@@ -297,6 +297,33 @@ impl App {
     }
 }
 
+/// Build the OSC 0 escape sequence that sets the terminal's window/icon title.
+///
+/// Format: `ESC ] 0 ; <title> BEL`.  Control bytes that would break the escape
+/// (BEL, ESC, newlines) are stripped from `title` so untrusted input cannot
+/// inject further sequences.
+fn set_title_seq(title: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(title.len() + 5);
+    out.extend_from_slice(b"\x1b]0;");
+    for byte in title.as_bytes() {
+        match *byte {
+            0x00..=0x1f | 0x7f => continue,
+            b => out.push(b),
+        }
+    }
+    out.push(0x07);
+    out
+}
+
+fn build_title(workspace: &std::path::Path) -> String {
+    let name = workspace
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| workspace.display().to_string());
+    format!("croft  {name}")
+}
+
 /// Returns true if the given key event should trigger "Save".
 /// Recognises Ctrl+S (cross-platform) and Cmd/Super+S (macOS-style).
 /// Case-insensitive on the letter so Shift+Ctrl+S also works.
@@ -488,14 +515,57 @@ mod tests {
     fn alt_s_is_not_save_key() {
         assert!(!is_save_key(key(KeyCode::Char('s'), KeyModifiers::ALT)));
     }
+
+    #[test]
+    fn set_title_seq_wraps_with_osc0_and_bel() {
+        let bytes = set_title_seq("croft");
+        assert_eq!(bytes, b"\x1b]0;croft\x07");
+    }
+
+    #[test]
+    fn set_title_seq_handles_empty_title() {
+        let bytes = set_title_seq("");
+        assert_eq!(bytes, b"\x1b]0;\x07");
+    }
+
+    #[test]
+    fn set_title_seq_passes_through_unicode() {
+        let bytes = set_title_seq("croft  README.md");
+        assert_eq!(bytes, "\x1b]0;croft  README.md\x07".as_bytes());
+    }
+
+    #[test]
+    fn set_title_seq_strips_control_bytes_that_would_break_the_escape() {
+        // BEL terminates the OSC, ESC starts a new sequence — both must be filtered.
+        let bytes = set_title_seq("evil\x07file");
+        assert_eq!(bytes, b"\x1b]0;evilfile\x07");
+        let bytes = set_title_seq("evil\x1bfile");
+        assert_eq!(bytes, b"\x1b]0;evilfile\x07");
+        let bytes = set_title_seq("evil\nfile");
+        assert_eq!(bytes, b"\x1b]0;evilfile\x07");
+    }
+
+    #[test]
+    fn build_title_uses_basename_and_app_name() {
+        let p = std::path::Path::new("/Users/somebody/projects/croft");
+        assert_eq!(build_title(p), "croft  croft");
+        let p = std::path::Path::new("/");
+        assert_eq!(build_title(p), "croft  /");
+    }
 }
 
 pub fn run(root: PathBuf) -> Result<()> {
+    let title = build_title(&root);
     let mut app = App::new(root)?;
 
     enable_raw_mode().context("enable raw mode")?;
     let mut out = stdout();
     execute!(out, EnterAlternateScreen, EnableMouseCapture).context("enter alt screen")?;
+    {
+        use std::io::Write;
+        out.write_all(&set_title_seq(&title)).ok();
+        out.flush().ok();
+    }
     let backend = CrosstermBackend::new(out);
     let mut terminal: Terminal<CrosstermBackend<Stdout>> =
         Terminal::new(backend).context("create terminal")?;
@@ -503,6 +573,12 @@ pub fn run(root: PathBuf) -> Result<()> {
     let result = main_loop(&mut app, &mut terminal);
 
     disable_raw_mode().ok();
+    {
+        use std::io::Write;
+        let mut out = stdout();
+        out.write_all(&set_title_seq("")).ok();
+        out.flush().ok();
+    }
     execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture).ok();
     terminal.show_cursor().ok();
 
