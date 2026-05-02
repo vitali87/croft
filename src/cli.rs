@@ -6,6 +6,10 @@ use std::process::Command;
 const SETUP_FONT_PS_NAME: &str = "MesloLGSNFM-Regular";
 const SETUP_FONT_SIZE: u32 = 13;
 
+const ITERM2_FONT_PS_NAME: &str = "MesloLGSNFM-Regular";
+const ITERM2_NONASCII_PS_NAME: &str = "SymbolsNFM";
+const ITERM2_FONT_SIZE: u32 = 13;
+
 #[derive(Parser, Debug)]
 #[command(name = "croft", version, about = "Terminal-based VS Code replica")]
 pub struct Cli {
@@ -30,6 +34,20 @@ pub enum CliCommand {
         #[arg(short, long, default_value_t = false)]
         yes: bool,
     },
+    /// Set iTerm2's default profile font (and Symbols Nerd Font Mono fallback) so file icons render.
+    SetupIterm2 {
+        /// PostScript name of the primary font
+        #[arg(long, default_value = ITERM2_FONT_PS_NAME)]
+        font: String,
+        /// PostScript name of the non-ASCII fallback font
+        #[arg(long, default_value = ITERM2_NONASCII_PS_NAME)]
+        nonascii: String,
+        #[arg(long, default_value_t = ITERM2_FONT_SIZE)]
+        size: u32,
+        /// Skip confirmation prompt
+        #[arg(short, long, default_value_t = false)]
+        yes: bool,
+    },
 }
 
 impl Cli {
@@ -37,6 +55,9 @@ impl Cli {
         match self.command {
             Some(CliCommand::SetupTerminal { font, size, yes }) => {
                 setup_terminal(&font, size, yes)
+            }
+            Some(CliCommand::SetupIterm2 { font, nonascii, size, yes }) => {
+                setup_iterm2(&font, &nonascii, size, yes)
             }
             None => {
                 let path = self
@@ -115,6 +136,44 @@ mod tests {
             _ => panic!("expected SetupTerminal"),
         }
     }
+
+    #[test]
+    fn parses_setup_iterm2_with_defaults() {
+        let cli = Cli::parse_from(["croft", "setup-iterm2"]);
+        match cli.command {
+            Some(CliCommand::SetupIterm2 { font, nonascii, size, yes }) => {
+                assert_eq!(font, ITERM2_FONT_PS_NAME);
+                assert_eq!(nonascii, ITERM2_NONASCII_PS_NAME);
+                assert_eq!(size, ITERM2_FONT_SIZE);
+                assert!(!yes);
+            }
+            _ => panic!("expected SetupIterm2"),
+        }
+    }
+
+    #[test]
+    fn parses_setup_iterm2_with_overrides() {
+        let cli = Cli::parse_from([
+            "croft",
+            "setup-iterm2",
+            "--font",
+            "FiraCodeNFM-Reg",
+            "--nonascii",
+            "SymbolsNFM",
+            "--size",
+            "15",
+            "-y",
+        ]);
+        match cli.command {
+            Some(CliCommand::SetupIterm2 { font, nonascii, size, yes }) => {
+                assert_eq!(font, "FiraCodeNFM-Reg");
+                assert_eq!(nonascii, "SymbolsNFM");
+                assert_eq!(size, 15);
+                assert!(yes);
+            }
+            _ => panic!("expected SetupIterm2"),
+        }
+    }
 }
 
 fn setup_terminal(font: &str, size: u32, yes: bool) -> Result<()> {
@@ -156,5 +215,32 @@ end tell"#
     }
     println!("Set Terminal.app default profile font to {font} at {size}pt.");
     println!("Quit Terminal.app entirely (cmd+Q) and reopen it for the change to take effect.");
+    Ok(())
+}
+
+fn setup_iterm2(font: &str, nonascii: &str, size: u32, yes: bool) -> Result<()> {
+    let plist_path = crate::iterm2::default_plist_path();
+    println!(
+        "This will set iTerm2's default profile to:\n  Normal Font: {font} {size}\n  Non-ASCII Font: {nonascii} {size}\n  Use Non-ASCII Font: enabled"
+    );
+    println!("Plist target: {}", plist_path.display());
+    println!("Existing custom profiles are not modified.");
+    if !yes {
+        print!("Apply this change? [y/N] ");
+        use std::io::Write;
+        std::io::stdout().flush()?;
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer)?;
+        if !matches!(answer.trim().to_lowercase().as_str(), "y" | "yes") {
+            println!("Aborted.");
+            return Ok(());
+        }
+    }
+    crate::iterm2::install_font_settings(&plist_path, font, nonascii, size)
+        .with_context(|| "applying iTerm2 font settings")?;
+    println!("Wrote font settings to {}.", plist_path.display());
+    println!(
+        "Quit iTerm2 entirely (cmd+Q) and reopen it. macOS caches plists; iTerm2 must be relaunched to pick up the change."
+    );
     Ok(())
 }

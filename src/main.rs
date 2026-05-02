@@ -2,6 +2,7 @@ mod app;
 mod cli;
 mod highlight;
 mod icons;
+mod iterm2;
 mod widgets;
 
 use anyhow::Result;
