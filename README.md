@@ -1,4 +1,4 @@
-Why it doe snot save?
+Why it doe sn
 # croft
 
 A VS Code style three pane workspace that runs entirely inside your terminal. Written in Rust for performance and ships as a single static binary.

@@ -34,6 +34,9 @@ pub enum CliCommand {
         #[arg(short, long, default_value_t = false)]
         yes: bool,
     },
+    /// Diagnostic: print every key event the terminal delivers, with modifiers.
+    /// Useful for confirming whether cmd / super reaches the app.  Press Ctrl+C to quit.
+    Keys,
     /// Set iTerm2's default profile font (and Symbols Nerd Font Mono fallback) so file icons render.
     SetupIterm2 {
         /// PostScript name of the primary font
@@ -56,6 +59,7 @@ impl Cli {
             Some(CliCommand::SetupTerminal { font, size, yes }) => {
                 setup_terminal(&font, size, yes)
             }
+            Some(CliCommand::Keys) => keys_diagnostic(),
             Some(CliCommand::SetupIterm2 { font, nonascii, size, yes }) => {
                 setup_iterm2(&font, &nonascii, size, yes)
             }
@@ -138,6 +142,12 @@ mod tests {
     }
 
     #[test]
+    fn parses_keys_subcommand() {
+        let cli = Cli::parse_from(["croft", "keys"]);
+        assert!(matches!(cli.command, Some(CliCommand::Keys)));
+    }
+
+    #[test]
     fn parses_setup_iterm2_with_defaults() {
         let cli = Cli::parse_from(["croft", "setup-iterm2"]);
         match cli.command {
@@ -216,6 +226,91 @@ end tell"#
     println!("Set Terminal.app default profile font to {font} at {size}pt.");
     println!("Quit Terminal.app entirely (cmd+Q) and reopen it for the change to take effect.");
     Ok(())
+}
+
+fn keys_diagnostic() -> Result<()> {
+    use crossterm::event::{
+        self, Event, KeyCode, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
+        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    };
+    use crossterm::{execute, terminal};
+    use std::io::stdout;
+    use std::time::Duration;
+
+    println!("croft keys: press any key to inspect; Ctrl+C to quit.");
+    println!("If the kitty keyboard protocol is negotiated, modifier keys");
+    println!("(including Cmd/Super on macOS) will appear in the modifier list.");
+    println!();
+
+    terminal::enable_raw_mode().context("enable raw mode")?;
+    let mut out = stdout();
+    let kbd_enhanced = execute!(
+        out,
+        PushKeyboardEnhancementFlags(
+            KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+        )
+    )
+    .is_ok();
+
+    let result = (|| -> Result<()> {
+        loop {
+            if event::poll(Duration::from_millis(500))? {
+                match event::read()? {
+                    Event::Key(k) => {
+                        if k.kind != KeyEventKind::Press && k.kind != KeyEventKind::Repeat {
+                            continue;
+                        }
+                        let mut mods: Vec<&str> = Vec::new();
+                        if k.modifiers.contains(KeyModifiers::CONTROL) {
+                            mods.push("CONTROL");
+                        }
+                        if k.modifiers.contains(KeyModifiers::ALT) {
+                            mods.push("ALT");
+                        }
+                        if k.modifiers.contains(KeyModifiers::SHIFT) {
+                            mods.push("SHIFT");
+                        }
+                        if k.modifiers.contains(KeyModifiers::SUPER) {
+                            mods.push("SUPER (Cmd)");
+                        }
+                        if k.modifiers.contains(KeyModifiers::HYPER) {
+                            mods.push("HYPER");
+                        }
+                        if k.modifiers.contains(KeyModifiers::META) {
+                            mods.push("META");
+                        }
+                        let mods_s = if mods.is_empty() {
+                            String::from("none")
+                        } else {
+                            mods.join(" + ")
+                        };
+                        // Quit on Ctrl+C.
+                        if matches!(k.code, KeyCode::Char('c'))
+                            && k.modifiers.contains(KeyModifiers::CONTROL)
+                        {
+                            print!("\r\nQuitting (Ctrl+C).\r\n");
+                            break;
+                        }
+                        print!(
+                            "\r  code={:?}  modifiers=[{}]  kitty={}\r\n",
+                            k.code, mods_s, kbd_enhanced
+                        );
+                        use std::io::Write;
+                        std::io::stdout().flush().ok();
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Ok(())
+    })();
+
+    if kbd_enhanced {
+        execute!(stdout(), PopKeyboardEnhancementFlags).ok();
+    }
+    terminal::disable_raw_mode().ok();
+    result
 }
 
 fn setup_iterm2(font: &str, nonascii: &str, size: u32, yes: bool) -> Result<()> {
