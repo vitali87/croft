@@ -880,15 +880,18 @@ fn build_title(workspace: &std::path::Path) -> String {
 }
 
 /// Returns true if the given key event should trash the currently-selected
-/// node in the file tree. Recognises the Delete key (forward-delete) and the
-/// macOS Finder convention `Cmd+Backspace`. Plain Backspace does **not**
-/// match — that's reserved for editor / shell input.
+/// node in the file tree. Recognises:
+///   * `KeyCode::Delete`       — the Forward-Delete key on full-size keyboards
+///                                (and `fn+Delete` on Mac laptops).
+///   * `KeyCode::Backspace`    — the key labeled "delete" on every Mac keyboard.
+///                                The tree pane has no text input that needs
+///                                Backspace, so plain Backspace is safe here.
+///   * `Cmd+Backspace`         — the macOS Finder gesture for trashing.
+/// This helper is only called from `handle_tree_key`, so plain Backspace is
+/// only swallowed when the tree pane has focus; the editor and terminal panes
+/// continue to consume Backspace for their own purposes.
 fn is_delete_node_key(key: KeyEvent) -> bool {
-    match key.code {
-        KeyCode::Delete => true,
-        KeyCode::Backspace if key.modifiers.contains(KeyModifiers::SUPER) => true,
-        _ => false,
-    }
+    matches!(key.code, KeyCode::Delete | KeyCode::Backspace)
 }
 
 /// Returns true if the given key event should trigger "Save".
@@ -1095,9 +1098,11 @@ mod tests {
     }
 
     #[test]
-    fn plain_backspace_is_not_delete_node() {
-        // Plain Backspace must not trigger destructive actions in the tree.
-        assert!(!is_delete_node_key(key(KeyCode::Backspace, KeyModifiers::NONE)));
+    fn plain_backspace_is_delete_node_on_mac_layouts() {
+        // On Mac keyboards the key labeled "delete" reports as Backspace; in
+        // the tree pane (the only context this helper is called from) it must
+        // trigger deletion to match the user's expectation.
+        assert!(is_delete_node_key(key(KeyCode::Backspace, KeyModifiers::NONE)));
     }
 
     #[test]
