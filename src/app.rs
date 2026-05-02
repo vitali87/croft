@@ -64,8 +64,6 @@ struct ContextMenu {
 #[derive(Clone, PartialEq, Eq, Debug)]
 enum PromptKind {
     Create(CreateKind),
-    /// Confirm-deletion modal. Enter trashes the path; Esc cancels.
-    DeleteConfirm(PathBuf),
 }
 
 struct Prompt {
@@ -384,21 +382,6 @@ impl App {
                 ]),
                 "Enter to create, Esc to cancel",
             ),
-            PromptKind::DeleteConfirm(_) => (
-                ratatui::text::Line::from(vec![
-                    ratatui::text::Span::styled(
-                        "Move to Trash? ",
-                        Style::default()
-                            .fg(Color::Rgb(0xe8, 0x27, 0x4b))
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    ratatui::text::Span::styled(
-                        "(this is recoverable from your OS Trash)",
-                        Style::default().fg(Color::DarkGray),
-                    ),
-                ]),
-                "Enter to move to Trash, Esc to cancel",
-            ),
         };
         frame.render_widget(
             ratatui::widgets::Paragraph::new(top_line),
@@ -466,6 +449,17 @@ impl App {
     }
 
     fn handle_tree_key(&mut self, key: KeyEvent) {
+        // Delete key (or Cmd+Backspace) trashes the selected node directly.
+        if is_delete_node_key(key) {
+            if let Some(node) = self.tree.nodes.get(self.tree.selected) {
+                if let Some(path) =
+                    crate::widgets::file_tree::delete_target_for(Some(node), &self.tree.root)
+                {
+                    self.delete_node(path);
+                }
+            }
+            return;
+        }
         match key.code {
             KeyCode::Up => self.tree.move_up(),
             KeyCode::Down => self.tree.move_down(),
@@ -721,7 +715,29 @@ impl App {
     fn dispatch_menu_action(&mut self, action: MenuAction, target_dir: PathBuf) {
         match action {
             MenuAction::Create(kind) => self.open_create_prompt(kind, target_dir),
-            MenuAction::Delete(path) => self.open_delete_prompt(path),
+            // No confirmation: trash is recoverable, the user asked for direct deletion.
+            MenuAction::Delete(path) => self.delete_node(path),
+        }
+    }
+
+    fn delete_node(&mut self, path: PathBuf) {
+        match crate::widgets::file_tree::move_to_trash(&path) {
+            Ok(()) => {
+                self.status = format!("Moved {} to Trash", path.display());
+                let parent = path
+                    .parent()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| self.tree.root.clone());
+                if let Some(idx) = self.tree.index_of_dir(&parent) {
+                    self.tree.refresh_children(idx);
+                }
+                if self.editor.matches_open_path(&path) {
+                    self.editor = Editor::new();
+                }
+            }
+            Err(e) => {
+                self.status = format!("Delete failed: {e}");
+            }
         }
     }
 
@@ -739,39 +755,20 @@ impl App {
         });
     }
 
-    fn open_delete_prompt(&mut self, path: PathBuf) {
-        let label = format!("Delete {}", path.display());
-        let parent = path
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| self.tree.root.clone());
-        self.prompt = Some(Prompt {
-            label,
-            buffer: String::new(),
-            kind: PromptKind::DeleteConfirm(path),
-            target_dir: parent,
-            error: None,
-        });
-    }
-
     fn handle_prompt_key(&mut self, key: KeyEvent) {
-        let is_create = matches!(
-            self.prompt.as_ref().map(|p| &p.kind),
-            Some(PromptKind::Create(_))
-        );
         match key.code {
             KeyCode::Esc => {
                 self.prompt = None;
                 self.status = String::from("Cancelled");
             }
             KeyCode::Enter => self.commit_prompt(),
-            KeyCode::Backspace if is_create => {
+            KeyCode::Backspace => {
                 if let Some(p) = self.prompt.as_mut() {
                     p.buffer.pop();
                     p.error = None;
                 }
             }
-            KeyCode::Char(c) if is_create => {
+            KeyCode::Char(c) => {
                 if !key.modifiers.contains(KeyModifiers::CONTROL)
                     && !key.modifiers.contains(KeyModifiers::ALT)
                     && !key.modifiers.contains(KeyModifiers::SUPER)
@@ -839,30 +836,6 @@ impl App {
                     }
                 }
             }
-            PromptKind::DeleteConfirm(path) => {
-                match crate::widgets::file_tree::move_to_trash(&path) {
-                    Ok(()) => {
-                        self.prompt = None;
-                        self.status = format!("Moved {} to Trash", path.display());
-                        let parent = path
-                            .parent()
-                            .map(Path::to_path_buf)
-                            .unwrap_or_else(|| self.tree.root.clone());
-                        if let Some(idx) = self.tree.index_of_dir(&parent) {
-                            self.tree.refresh_children(idx);
-                        }
-                        // If the deleted path was open in the editor, clear it.
-                        if self.editor.matches_open_path(&path) {
-                            self.editor = Editor::new();
-                        }
-                    }
-                    Err(e) => {
-                        if let Some(p) = self.prompt.as_mut() {
-                            p.error = Some(e.to_string());
-                        }
-                    }
-                }
-            }
         }
     }
 }
@@ -904,6 +877,18 @@ fn build_title(workspace: &std::path::Path) -> String {
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| workspace.display().to_string());
     format!("{APP_NAME}  {name}")
+}
+
+/// Returns true if the given key event should trash the currently-selected
+/// node in the file tree. Recognises the Delete key (forward-delete) and the
+/// macOS Finder convention `Cmd+Backspace`. Plain Backspace does **not**
+/// match — that's reserved for editor / shell input.
+fn is_delete_node_key(key: KeyEvent) -> bool {
+    match key.code {
+        KeyCode::Delete => true,
+        KeyCode::Backspace if key.modifiers.contains(KeyModifiers::SUPER) => true,
+        _ => false,
+    }
 }
 
 /// Returns true if the given key event should trigger "Save".
@@ -1096,6 +1081,28 @@ mod tests {
     #[test]
     fn alt_s_is_not_save_key() {
         assert!(!is_save_key(key(KeyCode::Char('s'), KeyModifiers::ALT)));
+    }
+
+    #[test]
+    fn delete_key_is_recognized_as_delete_node() {
+        assert!(is_delete_node_key(key(KeyCode::Delete, KeyModifiers::NONE)));
+    }
+
+    #[test]
+    fn cmd_backspace_is_recognized_as_delete_node() {
+        // macOS Finder convention: ⌘⌫ moves the selection to the Trash.
+        assert!(is_delete_node_key(key(KeyCode::Backspace, KeyModifiers::SUPER)));
+    }
+
+    #[test]
+    fn plain_backspace_is_not_delete_node() {
+        // Plain Backspace must not trigger destructive actions in the tree.
+        assert!(!is_delete_node_key(key(KeyCode::Backspace, KeyModifiers::NONE)));
+    }
+
+    #[test]
+    fn ctrl_d_is_not_delete_node() {
+        assert!(!is_delete_node_key(key(KeyCode::Char('d'), KeyModifiers::CONTROL)));
     }
 
     #[test]

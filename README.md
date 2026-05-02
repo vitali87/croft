@@ -80,6 +80,7 @@ croft setup-terminal --help
 | Editor: any printable char, Enter, Backspace, Delete, Tab | Edit |
 | Mouse click in any pane | Focus and (in tree) select / open, (in editor) move cursor |
 | Mouse right-click in tree | Open context menu (New File…, New Folder…, Delete) |
+| `Delete` (or `Cmd+Backspace`) in tree | Move the selected file or folder to the OS Trash, no confirmation |
 | Mouse wheel | Scroll the pane under the pointer |
 | Up/Down/Enter in context menu | Navigate / pick item; Esc dismisses |
 | Type + Enter in create prompt | Create the file or folder; Esc cancels |
