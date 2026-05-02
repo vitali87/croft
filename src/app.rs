@@ -25,20 +25,30 @@ use crate::widgets::{editor::Editor, file_tree::FileTree, terminal::PtyTerminal}
 /// Single source of truth for the application's user-facing name.
 pub const APP_NAME: &str = "croft";
 
-/// Build the status-bar spans for the git pill (branch name, dirty bullet,
-/// ahead/behind counts).  Returns an empty vec when the workspace is not in
-/// a git repo so the status bar shows nothing.
+/// Agnoster-style status colours: clean working tree is green, any dirtiness
+/// (modified, staged, or untracked) flips the pill to yellow/orange.
+const GIT_CLEAN_COLOR: Color = Color::Rgb(0xa3, 0xbe, 0x8c);
+const GIT_DIRTY_COLOR: Color = Color::Rgb(0xeb, 0xcb, 0x8b);
+
+/// Build the status-bar spans for the git pill: branch glyph, branch name,
+/// optional ahead/behind counts.  Colour alone carries clean/dirty state, in
+/// the spirit of the Agnoster zsh theme.  Returns an empty vec outside a git
+/// repo so the bar shows nothing.
 fn git_status_spans<'a>(status: &'a crate::git::GitStatus) -> Vec<Span<'a>> {
     if !status.in_repo {
         return Vec::new();
     }
-    let mut spans: Vec<Span> = Vec::with_capacity(8);
+    let pill_color = if status.dirty {
+        GIT_DIRTY_COLOR
+    } else {
+        GIT_CLEAN_COLOR
+    };
+    let mut spans: Vec<Span> = Vec::with_capacity(6);
     spans.push(Span::raw("  "));
-    // Codicon source-control / git-branch glyph (U+EAFC). Falls back to a
-    // textual marker if the user's font lacks the glyph.
+    // Codicon git-branch glyph (U+EAFC).
     spans.push(Span::styled(
         "\u{eafc} ",
-        Style::default().fg(Color::Rgb(0xdc, 0xb6, 0x7a)),
+        Style::default().fg(pill_color),
     ));
     let label: &str = match (&status.branch, &status.detached_hash) {
         (Some(b), _) => b.as_str(),
@@ -47,26 +57,18 @@ fn git_status_spans<'a>(status: &'a crate::git::GitStatus) -> Vec<Span<'a>> {
     };
     spans.push(Span::styled(
         label,
-        Style::default()
-            .fg(Color::White)
-            .add_modifier(Modifier::BOLD),
+        Style::default().fg(pill_color).add_modifier(Modifier::BOLD),
     ));
-    if status.dirty {
-        spans.push(Span::styled(
-            "\u{2009}●",
-            Style::default().fg(Color::Rgb(0xe8, 0x27, 0x4b)),
-        ));
-    }
     if status.ahead > 0 {
         spans.push(Span::styled(
             format!(" \u{2191}{}", status.ahead),
-            Style::default().fg(Color::Rgb(0xa3, 0xbe, 0x8c)),
+            Style::default().fg(GIT_CLEAN_COLOR),
         ));
     }
     if status.behind > 0 {
         spans.push(Span::styled(
             format!(" \u{2193}{}", status.behind),
-            Style::default().fg(Color::Rgb(0xeb, 0xcb, 0x8b)),
+            Style::default().fg(GIT_DIRTY_COLOR),
         ));
     }
     spans
@@ -1166,7 +1168,8 @@ mod tests {
     }
 
     #[test]
-    fn git_status_spans_renders_branch_and_no_dirty_marker_when_clean() {
+    fn git_status_spans_clean_branch_is_green() {
+        // Agnoster convention: clean working tree → green pill.
         let st = crate::git::GitStatus {
             in_repo: true,
             branch: Some("main".into()),
@@ -1176,13 +1179,17 @@ mod tests {
             behind: 0,
         };
         let spans = git_status_spans(&st);
-        let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(joined.contains("main"), "branch name should be present");
-        assert!(!joined.contains('●'), "no dirty bullet when clean");
+        let main_span = spans
+            .iter()
+            .find(|s| s.content.contains("main"))
+            .expect("branch span");
+        assert_eq!(main_span.style.fg, Some(GIT_CLEAN_COLOR));
     }
 
     #[test]
-    fn git_status_spans_renders_dirty_marker_when_dirty() {
+    fn git_status_spans_dirty_branch_is_yellow_not_red() {
+        // Agnoster convention: dirty working tree → yellow/orange pill.
+        // No red bullet either — colour alone carries the state.
         let st = crate::git::GitStatus {
             in_repo: true,
             branch: Some("main".into()),
@@ -1193,8 +1200,12 @@ mod tests {
         };
         let spans = git_status_spans(&st);
         let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(joined.contains("main"));
-        assert!(joined.contains('●'), "dirty bullet should appear when dirty");
+        assert!(!joined.contains('●'), "no red bullet — colour signals dirtiness");
+        let main_span = spans
+            .iter()
+            .find(|s| s.content.contains("main"))
+            .expect("branch span");
+        assert_eq!(main_span.style.fg, Some(GIT_DIRTY_COLOR));
     }
 
     #[test]
