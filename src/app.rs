@@ -472,7 +472,9 @@ impl App {
                     match self.editor.open(&path) {
                         Ok(()) => {
                             self.status = self.editor.status.clone();
-                            self.focus_pane(Pane::Editor);
+                            // Stay focused on the tree so Delete / arrows still
+                            // act on the explorer; click into the editor pane
+                            // to start typing.
                         }
                         Err(e) => {
                             self.status = format!("Error: {e}");
@@ -595,7 +597,9 @@ impl App {
                             match self.editor.open(&path) {
                                 Ok(()) => {
                                     self.status = self.editor.status.clone();
-                                    self.focus_pane(Pane::Editor);
+                                    // Tree keeps focus so Delete / arrows still
+                                    // act on the explorer. Click into the
+                                    // editor pane to start typing.
                                 }
                                 Err(e) => self.status = format!("Error: {e}"),
                             }
