@@ -238,8 +238,18 @@ impl App {
                     }
                 } else if in_editor {
                     self.focus_pane(Pane::Editor);
+                    self.editor.click(m.column, m.row);
                 } else if in_terminal {
                     self.focus_pane(Pane::Terminal);
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if in_editor {
+                    self.editor.click(m.column, m.row);
+                } else if in_tree {
+                    if let Some(idx) = self.tree.node_at_y(m.row) {
+                        self.tree.select(idx);
+                    }
                 }
             }
             MouseEventKind::ScrollDown => {

@@ -22,6 +22,8 @@ pub struct Editor {
     pub focused: bool,
     pub status: String,
     pub last_area: Rect,
+    pub last_inner: Rect,
+    pub last_gutter_width: u16,
     syntax_set: SyntaxSet,
     theme_set: ThemeSet,
     pub theme_name: String,
@@ -38,6 +40,8 @@ impl Editor {
             focused: false,
             status: String::from("No file open"),
             last_area: Rect::default(),
+            last_inner: Rect::default(),
+            last_gutter_width: 0,
             syntax_set: SyntaxSet::load_defaults_newlines(),
             theme_set: ThemeSet::load_defaults(),
             theme_name: String::from("base16-ocean.dark"),
@@ -52,6 +56,27 @@ impl Editor {
     pub fn scroll_down(&mut self, n: usize) {
         self.cursor_row = (self.cursor_row + n).min(self.lines.len().saturating_sub(1));
         self.cursor_col = self.cursor_col.min(self.lines.get(self.cursor_row).map(|s| s.len()).unwrap_or(0));
+    }
+
+    /// Move the cursor to the screen coordinates (col, row). Used for mouse clicks.
+    /// Coordinates are absolute terminal coordinates.
+    pub fn click(&mut self, col: u16, row: u16) {
+        if self.lines.is_empty() || self.last_inner.height == 0 {
+            return;
+        }
+        if row < self.last_inner.y || row >= self.last_inner.y + self.last_inner.height {
+            return;
+        }
+        let row_idx = (row - self.last_inner.y) as usize;
+        let target_line = (self.scroll + row_idx).min(self.lines.len().saturating_sub(1));
+        let text_x = self.last_inner.x + self.last_gutter_width + 1;
+        let target_col = if col < text_x {
+            0
+        } else {
+            (col - text_x) as usize
+        };
+        self.cursor_row = target_line;
+        self.cursor_col = target_col.min(self.lines[target_line].len());
     }
 
     pub fn open(&mut self, path: &Path) -> Result<()> {
@@ -190,6 +215,7 @@ impl Widget for &mut Editor {
         let inner = block.inner(area);
         block.render(area, buf);
         self.last_area = area;
+        self.last_inner = inner;
 
         let height = inner.height as usize;
         if self.cursor_row < self.scroll {
@@ -199,6 +225,7 @@ impl Widget for &mut Editor {
         }
 
         let gutter_width = (self.lines.len() + 1).to_string().len() as u16 + 1;
+        self.last_gutter_width = gutter_width;
         let text_x = inner.x + gutter_width + 1;
         let text_width = inner.width.saturating_sub(gutter_width + 2);
 
