@@ -1,0 +1,79 @@
+Screen {
+    layout: horizontal;
+    background: $surface;
+}
+
+Header {
+    background: $primary-darken-2;
+    color: $text;
+}
+
+Footer {
+    background: $primary-darken-2;
+}
+
+#file-tree {
+    width: 30;
+    min-width: 20;
+    max-width: 60;
+    border-right: solid $primary;
+    background: $panel;
+    padding: 0 1;
+}
+
+#right {
+    width: 1fr;
+    height: 1fr;
+    layout: vertical;
+}
+
+#editor {
+    height: 2fr;
+    border-bottom: solid $primary;
+    background: $surface;
+}
+
+#terminal {
+    height: 1fr;
+    background: black;
+    color: white;
+    padding: 0 1;
+}
+
+.pane-title {
+    background: $primary-darken-1;
+    color: $text;
+    text-style: bold;
+    padding: 0 1;
+    height: 1;
+}
+
+#tab-label {
+    background: $primary;
+    color: $text;
+    text-style: bold;
+    padding: 0 1;
+    height: 1;
+}
+
+#status-bar {
+    dock: bottom;
+    height: 1;
+    background: $accent;
+    color: $text;
+    padding: 0 1;
+}
+
+DirectoryTree {
+    background: $panel;
+}
+
+DirectoryTree > .tree--cursor {
+    background: $accent;
+    color: $text;
+    text-style: bold;
+}
+
+TextArea {
+    background: $surface;
+}
