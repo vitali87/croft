@@ -2,13 +2,11 @@
 
 A VS Code style three pane workspace that runs entirely inside your terminal.
 
-* **Left pane:** file explorer with colored type markers, click to open
+* **Left pane:** file explorer with VS Code style file type icons (Codicons / Devicons), click to open
 * **Top right pane:** code editor with syntax highlighting
 * **Bottom right pane:** a real interactive shell (your `$SHELL` running on a PTY)
 
 Built on [Textual](https://textual.textualize.io/) and [pyte](https://github.com/selectel/pyte).
-
-The file explorer uses plain Unicode shapes (`●`, `▸`, `▾`) plus per file type colors. This means it works in **any** terminal, including macOS Terminal.app on its default font, with **zero font configuration**. No Nerd Fonts required.
 
 ## Requirements
 
@@ -17,13 +15,32 @@ The file explorer uses plain Unicode shapes (`●`, `▸`, `▾`) plus per file 
 | macOS or Linux | Uses POSIX `pty.fork` for the embedded terminal. Windows is not supported. |
 | Python 3.12+ | Required by the project. |
 | [uv](https://docs.astral.sh/uv/) | Package manager and runner. |
-| A 256 color or truecolor terminal | macOS Terminal.app, iTerm2, Alacritty, kitty, WezTerm, Ghostty are all fine. |
+| A Nerd Font as your terminal font | The file explorer icons are Nerd Font glyphs (Codicons, Devicons, Seti UI). Without a Nerd Font, icons render as `[?]` boxes. The recipe below installs and configures one. |
+| A 256 color or truecolor terminal | macOS Terminal.app, iTerm2, Alacritty, kitty, WezTerm, Ghostty all qualify. |
 
 ### Install uv
 
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
+
+### Install a Nerd Font (macOS)
+
+```bash
+brew install --cask font-meslo-lg-nerd-font
+```
+
+Then set Terminal.app's default profile to use it. The fastest way is the bundled command:
+
+```bash
+uv run tcode setup-terminal
+```
+
+This sets the default profile font to `MesloLGSNerdFontMono-Regular` at 13pt via AppleScript. Existing custom profiles are not touched. Quit Terminal.app entirely (cmd+Q) and reopen it for the change to take effect.
+
+If you prefer to do it by hand: Terminal.app → Settings → Profiles → your default profile → Text → Font → Change → MesloLGS Nerd Font Mono Regular 13pt.
+
+**Why MesloLGS NF specifically:** macOS Terminal.app does not do CoreText style font fallback for Private Use Area glyphs the way iTerm2 does. The Nerd Font glyphs only render if the *primary* terminal font has them. MesloLGS NF is the most battle tested Nerd Font for Terminal.app and ships every Codicon, Devicon, and Seti glyph the explorer uses. Codepoint coverage is verified against `MesloLGSNerdFont-Regular.ttf` at build time.
 
 ## Install the app
 
@@ -91,8 +108,8 @@ The result is that anything you can do in a normal terminal works here too: run 
 
 ## Troubleshooting
 
-**Icons in the file explorer are boxes or wrong characters.**
-This should not happen with the default icon set (`●`, `▸`, `▾` are in every monospace font on macOS). If it does, your terminal is misconfigured for Unicode. Make sure your terminal profile is set to UTF-8 encoding.
+**Icons in the file explorer are boxes (`[?]`) instead of file type glyphs.**
+Terminal.app is not using a Nerd Font as its primary font. Run `uv run tcode setup-terminal`, then fully quit Terminal.app (cmd+Q) and reopen. Terminal.app does not fall back to other installed fonts for Private Use Area glyphs, so the primary font itself must contain them.
 
 **Colors look wrong in the editor or terminal.**
 Make sure your terminal is set to truecolor or 256 colors. In iTerm2: Profiles, Terminal, Report Terminal Type set to `xterm-256color`. The embedded shell exports `TERM=xterm-256color` and `COLORTERM=truecolor` automatically.
