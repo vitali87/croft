@@ -17,7 +17,7 @@ use ratatui::{
     Terminal,
 };
 use std::io::{stdout, Stdout};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::widgets::{editor::Editor, file_tree::FileTree, terminal::PtyTerminal};
@@ -72,6 +72,14 @@ pub struct App {
     quit: bool,
     context_menu: Option<ContextMenu>,
     prompt: Option<Prompt>,
+    /// Filesystem watcher; held to keep it alive. Events flow into `fs_rx`.
+    _fs_watcher: Option<
+        notify_debouncer_full::Debouncer<
+            notify::RecommendedWatcher,
+            notify_debouncer_full::RecommendedCache,
+        >,
+    >,
+    fs_rx: Option<std::sync::mpsc::Receiver<notify_debouncer_full::DebounceEventResult>>,
 }
 
 impl App {
@@ -79,6 +87,10 @@ impl App {
         let tree = FileTree::new(root.clone());
         let editor = Editor::new();
         let term = PtyTerminal::new(&root).context("spawning terminal")?;
+        let (watcher, rx) = match Self::spawn_fs_watcher(&root) {
+            Ok((w, r)) => (Some(w), Some(r)),
+            Err(_) => (None, None),
+        };
         Ok(Self {
             tree,
             editor,
@@ -89,7 +101,82 @@ impl App {
             quit: false,
             context_menu: None,
             prompt: None,
+            _fs_watcher: watcher,
+            fs_rx: rx,
         })
+    }
+
+    fn spawn_fs_watcher(
+        root: &Path,
+    ) -> Result<(
+        notify_debouncer_full::Debouncer<
+            notify::RecommendedWatcher,
+            notify_debouncer_full::RecommendedCache,
+        >,
+        std::sync::mpsc::Receiver<notify_debouncer_full::DebounceEventResult>,
+    )> {
+        use notify::RecursiveMode;
+        use notify_debouncer_full::new_debouncer;
+        use std::time::Duration;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut debouncer = new_debouncer(Duration::from_millis(100), None, tx)
+            .context("creating filesystem watcher")?;
+        debouncer
+            .watch(root, RecursiveMode::Recursive)
+            .context("starting watch on workspace root")?;
+        Ok((debouncer, rx))
+    }
+
+    /// Drain any pending filesystem events from the watcher and refresh the
+    /// tree directories whose contents may have changed. Coalesces multiple
+    /// events for the same directory into a single refresh.
+    fn drain_fs_events(&mut self) {
+        let Some(rx) = self.fs_rx.as_ref() else {
+            return;
+        };
+        let mut affected: std::collections::BTreeSet<PathBuf> =
+            std::collections::BTreeSet::new();
+        while let Ok(result) = rx.try_recv() {
+            let events = match result {
+                Ok(evs) => evs,
+                Err(_) => continue,
+            };
+            for ev in events {
+                for path in &ev.event.paths {
+                    if let Some(dir) = crate::widgets::file_tree::affected_dir_for_event(
+                        path,
+                        &self.tree.root,
+                    ) {
+                        affected.insert(dir);
+                    } else if path == &self.tree.root
+                        || path.canonicalize().ok().as_deref()
+                            == self.tree.root.canonicalize().ok().as_deref()
+                    {
+                        // Event on the workspace root itself: refresh it.
+                        affected.insert(self.tree.root.clone());
+                    }
+                }
+            }
+        }
+        if affected.is_empty() {
+            return;
+        }
+        // Refresh from leaf to root so deeper dirs settle before parents
+        // potentially drop them.
+        for dir in affected.iter().rev() {
+            if let Some(idx) = self.tree.index_of_dir(dir) {
+                self.tree.refresh_children(idx);
+            } else {
+                // Could be a directory that exists in the tree under its
+                // canonical path but the event arrived non-canonical.
+                let canon = dir.canonicalize().ok();
+                if let Some(c) = canon {
+                    if let Some(idx) = self.tree.index_of_dir(&c) {
+                        self.tree.refresh_children(idx);
+                    }
+                }
+            }
+        }
     }
 
     fn cycle_focus(&mut self) {
@@ -1026,6 +1113,10 @@ fn main_loop(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
 ) -> Result<()> {
     while !app.quit {
+        // Pull in any filesystem-watcher events first so the tree reflects
+        // disk reality on the very next frame.
+        app.drain_fs_events();
+
         let mut frame_size = Rect::default();
         terminal.draw(|f| {
             frame_size = f.area();

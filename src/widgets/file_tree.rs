@@ -197,11 +197,27 @@ impl FileTree {
         }
     }
 
-    /// Index of the deepest *directory* node that contains `path` (or whose
-    /// path equals `path`). Used by the right-click context menu after a
-    /// create to refresh the right subtree.
+    /// Index of the directory node whose path equals `path`, comparing both
+    /// the raw stored path and its canonicalized form so this is robust to
+    /// `/tmp` vs `/private/tmp` and similar symlink resolution differences.
     pub fn index_of_dir(&self, path: &Path) -> Option<usize> {
-        self.nodes.iter().position(|n| n.is_dir && n.path == path)
+        let canon_target = path.canonicalize().ok();
+        self.nodes.iter().position(|n| {
+            if !n.is_dir {
+                return false;
+            }
+            if n.path == path {
+                return true;
+            }
+            if let Some(target) = canon_target.as_ref() {
+                if let Ok(canon_node) = n.path.canonicalize() {
+                    if &canon_node == target {
+                        return true;
+                    }
+                }
+            }
+            false
+        })
     }
 }
 
@@ -258,6 +274,27 @@ pub fn create_file_in(parent: &Path, name: &str) -> std::io::Result<PathBuf> {
         .create_new(true)
         .open(&target)?;
     Ok(target)
+}
+
+/// Given a filesystem event path and the tree's workspace root, return the
+/// directory whose children should be refreshed.
+///
+/// * If `event_path` is the root or outside the root, returns `None`.
+/// * Otherwise returns the parent directory of `event_path`. The watcher
+///   layer is the one that decides whether the event is a create / remove /
+///   rename; this helper is only concerned with which subtree to invalidate.
+pub fn affected_dir_for_event(event_path: &Path, root: &Path) -> Option<PathBuf> {
+    let canon_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let canon_event = event_path
+        .canonicalize()
+        .unwrap_or_else(|_| event_path.to_path_buf());
+    if !canon_event.starts_with(&canon_root) {
+        return None;
+    }
+    if canon_event == canon_root {
+        return None;
+    }
+    canon_event.parent().map(Path::to_path_buf)
 }
 
 /// Create directory `name` inside `parent`. Errors if it already exists.
@@ -505,6 +542,75 @@ mod tests {
         std::fs::create_dir(tmp.path().join("d")).unwrap();
         let err = create_folder_in(tmp.path(), "d").unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+    }
+
+    #[test]
+    fn affected_dir_for_event_returns_parent() {
+        let tmp = TempDir::new().unwrap();
+        let sub = tmp.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let f = sub.join("a.txt");
+        std::fs::write(&f, "").unwrap();
+        let res = affected_dir_for_event(&f, tmp.path()).unwrap();
+        assert_eq!(res, sub.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn affected_dir_for_event_returns_none_for_root_itself() {
+        let tmp = TempDir::new().unwrap();
+        assert!(affected_dir_for_event(tmp.path(), tmp.path()).is_none());
+    }
+
+    #[test]
+    fn affected_dir_for_event_returns_none_when_outside_root() {
+        let tmp = TempDir::new().unwrap();
+        let other = TempDir::new().unwrap();
+        let f = other.path().join("x.txt");
+        std::fs::write(&f, "").unwrap();
+        assert!(affected_dir_for_event(&f, tmp.path()).is_none());
+    }
+
+    #[test]
+    fn affected_dir_for_top_level_file_returns_root() {
+        let tmp = TempDir::new().unwrap();
+        let f = tmp.path().join("top.txt");
+        std::fs::write(&f, "").unwrap();
+        let res = affected_dir_for_event(&f, tmp.path()).unwrap();
+        assert_eq!(res, tmp.path().canonicalize().unwrap());
+    }
+
+    #[test]
+    fn affected_dir_for_event_resolves_correctly_for_external_creation() {
+        // Simulating: an external process creates `<root>/sub/x.txt`. The
+        // watcher fires for that path; the helper should report `<root>/sub`
+        // as the directory to refresh.
+        let tmp = TempDir::new().unwrap();
+        let sub = tmp.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let f = sub.join("x.txt");
+        std::fs::write(&f, "external write").unwrap();
+        let dir = affected_dir_for_event(&f, tmp.path()).expect("inside root");
+        // Reload the tree's children of `sub` and verify x.txt is found.
+        let mut tree = FileTree::new(tmp.path().to_path_buf());
+        // Expand `sub` so its children are loaded.
+        let sub_idx = tree
+            .nodes
+            .iter()
+            .position(|n| n.is_dir && n.path.ends_with("sub"))
+            .unwrap();
+        tree.selected = sub_idx;
+        tree.activate();
+        // Now create another file externally and confirm refresh_children
+        // (driven by the watcher path the helper produces) picks it up.
+        let f2 = sub.join("y.txt");
+        std::fs::write(&f2, "").unwrap();
+        let canon_dir = dir.clone();
+        let target_idx = tree.index_of_dir(&canon_dir).unwrap();
+        tree.refresh_children(target_idx);
+        assert!(
+            tree.nodes.iter().any(|n| n.path.ends_with("y.txt")),
+            "y.txt should appear after refresh_children driven by the watcher event"
+        );
     }
 
     #[test]

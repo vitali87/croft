@@ -42,6 +42,8 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "io-ut
 futures = "0.3"
 tui-input = "0.15"
 plist = "1.9"
+notify = "8.2"
+notify-debouncer-full = "0.7"
 
 [dev-dependencies]
 tempfile = "3.27"
