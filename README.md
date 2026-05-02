@@ -85,6 +85,34 @@ croft setup-terminal --help
 | Type + Enter in create prompt | Create the file or folder; Esc cancels |
 | Terminal pane: any key | Forwarded to the shell PTY (arrows, Ctrl+letter, Alt+x, function keys all translated to the proper VT escape sequences) |
 
+## iTerm2 setup for macOS users
+
+Two iTerm2 toggles make croft feel native on macOS. Both are opt-in because they affect every terminal session, not just croft.
+
+### 1. Right-click reaches croft
+
+By default iTerm2 shows its own context menu (Copy / Open URL / etc.) on right-click and never forwards it to the running app, so croft's New File / New Folder menu would never trigger.
+
+iTerm2 → Settings (`⌘,`) → search **"right click"** → tick **"Right click reported to apps, does not open menu"**. After that, right-clicking inside croft's tree pane opens croft's menu. No iTerm2 restart needed.
+
+Terminal.app does not expose this toggle, so right-click is iTerm2-only.
+
+### 2. Cmd+S as save (and other Cmd shortcuts)
+
+`Ctrl+S` saves out of the box in any terminal. Getting `Cmd+S` to save in croft on macOS takes one extra step that no terminal app can fix on its own. macOS reserves the Cmd modifier for application menus; both Terminal.app and iTerm2 follow this rule. iTerm2 ≥3.5 supports the kitty keyboard protocol (croft negotiates `\x1b[>3u` on startup), but iTerm2 still does not deliver `Cmd+letter` over CSI u even with **Apps can change how keys are reported** and **Report keys using CSI u** both enabled. Verified empirically.
+
+The standard fix is a one-line key mapping that rewrites `Cmd+letter` to the byte `Ctrl+letter` already sends. Croft's existing tested `Ctrl+S` handler does the rest.
+
+iTerm2 → Settings → **Profiles** → Default → **Keys** tab → **Key Mappings** sub-tab → click **+** → "Click to Set" → press **⌘S** → Action: **Send Hex Code** → Code: `0x13` → OK.
+
+| iTerm2 keystroke to bind | Hex code | What croft does |
+|--------------------------|----------|-----------------|
+| `⌘S` | `0x13` | Save |
+| `⌘Q` | `0x11` | Quit |
+| `⌘B` | `0x02` | Toggle file tree |
+
+Other terminals (kitty, Ghostty, WezTerm, Alacritty) deliver Cmd over the kitty protocol natively; croft already negotiates it on startup, so `Cmd+S` works there with no remap.
+
 ## How the embedded terminal works
 
 `portable_pty::native_pty_system().openpty(...)` allocates a pseudoterminal and `spawn_command(...)` runs `$SHELL` on the slave side. A background thread drains the master fd into a `vt100::Parser`, which maintains the screen cell grid in memory. The render path walks `screen.cell(y, x)` for every cell in the pane and emits styled cells to the ratatui buffer with proper foreground / background / bold / italic / underline / reverse styles.
