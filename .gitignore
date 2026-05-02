@@ -11,3 +11,8 @@ wheels/
 
 # Local previews
 preview*.svg
+
+
+# Added by cargo
+
+/target

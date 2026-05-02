@@ -1,27 +1,28 @@
-# terminal-vscode
+# tcode
 
-A VS Code style three pane workspace that runs entirely inside your terminal.
+A VS Code style three pane workspace that runs entirely inside your terminal. Written in Rust for performance and ships as a single static binary.
 
-* **Left pane:** file explorer with VS Code style file type icons (Codicons / Devicons), click to open
-* **Top right pane:** code editor with syntax highlighting
-* **Bottom right pane:** a real interactive shell (your `$SHELL` running on a PTY)
+* **Left pane:** file explorer with VS Code style file type icons (Codicons / Devicons / Seti), `.gitignore` aware
+* **Top right pane:** code editor with `syntect` syntax highlighting (Sublime grammars, ~150 languages)
+* **Bottom right pane:** a real interactive shell, your `$SHELL` running on a real PTY
 
-Built on [Textual](https://textual.textualize.io/) and [pyte](https://github.com/selectel/pyte).
+Built on [ratatui](https://ratatui.rs/) + [crossterm](https://github.com/crossterm-rs/crossterm), with [portable-pty](https://docs.rs/portable-pty/) for the embedded shell, [vt100](https://docs.rs/vt100/) for terminal-state parsing, and [syntect](https://docs.rs/syntect/) for highlighting.
+
+> A previous Python prototype (Textual + pyte) lives on the `python-archive` branch. The Rust rewrite is the canonical implementation.
 
 ## Requirements
 
 | Requirement | Why |
 |-------------|-----|
-| macOS or Linux | Uses POSIX `pty.fork` for the embedded terminal. Windows is not supported. |
-| Python 3.12+ | Required by the project. |
-| [uv](https://docs.astral.sh/uv/) | Package manager and runner. |
-| A Nerd Font as your terminal font | The file explorer icons are Nerd Font glyphs (Codicons, Devicons, Seti UI). Without a Nerd Font, icons render as `[?]` boxes. The recipe below installs and configures one. |
+| macOS or Linux | The PTY layer uses POSIX `forkpty`. Windows is not yet supported. |
+| Rust 1.78+ stable | To compile the binary. |
+| A Nerd Font as your terminal font | The file explorer icons are Private Use Area glyphs (Codicons, Devicons, Seti). Without a Nerd Font, icons render as `[?]` boxes. |
 | A 256 color or truecolor terminal | macOS Terminal.app, iTerm2, Alacritty, kitty, WezTerm, Ghostty all qualify. |
 
-### Install uv
+### Install Rust
 
 ```bash
-curl -LsSf https://astral.sh/uv/install.sh | sh
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ```
 
 ### Install a Nerd Font (macOS)
@@ -30,102 +31,83 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 brew install --cask font-meslo-lg-nerd-font
 ```
 
-Then set Terminal.app's default profile to use it. The fastest way is the bundled command:
+Then set Terminal.app's default profile font to it. The fastest way is the bundled command (after building, see below):
 
 ```bash
-uv run tcode setup-terminal
+./target/release/tcode setup-terminal
 ```
 
-This sets the default profile font to `MesloLGSNerdFontMono-Regular` at 13pt via AppleScript. Existing custom profiles are not touched. Quit Terminal.app entirely (cmd+Q) and reopen it for the change to take effect.
+This sets the default profile font to PostScript name `MesloLGSNFM-Regular` at 13pt via AppleScript. Existing custom profiles are not modified. Quit Terminal.app entirely (cmd+Q) and reopen for the change to take effect.
 
 If you prefer to do it by hand: Terminal.app → Settings → Profiles → your default profile → Text → Font → Change → MesloLGS Nerd Font Mono Regular 13pt.
 
-**Why MesloLGS NF specifically:** macOS Terminal.app does not do CoreText style font fallback for Private Use Area glyphs the way iTerm2 does. The Nerd Font glyphs only render if the *primary* terminal font has them. MesloLGS NF is the most battle tested Nerd Font for Terminal.app and ships every Codicon, Devicon, and Seti glyph the explorer uses. Codepoint coverage is verified against `MesloLGSNerdFont-Regular.ttf` at build time.
+**Why MesloLGS NF specifically:** macOS Terminal.app does not perform CoreText style font fallback for Private Use Area glyphs the way iTerm2 does. The Nerd Font glyphs only render if the *primary* terminal font has them. MesloLGS NF ships every Codicon, Devicon, and Seti glyph the explorer uses.
 
-## Install the app
+> **PostScript name vs display name.** AppleScript needs the *PostScript* name, which is what's embedded in the .ttf, not what Terminal.app's font picker displays. The PostScript name for `MesloLGSNerdFontMono-Regular.ttf` is `MesloLGSNFM-Regular`. This was a real bug in the Python prototype: the wrong name silently no-ops in AppleScript and Terminal.app keeps the previous font, which is why the icons appeared broken even after running the setup command.
 
-```bash
-git clone <your fork or this repo> terminal-vscode
-cd terminal-vscode
-uv sync
-```
-
-That single `uv sync` reads `pyproject.toml`, creates a `.venv`, and installs every dependency (Textual, pyte, the tree sitter language packs for syntax highlighting, etc.).
-
-## Run the app
+## Build and install
 
 ```bash
-uv run tcode               # opens the current directory as the workspace
-uv run tcode ~/projects    # opens a specific folder
-uv run tcode --help        # show CLI options
+git clone <repo> tcode
+cd tcode
+cargo build --release
+# optional, install into ~/.cargo/bin
+cargo install --path .
 ```
 
-The first time you run it, you should see the file explorer on the left, an empty editor on the top right, and your shell prompt at the bottom right.
+## Run
+
+```bash
+tcode                # opens the current directory
+tcode ~/projects     # opens a specific folder
+tcode --help
+tcode setup-terminal --help
+```
 
 ## Keybindings
 
 | Keys | Action |
 |------|--------|
-| `enter` on a file in the tree | Open the file in the editor |
-| `ctrl+s` | Save the open file |
-| `ctrl+q` | Quit the app |
-| `f6` | Cycle focus across the three panes (tree, editor, terminal) |
-| `ctrl+b` | Toggle the file tree on or off |
-| Arrow keys, page up or down, etc. | Standard editor navigation when the editor is focused; forwarded to the shell when the terminal is focused |
-| `ctrl+letter` | When the terminal is focused, sent through to the shell as a control character (e.g. `ctrl+c` interrupts) |
+| `↑`/`↓` in tree | Move selection |
+| `Enter` or `→` on a file | Open in editor; on a folder: expand or collapse |
+| `←` on a folder | Collapse |
+| `Ctrl+s` | Save the open file |
+| `Ctrl+q` | Quit |
+| `F6` | Cycle focus across panes (tree → editor → terminal → tree) |
+| `Ctrl+b` | Toggle the file tree |
+| Editor: arrows, PageUp/PageDown, Home, End | Navigate (read-only for now) |
+| Terminal pane: any key | Forwarded to the shell PTY (arrows, Ctrl+letter, Alt+x, function keys all translated to the proper VT escape sequences) |
 
-## Supported file types for syntax highlighting
+## How the embedded terminal works
 
-Bash, CSS, Go, HTML, Java, JavaScript, JSON, Markdown, Python, regex, Rust, SQL, TOML, XML, YAML.
+`portable_pty::native_pty_system().openpty(...)` allocates a pseudoterminal and `spawn_command(...)` runs `$SHELL` on the slave side. A background thread drains the master fd into a `vt100::Parser`, which maintains the screen cell grid in memory. The render path walks `screen.cell(y, x)` for every cell in the pane and emits styled cells to the ratatui buffer with proper foreground / background / bold / italic / underline / reverse styles.
 
-Files in other languages still open and are editable; they just render in plain text.
+Resizes call `master.resize(...)` and `parser.set_size(...)` so programs like `htop`, `vim`, or your shell prompt redraw to fit the pane.
+
+Keystrokes from `crossterm`'s `Event::Key` are translated back to the byte sequences real terminals send (arrow keys to `\x1b[A` etc., `Ctrl+letter` to `0x01..0x1a`, `Alt+x` to `\x1b<x>`) and written to the master writer.
 
 ## Project layout
 
 ```
-src/terminal_vscode/
-├── app.py              # Textual app, three pane composition, key bindings
-├── cli.py              # typer entry point exposed as `tcode`
-├── constants.py        # IDs, file extension to language map, status messages
-├── icons.py            # Nerd Font glyphs and colors per file type
-├── styles.tcss         # Textual CSS for the three pane layout
+src/
+├── main.rs              entry point
+├── cli.rs               clap CLI: open path, setup-terminal subcommand
+├── app.rs               event loop, three-pane layout, key dispatch, status bar
+├── icons.rs             Codicon / Devicon / Seti glyphs and per-language colors
 └── widgets/
-    ├── editor.py       # TextArea subclass with file load and save
-    ├── file_tree.py    # DirectoryTree subclass that renders icons
-    └── terminal.py     # Custom widget: pty.fork, pyte screen, key forwarding
+    ├── mod.rs
+    ├── file_tree.rs     ignore::WalkBuilder backed tree, lazy children
+    ├── editor.rs        syntect-highlighted read-only viewport (write path coming)
+    └── terminal.rs      portable-pty + vt100 + ratatui integration
 ```
 
-## How the embedded terminal works
+## Status
 
-The terminal pane is not a fake or read only log. On mount it calls `pty.fork()`, which spawns your shell in a child process whose stdin, stdout, and stderr are wired to a pseudoterminal. The parent side keeps the master file descriptor.
-
-* Reads from the master fd are registered with asyncio via `add_reader`. Whenever the shell produces output, the bytes are fed to a `pyte.ByteStream`, which updates a `pyte.Screen` in memory.
-* The widget's `render` method walks that screen, builds a Rich `Text` with the right foreground, background, bold, italic, underline, and reverse styles per cell, and Textual paints it.
-* Key events from Textual are translated back to the byte sequences that real terminals send (arrow keys to `\x1b[A` etc., control letters to their `\x01` to `\x1a` codes, alt prefixed keys to `\x1b<char>`) and written to the master fd.
-* Resizes call `ioctl(fd, TIOCSWINSZ, ...)` so programs like `htop`, `vim`, or your shell prompt can react to the new size.
-
-The result is that anything you can do in a normal terminal works here too: run `vim`, `htop`, `ssh`, interactive Python, `git`, etc.
-
-## Troubleshooting
-
-**Icons in the file explorer are boxes (`[?]`) instead of file type glyphs.**
-Terminal.app is not using a Nerd Font as its primary font. Run `uv run tcode setup-terminal`, then fully quit Terminal.app (cmd+Q) and reopen. Terminal.app does not fall back to other installed fonts for Private Use Area glyphs, so the primary font itself must contain them.
-
-**Colors look wrong in the editor or terminal.**
-Make sure your terminal is set to truecolor or 256 colors. In iTerm2: Profiles, Terminal, Report Terminal Type set to `xterm-256color`. The embedded shell exports `TERM=xterm-256color` and `COLORTERM=truecolor` automatically.
-
-**The shell prompt looks weird in the bottom pane.**
-Your shell prompt may rely on glyphs that need a Nerd Font. Same fix as above.
-
-**It does not run on Windows.**
-Correct. The PTY layer relies on POSIX. Use WSL2 if you are on Windows.
-
-**`uv: command not found`.**
-Install uv first. See Requirements above.
+This is the first cut of the Rust rewrite. What works: three-pane layout, file tree expansion / collapse, file open into the editor with syntax highlighting, embedded shell with full ANSI color and key forwarding, `setup-terminal` AppleScript helper. What does not work yet: editor write path (insertion / deletion / save round trip), command palette, multi-tab editor, search, settings.
 
 ## Limitations
 
-This is a minimal three pane shell, not a full IDE. There is no LSP, no debugger, no plugin system, no command palette, no multi tab editor, no git integration. If you want any of those, use VS Code, Neovim, or Emacs. This project's goal is to demonstrate that the three pane experience can fit into a single TUI process and to serve as a small embeddable building block for larger Textual apps.
+This is not an IDE. There is no LSP, no debugger, no plugin system. If you want those, use VS Code, Neovim, or Helix. This project's goal is the three-pane experience as a single fast binary and a building block for embeddable Rust TUI products.
 
 ## License
 

@@ -1,0 +1,30 @@
+[package]
+name = "tcode"
+version = "0.1.0"
+edition = "2021"
+description = "Terminal-based VS Code replica: file tree, editor, embedded shell"
+license = "MIT"
+
+[[bin]]
+name = "tcode"
+path = "src/main.rs"
+
+[dependencies]
+ratatui = "0.29"
+crossterm = { version = "0.28", features = ["event-stream"] }
+portable-pty = "0.8"
+vt100 = "0.15"
+syntect = { version = "5", default-features = false, features = ["default-fancy"] }
+ignore = "0.4"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "io-util", "time"] }
+futures = "0.3"
+tui-input = "0.10"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
