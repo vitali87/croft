@@ -204,6 +204,17 @@ impl App {
             KeyCode::PageDown => self.editor.page_down(page),
             KeyCode::Home => self.editor.home_line(),
             KeyCode::End => self.editor.end_line(),
+            KeyCode::Backspace => self.editor.backspace(),
+            KeyCode::Delete => self.editor.delete_forward(),
+            KeyCode::Enter => self.editor.insert_newline(),
+            KeyCode::Tab => self.editor.insert_str("    "),
+            KeyCode::Char(c) => {
+                if !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT)
+                {
+                    self.editor.insert_char(c);
+                }
+            }
             _ => {}
         }
     }
@@ -279,14 +290,9 @@ impl App {
     }
 
     fn save(&mut self) {
-        if let Some(path) = self.editor.path.clone() {
-            let content = self.editor.lines.join("\n");
-            match std::fs::write(&path, content) {
-                Ok(()) => self.status = format!("Saved {}", path.display()),
-                Err(e) => self.status = format!("Save failed: {e}"),
-            }
-        } else {
-            self.status = String::from("No file to save");
+        match self.editor.save_to_disk() {
+            Ok(()) => self.status = self.editor.status.clone(),
+            Err(e) => self.status = format!("Save failed: {e}"),
         }
     }
 }

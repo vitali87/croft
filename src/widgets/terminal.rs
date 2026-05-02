@@ -89,7 +89,7 @@ impl PtyTerminal {
             pixel_height: 0,
         });
         if let Ok(mut p) = self.parser.lock() {
-            p.set_size(rows, cols);
+            p.screen_mut().set_size(rows, cols);
         }
     }
 }
@@ -137,29 +137,54 @@ impl Widget for &mut PtyTerminal {
         let (cur_row, cur_col) = screen.cursor_position();
         let cursor_visible = !screen.hide_cursor() && self.focused;
 
-        let default_cell = vt100::Cell::default();
         for y in 0..rows {
             for x in 0..cols {
-                let cell = screen.cell(y, x).unwrap_or(&default_cell);
-                let ch = cell.contents();
-                let display: &str = if ch.is_empty() { " " } else { &ch };
+                let cell_opt = screen.cell(y, x);
+                let (display, fg, bg, bold, italic, underline, inverse) = match cell_opt {
+                    Some(cell) => {
+                        let s = cell.contents();
+                        let owned = if s.is_empty() {
+                            String::from(" ")
+                        } else {
+                            s.to_string()
+                        };
+                        (
+                            owned,
+                            cell.fgcolor(),
+                            cell.bgcolor(),
+                            cell.bold(),
+                            cell.italic(),
+                            cell.underline(),
+                            cell.inverse(),
+                        )
+                    }
+                    None => (
+                        String::from(" "),
+                        vt100::Color::Default,
+                        vt100::Color::Default,
+                        false,
+                        false,
+                        false,
+                        false,
+                    ),
+                };
                 let mut style = Style::default();
-                if let Some(fg) = vt_color(cell.fgcolor()) {
-                    style = style.fg(fg);
+                if let Some(c) = vt_color(fg) {
+                    style = style.fg(c);
                 }
-                if let Some(bg) = vt_color(cell.bgcolor()) {
-                    style = style.bg(bg);
+                if let Some(c) = vt_color(bg) {
+                    style = style.bg(c);
                 }
-                if cell.bold() {
+                if bold {
                     style = style.add_modifier(Modifier::BOLD);
                 }
-                if cell.italic() {
+                if italic {
                     style = style.add_modifier(Modifier::ITALIC);
                 }
-                if cell.underline() {
+                if underline {
                     style = style.add_modifier(Modifier::UNDERLINED);
                 }
-                if cell.inverse() {
+                if inverse {
                     style = style.add_modifier(Modifier::REVERSED);
                 }
                 if cursor_visible && y == cur_row && x == cur_col {
@@ -168,7 +193,7 @@ impl Widget for &mut PtyTerminal {
                 let target_x = inner.x + x;
                 let target_y = inner.y + y;
                 let target = &mut buf[(target_x, target_y)];
-                target.set_symbol(display);
+                target.set_symbol(&display);
                 target.set_style(style);
             }
         }

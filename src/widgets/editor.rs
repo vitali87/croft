@@ -7,9 +7,10 @@ use ratatui::{
     widgets::{Block, Borders, Widget},
 };
 use std::path::{Path, PathBuf};
-use syntect::easy::HighlightLines;
-use syntect::highlighting::{FontStyle, Style as SynStyle, ThemeSet};
-use syntect::parsing::SyntaxSet;
+
+use crate::highlight::{
+    compute_line_starts, highlight_text, lang_for_extension, HiSpan, LangKind, LangRegistry,
+};
 
 const MAX_FILE_BYTES: u64 = 5 * 1024 * 1024;
 
@@ -17,16 +18,18 @@ pub struct Editor {
     pub path: Option<PathBuf>,
     pub lines: Vec<String>,
     pub scroll: usize,
+    /// Cursor column as a CHARACTER index (not bytes), for the current line.
     pub cursor_row: usize,
     pub cursor_col: usize,
     pub focused: bool,
+    pub dirty: bool,
     pub status: String,
     pub last_area: Rect,
     pub last_inner: Rect,
     pub last_gutter_width: u16,
-    syntax_set: SyntaxSet,
-    theme_set: ThemeSet,
-    pub theme_name: String,
+    lang: Option<LangKind>,
+    highlights: Vec<Vec<HiSpan>>,
+    registry: LangRegistry,
 }
 
 impl Editor {
@@ -38,45 +41,15 @@ impl Editor {
             cursor_row: 0,
             cursor_col: 0,
             focused: false,
+            dirty: false,
             status: String::from("No file open"),
             last_area: Rect::default(),
             last_inner: Rect::default(),
             last_gutter_width: 0,
-            syntax_set: SyntaxSet::load_defaults_newlines(),
-            theme_set: ThemeSet::load_defaults(),
-            theme_name: String::from("base16-ocean.dark"),
+            lang: None,
+            highlights: Vec::new(),
+            registry: LangRegistry::new(),
         }
-    }
-
-    pub fn scroll_up(&mut self, n: usize) {
-        self.cursor_row = self.cursor_row.saturating_sub(n);
-        self.cursor_col = self.cursor_col.min(self.lines.get(self.cursor_row).map(|s| s.len()).unwrap_or(0));
-    }
-
-    pub fn scroll_down(&mut self, n: usize) {
-        self.cursor_row = (self.cursor_row + n).min(self.lines.len().saturating_sub(1));
-        self.cursor_col = self.cursor_col.min(self.lines.get(self.cursor_row).map(|s| s.len()).unwrap_or(0));
-    }
-
-    /// Move the cursor to the screen coordinates (col, row). Used for mouse clicks.
-    /// Coordinates are absolute terminal coordinates.
-    pub fn click(&mut self, col: u16, row: u16) {
-        if self.lines.is_empty() || self.last_inner.height == 0 {
-            return;
-        }
-        if row < self.last_inner.y || row >= self.last_inner.y + self.last_inner.height {
-            return;
-        }
-        let row_idx = (row - self.last_inner.y) as usize;
-        let target_line = (self.scroll + row_idx).min(self.lines.len().saturating_sub(1));
-        let text_x = self.last_inner.x + self.last_gutter_width + 1;
-        let target_col = if col < text_x {
-            0
-        } else {
-            (col - text_x) as usize
-        };
-        self.cursor_row = target_line;
-        self.cursor_col = target_col.min(self.lines[target_line].len());
     }
 
     pub fn open(&mut self, path: &Path) -> Result<()> {
@@ -94,24 +67,142 @@ impl Editor {
             self.lines.push(String::new());
         }
         self.path = Some(path.to_path_buf());
+        self.lang = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .and_then(lang_for_extension);
         self.scroll = 0;
         self.cursor_row = 0;
         self.cursor_col = 0;
+        self.dirty = false;
         self.status = format!("Opened {}", path.display());
+        self.recompute_highlights();
+        Ok(())
+    }
+
+    fn recompute_highlights(&mut self) {
+        match self.lang {
+            Some(kind) => {
+                let text = self.lines.join("\n");
+                let bytes = text.as_bytes();
+                let line_starts = compute_line_starts(bytes);
+                self.highlights = highlight_text(&mut self.registry, kind, bytes, &line_starts);
+            }
+            None => {
+                self.highlights = vec![Vec::new(); self.lines.len()];
+            }
+        }
+    }
+
+    fn line_char_len(&self, row: usize) -> usize {
+        self.lines.get(row).map(|s| s.chars().count()).unwrap_or(0)
+    }
+
+    fn byte_index(&self, row: usize, col: usize) -> usize {
+        let line = &self.lines[row];
+        line.char_indices()
+            .nth(col)
+            .map(|(i, _)| i)
+            .unwrap_or(line.len())
+    }
+
+    pub fn insert_char(&mut self, c: char) {
+        if self.lines.is_empty() {
+            self.lines.push(String::new());
+        }
+        let row = self.cursor_row;
+        let col = self.cursor_col;
+        let byte = self.byte_index(row, col);
+        self.lines[row].insert(byte, c);
+        self.cursor_col += 1;
+        self.dirty = true;
+        self.recompute_highlights();
+    }
+
+    pub fn insert_str(&mut self, s: &str) {
+        for c in s.chars() {
+            if c == '\n' {
+                self.insert_newline();
+            } else {
+                self.insert_char(c);
+            }
+        }
+    }
+
+    pub fn insert_newline(&mut self) {
+        if self.lines.is_empty() {
+            self.lines.push(String::new());
+        }
+        let row = self.cursor_row;
+        let col = self.cursor_col;
+        let byte = self.byte_index(row, col);
+        let right = self.lines[row].split_off(byte);
+        self.lines.insert(row + 1, right);
+        self.cursor_row += 1;
+        self.cursor_col = 0;
+        self.dirty = true;
+        self.recompute_highlights();
+    }
+
+    pub fn backspace(&mut self) {
+        if self.cursor_col > 0 {
+            let row = self.cursor_row;
+            let col = self.cursor_col - 1;
+            let from = self.byte_index(row, col);
+            let to = self.byte_index(row, col + 1);
+            self.lines[row].replace_range(from..to, "");
+            self.cursor_col -= 1;
+            self.dirty = true;
+        } else if self.cursor_row > 0 {
+            let cur = self.lines.remove(self.cursor_row);
+            self.cursor_row -= 1;
+            self.cursor_col = self.line_char_len(self.cursor_row);
+            self.lines[self.cursor_row].push_str(&cur);
+            self.dirty = true;
+        }
+        self.recompute_highlights();
+    }
+
+    pub fn delete_forward(&mut self) {
+        let row = self.cursor_row;
+        let len = self.line_char_len(row);
+        if self.cursor_col < len {
+            let from = self.byte_index(row, self.cursor_col);
+            let to = self.byte_index(row, self.cursor_col + 1);
+            self.lines[row].replace_range(from..to, "");
+            self.dirty = true;
+        } else if row + 1 < self.lines.len() {
+            let next = self.lines.remove(row + 1);
+            self.lines[row].push_str(&next);
+            self.dirty = true;
+        }
+        self.recompute_highlights();
+    }
+
+    pub fn save_to_disk(&mut self) -> Result<()> {
+        let path = self
+            .path
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("No file open"))?
+            .clone();
+        let content = self.lines.join("\n");
+        std::fs::write(&path, content)?;
+        self.dirty = false;
+        self.status = format!("Saved {}", path.display());
         Ok(())
     }
 
     pub fn move_up(&mut self) {
         if self.cursor_row > 0 {
             self.cursor_row -= 1;
-            self.cursor_col = self.cursor_col.min(self.lines[self.cursor_row].len());
+            self.cursor_col = self.cursor_col.min(self.line_char_len(self.cursor_row));
         }
     }
 
     pub fn move_down(&mut self) {
         if self.cursor_row + 1 < self.lines.len() {
             self.cursor_row += 1;
-            self.cursor_col = self.cursor_col.min(self.lines[self.cursor_row].len());
+            self.cursor_col = self.cursor_col.min(self.line_char_len(self.cursor_row));
         }
     }
 
@@ -120,12 +211,12 @@ impl Editor {
             self.cursor_col -= 1;
         } else if self.cursor_row > 0 {
             self.cursor_row -= 1;
-            self.cursor_col = self.lines[self.cursor_row].len();
+            self.cursor_col = self.line_char_len(self.cursor_row);
         }
     }
 
     pub fn move_right(&mut self) {
-        if self.cursor_col < self.lines[self.cursor_row].len() {
+        if self.cursor_col < self.line_char_len(self.cursor_row) {
             self.cursor_col += 1;
         } else if self.cursor_row + 1 < self.lines.len() {
             self.cursor_row += 1;
@@ -135,12 +226,12 @@ impl Editor {
 
     pub fn page_up(&mut self, page: usize) {
         self.cursor_row = self.cursor_row.saturating_sub(page);
-        self.cursor_col = self.cursor_col.min(self.lines[self.cursor_row].len());
+        self.cursor_col = self.cursor_col.min(self.line_char_len(self.cursor_row));
     }
 
     pub fn page_down(&mut self, page: usize) {
         self.cursor_row = (self.cursor_row + page).min(self.lines.len().saturating_sub(1));
-        self.cursor_col = self.cursor_col.min(self.lines[self.cursor_row].len());
+        self.cursor_col = self.cursor_col.min(self.line_char_len(self.cursor_row));
     }
 
     pub fn home_line(&mut self) {
@@ -148,13 +239,37 @@ impl Editor {
     }
 
     pub fn end_line(&mut self) {
-        self.cursor_col = self.lines[self.cursor_row].len();
+        self.cursor_col = self.line_char_len(self.cursor_row);
     }
 
-    fn syntax_for_path(&self) -> Option<&syntect::parsing::SyntaxReference> {
-        let path = self.path.as_ref()?;
-        let ext = path.extension()?.to_str()?;
-        self.syntax_set.find_syntax_by_extension(ext)
+    pub fn scroll_up(&mut self, n: usize) {
+        self.cursor_row = self.cursor_row.saturating_sub(n);
+        self.cursor_col = self.cursor_col.min(self.line_char_len(self.cursor_row));
+    }
+
+    pub fn scroll_down(&mut self, n: usize) {
+        self.cursor_row = (self.cursor_row + n).min(self.lines.len().saturating_sub(1));
+        self.cursor_col = self.cursor_col.min(self.line_char_len(self.cursor_row));
+    }
+
+    /// Move the cursor to the screen coordinates (col, row). Used for mouse clicks.
+    pub fn click(&mut self, col: u16, row: u16) {
+        if self.lines.is_empty() || self.last_inner.height == 0 {
+            return;
+        }
+        if row < self.last_inner.y || row >= self.last_inner.y + self.last_inner.height {
+            return;
+        }
+        let row_idx = (row - self.last_inner.y) as usize;
+        let target_line = (self.scroll + row_idx).min(self.lines.len().saturating_sub(1));
+        let text_x = self.last_inner.x + self.last_gutter_width + 1;
+        let target_col = if col < text_x {
+            0
+        } else {
+            (col - text_x) as usize
+        };
+        self.cursor_row = target_line;
+        self.cursor_col = target_col.min(self.line_char_len(target_line));
     }
 }
 
@@ -173,19 +288,31 @@ fn is_binary(data: &[u8]) -> bool {
     (nontext as f32 / sample.len() as f32) > 0.30
 }
 
-fn syn_to_ratatui(s: SynStyle) -> Style {
-    let fg = Color::Rgb(s.foreground.r, s.foreground.g, s.foreground.b);
-    let mut style = Style::default().fg(fg);
-    if s.font_style.contains(FontStyle::BOLD) {
-        style = style.add_modifier(Modifier::BOLD);
+/// Build a Vec<Span> from a line and its byte-range highlight spans.
+fn build_line_spans<'a>(line: &'a str, spans: &[HiSpan]) -> Vec<Span<'a>> {
+    if spans.is_empty() {
+        return vec![Span::raw(line)];
     }
-    if s.font_style.contains(FontStyle::ITALIC) {
-        style = style.add_modifier(Modifier::ITALIC);
+    let mut out: Vec<Span> = Vec::with_capacity(spans.len() * 2);
+    let mut cursor = 0usize;
+    for sp in spans {
+        if sp.start > cursor && sp.start <= line.len() {
+            let slice = &line[cursor..sp.start];
+            if !slice.is_empty() {
+                out.push(Span::raw(slice));
+            }
+        }
+        let s = sp.start.min(line.len());
+        let e = sp.end.min(line.len());
+        if e > s {
+            out.push(Span::styled(&line[s..e], sp.style));
+            cursor = e;
+        }
     }
-    if s.font_style.contains(FontStyle::UNDERLINE) {
-        style = style.add_modifier(Modifier::UNDERLINED);
+    if cursor < line.len() {
+        out.push(Span::raw(&line[cursor..]));
     }
-    style
+    out
 }
 
 impl Widget for &mut Editor {
@@ -196,10 +323,14 @@ impl Widget for &mut Editor {
             Style::default().fg(Color::DarkGray)
         };
         let title = match &self.path {
-            Some(p) => format!(
-                " {} ",
-                p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
-            ),
+            Some(p) => {
+                let mark = if self.dirty { "● " } else { "" };
+                format!(
+                    " {}{} ",
+                    mark,
+                    p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+                )
+            }
             None => String::from(" EDITOR "),
         };
         let block = Block::default()
@@ -229,10 +360,6 @@ impl Widget for &mut Editor {
         let text_x = inner.x + gutter_width + 1;
         let text_width = inner.width.saturating_sub(gutter_width + 2);
 
-        let theme = &self.theme_set.themes[&self.theme_name];
-        let syntax = self.syntax_for_path();
-        let mut highlighter = syntax.map(|s| HighlightLines::new(s, theme));
-
         let end = (self.scroll + height).min(self.lines.len());
         for (row_idx, line_idx) in (self.scroll..end).enumerate() {
             let y = inner.y + row_idx as u16;
@@ -241,24 +368,9 @@ impl Widget for &mut Editor {
             buf.set_line(inner.x, y, &gutter, gutter_width);
 
             let raw = &self.lines[line_idx];
-            let mut line_with_nl = raw.clone();
-            line_with_nl.push('\n');
-
-            let spans: Vec<Span> = if let Some(h) = highlighter.as_mut() {
-                match h.highlight_line(&line_with_nl, &self.syntax_set) {
-                    Ok(ranges) => ranges
-                        .into_iter()
-                        .map(|(s, t)| {
-                            let txt = t.trim_end_matches('\n').to_string();
-                            Span::styled(txt, syn_to_ratatui(s))
-                        })
-                        .collect(),
-                    Err(_) => vec![Span::raw(raw.clone())],
-                }
-            } else {
-                vec![Span::raw(raw.clone())]
-            };
-
+            let empty: Vec<HiSpan> = Vec::new();
+            let line_spans = self.highlights.get(line_idx).unwrap_or(&empty);
+            let spans = build_line_spans(raw, line_spans);
             let line = Line::from(spans);
             buf.set_line(text_x, y, &line, text_width);
 

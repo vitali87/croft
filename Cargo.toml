@@ -9,19 +9,36 @@ license = "MIT"
 name = "tcode"
 path = "src/main.rs"
 
+# Versions verified against crates.io max_stable_version on 2026-05-02.
 [dependencies]
-ratatui = "0.29"
-crossterm = { version = "0.28", features = ["event-stream"] }
-portable-pty = "0.8"
-vt100 = "0.15"
-syntect = { version = "5", default-features = false, features = ["default-fancy"] }
+ratatui = "0.30"
+crossterm = { version = "0.29", features = ["event-stream"] }
+portable-pty = "0.9"
+vt100 = "0.16"
+
+# Tree-sitter core + per-language grammars.  Direct deps, no dynamic loading.
+tree-sitter = "0.26"
+tree-sitter-highlight = "0.26"
+tree-sitter-rust = "0.24"
+tree-sitter-python = "0.25"
+tree-sitter-javascript = "0.25"
+tree-sitter-typescript = "0.23"
+tree-sitter-json = "0.24"
+tree-sitter-toml-ng = "0.7"
+tree-sitter-yaml = "0.7"
+tree-sitter-md = "0.5"
+tree-sitter-go = "0.25"
+tree-sitter-html = "0.23"
+tree-sitter-css = "0.25"
+tree-sitter-bash = "0.25"
+
 ignore = "0.4"
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "io-util", "time"] }
 futures = "0.3"
-tui-input = "0.10"
+tui-input = "0.15"
 
 [profile.release]
 opt-level = 3
