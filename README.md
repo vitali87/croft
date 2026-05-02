@@ -1,12 +1,12 @@
-# tcode
+# croft
 
 A VS Code style three pane workspace that runs entirely inside your terminal. Written in Rust for performance and ships as a single static binary.
 
 * **Left pane:** file explorer with VS Code style file type icons (Codicons / Devicons / Seti), `.gitignore` aware
-* **Top right pane:** code editor with `syntect` syntax highlighting (Sublime grammars, ~150 languages)
+* **Top right pane:** code editor with `tree-sitter` syntax highlighting and edit / save
 * **Bottom right pane:** a real interactive shell, your `$SHELL` running on a real PTY
 
-Built on [ratatui](https://ratatui.rs/) + [crossterm](https://github.com/crossterm-rs/crossterm), with [portable-pty](https://docs.rs/portable-pty/) for the embedded shell, [vt100](https://docs.rs/vt100/) for terminal-state parsing, and [syntect](https://docs.rs/syntect/) for highlighting.
+Built on [ratatui](https://ratatui.rs/) + [crossterm](https://github.com/crossterm-rs/crossterm), with [portable-pty](https://docs.rs/portable-pty/) for the embedded shell, [vt100](https://docs.rs/vt100/) for terminal-state parsing, and [tree-sitter](https://tree-sitter.github.io/tree-sitter/) for incremental, AST-based syntax highlighting.
 
 > A previous Python prototype (Textual + pyte) lives on the `python-archive` branch. The Rust rewrite is the canonical implementation.
 
@@ -34,7 +34,7 @@ brew install --cask font-meslo-lg-nerd-font
 Then set Terminal.app's default profile font to it. The fastest way is the bundled command (after building, see below):
 
 ```bash
-./target/release/tcode setup-terminal
+./target/release/croft setup-terminal
 ```
 
 This sets the default profile font to PostScript name `MesloLGSNFM-Regular` at 13pt via AppleScript. Existing custom profiles are not modified. Quit Terminal.app entirely (cmd+Q) and reopen for the change to take effect.
@@ -48,8 +48,8 @@ If you prefer to do it by hand: Terminal.app → Settings → Profiles → your 
 ## Build and install
 
 ```bash
-git clone <repo> tcode
-cd tcode
+git clone <repo> croft
+cd croft
 cargo build --release
 # optional, install into ~/.cargo/bin
 cargo install --path .
@@ -58,10 +58,10 @@ cargo install --path .
 ## Run
 
 ```bash
-tcode                # opens the current directory
-tcode ~/projects     # opens a specific folder
-tcode --help
-tcode setup-terminal --help
+croft                # opens the current directory
+croft ~/projects     # opens a specific folder
+croft --help
+croft setup-terminal --help
 ```
 
 ## Keybindings
@@ -75,7 +75,10 @@ tcode setup-terminal --help
 | `Ctrl+q` | Quit |
 | `F6` | Cycle focus across panes (tree → editor → terminal → tree) |
 | `Ctrl+b` | Toggle the file tree |
-| Editor: arrows, PageUp/PageDown, Home, End | Navigate (read-only for now) |
+| Editor: arrows, PageUp/PageDown, Home, End | Navigate |
+| Editor: any printable char, Enter, Backspace, Delete, Tab | Edit |
+| Mouse click in any pane | Focus and (in tree) select / open, (in editor) move cursor |
+| Mouse wheel | Scroll the pane under the pointer |
 | Terminal pane: any key | Forwarded to the shell PTY (arrows, Ctrl+letter, Alt+x, function keys all translated to the proper VT escape sequences) |
 
 ## How the embedded terminal works
@@ -99,11 +102,13 @@ src/
     ├── file_tree.rs     ignore::WalkBuilder backed tree, lazy children
     ├── editor.rs        syntect-highlighted read-only viewport (write path coming)
     └── terminal.rs      portable-pty + vt100 + ratatui integration
+src/highlight.rs        tree-sitter highlight registry per language
+tests/cli.rs            integration tests for the CLI surface
 ```
 
 ## Status
 
-This is the first cut of the Rust rewrite. What works: three-pane layout, file tree expansion / collapse, file open into the editor with syntax highlighting, embedded shell with full ANSI color and key forwarding, `setup-terminal` AppleScript helper. What does not work yet: editor write path (insertion / deletion / save round trip), command palette, multi-tab editor, search, settings.
+What works: three-pane layout, file tree expansion / collapse, mouse and keyboard, file open with tree-sitter highlighting (Rust, Python, JS, TS, TSX, JSON, TOML, YAML, Markdown, Go, HTML, CSS, Bash), full editor write path (insert / delete / Enter / Tab / Backspace / save round-trip with `●` dirty marker), embedded shell with full ANSI color and key forwarding, `setup-terminal` AppleScript helper. The repo ships 80 tests; run with `cargo test`. What does not work yet: command palette, multi-tab editor, search, settings, LSP.
 
 ## Limitations
 

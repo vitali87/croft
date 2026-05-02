@@ -1,12 +1,14 @@
 [package]
-name = "tcode"
+name = "croft"
 version = "0.1.0"
 edition = "2021"
 description = "Terminal-based VS Code replica: file tree, editor, embedded shell"
 license = "MIT"
+repository = "https://bitbucket.org/<workspace>/croft"
+homepage = "https://croft.sh"
 
 [[bin]]
-name = "tcode"
+name = "croft"
 path = "src/main.rs"
 
 # Versions verified against crates.io max_stable_version on 2026-05-02.

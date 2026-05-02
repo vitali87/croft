@@ -7,7 +7,7 @@ const SETUP_FONT_PS_NAME: &str = "MesloLGSNFM-Regular";
 const SETUP_FONT_SIZE: u32 = 13;
 
 #[derive(Parser, Debug)]
-#[command(name = "tcode", version, about = "Terminal-based VS Code replica")]
+#[command(name = "croft", version, about = "Terminal-based VS Code replica")]
 pub struct Cli {
     /// Workspace folder to open (defaults to current directory)
     #[arg(value_name = "PATH")]
@@ -60,21 +60,21 @@ mod tests {
 
     #[test]
     fn parses_no_args() {
-        let cli = Cli::parse_from(["tcode"]);
+        let cli = Cli::parse_from(["croft"]);
         assert!(cli.path.is_none());
         assert!(cli.command.is_none());
     }
 
     #[test]
     fn parses_path_argument() {
-        let cli = Cli::parse_from(["tcode", "/tmp"]);
+        let cli = Cli::parse_from(["croft", "/tmp"]);
         assert_eq!(cli.path, Some(PathBuf::from("/tmp")));
         assert!(cli.command.is_none());
     }
 
     #[test]
     fn parses_setup_terminal_subcommand_with_defaults() {
-        let cli = Cli::parse_from(["tcode", "setup-terminal"]);
+        let cli = Cli::parse_from(["croft", "setup-terminal"]);
         assert!(cli.path.is_none());
         match cli.command {
             Some(CliCommand::SetupTerminal { font, size, yes }) => {
@@ -89,7 +89,7 @@ mod tests {
     #[test]
     fn parses_setup_terminal_with_overrides() {
         let cli = Cli::parse_from([
-            "tcode",
+            "croft",
             "setup-terminal",
             "--font",
             "FiraCodeNFM-Regular",
@@ -109,7 +109,7 @@ mod tests {
 
     #[test]
     fn parses_setup_terminal_with_short_yes() {
-        let cli = Cli::parse_from(["tcode", "setup-terminal", "-y"]);
+        let cli = Cli::parse_from(["croft", "setup-terminal", "-y"]);
         match cli.command {
             Some(CliCommand::SetupTerminal { yes, .. }) => assert!(yes),
             _ => panic!("expected SetupTerminal"),

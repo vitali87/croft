@@ -296,6 +296,40 @@ dependencies = [
 ]
 
 [[package]]
+name = "croft"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "assert_cmd",
+ "clap",
+ "crossterm",
+ "futures",
+ "ignore",
+ "portable-pty",
+ "pretty_assertions",
+ "ratatui",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tree-sitter",
+ "tree-sitter-bash",
+ "tree-sitter-css",
+ "tree-sitter-go",
+ "tree-sitter-highlight",
+ "tree-sitter-html",
+ "tree-sitter-javascript",
+ "tree-sitter-json",
+ "tree-sitter-md",
+ "tree-sitter-python",
+ "tree-sitter-rust",
+ "tree-sitter-toml-ng",
+ "tree-sitter-typescript",
+ "tree-sitter-yaml",
+ "tui-input",
+ "vt100",
+]
+
+[[package]]
 name = "crossbeam-deque"
 version = "0.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1682,40 +1716,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "unicode-ident",
-]
-
-[[package]]
-name = "tcode"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "assert_cmd",
- "clap",
- "crossterm",
- "futures",
- "ignore",
- "portable-pty",
- "pretty_assertions",
- "ratatui",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tree-sitter",
- "tree-sitter-bash",
- "tree-sitter-css",
- "tree-sitter-go",
- "tree-sitter-highlight",
- "tree-sitter-html",
- "tree-sitter-javascript",
- "tree-sitter-json",
- "tree-sitter-md",
- "tree-sitter-python",
- "tree-sitter-rust",
- "tree-sitter-toml-ng",
- "tree-sitter-typescript",
- "tree-sitter-yaml",
- "tui-input",
- "vt100",
 ]
 
 [[package]]
