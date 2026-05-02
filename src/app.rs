@@ -137,13 +137,13 @@ impl App {
             return Ok(());
         }
         // App-wide shortcuts (priority).
+        if is_save_key(key) {
+            self.save();
+            return Ok(());
+        }
         match (key.code, key.modifiers) {
             (KeyCode::Char('q'), KeyModifiers::CONTROL) => {
                 self.quit = true;
-                return Ok(());
-            }
-            (KeyCode::Char('s'), KeyModifiers::CONTROL) => {
-                self.save();
                 return Ok(());
             }
             (KeyCode::Char('b'), KeyModifiers::CONTROL) => {
@@ -297,6 +297,19 @@ impl App {
     }
 }
 
+/// Returns true if the given key event should trigger "Save".
+/// Recognises Ctrl+S (cross-platform) and Cmd/Super+S (macOS-style).
+/// Case-insensitive on the letter so Shift+Ctrl+S also works.
+fn is_save_key(key: KeyEvent) -> bool {
+    let KeyCode::Char(c) = key.code else {
+        return false;
+    };
+    if !c.eq_ignore_ascii_case(&'s') {
+        return false;
+    }
+    key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::SUPER)
+}
+
 fn rect_contains(r: Rect, x: u16, y: u16) -> bool {
     r.width > 0
         && r.height > 0
@@ -442,6 +455,38 @@ mod tests {
     #[test]
     fn key_to_bytes_unknown_returns_empty() {
         assert!(key_to_bytes(key(KeyCode::CapsLock, KeyModifiers::NONE)).is_empty());
+    }
+
+    #[test]
+    fn ctrl_s_is_save_key() {
+        assert!(is_save_key(key(KeyCode::Char('s'), KeyModifiers::CONTROL)));
+    }
+
+    #[test]
+    fn cmd_s_is_save_key() {
+        assert!(is_save_key(key(KeyCode::Char('s'), KeyModifiers::SUPER)));
+    }
+
+    #[test]
+    fn shift_ctrl_s_is_save_key() {
+        // Some terminals report capital S with Ctrl pressed.
+        let mods = KeyModifiers::CONTROL | KeyModifiers::SHIFT;
+        assert!(is_save_key(key(KeyCode::Char('S'), mods)));
+    }
+
+    #[test]
+    fn plain_s_is_not_save_key() {
+        assert!(!is_save_key(key(KeyCode::Char('s'), KeyModifiers::NONE)));
+    }
+
+    #[test]
+    fn ctrl_q_is_not_save_key() {
+        assert!(!is_save_key(key(KeyCode::Char('q'), KeyModifiers::CONTROL)));
+    }
+
+    #[test]
+    fn alt_s_is_not_save_key() {
+        assert!(!is_save_key(key(KeyCode::Char('s'), KeyModifiers::ALT)));
     }
 }
 
