@@ -2,7 +2,8 @@ use anyhow::{Context, Result};
 use crossterm::{
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-        KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+        KeyModifiers, KeyboardEnhancementFlags, MouseButton, MouseEvent, MouseEventKind,
+        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -305,6 +306,18 @@ impl App {
     }
 }
 
+/// Kitty keyboard-protocol flags croft requests on startup.
+///
+/// `DISAMBIGUATE_ESCAPE_CODES` is the bit that makes terminals deliver
+/// modifier keys (notably Cmd/Super on macOS in iTerm2 ≥3.5, Ghostty, kitty,
+/// WezTerm) as real key events rather than swallowing them or routing them to
+/// menus. We deliberately do NOT request `REPORT_ALL_KEYS_AS_ESCAPE_CODES`
+/// because that re-encodes ordinary printable input and would break typing.
+fn keyboard_enhancement_flags() -> KeyboardEnhancementFlags {
+    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+        | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+}
+
 /// Build the OSC 0 escape sequence that sets the terminal's window/icon title.
 ///
 /// Format: `ESC ] 0 ; <title> BEL`.  Control bytes that would break the escape
@@ -564,6 +577,26 @@ mod tests {
     }
 
     #[test]
+    fn keyboard_enhancement_flags_request_disambiguate_escape_codes() {
+        let f = keyboard_enhancement_flags();
+        assert!(
+            f.contains(crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
+            "Cmd / modifier delivery requires DISAMBIGUATE_ESCAPE_CODES"
+        );
+    }
+
+    #[test]
+    fn keyboard_enhancement_flags_do_not_force_all_keys_as_escapes() {
+        // REPORT_ALL_KEYS_AS_ESCAPE_CODES rewrites plain printable input.
+        // We only need the disambiguation bit, not the all-keys bit.
+        let f = keyboard_enhancement_flags();
+        assert!(
+            !f.contains(crossterm::event::KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES),
+            "we should not opt into REPORT_ALL_KEYS_AS_ESCAPE_CODES"
+        );
+    }
+
+    #[test]
     fn no_stale_tcode_pill_literal_in_source() {
         let src = include_str!("app.rs");
         assert!(
@@ -588,6 +621,14 @@ pub fn run(root: PathBuf) -> Result<()> {
     enable_raw_mode().context("enable raw mode")?;
     let mut out = stdout();
     execute!(out, EnterAlternateScreen, EnableMouseCapture).context("enter alt screen")?;
+    // Best-effort: terminals that don't speak the kitty keyboard protocol just
+    // ignore this; ones that do (iTerm2 >=3.5, Ghostty, kitty, WezTerm) start
+    // delivering Cmd/Super as a real modifier so cmd+s reaches the app.
+    let kbd_enhanced = execute!(
+        out,
+        PushKeyboardEnhancementFlags(keyboard_enhancement_flags())
+    )
+    .is_ok();
     {
         use std::io::Write;
         out.write_all(&set_title_seq(&title)).ok();
@@ -605,6 +646,9 @@ pub fn run(root: PathBuf) -> Result<()> {
         let mut out = stdout();
         out.write_all(&set_title_seq("")).ok();
         out.flush().ok();
+    }
+    if kbd_enhanced {
+        execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags).ok();
     }
     execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture).ok();
     terminal.show_cursor().ok();
