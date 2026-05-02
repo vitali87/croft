@@ -175,6 +175,102 @@ impl FileTree {
     pub fn selected_path(&self) -> Option<&Path> {
         self.nodes.get(self.selected).map(|n| n.path.as_path())
     }
+
+    /// Reload the children of the directory node at `idx`. Used after creating
+    /// new files / folders so the tree reflects the new on-disk state.
+    pub fn refresh_children(&mut self, idx: usize) {
+        if idx >= self.nodes.len() || !self.nodes[idx].is_dir {
+            return;
+        }
+        // Drop existing children of this node, then reload.
+        let depth = self.nodes[idx].depth;
+        let mut end = idx + 1;
+        while end < self.nodes.len() && self.nodes[end].depth > depth {
+            end += 1;
+        }
+        self.nodes.drain((idx + 1)..end);
+        self.nodes[idx].loaded = false;
+        self.load_children(idx);
+        self.nodes[idx].expanded = true;
+        if self.selected >= self.nodes.len() {
+            self.selected = self.nodes.len().saturating_sub(1);
+        }
+    }
+
+    /// Index of the deepest *directory* node that contains `path` (or whose
+    /// path equals `path`). Used by the right-click context menu after a
+    /// create to refresh the right subtree.
+    pub fn index_of_dir(&self, path: &Path) -> Option<usize> {
+        self.nodes.iter().position(|n| n.is_dir && n.path == path)
+    }
+}
+
+/// Decide where a "New File" / "New Folder" should be created relative to the
+/// node the user right-clicked on.
+///
+/// * Right-click on a directory → create *inside* that directory.
+/// * Right-click on a file       → create as a *sibling* (in the file's parent).
+/// * Right-click on empty space  → create in the workspace root.
+pub fn create_target_dir_for(node: Option<&Node>, root: &Path) -> PathBuf {
+    let Some(node) = node else {
+        return root.to_path_buf();
+    };
+    if node.is_dir {
+        node.path.clone()
+    } else {
+        node.path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| root.to_path_buf())
+    }
+}
+
+/// Validate a name typed into the New File / New Folder prompt.
+/// Returns Ok(()) if it can become a single child entry safely.
+pub fn validate_new_name(name: &str) -> Result<(), &'static str> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err("name cannot be empty");
+    }
+    if trimmed == "." || trimmed == ".." {
+        return Err("name cannot be '.' or '..'");
+    }
+    if trimmed.contains('/') || trimmed.contains('\\') {
+        return Err("name cannot contain slashes");
+    }
+    if trimmed.contains('\0') {
+        return Err("name cannot contain NUL");
+    }
+    Ok(())
+}
+
+/// Create an empty file `name` inside `parent`. Errors if it already exists.
+pub fn create_file_in(parent: &Path, name: &str) -> std::io::Result<PathBuf> {
+    let target = parent.join(name);
+    if target.exists() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!("{} already exists", target.display()),
+        ));
+    }
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&target)?;
+    Ok(target)
+}
+
+/// Create directory `name` inside `parent`. Errors if it already exists.
+pub fn create_folder_in(parent: &Path, name: &str) -> std::io::Result<PathBuf> {
+    let target = parent.join(name);
+    if target.exists() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!("{} already exists", target.display()),
+        ));
+    }
+    std::fs::create_dir(&target)?;
+    Ok(target)
 }
 
 #[cfg(test)]
@@ -309,6 +405,121 @@ mod tests {
         tree.selected = 1;
         tree.activate();
         assert!(tree.selected < tree.nodes.len());
+    }
+
+    #[test]
+    fn validate_new_name_accepts_normal() {
+        assert!(validate_new_name("hello.rs").is_ok());
+        assert!(validate_new_name("My Folder").is_ok());
+        assert!(validate_new_name("a").is_ok());
+    }
+
+    #[test]
+    fn validate_new_name_rejects_empty_or_whitespace() {
+        assert!(validate_new_name("").is_err());
+        assert!(validate_new_name("   ").is_err());
+    }
+
+    #[test]
+    fn validate_new_name_rejects_dots() {
+        assert!(validate_new_name(".").is_err());
+        assert!(validate_new_name("..").is_err());
+    }
+
+    #[test]
+    fn validate_new_name_rejects_path_separators() {
+        assert!(validate_new_name("a/b").is_err());
+        assert!(validate_new_name("a\\b").is_err());
+        assert!(validate_new_name("../escape").is_err());
+    }
+
+    #[test]
+    fn validate_new_name_rejects_nul() {
+        assert!(validate_new_name("evil\0name").is_err());
+    }
+
+    #[test]
+    fn create_target_dir_for_directory_returns_self() {
+        let dir = Node {
+            path: PathBuf::from("/r/a"),
+            depth: 1,
+            is_dir: true,
+            expanded: false,
+            loaded: false,
+        };
+        assert_eq!(
+            create_target_dir_for(Some(&dir), Path::new("/r")),
+            PathBuf::from("/r/a")
+        );
+    }
+
+    #[test]
+    fn create_target_dir_for_file_returns_parent() {
+        let file = Node {
+            path: PathBuf::from("/r/a/b.txt"),
+            depth: 2,
+            is_dir: false,
+            expanded: false,
+            loaded: false,
+        };
+        assert_eq!(
+            create_target_dir_for(Some(&file), Path::new("/r")),
+            PathBuf::from("/r/a")
+        );
+    }
+
+    #[test]
+    fn create_target_dir_for_none_returns_root() {
+        assert_eq!(
+            create_target_dir_for(None, Path::new("/r")),
+            PathBuf::from("/r")
+        );
+    }
+
+    #[test]
+    fn create_file_in_creates_empty_file() {
+        let tmp = TempDir::new().unwrap();
+        let path = create_file_in(tmp.path(), "new.txt").unwrap();
+        assert!(path.is_file());
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn create_file_in_errors_when_already_exists() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("x.txt"), "stuff").unwrap();
+        let err = create_file_in(tmp.path(), "x.txt").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+    }
+
+    #[test]
+    fn create_folder_in_creates_directory() {
+        let tmp = TempDir::new().unwrap();
+        let path = create_folder_in(tmp.path(), "newdir").unwrap();
+        assert!(path.is_dir());
+    }
+
+    #[test]
+    fn create_folder_in_errors_when_already_exists() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir(tmp.path().join("d")).unwrap();
+        let err = create_folder_in(tmp.path(), "d").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+    }
+
+    #[test]
+    fn refresh_children_picks_up_newly_created_file() {
+        let (tmp, mut tree) = fixture();
+        let root_dir_idx = tree.index_of_dir(tmp.path()).unwrap();
+        std::fs::write(tmp.path().join("brand-new.txt"), "").unwrap();
+        let before = tree.nodes.len();
+        tree.refresh_children(root_dir_idx);
+        let after = tree.nodes.len();
+        assert!(after > before, "expected new node to appear after refresh");
+        assert!(
+            tree.nodes.iter().any(|n| n.path.ends_with("brand-new.txt")),
+            "the newly created file should be in the tree"
+        );
     }
 
     #[test]

@@ -1,4 +1,4 @@
-Why it doe
+Why it d
 # croft
 
 A VS Code style three pane workspace that runs entirely inside your terminal. Written in Rust for performance and ships as a single static binary.
@@ -72,45 +72,18 @@ croft setup-terminal --help
 | `↑`/`↓` in tree | Move selection |
 | `Enter` or `→` on a file | Open in editor; on a folder: expand or collapse |
 | `←` on a folder | Collapse |
-| `Ctrl+s` (or `Cmd+s` once configured, see below) | Save the open file |
+| `Ctrl+s` | Save the open file |
 | `Ctrl+q` | Quit |
 | `F6` | Cycle focus across panes (tree → editor → terminal → tree) |
 | `Ctrl+b` | Toggle the file tree |
 | Editor: arrows, PageUp/PageDown, Home, End | Navigate |
 | Editor: any printable char, Enter, Backspace, Delete, Tab | Edit |
 | Mouse click in any pane | Focus and (in tree) select / open, (in editor) move cursor |
+| Mouse right-click in tree | Open context menu (New File…, New Folder…) |
 | Mouse wheel | Scroll the pane under the pointer |
+| Up/Down/Enter in context menu | Navigate / pick item; Esc dismisses |
+| Type + Enter in create prompt | Create the file or folder; Esc cancels |
 | Terminal pane: any key | Forwarded to the shell PTY (arrows, Ctrl+letter, Alt+x, function keys all translated to the proper VT escape sequences) |
-
-### Cmd+S (and other Cmd shortcuts) on macOS
-
-`Ctrl+S` saves out of the box in any terminal. Getting the more familiar `Cmd+S` to save in croft on macOS takes one extra step that no terminal application can fix on its own.
-
-Why: macOS reserves the Cmd modifier for application menus. Both Terminal.app and iTerm2 follow this rule. iTerm2 ≥3.5 supports the kitty keyboard protocol (croft negotiates `\x1b[>3u` on startup), but on macOS iTerm2 still does not deliver `Cmd+letter` over CSI u even with **Settings → Profiles → Default → Keys → General → Apps can change how keys are reported** and **Report keys using CSI u** both enabled. Verified empirically: with both toggles on, `cmd+J`, `cmd+1`, and `cmd+S` all produce zero bytes through `xxd` in raw mode. So `Cmd+letter` cannot reach a TUI on macOS by terminal-side configuration alone. You map it explicitly.
-
-The standard fix is a one-line key mapping in your terminal that rewrites `Cmd+letter` to the byte `Ctrl+letter` already sends. Croft handles the rest because its save handler accepts `Ctrl+S` directly.
-
-**iTerm2:**
-1. iTerm2 → Settings (`⌘,`) → **Profiles** → Default → **Keys** tab → **Key Mappings** sub-tab.
-2. Click **+** at the bottom.
-3. "Click to Set" → press **⌘S**.
-4. Action: **Send Hex Code**.
-5. Code: `0x13` (which is what `Ctrl+S` sends as a raw byte).
-6. OK.
-
-Now `Cmd+S` in iTerm2 is delivered to croft as `Ctrl+S` and saves the open file. No iTerm2 restart needed.
-
-The same pattern works for the rest of croft's shortcuts:
-
-| iTerm2 keystroke to bind | Hex code | What croft does |
-|--------------------------|----------|-----------------|
-| `⌘S` | `0x13` | Save |
-| `⌘Q` | `0x11` | Quit |
-| `⌘B` | `0x02` | Toggle file tree |
-
-**Terminal.app:** does not let you bind `Cmd+letter` to send a hex code at all (its key-mapping UI excludes Cmd). On Terminal.app stick with `Ctrl+S`, or install Karabiner-Elements and add a complex modification that rewrites `Cmd+S` to `Ctrl+S` only inside Terminal.app windows.
-
-**Other terminals** (kitty, Ghostty, WezTerm, Alacritty): these natively deliver Cmd over the kitty keyboard protocol with no per-key remap, because they don't follow the macOS menu-Cmd convention. Croft already negotiates the protocol on startup, so `Cmd+S` works in those terminals without any setup.
 
 ## How the embedded terminal works
 
