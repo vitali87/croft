@@ -10,6 +10,39 @@ use ratatui::{
 use std::io::Write;
 use std::sync::{Arc, Mutex};
 
+/// Inclusive cell range in the terminal's *inner* coordinate system (0,0 at
+/// the top-left of the content area, not the border).  Stored as the
+/// (row, col) of the cell where the user pressed the mouse and the cell
+/// where it currently is.  `selection_range()` normalises them so end >= start
+/// in row-major order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Selection {
+    pub anchor: (u16, u16),
+    pub head: (u16, u16),
+}
+
+impl Selection {
+    pub fn new(row: u16, col: u16) -> Self {
+        Self { anchor: (row, col), head: (row, col) }
+    }
+    /// `(start_row, start_col, end_row, end_col)` with start <= end in
+    /// row-major order.
+    pub fn normalised(&self) -> (u16, u16, u16, u16) {
+        let (a_r, a_c) = self.anchor;
+        let (b_r, b_c) = self.head;
+        let after = (a_r, a_c) <= (b_r, b_c);
+        if after {
+            (a_r, a_c, b_r, b_c)
+        } else {
+            (b_r, b_c, a_r, a_c)
+        }
+    }
+    /// True if the selected region covers more than a single cell.
+    pub fn has_area(&self) -> bool {
+        self.anchor != self.head
+    }
+}
+
 pub struct PtyTerminal {
     parser: Arc<Mutex<vt100::Parser>>,
     master: Box<dyn MasterPty + Send>,
@@ -19,6 +52,8 @@ pub struct PtyTerminal {
     rows: u16,
     pub focused: bool,
     pub last_area: Rect,
+    pub last_inner: Rect,
+    selection: Option<Selection>,
 }
 
 impl PtyTerminal {
@@ -68,7 +103,61 @@ impl PtyTerminal {
             rows,
             focused: false,
             last_area: Rect::default(),
+            last_inner: Rect::default(),
+            selection: None,
         })
+    }
+
+    /// Translate an absolute terminal mouse coordinate to an inner cell, or
+    /// `None` if outside the terminal pane's content area.
+    pub fn cell_at(&self, col: u16, row: u16) -> Option<(u16, u16)> {
+        let inner = self.last_inner;
+        if inner.width == 0 || inner.height == 0 {
+            return None;
+        }
+        if col < inner.x || col >= inner.x + inner.width {
+            return None;
+        }
+        if row < inner.y || row >= inner.y + inner.height {
+            return None;
+        }
+        Some((row - inner.y, col - inner.x))
+    }
+
+    pub fn start_selection_at(&mut self, col: u16, row: u16) {
+        if let Some((r, c)) = self.cell_at(col, row) {
+            self.selection = Some(Selection::new(r, c));
+        }
+    }
+
+    pub fn extend_selection_to(&mut self, col: u16, row: u16) {
+        let cell = self.cell_at(col, row);
+        if let (Some(sel), Some((r, c))) = (self.selection.as_mut(), cell) {
+            sel.head = (r, c);
+        }
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.selection = None;
+    }
+
+    pub fn selection(&self) -> Option<Selection> {
+        self.selection
+    }
+
+    /// Extract the text covered by the current selection by walking the
+    /// vt100 screen cells in row-major order.  Returns an empty string if
+    /// nothing is selected.  Trailing spaces on each row are trimmed (the
+    /// usual "row of cells" → "displayed text" convention).
+    pub fn selection_text(&self) -> String {
+        let Some(sel) = self.selection else { return String::new() };
+        let (sr, sc, er, ec) = sel.normalised();
+        let parser = match self.parser.lock() {
+            Ok(p) => p,
+            Err(_) => return String::new(),
+        };
+        let screen = parser.screen();
+        extract_selection_text(screen, sr, sc, er, ec)
     }
 
     pub fn write_input(&mut self, data: &[u8]) {
@@ -95,6 +184,56 @@ impl PtyTerminal {
 }
 
 use std::io::Read;
+
+/// Walk the vt100 screen from (sr, sc) to (er, ec) inclusive in row-major
+/// order, joining cell contents row by row, trimming trailing spaces, and
+/// inserting `\n` between rows.  Public so it can be unit-tested.
+pub fn extract_selection_text(
+    screen: &vt100::Screen,
+    sr: u16,
+    sc: u16,
+    er: u16,
+    ec: u16,
+) -> String {
+    let cols = screen.size().1;
+    let mut out = String::new();
+    for row in sr..=er {
+        let row_start = if row == sr { sc } else { 0 };
+        let row_end = if row == er { ec } else { cols.saturating_sub(1) };
+        let mut line = String::new();
+        for col in row_start..=row_end {
+            if let Some(cell) = screen.cell(row, col) {
+                let s = cell.contents();
+                if s.is_empty() {
+                    line.push(' ');
+                } else {
+                    line.push_str(s);
+                }
+            } else {
+                line.push(' ');
+            }
+        }
+        let trimmed = line.trim_end();
+        out.push_str(trimmed);
+        if row != er {
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// Build the OSC 52 escape sequence that asks the host terminal to put `text`
+/// on the system clipboard.  Format: `ESC ] 52 ; c ; <base64> BEL`. Supported
+/// by iTerm2, Ghostty, kitty, WezTerm, Alacritty, and tmux (when configured).
+pub fn osc52_copy_seq(text: &str) -> Vec<u8> {
+    use base64::Engine;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
+    let mut out = Vec::with_capacity(encoded.len() + 8);
+    out.extend_from_slice(b"\x1b]52;c;");
+    out.extend_from_slice(encoded.as_bytes());
+    out.push(0x07);
+    out
+}
 
 fn vt_color(c: vt100::Color) -> Option<Color> {
     match c {
@@ -124,6 +263,8 @@ impl Widget for &mut PtyTerminal {
         let inner = block.inner(area);
         block.render(area, buf);
         self.last_area = area;
+        self.last_inner = inner;
+        let sel_norm = self.selection.map(|s| s.normalised());
 
         let cols = inner.width;
         let rows = inner.height;
@@ -190,6 +331,11 @@ impl Widget for &mut PtyTerminal {
                 if cursor_visible && y == cur_row && x == cur_col {
                     style = style.add_modifier(Modifier::REVERSED);
                 }
+                if let Some((sr, sc, er, ec)) = sel_norm {
+                    if cell_in_selection(y, x, sr, sc, er, ec) {
+                        style = style.bg(Color::Rgb(0x26, 0x4f, 0x78));
+                    }
+                }
                 let target_x = inner.x + x;
                 let target_y = inner.y + y;
                 let target = &mut buf[(target_x, target_y)];
@@ -197,5 +343,111 @@ impl Widget for &mut PtyTerminal {
                 target.set_style(style);
             }
         }
+    }
+}
+
+/// True iff (row, col) is inside the inclusive row-major range [(sr,sc)..=(er,ec)].
+pub fn cell_in_selection(row: u16, col: u16, sr: u16, sc: u16, er: u16, ec: u16) -> bool {
+    if row < sr || row > er {
+        return false;
+    }
+    if row == sr && col < sc {
+        return false;
+    }
+    if row == er && col > ec {
+        return false;
+    }
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn selection_normalised_handles_anchor_after_head() {
+        let s = Selection { anchor: (5, 4), head: (2, 1) };
+        assert_eq!(s.normalised(), (2, 1, 5, 4));
+    }
+
+    #[test]
+    fn selection_normalised_handles_same_row() {
+        let s = Selection { anchor: (3, 9), head: (3, 2) };
+        assert_eq!(s.normalised(), (3, 2, 3, 9));
+    }
+
+    #[test]
+    fn selection_has_area_only_when_endpoints_differ() {
+        let s = Selection::new(2, 5);
+        assert!(!s.has_area());
+        let s2 = Selection { anchor: (2, 5), head: (2, 6) };
+        assert!(s2.has_area());
+    }
+
+    #[test]
+    fn cell_in_selection_within_single_row() {
+        // selection: row 2, cols 3..=7
+        assert!(cell_in_selection(2, 5, 2, 3, 2, 7));
+        assert!(!cell_in_selection(2, 2, 2, 3, 2, 7));
+        assert!(!cell_in_selection(2, 8, 2, 3, 2, 7));
+        assert!(!cell_in_selection(1, 5, 2, 3, 2, 7));
+        assert!(!cell_in_selection(3, 5, 2, 3, 2, 7));
+    }
+
+    #[test]
+    fn cell_in_selection_spans_multiple_rows() {
+        // selection: (1, 5) to (3, 2)
+        assert!(!cell_in_selection(1, 4, 1, 5, 3, 2));
+        assert!(cell_in_selection(1, 5, 1, 5, 3, 2));
+        assert!(cell_in_selection(1, 9, 1, 5, 3, 2));
+        assert!(cell_in_selection(2, 0, 1, 5, 3, 2));
+        assert!(cell_in_selection(2, 9, 1, 5, 3, 2));
+        assert!(cell_in_selection(3, 2, 1, 5, 3, 2));
+        assert!(!cell_in_selection(3, 3, 1, 5, 3, 2));
+        assert!(!cell_in_selection(4, 0, 1, 5, 3, 2));
+    }
+
+    #[test]
+    fn osc52_copy_seq_wraps_with_correct_envelope() {
+        let bytes = osc52_copy_seq("hello");
+        // ESC ] 5 2 ; c ; aGVsbG8= BEL
+        assert_eq!(bytes, b"\x1b]52;c;aGVsbG8=\x07");
+    }
+
+    #[test]
+    fn osc52_copy_seq_handles_empty() {
+        assert_eq!(osc52_copy_seq(""), b"\x1b]52;c;\x07");
+    }
+
+    #[test]
+    fn osc52_copy_seq_handles_unicode() {
+        let bytes = osc52_copy_seq("héllo");
+        // Just check the envelope and that the body decodes back.
+        assert!(bytes.starts_with(b"\x1b]52;c;"));
+        assert_eq!(*bytes.last().unwrap(), 0x07);
+        let body = &bytes[7..bytes.len() - 1];
+        use base64::Engine;
+        let decoded =
+            base64::engine::general_purpose::STANDARD.decode(body).unwrap();
+        assert_eq!(decoded, "héllo".as_bytes());
+    }
+
+    #[test]
+    fn extract_selection_text_single_line() {
+        let mut p = vt100::Parser::new(5, 20, 0);
+        p.process(b"hello world");
+        let txt = extract_selection_text(p.screen(), 0, 6, 0, 10);
+        assert_eq!(txt, "world");
+    }
+
+    #[test]
+    fn extract_selection_text_multi_line_trims_trailing_spaces() {
+        let mut p = vt100::Parser::new(5, 20, 0);
+        p.process(b"first line\r\nsecond line");
+        // From row 0 col 6 to row 1 col 5 (inclusive). vt100 reports cells
+        // unreachable by content as spaces; trailing whitespace per row is
+        // trimmed by extract_selection_text.
+        let txt = extract_selection_text(p.screen(), 0, 6, 1, 5);
+        assert_eq!(txt, "line\nsecond");
     }
 }

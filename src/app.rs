@@ -129,6 +129,7 @@ pub struct App {
     pub terminal: PtyTerminal,
     focus: Pane,
     show_tree: bool,
+    show_terminal: bool,
     status: String,
     quit: bool,
     context_menu: Option<ContextMenu>,
@@ -161,6 +162,7 @@ impl App {
             terminal: term,
             focus: Pane::Tree,
             show_tree: true,
+            show_terminal: true,
             status: String::from("Ready"),
             quit: false,
             context_menu: None,
@@ -280,14 +282,40 @@ impl App {
     }
 
     fn cycle_focus(&mut self) {
-        self.focus = match self.focus {
-            Pane::Tree => Pane::Editor,
-            Pane::Editor => Pane::Terminal,
-            Pane::Terminal => Pane::Tree,
-        };
+        // Skip hidden panes when cycling.
+        for _ in 0..3 {
+            self.focus = match self.focus {
+                Pane::Tree => Pane::Editor,
+                Pane::Editor => Pane::Terminal,
+                Pane::Terminal => Pane::Tree,
+            };
+            if self.pane_visible(self.focus) {
+                break;
+            }
+        }
         self.tree.focused = self.focus == Pane::Tree;
         self.editor.focused = self.focus == Pane::Editor;
         self.terminal.focused = self.focus == Pane::Terminal;
+    }
+
+    fn pane_visible(&self, p: Pane) -> bool {
+        match p {
+            Pane::Tree => self.show_tree,
+            Pane::Terminal => self.show_terminal,
+            Pane::Editor => true,
+        }
+    }
+
+    fn toggle_terminal(&mut self) {
+        self.show_terminal = !self.show_terminal;
+        // If we just hid the terminal while it was focused, fall back to editor.
+        if !self.show_terminal && self.focus == Pane::Terminal {
+            self.focus_pane(Pane::Editor);
+        }
+        // If we just showed the terminal, optionally jump focus to it for quick use.
+        if self.show_terminal {
+            self.focus_pane(Pane::Terminal);
+        }
     }
 
     fn focus_pane(&mut self, p: Pane) {
@@ -322,16 +350,23 @@ impl App {
             (None, main[0])
         };
 
-        let right = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Percentage(65), Constraint::Percentage(35)])
-            .split(right_area);
+        let (editor_area, terminal_area) = if self.show_terminal {
+            let right = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Percentage(65), Constraint::Percentage(35)])
+                .split(right_area);
+            (right[0], Some(right[1]))
+        } else {
+            (right_area, None)
+        };
 
         if let Some(area) = tree_area {
             frame.render_widget(&mut self.tree, area);
         }
-        frame.render_widget(&mut self.editor, right[0]);
-        frame.render_widget(&mut self.terminal, right[1]);
+        frame.render_widget(&mut self.editor, editor_area);
+        if let Some(area) = terminal_area {
+            frame.render_widget(&mut self.terminal, area);
+        }
 
         let mut spans: Vec<Span> = Vec::with_capacity(20);
         spans.push(Span::styled(
@@ -494,6 +529,10 @@ impl App {
             self.save();
             return Ok(());
         }
+        if is_terminal_toggle_key(key) {
+            self.toggle_terminal();
+            return Ok(());
+        }
         match (key.code, key.modifiers) {
             (KeyCode::Char('q'), KeyModifiers::CONTROL) => {
                 self.quit = true;
@@ -586,10 +625,42 @@ impl App {
     }
 
     fn handle_terminal_key(&mut self, key: KeyEvent) {
+        // Ctrl+Shift+C: copy current selection (terminal-friendly Cmd+C alt).
+        if is_terminal_copy_key(key) {
+            self.copy_terminal_selection_or_clear();
+            return;
+        }
+        // Any other keystroke clears the selection so the user's input is
+        // sent without the previous highlight lingering on screen.
+        if self.terminal.selection().is_some() {
+            self.terminal.clear_selection();
+        }
         let bytes = key_to_bytes(key);
         if !bytes.is_empty() {
             self.terminal.write_input(&bytes);
         }
+    }
+
+    /// Called on mouse-up over the terminal pane and on the explicit copy key.
+    /// If the current selection covers area, copy it to the host terminal's
+    /// clipboard via OSC 52.  Otherwise clear the (zero-area) selection.
+    fn copy_terminal_selection_or_clear(&mut self) {
+        let Some(sel) = self.terminal.selection() else { return };
+        if !sel.has_area() {
+            self.terminal.clear_selection();
+            return;
+        }
+        let text = self.terminal.selection_text();
+        if text.is_empty() {
+            self.terminal.clear_selection();
+            return;
+        }
+        use std::io::Write;
+        let bytes = crate::widgets::terminal::osc52_copy_seq(&text);
+        let mut out = std::io::stdout();
+        let _ = out.write_all(&bytes);
+        let _ = out.flush();
+        self.status = format!("Copied {} chars to clipboard", text.chars().count());
     }
 
     fn handle_mouse(&mut self, m: MouseEvent) {
@@ -680,6 +751,11 @@ impl App {
                     self.editor.click(m.column, m.row);
                 } else if in_terminal {
                     self.focus_pane(Pane::Terminal);
+                    // Begin a fresh selection at the click cell. Without a
+                    // drag this is a single cell (no area), so the selection
+                    // ends up cleared on mouse-up. With a drag, this is the
+                    // selection anchor.
+                    self.terminal.start_selection_at(m.column, m.row);
                 }
             }
             MouseEventKind::Drag(MouseButton::Left) => {
@@ -689,6 +765,13 @@ impl App {
                     if let Some(idx) = self.tree.node_at_y(m.row) {
                         self.tree.select(idx);
                     }
+                } else if in_terminal {
+                    self.terminal.extend_selection_to(m.column, m.row);
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                if in_terminal {
+                    self.copy_terminal_selection_or_clear();
                 }
             }
             MouseEventKind::ScrollDown => {
@@ -951,6 +1034,40 @@ fn build_title(workspace: &std::path::Path) -> String {
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| workspace.display().to_string());
     format!("{APP_NAME}  {name}")
+}
+
+/// Returns true if the given key event should copy the terminal pane's
+/// current selection to the clipboard.  Recognises:
+///   * `Ctrl+Shift+C` — universal Linux terminal copy convention; doesn't
+///     collide with `Ctrl+C` (SIGINT).
+///   * `Cmd+C`        — for terminals that deliver Super via the kitty
+///     keyboard protocol.
+fn is_terminal_copy_key(key: KeyEvent) -> bool {
+    let KeyCode::Char(c) = key.code else {
+        return false;
+    };
+    if !c.eq_ignore_ascii_case(&'c') {
+        return false;
+    }
+    let ctrl_shift = key.modifiers.contains(KeyModifiers::CONTROL)
+        && key.modifiers.contains(KeyModifiers::SHIFT);
+    let super_only = key.modifiers.contains(KeyModifiers::SUPER)
+        && !key.modifiers.contains(KeyModifiers::CONTROL);
+    ctrl_shift || super_only
+}
+
+/// Returns true if the given key event should toggle the terminal pane.
+/// VS Code uses `Ctrl+`` ` `` (backtick); we use `Ctrl+J` to match its
+/// "Toggle Terminal Panel" shortcut, which is more reliable to type on
+/// non-US keyboards. Case-insensitive on the letter so Shift+Ctrl+J works too.
+fn is_terminal_toggle_key(key: KeyEvent) -> bool {
+    let KeyCode::Char(c) = key.code else {
+        return false;
+    };
+    if !c.eq_ignore_ascii_case(&'j') {
+        return false;
+    }
+    key.modifiers.contains(KeyModifiers::CONTROL)
 }
 
 /// Returns true if the given key event should trash the currently-selected
@@ -1237,6 +1354,43 @@ mod tests {
         let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(joined.contains("↑2"));
         assert!(joined.contains("↓1"));
+    }
+
+    #[test]
+    fn ctrl_shift_c_is_recognized_as_terminal_copy() {
+        let mods = KeyModifiers::CONTROL | KeyModifiers::SHIFT;
+        assert!(is_terminal_copy_key(key(KeyCode::Char('C'), mods)));
+    }
+
+    #[test]
+    fn cmd_c_is_recognized_as_terminal_copy() {
+        // For terminals that pass Cmd via the kitty protocol; iTerm2 users
+        // can also remap ⌘C → Send Hex Code 0x03 for terminal-pane copies,
+        // but for keyboard-protocol-aware terminals we accept Super here.
+        assert!(is_terminal_copy_key(key(KeyCode::Char('c'), KeyModifiers::SUPER)));
+    }
+
+    #[test]
+    fn plain_ctrl_c_is_not_terminal_copy() {
+        // Ctrl+C must remain SIGINT in the embedded shell; it must not be
+        // intercepted as the croft copy gesture.
+        assert!(!is_terminal_copy_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL)));
+    }
+
+    #[test]
+    fn ctrl_j_is_recognized_as_terminal_toggle() {
+        assert!(is_terminal_toggle_key(key(KeyCode::Char('j'), KeyModifiers::CONTROL)));
+    }
+
+    #[test]
+    fn ctrl_shift_j_is_also_terminal_toggle() {
+        let mods = KeyModifiers::CONTROL | KeyModifiers::SHIFT;
+        assert!(is_terminal_toggle_key(key(KeyCode::Char('J'), mods)));
+    }
+
+    #[test]
+    fn plain_j_is_not_terminal_toggle() {
+        assert!(!is_terminal_toggle_key(key(KeyCode::Char('j'), KeyModifiers::NONE)));
     }
 
     #[test]
