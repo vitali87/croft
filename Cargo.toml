@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "Terminal-based VS Code replica: file tree, editor, embedded shell"
 license = "MIT"
-repository = "https://bitbucket.org/<workspace>/croft"
+repository = "https://bitbucket.org/vitali_avagyan/croft"
 homepage = "https://croft.sh"
 
 [[bin]]
