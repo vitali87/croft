@@ -21,6 +21,14 @@ use std::time::Duration;
 
 use crate::widgets::{editor::Editor, file_tree::FileTree, terminal::PtyTerminal};
 
+/// Single source of truth for the application's user-facing name.
+pub const APP_NAME: &str = "croft";
+
+/// Text shown inside the colored "brand" pill at the left of the status bar.
+fn brand_pill_text() -> String {
+    format!(" {APP_NAME} ")
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Pane {
     Tree,
@@ -110,7 +118,7 @@ impl App {
 
         let status = Paragraph::new(Line::from(vec![
             Span::styled(
-                " tcode ",
+                brand_pill_text(),
                 Style::default()
                     .bg(Color::Rgb(0x4e, 0x9a, 0xff))
                     .fg(Color::Black)
@@ -321,7 +329,7 @@ fn build_title(workspace: &std::path::Path) -> String {
         .map(|n| n.to_string_lossy().into_owned())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| workspace.display().to_string());
-    format!("croft  {name}")
+    format!("{APP_NAME}  {name}")
 }
 
 /// Returns true if the given key event should trigger "Save".
@@ -543,6 +551,25 @@ mod tests {
         assert_eq!(bytes, b"\x1b]0;evilfile\x07");
         let bytes = set_title_seq("evil\nfile");
         assert_eq!(bytes, b"\x1b]0;evilfile\x07");
+    }
+
+    #[test]
+    fn app_name_constant_is_croft() {
+        assert_eq!(APP_NAME, "croft");
+    }
+
+    #[test]
+    fn brand_pill_uses_app_name_constant() {
+        assert_eq!(brand_pill_text(), " croft ");
+    }
+
+    #[test]
+    fn no_stale_tcode_pill_literal_in_source() {
+        let src = include_str!("app.rs");
+        assert!(
+            !src.contains("\" tcode \""),
+            "stale ` tcode ` pill literal still present in src/app.rs"
+        );
     }
 
     #[test]

@@ -48,7 +48,7 @@ If you prefer to do it by hand: Terminal.app → Settings → Profiles → your 
 ## Build and install
 
 ```bash
-git clone <repo> croft
+git clone https://bitbucket.org/vitali_avagyan/croft.git
 cd croft
 cargo build --release
 # optional, install into ~/.cargo/bin
