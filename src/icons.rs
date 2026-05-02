@@ -45,6 +45,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn txt_icon_is_a_document_glyph_not_the_discard_arrow() {
+        // Regression: U+EA7D is `cod-discard` (a left-curving arrow). A .txt
+        // file should get a document-shaped glyph, not that.
+        let icon = for_path("notes.txt", ".txt");
+        assert_ne!(
+            icon.glyph as u32, 0xea7d,
+            "U+EA7D is cod-discard, not a text-file icon"
+        );
+        // Use Font Awesome's file-text-o which renders as a document with lines.
+        assert_eq!(icon.glyph, '\u{f15c}');
+    }
+
+    #[test]
     fn ext_lookup_python() {
         let icon = for_path("hello.py", ".py");
         assert_eq!(icon.glyph, '\u{e235}');
@@ -139,7 +152,7 @@ fn ext_icon(s: &str) -> Option<Icon> {
         ".zip" | ".tar" | ".gz" => i('\u{eaf1}', 0xcc, 0xa7, 0x00),
         ".lock" => i('\u{ea75}', 0x51, 0x9a, 0xba),
         ".log" => i('\u{eb1f}', 0xda, 0xd8, 0xd8),
-        ".txt" => i('\u{ea7d}', 0xcc, 0xcc, 0xcc),
+        ".txt" => i('\u{f15c}', 0xcc, 0xcc, 0xcc),
         ".csv" | ".tsv" => i('\u{eb6e}', 0x7c, 0xb3, 0x42),
         ".env" => i('\u{ea71}', 0xfa, 0xf7, 0x43),
         _ => return None,
