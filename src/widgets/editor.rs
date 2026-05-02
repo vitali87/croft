@@ -21,6 +21,7 @@ pub struct Editor {
     pub cursor_col: usize,
     pub focused: bool,
     pub status: String,
+    pub last_area: Rect,
     syntax_set: SyntaxSet,
     theme_set: ThemeSet,
     pub theme_name: String,
@@ -36,10 +37,21 @@ impl Editor {
             cursor_col: 0,
             focused: false,
             status: String::from("No file open"),
+            last_area: Rect::default(),
             syntax_set: SyntaxSet::load_defaults_newlines(),
             theme_set: ThemeSet::load_defaults(),
             theme_name: String::from("base16-ocean.dark"),
         }
+    }
+
+    pub fn scroll_up(&mut self, n: usize) {
+        self.cursor_row = self.cursor_row.saturating_sub(n);
+        self.cursor_col = self.cursor_col.min(self.lines.get(self.cursor_row).map(|s| s.len()).unwrap_or(0));
+    }
+
+    pub fn scroll_down(&mut self, n: usize) {
+        self.cursor_row = (self.cursor_row + n).min(self.lines.len().saturating_sub(1));
+        self.cursor_col = self.cursor_col.min(self.lines.get(self.cursor_row).map(|s| s.len()).unwrap_or(0));
     }
 
     pub fn open(&mut self, path: &Path) -> Result<()> {
@@ -177,6 +189,7 @@ impl Widget for &mut Editor {
             ));
         let inner = block.inner(area);
         block.render(area, buf);
+        self.last_area = area;
 
         let height = inner.height as usize;
         if self.cursor_row < self.scroll {

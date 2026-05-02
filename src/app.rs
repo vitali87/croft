@@ -1,6 +1,9 @@
 use anyhow::{Context, Result};
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+        KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -212,6 +215,59 @@ impl App {
         }
     }
 
+    fn handle_mouse(&mut self, m: MouseEvent) {
+        let in_tree = self.show_tree && rect_contains(self.tree.last_area, m.column, m.row);
+        let in_editor = rect_contains(self.editor.last_area, m.column, m.row);
+        let in_terminal = rect_contains(self.terminal.last_area, m.column, m.row);
+
+        match m.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if in_tree {
+                    self.focus_pane(Pane::Tree);
+                    if let Some(idx) = self.tree.node_at_y(m.row) {
+                        self.tree.select(idx);
+                        if let Some(path) = self.tree.activate() {
+                            match self.editor.open(&path) {
+                                Ok(()) => {
+                                    self.status = self.editor.status.clone();
+                                    self.focus_pane(Pane::Editor);
+                                }
+                                Err(e) => self.status = format!("Error: {e}"),
+                            }
+                        }
+                    }
+                } else if in_editor {
+                    self.focus_pane(Pane::Editor);
+                } else if in_terminal {
+                    self.focus_pane(Pane::Terminal);
+                }
+            }
+            MouseEventKind::ScrollDown => {
+                if in_tree {
+                    self.tree.move_down();
+                    self.tree.move_down();
+                    self.tree.move_down();
+                } else if in_editor {
+                    self.editor.scroll_down(3);
+                } else if in_terminal {
+                    self.terminal.write_input(b"\x1b[B\x1b[B\x1b[B");
+                }
+            }
+            MouseEventKind::ScrollUp => {
+                if in_tree {
+                    self.tree.move_up();
+                    self.tree.move_up();
+                    self.tree.move_up();
+                } else if in_editor {
+                    self.editor.scroll_up(3);
+                } else if in_terminal {
+                    self.terminal.write_input(b"\x1b[A\x1b[A\x1b[A");
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn save(&mut self) {
         if let Some(path) = self.editor.path.clone() {
             let content = self.editor.lines.join("\n");
@@ -223,6 +279,15 @@ impl App {
             self.status = String::from("No file to save");
         }
     }
+}
+
+fn rect_contains(r: Rect, x: u16, y: u16) -> bool {
+    r.width > 0
+        && r.height > 0
+        && x >= r.x
+        && x < r.x + r.width
+        && y >= r.y
+        && y < r.y + r.height
 }
 
 fn key_to_bytes(key: KeyEvent) -> Vec<u8> {
@@ -321,6 +386,7 @@ fn main_loop(
         if event::poll(Duration::from_millis(33))? {
             match event::read()? {
                 Event::Key(key) => app.handle_key(key, page)?,
+                Event::Mouse(m) => app.handle_mouse(m),
                 Event::Resize(_, _) => {}
                 _ => {}
             }

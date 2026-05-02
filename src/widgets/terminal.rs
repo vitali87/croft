@@ -18,6 +18,7 @@ pub struct PtyTerminal {
     cols: u16,
     rows: u16,
     pub focused: bool,
+    pub last_area: Rect,
 }
 
 impl PtyTerminal {
@@ -66,6 +67,7 @@ impl PtyTerminal {
             cols,
             rows,
             focused: false,
+            last_area: Rect::default(),
         })
     }
 
@@ -121,6 +123,7 @@ impl Widget for &mut PtyTerminal {
             ));
         let inner = block.inner(area);
         block.render(area, buf);
+        self.last_area = area;
 
         let cols = inner.width;
         let rows = inner.height;

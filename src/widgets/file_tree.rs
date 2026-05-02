@@ -23,6 +23,8 @@ pub struct FileTree {
     pub selected: usize,
     pub scroll: usize,
     pub focused: bool,
+    pub last_inner: Rect,
+    pub last_area: Rect,
 }
 
 impl FileTree {
@@ -39,9 +41,31 @@ impl FileTree {
             selected: 0,
             scroll: 0,
             focused: true,
+            last_inner: Rect::default(),
+            last_area: Rect::default(),
         };
         tree.load_children(0);
         tree
+    }
+
+    /// Map a screen y coordinate to a node index, if any.
+    pub fn node_at_y(&self, y: u16) -> Option<usize> {
+        if y < self.last_inner.y || y >= self.last_inner.y + self.last_inner.height {
+            return None;
+        }
+        let row = (y - self.last_inner.y) as usize;
+        let idx = self.scroll + row;
+        if idx < self.nodes.len() {
+            Some(idx)
+        } else {
+            None
+        }
+    }
+
+    pub fn select(&mut self, idx: usize) {
+        if idx < self.nodes.len() {
+            self.selected = idx;
+        }
     }
 
     fn load_children(&mut self, idx: usize) {
@@ -172,6 +196,8 @@ impl Widget for &mut FileTree {
             ));
         let inner = block.inner(area);
         block.render(area, buf);
+        self.last_inner = inner;
+        self.last_area = area;
 
         let visible_height = inner.height as usize;
         if self.selected < self.scroll {
