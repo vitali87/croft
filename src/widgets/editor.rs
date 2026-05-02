@@ -179,6 +179,43 @@ impl Editor {
         self.recompute_highlights();
     }
 
+    /// Returns true if the on-disk file at `event_path` is the file currently
+    /// open in this editor (used by the filesystem watcher to decide whether
+    /// to reload).
+    pub fn matches_open_path(&self, event_path: &Path) -> bool {
+        let Some(open) = self.path.as_ref() else {
+            return false;
+        };
+        if open == event_path {
+            return true;
+        }
+        if let (Ok(a), Ok(b)) = (open.canonicalize(), event_path.canonicalize()) {
+            return a == b;
+        }
+        false
+    }
+
+    /// Reload from disk *only if* there are no unsaved local edits. Returns
+    /// `Some(Ok(()))` if a reload happened, `Some(Err(_))` if reload failed,
+    /// `None` if reload was skipped because the buffer is dirty (caller
+    /// should surface a "file changed on disk" warning instead).
+    pub fn reload_if_clean(&mut self) -> Option<Result<()>> {
+        if self.dirty {
+            return None;
+        }
+        let path = self.path.as_ref().cloned()?;
+        let prev_row = self.cursor_row;
+        let prev_col = self.cursor_col;
+        let prev_scroll = self.scroll;
+        let result = self.open(&path);
+        // Clamp the restored cursor to the new contents so it stays valid
+        // even if the file shrank.
+        self.cursor_row = prev_row.min(self.lines.len().saturating_sub(1));
+        self.cursor_col = prev_col.min(self.line_char_len(self.cursor_row));
+        self.scroll = prev_scroll.min(self.lines.len().saturating_sub(1));
+        Some(result)
+    }
+
     pub fn save_to_disk(&mut self) -> Result<()> {
         let path = self
             .path
@@ -546,6 +583,49 @@ mod tests {
         let mut e = Editor::new();
         let err = e.open(tmp.path()).unwrap_err();
         assert!(err.to_string().to_lowercase().contains("binary"));
+    }
+
+    #[test]
+    fn matches_open_path_handles_canonical_difference() {
+        let mut tmp = NamedTempFile::new().unwrap();
+        writeln!(tmp, "x").unwrap();
+        let mut e = Editor::new();
+        e.open(tmp.path()).unwrap();
+        assert!(e.matches_open_path(tmp.path()));
+        let bogus = std::path::Path::new("/definitely/not/the/same/path.txt");
+        assert!(!e.matches_open_path(bogus));
+    }
+
+    #[test]
+    fn reload_if_clean_picks_up_external_changes() {
+        let mut tmp = NamedTempFile::new().unwrap();
+        writeln!(tmp, "def hello():").unwrap();
+        writeln!(tmp, "    print(\"hi\")").unwrap();
+        let mut e = Editor::new();
+        e.open(tmp.path()).unwrap();
+        assert!(e.lines[0].contains("hello"));
+
+        // Simulate an external edit (vim, git pull, etc.).
+        std::fs::write(tmp.path(), "def hi():\n    print(\"hi\")\n").unwrap();
+        let outcome = e.reload_if_clean();
+        assert!(matches!(outcome, Some(Ok(()))));
+        assert_eq!(e.lines[0], "def hi():");
+        assert!(!e.dirty);
+    }
+
+    #[test]
+    fn reload_if_clean_refuses_when_dirty() {
+        let tmp = NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), "original\n").unwrap();
+        let mut e = Editor::new();
+        e.open(tmp.path()).unwrap();
+        e.insert_str("local edit");
+        assert!(e.dirty);
+
+        std::fs::write(tmp.path(), "external change\n").unwrap();
+        let outcome = e.reload_if_clean();
+        assert!(outcome.is_none(), "should refuse to reload over dirty buffer");
+        assert!(e.lines[0].contains("local edit"));
     }
 
     #[test]

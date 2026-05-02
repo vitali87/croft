@@ -128,14 +128,16 @@ impl App {
     }
 
     /// Drain any pending filesystem events from the watcher and refresh the
-    /// tree directories whose contents may have changed. Coalesces multiple
-    /// events for the same directory into a single refresh.
+    /// tree directories whose contents may have changed. Also reloads the
+    /// editor's open file when an external write (vim, git pull, etc.)
+    /// changes it on disk.
     fn drain_fs_events(&mut self) {
         let Some(rx) = self.fs_rx.as_ref() else {
             return;
         };
         let mut affected: std::collections::BTreeSet<PathBuf> =
             std::collections::BTreeSet::new();
+        let mut touched_open_file = false;
         while let Ok(result) = rx.try_recv() {
             let events = match result {
                 Ok(evs) => evs,
@@ -143,6 +145,11 @@ impl App {
             };
             for ev in events {
                 for path in &ev.event.paths {
+                    // Editor reload trigger: any event mentioning the open
+                    // file's path, before we even classify it as a tree event.
+                    if self.editor.matches_open_path(path) {
+                        touched_open_file = true;
+                    }
                     if let Some(dir) = crate::widgets::file_tree::affected_dir_for_event(
                         path,
                         &self.tree.root,
@@ -152,28 +159,40 @@ impl App {
                         || path.canonicalize().ok().as_deref()
                             == self.tree.root.canonicalize().ok().as_deref()
                     {
-                        // Event on the workspace root itself: refresh it.
                         affected.insert(self.tree.root.clone());
                     }
                 }
             }
         }
-        if affected.is_empty() {
-            return;
-        }
-        // Refresh from leaf to root so deeper dirs settle before parents
-        // potentially drop them.
-        for dir in affected.iter().rev() {
-            if let Some(idx) = self.tree.index_of_dir(dir) {
-                self.tree.refresh_children(idx);
-            } else {
-                // Could be a directory that exists in the tree under its
-                // canonical path but the event arrived non-canonical.
-                let canon = dir.canonicalize().ok();
-                if let Some(c) = canon {
+        if !affected.is_empty() {
+            for dir in affected.iter().rev() {
+                if let Some(idx) = self.tree.index_of_dir(dir) {
+                    self.tree.refresh_children(idx);
+                } else if let Some(c) = dir.canonicalize().ok() {
                     if let Some(idx) = self.tree.index_of_dir(&c) {
                         self.tree.refresh_children(idx);
                     }
+                }
+            }
+        }
+        if touched_open_file {
+            match self.editor.reload_if_clean() {
+                Some(Ok(())) => {
+                    let path_disp = self
+                        .editor
+                        .path
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_default();
+                    self.status = format!("Reloaded {path_disp} (external change)");
+                }
+                Some(Err(e)) => {
+                    self.status = format!("External change but reload failed: {e}");
+                }
+                None => {
+                    self.status = String::from(
+                        "Open file changed on disk; you have unsaved edits, save or revert to reload",
+                    );
                 }
             }
         }
