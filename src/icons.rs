@@ -40,6 +40,68 @@ fn name_icon(n: &str) -> Option<Icon> {
     })
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ext_lookup_python() {
+        let icon = for_path("hello.py", ".py");
+        assert_eq!(icon.glyph, '\u{e235}');
+        assert_eq!(icon.color, rgb(0x35, 0x72, 0xa5));
+    }
+
+    #[test]
+    fn ext_lookup_json() {
+        let icon = for_path("config.json", ".json");
+        assert_eq!(icon.glyph, '\u{ed0d}');
+    }
+
+    #[test]
+    fn ext_lookup_is_case_insensitive() {
+        let lower = for_path("file.rs", ".rs");
+        let upper = for_path("FILE.RS", ".RS");
+        assert_eq!(lower.glyph, upper.glyph);
+        assert_eq!(lower.color, upper.color);
+    }
+
+    #[test]
+    fn unknown_extension_falls_back_to_default() {
+        let icon = for_path("weird.xyz123", ".xyz123");
+        assert_eq!(icon.glyph, DEFAULT_FILE.glyph);
+        assert_eq!(icon.color, DEFAULT_FILE.color);
+    }
+
+    #[test]
+    fn name_match_beats_extension_match() {
+        // .gitignore: filename match (red) vs no extension match
+        let icon = for_path(".gitignore", "");
+        assert_eq!(icon.color, rgb(0xe8, 0x27, 0x4b));
+    }
+
+    #[test]
+    fn pyproject_toml_overrides_generic_toml() {
+        let generic = for_path("config.toml", ".toml");
+        let specific = for_path("pyproject.toml", ".toml");
+        // pyproject.toml has python blue (#3572a5); generic toml has rust brown (#9c4221)
+        assert_eq!(specific.color, rgb(0x35, 0x72, 0xa5));
+        assert_eq!(generic.color, rgb(0x9c, 0x42, 0x21));
+    }
+
+    #[test]
+    fn dockerfile_name_match_is_case_insensitive() {
+        let lower = for_path("dockerfile", "");
+        let upper = for_path("Dockerfile", "");
+        assert_eq!(lower.color, upper.color);
+        assert_eq!(lower.color, rgb(0x38, 0x4d, 0x54));
+    }
+
+    #[test]
+    fn folder_icons_are_consistent_color() {
+        assert_eq!(FOLDER_OPEN.color, FOLDER_CLOSED.color);
+    }
+}
+
 fn ext_icon(s: &str) -> Option<Icon> {
     let i = |g, r, gr, b| Icon { glyph: g, color: rgb(r, gr, b) };
     Some(match s {

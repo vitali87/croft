@@ -367,6 +367,84 @@ fn key_to_bytes(key: KeyEvent) -> Vec<u8> {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, mods)
+    }
+
+    #[test]
+    fn rect_contains_basic() {
+        let r = Rect { x: 5, y: 5, width: 10, height: 10 };
+        assert!(rect_contains(r, 5, 5));
+        assert!(rect_contains(r, 14, 14));
+        assert!(!rect_contains(r, 4, 5));
+        assert!(!rect_contains(r, 15, 5));
+        assert!(!rect_contains(r, 5, 15));
+    }
+
+    #[test]
+    fn rect_contains_zero_sized_is_empty() {
+        let r = Rect { x: 0, y: 0, width: 0, height: 0 };
+        assert!(!rect_contains(r, 0, 0));
+    }
+
+    #[test]
+    fn key_to_bytes_arrows() {
+        assert_eq!(key_to_bytes(key(KeyCode::Up, KeyModifiers::NONE)), b"\x1b[A");
+        assert_eq!(key_to_bytes(key(KeyCode::Down, KeyModifiers::NONE)), b"\x1b[B");
+        assert_eq!(key_to_bytes(key(KeyCode::Right, KeyModifiers::NONE)), b"\x1b[C");
+        assert_eq!(key_to_bytes(key(KeyCode::Left, KeyModifiers::NONE)), b"\x1b[D");
+    }
+
+    #[test]
+    fn key_to_bytes_enter_tab_backspace() {
+        assert_eq!(key_to_bytes(key(KeyCode::Enter, KeyModifiers::NONE)), b"\r");
+        assert_eq!(key_to_bytes(key(KeyCode::Tab, KeyModifiers::NONE)), b"\t");
+        assert_eq!(key_to_bytes(key(KeyCode::Backspace, KeyModifiers::NONE)), &[0x7f]);
+    }
+
+    #[test]
+    fn key_to_bytes_ctrl_letter_maps_to_control_byte() {
+        let bytes = key_to_bytes(key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert_eq!(bytes, vec![0x03]);
+        let bytes = key_to_bytes(key(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        assert_eq!(bytes, vec![0x01]);
+        let bytes = key_to_bytes(key(KeyCode::Char('z'), KeyModifiers::CONTROL));
+        assert_eq!(bytes, vec![0x1a]);
+    }
+
+    #[test]
+    fn key_to_bytes_alt_letter_prefixes_esc() {
+        let bytes = key_to_bytes(key(KeyCode::Char('x'), KeyModifiers::ALT));
+        assert_eq!(bytes, vec![0x1b, b'x']);
+    }
+
+    #[test]
+    fn key_to_bytes_plain_char_utf8() {
+        assert_eq!(key_to_bytes(key(KeyCode::Char('a'), KeyModifiers::NONE)), b"a");
+        assert_eq!(
+            key_to_bytes(key(KeyCode::Char('é'), KeyModifiers::NONE)),
+            "é".as_bytes()
+        );
+    }
+
+    #[test]
+    fn key_to_bytes_function_keys() {
+        assert_eq!(key_to_bytes(key(KeyCode::F(1), KeyModifiers::NONE)), b"\x1bOP");
+        assert_eq!(key_to_bytes(key(KeyCode::F(5), KeyModifiers::NONE)), b"\x1b[15~");
+        assert_eq!(key_to_bytes(key(KeyCode::F(12), KeyModifiers::NONE)), b"\x1b[24~");
+    }
+
+    #[test]
+    fn key_to_bytes_unknown_returns_empty() {
+        assert!(key_to_bytes(key(KeyCode::CapsLock, KeyModifiers::NONE)).is_empty());
+    }
+}
+
 pub fn run(root: PathBuf) -> Result<()> {
     let mut app = App::new(root)?;
 

@@ -40,6 +40,11 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "io-ut
 futures = "0.3"
 tui-input = "0.15"
 
+[dev-dependencies]
+tempfile = "3.27"
+pretty_assertions = "1.4"
+assert_cmd = "2.2"
+
 [profile.release]
 opt-level = 3
 lto = "thin"

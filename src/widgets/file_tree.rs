@@ -177,6 +177,151 @@ impl FileTree {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    fn fixture() -> (TempDir, FileTree) {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        fs::create_dir(root.join("src")).unwrap();
+        fs::write(root.join("README.md"), "# hi\n").unwrap();
+        fs::write(root.join("main.rs"), "fn main() {}\n").unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn x() {}\n").unwrap();
+        let tree = FileTree::new(root.to_path_buf());
+        (tmp, tree)
+    }
+
+    #[test]
+    fn new_lists_root_and_children() {
+        let (_tmp, tree) = fixture();
+        // Root + 3 children (src/, main.rs, README.md). Hidden filtered by default.
+        assert_eq!(tree.nodes.len(), 4);
+        assert!(tree.nodes[0].is_dir);
+        assert!(tree.nodes[0].expanded);
+    }
+
+    #[test]
+    fn directories_sort_before_files() {
+        let (_tmp, tree) = fixture();
+        // Skip root (idx 0). Next should be the directory.
+        assert!(tree.nodes[1].is_dir);
+        assert!(!tree.nodes[2].is_dir);
+        assert!(!tree.nodes[3].is_dir);
+    }
+
+    #[test]
+    fn move_up_clamps_at_zero() {
+        let (_tmp, mut tree) = fixture();
+        tree.selected = 0;
+        tree.move_up();
+        assert_eq!(tree.selected, 0);
+    }
+
+    #[test]
+    fn move_down_clamps_at_last() {
+        let (_tmp, mut tree) = fixture();
+        let last = tree.nodes.len() - 1;
+        tree.selected = last;
+        tree.move_down();
+        assert_eq!(tree.selected, last);
+    }
+
+    #[test]
+    fn move_down_then_up() {
+        let (_tmp, mut tree) = fixture();
+        tree.move_down();
+        assert_eq!(tree.selected, 1);
+        tree.move_down();
+        assert_eq!(tree.selected, 2);
+        tree.move_up();
+        assert_eq!(tree.selected, 1);
+    }
+
+    #[test]
+    fn end_jumps_to_last() {
+        let (_tmp, mut tree) = fixture();
+        tree.end();
+        assert_eq!(tree.selected, tree.nodes.len() - 1);
+    }
+
+    #[test]
+    fn home_jumps_to_first() {
+        let (_tmp, mut tree) = fixture();
+        tree.selected = 3;
+        tree.home();
+        assert_eq!(tree.selected, 0);
+    }
+
+    #[test]
+    fn activate_file_returns_path() {
+        let (_tmp, mut tree) = fixture();
+        // Find a file node.
+        let file_idx = tree.nodes.iter().position(|n| !n.is_dir).unwrap();
+        tree.selected = file_idx;
+        let path = tree.activate();
+        assert!(path.is_some());
+        assert!(path.unwrap().is_file());
+    }
+
+    #[test]
+    fn activate_directory_expands_and_collapses() {
+        let (_tmp, mut tree) = fixture();
+        // src/ at index 1 (after directories-first sort).
+        tree.selected = 1;
+        let total_before = tree.nodes.len();
+        // Expand src/.
+        let opened = tree.activate();
+        assert!(opened.is_none()); // no file opened
+        assert!(tree.nodes[1].expanded);
+        assert!(tree.nodes.len() > total_before);
+        // Collapse it again.
+        let collapsed = tree.activate();
+        assert!(collapsed.is_none());
+        assert!(!tree.nodes[1].expanded);
+        assert_eq!(tree.nodes.len(), total_before);
+    }
+
+    #[test]
+    fn select_clamps_to_valid_index() {
+        let (_tmp, mut tree) = fixture();
+        let last = tree.nodes.len() - 1;
+        tree.select(last);
+        assert_eq!(tree.selected, last);
+        // Out of range: select() should be a no-op.
+        let prev = tree.selected;
+        tree.select(9999);
+        assert_eq!(tree.selected, prev);
+    }
+
+    #[test]
+    fn collapse_resets_selection_if_above_new_len() {
+        let (_tmp, mut tree) = fixture();
+        // Expand src/, point selection at a child, then collapse.
+        tree.selected = 1;
+        tree.activate();
+        // Move selection inside the expanded subtree.
+        let inside = tree.nodes.len() - 1;
+        tree.selected = inside;
+        // Collapse src/.
+        tree.selected = 1;
+        tree.activate();
+        assert!(tree.selected < tree.nodes.len());
+    }
+
+    #[test]
+    fn page_up_and_page_down() {
+        let (_tmp, mut tree) = fixture();
+        let last = tree.nodes.len().saturating_sub(1);
+        tree.page_down(100);
+        assert_eq!(tree.selected, last);
+        tree.page_up(100);
+        assert_eq!(tree.selected, 0);
+    }
+}
+
 impl Widget for &mut FileTree {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let block_style = if self.focused {

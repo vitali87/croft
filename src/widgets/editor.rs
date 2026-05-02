@@ -315,6 +315,291 @@ fn build_line_spans<'a>(line: &'a str, spans: &[HiSpan]) -> Vec<Span<'a>> {
     out
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    fn editor_with(text: &str) -> Editor {
+        let mut e = Editor::new();
+        e.lines = if text.is_empty() {
+            vec![String::new()]
+        } else {
+            text.lines().map(|s| s.to_string()).collect()
+        };
+        if e.lines.is_empty() {
+            e.lines.push(String::new());
+        }
+        e
+    }
+
+    #[test]
+    fn is_binary_detects_nul() {
+        assert!(is_binary(b"hello\0world"));
+        assert!(!is_binary(b"hello world"));
+        assert!(!is_binary(b""));
+    }
+
+    #[test]
+    fn is_binary_detects_high_nontext_ratio() {
+        let mut data = vec![0x01u8; 100];
+        data.extend_from_slice(b"abc");
+        assert!(is_binary(&data));
+    }
+
+    #[test]
+    fn is_binary_accepts_normal_text() {
+        let txt = "fn main() { println!(\"hello\"); }\n// this is fine\n";
+        assert!(!is_binary(txt.as_bytes()));
+    }
+
+    #[test]
+    fn line_char_len_counts_chars_not_bytes() {
+        let mut e = editor_with("héllo");
+        assert_eq!(e.line_char_len(0), 5);
+        e.lines[0] = String::from("日本語");
+        assert_eq!(e.line_char_len(0), 3);
+    }
+
+    #[test]
+    fn byte_index_ascii() {
+        let e = editor_with("abcdef");
+        assert_eq!(e.byte_index(0, 0), 0);
+        assert_eq!(e.byte_index(0, 3), 3);
+        assert_eq!(e.byte_index(0, 6), 6);
+        assert_eq!(e.byte_index(0, 99), 6); // saturates at end
+    }
+
+    #[test]
+    fn byte_index_multibyte() {
+        let e = editor_with("héllo");
+        // 'h'=1 byte, 'é'=2 bytes, 'l'=1 byte
+        assert_eq!(e.byte_index(0, 0), 0);
+        assert_eq!(e.byte_index(0, 1), 1); // before 'é'
+        assert_eq!(e.byte_index(0, 2), 3); // after 'é'
+        assert_eq!(e.byte_index(0, 3), 4);
+    }
+
+    #[test]
+    fn insert_char_at_end() {
+        let mut e = editor_with("abc");
+        e.cursor_col = 3;
+        e.insert_char('d');
+        assert_eq!(e.lines[0], "abcd");
+        assert_eq!(e.cursor_col, 4);
+        assert!(e.dirty);
+    }
+
+    #[test]
+    fn insert_char_at_start() {
+        let mut e = editor_with("bc");
+        e.cursor_col = 0;
+        e.insert_char('a');
+        assert_eq!(e.lines[0], "abc");
+        assert_eq!(e.cursor_col, 1);
+    }
+
+    #[test]
+    fn insert_char_in_middle() {
+        let mut e = editor_with("ac");
+        e.cursor_col = 1;
+        e.insert_char('b');
+        assert_eq!(e.lines[0], "abc");
+        assert_eq!(e.cursor_col, 2);
+    }
+
+    #[test]
+    fn insert_char_multibyte_position() {
+        let mut e = editor_with("aé");
+        e.cursor_col = 2; // after 'é'
+        e.insert_char('z');
+        assert_eq!(e.lines[0], "aéz");
+    }
+
+    #[test]
+    fn insert_newline_splits_line() {
+        let mut e = editor_with("hello world");
+        e.cursor_col = 5;
+        e.insert_newline();
+        assert_eq!(e.lines, vec!["hello".to_string(), " world".to_string()]);
+        assert_eq!(e.cursor_row, 1);
+        assert_eq!(e.cursor_col, 0);
+    }
+
+    #[test]
+    fn insert_newline_at_end_creates_blank_line() {
+        let mut e = editor_with("abc");
+        e.cursor_col = 3;
+        e.insert_newline();
+        assert_eq!(e.lines, vec!["abc".to_string(), String::new()]);
+        assert_eq!(e.cursor_row, 1);
+    }
+
+    #[test]
+    fn backspace_mid_line() {
+        let mut e = editor_with("abcd");
+        e.cursor_col = 3;
+        e.backspace();
+        assert_eq!(e.lines[0], "abd");
+        assert_eq!(e.cursor_col, 2);
+    }
+
+    #[test]
+    fn backspace_at_col_zero_joins_with_previous_line() {
+        let mut e = editor_with("hello\nworld");
+        e.cursor_row = 1;
+        e.cursor_col = 0;
+        e.backspace();
+        assert_eq!(e.lines, vec!["helloworld".to_string()]);
+        assert_eq!(e.cursor_row, 0);
+        assert_eq!(e.cursor_col, 5);
+    }
+
+    #[test]
+    fn backspace_at_origin_does_nothing_destructive() {
+        let mut e = editor_with("abc");
+        e.cursor_row = 0;
+        e.cursor_col = 0;
+        e.backspace();
+        assert_eq!(e.lines, vec!["abc".to_string()]);
+    }
+
+    #[test]
+    fn delete_forward_mid_line() {
+        let mut e = editor_with("abcd");
+        e.cursor_col = 1;
+        e.delete_forward();
+        assert_eq!(e.lines[0], "acd");
+        assert_eq!(e.cursor_col, 1);
+    }
+
+    #[test]
+    fn delete_forward_at_end_joins_with_next_line() {
+        let mut e = editor_with("hello\nworld");
+        e.cursor_row = 0;
+        e.cursor_col = 5;
+        e.delete_forward();
+        assert_eq!(e.lines, vec!["helloworld".to_string()]);
+        assert_eq!(e.cursor_row, 0);
+        assert_eq!(e.cursor_col, 5);
+    }
+
+    #[test]
+    fn move_left_crosses_line_boundary() {
+        let mut e = editor_with("abc\ndef");
+        e.cursor_row = 1;
+        e.cursor_col = 0;
+        e.move_left();
+        assert_eq!(e.cursor_row, 0);
+        assert_eq!(e.cursor_col, 3);
+    }
+
+    #[test]
+    fn move_right_crosses_line_boundary() {
+        let mut e = editor_with("abc\ndef");
+        e.cursor_row = 0;
+        e.cursor_col = 3;
+        e.move_right();
+        assert_eq!(e.cursor_row, 1);
+        assert_eq!(e.cursor_col, 0);
+    }
+
+    #[test]
+    fn move_up_clamps_column() {
+        let mut e = editor_with("ab\nlongline");
+        e.cursor_row = 1;
+        e.cursor_col = 7;
+        e.move_up();
+        assert_eq!(e.cursor_row, 0);
+        assert_eq!(e.cursor_col, 2);
+    }
+
+    #[test]
+    fn home_and_end() {
+        let mut e = editor_with("hello world");
+        e.cursor_col = 5;
+        e.home_line();
+        assert_eq!(e.cursor_col, 0);
+        e.end_line();
+        assert_eq!(e.cursor_col, 11);
+    }
+
+    #[test]
+    fn open_reads_file_and_splits_lines() {
+        let mut tmp = NamedTempFile::new().unwrap();
+        writeln!(tmp, "alpha").unwrap();
+        writeln!(tmp, "beta").unwrap();
+        write!(tmp, "gamma").unwrap();
+        let mut e = Editor::new();
+        e.open(tmp.path()).unwrap();
+        assert_eq!(e.lines, vec!["alpha".to_string(), "beta".to_string(), "gamma".to_string()]);
+        assert_eq!(e.cursor_row, 0);
+        assert_eq!(e.cursor_col, 0);
+        assert!(!e.dirty);
+    }
+
+    #[test]
+    fn open_rejects_binary_files() {
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(b"\x00\x01\x02binary garbage").unwrap();
+        let mut e = Editor::new();
+        let err = e.open(tmp.path()).unwrap_err();
+        assert!(err.to_string().to_lowercase().contains("binary"));
+    }
+
+    #[test]
+    fn save_round_trips_content() {
+        let tmp = NamedTempFile::new().unwrap();
+        let mut e = Editor::new();
+        e.open(tmp.path()).unwrap();
+        e.insert_str("hello\nworld");
+        assert!(e.dirty);
+        e.save_to_disk().unwrap();
+        assert!(!e.dirty);
+        let written = std::fs::read_to_string(tmp.path()).unwrap();
+        assert_eq!(written, "hello\nworld");
+    }
+
+    #[test]
+    fn dirty_flag_lifecycle() {
+        let mut e = editor_with("abc");
+        assert!(!e.dirty);
+        e.insert_char('z');
+        assert!(e.dirty);
+    }
+
+    #[test]
+    fn insert_str_inserts_newlines() {
+        let mut e = editor_with("");
+        e.insert_str("a\nb\nc");
+        assert_eq!(e.lines, vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+        assert_eq!(e.cursor_row, 2);
+        assert_eq!(e.cursor_col, 1);
+    }
+
+    #[test]
+    fn build_line_spans_no_highlights() {
+        let spans = build_line_spans("hello", &[]);
+        assert_eq!(spans.len(), 1);
+    }
+
+    #[test]
+    fn build_line_spans_full_line_highlighted() {
+        let hi = vec![HiSpan { start: 0, end: 5, style: Style::default() }];
+        let spans = build_line_spans("hello", &hi);
+        assert_eq!(spans.len(), 1);
+    }
+
+    #[test]
+    fn build_line_spans_partial_highlights() {
+        let hi = vec![HiSpan { start: 1, end: 3, style: Style::default() }];
+        let spans = build_line_spans("abcde", &hi);
+        // Expect: "a", "bc", "de"
+        assert_eq!(spans.len(), 3);
+    }
+}
+
 impl Widget for &mut Editor {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let block_style = if self.focused {

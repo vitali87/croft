@@ -69,7 +69,7 @@ fn style_for(idx: usize) -> Style {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum LangKind {
     Rust,
     Python,
@@ -301,12 +301,20 @@ fn project_range(
     };
     while start < end && line_idx < line_starts.len() {
         let line_start = line_starts[line_idx];
-        let line_end = line_starts.get(line_idx + 1).copied().unwrap_or(usize::MAX);
-        let chunk_end = end.min(line_end);
-        if chunk_end > start {
+        let next_line_start = line_starts.get(line_idx + 1).copied().unwrap_or(usize::MAX);
+        let chunk_end = end.min(next_line_start);
+        // If we ran into the next-line boundary, the last byte before it is the '\n'
+        // separator, which is not part of the line string. Trim it from the span.
+        let on_boundary = chunk_end == next_line_start && line_idx + 1 < line_starts.len();
+        let span_end_abs = if on_boundary && chunk_end > line_start {
+            chunk_end - 1
+        } else {
+            chunk_end
+        };
+        if span_end_abs > start {
             per_line[line_idx].push(HiSpan {
                 start: start - line_start,
-                end: chunk_end - line_start,
+                end: span_end_abs - line_start,
                 style,
             });
         }
@@ -324,4 +332,136 @@ pub fn compute_line_starts(text: &[u8]) -> Vec<usize> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lang_for_extension_known() {
+        assert_eq!(lang_for_extension("rs"), Some(LangKind::Rust));
+        assert_eq!(lang_for_extension("py"), Some(LangKind::Python));
+        assert_eq!(lang_for_extension("ts"), Some(LangKind::TypeScript));
+        assert_eq!(lang_for_extension("tsx"), Some(LangKind::Tsx));
+        assert_eq!(lang_for_extension("js"), Some(LangKind::JavaScript));
+        assert_eq!(lang_for_extension("jsx"), Some(LangKind::JavaScript));
+        assert_eq!(lang_for_extension("json"), Some(LangKind::Json));
+        assert_eq!(lang_for_extension("toml"), Some(LangKind::Toml));
+        assert_eq!(lang_for_extension("yaml"), Some(LangKind::Yaml));
+        assert_eq!(lang_for_extension("yml"), Some(LangKind::Yaml));
+        assert_eq!(lang_for_extension("md"), Some(LangKind::Markdown));
+        assert_eq!(lang_for_extension("go"), Some(LangKind::Go));
+        assert_eq!(lang_for_extension("html"), Some(LangKind::Html));
+        assert_eq!(lang_for_extension("htm"), Some(LangKind::Html));
+        assert_eq!(lang_for_extension("css"), Some(LangKind::Css));
+        assert_eq!(lang_for_extension("scss"), Some(LangKind::Css));
+        assert_eq!(lang_for_extension("sh"), Some(LangKind::Bash));
+    }
+
+    #[test]
+    fn lang_for_extension_unknown() {
+        assert_eq!(lang_for_extension("xyz"), None);
+        assert_eq!(lang_for_extension(""), None);
+    }
+
+    #[test]
+    fn line_starts_empty_input() {
+        assert_eq!(compute_line_starts(b""), vec![0]);
+    }
+
+    #[test]
+    fn line_starts_single_line_no_newline() {
+        assert_eq!(compute_line_starts(b"hello"), vec![0]);
+    }
+
+    #[test]
+    fn line_starts_multiple_lines() {
+        // "a\nbb\nccc"  → starts at 0, 2, 5
+        assert_eq!(compute_line_starts(b"a\nbb\nccc"), vec![0, 2, 5]);
+    }
+
+    #[test]
+    fn line_starts_trailing_newline() {
+        // "a\nb\n" → starts at 0, 2, 4 (an empty trailing line)
+        assert_eq!(compute_line_starts(b"a\nb\n"), vec![0, 2, 4]);
+    }
+
+    #[test]
+    fn line_starts_only_newlines() {
+        assert_eq!(compute_line_starts(b"\n\n\n"), vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn registry_caches_configs() {
+        let mut reg = LangRegistry::new();
+        // First call should build and insert.
+        assert!(reg.get(LangKind::Rust).is_some());
+        // Second call should hit the cache and still succeed.
+        assert!(reg.get(LangKind::Rust).is_some());
+    }
+
+    #[test]
+    fn highlight_rust_produces_per_line_spans() {
+        let mut reg = LangRegistry::new();
+        let src = "fn main() {\n    let x = 1;\n}\n";
+        let line_starts = compute_line_starts(src.as_bytes());
+        let highlights = highlight_text(&mut reg, LangKind::Rust, src.as_bytes(), &line_starts);
+        // 4 line entries (last "" after trailing newline)
+        assert_eq!(highlights.len(), 4);
+        // Line 0 has "fn" as a keyword — at least one span should land there.
+        assert!(!highlights[0].is_empty(), "line 0 should have spans");
+        // Spans on line 0 should be within line 0's length.
+        let line0_len = "fn main() {".len();
+        for sp in &highlights[0] {
+            assert!(sp.start <= line0_len, "span start {} > line len {}", sp.start, line0_len);
+            assert!(sp.end <= line0_len, "span end {} > line len {}", sp.end, line0_len);
+            assert!(sp.start <= sp.end);
+        }
+    }
+
+    #[test]
+    fn project_range_splits_across_lines() {
+        // "abc\ndef" → line_starts [0, 4]; range 1..6 covers "bc" on line 0 and "de" on line 1
+        let line_starts = vec![0usize, 4];
+        let mut per_line: Vec<Vec<HiSpan>> = vec![Vec::new(); 2];
+        let style = Style::default();
+        project_range(1, 6, style, &line_starts, &mut per_line);
+        assert_eq!(per_line[0].len(), 1);
+        assert_eq!(per_line[0][0].start, 1);
+        // Line content "abc" has byte length 3; the '\n' at byte 3 is excluded.
+        assert_eq!(per_line[0][0].end, 3);
+        assert_eq!(per_line[1].len(), 1);
+        assert_eq!(per_line[1][0].start, 0);
+        assert_eq!(per_line[1][0].end, 2);
+    }
+
+    #[test]
+    fn project_range_excludes_newline_at_end_of_line() {
+        // "abc\n" with the next-line entry set: the span 0..4 must end at 3, not 4.
+        let line_starts = vec![0usize, 4];
+        let mut per_line: Vec<Vec<HiSpan>> = vec![Vec::new(); 2];
+        project_range(0, 4, Style::default(), &line_starts, &mut per_line);
+        assert_eq!(per_line[0].len(), 1);
+        assert_eq!(per_line[0][0].end, 3);
+    }
+
+    #[test]
+    fn project_range_within_single_line() {
+        let line_starts = vec![0usize, 5];
+        let mut per_line: Vec<Vec<HiSpan>> = vec![Vec::new(); 2];
+        project_range(1, 4, Style::default(), &line_starts, &mut per_line);
+        assert_eq!(per_line[0].len(), 1);
+        assert_eq!(per_line[0][0].start, 1);
+        assert_eq!(per_line[0][0].end, 4);
+        assert!(per_line[1].is_empty());
+    }
+
+    #[test]
+    fn project_range_zero_length_noop() {
+        let line_starts = vec![0usize];
+        let mut per_line: Vec<Vec<HiSpan>> = vec![Vec::new(); 1];
+        project_range(3, 3, Style::default(), &line_starts, &mut per_line);
+        assert!(per_line[0].is_empty());
+    }
 }

@@ -53,6 +53,70 @@ impl Cli {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn parses_no_args() {
+        let cli = Cli::parse_from(["tcode"]);
+        assert!(cli.path.is_none());
+        assert!(cli.command.is_none());
+    }
+
+    #[test]
+    fn parses_path_argument() {
+        let cli = Cli::parse_from(["tcode", "/tmp"]);
+        assert_eq!(cli.path, Some(PathBuf::from("/tmp")));
+        assert!(cli.command.is_none());
+    }
+
+    #[test]
+    fn parses_setup_terminal_subcommand_with_defaults() {
+        let cli = Cli::parse_from(["tcode", "setup-terminal"]);
+        assert!(cli.path.is_none());
+        match cli.command {
+            Some(CliCommand::SetupTerminal { font, size, yes }) => {
+                assert_eq!(font, SETUP_FONT_PS_NAME);
+                assert_eq!(size, SETUP_FONT_SIZE);
+                assert!(!yes);
+            }
+            _ => panic!("expected SetupTerminal"),
+        }
+    }
+
+    #[test]
+    fn parses_setup_terminal_with_overrides() {
+        let cli = Cli::parse_from([
+            "tcode",
+            "setup-terminal",
+            "--font",
+            "FiraCodeNFM-Regular",
+            "--size",
+            "14",
+            "--yes",
+        ]);
+        match cli.command {
+            Some(CliCommand::SetupTerminal { font, size, yes }) => {
+                assert_eq!(font, "FiraCodeNFM-Regular");
+                assert_eq!(size, 14);
+                assert!(yes);
+            }
+            _ => panic!("expected SetupTerminal"),
+        }
+    }
+
+    #[test]
+    fn parses_setup_terminal_with_short_yes() {
+        let cli = Cli::parse_from(["tcode", "setup-terminal", "-y"]);
+        match cli.command {
+            Some(CliCommand::SetupTerminal { yes, .. }) => assert!(yes),
+            _ => panic!("expected SetupTerminal"),
+        }
+    }
+}
+
 fn setup_terminal(font: &str, size: u32, yes: bool) -> Result<()> {
     if !cfg!(target_os = "macos") {
         anyhow::bail!("setup-terminal is macOS-only");
