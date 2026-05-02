@@ -1,5 +1,6 @@
 mod app;
 mod cli;
+mod git;
 mod highlight;
 mod icons;
 mod iterm2;

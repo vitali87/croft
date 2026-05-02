@@ -25,6 +25,53 @@ use crate::widgets::{editor::Editor, file_tree::FileTree, terminal::PtyTerminal}
 /// Single source of truth for the application's user-facing name.
 pub const APP_NAME: &str = "croft";
 
+/// Build the status-bar spans for the git pill (branch name, dirty bullet,
+/// ahead/behind counts).  Returns an empty vec when the workspace is not in
+/// a git repo so the status bar shows nothing.
+fn git_status_spans<'a>(status: &'a crate::git::GitStatus) -> Vec<Span<'a>> {
+    if !status.in_repo {
+        return Vec::new();
+    }
+    let mut spans: Vec<Span> = Vec::with_capacity(8);
+    spans.push(Span::raw("  "));
+    // Codicon source-control / git-branch glyph (U+EAFC). Falls back to a
+    // textual marker if the user's font lacks the glyph.
+    spans.push(Span::styled(
+        "\u{eafc} ",
+        Style::default().fg(Color::Rgb(0xdc, 0xb6, 0x7a)),
+    ));
+    let label: &str = match (&status.branch, &status.detached_hash) {
+        (Some(b), _) => b.as_str(),
+        (None, Some(h)) => h.as_str(),
+        (None, None) => "(no head)",
+    };
+    spans.push(Span::styled(
+        label,
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD),
+    ));
+    if status.dirty {
+        spans.push(Span::styled(
+            "\u{2009}●",
+            Style::default().fg(Color::Rgb(0xe8, 0x27, 0x4b)),
+        ));
+    }
+    if status.ahead > 0 {
+        spans.push(Span::styled(
+            format!(" \u{2191}{}", status.ahead),
+            Style::default().fg(Color::Rgb(0xa3, 0xbe, 0x8c)),
+        ));
+    }
+    if status.behind > 0 {
+        spans.push(Span::styled(
+            format!(" \u{2193}{}", status.behind),
+            Style::default().fg(Color::Rgb(0xeb, 0xcb, 0x8b)),
+        ));
+    }
+    spans
+}
+
 /// Text shown inside the colored "brand" pill at the left of the status bar.
 fn brand_pill_text() -> String {
     format!(" {APP_NAME} ")
@@ -92,6 +139,8 @@ pub struct App {
         >,
     >,
     fs_rx: Option<std::sync::mpsc::Receiver<notify_debouncer_full::DebounceEventResult>>,
+    git_status: crate::git::GitStatus,
+    last_git_check: std::time::Instant,
 }
 
 impl App {
@@ -103,6 +152,7 @@ impl App {
             Ok((w, r)) => (Some(w), Some(r)),
             Err(_) => (None, None),
         };
+        let git_status = crate::git::query(&root);
         Ok(Self {
             tree,
             editor,
@@ -115,7 +165,21 @@ impl App {
             prompt: None,
             _fs_watcher: watcher,
             fs_rx: rx,
+            git_status,
+            last_git_check: std::time::Instant::now(),
         })
+    }
+
+    /// Re-query git status, but no more than once every ~400ms to avoid
+    /// spawning a `git` process on every keystroke.  Called after the file
+    /// watcher reports any changes.
+    fn refresh_git_status_debounced(&mut self) {
+        let min_gap = std::time::Duration::from_millis(400);
+        if self.last_git_check.elapsed() < min_gap {
+            return;
+        }
+        self.last_git_check = std::time::Instant::now();
+        self.git_status = crate::git::query(&self.tree.root);
     }
 
     fn spawn_fs_watcher(
@@ -186,6 +250,9 @@ impl App {
                     }
                 }
             }
+        }
+        if !affected.is_empty() || touched_open_file {
+            self.refresh_git_status_debounced();
         }
         if touched_open_file {
             match self.editor.reload_if_clean() {
@@ -264,27 +331,28 @@ impl App {
         frame.render_widget(&mut self.editor, right[0]);
         frame.render_widget(&mut self.terminal, right[1]);
 
-        let status = Paragraph::new(Line::from(vec![
-            Span::styled(
-                brand_pill_text(),
-                Style::default()
-                    .bg(Color::Rgb(0x4e, 0x9a, 0xff))
-                    .fg(Color::Black)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw("  "),
-            Span::raw(&self.status),
-            Span::raw("  "),
-            Span::styled("^q", Style::default().fg(Color::Yellow)),
-            Span::raw(" Quit  "),
-            Span::styled("^s", Style::default().fg(Color::Yellow)),
-            Span::raw(" Save  "),
-            Span::styled("F6", Style::default().fg(Color::Yellow)),
-            Span::raw(" Cycle pane  "),
-            Span::styled("^b", Style::default().fg(Color::Yellow)),
-            Span::raw(" Tree"),
-        ]))
-        .style(Style::default().bg(Color::Rgb(0x1e, 0x3a, 0x6e)));
+        let mut spans: Vec<Span> = Vec::with_capacity(20);
+        spans.push(Span::styled(
+            brand_pill_text(),
+            Style::default()
+                .bg(Color::Rgb(0x4e, 0x9a, 0xff))
+                .fg(Color::Black)
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.extend(git_status_spans(&self.git_status));
+        spans.push(Span::raw("  "));
+        spans.push(Span::raw(&self.status));
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled("^q", Style::default().fg(Color::Yellow)));
+        spans.push(Span::raw(" Quit  "));
+        spans.push(Span::styled("^s", Style::default().fg(Color::Yellow)));
+        spans.push(Span::raw(" Save  "));
+        spans.push(Span::styled("F6", Style::default().fg(Color::Yellow)));
+        spans.push(Span::raw(" Cycle pane  "));
+        spans.push(Span::styled("^b", Style::default().fg(Color::Yellow)));
+        spans.push(Span::raw(" Tree"));
+        let status = Paragraph::new(Line::from(spans))
+            .style(Style::default().bg(Color::Rgb(0x1e, 0x3a, 0x6e)));
         frame.render_widget(status, outer[1]);
 
         // Overlays render last so they sit on top of everything else.
@@ -1088,6 +1156,76 @@ mod tests {
     #[test]
     fn alt_s_is_not_save_key() {
         assert!(!is_save_key(key(KeyCode::Char('s'), KeyModifiers::ALT)));
+    }
+
+    #[test]
+    fn git_status_spans_empty_when_not_in_repo() {
+        let st = crate::git::GitStatus::default();
+        let spans = git_status_spans(&st);
+        assert!(spans.is_empty(), "no git pill outside a git repo");
+    }
+
+    #[test]
+    fn git_status_spans_renders_branch_and_no_dirty_marker_when_clean() {
+        let st = crate::git::GitStatus {
+            in_repo: true,
+            branch: Some("main".into()),
+            detached_hash: None,
+            dirty: false,
+            ahead: 0,
+            behind: 0,
+        };
+        let spans = git_status_spans(&st);
+        let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(joined.contains("main"), "branch name should be present");
+        assert!(!joined.contains('●'), "no dirty bullet when clean");
+    }
+
+    #[test]
+    fn git_status_spans_renders_dirty_marker_when_dirty() {
+        let st = crate::git::GitStatus {
+            in_repo: true,
+            branch: Some("main".into()),
+            detached_hash: None,
+            dirty: true,
+            ahead: 0,
+            behind: 0,
+        };
+        let spans = git_status_spans(&st);
+        let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(joined.contains("main"));
+        assert!(joined.contains('●'), "dirty bullet should appear when dirty");
+    }
+
+    #[test]
+    fn git_status_spans_renders_detached_hash_when_no_branch() {
+        let st = crate::git::GitStatus {
+            in_repo: true,
+            branch: None,
+            detached_hash: Some("abc1234".into()),
+            dirty: false,
+            ahead: 0,
+            behind: 0,
+        };
+        let spans = git_status_spans(&st);
+        let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(joined.contains("abc1234"));
+    }
+
+    #[test]
+    fn git_status_spans_renders_ahead_behind_counts() {
+        let st = crate::git::GitStatus {
+            in_repo: true,
+            branch: Some("main".into()),
+            detached_hash: None,
+            dirty: false,
+            ahead: 2,
+            behind: 1,
+        };
+        let spans = git_status_spans(&st);
+        let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(joined.contains("↑2"));
+        assert!(joined.contains("↓1"));
     }
 
     #[test]

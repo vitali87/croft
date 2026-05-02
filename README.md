@@ -141,7 +141,7 @@ tests/cli.rs            integration tests for the CLI surface
 
 ## Status
 
-What works: three-pane layout, file tree expansion / collapse, mouse and keyboard, file open with tree-sitter highlighting (Rust, Python, JS, TS, TSX, JSON, TOML, YAML, Markdown, Go, HTML, CSS, Bash), full editor write path (insert / delete / Enter / Tab / Backspace / save round-trip with `●` dirty marker), embedded shell with full ANSI color and key forwarding, `setup-terminal` AppleScript helper. The repo ships 80 tests; run with `cargo test`. What does not work yet: command palette, multi-tab editor, search, settings, LSP.
+What works: three-pane layout, file tree expansion / collapse, mouse and keyboard, right-click context menu (New File / New Folder / Delete-to-Trash) with Delete-key shortcut, live filesystem watcher that picks up external changes within ~100ms, file open with tree-sitter highlighting (Rust, Python, JS, TS, TSX, JSON, TOML, YAML, Markdown, Go, HTML, CSS, Bash), full editor write path (insert / delete / Enter / Tab / Backspace / save round-trip with `●` dirty marker, auto-reload on external write when buffer is clean), embedded shell with full ANSI color and key forwarding, git status pill in the bottom bar (branch, dirty bullet, ahead/behind), `setup-terminal` and `setup-iterm2` AppleScript / plist helpers. The repo ships 155 tests; run with `cargo test`. What does not work yet: command palette, multi-tab editor, search, settings, LSP.
 
 ## Limitations
 
