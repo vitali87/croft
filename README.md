@@ -2,11 +2,13 @@
 
 A VS Code style three pane workspace that runs entirely inside your terminal.
 
-* **Left pane:** file explorer (Nerd Font icons, click to open)
+* **Left pane:** file explorer with colored type markers, click to open
 * **Top right pane:** code editor with syntax highlighting
 * **Bottom right pane:** a real interactive shell (your `$SHELL` running on a PTY)
 
 Built on [Textual](https://textual.textualize.io/) and [pyte](https://github.com/selectel/pyte).
+
+The file explorer uses plain Unicode shapes (`●`, `▸`, `▾`) plus per file type colors. This means it works in **any** terminal, including macOS Terminal.app on its default font, with **zero font configuration**. No Nerd Fonts required.
 
 ## Requirements
 
@@ -15,32 +17,13 @@ Built on [Textual](https://textual.textualize.io/) and [pyte](https://github.com
 | macOS or Linux | Uses POSIX `pty.fork` for the embedded terminal. Windows is not supported. |
 | Python 3.12+ | Required by the project. |
 | [uv](https://docs.astral.sh/uv/) | Package manager and runner. |
-| A [Nerd Font](https://www.nerdfonts.com/) in your terminal | Needed for file icons in the explorer. Without one, icons appear as boxes or question marks. |
-| A 256 color or truecolor terminal | iTerm2, Alacritty, kitty, WezTerm, Ghostty, modern Terminal.app are all fine. |
+| A 256 color or truecolor terminal | macOS Terminal.app, iTerm2, Alacritty, kitty, WezTerm, Ghostty are all fine. |
 
 ### Install uv
 
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
-
-### Install a Nerd Font (macOS)
-
-**Use this exact recipe for macOS Terminal.app.** It is the only one that reliably renders all file type icons in the native Terminal.app on recent macOS:
-
-```bash
-brew install --cask font-symbols-only-nerd-font
-brew install --cask font-meslo-lg-nerd-font
-```
-
-Then in Terminal.app: `Settings → Profiles → your profile → Text → Font → Change → MesloLGS Nerd Font (Regular, 13pt)`. Quit Terminal.app entirely and reopen it so the font cache picks up the new fonts.
-
-**Why both fonts:**
-
-* `font-meslo-lg-nerd-font` (a.k.a. MesloLGS NF) is the Nerd Font with the most reliable glyph coverage in Terminal.app. JetBrainsMono Nerd Font has a known bug where its Devicons (file type icons in the U+E700 range) do not render in Terminal.app even when correctly selected (see [JetBrains/JetBrainsMono#732](https://github.com/JetBrains/JetBrainsMono/issues/732)).
-* `font-symbols-only-nerd-font` is a glyphs only font that macOS CoreText uses as a system wide fallback. If any glyph is missing in your primary font, macOS will pick it up from this one automatically. This makes the icons robust even if you switch your terminal font later.
-
-If you prefer a different look, any other Nerd Font from [nerdfonts.com](https://www.nerdfonts.com/font-downloads) works as long as you also keep `font-symbols-only-nerd-font` installed as the fallback.
 
 ## Install the app
 
@@ -108,8 +91,8 @@ The result is that anything you can do in a normal terminal works here too: run 
 
 ## Troubleshooting
 
-**Icons in the file explorer are boxes, question marks, or wrong characters.**
-The single most common cause on macOS Terminal.app is using JetBrainsMono Nerd Font, which has a known bug where Devicons do not render. Use the recipe in the Requirements section above: install both `font-meslo-lg-nerd-font` and `font-symbols-only-nerd-font` via Homebrew, set MesloLGS Nerd Font as the Terminal.app font, and fully quit and reopen Terminal.app.
+**Icons in the file explorer are boxes or wrong characters.**
+This should not happen with the default icon set (`●`, `▸`, `▾` are in every monospace font on macOS). If it does, your terminal is misconfigured for Unicode. Make sure your terminal profile is set to UTF-8 encoding.
 
 **Colors look wrong in the editor or terminal.**
 Make sure your terminal is set to truecolor or 256 colors. In iTerm2: Profiles, Terminal, Report Terminal Type set to `xterm-256color`. The embedded shell exports `TERM=xterm-256color` and `COLORTERM=truecolor` automatically.
