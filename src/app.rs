@@ -43,21 +43,35 @@ enum CreateKind {
     Folder,
 }
 
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum MenuAction {
+    Create(CreateKind),
+    /// Move the path to the OS trash (recoverable).
+    Delete(PathBuf),
+}
+
 struct ContextMenu {
     /// Top-left of the menu in absolute terminal coordinates.
     origin: (u16, u16),
     /// Items, in display order. Each is the label + the action.
-    items: Vec<(String, CreateKind)>,
+    items: Vec<(String, MenuAction)>,
     /// Highlighted row.
     selected: usize,
-    /// Where any subsequent New File / New Folder should be created.
+    /// Where any New File / New Folder should be created.
     target_dir: PathBuf,
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum PromptKind {
+    Create(CreateKind),
+    /// Confirm-deletion modal. Enter trashes the path; Esc cancels.
+    DeleteConfirm(PathBuf),
 }
 
 struct Prompt {
     label: String,
     buffer: String,
-    kind: CreateKind,
+    kind: PromptKind,
     target_dir: PathBuf,
     error: Option<String>,
 }
@@ -355,19 +369,43 @@ impl App {
             width: rect.width.saturating_sub(4),
             height: rect.height.saturating_sub(2),
         };
-        let input_line = ratatui::text::Line::from(vec![
-            ratatui::text::Span::raw("> "),
-            ratatui::text::Span::styled(p.buffer.as_str(), Style::default().fg(Color::White)),
-            ratatui::text::Span::styled("█", Style::default().fg(Color::Rgb(0x4e, 0x9a, 0xff))),
-        ]);
+        let (top_line, hint_text) = match &p.kind {
+            PromptKind::Create(_) => (
+                ratatui::text::Line::from(vec![
+                    ratatui::text::Span::raw("> "),
+                    ratatui::text::Span::styled(
+                        p.buffer.as_str(),
+                        Style::default().fg(Color::White),
+                    ),
+                    ratatui::text::Span::styled(
+                        "█",
+                        Style::default().fg(Color::Rgb(0x4e, 0x9a, 0xff)),
+                    ),
+                ]),
+                "Enter to create, Esc to cancel",
+            ),
+            PromptKind::DeleteConfirm(_) => (
+                ratatui::text::Line::from(vec![
+                    ratatui::text::Span::styled(
+                        "Move to Trash? ",
+                        Style::default()
+                            .fg(Color::Rgb(0xe8, 0x27, 0x4b))
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    ratatui::text::Span::styled(
+                        "(this is recoverable from your OS Trash)",
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]),
+                "Enter to move to Trash, Esc to cancel",
+            ),
+        };
         frame.render_widget(
-            ratatui::widgets::Paragraph::new(input_line),
+            ratatui::widgets::Paragraph::new(top_line),
             Rect { x: inner.x, y: inner.y, width: inner.width, height: 1 },
         );
-        let hint = ratatui::widgets::Paragraph::new(ratatui::text::Line::from(
-            "Enter to create, Esc to cancel",
-        ))
-        .style(Style::default().fg(Color::DarkGray));
+        let hint = ratatui::widgets::Paragraph::new(ratatui::text::Line::from(hint_text))
+            .style(Style::default().fg(Color::DarkGray));
         frame.render_widget(
             hint,
             Rect { x: inner.x, y: inner.y + 2, width: inner.width, height: 1 },
@@ -499,10 +537,10 @@ impl App {
             match m.kind {
                 MouseEventKind::Down(MouseButton::Left) => {
                     if let Some(idx) = self.menu_item_at(m.column, m.row) {
-                        let kind = menu.items[idx].1;
+                        let action = menu.items[idx].1.clone();
                         let dir = menu.target_dir.clone();
                         self.context_menu = None;
-                        self.open_create_prompt(kind, dir);
+                        self.dispatch_menu_action(action, dir);
                     } else {
                         // click outside the menu: dismiss
                         self.context_menu = None;
@@ -525,20 +563,30 @@ impl App {
             MouseEventKind::Down(MouseButton::Right) => {
                 if in_tree {
                     self.focus_pane(Pane::Tree);
-                    let node = self.tree.node_at_y(m.row).map(|i| {
+                    let node_idx = self.tree.node_at_y(m.row).inspect(|&i| {
                         self.tree.select(i);
-                        i
                     });
+                    let node = node_idx.and_then(|i| self.tree.nodes.get(i));
                     let target_dir = crate::widgets::file_tree::create_target_dir_for(
-                        node.and_then(|i| self.tree.nodes.get(i)),
-                        &self.tree.root,
+                        node, &self.tree.root,
                     );
+                    let delete_target = crate::widgets::file_tree::delete_target_for(
+                        node, &self.tree.root,
+                    );
+                    let mut items: Vec<(String, MenuAction)> = vec![
+                        (String::from("New File…"), MenuAction::Create(CreateKind::File)),
+                        (String::from("New Folder…"), MenuAction::Create(CreateKind::Folder)),
+                    ];
+                    if let Some(p) = delete_target {
+                        let label = match p.file_name() {
+                            Some(n) => format!("Delete {}", n.to_string_lossy()),
+                            None => String::from("Delete"),
+                        };
+                        items.push((label, MenuAction::Delete(p)));
+                    }
                     self.context_menu = Some(ContextMenu {
                         origin: (m.column, m.row),
-                        items: vec![
-                            (String::from("New File…"), CreateKind::File),
-                            (String::from("New Folder…"), CreateKind::Folder),
-                        ],
+                        items,
                         selected: 0,
                         target_dir,
                     });
@@ -660,13 +708,20 @@ impl App {
             }
             KeyCode::Enter => {
                 if let Some(menu) = self.context_menu.as_ref() {
-                    let kind = menu.items[menu.selected].1;
+                    let action = menu.items[menu.selected].1.clone();
                     let dir = menu.target_dir.clone();
                     self.context_menu = None;
-                    self.open_create_prompt(kind, dir);
+                    self.dispatch_menu_action(action, dir);
                 }
             }
             _ => {}
+        }
+    }
+
+    fn dispatch_menu_action(&mut self, action: MenuAction, target_dir: PathBuf) {
+        match action {
+            MenuAction::Create(kind) => self.open_create_prompt(kind, target_dir),
+            MenuAction::Delete(path) => self.open_delete_prompt(path),
         }
     }
 
@@ -678,26 +733,45 @@ impl App {
         self.prompt = Some(Prompt {
             label,
             buffer: String::new(),
-            kind,
+            kind: PromptKind::Create(kind),
             target_dir,
             error: None,
         });
     }
 
+    fn open_delete_prompt(&mut self, path: PathBuf) {
+        let label = format!("Delete {}", path.display());
+        let parent = path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| self.tree.root.clone());
+        self.prompt = Some(Prompt {
+            label,
+            buffer: String::new(),
+            kind: PromptKind::DeleteConfirm(path),
+            target_dir: parent,
+            error: None,
+        });
+    }
+
     fn handle_prompt_key(&mut self, key: KeyEvent) {
+        let is_create = matches!(
+            self.prompt.as_ref().map(|p| &p.kind),
+            Some(PromptKind::Create(_))
+        );
         match key.code {
             KeyCode::Esc => {
                 self.prompt = None;
                 self.status = String::from("Cancelled");
             }
             KeyCode::Enter => self.commit_prompt(),
-            KeyCode::Backspace => {
+            KeyCode::Backspace if is_create => {
                 if let Some(p) = self.prompt.as_mut() {
                     p.buffer.pop();
                     p.error = None;
                 }
             }
-            KeyCode::Char(c) => {
+            KeyCode::Char(c) if is_create => {
                 if !key.modifiers.contains(KeyModifiers::CONTROL)
                     && !key.modifiers.contains(KeyModifiers::ALT)
                     && !key.modifiers.contains(KeyModifiers::SUPER)
@@ -716,43 +790,77 @@ impl App {
         let Some(prompt) = self.prompt.as_ref() else {
             return;
         };
-        let name = prompt.buffer.trim().to_string();
-        if let Err(msg) = crate::widgets::file_tree::validate_new_name(&name) {
-            if let Some(p) = self.prompt.as_mut() {
-                p.error = Some(msg.to_string());
-            }
-            return;
-        }
-        let target_dir = prompt.target_dir.clone();
-        let kind = prompt.kind;
-        let result = match kind {
-            CreateKind::File => crate::widgets::file_tree::create_file_in(&target_dir, &name),
-            CreateKind::Folder => crate::widgets::file_tree::create_folder_in(&target_dir, &name),
-        };
-        match result {
-            Ok(path) => {
-                self.prompt = None;
-                self.status = match kind {
-                    CreateKind::File => format!("Created file {}", path.display()),
-                    CreateKind::Folder => format!("Created folder {}", path.display()),
+        let kind = prompt.kind.clone();
+        match kind {
+            PromptKind::Create(create_kind) => {
+                let name = prompt.buffer.trim().to_string();
+                if let Err(msg) = crate::widgets::file_tree::validate_new_name(&name) {
+                    if let Some(p) = self.prompt.as_mut() {
+                        p.error = Some(msg.to_string());
+                    }
+                    return;
+                }
+                let target_dir = prompt.target_dir.clone();
+                let result = match create_kind {
+                    CreateKind::File => {
+                        crate::widgets::file_tree::create_file_in(&target_dir, &name)
+                    }
+                    CreateKind::Folder => {
+                        crate::widgets::file_tree::create_folder_in(&target_dir, &name)
+                    }
                 };
-                if let Some(idx) = self.tree.index_of_dir(&target_dir) {
-                    self.tree.refresh_children(idx);
-                    if let Some(new_idx) = self.tree.nodes.iter().position(|n| n.path == path) {
-                        self.tree.select(new_idx);
+                match result {
+                    Ok(path) => {
+                        self.prompt = None;
+                        self.status = match create_kind {
+                            CreateKind::File => format!("Created file {}", path.display()),
+                            CreateKind::Folder => format!("Created folder {}", path.display()),
+                        };
+                        if let Some(idx) = self.tree.index_of_dir(&target_dir) {
+                            self.tree.refresh_children(idx);
+                            if let Some(new_idx) =
+                                self.tree.nodes.iter().position(|n| n.path == path)
+                            {
+                                self.tree.select(new_idx);
+                            }
+                        }
+                        if create_kind == CreateKind::File {
+                            if let Err(e) = self.editor.open(&path) {
+                                self.status = format!("Created but could not open: {e}");
+                            } else {
+                                self.focus_pane(Pane::Editor);
+                            }
+                        }
                     }
-                }
-                if kind == CreateKind::File {
-                    if let Err(e) = self.editor.open(&path) {
-                        self.status = format!("Created but could not open: {e}");
-                    } else {
-                        self.focus_pane(Pane::Editor);
+                    Err(e) => {
+                        if let Some(p) = self.prompt.as_mut() {
+                            p.error = Some(e.to_string());
+                        }
                     }
                 }
             }
-            Err(e) => {
-                if let Some(p) = self.prompt.as_mut() {
-                    p.error = Some(e.to_string());
+            PromptKind::DeleteConfirm(path) => {
+                match crate::widgets::file_tree::move_to_trash(&path) {
+                    Ok(()) => {
+                        self.prompt = None;
+                        self.status = format!("Moved {} to Trash", path.display());
+                        let parent = path
+                            .parent()
+                            .map(Path::to_path_buf)
+                            .unwrap_or_else(|| self.tree.root.clone());
+                        if let Some(idx) = self.tree.index_of_dir(&parent) {
+                            self.tree.refresh_children(idx);
+                        }
+                        // If the deleted path was open in the editor, clear it.
+                        if self.editor.matches_open_path(&path) {
+                            self.editor = Editor::new();
+                        }
+                    }
+                    Err(e) => {
+                        if let Some(p) = self.prompt.as_mut() {
+                            p.error = Some(e.to_string());
+                        }
+                    }
                 }
             }
         }

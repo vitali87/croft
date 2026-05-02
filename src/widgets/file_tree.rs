@@ -276,6 +276,27 @@ pub fn create_file_in(parent: &Path, name: &str) -> std::io::Result<PathBuf> {
     Ok(target)
 }
 
+/// Decide whether a given node may be deleted via the explorer's right-click
+/// menu, returning the path to delete. Refuses for the workspace root and
+/// returns `None` if `node` is None (i.e. right-click on empty tree space).
+pub fn delete_target_for(node: Option<&Node>, root: &Path) -> Option<PathBuf> {
+    let n = node?;
+    if &n.path == root {
+        return None;
+    }
+    let canon_root = root.canonicalize().ok();
+    let canon_target = n.path.canonicalize().ok();
+    if canon_root.is_some() && canon_target == canon_root {
+        return None;
+    }
+    Some(n.path.clone())
+}
+
+/// Move `path` to the OS trash (recoverable) rather than unlinking it.
+pub fn move_to_trash(path: &Path) -> std::io::Result<()> {
+    trash::delete(path).map_err(|e| std::io::Error::other(format!("{e}")))
+}
+
 /// Given a filesystem event path and the tree's workspace root, return the
 /// directory whose children should be refreshed.
 ///
@@ -542,6 +563,76 @@ mod tests {
         std::fs::create_dir(tmp.path().join("d")).unwrap();
         let err = create_folder_in(tmp.path(), "d").unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+    }
+
+    #[test]
+    fn delete_target_for_root_returns_none() {
+        let tmp = TempDir::new().unwrap();
+        let root_node = Node {
+            path: tmp.path().to_path_buf(),
+            depth: 0,
+            is_dir: true,
+            expanded: true,
+            loaded: true,
+        };
+        assert!(delete_target_for(Some(&root_node), tmp.path()).is_none());
+    }
+
+    #[test]
+    fn delete_target_for_empty_space_returns_none() {
+        let tmp = TempDir::new().unwrap();
+        assert!(delete_target_for(None, tmp.path()).is_none());
+    }
+
+    #[test]
+    fn delete_target_for_file_returns_path() {
+        let tmp = TempDir::new().unwrap();
+        let f = tmp.path().join("doomed.txt");
+        std::fs::write(&f, "").unwrap();
+        let node = Node {
+            path: f.clone(),
+            depth: 1,
+            is_dir: false,
+            expanded: false,
+            loaded: false,
+        };
+        assert_eq!(delete_target_for(Some(&node), tmp.path()), Some(f));
+    }
+
+    #[test]
+    fn delete_target_for_subfolder_returns_path() {
+        let tmp = TempDir::new().unwrap();
+        let sub = tmp.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let node = Node {
+            path: sub.clone(),
+            depth: 1,
+            is_dir: true,
+            expanded: false,
+            loaded: false,
+        };
+        assert_eq!(delete_target_for(Some(&node), tmp.path()), Some(sub));
+    }
+
+    #[test]
+    fn move_to_trash_removes_file_from_workspace() {
+        let tmp = TempDir::new().unwrap();
+        let f = tmp.path().join("bye.txt");
+        std::fs::write(&f, "see ya").unwrap();
+        assert!(f.exists());
+        move_to_trash(&f).unwrap();
+        assert!(!f.exists(), "file should be gone from the workspace after trash");
+    }
+
+    #[test]
+    fn move_to_trash_removes_folder_from_workspace() {
+        let tmp = TempDir::new().unwrap();
+        let d = tmp.path().join("byedir");
+        std::fs::create_dir(&d).unwrap();
+        std::fs::write(d.join("inner.txt"), "x").unwrap();
+        assert!(d.exists());
+        move_to_trash(&d).unwrap();
+        assert!(!d.exists(), "folder should be gone from the workspace after trash");
     }
 
     #[test]
