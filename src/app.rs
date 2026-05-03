@@ -34,7 +34,7 @@ pub enum SidebarView {
 
 const ACTIVITY_BAR_WIDTH: u16 = 4;
 const ACTIVITY_ICON_HEIGHT: u16 = 3;
-const ACTIVITY_ICON_GAP: u16 = 1;
+const ACTIVITY_ICON_GAP: u16 = 0;
 
 fn activity_icon_glyph_x(bar: Rect) -> u16 {
     bar.x + bar.width / 2
