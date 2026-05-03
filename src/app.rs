@@ -387,7 +387,9 @@ impl App {
         spans.push(Span::styled("F6", Style::default().fg(Color::Yellow)));
         spans.push(Span::raw(" Cycle pane  "));
         spans.push(Span::styled("^b", Style::default().fg(Color::Yellow)));
-        spans.push(Span::raw(" Tree"));
+        spans.push(Span::raw(" Tree  "));
+        spans.push(Span::styled("^j", Style::default().fg(Color::Yellow)));
+        spans.push(Span::raw(" Term"));
         let status = Paragraph::new(Line::from(spans))
             .style(Style::default().bg(Color::Rgb(0x1e, 0x3a, 0x6e)));
         frame.render_widget(status, outer[1]);
@@ -1491,6 +1493,19 @@ mod tests {
         assert!(
             !f.contains(crossterm::event::KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES),
             "we should not opt into REPORT_ALL_KEYS_AS_ESCAPE_CODES"
+        );
+    }
+
+    #[test]
+    fn status_bar_advertises_terminal_toggle_shortcut() {
+        let src = include_str!("app.rs");
+        assert!(
+            src.contains("\"^j\""),
+            "status bar should advertise ^j as the terminal-toggle shortcut"
+        );
+        assert!(
+            src.contains("\" Term\""),
+            "status bar should label the ^j shortcut 'Term'"
         );
     }
 
