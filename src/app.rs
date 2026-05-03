@@ -272,13 +272,12 @@ impl App {
         let w_cells = ACTIVITY_BAR_WIDTH;
         let h_cells = ACTIVITY_ICON_HEIGHT;
         let encode = |png: &[u8]| -> String {
-            // preserveAspectRatio=0 → stretch to fill the full N×M cell area.
-            // The PNG's bar-bg fills every pixel inside that area, so the
-            // cells underneath stay visually contiguous with the rest of
-            // the activity bar — no black sliver between the two icons due
-            // to a 1:1 PNG vs non-1:1 cell-area aspect mismatch.
+            // preserveAspectRatio=1 — codicons stay square. The PNG aspect
+            // (80×96, ≈1:1.2) is pre-baked to match a 4-cell × 2-row iTerm2
+            // viewport for the MesloLGS NF cell aspect, so the image fits
+            // edge-to-edge with no black sliver and no stretching.
             let raw =
-                crate::iterm2_inline::build_inline_image_osc(png, w_cells, h_cells, false);
+                crate::iterm2_inline::build_inline_image_osc(png, w_cells, h_cells, true);
             if is_tmux {
                 crate::iterm2_inline::tmux_passthrough_wrap(&raw)
             } else {
