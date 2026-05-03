@@ -167,9 +167,6 @@ pub struct App {
     fs_rx: Option<std::sync::mpsc::Receiver<notify_debouncer_full::DebounceEventResult>>,
     git_status: crate::git::GitStatus,
     last_git_check: std::time::Instant,
-    /// Wall-clock instant at which the cursor blink phase last toggled, OR
-    /// at which user activity (typing / movement) last reset the phase.
-    cursor_blink_anchor: std::time::Instant,
 }
 
 impl App {
@@ -201,32 +198,7 @@ impl App {
             fs_rx: rx,
             git_status,
             last_git_check: std::time::Instant::now(),
-            cursor_blink_anchor: std::time::Instant::now(),
         })
-    }
-
-    /// Reset the cursor blink phase so the caret is solidly visible right
-    /// now and does not blink off until ~530ms after this call. Used after
-    /// any edit, cursor movement, or focus change so the user always sees
-    /// where the cursor just landed.
-    fn poke_cursor(&mut self) {
-        self.cursor_blink_anchor = std::time::Instant::now();
-        self.editor.cursor_blink_on = true;
-    }
-
-    /// Compute the current blink phase from the elapsed time since the
-    /// last poke / toggle.  VS Code uses a 530ms half-period; we match.
-    /// The first 530ms after a poke shows the caret solidly; the next
-    /// 530ms hides it; and so on, as long as the editor pane has focus.
-    fn tick_cursor_blink(&mut self) {
-        const HALF: std::time::Duration = std::time::Duration::from_millis(530);
-        if !self.editor.focused {
-            self.editor.cursor_blink_on = true;
-            return;
-        }
-        let elapsed = self.cursor_blink_anchor.elapsed();
-        let phases = (elapsed.as_millis() / HALF.as_millis()) as u64;
-        self.editor.cursor_blink_on = phases % 2 == 0;
     }
 
     /// Re-query git status, but no more than once every ~400ms to avoid
@@ -486,9 +458,6 @@ impl App {
         self.tree.focused = self.focus == Pane::Tree;
         self.editor.focused = self.focus == Pane::Editor;
         self.terminal.focused = self.focus == Pane::Terminal;
-        if self.editor.focused {
-            self.poke_cursor();
-        }
     }
 
     fn render(&mut self, frame: &mut ratatui::Frame) {
@@ -577,6 +546,16 @@ impl App {
         // Overlays render last so they sit on top of everything else.
         self.render_context_menu(frame);
         self.render_prompt(frame);
+
+        // Show the host terminal's hardware caret only when the editor is
+        // focused and has no modal overlay. The DECSCUSR style is set to
+        // BlinkingBar at startup, so the terminal blinks a thin vertical
+        // line over the cursor cell without replacing its character.
+        if self.focus == Pane::Editor && self.context_menu.is_none() && self.prompt.is_none() {
+            if let Some((cx, cy)) = self.editor.cursor_screen_pos() {
+                frame.set_cursor_position((cx, cy));
+            }
+        }
     }
 
     fn render_context_menu(&self, frame: &mut ratatui::Frame) {
@@ -740,10 +719,7 @@ impl App {
                 SidebarView::Explorer => self.handle_tree_key(key),
                 SidebarView::Search => self.handle_search_key(key),
             },
-            Pane::Editor => {
-                self.handle_editor_key(key);
-                self.poke_cursor();
-            }
+            Pane::Editor => self.handle_editor_key(key),
             Pane::Terminal => self.handle_terminal_key(key),
         }
         Ok(())
@@ -1149,7 +1125,6 @@ impl App {
                     // Anchor a fresh selection at the click; a drag widens it,
                     // a clean click ends up cleared on mouse-up.
                     self.editor.mouse_down(m.column, m.row);
-                    self.poke_cursor();
                 } else if in_terminal {
                     self.focus_pane(Pane::Terminal);
                     // Begin a fresh selection at the click cell. Without a
@@ -1162,7 +1137,6 @@ impl App {
             MouseEventKind::Drag(MouseButton::Left) => {
                 if in_editor {
                     self.editor.mouse_drag(m.column, m.row);
-                    self.poke_cursor();
                 } else if in_tree {
                     if let Some(idx) = self.tree.node_at_y(m.row) {
                         self.tree.select(idx);
@@ -2081,8 +2055,14 @@ pub fn run(root: PathBuf) -> Result<()> {
 
     enable_raw_mode().context("enable raw mode")?;
     let mut out = stdout();
-    execute!(out, EnterAlternateScreen, EnableMouseCapture, EnableBracketedPaste)
-        .context("enter alt screen")?;
+    execute!(
+        out,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableBracketedPaste,
+        crossterm::cursor::SetCursorStyle::BlinkingBar,
+    )
+    .context("enter alt screen")?;
     // Best-effort: terminals that don't speak the kitty keyboard protocol just
     // ignore this; ones that do (iTerm2 >=3.5, Ghostty, kitty, WezTerm) start
     // delivering Cmd/Super as a real modifier so cmd+s reaches the app.
@@ -2114,9 +2094,10 @@ pub fn run(root: PathBuf) -> Result<()> {
     }
     execute!(
         terminal.backend_mut(),
+        crossterm::cursor::SetCursorStyle::DefaultUserShape,
         LeaveAlternateScreen,
         DisableMouseCapture,
-        DisableBracketedPaste
+        DisableBracketedPaste,
     )
     .ok();
     terminal.show_cursor().ok();
@@ -2132,7 +2113,6 @@ fn main_loop(
         // Pull in any filesystem-watcher events first so the tree reflects
         // disk reality on the very next frame.
         app.drain_fs_events();
-        app.tick_cursor_blink();
 
         terminal.draw(|f| {
             app.render(f);

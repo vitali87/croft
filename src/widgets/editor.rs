@@ -78,9 +78,6 @@ pub struct Editor {
     pub last_inner: Rect,
     pub last_gutter_width: u16,
     pub selection: Option<EditorSelection>,
-    /// Whether the (thin vertical bar) cursor glyph is currently shown.
-    /// Owned and ticked by `App`; the editor only reads it during render.
-    pub cursor_blink_on: bool,
     undo_stack: Vec<Snapshot>,
     last_edit_kind: Option<EditKind>,
     lang: Option<LangKind>,
@@ -103,7 +100,6 @@ impl Editor {
             last_inner: Rect::default(),
             last_gutter_width: 0,
             selection: None,
-            cursor_blink_on: true,
             undo_stack: Vec::new(),
             last_edit_kind: None,
             lang: None,
@@ -1307,12 +1303,14 @@ mod tests {
     }
 
     #[test]
-    fn render_uses_thin_bar_glyph_at_cursor_when_blink_on() {
+    fn render_never_replaces_character_at_cursor() {
+        // The hardware caret (DECSCUSR BlinkingBar) overlays the cell at the
+        // cursor position; the editor's own render must NEVER change the
+        // symbol there or the blink would visibly swallow the letter.
         use ratatui::buffer::Buffer;
         let mut e = editor_with("hello");
         e.cursor_col = 2;
         e.focused = true;
-        e.cursor_blink_on = true;
 
         let area = Rect { x: 0, y: 0, width: 30, height: 5 };
         let mut buf = Buffer::empty(area);
@@ -1320,42 +1318,29 @@ mod tests {
 
         let text_x = e.last_inner.x + e.last_gutter_width + 1;
         let cell = &buf[(text_x + 2, e.last_inner.y)];
-        assert_eq!(cell.symbol(), "▏", "cursor cell should render the thin vertical bar");
+        assert_eq!(cell.symbol(), "l", "editor render must leave the underlying glyph alone");
     }
 
     #[test]
-    fn render_omits_cursor_glyph_when_blink_off() {
-        use ratatui::buffer::Buffer;
-        let mut e = editor_with("hello");
-        e.cursor_col = 2;
-        e.focused = true;
-        e.cursor_blink_on = false;
-
-        let area = Rect { x: 0, y: 0, width: 30, height: 5 };
-        let mut buf = Buffer::empty(area);
-        (&mut e).render(area, &mut buf);
-
-        let text_x = e.last_inner.x + e.last_gutter_width + 1;
-        let cell = &buf[(text_x + 2, e.last_inner.y)];
-        // The original character 'l' is at char index 2 of "hello".
-        assert_eq!(cell.symbol(), "l", "blink-off should leave the original glyph visible");
+    fn cursor_screen_pos_inside_viewport() {
+        let mut e = editor_with("hello\nworld");
+        e.last_inner = Rect { x: 5, y: 7, width: 80, height: 25 };
+        e.last_gutter_width = 2;
+        e.cursor_row = 1;
+        e.cursor_col = 3;
+        // text_x = inner.x + gutter + 1 = 5 + 2 + 1 = 8
+        // cy = inner.y + (cursor_row - scroll) = 7 + 1 = 8
+        assert_eq!(e.cursor_screen_pos(), Some((8 + 3, 8)));
     }
 
     #[test]
-    fn render_does_not_draw_cursor_when_unfocused() {
-        use ratatui::buffer::Buffer;
-        let mut e = editor_with("hello");
-        e.cursor_col = 2;
-        e.focused = false;
-        e.cursor_blink_on = true;
-
-        let area = Rect { x: 0, y: 0, width: 30, height: 5 };
-        let mut buf = Buffer::empty(area);
-        (&mut e).render(area, &mut buf);
-
-        let text_x = e.last_inner.x + e.last_gutter_width + 1;
-        let cell = &buf[(text_x + 2, e.last_inner.y)];
-        assert_eq!(cell.symbol(), "l", "unfocused editor should not paint a cursor");
+    fn cursor_screen_pos_returns_none_when_scrolled_off() {
+        let mut e = editor_with_lines(50);
+        e.last_inner = Rect { x: 0, y: 0, width: 40, height: 10 };
+        e.last_gutter_width = 3;
+        e.scroll = 30;
+        e.cursor_row = 5; // above viewport
+        assert_eq!(e.cursor_screen_pos(), None);
     }
 
     #[test]
@@ -1618,19 +1603,41 @@ impl Widget for &mut Editor {
                 }
             }
 
-            if self.focused && self.cursor_blink_on && line_idx == self.cursor_row {
-                let col = (self.cursor_col as u16).min(text_width.saturating_sub(1));
-                let cx = text_x + col;
-                if cx < inner.x + inner.width {
-                    let cell = &mut buf[(cx, y)];
-                    // VS Code style thin caret: U+258F (LEFT ONE EIGHTH BLOCK)
-                    // renders as a slim vertical line on the cell's left edge,
-                    // hugging the start of the character it sits on.
-                    cell.set_symbol("\u{258f}");
-                    cell.fg = Color::Rgb(0xff, 0xff, 0xff);
-                }
-            }
+            // The cursor itself is drawn by the host terminal as a hardware
+            // caret (DECSCUSR `BlinkingBar`); App calls
+            // `frame.set_cursor_position(...)` so the blink/overlay never
+            // hides the underlying character.
         }
+    }
+}
+
+impl Editor {
+    /// Absolute (column, row) of the editor's cursor in screen coordinates,
+    /// or `None` if the cursor is outside the visible viewport. Used by
+    /// `App::render` to position the host terminal's hardware caret.
+    pub fn cursor_screen_pos(&self) -> Option<(u16, u16)> {
+        if self.last_inner.height == 0 {
+            return None;
+        }
+        if self.cursor_row < self.scroll {
+            return None;
+        }
+        let row_in_view = self.cursor_row - self.scroll;
+        if (row_in_view as u16) >= self.last_inner.height {
+            return None;
+        }
+        let text_x = self.last_inner.x + self.last_gutter_width + 1;
+        let text_width = self
+            .last_inner
+            .width
+            .saturating_sub(self.last_gutter_width + 2);
+        if text_width == 0 {
+            return None;
+        }
+        let col = (self.cursor_col as u16).min(text_width.saturating_sub(1));
+        let cx = text_x + col;
+        let cy = self.last_inner.y + row_in_view as u16;
+        Some((cx, cy))
     }
 }
 
