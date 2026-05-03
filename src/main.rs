@@ -4,6 +4,7 @@ mod git;
 mod highlight;
 mod icons;
 mod iterm2;
+mod iterm2_inline;
 mod widgets;
 
 use anyhow::Result;

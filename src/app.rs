@@ -33,13 +33,58 @@ pub enum SidebarView {
 }
 
 const ACTIVITY_BAR_WIDTH: u16 = 4;
+const ACTIVITY_ICON_HEIGHT: u16 = 3;
+const ACTIVITY_ICON_GAP: u16 = 1;
+
+fn activity_icon_glyph_x(bar: Rect) -> u16 {
+    bar.x + bar.width / 2
+}
+
+fn activity_explorer_y(bar: Rect) -> u16 {
+    bar.y + 1
+}
+
+fn activity_search_y(bar: Rect) -> u16 {
+    activity_explorer_y(bar) + ACTIVITY_ICON_HEIGHT + ACTIVITY_ICON_GAP
+}
+
+fn activity_explorer_block(bar: Rect) -> Rect {
+    Rect {
+        x: bar.x,
+        y: activity_explorer_y(bar),
+        width: bar.width,
+        height: ACTIVITY_ICON_HEIGHT,
+    }
+}
+
+fn activity_search_block(bar: Rect) -> Rect {
+    Rect {
+        x: bar.x,
+        y: activity_search_y(bar),
+        width: bar.width,
+        height: ACTIVITY_ICON_HEIGHT,
+    }
+}
 
 #[derive(Default, Clone, Copy)]
 struct SidebarAreas {
-    /// Cell occupied by the Explorer activity-bar icon, in absolute coords.
+    /// Block occupied by the Explorer activity-bar icon, in absolute coords.
+    /// Multi-row when image rendering is active; the hit-test still uses the
+    /// whole block.
     explorer_icon: Rect,
-    /// Cell occupied by the Search activity-bar icon, in absolute coords.
+    /// Block occupied by the Search activity-bar icon, in absolute coords.
     search_icon: Rect,
+}
+
+/// Pre-encoded iTerm2 OSC-1337 inline-image escape sequences for each icon
+/// state. Encoded once in `App::init_graphics` (no PNG re-encoding per
+/// frame) and rewritten under the activity-bar block after every ratatui
+/// frame draw, since ratatui's bg-clear overdraws the image.
+struct ActivityBarImages {
+    explorer_active: String,
+    explorer_inactive: String,
+    search_active: String,
+    search_inactive: String,
 }
 
 /// Single source of truth for the application's user-facing name.
@@ -172,6 +217,10 @@ pub struct App {
     /// off-half. `poke_cursor()` resets it so the caret stays solidly
     /// visible right after any user activity.
     cursor_blink_anchor: std::time::Instant,
+    /// Pre-encoded inline-image escapes for the activity-bar icons. `None`
+    /// when the host terminal can't render OSC-1337 (we then fall back to
+    /// the codicon glyph rendered inside the same multi-row block).
+    activity_images: Option<ActivityBarImages>,
 }
 
 impl App {
@@ -204,7 +253,66 @@ impl App {
             git_status,
             last_git_check: std::time::Instant::now(),
             cursor_blink_anchor: std::time::Instant::now(),
+            activity_images: None,
         })
+    }
+
+    /// Detect inline-image support via env vars only — no stdin queries, no
+    /// raw-mode contention. Pre-encodes the four icon escapes once so the
+    /// post-frame emit just does a single `Print` per icon. Width/height are
+    /// passed in cells: 3 cells wide (the bar minus the active-pill column)
+    /// × `ACTIVITY_ICON_HEIGHT` rows.
+    pub fn init_graphics(&mut self) {
+        if !crate::iterm2_inline::detect_iterm2_inline_support() {
+            return;
+        }
+        let is_tmux = crate::iterm2_inline::detect_tmux();
+        let w_cells = ACTIVITY_BAR_WIDTH.saturating_sub(1);
+        let h_cells = ACTIVITY_ICON_HEIGHT;
+        let encode = |png: &[u8]| -> String {
+            let raw =
+                crate::iterm2_inline::build_inline_image_osc(png, w_cells, h_cells, true);
+            if is_tmux {
+                crate::iterm2_inline::tmux_passthrough_wrap(&raw)
+            } else {
+                raw
+            }
+        };
+        self.activity_images = Some(ActivityBarImages {
+            explorer_active: encode(crate::iterm2_inline::EXPLORER_ACTIVE_PNG),
+            explorer_inactive: encode(crate::iterm2_inline::EXPLORER_INACTIVE_PNG),
+            search_active: encode(crate::iterm2_inline::SEARCH_ACTIVE_PNG),
+            search_inactive: encode(crate::iterm2_inline::SEARCH_INACTIVE_PNG),
+        });
+    }
+
+    /// Returns the post-frame OSC-1337 escapes to write under the activity
+    /// bar, paired with the absolute terminal cell where each one starts
+    /// (just past the active-pill column). Empty when image rendering is
+    /// disabled or the activity bar hasn't been laid out yet.
+    pub fn pending_activity_image_overlays(&self) -> Vec<((u16, u16), &str)> {
+        let Some(images) = self.activity_images.as_ref() else {
+            return Vec::new();
+        };
+        let exp_block = self.sidebar_areas.explorer_icon;
+        let sea_block = self.sidebar_areas.search_icon;
+        if exp_block.width == 0 || sea_block.width == 0 {
+            return Vec::new();
+        }
+        let exp_state = if self.sidebar_view == SidebarView::Explorer {
+            &images.explorer_active
+        } else {
+            &images.explorer_inactive
+        };
+        let sea_state = if self.sidebar_view == SidebarView::Search {
+            &images.search_active
+        } else {
+            &images.search_inactive
+        };
+        vec![
+            ((exp_block.x + 1, exp_block.y), exp_state.as_str()),
+            ((sea_block.x + 1, sea_block.y), sea_state.as_str()),
+        ]
     }
 
     /// Reset the blink phase so the caret is solidly visible for the next
@@ -361,97 +469,71 @@ impl App {
         if area.width == 0 || area.height == 0 {
             return;
         }
-        // Solid-ish background for the bar.
         let bg = Style::default().bg(Color::Rgb(0x14, 0x1a, 0x2a));
         frame.render_widget(
             ratatui::widgets::Block::default().style(bg),
             area,
         );
-        // Two icons: Explorer (cod-files) and Search (cod-search).
-        let active_color = Color::White;
-        let inactive_color = Color::Rgb(0x6c, 0x7d, 0x9c);
         let active_bar = Color::Rgb(0x4e, 0x9a, 0xff);
-        let icon_y = area.y + 1;
-        let explorer_icon_x = area.x + 1;
-        let search_icon_y = area.y + 3;
-        let search_icon_x = area.x + 1;
+        let bg_color = bg.bg.unwrap_or(Color::Reset);
+        let explorer_block = activity_explorer_block(area);
+        let search_block = activity_search_block(area);
+        let explorer_active = self.sidebar_view == SidebarView::Explorer;
+        let search_active = self.sidebar_view == SidebarView::Search;
 
-        let render_icon = |frame: &mut ratatui::Frame,
-                           cell_x: u16,
-                           cell_y: u16,
-                           glyph: &str,
-                           is_active: bool| {
-            let color = if is_active {
-                active_color
-            } else {
-                inactive_color
-            };
-            let line = Line::from(vec![
-                Span::styled(
-                    if is_active { "▎" } else { " " },
-                    Style::default().fg(active_bar),
-                ),
-                Span::styled(
-                    format!(" {glyph} "),
-                    Style::default().fg(color).add_modifier(Modifier::BOLD),
-                ),
-            ]);
-            let row = Rect {
-                x: area.x,
-                y: cell_y,
-                width: area.width,
-                height: 1,
-            };
-            frame.render_widget(
-                ratatui::widgets::Paragraph::new(line).style(bg),
-                row,
-            );
-            // Return the icon-glyph cell for hit-testing (skip the leading
-            // active-bar cell + leading space).
-            Rect {
-                x: cell_x + 1,
-                y: cell_y,
-                width: 1,
-                height: 1,
+        let active_pill = |frame: &mut ratatui::Frame, block: Rect, is_active: bool| {
+            if !is_active {
+                return;
             }
+            let mid = block.y + block.height / 2;
+            let cell = Rect { x: block.x, y: mid, width: 1, height: 1 };
+            frame.render_widget(
+                ratatui::widgets::Paragraph::new("▎")
+                    .style(Style::default().fg(active_bar).bg(bg_color)),
+                cell,
+            );
         };
+        active_pill(frame, explorer_block, explorer_active);
+        active_pill(frame, search_block, search_active);
 
-        let explorer_glyph_ch = crate::icons::ACTIVITY_EXPLORER;
-        let search_glyph_ch = crate::icons::ACTIVITY_SEARCH;
-        let explorer_glyph = explorer_glyph_ch.to_string();
-        let explorer_glyph = explorer_glyph.as_str();
-        let search_glyph = search_glyph_ch.to_string();
-        let search_glyph = search_glyph.as_str();
+        // When inline-image rendering is on, leave the icon area as plain
+        // background. main_loop emits the OSC-1337 sequences over those
+        // cells right after `terminal.draw()` returns.
+        if self.activity_images.is_none() {
+            let active_color = Color::White;
+            let inactive_color = Color::Rgb(0x6c, 0x7d, 0x9c);
+            let glyph_x = activity_icon_glyph_x(area);
+            let render_glyph =
+                |frame: &mut ratatui::Frame, block: Rect, glyph: char, is_active: bool| {
+                    let mid = block.y + block.height / 2;
+                    let cell = Rect { x: glyph_x, y: mid, width: 1, height: 1 };
+                    let color = if is_active { active_color } else { inactive_color };
+                    frame.render_widget(
+                        ratatui::widgets::Paragraph::new(glyph.to_string()).style(
+                            Style::default()
+                                .fg(color)
+                                .bg(bg_color)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        cell,
+                    );
+                };
+            render_glyph(
+                frame,
+                explorer_block,
+                crate::icons::ACTIVITY_EXPLORER,
+                explorer_active,
+            );
+            render_glyph(
+                frame,
+                search_block,
+                crate::icons::ACTIVITY_SEARCH,
+                search_active,
+            );
+        }
 
-        let exp_rect = render_icon(
-            frame,
-            explorer_icon_x,
-            icon_y,
-            explorer_glyph,
-            self.sidebar_view == SidebarView::Explorer,
-        );
-        let sea_rect = render_icon(
-            frame,
-            search_icon_x,
-            search_icon_y,
-            search_glyph,
-            self.sidebar_view == SidebarView::Search,
-        );
-
-        // Save broader hit areas: the entire row, not just the glyph cell.
-        self.sidebar_areas.explorer_icon = Rect {
-            x: area.x,
-            y: icon_y,
-            width: area.width,
-            height: 1,
-        };
-        self.sidebar_areas.search_icon = Rect {
-            x: area.x,
-            y: search_icon_y,
-            width: area.width,
-            height: 1,
-        };
-        let _ = (exp_rect, sea_rect); // currently unused, here for future use
+        self.sidebar_areas.explorer_icon = explorer_block;
+        self.sidebar_areas.search_icon = search_block;
     }
 
     fn set_sidebar_view(&mut self, view: SidebarView) {
@@ -2159,6 +2241,10 @@ pub fn run(root: PathBuf) -> Result<()> {
         out.write_all(&set_title_seq(&title)).ok();
         out.flush().ok();
     }
+    // Env-var-only iTerm2 detection: no stdin queries, so this can't
+    // contend with the crossterm event reader.
+    app.init_graphics();
+
     let backend = CrosstermBackend::new(out);
     let mut terminal: Terminal<CrosstermBackend<Stdout>> =
         Terminal::new(backend).context("create terminal")?;
@@ -2209,6 +2295,24 @@ fn main_loop(
             terminal.draw(|f| {
                 app.render(f);
             })?;
+            // After ratatui flushes its diff, paint the activity-bar icons
+            // directly via OSC-1337. Bypassing the buffer is the only path
+            // that's known to work in iTerm2 (yazi uses the same trick).
+            // ratatui's bg block re-clears those cells on every frame, so
+            // we re-emit on every redraw — no flicker because both writes
+            // hit the same diff cycle.
+            let overlays = app.pending_activity_image_overlays();
+            if !overlays.is_empty() {
+                use std::io::Write;
+                let mut out = stdout();
+                let _ = write!(out, "\x1b[s"); // DECSC: save cursor
+                for ((x, y), seq) in overlays {
+                    let _ = write!(out, "\x1b[{};{}H", y + 1, x + 1); // 1-based
+                    let _ = out.write_all(seq.as_bytes());
+                }
+                let _ = write!(out, "\x1b[u"); // DECRC: restore cursor
+                let _ = out.flush();
+            }
             needs_redraw = false;
             last_blink_visible = blink_visible;
         }
