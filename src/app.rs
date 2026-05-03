@@ -33,7 +33,7 @@ pub enum SidebarView {
 }
 
 const ACTIVITY_BAR_WIDTH: u16 = 4;
-const ACTIVITY_ICON_HEIGHT: u16 = 3;
+const ACTIVITY_ICON_HEIGHT: u16 = 2;
 const ACTIVITY_ICON_GAP: u16 = 0;
 
 fn activity_icon_glyph_x(bar: Rect) -> u16 {
@@ -267,7 +267,9 @@ impl App {
             return;
         }
         let is_tmux = crate::iterm2_inline::detect_tmux();
-        let w_cells = ACTIVITY_BAR_WIDTH.saturating_sub(1);
+        // Full bar width; the active-pill is baked into the PNGs so we don't
+        // reserve a separate column for it.
+        let w_cells = ACTIVITY_BAR_WIDTH;
         let h_cells = ACTIVITY_ICON_HEIGHT;
         let encode = |png: &[u8]| -> String {
             let raw =
@@ -310,8 +312,8 @@ impl App {
             &images.search_inactive
         };
         vec![
-            ((exp_block.x + 1, exp_block.y), exp_state.as_str()),
-            ((sea_block.x + 1, sea_block.y), sea_state.as_str()),
+            ((exp_block.x, exp_block.y), exp_state.as_str()),
+            ((sea_block.x, sea_block.y), sea_state.as_str()),
         ]
     }
 
@@ -481,31 +483,25 @@ impl App {
         let explorer_active = self.sidebar_view == SidebarView::Explorer;
         let search_active = self.sidebar_view == SidebarView::Search;
 
-        let active_pill = |frame: &mut ratatui::Frame, block: Rect, is_active: bool| {
-            if !is_active {
-                return;
-            }
-            let mid = block.y + block.height / 2;
-            let cell = Rect { x: block.x, y: mid, width: 1, height: 1 };
-            frame.render_widget(
-                ratatui::widgets::Paragraph::new("▎")
-                    .style(Style::default().fg(active_bar).bg(bg_color)),
-                cell,
-            );
-        };
-        active_pill(frame, explorer_block, explorer_active);
-        active_pill(frame, search_block, search_active);
-
-        // When inline-image rendering is on, leave the icon area as plain
-        // background. main_loop emits the OSC-1337 sequences over those
-        // cells right after `terminal.draw()` returns.
         if self.activity_images.is_none() {
+            // Glyph fallback path: render the codicon and a separate active
+            // pill on the leftmost column. iTerm2's image path bakes the
+            // pill into the PNG itself, so this branch is only used on
+            // terminals that can't render OSC-1337.
             let active_color = Color::White;
             let inactive_color = Color::Rgb(0x6c, 0x7d, 0x9c);
             let glyph_x = activity_icon_glyph_x(area);
             let render_glyph =
                 |frame: &mut ratatui::Frame, block: Rect, glyph: char, is_active: bool| {
-                    let mid = block.y + block.height / 2;
+                    let mid = block.y + block.height.saturating_sub(1) / 2;
+                    if is_active {
+                        let pill = Rect { x: block.x, y: mid, width: 1, height: 1 };
+                        frame.render_widget(
+                            ratatui::widgets::Paragraph::new("▎")
+                                .style(Style::default().fg(active_bar).bg(bg_color)),
+                            pill,
+                        );
+                    }
                     let cell = Rect { x: glyph_x, y: mid, width: 1, height: 1 };
                     let color = if is_active { active_color } else { inactive_color };
                     frame.render_widget(
