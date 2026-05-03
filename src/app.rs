@@ -33,6 +33,38 @@ pub enum SidebarView {
 }
 
 const ACTIVITY_BAR_WIDTH: u16 = 4;
+const ACTIVITY_ICON_HEIGHT: u16 = 3;
+const ACTIVITY_ICON_GAP: u16 = 1;
+
+fn activity_icon_glyph_x(bar: Rect) -> u16 {
+    bar.x + bar.width / 2
+}
+
+fn activity_explorer_y(bar: Rect) -> u16 {
+    bar.y + 1
+}
+
+fn activity_search_y(bar: Rect) -> u16 {
+    activity_explorer_y(bar) + ACTIVITY_ICON_HEIGHT + ACTIVITY_ICON_GAP
+}
+
+fn activity_explorer_block(bar: Rect) -> Rect {
+    Rect {
+        x: bar.x,
+        y: activity_explorer_y(bar),
+        width: bar.width,
+        height: ACTIVITY_ICON_HEIGHT,
+    }
+}
+
+fn activity_search_block(bar: Rect) -> Rect {
+    Rect {
+        x: bar.x,
+        y: activity_search_y(bar),
+        width: bar.width,
+        height: ACTIVITY_ICON_HEIGHT,
+    }
+}
 
 #[derive(Default, Clone, Copy)]
 struct SidebarAreas {
@@ -172,6 +204,18 @@ pub struct App {
     /// off-half. `poke_cursor()` resets it so the caret stays solidly
     /// visible right after any user activity.
     cursor_blink_anchor: std::time::Instant,
+    /// Inline-image protocols for the activity-bar icons. `None` until
+    /// `init_graphics` runs (after alt-screen is entered) or when the host
+    /// terminal can't do real graphics protocols (we then fall back to the
+    /// 1-cell codicon glyph).
+    activity_images: Option<ActivityBarImages>,
+}
+
+struct ActivityBarImages {
+    explorer_active: ratatui_image::protocol::StatefulProtocol,
+    explorer_inactive: ratatui_image::protocol::StatefulProtocol,
+    search_active: ratatui_image::protocol::StatefulProtocol,
+    search_inactive: ratatui_image::protocol::StatefulProtocol,
 }
 
 impl App {
@@ -204,7 +248,38 @@ impl App {
             git_status,
             last_git_check: std::time::Instant::now(),
             cursor_blink_anchor: std::time::Instant::now(),
+            activity_images: None,
         })
+    }
+
+    /// Probe the host terminal for inline-image support and pre-build the
+    /// activity-bar icon protocols. Must run after the app enters the
+    /// alternate screen (so the query escapes don't echo into normal output)
+    /// and before the event loop reads keystrokes (so the response sequences
+    /// land on `Picker::from_query_stdio`'s read, not on us).
+    pub fn init_graphics(&mut self) {
+        use ratatui_image::picker::{Picker, ProtocolType};
+        let Ok(picker) = Picker::from_query_stdio() else {
+            return; // glyph fallback
+        };
+        if matches!(picker.protocol_type(), ProtocolType::Halfblocks) {
+            // Halfblocks rendering of small codicons looks worse than the
+            // crisp 1-cell glyph fallback, so don't bother.
+            return;
+        }
+        let load = |bytes: &[u8]| -> Option<ratatui_image::protocol::StatefulProtocol> {
+            let img = crate::activity_icons::decode(bytes).ok()?;
+            Some(picker.new_resize_protocol(img))
+        };
+        let images = (|| {
+            Some(ActivityBarImages {
+                explorer_active: load(crate::activity_icons::EXPLORER_ACTIVE_PNG)?,
+                explorer_inactive: load(crate::activity_icons::EXPLORER_INACTIVE_PNG)?,
+                search_active: load(crate::activity_icons::SEARCH_ACTIVE_PNG)?,
+                search_inactive: load(crate::activity_icons::SEARCH_INACTIVE_PNG)?,
+            })
+        })();
+        self.activity_images = images;
     }
 
     /// Reset the blink phase so the caret is solidly visible for the next
@@ -361,97 +436,100 @@ impl App {
         if area.width == 0 || area.height == 0 {
             return;
         }
-        // Solid-ish background for the bar.
         let bg = Style::default().bg(Color::Rgb(0x14, 0x1a, 0x2a));
         frame.render_widget(
             ratatui::widgets::Block::default().style(bg),
             area,
         );
-        // Two icons: Explorer (cod-files) and Search (cod-search).
-        let active_color = Color::White;
-        let inactive_color = Color::Rgb(0x6c, 0x7d, 0x9c);
         let active_bar = Color::Rgb(0x4e, 0x9a, 0xff);
-        let icon_y = area.y + 1;
-        let explorer_icon_x = area.x + 1;
-        let search_icon_y = area.y + 3;
-        let search_icon_x = area.x + 1;
+        let bg_color = bg.bg.unwrap_or(Color::Reset);
+        let explorer_block = activity_explorer_block(area);
+        let search_block = activity_search_block(area);
+        let explorer_active = self.sidebar_view == SidebarView::Explorer;
+        let search_active = self.sidebar_view == SidebarView::Search;
 
-        let render_icon = |frame: &mut ratatui::Frame,
-                           cell_x: u16,
-                           cell_y: u16,
-                           glyph: &str,
-                           is_active: bool| {
-            let color = if is_active {
-                active_color
-            } else {
-                inactive_color
-            };
-            let line = Line::from(vec![
-                Span::styled(
-                    if is_active { "▎" } else { " " },
-                    Style::default().fg(active_bar),
-                ),
-                Span::styled(
-                    format!(" {glyph} "),
-                    Style::default().fg(color).add_modifier(Modifier::BOLD),
-                ),
-            ]);
-            let row = Rect {
-                x: area.x,
-                y: cell_y,
-                width: area.width,
-                height: 1,
-            };
+        let active_pill = |frame: &mut ratatui::Frame, block: Rect, is_active: bool| {
+            let pill = Rect { x: block.x, y: block.y, width: 1, height: block.height };
             frame.render_widget(
-                ratatui::widgets::Paragraph::new(line).style(bg),
-                row,
+                ratatui::widgets::Block::default()
+                    .style(Style::default().fg(active_bar).bg(bg_color)),
+                pill,
             );
-            // Return the icon-glyph cell for hit-testing (skip the leading
-            // active-bar cell + leading space).
-            Rect {
-                x: cell_x + 1,
-                y: cell_y,
-                width: 1,
-                height: 1,
+            if is_active {
+                let mid = block.y + block.height / 2;
+                let cell = Rect { x: block.x, y: mid, width: 1, height: 1 };
+                frame.render_widget(
+                    ratatui::widgets::Paragraph::new("▎")
+                        .style(Style::default().fg(active_bar).bg(bg_color)),
+                    cell,
+                );
             }
         };
+        active_pill(frame, explorer_block, explorer_active);
+        active_pill(frame, search_block, search_active);
 
-        let explorer_glyph_ch = crate::icons::ACTIVITY_EXPLORER;
-        let search_glyph_ch = crate::icons::ACTIVITY_SEARCH;
-        let explorer_glyph = explorer_glyph_ch.to_string();
-        let explorer_glyph = explorer_glyph.as_str();
-        let search_glyph = search_glyph_ch.to_string();
-        let search_glyph = search_glyph.as_str();
+        if let Some(images) = self.activity_images.as_mut() {
+            let icon_area = |block: Rect| Rect {
+                x: block.x + 1,
+                y: block.y,
+                width: block.width.saturating_sub(1),
+                height: block.height,
+            };
+            let exp_state = if explorer_active {
+                &mut images.explorer_active
+            } else {
+                &mut images.explorer_inactive
+            };
+            frame.render_stateful_widget(
+                ratatui_image::StatefulImage::default(),
+                icon_area(explorer_block),
+                exp_state,
+            );
+            let sea_state = if search_active {
+                &mut images.search_active
+            } else {
+                &mut images.search_inactive
+            };
+            frame.render_stateful_widget(
+                ratatui_image::StatefulImage::default(),
+                icon_area(search_block),
+                sea_state,
+            );
+        } else {
+            let active_color = Color::White;
+            let inactive_color = Color::Rgb(0x6c, 0x7d, 0x9c);
+            let glyph_x = activity_icon_glyph_x(area);
+            let render_glyph =
+                |frame: &mut ratatui::Frame, block: Rect, glyph: char, is_active: bool| {
+                    let mid = block.y + block.height / 2;
+                    let cell = Rect { x: glyph_x, y: mid, width: 1, height: 1 };
+                    let color = if is_active { active_color } else { inactive_color };
+                    frame.render_widget(
+                        ratatui::widgets::Paragraph::new(glyph.to_string()).style(
+                            Style::default()
+                                .fg(color)
+                                .bg(bg_color)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        cell,
+                    );
+                };
+            render_glyph(
+                frame,
+                explorer_block,
+                crate::icons::ACTIVITY_EXPLORER,
+                explorer_active,
+            );
+            render_glyph(
+                frame,
+                search_block,
+                crate::icons::ACTIVITY_SEARCH,
+                search_active,
+            );
+        }
 
-        let exp_rect = render_icon(
-            frame,
-            explorer_icon_x,
-            icon_y,
-            explorer_glyph,
-            self.sidebar_view == SidebarView::Explorer,
-        );
-        let sea_rect = render_icon(
-            frame,
-            search_icon_x,
-            search_icon_y,
-            search_glyph,
-            self.sidebar_view == SidebarView::Search,
-        );
-
-        // Save broader hit areas: the entire row, not just the glyph cell.
-        self.sidebar_areas.explorer_icon = Rect {
-            x: area.x,
-            y: icon_y,
-            width: area.width,
-            height: 1,
-        };
-        self.sidebar_areas.search_icon = Rect {
-            x: area.x,
-            y: search_icon_y,
-            width: area.width,
-            height: 1,
-        };
-        let _ = (exp_rect, sea_rect); // currently unused, here for future use
+        self.sidebar_areas.explorer_icon = explorer_block;
+        self.sidebar_areas.search_icon = search_block;
     }
 
     fn set_sidebar_view(&mut self, view: SidebarView) {
@@ -2126,6 +2204,48 @@ mod tests {
         let p = std::path::Path::new("/");
         assert_eq!(build_title(p), "croft  /");
     }
+
+    #[test]
+    fn activity_icon_glyph_x_centres_glyph_in_bar() {
+        let bar = Rect { x: 0, y: 0, width: 4, height: 10 };
+        assert_eq!(activity_icon_glyph_x(bar), 2);
+        let bar = Rect { x: 5, y: 0, width: 4, height: 10 };
+        assert_eq!(activity_icon_glyph_x(bar), 7);
+    }
+
+    #[test]
+    fn activity_icon_rows_have_breathing_room() {
+        let bar = Rect { x: 0, y: 0, width: 4, height: 20 };
+        let exp_y = activity_explorer_y(bar);
+        let sea_y = activity_search_y(bar);
+        // Search must sit below the explorer block plus a one-row gap.
+        assert!(
+            sea_y >= exp_y + ACTIVITY_ICON_HEIGHT,
+            "search overlaps explorer block: explorer={exp_y} search={sea_y} height={ACTIVITY_ICON_HEIGHT}"
+        );
+        assert!(exp_y >= bar.y + 1, "explorer must have top padding");
+    }
+
+    #[test]
+    fn activity_icon_block_is_at_least_three_rows_tall() {
+        // For inline-image rendering to look proportionate to a 4-cell-wide
+        // bar, each icon needs to span ≥3 rows so the rasterised codicon
+        // isn't squashed into a flat 1-row strip.
+        assert!(
+            ACTIVITY_ICON_HEIGHT >= 3,
+            "icon block too short for image rendering: {ACTIVITY_ICON_HEIGHT}"
+        );
+    }
+
+    #[test]
+    fn activity_icon_block_for_hit_test_spans_image_height() {
+        let bar = Rect { x: 0, y: 0, width: 4, height: 20 };
+        let block = activity_explorer_block(bar);
+        assert_eq!(block.x, bar.x);
+        assert_eq!(block.width, bar.width);
+        assert_eq!(block.y, activity_explorer_y(bar));
+        assert_eq!(block.height, ACTIVITY_ICON_HEIGHT);
+    }
 }
 
 pub fn run(root: PathBuf) -> Result<()> {
@@ -2159,6 +2279,11 @@ pub fn run(root: PathBuf) -> Result<()> {
         out.write_all(&set_title_seq(&title)).ok();
         out.flush().ok();
     }
+    // Probe terminal graphics capability before any ratatui frame is drawn or
+    // any key events are read. `Picker::from_query_stdio` writes a few escape
+    // queries and reads the responses synchronously from stdin.
+    app.init_graphics();
+
     let backend = CrosstermBackend::new(out);
     let mut terminal: Terminal<CrosstermBackend<Stdout>> =
         Terminal::new(backend).context("create terminal")?;

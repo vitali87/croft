@@ -1,3 +1,4 @@
+mod activity_icons;
 mod app;
 mod cli;
 mod git;
