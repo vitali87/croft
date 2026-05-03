@@ -1,6 +1,6 @@
-<p align="center">
-  <img src="assets/logo.png" alt="croft" width="220">
-</p>
+<div align="center">
+  <img src="assets/logo.png" alt="croft" width="140">
+</div>
 
 # croft
 
