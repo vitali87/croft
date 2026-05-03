@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="assets/logo.png" alt="croft" width="140">
+  <img src="assets/logo-tight.png" alt="croft" width="180">
 </div>
 
 # croft
