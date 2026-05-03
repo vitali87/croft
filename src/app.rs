@@ -416,8 +416,12 @@ impl App {
             }
         };
 
-        let explorer_glyph = "\u{eaeb}"; // cod-files
-        let search_glyph = "\u{ea6d}"; // cod-search
+        let explorer_glyph_ch = crate::icons::ACTIVITY_EXPLORER;
+        let search_glyph_ch = crate::icons::ACTIVITY_SEARCH;
+        let explorer_glyph = explorer_glyph_ch.to_string();
+        let explorer_glyph = explorer_glyph.as_str();
+        let search_glyph = search_glyph_ch.to_string();
+        let search_glyph = search_glyph.as_str();
 
         let exp_rect = render_icon(
             frame,
