@@ -784,7 +784,11 @@ impl App {
                 } else if in_editor {
                     self.editor.scroll_down(3);
                 } else if in_terminal {
-                    self.terminal.write_input(b"\x1b[B\x1b[B\x1b[B");
+                    // Try our scrollback first; if we're in vim/less/htop
+                    // (alternate-screen), fall back to forwarding arrow keys.
+                    if !self.terminal.scroll_down(3) {
+                        self.terminal.write_input(b"\x1b[B\x1b[B\x1b[B");
+                    }
                 }
             }
             MouseEventKind::ScrollUp => {
@@ -795,7 +799,9 @@ impl App {
                 } else if in_editor {
                     self.editor.scroll_up(3);
                 } else if in_terminal {
-                    self.terminal.write_input(b"\x1b[A\x1b[A\x1b[A");
+                    if !self.terminal.scroll_up(3) {
+                        self.terminal.write_input(b"\x1b[A\x1b[A\x1b[A");
+                    }
                 }
             }
             _ => {}

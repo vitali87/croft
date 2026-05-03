@@ -76,7 +76,9 @@ impl PtyTerminal {
 
         let writer = pair.master.take_writer().context("take writer")?;
         let mut reader = pair.master.try_clone_reader().context("clone reader")?;
-        let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 0)));
+        // 5000 rows of scrollback ≈ 1 MB at typical line widths; plenty for
+        // mouse-wheel history navigation, cheap in memory.
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 5000)));
         let parser_for_thread = parser.clone();
 
         std::thread::spawn(move || {
@@ -161,8 +163,35 @@ impl PtyTerminal {
     }
 
     pub fn write_input(&mut self, data: &[u8]) {
+        // Snap back to the live bottom on user input so the response is visible.
+        self.reset_scrollback();
         let _ = self.writer.write_all(data);
         let _ = self.writer.flush();
+    }
+
+    /// Scroll the visible window up by `n` rows into history. Returns false
+    /// if we're in alternate-screen mode (vim/less/htop manage their own
+    /// scrollback), so the caller can fall back to sending arrow keys.
+    pub fn scroll_up(&mut self, n: usize) -> bool {
+        let mut parser = match self.parser.lock() {
+            Ok(p) => p,
+            Err(_) => return false,
+        };
+        scroll_screen_up(parser.screen_mut(), n)
+    }
+
+    pub fn scroll_down(&mut self, n: usize) -> bool {
+        let mut parser = match self.parser.lock() {
+            Ok(p) => p,
+            Err(_) => return false,
+        };
+        scroll_screen_down(parser.screen_mut(), n)
+    }
+
+    pub fn reset_scrollback(&mut self) {
+        if let Ok(mut parser) = self.parser.lock() {
+            parser.screen_mut().set_scrollback(0);
+        }
     }
 
     pub fn resize(&mut self, cols: u16, rows: u16) {
@@ -220,6 +249,29 @@ pub fn extract_selection_text(
         }
     }
     out
+}
+
+/// Increase the screen's scrollback offset by `n` rows (showing older
+/// content). Refuses in alternate-screen mode so apps like vim / htop / less
+/// keep their own scrolling semantics.
+pub fn scroll_screen_up(screen: &mut vt100::Screen, n: usize) -> bool {
+    if screen.alternate_screen() {
+        return false;
+    }
+    let cur = screen.scrollback();
+    screen.set_scrollback(cur + n);
+    true
+}
+
+/// Decrease the scrollback offset (toward live bottom). Floors at zero.
+/// Refuses in alternate-screen mode.
+pub fn scroll_screen_down(screen: &mut vt100::Screen, n: usize) -> bool {
+    if screen.alternate_screen() {
+        return false;
+    }
+    let cur = screen.scrollback();
+    screen.set_scrollback(cur.saturating_sub(n));
+    true
 }
 
 /// Build the OSC 52 escape sequence that asks the host terminal to put `text`
@@ -430,6 +482,56 @@ mod tests {
         let decoded =
             base64::engine::general_purpose::STANDARD.decode(body).unwrap();
         assert_eq!(decoded, "héllo".as_bytes());
+    }
+
+    #[test]
+    fn scroll_screen_up_increments_scrollback_in_normal_mode() {
+        let mut p = vt100::Parser::new(5, 20, 1000);
+        // Push enough lines that scrolling back makes sense.
+        for i in 0..50 {
+            p.process(format!("line {i}\r\n").as_bytes());
+        }
+        let before = p.screen().scrollback();
+        let scrolled = scroll_screen_up(p.screen_mut(), 3);
+        assert!(scrolled);
+        assert_eq!(p.screen().scrollback(), before + 3);
+    }
+
+    #[test]
+    fn scroll_screen_down_decrements_with_floor_at_zero() {
+        let mut p = vt100::Parser::new(5, 20, 1000);
+        for i in 0..50 {
+            p.process(format!("line {i}\r\n").as_bytes());
+        }
+        scroll_screen_up(p.screen_mut(), 5);
+        scroll_screen_down(p.screen_mut(), 2);
+        assert_eq!(p.screen().scrollback(), 3);
+        // Floor at zero, no underflow.
+        scroll_screen_down(p.screen_mut(), 100);
+        assert_eq!(p.screen().scrollback(), 0);
+    }
+
+    #[test]
+    fn scroll_screen_up_refuses_in_alternate_screen() {
+        let mut p = vt100::Parser::new(5, 20, 1000);
+        for i in 0..50 {
+            p.process(format!("line {i}\r\n").as_bytes());
+        }
+        // Enter the alternate screen (DECSET 1049). Apps like vim / htop /
+        // less use this; their internal scrollback handling should win.
+        p.process(b"\x1b[?1049h");
+        let before = p.screen().scrollback();
+        let scrolled = scroll_screen_up(p.screen_mut(), 3);
+        assert!(!scrolled, "should refuse scrollback in alternate-screen mode");
+        assert_eq!(p.screen().scrollback(), before);
+    }
+
+    #[test]
+    fn scroll_screen_down_also_refuses_in_alternate_screen() {
+        let mut p = vt100::Parser::new(5, 20, 1000);
+        p.process(b"\x1b[?1049h");
+        let scrolled = scroll_screen_down(p.screen_mut(), 3);
+        assert!(!scrolled);
     }
 
     #[test]
