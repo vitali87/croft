@@ -265,14 +265,18 @@ impl App {
     /// tree directories whose contents may have changed. Also reloads the
     /// editor's open file when an external write (vim, git pull, etc.)
     /// changes it on disk.
-    fn drain_fs_events(&mut self) {
+    /// Drain pending filesystem events. Returns `true` iff anything was
+    /// processed (so the main loop knows it owes a redraw).
+    fn drain_fs_events(&mut self) -> bool {
         let Some(rx) = self.fs_rx.as_ref() else {
-            return;
+            return false;
         };
         let mut affected: std::collections::BTreeSet<PathBuf> =
             std::collections::BTreeSet::new();
         let mut touched_open_file = false;
+        let mut got_any = false;
         while let Ok(result) = rx.try_recv() {
+            got_any = true;
             let events = match result {
                 Ok(evs) => evs,
                 Err(_) => continue,
@@ -333,6 +337,7 @@ impl App {
                 }
             }
         }
+        got_any
     }
 
     fn cycle_focus(&mut self) {
@@ -1678,6 +1683,37 @@ mod tests {
     }
 
     #[test]
+    fn drain_fs_events_returns_false_when_nothing_pending() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        for _ in 0..20 {
+            let _ = app.drain_fs_events();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(!app.drain_fs_events(), "no fs events ⇒ no redraw needed");
+    }
+
+    #[test]
+    fn drain_fs_events_returns_true_after_workspace_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        for _ in 0..20 {
+            let _ = app.drain_fs_events();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        std::fs::write(tmp.path().join("new.txt"), "hi").unwrap();
+        let mut saw = false;
+        for _ in 0..150 {
+            if app.drain_fs_events() {
+                saw = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(saw, "workspace write should propagate as a dirty signal");
+    }
+
+    #[test]
     fn rect_contains_basic() {
         let r = Rect { x: 5, y: 5, width: 10, height: 10 };
         assert!(rect_contains(r, 5, 5));
@@ -2152,14 +2188,26 @@ fn main_loop(
     app: &mut App,
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
 ) -> Result<()> {
+    // Force the very first frame to render so the user sees the UI even
+    // before the first event arrives or any timer fires.
+    let mut needs_redraw = true;
+    let mut last_blink_visible = app.cursor_visible_phase();
+
     while !app.quit {
         // Pull in any filesystem-watcher events first so the tree reflects
         // disk reality on the very next frame.
-        app.drain_fs_events();
+        let fs_changed = app.drain_fs_events();
+        let pty_changed = app.terminal.take_dirty();
+        let blink_visible = app.cursor_visible_phase();
+        let blink_changed = blink_visible != last_blink_visible;
 
-        terminal.draw(|f| {
-            app.render(f);
-        })?;
+        if needs_redraw || fs_changed || pty_changed || blink_changed {
+            terminal.draw(|f| {
+                app.render(f);
+            })?;
+            needs_redraw = false;
+            last_blink_visible = blink_visible;
+        }
 
         if event::poll(Duration::from_millis(33))? {
             match event::read()? {
@@ -2169,6 +2217,10 @@ fn main_loop(
                 Event::Resize(_, _) => {}
                 _ => {}
             }
+            // Any handled event might have changed visible state; defer the
+            // call to the next iteration's terminal.draw so a stream of
+            // events coalesces into a single frame.
+            needs_redraw = true;
         }
     }
     Ok(())

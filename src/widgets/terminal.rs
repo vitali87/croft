@@ -8,6 +8,7 @@ use ratatui::{
     widgets::{Block, Borders, Widget},
 };
 use std::io::Write;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// Inclusive cell range in the terminal's *inner* coordinate system (0,0 at
@@ -45,6 +46,10 @@ impl Selection {
 
 pub struct PtyTerminal {
     parser: Arc<Mutex<vt100::Parser>>,
+    /// Set by the PTY reader thread on every chunk that reaches the screen
+    /// and by `write_input`; cleared by `take_dirty`. Lets the main loop
+    /// skip `terminal.draw` entirely when nothing has changed.
+    pty_dirty: Arc<AtomicBool>,
     master: Box<dyn MasterPty + Send>,
     writer: Box<dyn Write + Send>,
     _child: Box<dyn portable_pty::Child + Send + Sync>,
@@ -80,6 +85,10 @@ impl PtyTerminal {
         // mouse-wheel history navigation, cheap in memory.
         let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 5000)));
         let parser_for_thread = parser.clone();
+        // Start dirty so the very first frame renders even if the shell
+        // hasn't produced output yet (status bar, borders, etc.).
+        let pty_dirty = Arc::new(AtomicBool::new(true));
+        let pty_dirty_for_thread = pty_dirty.clone();
 
         std::thread::spawn(move || {
             let mut buf = [0u8; 4096];
@@ -90,6 +99,7 @@ impl PtyTerminal {
                         if let Ok(mut p) = parser_for_thread.lock() {
                             p.process(&buf[..n]);
                         }
+                        pty_dirty_for_thread.store(true, Ordering::Release);
                     }
                     Err(_) => break,
                 }
@@ -98,6 +108,7 @@ impl PtyTerminal {
 
         Ok(Self {
             parser,
+            pty_dirty,
             master: pair.master,
             writer,
             _child: child,
@@ -108,6 +119,14 @@ impl PtyTerminal {
             last_inner: Rect::default(),
             selection: None,
         })
+    }
+
+    /// Atomically check-and-clear the PTY dirty flag. Returns true iff the
+    /// reader thread or `write_input` has produced new bytes since the
+    /// previous call. Acquire ordering pairs with the Release store on
+    /// the writing side so any state mutations are visible.
+    pub fn take_dirty(&self) -> bool {
+        self.pty_dirty.swap(false, Ordering::AcqRel)
     }
 
     /// Translate an absolute terminal mouse coordinate to an inner cell, or
@@ -167,6 +186,9 @@ impl PtyTerminal {
         self.reset_scrollback();
         let _ = self.writer.write_all(data);
         let _ = self.writer.flush();
+        // Even before the shell echoes back, scrollback was just reset, so
+        // we must redraw at least once.
+        self.pty_dirty.store(true, Ordering::Release);
     }
 
     /// Scroll the visible window up by `n` rows into history. Returns false
@@ -415,6 +437,30 @@ pub fn cell_in_selection(row: u16, col: u16, sr: u16, sc: u16, er: u16, ec: u16)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pty_starts_dirty_so_first_frame_renders() {
+        let tmp = tempfile::tempdir().unwrap();
+        let term = PtyTerminal::new(tmp.path()).unwrap();
+        assert!(term.take_dirty(), "first take_dirty must be true so we draw the initial state");
+    }
+
+    #[test]
+    fn take_dirty_clears_the_flag() {
+        let tmp = tempfile::tempdir().unwrap();
+        let term = PtyTerminal::new(tmp.path()).unwrap();
+        let _ = term.take_dirty();
+        assert!(!term.take_dirty(), "second take_dirty without new bytes must be false");
+    }
+
+    #[test]
+    fn write_input_marks_dirty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut term = PtyTerminal::new(tmp.path()).unwrap();
+        let _ = term.take_dirty(); // drain initial
+        term.write_input(b"echo hi\r");
+        assert!(term.take_dirty(), "write_input must mark the terminal dirty");
+    }
 
     #[test]
     fn selection_normalised_handles_anchor_after_head() {
