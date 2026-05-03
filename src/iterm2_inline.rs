@@ -37,17 +37,16 @@ pub fn compose_icon(
     let mut canvas: RgbaImage =
         ImageBuffer::from_pixel(canvas_w, canvas_h, BAR_BG);
     let off_x = ((canvas_w - icon_size) / 2) as i64;
-    // Anchor the codicon to the top of the canvas (with a tiny pixel of
-    // padding so it doesn't touch the very edge). The activity-bar icon
-    // block starts at the top of the project-root row in the side panel,
-    // so anchoring top-of-icon to top-of-canvas makes the codicon's top
-    // edge coincide with that row's top edge.
-    let off_y: i64 = 1;
-    image::imageops::overlay(&mut canvas, &tinted, off_x, off_y);
+    let off_y: u32 = 1;
+    image::imageops::overlay(&mut canvas, &tinted, off_x, off_y as i64);
     if is_active {
         let pill_w: u32 = if canvas_w >= 8 { 2 } else { 1 };
-        let pad: u32 = (canvas_h / 6).max(1);
-        for y in pad..canvas_h.saturating_sub(pad) {
+        // Pill height = the codicon's vertical extent so the pill visually
+        // brackets the icon and doesn't drift to the empty bottom-canvas
+        // bg the way a centered pill would.
+        let pill_y_start = off_y;
+        let pill_y_end = (off_y + icon_size).min(canvas_h);
+        for y in pill_y_start..pill_y_end {
             for x in 0..pill_w {
                 canvas.put_pixel(x, y, ACTIVE_PILL);
             }
