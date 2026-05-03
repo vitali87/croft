@@ -843,6 +843,14 @@ impl App {
             );
             return;
         }
+        if is_editor_undo_key(key) {
+            if self.editor.undo() {
+                self.status = String::from("Undo");
+            } else {
+                self.status = String::from("Nothing to undo");
+            }
+            return;
+        }
         if matches!(key.code, KeyCode::Esc) && self.editor.selection.is_some() {
             self.editor.clear_selection();
             return;
@@ -911,9 +919,9 @@ impl App {
     }
 
     fn handle_terminal_key(&mut self, key: KeyEvent) {
-        // Ctrl+Shift+C: copy current selection (terminal-friendly Cmd+C alt).
+        // Ctrl+Shift+C / Cmd+C: copy current selection.
         if is_terminal_copy_key(key) {
-            self.copy_terminal_selection_or_clear();
+            self.copy_terminal_selection();
             return;
         }
         // Any other keystroke clears the selection so the user's input is
@@ -927,37 +935,16 @@ impl App {
         }
     }
 
-    /// Called on mouse-up over the terminal pane and on the explicit copy key.
-    /// If the current selection covers area, copy it to the host terminal's
-    /// clipboard via OSC 52.  Otherwise clear the (zero-area) selection.
-    fn copy_terminal_selection_or_clear(&mut self) {
+    /// Copy the terminal pane's current selection to the host clipboard via
+    /// OSC 52.  Selection stays visible so the user can verify what was
+    /// copied. No-op when the selection is empty / zero-area.
+    fn copy_terminal_selection(&mut self) {
         let Some(sel) = self.terminal.selection() else { return };
         if !sel.has_area() {
-            self.terminal.clear_selection();
             return;
         }
         let text = self.terminal.selection_text();
         if text.is_empty() {
-            self.terminal.clear_selection();
-            return;
-        }
-        write_osc52(&text);
-        self.status = format!("Copied {} chars to clipboard", text.chars().count());
-    }
-
-    /// Mouse-up over the editor: if the drag produced a real selection, copy
-    /// it to the host clipboard via OSC 52 and leave the highlight visible
-    /// so the user can see what was copied. A click without drag (zero area)
-    /// just clears the anchor.
-    fn copy_editor_selection_or_clear(&mut self) {
-        let Some(sel) = self.editor.selection else { return };
-        if !sel.has_area() {
-            self.editor.clear_selection();
-            return;
-        }
-        let text = self.editor.selection_text();
-        if text.is_empty() {
-            self.editor.clear_selection();
             return;
         }
         write_osc52(&text);
@@ -1149,10 +1136,21 @@ impl App {
                 }
             }
             MouseEventKind::Up(MouseButton::Left) => {
+                // Mouse-up never auto-copies. The selection stays highlighted
+                // so the user can hit Cmd/Ctrl+C themselves; a click without
+                // drag (zero-area selection) is silently dropped.
                 if in_terminal {
-                    self.copy_terminal_selection_or_clear();
+                    if let Some(sel) = self.terminal.selection() {
+                        if !sel.has_area() {
+                            self.terminal.clear_selection();
+                        }
+                    }
                 } else if in_editor {
-                    self.copy_editor_selection_or_clear();
+                    if let Some(sel) = self.editor.selection {
+                        if !sel.has_area() {
+                            self.editor.clear_selection();
+                        }
+                    }
                 }
             }
             MouseEventKind::ScrollDown => {
@@ -1538,6 +1536,19 @@ fn is_editor_select_all_key(key: KeyEvent) -> bool {
     key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::SUPER)
 }
 
+/// Undo: `Ctrl+Z` / `Cmd+Z`. Plain Shift is ignored (Shift+Cmd+Z is reserved
+/// for redo, which croft does not implement yet).
+fn is_editor_undo_key(key: KeyEvent) -> bool {
+    let KeyCode::Char(c) = key.code else { return false };
+    if !c.eq_ignore_ascii_case(&'z') {
+        return false;
+    }
+    if key.modifiers.contains(KeyModifiers::SHIFT) {
+        return false;
+    }
+    key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::SUPER)
+}
+
 fn rect_contains(r: Rect, x: u16, y: u16) -> bool {
     r.width > 0
         && r.height > 0
@@ -1840,6 +1851,23 @@ mod tests {
         assert!(is_editor_select_all_key(key(KeyCode::Char('a'), KeyModifiers::CONTROL)));
         assert!(is_editor_select_all_key(key(KeyCode::Char('a'), KeyModifiers::SUPER)));
         assert!(!is_editor_select_all_key(key(KeyCode::Char('a'), KeyModifiers::NONE)));
+    }
+
+    #[test]
+    fn ctrl_z_is_editor_undo_key() {
+        assert!(is_editor_undo_key(key(KeyCode::Char('z'), KeyModifiers::CONTROL)));
+        assert!(is_editor_undo_key(key(KeyCode::Char('z'), KeyModifiers::SUPER)));
+    }
+
+    #[test]
+    fn plain_z_is_not_editor_undo_key() {
+        assert!(!is_editor_undo_key(key(KeyCode::Char('z'), KeyModifiers::NONE)));
+    }
+
+    #[test]
+    fn shift_cmd_z_reserved_for_redo_not_undo() {
+        let mods = KeyModifiers::SUPER | KeyModifiers::SHIFT;
+        assert!(!is_editor_undo_key(key(KeyCode::Char('z'), mods)));
     }
 
     #[test]

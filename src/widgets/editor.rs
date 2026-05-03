@@ -40,6 +40,30 @@ impl EditorSelection {
     }
 }
 
+/// Coarse classification of the most recent edit, used so consecutive
+/// `InsertChar` ops coalesce into a single undo step (typing burst) but
+/// any other edit kind always opens a new step.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EditKind {
+    InsertChar,
+    Newline,
+    Backspace,
+    DeleteForward,
+    Paste,
+    DeleteSelection,
+}
+
+#[derive(Clone, Debug)]
+struct Snapshot {
+    lines: Vec<String>,
+    cursor_row: usize,
+    cursor_col: usize,
+    selection: Option<EditorSelection>,
+    dirty: bool,
+}
+
+const UNDO_STACK_LIMIT: usize = 500;
+
 pub struct Editor {
     pub path: Option<PathBuf>,
     pub lines: Vec<String>,
@@ -54,6 +78,8 @@ pub struct Editor {
     pub last_inner: Rect,
     pub last_gutter_width: u16,
     pub selection: Option<EditorSelection>,
+    undo_stack: Vec<Snapshot>,
+    last_edit_kind: Option<EditKind>,
     lang: Option<LangKind>,
     highlights: Vec<Vec<HiSpan>>,
     registry: LangRegistry,
@@ -74,6 +100,8 @@ impl Editor {
             last_inner: Rect::default(),
             last_gutter_width: 0,
             selection: None,
+            undo_stack: Vec::new(),
+            last_edit_kind: None,
             lang: None,
             highlights: Vec::new(),
             registry: LangRegistry::new(),
@@ -104,6 +132,8 @@ impl Editor {
         self.cursor_col = 0;
         self.dirty = false;
         self.selection = None;
+        self.undo_stack.clear();
+        self.last_edit_kind = None;
         self.status = format!("Opened {}", path.display());
         self.recompute_highlights();
         Ok(())
@@ -136,9 +166,20 @@ impl Editor {
     }
 
     pub fn insert_char(&mut self, c: char) {
-        if self.delete_selection() {
-            // selection consumed; fall through to insert at the new cursor.
-        }
+        // Selection-replace counts as one logical edit (Replace), not two.
+        // Coalesce subsequent typed chars onto the same step only when the
+        // previous edit was also a single-char insert with no selection.
+        let had_selection = self
+            .selection
+            .map(|s| s.has_area())
+            .unwrap_or(false);
+        let kind = if had_selection {
+            EditKind::DeleteSelection
+        } else {
+            EditKind::InsertChar
+        };
+        self.push_undo(kind);
+        self.delete_selection_inner();
         if self.lines.is_empty() {
             self.lines.push(String::new());
         }
@@ -152,8 +193,9 @@ impl Editor {
     }
 
     pub fn insert_str(&mut self, s: &str) {
+        self.push_undo(EditKind::Paste);
         if self.selection.is_some() {
-            self.delete_selection();
+            self.delete_selection_inner();
         }
         for c in s.chars() {
             if c == '\n' {
@@ -192,15 +234,15 @@ impl Editor {
     }
 
     pub fn insert_newline(&mut self) {
-        if self.delete_selection() {
-            // fall through.
-        }
+        self.push_undo(EditKind::Newline);
+        self.delete_selection_inner();
         self.insert_newline_raw();
         self.recompute_highlights();
     }
 
     pub fn backspace(&mut self) {
-        if self.delete_selection() {
+        self.push_undo(EditKind::Backspace);
+        if self.delete_selection_inner() {
             self.recompute_highlights();
             return;
         }
@@ -223,7 +265,8 @@ impl Editor {
     }
 
     pub fn delete_forward(&mut self) {
-        if self.delete_selection() {
+        self.push_undo(EditKind::DeleteForward);
+        if self.delete_selection_inner() {
             self.recompute_highlights();
             return;
         }
@@ -308,9 +351,28 @@ impl Editor {
 
     /// Delete the current selection if it has area.  Returns true iff content
     /// was removed.  Cursor lands at the start of the deleted range and the
-    /// selection is cleared.  Caller is responsible for `recompute_highlights`
-    /// when used outside an `insert_*` chain.
+    /// selection is cleared.  Pushes an undo step.
     pub fn delete_selection(&mut self) -> bool {
+        if !self
+            .selection
+            .map(|s| s.has_area())
+            .unwrap_or(false)
+        {
+            self.selection = None;
+            return false;
+        }
+        self.push_undo(EditKind::DeleteSelection);
+        let removed = self.delete_selection_inner();
+        if removed {
+            self.recompute_highlights();
+        }
+        removed
+    }
+
+    /// Same as `delete_selection` but does NOT push an undo step or
+    /// recompute highlights — used by other public mutators that have
+    /// already snapshotted state and will recompute themselves.
+    fn delete_selection_inner(&mut self) -> bool {
         let Some(sel) = self.selection else { return false };
         if !sel.has_area() {
             self.selection = None;
@@ -324,7 +386,6 @@ impl Editor {
             line.replace_range(from..to, "");
         } else {
             let last = self.lines.remove(er);
-            // remove intermediate rows
             for _ in (sr + 1)..er {
                 self.lines.remove(sr + 1);
             }
@@ -339,6 +400,57 @@ impl Editor {
         self.selection = None;
         self.dirty = true;
         true
+    }
+
+    fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            lines: self.lines.clone(),
+            cursor_row: self.cursor_row,
+            cursor_col: self.cursor_col,
+            selection: self.selection,
+            dirty: self.dirty,
+        }
+    }
+
+    /// Push an undo entry tagged with the kind of edit about to happen.
+    /// Coalesces consecutive `InsertChar` ops into one step so a typing
+    /// burst is undone as one unit; everything else opens a new step.
+    fn push_undo(&mut self, kind: EditKind) {
+        let coalesce = kind == EditKind::InsertChar
+            && self.last_edit_kind == Some(EditKind::InsertChar);
+        if !coalesce {
+            self.undo_stack.push(self.snapshot());
+            if self.undo_stack.len() > UNDO_STACK_LIMIT {
+                self.undo_stack.remove(0);
+            }
+        }
+        self.last_edit_kind = Some(kind);
+    }
+
+    /// Undo the most recent edit step. Returns true iff state was changed.
+    pub fn undo(&mut self) -> bool {
+        let Some(snap) = self.undo_stack.pop() else { return false };
+        self.lines = snap.lines;
+        if self.lines.is_empty() {
+            self.lines.push(String::new());
+        }
+        self.cursor_row = snap
+            .cursor_row
+            .min(self.lines.len().saturating_sub(1));
+        self.cursor_col = snap
+            .cursor_col
+            .min(self.line_char_len(self.cursor_row));
+        self.selection = snap.selection;
+        self.dirty = snap.dirty;
+        self.last_edit_kind = None;
+        self.recompute_highlights();
+        true
+    }
+
+    /// Open a new undo step for the next edit (so a typing run doesn't
+    /// merge with whatever comes after a movement / mouse / focus change).
+    pub fn break_undo_coalescing(&mut self) {
+        self.last_edit_kind = None;
     }
 
     /// Mouse-down: position the cursor at the click point and start a
@@ -414,6 +526,7 @@ impl Editor {
             self.cursor_row -= 1;
             self.cursor_col = self.cursor_col.min(self.line_char_len(self.cursor_row));
         }
+        self.last_edit_kind = None;
     }
 
     pub fn move_down(&mut self) {
@@ -421,6 +534,7 @@ impl Editor {
             self.cursor_row += 1;
             self.cursor_col = self.cursor_col.min(self.line_char_len(self.cursor_row));
         }
+        self.last_edit_kind = None;
     }
 
     pub fn move_left(&mut self) {
@@ -430,6 +544,7 @@ impl Editor {
             self.cursor_row -= 1;
             self.cursor_col = self.line_char_len(self.cursor_row);
         }
+        self.last_edit_kind = None;
     }
 
     pub fn move_right(&mut self) {
@@ -439,6 +554,7 @@ impl Editor {
             self.cursor_row += 1;
             self.cursor_col = 0;
         }
+        self.last_edit_kind = None;
     }
 
     /// One screen worth of rows, derived from the editor's last rendered
@@ -463,6 +579,7 @@ impl Editor {
         self.scroll = new_top;
         self.cursor_row = new_top;
         self.cursor_col = self.cursor_col.min(self.line_char_len(self.cursor_row));
+        self.last_edit_kind = None;
     }
 
     /// Move the viewport up by exactly one screen so the new top is `page`
@@ -474,24 +591,29 @@ impl Editor {
         self.scroll = new_top;
         self.cursor_row = new_top;
         self.cursor_col = self.cursor_col.min(self.line_char_len(self.cursor_row));
+        self.last_edit_kind = None;
     }
 
     pub fn home_line(&mut self) {
         self.cursor_col = 0;
+        self.last_edit_kind = None;
     }
 
     pub fn end_line(&mut self) {
         self.cursor_col = self.line_char_len(self.cursor_row);
+        self.last_edit_kind = None;
     }
 
     pub fn scroll_up(&mut self, n: usize) {
         self.cursor_row = self.cursor_row.saturating_sub(n);
         self.cursor_col = self.cursor_col.min(self.line_char_len(self.cursor_row));
+        self.last_edit_kind = None;
     }
 
     pub fn scroll_down(&mut self, n: usize) {
         self.cursor_row = (self.cursor_row + n).min(self.lines.len().saturating_sub(1));
         self.cursor_col = self.cursor_col.min(self.line_char_len(self.cursor_row));
+        self.last_edit_kind = None;
     }
 
     /// Move the cursor to the screen coordinates (col, row). Used for mouse clicks.
@@ -512,6 +634,7 @@ impl Editor {
         };
         self.cursor_row = target_line;
         self.cursor_col = target_col.min(self.line_char_len(target_line));
+        self.last_edit_kind = None;
     }
 }
 
@@ -1177,6 +1300,165 @@ mod tests {
         let sel = e.selection.expect("anchor created on mouse down");
         assert_eq!(sel.anchor, (0, 0));
         assert!(!sel.has_area());
+    }
+
+    #[test]
+    fn undo_restores_previous_buffer_and_cursor() {
+        let mut e = editor_with("abc");
+        e.cursor_col = 3;
+        e.insert_char('d');
+        assert_eq!(e.lines[0], "abcd");
+        assert!(e.undo());
+        assert_eq!(e.lines[0], "abc");
+        assert_eq!(e.cursor_col, 3);
+    }
+
+    #[test]
+    fn undo_on_empty_stack_returns_false() {
+        let mut e = editor_with("abc");
+        assert!(!e.undo());
+        assert_eq!(e.lines[0], "abc");
+    }
+
+    #[test]
+    fn undo_coalesces_consecutive_typed_chars_into_one_step() {
+        let mut e = editor_with("");
+        e.insert_char('h');
+        e.insert_char('i');
+        e.insert_char('!');
+        // One undo undoes the whole typed run "hi!".
+        assert!(e.undo());
+        assert_eq!(e.lines[0], "");
+    }
+
+    #[test]
+    fn undo_does_not_coalesce_across_movement() {
+        let mut e = editor_with("abc");
+        e.cursor_col = 3;
+        e.insert_char('d');
+        e.move_left();
+        e.insert_char('z');
+        // First undo removes 'z', second undo removes 'd'.
+        assert!(e.undo());
+        assert_eq!(e.lines[0], "abcd");
+        assert!(e.undo());
+        assert_eq!(e.lines[0], "abc");
+    }
+
+    #[test]
+    fn undo_does_not_coalesce_across_backspace() {
+        let mut e = editor_with("abc");
+        e.cursor_col = 3;
+        e.insert_char('d');
+        e.backspace();
+        e.insert_char('e');
+        assert!(e.undo());
+        assert_eq!(e.lines[0], "abc");
+        assert!(e.undo());
+        assert_eq!(e.lines[0], "abcd");
+        assert!(e.undo());
+        assert_eq!(e.lines[0], "abc");
+    }
+
+    #[test]
+    fn undo_paste_is_one_step() {
+        let mut e = editor_with("abc");
+        e.cursor_col = 3;
+        e.insert_str("XYZ");
+        assert_eq!(e.lines[0], "abcXYZ");
+        assert!(e.undo());
+        assert_eq!(e.lines[0], "abc");
+    }
+
+    #[test]
+    fn undo_after_replace_selection_restores_original() {
+        let mut e = editor_with("hello world");
+        e.cursor_col = 6;
+        e.start_selection_at_cursor();
+        e.cursor_col = 11;
+        e.extend_selection_to_cursor();
+        e.insert_char('X');
+        assert_eq!(e.lines[0], "hello X");
+        assert!(e.undo());
+        assert_eq!(e.lines[0], "hello world");
+    }
+
+    #[test]
+    fn undo_restores_dirty_flag() {
+        let mut e = editor_with("abc");
+        assert!(!e.dirty);
+        e.cursor_col = 3;
+        e.insert_char('d');
+        assert!(e.dirty);
+        e.undo();
+        assert!(!e.dirty, "undoing the only edit restores the clean state");
+    }
+
+    #[test]
+    fn render_paints_selection_band_on_selected_cells() {
+        use ratatui::buffer::Buffer;
+        let mut e = editor_with("hello world");
+        e.cursor_col = 0;
+        e.start_selection_at_cursor();
+        e.cursor_col = 5;
+        e.extend_selection_to_cursor();
+        e.focused = true;
+
+        let area = Rect { x: 0, y: 0, width: 30, height: 5 };
+        let mut buf = Buffer::empty(area);
+        (&mut e).render(area, &mut buf);
+
+        // gutter for 1 line: "1 ".len() = 2 → text_x = 0+1+2+1 = 4
+        let text_x = e.last_inner.x + e.last_gutter_width + 1;
+        let selected_bg = Color::Rgb(0x26, 0x4f, 0x78);
+        // chars 0..5 should be highlighted
+        for col in 0..5u16 {
+            let bg = buf[(text_x + col, e.last_inner.y)].bg;
+            assert_eq!(
+                bg, selected_bg,
+                "cell at col {col} should have selection bg, got {bg:?}"
+            );
+        }
+        // char 5 (the space) is OUTSIDE the selection (head exclusive end)
+        let bg5 = buf[(text_x + 5, e.last_inner.y)].bg;
+        assert_ne!(bg5, selected_bg, "cell at col 5 should NOT be highlighted");
+    }
+
+    #[test]
+    fn render_paints_selection_band_across_multiple_lines() {
+        use ratatui::buffer::Buffer;
+        let mut e = editor_with("first\nsecond\nthird");
+        e.cursor_row = 0;
+        e.cursor_col = 2;
+        e.start_selection_at_cursor();
+        e.cursor_row = 2;
+        e.cursor_col = 2;
+        e.extend_selection_to_cursor();
+        e.focused = true;
+
+        let area = Rect { x: 0, y: 0, width: 30, height: 6 };
+        let mut buf = Buffer::empty(area);
+        (&mut e).render(area, &mut buf);
+
+        let text_x = e.last_inner.x + e.last_gutter_width + 1;
+        let selected_bg = Color::Rgb(0x26, 0x4f, 0x78);
+
+        // Row 0: cols 2..end (all the way past the end of "first")
+        let row0_y = e.last_inner.y;
+        assert_eq!(buf[(text_x + 2, row0_y)].bg, selected_bg, "row 0 col 2");
+        assert_eq!(buf[(text_x + 4, row0_y)].bg, selected_bg, "row 0 col 4");
+        assert_ne!(buf[(text_x, row0_y)].bg, selected_bg, "row 0 col 0 not selected");
+
+        // Row 1 (full line "second"): all cells in selection
+        let row1_y = e.last_inner.y + 1;
+        assert_eq!(buf[(text_x, row1_y)].bg, selected_bg, "row 1 col 0");
+        assert_eq!(buf[(text_x + 5, row1_y)].bg, selected_bg, "row 1 col 5");
+
+        // Row 2 (last line "third"): cols 0..2 in selection
+        let row2_y = e.last_inner.y + 2;
+        assert_eq!(buf[(text_x, row2_y)].bg, selected_bg, "row 2 col 0");
+        assert_eq!(buf[(text_x + 1, row2_y)].bg, selected_bg, "row 2 col 1");
+        assert_ne!(buf[(text_x + 2, row2_y)].bg, selected_bg, "row 2 col 2 not selected");
     }
 
     #[test]

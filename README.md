@@ -84,18 +84,19 @@ croft setup-terminal --help
 | Click activity-bar icons (left edge) | Switch between Explorer (file icon) and Search (magnifying glass) views |
 | In Search view: type query, Enter | Run a `.gitignore`-aware substring search across the workspace; up to 200 hits |
 | In Search view: ↑/↓ + Enter, or click a result | Open the file at the matched line |
-| Mouse drag in terminal pane | Select text; on release, the selection is copied to the system clipboard via OSC 52 |
+| Mouse drag in terminal pane | Select text; selection stays highlighted until you copy or click elsewhere — no auto-copy |
 | Mouse wheel in terminal pane | Scroll through 5000 rows of scrollback. While vim / less / htop is in alternate-screen mode, wheel forwards arrow keys instead so the running app handles it. Any keystroke snaps back to the live bottom. |
 | `Ctrl+Shift+c` (or `Cmd+c` with kitty-protocol terminals) | Explicit copy of the terminal's current selection |
 | Editor: arrows, Home, End | Navigate (clears any active selection) |
 | Editor: `Shift`+arrows / `Shift`+Home / End / PageUp / PageDown | Extend the selection by the same motion |
 | Editor: PageUp / PageDown (`fn+↑` / `fn+↓` on Mac) | Scroll exactly one viewport; the line just past the previous bottom becomes the new top |
 | Editor: any printable char, Enter, Backspace, Delete, Tab | Edit (typing or deleting with an active selection replaces it) |
-| Editor: mouse drag | Select text; on release the selection is copied to the system clipboard via OSC 52 |
-| Editor: `Ctrl+C` / `Cmd+C` | Copy the current selection |
+| Editor: mouse drag | Select text; selection stays highlighted until you copy or click elsewhere — no auto-copy |
+| Editor: `Ctrl+C` / `Cmd+C` | Copy the current selection to the system clipboard via OSC 52 |
 | Editor: `Ctrl+X` / `Cmd+X` | Cut the current selection |
-| Editor: `Ctrl+A` / `Cmd+A` | Select the entire buffer |
 | Editor: `Ctrl+V` / `Cmd+V` (host-terminal paste) | Paste system-clipboard contents at the cursor; replaces selection if any |
+| Editor: `Ctrl+Z` / `Cmd+Z` | Undo the last edit (typing bursts coalesce into one step; backspace, paste, cut, replace are each their own step) |
+| Editor: `Ctrl+A` / `Cmd+A` | Select the entire buffer |
 | Editor: `Esc` | Clear the current selection |
 | Mouse click in any pane | Focus and (in tree) select / open, (in editor) move cursor |
 | Mouse right-click in tree | Open context menu (New File…, New Folder…, Delete) |
