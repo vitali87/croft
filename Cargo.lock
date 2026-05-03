@@ -338,6 +338,7 @@ dependencies = [
  "portable-pty",
  "pretty_assertions",
  "ratatui",
+ "regex",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",

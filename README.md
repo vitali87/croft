@@ -75,8 +75,12 @@ croft setup-terminal --help
 | `Ctrl+s` | Save the open file |
 | `Ctrl+q` | Quit |
 | `F6` | Cycle focus across panes (tree → editor → terminal → tree) |
-| `Ctrl+b` | Toggle the file tree |
+| `Ctrl+b` | Toggle the file tree / side panel |
 | `Ctrl+j` | Toggle the terminal pane |
+| `Ctrl+Shift+f` (or `Cmd+Shift+f` with kitty-protocol terminals) | Jump to the Search sidebar view |
+| Click activity-bar icons (left edge) | Switch between Explorer (file icon) and Search (magnifying glass) views |
+| In Search view: type query, Enter | Run a `.gitignore`-aware substring search across the workspace; up to 200 hits |
+| In Search view: ↑/↓ + Enter, or click a result | Open the file at the matched line |
 | Mouse drag in terminal pane | Select text; on release, the selection is copied to the system clipboard via OSC 52 |
 | Mouse wheel in terminal pane | Scroll through 5000 rows of scrollback. While vim / less / htop is in alternate-screen mode, wheel forwards arrow keys instead so the running app handles it. Any keystroke snaps back to the live bottom. |
 | `Ctrl+Shift+c` (or `Cmd+c` with kitty-protocol terminals) | Explicit copy of the terminal's current selection |

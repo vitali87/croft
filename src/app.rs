@@ -20,7 +20,26 @@ use std::io::{stdout, Stdout};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::widgets::{editor::Editor, file_tree::FileTree, terminal::PtyTerminal};
+use crate::widgets::{
+    editor::Editor, file_tree::FileTree, search::SearchPanel, terminal::PtyTerminal,
+};
+
+/// Which sidebar view is active in the left side panel.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SidebarView {
+    Explorer,
+    Search,
+}
+
+const ACTIVITY_BAR_WIDTH: u16 = 4;
+
+#[derive(Default, Clone, Copy)]
+struct SidebarAreas {
+    /// Cell occupied by the Explorer activity-bar icon, in absolute coords.
+    explorer_icon: Rect,
+    /// Cell occupied by the Search activity-bar icon, in absolute coords.
+    search_icon: Rect,
+}
 
 /// Single source of truth for the application's user-facing name.
 pub const APP_NAME: &str = "croft";
@@ -125,8 +144,11 @@ struct Prompt {
 
 pub struct App {
     pub tree: FileTree,
+    pub search: SearchPanel,
     pub editor: Editor,
     pub terminal: PtyTerminal,
+    sidebar_view: SidebarView,
+    sidebar_areas: SidebarAreas,
     focus: Pane,
     show_tree: bool,
     show_terminal: bool,
@@ -149,6 +171,7 @@ pub struct App {
 impl App {
     pub fn new(root: PathBuf) -> Result<Self> {
         let tree = FileTree::new(root.clone());
+        let search = SearchPanel::new(root.clone());
         let editor = Editor::new();
         let term = PtyTerminal::new(&root).context("spawning terminal")?;
         let (watcher, rx) = match Self::spawn_fs_watcher(&root) {
@@ -158,8 +181,11 @@ impl App {
         let git_status = crate::git::query(&root);
         Ok(Self {
             tree,
+            search,
             editor,
             terminal: term,
+            sidebar_view: SidebarView::Explorer,
+            sidebar_areas: SidebarAreas::default(),
             focus: Pane::Tree,
             show_tree: true,
             show_terminal: true,
@@ -298,6 +324,114 @@ impl App {
         self.terminal.focused = self.focus == Pane::Terminal;
     }
 
+    fn render_activity_bar(&mut self, frame: &mut ratatui::Frame, area: Rect) {
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+        // Solid-ish background for the bar.
+        let bg = Style::default().bg(Color::Rgb(0x14, 0x1a, 0x2a));
+        frame.render_widget(
+            ratatui::widgets::Block::default().style(bg),
+            area,
+        );
+        // Two icons: Explorer (cod-files) and Search (cod-search).
+        let active_color = Color::White;
+        let inactive_color = Color::Rgb(0x6c, 0x7d, 0x9c);
+        let active_bar = Color::Rgb(0x4e, 0x9a, 0xff);
+        let icon_y = area.y + 1;
+        let explorer_icon_x = area.x + 1;
+        let search_icon_y = area.y + 3;
+        let search_icon_x = area.x + 1;
+
+        let render_icon = |frame: &mut ratatui::Frame,
+                           cell_x: u16,
+                           cell_y: u16,
+                           glyph: &str,
+                           is_active: bool| {
+            let color = if is_active {
+                active_color
+            } else {
+                inactive_color
+            };
+            let line = Line::from(vec![
+                Span::styled(
+                    if is_active { "▎" } else { " " },
+                    Style::default().fg(active_bar),
+                ),
+                Span::styled(
+                    format!(" {glyph} "),
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                ),
+            ]);
+            let row = Rect {
+                x: area.x,
+                y: cell_y,
+                width: area.width,
+                height: 1,
+            };
+            frame.render_widget(
+                ratatui::widgets::Paragraph::new(line).style(bg),
+                row,
+            );
+            // Return the icon-glyph cell for hit-testing (skip the leading
+            // active-bar cell + leading space).
+            Rect {
+                x: cell_x + 1,
+                y: cell_y,
+                width: 1,
+                height: 1,
+            }
+        };
+
+        let explorer_glyph = "\u{eaeb}"; // cod-files
+        let search_glyph = "\u{ea6d}"; // cod-search
+
+        let exp_rect = render_icon(
+            frame,
+            explorer_icon_x,
+            icon_y,
+            explorer_glyph,
+            self.sidebar_view == SidebarView::Explorer,
+        );
+        let sea_rect = render_icon(
+            frame,
+            search_icon_x,
+            search_icon_y,
+            search_glyph,
+            self.sidebar_view == SidebarView::Search,
+        );
+
+        // Save broader hit areas: the entire row, not just the glyph cell.
+        self.sidebar_areas.explorer_icon = Rect {
+            x: area.x,
+            y: icon_y,
+            width: area.width,
+            height: 1,
+        };
+        self.sidebar_areas.search_icon = Rect {
+            x: area.x,
+            y: search_icon_y,
+            width: area.width,
+            height: 1,
+        };
+        let _ = (exp_rect, sea_rect); // currently unused, here for future use
+    }
+
+    fn set_sidebar_view(&mut self, view: SidebarView) {
+        self.sidebar_view = view;
+        if !self.show_tree {
+            self.show_tree = true; // ensure the side panel is open when switching
+        }
+        match view {
+            SidebarView::Explorer => self.focus_pane(Pane::Tree),
+            SidebarView::Search => {
+                self.focus_pane(Pane::Tree); // tree pane = side panel; we'll dispatch by view
+                self.search.focused = true;
+                self.tree.focused = false;
+            }
+        }
+    }
+
     fn pane_visible(&self, p: Pane) -> bool {
         match p {
             Pane::Tree => self.show_tree,
@@ -332,22 +466,31 @@ impl App {
             .constraints([Constraint::Min(1), Constraint::Length(1)])
             .split(size);
 
+        // Carve off the activity bar on the very left, then optionally the
+        // side panel, then the main content.
         let main = if self.show_tree {
             Layout::default()
                 .direction(Direction::Horizontal)
-                .constraints([Constraint::Length(32), Constraint::Min(20)])
+                .constraints([
+                    Constraint::Length(ACTIVITY_BAR_WIDTH),
+                    Constraint::Length(32),
+                    Constraint::Min(20),
+                ])
                 .split(outer[0])
         } else {
             Layout::default()
                 .direction(Direction::Horizontal)
-                .constraints([Constraint::Min(20)])
+                .constraints([
+                    Constraint::Length(ACTIVITY_BAR_WIDTH),
+                    Constraint::Min(20),
+                ])
                 .split(outer[0])
         };
 
-        let (tree_area, right_area) = if self.show_tree {
-            (Some(main[0]), main[1])
+        let (activity_area, side_area, right_area) = if self.show_tree {
+            (main[0], Some(main[1]), main[2])
         } else {
-            (None, main[0])
+            (main[0], None, main[1])
         };
 
         let (editor_area, terminal_area) = if self.show_terminal {
@@ -360,8 +503,13 @@ impl App {
             (right_area, None)
         };
 
-        if let Some(area) = tree_area {
-            frame.render_widget(&mut self.tree, area);
+        self.render_activity_bar(frame, activity_area);
+
+        if let Some(area) = side_area {
+            match self.sidebar_view {
+                SidebarView::Explorer => frame.render_widget(&mut self.tree, area),
+                SidebarView::Search => frame.render_widget(&mut self.search, area),
+            }
         }
         frame.render_widget(&mut self.editor, editor_area);
         if let Some(area) = terminal_area {
@@ -535,6 +683,10 @@ impl App {
             self.toggle_terminal();
             return Ok(());
         }
+        if is_search_jump_key(key) {
+            self.set_sidebar_view(SidebarView::Search);
+            return Ok(());
+        }
         match (key.code, key.modifiers) {
             (KeyCode::Char('q'), KeyModifiers::CONTROL) => {
                 self.quit = true;
@@ -552,11 +704,80 @@ impl App {
         }
 
         match self.focus {
-            Pane::Tree => self.handle_tree_key(key),
+            Pane::Tree => match self.sidebar_view {
+                SidebarView::Explorer => self.handle_tree_key(key),
+                SidebarView::Search => self.handle_search_key(key),
+            },
             Pane::Editor => self.handle_editor_key(key),
             Pane::Terminal => self.handle_terminal_key(key),
         }
         Ok(())
+    }
+
+    fn handle_search_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                // Empty the input or jump back to Explorer.
+                if self.search.query.is_empty() {
+                    self.set_sidebar_view(SidebarView::Explorer);
+                } else {
+                    self.search.query.clear();
+                    self.search.hits.clear();
+                }
+            }
+            KeyCode::Enter => {
+                // If a hit is selected and we already have results, open it.
+                if !self.search.hits.is_empty() {
+                    if let Some(hit) = self.search.selected_hit().cloned() {
+                        self.open_search_hit(&hit);
+                        return;
+                    }
+                }
+                // Otherwise run the query.
+                self.search.run_query();
+                self.status = format!(
+                    "Search '{}' → {} match{}",
+                    self.search.query,
+                    self.search.hits.len(),
+                    if self.search.hits.len() == 1 { "" } else { "es" }
+                );
+            }
+            KeyCode::Backspace => {
+                self.search.query.pop();
+            }
+            KeyCode::Up => self.search.move_up(),
+            KeyCode::Down => self.search.move_down(),
+            KeyCode::Char(c) => {
+                if !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT)
+                    && !key.modifiers.contains(KeyModifiers::SUPER)
+                {
+                    self.search.query.push(c);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn open_search_hit(&mut self, hit: &crate::widgets::search::SearchHit) {
+        match self.editor.open(&hit.path) {
+            Ok(()) => {
+                // Place the cursor on the matched line.
+                let row = hit.line_no.saturating_sub(1).min(
+                    self.editor.lines.len().saturating_sub(1),
+                );
+                self.editor.cursor_row = row;
+                self.editor.cursor_col = 0;
+                self.status = format!(
+                    "Opened {} at line {}",
+                    hit.path.display(),
+                    hit.line_no
+                );
+            }
+            Err(e) => {
+                self.status = format!("Open failed: {e}");
+            }
+        }
     }
 
     fn handle_tree_key(&mut self, key: KeyEvent) {
@@ -732,6 +953,33 @@ impl App {
                 }
             }
             MouseEventKind::Down(MouseButton::Left) => {
+                // Activity-bar hit-test takes precedence over the side panel.
+                if rect_contains(self.sidebar_areas.explorer_icon, m.column, m.row) {
+                    self.set_sidebar_view(SidebarView::Explorer);
+                    return;
+                }
+                if rect_contains(self.sidebar_areas.search_icon, m.column, m.row) {
+                    self.set_sidebar_view(SidebarView::Search);
+                    return;
+                }
+                if in_tree && self.sidebar_view == SidebarView::Search {
+                    // Click on a result row: open it.
+                    if let Some(idx) = self.search.hit_at_y(m.row) {
+                        self.search.selected = idx;
+                        if let Some(hit) = self.search.selected_hit().cloned() {
+                            self.open_search_hit(&hit);
+                        }
+                    } else {
+                        // Click on the input/header area: just focus search.
+                        self.search.focused = true;
+                        self.tree.focused = false;
+                        self.focus_pane(Pane::Tree);
+                        // focus_pane sets self.tree.focused; restore search ownership.
+                        self.tree.focused = false;
+                        self.search.focused = true;
+                    }
+                    return;
+                }
                 if in_tree {
                     self.focus_pane(Pane::Tree);
                     if let Some(idx) = self.tree.node_at_y(m.row) {
@@ -1064,6 +1312,19 @@ fn is_terminal_copy_key(key: KeyEvent) -> bool {
     ctrl_shift || super_only
 }
 
+/// Returns true if the given key event should jump to the Search sidebar
+/// view (VS Code's Ctrl/Cmd+Shift+F "Find in Files" gesture).
+fn is_search_jump_key(key: KeyEvent) -> bool {
+    let KeyCode::Char(c) = key.code else { return false };
+    if !c.eq_ignore_ascii_case(&'f') {
+        return false;
+    }
+    let has_shift = key.modifiers.contains(KeyModifiers::SHIFT);
+    let has_ctrl_or_super = key.modifiers.contains(KeyModifiers::CONTROL)
+        || key.modifiers.contains(KeyModifiers::SUPER);
+    has_shift && has_ctrl_or_super
+}
+
 /// Returns true if the given key event should toggle the terminal pane.
 /// VS Code uses `Ctrl+`` ` `` (backtick); we use `Ctrl+J` to match its
 /// "Toggle Terminal Panel" shortcut, which is more reliable to type on
@@ -1362,6 +1623,23 @@ mod tests {
         let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(joined.contains("↑2"));
         assert!(joined.contains("↓1"));
+    }
+
+    #[test]
+    fn ctrl_shift_f_jumps_to_search() {
+        let mods = KeyModifiers::CONTROL | KeyModifiers::SHIFT;
+        assert!(is_search_jump_key(key(KeyCode::Char('F'), mods)));
+    }
+
+    #[test]
+    fn cmd_shift_f_jumps_to_search() {
+        let mods = KeyModifiers::SUPER | KeyModifiers::SHIFT;
+        assert!(is_search_jump_key(key(KeyCode::Char('F'), mods)));
+    }
+
+    #[test]
+    fn plain_f_does_not_jump_to_search() {
+        assert!(!is_search_jump_key(key(KeyCode::Char('f'), KeyModifiers::NONE)));
     }
 
     #[test]

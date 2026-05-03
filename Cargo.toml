@@ -46,6 +46,7 @@ notify = "8.2"
 notify-debouncer-full = "0.7"
 trash = "5.2"
 base64 = "0.22"
+regex = "1.12"
 
 [dev-dependencies]
 tempfile = "3.27"
