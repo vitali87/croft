@@ -272,8 +272,13 @@ impl App {
         let w_cells = ACTIVITY_BAR_WIDTH;
         let h_cells = ACTIVITY_ICON_HEIGHT;
         let encode = |png: &[u8]| -> String {
+            // preserveAspectRatio=0 → stretch to fill the full N×M cell area.
+            // The PNG's bar-bg fills every pixel inside that area, so the
+            // cells underneath stay visually contiguous with the rest of
+            // the activity bar — no black sliver between the two icons due
+            // to a 1:1 PNG vs non-1:1 cell-area aspect mismatch.
             let raw =
-                crate::iterm2_inline::build_inline_image_osc(png, w_cells, h_cells, true);
+                crate::iterm2_inline::build_inline_image_osc(png, w_cells, h_cells, false);
             if is_tmux {
                 crate::iterm2_inline::tmux_passthrough_wrap(&raw)
             } else {
