@@ -41,7 +41,7 @@ fn activity_icon_glyph_x(bar: Rect) -> u16 {
 }
 
 fn activity_explorer_y(bar: Rect) -> u16 {
-    bar.y
+    bar.y + 1
 }
 
 fn activity_search_y(bar: Rect) -> u16 {
