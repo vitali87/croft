@@ -84,9 +84,16 @@ croft setup-terminal --help
 | Mouse drag in terminal pane | Select text; on release, the selection is copied to the system clipboard via OSC 52 |
 | Mouse wheel in terminal pane | Scroll through 5000 rows of scrollback. While vim / less / htop is in alternate-screen mode, wheel forwards arrow keys instead so the running app handles it. Any keystroke snaps back to the live bottom. |
 | `Ctrl+Shift+c` (or `Cmd+c` with kitty-protocol terminals) | Explicit copy of the terminal's current selection |
-| Editor: arrows, Home, End | Navigate |
+| Editor: arrows, Home, End | Navigate (clears any active selection) |
+| Editor: `Shift`+arrows / `Shift`+Home / End / PageUp / PageDown | Extend the selection by the same motion |
 | Editor: PageUp / PageDown (`fn+↑` / `fn+↓` on Mac) | Scroll exactly one viewport; the line just past the previous bottom becomes the new top |
-| Editor: any printable char, Enter, Backspace, Delete, Tab | Edit |
+| Editor: any printable char, Enter, Backspace, Delete, Tab | Edit (typing or deleting with an active selection replaces it) |
+| Editor: mouse drag | Select text; on release the selection is copied to the system clipboard via OSC 52 |
+| Editor: `Ctrl+C` / `Cmd+C` | Copy the current selection |
+| Editor: `Ctrl+X` / `Cmd+X` | Cut the current selection |
+| Editor: `Ctrl+A` / `Cmd+A` | Select the entire buffer |
+| Editor: `Ctrl+V` / `Cmd+V` (host-terminal paste) | Paste system-clipboard contents at the cursor; replaces selection if any |
+| Editor: `Esc` | Clear the current selection |
 | Mouse click in any pane | Focus and (in tree) select / open, (in editor) move cursor |
 | Mouse right-click in tree | Open context menu (New File…, New Folder…, Delete) |
 | `Delete` / `Backspace` (or `Cmd+Backspace`) in tree | Move the selected file or folder to the OS Trash, no confirmation. Mac keyboards label the Backspace key as "delete," so the obvious key works regardless of layout. |

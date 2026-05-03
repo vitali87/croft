@@ -14,6 +14,32 @@ use crate::highlight::{
 
 const MAX_FILE_BYTES: u64 = 5 * 1024 * 1024;
 
+/// Inclusive char-indexed range `(row, col)` anchor and head, where head
+/// follows the cursor as the user drags / shift-arrows.  `normalised()` returns
+/// the pair in row-major order so callers don't have to care which end came
+/// first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EditorSelection {
+    pub anchor: (usize, usize),
+    pub head: (usize, usize),
+}
+
+impl EditorSelection {
+    pub fn new(row: usize, col: usize) -> Self {
+        Self { anchor: (row, col), head: (row, col) }
+    }
+    pub fn normalised(&self) -> ((usize, usize), (usize, usize)) {
+        if self.anchor <= self.head {
+            (self.anchor, self.head)
+        } else {
+            (self.head, self.anchor)
+        }
+    }
+    pub fn has_area(&self) -> bool {
+        self.anchor != self.head
+    }
+}
+
 pub struct Editor {
     pub path: Option<PathBuf>,
     pub lines: Vec<String>,
@@ -27,6 +53,7 @@ pub struct Editor {
     pub last_area: Rect,
     pub last_inner: Rect,
     pub last_gutter_width: u16,
+    pub selection: Option<EditorSelection>,
     lang: Option<LangKind>,
     highlights: Vec<Vec<HiSpan>>,
     registry: LangRegistry,
@@ -46,6 +73,7 @@ impl Editor {
             last_area: Rect::default(),
             last_inner: Rect::default(),
             last_gutter_width: 0,
+            selection: None,
             lang: None,
             highlights: Vec::new(),
             registry: LangRegistry::new(),
@@ -75,6 +103,7 @@ impl Editor {
         self.cursor_row = 0;
         self.cursor_col = 0;
         self.dirty = false;
+        self.selection = None;
         self.status = format!("Opened {}", path.display());
         self.recompute_highlights();
         Ok(())
@@ -107,6 +136,9 @@ impl Editor {
     }
 
     pub fn insert_char(&mut self, c: char) {
+        if self.delete_selection() {
+            // selection consumed; fall through to insert at the new cursor.
+        }
         if self.lines.is_empty() {
             self.lines.push(String::new());
         }
@@ -120,16 +152,32 @@ impl Editor {
     }
 
     pub fn insert_str(&mut self, s: &str) {
+        if self.selection.is_some() {
+            self.delete_selection();
+        }
         for c in s.chars() {
             if c == '\n' {
-                self.insert_newline();
+                self.insert_newline_raw();
             } else {
-                self.insert_char(c);
+                self.insert_char_raw(c);
             }
         }
+        self.recompute_highlights();
     }
 
-    pub fn insert_newline(&mut self) {
+    fn insert_char_raw(&mut self, c: char) {
+        if self.lines.is_empty() {
+            self.lines.push(String::new());
+        }
+        let row = self.cursor_row;
+        let col = self.cursor_col;
+        let byte = self.byte_index(row, col);
+        self.lines[row].insert(byte, c);
+        self.cursor_col += 1;
+        self.dirty = true;
+    }
+
+    fn insert_newline_raw(&mut self) {
         if self.lines.is_empty() {
             self.lines.push(String::new());
         }
@@ -141,10 +189,21 @@ impl Editor {
         self.cursor_row += 1;
         self.cursor_col = 0;
         self.dirty = true;
+    }
+
+    pub fn insert_newline(&mut self) {
+        if self.delete_selection() {
+            // fall through.
+        }
+        self.insert_newline_raw();
         self.recompute_highlights();
     }
 
     pub fn backspace(&mut self) {
+        if self.delete_selection() {
+            self.recompute_highlights();
+            return;
+        }
         if self.cursor_col > 0 {
             let row = self.cursor_row;
             let col = self.cursor_col - 1;
@@ -164,6 +223,10 @@ impl Editor {
     }
 
     pub fn delete_forward(&mut self) {
+        if self.delete_selection() {
+            self.recompute_highlights();
+            return;
+        }
         let row = self.cursor_row;
         let len = self.line_char_len(row);
         if self.cursor_col < len {
@@ -177,6 +240,123 @@ impl Editor {
             self.dirty = true;
         }
         self.recompute_highlights();
+    }
+
+    pub fn start_selection_at_cursor(&mut self) {
+        self.selection = Some(EditorSelection::new(self.cursor_row, self.cursor_col));
+    }
+
+    pub fn extend_selection_to_cursor(&mut self) {
+        if let Some(sel) = self.selection.as_mut() {
+            sel.head = (self.cursor_row, self.cursor_col);
+        } else {
+            self.start_selection_at_cursor();
+        }
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.selection = None;
+    }
+
+    pub fn select_all(&mut self) {
+        if self.lines.is_empty() {
+            self.selection = None;
+            return;
+        }
+        let last_row = self.lines.len() - 1;
+        let last_col = self.line_char_len(last_row);
+        self.selection = Some(EditorSelection {
+            anchor: (0, 0),
+            head: (last_row, last_col),
+        });
+        self.cursor_row = last_row;
+        self.cursor_col = last_col;
+    }
+
+    /// Extract the selection text (`\n`-joined across rows) using the
+    /// editor's char-indexed coordinates.  Returns "" when there's no
+    /// selection or the selection is zero-area.
+    pub fn selection_text(&self) -> String {
+        let Some(sel) = self.selection else { return String::new() };
+        if !sel.has_area() {
+            return String::new();
+        }
+        let ((sr, sc), (er, ec)) = sel.normalised();
+        if sr == er {
+            let line = &self.lines[sr];
+            let from = char_byte(line, sc);
+            let to = char_byte(line, ec);
+            return line[from..to].to_string();
+        }
+        let mut out = String::new();
+        // first row: from sc to end of line
+        let first = &self.lines[sr];
+        let from = char_byte(first, sc);
+        out.push_str(&first[from..]);
+        out.push('\n');
+        // full middle rows
+        for r in (sr + 1)..er {
+            out.push_str(&self.lines[r]);
+            out.push('\n');
+        }
+        // last row: from start to ec
+        let last = &self.lines[er];
+        let to = char_byte(last, ec);
+        out.push_str(&last[..to]);
+        out
+    }
+
+    /// Delete the current selection if it has area.  Returns true iff content
+    /// was removed.  Cursor lands at the start of the deleted range and the
+    /// selection is cleared.  Caller is responsible for `recompute_highlights`
+    /// when used outside an `insert_*` chain.
+    pub fn delete_selection(&mut self) -> bool {
+        let Some(sel) = self.selection else { return false };
+        if !sel.has_area() {
+            self.selection = None;
+            return false;
+        }
+        let ((sr, sc), (er, ec)) = sel.normalised();
+        if sr == er {
+            let line = &mut self.lines[sr];
+            let from = char_byte(line, sc);
+            let to = char_byte(line, ec);
+            line.replace_range(from..to, "");
+        } else {
+            let last = self.lines.remove(er);
+            // remove intermediate rows
+            for _ in (sr + 1)..er {
+                self.lines.remove(sr + 1);
+            }
+            let first = &mut self.lines[sr];
+            let from = char_byte(first, sc);
+            first.truncate(from);
+            let to = char_byte(&last, ec);
+            first.push_str(&last[to..]);
+        }
+        self.cursor_row = sr;
+        self.cursor_col = sc;
+        self.selection = None;
+        self.dirty = true;
+        true
+    }
+
+    /// Mouse-down: position the cursor at the click point and start a
+    /// fresh zero-area selection there. A subsequent drag widens it.
+    pub fn mouse_down(&mut self, col: u16, row: u16) {
+        self.click(col, row);
+        self.start_selection_at_cursor();
+    }
+
+    /// Mouse-drag: move the cursor to the drag point and extend the selection
+    /// head to the new cursor.  Anchors at the current cursor if no prior
+    /// selection exists.
+    pub fn mouse_drag(&mut self, col: u16, row: u16) {
+        if self.selection.is_none() {
+            self.start_selection_at_cursor();
+        }
+        self.click(col, row);
+        self.extend_selection_to_cursor();
     }
 
     /// Returns true if the on-disk file at `event_path` is the file currently
@@ -333,6 +513,11 @@ impl Editor {
         self.cursor_row = target_line;
         self.cursor_col = target_col.min(self.line_char_len(target_line));
     }
+}
+
+/// Convert a char index within `s` to a byte index, saturating at `s.len()`.
+fn char_byte(s: &str, char_idx: usize) -> usize {
+    s.char_indices().nth(char_idx).map(|(i, _)| i).unwrap_or(s.len())
 }
 
 fn is_binary(data: &[u8]) -> bool {
@@ -779,6 +964,234 @@ mod tests {
         // Expect: "a", "bc", "de"
         assert_eq!(spans.len(), 3);
     }
+
+    #[test]
+    fn editor_selection_normalised_handles_anchor_after_head() {
+        let s = EditorSelection { anchor: (5, 4), head: (2, 1) };
+        assert_eq!(s.normalised(), ((2, 1), (5, 4)));
+    }
+
+    #[test]
+    fn editor_selection_normalised_handles_same_row() {
+        let s = EditorSelection { anchor: (3, 9), head: (3, 2) };
+        assert_eq!(s.normalised(), ((3, 2), (3, 9)));
+    }
+
+    #[test]
+    fn editor_selection_has_area_only_when_endpoints_differ() {
+        let s = EditorSelection::new(2, 5);
+        assert!(!s.has_area());
+        let s2 = EditorSelection { anchor: (2, 5), head: (2, 6) };
+        assert!(s2.has_area());
+    }
+
+    #[test]
+    fn start_selection_at_cursor_creates_zero_area_selection() {
+        let mut e = editor_with("hello");
+        e.cursor_row = 0;
+        e.cursor_col = 2;
+        e.start_selection_at_cursor();
+        let sel = e.selection.expect("selection should exist");
+        assert_eq!(sel.anchor, (0, 2));
+        assert_eq!(sel.head, (0, 2));
+        assert!(!sel.has_area());
+    }
+
+    #[test]
+    fn extend_selection_to_cursor_updates_head_only() {
+        let mut e = editor_with("abcdef");
+        e.cursor_col = 1;
+        e.start_selection_at_cursor();
+        e.cursor_col = 4;
+        e.extend_selection_to_cursor();
+        let sel = e.selection.unwrap();
+        assert_eq!(sel.anchor, (0, 1));
+        assert_eq!(sel.head, (0, 4));
+        assert!(sel.has_area());
+    }
+
+    #[test]
+    fn selection_text_single_line() {
+        let mut e = editor_with("hello world");
+        e.cursor_col = 6;
+        e.start_selection_at_cursor();
+        e.cursor_col = 11;
+        e.extend_selection_to_cursor();
+        assert_eq!(e.selection_text(), "world");
+    }
+
+    #[test]
+    fn selection_text_handles_reversed_endpoints() {
+        let mut e = editor_with("hello world");
+        e.cursor_col = 11;
+        e.start_selection_at_cursor();
+        e.cursor_col = 6;
+        e.extend_selection_to_cursor();
+        assert_eq!(e.selection_text(), "world");
+    }
+
+    #[test]
+    fn selection_text_multi_line_includes_newlines() {
+        let mut e = editor_with("first line\nsecond line\nthird");
+        e.cursor_row = 0;
+        e.cursor_col = 6;
+        e.start_selection_at_cursor();
+        e.cursor_row = 1;
+        e.cursor_col = 6;
+        e.extend_selection_to_cursor();
+        assert_eq!(e.selection_text(), "line\nsecond");
+    }
+
+    #[test]
+    fn selection_text_multibyte_chars() {
+        let mut e = editor_with("héllo");
+        e.cursor_col = 1;
+        e.start_selection_at_cursor();
+        e.cursor_col = 3;
+        e.extend_selection_to_cursor();
+        assert_eq!(e.selection_text(), "él");
+    }
+
+    #[test]
+    fn clear_selection_removes_it() {
+        let mut e = editor_with("abc");
+        e.start_selection_at_cursor();
+        assert!(e.selection.is_some());
+        e.clear_selection();
+        assert!(e.selection.is_none());
+    }
+
+    #[test]
+    fn delete_selection_removes_range_within_one_line() {
+        let mut e = editor_with("hello world");
+        e.cursor_col = 5;
+        e.start_selection_at_cursor();
+        e.cursor_col = 11;
+        e.extend_selection_to_cursor();
+        assert!(e.delete_selection());
+        assert_eq!(e.lines, vec!["hello".to_string()]);
+        assert_eq!(e.cursor_row, 0);
+        assert_eq!(e.cursor_col, 5);
+        assert!(e.selection.is_none());
+        assert!(e.dirty);
+    }
+
+    #[test]
+    fn delete_selection_collapses_multiple_lines() {
+        let mut e = editor_with("first\nsecond\nthird");
+        e.cursor_row = 0;
+        e.cursor_col = 2;
+        e.start_selection_at_cursor();
+        e.cursor_row = 2;
+        e.cursor_col = 2;
+        e.extend_selection_to_cursor();
+        assert!(e.delete_selection());
+        assert_eq!(e.lines, vec!["fiird".to_string()]);
+        assert_eq!(e.cursor_row, 0);
+        assert_eq!(e.cursor_col, 2);
+    }
+
+    #[test]
+    fn delete_selection_returns_false_when_no_selection() {
+        let mut e = editor_with("abc");
+        assert!(!e.delete_selection());
+        assert_eq!(e.lines, vec!["abc".to_string()]);
+    }
+
+    #[test]
+    fn delete_selection_returns_false_when_zero_area() {
+        let mut e = editor_with("abc");
+        e.cursor_col = 1;
+        e.start_selection_at_cursor();
+        assert!(!e.delete_selection());
+        assert_eq!(e.lines, vec!["abc".to_string()]);
+    }
+
+    #[test]
+    fn insert_char_replaces_selection_when_active() {
+        let mut e = editor_with("hello world");
+        e.cursor_col = 6;
+        e.start_selection_at_cursor();
+        e.cursor_col = 11;
+        e.extend_selection_to_cursor();
+        e.insert_char('X');
+        assert_eq!(e.lines, vec!["hello X".to_string()]);
+        assert_eq!(e.cursor_col, 7);
+        assert!(e.selection.is_none());
+    }
+
+    #[test]
+    fn backspace_deletes_selection_when_active() {
+        let mut e = editor_with("hello world");
+        e.cursor_col = 6;
+        e.start_selection_at_cursor();
+        e.cursor_col = 11;
+        e.extend_selection_to_cursor();
+        e.backspace();
+        assert_eq!(e.lines, vec!["hello ".to_string()]);
+        assert!(e.selection.is_none());
+    }
+
+    #[test]
+    fn delete_forward_deletes_selection_when_active() {
+        let mut e = editor_with("hello world");
+        e.cursor_col = 6;
+        e.start_selection_at_cursor();
+        e.cursor_col = 11;
+        e.extend_selection_to_cursor();
+        e.delete_forward();
+        assert_eq!(e.lines, vec!["hello ".to_string()]);
+        assert!(e.selection.is_none());
+    }
+
+    #[test]
+    fn insert_str_replaces_selection_when_active() {
+        let mut e = editor_with("hello world");
+        e.cursor_col = 6;
+        e.start_selection_at_cursor();
+        e.cursor_col = 11;
+        e.extend_selection_to_cursor();
+        e.insert_str("everyone");
+        assert_eq!(e.lines, vec!["hello everyone".to_string()]);
+        assert!(e.selection.is_none());
+    }
+
+    #[test]
+    fn select_all_spans_entire_buffer() {
+        let mut e = editor_with("a\nbc\nd");
+        e.select_all();
+        let sel = e.selection.unwrap();
+        let (start, end) = sel.normalised();
+        assert_eq!(start, (0, 0));
+        assert_eq!(end, (2, 1));
+        assert_eq!(e.selection_text(), "a\nbc\nd");
+    }
+
+    #[test]
+    fn mouse_down_starts_zero_area_selection_at_click() {
+        let mut e = editor_with("hello");
+        e.last_inner = Rect { x: 0, y: 0, width: 80, height: 25 };
+        e.last_gutter_width = 2;
+        e.mouse_down(3 + 0, 0); // text_x = 0 + 2 + 1 = 3, click col 3 → editor col 0
+        assert_eq!(e.cursor_col, 0);
+        let sel = e.selection.expect("anchor created on mouse down");
+        assert_eq!(sel.anchor, (0, 0));
+        assert!(!sel.has_area());
+    }
+
+    #[test]
+    fn mouse_drag_extends_selection() {
+        let mut e = editor_with("hello world");
+        e.last_inner = Rect { x: 0, y: 0, width: 80, height: 25 };
+        e.last_gutter_width = 2;
+        let text_x: u16 = 3;
+        e.mouse_down(text_x + 0, 0);
+        e.mouse_drag(text_x + 5, 0);
+        let sel = e.selection.unwrap();
+        assert_eq!(sel.anchor, (0, 0));
+        assert_eq!(sel.head, (0, 5));
+        assert_eq!(e.cursor_col, 5);
+    }
 }
 
 impl Widget for &mut Editor {
@@ -826,6 +1239,11 @@ impl Widget for &mut Editor {
         let text_x = inner.x + gutter_width + 1;
         let text_width = inner.width.saturating_sub(gutter_width + 2);
 
+        let sel_norm = self
+            .selection
+            .filter(|s| s.has_area())
+            .map(|s| s.normalised());
+
         let end = (self.scroll + height).min(self.lines.len());
         for (row_idx, line_idx) in (self.scroll..end).enumerate() {
             let y = inner.y + row_idx as u16;
@@ -840,14 +1258,62 @@ impl Widget for &mut Editor {
             let line = Line::from(spans);
             buf.set_line(text_x, y, &line, text_width);
 
+            if let Some(((sr, sc), (er, ec))) = sel_norm {
+                if line_idx >= sr && line_idx <= er {
+                    let line_chars = self.line_char_len(line_idx);
+                    let row_start = if line_idx == sr { sc } else { 0 };
+                    // For non-final selected rows, paint past the line content
+                    // by one cell to make the trailing newline visible.
+                    let row_end = if line_idx == er {
+                        ec
+                    } else {
+                        line_chars + 1
+                    };
+                    paint_selection_band(
+                        buf,
+                        text_x,
+                        y,
+                        text_width,
+                        row_start,
+                        row_end,
+                    );
+                }
+            }
+
             if self.focused && line_idx == self.cursor_row {
                 let col = (self.cursor_col as u16).min(text_width.saturating_sub(1));
                 let cx = text_x + col;
                 if cx < inner.x + inner.width {
                     let cell = &mut buf[(cx, y)];
-                    cell.set_style(Style::default().add_modifier(Modifier::REVERSED));
+                    cell.set_style(
+                        cell.style().add_modifier(Modifier::REVERSED),
+                    );
                 }
             }
         }
+    }
+}
+
+/// Apply the selection background colour to columns `[start_char..end_char)`
+/// of row `y`, where columns are character indices within the editor's text
+/// area.  Clamps to the visible width.
+fn paint_selection_band(
+    buf: &mut Buffer,
+    text_x: u16,
+    y: u16,
+    text_width: u16,
+    start_char: usize,
+    end_char: usize,
+) {
+    let bg = Color::Rgb(0x26, 0x4f, 0x78);
+    let s = start_char.min(text_width as usize);
+    let e = end_char.min(text_width as usize);
+    if e <= s {
+        return;
+    }
+    for col in s..e {
+        let x = text_x + col as u16;
+        let cell = &mut buf[(x, y)];
+        cell.set_style(cell.style().bg(bg));
     }
 }

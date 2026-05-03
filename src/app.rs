@@ -1,8 +1,9 @@
 use anyhow::{Context, Result};
 use crossterm::{
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-        KeyModifiers, KeyboardEnhancementFlags, MouseButton, MouseEvent, MouseEventKind,
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste,
+        EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+        KeyboardEnhancementFlags, MouseButton, MouseEvent, MouseEventKind,
         PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute,
@@ -823,6 +824,67 @@ impl App {
     }
 
     fn handle_editor_key(&mut self, key: KeyEvent) {
+        // Clipboard gestures take precedence over text input. They never
+        // conflict with normal typing (Ctrl/Cmd + C/X/A) so the order is
+        // safe even when the user is in the middle of editing.
+        if is_editor_copy_key(key) {
+            self.copy_editor_selection();
+            return;
+        }
+        if is_editor_cut_key(key) {
+            self.cut_editor_selection();
+            return;
+        }
+        if is_editor_select_all_key(key) {
+            self.editor.select_all();
+            self.status = format!(
+                "Selected {} chars",
+                self.editor.selection_text().chars().count()
+            );
+            return;
+        }
+        if matches!(key.code, KeyCode::Esc) && self.editor.selection.is_some() {
+            self.editor.clear_selection();
+            return;
+        }
+
+        // Shift+<motion> extends selection in the motion's direction.
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        let is_motion = matches!(
+            key.code,
+            KeyCode::Up
+                | KeyCode::Down
+                | KeyCode::Left
+                | KeyCode::Right
+                | KeyCode::Home
+                | KeyCode::End
+                | KeyCode::PageUp
+                | KeyCode::PageDown
+        );
+        if is_motion && shift {
+            if self.editor.selection.is_none() {
+                self.editor.start_selection_at_cursor();
+            }
+            match key.code {
+                KeyCode::Up => self.editor.move_up(),
+                KeyCode::Down => self.editor.move_down(),
+                KeyCode::Left => self.editor.move_left(),
+                KeyCode::Right => self.editor.move_right(),
+                KeyCode::Home => self.editor.home_line(),
+                KeyCode::End => self.editor.end_line(),
+                KeyCode::PageUp => self.editor.page_up_one_screen(),
+                KeyCode::PageDown => self.editor.page_down_one_screen(),
+                _ => {}
+            }
+            self.editor.extend_selection_to_cursor();
+            return;
+        }
+        if is_motion {
+            // Plain motion clears any prior selection (VS Code / Sublime
+            // convention: arrows without Shift collapse the selection).
+            self.editor.clear_selection();
+        }
+
         match key.code {
             KeyCode::Up => self.editor.move_up(),
             KeyCode::Down => self.editor.move_down(),
@@ -839,6 +901,7 @@ impl App {
             KeyCode::Char(c) => {
                 if !key.modifiers.contains(KeyModifiers::CONTROL)
                     && !key.modifiers.contains(KeyModifiers::ALT)
+                    && !key.modifiers.contains(KeyModifiers::SUPER)
                 {
                     self.editor.insert_char(c);
                 }
@@ -878,12 +941,76 @@ impl App {
             self.terminal.clear_selection();
             return;
         }
-        use std::io::Write;
-        let bytes = crate::widgets::terminal::osc52_copy_seq(&text);
-        let mut out = std::io::stdout();
-        let _ = out.write_all(&bytes);
-        let _ = out.flush();
+        write_osc52(&text);
         self.status = format!("Copied {} chars to clipboard", text.chars().count());
+    }
+
+    /// Mouse-up over the editor: if the drag produced a real selection, copy
+    /// it to the host clipboard via OSC 52 and leave the highlight visible
+    /// so the user can see what was copied. A click without drag (zero area)
+    /// just clears the anchor.
+    fn copy_editor_selection_or_clear(&mut self) {
+        let Some(sel) = self.editor.selection else { return };
+        if !sel.has_area() {
+            self.editor.clear_selection();
+            return;
+        }
+        let text = self.editor.selection_text();
+        if text.is_empty() {
+            self.editor.clear_selection();
+            return;
+        }
+        write_osc52(&text);
+        self.status = format!("Copied {} chars to clipboard", text.chars().count());
+    }
+
+    fn copy_editor_selection(&mut self) {
+        let Some(sel) = self.editor.selection else { return };
+        if !sel.has_area() {
+            return;
+        }
+        let text = self.editor.selection_text();
+        if text.is_empty() {
+            return;
+        }
+        write_osc52(&text);
+        self.status = format!("Copied {} chars to clipboard", text.chars().count());
+    }
+
+    fn cut_editor_selection(&mut self) {
+        let Some(sel) = self.editor.selection else { return };
+        if !sel.has_area() {
+            return;
+        }
+        let text = self.editor.selection_text();
+        if text.is_empty() {
+            self.editor.clear_selection();
+            return;
+        }
+        write_osc52(&text);
+        let n = text.chars().count();
+        self.editor.delete_selection();
+        self.status = format!("Cut {n} chars to clipboard");
+    }
+
+    fn handle_paste(&mut self, s: &str) {
+        match self.focus {
+            Pane::Editor => {
+                self.editor.insert_str(s);
+                self.status = format!("Pasted {} chars", s.chars().count());
+            }
+            Pane::Terminal => {
+                // Forward bracketed paste to the embedded shell verbatim,
+                // wrapped in the same envelope so the shell treats it as a
+                // paste rather than typed input.
+                self.terminal.write_input(b"\x1b[200~");
+                self.terminal.write_input(s.as_bytes());
+                self.terminal.write_input(b"\x1b[201~");
+            }
+            Pane::Tree => {
+                // Tree has no text input target; paste is a no-op here.
+            }
+        }
     }
 
     fn handle_mouse(&mut self, m: MouseEvent) {
@@ -998,7 +1125,9 @@ impl App {
                     }
                 } else if in_editor {
                     self.focus_pane(Pane::Editor);
-                    self.editor.click(m.column, m.row);
+                    // Anchor a fresh selection at the click; a drag widens it,
+                    // a clean click ends up cleared on mouse-up.
+                    self.editor.mouse_down(m.column, m.row);
                 } else if in_terminal {
                     self.focus_pane(Pane::Terminal);
                     // Begin a fresh selection at the click cell. Without a
@@ -1010,7 +1139,7 @@ impl App {
             }
             MouseEventKind::Drag(MouseButton::Left) => {
                 if in_editor {
-                    self.editor.click(m.column, m.row);
+                    self.editor.mouse_drag(m.column, m.row);
                 } else if in_tree {
                     if let Some(idx) = self.tree.node_at_y(m.row) {
                         self.tree.select(idx);
@@ -1022,6 +1151,8 @@ impl App {
             MouseEventKind::Up(MouseButton::Left) => {
                 if in_terminal {
                     self.copy_terminal_selection_or_clear();
+                } else if in_editor {
+                    self.copy_editor_selection_or_clear();
                 }
             }
             MouseEventKind::ScrollDown => {
@@ -1367,6 +1498,46 @@ fn is_save_key(key: KeyEvent) -> bool {
     key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::SUPER)
 }
 
+/// Send an OSC 52 sequence to put `text` on the host terminal's system
+/// clipboard. Best-effort; failures are silent because there's nothing
+/// useful the user could do about them.
+fn write_osc52(text: &str) {
+    use std::io::Write;
+    let bytes = crate::widgets::terminal::osc52_copy_seq(text);
+    let mut out = std::io::stdout();
+    let _ = out.write_all(&bytes);
+    let _ = out.flush();
+}
+
+/// Returns true if the given key event should copy the editor's current
+/// selection to the system clipboard. Recognises plain `Ctrl+C` and `Cmd+C`
+/// — there's no SIGINT collision since the editor pane is not a shell.
+fn is_editor_copy_key(key: KeyEvent) -> bool {
+    let KeyCode::Char(c) = key.code else { return false };
+    if !c.eq_ignore_ascii_case(&'c') {
+        return false;
+    }
+    key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::SUPER)
+}
+
+/// Cut: `Ctrl+X` / `Cmd+X`.
+fn is_editor_cut_key(key: KeyEvent) -> bool {
+    let KeyCode::Char(c) = key.code else { return false };
+    if !c.eq_ignore_ascii_case(&'x') {
+        return false;
+    }
+    key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::SUPER)
+}
+
+/// Select-all: `Ctrl+A` / `Cmd+A`.
+fn is_editor_select_all_key(key: KeyEvent) -> bool {
+    let KeyCode::Char(c) = key.code else { return false };
+    if !c.eq_ignore_ascii_case(&'a') {
+        return false;
+    }
+    key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::SUPER)
+}
+
 fn rect_contains(r: Rect, x: u16, y: u16) -> bool {
     r.width > 0
         && r.height > 0
@@ -1643,6 +1814,35 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_c_is_editor_copy_key() {
+        assert!(is_editor_copy_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL)));
+    }
+
+    #[test]
+    fn cmd_c_is_editor_copy_key() {
+        assert!(is_editor_copy_key(key(KeyCode::Char('c'), KeyModifiers::SUPER)));
+    }
+
+    #[test]
+    fn plain_c_is_not_editor_copy_key() {
+        assert!(!is_editor_copy_key(key(KeyCode::Char('c'), KeyModifiers::NONE)));
+    }
+
+    #[test]
+    fn ctrl_x_is_editor_cut_key() {
+        assert!(is_editor_cut_key(key(KeyCode::Char('x'), KeyModifiers::CONTROL)));
+        assert!(is_editor_cut_key(key(KeyCode::Char('x'), KeyModifiers::SUPER)));
+        assert!(!is_editor_cut_key(key(KeyCode::Char('x'), KeyModifiers::NONE)));
+    }
+
+    #[test]
+    fn ctrl_a_is_editor_select_all_key() {
+        assert!(is_editor_select_all_key(key(KeyCode::Char('a'), KeyModifiers::CONTROL)));
+        assert!(is_editor_select_all_key(key(KeyCode::Char('a'), KeyModifiers::SUPER)));
+        assert!(!is_editor_select_all_key(key(KeyCode::Char('a'), KeyModifiers::NONE)));
+    }
+
+    #[test]
     fn ctrl_shift_c_is_recognized_as_terminal_copy() {
         let mods = KeyModifiers::CONTROL | KeyModifiers::SHIFT;
         assert!(is_terminal_copy_key(key(KeyCode::Char('C'), mods)));
@@ -1817,7 +2017,8 @@ pub fn run(root: PathBuf) -> Result<()> {
 
     enable_raw_mode().context("enable raw mode")?;
     let mut out = stdout();
-    execute!(out, EnterAlternateScreen, EnableMouseCapture).context("enter alt screen")?;
+    execute!(out, EnterAlternateScreen, EnableMouseCapture, EnableBracketedPaste)
+        .context("enter alt screen")?;
     // Best-effort: terminals that don't speak the kitty keyboard protocol just
     // ignore this; ones that do (iTerm2 >=3.5, Ghostty, kitty, WezTerm) start
     // delivering Cmd/Super as a real modifier so cmd+s reaches the app.
@@ -1847,7 +2048,13 @@ pub fn run(root: PathBuf) -> Result<()> {
     if kbd_enhanced {
         execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags).ok();
     }
-    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture).ok();
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture,
+        DisableBracketedPaste
+    )
+    .ok();
     terminal.show_cursor().ok();
 
     result
@@ -1870,6 +2077,7 @@ fn main_loop(
             match event::read()? {
                 Event::Key(key) => app.handle_key(key)?,
                 Event::Mouse(m) => app.handle_mouse(m),
+                Event::Paste(s) => app.handle_paste(&s),
                 Event::Resize(_, _) => {}
                 _ => {}
             }
