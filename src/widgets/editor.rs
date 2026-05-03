@@ -78,6 +78,9 @@ pub struct Editor {
     pub last_inner: Rect,
     pub last_gutter_width: u16,
     pub selection: Option<EditorSelection>,
+    /// Whether the (thin vertical bar) cursor glyph is currently shown.
+    /// Owned and ticked by `App`; the editor only reads it during render.
+    pub cursor_blink_on: bool,
     undo_stack: Vec<Snapshot>,
     last_edit_kind: Option<EditKind>,
     lang: Option<LangKind>,
@@ -100,6 +103,7 @@ impl Editor {
             last_inner: Rect::default(),
             last_gutter_width: 0,
             selection: None,
+            cursor_blink_on: true,
             undo_stack: Vec::new(),
             last_edit_kind: None,
             lang: None,
@@ -1303,6 +1307,58 @@ mod tests {
     }
 
     #[test]
+    fn render_uses_thin_bar_glyph_at_cursor_when_blink_on() {
+        use ratatui::buffer::Buffer;
+        let mut e = editor_with("hello");
+        e.cursor_col = 2;
+        e.focused = true;
+        e.cursor_blink_on = true;
+
+        let area = Rect { x: 0, y: 0, width: 30, height: 5 };
+        let mut buf = Buffer::empty(area);
+        (&mut e).render(area, &mut buf);
+
+        let text_x = e.last_inner.x + e.last_gutter_width + 1;
+        let cell = &buf[(text_x + 2, e.last_inner.y)];
+        assert_eq!(cell.symbol(), "▏", "cursor cell should render the thin vertical bar");
+    }
+
+    #[test]
+    fn render_omits_cursor_glyph_when_blink_off() {
+        use ratatui::buffer::Buffer;
+        let mut e = editor_with("hello");
+        e.cursor_col = 2;
+        e.focused = true;
+        e.cursor_blink_on = false;
+
+        let area = Rect { x: 0, y: 0, width: 30, height: 5 };
+        let mut buf = Buffer::empty(area);
+        (&mut e).render(area, &mut buf);
+
+        let text_x = e.last_inner.x + e.last_gutter_width + 1;
+        let cell = &buf[(text_x + 2, e.last_inner.y)];
+        // The original character 'l' is at char index 2 of "hello".
+        assert_eq!(cell.symbol(), "l", "blink-off should leave the original glyph visible");
+    }
+
+    #[test]
+    fn render_does_not_draw_cursor_when_unfocused() {
+        use ratatui::buffer::Buffer;
+        let mut e = editor_with("hello");
+        e.cursor_col = 2;
+        e.focused = false;
+        e.cursor_blink_on = true;
+
+        let area = Rect { x: 0, y: 0, width: 30, height: 5 };
+        let mut buf = Buffer::empty(area);
+        (&mut e).render(area, &mut buf);
+
+        let text_x = e.last_inner.x + e.last_gutter_width + 1;
+        let cell = &buf[(text_x + 2, e.last_inner.y)];
+        assert_eq!(cell.symbol(), "l", "unfocused editor should not paint a cursor");
+    }
+
+    #[test]
     fn undo_restores_previous_buffer_and_cursor() {
         let mut e = editor_with("abc");
         e.cursor_col = 3;
@@ -1562,14 +1618,16 @@ impl Widget for &mut Editor {
                 }
             }
 
-            if self.focused && line_idx == self.cursor_row {
+            if self.focused && self.cursor_blink_on && line_idx == self.cursor_row {
                 let col = (self.cursor_col as u16).min(text_width.saturating_sub(1));
                 let cx = text_x + col;
                 if cx < inner.x + inner.width {
                     let cell = &mut buf[(cx, y)];
-                    cell.set_style(
-                        cell.style().add_modifier(Modifier::REVERSED),
-                    );
+                    // VS Code style thin caret: U+258F (LEFT ONE EIGHTH BLOCK)
+                    // renders as a slim vertical line on the cell's left edge,
+                    // hugging the start of the character it sits on.
+                    cell.set_symbol("\u{258f}");
+                    cell.fg = Color::Rgb(0xff, 0xff, 0xff);
                 }
             }
         }
