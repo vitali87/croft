@@ -146,16 +146,19 @@ Keystrokes from `crossterm`'s `Event::Key` are translated back to the byte seque
 ```
 src/
 ├── main.rs              entry point
-├── cli.rs               clap CLI: open path, setup-terminal subcommand
-├── app.rs               event loop, three-pane layout, key dispatch, status bar
+├── cli.rs               clap CLI: open path, setup-terminal / setup-iterm2 / keys subcommands
+├── app.rs               event loop, three-pane layout + activity bar, key dispatch, status bar, mouse + clipboard
+├── git.rs               branch / dirty / ahead-behind status by shelling out to git
+├── highlight.rs         tree-sitter highlight registry per language
 ├── icons.rs             Codicon / Devicon / Seti glyphs and per-language colors
+├── iterm2.rs            iTerm2 plist mutation helpers for setup-iterm2
 └── widgets/
     ├── mod.rs
-    ├── file_tree.rs     ignore::WalkBuilder backed tree, lazy children
-    ├── editor.rs        syntect-highlighted read-only viewport (write path coming)
-    └── terminal.rs      portable-pty + vt100 + ratatui integration
-src/highlight.rs        tree-sitter highlight registry per language
-tests/cli.rs            integration tests for the CLI surface
+    ├── file_tree.rs     ignore::WalkBuilder backed tree, lazy children, fs-watcher refresh
+    ├── editor.rs        tree-sitter highlighted editor with full write path, mouse-drag selection, OSC 52 copy/cut
+    ├── search.rs        sidebar search panel + .gitignore-aware substring walker
+    └── terminal.rs      portable-pty + vt100 + ratatui integration with selection + scrollback
+tests/cli.rs             integration tests for the CLI surface
 ```
 
 ## Status
