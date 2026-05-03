@@ -258,38 +258,60 @@ impl App {
     }
 
     /// Detect inline-image support via env vars only — no stdin queries, no
-    /// raw-mode contention. Pre-encodes the four icon escapes once so the
-    /// post-frame emit just does a single `Print` per icon. Width/height are
-    /// passed in cells: 3 cells wide (the bar minus the active-pill column)
-    /// × `ACTIVITY_ICON_HEIGHT` rows.
+    /// raw-mode contention. Queries the terminal cell pixel size via
+    /// crossterm's `window_size` (TIOCGWINSZ ioctl, no stdin involvement),
+    /// then composes each icon PNG at the *exact* viewport pixel size
+    /// (4 cells × 2 rows in the user's font). With the canvas matching the
+    /// viewport pixel-for-pixel, iTerm2 displays the image with zero
+    /// leftover bg sliver and zero stretching — the codicon stays visually
+    /// square because it lives inside a `min(w, h)` sub-square of the
+    /// canvas, with bar-bg padding filling the longer axis.
     pub fn init_graphics(&mut self) {
         if !crate::iterm2_inline::detect_iterm2_inline_support() {
             return;
         }
+        let Ok(ws) = crossterm::terminal::window_size() else {
+            return;
+        };
+        if ws.columns == 0 || ws.rows == 0 || ws.width == 0 || ws.height == 0 {
+            return;
+        }
+        let cell_w = (ws.width / ws.columns).max(1) as u32;
+        let cell_h = (ws.height / ws.rows).max(1) as u32;
+        let canvas_w = cell_w * ACTIVITY_BAR_WIDTH as u32;
+        let canvas_h = cell_h * ACTIVITY_ICON_HEIGHT as u32;
         let is_tmux = crate::iterm2_inline::detect_tmux();
-        // Full bar width; the active-pill is baked into the PNGs so we don't
-        // reserve a separate column for it.
         let w_cells = ACTIVITY_BAR_WIDTH;
         let h_cells = ACTIVITY_ICON_HEIGHT;
-        let encode = |png: &[u8]| -> String {
-            // preserveAspectRatio=1 — codicons stay square. The PNG aspect
-            // (80×96, ≈1:1.2) is pre-baked to match a 4-cell × 2-row iTerm2
-            // viewport for the MesloLGS NF cell aspect, so the image fits
-            // edge-to-edge with no black sliver and no stretching.
+        let encode = |src: &[u8], is_active: bool| -> Option<String> {
+            let baked =
+                crate::iterm2_inline::compose_icon(src, canvas_w, canvas_h, is_active).ok()?;
+            // preserveAspectRatio=0: stretch to exactly fill 4×2 cells.
+            // Since the PNG was composed at exactly that pixel size,
+            // there's no actual scaling and the codicon's square area
+            // remains a true square on screen.
             let raw =
-                crate::iterm2_inline::build_inline_image_osc(png, w_cells, h_cells, true);
-            if is_tmux {
+                crate::iterm2_inline::build_inline_image_osc(&baked, w_cells, h_cells, false);
+            Some(if is_tmux {
                 crate::iterm2_inline::tmux_passthrough_wrap(&raw)
             } else {
                 raw
-            }
+            })
         };
-        self.activity_images = Some(ActivityBarImages {
-            explorer_active: encode(crate::iterm2_inline::EXPLORER_ACTIVE_PNG),
-            explorer_inactive: encode(crate::iterm2_inline::EXPLORER_INACTIVE_PNG),
-            search_active: encode(crate::iterm2_inline::SEARCH_ACTIVE_PNG),
-            search_inactive: encode(crate::iterm2_inline::SEARCH_INACTIVE_PNG),
-        });
+        let explorer_active = encode(crate::iterm2_inline::EXPLORER_SRC_PNG, true);
+        let explorer_inactive = encode(crate::iterm2_inline::EXPLORER_SRC_PNG, false);
+        let search_active = encode(crate::iterm2_inline::SEARCH_SRC_PNG, true);
+        let search_inactive = encode(crate::iterm2_inline::SEARCH_SRC_PNG, false);
+        if let (Some(ea), Some(ei), Some(sa), Some(si)) =
+            (explorer_active, explorer_inactive, search_active, search_inactive)
+        {
+            self.activity_images = Some(ActivityBarImages {
+                explorer_active: ea,
+                explorer_inactive: ei,
+                search_active: sa,
+                search_inactive: si,
+            });
+        }
     }
 
     /// Returns the post-frame OSC-1337 escapes to write under the activity

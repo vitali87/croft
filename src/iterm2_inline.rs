@@ -1,13 +1,69 @@
 use base64::Engine;
+use image::{ImageBuffer, Rgba, RgbaImage};
 
-pub const EXPLORER_ACTIVE_PNG: &[u8] =
-    include_bytes!("../assets/icons/explorer_active.png");
-pub const EXPLORER_INACTIVE_PNG: &[u8] =
-    include_bytes!("../assets/icons/explorer_inactive.png");
-pub const SEARCH_ACTIVE_PNG: &[u8] =
-    include_bytes!("../assets/icons/search_active.png");
-pub const SEARCH_INACTIVE_PNG: &[u8] =
-    include_bytes!("../assets/icons/search_inactive.png");
+pub const EXPLORER_SRC_PNG: &[u8] =
+    include_bytes!("../assets/icons/explorer_src.png");
+pub const SEARCH_SRC_PNG: &[u8] =
+    include_bytes!("../assets/icons/search_src.png");
+
+const BAR_BG: Rgba<u8> = Rgba([0x14, 0x1a, 0x2a, 0xff]);
+const ACTIVE_PILL: Rgba<u8> = Rgba([0x4e, 0x9a, 0xff, 0xff]);
+const ACTIVE_TINT: Rgba<u8> = Rgba([0xff, 0xff, 0xff, 0xff]);
+const INACTIVE_TINT: Rgba<u8> = Rgba([0x9d, 0xa5, 0xb4, 0xff]);
+
+/// Compose a runtime-sized icon canvas matching the iTerm2 cell viewport
+/// exactly: width × height in physical pixels, bar-bg fill, codicon scaled
+/// to a square area centred inside the canvas, optional active blue pill on
+/// the left edge. The codicon stays visually square because we sit it in a
+/// `min(w,h)` square sub-area; the canvas extra space along the longer
+/// axis is filled with bar bg, so the rendered cell area shows zero
+/// terminal-default-bg leftover.
+pub fn compose_icon(
+    src_codicon_png: &[u8],
+    canvas_w: u32,
+    canvas_h: u32,
+    is_active: bool,
+) -> Result<Vec<u8>, image::ImageError> {
+    let codicon = image::load_from_memory_with_format(
+        src_codicon_png,
+        image::ImageFormat::Png,
+    )?
+    .to_rgba8();
+    let icon_size = canvas_w.min(canvas_h).saturating_sub(4).max(8);
+    let scaled =
+        image::imageops::resize(&codicon, icon_size, icon_size, image::imageops::FilterType::Lanczos3);
+    let tint = if is_active { ACTIVE_TINT } else { INACTIVE_TINT };
+    let tinted = tint_rgba(&scaled, tint);
+    let mut canvas: RgbaImage =
+        ImageBuffer::from_pixel(canvas_w, canvas_h, BAR_BG);
+    let off_x = ((canvas_w - icon_size) / 2) as i64;
+    let off_y = ((canvas_h - icon_size) / 2) as i64;
+    image::imageops::overlay(&mut canvas, &tinted, off_x, off_y);
+    if is_active {
+        let pill_w: u32 = if canvas_w >= 8 { 2 } else { 1 };
+        let pad: u32 = (canvas_h / 6).max(1);
+        for y in pad..canvas_h.saturating_sub(pad) {
+            for x in 0..pill_w {
+                canvas.put_pixel(x, y, ACTIVE_PILL);
+            }
+        }
+    }
+    let mut out = Vec::with_capacity(2048);
+    image::DynamicImage::ImageRgba8(canvas).write_to(
+        &mut std::io::Cursor::new(&mut out),
+        image::ImageFormat::Png,
+    )?;
+    Ok(out)
+}
+
+fn tint_rgba(src: &RgbaImage, tint: Rgba<u8>) -> RgbaImage {
+    let mut out = src.clone();
+    for px in out.pixels_mut() {
+        let a = px.0[3];
+        px.0 = [tint.0[0], tint.0[1], tint.0[2], a];
+    }
+    out
+}
 
 pub fn is_iterm2_term_program(value: Option<&str>) -> bool {
     matches!(value, Some("iTerm.app") | Some("WezTerm") | Some("ghostty"))
