@@ -131,8 +131,14 @@ iTerm2 → Settings → **Profiles** → Default → **Keys** tab → **Key Mapp
 | `⌘S` | `0x13` | Save |
 | `⌘Q` | `0x11` | Quit |
 | `⌘B` | `0x02` | Toggle file tree |
+| `⌘C` | `0x03` | Copy current selection (editor or terminal) to the system clipboard via OSC 52 |
+| `⌘X` | `0x18` | Cut the editor selection |
+| `⌘Z` | `0x1a` | Undo the last editor edit |
+| `⌘A` | `0x01` | Select all in the focused pane (editor: select whole buffer). Without this map iTerm2 runs **Edit → Select All** on the whole iTerm2 window instead. |
 
-Other terminals (kitty, Ghostty, WezTerm, Alacritty) deliver Cmd over the kitty protocol natively; croft already negotiates it on startup, so `Cmd+S` works there with no remap.
+Leave `⌘V` alone — iTerm2's default **Edit → Paste** already injects the clipboard as a bracketed-paste sequence, which croft handles natively.
+
+Other terminals (kitty, Ghostty, WezTerm, Alacritty) deliver Cmd over the kitty protocol natively; croft already negotiates it on startup, so `Cmd+S` and friends work there with no remap.
 
 ## How the embedded terminal works
 
