@@ -1,4 +1,7 @@
-Why it d
+<p align="center">
+  <img src="assets/logo.png" alt="croft" width="220">
+</p>
+
 # croft
 
 A VS Code style three pane workspace that runs entirely inside your terminal. Written in Rust for performance and ships as a single static binary.
