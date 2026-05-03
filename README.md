@@ -80,7 +80,8 @@ croft setup-terminal --help
 | Mouse drag in terminal pane | Select text; on release, the selection is copied to the system clipboard via OSC 52 |
 | Mouse wheel in terminal pane | Scroll through 5000 rows of scrollback. While vim / less / htop is in alternate-screen mode, wheel forwards arrow keys instead so the running app handles it. Any keystroke snaps back to the live bottom. |
 | `Ctrl+Shift+c` (or `Cmd+c` with kitty-protocol terminals) | Explicit copy of the terminal's current selection |
-| Editor: arrows, PageUp/PageDown, Home, End | Navigate |
+| Editor: arrows, Home, End | Navigate |
+| Editor: PageUp / PageDown (`fn+↑` / `fn+↓` on Mac) | Scroll exactly one viewport; the line just past the previous bottom becomes the new top |
 | Editor: any printable char, Enter, Backspace, Delete, Tab | Edit |
 | Mouse click in any pane | Focus and (in tree) select / open, (in editor) move cursor |
 | Mouse right-click in tree | Open context menu (New File…, New Folder…, Delete) |

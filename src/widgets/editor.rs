@@ -261,13 +261,38 @@ impl Editor {
         }
     }
 
-    pub fn page_up(&mut self, page: usize) {
-        self.cursor_row = self.cursor_row.saturating_sub(page);
+    /// One screen worth of rows, derived from the editor's last rendered
+    /// inner height.  Falls back to a sensible default before the first
+    /// render (when `last_inner.height` is still 0).
+    pub fn page_size(&self) -> usize {
+        let from_inner = self.last_inner.height as usize;
+        if from_inner > 0 {
+            from_inner
+        } else {
+            20
+        }
+    }
+
+    /// Move the viewport down by exactly one screen so the first
+    /// previously-unseen row becomes the new top of the viewport, and place
+    /// the cursor on that new top row.  Clamps at end of file.
+    pub fn page_down_one_screen(&mut self) {
+        let page = self.page_size();
+        let max_row = self.lines.len().saturating_sub(1);
+        let new_top = (self.scroll + page).min(max_row);
+        self.scroll = new_top;
+        self.cursor_row = new_top;
         self.cursor_col = self.cursor_col.min(self.line_char_len(self.cursor_row));
     }
 
-    pub fn page_down(&mut self, page: usize) {
-        self.cursor_row = (self.cursor_row + page).min(self.lines.len().saturating_sub(1));
+    /// Move the viewport up by exactly one screen so the new top is `page`
+    /// rows above the previous top.  Cursor lands on the new top row.
+    /// Clamps at the start of file.
+    pub fn page_up_one_screen(&mut self) {
+        let page = self.page_size();
+        let new_top = self.scroll.saturating_sub(page);
+        self.scroll = new_top;
+        self.cursor_row = new_top;
         self.cursor_col = self.cursor_col.min(self.line_char_len(self.cursor_row));
     }
 
@@ -520,6 +545,82 @@ mod tests {
         assert_eq!(e.lines, vec!["helloworld".to_string()]);
         assert_eq!(e.cursor_row, 0);
         assert_eq!(e.cursor_col, 5);
+    }
+
+    #[test]
+    fn page_down_advances_one_full_viewport_and_puts_first_unseen_line_at_top() {
+        // Simulate a 100-line file with the editor's viewport rendering 25
+        // lines. After PageDown the cursor should land on row 25 (line 26 in
+        // 1-indexed terms) and that row should be the new top of the view.
+        let mut e = editor_with_lines(100);
+        e.last_inner = Rect { x: 0, y: 0, width: 80, height: 25 };
+        assert_eq!(e.scroll, 0);
+        assert_eq!(e.cursor_row, 0);
+        e.page_down_one_screen();
+        assert_eq!(e.cursor_row, 25, "cursor should jump to first previously-unseen row");
+        assert_eq!(e.scroll, 25, "scroll should align with new cursor at top of viewport");
+    }
+
+    #[test]
+    fn page_down_repeats_advance_one_viewport_at_a_time() {
+        let mut e = editor_with_lines(100);
+        e.last_inner = Rect { x: 0, y: 0, width: 80, height: 20 };
+        e.page_down_one_screen();
+        e.page_down_one_screen();
+        assert_eq!(e.cursor_row, 40);
+        assert_eq!(e.scroll, 40);
+    }
+
+    #[test]
+    fn page_down_clamps_at_end_of_file() {
+        let mut e = editor_with_lines(30);
+        e.last_inner = Rect { x: 0, y: 0, width: 80, height: 25 };
+        // Realistic state: scroll = 4 means rows 4..=28 are on screen, with
+        // line 29 (cursor_row 28) visible at the bottom.
+        e.scroll = 4;
+        e.cursor_row = 28;
+        e.page_down_one_screen();
+        // 4 + 25 = 29 → last row.  Cursor and scroll land there.
+        assert_eq!(e.cursor_row, 29);
+        assert_eq!(e.scroll, 29);
+    }
+
+    #[test]
+    fn page_up_rewinds_one_full_viewport() {
+        let mut e = editor_with_lines(200);
+        e.last_inner = Rect { x: 0, y: 0, width: 80, height: 25 };
+        e.scroll = 100;
+        e.cursor_row = 100;
+        e.page_up_one_screen();
+        assert_eq!(e.cursor_row, 75);
+        assert_eq!(e.scroll, 75);
+    }
+
+    #[test]
+    fn page_up_clamps_at_top_of_file() {
+        let mut e = editor_with_lines(50);
+        e.last_inner = Rect { x: 0, y: 0, width: 80, height: 25 };
+        e.scroll = 5;
+        e.cursor_row = 5;
+        e.page_up_one_screen();
+        assert_eq!(e.cursor_row, 0);
+        assert_eq!(e.scroll, 0);
+    }
+
+    #[test]
+    fn page_size_falls_back_when_viewport_is_unknown() {
+        // Before the first render last_inner is zero-sized; PageDown should
+        // still advance by some sensible default rather than no-op.
+        let mut e = editor_with_lines(100);
+        e.last_inner = Rect::default();
+        e.page_down_one_screen();
+        assert!(e.cursor_row > 0, "should advance even with zero last_inner");
+    }
+
+    fn editor_with_lines(n: usize) -> Editor {
+        let mut e = Editor::new();
+        e.lines = (0..n).map(|i| format!("line {i}")).collect();
+        e
     }
 
     #[test]

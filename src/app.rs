@@ -512,7 +512,7 @@ impl App {
         }
     }
 
-    fn handle_key(&mut self, key: KeyEvent, page: usize) -> Result<()> {
+    fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
         if key.kind != KeyEventKind::Press && key.kind != KeyEventKind::Repeat {
             return Ok(());
         }
@@ -553,7 +553,7 @@ impl App {
 
         match self.focus {
             Pane::Tree => self.handle_tree_key(key),
-            Pane::Editor => self.handle_editor_key(key, page),
+            Pane::Editor => self.handle_editor_key(key),
             Pane::Terminal => self.handle_terminal_key(key),
         }
         Ok(())
@@ -601,14 +601,14 @@ impl App {
         }
     }
 
-    fn handle_editor_key(&mut self, key: KeyEvent, page: usize) {
+    fn handle_editor_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Up => self.editor.move_up(),
             KeyCode::Down => self.editor.move_down(),
             KeyCode::Left => self.editor.move_left(),
             KeyCode::Right => self.editor.move_right(),
-            KeyCode::PageUp => self.editor.page_up(page),
-            KeyCode::PageDown => self.editor.page_down(page),
+            KeyCode::PageUp => self.editor.page_up_one_screen(),
+            KeyCode::PageDown => self.editor.page_down_one_screen(),
             KeyCode::Home => self.editor.home_line(),
             KeyCode::End => self.editor.end_line(),
             KeyCode::Backspace => self.editor.backspace(),
@@ -1584,17 +1584,13 @@ fn main_loop(
         // disk reality on the very next frame.
         app.drain_fs_events();
 
-        let mut frame_size = Rect::default();
         terminal.draw(|f| {
-            frame_size = f.area();
             app.render(f);
         })?;
-        // Page size for editor PageUp/PageDown is approx half the editor pane height.
-        let page = (frame_size.height as usize / 4).max(1);
 
         if event::poll(Duration::from_millis(33))? {
             match event::read()? {
-                Event::Key(key) => app.handle_key(key, page)?,
+                Event::Key(key) => app.handle_key(key)?,
                 Event::Mouse(m) => app.handle_mouse(m),
                 Event::Resize(_, _) => {}
                 _ => {}
