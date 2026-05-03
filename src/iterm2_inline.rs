@@ -37,7 +37,12 @@ pub fn compose_icon(
     let mut canvas: RgbaImage =
         ImageBuffer::from_pixel(canvas_w, canvas_h, BAR_BG);
     let off_x = ((canvas_w - icon_size) / 2) as i64;
-    let off_y = ((canvas_h - icon_size) / 2) as i64;
+    // Anchor the codicon to the top of the canvas (with a tiny pixel of
+    // padding so it doesn't touch the very edge). The activity-bar icon
+    // block starts at the top of the project-root row in the side panel,
+    // so anchoring top-of-icon to top-of-canvas makes the codicon's top
+    // edge coincide with that row's top edge.
+    let off_y: i64 = 1;
     image::imageops::overlay(&mut canvas, &tinted, off_x, off_y);
     if is_active {
         let pill_w: u32 = if canvas_w >= 8 { 2 } else { 1 };
