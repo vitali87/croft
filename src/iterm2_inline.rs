@@ -29,7 +29,7 @@ pub fn compose_icon(
         image::ImageFormat::Png,
     )?
     .to_rgba8();
-    let icon_size = canvas_w.min(canvas_h).saturating_sub(4).max(8);
+    let icon_size = (canvas_w.min(canvas_h).saturating_sub(4) * 9 / 10).max(8);
     let scaled =
         image::imageops::resize(&codicon, icon_size, icon_size, image::imageops::FilterType::Lanczos3);
     let tint = if is_active { ACTIVE_TINT } else { INACTIVE_TINT };
