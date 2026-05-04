@@ -37,7 +37,7 @@ pub enum CliCommand {
     /// Diagnostic: print every key event the terminal delivers, with modifiers.
     /// Useful for confirming whether cmd / super reaches the app.  Press Ctrl+C to quit.
     Keys,
-    /// Set iTerm2's default profile font (and Symbols Nerd Font Mono fallback) so file icons render.
+    /// Configure iTerm2 for Croft: fonts plus Cmd+Shift+F and Search paste.
     SetupIterm2 {
         /// PostScript name of the primary font
         #[arg(long, default_value = ITERM2_FONT_PS_NAME)]
@@ -292,14 +292,43 @@ fn keys_diagnostic() -> Result<()> {
                             print!("\r\nQuitting (Ctrl+C).\r\n");
                             break;
                         }
+                        let clipboard_probe = if is_paste_probe_key(k.code, k.modifiers) {
+                            match crate::clipboard::read_string() {
+                                Some(s) if s.is_empty() => {
+                                    String::from("  clipboard=empty")
+                                }
+                                Some(s) => format!(
+                                    "  clipboard=ok chars={} bytes={}",
+                                    s.chars().count(),
+                                    s.len()
+                                ),
+                                None => String::from("  clipboard=read_failed"),
+                            }
+                        } else {
+                            String::new()
+                        };
                         print!(
-                            "\r  code={:?}  modifiers=[{}]  kitty={}\r\n",
-                            k.code, mods_s, kbd_enhanced
+                            "\r  key={:?}  code={:?}  modifiers=[{}]  kitty={}{}\r\n",
+                            k, k.code, mods_s, kbd_enhanced, clipboard_probe
                         );
                         use std::io::Write;
                         std::io::stdout().flush().ok();
                     }
-                    _ => {}
+                    Event::Paste(s) => {
+                        print!(
+                            "\r  paste_event chars={} bytes={} kitty={}\r\n",
+                            s.chars().count(),
+                            s.len(),
+                            kbd_enhanced
+                        );
+                        use std::io::Write;
+                        std::io::stdout().flush().ok();
+                    }
+                    other => {
+                        print!("\r  event={other:?} kitty={kbd_enhanced}\r\n");
+                        use std::io::Write;
+                        std::io::stdout().flush().ok();
+                    }
                 }
             }
         }
@@ -313,13 +342,26 @@ fn keys_diagnostic() -> Result<()> {
     result
 }
 
+fn is_paste_probe_key(
+    code: crossterm::event::KeyCode,
+    modifiers: crossterm::event::KeyModifiers,
+) -> bool {
+    let crossterm::event::KeyCode::Char(c) = code else {
+        return false;
+    };
+    c == '\u{16}'
+        || (c.eq_ignore_ascii_case(&'v')
+            && (modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
+                || modifiers.contains(crossterm::event::KeyModifiers::SUPER)))
+}
+
 fn setup_iterm2(font: &str, nonascii: &str, size: u32, yes: bool) -> Result<()> {
     let plist_path = crate::iterm2::default_plist_path();
     println!(
-        "This will set iTerm2's default profile to:\n  Normal Font: {font} {size}\n  Non-ASCII Font: {nonascii} {size}\n  Use Non-ASCII Font: enabled"
+        "This will configure iTerm2 for Croft:\n  Normal Font: {font} {size}\n  Non-ASCII Font: {nonascii} {size}\n  Use Non-ASCII Font: enabled\n  Global key: Cmd+Shift+F -> Croft Search\n  Global/profile key: Cmd+V -> CSI-u Cmd+V, handled by Croft Search\n  App menu shortcuts: move Find Globally and Paste off Cmd+Shift+F/Cmd+V"
     );
     println!("Plist target: {}", plist_path.display());
-    println!("Existing custom profiles are not modified.");
+    println!("Existing custom profile fonts are not modified; global key mappings are updated.");
     if !yes {
         print!("Apply this change? [y/N] ");
         use std::io::Write;
@@ -331,9 +373,9 @@ fn setup_iterm2(font: &str, nonascii: &str, size: u32, yes: bool) -> Result<()> 
             return Ok(());
         }
     }
-    crate::iterm2::install_font_settings(&plist_path, font, nonascii, size)
-        .with_context(|| "applying iTerm2 font settings")?;
-    println!("Wrote font settings to {}.", plist_path.display());
+    crate::iterm2::install_croft_settings(&plist_path, font, nonascii, size)
+        .with_context(|| "applying iTerm2 Croft settings")?;
+    println!("Wrote Croft settings to {}.", plist_path.display());
     println!(
         "Quit iTerm2 entirely (cmd+Q) and reopen it. macOS caches plists; iTerm2 must be relaunched to pick up the change."
     );

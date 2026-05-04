@@ -1,5 +1,6 @@
 mod app;
 mod cli;
+mod clipboard;
 mod git;
 mod highlight;
 mod icons;

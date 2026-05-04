@@ -323,6 +323,9 @@ pub struct App {
     /// Required to bake OSC-1337 images at exact viewport pixel size so
     /// iTerm draws them with no stretching or letterboxing.
     cell_pixel: Option<(u32, u32)>,
+    /// Clipboard read entrypoint. Production uses the host clipboard; tests
+    /// can swap in a deterministic reader for Cmd+V routing assertions.
+    clipboard_reader: fn() -> Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -424,6 +427,7 @@ impl App {
             welcome_overlay_dirty: true,
             welcome_image_displayed: false,
             cell_pixel: None,
+            clipboard_reader: read_system_clipboard,
         })
     }
 
@@ -771,9 +775,7 @@ impl App {
                 break;
             }
         }
-        self.tree.focused = self.focus == Pane::Tree;
-        self.editor.focused = self.focus == Pane::Editor;
-        self.terminal.focused = self.focus == Pane::Terminal;
+        self.sync_focus_flags();
     }
 
     /// Returns true exactly once after the welcome OSC-1337 image has been
@@ -1036,9 +1038,7 @@ impl App {
         match view {
             SidebarView::Explorer => self.focus_pane(Pane::Tree),
             SidebarView::Search => {
-                self.focus_pane(Pane::Tree); // tree pane = side panel; we'll dispatch by view
-                self.search.focused = true;
-                self.tree.focused = false;
+                self.focus_pane(Pane::Tree); // tree pane = side panel; dispatch by view
             }
         }
     }
@@ -1065,12 +1065,17 @@ impl App {
 
     fn focus_pane(&mut self, p: Pane) {
         self.focus = p;
-        self.tree.focused = self.focus == Pane::Tree;
-        self.editor.focused = self.focus == Pane::Editor;
-        self.terminal.focused = self.focus == Pane::Terminal;
+        self.sync_focus_flags();
         if self.editor.focused {
             self.poke_cursor();
         }
+    }
+
+    fn sync_focus_flags(&mut self) {
+        self.tree.focused = self.focus == Pane::Tree && self.sidebar_view == SidebarView::Explorer;
+        self.search.focused = self.focus == Pane::Tree && self.sidebar_view == SidebarView::Search;
+        self.editor.focused = self.focus == Pane::Editor;
+        self.terminal.focused = self.focus == Pane::Terminal;
     }
 
     fn render(&mut self, frame: &mut ratatui::Frame) {
@@ -1347,6 +1352,13 @@ impl App {
             self.set_sidebar_view(SidebarView::Search);
             return Ok(());
         }
+        if self.sidebar_view == SidebarView::Search
+            && self.focus != Pane::Editor
+            && is_search_editing_shortcut(key)
+        {
+            self.handle_search_key(key);
+            return Ok(());
+        }
         match (key.code, key.modifiers) {
             (KeyCode::Char('q'), KeyModifiers::CONTROL) => {
                 self.quit = true;
@@ -1379,7 +1391,7 @@ impl App {
 
     fn handle_search_key(&mut self, key: KeyEvent) {
         if is_search_paste_key(key) {
-            let text = read_system_clipboard();
+            let text = (self.clipboard_reader)();
             self.paste_clipboard_into_search(text.as_deref());
             return;
         }
@@ -1536,6 +1548,11 @@ impl App {
         }
         if is_editor_cut_key(key) {
             self.cut_editor_selection();
+            return;
+        }
+        if is_editor_paste_key(key) {
+            let text = (self.clipboard_reader)();
+            self.paste_clipboard_into_editor(text.as_deref());
             return;
         }
         if is_editor_select_all_key(key) {
@@ -1699,20 +1716,43 @@ impl App {
 
     fn paste_clipboard_into_search(&mut self, text: Option<&str>) {
         let Some(s) = text else {
-            self.status = String::from("Cmd+V: clipboard read failed (pbpaste)");
+            self.status = String::from("Cmd+V: clipboard read failed");
             return;
         };
         if s.is_empty() {
             self.status = String::from("Cmd+V: clipboard is empty");
             return;
         }
+        let before = self.search.query.chars().count();
         self.search.insert_str_into_query(s);
         self.submit_search_query();
+        let after = self.search.query.chars().count();
+        let inserted = after.saturating_sub(before);
+        if inserted == 0 {
+            self.status = format!(
+                "Cmd+V: saw clipboard chars={}, inserted 0 after filtering",
+                s.chars().count()
+            );
+        } else {
+            self.status = format!("Cmd+V: inserted {inserted} chars; query len {after}");
+        }
+    }
+
+    fn paste_clipboard_into_editor(&mut self, text: Option<&str>) {
+        let Some(s) = text else {
+            self.status = String::from("Cmd+V: clipboard read failed");
+            return;
+        };
+        if s.is_empty() {
+            self.status = String::from("Cmd+V: clipboard is empty");
+            return;
+        }
+        self.editor.insert_str(s);
         self.status = format!("Pasted {} chars", s.chars().count());
     }
 
     fn handle_paste(&mut self, s: &str) {
-        if self.sidebar_view == SidebarView::Search {
+        if self.sidebar_view == SidebarView::Search && self.focus != Pane::Editor {
             self.search.insert_str_into_query(s);
             self.submit_search_query();
             self.status = format!("Pasted {} chars", s.chars().count());
@@ -1803,11 +1843,10 @@ impl App {
                     return;
                 }
                 if in_tree && self.sidebar_view == SidebarView::Search {
+                    self.focus_pane(Pane::Tree);
                     if self.search.paste_button_at(m.column, m.row) {
-                        let text = read_system_clipboard();
+                        let text = (self.clipboard_reader)();
                         self.paste_clipboard_into_search(text.as_deref());
-                        self.search.focused = true;
-                        self.tree.focused = false;
                         return;
                     }
                     if let Some(t) = self.search.toggle_at(m.column, m.row) {
@@ -1823,8 +1862,6 @@ impl App {
                             }
                         }
                         self.submit_search_query();
-                        self.search.focused = true;
-                        self.tree.focused = false;
                         return;
                     }
                     // Click on a result row: open it.
@@ -1835,12 +1872,6 @@ impl App {
                         }
                     } else {
                         // Click on the input/header area: just focus search.
-                        self.search.focused = true;
-                        self.tree.focused = false;
-                        self.focus_pane(Pane::Tree);
-                        // focus_pane sets self.tree.focused; restore search ownership.
-                        self.tree.focused = false;
-                        self.search.focused = true;
                     }
                     return;
                 }
@@ -2381,16 +2412,10 @@ fn is_save_key(key: KeyEvent) -> bool {
     key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::SUPER)
 }
 
-/// Read the macOS system clipboard via `pbpaste`. Returns `None` if the
-/// command fails or is unavailable. Used by the search input as a fallback
-/// path when iTerm2 swallows Cmd+V as its Edit→Paste menu shortcut and the
-/// bracketed-paste sequence never reaches us.
+/// Read the system clipboard. Used by the search input when Cmd+V arrives as
+/// a key event rather than bracketed paste content.
 fn read_system_clipboard() -> Option<String> {
-    let out = std::process::Command::new("pbpaste").output().ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    Some(String::from_utf8_lossy(&out.stdout).to_string())
+    crate::clipboard::read_string()
 }
 
 /// Send an OSC 52 sequence to put `text` on the host terminal's system
@@ -2424,15 +2449,33 @@ fn is_editor_cut_key(key: KeyEvent) -> bool {
     key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::SUPER)
 }
 
-/// Paste in the search input: `Ctrl+V` / `Cmd+V`. iTerm2 swallows Cmd+V as
-/// its Edit→Paste menu shortcut, so croft can't rely on bracketed paste
-/// reaching it; this lets the search field handle the keystroke directly.
+/// Paste in the search input. Normal terminal paste is handled via
+/// `Event::Paste`; `setup-iterm2` maps Cmd+V to a CSI-u Cmd+V sequence, and
+/// the raw Ctrl+V byte is accepted as a fallback for older setups.
 fn is_search_paste_key(key: KeyEvent) -> bool {
+    is_clipboard_paste_key(key)
+}
+
+fn is_editor_paste_key(key: KeyEvent) -> bool {
+    is_clipboard_paste_key(key)
+}
+
+fn is_clipboard_paste_key(key: KeyEvent) -> bool {
     let KeyCode::Char(c) = key.code else { return false };
+    if c == '\u{16}' {
+        return true;
+    }
     if !c.eq_ignore_ascii_case(&'v') {
         return false;
     }
     key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::SUPER)
+}
+
+fn is_search_editing_shortcut(key: KeyEvent) -> bool {
+    is_search_paste_key(key)
+        || is_editor_select_all_key(key)
+        || is_editor_copy_key(key)
+        || is_editor_cut_key(key)
 }
 
 /// Select-all: `Ctrl+A` / `Cmd+A`.
@@ -3220,6 +3263,115 @@ mod tests {
     }
 
     #[test]
+    fn search_view_focuses_search_input_not_terminal_or_tree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.show_terminal = true;
+        app.focus_pane(Pane::Terminal);
+        app.handle_key(key(
+            KeyCode::Char('F'),
+            KeyModifiers::SUPER | KeyModifiers::SHIFT,
+        ))
+        .unwrap();
+        assert!(app.focus == Pane::Tree);
+        assert!(app.search.focused);
+        assert!(!app.tree.focused);
+        assert!(!app.terminal.focused);
+    }
+
+    #[test]
+    fn cycling_focus_away_from_search_clears_search_focus_flag() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.set_sidebar_view(SidebarView::Search);
+        app.cycle_focus();
+        assert!(!app.search.focused);
+    }
+
+    #[test]
+    fn search_visible_routes_editing_shortcuts_to_search_even_if_terminal_focused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.set_sidebar_view(SidebarView::Search);
+        app.show_terminal = true;
+        app.focus_pane(Pane::Terminal);
+        app.search.query = String::from("alpha");
+        app.handle_key(key(KeyCode::Char('a'), KeyModifiers::SUPER))
+            .unwrap();
+        assert_eq!(app.search.selection_range(), Some((0, 5)));
+    }
+
+    #[test]
+    fn search_visible_routes_cmd_v_to_search_if_terminal_focused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.clipboard_reader = || Some(String::from("needle"));
+        app.set_sidebar_view(SidebarView::Search);
+        app.show_terminal = true;
+        app.focus_pane(Pane::Terminal);
+
+        app.handle_key(key(KeyCode::Char('v'), KeyModifiers::SUPER))
+            .unwrap();
+
+        assert_eq!(app.search.query, "needle");
+    }
+
+    #[test]
+    fn search_visible_does_not_steal_cmd_x_from_focused_editor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.set_sidebar_view(SidebarView::Search);
+        app.focus_pane(Pane::Editor);
+        app.search.query = String::from("needle");
+        app.editor.lines = vec![String::from("alpha")];
+        app.editor.cursor_row = 0;
+        app.editor.cursor_col = 5;
+        app.editor.select_all();
+
+        app.handle_key(key(KeyCode::Char('x'), KeyModifiers::SUPER))
+            .unwrap();
+
+        assert_eq!(app.editor.lines, [String::new()]);
+        assert_eq!(app.search.query, "needle");
+    }
+
+    #[test]
+    fn search_visible_does_not_steal_bracketed_paste_from_focused_editor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.set_sidebar_view(SidebarView::Search);
+        app.focus_pane(Pane::Editor);
+        app.search.query = String::from("needle");
+        app.editor.lines = vec![String::from("alpha")];
+        app.editor.cursor_row = 0;
+        app.editor.cursor_col = 5;
+
+        app.handle_paste(" beta");
+
+        assert_eq!(app.editor.lines, [String::from("alpha beta")]);
+        assert_eq!(app.search.query, "needle");
+    }
+
+    #[test]
+    fn cmd_v_pastes_clipboard_into_focused_editor_even_when_search_sidebar_visible() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.clipboard_reader = || Some(String::from(" beta"));
+        app.set_sidebar_view(SidebarView::Search);
+        app.focus_pane(Pane::Editor);
+        app.search.query = String::from("needle");
+        app.editor.lines = vec![String::from("alpha")];
+        app.editor.cursor_row = 0;
+        app.editor.cursor_col = 5;
+
+        app.handle_key(key(KeyCode::Char('v'), KeyModifiers::SUPER))
+            .unwrap();
+
+        assert_eq!(app.editor.lines, [String::from("alpha beta")]);
+        assert_eq!(app.search.query, "needle");
+    }
+
+    #[test]
     fn cmd_a_in_search_selects_entire_query() {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(tmp.path().to_path_buf()).unwrap();
@@ -3324,8 +3476,18 @@ mod tests {
     fn cmd_v_is_recognised_as_search_paste_key() {
         assert!(is_search_paste_key(key(KeyCode::Char('v'), KeyModifiers::SUPER)));
         assert!(is_search_paste_key(key(KeyCode::Char('v'), KeyModifiers::CONTROL)));
+        assert!(is_search_paste_key(key(KeyCode::Char('\u{16}'), KeyModifiers::NONE)));
         assert!(!is_search_paste_key(key(KeyCode::Char('v'), KeyModifiers::NONE)));
         assert!(!is_search_paste_key(key(KeyCode::Char('a'), KeyModifiers::SUPER)));
+    }
+
+    #[test]
+    fn cmd_v_is_recognised_as_editor_paste_key() {
+        assert!(is_editor_paste_key(key(KeyCode::Char('v'), KeyModifiers::SUPER)));
+        assert!(is_editor_paste_key(key(KeyCode::Char('v'), KeyModifiers::CONTROL)));
+        assert!(is_editor_paste_key(key(KeyCode::Char('\u{16}'), KeyModifiers::NONE)));
+        assert!(!is_editor_paste_key(key(KeyCode::Char('v'), KeyModifiers::NONE)));
+        assert!(!is_editor_paste_key(key(KeyCode::Char('a'), KeyModifiers::SUPER)));
     }
 
     #[test]
@@ -3349,7 +3511,7 @@ mod tests {
         app.handle_mouse(m);
         assert_ne!(
             app.status, original_status,
-            "click on Paste button must invoke the clipboard paste path (status updates whether pbpaste succeeds, fails, or returns empty)"
+            "click on Paste button must invoke the clipboard paste path (status updates whether clipboard read succeeds, fails, or returns empty)"
         );
     }
 

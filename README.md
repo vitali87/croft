@@ -95,7 +95,7 @@ croft setup-terminal --help
 | Editor: mouse drag | Select text; selection stays highlighted until you copy or click elsewhere — no auto-copy |
 | Editor: `Ctrl+C` / `Cmd+C` | Copy the current selection to the system clipboard via OSC 52 |
 | Editor: `Ctrl+X` / `Cmd+X` | Cut the current selection |
-| Editor: `Ctrl+V` / `Cmd+V` (host-terminal paste) | Paste system-clipboard contents at the cursor; replaces selection if any |
+| Editor: `Ctrl+V` / `Cmd+V` | Paste system-clipboard contents at the cursor; replaces selection if any |
 | Editor: `Ctrl+Z` / `Cmd+Z` | Undo the last edit (typing bursts coalesce into one step; backspace, paste, cut, replace are each their own step) |
 | Editor: `Ctrl+A` / `Cmd+A` | Select the entire buffer |
 | Editor: `Esc` | Clear the current selection |
@@ -109,7 +109,20 @@ croft setup-terminal --help
 
 ## iTerm2 setup for macOS users
 
-Two iTerm2 toggles make croft feel native on macOS. Both are opt-in because they affect every terminal session, not just croft.
+Run Croft's iTerm2 setup once after building:
+
+```bash
+./target/release/croft setup-iterm2
+```
+
+This writes the default-profile font settings plus Croft's iTerm2 keyboard setup:
+
+| iTerm2 keystroke | Installed mapping | What croft does |
+|------------------|-------------------|-----------------|
+| `⌘⇧F` | `\x1b[70;10u` | Jump to the Search sidebar |
+| `⌘V` | `\x1b[118;9u` in global and profile key maps | Read the system clipboard and paste into the focused editor, or into Search when Search is active |
+
+It moves iTerm2's **Edit → Find → Find Globally...** and **Edit → Paste** menu shortcuts out of the way so macOS does not consume `⌘⇧F` or `⌘V` before iTerm2's key maps can deliver them to croft. Fully quit iTerm2 with `⌘Q` and reopen it after setup; iTerm2 caches its plist while running.
 
 ### 1. Right-click reaches croft
 
@@ -137,47 +150,23 @@ iTerm2 → Settings → **Profiles** → Default → **Keys** tab → **Key Mapp
 | `⌘Z` | `0x1a` | Undo the last editor edit |
 | `⌘A` | `0x01` | Select all in the focused pane (editor: select whole buffer). Without this map iTerm2 runs **Edit → Select All** on the whole iTerm2 window instead. |
 
-For `⌘V` to paste into the croft Search input, see section 4 below — iTerm2's **Edit → Paste** menu eats the keystroke at the macOS app-menu level before any bracketed-paste sequence is generated, so the same App Shortcuts + Send Hex Codes workaround applies.
+For `⌘⇧F` and `⌘V`, use `croft setup-iterm2`; it installs both mappings globally and into every profile.
 
 ### 3. Cmd+Shift+F to jump to the Search sidebar
 
-`Cmd+Shift+F` in iTerm2 collides twice with croft. First, iTerm2's **Edit → Find → Find Globally…** menu item owns `⌘⇧F` at the macOS application-menu level, so the chord never reaches the terminal session. Second, even after freeing the menu shortcut, iTerm2 doesn't deliver `⌘⇧letter` over the kitty protocol the way other terminals do — the same constraint that forces the `⌘S → Ctrl+S` workaround above.
+After `setup-iterm2` and an iTerm2 relaunch, `⌘⇧F` jumps to the Search panel from anywhere in croft. The installed global mapping emits `\x1b[70;10u`, the kitty-protocol encoding for `Shift+Cmd+F`; crossterm decodes that as `KeyEvent { code: Char('F'), modifiers: SHIFT | SUPER }`, which croft handles as Search.
 
-To make `⌘⇧F` jump croft to the Search view:
+### 4. ⌘V paste
 
-1. **Free the menu shortcut.** System Settings → Keyboard → Keyboard Shortcuts → **App Shortcuts** → click `+` → Application: **iTerm**, Menu Title: `Find Globally...` (with the three dots), Keyboard Shortcut: any chord you don't use (e.g. `⌃⌥⇧⌘F`). Quit and reopen iTerm2.
-2. **Bind `⌘⇧F` to emit the kitty CSI u sequence croft recognises.** iTerm2 → Settings → **Profiles** → Default → **Keys** → **Key Mappings** → click `+` → Click to Set: press `⌘⇧F` → Action: **Send Hex Code** → Codes:
-   ```
-   0x1b 0x5b 0x37 0x30 0x3b 0x31 0x30 0x75
-   ```
-   That's `\x1b[70;10u` — kitty-protocol-encoded `Shift+Cmd+F` (codepoint 70 for `F`, modifier mask 10 = base 1 + Shift 1 + Super 8). Crossterm decodes it as `KeyEvent { code: Char('F'), modifiers: SHIFT | SUPER }`, which croft's existing `is_search_jump_key` already matches.
+After `setup-iterm2` and an iTerm2 relaunch, the working flow is:
 
-After both steps `⌘⇧F` jumps to the Search panel from anywhere in croft.
+1. Press `⌘⇧F`; Search becomes active.
+2. Press `⌘V`; iTerm2 sends `\x1b[118;9u`, the kitty/CSI-u encoding for `Cmd+V`.
+3. Croft handles that as Search paste, reads the macOS clipboard via native `NSPasteboard`, and inserts it into the Search query.
 
-### 4. ⌘V to paste into the Search input
-
-iTerm2 owns ⌘V at the macOS app-menu level via **Edit → Paste**. macOS routes ⌘V to that menu *before* iTerm's per-profile Key Mappings can intercept it. That is why you see iTerm's Edit menu flicker on ⌘V — the keystroke is being consumed by the menu, not by iTerm's keymap, and never reaches croft. The iTerm Send Hex Code binding alone is not enough; you must also free the macOS menu shortcut first.
-
-The full recipe is four steps. Skipping any one of them leaves you with a flickering Edit menu and no paste.
-
-**Step 1 — free the macOS app-menu shortcut.** System Settings → Keyboard → Keyboard Shortcuts → **App Shortcuts** → click `+`.
-- *Application:* whichever iTerm2 binary you actually launch. If the app in `/Applications` is named `iTerm.app`, pick **iTerm**; if it's `iTerm2.app`, pick **iTerm2**. The bundle has to match exactly.
-- *Menu Title:* `Paste` — exactly five characters, no leading space, no trailing ellipsis, case-sensitive. The easiest way to get this right is to open iTerm's Edit menu, copy the literal label, and paste it into this field.
-- *Keyboard Shortcut:* any chord you do not otherwise use (e.g. `⌃⌥⌘V`).
-
-Click **Add**.
-
-**Step 2 — fully quit and reopen iTerm.** Press `⌘Q` inside iTerm. Closing the window is not enough; the App Shortcut rename only attaches to a fresh launch. Wait a couple of seconds, then relaunch iTerm.
-
-**Step 3 — verify the rename took effect.** Open the iTerm **Edit** menu. Find the **Paste** row. The keyboard shortcut shown next to it must be the chord you chose in Step 1, *not* `⌘V`. If it still says `⌘V`, the rename did not apply — most often the *Menu Title* string did not match exactly, or you renamed for the wrong app bundle, or iTerm was not fully quit. Fix and repeat until the Edit menu confirms the new chord. **Do not skip this verification — without it, Step 4 silently does nothing and ⌘V keeps going to the menu.**
-
-**Step 4 — bind ⌘V in iTerm to send the `Ctrl+V` byte.** iTerm2 → Settings → **Profiles** → Default → **Keys** tab → **Key Mappings** sub-tab → click `+` → "Click to Set" → press `⌘V` → Action: **Send Hex Code** → Code: `0x16` → OK.
-
-After all four steps, ⌘V reaches croft as `KeyEvent { code: Char('v'), modifiers: CONTROL }`. croft's `is_search_paste_key` matches it; the Search input reads the macOS clipboard via `pbpaste` and inserts the contents. The status bar updates to either `Pasted N chars` on success or `Cmd+V: clipboard read failed / empty` if `pbpaste` returned nothing.
+When the editor is focused, that same `⌘V` path pastes into the editor, even if the Search sidebar is still visible. If another terminal sends a normal bracketed paste event instead of the CSI-u key event, croft routes it by focus the same way.
 
 **Zero-setup alternative: ⌃⇧V.** If you don't want to touch System Settings, press `⌃⇧V` (Control+Shift+V) inside the Search input. iTerm encodes that as the `0x16` byte natively, with no menu conflict and no per-profile mapping needed. croft's search-paste handler matches it the same way as ⌘V.
-
-**Mouse fallback.** The Search input row also has a clickable **`[Paste]`** button on the right, just before the `Aa ab .*` toggles. Click it and croft runs `pbpaste` directly — useful when neither ⌘V nor ⌃⇧V is reaching the app and you want to confirm the paste path itself works.
 
 Other terminals (kitty, Ghostty, WezTerm, Alacritty) deliver Cmd over the kitty protocol natively; croft already negotiates it on startup, so `Cmd+S`, `Cmd+Shift+F`, `Cmd+V`, and friends work there with no remap.
 
@@ -196,10 +185,11 @@ src/
 ├── main.rs              entry point
 ├── cli.rs               clap CLI: open path, setup-terminal / setup-iterm2 / keys subcommands
 ├── app.rs               event loop, three-pane layout + activity bar, key dispatch, status bar, mouse + clipboard
+├── clipboard.rs         native macOS clipboard read path with pbpaste fallback
 ├── git.rs               branch / dirty / ahead-behind status by shelling out to git
 ├── highlight.rs         tree-sitter highlight registry per language
 ├── icons.rs             Codicon / Devicon / Seti glyphs and per-language colors
-├── iterm2.rs            iTerm2 plist mutation helpers for setup-iterm2
+├── iterm2.rs            iTerm2 plist mutation helpers for fonts and Croft key mappings
 └── widgets/
     ├── mod.rs
     ├── file_tree.rs     ignore::WalkBuilder backed tree, lazy children, fs-watcher refresh
@@ -211,7 +201,7 @@ tests/cli.rs             integration tests for the CLI surface
 
 ## Status
 
-What works: three-pane layout, file tree expansion / collapse, mouse and keyboard, right-click context menu (New File / New Folder / Delete-to-Trash) with Delete-key shortcut, live filesystem watcher that picks up external changes within ~100ms, file open with tree-sitter highlighting (Rust, Python, JS, TS, TSX, JSON, TOML, YAML, Markdown, Go, HTML, CSS, Bash), full editor write path (insert / delete / Enter / Tab / Backspace / save round-trip with `●` dirty marker, auto-reload on external write when buffer is clean), embedded shell with full ANSI color and key forwarding, git status pill in the bottom bar (branch, dirty bullet, ahead/behind), `setup-terminal` and `setup-iterm2` AppleScript / plist helpers. The repo ships 155 tests; run with `cargo test`. What does not work yet: command palette, multi-tab editor, search, settings, LSP.
+What works: three-pane layout, file tree expansion / collapse, mouse and keyboard, right-click context menu (New File / New Folder / Delete-to-Trash) with Delete-key shortcut, live filesystem watcher that picks up external changes within ~100ms, file open with tree-sitter highlighting (Rust, Python, JS, TS, TSX, JSON, TOML, YAML, Markdown, Go, HTML, CSS, Bash), full editor write path (insert / delete / Enter / Tab / Backspace / save round-trip with `●` dirty marker, auto-reload on external write when buffer is clean), Search sidebar with clipboard paste, embedded shell with full ANSI color and key forwarding, git status pill in the bottom bar (branch, dirty bullet, ahead/behind), `setup-terminal` and `setup-iterm2` AppleScript / plist helpers. The repo ships 361 unit tests plus CLI integration tests; run with `cargo test`. What does not work yet: command palette, settings, LSP.
 
 ## Limitations
 
