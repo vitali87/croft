@@ -249,7 +249,16 @@ pub struct App {
         >,
     >,
     fs_rx: Option<std::sync::mpsc::Receiver<notify_debouncer_full::DebounceEventResult>>,
+    /// Receives the debouncer + event channel from a background thread once
+    /// notify_debouncer_full finishes its initial recursive cache walk. On
+    /// large monorepos this walk is the dominant startup cost (≥1 s), so
+    /// it must not block `App::new`. None once installed.
+    fs_watcher_init_rx: Option<std::sync::mpsc::Receiver<FsWatcherInit>>,
     git_status: crate::git::GitStatus,
+    /// Receives the initial `git::query` result from a background thread.
+    /// `git status --porcelain` on a huge dirty repo can take hundreds of
+    /// milliseconds, so it's deferred. None once installed.
+    git_status_init_rx: Option<std::sync::mpsc::Receiver<crate::git::GitStatus>>,
     last_git_check: std::time::Instant,
     /// Anchor instant for the cursor blink. `tick_cursor_visible()` reads
     /// this to compute whether the caret is currently in its on-half or
@@ -318,17 +327,44 @@ struct WelcomeLayout {
 
 const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(500);
 
+type FsWatcherInit = (
+    notify_debouncer_full::Debouncer<
+        notify::RecommendedWatcher,
+        notify_debouncer_full::RecommendedCache,
+    >,
+    std::sync::mpsc::Receiver<notify_debouncer_full::DebounceEventResult>,
+);
+
 impl App {
     pub fn new(root: PathBuf) -> Result<Self> {
         let tree = FileTree::new(root.clone());
         let search = SearchPanel::new(root.clone());
         let editor = EditorTabs::new();
         let term = PtyTerminal::new(&root).context("spawning terminal")?;
-        let (watcher, rx) = match Self::spawn_fs_watcher(&root) {
-            Ok((w, r)) => (Some(w), Some(r)),
-            Err(_) => (None, None),
-        };
-        let git_status = crate::git::query(&root);
+
+        // notify_debouncer_full's RecommendedCache walks the entire watched
+        // subtree to populate its path↔inode map; on a multi-GB monorepo
+        // that's >1 s. Defer to a background thread; install via
+        // `try_install_pending_init` once it completes. The user sees the
+        // UI immediately and edits made in the first ~second go undetected
+        // by the watcher (acceptable: the user is just opening the app).
+        let (fs_init_tx, fs_init_rx) = std::sync::mpsc::channel();
+        let root_for_fs = root.clone();
+        std::thread::spawn(move || {
+            if let Ok(pair) = Self::spawn_fs_watcher(&root_for_fs) {
+                let _ = fs_init_tx.send(pair);
+            }
+        });
+
+        // `git status --porcelain` on a huge dirty repo can be hundreds of
+        // ms. Same treatment: kick it off, install when ready.
+        let (git_init_tx, git_init_rx) = std::sync::mpsc::channel();
+        let root_for_git = root.clone();
+        std::thread::spawn(move || {
+            let s = crate::git::query(&root_for_git);
+            let _ = git_init_tx.send(s);
+        });
+
         let (commits_tx, commits_rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let timeout = std::time::Duration::from_secs(3);
@@ -349,9 +385,11 @@ impl App {
             quit: false,
             context_menu: None,
             prompt: None,
-            _fs_watcher: watcher,
-            fs_rx: rx,
-            git_status,
+            _fs_watcher: None,
+            fs_rx: None,
+            fs_watcher_init_rx: Some(fs_init_rx),
+            git_status: crate::git::GitStatus::default(),
+            git_status_init_rx: Some(git_init_rx),
             last_git_check: std::time::Instant::now(),
             cursor_blink_anchor: std::time::Instant::now(),
             activity_images: None,
@@ -534,6 +572,41 @@ impl App {
     /// changes it on disk.
     /// Drain pending filesystem events. Returns `true` iff anything was
     /// processed (so the main loop knows it owes a redraw).
+    /// Install background-initialised resources (fs watcher, git status) if
+    /// their threads have finished. Returns true if any were installed this
+    /// tick (so the caller redraws). Cheap no-op once both are installed.
+    pub fn try_install_pending_init(&mut self) -> bool {
+        let mut changed = false;
+        if let Some(rx) = self.fs_watcher_init_rx.as_ref() {
+            match rx.try_recv() {
+                Ok((w, evrx)) => {
+                    self._fs_watcher = Some(w);
+                    self.fs_rx = Some(evrx);
+                    self.fs_watcher_init_rx = None;
+                    changed = true;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.fs_watcher_init_rx = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        if let Some(rx) = self.git_status_init_rx.as_ref() {
+            match rx.try_recv() {
+                Ok(s) => {
+                    self.git_status = s;
+                    self.git_status_init_rx = None;
+                    changed = true;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.git_status_init_rx = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        changed
+    }
+
     /// Pull a single batch of croft commits from the background HTTP fetch,
     /// if it has finished. Returns true exactly once when commits are
     /// installed (so the welcome panel repaints), false otherwise. Drops
@@ -558,8 +631,10 @@ impl App {
     }
 
     fn drain_fs_events(&mut self) -> bool {
+        // Pick up the watcher if its background init has just finished.
+        let init_changed = self.try_install_pending_init();
         let Some(rx) = self.fs_rx.as_ref() else {
-            return false;
+            return init_changed;
         };
         let mut affected: std::collections::BTreeSet<PathBuf> =
             std::collections::BTreeSet::new();
@@ -627,7 +702,7 @@ impl App {
                 }
             }
         }
-        got_any
+        got_any || init_changed
     }
 
     fn cycle_focus(&mut self) {
