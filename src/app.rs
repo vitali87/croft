@@ -1378,6 +1378,11 @@ impl App {
     }
 
     fn handle_search_key(&mut self, key: KeyEvent) {
+        if is_search_paste_key(key) {
+            let text = read_system_clipboard();
+            self.paste_clipboard_into_search(text.as_deref());
+            return;
+        }
         if is_editor_select_all_key(key) {
             self.search.select_all_query();
             return;
@@ -1686,6 +1691,16 @@ impl App {
         let n = text.chars().count();
         self.editor.delete_selection();
         self.status = format!("Cut {n} chars to clipboard");
+    }
+
+    fn paste_clipboard_into_search(&mut self, text: Option<&str>) {
+        let Some(s) = text else { return };
+        if s.is_empty() {
+            return;
+        }
+        self.search.insert_str_into_query(s);
+        self.submit_search_query();
+        self.status = format!("Pasted {} chars", s.chars().count());
     }
 
     fn handle_paste(&mut self, s: &str) {
@@ -2354,6 +2369,18 @@ fn is_save_key(key: KeyEvent) -> bool {
     key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::SUPER)
 }
 
+/// Read the macOS system clipboard via `pbpaste`. Returns `None` if the
+/// command fails or is unavailable. Used by the search input as a fallback
+/// path when iTerm2 swallows Cmd+V as its Edit→Paste menu shortcut and the
+/// bracketed-paste sequence never reaches us.
+fn read_system_clipboard() -> Option<String> {
+    let out = std::process::Command::new("pbpaste").output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
 /// Send an OSC 52 sequence to put `text` on the host terminal's system
 /// clipboard. Best-effort; failures are silent because there's nothing
 /// useful the user could do about them.
@@ -2380,6 +2407,17 @@ fn is_editor_copy_key(key: KeyEvent) -> bool {
 fn is_editor_cut_key(key: KeyEvent) -> bool {
     let KeyCode::Char(c) = key.code else { return false };
     if !c.eq_ignore_ascii_case(&'x') {
+        return false;
+    }
+    key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::SUPER)
+}
+
+/// Paste in the search input: `Ctrl+V` / `Cmd+V`. iTerm2 swallows Cmd+V as
+/// its Edit→Paste menu shortcut, so croft can't rely on bracketed paste
+/// reaching it; this lets the search field handle the keystroke directly.
+fn is_search_paste_key(key: KeyEvent) -> bool {
+    let KeyCode::Char(c) = key.code else { return false };
+    if !c.eq_ignore_ascii_case(&'v') {
         return false;
     }
     key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::SUPER)
@@ -3205,6 +3243,34 @@ mod tests {
         app.handle_search_key(key(KeyCode::Char('x'), KeyModifiers::SUPER));
         assert_eq!(app.search.query, "");
         assert_eq!(app.search.selection_range(), None);
+    }
+
+    #[test]
+    fn paste_clipboard_into_search_with_injected_text_appends_to_query() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.set_sidebar_view(SidebarView::Search);
+        app.search.query = String::from("foo");
+        app.paste_clipboard_into_search(Some("BAR"));
+        assert_eq!(app.search.query, "fooBAR");
+    }
+
+    #[test]
+    fn paste_clipboard_into_search_with_no_text_is_noop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.set_sidebar_view(SidebarView::Search);
+        app.search.query = String::from("foo");
+        app.paste_clipboard_into_search(None);
+        assert_eq!(app.search.query, "foo");
+    }
+
+    #[test]
+    fn cmd_v_is_recognised_as_search_paste_key() {
+        assert!(is_search_paste_key(key(KeyCode::Char('v'), KeyModifiers::SUPER)));
+        assert!(is_search_paste_key(key(KeyCode::Char('v'), KeyModifiers::CONTROL)));
+        assert!(!is_search_paste_key(key(KeyCode::Char('v'), KeyModifiers::NONE)));
+        assert!(!is_search_paste_key(key(KeyCode::Char('a'), KeyModifiers::SUPER)));
     }
 
     #[test]
