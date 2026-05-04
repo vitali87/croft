@@ -89,6 +89,11 @@ pub struct Editor {
     lang: Option<LangKind>,
     highlights: Vec<Vec<HiSpan>>,
     registry: LangRegistry,
+    /// When set, every occurrence of this string in the visible portion of
+    /// the buffer is overpainted with the search-match style after the
+    /// syntax-highlighted line is laid down. Mirrors the highlight in the
+    /// Search panel so the user sees their query lit up in the file too.
+    pub search_highlight: Option<String>,
 }
 
 impl Editor {
@@ -112,7 +117,12 @@ impl Editor {
             lang: None,
             highlights: Vec::new(),
             registry: LangRegistry::new(),
+            search_highlight: None,
         }
+    }
+
+    pub fn set_search_highlight(&mut self, term: Option<String>) {
+        self.search_highlight = term.filter(|s| !s.is_empty());
     }
 
     pub fn open(&mut self, path: &Path) -> Result<()> {
@@ -1499,6 +1509,96 @@ mod tests {
     }
 
     #[test]
+    fn editor_render_paints_search_match_cells_with_yellow_bg() {
+        use ratatui::buffer::Buffer;
+        let mut e = editor_with("alpha needle bravo needle zulu");
+        e.set_search_highlight(Some(String::from("needle")));
+        e.focused = true;
+        let area = Rect { x: 0, y: 0, width: 60, height: 3 };
+        let mut buf = Buffer::empty(area);
+        (&mut e).render(area, &mut buf);
+        let text_x = e.last_inner.x + e.last_gutter_width + 1;
+        let y = e.last_inner.y;
+        let yellow = Color::Rgb(0xff, 0xd7, 0x4a);
+        // First "needle" starts at char index 6 ("alpha "), 6 chars long.
+        for col in 6..12u16 {
+            assert_eq!(
+                buf[(text_x + col, y)].bg, yellow,
+                "first match cell {col} must have yellow bg"
+            );
+        }
+        // Cells just outside the match must NOT be yellow.
+        assert_ne!(buf[(text_x + 5, y)].bg, yellow, "cell before match");
+        assert_ne!(buf[(text_x + 12, y)].bg, yellow, "cell after match");
+        // Second "needle" starts at char index 19 ("alpha needle bravo "), 6 chars.
+        for col in 19..25u16 {
+            assert_eq!(
+                buf[(text_x + col, y)].bg, yellow,
+                "second match cell {col} must have yellow bg"
+            );
+        }
+    }
+
+    #[test]
+    fn editor_render_does_not_paint_search_highlight_when_unset() {
+        use ratatui::buffer::Buffer;
+        let mut e = editor_with("alpha needle bravo");
+        e.set_search_highlight(None);
+        e.focused = true;
+        let area = Rect { x: 0, y: 0, width: 40, height: 3 };
+        let mut buf = Buffer::empty(area);
+        (&mut e).render(area, &mut buf);
+        let text_x = e.last_inner.x + e.last_gutter_width + 1;
+        let y = e.last_inner.y;
+        let yellow = Color::Rgb(0xff, 0xd7, 0x4a);
+        for col in 0..18u16 {
+            assert_ne!(
+                buf[(text_x + col, y)].bg, yellow,
+                "no cell should be highlighted when search_highlight is None"
+            );
+        }
+    }
+
+    #[test]
+    fn editor_render_search_highlight_is_case_insensitive() {
+        use ratatui::buffer::Buffer;
+        let mut e = editor_with("Foo bar FOO baz");
+        e.set_search_highlight(Some(String::from("foo")));
+        e.focused = true;
+        let area = Rect { x: 0, y: 0, width: 40, height: 3 };
+        let mut buf = Buffer::empty(area);
+        (&mut e).render(area, &mut buf);
+        let text_x = e.last_inner.x + e.last_gutter_width + 1;
+        let y = e.last_inner.y;
+        let yellow = Color::Rgb(0xff, 0xd7, 0x4a);
+        for col in 0..3u16 {
+            assert_eq!(buf[(text_x + col, y)].bg, yellow, "cell {col} of 'Foo'");
+        }
+        for col in 8..11u16 {
+            assert_eq!(buf[(text_x + col, y)].bg, yellow, "cell {col} of 'FOO'");
+        }
+    }
+
+    #[test]
+    fn editor_tabs_set_search_highlight_propagates_to_every_tab() {
+        let mut t = EditorTabs::new();
+        let f1 = NamedTempFile::new().unwrap();
+        let f2 = NamedTempFile::new().unwrap();
+        std::fs::write(f1.path(), "hello").unwrap();
+        std::fs::write(f2.path(), "world").unwrap();
+        t.open_pinned(f1.path()).unwrap();
+        t.open_pinned(f2.path()).unwrap();
+        t.set_search_highlight(Some(String::from("term")));
+        for ed in &t.editors {
+            assert_eq!(ed.search_highlight.as_deref(), Some("term"));
+        }
+        t.set_search_highlight(None);
+        for ed in &t.editors {
+            assert!(ed.search_highlight.is_none());
+        }
+    }
+
+    #[test]
     fn render_paints_selection_band_on_selected_cells() {
         use ratatui::buffer::Buffer;
         let mut e = editor_with("hello world");
@@ -1939,6 +2039,10 @@ impl Widget for &mut Editor {
             let line = Line::from(spans);
             buf.set_line(text_x, y, &line, text_width);
 
+            if let Some(term) = self.search_highlight.as_deref() {
+                paint_search_highlight(buf, text_x, y, text_width, raw, term);
+            }
+
             if let Some(((sr, sc), (er, ec))) = sel_norm {
                 if line_idx >= sr && line_idx <= er {
                     let line_chars = self.line_char_len(line_idx);
@@ -1996,6 +2100,47 @@ impl Editor {
         let cx = text_x + col;
         let cy = self.last_inner.y + row_in_view as u16;
         Some((cx, cy))
+    }
+}
+
+/// Overpaint every case-insensitive occurrence of `needle` in `raw_line`
+/// with the search-match style. Bails out without changes when lowercasing
+/// changes the byte length (rare Unicode edge case) so we never slice into
+/// the middle of a UTF-8 codepoint. Char-aligned for ASCII; for Unicode
+/// the column conversion uses `chars().count()` over the byte prefix.
+fn paint_search_highlight(
+    buf: &mut Buffer,
+    text_x: u16,
+    y: u16,
+    text_width: u16,
+    raw_line: &str,
+    needle: &str,
+) {
+    if needle.is_empty() {
+        return;
+    }
+    let lower_line = raw_line.to_lowercase();
+    let lower_needle = needle.to_lowercase();
+    if lower_line.len() != raw_line.len() {
+        return;
+    }
+    let style = Style::default()
+        .fg(Color::Black)
+        .bg(Color::Rgb(0xff, 0xd7, 0x4a))
+        .add_modifier(Modifier::BOLD);
+    let mut start = 0usize;
+    while let Some(rel) = lower_line[start..].find(&lower_needle) {
+        let abs_byte_start = start + rel;
+        let abs_byte_end = abs_byte_start + lower_needle.len();
+        let col_start = raw_line[..abs_byte_start].chars().count() as u16;
+        let col_end = raw_line[..abs_byte_end].chars().count() as u16;
+        for c in col_start..col_end {
+            if c >= text_width {
+                break;
+            }
+            buf[(text_x + c, y)].set_style(style);
+        }
+        start = abs_byte_end;
     }
 }
 
@@ -2059,6 +2204,16 @@ impl EditorTabs {
 
     pub fn tab_count(&self) -> usize {
         self.editors.len()
+    }
+
+    /// Set (or clear) the search-match highlight term for every open tab,
+    /// so opening another file from search keeps the same query lit, and
+    /// clearing the search box wipes the highlights everywhere at once.
+    pub fn set_search_highlight(&mut self, term: Option<String>) {
+        let normalised = term.filter(|s| !s.is_empty());
+        for ed in &mut self.editors {
+            ed.search_highlight = normalised.clone();
+        }
     }
 
     pub fn active_index(&self) -> usize {

@@ -628,11 +628,18 @@ impl App {
         changed
     }
 
-    /// Push the current search query string onto the worker channel.
-    /// Called whenever the input text changes (Char, Backspace, Esc-clear).
-    /// Sending on a closed channel is harmless — search just goes silent.
-    fn submit_search_query(&self) {
+    /// Push the current search query string onto the worker channel and
+    /// keep the editor's match highlight synced to the same term so the
+    /// active file lights up matches as the user types. Called whenever
+    /// the search input changes.
+    fn submit_search_query(&mut self) {
         let _ = self.search_query_tx.send(self.search.query.clone());
+        let term = if self.search.query.trim().is_empty() {
+            None
+        } else {
+            Some(self.search.query.clone())
+        };
+        self.editor.set_search_highlight(term);
     }
 
     /// Apply any pending search results from the background worker. Drops
