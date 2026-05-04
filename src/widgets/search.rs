@@ -328,8 +328,9 @@ pub struct SearchPanel {
     pub toggle_word_x: u16,
     pub toggle_regex_x: u16,
     pub toggle_y: u16,
-    /// Byte range `(start, end)` selected within `query`. Used by Cmd+A /
-    /// Cmd+C / Cmd+X in the search input. `None` means no selection.
+    pub paste_button_x: u16,
+    pub paste_button_y: u16,
+    pub paste_button_w: u16,
     pub selection: Option<(usize, usize)>,
 }
 
@@ -349,8 +350,18 @@ impl SearchPanel {
             toggle_word_x: 0,
             toggle_regex_x: 0,
             toggle_y: 0,
+            paste_button_x: 0,
+            paste_button_y: 0,
+            paste_button_w: 0,
             selection: None,
         }
+    }
+
+    pub fn paste_button_at(&self, col: u16, row: u16) -> bool {
+        if self.paste_button_w == 0 || row != self.paste_button_y {
+            return false;
+        }
+        col >= self.paste_button_x && col < self.paste_button_x + self.paste_button_w
     }
 
     pub fn selection_range(&self) -> Option<(usize, usize)> {
@@ -503,10 +514,12 @@ impl Widget for &mut SearchPanel {
         } else {
             Color::DarkGray
         };
-        // Per-toggle 2-char glyphs, separated by 1 space, right-aligned.
-        // `Aa` = case-sensitive, `ab` = whole-word, `.*` = regex.
         let toggle_glyph_w: u16 = 2;
         let toggles_w: u16 = toggle_glyph_w * 3 + 2;
+        let paste_label = "[Paste]";
+        let paste_w: u16 = paste_label.chars().count() as u16;
+        let cluster_w: u16 = paste_w + 1 + toggles_w;
+        let paste_visible = inner.width >= cluster_w + 4;
         let toggles_x = inner
             .x
             .saturating_add(inner.width.saturating_sub(toggles_w));
@@ -556,8 +569,27 @@ impl Widget for &mut SearchPanel {
                 spans.push(cursor_span);
             }
         }
-        let typed_w = inner.width.saturating_sub(toggles_w + 1);
+        let typed_w = if paste_visible {
+            inner.width.saturating_sub(toggles_w + 1 + paste_w + 1)
+        } else {
+            inner.width.saturating_sub(toggles_w + 1)
+        };
         buf.set_line(inner.x, inner.y, &Line::from(spans), typed_w);
+
+        if paste_visible {
+            self.paste_button_x = toggles_x.saturating_sub(1 + paste_w);
+            self.paste_button_y = inner.y;
+            self.paste_button_w = paste_w;
+            let btn_style = Style::default()
+                .fg(Color::Black)
+                .bg(Color::Rgb(0x4e, 0x9a, 0xff))
+                .add_modifier(Modifier::BOLD);
+            buf.set_string(self.paste_button_x, inner.y, paste_label, btn_style);
+        } else {
+            self.paste_button_x = 0;
+            self.paste_button_y = inner.y;
+            self.paste_button_w = 0;
+        }
 
         let active_style = Style::default()
             .fg(Color::Black)
@@ -790,6 +822,48 @@ mod tests {
             "█",
             "cursor must sit immediately after the typed query"
         );
+    }
+
+    #[test]
+    fn search_panel_renders_paste_button_glyph_in_input_row() {
+        use ratatui::buffer::Buffer;
+        let tmp = TempDir::new().unwrap();
+        let mut panel = SearchPanel::new(tmp.path().to_path_buf());
+        panel.focused = true;
+        let area = Rect { x: 0, y: 0, width: 60, height: 5 };
+        let mut buf = Buffer::empty(area);
+        ratatui::widgets::Widget::render(&mut panel, area, &mut buf);
+        assert!(panel.paste_button_x > 0, "paste button x should be set after render");
+        assert!(panel.paste_button_w >= 5, "paste button should reserve >= 5 cells");
+        let y = panel.paste_button_y;
+        let x = panel.paste_button_x;
+        let mut collected = String::new();
+        for dx in 0..panel.paste_button_w {
+            collected.push_str(buf[(x + dx, y)].symbol());
+        }
+        assert!(
+            collected.to_lowercase().contains("paste"),
+            "input row at the paste-button cells should literally contain 'paste', got: {collected:?}"
+        );
+    }
+
+    #[test]
+    fn paste_button_at_returns_true_for_button_cell_and_false_outside() {
+        use ratatui::buffer::Buffer;
+        let tmp = TempDir::new().unwrap();
+        let mut panel = SearchPanel::new(tmp.path().to_path_buf());
+        panel.focused = true;
+        let area = Rect { x: 0, y: 0, width: 60, height: 5 };
+        let mut buf = Buffer::empty(area);
+        ratatui::widgets::Widget::render(&mut panel, area, &mut buf);
+        let x = panel.paste_button_x;
+        let y = panel.paste_button_y;
+        let w = panel.paste_button_w;
+        assert!(panel.paste_button_at(x, y));
+        assert!(panel.paste_button_at(x + w - 1, y));
+        assert!(!panel.paste_button_at(x + w, y));
+        assert!(x == 0 || !panel.paste_button_at(x - 1, y));
+        assert!(!panel.paste_button_at(x, y + 1));
     }
 
     #[test]

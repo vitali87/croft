@@ -1803,9 +1803,13 @@ impl App {
                     return;
                 }
                 if in_tree && self.sidebar_view == SidebarView::Search {
-                    // Toggle hit-test takes precedence over result-row /
-                    // input-focus dispatch — the toggles live on the input
-                    // row, so a click there must flip a flag, not focus.
+                    if self.search.paste_button_at(m.column, m.row) {
+                        let text = read_system_clipboard();
+                        self.paste_clipboard_into_search(text.as_deref());
+                        self.search.focused = true;
+                        self.tree.focused = false;
+                        return;
+                    }
                     if let Some(t) = self.search.toggle_at(m.column, m.row) {
                         match t {
                             crate::widgets::search::SearchToggle::CaseSensitive => {
@@ -3322,6 +3326,31 @@ mod tests {
         assert!(is_search_paste_key(key(KeyCode::Char('v'), KeyModifiers::CONTROL)));
         assert!(!is_search_paste_key(key(KeyCode::Char('v'), KeyModifiers::NONE)));
         assert!(!is_search_paste_key(key(KeyCode::Char('a'), KeyModifiers::SUPER)));
+    }
+
+    #[test]
+    fn left_click_on_paste_button_triggers_clipboard_paste_into_search() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.set_sidebar_view(SidebarView::Search);
+        app.tree.last_area = Rect { x: 0, y: 0, width: 60, height: 12 };
+        app.search.last_area = Rect { x: 0, y: 0, width: 60, height: 12 };
+        app.search.last_inner = Rect { x: 1, y: 1, width: 58, height: 10 };
+        app.search.paste_button_x = 40;
+        app.search.paste_button_y = 1;
+        app.search.paste_button_w = 5;
+        let original_status = app.status.clone();
+        let m = crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: 42,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        };
+        app.handle_mouse(m);
+        assert_ne!(
+            app.status, original_status,
+            "click on Paste button must invoke the clipboard paste path (status updates whether pbpaste succeeds, fails, or returns empty)"
+        );
     }
 
     #[test]
