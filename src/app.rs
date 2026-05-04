@@ -104,6 +104,7 @@ pub const APP_NAME: &str = "croft";
 /// (modified, staged, or untracked) flips the pill to yellow/orange.
 const GIT_CLEAN_COLOR: Color = Color::Rgb(0xa3, 0xbe, 0x8c);
 const GIT_DIRTY_COLOR: Color = Color::Rgb(0xeb, 0xcb, 0x8b);
+const FS_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Build the status-bar spans for the git pill: branch glyph, branch name,
 /// optional ahead/behind counts.  Colour alone carries clean/dirty state, in
@@ -326,6 +327,12 @@ pub struct App {
     /// Clipboard read entrypoint. Production uses the host clipboard; tests
     /// can swap in a deterministic reader for Cmd+V routing assertions.
     clipboard_reader: fn() -> Option<String>,
+    /// Last low-frequency reconciliation of expanded directories. This is a
+    /// backstop for events missed while the async watcher is still starting,
+    /// and for host watcher failures.
+    fs_poll_last_check: std::time::Instant,
+    fs_poll_dir_mtimes: std::collections::BTreeMap<PathBuf, Option<std::time::SystemTime>>,
+    fs_poll_open_file_mtime: Option<(PathBuf, Option<(std::time::SystemTime, u64)>)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -357,8 +364,8 @@ impl App {
         // subtree to populate its path↔inode map; on a multi-GB monorepo
         // that's >1 s. Defer to a background thread; install via
         // `try_install_pending_init` once it completes. The user sees the
-        // UI immediately and edits made in the first ~second go undetected
-        // by the watcher (acceptable: the user is just opening the app).
+        // UI immediately; the 50ms polling fallback below reconciles the
+        // visible tree and active editor while the watcher starts.
         let (fs_init_tx, fs_init_rx) = std::sync::mpsc::channel();
         let root_for_fs = root.clone();
         std::thread::spawn(move || {
@@ -393,6 +400,7 @@ impl App {
                 search_results_tx,
             );
         });
+        let fs_poll_dir_mtimes = Self::snapshot_expanded_dir_mtimes(&tree);
         Ok(Self {
             tree,
             search,
@@ -428,6 +436,9 @@ impl App {
             welcome_image_displayed: false,
             cell_pixel: None,
             clipboard_reader: read_system_clipboard,
+            fs_poll_last_check: std::time::Instant::now(),
+            fs_poll_dir_mtimes,
+            fs_poll_open_file_mtime: None,
         })
     }
 
@@ -591,6 +602,113 @@ impl App {
         Ok((debouncer, rx))
     }
 
+    fn dir_modified(path: &Path) -> Option<std::time::SystemTime> {
+        std::fs::metadata(path).and_then(|m| m.modified()).ok()
+    }
+
+    fn file_stamp(path: &Path) -> Option<(std::time::SystemTime, u64)> {
+        let meta = std::fs::metadata(path).ok()?;
+        let modified = meta.modified().ok()?;
+        Some((modified, meta.len()))
+    }
+
+    fn snapshot_open_file_mtime(&self) -> Option<(PathBuf, Option<(std::time::SystemTime, u64)>)> {
+        self.editor
+            .path
+            .as_ref()
+            .map(|path| (path.clone(), Self::file_stamp(path)))
+    }
+
+    fn sync_open_file_poll_mtime(&mut self) {
+        self.fs_poll_open_file_mtime = self.snapshot_open_file_mtime();
+    }
+
+    fn snapshot_expanded_dir_mtimes(
+        tree: &FileTree,
+    ) -> std::collections::BTreeMap<PathBuf, Option<std::time::SystemTime>> {
+        tree.nodes
+            .iter()
+            .filter(|n| n.is_dir && n.expanded)
+            .map(|n| (n.path.clone(), Self::dir_modified(&n.path)))
+            .collect()
+    }
+
+    fn reload_open_file_after_external_change(&mut self) -> bool {
+        self.refresh_git_status_debounced();
+        match self.editor.reload_if_clean() {
+            Some(Ok(())) => {
+                let path_disp = self
+                    .editor
+                    .path
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default();
+                self.status = format!("Reloaded {path_disp} (external change)");
+            }
+            Some(Err(e)) => {
+                self.status = format!("External change but reload failed: {e}");
+            }
+            None => {
+                self.status = String::from(
+                    "Open file changed on disk; you have unsaved edits, save or revert to reload",
+                );
+            }
+        }
+        self.sync_open_file_poll_mtime();
+        true
+    }
+
+    fn poll_open_file_change(&mut self) -> bool {
+        let current = self.snapshot_open_file_mtime();
+        let changed = match (&self.fs_poll_open_file_mtime, &current) {
+            (Some((old_path, old_stamp)), Some((path, stamp))) if old_path == path => {
+                old_stamp != stamp
+            }
+            _ => {
+                self.fs_poll_open_file_mtime = current;
+                return false;
+            }
+        };
+        self.fs_poll_open_file_mtime = current;
+        if changed {
+            self.reload_open_file_after_external_change()
+        } else {
+            false
+        }
+    }
+
+    fn poll_filesystem_changes(&mut self) -> bool {
+        if self.fs_poll_last_check.elapsed() < FS_POLL_INTERVAL {
+            return false;
+        }
+        self.fs_poll_last_check = std::time::Instant::now();
+        let mut changed = self.poll_open_file_change();
+        let current = Self::snapshot_expanded_dir_mtimes(&self.tree);
+        let changed_dirs: Vec<PathBuf> = current
+            .iter()
+            .filter_map(|(path, stamp)| {
+                if self.fs_poll_dir_mtimes.get(path) == Some(stamp) {
+                    None
+                } else {
+                    Some(path.clone())
+                }
+            })
+            .collect();
+        if changed_dirs.is_empty() {
+            self.fs_poll_dir_mtimes = current;
+            return changed;
+        }
+        for dir in changed_dirs.iter().rev() {
+            if let Some(idx) = self.tree.index_of_dir(dir) {
+                self.tree.refresh_children(idx);
+            }
+        }
+        self.fs_poll_dir_mtimes = Self::snapshot_expanded_dir_mtimes(&self.tree);
+        self.refresh_git_status_debounced();
+        changed = true;
+        changed
+    }
+
     /// Drain any pending filesystem events from the watcher and refresh the
     /// tree directories whose contents may have changed. Also reloads the
     /// editor's open file when an external write (vim, git pull, etc.)
@@ -692,7 +810,8 @@ impl App {
         // Pick up the watcher if its background init has just finished.
         let init_changed = self.try_install_pending_init();
         let Some(rx) = self.fs_rx.as_ref() else {
-            return init_changed;
+            let polled = self.poll_filesystem_changes();
+            return init_changed || polled;
         };
         let mut affected: std::collections::BTreeSet<PathBuf> =
             std::collections::BTreeSet::new();
@@ -735,32 +854,16 @@ impl App {
                     }
                 }
             }
+            self.fs_poll_dir_mtimes = Self::snapshot_expanded_dir_mtimes(&self.tree);
         }
-        if !affected.is_empty() || touched_open_file {
+        if !affected.is_empty() {
             self.refresh_git_status_debounced();
         }
         if touched_open_file {
-            match self.editor.reload_if_clean() {
-                Some(Ok(())) => {
-                    let path_disp = self
-                        .editor
-                        .path
-                        .as_ref()
-                        .map(|p| p.display().to_string())
-                        .unwrap_or_default();
-                    self.status = format!("Reloaded {path_disp} (external change)");
-                }
-                Some(Err(e)) => {
-                    self.status = format!("External change but reload failed: {e}");
-                }
-                None => {
-                    self.status = String::from(
-                        "Open file changed on disk; you have unsaved edits, save or revert to reload",
-                    );
-                }
-            }
+            self.reload_open_file_after_external_change();
         }
-        got_any || init_changed
+        let polled = self.poll_filesystem_changes();
+        got_any || init_changed || polled
     }
 
     fn cycle_focus(&mut self) {
@@ -1464,6 +1567,7 @@ impl App {
     fn open_search_hit(&mut self, hit: &crate::widgets::search::SearchHit) {
         match self.editor.open_preview(&hit.path) {
             Ok(()) => {
+                self.sync_open_file_poll_mtime();
                 // Place the cursor on the matched line.
                 let row = hit.line_no.saturating_sub(1).min(
                     self.editor.lines.len().saturating_sub(1),
@@ -1519,6 +1623,7 @@ impl App {
                     };
                     match result {
                         Ok(()) => {
+                            self.sync_open_file_poll_mtime();
                             self.status = self.editor.status.clone();
                             // Stay focused on the tree so Delete / arrows still
                             // act on the explorer; click into the editor pane
@@ -1573,6 +1678,7 @@ impl App {
         }
         if is_close_tab_key(key) {
             if self.editor.close_active() {
+                self.sync_open_file_poll_mtime();
                 self.status = String::from("Closed tab");
             } else {
                 self.status = String::from("Cannot close last tab");
@@ -1581,6 +1687,7 @@ impl App {
         }
         if let Some(idx) = jump_to_tab_index(key) {
             if self.editor.select(idx) {
+                self.sync_open_file_poll_mtime();
                 self.status = format!("Tab {}", idx + 1);
             }
             return;
@@ -1895,6 +2002,7 @@ impl App {
                             };
                             match result {
                                 Ok(()) => {
+                                    self.sync_open_file_poll_mtime();
                                     self.status = self.editor.status.clone();
                                     if is_double {
                                         // Double-click "pins" the file: focus
@@ -1921,6 +2029,7 @@ impl App {
                 } else if in_editor_pane && !in_editor {
                     if let Some(idx) = self.editor.close_at(m.column, m.row) {
                         if self.editor.close_tab(idx) {
+                            self.sync_open_file_poll_mtime();
                             self.status = String::from("Closed tab");
                             self.poke_cursor();
                         }
@@ -1928,6 +2037,7 @@ impl App {
                         self.focus_pane(Pane::Editor);
                         if self.editor.active_index() != idx {
                             self.editor.select(idx);
+                            self.sync_open_file_poll_mtime();
                         }
                         self.poke_cursor();
                     }
@@ -2129,6 +2239,7 @@ impl App {
                         // Sole tab: just blank out its buffer instead.
                         *self.editor = Editor::new();
                     }
+                    self.sync_open_file_poll_mtime();
                 }
             }
             Err(e) => {
@@ -2240,6 +2351,7 @@ impl App {
                             if let Err(e) = self.editor.open(&path) {
                                 self.status = format!("Created but could not open: {e}");
                             } else {
+                                self.sync_open_file_poll_mtime();
                                 self.focus_pane(Pane::Editor);
                             }
                         }
@@ -2267,6 +2379,7 @@ impl App {
                             }
                         }
                         self.editor.rename_open_path(&old_path, &new_path);
+                        self.sync_open_file_poll_mtime();
                     }
                     Err(e) => {
                         if let Some(p) = self.prompt.as_mut() {
@@ -2621,21 +2734,105 @@ mod tests {
     #[test]
     fn drain_fs_events_returns_true_after_workspace_write() {
         let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+        std::fs::write(tmp.path().join(".gitignore"), "*.txt\n").unwrap();
         let mut app = App::new(tmp.path().to_path_buf()).unwrap();
         for _ in 0..20 {
             let _ = app.drain_fs_events();
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        std::fs::write(tmp.path().join("new.txt"), "hi").unwrap();
+        let new_file = tmp.path().join("new.txt");
+        std::fs::write(&new_file, "hi").unwrap();
+        let started = std::time::Instant::now();
         let mut saw = false;
+        let mut saw_tree = false;
         for _ in 0..150 {
             if app.drain_fs_events() {
                 saw = true;
+            }
+            if app.tree.nodes.iter().any(|n| n.path == new_file) {
+                saw_tree = true;
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert!(saw, "workspace write should propagate as a dirty signal");
+        assert!(saw_tree, "workspace write should refresh the tree with the created file");
+        assert!(
+            started.elapsed() <= std::time::Duration::from_millis(200),
+            "created file should appear in Explorer within 200ms"
+        );
+    }
+
+    #[test]
+    fn drain_fs_events_removes_deleted_root_file_from_tree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let doomed = tmp.path().join("doomed.txt");
+        std::fs::write(&doomed, "bye").unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        assert!(
+            app.tree.nodes.iter().any(|n| n.path == doomed),
+            "precondition: initial tree contains the file"
+        );
+
+        std::fs::remove_file(&doomed).unwrap();
+        let started = std::time::Instant::now();
+        let mut saw_tree = false;
+        for _ in 0..150 {
+            let _ = app.drain_fs_events();
+            if !app.tree.nodes.iter().any(|n| n.path == doomed) {
+                saw_tree = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(saw_tree, "deleted file should disappear from the tree");
+        assert!(
+            started.elapsed() <= std::time::Duration::from_millis(200),
+            "deleted file should disappear from Explorer within 200ms"
+        );
+    }
+
+    #[test]
+    fn drain_fs_events_polling_fallback_refreshes_tree_without_watcher_event() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app._fs_watcher = None;
+        app.fs_rx = None;
+        app.fs_watcher_init_rx = None;
+        app.git_status_init_rx = None;
+        app.fs_poll_dir_mtimes.clear();
+        app.fs_poll_last_check = std::time::Instant::now() - FS_POLL_INTERVAL;
+
+        let new_file = tmp.path().join("new.txt");
+        std::fs::write(&new_file, "hi").unwrap();
+
+        assert!(app.drain_fs_events());
+        assert!(
+            app.tree.nodes.iter().any(|n| n.path == new_file),
+            "polling fallback should refresh the tree when no watcher event arrives"
+        );
+    }
+
+    #[test]
+    fn drain_fs_events_polling_fallback_reloads_clean_open_file_without_watcher_event() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("open.txt");
+        std::fs::write(&file, "old\n").unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.editor.open_pinned(&file).unwrap();
+        app.sync_open_file_poll_mtime();
+        app._fs_watcher = None;
+        app.fs_rx = None;
+        app.fs_watcher_init_rx = None;
+        app.git_status_init_rx = None;
+        app.fs_poll_last_check = std::time::Instant::now() - FS_POLL_INTERVAL;
+
+        std::fs::write(&file, "new content\n").unwrap();
+
+        assert!(app.drain_fs_events());
+        assert_eq!(app.editor.lines, vec!["new content"]);
+        assert!(!app.editor.dirty);
     }
 
     #[test]

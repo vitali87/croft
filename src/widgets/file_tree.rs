@@ -1,5 +1,4 @@
 use crate::icons;
-use ignore::WalkBuilder;
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
@@ -74,19 +73,14 @@ impl FileTree {
         }
         let path = self.nodes[idx].path.clone();
         let depth = self.nodes[idx].depth + 1;
-        let mut entries: Vec<(PathBuf, bool)> = WalkBuilder::new(&path)
-            .max_depth(Some(1))
-            .git_ignore(true)
-            .hidden(false)
-            .build()
-            .filter_map(Result::ok)
-            .filter_map(|e| {
-                let p = e.path().to_path_buf();
-                if p == path {
-                    return None;
-                }
-                let is_dir = p.is_dir();
-                Some((p, is_dir))
+        let mut entries: Vec<(PathBuf, bool)> = std::fs::read_dir(&path)
+            .ok()
+            .into_iter()
+            .flat_map(|rd| rd.filter_map(Result::ok))
+            .map(|e| {
+                let p = e.path();
+                let is_dir = e.file_type().map(|ft| ft.is_dir()).unwrap_or_else(|_| p.is_dir());
+                (p, is_dir)
             })
             .collect();
         entries.sort_by(|a, b| match (a.1, b.1) {
@@ -383,10 +377,23 @@ mod tests {
     #[test]
     fn new_lists_root_and_children() {
         let (_tmp, tree) = fixture();
-        // Root + 3 children (src/, main.rs, README.md). Hidden filtered by default.
+        // Root + 3 children (src/, main.rs, README.md).
         assert_eq!(tree.nodes.len(), 4);
         assert!(tree.nodes[0].is_dir);
         assert!(tree.nodes[0].expanded);
+    }
+
+    #[test]
+    fn explorer_lists_gitignored_files() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join(".git")).unwrap();
+        fs::write(tmp.path().join(".gitignore"), "*.txt\n").unwrap();
+        fs::write(tmp.path().join("dummy2.txt"), "").unwrap();
+        let tree = FileTree::new(tmp.path().to_path_buf());
+        assert!(
+            tree.nodes.iter().any(|n| n.path.ends_with("dummy2.txt")),
+            "Explorer must show disk reality, including gitignored files"
+        );
     }
 
     #[test]
