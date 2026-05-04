@@ -1378,24 +1378,49 @@ impl App {
     }
 
     fn handle_search_key(&mut self, key: KeyEvent) {
+        if is_editor_select_all_key(key) {
+            self.search.select_all_query();
+            return;
+        }
+        if is_editor_copy_key(key) {
+            let text = self.search.selection_text();
+            if !text.is_empty() {
+                write_osc52(&text);
+                self.status = format!("Copied {} chars to clipboard", text.chars().count());
+            }
+            return;
+        }
+        if is_editor_cut_key(key) {
+            let text = self.search.selection_text();
+            if !text.is_empty() {
+                write_osc52(&text);
+                let n = text.chars().count();
+                self.search.delete_selection();
+                self.submit_search_query();
+                self.status = format!("Cut {n} chars to clipboard");
+            }
+            return;
+        }
         match key.code {
             KeyCode::Esc => {
                 if self.search.query.is_empty() {
                     self.set_sidebar_view(SidebarView::Explorer);
                 } else {
                     self.search.query.clear();
+                    self.search.clear_selection();
                     self.search.hits.clear();
                     self.submit_search_query();
                 }
             }
             KeyCode::Enter => {
-                // Search is live now; Enter just opens the highlighted hit.
                 if let Some(hit) = self.search.selected_hit().cloned() {
                     self.open_search_hit(&hit);
                 }
             }
             KeyCode::Backspace => {
-                if self.search.query.pop().is_some() {
+                if self.search.delete_selection() {
+                    self.submit_search_query();
+                } else if self.search.query.pop().is_some() {
                     self.submit_search_query();
                 }
             }
@@ -1406,6 +1431,7 @@ impl App {
                     && !key.modifiers.contains(KeyModifiers::ALT)
                     && !key.modifiers.contains(KeyModifiers::SUPER)
                 {
+                    self.search.delete_selection();
                     self.search.query.push(c);
                     self.submit_search_query();
                 }
@@ -1663,22 +1689,23 @@ impl App {
     }
 
     fn handle_paste(&mut self, s: &str) {
+        if self.sidebar_view == SidebarView::Search {
+            self.search.insert_str_into_query(s);
+            self.submit_search_query();
+            self.status = format!("Pasted {} chars", s.chars().count());
+            return;
+        }
         match self.focus {
             Pane::Editor => {
                 self.editor.insert_str(s);
                 self.status = format!("Pasted {} chars", s.chars().count());
             }
             Pane::Terminal => {
-                // Forward bracketed paste to the embedded shell verbatim,
-                // wrapped in the same envelope so the shell treats it as a
-                // paste rather than typed input.
                 self.terminal.write_input(b"\x1b[200~");
                 self.terminal.write_input(s.as_bytes());
                 self.terminal.write_input(b"\x1b[201~");
             }
-            Pane::Tree => {
-                // Tree has no text input target; paste is a no-op here.
-            }
+            Pane::Tree => {}
         }
     }
 
@@ -3121,6 +3148,74 @@ mod tests {
         let items = build_tree_context_menu_items(Some(&n), tmp.path());
         let labels: Vec<&str> = items.iter().map(|(s, _)| s.as_str()).collect();
         assert_eq!(labels, ["New File…", "New Folder…"]);
+    }
+
+    #[test]
+    fn bracketed_paste_into_search_input_appends_to_query() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.set_sidebar_view(SidebarView::Search);
+        app.search.query = String::from("foo");
+        app.handle_paste("bar");
+        assert_eq!(app.search.query, "foobar");
+    }
+
+    #[test]
+    fn bracketed_paste_into_search_strips_newlines() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.set_sidebar_view(SidebarView::Search);
+        app.handle_paste("hello\nworld\r\n");
+        assert_eq!(app.search.query, "helloworld");
+    }
+
+    #[test]
+    fn cmd_a_in_search_selects_entire_query() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.set_sidebar_view(SidebarView::Search);
+        app.search.query = String::from("alpha");
+        app.handle_search_key(key(KeyCode::Char('a'), KeyModifiers::SUPER));
+        assert_eq!(
+            app.search.selection_range(),
+            Some((0, "alpha".len())),
+            "Cmd+A in search input must select the whole query"
+        );
+    }
+
+    #[test]
+    fn cmd_c_in_search_with_full_selection_clears_no_text() {
+        // After Cmd+A then Cmd+C, the query stays put (copy is non-destructive).
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.set_sidebar_view(SidebarView::Search);
+        app.search.query = String::from("alpha");
+        app.handle_search_key(key(KeyCode::Char('a'), KeyModifiers::SUPER));
+        app.handle_search_key(key(KeyCode::Char('c'), KeyModifiers::SUPER));
+        assert_eq!(app.search.query, "alpha");
+    }
+
+    #[test]
+    fn cmd_x_in_search_with_full_selection_clears_query() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.set_sidebar_view(SidebarView::Search);
+        app.search.query = String::from("alpha");
+        app.handle_search_key(key(KeyCode::Char('a'), KeyModifiers::SUPER));
+        app.handle_search_key(key(KeyCode::Char('x'), KeyModifiers::SUPER));
+        assert_eq!(app.search.query, "");
+        assert_eq!(app.search.selection_range(), None);
+    }
+
+    #[test]
+    fn typing_after_select_all_replaces_query() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.set_sidebar_view(SidebarView::Search);
+        app.search.query = String::from("alpha");
+        app.handle_search_key(key(KeyCode::Char('a'), KeyModifiers::SUPER));
+        app.handle_search_key(key(KeyCode::Char('z'), KeyModifiers::NONE));
+        assert_eq!(app.search.query, "z");
     }
 }
 

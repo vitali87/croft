@@ -328,6 +328,9 @@ pub struct SearchPanel {
     pub toggle_word_x: u16,
     pub toggle_regex_x: u16,
     pub toggle_y: u16,
+    /// Byte range `(start, end)` selected within `query`. Used by Cmd+A /
+    /// Cmd+C / Cmd+X in the search input. `None` means no selection.
+    pub selection: Option<(usize, usize)>,
 }
 
 impl SearchPanel {
@@ -346,6 +349,54 @@ impl SearchPanel {
             toggle_word_x: 0,
             toggle_regex_x: 0,
             toggle_y: 0,
+            selection: None,
+        }
+    }
+
+    pub fn selection_range(&self) -> Option<(usize, usize)> {
+        self.selection
+            .map(|(a, b)| if a <= b { (a, b) } else { (b, a) })
+    }
+
+    pub fn select_all_query(&mut self) {
+        if self.query.is_empty() {
+            self.selection = None;
+        } else {
+            self.selection = Some((0, self.query.len()));
+        }
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.selection = None;
+    }
+
+    pub fn delete_selection(&mut self) -> bool {
+        let Some((a, b)) = self.selection_range() else { return false };
+        if a == b {
+            self.selection = None;
+            return false;
+        }
+        self.query.replace_range(a..b, "");
+        self.selection = None;
+        true
+    }
+
+    pub fn selection_text(&self) -> String {
+        match self.selection_range() {
+            Some((a, b)) if a < b => self.query[a..b].to_string(),
+            _ => String::new(),
+        }
+    }
+
+    /// Insert `s` at the end of the query, replacing the current selection
+    /// (if any) first. Newlines and carriage returns are stripped — search
+    /// queries are single-line.
+    pub fn insert_str_into_query(&mut self, s: &str) {
+        self.delete_selection();
+        for c in s.chars() {
+            if c != '\n' && c != '\r' {
+                self.query.push(c);
+            }
         }
     }
 
@@ -483,10 +534,24 @@ impl Widget for &mut SearchPanel {
             }
             spans.push(placeholder_span);
         } else {
-            spans.push(Span::styled(
-                self.query.as_str(),
-                Style::default().fg(Color::White),
-            ));
+            let plain = Style::default().fg(Color::White);
+            let selected = Style::default()
+                .fg(Color::White)
+                .bg(Color::Rgb(0x26, 0x4f, 0x78));
+            match self.selection_range() {
+                Some((a, b)) if a < b => {
+                    if a > 0 {
+                        spans.push(Span::styled(self.query[..a].to_string(), plain));
+                    }
+                    spans.push(Span::styled(self.query[a..b].to_string(), selected));
+                    if b < self.query.len() {
+                        spans.push(Span::styled(self.query[b..].to_string(), plain));
+                    }
+                }
+                _ => {
+                    spans.push(Span::styled(self.query.as_str(), plain));
+                }
+            }
             if self.focused {
                 spans.push(cursor_span);
             }
