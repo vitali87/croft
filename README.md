@@ -154,11 +154,30 @@ To make `⌘⇧F` jump croft to the Search view:
 
 After both steps `⌘⇧F` jumps to the Search panel from anywhere in croft.
 
-### 4. Pasting into the Search input
+### 4. ⌘V to paste into the Search input
 
-The Search input row has a clickable **`[Paste]`** button on the right, just before the `Aa ab .*` toggles. Click it with the mouse and croft reads the macOS clipboard via `pbpaste` and inserts the contents into the query. This path is iTerm2-immune: mouse events come through the terminal regardless of any menu shortcut conflicts.
+iTerm2 owns ⌘V at the macOS app-menu level via **Edit → Paste**. macOS routes ⌘V to that menu *before* iTerm's per-profile Key Mappings can intercept it. That is why you see iTerm's Edit menu flicker on ⌘V — the keystroke is being consumed by the menu, not by iTerm's keymap, and never reaches croft. The iTerm Send Hex Code binding alone is not enough; you must also free the macOS menu shortcut first.
 
-`⌘V` may also work as a keystroke if you bind iTerm2 → Settings → **Profiles** → Default → **Keys** → **Key Mappings** → click `+` → press `⌘V` → Action: **Send Hex Code** → Code: `0x16`. That's the `Ctrl+V` byte; croft's `is_search_paste_key` handler matches it. But many iTerm2 profile/version combinations ignore the per-profile Key Mapping for `⌘V` because the macOS Edit → Paste app-menu shortcut fires first. If you see the Edit menu flicker and nothing pastes, iTerm took the keystroke at the menu level and never sent the hex code; click the `[Paste]` button instead.
+The full recipe is four steps. Skipping any one of them leaves you with a flickering Edit menu and no paste.
+
+**Step 1 — free the macOS app-menu shortcut.** System Settings → Keyboard → Keyboard Shortcuts → **App Shortcuts** → click `+`.
+- *Application:* whichever iTerm2 binary you actually launch. If the app in `/Applications` is named `iTerm.app`, pick **iTerm**; if it's `iTerm2.app`, pick **iTerm2**. The bundle has to match exactly.
+- *Menu Title:* `Paste` — exactly five characters, no leading space, no trailing ellipsis, case-sensitive. The easiest way to get this right is to open iTerm's Edit menu, copy the literal label, and paste it into this field.
+- *Keyboard Shortcut:* any chord you do not otherwise use (e.g. `⌃⌥⌘V`).
+
+Click **Add**.
+
+**Step 2 — fully quit and reopen iTerm.** Press `⌘Q` inside iTerm. Closing the window is not enough; the App Shortcut rename only attaches to a fresh launch. Wait a couple of seconds, then relaunch iTerm.
+
+**Step 3 — verify the rename took effect.** Open the iTerm **Edit** menu. Find the **Paste** row. The keyboard shortcut shown next to it must be the chord you chose in Step 1, *not* `⌘V`. If it still says `⌘V`, the rename did not apply — most often the *Menu Title* string did not match exactly, or you renamed for the wrong app bundle, or iTerm was not fully quit. Fix and repeat until the Edit menu confirms the new chord. **Do not skip this verification — without it, Step 4 silently does nothing and ⌘V keeps going to the menu.**
+
+**Step 4 — bind ⌘V in iTerm to send the `Ctrl+V` byte.** iTerm2 → Settings → **Profiles** → Default → **Keys** tab → **Key Mappings** sub-tab → click `+` → "Click to Set" → press `⌘V` → Action: **Send Hex Code** → Code: `0x16` → OK.
+
+After all four steps, ⌘V reaches croft as `KeyEvent { code: Char('v'), modifiers: CONTROL }`. croft's `is_search_paste_key` matches it; the Search input reads the macOS clipboard via `pbpaste` and inserts the contents. The status bar updates to either `Pasted N chars` on success or `Cmd+V: clipboard read failed / empty` if `pbpaste` returned nothing.
+
+**Zero-setup alternative: ⌃⇧V.** If you don't want to touch System Settings, press `⌃⇧V` (Control+Shift+V) inside the Search input. iTerm encodes that as the `0x16` byte natively, with no menu conflict and no per-profile mapping needed. croft's search-paste handler matches it the same way as ⌘V.
+
+**Mouse fallback.** The Search input row also has a clickable **`[Paste]`** button on the right, just before the `Aa ab .*` toggles. Click it and croft runs `pbpaste` directly — useful when neither ⌘V nor ⌃⇧V is reaching the app and you want to confirm the paste path itself works.
 
 Other terminals (kitty, Ghostty, WezTerm, Alacritty) deliver Cmd over the kitty protocol natively; croft already negotiates it on startup, so `Cmd+S`, `Cmd+Shift+F`, `Cmd+V`, and friends work there with no remap.
 
