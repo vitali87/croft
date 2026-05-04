@@ -156,18 +156,15 @@ After both steps `⌘⇧F` jumps to the Search panel from anywhere in croft.
 
 ### 4. Cmd+V to paste into the Search input
 
-iTerm2 owns `⌘V` at the macOS app-menu level (**Edit → Paste**), and that menu binding fires *before* iTerm's own Key Mappings get a chance to translate the keystroke. Inside croft, you'll see the iTerm Edit menu flicker but nothing is pasted into the Search field — the keystroke never reaches croft as a key event, and iTerm's menu-driven paste is not delivered as a bracketed-paste sequence to the running TUI.
+If you previously added a System Settings App Shortcut renaming iTerm's `Paste` menu item, **remove it first**: System Settings → Keyboard → Keyboard Shortcuts → **App Shortcuts** → select the iTerm `Paste` row → click `−`. Quit iTerm2 with `⌘Q` (a window-close is not enough) and reopen it. Same for any prior kitty-CSI-u binding for `⌘V` in iTerm Profiles → Keys → Key Mappings — delete it.
 
-To make `⌘V` paste into croft's Search input:
+Then add this single iTerm Key Mapping, mirroring the proven `⌘S → Ctrl+S = 0x13` pattern from section 1:
 
-1. **Free the menu shortcut.** System Settings → Keyboard → Keyboard Shortcuts → **App Shortcuts** → click `+` → Application: **iTerm**, Menu Title: `Paste`, Keyboard Shortcut: any chord you don't use (e.g. `⌃⌥⌘V`). Quit and reopen iTerm2.
-2. **Bind `⌘V` to emit the kitty CSI u sequence croft recognises.** iTerm2 → Settings → **Profiles** → Default → **Keys** → **Key Mappings** → click `+` → Click to Set: press `⌘V` → Action: **Send Hex Code** → Codes:
-   ```
-   0x1b 0x5b 0x31 0x31 0x38 0x3b 0x39 0x75
-   ```
-   That's `\x1b[118;9u` — kitty-protocol-encoded `Cmd+v` (codepoint 118 for `v`, modifier mask 9 = base 1 + Super 8). Crossterm decodes it as `KeyEvent { code: Char('v'), modifiers: SUPER }`, which croft's `is_search_paste_key` matches; the search input then reads the macOS clipboard via `pbpaste` and inserts it into the query.
+iTerm2 → Settings → **Profiles** → Default → **Keys** tab → **Key Mappings** sub-tab → click `+` → "Click to Set" → press `⌘V` → Action: **Send Hex Code** → Code: `0x16` → OK.
 
-After both steps `⌘V` pastes the system clipboard into the Search input. (The terminal pane and the editor pane still receive the same keystroke and behave normally; croft only intercepts `⌘V` when the Search sidebar is focused.)
+`0x16` is the byte `Ctrl+V`. iTerm's per-profile Key Mapping intercepts `⌘V` *before* the macOS Edit → Paste menu binding fires, so iTerm sends a single `0x16` byte to croft. Crossterm decodes that as `KeyEvent { code: Char('v'), modifiers: CONTROL }`, which `is_search_paste_key` matches. The search input then reads the macOS clipboard via `pbpaste` and inserts the contents.
+
+You may still see the Edit menu briefly highlight as Cocoa shows the visual cue for `⌘V`, but the actual paste action is preempted by iTerm's Key Mapping — the clipboard goes into croft's search field, not iTerm's terminal pane.
 
 Other terminals (kitty, Ghostty, WezTerm, Alacritty) deliver Cmd over the kitty protocol natively; croft already negotiates it on startup, so `Cmd+S`, `Cmd+Shift+F`, `Cmd+V`, and friends work there with no remap.
 
