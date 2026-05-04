@@ -79,6 +79,11 @@ pub struct Editor {
     pub last_inner: Rect,
     pub last_gutter_width: u16,
     pub selection: Option<EditorSelection>,
+    /// True when this tab is the single replaceable "preview" slot. Single-
+    /// click / plain-Enter opens replace the preview tab's contents in place;
+    /// double-click / Ctrl+Enter / typing into the buffer pin the tab
+    /// (preview = false) so subsequent previews don't overwrite it.
+    pub preview: bool,
     undo_stack: Vec<Snapshot>,
     last_edit_kind: Option<EditKind>,
     lang: Option<LangKind>,
@@ -101,6 +106,7 @@ impl Editor {
             last_inner: Rect::default(),
             last_gutter_width: 0,
             selection: None,
+            preview: false,
             undo_stack: Vec::new(),
             last_edit_kind: None,
             lang: None,
@@ -166,7 +172,15 @@ impl Editor {
             .unwrap_or(line.len())
     }
 
+    /// Any user-driven mutation pins the buffer (matches VS Code: typing in
+    /// a preview tab promotes it to a regular tab so a subsequent
+    /// single-click on another file can't silently replace your edits).
+    fn pin_on_edit(&mut self) {
+        self.preview = false;
+    }
+
     pub fn insert_char(&mut self, c: char) {
+        self.pin_on_edit();
         // Selection-replace counts as one logical edit (Replace), not two.
         // Coalesce subsequent typed chars onto the same step only when the
         // previous edit was also a single-char insert with no selection.
@@ -194,6 +208,7 @@ impl Editor {
     }
 
     pub fn insert_str(&mut self, s: &str) {
+        self.pin_on_edit();
         self.push_undo(EditKind::Paste);
         if self.selection.is_some() {
             self.delete_selection_inner();
@@ -235,6 +250,7 @@ impl Editor {
     }
 
     pub fn insert_newline(&mut self) {
+        self.pin_on_edit();
         self.push_undo(EditKind::Newline);
         self.delete_selection_inner();
         self.insert_newline_raw();
@@ -242,6 +258,7 @@ impl Editor {
     }
 
     pub fn backspace(&mut self) {
+        self.pin_on_edit();
         self.push_undo(EditKind::Backspace);
         if self.delete_selection_inner() {
             self.recompute_highlights();
@@ -266,6 +283,7 @@ impl Editor {
     }
 
     pub fn delete_forward(&mut self) {
+        self.pin_on_edit();
         self.push_undo(EditKind::DeleteForward);
         if self.delete_selection_inner() {
             self.recompute_highlights();
@@ -1669,6 +1687,83 @@ mod tests {
     }
 
     #[test]
+    fn open_preview_creates_a_preview_tab_when_none_exists() {
+        let mut t = EditorTabs::new();
+        t.editors[0].path = Some(std::path::PathBuf::from("/a"));
+        t.editors[0].preview = false;
+        // Stand in for a real disk open: simulate the side-effects directly.
+        t.add_preview_tab_with_path(std::path::PathBuf::from("/b"));
+        assert_eq!(t.tab_count(), 2);
+        assert_eq!(t.preview_index(), Some(1));
+        assert_eq!(t.active_index(), 1);
+    }
+
+    #[test]
+    fn open_preview_reuses_existing_preview_slot_for_a_new_path() {
+        let mut t = EditorTabs::new();
+        t.editors[0].path = Some(std::path::PathBuf::from("/a"));
+        t.editors[0].preview = false;
+        t.add_preview_tab_with_path(std::path::PathBuf::from("/b"));
+        // Now repoint the preview tab at /c — count must NOT grow.
+        t.repoint_preview_to(std::path::PathBuf::from("/c"));
+        assert_eq!(t.tab_count(), 2);
+        assert_eq!(t.preview_index(), Some(1));
+        assert_eq!(
+            t.editors[1].path.as_deref(),
+            Some(std::path::Path::new("/c"))
+        );
+    }
+
+    #[test]
+    fn open_preview_reuses_blank_initial_tab_instead_of_stacking() {
+        let mut t = EditorTabs::new();
+        let mut f = NamedTempFile::new().unwrap();
+        write!(f, "hello").unwrap();
+        t.open_preview(f.path()).unwrap();
+        assert_eq!(t.tab_count(), 1, "blank initial tab must be reused");
+        assert_eq!(t.preview_index(), Some(0));
+        assert_eq!(t.path.as_deref(), Some(f.path()));
+    }
+
+    #[test]
+    fn open_pinned_reuses_blank_initial_tab_instead_of_stacking() {
+        let mut t = EditorTabs::new();
+        let mut f = NamedTempFile::new().unwrap();
+        write!(f, "hello").unwrap();
+        t.open_pinned(f.path()).unwrap();
+        assert_eq!(t.tab_count(), 1, "blank initial tab must be reused");
+        assert!(t.preview_index().is_none(), "pinned open must not leave preview state");
+    }
+
+    #[test]
+    fn open_preview_drops_stale_preview_when_switching_to_pinned_tab() {
+        let mut t = EditorTabs::new();
+        let mut f1 = NamedTempFile::new().unwrap();
+        write!(f1, "a").unwrap();
+        let mut f2 = NamedTempFile::new().unwrap();
+        write!(f2, "b").unwrap();
+        t.open_preview(f1.path()).unwrap();   // preview slot = f1, only tab
+        t.pin_active();                       // f1 pinned
+        t.open_preview(f2.path()).unwrap();   // preview tab for f2 alongside pinned f1
+        assert_eq!(t.tab_count(), 2);
+        t.open_preview(f1.path()).unwrap();   // back to f1 → stale f2 preview must vanish
+        assert_eq!(t.tab_count(), 1);
+        assert!(t.preview_index().is_none());
+        assert_eq!(t.path.as_deref(), Some(f1.path()));
+    }
+
+    #[test]
+    fn pin_active_clears_preview_flag() {
+        let mut t = EditorTabs::new();
+        t.editors[0].path = Some(std::path::PathBuf::from("/a"));
+        t.add_preview_tab_with_path(std::path::PathBuf::from("/b"));
+        assert_eq!(t.preview_index(), Some(1));
+        t.pin_active();
+        assert!(t.preview_index().is_none(), "no tab should be in preview state");
+        assert!(!t.editors[1].preview);
+    }
+
+    #[test]
     fn editor_tabs_find_tab_with_path_returns_index_when_open() {
         let mut t = EditorTabs::new();
         t.editors[0].path = Some(std::path::PathBuf::from("/a"));
@@ -1964,27 +2059,124 @@ impl EditorTabs {
         })
     }
 
-    /// Either switch to the tab already holding `path`, or open `path` in a
-    /// brand-new tab next to the active one. Used by Ctrl+Enter so the user
-    /// never gets two tabs pointing at the same file.
-    pub fn open_in_new_tab_or_switch(&mut self, path: &Path) -> Result<()> {
-        if let Some(idx) = self.find_tab_with_path(path) {
-            self.select(idx);
-            return Ok(());
-        }
-        self.open_in_new_tab(path)
+    pub fn preview_index(&self) -> Option<usize> {
+        self.editors.iter().position(|e| e.preview)
     }
 
-    /// Either switch to an existing tab holding `path`, or replace the
-    /// active tab's contents with `path`. Used by plain Enter / mouse click /
-    /// search-result open so opening a file already on screen never creates
-    /// a second tab for it.
-    pub fn open_or_switch(&mut self, path: &Path) -> Result<()> {
+    /// Mark the active tab as pinned (no longer the preview slot). Called
+    /// when the user double-clicks a file, hits Ctrl+Enter, or starts typing
+    /// inside a preview tab.
+    pub fn pin_active(&mut self) {
+        self.editors[self.active].preview = false;
+    }
+
+    /// VS Code "preview tab" semantics: open `path` in the single
+    /// replaceable preview slot. If the file is already in some tab, just
+    /// switch to it. Otherwise reuse the existing preview slot, or create a
+    /// fresh preview tab next to the active one when none exists.
+    pub fn open_preview(&mut self, path: &Path) -> Result<()> {
         if let Some(idx) = self.find_tab_with_path(path) {
+            // Switching to an already-open file: if a stale preview tab
+            // exists for some OTHER file, drop it so the user doesn't
+            // accumulate ghost tabs from quick "peek" navigations.
+            if let Some(prev) = self.preview_index() {
+                if prev != idx {
+                    self.editors.remove(prev);
+                    let new_idx = if idx > prev { idx - 1 } else { idx };
+                    // Bypass `select` here because the removal may have left
+                    // `self.active` pointing past the end (when the active
+                    // tab was the preview we just dropped).
+                    self.active = new_idx;
+                    for (i, ed) in self.editors.iter_mut().enumerate() {
+                        ed.focused = i == new_idx;
+                    }
+                    return Ok(());
+                }
+            }
             self.select(idx);
             return Ok(());
         }
-        self.open(path)
+        if let Some(idx) = self.preview_index() {
+            self.select(idx);
+            self.editors[idx].open(path)?;
+            self.editors[idx].preview = true;
+            return Ok(());
+        }
+        if self.is_blank_initial() {
+            let active = self.active;
+            self.editors[active].open(path)?;
+            self.editors[active].preview = true;
+            return Ok(());
+        }
+        let mut e = Editor::new();
+        e.focused = self.editors[self.active].focused;
+        e.open(path)?;
+        e.preview = true;
+        let pos = self.active + 1;
+        self.editors.insert(pos, e);
+        self.editors[self.active].focused = false;
+        self.active = pos;
+        Ok(())
+    }
+
+    /// Pinned-tab open: if the file is already in some tab, pin and switch
+    /// to it. Otherwise create a fresh pinned tab next to the active one.
+    /// Used by double-click in the explorer and Ctrl+Enter on a tree row.
+    pub fn open_pinned(&mut self, path: &Path) -> Result<()> {
+        if let Some(idx) = self.find_tab_with_path(path) {
+            self.editors[idx].preview = false;
+            self.select(idx);
+            return Ok(());
+        }
+        if self.is_blank_initial() {
+            let active = self.active;
+            self.editors[active].open(path)?;
+            self.editors[active].preview = false;
+            return Ok(());
+        }
+        let mut e = Editor::new();
+        e.focused = self.editors[self.active].focused;
+        e.open(path)?;
+        e.preview = false;
+        let pos = self.active + 1;
+        self.editors.insert(pos, e);
+        self.editors[self.active].focused = false;
+        self.active = pos;
+        Ok(())
+    }
+
+    /// True iff the editor is in its just-launched state: a single tab with
+    /// no file loaded and no edits. Used by `open_preview` / `open_pinned`
+    /// to reuse that placeholder rather than stack a new tab on top of it.
+    fn is_blank_initial(&self) -> bool {
+        self.editors.len() == 1
+            && self.editors[0].path.is_none()
+            && !self.editors[0].dirty
+            && self.editors[0].lines.iter().all(|l| l.is_empty())
+    }
+
+    /// Test-only helper that mirrors `open_preview` without going through
+    /// the disk: insert a preview tab whose path is set but whose buffer is
+    /// empty. Used by unit tests to exercise preview-slot bookkeeping in
+    /// isolation from filesystem I/O.
+    pub fn add_preview_tab_with_path(&mut self, path: PathBuf) {
+        let mut e = Editor::new();
+        e.path = Some(path);
+        e.preview = true;
+        e.focused = self.editors[self.active].focused;
+        let pos = self.active + 1;
+        self.editors.insert(pos, e);
+        self.editors[self.active].focused = false;
+        self.active = pos;
+    }
+
+    /// Test-only helper for the "single-click on a different file when a
+    /// preview tab already exists" path: rewrite the existing preview tab's
+    /// path without changing tab count.
+    pub fn repoint_preview_to(&mut self, path: PathBuf) {
+        if let Some(idx) = self.preview_index() {
+            self.editors[idx].path = Some(path);
+        }
     }
 }
 
@@ -2052,9 +2244,14 @@ impl Widget for &mut EditorTabs {
             let is_active = i == active;
             let bg = if is_active { TAB_ACTIVE_BG } else { TAB_INACTIVE_BG };
             let fg = if is_active { TAB_ACTIVE_FG } else { TAB_INACTIVE_FG };
-            let style = Style::default().fg(fg).bg(bg).add_modifier(
-                if is_active { Modifier::BOLD } else { Modifier::empty() },
-            );
+            let mut modifiers = Modifier::empty();
+            if is_active {
+                modifiers |= Modifier::BOLD;
+            }
+            if ed.preview {
+                modifiers |= Modifier::ITALIC;
+            }
+            let style = Style::default().fg(fg).bg(bg).add_modifier(modifiers);
             let padded = format!(" {label_text} ");
             buf.set_string(cursor_x, strip.y, &padded, style);
             self.tab_screen_ranges.push((cursor_x, width));

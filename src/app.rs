@@ -229,6 +229,12 @@ pub struct App {
     /// `DOUBLE_CLICK_WINDOW`. Cleared when the next click lands elsewhere or
     /// after the double-click fires.
     last_editor_left_down: Option<(std::time::Instant, u16, u16)>,
+    /// Same idea as `last_editor_left_down` but for the file-tree pane.
+    /// Double-click on a tree row (within `DOUBLE_CLICK_WINDOW`) opens the
+    /// file in a new editor tab and moves focus to it; a single click keeps
+    /// the existing preview-style behaviour (replace active tab, keep tree
+    /// focused).
+    last_tree_left_down: Option<(std::time::Instant, u16, u16)>,
     /// True when the activity-bar OSC-1337 images need to be (re)written on
     /// the next post-draw flush. Set initially, on sidebar-view change, and
     /// on terminal resize. Cleared after emit. Without this gate every
@@ -271,6 +277,7 @@ impl App {
             cursor_blink_anchor: std::time::Instant::now(),
             activity_images: None,
             last_editor_left_down: None,
+            last_tree_left_down: None,
             activity_overlay_dirty: true,
         })
     }
@@ -962,7 +969,7 @@ impl App {
     }
 
     fn open_search_hit(&mut self, hit: &crate::widgets::search::SearchHit) {
-        match self.editor.open_or_switch(&hit.path) {
+        match self.editor.open_preview(&hit.path) {
             Ok(()) => {
                 // Place the cursor on the matched line.
                 let row = hit.line_no.saturating_sub(1).min(
@@ -1013,9 +1020,9 @@ impl App {
                         KeyModifiers::CONTROL | KeyModifiers::SUPER | KeyModifiers::META,
                     );
                     let result = if in_new_tab {
-                        self.editor.open_in_new_tab_or_switch(&path)
+                        self.editor.open_pinned(&path)
                     } else {
-                        self.editor.open_or_switch(&path)
+                        self.editor.open_preview(&path)
                     };
                     match result {
                         Ok(()) => {
@@ -1300,6 +1307,9 @@ impl App {
                 if !in_editor {
                     self.last_editor_left_down = None;
                 }
+                if !in_tree {
+                    self.last_tree_left_down = None;
+                }
                 // Activity-bar hit-test takes precedence over the side panel.
                 if rect_contains(self.sidebar_areas.explorer_icon, m.column, m.row) {
                     self.set_sidebar_view(SidebarView::Explorer);
@@ -1331,16 +1341,43 @@ impl App {
                     self.focus_pane(Pane::Tree);
                     if let Some(idx) = self.tree.node_at_y(m.row) {
                         self.tree.select(idx);
+                        let now = std::time::Instant::now();
+                        let is_double = matches!(
+                            self.last_tree_left_down,
+                            Some((t, x, y))
+                                if m.row == y
+                                    && m.column.abs_diff(x) <= 1
+                                    && now.duration_since(t) <= DOUBLE_CLICK_WINDOW
+                        );
                         if let Some(path) = self.tree.activate() {
-                            match self.editor.open_or_switch(&path) {
+                            let result = if is_double {
+                                self.editor.open_pinned(&path)
+                            } else {
+                                self.editor.open_preview(&path)
+                            };
+                            match result {
                                 Ok(()) => {
                                     self.status = self.editor.status.clone();
-                                    // Tree keeps focus so Delete / arrows still
-                                    // act on the explorer. Click into the
-                                    // editor pane to start typing.
+                                    if is_double {
+                                        // Double-click "pins" the file: focus
+                                        // moves to the editor so the user can
+                                        // start editing immediately.
+                                        self.focus_pane(Pane::Editor);
+                                        self.poke_cursor();
+                                    }
+                                    // Single-click keeps the tree focused so
+                                    // Delete / arrows still act on the
+                                    // explorer; the user follows up with a
+                                    // double-click (or a click in the editor
+                                    // pane) when they want to start typing.
                                 }
                                 Err(e) => self.status = format!("Error: {e}"),
                             }
+                        }
+                        if is_double {
+                            self.last_tree_left_down = None;
+                        } else {
+                            self.last_tree_left_down = Some((now, m.column, m.row));
                         }
                     }
                 } else if in_editor_pane && !in_editor {
@@ -1387,6 +1424,11 @@ impl App {
                 if let Some((_, x, y)) = self.last_editor_left_down {
                     if m.column != x || m.row != y {
                         self.last_editor_left_down = None;
+                    }
+                }
+                if let Some((_, x, y)) = self.last_tree_left_down {
+                    if m.column != x || m.row != y {
+                        self.last_tree_left_down = None;
                     }
                 }
                 if in_editor {
