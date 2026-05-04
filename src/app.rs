@@ -24,6 +24,7 @@ use std::time::Duration;
 use crate::widgets::{
     editor::{Editor, EditorTabs},
     file_tree::FileTree,
+    remote::RemotePanel,
     search::SearchPanel,
     terminal::PtyTerminal,
 };
@@ -33,6 +34,7 @@ use crate::widgets::{
 pub enum SidebarView {
     Explorer,
     Search,
+    Remote,
 }
 
 const ACTIVITY_BAR_WIDTH: u16 = 4;
@@ -45,6 +47,7 @@ const ACTIVITY_BAR_WIDTH: u16 = 4;
 const EDITOR_BG_RGB: (u8, u8, u8) = (0x1e, 0x22, 0x2e);
 const ACTIVITY_ICON_HEIGHT: u16 = 2;
 const ACTIVITY_ICON_GAP: u16 = 0;
+const FALLBACK_CELL_PIXEL: (u32, u32) = (10, 20);
 
 fn activity_icon_glyph_x(bar: Rect) -> u16 {
     bar.x + bar.width / 2
@@ -56,6 +59,10 @@ fn activity_explorer_y(bar: Rect) -> u16 {
 
 fn activity_search_y(bar: Rect) -> u16 {
     activity_explorer_y(bar) + ACTIVITY_ICON_HEIGHT + ACTIVITY_ICON_GAP
+}
+
+fn activity_remote_y(bar: Rect) -> u16 {
+    activity_search_y(bar) + ACTIVITY_ICON_HEIGHT + ACTIVITY_ICON_GAP
 }
 
 fn activity_explorer_block(bar: Rect) -> Rect {
@@ -76,6 +83,15 @@ fn activity_search_block(bar: Rect) -> Rect {
     }
 }
 
+fn activity_remote_block(bar: Rect) -> Rect {
+    Rect {
+        x: bar.x,
+        y: activity_remote_y(bar),
+        width: bar.width,
+        height: ACTIVITY_ICON_HEIGHT,
+    }
+}
+
 #[derive(Default, Clone, Copy)]
 struct SidebarAreas {
     /// Block occupied by the Explorer activity-bar icon, in absolute coords.
@@ -84,6 +100,8 @@ struct SidebarAreas {
     explorer_icon: Rect,
     /// Block occupied by the Search activity-bar icon, in absolute coords.
     search_icon: Rect,
+    /// Block occupied by the Remote Explorer activity-bar icon, in absolute coords.
+    remote_icon: Rect,
 }
 
 /// Pre-encoded iTerm2 OSC-1337 inline-image escape sequences for each icon
@@ -95,6 +113,8 @@ struct ActivityBarImages {
     explorer_inactive: String,
     search_active: String,
     search_inactive: String,
+    remote_active: String,
+    remote_inactive: String,
 }
 
 /// Single source of truth for the application's user-facing name.
@@ -231,6 +251,7 @@ struct Prompt {
 pub struct App {
     pub tree: FileTree,
     pub search: SearchPanel,
+    pub remote: RemotePanel,
     pub editor: EditorTabs,
     pub terminal: PtyTerminal,
     sidebar_view: SidebarView,
@@ -336,6 +357,7 @@ pub struct App {
     fs_poll_last_check: std::time::Instant,
     fs_poll_dir_mtimes: std::collections::BTreeMap<PathBuf, Option<std::time::SystemTime>>,
     fs_poll_open_file_mtime: Option<(PathBuf, Option<(std::time::SystemTime, u64)>)>,
+    remote_launch: Option<RemoteLaunch>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -344,6 +366,12 @@ struct WelcomeLayout {
     cell_y: u16,
     cell_w: u16,
     cell_h: u16,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RemoteLaunch {
+    host: String,
+    path: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -507,6 +535,7 @@ impl App {
     pub fn new(root: PathBuf) -> Result<Self> {
         let tree = FileTree::new(root.clone());
         let search = SearchPanel::new(root.clone());
+        let remote = RemotePanel::new();
         let editor = EditorTabs::new();
         let term = PtyTerminal::new(&root).context("spawning terminal")?;
 
@@ -555,6 +584,7 @@ impl App {
         Ok(Self {
             tree,
             search,
+            remote,
             editor,
             terminal: term,
             sidebar_view: SidebarView::Explorer,
@@ -593,18 +623,16 @@ impl App {
             fs_poll_last_check: std::time::Instant::now(),
             fs_poll_dir_mtimes,
             fs_poll_open_file_mtime: None,
+            remote_launch: None,
         })
     }
 
     /// Detect inline-image support via env vars only — no stdin queries, no
     /// raw-mode contention. Queries the terminal cell pixel size via
-    /// crossterm's `window_size` (TIOCGWINSZ ioctl, no stdin involvement),
-    /// then composes each icon PNG at the *exact* viewport pixel size
-    /// (4 cells × 2 rows in the user's font). With the canvas matching the
-    /// viewport pixel-for-pixel, iTerm2 displays the image with zero
-    /// leftover bg sliver and zero stretching — the codicon stays visually
-    /// square because it lives inside a `min(w, h)` sub-square of the
-    /// canvas, with bar-bg padding filling the longer axis.
+    /// crossterm's `window_size` (TIOCGWINSZ ioctl, no stdin involvement).
+    /// SSH PTYs often report only rows/columns and leave pixel dimensions
+    /// as zero, so fall back to a sane 10×20 cell estimate; OSC-1337 still
+    /// scales the image to the requested cell rectangle.
     pub fn init_graphics(&mut self) {
         if !crate::iterm2_inline::detect_iterm2_inline_support() {
             return;
@@ -612,11 +640,17 @@ impl App {
         let Ok(ws) = crossterm::terminal::window_size() else {
             return;
         };
-        if ws.columns == 0 || ws.rows == 0 || ws.width == 0 || ws.height == 0 {
+        if ws.columns == 0 || ws.rows == 0 {
             return;
         }
-        let cell_w = (ws.width / ws.columns).max(1) as u32;
-        let cell_h = (ws.height / ws.rows).max(1) as u32;
+        let (cell_w, cell_h) = if ws.width > 0 && ws.height > 0 {
+            (
+                (ws.width / ws.columns).max(1) as u32,
+                (ws.height / ws.rows).max(1) as u32,
+            )
+        } else {
+            FALLBACK_CELL_PIXEL
+        };
         self.cell_pixel = Some((cell_w, cell_h));
         let canvas_w = cell_w * ACTIVITY_BAR_WIDTH as u32;
         let canvas_h = cell_h * ACTIVITY_ICON_HEIGHT as u32;
@@ -649,14 +683,23 @@ impl App {
         let explorer_inactive = encode(crate::iterm2_inline::EXPLORER_SRC_PNG, false);
         let search_active = encode(crate::iterm2_inline::SEARCH_SRC_PNG, true);
         let search_inactive = encode(crate::iterm2_inline::SEARCH_SRC_PNG, false);
-        if let (Some(ea), Some(ei), Some(sa), Some(si)) =
-            (explorer_active, explorer_inactive, search_active, search_inactive)
-        {
+        let remote_active = encode(crate::iterm2_inline::REMOTE_SRC_PNG, true);
+        let remote_inactive = encode(crate::iterm2_inline::REMOTE_SRC_PNG, false);
+        if let (Some(ea), Some(ei), Some(sa), Some(si), Some(ra), Some(ri)) = (
+            explorer_active,
+            explorer_inactive,
+            search_active,
+            search_inactive,
+            remote_active,
+            remote_inactive,
+        ) {
             self.activity_images = Some(ActivityBarImages {
                 explorer_active: ea,
                 explorer_inactive: ei,
                 search_active: sa,
                 search_inactive: si,
+                remote_active: ra,
+                remote_inactive: ri,
             });
         }
     }
@@ -671,7 +714,8 @@ impl App {
         };
         let exp_block = self.sidebar_areas.explorer_icon;
         let sea_block = self.sidebar_areas.search_icon;
-        if exp_block.width == 0 || sea_block.width == 0 {
+        let rem_block = self.sidebar_areas.remote_icon;
+        if exp_block.width == 0 || sea_block.width == 0 || rem_block.width == 0 {
             return Vec::new();
         }
         let exp_state = if self.sidebar_view == SidebarView::Explorer {
@@ -684,9 +728,15 @@ impl App {
         } else {
             &images.search_inactive
         };
+        let rem_state = if self.sidebar_view == SidebarView::Remote {
+            &images.remote_active
+        } else {
+            &images.remote_inactive
+        };
         vec![
             ((exp_block.x, exp_block.y), exp_state.as_str()),
             ((sea_block.x, sea_block.y), sea_state.as_str()),
+            ((rem_block.x, rem_block.y), rem_state.as_str()),
         ]
     }
 
@@ -1279,40 +1329,57 @@ impl App {
         let bg_color = bg.bg.unwrap_or(Color::Reset);
         let explorer_block = activity_explorer_block(area);
         let search_block = activity_search_block(area);
+        let remote_block = activity_remote_block(area);
         let explorer_active = self.sidebar_view == SidebarView::Explorer;
         let search_active = self.sidebar_view == SidebarView::Search;
+        let remote_active = self.sidebar_view == SidebarView::Remote;
+
+        let active_color = Color::White;
+        let inactive_color = Color::Rgb(0x6c, 0x7d, 0x9c);
+        let glyph_x = activity_icon_glyph_x(area);
+        let render_glyph =
+            |frame: &mut ratatui::Frame, block: Rect, glyph: char, is_active: bool| {
+                let mid = block.y + block.height.saturating_sub(1) / 2;
+                if is_active {
+                    let pill = Rect {
+                        x: block.x,
+                        y: mid,
+                        width: 1,
+                        height: 1,
+                    };
+                    frame.render_widget(
+                        ratatui::widgets::Paragraph::new("▎")
+                            .style(Style::default().fg(active_bar).bg(bg_color)),
+                        pill,
+                    );
+                }
+                let cell = Rect {
+                    x: glyph_x,
+                    y: mid,
+                    width: 1,
+                    height: 1,
+                };
+                let color = if is_active {
+                    active_color
+                } else {
+                    inactive_color
+                };
+                frame.render_widget(
+                    ratatui::widgets::Paragraph::new(glyph.to_string()).style(
+                        Style::default()
+                            .fg(color)
+                            .bg(bg_color)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    cell,
+                );
+            };
 
         if self.activity_images.is_none() {
             // Glyph fallback path: render the codicon and a separate active
             // pill on the leftmost column. iTerm2's image path bakes the
             // pill into the PNG itself, so this branch is only used on
             // terminals that can't render OSC-1337.
-            let active_color = Color::White;
-            let inactive_color = Color::Rgb(0x6c, 0x7d, 0x9c);
-            let glyph_x = activity_icon_glyph_x(area);
-            let render_glyph =
-                |frame: &mut ratatui::Frame, block: Rect, glyph: char, is_active: bool| {
-                    let mid = block.y + block.height.saturating_sub(1) / 2;
-                    if is_active {
-                        let pill = Rect { x: block.x, y: mid, width: 1, height: 1 };
-                        frame.render_widget(
-                            ratatui::widgets::Paragraph::new("▎")
-                                .style(Style::default().fg(active_bar).bg(bg_color)),
-                            pill,
-                        );
-                    }
-                    let cell = Rect { x: glyph_x, y: mid, width: 1, height: 1 };
-                    let color = if is_active { active_color } else { inactive_color };
-                    frame.render_widget(
-                        ratatui::widgets::Paragraph::new(glyph.to_string()).style(
-                            Style::default()
-                                .fg(color)
-                                .bg(bg_color)
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                        cell,
-                    );
-                };
             render_glyph(
                 frame,
                 explorer_block,
@@ -1325,10 +1392,17 @@ impl App {
                 crate::icons::ACTIVITY_SEARCH,
                 search_active,
             );
+            render_glyph(
+                frame,
+                remote_block,
+                crate::icons::ACTIVITY_REMOTE,
+                remote_active,
+            );
         }
 
         self.sidebar_areas.explorer_icon = explorer_block;
         self.sidebar_areas.search_icon = search_block;
+        self.sidebar_areas.remote_icon = remote_block;
     }
 
     fn set_sidebar_view(&mut self, view: SidebarView) {
@@ -1336,6 +1410,9 @@ impl App {
             self.activity_overlay_dirty = true;
         }
         self.sidebar_view = view;
+        if self.sidebar_view == SidebarView::Remote && self.remote.refresh_if_config_changed() {
+            self.status = String::from("Reloaded SSH remotes");
+        }
         if !self.show_tree {
             self.show_tree = true; // ensure the side panel is open when switching
         }
@@ -1344,6 +1421,7 @@ impl App {
             SidebarView::Search => {
                 self.focus_pane(Pane::Tree); // tree pane = side panel; dispatch by view
             }
+            SidebarView::Remote => self.focus_pane(Pane::Tree),
         }
     }
 
@@ -1378,6 +1456,7 @@ impl App {
     fn sync_focus_flags(&mut self) {
         self.tree.focused = self.focus == Pane::Tree && self.sidebar_view == SidebarView::Explorer;
         self.search.focused = self.focus == Pane::Tree && self.sidebar_view == SidebarView::Search;
+        self.remote.focused = self.focus == Pane::Tree && self.sidebar_view == SidebarView::Remote;
         self.editor.focused = self.focus == Pane::Editor;
         self.terminal.focused = self.focus == Pane::Terminal;
     }
@@ -1432,6 +1511,7 @@ impl App {
             match self.sidebar_view {
                 SidebarView::Explorer => frame.render_widget(&mut self.tree, area),
                 SidebarView::Search => frame.render_widget(&mut self.search, area),
+                SidebarView::Remote => frame.render_widget(&mut self.remote, area),
             }
         }
         if self.editor.is_blank_initial() {
@@ -1683,6 +1763,7 @@ impl App {
             Pane::Tree => match self.sidebar_view {
                 SidebarView::Explorer => self.handle_tree_key(key),
                 SidebarView::Search => self.handle_search_key(key),
+                SidebarView::Remote => self.handle_remote_key(key),
             },
             Pane::Editor => {
                 self.handle_editor_key(key);
@@ -1763,6 +1844,43 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    fn handle_remote_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Up => self.remote.move_up(),
+            KeyCode::Down => self.remote.move_down(),
+            KeyCode::PageUp => self.remote.scroll_up(10),
+            KeyCode::PageDown => self.remote.scroll_down(10),
+            KeyCode::Char('r') | KeyCode::Char('R') => {
+                self.remote.refresh();
+                self.status = String::from("Refreshed SSH remotes");
+            }
+            KeyCode::Enter => {
+                if let Some(target) = self.remote.selected_target().cloned() {
+                    self.request_remote_launch(target.alias, None);
+                }
+            }
+            KeyCode::Esc => self.set_sidebar_view(SidebarView::Explorer),
+            _ => {}
+        }
+    }
+
+    fn request_remote_launch(&mut self, host: String, path: Option<String>) {
+        self.status = format!("Connecting to {host}");
+        self.remote_launch = Some(RemoteLaunch { host, path });
+        self.quit = true;
+    }
+
+    fn refresh_remote_if_config_changed(&mut self) -> bool {
+        if self.sidebar_view != SidebarView::Remote {
+            return false;
+        }
+        if !self.remote.refresh_if_config_changed() {
+            return false;
+        }
+        self.status = String::from("Reloaded SSH remotes");
+        true
     }
 
     fn open_search_hit(&mut self, hit: &crate::widgets::search::SearchHit) {
@@ -2136,11 +2254,13 @@ impl App {
         let in_terminal = rect_contains(self.terminal.last_area, m.column, m.row);
         let in_tree_scrollbar = self.sidebar_view == SidebarView::Explorer
             && rect_contains(self.tree.last_scrollbar, m.column, m.row);
+        let in_remote_scrollbar = self.sidebar_view == SidebarView::Remote
+            && rect_contains(self.remote.last_scrollbar, m.column, m.row);
         let in_editor_scrollbar = rect_contains(self.editor.last_scrollbar, m.column, m.row);
 
         match m.kind {
             MouseEventKind::Down(MouseButton::Right) => {
-                if in_tree {
+                if in_tree && self.sidebar_view == SidebarView::Explorer {
                     self.focus_pane(Pane::Tree);
                     let node_idx = self.tree.node_at_y(m.row).inspect(|&i| {
                         self.tree.select(i);
@@ -2174,6 +2294,10 @@ impl App {
                     self.set_sidebar_view(SidebarView::Search);
                     return;
                 }
+                if rect_contains(self.sidebar_areas.remote_icon, m.column, m.row) {
+                    self.set_sidebar_view(SidebarView::Remote);
+                    return;
+                }
                 if in_editor_pane
                     && self.editor.is_blank_initial()
                     && self.activate_welcome_link(m.column, m.row)
@@ -2183,6 +2307,13 @@ impl App {
                 if in_tree_scrollbar {
                     self.focus_pane(Pane::Tree);
                     self.tree.scroll_to_bar_y(m.row);
+                    self.scrollbar_drag = Some(Pane::Tree);
+                    self.last_tree_left_down = None;
+                    return;
+                }
+                if in_remote_scrollbar {
+                    self.focus_pane(Pane::Tree);
+                    self.remote.scroll_to_bar_y(m.row);
                     self.scrollbar_drag = Some(Pane::Tree);
                     self.last_tree_left_down = None;
                     return;
@@ -2228,7 +2359,30 @@ impl App {
                     }
                     return;
                 }
-                if in_tree {
+                if in_tree && self.sidebar_view == SidebarView::Remote {
+                    self.focus_pane(Pane::Tree);
+                    if let Some(idx) = self.remote.target_at_y(m.row) {
+                        self.remote.select(idx);
+                        let now = std::time::Instant::now();
+                        let is_double = matches!(
+                            self.last_tree_left_down,
+                            Some((t, x, y))
+                                if m.row == y
+                                    && m.column.abs_diff(x) <= 1
+                                    && now.duration_since(t) <= DOUBLE_CLICK_WINDOW
+                        );
+                        if is_double {
+                            if let Some(target) = self.remote.selected_target().cloned() {
+                                self.request_remote_launch(target.alias, None);
+                            }
+                            self.last_tree_left_down = None;
+                        } else {
+                            self.last_tree_left_down = Some((now, m.column, m.row));
+                        }
+                    }
+                    return;
+                }
+                if in_tree && self.sidebar_view == SidebarView::Explorer {
                     self.focus_pane(Pane::Tree);
                     if let Some(idx) = self.tree.node_at_y(m.row) {
                         self.tree.select(idx);
@@ -2319,9 +2473,15 @@ impl App {
             MouseEventKind::Drag(MouseButton::Left) => {
                 if let Some(pane) = self.scrollbar_drag {
                     match pane {
-                        Pane::Tree => {
-                            self.tree.scroll_to_bar_y(m.row);
-                        }
+                        Pane::Tree => match self.sidebar_view {
+                            SidebarView::Explorer => {
+                                self.tree.scroll_to_bar_y(m.row);
+                            }
+                            SidebarView::Remote => {
+                                self.remote.scroll_to_bar_y(m.row);
+                            }
+                            SidebarView::Search => {}
+                        },
                         Pane::Editor => {
                             self.editor.scroll_to_bar_y(m.row);
                             self.poke_cursor();
@@ -2347,8 +2507,18 @@ impl App {
                     self.editor.mouse_drag(m.column, m.row);
                     self.poke_cursor();
                 } else if in_tree {
-                    if let Some(idx) = self.tree.node_at_y(m.row) {
-                        self.tree.select(idx);
+                    match self.sidebar_view {
+                        SidebarView::Explorer => {
+                            if let Some(idx) = self.tree.node_at_y(m.row) {
+                                self.tree.select(idx);
+                            }
+                        }
+                        SidebarView::Remote => {
+                            if let Some(idx) = self.remote.target_at_y(m.row) {
+                                self.remote.select(idx);
+                            }
+                        }
+                        SidebarView::Search => {}
                     }
                 } else if in_terminal {
                     self.terminal.extend_selection_to(m.column, m.row);
@@ -2376,8 +2546,12 @@ impl App {
                 }
             }
             MouseEventKind::ScrollDown => {
-                if in_tree && self.sidebar_view == SidebarView::Explorer {
-                    self.tree.scroll_down(3);
+                if in_tree {
+                    match self.sidebar_view {
+                        SidebarView::Explorer => self.tree.scroll_down(3),
+                        SidebarView::Remote => self.remote.scroll_down(3),
+                        SidebarView::Search => {}
+                    }
                 } else if in_editor {
                     self.editor.scroll_down(3);
                 } else if in_terminal {
@@ -2389,8 +2563,12 @@ impl App {
                 }
             }
             MouseEventKind::ScrollUp => {
-                if in_tree && self.sidebar_view == SidebarView::Explorer {
-                    self.tree.scroll_up(3);
+                if in_tree {
+                    match self.sidebar_view {
+                        SidebarView::Explorer => self.tree.scroll_up(3),
+                        SidebarView::Remote => self.remote.scroll_up(3),
+                        SidebarView::Search => {}
+                    }
                 } else if in_editor {
                     self.editor.scroll_up(3);
                 } else if in_terminal {
@@ -4098,7 +4276,11 @@ pub fn run(root: PathBuf) -> Result<()> {
     .ok();
     terminal.show_cursor().ok();
 
-    result
+    result?;
+    if let Some(remote) = app.remote_launch.take() {
+        crate::remote::launch_croft(&remote.host, remote.path.as_deref())?;
+    }
+    Ok(())
 }
 
 fn main_loop(
@@ -4119,8 +4301,9 @@ fn main_loop(
         let blink_changed = blink_visible != last_blink_visible;
         let commits_changed = app.drain_recent_commits();
         let search_changed = app.drain_search_results();
+        let remote_changed = app.refresh_remote_if_config_changed();
 
-        if needs_redraw || fs_changed || pty_changed || blink_changed || commits_changed || search_changed {
+        if needs_redraw || fs_changed || pty_changed || blink_changed || commits_changed || search_changed || remote_changed {
             // If the welcome OSC-1337 image was painted earlier and the
             // user has just opened a file, wipe the screen so iTerm drops
             // its cached image cells AND ratatui repaints every cell on

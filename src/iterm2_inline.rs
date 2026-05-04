@@ -5,6 +5,8 @@ pub const EXPLORER_SRC_PNG: &[u8] =
     include_bytes!("../assets/icons/explorer_src.png");
 pub const SEARCH_SRC_PNG: &[u8] =
     include_bytes!("../assets/icons/search_src.png");
+pub const REMOTE_SRC_PNG: &[u8] =
+    include_bytes!("../assets/icons/remote_src.png");
 pub const WELCOME_LOGO_PNG: &[u8] =
     include_bytes!("../assets/logo-tight-removebg-preview.png");
 
@@ -75,12 +77,24 @@ pub fn is_iterm2_term_program(value: Option<&str>) -> bool {
     matches!(value, Some("iTerm.app") | Some("WezTerm") | Some("ghostty"))
 }
 
+pub fn force_inline_images(value: Option<&str>) -> bool {
+    value.is_some_and(|v| {
+        matches!(
+            v.to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
 pub fn is_tmux_env(term: Option<&str>, tmux_var: Option<&str>) -> bool {
     tmux_var.is_some_and(|v| !v.is_empty())
         || term.is_some_and(|v| v.starts_with("tmux") || v.starts_with("screen"))
 }
 
 pub fn detect_iterm2_inline_support() -> bool {
+    if force_inline_images(std::env::var("CROFT_FORCE_INLINE_IMAGES").ok().as_deref()) {
+        return true;
+    }
     let term_program = std::env::var("TERM_PROGRAM").ok();
     is_iterm2_term_program(term_program.as_deref())
 }
@@ -180,6 +194,15 @@ mod tests {
     #[test]
     fn missing_term_program_is_not_iterm2() {
         assert!(!is_iterm2_term_program(None));
+    }
+
+    #[test]
+    fn force_inline_images_accepts_true_values() {
+        assert!(force_inline_images(Some("1")));
+        assert!(force_inline_images(Some("true")));
+        assert!(force_inline_images(Some("yes")));
+        assert!(!force_inline_images(Some("0")));
+        assert!(!force_inline_images(None));
     }
 
     #[test]

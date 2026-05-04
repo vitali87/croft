@@ -20,6 +20,7 @@ pub const CHEVRON_OPEN: char = '▾';
 /// `cod-file_pdf` and renders the literal "PDF" document.
 pub const ACTIVITY_EXPLORER: char = '\u{eaf0}';
 pub const ACTIVITY_SEARCH: char = '\u{ea6d}';
+pub const ACTIVITY_REMOTE: char = '\u{eb39}';
 
 pub fn for_path(name: &str, suffix: &str) -> Icon {
     let n = name.to_ascii_lowercase();
@@ -160,6 +161,12 @@ mod tests {
     #[test]
     fn activity_bar_search_glyph_is_cod_search() {
         assert_eq!(ACTIVITY_SEARCH, '\u{ea6d}');
+    }
+
+    #[test]
+    fn activity_bar_remote_glyph_is_cod_remote_explorer() {
+        assert_eq!(ACTIVITY_REMOTE, '\u{eb39}');
+        assert_ne!(ACTIVITY_REMOTE, '\u{eb3c}', "U+EB3C is not the Remote Explorer glyph");
     }
 
     #[test]

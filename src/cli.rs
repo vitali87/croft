@@ -51,6 +51,13 @@ pub enum CliCommand {
         #[arg(short, long, default_value_t = false)]
         yes: bool,
     },
+    /// Launch croft on a remote SSH host.
+    Remote {
+        /// SSH host alias from ~/.ssh/config, or any host accepted by ssh.
+        host: String,
+        /// Remote workspace folder to open.
+        path: Option<String>,
+    },
 }
 
 impl Cli {
@@ -62,6 +69,9 @@ impl Cli {
             Some(CliCommand::Keys) => keys_diagnostic(),
             Some(CliCommand::SetupIterm2 { font, nonascii, size, yes }) => {
                 setup_iterm2(&font, &nonascii, size, yes)
+            }
+            Some(CliCommand::Remote { host, path }) => {
+                crate::remote::launch_croft(&host, path.as_deref())
             }
             None => {
                 let path = self
@@ -182,6 +192,18 @@ mod tests {
                 assert!(yes);
             }
             _ => panic!("expected SetupIterm2"),
+        }
+    }
+
+    #[test]
+    fn parses_remote_command() {
+        let cli = Cli::parse_from(["croft", "remote", "reasoner", "/work"]);
+        match cli.command {
+            Some(CliCommand::Remote { host, path }) => {
+                assert_eq!(host, "reasoner");
+                assert_eq!(path, Some(String::from("/work")));
+            }
+            _ => panic!("expected Remote"),
         }
     }
 }
