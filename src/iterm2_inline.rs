@@ -6,17 +6,19 @@ pub const EXPLORER_SRC_PNG: &[u8] =
 pub const SEARCH_SRC_PNG: &[u8] =
     include_bytes!("../assets/icons/search_src.png");
 pub const WELCOME_LOGO_PNG: &[u8] =
-    include_bytes!("../assets/logo-tight.png");
+    include_bytes!("../assets/logo-tight-removebg-preview.png");
 
 /// Re-encode a PNG so its pixel dimensions exactly match the requested
-/// (canvas_w_px, canvas_h_px). The source image is scaled with Lanczos3
-/// while preserving aspect ratio — letterboxed onto a transparent canvas
-/// so the rendered cell area shows zero stretching. Used by the welcome
-/// screen to bake the croft wordmark to the iTerm2 cell viewport.
+/// `(canvas_w_px, canvas_h_px)`. The source image is scaled with Lanczos3
+/// while preserving aspect ratio and letterboxed onto `bg`. Pass an
+/// `Rgba([_, _, _, 0])` to keep transparent letterboxing — iTerm will then
+/// blend the image against whatever cell background lies beneath, which
+/// is what we want for theme-agnostic welcome rendering.
 pub fn fit_image(
     src_png: &[u8],
     canvas_w_px: u32,
     canvas_h_px: u32,
+    bg: Rgba<u8>,
 ) -> Result<Vec<u8>, image::ImageError> {
     let img = image::load_from_memory_with_format(src_png, image::ImageFormat::Png)?
         .to_rgba8();
@@ -33,11 +35,11 @@ pub fn fit_image(
         new_h,
         image::imageops::FilterType::Lanczos3,
     );
-    let mut canvas: RgbaImage = ImageBuffer::from_pixel(
-        canvas_w_px,
-        canvas_h_px,
-        Rgba([0, 0, 0, 0]),
-    );
+    // Letterbox onto a fully transparent canvas. The OSC-1337 emit is
+    // paired with an iTerm `SetColors=bg=srgb:…` override at startup so
+    // the SGR-painted editor pane bg and the PNG's transparent areas
+    // both flow through sRGB → display, matching pixel-for-pixel.
+    let mut canvas: RgbaImage = ImageBuffer::from_pixel(canvas_w_px, canvas_h_px, bg);
     let off_x = ((canvas_w_px - new_w) / 2) as i64;
     let off_y = ((canvas_h_px - new_h) / 2) as i64;
     image::imageops::overlay(&mut canvas, &scaled, off_x, off_y);

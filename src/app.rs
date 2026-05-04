@@ -36,6 +36,13 @@ pub enum SidebarView {
 }
 
 const ACTIVITY_BAR_WIDTH: u16 = 4;
+
+/// Single source of truth for the editor pane background. Used both as
+/// ratatui's bg style and as the canvas fill behind the welcome OSC-1337
+/// image, so the wordmark seamlessly merges with the pane. When the IDE
+/// later supports themes, swap this for a lookup against the active theme
+/// and the welcome image will re-bake automatically on the next render.
+const EDITOR_BG_RGB: (u8, u8, u8) = (0x1e, 0x22, 0x2e);
 const ACTIVITY_ICON_HEIGHT: u16 = 2;
 const ACTIVITY_ICON_GAP: u16 = 0;
 
@@ -567,7 +574,7 @@ impl App {
         if area.width == 0 || area.height == 0 {
             return;
         }
-        let bg = Style::default().bg(Color::Rgb(0x1e, 0x22, 0x2e));
+        let bg = Style::default().bg(Color::Rgb(EDITOR_BG_RGB.0, EDITOR_BG_RGB.1, EDITOR_BG_RGB.2));
         frame.render_widget(
             ratatui::widgets::Block::default().style(bg),
             area,
@@ -606,10 +613,17 @@ impl App {
             if let Some((cw, ch)) = self.cell_pixel {
                 let canvas_w = (logo_w_cells as u32) * cw;
                 let canvas_h = (logo_h_cells as u32) * ch;
+                // Fully transparent letterbox so iTerm composites the
+                // wordmark against the SGR-painted editor pane bg directly.
+                // Combined with the `SetColors=bg=srgb:…` override emitted
+                // in `run()`, both surfaces flow through sRGB → display and
+                // colour-match exactly.
+                let bg = image::Rgba([0, 0, 0, 0]);
                 if let Ok(baked) = crate::iterm2_inline::fit_image(
                     crate::iterm2_inline::WELCOME_LOGO_PNG,
                     canvas_w,
                     canvas_h,
+                    bg,
                 ) {
                     let raw = crate::iterm2_inline::build_inline_image_osc(
                         &baked,
@@ -2620,6 +2634,19 @@ pub fn run(root: PathBuf) -> Result<()> {
     {
         use std::io::Write;
         out.write_all(&set_title_seq(&title)).ok();
+        // iTerm2 interprets SGR truecolor as Apple Generic RGB by default,
+        // but OSC-1337 inline images are decoded as sRGB — same hex value
+        // displays as different on-screen pixels, which makes welcome-image
+        // bg vs editor-pane bg visibly mismatch. Forcing the iTerm bg
+        // colour into sRGB makes both surfaces flow through the same
+        // colour space (https://gitlab.com/gnachman/iterm2/-/issues/12529).
+        if crate::iterm2_inline::detect_iterm2_inline_support() {
+            let bg_seq = format!(
+                "\x1b]1337;SetColors=bg=srgb:{:02x}{:02x}{:02x}\x07",
+                EDITOR_BG_RGB.0, EDITOR_BG_RGB.1, EDITOR_BG_RGB.2,
+            );
+            out.write_all(bg_seq.as_bytes()).ok();
+        }
         out.flush().ok();
     }
     // Env-var-only iTerm2 detection: no stdin queries, so this can't
