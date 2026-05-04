@@ -1439,6 +1439,10 @@ impl App {
                     self.search.delete_selection();
                     self.search.query.push(c);
                     self.submit_search_query();
+                } else if key.modifiers.contains(KeyModifiers::SUPER) {
+                    self.status = format!("Search: unhandled Cmd+{c}");
+                } else if key.modifiers.contains(KeyModifiers::CONTROL) {
+                    self.status = format!("Search: unhandled Ctrl+{c}");
                 }
             }
             _ => {}
@@ -1694,8 +1698,12 @@ impl App {
     }
 
     fn paste_clipboard_into_search(&mut self, text: Option<&str>) {
-        let Some(s) = text else { return };
+        let Some(s) = text else {
+            self.status = String::from("Cmd+V: clipboard read failed (pbpaste)");
+            return;
+        };
         if s.is_empty() {
+            self.status = String::from("Cmd+V: clipboard is empty");
             return;
         }
         self.search.insert_str_into_query(s);
@@ -3263,6 +3271,49 @@ mod tests {
         app.search.query = String::from("foo");
         app.paste_clipboard_into_search(None);
         assert_eq!(app.search.query, "foo");
+    }
+
+    #[test]
+    fn paste_clipboard_into_search_with_no_text_sets_diagnostic_status() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.set_sidebar_view(SidebarView::Search);
+        app.paste_clipboard_into_search(None);
+        assert!(
+            app.status.to_lowercase().contains("clipboard"),
+            "expected diagnostic status mentioning the clipboard, got: {:?}",
+            app.status
+        );
+    }
+
+    #[test]
+    fn paste_clipboard_into_search_with_empty_text_sets_diagnostic_status() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.set_sidebar_view(SidebarView::Search);
+        app.paste_clipboard_into_search(Some(""));
+        assert!(
+            app.status.to_lowercase().contains("clipboard"),
+            "expected diagnostic status mentioning the clipboard, got: {:?}",
+            app.status
+        );
+    }
+
+    #[test]
+    fn unmatched_cmd_key_in_search_logs_diagnostic_status() {
+        // If iTerm or the kitty CSI u path delivers a Cmd+<letter> the search
+        // handler doesn't recognise, leave a breadcrumb so the user can tell
+        // us exactly what crossterm saw — this is how we'll diagnose Cmd+V
+        // delivery problems without an interactive debugger.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.set_sidebar_view(SidebarView::Search);
+        app.handle_search_key(key(KeyCode::Char('q'), KeyModifiers::SUPER));
+        assert!(
+            app.status.contains("Cmd+"),
+            "expected unhandled-cmd diagnostic, got: {:?}",
+            app.status
+        );
     }
 
     #[test]
