@@ -288,13 +288,14 @@ pub struct App {
     /// processes the image.
     activity_overlay_dirty: bool,
     /// Drives the welcome screen's "Recent" list. Always sourced from the
-    /// croft project's Bitbucket repo (live HTTP fetch on every launch),
-    /// never from the workspace the user opened — the goal is to surface
-    /// croft's own progress to the developer.
+    /// croft repository remote baked into this binary at build time, never
+    /// from the workspace the user opened.
+    recent_repo_remote: Option<String>,
     recent_commits: Vec<crate::git::CommitInfo>,
+    welcome_links: Vec<WelcomeLink>,
     /// Receiver for the background HTTP fetch of croft's recent commits.
     /// `None` once the fetch has completed (or failed) and been drained.
-    recent_commits_rx: Option<std::sync::mpsc::Receiver<Vec<crate::git::CommitInfo>>>,
+    recent_commits_rx: Option<std::sync::mpsc::Receiver<crate::git::RecentCommits>>,
     /// Channel to the background search worker. Each keystroke or toggle
     /// flip pushes a `(query, opts)` request here; the worker debounces
     /// and runs `search_workspace` off the UI thread.
@@ -343,6 +344,13 @@ struct WelcomeLayout {
     cell_h: u16,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WelcomeLink {
+    rect: Rect,
+    url: String,
+    label: String,
+}
+
 const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(500);
 
 type FsWatcherInit = (
@@ -352,6 +360,146 @@ type FsWatcherInit = (
     >,
     std::sync::mpsc::Receiver<notify_debouncer_full::DebounceEventResult>,
 );
+
+fn welcome_provider_label(remote: &str) -> &'static str {
+    crate::git::commit_api_provider_for_remote(remote)
+        .map(crate::git::CommitApiProvider::label)
+        .unwrap_or("Repo")
+}
+
+fn welcome_provider_badge(remote: &str) -> String {
+    match crate::git::commit_api_provider_for_remote(remote) {
+        Some(crate::git::CommitApiProvider::Bitbucket) => "\u{f171} Bitbucket".to_string(),
+        Some(crate::git::CommitApiProvider::GitHub) => "\u{f09b} GitHub".to_string(),
+        None => "Repo".to_string(),
+    }
+}
+
+fn split_at_char_count(s: &str, count: usize) -> (String, String) {
+    let left: String = s.chars().take(count).collect();
+    let right: String = s.chars().skip(count).collect();
+    (left, right)
+}
+
+fn wrap_cells_variable_width(text: &str, first_width: u16, rest_width: u16) -> Vec<String> {
+    let first_width = first_width.max(1) as usize;
+    let rest_width = rest_width.max(1) as usize;
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return vec![String::new()];
+    }
+
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in trimmed.split_whitespace() {
+        let mut remaining = word.to_string();
+        while !remaining.is_empty() {
+            let width = if lines.is_empty() { first_width } else { rest_width };
+            let sep = usize::from(!current.is_empty());
+            let remaining_len = remaining.chars().count();
+            let current_len = current.chars().count();
+            if current_len + sep + remaining_len <= width {
+                if sep == 1 {
+                    current.push(' ');
+                }
+                current.push_str(&remaining);
+                break;
+            }
+            if !current.is_empty() {
+                lines.push(std::mem::take(&mut current));
+                continue;
+            }
+            let (head, tail) = split_at_char_count(&remaining, width);
+            lines.push(head);
+            remaining = tail;
+        }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    if lines.is_empty() {
+        vec![String::new()]
+    } else {
+        lines
+    }
+}
+
+fn welcome_commit_widths(
+    commit: &crate::git::CommitInfo,
+    block_w: u16,
+) -> (u16, u16) {
+    let hash_w = commit.hash.chars().count() as u16;
+    let when_w = commit.when.chars().count() as u16;
+    let prefix_w = hash_w.saturating_add(1);
+    let first = block_w
+        .saturating_sub(prefix_w)
+        .saturating_sub(when_w.saturating_add(2))
+        .max(1);
+    let rest = block_w.saturating_sub(prefix_w).max(1);
+    (first, rest)
+}
+
+fn wrapped_welcome_commit_subject(
+    commit: &crate::git::CommitInfo,
+    block_w: u16,
+) -> Vec<String> {
+    let (first, rest) = welcome_commit_widths(commit, block_w);
+    wrap_cells_variable_width(&commit.subject, first, rest)
+}
+
+fn welcome_commit_row_height(commit: &crate::git::CommitInfo, block_w: u16) -> u16 {
+    wrapped_welcome_commit_subject(commit, block_w).len().max(1) as u16
+}
+
+fn welcome_recents_height(
+    remote: Option<&str>,
+    commits: &[crate::git::CommitInfo],
+    block_w: u16,
+) -> u16 {
+    if remote.is_none() && commits.is_empty() {
+        return 0;
+    }
+    let remote_h = u16::from(remote.is_some());
+    let commit_h = if commits.is_empty() {
+        0
+    } else {
+        1 + commits
+            .iter()
+            .map(|c| welcome_commit_row_height(c, block_w))
+            .sum::<u16>()
+    };
+    1 + remote_h + commit_h
+}
+
+fn open_url(url: &str) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    let mut cmd = {
+        let mut c = std::process::Command::new("open");
+        c.arg(url);
+        c
+    };
+    #[cfg(target_os = "linux")]
+    let mut cmd = {
+        let mut c = std::process::Command::new("xdg-open");
+        c.arg(url);
+        c
+    };
+    #[cfg(target_os = "windows")]
+    let mut cmd = {
+        let mut c = std::process::Command::new("cmd");
+        c.args(["/C", "start", "", url]);
+        c
+    };
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    let mut cmd = {
+        let mut c = std::process::Command::new("open");
+        c.arg(url);
+        c
+    };
+    cmd.spawn()
+        .with_context(|| format!("opening {url}"))?;
+    Ok(())
+}
 
 impl App {
     pub fn new(root: PathBuf) -> Result<Self> {
@@ -384,6 +532,7 @@ impl App {
         });
 
         let (commits_tx, commits_rx) = std::sync::mpsc::channel();
+        let recent_repo_remote = crate::git::croft_repository_remote();
         std::thread::spawn(move || {
             let timeout = std::time::Duration::from_secs(3);
             let commits = crate::git::fetch_croft_recent_commits(timeout);
@@ -426,7 +575,9 @@ impl App {
             last_editor_left_down: None,
             last_tree_left_down: None,
             activity_overlay_dirty: true,
+            recent_repo_remote,
             recent_commits: Vec::new(),
+            welcome_links: Vec::new(),
             recent_commits_rx: Some(commits_rx),
             search_query_tx,
             search_results_rx,
@@ -793,7 +944,8 @@ impl App {
         };
         match rx.try_recv() {
             Ok(commits) => {
-                self.recent_commits = commits;
+                self.recent_repo_remote = commits.remote;
+                self.recent_commits = commits.commits;
                 self.recent_commits_rx = None;
                 self.welcome_overlay_dirty = true;
                 true
@@ -896,6 +1048,7 @@ impl App {
     }
 
     fn render_welcome(&mut self, frame: &mut ratatui::Frame, area: Rect) {
+        self.welcome_links.clear();
         if area.width == 0 || area.height == 0 {
             return;
         }
@@ -920,13 +1073,18 @@ impl App {
             area,
         );
 
-        // Reserve space for the recent-commits panel below the logo, then
+        // Reserve space for the repo/commit panel below the logo, then
         // hand the remainder to the centred image.
-        let recents_h: u16 = if self.recent_commits.is_empty() {
-            0
-        } else {
-            (self.recent_commits.len() as u16) + 2 // header + spacer
-        };
+        let block_left = area.x + area.width / 8;
+        let block_right = area.x + area.width - area.width / 8;
+        let block_w = block_right.saturating_sub(block_left);
+        let has_recent_panel =
+            self.recent_repo_remote.is_some() || !self.recent_commits.is_empty();
+        let recents_h = welcome_recents_height(
+            self.recent_repo_remote.as_deref(),
+            &self.recent_commits,
+            block_w,
+        );
         let logo_max_w = (area.width as u32).saturating_sub(4) as u16;
         let logo_max_h = area
             .height
@@ -1004,14 +1162,11 @@ impl App {
             );
         }
 
-        if self.recent_commits.is_empty() {
+        if !has_recent_panel {
             return;
         }
 
         let header_y = logo_y + logo_h_cells + 1;
-        let block_left = area.x + area.width / 8;
-        let block_right = area.x + area.width - area.width / 8;
-        let block_w = block_right.saturating_sub(block_left);
         let header = "RECENT";
         let header_style = Style::default()
             .fg(Color::Rgb(0x9d, 0xa5, 0xb4))
@@ -1021,31 +1176,74 @@ impl App {
             .set_string(block_left, header_y, header, header_style);
         let row_style = Style::default().fg(Color::Rgb(0xc5, 0xcd, 0xd9));
         let dim = Style::default().fg(Color::Rgb(0x6c, 0x7d, 0x9c));
-        for (i, c) in self.recent_commits.iter().enumerate() {
-            let y = header_y + 2 + i as u16;
+        let link_style = Style::default()
+            .fg(Color::Rgb(0x4e, 0x9a, 0xff))
+            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+        let mut row_y = header_y + 2;
+        if let Some(remote) = self.recent_repo_remote.as_ref() {
+            let remote_y = header_y + 1;
+            let provider = welcome_provider_label(remote);
+            let badge = welcome_provider_badge(remote);
+            frame
+                .buffer_mut()
+                .set_string(block_left, remote_y, &badge, link_style);
+            let badge_w = badge.chars().count() as u16;
+            let remote_x = block_left + badge_w + 1;
+            let room = block_left
+                .saturating_add(block_w)
+                .saturating_sub(remote_x) as usize;
+            let clipped: String = remote.chars().take(room).collect();
+            frame.buffer_mut().set_string(remote_x, remote_y, clipped, dim);
+            let link_w = badge_w
+                .saturating_add(1)
+                .saturating_add(room.min(remote.chars().count()) as u16)
+                .min(block_w);
+            self.welcome_links.push(WelcomeLink {
+                rect: Rect { x: block_left, y: remote_y, width: link_w, height: 1 },
+                url: remote.clone(),
+                label: format!("Open {provider} repository"),
+            });
+            row_y = header_y + 3;
+        }
+        for c in &self.recent_commits {
+            let y = row_y;
             if y >= area.y + area.height {
                 break;
             }
-            let mut x = block_left;
-            frame.buffer_mut().set_string(x, y, &c.hash, dim);
-            x += c.hash.chars().count() as u16 + 1;
+            let x = block_left;
+            frame.buffer_mut().set_string(x, y, &c.hash, link_style);
+            let subject_x = x + c.hash.chars().count() as u16 + 1;
             let when_w = c.when.chars().count() as u16;
             let row_end = block_left + block_w;
-            let subject_w = c.subject.chars().count() as u16;
-            let can_fit_when = x + subject_w + 2 + when_w <= row_end;
-            if can_fit_when {
-                frame.buffer_mut().set_string(x, y, &c.subject, row_style);
-                let when_x = row_end.saturating_sub(when_w);
-                frame.buffer_mut().set_string(when_x, y, &c.when, dim);
-            } else {
-                // Subject won't share the row with the relative date; show
-                // the full subject (clipped only at the welcome block's
-                // right edge) and drop the date for this row.
-                let room = row_end.saturating_sub(x);
-                let subject_clip: String =
-                    c.subject.chars().take(room as usize).collect();
-                frame.buffer_mut().set_string(x, y, &subject_clip, row_style);
+            let when_x = row_end.saturating_sub(when_w);
+            let subject_lines = wrapped_welcome_commit_subject(c, block_w);
+            for (line_idx, line) in subject_lines.iter().enumerate() {
+                let line_y = y + line_idx as u16;
+                if line_y >= area.y + area.height {
+                    break;
+                }
+                let room = if line_idx == 0 {
+                    when_x.saturating_sub(subject_x).saturating_sub(2)
+                } else {
+                    row_end.saturating_sub(subject_x)
+                };
+                let clipped: String = line.chars().take(room as usize).collect();
+                frame
+                    .buffer_mut()
+                    .set_string(subject_x, line_y, clipped, row_style);
             }
+            frame.buffer_mut().set_string(when_x, y, &c.when, dim);
+            if let Some(remote) = self.recent_repo_remote.as_ref() {
+                if let Some(url) = crate::git::commit_url_for_remote(remote, &c.full_hash) {
+                    let height = subject_lines.len().max(1) as u16;
+                    self.welcome_links.push(WelcomeLink {
+                        rect: Rect { x: block_left, y, width: block_w, height },
+                        url,
+                        label: format!("Open commit {}", c.hash),
+                    });
+                }
+            }
+            row_y = row_y.saturating_add(subject_lines.len().max(1) as u16);
         }
     }
 
@@ -1879,6 +2077,27 @@ impl App {
         }
     }
 
+    fn welcome_link_at(&self, col: u16, row: u16) -> Option<&WelcomeLink> {
+        self.welcome_links
+            .iter()
+            .find(|link| rect_contains(link.rect, col, row))
+    }
+
+    fn activate_welcome_link(&mut self, col: u16, row: u16) -> bool {
+        let Some(link) = self.welcome_link_at(col, row).cloned() else {
+            return false;
+        };
+        match open_url(&link.url) {
+            Ok(()) => {
+                self.status = link.label;
+            }
+            Err(e) => {
+                self.status = format!("Open link failed: {e}");
+            }
+        }
+        true
+    }
+
     fn handle_mouse(&mut self, m: MouseEvent) {
         // While a prompt is open, mouse events are ignored.
         if self.prompt.is_some() {
@@ -1947,6 +2166,12 @@ impl App {
                 }
                 if rect_contains(self.sidebar_areas.search_icon, m.column, m.row) {
                     self.set_sidebar_view(SidebarView::Search);
+                    return;
+                }
+                if in_editor_pane
+                    && self.editor.is_blank_initial()
+                    && self.activate_welcome_link(m.column, m.row)
+                {
                     return;
                 }
                 if in_tree && self.sidebar_view == SidebarView::Search {
@@ -2724,6 +2949,8 @@ mod tests {
     fn drain_fs_events_returns_false_when_nothing_pending() {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.fs_watcher_init_rx = None;
+        app.git_status_init_rx = None;
         for _ in 0..20 {
             let _ = app.drain_fs_events();
             std::thread::sleep(std::time::Duration::from_millis(10));
@@ -2849,6 +3076,45 @@ mod tests {
     fn rect_contains_zero_sized_is_empty() {
         let r = Rect { x: 0, y: 0, width: 0, height: 0 };
         assert!(!rect_contains(r, 0, 0));
+    }
+
+    fn commit_fixture(subject: &str, when: &str) -> crate::git::CommitInfo {
+        crate::git::CommitInfo {
+            hash: "abc1234".to_string(),
+            full_hash: "abc1234deadbeef".to_string(),
+            when: when.to_string(),
+            subject: subject.to_string(),
+        }
+    }
+
+    #[test]
+    fn welcome_commit_wrapping_reserves_timestamp_column() {
+        let c = commit_fixture(
+            "feat(search): clickable paste button in input row reads pbpaste and keeps going",
+            "3 hours ago",
+        );
+        let (first, rest) = welcome_commit_widths(&c, 42);
+        assert!(first < rest, "first line should reserve room for the timestamp");
+        let lines = wrapped_welcome_commit_subject(&c, 42);
+        assert!(lines.len() > 1, "long commit subjects should wrap");
+        assert!(lines[0].chars().count() <= first as usize);
+        assert!(lines[1].chars().count() <= rest as usize);
+    }
+
+    #[test]
+    fn welcome_recents_height_accounts_for_wrapped_commit_rows() {
+        let c = commit_fixture(
+            "feat(search): clickable paste button in input row reads pbpaste and keeps going",
+            "3 hours ago",
+        );
+        let compact = welcome_recents_height(Some("https://bitbucket.org/a/b"), &[c], 42);
+        assert!(compact > 1 + 1 + 1, "height must include wrapped commit continuation rows");
+    }
+
+    #[test]
+    fn welcome_provider_badge_uses_repo_provider() {
+        assert!(welcome_provider_badge("https://bitbucket.org/a/b").contains("Bitbucket"));
+        assert!(welcome_provider_badge("https://github.com/a/b").contains("GitHub"));
     }
 
     #[test]

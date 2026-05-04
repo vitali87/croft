@@ -97,32 +97,164 @@ pub fn parse_porcelain_dirty(out: &str) -> bool {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CommitInfo {
     pub hash: String,
+    pub full_hash: String,
     pub when: String,
     pub subject: String,
 }
 
-/// Bitbucket REST endpoint for the croft repo's commit list.  Pinned here
-/// because the welcome panel must always show *croft's* progress, never
-/// the workspace the user happens to have opened.
-pub const CROFT_BITBUCKET_COMMITS_URL: &str =
-    "https://api.bitbucket.org/2.0/repositories/vitali_avagyan/croft/commits?pagelen=5";
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RecentCommits {
+    pub remote: Option<String>,
+    pub commits: Vec<CommitInfo>,
+}
 
-/// Live-fetch the latest 5 croft commits from Bitbucket. Synchronous;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CommitApiProvider {
+    Bitbucket,
+    GitHub,
+}
+
+impl CommitApiProvider {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Bitbucket => "Bitbucket",
+            Self::GitHub => "GitHub",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommitApiEndpoint {
+    pub provider: CommitApiProvider,
+    pub url: String,
+}
+
+const DEFAULT_CROFT_REPOSITORY_REMOTE: &str = "git@bitbucket.org:vitali_avagyan/croft.git";
+
+/// Live-fetch the latest 5 croft commits from the repository remote. Synchronous;
 /// callers should run this off the UI thread (see `App::spawn_recent_commits_fetch`).
-/// Returns an empty Vec on any error (network down, API change, parse error).
-pub fn fetch_croft_recent_commits(timeout: std::time::Duration) -> Vec<CommitInfo> {
+/// Returns only the remote reference on any fetch error (network down, API
+/// change, unsupported provider).
+pub fn fetch_croft_recent_commits(timeout: std::time::Duration) -> RecentCommits {
+    let remote = croft_repository_remote();
+    let Some(endpoint) = remote.as_deref().and_then(commits_api_endpoint_for_remote) else {
+        return RecentCommits { remote, commits: Vec::new() };
+    };
     let agent = ureq::AgentBuilder::new()
         .timeout(timeout)
         .build();
-    let resp = match agent.get(CROFT_BITBUCKET_COMMITS_URL).call() {
+    let resp = match agent
+        .get(&endpoint.url)
+        .set("User-Agent", "croft")
+        .call()
+    {
         Ok(r) => r,
-        Err(_) => return Vec::new(),
+        Err(_) => return RecentCommits { remote, commits: Vec::new() },
     };
     let body = match resp.into_string() {
         Ok(s) => s,
-        Err(_) => return Vec::new(),
+        Err(_) => return RecentCommits { remote, commits: Vec::new() },
     };
-    parse_bitbucket_commits_response(&body, current_unix_seconds())
+    let now = current_unix_seconds();
+    let commits = match endpoint.provider {
+        CommitApiProvider::Bitbucket => parse_bitbucket_commits_response(&body, now),
+        CommitApiProvider::GitHub => parse_github_commits_response(&body, now),
+    };
+    RecentCommits { remote, commits }
+}
+
+pub fn croft_repository_remote() -> Option<String> {
+    let raw = std::env::var("CROFT_REPOSITORY_REMOTE")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            option_env!("CROFT_REPOSITORY_REMOTE")
+                .filter(|s| !s.trim().is_empty())
+                .map(ToString::to_string)
+        })
+        .unwrap_or_else(|| DEFAULT_CROFT_REPOSITORY_REMOTE.to_string());
+    normalize_remote_reference(&raw)
+}
+
+pub fn normalize_remote_reference(remote: &str) -> Option<String> {
+    let remote = remote.trim().trim_end_matches('/');
+    if remote.is_empty() {
+        return None;
+    }
+    if let Some(rest) = remote.strip_prefix("git@") {
+        let (host, path) = rest.split_once(':')?;
+        return normalize_host_path(host, path);
+    }
+    if let Some(rest) = remote.strip_prefix("ssh://git@") {
+        let (host, path) = rest.split_once('/')?;
+        return normalize_host_path(host, path);
+    }
+    if let Some(rest) = remote
+        .strip_prefix("https://")
+        .or_else(|| remote.strip_prefix("http://"))
+    {
+        let (host, path) = rest.split_once('/')?;
+        return normalize_host_path(host, path);
+    }
+    if let Some((host, path)) = remote.split_once('/') {
+        return normalize_host_path(host, path);
+    }
+    None
+}
+
+fn normalize_host_path(host: &str, path: &str) -> Option<String> {
+    let host = host.trim();
+    let path = trim_git_suffix(path.trim().trim_start_matches('/'));
+    if host.is_empty() || path.is_empty() {
+        return None;
+    }
+    Some(format!("https://{host}/{path}"))
+}
+
+fn trim_git_suffix(path: &str) -> String {
+    path.trim_end_matches('/')
+        .strip_suffix(".git")
+        .unwrap_or(path.trim_end_matches('/'))
+        .to_string()
+}
+
+pub fn commits_api_endpoint_for_remote(remote: &str) -> Option<CommitApiEndpoint> {
+    let normalized = normalize_remote_reference(remote)?;
+    let rest = normalized.strip_prefix("https://")?;
+    let (host, path) = rest.split_once('/')?;
+    let mut parts = path.split('/').filter(|s| !s.is_empty());
+    let owner = parts.next()?;
+    let repo = parts.next()?;
+    match host {
+        "bitbucket.org" => Some(CommitApiEndpoint {
+            provider: CommitApiProvider::Bitbucket,
+            url: format!(
+                "https://api.bitbucket.org/2.0/repositories/{owner}/{repo}/commits?pagelen=5"
+            ),
+        }),
+        "github.com" => Some(CommitApiEndpoint {
+            provider: CommitApiProvider::GitHub,
+            url: format!("https://api.github.com/repos/{owner}/{repo}/commits?per_page=5"),
+        }),
+        _ => None,
+    }
+}
+
+pub fn commit_api_provider_for_remote(remote: &str) -> Option<CommitApiProvider> {
+    commits_api_endpoint_for_remote(remote).map(|e| e.provider)
+}
+
+pub fn commit_url_for_remote(remote: &str, hash: &str) -> Option<String> {
+    let normalized = normalize_remote_reference(remote)?;
+    let provider = commit_api_provider_for_remote(&normalized)?;
+    let hash = hash.trim();
+    if hash.is_empty() {
+        return None;
+    }
+    match provider {
+        CommitApiProvider::Bitbucket => Some(format!("{normalized}/commits/{hash}")),
+        CommitApiProvider::GitHub => Some(format!("{normalized}/commit/{hash}")),
+    }
 }
 
 /// Pure function: takes the raw Bitbucket JSON body plus the current unix
@@ -139,6 +271,17 @@ pub fn parse_bitbucket_commits_response(body: &str, now_secs: i64) -> Vec<Commit
         .collect()
 }
 
+pub fn parse_github_commits_response(body: &str, now_secs: i64) -> Vec<CommitInfo> {
+    let parsed: Vec<GitHubCommit> = match serde_json::from_str(body) {
+        Ok(p) => p,
+        Err(_) => return Vec::new(),
+    };
+    parsed
+        .into_iter()
+        .filter_map(|c| convert_github_commit(&c, now_secs))
+        .collect()
+}
+
 #[derive(serde::Deserialize)]
 pub struct BitbucketCommitsResponse {
     pub values: Vec<BitbucketCommit>,
@@ -152,6 +295,7 @@ pub struct BitbucketCommit {
 }
 
 fn convert_bitbucket_commit(c: &BitbucketCommit, now_secs: i64) -> Option<CommitInfo> {
+    let full_hash = c.hash.trim().to_string();
     let hash: String = c.hash.chars().take(7).collect();
     if hash.trim().is_empty() {
         return None;
@@ -167,7 +311,53 @@ fn convert_bitbucket_commit(c: &BitbucketCommit, now_secs: i64) -> Option<Commit
         Some(ts) => humanize_age(now_secs.saturating_sub(ts)),
         None => c.date.clone(),
     };
-    Some(CommitInfo { hash, when, subject })
+    Some(CommitInfo { hash, full_hash, when, subject })
+}
+
+#[derive(serde::Deserialize)]
+pub struct GitHubCommit {
+    pub sha: String,
+    pub commit: GitHubCommitBody,
+}
+
+#[derive(serde::Deserialize)]
+pub struct GitHubCommitBody {
+    pub message: String,
+    pub committer: Option<GitHubCommitPerson>,
+    pub author: Option<GitHubCommitPerson>,
+}
+
+#[derive(serde::Deserialize)]
+pub struct GitHubCommitPerson {
+    pub date: String,
+}
+
+fn convert_github_commit(c: &GitHubCommit, now_secs: i64) -> Option<CommitInfo> {
+    let full_hash = c.sha.trim().to_string();
+    let hash: String = c.sha.chars().take(7).collect();
+    if hash.trim().is_empty() {
+        return None;
+    }
+    let subject = c
+        .commit
+        .message
+        .lines()
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let date = c
+        .commit
+        .committer
+        .as_ref()
+        .or(c.commit.author.as_ref())
+        .map(|p| p.date.as_str())
+        .unwrap_or("");
+    let when = match parse_rfc3339_to_unix(date) {
+        Some(ts) => humanize_age(now_secs.saturating_sub(ts)),
+        None => date.to_string(),
+    };
+    Some(CommitInfo { hash, full_hash, when, subject })
 }
 
 /// Parse a date in the formats Bitbucket emits:
@@ -410,6 +600,63 @@ mod tests {
     }
 
     #[test]
+    fn normalize_remote_reference_handles_bitbucket_ssh() {
+        assert_eq!(
+            normalize_remote_reference("git@bitbucket.org:vitali_avagyan/croft.git"),
+            Some("https://bitbucket.org/vitali_avagyan/croft".to_string())
+        );
+    }
+
+    #[test]
+    fn normalize_remote_reference_handles_github_https() {
+        assert_eq!(
+            normalize_remote_reference("https://github.com/example/croft.git"),
+            Some("https://github.com/example/croft".to_string())
+        );
+    }
+
+    #[test]
+    fn normalize_remote_reference_handles_ssh_url() {
+        assert_eq!(
+            normalize_remote_reference("ssh://git@github.com/example/croft.git"),
+            Some("https://github.com/example/croft".to_string())
+        );
+    }
+
+    #[test]
+    fn commits_api_endpoint_for_remote_supports_bitbucket_and_github() {
+        let bitbucket =
+            commits_api_endpoint_for_remote("https://bitbucket.org/vitali_avagyan/croft")
+                .unwrap();
+        assert_eq!(bitbucket.provider, CommitApiProvider::Bitbucket);
+        assert_eq!(
+            bitbucket.url,
+            "https://api.bitbucket.org/2.0/repositories/vitali_avagyan/croft/commits?pagelen=5"
+        );
+
+        let github = commits_api_endpoint_for_remote("git@github.com:example/croft.git").unwrap();
+        assert_eq!(github.provider, CommitApiProvider::GitHub);
+        assert_eq!(github.url, "https://api.github.com/repos/example/croft/commits?per_page=5");
+    }
+
+    #[test]
+    fn commits_api_endpoint_for_remote_returns_none_for_unknown_host() {
+        assert!(commits_api_endpoint_for_remote("https://gitlab.com/example/croft").is_none());
+    }
+
+    #[test]
+    fn commit_url_for_remote_builds_provider_specific_urls() {
+        assert_eq!(
+            commit_url_for_remote("git@bitbucket.org:vitali_avagyan/croft.git", "abc123"),
+            Some("https://bitbucket.org/vitali_avagyan/croft/commits/abc123".to_string())
+        );
+        assert_eq!(
+            commit_url_for_remote("https://github.com/example/croft.git", "abc123"),
+            Some("https://github.com/example/croft/commit/abc123".to_string())
+        );
+    }
+
+    #[test]
     fn parse_bitbucket_response_extracts_first_message_line_and_short_hash() {
         let now = parse_rfc3339_to_unix("2026-05-04T16:30:00Z").unwrap();
         let body = r#"{
@@ -429,6 +676,7 @@ mod tests {
         let got = parse_bitbucket_commits_response(body, now);
         assert_eq!(got.len(), 2);
         assert_eq!(got[0].hash, "abc1234");
+        assert_eq!(got[0].full_hash, "abc1234deadbeef");
         assert_eq!(got[0].subject, "feat: live commits");
         assert_eq!(got[0].when, "30 minutes ago");
         assert_eq!(got[1].hash, "fedc987");
@@ -439,5 +687,42 @@ mod tests {
     fn parse_bitbucket_response_returns_empty_on_garbage() {
         assert!(parse_bitbucket_commits_response("not json", 0).is_empty());
         assert!(parse_bitbucket_commits_response("{}", 0).is_empty());
+    }
+
+    #[test]
+    fn parse_github_response_extracts_first_message_line_and_short_hash() {
+        let now = parse_rfc3339_to_unix("2026-05-04T16:30:00Z").unwrap();
+        let body = r#"[
+          {
+            "sha": "abc1234deadbeef",
+            "commit": {
+              "message": "feat: live commits\n\nbody line ignored",
+              "committer": { "date": "2026-05-04T16:00:00Z" },
+              "author": { "date": "2026-05-04T15:00:00Z" }
+            }
+          },
+          {
+            "sha": "fedc987",
+            "commit": {
+              "message": "fix: parse offsets",
+              "committer": null,
+              "author": { "date": "2026-05-03T12:00:00Z" }
+            }
+          }
+        ]"#;
+        let got = parse_github_commits_response(body, now);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].hash, "abc1234");
+        assert_eq!(got[0].full_hash, "abc1234deadbeef");
+        assert_eq!(got[0].subject, "feat: live commits");
+        assert_eq!(got[0].when, "30 minutes ago");
+        assert_eq!(got[1].hash, "fedc987");
+        assert_eq!(got[1].subject, "fix: parse offsets");
+    }
+
+    #[test]
+    fn parse_github_response_returns_empty_on_garbage() {
+        assert!(parse_github_commits_response("not json", 0).is_empty());
+        assert!(parse_github_commits_response("{}", 0).is_empty());
     }
 }
