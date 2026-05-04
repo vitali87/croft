@@ -1381,7 +1381,12 @@ impl App {
                         }
                     }
                 } else if in_editor_pane && !in_editor {
-                    if let Some(idx) = self.editor.tab_at(m.column, m.row) {
+                    if let Some(idx) = self.editor.close_at(m.column, m.row) {
+                        if self.editor.close_tab(idx) {
+                            self.status = String::from("Closed tab");
+                            self.poke_cursor();
+                        }
+                    } else if let Some(idx) = self.editor.tab_at(m.column, m.row) {
                         self.focus_pane(Pane::Editor);
                         if self.editor.active_index() != idx {
                             self.editor.select(idx);

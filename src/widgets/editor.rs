@@ -1663,11 +1663,72 @@ mod tests {
     }
 
     #[test]
-    fn editor_tabs_close_last_tab_keeps_one_empty_editor() {
+    fn editor_tabs_close_last_tab_resets_buffer_to_blank() {
         let mut t = EditorTabs::new();
         t.editors[0].path = Some(std::path::PathBuf::from("/a"));
-        assert!(!t.close_active(), "must not drop the only tab");
+        assert!(t.close_active(), "closing the only tab resets it instead of refusing");
         assert_eq!(t.tab_count(), 1);
+        assert!(t.path.is_none());
+    }
+
+    #[test]
+    fn close_at_maps_a_click_on_the_x_glyph_to_its_tab_index() {
+        use ratatui::buffer::Buffer;
+        let mut t = EditorTabs::new();
+        t.editors[0].path = Some(std::path::PathBuf::from("/foo.rs"));
+        t.add_tab_with_path(std::path::PathBuf::from("/bar.rs"));
+        let area = Rect { x: 0, y: 0, width: 80, height: 10 };
+        let mut buf = Buffer::empty(area);
+        (&mut t).render(area, &mut buf);
+        let cx0 = t.close_screen_x(0).expect("tab 0 has a close button when count > 1");
+        let cx1 = t.close_screen_x(1).expect("tab 1 has a close button");
+        assert_eq!(t.close_at(cx0, area.y), Some(0));
+        assert_eq!(t.close_at(cx1, area.y), Some(1));
+        // A click on a non-close cell of the tab still routes to `tab_at`,
+        // not `close_at`.
+        let (tab0_x, _) = t.tab_screen_x(0).unwrap();
+        assert_ne!(tab0_x, cx0);
+        assert_eq!(t.close_at(tab0_x, area.y), None);
+        // Clicks outside the strip row are not close clicks.
+        assert_eq!(t.close_at(cx0, area.y + 2), None);
+    }
+
+    #[test]
+    fn close_tab_removes_specific_index_and_keeps_active_pointing_correctly() {
+        let mut t = EditorTabs::new();
+        t.editors[0].path = Some(std::path::PathBuf::from("/a"));
+        t.add_tab_with_path(std::path::PathBuf::from("/b"));
+        t.add_tab_with_path(std::path::PathBuf::from("/c"));
+        // active = 2 (c). Closing tab 1 (b) shifts c to index 1; active follows.
+        assert!(t.close_tab(1));
+        assert_eq!(t.tab_count(), 2);
+        assert_eq!(t.active_index(), 1);
+        assert_eq!(t.path.as_deref(), Some(std::path::Path::new("/c")));
+    }
+
+    #[test]
+    fn close_tab_on_last_remaining_tab_resets_to_blank_buffer() {
+        let mut t = EditorTabs::new();
+        t.editors[0].path = Some(std::path::PathBuf::from("/only.rs"));
+        t.editors[0].lines = vec!["something".to_string()];
+        t.editors[0].dirty = true;
+        assert!(t.close_tab(0));
+        assert_eq!(t.tab_count(), 1);
+        assert!(t.path.is_none());
+        assert!(t.lines.is_empty() || t.lines == vec![String::new()]);
+        assert!(!t.dirty);
+    }
+
+    #[test]
+    fn close_screen_x_is_present_even_for_a_single_open_tab() {
+        use ratatui::buffer::Buffer;
+        let mut t = EditorTabs::new();
+        t.editors[0].path = Some(std::path::PathBuf::from("/only.rs"));
+        let area = Rect { x: 0, y: 0, width: 60, height: 5 };
+        let mut buf = Buffer::empty(area);
+        (&mut t).render(area, &mut buf);
+        let close_x = t.close_screen_x(0).expect("single tab still shows X");
+        assert_eq!(t.close_at(close_x, area.y), Some(0));
     }
 
     #[test]
@@ -1941,6 +2002,10 @@ pub struct EditorTabs {
     /// render. `tab_at(col, row)` reads this to map mouse clicks to tab
     /// indices.
     tab_screen_ranges: Vec<(u16, u16)>,
+    /// Per-tab absolute column where the close `\u{2715}` glyph lives.
+    /// `0` means "no close button rendered for this tab" (e.g. when the
+    /// tab is the only one — closing it isn't allowed so we hide the X).
+    tab_close_x: Vec<u16>,
     tab_strip_y: u16,
     /// The full pane area (tab strip + body) from the most recent render.
     /// Used by `App::handle_mouse` for hit-testing — the active editor's
@@ -1954,6 +2019,7 @@ impl EditorTabs {
             editors: vec![Editor::new()],
             active: 0,
             tab_screen_ranges: Vec::new(),
+            tab_close_x: Vec::new(),
             tab_strip_y: 0,
             last_full_area: Rect::default(),
         }
@@ -2011,14 +2077,36 @@ impl EditorTabs {
     /// Close the currently active tab. Refuses (returns false) when only one
     /// tab remains — closing the last would leave the editor pane empty.
     pub fn close_active(&mut self) -> bool {
-        if self.editors.len() <= 1 {
+        self.close_tab(self.active)
+    }
+
+    /// Close the tab at `idx`. When more than one tab is open the tab is
+    /// removed and `self.active` is shifted so it still points at a valid
+    /// tab. When this is the last remaining tab it is reset to the blank
+    /// just-launched state instead of being removed (so the editor pane
+    /// always has at least one buffer to render). Returns false only on an
+    /// out-of-range index.
+    pub fn close_tab(&mut self, idx: usize) -> bool {
+        if idx >= self.editors.len() {
             return false;
         }
-        self.editors.remove(self.active);
-        if self.active >= self.editors.len() {
+        if self.editors.len() == 1 {
+            let was_focused = self.editors[0].focused;
+            let mut fresh = Editor::new();
+            fresh.focused = was_focused;
+            self.editors[0] = fresh;
+            self.active = 0;
+            return true;
+        }
+        self.editors.remove(idx);
+        if self.active > idx {
+            self.active -= 1;
+        } else if self.active >= self.editors.len() {
             self.active = self.editors.len() - 1;
         }
-        self.editors[self.active].focused = true;
+        for (i, ed) in self.editors.iter_mut().enumerate() {
+            ed.focused = i == self.active;
+        }
         true
     }
 
@@ -2039,6 +2127,23 @@ impl EditorTabs {
 
     pub fn tab_screen_x(&self, idx: usize) -> Option<(u16, u16)> {
         self.tab_screen_ranges.get(idx).copied()
+    }
+
+    pub fn close_screen_x(&self, idx: usize) -> Option<u16> {
+        self.tab_close_x.get(idx).copied().filter(|&x| x != 0)
+    }
+
+    /// Map a mouse cell to the tab whose close `\u{2715}` glyph occupies it,
+    /// or `None` if the click missed every close button. Used by the App's
+    /// mouse handler to short-circuit ahead of `tab_at` so a click on the X
+    /// closes the tab instead of selecting it.
+    pub fn close_at(&self, col: u16, row: u16) -> Option<usize> {
+        if row != self.tab_strip_y {
+            return None;
+        }
+        self.tab_close_x
+            .iter()
+            .position(|&x| x != 0 && x == col)
     }
 
     /// Index of the first tab whose `path` matches `target` either by
@@ -2230,15 +2335,18 @@ impl Widget for &mut EditorTabs {
 
         self.tab_strip_y = strip.y;
         self.tab_screen_ranges.clear();
+        self.tab_close_x.clear();
         let mut cursor_x = strip.x;
         let active = self.active;
         for (i, ed) in self.editors.iter().enumerate() {
             let label_text = tab_label(ed);
             let label_chars = label_text.chars().count() as u16;
             let pad: u16 = 1;
-            let width = label_chars.saturating_add(pad * 2);
+            let close_pad: u16 = 2;
+            let width = label_chars.saturating_add(pad * 2).saturating_add(close_pad);
             if cursor_x.saturating_add(width) > strip.x + strip.width {
                 self.tab_screen_ranges.push((cursor_x, 0));
+                self.tab_close_x.push(0);
                 continue;
             }
             let is_active = i == active;
@@ -2252,9 +2360,11 @@ impl Widget for &mut EditorTabs {
                 modifiers |= Modifier::ITALIC;
             }
             let style = Style::default().fg(fg).bg(bg).add_modifier(modifiers);
-            let padded = format!(" {label_text} ");
+            // Layout: " " + label + " " + ✕ + " "
+            let padded = format!(" {label_text} \u{2715} ");
             buf.set_string(cursor_x, strip.y, &padded, style);
             self.tab_screen_ranges.push((cursor_x, width));
+            self.tab_close_x.push(cursor_x + 1 + label_chars + 1);
             cursor_x = cursor_x.saturating_add(width);
         }
 
