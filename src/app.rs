@@ -22,7 +22,10 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::widgets::{
-    editor::Editor, file_tree::FileTree, search::SearchPanel, terminal::PtyTerminal,
+    editor::{Editor, EditorTabs},
+    file_tree::FileTree,
+    search::SearchPanel,
+    terminal::PtyTerminal,
 };
 
 /// Which sidebar view is active in the left side panel.
@@ -191,7 +194,7 @@ struct Prompt {
 pub struct App {
     pub tree: FileTree,
     pub search: SearchPanel,
-    pub editor: Editor,
+    pub editor: EditorTabs,
     pub terminal: PtyTerminal,
     sidebar_view: SidebarView,
     sidebar_areas: SidebarAreas,
@@ -240,7 +243,7 @@ impl App {
     pub fn new(root: PathBuf) -> Result<Self> {
         let tree = FileTree::new(root.clone());
         let search = SearchPanel::new(root.clone());
-        let editor = Editor::new();
+        let editor = EditorTabs::new();
         let term = PtyTerminal::new(&root).context("spawning terminal")?;
         let (watcher, rx) = match Self::spawn_fs_watcher(&root) {
             Ok((w, r)) => (Some(w), Some(r)),
@@ -959,7 +962,7 @@ impl App {
     }
 
     fn open_search_hit(&mut self, hit: &crate::widgets::search::SearchHit) {
-        match self.editor.open(&hit.path) {
+        match self.editor.open_or_switch(&hit.path) {
             Ok(()) => {
                 // Place the cursor on the matched line.
                 let row = hit.line_no.saturating_sub(1).min(
@@ -1000,7 +1003,21 @@ impl App {
             KeyCode::End => self.tree.end(),
             KeyCode::Enter | KeyCode::Right => {
                 if let Some(path) = self.tree.activate() {
-                    match self.editor.open(&path) {
+                    // Ctrl+Enter is the primary "open in new tab" gesture — it
+                    // reaches the app on every terminal. Cmd+Enter is also
+                    // accepted but iTerm2 binds it to Toggle Fullscreen by
+                    // default and never forwards it to the app unless the user
+                    // has remapped that shortcut in iTerm Preferences →
+                    // Profiles → Keys.
+                    let in_new_tab = key.modifiers.intersects(
+                        KeyModifiers::CONTROL | KeyModifiers::SUPER | KeyModifiers::META,
+                    );
+                    let result = if in_new_tab {
+                        self.editor.open_in_new_tab_or_switch(&path)
+                    } else {
+                        self.editor.open_or_switch(&path)
+                    };
+                    match result {
                         Ok(()) => {
                             self.status = self.editor.status.clone();
                             // Stay focused on the tree so Delete / arrows still
@@ -1046,6 +1063,20 @@ impl App {
                 self.status = String::from("Undo");
             } else {
                 self.status = String::from("Nothing to undo");
+            }
+            return;
+        }
+        if is_close_tab_key(key) {
+            if self.editor.close_active() {
+                self.status = String::from("Closed tab");
+            } else {
+                self.status = String::from("Cannot close last tab");
+            }
+            return;
+        }
+        if let Some(idx) = jump_to_tab_index(key) {
+            if self.editor.select(idx) {
+                self.status = format!("Tab {}", idx + 1);
             }
             return;
         }
@@ -1228,6 +1259,7 @@ impl App {
         }
 
         let in_tree = self.show_tree && rect_contains(self.tree.last_area, m.column, m.row);
+        let in_editor_pane = rect_contains(self.editor.last_full_area, m.column, m.row);
         let in_editor = rect_contains(self.editor.last_area, m.column, m.row);
         let in_terminal = rect_contains(self.terminal.last_area, m.column, m.row);
 
@@ -1300,7 +1332,7 @@ impl App {
                     if let Some(idx) = self.tree.node_at_y(m.row) {
                         self.tree.select(idx);
                         if let Some(path) = self.tree.activate() {
-                            match self.editor.open(&path) {
+                            match self.editor.open_or_switch(&path) {
                                 Ok(()) => {
                                     self.status = self.editor.status.clone();
                                     // Tree keeps focus so Delete / arrows still
@@ -1310,6 +1342,14 @@ impl App {
                                 Err(e) => self.status = format!("Error: {e}"),
                             }
                         }
+                    }
+                } else if in_editor_pane && !in_editor {
+                    if let Some(idx) = self.editor.tab_at(m.column, m.row) {
+                        self.focus_pane(Pane::Editor);
+                        if self.editor.active_index() != idx {
+                            self.editor.select(idx);
+                        }
+                        self.poke_cursor();
                     }
                 } else if in_editor {
                     self.focus_pane(Pane::Editor);
@@ -1499,7 +1539,10 @@ impl App {
                     self.tree.refresh_children(idx);
                 }
                 if self.editor.matches_open_path(&path) {
-                    self.editor = Editor::new();
+                    if !self.editor.close_active() {
+                        // Sole tab: just blank out its buffer instead.
+                        *self.editor = Editor::new();
+                    }
                 }
             }
             Err(e) => {
@@ -1772,6 +1815,34 @@ fn is_editor_undo_key(key: KeyEvent) -> bool {
         return false;
     }
     key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::SUPER)
+}
+
+/// Close active tab: `Ctrl+W` / `Cmd+W`.
+fn is_close_tab_key(key: KeyEvent) -> bool {
+    let KeyCode::Char(c) = key.code else { return false };
+    if !c.eq_ignore_ascii_case(&'w') {
+        return false;
+    }
+    key.modifiers.contains(KeyModifiers::CONTROL)
+        || key.modifiers.contains(KeyModifiers::SUPER)
+        || key.modifiers.contains(KeyModifiers::META)
+}
+
+/// Cmd+1..9 / Ctrl+1..9 — jump straight to that tab (1-based; returns the
+/// 0-based index). Anything outside that range returns `None`.
+fn jump_to_tab_index(key: KeyEvent) -> Option<usize> {
+    let KeyCode::Char(c) = key.code else { return None };
+    if !key.modifiers.contains(KeyModifiers::SUPER)
+        && !key.modifiers.contains(KeyModifiers::META)
+        && !key.modifiers.contains(KeyModifiers::CONTROL)
+    {
+        return None;
+    }
+    let d = c.to_digit(10)?;
+    if !(1..=9).contains(&d) {
+        return None;
+    }
+    Some((d - 1) as usize)
 }
 
 fn rect_contains(r: Rect, x: u16, y: u16) -> bool {

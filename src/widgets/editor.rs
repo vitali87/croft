@@ -6,6 +6,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Widget},
 };
+use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 
 use crate::highlight::{
@@ -1596,6 +1597,100 @@ mod tests {
     }
 
     #[test]
+    fn editor_tabs_starts_with_one_empty_editor() {
+        let t = EditorTabs::new();
+        assert_eq!(t.tab_count(), 1);
+        assert_eq!(t.active_index(), 0);
+        assert!(t.path.is_none());
+    }
+
+    #[test]
+    fn editor_tabs_open_in_new_tab_appends_and_activates() {
+        let mut t = EditorTabs::new();
+        t.editors[0].path = Some(std::path::PathBuf::from("/tmp/a.rs"));
+        t.add_tab_with_path(std::path::PathBuf::from("/tmp/b.rs"));
+        assert_eq!(t.tab_count(), 2);
+        assert_eq!(t.active_index(), 1);
+        assert_eq!(t.path.as_deref(), Some(std::path::Path::new("/tmp/b.rs")));
+    }
+
+    #[test]
+    fn editor_tabs_new_tab_lands_immediately_after_active() {
+        let mut t = EditorTabs::new();
+        t.editors[0].path = Some(std::path::PathBuf::from("/a"));
+        t.add_tab_with_path(std::path::PathBuf::from("/b"));
+        t.add_tab_with_path(std::path::PathBuf::from("/c"));
+        // active is now 2 (c). Switch back to a (idx 0), open d → should be at idx 1.
+        t.select(0);
+        t.add_tab_with_path(std::path::PathBuf::from("/d"));
+        let labels: Vec<_> = t
+            .iter_tabs()
+            .map(|e| e.path.as_ref().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(labels, vec!["/a", "/d", "/b", "/c"]);
+        assert_eq!(t.active_index(), 1);
+    }
+
+    #[test]
+    fn editor_tabs_close_active_drops_tab_and_reselects() {
+        let mut t = EditorTabs::new();
+        t.editors[0].path = Some(std::path::PathBuf::from("/a"));
+        t.add_tab_with_path(std::path::PathBuf::from("/b"));
+        t.add_tab_with_path(std::path::PathBuf::from("/c"));
+        t.select(1); // active = b
+        assert!(t.close_active());
+        assert_eq!(t.tab_count(), 2);
+        // After closing the middle tab, the next tab takes its slot, which is c.
+        assert_eq!(t.path.as_deref(), Some(std::path::Path::new("/c")));
+    }
+
+    #[test]
+    fn editor_tabs_close_last_tab_keeps_one_empty_editor() {
+        let mut t = EditorTabs::new();
+        t.editors[0].path = Some(std::path::PathBuf::from("/a"));
+        assert!(!t.close_active(), "must not drop the only tab");
+        assert_eq!(t.tab_count(), 1);
+    }
+
+    #[test]
+    fn editor_tabs_tab_at_x_returns_index_of_clicked_tab() {
+        use ratatui::buffer::Buffer;
+        let mut t = EditorTabs::new();
+        t.editors[0].path = Some(std::path::PathBuf::from("/long_name.rs"));
+        t.add_tab_with_path(std::path::PathBuf::from("/b.rs"));
+        let area = Rect { x: 0, y: 0, width: 60, height: 10 };
+        let mut buf = Buffer::empty(area);
+        (&mut t).render(area, &mut buf);
+        let first = t.tab_screen_x(0).expect("tab 0 laid out");
+        let second = t.tab_screen_x(1).expect("tab 1 laid out");
+        assert_eq!(t.tab_at(first.0, area.y), Some(0));
+        assert_eq!(t.tab_at(second.0, area.y), Some(1));
+        assert_eq!(t.tab_at(area.x + area.width - 1, area.y + 5), None);
+    }
+
+    #[test]
+    fn editor_tabs_find_tab_with_path_returns_index_when_open() {
+        let mut t = EditorTabs::new();
+        t.editors[0].path = Some(std::path::PathBuf::from("/a"));
+        t.add_tab_with_path(std::path::PathBuf::from("/b"));
+        t.add_tab_with_path(std::path::PathBuf::from("/c"));
+        assert_eq!(t.find_tab_with_path(std::path::Path::new("/a")), Some(0));
+        assert_eq!(t.find_tab_with_path(std::path::Path::new("/b")), Some(1));
+        assert_eq!(t.find_tab_with_path(std::path::Path::new("/c")), Some(2));
+        assert_eq!(t.find_tab_with_path(std::path::Path::new("/missing")), None);
+    }
+
+    #[test]
+    fn editor_tabs_deref_exposes_active_editor_state() {
+        let mut t = EditorTabs::new();
+        t.lines = vec!["abc".to_string()];
+        t.cursor_col = 3;
+        // Field access reaches active editor via DerefMut.
+        assert_eq!(t.lines, vec!["abc".to_string()]);
+        assert_eq!(t.cursor_col, 3);
+    }
+
+    #[test]
     fn mouse_drag_extends_selection() {
         let mut e = editor_with("hello world");
         e.last_inner = Rect { x: 0, y: 0, width: 80, height: 25 };
@@ -1617,27 +1712,9 @@ impl Widget for &mut Editor {
         } else {
             Style::default().fg(Color::DarkGray)
         };
-        let title = match &self.path {
-            Some(p) => {
-                let mark = if self.dirty { "● " } else { "" };
-                format!(
-                    " {}{} ",
-                    mark,
-                    p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
-                )
-            }
-            None => String::from(" EDITOR "),
-        };
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(block_style)
-            .title(Span::styled(
-                title,
-                Style::default()
-                    .fg(Color::White)
-                    .bg(Color::Rgb(0x1e, 0x3a, 0x6e))
-                    .add_modifier(Modifier::BOLD),
-            ));
+            .border_style(block_style);
         let inner = block.inner(area);
         block.render(area, buf);
         self.last_area = area;
@@ -1755,5 +1832,251 @@ fn paint_selection_band(
         let x = text_x + col as u16;
         let cell = &mut buf[(x, y)];
         cell.set_style(cell.style().bg(bg));
+    }
+}
+
+/// Multi-buffer editor: a stack of `Editor` instances with a single active
+/// one, plus a 1-row clickable tab strip rendered above the active editor.
+/// `Deref`/`DerefMut` aim at the active editor so existing call sites that
+/// were written for a single `Editor` continue to work without rewrites.
+pub struct EditorTabs {
+    pub editors: Vec<Editor>,
+    active: usize,
+    /// Per-tab on-screen `(x_start, width)` recorded by the most recent
+    /// render. `tab_at(col, row)` reads this to map mouse clicks to tab
+    /// indices.
+    tab_screen_ranges: Vec<(u16, u16)>,
+    tab_strip_y: u16,
+    /// The full pane area (tab strip + body) from the most recent render.
+    /// Used by `App::handle_mouse` for hit-testing — the active editor's
+    /// own `last_area` only covers the body below the strip.
+    pub last_full_area: Rect,
+}
+
+impl EditorTabs {
+    pub fn new() -> Self {
+        Self {
+            editors: vec![Editor::new()],
+            active: 0,
+            tab_screen_ranges: Vec::new(),
+            tab_strip_y: 0,
+            last_full_area: Rect::default(),
+        }
+    }
+
+    pub fn tab_count(&self) -> usize {
+        self.editors.len()
+    }
+
+    pub fn active_index(&self) -> usize {
+        self.active
+    }
+
+    pub fn iter_tabs(&self) -> impl Iterator<Item = &Editor> {
+        self.editors.iter()
+    }
+
+    pub fn select(&mut self, idx: usize) -> bool {
+        if idx >= self.editors.len() {
+            return false;
+        }
+        self.editors[self.active].focused = false;
+        self.active = idx;
+        self.editors[self.active].focused = true;
+        true
+    }
+
+    /// Open `path` in a brand-new tab inserted directly after the active
+    /// one, then make that new tab active. Returns the result of the
+    /// underlying `Editor::open` so the caller can surface errors.
+    pub fn open_in_new_tab(&mut self, path: &Path) -> Result<()> {
+        let mut e = Editor::new();
+        e.focused = self.editors[self.active].focused;
+        e.open(path)?;
+        let pos = self.active + 1;
+        self.editors.insert(pos, e);
+        self.editors[self.active].focused = false;
+        self.active = pos;
+        Ok(())
+    }
+
+    /// Test-only / disk-less helper: insert a tab whose path is set but
+    /// whose contents are empty. Production code should call
+    /// `open_in_new_tab` so the file is actually loaded from disk.
+    pub fn add_tab_with_path(&mut self, path: PathBuf) {
+        let mut e = Editor::new();
+        e.path = Some(path);
+        e.focused = self.editors[self.active].focused;
+        let pos = self.active + 1;
+        self.editors.insert(pos, e);
+        self.editors[self.active].focused = false;
+        self.active = pos;
+    }
+
+    /// Close the currently active tab. Refuses (returns false) when only one
+    /// tab remains — closing the last would leave the editor pane empty.
+    pub fn close_active(&mut self) -> bool {
+        if self.editors.len() <= 1 {
+            return false;
+        }
+        self.editors.remove(self.active);
+        if self.active >= self.editors.len() {
+            self.active = self.editors.len() - 1;
+        }
+        self.editors[self.active].focused = true;
+        true
+    }
+
+    /// Map a mouse cell `(col, row)` to a tab index, or `None` if the click
+    /// missed every tab. Uses the on-screen ranges captured during the most
+    /// recent render.
+    pub fn tab_at(&self, col: u16, row: u16) -> Option<usize> {
+        if row != self.tab_strip_y {
+            return None;
+        }
+        for (i, &(x, w)) in self.tab_screen_ranges.iter().enumerate() {
+            if col >= x && col < x.saturating_add(w) {
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    pub fn tab_screen_x(&self, idx: usize) -> Option<(u16, u16)> {
+        self.tab_screen_ranges.get(idx).copied()
+    }
+
+    /// Index of the first tab whose `path` matches `target` either by
+    /// literal equality or by canonicalised equality (so symlink + relative
+    /// path aliases dedupe to the same tab). Returns `None` if no tab is
+    /// currently holding that file.
+    pub fn find_tab_with_path(&self, target: &Path) -> Option<usize> {
+        let canon_target = target.canonicalize().ok();
+        self.editors.iter().position(|e| {
+            let Some(p) = e.path.as_ref() else { return false };
+            if p == target {
+                return true;
+            }
+            match (canon_target.as_ref(), p.canonicalize().ok()) {
+                (Some(a), Some(b)) => *a == b,
+                _ => false,
+            }
+        })
+    }
+
+    /// Either switch to the tab already holding `path`, or open `path` in a
+    /// brand-new tab next to the active one. Used by Ctrl+Enter so the user
+    /// never gets two tabs pointing at the same file.
+    pub fn open_in_new_tab_or_switch(&mut self, path: &Path) -> Result<()> {
+        if let Some(idx) = self.find_tab_with_path(path) {
+            self.select(idx);
+            return Ok(());
+        }
+        self.open_in_new_tab(path)
+    }
+
+    /// Either switch to an existing tab holding `path`, or replace the
+    /// active tab's contents with `path`. Used by plain Enter / mouse click /
+    /// search-result open so opening a file already on screen never creates
+    /// a second tab for it.
+    pub fn open_or_switch(&mut self, path: &Path) -> Result<()> {
+        if let Some(idx) = self.find_tab_with_path(path) {
+            self.select(idx);
+            return Ok(());
+        }
+        self.open(path)
+    }
+}
+
+impl Default for EditorTabs {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Deref for EditorTabs {
+    type Target = Editor;
+    fn deref(&self) -> &Editor {
+        &self.editors[self.active]
+    }
+}
+
+impl DerefMut for EditorTabs {
+    fn deref_mut(&mut self) -> &mut Editor {
+        &mut self.editors[self.active]
+    }
+}
+
+const TAB_STRIP_BG: Color = Color::Rgb(0x1f, 0x24, 0x36);
+const TAB_INACTIVE_BG: Color = Color::Rgb(0x2a, 0x2f, 0x3e);
+const TAB_ACTIVE_BG: Color = Color::Rgb(0x1e, 0x3a, 0x6e);
+const TAB_INACTIVE_FG: Color = Color::Rgb(0x9d, 0xa5, 0xb4);
+const TAB_ACTIVE_FG: Color = Color::White;
+
+impl Widget for &mut EditorTabs {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        self.last_full_area = area;
+        if area.height == 0 || area.width == 0 {
+            return;
+        }
+        let strip_h: u16 = 1;
+        let strip = Rect { x: area.x, y: area.y, width: area.width, height: strip_h };
+        let body = Rect {
+            x: area.x,
+            y: area.y + strip_h,
+            width: area.width,
+            height: area.height - strip_h,
+        };
+
+        // Paint strip background first so the gap to the right of the last
+        // tab still reads as the tab-strip colour rather than terminal default.
+        let strip_bg_style = Style::default().bg(TAB_STRIP_BG);
+        for x in strip.x..strip.x + strip.width {
+            buf[(x, strip.y)].set_style(strip_bg_style);
+            buf[(x, strip.y)].set_symbol(" ");
+        }
+
+        self.tab_strip_y = strip.y;
+        self.tab_screen_ranges.clear();
+        let mut cursor_x = strip.x;
+        let active = self.active;
+        for (i, ed) in self.editors.iter().enumerate() {
+            let label_text = tab_label(ed);
+            let label_chars = label_text.chars().count() as u16;
+            let pad: u16 = 1;
+            let width = label_chars.saturating_add(pad * 2);
+            if cursor_x.saturating_add(width) > strip.x + strip.width {
+                self.tab_screen_ranges.push((cursor_x, 0));
+                continue;
+            }
+            let is_active = i == active;
+            let bg = if is_active { TAB_ACTIVE_BG } else { TAB_INACTIVE_BG };
+            let fg = if is_active { TAB_ACTIVE_FG } else { TAB_INACTIVE_FG };
+            let style = Style::default().fg(fg).bg(bg).add_modifier(
+                if is_active { Modifier::BOLD } else { Modifier::empty() },
+            );
+            let padded = format!(" {label_text} ");
+            buf.set_string(cursor_x, strip.y, &padded, style);
+            self.tab_screen_ranges.push((cursor_x, width));
+            cursor_x = cursor_x.saturating_add(width);
+        }
+
+        let active_editor = &mut self.editors[active];
+        Widget::render(active_editor, body, buf);
+    }
+}
+
+fn tab_label(e: &Editor) -> String {
+    let name = match &e.path {
+        Some(p) => p
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| String::from("untitled")),
+        None => String::from("untitled"),
+    };
+    if e.dirty {
+        format!("\u{25cf} {name}")
+    } else {
+        name
     }
 }
