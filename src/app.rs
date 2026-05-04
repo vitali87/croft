@@ -291,6 +291,13 @@ pub struct App {
     /// A change here triggers a re-bake on the next render.
     welcome_layout: Option<WelcomeLayout>,
     welcome_overlay_dirty: bool,
+    /// True between the moment the welcome OSC-1337 image is written to the
+    /// terminal and the moment we explicitly clear it. iTerm caches the
+    /// image bytes outside ratatui's buffer, so when the user opens a file
+    /// ratatui's diff misses cells whose buffer content didn't change and
+    /// the image bleeds through under the editor. `consume_welcome_image_clear`
+    /// returns true once when this needs to be wiped.
+    welcome_image_displayed: bool,
     /// Pixel size of one terminal cell, captured in `init_graphics`.
     /// Required to bake OSC-1337 images at exact viewport pixel size so
     /// iTerm draws them with no stretching or letterboxing.
@@ -346,6 +353,7 @@ impl App {
             welcome_image: None,
             welcome_layout: None,
             welcome_overlay_dirty: true,
+            welcome_image_displayed: false,
             cell_pixel: None,
         })
     }
@@ -597,6 +605,20 @@ impl App {
         self.tree.focused = self.focus == Pane::Tree;
         self.editor.focused = self.focus == Pane::Editor;
         self.terminal.focused = self.focus == Pane::Terminal;
+    }
+
+    /// Returns true exactly once after the welcome OSC-1337 image has been
+    /// emitted and the editor pane has stopped being blank (i.e. a file is
+    /// now open). The caller — the main draw loop — must respond by
+    /// invalidating the prev buffer so ratatui repaints every cell on the
+    /// next draw, wiping iTerm's image cache for the welcome region.
+    pub fn consume_welcome_image_clear(&mut self) -> bool {
+        if self.welcome_image_displayed && !self.editor.is_blank_initial() {
+            self.welcome_image_displayed = false;
+            true
+        } else {
+            false
+        }
     }
 
     fn render_welcome(&mut self, frame: &mut ratatui::Frame, area: Rect) {
@@ -2857,6 +2879,51 @@ mod tests {
     }
 
     #[test]
+    fn consume_welcome_image_clear_fires_once_when_editor_opens_a_file() {
+        // Repro for the "logo bleeds through under an open file" bug:
+        // after the welcome OSC-1337 has been written to iTerm, opening a
+        // file must signal a one-shot screen clear so ratatui repaints
+        // every cell on the next draw and iTerm's image cache for those
+        // cells is wiped.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.welcome_image_displayed = true;
+        let f = tmp.path().join("hi.txt");
+        std::fs::write(&f, "hi").unwrap();
+        app.editor.open_pinned(&f).unwrap();
+        assert!(app.consume_welcome_image_clear(), "first call must fire");
+        assert!(!app.welcome_image_displayed, "flag must reset after consume");
+        assert!(
+            !app.consume_welcome_image_clear(),
+            "second call must be a no-op until welcome is re-shown"
+        );
+    }
+
+    #[test]
+    fn consume_welcome_image_clear_is_noop_while_editor_pane_is_blank() {
+        // The image is still meant to be visible, so don't clear.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.welcome_image_displayed = true;
+        assert!(!app.consume_welcome_image_clear());
+        assert!(
+            app.welcome_image_displayed,
+            "flag must NOT reset while image is still meant to show"
+        );
+    }
+
+    #[test]
+    fn consume_welcome_image_clear_is_noop_when_image_was_never_shown() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.welcome_image_displayed = false;
+        let f = tmp.path().join("hi.txt");
+        std::fs::write(&f, "hi").unwrap();
+        app.editor.open_pinned(&f).unwrap();
+        assert!(!app.consume_welcome_image_clear());
+    }
+
+    #[test]
     fn tree_context_menu_on_workspace_root_offers_new_file_and_new_folder_only() {
         // Right-clicking the workspace root row must NOT offer Rename/Delete
         // (the root cannot be renamed or moved to trash from inside croft).
@@ -2964,6 +3031,17 @@ fn main_loop(
         let blink_changed = blink_visible != last_blink_visible;
 
         if needs_redraw || fs_changed || pty_changed || blink_changed {
+            // If the welcome OSC-1337 image was painted earlier and the
+            // user has just opened a file, wipe the screen so iTerm drops
+            // its cached image cells AND ratatui repaints every cell on
+            // the next draw (its diff alone misses cells whose content
+            // didn't change between welcome and editor buffers).
+            if app.consume_welcome_image_clear() {
+                terminal.clear()?;
+                // Activity-bar icons live outside ratatui too; re-emit
+                // them on the next post-draw flush.
+                app.activity_overlay_dirty = true;
+            }
             terminal.draw(|f| {
                 app.render(f);
             })?;
@@ -3014,6 +3092,7 @@ fn main_loop(
                     }
                     let _ = out.flush();
                     app.welcome_overlay_dirty = false;
+                    app.welcome_image_displayed = true;
                 }
             }
             needs_redraw = false;
