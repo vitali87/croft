@@ -616,6 +616,46 @@ impl Editor {
         self.last_edit_kind = None;
     }
 
+    /// Double-click word selection: place the cursor at the click point, then
+    /// select the maximal run of word characters covering it and leave the
+    /// caret at the right edge of that run (VS Code parity). A click on
+    /// whitespace or past the end of an empty line clears any selection.
+    pub fn select_word_at(&mut self, col: u16, row: u16) {
+        self.click(col, row);
+        if self.lines.is_empty() {
+            self.selection = None;
+            return;
+        }
+        let r = self.cursor_row;
+        let chars: Vec<char> = self.lines[r].chars().collect();
+        let c = self.cursor_col;
+        let pivot = if c < chars.len() && is_word_char(chars[c]) {
+            Some(c)
+        } else if c == chars.len() && c > 0 && is_word_char(chars[c - 1]) {
+            Some(c - 1)
+        } else {
+            None
+        };
+        let Some(p) = pivot else {
+            self.selection = None;
+            return;
+        };
+        let mut start = p;
+        while start > 0 && is_word_char(chars[start - 1]) {
+            start -= 1;
+        }
+        let mut end = p + 1;
+        while end < chars.len() && is_word_char(chars[end]) {
+            end += 1;
+        }
+        self.cursor_col = end;
+        self.selection = Some(EditorSelection {
+            anchor: (r, start),
+            head: (r, end),
+        });
+        self.last_edit_kind = None;
+    }
+
     /// Move the cursor to the screen coordinates (col, row). Used for mouse clicks.
     pub fn click(&mut self, col: u16, row: u16) {
         if self.lines.is_empty() || self.last_inner.height == 0 {
@@ -641,6 +681,10 @@ impl Editor {
 /// Convert a char index within `s` to a byte index, saturating at `s.len()`.
 fn char_byte(s: &str, char_idx: usize) -> usize {
     s.char_indices().nth(char_idx).map(|(i, _)| i).unwrap_or(s.len())
+}
+
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
 }
 
 fn is_binary(data: &[u8]) -> bool {
@@ -1500,6 +1544,55 @@ mod tests {
         assert_eq!(buf[(text_x, row2_y)].bg, selected_bg, "row 2 col 0");
         assert_eq!(buf[(text_x + 1, row2_y)].bg, selected_bg, "row 2 col 1");
         assert_ne!(buf[(text_x + 2, row2_y)].bg, selected_bg, "row 2 col 2 not selected");
+    }
+
+    #[test]
+    fn double_click_selects_word_and_moves_cursor_to_end() {
+        let mut e = editor_with("hello world");
+        e.last_inner = Rect { x: 0, y: 0, width: 80, height: 25 };
+        e.last_gutter_width = 2;
+        let text_x: u16 = 3;
+        e.select_word_at(text_x + 7, 0);
+        let sel = e.selection.expect("word selection created");
+        assert_eq!(sel.normalised(), ((0, 6), (0, 11)));
+        assert_eq!(e.cursor_col, 11);
+    }
+
+    #[test]
+    fn double_click_on_first_word_selects_it_from_column_zero() {
+        let mut e = editor_with("foo bar");
+        e.last_inner = Rect { x: 0, y: 0, width: 80, height: 25 };
+        e.last_gutter_width = 2;
+        let text_x: u16 = 3;
+        e.select_word_at(text_x + 1, 0);
+        let sel = e.selection.unwrap();
+        assert_eq!(sel.normalised(), ((0, 0), (0, 3)));
+        assert_eq!(e.cursor_col, 3);
+    }
+
+    #[test]
+    fn double_click_on_whitespace_does_not_create_a_selection() {
+        let mut e = editor_with("hello world");
+        e.last_inner = Rect { x: 0, y: 0, width: 80, height: 25 };
+        e.last_gutter_width = 2;
+        let text_x: u16 = 3;
+        e.select_word_at(text_x + 5, 0);
+        assert!(
+            e.selection.map(|s| !s.has_area()).unwrap_or(true),
+            "whitespace double-click must not start a non-empty selection"
+        );
+    }
+
+    #[test]
+    fn double_click_past_end_of_line_extends_last_word() {
+        let mut e = editor_with("foo");
+        e.last_inner = Rect { x: 0, y: 0, width: 80, height: 25 };
+        e.last_gutter_width = 2;
+        let text_x: u16 = 3;
+        e.select_word_at(text_x + 12, 0);
+        let sel = e.selection.unwrap();
+        assert_eq!(sel.normalised(), ((0, 0), (0, 3)));
+        assert_eq!(e.cursor_col, 3);
     }
 
     #[test]

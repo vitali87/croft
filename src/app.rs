@@ -221,7 +221,20 @@ pub struct App {
     /// when the host terminal can't render OSC-1337 (we then fall back to
     /// the codicon glyph rendered inside the same multi-row block).
     activity_images: Option<ActivityBarImages>,
+    /// Last mouse-down on the editor pane: `(when, column, row)`. Used to
+    /// detect a double-click as two left-down events at the same cell within
+    /// `DOUBLE_CLICK_WINDOW`. Cleared when the next click lands elsewhere or
+    /// after the double-click fires.
+    last_editor_left_down: Option<(std::time::Instant, u16, u16)>,
+    /// True when the activity-bar OSC-1337 images need to be (re)written on
+    /// the next post-draw flush. Set initially, on sidebar-view change, and
+    /// on terminal resize. Cleared after emit. Without this gate every
+    /// redraw repaints the PNGs and you see the cursor blink each time iTerm
+    /// processes the image.
+    activity_overlay_dirty: bool,
 }
+
+const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(500);
 
 impl App {
     pub fn new(root: PathBuf) -> Result<Self> {
@@ -254,6 +267,8 @@ impl App {
             last_git_check: std::time::Instant::now(),
             cursor_blink_anchor: std::time::Instant::now(),
             activity_images: None,
+            last_editor_left_down: None,
+            activity_overlay_dirty: true,
         })
     }
 
@@ -349,6 +364,18 @@ impl App {
     /// blink off.
     fn poke_cursor(&mut self) {
         self.cursor_blink_anchor = std::time::Instant::now();
+    }
+
+    /// Mirrors the predicate used in `App::render` to decide whether to call
+    /// `frame.set_cursor_position`. Used by the post-draw overlay writer so
+    /// it can re-Show the caret after the OSC-1337 image emit only when the
+    /// editor would have shown it this frame.
+    fn cursor_should_be_visible(&self) -> bool {
+        self.focus == Pane::Editor
+            && self.context_menu.is_none()
+            && self.prompt.is_none()
+            && self.cursor_visible_phase()
+            && self.editor.cursor_screen_pos().is_some()
     }
 
     /// True iff the caret is currently in its visible half of the blink
@@ -498,10 +525,18 @@ impl App {
             return;
         }
         let bg = Style::default().bg(Color::Rgb(0x14, 0x1a, 0x2a));
-        frame.render_widget(
-            ratatui::widgets::Block::default().style(bg),
-            area,
-        );
+        // In images mode the icon PNG owns the entire activity-bar block —
+        // background, codicon, and active pill are baked in. Rendering a bg
+        // block here would force a per-cell diff every frame, which in turn
+        // would force us to re-emit the OSC-1337 images on every draw. Both
+        // are visible to the user. So in images mode we leave the cells
+        // untouched and let the post-draw OSC writer paint them once.
+        if self.activity_images.is_none() {
+            frame.render_widget(
+                ratatui::widgets::Block::default().style(bg),
+                area,
+            );
+        }
         let active_bar = Color::Rgb(0x4e, 0x9a, 0xff);
         let bg_color = bg.bg.unwrap_or(Color::Reset);
         let explorer_block = activity_explorer_block(area);
@@ -559,6 +594,9 @@ impl App {
     }
 
     fn set_sidebar_view(&mut self, view: SidebarView) {
+        if self.sidebar_view != view {
+            self.activity_overlay_dirty = true;
+        }
         self.sidebar_view = view;
         if !self.show_tree {
             self.show_tree = true; // ensure the side panel is open when switching
@@ -1227,6 +1265,9 @@ impl App {
                 }
             }
             MouseEventKind::Down(MouseButton::Left) => {
+                if !in_editor {
+                    self.last_editor_left_down = None;
+                }
                 // Activity-bar hit-test takes precedence over the side panel.
                 if rect_contains(self.sidebar_areas.explorer_icon, m.column, m.row) {
                     self.set_sidebar_view(SidebarView::Explorer);
@@ -1272,9 +1313,23 @@ impl App {
                     }
                 } else if in_editor {
                     self.focus_pane(Pane::Editor);
-                    // Anchor a fresh selection at the click; a drag widens it,
-                    // a clean click ends up cleared on mouse-up.
-                    self.editor.mouse_down(m.column, m.row);
+                    let now = std::time::Instant::now();
+                    let is_double = matches!(
+                        self.last_editor_left_down,
+                        Some((t, x, y))
+                            if m.row == y
+                                && m.column.abs_diff(x) <= 1
+                                && now.duration_since(t) <= DOUBLE_CLICK_WINDOW
+                    );
+                    if is_double {
+                        self.editor.select_word_at(m.column, m.row);
+                        self.last_editor_left_down = None;
+                    } else {
+                        // Anchor a fresh selection at the click; a drag widens it,
+                        // a clean click ends up cleared on mouse-up.
+                        self.editor.mouse_down(m.column, m.row);
+                        self.last_editor_left_down = Some((now, m.column, m.row));
+                    }
                     self.poke_cursor();
                 } else if in_terminal {
                     self.focus_pane(Pane::Terminal);
@@ -1286,6 +1341,14 @@ impl App {
                 }
             }
             MouseEventKind::Drag(MouseButton::Left) => {
+                // Some terminals emit a Drag at the same cell as the Down even
+                // when the user hasn't actually dragged. Only forget the prior
+                // click when the pointer has truly moved off that cell.
+                if let Some((_, x, y)) = self.last_editor_left_down {
+                    if m.column != x || m.row != y {
+                        self.last_editor_left_down = None;
+                    }
+                }
                 if in_editor {
                     self.editor.mouse_drag(m.column, m.row);
                     self.poke_cursor();
@@ -2324,32 +2387,49 @@ fn main_loop(
             // we re-emit on every redraw — no flicker because both writes
             // hit the same diff cycle.
             let overlays = app.pending_activity_image_overlays();
-            if !overlays.is_empty() {
+            if app.activity_overlay_dirty && !overlays.is_empty() {
                 use std::io::Write;
                 let mut out = stdout();
-                let _ = write!(out, "\x1b[s"); // DECSC: save cursor
+                let cursor_on = app.cursor_should_be_visible();
+                let _ = write!(out, "\x1b[?25l\x1b[s");
                 for ((x, y), seq) in overlays {
                     let _ = write!(out, "\x1b[{};{}H", y + 1, x + 1); // 1-based
                     let _ = out.write_all(seq.as_bytes());
                 }
-                let _ = write!(out, "\x1b[u"); // DECRC: restore cursor
+                let _ = write!(out, "\x1b[u");
+                if cursor_on {
+                    let _ = write!(out, "\x1b[?25h");
+                }
                 let _ = out.flush();
+                app.activity_overlay_dirty = false;
             }
             needs_redraw = false;
             last_blink_visible = blink_visible;
         }
 
         if event::poll(Duration::from_millis(33))? {
-            match event::read()? {
-                Event::Key(key) => app.handle_key(key)?,
-                Event::Mouse(m) => app.handle_mouse(m),
-                Event::Paste(s) => app.handle_paste(&s),
-                Event::Resize(_, _) => {}
-                _ => {}
+            // Drain every event already queued so a click burst (Down + zero-
+            // movement Drag + Up, all delivered in <50ms by the terminal)
+            // coalesces into a single redraw. Otherwise each event triggers
+            // its own terminal.draw cycle, which Hides+Shows the hardware
+            // caret each time and the user sees the cursor blink twice
+            // rapidly before settling into the normal 530ms blink.
+            loop {
+                match event::read()? {
+                    Event::Key(key) => app.handle_key(key)?,
+                    Event::Mouse(m) => app.handle_mouse(m),
+                    Event::Paste(s) => app.handle_paste(&s),
+                    Event::Resize(_, _) => {
+                        // Alt-screen reflow blanks the activity bar cells; the
+                        // OSC images need to be re-emitted on the next draw.
+                        app.activity_overlay_dirty = true;
+                    }
+                    _ => {}
+                }
+                if !event::poll(Duration::ZERO)? {
+                    break;
+                }
             }
-            // Any handled event might have changed visible state; defer the
-            // call to the next iteration's terminal.draw so a stream of
-            // events coalesces into a single frame.
             needs_redraw = true;
         }
     }
