@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use crate::highlight::{
     compute_line_starts, highlight_text, lang_for_extension, HiSpan, LangKind, LangRegistry,
 };
+use crate::widgets::scrollbar;
 
 const MAX_FILE_BYTES: u64 = 5 * 1024 * 1024;
 
@@ -77,6 +78,7 @@ pub struct Editor {
     pub status: String,
     pub last_area: Rect,
     pub last_inner: Rect,
+    pub last_scrollbar: Rect,
     pub last_gutter_width: u16,
     pub selection: Option<EditorSelection>,
     /// True when this tab is the single replaceable "preview" slot. Single-
@@ -114,6 +116,7 @@ impl Editor {
             status: String::from("No file open"),
             last_area: Rect::default(),
             last_inner: Rect::default(),
+            last_scrollbar: Rect::default(),
             last_gutter_width: 0,
             selection: None,
             preview: false,
@@ -640,13 +643,42 @@ impl Editor {
     }
 
     pub fn scroll_up(&mut self, n: usize) {
-        self.cursor_row = self.cursor_row.saturating_sub(n);
-        self.cursor_col = self.cursor_col.min(self.line_char_len(self.cursor_row));
-        self.last_edit_kind = None;
+        self.scroll_view_to(self.scroll.saturating_sub(n));
     }
 
     pub fn scroll_down(&mut self, n: usize) {
-        self.cursor_row = (self.cursor_row + n).min(self.lines.len().saturating_sub(1));
+        self.scroll_view_to(self.scroll.saturating_add(n));
+    }
+
+    pub fn scroll_to_bar_y(&mut self, y: u16) -> bool {
+        let Some(metrics) = scrollbar::vertical_metrics(
+            self.last_scrollbar,
+            self.lines.len(),
+            self.last_inner.height as usize,
+            self.scroll,
+        ) else {
+            return false;
+        };
+        self.scroll_view_to(scrollbar::scroll_for_y(metrics, y));
+        true
+    }
+
+    fn scroll_view_to(&mut self, top: usize) {
+        let viewport = self.last_inner.height as usize;
+        if viewport == 0 || self.lines.is_empty() {
+            self.scroll = 0;
+            self.cursor_row = 0;
+            self.cursor_col = 0;
+            self.last_edit_kind = None;
+            return;
+        }
+        self.scroll = top.min(self.lines.len().saturating_sub(viewport));
+        let last_visible = (self.scroll + viewport - 1).min(self.lines.len().saturating_sub(1));
+        if self.cursor_row < self.scroll {
+            self.cursor_row = self.scroll;
+        } else if self.cursor_row > last_visible {
+            self.cursor_row = last_visible;
+        }
         self.cursor_col = self.cursor_col.min(self.line_char_len(self.cursor_row));
         self.last_edit_kind = None;
     }
@@ -2080,8 +2112,12 @@ impl Widget for &mut Editor {
         block.render(area, buf);
         self.last_area = area;
         self.last_inner = inner;
+        self.last_scrollbar = Rect::default();
 
         let height = inner.height as usize;
+        if height == 0 {
+            return;
+        }
         if self.cursor_row < self.scroll {
             self.scroll = self.cursor_row;
         } else if self.cursor_row >= self.scroll + height {
@@ -2090,8 +2126,20 @@ impl Widget for &mut Editor {
 
         let gutter_width = (self.lines.len() + 1).to_string().len() as u16 + 1;
         self.last_gutter_width = gutter_width;
+        let scrollbar_area = Rect {
+            x: inner.x + inner.width.saturating_sub(1),
+            y: inner.y,
+            width: u16::from(inner.width > 0),
+            height: inner.height,
+        };
+        let scrollbar_metrics =
+            scrollbar::vertical_metrics(scrollbar_area, self.lines.len(), height, self.scroll);
+        if let Some(metrics) = scrollbar_metrics {
+            self.last_scrollbar = metrics.area;
+        }
+        let scrollbar_width = u16::from(scrollbar_metrics.is_some());
         let text_x = inner.x + gutter_width + 1;
-        let text_width = inner.width.saturating_sub(gutter_width + 2);
+        let text_width = inner.width.saturating_sub(gutter_width + 2 + scrollbar_width);
 
         let sel_norm = self
             .selection
@@ -2151,6 +2199,9 @@ impl Widget for &mut Editor {
             // `frame.set_cursor_position(...)` so the blink/overlay never
             // hides the underlying character.
         }
+        if let Some(metrics) = scrollbar_metrics {
+            scrollbar::render_vertical(buf, metrics, self.focused);
+        }
     }
 }
 
@@ -2173,7 +2224,7 @@ impl Editor {
         let text_width = self
             .last_inner
             .width
-            .saturating_sub(self.last_gutter_width + 2);
+            .saturating_sub(self.last_gutter_width + 2 + u16::from(self.last_scrollbar.width > 0));
         if text_width == 0 {
             return None;
         }

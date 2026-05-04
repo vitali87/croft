@@ -1,4 +1,5 @@
 use crate::icons;
+use crate::widgets::scrollbar;
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
@@ -24,6 +25,7 @@ pub struct FileTree {
     pub focused: bool,
     pub last_inner: Rect,
     pub last_area: Rect,
+    pub last_scrollbar: Rect,
 }
 
 impl FileTree {
@@ -42,6 +44,7 @@ impl FileTree {
             focused: true,
             last_inner: Rect::default(),
             last_area: Rect::default(),
+            last_scrollbar: Rect::default(),
         };
         tree.load_children(0);
         tree
@@ -137,6 +140,43 @@ impl FileTree {
 
     pub fn page_down(&mut self, page: usize) {
         self.selected = (self.selected + page).min(self.nodes.len().saturating_sub(1));
+    }
+
+    pub fn scroll_up(&mut self, rows: usize) {
+        self.scroll_to(self.scroll.saturating_sub(rows));
+    }
+
+    pub fn scroll_down(&mut self, rows: usize) {
+        self.scroll_to(self.scroll.saturating_add(rows));
+    }
+
+    pub fn scroll_to_bar_y(&mut self, y: u16) -> bool {
+        let Some(metrics) = scrollbar::vertical_metrics(
+            self.last_scrollbar,
+            self.nodes.len(),
+            self.last_inner.height as usize,
+            self.scroll,
+        ) else {
+            return false;
+        };
+        self.scroll_to(scrollbar::scroll_for_y(metrics, y));
+        true
+    }
+
+    fn scroll_to(&mut self, top: usize) {
+        let viewport = self.last_inner.height as usize;
+        if viewport == 0 || self.nodes.is_empty() {
+            self.scroll = 0;
+            self.selected = 0;
+            return;
+        }
+        self.scroll = top.min(self.nodes.len().saturating_sub(viewport));
+        let last_visible = (self.scroll + viewport - 1).min(self.nodes.len().saturating_sub(1));
+        if self.selected < self.scroll {
+            self.selected = self.scroll;
+        } else if self.selected > last_visible {
+            self.selected = last_visible;
+        }
     }
 
     pub fn home(&mut self) {
@@ -894,13 +934,33 @@ impl Widget for &mut FileTree {
         block.render(area, buf);
         self.last_inner = inner;
         self.last_area = area;
+        self.last_scrollbar = Rect::default();
 
         let visible_height = inner.height as usize;
+        if visible_height == 0 {
+            return;
+        }
         if self.selected < self.scroll {
             self.scroll = self.selected;
         } else if self.selected >= self.scroll + visible_height {
             self.scroll = self.selected + 1 - visible_height;
         }
+        let scrollbar_area = Rect {
+            x: inner.x + inner.width.saturating_sub(1),
+            y: inner.y,
+            width: u16::from(inner.width > 0),
+            height: inner.height,
+        };
+        let scrollbar_metrics = scrollbar::vertical_metrics(
+            scrollbar_area,
+            self.nodes.len(),
+            visible_height,
+            self.scroll,
+        );
+        if let Some(metrics) = scrollbar_metrics {
+            self.last_scrollbar = metrics.area;
+        }
+        let row_width = inner.width.saturating_sub(u16::from(scrollbar_metrics.is_some()));
 
         let end = (self.scroll + visible_height).min(self.nodes.len());
         for (row, idx) in (self.scroll..end).enumerate() {
@@ -964,8 +1024,11 @@ impl Widget for &mut FileTree {
             } else {
                 Style::default()
             };
-            buf.set_style(Rect { x: inner.x, y, width: inner.width, height: 1 }, line_style);
-            buf.set_line(inner.x, y, &line, inner.width);
+            buf.set_style(Rect { x: inner.x, y, width: row_width, height: 1 }, line_style);
+            buf.set_line(inner.x, y, &line, row_width);
+        }
+        if let Some(metrics) = scrollbar_metrics {
+            scrollbar::render_vertical(buf, metrics, self.focused);
         }
     }
 }

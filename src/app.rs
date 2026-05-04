@@ -281,6 +281,8 @@ pub struct App {
     /// the existing preview-style behaviour (replace active tab, keep tree
     /// focused).
     last_tree_left_down: Option<(std::time::Instant, u16, u16)>,
+    /// Pane whose scrollbar is currently being dragged with the left mouse button.
+    scrollbar_drag: Option<Pane>,
     /// True when the activity-bar OSC-1337 images need to be (re)written on
     /// the next post-draw flush. Set initially, on sidebar-view change, and
     /// on terminal resize. Cleared after emit. Without this gate every
@@ -574,6 +576,7 @@ impl App {
             activity_images: None,
             last_editor_left_down: None,
             last_tree_left_down: None,
+            scrollbar_drag: None,
             activity_overlay_dirty: true,
             recent_repo_remote,
             recent_commits: Vec::new(),
@@ -2131,6 +2134,9 @@ impl App {
         let in_editor_pane = rect_contains(self.editor.last_full_area, m.column, m.row);
         let in_editor = rect_contains(self.editor.last_area, m.column, m.row);
         let in_terminal = rect_contains(self.terminal.last_area, m.column, m.row);
+        let in_tree_scrollbar = self.sidebar_view == SidebarView::Explorer
+            && rect_contains(self.tree.last_scrollbar, m.column, m.row);
+        let in_editor_scrollbar = rect_contains(self.editor.last_scrollbar, m.column, m.row);
 
         match m.kind {
             MouseEventKind::Down(MouseButton::Right) => {
@@ -2172,6 +2178,21 @@ impl App {
                     && self.editor.is_blank_initial()
                     && self.activate_welcome_link(m.column, m.row)
                 {
+                    return;
+                }
+                if in_tree_scrollbar {
+                    self.focus_pane(Pane::Tree);
+                    self.tree.scroll_to_bar_y(m.row);
+                    self.scrollbar_drag = Some(Pane::Tree);
+                    self.last_tree_left_down = None;
+                    return;
+                }
+                if in_editor_scrollbar {
+                    self.focus_pane(Pane::Editor);
+                    self.editor.scroll_to_bar_y(m.row);
+                    self.scrollbar_drag = Some(Pane::Editor);
+                    self.last_editor_left_down = None;
+                    self.poke_cursor();
                     return;
                 }
                 if in_tree && self.sidebar_view == SidebarView::Search {
@@ -2296,6 +2317,19 @@ impl App {
                 }
             }
             MouseEventKind::Drag(MouseButton::Left) => {
+                if let Some(pane) = self.scrollbar_drag {
+                    match pane {
+                        Pane::Tree => {
+                            self.tree.scroll_to_bar_y(m.row);
+                        }
+                        Pane::Editor => {
+                            self.editor.scroll_to_bar_y(m.row);
+                            self.poke_cursor();
+                        }
+                        Pane::Terminal => {}
+                    }
+                    return;
+                }
                 // Some terminals emit a Drag at the same cell as the Down even
                 // when the user hasn't actually dragged. Only forget the prior
                 // click when the pointer has truly moved off that cell.
@@ -2321,6 +2355,9 @@ impl App {
                 }
             }
             MouseEventKind::Up(MouseButton::Left) => {
+                if self.scrollbar_drag.take().is_some() {
+                    return;
+                }
                 // Mouse-up never auto-copies. The selection stays highlighted
                 // so the user can hit Cmd/Ctrl+C themselves; a click without
                 // drag (zero-area selection) is silently dropped.
@@ -2339,10 +2376,8 @@ impl App {
                 }
             }
             MouseEventKind::ScrollDown => {
-                if in_tree {
-                    self.tree.move_down();
-                    self.tree.move_down();
-                    self.tree.move_down();
+                if in_tree && self.sidebar_view == SidebarView::Explorer {
+                    self.tree.scroll_down(3);
                 } else if in_editor {
                     self.editor.scroll_down(3);
                 } else if in_terminal {
@@ -2354,10 +2389,8 @@ impl App {
                 }
             }
             MouseEventKind::ScrollUp => {
-                if in_tree {
-                    self.tree.move_up();
-                    self.tree.move_up();
-                    self.tree.move_up();
+                if in_tree && self.sidebar_view == SidebarView::Explorer {
+                    self.tree.scroll_up(3);
                 } else if in_editor {
                     self.editor.scroll_up(3);
                 } else if in_terminal {
