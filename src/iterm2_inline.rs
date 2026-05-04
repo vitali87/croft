@@ -8,7 +8,6 @@ pub const SEARCH_SRC_PNG: &[u8] =
 pub const WELCOME_LOGO_PNG: &[u8] =
     include_bytes!("../assets/logo-tight-removebg-preview.png");
 
-const BAR_BG: Rgba<u8> = Rgba([0x14, 0x1a, 0x2a, 0xff]);
 const ACTIVE_PILL: Rgba<u8> = Rgba([0x4e, 0x9a, 0xff, 0xff]);
 const ACTIVE_TINT: Rgba<u8> = Rgba([0xff, 0xff, 0xff, 0xff]);
 const INACTIVE_TINT: Rgba<u8> = Rgba([0x9d, 0xa5, 0xb4, 0xff]);
@@ -25,6 +24,7 @@ pub fn compose_icon(
     canvas_w: u32,
     canvas_h: u32,
     is_active: bool,
+    bg: Rgba<u8>,
 ) -> Result<Vec<u8>, image::ImageError> {
     let codicon = image::load_from_memory_with_format(
         src_codicon_png,
@@ -37,7 +37,7 @@ pub fn compose_icon(
     let tint = if is_active { ACTIVE_TINT } else { INACTIVE_TINT };
     let tinted = tint_rgba(&scaled, tint);
     let mut canvas: RgbaImage =
-        ImageBuffer::from_pixel(canvas_w, canvas_h, BAR_BG);
+        ImageBuffer::from_pixel(canvas_w, canvas_h, bg);
     let off_x = ((canvas_w - icon_size) / 2) as i64;
     let off_y: u32 = 1;
     image::imageops::overlay(&mut canvas, &tinted, off_x, off_y as i64);
@@ -231,6 +231,34 @@ mod tests {
             seq.contains(":UE5HREFUQQ=="),
             "expected base64 payload after colon: {seq:?}"
         );
+    }
+
+    #[test]
+    fn compose_icon_canvas_corners_equal_caller_supplied_bg() {
+        // 1x1 transparent PNG: avoids needing a real codicon asset and lets
+        // us verify the canvas fill is exactly the caller-provided sRGB bg.
+        let src = {
+            let img: RgbaImage = ImageBuffer::from_pixel(1, 1, Rgba([0, 0, 0, 0]));
+            let mut buf = Vec::new();
+            image::DynamicImage::ImageRgba8(img)
+                .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+                .unwrap();
+            buf
+        };
+        let bg = Rgba([0x1e, 0x22, 0x2e, 0xff]);
+        let baked = compose_icon(&src, 32, 16, false, bg).unwrap();
+        let decoded = image::load_from_memory_with_format(&baked, image::ImageFormat::Png)
+            .unwrap()
+            .to_rgba8();
+        let (w, h) = (decoded.width(), decoded.height());
+        for (x, y) in [(0, 0), (w - 1, 0), (0, h - 1), (w - 1, h - 1)] {
+            let px = decoded.get_pixel(x, y).0;
+            assert_eq!(
+                (px[0], px[1], px[2], px[3]),
+                (bg.0[0], bg.0[1], bg.0[2], bg.0[3]),
+                "corner ({x},{y}) must equal caller bg"
+            );
+        }
     }
 
     #[test]

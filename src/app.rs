@@ -385,9 +385,16 @@ impl App {
         let is_tmux = crate::iterm2_inline::detect_tmux();
         let w_cells = ACTIVITY_BAR_WIDTH;
         let h_cells = ACTIVITY_ICON_HEIGHT;
+        let icon_bg = image::Rgba([
+            EDITOR_BG_RGB.0,
+            EDITOR_BG_RGB.1,
+            EDITOR_BG_RGB.2,
+            0xff,
+        ]);
         let encode = |src: &[u8], is_active: bool| -> Option<String> {
             let baked =
-                crate::iterm2_inline::compose_icon(src, canvas_w, canvas_h, is_active).ok()?;
+                crate::iterm2_inline::compose_icon(src, canvas_w, canvas_h, is_active, icon_bg)
+                    .ok()?;
             // preserveAspectRatio=0: stretch to exactly fill 4×2 cells.
             // Since the PNG was composed at exactly that pixel size,
             // there's no actual scaling and the codicon's square area
@@ -779,7 +786,15 @@ impl App {
         if area.width == 0 || area.height == 0 {
             return;
         }
-        let bg = Style::default().bg(Color::Rgb(0x14, 0x1a, 0x2a));
+        // In images mode the activity bar inherits the iTerm session bg
+        // (forced to sRGB(EDITOR_BG_RGB) via SetColors), matching the rest
+        // of the panes. The glyph-fallback path keeps a solid bg for
+        // terminals that can't render OSC-1337.
+        let bg = if self.activity_images.is_some() {
+            Style::default().bg(Color::Reset)
+        } else {
+            Style::default().bg(Color::Rgb(EDITOR_BG_RGB.0, EDITOR_BG_RGB.1, EDITOR_BG_RGB.2))
+        };
         // In images mode the icon PNG owns the entire activity-bar block —
         // background, codicon, and active pill are baked in. Rendering a bg
         // block here would force a per-cell diff every frame, which in turn
