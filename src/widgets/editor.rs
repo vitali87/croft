@@ -1580,6 +1580,64 @@ mod tests {
     }
 
     #[test]
+    fn editor_tabs_search_highlight_survives_close_then_open_via_preview() {
+        // Reported bug: after closing the first tab with X, the next file
+        // opened from search lost the yellow highlights. The new editor
+        // was created without the EditorTabs' current term applied.
+        let f1 = NamedTempFile::new().unwrap();
+        let f2 = NamedTempFile::new().unwrap();
+        std::fs::write(f1.path(), "alpha needle bravo\n").unwrap();
+        std::fs::write(f2.path(), "second needle line\n").unwrap();
+        let mut t = EditorTabs::new();
+        t.open_pinned(f1.path()).unwrap();
+        t.set_search_highlight(Some(String::from("needle")));
+        // Close the first (and only non-blank) tab — leaves the blank
+        // initial tab.
+        let close_idx = t
+            .editors
+            .iter()
+            .position(|e| e.path.as_deref() == Some(f1.path()))
+            .unwrap();
+        assert!(t.close_tab(close_idx));
+        // Now open a different file via preview, mirroring "click on a
+        // search hit" in the running app.
+        t.open_preview(f2.path()).unwrap();
+        let active = t.editors.iter().find(|e| e.path.as_deref() == Some(f2.path())).unwrap();
+        assert_eq!(
+            active.search_highlight.as_deref(),
+            Some("needle"),
+            "newly opened tab must inherit the EditorTabs' current search term"
+        );
+    }
+
+    #[test]
+    fn editor_tabs_search_highlight_survives_open_pinned_after_close() {
+        // Same scenario as above but via open_pinned (double-click /
+        // Ctrl+Enter). The new editor must also inherit the term.
+        let f1 = NamedTempFile::new().unwrap();
+        let f2 = NamedTempFile::new().unwrap();
+        std::fs::write(f1.path(), "first\n").unwrap();
+        std::fs::write(f2.path(), "second needle line\n").unwrap();
+        let mut t = EditorTabs::new();
+        t.open_pinned(f1.path()).unwrap();
+        t.open_pinned(f2.path()).unwrap();
+        t.set_search_highlight(Some(String::from("needle")));
+        // Close f1; both should still be highlighted, and now a fresh open
+        // of a third file should inherit too.
+        let f3 = NamedTempFile::new().unwrap();
+        std::fs::write(f3.path(), "third needle row\n").unwrap();
+        let close_idx = t
+            .editors
+            .iter()
+            .position(|e| e.path.as_deref() == Some(f1.path()))
+            .unwrap();
+        assert!(t.close_tab(close_idx));
+        t.open_pinned(f3.path()).unwrap();
+        let third = t.editors.iter().find(|e| e.path.as_deref() == Some(f3.path())).unwrap();
+        assert_eq!(third.search_highlight.as_deref(), Some("needle"));
+    }
+
+    #[test]
     fn editor_tabs_set_search_highlight_propagates_to_every_tab() {
         let mut t = EditorTabs::new();
         let f1 = NamedTempFile::new().unwrap();
@@ -2188,6 +2246,13 @@ pub struct EditorTabs {
     /// Used by `App::handle_mouse` for hit-testing — the active editor's
     /// own `last_area` only covers the body below the strip.
     pub last_full_area: Rect,
+    /// Source of truth for the search-match term that's currently being
+    /// painted in every tab's body. Each `Editor.search_highlight` is a
+    /// copy kept in sync with this; storing it here lets a freshly-created
+    /// editor (e.g. after closing the previous tab and opening a new file
+    /// from a search hit) inherit the term without the App needing to
+    /// re-call `set_search_highlight` after every open.
+    search_highlight_term: Option<String>,
 }
 
 impl EditorTabs {
@@ -2199,6 +2264,7 @@ impl EditorTabs {
             tab_close_x: Vec::new(),
             tab_strip_y: 0,
             last_full_area: Rect::default(),
+            search_highlight_term: None,
         }
     }
 
@@ -2209,8 +2275,12 @@ impl EditorTabs {
     /// Set (or clear) the search-match highlight term for every open tab,
     /// so opening another file from search keeps the same query lit, and
     /// clearing the search box wipes the highlights everywhere at once.
+    /// Also persists the term so editors created after this call (e.g.
+    /// when a tab is closed and a new file is opened from a search hit)
+    /// inherit the highlight automatically.
     pub fn set_search_highlight(&mut self, term: Option<String>) {
         let normalised = term.filter(|s| !s.is_empty());
+        self.search_highlight_term = normalised.clone();
         for ed in &mut self.editors {
             ed.search_highlight = normalised.clone();
         }
@@ -2409,12 +2479,14 @@ impl EditorTabs {
             let active = self.active;
             self.editors[active].open(path)?;
             self.editors[active].preview = true;
+            self.editors[active].search_highlight = self.search_highlight_term.clone();
             return Ok(());
         }
         let mut e = Editor::new();
         e.focused = self.editors[self.active].focused;
         e.open(path)?;
         e.preview = true;
+        e.search_highlight = self.search_highlight_term.clone();
         let pos = self.active + 1;
         self.editors.insert(pos, e);
         self.editors[self.active].focused = false;
@@ -2435,12 +2507,14 @@ impl EditorTabs {
             let active = self.active;
             self.editors[active].open(path)?;
             self.editors[active].preview = false;
+            self.editors[active].search_highlight = self.search_highlight_term.clone();
             return Ok(());
         }
         let mut e = Editor::new();
         e.focused = self.editors[self.active].focused;
         e.open(path)?;
         e.preview = false;
+        e.search_highlight = self.search_highlight_term.clone();
         let pos = self.active + 1;
         self.editors.insert(pos, e);
         self.editors[self.active].focused = false;
