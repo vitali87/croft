@@ -1859,6 +1859,38 @@ mod tests {
         assert_eq!(sel.head, (0, 5));
         assert_eq!(e.cursor_col, 5);
     }
+
+    #[test]
+    fn editor_tabs_rename_open_path_updates_matching_tab_only() {
+        // Renaming a file on disk must update the matching tab so the
+        // editor keeps tracking the entry. Other tabs must be untouched.
+        let mut tabs = EditorTabs::new();
+        tabs.add_tab_with_path(std::path::PathBuf::from("/work/old.txt"));
+        tabs.add_tab_with_path(std::path::PathBuf::from("/work/other.txt"));
+        let old = std::path::PathBuf::from("/work/old.txt");
+        let new = std::path::PathBuf::from("/work/renamed.txt");
+        tabs.rename_open_path(&old, &new);
+        let paths: Vec<Option<std::path::PathBuf>> =
+            tabs.iter_tabs().map(|e| e.path.clone()).collect();
+        assert!(paths.contains(&Some(new.clone())));
+        assert!(!paths.contains(&Some(old)));
+        assert!(paths.contains(&Some(std::path::PathBuf::from("/work/other.txt"))));
+    }
+
+    #[test]
+    fn editor_tabs_rename_open_path_is_noop_when_path_not_open() {
+        let mut tabs = EditorTabs::new();
+        tabs.add_tab_with_path(std::path::PathBuf::from("/work/a.txt"));
+        let before: Vec<Option<std::path::PathBuf>> =
+            tabs.iter_tabs().map(|e| e.path.clone()).collect();
+        tabs.rename_open_path(
+            std::path::Path::new("/work/never-opened.txt"),
+            std::path::Path::new("/work/whatever.txt"),
+        );
+        let after: Vec<Option<std::path::PathBuf>> =
+            tabs.iter_tabs().map(|e| e.path.clone()).collect();
+        assert_eq!(before, after);
+    }
 }
 
 impl Widget for &mut Editor {
@@ -2045,6 +2077,17 @@ impl EditorTabs {
         self.active = idx;
         self.editors[self.active].focused = true;
         true
+    }
+
+    /// If any tab currently points at `old`, repoint it to `new`. The on-
+    /// disk file has already been moved; this only updates the in-memory
+    /// path so subsequent saves and the tab label track the new name.
+    pub fn rename_open_path(&mut self, old: &Path, new: &Path) {
+        for e in &mut self.editors {
+            if e.path.as_deref() == Some(old) {
+                e.path = Some(new.to_path_buf());
+            }
+        }
     }
 
     /// Open `path` in a brand-new tab inserted directly after the active

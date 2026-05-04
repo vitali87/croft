@@ -172,6 +172,32 @@ enum MenuAction {
     Create(CreateKind),
     /// Move the path to the OS trash (recoverable).
     Delete(PathBuf),
+    /// Open the rename prompt pre-filled with the entry's current name.
+    Rename(PathBuf),
+}
+
+/// Build the right-click context-menu items for the explorer.
+///
+/// * Right-click on an entry (file or non-root folder) → entry-scoped
+///   actions: Rename, Delete.
+/// * Right-click on empty tree space, or on the workspace root row →
+///   workspace-scoped actions: New File, New Folder.
+fn build_tree_context_menu_items(
+    node: Option<&crate::widgets::file_tree::Node>,
+    root: &Path,
+) -> Vec<(String, MenuAction)> {
+    let entry_target = crate::widgets::file_tree::delete_target_for(node, root);
+    if let Some(p) = entry_target {
+        vec![
+            (String::from("Rename…"), MenuAction::Rename(p.clone())),
+            (String::from("Delete"), MenuAction::Delete(p)),
+        ]
+    } else {
+        vec![
+            (String::from("New File…"), MenuAction::Create(CreateKind::File)),
+            (String::from("New Folder…"), MenuAction::Create(CreateKind::Folder)),
+        ]
+    }
 }
 
 struct ContextMenu {
@@ -188,6 +214,9 @@ struct ContextMenu {
 #[derive(Clone, PartialEq, Eq, Debug)]
 enum PromptKind {
     Create(CreateKind),
+    /// Rename the entry at `path`. The prompt's `target_dir` holds the
+    /// entry's parent; `buffer` is pre-filled with the current basename.
+    Rename(PathBuf),
 }
 
 struct Prompt {
@@ -1055,6 +1084,20 @@ impl App {
                 ]),
                 "Enter to create, Esc to cancel",
             ),
+            PromptKind::Rename(_) => (
+                ratatui::text::Line::from(vec![
+                    ratatui::text::Span::raw("> "),
+                    ratatui::text::Span::styled(
+                        p.buffer.as_str(),
+                        Style::default().fg(Color::White),
+                    ),
+                    ratatui::text::Span::styled(
+                        "█",
+                        Style::default().fg(Color::Rgb(0x4e, 0x9a, 0xff)),
+                    ),
+                ]),
+                "Enter to rename, Esc to cancel",
+            ),
         };
         frame.render_widget(
             ratatui::widgets::Paragraph::new(top_line),
@@ -1493,20 +1536,7 @@ impl App {
                     let target_dir = crate::widgets::file_tree::create_target_dir_for(
                         node, &self.tree.root,
                     );
-                    let delete_target = crate::widgets::file_tree::delete_target_for(
-                        node, &self.tree.root,
-                    );
-                    let mut items: Vec<(String, MenuAction)> = vec![
-                        (String::from("New File…"), MenuAction::Create(CreateKind::File)),
-                        (String::from("New Folder…"), MenuAction::Create(CreateKind::Folder)),
-                    ];
-                    if let Some(p) = delete_target {
-                        let label = match p.file_name() {
-                            Some(n) => format!("Delete {}", n.to_string_lossy()),
-                            None => String::from("Delete"),
-                        };
-                        items.push((label, MenuAction::Delete(p)));
-                    }
+                    let items = build_tree_context_menu_items(node, &self.tree.root);
                     self.context_menu = Some(ContextMenu {
                         origin: (m.column, m.row),
                         items,
@@ -1783,6 +1813,7 @@ impl App {
             MenuAction::Create(kind) => self.open_create_prompt(kind, target_dir),
             // No confirmation: trash is recoverable, the user asked for direct deletion.
             MenuAction::Delete(path) => self.delete_node(path),
+            MenuAction::Rename(path) => self.open_rename_prompt(path),
         }
     }
 
@@ -1820,6 +1851,25 @@ impl App {
             buffer: String::new(),
             kind: PromptKind::Create(kind),
             target_dir,
+            error: None,
+        });
+    }
+
+    fn open_rename_prompt(&mut self, path: PathBuf) {
+        let parent = path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| self.tree.root.clone());
+        let current = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let label = format!("Rename {}", path.display());
+        self.prompt = Some(Prompt {
+            label,
+            buffer: current,
+            kind: PromptKind::Rename(path),
+            target_dir: parent,
             error: None,
         });
     }
@@ -1897,6 +1947,30 @@ impl App {
                                 self.focus_pane(Pane::Editor);
                             }
                         }
+                    }
+                    Err(e) => {
+                        if let Some(p) = self.prompt.as_mut() {
+                            p.error = Some(e.to_string());
+                        }
+                    }
+                }
+            }
+            PromptKind::Rename(old_path) => {
+                let new_name = prompt.buffer.trim().to_string();
+                let parent = prompt.target_dir.clone();
+                match crate::widgets::file_tree::rename_in(&parent, &old_path, &new_name) {
+                    Ok(new_path) => {
+                        self.prompt = None;
+                        self.status = format!("Renamed to {}", new_path.display());
+                        if let Some(idx) = self.tree.index_of_dir(&parent) {
+                            self.tree.refresh_children(idx);
+                            if let Some(new_idx) =
+                                self.tree.nodes.iter().position(|n| n.path == new_path)
+                            {
+                                self.tree.select(new_idx);
+                            }
+                        }
+                        self.editor.rename_open_path(&old_path, &new_path);
                     }
                     Err(e) => {
                         if let Some(p) = self.prompt.as_mut() {
@@ -2724,6 +2798,73 @@ mod tests {
         assert_eq!(build_title(p), "croft  croft");
         let p = std::path::Path::new("/");
         assert_eq!(build_title(p), "croft  /");
+    }
+
+    fn file_node(path: &Path) -> crate::widgets::file_tree::Node {
+        crate::widgets::file_tree::Node {
+            path: path.to_path_buf(),
+            depth: 1,
+            is_dir: false,
+            expanded: false,
+            loaded: false,
+        }
+    }
+
+    fn dir_node(path: &Path) -> crate::widgets::file_tree::Node {
+        crate::widgets::file_tree::Node {
+            path: path.to_path_buf(),
+            depth: 1,
+            is_dir: true,
+            expanded: false,
+            loaded: false,
+        }
+    }
+
+    #[test]
+    fn tree_context_menu_on_file_offers_rename_and_delete_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("hello.txt");
+        std::fs::write(&f, "hi").unwrap();
+        let n = file_node(&f);
+        let items = build_tree_context_menu_items(Some(&n), tmp.path());
+        let labels: Vec<&str> = items.iter().map(|(s, _)| s.as_str()).collect();
+        assert_eq!(labels, ["Rename…", "Delete"]);
+        assert!(matches!(items[0].1, MenuAction::Rename(ref p) if p == &f));
+        assert!(matches!(items[1].1, MenuAction::Delete(ref p) if p == &f));
+    }
+
+    #[test]
+    fn tree_context_menu_on_subfolder_offers_rename_and_delete_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path().join("sub");
+        std::fs::create_dir(&d).unwrap();
+        let n = dir_node(&d);
+        let items = build_tree_context_menu_items(Some(&n), tmp.path());
+        let labels: Vec<&str> = items.iter().map(|(s, _)| s.as_str()).collect();
+        assert_eq!(labels, ["Rename…", "Delete"]);
+        assert!(matches!(items[0].1, MenuAction::Rename(ref p) if p == &d));
+        assert!(matches!(items[1].1, MenuAction::Delete(ref p) if p == &d));
+    }
+
+    #[test]
+    fn tree_context_menu_on_empty_space_offers_new_file_and_new_folder_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let items = build_tree_context_menu_items(None, tmp.path());
+        let labels: Vec<&str> = items.iter().map(|(s, _)| s.as_str()).collect();
+        assert_eq!(labels, ["New File…", "New Folder…"]);
+        assert!(matches!(items[0].1, MenuAction::Create(CreateKind::File)));
+        assert!(matches!(items[1].1, MenuAction::Create(CreateKind::Folder)));
+    }
+
+    #[test]
+    fn tree_context_menu_on_workspace_root_offers_new_file_and_new_folder_only() {
+        // Right-clicking the workspace root row must NOT offer Rename/Delete
+        // (the root cannot be renamed or moved to trash from inside croft).
+        let tmp = tempfile::tempdir().unwrap();
+        let n = dir_node(tmp.path());
+        let items = build_tree_context_menu_items(Some(&n), tmp.path());
+        let labels: Vec<&str> = items.iter().map(|(s, _)| s.as_str()).collect();
+        assert_eq!(labels, ["New File…", "New Folder…"]);
     }
 }
 

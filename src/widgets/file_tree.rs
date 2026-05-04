@@ -297,6 +297,34 @@ pub fn move_to_trash(path: &Path) -> std::io::Result<()> {
     trash::delete(path).map_err(|e| std::io::Error::other(format!("{e}")))
 }
 
+/// Rename the entry at `old_path` to `new_name` within `parent`. Validates
+/// `new_name` via `validate_new_name`, refuses to overwrite an existing
+/// entry, and returns the new absolute path on success. A no-op rename
+/// (same name) returns Ok with the original path unchanged so the user
+/// can hit Enter on the prompt without typing.
+pub fn rename_in(
+    parent: &Path,
+    old_path: &Path,
+    new_name: &str,
+) -> std::io::Result<PathBuf> {
+    let trimmed = new_name.trim();
+    if let Err(msg) = validate_new_name(trimmed) {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, msg));
+    }
+    let target = parent.join(trimmed);
+    if target == old_path {
+        return Ok(target);
+    }
+    if target.exists() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!("{} already exists", target.display()),
+        ));
+    }
+    std::fs::rename(old_path, &target)?;
+    Ok(target)
+}
+
 /// Given a filesystem event path and the tree's workspace root, return the
 /// directory whose children should be refreshed.
 ///
@@ -727,6 +755,74 @@ mod tests {
         assert_eq!(tree.selected, last);
         tree.page_up(100);
         assert_eq!(tree.selected, 0);
+    }
+
+    #[test]
+    fn rename_in_renames_a_file_within_its_parent() {
+        let tmp = TempDir::new().unwrap();
+        let old = tmp.path().join("old.txt");
+        std::fs::write(&old, "hello").unwrap();
+        let new_path = rename_in(tmp.path(), &old, "new.txt").unwrap();
+        assert_eq!(new_path, tmp.path().join("new.txt"));
+        assert!(!old.exists(), "old name must be gone");
+        assert!(new_path.exists(), "new name must exist");
+        assert_eq!(std::fs::read_to_string(&new_path).unwrap(), "hello");
+    }
+
+    #[test]
+    fn rename_in_renames_a_folder_within_its_parent() {
+        let tmp = TempDir::new().unwrap();
+        let old = tmp.path().join("olddir");
+        std::fs::create_dir(&old).unwrap();
+        std::fs::write(old.join("inner.txt"), "x").unwrap();
+        let new_path = rename_in(tmp.path(), &old, "newdir").unwrap();
+        assert_eq!(new_path, tmp.path().join("newdir"));
+        assert!(new_path.is_dir());
+        assert_eq!(
+            std::fs::read_to_string(new_path.join("inner.txt")).unwrap(),
+            "x"
+        );
+    }
+
+    #[test]
+    fn rename_in_errors_when_target_already_exists() {
+        let tmp = TempDir::new().unwrap();
+        let a = tmp.path().join("a.txt");
+        let b = tmp.path().join("b.txt");
+        std::fs::write(&a, "a").unwrap();
+        std::fs::write(&b, "b").unwrap();
+        let err = rename_in(tmp.path(), &a, "b.txt").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        // Both originals must still exist intact.
+        assert!(a.exists());
+        assert!(b.exists());
+    }
+
+    #[test]
+    fn rename_in_rejects_invalid_names() {
+        let tmp = TempDir::new().unwrap();
+        let a = tmp.path().join("a.txt");
+        std::fs::write(&a, "a").unwrap();
+        // Slashes and reserved names must be rejected before the syscall.
+        assert!(rename_in(tmp.path(), &a, "sub/x.txt").is_err());
+        assert!(rename_in(tmp.path(), &a, "").is_err());
+        assert!(rename_in(tmp.path(), &a, ".").is_err());
+        assert!(rename_in(tmp.path(), &a, "..").is_err());
+        // Original is untouched.
+        assert!(a.exists());
+    }
+
+    #[test]
+    fn rename_in_no_op_returns_ok_with_same_path() {
+        // Renaming to the same name is a useful early-return: it covers the
+        // case where the user opens the prompt, doesn't change anything,
+        // and hits Enter. Treat it as success rather than ErrorKind::AlreadyExists.
+        let tmp = TempDir::new().unwrap();
+        let a = tmp.path().join("keep.txt");
+        std::fs::write(&a, "k").unwrap();
+        let new_path = rename_in(tmp.path(), &a, "keep.txt").unwrap();
+        assert_eq!(new_path, a);
+        assert!(a.exists());
     }
 }
 
