@@ -8,49 +8,6 @@ pub const SEARCH_SRC_PNG: &[u8] =
 pub const WELCOME_LOGO_PNG: &[u8] =
     include_bytes!("../assets/logo-tight-removebg-preview.png");
 
-/// Re-encode a PNG so its pixel dimensions exactly match the requested
-/// `(canvas_w_px, canvas_h_px)`. The source image is scaled with Lanczos3
-/// while preserving aspect ratio and letterboxed onto `bg`. Pass an
-/// `Rgba([_, _, _, 0])` to keep transparent letterboxing — iTerm will then
-/// blend the image against whatever cell background lies beneath, which
-/// is what we want for theme-agnostic welcome rendering.
-pub fn fit_image(
-    src_png: &[u8],
-    canvas_w_px: u32,
-    canvas_h_px: u32,
-    bg: Rgba<u8>,
-) -> Result<Vec<u8>, image::ImageError> {
-    let img = image::load_from_memory_with_format(src_png, image::ImageFormat::Png)?
-        .to_rgba8();
-    let (sw, sh) = (img.width(), img.height());
-    let scale = f64::min(
-        canvas_w_px as f64 / sw as f64,
-        canvas_h_px as f64 / sh as f64,
-    );
-    let new_w = ((sw as f64 * scale).round() as u32).max(1);
-    let new_h = ((sh as f64 * scale).round() as u32).max(1);
-    let scaled = image::imageops::resize(
-        &img,
-        new_w,
-        new_h,
-        image::imageops::FilterType::Lanczos3,
-    );
-    // Letterbox onto a fully transparent canvas. The OSC-1337 emit is
-    // paired with an iTerm `SetColors=bg=srgb:…` override at startup so
-    // the SGR-painted editor pane bg and the PNG's transparent areas
-    // both flow through sRGB → display, matching pixel-for-pixel.
-    let mut canvas: RgbaImage = ImageBuffer::from_pixel(canvas_w_px, canvas_h_px, bg);
-    let off_x = ((canvas_w_px - new_w) / 2) as i64;
-    let off_y = ((canvas_h_px - new_h) / 2) as i64;
-    image::imageops::overlay(&mut canvas, &scaled, off_x, off_y);
-    let mut out = Vec::with_capacity(8192);
-    image::DynamicImage::ImageRgba8(canvas).write_to(
-        &mut std::io::Cursor::new(&mut out),
-        image::ImageFormat::Png,
-    )?;
-    Ok(out)
-}
-
 const BAR_BG: Rgba<u8> = Rgba([0x14, 0x1a, 0x2a, 0xff]);
 const ACTIVE_PILL: Rgba<u8> = Rgba([0x4e, 0x9a, 0xff, 0xff]);
 const ACTIVE_TINT: Rgba<u8> = Rgba([0xff, 0xff, 0xff, 0xff]);
@@ -132,6 +89,45 @@ pub fn detect_tmux() -> bool {
     let term = std::env::var("TERM").ok();
     let tmux = std::env::var("TMUX").ok();
     is_tmux_env(term.as_deref(), tmux.as_deref())
+}
+
+/// Bake an opaque PNG that exactly fills `(canvas_w_px, canvas_h_px)`. The
+/// source image is scaled with Lanczos3 (preserving aspect ratio) and
+/// overlaid on a solid `bg` fill. iTerm2 decodes the PNG as sRGB, so pass
+/// the *sRGB-equivalent* of the surrounding SGR-painted pane bg here (see
+/// `generic_rgb_to_srgb`) — that way the welcome image bg and the editor
+/// pane bg display as the same physical pixel.
+pub fn fit_image(
+    src_png: &[u8],
+    canvas_w_px: u32,
+    canvas_h_px: u32,
+    bg: Rgba<u8>,
+) -> Result<Vec<u8>, image::ImageError> {
+    let img = image::load_from_memory_with_format(src_png, image::ImageFormat::Png)?
+        .to_rgba8();
+    let (sw, sh) = (img.width(), img.height());
+    let scale = f64::min(
+        canvas_w_px as f64 / sw as f64,
+        canvas_h_px as f64 / sh as f64,
+    );
+    let new_w = ((sw as f64 * scale).round() as u32).max(1);
+    let new_h = ((sh as f64 * scale).round() as u32).max(1);
+    let scaled = image::imageops::resize(
+        &img,
+        new_w,
+        new_h,
+        image::imageops::FilterType::Lanczos3,
+    );
+    let mut canvas: RgbaImage = ImageBuffer::from_pixel(canvas_w_px, canvas_h_px, bg);
+    let off_x = ((canvas_w_px as i64) - (new_w as i64)) / 2;
+    let off_y = ((canvas_h_px as i64) - (new_h as i64)) / 2;
+    image::imageops::overlay(&mut canvas, &scaled, off_x, off_y);
+    let mut out = Vec::with_capacity(8192);
+    image::DynamicImage::ImageRgba8(canvas).write_to(
+        &mut std::io::Cursor::new(&mut out),
+        image::ImageFormat::Png,
+    )?;
+    Ok(out)
 }
 
 pub fn build_inline_image_osc(

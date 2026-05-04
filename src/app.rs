@@ -38,10 +38,10 @@ pub enum SidebarView {
 const ACTIVITY_BAR_WIDTH: u16 = 4;
 
 /// Single source of truth for the editor pane background. Used both as
-/// ratatui's bg style and as the canvas fill behind the welcome OSC-1337
-/// image, so the wordmark seamlessly merges with the pane. When the IDE
-/// later supports themes, swap this for a lookup against the active theme
-/// and the welcome image will re-bake automatically on the next render.
+/// ratatui's bg style and as the alpha-blend target behind the welcome
+/// half-block raster, so the wordmark seamlessly merges with the pane.
+/// When the IDE later supports themes, swap this for a lookup against the
+/// active theme and the welcome grid will re-bake on the next render.
 const EDITOR_BG_RGB: (u8, u8, u8) = (0x1e, 0x22, 0x2e);
 const ACTIVITY_ICON_HEIGHT: u16 = 2;
 const ACTIVITY_ICON_GAP: u16 = 0;
@@ -253,13 +253,13 @@ pub struct App {
     /// launched outside a git workspace.
     recent_commits: Vec<crate::git::CommitInfo>,
     /// Pre-encoded OSC-1337 escape carrying the croft wordmark sized to the
-    /// welcome banner block. None when the host terminal can't render
-    /// inline images. Set in `init_graphics`; re-baked in `mark_welcome_dirty`
-    /// when the editor pane resizes.
+    /// welcome banner block, painted on a canvas filled with the sRGB-
+    /// equivalent of `EDITOR_BG_RGB` so its bg matches the SGR-painted
+    /// editor pane pixel-for-pixel. None when the host terminal can't
+    /// render inline images.
     welcome_image: Option<String>,
-    /// Cell `(width, height)` the welcome image was last baked at, plus the
-    /// absolute `(x, y)` of its top-left in the editor pane. Used to detect
-    /// layout changes that require a re-bake or re-emit.
+    /// Cell `(x, y, width, height)` the welcome image was last baked at.
+    /// A change here triggers a re-bake on the next render.
     welcome_layout: Option<WelcomeLayout>,
     welcome_overlay_dirty: bool,
     /// Pixel size of one terminal cell, captured in `init_graphics`.
@@ -574,7 +574,22 @@ impl App {
         if area.width == 0 || area.height == 0 {
             return;
         }
-        let bg = Style::default().bg(Color::Rgb(EDITOR_BG_RGB.0, EDITOR_BG_RGB.1, EDITOR_BG_RGB.2));
+        // In iTerm2 image mode we let the iTerm session bg (forced to
+        // sRGB(EDITOR_BG_RGB) by `SetColors=bg=srgb:…` at startup) show
+        // through the welcome cells via SGR 49 (default bg). The OSC-1337
+        // PNG canvas is filled with the same sRGB hex, so both surfaces
+        // display the same physical pixel — no Generic-RGB vs sRGB seam.
+        // Outside iTerm we fall back to explicit truecolor since there's
+        // no PNG to match against.
+        let bg = if crate::iterm2_inline::detect_iterm2_inline_support() {
+            Style::default().bg(Color::Reset)
+        } else {
+            Style::default().bg(Color::Rgb(
+                EDITOR_BG_RGB.0,
+                EDITOR_BG_RGB.1,
+                EDITOR_BG_RGB.2,
+            ))
+        };
         frame.render_widget(
             ratatui::widgets::Block::default().style(bg),
             area,
@@ -606,19 +621,24 @@ impl App {
             cell_h: logo_h_cells,
         };
 
-        // (Re)bake the OSC-1337 image whenever the layout shifts (resize,
-        // sidebar toggle, etc). In terminals without inline-image support
-        // we leave `welcome_image = None` and just render a text wordmark.
+        // Re-bake the OSC-1337 image whenever the layout shifts (resize,
+        // sidebar toggle, font size change). The canvas is filled with the
+        // raw `EDITOR_BG_RGB` bytes interpreted as sRGB (iTerm2 decodes
+        // PNG bytes as sRGB by default). The pane's SGR-painted cells use
+        // `Color::Reset` so they fall back to the iTerm session bg, which
+        // we force to the same sRGB hex via `SetColors=bg=srgb:…` at
+        // startup. Both surfaces therefore display the same physical
+        // pixel pair-for-pair.
         if self.welcome_layout != Some(desired) {
             if let Some((cw, ch)) = self.cell_pixel {
                 let canvas_w = (logo_w_cells as u32) * cw;
                 let canvas_h = (logo_h_cells as u32) * ch;
-                // Fully transparent letterbox so iTerm composites the
-                // wordmark against the SGR-painted editor pane bg directly.
-                // Combined with the `SetColors=bg=srgb:…` override emitted
-                // in `run()`, both surfaces flow through sRGB → display and
-                // colour-match exactly.
-                let bg = image::Rgba([0, 0, 0, 0]);
+                let bg = image::Rgba([
+                    EDITOR_BG_RGB.0,
+                    EDITOR_BG_RGB.1,
+                    EDITOR_BG_RGB.2,
+                    0xff,
+                ]);
                 if let Ok(baked) = crate::iterm2_inline::fit_image(
                     crate::iterm2_inline::WELCOME_LOGO_PNG,
                     canvas_w,
@@ -892,7 +912,7 @@ impl App {
         } else {
             frame.render_widget(&mut self.editor, editor_area);
             // The editor just overdrew whatever cells the welcome image
-            // occupied; if the user reopens the welcome screen, we'll need
+            // occupied; if the user reopens the welcome screen we'll need
             // to re-emit it.
             self.welcome_overlay_dirty = true;
         }
@@ -1919,6 +1939,25 @@ fn set_title_seq(title: &str) -> Vec<u8> {
     out
 }
 
+/// iTerm2 proprietary OSC that overrides the *session* (not profile-on-disk)
+/// bg colour. The `srgb:` prefix forces iTerm2 to interpret the hex bytes
+/// as sRGB regardless of the user's "Use sRGB colour space" profile setting,
+/// so combining this with an OSC-1337 PNG canvas filled with the same hex
+/// guarantees both surfaces display the same physical pixel.
+/// Format: `ESC ] 1 3 3 7 ; SetColors=bg=srgb:RRGGBB BEL`.
+fn set_session_bg_srgb_seq(rgb: (u8, u8, u8)) -> String {
+    format!(
+        "\x1b]1337;SetColors=bg=srgb:{:02x}{:02x}{:02x}\x07",
+        rgb.0, rgb.1, rgb.2,
+    )
+}
+
+/// Revert the iTerm2 session bg to the user's profile default. Emitted on
+/// exit so the user's shell doesn't inherit croft's forced bg colour.
+fn reset_session_bg_seq() -> String {
+    String::from("\x1b]1337;SetColors=bg=default\x07")
+}
+
 fn build_title(workspace: &std::path::Path) -> String {
     let name = workspace
         .file_name()
@@ -2550,6 +2589,89 @@ mod tests {
     }
 
     #[test]
+    fn set_session_bg_srgb_seq_uses_iterm_osc1337_and_srgb_prefix() {
+        // iTerm2 must read the bg as sRGB so the OSC-1337 PNG canvas (also
+        // sRGB) matches pixel-for-pixel. Locking in the exact bytes catches
+        // any future refactor that drops the `srgb:` prefix or the iTerm2
+        // OSC introducer.
+        let seq = set_session_bg_srgb_seq(EDITOR_BG_RGB);
+        assert_eq!(seq, "\x1b]1337;SetColors=bg=srgb:1e222e\x07");
+    }
+
+    #[test]
+    fn reset_session_bg_seq_restores_profile_default() {
+        // On exit we must revert iTerm2's session bg so the user's shell
+        // doesn't keep croft's forced bg colour.
+        assert_eq!(reset_session_bg_seq(), "\x1b]1337;SetColors=bg=default\x07");
+    }
+
+    #[test]
+    fn welcome_logo_png_asset_is_present_and_decodable() {
+        // Regression guard for the welcome screen: the bundled logo asset
+        // must remain a valid PNG so the OSC-1337 path can bake it. If
+        // someone replaces it with a half-block fallback or empties the
+        // asset, this catches it on every CI run.
+        let bytes = crate::iterm2_inline::WELCOME_LOGO_PNG;
+        assert!(bytes.len() > 1024, "welcome logo asset suspiciously small");
+        assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n", "not a PNG file");
+        let img = image::load_from_memory_with_format(bytes, image::ImageFormat::Png)
+            .expect("welcome logo PNG must decode");
+        assert!(img.width() > 0 && img.height() > 0);
+    }
+
+    #[test]
+    fn welcome_image_bake_produces_osc1337_carrying_logo_pixels() {
+        // End-to-end regression for the welcome render path: feeding the
+        // bundled logo PNG through the same `fit_image` + `build_inline_image_osc`
+        // pipeline `render_welcome` uses must yield an OSC-1337 sequence
+        // that (a) starts with the iTerm2 introducer, (b) advertises the
+        // requested cell dimensions, and (c) carries an opaque canvas
+        // filled with `EDITOR_BG_RGB`. If anyone swaps OSC-1337 for a
+        // half-block or text fallback, this test will refuse to compile
+        // or fail the byte assertions.
+        let canvas_w = 48u32 * 8; // approx welcome cell w * cell pixel w
+        let canvas_h = 14u32 * 16;
+        let bg = image::Rgba([
+            EDITOR_BG_RGB.0,
+            EDITOR_BG_RGB.1,
+            EDITOR_BG_RGB.2,
+            0xff,
+        ]);
+        let baked = crate::iterm2_inline::fit_image(
+            crate::iterm2_inline::WELCOME_LOGO_PNG,
+            canvas_w,
+            canvas_h,
+            bg,
+        )
+        .expect("baked welcome PNG");
+        assert_eq!(&baked[..8], b"\x89PNG\r\n\x1a\n", "fit_image must emit a PNG");
+        let osc = crate::iterm2_inline::build_inline_image_osc(&baked, 48, 14, false);
+        assert!(osc.starts_with("\x1b]1337;File=inline=1"));
+        assert!(osc.ends_with('\x07'));
+        assert!(osc.contains("width=48"));
+        assert!(osc.contains("height=14"));
+
+        // Verify the canvas corner pixels are exactly EDITOR_BG_RGB so the
+        // welcome image bg matches the sRGB-decoded session bg.
+        let img = image::load_from_memory_with_format(&baked, image::ImageFormat::Png)
+            .unwrap()
+            .to_rgba8();
+        for &(x, y) in &[
+            (0u32, 0u32),
+            (canvas_w - 1, 0),
+            (0, canvas_h - 1),
+            (canvas_w - 1, canvas_h - 1),
+        ] {
+            let p = img.get_pixel(x, y);
+            assert_eq!(
+                (p.0[0], p.0[1], p.0[2], p.0[3]),
+                (EDITOR_BG_RGB.0, EDITOR_BG_RGB.1, EDITOR_BG_RGB.2, 0xff),
+                "canvas corner ({x}, {y}) must be opaque editor bg"
+            );
+        }
+    }
+
+    #[test]
     fn brand_pill_uses_app_name_constant() {
         assert_eq!(brand_pill_text(), " croft ");
     }
@@ -2634,18 +2756,14 @@ pub fn run(root: PathBuf) -> Result<()> {
     {
         use std::io::Write;
         out.write_all(&set_title_seq(&title)).ok();
-        // iTerm2 interprets SGR truecolor as Apple Generic RGB by default,
-        // but OSC-1337 inline images are decoded as sRGB — same hex value
-        // displays as different on-screen pixels, which makes welcome-image
-        // bg vs editor-pane bg visibly mismatch. Forcing the iTerm bg
-        // colour into sRGB makes both surfaces flow through the same
-        // colour space (https://gitlab.com/gnachman/iterm2/-/issues/12529).
+        // Force iTerm2's session bg to sRGB(EDITOR_BG_RGB). Combined with
+        // `Color::Reset` on welcome-pane cells and the same sRGB hex baked
+        // into the OSC-1337 PNG canvas, both surfaces flow through iTerm2's
+        // sRGB → display path and the welcome image bg matches the
+        // surrounding pane bg pixel-for-pixel
+        // (https://gitlab.com/gnachman/iterm2/-/issues/12529).
         if crate::iterm2_inline::detect_iterm2_inline_support() {
-            let bg_seq = format!(
-                "\x1b]1337;SetColors=bg=srgb:{:02x}{:02x}{:02x}\x07",
-                EDITOR_BG_RGB.0, EDITOR_BG_RGB.1, EDITOR_BG_RGB.2,
-            );
-            out.write_all(bg_seq.as_bytes()).ok();
+            out.write_all(set_session_bg_srgb_seq(EDITOR_BG_RGB).as_bytes()).ok();
         }
         out.flush().ok();
     }
@@ -2664,6 +2782,11 @@ pub fn run(root: PathBuf) -> Result<()> {
         use std::io::Write;
         let mut out = stdout();
         out.write_all(&set_title_seq("")).ok();
+        // Revert iTerm2's session bg to the profile default so the user's
+        // shell after croft exits doesn't keep our forced editor-bg colour.
+        if crate::iterm2_inline::detect_iterm2_inline_support() {
+            out.write_all(reset_session_bg_seq().as_bytes()).ok();
+        }
         out.flush().ok();
     }
     if kbd_enhanced {
@@ -2729,9 +2852,7 @@ fn main_loop(
             // Welcome-screen logo: same OSC-1337 trick, gated by its own
             // dirty flag and only emitted while the editor pane is in its
             // blank initial state.
-            if app.editor.is_blank_initial()
-                && app.welcome_overlay_dirty
-            {
+            if app.editor.is_blank_initial() && app.welcome_overlay_dirty {
                 if let (Some(img), Some(layout)) =
                     (app.welcome_image.as_ref(), app.welcome_layout)
                 {
