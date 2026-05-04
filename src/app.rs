@@ -277,10 +277,14 @@ pub struct App {
     /// redraw repaints the PNGs and you see the cursor blink each time iTerm
     /// processes the image.
     activity_overlay_dirty: bool,
-    /// Captured at startup. Drives the welcome screen's "Recent" list when
-    /// the editor pane is in its blank initial state. Empty when croft was
-    /// launched outside a git workspace.
+    /// Drives the welcome screen's "Recent" list. Always sourced from the
+    /// croft project's Bitbucket repo (live HTTP fetch on every launch),
+    /// never from the workspace the user opened — the goal is to surface
+    /// croft's own progress to the developer.
     recent_commits: Vec<crate::git::CommitInfo>,
+    /// Receiver for the background HTTP fetch of croft's recent commits.
+    /// `None` once the fetch has completed (or failed) and been drained.
+    recent_commits_rx: Option<std::sync::mpsc::Receiver<Vec<crate::git::CommitInfo>>>,
     /// Pre-encoded OSC-1337 escape carrying the croft wordmark sized to the
     /// welcome banner block, painted on a canvas filled with the sRGB-
     /// equivalent of `EDITOR_BG_RGB` so its bg matches the SGR-painted
@@ -325,7 +329,12 @@ impl App {
             Err(_) => (None, None),
         };
         let git_status = crate::git::query(&root);
-        let recent_commits = crate::git::recent_commits(&root, 5);
+        let (commits_tx, commits_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let timeout = std::time::Duration::from_secs(3);
+            let commits = crate::git::fetch_croft_recent_commits(timeout);
+            let _ = commits_tx.send(commits);
+        });
         Ok(Self {
             tree,
             search,
@@ -349,7 +358,8 @@ impl App {
             last_editor_left_down: None,
             last_tree_left_down: None,
             activity_overlay_dirty: true,
-            recent_commits,
+            recent_commits: Vec::new(),
+            recent_commits_rx: Some(commits_rx),
             welcome_image: None,
             welcome_layout: None,
             welcome_overlay_dirty: true,
@@ -524,6 +534,29 @@ impl App {
     /// changes it on disk.
     /// Drain pending filesystem events. Returns `true` iff anything was
     /// processed (so the main loop knows it owes a redraw).
+    /// Pull a single batch of croft commits from the background HTTP fetch,
+    /// if it has finished. Returns true exactly once when commits are
+    /// installed (so the welcome panel repaints), false otherwise. Drops
+    /// the receiver after consuming so subsequent calls are cheap no-ops.
+    pub fn drain_recent_commits(&mut self) -> bool {
+        let Some(rx) = self.recent_commits_rx.as_ref() else {
+            return false;
+        };
+        match rx.try_recv() {
+            Ok(commits) => {
+                self.recent_commits = commits;
+                self.recent_commits_rx = None;
+                self.welcome_overlay_dirty = true;
+                true
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.recent_commits_rx = None;
+                false
+            }
+        }
+    }
+
     fn drain_fs_events(&mut self) -> bool {
         let Some(rx) = self.fs_rx.as_ref() else {
             return false;
@@ -3044,8 +3077,9 @@ fn main_loop(
         let pty_changed = app.terminal.take_dirty();
         let blink_visible = app.cursor_visible_phase();
         let blink_changed = blink_visible != last_blink_visible;
+        let commits_changed = app.drain_recent_commits();
 
-        if needs_redraw || fs_changed || pty_changed || blink_changed {
+        if needs_redraw || fs_changed || pty_changed || blink_changed || commits_changed {
             // If the welcome OSC-1337 image was painted earlier and the
             // user has just opened a file, wipe the screen so iTerm drops
             // its cached image cells AND ratatui repaints every cell on
