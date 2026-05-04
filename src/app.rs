@@ -294,6 +294,14 @@ pub struct App {
     /// Receiver for the background HTTP fetch of croft's recent commits.
     /// `None` once the fetch has completed (or failed) and been drained.
     recent_commits_rx: Option<std::sync::mpsc::Receiver<Vec<crate::git::CommitInfo>>>,
+    /// Channel to the background search worker. Each keystroke in the
+    /// search input pushes the current query string here; the worker
+    /// debounces and runs `search_workspace` off the UI thread.
+    search_query_tx: std::sync::mpsc::Sender<String>,
+    /// Results coming back from the search worker: `(query, hits)`. The
+    /// query is echoed so we can drop stale results when the user has
+    /// typed past the query that produced them.
+    search_results_rx: std::sync::mpsc::Receiver<crate::widgets::search::SearchResult>,
     /// Pre-encoded OSC-1337 escape carrying the croft wordmark sized to the
     /// welcome banner block, painted on a canvas filled with the sRGB-
     /// equivalent of `EDITOR_BG_RGB` so its bg matches the SGR-painted
@@ -371,6 +379,17 @@ impl App {
             let commits = crate::git::fetch_croft_recent_commits(timeout);
             let _ = commits_tx.send(commits);
         });
+
+        let (search_query_tx, search_query_rx) = std::sync::mpsc::channel();
+        let (search_results_tx, search_results_rx) = std::sync::mpsc::channel();
+        let search_root = root.clone();
+        std::thread::spawn(move || {
+            crate::widgets::search::search_worker_loop(
+                search_root,
+                search_query_rx,
+                search_results_tx,
+            );
+        });
         Ok(Self {
             tree,
             search,
@@ -398,6 +417,8 @@ impl App {
             activity_overlay_dirty: true,
             recent_commits: Vec::new(),
             recent_commits_rx: Some(commits_rx),
+            search_query_tx,
+            search_results_rx,
             welcome_image: None,
             welcome_layout: None,
             welcome_overlay_dirty: true,
@@ -605,6 +626,30 @@ impl App {
             }
         }
         changed
+    }
+
+    /// Push the current search query string onto the worker channel.
+    /// Called whenever the input text changes (Char, Backspace, Esc-clear).
+    /// Sending on a closed channel is harmless — search just goes silent.
+    fn submit_search_query(&self) {
+        let _ = self.search_query_tx.send(self.search.query.clone());
+    }
+
+    /// Apply any pending search results from the background worker. Drops
+    /// stale results whose query no longer matches the input field (the
+    /// user has typed past it). Returns true iff hits were updated, so
+    /// the main loop knows to redraw.
+    pub fn drain_search_results(&mut self) -> bool {
+        let mut applied = false;
+        while let Ok((q, hits)) = self.search_results_rx.try_recv() {
+            if q == self.search.query {
+                self.search.hits = hits;
+                self.search.selected = 0;
+                self.search.scroll = 0;
+                applied = true;
+            }
+        }
+        applied
     }
 
     /// Pull a single batch of croft commits from the background HTTP fetch,
@@ -1326,33 +1371,24 @@ impl App {
     fn handle_search_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Esc => {
-                // Empty the input or jump back to Explorer.
                 if self.search.query.is_empty() {
                     self.set_sidebar_view(SidebarView::Explorer);
                 } else {
                     self.search.query.clear();
                     self.search.hits.clear();
+                    self.submit_search_query();
                 }
             }
             KeyCode::Enter => {
-                // If a hit is selected and we already have results, open it.
-                if !self.search.hits.is_empty() {
-                    if let Some(hit) = self.search.selected_hit().cloned() {
-                        self.open_search_hit(&hit);
-                        return;
-                    }
+                // Search is live now; Enter just opens the highlighted hit.
+                if let Some(hit) = self.search.selected_hit().cloned() {
+                    self.open_search_hit(&hit);
                 }
-                // Otherwise run the query.
-                self.search.run_query();
-                self.status = format!(
-                    "Search '{}' → {} match{}",
-                    self.search.query,
-                    self.search.hits.len(),
-                    if self.search.hits.len() == 1 { "" } else { "es" }
-                );
             }
             KeyCode::Backspace => {
-                self.search.query.pop();
+                if self.search.query.pop().is_some() {
+                    self.submit_search_query();
+                }
             }
             KeyCode::Up => self.search.move_up(),
             KeyCode::Down => self.search.move_down(),
@@ -1362,6 +1398,7 @@ impl App {
                     && !key.modifiers.contains(KeyModifiers::SUPER)
                 {
                     self.search.query.push(c);
+                    self.submit_search_query();
                 }
             }
             _ => {}
@@ -3153,8 +3190,9 @@ fn main_loop(
         let blink_visible = app.cursor_visible_phase();
         let blink_changed = blink_visible != last_blink_visible;
         let commits_changed = app.drain_recent_commits();
+        let search_changed = app.drain_search_results();
 
-        if needs_redraw || fs_changed || pty_changed || blink_changed || commits_changed {
+        if needs_redraw || fs_changed || pty_changed || blink_changed || commits_changed || search_changed {
             // If the welcome OSC-1337 image was painted earlier and the
             // user has just opened a file, wipe the screen so iTerm drops
             // its cached image cells AND ratatui repaints every cell on

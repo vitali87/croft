@@ -54,6 +54,85 @@ pub fn search_workspace(root: &Path, query: &str) -> Vec<SearchHit> {
     hits
 }
 
+/// Split `line` into `(segment, is_match)` runs against a case-insensitive
+/// `needle`. Concatenating the segments reproduces the original line
+/// byte-for-byte. Empty needle or no match returns the whole line as a
+/// single non-match segment. Used by the result-row renderer to highlight
+/// every occurrence of the user's query inside the matched line.
+pub fn split_for_highlight(line: &str, needle: &str) -> Vec<(String, bool)> {
+    if needle.is_empty() {
+        return vec![(line.to_string(), false)];
+    }
+    let lower_line = line.to_lowercase();
+    let lower_needle = needle.to_lowercase();
+    // If lowercasing changed the byte length (rare: e.g. some Unicode
+    // titlecase forms), the lower_line ↔ line index mapping no longer
+    // holds; bail out without highlights rather than risk slicing into
+    // the middle of a UTF-8 codepoint.
+    if lower_line.len() != line.len() {
+        return vec![(line.to_string(), false)];
+    }
+    let mut out: Vec<(String, bool)> = Vec::new();
+    let mut last = 0usize;
+    let mut start = 0usize;
+    while let Some(rel) = lower_line[start..].find(&lower_needle) {
+        let abs = start + rel;
+        if abs > last {
+            out.push((line[last..abs].to_string(), false));
+        }
+        let end = abs + lower_needle.len();
+        out.push((line[abs..end].to_string(), true));
+        last = end;
+        start = end;
+        if lower_needle.is_empty() {
+            break;
+        }
+    }
+    if last < line.len() {
+        out.push((line[last..].to_string(), false));
+    }
+    if out.is_empty() {
+        out.push((line.to_string(), false));
+    }
+    out
+}
+
+/// `(query_that_was_run, hits)`. The query is echoed back so the receiver
+/// can drop stale results when the user has typed past the query that
+/// produced them.
+pub type SearchResult = (String, Vec<SearchHit>);
+
+/// Background worker loop. Reads queries from `rx`, coalesces by always
+/// taking the most recent pending query, debounces ~120 ms so a fast typist
+/// doesn't trigger a search per keystroke, runs `search_workspace`, and
+/// ships `(query, hits)` back via `tx`. Empty queries short-circuit to
+/// empty hits without walking the tree. The thread exits cleanly when the
+/// query channel closes (App dropped).
+pub fn search_worker_loop(
+    root: PathBuf,
+    rx: std::sync::mpsc::Receiver<String>,
+    tx: std::sync::mpsc::Sender<SearchResult>,
+) {
+    use std::time::Duration;
+    while let Ok(mut query) = rx.recv() {
+        while let Ok(newer) = rx.try_recv() {
+            query = newer;
+        }
+        std::thread::sleep(Duration::from_millis(120));
+        while let Ok(newer) = rx.try_recv() {
+            query = newer;
+        }
+        let hits = if query.trim().is_empty() {
+            Vec::new()
+        } else {
+            search_workspace(&root, &query)
+        };
+        if tx.send((query, hits)).is_err() {
+            return;
+        }
+    }
+}
+
 fn is_searchable_size(path: &Path) -> bool {
     std::fs::metadata(path)
         .map(|m| m.len() <= MAX_FILE_BYTES)
@@ -181,24 +260,64 @@ impl Widget for &mut SearchPanel {
             return;
         }
 
-        // Input row
-        let cursor = if self.focused { "█" } else { " " };
-        let input_line = Line::from(vec![
-            Span::styled(
-                "  ",
-                Style::default().fg(Color::Rgb(0xdc, 0xb6, 0x7a)),
-            ),
-            Span::styled(self.query.as_str(), Style::default().fg(Color::White)),
-            Span::styled(cursor, Style::default().fg(Color::Rgb(0x4e, 0x9a, 0xff))),
-        ]);
-        buf.set_line(inner.x, inner.y, &input_line, inner.width);
+        // Input row: chevron prefix, query (or italic placeholder when empty),
+        // a software-cursor block when focused, and a right-aligned cluster
+        // of `Aa ab .*` mode glyphs (cosmetic for now; actual case / whole-
+        // word / regex toggles arrive in a follow-up).
+        let chevron_color = if self.focused {
+            Color::Rgb(0x4e, 0x9a, 0xff)
+        } else {
+            Color::DarkGray
+        };
+        let toggles = "Aa ab .*";
+        let toggles_w = toggles.chars().count() as u16;
+        let toggles_x = inner
+            .x
+            .saturating_add(inner.width.saturating_sub(toggles_w));
+        let chevron = Span::styled(
+            "› ",
+            Style::default().fg(chevron_color).add_modifier(Modifier::BOLD),
+        );
+        let mut spans: Vec<Span> = vec![chevron];
+        if self.query.is_empty() {
+            spans.push(Span::styled(
+                "Search",
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::ITALIC),
+            ));
+        } else {
+            spans.push(Span::styled(
+                self.query.as_str(),
+                Style::default().fg(Color::White),
+            ));
+        }
+        if self.focused {
+            spans.push(Span::styled(
+                "█",
+                Style::default().fg(Color::Rgb(0x4e, 0x9a, 0xff)),
+            ));
+        }
+        let typed_w = inner.width.saturating_sub(toggles_w + 1);
+        buf.set_line(inner.x, inner.y, &Line::from(spans), typed_w);
+        buf.set_line(
+            toggles_x,
+            inner.y,
+            &Line::from(Span::styled(
+                toggles,
+                Style::default().fg(Color::Rgb(0x6c, 0x7d, 0x9c)),
+            )),
+            toggles_w,
+        );
 
-        // Results header (row 1)
+        // Status row: live match count. Left blank while waiting for the
+        // first result of a non-empty query so the panel doesn't flash
+        // "0 matches" between keystrokes.
         if inner.height >= 2 {
-            let count = self.hits.len();
             let header = if self.query.trim().is_empty() {
-                String::from("type and press Enter to search")
+                String::new()
             } else {
+                let count = self.hits.len();
                 format!("{count} match{}", if count == 1 { "" } else { "es" })
             };
             let line = Line::from(Span::styled(
@@ -223,12 +342,21 @@ impl Widget for &mut SearchPanel {
         for (row_idx, hit_idx) in (self.scroll..end).enumerate() {
             let y = inner.y + 2 + row_idx as u16;
             let hit = &self.hits[hit_idx];
+            // Show just the basename so the matched line itself has room
+            // to render inside a narrow side panel — without this, deep
+            // monorepo paths consumed the whole row and the highlight fell
+            // off the right edge.
             let path_display = hit
                 .path
-                .strip_prefix(&self.root)
-                .unwrap_or(hit.path.as_path())
-                .display()
-                .to_string();
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| {
+                    hit.path
+                        .strip_prefix(&self.root)
+                        .unwrap_or(hit.path.as_path())
+                        .display()
+                        .to_string()
+                });
             let header_style = if hit_idx == self.selected {
                 Style::default()
                     .fg(Color::Black)
@@ -237,17 +365,30 @@ impl Widget for &mut SearchPanel {
             } else {
                 Style::default().fg(Color::White)
             };
-            let line = Line::from(vec![
+            let needle = self.query.trim();
+            // High-contrast yellow background like ripgrep / VS Code's
+            // editor.findMatchHighlightBackground. Different treatment when
+            // the row is selected so the highlight stays readable against
+            // the blue row bg instead of fighting it.
+            let highlight_style = Style::default()
+                .fg(Color::Black)
+                .bg(Color::Rgb(0xff, 0xd7, 0x4a))
+                .add_modifier(Modifier::BOLD);
+            let plain_style = Style::default().fg(Color::Gray);
+            let mut spans: Vec<Span> = vec![
                 Span::styled(format!(" {path_display}"), header_style),
                 Span::styled(
                     format!(":{}: ", hit.line_no),
                     Style::default().fg(Color::Rgb(0xeb, 0xcb, 0x8b)),
                 ),
-                Span::styled(
-                    hit.line_text.as_str(),
-                    Style::default().fg(Color::Gray),
-                ),
-            ]);
+            ];
+            for (chunk, is_match) in split_for_highlight(&hit.line_text, needle) {
+                spans.push(Span::styled(
+                    chunk,
+                    if is_match { highlight_style } else { plain_style },
+                ));
+            }
+            let line = Line::from(spans);
             buf.set_line(inner.x, y, &line, inner.width);
         }
     }
@@ -340,6 +481,109 @@ mod tests {
         panel.run_query();
         assert_eq!(panel.hits.len(), 1);
         assert_eq!(panel.selected, 0);
+    }
+
+    #[test]
+    fn split_highlight_returns_whole_line_when_needle_empty() {
+        let segs = split_for_highlight("hello world", "");
+        assert_eq!(segs, vec![(String::from("hello world"), false)]);
+    }
+
+    #[test]
+    fn split_highlight_returns_whole_line_when_no_match() {
+        let segs = split_for_highlight("hello world", "xyz");
+        assert_eq!(segs, vec![(String::from("hello world"), false)]);
+    }
+
+    #[test]
+    fn split_highlight_marks_each_match_run_case_insensitive() {
+        let segs = split_for_highlight("The Quick brown fox jumps over the QUICK fence", "quick");
+        // Two runs of "quick" (mixed case), three non-match tails.
+        let matches: Vec<&String> =
+            segs.iter().filter_map(|(s, m)| if *m { Some(s) } else { None }).collect();
+        assert_eq!(matches.len(), 2);
+        // Original-case slice must be preserved in the matched segment.
+        assert_eq!(matches[0], "Quick");
+        assert_eq!(matches[1], "QUICK");
+        // Concatenating all segments must reproduce the original line.
+        let joined: String = segs.iter().map(|(s, _)| s.as_str()).collect();
+        assert_eq!(joined, "The Quick brown fox jumps over the QUICK fence");
+    }
+
+    #[test]
+    fn split_highlight_handles_match_at_start_and_end() {
+        let segs = split_for_highlight("foo bar foo", "foo");
+        let joined: String = segs.iter().map(|(s, _)| s.as_str()).collect();
+        assert_eq!(joined, "foo bar foo");
+        assert_eq!(segs.first().map(|(_, m)| *m), Some(true), "first seg is match");
+        assert_eq!(segs.last().map(|(_, m)| *m), Some(true), "last seg is match");
+    }
+
+    #[test]
+    fn search_worker_loop_returns_hits_for_a_typed_query() {
+        let tmp = TempDir::new().unwrap();
+        write(&tmp.path().join("a.txt"), "one\nneedle\nthree\n");
+        let (q_tx, q_rx) = std::sync::mpsc::channel::<String>();
+        let (r_tx, r_rx) = std::sync::mpsc::channel::<SearchResult>();
+        let root = tmp.path().to_path_buf();
+        let join = std::thread::spawn(move || search_worker_loop(root, q_rx, r_tx));
+        q_tx.send("needle".into()).unwrap();
+        let (q, hits) = r_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("worker should ship a result");
+        assert_eq!(q, "needle");
+        assert_eq!(hits.len(), 1);
+        drop(q_tx);
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn search_worker_loop_coalesces_a_burst_of_keystrokes() {
+        // Simulate a fast typist sending o, on, one. Worker must coalesce
+        // and only run the latest, returning hits for "one" — not for the
+        // intermediate prefixes.
+        let tmp = TempDir::new().unwrap();
+        write(&tmp.path().join("a.txt"), "alpha one beta\nzeta\n");
+        let (q_tx, q_rx) = std::sync::mpsc::channel::<String>();
+        let (r_tx, r_rx) = std::sync::mpsc::channel::<SearchResult>();
+        let root = tmp.path().to_path_buf();
+        let join = std::thread::spawn(move || search_worker_loop(root, q_rx, r_tx));
+        q_tx.send("o".into()).unwrap();
+        q_tx.send("on".into()).unwrap();
+        q_tx.send("one".into()).unwrap();
+        let mut last: Option<SearchResult> = None;
+        while let Ok(r) = r_rx.recv_timeout(std::time::Duration::from_secs(2)) {
+            last = Some(r);
+            if r_rx
+                .recv_timeout(std::time::Duration::from_millis(200))
+                .is_err()
+            {
+                break;
+            }
+        }
+        let (q, hits) = last.expect("worker must produce at least one result");
+        assert_eq!(q, "one", "coalesce must drop intermediate prefixes");
+        assert_eq!(hits.len(), 1);
+        drop(q_tx);
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn search_worker_loop_short_circuits_empty_queries() {
+        let tmp = TempDir::new().unwrap();
+        write(&tmp.path().join("a.txt"), "anything\n");
+        let (q_tx, q_rx) = std::sync::mpsc::channel::<String>();
+        let (r_tx, r_rx) = std::sync::mpsc::channel::<SearchResult>();
+        let root = tmp.path().to_path_buf();
+        let join = std::thread::spawn(move || search_worker_loop(root, q_rx, r_tx));
+        q_tx.send("".into()).unwrap();
+        let (q, hits) = r_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        assert_eq!(q, "");
+        assert!(hits.is_empty());
+        drop(q_tx);
+        join.join().unwrap();
     }
 
     #[test]
