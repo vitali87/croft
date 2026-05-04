@@ -294,10 +294,10 @@ pub struct App {
     /// Receiver for the background HTTP fetch of croft's recent commits.
     /// `None` once the fetch has completed (or failed) and been drained.
     recent_commits_rx: Option<std::sync::mpsc::Receiver<Vec<crate::git::CommitInfo>>>,
-    /// Channel to the background search worker. Each keystroke in the
-    /// search input pushes the current query string here; the worker
-    /// debounces and runs `search_workspace` off the UI thread.
-    search_query_tx: std::sync::mpsc::Sender<String>,
+    /// Channel to the background search worker. Each keystroke or toggle
+    /// flip pushes a `(query, opts)` request here; the worker debounces
+    /// and runs `search_workspace` off the UI thread.
+    search_query_tx: std::sync::mpsc::Sender<crate::widgets::search::SearchRequest>,
     /// Results coming back from the search worker: `(query, hits)`. The
     /// query is echoed so we can drop stale results when the user has
     /// typed past the query that produced them.
@@ -628,18 +628,20 @@ impl App {
         changed
     }
 
-    /// Push the current search query string onto the worker channel and
-    /// keep the editor's match highlight synced to the same term so the
-    /// active file lights up matches as the user types. Called whenever
-    /// the search input changes.
+    /// Push the current search query string and toggle state onto the
+    /// worker channel and keep the editor's match highlight synced to the
+    /// same term so the active file lights up matches as the user types.
+    /// Called whenever the search input or one of the toggles changes.
     fn submit_search_query(&mut self) {
-        let _ = self.search_query_tx.send(self.search.query.clone());
+        let _ = self
+            .search_query_tx
+            .send((self.search.query.clone(), self.search.opts));
         let term = if self.search.query.trim().is_empty() {
             None
         } else {
             Some(self.search.query.clone())
         };
-        self.editor.set_search_highlight(term);
+        self.editor.set_search_highlight(term, self.search.opts);
     }
 
     /// Apply any pending search results from the background worker. Drops
@@ -648,8 +650,8 @@ impl App {
     /// the main loop knows to redraw.
     pub fn drain_search_results(&mut self) -> bool {
         let mut applied = false;
-        while let Ok((q, hits)) = self.search_results_rx.try_recv() {
-            if q == self.search.query {
+        while let Ok((q, opts, hits)) = self.search_results_rx.try_recv() {
+            if q == self.search.query && opts == self.search.opts {
                 self.search.hits = hits;
                 self.search.selected = 0;
                 self.search.scroll = 0;
@@ -1751,6 +1753,26 @@ impl App {
                     return;
                 }
                 if in_tree && self.sidebar_view == SidebarView::Search {
+                    // Toggle hit-test takes precedence over result-row /
+                    // input-focus dispatch — the toggles live on the input
+                    // row, so a click there must flip a flag, not focus.
+                    if let Some(t) = self.search.toggle_at(m.column, m.row) {
+                        match t {
+                            crate::widgets::search::SearchToggle::CaseSensitive => {
+                                self.search.opts.case_sensitive = !self.search.opts.case_sensitive;
+                            }
+                            crate::widgets::search::SearchToggle::WholeWord => {
+                                self.search.opts.whole_word = !self.search.opts.whole_word;
+                            }
+                            crate::widgets::search::SearchToggle::UseRegex => {
+                                self.search.opts.use_regex = !self.search.opts.use_regex;
+                            }
+                        }
+                        self.submit_search_query();
+                        self.search.focused = true;
+                        self.tree.focused = false;
+                        return;
+                    }
                     // Click on a result row: open it.
                     if let Some(idx) = self.search.hit_at_y(m.row) {
                         self.search.selected = idx;

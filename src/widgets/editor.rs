@@ -94,6 +94,11 @@ pub struct Editor {
     /// syntax-highlighted line is laid down. Mirrors the highlight in the
     /// Search panel so the user sees their query lit up in the file too.
     pub search_highlight: Option<String>,
+    /// Toggle state that drives `search_highlight` matching: case
+    /// sensitivity, whole-word boundaries, regex. Mirrors `SearchPanel.opts`
+    /// so the editor's yellow highlight stays consistent with what the
+    /// search panel claims is a match.
+    pub search_highlight_opts: crate::widgets::search::SearchOpts,
 }
 
 impl Editor {
@@ -118,6 +123,7 @@ impl Editor {
             highlights: Vec::new(),
             registry: LangRegistry::new(),
             search_highlight: None,
+            search_highlight_opts: crate::widgets::search::SearchOpts::default(),
         }
     }
 
@@ -1590,7 +1596,10 @@ mod tests {
         std::fs::write(f2.path(), "second needle line\n").unwrap();
         let mut t = EditorTabs::new();
         t.open_pinned(f1.path()).unwrap();
-        t.set_search_highlight(Some(String::from("needle")));
+        t.set_search_highlight(
+            Some(String::from("needle")),
+            crate::widgets::search::SearchOpts::default(),
+        );
         // Close the first (and only non-blank) tab — leaves the blank
         // initial tab.
         let close_idx = t
@@ -1621,7 +1630,10 @@ mod tests {
         let mut t = EditorTabs::new();
         t.open_pinned(f1.path()).unwrap();
         t.open_pinned(f2.path()).unwrap();
-        t.set_search_highlight(Some(String::from("needle")));
+        t.set_search_highlight(
+            Some(String::from("needle")),
+            crate::widgets::search::SearchOpts::default(),
+        );
         // Close f1; both should still be highlighted, and now a fresh open
         // of a third file should inherit too.
         let f3 = NamedTempFile::new().unwrap();
@@ -1646,11 +1658,14 @@ mod tests {
         std::fs::write(f2.path(), "world").unwrap();
         t.open_pinned(f1.path()).unwrap();
         t.open_pinned(f2.path()).unwrap();
-        t.set_search_highlight(Some(String::from("term")));
+        t.set_search_highlight(
+            Some(String::from("term")),
+            crate::widgets::search::SearchOpts::default(),
+        );
         for ed in &t.editors {
             assert_eq!(ed.search_highlight.as_deref(), Some("term"));
         }
-        t.set_search_highlight(None);
+        t.set_search_highlight(None, crate::widgets::search::SearchOpts::default());
         for ed in &t.editors {
             assert!(ed.search_highlight.is_none());
         }
@@ -2098,7 +2113,15 @@ impl Widget for &mut Editor {
             buf.set_line(text_x, y, &line, text_width);
 
             if let Some(term) = self.search_highlight.as_deref() {
-                paint_search_highlight(buf, text_x, y, text_width, raw, term);
+                paint_search_highlight(
+                    buf,
+                    text_x,
+                    y,
+                    text_width,
+                    raw,
+                    term,
+                    self.search_highlight_opts,
+                );
             }
 
             if let Some(((sr, sc), (er, ec))) = sel_norm {
@@ -2161,11 +2184,11 @@ impl Editor {
     }
 }
 
-/// Overpaint every case-insensitive occurrence of `needle` in `raw_line`
-/// with the search-match style. Bails out without changes when lowercasing
-/// changes the byte length (rare Unicode edge case) so we never slice into
-/// the middle of a UTF-8 codepoint. Char-aligned for ASCII; for Unicode
-/// the column conversion uses `chars().count()` over the byte prefix.
+/// Overpaint every match of `needle` in `raw_line` with the search-match
+/// style, honouring `opts` (case-sensitive / whole-word / regex). Delegates
+/// to `split_for_highlight` so the highlight rule stays 1:1 with the
+/// search-engine matcher; column conversion uses `chars().count()` over
+/// the byte prefix to stay correct for Unicode.
 fn paint_search_highlight(
     buf: &mut Buffer,
     text_x: u16,
@@ -2173,32 +2196,32 @@ fn paint_search_highlight(
     text_width: u16,
     raw_line: &str,
     needle: &str,
+    opts: crate::widgets::search::SearchOpts,
 ) {
     if needle.is_empty() {
-        return;
-    }
-    let lower_line = raw_line.to_lowercase();
-    let lower_needle = needle.to_lowercase();
-    if lower_line.len() != raw_line.len() {
         return;
     }
     let style = Style::default()
         .fg(Color::Black)
         .bg(Color::Rgb(0xff, 0xd7, 0x4a))
         .add_modifier(Modifier::BOLD);
-    let mut start = 0usize;
-    while let Some(rel) = lower_line[start..].find(&lower_needle) {
-        let abs_byte_start = start + rel;
-        let abs_byte_end = abs_byte_start + lower_needle.len();
-        let col_start = raw_line[..abs_byte_start].chars().count() as u16;
-        let col_end = raw_line[..abs_byte_end].chars().count() as u16;
-        for c in col_start..col_end {
-            if c >= text_width {
-                break;
+    let segments = crate::widgets::search::split_for_highlight(raw_line, needle, opts);
+    let mut col_cursor: u16 = 0;
+    for (chunk, is_match) in segments {
+        let chunk_cols = chunk.chars().count() as u16;
+        if is_match {
+            for c in 0..chunk_cols {
+                let col = col_cursor + c;
+                if col >= text_width {
+                    break;
+                }
+                buf[(text_x + col, y)].set_style(style);
             }
-            buf[(text_x + c, y)].set_style(style);
         }
-        start = abs_byte_end;
+        col_cursor = col_cursor.saturating_add(chunk_cols);
+        if col_cursor >= text_width {
+            break;
+        }
     }
 }
 
@@ -2253,6 +2276,9 @@ pub struct EditorTabs {
     /// from a search hit) inherit the term without the App needing to
     /// re-call `set_search_highlight` after every open.
     search_highlight_term: Option<String>,
+    /// Toggle state matching `search_highlight_term`. Same propagation
+    /// strategy: every newly-created editor inherits these.
+    search_highlight_opts: crate::widgets::search::SearchOpts,
 }
 
 impl EditorTabs {
@@ -2265,6 +2291,7 @@ impl EditorTabs {
             tab_strip_y: 0,
             last_full_area: Rect::default(),
             search_highlight_term: None,
+            search_highlight_opts: crate::widgets::search::SearchOpts::default(),
         }
     }
 
@@ -2272,17 +2299,23 @@ impl EditorTabs {
         self.editors.len()
     }
 
-    /// Set (or clear) the search-match highlight term for every open tab,
-    /// so opening another file from search keeps the same query lit, and
-    /// clearing the search box wipes the highlights everywhere at once.
-    /// Also persists the term so editors created after this call (e.g.
-    /// when a tab is closed and a new file is opened from a search hit)
-    /// inherit the highlight automatically.
-    pub fn set_search_highlight(&mut self, term: Option<String>) {
+    /// Set (or clear) the search-match highlight term + opts for every
+    /// open tab, so opening another file from search keeps the same query
+    /// lit, clearing the search box wipes the highlights, and toggling a
+    /// search mode (case / whole-word / regex) re-paints the file with
+    /// the matching rule. Also persists term + opts so editors created
+    /// after this call (e.g. after a close + reopen) inherit them.
+    pub fn set_search_highlight(
+        &mut self,
+        term: Option<String>,
+        opts: crate::widgets::search::SearchOpts,
+    ) {
         let normalised = term.filter(|s| !s.is_empty());
         self.search_highlight_term = normalised.clone();
+        self.search_highlight_opts = opts;
         for ed in &mut self.editors {
             ed.search_highlight = normalised.clone();
+            ed.search_highlight_opts = opts;
         }
     }
 
@@ -2480,6 +2513,7 @@ impl EditorTabs {
             self.editors[active].open(path)?;
             self.editors[active].preview = true;
             self.editors[active].search_highlight = self.search_highlight_term.clone();
+            self.editors[active].search_highlight_opts = self.search_highlight_opts;
             return Ok(());
         }
         let mut e = Editor::new();
@@ -2487,6 +2521,7 @@ impl EditorTabs {
         e.open(path)?;
         e.preview = true;
         e.search_highlight = self.search_highlight_term.clone();
+        e.search_highlight_opts = self.search_highlight_opts;
         let pos = self.active + 1;
         self.editors.insert(pos, e);
         self.editors[self.active].focused = false;
@@ -2508,6 +2543,7 @@ impl EditorTabs {
             self.editors[active].open(path)?;
             self.editors[active].preview = false;
             self.editors[active].search_highlight = self.search_highlight_term.clone();
+            self.editors[active].search_highlight_opts = self.search_highlight_opts;
             return Ok(());
         }
         let mut e = Editor::new();
@@ -2515,6 +2551,7 @@ impl EditorTabs {
         e.open(path)?;
         e.preview = false;
         e.search_highlight = self.search_highlight_term.clone();
+        e.search_highlight_opts = self.search_highlight_opts;
         let pos = self.active + 1;
         self.editors.insert(pos, e);
         self.editors[self.active].focused = false;

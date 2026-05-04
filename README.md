@@ -80,9 +80,10 @@ croft setup-terminal --help
 | `F6` | Cycle focus across panes (tree → editor → terminal → tree) |
 | `Ctrl+b` | Toggle the file tree / side panel |
 | `Ctrl+j` | Toggle the terminal pane |
-| `Ctrl+Shift+f` (or `Cmd+Shift+f` with kitty-protocol terminals) | Jump to the Search sidebar view |
+| `Ctrl+Shift+f` (or `Cmd+Shift+f` with the iTerm2 setup below) | Jump to the Search sidebar view |
 | Click activity-bar icons (left edge) | Switch between Explorer (file icon) and Search (magnifying glass) views |
-| In Search view: type query, Enter | Run a `.gitignore`-aware substring search across the workspace; up to 200 hits |
+| In Search view: type | Live `.gitignore`-aware search across the workspace; results refresh per keystroke (~120 ms debounce, runs off the UI thread). Capped at 200 hits. |
+| In Search view: click `Aa`, `ab`, `.*` toggles | Flip case-sensitive / whole-word / regex modes; the search re-runs immediately. Active toggles render with a yellow background. |
 | In Search view: ↑/↓ + Enter, or click a result | Open the file at the matched line |
 | Mouse drag in terminal pane | Select text; selection stays highlighted until you copy or click elsewhere — no auto-copy |
 | Mouse wheel in terminal pane | Scroll through 5000 rows of scrollback. While vim / less / htop is in alternate-screen mode, wheel forwards arrow keys instead so the running app handles it. Any keystroke snaps back to the live bottom. |
@@ -138,7 +139,22 @@ iTerm2 → Settings → **Profiles** → Default → **Keys** tab → **Key Mapp
 
 Leave `⌘V` alone — iTerm2's default **Edit → Paste** already injects the clipboard as a bracketed-paste sequence, which croft handles natively.
 
-Other terminals (kitty, Ghostty, WezTerm, Alacritty) deliver Cmd over the kitty protocol natively; croft already negotiates it on startup, so `Cmd+S` and friends work there with no remap.
+### 3. Cmd+Shift+F to jump to the Search sidebar
+
+`Cmd+Shift+F` in iTerm2 collides twice with croft. First, iTerm2's **Edit → Find → Find Globally…** menu item owns `⌘⇧F` at the macOS application-menu level, so the chord never reaches the terminal session. Second, even after freeing the menu shortcut, iTerm2 doesn't deliver `⌘⇧letter` over the kitty protocol the way other terminals do — the same constraint that forces the `⌘S → Ctrl+S` workaround above.
+
+To make `⌘⇧F` jump croft to the Search view:
+
+1. **Free the menu shortcut.** System Settings → Keyboard → Keyboard Shortcuts → **App Shortcuts** → click `+` → Application: **iTerm**, Menu Title: `Find Globally...` (with the three dots), Keyboard Shortcut: any chord you don't use (e.g. `⌃⌥⇧⌘F`). Quit and reopen iTerm2.
+2. **Bind `⌘⇧F` to emit the kitty CSI u sequence croft recognises.** iTerm2 → Settings → **Profiles** → Default → **Keys** → **Key Mappings** → click `+` → Click to Set: press `⌘⇧F` → Action: **Send Hex Code** → Codes:
+   ```
+   0x1b 0x5b 0x37 0x30 0x3b 0x31 0x30 0x75
+   ```
+   That's `\x1b[70;10u` — kitty-protocol-encoded `Shift+Cmd+F` (codepoint 70 for `F`, modifier mask 10 = base 1 + Shift 1 + Super 8). Crossterm decodes it as `KeyEvent { code: Char('F'), modifiers: SHIFT | SUPER }`, which croft's existing `is_search_jump_key` already matches.
+
+After both steps `⌘⇧F` jumps to the Search panel from anywhere in croft.
+
+Other terminals (kitty, Ghostty, WezTerm, Alacritty) deliver Cmd over the kitty protocol natively; croft already negotiates it on startup, so `Cmd+S`, `Cmd+Shift+F`, and friends work there with no remap.
 
 ## How the embedded terminal works
 

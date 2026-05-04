@@ -21,15 +21,28 @@ pub struct SearchHit {
     pub line_text: String,
 }
 
-/// Search the workspace rooted at `root` for `query` and return up to
-/// `MAX_HITS` matches.  Substring match, case-insensitive.  Honours
-/// `.gitignore` (via the `ignore` crate) so generated files don't dominate.
-pub fn search_workspace(root: &Path, query: &str) -> Vec<SearchHit> {
+/// Mode toggles that drive `search_workspace`. Mirror VS Code's three
+/// search input toggles, in the same left-to-right order:
+///   - `case_sensitive` (Aa)
+///   - `whole_word` (ab with underline)
+///   - `use_regex` (.*)
+/// All-false matches the original case-insensitive substring behaviour.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct SearchOpts {
+    pub case_sensitive: bool,
+    pub whole_word: bool,
+    pub use_regex: bool,
+}
+
+/// Search the workspace rooted at `root` for `query` honouring `opts`
+/// (case-sensitivity, whole-word boundaries, regex). Honours `.gitignore`
+/// (via the `ignore` crate) so generated files don't dominate. Capped at
+/// `MAX_HITS`.
+pub fn search_workspace(root: &Path, query: &str, opts: SearchOpts) -> Vec<SearchHit> {
     let q = query.trim();
     if q.is_empty() {
         return Vec::new();
     }
-    let needle = q.to_lowercase();
     let mut hits: Vec<SearchHit> = Vec::new();
     let walker = WalkBuilder::new(root)
         .git_ignore(true)
@@ -47,46 +60,53 @@ pub fn search_workspace(root: &Path, query: &str) -> Vec<SearchHit> {
             continue;
         }
         match std::fs::read_to_string(path) {
-            Ok(content) => collect_matches_in_text(path, &content, &needle, &mut hits),
+            Ok(content) => collect_matches_in_text(path, &content, q, opts, &mut hits),
             Err(_) => {} // binary or unreadable; skip silently
         }
     }
     hits
 }
 
-/// Split `line` into `(segment, is_match)` runs against a case-insensitive
-/// `needle`. Concatenating the segments reproduces the original line
-/// byte-for-byte. Empty needle or no match returns the whole line as a
-/// single non-match segment. Used by the result-row renderer to highlight
-/// every occurrence of the user's query inside the matched line.
-pub fn split_for_highlight(line: &str, needle: &str) -> Vec<(String, bool)> {
+/// Split `line` into `(segment, is_match)` runs against `needle` honouring
+/// the supplied `opts`, so highlights in result rows / the editor stay
+/// consistent with what `collect_matches_in_text` would actually match.
+/// Concatenating the segments reproduces the original line byte-for-byte.
+/// Empty needle, no match, or invalid regex all return the whole line as
+/// a single non-match segment.
+pub fn split_for_highlight(line: &str, needle: &str, opts: SearchOpts) -> Vec<(String, bool)> {
     if needle.is_empty() {
         return vec![(line.to_string(), false)];
     }
-    let lower_line = line.to_lowercase();
-    let lower_needle = needle.to_lowercase();
-    // If lowercasing changed the byte length (rare: e.g. some Unicode
-    // titlecase forms), the lower_line ↔ line index mapping no longer
-    // holds; bail out without highlights rather than risk slicing into
-    // the middle of a UTF-8 codepoint.
-    if lower_line.len() != line.len() {
+    if opts.use_regex {
+        return split_for_highlight_regex(line, needle, opts);
+    }
+    let (haystack, search_for): (String, String) = if opts.case_sensitive {
+        (line.to_string(), needle.to_string())
+    } else {
+        (line.to_lowercase(), needle.to_lowercase())
+    };
+    // If lowercasing changed the byte length (rare Unicode edge case) we
+    // can't safely map `haystack` indices back into `line`, so bail out
+    // without highlights.
+    if haystack.len() != line.len() || search_for.is_empty() {
         return vec![(line.to_string(), false)];
     }
     let mut out: Vec<(String, bool)> = Vec::new();
     let mut last = 0usize;
     let mut start = 0usize;
-    while let Some(rel) = lower_line[start..].find(&lower_needle) {
+    while let Some(rel) = haystack[start..].find(&search_for) {
         let abs = start + rel;
+        let end = abs + search_for.len();
+        if opts.whole_word && !is_whole_word_match(&haystack, abs, end) {
+            start = end;
+            continue;
+        }
         if abs > last {
             out.push((line[last..abs].to_string(), false));
         }
-        let end = abs + lower_needle.len();
         out.push((line[abs..end].to_string(), true));
         last = end;
         start = end;
-        if lower_needle.is_empty() {
-            break;
-        }
     }
     if last < line.len() {
         out.push((line[last..].to_string(), false));
@@ -97,37 +117,82 @@ pub fn split_for_highlight(line: &str, needle: &str) -> Vec<(String, bool)> {
     out
 }
 
-/// `(query_that_was_run, hits)`. The query is echoed back so the receiver
-/// can drop stale results when the user has typed past the query that
-/// produced them.
-pub type SearchResult = (String, Vec<SearchHit>);
+fn split_for_highlight_regex(line: &str, needle: &str, opts: SearchOpts) -> Vec<(String, bool)> {
+    let mut pattern = String::new();
+    if !opts.case_sensitive {
+        pattern.push_str("(?i)");
+    }
+    if opts.whole_word {
+        pattern.push_str("\\b(?:");
+        pattern.push_str(needle);
+        pattern.push_str(")\\b");
+    } else {
+        pattern.push_str(needle);
+    }
+    let re = match regex::Regex::new(&pattern) {
+        Ok(r) => r,
+        Err(_) => return vec![(line.to_string(), false)],
+    };
+    let mut out: Vec<(String, bool)> = Vec::new();
+    let mut last = 0usize;
+    for m in re.find_iter(line) {
+        if m.start() > last {
+            out.push((line[last..m.start()].to_string(), false));
+        }
+        // Empty matches (`.*` against an empty position) would loop
+        // forever; advance past them.
+        if m.end() == m.start() {
+            continue;
+        }
+        out.push((line[m.start()..m.end()].to_string(), true));
+        last = m.end();
+    }
+    if last < line.len() {
+        out.push((line[last..].to_string(), false));
+    }
+    if out.is_empty() {
+        out.push((line.to_string(), false));
+    }
+    out
+}
 
-/// Background worker loop. Reads queries from `rx`, coalesces by always
-/// taking the most recent pending query, debounces ~120 ms so a fast typist
-/// doesn't trigger a search per keystroke, runs `search_workspace`, and
-/// ships `(query, hits)` back via `tx`. Empty queries short-circuit to
-/// empty hits without walking the tree. The thread exits cleanly when the
-/// query channel closes (App dropped).
+/// `(query_that_was_run, opts_used, hits)`. The query and opts are echoed
+/// back so the receiver can drop stale results when the user has typed
+/// past or flipped a toggle since the search started.
+pub type SearchResult = (String, SearchOpts, Vec<SearchHit>);
+
+/// Submitted unit of work: the query string and the toggle state at the
+/// moment of submission. Bundling them lets the user flip a toggle and
+/// re-fire the same query string with new opts.
+pub type SearchRequest = (String, SearchOpts);
+
+/// Background worker loop. Reads requests from `rx`, coalesces by always
+/// taking the most recent pending request, debounces ~120 ms so a fast
+/// typist doesn't trigger a search per keystroke, runs `search_workspace`,
+/// and ships `(query, opts, hits)` back via `tx`. Empty queries
+/// short-circuit to empty hits without walking the tree. The thread
+/// exits cleanly when the channel closes.
 pub fn search_worker_loop(
     root: PathBuf,
-    rx: std::sync::mpsc::Receiver<String>,
+    rx: std::sync::mpsc::Receiver<SearchRequest>,
     tx: std::sync::mpsc::Sender<SearchResult>,
 ) {
     use std::time::Duration;
-    while let Ok(mut query) = rx.recv() {
+    while let Ok(mut req) = rx.recv() {
         while let Ok(newer) = rx.try_recv() {
-            query = newer;
+            req = newer;
         }
         std::thread::sleep(Duration::from_millis(120));
         while let Ok(newer) = rx.try_recv() {
-            query = newer;
+            req = newer;
         }
+        let (query, opts) = req;
         let hits = if query.trim().is_empty() {
             Vec::new()
         } else {
-            search_workspace(&root, &query)
+            search_workspace(&root, &query, opts)
         };
-        if tx.send((query, hits)).is_err() {
+        if tx.send((query, opts, hits)).is_err() {
             return;
         }
     }
@@ -139,18 +204,50 @@ fn is_searchable_size(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Pure helper used by `search_workspace` and unit-tested directly.
+/// Pure helper used by `search_workspace` and unit-tested directly. Honours
+/// the three `SearchOpts` toggles. Regex compilation failure for invalid
+/// patterns is silent: returns no matches rather than crashing.
 pub fn collect_matches_in_text(
     path: &Path,
     content: &str,
-    lowercase_needle: &str,
+    query: &str,
+    opts: SearchOpts,
     out: &mut Vec<SearchHit>,
 ) {
+    let regex = if opts.use_regex {
+        let mut pattern = String::new();
+        if !opts.case_sensitive {
+            pattern.push_str("(?i)");
+        }
+        if opts.whole_word {
+            pattern.push_str("\\b(?:");
+            pattern.push_str(query);
+            pattern.push_str(")\\b");
+        } else {
+            pattern.push_str(query);
+        }
+        match regex::Regex::new(&pattern) {
+            Ok(r) => Some(r),
+            Err(_) => return, // invalid regex: silently yield zero hits
+        }
+    } else {
+        None
+    };
+    let lowered_needle = if opts.case_sensitive {
+        query.to_string()
+    } else {
+        query.to_lowercase()
+    };
     for (idx, line) in content.lines().enumerate() {
         if out.len() >= MAX_HITS {
             return;
         }
-        if line.to_lowercase().contains(lowercase_needle) {
+        let matched = if let Some(r) = regex.as_ref() {
+            r.is_match(line)
+        } else {
+            line_contains_needle(line, query, &lowered_needle, opts)
+        };
+        if matched {
             let trimmed = line.trim_start().trim_end();
             let cut: String = if trimmed.len() > MAX_LINE_LEN {
                 let mut s: String = trimmed.chars().take(MAX_LINE_LEN).collect();
@@ -168,6 +265,51 @@ pub fn collect_matches_in_text(
     }
 }
 
+/// Literal-mode line match: case-sensitive direct contains when the flag
+/// is on, lowercase-folded otherwise. Whole-word check inspects the
+/// characters bounding each match position so partial-word hits get
+/// filtered out.
+fn line_contains_needle(line: &str, query: &str, lowered_needle: &str, opts: SearchOpts) -> bool {
+    let (haystack, needle): (String, &str) = if opts.case_sensitive {
+        (line.to_string(), query)
+    } else {
+        (line.to_lowercase(), &lowered_needle[..])
+    };
+    if needle.is_empty() {
+        return false;
+    }
+    let mut start = 0;
+    while let Some(rel) = haystack[start..].find(needle) {
+        let abs = start + rel;
+        let end = abs + needle.len();
+        if !opts.whole_word || is_whole_word_match(&haystack, abs, end) {
+            return true;
+        }
+        start = end;
+    }
+    false
+}
+
+fn is_whole_word_match(haystack: &str, start: usize, end: usize) -> bool {
+    let prev_ok = start == 0
+        || haystack[..start]
+            .chars()
+            .last()
+            .map(|c| !is_word_char(c))
+            .unwrap_or(true);
+    let next_ok = end >= haystack.len()
+        || haystack[end..]
+            .chars()
+            .next()
+            .map(|c| !is_word_char(c))
+            .unwrap_or(true);
+    prev_ok && next_ok
+}
+
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
 /// Side-panel widget shown when the active sidebar view is "Search".
 pub struct SearchPanel {
     pub query: String,
@@ -178,6 +320,14 @@ pub struct SearchPanel {
     pub last_inner: Rect,
     pub last_area: Rect,
     pub root: PathBuf,
+    pub opts: SearchOpts,
+    /// Per-toggle absolute screen column captured by the most recent render.
+    /// Used by `App::handle_mouse` to map clicks on `Aa`, `ab`, `.*` into
+    /// flag flips. Zero means the row was too narrow to render that toggle.
+    pub toggle_case_x: u16,
+    pub toggle_word_x: u16,
+    pub toggle_regex_x: u16,
+    pub toggle_y: u16,
 }
 
 impl SearchPanel {
@@ -191,14 +341,39 @@ impl SearchPanel {
             last_inner: Rect::default(),
             last_area: Rect::default(),
             root,
+            opts: SearchOpts::default(),
+            toggle_case_x: 0,
+            toggle_word_x: 0,
+            toggle_regex_x: 0,
+            toggle_y: 0,
         }
     }
 
     /// Run the current query, store the results, and reset selection.
     pub fn run_query(&mut self) {
-        self.hits = search_workspace(&self.root, &self.query);
+        self.hits = search_workspace(&self.root, &self.query, self.opts);
         self.selected = 0;
         self.scroll = 0;
+    }
+
+    /// If the cell `(col, row)` falls on one of the three toggle glyphs
+    /// (each rendered as a 2-cell pair), return a mutable pointer to the
+    /// corresponding flag so the caller can flip it. Returns `None`
+    /// otherwise.
+    pub fn toggle_at(&self, col: u16, row: u16) -> Option<SearchToggle> {
+        if row != self.toggle_y {
+            return None;
+        }
+        for (start, kind) in [
+            (self.toggle_case_x, SearchToggle::CaseSensitive),
+            (self.toggle_word_x, SearchToggle::WholeWord),
+            (self.toggle_regex_x, SearchToggle::UseRegex),
+        ] {
+            if start != 0 && col >= start && col < start + 2 {
+                return Some(kind);
+            }
+        }
+        None
     }
 
     pub fn move_up(&mut self) {
@@ -235,6 +410,14 @@ impl SearchPanel {
     }
 }
 
+/// Identifies which of the three search-mode toggles a click landed on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SearchToggle {
+    CaseSensitive,
+    WholeWord,
+    UseRegex,
+}
+
 impl Widget for &mut SearchPanel {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let block_style = if self.focused {
@@ -269,8 +452,10 @@ impl Widget for &mut SearchPanel {
         } else {
             Color::DarkGray
         };
-        let toggles = "Aa ab .*";
-        let toggles_w = toggles.chars().count() as u16;
+        // Per-toggle 2-char glyphs, separated by 1 space, right-aligned.
+        // `Aa` = case-sensitive, `ab` = whole-word, `.*` = regex.
+        let toggle_glyph_w: u16 = 2;
+        let toggles_w: u16 = toggle_glyph_w * 3 + 2;
         let toggles_x = inner
             .x
             .saturating_add(inner.width.saturating_sub(toggles_w));
@@ -278,37 +463,56 @@ impl Widget for &mut SearchPanel {
             "› ",
             Style::default().fg(chevron_color).add_modifier(Modifier::BOLD),
         );
+        let cursor_span = Span::styled(
+            "█",
+            Style::default().fg(Color::Rgb(0x4e, 0x9a, 0xff)),
+        );
+        let placeholder_span = Span::styled(
+            "Search",
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC),
+        );
         let mut spans: Vec<Span> = vec![chevron];
         if self.query.is_empty() {
-            spans.push(Span::styled(
-                "Search",
-                Style::default()
-                    .fg(Color::DarkGray)
-                    .add_modifier(Modifier::ITALIC),
-            ));
+            // Empty input: cursor sits at column 0 of the input area, with
+            // the dim placeholder trailing behind it. Matches VS Code: a
+            // blinking caret at position 0 even before the user types.
+            if self.focused {
+                spans.push(cursor_span);
+            }
+            spans.push(placeholder_span);
         } else {
             spans.push(Span::styled(
                 self.query.as_str(),
                 Style::default().fg(Color::White),
             ));
-        }
-        if self.focused {
-            spans.push(Span::styled(
-                "█",
-                Style::default().fg(Color::Rgb(0x4e, 0x9a, 0xff)),
-            ));
+            if self.focused {
+                spans.push(cursor_span);
+            }
         }
         let typed_w = inner.width.saturating_sub(toggles_w + 1);
         buf.set_line(inner.x, inner.y, &Line::from(spans), typed_w);
-        buf.set_line(
-            toggles_x,
-            inner.y,
-            &Line::from(Span::styled(
-                toggles,
-                Style::default().fg(Color::Rgb(0x6c, 0x7d, 0x9c)),
-            )),
-            toggles_w,
-        );
+
+        let active_style = Style::default()
+            .fg(Color::Black)
+            .bg(Color::Rgb(0xff, 0xd7, 0x4a))
+            .add_modifier(Modifier::BOLD);
+        let inactive_style = Style::default()
+            .fg(Color::Rgb(0x9d, 0xa5, 0xb4));
+        let toggles: [(u16, &str, bool); 3] = [
+            (toggles_x, "Aa", self.opts.case_sensitive),
+            (toggles_x + toggle_glyph_w + 1, "ab", self.opts.whole_word),
+            (toggles_x + (toggle_glyph_w + 1) * 2, ".*", self.opts.use_regex),
+        ];
+        self.toggle_y = inner.y;
+        self.toggle_case_x = toggles[0].0;
+        self.toggle_word_x = toggles[1].0;
+        self.toggle_regex_x = toggles[2].0;
+        for (x, glyph, active) in toggles {
+            let style = if active { active_style } else { inactive_style };
+            buf.set_string(x, inner.y, glyph, style);
+        }
 
         // Status row: live match count. Left blank while waiting for the
         // first result of a non-empty query so the panel doesn't flash
@@ -382,7 +586,7 @@ impl Widget for &mut SearchPanel {
                     Style::default().fg(Color::Rgb(0xeb, 0xcb, 0x8b)),
                 ),
             ];
-            for (chunk, is_match) in split_for_highlight(&hit.line_text, needle) {
+            for (chunk, is_match) in split_for_highlight(&hit.line_text, needle, self.opts) {
                 spans.push(Span::styled(
                     chunk,
                     if is_match { highlight_style } else { plain_style },
@@ -408,7 +612,7 @@ mod tests {
     fn collect_matches_substring_case_insensitive() {
         let mut out = Vec::new();
         let content = "Hello World\nfoo bar\nHELLO again\nno match here";
-        collect_matches_in_text(Path::new("a.txt"), content, "hello", &mut out);
+        collect_matches_in_text(Path::new("a.txt"), content, "hello", SearchOpts::default(), &mut out);
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].line_no, 1);
         assert_eq!(out[0].line_text, "Hello World");
@@ -420,7 +624,7 @@ mod tests {
     fn collect_matches_truncates_very_long_lines() {
         let mut out = Vec::new();
         let long_line = "x".repeat(MAX_LINE_LEN + 50) + "needle";
-        collect_matches_in_text(Path::new("a.txt"), &long_line, "needle", &mut out);
+        collect_matches_in_text(Path::new("a.txt"), &long_line, "needle", SearchOpts::default(), &mut out);
         assert_eq!(out.len(), 1);
         assert!(out[0].line_text.ends_with('…'));
         assert!(out[0].line_text.chars().count() <= MAX_LINE_LEN + 1);
@@ -431,7 +635,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         write(&tmp.path().join("a.txt"), "alpha\nbeta\nbananas\n");
         write(&tmp.path().join("b.rs"), "fn beta() {}\nlet bananas = 1;\n");
-        let hits = search_workspace(tmp.path(), "bananas");
+        let hits = search_workspace(tmp.path(), "bananas", SearchOpts::default());
         assert_eq!(hits.len(), 2);
         let names: Vec<String> = hits
             .iter()
@@ -445,8 +649,8 @@ mod tests {
     fn search_workspace_returns_empty_for_blank_query() {
         let tmp = TempDir::new().unwrap();
         write(&tmp.path().join("a.txt"), "anything");
-        assert!(search_workspace(tmp.path(), "").is_empty());
-        assert!(search_workspace(tmp.path(), "   ").is_empty());
+        assert!(search_workspace(tmp.path(), "", SearchOpts::default()).is_empty());
+        assert!(search_workspace(tmp.path(), "   ", SearchOpts::default()).is_empty());
     }
 
     #[test]
@@ -455,7 +659,7 @@ mod tests {
         write(&tmp.path().join("text.txt"), "hello world");
         // A non-utf8 file: read_to_string returns Err, we silently skip.
         std::fs::write(tmp.path().join("blob.bin"), [0u8, 159, 146, 150]).unwrap();
-        let hits = search_workspace(tmp.path(), "hello");
+        let hits = search_workspace(tmp.path(), "hello", SearchOpts::default());
         assert_eq!(hits.len(), 1);
         assert!(hits[0].path.ends_with("text.txt"));
     }
@@ -468,7 +672,7 @@ mod tests {
             let many = (0..100).map(|_| "needle\n").collect::<String>();
             write(&tmp.path().join(format!("f{i}.txt")), &many);
         }
-        let hits = search_workspace(tmp.path(), "needle");
+        let hits = search_workspace(tmp.path(), "needle", SearchOpts::default());
         assert_eq!(hits.len(), MAX_HITS);
     }
 
@@ -484,20 +688,60 @@ mod tests {
     }
 
     #[test]
+    fn cursor_sits_at_input_start_when_query_empty_and_focused() {
+        use ratatui::buffer::Buffer;
+        let tmp = TempDir::new().unwrap();
+        let mut panel = SearchPanel::new(tmp.path().to_path_buf());
+        panel.focused = true;
+        let area = Rect { x: 0, y: 0, width: 30, height: 5 };
+        let mut buf = Buffer::empty(area);
+        ratatui::widgets::Widget::render(&mut panel, area, &mut buf);
+        let inner_x = panel.last_inner.x;
+        let inner_y = panel.last_inner.y;
+        // Chevron "› " is 2 cells; cursor "█" must sit at column inner_x + 2,
+        // i.e. at the very start of where the user's typed text would go.
+        assert_eq!(
+            buf[(inner_x + 2, inner_y)].symbol(),
+            "█",
+            "cursor must immediately follow the chevron when the query is empty"
+        );
+    }
+
+    #[test]
+    fn cursor_sits_after_typed_text_when_query_non_empty_and_focused() {
+        use ratatui::buffer::Buffer;
+        let tmp = TempDir::new().unwrap();
+        let mut panel = SearchPanel::new(tmp.path().to_path_buf());
+        panel.focused = true;
+        panel.query = String::from("foo");
+        let area = Rect { x: 0, y: 0, width: 30, height: 5 };
+        let mut buf = Buffer::empty(area);
+        ratatui::widgets::Widget::render(&mut panel, area, &mut buf);
+        let inner_x = panel.last_inner.x;
+        let inner_y = panel.last_inner.y;
+        // Chevron "› " (2 cells) + "foo" (3 cells) → cursor at inner_x + 5.
+        assert_eq!(
+            buf[(inner_x + 5, inner_y)].symbol(),
+            "█",
+            "cursor must sit immediately after the typed query"
+        );
+    }
+
+    #[test]
     fn split_highlight_returns_whole_line_when_needle_empty() {
-        let segs = split_for_highlight("hello world", "");
+        let segs = split_for_highlight("hello world", "", SearchOpts::default());
         assert_eq!(segs, vec![(String::from("hello world"), false)]);
     }
 
     #[test]
     fn split_highlight_returns_whole_line_when_no_match() {
-        let segs = split_for_highlight("hello world", "xyz");
+        let segs = split_for_highlight("hello world", "xyz", SearchOpts::default());
         assert_eq!(segs, vec![(String::from("hello world"), false)]);
     }
 
     #[test]
     fn split_highlight_marks_each_match_run_case_insensitive() {
-        let segs = split_for_highlight("The Quick brown fox jumps over the QUICK fence", "quick");
+        let segs = split_for_highlight("The Quick brown fox jumps over the QUICK fence", "quick", SearchOpts::default());
         // Two runs of "quick" (mixed case), three non-match tails.
         let matches: Vec<&String> =
             segs.iter().filter_map(|(s, m)| if *m { Some(s) } else { None }).collect();
@@ -512,7 +756,7 @@ mod tests {
 
     #[test]
     fn split_highlight_handles_match_at_start_and_end() {
-        let segs = split_for_highlight("foo bar foo", "foo");
+        let segs = split_for_highlight("foo bar foo", "foo", SearchOpts::default());
         let joined: String = segs.iter().map(|(s, _)| s.as_str()).collect();
         assert_eq!(joined, "foo bar foo");
         assert_eq!(segs.first().map(|(_, m)| *m), Some(true), "first seg is match");
@@ -523,12 +767,12 @@ mod tests {
     fn search_worker_loop_returns_hits_for_a_typed_query() {
         let tmp = TempDir::new().unwrap();
         write(&tmp.path().join("a.txt"), "one\nneedle\nthree\n");
-        let (q_tx, q_rx) = std::sync::mpsc::channel::<String>();
+        let (q_tx, q_rx) = std::sync::mpsc::channel::<SearchRequest>();
         let (r_tx, r_rx) = std::sync::mpsc::channel::<SearchResult>();
         let root = tmp.path().to_path_buf();
         let join = std::thread::spawn(move || search_worker_loop(root, q_rx, r_tx));
-        q_tx.send("needle".into()).unwrap();
-        let (q, hits) = r_rx
+        q_tx.send(("needle".into(), SearchOpts::default())).unwrap();
+        let (q, _opts, hits) = r_rx
             .recv_timeout(std::time::Duration::from_secs(2))
             .expect("worker should ship a result");
         assert_eq!(q, "needle");
@@ -544,13 +788,13 @@ mod tests {
         // intermediate prefixes.
         let tmp = TempDir::new().unwrap();
         write(&tmp.path().join("a.txt"), "alpha one beta\nzeta\n");
-        let (q_tx, q_rx) = std::sync::mpsc::channel::<String>();
+        let (q_tx, q_rx) = std::sync::mpsc::channel::<SearchRequest>();
         let (r_tx, r_rx) = std::sync::mpsc::channel::<SearchResult>();
         let root = tmp.path().to_path_buf();
         let join = std::thread::spawn(move || search_worker_loop(root, q_rx, r_tx));
-        q_tx.send("o".into()).unwrap();
-        q_tx.send("on".into()).unwrap();
-        q_tx.send("one".into()).unwrap();
+        q_tx.send(("o".into(), SearchOpts::default())).unwrap();
+        q_tx.send(("on".into(), SearchOpts::default())).unwrap();
+        q_tx.send(("one".into(), SearchOpts::default())).unwrap();
         let mut last: Option<SearchResult> = None;
         while let Ok(r) = r_rx.recv_timeout(std::time::Duration::from_secs(2)) {
             last = Some(r);
@@ -561,7 +805,7 @@ mod tests {
                 break;
             }
         }
-        let (q, hits) = last.expect("worker must produce at least one result");
+        let (q, _opts, hits) = last.expect("worker must produce at least one result");
         assert_eq!(q, "one", "coalesce must drop intermediate prefixes");
         assert_eq!(hits.len(), 1);
         drop(q_tx);
@@ -572,18 +816,141 @@ mod tests {
     fn search_worker_loop_short_circuits_empty_queries() {
         let tmp = TempDir::new().unwrap();
         write(&tmp.path().join("a.txt"), "anything\n");
-        let (q_tx, q_rx) = std::sync::mpsc::channel::<String>();
+        let (q_tx, q_rx) = std::sync::mpsc::channel::<SearchRequest>();
         let (r_tx, r_rx) = std::sync::mpsc::channel::<SearchResult>();
         let root = tmp.path().to_path_buf();
         let join = std::thread::spawn(move || search_worker_loop(root, q_rx, r_tx));
-        q_tx.send("".into()).unwrap();
-        let (q, hits) = r_rx
+        q_tx.send(("".into(), SearchOpts::default())).unwrap();
+        let (q, _opts, hits) = r_rx
             .recv_timeout(std::time::Duration::from_secs(2))
             .unwrap();
         assert_eq!(q, "");
         assert!(hits.is_empty());
         drop(q_tx);
         join.join().unwrap();
+    }
+
+    #[test]
+    fn search_opts_default_matches_legacy_case_insensitive_substring() {
+        let mut out = Vec::new();
+        let opts = SearchOpts::default();
+        collect_matches_in_text(
+            Path::new("a.txt"),
+            "Hello World\nfoo bar\nHELLO again\nno match",
+            "hello",
+            opts,
+            &mut out,
+        );
+        assert_eq!(out.len(), 2, "default opts mirror the original behaviour");
+    }
+
+    #[test]
+    fn search_opts_case_sensitive_excludes_different_case() {
+        let mut out = Vec::new();
+        let opts = SearchOpts { case_sensitive: true, ..Default::default() };
+        collect_matches_in_text(
+            Path::new("a.txt"),
+            "Hello World\nhello again\nHELLO loud",
+            "hello",
+            opts,
+            &mut out,
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].line_text, "hello again");
+    }
+
+    #[test]
+    fn search_opts_whole_word_excludes_partial_matches() {
+        let mut out = Vec::new();
+        let opts = SearchOpts { whole_word: true, ..Default::default() };
+        collect_matches_in_text(
+            Path::new("a.txt"),
+            "cat sat\ncategory animal\ncat\nbobcat sleeps",
+            "cat",
+            opts,
+            &mut out,
+        );
+        // Only the lines where 'cat' is a standalone word should match.
+        let texts: Vec<&str> = out.iter().map(|h| h.line_text.as_str()).collect();
+        assert_eq!(texts, vec!["cat sat", "cat"]);
+    }
+
+    #[test]
+    fn search_opts_regex_finds_pattern_class() {
+        let mut out = Vec::new();
+        let opts = SearchOpts { use_regex: true, ..Default::default() };
+        collect_matches_in_text(
+            Path::new("a.txt"),
+            "let x = 42;\nlet y = abc;\nlet z = 13;\nno number",
+            r"\d+",
+            opts,
+            &mut out,
+        );
+        let texts: Vec<&str> = out.iter().map(|h| h.line_text.as_str()).collect();
+        assert_eq!(texts, vec!["let x = 42;", "let z = 13;"]);
+    }
+
+    #[test]
+    fn search_opts_regex_honours_case_sensitive_flag() {
+        let mut out = Vec::new();
+        let opts = SearchOpts { use_regex: true, case_sensitive: true, ..Default::default() };
+        collect_matches_in_text(
+            Path::new("a.txt"),
+            "Foo\nfoo\nFOO",
+            r"foo",
+            opts,
+            &mut out,
+        );
+        let texts: Vec<&str> = out.iter().map(|h| h.line_text.as_str()).collect();
+        assert_eq!(texts, vec!["foo"], "regex must respect case-sensitive flag");
+    }
+
+    #[test]
+    fn search_opts_invalid_regex_returns_empty_quietly() {
+        let mut out = Vec::new();
+        let opts = SearchOpts { use_regex: true, ..Default::default() };
+        collect_matches_in_text(
+            Path::new("a.txt"),
+            "anything\nat all",
+            r"[unclosed",
+            opts,
+            &mut out,
+        );
+        assert!(out.is_empty(), "invalid regex must not crash, just yield no hits");
+    }
+
+    #[test]
+    fn toggle_at_maps_a_click_on_each_glyph_to_the_right_kind() {
+        use ratatui::buffer::Buffer;
+        let tmp = TempDir::new().unwrap();
+        let mut panel = SearchPanel::new(tmp.path().to_path_buf());
+        panel.focused = true;
+        let area = Rect { x: 0, y: 0, width: 30, height: 5 };
+        let mut buf = Buffer::empty(area);
+        ratatui::widgets::Widget::render(&mut panel, area, &mut buf);
+        let y = panel.toggle_y;
+        // Each toggle is 2 cells; clicking either cell on the same row
+        // should map to its kind.
+        assert_eq!(
+            panel.toggle_at(panel.toggle_case_x, y),
+            Some(SearchToggle::CaseSensitive)
+        );
+        assert_eq!(
+            panel.toggle_at(panel.toggle_case_x + 1, y),
+            Some(SearchToggle::CaseSensitive)
+        );
+        assert_eq!(
+            panel.toggle_at(panel.toggle_word_x, y),
+            Some(SearchToggle::WholeWord)
+        );
+        assert_eq!(
+            panel.toggle_at(panel.toggle_regex_x + 1, y),
+            Some(SearchToggle::UseRegex)
+        );
+        // Wrong row → None.
+        assert_eq!(panel.toggle_at(panel.toggle_case_x, y + 1), None);
+        // Outside the toggle columns → None.
+        assert_eq!(panel.toggle_at(0, y), None);
     }
 
     #[test]
