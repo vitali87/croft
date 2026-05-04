@@ -91,6 +91,54 @@ pub fn parse_porcelain_dirty(out: &str) -> bool {
     out.lines().any(|l| !l.trim().is_empty())
 }
 
+/// One row in the welcome-screen recent-commits panel: the short hash, a
+/// human-readable relative date (e.g. "2 hours ago"), and the commit
+/// subject. Returned by `recent_commits` for any non-empty git workspace.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommitInfo {
+    pub hash: String,
+    pub when: String,
+    pub subject: String,
+}
+
+/// Return the most recent `n` commits reachable from HEAD, newest-first.
+/// Empty when not in a git repo or when git isn't on PATH; callers should
+/// fall back to a static welcome message in that case.
+pub fn recent_commits(root: &Path, n: usize) -> Vec<CommitInfo> {
+    if n == 0 || !is_git_repo(root) {
+        return Vec::new();
+    }
+    let count = n.to_string();
+    let raw = match run_git(
+        root,
+        &[
+            "log",
+            "-n",
+            &count,
+            "--pretty=format:%h\x1f%cr\x1f%s",
+        ],
+    ) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    parse_recent_commits(&raw)
+}
+
+pub fn parse_recent_commits(raw: &str) -> Vec<CommitInfo> {
+    raw.lines()
+        .filter_map(|line| {
+            let mut parts = line.splitn(3, '\x1f');
+            let hash = parts.next()?.trim().to_string();
+            let when = parts.next()?.trim().to_string();
+            let subject = parts.next()?.trim().to_string();
+            if hash.is_empty() {
+                return None;
+            }
+            Some(CommitInfo { hash, when, subject })
+        })
+        .collect()
+}
+
 /// `git rev-list --left-right --count HEAD...@{u}` returns "<ahead>\t<behind>".
 pub fn parse_ahead_behind(out: &str) -> (usize, usize) {
     let mut parts = out.split_whitespace();
@@ -117,6 +165,24 @@ mod tests {
     fn parse_branch_treats_empty_as_none() {
         assert_eq!(parse_branch(String::new()), None);
         assert_eq!(parse_branch("   \n".into()), None);
+    }
+
+    #[test]
+    fn parse_recent_commits_three_rows() {
+        let raw = "abc1\x1f2 hours ago\x1ffeat: tabs\nde2\x1fyesterday\x1ffix: bug\n333\x1flast week\x1fdocs: readme";
+        let got = parse_recent_commits(raw);
+        assert_eq!(got.len(), 3);
+        assert_eq!(got[0].hash, "abc1");
+        assert_eq!(got[0].when, "2 hours ago");
+        assert_eq!(got[0].subject, "feat: tabs");
+        assert_eq!(got[2].subject, "docs: readme");
+    }
+
+    #[test]
+    fn parse_recent_commits_skips_malformed_rows() {
+        let raw = "abc1\x1f2 hours ago\x1fok\nincomplete\nde2\x1fyesterday\x1falso ok";
+        let got = parse_recent_commits(raw);
+        assert_eq!(got.len(), 2);
     }
 
     #[test]

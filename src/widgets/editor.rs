@@ -2251,9 +2251,11 @@ impl EditorTabs {
     }
 
     /// True iff the editor is in its just-launched state: a single tab with
-    /// no file loaded and no edits. Used by `open_preview` / `open_pinned`
-    /// to reuse that placeholder rather than stack a new tab on top of it.
-    fn is_blank_initial(&self) -> bool {
+    /// no file loaded and no edits. `App::render` uses this to swap the
+    /// editor pane for the welcome screen, and `open_preview` /
+    /// `open_pinned` use it to reuse the placeholder tab rather than stack
+    /// a new one on top.
+    pub fn is_blank_initial(&self) -> bool {
         self.editors.len() == 1
             && self.editors[0].path.is_none()
             && !self.editors[0].dirty

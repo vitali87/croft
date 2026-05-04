@@ -241,6 +241,32 @@ pub struct App {
     /// redraw repaints the PNGs and you see the cursor blink each time iTerm
     /// processes the image.
     activity_overlay_dirty: bool,
+    /// Captured at startup. Drives the welcome screen's "Recent" list when
+    /// the editor pane is in its blank initial state. Empty when croft was
+    /// launched outside a git workspace.
+    recent_commits: Vec<crate::git::CommitInfo>,
+    /// Pre-encoded OSC-1337 escape carrying the croft wordmark sized to the
+    /// welcome banner block. None when the host terminal can't render
+    /// inline images. Set in `init_graphics`; re-baked in `mark_welcome_dirty`
+    /// when the editor pane resizes.
+    welcome_image: Option<String>,
+    /// Cell `(width, height)` the welcome image was last baked at, plus the
+    /// absolute `(x, y)` of its top-left in the editor pane. Used to detect
+    /// layout changes that require a re-bake or re-emit.
+    welcome_layout: Option<WelcomeLayout>,
+    welcome_overlay_dirty: bool,
+    /// Pixel size of one terminal cell, captured in `init_graphics`.
+    /// Required to bake OSC-1337 images at exact viewport pixel size so
+    /// iTerm draws them with no stretching or letterboxing.
+    cell_pixel: Option<(u32, u32)>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WelcomeLayout {
+    cell_x: u16,
+    cell_y: u16,
+    cell_w: u16,
+    cell_h: u16,
 }
 
 const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(500);
@@ -256,6 +282,7 @@ impl App {
             Err(_) => (None, None),
         };
         let git_status = crate::git::query(&root);
+        let recent_commits = crate::git::recent_commits(&root, 5);
         Ok(Self {
             tree,
             search,
@@ -279,6 +306,11 @@ impl App {
             last_editor_left_down: None,
             last_tree_left_down: None,
             activity_overlay_dirty: true,
+            recent_commits,
+            welcome_image: None,
+            welcome_layout: None,
+            welcome_overlay_dirty: true,
+            cell_pixel: None,
         })
     }
 
@@ -303,6 +335,7 @@ impl App {
         }
         let cell_w = (ws.width / ws.columns).max(1) as u32;
         let cell_h = (ws.height / ws.rows).max(1) as u32;
+        self.cell_pixel = Some((cell_w, cell_h));
         let canvas_w = cell_w * ACTIVITY_BAR_WIDTH as u32;
         let canvas_h = cell_h * ACTIVITY_ICON_HEIGHT as u32;
         let is_tmux = crate::iterm2_inline::detect_tmux();
@@ -530,6 +563,133 @@ impl App {
         self.terminal.focused = self.focus == Pane::Terminal;
     }
 
+    fn render_welcome(&mut self, frame: &mut ratatui::Frame, area: Rect) {
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+        let bg = Style::default().bg(Color::Rgb(0x1e, 0x22, 0x2e));
+        frame.render_widget(
+            ratatui::widgets::Block::default().style(bg),
+            area,
+        );
+
+        // Reserve space for the recent-commits panel below the logo, then
+        // hand the remainder to the centred image.
+        let recents_h: u16 = if self.recent_commits.is_empty() {
+            0
+        } else {
+            (self.recent_commits.len() as u16) + 2 // header + spacer
+        };
+        let logo_max_w = (area.width as u32).saturating_sub(4) as u16;
+        let logo_max_h = area
+            .height
+            .saturating_sub(recents_h.saturating_add(2));
+        let logo_w_cells = logo_max_w.min(48).max(8);
+        let logo_h_cells = logo_max_h.min(14).max(4);
+
+        let total_h = logo_h_cells + 1 + recents_h;
+        let block_top = area.y + area.height.saturating_sub(total_h) / 2;
+        let logo_x = area.x + area.width.saturating_sub(logo_w_cells) / 2;
+        let logo_y = block_top;
+
+        let desired = WelcomeLayout {
+            cell_x: logo_x,
+            cell_y: logo_y,
+            cell_w: logo_w_cells,
+            cell_h: logo_h_cells,
+        };
+
+        // (Re)bake the OSC-1337 image whenever the layout shifts (resize,
+        // sidebar toggle, etc). In terminals without inline-image support
+        // we leave `welcome_image = None` and just render a text wordmark.
+        if self.welcome_layout != Some(desired) {
+            if let Some((cw, ch)) = self.cell_pixel {
+                let canvas_w = (logo_w_cells as u32) * cw;
+                let canvas_h = (logo_h_cells as u32) * ch;
+                if let Ok(baked) = crate::iterm2_inline::fit_image(
+                    crate::iterm2_inline::WELCOME_LOGO_PNG,
+                    canvas_w,
+                    canvas_h,
+                ) {
+                    let raw = crate::iterm2_inline::build_inline_image_osc(
+                        &baked,
+                        logo_w_cells,
+                        logo_h_cells,
+                        false,
+                    );
+                    let osc = if crate::iterm2_inline::detect_tmux() {
+                        crate::iterm2_inline::tmux_passthrough_wrap(&raw)
+                    } else {
+                        raw
+                    };
+                    self.welcome_image = Some(osc);
+                }
+            }
+            self.welcome_layout = Some(desired);
+            self.welcome_overlay_dirty = true;
+        }
+
+        if self.welcome_image.is_none() {
+            // Text fallback for non-iTerm2 terminals.
+            let label = " croft ";
+            let lx = logo_x
+                .saturating_add(logo_w_cells.saturating_sub(label.chars().count() as u16) / 2);
+            let ly = logo_y + logo_h_cells / 2;
+            frame.buffer_mut().set_string(
+                lx,
+                ly,
+                label,
+                Style::default()
+                    .fg(Color::Rgb(0x9d, 0xa5, 0xb4))
+                    .add_modifier(Modifier::BOLD),
+            );
+        }
+
+        if self.recent_commits.is_empty() {
+            return;
+        }
+
+        let header_y = logo_y + logo_h_cells + 1;
+        let block_left = area.x + area.width / 8;
+        let block_right = area.x + area.width - area.width / 8;
+        let block_w = block_right.saturating_sub(block_left);
+        let header = "RECENT";
+        let header_style = Style::default()
+            .fg(Color::Rgb(0x9d, 0xa5, 0xb4))
+            .add_modifier(Modifier::BOLD);
+        frame
+            .buffer_mut()
+            .set_string(block_left, header_y, header, header_style);
+        let row_style = Style::default().fg(Color::Rgb(0xc5, 0xcd, 0xd9));
+        let dim = Style::default().fg(Color::Rgb(0x6c, 0x7d, 0x9c));
+        for (i, c) in self.recent_commits.iter().enumerate() {
+            let y = header_y + 2 + i as u16;
+            if y >= area.y + area.height {
+                break;
+            }
+            let mut x = block_left;
+            frame.buffer_mut().set_string(x, y, &c.hash, dim);
+            x += c.hash.chars().count() as u16 + 1;
+            let when_w = c.when.chars().count() as u16;
+            let row_end = block_left + block_w;
+            let subject_w = c.subject.chars().count() as u16;
+            let can_fit_when = x + subject_w + 2 + when_w <= row_end;
+            if can_fit_when {
+                frame.buffer_mut().set_string(x, y, &c.subject, row_style);
+                let when_x = row_end.saturating_sub(when_w);
+                frame.buffer_mut().set_string(when_x, y, &c.when, dim);
+            } else {
+                // Subject won't share the row with the relative date; show
+                // the full subject (clipped only at the welcome block's
+                // right edge) and drop the date for this row.
+                let room = row_end.saturating_sub(x);
+                let subject_clip: String =
+                    c.subject.chars().take(room as usize).collect();
+                frame.buffer_mut().set_string(x, y, &subject_clip, row_style);
+            }
+        }
+    }
+
     fn render_activity_bar(&mut self, frame: &mut ratatui::Frame, area: Rect) {
         if area.width == 0 || area.height == 0 {
             return;
@@ -703,7 +863,25 @@ impl App {
                 SidebarView::Search => frame.render_widget(&mut self.search, area),
             }
         }
-        frame.render_widget(&mut self.editor, editor_area);
+        if self.editor.is_blank_initial() {
+            self.render_welcome(frame, editor_area);
+            // Keep the editor's hit-test rectangles fresh so the activity-bar
+            // / tree click logic still works even though we skipped the
+            // EditorTabs widget this frame.
+            self.editor.last_full_area = editor_area;
+            self.editor.last_area = Rect {
+                x: editor_area.x,
+                y: editor_area.y,
+                width: editor_area.width,
+                height: 0,
+            };
+        } else {
+            frame.render_widget(&mut self.editor, editor_area);
+            // The editor just overdrew whatever cells the welcome image
+            // occupied; if the user reopens the welcome screen, we'll need
+            // to re-emit it.
+            self.welcome_overlay_dirty = true;
+        }
         if let Some(area) = terminal_area {
             frame.render_widget(&mut self.terminal, area);
         }
@@ -2520,6 +2698,34 @@ fn main_loop(
                 }
                 let _ = out.flush();
                 app.activity_overlay_dirty = false;
+            }
+            // Welcome-screen logo: same OSC-1337 trick, gated by its own
+            // dirty flag and only emitted while the editor pane is in its
+            // blank initial state.
+            if app.editor.is_blank_initial()
+                && app.welcome_overlay_dirty
+            {
+                if let (Some(img), Some(layout)) =
+                    (app.welcome_image.as_ref(), app.welcome_layout)
+                {
+                    use std::io::Write;
+                    let mut out = stdout();
+                    let cursor_on = app.cursor_should_be_visible();
+                    let _ = write!(out, "\x1b[?25l\x1b[s");
+                    let _ = write!(
+                        out,
+                        "\x1b[{};{}H",
+                        layout.cell_y + 1,
+                        layout.cell_x + 1
+                    );
+                    let _ = out.write_all(img.as_bytes());
+                    let _ = write!(out, "\x1b[u");
+                    if cursor_on {
+                        let _ = write!(out, "\x1b[?25h");
+                    }
+                    let _ = out.flush();
+                    app.welcome_overlay_dirty = false;
+                }
             }
             needs_redraw = false;
             last_blink_visible = blink_visible;
