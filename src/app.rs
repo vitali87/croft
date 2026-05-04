@@ -3215,13 +3215,18 @@ fn main_loop(
                 app.render(f);
             })?;
             // After ratatui flushes its diff, paint the activity-bar icons
-            // directly via OSC-1337. Bypassing the buffer is the only path
-            // that's known to work in iTerm2 (yazi uses the same trick).
-            // ratatui's bg block re-clears those cells on every frame, so
-            // we re-emit on every redraw — no flicker because both writes
-            // hit the same diff cycle.
+            // directly via OSC-1337 on every redraw. We previously gated
+            // this on a `dirty` flag and only re-emitted on resize / view
+            // change, but the icons would intermittently vanish: iTerm2
+            // can drop cached OSC-1337 image cells under heavy SGR traffic
+            // on adjacent cells (cursor-blink redraws, search updates,
+            // mouse motion bursts) and the dirty gate had no way to detect
+            // that. Since `render_activity_bar` writes nothing to the
+            // buffer in image-mode, ratatui's diff produces zero per-cell
+            // writes here — re-emitting the pre-encoded OSC bytes every
+            // frame is cheap and locks the images in.
             let overlays = app.pending_activity_image_overlays();
-            if app.activity_overlay_dirty && !overlays.is_empty() {
+            if !overlays.is_empty() {
                 use std::io::Write;
                 let mut out = stdout();
                 let cursor_on = app.cursor_should_be_visible();
