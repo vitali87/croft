@@ -176,13 +176,16 @@ impl FileTree {
         self.nodes.get(self.selected).map(|n| n.path.as_path())
     }
 
-    /// Reload the children of the directory node at `idx`. Used after creating
-    /// new files / folders so the tree reflects the new on-disk state.
+    /// Reload the children of the directory node at `idx`. Preserves the
+    /// node's existing `expanded` state — an FS event arriving inside a
+    /// folder the user just collapsed must not pop it back open. When the
+    /// node is collapsed we just drop its stale children and mark it
+    /// unloaded so reopening reloads fresh, skipping the directory walk
+    /// entirely.
     pub fn refresh_children(&mut self, idx: usize) {
         if idx >= self.nodes.len() || !self.nodes[idx].is_dir {
             return;
         }
-        // Drop existing children of this node, then reload.
         let depth = self.nodes[idx].depth;
         let mut end = idx + 1;
         while end < self.nodes.len() && self.nodes[end].depth > depth {
@@ -190,8 +193,9 @@ impl FileTree {
         }
         self.nodes.drain((idx + 1)..end);
         self.nodes[idx].loaded = false;
-        self.load_children(idx);
-        self.nodes[idx].expanded = true;
+        if self.nodes[idx].expanded {
+            self.load_children(idx);
+        }
         if self.selected >= self.nodes.len() {
             self.selected = self.nodes.len().saturating_sub(1);
         }
@@ -729,6 +733,42 @@ mod tests {
         assert!(
             tree.nodes.iter().any(|n| n.path.ends_with("y.txt")),
             "y.txt should appear after refresh_children driven by the watcher event"
+        );
+    }
+
+    #[test]
+    fn refresh_children_preserves_collapsed_state_on_external_change() {
+        // FS events fire asynchronously inside any expanded ancestor. If the
+        // user just collapsed a folder (e.g. .git), an event arriving inside
+        // it must NOT pop it back open — refresh_children must preserve the
+        // user's collapse choice.
+        let tmp = TempDir::new().unwrap();
+        let sub = tmp.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(sub.join("a.txt"), "").unwrap();
+        let mut tree = FileTree::new(tmp.path().to_path_buf());
+        // Expand `sub`, then collapse it again to simulate the user's choice.
+        let sub_idx = tree
+            .nodes
+            .iter()
+            .position(|n| n.is_dir && n.path.ends_with("sub"))
+            .unwrap();
+        tree.selected = sub_idx;
+        tree.activate();
+        let sub_idx = tree
+            .nodes
+            .iter()
+            .position(|n| n.is_dir && n.path.ends_with("sub"))
+            .unwrap();
+        tree.selected = sub_idx;
+        tree.activate();
+        assert!(!tree.nodes[sub_idx].expanded, "precondition: sub is collapsed");
+        // External write fires a watcher event for `sub`.
+        std::fs::write(sub.join("b.txt"), "").unwrap();
+        tree.refresh_children(sub_idx);
+        assert!(
+            !tree.nodes[sub_idx].expanded,
+            "refresh_children must not re-expand a folder the user collapsed"
         );
     }
 
