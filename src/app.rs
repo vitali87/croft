@@ -1740,6 +1740,12 @@ impl App {
         }
         if self.editor.is_blank_initial() {
             self.render_welcome(frame, editor_area);
+            // The previous frame may have rendered an image-preview tab
+            // whose OSC-1337 pixels are still cached in iTerm's image
+            // store. Closing that tab brings us here, but ratatui's diff
+            // alone doesn't tell iTerm to drop the image — flag it so the
+            // main loop wipes the screen on the next pass.
+            self.disable_editor_image();
             // Keep the editor's hit-test rectangles fresh so the activity-bar
             // / tree click logic still works even though we skipped the
             // EditorTabs widget this frame.
@@ -5580,6 +5586,39 @@ mod tests {
             modifiers: KeyModifiers::ALT,
         });
         assert!(app.editor.is_blank_initial(), "alt-click must not open the file");
+    }
+
+    #[test]
+    fn closing_image_tab_requests_overlay_clear_on_next_render() {
+        // Repro for: opening a PNG/PDF then closing the tab leaves the
+        // OSC-1337 pixels bleeding through the welcome screen. The render
+        // path that swaps to welcome must mark the editor image overlay
+        // for clearing so the main loop wipes the screen.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.editor_image_displayed = true;
+        app.editor_image_osc = Some(String::from("dummy-osc"));
+        app.editor_image_layout = Some(EditorImageLayout {
+            cell_x: 0,
+            cell_y: 0,
+            cell_w: 10,
+            cell_h: 10,
+            path: tmp.path().join("doomed.png"),
+        });
+        // Editor is blank-initial right after construction, so calling
+        // disable_editor_image directly mimics what render() does on
+        // the welcome branch.
+        app.disable_editor_image();
+        assert!(app.editor_image_osc.is_none());
+        assert!(app.editor_image_layout.is_none());
+        assert!(
+            app.consume_editor_image_clear(),
+            "first call must report a pending clear"
+        );
+        assert!(
+            !app.consume_editor_image_clear(),
+            "second call must be a no-op"
+        );
     }
 
     #[test]
