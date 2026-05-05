@@ -230,6 +230,37 @@ mod tests {
     }
 
     #[test]
+    fn xlsx_uses_table_glyph_in_excel_green() {
+        let icon = for_path("data.xlsx", ".xlsx");
+        assert_eq!(icon.glyph, '\u{ebb7}');
+        assert_eq!(icon.color, rgb(0x10, 0x7c, 0x41));
+    }
+
+    #[test]
+    fn xls_and_xlsb_share_xlsx_styling() {
+        let xls = for_path("legacy.xls", ".xls");
+        let xlsb = for_path("binary.xlsb", ".xlsb");
+        let xlsx = for_path("modern.xlsx", ".xlsx");
+        assert_eq!(xls.glyph, xlsx.glyph);
+        assert_eq!(xls.color, xlsx.color);
+        assert_eq!(xlsb.glyph, xlsx.glyph);
+        assert_eq!(xlsb.color, xlsx.color);
+    }
+
+    #[test]
+    fn ods_uses_table_glyph_in_libreoffice_green() {
+        let icon = for_path("data.ods", ".ods");
+        assert_eq!(icon.glyph, '\u{ebb7}');
+        assert_eq!(icon.color, rgb(0x18, 0xa3, 0x03));
+    }
+
+    #[test]
+    fn bmp_inherits_image_media_glyph() {
+        let icon = for_path("logo.bmp", ".bmp");
+        assert_eq!(icon.glyph, '\u{eaea}');
+    }
+
+    #[test]
     fn sql_glyph_is_cod_database_not_workspace_trusted() {
         // Same wrong shield. SQL → cod-database U+EBE6 (table-like icon).
         let icon = for_path("query.sql", ".sql");
@@ -271,7 +302,9 @@ fn ext_icon(s: &str) -> Option<Icon> {
         ".xml" => i('\u{eabe}', 0xe3, 0x79, 0x33),
         ".svg" => i('\u{eabe}', 0xff, 0xb1, 0x3b),
         // cod-file_media (NOT cod-mail U+EB1C, which is an envelope)
-        ".png" | ".jpg" | ".jpeg" | ".gif" | ".webp" | ".ico" => i('\u{eaea}', 0xa0, 0x74, 0xc4),
+        ".png" | ".jpg" | ".jpeg" | ".gif" | ".webp" | ".bmp" | ".ico" => {
+            i('\u{eaea}', 0xa0, 0x74, 0xc4)
+        }
         ".pdf" => i('\u{eaeb}', 0xb3, 0x0b, 0x00),
         // cod-file_zip (NOT cod-filter U+EAF1, which is a funnel)
         ".zip" | ".tar" | ".gz" => i('\u{eaef}', 0xcc, 0xa7, 0x00),
@@ -281,6 +314,12 @@ fn ext_icon(s: &str) -> Option<Icon> {
         ".txt" => i('\u{f15c}', 0xcc, 0xcc, 0xcc),
         // cod-table (NOT cod-triangle_down U+EB6E)
         ".csv" | ".tsv" => i('\u{ebb7}', 0x7c, 0xb3, 0x42),
+        // Microsoft Excel green (#107c41) for .xlsx/.xls/.xlsb so the
+        // explorer reads spreadsheet-at-a-glance the same way the editor's
+        // sheet-preview pane does.
+        ".xlsx" | ".xls" | ".xlsb" => i('\u{ebb7}', 0x10, 0x7c, 0x41),
+        // LibreOffice Calc green for OpenDocument Spreadsheets.
+        ".ods" => i('\u{ebb7}', 0x18, 0xa3, 0x03),
         ".env" => i('\u{eb51}', 0xfa, 0xf7, 0x43),
         _ => return None,
     })
