@@ -2520,6 +2520,27 @@ impl App {
     }
 
     fn handle_paste(&mut self, s: &str) {
+        // Finder drag-and-drop into croft arrives via the host terminal as
+        // a bracketed paste containing absolute filesystem path(s). When
+        // the tree pane has focus we treat that as an import gesture (mv
+        // for the local Explorer, scp+rm for the Remote Explorer) instead
+        // of dropping the path text into a buffer.
+        if self.focus == Pane::Tree {
+            let dropped = parse_dropped_paths(s);
+            if !dropped.is_empty() {
+                match self.sidebar_view {
+                    SidebarView::Explorer => {
+                        self.import_paths_into_explorer(&dropped);
+                        return;
+                    }
+                    SidebarView::Remote => {
+                        self.import_paths_into_remote(&dropped);
+                        return;
+                    }
+                    SidebarView::Search => {}
+                }
+            }
+        }
         if self.sidebar_view == SidebarView::Search && self.focus != Pane::Editor {
             self.search.insert_str_into_query(s);
             self.submit_search_query();
@@ -2538,6 +2559,86 @@ impl App {
             }
             Pane::Tree => {}
         }
+    }
+
+    /// Move every dropped path into the directory the explorer is
+    /// currently pointing at. Files outside the workspace are *moved* in
+    /// (matching the user's Finder-drop expectation), not copied — they
+    /// disappear from the source location and re-appear in the explorer.
+    fn import_paths_into_explorer(&mut self, paths: &[PathBuf]) {
+        let dest_dir = self.paste_target_dir();
+        let total = paths.len();
+        let mut placed: Vec<PathBuf> = Vec::new();
+        let mut errors: Vec<String> = Vec::new();
+        let mut affected: BTreeSet<PathBuf> = BTreeSet::new();
+        affected.insert(dest_dir.clone());
+        for src in paths {
+            if let Some(parent) = src.parent() {
+                affected.insert(parent.to_path_buf());
+            }
+            match crate::widgets::file_tree::move_into(&dest_dir, src) {
+                Ok(p) => placed.push(p),
+                Err(e) => errors.push(format!("{}: {e}", src.display())),
+            }
+        }
+        for dir in &affected {
+            if let Some(idx) = self.tree.index_of_dir(dir) {
+                self.tree.refresh_children(idx);
+            }
+        }
+        self.tree.marked.clear();
+        for p in &placed {
+            self.tree.marked.insert(p.clone());
+        }
+        if let Some(first) = placed.first() {
+            if let Some(idx) = self.tree.nodes.iter().position(|n| &n.path == first) {
+                self.tree.selected = idx;
+                self.tree.anchor = idx;
+            }
+        }
+        self.status = if !errors.is_empty() {
+            format!(
+                "Imported {}/{}; failed: {}",
+                placed.len(),
+                total,
+                errors.join("; ")
+            )
+        } else if total == 1 {
+            format!("Imported {} into {}", paths[0].display(), dest_dir.display())
+        } else {
+            format!("Imported {total} items into {}", dest_dir.display())
+        };
+    }
+
+    /// Upload every dropped path to the currently selected SSH target via
+    /// `scp -r`, then remove the local source so the gesture matches the
+    /// "move from Mac to remote" intent the user asked for.
+    fn import_paths_into_remote(&mut self, paths: &[PathBuf]) {
+        let Some(target) = self.remote.selected_target().cloned() else {
+            self.status =
+                String::from("Drop ignored: no Remote Explorer host selected");
+            return;
+        };
+        let total = paths.len();
+        let mut moved = 0usize;
+        let mut errors: Vec<String> = Vec::new();
+        for src in paths {
+            match scp_upload_then_remove(&target.alias, src) {
+                Ok(()) => moved += 1,
+                Err(e) => errors.push(format!("{}: {e}", src.display())),
+            }
+        }
+        self.status = if !errors.is_empty() {
+            format!(
+                "Uploaded {moved}/{total} to {}; failed: {}",
+                target.alias,
+                errors.join("; ")
+            )
+        } else if total == 1 {
+            format!("Moved {} to {}:~", paths[0].display(), target.alias)
+        } else {
+            format!("Moved {total} items to {}:~", target.alias)
+        };
     }
 
     fn welcome_link_at(&self, col: u16, row: u16) -> Option<&WelcomeLink> {
@@ -4033,6 +4134,129 @@ fn drop_target_dir(
         .get(target_idx)
         .map(|n| n.path.clone())
         .unwrap_or_else(|| tree.root.clone())
+}
+
+/// Parse a bracketed-paste payload that originated from a Finder-style
+/// drag-and-drop into the host terminal. Returns the absolute existing
+/// paths the user dropped, or an empty Vec when the payload is plain text
+/// (in which case the caller falls back to the normal paste path). Each
+/// candidate token survives only if it resolves to an existing absolute
+/// path on disk, so a stray paste of "/usr/bin" worth of typed text still
+/// behaves like text.
+pub fn parse_dropped_paths(s: &str) -> Vec<PathBuf> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    let mut tokens: Vec<String> = Vec::new();
+    if trimmed.contains('\n') || trimmed.contains('\t') {
+        for line in trimmed.split(|c| c == '\n' || c == '\r' || c == '\t') {
+            let cleaned = line.trim();
+            if !cleaned.is_empty() {
+                tokens.push(cleaned.to_string());
+            }
+        }
+    } else {
+        tokens.push(trimmed.to_string());
+    }
+    let mut out: Vec<PathBuf> = Vec::new();
+    for raw in tokens {
+        if let Some(p) = normalise_dropped_token(&raw) {
+            if p.is_absolute() && p.exists() {
+                out.push(p);
+            }
+        }
+    }
+    out
+}
+
+/// Strip surrounding quotes, decode `file://` URLs (with %xx escapes), and
+/// unescape `\<space>` style backslash escapes that some shells / drag
+/// sources produce. Anything that isn't a plausible filesystem path
+/// returns None and is dropped by the caller.
+fn normalise_dropped_token(raw: &str) -> Option<PathBuf> {
+    let mut s = raw.trim().to_string();
+    if (s.starts_with('"') && s.ends_with('"') && s.len() >= 2)
+        || (s.starts_with('\'') && s.ends_with('\'') && s.len() >= 2)
+    {
+        s = s[1..s.len() - 1].to_string();
+    }
+    if let Some(rest) = s.strip_prefix("file://") {
+        let mut path = String::with_capacity(rest.len());
+        let bytes = rest.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'%' && i + 2 < bytes.len() {
+                if let (Some(h), Some(l)) =
+                    (hex_digit(bytes[i + 1]), hex_digit(bytes[i + 2]))
+                {
+                    path.push((h * 16 + l) as char);
+                    i += 3;
+                    continue;
+                }
+            }
+            path.push(bytes[i] as char);
+            i += 1;
+        }
+        s = path;
+    }
+    let mut unescaped = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            if let Some(next) = chars.next() {
+                unescaped.push(next);
+                continue;
+            }
+        }
+        unescaped.push(c);
+    }
+    if unescaped.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(unescaped))
+}
+
+fn hex_digit(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Move a single local path to a remote SSH target's home directory by
+/// running `scp -r <local> <alias>:` and then removing the local source on
+/// success. Falls back to the user's `~/.ssh/config` for the host details
+/// (port, identity file, jump host, etc.) since `<alias>` is the same
+/// alias the user already configured.
+fn scp_upload_then_remove(alias: &str, src: &Path) -> std::io::Result<()> {
+    if !src.exists() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("{} does not exist", src.display()),
+        ));
+    }
+    let dest = format!("{alias}:");
+    let status = std::process::Command::new("scp")
+        .arg("-r")
+        .arg("-q")
+        .arg(src)
+        .arg(&dest)
+        .status()?;
+    if !status.success() {
+        return Err(std::io::Error::other(format!(
+            "scp exited with {status}"
+        )));
+    }
+    let meta = std::fs::symlink_metadata(src)?;
+    if meta.is_dir() {
+        std::fs::remove_dir_all(src)?;
+    } else {
+        std::fs::remove_file(src)?;
+    }
+    Ok(())
 }
 
 fn sheet_visible_rows(inner: Rect) -> usize {
@@ -5658,6 +5882,84 @@ mod tests {
             modifiers: KeyModifiers::ALT,
         });
         assert!(app.editor.is_blank_initial(), "alt-click must not open the file");
+    }
+
+    #[test]
+    fn parse_dropped_paths_accepts_a_single_existing_absolute_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("dropped.txt");
+        std::fs::write(&f, "hi").unwrap();
+        let parsed = parse_dropped_paths(&format!("{}\n", f.display()));
+        assert_eq!(parsed, vec![f]);
+    }
+
+    #[test]
+    fn parse_dropped_paths_strips_file_url_prefix_and_decodes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("with space.txt");
+        std::fs::write(&f, "hi").unwrap();
+        let url = format!(
+            "file://{}/with%20space.txt",
+            tmp.path().to_string_lossy()
+        );
+        let parsed = parse_dropped_paths(&url);
+        assert_eq!(parsed, vec![f]);
+    }
+
+    #[test]
+    fn parse_dropped_paths_handles_backslash_escaped_spaces() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("with space.txt");
+        std::fs::write(&f, "hi").unwrap();
+        let escaped = format!(
+            "{}/with\\ space.txt",
+            tmp.path().to_string_lossy()
+        );
+        let parsed = parse_dropped_paths(&escaped);
+        assert_eq!(parsed, vec![f]);
+    }
+
+    #[test]
+    fn parse_dropped_paths_supports_multi_file_drop_via_newlines() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a.txt");
+        let b = tmp.path().join("b.txt");
+        std::fs::write(&a, "1").unwrap();
+        std::fs::write(&b, "2").unwrap();
+        let payload = format!("{}\n{}\n", a.display(), b.display());
+        let parsed = parse_dropped_paths(&payload);
+        assert_eq!(parsed.len(), 2);
+        assert!(parsed.contains(&a));
+        assert!(parsed.contains(&b));
+    }
+
+    #[test]
+    fn parse_dropped_paths_returns_empty_for_plain_text() {
+        // Plain typed text must not be hijacked as a drop import.
+        let parsed = parse_dropped_paths("hello world this is some text");
+        assert!(parsed.is_empty());
+    }
+
+    #[test]
+    fn parse_dropped_paths_skips_nonexistent_paths() {
+        let parsed = parse_dropped_paths("/this/path/definitely/does/not/exist");
+        assert!(parsed.is_empty());
+    }
+
+    #[test]
+    fn finder_drop_into_explorer_moves_file_into_workspace() {
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let src = outside.path().join("dragged.txt");
+        std::fs::write(&src, "hello").unwrap();
+        let mut app = App::new(workspace.path().to_path_buf()).unwrap();
+        app.focus_pane(Pane::Tree);
+        app.set_sidebar_view(SidebarView::Explorer);
+        app.handle_paste(&format!("{}\n", src.display()));
+        let dest = workspace.path().join("dragged.txt");
+        assert!(dest.exists(), "file should land in the workspace");
+        assert!(!src.exists(), "Finder drop must move, not copy");
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "hello");
     }
 
     #[test]
