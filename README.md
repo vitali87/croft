@@ -6,11 +6,12 @@
 
 A VS Code style three pane workspace that runs entirely inside your terminal. Written in Rust for performance and ships as a single static binary.
 
-* **Left pane:** file explorer with VS Code style file type icons (Codicons / Devicons / Seti), showing actual files on disk including gitignored files
-* **Top right pane:** code editor with `tree-sitter` syntax highlighting and edit / save
-* **Bottom right pane:** a real interactive shell, your `$SHELL` running on a real PTY
+* **Left pane (sidebar):** Explorer with multi-select, cut / copy / paste, drag and drop file moves, and VS Code style icons (Codicons / Devicons / Seti). Two more sidebar views switch in via the activity bar: full-text Search and a Remote (SSH) explorer.
+* **Top right pane (editor):** code editor with `tree-sitter` syntax highlighting plus inline preview tabs for PNG / JPEG / GIF / BMP / WebP, PDFs (with page navigation), and CSV / TSV / XLSX / XLS / ODS spreadsheets.
+* **Bottom right pane (terminal):** a real interactive shell, your `$SHELL` running on a real PTY.
+* All three panes resize by dragging the seams between them.
 
-Built on [ratatui](https://ratatui.rs/) + [crossterm](https://github.com/crossterm-rs/crossterm), with [portable-pty](https://docs.rs/portable-pty/) for the embedded shell, [vt100](https://docs.rs/vt100/) for terminal-state parsing, and [tree-sitter](https://tree-sitter.github.io/tree-sitter/) for incremental, AST-based syntax highlighting.
+Built on [ratatui](https://ratatui.rs/) + [crossterm](https://github.com/crossterm-rs/crossterm), with [portable-pty](https://docs.rs/portable-pty/) for the embedded shell, [vt100](https://docs.rs/vt100/) for terminal-state parsing, [tree-sitter](https://tree-sitter.github.io/tree-sitter/) for incremental, AST-based syntax highlighting, [calamine](https://docs.rs/calamine/) for spreadsheet parsing, and the iTerm2 OSC 1337 inline-image protocol for image / PDF previews.
 
 > A previous Python prototype (Textual + pyte) lives on the `python-archive` branch. The Rust rewrite is the canonical implementation.
 
@@ -22,6 +23,8 @@ Built on [ratatui](https://ratatui.rs/) + [crossterm](https://github.com/crosste
 | Rust 1.78+ stable | To compile the binary. |
 | A Nerd Font as your terminal font | The file explorer icons are Private Use Area glyphs (Codicons, Devicons, Seti). Without a Nerd Font, icons render as `[?]` boxes. |
 | A 256 color or truecolor terminal | macOS Terminal.app, iTerm2, Alacritty, kitty, WezTerm, Ghostty all qualify. |
+| iTerm2, WezTerm, Ghostty, or kitty (optional) | Required for inline image / PDF / sheet preview rendering via OSC 1337. Other terminals fall back to a metadata header line so the feature is still informative. |
+| `pdftoppm` from poppler-utils (optional) | Multi-page PDF preview. Install with `brew install poppler` (macOS) or `apt install poppler-utils` (Linux). Without it, croft falls back to macOS `sips` for page 1 only. |
 
 ### Install Rust
 
@@ -70,42 +73,96 @@ croft setup-terminal --help
 
 ## Keybindings
 
+### Global
+
 | Keys | Action |
 |------|--------|
-| `↑`/`↓` in tree | Move selection |
-| `Enter` or `→` on a file | Open in editor; on a folder: expand or collapse |
-| `←` on a folder | Collapse |
 | `Ctrl+s` | Save the open file |
 | `Ctrl+q` | Quit |
 | `F6` | Cycle focus across panes (tree → editor → terminal → tree) |
 | `Ctrl+b` | Toggle the file tree / side panel |
 | `Ctrl+j` | Toggle the terminal pane |
 | `Ctrl+Shift+f` (or `Cmd+Shift+f` with the iTerm2 setup below) | Jump to the Search sidebar view |
-| Click activity-bar icons (left edge) | Switch between Explorer (file icon) and Search (magnifying glass) views |
-| In Search view: type | Live `.gitignore`-aware search across the workspace; results refresh per keystroke (~120 ms debounce, runs off the UI thread). Capped at 200 hits. |
-| In Search view: click `Aa`, `ab`, `.*` toggles | Flip case-sensitive / whole-word / regex modes; the search re-runs immediately. Active toggles render with a yellow background. |
-| In Search view: ↑/↓ + Enter, or click a result | Open the file at the matched line |
-| Mouse drag in terminal pane | Select text; selection stays highlighted until you copy or click elsewhere — no auto-copy |
-| Mouse wheel in terminal pane | Scroll through 5000 rows of scrollback. While vim / less / htop is in alternate-screen mode, wheel forwards arrow keys instead so the running app handles it. Any keystroke snaps back to the live bottom. |
-| `Ctrl+Shift+c` (or `Cmd+c` with kitty-protocol terminals) | Explicit copy of the terminal's current selection |
-| Editor: arrows, Home, End | Navigate (clears any active selection) |
-| Editor: `Shift`+arrows / `Shift`+Home / End / PageUp / PageDown | Extend the selection by the same motion |
-| Editor: PageUp / PageDown (`fn+↑` / `fn+↓` on Mac) | Scroll exactly one viewport; the line just past the previous bottom becomes the new top |
-| Editor: any printable char, Enter, Backspace, Delete, Tab | Edit (typing or deleting with an active selection replaces it) |
-| Editor: mouse drag | Select text; selection stays highlighted until you copy or click elsewhere — no auto-copy |
-| Editor: `Ctrl+C` / `Cmd+C` | Copy the current selection to the system clipboard via OSC 52 |
-| Editor: `Ctrl+X` / `Cmd+X` | Cut the current selection |
-| Editor: `Ctrl+V` / `Cmd+V` | Paste system-clipboard contents at the cursor; replaces selection if any |
-| Editor: `Ctrl+Z` / `Cmd+Z` | Undo the last edit (typing bursts coalesce into one step; backspace, paste, cut, replace are each their own step) |
-| Editor: `Ctrl+A` / `Cmd+A` | Select the entire buffer |
-| Editor: `Esc` | Clear the current selection |
-| Mouse click in any pane | Focus and (in tree) select / open, (in editor) move cursor |
-| Mouse right-click in tree | Open context menu (New File…, New Folder…, Delete) |
-| `Delete` / `Backspace` (or `Cmd+Backspace`) in tree | Move the selected file or folder to the OS Trash, no confirmation. Mac keyboards label the Backspace key as "delete," so the obvious key works regardless of layout. |
+| Click activity-bar icons (left edge) | Switch between Explorer, Search, and Remote (SSH) sidebar views |
+| Drag the vertical seam between sidebar and editor | Resize the sidebar |
+| Drag the horizontal seam between editor and terminal | Resize the terminal pane |
 | Mouse wheel | Scroll the pane under the pointer |
-| Up/Down/Enter in context menu | Navigate / pick item; Esc dismisses |
-| Type + Enter in create prompt | Create the file or folder; Esc cancels |
-| Terminal pane: any key | Forwarded to the shell PTY (arrows, Ctrl+letter, Alt+x, function keys all translated to the proper VT escape sequences) |
+
+### Explorer (file tree)
+
+| Keys | Action |
+|------|--------|
+| `↑` / `↓` | Move selection |
+| `Enter` or `→` on a file | Open in editor; on a folder: expand or collapse |
+| `←` on a folder | Collapse |
+| `Shift`+`↑` / `↓` / `PageUp` / `PageDown` / `Home` / `End` | Extend multi-selection from the anchor row |
+| `Shift`+click another row | Extend multi-selection across the range |
+| `Alt`+click (Option+click on macOS) or `Ctrl`+click | Toggle a row in or out of the multi-selection |
+| `Ctrl`+`A` / `Cmd`+`A` | Select every visible row |
+| `Esc` | Clear the multi-selection |
+| `Ctrl`+`C` / `Cmd`+`C` | Copy selected paths to the explorer clipboard |
+| `Ctrl`+`X` / `Cmd`+`X` | Cut selected paths to the explorer clipboard |
+| `Ctrl`+`V` / `Cmd`+`V` | Paste clipboard paths into the focused folder (move on Cut, copy on Copy) |
+| Drag a row onto a folder | Move the selection into that folder |
+| `Alt`-drag a row onto a folder | Copy the selection into that folder instead of moving |
+| `Delete` / `Backspace` (or `Cmd`+`Backspace`) | Move every selected path to the OS Trash. On macOS the trash sound plays once for the whole batch. |
+| Right-click | Context menu: Cut, Copy, Paste, Rename, Delete (with item count when multi-selected), and on empty space New File / New Folder |
+
+### Search sidebar
+
+| Keys | Action |
+|------|--------|
+| Type | Live `.gitignore`-aware search across the workspace; refreshes per keystroke (~120 ms debounce, off the UI thread). Capped at 200 hits. |
+| Click `Aa`, `ab`, `.*` toggles | Flip case-sensitive / whole-word / regex; re-runs immediately. Active toggles render with a yellow background. |
+| `↑` / `↓` + `Enter`, or click a result | Open the file at the matched line |
+
+### Editor: text
+
+| Keys | Action |
+|------|--------|
+| Arrows, Home, End | Navigate (clears any active selection) |
+| `Shift`+arrows / `Shift`+`Home` / `End` / `PageUp` / `PageDown` | Extend the selection by the same motion |
+| `PageUp` / `PageDown` (`fn`+`↑` / `fn`+`↓` on Mac) | Scroll exactly one viewport |
+| Any printable char, Enter, Backspace, Delete, Tab | Edit (typing or deleting with an active selection replaces it) |
+| Mouse drag | Select text; selection stays highlighted until you copy or click elsewhere |
+| `Ctrl`+`C` / `Cmd`+`C` | Copy the selection to the system clipboard via OSC 52 |
+| `Ctrl`+`X` / `Cmd`+`X` | Cut the selection |
+| `Ctrl`+`V` / `Cmd`+`V` | Paste at the cursor; replaces selection if any |
+| `Ctrl`+`Z` / `Cmd`+`Z` | Undo (typing bursts coalesce into one step; backspace, paste, cut, replace are each their own step) |
+| `Ctrl`+`A` / `Cmd`+`A` | Select the entire buffer |
+| `Esc` | Clear the current selection |
+
+### Editor: image preview (`.png`, `.jpg`, `.jpeg`, `.gif`, `.bmp`, `.webp`)
+
+Tabs are read-only. Every keystroke is swallowed so a stray key cannot corrupt a buffer the user cannot see.
+
+### Editor: PDF preview (`.pdf`)
+
+| Keys | Action |
+|------|--------|
+| `→` / `Page Down` / `Space` | Next page |
+| `←` / `Page Up` | Previous page |
+| `Home` | First page |
+| `End` | Last page (when page count is known) |
+
+### Editor: spreadsheet preview (`.csv`, `.tsv`, `.xlsx`, `.xls`, `.xlsb`, `.ods`)
+
+| Keys | Action |
+|------|--------|
+| `↑` / `↓` / `←` / `→` | Pan one row / column |
+| `PageUp` / `PageDown` | Pan a full viewport vertically |
+| `Home` | Jump to row 1, column 1 |
+| `End` | Jump to the last visible page |
+| `Tab` / `Shift+Tab` | Switch worksheet (in multi-sheet workbooks) |
+
+### Terminal
+
+| Keys | Action |
+|------|--------|
+| Any key | Forwarded to the shell PTY (arrows, `Ctrl+letter`, `Alt+x`, function keys all translated to the proper VT escape sequences) |
+| Mouse drag | Select text; selection stays highlighted until you copy or click elsewhere |
+| Mouse wheel | Scroll through 5000 rows of scrollback. In alternate-screen mode (vim / less / htop) the wheel forwards arrow keys so the running app handles it. Any keystroke snaps back to the live bottom. |
+| `Ctrl+Shift+c` (or `Cmd+c` with kitty-protocol terminals) | Explicit copy of the terminal's current selection |
 
 ## iTerm2 setup for macOS users
 
@@ -184,24 +241,48 @@ Keystrokes from `crossterm`'s `Event::Key` are translated back to the byte seque
 src/
 ├── main.rs              entry point
 ├── cli.rs               clap CLI: open path, setup-terminal / setup-iterm2 / keys subcommands
-├── app.rs               event loop, three-pane layout + activity bar, key dispatch, status bar, mouse + clipboard
+├── app.rs               event loop, three-pane layout + activity bar, key dispatch, status bar, mouse, clipboard, splitters, preview overlays
 ├── clipboard.rs         native macOS clipboard read path with pbpaste fallback
-├── git.rs               branch / dirty / ahead-behind status by shelling out to git
+├── git.rs               branch / dirty / ahead-behind status, plus anonymous git-protocol fetch for the welcome screen recents
 ├── highlight.rs         tree-sitter highlight registry per language
 ├── icons.rs             Codicon / Devicon / Seti glyphs and per-language colors
 ├── iterm2.rs            iTerm2 plist mutation helpers for fonts and Croft key mappings
+├── iterm2_inline.rs     OSC 1337 inline-image baking pipeline (welcome wordmark, image / PDF preview)
+├── pdf.rs               PDF rasteriser: prefers pdftoppm (poppler), falls back to macOS sips
+├── remote.rs            remote (SSH) target metadata and launch dispatch
+├── sheet.rs             CSV / TSV / XLSX / XLS / XLSB / ODS parsing via the csv and calamine crates
 └── widgets/
     ├── mod.rs
-    ├── file_tree.rs     ignore::WalkBuilder backed tree, lazy children, fs-watcher refresh
-    ├── editor.rs        tree-sitter highlighted editor with full write path, mouse-drag selection, OSC 52 copy/cut
+    ├── file_tree.rs     ignore::WalkBuilder backed tree, lazy children, fs-watcher refresh, multi-select, drag-drop, bulk trash
+    ├── editor.rs        tree-sitter highlighted editor with full write path, mouse-drag selection, OSC 52 copy/cut, plus image / PDF / spreadsheet preview tabs
     ├── search.rs        sidebar search panel + .gitignore-aware substring walker
+    ├── remote.rs        Remote Explorer sidebar widget
+    ├── scrollbar.rs     shared vertical-scrollbar geometry
     └── terminal.rs      portable-pty + vt100 + ratatui integration with selection + scrollback
 tests/cli.rs             integration tests for the CLI surface
 ```
 
 ## Status
 
-What works: three-pane layout, file tree expansion / collapse, mouse and keyboard, right-click context menu (New File / New Folder / Delete-to-Trash) with Delete-key shortcut, live filesystem watcher with a 50ms polling fallback for missed startup / host events, file open with tree-sitter highlighting (Rust, Python, JS, TS, TSX, JSON, TOML, YAML, Markdown, Go, HTML, CSS, Bash), full editor write path (insert / delete / Enter / Tab / Backspace / save round-trip with `●` dirty marker, auto-reload on external write when buffer is clean), Search sidebar with clipboard paste, embedded shell with full ANSI color and key forwarding, git status pill in the bottom bar (branch, dirty bullet, ahead/behind), clickable welcome recents sourced from the built binary's repo remote reference, `setup-terminal` and `setup-iterm2` AppleScript / plist helpers. The repo ships 376 unit tests plus CLI integration tests; run with `cargo test`. What does not work yet: command palette, settings, LSP.
+What works:
+
+* Three-pane layout with draggable splitters between sidebar / editor / terminal.
+* File tree with expansion / collapse, multi-select (Shift+click range, Alt or Ctrl+click toggle), drag-and-drop file moves (Alt-drag for copy), explorer-scoped Cut / Copy / Paste, bulk delete to OS Trash with a single trash sound on macOS.
+* Right-click context menu with Cut, Copy, Paste, Rename, count-aware Delete, plus New File / New Folder on empty space.
+* Live filesystem watcher with a 50 ms polling fallback for missed startup or host events.
+* File open with tree-sitter highlighting (Rust, Python, JS, TS, TSX, JSON, TOML, YAML, Markdown, Go, HTML, CSS, Bash).
+* Full editor write path: insert / delete / Enter / Tab / Backspace / save round-trip with `●` dirty marker, auto-reload on external write when buffer is clean, OSC 52 copy / cut, undo with intelligent edit-step coalescing.
+* Inline preview tabs that render directly in the editor pane via OSC 1337: PNG / JPEG / GIF / BMP / WebP, PDFs (with page navigation, multi-page when poppler is installed), and CSV / TSV / XLSX / XLS / XLSB / ODS spreadsheets.
+* Search sidebar (live, `.gitignore`-aware, off the UI thread, regex / case / whole-word toggles).
+* Remote (SSH) sidebar that lists hosts from `~/.ssh/config` and launches a remote croft session.
+* Embedded shell with full ANSI color, key forwarding, mouse-drag text selection, and 5000-row scrollback.
+* Git status pill in the bottom bar (branch, dirty bullet, ahead / behind).
+* Welcome recents fetched live via the anonymous git protocol so the panel works behind shared egress IPs (Tailscale, corporate NAT) where the Bitbucket / GitHub REST APIs are rate-limited.
+* `setup-terminal` and `setup-iterm2` AppleScript / plist helpers.
+
+The repo ships 441 unit tests plus CLI integration tests; run with `cargo test`.
+
+What does not work yet: command palette, settings, LSP, debugger.
 
 ## Limitations
 
