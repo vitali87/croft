@@ -3011,18 +3011,29 @@ impl App {
 
     fn delete_paths(&mut self, paths: Vec<PathBuf>) {
         let total = paths.len();
+        if total == 0 {
+            return;
+        }
         let mut affected_dirs: BTreeSet<PathBuf> = BTreeSet::new();
-        let mut errors: Vec<String> = Vec::new();
-        let mut ok_count = 0usize;
         for path in &paths {
-            match crate::widgets::file_tree::move_to_trash(path) {
-                Ok(()) => {
-                    ok_count += 1;
-                    let parent = path
-                        .parent()
-                        .map(Path::to_path_buf)
-                        .unwrap_or_else(|| self.tree.root.clone());
-                    affected_dirs.insert(parent);
+            let parent = path
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| self.tree.root.clone());
+            affected_dirs.insert(parent);
+        }
+        // One trash call for the whole batch — on macOS this routes through
+        // Finder so the trash sound effect fires once for the operation
+        // instead of once per file. The single-path path keeps the cheaper
+        // NSFileManager backend.
+        let result = if total == 1 {
+            crate::widgets::file_tree::move_to_trash(&paths[0])
+        } else {
+            crate::widgets::file_tree::move_to_trash_bulk(&paths)
+        };
+        match result {
+            Ok(()) => {
+                for path in &paths {
                     if self.editor.matches_open_path(path) {
                         if !self.editor.close_active() {
                             *self.editor = Editor::new();
@@ -3030,24 +3041,30 @@ impl App {
                         self.sync_open_file_poll_mtime();
                     }
                 }
-                Err(e) => errors.push(format!("{}: {e}", path.display())),
+                for dir in &affected_dirs {
+                    if let Some(idx) = self.tree.index_of_dir(dir) {
+                        self.tree.refresh_children(idx);
+                    }
+                }
+                self.tree.clear_marks();
+                self.status = if total == 1 {
+                    format!("Moved {} to Trash", paths[0].display())
+                } else {
+                    format!("Moved {total} items to Trash")
+                };
             }
-        }
-        for dir in &affected_dirs {
-            if let Some(idx) = self.tree.index_of_dir(dir) {
-                self.tree.refresh_children(idx);
+            Err(e) => {
+                for dir in &affected_dirs {
+                    if let Some(idx) = self.tree.index_of_dir(dir) {
+                        self.tree.refresh_children(idx);
+                    }
+                }
+                self.status = if total == 1 {
+                    format!("Delete failed: {e}")
+                } else {
+                    format!("Bulk delete failed: {e}")
+                };
             }
-        }
-        self.tree.clear_marks();
-        if !errors.is_empty() {
-            self.status = format!(
-                "Deleted {ok_count}/{total}; failed: {}",
-                errors.join("; ")
-            );
-        } else if total == 1 {
-            self.status = format!("Moved {} to Trash", paths[0].display());
-        } else {
-            self.status = format!("Moved {ok_count} items to Trash");
         }
     }
 

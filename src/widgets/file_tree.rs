@@ -564,6 +564,28 @@ pub fn move_to_trash(path: &Path) -> std::io::Result<()> {
     trash::delete(path).map_err(|e| std::io::Error::other(format!("{e}")))
 }
 
+/// Bulk-trash a batch of paths in a single OS call. On macOS this routes
+/// through Finder via one AppleScript so the system trash sound plays once
+/// for the whole batch instead of once per file. On Linux/Windows the
+/// underlying `trash::delete_all` already groups the request.
+pub fn move_to_trash_bulk(paths: &[PathBuf]) -> std::io::Result<()> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use trash::macos::{DeleteMethod, TrashContextExtMacos};
+        let mut ctx = trash::TrashContext::default();
+        ctx.set_delete_method(DeleteMethod::Finder);
+        ctx.delete_all(paths)
+            .map_err(|e| std::io::Error::other(format!("{e}")))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        trash::delete_all(paths).map_err(|e| std::io::Error::other(format!("{e}")))
+    }
+}
+
 /// Rename the entry at `old_path` to `new_name` within `parent`. Validates
 /// `new_name` via `validate_new_name`, refuses to overwrite an existing
 /// entry, and returns the new absolute path on success. A no-op rename
