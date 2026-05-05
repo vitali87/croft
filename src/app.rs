@@ -4227,10 +4227,16 @@ fn hex_digit(b: u8) -> Option<u8> {
 }
 
 /// Move a single local path to a remote SSH target's home directory by
-/// running `scp -r <local> <alias>:` and then removing the local source on
-/// success. Falls back to the user's `~/.ssh/config` for the host details
-/// (port, identity file, jump host, etc.) since `<alias>` is the same
-/// alias the user already configured.
+/// running `scp -r -B -o BatchMode=yes <local> <alias>:` and then removing
+/// the local source on success. Resolves the host via the user's
+/// `~/.ssh/config` (port, identity file, jump host, agent forwarding all
+/// flow through the alias).
+///
+/// The `-B` / `BatchMode=yes` pair is critical: croft is in alt-screen
+/// mode while this runs, so any interactive prompt (password,
+/// host-authenticity confirmation, FIDO touch) would silently hang the
+/// process. Batch mode forces those failures to surface as a non-zero
+/// exit + stderr line that we then bubble into the status bar.
 fn scp_upload_then_remove(alias: &str, src: &Path) -> std::io::Result<()> {
     if !src.exists() {
         return Err(std::io::Error::new(
@@ -4239,15 +4245,22 @@ fn scp_upload_then_remove(alias: &str, src: &Path) -> std::io::Result<()> {
         ));
     }
     let dest = format!("{alias}:");
-    let status = std::process::Command::new("scp")
+    let out = std::process::Command::new("scp")
         .arg("-r")
-        .arg("-q")
+        .arg("-B")
+        .args(["-o", "BatchMode=yes"])
         .arg(src)
         .arg(&dest)
-        .status()?;
-    if !status.success() {
+        .stdin(std::process::Stdio::null())
+        .output()?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let summary = stderr
+            .lines()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or("scp returned a non-zero exit");
         return Err(std::io::Error::other(format!(
-            "scp exited with {status}"
+            "scp -> {alias}: {summary}"
         )));
     }
     let meta = std::fs::symlink_metadata(src)?;
