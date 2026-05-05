@@ -281,13 +281,21 @@ fn remote_install_needed(ssh: &SshControl, local_stamp: &str) -> Result<bool> {
     let output = ssh
         .command()
         .arg(&ssh.host)
-        .arg("command -v croft >/dev/null 2>&1 && cat \"$HOME/.cache/croft/install-stamp\" 2>/dev/null")
+        .arg(remote_install_check_command())
         .output()
         .context("checking remote croft install")?;
     if !output.status.success() {
         return Ok(true);
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim() != local_stamp)
+}
+
+fn remote_install_check_command() -> &'static str {
+    r#"if [ -f "$HOME/.cargo/env" ]; then
+  . "$HOME/.cargo/env"
+fi
+export PATH="$HOME/.cargo/bin:$PATH"
+command -v croft >/dev/null 2>&1 && cat "$HOME/.cache/croft/install-stamp" 2>/dev/null"#
 }
 
 fn sync_local_source_to_remote(ssh: &SshControl) -> Result<()> {
@@ -464,6 +472,16 @@ Host !blocked *.internal
         assert!(command.contains("cargo install --path \"$HOME/.cache/croft/source\""));
         assert!(command.contains("rustup.rs"));
         assert!(command.contains("printf %s 'abc123' > \"$HOME/.cache/croft/install-stamp\""));
+    }
+
+    #[test]
+    fn remote_install_check_uses_cargo_path_before_probe() {
+        let command = remote_install_check_command();
+        let path_pos = command.find("export PATH=\"$HOME/.cargo/bin:$PATH\"").unwrap();
+        let probe_pos = command.find("command -v croft").unwrap();
+        assert!(command.contains(". \"$HOME/.cargo/env\""));
+        assert!(path_pos < probe_pos);
+        assert!(command.contains("cat \"$HOME/.cache/croft/install-stamp\""));
     }
 
     #[test]
