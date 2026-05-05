@@ -299,6 +299,70 @@ command -v croft >/dev/null 2>&1 && cat "$HOME/.cache/croft/install-stamp" 2>/de
 }
 
 fn sync_local_source_to_remote(ssh: &SshControl) -> Result<()> {
+    match sync_via_rsync(ssh) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            // Fallback path so first-time installs on minimal remotes
+            // (alpine images, locked-down VMs) that ship without rsync
+            // still succeed. The trade-off is a from-scratch dependency
+            // rebuild on those hosts, same as the legacy behaviour.
+            eprintln!("rsync sync failed ({e}); falling back to tar pipe");
+            sync_via_tar(ssh)
+        }
+    }
+}
+
+/// Mirror the local source tree onto the remote with rsync, preserving
+/// mtimes and skipping unchanged files. Critically, this does NOT delete
+/// `target/` on the remote, so `cargo install` does an incremental rebuild
+/// (typically rebuilding only the 1-3 crates that actually changed)
+/// instead of starting from scratch every time.
+fn sync_via_rsync(ssh: &SshControl) -> Result<()> {
+    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let mkdir_status = ssh
+        .command()
+        .arg(&ssh.host)
+        .arg("mkdir -p \"$HOME/.cache/croft/source\"")
+        .status()
+        .context("creating remote source dir")?;
+    if !mkdir_status.success() {
+        anyhow::bail!("remote mkdir exited with {mkdir_status}");
+    }
+    let ssh_e = format!(
+        "ssh -S {} -o ControlMaster=no",
+        shell_quote_for_e_arg(&ssh.socket_path),
+    );
+    let mut source_arg: std::ffi::OsString = source.clone().into_os_string();
+    source_arg.push("/");
+    let dest = format!("{}:.cache/croft/source/", ssh.host);
+    let status = Command::new("rsync")
+        .args([
+            "-a",
+            "-z",
+            "--delete",
+            "--exclude=target",
+            "--exclude=.git",
+            "--exclude=.DS_Store",
+            "--exclude=assets/.DS_Store",
+            "-e",
+        ])
+        .arg(&ssh_e)
+        .arg(&source_arg)
+        .arg(&dest)
+        .status()
+        .context("running rsync to remote")?;
+    if !status.success() {
+        anyhow::bail!("rsync exited with {status}");
+    }
+    Ok(())
+}
+
+/// Last-resort tar pipe sync used when rsync isn't available on either
+/// side. This path also keeps the remote source dir in place rather than
+/// blowing it away — extracting over an existing tree overwrites changed
+/// files, so `target/` still survives between installs even when the user
+/// is forced down this branch.
+fn sync_via_tar(ssh: &SshControl) -> Result<()> {
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let mut tar = Command::new("tar")
         .env("COPYFILE_DISABLE", "1")
@@ -321,7 +385,10 @@ fn sync_local_source_to_remote(ssh: &SshControl) -> Result<()> {
     let mut remote = ssh
         .command()
         .arg(&ssh.host)
-        .arg("rm -rf \"$HOME/.cache/croft/source\" && mkdir -p \"$HOME/.cache/croft/source\" && tar -xzf - -C \"$HOME/.cache/croft/source\"")
+        .arg(
+            "mkdir -p \"$HOME/.cache/croft/source\" && \
+             tar -xzf - -C \"$HOME/.cache/croft/source\"",
+        )
         .stdin(Stdio::from(tar_stdout))
         .spawn()
         .context("copying croft source to remote")?;
@@ -335,6 +402,22 @@ fn sync_local_source_to_remote(ssh: &SshControl) -> Result<()> {
         anyhow::bail!("remote source copy failed with {ssh_status}");
     }
     Ok(())
+}
+
+/// Quote a path for embedding inside rsync's `-e "ssh -S <path> ..."`
+/// argument. rsync executes the remote-shell string through `/bin/sh -c`,
+/// so any spaces or shell metacharacters in the control-socket path would
+/// break the invocation. The control socket lives under
+/// `std::env::temp_dir()` which is normally space-free, but the socket
+/// path is process-id + millisecond-stamped so quote defensively rather
+/// than trust the format.
+fn shell_quote_for_e_arg(p: &std::path::Path) -> String {
+    let s = p.to_string_lossy();
+    if s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-')) {
+        s.into_owned()
+    } else {
+        format!("'{}'", s.replace('\'', r"'\''"))
+    }
 }
 
 fn remote_install_command(source_stamp: &str) -> String {
@@ -482,6 +565,28 @@ Host !blocked *.internal
         assert!(command.contains(". \"$HOME/.cargo/env\""));
         assert!(path_pos < probe_pos);
         assert!(command.contains("cat \"$HOME/.cache/croft/install-stamp\""));
+    }
+
+    #[test]
+    fn shell_quote_for_e_arg_passes_alnum_paths_through() {
+        assert_eq!(
+            shell_quote_for_e_arg(Path::new("/tmp/croft-ssh-1234/ctl")),
+            "/tmp/croft-ssh-1234/ctl",
+        );
+    }
+
+    #[test]
+    fn shell_quote_for_e_arg_quotes_paths_with_spaces() {
+        let q = shell_quote_for_e_arg(Path::new("/Users/v a/croft/ctl"));
+        assert_eq!(q, "'/Users/v a/croft/ctl'");
+    }
+
+    #[test]
+    fn shell_quote_for_e_arg_escapes_single_quotes_inside_path() {
+        let q = shell_quote_for_e_arg(Path::new("/tmp/it's/ctl"));
+        // /tmp/it's → /tmp/it'\''s after the standard sh single-quote
+        // escaping trick (close, escaped quote, reopen).
+        assert_eq!(q, "'/tmp/it'\\''s/ctl'");
     }
 
     #[test]
