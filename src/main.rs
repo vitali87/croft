@@ -8,6 +8,7 @@ mod iterm2;
 mod iterm2_inline;
 mod pdf;
 mod remote;
+mod sheet;
 mod widgets;
 
 use anyhow::Result;

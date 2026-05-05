@@ -2267,6 +2267,10 @@ impl App {
     }
 
     fn handle_editor_key(&mut self, key: KeyEvent) {
+        if self.editor.sheet.is_some() {
+            self.handle_sheet_key(key);
+            return;
+        }
         // Image preview tabs are read-only. PDF tabs allow page navigation
         // via Left/Right + PageUp/PageDown; everything else is swallowed.
         if self.editor.image.is_some() {
@@ -3291,6 +3295,68 @@ impl App {
         self.editor_image_displayed = true;
     }
 
+    /// Keyboard navigation for spreadsheet preview tabs. All gestures are
+    /// scroll-only: arrows pan one row/column, PageUp/PageDown jump by a
+    /// full viewport, Home/End jump to the first/last row, Tab/Shift+Tab
+    /// switch worksheets. Anything else is swallowed so a stray keystroke
+    /// can't insert characters into a buffer the user can't see.
+    fn handle_sheet_key(&mut self, key: KeyEvent) {
+        let visible = sheet_visible_rows(self.editor.last_inner);
+        let Some(sheet) = self.editor.sheet.as_mut() else {
+            return;
+        };
+        let total_sheets = sheet.sheets.len();
+        let current = sheet.current_sheet;
+        let data = match sheet.sheets.get_mut(current) {
+            Some(d) => d,
+            None => return,
+        };
+        let row_count = data.rows.len();
+        let col_count = data.col_widths.len();
+        match key.code {
+            KeyCode::Down => {
+                if data.scroll_row + 1 < row_count {
+                    data.scroll_row += 1;
+                }
+            }
+            KeyCode::Up => {
+                data.scroll_row = data.scroll_row.saturating_sub(1);
+            }
+            KeyCode::Right => {
+                if data.scroll_col + 1 < col_count {
+                    data.scroll_col += 1;
+                }
+            }
+            KeyCode::Left => {
+                data.scroll_col = data.scroll_col.saturating_sub(1);
+            }
+            KeyCode::PageDown => {
+                data.scroll_row = (data.scroll_row + visible).min(row_count.saturating_sub(1));
+            }
+            KeyCode::PageUp => {
+                data.scroll_row = data.scroll_row.saturating_sub(visible);
+            }
+            KeyCode::Home => {
+                data.scroll_row = 0;
+                data.scroll_col = 0;
+            }
+            KeyCode::End => {
+                data.scroll_row = row_count.saturating_sub(visible.max(1));
+            }
+            KeyCode::Tab => {
+                if total_sheets > 1 {
+                    sheet.current_sheet = (current + 1) % total_sheets;
+                }
+            }
+            KeyCode::BackTab => {
+                if total_sheets > 1 {
+                    sheet.current_sheet = (current + total_sheets - 1) % total_sheets;
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Resize the sidebar / terminal pane while a splitter drag is in
     /// progress. The pointer's screen coordinate maps directly to the new
     /// edge: dragging horizontally sets the sidebar width to (column −
@@ -3967,6 +4033,12 @@ fn drop_target_dir(
         .get(target_idx)
         .map(|n| n.path.clone())
         .unwrap_or_else(|| tree.root.clone())
+}
+
+fn sheet_visible_rows(inner: Rect) -> usize {
+    // Renderer reserves 1 row for the header line, 1 row for the column
+    // labels, and 1 row for the bottom status. Anything left is data.
+    inner.height.saturating_sub(3) as usize
 }
 
 fn rect_contains(r: Rect, x: u16, y: u16) -> bool {

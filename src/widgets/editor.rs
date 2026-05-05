@@ -99,6 +99,185 @@ fn render_image_placeholder(
     );
 }
 
+fn render_sheet(
+    view: &crate::sheet::SheetView,
+    path: Option<&Path>,
+    inner: Rect,
+    buf: &mut Buffer,
+) {
+    // Bg fill so the spreadsheet sits on a clean canvas regardless of
+    // what the previous tab left behind.
+    let bg_style = Style::default().bg(Color::Rgb(0x1e, 0x22, 0x2e));
+    for y in inner.y..inner.y + inner.height {
+        for x in inner.x..inner.x + inner.width {
+            buf[(x, y)].set_style(bg_style);
+            buf[(x, y)].set_symbol(" ");
+        }
+    }
+    if inner.height < 3 || inner.width < 8 {
+        return;
+    }
+    let name = path
+        .and_then(|p| p.file_name())
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| String::from("(unnamed sheet)"));
+    let sheet = match view.sheets.get(view.current_sheet) {
+        Some(s) => s,
+        None => return,
+    };
+    let row_count = sheet.row_count();
+    let col_count = sheet.col_count();
+    let header = format!(
+        " {} · {} · sheet {}/{} ({}) · {} rows × {} cols ",
+        name,
+        view.kind.label(),
+        view.current_sheet + 1,
+        view.sheets.len(),
+        sheet.name,
+        row_count,
+        col_count,
+    );
+    buf.set_string(
+        inner.x,
+        inner.y,
+        &header,
+        Style::default()
+            .fg(Color::White)
+            .bg(Color::Rgb(0x09, 0x4d, 0x77))
+            .add_modifier(Modifier::BOLD),
+    );
+
+    let grid_top = inner.y + 1;
+    let grid_height = inner.height.saturating_sub(2); // header + status row
+    let grid_w = inner.width;
+    if grid_height < 2 || col_count == 0 {
+        return;
+    }
+
+    // Reserve a row-number gutter so the user can see the absolute row
+    // index even after horizontal scrolling.
+    let gutter_w = (row_count.max(1).to_string().len() as u16 + 2).max(4);
+    if grid_w <= gutter_w + 2 {
+        return;
+    }
+    let body_x = inner.x + gutter_w;
+    let body_w = grid_w - gutter_w;
+
+    let header_y = grid_top;
+    let data_top = grid_top + 1;
+    let data_rows = grid_height.saturating_sub(1) as usize;
+
+    // Header row backdrop.
+    let head_style = Style::default()
+        .fg(Color::White)
+        .bg(Color::Rgb(0x07, 0x33, 0x55))
+        .add_modifier(Modifier::BOLD);
+    for x in inner.x..inner.x + inner.width {
+        buf[(x, header_y)].set_style(head_style);
+        buf[(x, header_y)].set_symbol(" ");
+    }
+
+    // Lay out visible columns from `scroll_col` rightwards until we run
+    // out of horizontal space.
+    let mut visible: Vec<(usize, u16)> = Vec::new(); // (col_idx, x_offset)
+    let mut x_off = 0u16;
+    for (c, w) in sheet
+        .col_widths
+        .iter()
+        .enumerate()
+        .skip(sheet.scroll_col)
+    {
+        if x_off + w + 1 > body_w {
+            break;
+        }
+        visible.push((c, x_off));
+        x_off += w + 1; // +1 for inter-column gap
+    }
+
+    // Header text.
+    for (c, x_off) in &visible {
+        let label = sheet
+            .headers
+            .get(*c)
+            .map(|s| s.as_str())
+            .unwrap_or("");
+        let cell_x = body_x + *x_off;
+        let w = sheet.col_widths[*c];
+        write_cell(buf, cell_x, header_y, w, label, head_style);
+    }
+
+    // Data rows.
+    let row_end = (sheet.scroll_row + data_rows).min(row_count);
+    let row_style = Style::default()
+        .fg(Color::White)
+        .bg(Color::Rgb(0x1e, 0x22, 0x2e));
+    let alt_row_style = Style::default()
+        .fg(Color::White)
+        .bg(Color::Rgb(0x24, 0x29, 0x37));
+    let gutter_style = Style::default().fg(Color::DarkGray);
+    for (display_row, row_idx) in (sheet.scroll_row..row_end).enumerate() {
+        let y = data_top + display_row as u16;
+        let style = if display_row % 2 == 0 { row_style } else { alt_row_style };
+        for x in inner.x..inner.x + inner.width {
+            buf[(x, y)].set_style(style);
+            buf[(x, y)].set_symbol(" ");
+        }
+        let row_label = format!(" {:>width$} ", row_idx + 1, width = (gutter_w - 2) as usize);
+        buf.set_string(inner.x, y, &row_label, gutter_style.bg(style.bg.unwrap_or(Color::Reset)));
+        let row = &sheet.rows[row_idx];
+        for (c, x_off) in &visible {
+            let cell_text = row.get(*c).map(|s| s.as_str()).unwrap_or("");
+            let w = sheet.col_widths[*c];
+            write_cell(buf, body_x + *x_off, y, w, cell_text, style);
+        }
+    }
+
+    // Status row at the bottom showing scroll position + nav hint.
+    let status_y = inner.y + inner.height - 1;
+    let visible_first = sheet.scroll_row + 1;
+    let visible_last = (sheet.scroll_row + data_rows).min(row_count);
+    let visible_col_first = sheet.scroll_col + 1;
+    let visible_col_last = visible
+        .last()
+        .map(|(c, _)| *c + 1)
+        .unwrap_or(visible_col_first);
+    let status = format!(
+        " rows {visible_first}–{visible_last} of {row_count} · cols {visible_col_first}–{visible_col_last} of {col_count} · ←/→ ↑/↓ PgUp/PgDn Tab=next sheet "
+    );
+    buf.set_string(
+        inner.x,
+        status_y,
+        &status,
+        Style::default()
+            .fg(Color::Gray)
+            .bg(Color::Rgb(0x14, 0x18, 0x22)),
+    );
+}
+
+fn write_cell(
+    buf: &mut Buffer,
+    x: u16,
+    y: u16,
+    w: u16,
+    text: &str,
+    style: Style,
+) {
+    let max_chars = w as usize;
+    let mut content: String = text.chars().take(max_chars).collect();
+    if text.chars().count() > max_chars && max_chars >= 1 {
+        // Replace the last visible char with an ellipsis to make
+        // truncation visually obvious.
+        content.pop();
+        content.push('…');
+    }
+    let mut padded = content;
+    let pad_count = max_chars.saturating_sub(padded.chars().count());
+    for _ in 0..pad_count {
+        padded.push(' ');
+    }
+    buf.set_string(x, y, &padded, style);
+}
+
 fn format_bytes_human(n: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = KB * 1024;
@@ -218,6 +397,10 @@ pub struct Editor {
     /// the actual pixels are emitted as an OSC-1337 inline image overlay
     /// by `App` after each frame.
     pub image: Option<ImageView>,
+    /// Read-only spreadsheet preview for `.csv` / `.tsv` / `.xlsx` / etc.
+    /// Mutually exclusive with `image` and the text path; none of the
+    /// editor's text fields are populated when this is `Some`.
+    pub sheet: Option<crate::sheet::SheetView>,
 }
 
 impl Editor {
@@ -245,6 +428,7 @@ impl Editor {
             search_highlight: None,
             search_highlight_opts: crate::widgets::search::SearchOpts::default(),
             image: None,
+            sheet: None,
         }
     }
 
@@ -259,6 +443,9 @@ impl Editor {
         }
         if extension_is_pdf(ext) {
             return self.open_pdf(path);
+        }
+        if crate::sheet::extension_is_sheet(ext) {
+            return self.open_sheet(path);
         }
         let meta = std::fs::metadata(path)?;
         if meta.len() > MAX_FILE_BYTES {
@@ -286,6 +473,7 @@ impl Editor {
         self.undo_stack.clear();
         self.last_edit_kind = None;
         self.image = None;
+        self.sheet = None;
         self.status = format!("Opened {}", path.display());
         self.recompute_highlights();
         Ok(())
@@ -321,7 +509,28 @@ impl Editor {
             byte_size: meta.len(),
             pdf: None,
         });
+        self.sheet = None;
         self.status = format!("Opened image {}", path.display());
+        Ok(())
+    }
+
+    fn open_sheet(&mut self, path: &Path) -> Result<()> {
+        let view = crate::sheet::open_sheet(path)
+            .map_err(|e| anyhow::anyhow!("Spreadsheet open failed: {e}"))?;
+        self.path = Some(path.to_path_buf());
+        self.lines = vec![String::new()];
+        self.lang = None;
+        self.scroll = 0;
+        self.cursor_row = 0;
+        self.cursor_col = 0;
+        self.dirty = false;
+        self.selection = None;
+        self.undo_stack.clear();
+        self.last_edit_kind = None;
+        self.highlights = vec![Vec::new()];
+        self.image = None;
+        self.status = format!("Opened {} ({})", path.display(), view.kind.label());
+        self.sheet = Some(view);
         Ok(())
     }
 
@@ -360,6 +569,7 @@ impl Editor {
                 source_byte_size: meta.len(),
             }),
         });
+        self.sheet = None;
         self.status = format!("Opened PDF {}", path.display());
         Ok(())
     }
@@ -2422,6 +2632,10 @@ impl Widget for &mut Editor {
         }
         if let Some(image) = self.image.as_ref() {
             render_image_placeholder(image, self.path.as_deref(), inner, buf);
+            return;
+        }
+        if let Some(view) = self.sheet.as_ref() {
+            render_sheet(view, self.path.as_deref(), inner, buf);
             return;
         }
         if self.cursor_row < self.scroll {
