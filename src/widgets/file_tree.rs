@@ -27,6 +27,13 @@ pub struct FileTree {
     pub last_inner: Rect,
     pub last_area: Rect,
     pub last_scrollbar: Rect,
+    pub anchor: usize,
+    pub marked: BTreeSet<PathBuf>,
+    /// While the user is mid-drag, the index of the directory row currently
+    /// under the pointer (or the parent dir of a hovered file). Drawn with
+    /// a highlighted bg so the drop target is unambiguous. Cleared on drop
+    /// or cancel.
+    pub drag_target: Option<usize>,
 }
 
 impl FileTree {
@@ -46,6 +53,9 @@ impl FileTree {
             last_inner: Rect::default(),
             last_area: Rect::default(),
             last_scrollbar: Rect::default(),
+            anchor: 0,
+            marked: BTreeSet::new(),
+            drag_target: None,
         };
         tree.load_children(0);
         tree
@@ -69,6 +79,99 @@ impl FileTree {
         if idx < self.nodes.len() {
             self.selected = idx;
         }
+    }
+
+    /// Single-select: clear the multi-selection, set both selected and the
+    /// shift-anchor to `idx`.
+    pub fn select_replace(&mut self, idx: usize) {
+        if idx >= self.nodes.len() {
+            return;
+        }
+        self.selected = idx;
+        self.anchor = idx;
+        self.marked.clear();
+    }
+
+    /// Toggle whether the node at `idx` is in the multi-selection. Moves
+    /// the cursor to `idx` and resets the shift-anchor to it (matching VS
+    /// Code's Cmd/Ctrl+click behaviour). When entering multi-select mode
+    /// from a single selection, the previously-focused path is also added
+    /// to the marked set so the original cursor row is not silently lost.
+    pub fn toggle_mark(&mut self, idx: usize) {
+        if idx >= self.nodes.len() {
+            return;
+        }
+        let entering_multi = self.marked.is_empty();
+        if entering_multi {
+            if let Some(prev) = self.nodes.get(self.selected).map(|n| n.path.clone()) {
+                if self.selected != idx {
+                    self.marked.insert(prev);
+                }
+            }
+        }
+        let path = self.nodes[idx].path.clone();
+        if !self.marked.remove(&path) {
+            self.marked.insert(path);
+        }
+        self.selected = idx;
+        self.anchor = idx;
+    }
+
+    /// Replace the multi-selection with the inclusive range between the
+    /// current shift-anchor and `idx`. Moves the cursor to `idx`.
+    pub fn extend_to(&mut self, idx: usize) {
+        if idx >= self.nodes.len() {
+            return;
+        }
+        let anchor = self.anchor.min(self.nodes.len().saturating_sub(1));
+        let (lo, hi) = if anchor <= idx { (anchor, idx) } else { (idx, anchor) };
+        self.marked.clear();
+        for i in lo..=hi {
+            self.marked.insert(self.nodes[i].path.clone());
+        }
+        self.selected = idx;
+    }
+
+    pub fn clear_marks(&mut self) {
+        self.marked.clear();
+        self.anchor = self.selected;
+    }
+
+    pub fn is_marked(&self, idx: usize) -> bool {
+        self.nodes
+            .get(idx)
+            .is_some_and(|n| self.marked.contains(&n.path))
+    }
+
+    /// Mark every visible node (root included). Anchor goes to 0, selected
+    /// stays where it is so the user's caret doesn't jump.
+    pub fn select_all_visible(&mut self) {
+        self.marked.clear();
+        for n in &self.nodes {
+            self.marked.insert(n.path.clone());
+        }
+        self.anchor = 0;
+    }
+
+    /// Paths that should be acted on by Cut/Copy/Delete/Drag. If the
+    /// multi-selection is non-empty, returns the marked paths in tree
+    /// order plus the cursor row (so a Cmd-toggled row never excludes the
+    /// originally-focused row). Otherwise returns just the cursor path.
+    pub fn action_paths(&self) -> Vec<PathBuf> {
+        let Some(focused) = self.nodes.get(self.selected).map(|n| n.path.clone()) else {
+            return Vec::new();
+        };
+        if self.marked.is_empty() {
+            return vec![focused];
+        }
+        let mut paths: Vec<PathBuf> = self
+            .nodes
+            .iter()
+            .filter(|n| self.marked.contains(&n.path) || n.path == focused)
+            .map(|n| n.path.clone())
+            .collect();
+        paths.dedup();
+        paths
     }
 
     fn load_children(&mut self, idx: usize) {
@@ -148,26 +251,61 @@ impl FileTree {
         if self.selected >= self.nodes.len() {
             self.selected = self.nodes.len().saturating_sub(1);
         }
+        if self.anchor >= self.nodes.len() {
+            self.anchor = self.nodes.len().saturating_sub(1);
+        }
     }
 
     pub fn move_up(&mut self) {
         if self.selected > 0 {
             self.selected -= 1;
         }
+        self.anchor = self.selected;
+        self.marked.clear();
     }
 
     pub fn move_down(&mut self) {
         if self.selected + 1 < self.nodes.len() {
             self.selected += 1;
         }
+        self.anchor = self.selected;
+        self.marked.clear();
     }
 
     pub fn page_up(&mut self, page: usize) {
         self.selected = self.selected.saturating_sub(page);
+        self.anchor = self.selected;
+        self.marked.clear();
     }
 
     pub fn page_down(&mut self, page: usize) {
         self.selected = (self.selected + page).min(self.nodes.len().saturating_sub(1));
+        self.anchor = self.selected;
+        self.marked.clear();
+    }
+
+    pub fn move_up_extend(&mut self) {
+        if self.selected > 0 {
+            let new_idx = self.selected - 1;
+            self.extend_to(new_idx);
+        }
+    }
+
+    pub fn move_down_extend(&mut self) {
+        if self.selected + 1 < self.nodes.len() {
+            let new_idx = self.selected + 1;
+            self.extend_to(new_idx);
+        }
+    }
+
+    pub fn page_up_extend(&mut self, page: usize) {
+        let new_idx = self.selected.saturating_sub(page);
+        self.extend_to(new_idx);
+    }
+
+    pub fn page_down_extend(&mut self, page: usize) {
+        let new_idx = (self.selected + page).min(self.nodes.len().saturating_sub(1));
+        self.extend_to(new_idx);
     }
 
     pub fn scroll_up(&mut self, rows: usize) {
@@ -209,10 +347,23 @@ impl FileTree {
 
     pub fn home(&mut self) {
         self.selected = 0;
+        self.anchor = 0;
+        self.marked.clear();
     }
 
     pub fn end(&mut self) {
         self.selected = self.nodes.len().saturating_sub(1);
+        self.anchor = self.selected;
+        self.marked.clear();
+    }
+
+    pub fn home_extend(&mut self) {
+        self.extend_to(0);
+    }
+
+    pub fn end_extend(&mut self) {
+        let last = self.nodes.len().saturating_sub(1);
+        self.extend_to(last);
     }
 
     /// Activate the selected node. Returns Some(path) if a file should be opened.
@@ -284,12 +435,33 @@ impl FileTree {
         if let Some(path) = selected_path {
             if let Some(new_idx) = self.nodes.iter().position(|n| n.path == path) {
                 self.selected = new_idx;
+                self.prune_marks();
+                if self.anchor >= self.nodes.len() {
+                    self.anchor = self.selected;
+                }
                 return;
             }
         }
         if self.selected >= self.nodes.len() {
             self.selected = self.nodes.len().saturating_sub(1);
         }
+        if self.anchor >= self.nodes.len() {
+            self.anchor = self.nodes.len().saturating_sub(1);
+        }
+        self.prune_marks();
+    }
+
+    /// Drop multi-selection entries whose paths no longer exist in the
+    /// flattened node list (e.g. their parent folder was collapsed). Marks
+    /// always reference visible rows so a stale path can't accidentally
+    /// participate in Cut/Copy/Drag.
+    fn prune_marks(&mut self) {
+        if self.marked.is_empty() {
+            return;
+        }
+        let visible: BTreeSet<PathBuf> =
+            self.nodes.iter().map(|n| n.path.clone()).collect();
+        self.marked.retain(|p| visible.contains(p));
     }
 
     /// Index of the directory node whose path equals `path`, comparing both
@@ -439,6 +611,129 @@ pub fn affected_dir_for_event(event_path: &Path, root: &Path) -> Option<PathBuf>
         return None;
     }
     canon_event.parent().map(Path::to_path_buf)
+}
+
+/// Suggest a non-colliding destination path for `source` placed inside
+/// `dest_dir`. If a sibling with the source's basename already exists,
+/// appends ` copy`, ` copy 2`, … until a free name is found, mirroring how
+/// macOS Finder de-duplicates pasted names. Returns the resolved path; the
+/// caller still has to perform the actual move/copy syscall.
+pub fn unique_destination_in(dest_dir: &Path, source: &Path) -> PathBuf {
+    let stem = source
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let ext = source
+        .extension()
+        .map(|s| s.to_string_lossy().into_owned());
+    let original_name = source
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let mut candidate = dest_dir.join(&original_name);
+    if !candidate.exists() {
+        return candidate;
+    }
+    for n in 1.. {
+        let suffix = if n == 1 {
+            String::from(" copy")
+        } else {
+            format!(" copy {n}")
+        };
+        let name = match &ext {
+            Some(e) if !stem.is_empty() => format!("{stem}{suffix}.{e}"),
+            Some(e) => format!("{suffix}.{e}"),
+            None => format!("{stem}{suffix}"),
+        };
+        candidate = dest_dir.join(name);
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    candidate
+}
+
+/// Reject paste/drop operations that would move a directory into itself or
+/// a descendant of itself (which would either error or, worse, produce an
+/// infinite-recursion copy on filesystems that follow symlinks).
+pub fn is_descendant_or_same(target: &Path, source: &Path) -> bool {
+    let canon_target = target.canonicalize().unwrap_or_else(|_| target.to_path_buf());
+    let canon_source = source.canonicalize().unwrap_or_else(|_| source.to_path_buf());
+    canon_target == canon_source || canon_target.starts_with(&canon_source)
+}
+
+/// Move `source` to a fresh path inside `dest_dir`. Falls back to
+/// copy-then-remove when the source and destination live on different
+/// filesystems and `std::fs::rename` returns `EXDEV`. Returns the final
+/// destination path on success.
+pub fn move_into(dest_dir: &Path, source: &Path) -> std::io::Result<PathBuf> {
+    if is_descendant_or_same(dest_dir, source) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("cannot move {} into itself", source.display()),
+        ));
+    }
+    let dest = unique_destination_in(dest_dir, source);
+    if std::fs::rename(source, &dest).is_ok() {
+        return Ok(dest);
+    }
+    copy_recursive(source, &dest)?;
+    remove_recursive(source)?;
+    Ok(dest)
+}
+
+/// Recursively copy `source` to `dest`. `dest` must not already exist.
+pub fn copy_into(dest_dir: &Path, source: &Path) -> std::io::Result<PathBuf> {
+    if is_descendant_or_same(dest_dir, source) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("cannot copy {} into itself", source.display()),
+        ));
+    }
+    let dest = unique_destination_in(dest_dir, source);
+    copy_recursive(source, &dest)?;
+    Ok(dest)
+}
+
+fn copy_recursive(source: &Path, dest: &Path) -> std::io::Result<()> {
+    let meta = std::fs::symlink_metadata(source)?;
+    let ft = meta.file_type();
+    if ft.is_dir() {
+        std::fs::create_dir(dest)?;
+        for entry in std::fs::read_dir(source)? {
+            let entry = entry?;
+            let from = entry.path();
+            let to = dest.join(entry.file_name());
+            copy_recursive(&from, &to)?;
+        }
+        Ok(())
+    } else if ft.is_symlink() {
+        let link_target = std::fs::read_link(source)?;
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&link_target, dest)?;
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = link_target;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "symlink copy not supported on this platform",
+            ));
+        }
+        Ok(())
+    } else {
+        std::fs::copy(source, dest).map(|_| ())
+    }
+}
+
+fn remove_recursive(path: &Path) -> std::io::Result<()> {
+    let meta = std::fs::symlink_metadata(path)?;
+    if meta.is_dir() {
+        std::fs::remove_dir_all(path)
+    } else {
+        std::fs::remove_file(path)
+    }
 }
 
 /// Create directory `name` inside `parent`. Errors if it already exists.
@@ -1010,6 +1305,172 @@ mod tests {
     }
 
     #[test]
+    fn select_replace_clears_marks_and_sets_anchor() {
+        let (_tmp, mut tree) = fixture();
+        tree.marked.insert(tree.nodes[1].path.clone());
+        tree.select_replace(2);
+        assert_eq!(tree.selected, 2);
+        assert_eq!(tree.anchor, 2);
+        assert!(tree.marked.is_empty());
+    }
+
+    #[test]
+    fn extend_to_marks_inclusive_range() {
+        let (_tmp, mut tree) = fixture();
+        tree.select_replace(1);
+        tree.extend_to(3);
+        assert_eq!(tree.selected, 3);
+        assert!(tree.is_marked(1));
+        assert!(tree.is_marked(2));
+        assert!(tree.is_marked(3));
+    }
+
+    #[test]
+    fn extend_to_works_in_either_direction() {
+        let (_tmp, mut tree) = fixture();
+        tree.select_replace(3);
+        tree.extend_to(1);
+        assert_eq!(tree.selected, 1);
+        assert!(tree.is_marked(1));
+        assert!(tree.is_marked(2));
+        assert!(tree.is_marked(3));
+    }
+
+    #[test]
+    fn extend_to_replaces_previous_range() {
+        let (_tmp, mut tree) = fixture();
+        tree.select_replace(0);
+        tree.extend_to(2);
+        tree.extend_to(1);
+        assert!(tree.is_marked(0));
+        assert!(tree.is_marked(1));
+        assert!(!tree.is_marked(2));
+    }
+
+    #[test]
+    fn toggle_mark_adds_then_removes() {
+        let (_tmp, mut tree) = fixture();
+        tree.toggle_mark(1);
+        assert!(tree.is_marked(1));
+        tree.toggle_mark(1);
+        assert!(!tree.is_marked(1));
+    }
+
+    #[test]
+    fn action_paths_returns_marks_in_tree_order() {
+        let (_tmp, mut tree) = fixture();
+        tree.select_replace(1);
+        tree.toggle_mark(2);
+        let paths = tree.action_paths();
+        assert_eq!(paths.len(), 2);
+        assert_eq!(paths[0], tree.nodes[1].path);
+        assert_eq!(paths[1], tree.nodes[2].path);
+    }
+
+    #[test]
+    fn action_paths_falls_back_to_selected_when_no_marks() {
+        let (_tmp, mut tree) = fixture();
+        tree.selected = 2;
+        let paths = tree.action_paths();
+        assert_eq!(paths, vec![tree.nodes[2].path.clone()]);
+    }
+
+    #[test]
+    fn move_up_and_down_clear_marks() {
+        let (_tmp, mut tree) = fixture();
+        tree.select_replace(1);
+        tree.extend_to(2);
+        assert!(!tree.marked.is_empty());
+        tree.move_down();
+        assert!(tree.marked.is_empty());
+        assert_eq!(tree.anchor, tree.selected);
+    }
+
+    #[test]
+    fn move_down_extend_grows_selection_from_anchor() {
+        let (_tmp, mut tree) = fixture();
+        tree.select_replace(1);
+        tree.move_down_extend();
+        assert!(tree.is_marked(1));
+        assert!(tree.is_marked(2));
+    }
+
+    #[test]
+    fn unique_destination_in_avoids_collision() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("a.txt");
+        std::fs::write(&src, "x").unwrap();
+        let dst = tmp.path().join("dest");
+        std::fs::create_dir(&dst).unwrap();
+        let p = unique_destination_in(&dst, &src);
+        assert_eq!(p, dst.join("a.txt"));
+        std::fs::write(&p, "x").unwrap();
+        let p2 = unique_destination_in(&dst, &src);
+        assert_eq!(p2, dst.join("a copy.txt"));
+    }
+
+    #[test]
+    fn move_into_renames_when_no_collision() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("a.txt");
+        std::fs::write(&src, "x").unwrap();
+        let dst_dir = tmp.path().join("dest");
+        std::fs::create_dir(&dst_dir).unwrap();
+        let placed = move_into(&dst_dir, &src).unwrap();
+        assert_eq!(placed, dst_dir.join("a.txt"));
+        assert!(!src.exists());
+        assert!(placed.exists());
+    }
+
+    #[test]
+    fn move_into_dedupes_collision() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("a.txt");
+        std::fs::write(&src, "src").unwrap();
+        let dst_dir = tmp.path().join("dest");
+        std::fs::create_dir(&dst_dir).unwrap();
+        std::fs::write(dst_dir.join("a.txt"), "preexisting").unwrap();
+        let placed = move_into(&dst_dir, &src).unwrap();
+        assert_eq!(placed.file_name().unwrap(), "a copy.txt");
+        assert_eq!(std::fs::read_to_string(&placed).unwrap(), "src");
+        assert_eq!(
+            std::fs::read_to_string(dst_dir.join("a.txt")).unwrap(),
+            "preexisting"
+        );
+    }
+
+    #[test]
+    fn move_into_refuses_to_move_directory_into_itself() {
+        let tmp = TempDir::new().unwrap();
+        let d = tmp.path().join("d");
+        std::fs::create_dir(&d).unwrap();
+        let inner = d.join("inner");
+        std::fs::create_dir(&inner).unwrap();
+        assert!(move_into(&inner, &d).is_err());
+    }
+
+    #[test]
+    fn copy_into_recurses_into_subfolders() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("d");
+        std::fs::create_dir(&src).unwrap();
+        std::fs::write(src.join("a.txt"), "hi").unwrap();
+        let inner = src.join("inner");
+        std::fs::create_dir(&inner).unwrap();
+        std::fs::write(inner.join("b.txt"), "deep").unwrap();
+        let dst_dir = tmp.path().join("dest");
+        std::fs::create_dir(&dst_dir).unwrap();
+        let placed = copy_into(&dst_dir, &src).unwrap();
+        assert_eq!(placed, dst_dir.join("d"));
+        assert_eq!(std::fs::read_to_string(placed.join("a.txt")).unwrap(), "hi");
+        assert_eq!(
+            std::fs::read_to_string(placed.join("inner/b.txt")).unwrap(),
+            "deep"
+        );
+        assert!(src.exists(), "copy must leave source intact");
+    }
+
+    #[test]
     fn rename_in_no_op_returns_ok_with_same_path() {
         // Renaming to the same name is a useful early-return: it covers the
         // case where the user opens the prompt, doesn't change anything,
@@ -1076,6 +1537,8 @@ impl Widget for &mut FileTree {
         for (row, idx) in (self.scroll..end).enumerate() {
             let node = &self.nodes[idx];
             let is_selected = idx == self.selected;
+            let is_marked = self.marked.contains(&node.path);
+            let is_drop_target = self.drag_target == Some(idx);
             let y = inner.y + row as u16;
 
             let indent = "  ".repeat(node.depth);
@@ -1129,8 +1592,12 @@ impl Widget for &mut FileTree {
             }
 
             let line = Line::from(spans);
-            let line_style = if is_selected {
+            let line_style = if is_drop_target {
+                Style::default().bg(Color::Rgb(0x2c, 0x60, 0x2e))
+            } else if is_selected {
                 Style::default().bg(Color::Rgb(0x09, 0x4d, 0x77))
+            } else if is_marked {
+                Style::default().bg(Color::Rgb(0x07, 0x33, 0x55))
             } else {
                 Style::default()
             };

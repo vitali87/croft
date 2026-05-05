@@ -17,6 +17,7 @@ use ratatui::{
     widgets::Paragraph,
     Terminal,
 };
+use std::collections::BTreeSet;
 use std::io::{stdout, Stdout};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -191,34 +192,110 @@ enum CreateKind {
 #[derive(Clone, PartialEq, Eq, Debug)]
 enum MenuAction {
     Create(CreateKind),
-    /// Move the path to the OS trash (recoverable).
-    Delete(PathBuf),
+    /// Move every path in `paths` to the OS trash (recoverable). One entry
+    /// for a single right-click, more when a multi-selection is active.
+    Delete { paths: Vec<PathBuf> },
     /// Open the rename prompt pre-filled with the entry's current name.
     Rename(PathBuf),
+    /// Cut the listed paths to the explorer clipboard for later Paste.
+    Cut(Vec<PathBuf>),
+    /// Copy the listed paths to the explorer clipboard for later Paste.
+    Copy(Vec<PathBuf>),
+    /// Paste the explorer clipboard's payload into `target_dir`.
+    Paste(PathBuf),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ExplorerClipMode {
+    Copy,
+    Cut,
+}
+
+#[derive(Clone, Debug)]
+struct ExplorerClipboard {
+    mode: ExplorerClipMode,
+    paths: Vec<PathBuf>,
+}
+
+/// State for an in-progress drag inside the explorer pane. The drag is only
+/// "armed" once the pointer has actually moved off the original cell, so a
+/// stationary mouse-down → mouse-up still behaves like a click.
+#[derive(Clone, Debug)]
+struct ExplorerDrag {
+    /// Paths the drag is moving (or copying, when Alt is held).
+    paths: Vec<PathBuf>,
+    /// Tree row of the drop target under the pointer. `None` means the
+    /// pointer is over empty space or outside the tree.
+    target_idx: Option<usize>,
+    /// True once we've seen a Drag event with a different cell from the
+    /// initial Down. Until then we treat the gesture as a still-pending click.
+    armed: bool,
+    /// (instant, x, y) of the initiating mouse-down.
+    started_at: (std::time::Instant, u16, u16),
+    /// Index of the row the user pressed on. Used as the toggle target if
+    /// the gesture turns out to be a stationary Alt-click rather than a drag.
+    start_idx: usize,
+    /// True when the initiating mouse-down was an Alt/Ctrl click. A
+    /// non-armed release toggles the start row's mark; an armed release
+    /// performs a copy-drop instead of the default move-drop.
+    toggle_on_release: bool,
 }
 
 /// Build the right-click context-menu items for the explorer.
 ///
 /// * Right-click on an entry (file or non-root folder) → entry-scoped
-///   actions: Rename, Delete.
+///   actions: Cut, Copy, Paste, Rename, Delete. Multi-select promotes
+///   Delete to a count and keeps Rename on a single entry only.
 /// * Right-click on empty tree space, or on the workspace root row →
-///   workspace-scoped actions: New File, New Folder.
+///   workspace-scoped actions: New File, New Folder, Paste.
 fn build_tree_context_menu_items(
     node: Option<&crate::widgets::file_tree::Node>,
     root: &Path,
+    selection: &[PathBuf],
+    target_dir: &Path,
+    clipboard: Option<&ExplorerClipboard>,
 ) -> Vec<(String, MenuAction)> {
     let entry_target = crate::widgets::file_tree::delete_target_for(node, root);
+    let mut items: Vec<(String, MenuAction)> = Vec::new();
     if let Some(p) = entry_target {
-        vec![
-            (String::from("Rename…"), MenuAction::Rename(p.clone())),
-            (String::from("Delete"), MenuAction::Delete(p)),
-        ]
+        let paths_for_action: Vec<PathBuf> = if selection.iter().any(|sp| sp == &p) {
+            selection.to_vec()
+        } else {
+            vec![p.clone()]
+        };
+        items.push((String::from("Cut"), MenuAction::Cut(paths_for_action.clone())));
+        items.push((String::from("Copy"), MenuAction::Copy(paths_for_action.clone())));
+        if clipboard.is_some() {
+            items.push((String::from("Paste"), MenuAction::Paste(target_dir.to_path_buf())));
+        }
+        if paths_for_action.len() == 1 {
+            items.push((String::from("Rename…"), MenuAction::Rename(p.clone())));
+        }
+        let label = if paths_for_action.len() > 1 {
+            format!("Delete {} items", paths_for_action.len())
+        } else {
+            String::from("Delete")
+        };
+        items.push((
+            label,
+            MenuAction::Delete {
+                paths: paths_for_action,
+            },
+        ));
     } else {
-        vec![
-            (String::from("New File…"), MenuAction::Create(CreateKind::File)),
-            (String::from("New Folder…"), MenuAction::Create(CreateKind::Folder)),
-        ]
+        items.push((
+            String::from("New File…"),
+            MenuAction::Create(CreateKind::File),
+        ));
+        items.push((
+            String::from("New Folder…"),
+            MenuAction::Create(CreateKind::Folder),
+        ));
+        if clipboard.is_some() {
+            items.push((String::from("Paste"), MenuAction::Paste(target_dir.to_path_buf())));
+        }
     }
+    items
 }
 
 struct ContextMenu {
@@ -362,6 +439,12 @@ pub struct App {
     fs_poll_dir_mtimes: std::collections::BTreeMap<PathBuf, Option<std::time::SystemTime>>,
     fs_poll_open_file_mtime: Option<(PathBuf, Option<(std::time::SystemTime, u64)>)>,
     remote_launch: Option<RemoteLaunch>,
+    /// Explorer-scoped Cut/Copy buffer. Independent from the OS clipboard
+    /// (which carries text), this stores filesystem paths and the intent
+    /// (move vs. copy) until the next Paste consumes it.
+    tree_clipboard: Option<ExplorerClipboard>,
+    /// Active explorer drag-and-drop, if any.
+    tree_drag: Option<ExplorerDrag>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -629,6 +712,8 @@ impl App {
             fs_poll_dir_mtimes,
             fs_poll_open_file_mtime: None,
             remote_launch: None,
+            tree_clipboard: None,
+            tree_drag: None,
         })
     }
 
@@ -1920,24 +2005,77 @@ impl App {
     }
 
     fn handle_tree_key(&mut self, key: KeyEvent) {
-        // Delete key (or Cmd+Backspace) trashes the selected node directly.
+        // Delete key (or Cmd+Backspace) trashes every selected node.
         if is_delete_node_key(key) {
-            if let Some(node) = self.tree.nodes.get(self.tree.selected) {
-                if let Some(path) =
-                    crate::widgets::file_tree::delete_target_for(Some(node), &self.tree.root)
-                {
-                    self.delete_node(path);
-                }
+            self.delete_selection();
+            return;
+        }
+        if is_editor_select_all_key(key) {
+            self.tree.select_all_visible();
+            return;
+        }
+        if is_editor_copy_key(key) {
+            self.copy_selection_to_explorer_clipboard(ExplorerClipMode::Copy);
+            return;
+        }
+        if is_editor_cut_key(key) {
+            self.copy_selection_to_explorer_clipboard(ExplorerClipMode::Cut);
+            return;
+        }
+        if is_clipboard_paste_key(key) {
+            self.paste_explorer_clipboard();
+            return;
+        }
+        if key.code == KeyCode::Esc {
+            if !self.tree.marked.is_empty() {
+                self.tree.clear_marks();
             }
             return;
         }
+        let extending = key.modifiers.contains(KeyModifiers::SHIFT);
         match key.code {
-            KeyCode::Up => self.tree.move_up(),
-            KeyCode::Down => self.tree.move_down(),
-            KeyCode::PageUp => self.tree.page_up(10),
-            KeyCode::PageDown => self.tree.page_down(10),
-            KeyCode::Home => self.tree.home(),
-            KeyCode::End => self.tree.end(),
+            KeyCode::Up => {
+                if extending {
+                    self.tree.move_up_extend();
+                } else {
+                    self.tree.move_up();
+                }
+            }
+            KeyCode::Down => {
+                if extending {
+                    self.tree.move_down_extend();
+                } else {
+                    self.tree.move_down();
+                }
+            }
+            KeyCode::PageUp => {
+                if extending {
+                    self.tree.page_up_extend(10);
+                } else {
+                    self.tree.page_up(10);
+                }
+            }
+            KeyCode::PageDown => {
+                if extending {
+                    self.tree.page_down_extend(10);
+                } else {
+                    self.tree.page_down(10);
+                }
+            }
+            KeyCode::Home => {
+                if extending {
+                    self.tree.home_extend();
+                } else {
+                    self.tree.home();
+                }
+            }
+            KeyCode::End => {
+                if extending {
+                    self.tree.end_extend();
+                } else {
+                    self.tree.end();
+                }
+            }
             KeyCode::Enter => {
                 if let Some(path) = self.tree.activate() {
                     // Ctrl+Enter is the primary "open in new tab" gesture — it
@@ -2296,14 +2434,28 @@ impl App {
             MouseEventKind::Down(MouseButton::Right) => {
                 if in_tree && self.sidebar_view == SidebarView::Explorer {
                     self.focus_pane(Pane::Tree);
-                    let node_idx = self.tree.node_at_y(m.row).inspect(|&i| {
-                        self.tree.select(i);
-                    });
+                    let node_idx = self.tree.node_at_y(m.row);
+                    if let Some(idx) = node_idx {
+                        let path_clicked = self.tree.nodes[idx].path.clone();
+                        let already_marked = self.tree.marked.contains(&path_clicked);
+                        if already_marked {
+                            self.tree.selected = idx;
+                        } else {
+                            self.tree.select_replace(idx);
+                        }
+                    }
                     let node = node_idx.and_then(|i| self.tree.nodes.get(i));
                     let target_dir = crate::widgets::file_tree::create_target_dir_for(
                         node, &self.tree.root,
                     );
-                    let items = build_tree_context_menu_items(node, &self.tree.root);
+                    let selection = self.tree.action_paths();
+                    let items = build_tree_context_menu_items(
+                        node,
+                        &self.tree.root,
+                        &selection,
+                        &target_dir,
+                        self.tree_clipboard.as_ref(),
+                    );
                     self.context_menu = Some(ContextMenu {
                         origin: (m.column, m.row),
                         items,
@@ -2419,7 +2571,6 @@ impl App {
                 if in_tree && self.sidebar_view == SidebarView::Explorer {
                     self.focus_pane(Pane::Tree);
                     if let Some(idx) = self.tree.node_at_y(m.row) {
-                        self.tree.select(idx);
                         let now = std::time::Instant::now();
                         let is_double = matches!(
                             self.last_tree_left_down,
@@ -2428,6 +2579,56 @@ impl App {
                                     && m.column.abs_diff(x) <= 1
                                     && now.duration_since(t) <= DOUBLE_CLICK_WINDOW
                         );
+                        let has_shift = m.modifiers.contains(KeyModifiers::SHIFT);
+                        // macOS terminals (iTerm2, Terminal.app) never put the
+                        // Cmd bit on mouse events — the SGR mouse encoding only
+                        // carries Shift/Alt/Ctrl. Treat Alt (Option on macOS)
+                        // and Ctrl as the cherry-pick modifier so the gesture
+                        // actually reaches the app.
+                        let has_toggle_mod = m.modifiers.contains(KeyModifiers::ALT)
+                            || m.modifiers.contains(KeyModifiers::CONTROL);
+                        // Shift-click extends the range from the anchor. No
+                        // activation, no drag.
+                        if has_shift {
+                            self.tree.extend_to(idx);
+                            self.last_tree_left_down = None;
+                            self.tree_drag = None;
+                            return;
+                        }
+                        // Alt/Ctrl-click: defer the toggle until mouse-up so a
+                        // movement in between can promote the gesture into an
+                        // Alt-drag (copy) instead. Don't activate (no file
+                        // open, no folder toggle) and don't include the row
+                        // in the multi-selection yet.
+                        if has_toggle_mod {
+                            self.last_tree_left_down = None;
+                            let mut drag_paths = self.tree.action_paths();
+                            let path_clicked = self.tree.nodes[idx].path.clone();
+                            if !drag_paths.iter().any(|p| p == &path_clicked) {
+                                drag_paths.push(path_clicked);
+                            }
+                            self.tree_drag = Some(ExplorerDrag {
+                                paths: drag_paths,
+                                target_idx: None,
+                                armed: false,
+                                started_at: (now, m.column, m.row),
+                                start_idx: idx,
+                                toggle_on_release: true,
+                            });
+                            return;
+                        }
+                        // Plain click: if the row is already in the marked set,
+                        // keep the marks intact so a subsequent drag carries
+                        // every selected entry; otherwise collapse selection
+                        // to this single row.
+                        let already_marked =
+                            self.tree.marked.contains(&self.tree.nodes[idx].path);
+                        if !already_marked {
+                            self.tree.select_replace(idx);
+                        } else {
+                            self.tree.selected = idx;
+                            self.tree.anchor = idx;
+                        }
                         let clicked_is_dir = self
                             .tree
                             .nodes
@@ -2435,7 +2636,22 @@ impl App {
                             .is_some_and(|node| node.is_dir);
                         if clicked_is_dir && is_double {
                             self.last_tree_left_down = None;
+                            self.tree_drag = None;
                             return;
+                        }
+                        // Arm a potential drag-source. Movement off this cell
+                        // promotes it into a real drag in the Drag handler;
+                        // a stationary release keeps the click semantics.
+                        let drag_paths = self.tree.action_paths();
+                        if !drag_paths.is_empty() {
+                            self.tree_drag = Some(ExplorerDrag {
+                                paths: drag_paths,
+                                target_idx: None,
+                                armed: false,
+                                started_at: (now, m.column, m.row),
+                                start_idx: idx,
+                                toggle_on_release: false,
+                            });
                         }
                         if let Some(path) = self.tree.activate() {
                             let result = if is_double {
@@ -2448,17 +2664,9 @@ impl App {
                                     self.sync_open_file_poll_mtime();
                                     self.status = self.editor.status.clone();
                                     if is_double {
-                                        // Double-click "pins" the file: focus
-                                        // moves to the editor so the user can
-                                        // start editing immediately.
                                         self.focus_pane(Pane::Editor);
                                         self.poke_cursor();
                                     }
-                                    // Single-click keeps the tree focused so
-                                    // Delete / arrows still act on the
-                                    // explorer; the user follows up with a
-                                    // double-click (or a click in the editor
-                                    // pane) when they want to start typing.
                                 }
                                 Err(e) => self.status = format!("Error: {e}"),
                             }
@@ -2552,8 +2760,29 @@ impl App {
                 } else if in_tree {
                     match self.sidebar_view {
                         SidebarView::Explorer => {
-                            if let Some(idx) = self.tree.node_at_y(m.row) {
-                                self.tree.select(idx);
+                            // Promote to a real drag-and-drop the moment the
+                            // pointer leaves the initiating cell.
+                            if let Some(drag) = self.tree_drag.as_mut() {
+                                let (_, sx, sy) = drag.started_at;
+                                if m.column != sx || m.row != sy {
+                                    drag.armed = true;
+                                }
+                                if drag.armed {
+                                    drag.target_idx = drag_target_index(
+                                        &self.tree,
+                                        m.row,
+                                        &drag.paths,
+                                    );
+                                    self.tree.drag_target = drag.target_idx;
+                                }
+                            }
+                            // While not dragging, treat continued movement as a
+                            // range-extend from the initial anchor — just like
+                            // VS Code's drag-to-select.
+                            if self.tree_drag.as_ref().is_none_or(|d| !d.armed) {
+                                if let Some(idx) = self.tree.node_at_y(m.row) {
+                                    self.tree.select(idx);
+                                }
                             }
                         }
                         SidebarView::Remote => {
@@ -2565,11 +2794,45 @@ impl App {
                     }
                 } else if in_terminal {
                     self.terminal.extend_selection_to(m.column, m.row);
+                } else if self.tree_drag.is_some() {
+                    // Pointer dragged outside the tree pane: still keep the drag
+                    // alive so dropping back inside lands; just clear the drop
+                    // highlight so the user knows nothing will happen here.
+                    if let Some(drag) = self.tree_drag.as_mut() {
+                        drag.target_idx = None;
+                    }
+                    self.tree.drag_target = None;
                 }
             }
             MouseEventKind::Up(MouseButton::Left) => {
                 if self.scrollbar_drag.take().is_some() {
                     return;
+                }
+                if let Some(drag) = self.tree_drag.take() {
+                    self.tree.drag_target = None;
+                    if drag.armed {
+                        // Drag while Alt/Ctrl is held copies; default is move.
+                        let copy = drag.toggle_on_release
+                            || m.modifiers.contains(KeyModifiers::ALT)
+                            || m.modifiers.contains(KeyModifiers::CONTROL);
+                        let mode = if copy {
+                            ExplorerClipMode::Copy
+                        } else {
+                            ExplorerClipMode::Cut
+                        };
+                        if let Some(target_idx) = drag.target_idx {
+                            let target_dir = drop_target_dir(&self.tree, target_idx);
+                            self.apply_paste_or_drop(&target_dir, &drag.paths, mode);
+                        } else {
+                            self.status = String::from("Drop cancelled");
+                        }
+                        return;
+                    }
+                    if drag.toggle_on_release {
+                        // Stationary Alt/Ctrl-click: now perform the toggle.
+                        self.tree.toggle_mark(drag.start_idx);
+                        return;
+                    }
                 }
                 // Mouse-up never auto-copies. The selection stays highlighted
                 // so the user can hit Cmd/Ctrl+C themselves; a click without
@@ -2696,34 +2959,212 @@ impl App {
     fn dispatch_menu_action(&mut self, action: MenuAction, target_dir: PathBuf) {
         match action {
             MenuAction::Create(kind) => self.open_create_prompt(kind, target_dir),
-            // No confirmation: trash is recoverable, the user asked for direct deletion.
-            MenuAction::Delete(path) => self.delete_node(path),
+            MenuAction::Delete { paths } => self.delete_paths(paths),
             MenuAction::Rename(path) => self.open_rename_prompt(path),
+            MenuAction::Cut(paths) => {
+                let n = paths.len();
+                self.tree_clipboard = Some(ExplorerClipboard {
+                    mode: ExplorerClipMode::Cut,
+                    paths,
+                });
+                self.status = if n == 1 {
+                    String::from("Cut 1 item")
+                } else {
+                    format!("Cut {n} items")
+                };
+            }
+            MenuAction::Copy(paths) => {
+                let n = paths.len();
+                self.tree_clipboard = Some(ExplorerClipboard {
+                    mode: ExplorerClipMode::Copy,
+                    paths,
+                });
+                self.status = if n == 1 {
+                    String::from("Copied 1 item")
+                } else {
+                    format!("Copied {n} items")
+                };
+            }
+            MenuAction::Paste(dest) => self.paste_into(dest),
         }
     }
 
-    fn delete_node(&mut self, path: PathBuf) {
-        match crate::widgets::file_tree::move_to_trash(&path) {
-            Ok(()) => {
-                self.status = format!("Moved {} to Trash", path.display());
-                let parent = path
-                    .parent()
-                    .map(Path::to_path_buf)
-                    .unwrap_or_else(|| self.tree.root.clone());
-                if let Some(idx) = self.tree.index_of_dir(&parent) {
-                    self.tree.refresh_children(idx);
-                }
-                if self.editor.matches_open_path(&path) {
-                    if !self.editor.close_active() {
-                        // Sole tab: just blank out its buffer instead.
-                        *self.editor = Editor::new();
+    /// Trash every entry in the tree's current action set (the multi-
+    /// selection if non-empty, otherwise just the focused row). Refuses the
+    /// workspace root, even if some other path in the set succeeds.
+    fn delete_selection(&mut self) {
+        let paths: Vec<PathBuf> = self
+            .tree
+            .action_paths()
+            .into_iter()
+            .filter(|p| {
+                let canon_root = self.tree.root.canonicalize().ok();
+                let canon_p = p.canonicalize().ok();
+                p != &self.tree.root && canon_root != canon_p
+            })
+            .collect();
+        if paths.is_empty() {
+            return;
+        }
+        self.delete_paths(paths);
+    }
+
+    fn delete_paths(&mut self, paths: Vec<PathBuf>) {
+        let total = paths.len();
+        let mut affected_dirs: BTreeSet<PathBuf> = BTreeSet::new();
+        let mut errors: Vec<String> = Vec::new();
+        let mut ok_count = 0usize;
+        for path in &paths {
+            match crate::widgets::file_tree::move_to_trash(path) {
+                Ok(()) => {
+                    ok_count += 1;
+                    let parent = path
+                        .parent()
+                        .map(Path::to_path_buf)
+                        .unwrap_or_else(|| self.tree.root.clone());
+                    affected_dirs.insert(parent);
+                    if self.editor.matches_open_path(path) {
+                        if !self.editor.close_active() {
+                            *self.editor = Editor::new();
+                        }
+                        self.sync_open_file_poll_mtime();
                     }
-                    self.sync_open_file_poll_mtime();
                 }
+                Err(e) => errors.push(format!("{}: {e}", path.display())),
             }
-            Err(e) => {
-                self.status = format!("Delete failed: {e}");
+        }
+        for dir in &affected_dirs {
+            if let Some(idx) = self.tree.index_of_dir(dir) {
+                self.tree.refresh_children(idx);
             }
+        }
+        self.tree.clear_marks();
+        if !errors.is_empty() {
+            self.status = format!(
+                "Deleted {ok_count}/{total}; failed: {}",
+                errors.join("; ")
+            );
+        } else if total == 1 {
+            self.status = format!("Moved {} to Trash", paths[0].display());
+        } else {
+            self.status = format!("Moved {ok_count} items to Trash");
+        }
+    }
+
+    /// Stash the current action paths into the explorer clipboard. The
+    /// system text clipboard is left untouched so editor/terminal text
+    /// copy gestures still work elsewhere in the app.
+    fn copy_selection_to_explorer_clipboard(&mut self, mode: ExplorerClipMode) {
+        let paths = self.tree.action_paths();
+        if paths.is_empty() {
+            return;
+        }
+        let n = paths.len();
+        self.tree_clipboard = Some(ExplorerClipboard { mode, paths });
+        self.status = match (mode, n) {
+            (ExplorerClipMode::Copy, 1) => String::from("Copied 1 item"),
+            (ExplorerClipMode::Copy, _) => format!("Copied {n} items"),
+            (ExplorerClipMode::Cut, 1) => String::from("Cut 1 item"),
+            (ExplorerClipMode::Cut, _) => format!("Cut {n} items"),
+        };
+    }
+
+    /// Resolve the directory that an explorer paste/drop should land in,
+    /// based on the currently focused node. Mirrors `create_target_dir_for`
+    /// but for keyboard paste (no right-click coordinates).
+    fn paste_target_dir(&self) -> PathBuf {
+        let node = self.tree.nodes.get(self.tree.selected);
+        crate::widgets::file_tree::create_target_dir_for(node, &self.tree.root)
+    }
+
+    /// Move (Cut) or copy (Copy) every clipboard path into `dest_dir`,
+    /// then refresh affected directories and select the freshly-pasted
+    /// items. Cut clears the explorer clipboard on success; Copy preserves
+    /// it so the user can paste again.
+    fn paste_explorer_clipboard(&mut self) {
+        let dest_dir = self.paste_target_dir();
+        self.paste_into(dest_dir);
+    }
+
+    fn paste_into(&mut self, dest_dir: PathBuf) {
+        let Some(clip) = self.tree_clipboard.clone() else {
+            self.status = String::from("Explorer clipboard is empty");
+            return;
+        };
+        self.apply_paste_or_drop(&dest_dir, &clip.paths, clip.mode);
+        if matches!(clip.mode, ExplorerClipMode::Cut) {
+            self.tree_clipboard = None;
+        }
+    }
+
+    /// Shared implementation for explorer paste and drag-drop. `mode`
+    /// distinguishes a move (Cut/drag) from a copy (Copy/Alt-drag).
+    fn apply_paste_or_drop(
+        &mut self,
+        dest_dir: &Path,
+        paths: &[PathBuf],
+        mode: ExplorerClipMode,
+    ) {
+        let mut affected: BTreeSet<PathBuf> = BTreeSet::new();
+        affected.insert(dest_dir.to_path_buf());
+        let mut placed: Vec<PathBuf> = Vec::new();
+        let mut errors: Vec<String> = Vec::new();
+        for src in paths {
+            let result = match mode {
+                ExplorerClipMode::Cut => {
+                    let parent = src
+                        .parent()
+                        .map(Path::to_path_buf)
+                        .unwrap_or_else(|| self.tree.root.clone());
+                    affected.insert(parent);
+                    crate::widgets::file_tree::move_into(dest_dir, src)
+                }
+                ExplorerClipMode::Copy => {
+                    crate::widgets::file_tree::copy_into(dest_dir, src)
+                }
+            };
+            match result {
+                Ok(p) => {
+                    if matches!(mode, ExplorerClipMode::Cut)
+                        && self.editor.matches_open_path(src)
+                    {
+                        self.editor.rename_open_path(src, &p);
+                    }
+                    placed.push(p);
+                }
+                Err(e) => errors.push(format!("{}: {e}", src.display())),
+            }
+        }
+        for dir in &affected {
+            if let Some(idx) = self.tree.index_of_dir(dir) {
+                self.tree.refresh_children(idx);
+            }
+        }
+        self.tree.marked.clear();
+        for p in &placed {
+            self.tree.marked.insert(p.clone());
+        }
+        if let Some(first) = placed.first() {
+            if let Some(idx) = self.tree.nodes.iter().position(|n| &n.path == first) {
+                self.tree.selected = idx;
+                self.tree.anchor = idx;
+            }
+        }
+        let verb = match mode {
+            ExplorerClipMode::Cut => "Moved",
+            ExplorerClipMode::Copy => "Copied",
+        };
+        if !errors.is_empty() {
+            self.status = format!(
+                "{verb} {}/{}; failed: {}",
+                placed.len(),
+                paths.len(),
+                errors.join("; ")
+            );
+        } else if placed.len() == 1 {
+            self.status = format!("{verb} 1 item to {}", dest_dir.display());
+        } else {
+            self.status = format!("{verb} {} items to {}", placed.len(), dest_dir.display());
         }
     }
 
@@ -3118,6 +3559,52 @@ fn jump_to_tab_index(key: KeyEvent) -> Option<usize> {
         return None;
     }
     Some((d - 1) as usize)
+}
+
+/// Map a screen row to the tree row that should be highlighted as a drop
+/// target. Hovering a directory targets that directory; hovering a file
+/// targets its parent directory (so dragging onto a file row drops the
+/// payload as siblings of that file). Returns `None` when the pointer is
+/// over empty tree space, when the row would be a no-op (hovering an
+/// item that's part of the drag set), or when the resolved directory is
+/// inside one of the dragged folders.
+fn drag_target_index(
+    tree: &crate::widgets::file_tree::FileTree,
+    y: u16,
+    drag_paths: &[PathBuf],
+) -> Option<usize> {
+    let idx = tree.node_at_y(y)?;
+    let node = tree.nodes.get(idx)?;
+    let dir_idx = if node.is_dir {
+        idx
+    } else {
+        let parent = node.path.parent()?;
+        tree.index_of_dir(parent)?
+    };
+    let dir_path = tree.nodes.get(dir_idx)?.path.clone();
+    for src in drag_paths {
+        if crate::widgets::file_tree::is_descendant_or_same(&dir_path, src) {
+            return None;
+        }
+        if let Some(parent) = src.parent() {
+            if parent == dir_path && drag_paths.len() == 1 {
+                // Dropping a single source onto its own parent is a no-op;
+                // don't show a highlight so the user knows nothing will move.
+                return None;
+            }
+        }
+    }
+    Some(dir_idx)
+}
+
+fn drop_target_dir(
+    tree: &crate::widgets::file_tree::FileTree,
+    target_idx: usize,
+) -> PathBuf {
+    tree.nodes
+        .get(target_idx)
+        .map(|n| n.path.clone())
+        .unwrap_or_else(|| tree.root.clone())
 }
 
 fn rect_contains(r: Rect, x: u16, y: u16) -> bool {
@@ -3869,39 +4356,118 @@ mod tests {
     }
 
     #[test]
-    fn tree_context_menu_on_file_offers_rename_and_delete_only() {
+    fn tree_context_menu_on_file_offers_cut_copy_rename_delete() {
         let tmp = tempfile::tempdir().unwrap();
         let f = tmp.path().join("hello.txt");
         std::fs::write(&f, "hi").unwrap();
         let n = file_node(&f);
-        let items = build_tree_context_menu_items(Some(&n), tmp.path());
+        let target = f.parent().unwrap().to_path_buf();
+        let items = build_tree_context_menu_items(
+            Some(&n),
+            tmp.path(),
+            &[f.clone()],
+            &target,
+            None,
+        );
         let labels: Vec<&str> = items.iter().map(|(s, _)| s.as_str()).collect();
-        assert_eq!(labels, ["Rename…", "Delete"]);
-        assert!(matches!(items[0].1, MenuAction::Rename(ref p) if p == &f));
-        assert!(matches!(items[1].1, MenuAction::Delete(ref p) if p == &f));
+        assert_eq!(labels, ["Cut", "Copy", "Rename…", "Delete"]);
+        assert!(matches!(&items[0].1, MenuAction::Cut(ps) if ps == &vec![f.clone()]));
+        assert!(matches!(&items[1].1, MenuAction::Copy(ps) if ps == &vec![f.clone()]));
+        assert!(matches!(&items[2].1, MenuAction::Rename(p) if p == &f));
+        assert!(matches!(&items[3].1, MenuAction::Delete { paths } if paths == &vec![f.clone()]));
     }
 
     #[test]
-    fn tree_context_menu_on_subfolder_offers_rename_and_delete_only() {
+    fn tree_context_menu_on_subfolder_offers_cut_copy_rename_delete() {
         let tmp = tempfile::tempdir().unwrap();
         let d = tmp.path().join("sub");
         std::fs::create_dir(&d).unwrap();
         let n = dir_node(&d);
-        let items = build_tree_context_menu_items(Some(&n), tmp.path());
+        let target = d.clone();
+        let items = build_tree_context_menu_items(
+            Some(&n),
+            tmp.path(),
+            &[d.clone()],
+            &target,
+            None,
+        );
         let labels: Vec<&str> = items.iter().map(|(s, _)| s.as_str()).collect();
-        assert_eq!(labels, ["Rename…", "Delete"]);
-        assert!(matches!(items[0].1, MenuAction::Rename(ref p) if p == &d));
-        assert!(matches!(items[1].1, MenuAction::Delete(ref p) if p == &d));
+        assert_eq!(labels, ["Cut", "Copy", "Rename…", "Delete"]);
+    }
+
+    #[test]
+    fn tree_context_menu_with_clipboard_offers_paste_on_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path().join("sub");
+        std::fs::create_dir(&d).unwrap();
+        let n = dir_node(&d);
+        let clip = ExplorerClipboard {
+            mode: ExplorerClipMode::Cut,
+            paths: vec![tmp.path().join("a.txt")],
+        };
+        let items = build_tree_context_menu_items(
+            Some(&n),
+            tmp.path(),
+            &[d.clone()],
+            &d,
+            Some(&clip),
+        );
+        let labels: Vec<&str> = items.iter().map(|(s, _)| s.as_str()).collect();
+        assert_eq!(labels, ["Cut", "Copy", "Paste", "Rename…", "Delete"]);
+    }
+
+    #[test]
+    fn tree_context_menu_with_multi_selection_promotes_delete_count() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("hello.txt");
+        std::fs::write(&f, "hi").unwrap();
+        let f2 = tmp.path().join("bye.txt");
+        std::fs::write(&f2, "bye").unwrap();
+        let n = file_node(&f);
+        let target = f.parent().unwrap().to_path_buf();
+        let items = build_tree_context_menu_items(
+            Some(&n),
+            tmp.path(),
+            &[f.clone(), f2.clone()],
+            &target,
+            None,
+        );
+        let labels: Vec<&str> = items.iter().map(|(s, _)| s.as_str()).collect();
+        assert_eq!(labels, ["Cut", "Copy", "Delete 2 items"]);
     }
 
     #[test]
     fn tree_context_menu_on_empty_space_offers_new_file_and_new_folder_only() {
         let tmp = tempfile::tempdir().unwrap();
-        let items = build_tree_context_menu_items(None, tmp.path());
+        let items = build_tree_context_menu_items(
+            None,
+            tmp.path(),
+            &[],
+            tmp.path(),
+            None,
+        );
         let labels: Vec<&str> = items.iter().map(|(s, _)| s.as_str()).collect();
         assert_eq!(labels, ["New File…", "New Folder…"]);
         assert!(matches!(items[0].1, MenuAction::Create(CreateKind::File)));
         assert!(matches!(items[1].1, MenuAction::Create(CreateKind::Folder)));
+    }
+
+    #[test]
+    fn tree_context_menu_on_empty_space_includes_paste_when_clipboard_set() {
+        let tmp = tempfile::tempdir().unwrap();
+        let clip = ExplorerClipboard {
+            mode: ExplorerClipMode::Copy,
+            paths: vec![tmp.path().join("x.txt")],
+        };
+        let items = build_tree_context_menu_items(
+            None,
+            tmp.path(),
+            &[],
+            tmp.path(),
+            Some(&clip),
+        );
+        let labels: Vec<&str> = items.iter().map(|(s, _)| s.as_str()).collect();
+        assert_eq!(labels, ["New File…", "New Folder…", "Paste"]);
     }
 
     #[test]
@@ -3967,7 +4533,13 @@ mod tests {
         // (the root cannot be renamed or moved to trash from inside croft).
         let tmp = tempfile::tempdir().unwrap();
         let n = dir_node(tmp.path());
-        let items = build_tree_context_menu_items(Some(&n), tmp.path());
+        let items = build_tree_context_menu_items(
+            Some(&n),
+            tmp.path(),
+            &[],
+            tmp.path(),
+            None,
+        );
         let labels: Vec<&str> = items.iter().map(|(s, _)| s.as_str()).collect();
         assert_eq!(labels, ["New File…", "New Folder…"]);
     }
@@ -4298,6 +4870,360 @@ mod tests {
         app.handle_search_key(key(KeyCode::Char('a'), KeyModifiers::SUPER));
         app.handle_search_key(key(KeyCode::Char('z'), KeyModifiers::NONE));
         assert_eq!(app.search.query, "z");
+    }
+
+    #[test]
+    fn shift_arrow_extends_tree_selection() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("a.txt"), "").unwrap();
+        std::fs::write(tmp.path().join("b.txt"), "").unwrap();
+        std::fs::write(tmp.path().join("c.txt"), "").unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.tree.select_replace(1);
+        app.handle_tree_key(key(KeyCode::Down, KeyModifiers::SHIFT));
+        app.handle_tree_key(key(KeyCode::Down, KeyModifiers::SHIFT));
+        assert_eq!(app.tree.action_paths().len(), 3);
+    }
+
+    #[test]
+    fn cmd_a_in_tree_marks_all_visible() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("a.txt"), "").unwrap();
+        std::fs::write(tmp.path().join("b.txt"), "").unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.handle_tree_key(key(KeyCode::Char('a'), KeyModifiers::SUPER));
+        assert_eq!(app.tree.marked.len(), app.tree.nodes.len());
+    }
+
+    #[test]
+    fn esc_in_tree_clears_marks() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("a.txt"), "").unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.tree.toggle_mark(1);
+        assert!(!app.tree.marked.is_empty());
+        app.handle_tree_key(key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.tree.marked.is_empty());
+    }
+
+    #[test]
+    fn cmd_c_then_cmd_v_copies_explorer_paths_into_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("src.txt"), "hello").unwrap();
+        std::fs::create_dir(tmp.path().join("dest")).unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        let src_idx = app
+            .tree
+            .nodes
+            .iter()
+            .position(|n| n.path.ends_with("src.txt"))
+            .unwrap();
+        app.tree.select_replace(src_idx);
+        app.handle_tree_key(key(KeyCode::Char('c'), KeyModifiers::SUPER));
+        let dest_idx = app
+            .tree
+            .nodes
+            .iter()
+            .position(|n| n.path.ends_with("dest"))
+            .unwrap();
+        app.tree.select_replace(dest_idx);
+        app.handle_tree_key(key(KeyCode::Char('v'), KeyModifiers::SUPER));
+        let dest_file = tmp.path().join("dest/src.txt");
+        assert!(dest_file.exists(), "copy must place file in target dir");
+        assert!(
+            tmp.path().join("src.txt").exists(),
+            "copy must keep the source"
+        );
+    }
+
+    #[test]
+    fn cmd_x_then_cmd_v_moves_explorer_paths_into_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("src.txt"), "hello").unwrap();
+        std::fs::create_dir(tmp.path().join("dest")).unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        let src_idx = app
+            .tree
+            .nodes
+            .iter()
+            .position(|n| n.path.ends_with("src.txt"))
+            .unwrap();
+        app.tree.select_replace(src_idx);
+        app.handle_tree_key(key(KeyCode::Char('x'), KeyModifiers::SUPER));
+        let dest_idx = app
+            .tree
+            .nodes
+            .iter()
+            .position(|n| n.path.ends_with("dest"))
+            .unwrap();
+        app.tree.select_replace(dest_idx);
+        app.handle_tree_key(key(KeyCode::Char('v'), KeyModifiers::SUPER));
+        assert!(tmp.path().join("dest/src.txt").exists());
+        assert!(
+            !tmp.path().join("src.txt").exists(),
+            "cut must remove source"
+        );
+        assert!(
+            app.tree_clipboard.is_none(),
+            "cut clipboard must be consumed on paste"
+        );
+    }
+
+    #[test]
+    fn delete_key_trashes_every_marked_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("a.txt"), "").unwrap();
+        std::fs::write(tmp.path().join("b.txt"), "").unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        let a_idx = app
+            .tree
+            .nodes
+            .iter()
+            .position(|n| n.path.ends_with("a.txt"))
+            .unwrap();
+        let b_idx = app
+            .tree
+            .nodes
+            .iter()
+            .position(|n| n.path.ends_with("b.txt"))
+            .unwrap();
+        app.tree.select_replace(a_idx);
+        app.tree.toggle_mark(b_idx);
+        app.handle_tree_key(key(KeyCode::Delete, KeyModifiers::NONE));
+        assert!(!tmp.path().join("a.txt").exists());
+        assert!(!tmp.path().join("b.txt").exists());
+    }
+
+    #[test]
+    fn drag_drop_moves_marked_paths_to_target_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("src.txt"), "x").unwrap();
+        std::fs::create_dir(tmp.path().join("dest")).unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.tree.last_area = Rect { x: 0, y: 0, width: 40, height: 8 };
+        app.tree.last_inner = Rect { x: 1, y: 1, width: 38, height: 6 };
+        let src_idx = app
+            .tree
+            .nodes
+            .iter()
+            .position(|n| n.path.ends_with("src.txt"))
+            .unwrap();
+        let dest_idx = app
+            .tree
+            .nodes
+            .iter()
+            .position(|n| n.path.ends_with("dest"))
+            .unwrap();
+        let src_row = app.tree.last_inner.y + src_idx as u16;
+        let dest_row = app.tree.last_inner.y + dest_idx as u16;
+        app.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: 6,
+            row: src_row,
+            modifiers: KeyModifiers::NONE,
+        });
+        app.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+            column: 6,
+            row: dest_row,
+            modifiers: KeyModifiers::NONE,
+        });
+        app.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
+            column: 6,
+            row: dest_row,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(tmp.path().join("dest/src.txt").exists());
+        assert!(!tmp.path().join("src.txt").exists());
+    }
+
+    #[test]
+    fn alt_drag_copies_instead_of_moves() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("src.txt"), "x").unwrap();
+        std::fs::create_dir(tmp.path().join("dest")).unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.tree.last_area = Rect { x: 0, y: 0, width: 40, height: 8 };
+        app.tree.last_inner = Rect { x: 1, y: 1, width: 38, height: 6 };
+        let src_idx = app
+            .tree
+            .nodes
+            .iter()
+            .position(|n| n.path.ends_with("src.txt"))
+            .unwrap();
+        let dest_idx = app
+            .tree
+            .nodes
+            .iter()
+            .position(|n| n.path.ends_with("dest"))
+            .unwrap();
+        let src_row = app.tree.last_inner.y + src_idx as u16;
+        let dest_row = app.tree.last_inner.y + dest_idx as u16;
+        app.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: 6,
+            row: src_row,
+            modifiers: KeyModifiers::NONE,
+        });
+        app.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+            column: 6,
+            row: dest_row,
+            modifiers: KeyModifiers::ALT,
+        });
+        app.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
+            column: 6,
+            row: dest_row,
+            modifiers: KeyModifiers::ALT,
+        });
+        assert!(tmp.path().join("dest/src.txt").exists());
+        assert!(
+            tmp.path().join("src.txt").exists(),
+            "Alt-drag must keep the source"
+        );
+    }
+
+    #[test]
+    fn shift_click_extends_marks_from_anchor() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("a.txt"), "").unwrap();
+        std::fs::write(tmp.path().join("b.txt"), "").unwrap();
+        std::fs::write(tmp.path().join("c.txt"), "").unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.tree.last_area = Rect { x: 0, y: 0, width: 40, height: 8 };
+        app.tree.last_inner = Rect { x: 1, y: 1, width: 38, height: 6 };
+        let first_idx = 1usize;
+        let last_idx = app.tree.nodes.len() - 1;
+        let first_row = app.tree.last_inner.y + first_idx as u16;
+        let last_row = app.tree.last_inner.y + last_idx as u16;
+        app.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: 6,
+            row: first_row,
+            modifiers: KeyModifiers::NONE,
+        });
+        app.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
+            column: 6,
+            row: first_row,
+            modifiers: KeyModifiers::NONE,
+        });
+        app.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: 6,
+            row: last_row,
+            modifiers: KeyModifiers::SHIFT,
+        });
+        let span = last_idx - first_idx + 1;
+        assert_eq!(app.tree.action_paths().len(), span);
+    }
+
+    #[test]
+    fn alt_click_toggles_individual_mark_on_release() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("a.txt"), "").unwrap();
+        std::fs::write(tmp.path().join("b.txt"), "").unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.tree.last_area = Rect { x: 0, y: 0, width: 40, height: 8 };
+        app.tree.last_inner = Rect { x: 1, y: 1, width: 38, height: 6 };
+        let a_idx = app
+            .tree
+            .nodes
+            .iter()
+            .position(|n| n.path.ends_with("a.txt"))
+            .unwrap();
+        let b_idx = app
+            .tree
+            .nodes
+            .iter()
+            .position(|n| n.path.ends_with("b.txt"))
+            .unwrap();
+        let a_row = app.tree.last_inner.y + a_idx as u16;
+        let b_row = app.tree.last_inner.y + b_idx as u16;
+        for row in [a_row, b_row] {
+            app.handle_mouse(crossterm::event::MouseEvent {
+                kind: crossterm::event::MouseEventKind::Down(
+                    crossterm::event::MouseButton::Left,
+                ),
+                column: 6,
+                row,
+                modifiers: KeyModifiers::ALT,
+            });
+            app.handle_mouse(crossterm::event::MouseEvent {
+                kind: crossterm::event::MouseEventKind::Up(
+                    crossterm::event::MouseButton::Left,
+                ),
+                column: 6,
+                row,
+                modifiers: KeyModifiers::ALT,
+            });
+        }
+        let marked: BTreeSet<PathBuf> = app.tree.marked.clone();
+        assert!(marked.contains(&tmp.path().join("a.txt")));
+        assert!(marked.contains(&tmp.path().join("b.txt")));
+    }
+
+    #[test]
+    fn ctrl_click_also_toggles_individual_mark() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("a.txt"), "").unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.tree.last_area = Rect { x: 0, y: 0, width: 40, height: 8 };
+        app.tree.last_inner = Rect { x: 1, y: 1, width: 38, height: 6 };
+        let a_idx = app
+            .tree
+            .nodes
+            .iter()
+            .position(|n| n.path.ends_with("a.txt"))
+            .unwrap();
+        let row = app.tree.last_inner.y + a_idx as u16;
+        app.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: 6,
+            row,
+            modifiers: KeyModifiers::CONTROL,
+        });
+        app.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
+            column: 6,
+            row,
+            modifiers: KeyModifiers::CONTROL,
+        });
+        assert!(app.tree.marked.contains(&tmp.path().join("a.txt")));
+    }
+
+    #[test]
+    fn alt_click_does_not_open_the_file() {
+        // Toggle is meant to mark — never to open. The deferred-toggle flow
+        // must not reach `editor.open_preview` when Alt/Ctrl is held.
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("a.txt");
+        std::fs::write(&f, "hi").unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.tree.last_area = Rect { x: 0, y: 0, width: 40, height: 8 };
+        app.tree.last_inner = Rect { x: 1, y: 1, width: 38, height: 6 };
+        let idx = app
+            .tree
+            .nodes
+            .iter()
+            .position(|n| n.path == f)
+            .unwrap();
+        let row = app.tree.last_inner.y + idx as u16;
+        app.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: 6,
+            row,
+            modifiers: KeyModifiers::ALT,
+        });
+        app.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
+            column: 6,
+            row,
+            modifiers: KeyModifiers::ALT,
+        });
+        assert!(app.editor.is_blank_initial(), "alt-click must not open the file");
     }
 }
 
