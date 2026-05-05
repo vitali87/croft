@@ -7,6 +7,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Widget},
 };
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 pub struct Node {
@@ -108,6 +109,33 @@ impl FileTree {
         self.nodes[idx].loaded = true;
     }
 
+    fn load_children_preserving_expansion(
+        &mut self,
+        idx: usize,
+        expanded_paths: &BTreeSet<PathBuf>,
+    ) {
+        self.load_children(idx);
+        let child_depth = self.nodes[idx].depth + 1;
+        let mut child = idx + 1;
+        while child < self.nodes.len() {
+            if self.nodes[child].depth < child_depth {
+                break;
+            }
+            if self.nodes[child].depth > child_depth {
+                child += 1;
+                continue;
+            }
+            if self.nodes[child].is_dir && expanded_paths.contains(&self.nodes[child].path) {
+                self.nodes[child].expanded = true;
+                self.load_children_preserving_expansion(child, expanded_paths);
+            }
+            child += 1;
+            while child < self.nodes.len() && self.nodes[child].depth > child_depth {
+                child += 1;
+            }
+        }
+    }
+
     fn collapse(&mut self, idx: usize) {
         let depth = self.nodes[idx].depth;
         self.nodes[idx].expanded = false;
@@ -206,6 +234,23 @@ impl FileTree {
         }
     }
 
+    pub fn expand_selected(&mut self) {
+        let idx = self.selected;
+        if idx >= self.nodes.len() || !self.nodes[idx].is_dir || self.nodes[idx].expanded {
+            return;
+        }
+        self.nodes[idx].expanded = true;
+        self.load_children(idx);
+    }
+
+    pub fn collapse_selected(&mut self) {
+        let idx = self.selected;
+        if idx >= self.nodes.len() || !self.nodes[idx].is_dir || !self.nodes[idx].expanded {
+            return;
+        }
+        self.collapse(idx);
+    }
+
     pub fn selected_path(&self) -> Option<&Path> {
         self.nodes.get(self.selected).map(|n| n.path.as_path())
     }
@@ -225,10 +270,22 @@ impl FileTree {
         while end < self.nodes.len() && self.nodes[end].depth > depth {
             end += 1;
         }
+        let expanded_paths: BTreeSet<PathBuf> = self.nodes[(idx + 1)..end]
+            .iter()
+            .filter(|n| n.is_dir && n.expanded)
+            .map(|n| n.path.clone())
+            .collect();
+        let selected_path = self.selected_path().map(Path::to_path_buf);
         self.nodes.drain((idx + 1)..end);
         self.nodes[idx].loaded = false;
         if self.nodes[idx].expanded {
-            self.load_children(idx);
+            self.load_children_preserving_expansion(idx, &expanded_paths);
+        }
+        if let Some(path) = selected_path {
+            if let Some(new_idx) = self.nodes.iter().position(|n| n.path == path) {
+                self.selected = new_idx;
+                return;
+            }
         }
         if self.selected >= self.nodes.len() {
             self.selected = self.nodes.len().saturating_sub(1);
@@ -515,6 +572,30 @@ mod tests {
         assert!(collapsed.is_none());
         assert!(!tree.nodes[1].expanded);
         assert_eq!(tree.nodes.len(), total_before);
+    }
+
+    #[test]
+    fn expand_selected_does_not_collapse_open_directory() {
+        let (_tmp, mut tree) = fixture();
+        tree.selected = 1;
+        tree.expand_selected();
+        let expanded_len = tree.nodes.len();
+
+        tree.expand_selected();
+
+        assert!(tree.nodes[1].expanded);
+        assert_eq!(tree.nodes.len(), expanded_len);
+    }
+
+    #[test]
+    fn collapse_selected_does_not_expand_closed_directory() {
+        let (_tmp, mut tree) = fixture();
+        tree.selected = 1;
+
+        tree.collapse_selected();
+
+        assert!(!tree.nodes[1].expanded);
+        assert_eq!(tree.nodes.len(), 4);
     }
 
     #[test]
@@ -816,6 +897,35 @@ mod tests {
         assert!(
             !tree.nodes[sub_idx].expanded,
             "refresh_children must not re-expand a folder the user collapsed"
+        );
+    }
+
+    #[test]
+    fn refresh_children_preserves_expanded_descendants_when_parent_refreshes() {
+        let (_tmp, mut tree) = fixture();
+        tree.selected = 1;
+        tree.activate();
+        let src_path = tree.nodes[1].path.clone();
+        assert!(tree.nodes[1].expanded);
+        assert!(
+            tree.nodes.iter().any(|n| n.path.ends_with("src/lib.rs")),
+            "precondition: expanded child should be visible"
+        );
+
+        tree.refresh_children(0);
+
+        let src_idx = tree
+            .nodes
+            .iter()
+            .position(|n| n.path == src_path)
+            .expect("src should still be present");
+        assert!(
+            tree.nodes[src_idx].expanded,
+            "expanded child directory should survive a root refresh"
+        );
+        assert!(
+            tree.nodes.iter().any(|n| n.path.ends_with("src/lib.rs")),
+            "expanded descendant children should be reloaded after parent refresh"
         );
     }
 

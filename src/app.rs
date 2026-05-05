@@ -344,6 +344,10 @@ pub struct App {
     /// the image bleeds through under the editor. `consume_welcome_image_clear`
     /// returns true once when this needs to be wiped.
     welcome_image_displayed: bool,
+    /// One-shot request to clear the cached welcome image while the welcome
+    /// pane is still visible. This is needed when async recents or a resize
+    /// move the logo; otherwise iTerm keeps the old image cached too.
+    welcome_image_clear_requested: bool,
     /// Pixel size of one terminal cell, captured in `init_graphics`.
     /// Required to bake OSC-1337 images at exact viewport pixel size so
     /// iTerm draws them with no stretching or letterboxing.
@@ -618,6 +622,7 @@ impl App {
             welcome_layout: None,
             welcome_overlay_dirty: true,
             welcome_image_displayed: false,
+            welcome_image_clear_requested: false,
             cell_pixel: None,
             clipboard_reader: read_system_clipboard,
             fs_poll_last_check: std::time::Instant::now(),
@@ -1000,6 +1005,9 @@ impl App {
                 self.recent_repo_remote = commits.remote;
                 self.recent_commits = commits.commits;
                 self.recent_commits_rx = None;
+                if self.editor.is_blank_initial() && self.welcome_image_displayed {
+                    self.welcome_image_clear_requested = true;
+                }
                 self.welcome_overlay_dirty = true;
                 true
             }
@@ -1092,8 +1100,11 @@ impl App {
     /// invalidating the prev buffer so ratatui repaints every cell on the
     /// next draw, wiping iTerm's image cache for the welcome region.
     pub fn consume_welcome_image_clear(&mut self) -> bool {
-        if self.welcome_image_displayed && !self.editor.is_blank_initial() {
+        if self.welcome_image_clear_requested
+            || (self.welcome_image_displayed && !self.editor.is_blank_initial())
+        {
             self.welcome_image_displayed = false;
+            self.welcome_image_clear_requested = false;
             true
         } else {
             false
@@ -1166,6 +1177,9 @@ impl App {
         // startup. Both surfaces therefore display the same physical
         // pixel pair-for-pair.
         if self.welcome_layout != Some(desired) {
+            if self.welcome_image_displayed {
+                self.welcome_image_clear_requested = true;
+            }
             if let Some((cw, ch)) = self.cell_pixel {
                 let canvas_w = (logo_w_cells as u32) * cw;
                 let canvas_h = (logo_h_cells as u32) * ch;
@@ -1924,7 +1938,7 @@ impl App {
             KeyCode::PageDown => self.tree.page_down(10),
             KeyCode::Home => self.tree.home(),
             KeyCode::End => self.tree.end(),
-            KeyCode::Enter | KeyCode::Right => {
+            KeyCode::Enter => {
                 if let Some(path) = self.tree.activate() {
                     // Ctrl+Enter is the primary "open in new tab" gesture — it
                     // reaches the app on every terminal. Cmd+Enter is also
@@ -1954,9 +1968,29 @@ impl App {
                     }
                 }
             }
+            KeyCode::Right => {
+                let selected_is_dir = self
+                    .tree
+                    .nodes
+                    .get(self.tree.selected)
+                    .is_some_and(|node| node.is_dir);
+                if selected_is_dir {
+                    self.tree.expand_selected();
+                } else if let Some(path) = self.tree.activate() {
+                    let result = self.editor.open_preview(&path);
+                    match result {
+                        Ok(()) => {
+                            self.sync_open_file_poll_mtime();
+                            self.status = self.editor.status.clone();
+                        }
+                        Err(e) => {
+                            self.status = format!("Error: {e}");
+                        }
+                    }
+                }
+            }
             KeyCode::Left => {
-                // collapse if dir, otherwise move to parent (simple approach: just collapse)
-                self.tree.activate();
+                self.tree.collapse_selected();
             }
             _ => {}
         }
@@ -2394,6 +2428,15 @@ impl App {
                                     && m.column.abs_diff(x) <= 1
                                     && now.duration_since(t) <= DOUBLE_CLICK_WINDOW
                         );
+                        let clicked_is_dir = self
+                            .tree
+                            .nodes
+                            .get(idx)
+                            .is_some_and(|node| node.is_dir);
+                        if clicked_is_dir && is_double {
+                            self.last_tree_left_down = None;
+                            return;
+                        }
                         if let Some(path) = self.tree.activate() {
                             let result = if is_double {
                                 self.editor.open_pinned(&path)
@@ -3896,6 +3939,18 @@ mod tests {
     }
 
     #[test]
+    fn consume_welcome_image_clear_handles_reposition_request_while_blank() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.welcome_image_displayed = true;
+        app.welcome_image_clear_requested = true;
+
+        assert!(app.consume_welcome_image_clear());
+        assert!(!app.welcome_image_displayed);
+        assert!(!app.welcome_image_clear_requested);
+    }
+
+    #[test]
     fn consume_welcome_image_clear_is_noop_when_image_was_never_shown() {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(tmp.path().to_path_buf()).unwrap();
@@ -4190,6 +4245,51 @@ mod tests {
     }
 
     #[test]
+    fn double_clicking_directory_toggles_only_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("sub")).unwrap();
+        std::fs::write(tmp.path().join("sub").join("child.txt"), "hi").unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.tree.last_area = Rect { x: 0, y: 0, width: 40, height: 8 };
+        app.tree.last_inner = Rect { x: 1, y: 1, width: 38, height: 6 };
+        let sub_idx = app
+            .tree
+            .nodes
+            .iter()
+            .position(|node| node.path.ends_with("sub"))
+            .unwrap();
+        let row = app.tree.last_inner.y + sub_idx as u16;
+        let click = crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(
+                crossterm::event::MouseButton::Left,
+            ),
+            column: 6,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        app.handle_mouse(click);
+        let sub_idx = app
+            .tree
+            .nodes
+            .iter()
+            .position(|node| node.path.ends_with("sub"))
+            .unwrap();
+        assert!(app.tree.nodes[sub_idx].expanded);
+        let expanded_len = app.tree.nodes.len();
+
+        app.handle_mouse(click);
+        let sub_idx = app
+            .tree
+            .nodes
+            .iter()
+            .position(|node| node.path.ends_with("sub"))
+            .unwrap();
+        assert!(app.tree.nodes[sub_idx].expanded);
+        assert_eq!(app.tree.nodes.len(), expanded_len);
+    }
+
+    #[test]
     fn typing_after_select_all_replaces_query() {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(tmp.path().to_path_buf()).unwrap();
@@ -4318,6 +4418,13 @@ fn main_loop(
             terminal.draw(|f| {
                 app.render(f);
             })?;
+            if app.consume_welcome_image_clear() {
+                terminal.clear()?;
+                app.activity_overlay_dirty = true;
+                terminal.draw(|f| {
+                    app.render(f);
+                })?;
+            }
             // After ratatui flushes its diff, paint the activity-bar icons
             // directly via OSC-1337 on every redraw. We previously gated
             // this on a `dirty` flag and only re-emitted on resize / view
