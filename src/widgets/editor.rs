@@ -15,6 +15,85 @@ use crate::highlight::{
 use crate::widgets::scrollbar;
 
 const MAX_FILE_BYTES: u64 = 5 * 1024 * 1024;
+const MAX_IMAGE_BYTES: u64 = 25 * 1024 * 1024;
+const IMAGE_EXTENSIONS: &[&str] =
+    &["png", "jpg", "jpeg", "gif", "bmp", "webp"];
+
+/// Read-only image preview attached to a tab. Holds the raw file bytes so
+/// the OSC-1337 inline-image bake can re-fit on resize without rereading
+/// from disk, plus parsed metadata for the header line that's painted in
+/// the buffer (so non-image-capable terminals still see meaningful info).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImageView {
+    pub bytes: Vec<u8>,
+    pub format_label: String,
+    pub pixel_w: u32,
+    pub pixel_h: u32,
+    pub byte_size: u64,
+}
+
+fn render_image_placeholder(
+    image: &ImageView,
+    path: Option<&Path>,
+    inner: Rect,
+    buf: &mut Buffer,
+) {
+    // Solid bg fill so the OSC-1337 inline image (emitted post-frame on
+    // capable terminals) sits on a clean canvas; on non-capable terminals
+    // the metadata header below is the only content the user sees.
+    let bg_style = Style::default().bg(Color::Rgb(0x1e, 0x22, 0x2e));
+    for y in inner.y..inner.y + inner.height {
+        for x in inner.x..inner.x + inner.width {
+            buf[(x, y)].set_style(bg_style);
+            buf[(x, y)].set_symbol(" ");
+        }
+    }
+    let name = path
+        .and_then(|p| p.file_name())
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| String::from("(unnamed image)"));
+    let header = format!(
+        " {} · {}×{} · {} · {} ",
+        name,
+        image.pixel_w,
+        image.pixel_h,
+        format_bytes_human(image.byte_size),
+        image.format_label,
+    );
+    buf.set_string(
+        inner.x,
+        inner.y,
+        &header,
+        Style::default()
+            .fg(Color::White)
+            .bg(Color::Rgb(0x09, 0x4d, 0x77))
+            .add_modifier(Modifier::BOLD),
+    );
+}
+
+fn format_bytes_human(n: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    if n >= MB {
+        format!("{:.1} MB", n as f64 / MB as f64)
+    } else if n >= KB {
+        format!("{:.1} KB", n as f64 / KB as f64)
+    } else {
+        format!("{n} B")
+    }
+}
+
+pub fn extension_is_image(ext: &str) -> bool {
+    let lc = ext.to_ascii_lowercase();
+    IMAGE_EXTENSIONS.iter().any(|e| *e == lc)
+}
+
+pub fn image_format_label_from_ext(ext: &str) -> String {
+    match ext.to_ascii_lowercase().as_str() {
+        "jpg" | "jpeg" => "JPEG".to_string(),
+        other => other.to_ascii_uppercase(),
+    }
+}
 
 /// Inclusive char-indexed range `(row, col)` anchor and head, where head
 /// follows the cursor as the user drags / shift-arrows.  `normalised()` returns
@@ -101,6 +180,12 @@ pub struct Editor {
     /// so the editor's yellow highlight stays consistent with what the
     /// search panel claims is a match.
     pub search_highlight_opts: crate::widgets::search::SearchOpts,
+    /// Some when this tab is a read-only image preview rather than a text
+    /// buffer. The text fields (`lines`, undo, highlights, …) are left in
+    /// their default empty state and the renderer paints metadata only;
+    /// the actual pixels are emitted as an OSC-1337 inline image overlay
+    /// by `App` after each frame.
+    pub image: Option<ImageView>,
 }
 
 impl Editor {
@@ -127,6 +212,7 @@ impl Editor {
             registry: LangRegistry::new(),
             search_highlight: None,
             search_highlight_opts: crate::widgets::search::SearchOpts::default(),
+            image: None,
         }
     }
 
@@ -135,6 +221,10 @@ impl Editor {
     }
 
     pub fn open(&mut self, path: &Path) -> Result<()> {
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        if extension_is_image(ext) {
+            return self.open_image(path);
+        }
         let meta = std::fs::metadata(path)?;
         if meta.len() > MAX_FILE_BYTES {
             anyhow::bail!("File too large ({} bytes)", meta.len());
@@ -160,8 +250,42 @@ impl Editor {
         self.selection = None;
         self.undo_stack.clear();
         self.last_edit_kind = None;
+        self.image = None;
         self.status = format!("Opened {}", path.display());
         self.recompute_highlights();
+        Ok(())
+    }
+
+    fn open_image(&mut self, path: &Path) -> Result<()> {
+        let meta = std::fs::metadata(path)?;
+        if meta.len() > MAX_IMAGE_BYTES {
+            anyhow::bail!("Image too large ({} bytes)", meta.len());
+        }
+        let bytes = std::fs::read(path)?;
+        let (pixel_w, pixel_h) = image::load_from_memory(&bytes)
+            .map(|img| (img.width(), img.height()))
+            .map_err(|e| anyhow::anyhow!("Could not decode image: {e}"))?;
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        let format_label = image_format_label_from_ext(ext);
+        self.path = Some(path.to_path_buf());
+        self.lines = vec![String::new()];
+        self.lang = None;
+        self.scroll = 0;
+        self.cursor_row = 0;
+        self.cursor_col = 0;
+        self.dirty = false;
+        self.selection = None;
+        self.undo_stack.clear();
+        self.last_edit_kind = None;
+        self.highlights = vec![Vec::new()];
+        self.image = Some(ImageView {
+            bytes,
+            format_label,
+            pixel_w,
+            pixel_h,
+            byte_size: meta.len(),
+        });
+        self.status = format!("Opened image {}", path.display());
         Ok(())
     }
 
@@ -1094,6 +1218,62 @@ mod tests {
         assert_eq!(e.cursor_row, 0);
         assert_eq!(e.cursor_col, 0);
         assert!(!e.dirty);
+    }
+
+    #[test]
+    fn open_png_populates_image_view_and_skips_text_buffer() {
+        // 1×1 transparent PNG, hand-crafted via the image crate.
+        let img: image::RgbaImage = image::ImageBuffer::from_pixel(1, 1, image::Rgba([0, 0, 0, 0]));
+        let mut buf: Vec<u8> = Vec::new();
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pic.png");
+        std::fs::write(&path, &buf).unwrap();
+        let mut e = Editor::new();
+        e.open(&path).unwrap();
+        let img = e.image.as_ref().expect("image-mode tab");
+        assert_eq!(img.pixel_w, 1);
+        assert_eq!(img.pixel_h, 1);
+        assert_eq!(img.format_label, "PNG");
+        // Text scaffolding should be inert.
+        assert_eq!(e.lines, vec![String::new()]);
+        assert!(e.path.is_some());
+        assert!(e.lang.is_none());
+        assert!(!e.dirty);
+    }
+
+    #[test]
+    fn extension_is_image_recognises_common_formats() {
+        for ext in ["png", "PNG", "jpg", "jpeg", "JPEG", "gif", "bmp", "webp"] {
+            assert!(extension_is_image(ext), "should recognise: {ext}");
+        }
+        for ext in ["txt", "rs", "md", "py", ""] {
+            assert!(!extension_is_image(ext), "should not recognise: {ext}");
+        }
+    }
+
+    #[test]
+    fn open_unrecognised_file_after_image_clears_image_view() {
+        // Open an image, then a text file in the same Editor — `image`
+        // must reset so the text-rendering path comes back.
+        let img: image::RgbaImage = image::ImageBuffer::from_pixel(1, 1, image::Rgba([0, 0, 0, 0]));
+        let mut buf: Vec<u8> = Vec::new();
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let img_path = dir.path().join("pic.png");
+        std::fs::write(&img_path, &buf).unwrap();
+        let txt_path = dir.path().join("hi.txt");
+        std::fs::write(&txt_path, "hi\n").unwrap();
+        let mut e = Editor::new();
+        e.open(&img_path).unwrap();
+        assert!(e.image.is_some());
+        e.open(&txt_path).unwrap();
+        assert!(e.image.is_none());
+        assert_eq!(e.lines, vec!["hi".to_string()]);
     }
 
     #[test]
@@ -2116,6 +2296,10 @@ impl Widget for &mut Editor {
 
         let height = inner.height as usize;
         if height == 0 {
+            return;
+        }
+        if let Some(image) = self.image.as_ref() {
+            render_image_placeholder(image, self.path.as_deref(), inner, buf);
             return;
         }
         if self.cursor_row < self.scroll {

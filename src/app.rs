@@ -467,6 +467,32 @@ pub struct App {
     /// every render so a splitter drag can clamp to the live viewport.
     last_content_width: u16,
     last_content_height: u16,
+    /// Pre-encoded OSC-1337 escape carrying a fitted PNG of the active
+    /// image-preview tab. Re-baked when the tab path or its target cell
+    /// rect changes; emitted post-frame the same way the welcome wordmark
+    /// is. None when the active tab is text.
+    editor_image_osc: Option<String>,
+    /// Cell rectangle the OSC was last baked at: (x, y, w, h, path-key).
+    /// Drives the "needs re-bake" check and tells the post-frame writer
+    /// where to position the cursor before sending the escape.
+    editor_image_layout: Option<EditorImageLayout>,
+    /// True from the moment we send the OSC bytes to iTerm until we
+    /// explicitly clear them; gates the redraw-clearing so we don't keep
+    /// re-emitting the same image every tick.
+    editor_image_displayed: bool,
+    /// One-shot request to wipe the cached image cells (set when the user
+    /// switches to a non-image tab, closes the image, or the editor area
+    /// shrinks).
+    editor_image_clear_requested: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EditorImageLayout {
+    pub cell_x: u16,
+    pub cell_y: u16,
+    pub cell_w: u16,
+    pub cell_h: u16,
+    pub path: PathBuf,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -755,6 +781,10 @@ impl App {
             terminal_splitter_y: None,
             last_content_width: 0,
             last_content_height: 0,
+            editor_image_osc: None,
+            editor_image_layout: None,
+            editor_image_displayed: false,
+            editor_image_clear_requested: false,
         })
     }
 
@@ -1726,6 +1756,7 @@ impl App {
             // occupied; if the user reopens the welcome screen we'll need
             // to re-emit it.
             self.welcome_overlay_dirty = true;
+            self.update_editor_image_overlay(editor_area);
         }
         if let Some(area) = terminal_area {
             frame.render_widget(&mut self.terminal, area);
@@ -2230,6 +2261,12 @@ impl App {
     }
 
     fn handle_editor_key(&mut self, key: KeyEvent) {
+        // Image preview tabs are read-only. Swallow all keys here so a
+        // stray keystroke can't insert characters into a buffer the user
+        // can't see.
+        if self.editor.image.is_some() {
+            return;
+        }
         // Clipboard gestures take precedence over text input. They never
         // conflict with normal typing (Ctrl/Cmd + C/X/A) so the order is
         // safe even when the user is in the middle of editing.
@@ -3106,6 +3143,118 @@ impl App {
             }
             MenuAction::Paste(dest) => self.paste_into(dest),
         }
+    }
+
+    /// Bake an OSC-1337 inline-image escape sized to the editor pane so
+    /// the active image tab can be painted on top of ratatui's text
+    /// buffer. Skipped when the active tab is text or when the host
+    /// terminal can't render inline images (Terminal.app, raw SSH); in
+    /// those cases the metadata header line painted by the editor widget
+    /// is the entire preview the user sees.
+    fn update_editor_image_overlay(&mut self, editor_area: Rect) {
+        let Some(image) = self.editor.image.clone() else {
+            self.disable_editor_image();
+            return;
+        };
+        let path = match self.editor.path.clone() {
+            Some(p) => p,
+            None => {
+                self.disable_editor_image();
+                return;
+            }
+        };
+        if !crate::iterm2_inline::detect_iterm2_inline_support() {
+            self.disable_editor_image();
+            return;
+        }
+        let Some((cw_px, ch_px)) = self.cell_pixel else {
+            return;
+        };
+        // The editor widget paints its own 1-cell border + a 1-row header
+        // strip; the EditorTabs widget paints a 1-row tab strip above
+        // that. Carve those off before baking the image so the OSC
+        // doesn't bleed over the labels.
+        let tab_strip = 1u16;
+        let border = 1u16;
+        let header = 1u16;
+        if editor_area.height < tab_strip + 2 * border + header + 2
+            || editor_area.width < 2 * border + 4
+        {
+            self.disable_editor_image();
+            return;
+        }
+        let cell_x = editor_area.x + border;
+        let cell_y = editor_area.y + tab_strip + border + header;
+        let cell_w = editor_area.width.saturating_sub(2 * border);
+        let cell_h = editor_area
+            .height
+            .saturating_sub(tab_strip + 2 * border + header);
+        let desired = EditorImageLayout {
+            cell_x,
+            cell_y,
+            cell_w,
+            cell_h,
+            path,
+        };
+        if self.editor_image_layout.as_ref() == Some(&desired) {
+            return;
+        }
+        if self.editor_image_displayed {
+            self.editor_image_clear_requested = true;
+        }
+        let canvas_w = cell_w as u32 * cw_px;
+        let canvas_h = cell_h as u32 * ch_px;
+        let bg = image::Rgba([
+            EDITOR_BG_RGB.0,
+            EDITOR_BG_RGB.1,
+            EDITOR_BG_RGB.2,
+            0xff,
+        ]);
+        if let Ok(baked) =
+            crate::iterm2_inline::fit_image_auto(&image.bytes, canvas_w, canvas_h, bg)
+        {
+            let raw = crate::iterm2_inline::build_inline_image_osc(
+                &baked, cell_w, cell_h, false,
+            );
+            let osc = if crate::iterm2_inline::detect_tmux() {
+                crate::iterm2_inline::tmux_passthrough_wrap(&raw)
+            } else {
+                raw
+            };
+            self.editor_image_osc = Some(osc);
+            self.editor_image_layout = Some(desired);
+        }
+    }
+
+    fn disable_editor_image(&mut self) {
+        if self.editor_image_displayed {
+            self.editor_image_clear_requested = true;
+        }
+        self.editor_image_osc = None;
+        self.editor_image_layout = None;
+    }
+
+    /// Returns true if the cached editor-image cells need to be repainted
+    /// by ratatui this frame (because the user closed/switched away from
+    /// the image, or the layout changed). Called from the main loop to
+    /// force a full redraw before re-emitting.
+    pub fn consume_editor_image_clear(&mut self) -> bool {
+        if self.editor_image_clear_requested {
+            self.editor_image_clear_requested = false;
+            self.editor_image_displayed = false;
+            return true;
+        }
+        false
+    }
+
+    pub fn editor_image_payload(&self) -> Option<(&str, &EditorImageLayout)> {
+        let osc = self.editor_image_osc.as_deref()?;
+        let layout = self.editor_image_layout.as_ref()?;
+        Some((osc, layout))
+    }
+
+    pub fn mark_editor_image_displayed(&mut self) {
+        self.editor_image_displayed = true;
     }
 
     /// Resize the sidebar / terminal pane while a splitter drag is in
@@ -5598,7 +5747,7 @@ fn main_loop(
             // its cached image cells AND ratatui repaints every cell on
             // the next draw (its diff alone misses cells whose content
             // didn't change between welcome and editor buffers).
-            if app.consume_welcome_image_clear() {
+            if app.consume_welcome_image_clear() || app.consume_editor_image_clear() {
                 terminal.clear()?;
                 // Activity-bar icons live outside ratatui too; re-emit
                 // them on the next post-draw flush.
@@ -5607,7 +5756,7 @@ fn main_loop(
             terminal.draw(|f| {
                 app.render(f);
             })?;
-            if app.consume_welcome_image_clear() {
+            if app.consume_welcome_image_clear() || app.consume_editor_image_clear() {
                 terminal.clear()?;
                 app.activity_overlay_dirty = true;
                 terminal.draw(|f| {
@@ -5641,6 +5790,24 @@ fn main_loop(
                 }
                 let _ = out.flush();
                 app.activity_overlay_dirty = false;
+            }
+            // Active editor image preview: bake-once-emit-each-frame
+            // overlay, just like the welcome wordmark. Sent after ratatui
+            // has finished its diff so the image bytes land on cells
+            // ratatui won't repaint until layout changes again.
+            if let Some((osc, layout)) = app.editor_image_payload() {
+                use std::io::Write;
+                let mut out = stdout();
+                let cursor_on = app.cursor_should_be_visible();
+                let _ = write!(out, "\x1b[?25l\x1b[s");
+                let _ = write!(out, "\x1b[{};{}H", layout.cell_y + 1, layout.cell_x + 1);
+                let _ = out.write_all(osc.as_bytes());
+                let _ = write!(out, "\x1b[u");
+                if cursor_on {
+                    let _ = write!(out, "\x1b[?25h");
+                }
+                let _ = out.flush();
+                app.mark_editor_image_displayed();
             }
             // Welcome-screen logo: same OSC-1337 trick, gated by its own
             // dirty flag and only emitted while the editor pane is in its

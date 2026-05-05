@@ -117,8 +117,19 @@ pub fn fit_image(
     canvas_h_px: u32,
     bg: Rgba<u8>,
 ) -> Result<Vec<u8>, image::ImageError> {
-    let img = image::load_from_memory_with_format(src_png, image::ImageFormat::Png)?
-        .to_rgba8();
+    fit_image_auto(src_png, canvas_w_px, canvas_h_px, bg)
+}
+
+/// Same as `fit_image` but accepts any format `image` can decode (PNG,
+/// JPEG, GIF first frame, BMP, WebP). Bakes the result back to a PNG sized
+/// to the supplied canvas with `bg` as the letterbox fill.
+pub fn fit_image_auto(
+    src: &[u8],
+    canvas_w_px: u32,
+    canvas_h_px: u32,
+    bg: Rgba<u8>,
+) -> Result<Vec<u8>, image::ImageError> {
+    let img = image::load_from_memory(src)?.to_rgba8();
     let (sw, sh) = (img.width(), img.height());
     let scale = f64::min(
         canvas_w_px as f64 / sw as f64,
