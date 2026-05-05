@@ -30,6 +30,19 @@ pub struct ImageView {
     pub pixel_w: u32,
     pub pixel_h: u32,
     pub byte_size: u64,
+    /// Set when this preview was rasterised from a PDF page; tracks the
+    /// page-navigation state so re-renders on Page Down/Up know which
+    /// page to ask the rasteriser for next.
+    pub pdf: Option<PdfState>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PdfState {
+    pub source_path: PathBuf,
+    pub current_page: u32,
+    pub page_count: Option<u32>,
+    pub backend: crate::pdf::PdfBackend,
+    pub source_byte_size: u64,
 }
 
 fn render_image_placeholder(
@@ -52,14 +65,29 @@ fn render_image_placeholder(
         .and_then(|p| p.file_name())
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| String::from("(unnamed image)"));
-    let header = format!(
-        " {} · {}×{} · {} · {} ",
-        name,
-        image.pixel_w,
-        image.pixel_h,
-        format_bytes_human(image.byte_size),
-        image.format_label,
-    );
+    let header = if let Some(pdf) = image.pdf.as_ref() {
+        let page_label = match pdf.page_count {
+            Some(total) => format!("page {} / {}", pdf.current_page, total),
+            None => format!("page {}", pdf.current_page),
+        };
+        format!(
+            " {} · {} · {}×{} · {} · PDF (← / → to flip) ",
+            name,
+            page_label,
+            image.pixel_w,
+            image.pixel_h,
+            format_bytes_human(pdf.source_byte_size),
+        )
+    } else {
+        format!(
+            " {} · {}×{} · {} · {} ",
+            name,
+            image.pixel_w,
+            image.pixel_h,
+            format_bytes_human(image.byte_size),
+            image.format_label,
+        )
+    };
     buf.set_string(
         inner.x,
         inner.y,
@@ -86,6 +114,10 @@ fn format_bytes_human(n: u64) -> String {
 pub fn extension_is_image(ext: &str) -> bool {
     let lc = ext.to_ascii_lowercase();
     IMAGE_EXTENSIONS.iter().any(|e| *e == lc)
+}
+
+pub fn extension_is_pdf(ext: &str) -> bool {
+    ext.eq_ignore_ascii_case("pdf")
 }
 
 pub fn image_format_label_from_ext(ext: &str) -> String {
@@ -225,6 +257,9 @@ impl Editor {
         if extension_is_image(ext) {
             return self.open_image(path);
         }
+        if extension_is_pdf(ext) {
+            return self.open_pdf(path);
+        }
         let meta = std::fs::metadata(path)?;
         if meta.len() > MAX_FILE_BYTES {
             anyhow::bail!("File too large ({} bytes)", meta.len());
@@ -284,9 +319,96 @@ impl Editor {
             pixel_w,
             pixel_h,
             byte_size: meta.len(),
+            pdf: None,
         });
         self.status = format!("Opened image {}", path.display());
         Ok(())
+    }
+
+    fn open_pdf(&mut self, path: &Path) -> Result<()> {
+        let backend = crate::pdf::detect_backend()
+            .ok_or_else(|| anyhow::anyhow!("Install poppler (pdftoppm) to preview PDFs"))?;
+        let meta = std::fs::metadata(path)?;
+        let page_count = crate::pdf::detect_page_count(path);
+        let bytes = crate::pdf::rasterize_page(path, 1, backend)
+            .map_err(|e| anyhow::anyhow!("PDF render failed: {e}"))?;
+        let (pixel_w, pixel_h) = image::load_from_memory(&bytes)
+            .map(|img| (img.width(), img.height()))
+            .map_err(|e| anyhow::anyhow!("Could not decode rasterised PDF: {e}"))?;
+        self.path = Some(path.to_path_buf());
+        self.lines = vec![String::new()];
+        self.lang = None;
+        self.scroll = 0;
+        self.cursor_row = 0;
+        self.cursor_col = 0;
+        self.dirty = false;
+        self.selection = None;
+        self.undo_stack.clear();
+        self.last_edit_kind = None;
+        self.highlights = vec![Vec::new()];
+        self.image = Some(ImageView {
+            bytes,
+            format_label: String::from("PDF"),
+            pixel_w,
+            pixel_h,
+            byte_size: meta.len(),
+            pdf: Some(PdfState {
+                source_path: path.to_path_buf(),
+                current_page: 1,
+                page_count,
+                backend,
+                source_byte_size: meta.len(),
+            }),
+        });
+        self.status = format!("Opened PDF {}", path.display());
+        Ok(())
+    }
+
+    /// Re-rasterise the active PDF preview at a new page. Returns true if
+    /// the page actually changed, so the caller can flag the OSC overlay
+    /// for re-bake. Wraps around at the document boundaries when the page
+    /// count is known; clamps at page 1 below otherwise.
+    pub fn change_pdf_page(&mut self, delta: i32) -> bool {
+        let Some(image) = self.image.as_mut() else {
+            return false;
+        };
+        let Some(pdf) = image.pdf.clone() else {
+            return false;
+        };
+        let new_page = if let Some(total) = pdf.page_count {
+            if total == 0 {
+                return false;
+            }
+            let cur = pdf.current_page as i64;
+            let next = ((cur - 1 + delta as i64).rem_euclid(total as i64)) + 1;
+            next as u32
+        } else if delta > 0 {
+            pdf.current_page.saturating_add(delta as u32)
+        } else {
+            pdf.current_page.saturating_sub((-delta) as u32).max(1)
+        };
+        if new_page == pdf.current_page {
+            return false;
+        }
+        let bytes =
+            match crate::pdf::rasterize_page(&pdf.source_path, new_page, pdf.backend) {
+                Ok(b) => b,
+                Err(e) => {
+                    self.status = format!("PDF page {new_page} failed: {e}");
+                    return false;
+                }
+            };
+        let (pixel_w, pixel_h) = match image::load_from_memory(&bytes) {
+            Ok(img) => (img.width(), img.height()),
+            Err(_) => return false,
+        };
+        image.bytes = bytes;
+        image.pixel_w = pixel_w;
+        image.pixel_h = pixel_h;
+        if let Some(state) = image.pdf.as_mut() {
+            state.current_page = new_page;
+        }
+        true
     }
 
     fn recompute_highlights(&mut self) {

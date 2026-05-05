@@ -2261,10 +2261,38 @@ impl App {
     }
 
     fn handle_editor_key(&mut self, key: KeyEvent) {
-        // Image preview tabs are read-only. Swallow all keys here so a
-        // stray keystroke can't insert characters into a buffer the user
-        // can't see.
+        // Image preview tabs are read-only. PDF tabs allow page navigation
+        // via Left/Right + PageUp/PageDown; everything else is swallowed.
         if self.editor.image.is_some() {
+            if self.editor.image.as_ref().is_some_and(|i| i.pdf.is_some()) {
+                let delta: i32 = match key.code {
+                    KeyCode::Right | KeyCode::PageDown | KeyCode::Char(' ') => 1,
+                    KeyCode::Left | KeyCode::PageUp => -1,
+                    KeyCode::Home => i32::MIN,
+                    KeyCode::End => i32::MAX,
+                    _ => 0,
+                };
+                if delta != 0 {
+                    let absolute = matches!(key.code, KeyCode::Home | KeyCode::End);
+                    let stepped = if absolute {
+                        let target_page: i32 = if delta < 0 { 1 } else { i32::MAX };
+                        let cur = self
+                            .editor
+                            .image
+                            .as_ref()
+                            .and_then(|i| i.pdf.as_ref())
+                            .map(|p| p.current_page as i32)
+                            .unwrap_or(1);
+                        self.editor.change_pdf_page(target_page - cur)
+                    } else {
+                        self.editor.change_pdf_page(delta)
+                    };
+                    if stepped {
+                        // Force the OSC overlay to re-bake on next render.
+                        self.editor_image_layout = None;
+                    }
+                }
+            }
             return;
         }
         // Clipboard gestures take precedence over text input. They never
