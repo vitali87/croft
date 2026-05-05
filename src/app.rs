@@ -447,7 +447,39 @@ pub struct App {
     tree_clipboard: Option<ExplorerClipboard>,
     /// Active explorer drag-and-drop, if any.
     tree_drag: Option<ExplorerDrag>,
+    /// Width in cells of the sidebar (Explorer / Search / Remote pane).
+    /// Defaults to 32 cells; user can drag the splitter between sidebar
+    /// and editor to widen or narrow.
+    sidebar_width: u16,
+    /// Height in cells of the bottom terminal pane. `None` = use the
+    /// default 35% split; Some = a user-specified pinned height. Stored
+    /// in cells (not percent) so it doesn't drift on window resize.
+    terminal_height: Option<u16>,
+    /// Active splitter drag, if any. Cleared on mouse-up.
+    splitter_drag: Option<SplitterDrag>,
+    /// Last-rendered geometry of the vertical splitter column (between
+    /// sidebar and editor) and the horizontal splitter row (between
+    /// editor and terminal). Used by the mouse handler to hit-test cleanly
+    /// without recomputing layout outside of `render`.
+    sidebar_splitter_x: Option<u16>,
+    terminal_splitter_y: Option<u16>,
+    /// Total width / height of the right-hand content area, captured on
+    /// every render so a splitter drag can clamp to the live viewport.
+    last_content_width: u16,
+    last_content_height: u16,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SplitterDrag {
+    Sidebar,
+    Terminal,
+}
+
+const SIDEBAR_WIDTH_DEFAULT: u16 = 32;
+const SIDEBAR_WIDTH_MIN: u16 = 12;
+const TERMINAL_HEIGHT_MIN: u16 = 3;
+const EDITOR_HEIGHT_MIN: u16 = 3;
+const RIGHT_PANE_MIN: u16 = 20;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct WelcomeLayout {
@@ -716,6 +748,13 @@ impl App {
             remote_launch: None,
             tree_clipboard: None,
             tree_drag: None,
+            sidebar_width: SIDEBAR_WIDTH_DEFAULT,
+            terminal_height: None,
+            splitter_drag: None,
+            sidebar_splitter_x: None,
+            terminal_splitter_y: None,
+            last_content_width: 0,
+            last_content_height: 0,
         })
     }
 
@@ -1580,15 +1619,27 @@ impl App {
             .constraints([Constraint::Min(1), Constraint::Length(1)])
             .split(size);
 
-        // Carve off the activity bar on the very left, then optionally the
-        // side panel, then the main content.
+        // Clamp sidebar width to leave at least RIGHT_PANE_MIN cells for
+        // the editor + terminal. Window resizes shrink the sidebar to fit
+        // rather than refusing to render the right pane.
+        let total_w = outer[0].width;
+        let max_sidebar = total_w
+            .saturating_sub(ACTIVITY_BAR_WIDTH)
+            .saturating_sub(RIGHT_PANE_MIN);
+        let sidebar_w = self
+            .sidebar_width
+            .clamp(SIDEBAR_WIDTH_MIN, max_sidebar.max(SIDEBAR_WIDTH_MIN));
+        // Persist the clamped value so subsequent drags start from where
+        // the user can actually see the splitter.
+        self.sidebar_width = sidebar_w;
+
         let main = if self.show_tree {
             Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([
                     Constraint::Length(ACTIVITY_BAR_WIDTH),
-                    Constraint::Length(32),
-                    Constraint::Min(20),
+                    Constraint::Length(sidebar_w),
+                    Constraint::Min(RIGHT_PANE_MIN),
                 ])
                 .split(outer[0])
         } else {
@@ -1596,7 +1647,7 @@ impl App {
                 .direction(Direction::Horizontal)
                 .constraints([
                     Constraint::Length(ACTIVITY_BAR_WIDTH),
-                    Constraint::Min(20),
+                    Constraint::Min(RIGHT_PANE_MIN),
                 ])
                 .split(outer[0])
         };
@@ -1607,13 +1658,44 @@ impl App {
             (main[0], None, main[1])
         };
 
+        // Splitter column is the leftmost cell of the right (editor) pane —
+        // i.e. the seam where the sidebar's border meets the editor's
+        // border. Mouse-down on that column starts a horizontal drag.
+        self.sidebar_splitter_x = if self.show_tree {
+            Some(right_area.x)
+        } else {
+            None
+        };
+        self.last_content_width = right_area.width;
+        self.last_content_height = right_area.height;
+
         let (editor_area, terminal_area) = if self.show_terminal {
-            let right = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Percentage(65), Constraint::Percentage(35)])
-                .split(right_area);
+            let total_h = right_area.height;
+            let pinned = self.terminal_height.map(|h| {
+                h.clamp(
+                    TERMINAL_HEIGHT_MIN,
+                    total_h.saturating_sub(EDITOR_HEIGHT_MIN).max(TERMINAL_HEIGHT_MIN),
+                )
+            });
+            let right = if let Some(term_h) = pinned {
+                self.terminal_height = Some(term_h);
+                Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Min(EDITOR_HEIGHT_MIN),
+                        Constraint::Length(term_h),
+                    ])
+                    .split(right_area)
+            } else {
+                Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Percentage(65), Constraint::Percentage(35)])
+                    .split(right_area)
+            };
+            self.terminal_splitter_y = Some(right[1].y);
             (right[0], Some(right[1]))
         } else {
+            self.terminal_splitter_y = None;
             (right_area, None)
         };
 
@@ -2484,6 +2566,23 @@ impl App {
                 if !in_tree {
                     self.last_tree_left_down = None;
                 }
+                // Splitter hit-test runs before everything else: clicking the
+                // single-column seam between sidebar and editor (or the
+                // single-row seam between editor and terminal) starts a
+                // resize drag instead of falling through to the underlying
+                // pane's click handler.
+                if let Some(x) = self.sidebar_splitter_x {
+                    if m.column == x {
+                        self.splitter_drag = Some(SplitterDrag::Sidebar);
+                        return;
+                    }
+                }
+                if let Some(y) = self.terminal_splitter_y {
+                    if m.row == y {
+                        self.splitter_drag = Some(SplitterDrag::Terminal);
+                        return;
+                    }
+                }
                 // Activity-bar hit-test takes precedence over the side panel.
                 if rect_contains(self.sidebar_areas.explorer_icon, m.column, m.row) {
                     self.set_sidebar_view(SidebarView::Explorer);
@@ -2735,6 +2834,10 @@ impl App {
                 }
             }
             MouseEventKind::Drag(MouseButton::Left) => {
+                if let Some(kind) = self.splitter_drag {
+                    self.handle_splitter_drag(kind, m.column, m.row);
+                    return;
+                }
                 if let Some(pane) = self.scrollbar_drag {
                     match pane {
                         Pane::Tree => match self.sidebar_view {
@@ -2818,6 +2921,9 @@ impl App {
                 }
             }
             MouseEventKind::Up(MouseButton::Left) => {
+                if self.splitter_drag.take().is_some() {
+                    return;
+                }
                 if self.scrollbar_drag.take().is_some() {
                     return;
                 }
@@ -2999,6 +3105,49 @@ impl App {
                 };
             }
             MenuAction::Paste(dest) => self.paste_into(dest),
+        }
+    }
+
+    /// Resize the sidebar / terminal pane while a splitter drag is in
+    /// progress. The pointer's screen coordinate maps directly to the new
+    /// edge: dragging horizontally sets the sidebar width to (column −
+    /// activity-bar width); dragging vertically sets the terminal height
+    /// to (right-pane bottom − row).
+    fn handle_splitter_drag(&mut self, kind: SplitterDrag, column: u16, row: u16) {
+        match kind {
+            SplitterDrag::Sidebar => {
+                let activity_w = ACTIVITY_BAR_WIDTH;
+                let new_w = column.saturating_sub(activity_w);
+                let total = activity_w + self.sidebar_width + self.last_content_width;
+                let max_sidebar = total
+                    .saturating_sub(activity_w)
+                    .saturating_sub(RIGHT_PANE_MIN);
+                self.sidebar_width =
+                    new_w.clamp(SIDEBAR_WIDTH_MIN, max_sidebar.max(SIDEBAR_WIDTH_MIN));
+            }
+            SplitterDrag::Terminal => {
+                let Some(splitter_y) = self.terminal_splitter_y else {
+                    return;
+                };
+                // Right pane spans [splitter_y - editor_h, splitter_y +
+                // current_terminal_h). Compute the right-pane bottom from
+                // the captured height so a drag past it just clamps.
+                let bottom = splitter_y + self.terminal_height.unwrap_or(0);
+                let actual_bottom = if bottom == splitter_y {
+                    // Pre-drag we may have used a percent split; fall back
+                    // to the captured content height.
+                    splitter_y.saturating_add(self.last_content_height)
+                } else {
+                    bottom
+                };
+                let new_h = actual_bottom.saturating_sub(row);
+                let max_h = self
+                    .last_content_height
+                    .saturating_sub(EDITOR_HEIGHT_MIN)
+                    .max(TERMINAL_HEIGHT_MIN);
+                self.terminal_height =
+                    Some(new_h.clamp(TERMINAL_HEIGHT_MIN, max_h));
+            }
         }
     }
 
@@ -5254,6 +5403,90 @@ mod tests {
             modifiers: KeyModifiers::ALT,
         });
         assert!(app.editor.is_blank_initial(), "alt-click must not open the file");
+    }
+
+    #[test]
+    fn dragging_sidebar_splitter_resizes_sidebar() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        // Simulate a render so splitter coords are populated.
+        app.sidebar_splitter_x = Some(36); // activity(4) + sidebar(32) = 36
+        app.last_content_width = 60;
+        app.last_content_height = 20;
+        app.sidebar_width = 32;
+        // Mouse-down on the splitter column.
+        app.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: 36,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.splitter_drag, Some(SplitterDrag::Sidebar));
+        // Drag right by 10 cells: column 46 -> sidebar should grow to 42.
+        app.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+            column: 46,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.sidebar_width, 42);
+        // Mouse-up clears the drag state.
+        app.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
+            column: 46,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(app.splitter_drag.is_none());
+    }
+
+    #[test]
+    fn sidebar_drag_clamps_to_minimum() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.sidebar_splitter_x = Some(36);
+        app.last_content_width = 60;
+        app.last_content_height = 20;
+        app.sidebar_width = 32;
+        app.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: 36,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        });
+        // Drag far to the left — sidebar should clamp to its min, not collapse.
+        app.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+            column: 5,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.sidebar_width, SIDEBAR_WIDTH_MIN);
+    }
+
+    #[test]
+    fn dragging_terminal_splitter_resizes_terminal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.terminal_splitter_y = Some(15);
+        app.last_content_height = 20;
+        app.last_content_width = 60;
+        app.terminal_height = Some(5); // bottom = 15 + 5 = 20
+        app.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: 50,
+            row: 15,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.splitter_drag, Some(SplitterDrag::Terminal));
+        // Drag the splitter up to row 10: terminal height = 20 - 10 = 10.
+        app.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+            column: 50,
+            row: 10,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.terminal_height, Some(10));
     }
 }
 
