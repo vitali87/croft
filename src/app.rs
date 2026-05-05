@@ -395,7 +395,9 @@ pub struct App {
     welcome_links: Vec<WelcomeLink>,
     /// Receiver for the background HTTP fetch of croft's recent commits.
     /// `None` once the fetch has completed (or failed) and been drained.
-    recent_commits_rx: Option<std::sync::mpsc::Receiver<crate::git::RecentCommits>>,
+    recent_commits_rx: Option<
+        std::sync::mpsc::Receiver<(crate::git::RecentCommits, crate::git::RecentCommitsError)>,
+    >,
     /// Channel to the background search worker. Each keystroke or toggle
     /// flip pushes a `(query, opts)` request here; the worker debounces
     /// and runs `search_workspace` off the UI thread.
@@ -653,8 +655,8 @@ impl App {
         let recent_repo_remote = crate::git::croft_repository_remote();
         std::thread::spawn(move || {
             let timeout = std::time::Duration::from_secs(3);
-            let commits = crate::git::fetch_croft_recent_commits(timeout);
-            let _ = commits_tx.send(commits);
+            let result = crate::git::fetch_croft_recent_commits_full(timeout);
+            let _ = commits_tx.send(result);
         });
 
         let (search_query_tx, search_query_rx) = std::sync::mpsc::channel();
@@ -1086,7 +1088,7 @@ impl App {
             return false;
         };
         match rx.try_recv() {
-            Ok(commits) => {
+            Ok((commits, err)) => {
                 self.recent_repo_remote = commits.remote;
                 self.recent_commits = commits.commits;
                 self.recent_commits_rx = None;
@@ -1094,6 +1096,25 @@ impl App {
                     self.welcome_image_clear_requested = true;
                 }
                 self.welcome_overlay_dirty = true;
+                match err {
+                    crate::git::RecentCommitsError::None => {}
+                    crate::git::RecentCommitsError::RateLimited => {
+                        self.status =
+                            String::from("Recent commits unavailable: API rate-limited");
+                    }
+                    crate::git::RecentCommitsError::HttpStatus(code) => {
+                        self.status =
+                            format!("Recent commits unavailable: HTTP {code}");
+                    }
+                    crate::git::RecentCommitsError::Network => {
+                        self.status =
+                            String::from("Recent commits unavailable: network error");
+                    }
+                    crate::git::RecentCommitsError::NoEndpoint => {
+                        self.status =
+                            String::from("Recent commits unavailable: no remote configured");
+                    }
+                }
                 true
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => false,

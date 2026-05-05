@@ -131,36 +131,90 @@ pub struct CommitApiEndpoint {
 
 const DEFAULT_CROFT_REPOSITORY_REMOTE: &str = "git@bitbucket.org:vitali_avagyan/croft.git";
 
-/// Live-fetch the latest 5 croft commits from the repository remote. Synchronous;
-/// callers should run this off the UI thread (see `App::spawn_recent_commits_fetch`).
-/// Returns only the remote reference on any fetch error (network down, API
-/// change, unsupported provider).
+/// Why the welcome panel's commit list is empty. Used by the UI to phrase
+/// the status bar honestly — the panel itself only ever shows commits from
+/// a *successful, current* fetch. Stale or cached commits are deliberately
+/// not an option: this is a high-velocity project and an out-of-date
+/// "Recent" list is misinformation, strictly worse than an empty one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum RecentCommitsError {
+    #[default]
+    None,
+    /// API returned HTTP 429. The caller's egress IP is rate-limited
+    /// (often shared via Tailscale exit nodes, corporate NAT, etc.).
+    RateLimited,
+    /// API returned a non-2xx that wasn't 429.
+    HttpStatus(u16),
+    /// Transport failure: DNS, connect, TLS, timeout, body read.
+    Network,
+    /// The repository remote is unset or points at an unsupported provider.
+    NoEndpoint,
+}
+
+/// Live-fetch the latest 5 croft commits from the repository remote.
+/// Synchronous — callers should run this off the UI thread (see
+/// `App::new`). Returns an empty `commits` Vec on every failure mode; the
+/// out-of-band `RecentCommitsError` is captured via
+/// `fetch_croft_recent_commits_full` for callers that want to display a
+/// reason. There is intentionally no caching: an out-of-date list is worse
+/// than no list for this project.
 pub fn fetch_croft_recent_commits(timeout: std::time::Duration) -> RecentCommits {
+    fetch_croft_recent_commits_full(timeout).0
+}
+
+pub fn fetch_croft_recent_commits_full(
+    timeout: std::time::Duration,
+) -> (RecentCommits, RecentCommitsError) {
     let remote = croft_repository_remote();
     let Some(endpoint) = remote.as_deref().and_then(commits_api_endpoint_for_remote) else {
-        return RecentCommits { remote, commits: Vec::new() };
+        return (
+            RecentCommits { remote, commits: Vec::new() },
+            RecentCommitsError::NoEndpoint,
+        );
     };
-    let agent = ureq::AgentBuilder::new()
-        .timeout(timeout)
-        .build();
-    let resp = match agent
+    let agent = ureq::AgentBuilder::new().timeout(timeout).build();
+    let now = current_unix_seconds();
+    let result = agent
         .get(&endpoint.url)
         .set("User-Agent", "croft")
-        .call()
-    {
-        Ok(r) => r,
-        Err(_) => return RecentCommits { remote, commits: Vec::new() },
-    };
-    let body = match resp.into_string() {
-        Ok(s) => s,
-        Err(_) => return RecentCommits { remote, commits: Vec::new() },
-    };
-    let now = current_unix_seconds();
-    let commits = match endpoint.provider {
-        CommitApiProvider::Bitbucket => parse_bitbucket_commits_response(&body, now),
-        CommitApiProvider::GitHub => parse_github_commits_response(&body, now),
-    };
-    RecentCommits { remote, commits }
+        .call();
+    match result {
+        Ok(resp) => match resp.into_string() {
+            Ok(body) => {
+                let commits = match endpoint.provider {
+                    CommitApiProvider::Bitbucket => {
+                        parse_bitbucket_commits_response(&body, now)
+                    }
+                    CommitApiProvider::GitHub => {
+                        parse_github_commits_response(&body, now)
+                    }
+                };
+                (
+                    RecentCommits { remote, commits },
+                    RecentCommitsError::None,
+                )
+            }
+            Err(_) => (
+                RecentCommits { remote, commits: Vec::new() },
+                RecentCommitsError::Network,
+            ),
+        },
+        Err(ureq::Error::Status(code, _)) => {
+            let err = if code == 429 {
+                RecentCommitsError::RateLimited
+            } else {
+                RecentCommitsError::HttpStatus(code)
+            };
+            (
+                RecentCommits { remote, commits: Vec::new() },
+                err,
+            )
+        }
+        Err(_) => (
+            RecentCommits { remote, commits: Vec::new() },
+            RecentCommitsError::Network,
+        ),
+    }
 }
 
 pub fn croft_repository_remote() -> Option<String> {
