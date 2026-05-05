@@ -131,6 +131,47 @@ pub struct CommitApiEndpoint {
 
 const DEFAULT_CROFT_REPOSITORY_REMOTE: &str = "git@bitbucket.org:vitali_avagyan/croft.git";
 
+/// Build an `Authorization` header value for the welcome-screen API call,
+/// reading credentials from environment variables. Returning `None` keeps
+/// the request anonymous (and subject to per-IP rate-limits).
+///
+/// Bitbucket precedence:
+/// 1. `CROFT_BITBUCKET_USERNAME` + `CROFT_BITBUCKET_APP_PASSWORD` →
+///    HTTP Basic `username:app-password`. This is the canonical path for
+///    Bitbucket Cloud app passwords (per-user 1000 req/h, independent of
+///    egress IP).
+/// 2. `CROFT_BITBUCKET_TOKEN` alone → `Bearer <token>`. Works for the
+///    newer Bitbucket Cloud API tokens that accept Bearer.
+///
+/// GitHub:
+/// `CROFT_GITHUB_TOKEN` → `Bearer <token>`. Standard PAT/fine-grained-token
+/// auth (per-user 5000 req/h vs anonymous 60 req/h).
+pub fn auth_header_for(provider: CommitApiProvider) -> Option<String> {
+    match provider {
+        CommitApiProvider::Bitbucket => {
+            let user = nonempty_env("CROFT_BITBUCKET_USERNAME");
+            let pass = nonempty_env("CROFT_BITBUCKET_APP_PASSWORD");
+            if let (Some(u), Some(p)) = (user.as_deref(), pass.as_deref()) {
+                use base64::Engine;
+                let token =
+                    base64::engine::general_purpose::STANDARD.encode(format!("{u}:{p}"));
+                return Some(format!("Basic {token}"));
+            }
+            nonempty_env("CROFT_BITBUCKET_TOKEN").map(|t| format!("Bearer {t}"))
+        }
+        CommitApiProvider::GitHub => {
+            nonempty_env("CROFT_GITHUB_TOKEN").map(|t| format!("Bearer {t}"))
+        }
+    }
+}
+
+fn nonempty_env(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 /// Why the welcome panel's commit list is empty. Used by the UI to phrase
 /// the status bar honestly — the panel itself only ever shows commits from
 /// a *successful, current* fetch. Stale or cached commits are deliberately
@@ -174,10 +215,11 @@ pub fn fetch_croft_recent_commits_full(
     };
     let agent = ureq::AgentBuilder::new().timeout(timeout).build();
     let now = current_unix_seconds();
-    let result = agent
-        .get(&endpoint.url)
-        .set("User-Agent", "croft")
-        .call();
+    let mut req = agent.get(&endpoint.url).set("User-Agent", "croft");
+    if let Some(header) = auth_header_for(endpoint.provider) {
+        req = req.set("Authorization", &header);
+    }
+    let result = req.call();
     match result {
         Ok(resp) => match resp.into_string() {
             Ok(body) => {
@@ -778,5 +820,93 @@ mod tests {
     fn parse_github_response_returns_empty_on_garbage() {
         assert!(parse_github_commits_response("not json", 0).is_empty());
         assert!(parse_github_commits_response("{}", 0).is_empty());
+    }
+
+    /// Run `f` with a hermetic env: every croft auth var unset on entry,
+    /// restored on exit even if `f` panics. Cargo runs tests in parallel,
+    /// and process env is global state, so the mutex serialises every
+    /// auth-env test in this module.
+    fn with_clean_auth_env<F: FnOnce()>(f: F) {
+        use std::sync::{Mutex, OnceLock};
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let lock = LOCK.get_or_init(|| Mutex::new(()));
+        let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+        let keys = [
+            "CROFT_BITBUCKET_USERNAME",
+            "CROFT_BITBUCKET_APP_PASSWORD",
+            "CROFT_BITBUCKET_TOKEN",
+            "CROFT_GITHUB_TOKEN",
+        ];
+        let saved: Vec<(&str, Option<String>)> =
+            keys.iter().map(|k| (*k, std::env::var(k).ok())).collect();
+        for k in &keys {
+            std::env::remove_var(k);
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        for (k, v) in saved {
+            match v {
+                Some(val) => std::env::set_var(k, val),
+                None => std::env::remove_var(k),
+            }
+        }
+        if let Err(p) = result {
+            std::panic::resume_unwind(p);
+        }
+    }
+
+    #[test]
+    fn auth_header_returns_none_when_no_env_vars_set() {
+        with_clean_auth_env(|| {
+            assert!(auth_header_for(CommitApiProvider::Bitbucket).is_none());
+            assert!(auth_header_for(CommitApiProvider::GitHub).is_none());
+        });
+    }
+
+    #[test]
+    fn bitbucket_basic_auth_uses_username_and_app_password() {
+        with_clean_auth_env(|| {
+            std::env::set_var("CROFT_BITBUCKET_USERNAME", "alice");
+            std::env::set_var("CROFT_BITBUCKET_APP_PASSWORD", "secret");
+            let header = auth_header_for(CommitApiProvider::Bitbucket).unwrap();
+            // base64("alice:secret") == YWxpY2U6c2VjcmV0
+            assert_eq!(header, "Basic YWxpY2U6c2VjcmV0");
+        });
+    }
+
+    #[test]
+    fn bitbucket_falls_back_to_bearer_when_only_token_is_set() {
+        with_clean_auth_env(|| {
+            std::env::set_var("CROFT_BITBUCKET_TOKEN", "tok123");
+            let header = auth_header_for(CommitApiProvider::Bitbucket).unwrap();
+            assert_eq!(header, "Bearer tok123");
+        });
+    }
+
+    #[test]
+    fn bitbucket_basic_auth_wins_over_token_when_both_set() {
+        with_clean_auth_env(|| {
+            std::env::set_var("CROFT_BITBUCKET_USERNAME", "alice");
+            std::env::set_var("CROFT_BITBUCKET_APP_PASSWORD", "secret");
+            std::env::set_var("CROFT_BITBUCKET_TOKEN", "tok123");
+            let header = auth_header_for(CommitApiProvider::Bitbucket).unwrap();
+            assert!(header.starts_with("Basic "));
+        });
+    }
+
+    #[test]
+    fn github_token_uses_bearer() {
+        with_clean_auth_env(|| {
+            std::env::set_var("CROFT_GITHUB_TOKEN", "ghp_xyz");
+            let header = auth_header_for(CommitApiProvider::GitHub).unwrap();
+            assert_eq!(header, "Bearer ghp_xyz");
+        });
+    }
+
+    #[test]
+    fn empty_or_whitespace_env_values_are_ignored() {
+        with_clean_auth_env(|| {
+            std::env::set_var("CROFT_BITBUCKET_TOKEN", "   ");
+            assert!(auth_header_for(CommitApiProvider::Bitbucket).is_none());
+        });
     }
 }
