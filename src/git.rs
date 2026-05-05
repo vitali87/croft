@@ -131,47 +131,6 @@ pub struct CommitApiEndpoint {
 
 const DEFAULT_CROFT_REPOSITORY_REMOTE: &str = "git@bitbucket.org:vitali_avagyan/croft.git";
 
-/// Build an `Authorization` header value for the welcome-screen API call,
-/// reading credentials from environment variables. Returning `None` keeps
-/// the request anonymous (and subject to per-IP rate-limits).
-///
-/// Bitbucket precedence:
-/// 1. `CROFT_BITBUCKET_USERNAME` + `CROFT_BITBUCKET_APP_PASSWORD` →
-///    HTTP Basic `username:app-password`. This is the canonical path for
-///    Bitbucket Cloud app passwords (per-user 1000 req/h, independent of
-///    egress IP).
-/// 2. `CROFT_BITBUCKET_TOKEN` alone → `Bearer <token>`. Works for the
-///    newer Bitbucket Cloud API tokens that accept Bearer.
-///
-/// GitHub:
-/// `CROFT_GITHUB_TOKEN` → `Bearer <token>`. Standard PAT/fine-grained-token
-/// auth (per-user 5000 req/h vs anonymous 60 req/h).
-pub fn auth_header_for(provider: CommitApiProvider) -> Option<String> {
-    match provider {
-        CommitApiProvider::Bitbucket => {
-            let user = nonempty_env("CROFT_BITBUCKET_USERNAME");
-            let pass = nonempty_env("CROFT_BITBUCKET_APP_PASSWORD");
-            if let (Some(u), Some(p)) = (user.as_deref(), pass.as_deref()) {
-                use base64::Engine;
-                let token =
-                    base64::engine::general_purpose::STANDARD.encode(format!("{u}:{p}"));
-                return Some(format!("Basic {token}"));
-            }
-            nonempty_env("CROFT_BITBUCKET_TOKEN").map(|t| format!("Bearer {t}"))
-        }
-        CommitApiProvider::GitHub => {
-            nonempty_env("CROFT_GITHUB_TOKEN").map(|t| format!("Bearer {t}"))
-        }
-    }
-}
-
-fn nonempty_env(key: &str) -> Option<String> {
-    std::env::var(key)
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-}
-
 /// Why the welcome panel's commit list is empty. Used by the UI to phrase
 /// the status bar honestly — the panel itself only ever shows commits from
 /// a *successful, current* fetch. Stale or cached commits are deliberately
@@ -181,24 +140,19 @@ fn nonempty_env(key: &str) -> Option<String> {
 pub enum RecentCommitsError {
     #[default]
     None,
-    /// API returned HTTP 429. The caller's egress IP is rate-limited
-    /// (often shared via Tailscale exit nodes, corporate NAT, etc.).
-    RateLimited,
-    /// API returned a non-2xx that wasn't 429.
-    HttpStatus(u16),
-    /// Transport failure: DNS, connect, TLS, timeout, body read.
+    /// `git clone` / `git log` exited non-zero (transport failure, host
+    /// down, repo moved, malformed git output).
     Network,
-    /// The repository remote is unset or points at an unsupported provider.
+    /// The repository remote is unset or doesn't resolve to an HTTPS URL.
     NoEndpoint,
 }
 
-/// Live-fetch the latest 5 croft commits from the repository remote.
-/// Synchronous — callers should run this off the UI thread (see
-/// `App::new`). Returns an empty `commits` Vec on every failure mode; the
-/// out-of-band `RecentCommitsError` is captured via
-/// `fetch_croft_recent_commits_full` for callers that want to display a
-/// reason. There is intentionally no caching: an out-of-date list is worse
-/// than no list for this project.
+/// Live-fetch the latest 5 commits for the croft repository using the
+/// anonymous git smart-HTTP protocol. Bypasses the per-IP REST-API rate
+/// limit (60/h on Bitbucket Cloud) by going through the same endpoint
+/// `git clone` uses, which is provisioned for very different traffic and
+/// works the same for every developer regardless of VPN, NAT, or shared
+/// egress IP. Synchronous — callers should run this off the UI thread.
 pub fn fetch_croft_recent_commits(timeout: std::time::Duration) -> RecentCommits {
     fetch_croft_recent_commits_full(timeout).0
 }
@@ -207,55 +161,154 @@ pub fn fetch_croft_recent_commits_full(
     timeout: std::time::Duration,
 ) -> (RecentCommits, RecentCommitsError) {
     let remote = croft_repository_remote();
-    let Some(endpoint) = remote.as_deref().and_then(commits_api_endpoint_for_remote) else {
+    let Some(https_url) = remote.as_deref().and_then(https_clone_url_for_remote) else {
         return (
             RecentCommits { remote, commits: Vec::new() },
             RecentCommitsError::NoEndpoint,
         );
     };
-    let agent = ureq::AgentBuilder::new().timeout(timeout).build();
     let now = current_unix_seconds();
-    let mut req = agent.get(&endpoint.url).set("User-Agent", "croft");
-    if let Some(header) = auth_header_for(endpoint.provider) {
-        req = req.set("Authorization", &header);
-    }
-    let result = req.call();
-    match result {
-        Ok(resp) => match resp.into_string() {
-            Ok(body) => {
-                let commits = match endpoint.provider {
-                    CommitApiProvider::Bitbucket => {
-                        parse_bitbucket_commits_response(&body, now)
-                    }
-                    CommitApiProvider::GitHub => {
-                        parse_github_commits_response(&body, now)
-                    }
-                };
-                (
-                    RecentCommits { remote, commits },
-                    RecentCommitsError::None,
-                )
-            }
-            Err(_) => (
-                RecentCommits { remote, commits: Vec::new() },
-                RecentCommitsError::Network,
-            ),
-        },
-        Err(ureq::Error::Status(code, _)) => {
-            let err = if code == 429 {
-                RecentCommitsError::RateLimited
-            } else {
-                RecentCommitsError::HttpStatus(code)
-            };
-            (
-                RecentCommits { remote, commits: Vec::new() },
-                err,
-            )
-        }
+    match fetch_recent_commits_via_clone(&https_url, 5, timeout) {
+        Ok(commits) => (
+            RecentCommits {
+                remote,
+                commits: commits
+                    .into_iter()
+                    .map(|c| commit_info_from_log(c, now))
+                    .collect(),
+            },
+            RecentCommitsError::None,
+        ),
         Err(_) => (
             RecentCommits { remote, commits: Vec::new() },
             RecentCommitsError::Network,
         ),
+    }
+}
+
+/// One row from `git log --pretty=...`. `committer_unix` is seconds since
+/// epoch (committer date, %ct), used to compute the human-readable
+/// "X hours ago" string at render time.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GitLogRow {
+    pub short_hash: String,
+    pub full_hash: String,
+    pub committer_unix: i64,
+    pub subject: String,
+}
+
+fn commit_info_from_log(row: GitLogRow, now: i64) -> CommitInfo {
+    CommitInfo {
+        hash: row.short_hash,
+        full_hash: row.full_hash,
+        when: humanize_age(now.saturating_sub(row.committer_unix)),
+        subject: row.subject,
+    }
+}
+
+/// Convert SSH or HTTPS remote refs to a clone-able HTTPS URL. Bitbucket
+/// and GitHub both accept the `https://<host>/<owner>/<repo>.git` form
+/// for anonymous public clones.
+pub fn https_clone_url_for_remote(remote: &str) -> Option<String> {
+    let normalized = normalize_remote_reference(remote)?;
+    Some(format!("{normalized}.git"))
+}
+
+fn fetch_recent_commits_via_clone(
+    https_url: &str,
+    depth: u32,
+    timeout: std::time::Duration,
+) -> std::io::Result<Vec<GitLogRow>> {
+    let staging = unique_staging_dir()?;
+    let _guard = TempDirGuard(staging.clone());
+    // --bare: no working tree
+    // --depth: shallow, only the most recent commits
+    // --filter=blob:none: skip file contents (we only need commit metadata)
+    // --no-tags: skip tag refs
+    // --quiet: silence progress output
+    let timeout_secs = timeout.as_secs().max(1).to_string();
+    let clone = Command::new("git")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_HTTP_LOW_SPEED_LIMIT", "1")
+        .env("GIT_HTTP_LOW_SPEED_TIME", &timeout_secs)
+        .args([
+            "clone",
+            "--bare",
+            "--no-tags",
+            "--filter=blob:none",
+            "--quiet",
+            "--depth",
+        ])
+        .arg(depth.to_string())
+        .arg(https_url)
+        .arg(&staging)
+        .output()?;
+    if !clone.status.success() {
+        return Err(std::io::Error::other(format!(
+            "git clone failed: {}",
+            String::from_utf8_lossy(&clone.stderr).trim()
+        )));
+    }
+    let log = Command::new("git")
+        .arg("-C")
+        .arg(&staging)
+        .args([
+            "log",
+            "--no-merges",
+            "--pretty=format:%h%x09%H%x09%ct%x09%s",
+            "-n",
+        ])
+        .arg(depth.to_string())
+        .output()?;
+    if !log.status.success() {
+        return Err(std::io::Error::other(format!(
+            "git log failed: {}",
+            String::from_utf8_lossy(&log.stderr).trim()
+        )));
+    }
+    parse_git_log_lines(&String::from_utf8_lossy(&log.stdout))
+        .ok_or_else(|| std::io::Error::other("git log produced unparseable output"))
+}
+
+pub fn parse_git_log_lines(out: &str) -> Option<Vec<GitLogRow>> {
+    let mut rows = Vec::new();
+    for line in out.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let mut parts = line.splitn(4, '\t');
+        let short_hash = parts.next()?.to_string();
+        let full_hash = parts.next()?.to_string();
+        let unix: i64 = parts.next()?.parse().ok()?;
+        let subject = parts.next().unwrap_or("").to_string();
+        rows.push(GitLogRow {
+            short_hash,
+            full_hash,
+            committer_unix: unix,
+            subject,
+        });
+    }
+    Some(rows)
+}
+
+fn unique_staging_dir() -> std::io::Result<std::path::PathBuf> {
+    let pid = std::process::id();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    let path = std::env::temp_dir().join(format!("croft-recent-{pid}-{nanos}"));
+    if path.exists() {
+        std::fs::remove_dir_all(&path)?;
+    }
+    Ok(path)
+}
+
+struct TempDirGuard(std::path::PathBuf);
+
+impl Drop for TempDirGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
@@ -354,172 +407,6 @@ pub fn commit_url_for_remote(remote: &str, hash: &str) -> Option<String> {
 }
 
 /// Pure function: takes the raw Bitbucket JSON body plus the current unix
-/// timestamp and returns a Vec of CommitInfo. Tested in isolation.
-pub fn parse_bitbucket_commits_response(body: &str, now_secs: i64) -> Vec<CommitInfo> {
-    let parsed: BitbucketCommitsResponse = match serde_json::from_str(body) {
-        Ok(p) => p,
-        Err(_) => return Vec::new(),
-    };
-    parsed
-        .values
-        .into_iter()
-        .filter_map(|c| convert_bitbucket_commit(&c, now_secs))
-        .collect()
-}
-
-pub fn parse_github_commits_response(body: &str, now_secs: i64) -> Vec<CommitInfo> {
-    let parsed: Vec<GitHubCommit> = match serde_json::from_str(body) {
-        Ok(p) => p,
-        Err(_) => return Vec::new(),
-    };
-    parsed
-        .into_iter()
-        .filter_map(|c| convert_github_commit(&c, now_secs))
-        .collect()
-}
-
-#[derive(serde::Deserialize)]
-pub struct BitbucketCommitsResponse {
-    pub values: Vec<BitbucketCommit>,
-}
-
-#[derive(serde::Deserialize)]
-pub struct BitbucketCommit {
-    pub hash: String,
-    pub date: String,
-    pub message: String,
-}
-
-fn convert_bitbucket_commit(c: &BitbucketCommit, now_secs: i64) -> Option<CommitInfo> {
-    let full_hash = c.hash.trim().to_string();
-    let hash: String = c.hash.chars().take(7).collect();
-    if hash.trim().is_empty() {
-        return None;
-    }
-    let subject = c
-        .message
-        .lines()
-        .next()
-        .unwrap_or("")
-        .trim()
-        .to_string();
-    let when = match parse_rfc3339_to_unix(&c.date) {
-        Some(ts) => humanize_age(now_secs.saturating_sub(ts)),
-        None => c.date.clone(),
-    };
-    Some(CommitInfo { hash, full_hash, when, subject })
-}
-
-#[derive(serde::Deserialize)]
-pub struct GitHubCommit {
-    pub sha: String,
-    pub commit: GitHubCommitBody,
-}
-
-#[derive(serde::Deserialize)]
-pub struct GitHubCommitBody {
-    pub message: String,
-    pub committer: Option<GitHubCommitPerson>,
-    pub author: Option<GitHubCommitPerson>,
-}
-
-#[derive(serde::Deserialize)]
-pub struct GitHubCommitPerson {
-    pub date: String,
-}
-
-fn convert_github_commit(c: &GitHubCommit, now_secs: i64) -> Option<CommitInfo> {
-    let full_hash = c.sha.trim().to_string();
-    let hash: String = c.sha.chars().take(7).collect();
-    if hash.trim().is_empty() {
-        return None;
-    }
-    let subject = c
-        .commit
-        .message
-        .lines()
-        .next()
-        .unwrap_or("")
-        .trim()
-        .to_string();
-    let date = c
-        .commit
-        .committer
-        .as_ref()
-        .or(c.commit.author.as_ref())
-        .map(|p| p.date.as_str())
-        .unwrap_or("");
-    let when = match parse_rfc3339_to_unix(date) {
-        Some(ts) => humanize_age(now_secs.saturating_sub(ts)),
-        None => date.to_string(),
-    };
-    Some(CommitInfo { hash, full_hash, when, subject })
-}
-
-/// Parse a date in the formats Bitbucket emits:
-///   2026-05-04T16:23:45+00:00
-///   2026-05-04T16:23:45.123456+00:00
-///   2026-05-04T16:23:45Z
-/// Returns the unix timestamp in seconds. Returns None for any malformed
-/// input. Roll our own to avoid pulling chrono/time for one parse.
-pub fn parse_rfc3339_to_unix(s: &str) -> Option<i64> {
-    let s = s.trim();
-    let (date, rest) = s.split_once('T')?;
-    let mut date_parts = date.splitn(3, '-');
-    let y: i64 = date_parts.next()?.parse().ok()?;
-    let mo: i64 = date_parts.next()?.parse().ok()?;
-    let d: i64 = date_parts.next()?.parse().ok()?;
-
-    // Strip any trailing fractional seconds before splitting time/offset.
-    let no_frac = match rest.find('.') {
-        Some(dot) => {
-            let after_dot = &rest[dot + 1..];
-            let frac_end = after_dot
-                .find(|c: char| c == 'Z' || c == '+' || c == '-')
-                .unwrap_or(after_dot.len());
-            let mut joined = String::with_capacity(rest.len());
-            joined.push_str(&rest[..dot]);
-            joined.push_str(&after_dot[frac_end..]);
-            joined
-        }
-        None => rest.to_string(),
-    };
-
-    let (time_str, offset_secs) = if let Some(stripped) = no_frac.strip_suffix('Z') {
-        (stripped.to_string(), 0i64)
-    } else {
-        let sign_idx = no_frac
-            .rfind(|c: char| c == '+' || c == '-')?;
-        let sign = if &no_frac[sign_idx..sign_idx + 1] == "+" { 1i64 } else { -1i64 };
-        let off = &no_frac[sign_idx + 1..];
-        let mut off_parts = off.splitn(2, ':');
-        let oh: i64 = off_parts.next()?.parse().ok()?;
-        let om: i64 = off_parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-        (no_frac[..sign_idx].to_string(), sign * (oh * 3600 + om * 60))
-    };
-
-    let mut t_parts = time_str.splitn(3, ':');
-    let h: i64 = t_parts.next()?.parse().ok()?;
-    let mi: i64 = t_parts.next()?.parse().ok()?;
-    let se: i64 = t_parts.next()?.parse().ok()?;
-
-    let days = days_from_civil(y, mo, d);
-    let utc_secs = days * 86_400 + h * 3_600 + mi * 60 + se - offset_secs;
-    Some(utc_secs)
-}
-
-/// Howard Hinnant's days_from_civil algorithm: returns the number of days
-/// since 1970-01-01 for a given Gregorian (y, m, d). Public-domain.
-fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = (y - era * 400) as i64;
-    let m_adj = if m > 2 { m - 3 } else { m + 9 };
-    let doy = (153 * m_adj + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146_097 + doe - 719_468
-}
-
 pub fn humanize_age(secs_ago: i64) -> String {
     let s = secs_ago.max(0);
     if s < 60 {
@@ -643,42 +530,6 @@ mod tests {
     }
 
     #[test]
-    fn rfc3339_z_suffix_parses_to_unix_epoch() {
-        // 1970-01-01T00:00:00Z is the epoch.
-        assert_eq!(parse_rfc3339_to_unix("1970-01-01T00:00:00Z"), Some(0));
-    }
-
-    #[test]
-    fn rfc3339_with_offset_subtracts_offset_to_get_utc() {
-        // 2026-01-01T01:00:00+01:00 == 2026-01-01T00:00:00Z
-        let utc = parse_rfc3339_to_unix("2026-01-01T00:00:00Z").unwrap();
-        let plus = parse_rfc3339_to_unix("2026-01-01T01:00:00+01:00").unwrap();
-        assert_eq!(utc, plus);
-    }
-
-    #[test]
-    fn rfc3339_with_negative_offset_adds_to_utc() {
-        // 2026-01-01T00:00:00-05:00 == 2026-01-01T05:00:00Z
-        let east = parse_rfc3339_to_unix("2026-01-01T05:00:00Z").unwrap();
-        let west = parse_rfc3339_to_unix("2026-01-01T00:00:00-05:00").unwrap();
-        assert_eq!(east, west);
-    }
-
-    #[test]
-    fn rfc3339_strips_fractional_seconds() {
-        let a = parse_rfc3339_to_unix("2026-05-04T16:23:45+00:00").unwrap();
-        let b = parse_rfc3339_to_unix("2026-05-04T16:23:45.123456+00:00").unwrap();
-        assert_eq!(a, b);
-    }
-
-    #[test]
-    fn rfc3339_rejects_garbage() {
-        assert_eq!(parse_rfc3339_to_unix(""), None);
-        assert_eq!(parse_rfc3339_to_unix("not a date"), None);
-        assert_eq!(parse_rfc3339_to_unix("2026-05-04"), None); // no time
-    }
-
-    #[test]
     fn humanize_seconds_minutes_hours_days() {
         assert_eq!(humanize_age(0), "0 seconds ago");
         assert_eq!(humanize_age(45), "45 seconds ago");
@@ -753,160 +604,83 @@ mod tests {
     }
 
     #[test]
-    fn parse_bitbucket_response_extracts_first_message_line_and_short_hash() {
-        let now = parse_rfc3339_to_unix("2026-05-04T16:30:00Z").unwrap();
-        let body = r#"{
-            "values": [
-              {
-                "hash": "abc1234deadbeef",
-                "date": "2026-05-04T16:00:00+00:00",
-                "message": "feat: live commits\n\nbody line ignored"
-              },
-              {
-                "hash": "fedc987",
-                "date": "2026-05-03T12:00:00+00:00",
-                "message": "fix: parse offsets"
-              }
-            ]
-        }"#;
-        let got = parse_bitbucket_commits_response(body, now);
-        assert_eq!(got.len(), 2);
-        assert_eq!(got[0].hash, "abc1234");
-        assert_eq!(got[0].full_hash, "abc1234deadbeef");
-        assert_eq!(got[0].subject, "feat: live commits");
-        assert_eq!(got[0].when, "30 minutes ago");
-        assert_eq!(got[1].hash, "fedc987");
-        assert_eq!(got[1].subject, "fix: parse offsets");
+    fn parse_git_log_lines_handles_typical_output() {
+        let out = "abc1234\tabc1234fffffffffffffffffffffffffffffffffff\t1762348800\tfeat: do thing\n\
+                   def5678\tdef5678eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\t1762262400\tfix: another\n";
+        let rows = parse_git_log_lines(out).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].short_hash, "abc1234");
+        assert_eq!(rows[0].full_hash, "abc1234fffffffffffffffffffffffffffffffffff");
+        assert_eq!(rows[0].committer_unix, 1762348800);
+        assert_eq!(rows[0].subject, "feat: do thing");
+        assert_eq!(rows[1].subject, "fix: another");
     }
 
     #[test]
-    fn parse_bitbucket_response_returns_empty_on_garbage() {
-        assert!(parse_bitbucket_commits_response("not json", 0).is_empty());
-        assert!(parse_bitbucket_commits_response("{}", 0).is_empty());
+    fn parse_git_log_lines_keeps_tabs_inside_subject() {
+        // splitn(4, '\t') means tabs inside the subject body survive.
+        let out = "h1\thash1\t100\tsubject\twith\ttabs\n";
+        let rows = parse_git_log_lines(out).unwrap();
+        assert_eq!(rows[0].subject, "subject\twith\ttabs");
     }
 
     #[test]
-    fn parse_github_response_extracts_first_message_line_and_short_hash() {
-        let now = parse_rfc3339_to_unix("2026-05-04T16:30:00Z").unwrap();
-        let body = r#"[
-          {
-            "sha": "abc1234deadbeef",
-            "commit": {
-              "message": "feat: live commits\n\nbody line ignored",
-              "committer": { "date": "2026-05-04T16:00:00Z" },
-              "author": { "date": "2026-05-04T15:00:00Z" }
-            }
-          },
-          {
-            "sha": "fedc987",
-            "commit": {
-              "message": "fix: parse offsets",
-              "committer": null,
-              "author": { "date": "2026-05-03T12:00:00Z" }
-            }
-          }
-        ]"#;
-        let got = parse_github_commits_response(body, now);
-        assert_eq!(got.len(), 2);
-        assert_eq!(got[0].hash, "abc1234");
-        assert_eq!(got[0].full_hash, "abc1234deadbeef");
-        assert_eq!(got[0].subject, "feat: live commits");
-        assert_eq!(got[0].when, "30 minutes ago");
-        assert_eq!(got[1].hash, "fedc987");
-        assert_eq!(got[1].subject, "fix: parse offsets");
+    fn parse_git_log_lines_skips_blank_lines() {
+        let out = "\nh1\thash1\t100\tsubject\n\n";
+        let rows = parse_git_log_lines(out).unwrap();
+        assert_eq!(rows.len(), 1);
     }
 
     #[test]
-    fn parse_github_response_returns_empty_on_garbage() {
-        assert!(parse_github_commits_response("not json", 0).is_empty());
-        assert!(parse_github_commits_response("{}", 0).is_empty());
-    }
-
-    /// Run `f` with a hermetic env: every croft auth var unset on entry,
-    /// restored on exit even if `f` panics. Cargo runs tests in parallel,
-    /// and process env is global state, so the mutex serialises every
-    /// auth-env test in this module.
-    fn with_clean_auth_env<F: FnOnce()>(f: F) {
-        use std::sync::{Mutex, OnceLock};
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        let lock = LOCK.get_or_init(|| Mutex::new(()));
-        let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
-        let keys = [
-            "CROFT_BITBUCKET_USERNAME",
-            "CROFT_BITBUCKET_APP_PASSWORD",
-            "CROFT_BITBUCKET_TOKEN",
-            "CROFT_GITHUB_TOKEN",
-        ];
-        let saved: Vec<(&str, Option<String>)> =
-            keys.iter().map(|k| (*k, std::env::var(k).ok())).collect();
-        for k in &keys {
-            std::env::remove_var(k);
-        }
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
-        for (k, v) in saved {
-            match v {
-                Some(val) => std::env::set_var(k, val),
-                None => std::env::remove_var(k),
-            }
-        }
-        if let Err(p) = result {
-            std::panic::resume_unwind(p);
-        }
+    fn parse_git_log_lines_returns_none_on_malformed_unix_time() {
+        let out = "h1\thash1\tnotanumber\tsubject\n";
+        assert!(parse_git_log_lines(out).is_none());
     }
 
     #[test]
-    fn auth_header_returns_none_when_no_env_vars_set() {
-        with_clean_auth_env(|| {
-            assert!(auth_header_for(CommitApiProvider::Bitbucket).is_none());
-            assert!(auth_header_for(CommitApiProvider::GitHub).is_none());
-        });
+    fn https_clone_url_for_bitbucket_ssh_remote() {
+        let url = https_clone_url_for_remote("git@bitbucket.org:vitali_avagyan/croft.git").unwrap();
+        assert_eq!(url, "https://bitbucket.org/vitali_avagyan/croft.git");
     }
 
     #[test]
-    fn bitbucket_basic_auth_uses_username_and_app_password() {
-        with_clean_auth_env(|| {
-            std::env::set_var("CROFT_BITBUCKET_USERNAME", "alice");
-            std::env::set_var("CROFT_BITBUCKET_APP_PASSWORD", "secret");
-            let header = auth_header_for(CommitApiProvider::Bitbucket).unwrap();
-            // base64("alice:secret") == YWxpY2U6c2VjcmV0
-            assert_eq!(header, "Basic YWxpY2U6c2VjcmV0");
-        });
+    fn https_clone_url_for_https_remote_already_normalized() {
+        let url = https_clone_url_for_remote("https://github.com/owner/repo").unwrap();
+        assert_eq!(url, "https://github.com/owner/repo.git");
     }
 
     #[test]
-    fn bitbucket_falls_back_to_bearer_when_only_token_is_set() {
-        with_clean_auth_env(|| {
-            std::env::set_var("CROFT_BITBUCKET_TOKEN", "tok123");
-            let header = auth_header_for(CommitApiProvider::Bitbucket).unwrap();
-            assert_eq!(header, "Bearer tok123");
-        });
-    }
-
-    #[test]
-    fn bitbucket_basic_auth_wins_over_token_when_both_set() {
-        with_clean_auth_env(|| {
-            std::env::set_var("CROFT_BITBUCKET_USERNAME", "alice");
-            std::env::set_var("CROFT_BITBUCKET_APP_PASSWORD", "secret");
-            std::env::set_var("CROFT_BITBUCKET_TOKEN", "tok123");
-            let header = auth_header_for(CommitApiProvider::Bitbucket).unwrap();
-            assert!(header.starts_with("Basic "));
-        });
-    }
-
-    #[test]
-    fn github_token_uses_bearer() {
-        with_clean_auth_env(|| {
-            std::env::set_var("CROFT_GITHUB_TOKEN", "ghp_xyz");
-            let header = auth_header_for(CommitApiProvider::GitHub).unwrap();
-            assert_eq!(header, "Bearer ghp_xyz");
-        });
-    }
-
-    #[test]
-    fn empty_or_whitespace_env_values_are_ignored() {
-        with_clean_auth_env(|| {
-            std::env::set_var("CROFT_BITBUCKET_TOKEN", "   ");
-            assert!(auth_header_for(CommitApiProvider::Bitbucket).is_none());
-        });
+    fn fetch_recent_commits_via_clone_returns_real_commits_for_local_repo() {
+        // Clone-from-local works through the same code path; a tempdir
+        // upstream avoids hitting the network in tests but exercises the
+        // git + parse pipeline end-to-end.
+        let upstream = tempfile::TempDir::new().unwrap();
+        Command::new("git")
+            .args(["init", "--quiet", "--initial-branch=main"])
+            .arg(upstream.path())
+            .status()
+            .unwrap();
+        Command::new("git")
+            .args(["-C"]).arg(upstream.path())
+            .args(["config", "user.email", "test@example.com"])
+            .status().unwrap();
+        Command::new("git")
+            .args(["-C"]).arg(upstream.path())
+            .args(["config", "user.name", "test"])
+            .status().unwrap();
+        std::fs::write(upstream.path().join("a.txt"), "1").unwrap();
+        Command::new("git").args(["-C"]).arg(upstream.path()).args(["add", "."]).status().unwrap();
+        Command::new("git").args(["-C"]).arg(upstream.path())
+            .args(["commit", "-m", "first commit", "--quiet"]).status().unwrap();
+        std::fs::write(upstream.path().join("a.txt"), "2").unwrap();
+        Command::new("git").args(["-C"]).arg(upstream.path()).args(["add", "."]).status().unwrap();
+        Command::new("git").args(["-C"]).arg(upstream.path())
+            .args(["commit", "-m", "second commit", "--quiet"]).status().unwrap();
+        let url = format!("file://{}", upstream.path().display());
+        let rows = fetch_recent_commits_via_clone(&url, 5, std::time::Duration::from_secs(10))
+            .expect("local clone must succeed");
+        assert!(rows.len() >= 2);
+        assert_eq!(rows[0].subject, "second commit");
+        assert_eq!(rows[1].subject, "first commit");
     }
 }

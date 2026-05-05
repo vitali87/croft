@@ -1098,27 +1098,9 @@ impl App {
                 self.welcome_overlay_dirty = true;
                 match err {
                     crate::git::RecentCommitsError::None => {}
-                    crate::git::RecentCommitsError::RateLimited => {
-                        let has_auth = std::env::var("CROFT_BITBUCKET_TOKEN").is_ok()
-                            || std::env::var("CROFT_BITBUCKET_APP_PASSWORD").is_ok()
-                            || std::env::var("CROFT_GITHUB_TOKEN").is_ok();
-                        self.status = if has_auth {
-                            String::from(
-                                "Recent commits unavailable: API rate-limited even with token",
-                            )
-                        } else {
-                            String::from(
-                                "Recent commits unavailable: API rate-limited (set CROFT_BITBUCKET_USERNAME + CROFT_BITBUCKET_APP_PASSWORD to bypass)",
-                            )
-                        };
-                    }
-                    crate::git::RecentCommitsError::HttpStatus(code) => {
-                        self.status =
-                            format!("Recent commits unavailable: HTTP {code}");
-                    }
                     crate::git::RecentCommitsError::Network => {
                         self.status =
-                            String::from("Recent commits unavailable: network error");
+                            String::from("Recent commits unavailable: git fetch failed");
                     }
                     crate::git::RecentCommitsError::NoEndpoint => {
                         self.status =
