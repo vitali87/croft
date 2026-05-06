@@ -6893,7 +6893,11 @@ fn main_loop(
             last_blink_visible = blink_visible;
         }
 
-        if event::poll(Duration::from_millis(33))? {
+        // 8 ms (~125 Hz) keeps echo lag tight when the embedded pty is the
+        // hot path (remote-launched croft over SSH). Idle cost is still
+        // negligible because the redraw branch above gates on dirty flags;
+        // this poll just decides how often we wake up to *check*.
+        if event::poll(Duration::from_millis(8))? {
             // Drain every event already queued so a click burst (Down + zero-
             // movement Drag + Up, all delivered in <50ms by the terminal)
             // coalesces into a single redraw. Otherwise each event triggers
