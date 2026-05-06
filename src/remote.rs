@@ -395,21 +395,6 @@ fn handle_pull_request(
 ) {
     let src_path = PathBuf::from(src);
     let dest_dir = format!("{inbox_dir}/{request_id}");
-    let mkdir = format!("mkdir -p {}", shell_quote(&dest_dir));
-    let mkdir_ok = Command::new("ssh")
-        .arg("-S")
-        .arg(socket)
-        .arg("-o")
-        .arg("ControlMaster=no")
-        .arg(host)
-        .arg(&mkdir)
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    if !mkdir_ok {
-        write_relay_err(host, socket, inbox_dir, request_id, "remote mkdir failed");
-        return;
-    }
     if !src_path.exists() {
         write_relay_err(
             host,
@@ -420,28 +405,83 @@ fn handle_pull_request(
         );
         return;
     }
-    // scp -r with OpenSSH 9.x uses sftp under the hood; sftp wants the
-    // parent dir to already exist and copies the source INTO it when
-    // the destination ends in `/`. So we point scp at $request_dir/
-    // (already mkdir'd above) and let scp drop the file/folder under
-    // its original basename. The remote path is shell-quoted to survive
-    // any spaces in $HOME.
-    let dest_with_slash = format!("{dest_dir}/");
-    let dest = format!("{host}:{}", shell_quote(&dest_with_slash));
-    let scp = Command::new("scp")
-        .arg("-o")
-        .arg(format!(
-            "ControlPath={}",
-            socket.to_string_lossy()
-        ))
+    let Some(parent) = src_path.parent() else {
+        write_relay_err(host, socket, inbox_dir, request_id, "source has no parent");
+        return;
+    };
+    let Some(basename) = src_path.file_name() else {
+        write_relay_err(host, socket, inbox_dir, request_id, "source has no basename");
+        return;
+    };
+    // Pipe a tar of the source through ssh into a remote tar -x. This
+    // copies file or directory equivalently in one round trip and
+    // sidesteps OpenSSH 9.x scp/sftp's realpath check on the
+    // destination, which kept failing on freshly-mkdir'd dirs.
+    let mut tar = match Command::new("tar")
+        .env("COPYFILE_DISABLE", "1")
+        .arg("-c")
+        .arg("-f")
+        .arg("-")
+        .arg("-C")
+        .arg(parent)
+        .arg(basename)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            write_relay_err(
+                host,
+                socket,
+                inbox_dir,
+                request_id,
+                &format!("local tar spawn failed: {e}"),
+            );
+            return;
+        }
+    };
+    let tar_stdout = match tar.stdout.take() {
+        Some(s) => s,
+        None => {
+            let _ = tar.wait();
+            write_relay_err(host, socket, inbox_dir, request_id, "tar stdout missing");
+            return;
+        }
+    };
+    let remote_cmd = format!(
+        "set -e; mkdir -p {dir} && tar -x -f - -C {dir}",
+        dir = shell_quote(&dest_dir),
+    );
+    let mut ssh_recv = match Command::new("ssh")
+        .arg("-S")
+        .arg(socket)
         .arg("-o")
         .arg("ControlMaster=no")
-        .arg("-r")
-        .arg(&src_path)
-        .arg(&dest)
-        .status();
-    match scp {
-        Ok(s) if s.success() => {
+        .arg(host)
+        .arg(&remote_cmd)
+        .stdin(Stdio::from(tar_stdout))
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = tar.wait();
+            write_relay_err(
+                host,
+                socket,
+                inbox_dir,
+                request_id,
+                &format!("ssh recv spawn failed: {e}"),
+            );
+            return;
+        }
+    };
+    let ssh_status = ssh_recv.wait();
+    let tar_status = tar.wait();
+    match (tar_status, ssh_status) {
+        (Ok(t), Ok(s)) if t.success() && s.success() => {
             let touch = format!("touch {}/.ok", shell_quote(&dest_dir));
             let _ = Command::new("ssh")
                 .arg("-S")
@@ -452,19 +492,19 @@ fn handle_pull_request(
                 .arg(&touch)
                 .status();
         }
-        Ok(s) => write_relay_err(
+        (Ok(t), Ok(s)) => write_relay_err(
             host,
             socket,
             inbox_dir,
             request_id,
-            &format!("scp exited with {s}"),
+            &format!("tar exited {t}, ssh exited {s}"),
         ),
-        Err(e) => write_relay_err(
+        (Err(e), _) | (_, Err(e)) => write_relay_err(
             host,
             socket,
             inbox_dir,
             request_id,
-            &format!("scp spawn failed: {e}"),
+            &format!("relay pipe wait failed: {e}"),
         ),
     }
 }
