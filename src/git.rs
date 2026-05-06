@@ -147,16 +147,6 @@ pub enum RecentCommitsError {
     NoEndpoint,
 }
 
-/// Live-fetch the latest 5 commits for the croft repository using the
-/// anonymous git smart-HTTP protocol. Bypasses the per-IP REST-API rate
-/// limit (60/h on Bitbucket Cloud) by going through the same endpoint
-/// `git clone` uses, which is provisioned for very different traffic and
-/// works the same for every developer regardless of VPN, NAT, or shared
-/// egress IP. Synchronous — callers should run this off the UI thread.
-pub fn fetch_croft_recent_commits(timeout: std::time::Duration) -> RecentCommits {
-    fetch_croft_recent_commits_full(timeout).0
-}
-
 pub fn fetch_croft_recent_commits_full(
     timeout: std::time::Duration,
 ) -> (RecentCommits, RecentCommitsError) {
