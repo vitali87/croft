@@ -1,6 +1,6 @@
 [package]
 name = "croft"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "Terminal-based VS Code replica: file tree, editor, embedded shell"
 license = "MIT"

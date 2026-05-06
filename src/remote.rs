@@ -375,6 +375,9 @@ fn run_pump(
             Some(RelayRequest::Clipboard { id }) => {
                 handle_clipboard_request(&host, &socket, &inbox_dir, &id);
             }
+            Some(RelayRequest::Open { id, url }) => {
+                handle_open_request(&host, &socket, &inbox_dir, &id, &url);
+            }
             None => {}
         }
     }
@@ -475,6 +478,7 @@ fn handle_clipboard_request(host: &str, socket: &Path, inbox_dir: &str, request_
 enum RelayRequest {
     Pull { id: String, src: String },
     Clipboard { id: String },
+    Open { id: String, url: String },
 }
 
 fn parse_relay_request(line: &str) -> Option<RelayRequest> {
@@ -494,8 +498,32 @@ fn parse_relay_request(line: &str) -> Option<RelayRequest> {
             Some(RelayRequest::Pull { id, src })
         }
         "clipboard" => Some(RelayRequest::Clipboard { id }),
+        "open" => {
+            let url = parts.next()?.to_string();
+            if url.is_empty() {
+                return None;
+            }
+            Some(RelayRequest::Open { id, url })
+        }
         _ => None,
     }
+}
+
+/// Validate a URL we're about to hand to the local Mac's `open(1)`. We
+/// only accept the schemes the welcome panel ever produces — http, https,
+/// mailto — so a hostile remote can't smuggle `file://` or shell metachars
+/// through the relay log.
+fn url_is_safe_to_open(url: &str) -> bool {
+    let lower: String = url.chars().take(16).collect::<String>().to_ascii_lowercase();
+    let scheme_ok = lower.starts_with("https://")
+        || lower.starts_with("http://")
+        || lower.starts_with("mailto:");
+    if !scheme_ok {
+        return false;
+    }
+    !url.chars().any(|c| {
+        c == '\0' || c == '\n' || c == '\r' || c == '\t'
+    })
 }
 
 fn handle_pull_request(
@@ -628,6 +656,96 @@ fn handle_pull_request(
             inbox_dir,
             request_id,
             &format!("relay pipe wait failed: {e}"),
+        ),
+    }
+}
+
+fn handle_open_request(
+    host: &str,
+    socket: &Path,
+    inbox_dir: &str,
+    request_id: &str,
+    url: &str,
+) {
+    if !url_is_safe_to_open(url) {
+        write_relay_err(
+            host,
+            socket,
+            inbox_dir,
+            request_id,
+            "rejected: URL scheme must be http/https/mailto and contain no control chars",
+        );
+        return;
+    }
+    let dest_dir = format!("{inbox_dir}/{request_id}");
+    let mkdir = format!("mkdir -p {}", shell_quote(&dest_dir));
+    let mkdir_ok = Command::new("ssh")
+        .arg("-S")
+        .arg(socket)
+        .arg("-o")
+        .arg("ControlMaster=no")
+        .arg(host)
+        .arg(&mkdir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !mkdir_ok {
+        write_relay_err(host, socket, inbox_dir, request_id, "remote mkdir failed");
+        return;
+    }
+    let result = if cfg!(target_os = "macos") {
+        Command::new("open")
+            .arg(url)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+    } else if cfg!(target_os = "linux") {
+        Command::new("xdg-open")
+            .arg(url)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+    } else {
+        Command::new("open")
+            .arg(url)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+    };
+    match result {
+        Ok(s) if s.success() => {
+            let touch = format!("touch {}/.ok", shell_quote(&dest_dir));
+            let _ = Command::new("ssh")
+                .arg("-S")
+                .arg(socket)
+                .arg("-o")
+                .arg("ControlMaster=no")
+                .arg(host)
+                .arg(&touch)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+        Ok(s) => write_relay_err(
+            host,
+            socket,
+            inbox_dir,
+            request_id,
+            &format!("local open(1) exited {s}"),
+        ),
+        Err(e) => write_relay_err(
+            host,
+            socket,
+            inbox_dir,
+            request_id,
+            &format!("local open(1) spawn failed: {e}"),
         ),
     }
 }
@@ -1033,6 +1151,35 @@ Host !blocked *.internal
             }
             other => panic!("expected Pull, got {:?}", matches!(other, Some(_))),
         }
+    }
+
+    #[test]
+    fn parse_relay_request_open_extracts_id_and_url() {
+        match super::parse_relay_request("open\topen-1\thttps://example.com/x") {
+            Some(super::RelayRequest::Open { id, url }) => {
+                assert_eq!(id, "open-1");
+                assert_eq!(url, "https://example.com/x");
+            }
+            _ => panic!("expected Open variant"),
+        }
+    }
+
+    #[test]
+    fn url_is_safe_to_open_accepts_http_https_mailto() {
+        assert!(super::url_is_safe_to_open("https://example.com/path"));
+        assert!(super::url_is_safe_to_open("http://example.com"));
+        assert!(super::url_is_safe_to_open("HTTPS://Example.COM"));
+        assert!(super::url_is_safe_to_open("mailto:foo@example.com"));
+    }
+
+    #[test]
+    fn url_is_safe_to_open_rejects_other_schemes_and_control_chars() {
+        assert!(!super::url_is_safe_to_open("file:///etc/passwd"));
+        assert!(!super::url_is_safe_to_open("javascript:alert(1)"));
+        assert!(!super::url_is_safe_to_open("ssh://attacker"));
+        assert!(!super::url_is_safe_to_open("https://example.com\nrm -rf /"));
+        assert!(!super::url_is_safe_to_open("https://example.com\r\nx"));
+        assert!(!super::url_is_safe_to_open("plaintext"));
     }
 
     #[test]

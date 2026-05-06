@@ -456,6 +456,14 @@ pub struct App {
     /// Drops awaiting reverse-pull from the user's local Mac via the
     /// drop-relay launched by the local croft parent. Polled each frame.
     pending_remote_pulls: Vec<PendingRemotePull>,
+    /// URL awaiting the user's local-browser confirmation (remote-
+    /// launched croft only). When `Some`, a modal asks Y/A/N and all
+    /// other keys are swallowed.
+    pending_local_open: Option<String>,
+    /// True after the user has chosen "Always for this session" on the
+    /// local-browser confirmation. Subsequent link clicks dispatch to
+    /// the relay silently.
+    trust_local_browser: bool,
     /// Width in cells of the sidebar (Explorer / Search / Remote pane).
     /// Defaults to 32 cells; user can drag the splitter between sidebar
     /// and editor to widen or narrow.
@@ -548,6 +556,9 @@ pub enum RemotePullKind {
     /// Local-Mac clipboard contents staged at `<inbox>/<id>/clipboard.txt`;
     /// on completion the bytes are pasted into the focused terminal.
     Clipboard,
+    /// URL handed to the user's local Mac `open(1)`; on completion croft
+    /// just surfaces a status confirmation. No payload is shipped back.
+    Open,
 }
 
 const REMOTE_PULL_TIMEOUT: Duration = Duration::from_secs(120);
@@ -813,6 +824,8 @@ impl App {
             tree_drag: None,
             pending_scp_uploads: Vec::new(),
             pending_remote_pulls: Vec::new(),
+            pending_local_open: None,
+            trust_local_browser: false,
             sidebar_width: SIDEBAR_WIDTH_DEFAULT,
             terminal_height: None,
             splitter_drag: None,
@@ -1836,6 +1849,7 @@ impl App {
         // Overlays render last so they sit on top of everything else.
         self.render_context_menu(frame);
         self.render_prompt(frame);
+        self.render_local_open_confirm(frame);
 
         // Show the host terminal's hardware caret only when the editor is
         // focused and has no modal overlay. The DECSCUSR style is set to
@@ -1898,6 +1912,67 @@ impl App {
                 row,
             );
         }
+    }
+
+    fn render_local_open_confirm(&self, frame: &mut ratatui::Frame) {
+        let Some(url) = &self.pending_local_open else { return };
+        let area = frame.area();
+        let width = area.width.saturating_sub(8).min(96).max(50);
+        let height: u16 = 8;
+        let x = (area.width.saturating_sub(width)) / 2 + area.x;
+        let y = (area.height.saturating_sub(height)) / 2 + area.y;
+        let rect = Rect { x, y, width, height };
+        let block = ratatui::widgets::Block::default()
+            .borders(ratatui::widgets::Borders::ALL)
+            .border_style(Style::default().fg(Color::Rgb(0xff, 0xa5, 0x00)))
+            .style(Style::default().bg(Color::Rgb(0x1e, 0x1e, 0x1e)))
+            .title(ratatui::text::Span::styled(
+                " OPEN ON LOCAL MAC? ",
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Rgb(0xff, 0xa5, 0x00))
+                    .add_modifier(Modifier::BOLD),
+            ));
+        frame.render_widget(ratatui::widgets::Clear, rect);
+        frame.render_widget(block, rect);
+        let inner = Rect {
+            x: rect.x + 2,
+            y: rect.y + 1,
+            width: rect.width.saturating_sub(4),
+            height: rect.height.saturating_sub(2),
+        };
+        let body = ratatui::text::Text::from(vec![
+            ratatui::text::Line::from(ratatui::text::Span::styled(
+                "This URL will open in YOUR LOCAL MAC's browser via the croft relay.",
+                Style::default().fg(Color::White),
+            )),
+            ratatui::text::Line::from(""),
+            ratatui::text::Line::from(ratatui::text::Span::styled(
+                truncate_for_display(url, inner.width as usize),
+                Style::default()
+                    .fg(Color::Rgb(0x4e, 0x9a, 0xff))
+                    .add_modifier(Modifier::UNDERLINED),
+            )),
+            ratatui::text::Line::from(""),
+            ratatui::text::Line::from(vec![
+                ratatui::text::Span::styled(
+                    "[Y]",
+                    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                ),
+                ratatui::text::Span::raw("es once   "),
+                ratatui::text::Span::styled(
+                    "[A]",
+                    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                ),
+                ratatui::text::Span::raw("lways for this session   "),
+                ratatui::text::Span::styled(
+                    "[N]",
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                ),
+                ratatui::text::Span::raw("o / Esc"),
+            ]),
+        ]);
+        frame.render_widget(ratatui::widgets::Paragraph::new(body), inner);
     }
 
     fn render_prompt(&self, frame: &mut ratatui::Frame) {
@@ -1986,6 +2061,11 @@ impl App {
         // Modal layer: prompt eats every key while it's open.
         if self.prompt.is_some() {
             self.handle_prompt_key(key);
+            return Ok(());
+        }
+        // Modal layer: local-browser confirmation eats every key.
+        if self.pending_local_open.is_some() {
+            self.handle_local_open_confirm_key(key);
             return Ok(());
         }
         // Modal layer: open context menu eats keyboard navigation.
@@ -2824,6 +2904,7 @@ impl App {
         };
         let mut still_pending: Vec<PendingRemotePull> = Vec::new();
         let mut placed: Vec<PathBuf> = Vec::new();
+        let mut opened_urls: Vec<String> = Vec::new();
         let mut errors: Vec<String> = Vec::new();
         let mut affected: BTreeSet<PathBuf> = BTreeSet::new();
         let pulls = std::mem::take(&mut self.pending_remote_pulls);
@@ -2849,6 +2930,9 @@ impl App {
                             Err(e) => errors.push(format!("clipboard relay: {e}")),
                         }
                     }
+                    RemotePullKind::Open => {
+                        opened_urls.push(pull.src_display.clone());
+                    }
                 }
                 let _ = std::fs::remove_dir_all(&request_dir);
             } else if err.exists() {
@@ -2868,7 +2952,8 @@ impl App {
                 self.terminal.paste_input(&bytes);
             }
         }
-        let resolved_any = !placed.is_empty() || !errors.is_empty();
+        let resolved_any =
+            !placed.is_empty() || !opened_urls.is_empty() || !errors.is_empty();
         self.pending_remote_pulls = still_pending;
         for dir in &affected {
             if let Some(idx) = self.tree.index_of_dir(dir) {
@@ -2889,17 +2974,24 @@ impl App {
         }
         if resolved_any {
             self.status = if errors.is_empty() {
-                if placed.len() == 1 {
+                if !opened_urls.is_empty() && placed.is_empty() {
+                    if opened_urls.len() == 1 {
+                        format!("Opened {} in your local browser", opened_urls[0])
+                    } else {
+                        format!("Opened {} URL(s) in your local browser", opened_urls.len())
+                    }
+                } else if placed.len() == 1 {
                     format!("Pulled {} from your Mac", placed[0].display())
                 } else {
                     format!("Pulled {} item(s) from your Mac", placed.len())
                 }
-            } else if placed.is_empty() {
+            } else if placed.is_empty() && opened_urls.is_empty() {
                 format!("Drop relay failed: {}", errors.join("; "))
             } else {
                 format!(
-                    "Pulled {}; failures: {}",
+                    "Pulled {} / opened {}; failures: {}",
                     placed.len(),
+                    opened_urls.len(),
                     errors.join("; "),
                 )
             };
@@ -2936,6 +3028,20 @@ impl App {
         let Some(link) = self.welcome_link_at(col, row).cloned() else {
             return false;
         };
+        // Remote-launched croft has no working `xdg-open`, and even if it
+        // did, the user wants the URL on their *local* Mac browser. Route
+        // it through the drop-relay back to local croft. First click in
+        // a session pops a confirmation; subsequent clicks go silently
+        // once the user has chosen "Always".
+        if self.drop_relay_active() {
+            if self.trust_local_browser {
+                self.request_remote_url_open(link.url.clone());
+                self.status = format!("Opening {} on your local Mac…", link.label);
+            } else {
+                self.pending_local_open = Some(link.url.clone());
+            }
+            return true;
+        }
         match open_url(&link.url) {
             Ok(()) => {
                 self.status = link.label;
@@ -2945,6 +3051,67 @@ impl App {
             }
         }
         true
+    }
+
+    fn request_remote_url_open(&mut self, url: String) {
+        let Some(log_path) = std::env::var_os("CROFT_DROP_RELAY_LOG").map(PathBuf::from) else {
+            self.status = String::from("Open link: drop relay vanished");
+            return;
+        };
+        let request_id = format!(
+            "open-{}-{}",
+            std::process::id(),
+            std::time::Instant::now().elapsed().as_nanos(),
+        );
+        let mut line = String::from("open\t");
+        line.push_str(&request_id);
+        line.push('\t');
+        line.push_str(&url);
+        line.push('\n');
+        match append_to_relay_log(&log_path, &line) {
+            Ok(()) => {
+                self.pending_remote_pulls.push(PendingRemotePull {
+                    request_id,
+                    src_display: url,
+                    basename: String::new(),
+                    dest_dir: PathBuf::new(),
+                    started_at: std::time::Instant::now(),
+                    kind: RemotePullKind::Open,
+                });
+            }
+            Err(e) => {
+                self.status = format!("Open link: relay write failed: {e}");
+            }
+        }
+    }
+
+    /// Handle a key while the local-browser confirmation modal is open.
+    /// `Y`/`Enter` opens this URL once. `A` opens it AND remembers
+    /// "always" for the rest of the session. `N`/`Esc` cancels.
+    fn handle_local_open_confirm_key(&mut self, key: KeyEvent) {
+        let Some(url) = self.pending_local_open.clone() else {
+            return;
+        };
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                self.pending_local_open = None;
+                self.request_remote_url_open(url.clone());
+                self.status = format!("Opening {url} on your local Mac…");
+            }
+            KeyCode::Char('a') | KeyCode::Char('A') => {
+                self.pending_local_open = None;
+                self.trust_local_browser = true;
+                self.request_remote_url_open(url.clone());
+                self.status = format!(
+                    "Trusted local browser for this session. Opening {url}…"
+                );
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                self.pending_local_open = None;
+                self.status = String::from("Open link cancelled");
+            }
+            _ => {}
+        }
     }
 
     fn handle_mouse(&mut self, m: MouseEvent) {
@@ -4552,6 +4719,24 @@ fn normalise_dropped_token(raw: &str) -> Option<PathBuf> {
         return None;
     }
     Some(PathBuf::from(unescaped))
+}
+
+/// Cap a string at `max` characters by inserting an ellipsis in the
+/// middle so the start (scheme/host) and end (path tail) both stay
+/// visible. `max <= 8` returns the original; below that the ellipsis
+/// alone wouldn't help.
+fn truncate_for_display(s: &str, max: usize) -> String {
+    if s.chars().count() <= max || max <= 8 {
+        return s.to_string();
+    }
+    let head = max / 2 - 1;
+    let tail = max - head - 1;
+    let mut out = String::new();
+    let chars: Vec<char> = s.chars().collect();
+    out.extend(chars.iter().take(head));
+    out.push('…');
+    out.extend(chars.iter().skip(chars.len() - tail));
+    out
 }
 
 fn append_to_relay_log(log_path: &Path, payload: &str) -> std::io::Result<()> {
