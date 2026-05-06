@@ -4451,21 +4451,60 @@ fn parsed_drop_tokens(s: &str) -> Vec<PathBuf> {
     if trimmed.is_empty() {
         return Vec::new();
     }
-    let mut tokens: Vec<String> = Vec::new();
-    if trimmed.contains('\n') || trimmed.contains('\t') {
-        for line in trimmed.split(|c| c == '\n' || c == '\r' || c == '\t') {
-            let cleaned = line.trim();
-            if !cleaned.is_empty() {
-                tokens.push(cleaned.to_string());
-            }
-        }
-    } else {
-        tokens.push(trimmed.to_string());
-    }
-    tokens
+    shell_split_drop_payload(trimmed)
         .into_iter()
         .filter_map(|raw| normalise_dropped_token(&raw))
         .collect()
+}
+
+/// Split a Finder / iTerm2 drag-drop payload into individual path tokens
+/// the way a POSIX-ish shell would. Backslash escapes the next char (so
+/// `\ ` keeps a literal space inside a filename); single- and double-
+/// quoted runs stay intact; unescaped whitespace (space, tab, CR, LF)
+/// separates tokens. Quote/backslash characters are *retained* in the
+/// emitted token so downstream `normalise_dropped_token` can reuse its
+/// existing un-escape + un-quote logic.
+fn shell_split_drop_payload(s: &str) -> Vec<String> {
+    let mut tokens: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut in_double = false;
+    let mut in_single = false;
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' && !in_single {
+            // Carry the backslash and its escapee through verbatim;
+            // `normalise_dropped_token` strips them later.
+            cur.push('\\');
+            if let Some(next) = chars.next() {
+                cur.push(next);
+            }
+            continue;
+        }
+        if c == '"' && !in_single {
+            in_double = !in_double;
+            cur.push(c);
+            continue;
+        }
+        if c == '\'' && !in_double {
+            in_single = !in_single;
+            cur.push(c);
+            continue;
+        }
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\r')
+            && !in_single
+            && !in_double
+        {
+            if !cur.is_empty() {
+                tokens.push(std::mem::take(&mut cur));
+            }
+            continue;
+        }
+        cur.push(c);
+    }
+    if !cur.is_empty() {
+        tokens.push(cur);
+    }
+    tokens
 }
 
 /// Strip surrounding quotes, decode `file://` URLs (with %xx escapes), and
@@ -6205,6 +6244,56 @@ mod tests {
         let payload = format!("{}\n{}\n", a.display(), b.display());
         let parsed = parse_dropped_paths(&payload);
         assert_eq!(parsed.len(), 2);
+        assert!(parsed.contains(&a));
+        assert!(parsed.contains(&b));
+    }
+
+    #[test]
+    fn parse_dropped_paths_supports_multi_file_drop_via_unescaped_spaces() {
+        // iTerm2's Finder-drop format for two files with spaces in their
+        // names is `<path1> <path2>`, where spaces inside a path are
+        // backslash-escaped and the separator between paths is a literal
+        // space. Make sure both paths come through.
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("02 Аленький цветочек.mp3");
+        let b = tmp.path().join("03 Буратино.mp3");
+        std::fs::write(&a, "x").unwrap();
+        std::fs::write(&b, "y").unwrap();
+        let payload = format!(
+            "{}/02\\ Аленький\\ цветочек.mp3 {}/03\\ Буратино.mp3",
+            tmp.path().to_string_lossy(),
+            tmp.path().to_string_lossy(),
+        );
+        let parsed = parse_dropped_paths(&payload);
+        assert_eq!(parsed.len(), 2, "expected two paths, got {parsed:?}");
+        assert!(parsed.contains(&a));
+        assert!(parsed.contains(&b));
+    }
+
+    #[test]
+    fn parse_dropped_paths_keeps_quoted_path_with_space_intact() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("with space.txt");
+        std::fs::write(&a, "x").unwrap();
+        let payload = format!("\"{}\"", a.display());
+        let parsed = parse_dropped_paths(&payload);
+        assert_eq!(parsed, vec![a]);
+    }
+
+    #[test]
+    fn parse_dropped_paths_handles_mix_of_quoted_and_escaped_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("plain.txt");
+        let b = tmp.path().join("with space.txt");
+        std::fs::write(&a, "x").unwrap();
+        std::fs::write(&b, "y").unwrap();
+        let payload = format!(
+            "{} \"{}\"",
+            a.display(),
+            b.display(),
+        );
+        let parsed = parse_dropped_paths(&payload);
+        assert_eq!(parsed.len(), 2, "got {parsed:?}");
         assert!(parsed.contains(&a));
         assert!(parsed.contains(&b));
     }
