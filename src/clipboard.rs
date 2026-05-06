@@ -52,83 +52,95 @@ mod macos {
     }
 
     unsafe fn read_string_native_inner() -> Option<String> {
-        let pasteboard_class = class(b"NSPasteboard\0")?;
-        let pasteboard = msg_send_id(pasteboard_class, sel(b"generalPasteboard\0")?);
-        if pasteboard.is_null() {
-            return None;
-        }
-
-        for type_name in [
-            b"public.utf8-plain-text\0".as_slice(),
-            b"public.plain-text\0".as_slice(),
-            b"public.text\0".as_slice(),
-            b"NSStringPboardType\0".as_slice(),
-        ] {
-            if let Some(value) = pasteboard_string_for_type(pasteboard, type_name) {
-                return Some(value);
+        unsafe {
+            let pasteboard_class = class(b"NSPasteboard\0")?;
+            let pasteboard = msg_send_id(pasteboard_class, sel(b"generalPasteboard\0")?);
+            if pasteboard.is_null() {
+                return None;
             }
-        }
 
-        None
+            for type_name in [
+                b"public.utf8-plain-text\0".as_slice(),
+                b"public.plain-text\0".as_slice(),
+                b"public.text\0".as_slice(),
+                b"NSStringPboardType\0".as_slice(),
+            ] {
+                if let Some(value) = pasteboard_string_for_type(pasteboard, type_name) {
+                    return Some(value);
+                }
+            }
+
+            None
+        }
     }
 
     unsafe fn pasteboard_string_for_type(
         pasteboard: ObjcId,
         type_name: &'static [u8],
     ) -> Option<String> {
-        let string_class = class(b"NSString\0")?;
-        let pasteboard_type = msg_send_id_ptr(
-            string_class,
-            sel(b"stringWithUTF8String:\0")?,
-            type_name.as_ptr().cast(),
-        );
-        if pasteboard_type.is_null() {
-            return None;
-        }
+        unsafe {
+            let string_class = class(b"NSString\0")?;
+            let pasteboard_type = msg_send_id_ptr(
+                string_class,
+                sel(b"stringWithUTF8String:\0")?,
+                type_name.as_ptr().cast(),
+            );
+            if pasteboard_type.is_null() {
+                return None;
+            }
 
-        let value = msg_send_id_id(pasteboard, sel(b"stringForType:\0")?, pasteboard_type);
-        if value.is_null() {
-            return None;
-        }
-        let utf8 = msg_send_ptr(value, sel(b"UTF8String\0")?);
-        if utf8.is_null() {
-            return None;
-        }
+            let value = msg_send_id_id(pasteboard, sel(b"stringForType:\0")?, pasteboard_type);
+            if value.is_null() {
+                return None;
+            }
+            let utf8 = msg_send_ptr(value, sel(b"UTF8String\0")?);
+            if utf8.is_null() {
+                return None;
+            }
 
-        Some(CStr::from_ptr(utf8).to_string_lossy().into_owned())
+            Some(CStr::from_ptr(utf8).to_string_lossy().into_owned())
+        }
     }
 
     unsafe fn class(name: &'static [u8]) -> Option<ObjcId> {
-        let c = objc_getClass(name.as_ptr().cast());
+        let c = unsafe { objc_getClass(name.as_ptr().cast()) };
         (!c.is_null()).then_some(c)
     }
 
     unsafe fn sel(name: &'static [u8]) -> Option<Sel> {
-        let s = sel_registerName(name.as_ptr().cast());
+        let s = unsafe { sel_registerName(name.as_ptr().cast()) };
         (!s.is_null()).then_some(s)
     }
 
     unsafe fn msg_send_id(receiver: ObjcId, selector: Sel) -> ObjcId {
-        let f: unsafe extern "C" fn(ObjcId, Sel) -> ObjcId =
-            std::mem::transmute(objc_msgSend as *const ());
-        f(receiver, selector)
+        unsafe {
+            let f: unsafe extern "C" fn(ObjcId, Sel) -> ObjcId =
+                std::mem::transmute(objc_msgSend as *const ());
+            f(receiver, selector)
+        }
     }
 
     unsafe fn msg_send_id_ptr(receiver: ObjcId, selector: Sel, arg: *const c_char) -> ObjcId {
-        let f: unsafe extern "C" fn(ObjcId, Sel, *const c_char) -> ObjcId =
-            std::mem::transmute(objc_msgSend as *const ());
-        f(receiver, selector, arg)
+        unsafe {
+            let f: unsafe extern "C" fn(ObjcId, Sel, *const c_char) -> ObjcId =
+                std::mem::transmute(objc_msgSend as *const ());
+            f(receiver, selector, arg)
+        }
     }
 
     unsafe fn msg_send_id_id(receiver: ObjcId, selector: Sel, arg: ObjcId) -> ObjcId {
-        let f: unsafe extern "C" fn(ObjcId, Sel, ObjcId) -> ObjcId =
-            std::mem::transmute(objc_msgSend as *const ());
-        f(receiver, selector, arg)
+        unsafe {
+            let f: unsafe extern "C" fn(ObjcId, Sel, ObjcId) -> ObjcId =
+                std::mem::transmute(objc_msgSend as *const ());
+            f(receiver, selector, arg)
+        }
     }
 
     unsafe fn msg_send_ptr(receiver: ObjcId, selector: Sel) -> *const c_char {
-        let f: unsafe extern "C" fn(ObjcId, Sel) -> *const c_char =
-            std::mem::transmute(objc_msgSend as *const ());
-        f(receiver, selector)
+        unsafe {
+            let f: unsafe extern "C" fn(ObjcId, Sel) -> *const c_char =
+                std::mem::transmute(objc_msgSend as *const ());
+            f(receiver, selector)
+        }
     }
 }
