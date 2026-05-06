@@ -259,25 +259,52 @@ struct DropPump {
 impl DropPump {
     fn start(ssh: &SshControl) -> Result<Self> {
         let id = relay_session_id();
-        let relay_dir = format!("$HOME/.cache/croft/relay-{id}");
-        let inbox_dir = format!("{relay_dir}/inbox");
-        let requests_log = format!("{relay_dir}/requests.log");
-        let setup = format!(
-            "set -e; mkdir -p {inbox_dir}; : > {requests_log}",
+        // The child croft process will see CROFT_DROP_RELAY_LOG /
+        // CROFT_DROP_RELAY_INBOX as plain string env vars and call
+        // open() on them directly, so the path must be absolute and
+        // already-expanded by the remote shell. Resolve $HOME once on
+        // the remote and capture the literal absolute path.
+        let resolve = format!(
+            "set -e; \
+             RELAY=\"$HOME/.cache/croft/relay-{id}\"; \
+             INBOX=\"$RELAY/inbox\"; \
+             LOG=\"$RELAY/requests.log\"; \
+             mkdir -p \"$INBOX\"; \
+             : > \"$LOG\"; \
+             printf '%s\\n%s\\n' \"$INBOX\" \"$LOG\""
         );
-        let status = ssh
+        let output = ssh
             .command()
             .arg(&ssh.host)
-            .arg(&setup)
-            .status()
+            .arg(&resolve)
+            .stderr(Stdio::inherit())
+            .output()
             .context("preparing remote drop relay")?;
-        if !status.success() {
-            anyhow::bail!("remote relay setup failed with {status}");
+        if !output.status.success() {
+            anyhow::bail!("remote relay setup failed with {}", output.status);
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut lines = stdout.lines();
+        let inbox_dir = lines
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("remote relay setup returned no inbox path"))?
+            .trim()
+            .to_string();
+        let requests_log = lines
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("remote relay setup returned no log path"))?
+            .trim()
+            .to_string();
+        if inbox_dir.is_empty() || requests_log.is_empty() {
+            anyhow::bail!("remote relay setup returned blank paths");
         }
         let mut tail = ssh
             .command()
             .arg(&ssh.host)
-            .arg(format!("exec tail -F -n 0 {requests_log} 2>/dev/null"))
+            .arg(format!(
+                "exec tail -F -n 0 {} 2>/dev/null",
+                shell_quote(&requests_log)
+            ))
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .stdin(Stdio::null())
@@ -397,7 +424,11 @@ fn handle_pull_request(
         );
         return;
     }
-    let dest = format!("{host}:{}/{}", dest_dir, basename);
+    // scp interprets the remote-side path through a shell on the
+    // remote, so any spaces in the user's $HOME would otherwise break
+    // the destination split. Single-quote it.
+    let remote_dest = format!("{}/{}", dest_dir, basename);
+    let dest = format!("{host}:{}", shell_quote(&remote_dest));
     let scp = Command::new("scp")
         .arg("-o")
         .arg(format!(
@@ -447,10 +478,12 @@ fn write_relay_err(
     message: &str,
 ) {
     let dest_dir = format!("{inbox_dir}/{request_id}");
+    let err_path = format!("{dest_dir}/.err");
     let cmd = format!(
-        "mkdir -p {dir} && printf %s {msg} > {dir}/.err",
+        "mkdir -p {dir} && printf %s {msg} > {err}",
         dir = shell_quote(&dest_dir),
         msg = shell_quote(message),
+        err = shell_quote(&err_path),
     );
     let _ = Command::new("ssh")
         .arg("-S")
