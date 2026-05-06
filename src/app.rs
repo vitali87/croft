@@ -453,6 +453,9 @@ pub struct App {
     /// the host shell for password / FIDO / known_hosts prompts and the
     /// user actually sees what's happening.
     pending_scp_uploads: Vec<ScpUpload>,
+    /// Drops awaiting reverse-pull from the user's local Mac via the
+    /// drop-relay launched by the local croft parent. Polled each frame.
+    pending_remote_pulls: Vec<PendingRemotePull>,
     /// Width in cells of the sidebar (Explorer / Search / Remote pane).
     /// Defaults to 32 cells; user can drag the splitter between sidebar
     /// and editor to widen or narrow.
@@ -526,6 +529,17 @@ pub struct ScpUpload {
     pub alias: String,
     pub src: PathBuf,
 }
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingRemotePull {
+    pub request_id: String,
+    pub src_display: String,
+    pub basename: String,
+    pub dest_dir: PathBuf,
+    pub started_at: std::time::Instant,
+}
+
+const REMOTE_PULL_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct RemoteLaunch {
@@ -787,6 +801,7 @@ impl App {
             tree_clipboard: None,
             tree_drag: None,
             pending_scp_uploads: Vec::new(),
+            pending_remote_pulls: Vec::new(),
             sidebar_width: SIDEBAR_WIDTH_DEFAULT,
             terminal_height: None,
             splitter_drag: None,
@@ -2561,6 +2576,19 @@ impl App {
                 _ => {}
             }
         }
+        // Remote-launched croft case: the path the user dragged from
+        // their local Finder doesn't exist on this remote box, so the
+        // strict parser above returned nothing. If the drop-relay env
+        // is plumbed (set by the local-croft parent over the SSH
+        // session) and the paste shape is path-like, request a reverse
+        // pull through the relay.
+        if self.drop_relay_active() && self.sidebar_view == SidebarView::Explorer {
+            let foreign = parse_foreign_dropped_paths(s);
+            if !foreign.is_empty() {
+                self.request_remote_pulls(&foreign);
+                return;
+            }
+        }
         if self.sidebar_view == SidebarView::Search && self.focus != Pane::Editor {
             self.search.insert_str_into_query(s);
             self.submit_search_query();
@@ -2662,6 +2690,137 @@ impl App {
 
     pub fn take_pending_scp_uploads(&mut self) -> Vec<ScpUpload> {
         std::mem::take(&mut self.pending_scp_uploads)
+    }
+
+    fn drop_relay_active(&self) -> bool {
+        std::env::var_os("CROFT_DROP_RELAY_LOG").is_some()
+            && std::env::var_os("CROFT_DROP_RELAY_INBOX").is_some()
+    }
+
+    fn request_remote_pulls(&mut self, paths: &[PathBuf]) {
+        let dest_dir = self.paste_target_dir();
+        let Some(log_path) = std::env::var_os("CROFT_DROP_RELAY_LOG").map(PathBuf::from) else {
+            self.status = String::from("Drop relay not available on this remote session");
+            return;
+        };
+        let mut lines = String::new();
+        let mut staged: Vec<PendingRemotePull> = Vec::new();
+        let now = std::time::Instant::now();
+        for src in paths {
+            let request_id = format!(
+                "{}-{}",
+                std::process::id(),
+                now.elapsed().as_nanos().wrapping_add(staged.len() as u128),
+            );
+            let basename = src
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| String::from("dropped"));
+            lines.push_str("pull\t");
+            lines.push_str(&request_id);
+            lines.push('\t');
+            lines.push_str(&src.to_string_lossy());
+            lines.push('\n');
+            staged.push(PendingRemotePull {
+                request_id,
+                src_display: src.to_string_lossy().into_owned(),
+                basename,
+                dest_dir: dest_dir.clone(),
+                started_at: now,
+            });
+        }
+        match append_to_relay_log(&log_path, &lines) {
+            Ok(()) => {
+                self.status = format!(
+                    "Fetching {} item(s) from your local Mac via croft relay…",
+                    staged.len(),
+                );
+                self.pending_remote_pulls.extend(staged);
+            }
+            Err(e) => {
+                self.status = format!("Drop relay write failed: {e}");
+            }
+        }
+    }
+
+    /// Check the relay inbox for completed pulls and surface them in the
+    /// explorer. Returns true if any pending pull resolved (success,
+    /// failure, or timeout) so the main loop knows to redraw.
+    pub fn drain_remote_pulls(&mut self) -> bool {
+        if self.pending_remote_pulls.is_empty() {
+            return false;
+        }
+        let Some(inbox) = std::env::var_os("CROFT_DROP_RELAY_INBOX").map(PathBuf::from) else {
+            self.pending_remote_pulls.clear();
+            self.status = String::from("Drop relay vanished mid-pull");
+            return true;
+        };
+        let mut still_pending: Vec<PendingRemotePull> = Vec::new();
+        let mut placed: Vec<PathBuf> = Vec::new();
+        let mut errors: Vec<String> = Vec::new();
+        let mut affected: BTreeSet<PathBuf> = BTreeSet::new();
+        let pulls = std::mem::take(&mut self.pending_remote_pulls);
+        for pull in pulls {
+            let request_dir = inbox.join(&pull.request_id);
+            let ok = request_dir.join(".ok");
+            let err = request_dir.join(".err");
+            if ok.exists() {
+                let staged_src = request_dir.join(&pull.basename);
+                affected.insert(pull.dest_dir.clone());
+                match crate::widgets::file_tree::move_into(&pull.dest_dir, &staged_src) {
+                    Ok(p) => placed.push(p),
+                    Err(e) => errors.push(format!("{}: {e}", pull.src_display)),
+                }
+                let _ = std::fs::remove_dir_all(&request_dir);
+            } else if err.exists() {
+                let msg = std::fs::read_to_string(&err)
+                    .unwrap_or_else(|_| String::from("relay error"));
+                errors.push(format!("{}: {}", pull.src_display, msg.trim()));
+                let _ = std::fs::remove_dir_all(&request_dir);
+            } else if pull.started_at.elapsed() > REMOTE_PULL_TIMEOUT {
+                errors.push(format!("{}: timed out after 120s", pull.src_display));
+                let _ = std::fs::remove_dir_all(&request_dir);
+            } else {
+                still_pending.push(pull);
+            }
+        }
+        let resolved_any = !placed.is_empty() || !errors.is_empty();
+        self.pending_remote_pulls = still_pending;
+        for dir in &affected {
+            if let Some(idx) = self.tree.index_of_dir(dir) {
+                self.tree.refresh_children(idx);
+            }
+        }
+        if !placed.is_empty() {
+            self.tree.marked.clear();
+            for p in &placed {
+                self.tree.marked.insert(p.clone());
+            }
+            if let Some(first) = placed.first() {
+                if let Some(idx) = self.tree.nodes.iter().position(|n| &n.path == first) {
+                    self.tree.selected = idx;
+                    self.tree.anchor = idx;
+                }
+            }
+        }
+        if resolved_any {
+            self.status = if errors.is_empty() {
+                if placed.len() == 1 {
+                    format!("Pulled {} from your Mac", placed[0].display())
+                } else {
+                    format!("Pulled {} item(s) from your Mac", placed.len())
+                }
+            } else if placed.is_empty() {
+                format!("Drop relay failed: {}", errors.join("; "))
+            } else {
+                format!(
+                    "Pulled {}; failures: {}",
+                    placed.len(),
+                    errors.join("; "),
+                )
+            };
+        }
+        resolved_any
     }
 
     pub fn report_scp_results(
@@ -4186,6 +4345,24 @@ fn drop_target_dir(
 /// path on disk, so a stray paste of "/usr/bin" worth of typed text still
 /// behaves like text.
 pub fn parse_dropped_paths(s: &str) -> Vec<PathBuf> {
+    parsed_drop_tokens(s)
+        .into_iter()
+        .filter(|p| p.is_absolute() && p.exists())
+        .collect()
+}
+
+/// Parse a bracketed-paste payload as candidate filesystem paths WITHOUT
+/// requiring the paths to exist on this machine. Used by the remote-
+/// launched croft to recognise drops whose paths refer to files on the
+/// user's local Mac, which the relay will fetch over scp.
+pub fn parse_foreign_dropped_paths(s: &str) -> Vec<PathBuf> {
+    parsed_drop_tokens(s)
+        .into_iter()
+        .filter(|p| p.is_absolute())
+        .collect()
+}
+
+fn parsed_drop_tokens(s: &str) -> Vec<PathBuf> {
     let trimmed = s.trim();
     if trimmed.is_empty() {
         return Vec::new();
@@ -4201,15 +4378,10 @@ pub fn parse_dropped_paths(s: &str) -> Vec<PathBuf> {
     } else {
         tokens.push(trimmed.to_string());
     }
-    let mut out: Vec<PathBuf> = Vec::new();
-    for raw in tokens {
-        if let Some(p) = normalise_dropped_token(&raw) {
-            if p.is_absolute() && p.exists() {
-                out.push(p);
-            }
-        }
-    }
-    out
+    tokens
+        .into_iter()
+        .filter_map(|raw| normalise_dropped_token(&raw))
+        .collect()
 }
 
 /// Strip surrounding quotes, decode `file://` URLs (with %xx escapes), and
@@ -4257,6 +4429,17 @@ fn normalise_dropped_token(raw: &str) -> Option<PathBuf> {
         return None;
     }
     Some(PathBuf::from(unescaped))
+}
+
+fn append_to_relay_log(log_path: &Path, payload: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)?;
+    f.write_all(payload.as_bytes())?;
+    f.sync_data().ok();
+    Ok(())
 }
 
 fn hex_digit(b: u8) -> Option<u8> {
@@ -6048,6 +6231,120 @@ mod tests {
         );
     }
 
+    fn relay_test_lock() -> &'static std::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    #[test]
+    fn remote_launched_drop_queues_pull_request_via_relay_log() {
+        let _guard = relay_test_lock().lock().unwrap();
+        // Simulates the case where the user dragged a Finder file onto a
+        // remote-launched croft. The Mac path doesn't exist on the remote
+        // box, but the parent local-croft has plumbed the relay env, so
+        // the drop is recorded in the request log instead of being
+        // pasted into the editor.
+        let workspace = tempfile::tempdir().unwrap();
+        let relay = tempfile::tempdir().unwrap();
+        let log = relay.path().join("requests.log");
+        let inbox = relay.path().join("inbox");
+        std::fs::create_dir_all(&inbox).unwrap();
+        // SAFETY: tests are single-threaded for env var manipulation.
+        unsafe {
+            std::env::set_var("CROFT_DROP_RELAY_LOG", &log);
+            std::env::set_var("CROFT_DROP_RELAY_INBOX", &inbox);
+        }
+        let mut app = App::new(workspace.path().to_path_buf()).unwrap();
+        app.set_sidebar_view(SidebarView::Explorer);
+        app.focus_pane(Pane::Tree);
+        app.handle_paste("/Users/vitali/Documents/foo.txt\n");
+        unsafe {
+            std::env::remove_var("CROFT_DROP_RELAY_LOG");
+            std::env::remove_var("CROFT_DROP_RELAY_INBOX");
+        }
+        let written = std::fs::read_to_string(&log).expect("relay log was written");
+        assert!(
+            written.starts_with("pull\t"),
+            "relay log entry must be a pull request, got: {written:?}",
+        );
+        assert!(
+            written.contains("/Users/vitali/Documents/foo.txt"),
+            "relay log must carry the foreign path, got: {written:?}",
+        );
+        assert_eq!(app.pending_remote_pulls.len(), 1);
+    }
+
+    #[test]
+    fn drain_remote_pulls_imports_file_when_relay_signals_ok() {
+        let _guard = relay_test_lock().lock().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let relay = tempfile::tempdir().unwrap();
+        let inbox = relay.path().join("inbox");
+        std::fs::create_dir_all(&inbox).unwrap();
+        unsafe {
+            std::env::set_var("CROFT_DROP_RELAY_INBOX", &inbox);
+        }
+        let mut app = App::new(workspace.path().to_path_buf()).unwrap();
+        app.set_sidebar_view(SidebarView::Explorer);
+        app.focus_pane(Pane::Tree);
+        let request_id = String::from("test-req-1");
+        let request_dir = inbox.join(&request_id);
+        std::fs::create_dir_all(&request_dir).unwrap();
+        let staged = request_dir.join("foo.txt");
+        std::fs::write(&staged, "payload").unwrap();
+        std::fs::write(request_dir.join(".ok"), b"").unwrap();
+        app.pending_remote_pulls.push(PendingRemotePull {
+            request_id: request_id.clone(),
+            src_display: String::from("/Users/v/Docs/foo.txt"),
+            basename: String::from("foo.txt"),
+            dest_dir: workspace.path().to_path_buf(),
+            started_at: std::time::Instant::now(),
+        });
+        let changed = app.drain_remote_pulls();
+        unsafe {
+            std::env::remove_var("CROFT_DROP_RELAY_INBOX");
+        }
+        assert!(changed);
+        assert!(app.pending_remote_pulls.is_empty());
+        let landed = workspace.path().join("foo.txt");
+        assert!(landed.exists(), "file should land in workspace");
+        assert_eq!(std::fs::read_to_string(&landed).unwrap(), "payload");
+        assert!(
+            !request_dir.exists(),
+            "relay request dir must be cleaned up after import",
+        );
+        assert!(app.status.contains("Pulled"));
+    }
+
+    #[test]
+    fn drain_remote_pulls_surfaces_relay_error_message() {
+        let _guard = relay_test_lock().lock().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let relay = tempfile::tempdir().unwrap();
+        let inbox = relay.path().join("inbox");
+        std::fs::create_dir_all(&inbox).unwrap();
+        unsafe {
+            std::env::set_var("CROFT_DROP_RELAY_INBOX", &inbox);
+        }
+        let mut app = App::new(workspace.path().to_path_buf()).unwrap();
+        let request_dir = inbox.join("req-2");
+        std::fs::create_dir_all(&request_dir).unwrap();
+        std::fs::write(request_dir.join(".err"), b"scp exited with 1").unwrap();
+        app.pending_remote_pulls.push(PendingRemotePull {
+            request_id: String::from("req-2"),
+            src_display: String::from("/Users/v/missing.txt"),
+            basename: String::from("missing.txt"),
+            dest_dir: workspace.path().to_path_buf(),
+            started_at: std::time::Instant::now(),
+        });
+        let changed = app.drain_remote_pulls();
+        unsafe {
+            std::env::remove_var("CROFT_DROP_RELAY_INBOX");
+        }
+        assert!(changed);
+        assert!(app.status.contains("scp exited with 1"));
+    }
+
     #[test]
     fn explorer_drop_on_terminal_focus_does_not_hijack_text_paste() {
         // Regression guard: when sidebar is Explorer and focus is on the
@@ -6409,8 +6706,9 @@ fn main_loop(
         let commits_changed = app.drain_recent_commits();
         let search_changed = app.drain_search_results();
         let remote_changed = app.refresh_remote_if_config_changed();
+        let pulls_changed = app.drain_remote_pulls();
 
-        if needs_redraw || fs_changed || pty_changed || blink_changed || commits_changed || search_changed || remote_changed {
+        if needs_redraw || fs_changed || pty_changed || blink_changed || commits_changed || search_changed || remote_changed || pulls_changed {
             // If the welcome OSC-1337 image was painted earlier and the
             // user has just opened a file, wipe the screen so iTerm drops
             // its cached image cells AND ratatui repaints every cell on

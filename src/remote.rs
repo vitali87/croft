@@ -1,10 +1,12 @@
 use anyhow::{Context, Result};
 use std::collections::BTreeSet;
 use std::hash::Hasher;
-#[cfg(test)]
-use std::path::Path;
-use std::path::PathBuf;
-use std::process::{Command, ExitStatus, Stdio};
+use std::io::{BufRead, BufReader};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::thread::{self, JoinHandle};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RemoteTarget {
@@ -147,7 +149,15 @@ pub fn launch_croft(host: &str, path: Option<&str>) -> Result<()> {
         println!("Installing/updating Croft on {host}...");
         install_remote_croft(&ssh, &local_stamp)?;
     }
-    let status = run_remote_croft(&ssh, path)?;
+    let pump = match DropPump::start(&ssh) {
+        Ok(p) => Some(p),
+        Err(e) => {
+            eprintln!("Drag-drop relay disabled: {e}");
+            None
+        }
+    };
+    let env = pump.as_ref().map(DropPump::remote_env).unwrap_or_default();
+    let status = run_remote_croft(&ssh, path, &env)?;
     if status.success() {
         return Ok(());
     }
@@ -155,7 +165,7 @@ pub fn launch_croft(host: &str, path: Option<&str>) -> Result<()> {
         println!("Croft is not installed on {host}; bootstrapping from local source...");
         install_remote_croft(&ssh, &local_stamp)?;
         println!("Reconnecting to {host}...");
-        let status = run_remote_croft(&ssh, path)?;
+        let status = run_remote_croft(&ssh, path, &env)?;
         if status.success() {
             return Ok(());
         }
@@ -220,6 +230,246 @@ impl Drop for SshControl {
     }
 }
 
+/// Drag-drop relay between local Finder and a remote-launched croft.
+///
+/// Local croft holds an SSH ControlMaster to the remote host. We piggy-
+/// back on it to expose a tiny request/response protocol so the remote
+/// croft can pull files from the user's local machine without needing
+/// macOS Remote Login or reverse port forwarding.
+///
+/// Wire format on the remote box:
+///
+///   `~/.cache/croft/relay-<id>/requests.log`
+///       Append-only log. Remote croft writes one line per drop:
+///         `pull\t<request-id>\t<absolute-local-path>\n`
+///   `~/.cache/croft/relay-<id>/inbox/<request-id>/<basename>`
+///       Where the file lands once scp succeeds.
+///   `~/.cache/croft/relay-<id>/inbox/<request-id>/.ok`
+///       Sentinel local croft writes after a successful copy.
+///   `~/.cache/croft/relay-<id>/inbox/<request-id>/.err`
+///       Sentinel local croft writes with the failure message.
+struct DropPump {
+    inbox_dir: String,
+    requests_log: String,
+    stop: Arc<AtomicBool>,
+    tail: Option<Child>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl DropPump {
+    fn start(ssh: &SshControl) -> Result<Self> {
+        let id = relay_session_id();
+        let relay_dir = format!("$HOME/.cache/croft/relay-{id}");
+        let inbox_dir = format!("{relay_dir}/inbox");
+        let requests_log = format!("{relay_dir}/requests.log");
+        let setup = format!(
+            "set -e; mkdir -p {inbox_dir}; : > {requests_log}",
+        );
+        let status = ssh
+            .command()
+            .arg(&ssh.host)
+            .arg(&setup)
+            .status()
+            .context("preparing remote drop relay")?;
+        if !status.success() {
+            anyhow::bail!("remote relay setup failed with {status}");
+        }
+        let mut tail = ssh
+            .command()
+            .arg(&ssh.host)
+            .arg(format!("exec tail -F -n 0 {requests_log} 2>/dev/null"))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .stdin(Stdio::null())
+            .spawn()
+            .context("spawning remote requests tail")?;
+        let stdout = tail
+            .stdout
+            .take()
+            .context("capturing remote requests tail stdout")?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let pump_ssh_host = ssh.host.clone();
+        let pump_socket = ssh.socket_path.clone();
+        let pump_inbox = inbox_dir.clone();
+        let pump_stop = stop.clone();
+        let handle = thread::spawn(move || {
+            run_pump(pump_ssh_host, pump_socket, pump_inbox, stdout, pump_stop);
+        });
+        Ok(Self {
+            inbox_dir,
+            requests_log,
+            stop,
+            tail: Some(tail),
+            handle: Some(handle),
+        })
+    }
+
+    fn remote_env(&self) -> Vec<(String, String)> {
+        vec![
+            (String::from("CROFT_DROP_RELAY_LOG"), self.requests_log.clone()),
+            (String::from("CROFT_DROP_RELAY_INBOX"), self.inbox_dir.clone()),
+        ]
+    }
+}
+
+impl Drop for DropPump {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(mut tail) = self.tail.take() {
+            let _ = tail.kill();
+            let _ = tail.wait();
+        }
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn run_pump(
+    host: String,
+    socket: PathBuf,
+    inbox_dir: String,
+    stdout: std::process::ChildStdout,
+    stop: Arc<AtomicBool>,
+) {
+    let reader = BufReader::new(stdout);
+    for line in reader.lines() {
+        if stop.load(Ordering::SeqCst) {
+            break;
+        }
+        let Ok(line) = line else { break };
+        if let Some((request_id, src)) = parse_pull_request(&line) {
+            handle_pull_request(&host, &socket, &inbox_dir, &request_id, &src);
+        }
+    }
+}
+
+fn parse_pull_request(line: &str) -> Option<(String, String)> {
+    let line = line.trim();
+    let mut parts = line.split('\t');
+    let kind = parts.next()?;
+    if kind != "pull" {
+        return None;
+    }
+    let id = parts.next()?.to_string();
+    let src = parts.next()?.to_string();
+    if id.is_empty() || src.is_empty() {
+        return None;
+    }
+    Some((id, src))
+}
+
+fn handle_pull_request(
+    host: &str,
+    socket: &Path,
+    inbox_dir: &str,
+    request_id: &str,
+    src: &str,
+) {
+    let src_path = PathBuf::from(src);
+    let basename = src_path
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| String::from("dropped"));
+    let dest_dir = format!("{inbox_dir}/{request_id}");
+    let mkdir = format!("mkdir -p {}", shell_quote(&dest_dir));
+    let mkdir_ok = Command::new("ssh")
+        .arg("-S")
+        .arg(socket)
+        .arg("-o")
+        .arg("ControlMaster=no")
+        .arg(host)
+        .arg(&mkdir)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !mkdir_ok {
+        write_relay_err(host, socket, inbox_dir, request_id, "remote mkdir failed");
+        return;
+    }
+    if !src_path.exists() {
+        write_relay_err(
+            host,
+            socket,
+            inbox_dir,
+            request_id,
+            &format!("local file not found: {}", src_path.display()),
+        );
+        return;
+    }
+    let dest = format!("{host}:{}/{}", dest_dir, basename);
+    let scp = Command::new("scp")
+        .arg("-o")
+        .arg(format!(
+            "ControlPath={}",
+            socket.to_string_lossy()
+        ))
+        .arg("-o")
+        .arg("ControlMaster=no")
+        .arg("-r")
+        .arg(&src_path)
+        .arg(&dest)
+        .status();
+    match scp {
+        Ok(s) if s.success() => {
+            let touch = format!("touch {}/.ok", shell_quote(&dest_dir));
+            let _ = Command::new("ssh")
+                .arg("-S")
+                .arg(socket)
+                .arg("-o")
+                .arg("ControlMaster=no")
+                .arg(host)
+                .arg(&touch)
+                .status();
+        }
+        Ok(s) => write_relay_err(
+            host,
+            socket,
+            inbox_dir,
+            request_id,
+            &format!("scp exited with {s}"),
+        ),
+        Err(e) => write_relay_err(
+            host,
+            socket,
+            inbox_dir,
+            request_id,
+            &format!("scp spawn failed: {e}"),
+        ),
+    }
+}
+
+fn write_relay_err(
+    host: &str,
+    socket: &Path,
+    inbox_dir: &str,
+    request_id: &str,
+    message: &str,
+) {
+    let dest_dir = format!("{inbox_dir}/{request_id}");
+    let cmd = format!(
+        "mkdir -p {dir} && printf %s {msg} > {dir}/.err",
+        dir = shell_quote(&dest_dir),
+        msg = shell_quote(message),
+    );
+    let _ = Command::new("ssh")
+        .arg("-S")
+        .arg(socket)
+        .arg("-o")
+        .arg("ControlMaster=no")
+        .arg(host)
+        .arg(&cmd)
+        .status();
+}
+
+fn relay_session_id() -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{}-{now}", std::process::id())
+}
+
 fn ssh_control_dir() -> Result<PathBuf> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -231,12 +481,16 @@ fn ssh_control_dir() -> Result<PathBuf> {
     )))
 }
 
-fn run_remote_croft(ssh: &SshControl, path: Option<&str>) -> Result<ExitStatus> {
+fn run_remote_croft(
+    ssh: &SshControl,
+    path: Option<&str>,
+    env: &[(String, String)],
+) -> Result<ExitStatus> {
     let mut command = ssh.command();
     command
         .arg("-tt")
         .arg(&ssh.host)
-        .arg(remote_croft_command(path));
+        .arg(remote_croft_command(path, env));
     command.status().context("starting ssh")
 }
 
@@ -254,20 +508,32 @@ fn install_remote_croft(ssh: &SshControl, source_stamp: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn remote_croft_command(path: Option<&str>) -> String {
+pub fn remote_croft_command(path: Option<&str>, env: &[(String, String)]) -> String {
     remote_croft_command_for_terminal(
         path,
         std::env::var("TERM_PROGRAM").ok().as_deref(),
+        env,
     )
 }
 
-fn remote_croft_command_for_terminal(path: Option<&str>, term_program: Option<&str>) -> String {
+fn remote_croft_command_for_terminal(
+    path: Option<&str>,
+    term_program: Option<&str>,
+    env: &[(String, String)],
+) -> String {
     let mut prefix = String::new();
     if let Some(term_program) =
         term_program.filter(|value| crate::iterm2_inline::is_iterm2_term_program(Some(value)))
     {
         prefix.push_str("export CROFT_FORCE_INLINE_IMAGES=1 TERM_PROGRAM=");
         prefix.push_str(&shell_quote(term_program));
+        prefix.push_str("; ");
+    }
+    for (k, v) in env {
+        prefix.push_str("export ");
+        prefix.push_str(k);
+        prefix.push('=');
+        prefix.push_str(&shell_quote(v));
         prefix.push_str("; ");
     }
     prefix.push_str("export PATH=\"$HOME/.cargo/bin:$PATH\"; command -v croft >/dev/null 2>&1 || { echo 'croft not found on remote PATH' >&2; exit 127; }; exec croft");
@@ -536,7 +802,7 @@ Host !blocked *.internal
     #[test]
     fn remote_croft_command_quotes_paths() {
         assert_eq!(
-            remote_croft_command_for_terminal(Some("/tmp/it's here"), None),
+            remote_croft_command_for_terminal(Some("/tmp/it's here"), None, &[]),
             "export PATH=\"$HOME/.cargo/bin:$PATH\"; command -v croft >/dev/null 2>&1 || { echo 'croft not found on remote PATH' >&2; exit 127; }; exec croft '/tmp/it'\"'\"'s here'"
         );
     }
@@ -544,9 +810,36 @@ Host !blocked *.internal
     #[test]
     fn remote_croft_command_forwards_supported_terminal_program() {
         assert_eq!(
-            remote_croft_command_for_terminal(None, Some("iTerm.app")),
+            remote_croft_command_for_terminal(None, Some("iTerm.app"), &[]),
             "export CROFT_FORCE_INLINE_IMAGES=1 TERM_PROGRAM='iTerm.app'; export PATH=\"$HOME/.cargo/bin:$PATH\"; command -v croft >/dev/null 2>&1 || { echo 'croft not found on remote PATH' >&2; exit 127; }; exec croft"
         );
+    }
+
+    #[test]
+    fn remote_croft_command_exports_drop_relay_env() {
+        let env = vec![
+            (String::from("CROFT_DROP_RELAY_LOG"), String::from("/tmp/r/log")),
+            (String::from("CROFT_DROP_RELAY_INBOX"), String::from("/tmp/r/inbox")),
+        ];
+        let command = remote_croft_command_for_terminal(None, None, &env);
+        assert!(command.contains("export CROFT_DROP_RELAY_LOG='/tmp/r/log'"));
+        assert!(command.contains("export CROFT_DROP_RELAY_INBOX='/tmp/r/inbox'"));
+    }
+
+    #[test]
+    fn parse_pull_request_extracts_id_and_path() {
+        let parsed = super::parse_pull_request("pull\tabc-123\t/Users/v/foo.txt");
+        assert_eq!(
+            parsed,
+            Some((String::from("abc-123"), String::from("/Users/v/foo.txt"))),
+        );
+    }
+
+    #[test]
+    fn parse_pull_request_rejects_unknown_kind() {
+        assert!(super::parse_pull_request("ping\tabc\t/x").is_none());
+        assert!(super::parse_pull_request("pull\t\t/x").is_none());
+        assert!(super::parse_pull_request("pull\tabc\t").is_none());
     }
 
     #[test]
