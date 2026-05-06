@@ -16,7 +16,11 @@ path = "src/main.rs"
 ratatui = "0.30"
 crossterm = { version = "0.29", features = ["event-stream"] }
 portable-pty = "0.9"
-vt100 = "0.16"
+# Embedded-shell terminal emulator. Production-grade engine from
+# alacritty + zed; bounded scrollback, no allocation churn under
+# heavy alt-screen TUI workloads (vt100 0.16 leaks tens of GB
+# under multi-hour `claude`-style streams; this does not).
+alacritty_terminal = "0.26"
 
 # Tree-sitter core + per-language grammars.  Direct deps, no dynamic loading.
 tree-sitter = "0.26"

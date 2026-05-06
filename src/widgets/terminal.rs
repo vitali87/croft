@@ -1,3 +1,12 @@
+use alacritty_terminal::event::{Event as AlacEvent, EventListener};
+use alacritty_terminal::grid::{Dimensions, Scroll};
+use alacritty_terminal::index::{Column, Line, Point};
+use alacritty_terminal::sync::FairMutex;
+use alacritty_terminal::term::cell::Flags;
+use alacritty_terminal::term::test::TermSize;
+use alacritty_terminal::term::{Config, TermMode};
+use alacritty_terminal::vte::ansi::{Color as AnsiColor, NamedColor, Processor, StdSyncHandler};
+use alacritty_terminal::Term;
 use anyhow::{Context, Result};
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use ratatui::{
@@ -7,15 +16,12 @@ use ratatui::{
     text::Span,
     widgets::{Block, Borders, Widget},
 };
-use std::io::Write;
+use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-/// Inclusive cell range in the terminal's *inner* coordinate system (0,0 at
-/// the top-left of the content area, not the border).  Stored as the
-/// (row, col) of the cell where the user pressed the mouse and the cell
-/// where it currently is.  `selection_range()` normalises them so end >= start
-/// in row-major order.
+const SCROLLBACK_LINES: usize = 5000;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Selection {
     pub anchor: (u16, u16),
@@ -26,8 +32,6 @@ impl Selection {
     pub fn new(row: u16, col: u16) -> Self {
         Self { anchor: (row, col), head: (row, col) }
     }
-    /// `(start_row, start_col, end_row, end_col)` with start <= end in
-    /// row-major order.
     pub fn normalised(&self) -> (u16, u16, u16, u16) {
         let (a_r, a_c) = self.anchor;
         let (b_r, b_c) = self.head;
@@ -38,23 +42,27 @@ impl Selection {
             (b_r, b_c, a_r, a_c)
         }
     }
-    /// True if the selected region covers more than a single cell.
     pub fn has_area(&self) -> bool {
         self.anchor != self.head
     }
 }
 
+/// Listener that swallows events from the embedded `Term`. We don't act
+/// on title changes / cursor blink / clipboard requests etc. — the outer
+/// croft TUI owns all of those.
+#[derive(Clone, Default)]
+pub struct VoidListener;
+impl EventListener for VoidListener {
+    fn send_event(&self, _event: AlacEvent) {}
+}
+
 pub struct PtyTerminal {
-    parser: Arc<Mutex<vt100::Parser>>,
-    /// Set by the PTY reader thread on every chunk that reaches the screen
-    /// and by `write_input`; cleared by `take_dirty`. Lets the main loop
-    /// skip `terminal.draw` entirely when nothing has changed.
+    term: Arc<FairMutex<Term<VoidListener>>>,
+    /// Set by the PTY reader thread on every chunk and by `write_input`;
+    /// cleared by `take_dirty`. The main loop only redraws when set.
     pty_dirty: Arc<AtomicBool>,
     /// Tracks whether the inner program has enabled DECSET 2004 (bracketed
-    /// paste). Updated by the reader thread. The paste-into-terminal path
-    /// reads this to decide whether to wrap the payload in `\e[200~` /
-    /// `\e[201~` markers; sending markers to a shell that didn't ask for
-    /// them produces literal escape garbage on the line.
+    /// paste). Sniffed off the byte stream; not all parsers expose it.
     bracketed_paste_enabled: Arc<AtomicBool>,
     master: Box<dyn MasterPty + Send>,
     writer: Box<dyn Write + Send>,
@@ -87,19 +95,21 @@ impl PtyTerminal {
 
         let writer = pair.master.take_writer().context("take writer")?;
         let mut reader = pair.master.try_clone_reader().context("clone reader")?;
-        // 5000 rows of scrollback ≈ 1 MB at typical line widths; plenty for
-        // mouse-wheel history navigation, cheap in memory.
-        let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 5000)));
-        let parser_for_thread = parser.clone();
-        // Start dirty so the very first frame renders even if the shell
-        // hasn't produced output yet (status bar, borders, etc.).
+
+        let term_size = TermSize::new(cols as usize, rows as usize);
+        let cfg = Config { scrolling_history: SCROLLBACK_LINES, ..Config::default() };
+        let term = Term::new(cfg, &term_size, VoidListener);
+        let term = Arc::new(FairMutex::new(term));
+        let term_for_thread = term.clone();
+
         let pty_dirty = Arc::new(AtomicBool::new(true));
         let pty_dirty_for_thread = pty_dirty.clone();
         let bracketed_paste_enabled = Arc::new(AtomicBool::new(false));
         let bracketed_paste_for_thread = bracketed_paste_enabled.clone();
 
         std::thread::spawn(move || {
-            let mut buf = [0u8; 4096];
+            let mut processor = Processor::<StdSyncHandler>::new();
+            let mut buf = [0u8; 65536];
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) => break,
@@ -108,9 +118,9 @@ impl PtyTerminal {
                             &buf[..n],
                             &bracketed_paste_for_thread,
                         );
-                        if let Ok(mut p) = parser_for_thread.lock() {
-                            p.process(&buf[..n]);
-                        }
+                        let mut t = term_for_thread.lock();
+                        processor.advance(&mut *t, &buf[..n]);
+                        drop(t);
                         pty_dirty_for_thread.store(true, Ordering::Release);
                     }
                     Err(_) => break,
@@ -119,7 +129,7 @@ impl PtyTerminal {
         });
 
         Ok(Self {
-            parser,
+            term,
             pty_dirty,
             bracketed_paste_enabled,
             master: pair.master,
@@ -134,16 +144,10 @@ impl PtyTerminal {
         })
     }
 
-    /// Atomically check-and-clear the PTY dirty flag. Returns true iff the
-    /// reader thread or `write_input` has produced new bytes since the
-    /// previous call. Acquire ordering pairs with the Release store on
-    /// the writing side so any state mutations are visible.
     pub fn take_dirty(&self) -> bool {
         self.pty_dirty.swap(false, Ordering::AcqRel)
     }
 
-    /// Translate an absolute terminal mouse coordinate to an inner cell, or
-    /// `None` if outside the terminal pane's content area.
     pub fn cell_at(&self, col: u16, row: u16) -> Option<(u16, u16)> {
         let inner = self.last_inner;
         if inner.width == 0 || inner.height == 0 {
@@ -179,36 +183,23 @@ impl PtyTerminal {
         self.selection
     }
 
-    /// Extract the text covered by the current selection by walking the
-    /// vt100 screen cells in row-major order.  Returns an empty string if
-    /// nothing is selected.  Trailing spaces on each row are trimmed (the
-    /// usual "row of cells" → "displayed text" convention).
     pub fn selection_text(&self) -> String {
         let Some(sel) = self.selection else { return String::new() };
         let (sr, sc, er, ec) = sel.normalised();
-        let parser = match self.parser.lock() {
-            Ok(p) => p,
-            Err(_) => return String::new(),
-        };
-        let screen = parser.screen();
-        extract_selection_text(screen, sr, sc, er, ec)
+        let term = self.term.lock();
+        extract_selection_text(&term, sr as usize, sc as usize, er as usize, ec as usize)
     }
 
     pub fn write_input(&mut self, data: &[u8]) {
-        // Snap back to the live bottom on user input so the response is visible.
         self.reset_scrollback();
         let _ = self.writer.write_all(data);
         let _ = self.writer.flush();
-        // Even before the shell echoes back, scrollback was just reset, so
-        // we must redraw at least once.
         self.pty_dirty.store(true, Ordering::Release);
     }
 
-    /// Paste a payload into the embedded shell. If the inner program has
-    /// enabled bracketed-paste mode, wrap the bytes in `\e[200~` /
-    /// `\e[201~` so the shell handles multi-line content as a single
-    /// edit; otherwise send raw bytes so the markers don't appear as
-    /// literal escape garbage on the prompt.
+    /// Paste a payload into the embedded shell. Bracketed-paste markers
+    /// are added only if the inner program asked for them; otherwise the
+    /// payload is sent raw so simple shells don't see literal `\e[200~`.
     pub fn paste_input(&mut self, payload: &[u8]) {
         if self.bracketed_paste_enabled.load(Ordering::Acquire) {
             self.write_input(b"\x1b[200~");
@@ -219,29 +210,33 @@ impl PtyTerminal {
         }
     }
 
-    /// Scroll the visible window up by `n` rows into history. Returns false
-    /// if we're in alternate-screen mode (vim/less/htop manage their own
-    /// scrollback), so the caller can fall back to sending arrow keys.
+    /// Scroll the visible viewport up by `n` rows into scrollback.
+    /// Returns false if the inner program is in alternate-screen mode
+    /// (apps like vim/htop/less manage their own scrolling).
     pub fn scroll_up(&mut self, n: usize) -> bool {
-        let mut parser = match self.parser.lock() {
-            Ok(p) => p,
-            Err(_) => return false,
-        };
-        scroll_screen_up(parser.screen_mut(), n)
+        let mut term = self.term.lock();
+        if term.mode().contains(TermMode::ALT_SCREEN) {
+            return false;
+        }
+        term.scroll_display(Scroll::Delta(n as i32));
+        self.pty_dirty.store(true, Ordering::Release);
+        true
     }
 
     pub fn scroll_down(&mut self, n: usize) -> bool {
-        let mut parser = match self.parser.lock() {
-            Ok(p) => p,
-            Err(_) => return false,
-        };
-        scroll_screen_down(parser.screen_mut(), n)
+        let mut term = self.term.lock();
+        if term.mode().contains(TermMode::ALT_SCREEN) {
+            return false;
+        }
+        term.scroll_display(Scroll::Delta(-(n as i32)));
+        self.pty_dirty.store(true, Ordering::Release);
+        true
     }
 
     pub fn reset_scrollback(&mut self) {
-        if let Ok(mut parser) = self.parser.lock() {
-            parser.screen_mut().set_scrollback(0);
-        }
+        let mut term = self.term.lock();
+        term.scroll_display(Scroll::Bottom);
+        self.pty_dirty.store(true, Ordering::Release);
     }
 
     pub fn resize(&mut self, cols: u16, rows: u16) {
@@ -256,40 +251,38 @@ impl PtyTerminal {
             pixel_width: 0,
             pixel_height: 0,
         });
-        if let Ok(mut p) = self.parser.lock() {
-            p.screen_mut().set_size(rows, cols);
-        }
+        let mut term = self.term.lock();
+        let size = TermSize::new(cols as usize, rows as usize);
+        term.resize(size);
+        self.pty_dirty.store(true, Ordering::Release);
     }
 }
 
-use std::io::Read;
-
-/// Walk the vt100 screen from (sr, sc) to (er, ec) inclusive in row-major
-/// order, joining cell contents row by row, trimming trailing spaces, and
-/// inserting `\n` between rows.  Public so it can be unit-tested.
+/// Walk the visible grid from (sr, sc) to (er, ec) inclusive, joining
+/// cell contents row-by-row, trimming trailing whitespace per row, and
+/// inserting `\n` between rows. Coordinates are viewport-relative.
 pub fn extract_selection_text(
-    screen: &vt100::Screen,
-    sr: u16,
-    sc: u16,
-    er: u16,
-    ec: u16,
+    term: &Term<VoidListener>,
+    sr: usize,
+    sc: usize,
+    er: usize,
+    ec: usize,
 ) -> String {
-    let cols = screen.size().1;
+    let cols = term.columns();
+    let rows = term.screen_lines();
     let mut out = String::new();
-    for row in sr..=er {
+    for row in sr..=er.min(rows.saturating_sub(1)) {
         let row_start = if row == sr { sc } else { 0 };
-        let row_end = if row == er { ec } else { cols.saturating_sub(1) };
+        let row_end = if row == er { ec.min(cols.saturating_sub(1)) } else { cols.saturating_sub(1) };
         let mut line = String::new();
         for col in row_start..=row_end {
-            if let Some(cell) = screen.cell(row, col) {
-                let s = cell.contents();
-                if s.is_empty() {
-                    line.push(' ');
-                } else {
-                    line.push_str(s);
-                }
-            } else {
+            let p = Point::new(Line(row as i32), Column(col));
+            let cell = &term.grid()[p];
+            let c = cell.c;
+            if c == '\0' {
                 line.push(' ');
+            } else {
+                line.push(c);
             }
         }
         let trimmed = line.trim_end();
@@ -302,11 +295,7 @@ pub fn extract_selection_text(
 }
 
 /// Walk a chunk of PTY output and toggle the bracketed-paste flag when
-/// we see `\e[?2004h` (set) / `\e[?2004l` (reset). vt100 0.15 doesn't
-/// expose this mode, so we sniff the byte stream alongside the parser.
-/// Tolerates the markers split across read calls only when the boundary
-/// falls outside an active match — good enough in practice because shells
-/// emit the marker as a single contiguous write.
+/// we see `\e[?2004h` (set) / `\e[?2004l` (reset).
 pub fn sniff_bracketed_paste_mode(chunk: &[u8], flag: &AtomicBool) {
     let needle_set: &[u8] = b"\x1b[?2004h";
     let needle_reset: &[u8] = b"\x1b[?2004l";
@@ -324,32 +313,8 @@ pub fn sniff_bracketed_paste_mode(chunk: &[u8], flag: &AtomicBool) {
     }
 }
 
-/// Increase the screen's scrollback offset by `n` rows (showing older
-/// content). Refuses in alternate-screen mode so apps like vim / htop / less
-/// keep their own scrolling semantics.
-pub fn scroll_screen_up(screen: &mut vt100::Screen, n: usize) -> bool {
-    if screen.alternate_screen() {
-        return false;
-    }
-    let cur = screen.scrollback();
-    screen.set_scrollback(cur + n);
-    true
-}
-
-/// Decrease the scrollback offset (toward live bottom). Floors at zero.
-/// Refuses in alternate-screen mode.
-pub fn scroll_screen_down(screen: &mut vt100::Screen, n: usize) -> bool {
-    if screen.alternate_screen() {
-        return false;
-    }
-    let cur = screen.scrollback();
-    screen.set_scrollback(cur.saturating_sub(n));
-    true
-}
-
-/// Build the OSC 52 escape sequence that asks the host terminal to put `text`
-/// on the system clipboard.  Format: `ESC ] 52 ; c ; <base64> BEL`. Supported
-/// by iTerm2, Ghostty, kitty, WezTerm, Alacritty, and tmux (when configured).
+/// Build the OSC 52 escape sequence that asks the host terminal to put
+/// `text` on the system clipboard.
 pub fn osc52_copy_seq(text: &str) -> Vec<u8> {
     use base64::Engine;
     let encoded = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
@@ -360,11 +325,43 @@ pub fn osc52_copy_seq(text: &str) -> Vec<u8> {
     out
 }
 
-fn vt_color(c: vt100::Color) -> Option<Color> {
+fn ansi_to_ratatui(c: AnsiColor) -> Option<Color> {
     match c {
-        vt100::Color::Default => None,
-        vt100::Color::Idx(i) => Some(Color::Indexed(i)),
-        vt100::Color::Rgb(r, g, b) => Some(Color::Rgb(r, g, b)),
+        AnsiColor::Spec(rgb) => Some(Color::Rgb(rgb.r, rgb.g, rgb.b)),
+        AnsiColor::Indexed(i) => Some(Color::Indexed(i)),
+        AnsiColor::Named(named) => named_to_ratatui(named),
+    }
+}
+
+fn named_to_ratatui(n: NamedColor) -> Option<Color> {
+    use NamedColor::*;
+    match n {
+        Foreground | Background | Cursor | DimForeground => None,
+        Black => Some(Color::Black),
+        Red => Some(Color::Red),
+        Green => Some(Color::Green),
+        Yellow => Some(Color::Yellow),
+        Blue => Some(Color::Blue),
+        Magenta => Some(Color::Magenta),
+        Cyan => Some(Color::Cyan),
+        White => Some(Color::Gray),
+        BrightBlack => Some(Color::DarkGray),
+        BrightRed => Some(Color::LightRed),
+        BrightGreen => Some(Color::LightGreen),
+        BrightYellow => Some(Color::LightYellow),
+        BrightBlue => Some(Color::LightBlue),
+        BrightMagenta => Some(Color::LightMagenta),
+        BrightCyan => Some(Color::LightCyan),
+        BrightWhite => Some(Color::White),
+        DimBlack => Some(Color::Black),
+        DimRed => Some(Color::Red),
+        DimGreen => Some(Color::Green),
+        DimYellow => Some(Color::Yellow),
+        DimBlue => Some(Color::Blue),
+        DimMagenta => Some(Color::Magenta),
+        DimCyan => Some(Color::Cyan),
+        DimWhite => Some(Color::Gray),
+        BrightForeground => None,
     }
 }
 
@@ -395,65 +392,52 @@ impl Widget for &mut PtyTerminal {
         let rows = inner.height;
         self.resize(cols, rows);
 
-        let parser = match self.parser.lock() {
-            Ok(p) => p,
-            Err(_) => return,
+        let term = self.term.lock();
+        let display_offset = term.grid().display_offset();
+        let cursor_visible = term.mode().contains(TermMode::SHOW_CURSOR) && self.focused;
+        let alt_screen = term.mode().contains(TermMode::ALT_SCREEN);
+        let cursor_point = term.grid().cursor.point;
+        // The cursor is in absolute grid coords (Line is 0..rows in alt
+        // screen, can wander into negative scrollback in normal screen).
+        // Convert to viewport row by adding display_offset (>0 when the
+        // user has scrolled up into history).
+        let cursor_row_in_viewport = if alt_screen {
+            cursor_point.line.0
+        } else {
+            cursor_point.line.0 + display_offset as i32
         };
-        let screen = parser.screen();
-        let (cur_row, cur_col) = screen.cursor_position();
-        let cursor_visible = !screen.hide_cursor() && self.focused;
+        let cursor_col_in_viewport = cursor_point.column.0 as i32;
 
         for y in 0..rows {
             for x in 0..cols {
-                let cell_opt = screen.cell(y, x);
-                let (display, fg, bg, bold, italic, underline, inverse) = match cell_opt {
-                    Some(cell) => {
-                        let s = cell.contents();
-                        let owned = if s.is_empty() {
-                            String::from(" ")
-                        } else {
-                            s.to_string()
-                        };
-                        (
-                            owned,
-                            cell.fgcolor(),
-                            cell.bgcolor(),
-                            cell.bold(),
-                            cell.italic(),
-                            cell.underline(),
-                            cell.inverse(),
-                        )
-                    }
-                    None => (
-                        String::from(" "),
-                        vt100::Color::Default,
-                        vt100::Color::Default,
-                        false,
-                        false,
-                        false,
-                        false,
-                    ),
-                };
+                let line_idx = (y as i32) - (display_offset as i32);
+                let p = Point::new(Line(line_idx), Column(x as usize));
+                let cell = &term.grid()[p];
+                let display_char = if cell.c == '\0' { ' ' } else { cell.c };
                 let mut style = Style::default();
-                if let Some(c) = vt_color(fg) {
+                if let Some(c) = ansi_to_ratatui(cell.fg) {
                     style = style.fg(c);
                 }
-                if let Some(c) = vt_color(bg) {
+                if let Some(c) = ansi_to_ratatui(cell.bg) {
                     style = style.bg(c);
                 }
-                if bold {
+                let flags = cell.flags;
+                if flags.contains(Flags::BOLD) {
                     style = style.add_modifier(Modifier::BOLD);
                 }
-                if italic {
+                if flags.contains(Flags::ITALIC) {
                     style = style.add_modifier(Modifier::ITALIC);
                 }
-                if underline {
+                if flags.intersects(Flags::ALL_UNDERLINES) {
                     style = style.add_modifier(Modifier::UNDERLINED);
                 }
-                if inverse {
+                if flags.contains(Flags::INVERSE) {
                     style = style.add_modifier(Modifier::REVERSED);
                 }
-                if cursor_visible && y == cur_row && x == cur_col {
+                if cursor_visible
+                    && (y as i32) == cursor_row_in_viewport
+                    && (x as i32) == cursor_col_in_viewport
+                {
                     style = style.add_modifier(Modifier::REVERSED);
                 }
                 if let Some((sr, sc, er, ec)) = sel_norm {
@@ -464,14 +448,16 @@ impl Widget for &mut PtyTerminal {
                 let target_x = inner.x + x;
                 let target_y = inner.y + y;
                 let target = &mut buf[(target_x, target_y)];
-                target.set_symbol(&display);
+                let mut tmp = [0u8; 4];
+                target.set_symbol(display_char.encode_utf8(&mut tmp));
                 target.set_style(style);
             }
         }
     }
 }
 
-/// True iff (row, col) is inside the inclusive row-major range [(sr,sc)..=(er,ec)].
+/// True iff (row, col) is inside the inclusive row-major range
+/// [(sr,sc)..=(er,ec)]. Public for unit testing.
 pub fn cell_in_selection(row: u16, col: u16, sr: u16, sc: u16, er: u16, ec: u16) -> bool {
     if row < sr || row > er {
         return false;
@@ -488,6 +474,17 @@ pub fn cell_in_selection(row: u16, col: u16, sr: u16, sc: u16, er: u16, ec: u16)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fresh_term(cols: usize, rows: usize) -> Term<VoidListener> {
+        let cfg = Config { scrolling_history: 1000, ..Config::default() };
+        let size = TermSize::new(cols, rows);
+        Term::new(cfg, &size, VoidListener)
+    }
+
+    fn feed(term: &mut Term<VoidListener>, bytes: &[u8]) {
+        let mut p = Processor::<StdSyncHandler>::new();
+        p.advance(term, bytes);
+    }
 
     #[test]
     fn sniff_bracketed_paste_mode_toggles_on_set_and_reset() {
@@ -524,7 +521,7 @@ mod tests {
     fn write_input_marks_dirty() {
         let tmp = tempfile::tempdir().unwrap();
         let mut term = PtyTerminal::new(tmp.path()).unwrap();
-        let _ = term.take_dirty(); // drain initial
+        let _ = term.take_dirty();
         term.write_input(b"echo hi\r");
         assert!(term.take_dirty(), "write_input must mark the terminal dirty");
     }
@@ -551,7 +548,6 @@ mod tests {
 
     #[test]
     fn cell_in_selection_within_single_row() {
-        // selection: row 2, cols 3..=7
         assert!(cell_in_selection(2, 5, 2, 3, 2, 7));
         assert!(!cell_in_selection(2, 2, 2, 3, 2, 7));
         assert!(!cell_in_selection(2, 8, 2, 3, 2, 7));
@@ -561,7 +557,6 @@ mod tests {
 
     #[test]
     fn cell_in_selection_spans_multiple_rows() {
-        // selection: (1, 5) to (3, 2)
         assert!(!cell_in_selection(1, 4, 1, 5, 3, 2));
         assert!(cell_in_selection(1, 5, 1, 5, 3, 2));
         assert!(cell_in_selection(1, 9, 1, 5, 3, 2));
@@ -575,7 +570,6 @@ mod tests {
     #[test]
     fn osc52_copy_seq_wraps_with_correct_envelope() {
         let bytes = osc52_copy_seq("hello");
-        // ESC ] 5 2 ; c ; aGVsbG8= BEL
         assert_eq!(bytes, b"\x1b]52;c;aGVsbG8=\x07");
     }
 
@@ -587,7 +581,6 @@ mod tests {
     #[test]
     fn osc52_copy_seq_handles_unicode() {
         let bytes = osc52_copy_seq("héllo");
-        // Just check the envelope and that the body decodes back.
         assert!(bytes.starts_with(b"\x1b]52;c;"));
         assert_eq!(*bytes.last().unwrap(), 0x07);
         let body = &bytes[7..bytes.len() - 1];
@@ -598,71 +591,19 @@ mod tests {
     }
 
     #[test]
-    fn scroll_screen_up_increments_scrollback_in_normal_mode() {
-        let mut p = vt100::Parser::new(5, 20, 1000);
-        // Push enough lines that scrolling back makes sense.
-        for i in 0..50 {
-            p.process(format!("line {i}\r\n").as_bytes());
-        }
-        let before = p.screen().scrollback();
-        let scrolled = scroll_screen_up(p.screen_mut(), 3);
-        assert!(scrolled);
-        assert_eq!(p.screen().scrollback(), before + 3);
-    }
-
-    #[test]
-    fn scroll_screen_down_decrements_with_floor_at_zero() {
-        let mut p = vt100::Parser::new(5, 20, 1000);
-        for i in 0..50 {
-            p.process(format!("line {i}\r\n").as_bytes());
-        }
-        scroll_screen_up(p.screen_mut(), 5);
-        scroll_screen_down(p.screen_mut(), 2);
-        assert_eq!(p.screen().scrollback(), 3);
-        // Floor at zero, no underflow.
-        scroll_screen_down(p.screen_mut(), 100);
-        assert_eq!(p.screen().scrollback(), 0);
-    }
-
-    #[test]
-    fn scroll_screen_up_refuses_in_alternate_screen() {
-        let mut p = vt100::Parser::new(5, 20, 1000);
-        for i in 0..50 {
-            p.process(format!("line {i}\r\n").as_bytes());
-        }
-        // Enter the alternate screen (DECSET 1049). Apps like vim / htop /
-        // less use this; their internal scrollback handling should win.
-        p.process(b"\x1b[?1049h");
-        let before = p.screen().scrollback();
-        let scrolled = scroll_screen_up(p.screen_mut(), 3);
-        assert!(!scrolled, "should refuse scrollback in alternate-screen mode");
-        assert_eq!(p.screen().scrollback(), before);
-    }
-
-    #[test]
-    fn scroll_screen_down_also_refuses_in_alternate_screen() {
-        let mut p = vt100::Parser::new(5, 20, 1000);
-        p.process(b"\x1b[?1049h");
-        let scrolled = scroll_screen_down(p.screen_mut(), 3);
-        assert!(!scrolled);
-    }
-
-    #[test]
     fn extract_selection_text_single_line() {
-        let mut p = vt100::Parser::new(5, 20, 0);
-        p.process(b"hello world");
-        let txt = extract_selection_text(p.screen(), 0, 6, 0, 10);
+        let mut t = fresh_term(20, 5);
+        feed(&mut t, b"hello world");
+        let txt = extract_selection_text(&t, 0, 6, 0, 10);
         assert_eq!(txt, "world");
     }
 
     #[test]
     fn extract_selection_text_multi_line_trims_trailing_spaces() {
-        let mut p = vt100::Parser::new(5, 20, 0);
-        p.process(b"first line\r\nsecond line");
-        // From row 0 col 6 to row 1 col 5 (inclusive). vt100 reports cells
-        // unreachable by content as spaces; trailing whitespace per row is
-        // trimmed by extract_selection_text.
-        let txt = extract_selection_text(p.screen(), 0, 6, 1, 5);
+        let mut t = fresh_term(20, 5);
+        feed(&mut t, b"first line\r\nsecond line");
+        let txt = extract_selection_text(&t, 0, 6, 1, 5);
         assert_eq!(txt, "line\nsecond");
     }
 }
+
