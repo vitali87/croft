@@ -566,7 +566,7 @@ fn handle_pull_request(
         "set -e; mkdir -p {dir} && tar -x -f - -C {dir}",
         dir = shell_quote(&dest_dir),
     );
-    let mut ssh_recv = match Command::new("ssh")
+    let ssh_recv = match Command::new("ssh")
         .arg("-S")
         .arg(socket)
         .arg("-o")
