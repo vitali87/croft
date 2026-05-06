@@ -394,10 +394,6 @@ fn handle_pull_request(
     src: &str,
 ) {
     let src_path = PathBuf::from(src);
-    let basename = src_path
-        .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| String::from("dropped"));
     let dest_dir = format!("{inbox_dir}/{request_id}");
     let mkdir = format!("mkdir -p {}", shell_quote(&dest_dir));
     let mkdir_ok = Command::new("ssh")
@@ -424,11 +420,14 @@ fn handle_pull_request(
         );
         return;
     }
-    // scp interprets the remote-side path through a shell on the
-    // remote, so any spaces in the user's $HOME would otherwise break
-    // the destination split. Single-quote it.
-    let remote_dest = format!("{}/{}", dest_dir, basename);
-    let dest = format!("{host}:{}", shell_quote(&remote_dest));
+    // scp -r with OpenSSH 9.x uses sftp under the hood; sftp wants the
+    // parent dir to already exist and copies the source INTO it when
+    // the destination ends in `/`. So we point scp at $request_dir/
+    // (already mkdir'd above) and let scp drop the file/folder under
+    // its original basename. The remote path is shell-quoted to survive
+    // any spaces in $HOME.
+    let dest_with_slash = format!("{dest_dir}/");
+    let dest = format!("{host}:{}", shell_quote(&dest_with_slash));
     let scp = Command::new("scp")
         .arg("-o")
         .arg(format!(
