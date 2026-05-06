@@ -447,6 +447,12 @@ pub struct App {
     tree_clipboard: Option<ExplorerClipboard>,
     /// Active explorer drag-and-drop, if any.
     tree_drag: Option<ExplorerDrag>,
+    /// Pending SCP uploads queued by a Finder drag-drop onto the Remote
+    /// Explorer. These are intentionally NOT run inline — the main loop
+    /// drains the queue after suspending the alt-screen so scp can use
+    /// the host shell for password / FIDO / known_hosts prompts and the
+    /// user actually sees what's happening.
+    pending_scp_uploads: Vec<ScpUpload>,
     /// Width in cells of the sidebar (Explorer / Search / Remote pane).
     /// Defaults to 32 cells; user can drag the splitter between sidebar
     /// and editor to widen or narrow.
@@ -513,6 +519,16 @@ struct WelcomeLayout {
     cell_y: u16,
     cell_w: u16,
     cell_h: u16,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScpUpload {
+    pub alias: String,
+    pub src: PathBuf,
+    /// True for the Finder-drop import gesture: scp the file up, then
+    /// remove the local source on success. False would mean a future
+    /// "copy to remote" gesture that leaves the local source in place.
+    pub remove_local_on_success: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -774,6 +790,7 @@ impl App {
             remote_launch: None,
             tree_clipboard: None,
             tree_drag: None,
+            pending_scp_uploads: Vec::new(),
             sidebar_width: SIDEBAR_WIDTH_DEFAULT,
             terminal_height: None,
             splitter_drag: None,
@@ -2610,34 +2627,57 @@ impl App {
         };
     }
 
-    /// Upload every dropped path to the currently selected SSH target via
-    /// `scp -r`, then remove the local source so the gesture matches the
-    /// "move from Mac to remote" intent the user asked for.
+    /// Queue every dropped path for an interactive SCP upload to the
+    /// currently selected SSH target. The actual scp invocation happens
+    /// in `main_loop` after suspending the alt-screen, so scp inherits
+    /// the host shell's stdin / stdout / stderr — that means password
+    /// prompts, FIDO touch requests, and host-key confirmations all work
+    /// the way the user expects, and the user sees scp's progress and
+    /// errors directly. After all uploads finish (success or failure),
+    /// croft prompts for Enter and resumes the TUI.
     fn import_paths_into_remote(&mut self, paths: &[PathBuf]) {
         let Some(target) = self.remote.selected_target().cloned() else {
             self.status =
                 String::from("Drop ignored: no Remote Explorer host selected");
             return;
         };
-        let total = paths.len();
-        let mut moved = 0usize;
-        let mut errors: Vec<String> = Vec::new();
+        if paths.is_empty() {
+            return;
+        }
         for src in paths {
-            match scp_upload_then_remove(&target.alias, src) {
-                Ok(()) => moved += 1,
-                Err(e) => errors.push(format!("{}: {e}", src.display())),
+            self.pending_scp_uploads.push(ScpUpload {
+                alias: target.alias.clone(),
+                src: src.clone(),
+                remove_local_on_success: true,
+            });
+        }
+        self.status = format!(
+            "Queued {} item(s) for upload to {} (you'll see scp's prompts next)…",
+            paths.len(),
+            target.alias,
+        );
+    }
+
+    pub fn take_pending_scp_uploads(&mut self) -> Vec<ScpUpload> {
+        std::mem::take(&mut self.pending_scp_uploads)
+    }
+
+    pub fn report_scp_results(
+        &mut self,
+        moved: usize,
+        total: usize,
+        errors: usize,
+        affected_dirs: &[PathBuf],
+    ) {
+        for dir in affected_dirs {
+            if let Some(idx) = self.tree.index_of_dir(dir) {
+                self.tree.refresh_children(idx);
             }
         }
-        self.status = if !errors.is_empty() {
-            format!(
-                "Uploaded {moved}/{total} to {}; failed: {}",
-                target.alias,
-                errors.join("; ")
-            )
-        } else if total == 1 {
-            format!("Moved {} to {}:~", paths[0].display(), target.alias)
+        self.status = if errors == 0 {
+            format!("Uploaded {moved}/{total} via scp")
         } else {
-            format!("Moved {total} items to {}:~", target.alias)
+            format!("Uploaded {moved}/{total} via scp; {errors} error(s)")
         };
     }
 
@@ -4224,52 +4264,6 @@ fn hex_digit(b: u8) -> Option<u8> {
         b'A'..=b'F' => Some(b - b'A' + 10),
         _ => None,
     }
-}
-
-/// Move a single local path to a remote SSH target's home directory by
-/// running `scp -r -B -o BatchMode=yes <local> <alias>:` and then removing
-/// the local source on success. Resolves the host via the user's
-/// `~/.ssh/config` (port, identity file, jump host, agent forwarding all
-/// flow through the alias).
-///
-/// The `-B` / `BatchMode=yes` pair is critical: croft is in alt-screen
-/// mode while this runs, so any interactive prompt (password,
-/// host-authenticity confirmation, FIDO touch) would silently hang the
-/// process. Batch mode forces those failures to surface as a non-zero
-/// exit + stderr line that we then bubble into the status bar.
-fn scp_upload_then_remove(alias: &str, src: &Path) -> std::io::Result<()> {
-    if !src.exists() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            format!("{} does not exist", src.display()),
-        ));
-    }
-    let dest = format!("{alias}:");
-    let out = std::process::Command::new("scp")
-        .arg("-r")
-        .arg("-B")
-        .args(["-o", "BatchMode=yes"])
-        .arg(src)
-        .arg(&dest)
-        .stdin(std::process::Stdio::null())
-        .output()?;
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        let summary = stderr
-            .lines()
-            .find(|l| !l.trim().is_empty())
-            .unwrap_or("scp returned a non-zero exit");
-        return Err(std::io::Error::other(format!(
-            "scp -> {alias}: {summary}"
-        )));
-    }
-    let meta = std::fs::symlink_metadata(src)?;
-    if meta.is_dir() {
-        std::fs::remove_dir_all(src)?;
-    } else {
-        std::fs::remove_file(src)?;
-    }
-    Ok(())
 }
 
 fn sheet_visible_rows(inner: Rect) -> usize {
@@ -6175,6 +6169,131 @@ pub fn run(root: PathBuf) -> Result<()> {
     Ok(())
 }
 
+/// Suspend the alt-screen, run every queued scp upload with the host
+/// shell's stdin / stdout / stderr inherited (so the user sees scp's
+/// progress and can answer any prompt it raises), then prompt for Enter
+/// and restore the alt-screen. The local source is removed only on a
+/// successful upload — if scp fails, the local copy stays put so the
+/// user can retry without losing data.
+fn run_pending_scp_uploads(
+    app: &mut App,
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+) -> Result<()> {
+    use std::io::Write;
+    let uploads = app.take_pending_scp_uploads();
+    if uploads.is_empty() {
+        return Ok(());
+    }
+    // Tear down the TUI surface so scp can use the real terminal.
+    disable_raw_mode().ok();
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture,
+        DisableBracketedPaste,
+        crossterm::cursor::SetCursorStyle::DefaultUserShape,
+    )
+    .ok();
+    terminal.show_cursor().ok();
+
+    let total = uploads.len();
+    let mut moved = 0usize;
+    let mut error_count = 0usize;
+    let mut affected_dirs: Vec<PathBuf> = Vec::new();
+    {
+        let mut out = stdout();
+        let _ = writeln!(out);
+        let _ = writeln!(
+            out,
+            "── croft: uploading {total} item(s) via scp ──"
+        );
+        let _ = writeln!(out, "(scp prompts for password / passphrase / host-key will appear below)");
+        let _ = writeln!(out);
+        let _ = out.flush();
+    }
+    for (i, upload) in uploads.iter().enumerate() {
+        if let Some(parent) = upload.src.parent() {
+            affected_dirs.push(parent.to_path_buf());
+        }
+        {
+            let mut out = stdout();
+            let _ = writeln!(
+                out,
+                "[{}/{}] scp -r {} {}:",
+                i + 1,
+                total,
+                upload.src.display(),
+                upload.alias,
+            );
+            let _ = out.flush();
+        }
+        if !upload.src.exists() {
+            eprintln!("  ! source no longer exists, skipping");
+            error_count += 1;
+            continue;
+        }
+        let dest = format!("{}:", upload.alias);
+        let status = std::process::Command::new("scp")
+            .arg("-r")
+            .arg(&upload.src)
+            .arg(&dest)
+            .status();
+        match status {
+            Ok(s) if s.success() => {
+                if upload.remove_local_on_success {
+                    let rm = match std::fs::symlink_metadata(&upload.src) {
+                        Ok(m) if m.is_dir() => std::fs::remove_dir_all(&upload.src),
+                        Ok(_) => std::fs::remove_file(&upload.src),
+                        Err(e) => Err(e),
+                    };
+                    if let Err(e) = rm {
+                        eprintln!("  ! upload OK but local rm failed: {e}");
+                        error_count += 1;
+                        continue;
+                    }
+                }
+                moved += 1;
+            }
+            Ok(s) => {
+                eprintln!("  ! scp exited with {s}; local source preserved");
+                error_count += 1;
+            }
+            Err(e) => {
+                eprintln!("  ! could not spawn scp: {e}");
+                error_count += 1;
+            }
+        }
+    }
+    {
+        let mut out = stdout();
+        let _ = writeln!(out);
+        let _ = writeln!(
+            out,
+            "── done: {moved}/{total} uploaded, {error_count} error(s) ──"
+        );
+        let _ = write!(out, "Press Enter to return to croft… ");
+        let _ = out.flush();
+    }
+    let mut line = String::new();
+    let _ = std::io::stdin().read_line(&mut line);
+
+    // Restore the TUI.
+    enable_raw_mode().ok();
+    execute!(
+        terminal.backend_mut(),
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableBracketedPaste,
+        crossterm::cursor::SetCursorStyle::SteadyBar,
+    )
+    .ok();
+    terminal.clear().ok();
+    app.activity_overlay_dirty = true;
+    app.welcome_overlay_dirty = true;
+    app.report_scp_results(moved, total, error_count, &affected_dirs);
+    Ok(())
+}
+
 fn main_loop(
     app: &mut App,
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
@@ -6185,6 +6304,14 @@ fn main_loop(
     let mut last_blink_visible = app.cursor_visible_phase();
 
     while !app.quit {
+        // If the user dropped files onto the Remote Explorer, suspend the
+        // alt-screen and run scp in the host shell so the user sees its
+        // progress, can answer password / FIDO / known_hosts prompts,
+        // and gets explicit success / failure output before we resume.
+        if !app.pending_scp_uploads.is_empty() {
+            run_pending_scp_uploads(app, terminal)?;
+            needs_redraw = true;
+        }
         // Pull in any filesystem-watcher events first so the tree reflects
         // disk reality on the very next frame.
         let fs_changed = app.drain_fs_events();
