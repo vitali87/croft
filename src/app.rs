@@ -525,10 +525,6 @@ struct WelcomeLayout {
 pub struct ScpUpload {
     pub alias: String,
     pub src: PathBuf,
-    /// True for the Finder-drop import gesture: scp the file up, then
-    /// remove the local source on success. False would mean a future
-    /// "copy to remote" gesture that leaves the local source in place.
-    pub remove_local_on_success: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2655,11 +2651,10 @@ impl App {
             self.pending_scp_uploads.push(ScpUpload {
                 alias: target.alias.clone(),
                 src: src.clone(),
-                remove_local_on_success: true,
             });
         }
         self.status = format!(
-            "Queued {} item(s) for upload to {} (you'll see scp's prompts next)…",
+            "Queued {} item(s) for scp copy to {} (you'll see scp's prompts next)…",
             paths.len(),
             target.alias,
         );
@@ -6001,7 +5996,7 @@ mod tests {
         assert_eq!(queued.len(), 1, "one scp upload should be queued");
         assert_eq!(queued[0].alias, "alpha");
         assert_eq!(queued[0].src, src);
-        assert!(queued[0].remove_local_on_success);
+        assert!(src.exists(), "scp must copy, not move");
     }
 
     #[test]
@@ -6345,18 +6340,6 @@ fn run_pending_scp_uploads(
             .status();
         match status {
             Ok(s) if s.success() => {
-                if upload.remove_local_on_success {
-                    let rm = match std::fs::symlink_metadata(&upload.src) {
-                        Ok(m) if m.is_dir() => std::fs::remove_dir_all(&upload.src),
-                        Ok(_) => std::fs::remove_file(&upload.src),
-                        Err(e) => Err(e),
-                    };
-                    if let Err(e) = rm {
-                        eprintln!("  ! upload OK but local rm failed: {e}");
-                        error_count += 1;
-                        continue;
-                    }
-                }
                 moved += 1;
             }
             Ok(s) => {
