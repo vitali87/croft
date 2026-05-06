@@ -2538,24 +2538,31 @@ impl App {
 
     fn handle_paste(&mut self, s: &str) {
         // Finder drag-and-drop into croft arrives via the host terminal as
-        // a bracketed paste containing absolute filesystem path(s). When
-        // the tree pane has focus we treat that as an import gesture (mv
-        // for the local Explorer, scp+rm for the Remote Explorer) instead
-        // of dropping the path text into a buffer.
-        if self.focus == Pane::Tree {
-            let dropped = parse_dropped_paths(s);
-            if !dropped.is_empty() {
-                match self.sidebar_view {
-                    SidebarView::Explorer => {
-                        self.import_paths_into_explorer(&dropped);
-                        return;
-                    }
-                    SidebarView::Remote => {
-                        self.import_paths_into_remote(&dropped);
-                        return;
-                    }
-                    SidebarView::Search => {}
+        // a bracketed paste containing absolute filesystem path(s). The
+        // drop in iTerm2 does NOT shift mouse focus, so we cannot require
+        // `self.focus == Pane::Tree` for the gesture: the user can have
+        // last clicked into the editor or the embedded terminal and still
+        // expect the drop on the sidebar to import.
+        //
+        //   * Remote view: any path-shaped paste is an scp upload. There
+        //     is no other reasonable thing the user could want, since the
+        //     visible UI is a host list.
+        //   * Explorer view: a path-shaped paste is an import only when
+        //     focus is on the tree, otherwise we keep the current
+        //     behaviour (typing a path string into the focused editor or
+        //     terminal command line) because that is a legitimate use.
+        let dropped = parse_dropped_paths(s);
+        if !dropped.is_empty() {
+            match self.sidebar_view {
+                SidebarView::Remote => {
+                    self.import_paths_into_remote(&dropped);
+                    return;
                 }
+                SidebarView::Explorer if self.focus == Pane::Tree => {
+                    self.import_paths_into_explorer(&dropped);
+                    return;
+                }
+                _ => {}
             }
         }
         if self.sidebar_view == SidebarView::Search && self.focus != Pane::Editor {
@@ -5967,6 +5974,104 @@ mod tests {
         assert!(dest.exists(), "file should land in the workspace");
         assert!(!src.exists(), "Finder drop must move, not copy");
         assert_eq!(std::fs::read_to_string(&dest).unwrap(), "hello");
+    }
+
+    #[test]
+    fn finder_drop_on_remote_view_queues_scp_even_when_terminal_focused() {
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let src = outside.path().join("dragged.txt");
+        std::fs::write(&src, "hello").unwrap();
+        let mut app = App::new(workspace.path().to_path_buf()).unwrap();
+        app.remote.targets = vec![crate::remote::RemoteTarget {
+            alias: String::from("alpha"),
+            host_name: Some(String::from("alpha.example.com")),
+            user: Some(String::from("vitali")),
+        }];
+        app.remote.selected = 0;
+        app.set_sidebar_view(SidebarView::Remote);
+        // The user clicked into the embedded terminal and never returned
+        // focus to the sidebar before dragging from Finder. iTerm2's
+        // drag-drop arrives as a bracketed paste; mouse focus does not
+        // shift on drop.
+        app.show_terminal = true;
+        app.focus_pane(Pane::Terminal);
+        app.handle_paste(&format!("{}\n", src.display()));
+        let queued = app.take_pending_scp_uploads();
+        assert_eq!(queued.len(), 1, "one scp upload should be queued");
+        assert_eq!(queued[0].alias, "alpha");
+        assert_eq!(queued[0].src, src);
+        assert!(queued[0].remove_local_on_success);
+    }
+
+    #[test]
+    fn finder_drop_on_remote_view_queues_scp_even_when_editor_focused() {
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let src = outside.path().join("e.txt");
+        std::fs::write(&src, "x").unwrap();
+        let mut app = App::new(workspace.path().to_path_buf()).unwrap();
+        app.remote.targets = vec![crate::remote::RemoteTarget {
+            alias: String::from("beta"),
+            host_name: None,
+            user: None,
+        }];
+        app.remote.selected = 0;
+        app.set_sidebar_view(SidebarView::Remote);
+        app.focus_pane(Pane::Editor);
+        let editor_before = app.editor.lines.clone();
+        app.handle_paste(&format!("{}\n", src.display()));
+        assert_eq!(
+            app.editor.lines, editor_before,
+            "remote drop must not leak the path text into the editor",
+        );
+        let queued = app.take_pending_scp_uploads();
+        assert_eq!(queued.len(), 1);
+    }
+
+    #[test]
+    fn finder_drop_on_remote_view_with_no_target_reports_clear_status() {
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let src = outside.path().join("dragged.txt");
+        std::fs::write(&src, "hi").unwrap();
+        let mut app = App::new(workspace.path().to_path_buf()).unwrap();
+        app.remote.targets.clear();
+        app.remote.selected = 0;
+        app.set_sidebar_view(SidebarView::Remote);
+        app.focus_pane(Pane::Tree);
+        app.handle_paste(&format!("{}\n", src.display()));
+        assert!(app.take_pending_scp_uploads().is_empty());
+        assert!(
+            app.status.contains("no Remote Explorer host"),
+            "status must explain the failure, was: {:?}",
+            app.status,
+        );
+        assert!(
+            src.exists(),
+            "with no host the source file must be left intact",
+        );
+    }
+
+    #[test]
+    fn explorer_drop_on_terminal_focus_does_not_hijack_text_paste() {
+        // Regression guard: when sidebar is Explorer and focus is on the
+        // embedded terminal, pasting still goes to the terminal so the
+        // user can type a path into a shell command.
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let src = outside.path().join("typed.txt");
+        std::fs::write(&src, "x").unwrap();
+        let mut app = App::new(workspace.path().to_path_buf()).unwrap();
+        app.set_sidebar_view(SidebarView::Explorer);
+        app.show_terminal = true;
+        app.focus_pane(Pane::Terminal);
+        app.handle_paste(&format!("{}\n", src.display()));
+        assert!(
+            src.exists(),
+            "explorer-with-terminal-focus drop must NOT move the source",
+        );
+        assert!(!workspace.path().join("typed.txt").exists());
     }
 
     #[test]
