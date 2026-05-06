@@ -6736,6 +6736,17 @@ pub fn run(root: PathBuf) -> Result<()> {
 
     result?;
     if let Some(remote) = app.remote_launch.take() {
+        // Tear down the local croft's background workers BEFORE we hand
+        // the terminal to the remote-launched croft. Otherwise the
+        // fs-watcher thread keeps firing FSEvents callbacks and pushing
+        // into an unbounded mpsc channel that nobody drains (main loop
+        // has exited), and the embedded shell's PTY reader keeps feeding
+        // alacritty_terminal — both leak heap for the duration of the
+        // SSH session. Closing them here pegs the local process at a
+        // few MB while the user lives inside the remote croft.
+        app._fs_watcher = None;
+        app.fs_rx = None;
+        app.fs_watcher_init_rx = None;
         crate::remote::launch_croft(&remote.host, remote.path.as_deref())?;
     }
     Ok(())
