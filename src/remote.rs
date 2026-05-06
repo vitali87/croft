@@ -298,8 +298,11 @@ impl DropPump {
         if inbox_dir.is_empty() || requests_log.is_empty() {
             anyhow::bail!("remote relay setup returned blank paths");
         }
-        let mut tail = ssh
-            .command()
+        let mut tail = Command::new("ssh")
+            .arg("-S")
+            .arg(&ssh.socket_path)
+            .arg("-o")
+            .arg("ControlMaster=no")
             .arg(&ssh.host)
             .arg(format!(
                 "exec tail -F -n 0 {} 2>/dev/null",
@@ -426,7 +429,8 @@ fn handle_pull_request(
         .arg(parent)
         .arg(basename)
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
+        .stderr(Stdio::piped())
+        .stdin(Stdio::null())
         .spawn()
     {
         Ok(c) => c,
@@ -461,8 +465,8 @@ fn handle_pull_request(
         .arg(host)
         .arg(&remote_cmd)
         .stdin(Stdio::from(tar_stdout))
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
     {
         Ok(c) => c,
@@ -478,10 +482,10 @@ fn handle_pull_request(
             return;
         }
     };
-    let ssh_status = ssh_recv.wait();
-    let tar_status = tar.wait();
-    match (tar_status, ssh_status) {
-        (Ok(t), Ok(s)) if t.success() && s.success() => {
+    let ssh_out = ssh_recv.wait_with_output();
+    let tar_out = tar.wait_with_output();
+    match (tar_out, ssh_out) {
+        (Ok(t), Ok(s)) if t.status.success() && s.status.success() => {
             let touch = format!("touch {}/.ok", shell_quote(&dest_dir));
             let _ = Command::new("ssh")
                 .arg("-S")
@@ -490,15 +494,25 @@ fn handle_pull_request(
                 .arg("ControlMaster=no")
                 .arg(host)
                 .arg(&touch)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
                 .status();
         }
-        (Ok(t), Ok(s)) => write_relay_err(
-            host,
-            socket,
-            inbox_dir,
-            request_id,
-            &format!("tar exited {t}, ssh exited {s}"),
-        ),
+        (Ok(t), Ok(s)) => {
+            let mut detail = format!("tar exited {}, ssh exited {}", t.status, s.status);
+            let tar_err = String::from_utf8_lossy(&t.stderr);
+            let ssh_err = String::from_utf8_lossy(&s.stderr);
+            if !tar_err.trim().is_empty() {
+                detail.push_str(" | tar: ");
+                detail.push_str(tar_err.trim());
+            }
+            if !ssh_err.trim().is_empty() {
+                detail.push_str(" | remote: ");
+                detail.push_str(ssh_err.trim());
+            }
+            write_relay_err(host, socket, inbox_dir, request_id, &detail);
+        }
         (Err(e), _) | (_, Err(e)) => write_relay_err(
             host,
             socket,
@@ -531,6 +545,9 @@ fn write_relay_err(
         .arg("ControlMaster=no")
         .arg(host)
         .arg(&cmd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status();
 }
 
