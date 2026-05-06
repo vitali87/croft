@@ -50,6 +50,12 @@ pub struct PtyTerminal {
     /// and by `write_input`; cleared by `take_dirty`. Lets the main loop
     /// skip `terminal.draw` entirely when nothing has changed.
     pty_dirty: Arc<AtomicBool>,
+    /// Tracks whether the inner program has enabled DECSET 2004 (bracketed
+    /// paste). Updated by the reader thread. The paste-into-terminal path
+    /// reads this to decide whether to wrap the payload in `\e[200~` /
+    /// `\e[201~` markers; sending markers to a shell that didn't ask for
+    /// them produces literal escape garbage on the line.
+    bracketed_paste_enabled: Arc<AtomicBool>,
     master: Box<dyn MasterPty + Send>,
     writer: Box<dyn Write + Send>,
     _child: Box<dyn portable_pty::Child + Send + Sync>,
@@ -89,6 +95,8 @@ impl PtyTerminal {
         // hasn't produced output yet (status bar, borders, etc.).
         let pty_dirty = Arc::new(AtomicBool::new(true));
         let pty_dirty_for_thread = pty_dirty.clone();
+        let bracketed_paste_enabled = Arc::new(AtomicBool::new(false));
+        let bracketed_paste_for_thread = bracketed_paste_enabled.clone();
 
         std::thread::spawn(move || {
             let mut buf = [0u8; 4096];
@@ -96,6 +104,10 @@ impl PtyTerminal {
                 match reader.read(&mut buf) {
                     Ok(0) => break,
                     Ok(n) => {
+                        sniff_bracketed_paste_mode(
+                            &buf[..n],
+                            &bracketed_paste_for_thread,
+                        );
                         if let Ok(mut p) = parser_for_thread.lock() {
                             p.process(&buf[..n]);
                         }
@@ -109,6 +121,7 @@ impl PtyTerminal {
         Ok(Self {
             parser,
             pty_dirty,
+            bracketed_paste_enabled,
             master: pair.master,
             writer,
             _child: child,
@@ -191,6 +204,21 @@ impl PtyTerminal {
         self.pty_dirty.store(true, Ordering::Release);
     }
 
+    /// Paste a payload into the embedded shell. If the inner program has
+    /// enabled bracketed-paste mode, wrap the bytes in `\e[200~` /
+    /// `\e[201~` so the shell handles multi-line content as a single
+    /// edit; otherwise send raw bytes so the markers don't appear as
+    /// literal escape garbage on the prompt.
+    pub fn paste_input(&mut self, payload: &[u8]) {
+        if self.bracketed_paste_enabled.load(Ordering::Acquire) {
+            self.write_input(b"\x1b[200~");
+            self.write_input(payload);
+            self.write_input(b"\x1b[201~");
+        } else {
+            self.write_input(payload);
+        }
+    }
+
     /// Scroll the visible window up by `n` rows into history. Returns false
     /// if we're in alternate-screen mode (vim/less/htop manage their own
     /// scrollback), so the caller can fall back to sending arrow keys.
@@ -271,6 +299,29 @@ pub fn extract_selection_text(
         }
     }
     out
+}
+
+/// Walk a chunk of PTY output and toggle the bracketed-paste flag when
+/// we see `\e[?2004h` (set) / `\e[?2004l` (reset). vt100 0.15 doesn't
+/// expose this mode, so we sniff the byte stream alongside the parser.
+/// Tolerates the markers split across read calls only when the boundary
+/// falls outside an active match — good enough in practice because shells
+/// emit the marker as a single contiguous write.
+pub fn sniff_bracketed_paste_mode(chunk: &[u8], flag: &AtomicBool) {
+    let needle_set: &[u8] = b"\x1b[?2004h";
+    let needle_reset: &[u8] = b"\x1b[?2004l";
+    let mut i = 0;
+    while i < chunk.len() {
+        if chunk[i..].starts_with(needle_set) {
+            flag.store(true, Ordering::Release);
+            i += needle_set.len();
+        } else if chunk[i..].starts_with(needle_reset) {
+            flag.store(false, Ordering::Release);
+            i += needle_reset.len();
+        } else {
+            i += 1;
+        }
+    }
 }
 
 /// Increase the screen's scrollback offset by `n` rows (showing older
@@ -437,6 +488,22 @@ pub fn cell_in_selection(row: u16, col: u16, sr: u16, sc: u16, er: u16, ec: u16)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sniff_bracketed_paste_mode_toggles_on_set_and_reset() {
+        let flag = AtomicBool::new(false);
+        sniff_bracketed_paste_mode(b"prompt> \x1b[?2004h", &flag);
+        assert!(flag.load(Ordering::Acquire));
+        sniff_bracketed_paste_mode(b"\x1b[?2004l\nbye", &flag);
+        assert!(!flag.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn sniff_bracketed_paste_mode_ignores_unrelated_dec_modes() {
+        let flag = AtomicBool::new(false);
+        sniff_bracketed_paste_mode(b"\x1b[?25h\x1b[?1049h", &flag);
+        assert!(!flag.load(Ordering::Acquire));
+    }
 
     #[test]
     fn pty_starts_dirty_so_first_frame_renders() {

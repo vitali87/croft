@@ -537,6 +537,17 @@ pub struct PendingRemotePull {
     pub basename: String,
     pub dest_dir: PathBuf,
     pub started_at: std::time::Instant,
+    pub kind: RemotePullKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RemotePullKind {
+    /// File or directory copied from the user's local Mac into the
+    /// inbox; on completion the relay file is moved into `dest_dir`.
+    File,
+    /// Local-Mac clipboard contents staged at `<inbox>/<id>/clipboard.txt`;
+    /// on completion the bytes are pasted into the focused terminal.
+    Clipboard,
 }
 
 const REMOTE_PULL_TIMEOUT: Duration = Duration::from_secs(120);
@@ -2454,6 +2465,28 @@ impl App {
             self.copy_terminal_selection();
             return;
         }
+        // Cmd+V / Ctrl+V / Ctrl+Shift+V: paste local clipboard into the
+        // embedded shell. Without this, raw Ctrl+V bytes (\x16) just go
+        // through to the shell unchanged, and Cmd+V — when not eaten by
+        // the host terminal's menu shortcut — would do nothing useful.
+        if is_clipboard_paste_key(key) {
+            match crate::clipboard::read_string() {
+                Some(text) if !text.is_empty() => {
+                    self.terminal.paste_input(text.as_bytes());
+                }
+                Some(_) => {
+                    self.status = String::from("Cmd+V: clipboard is empty");
+                }
+                None if self.drop_relay_active() => {
+                    self.request_remote_clipboard();
+                }
+                None => {
+                    self.status =
+                        String::from("Cmd+V: clipboard read failed (no pbpaste / NSPasteboard)");
+                }
+            }
+            return;
+        }
         // Any other keystroke clears the selection so the user's input is
         // sent without the previous highlight lingering on screen.
         if self.terminal.selection().is_some() {
@@ -2601,9 +2634,7 @@ impl App {
                 self.status = format!("Pasted {} chars", s.chars().count());
             }
             Pane::Terminal => {
-                self.terminal.write_input(b"\x1b[200~");
-                self.terminal.write_input(s.as_bytes());
-                self.terminal.write_input(b"\x1b[201~");
+                self.terminal.paste_input(s.as_bytes());
             }
             Pane::Tree => {}
         }
@@ -2727,6 +2758,7 @@ impl App {
                 basename,
                 dest_dir: dest_dir.clone(),
                 started_at: now,
+                kind: RemotePullKind::File,
             });
         }
         match append_to_relay_log(&log_path, &lines) {
@@ -2739,6 +2771,41 @@ impl App {
             }
             Err(e) => {
                 self.status = format!("Drop relay write failed: {e}");
+            }
+        }
+    }
+
+    /// Ask the local-croft drop pump to fetch the user's macOS clipboard
+    /// and stage it on this remote box. The drained pull resolves to a
+    /// `paste_input` call on the embedded terminal — see `drain_remote_pulls`.
+    fn request_remote_clipboard(&mut self) {
+        let Some(log_path) = std::env::var_os("CROFT_DROP_RELAY_LOG").map(PathBuf::from) else {
+            self.status = String::from("Cmd+V: drop relay vanished");
+            return;
+        };
+        let request_id = format!(
+            "clip-{}-{}",
+            std::process::id(),
+            std::time::Instant::now().elapsed().as_nanos(),
+        );
+        let mut line = String::from("clipboard\t");
+        line.push_str(&request_id);
+        line.push('\n');
+        match append_to_relay_log(&log_path, &line) {
+            Ok(()) => {
+                self.pending_remote_pulls.push(PendingRemotePull {
+                    request_id,
+                    src_display: String::from("clipboard"),
+                    basename: String::from("clipboard.txt"),
+                    dest_dir: PathBuf::new(),
+                    started_at: std::time::Instant::now(),
+                    kind: RemotePullKind::Clipboard,
+                });
+                self.status =
+                    String::from("Cmd+V: fetching local Mac clipboard via croft relay…");
+            }
+            Err(e) => {
+                self.status = format!("Cmd+V: relay write failed: {e}");
             }
         }
     }
@@ -2760,16 +2827,28 @@ impl App {
         let mut errors: Vec<String> = Vec::new();
         let mut affected: BTreeSet<PathBuf> = BTreeSet::new();
         let pulls = std::mem::take(&mut self.pending_remote_pulls);
+        let mut clipboard_payload: Option<Vec<u8>> = None;
         for pull in pulls {
             let request_dir = inbox.join(&pull.request_id);
             let ok = request_dir.join(".ok");
             let err = request_dir.join(".err");
             if ok.exists() {
-                let staged_src = request_dir.join(&pull.basename);
-                affected.insert(pull.dest_dir.clone());
-                match crate::widgets::file_tree::move_into(&pull.dest_dir, &staged_src) {
-                    Ok(p) => placed.push(p),
-                    Err(e) => errors.push(format!("{}: {e}", pull.src_display)),
+                match pull.kind {
+                    RemotePullKind::File => {
+                        let staged_src = request_dir.join(&pull.basename);
+                        affected.insert(pull.dest_dir.clone());
+                        match crate::widgets::file_tree::move_into(&pull.dest_dir, &staged_src) {
+                            Ok(p) => placed.push(p),
+                            Err(e) => errors.push(format!("{}: {e}", pull.src_display)),
+                        }
+                    }
+                    RemotePullKind::Clipboard => {
+                        let staged = request_dir.join("clipboard.txt");
+                        match std::fs::read(&staged) {
+                            Ok(bytes) => clipboard_payload = Some(bytes),
+                            Err(e) => errors.push(format!("clipboard relay: {e}")),
+                        }
+                    }
                 }
                 let _ = std::fs::remove_dir_all(&request_dir);
             } else if err.exists() {
@@ -2782,6 +2861,11 @@ impl App {
                 let _ = std::fs::remove_dir_all(&request_dir);
             } else {
                 still_pending.push(pull);
+            }
+        }
+        if let Some(bytes) = clipboard_payload {
+            if !bytes.is_empty() {
+                self.terminal.paste_input(&bytes);
             }
         }
         let resolved_any = !placed.is_empty() || !errors.is_empty();
@@ -6299,6 +6383,7 @@ mod tests {
             basename: String::from("foo.txt"),
             dest_dir: workspace.path().to_path_buf(),
             started_at: std::time::Instant::now(),
+            kind: RemotePullKind::File,
         });
         let changed = app.drain_remote_pulls();
         unsafe {
@@ -6336,6 +6421,7 @@ mod tests {
             basename: String::from("missing.txt"),
             dest_dir: workspace.path().to_path_buf(),
             started_at: std::time::Instant::now(),
+            kind: RemotePullKind::File,
         });
         let changed = app.drain_remote_pulls();
         unsafe {

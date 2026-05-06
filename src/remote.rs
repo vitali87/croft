@@ -368,25 +368,134 @@ fn run_pump(
             break;
         }
         let Ok(line) = line else { break };
-        if let Some((request_id, src)) = parse_pull_request(&line) {
-            handle_pull_request(&host, &socket, &inbox_dir, &request_id, &src);
+        match parse_relay_request(&line) {
+            Some(RelayRequest::Pull { id, src }) => {
+                handle_pull_request(&host, &socket, &inbox_dir, &id, &src);
+            }
+            Some(RelayRequest::Clipboard { id }) => {
+                handle_clipboard_request(&host, &socket, &inbox_dir, &id);
+            }
+            None => {}
         }
     }
 }
 
-fn parse_pull_request(line: &str) -> Option<(String, String)> {
+fn handle_clipboard_request(host: &str, socket: &Path, inbox_dir: &str, request_id: &str) {
+    let dest_dir = format!("{inbox_dir}/{request_id}");
+    let mkdir = format!("mkdir -p {}", shell_quote(&dest_dir));
+    let mkdir_ok = Command::new("ssh")
+        .arg("-S")
+        .arg(socket)
+        .arg("-o")
+        .arg("ControlMaster=no")
+        .arg(host)
+        .arg(&mkdir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !mkdir_ok {
+        write_relay_err(host, socket, inbox_dir, request_id, "remote mkdir failed");
+        return;
+    }
+    let payload = match crate::clipboard::read_string() {
+        Some(s) => s,
+        None => {
+            write_relay_err(host, socket, inbox_dir, request_id, "local clipboard unavailable");
+            return;
+        }
+    };
+    let remote_cmd = format!(
+        "cat > {dst}",
+        dst = shell_quote(&format!("{dest_dir}/clipboard.txt")),
+    );
+    let mut ssh_recv = match Command::new("ssh")
+        .arg("-S")
+        .arg(socket)
+        .arg("-o")
+        .arg("ControlMaster=no")
+        .arg(host)
+        .arg(&remote_cmd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            write_relay_err(
+                host,
+                socket,
+                inbox_dir,
+                request_id,
+                &format!("clipboard relay spawn failed: {e}"),
+            );
+            return;
+        }
+    };
+    if let Some(mut stdin) = ssh_recv.stdin.take() {
+        use std::io::Write as _;
+        let _ = stdin.write_all(payload.as_bytes());
+    }
+    let status = ssh_recv.wait();
+    match status {
+        Ok(s) if s.success() => {
+            let touch = format!("touch {}/.ok", shell_quote(&dest_dir));
+            let _ = Command::new("ssh")
+                .arg("-S")
+                .arg(socket)
+                .arg("-o")
+                .arg("ControlMaster=no")
+                .arg(host)
+                .arg(&touch)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+        Ok(s) => write_relay_err(
+            host,
+            socket,
+            inbox_dir,
+            request_id,
+            &format!("clipboard relay ssh exited {s}"),
+        ),
+        Err(e) => write_relay_err(
+            host,
+            socket,
+            inbox_dir,
+            request_id,
+            &format!("clipboard relay wait failed: {e}"),
+        ),
+    }
+}
+
+enum RelayRequest {
+    Pull { id: String, src: String },
+    Clipboard { id: String },
+}
+
+fn parse_relay_request(line: &str) -> Option<RelayRequest> {
     let line = line.trim();
     let mut parts = line.split('\t');
     let kind = parts.next()?;
-    if kind != "pull" {
-        return None;
-    }
     let id = parts.next()?.to_string();
-    let src = parts.next()?.to_string();
-    if id.is_empty() || src.is_empty() {
+    if id.is_empty() {
         return None;
     }
-    Some((id, src))
+    match kind {
+        "pull" => {
+            let src = parts.next()?.to_string();
+            if src.is_empty() {
+                return None;
+            }
+            Some(RelayRequest::Pull { id, src })
+        }
+        "clipboard" => Some(RelayRequest::Clipboard { id }),
+        _ => None,
+    }
 }
 
 fn handle_pull_request(
@@ -916,19 +1025,30 @@ Host !blocked *.internal
     }
 
     #[test]
-    fn parse_pull_request_extracts_id_and_path() {
-        let parsed = super::parse_pull_request("pull\tabc-123\t/Users/v/foo.txt");
-        assert_eq!(
-            parsed,
-            Some((String::from("abc-123"), String::from("/Users/v/foo.txt"))),
-        );
+    fn parse_relay_request_pulls_have_id_and_path() {
+        match super::parse_relay_request("pull\tabc-123\t/Users/v/foo.txt") {
+            Some(super::RelayRequest::Pull { id, src }) => {
+                assert_eq!(id, "abc-123");
+                assert_eq!(src, "/Users/v/foo.txt");
+            }
+            other => panic!("expected Pull, got {:?}", matches!(other, Some(_))),
+        }
     }
 
     #[test]
-    fn parse_pull_request_rejects_unknown_kind() {
-        assert!(super::parse_pull_request("ping\tabc\t/x").is_none());
-        assert!(super::parse_pull_request("pull\t\t/x").is_none());
-        assert!(super::parse_pull_request("pull\tabc\t").is_none());
+    fn parse_relay_request_clipboard_requires_id_only() {
+        match super::parse_relay_request("clipboard\tclip-7") {
+            Some(super::RelayRequest::Clipboard { id }) => assert_eq!(id, "clip-7"),
+            _ => panic!("expected Clipboard variant"),
+        }
+    }
+
+    #[test]
+    fn parse_relay_request_rejects_malformed_lines() {
+        assert!(super::parse_relay_request("ping\tabc\t/x").is_none());
+        assert!(super::parse_relay_request("pull\t\t/x").is_none());
+        assert!(super::parse_relay_request("pull\tabc\t").is_none());
+        assert!(super::parse_relay_request("clipboard\t").is_none());
     }
 
     #[test]
