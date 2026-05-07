@@ -1,10 +1,10 @@
 [package]
 name = "croft"
-version = "0.1.29"
+version = "0.1.30"
 edition = "2024"
 description = "Terminal-based VS Code replica: file tree, editor, embedded shell"
 license = "MIT"
-repository = "https://bitbucket.org/vitali_avagyan/croft"
+repository = "https://codeberg.org/vitali87/croft"
 homepage = "https://croft.sh"
 
 [[bin]]

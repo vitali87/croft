@@ -685,6 +685,7 @@ fn welcome_provider_badge(remote: &str) -> String {
     match crate::git::commit_api_provider_for_remote(remote) {
         Some(crate::git::CommitApiProvider::Bitbucket) => "\u{f171} Bitbucket".to_string(),
         Some(crate::git::CommitApiProvider::GitHub) => "\u{f09b} GitHub".to_string(),
+        Some(crate::git::CommitApiProvider::Codeberg) => "\u{ea60} Codeberg".to_string(),
         None => "Repo".to_string(),
     }
 }

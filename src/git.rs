@@ -273,6 +273,7 @@ pub struct RecentCommits {
 pub enum CommitApiProvider {
     Bitbucket,
     GitHub,
+    Codeberg,
 }
 
 impl CommitApiProvider {
@@ -280,6 +281,7 @@ impl CommitApiProvider {
         match self {
             Self::Bitbucket => "Bitbucket",
             Self::GitHub => "GitHub",
+            Self::Codeberg => "Codeberg",
         }
     }
 }
@@ -290,7 +292,7 @@ pub struct CommitApiEndpoint {
     pub url: String,
 }
 
-const DEFAULT_CROFT_REPOSITORY_REMOTE: &str = "git@bitbucket.org:vitali_avagyan/croft.git";
+const DEFAULT_CROFT_REPOSITORY_REMOTE: &str = "ssh://git@codeberg.org/vitali87/croft.git";
 
 /// Why the welcome panel's commit list is empty. Used by the UI to phrase
 /// the status bar honestly — the panel itself only ever shows commits from
@@ -536,6 +538,10 @@ pub fn commits_api_endpoint_for_remote(remote: &str) -> Option<CommitApiEndpoint
             provider: CommitApiProvider::GitHub,
             url: format!("https://api.github.com/repos/{owner}/{repo}/commits?per_page=5"),
         }),
+        "codeberg.org" => Some(CommitApiEndpoint {
+            provider: CommitApiProvider::Codeberg,
+            url: format!("https://codeberg.org/api/v1/repos/{owner}/{repo}/commits?limit=5"),
+        }),
         _ => None,
     }
 }
@@ -554,6 +560,7 @@ pub fn commit_url_for_remote(remote: &str, hash: &str) -> Option<String> {
     match provider {
         CommitApiProvider::Bitbucket => Some(format!("{normalized}/commits/{hash}")),
         CommitApiProvider::GitHub => Some(format!("{normalized}/commit/{hash}")),
+        CommitApiProvider::Codeberg => Some(format!("{normalized}/commit/{hash}")),
     }
 }
 
@@ -740,6 +747,67 @@ mod tests {
     #[test]
     fn commits_api_endpoint_for_remote_returns_none_for_unknown_host() {
         assert!(commits_api_endpoint_for_remote("https://gitlab.com/example/croft").is_none());
+    }
+
+    /// Codeberg is Gitea-based; the welcome panel needs to recognise it both
+    /// for the "Recent commits via Codeberg" badge and so the commit-page
+    /// URL builder routes through `/commit/<hash>` (Gitea), not Bitbucket's
+    /// `/commits/<hash>` plural form.
+    #[test]
+    fn commits_api_endpoint_for_remote_supports_codeberg_ssh_url() {
+        let endpoint =
+            commits_api_endpoint_for_remote("ssh://git@codeberg.org/vitali87/croft.git")
+                .unwrap();
+        assert_eq!(endpoint.provider, CommitApiProvider::Codeberg);
+        assert_eq!(
+            endpoint.url,
+            "https://codeberg.org/api/v1/repos/vitali87/croft/commits?limit=5"
+        );
+    }
+
+    #[test]
+    fn commits_api_endpoint_for_remote_supports_codeberg_https() {
+        let endpoint =
+            commits_api_endpoint_for_remote("https://codeberg.org/vitali87/croft").unwrap();
+        assert_eq!(endpoint.provider, CommitApiProvider::Codeberg);
+    }
+
+    #[test]
+    fn commit_url_for_codeberg_uses_singular_commit_path() {
+        assert_eq!(
+            commit_url_for_remote("ssh://git@codeberg.org/vitali87/croft.git", "abc123"),
+            Some("https://codeberg.org/vitali87/croft/commit/abc123".to_string())
+        );
+    }
+
+    #[test]
+    fn commit_api_provider_label_includes_codeberg() {
+        assert_eq!(CommitApiProvider::Codeberg.label(), "Codeberg");
+    }
+
+    /// The default repo the welcome panel pulls commits from must be the
+    /// Codeberg upstream now that origin moved off Bitbucket; otherwise the
+    /// welcome list goes stale because new pushes only land on Codeberg.
+    #[test]
+    fn croft_repository_remote_default_points_at_codeberg() {
+        // The const is private; inspect the default behavior end-to-end.
+        // Clear any local override so the binary's compile-time default wins.
+        let prev = std::env::var("CROFT_REPOSITORY_REMOTE").ok();
+        // SAFETY: tests in this module run sequentially within one process.
+        unsafe {
+            std::env::remove_var("CROFT_REPOSITORY_REMOTE");
+        }
+        let resolved = croft_repository_remote();
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("CROFT_REPOSITORY_REMOTE", v),
+                None => std::env::remove_var("CROFT_REPOSITORY_REMOTE"),
+            }
+        }
+        assert_eq!(
+            resolved,
+            Some("https://codeberg.org/vitali87/croft".to_string())
+        );
     }
 
     #[test]
