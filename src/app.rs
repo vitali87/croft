@@ -2873,6 +2873,10 @@ impl App {
             self.paste_explorer_clipboard();
             return;
         }
+        if is_compare_key(key) {
+            self.toggle_compare_on_selected_file();
+            return;
+        }
         if key.code == KeyCode::Esc {
             if !self.tree.marked.is_empty() {
                 self.tree.clear_marks();
@@ -4852,6 +4856,58 @@ impl App {
         self.paste_into(dest_dir);
     }
 
+    /// `Ctrl/Cmd+D` from the explorer: smart toggle that mirrors the right-
+    /// click "Select for Compare" / "Compare with Selected" / clear-anchor
+    /// chain in a single key press.
+    fn toggle_compare_on_selected_file(&mut self) {
+        let Some(node) = self.tree.nodes.get(self.tree.selected) else {
+            self.status = String::from("No file selected to compare");
+            return;
+        };
+        if node.is_dir {
+            self.status = String::from("Compare needs a file, not a folder");
+            return;
+        }
+        let path = node.path.clone();
+        match self.compare_anchor.as_ref() {
+            Some(anchor) if anchor == &path => {
+                self.compare_anchor = None;
+                self.status = String::from("Cleared compare anchor");
+            }
+            Some(anchor) => {
+                let anchor_clone = anchor.clone();
+                match self.editor.open_diff(&anchor_clone, &path) {
+                    Ok(()) => {
+                        self.focus_pane(Pane::Editor);
+                        self.compare_anchor = None;
+                        self.sync_open_file_poll_mtime();
+                        let l = anchor_clone
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| anchor_clone.display().to_string());
+                        let r = path
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| path.display().to_string());
+                        self.status = format!("Diff: {l} \u{2194} {r}");
+                    }
+                    Err(e) => {
+                        self.status = format!("Diff failed: {e}");
+                    }
+                }
+            }
+            None => {
+                let label = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.display().to_string());
+                self.compare_anchor = Some(path);
+                self.status =
+                    format!("Selected {label} for compare — Ctrl/Cmd+D again on another file");
+            }
+        }
+    }
+
     fn paste_into(&mut self, dest_dir: PathBuf) {
         let Some(clip) = self.tree_clipboard.clone() else {
             self.status = String::from("Explorer clipboard is empty");
@@ -5158,6 +5214,24 @@ fn is_terminal_copy_key(key: KeyEvent) -> bool {
 
 /// Returns true if the given key event should jump to the Search sidebar
 /// view (VS Code's Ctrl/Cmd+Shift+F "Find in Files" gesture).
+/// `Ctrl+D` / `Cmd+D` (no Shift). Used in the Explorer to drive the
+/// "compare two files" flow:
+///   * no anchor yet → stash the highlighted file as the anchor;
+///   * anchor + different file → open a side-by-side diff;
+///   * anchor + same file → clear the anchor (toggle off).
+fn is_compare_key(key: KeyEvent) -> bool {
+    let KeyCode::Char(c) = key.code else { return false };
+    if !c.eq_ignore_ascii_case(&'d') {
+        return false;
+    }
+    if key.modifiers.contains(KeyModifiers::SHIFT)
+        || key.modifiers.contains(KeyModifiers::ALT)
+    {
+        return false;
+    }
+    key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::SUPER)
+}
+
 fn is_search_jump_key(key: KeyEvent) -> bool {
     let KeyCode::Char(c) = key.code else { return false };
     if !c.eq_ignore_ascii_case(&'f') {
@@ -6717,6 +6791,64 @@ mod tests {
         assert_eq!(app.editor.diff.as_ref().unwrap().scroll, total);
         app.handle_key(key(KeyCode::Home, KeyModifiers::NONE)).unwrap();
         assert_eq!(app.editor.diff.as_ref().unwrap().scroll, 0);
+    }
+
+    #[test]
+    fn ctrl_d_with_no_anchor_stashes_selected_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("a.txt");
+        std::fs::write(&f, "v1").unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        let idx = app
+            .tree
+            .nodes
+            .iter()
+            .position(|n| n.path == f)
+            .expect("file must appear in tree");
+        app.tree.selected = idx;
+        app.handle_key(key(KeyCode::Char('d'), KeyModifiers::CONTROL))
+            .unwrap();
+        assert_eq!(app.compare_anchor.as_deref(), Some(f.as_path()));
+    }
+
+    #[test]
+    fn ctrl_d_again_on_same_file_clears_the_anchor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("a.txt");
+        std::fs::write(&f, "v1").unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        let idx = app.tree.nodes.iter().position(|n| n.path == f).unwrap();
+        app.tree.selected = idx;
+        app.handle_key(key(KeyCode::Char('d'), KeyModifiers::CONTROL))
+            .unwrap();
+        app.handle_key(key(KeyCode::Char('d'), KeyModifiers::CONTROL))
+            .unwrap();
+        assert!(app.compare_anchor.is_none(), "second press toggles off");
+    }
+
+    #[test]
+    fn ctrl_d_with_anchor_on_other_file_opens_a_diff_tab() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a.txt");
+        let b = tmp.path().join("b.txt");
+        std::fs::write(&a, "alpha\nbravo\n").unwrap();
+        std::fs::write(&b, "alpha\nBRAVO\n").unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        let a_idx = app.tree.nodes.iter().position(|n| n.path == a).unwrap();
+        let b_idx = app.tree.nodes.iter().position(|n| n.path == b).unwrap();
+        // Anchor a.txt.
+        app.tree.selected = a_idx;
+        app.handle_key(key(KeyCode::Char('d'), KeyModifiers::CONTROL))
+            .unwrap();
+        // Move to b.txt and press again.
+        app.tree.selected = b_idx;
+        app.handle_key(key(KeyCode::Char('d'), KeyModifiers::CONTROL))
+            .unwrap();
+        assert!(app.compare_anchor.is_none(), "anchor consumed by compare");
+        assert!(
+            app.editor.diff.is_some(),
+            "editor must now hold a diff tab"
+        );
     }
 
     #[test]
