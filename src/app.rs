@@ -27,6 +27,7 @@ use crate::widgets::{
     file_tree::FileTree,
     remote::RemotePanel,
     search::SearchPanel,
+    source_control::SourceControlPanel,
     terminal::PtyTerminal,
 };
 
@@ -35,6 +36,7 @@ use crate::widgets::{
 pub enum SidebarView {
     Explorer,
     Search,
+    SourceControl,
     Remote,
 }
 
@@ -62,8 +64,12 @@ fn activity_search_y(bar: Rect) -> u16 {
     activity_explorer_y(bar) + ACTIVITY_ICON_HEIGHT + ACTIVITY_ICON_GAP
 }
 
-fn activity_remote_y(bar: Rect) -> u16 {
+fn activity_source_control_y(bar: Rect) -> u16 {
     activity_search_y(bar) + ACTIVITY_ICON_HEIGHT + ACTIVITY_ICON_GAP
+}
+
+fn activity_remote_y(bar: Rect) -> u16 {
+    activity_source_control_y(bar) + ACTIVITY_ICON_HEIGHT + ACTIVITY_ICON_GAP
 }
 
 fn activity_explorer_block(bar: Rect) -> Rect {
@@ -79,6 +85,15 @@ fn activity_search_block(bar: Rect) -> Rect {
     Rect {
         x: bar.x,
         y: activity_search_y(bar),
+        width: bar.width,
+        height: ACTIVITY_ICON_HEIGHT,
+    }
+}
+
+fn activity_source_control_block(bar: Rect) -> Rect {
+    Rect {
+        x: bar.x,
+        y: activity_source_control_y(bar),
         width: bar.width,
         height: ACTIVITY_ICON_HEIGHT,
     }
@@ -101,6 +116,8 @@ struct SidebarAreas {
     explorer_icon: Rect,
     /// Block occupied by the Search activity-bar icon, in absolute coords.
     search_icon: Rect,
+    /// Block occupied by the Source Control activity-bar icon, in absolute coords.
+    source_control_icon: Rect,
     /// Block occupied by the Remote Explorer activity-bar icon, in absolute coords.
     remote_icon: Rect,
 }
@@ -329,6 +346,7 @@ pub struct App {
     pub tree: FileTree,
     pub search: SearchPanel,
     pub remote: RemotePanel,
+    pub source_control: SourceControlPanel,
     pub editor: EditorTabs,
     pub terminals: Vec<PtyTerminal>,
     pub active_terminal: usize,
@@ -741,6 +759,7 @@ impl App {
         let tree = FileTree::new(root.clone());
         let search = SearchPanel::new(root.clone());
         let remote = RemotePanel::new();
+        let source_control = SourceControlPanel::new();
         let editor = EditorTabs::new();
         let term = PtyTerminal::new(&root).context("spawning terminal")?;
 
@@ -790,6 +809,7 @@ impl App {
             tree,
             search,
             remote,
+            source_control,
             editor,
             terminals: vec![term],
             active_terminal: 0,
@@ -1010,6 +1030,16 @@ impl App {
         }
         self.last_git_check = std::time::Instant::now();
         self.git_status = crate::git::query(&self.tree.root);
+        // The Source Control panel reads `git status --porcelain` for its
+        // row list; refresh whenever git state changes so the user sees the
+        // tree reflect the same disk reality the badge in the status bar
+        // already shows.
+        if self.sidebar_view == SidebarView::SourceControl {
+            let entries = crate::git::query_changes(&self.tree.root);
+            self.source_control.set_status(self.git_status.clone(), entries);
+        } else {
+            self.source_control.status = self.git_status.clone();
+        }
     }
 
     fn spawn_fs_watcher(
@@ -1576,9 +1606,11 @@ impl App {
         let bg_color = bg.bg.unwrap_or(Color::Reset);
         let explorer_block = activity_explorer_block(area);
         let search_block = activity_search_block(area);
+        let source_control_block = activity_source_control_block(area);
         let remote_block = activity_remote_block(area);
         let explorer_active = self.sidebar_view == SidebarView::Explorer;
         let search_active = self.sidebar_view == SidebarView::Search;
+        let source_control_active = self.sidebar_view == SidebarView::SourceControl;
         let remote_active = self.sidebar_view == SidebarView::Remote;
 
         let active_color = Color::White;
@@ -1646,9 +1678,19 @@ impl App {
                 remote_active,
             );
         }
+        // Source Control has no baked PNG yet, so render its glyph in both
+        // modes. Adjacent cells keep their OSC-1337 overlays through the
+        // 2 s activity-overlay keepalive in the main loop.
+        render_glyph(
+            frame,
+            source_control_block,
+            crate::icons::ACTIVITY_SOURCE_CONTROL,
+            source_control_active,
+        );
 
         self.sidebar_areas.explorer_icon = explorer_block;
         self.sidebar_areas.search_icon = search_block;
+        self.sidebar_areas.source_control_icon = source_control_block;
         self.sidebar_areas.remote_icon = remote_block;
     }
 
@@ -1667,6 +1709,10 @@ impl App {
             SidebarView::Explorer => self.focus_pane(Pane::Tree),
             SidebarView::Search => {
                 self.focus_pane(Pane::Tree); // tree pane = side panel; dispatch by view
+            }
+            SidebarView::SourceControl => {
+                self.refresh_source_control();
+                self.focus_pane(Pane::Tree);
             }
             SidebarView::Remote => self.focus_pane(Pane::Tree),
         }
@@ -1769,6 +1815,8 @@ impl App {
     fn sync_focus_flags(&mut self) {
         self.tree.focused = self.focus == Pane::Tree && self.sidebar_view == SidebarView::Explorer;
         self.search.focused = self.focus == Pane::Tree && self.sidebar_view == SidebarView::Search;
+        self.source_control.focused =
+            self.focus == Pane::Tree && self.sidebar_view == SidebarView::SourceControl;
         self.remote.focused = self.focus == Pane::Tree && self.sidebar_view == SidebarView::Remote;
         self.editor.focused = self.focus == Pane::Editor;
         let focused_pane = self.focus == Pane::Terminal;
@@ -1871,6 +1919,7 @@ impl App {
             match self.sidebar_view {
                 SidebarView::Explorer => frame.render_widget(&mut self.tree, area),
                 SidebarView::Search => frame.render_widget(&mut self.search, area),
+                SidebarView::SourceControl => frame.render_widget(&mut self.source_control, area),
                 SidebarView::Remote => frame.render_widget(&mut self.remote, area),
             }
         }
@@ -2195,6 +2244,10 @@ impl App {
             self.set_sidebar_view(SidebarView::Search);
             return Ok(());
         }
+        if is_source_control_jump_key(key) {
+            self.set_sidebar_view(SidebarView::SourceControl);
+            return Ok(());
+        }
         if self.sidebar_view == SidebarView::Search
             && self.focus != Pane::Editor
             && is_search_editing_shortcut(key)
@@ -2222,6 +2275,7 @@ impl App {
             Pane::Tree => match self.sidebar_view {
                 SidebarView::Explorer => self.handle_tree_key(key),
                 SidebarView::Search => self.handle_search_key(key),
+                SidebarView::SourceControl => self.handle_source_control_key(key),
                 SidebarView::Remote => self.handle_remote_key(key),
             },
             Pane::Editor => {
@@ -2322,6 +2376,77 @@ impl App {
             }
             KeyCode::Esc => self.set_sidebar_view(SidebarView::Explorer),
             _ => {}
+        }
+    }
+
+    fn handle_source_control_key(&mut self, key: KeyEvent) {
+        if matches!(key.code, KeyCode::Esc) {
+            self.set_sidebar_view(SidebarView::Explorer);
+            return;
+        }
+        let cmd_or_ctrl = key.modifiers.contains(KeyModifiers::SUPER)
+            || key.modifiers.contains(KeyModifiers::CONTROL);
+        if cmd_or_ctrl && matches!(key.code, KeyCode::Enter) {
+            self.commit_source_control();
+            return;
+        }
+        if is_clipboard_paste_key(key) {
+            if let Some(text) = (self.clipboard_reader)() {
+                self.source_control.insert_str(&text);
+            }
+            return;
+        }
+        match key.code {
+            KeyCode::Backspace => self.source_control.backspace(),
+            KeyCode::Left => self.source_control.move_cursor_left(),
+            KeyCode::Right => self.source_control.move_cursor_right(),
+            KeyCode::Home => self.source_control.home(),
+            KeyCode::End => self.source_control.end(),
+            KeyCode::Up => self.source_control.scroll_up(1),
+            KeyCode::Down => self.source_control.scroll_down(1),
+            KeyCode::Enter => self.commit_source_control(),
+            KeyCode::Char(c) => {
+                if !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT)
+                    && !key.modifiers.contains(KeyModifiers::SUPER)
+                {
+                    self.source_control.insert_char(c);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn refresh_source_control(&mut self) {
+        let entries = crate::git::query_changes(&self.tree.root);
+        self.source_control.set_status(self.git_status.clone(), entries);
+    }
+
+    fn commit_source_control(&mut self) {
+        let message = self.source_control.message.trim().to_string();
+        if message.is_empty() {
+            self.source_control.commit_feedback =
+                Some(String::from("Empty commit message"));
+            self.source_control.commit_feedback_is_error = true;
+            return;
+        }
+        match crate::git::commit_all_tracked(&self.tree.root, &message) {
+            Ok(summary) => {
+                self.source_control.clear_message();
+                self.source_control.commit_feedback = Some(summary.clone());
+                self.source_control.commit_feedback_is_error = false;
+                self.status = format!("Committed: {summary}");
+                self.last_git_check = std::time::Instant::now()
+                    .checked_sub(std::time::Duration::from_secs(1))
+                    .unwrap_or_else(std::time::Instant::now);
+                self.refresh_git_status_debounced();
+                self.refresh_source_control();
+            }
+            Err(err) => {
+                self.source_control.commit_feedback = Some(err.clone());
+                self.source_control.commit_feedback_is_error = true;
+                self.status = format!("Commit failed: {err}");
+            }
         }
     }
 
@@ -3375,6 +3500,10 @@ impl App {
                     self.set_sidebar_view(SidebarView::Search);
                     return;
                 }
+                if rect_contains(self.sidebar_areas.source_control_icon, m.column, m.row) {
+                    self.set_sidebar_view(SidebarView::SourceControl);
+                    return;
+                }
                 if rect_contains(self.sidebar_areas.remote_icon, m.column, m.row) {
                     self.set_sidebar_view(SidebarView::Remote);
                     return;
@@ -3437,6 +3566,30 @@ impl App {
                         }
                     } else {
                         // Click on the input/header area: just focus search.
+                    }
+                    return;
+                }
+                if in_tree && self.sidebar_view == SidebarView::SourceControl {
+                    self.focus_pane(Pane::Tree);
+                    if self.source_control.click_button(m.column, m.row) {
+                        self.commit_source_control();
+                        return;
+                    }
+                    if self.source_control.click_input(m.column, m.row) {
+                        return;
+                    }
+                    if let Some(idx) = self.source_control.entry_at_y(m.row) {
+                        if let Some(entry) = self.source_control.entries.get(idx).cloned() {
+                            let abs = self.tree.root.join(&entry.path);
+                            if abs.is_file() {
+                                if let Err(e) = self.editor.open_pinned(&abs) {
+                                    self.status = format!("Open failed: {e}");
+                                } else {
+                                    self.focus_pane(Pane::Editor);
+                                    self.sync_open_file_poll_mtime();
+                                }
+                            }
+                        }
                     }
                     return;
                 }
@@ -3633,6 +3786,9 @@ impl App {
                             SidebarView::Remote => {
                                 self.remote.scroll_to_bar_y(m.row);
                             }
+                            SidebarView::SourceControl => {
+                                self.source_control.scroll_to_bar_y(m.row);
+                            }
                             SidebarView::Search => {}
                         },
                         Pane::Editor => {
@@ -3692,7 +3848,7 @@ impl App {
                                 self.remote.select(idx);
                             }
                         }
-                        SidebarView::Search => {}
+                        SidebarView::Search | SidebarView::SourceControl => {}
                     }
                 } else if in_terminal {
                     self.terminal_mut().extend_selection_to(m.column, m.row);
@@ -3761,6 +3917,7 @@ impl App {
                     match self.sidebar_view {
                         SidebarView::Explorer => self.tree.scroll_down(3),
                         SidebarView::Remote => self.remote.scroll_down(3),
+                        SidebarView::SourceControl => self.source_control.scroll_down(3),
                         SidebarView::Search => {}
                     }
                 } else if in_editor {
@@ -3779,6 +3936,7 @@ impl App {
                     match self.sidebar_view {
                         SidebarView::Explorer => self.tree.scroll_up(3),
                         SidebarView::Remote => self.remote.scroll_up(3),
+                        SidebarView::SourceControl => self.source_control.scroll_up(3),
                         SidebarView::Search => {}
                     }
                 } else if in_editor {
@@ -4536,6 +4694,19 @@ fn is_terminal_copy_key(key: KeyEvent) -> bool {
 fn is_search_jump_key(key: KeyEvent) -> bool {
     let KeyCode::Char(c) = key.code else { return false };
     if !c.eq_ignore_ascii_case(&'f') {
+        return false;
+    }
+    let has_shift = key.modifiers.contains(KeyModifiers::SHIFT);
+    let has_ctrl_or_super = key.modifiers.contains(KeyModifiers::CONTROL)
+        || key.modifiers.contains(KeyModifiers::SUPER);
+    has_shift && has_ctrl_or_super
+}
+
+/// `Ctrl/Cmd+Shift+G`: jump to the Source Control sidebar view, matching
+/// VS Code's "Show Source Control" gesture.
+fn is_source_control_jump_key(key: KeyEvent) -> bool {
+    let KeyCode::Char(c) = key.code else { return false };
+    if !c.eq_ignore_ascii_case(&'g') {
         return false;
     }
     let has_shift = key.modifiers.contains(KeyModifiers::SHIFT);
@@ -7191,6 +7362,19 @@ mod tests {
         let drained = app.drain_terminals_dirty();
         assert!(drained, "drain after peek should still report dirty once");
         assert!(!app.peek_terminals_dirty(), "after drain, peek must be clean");
+    }
+
+    #[test]
+    fn ctrl_shift_g_jumps_to_source_control() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.handle_key(key(
+            KeyCode::Char('G'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ))
+        .unwrap();
+        assert_eq!(app.sidebar_view, SidebarView::SourceControl);
+        assert!(app.source_control.focused);
     }
 
     #[test]

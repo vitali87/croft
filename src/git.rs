@@ -91,6 +91,167 @@ pub fn parse_porcelain_dirty(out: &str) -> bool {
     out.lines().any(|l| !l.trim().is_empty())
 }
 
+/// Working-tree change reported by `git status --porcelain`. The Source
+/// Control panel groups entries by `kind.section()` and renders a one-letter
+/// badge per row.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChangeEntry {
+    /// Workspace-relative path. For renames this is the destination path.
+    pub path: String,
+    pub kind: ChangeKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChangeKind {
+    StagedAdded,
+    StagedModified,
+    StagedDeleted,
+    StagedRenamed,
+    Modified,
+    Deleted,
+    Untracked,
+    Conflicted,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChangeSection {
+    Staged,
+    Changes,
+    Untracked,
+    Conflicts,
+}
+
+impl ChangeKind {
+    pub fn section(self) -> ChangeSection {
+        match self {
+            Self::StagedAdded
+            | Self::StagedModified
+            | Self::StagedDeleted
+            | Self::StagedRenamed => ChangeSection::Staged,
+            Self::Modified | Self::Deleted => ChangeSection::Changes,
+            Self::Untracked => ChangeSection::Untracked,
+            Self::Conflicted => ChangeSection::Conflicts,
+        }
+    }
+
+    pub fn badge(self) -> char {
+        match self {
+            Self::StagedAdded => 'A',
+            Self::StagedModified | Self::Modified => 'M',
+            Self::StagedDeleted | Self::Deleted => 'D',
+            Self::StagedRenamed => 'R',
+            Self::Untracked => 'U',
+            Self::Conflicted => '!',
+        }
+    }
+}
+
+/// Parse `git status --porcelain` (v1) into the change entries the Source
+/// Control panel renders. Each line is `XY <path>` where `X` is the index
+/// status and `Y` is the worktree status; renames carry both old and new
+/// paths separated by ` -> `.
+pub fn parse_porcelain_changes(out: &str) -> Vec<ChangeEntry> {
+    let mut entries = Vec::new();
+    for line in out.lines() {
+        if line.len() < 3 {
+            continue;
+        }
+        let bytes = line.as_bytes();
+        let x = bytes[0] as char;
+        let y = bytes[1] as char;
+        let path_part = &line[3..];
+        let path = if let Some((_, dst)) = path_part.split_once(" -> ") {
+            dst.to_string()
+        } else {
+            path_part.to_string()
+        };
+        // Conflicts: AA, DD, AU, UA, DU, UD, UU.
+        let conflict = matches!((x, y),
+            ('A', 'A') | ('D', 'D') | ('A', 'U') | ('U', 'A')
+            | ('D', 'U') | ('U', 'D') | ('U', 'U'));
+        if conflict {
+            entries.push(ChangeEntry { path, kind: ChangeKind::Conflicted });
+            continue;
+        }
+        if x == '?' && y == '?' {
+            entries.push(ChangeEntry { path, kind: ChangeKind::Untracked });
+            continue;
+        }
+        if x != ' ' && x != '?' {
+            let kind = match x {
+                'A' => ChangeKind::StagedAdded,
+                'M' => ChangeKind::StagedModified,
+                'D' => ChangeKind::StagedDeleted,
+                'R' | 'C' => ChangeKind::StagedRenamed,
+                _ => ChangeKind::StagedModified,
+            };
+            entries.push(ChangeEntry { path: path.clone(), kind });
+        }
+        if y != ' ' && y != '?' {
+            let kind = match y {
+                'M' => ChangeKind::Modified,
+                'D' => ChangeKind::Deleted,
+                _ => ChangeKind::Modified,
+            };
+            entries.push(ChangeEntry { path, kind });
+        }
+    }
+    entries
+}
+
+/// Run `git status --porcelain` against `root` and return parsed entries.
+/// Returns an empty vec on any error so the panel renders cleanly even
+/// when the workspace isn't a git repo or git is missing.
+///
+/// Does not call `run_git`: that helper trims stdout, which destroys the
+/// fixed-width porcelain v1 format (a line like ` M README.md` becomes
+/// `M README.md` after `.trim()`, shifting the status code by one column).
+pub fn query_changes(root: &Path) -> Vec<ChangeEntry> {
+    if !is_git_repo(root) {
+        return Vec::new();
+    }
+    let path_str = match root.to_str() {
+        Some(s) => s,
+        None => return Vec::new(),
+    };
+    let output = match Command::new("git")
+        .args(["-C", path_str, "status", "--porcelain"])
+        .output()
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return Vec::new(),
+    };
+    let raw = String::from_utf8_lossy(&output.stdout);
+    parse_porcelain_changes(&raw)
+}
+
+/// Result of an attempted commit. `Ok(summary)` carries git's stdout/stderr
+/// summary (e.g. "[main 4a5b6c7] message"); `Err` carries git's error
+/// message verbatim so the user sees exactly what blocked them.
+pub fn commit_all_tracked(root: &Path, message: &str) -> Result<String, String> {
+    if message.trim().is_empty() {
+        return Err("Commit message is empty".to_string());
+    }
+    let path_str = root.to_str().ok_or_else(|| "non-utf8 workspace path".to_string())?;
+    let output = Command::new("git")
+        .args(["-C", path_str, "commit", "-am", message])
+        .output()
+        .map_err(|e| format!("failed to spawn git: {e}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if output.status.success() {
+        let summary = if !stdout.is_empty() { stdout } else { stderr };
+        Ok(summary)
+    } else {
+        let msg = if !stderr.is_empty() { stderr } else { stdout };
+        Err(if msg.is_empty() {
+            format!("git commit failed with code {:?}", output.status.code())
+        } else {
+            msg
+        })
+    }
+}
+
 /// One row in the welcome-screen recent-commits panel: the short hash, a
 /// human-readable relative date (e.g. "2 hours ago"), and the commit
 /// subject.
@@ -672,5 +833,94 @@ mod tests {
         assert!(rows.len() >= 2);
         assert_eq!(rows[0].subject, "second commit");
         assert_eq!(rows[1].subject, "first commit");
+    }
+
+    #[test]
+    fn parse_porcelain_changes_handles_unstaged_modified() {
+        let entries = parse_porcelain_changes(" M src/app.rs\n");
+        assert_eq!(entries, vec![ChangeEntry {
+            path: "src/app.rs".to_string(),
+            kind: ChangeKind::Modified,
+        }]);
+    }
+
+    #[test]
+    fn parse_porcelain_changes_handles_staged_modified() {
+        let entries = parse_porcelain_changes("M  src/app.rs\n");
+        assert_eq!(entries, vec![ChangeEntry {
+            path: "src/app.rs".to_string(),
+            kind: ChangeKind::StagedModified,
+        }]);
+    }
+
+    #[test]
+    fn parse_porcelain_changes_emits_two_entries_for_partially_staged() {
+        // MM: staged content then further modified in worktree.
+        let entries = parse_porcelain_changes("MM src/app.rs\n");
+        assert_eq!(
+            entries,
+            vec![
+                ChangeEntry { path: "src/app.rs".to_string(), kind: ChangeKind::StagedModified },
+                ChangeEntry { path: "src/app.rs".to_string(), kind: ChangeKind::Modified },
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_porcelain_changes_handles_untracked() {
+        let entries = parse_porcelain_changes("?? scratch.txt\n");
+        assert_eq!(entries, vec![ChangeEntry {
+            path: "scratch.txt".to_string(),
+            kind: ChangeKind::Untracked,
+        }]);
+    }
+
+    #[test]
+    fn parse_porcelain_changes_handles_rename_takes_destination_path() {
+        let entries = parse_porcelain_changes("R  old.txt -> new.txt\n");
+        assert_eq!(entries, vec![ChangeEntry {
+            path: "new.txt".to_string(),
+            kind: ChangeKind::StagedRenamed,
+        }]);
+    }
+
+    #[test]
+    fn parse_porcelain_changes_handles_conflict() {
+        let entries = parse_porcelain_changes("UU merge.txt\n");
+        assert_eq!(entries, vec![ChangeEntry {
+            path: "merge.txt".to_string(),
+            kind: ChangeKind::Conflicted,
+        }]);
+    }
+
+    #[test]
+    fn change_kind_section_groups_correctly() {
+        assert_eq!(ChangeKind::StagedAdded.section(), ChangeSection::Staged);
+        assert_eq!(ChangeKind::Modified.section(), ChangeSection::Changes);
+        assert_eq!(ChangeKind::Untracked.section(), ChangeSection::Untracked);
+        assert_eq!(ChangeKind::Conflicted.section(), ChangeSection::Conflicts);
+    }
+
+    #[test]
+    fn commit_all_tracked_rejects_empty_message() {
+        let tmp = TempDir::new().unwrap();
+        assert!(commit_all_tracked(tmp.path(), "").is_err());
+        assert!(commit_all_tracked(tmp.path(), "   \n").is_err());
+    }
+
+    #[test]
+    fn commit_all_tracked_creates_a_commit_in_a_real_repo() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        let _ = Command::new("git").args(["-C"]).arg(p).args(["init", "-q", "-b", "main"]).output();
+        let _ = Command::new("git").args(["-C"]).arg(p).args(["config", "user.email", "a@b"]).status();
+        let _ = Command::new("git").args(["-C"]).arg(p).args(["config", "user.name", "a"]).status();
+        std::fs::write(p.join("hello.txt"), "hi").unwrap();
+        let _ = Command::new("git").args(["-C"]).arg(p).args(["add", "."]).status();
+        let _ = Command::new("git").args(["-C"]).arg(p).args(["commit", "-m", "init", "--quiet"]).status();
+        std::fs::write(p.join("hello.txt"), "hi v2").unwrap();
+        let summary = commit_all_tracked(p, "second commit").expect("commit should succeed");
+        assert!(summary.contains("second commit") || summary.contains("main"), "summary was: {summary}");
+        assert!(query_changes(p).is_empty(), "post-commit working tree should be clean");
     }
 }

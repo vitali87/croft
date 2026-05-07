@@ -21,6 +21,9 @@ pub const CHEVRON_OPEN: char = '▾';
 pub const ACTIVITY_EXPLORER: char = '\u{eaf0}';
 pub const ACTIVITY_SEARCH: char = '\u{ea6d}';
 pub const ACTIVITY_REMOTE: char = '\u{eb39}';
+/// Codicon "source-control" (the fork glyph). Verified against Nerd Font cmap;
+/// distinct from `cod-git_branch` (U+EAFC) which is the simpler branch icon.
+pub const ACTIVITY_SOURCE_CONTROL: char = '\u{eafc}';
 
 pub fn for_path(name: &str, suffix: &str) -> Icon {
     let n = name.to_ascii_lowercase();
