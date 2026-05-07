@@ -7,6 +7,8 @@ pub const SEARCH_SRC_PNG: &[u8] =
     include_bytes!("../assets/icons/search_src.png");
 pub const REMOTE_SRC_PNG: &[u8] =
     include_bytes!("../assets/icons/remote_src.png");
+pub const CODEBERG_SRC_PNG: &[u8] =
+    include_bytes!("../assets/icons/codeberg_src.png");
 pub const WELCOME_LOGO_PNG: &[u8] =
     include_bytes!("../assets/logo-tight-removebg-preview.png");
 

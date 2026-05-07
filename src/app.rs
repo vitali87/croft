@@ -435,6 +435,15 @@ pub struct App {
     /// when the host terminal can't render OSC-1337 (we then fall back to
     /// the codicon glyph rendered inside the same multi-row block).
     activity_images: Option<ActivityBarImages>,
+    /// Pre-encoded OSC-1337 image for the Codeberg "Recent Activity" badge,
+    /// sized to a 2x1 cell rectangle. Painted by the main loop right after
+    /// ratatui flushes the welcome panel, at `welcome_codeberg_badge_cell`.
+    /// `None` when the host terminal lacks OSC-1337 image support.
+    welcome_codeberg_badge_osc: Option<String>,
+    /// Absolute terminal cell where the Codeberg badge image goes. Recorded
+    /// during welcome render; consumed post-draw. `None` when the welcome
+    /// panel isn't visible or the open repo isn't on Codeberg.
+    welcome_codeberg_badge_cell: Option<(u16, u16)>,
     /// Last mouse-down on the editor pane: `(when, column, row)`. Used to
     /// detect a double-click as two left-down events at the same cell within
     /// `DOUBLE_CLICK_WINDOW`. Cleared when the next click lands elsewhere or
@@ -685,7 +694,12 @@ fn welcome_provider_badge(remote: &str) -> String {
     match crate::git::commit_api_provider_for_remote(remote) {
         Some(crate::git::CommitApiProvider::Bitbucket) => "\u{f171} Bitbucket".to_string(),
         Some(crate::git::CommitApiProvider::GitHub) => "\u{f09b} GitHub".to_string(),
-        Some(crate::git::CommitApiProvider::Codeberg) => "\u{ea60} Codeberg".to_string(),
+        // Codeberg has no reliable Nerd Font codepoint (many fonts ship
+        // without one), and the previous `\u{ea60}` placeholder rendered
+        // as the wrong symbol. Two leading spaces reserve the cells where
+        // the OSC-1337 image overlay paints the actual Codeberg logo on
+        // iTerm2; on non-image terminals the badge is plain "  Codeberg".
+        Some(crate::git::CommitApiProvider::Codeberg) => "  Codeberg".to_string(),
         None => "Repo".to_string(),
     }
 }
@@ -984,6 +998,8 @@ impl App {
             last_git_check: std::time::Instant::now(),
             cursor_blink_anchor: std::time::Instant::now(),
             activity_images: None,
+            welcome_codeberg_badge_osc: None,
+            welcome_codeberg_badge_cell: None,
             last_editor_left_down: None,
             last_tree_left_down: None,
             scrollbar_drag: None,
@@ -1110,6 +1126,24 @@ impl App {
                 source_control_inactive: sci,
                 remote_active: ra,
                 remote_inactive: ri,
+            });
+        }
+        // Codeberg badge for the welcome panel: 2 cells wide, 1 cell tall,
+        // rendered as an OSC-1337 image overlay at the badge's anchor cell
+        // because Nerd Fonts have no reliable Codeberg codepoint.
+        let badge_w_px = cell_w * 2;
+        let badge_h_px = cell_h;
+        if let Ok(baked) = crate::iterm2_inline::fit_image_auto(
+            crate::iterm2_inline::CODEBERG_SRC_PNG,
+            badge_w_px,
+            badge_h_px,
+            icon_bg,
+        ) {
+            let raw = crate::iterm2_inline::build_inline_image_osc(&baked, 2, 1, false);
+            self.welcome_codeberg_badge_osc = Some(if is_tmux {
+                crate::iterm2_inline::tmux_passthrough_wrap(&raw)
+            } else {
+                raw
             });
         }
     }
@@ -1882,6 +1916,16 @@ impl App {
                 frame
                     .buffer_mut()
                     .set_string(inner_x, row_y, &badge, link_style);
+                let is_codeberg = matches!(
+                    crate::git::commit_api_provider_for_remote(remote),
+                    Some(crate::git::CommitApiProvider::Codeberg)
+                );
+                self.welcome_codeberg_badge_cell =
+                    if is_codeberg && self.welcome_codeberg_badge_osc.is_some() {
+                        Some((inner_x, row_y))
+                    } else {
+                        None
+                    };
                 let badge_w = badge.chars().count() as u16;
                 let remote_x = inner_x + badge_w + 2;
                 let room = (inner_x + inner_w_actual)
@@ -2331,6 +2375,7 @@ impl App {
             // occupied; if the user reopens the welcome screen we'll need
             // to re-emit it.
             self.welcome_overlay_dirty = true;
+            self.welcome_codeberg_badge_cell = None;
             self.update_editor_image_overlay(editor_area);
         }
         if let Some(area) = terminal_area {
@@ -6285,6 +6330,24 @@ mod tests {
         assert!(welcome_provider_badge("https://github.com/a/b").contains("GitHub"));
     }
 
+    /// Codeberg's badge must show the literal name without a Nerd Font glyph
+    /// in front of it: most installed Nerd Fonts (including the one croft
+    /// ships with via `setup-iterm2`) do not have a Codeberg codepoint, so
+    /// the previous `\u{ea60}` placeholder rendered as a stray symbol or
+    /// tofu box. The actual Codeberg logo is composited as an OSC-1337
+    /// image overlay at the badge cell when iTerm2 is detected (handled
+    /// elsewhere); the text path stays glyph-free so non-iTerm2 terminals
+    /// also display correctly.
+    #[test]
+    fn welcome_provider_badge_for_codeberg_has_no_unicode_glyph() {
+        let badge = welcome_provider_badge("ssh://git@codeberg.org/vitali87/croft.git");
+        assert!(badge.contains("Codeberg"), "badge: {badge:?}");
+        assert!(
+            badge.chars().all(|c| c.is_ascii() || c == ' '),
+            "badge must be glyph-free for Codeberg until/unless we render the icon as an image overlay; current badge: {badge:?}"
+        );
+    }
+
     #[test]
     fn lerp_rgb_hits_endpoints_exactly() {
         let a = (10u8, 20, 30);
@@ -9116,6 +9179,29 @@ fn main_loop(
                 }
                 let _ = out.flush();
                 app.mark_editor_image_displayed();
+            }
+            // Codeberg badge image overlay on the welcome panel. Same
+            // re-emit-every-frame strategy as the activity bar: ratatui
+            // doesn't track OSC-1337 image cells, so any neighbouring SGR
+            // burst can evict them in iTerm2's cache. Only fires when the
+            // welcome panel is visible, the open repo is on Codeberg, and
+            // we successfully baked the icon at init time.
+            if app.editor.is_blank_initial() {
+                if let (Some(osc), Some((cx, cy))) =
+                    (app.welcome_codeberg_badge_osc.as_deref(), app.welcome_codeberg_badge_cell)
+                {
+                    use std::io::Write;
+                    let mut out = stdout();
+                    let cursor_on = app.cursor_should_be_visible();
+                    let _ = write!(out, "\x1b[?25l\x1b[s");
+                    let _ = write!(out, "\x1b[{};{}H", cy + 1, cx + 1);
+                    let _ = out.write_all(osc.as_bytes());
+                    let _ = write!(out, "\x1b[u");
+                    if cursor_on {
+                        let _ = write!(out, "\x1b[?25h");
+                    }
+                    let _ = out.flush();
+                }
             }
             // Welcome-screen logo: same OSC-1337 trick, gated by its own
             // dirty flag and only emitted while the editor pane is in its
