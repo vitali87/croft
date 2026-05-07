@@ -131,6 +131,8 @@ struct ActivityBarImages {
     explorer_inactive: String,
     search_active: String,
     search_inactive: String,
+    source_control_active: String,
+    source_control_inactive: String,
     remote_active: String,
     remote_inactive: String,
 }
@@ -159,9 +161,11 @@ fn git_status_spans<'a>(status: &'a crate::git::GitStatus) -> Vec<Span<'a>> {
     };
     let mut spans: Vec<Span> = Vec::with_capacity(6);
     spans.push(Span::raw("  "));
-    // Codicon git-branch glyph (U+EAFC).
+    // Codicon `source-control` (U+EB14): the Y-fork that matches the
+    // activity-bar Source Control icon, so the status-bar branch indicator
+    // and the SCM panel share the same visual mark.
     spans.push(Span::styled(
-        "\u{eafc} ",
+        "\u{eb14} ",
         Style::default().fg(pill_color),
     ));
     let label: &str = match (&status.branch, &status.detached_hash) {
@@ -930,13 +934,18 @@ impl App {
         let explorer_inactive = encode(crate::iterm2_inline::EXPLORER_SRC_PNG, false);
         let search_active = encode(crate::iterm2_inline::SEARCH_SRC_PNG, true);
         let search_inactive = encode(crate::iterm2_inline::SEARCH_SRC_PNG, false);
+        let source_control_png = crate::iterm2_inline::bake_source_control_src_png();
+        let source_control_active = encode(&source_control_png, true);
+        let source_control_inactive = encode(&source_control_png, false);
         let remote_active = encode(crate::iterm2_inline::REMOTE_SRC_PNG, true);
         let remote_inactive = encode(crate::iterm2_inline::REMOTE_SRC_PNG, false);
-        if let (Some(ea), Some(ei), Some(sa), Some(si), Some(ra), Some(ri)) = (
+        if let (Some(ea), Some(ei), Some(sa), Some(si), Some(sca), Some(sci), Some(ra), Some(ri)) = (
             explorer_active,
             explorer_inactive,
             search_active,
             search_inactive,
+            source_control_active,
+            source_control_inactive,
             remote_active,
             remote_inactive,
         ) {
@@ -945,6 +954,8 @@ impl App {
                 explorer_inactive: ei,
                 search_active: sa,
                 search_inactive: si,
+                source_control_active: sca,
+                source_control_inactive: sci,
                 remote_active: ra,
                 remote_inactive: ri,
             });
@@ -961,8 +972,13 @@ impl App {
         };
         let exp_block = self.sidebar_areas.explorer_icon;
         let sea_block = self.sidebar_areas.search_icon;
+        let scm_block = self.sidebar_areas.source_control_icon;
         let rem_block = self.sidebar_areas.remote_icon;
-        if exp_block.width == 0 || sea_block.width == 0 || rem_block.width == 0 {
+        if exp_block.width == 0
+            || sea_block.width == 0
+            || scm_block.width == 0
+            || rem_block.width == 0
+        {
             return Vec::new();
         }
         let exp_state = if self.sidebar_view == SidebarView::Explorer {
@@ -975,6 +991,11 @@ impl App {
         } else {
             &images.search_inactive
         };
+        let scm_state = if self.sidebar_view == SidebarView::SourceControl {
+            &images.source_control_active
+        } else {
+            &images.source_control_inactive
+        };
         let rem_state = if self.sidebar_view == SidebarView::Remote {
             &images.remote_active
         } else {
@@ -983,6 +1004,7 @@ impl App {
         vec![
             ((exp_block.x, exp_block.y), exp_state.as_str()),
             ((sea_block.x, sea_block.y), sea_state.as_str()),
+            ((scm_block.x, scm_block.y), scm_state.as_str()),
             ((rem_block.x, rem_block.y), rem_state.as_str()),
         ]
     }
@@ -1673,20 +1695,17 @@ impl App {
             );
             render_glyph(
                 frame,
+                source_control_block,
+                crate::icons::ACTIVITY_SOURCE_CONTROL,
+                source_control_active,
+            );
+            render_glyph(
+                frame,
                 remote_block,
                 crate::icons::ACTIVITY_REMOTE,
                 remote_active,
             );
         }
-        // Source Control has no baked PNG yet, so render its glyph in both
-        // modes. Adjacent cells keep their OSC-1337 overlays through the
-        // 2 s activity-overlay keepalive in the main loop.
-        render_glyph(
-            frame,
-            source_control_block,
-            crate::icons::ACTIVITY_SOURCE_CONTROL,
-            source_control_active,
-        );
 
         self.sidebar_areas.explorer_icon = explorer_block;
         self.sidebar_areas.search_icon = search_block;

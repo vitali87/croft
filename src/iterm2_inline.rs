@@ -10,6 +10,99 @@ pub const REMOTE_SRC_PNG: &[u8] =
 pub const WELCOME_LOGO_PNG: &[u8] =
     include_bytes!("../assets/logo-tight-removebg-preview.png");
 
+/// Bake the canonical Source Control icon (Codicon `source-control`,
+/// U+EB14) into a 192x192 RGBA PNG matching the other activity-bar source
+/// PNGs. Drawing it programmatically avoids shipping a separate asset file
+/// and guarantees the shape doesn't drift under SVG rasterizer differences.
+pub fn bake_source_control_src_png() -> Vec<u8> {
+    let canvas_size: u32 = 192;
+    let mut img: RgbaImage =
+        ImageBuffer::from_pixel(canvas_size, canvas_size, Rgba([0, 0, 0, 0]));
+    let white = Rgba([0xff, 0xff, 0xff, 0xff]);
+
+    // Two trunk nodes (top + bottom of the vertical line) and one branch
+    // node sprouting up-and-right from the middle of the trunk. Geometry
+    // mirrors the codicon source-control glyph.
+    let trunk_x: i32 = 64;
+    let top_y: i32 = 44;
+    let bot_y: i32 = 148;
+    let branch_x: i32 = 144;
+    let branch_y: i32 = 80;
+    let r: i32 = 22;
+    let stroke: i32 = 12;
+
+    // Vertical trunk between the two trunk nodes.
+    fill_rect(
+        &mut img,
+        trunk_x - stroke / 2,
+        top_y,
+        stroke,
+        bot_y - top_y,
+        white,
+    );
+    // Branch line from the trunk to the side node. Stroked thick segment so
+    // it reads at small sizes; a 90-degree elbow is plenty here.
+    fill_rect(
+        &mut img,
+        trunk_x,
+        branch_y - stroke / 2,
+        branch_x - trunk_x,
+        stroke,
+        white,
+    );
+    fill_circle(&mut img, trunk_x, top_y, r, white);
+    fill_circle(&mut img, trunk_x, bot_y, r, white);
+    fill_circle(&mut img, branch_x, branch_y, r, white);
+    // Knock out a smaller hole in each node so they read as rings, matching
+    // the codicon glyph's outlined-circle look. Without this they'd be
+    // solid dots.
+    let inner_hole = Rgba([0, 0, 0, 0]);
+    let inner_r = r - stroke / 2 - 1;
+    fill_circle(&mut img, trunk_x, top_y, inner_r, inner_hole);
+    fill_circle(&mut img, trunk_x, bot_y, inner_r, inner_hole);
+    fill_circle(&mut img, branch_x, branch_y, inner_r, inner_hole);
+
+    let mut out = Vec::with_capacity(8192);
+    image::DynamicImage::ImageRgba8(img)
+        .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
+        .expect("encoding a 192x192 RGBA buffer to PNG cannot fail");
+    out
+}
+
+fn fill_rect(img: &mut RgbaImage, x: i32, y: i32, w: i32, h: i32, color: Rgba<u8>) {
+    let (cw, ch) = (img.width() as i32, img.height() as i32);
+    let x0 = x.max(0);
+    let y0 = y.max(0);
+    let x1 = (x + w).min(cw);
+    let y1 = (y + h).min(ch);
+    for yy in y0..y1 {
+        for xx in x0..x1 {
+            img.put_pixel(xx as u32, yy as u32, color);
+        }
+    }
+}
+
+fn fill_circle(img: &mut RgbaImage, cx: i32, cy: i32, r: i32, color: Rgba<u8>) {
+    if r <= 0 {
+        return;
+    }
+    let (cw, ch) = (img.width() as i32, img.height() as i32);
+    let r2 = r * r;
+    let x0 = (cx - r).max(0);
+    let y0 = (cy - r).max(0);
+    let x1 = (cx + r + 1).min(cw);
+    let y1 = (cy + r + 1).min(ch);
+    for yy in y0..y1 {
+        let dy = yy - cy;
+        for xx in x0..x1 {
+            let dx = xx - cx;
+            if dx * dx + dy * dy <= r2 {
+                img.put_pixel(xx as u32, yy as u32, color);
+            }
+        }
+    }
+}
+
 const ACTIVE_PILL: Rgba<u8> = Rgba([0x4e, 0x9a, 0xff, 0xff]);
 const ACTIVE_TINT: Rgba<u8> = Rgba([0xff, 0xff, 0xff, 0xff]);
 const INACTIVE_TINT: Rgba<u8> = Rgba([0x9d, 0xa5, 0xb4, 0xff]);
@@ -293,6 +386,37 @@ mod tests {
                 "corner ({x},{y}) must equal caller bg"
             );
         }
+    }
+
+    #[test]
+    fn bake_source_control_src_png_is_192x192_with_visible_strokes() {
+        let bytes = bake_source_control_src_png();
+        let decoded = image::load_from_memory_with_format(&bytes, image::ImageFormat::Png)
+            .expect("baked source-control icon must decode")
+            .to_rgba8();
+        assert_eq!(decoded.width(), 192);
+        assert_eq!(decoded.height(), 192);
+        // Centroid of the trunk: should hit a fully opaque white stroke.
+        let trunk_pixel = decoded.get_pixel(64, 96).0;
+        assert_eq!(
+            trunk_pixel[3], 0xff,
+            "trunk midpoint must be drawn (alpha 255)"
+        );
+        // Corner: should still be transparent so compose_icon's bg fills it.
+        let corner = decoded.get_pixel(0, 0).0;
+        assert_eq!(corner[3], 0x00, "outside the icon must stay transparent");
+    }
+
+    #[test]
+    fn baked_source_control_icon_composes_through_icon_pipeline() {
+        let src = bake_source_control_src_png();
+        let bg = Rgba([0x1e, 0x22, 0x2e, 0xff]);
+        let baked =
+            compose_icon(&src, 32, 16, false, bg).expect("compose_icon must accept the baked PNG");
+        let decoded = image::load_from_memory_with_format(&baked, image::ImageFormat::Png)
+            .unwrap()
+            .to_rgba8();
+        assert_eq!((decoded.width(), decoded.height()), (32, 16));
     }
 
     #[test]

@@ -21,9 +21,10 @@ pub const CHEVRON_OPEN: char = '▾';
 pub const ACTIVITY_EXPLORER: char = '\u{eaf0}';
 pub const ACTIVITY_SEARCH: char = '\u{ea6d}';
 pub const ACTIVITY_REMOTE: char = '\u{eb39}';
-/// Codicon "source-control" (the fork glyph). Verified against Nerd Font cmap;
-/// distinct from `cod-git_branch` (U+EAFC) which is the simpler branch icon.
-pub const ACTIVITY_SOURCE_CONTROL: char = '\u{eafc}';
+/// Codicon `source-control` — the Y-fork glyph with three nodes that
+/// VS Code uses for its Source Control activity-bar entry. U+EAFC is the
+/// simpler `cod-git_branch` (single branch) and is wrong for this slot.
+pub const ACTIVITY_SOURCE_CONTROL: char = '\u{eb14}';
 
 pub fn for_path(name: &str, suffix: &str) -> Icon {
     let n = name.to_ascii_lowercase();
@@ -170,6 +171,18 @@ mod tests {
     fn activity_bar_remote_glyph_is_cod_remote_explorer() {
         assert_eq!(ACTIVITY_REMOTE, '\u{eb39}');
         assert_ne!(ACTIVITY_REMOTE, '\u{eb3c}', "U+EB3C is not the Remote Explorer glyph");
+    }
+
+    #[test]
+    fn activity_bar_source_control_glyph_is_cod_source_control_not_git_branch() {
+        // U+EAFC is `cod-git_branch` (a single branch sprouting off a line).
+        // The Source Control activity-bar slot must use `cod-source_control`
+        // at U+EB14 (Y-fork with three nodes) to match VS Code.
+        assert_eq!(ACTIVITY_SOURCE_CONTROL, '\u{eb14}');
+        assert_ne!(
+            ACTIVITY_SOURCE_CONTROL, '\u{eafc}',
+            "U+EAFC is cod-git_branch, not the Source Control fork glyph"
+        );
     }
 
     #[test]

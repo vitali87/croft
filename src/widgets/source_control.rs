@@ -302,7 +302,7 @@ impl Widget for &mut SourceControlPanel {
         // Branch / dirty summary row.
         let mut spans: Vec<Span> = Vec::with_capacity(4);
         spans.push(Span::raw(" "));
-        spans.push(Span::styled("\u{eafc} ", Style::default().fg(Color::Rgb(0xa3, 0xbe, 0x8c))));
+        spans.push(Span::styled("\u{eb14} ", Style::default().fg(Color::Rgb(0xa3, 0xbe, 0x8c))));
         let label = match (&self.status.branch, &self.status.detached_hash) {
             (Some(b), _) => b.clone(),
             (None, Some(h)) => h.clone(),
