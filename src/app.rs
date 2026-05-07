@@ -733,9 +733,9 @@ fn welcome_recents_height(
     1 + remote_h + commit_h
 }
 
-const WELCOME_TAGLINE: &str = "LIGHTWEIGHT.  FAST.  BUILT FOR DEVELOPERS.";
+const WELCOME_TAGLINE: &str = "LIGHTWEIGHT.  BLAZINGLY FAST.  BUILT FOR DEVELOPERS.";
 const WELCOME_FOOTER: &str =
-    "\u{2039}  Fast by design.  Secure by default.  Loved by developers.  \u{203a}";
+    "\u{2039}  Blazingly fast by design.  Secure by default.  Loved by developers.  \u{203a}";
 
 const GRAD_TL: (u8, u8, u8) = (0x5c, 0xd6, 0xc8);
 const GRAD_TR: (u8, u8, u8) = (0xec, 0x8c, 0x5a);
@@ -5815,9 +5815,9 @@ mod tests {
     #[test]
     fn welcome_tagline_and_footer_constants_are_present() {
         assert!(WELCOME_TAGLINE.contains("LIGHTWEIGHT"));
-        assert!(WELCOME_TAGLINE.contains("FAST"));
+        assert!(WELCOME_TAGLINE.contains("BLAZINGLY FAST"));
         assert!(WELCOME_TAGLINE.contains("DEVELOPERS"));
-        assert!(WELCOME_FOOTER.contains("Fast by design"));
+        assert!(WELCOME_FOOTER.contains("Blazingly fast by design"));
         assert!(WELCOME_FOOTER.contains("Loved by developers"));
     }
 
