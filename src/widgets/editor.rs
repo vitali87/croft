@@ -400,7 +400,11 @@ fn render_diff(
                 .bg(l_cell_bg)
                 .add_modifier(Modifier::BOLD),
         );
-        let l_clipped: String = l_text.chars().take(l_text_w as usize).collect();
+        let l_clipped: String = l_text
+            .chars()
+            .skip(diff.scroll_x)
+            .take(l_text_w as usize)
+            .collect();
         let mut l_padded = l_clipped.clone();
         let l_pad = (l_text_w as usize).saturating_sub(l_padded.chars().count());
         for _ in 0..l_pad {
@@ -440,7 +444,11 @@ fn render_diff(
                 .bg(r_cell_bg)
                 .add_modifier(Modifier::BOLD),
         );
-        let r_clipped: String = r_text.chars().take(r_text_w as usize).collect();
+        let r_clipped: String = r_text
+            .chars()
+            .skip(diff.scroll_x)
+            .take(r_text_w as usize)
+            .collect();
         let mut r_padded = r_clipped.clone();
         let r_pad = (r_text_w as usize).saturating_sub(r_padded.chars().count());
         for _ in 0..r_pad {

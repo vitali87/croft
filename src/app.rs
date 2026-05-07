@@ -4333,6 +4333,20 @@ impl App {
                     }
                 }
             }
+            MouseEventKind::ScrollLeft => {
+                if in_editor {
+                    if let Some(diff) = self.editor.diff.as_mut() {
+                        diff.scroll_left_by(4);
+                    }
+                }
+            }
+            MouseEventKind::ScrollRight => {
+                if in_editor {
+                    if let Some(diff) = self.editor.diff.as_mut() {
+                        diff.scroll_right_by(4);
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -4618,6 +4632,8 @@ impl App {
             KeyCode::PageDown => diff.scroll_down_by(page),
             KeyCode::Home => diff.scroll_home(),
             KeyCode::End => diff.scroll_end(),
+            KeyCode::Left => diff.scroll_left_by(4),
+            KeyCode::Right => diff.scroll_right_by(4),
             _ => {}
         }
     }
@@ -6701,6 +6717,59 @@ mod tests {
         assert_eq!(app.editor.diff.as_ref().unwrap().scroll, total);
         app.handle_key(key(KeyCode::Home, KeyModifiers::NONE)).unwrap();
         assert_eq!(app.editor.diff.as_ref().unwrap().scroll, 0);
+    }
+
+    #[test]
+    fn left_right_arrows_pan_diff_horizontally() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        let f1 = tmp.path().join("a.txt");
+        let f2 = tmp.path().join("b.txt");
+        let long_line: String = std::iter::repeat('x').take(200).collect();
+        std::fs::write(&f1, format!("{long_line}\n")).unwrap();
+        std::fs::write(&f2, format!("{long_line}y\n")).unwrap();
+        app.editor.open_diff(&f1, &f2).unwrap();
+        app.editor.last_inner = Rect { x: 0, y: 0, width: 80, height: 12 };
+        app.focus_pane(Pane::Editor);
+
+        app.handle_key(key(KeyCode::Right, KeyModifiers::NONE)).unwrap();
+        assert_eq!(app.editor.diff.as_ref().unwrap().scroll_x, 4);
+        app.handle_key(key(KeyCode::Right, KeyModifiers::NONE)).unwrap();
+        assert_eq!(app.editor.diff.as_ref().unwrap().scroll_x, 8);
+        app.handle_key(key(KeyCode::Left, KeyModifiers::NONE)).unwrap();
+        assert_eq!(app.editor.diff.as_ref().unwrap().scroll_x, 4);
+        // Vertical Up/Down still go to diff.scroll, not scroll_x.
+        let before_y = app.editor.diff.as_ref().unwrap().scroll;
+        app.handle_key(key(KeyCode::Down, KeyModifiers::NONE)).unwrap();
+        assert!(app.editor.diff.as_ref().unwrap().scroll >= before_y);
+    }
+
+    #[test]
+    fn mouse_horizontal_wheel_over_diff_pans_horizontally() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        let f1 = tmp.path().join("a.txt");
+        let f2 = tmp.path().join("b.txt");
+        let long: String = std::iter::repeat('z').take(120).collect();
+        std::fs::write(&f1, format!("{long}\n")).unwrap();
+        std::fs::write(&f2, format!("{long}\n")).unwrap();
+        app.editor.open_diff(&f1, &f2).unwrap();
+        app.editor.last_area = Rect { x: 0, y: 0, width: 80, height: 20 };
+        app.editor.last_full_area = app.editor.last_area;
+        app.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::ScrollRight,
+            column: 5,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.editor.diff.as_ref().unwrap().scroll_x, 4);
+        app.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::ScrollLeft,
+            column: 5,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.editor.diff.as_ref().unwrap().scroll_x, 0);
     }
 
     #[test]

@@ -10,6 +10,10 @@ pub struct DiffData {
     /// Top-most row index visible in the viewport. Mirrors `Editor.scroll_y`
     /// for non-diff tabs.
     pub scroll: usize,
+    /// Number of leading characters to skip on each rendered row so the
+    /// user can pan horizontally past long lines. Same value applies to
+    /// both columns so the side-by-side rows stay aligned.
+    pub scroll_x: usize,
 }
 
 /// One visual row in a side-by-side diff view. The left column shows
@@ -42,7 +46,20 @@ impl DiffData {
             right_lines,
             rows,
             scroll: 0,
+            scroll_x: 0,
         }
+    }
+
+    /// Length (in chars) of the longest line across both files. Used to
+    /// clamp horizontal scrolling so the user can't pan into empty space
+    /// past the end of the longest content.
+    pub fn longest_line_chars(&self) -> usize {
+        self.left_lines
+            .iter()
+            .chain(self.right_lines.iter())
+            .map(|l| l.chars().count())
+            .max()
+            .unwrap_or(0)
     }
 
     pub fn total_rows(&self) -> usize {
@@ -66,6 +83,15 @@ impl DiffData {
 
     pub fn scroll_end(&mut self) {
         self.scroll = self.rows.len();
+    }
+
+    pub fn scroll_left_by(&mut self, n: usize) {
+        self.scroll_x = self.scroll_x.saturating_sub(n);
+    }
+
+    pub fn scroll_right_by(&mut self, n: usize) {
+        let max = self.longest_line_chars();
+        self.scroll_x = (self.scroll_x + n).min(max);
     }
 }
 
@@ -197,6 +223,26 @@ mod tests {
             })
             .collect();
         assert_eq!(kinds, vec!["rep", "rm", "rm", "rm"]);
+    }
+
+    #[test]
+    fn horizontal_scroll_helpers_clamp_at_longest_line() {
+        let mut d = DiffData::build(
+            PathBuf::from("/a"),
+            PathBuf::from("/b"),
+            lines(&["short", "medium length", "much-much-much-much-much-longer"]),
+            lines(&["short", "medium length", "much-much-much-much-much-longer"]),
+        );
+        assert_eq!(d.scroll_x, 0);
+        d.scroll_left_by(5);
+        assert_eq!(d.scroll_x, 0, "saturating sub at 0");
+        d.scroll_right_by(10);
+        assert_eq!(d.scroll_x, 10);
+        let longest = d.longest_line_chars();
+        d.scroll_right_by(99_999);
+        assert_eq!(d.scroll_x, longest, "right scroll clamps at longest line");
+        d.scroll_left_by(longest);
+        assert_eq!(d.scroll_x, 0);
     }
 
     #[test]
