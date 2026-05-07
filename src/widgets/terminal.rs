@@ -148,6 +148,13 @@ impl PtyTerminal {
         self.pty_dirty.swap(false, Ordering::AcqRel)
     }
 
+    /// Read the dirty flag without clearing it. Lets the main loop decide
+    /// whether to redraw now or coalesce, without losing the signal if we
+    /// choose to skip this iteration.
+    pub fn peek_dirty(&self) -> bool {
+        self.pty_dirty.load(Ordering::Acquire)
+    }
+
     pub fn cell_at(&self, col: u16, row: u16) -> Option<(u16, u16)> {
         let inner = self.last_inner;
         if inner.width == 0 || inner.height == 0 {

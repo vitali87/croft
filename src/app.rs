@@ -1739,6 +1739,13 @@ impl App {
         self.terminals.iter().fold(false, |acc, t| acc | t.take_dirty())
     }
 
+    /// Like `drain_terminals_dirty` but does not clear the underlying flags.
+    /// The main loop uses this to decide whether to coalesce a PTY-only
+    /// redraw without losing the signal if it chooses to skip.
+    pub fn peek_terminals_dirty(&self) -> bool {
+        self.terminals.iter().any(|t| t.peek_dirty())
+    }
+
     fn terminal_at_pos(&self, col: u16, row: u16) -> Option<usize> {
         self.terminals
             .iter()
@@ -4950,6 +4957,15 @@ fn rect_contains(r: Rect, x: u16, y: u16) -> bool {
 
 const TERMINAL_ADD_LABEL: &str = " + ";
 
+/// True when croft was invoked over an SSH login (or otherwise inside a
+/// remote shell). Used to throttle PTY-driven redraws further so the SSH
+/// pipe never saturates and starves input handling on the same thread.
+fn is_remote_session() -> bool {
+    std::env::var_os("SSH_CONNECTION").is_some()
+        || std::env::var_os("SSH_TTY").is_some()
+        || std::env::var_os("SSH_CLIENT").is_some()
+}
+
 /// Paint the "+" button on the top-right of the terminal pane and return
 /// its hit-test rectangle. Returns None when the pane is too narrow / short
 /// for the label to fit without colliding with the right-corner glyph.
@@ -7158,6 +7174,20 @@ mod tests {
     }
 
     #[test]
+    fn peek_terminals_dirty_does_not_clear_flags() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        // Fresh App starts dirty so the first frame paints.
+        assert!(app.peek_terminals_dirty(), "fresh app should be dirty");
+        // Two consecutive peeks must both see the flag - peek must not clear.
+        assert!(app.peek_terminals_dirty(), "peek must not consume the dirty flag");
+        // Drain consumes it.
+        let drained = app.drain_terminals_dirty();
+        assert!(drained, "drain after peek should still report dirty once");
+        assert!(!app.peek_terminals_dirty(), "after drain, peek must be clean");
+    }
+
+    #[test]
     fn focus_flag_only_set_on_active_terminal() {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(tmp.path().to_path_buf()).unwrap();
@@ -7388,6 +7418,20 @@ fn main_loop(
     // before the first event arrives or any timer fires.
     let mut needs_redraw = true;
     let mut last_blink_visible = app.cursor_visible_phase();
+    // PTY-only redraws are capped so a chatty embedded shell (Claude Code,
+    // npm install, log streams) cannot saturate stdout and starve mouse /
+    // key events on the same thread. Input + FS + search + git + remote
+    // signals always bypass the cap, so clicks and keystrokes stay at 0ms.
+    // Over SSH the user's link is the bottleneck, so we drop further to
+    // ~20 Hz; locally ~30 Hz is plenty for shell text.
+    let pty_min_interval = if is_remote_session() {
+        Duration::from_millis(50)
+    } else {
+        Duration::from_millis(33)
+    };
+    let mut last_pty_redraw = std::time::Instant::now()
+        .checked_sub(pty_min_interval)
+        .unwrap_or_else(std::time::Instant::now);
 
     while !app.quit {
         // If the user dropped files onto the Remote Explorer, suspend the
@@ -7401,7 +7445,10 @@ fn main_loop(
         // Pull in any filesystem-watcher events first so the tree reflects
         // disk reality on the very next frame.
         let fs_changed = app.drain_fs_events();
-        let pty_changed = app.drain_terminals_dirty();
+        // Peek without clearing so we can coalesce PTY-only redraws without
+        // losing bytes that the reader thread has already advanced into the
+        // terminal grid.
+        let pty_pending = app.peek_terminals_dirty();
         let blink_visible = app.cursor_visible_phase();
         let blink_changed = blink_visible != last_blink_visible;
         let commits_changed = app.drain_recent_commits();
@@ -7409,7 +7456,29 @@ fn main_loop(
         let remote_changed = app.refresh_remote_if_config_changed();
         let pulls_changed = app.drain_remote_pulls();
 
-        if needs_redraw || fs_changed || pty_changed || blink_changed || commits_changed || search_changed || remote_changed || pulls_changed {
+        let non_pty_dirty = needs_redraw
+            || fs_changed
+            || blink_changed
+            || commits_changed
+            || search_changed
+            || remote_changed
+            || pulls_changed;
+        let pty_eligible =
+            pty_pending && last_pty_redraw.elapsed() >= pty_min_interval;
+        let do_redraw = non_pty_dirty || pty_eligible;
+        // Consume the PTY dirty flags only when we are actually redrawing.
+        // Skipping a frame must leave them set so the next eligible tick
+        // emits the deferred output.
+        let pty_changed = if do_redraw {
+            app.drain_terminals_dirty()
+        } else {
+            false
+        };
+
+        if do_redraw {
+            if pty_changed {
+                last_pty_redraw = std::time::Instant::now();
+            }
             // If the welcome OSC-1337 image was painted earlier and the
             // user has just opened a file, wipe the screen so iTerm drops
             // its cached image cells AND ratatui repaints every cell on
