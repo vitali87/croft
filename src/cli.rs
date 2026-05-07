@@ -36,7 +36,13 @@ pub enum CliCommand {
     },
     /// Diagnostic: print every key event the terminal delivers, with modifiers.
     /// Useful for confirming whether cmd / super reaches the app.  Press Ctrl+C to quit.
-    Keys,
+    Keys {
+        /// Also enable mouse capture and print every mouse event (Down / Drag / Up / Move /
+        /// Scroll). Use over SSH to confirm that drag events make it from the local terminal
+        /// to the remote croft when editor selection misbehaves.
+        #[arg(long)]
+        mouse: bool,
+    },
     /// Configure iTerm2 for Croft: fonts plus Cmd+Shift+F and Search paste.
     SetupIterm2 {
         /// PostScript name of the primary font
@@ -66,7 +72,7 @@ impl Cli {
             Some(CliCommand::SetupTerminal { font, size, yes }) => {
                 setup_terminal(&font, size, yes)
             }
-            Some(CliCommand::Keys) => keys_diagnostic(),
+            Some(CliCommand::Keys { mouse }) => keys_diagnostic(mouse),
             Some(CliCommand::SetupIterm2 { font, nonascii, size, yes }) => {
                 setup_iterm2(&font, &nonascii, size, yes)
             }
@@ -154,7 +160,13 @@ mod tests {
     #[test]
     fn parses_keys_subcommand() {
         let cli = Cli::parse_from(["croft", "keys"]);
-        assert!(matches!(cli.command, Some(CliCommand::Keys)));
+        assert!(matches!(cli.command, Some(CliCommand::Keys { mouse: false })));
+    }
+
+    #[test]
+    fn parses_keys_subcommand_with_mouse() {
+        let cli = Cli::parse_from(["croft", "keys", "--mouse"]);
+        assert!(matches!(cli.command, Some(CliCommand::Keys { mouse: true })));
     }
 
     #[test]
@@ -250,10 +262,10 @@ end tell"#
     Ok(())
 }
 
-fn keys_diagnostic() -> Result<()> {
+fn keys_diagnostic(mouse: bool) -> Result<()> {
     use crossterm::event::{
-        self, Event, KeyCode, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
-        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+        KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     };
     use crossterm::{execute, terminal};
     use std::io::stdout;
@@ -262,6 +274,9 @@ fn keys_diagnostic() -> Result<()> {
     println!("croft keys: press any key to inspect; Ctrl+C to quit.");
     println!("If the kitty keyboard protocol is negotiated, modifier keys");
     println!("(including Cmd/Super on macOS) will appear in the modifier list.");
+    if mouse {
+        println!("Mouse capture is on: click and drag to inspect mouse events.");
+    }
     println!();
 
     terminal::enable_raw_mode().context("enable raw mode")?;
@@ -274,6 +289,7 @@ fn keys_diagnostic() -> Result<()> {
         )
     )
     .is_ok();
+    let mouse_capture_enabled = mouse && execute!(out, EnableMouseCapture).is_ok();
 
     let result = (|| -> Result<()> {
         loop {
@@ -346,6 +362,29 @@ fn keys_diagnostic() -> Result<()> {
                         use std::io::Write;
                         std::io::stdout().flush().ok();
                     }
+                    Event::Mouse(mev) => {
+                        let mut mods: Vec<&str> = Vec::new();
+                        if mev.modifiers.contains(KeyModifiers::CONTROL) {
+                            mods.push("CONTROL");
+                        }
+                        if mev.modifiers.contains(KeyModifiers::ALT) {
+                            mods.push("ALT");
+                        }
+                        if mev.modifiers.contains(KeyModifiers::SHIFT) {
+                            mods.push("SHIFT");
+                        }
+                        let mods_s = if mods.is_empty() {
+                            String::from("none")
+                        } else {
+                            mods.join(" + ")
+                        };
+                        print!(
+                            "\r  mouse kind={:?}  col={}  row={}  modifiers=[{}]\r\n",
+                            mev.kind, mev.column, mev.row, mods_s
+                        );
+                        use std::io::Write;
+                        std::io::stdout().flush().ok();
+                    }
                     other => {
                         print!("\r  event={other:?} kitty={kbd_enhanced}\r\n");
                         use std::io::Write;
@@ -357,6 +396,9 @@ fn keys_diagnostic() -> Result<()> {
         Ok(())
     })();
 
+    if mouse_capture_enabled {
+        execute!(stdout(), DisableMouseCapture).ok();
+    }
     if kbd_enhanced {
         execute!(stdout(), PopKeyboardEnhancementFlags).ok();
     }
