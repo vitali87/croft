@@ -485,6 +485,11 @@ pub struct App {
     /// Hit-test rectangle of the "[+]" button on the terminal pane's top
     /// border. None when the pane is hidden or too narrow for the label.
     terminal_add_button: Option<Rect>,
+    /// When the activity-bar OSC-1337 overlay was last written to stdout.
+    /// Re-emitting on every redraw (the previous behaviour) flickered the
+    /// editor caret at the PTY redraw rate; we now refresh on dirty plus a
+    /// periodic keep-alive to defeat iTerm2's image-cell eviction.
+    last_activity_overlay_emit: Option<std::time::Instant>,
     /// Total width / height of the right-hand content area, captured on
     /// every render so a splitter drag can clamp to the live viewport.
     last_content_width: u16,
@@ -839,6 +844,7 @@ impl App {
             sidebar_splitter_x: None,
             terminal_splitter_y: None,
             terminal_add_button: None,
+            last_activity_overlay_emit: None,
             last_content_width: 0,
             last_content_height: 0,
             editor_image_osc: None,
@@ -7511,7 +7517,20 @@ fn main_loop(
             // buffer in image-mode, ratatui's diff produces zero per-cell
             // writes here — re-emitting the pre-encoded OSC bytes every
             // frame is cheap and locks the images in.
-            let overlays = app.pending_activity_image_overlays();
+            // Keep-alive interval for the activity overlay refresh. Long
+            // enough that the editor caret never flickers at the PTY redraw
+            // cadence, short enough that iTerm2's image-cell eviction is
+            // imperceptible if it ever fires.
+            const ACTIVITY_OVERLAY_KEEPALIVE: Duration = Duration::from_secs(2);
+            let must_refresh_activity = app.activity_overlay_dirty
+                || app
+                    .last_activity_overlay_emit
+                    .map_or(true, |t| t.elapsed() >= ACTIVITY_OVERLAY_KEEPALIVE);
+            let overlays = if must_refresh_activity {
+                app.pending_activity_image_overlays()
+            } else {
+                Vec::new()
+            };
             if !overlays.is_empty() {
                 use std::io::Write;
                 let mut out = stdout();
@@ -7527,6 +7546,7 @@ fn main_loop(
                 }
                 let _ = out.flush();
                 app.activity_overlay_dirty = false;
+                app.last_activity_overlay_emit = Some(std::time::Instant::now());
             }
             // Active editor image preview: bake-once-emit-each-frame
             // overlay, just like the welcome wordmark. Sent after ratatui
