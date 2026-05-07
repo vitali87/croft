@@ -755,8 +755,21 @@ fn rgb_color((r, g, b): (u8, u8, u8)) -> Color {
 /// Paint a rounded-rectangle border whose stroke colour interpolates
 /// linearly between the four corner colours along each edge. The interior
 /// is left untouched so the caller can fill it with content.
+///
+/// The rect is clipped against the buffer's area, so callers don't have to
+/// do the bounds math themselves — passing a rect that runs off the edge
+/// (e.g., a 80x25 default startup buffer with a tall recents list) draws
+/// nothing instead of panicking inside `set_string`.
 fn paint_gradient_box(buf: &mut ratatui::buffer::Buffer, rect: Rect) {
     if rect.width < 2 || rect.height < 2 {
+        return;
+    }
+    let buf_area = buf.area;
+    if rect.x < buf_area.x
+        || rect.y < buf_area.y
+        || rect.x + rect.width > buf_area.x + buf_area.width
+        || rect.y + rect.height > buf_area.y + buf_area.height
+    {
         return;
     }
     let max_x = rect.width - 1;
@@ -1524,23 +1537,38 @@ impl App {
             &self.recent_commits,
             inner_w,
         );
-        // Box: top + bottom border (2) + 1-row inset on each side (2) + content.
-        let box_h = if has_recent_panel { recents_inner_h.saturating_add(4) } else { 0 };
         let tagline_h = 1u16;
         let footer_h = 1u16;
         // Gaps: blank row after logo, after tagline, after box.
         let gaps_h = 3u16;
 
         let logo_max_w = (area.width as u32).saturating_sub(4) as u16;
-        let stack_overhead = box_h.saturating_add(tagline_h + footer_h + gaps_h);
-        let logo_max_h = area.height.saturating_sub(stack_overhead);
         let logo_w_cells = logo_max_w.min(48).max(8);
-        let logo_h_cells = logo_max_h.min(14).max(4);
+        // Pick the logo height first, then size the recents box to fit
+        // whatever's left. Without this a tall commit list would extend the
+        // stack past the bottom of the welcome area and we'd panic painting
+        // into rows that don't exist (ratatui buffers are fixed-size).
+        let logo_h_cells = area
+            .height
+            .saturating_sub(tagline_h + footer_h + gaps_h)
+            .min(14)
+            .max(4);
+        let used_above_box = logo_h_cells + 1 + tagline_h + 1; // logo, gap, tagline, gap
+        let used_below_box = 1 + footer_h; // gap, footer
+        let max_box_h = area
+            .height
+            .saturating_sub(used_above_box)
+            .saturating_sub(used_below_box);
+        // Box content needs at least the 4-cell border+inset envelope to be
+        // worth drawing.
+        let desired_box_h = if has_recent_panel { recents_inner_h.saturating_add(4) } else { 0 };
+        let box_h = desired_box_h.min(max_box_h);
 
-        let total_h = logo_h_cells + 1 + tagline_h + 1 + box_h + 1 + footer_h;
+        let total_h = used_above_box + box_h + used_below_box;
         let block_top = area.y + area.height.saturating_sub(total_h) / 2;
         let logo_x = area.x + area.width.saturating_sub(logo_w_cells) / 2;
         let logo_y = block_top;
+        let area_max_y = area.y + area.height;
 
         let desired = WelcomeLayout {
             cell_x: logo_x,
@@ -1617,7 +1645,7 @@ impl App {
         let badge_x = logo_x + logo_w_cells + 1;
         let badge_y = logo_y + (logo_h_cells * 5) / 6;
         if badge_x + version_w + 2 <= area.x + area.width
-            && badge_y < area.y + area.height
+            && badge_y + 2 < area_max_y
         {
             let badge_style = Style::default()
                 .fg(rgb_color(GRAD_TL))
@@ -1679,15 +1707,21 @@ impl App {
         let tagline_y = logo_y + logo_h_cells + 1;
         let tagline_w = WELCOME_TAGLINE.chars().count() as u16;
         let tagline_x = area.x + area.width.saturating_sub(tagline_w) / 2;
-        frame.buffer_mut().set_string(
-            tagline_x,
-            tagline_y,
-            WELCOME_TAGLINE,
-            Style::default().fg(Color::Rgb(0x88, 0xc0, 0xd0)),
-        );
+        if tagline_y < area_max_y && tagline_w <= area.width {
+            frame.buffer_mut().set_string(
+                tagline_x,
+                tagline_y,
+                WELCOME_TAGLINE,
+                Style::default().fg(Color::Rgb(0x88, 0xc0, 0xd0)),
+            );
+        }
 
         let box_y = tagline_y + tagline_h + 1;
-        if has_recent_panel && box_h > 0 && block_w >= 4 {
+        if has_recent_panel
+            && box_h >= 4
+            && block_w >= 4
+            && box_y + box_h <= area_max_y
+        {
             let box_rect = Rect {
                 x: block_left,
                 y: box_y,
@@ -5718,6 +5752,46 @@ mod tests {
         assert_eq!(lerp_rgb(a, b, 1.0), b);
         let mid = lerp_rgb(a, b, 0.5);
         assert!(mid.0 > a.0 && mid.0 < b.0);
+    }
+
+    #[test]
+    fn paint_gradient_box_skips_when_rect_runs_off_buffer() {
+        // The panic that motivated the bounds clip: an 80x25 buffer asked
+        // to render a tall recents box that extended past row 25.
+        let buf_area = Rect { x: 0, y: 0, width: 80, height: 25 };
+        let mut buf = ratatui::buffer::Buffer::empty(buf_area);
+        let oversized = Rect { x: 0, y: 0, width: 80, height: 60 };
+        // Must not panic; the no-op clip is the contract.
+        paint_gradient_box(&mut buf, oversized);
+        let off_top_left = Rect { x: 0, y: 0, width: 80, height: 25 };
+        // Sanity: a fitting rect still draws.
+        paint_gradient_box(&mut buf, off_top_left);
+        assert_eq!(buf[(0, 0)].symbol(), "\u{256d}");
+    }
+
+    #[test]
+    fn render_welcome_does_not_panic_in_default_80x25_with_many_commits() {
+        // Repro for the index-(41,70) panic at startup: ratatui's initial
+        // backend size is 80x25 before the alt-screen reflow. With a long
+        // recents list the previous code computed a box taller than 25,
+        // ran past the buffer, and panicked inside set_string.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.recent_repo_remote = Some("https://bitbucket.org/u/repo".to_string());
+        app.recent_commits = (0..40)
+            .map(|i| crate::git::CommitInfo {
+                hash: format!("hash{i:04}"),
+                full_hash: format!("fullhash{i:040}"),
+                when: "1 hour ago".to_string(),
+                subject:
+                    "this is a long subject line that will wrap to multiple lines on a narrow recents column"
+                        .to_string(),
+            })
+            .collect();
+        let area = Rect { x: 0, y: 0, width: 80, height: 25 };
+        let backend = ratatui::backend::TestBackend::new(area.width, area.height);
+        let mut term = ratatui::Terminal::new(backend).unwrap();
+        term.draw(|f| app.render_welcome(f, area)).unwrap();
     }
 
     #[test]
