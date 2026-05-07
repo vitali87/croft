@@ -696,10 +696,12 @@ fn welcome_provider_badge(remote: &str) -> String {
         Some(crate::git::CommitApiProvider::GitHub) => "\u{f09b} GitHub".to_string(),
         // Codeberg has no reliable Nerd Font codepoint (many fonts ship
         // without one), and the previous `\u{ea60}` placeholder rendered
-        // as the wrong symbol. Two leading spaces reserve the cells where
-        // the OSC-1337 image overlay paints the actual Codeberg logo on
-        // iTerm2; on non-image terminals the badge is plain "  Codeberg".
-        Some(crate::git::CommitApiProvider::Codeberg) => "  Codeberg".to_string(),
+        // as the wrong symbol. Three leading spaces reserve the layout:
+        // two cells for the OSC-1337 image overlay that paints the actual
+        // Codeberg logo on iTerm2, plus one cell of visual gap so the
+        // logo doesn't butt against the "C". On non-image terminals the
+        // badge reads as plain "   Codeberg".
+        Some(crate::git::CommitApiProvider::Codeberg) => "   Codeberg".to_string(),
         None => "Repo".to_string(),
     }
 }
@@ -6345,6 +6347,19 @@ mod tests {
         assert!(
             badge.chars().all(|c| c.is_ascii() || c == ' '),
             "badge must be glyph-free for Codeberg until/unless we render the icon as an image overlay; current badge: {badge:?}"
+        );
+    }
+
+    /// The Codeberg icon is overlaid as a 2-cell-wide OSC-1337 image at the
+    /// badge's anchor; the text after it must start at least one cell later
+    /// so the logo doesn't visually butt against the "C". That means three
+    /// leading spaces total: two reserved for the icon, one for the gap.
+    #[test]
+    fn welcome_provider_badge_for_codeberg_leaves_a_gap_between_icon_and_text() {
+        let badge = welcome_provider_badge("https://codeberg.org/vitali87/croft");
+        assert!(
+            badge.starts_with("   Codeberg"),
+            "badge must start with three spaces (2 for the icon overlay + 1 visual gap) followed by 'Codeberg'; got: {badge:?}"
         );
     }
 
