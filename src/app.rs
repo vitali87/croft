@@ -733,6 +733,84 @@ fn welcome_recents_height(
     1 + remote_h + commit_h
 }
 
+const WELCOME_TAGLINE: &str = "LIGHTWEIGHT.  FAST.  BUILT FOR DEVELOPERS.";
+const WELCOME_FOOTER: &str =
+    "\u{2039}  Fast by design.  Secure by default.  Loved by developers.  \u{203a}";
+
+const GRAD_TL: (u8, u8, u8) = (0x5c, 0xd6, 0xc8);
+const GRAD_TR: (u8, u8, u8) = (0xec, 0x8c, 0x5a);
+const GRAD_BR: (u8, u8, u8) = (0x4f, 0xb1, 0xa6);
+const GRAD_BL: (u8, u8, u8) = (0x35, 0x80, 0x78);
+
+fn lerp_rgb(a: (u8, u8, u8), b: (u8, u8, u8), t: f32) -> (u8, u8, u8) {
+    let t = t.clamp(0.0, 1.0);
+    let mix = |x: u8, y: u8| ((1.0 - t) * x as f32 + t * y as f32).round() as u8;
+    (mix(a.0, b.0), mix(a.1, b.1), mix(a.2, b.2))
+}
+
+fn rgb_color((r, g, b): (u8, u8, u8)) -> Color {
+    Color::Rgb(r, g, b)
+}
+
+/// Paint a rounded-rectangle border whose stroke colour interpolates
+/// linearly between the four corner colours along each edge. The interior
+/// is left untouched so the caller can fill it with content.
+fn paint_gradient_box(buf: &mut ratatui::buffer::Buffer, rect: Rect) {
+    if rect.width < 2 || rect.height < 2 {
+        return;
+    }
+    let max_x = rect.width - 1;
+    let max_y = rect.height - 1;
+    for x in 0..rect.width {
+        let u = if max_x > 0 { x as f32 / max_x as f32 } else { 0.0 };
+        let top = lerp_rgb(GRAD_TL, GRAD_TR, u);
+        let bot = lerp_rgb(GRAD_BL, GRAD_BR, u);
+        let top_ch = if x == 0 {
+            "\u{256d}"
+        } else if x == max_x {
+            "\u{256e}"
+        } else {
+            "\u{2500}"
+        };
+        let bot_ch = if x == 0 {
+            "\u{2570}"
+        } else if x == max_x {
+            "\u{256f}"
+        } else {
+            "\u{2500}"
+        };
+        buf.set_string(
+            rect.x + x,
+            rect.y,
+            top_ch,
+            Style::default().fg(rgb_color(top)),
+        );
+        buf.set_string(
+            rect.x + x,
+            rect.y + max_y,
+            bot_ch,
+            Style::default().fg(rgb_color(bot)),
+        );
+    }
+    for y in 1..max_y {
+        let v = if max_y > 0 { y as f32 / max_y as f32 } else { 0.0 };
+        let left = lerp_rgb(GRAD_TL, GRAD_BL, v);
+        let right = lerp_rgb(GRAD_TR, GRAD_BR, v);
+        buf.set_string(
+            rect.x,
+            rect.y + y,
+            "\u{2502}",
+            Style::default().fg(rgb_color(left)),
+        );
+        buf.set_string(
+            rect.x + max_x,
+            rect.y + y,
+            "\u{2502}",
+            Style::default().fg(rgb_color(right)),
+        );
+    }
+}
+
 fn open_url(url: &str) -> Result<()> {
     #[cfg(target_os = "macos")]
     let mut cmd = {
@@ -1428,26 +1506,38 @@ impl App {
             area,
         );
 
-        // Reserve space for the repo/commit panel below the logo, then
-        // hand the remainder to the centred image.
+        // Layout regions, top-to-bottom:
+        //   [logo + version badge]
+        //   [tagline]
+        //   [gradient box: header, provider, commits]
+        //   [footer chevron line]
         let block_left = area.x + area.width / 8;
         let block_right = area.x + area.width - area.width / 8;
         let block_w = block_right.saturating_sub(block_left);
+        // The gradient box's content area is 2 cells narrower (the box
+        // border itself).
+        let inner_w = block_w.saturating_sub(2);
         let has_recent_panel =
             self.recent_repo_remote.is_some() || !self.recent_commits.is_empty();
-        let recents_h = welcome_recents_height(
+        let recents_inner_h = welcome_recents_height(
             self.recent_repo_remote.as_deref(),
             &self.recent_commits,
-            block_w,
+            inner_w,
         );
+        // Box: top + bottom border (2) + 1-row inset on each side (2) + content.
+        let box_h = if has_recent_panel { recents_inner_h.saturating_add(4) } else { 0 };
+        let tagline_h = 1u16;
+        let footer_h = 1u16;
+        // Gaps: blank row after logo, after tagline, after box.
+        let gaps_h = 3u16;
+
         let logo_max_w = (area.width as u32).saturating_sub(4) as u16;
-        let logo_max_h = area
-            .height
-            .saturating_sub(recents_h.saturating_add(2));
+        let stack_overhead = box_h.saturating_add(tagline_h + footer_h + gaps_h);
+        let logo_max_h = area.height.saturating_sub(stack_overhead);
         let logo_w_cells = logo_max_w.min(48).max(8);
         let logo_h_cells = logo_max_h.min(14).max(4);
 
-        let total_h = logo_h_cells + 1 + recents_h;
+        let total_h = logo_h_cells + 1 + tagline_h + 1 + box_h + 1 + footer_h;
         let block_top = area.y + area.height.saturating_sub(total_h) / 2;
         let logo_x = area.x + area.width.saturating_sub(logo_w_cells) / 2;
         let logo_y = block_top;
@@ -1520,88 +1610,198 @@ impl App {
             );
         }
 
-        if !has_recent_panel {
-            return;
-        }
-
-        let header_y = logo_y + logo_h_cells + 1;
-        let header = "RECENT";
-        let header_style = Style::default()
-            .fg(Color::Rgb(0x9d, 0xa5, 0xb4))
-            .add_modifier(Modifier::BOLD);
-        frame
-            .buffer_mut()
-            .set_string(block_left, header_y, header, header_style);
-        let row_style = Style::default().fg(Color::Rgb(0xc5, 0xcd, 0xd9));
-        let dim = Style::default().fg(Color::Rgb(0x6c, 0x7d, 0x9c));
-        let link_style = Style::default()
-            .fg(Color::Rgb(0x4e, 0x9a, 0xff))
-            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
-        let mut row_y = header_y + 2;
-        if let Some(remote) = self.recent_repo_remote.as_ref() {
-            let remote_y = header_y + 1;
-            let provider = welcome_provider_label(remote);
-            let badge = welcome_provider_badge(remote);
+        // Version badge to the right of the wordmark (the wordmark sits
+        // in the lower portion of the logo PNG; the badge tracks that row).
+        let version_label = format!(" v{} ", env!("CARGO_PKG_VERSION"));
+        let version_w = version_label.chars().count() as u16;
+        let badge_x = logo_x + logo_w_cells + 1;
+        let badge_y = logo_y + (logo_h_cells * 5) / 6;
+        if badge_x + version_w + 2 <= area.x + area.width
+            && badge_y < area.y + area.height
+        {
+            let badge_style = Style::default()
+                .fg(rgb_color(GRAD_TL))
+                .add_modifier(Modifier::BOLD);
             frame
                 .buffer_mut()
-                .set_string(block_left, remote_y, &badge, link_style);
-            let badge_w = badge.chars().count() as u16;
-            let remote_x = block_left + badge_w + 1;
-            let room = block_left
-                .saturating_add(block_w)
-                .saturating_sub(remote_x) as usize;
-            let clipped: String = remote.chars().take(room).collect();
-            frame.buffer_mut().set_string(remote_x, remote_y, clipped, dim);
-            let link_w = badge_w
-                .saturating_add(1)
-                .saturating_add(room.min(remote.chars().count()) as u16)
-                .min(block_w);
-            self.welcome_links.push(WelcomeLink {
-                rect: Rect { x: block_left, y: remote_y, width: link_w, height: 1 },
-                url: remote.clone(),
-                label: format!("Open {provider} repository"),
-            });
-            row_y = header_y + 3;
-        }
-        for c in &self.recent_commits {
-            let y = row_y;
-            if y >= area.y + area.height {
-                break;
+                .set_string(badge_x, badge_y, "\u{256d}", badge_style);
+            for i in 0..version_w {
+                frame.buffer_mut().set_string(
+                    badge_x + 1 + i,
+                    badge_y,
+                    "\u{2500}",
+                    badge_style,
+                );
             }
-            let x = block_left;
-            frame.buffer_mut().set_string(x, y, &c.hash, link_style);
-            let subject_x = x + c.hash.chars().count() as u16 + 1;
-            let when_w = c.when.chars().count() as u16;
-            let row_end = block_left + block_w;
-            let when_x = row_end.saturating_sub(when_w);
-            let subject_lines = wrapped_welcome_commit_subject(c, block_w);
-            for (line_idx, line) in subject_lines.iter().enumerate() {
-                let line_y = y + line_idx as u16;
-                if line_y >= area.y + area.height {
-                    break;
-                }
-                let room = if line_idx == 0 {
-                    when_x.saturating_sub(subject_x).saturating_sub(2)
-                } else {
-                    row_end.saturating_sub(subject_x)
-                };
-                let clipped: String = line.chars().take(room as usize).collect();
+            frame.buffer_mut().set_string(
+                badge_x + 1 + version_w,
+                badge_y,
+                "\u{256e}",
+                badge_style,
+            );
+            frame
+                .buffer_mut()
+                .set_string(badge_x, badge_y + 1, "\u{2502}", badge_style);
+            frame.buffer_mut().set_string(
+                badge_x + 1,
+                badge_y + 1,
+                &version_label,
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            );
+            frame.buffer_mut().set_string(
+                badge_x + 1 + version_w,
+                badge_y + 1,
+                "\u{2502}",
+                badge_style,
+            );
+            frame
+                .buffer_mut()
+                .set_string(badge_x, badge_y + 2, "\u{2570}", badge_style);
+            for i in 0..version_w {
+                frame.buffer_mut().set_string(
+                    badge_x + 1 + i,
+                    badge_y + 2,
+                    "\u{2500}",
+                    badge_style,
+                );
+            }
+            frame.buffer_mut().set_string(
+                badge_x + 1 + version_w,
+                badge_y + 2,
+                "\u{256f}",
+                badge_style,
+            );
+        }
+
+        // Tagline.
+        let tagline_y = logo_y + logo_h_cells + 1;
+        let tagline_w = WELCOME_TAGLINE.chars().count() as u16;
+        let tagline_x = area.x + area.width.saturating_sub(tagline_w) / 2;
+        frame.buffer_mut().set_string(
+            tagline_x,
+            tagline_y,
+            WELCOME_TAGLINE,
+            Style::default().fg(Color::Rgb(0x88, 0xc0, 0xd0)),
+        );
+
+        let box_y = tagline_y + tagline_h + 1;
+        if has_recent_panel && box_h > 0 && block_w >= 4 {
+            let box_rect = Rect {
+                x: block_left,
+                y: box_y,
+                width: block_w,
+                height: box_h,
+            };
+            paint_gradient_box(frame.buffer_mut(), box_rect);
+
+            // Inner content area: 1-cell inset from each border.
+            let inner_x = box_rect.x + 2;
+            let inner_y = box_rect.y + 1;
+            let inner_w_actual = box_rect.width.saturating_sub(4);
+
+            let row_style = Style::default().fg(Color::Rgb(0xc5, 0xcd, 0xd9));
+            let dim = Style::default().fg(Color::Rgb(0x6c, 0x7d, 0x9c));
+            let link_style = Style::default()
+                .fg(Color::Rgb(0x4e, 0x9a, 0xff))
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+
+            // Header row: "▎ RECENT ACTIVITY".
+            let header_y = inner_y;
+            frame.buffer_mut().set_string(
+                inner_x,
+                header_y,
+                "\u{258e} ",
+                Style::default()
+                    .fg(rgb_color(GRAD_TR))
+                    .add_modifier(Modifier::BOLD),
+            );
+            frame.buffer_mut().set_string(
+                inner_x + 2,
+                header_y,
+                "RECENT ACTIVITY",
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            );
+
+            let mut row_y = header_y + 2;
+            if let Some(remote) = self.recent_repo_remote.as_ref() {
+                let provider = welcome_provider_label(remote);
+                let badge = welcome_provider_badge(remote);
                 frame
                     .buffer_mut()
-                    .set_string(subject_x, line_y, clipped, row_style);
+                    .set_string(inner_x, row_y, &badge, link_style);
+                let badge_w = badge.chars().count() as u16;
+                let remote_x = inner_x + badge_w + 2;
+                let room = (inner_x + inner_w_actual)
+                    .saturating_sub(remote_x) as usize;
+                let clipped: String = remote.chars().take(room).collect();
+                frame.buffer_mut().set_string(remote_x, row_y, clipped, dim);
+                let link_w = badge_w
+                    .saturating_add(2)
+                    .saturating_add(room.min(remote.chars().count()) as u16)
+                    .min(inner_w_actual);
+                self.welcome_links.push(WelcomeLink {
+                    rect: Rect { x: inner_x, y: row_y, width: link_w, height: 1 },
+                    url: remote.clone(),
+                    label: format!("Open {provider} repository"),
+                });
+                row_y += 2;
             }
-            frame.buffer_mut().set_string(when_x, y, &c.when, dim);
-            if let Some(remote) = self.recent_repo_remote.as_ref() {
-                if let Some(url) = crate::git::commit_url_for_remote(remote, &c.full_hash) {
-                    let height = subject_lines.len().max(1) as u16;
-                    self.welcome_links.push(WelcomeLink {
-                        rect: Rect { x: block_left, y, width: block_w, height },
-                        url,
-                        label: format!("Open commit {}", c.hash),
-                    });
+            for c in &self.recent_commits {
+                let y = row_y;
+                if y >= box_rect.y + box_rect.height - 1 {
+                    break;
                 }
+                frame.buffer_mut().set_string(inner_x, y, &c.hash, link_style);
+                let subject_x = inner_x + c.hash.chars().count() as u16 + 2;
+                let when_w = c.when.chars().count() as u16;
+                let row_end = inner_x + inner_w_actual;
+                let when_x = row_end.saturating_sub(when_w);
+                let subject_lines = wrapped_welcome_commit_subject(c, inner_w_actual);
+                for (line_idx, line) in subject_lines.iter().enumerate() {
+                    let line_y = y + line_idx as u16;
+                    if line_y >= box_rect.y + box_rect.height - 1 {
+                        break;
+                    }
+                    let room = if line_idx == 0 {
+                        when_x.saturating_sub(subject_x).saturating_sub(2)
+                    } else {
+                        row_end.saturating_sub(subject_x)
+                    };
+                    let clipped: String = line.chars().take(room as usize).collect();
+                    frame
+                        .buffer_mut()
+                        .set_string(subject_x, line_y, clipped, row_style);
+                }
+                frame.buffer_mut().set_string(when_x, y, &c.when, dim);
+                if let Some(remote) = self.recent_repo_remote.as_ref() {
+                    if let Some(url) = crate::git::commit_url_for_remote(remote, &c.full_hash) {
+                        let height = subject_lines.len().max(1) as u16;
+                        self.welcome_links.push(WelcomeLink {
+                            rect: Rect { x: inner_x, y, width: inner_w_actual, height },
+                            url,
+                            label: format!("Open commit {}", c.hash),
+                        });
+                    }
+                }
+                row_y = row_y.saturating_add(subject_lines.len().max(1) as u16);
             }
-            row_y = row_y.saturating_add(subject_lines.len().max(1) as u16);
+        }
+
+        // Footer chevron line, centred on the bottom of the stack.
+        let footer_y = box_y + box_h + 1;
+        if footer_y < area.y + area.height {
+            let footer_w = WELCOME_FOOTER.chars().count() as u16;
+            let footer_x = area.x + area.width.saturating_sub(footer_w) / 2;
+            frame.buffer_mut().set_string(
+                footer_x,
+                footer_y,
+                WELCOME_FOOTER,
+                Style::default().fg(Color::Rgb(0x6c, 0x7d, 0x9c)),
+            );
         }
     }
 
@@ -5508,6 +5708,43 @@ mod tests {
     fn welcome_provider_badge_uses_repo_provider() {
         assert!(welcome_provider_badge("https://bitbucket.org/a/b").contains("Bitbucket"));
         assert!(welcome_provider_badge("https://github.com/a/b").contains("GitHub"));
+    }
+
+    #[test]
+    fn lerp_rgb_hits_endpoints_exactly() {
+        let a = (10u8, 20, 30);
+        let b = (100u8, 200, 250);
+        assert_eq!(lerp_rgb(a, b, 0.0), a);
+        assert_eq!(lerp_rgb(a, b, 1.0), b);
+        let mid = lerp_rgb(a, b, 0.5);
+        assert!(mid.0 > a.0 && mid.0 < b.0);
+    }
+
+    #[test]
+    fn paint_gradient_box_draws_rounded_corners_with_corner_colours() {
+        let rect = Rect { x: 0, y: 0, width: 8, height: 4 };
+        let mut buf = ratatui::buffer::Buffer::empty(rect);
+        paint_gradient_box(&mut buf, rect);
+        assert_eq!(buf[(0, 0)].symbol(), "\u{256d}", "top-left rounded");
+        assert_eq!(buf[(7, 0)].symbol(), "\u{256e}", "top-right rounded");
+        assert_eq!(buf[(0, 3)].symbol(), "\u{2570}", "bottom-left rounded");
+        assert_eq!(buf[(7, 3)].symbol(), "\u{256f}", "bottom-right rounded");
+        assert_eq!(buf[(3, 0)].symbol(), "\u{2500}", "top edge horizontal");
+        assert_eq!(buf[(0, 1)].symbol(), "\u{2502}", "left edge vertical");
+        // Top-left cell carries the GRAD_TL fg colour exactly.
+        let tl_fg = buf[(0, 0)].fg;
+        assert_eq!(tl_fg, rgb_color(GRAD_TL));
+        let tr_fg = buf[(7, 0)].fg;
+        assert_eq!(tr_fg, rgb_color(GRAD_TR));
+    }
+
+    #[test]
+    fn welcome_tagline_and_footer_constants_are_present() {
+        assert!(WELCOME_TAGLINE.contains("LIGHTWEIGHT"));
+        assert!(WELCOME_TAGLINE.contains("FAST"));
+        assert!(WELCOME_TAGLINE.contains("DEVELOPERS"));
+        assert!(WELCOME_FOOTER.contains("Fast by design"));
+        assert!(WELCOME_FOOTER.contains("Loved by developers"));
     }
 
     #[test]
