@@ -57,7 +57,7 @@ If you prefer to do it by hand: Terminal.app → Settings → Profiles → your 
 The fastest path, no clone required:
 
 ```bash
-cargo install --git https://bitbucket.org/vitali_avagyan/croft.git
+cargo install --git https://codeberg.org/vitali87/croft.git
 ```
 
 This compiles croft from the latest `main` and drops the binary in `~/.cargo/bin/croft`. Re-run the same command to upgrade.
@@ -65,7 +65,7 @@ This compiles croft from the latest `main` and drops the binary in `~/.cargo/bin
 ### Build from source
 
 ```bash
-git clone https://bitbucket.org/vitali_avagyan/croft.git
+git clone https://codeberg.org/vitali87/croft.git
 cd croft
 cargo build --release
 # optional, install into ~/.cargo/bin
