@@ -6,9 +6,7 @@ pub const ITERM2_PLIST_REL: &str = "Library/Preferences/com.googlecode.iterm2.pl
 const CMD_SHIFT_F_KEY: &str = "0x46-0x120000-0x3";
 const CMD_SHIFT_F_HEX: &str = "0x1b 0x5b 0x37 0x30 0x3b 0x31 0x30 0x75";
 const CMD_V_KEY: &str = "0x76-0x100000-0x9";
-const CMD_V_HEX: &str = "0x1b 0x5b 0x31 0x31 0x38 0x3b 0x39 0x75";
 const FIND_GLOBALLY_MENU_EQUIV: &str = "@~^f";
-const PASTE_MENU_EQUIV: &str = "@~^v";
 
 /// PostScript name iTerm2 stores in `Normal Font` and `Non Ascii Font`.
 /// Format is "<PostScriptName> <size>".
@@ -59,10 +57,17 @@ pub fn apply_font_settings(
     Ok(())
 }
 
-/// Apply the iTerm2-side pieces needed for Croft's macOS keyboard gestures:
-/// free iTerm2 menu shortcuts that macOS consumes first, install the Search
-/// shortcut globally, and bind Cmd+V in every profile to the CSI-u Cmd+V
-/// sequence that Croft handles as Search paste.
+/// Apply the iTerm2-side pieces needed for Croft's macOS keyboard gestures.
+/// Installs the Cmd+Shift+F search shortcut globally, frees the matching
+/// menu equivalent so macOS doesn't eat it for "Find Globally...", and
+/// scrubs any legacy Cmd+V or Paste-menu remappings that older croft
+/// versions wrote in. Cmd+V is intentionally **not** bound: leaving it on
+/// the default Edit menu shortcut routes through iTerm2's native Paste
+/// action, which emits a bracketed-paste sequence carrying the local
+/// clipboard. That works identically in local and SSH'd croft sessions
+/// (croft handles `Event::Paste`); intercepting Cmd+V as a key event
+/// instead — the previous design — broke paste over SSH because the
+/// remote process has no path to the local Mac clipboard.
 pub fn apply_croft_key_settings(plist: &mut Value) -> Result<(), ITerm2Error> {
     let dict = plist
         .as_dictionary_mut()
@@ -74,19 +79,20 @@ pub fn apply_croft_key_settings(plist: &mut Value) -> Result<(), ITerm2Error> {
         "Find Globally...",
         FIND_GLOBALLY_MENU_EQUIV.to_string(),
     );
-    set_string(menu, "Paste", PASTE_MENU_EQUIV.to_string());
+    menu.remove("Paste");
 
     let global = dict_entry_mut(dict, "GlobalKeyMap");
     global.insert(CMD_SHIFT_F_KEY.into(), send_hex_action(CMD_SHIFT_F_HEX, 0));
-    global.insert(CMD_V_KEY.into(), send_hex_action(CMD_V_HEX, 0));
+    global.remove(CMD_V_KEY);
 
     let bookmarks = dict
         .get_mut("New Bookmarks")
         .and_then(|v| v.as_array_mut())
         .ok_or(ITerm2Error::NoBookmarksArray)?;
     for profile in bookmarks.iter_mut().filter_map(|v| v.as_dictionary_mut()) {
-        let profile_keys = dict_entry_mut(profile, "Keyboard Map");
-        profile_keys.insert(CMD_V_KEY.into(), send_hex_action(CMD_V_HEX, 0));
+        if let Some(Value::Dictionary(profile_keys)) = profile.get_mut("Keyboard Map") {
+            profile_keys.remove(CMD_V_KEY);
+        }
     }
 
     Ok(())
@@ -239,10 +245,15 @@ mod tests {
             .unwrap()
     }
 
+    /// The historical kitty CSI-u Cmd+V escape that older croft versions
+    /// installed in iTerm2 plists. Tests use it to seed a "legacy state"
+    /// fixture so we can prove `apply_croft_key_settings` cleans it up.
+    const LEGACY_CMD_V_HEX: &str = "0x1b 0x5b 0x31 0x31 0x38 0x3b 0x39 0x75";
+
     fn seed_stale_cmd_v_mappings(plist: &mut Value) {
         let top = plist.as_dictionary_mut().unwrap();
         dict_entry_mut(top, "GlobalKeyMap")
-            .insert(CMD_V_KEY.into(), send_hex_action(CMD_V_HEX, 0));
+            .insert(CMD_V_KEY.into(), send_hex_action(LEGACY_CMD_V_HEX, 0));
         let bookmarks = top
             .get_mut("New Bookmarks")
             .unwrap()
@@ -250,7 +261,7 @@ mod tests {
             .unwrap();
         for profile in bookmarks.iter_mut().filter_map(|v| v.as_dictionary_mut()) {
             dict_entry_mut(profile, "Keyboard Map")
-                .insert(CMD_V_KEY.into(), send_hex_action(CMD_V_HEX, 0));
+                .insert(CMD_V_KEY.into(), send_hex_action(LEGACY_CMD_V_HEX, 0));
         }
     }
 
@@ -355,7 +366,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_croft_key_settings_frees_find_and_paste_menu_shortcuts() {
+    fn apply_croft_key_settings_frees_find_menu_shortcut_only() {
         let mut plist = synth_plist("GUID-1", &["GUID-1"]);
         apply_croft_key_settings(&mut plist).unwrap();
         let top = plist.as_dictionary().unwrap();
@@ -364,29 +375,76 @@ mod tests {
             menu.get("Find Globally...").and_then(|v| v.as_string()),
             Some(FIND_GLOBALLY_MENU_EQUIV)
         );
-        assert_eq!(
-            menu.get("Paste").and_then(|v| v.as_string()),
-            Some(PASTE_MENU_EQUIV)
+        assert!(
+            menu.get("Paste").is_none(),
+            "Paste must remain on its default Cmd+V menu shortcut so iTerm2 fires its native bracketed-paste action when Cmd+V is pressed; remapping it off Cmd+V breaks paste over SSH because the resulting key event has no clipboard reachable from the remote process"
         );
     }
 
     #[test]
-    fn apply_croft_key_settings_installs_global_search_and_cmd_v_mapping() {
+    fn apply_croft_key_settings_installs_global_search_only() {
         let mut plist = synth_plist("GUID-1", &["GUID-1", "GUID-2"]);
         apply_croft_key_settings(&mut plist).unwrap();
         let top = plist.as_dictionary().unwrap();
         let global = dict_in(top, "GlobalKeyMap");
         assert_eq!(action_text(global, CMD_SHIFT_F_KEY), CMD_SHIFT_F_HEX);
-        assert_eq!(action_text(global, CMD_V_KEY), CMD_V_HEX);
+        assert!(
+            global.get(CMD_V_KEY).is_none(),
+            "Cmd+V must not be hex-bound at the iTerm2 level; intercepting it as a key event prevents the terminal's native paste from emitting a bracketed-paste sequence, which is the only clipboard path that works over SSH"
+        );
         for guid in ["GUID-1", "GUID-2"] {
             let profile = profile_in(&plist, guid);
-            let profile_keys = dict_in(profile, "Keyboard Map");
-            assert_eq!(action_text(profile_keys, CMD_V_KEY), CMD_V_HEX);
+            let cmd_v_in_profile = profile
+                .get("Keyboard Map")
+                .and_then(|v| v.as_dictionary())
+                .and_then(|d| d.get(CMD_V_KEY));
+            assert!(
+                cmd_v_in_profile.is_none(),
+                "profile-level Cmd+V binding must not exist (whether the Keyboard Map dict is absent or just missing this key) so every profile defers to iTerm2's native paste action"
+            );
         }
     }
 
     #[test]
-    fn install_croft_settings_round_trips_fonts_and_keys_through_disk() {
+    fn apply_croft_key_settings_clears_legacy_cmd_v_bindings() {
+        let mut plist = synth_plist("GUID-1", &["GUID-1", "GUID-2"]);
+        seed_stale_cmd_v_mappings(&mut plist);
+        apply_croft_key_settings(&mut plist).unwrap();
+        let top = plist.as_dictionary().unwrap();
+        let global = dict_in(top, "GlobalKeyMap");
+        assert!(
+            global.get(CMD_V_KEY).is_none(),
+            "re-running setup must remove the legacy GlobalKeyMap Cmd+V hex binding installed by older croft versions"
+        );
+        for guid in ["GUID-1", "GUID-2"] {
+            let profile = profile_in(&plist, guid);
+            let profile_keys = dict_in(profile, "Keyboard Map");
+            assert!(
+                profile_keys.get(CMD_V_KEY).is_none(),
+                "re-running setup must remove the legacy profile-level Cmd+V hex binding"
+            );
+        }
+    }
+
+    #[test]
+    fn apply_croft_key_settings_clears_legacy_paste_menu_remap() {
+        let mut plist = synth_plist("GUID-1", &["GUID-1"]);
+        {
+            let top = plist.as_dictionary_mut().unwrap();
+            let menu = dict_entry_mut(top, "NSUserKeyEquivalents");
+            set_string(menu, "Paste", "@~^v".to_string());
+        }
+        apply_croft_key_settings(&mut plist).unwrap();
+        let top = plist.as_dictionary().unwrap();
+        let menu = dict_in(top, "NSUserKeyEquivalents");
+        assert!(
+            menu.get("Paste").is_none(),
+            "re-running setup must remove the legacy Paste -> Cmd+Opt+Ctrl+V menu remap that older croft versions installed; the menu must fall back to the default Cmd+V shortcut so the native paste action fires"
+        );
+    }
+
+    #[test]
+    fn install_croft_settings_round_trips_fonts_and_clears_cmd_v_through_disk() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let mut plist = synth_plist("GUID-1", &["GUID-1"]);
         seed_stale_cmd_v_mappings(&mut plist);
@@ -399,9 +457,14 @@ mod tests {
             Some("MesloLGSNFM-Regular 13")
         );
         let top = reloaded.as_dictionary().unwrap();
-        assert_eq!(
-            action_text(dict_in(top, "GlobalKeyMap"), CMD_V_KEY),
-            CMD_V_HEX
+        assert!(
+            dict_in(top, "GlobalKeyMap").get(CMD_V_KEY).is_none(),
+            "round-trip: Cmd+V binding must not survive on disk after a fresh setup"
+        );
+        let profile_keys = dict_in(profile, "Keyboard Map");
+        assert!(
+            profile_keys.get(CMD_V_KEY).is_none(),
+            "round-trip: profile-level Cmd+V binding must not survive on disk after a fresh setup"
         );
     }
 }

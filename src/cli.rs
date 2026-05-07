@@ -43,7 +43,7 @@ pub enum CliCommand {
         #[arg(long)]
         mouse: bool,
     },
-    /// Configure iTerm2 for Croft: fonts plus Cmd+Shift+F and Search paste.
+    /// Configure iTerm2 for Croft: fonts plus the Cmd+Shift+F search shortcut.
     SetupIterm2 {
         /// PostScript name of the primary font
         #[arg(long, default_value = ITERM2_FONT_PS_NAME)]
@@ -422,7 +422,7 @@ fn is_paste_probe_key(
 fn setup_iterm2(font: &str, nonascii: &str, size: u32, yes: bool) -> Result<()> {
     let plist_path = crate::iterm2::default_plist_path();
     println!(
-        "This will configure iTerm2 for Croft:\n  Normal Font: {font} {size}\n  Non-ASCII Font: {nonascii} {size}\n  Use Non-ASCII Font: enabled\n  Global key: Cmd+Shift+F -> Croft Search\n  Global/profile key: Cmd+V -> CSI-u Cmd+V, handled by Croft Search\n  App menu shortcuts: move Find Globally and Paste off Cmd+Shift+F/Cmd+V"
+        "This will configure iTerm2 for Croft:\n  Normal Font: {font} {size}\n  Non-ASCII Font: {nonascii} {size}\n  Use Non-ASCII Font: enabled\n  Global key: Cmd+Shift+F -> Croft Search\n  App menu shortcut: move Find Globally off Cmd+Shift+F\n  Cmd+V: left on iTerm2's native Paste action so it works locally and over SSH via bracketed paste; legacy Cmd+V hex bindings and Paste menu remaps from earlier croft versions are cleared"
     );
     println!("Plist target: {}", plist_path.display());
     println!("Existing custom profile fonts are not modified; global key mappings are updated.");
