@@ -1585,9 +1585,9 @@ impl App {
         }
     }
 
-    fn render_welcome(&mut self, frame: &mut ratatui::Frame, area: Rect) {
+    fn render_welcome(&mut self, frame: &mut ratatui::Frame, outer_area: Rect) {
         self.welcome_links.clear();
-        if area.width == 0 || area.height == 0 {
+        if outer_area.width == 0 || outer_area.height == 0 {
             return;
         }
         // In iTerm2 image mode we let the iTerm session bg (forced to
@@ -1606,22 +1606,23 @@ impl App {
                 EDITOR_BG_RGB.2,
             ))
         };
-        frame.render_widget(
-            ratatui::widgets::Block::default().style(bg),
-            area,
-        );
-
-        // Paint the leftmost column of the editor area as a visible vertical
-        // seam so the sidebar splitter is perceptible even before a file is
-        // opened. Without this, the welcome bg fills `area.x` and users can't
-        // tell the explorer is resizable. Matches the file-tree's unfocused
-        // border tone so the two panes look mirrored.
-        if area.width > 0 && self.show_tree {
-            let buf = frame.buffer_mut();
-            let seam_style = Style::default().fg(Color::DarkGray);
-            for row in 0..area.height {
-                buf.set_string(area.x, area.y + row, "│", seam_style);
-            }
+        // Paint a full bordered box around the welcome area so the editor
+        // pane has the same visible envelope as when a file is open
+        // (Borders::ALL on the editor widget). Without this, the welcome
+        // bg bleeds into the tree, the terminal, and the window edge with
+        // no perceptible seam — and the sidebar splitter looks
+        // unreachable. The bg style is applied to the same block so the
+        // inside is filled in one pass. The welcome content then renders
+        // into `block.inner(outer_area)` so a tall recents list can never
+        // paint over the border rows.
+        let outer_block = ratatui::widgets::Block::default()
+            .borders(ratatui::widgets::Borders::ALL)
+            .border_style(Style::default().fg(Color::DarkGray))
+            .style(bg);
+        let area = outer_block.inner(outer_area);
+        frame.render_widget(outer_block, outer_area);
+        if area.width == 0 || area.height == 0 {
+            return;
         }
 
         // Layout regions, top-to-bottom:
@@ -8288,11 +8289,12 @@ mod tests {
     }
 
     #[test]
-    fn welcome_paints_visible_splitter_seam_at_editor_left_edge() {
-        // Without a visible cell at the splitter column, users on the
-        // welcome page can't perceive that the explorer is resizable.
-        // Regression guard: the welcome render must paint the editor's
-        // leftmost column with a vertical-bar glyph.
+    fn welcome_paints_a_full_bordered_box_around_the_editor_area() {
+        // Without a visible envelope, users on the welcome page can't
+        // perceive that the explorer is resizable and can't see where the
+        // editor pane ends. Regression guard: the welcome render must
+        // paint a full Borders::ALL frame around `area` so all four edges
+        // are perceptible.
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(tmp.path().to_path_buf()).unwrap();
         let backend = ratatui::backend::TestBackend::new(120, 40);
@@ -8300,16 +8302,45 @@ mod tests {
         let area = ratatui::layout::Rect::new(40, 0, 80, 40);
         term.draw(|f| app.render_welcome(f, area)).unwrap();
         let buf = term.backend().buffer();
-        let mut found = 0;
-        for y in area.y..area.y + area.height {
-            if buf[(area.x, y)].symbol() == "│" {
-                found += 1;
+        let left = area.x;
+        let right = area.x + area.width - 1;
+        let top = area.y;
+        let bot = area.y + area.height - 1;
+        // Vertical edges: left and right columns must be vertical bars on
+        // most rows (corners use ─/└/┌/┘).
+        let mut left_bars = 0;
+        let mut right_bars = 0;
+        for y in (top + 1)..bot {
+            if buf[(left, y)].symbol() == "│" {
+                left_bars += 1;
+            }
+            if buf[(right, y)].symbol() == "│" {
+                right_bars += 1;
             }
         }
-        assert!(
-            found >= area.height as usize / 2,
-            "expected the splitter seam to be painted on most rows, found {found}"
-        );
+        let inner_h = (bot - top - 1) as usize;
+        assert!(left_bars >= inner_h / 2, "left edge underpainted: {left_bars}");
+        assert!(right_bars >= inner_h / 2, "right edge underpainted: {right_bars}");
+        // Horizontal edges: top and bottom rows must be horizontal bars on
+        // most columns.
+        let mut top_bars = 0;
+        let mut bot_bars = 0;
+        for x in (left + 1)..right {
+            if buf[(x, top)].symbol() == "─" {
+                top_bars += 1;
+            }
+            if buf[(x, bot)].symbol() == "─" {
+                bot_bars += 1;
+            }
+        }
+        let inner_w = (right - left - 1) as usize;
+        assert!(top_bars >= inner_w / 2, "top edge underpainted: {top_bars}");
+        assert!(bot_bars >= inner_w / 2, "bottom edge underpainted: {bot_bars}");
+        // Corners.
+        assert_eq!(buf[(left, top)].symbol(), "┌");
+        assert_eq!(buf[(right, top)].symbol(), "┐");
+        assert_eq!(buf[(left, bot)].symbol(), "└");
+        assert_eq!(buf[(right, bot)].symbol(), "┘");
     }
 
     #[test]
