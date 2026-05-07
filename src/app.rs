@@ -330,7 +330,9 @@ pub struct App {
     pub search: SearchPanel,
     pub remote: RemotePanel,
     pub editor: EditorTabs,
-    pub terminal: PtyTerminal,
+    pub terminals: Vec<PtyTerminal>,
+    pub active_terminal: usize,
+    workspace_root: PathBuf,
     sidebar_view: SidebarView,
     sidebar_areas: SidebarAreas,
     focus: Pane,
@@ -480,6 +482,9 @@ pub struct App {
     /// without recomputing layout outside of `render`.
     sidebar_splitter_x: Option<u16>,
     terminal_splitter_y: Option<u16>,
+    /// Hit-test rectangle of the "[+]" button on the terminal pane's top
+    /// border. None when the pane is hidden or too narrow for the label.
+    terminal_add_button: Option<Rect>,
     /// Total width / height of the right-hand content area, captured on
     /// every render so a splitter drag can clamp to the live viewport.
     last_content_width: u16,
@@ -781,7 +786,9 @@ impl App {
             search,
             remote,
             editor,
-            terminal: term,
+            terminals: vec![term],
+            active_terminal: 0,
+            workspace_root: root.clone(),
             sidebar_view: SidebarView::Explorer,
             sidebar_areas: SidebarAreas::default(),
             focus: Pane::Tree,
@@ -831,6 +838,7 @@ impl App {
             splitter_drag: None,
             sidebar_splitter_x: None,
             terminal_splitter_y: None,
+            terminal_add_button: None,
             last_content_width: 0,
             last_content_height: 0,
             editor_image_osc: None,
@@ -1678,6 +1686,65 @@ impl App {
         }
     }
 
+    pub fn terminal(&self) -> &PtyTerminal {
+        &self.terminals[self.active_terminal]
+    }
+
+    pub fn terminal_mut(&mut self) -> &mut PtyTerminal {
+        &mut self.terminals[self.active_terminal]
+    }
+
+    /// Spawn a new PTY-backed terminal next to the existing ones and make
+    /// it the active one. The pane becomes visible if it was hidden.
+    pub fn split_terminal(&mut self) -> Result<()> {
+        let term = PtyTerminal::new(&self.workspace_root).context("spawning terminal")?;
+        self.terminals.push(term);
+        self.active_terminal = self.terminals.len() - 1;
+        if !self.show_terminal {
+            self.show_terminal = true;
+        }
+        self.focus_pane(Pane::Terminal);
+        Ok(())
+    }
+
+    /// Drop the active terminal. Returns false (and does nothing) when only
+    /// one terminal is left, since hiding the pane is the user's job
+    /// (Ctrl+J), not ours.
+    pub fn close_active_terminal(&mut self) -> bool {
+        if self.terminals.len() <= 1 {
+            return false;
+        }
+        let idx = self.active_terminal;
+        self.terminals.remove(idx);
+        if self.active_terminal >= self.terminals.len() {
+            self.active_terminal = self.terminals.len() - 1;
+        }
+        self.sync_focus_flags();
+        true
+    }
+
+    /// Cycle the active terminal forward by one slot, wrapping at the end.
+    pub fn cycle_terminal(&mut self) {
+        if self.terminals.len() <= 1 {
+            return;
+        }
+        self.active_terminal = (self.active_terminal + 1) % self.terminals.len();
+        self.sync_focus_flags();
+    }
+
+    /// OR-fold dirty flags across all terminals while clearing each. Use `|`
+    /// (not `||`) so every terminal's flag is consumed even after the first
+    /// dirty one is found.
+    pub fn drain_terminals_dirty(&mut self) -> bool {
+        self.terminals.iter().fold(false, |acc, t| acc | t.take_dirty())
+    }
+
+    fn terminal_at_pos(&self, col: u16, row: u16) -> Option<usize> {
+        self.terminals
+            .iter()
+            .position(|t| rect_contains(t.last_area, col, row))
+    }
+
     fn focus_pane(&mut self, p: Pane) {
         self.focus = p;
         self.sync_focus_flags();
@@ -1691,7 +1758,11 @@ impl App {
         self.search.focused = self.focus == Pane::Tree && self.sidebar_view == SidebarView::Search;
         self.remote.focused = self.focus == Pane::Tree && self.sidebar_view == SidebarView::Remote;
         self.editor.focused = self.focus == Pane::Editor;
-        self.terminal.focused = self.focus == Pane::Terminal;
+        let focused_pane = self.focus == Pane::Terminal;
+        let active = self.active_terminal;
+        for (i, t) in self.terminals.iter_mut().enumerate() {
+            t.focused = focused_pane && i == active;
+        }
     }
 
     fn render(&mut self, frame: &mut ratatui::Frame) {
@@ -1817,7 +1888,20 @@ impl App {
             self.update_editor_image_overlay(editor_area);
         }
         if let Some(area) = terminal_area {
-            frame.render_widget(&mut self.terminal, area);
+            let n = self.terminals.len().max(1);
+            let constraints: Vec<Constraint> = (0..n)
+                .map(|_| Constraint::Ratio(1, n as u32))
+                .collect();
+            let cols = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints(constraints)
+                .split(area);
+            for (i, t) in self.terminals.iter_mut().enumerate() {
+                frame.render_widget(t, cols[i]);
+            }
+            self.terminal_add_button = paint_terminal_add_button(frame, area);
+        } else {
+            self.terminal_add_button = None;
         }
 
         let mut spans: Vec<Span> = Vec::with_capacity(20);
@@ -2080,6 +2164,18 @@ impl App {
         }
         if is_terminal_toggle_key(key) {
             self.toggle_terminal();
+            return Ok(());
+        }
+        if is_terminal_split_key(key) {
+            match self.split_terminal() {
+                Ok(()) => {
+                    self.status =
+                        format!("Split terminal: {} active", self.terminals.len());
+                }
+                Err(e) => {
+                    self.status = format!("Split terminal failed: {e}");
+                }
+            }
             return Ok(());
         }
         if is_search_jump_key(key) {
@@ -2540,6 +2636,34 @@ impl App {
     }
 
     fn handle_terminal_key(&mut self, key: KeyEvent) {
+        // Ctrl+Shift+T: open another terminal next to the active one.
+        if is_terminal_split_key(key) {
+            match self.split_terminal() {
+                Ok(()) => {
+                    self.status =
+                        format!("Split terminal: {} active", self.terminals.len());
+                }
+                Err(e) => {
+                    self.status = format!("Split terminal failed: {e}");
+                }
+            }
+            return;
+        }
+        // Ctrl+Shift+W: close the active terminal (no-op when only one is left).
+        if is_terminal_close_key(key) {
+            if self.close_active_terminal() {
+                self.status =
+                    format!("Closed terminal: {} remaining", self.terminals.len());
+            } else {
+                self.status = String::from("Cannot close the last terminal; press Ctrl+J to hide");
+            }
+            return;
+        }
+        // Ctrl+Shift+] / Ctrl+Shift+[: cycle to the next terminal.
+        if is_terminal_cycle_key(key) {
+            self.cycle_terminal();
+            return;
+        }
         // Ctrl+Shift+C / Cmd+C: copy current selection.
         if is_terminal_copy_key(key) {
             self.copy_terminal_selection();
@@ -2552,7 +2676,7 @@ impl App {
         if is_clipboard_paste_key(key) {
             match crate::clipboard::read_string() {
                 Some(text) if !text.is_empty() => {
-                    self.terminal.paste_input(text.as_bytes());
+                    self.terminal_mut().paste_input(text.as_bytes());
                 }
                 Some(_) => {
                     self.status = String::from("Cmd+V: clipboard is empty");
@@ -2569,12 +2693,12 @@ impl App {
         }
         // Any other keystroke clears the selection so the user's input is
         // sent without the previous highlight lingering on screen.
-        if self.terminal.selection().is_some() {
-            self.terminal.clear_selection();
+        if self.terminal().selection().is_some() {
+            self.terminal_mut().clear_selection();
         }
         let bytes = key_to_bytes(key);
         if !bytes.is_empty() {
-            self.terminal.write_input(&bytes);
+            self.terminal_mut().write_input(&bytes);
         }
     }
 
@@ -2582,11 +2706,11 @@ impl App {
     /// OSC 52.  Selection stays visible so the user can verify what was
     /// copied. No-op when the selection is empty / zero-area.
     fn copy_terminal_selection(&mut self) {
-        let Some(sel) = self.terminal.selection() else { return };
+        let Some(sel) = self.terminal().selection() else { return };
         if !sel.has_area() {
             return;
         }
-        let text = self.terminal.selection_text();
+        let text = self.terminal().selection_text();
         if text.is_empty() {
             return;
         }
@@ -2714,7 +2838,7 @@ impl App {
                 self.status = format!("Pasted {} chars", s.chars().count());
             }
             Pane::Terminal => {
-                self.terminal.paste_input(s.as_bytes());
+                self.terminal_mut().paste_input(s.as_bytes());
             }
             Pane::Tree => {}
         }
@@ -2949,7 +3073,7 @@ impl App {
         }
         if let Some(bytes) = clipboard_payload {
             if !bytes.is_empty() {
-                self.terminal.paste_input(&bytes);
+                self.terminal_mut().paste_input(&bytes);
             }
         }
         let resolved_any =
@@ -3146,7 +3270,8 @@ impl App {
         let in_tree = self.show_tree && rect_contains(self.tree.last_area, m.column, m.row);
         let in_editor_pane = rect_contains(self.editor.last_full_area, m.column, m.row);
         let in_editor = rect_contains(self.editor.last_area, m.column, m.row);
-        let in_terminal = rect_contains(self.terminal.last_area, m.column, m.row);
+        let terminal_hit = self.terminal_at_pos(m.column, m.row);
+        let in_terminal = terminal_hit.is_some();
         let in_tree_scrollbar = self.sidebar_view == SidebarView::Explorer
             && rect_contains(self.tree.last_scrollbar, m.column, m.row);
         let in_remote_scrollbar = self.sidebar_view == SidebarView::Remote
@@ -3202,6 +3327,23 @@ impl App {
                 if let Some(x) = self.sidebar_splitter_x {
                     if m.column == x {
                         self.splitter_drag = Some(SplitterDrag::Sidebar);
+                        return;
+                    }
+                }
+                // The "[+]" button sits on the same row as the
+                // editor/terminal splitter, so it has to win the hit-test
+                // before the splitter-drag handler claims this click.
+                if let Some(rect) = self.terminal_add_button {
+                    if rect_contains(rect, m.column, m.row) {
+                        match self.split_terminal() {
+                            Ok(()) => {
+                                self.status =
+                                    format!("Split terminal: {} active", self.terminals.len());
+                            }
+                            Err(e) => {
+                                self.status = format!("Split terminal failed: {e}");
+                            }
+                        }
                         return;
                     }
                 }
@@ -3452,13 +3594,16 @@ impl App {
                         self.last_editor_left_down = Some((now, m.column, m.row));
                     }
                     self.poke_cursor();
-                } else if in_terminal {
+                } else if let Some(idx) = terminal_hit {
+                    if self.active_terminal != idx {
+                        self.active_terminal = idx;
+                    }
                     self.focus_pane(Pane::Terminal);
                     // Begin a fresh selection at the click cell. Without a
                     // drag this is a single cell (no area), so the selection
                     // ends up cleared on mouse-up. With a drag, this is the
                     // selection anchor.
-                    self.terminal.start_selection_at(m.column, m.row);
+                    self.terminal_mut().start_selection_at(m.column, m.row);
                 }
             }
             MouseEventKind::Drag(MouseButton::Left) => {
@@ -3537,7 +3682,7 @@ impl App {
                         SidebarView::Search => {}
                     }
                 } else if in_terminal {
-                    self.terminal.extend_selection_to(m.column, m.row);
+                    self.terminal_mut().extend_selection_to(m.column, m.row);
                 } else if self.tree_drag.is_some() {
                     // Pointer dragged outside the tree pane: still keep the drag
                     // alive so dropping back inside lands; just clear the drop
@@ -3585,9 +3730,9 @@ impl App {
                 // so the user can hit Cmd/Ctrl+C themselves; a click without
                 // drag (zero-area selection) is silently dropped.
                 if in_terminal {
-                    if let Some(sel) = self.terminal.selection() {
+                    if let Some(sel) = self.terminal().selection() {
                         if !sel.has_area() {
-                            self.terminal.clear_selection();
+                            self.terminal_mut().clear_selection();
                         }
                     }
                 } else if in_editor {
@@ -3607,11 +3752,12 @@ impl App {
                     }
                 } else if in_editor {
                     self.editor.scroll_down(3);
-                } else if in_terminal {
+                } else if let Some(idx) = terminal_hit {
+                    let t = &mut self.terminals[idx];
                     // Try our scrollback first; if we're in vim/less/htop
                     // (alternate-screen), fall back to forwarding arrow keys.
-                    if !self.terminal.scroll_down(3) {
-                        self.terminal.write_input(b"\x1b[B\x1b[B\x1b[B");
+                    if !t.scroll_down(3) {
+                        t.write_input(b"\x1b[B\x1b[B\x1b[B");
                     }
                 }
             }
@@ -3624,9 +3770,10 @@ impl App {
                     }
                 } else if in_editor {
                     self.editor.scroll_up(3);
-                } else if in_terminal {
-                    if !self.terminal.scroll_up(3) {
-                        self.terminal.write_input(b"\x1b[A\x1b[A\x1b[A");
+                } else if let Some(idx) = terminal_hit {
+                    let t = &mut self.terminals[idx];
+                    if !t.scroll_up(3) {
+                        t.write_input(b"\x1b[A\x1b[A\x1b[A");
                     }
                 }
             }
@@ -4398,6 +4545,33 @@ fn is_terminal_toggle_key(key: KeyEvent) -> bool {
     key.modifiers.contains(KeyModifiers::CONTROL)
 }
 
+/// `Ctrl+Shift+T`: spawn an additional terminal next to the active one.
+fn is_terminal_split_key(key: KeyEvent) -> bool {
+    let KeyCode::Char(c) = key.code else { return false };
+    if !c.eq_ignore_ascii_case(&'t') {
+        return false;
+    }
+    key.modifiers.contains(KeyModifiers::CONTROL) && key.modifiers.contains(KeyModifiers::SHIFT)
+}
+
+/// `Ctrl+Shift+W`: close the active terminal (no-op if it's the only one).
+fn is_terminal_close_key(key: KeyEvent) -> bool {
+    let KeyCode::Char(c) = key.code else { return false };
+    if !c.eq_ignore_ascii_case(&'w') {
+        return false;
+    }
+    key.modifiers.contains(KeyModifiers::CONTROL) && key.modifiers.contains(KeyModifiers::SHIFT)
+}
+
+/// `Ctrl+Shift+]`: cycle to the next terminal in the pane.
+fn is_terminal_cycle_key(key: KeyEvent) -> bool {
+    let KeyCode::Char(c) = key.code else { return false };
+    if c != ']' && c != '}' {
+        return false;
+    }
+    key.modifiers.contains(KeyModifiers::CONTROL) && key.modifiers.contains(KeyModifiers::SHIFT)
+}
+
 /// Returns true if the given key event should trash the currently-selected
 /// node in the file tree. Recognises:
 ///   * `KeyCode::Delete`       — the Forward-Delete key on full-size keyboards
@@ -4772,6 +4946,27 @@ fn rect_contains(r: Rect, x: u16, y: u16) -> bool {
         && x < r.x + r.width
         && y >= r.y
         && y < r.y + r.height
+}
+
+const TERMINAL_ADD_LABEL: &str = " + ";
+
+/// Paint the "+" button on the top-right of the terminal pane and return
+/// its hit-test rectangle. Returns None when the pane is too narrow / short
+/// for the label to fit without colliding with the right-corner glyph.
+fn paint_terminal_add_button(frame: &mut ratatui::Frame, area: Rect) -> Option<Rect> {
+    let label = TERMINAL_ADD_LABEL;
+    let label_w = label.chars().count() as u16;
+    if area.height == 0 || area.width < label_w + 2 {
+        return None;
+    }
+    let x = area.x + area.width - label_w - 1;
+    let y = area.y;
+    let style = Style::default()
+        .fg(Color::White)
+        .bg(Color::Rgb(0x1e, 0x3a, 0x6e))
+        .add_modifier(Modifier::BOLD);
+    frame.buffer_mut().set_string(x, y, label, style);
+    Some(Rect { x, y, width: label_w, height: 1 })
 }
 
 fn key_to_bytes(key: KeyEvent) -> Vec<u8> {
@@ -5735,7 +5930,7 @@ mod tests {
         assert!(app.focus == Pane::Tree);
         assert!(app.search.focused);
         assert!(!app.tree.focused);
-        assert!(!app.terminal.focused);
+        assert!(!app.terminal().focused);
     }
 
     #[test]
@@ -6842,6 +7037,141 @@ mod tests {
         });
         assert_eq!(app.terminal_height, Some(10));
     }
+
+    #[test]
+    fn fresh_app_has_one_active_terminal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = App::new(tmp.path().to_path_buf()).unwrap();
+        assert_eq!(app.terminals.len(), 1);
+        assert_eq!(app.active_terminal, 0);
+    }
+
+    #[test]
+    fn split_terminal_appends_and_activates_new_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.split_terminal().unwrap();
+        assert_eq!(app.terminals.len(), 2);
+        assert_eq!(app.active_terminal, 1);
+        app.split_terminal().unwrap();
+        assert_eq!(app.terminals.len(), 3);
+        assert_eq!(app.active_terminal, 2);
+    }
+
+    #[test]
+    fn close_active_terminal_drops_the_active_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.split_terminal().unwrap();
+        app.split_terminal().unwrap();
+        assert_eq!(app.active_terminal, 2);
+        assert!(app.close_active_terminal());
+        assert_eq!(app.terminals.len(), 2);
+        assert_eq!(app.active_terminal, 1);
+        assert!(app.close_active_terminal());
+        assert_eq!(app.terminals.len(), 1);
+        assert_eq!(app.active_terminal, 0);
+    }
+
+    #[test]
+    fn close_active_terminal_refuses_to_drop_the_last_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        assert!(!app.close_active_terminal());
+        assert_eq!(app.terminals.len(), 1);
+        assert_eq!(app.active_terminal, 0);
+    }
+
+    #[test]
+    fn cycle_terminal_wraps_around() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.split_terminal().unwrap();
+        app.split_terminal().unwrap();
+        app.active_terminal = 0;
+        app.cycle_terminal();
+        assert_eq!(app.active_terminal, 1);
+        app.cycle_terminal();
+        assert_eq!(app.active_terminal, 2);
+        app.cycle_terminal();
+        assert_eq!(app.active_terminal, 0);
+    }
+
+    #[test]
+    fn ctrl_shift_t_globally_splits_terminal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        assert_eq!(app.terminals.len(), 1);
+        app.handle_key(key(
+            KeyCode::Char('T'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ))
+        .unwrap();
+        assert_eq!(app.terminals.len(), 2);
+        assert_eq!(app.active_terminal, 1);
+    }
+
+    #[test]
+    fn ctrl_shift_w_in_terminal_pane_closes_active() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.split_terminal().unwrap();
+        app.focus_pane(Pane::Terminal);
+        app.handle_key(key(
+            KeyCode::Char('W'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ))
+        .unwrap();
+        assert_eq!(app.terminals.len(), 1);
+    }
+
+    #[test]
+    fn clicking_terminal_add_button_splits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.terminal_add_button = Some(Rect { x: 50, y: 30, width: 3, height: 1 });
+        app.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: 51,
+            row: 30,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.terminals.len(), 2);
+        assert_eq!(app.active_terminal, 1);
+    }
+
+    #[test]
+    fn add_button_wins_over_terminal_splitter_on_same_row() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        // Splitter and button share the row, as they do in real layout.
+        app.terminal_splitter_y = Some(30);
+        app.terminal_add_button = Some(Rect { x: 50, y: 30, width: 3, height: 1 });
+        app.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: 51,
+            row: 30,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(app.splitter_drag.is_none(), "click on [+] must not start a splitter drag");
+        assert_eq!(app.terminals.len(), 2);
+    }
+
+    #[test]
+    fn focus_flag_only_set_on_active_terminal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.split_terminal().unwrap();
+        app.focus_pane(Pane::Terminal);
+        let active = app.active_terminal;
+        for (i, t) in app.terminals.iter().enumerate() {
+            assert_eq!(t.focused, i == active);
+        }
+        app.focus_pane(Pane::Editor);
+        for t in &app.terminals {
+            assert!(!t.focused);
+        }
+    }
 }
 
 pub fn run(root: PathBuf) -> Result<()> {
@@ -7071,7 +7401,7 @@ fn main_loop(
         // Pull in any filesystem-watcher events first so the tree reflects
         // disk reality on the very next frame.
         let fs_changed = app.drain_fs_events();
-        let pty_changed = app.terminal.take_dirty();
+        let pty_changed = app.drain_terminals_dirty();
         let blink_visible = app.cursor_visible_phase();
         let blink_changed = blink_visible != last_blink_visible;
         let commits_changed = app.drain_recent_commits();

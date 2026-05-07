@@ -163,6 +163,9 @@ Tabs are read-only. Every keystroke is swallowed so a stray key cannot corrupt a
 | Mouse drag | Select text; selection stays highlighted until you copy or click elsewhere |
 | Mouse wheel | Scroll through 5000 rows of scrollback. In alternate-screen mode (vim / less / htop) the wheel forwards arrow keys so the running app handles it. Any keystroke snaps back to the live bottom. |
 | `Ctrl+Shift+c` (or `Cmd+c` with kitty-protocol terminals) | Explicit copy of the terminal's current selection |
+| `Ctrl+Shift+t` | Open another terminal next to the current one (works from any pane). Each terminal has its own PTY, scrollback, and selection. |
+| `Ctrl+Shift+w` | Close the active terminal (no-op when only one is left; use `Ctrl+J` to hide the pane). |
+| `Ctrl+Shift+]` | Cycle to the next terminal in the pane. Click any terminal to switch focus directly. |
 
 ## iTerm2 setup for macOS users
 
