@@ -279,6 +279,23 @@ impl Widget for &mut SourceControlPanel {
             return;
         }
 
+        // Non-repo workspace: nothing to commit, no branch to show. Render
+        // a clear empty state and bail before painting the input/button —
+        // both would imply functionality this folder doesn't support.
+        if !self.status.in_repo {
+            let dim = Style::default().fg(Color::DarkGray);
+            buf.set_string(inner.x + 1, inner.y, "Not a git repository", dim);
+            if inner.height > 1 {
+                buf.set_string(
+                    inner.x + 1,
+                    inner.y + 1,
+                    "Open a folder under git to commit",
+                    dim,
+                );
+            }
+            return;
+        }
+
         let header_style = Style::default()
             .fg(Color::Rgb(SECTION_HEADER_RGB.0, SECTION_HEADER_RGB.1, SECTION_HEADER_RGB.2))
             .add_modifier(Modifier::BOLD);
@@ -520,6 +537,36 @@ mod tests {
         assert!(matches!(lines[2], ListLine::Header(ChangeSection::Staged)));
         assert!(matches!(lines[4], ListLine::Header(ChangeSection::Changes)));
         assert!(matches!(lines[6], ListLine::Header(ChangeSection::Untracked)));
+    }
+
+    #[test]
+    fn render_in_non_repo_hides_input_and_button() {
+        use crate::git::GitStatus;
+        let mut p = SourceControlPanel::new();
+        p.status = GitStatus::default(); // in_repo = false
+        let area = Rect { x: 0, y: 0, width: 32, height: 10 };
+        let mut buf = Buffer::empty(area);
+        (&mut p).render(area, &mut buf);
+        assert_eq!(p.last_input_area, Rect::default(), "input area must stay empty in non-repo");
+        assert_eq!(p.last_button_area, Rect::default(), "button area must stay empty in non-repo");
+        assert_eq!(p.last_list_area, Rect::default(), "list area must stay empty in non-repo");
+        let mut row0 = String::new();
+        for x in 0..area.width {
+            row0.push_str(buf[(x, 1)].symbol());
+        }
+        assert!(row0.contains("Not a git repository"), "row was: {row0:?}");
+    }
+
+    #[test]
+    fn render_in_repo_paints_input_and_button() {
+        use crate::git::GitStatus;
+        let mut p = SourceControlPanel::new();
+        p.status = GitStatus { in_repo: true, branch: Some("main".into()), ..Default::default() };
+        let area = Rect { x: 0, y: 0, width: 32, height: 10 };
+        let mut buf = Buffer::empty(area);
+        (&mut p).render(area, &mut buf);
+        assert!(p.last_input_area.height > 0, "input area must paint when in_repo");
+        assert!(p.last_button_area.height > 0, "button area must paint when in_repo");
     }
 
     #[test]
