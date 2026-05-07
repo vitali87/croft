@@ -516,6 +516,11 @@ pub struct App {
     /// action. None until they pick one; cleared once they invoke
     /// "Compare with Selected" against another file.
     compare_anchor: Option<PathBuf>,
+    /// Whole-screen rect captured at the start of every `render`. The
+    /// context-menu hit-test reads this to clamp the menu's bounds the
+    /// same way the renderer does, so a menu that gets shifted up to fit
+    /// on screen still maps clicks to the right item.
+    last_frame_area: Rect,
     /// Active explorer drag-and-drop, if any.
     tree_drag: Option<ExplorerDrag>,
     /// Pending SCP uploads queued by a Finder drag-drop onto the Remote
@@ -1001,6 +1006,7 @@ impl App {
             remote_launch: None,
             tree_clipboard: None,
             compare_anchor: None,
+            last_frame_area: Rect::default(),
             tree_drag: None,
             pending_scp_uploads: Vec::new(),
             pending_remote_pulls: Vec::new(),
@@ -2182,6 +2188,7 @@ impl App {
 
     fn render(&mut self, frame: &mut ratatui::Frame) {
         let size = frame.area();
+        self.last_frame_area = size;
         let outer = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Min(1), Constraint::Length(1)])
@@ -2373,15 +2380,11 @@ impl App {
 
     fn render_context_menu(&self, frame: &mut ratatui::Frame) {
         let Some(menu) = &self.context_menu else { return };
-        let Some(rect) = self.menu_rect() else { return };
-        let area = frame.area();
-        // Clip the menu to the screen so it doesn't run off the edges.
-        let clipped = Rect {
-            x: rect.x.min(area.width.saturating_sub(rect.width)),
-            y: rect.y.min(area.height.saturating_sub(rect.height)),
-            width: rect.width,
-            height: rect.height,
-        };
+        // `menu_rect` already clamps against `last_frame_area`, so the
+        // rect we draw here is the same rect `menu_item_at` hit-tests
+        // against. Keeping the two in lock-step is what prevents the
+        // off-by-N row dispatch when the menu has to shift up to fit.
+        let Some(clipped) = self.menu_rect() else { return };
         let block = ratatui::widgets::Block::default()
             .borders(ratatui::widgets::Borders::ALL)
             .border_style(Style::default().fg(Color::Rgb(0x4e, 0x9a, 0xff)))
@@ -4332,15 +4335,33 @@ impl App {
     /// Compute the menu's bounding rect from current state.
     fn menu_rect(&self) -> Option<Rect> {
         let menu = self.context_menu.as_ref()?;
-        let widest = menu.items.iter().map(|(s, _)| s.len()).max().unwrap_or(0);
+        // Use char count (not byte len) so multi-byte glyphs in menu
+        // labels (e.g. the "…" in "Rename…", the arrow in "Compare with
+        // Selected") don't inflate the menu width past what's needed.
+        let widest = menu
+            .items
+            .iter()
+            .map(|(s, _)| s.chars().count())
+            .max()
+            .unwrap_or(0);
         let width = (widest + 4).max(18) as u16;
         let height = (menu.items.len() + 2) as u16;
-        Some(Rect {
-            x: menu.origin.0,
-            y: menu.origin.1,
-            width,
-            height,
-        })
+        let area = self.last_frame_area;
+        // Clamp identically to `render_context_menu` so hit-testing maps
+        // clicks to the same row the user actually sees. Without this, a
+        // menu that has to shift up to fit (right-click low on screen)
+        // dispatches the row above the one the user clicked.
+        let x = if area.width > 0 {
+            menu.origin.0.min(area.width.saturating_sub(width))
+        } else {
+            menu.origin.0
+        };
+        let y = if area.height > 0 {
+            menu.origin.1.min(area.height.saturating_sub(height))
+        } else {
+            menu.origin.1
+        };
+        Some(Rect { x, y, width, height })
     }
 
     /// If (x, y) hits a menu item row, return its index.
@@ -6612,6 +6633,52 @@ mod tests {
         );
         let labels: Vec<&str> = items.iter().map(|(s, _)| s.as_str()).collect();
         assert_eq!(labels, ["Cut", "Copy", "Paste", "Rename…", "Delete"]);
+    }
+
+    #[test]
+    fn menu_item_at_handles_clipped_menu_so_clicks_dispatch_the_visible_row() {
+        // Repro: with a 5-item menu (Cut, Copy, Rename…, Select for
+        // Compare, Delete), if the user right-clicks low enough that
+        // the menu must shift up by 1 to fit on screen, a click on the
+        // visible "Select for Compare" row used to map to "Rename…"
+        // because hit-testing used the unclipped rect while rendering
+        // used the clipped one.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        // Frame is 60 wide, 10 tall.
+        app.last_frame_area = Rect { x: 0, y: 0, width: 60, height: 10 };
+        // Menu height = items.len() + 2 borders = 7. Origin at y=4 would
+        // make the menu run from row 4 to row 11 (off-screen). The
+        // renderer (and now hit-test) clamp y to 10 - 7 = 3.
+        let f = tmp.path().join("file.txt");
+        std::fs::write(&f, "x").unwrap();
+        let n = crate::widgets::file_tree::Node {
+            path: f.clone(),
+            depth: 1,
+            is_dir: false,
+            expanded: false,
+            loaded: true,
+        };
+        let target = f.parent().unwrap().to_path_buf();
+        let items = build_tree_context_menu_items(
+            Some(&n),
+            tmp.path(),
+            &[f.clone()],
+            &target,
+            None,
+            None,
+        );
+        // Sanity: items[3] is the new "Select for Compare".
+        assert!(matches!(&items[3].1, MenuAction::SelectForCompare(_)));
+        app.context_menu = Some(ContextMenu {
+            origin: (10, 4),
+            items,
+            selected: 0,
+            target_dir: target,
+        });
+        // The visible "Select for Compare" row sits at clipped.y + 1 + 3 = 3 + 4 = 7.
+        let idx = app.menu_item_at(11, 7).expect("hit must land inside the menu");
+        assert_eq!(idx, 3, "click on visible row 7 must map to item 3, not 2");
     }
 
     #[test]
