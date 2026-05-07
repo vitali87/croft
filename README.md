@@ -52,7 +52,17 @@ If you prefer to do it by hand: Terminal.app → Settings → Profiles → your 
 
 > **PostScript name vs display name.** AppleScript needs the *PostScript* name, which is what's embedded in the .ttf, not what Terminal.app's font picker displays. The PostScript name for `MesloLGSNerdFontMono-Regular.ttf` is `MesloLGSNFM-Regular`. This was a real bug in the Python prototype: the wrong name silently no-ops in AppleScript and Terminal.app keeps the previous font, which is why the icons appeared broken even after running the setup command.
 
-## Build and install
+## Install
+
+The fastest path, no clone required:
+
+```bash
+cargo install --git https://bitbucket.org/vitali_avagyan/croft.git
+```
+
+This compiles croft from the latest `main` and drops the binary in `~/.cargo/bin/croft`. Re-run the same command to upgrade.
+
+### Build from source
 
 ```bash
 git clone https://bitbucket.org/vitali_avagyan/croft.git
