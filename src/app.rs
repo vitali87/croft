@@ -2982,6 +2982,10 @@ impl App {
     }
 
     fn handle_editor_key(&mut self, key: KeyEvent) {
+        if self.editor.diff.is_some() {
+            self.handle_diff_key(key);
+            return;
+        }
         if self.editor.sheet.is_some() {
             self.handle_sheet_key(key);
             return;
@@ -4294,7 +4298,11 @@ impl App {
                         SidebarView::Search => {}
                     }
                 } else if in_editor {
-                    self.editor.scroll_down(3);
+                    if let Some(diff) = self.editor.diff.as_mut() {
+                        diff.scroll_down_by(3);
+                    } else {
+                        self.editor.scroll_down(3);
+                    }
                 } else if let Some(idx) = terminal_hit {
                     let t = &mut self.terminals[idx];
                     // Try our scrollback first; if we're in vim/less/htop
@@ -4313,7 +4321,11 @@ impl App {
                         SidebarView::Search => {}
                     }
                 } else if in_editor {
-                    self.editor.scroll_up(3);
+                    if let Some(diff) = self.editor.diff.as_mut() {
+                        diff.scroll_up_by(3);
+                    } else {
+                        self.editor.scroll_up(3);
+                    }
                 } else if let Some(idx) = terminal_hit {
                     let t = &mut self.terminals[idx];
                     if !t.scroll_up(3) {
@@ -4591,6 +4603,25 @@ impl App {
     /// full viewport, Home/End jump to the first/last row, Tab/Shift+Tab
     /// switch worksheets. Anything else is swallowed so a stray keystroke
     /// can't insert characters into a buffer the user can't see.
+    fn handle_diff_key(&mut self, key: KeyEvent) {
+        // Page = inner viewport rows minus the header + footer the diff
+        // renderer reserves. Falls back to a sane default when the editor
+        // hasn't laid out yet.
+        let page = (self.editor.last_inner.height as usize).saturating_sub(2).max(1);
+        let Some(diff) = self.editor.diff.as_mut() else {
+            return;
+        };
+        match key.code {
+            KeyCode::Up => diff.scroll_up_by(1),
+            KeyCode::Down => diff.scroll_down_by(1),
+            KeyCode::PageUp => diff.scroll_up_by(page),
+            KeyCode::PageDown => diff.scroll_down_by(page),
+            KeyCode::Home => diff.scroll_home(),
+            KeyCode::End => diff.scroll_end(),
+            _ => {}
+        }
+    }
+
     fn handle_sheet_key(&mut self, key: KeyEvent) {
         let visible = sheet_visible_rows(self.editor.last_inner);
         let Some(sheet) = self.editor.sheet.as_mut() else {
@@ -6633,6 +6664,71 @@ mod tests {
         );
         let labels: Vec<&str> = items.iter().map(|(s, _)| s.as_str()).collect();
         assert_eq!(labels, ["Cut", "Copy", "Paste", "Rename…", "Delete"]);
+    }
+
+    #[test]
+    fn arrow_and_pageup_pagedown_scroll_the_diff_view() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        let f1 = tmp.path().join("a.txt");
+        let f2 = tmp.path().join("b.txt");
+        // 30 distinct lines so the diff has plenty of rows to scroll.
+        let left: String = (0..30).map(|i| format!("left-{i}\n")).collect();
+        let right: String = (0..30).map(|i| format!("right-{i}\n")).collect();
+        std::fs::write(&f1, left).unwrap();
+        std::fs::write(&f2, right).unwrap();
+        app.editor.open_diff(&f1, &f2).unwrap();
+        // Pretend the editor inner is 12 rows tall (page = 10 after the
+        // header + footer reservation).
+        app.editor.last_inner = Rect { x: 0, y: 0, width: 80, height: 12 };
+        app.focus_pane(Pane::Editor);
+
+        // Down once → +1.
+        app.handle_key(key(KeyCode::Down, KeyModifiers::NONE)).unwrap();
+        assert_eq!(app.editor.diff.as_ref().unwrap().scroll, 1);
+        // PageDown → +page (10).
+        app.handle_key(key(KeyCode::PageDown, KeyModifiers::NONE)).unwrap();
+        assert_eq!(app.editor.diff.as_ref().unwrap().scroll, 11);
+        // Up once → -1.
+        app.handle_key(key(KeyCode::Up, KeyModifiers::NONE)).unwrap();
+        assert_eq!(app.editor.diff.as_ref().unwrap().scroll, 10);
+        // PageUp → -page.
+        app.handle_key(key(KeyCode::PageUp, KeyModifiers::NONE)).unwrap();
+        assert_eq!(app.editor.diff.as_ref().unwrap().scroll, 0);
+        // Home / End.
+        app.handle_key(key(KeyCode::End, KeyModifiers::NONE)).unwrap();
+        let total = app.editor.diff.as_ref().unwrap().rows.len();
+        assert_eq!(app.editor.diff.as_ref().unwrap().scroll, total);
+        app.handle_key(key(KeyCode::Home, KeyModifiers::NONE)).unwrap();
+        assert_eq!(app.editor.diff.as_ref().unwrap().scroll, 0);
+    }
+
+    #[test]
+    fn mouse_wheel_over_diff_scrolls_the_diff_not_the_text_buffer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        let f1 = tmp.path().join("a.txt");
+        let f2 = tmp.path().join("b.txt");
+        std::fs::write(&f1, "1\n2\n3\n4\n5\n6\n").unwrap();
+        std::fs::write(&f2, "1\n2\n3\n4\n5\n6\n").unwrap();
+        app.editor.open_diff(&f1, &f2).unwrap();
+        // Place the editor pane somewhere the mouse can hit it.
+        app.editor.last_area = Rect { x: 0, y: 0, width: 80, height: 20 };
+        app.editor.last_full_area = app.editor.last_area;
+        app.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::ScrollDown,
+            column: 5,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.editor.diff.as_ref().unwrap().scroll, 3);
+        app.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::ScrollUp,
+            column: 5,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.editor.diff.as_ref().unwrap().scroll, 0);
     }
 
     #[test]

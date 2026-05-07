@@ -48,6 +48,25 @@ impl DiffData {
     pub fn total_rows(&self) -> usize {
         self.rows.len()
     }
+
+    pub fn scroll_up_by(&mut self, n: usize) {
+        self.scroll = self.scroll.saturating_sub(n);
+    }
+
+    pub fn scroll_down_by(&mut self, n: usize) {
+        let max = self.rows.len();
+        // Clamp loosely here; render_diff also re-clamps against the live
+        // viewport, so we don't need to know it at scroll time.
+        self.scroll = (self.scroll + n).min(max);
+    }
+
+    pub fn scroll_home(&mut self) {
+        self.scroll = 0;
+    }
+
+    pub fn scroll_end(&mut self) {
+        self.scroll = self.rows.len();
+    }
 }
 
 /// Run a line-level diff over `left` vs `right` and emit one DiffRow per
@@ -178,6 +197,27 @@ mod tests {
             })
             .collect();
         assert_eq!(kinds, vec!["rep", "rm", "rm", "rm"]);
+    }
+
+    #[test]
+    fn scroll_helpers_clamp_at_zero_and_total() {
+        let mut d = DiffData::build(
+            PathBuf::from("/a"),
+            PathBuf::from("/b"),
+            lines(&["1", "2", "3", "4", "5"]),
+            lines(&["1", "2", "X", "4", "5"]),
+        );
+        assert_eq!(d.scroll, 0);
+        d.scroll_up_by(3);
+        assert_eq!(d.scroll, 0, "saturating sub at 0");
+        d.scroll_down_by(2);
+        assert_eq!(d.scroll, 2);
+        d.scroll_down_by(99);
+        assert_eq!(d.scroll, d.rows.len(), "clamp at total rows");
+        d.scroll_home();
+        assert_eq!(d.scroll, 0);
+        d.scroll_end();
+        assert_eq!(d.scroll, d.rows.len());
     }
 
     #[test]
