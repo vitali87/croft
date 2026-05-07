@@ -231,6 +231,12 @@ enum MenuAction {
     Copy(Vec<PathBuf>),
     /// Paste the explorer clipboard's payload into `target_dir`.
     Paste(PathBuf),
+    /// Stash this path as the "compare anchor" so the next file the user
+    /// right-clicks can be diffed against it.
+    SelectForCompare(PathBuf),
+    /// Open a side-by-side diff between the previously-selected anchor and
+    /// the file the user just right-clicked.
+    CompareWithSelected { anchor: PathBuf, other: PathBuf },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -282,6 +288,7 @@ fn build_tree_context_menu_items(
     selection: &[PathBuf],
     target_dir: &Path,
     clipboard: Option<&ExplorerClipboard>,
+    compare_anchor: Option<&Path>,
 ) -> Vec<(String, MenuAction)> {
     let entry_target = crate::widgets::file_tree::delete_target_for(node, root);
     let mut items: Vec<(String, MenuAction)> = Vec::new();
@@ -298,6 +305,35 @@ fn build_tree_context_menu_items(
         }
         if paths_for_action.len() == 1 {
             items.push((String::from("Rename…"), MenuAction::Rename(p.clone())));
+        }
+        // Compare actions only make sense for a single regular file.
+        let single_file_target = paths_for_action
+            .first()
+            .filter(|_| paths_for_action.len() == 1)
+            .filter(|pp| pp.is_file());
+        if let Some(file) = single_file_target {
+            match compare_anchor {
+                Some(anchor) if anchor != file.as_path() => {
+                    items.push((
+                        format!(
+                            "Compare with Selected ({})",
+                            anchor
+                                .file_name()
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| anchor.display().to_string()),
+                        ),
+                        MenuAction::CompareWithSelected {
+                            anchor: anchor.to_path_buf(),
+                            other: file.clone(),
+                        },
+                    ));
+                }
+                _ => {}
+            }
+            items.push((
+                String::from("Select for Compare"),
+                MenuAction::SelectForCompare(file.clone()),
+            ));
         }
         let label = if paths_for_action.len() > 1 {
             format!("Delete {} items", paths_for_action.len())
@@ -476,6 +512,10 @@ pub struct App {
     /// (which carries text), this stores filesystem paths and the intent
     /// (move vs. copy) until the next Paste consumes it.
     tree_clipboard: Option<ExplorerClipboard>,
+    /// File the user picked via the explorer's "Select for Compare" menu
+    /// action. None until they pick one; cleared once they invoke
+    /// "Compare with Selected" against another file.
+    compare_anchor: Option<PathBuf>,
     /// Active explorer drag-and-drop, if any.
     tree_drag: Option<ExplorerDrag>,
     /// Pending SCP uploads queued by a Finder drag-drop onto the Remote
@@ -960,6 +1000,7 @@ impl App {
             fs_poll_open_file_mtime: None,
             remote_launch: None,
             tree_clipboard: None,
+            compare_anchor: None,
             tree_drag: None,
             pending_scp_uploads: Vec::new(),
             pending_remote_pulls: Vec::new(),
@@ -3759,6 +3800,7 @@ impl App {
                         &selection,
                         &target_dir,
                         self.tree_clipboard.as_ref(),
+                        self.compare_anchor.as_deref(),
                     );
                     self.context_menu = Some(ContextMenu {
                         origin: (m.column, m.row),
@@ -4379,6 +4421,35 @@ impl App {
                 };
             }
             MenuAction::Paste(dest) => self.paste_into(dest),
+            MenuAction::SelectForCompare(path) => {
+                let label = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.display().to_string());
+                self.compare_anchor = Some(path);
+                self.status = format!("Selected {label} for compare");
+            }
+            MenuAction::CompareWithSelected { anchor, other } => {
+                match self.editor.open_diff(&anchor, &other) {
+                    Ok(()) => {
+                        self.focus_pane(Pane::Editor);
+                        self.compare_anchor = None;
+                        self.sync_open_file_poll_mtime();
+                        let l = anchor
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| anchor.display().to_string());
+                        let r = other
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| other.display().to_string());
+                        self.status = format!("Diff: {l} \u{2194} {r}");
+                    }
+                    Err(e) => {
+                        self.status = format!("Diff failed: {e}");
+                    }
+                }
+            }
         }
     }
 
@@ -6488,13 +6559,18 @@ mod tests {
             &[f.clone()],
             &target,
             None,
+            None,
         );
         let labels: Vec<&str> = items.iter().map(|(s, _)| s.as_str()).collect();
-        assert_eq!(labels, ["Cut", "Copy", "Rename…", "Delete"]);
+        assert_eq!(
+            labels,
+            ["Cut", "Copy", "Rename…", "Select for Compare", "Delete"]
+        );
         assert!(matches!(&items[0].1, MenuAction::Cut(ps) if ps == &vec![f.clone()]));
         assert!(matches!(&items[1].1, MenuAction::Copy(ps) if ps == &vec![f.clone()]));
         assert!(matches!(&items[2].1, MenuAction::Rename(p) if p == &f));
-        assert!(matches!(&items[3].1, MenuAction::Delete { paths } if paths == &vec![f.clone()]));
+        assert!(matches!(&items[3].1, MenuAction::SelectForCompare(p) if p == &f));
+        assert!(matches!(&items[4].1, MenuAction::Delete { paths } if paths == &vec![f.clone()]));
     }
 
     #[test]
@@ -6509,6 +6585,7 @@ mod tests {
             tmp.path(),
             &[d.clone()],
             &target,
+            None,
             None,
         );
         let labels: Vec<&str> = items.iter().map(|(s, _)| s.as_str()).collect();
@@ -6531,9 +6608,58 @@ mod tests {
             &[d.clone()],
             &d,
             Some(&clip),
+            None,
         );
         let labels: Vec<&str> = items.iter().map(|(s, _)| s.as_str()).collect();
         assert_eq!(labels, ["Cut", "Copy", "Paste", "Rename…", "Delete"]);
+    }
+
+    #[test]
+    fn tree_context_menu_offers_compare_with_selected_when_anchor_is_present() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a.txt");
+        std::fs::write(&a, "v1").unwrap();
+        let b = tmp.path().join("b.txt");
+        std::fs::write(&b, "v2").unwrap();
+        let n = file_node(&b);
+        let items = build_tree_context_menu_items(
+            Some(&n),
+            tmp.path(),
+            &[b.clone()],
+            tmp.path(),
+            None,
+            Some(a.as_path()),
+        );
+        let kinds: Vec<&MenuAction> = items.iter().map(|(_, a)| a).collect();
+        assert!(
+            kinds.iter().any(|a| matches!(a, MenuAction::CompareWithSelected { .. })),
+            "Compare with Selected must be offered when an anchor is set"
+        );
+        assert!(
+            kinds.iter().any(|a| matches!(a, MenuAction::SelectForCompare(_))),
+            "Select for Compare must always be offered for single files"
+        );
+    }
+
+    #[test]
+    fn tree_context_menu_hides_compare_when_anchor_is_the_same_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a.txt");
+        std::fs::write(&a, "v1").unwrap();
+        let n = file_node(&a);
+        let items = build_tree_context_menu_items(
+            Some(&n),
+            tmp.path(),
+            &[a.clone()],
+            tmp.path(),
+            None,
+            Some(a.as_path()),
+        );
+        let kinds: Vec<&MenuAction> = items.iter().map(|(_, a)| a).collect();
+        assert!(
+            !kinds.iter().any(|a| matches!(a, MenuAction::CompareWithSelected { .. })),
+            "Compare with Selected must not appear against itself"
+        );
     }
 
     #[test]
@@ -6551,6 +6677,7 @@ mod tests {
             &[f.clone(), f2.clone()],
             &target,
             None,
+            None,
         );
         let labels: Vec<&str> = items.iter().map(|(s, _)| s.as_str()).collect();
         assert_eq!(labels, ["Cut", "Copy", "Delete 2 items"]);
@@ -6564,6 +6691,7 @@ mod tests {
             tmp.path(),
             &[],
             tmp.path(),
+            None,
             None,
         );
         let labels: Vec<&str> = items.iter().map(|(s, _)| s.as_str()).collect();
@@ -6585,6 +6713,7 @@ mod tests {
             &[],
             tmp.path(),
             Some(&clip),
+            None,
         );
         let labels: Vec<&str> = items.iter().map(|(s, _)| s.as_str()).collect();
         assert_eq!(labels, ["New File…", "New Folder…", "Paste"]);
@@ -6658,6 +6787,7 @@ mod tests {
             tmp.path(),
             &[],
             tmp.path(),
+            None,
             None,
         );
         let labels: Vec<&str> = items.iter().map(|(s, _)| s.as_str()).collect();

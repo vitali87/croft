@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
@@ -254,6 +254,224 @@ fn render_sheet(
     );
 }
 
+fn render_diff(
+    diff: &mut crate::widgets::diff::DiffData,
+    inner: Rect,
+    buf: &mut Buffer,
+) {
+    use crate::widgets::diff::DiffRow;
+    // Background fill so the diff sits on a clean canvas.
+    let bg_style = Style::default().bg(Color::Rgb(0x1e, 0x22, 0x2e));
+    for y in inner.y..inner.y + inner.height {
+        for x in inner.x..inner.x + inner.width {
+            buf[(x, y)].set_style(bg_style);
+            buf[(x, y)].set_symbol(" ");
+        }
+    }
+    if inner.height < 3 || inner.width < 16 {
+        return;
+    }
+    let left_name = diff
+        .left_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| diff.left_path.display().to_string());
+    let right_name = diff
+        .right_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| diff.right_path.display().to_string());
+    let header = format!(" diff: {left_name}  \u{2194}  {right_name} ");
+    let head_style = Style::default()
+        .fg(Color::White)
+        .bg(Color::Rgb(0x09, 0x4d, 0x77))
+        .add_modifier(Modifier::BOLD);
+    for x in inner.x..inner.x + inner.width {
+        buf[(x, inner.y)].set_style(head_style);
+        buf[(x, inner.y)].set_symbol(" ");
+    }
+    buf.set_string(inner.x, inner.y, &header, head_style);
+
+    // Two columns split exactly down the middle. Each column has a small
+    // line-number gutter on its left and a 1-cell sign column showing
+    // -, +, or space.
+    let body_top = inner.y + 1;
+    let body_height = inner.height.saturating_sub(2);
+    let status_y = inner.y + inner.height - 1;
+    if body_height == 0 {
+        return;
+    }
+    let half = inner.width / 2;
+    if half < 8 {
+        return;
+    }
+    let left_max = diff.left_lines.len();
+    let right_max = diff.right_lines.len();
+    let l_gutter = (left_max + 1).to_string().len() as u16 + 1;
+    let r_gutter = (right_max + 1).to_string().len() as u16 + 1;
+    // Per-column layout: gutter + sign + content.
+    let l_x = inner.x;
+    let l_sign_x = l_x + l_gutter;
+    let l_text_x = l_sign_x + 2;
+    let l_text_w = half.saturating_sub(l_gutter + 2 + 1); // -1 spacer
+    let r_x = inner.x + half + 1;
+    let r_sign_x = r_x + r_gutter;
+    let r_text_x = r_sign_x + 2;
+    let r_text_w = (inner.width - (half + 1)).saturating_sub(r_gutter + 2);
+
+    // Vertical seam between the two columns.
+    let seam_x = inner.x + half;
+    for y in body_top..body_top + body_height {
+        buf[(seam_x, y)].set_symbol("\u{2502}");
+        buf[(seam_x, y)].set_style(Style::default().fg(Color::Rgb(0x3a, 0x42, 0x52)));
+    }
+
+    let total = diff.rows.len();
+    let viewport = body_height as usize;
+    let max_scroll = total.saturating_sub(viewport);
+    if diff.scroll > max_scroll {
+        diff.scroll = max_scroll;
+    }
+
+    let removed_bg = Color::Rgb(0x4a, 0x1f, 0x1f);
+    let removed_fg = Color::Rgb(0xff, 0xb3, 0xb3);
+    let added_bg = Color::Rgb(0x1f, 0x42, 0x2a);
+    let added_fg = Color::Rgb(0xb6, 0xee, 0xc4);
+    let equal_fg = Color::Rgb(0xc5, 0xcd, 0xd9);
+    let gutter_fg = Color::Rgb(0x6c, 0x7d, 0x9c);
+
+    let end = (diff.scroll + viewport).min(total);
+    for (vis_row, row_idx) in (diff.scroll..end).enumerate() {
+        let y = body_top + vis_row as u16;
+        let row = diff.rows[row_idx];
+        let (l_cell_bg, l_sign, l_text) = match row {
+            DiffRow::Equal { left, .. } => {
+                (Color::Reset, ' ', diff.left_lines.get(left).cloned().unwrap_or_default())
+            }
+            DiffRow::Removed { left } => {
+                (removed_bg, '-', diff.left_lines.get(left).cloned().unwrap_or_default())
+            }
+            DiffRow::Replaced { left, .. } => {
+                (removed_bg, '-', diff.left_lines.get(left).cloned().unwrap_or_default())
+            }
+            DiffRow::Added { .. } => (added_bg, ' ', String::new()),
+        };
+        let (r_cell_bg, r_sign, r_text) = match row {
+            DiffRow::Equal { right, .. } => (
+                Color::Reset,
+                ' ',
+                diff.right_lines.get(right).cloned().unwrap_or_default(),
+            ),
+            DiffRow::Added { right } => (
+                added_bg,
+                '+',
+                diff.right_lines.get(right).cloned().unwrap_or_default(),
+            ),
+            DiffRow::Replaced { right, .. } => (
+                added_bg,
+                '+',
+                diff.right_lines.get(right).cloned().unwrap_or_default(),
+            ),
+            DiffRow::Removed { .. } => (removed_bg, ' ', String::new()),
+        };
+
+        // Left column.
+        let l_left_idx = match row {
+            DiffRow::Equal { left, .. }
+            | DiffRow::Removed { left }
+            | DiffRow::Replaced { left, .. } => Some(left),
+            DiffRow::Added { .. } => None,
+        };
+        let l_label = l_left_idx
+            .map(|i| format!("{:>width$} ", i + 1, width = l_gutter as usize - 1))
+            .unwrap_or_else(|| " ".repeat(l_gutter as usize));
+        buf.set_string(
+            l_x,
+            y,
+            &l_label,
+            Style::default().fg(gutter_fg).bg(l_cell_bg),
+        );
+        buf.set_string(
+            l_sign_x,
+            y,
+            &format!("{l_sign} "),
+            Style::default()
+                .fg(if l_cell_bg == removed_bg { removed_fg } else { equal_fg })
+                .bg(l_cell_bg)
+                .add_modifier(Modifier::BOLD),
+        );
+        let l_clipped: String = l_text.chars().take(l_text_w as usize).collect();
+        let mut l_padded = l_clipped.clone();
+        let l_pad = (l_text_w as usize).saturating_sub(l_padded.chars().count());
+        for _ in 0..l_pad {
+            l_padded.push(' ');
+        }
+        buf.set_string(
+            l_text_x,
+            y,
+            &l_padded,
+            Style::default()
+                .fg(if l_cell_bg == removed_bg { removed_fg } else { equal_fg })
+                .bg(l_cell_bg),
+        );
+
+        // Right column.
+        let r_right_idx = match row {
+            DiffRow::Equal { right, .. }
+            | DiffRow::Added { right }
+            | DiffRow::Replaced { right, .. } => Some(right),
+            DiffRow::Removed { .. } => None,
+        };
+        let r_label = r_right_idx
+            .map(|i| format!("{:>width$} ", i + 1, width = r_gutter as usize - 1))
+            .unwrap_or_else(|| " ".repeat(r_gutter as usize));
+        buf.set_string(
+            r_x,
+            y,
+            &r_label,
+            Style::default().fg(gutter_fg).bg(r_cell_bg),
+        );
+        buf.set_string(
+            r_sign_x,
+            y,
+            &format!("{r_sign} "),
+            Style::default()
+                .fg(if r_cell_bg == added_bg { added_fg } else { equal_fg })
+                .bg(r_cell_bg)
+                .add_modifier(Modifier::BOLD),
+        );
+        let r_clipped: String = r_text.chars().take(r_text_w as usize).collect();
+        let mut r_padded = r_clipped.clone();
+        let r_pad = (r_text_w as usize).saturating_sub(r_padded.chars().count());
+        for _ in 0..r_pad {
+            r_padded.push(' ');
+        }
+        buf.set_string(
+            r_text_x,
+            y,
+            &r_padded,
+            Style::default()
+                .fg(if r_cell_bg == added_bg { added_fg } else { equal_fg })
+                .bg(r_cell_bg),
+        );
+    }
+
+    // Status footer.
+    let visible_first = diff.scroll + 1;
+    let visible_last = end;
+    let status = format!(
+        " {visible_first}–{visible_last} of {total}  ·  ↑/↓ PgUp/PgDn to scroll "
+    );
+    buf.set_string(
+        inner.x,
+        status_y,
+        &status,
+        Style::default()
+            .fg(Color::Gray)
+            .bg(Color::Rgb(0x14, 0x18, 0x22)),
+    );
+}
+
 fn write_cell(
     buf: &mut Buffer,
     x: u16,
@@ -401,6 +619,10 @@ pub struct Editor {
     /// Mutually exclusive with `image` and the text path; none of the
     /// editor's text fields are populated when this is `Some`.
     pub sheet: Option<crate::sheet::SheetView>,
+    /// Read-only side-by-side diff view. Mutually exclusive with the text
+    /// path, `image`, and `sheet` — when set the renderer paints two
+    /// columns based on `diff.rows` and ignores `lines`.
+    pub diff: Option<crate::widgets::diff::DiffData>,
 }
 
 impl Editor {
@@ -429,6 +651,7 @@ impl Editor {
             search_highlight_opts: crate::widgets::search::SearchOpts::default(),
             image: None,
             sheet: None,
+            diff: None,
         }
     }
 
@@ -2130,6 +2353,53 @@ mod tests {
     }
 
     #[test]
+    fn open_diff_replaces_blank_initial_tab_with_diff_view() {
+        let f1 = NamedTempFile::new().unwrap();
+        let f2 = NamedTempFile::new().unwrap();
+        std::fs::write(f1.path(), "alpha\nbravo\ncharlie\n").unwrap();
+        std::fs::write(f2.path(), "alpha\nBRAVO\ncharlie\n").unwrap();
+        let mut t = EditorTabs::new();
+        t.open_diff(f1.path(), f2.path()).unwrap();
+        assert_eq!(t.tab_count(), 1, "blank initial slot should be reused");
+        let active = &t.editors[t.active_index()];
+        assert!(active.diff.is_some(), "active tab must hold diff data");
+        let diff = active.diff.as_ref().unwrap();
+        assert_eq!(diff.left_lines, vec!["alpha", "bravo", "charlie"]);
+        assert_eq!(diff.right_lines, vec!["alpha", "BRAVO", "charlie"]);
+        assert_eq!(diff.rows.len(), 3);
+    }
+
+    #[test]
+    fn open_diff_inserts_a_new_tab_when_an_open_file_already_exists() {
+        let existing = NamedTempFile::new().unwrap();
+        std::fs::write(existing.path(), "x\n").unwrap();
+        let f1 = NamedTempFile::new().unwrap();
+        let f2 = NamedTempFile::new().unwrap();
+        std::fs::write(f1.path(), "1\n").unwrap();
+        std::fs::write(f2.path(), "2\n").unwrap();
+        let mut t = EditorTabs::new();
+        t.open_pinned(existing.path()).unwrap();
+        let before = t.tab_count();
+        t.open_diff(f1.path(), f2.path()).unwrap();
+        assert_eq!(t.tab_count(), before + 1, "must insert a new diff tab");
+        assert!(t.editors[t.active_index()].diff.is_some());
+    }
+
+    #[test]
+    fn diff_tab_label_uses_arrow_between_filenames() {
+        let f1 = NamedTempFile::new().unwrap();
+        let f2 = NamedTempFile::new().unwrap();
+        std::fs::write(f1.path(), "a\n").unwrap();
+        std::fs::write(f2.path(), "b\n").unwrap();
+        let mut t = EditorTabs::new();
+        t.open_diff(f1.path(), f2.path()).unwrap();
+        let label = tab_label(&t.editors[t.active_index()]);
+        let l = f1.path().file_name().unwrap().to_string_lossy().into_owned();
+        let r = f2.path().file_name().unwrap().to_string_lossy().into_owned();
+        assert_eq!(label, format!("{l} \u{2194} {r}"));
+    }
+
+    #[test]
     fn editor_tabs_search_highlight_survives_close_then_open_via_preview() {
         // Reported bug: after closing the first tab with X, the next file
         // opened from search lost the yellow highlights. The new editor
@@ -2638,6 +2908,10 @@ impl Widget for &mut Editor {
             render_sheet(view, self.path.as_deref(), inner, buf);
             return;
         }
+        if let Some(diff) = self.diff.as_mut() {
+            render_diff(diff, inner, buf);
+            return;
+        }
         if self.cursor_row < self.scroll {
             self.scroll = self.cursor_row;
         } else if self.cursor_row >= self.scroll + height {
@@ -3100,6 +3374,46 @@ impl EditorTabs {
         Ok(())
     }
 
+    /// Open a side-by-side diff of two files in a fresh pinned tab next
+    /// to the active one. The new tab is read-only: edits, save, and the
+    /// text-rendering path are all bypassed via the `diff: Some(...)` flag
+    /// on the underlying Editor.
+    pub fn open_diff(&mut self, left: &Path, right: &Path) -> Result<()> {
+        let left_text = std::fs::read_to_string(left)
+            .with_context(|| format!("reading {}", left.display()))?;
+        let right_text = std::fs::read_to_string(right)
+            .with_context(|| format!("reading {}", right.display()))?;
+        let left_lines: Vec<String> =
+            left_text.lines().map(str::to_string).collect();
+        let right_lines: Vec<String> =
+            right_text.lines().map(str::to_string).collect();
+        let data = crate::widgets::diff::DiffData::build(
+            left.to_path_buf(),
+            right.to_path_buf(),
+            left_lines,
+            right_lines,
+        );
+
+        let mut e = Editor::new();
+        e.focused = self.editors[self.active].focused;
+        e.preview = false;
+        // The path is set so close-by-path lookups work; `diff` being Some
+        // is what diverts the renderer onto the side-by-side path.
+        e.path = Some(left.to_path_buf());
+        e.diff = Some(data);
+        // Reuse the blank-initial slot if the editor pane was empty;
+        // otherwise insert a new tab next to the active one.
+        if self.is_blank_initial() {
+            self.editors[self.active] = e;
+            return Ok(());
+        }
+        let pos = self.active + 1;
+        self.editors.insert(pos, e);
+        self.editors[self.active].focused = false;
+        self.active = pos;
+        Ok(())
+    }
+
     /// Pinned-tab open: if the file is already in some tab, pin and switch
     /// to it. Otherwise create a fresh pinned tab next to the active one.
     /// Used by double-click in the explorer and Ctrl+Enter on a tree row.
@@ -3256,6 +3570,19 @@ impl Widget for &mut EditorTabs {
 }
 
 fn tab_label(e: &Editor) -> String {
+    if let Some(diff) = e.diff.as_ref() {
+        let l = diff
+            .left_path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| String::from("?"));
+        let r = diff
+            .right_path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| String::from("?"));
+        return format!("{l} \u{2194} {r}");
+    }
     let name = match &e.path {
         Some(p) => p
             .file_name()
