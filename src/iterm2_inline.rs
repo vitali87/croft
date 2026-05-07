@@ -14,24 +14,27 @@ pub const WELCOME_LOGO_PNG: &[u8] =
 /// U+EB14) into a 192x192 RGBA PNG matching the other activity-bar source
 /// PNGs. Drawing it programmatically avoids shipping a separate asset file
 /// and guarantees the shape doesn't drift under SVG rasterizer differences.
+///
+/// Geometry follows the codicon SVG: a left-side trunk with rings at top
+/// and bottom, plus a third ring at the upper-right reached by a smooth
+/// curve sprouting from the trunk's midpoint. The curve (not a 90-degree
+/// elbow) is what gives the glyph its Y-fork silhouette; without it the
+/// shape reads as an inverted T.
 pub fn bake_source_control_src_png() -> Vec<u8> {
     let canvas_size: u32 = 192;
     let mut img: RgbaImage =
         ImageBuffer::from_pixel(canvas_size, canvas_size, Rgba([0, 0, 0, 0]));
     let white = Rgba([0xff, 0xff, 0xff, 0xff]);
 
-    // Two trunk nodes (top + bottom of the vertical line) and one branch
-    // node sprouting up-and-right from the middle of the trunk. Geometry
-    // mirrors the codicon source-control glyph.
-    let trunk_x: i32 = 64;
-    let top_y: i32 = 44;
-    let bot_y: i32 = 148;
-    let branch_x: i32 = 144;
-    let branch_y: i32 = 80;
+    let trunk_x: i32 = 56;
+    let top_y: i32 = 40;
+    let bot_y: i32 = 152;
+    let branch_x: i32 = 148;
+    let branch_y: i32 = 60;
     let r: i32 = 22;
     let stroke: i32 = 12;
 
-    // Vertical trunk between the two trunk nodes.
+    // Vertical trunk between the two trunk rings.
     fill_rect(
         &mut img,
         trunk_x - stroke / 2,
@@ -40,22 +43,26 @@ pub fn bake_source_control_src_png() -> Vec<u8> {
         bot_y - top_y,
         white,
     );
-    // Branch line from the trunk to the side node. Stroked thick segment so
-    // it reads at small sizes; a 90-degree elbow is plenty here.
-    fill_rect(
+    // Branch sprouts from the midpoint of the trunk and curves up-and-right
+    // to the side ring. Quadratic Bezier with the control point at the
+    // (branch_x, trunk_mid) corner makes the stroke leave the trunk
+    // horizontally and arrive at the side ring vertically — same
+    // tangents the codicon SVG draws.
+    let trunk_mid_y = (top_y + bot_y) / 2;
+    draw_quadratic_bezier(
         &mut img,
-        trunk_x,
-        branch_y - stroke / 2,
-        branch_x - trunk_x,
+        (trunk_x, trunk_mid_y),
+        (branch_x, trunk_mid_y),
+        (branch_x, branch_y),
         stroke,
         white,
     );
+
+    // Three outlined rings, knocked out at the centre so they don't read as
+    // solid dots.
     fill_circle(&mut img, trunk_x, top_y, r, white);
     fill_circle(&mut img, trunk_x, bot_y, r, white);
     fill_circle(&mut img, branch_x, branch_y, r, white);
-    // Knock out a smaller hole in each node so they read as rings, matching
-    // the codicon glyph's outlined-circle look. Without this they'd be
-    // solid dots.
     let inner_hole = Rgba([0, 0, 0, 0]);
     let inner_r = r - stroke / 2 - 1;
     fill_circle(&mut img, trunk_x, top_y, inner_r, inner_hole);
@@ -67,6 +74,30 @@ pub fn bake_source_control_src_png() -> Vec<u8> {
         .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
         .expect("encoding a 192x192 RGBA buffer to PNG cannot fail");
     out
+}
+
+/// Stroke a quadratic Bezier with a round pen of diameter `thickness`.
+fn draw_quadratic_bezier(
+    img: &mut RgbaImage,
+    p0: (i32, i32),
+    pc: (i32, i32),
+    p1: (i32, i32),
+    thickness: i32,
+    color: Rgba<u8>,
+) {
+    let steps = 96;
+    let r = thickness / 2;
+    for i in 0..=steps {
+        let t = i as f32 / steps as f32;
+        let omt = 1.0 - t;
+        let x = (omt * omt * p0.0 as f32
+            + 2.0 * omt * t * pc.0 as f32
+            + t * t * p1.0 as f32) as i32;
+        let y = (omt * omt * p0.1 as f32
+            + 2.0 * omt * t * pc.1 as f32
+            + t * t * p1.1 as f32) as i32;
+        fill_circle(img, x, y, r, color);
+    }
 }
 
 fn fill_rect(img: &mut RgbaImage, x: i32, y: i32, w: i32, h: i32, color: Rgba<u8>) {
@@ -397,14 +428,50 @@ mod tests {
         assert_eq!(decoded.width(), 192);
         assert_eq!(decoded.height(), 192);
         // Centroid of the trunk: should hit a fully opaque white stroke.
-        let trunk_pixel = decoded.get_pixel(64, 96).0;
+        let trunk_pixel = decoded.get_pixel(56, 96).0;
         assert_eq!(
             trunk_pixel[3], 0xff,
             "trunk midpoint must be drawn (alpha 255)"
         );
+        // Branch ring (upper-right) must be drawn — guards against the
+        // curve drifting off-canvas under future tweaks.
+        let branch_ring = decoded.get_pixel(148, 60).0;
+        assert!(
+            branch_ring[3] == 0x00 || branch_ring[3] == 0xff,
+            "branch ring center is either the knocked-out hole or filled stroke"
+        );
+        // The ring's stroke (one pen-radius outside the centre) must hit
+        // an opaque pixel.
+        let ring_edge = decoded.get_pixel(148 + 22, 60).0;
+        assert_eq!(
+            ring_edge[3], 0xff,
+            "branch ring edge at (170, 60) must be drawn"
+        );
         // Corner: should still be transparent so compose_icon's bg fills it.
         let corner = decoded.get_pixel(0, 0).0;
         assert_eq!(corner[3], 0x00, "outside the icon must stay transparent");
+    }
+
+    #[test]
+    fn baked_source_control_curve_leaves_trunk_midpoint_with_higher_branch_endpoint() {
+        // Regression on "inverted T": the branch must terminate ABOVE the
+        // trunk's midpoint, otherwise the silhouette reads as a T not a Y.
+        let bytes = bake_source_control_src_png();
+        let decoded = image::load_from_memory_with_format(&bytes, image::ImageFormat::Png)
+            .unwrap()
+            .to_rgba8();
+        let branch_y = 60u32;
+        let trunk_mid_y = ((40 + 152) / 2) as u32;
+        assert!(
+            branch_y < trunk_mid_y,
+            "branch ring at y={branch_y} must sit higher than the trunk midpoint at y={trunk_mid_y}"
+        );
+        // Pixel just inside the branch ring's stroke at its top edge.
+        let top_of_branch_ring = decoded.get_pixel(148, branch_y - 22).0;
+        assert_eq!(
+            top_of_branch_ring[3], 0xff,
+            "branch ring's top edge must be drawn",
+        );
     }
 
     #[test]
