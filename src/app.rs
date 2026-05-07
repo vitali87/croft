@@ -1511,10 +1511,18 @@ impl App {
                 Err(_) => continue,
             };
             for ev in events {
+                let mutates_content = event_mutates_content(&ev.event.kind);
                 for path in &ev.event.paths {
-                    // Editor reload trigger: any event mentioning the open
-                    // file's path, before we even classify it as a tree event.
-                    if self.editor.matches_open_path(path) {
+                    // Editor reload trigger: only events that mutate the
+                    // file's content. Access reads and metadata-only changes
+                    // (atime updates from `cat` / indexers / containerised
+                    // overlay filesystems) used to flip this flag too, which
+                    // reloaded the editor and wiped any in-flight selection
+                    // — confirmed empirically on a Linux remote where the
+                    // status bar repeatedly read "Reloaded README.md
+                    // (external change)" while the user was trying to
+                    // Cmd+A / Shift+Right / mouse-drag.
+                    if mutates_content && self.editor.matches_open_path(path) {
                         touched_open_file = true;
                     }
                     if let Some(dir) = crate::widgets::file_tree::affected_dir_for_event(
@@ -5698,6 +5706,21 @@ fn rect_contains(r: Rect, x: u16, y: u16) -> bool {
 const TERMINAL_ADD_LABEL: &str = " + ";
 const TERMINAL_CLOSE_LABEL: &str = " - ";
 
+/// Classify a notify `EventKind` as touching file content. Pure reads
+/// (`Access(_)`) and metadata-only mutations (`Modify(Metadata(_))` —
+/// chmod, chown, atime, xattr) leave bytes on disk unchanged and must
+/// not trigger an editor reload, otherwise the open buffer's selection
+/// is wiped on every benign indexer/atime update on Linux remotes.
+fn event_mutates_content(kind: &notify::EventKind) -> bool {
+    use notify::event::ModifyKind;
+    use notify::EventKind;
+    match kind {
+        EventKind::Access(_) => false,
+        EventKind::Modify(ModifyKind::Metadata(_)) => false,
+        _ => true,
+    }
+}
+
 /// True when croft was invoked over an SSH login (or otherwise inside a
 /// remote shell). Used to throttle PTY-driven redraws further so the SSH
 /// pipe never saturates and starves input handling on the same thread.
@@ -6079,6 +6102,131 @@ mod tests {
         assert!(app.drain_fs_events());
         assert_eq!(app.editor.lines, vec!["new content"]);
         assert!(!app.editor.dirty);
+    }
+
+    /// Watcher backends on Linux fire `Access(...)` events when croft (or any
+    /// other process) reads the open file — the inotify subsystem does not
+    /// distinguish a benign read from a real content change. Treating those
+    /// as "external change" reloads the editor, which clears `selection` and
+    /// kills any in-flight Cmd+A / mouse-drag / Shift+Right gesture. The
+    /// reload must only fire for events that mutate content.
+    #[test]
+    fn drain_fs_events_preserves_editor_selection_on_access_only_event() {
+        use notify::event::{AccessKind, AccessMode, EventKind};
+        use notify::Event as NotifyEvent;
+        use notify_debouncer_full::DebouncedEvent;
+        use std::sync::mpsc;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("readme.md");
+        std::fs::write(&file, "hello world\n").unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.editor.open_pinned(&file).unwrap();
+        app.editor.select_all();
+        assert!(
+            app.editor.selection.is_some(),
+            "precondition: selection set after select_all"
+        );
+
+        let (tx, rx) = mpsc::channel();
+        app._fs_watcher = None;
+        app.fs_watcher_init_rx = None;
+        app.git_status_init_rx = None;
+        app.fs_rx = Some(rx);
+        app.sync_open_file_poll_mtime();
+
+        let access_event = NotifyEvent::new(EventKind::Access(AccessKind::Open(AccessMode::Read)))
+            .add_path(file.clone());
+        tx.send(Ok(vec![DebouncedEvent::new(
+            access_event,
+            std::time::Instant::now(),
+        )]))
+        .unwrap();
+
+        app.drain_fs_events();
+        assert!(
+            app.editor.selection.is_some(),
+            "Access(Read) on the open file must not clobber editor selection"
+        );
+    }
+
+    /// Same class of spurious wake-up as the Access event, via the other
+    /// notify branch: `chmod`, `touch -a`, ownership changes, and xattr
+    /// updates surface as `Modify(Metadata(_))`. None mutate file content,
+    /// so none should trigger an editor reload that wipes selection.
+    #[test]
+    fn drain_fs_events_preserves_editor_selection_on_metadata_event() {
+        use notify::event::{EventKind, MetadataKind, ModifyKind};
+        use notify::Event as NotifyEvent;
+        use notify_debouncer_full::DebouncedEvent;
+        use std::sync::mpsc;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("readme.md");
+        std::fs::write(&file, "hello world\n").unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.editor.open_pinned(&file).unwrap();
+        app.editor.select_all();
+
+        let (tx, rx) = mpsc::channel();
+        app._fs_watcher = None;
+        app.fs_watcher_init_rx = None;
+        app.git_status_init_rx = None;
+        app.fs_rx = Some(rx);
+        app.sync_open_file_poll_mtime();
+
+        let metadata_event = NotifyEvent::new(EventKind::Modify(ModifyKind::Metadata(
+            MetadataKind::AccessTime,
+        )))
+        .add_path(file.clone());
+        tx.send(Ok(vec![DebouncedEvent::new(
+            metadata_event,
+            std::time::Instant::now(),
+        )]))
+        .unwrap();
+
+        app.drain_fs_events();
+        assert!(
+            app.editor.selection.is_some(),
+            "Modify(Metadata(AccessTime)) on the open file must not clobber editor selection"
+        );
+    }
+
+    /// Companion to the access-event test: a real content change still has to
+    /// trigger the reload, otherwise external edits would never refresh the
+    /// buffer. Guards against an over-broad fix that drops legitimate events.
+    #[test]
+    fn drain_fs_events_reloads_on_modify_data_event() {
+        use notify::event::{DataChange, EventKind, ModifyKind};
+        use notify::Event as NotifyEvent;
+        use notify_debouncer_full::DebouncedEvent;
+        use std::sync::mpsc;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("readme.md");
+        std::fs::write(&file, "old\n").unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.editor.open_pinned(&file).unwrap();
+
+        let (tx, rx) = mpsc::channel();
+        app._fs_watcher = None;
+        app.fs_watcher_init_rx = None;
+        app.git_status_init_rx = None;
+        app.fs_rx = Some(rx);
+        app.sync_open_file_poll_mtime();
+
+        std::fs::write(&file, "new content\n").unwrap();
+        let modify_event =
+            NotifyEvent::new(EventKind::Modify(ModifyKind::Data(DataChange::Content)))
+                .add_path(file.clone());
+        tx.send(Ok(vec![DebouncedEvent::new(
+            modify_event,
+            std::time::Instant::now(),
+        )]))
+        .unwrap();
+
+        app.drain_fs_events();
+        assert_eq!(app.editor.lines, vec!["new content"]);
     }
 
     #[test]
