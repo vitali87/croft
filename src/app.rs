@@ -146,6 +146,13 @@ const GIT_CLEAN_COLOR: Color = Color::Rgb(0xa3, 0xbe, 0x8c);
 const GIT_DIRTY_COLOR: Color = Color::Rgb(0xeb, 0xcb, 0x8b);
 const FS_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
+/// Top-level directory names that the FS watcher must NOT descend into.
+/// Each lives behind a macOS TCC class (`kTCCServiceSystemPolicyAppData`,
+/// `kTCCServiceSystemPolicyContainersGroups`, etc.); statting their
+/// contents from a non-owning process trips the App Management privacy
+/// prompt for the responsible parent terminal.
+const FS_WATCH_PROTECTED_NAMES: &[&str] = &["Library", ".Trash"];
+
 /// Build the status-bar spans for the git pill: branch glyph, branch name,
 /// optional ahead/behind counts.  Colour alone carries clean/dirty state, in
 /// the spirit of the Agnoster zsh theme.  Returns an empty vec outside a git
@@ -1176,9 +1183,47 @@ impl App {
         let (tx, rx) = std::sync::mpsc::channel();
         let mut debouncer = new_debouncer(Duration::from_millis(100), None, tx)
             .context("creating filesystem watcher")?;
-        debouncer
-            .watch(root, RecursiveMode::Recursive)
-            .context("starting watch on workspace root")?;
+        // notify_debouncer_full's FileIdMap walks `WalkDir(usize::MAX)` on
+        // watcher creation and `stat()`s every file. When the workspace is
+        // `$HOME`, that descent enters `~/Library/Containers/<bundle>/Data`
+        // and `~/Library/Group Containers/...`, which macOS Sonoma's
+        // App Management TCC class flags as "iTerm.app accessing data
+        // from other apps." Diagnostic-confirmed root cause; verified by
+        // disabling the watcher and watching the prompt stop.
+        //
+        // Workaround: if any TCC-protected directory sits at the top level
+        // of the workspace, watch the root non-recursively and recursively-
+        // watch each safe sibling instead. Identical event coverage minus
+        // the protected subtrees.
+        let entries: Vec<std::fs::DirEntry> = std::fs::read_dir(root)
+            .map(|rd| rd.filter_map(Result::ok).collect())
+            .unwrap_or_default();
+        let needs_split = entries
+            .iter()
+            .any(|e| FS_WATCH_PROTECTED_NAMES.iter().any(|n| e.file_name() == *n));
+        if needs_split {
+            debouncer
+                .watch(root, RecursiveMode::NonRecursive)
+                .context("starting non-recursive watch on workspace root")?;
+            for entry in entries {
+                let name = entry.file_name();
+                if FS_WATCH_PROTECTED_NAMES.iter().any(|n| name == *n) {
+                    continue;
+                }
+                let path = entry.path();
+                let is_dir = entry
+                    .file_type()
+                    .map(|ft| ft.is_dir())
+                    .unwrap_or_else(|_| path.is_dir());
+                if is_dir {
+                    let _ = debouncer.watch(&path, RecursiveMode::Recursive);
+                }
+            }
+        } else {
+            debouncer
+                .watch(root, RecursiveMode::Recursive)
+                .context("starting watch on workspace root")?;
+        }
         Ok((debouncer, rx))
     }
 
@@ -5645,6 +5690,43 @@ mod tests {
 
     fn key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, mods)
+    }
+
+    #[test]
+    fn fs_watcher_does_not_descend_into_protected_top_level_dirs() {
+        // Regression for the macOS App Management TCC prompt: when the
+        // workspace contains a `Library` subdir at the top level (as $HOME
+        // does), the watcher must not call WalkDir+stat into it. Asserted
+        // here by making `Library` unreadable (mode 000): a recursive
+        // watch would fail spawning because notify_debouncer_full would
+        // hit a permission error inside the walk; our split-watch path
+        // skips Library entirely and starts cleanly.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("src")).unwrap();
+        std::fs::write(tmp.path().join("src").join("a.txt"), "hi").unwrap();
+        let library = tmp.path().join("Library");
+        std::fs::create_dir(&library).unwrap();
+        std::fs::create_dir(library.join("Containers")).unwrap();
+        std::fs::write(library.join("Containers").join("payload"), "x").unwrap();
+        // Mode 000 makes any descent fail; if the watcher were to descend,
+        // the WalkDir/stat would error during cache init.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&library, std::fs::Permissions::from_mode(0o000)).unwrap();
+        }
+        let result = App::spawn_fs_watcher(tmp.path());
+        // Restore perms so tempdir cleanup works.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ =
+                std::fs::set_permissions(&library, std::fs::Permissions::from_mode(0o755));
+        }
+        assert!(
+            result.is_ok(),
+            "watcher must skip protected dirs and start cleanly"
+        );
     }
 
     #[test]
