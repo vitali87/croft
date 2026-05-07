@@ -1611,6 +1611,19 @@ impl App {
             area,
         );
 
+        // Paint the leftmost column of the editor area as a visible vertical
+        // seam so the sidebar splitter is perceptible even before a file is
+        // opened. Without this, the welcome bg fills `area.x` and users can't
+        // tell the explorer is resizable. Matches the file-tree's unfocused
+        // border tone so the two panes look mirrored.
+        if area.width > 0 && self.show_tree {
+            let buf = frame.buffer_mut();
+            let seam_style = Style::default().fg(Color::DarkGray);
+            for row in 0..area.height {
+                buf.set_string(area.x, area.y + row, "│", seam_style);
+            }
+        }
+
         // Layout regions, top-to-bottom:
         //   [logo + version badge]
         //   [tagline]
@@ -3834,7 +3847,11 @@ impl App {
                 // resize drag instead of falling through to the underlying
                 // pane's click handler.
                 if let Some(x) = self.sidebar_splitter_x {
-                    if m.column == x {
+                    // Two-column hit-zone: the seam itself (`x`, the editor's
+                    // left edge) and one column to the left (the tree's right
+                    // border). Either grab starts a sidebar drag — a 1-cell
+                    // target is too easy to miss.
+                    if m.column == x || m.column == x.saturating_sub(1) {
                         self.splitter_drag = Some(SplitterDrag::Sidebar);
                         return;
                     }
@@ -8248,6 +8265,51 @@ mod tests {
             modifiers: KeyModifiers::NONE,
         });
         assert!(app.splitter_drag.is_none());
+    }
+
+    #[test]
+    fn sidebar_drag_grabs_one_column_left_of_seam() {
+        // The seam is a single column wide. To make it easier to grab (and
+        // to mirror the visible pair of borders the user sees), a click on
+        // the cell immediately to its left also starts the drag.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.sidebar_splitter_x = Some(36);
+        app.last_content_width = 60;
+        app.last_content_height = 20;
+        app.sidebar_width = 32;
+        app.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: 35,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.splitter_drag, Some(SplitterDrag::Sidebar));
+    }
+
+    #[test]
+    fn welcome_paints_visible_splitter_seam_at_editor_left_edge() {
+        // Without a visible cell at the splitter column, users on the
+        // welcome page can't perceive that the explorer is resizable.
+        // Regression guard: the welcome render must paint the editor's
+        // leftmost column with a vertical-bar glyph.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        let backend = ratatui::backend::TestBackend::new(120, 40);
+        let mut term = ratatui::Terminal::new(backend).unwrap();
+        let area = ratatui::layout::Rect::new(40, 0, 80, 40);
+        term.draw(|f| app.render_welcome(f, area)).unwrap();
+        let buf = term.backend().buffer();
+        let mut found = 0;
+        for y in area.y..area.y + area.height {
+            if buf[(area.x, y)].symbol() == "│" {
+                found += 1;
+            }
+        }
+        assert!(
+            found >= area.height as usize / 2,
+            "expected the splitter seam to be painted on most rows, found {found}"
+        );
     }
 
     #[test]
