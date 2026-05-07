@@ -3885,7 +3885,11 @@ impl App {
                     }
                 }
                 if let Some(y) = self.terminal_splitter_y {
-                    if m.row == y {
+                    // Two-row hit-zone: the terminal's top border (`y`) and
+                    // the editor / welcome's bottom border (`y - 1`).
+                    // Symmetric with the sidebar drag — either edge of the
+                    // visible seam grabs the splitter.
+                    if m.row == y || m.row == y.saturating_sub(1) {
                         self.splitter_drag = Some(SplitterDrag::Terminal);
                         return;
                     }
@@ -8390,6 +8394,26 @@ mod tests {
             modifiers: KeyModifiers::NONE,
         });
         assert_eq!(app.terminal_height, Some(10));
+    }
+
+    #[test]
+    fn terminal_drag_grabs_one_row_above_seam() {
+        // The terminal splitter sits on the terminal's top border row, but
+        // the editor / welcome bottom border row (one row above) is also a
+        // grabbable handle — symmetric with the sidebar's two-column zone.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.terminal_splitter_y = Some(15);
+        app.last_content_height = 20;
+        app.last_content_width = 60;
+        app.terminal_height = Some(5);
+        app.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: 50,
+            row: 14,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.splitter_drag, Some(SplitterDrag::Terminal));
     }
 
     #[test]
