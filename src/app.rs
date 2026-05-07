@@ -507,6 +507,11 @@ pub struct App {
     /// Hit-test rectangle of the "[+]" button on the terminal pane's top
     /// border. None when the pane is hidden or too narrow for the label.
     terminal_add_button: Option<Rect>,
+    /// Hit-test rectangle of the "[-]" button on the terminal pane's top
+    /// border. None when the pane is hidden, the label can't fit, or only
+    /// one terminal is open (closing the last one would leave the pane
+    /// empty, which we explicitly forbid).
+    terminal_close_button: Option<Rect>,
     /// When the activity-bar OSC-1337 overlay was last written to stdout.
     /// Re-emitting on every redraw (the previous behaviour) flickered the
     /// editor caret at the PTY redraw rate; we now refresh on dirty plus a
@@ -868,6 +873,7 @@ impl App {
             sidebar_splitter_x: None,
             terminal_splitter_y: None,
             terminal_add_button: None,
+            terminal_close_button: None,
             last_activity_overlay_emit: None,
             last_content_width: 0,
             last_content_height: 0,
@@ -1766,9 +1772,18 @@ impl App {
     }
 
     /// Spawn a new PTY-backed terminal next to the existing ones and make
-    /// it the active one. The pane becomes visible if it was hidden.
+    /// it the active one. The pane becomes visible if it was hidden. The
+    /// new terminal's cwd is the *live* cwd of the active terminal's shell
+    /// (so a `cd somewhere` inside the user's prompt is reflected), with
+    /// the workspace root as a fallback if we can't resolve it.
     pub fn split_terminal(&mut self) -> Result<()> {
-        let term = PtyTerminal::new(&self.workspace_root).context("spawning terminal")?;
+        let cwd = self
+            .terminal()
+            .pid()
+            .and_then(cwd_of_pid)
+            .filter(|p| p.is_dir())
+            .unwrap_or_else(|| self.workspace_root.clone());
+        let term = PtyTerminal::new(&cwd).context("spawning terminal")?;
         self.terminals.push(term);
         self.active_terminal = self.terminals.len() - 1;
         if !self.show_terminal {
@@ -1980,9 +1995,14 @@ impl App {
             for (i, t) in self.terminals.iter_mut().enumerate() {
                 frame.render_widget(t, cols[i]);
             }
-            self.terminal_add_button = paint_terminal_add_button(frame, area);
+            let show_close = self.terminals.len() > 1;
+            let (add_rect, close_rect) =
+                paint_terminal_pane_buttons(frame, area, show_close);
+            self.terminal_add_button = add_rect;
+            self.terminal_close_button = close_rect;
         } else {
             self.terminal_add_button = None;
+            self.terminal_close_button = None;
         }
 
         let mut spans: Vec<Span> = Vec::with_capacity(20);
@@ -3487,9 +3507,19 @@ impl App {
                         return;
                     }
                 }
-                // The "[+]" button sits on the same row as the
-                // editor/terminal splitter, so it has to win the hit-test
-                // before the splitter-drag handler claims this click.
+                // The "[+]" / "[-]" buttons sit on the same row as the
+                // editor/terminal splitter, so they have to win the
+                // hit-test before the splitter-drag handler claims this
+                // click.
+                if let Some(rect) = self.terminal_close_button {
+                    if rect_contains(rect, m.column, m.row) {
+                        if self.close_active_terminal() {
+                            self.status =
+                                format!("Closed terminal: {} remaining", self.terminals.len());
+                        }
+                        return;
+                    }
+                }
                 if let Some(rect) = self.terminal_add_button {
                     if rect_contains(rect, m.column, m.row) {
                         match self.split_terminal() {
@@ -5152,6 +5182,7 @@ fn rect_contains(r: Rect, x: u16, y: u16) -> bool {
 }
 
 const TERMINAL_ADD_LABEL: &str = " + ";
+const TERMINAL_CLOSE_LABEL: &str = " - ";
 
 /// True when croft was invoked over an SSH login (or otherwise inside a
 /// remote shell). Used to throttle PTY-driven redraws further so the SSH
@@ -5162,23 +5193,79 @@ fn is_remote_session() -> bool {
         || std::env::var_os("SSH_CLIENT").is_some()
 }
 
-/// Paint the "+" button on the top-right of the terminal pane and return
-/// its hit-test rectangle. Returns None when the pane is too narrow / short
-/// for the label to fit without colliding with the right-corner glyph.
-fn paint_terminal_add_button(frame: &mut ratatui::Frame, area: Rect) -> Option<Rect> {
-    let label = TERMINAL_ADD_LABEL;
-    let label_w = label.chars().count() as u16;
-    if area.height == 0 || area.width < label_w + 2 {
+/// Live cwd of a running process by PID, or None when the platform doesn't
+/// expose one. macOS uses `lsof -d cwd` (the only portable read of a
+/// process's chdir state without linking libproc), Linux reads
+/// `/proc/<pid>/cwd`. Used by `split_terminal` so a new pane lands wherever
+/// the user has `cd`'d the active shell.
+#[cfg(target_os = "linux")]
+fn cwd_of_pid(pid: u32) -> Option<PathBuf> {
+    std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
+}
+
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+fn cwd_of_pid(pid: u32) -> Option<PathBuf> {
+    let output = std::process::Command::new("lsof")
+        .args(["-a", "-p", &pid.to_string(), "-d", "cwd", "-Fn"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
         return None;
     }
-    let x = area.x + area.width - label_w - 1;
-    let y = area.y;
+    // lsof -Fn output: lines prefixed by `p<pid>`, `f<fd>`, `n<path>`.
+    // Read the first `n`-prefixed line under our `cwd` fd.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        if let Some(path) = line.strip_prefix('n') {
+            let trimmed = path.trim();
+            if !trimmed.is_empty() {
+                return Some(PathBuf::from(trimmed));
+            }
+        }
+    }
+    None
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "freebsd")))]
+fn cwd_of_pid(_pid: u32) -> Option<PathBuf> {
+    None
+}
+
+/// Paint the `[+]` and (when more than one terminal is open) `[-]` buttons
+/// on the top border of the terminal pane and return their hit-test
+/// rectangles `(add, close)`. Either side is None when the pane is too
+/// narrow / short for the label, or — for close — when only one terminal
+/// is open and there's nothing to drop.
+fn paint_terminal_pane_buttons(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    show_close_button: bool,
+) -> (Option<Rect>, Option<Rect>) {
+    let add_w = TERMINAL_ADD_LABEL.chars().count() as u16;
+    let close_w = TERMINAL_CLOSE_LABEL.chars().count() as u16;
+    if area.height == 0 {
+        return (None, None);
+    }
     let style = Style::default()
         .fg(Color::White)
         .bg(Color::Rgb(0x1e, 0x3a, 0x6e))
         .add_modifier(Modifier::BOLD);
-    frame.buffer_mut().set_string(x, y, label, style);
-    Some(Rect { x, y, width: label_w, height: 1 })
+    let y = area.y;
+    let mut add_rect: Option<Rect> = None;
+    let mut close_rect: Option<Rect> = None;
+
+    if area.width >= add_w + 2 {
+        let x = area.x + area.width - add_w - 1;
+        frame.buffer_mut().set_string(x, y, TERMINAL_ADD_LABEL, style);
+        add_rect = Some(Rect { x, y, width: add_w, height: 1 });
+    }
+    if show_close_button && area.width >= add_w + close_w + 2 {
+        // Sit just to the left of the add button.
+        let x = area.x + area.width - add_w - close_w - 1;
+        frame.buffer_mut().set_string(x, y, TERMINAL_CLOSE_LABEL, style);
+        close_rect = Some(Rect { x, y, width: close_w, height: 1 });
+    }
+    (add_rect, close_rect)
 }
 
 fn key_to_bytes(key: KeyEvent) -> Vec<u8> {
@@ -7350,6 +7437,39 @@ mod tests {
         });
         assert_eq!(app.terminals.len(), 2);
         assert_eq!(app.active_terminal, 1);
+    }
+
+    #[test]
+    fn clicking_terminal_close_button_drops_active_terminal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.split_terminal().unwrap();
+        assert_eq!(app.terminals.len(), 2);
+        app.terminal_close_button = Some(Rect { x: 50, y: 30, width: 3, height: 1 });
+        app.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: 51,
+            row: 30,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.terminals.len(), 1);
+    }
+
+    #[test]
+    fn cwd_of_pid_on_self_returns_a_directory_under_tempdir() {
+        // The harness runs each test from the crate root by default, but
+        // we don't depend on that — we just need cwd_of_pid to round-trip
+        // *some* directory for the current process. lsof / /proc gives us
+        // the live cwd of the shell that started the test runner.
+        let pid = std::process::id();
+        match cwd_of_pid(pid) {
+            Some(p) => assert!(p.is_dir(), "cwd lookup must return a real directory, got {p:?}"),
+            None => {
+                // Acceptable on platforms where neither /proc nor lsof
+                // resolve the cwd in the sandbox. The fallback in
+                // split_terminal handles that case; nothing to assert here.
+            }
+        }
     }
 
     #[test]

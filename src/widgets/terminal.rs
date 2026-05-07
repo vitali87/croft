@@ -148,6 +148,13 @@ impl PtyTerminal {
         self.pty_dirty.swap(false, Ordering::AcqRel)
     }
 
+    /// Process ID of the shell running inside this terminal, when the
+    /// platform exposes one. Used to look up the live cwd so a new split
+    /// inherits the directory the user has `cd`'d into.
+    pub fn pid(&self) -> Option<u32> {
+        self._child.process_id()
+    }
+
     /// Read the dirty flag without clearing it. Lets the main loop decide
     /// whether to redraw now or coalesce, without losing the signal if we
     /// choose to skip this iteration.
