@@ -1890,7 +1890,7 @@ impl App {
             let dim = Style::default().fg(Color::Rgb(0x6c, 0x7d, 0x9c));
             let link_style = Style::default()
                 .fg(Color::Rgb(0x4e, 0x9a, 0xff))
-                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+                .add_modifier(Modifier::BOLD);
 
             // Header row: "▎ RECENT ACTIVITY".
             let header_y = inner_y;
@@ -2527,9 +2527,7 @@ impl App {
             ratatui::text::Line::from(""),
             ratatui::text::Line::from(ratatui::text::Span::styled(
                 truncate_for_display(url, inner.width as usize),
-                Style::default()
-                    .fg(Color::Rgb(0x4e, 0x9a, 0xff))
-                    .add_modifier(Modifier::UNDERLINED),
+                Style::default().fg(Color::Rgb(0x4e, 0x9a, 0xff)),
             )),
             ratatui::text::Line::from(""),
             ratatui::text::Line::from(vec![
@@ -6386,6 +6384,40 @@ mod tests {
         // Sanity: a fitting rect still draws.
         paint_gradient_box(&mut buf, off_top_left);
         assert_eq!(buf[(0, 0)].symbol(), "\u{256d}");
+    }
+
+    #[test]
+    /// The user dislikes underlined links in the welcome panel; the blue
+    /// foreground colour already signals "clickable", and the underline
+    /// adds visual noise (especially under the Codeberg logo overlay).
+    /// Assert the rendered buffer contains zero cells with the UNDERLINED
+    /// modifier so this preference is enforced by the test suite.
+    #[test]
+    fn welcome_panel_renders_without_any_underlined_cells() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.recent_repo_remote = Some("https://codeberg.org/vitali87/croft".to_string());
+        app.recent_commits = vec![crate::git::CommitInfo {
+            hash: "abc1234".to_string(),
+            full_hash: "abc1234fffffffffffffffffffffffffffffffffff".to_string(),
+            when: "1 hour ago".to_string(),
+            subject: "feat: do thing".to_string(),
+        }];
+        let area = Rect { x: 0, y: 0, width: 120, height: 30 };
+        let backend = ratatui::backend::TestBackend::new(area.width, area.height);
+        let mut term = ratatui::Terminal::new(backend).unwrap();
+        term.draw(|f| app.render_welcome(f, area)).unwrap();
+        let buffer = term.backend().buffer();
+        for y in 0..area.height {
+            for x in 0..area.width {
+                let cell = &buffer[(x, y)];
+                assert!(
+                    !cell.modifier.contains(Modifier::UNDERLINED),
+                    "cell at ({x}, {y}) symbol={:?} has UNDERLINED set; the welcome panel must render no underlines",
+                    cell.symbol()
+                );
+            }
+        }
     }
 
     #[test]
