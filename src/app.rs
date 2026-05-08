@@ -444,6 +444,13 @@ pub struct App {
     /// during welcome render; consumed post-draw. `None` when the welcome
     /// panel isn't visible or the open repo isn't on Codeberg.
     welcome_codeberg_badge_cell: Option<(u16, u16)>,
+    /// Cell where the Codeberg badge image was actually painted on the
+    /// previous redraw. Used to wipe the OLD position before re-emitting
+    /// at a new one after a resize: iTerm2's OSC-1337 image cells survive
+    /// `terminal.clear()` and a plain SGR overwrite, so without explicitly
+    /// stamping blanks at the old cell pair the logo "ghosts" mid-screen
+    /// when the welcome layout shifts.
+    welcome_codeberg_badge_last_emitted: Option<(u16, u16)>,
     /// Last mouse-down on the editor pane: `(when, column, row)`. Used to
     /// detect a double-click as two left-down events at the same cell within
     /// `DOUBLE_CLICK_WINDOW`. Cleared when the next click lands elsewhere or
@@ -1002,6 +1009,7 @@ impl App {
             activity_images: None,
             welcome_codeberg_badge_osc: None,
             welcome_codeberg_badge_cell: None,
+            welcome_codeberg_badge_last_emitted: None,
             last_editor_left_down: None,
             last_tree_left_down: None,
             scrollbar_drag: None,
@@ -1195,6 +1203,73 @@ impl App {
             ((scm_block.x, scm_block.y), scm_state.as_str()),
             ((rem_block.x, rem_block.y), rem_state.as_str()),
         ]
+    }
+
+    /// Paint the Codeberg badge OSC-1337 image at its current welcome-panel
+    /// cell, after first wiping any previous emit position. iTerm2 keeps
+    /// image cells in a layer that survives plain SGR redraws, so when
+    /// `welcome_codeberg_badge_cell` changes (window resize, sidebar
+    /// toggle, terminal-pane open/close) the *old* image stays on screen
+    /// unless we explicitly stamp blanks over it. Idempotent: when the
+    /// badge cell hasn't moved we just re-emit at the same position to
+    /// outlast iTerm2's image-cache eviction under heavy SGR traffic.
+    pub fn flush_welcome_codeberg_badge_overlay(&mut self) {
+        use std::io::Write;
+        if !self.editor.is_blank_initial() {
+            // Welcome panel hidden: clear any previous emit and stop
+            // re-emitting until we're back on the welcome screen.
+            if let Some((px, py)) = self.welcome_codeberg_badge_last_emitted.take() {
+                let mut out = stdout();
+                let cursor_on = self.cursor_should_be_visible();
+                let _ = write!(out, "\x1b[?25l\x1b[s");
+                let _ = write!(out, "\x1b[{};{}H  ", py + 1, px + 1);
+                let _ = write!(out, "\x1b[u");
+                if cursor_on {
+                    let _ = write!(out, "\x1b[?25h");
+                }
+                let _ = out.flush();
+            }
+            return;
+        }
+        let Some(osc) = self.welcome_codeberg_badge_osc.as_deref() else {
+            return;
+        };
+        let Some((cx, cy)) = self.welcome_codeberg_badge_cell else {
+            // Welcome visible but provider isn't Codeberg: still need to
+            // wipe a stale prior emit (e.g. user just changed providers
+            // without restart, or layout collapsed the badge row).
+            if let Some((px, py)) = self.welcome_codeberg_badge_last_emitted.take() {
+                let mut out = stdout();
+                let cursor_on = self.cursor_should_be_visible();
+                let _ = write!(out, "\x1b[?25l\x1b[s");
+                let _ = write!(out, "\x1b[{};{}H  ", py + 1, px + 1);
+                let _ = write!(out, "\x1b[u");
+                if cursor_on {
+                    let _ = write!(out, "\x1b[?25h");
+                }
+                let _ = out.flush();
+            }
+            return;
+        };
+        let mut out = stdout();
+        let cursor_on = self.cursor_should_be_visible();
+        let _ = write!(out, "\x1b[?25l\x1b[s");
+        // If the cell moved since the last emit, stamp blanks over the
+        // previous position first so the old logo doesn't ghost-overlay
+        // the freshly-drawn welcome layout.
+        if let Some((px, py)) = self.welcome_codeberg_badge_last_emitted {
+            if (px, py) != (cx, cy) {
+                let _ = write!(out, "\x1b[{};{}H  ", py + 1, px + 1);
+            }
+        }
+        let _ = write!(out, "\x1b[{};{}H", cy + 1, cx + 1);
+        let _ = out.write_all(osc.as_bytes());
+        let _ = write!(out, "\x1b[u");
+        if cursor_on {
+            let _ = write!(out, "\x1b[?25h");
+        }
+        let _ = out.flush();
+        self.welcome_codeberg_badge_last_emitted = Some((cx, cy));
     }
 
     /// Reset the blink phase so the caret is solidly visible for the next
@@ -6387,6 +6462,61 @@ mod tests {
     }
 
     #[test]
+    /// On terminal resize the welcome layout shifts, so
+    /// `welcome_codeberg_badge_cell` moves. iTerm2's OSC-1337 image cells
+    /// survive plain SGR redraws, so without explicit cleanup the old
+    /// logo "ghosts" mid-screen. The flush method must record the last
+    /// emit cell, wipe it on move, and clear it when the welcome panel
+    /// goes away (file opened, or provider switches off Codeberg).
+    #[test]
+    fn flush_welcome_codeberg_badge_overlay_tracks_last_emitted_cell_across_resizes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        // Stub a baked OSC so the flush has something to "emit". The
+        // bytes never reach a real terminal in tests — we're checking
+        // the bookkeeping, not the wire format.
+        app.welcome_codeberg_badge_osc = Some("\x1b]1337;File=...\x07".to_string());
+
+        // Initial render of welcome panel: badge anchored at (10, 5).
+        app.welcome_codeberg_badge_cell = Some((10, 5));
+        app.flush_welcome_codeberg_badge_overlay();
+        assert_eq!(
+            app.welcome_codeberg_badge_last_emitted,
+            Some((10, 5)),
+            "after the first flush the last-emitted cell must match the target cell"
+        );
+
+        // Simulate a window resize that shifts the welcome panel right.
+        app.welcome_codeberg_badge_cell = Some((20, 8));
+        app.flush_welcome_codeberg_badge_overlay();
+        assert_eq!(
+            app.welcome_codeberg_badge_last_emitted,
+            Some((20, 8)),
+            "after a resize the last-emitted cell must update to the new target so the next resize knows where to wipe"
+        );
+
+        // Repeated flush at the same cell is a no-op for tracking.
+        app.flush_welcome_codeberg_badge_overlay();
+        assert_eq!(
+            app.welcome_codeberg_badge_last_emitted,
+            Some((20, 8)),
+            "re-emitting at the same cell must not change tracking"
+        );
+
+        // User opens a file: welcome panel hides, badge cell cleared,
+        // and the next flush must drop the last-emitted record so the
+        // image cells are wiped and not re-emitted.
+        let file = tmp.path().join("README.md");
+        std::fs::write(&file, "hi").unwrap();
+        app.editor.open_pinned(&file).unwrap();
+        app.welcome_codeberg_badge_cell = None;
+        app.flush_welcome_codeberg_badge_overlay();
+        assert_eq!(
+            app.welcome_codeberg_badge_last_emitted, None,
+            "leaving the welcome panel must clear the last-emitted record so a future welcome render starts fresh"
+        );
+    }
+
     /// The user dislikes underlined links in the welcome panel; the blue
     /// foreground colour already signals "clickable", and the underline
     /// adds visual noise (especially under the Codeberg logo overlay).
@@ -9233,23 +9363,7 @@ fn main_loop(
             // burst can evict them in iTerm2's cache. Only fires when the
             // welcome panel is visible, the open repo is on Codeberg, and
             // we successfully baked the icon at init time.
-            if app.editor.is_blank_initial() {
-                if let (Some(osc), Some((cx, cy))) =
-                    (app.welcome_codeberg_badge_osc.as_deref(), app.welcome_codeberg_badge_cell)
-                {
-                    use std::io::Write;
-                    let mut out = stdout();
-                    let cursor_on = app.cursor_should_be_visible();
-                    let _ = write!(out, "\x1b[?25l\x1b[s");
-                    let _ = write!(out, "\x1b[{};{}H", cy + 1, cx + 1);
-                    let _ = out.write_all(osc.as_bytes());
-                    let _ = write!(out, "\x1b[u");
-                    if cursor_on {
-                        let _ = write!(out, "\x1b[?25h");
-                    }
-                    let _ = out.flush();
-                }
-            }
+            app.flush_welcome_codeberg_badge_overlay();
             // Welcome-screen logo: same OSC-1337 trick, gated by its own
             // dirty flag and only emitted while the editor pane is in its
             // blank initial state.
