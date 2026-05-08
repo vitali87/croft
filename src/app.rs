@@ -1707,6 +1707,7 @@ impl App {
 
     fn render_welcome(&mut self, frame: &mut ratatui::Frame, outer_area: Rect) {
         self.welcome_links.clear();
+        self.welcome_codeberg_badge_cell = None;
         if outer_area.width == 0 || outer_area.height == 0 {
             return;
         }
@@ -6514,6 +6515,32 @@ mod tests {
         assert_eq!(
             app.welcome_codeberg_badge_last_emitted, None,
             "leaving the welcome panel must clear the last-emitted record so a future welcome render starts fresh"
+        );
+    }
+
+    #[test]
+    fn render_welcome_clears_codeberg_badge_cell_when_recents_box_collapses() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.recent_repo_remote = Some("https://codeberg.org/vitali87/croft".to_string());
+        app.welcome_codeberg_badge_osc = Some("\x1b]1337;File=...\x07".to_string());
+
+        let tall = Rect { x: 0, y: 0, width: 120, height: 30 };
+        let backend = ratatui::backend::TestBackend::new(tall.width, tall.height);
+        let mut term = ratatui::Terminal::new(backend).unwrap();
+        term.draw(|f| app.render_welcome(f, tall)).unwrap();
+        assert!(
+            app.welcome_codeberg_badge_cell.is_some(),
+            "with a tall welcome area the recents box must fit and the badge cell must be set so the flush emits the OSC-1337 image"
+        );
+
+        let tight = Rect { x: 0, y: 0, width: 120, height: 10 };
+        let backend = ratatui::backend::TestBackend::new(tight.width, tight.height);
+        let mut term = ratatui::Terminal::new(backend).unwrap();
+        term.draw(|f| app.render_welcome(f, tight)).unwrap();
+        assert_eq!(
+            app.welcome_codeberg_badge_cell, None,
+            "when the recents box can't fit, the badge cell must reset to None so the post-draw flush wipes the stale image instead of re-emitting at the prior anchor"
         );
     }
 
