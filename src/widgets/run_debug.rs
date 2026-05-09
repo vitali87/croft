@@ -13,16 +13,24 @@ const BODY_FG_RGB: (u8, u8, u8) = (0xb0, 0xb8, 0xc8);
 const TITLE_FG_RGB: (u8, u8, u8) = (0xff, 0xff, 0xff);
 const FOCUS_BORDER_RGB: (u8, u8, u8) = (0x4e, 0x9a, 0xff);
 
-/// Cells reserved above the headline for the codicon `debug-alt` glyph.
-/// One cell wide, three rows tall: the glyph sits on the centre row, with
-/// the surrounding rows acting as visual breathing room. We previously
-/// rendered this as a 6×3 OSC-1337 image overlay but iTerm2's image cells
-/// survive every reasonable wipe attempt (\x1b[2J, space-stamp, fresh
-/// OSC at the same rect), leaving the icon ghosting on top of whichever
-/// panel came next; rendering the codicon through ratatui's normal text
-/// path lets the diff evict it cleanly on view changes.
-pub const RUN_DEBUG_ICON_CELLS_W: u16 = 1;
+/// Cells reserved above the headline for the bug+play emblem. Twelve
+/// cells wide × three cells tall. Each cell encodes two vertical pixels
+/// via Unicode half-block characters (`▀`, `▄`, `█`), giving a 12×6
+/// pixel grid that's recognisable as a bug-on-the-left + play-triangle-
+/// on-the-right silhouette without requiring an OSC-1337 inline image
+/// (which iTerm2 refuses to evict on view changes).
+pub const RUN_DEBUG_ICON_CELLS_W: u16 = 12;
 pub const RUN_DEBUG_ICON_CELLS_H: u16 = 3;
+
+/// Three-row half-block-pixel rendering of the codicon `debug-alt`
+/// silhouette: bug body (lower-left) + play triangle (right). Painted
+/// directly into ratatui's buffer at the panel's icon area; ratatui's
+/// diff evicts every cell cleanly when the sidebar view changes.
+const RUN_DEBUG_ICON_ART: [&str; 3] = [
+    "       █▄   ",
+    "▄██▄   ███▄ ",
+    "▀███▀  ██▀  ",
+];
 
 pub struct RunDebugPanel {
     pub focused: bool,
@@ -136,20 +144,19 @@ impl Widget for &mut RunDebugPanel {
 
         if icon_h > 0 && y + icon_h <= inner.y + inner.height {
             let icon_x = inner.x + (inner.width.saturating_sub(icon_w)) / 2;
-            // Centre the codicon `debug-alt` (U+EB91) on the middle row
-            // of the reserved icon block; the rows above and below stay
-            // blank for breathing room. Painting the glyph through
-            // ratatui (no OSC-1337) means the next sidebar redraw
-            // evicts it cleanly via the buffer diff.
-            let glyph_y = y + icon_h / 2;
-            buf.set_string(
-                icon_x,
-                glyph_y,
-                "\u{eb91}",
-                Style::default()
-                    .fg(Color::Rgb(BODY_FG_RGB.0, BODY_FG_RGB.1, BODY_FG_RGB.2))
-                    .add_modifier(Modifier::BOLD),
-            );
+            // Paint the half-block bug+play silhouette into ratatui's
+            // buffer one row at a time. Each row is exactly icon_w
+            // cells wide; the next sidebar's render overwrites them
+            // through the diff with no special handling required.
+            let icon_style = Style::default()
+                .fg(Color::Rgb(BODY_FG_RGB.0, BODY_FG_RGB.1, BODY_FG_RGB.2))
+                .add_modifier(Modifier::BOLD);
+            for (row_idx, art_row) in RUN_DEBUG_ICON_ART.iter().enumerate() {
+                if (row_idx as u16) >= icon_h {
+                    break;
+                }
+                buf.set_string(icon_x, y + row_idx as u16, *art_row, icon_style);
+            }
             y += icon_h + gap_after_icon;
         }
 
@@ -312,51 +319,49 @@ mod tests {
             "button must be at least 3 rows tall to feel chunky like the mockup; got height={}",
             button.height
         );
-        // The codicon glyph must sit ABOVE the button.
-        let mut glyph_y: Option<u16> = None;
+        // The block-art icon must sit ABOVE the button.
+        let mut icon_top: Option<u16> = None;
         for y in 0..area.height {
             for x in 0..area.width {
-                if buf[(x, y)].symbol() == "\u{eb91}" {
-                    glyph_y = Some(y);
+                if matches!(buf[(x, y)].symbol(), "█" | "▀" | "▄") {
+                    icon_top = Some(icon_top.map_or(y, |existing| existing.min(y)));
                 }
             }
         }
-        let glyph_y = glyph_y.expect("codicon glyph must render");
+        let icon_top = icon_top.expect("block-art icon must render");
         assert!(
-            button.y > glyph_y,
-            "button must sit below the codicon glyph (glyph_y={glyph_y}, button.y={})",
+            button.y > icon_top,
+            "button must sit below the icon (icon_top={icon_top}, button.y={})",
             button.y
         );
     }
 
     #[test]
-    fn icon_area_renders_codicon_glyph_through_ratatui_not_via_osc_overlay() {
-        // Two prior bugs taught us iTerm2 doesn't reliably evict
-        // OSC-1337 image cells when a panel goes away — `\x1b[2J`,
-        // space-stamps, and same-rectangle replace emits all leave a
-        // visible block parked over whichever panel comes next. The
-        // safest way out is to stop using inline images for the run-
-        // debug headline and render the codicon glyph (U+EB91) in
-        // ratatui cells like the rest of the widgets — ratatui's diff
-        // already evicts text cells cleanly on view changes.
+    fn icon_area_renders_block_art_through_ratatui_not_via_osc_overlay() {
+        // Three prior wipe attempts (space-stamp, terminal.clear,
+        // same-rect OSC-1337 replace) all left visible image cells
+        // ghosting on top of whichever panel came next, and the single-
+        // cell codicon glyph the user saw next was visibly too small.
+        // The icon is now half-block pixel art across 12 cells × 3
+        // rows — bigger than the codicon glyph, paints through ratatui
+        // like every other widget, evicts cleanly via the buffer diff.
         let mut panel = RunDebugPanel::new();
         let area = Rect { x: 0, y: 0, width: 36, height: 24 };
         let mut buf = Buffer::empty(area);
         Widget::render(&mut panel, area, &mut buf);
-        let mut found_glyph = false;
+        let mut found_blocks = 0usize;
         for y in 0..area.height {
             for x in 0..area.width {
-                if buf[(x, y)].symbol() == "\u{eb91}" {
-                    found_glyph = true;
+                let s = buf[(x, y)].symbol();
+                if matches!(s, "█" | "▀" | "▄") {
+                    found_blocks += 1;
                 }
             }
         }
         assert!(
-            found_glyph,
-            "the bug+play codicon (U+EB91) must be painted directly into the ratatui buffer"
+            found_blocks >= 8,
+            "icon must be a multi-cell block-art rendering (got {found_blocks} block cells); the panel must NOT shrink back to a single 1x1 codicon glyph the user already called too small"
         );
-        // Defensive: the panel widget no longer reserves a cell for an
-        // OSC-1337 overlay, since there's no overlay any more.
         assert!(
             panel.last_icon_cell.is_none(),
             "no OSC-1337 overlay cell should be reserved — the icon is now plain text"
