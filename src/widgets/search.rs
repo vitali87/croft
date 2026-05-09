@@ -521,18 +521,29 @@ impl Widget for &mut SearchPanel {
         // the box's middle row.
         let toggles_inner_w: u16 = 2 + 3 + 2 + 3 + 2; // "Aa" + " │ " + "ab" + " │ " + ".*"
         let chevron_w: u16 = 2; // "▾ "
+        // Matching breathing room on both sides of the toggle cluster: one
+        // cell between the input box's right border and `Aa`, and the same
+        // one cell between `.*` and the panel's outer right border. Without
+        // this margin the asterisk reads as crowded into the corner.
+        const TOGGLE_GAP: u16 = 1;
         let input_top_y = inner.y + 2;
         let input_bot_y = input_top_y + 2;
         let content_y = input_top_y + 1;
         let chevron_x = inner.x;
         let input_x = chevron_x + chevron_w;
-        let toggles_x = inner
-            .x
-            .saturating_add(inner.width.saturating_sub(toggles_inner_w));
+        let toggles_x = inner.x.saturating_add(
+            inner
+                .width
+                .saturating_sub(toggles_inner_w)
+                .saturating_sub(TOGGLE_GAP),
+        );
         // Input box width is whatever sits between the chevron column and
-        // the start of the toggles cluster (with a 1-cell gap on either
-        // side so neither ever bumps the box border).
-        let input_w = toggles_x.saturating_sub(input_x).saturating_sub(1).max(8);
+        // the start of the toggles cluster, with the same TOGGLE_GAP cell
+        // separating the box border from `Aa`.
+        let input_w = toggles_x
+            .saturating_sub(input_x)
+            .saturating_sub(TOGGLE_GAP)
+            .max(8);
         let input_box = Rect {
             x: input_x,
             y: input_top_y,
@@ -946,6 +957,30 @@ mod tests {
         assert!(
             dump.contains('└') || dump.contains('╰'),
             "input box must have a bottom-left corner so the border reads as a 3-row box, not a single rule:\n{dump}"
+        );
+    }
+
+    #[test]
+    fn asterisk_keeps_breathing_room_against_the_outer_right_border() {
+        // User report: the asterisk in `.*` was sitting flush against the
+        // outer right border, looking crowded into the corner. The fix
+        // mirrors the gap that already exists between the input box and
+        // `Aa` so the toggle cluster reads as a contained group on both
+        // sides.
+        use ratatui::buffer::Buffer;
+        let tmp = TempDir::new().unwrap();
+        let mut panel = SearchPanel::new(tmp.path().to_path_buf());
+        let area = Rect { x: 0, y: 0, width: 60, height: 12 };
+        let mut buf = Buffer::empty(area);
+        ratatui::widgets::Widget::render(&mut panel, area, &mut buf);
+        let inner = panel.last_inner;
+        // `.*` toggle is 2 cells wide starting at toggle_regex_x.
+        let regex_end = panel.toggle_regex_x + 1;
+        let inner_right = inner.x + inner.width - 1;
+        let right_gap = inner_right.saturating_sub(regex_end);
+        assert!(
+            right_gap >= 1,
+            "asterisk must not sit flush against the outer right border (right_gap={right_gap})"
         );
     }
 
