@@ -4247,7 +4247,21 @@ impl App {
             }
         }
 
-        let in_tree = self.show_tree && rect_contains(self.tree.last_area, m.column, m.row);
+        // Hit-test the side panel against the ACTIVE widget's last_area
+        // rather than always against `self.tree.last_area`. The tree is
+        // only re-rendered when the Explorer view is active; switching
+        // to Search / Source Control / Remote / Run-Debug freezes
+        // `tree.last_area` at whatever rectangle the last Explorer
+        // render captured, which can be smaller than the current side
+        // panel and silently swallow clicks on rows below that rect.
+        let active_sidebar_area = match self.sidebar_view {
+            SidebarView::Explorer => self.tree.last_area,
+            SidebarView::Search => self.search.last_area,
+            SidebarView::SourceControl => self.source_control.last_area,
+            SidebarView::Remote => self.remote.last_area,
+            SidebarView::RunDebug => self.run_debug.last_area,
+        };
+        let in_tree = self.show_tree && rect_contains(active_sidebar_area, m.column, m.row);
         let in_editor_pane = rect_contains(self.editor.last_full_area, m.column, m.row);
         let in_editor = rect_contains(self.editor.last_area, m.column, m.row);
         let terminal_hit = self.terminal_at_pos(m.column, m.row);
@@ -6860,6 +6874,71 @@ mod tests {
     /// logo "ghosts" mid-screen. The flush method must record the last
     /// emit cell, wipe it on move, and clear it when the welcome panel
     /// goes away (file opened, or provider switches off Codeberg).
+    #[test]
+    fn clicking_an_scm_entry_below_a_stale_tree_last_area_still_selects_and_opens() {
+        // User report: after the Source Control list got long enough to
+        // reach below where the file tree had last rendered, the rows in
+        // that lower band became unclickable. Root cause: the mouse
+        // handler gated all sidebar-view click branches on `rect_contains
+        // (self.tree.last_area, ...)`, but `tree.last_area` is only
+        // refreshed when the Explorer view renders — switching to
+        // Source Control freezes that rectangle, and any click below
+        // its bottom edge fell through even though it was inside the
+        // SCM panel.
+        use crate::git::{ChangeEntry, ChangeKind};
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        // Pretend the Explorer view rendered into a tall pane; then the
+        // user opened the terminal which shrank the side area; then they
+        // switched to Source Control. Set tree.last_area to the OLD,
+        // taller rectangle so we can prove the SCM click-handler is no
+        // longer dependent on it.
+        app.tree.last_area = Rect { x: 4, y: 1, width: 30, height: 6 };
+        app.set_sidebar_view(SidebarView::SourceControl);
+        // Set entries AFTER set_sidebar_view because that path calls
+        // refresh_source_control which overwrites entries with the live
+        // git query (empty in a non-repo temp dir).
+        app.source_control.status.in_repo = true;
+        app.source_control.status.branch = Some("main".into());
+        app.source_control.entries = (0..15)
+            .map(|i| ChangeEntry {
+                path: format!("file{i}.py"),
+                kind: ChangeKind::Untracked,
+            })
+            .collect();
+
+        let backend = ratatui::backend::TestBackend::new(80, 30);
+        let mut term = ratatui::Terminal::new(backend).unwrap();
+        term.draw(|f| app.render(f)).unwrap();
+
+        // Pick the y of a row that lives BELOW tree.last_area's bottom
+        // but inside the SCM list. Walk the rendered list area to find
+        // one.
+        let stale_bottom = app.tree.last_area.y + app.tree.last_area.height;
+        let list_area = app.source_control.last_list_area;
+        assert!(
+            list_area.y + list_area.height > stale_bottom,
+            "test setup must put SCM rows below the stale tree.last_area"
+        );
+        // Walk from stale_bottom down looking for a row that maps to an
+        // entry (skip section-header rows).
+        let target_row = (stale_bottom..list_area.y + list_area.height)
+            .find(|y| app.source_control.entry_at_y(*y).is_some())
+            .expect("at least one entry must render below the stale tree band");
+
+        app.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: list_area.x + 4,
+            row: target_row,
+            modifiers: KeyModifiers::NONE,
+        });
+
+        assert!(
+            app.source_control.selected_change.is_some(),
+            "click on an SCM entry below the stale tree.last_area must still select it"
+        );
+    }
+
     #[test]
     fn click_on_a_modified_source_control_entry_opens_a_diff_view_against_head() {
         // VS Code surfaces the diff between the working-tree file and
