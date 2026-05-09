@@ -27,6 +27,10 @@ pub struct SourceControlPanel {
     pub last_list_area: Rect,
     pub last_scrollbar: Rect,
     pub scroll: usize,
+    /// Index into `entries` of the currently-selected change, if any.
+    /// Drives the row-highlight bg so the user can tell at a glance
+    /// which entry the editor is showing the diff for.
+    pub selected_change: Option<usize>,
     /// Status / error line painted below the button after a commit attempt.
     /// Cleared on the next refresh.
     pub commit_feedback: Option<String>,
@@ -48,6 +52,7 @@ impl SourceControlPanel {
             last_list_area: Rect::default(),
             last_scrollbar: Rect::default(),
             scroll: 0,
+            selected_change: None,
             commit_feedback: None,
             commit_feedback_is_error: false,
         }
@@ -56,6 +61,21 @@ impl SourceControlPanel {
     pub fn set_status(&mut self, status: GitStatus, entries: Vec<ChangeEntry>) {
         self.status = status;
         self.entries = entries;
+        // A change set refresh can re-order entries; clear the selection
+        // rather than risk pointing it at the wrong file.
+        if let Some(idx) = self.selected_change {
+            if idx >= self.entries.len() {
+                self.selected_change = None;
+            }
+        }
+    }
+
+    /// Click-to-select: returns the entry index now selected, if the
+    /// click landed on an entry row.
+    pub fn select_change_at(&mut self, y: u16) -> Option<usize> {
+        let idx = self.entry_at_y(y)?;
+        self.selected_change = Some(idx);
+        Some(idx)
     }
 
     pub fn changes_count(&self) -> usize {
@@ -518,7 +538,7 @@ impl Widget for &mut SourceControlPanel {
             return;
         }
 
-        let row_bg_style = Style::default().bg(Color::Rgb(0x16, 0x1b, 0x25));
+        let selected_bg = Color::Rgb(0x26, 0x4f, 0x78);
         let end = (self.scroll + viewport).min(total);
         for (row, idx) in (self.scroll..end).enumerate() {
             let row_y = list_area.y + row as u16;
@@ -563,15 +583,24 @@ impl Widget for &mut SourceControlPanel {
                         width: row_width,
                         height: 1,
                     };
-                    // Subtle row background so each entry reads as a chip.
-                    for rx in 0..row_rect.width {
-                        buf[(row_rect.x + rx, row_rect.y)]
-                            .set_symbol(" ")
-                            .set_style(row_bg_style);
+                    let is_selected = self.selected_change == Some(*entry_idx);
+                    // Selected rows carry the VS Code list-active-blue bg
+                    // so the user can see which entry the editor's diff
+                    // is currently bound to. Unselected rows inherit the
+                    // panel bg so the list reads cleanly.
+                    let row_bg = if is_selected {
+                        Some(selected_bg)
+                    } else {
+                        None
+                    };
+                    if let Some(bg) = row_bg {
+                        let row_bg_style = Style::default().bg(bg);
+                        for rx in 0..row_rect.width {
+                            buf[(row_rect.x + rx, row_rect.y)]
+                                .set_symbol(" ")
+                                .set_style(row_bg_style);
+                        }
                     }
-                    // Entry icon: pick the file/folder icon by name +
-                    // extension; folders carry a trailing '/' in
-                    // git-porcelain output.
                     let path_str = entry.path.as_str();
                     let is_dir = path_str.ends_with('/');
                     let icon = if is_dir {
@@ -591,39 +620,28 @@ impl Widget for &mut SourceControlPanel {
                     let badge_str = badge.to_string();
                     let badge_w: u16 = 1;
                     let row_padding: u16 = 1;
-                    // Right-align the status badge inside the row, leaving
-                    // a one-cell gap from the row's right edge.
                     let badge_x = row_rect
                         .x
                         .saturating_add(row_rect.width.saturating_sub(badge_w + row_padding));
-                    if row_rect.width > badge_w + row_padding + 4 {
-                        buf.set_string(
-                            badge_x,
-                            row_y,
-                            badge_str.as_str(),
-                            Style::default()
-                                .fg(badge_color(entry.kind))
-                                .bg(Color::Rgb(0x16, 0x1b, 0x25))
-                                .add_modifier(Modifier::BOLD),
-                        );
+                    let mut badge_style = Style::default()
+                        .fg(badge_color(entry.kind))
+                        .add_modifier(Modifier::BOLD);
+                    let mut icon_style = Style::default().fg(icon.color);
+                    let mut path_style = Style::default().fg(Color::White);
+                    if let Some(bg) = row_bg {
+                        badge_style = badge_style.bg(bg);
+                        icon_style = icon_style.bg(bg);
+                        path_style = path_style.bg(bg);
                     }
-                    // Icon on the left.
+                    if row_rect.width > badge_w + row_padding + 4 {
+                        buf.set_string(badge_x, row_y, badge_str.as_str(), badge_style);
+                    }
                     let icon_x = row_rect.x + 1;
-                    buf.set_string(
-                        icon_x,
-                        row_y,
-                        icon.glyph.to_string(),
-                        Style::default().fg(icon.color).bg(Color::Rgb(0x16, 0x1b, 0x25)),
-                    );
-                    // Path text between the icon and the badge column.
+                    buf.set_string(icon_x, row_y, icon.glyph.to_string(), icon_style);
                     let text_x = icon_x + 2;
                     let text_w = badge_x.saturating_sub(text_x).saturating_sub(1);
                     if text_w > 0 {
-                        let path_para = Paragraph::new(path_str).style(
-                            Style::default()
-                                .fg(Color::White)
-                                .bg(Color::Rgb(0x16, 0x1b, 0x25)),
-                        );
+                        let path_para = Paragraph::new(path_str).style(path_style);
                         path_para.render(
                             Rect { x: text_x, y: row_y, width: text_w, height: 1 },
                             buf,
@@ -883,6 +901,80 @@ mod tests {
             row.push_str(buf[(x, 3)].symbol());
         }
         assert!(row.contains("Not a git repository"), "row was: {row:?}");
+    }
+
+    #[test]
+    fn change_rows_use_a_subtle_row_tint_not_darker_than_panel_bg() {
+        // User report: the rows were darker than the panel bg, the
+        // opposite of what the mockup shows. Drop the heavy dark tint —
+        // either no row bg at all, or a tint LIGHTER than the editor bg
+        // (Color::Reset / 0x1e222e). Rgb(0x16,0x1b,0x25) is darker and
+        // must not appear on entry rows.
+        use ratatui::buffer::Buffer;
+        let mut p = SourceControlPanel::new();
+        p.set_status(
+            dummy_status_with_branch("main"),
+            vec![ChangeEntry { path: "a.py".into(), kind: ChangeKind::Modified }],
+        );
+        let area = Rect { x: 0, y: 0, width: 60, height: 30 };
+        let mut buf = Buffer::empty(area);
+        ratatui::widgets::Widget::render(&mut p, area, &mut buf);
+        let bad = ratatui::style::Color::Rgb(0x16, 0x1b, 0x25);
+        for y in 0..area.height {
+            for x in 0..area.width {
+                assert_ne!(
+                    buf[(x, y)].style().bg,
+                    Some(bad),
+                    "no cell may carry the darker-than-panel row bg ({bad:?}) — that's the colour the user complained about; cell at ({x},{y})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn clicking_a_change_entry_highlights_it_with_a_visible_row_bg() {
+        use ratatui::buffer::Buffer;
+        let mut p = SourceControlPanel::new();
+        p.set_status(
+            dummy_status_with_branch("main"),
+            vec![
+                ChangeEntry { path: "a.py".into(), kind: ChangeKind::Modified },
+                ChangeEntry { path: "b.py".into(), kind: ChangeKind::Modified },
+            ],
+        );
+        // Render once to learn the row coordinates.
+        let area = Rect { x: 0, y: 0, width: 60, height: 30 };
+        let mut buf = Buffer::empty(area);
+        ratatui::widgets::Widget::render(&mut p, area, &mut buf);
+        // Pretend the user clicked the second change row.
+        let target_y = (0..area.height)
+            .find(|y| {
+                let mut row = String::new();
+                for x in 0..area.width {
+                    row.push_str(buf[(x, *y)].symbol());
+                }
+                row.contains("b.py")
+            })
+            .expect("b.py row must render");
+        p.select_change_at(target_y);
+        // Re-render with the new selection.
+        let mut buf = Buffer::empty(area);
+        ratatui::widgets::Widget::render(&mut p, area, &mut buf);
+        // The selected row must carry a non-Reset bg distinct from the
+        // unselected rows so the user can tell which entry is active.
+        let mut selected_has_bg = false;
+        for x in 0..area.width {
+            if let Some(bg) = buf[(x, target_y)].style().bg {
+                if bg != ratatui::style::Color::Reset {
+                    selected_has_bg = true;
+                    break;
+                }
+            }
+        }
+        assert!(
+            selected_has_bg,
+            "the row of the clicked entry must carry a visible bg highlight"
+        );
     }
 
     #[test]

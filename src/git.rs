@@ -227,6 +227,30 @@ pub fn query_changes(root: &Path) -> Vec<ChangeEntry> {
 
 /// Result of an attempted commit. `Ok(summary)` carries git's stdout/stderr
 /// summary (e.g. "[main 4a5b6c7] message"); `Err` carries git's error
+/// Read the HEAD-committed contents of `rel_path` (workspace-relative)
+/// via `git show HEAD:<rel_path>`. Used by the Source Control panel to
+/// surface a side-by-side diff between the working tree and HEAD when
+/// the user clicks a Modified entry. Returns the raw bytes as a String;
+/// non-UTF8 content (binary file) is reported as an error so the caller
+/// can fall back to opening the file directly.
+pub fn read_file_at_head(root: &Path, rel_path: &str) -> Result<String, String> {
+    let path_str = root.to_str().ok_or_else(|| "non-utf8 workspace path".to_string())?;
+    let spec = format!("HEAD:{rel_path}");
+    let output = Command::new("git")
+        .args(["-C", path_str, "show", &spec])
+        .output()
+        .map_err(|e| format!("failed to spawn git: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if stderr.is_empty() {
+            format!("git show {spec} failed with code {:?}", output.status.code())
+        } else {
+            stderr
+        });
+    }
+    String::from_utf8(output.stdout).map_err(|_| format!("{rel_path} at HEAD is not UTF-8"))
+}
+
 /// message verbatim so the user sees exactly what blocked them.
 pub fn commit_all_tracked(root: &Path, message: &str) -> Result<String, String> {
     if message.trim().is_empty() {

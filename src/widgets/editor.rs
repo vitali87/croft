@@ -3422,6 +3422,51 @@ impl EditorTabs {
         Ok(())
     }
 
+    /// Open a side-by-side diff between an in-memory `left_text` (e.g.
+    /// the HEAD version of a file) and the working-tree file at `right`.
+    /// The left "path" is purely a label; nothing reads from it on disk.
+    /// Used by the Source Control panel to show working-tree-vs-HEAD
+    /// diffs when the user clicks a Modified entry.
+    pub fn open_head_diff_with_text(
+        &mut self,
+        left_label: PathBuf,
+        left_text: &str,
+        right: &Path,
+    ) -> Result<()> {
+        let right_text = std::fs::read_to_string(right)
+            .with_context(|| format!("reading {}", right.display()))?;
+        let left_lines: Vec<String> = left_text.lines().map(str::to_string).collect();
+        let right_lines: Vec<String> = right_text.lines().map(str::to_string).collect();
+        let data = crate::widgets::diff::DiffData::build(
+            left_label,
+            right.to_path_buf(),
+            left_lines,
+            right_lines,
+        );
+        let mut e = Editor::new();
+        e.focused = self.editors[self.active].focused;
+        e.preview = false;
+        e.path = Some(right.to_path_buf());
+        e.diff = Some(data);
+        if self.is_blank_initial() {
+            self.editors[self.active] = e;
+            return Ok(());
+        }
+        // If a tab is already showing this path (as a plain file or a
+        // diff), reuse it so we don't pile up duplicate tabs as the
+        // user clicks through the change list.
+        if let Some(idx) = self.find_tab_with_path(right) {
+            self.editors[idx] = e;
+            self.select(idx);
+            return Ok(());
+        }
+        let pos = self.active + 1;
+        self.editors.insert(pos, e);
+        self.editors[self.active].focused = false;
+        self.active = pos;
+        Ok(())
+    }
+
     /// Pinned-tab open: if the file is already in some tab, pin and switch
     /// to it. Otherwise create a fresh pinned tab next to the active one.
     /// Used by double-click in the explorer and Ctrl+Enter on a tree row.

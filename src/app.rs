@@ -3197,6 +3197,65 @@ impl App {
         }
     }
 
+    /// Open the change at `entry_idx` in the editor pane: a side-by-side
+    /// diff against HEAD for Modified / StagedModified entries (the
+    /// VS Code Source Control click behaviour), or a plain file open
+    /// for everything else where the working tree IS the only version
+    /// (Untracked, StagedAdded) or HEAD doesn't carry the file
+    /// (Deleted). Selection state on the panel updates so the user can
+    /// see which entry the editor is bound to.
+    pub fn open_source_control_entry(&mut self, entry_idx: usize) {
+        use crate::git::ChangeKind;
+        let Some(entry) = self.source_control.entries.get(entry_idx).cloned() else {
+            return;
+        };
+        self.source_control.selected_change = Some(entry_idx);
+        let abs = self.tree.root.join(&entry.path);
+        let opened = match entry.kind {
+            ChangeKind::Modified | ChangeKind::StagedModified => {
+                match crate::git::read_file_at_head(&self.tree.root, &entry.path) {
+                    Ok(head_text) => {
+                        let label = std::path::PathBuf::from(format!("{} (HEAD)", entry.path));
+                        match self.editor.open_head_diff_with_text(label, &head_text, &abs) {
+                            Ok(()) => true,
+                            Err(e) => {
+                                self.status = format!("Diff failed: {e}");
+                                false
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        self.status = format!("git show HEAD failed: {e}");
+                        // Fall back to plain open so the user still sees
+                        // something rather than nothing.
+                        if abs.is_file() {
+                            self.editor.open_pinned(&abs).is_ok()
+                        } else {
+                            false
+                        }
+                    }
+                }
+            }
+            _ => {
+                if abs.is_file() {
+                    match self.editor.open_pinned(&abs) {
+                        Ok(()) => true,
+                        Err(e) => {
+                            self.status = format!("Open failed: {e}");
+                            false
+                        }
+                    }
+                } else {
+                    false
+                }
+            }
+        };
+        if opened {
+            self.focus_pane(Pane::Editor);
+            self.sync_open_file_poll_mtime();
+        }
+    }
+
     fn commit_source_control(&mut self) {
         let message = self.source_control.message.trim().to_string();
         if message.is_empty() {
@@ -4385,17 +4444,7 @@ impl App {
                         return;
                     }
                     if let Some(idx) = self.source_control.entry_at_y(m.row) {
-                        if let Some(entry) = self.source_control.entries.get(idx).cloned() {
-                            let abs = self.tree.root.join(&entry.path);
-                            if abs.is_file() {
-                                if let Err(e) = self.editor.open_pinned(&abs) {
-                                    self.status = format!("Open failed: {e}");
-                                } else {
-                                    self.focus_pane(Pane::Editor);
-                                    self.sync_open_file_poll_mtime();
-                                }
-                            }
-                        }
+                        self.open_source_control_entry(idx);
                     }
                     return;
                 }
@@ -6811,6 +6860,53 @@ mod tests {
     /// logo "ghosts" mid-screen. The flush method must record the last
     /// emit cell, wipe it on move, and clear it when the welcome panel
     /// goes away (file opened, or provider switches off Codeberg).
+    #[test]
+    fn click_on_a_modified_source_control_entry_opens_a_diff_view_against_head() {
+        // VS Code surfaces the diff between the working-tree file and
+        // the HEAD version when the user clicks a Modified entry in the
+        // Source Control panel. Croft used to just open the working
+        // file as plain text — assert the new behaviour: the active
+        // editor tab carries a `diff: Some(...)` payload.
+        use crate::git::{ChangeEntry, ChangeKind};
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // Init a real repo so git show HEAD:<path> returns content.
+        let init = std::process::Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .current_dir(root)
+            .status()
+            .unwrap();
+        assert!(init.success());
+        let _ = std::process::Command::new("git")
+            .args(["config", "user.email", "t@t"])
+            .current_dir(root)
+            .status();
+        let _ = std::process::Command::new("git")
+            .args(["config", "user.name", "t"])
+            .current_dir(root)
+            .status();
+        let f = root.join("a.py");
+        std::fs::write(&f, b"print(1)\n").unwrap();
+        let _ = std::process::Command::new("git")
+            .args(["add", "a.py"])
+            .current_dir(root)
+            .status();
+        let _ = std::process::Command::new("git")
+            .args(["commit", "-q", "-m", "init"])
+            .current_dir(root)
+            .status();
+        std::fs::write(&f, b"print(2)\n").unwrap();
+        let mut app = App::new(root.to_path_buf()).unwrap();
+        app.source_control.entries =
+            vec![ChangeEntry { path: "a.py".into(), kind: ChangeKind::Modified }];
+        app.set_sidebar_view(SidebarView::SourceControl);
+        app.open_source_control_entry(0);
+        assert!(
+            app.editor.diff.is_some(),
+            "clicking a Modified entry must open the editor in diff-vs-HEAD mode, not as plain text"
+        );
+    }
+
     #[test]
     fn switching_away_from_run_debug_wipes_the_icon_overlay_so_it_does_not_ghost_other_sidebars() {
         // User-reported regression: the OSC-1337 debug-alt overlay kept
