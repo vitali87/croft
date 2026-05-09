@@ -460,6 +460,12 @@ pub struct App {
     /// ratatui flushes the welcome panel, at `welcome_codeberg_badge_cell`.
     /// `None` when the host terminal lacks OSC-1337 image support.
     welcome_codeberg_badge_osc: Option<String>,
+    /// Pre-encoded OSC-1337 image of the codicon `debug-alt` glyph sized to
+    /// the run-debug panel's headline icon block. `None` when the host
+    /// terminal lacks OSC-1337 support; the panel falls back to drawing
+    /// nothing in the icon area, which leaves the bordered cluster looking
+    /// like a clean text-only sidebar (still legible).
+    run_debug_icon_osc: Option<String>,
     /// Absolute terminal cell where the Codeberg badge image goes. Recorded
     /// during welcome render; consumed post-draw. `None` when the welcome
     /// panel isn't visible or the open repo isn't on Codeberg.
@@ -1030,6 +1036,7 @@ impl App {
             cursor_blink_anchor: std::time::Instant::now(),
             activity_images: None,
             welcome_codeberg_badge_osc: None,
+            run_debug_icon_osc: None,
             welcome_codeberg_badge_cell: None,
             welcome_codeberg_badge_last_emitted: None,
             last_editor_left_down: None,
@@ -1195,6 +1202,64 @@ impl App {
                 raw
             });
         }
+        // Run-and-Debug headline icon: the same debug-alt PNG used in the
+        // activity bar, fitted to the panel's icon block (RUN_DEBUG_ICON_CELLS_W
+        // cells wide × RUN_DEBUG_ICON_CELLS_H cells tall) and tinted at icon-
+        // inactive grey so it reads as the same monochrome family as the rest
+        // of the activity-bar icons. Encoded once at init; emitted post-frame
+        // by `flush_run_debug_icon_overlay` while the panel is visible.
+        let rd_icon_w_cells = crate::widgets::run_debug::RUN_DEBUG_ICON_CELLS_W as u32;
+        let rd_icon_h_cells = crate::widgets::run_debug::RUN_DEBUG_ICON_CELLS_H as u32;
+        let rd_icon_w_px = cell_w * rd_icon_w_cells;
+        let rd_icon_h_px = cell_h * rd_icon_h_cells;
+        if let Ok(baked) = crate::iterm2_inline::compose_icon(
+            crate::iterm2_inline::RUN_DEBUG_SRC_PNG,
+            rd_icon_w_px,
+            rd_icon_h_px,
+            false,
+            icon_bg,
+        ) {
+            let raw = crate::iterm2_inline::build_inline_image_osc(
+                &baked,
+                crate::widgets::run_debug::RUN_DEBUG_ICON_CELLS_W,
+                crate::widgets::run_debug::RUN_DEBUG_ICON_CELLS_H,
+                false,
+            );
+            self.run_debug_icon_osc = Some(if is_tmux {
+                crate::iterm2_inline::tmux_passthrough_wrap(&raw)
+            } else {
+                raw
+            });
+        }
+    }
+
+    /// Emit the OSC-1337 image carrying the run-debug headline icon at the
+    /// cell the panel reserved on its most recent render. Idempotent: when
+    /// the panel isn't visible (different sidebar view, sidebar collapsed)
+    /// or the icon hasn't been baked, this is a no-op. The OSC writes
+    /// happen outside ratatui's diff so the image lands cleanly above the
+    /// headline without flicker.
+    pub fn flush_run_debug_icon_overlay(&mut self) {
+        use std::io::Write;
+        if self.sidebar_view != SidebarView::RunDebug {
+            return;
+        }
+        let Some(osc) = self.run_debug_icon_osc.as_deref() else {
+            return;
+        };
+        let Some((cx, cy)) = self.run_debug.last_icon_cell else {
+            return;
+        };
+        let mut out = stdout();
+        let cursor_on = self.cursor_should_be_visible();
+        let _ = write!(out, "\x1b[?25l\x1b[s");
+        let _ = write!(out, "\x1b[{};{}H", cy + 1, cx + 1);
+        let _ = out.write_all(osc.as_bytes());
+        let _ = write!(out, "\x1b[u");
+        if cursor_on {
+            let _ = write!(out, "\x1b[?25h");
+        }
+        let _ = out.flush();
     }
 
     /// Returns the post-frame OSC-1337 escapes to write under the activity
@@ -9861,6 +9926,10 @@ fn main_loop(
             // welcome panel is visible, the open repo is on Codeberg, and
             // we successfully baked the icon at init time.
             app.flush_welcome_codeberg_badge_overlay();
+            // Run-and-Debug headline icon: same trick. Only emits while the
+            // sidebar is on the Run-Debug view and the panel reserved a
+            // cell for the icon on its last render.
+            app.flush_run_debug_icon_overlay();
             // Welcome-screen logo: same OSC-1337 trick, gated by its own
             // dirty flag and only emitted while the editor pane is in its
             // blank initial state.

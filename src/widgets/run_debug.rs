@@ -1,20 +1,36 @@
 use ratatui::{
     buffer::Buffer,
-    layout::Rect,
+    layout::{Alignment, Rect},
     style::{Color, Modifier, Style},
-    text::{Line, Span},
-    widgets::{Block, Borders, Widget, Wrap, Paragraph},
+    text::Line,
+    widgets::{Block, Borders, Paragraph, Widget, Wrap},
 };
 use std::path::PathBuf;
 
 const BUTTON_BG_RGB: (u8, u8, u8) = (0x09, 0x67, 0xb8);
 const BUTTON_FG_RGB: (u8, u8, u8) = (0xff, 0xff, 0xff);
+const BODY_FG_RGB: (u8, u8, u8) = (0xb0, 0xb8, 0xc8);
+const TITLE_FG_RGB: (u8, u8, u8) = (0xff, 0xff, 0xff);
+const FOCUS_BORDER_RGB: (u8, u8, u8) = (0x4e, 0x9a, 0xff);
+
+/// Cells reserved above the headline for the OSC-1337 debug-alt icon overlay.
+/// Six cells wide × three cells tall lands a roughly 60×60-pixel icon at typical
+/// iTerm2 cell sizes (10×20 px), matching the proportions of the VS Code mockup
+/// the user supplied.
+pub const RUN_DEBUG_ICON_CELLS_W: u16 = 6;
+pub const RUN_DEBUG_ICON_CELLS_H: u16 = 3;
 
 pub struct RunDebugPanel {
     pub focused: bool,
     pub active_file: Option<PathBuf>,
     pub last_area: Rect,
     pub last_button_area: Rect,
+    /// Top-left cell of the OSC-1337 icon overlay block. The post-draw flush
+    /// in `App` reads this to emit the rasterised debug-alt PNG above the
+    /// headline. `None` when the panel hasn't been laid out yet, or when
+    /// the panel is too short for the icon to fit alongside the rest of
+    /// the cluster.
+    pub last_icon_cell: Option<(u16, u16)>,
     pub feedback: Option<String>,
     pub feedback_is_error: bool,
 }
@@ -26,6 +42,7 @@ impl RunDebugPanel {
             active_file: None,
             last_area: Rect::default(),
             last_button_area: Rect::default(),
+            last_icon_cell: None,
             feedback: None,
             feedback_is_error: false,
         }
@@ -42,8 +59,8 @@ impl RunDebugPanel {
 
     pub fn button_label(&self) -> String {
         match self.active_file.as_ref().and_then(|p| p.file_name()) {
-            Some(name) => format!("  Run {}  ", name.to_string_lossy()),
-            None => String::from("  Run and Debug  "),
+            Some(name) => format!("Run {}", name.to_string_lossy()),
+            None => String::from("Run and Debug"),
         }
     }
 }
@@ -56,56 +73,136 @@ impl Default for RunDebugPanel {
 
 impl Widget for &mut RunDebugPanel {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        let block_style = if self.focused {
-            Style::default().fg(Color::Rgb(0x4e, 0x9a, 0xff))
+        let border_style = if self.focused {
+            Style::default().fg(Color::Rgb(
+                FOCUS_BORDER_RGB.0,
+                FOCUS_BORDER_RGB.1,
+                FOCUS_BORDER_RGB.2,
+            ))
         } else {
             Style::default().fg(Color::DarkGray)
         };
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(block_style)
-            .title(Span::styled(
-                " RUN AND DEBUG ",
-                Style::default()
-                    .fg(Color::White)
-                    .bg(Color::Rgb(0x1e, 0x3a, 0x6e))
-                    .add_modifier(Modifier::BOLD),
-            ));
+        let block = Block::default().borders(Borders::ALL).border_style(border_style);
         let inner = block.inner(area);
         block.render(area, buf);
         self.last_area = area;
         self.last_button_area = Rect::default();
+        self.last_icon_cell = None;
         if inner.height == 0 || inner.width == 0 {
             return;
         }
 
-        let dim = Style::default().fg(Color::Rgb(0xa0, 0xa8, 0xb8));
-        let body = match self.active_file.as_ref() {
-            Some(_) => "Press the button below to run the active file in a new terminal.",
-            None => "Open a file which can be run, then press the button below.",
-        };
-        let para = Paragraph::new(Line::from(Span::styled(body, dim))).wrap(Wrap { trim: true });
-        let body_height = inner.height.min(3);
-        let body_area = Rect { x: inner.x, y: inner.y, width: inner.width, height: body_height };
-        para.render(body_area, buf);
+        // Vertical cluster, top-to-bottom: icon, gap, headline, gap, body, gap, button.
+        // Centre the cluster vertically so the panel feels balanced like the mockup.
+        const GAP_AFTER_ICON: u16 = 2;
+        const TITLE_H: u16 = 1;
+        const GAP_AFTER_TITLE: u16 = 1;
+        const BODY_MAX_H: u16 = 3;
+        const GAP_AFTER_BODY: u16 = 2;
+        const BUTTON_H: u16 = 3;
 
-        let button_y = body_area.y + body_area.height + 1;
-        if button_y >= inner.y + inner.height {
+        let icon_w = RUN_DEBUG_ICON_CELLS_W.min(inner.width);
+        let icon_h_full = RUN_DEBUG_ICON_CELLS_H;
+        let cluster_full = icon_h_full
+            + GAP_AFTER_ICON
+            + TITLE_H
+            + GAP_AFTER_TITLE
+            + BODY_MAX_H
+            + GAP_AFTER_BODY
+            + BUTTON_H;
+
+        // If the panel is too short for the full cluster, drop the icon
+        // first (it's decorative) before sacrificing the body or button.
+        let (icon_h, gap_after_icon, cluster) = if inner.height >= cluster_full {
+            (icon_h_full, GAP_AFTER_ICON, cluster_full)
+        } else {
+            (
+                0,
+                0,
+                TITLE_H + GAP_AFTER_TITLE + BODY_MAX_H + GAP_AFTER_BODY + BUTTON_H,
+            )
+        };
+
+        let top_pad = if inner.height > cluster {
+            (inner.height - cluster) / 2
+        } else {
+            0
+        };
+        let mut y = inner.y + top_pad;
+
+        if icon_h > 0 && y + icon_h <= inner.y + inner.height {
+            let icon_x = inner.x + (inner.width - icon_w) / 2;
+            self.last_icon_cell = Some((icon_x, y));
+            y += icon_h + gap_after_icon;
+        }
+
+        if y + TITLE_H > inner.y + inner.height {
+            return;
+        }
+        let title = Paragraph::new(Line::from("RUN AND DEBUG"))
+            .alignment(Alignment::Center)
+            .style(
+                Style::default()
+                    .fg(Color::Rgb(TITLE_FG_RGB.0, TITLE_FG_RGB.1, TITLE_FG_RGB.2))
+                    .add_modifier(Modifier::BOLD),
+            );
+        title.render(
+            Rect { x: inner.x, y, width: inner.width, height: TITLE_H },
+            buf,
+        );
+        y += TITLE_H + GAP_AFTER_TITLE;
+
+        if y >= inner.y + inner.height {
+            return;
+        }
+        let body_text = match self.active_file.as_ref() {
+            Some(_) => "Press the button below to run the active file in a new terminal.",
+            None => "Open a file that can be run or debugged, then press the button below.",
+        };
+        let body_h = BODY_MAX_H.min(inner.y + inner.height - y);
+        let body_x_pad = (inner.width / 12).max(1).min(4);
+        let body_area = Rect {
+            x: inner.x + body_x_pad,
+            y,
+            width: inner.width.saturating_sub(body_x_pad * 2).max(1),
+            height: body_h,
+        };
+        let body = Paragraph::new(body_text)
+            .style(Style::default().fg(Color::Rgb(BODY_FG_RGB.0, BODY_FG_RGB.1, BODY_FG_RGB.2)))
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: true });
+        body.render(body_area, buf);
+        y += BODY_MAX_H + GAP_AFTER_BODY;
+
+        if y + BUTTON_H > inner.y + inner.height {
             return;
         }
         let label = self.button_label();
-        let label_w = label.chars().count() as u16;
-        let button_w = label_w.min(inner.width);
+        let label_chars = label.chars().count() as u16;
+        let button_w = (label_chars + 8).min(inner.width.saturating_sub(2)).max(label_chars);
         let button_x = inner.x + (inner.width - button_w) / 2;
-        let button_area = Rect { x: button_x, y: button_y, width: button_w, height: 1 };
+        let button_area = Rect {
+            x: button_x,
+            y,
+            width: button_w,
+            height: BUTTON_H,
+        };
         self.last_button_area = button_area;
-        buf.set_style(
-            button_area,
-            Style::default().bg(Color::Rgb(BUTTON_BG_RGB.0, BUTTON_BG_RGB.1, BUTTON_BG_RGB.2)),
-        );
+        let button_bg = Style::default().bg(Color::Rgb(BUTTON_BG_RGB.0, BUTTON_BG_RGB.1, BUTTON_BG_RGB.2));
+        // Fill the whole button rectangle with the bg colour so the chunky
+        // 3-row button reads as one shape.
+        for ry in 0..button_area.height {
+            for rx in 0..button_area.width {
+                buf[(button_area.x + rx, button_area.y + ry)]
+                    .set_symbol(" ")
+                    .set_style(button_bg);
+            }
+        }
+        let label_y = button_area.y + button_area.height / 2;
+        let label_x = button_area.x + (button_area.width.saturating_sub(label_chars)) / 2;
         buf.set_string(
-            button_area.x,
-            button_area.y,
+            label_x,
+            label_y,
             label.as_str(),
             Style::default()
                 .fg(Color::Rgb(BUTTON_FG_RGB.0, BUTTON_FG_RGB.1, BUTTON_FG_RGB.2))
@@ -113,7 +210,7 @@ impl Widget for &mut RunDebugPanel {
                 .add_modifier(Modifier::BOLD),
         );
 
-        let mut next_y = button_area.y + 1;
+        let mut next_y = button_area.y + button_area.height + 1;
         if let Some(msg) = self.feedback.as_ref() {
             if next_y < inner.y + inner.height {
                 let style = if self.feedback_is_error {
@@ -121,8 +218,8 @@ impl Widget for &mut RunDebugPanel {
                 } else {
                     Style::default().fg(Color::Rgb(0xa3, 0xbe, 0x8c))
                 };
-                buf.set_string(inner.x, next_y, msg.as_str(), style);
-                next_y += 1;
+                buf.set_string(inner.x + 1, next_y, msg.as_str(), style);
+                next_y = next_y.saturating_add(1);
             }
         }
         let _ = next_y;
@@ -136,36 +233,100 @@ mod tests {
     #[test]
     fn button_label_says_run_and_debug_when_no_file_is_active() {
         let panel = RunDebugPanel::new();
-        assert_eq!(panel.button_label(), "  Run and Debug  ");
+        assert_eq!(panel.button_label(), "Run and Debug");
     }
 
     #[test]
     fn button_label_includes_filename_when_a_file_is_active() {
         let mut panel = RunDebugPanel::new();
         panel.set_active_file(Some(PathBuf::from("/work/script.py")));
-        assert_eq!(panel.button_label(), "  Run script.py  ");
+        assert_eq!(panel.button_label(), "Run script.py");
     }
 
     #[test]
     fn click_button_is_inside_recorded_button_area() {
         let mut panel = RunDebugPanel::new();
-        panel.last_button_area = Rect { x: 10, y: 5, width: 12, height: 1 };
+        panel.last_button_area = Rect { x: 10, y: 5, width: 12, height: 3 };
         assert!(panel.click_button(10, 5));
-        assert!(panel.click_button(21, 5));
+        assert!(panel.click_button(21, 7));
         assert!(!panel.click_button(22, 5));
-        assert!(!panel.click_button(15, 6));
+        assert!(!panel.click_button(15, 8));
     }
 
     #[test]
     fn rendering_lays_out_button_area_inside_panel() {
         let mut panel = RunDebugPanel::new();
         panel.set_active_file(Some(PathBuf::from("/work/run_me.rs")));
-        let area = Rect { x: 0, y: 0, width: 40, height: 12 };
+        let area = Rect { x: 0, y: 0, width: 40, height: 24 };
         let mut buf = Buffer::empty(area);
         Widget::render(&mut panel, area, &mut buf);
         let b = panel.last_button_area;
         assert!(b.width > 0 && b.height > 0, "button area must be laid out");
         assert!(b.x >= area.x && b.x + b.width <= area.x + area.width);
         assert!(b.y >= area.y && b.y < area.y + area.height);
+    }
+
+    fn buffer_to_string(buf: &Buffer) -> String {
+        let mut out = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                out.push_str(buf[(buf.area.x + x, buf.area.y + y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    #[test]
+    fn empty_state_renders_centred_title_and_description_and_chunky_button() {
+        let mut panel = RunDebugPanel::new();
+        let area = Rect { x: 0, y: 0, width: 36, height: 24 };
+        let mut buf = Buffer::empty(area);
+        Widget::render(&mut panel, area, &mut buf);
+        let dump = buffer_to_string(&buf);
+        assert!(
+            dump.contains("RUN AND DEBUG"),
+            "headline must be present: \n{dump}"
+        );
+        assert!(
+            dump.contains("Open a file"),
+            "body copy must be present: \n{dump}"
+        );
+        assert!(
+            !dump.lines().next().unwrap().contains("RUN AND DEBUG"),
+            "title bar must NOT sit on the top border row (mockup has no title bar): \n{dump}"
+        );
+        assert!(
+            panel.last_icon_cell.is_some(),
+            "run-debug panel must record a cell for the OSC-1337 icon overlay so the App can emit it post-draw"
+        );
+        let button = panel.last_button_area;
+        assert!(
+            button.height >= 3,
+            "button must be at least 3 rows tall to feel chunky like the mockup; got height={}",
+            button.height
+        );
+        let (_, icon_y) = panel.last_icon_cell.unwrap();
+        assert!(
+            button.y > icon_y,
+            "button must sit below the icon (icon_y={icon_y}, button.y={})",
+            button.y
+        );
+    }
+
+    #[test]
+    fn small_panel_drops_icon_to_keep_button_visible() {
+        let mut panel = RunDebugPanel::new();
+        let area = Rect { x: 0, y: 0, width: 30, height: 12 };
+        let mut buf = Buffer::empty(area);
+        Widget::render(&mut panel, area, &mut buf);
+        assert!(
+            panel.last_icon_cell.is_none(),
+            "icon is decorative; in a short panel it must yield to the button"
+        );
+        assert!(
+            panel.last_button_area.height >= 3,
+            "button must remain laid out when the panel collapses the icon"
+        );
     }
 }
