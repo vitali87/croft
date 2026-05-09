@@ -291,13 +291,13 @@ What works:
 * Inline preview tabs that render directly in the editor pane via OSC 1337: PNG / JPEG / GIF / BMP / WebP, PDFs (with page navigation, multi-page when poppler is installed), and CSV / TSV / XLSX / XLS / XLSB / ODS spreadsheets.
 * Search sidebar (live, `.gitignore`-aware, off the UI thread, regex / case / whole-word toggles).
 * Remote (SSH) sidebar that lists hosts from `~/.ssh/config` and launches a remote croft session.
-* Run and Debug sidebar (icon five): a Run [filename] button that picks a runner by file extension (Python, Node, Ruby, bash, zsh, fish, PHP, Perl, Lua, plus tsx for TS/TSX) and spawns the file in a fresh terminal, focusing the terminal pane so the output streams in immediately.
+* Run and Debug sidebar (icon four): a Run [filename] button that picks a runner by file extension (Python, Node, Ruby, bash, zsh, fish, PHP, Perl, Lua, plus tsx for TS/TSX) and spawns the file in a fresh terminal at the right cwd. Python is venv-aware: walks from the file's directory up to the workspace root looking for `.venv/bin/python`, `venv/bin/python`, or `.env/bin/python` and uses the project's interpreter when found, falling back to system `python3` only when nothing is in scope.
 * Embedded shell with full ANSI color, key forwarding, mouse-drag text selection, and 5000-row scrollback.
 * Git status pill in the bottom bar (branch, dirty bullet, ahead / behind).
 * Welcome recents fetched live via the anonymous git protocol so the panel works behind shared egress IPs (Tailscale, corporate NAT) where the Bitbucket / GitHub REST APIs are rate-limited.
 * `setup-terminal` and `setup-iterm2` AppleScript / plist helpers.
 
-The repo ships 564 unit tests plus CLI integration tests; run with `cargo test`.
+The repo ships 568 unit tests plus CLI integration tests; run with `cargo test`.
 
 What does not work yet: command palette, settings, LSP, debugger.
 

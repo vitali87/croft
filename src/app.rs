@@ -3007,20 +3007,40 @@ impl App {
         self.run_debug.feedback_is_error = false;
     }
 
-    /// Build a shell command line that runs `path` based on its extension.
-    /// Returns `None` for paths whose extension we don't know how to run; the
-    /// caller renders that as a feedback line so the user sees why nothing
-    /// happened. The path is single-quoted with embedded `'` escaped so a
-    /// filename like `O'Reilly.py` cannot break out of the quoting.
-    fn run_command_for_path(path: &Path) -> Option<String> {
-        let quoted = shell_single_quote(&path.to_string_lossy());
-        let ext = path
+    /// Resolve how to run `file`: which command line to feed the PTY and
+    /// which directory the PTY should `chdir` to. Returns `None` for
+    /// extensions we don't know how to run.
+    ///
+    /// For Python files the resolver walks from the file's directory up to
+    /// (and including) `workspace_root`, picking the first `.venv/bin/python`,
+    /// `venv/bin/python`, or `.env/bin/python` it finds. The cwd is set to
+    /// the directory that owns the venv so relative imports, `.env` reads,
+    /// and any path-relative work the script does line up with how the user
+    /// would run it from their own shell. With no venv anywhere on the
+    /// path the resolver falls back to the system `python3` and the file's
+    /// own directory.
+    fn run_spec_for(file: &Path, workspace_root: &Path) -> Option<RunSpec> {
+        let ext = file
             .extension()
             .and_then(|e| e.to_str())
             .unwrap_or("")
             .to_ascii_lowercase();
+        let quoted_file = shell_single_quote(&file.to_string_lossy());
+        let file_dir = file.parent().unwrap_or(Path::new(".")).to_path_buf();
+        if matches!(ext.as_str(), "py" | "pyi" | "pyw") {
+            if let Some((py, venv_dir)) = find_python_venv(&file_dir, workspace_root) {
+                let quoted_py = shell_single_quote(&py.to_string_lossy());
+                return Some(RunSpec {
+                    cmd: format!("{quoted_py} {quoted_file}\n"),
+                    cwd: venv_dir,
+                });
+            }
+            return Some(RunSpec {
+                cmd: format!("python3 {quoted_file}\n"),
+                cwd: file_dir,
+            });
+        }
         let runner: &str = match ext.as_str() {
-            "py" => "python3",
             "js" | "mjs" | "cjs" => "node",
             "ts" | "tsx" => "tsx",
             "rb" => "ruby",
@@ -3030,22 +3050,24 @@ impl App {
             "sh" | "bash" => "bash",
             "zsh" => "zsh",
             "fish" => "fish",
-            "rs" | "" => return None,
             _ => return None,
         };
-        Some(format!("{runner} {quoted}\n"))
+        Some(RunSpec {
+            cmd: format!("{runner} {quoted_file}\n"),
+            cwd: file_dir,
+        })
     }
 
-    /// Spawn a fresh PTY in the workspace root and seed it with the runner
-    /// command for the active editor tab's file, then focus the terminal
-    /// pane so the user sees the output immediately.
+    /// Spawn a fresh PTY at the resolved working directory, seed it with the
+    /// runner command for the active editor tab's file, and focus the
+    /// terminal pane so the user sees output immediately.
     pub fn run_active_file(&mut self) {
         let Some(path) = self.editor.path.clone() else {
             self.run_debug.feedback = Some(String::from("Open a file first"));
             self.run_debug.feedback_is_error = true;
             return;
         };
-        let Some(cmd) = Self::run_command_for_path(&path) else {
+        let Some(spec) = Self::run_spec_for(&path, &self.workspace_root) else {
             self.run_debug.feedback = Some(format!(
                 "Don't know how to run {}",
                 path.file_name()
@@ -3055,9 +3077,9 @@ impl App {
             self.run_debug.feedback_is_error = true;
             return;
         };
-        match PtyTerminal::new(&self.workspace_root) {
+        match PtyTerminal::new(&spec.cwd) {
             Ok(mut term) => {
-                term.write_input(cmd.as_bytes());
+                term.write_input(spec.cmd.as_bytes());
                 self.terminals.push(term);
                 self.active_terminal = self.terminals.len() - 1;
                 if !self.show_terminal {
@@ -5988,6 +6010,49 @@ fn rect_contains(r: Rect, x: u16, y: u16) -> bool {
         && x < r.x + r.width
         && y >= r.y
         && y < r.y + r.height
+}
+
+/// What `App::run_active_file` needs to spawn one PTY: the literal command
+/// line to feed the shell (terminated with a newline so the shell executes
+/// it) and the directory the PTY should `chdir` to. Two fields instead of
+/// one tuple because each one has a load-bearing invariant — see the docs
+/// on `App::run_spec_for`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunSpec {
+    pub cmd: String,
+    pub cwd: PathBuf,
+}
+
+/// Walk from `start` up to and including `workspace_root` looking for a
+/// venv-style Python interpreter. Returns `(interpreter_path, owning_dir)`
+/// where `owning_dir` is the directory that contains the venv folder — the
+/// natural cwd for the run.
+///
+/// The walk stops at `workspace_root`: a venv that lives ABOVE the workspace
+/// would belong to a different project the user has not opened, and using it
+/// silently would surprise them.
+fn find_python_venv(start: &Path, workspace_root: &Path) -> Option<(PathBuf, PathBuf)> {
+    let mut probe = start.to_path_buf();
+    loop {
+        for venv_name in [".venv", "venv", ".env"] {
+            let py = probe.join(venv_name).join("bin").join("python");
+            if py.is_file() {
+                return Some((py, probe));
+            }
+        }
+        if probe == workspace_root {
+            return None;
+        }
+        match probe.parent() {
+            Some(parent) if parent != probe => {
+                if !parent.starts_with(workspace_root) && parent != workspace_root {
+                    return None;
+                }
+                probe = parent.to_path_buf();
+            }
+            _ => return None,
+        }
+    }
 }
 
 /// POSIX-shell single-quote `s` so it round-trips through `bash -c` etc.
@@ -9237,40 +9302,135 @@ mod tests {
     }
 
     #[test]
-    fn run_command_for_path_picks_python3_for_dot_py() {
-        let cmd = App::run_command_for_path(std::path::Path::new("/work/script.py")).unwrap();
-        assert!(cmd.starts_with("python3 "), "got: {cmd}");
-        assert!(cmd.ends_with('\n'), "command must end with newline so the shell executes it");
-        assert!(cmd.contains("'/work/script.py'"));
+    fn run_spec_for_python_with_no_venv_falls_back_to_system_python3() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("script.py");
+        std::fs::write(&f, b"").unwrap();
+        let spec = App::run_spec_for(&f, tmp.path()).unwrap();
+        assert!(spec.cmd.starts_with("python3 "), "got cmd: {}", spec.cmd);
+        assert!(spec.cmd.ends_with('\n'));
+        assert_eq!(spec.cwd, tmp.path());
     }
 
     #[test]
-    fn run_command_for_path_picks_node_for_dot_js() {
-        let cmd = App::run_command_for_path(std::path::Path::new("/work/server.js")).unwrap();
-        assert!(cmd.starts_with("node "));
+    fn run_spec_for_node_picks_node_for_dot_js() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("server.js");
+        std::fs::write(&f, b"").unwrap();
+        let spec = App::run_spec_for(&f, tmp.path()).unwrap();
+        assert!(spec.cmd.starts_with("node "));
     }
 
     #[test]
-    fn run_command_for_path_picks_bash_for_dot_sh() {
-        let cmd = App::run_command_for_path(std::path::Path::new("/work/build.sh")).unwrap();
-        assert!(cmd.starts_with("bash "));
+    fn run_spec_for_bash_picks_bash_for_dot_sh() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("build.sh");
+        std::fs::write(&f, b"").unwrap();
+        let spec = App::run_spec_for(&f, tmp.path()).unwrap();
+        assert!(spec.cmd.starts_with("bash "));
     }
 
     #[test]
-    fn run_command_for_path_returns_none_for_unknown_extension() {
-        assert!(App::run_command_for_path(std::path::Path::new("/work/notes.txt")).is_none());
-        assert!(App::run_command_for_path(std::path::Path::new("/work/Cargo.toml")).is_none());
+    fn run_spec_for_unknown_extension_returns_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("notes.txt");
+        std::fs::write(&f, b"").unwrap();
+        assert!(App::run_spec_for(&f, tmp.path()).is_none());
     }
 
     #[test]
-    fn run_command_for_path_quotes_apostrophes_safely() {
-        // Filenames containing ' must be POSIX-quoted so the shell sees the
-        // literal single-quote and not a quoting break-out.
-        let cmd =
-            App::run_command_for_path(std::path::Path::new("/work/O'Reilly.py")).unwrap();
+    fn run_spec_quotes_apostrophes_safely() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("O'Reilly.py");
+        std::fs::write(&f, b"").unwrap();
+        let spec = App::run_spec_for(&f, tmp.path()).unwrap();
         assert!(
-            cmd.contains("'/work/O'\\''Reilly.py'"),
-            "apostrophe must be POSIX-escaped via '\\'' in: {cmd}"
+            spec.cmd.contains("O'\\''Reilly.py"),
+            "apostrophe must be POSIX-escaped via '\\'' in: {}",
+            spec.cmd
+        );
+    }
+
+    /// Drop a fake `bin/python` shim in `dir/.venv/bin/python` so the venv
+    /// detector finds an executable file. Returns the full path to the shim
+    /// for assertions.
+    fn make_venv(dir: &Path, venv_name: &str) -> PathBuf {
+        let bin = dir.join(venv_name).join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let py = bin.join("python");
+        std::fs::write(&py, b"#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&py).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&py, perms).unwrap();
+        }
+        py
+    }
+
+    #[test]
+    fn run_spec_picks_dot_venv_python_in_the_file_directory_over_system_python3() {
+        // Reproduces the user-reported case: croft is opened on a parent
+        // directory, the file lives in a subfolder that owns a .venv, and
+        // running the file with system python3 misses the project's deps.
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let venv_python = make_venv(&project, ".venv");
+        let f = project.join("main.py");
+        std::fs::write(&f, b"").unwrap();
+        let spec = App::run_spec_for(&f, tmp.path()).unwrap();
+        assert!(
+            spec.cmd.contains(venv_python.to_string_lossy().as_ref()),
+            "venv interpreter must be invoked: {} (looked for {})",
+            spec.cmd,
+            venv_python.display()
+        );
+        assert_eq!(
+            spec.cwd, project,
+            "cwd must be the directory that owns the venv so relative imports / .env files resolve"
+        );
+    }
+
+    #[test]
+    fn run_spec_walks_up_from_file_dir_to_find_venv_in_an_ancestor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        let nested = project.join("src").join("pkg");
+        std::fs::create_dir_all(&nested).unwrap();
+        make_venv(&project, ".venv");
+        let f = nested.join("main.py");
+        std::fs::write(&f, b"").unwrap();
+        let spec = App::run_spec_for(&f, tmp.path()).unwrap();
+        assert!(spec.cmd.contains(".venv/bin/python"));
+        assert_eq!(spec.cwd, project);
+    }
+
+    #[test]
+    fn run_spec_also_picks_a_plain_venv_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        make_venv(tmp.path(), "venv");
+        let f = tmp.path().join("main.py");
+        std::fs::write(&f, b"").unwrap();
+        let spec = App::run_spec_for(&f, tmp.path()).unwrap();
+        assert!(spec.cmd.contains("venv/bin/python"));
+    }
+
+    #[test]
+    fn run_spec_does_not_walk_above_workspace_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        // venv lives ABOVE the workspace root — must be ignored.
+        make_venv(tmp.path(), ".venv");
+        let workspace = tmp.path().join("inner");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let f = workspace.join("main.py");
+        std::fs::write(&f, b"").unwrap();
+        let spec = App::run_spec_for(&f, &workspace).unwrap();
+        assert!(
+            spec.cmd.starts_with("python3 "),
+            "must NOT use a venv that sits above the workspace root: {}",
+            spec.cmd
         );
     }
 
