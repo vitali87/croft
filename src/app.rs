@@ -466,6 +466,14 @@ pub struct App {
     /// nothing in the icon area, which leaves the bordered cluster looking
     /// like a clean text-only sidebar (still legible).
     run_debug_icon_osc: Option<String>,
+    /// Cell where the run-debug icon was actually painted on the previous
+    /// flush. Used to wipe the OLD position before re-emitting at a new
+    /// one, or once the user switches sidebar views away from Run-Debug —
+    /// iTerm2's OSC-1337 image cells survive ratatui's diff and a plain
+    /// SGR overdraw, so without explicitly stamping blanks at the old
+    /// cell the bug+play picture ghosts on top of whichever panel comes
+    /// next (Explorer / Search / Source Control).
+    run_debug_icon_last_emitted: Option<(u16, u16)>,
     /// Absolute terminal cell where the Codeberg badge image goes. Recorded
     /// during welcome render; consumed post-draw. `None` when the welcome
     /// panel isn't visible or the open repo isn't on Codeberg.
@@ -1037,6 +1045,7 @@ impl App {
             activity_images: None,
             welcome_codeberg_badge_osc: None,
             run_debug_icon_osc: None,
+            run_debug_icon_last_emitted: None,
             welcome_codeberg_badge_cell: None,
             welcome_codeberg_badge_last_emitted: None,
             last_editor_left_down: None,
@@ -1234,32 +1243,54 @@ impl App {
     }
 
     /// Emit the OSC-1337 image carrying the run-debug headline icon at the
-    /// cell the panel reserved on its most recent render. Idempotent: when
-    /// the panel isn't visible (different sidebar view, sidebar collapsed)
-    /// or the icon hasn't been baked, this is a no-op. The OSC writes
-    /// happen outside ratatui's diff so the image lands cleanly above the
-    /// headline without flicker.
+    /// cell the panel reserved on its most recent render. When the panel
+    /// is no longer visible (sidebar view switched away, sidebar
+    /// collapsed) the prior emit is wiped with a block of spaces so
+    /// iTerm2's image-cell cache doesn't ghost the bug+play picture on
+    /// top of whichever panel replaces it. The OSC writes happen outside
+    /// ratatui's diff so neither the emit nor the wipe flickers.
     pub fn flush_run_debug_icon_overlay(&mut self) {
         use std::io::Write;
-        if self.sidebar_view != SidebarView::RunDebug {
+        let panel_visible = self.show_tree
+            && self.sidebar_view == SidebarView::RunDebug
+            && self.run_debug_icon_osc.is_some();
+        let target = if panel_visible {
+            self.run_debug.last_icon_cell
+        } else {
+            None
+        };
+        if target.is_none() && self.run_debug_icon_last_emitted.is_none() {
             return;
         }
-        let Some(osc) = self.run_debug_icon_osc.as_deref() else {
-            return;
-        };
-        let Some((cx, cy)) = self.run_debug.last_icon_cell else {
-            return;
-        };
         let mut out = stdout();
         let cursor_on = self.cursor_should_be_visible();
         let _ = write!(out, "\x1b[?25l\x1b[s");
-        let _ = write!(out, "\x1b[{};{}H", cy + 1, cx + 1);
-        let _ = out.write_all(osc.as_bytes());
+        // Wipe the previous emit (with spaces matching the icon block size)
+        // when either the panel went away or its anchor cell moved.
+        if let Some((ox, oy)) = self.run_debug_icon_last_emitted {
+            let needs_wipe = match target {
+                Some(t) => t != (ox, oy),
+                None => true,
+            };
+            if needs_wipe {
+                let block_w = crate::widgets::run_debug::RUN_DEBUG_ICON_CELLS_W as usize;
+                for ry in 0..crate::widgets::run_debug::RUN_DEBUG_ICON_CELLS_H {
+                    let _ = write!(out, "\x1b[{};{}H", oy + ry + 1, ox + 1);
+                    let blanks: String = std::iter::repeat(' ').take(block_w).collect();
+                    let _ = out.write_all(blanks.as_bytes());
+                }
+            }
+        }
+        if let (Some((nx, ny)), Some(osc)) = (target, self.run_debug_icon_osc.as_deref()) {
+            let _ = write!(out, "\x1b[{};{}H", ny + 1, nx + 1);
+            let _ = out.write_all(osc.as_bytes());
+        }
         let _ = write!(out, "\x1b[u");
         if cursor_on {
             let _ = write!(out, "\x1b[?25h");
         }
         let _ = out.flush();
+        self.run_debug_icon_last_emitted = target;
     }
 
     /// Returns the post-frame OSC-1337 escapes to write under the activity
@@ -6780,6 +6811,37 @@ mod tests {
     /// logo "ghosts" mid-screen. The flush method must record the last
     /// emit cell, wipe it on move, and clear it when the welcome panel
     /// goes away (file opened, or provider switches off Codeberg).
+    #[test]
+    fn switching_away_from_run_debug_wipes_the_icon_overlay_so_it_does_not_ghost_other_sidebars() {
+        // User-reported regression: the OSC-1337 debug-alt overlay kept
+        // appearing on top of the Explorer / Search / Source-Control
+        // panels because iTerm2 caches image cells outside ratatui's
+        // buffer. The flush must record the previous emit and stamp
+        // blanks at that position when the panel goes away.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.run_debug_icon_osc = Some("\x1b]1337;File=...\x07".to_string());
+
+        // Render with Run-Debug visible; flush records the emit cell.
+        app.set_sidebar_view(SidebarView::RunDebug);
+        app.run_debug.last_icon_cell = Some((10, 5));
+        app.flush_run_debug_icon_overlay();
+        assert_eq!(
+            app.run_debug_icon_last_emitted,
+            Some((10, 5)),
+            "while the panel is visible the flush must record the cell so a future switch-away knows where to wipe"
+        );
+
+        // Switch to Explorer; flush must wipe the prior emit so the
+        // bug+play picture stops bleeding through into the file tree.
+        app.set_sidebar_view(SidebarView::Explorer);
+        app.flush_run_debug_icon_overlay();
+        assert_eq!(
+            app.run_debug_icon_last_emitted, None,
+            "after leaving the Run and Debug view the flush must drop the last-emitted record (the wipe pass already stamped blanks at the old cell)"
+        );
+    }
+
     #[test]
     fn flush_welcome_codeberg_badge_overlay_tracks_last_emitted_cell_across_resizes() {
         let tmp = tempfile::tempdir().unwrap();
