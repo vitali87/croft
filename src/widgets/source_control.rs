@@ -9,9 +9,7 @@ use ratatui::{
     widgets::{Block, BorderType, Borders, Paragraph, Widget},
 };
 
-const BUTTON_LABEL: &str = "  Commit  ";
 const INPUT_PROMPT_RGB: (u8, u8, u8) = (0x6c, 0x7d, 0x9c);
-const INPUT_BG_RGB: (u8, u8, u8) = (0x2a, 0x2f, 0x3b);
 const BUTTON_BG_RGB: (u8, u8, u8) = (0x09, 0x67, 0xb8);
 const BUTTON_FG_RGB: (u8, u8, u8) = (0xff, 0xff, 0xff);
 const SECTION_HEADER_RGB: (u8, u8, u8) = (0xcc, 0xcc, 0xcc);
@@ -239,6 +237,64 @@ fn section_label(section: ChangeSection) -> &'static str {
     }
 }
 
+/// Paint a chunky 3-row solid-bg button at `area`, with rounded corner
+/// glyphs that let the panel bg show through the four corner notches so
+/// the button reads as a rounded rectangle (matching the VS Code mockup).
+/// Shared between the Source Control commit button and the Run-and-Debug
+/// button — same style, same corner treatment.
+pub fn render_rounded_button(
+    buf: &mut Buffer,
+    area: Rect,
+    label: &str,
+    bg: Color,
+    fg: Color,
+) {
+    if area.width < 2 || area.height < 1 {
+        return;
+    }
+    // Fill every cell with the solid bg. The label and the corner glyphs
+    // overwrite specific cells below.
+    let solid = Style::default().bg(bg);
+    for ry in 0..area.height {
+        for rx in 0..area.width {
+            buf[(area.x + rx, area.y + ry)]
+                .set_symbol(" ")
+                .set_style(solid);
+        }
+    }
+    // Replace the four corner cells with rounded-border glyphs whose bg is
+    // *unset* so the panel bg shows through the outer angle of each curve;
+    // the glyph's stroke is drawn in the button bg colour so the curve
+    // visually continues the button outline.
+    let corner_style = Style::default().fg(bg);
+    if area.height >= 2 {
+        buf[(area.x, area.y)]
+            .set_symbol("╭")
+            .set_style(corner_style);
+        buf[(area.x + area.width - 1, area.y)]
+            .set_symbol("╮")
+            .set_style(corner_style);
+        buf[(area.x, area.y + area.height - 1)]
+            .set_symbol("╰")
+            .set_style(corner_style);
+        buf[(area.x + area.width - 1, area.y + area.height - 1)]
+            .set_symbol("╯")
+            .set_style(corner_style);
+    }
+    let label_w = label.chars().count() as u16;
+    if label_w > area.width {
+        return;
+    }
+    let label_x = area.x + (area.width - label_w) / 2;
+    let label_y = area.y + area.height / 2;
+    buf.set_string(
+        label_x,
+        label_y,
+        label,
+        Style::default().fg(fg).bg(bg).add_modifier(Modifier::BOLD),
+    );
+}
+
 fn badge_color(kind: ChangeKind) -> Color {
     match kind {
         ChangeKind::StagedAdded => Color::Rgb(0x81, 0xb8, 0x8c),
@@ -305,9 +361,13 @@ impl Widget for &mut SourceControlPanel {
             return;
         }
         let mut spans: Vec<Span> = Vec::with_capacity(5);
+        // Codicon `cod-github` (U+EA84) in cyan, matching the VS Code
+        // mockup. The old `cod-source-control` (U+EB14) green fork glyph
+        // was the wrong glyph for the branch row — that one belongs to
+        // the activity-bar slot, not the per-branch indicator.
         spans.push(Span::styled(
-            "\u{eb14} ",
-            Style::default().fg(Color::Rgb(0xa3, 0xbe, 0x8c)),
+            "\u{ea84} ",
+            Style::default().fg(Color::Rgb(0x88, 0xc0, 0xd0)),
         ));
         let label = match (&self.status.branch, &self.status.detached_hash) {
             (Some(b), _) => b.clone(),
@@ -376,34 +436,15 @@ impl Widget for &mut SourceControlPanel {
         }
         y += 3 + 1; // input box + 1-row gap
 
-        // Rows y..y+3: chunky commit button.
+        // Rows y..y+3: chunky commit button with rounded corners.
         if y + 3 > inner.y + inner.height {
             return;
         }
         let button_area = Rect { x: inner.x, y, width: inner.width, height: 3 };
         self.last_button_area = button_area;
-        let button_bg =
-            Style::default().bg(Color::Rgb(BUTTON_BG_RGB.0, BUTTON_BG_RGB.1, BUTTON_BG_RGB.2));
-        for ry in 0..button_area.height {
-            for rx in 0..button_area.width {
-                buf[(button_area.x + rx, button_area.y + ry)]
-                    .set_symbol(" ")
-                    .set_style(button_bg);
-            }
-        }
-        let label_text = "Commit";
-        let label_w = label_text.chars().count() as u16;
-        let label_x = button_area.x + (button_area.width.saturating_sub(label_w)) / 2;
-        let label_y = button_area.y + button_area.height / 2;
-        buf.set_string(
-            label_x,
-            label_y,
-            label_text,
-            Style::default()
-                .fg(Color::Rgb(BUTTON_FG_RGB.0, BUTTON_FG_RGB.1, BUTTON_FG_RGB.2))
-                .bg(Color::Rgb(BUTTON_BG_RGB.0, BUTTON_BG_RGB.1, BUTTON_BG_RGB.2))
-                .add_modifier(Modifier::BOLD),
-        );
+        let blue = Color::Rgb(BUTTON_BG_RGB.0, BUTTON_BG_RGB.1, BUTTON_BG_RGB.2);
+        let white = Color::Rgb(BUTTON_FG_RGB.0, BUTTON_FG_RGB.1, BUTTON_FG_RGB.2);
+        render_rounded_button(buf, button_area, "Commit", blue, white);
         y += 3 + 1; // button + 1-row gap
 
         // Optional feedback line.
@@ -721,6 +762,57 @@ mod tests {
             "Commit button must be near-full-width; got {}",
             p.last_button_area.width
         );
+    }
+
+    #[test]
+    fn branch_row_uses_the_github_codicon_in_cyan() {
+        use ratatui::buffer::Buffer;
+        let mut p = SourceControlPanel::new();
+        p.set_status(dummy_status_with_branch("main"), Vec::new());
+        let area = Rect { x: 0, y: 0, width: 60, height: 20 };
+        let mut buf = Buffer::empty(area);
+        ratatui::widgets::Widget::render(&mut p, area, &mut buf);
+        // Branch row sits at inner.y + 2 = buffer row 3 (after the
+        // outer top border and the SOURCE CONTROL header).
+        let inner = p.last_inner;
+        let row_y = inner.y + 2;
+        // Find the GitHub codicon (cod-github, U+EA84) on that row.
+        let mut hit: Option<u16> = None;
+        for x in inner.x..inner.x + inner.width {
+            if buf[(x, row_y)].symbol() == "\u{ea84}" {
+                hit = Some(x);
+                break;
+            }
+        }
+        let x = hit.expect("branch row must carry the cod-github (U+EA84) glyph");
+        let style = buf[(x, row_y)].style();
+        // Cyan-ish colour, not the old green.
+        let expected = ratatui::style::Color::Rgb(0x88, 0xc0, 0xd0);
+        assert_eq!(
+            style.fg,
+            Some(expected),
+            "GitHub icon must render in the cyan branch colour, not the old green source-control colour"
+        );
+    }
+
+    #[test]
+    fn commit_button_uses_rounded_border_corners() {
+        use ratatui::buffer::Buffer;
+        let mut p = SourceControlPanel::new();
+        p.set_status(dummy_status_with_branch("main"), Vec::new());
+        let area = Rect { x: 0, y: 0, width: 40, height: 20 };
+        let mut buf = Buffer::empty(area);
+        ratatui::widgets::Widget::render(&mut p, area, &mut buf);
+        let b = p.last_button_area;
+        assert!(b.height >= 3 && b.width >= 4, "button must be laid out");
+        let tl = buf[(b.x, b.y)].symbol().to_string();
+        let tr = buf[(b.x + b.width - 1, b.y)].symbol().to_string();
+        let bl = buf[(b.x, b.y + b.height - 1)].symbol().to_string();
+        let br = buf[(b.x + b.width - 1, b.y + b.height - 1)].symbol().to_string();
+        assert_eq!(tl, "╭", "top-left commit-button corner must be rounded; got {tl:?}");
+        assert_eq!(tr, "╮", "top-right commit-button corner must be rounded; got {tr:?}");
+        assert_eq!(bl, "╰", "bottom-left commit-button corner must be rounded; got {bl:?}");
+        assert_eq!(br, "╯", "bottom-right commit-button corner must be rounded; got {br:?}");
     }
 
     #[test]

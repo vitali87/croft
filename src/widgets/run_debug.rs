@@ -188,26 +188,12 @@ impl Widget for &mut RunDebugPanel {
             height: BUTTON_H,
         };
         self.last_button_area = button_area;
-        let button_bg = Style::default().bg(Color::Rgb(BUTTON_BG_RGB.0, BUTTON_BG_RGB.1, BUTTON_BG_RGB.2));
-        // Fill the whole button rectangle with the bg colour so the chunky
-        // 3-row button reads as one shape.
-        for ry in 0..button_area.height {
-            for rx in 0..button_area.width {
-                buf[(button_area.x + rx, button_area.y + ry)]
-                    .set_symbol(" ")
-                    .set_style(button_bg);
-            }
-        }
-        let label_y = button_area.y + button_area.height / 2;
-        let label_x = button_area.x + (button_area.width.saturating_sub(label_chars)) / 2;
-        buf.set_string(
-            label_x,
-            label_y,
+        crate::widgets::source_control::render_rounded_button(
+            buf,
+            button_area,
             label.as_str(),
-            Style::default()
-                .fg(Color::Rgb(BUTTON_FG_RGB.0, BUTTON_FG_RGB.1, BUTTON_FG_RGB.2))
-                .bg(Color::Rgb(BUTTON_BG_RGB.0, BUTTON_BG_RGB.1, BUTTON_BG_RGB.2))
-                .add_modifier(Modifier::BOLD),
+            Color::Rgb(BUTTON_BG_RGB.0, BUTTON_BG_RGB.1, BUTTON_BG_RGB.2),
+            Color::Rgb(BUTTON_FG_RGB.0, BUTTON_FG_RGB.1, BUTTON_FG_RGB.2),
         );
 
         let mut next_y = button_area.y + button_area.height + 1;
@@ -312,6 +298,24 @@ mod tests {
             "button must sit below the icon (icon_y={icon_y}, button.y={})",
             button.y
         );
+    }
+
+    #[test]
+    fn run_and_debug_button_uses_rounded_border_corners() {
+        let mut panel = RunDebugPanel::new();
+        let area = Rect { x: 0, y: 0, width: 36, height: 24 };
+        let mut buf = Buffer::empty(area);
+        Widget::render(&mut panel, area, &mut buf);
+        let b = panel.last_button_area;
+        assert!(b.height >= 3 && b.width >= 4, "button must be laid out");
+        let tl = buf[(b.x, b.y)].symbol().to_string();
+        let tr = buf[(b.x + b.width - 1, b.y)].symbol().to_string();
+        let bl = buf[(b.x, b.y + b.height - 1)].symbol().to_string();
+        let br = buf[(b.x + b.width - 1, b.y + b.height - 1)].symbol().to_string();
+        assert_eq!(tl, "╭", "top-left button corner must be rounded; got {tl:?}");
+        assert_eq!(tr, "╮", "top-right button corner must be rounded; got {tr:?}");
+        assert_eq!(bl, "╰", "bottom-left button corner must be rounded; got {bl:?}");
+        assert_eq!(br, "╯", "bottom-right button corner must be rounded; got {br:?}");
     }
 
     #[test]
