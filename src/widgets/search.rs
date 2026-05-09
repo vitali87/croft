@@ -4,7 +4,7 @@ use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Widget},
+    widgets::{Block, BorderType, Borders, Widget},
 };
 use std::path::{Path, PathBuf};
 
@@ -454,15 +454,16 @@ impl SearchPanel {
         self.hits.get(self.selected)
     }
 
-    /// Map a click row to a hit index, if any.
+    /// Map a click row to a hit index, if any. Hits sit below the cluster:
+    /// row 0 = "SEARCH" header, rows 2..=4 = bordered input box, row 5 =
+    /// thin separator, row 6 = match-count caption, rows 7+ = results.
     pub fn hit_at_y(&self, y: u16) -> Option<usize> {
         let inner = self.last_inner;
-        // First inner row is the input box, second row is a separator/blank,
-        // hits start at row 2.
-        if y < inner.y + 2 || y >= inner.y + inner.height {
+        let results_start = inner.y + 7;
+        if y < results_start || y >= inner.y + inner.height {
             return None;
         }
-        let row_in_results = (y - (inner.y + 2)) as usize;
+        let row_in_results = (y - results_start) as usize;
         let idx = self.scroll + row_in_results;
         if idx < self.hits.len() {
             Some(idx)
@@ -482,61 +483,114 @@ pub enum SearchToggle {
 
 impl Widget for &mut SearchPanel {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        let block_style = if self.focused {
-            Style::default().fg(Color::Rgb(0x4e, 0x9a, 0xff))
+        let focus_blue = Color::Rgb(0x4e, 0x9a, 0xff);
+        let outer_style = if self.focused {
+            Style::default().fg(focus_blue)
         } else {
             Style::default().fg(Color::DarkGray)
         };
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(block_style)
-            .title(Span::styled(
-                " SEARCH ",
-                Style::default()
-                    .fg(Color::White)
-                    .bg(Color::Rgb(0x1e, 0x3a, 0x6e))
-                    .add_modifier(Modifier::BOLD),
-            ));
-        let inner = block.inner(area);
-        block.render(area, buf);
+        let outer = Block::default().borders(Borders::ALL).border_style(outer_style);
+        let inner = outer.inner(area);
+        outer.render(area, buf);
         self.last_area = area;
         self.last_inner = inner;
-        if inner.height == 0 {
+        if inner.height == 0 || inner.width == 0 {
             return;
         }
 
-        // Input row: chevron prefix, query (or italic placeholder when empty),
-        // a software-cursor block when focused, and a right-aligned cluster
-        // of `Aa ab .*` mode glyphs.
-        let chevron_color = if self.focused {
-            Color::Rgb(0x4e, 0x9a, 0xff)
-        } else {
-            Color::DarkGray
-        };
-        let toggle_glyph_w: u16 = 2;
-        let toggles_w: u16 = toggle_glyph_w * 3 + 2;
+        // Row 0: "SEARCH" header, top-left, light grey. Replaces the old
+        // dark-blue title chip on the outer border, matching the VS Code
+        // mockup the user supplied.
+        buf.set_string(
+            inner.x,
+            inner.y,
+            "SEARCH",
+            Style::default()
+                .fg(Color::Rgb(0xb0, 0xb8, 0xc8))
+                .add_modifier(Modifier::BOLD),
+        );
+
+        if inner.height < 4 {
+            return;
+        }
+
+        // Geometry for the input cluster sitting at rows 2..=4 of the
+        // inner area: a chevron `▾` on the left, a 3-row input box in the
+        // middle (thin rounded border, focus-aware), and `Aa │ ab │ .*`
+        // toggles to the right of the input. Cursor and content sit on
+        // the box's middle row.
+        let toggles_inner_w: u16 = 2 + 3 + 2 + 3 + 2; // "Aa" + " │ " + "ab" + " │ " + ".*"
+        let chevron_w: u16 = 2; // "▾ "
+        let input_top_y = inner.y + 2;
+        let input_bot_y = input_top_y + 2;
+        let content_y = input_top_y + 1;
+        let chevron_x = inner.x;
+        let input_x = chevron_x + chevron_w;
         let toggles_x = inner
             .x
-            .saturating_add(inner.width.saturating_sub(toggles_w));
-        let chevron = Span::styled(
-            "› ",
+            .saturating_add(inner.width.saturating_sub(toggles_inner_w));
+        // Input box width is whatever sits between the chevron column and
+        // the start of the toggles cluster (with a 1-cell gap on either
+        // side so neither ever bumps the box border).
+        let input_w = toggles_x.saturating_sub(input_x).saturating_sub(1).max(8);
+        let input_box = Rect {
+            x: input_x,
+            y: input_top_y,
+            width: input_w,
+            height: 3,
+        };
+
+        // Chevron, vertically aligned with the input content row.
+        let chevron_color = if self.focused { focus_blue } else { Color::DarkGray };
+        buf.set_string(
+            chevron_x,
+            content_y,
+            "▾",
             Style::default().fg(chevron_color).add_modifier(Modifier::BOLD),
         );
-        let cursor_span = Span::styled(
-            "█",
-            Style::default().fg(Color::Rgb(0x4e, 0x9a, 0xff)),
-        );
+
+        // Input box border (rounded so it reads softer than the outer
+        // panel border). Style switches to focus blue when the panel is
+        // focused; otherwise dim grey, matching the rest of the panel.
+        let input_border_style = if self.focused {
+            Style::default().fg(focus_blue)
+        } else {
+            Style::default().fg(Color::Rgb(0x60, 0x68, 0x78))
+        };
+        let input_block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(input_border_style);
+        let input_inner = input_block.inner(input_box);
+        input_block.render(input_box, buf);
+
+        // Magnifier glyph on the left of the input content, matching the
+        // codicon `search` U+EA6D used in the activity bar.
+        let magnifier_glyph = "\u{ea6d}";
+        let magnifier_color = if self.focused { focus_blue } else { Color::Rgb(0x9d, 0xa5, 0xb4) };
+        let magnifier_w: u16 = 2; // glyph + 1-cell gap
+        if input_inner.width > magnifier_w {
+            buf.set_string(
+                input_inner.x,
+                input_inner.y,
+                magnifier_glyph,
+                Style::default().fg(magnifier_color),
+            );
+        }
+        let typed_x = input_inner.x + magnifier_w;
+        let typed_w = input_inner.width.saturating_sub(magnifier_w);
+
+        // Query / placeholder / cursor inside the input box, on its
+        // single content row.
+        let cursor_span = Span::styled("█", Style::default().fg(focus_blue));
         let placeholder_span = Span::styled(
             "Search",
             Style::default()
-                .fg(Color::DarkGray)
+                .fg(Color::Rgb(0x6c, 0x7d, 0x9c))
                 .add_modifier(Modifier::ITALIC),
         );
-        let mut spans: Vec<Span> = vec![chevron];
+        let mut spans: Vec<Span> = Vec::with_capacity(4);
         if self.query.is_empty() {
-            // Empty input: cursor sits at column 0 of the input area, with
-            // the dim placeholder trailing behind it. Matches VS Code: a
-            // blinking caret at position 0 even before the user types.
             if self.focused {
                 spans.push(cursor_span);
             }
@@ -564,55 +618,73 @@ impl Widget for &mut SearchPanel {
                 spans.push(cursor_span);
             }
         }
-        let typed_w = inner.width.saturating_sub(toggles_w + 1);
-        buf.set_line(inner.x, inner.y, &Line::from(spans), typed_w);
+        buf.set_line(typed_x, input_inner.y, &Line::from(spans), typed_w);
 
+        // Toggles cluster: `Aa │ ab │ .*` aligned with the input content
+        // row, with vertical-bar separators between the three glyphs.
         self.paste_button_x = 0;
-        self.paste_button_y = inner.y;
+        self.paste_button_y = content_y;
         self.paste_button_w = 0;
 
         let active_style = Style::default()
             .fg(Color::Black)
             .bg(Color::Rgb(0xff, 0xd7, 0x4a))
             .add_modifier(Modifier::BOLD);
-        let inactive_style = Style::default()
-            .fg(Color::Rgb(0x9d, 0xa5, 0xb4));
-        let toggles: [(u16, &str, bool); 3] = [
-            (toggles_x, "Aa", self.opts.case_sensitive),
-            (toggles_x + toggle_glyph_w + 1, "ab", self.opts.whole_word),
-            (toggles_x + (toggle_glyph_w + 1) * 2, ".*", self.opts.use_regex),
-        ];
-        self.toggle_y = inner.y;
-        self.toggle_case_x = toggles[0].0;
-        self.toggle_word_x = toggles[1].0;
-        self.toggle_regex_x = toggles[2].0;
-        for (x, glyph, active) in toggles {
+        let inactive_style = Style::default().fg(Color::Rgb(0x9d, 0xa5, 0xb4));
+        let pipe_style = Style::default().fg(Color::Rgb(0x60, 0x68, 0x78));
+        let case_x = toggles_x;
+        let word_x = case_x + 2 + 3;
+        let regex_x = word_x + 2 + 3;
+        self.toggle_y = content_y;
+        self.toggle_case_x = case_x;
+        self.toggle_word_x = word_x;
+        self.toggle_regex_x = regex_x;
+        for (x, glyph, active) in [
+            (case_x, "Aa", self.opts.case_sensitive),
+            (word_x, "ab", self.opts.whole_word),
+            (regex_x, ".*", self.opts.use_regex),
+        ] {
             let style = if active { active_style } else { inactive_style };
-            buf.set_string(x, inner.y, glyph, style);
+            buf.set_string(x, content_y, glyph, style);
+        }
+        buf.set_string(case_x + 2 + 1, content_y, "│", pipe_style);
+        buf.set_string(word_x + 2 + 1, content_y, "│", pipe_style);
+
+        // Thin separator below the input box: light grey horizontal rule
+        // running the full inner width.
+        let separator_y = input_bot_y + 1;
+        if separator_y < inner.y + inner.height {
+            let sep_style = Style::default().fg(Color::Rgb(0x40, 0x48, 0x58));
+            for x in inner.x..inner.x + inner.width {
+                buf.set_string(x, separator_y, "─", sep_style);
+            }
         }
 
-        // Status row: live match count. Left blank while waiting for the
-        // first result of a non-empty query so the panel doesn't flash
-        // "0 matches" between keystrokes.
-        if inner.height >= 2 {
-            let header = if self.query.trim().is_empty() {
-                String::new()
-            } else {
-                let count = self.hits.len();
-                format!("{count} match{}", if count == 1 { "" } else { "es" })
-            };
-            let line = Line::from(Span::styled(
+        // Match-count caption: live "N matches" line just below the
+        // separator. Left blank while waiting for the first result so the
+        // panel doesn't flash "0 matches" between keystrokes.
+        let caption_y = separator_y + 1;
+        let results_start_y = caption_y + 1;
+        if caption_y < inner.y + inner.height && !self.query.trim().is_empty() {
+            let count = self.hits.len();
+            let header = format!("{count} match{}", if count == 1 { "" } else { "es" });
+            let caption = Line::from(Span::styled(
                 header,
-                Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+                Style::default()
+                    .fg(Color::Rgb(0x9d, 0xa5, 0xb4))
+                    .add_modifier(Modifier::ITALIC),
             ));
-            buf.set_line(inner.x, inner.y + 1, &line, inner.width);
+            buf.set_line(inner.x, caption_y, &caption, inner.width);
         }
 
         // Results
-        if inner.height < 3 {
+        if results_start_y >= inner.y + inner.height {
             return;
         }
-        let visible = (inner.height as usize).saturating_sub(2);
+        let visible = (inner.y + inner.height - results_start_y) as usize;
+        if visible == 0 {
+            return;
+        }
         if self.selected >= self.scroll + visible {
             self.scroll = self.selected + 1 - visible;
         }
@@ -621,7 +693,7 @@ impl Widget for &mut SearchPanel {
         }
         let end = (self.scroll + visible).min(self.hits.len());
         for (row_idx, hit_idx) in (self.scroll..end).enumerate() {
-            let y = inner.y + 2 + row_idx as u16;
+            let y = results_start_y + row_idx as u16;
             let hit = &self.hits[hit_idx];
             // Show just the basename so the matched line itself has room
             // to render inside a narrow side panel — without this, deep
@@ -764,23 +836,29 @@ mod tests {
         assert_eq!(panel.selected, 0);
     }
 
+    /// New layout x-offset for the typed-content cell, relative to
+    /// `inner.x`: 2-cell chevron column + 1 input-box left border +
+    /// 2-cell magnifier glyph (codicon + 1 cell gap) = 5.
+    const INPUT_TYPED_COL: u16 = 5;
+    /// New layout y-offset for the input content row, relative to
+    /// `inner.y`: header + blank + top border + content = 3.
+    const INPUT_CONTENT_ROW: u16 = 3;
+
     #[test]
     fn cursor_sits_at_input_start_when_query_empty_and_focused() {
         use ratatui::buffer::Buffer;
         let tmp = TempDir::new().unwrap();
         let mut panel = SearchPanel::new(tmp.path().to_path_buf());
         panel.focused = true;
-        let area = Rect { x: 0, y: 0, width: 30, height: 5 };
+        let area = Rect { x: 0, y: 0, width: 60, height: 12 };
         let mut buf = Buffer::empty(area);
         ratatui::widgets::Widget::render(&mut panel, area, &mut buf);
         let inner_x = panel.last_inner.x;
         let inner_y = panel.last_inner.y;
-        // Chevron "› " is 2 cells; cursor "█" must sit at column inner_x + 2,
-        // i.e. at the very start of where the user's typed text would go.
         assert_eq!(
-            buf[(inner_x + 2, inner_y)].symbol(),
+            buf[(inner_x + INPUT_TYPED_COL, inner_y + INPUT_CONTENT_ROW)].symbol(),
             "█",
-            "cursor must immediately follow the chevron when the query is empty"
+            "cursor must sit at the start of the input content area when the query is empty"
         );
     }
 
@@ -791,16 +869,133 @@ mod tests {
         let mut panel = SearchPanel::new(tmp.path().to_path_buf());
         panel.focused = true;
         panel.query = String::from("foo");
-        let area = Rect { x: 0, y: 0, width: 30, height: 5 };
+        let area = Rect { x: 0, y: 0, width: 60, height: 12 };
         let mut buf = Buffer::empty(area);
         ratatui::widgets::Widget::render(&mut panel, area, &mut buf);
         let inner_x = panel.last_inner.x;
         let inner_y = panel.last_inner.y;
-        // Chevron "› " (2 cells) + "foo" (3 cells) → cursor at inner_x + 5.
+        // INPUT_TYPED_COL + "foo" (3 cells) → cursor sits 3 cells past
+        // the start of typed content.
         assert_eq!(
-            buf[(inner_x + 5, inner_y)].symbol(),
+            buf[(inner_x + INPUT_TYPED_COL + 3, inner_y + INPUT_CONTENT_ROW)].symbol(),
             "█",
             "cursor must sit immediately after the typed query"
+        );
+    }
+
+    fn buffer_to_string(buf: &Buffer) -> String {
+        let mut out = String::new();
+        for y in buf.area.y..buf.area.y + buf.area.height {
+            for x in buf.area.x..buf.area.x + buf.area.width {
+                out.push_str(buf[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    #[test]
+    fn header_row_says_search_in_upper_case() {
+        // Mockup-driven: an uppercase "SEARCH" header sits at the top-left
+        // of the inner area, in light grey — replacing the old dark-blue
+        // title bar that used to overlap the outer border.
+        use ratatui::buffer::Buffer;
+        let tmp = TempDir::new().unwrap();
+        let mut panel = SearchPanel::new(tmp.path().to_path_buf());
+        let area = Rect { x: 0, y: 0, width: 60, height: 10 };
+        let mut buf = Buffer::empty(area);
+        ratatui::widgets::Widget::render(&mut panel, area, &mut buf);
+        let inner_x = panel.last_inner.x;
+        let inner_y = panel.last_inner.y;
+        let mut header = String::new();
+        for x in inner_x..inner_x + 8 {
+            header.push_str(buf[(x, inner_y)].symbol());
+        }
+        assert!(
+            header.starts_with("SEARCH"),
+            "first inner row must start with the uppercase SEARCH header; got: {header:?}"
+        );
+        // Outer-border title row must NOT carry a SEARCH chip — the mockup
+        // has no title bar; the header lives inside the panel.
+        let mut top_border = String::new();
+        for x in area.x..area.x + area.width {
+            top_border.push_str(buf[(x, area.y)].symbol());
+        }
+        assert!(
+            !top_border.contains("SEARCH"),
+            "outer border row must not carry a SEARCH title chip: {top_border:?}"
+        );
+    }
+
+    #[test]
+    fn input_box_renders_a_thin_focused_border_three_rows_tall() {
+        use ratatui::buffer::Buffer;
+        let tmp = TempDir::new().unwrap();
+        let mut panel = SearchPanel::new(tmp.path().to_path_buf());
+        panel.focused = true;
+        let area = Rect { x: 0, y: 0, width: 60, height: 12 };
+        let mut buf = Buffer::empty(area);
+        ratatui::widgets::Widget::render(&mut panel, area, &mut buf);
+        let dump = buffer_to_string(&buf);
+        // The input box must render a single-line top-left corner glyph
+        // somewhere in the upper half of the panel.
+        assert!(
+            dump.contains('┌') || dump.contains('╭'),
+            "input box must have a top-left corner; got buffer:\n{dump}"
+        );
+        assert!(
+            dump.contains('└') || dump.contains('╰'),
+            "input box must have a bottom-left corner so the border reads as a 3-row box, not a single rule:\n{dump}"
+        );
+    }
+
+    #[test]
+    fn input_row_carries_a_chevron_and_pipe_separated_toggles() {
+        use ratatui::buffer::Buffer;
+        let tmp = TempDir::new().unwrap();
+        let mut panel = SearchPanel::new(tmp.path().to_path_buf());
+        let area = Rect { x: 0, y: 0, width: 60, height: 10 };
+        let mut buf = Buffer::empty(area);
+        ratatui::widgets::Widget::render(&mut panel, area, &mut buf);
+        let dump = buffer_to_string(&buf);
+        // The expand chevron is the only down-arrow on the panel; absence
+        // of it means we regressed back to the right-pointing chevron.
+        assert!(
+            dump.contains('▾') || dump.contains('⌄'),
+            "input row must have a down-chevron on the left, like VS Code's expand-to-replace toggle:\n{dump}"
+        );
+        // Toggles separated by pipe '│' so the trio reads "Aa │ ab │ .*".
+        assert!(
+            dump.contains("Aa") && dump.contains("ab") && dump.contains(".*"),
+            "all three toggle glyphs must render:\n{dump}"
+        );
+        let pipes = dump.matches('│').count();
+        assert!(
+            pipes >= 2,
+            "at least two pipe separators must sit between the three toggles; got {pipes} pipes in:\n{dump}"
+        );
+    }
+
+    #[test]
+    fn results_start_below_the_input_box_with_a_separator_in_between() {
+        use ratatui::buffer::Buffer;
+        let tmp = TempDir::new().unwrap();
+        write(&tmp.path().join("a.txt"), "needle\n");
+        let mut panel = SearchPanel::new(tmp.path().to_path_buf());
+        panel.query = String::from("needle");
+        panel.run_query();
+        assert_eq!(panel.hits.len(), 1);
+        let area = Rect { x: 0, y: 0, width: 60, height: 14 };
+        let mut buf = Buffer::empty(area);
+        ratatui::widgets::Widget::render(&mut panel, area, &mut buf);
+        let dump = buffer_to_string(&buf);
+        let row_with_needle = dump
+            .lines()
+            .position(|l| l.contains("needle") && l.contains("a.txt"))
+            .expect("result row with needle must render");
+        assert!(
+            row_with_needle >= 5,
+            "result row must sit below the input box (expected row >= 5, got {row_with_needle}):\n{dump}"
         );
     }
 
@@ -1036,7 +1231,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut panel = SearchPanel::new(tmp.path().to_path_buf());
         panel.focused = true;
-        let area = Rect { x: 0, y: 0, width: 30, height: 5 };
+        let area = Rect { x: 0, y: 0, width: 60, height: 12 };
         let mut buf = Buffer::empty(area);
         ratatui::widgets::Widget::render(&mut panel, area, &mut buf);
         let y = panel.toggle_y;
