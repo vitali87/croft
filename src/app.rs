@@ -70,12 +70,12 @@ fn activity_source_control_y(bar: Rect) -> u16 {
     activity_search_y(bar) + ACTIVITY_ICON_HEIGHT + ACTIVITY_ICON_GAP
 }
 
-fn activity_remote_y(bar: Rect) -> u16 {
+fn activity_run_debug_y(bar: Rect) -> u16 {
     activity_source_control_y(bar) + ACTIVITY_ICON_HEIGHT + ACTIVITY_ICON_GAP
 }
 
-fn activity_run_debug_y(bar: Rect) -> u16 {
-    activity_remote_y(bar) + ACTIVITY_ICON_HEIGHT + ACTIVITY_ICON_GAP
+fn activity_remote_y(bar: Rect) -> u16 {
+    activity_run_debug_y(bar) + ACTIVITY_ICON_HEIGHT + ACTIVITY_ICON_GAP
 }
 
 fn activity_explorer_block(bar: Rect) -> Rect {
@@ -9193,7 +9193,7 @@ mod tests {
     }
 
     #[test]
-    fn activity_bar_render_lays_out_run_debug_block_below_source_control() {
+    fn activity_bar_render_lays_out_run_debug_between_source_control_and_remote() {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(tmp.path().to_path_buf()).unwrap();
         let bar = Rect { x: 0, y: 0, width: ACTIVITY_BAR_WIDTH, height: 30 };
@@ -9202,12 +9202,19 @@ mod tests {
         term.draw(|f| app.render_activity_bar(f, bar)).unwrap();
         let scm = app.sidebar_areas.source_control_icon;
         let run = app.sidebar_areas.run_debug_icon;
+        let rem = app.sidebar_areas.remote_icon;
         assert!(run.height > 0, "run-debug icon must claim a non-zero block");
         assert!(
             run.y > scm.y,
-            "run-debug icon must sit BELOW source-control (scm.y={}, run.y={})",
+            "run-debug must sit BELOW source-control (scm.y={}, run.y={})",
             scm.y,
             run.y
+        );
+        assert!(
+            run.y < rem.y,
+            "run-debug must sit ABOVE remote (run.y={}, rem.y={}) — VS Code's activity-bar order",
+            run.y,
+            rem.y
         );
     }
 
