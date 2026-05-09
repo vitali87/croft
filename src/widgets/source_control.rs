@@ -1,11 +1,12 @@
 use crate::git::{ChangeEntry, ChangeKind, ChangeSection, GitStatus};
+use crate::icons;
 use crate::widgets::scrollbar;
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Widget},
+    widgets::{Block, BorderType, Borders, Paragraph, Widget},
 };
 
 const BUTTON_LABEL: &str = "  Commit  ";
@@ -251,23 +252,15 @@ fn badge_color(kind: ChangeKind) -> Color {
 
 impl Widget for &mut SourceControlPanel {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        let block_style = if self.focused {
-            Style::default().fg(Color::Rgb(0x4e, 0x9a, 0xff))
+        let focus_blue = Color::Rgb(0x4e, 0x9a, 0xff);
+        let outer_style = if self.focused {
+            Style::default().fg(focus_blue)
         } else {
             Style::default().fg(Color::DarkGray)
         };
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(block_style)
-            .title(Span::styled(
-                " SOURCE CONTROL ",
-                Style::default()
-                    .fg(Color::White)
-                    .bg(Color::Rgb(0x1e, 0x3a, 0x6e))
-                    .add_modifier(Modifier::BOLD),
-            ));
-        let inner = block.inner(area);
-        block.render(area, buf);
+        let outer = Block::default().borders(Borders::ALL).border_style(outer_style);
+        let inner = outer.inner(area);
+        outer.render(area, buf);
         self.last_area = area;
         self.last_inner = inner;
         self.last_input_area = Rect::default();
@@ -279,16 +272,26 @@ impl Widget for &mut SourceControlPanel {
             return;
         }
 
-        // Non-repo workspace: nothing to commit, no branch to show. Render
-        // a clear empty state and bail before painting the input/button —
-        // both would imply functionality this folder doesn't support.
+        // Row 0: SOURCE CONTROL header (light grey bold), inside the panel.
+        buf.set_string(
+            inner.x,
+            inner.y,
+            "SOURCE CONTROL",
+            Style::default()
+                .fg(Color::Rgb(0xb0, 0xb8, 0xc8))
+                .add_modifier(Modifier::BOLD),
+        );
+
+        // Non-repo workspace: clear empty state below the header.
         if !self.status.in_repo {
             let dim = Style::default().fg(Color::DarkGray);
-            buf.set_string(inner.x + 1, inner.y, "Not a git repository", dim);
-            if inner.height > 1 {
+            if inner.height > 2 {
+                buf.set_string(inner.x, inner.y + 2, "Not a git repository", dim);
+            }
+            if inner.height > 3 {
                 buf.set_string(
-                    inner.x + 1,
-                    inner.y + 1,
+                    inner.x,
+                    inner.y + 3,
                     "Open a folder under git to commit",
                     dim,
                 );
@@ -296,109 +299,145 @@ impl Widget for &mut SourceControlPanel {
             return;
         }
 
-        let header_style = Style::default()
-            .fg(Color::Rgb(SECTION_HEADER_RGB.0, SECTION_HEADER_RGB.1, SECTION_HEADER_RGB.2))
-            .add_modifier(Modifier::BOLD);
-        // Branch / dirty summary row.
-        let mut spans: Vec<Span> = Vec::with_capacity(4);
-        spans.push(Span::raw(" "));
-        spans.push(Span::styled("\u{eb14} ", Style::default().fg(Color::Rgb(0xa3, 0xbe, 0x8c))));
+        // Row 2: branch row — a green branch glyph plus the branch name.
+        let mut y = inner.y + 2;
+        if y >= inner.y + inner.height {
+            return;
+        }
+        let mut spans: Vec<Span> = Vec::with_capacity(5);
+        spans.push(Span::styled(
+            "\u{eb14} ",
+            Style::default().fg(Color::Rgb(0xa3, 0xbe, 0x8c)),
+        ));
         let label = match (&self.status.branch, &self.status.detached_hash) {
             (Some(b), _) => b.clone(),
             (None, Some(h)) => h.clone(),
             (None, None) => "(no head)".to_string(),
         };
-        spans.push(Span::styled(label, header_style));
+        spans.push(Span::styled(
+            label,
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+        ));
         if self.status.ahead > 0 {
             spans.push(Span::styled(
-                format!(" \u{2191}{}", self.status.ahead),
+                format!("  \u{2191}{}", self.status.ahead),
                 Style::default().fg(Color::Rgb(0xa3, 0xbe, 0x8c)),
             ));
         }
         if self.status.behind > 0 {
             spans.push(Span::styled(
-                format!(" \u{2193}{}", self.status.behind),
+                format!("  \u{2193}{}", self.status.behind),
                 Style::default().fg(Color::Rgb(0xeb, 0xcb, 0x8b)),
             ));
         }
-        buf.set_line(inner.x, inner.y, &Line::from(spans), inner.width);
+        buf.set_line(inner.x, y, &Line::from(spans), inner.width);
+        y += 2; // blank gap below branch row
 
-        // Message input (single-line).
-        let input_y = inner.y + 1;
-        if input_y >= inner.y + inner.height {
+        // Rows y..y+3: commit-message input (3-row rounded box).
+        if y + 3 > inner.y + inner.height {
             return;
         }
-        let input_area = Rect { x: inner.x, y: input_y, width: inner.width, height: 1 };
-        self.last_input_area = input_area;
-        let input_bg = Style::default().bg(Color::Rgb(INPUT_BG_RGB.0, INPUT_BG_RGB.1, INPUT_BG_RGB.2));
-        buf.set_style(input_area, input_bg);
-        if self.message.is_empty() {
-            buf.set_string(
-                input_area.x + 1,
-                input_y,
-                "Message (\u{2318}Enter to commit)",
-                Style::default()
-                    .fg(Color::Rgb(INPUT_PROMPT_RGB.0, INPUT_PROMPT_RGB.1, INPUT_PROMPT_RGB.2))
-                    .bg(Color::Rgb(INPUT_BG_RGB.0, INPUT_BG_RGB.1, INPUT_BG_RGB.2)),
-            );
+        let input_box = Rect { x: inner.x, y, width: inner.width, height: 3 };
+        self.last_input_area = input_box;
+        let input_border_style = if self.focused {
+            Style::default().fg(focus_blue)
         } else {
-            buf.set_string(
-                input_area.x + 1,
-                input_y,
-                self.message.as_str(),
-                Style::default()
-                    .fg(Color::White)
-                    .bg(Color::Rgb(INPUT_BG_RGB.0, INPUT_BG_RGB.1, INPUT_BG_RGB.2)),
-            );
+            Style::default().fg(Color::Rgb(0x60, 0x68, 0x78))
+        };
+        let input_block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(input_border_style);
+        let input_inner = input_block.inner(input_box);
+        input_block.render(input_box, buf);
+        if input_inner.width > 0 && input_inner.height > 0 {
+            let content_y = input_inner.y;
+            if self.message.is_empty() {
+                buf.set_string(
+                    input_inner.x + 1,
+                    content_y,
+                    "Message (\u{2318}Enter to commit)",
+                    Style::default()
+                        .fg(Color::Rgb(
+                            INPUT_PROMPT_RGB.0,
+                            INPUT_PROMPT_RGB.1,
+                            INPUT_PROMPT_RGB.2,
+                        ))
+                        .add_modifier(Modifier::ITALIC),
+                );
+            } else {
+                buf.set_string(
+                    input_inner.x + 1,
+                    content_y,
+                    self.message.as_str(),
+                    Style::default().fg(Color::White),
+                );
+            }
         }
+        y += 3 + 1; // input box + 1-row gap
 
-        // Commit button.
-        let button_y = input_y + 1;
-        if button_y >= inner.y + inner.height {
+        // Rows y..y+3: chunky commit button.
+        if y + 3 > inner.y + inner.height {
             return;
         }
-        let button_w = (BUTTON_LABEL.chars().count() as u16).min(inner.width);
-        let button_x = inner.x + (inner.width - button_w) / 2;
-        let button_area = Rect { x: button_x, y: button_y, width: button_w, height: 1 };
+        let button_area = Rect { x: inner.x, y, width: inner.width, height: 3 };
         self.last_button_area = button_area;
-        buf.set_style(
-            button_area,
-            Style::default()
-                .bg(Color::Rgb(BUTTON_BG_RGB.0, BUTTON_BG_RGB.1, BUTTON_BG_RGB.2)),
-        );
+        let button_bg =
+            Style::default().bg(Color::Rgb(BUTTON_BG_RGB.0, BUTTON_BG_RGB.1, BUTTON_BG_RGB.2));
+        for ry in 0..button_area.height {
+            for rx in 0..button_area.width {
+                buf[(button_area.x + rx, button_area.y + ry)]
+                    .set_symbol(" ")
+                    .set_style(button_bg);
+            }
+        }
+        let label_text = "Commit";
+        let label_w = label_text.chars().count() as u16;
+        let label_x = button_area.x + (button_area.width.saturating_sub(label_w)) / 2;
+        let label_y = button_area.y + button_area.height / 2;
         buf.set_string(
-            button_area.x,
-            button_area.y,
-            BUTTON_LABEL,
+            label_x,
+            label_y,
+            label_text,
             Style::default()
                 .fg(Color::Rgb(BUTTON_FG_RGB.0, BUTTON_FG_RGB.1, BUTTON_FG_RGB.2))
                 .bg(Color::Rgb(BUTTON_BG_RGB.0, BUTTON_BG_RGB.1, BUTTON_BG_RGB.2))
                 .add_modifier(Modifier::BOLD),
         );
+        y += 3 + 1; // button + 1-row gap
 
-        // Optional feedback line below the button.
-        let mut next_y = button_y + 1;
+        // Optional feedback line.
         if let Some(msg) = self.commit_feedback.as_ref() {
-            if next_y < inner.y + inner.height {
+            if y < inner.y + inner.height {
                 let style = if self.commit_feedback_is_error {
                     Style::default().fg(Color::Rgb(0xe7, 0x70, 0x70))
                 } else {
                     Style::default().fg(Color::Rgb(0xa3, 0xbe, 0x8c))
                 };
-                buf.set_string(inner.x, next_y, msg.as_str(), style);
-                next_y += 1;
+                buf.set_string(inner.x, y, msg.as_str(), style);
+                y += 2;
             }
         }
 
+        // Thin separator line.
+        if y >= inner.y + inner.height {
+            return;
+        }
+        let sep_style = Style::default().fg(Color::Rgb(0x40, 0x48, 0x58));
+        for x in inner.x..inner.x + inner.width {
+            buf.set_string(x, y, "─", sep_style);
+        }
+        y += 1;
+
         // List of changes.
-        if next_y >= inner.y + inner.height {
+        if y >= inner.y + inner.height {
             return;
         }
         let list_area = Rect {
             x: inner.x,
-            y: next_y,
+            y,
             width: inner.width,
-            height: inner.y + inner.height - next_y,
+            height: inner.y + inner.height - y,
         };
         self.last_list_area = list_area;
         let lines = self.list_layout();
@@ -428,7 +467,7 @@ impl Widget for &mut SourceControlPanel {
 
         if total == 0 {
             buf.set_string(
-                list_area.x + 1,
+                list_area.x,
                 list_area.y,
                 "No changes",
                 Style::default().fg(Color::DarkGray),
@@ -436,9 +475,10 @@ impl Widget for &mut SourceControlPanel {
             return;
         }
 
+        let row_bg_style = Style::default().bg(Color::Rgb(0x16, 0x1b, 0x25));
         let end = (self.scroll + viewport).min(total);
         for (row, idx) in (self.scroll..end).enumerate() {
-            let y = list_area.y + row as u16;
+            let row_y = list_area.y + row as u16;
             match &lines[idx] {
                 ListLine::Header(section) => {
                     let count = self
@@ -446,8 +486,11 @@ impl Widget for &mut SourceControlPanel {
                         .iter()
                         .filter(|e| e.kind.section() == *section)
                         .count();
-                    let line = Line::from(vec![
-                        Span::styled("\u{25be} ", Style::default().fg(Color::Gray)),
+                    let header_spans = vec![
+                        Span::styled(
+                            "\u{25be} ",
+                            Style::default().fg(Color::Rgb(0xb0, 0xb8, 0xc8)),
+                        ),
                         Span::styled(
                             section_label(*section),
                             Style::default()
@@ -460,30 +503,89 @@ impl Widget for &mut SourceControlPanel {
                         ),
                         Span::raw("  "),
                         Span::styled(
-                            format!("{count}"),
-                            Style::default().fg(Color::DarkGray),
+                            format!(" {count} "),
+                            Style::default()
+                                .fg(Color::White)
+                                .bg(Color::Rgb(0x2a, 0x33, 0x42))
+                                .add_modifier(Modifier::BOLD),
                         ),
-                    ]);
-                    buf.set_line(list_area.x, y, &line, row_width);
+                    ];
+                    buf.set_line(list_area.x, row_y, &Line::from(header_spans), row_width);
                 }
                 ListLine::Entry(entry_idx) => {
                     let entry = &self.entries[*entry_idx];
+                    let row_rect = Rect {
+                        x: list_area.x,
+                        y: row_y,
+                        width: row_width,
+                        height: 1,
+                    };
+                    // Subtle row background so each entry reads as a chip.
+                    for rx in 0..row_rect.width {
+                        buf[(row_rect.x + rx, row_rect.y)]
+                            .set_symbol(" ")
+                            .set_style(row_bg_style);
+                    }
+                    // Entry icon: pick the file/folder icon by name +
+                    // extension; folders carry a trailing '/' in
+                    // git-porcelain output.
+                    let path_str = entry.path.as_str();
+                    let is_dir = path_str.ends_with('/');
+                    let icon = if is_dir {
+                        icons::FOLDER_CLOSED
+                    } else {
+                        let basename = std::path::Path::new(path_str)
+                            .file_name()
+                            .map(|s| s.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| path_str.to_string());
+                        let suffix = std::path::Path::new(&basename)
+                            .extension()
+                            .map(|e| format!(".{}", e.to_string_lossy()))
+                            .unwrap_or_default();
+                        icons::for_path(&basename, &suffix)
+                    };
                     let badge = entry.kind.badge();
-                    let line = Line::from(vec![
-                        Span::raw("  "),
-                        Span::styled(
-                            entry.path.as_str(),
-                            Style::default().fg(Color::White),
-                        ),
-                        Span::raw("  "),
-                        Span::styled(
-                            badge.to_string(),
+                    let badge_str = badge.to_string();
+                    let badge_w: u16 = 1;
+                    let row_padding: u16 = 1;
+                    // Right-align the status badge inside the row, leaving
+                    // a one-cell gap from the row's right edge.
+                    let badge_x = row_rect
+                        .x
+                        .saturating_add(row_rect.width.saturating_sub(badge_w + row_padding));
+                    if row_rect.width > badge_w + row_padding + 4 {
+                        buf.set_string(
+                            badge_x,
+                            row_y,
+                            badge_str.as_str(),
                             Style::default()
                                 .fg(badge_color(entry.kind))
+                                .bg(Color::Rgb(0x16, 0x1b, 0x25))
                                 .add_modifier(Modifier::BOLD),
-                        ),
-                    ]);
-                    buf.set_line(list_area.x, y, &line, row_width);
+                        );
+                    }
+                    // Icon on the left.
+                    let icon_x = row_rect.x + 1;
+                    buf.set_string(
+                        icon_x,
+                        row_y,
+                        icon.glyph.to_string(),
+                        Style::default().fg(icon.color).bg(Color::Rgb(0x16, 0x1b, 0x25)),
+                    );
+                    // Path text between the icon and the badge column.
+                    let text_x = icon_x + 2;
+                    let text_w = badge_x.saturating_sub(text_x).saturating_sub(1);
+                    if text_w > 0 {
+                        let path_para = Paragraph::new(path_str).style(
+                            Style::default()
+                                .fg(Color::White)
+                                .bg(Color::Rgb(0x16, 0x1b, 0x25)),
+                        );
+                        path_para.render(
+                            Rect { x: text_x, y: row_y, width: text_w, height: 1 },
+                            buf,
+                        );
+                    }
                 }
             }
         }
@@ -539,22 +641,137 @@ mod tests {
         assert!(matches!(lines[6], ListLine::Header(ChangeSection::Untracked)));
     }
 
+    fn buffer_to_string(buf: &Buffer) -> String {
+        let mut out = String::new();
+        for y in buf.area.y..buf.area.y + buf.area.height {
+            for x in buf.area.x..buf.area.x + buf.area.width {
+                out.push_str(buf[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    fn dummy_status_with_branch(name: &str) -> GitStatus {
+        GitStatus {
+            in_repo: true,
+            branch: Some(name.to_string()),
+            detached_hash: None,
+            ahead: 0,
+            behind: 0,
+            dirty: false,
+        }
+    }
+
+    #[test]
+    fn header_row_says_source_control_inside_the_panel_not_on_the_outer_border() {
+        use ratatui::buffer::Buffer;
+        let mut p = SourceControlPanel::new();
+        p.set_status(dummy_status_with_branch("main"), Vec::new());
+        let area = Rect { x: 0, y: 0, width: 60, height: 30 };
+        let mut buf = Buffer::empty(area);
+        ratatui::widgets::Widget::render(&mut p, area, &mut buf);
+        let dump = buffer_to_string(&buf);
+        // Header lives on the first inner row in light-grey-bold.
+        let inner_top = dump.lines().nth(1).expect("inner row 0");
+        assert!(
+            inner_top.contains("SOURCE CONTROL"),
+            "first inner row must carry SOURCE CONTROL: {inner_top:?}"
+        );
+        // Outer border row carries no chip / title.
+        let outer = dump.lines().next().expect("outer top border");
+        assert!(
+            !outer.contains("SOURCE CONTROL"),
+            "outer border must not carry the title chip: {outer:?}"
+        );
+    }
+
+    #[test]
+    fn input_box_is_three_rows_tall_with_a_focus_aware_border() {
+        use ratatui::buffer::Buffer;
+        let mut p = SourceControlPanel::new();
+        p.set_status(dummy_status_with_branch("main"), Vec::new());
+        p.focused = true;
+        let area = Rect { x: 0, y: 0, width: 60, height: 30 };
+        let mut buf = Buffer::empty(area);
+        ratatui::widgets::Widget::render(&mut p, area, &mut buf);
+        assert_eq!(
+            p.last_input_area.height, 3,
+            "commit-message input must be 3 rows tall to match the chunky aesthetic"
+        );
+        assert!(p.last_input_area.width >= 20);
+    }
+
+    #[test]
+    fn commit_button_is_chunky_three_row_full_width_block() {
+        use ratatui::buffer::Buffer;
+        let mut p = SourceControlPanel::new();
+        p.set_status(dummy_status_with_branch("main"), Vec::new());
+        let area = Rect { x: 0, y: 0, width: 60, height: 30 };
+        let mut buf = Buffer::empty(area);
+        ratatui::widgets::Widget::render(&mut p, area, &mut buf);
+        assert_eq!(
+            p.last_button_area.height, 3,
+            "Commit button must be 3 rows tall (chunky) like the mockup"
+        );
+        // Button must be wider than the old single-glyph label — close to
+        // the inner width.
+        assert!(
+            p.last_button_area.width >= 20,
+            "Commit button must be near-full-width; got {}",
+            p.last_button_area.width
+        );
+    }
+
+    #[test]
+    fn change_section_header_carries_a_count_pill() {
+        use ratatui::buffer::Buffer;
+        let mut p = SourceControlPanel::new();
+        p.set_status(
+            dummy_status_with_branch("main"),
+            vec![
+                ChangeEntry { path: "a.py".into(), kind: ChangeKind::Modified },
+                ChangeEntry { path: "b.py".into(), kind: ChangeKind::Modified },
+                ChangeEntry { path: "c.py".into(), kind: ChangeKind::Modified },
+            ],
+        );
+        let area = Rect { x: 0, y: 0, width: 60, height: 40 };
+        let mut buf = Buffer::empty(area);
+        ratatui::widgets::Widget::render(&mut p, area, &mut buf);
+        let dump = buffer_to_string(&buf);
+        assert!(
+            dump.contains("CHANGES"),
+            "section header must say CHANGES:\n{dump}"
+        );
+        assert!(
+            dump.contains('3'),
+            "section header must include a count badge of 3:\n{dump}"
+        );
+        assert!(
+            dump.contains('▾') || dump.contains('▿'),
+            "section header must carry a down chevron:\n{dump}"
+        );
+    }
+
     #[test]
     fn render_in_non_repo_hides_input_and_button() {
         use crate::git::GitStatus;
         let mut p = SourceControlPanel::new();
         p.status = GitStatus::default(); // in_repo = false
-        let area = Rect { x: 0, y: 0, width: 32, height: 10 };
+        let area = Rect { x: 0, y: 0, width: 40, height: 10 };
         let mut buf = Buffer::empty(area);
         (&mut p).render(area, &mut buf);
         assert_eq!(p.last_input_area, Rect::default(), "input area must stay empty in non-repo");
         assert_eq!(p.last_button_area, Rect::default(), "button area must stay empty in non-repo");
         assert_eq!(p.last_list_area, Rect::default(), "list area must stay empty in non-repo");
-        let mut row0 = String::new();
+        // The empty-state message lives below the SOURCE CONTROL header
+        // (row 0 of inner = row 1 of buffer), at inner.y + 2 = buffer
+        // row 3.
+        let mut row = String::new();
         for x in 0..area.width {
-            row0.push_str(buf[(x, 1)].symbol());
+            row.push_str(buf[(x, 3)].symbol());
         }
-        assert!(row0.contains("Not a git repository"), "row was: {row0:?}");
+        assert!(row.contains("Not a git repository"), "row was: {row:?}");
     }
 
     #[test]
@@ -562,7 +779,10 @@ mod tests {
         use crate::git::GitStatus;
         let mut p = SourceControlPanel::new();
         p.status = GitStatus { in_repo: true, branch: Some("main".into()), ..Default::default() };
-        let area = Rect { x: 0, y: 0, width: 32, height: 10 };
+        // Need at least: header + blank + branch + blank + 3-row input +
+        // blank + 3-row button = 11 rows of inner area, so 13 rows of
+        // outer area to clear the borders.
+        let area = Rect { x: 0, y: 0, width: 40, height: 16 };
         let mut buf = Buffer::empty(area);
         (&mut p).render(area, &mut buf);
         assert!(p.last_input_area.height > 0, "input area must paint when in_repo");
