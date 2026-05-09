@@ -9,6 +9,16 @@ pub const REMOTE_SRC_PNG: &[u8] =
     include_bytes!("../assets/icons/remote_src.png");
 pub const CODEBERG_SRC_PNG: &[u8] =
     include_bytes!("../assets/icons/codeberg_src.png");
+/// 192x192 white-on-transparent rasterisation of `assets/icons/debug-alt.svg`,
+/// the upstream codicon `debug-alt` glyph (bug + play triangle). Rendered
+/// once with `rsvg-convert -w 192 -h 192 -b transparent`; the resulting PNG
+/// is committed alongside the SVG so cargo builds don't need rsvg-convert
+/// installed. Hand-drawing the same shape from primitives loses too much
+/// detail under the activity-bar's downsample (the bug stops reading as a
+/// bug at ~30px); the SVG render keeps the silhouette legible at every
+/// cell-size croft is likely to see.
+pub const RUN_DEBUG_SRC_PNG: &[u8] =
+    include_bytes!("../assets/icons/run_debug_src.png");
 pub const WELCOME_LOGO_PNG: &[u8] =
     include_bytes!("../assets/logo-tight-removebg-preview.png");
 
@@ -76,126 +86,6 @@ pub fn bake_source_control_src_png() -> Vec<u8> {
         .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
         .expect("encoding a 192x192 RGBA buffer to PNG cannot fail");
     out
-}
-
-/// Bake the canonical Run-and-Debug icon (Codicon `debug-alt`, U+EB91) into
-/// a 192x192 RGBA PNG matching the other activity-bar source PNGs. Drawing
-/// it programmatically (no SVG rasterizer dep) keeps the shape deterministic
-/// and keeps the binary one PNG slimmer.
-///
-/// The shape is a ladybug-style body in the lower-left half plus a
-/// right-pointing play triangle in the upper-right half — the same dual-
-/// element silhouette VS Code's debug-alt SVG carries. The two regions
-/// don't overlap so each one reads cleanly even when the icon is
-/// downsampled into a two-row activity-bar cell.
-pub fn bake_run_debug_src_png() -> Vec<u8> {
-    let canvas: u32 = 192;
-    let mut img: RgbaImage = ImageBuffer::from_pixel(canvas, canvas, Rgba([0, 0, 0, 0]));
-    let white = Rgba([0xff, 0xff, 0xff, 0xff]);
-
-    let bug_cx: i32 = 48;
-    let bug_cy: i32 = 132;
-    let bug_w: i32 = 56;
-    let bug_h: i32 = 72;
-    let leg_len: i32 = 18;
-    let leg_thickness: i32 = 6;
-    let antenna_len: i32 = 18;
-    let antenna_thickness: i32 = 6;
-
-    let body_top = bug_cy - bug_h / 2;
-    let body_bot = bug_cy + bug_h / 2;
-    let body_left = bug_cx - bug_w / 2;
-    let body_right = bug_cx + bug_w / 2;
-    fill_rect(
-        &mut img,
-        body_left,
-        body_top,
-        body_right - body_left,
-        body_bot - body_top,
-        white,
-    );
-    fill_circle(&mut img, bug_cx, body_top, bug_w / 2, white);
-    fill_circle(&mut img, bug_cx, body_bot, bug_w / 2, white);
-
-    for &leg_y in &[body_top + 6, bug_cy, body_bot - 6] {
-        fill_rect(
-            &mut img,
-            body_left - leg_len,
-            leg_y - leg_thickness / 2,
-            leg_len,
-            leg_thickness,
-            white,
-        );
-        fill_rect(
-            &mut img,
-            body_right,
-            leg_y - leg_thickness / 2,
-            leg_len,
-            leg_thickness,
-            white,
-        );
-    }
-
-    fill_rect(
-        &mut img,
-        bug_cx - bug_w / 4 - antenna_thickness / 2,
-        body_top - antenna_len,
-        antenna_thickness,
-        antenna_len,
-        white,
-    );
-    fill_rect(
-        &mut img,
-        bug_cx + bug_w / 4 - antenna_thickness / 2,
-        body_top - antenna_len,
-        antenna_thickness,
-        antenna_len,
-        white,
-    );
-
-    fill_triangle(&mut img, (88, 16), (88, 96), (168, 56), white);
-
-    let mut out = Vec::with_capacity(8192);
-    image::DynamicImage::ImageRgba8(img)
-        .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
-        .expect("encoding a 192x192 RGBA buffer to PNG cannot fail");
-    out
-}
-
-/// Fill the triangle with vertices `a`, `b`, `c` using a half-plane test.
-/// Barycentric edge function: `edge(p,q,r) = (q.x - p.x)(r.y - p.y) - (q.y - p.y)(r.x - p.x)`;
-/// a point is inside iff the three edge signs match the triangle's orientation.
-fn fill_triangle(
-    img: &mut RgbaImage,
-    a: (i32, i32),
-    b: (i32, i32),
-    c: (i32, i32),
-    color: Rgba<u8>,
-) {
-    let (cw, ch) = (img.width() as i32, img.height() as i32);
-    let min_x = a.0.min(b.0).min(c.0).max(0);
-    let min_y = a.1.min(b.1).min(c.1).max(0);
-    let max_x = a.0.max(b.0).max(c.0).min(cw - 1);
-    let max_y = a.1.max(b.1).max(c.1).min(ch - 1);
-    let edge = |p: (i32, i32), q: (i32, i32), r: (i32, i32)| -> i32 {
-        (q.0 - p.0) * (r.1 - p.1) - (q.1 - p.1) * (r.0 - p.0)
-    };
-    let area = edge(a, b, c);
-    if area == 0 {
-        return;
-    }
-    let sign = area.signum();
-    for y in min_y..=max_y {
-        for x in min_x..=max_x {
-            let p = (x, y);
-            let w0 = edge(b, c, p) * sign;
-            let w1 = edge(c, a, p) * sign;
-            let w2 = edge(a, b, p) * sign;
-            if w0 >= 0 && w1 >= 0 && w2 >= 0 {
-                img.put_pixel(x as u32, y as u32, color);
-            }
-        }
-    }
 }
 
 /// Stroke a quadratic Bezier with a round pen of diameter `thickness`.
@@ -597,36 +487,42 @@ mod tests {
     }
 
     #[test]
-    fn bake_run_debug_src_png_is_192x192_with_visible_bug_and_triangle() {
-        let bytes = bake_run_debug_src_png();
-        let decoded = image::load_from_memory_with_format(&bytes, image::ImageFormat::Png)
-            .expect("baked run-debug icon must decode")
-            .to_rgba8();
+    fn run_debug_src_png_is_192x192_with_visible_bug_and_triangle() {
+        let decoded =
+            image::load_from_memory_with_format(RUN_DEBUG_SRC_PNG, image::ImageFormat::Png)
+                .expect("rsvg-convert output must decode as a PNG")
+                .to_rgba8();
         assert_eq!(decoded.width(), 192);
         assert_eq!(decoded.height(), 192);
-        let bug_centre = decoded.get_pixel(48, 132).0;
-        assert_eq!(
-            bug_centre[3], 0xff,
-            "bug body centre at (48,132) must be drawn (alpha 255); without the bug shape the icon reads only as a triangle"
+        // Pixel coordinates derived empirically from `rsvg-convert -w 192
+        // -h 192 assets/icons/debug-alt.svg` on 2026-05-09. They sit deep
+        // inside each subshape rather than on its antialiased edge so a
+        // future re-render of the SVG (different rsvg version, slightly
+        // different antialias kernel) keeps the assertion meaningful.
+        let bug_body = decoded.get_pixel(40, 124).0;
+        assert!(
+            bug_body[3] >= 0xc0,
+            "bug body fill at (40,124) must be (mostly) opaque; got alpha {} — codicon debug-alt's body sits in the lower-left quadrant of a 192x192 render",
+            bug_body[3]
         );
-        let triangle_pixel = decoded.get_pixel(110, 60).0;
-        assert_eq!(
-            triangle_pixel[3], 0xff,
-            "play-triangle interior at (110,60) must be drawn (alpha 255); the triangle is what tells the user this is a Run icon"
+        let triangle_stroke = decoded.get_pixel(48, 32).0;
+        assert!(
+            triangle_stroke[3] >= 0xc0,
+            "play-triangle's left stroke at (48,32) must be (mostly) opaque; got alpha {}",
+            triangle_stroke[3]
         );
         let corner = decoded.get_pixel(0, 0).0;
         assert_eq!(
             corner[3], 0x00,
-            "outside the bug+triangle silhouette must stay transparent so compose_icon's bg fills it"
+            "outside the silhouette must stay transparent so compose_icon's bg fills it"
         );
     }
 
     #[test]
-    fn baked_run_debug_icon_composes_through_icon_pipeline() {
-        let src = bake_run_debug_src_png();
+    fn run_debug_icon_composes_through_icon_pipeline() {
         let bg = Rgba([0x1e, 0x22, 0x2e, 0xff]);
-        let baked = compose_icon(&src, 32, 16, false, bg)
-            .expect("compose_icon must accept the baked run-debug PNG");
+        let baked = compose_icon(RUN_DEBUG_SRC_PNG, 32, 16, false, bg)
+            .expect("compose_icon must accept the SVG-rasterised run-debug PNG");
         let decoded = image::load_from_memory_with_format(&baked, image::ImageFormat::Png)
             .unwrap()
             .to_rgba8();

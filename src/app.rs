@@ -1139,9 +1139,8 @@ impl App {
         let source_control_inactive = encode(&source_control_png, false);
         let remote_active = encode(crate::iterm2_inline::REMOTE_SRC_PNG, true);
         let remote_inactive = encode(crate::iterm2_inline::REMOTE_SRC_PNG, false);
-        let run_debug_png = crate::iterm2_inline::bake_run_debug_src_png();
-        let run_debug_active = encode(&run_debug_png, true);
-        let run_debug_inactive = encode(&run_debug_png, false);
+        let run_debug_active = encode(crate::iterm2_inline::RUN_DEBUG_SRC_PNG, true);
+        let run_debug_inactive = encode(crate::iterm2_inline::RUN_DEBUG_SRC_PNG, false);
         if let (
             Some(ea),
             Some(ei),
