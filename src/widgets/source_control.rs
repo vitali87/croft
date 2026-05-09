@@ -886,6 +886,29 @@ mod tests {
     }
 
     #[test]
+    fn rendering_at_narrow_widths_does_not_panic() {
+        use ratatui::buffer::Buffer;
+        for width in 0u16..40 {
+            for height in 0u16..30 {
+                let mut p = SourceControlPanel::new();
+                p.set_status(
+                    dummy_status_with_branch("main"),
+                    vec![
+                        ChangeEntry { path: "a.py".into(), kind: ChangeKind::Modified },
+                        ChangeEntry { path: ".idea/".into(), kind: ChangeKind::Untracked },
+                    ],
+                );
+                let area = Rect { x: 0, y: 0, width, height };
+                if area.width == 0 || area.height == 0 {
+                    continue;
+                }
+                let mut buf = Buffer::empty(area);
+                ratatui::widgets::Widget::render(&mut p, area, &mut buf);
+            }
+        }
+    }
+
+    #[test]
     fn render_in_repo_paints_input_and_button() {
         use crate::git::GitStatus;
         let mut p = SourceControlPanel::new();

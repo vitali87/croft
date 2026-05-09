@@ -961,6 +961,23 @@ mod tests {
     }
 
     #[test]
+    fn rendering_at_narrow_widths_does_not_panic() {
+        use ratatui::buffer::Buffer;
+        let tmp = TempDir::new().unwrap();
+        for width in 0u16..40 {
+            for height in 0u16..20 {
+                let mut panel = SearchPanel::new(tmp.path().to_path_buf());
+                let area = Rect { x: 0, y: 0, width, height };
+                if area.width == 0 || area.height == 0 {
+                    continue;
+                }
+                let mut buf = Buffer::empty(area);
+                ratatui::widgets::Widget::render(&mut panel, area, &mut buf);
+            }
+        }
+    }
+
+    #[test]
     fn asterisk_keeps_breathing_room_against_the_outer_right_border() {
         // User report: the asterisk in `.*` was sitting flush against the
         // outer right border, looking crowded into the corner. The fix

@@ -179,8 +179,15 @@ impl Widget for &mut RunDebugPanel {
         }
         let label = self.button_label();
         let label_chars = label.chars().count() as u16;
-        let button_w = (label_chars + 8).min(inner.width.saturating_sub(2)).max(label_chars);
-        let button_x = inner.x + (inner.width - button_w) / 2;
+        // Pin the button to the panel's interior so it can never be wider
+        // than the available space; without this clamp `inner.width -
+        // button_w` underflowed at narrow sidebar widths and ratatui
+        // panicked indexing the buffer at a wrapped-u16 column.
+        let button_w = (label_chars + 8).min(inner.width.saturating_sub(2));
+        if button_w < 4 {
+            return;
+        }
+        let button_x = inner.x + inner.width.saturating_sub(button_w) / 2;
         let button_area = Rect {
             x: button_x,
             y,
@@ -316,6 +323,29 @@ mod tests {
         assert_eq!(tr, "╮", "top-right button corner must be rounded; got {tr:?}");
         assert_eq!(bl, "╰", "bottom-left button corner must be rounded; got {bl:?}");
         assert_eq!(br, "╯", "bottom-right button corner must be rounded; got {br:?}");
+    }
+
+    #[test]
+    fn rendering_at_narrow_widths_does_not_panic() {
+        // Repro for the user-reported crash: dragging the sidebar
+        // splitter all the way to the left squeezed Run-and-Debug to a
+        // few cells wide and ratatui panicked with `index outside of
+        // buffer`. The cause was `inner.width - button_w` wrapping to a
+        // huge u16 when the "Run and Debug" label (13 chars) was wider
+        // than `inner.width`. Render the panel at every width from 0 up
+        // to a reasonable maximum and assert nothing crashes.
+        for width in 0u16..40 {
+            for height in 0u16..30 {
+                let mut panel = RunDebugPanel::new();
+                panel.set_active_file(Some(PathBuf::from("/work/run_me.rs")));
+                let area = Rect { x: 0, y: 0, width, height };
+                if area.width == 0 || area.height == 0 {
+                    continue;
+                }
+                let mut buf = Buffer::empty(area);
+                Widget::render(&mut panel, area, &mut buf);
+            }
+        }
     }
 
     #[test]
