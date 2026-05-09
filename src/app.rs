@@ -187,11 +187,11 @@ fn git_status_spans<'a>(status: &'a crate::git::GitStatus) -> Vec<Span<'a>> {
     };
     let mut spans: Vec<Span> = Vec::with_capacity(6);
     spans.push(Span::raw("  "));
-    // Codicon `source-control` (U+EB14): the Y-fork that matches the
+    // Codicon `cod-source-control` (U+EA68): the Y-fork that matches the
     // activity-bar Source Control icon, so the status-bar branch indicator
     // and the SCM panel share the same visual mark.
     spans.push(Span::styled(
-        "\u{eb14} ",
+        "\u{ea68} ",
         Style::default().fg(pill_color),
     ));
     let label: &str = match (&status.branch, &status.detached_hash) {

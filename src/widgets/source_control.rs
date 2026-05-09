@@ -361,12 +361,14 @@ impl Widget for &mut SourceControlPanel {
             return;
         }
         let mut spans: Vec<Span> = Vec::with_capacity(5);
-        // Codicon `cod-source-control` (U+EB14) — the same Y-fork glyph
-        // VS Code shows in the activity bar AND on the branch row, in
-        // cyan. The previous green tint and the U+EA84 cod-github swap
-        // were both wrong for this slot.
+        // Codicon `cod-source-control` (U+EA68, verified against the
+        // upstream codicon mapping.json AND the Nerd Fonts CSS) — the
+        // Y-fork branch glyph in cyan, matching VS Code's mockup.
+        // U+EB14 was wrong: that's `cod-link-external`, the share-arrow
+        // the user spotted; ACTIVITY_SOURCE_CONTROL in icons.rs had the
+        // same mis-pin and is fixed in the same commit.
         spans.push(Span::styled(
-            "\u{eb14} ",
+            "\u{ea68} ",
             Style::default().fg(Color::Rgb(0x88, 0xc0, 0xd0)),
         ));
         let label = match (&self.status.branch, &self.status.detached_hash) {
@@ -774,18 +776,20 @@ mod tests {
         ratatui::widgets::Widget::render(&mut p, area, &mut buf);
         let inner = p.last_inner;
         let row_y = inner.y + 2;
-        // The branch glyph is the cod-source-control Y-fork (U+EB14) —
-        // SAME glyph as the activity-bar slot, in cyan. NOT cod-github
-        // (U+EA84): that's the GitHub octocat and the user explicitly
-        // pointed out the wrong glyph in the previous build.
+        // The branch glyph is cod-source-control (U+EA68) in cyan.
+        // Verified against the upstream codicon mapping.json and the
+        // Nerd Fonts CSS on 2026-05-09. Two prior mis-pins (U+EB14 =
+        // link-external, U+EA84 = github) put the wrong shape on the
+        // user's branch row; this test guards against either coming
+        // back.
         let mut hit: Option<u16> = None;
         for x in inner.x..inner.x + inner.width {
-            if buf[(x, row_y)].symbol() == "\u{eb14}" {
+            if buf[(x, row_y)].symbol() == "\u{ea68}" {
                 hit = Some(x);
                 break;
             }
         }
-        let x = hit.expect("branch row must carry the cod-source-control (U+EB14) Y-fork glyph");
+        let x = hit.expect("branch row must carry the cod-source-control (U+EA68) Y-fork glyph");
         let style = buf[(x, row_y)].style();
         let expected = ratatui::style::Color::Rgb(0x88, 0xc0, 0xd0);
         assert_eq!(
@@ -793,13 +797,19 @@ mod tests {
             Some(expected),
             "branch glyph must render in cyan, matching the VS Code mockup"
         );
-        // Defensive: the GitHub octocat must NOT appear here (regression
-        // guard against the previous wrong choice).
+        // Regression guards against the two wrong codepoints that
+        // shipped before:
+        //   U+EB14 → cod-link-external (the share-arrow the user spotted)
+        //   U+EA84 → cod-github (the octocat the user spotted before that)
         for x in inner.x..inner.x + inner.width {
+            let s = buf[(x, row_y)].symbol();
             assert_ne!(
-                buf[(x, row_y)].symbol(),
-                "\u{ea84}",
-                "branch row must not carry the cod-github octocat (U+EA84) — that was the wrong glyph"
+                s, "\u{eb14}",
+                "branch row must not carry cod-link-external (U+EB14)"
+            );
+            assert_ne!(
+                s, "\u{ea84}",
+                "branch row must not carry cod-github (U+EA84)"
             );
         }
     }

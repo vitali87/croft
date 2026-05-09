@@ -22,9 +22,13 @@ pub const ACTIVITY_EXPLORER: char = '\u{eaf0}';
 pub const ACTIVITY_SEARCH: char = '\u{ea6d}';
 pub const ACTIVITY_REMOTE: char = '\u{eb39}';
 /// Codicon `source-control` — the Y-fork glyph with three nodes that
-/// VS Code uses for its Source Control activity-bar entry. U+EAFC is the
-/// simpler `cod-git_branch` (single branch) and is wrong for this slot.
-pub const ACTIVITY_SOURCE_CONTROL: char = '\u{eb14}';
+/// VS Code uses for its Source Control activity-bar entry. Verified
+/// against the upstream codicon mapping.json AND the Nerd Fonts CSS
+/// (`.nf-cod-source_control`) on 2026-05-09: both pin source-control to
+/// **U+EA68**. The earlier U+EB14 was a mis-pin — that codepoint is
+/// `cod-link-external` (the share-arrow), which is what the user spotted
+/// rendering on the source-control branch row.
+pub const ACTIVITY_SOURCE_CONTROL: char = '\u{ea68}';
 /// Codicon `debug-alt` — the bug + play-triangle glyph VS Code uses for
 /// its Run and Debug activity-bar entry. Verified against the upstream
 /// codicon mapping.json AND the Nerd Fonts CSS (.nf-cod-debug_alt). Do
@@ -193,14 +197,22 @@ mod tests {
     }
 
     #[test]
-    fn activity_bar_source_control_glyph_is_cod_source_control_not_git_branch() {
-        // U+EAFC is `cod-git_branch` (a single branch sprouting off a line).
-        // The Source Control activity-bar slot must use `cod-source_control`
-        // at U+EB14 (Y-fork with three nodes) to match VS Code.
-        assert_eq!(ACTIVITY_SOURCE_CONTROL, '\u{eb14}');
+    fn activity_bar_source_control_glyph_is_cod_source_control_not_link_external() {
+        // Verified against codicon mapping.json + Nerd Fonts CSS on
+        // 2026-05-09: cod-source-control = U+EA68. Three regression
+        // guards against past mis-pins:
+        //   U+EAFC → cod-git_commit (was claimed to be git_branch)
+        //   U+EB14 → cod-link-external (the share-arrow the user spotted)
+        //   U+EA84 → cod-github (the octocat the user spotted earlier)
+        assert_eq!(ACTIVITY_SOURCE_CONTROL, '\u{ea68}');
+        assert_ne!(ACTIVITY_SOURCE_CONTROL, '\u{eafc}');
         assert_ne!(
-            ACTIVITY_SOURCE_CONTROL, '\u{eafc}',
-            "U+EAFC is cod-git_branch, not the Source Control fork glyph"
+            ACTIVITY_SOURCE_CONTROL, '\u{eb14}',
+            "U+EB14 is cod-link-external (an external-link arrow), not the source-control Y-fork"
+        );
+        assert_ne!(
+            ACTIVITY_SOURCE_CONTROL, '\u{ea84}',
+            "U+EA84 is cod-github, not the source-control Y-fork"
         );
     }
 
