@@ -466,6 +466,15 @@ pub struct App {
     /// nothing in the icon area, which leaves the bordered cluster looking
     /// like a clean text-only sidebar (still legible).
     run_debug_icon_osc: Option<String>,
+    /// Pre-encoded OSC-1337 image of a solid editor-bg block sized to
+    /// the run-debug headline icon. Emitted at `run_debug_icon_last_emitted`
+    /// when the panel goes away to REPLACE iTerm2's cached bug+play
+    /// picture; a plain SGR overwrite or `\x1b[2J` doesn't reliably
+    /// evict OSC-1337 image cells (the cause of the ghosting bug the
+    /// user has called out twice now). An OSC-1337 emit at the same
+    /// cell rectangle is the canonical replace operation iTerm2
+    /// honours.
+    run_debug_icon_wipe_osc: Option<String>,
     /// Cell where the run-debug icon was actually painted on the previous
     /// flush. Used to wipe the OLD position before re-emitting at a new
     /// one, or once the user switches sidebar views away from Run-Debug —
@@ -1054,6 +1063,7 @@ impl App {
             activity_images: None,
             welcome_codeberg_badge_osc: None,
             run_debug_icon_osc: None,
+            run_debug_icon_wipe_osc: None,
             run_debug_icon_last_emitted: None,
             run_debug_image_clear_requested: false,
             welcome_codeberg_badge_cell: None,
@@ -1250,6 +1260,26 @@ impl App {
                 raw
             });
         }
+        // Wipe image: a solid editor-bg block at the same cell footprint.
+        // Emitted at the previous icon cell when the panel goes away so
+        // iTerm2 REPLACES the cached bug+play picture (plain character
+        // writes and `\x1b[2J` don't reliably evict OSC-1337 cells, but
+        // a fresh OSC-1337 emit at the same cell rectangle does).
+        if let Ok(blank) =
+            crate::iterm2_inline::bake_solid_block(rd_icon_w_px, rd_icon_h_px, icon_bg)
+        {
+            let raw = crate::iterm2_inline::build_inline_image_osc(
+                &blank,
+                crate::widgets::run_debug::RUN_DEBUG_ICON_CELLS_W,
+                crate::widgets::run_debug::RUN_DEBUG_ICON_CELLS_H,
+                false,
+            );
+            self.run_debug_icon_wipe_osc = Some(if is_tmux {
+                crate::iterm2_inline::tmux_passthrough_wrap(&raw)
+            } else {
+                raw
+            });
+        }
     }
 
     /// Emit the OSC-1337 image carrying the run-debug headline icon at the
@@ -1283,11 +1313,23 @@ impl App {
                 None => true,
             };
             if needs_wipe {
-                let block_w = crate::widgets::run_debug::RUN_DEBUG_ICON_CELLS_W as usize;
-                for ry in 0..crate::widgets::run_debug::RUN_DEBUG_ICON_CELLS_H {
-                    let _ = write!(out, "\x1b[{};{}H", oy + ry + 1, ox + 1);
-                    let blanks: String = std::iter::repeat(' ').take(block_w).collect();
-                    let _ = out.write_all(blanks.as_bytes());
+                if let Some(wipe_osc) = self.run_debug_icon_wipe_osc.as_deref() {
+                    // OSC-1337 emit at the same cell rectangle: iTerm2
+                    // REPLACES the previous image (a plain space-stamp
+                    // wipe leaves the image visible because iTerm2's
+                    // image cells survive SGR overwrites).
+                    let _ = write!(out, "\x1b[{};{}H", oy + 1, ox + 1);
+                    let _ = out.write_all(wipe_osc.as_bytes());
+                } else {
+                    // Glyph-fallback path (no iTerm2 inline images): the
+                    // headline icon was never emitted, so a space-stamp
+                    // wipe is sufficient and harmless.
+                    let block_w = crate::widgets::run_debug::RUN_DEBUG_ICON_CELLS_W as usize;
+                    for ry in 0..crate::widgets::run_debug::RUN_DEBUG_ICON_CELLS_H {
+                        let _ = write!(out, "\x1b[{};{}H", oy + ry + 1, ox + 1);
+                        let blanks: String = std::iter::repeat(' ').take(block_w).collect();
+                        let _ = out.write_all(blanks.as_bytes());
+                    }
                 }
             }
         }
