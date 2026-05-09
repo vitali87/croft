@@ -13,11 +13,15 @@ const BODY_FG_RGB: (u8, u8, u8) = (0xb0, 0xb8, 0xc8);
 const TITLE_FG_RGB: (u8, u8, u8) = (0xff, 0xff, 0xff);
 const FOCUS_BORDER_RGB: (u8, u8, u8) = (0x4e, 0x9a, 0xff);
 
-/// Cells reserved above the headline for the OSC-1337 debug-alt icon overlay.
-/// Six cells wide × three cells tall lands a roughly 60×60-pixel icon at typical
-/// iTerm2 cell sizes (10×20 px), matching the proportions of the VS Code mockup
-/// the user supplied.
-pub const RUN_DEBUG_ICON_CELLS_W: u16 = 6;
+/// Cells reserved above the headline for the codicon `debug-alt` glyph.
+/// One cell wide, three rows tall: the glyph sits on the centre row, with
+/// the surrounding rows acting as visual breathing room. We previously
+/// rendered this as a 6×3 OSC-1337 image overlay but iTerm2's image cells
+/// survive every reasonable wipe attempt (\x1b[2J, space-stamp, fresh
+/// OSC at the same rect), leaving the icon ghosting on top of whichever
+/// panel came next; rendering the codicon through ratatui's normal text
+/// path lets the diff evict it cleanly on view changes.
+pub const RUN_DEBUG_ICON_CELLS_W: u16 = 1;
 pub const RUN_DEBUG_ICON_CELLS_H: u16 = 3;
 
 pub struct RunDebugPanel {
@@ -25,11 +29,11 @@ pub struct RunDebugPanel {
     pub active_file: Option<PathBuf>,
     pub last_area: Rect,
     pub last_button_area: Rect,
-    /// Top-left cell of the OSC-1337 icon overlay block. The post-draw flush
-    /// in `App` reads this to emit the rasterised debug-alt PNG above the
-    /// headline. `None` when the panel hasn't been laid out yet, or when
-    /// the panel is too short for the icon to fit alongside the rest of
-    /// the cluster.
+    /// Vestigial — kept to preserve the public field on the panel struct
+    /// for any external callers that touched it before the icon was
+    /// switched off OSC-1337. Always `None`: the codicon glyph is now
+    /// painted through ratatui directly, no post-draw overlay is
+    /// needed.
     pub last_icon_cell: Option<(u16, u16)>,
     pub feedback: Option<String>,
     pub feedback_is_error: bool,
@@ -131,8 +135,21 @@ impl Widget for &mut RunDebugPanel {
         let mut y = inner.y + top_pad;
 
         if icon_h > 0 && y + icon_h <= inner.y + inner.height {
-            let icon_x = inner.x + (inner.width - icon_w) / 2;
-            self.last_icon_cell = Some((icon_x, y));
+            let icon_x = inner.x + (inner.width.saturating_sub(icon_w)) / 2;
+            // Centre the codicon `debug-alt` (U+EB91) on the middle row
+            // of the reserved icon block; the rows above and below stay
+            // blank for breathing room. Painting the glyph through
+            // ratatui (no OSC-1337) means the next sidebar redraw
+            // evicts it cleanly via the buffer diff.
+            let glyph_y = y + icon_h / 2;
+            buf.set_string(
+                icon_x,
+                glyph_y,
+                "\u{eb91}",
+                Style::default()
+                    .fg(Color::Rgb(BODY_FG_RGB.0, BODY_FG_RGB.1, BODY_FG_RGB.2))
+                    .add_modifier(Modifier::BOLD),
+            );
             y += icon_h + gap_after_icon;
         }
 
@@ -289,21 +306,60 @@ mod tests {
             !dump.lines().next().unwrap().contains("RUN AND DEBUG"),
             "title bar must NOT sit on the top border row (mockup has no title bar): \n{dump}"
         );
-        assert!(
-            panel.last_icon_cell.is_some(),
-            "run-debug panel must record a cell for the OSC-1337 icon overlay so the App can emit it post-draw"
-        );
         let button = panel.last_button_area;
         assert!(
             button.height >= 3,
             "button must be at least 3 rows tall to feel chunky like the mockup; got height={}",
             button.height
         );
-        let (_, icon_y) = panel.last_icon_cell.unwrap();
+        // The codicon glyph must sit ABOVE the button.
+        let mut glyph_y: Option<u16> = None;
+        for y in 0..area.height {
+            for x in 0..area.width {
+                if buf[(x, y)].symbol() == "\u{eb91}" {
+                    glyph_y = Some(y);
+                }
+            }
+        }
+        let glyph_y = glyph_y.expect("codicon glyph must render");
         assert!(
-            button.y > icon_y,
-            "button must sit below the icon (icon_y={icon_y}, button.y={})",
+            button.y > glyph_y,
+            "button must sit below the codicon glyph (glyph_y={glyph_y}, button.y={})",
             button.y
+        );
+    }
+
+    #[test]
+    fn icon_area_renders_codicon_glyph_through_ratatui_not_via_osc_overlay() {
+        // Two prior bugs taught us iTerm2 doesn't reliably evict
+        // OSC-1337 image cells when a panel goes away — `\x1b[2J`,
+        // space-stamps, and same-rectangle replace emits all leave a
+        // visible block parked over whichever panel comes next. The
+        // safest way out is to stop using inline images for the run-
+        // debug headline and render the codicon glyph (U+EB91) in
+        // ratatui cells like the rest of the widgets — ratatui's diff
+        // already evicts text cells cleanly on view changes.
+        let mut panel = RunDebugPanel::new();
+        let area = Rect { x: 0, y: 0, width: 36, height: 24 };
+        let mut buf = Buffer::empty(area);
+        Widget::render(&mut panel, area, &mut buf);
+        let mut found_glyph = false;
+        for y in 0..area.height {
+            for x in 0..area.width {
+                if buf[(x, y)].symbol() == "\u{eb91}" {
+                    found_glyph = true;
+                }
+            }
+        }
+        assert!(
+            found_glyph,
+            "the bug+play codicon (U+EB91) must be painted directly into the ratatui buffer"
+        );
+        // Defensive: the panel widget no longer reserves a cell for an
+        // OSC-1337 overlay, since there's no overlay any more.
+        assert!(
+            panel.last_icon_cell.is_none(),
+            "no OSC-1337 overlay cell should be reserved — the icon is now plain text"
         );
     }
 
@@ -349,18 +405,14 @@ mod tests {
     }
 
     #[test]
-    fn small_panel_drops_icon_to_keep_button_visible() {
+    fn small_panel_skips_icon_block_to_keep_button_visible() {
         let mut panel = RunDebugPanel::new();
         let area = Rect { x: 0, y: 0, width: 30, height: 12 };
         let mut buf = Buffer::empty(area);
         Widget::render(&mut panel, area, &mut buf);
         assert!(
-            panel.last_icon_cell.is_none(),
-            "icon is decorative; in a short panel it must yield to the button"
-        );
-        assert!(
             panel.last_button_area.height >= 3,
-            "button must remain laid out when the panel collapses the icon"
+            "button must remain laid out when the panel collapses the icon block"
         );
     }
 }

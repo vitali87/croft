@@ -88,20 +88,6 @@ pub fn bake_source_control_src_png() -> Vec<u8> {
     out
 }
 
-/// Bake a solid-`bg` PNG of size `w_px × h_px`. Used to produce a
-/// "wipe" image the App emits via OSC-1337 at the same cell rectangle
-/// as a previous overlay — iTerm2 replaces the cached image cells in
-/// place, which is the only reliable way to evict a multi-cell inline
-/// image (plain SGR overwrites and `\x1b[2J` both leave the image
-/// visible underneath fresh content).
-pub fn bake_solid_block(w_px: u32, h_px: u32, bg: Rgba<u8>) -> Result<Vec<u8>, image::ImageError> {
-    let canvas: RgbaImage = ImageBuffer::from_pixel(w_px.max(1), h_px.max(1), bg);
-    let mut out = Vec::with_capacity(2048);
-    image::DynamicImage::ImageRgba8(canvas)
-        .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)?;
-    Ok(out)
-}
-
 /// Stroke a quadratic Bezier with a round pen of diameter `thickness`.
 fn draw_quadratic_bezier(
     img: &mut RgbaImage,
