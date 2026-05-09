@@ -361,12 +361,12 @@ impl Widget for &mut SourceControlPanel {
             return;
         }
         let mut spans: Vec<Span> = Vec::with_capacity(5);
-        // Codicon `cod-github` (U+EA84) in cyan, matching the VS Code
-        // mockup. The old `cod-source-control` (U+EB14) green fork glyph
-        // was the wrong glyph for the branch row — that one belongs to
-        // the activity-bar slot, not the per-branch indicator.
+        // Codicon `cod-source-control` (U+EB14) — the same Y-fork glyph
+        // VS Code shows in the activity bar AND on the branch row, in
+        // cyan. The previous green tint and the U+EA84 cod-github swap
+        // were both wrong for this slot.
         spans.push(Span::styled(
-            "\u{ea84} ",
+            "\u{eb14} ",
             Style::default().fg(Color::Rgb(0x88, 0xc0, 0xd0)),
         ));
         let label = match (&self.status.branch, &self.status.detached_hash) {
@@ -765,34 +765,43 @@ mod tests {
     }
 
     #[test]
-    fn branch_row_uses_the_github_codicon_in_cyan() {
+    fn branch_row_uses_the_source_control_codicon_in_cyan() {
         use ratatui::buffer::Buffer;
         let mut p = SourceControlPanel::new();
         p.set_status(dummy_status_with_branch("main"), Vec::new());
         let area = Rect { x: 0, y: 0, width: 60, height: 20 };
         let mut buf = Buffer::empty(area);
         ratatui::widgets::Widget::render(&mut p, area, &mut buf);
-        // Branch row sits at inner.y + 2 = buffer row 3 (after the
-        // outer top border and the SOURCE CONTROL header).
         let inner = p.last_inner;
         let row_y = inner.y + 2;
-        // Find the GitHub codicon (cod-github, U+EA84) on that row.
+        // The branch glyph is the cod-source-control Y-fork (U+EB14) —
+        // SAME glyph as the activity-bar slot, in cyan. NOT cod-github
+        // (U+EA84): that's the GitHub octocat and the user explicitly
+        // pointed out the wrong glyph in the previous build.
         let mut hit: Option<u16> = None;
         for x in inner.x..inner.x + inner.width {
-            if buf[(x, row_y)].symbol() == "\u{ea84}" {
+            if buf[(x, row_y)].symbol() == "\u{eb14}" {
                 hit = Some(x);
                 break;
             }
         }
-        let x = hit.expect("branch row must carry the cod-github (U+EA84) glyph");
+        let x = hit.expect("branch row must carry the cod-source-control (U+EB14) Y-fork glyph");
         let style = buf[(x, row_y)].style();
-        // Cyan-ish colour, not the old green.
         let expected = ratatui::style::Color::Rgb(0x88, 0xc0, 0xd0);
         assert_eq!(
             style.fg,
             Some(expected),
-            "GitHub icon must render in the cyan branch colour, not the old green source-control colour"
+            "branch glyph must render in cyan, matching the VS Code mockup"
         );
+        // Defensive: the GitHub octocat must NOT appear here (regression
+        // guard against the previous wrong choice).
+        for x in inner.x..inner.x + inner.width {
+            assert_ne!(
+                buf[(x, row_y)].symbol(),
+                "\u{ea84}",
+                "branch row must not carry the cod-github octocat (U+EA84) — that was the wrong glyph"
+            );
+        }
     }
 
     #[test]
