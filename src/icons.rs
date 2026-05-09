@@ -25,6 +25,12 @@ pub const ACTIVITY_REMOTE: char = '\u{eb39}';
 /// VS Code uses for its Source Control activity-bar entry. U+EAFC is the
 /// simpler `cod-git_branch` (single branch) and is wrong for this slot.
 pub const ACTIVITY_SOURCE_CONTROL: char = '\u{eb14}';
+/// Codicon `debug-alt` — the bug + play-triangle glyph VS Code uses for
+/// its Run and Debug activity-bar entry. Verified against the upstream
+/// codicon mapping.json AND the Nerd Fonts CSS (.nf-cod-debug_alt). Do
+/// NOT use U+EAD8 (cod-debug, just the bug) or U+EB2C (cod-play, just
+/// the triangle): both lose half the silhouette.
+pub const ACTIVITY_RUN_DEBUG: char = '\u{eb91}';
 
 pub fn for_path(name: &str, suffix: &str) -> Icon {
     let n = name.to_ascii_lowercase();
@@ -171,6 +177,19 @@ mod tests {
     fn activity_bar_remote_glyph_is_cod_remote_explorer() {
         assert_eq!(ACTIVITY_REMOTE, '\u{eb39}');
         assert_ne!(ACTIVITY_REMOTE, '\u{eb3c}', "U+EB3C is not the Remote Explorer glyph");
+    }
+
+    #[test]
+    fn activity_bar_run_debug_glyph_is_cod_debug_alt() {
+        // VS Code's Run and Debug activity-bar slot uses Codicon `debug-alt`
+        // (bug + small play triangle). Verified against
+        // microsoft/vscode-codicons mapping.json AND the upstream Nerd Fonts
+        // CSS (.nf-cod-debug_alt) on 2026-05-09: both map debug-alt to U+EB91.
+        // U+EAD1 is `debug-pause` and U+EAD8 is `debug` (just the bug,
+        // no triangle); both are wrong for the Run-and-Debug entry.
+        assert_eq!(ACTIVITY_RUN_DEBUG, '\u{eb91}');
+        assert_ne!(ACTIVITY_RUN_DEBUG, '\u{ead1}', "U+EAD1 is debug-pause");
+        assert_ne!(ACTIVITY_RUN_DEBUG, '\u{ead8}', "U+EAD8 is debug, no triangle");
     }
 
     #[test]

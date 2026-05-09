@@ -26,6 +26,7 @@ use crate::widgets::{
     editor::{Editor, EditorTabs},
     file_tree::FileTree,
     remote::RemotePanel,
+    run_debug::RunDebugPanel,
     search::SearchPanel,
     source_control::SourceControlPanel,
     terminal::PtyTerminal,
@@ -38,6 +39,7 @@ pub enum SidebarView {
     Search,
     SourceControl,
     Remote,
+    RunDebug,
 }
 
 const ACTIVITY_BAR_WIDTH: u16 = 4;
@@ -70,6 +72,10 @@ fn activity_source_control_y(bar: Rect) -> u16 {
 
 fn activity_remote_y(bar: Rect) -> u16 {
     activity_source_control_y(bar) + ACTIVITY_ICON_HEIGHT + ACTIVITY_ICON_GAP
+}
+
+fn activity_run_debug_y(bar: Rect) -> u16 {
+    activity_remote_y(bar) + ACTIVITY_ICON_HEIGHT + ACTIVITY_ICON_GAP
 }
 
 fn activity_explorer_block(bar: Rect) -> Rect {
@@ -108,6 +114,15 @@ fn activity_remote_block(bar: Rect) -> Rect {
     }
 }
 
+fn activity_run_debug_block(bar: Rect) -> Rect {
+    Rect {
+        x: bar.x,
+        y: activity_run_debug_y(bar),
+        width: bar.width,
+        height: ACTIVITY_ICON_HEIGHT,
+    }
+}
+
 #[derive(Default, Clone, Copy)]
 struct SidebarAreas {
     /// Block occupied by the Explorer activity-bar icon, in absolute coords.
@@ -120,6 +135,8 @@ struct SidebarAreas {
     source_control_icon: Rect,
     /// Block occupied by the Remote Explorer activity-bar icon, in absolute coords.
     remote_icon: Rect,
+    /// Block occupied by the Run and Debug activity-bar icon, in absolute coords.
+    run_debug_icon: Rect,
 }
 
 /// Pre-encoded iTerm2 OSC-1337 inline-image escape sequences for each icon
@@ -135,6 +152,8 @@ struct ActivityBarImages {
     source_control_inactive: String,
     remote_active: String,
     remote_inactive: String,
+    run_debug_active: String,
+    run_debug_inactive: String,
 }
 
 /// Single source of truth for the application's user-facing name.
@@ -394,6 +413,7 @@ pub struct App {
     pub search: SearchPanel,
     pub remote: RemotePanel,
     pub source_control: SourceControlPanel,
+    pub run_debug: RunDebugPanel,
     pub editor: EditorTabs,
     pub terminals: Vec<PtyTerminal>,
     pub active_terminal: usize,
@@ -936,6 +956,7 @@ impl App {
         let search = SearchPanel::new(root.clone());
         let remote = RemotePanel::new();
         let source_control = SourceControlPanel::new();
+        let run_debug = RunDebugPanel::new();
         let editor = EditorTabs::new();
         let term = PtyTerminal::new(&root).context("spawning terminal")?;
 
@@ -986,6 +1007,7 @@ impl App {
             search,
             remote,
             source_control,
+            run_debug,
             editor,
             terminals: vec![term],
             active_terminal: 0,
@@ -1117,7 +1139,21 @@ impl App {
         let source_control_inactive = encode(&source_control_png, false);
         let remote_active = encode(crate::iterm2_inline::REMOTE_SRC_PNG, true);
         let remote_inactive = encode(crate::iterm2_inline::REMOTE_SRC_PNG, false);
-        if let (Some(ea), Some(ei), Some(sa), Some(si), Some(sca), Some(sci), Some(ra), Some(ri)) = (
+        let run_debug_png = crate::iterm2_inline::bake_run_debug_src_png();
+        let run_debug_active = encode(&run_debug_png, true);
+        let run_debug_inactive = encode(&run_debug_png, false);
+        if let (
+            Some(ea),
+            Some(ei),
+            Some(sa),
+            Some(si),
+            Some(sca),
+            Some(sci),
+            Some(ra),
+            Some(ri),
+            Some(rda),
+            Some(rdi),
+        ) = (
             explorer_active,
             explorer_inactive,
             search_active,
@@ -1126,6 +1162,8 @@ impl App {
             source_control_inactive,
             remote_active,
             remote_inactive,
+            run_debug_active,
+            run_debug_inactive,
         ) {
             self.activity_images = Some(ActivityBarImages {
                 explorer_active: ea,
@@ -1136,6 +1174,8 @@ impl App {
                 source_control_inactive: sci,
                 remote_active: ra,
                 remote_inactive: ri,
+                run_debug_active: rda,
+                run_debug_inactive: rdi,
             });
         }
         // Codeberg badge for the welcome panel: 2 cells wide, 1 cell tall,
@@ -1170,10 +1210,12 @@ impl App {
         let sea_block = self.sidebar_areas.search_icon;
         let scm_block = self.sidebar_areas.source_control_icon;
         let rem_block = self.sidebar_areas.remote_icon;
+        let rdb_block = self.sidebar_areas.run_debug_icon;
         if exp_block.width == 0
             || sea_block.width == 0
             || scm_block.width == 0
             || rem_block.width == 0
+            || rdb_block.width == 0
         {
             return Vec::new();
         }
@@ -1197,11 +1239,17 @@ impl App {
         } else {
             &images.remote_inactive
         };
+        let rdb_state = if self.sidebar_view == SidebarView::RunDebug {
+            &images.run_debug_active
+        } else {
+            &images.run_debug_inactive
+        };
         vec![
             ((exp_block.x, exp_block.y), exp_state.as_str()),
             ((sea_block.x, sea_block.y), sea_state.as_str()),
             ((scm_block.x, scm_block.y), scm_state.as_str()),
             ((rem_block.x, rem_block.y), rem_state.as_str()),
+            ((rdb_block.x, rdb_block.y), rdb_state.as_str()),
         ]
     }
 
@@ -2107,10 +2155,12 @@ impl App {
         let search_block = activity_search_block(area);
         let source_control_block = activity_source_control_block(area);
         let remote_block = activity_remote_block(area);
+        let run_debug_block = activity_run_debug_block(area);
         let explorer_active = self.sidebar_view == SidebarView::Explorer;
         let search_active = self.sidebar_view == SidebarView::Search;
         let source_control_active = self.sidebar_view == SidebarView::SourceControl;
         let remote_active = self.sidebar_view == SidebarView::Remote;
+        let run_debug_active = self.sidebar_view == SidebarView::RunDebug;
 
         let active_color = Color::White;
         let inactive_color = Color::Rgb(0x6c, 0x7d, 0x9c);
@@ -2182,12 +2232,19 @@ impl App {
                 crate::icons::ACTIVITY_REMOTE,
                 remote_active,
             );
+            render_glyph(
+                frame,
+                run_debug_block,
+                crate::icons::ACTIVITY_RUN_DEBUG,
+                run_debug_active,
+            );
         }
 
         self.sidebar_areas.explorer_icon = explorer_block;
         self.sidebar_areas.search_icon = search_block;
         self.sidebar_areas.source_control_icon = source_control_block;
         self.sidebar_areas.remote_icon = remote_block;
+        self.sidebar_areas.run_debug_icon = run_debug_block;
     }
 
     fn set_sidebar_view(&mut self, view: SidebarView) {
@@ -2211,6 +2268,10 @@ impl App {
                 self.focus_pane(Pane::Tree);
             }
             SidebarView::Remote => self.focus_pane(Pane::Tree),
+            SidebarView::RunDebug => {
+                self.refresh_run_debug();
+                self.focus_pane(Pane::Tree);
+            }
         }
     }
 
@@ -2323,6 +2384,8 @@ impl App {
         self.source_control.focused =
             self.focus == Pane::Tree && self.sidebar_view == SidebarView::SourceControl;
         self.remote.focused = self.focus == Pane::Tree && self.sidebar_view == SidebarView::Remote;
+        self.run_debug.focused =
+            self.focus == Pane::Tree && self.sidebar_view == SidebarView::RunDebug;
         self.editor.focused = self.focus == Pane::Editor;
         let focused_pane = self.focus == Pane::Terminal;
         let active = self.active_terminal;
@@ -2427,6 +2490,7 @@ impl App {
                 SidebarView::Search => frame.render_widget(&mut self.search, area),
                 SidebarView::SourceControl => frame.render_widget(&mut self.source_control, area),
                 SidebarView::Remote => frame.render_widget(&mut self.remote, area),
+                SidebarView::RunDebug => frame.render_widget(&mut self.run_debug, area),
             }
         }
         if self.editor.is_blank_initial() {
@@ -2783,6 +2847,7 @@ impl App {
                 SidebarView::Search => self.handle_search_key(key),
                 SidebarView::SourceControl => self.handle_source_control_key(key),
                 SidebarView::Remote => self.handle_remote_key(key),
+                SidebarView::RunDebug => self.handle_run_debug_key(key),
             },
             Pane::Editor => {
                 self.handle_editor_key(key);
@@ -2926,6 +2991,93 @@ impl App {
     fn refresh_source_control(&mut self) {
         let entries = crate::git::query_changes(&self.tree.root);
         self.source_control.set_status(self.git_status.clone(), entries);
+    }
+
+    fn handle_run_debug_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => self.set_sidebar_view(SidebarView::Explorer),
+            KeyCode::Enter => self.run_active_file(),
+            _ => {}
+        }
+    }
+
+    fn refresh_run_debug(&mut self) {
+        let path = self.editor.path.clone();
+        self.run_debug.set_active_file(path);
+        self.run_debug.feedback = None;
+        self.run_debug.feedback_is_error = false;
+    }
+
+    /// Build a shell command line that runs `path` based on its extension.
+    /// Returns `None` for paths whose extension we don't know how to run; the
+    /// caller renders that as a feedback line so the user sees why nothing
+    /// happened. The path is single-quoted with embedded `'` escaped so a
+    /// filename like `O'Reilly.py` cannot break out of the quoting.
+    fn run_command_for_path(path: &Path) -> Option<String> {
+        let quoted = shell_single_quote(&path.to_string_lossy());
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let runner: &str = match ext.as_str() {
+            "py" => "python3",
+            "js" | "mjs" | "cjs" => "node",
+            "ts" | "tsx" => "tsx",
+            "rb" => "ruby",
+            "lua" => "lua",
+            "php" => "php",
+            "pl" => "perl",
+            "sh" | "bash" => "bash",
+            "zsh" => "zsh",
+            "fish" => "fish",
+            "rs" | "" => return None,
+            _ => return None,
+        };
+        Some(format!("{runner} {quoted}\n"))
+    }
+
+    /// Spawn a fresh PTY in the workspace root and seed it with the runner
+    /// command for the active editor tab's file, then focus the terminal
+    /// pane so the user sees the output immediately.
+    pub fn run_active_file(&mut self) {
+        let Some(path) = self.editor.path.clone() else {
+            self.run_debug.feedback = Some(String::from("Open a file first"));
+            self.run_debug.feedback_is_error = true;
+            return;
+        };
+        let Some(cmd) = Self::run_command_for_path(&path) else {
+            self.run_debug.feedback = Some(format!(
+                "Don't know how to run {}",
+                path.file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.display().to_string())
+            ));
+            self.run_debug.feedback_is_error = true;
+            return;
+        };
+        match PtyTerminal::new(&self.workspace_root) {
+            Ok(mut term) => {
+                term.write_input(cmd.as_bytes());
+                self.terminals.push(term);
+                self.active_terminal = self.terminals.len() - 1;
+                if !self.show_terminal {
+                    self.show_terminal = true;
+                }
+                self.focus_pane(Pane::Terminal);
+                self.run_debug.feedback = Some(format!(
+                    "Running {}",
+                    path.file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| path.display().to_string())
+                ));
+                self.run_debug.feedback_is_error = false;
+            }
+            Err(e) => {
+                self.run_debug.feedback = Some(format!("Failed to spawn terminal: {e}"));
+                self.run_debug.feedback_is_error = true;
+            }
+        }
     }
 
     fn commit_source_control(&mut self) {
@@ -4041,6 +4193,10 @@ impl App {
                     self.set_sidebar_view(SidebarView::Remote);
                     return;
                 }
+                if rect_contains(self.sidebar_areas.run_debug_icon, m.column, m.row) {
+                    self.set_sidebar_view(SidebarView::RunDebug);
+                    return;
+                }
                 if in_editor_pane
                     && self.editor.is_blank_initial()
                     && self.activate_welcome_link(m.column, m.row)
@@ -4123,6 +4279,13 @@ impl App {
                                 }
                             }
                         }
+                    }
+                    return;
+                }
+                if in_tree && self.sidebar_view == SidebarView::RunDebug {
+                    self.focus_pane(Pane::Tree);
+                    if self.run_debug.click_button(m.column, m.row) {
+                        self.run_active_file();
                     }
                     return;
                 }
@@ -4323,6 +4486,7 @@ impl App {
                                 self.source_control.scroll_to_bar_y(m.row);
                             }
                             SidebarView::Search => {}
+                            SidebarView::RunDebug => {}
                         },
                         Pane::Editor => {
                             self.editor.scroll_to_bar_y(m.row);
@@ -4381,7 +4545,9 @@ impl App {
                                 self.remote.select(idx);
                             }
                         }
-                        SidebarView::Search | SidebarView::SourceControl => {}
+                        SidebarView::Search
+                        | SidebarView::SourceControl
+                        | SidebarView::RunDebug => {}
                     }
                 } else if in_terminal {
                     self.terminal_mut().extend_selection_to(m.column, m.row);
@@ -4451,7 +4617,7 @@ impl App {
                         SidebarView::Explorer => self.tree.scroll_down(3),
                         SidebarView::Remote => self.remote.scroll_down(3),
                         SidebarView::SourceControl => self.source_control.scroll_down(3),
-                        SidebarView::Search => {}
+                        SidebarView::Search | SidebarView::RunDebug => {}
                     }
                 } else if in_editor {
                     if let Some(diff) = self.editor.diff.as_mut() {
@@ -4474,7 +4640,7 @@ impl App {
                         SidebarView::Explorer => self.tree.scroll_up(3),
                         SidebarView::Remote => self.remote.scroll_up(3),
                         SidebarView::SourceControl => self.source_control.scroll_up(3),
-                        SidebarView::Search => {}
+                        SidebarView::Search | SidebarView::RunDebug => {}
                     }
                 } else if in_editor {
                     if let Some(diff) = self.editor.diff.as_mut() {
@@ -5823,6 +5989,22 @@ fn rect_contains(r: Rect, x: u16, y: u16) -> bool {
         && x < r.x + r.width
         && y >= r.y
         && y < r.y + r.height
+}
+
+/// POSIX-shell single-quote `s` so it round-trips through `bash -c` etc.
+/// Embedded `'` characters are closed, escaped via `'\''`, and reopened.
+fn shell_single_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for c in s.chars() {
+        if c == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(c);
+        }
+    }
+    out.push('\'');
+    out
 }
 
 const TERMINAL_ADD_LABEL: &str = " + ";
@@ -9009,6 +9191,128 @@ mod tests {
         .unwrap();
         assert_eq!(app.sidebar_view, SidebarView::SourceControl);
         assert!(app.source_control.focused);
+    }
+
+    #[test]
+    fn activity_bar_render_lays_out_run_debug_block_below_source_control() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        let bar = Rect { x: 0, y: 0, width: ACTIVITY_BAR_WIDTH, height: 30 };
+        let backend = ratatui::backend::TestBackend::new(40, 30);
+        let mut term = ratatui::Terminal::new(backend).unwrap();
+        term.draw(|f| app.render_activity_bar(f, bar)).unwrap();
+        let scm = app.sidebar_areas.source_control_icon;
+        let run = app.sidebar_areas.run_debug_icon;
+        assert!(run.height > 0, "run-debug icon must claim a non-zero block");
+        assert!(
+            run.y > scm.y,
+            "run-debug icon must sit BELOW source-control (scm.y={}, run.y={})",
+            scm.y,
+            run.y
+        );
+    }
+
+    #[test]
+    fn click_on_run_debug_icon_switches_sidebar_to_run_debug() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        let backend = ratatui::backend::TestBackend::new(80, 30);
+        let mut term = ratatui::Terminal::new(backend).unwrap();
+        term.draw(|f| app.render(f)).unwrap();
+        let run = app.sidebar_areas.run_debug_icon;
+        assert!(run.height > 0, "run-debug icon must be laid out");
+        app.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: run.x,
+            row: run.y,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.sidebar_view, SidebarView::RunDebug);
+    }
+
+    #[test]
+    fn run_command_for_path_picks_python3_for_dot_py() {
+        let cmd = App::run_command_for_path(std::path::Path::new("/work/script.py")).unwrap();
+        assert!(cmd.starts_with("python3 "), "got: {cmd}");
+        assert!(cmd.ends_with('\n'), "command must end with newline so the shell executes it");
+        assert!(cmd.contains("'/work/script.py'"));
+    }
+
+    #[test]
+    fn run_command_for_path_picks_node_for_dot_js() {
+        let cmd = App::run_command_for_path(std::path::Path::new("/work/server.js")).unwrap();
+        assert!(cmd.starts_with("node "));
+    }
+
+    #[test]
+    fn run_command_for_path_picks_bash_for_dot_sh() {
+        let cmd = App::run_command_for_path(std::path::Path::new("/work/build.sh")).unwrap();
+        assert!(cmd.starts_with("bash "));
+    }
+
+    #[test]
+    fn run_command_for_path_returns_none_for_unknown_extension() {
+        assert!(App::run_command_for_path(std::path::Path::new("/work/notes.txt")).is_none());
+        assert!(App::run_command_for_path(std::path::Path::new("/work/Cargo.toml")).is_none());
+    }
+
+    #[test]
+    fn run_command_for_path_quotes_apostrophes_safely() {
+        // Filenames containing ' must be POSIX-quoted so the shell sees the
+        // literal single-quote and not a quoting break-out.
+        let cmd =
+            App::run_command_for_path(std::path::Path::new("/work/O'Reilly.py")).unwrap();
+        assert!(
+            cmd.contains("'/work/O'\\''Reilly.py'"),
+            "apostrophe must be POSIX-escaped via '\\'' in: {cmd}"
+        );
+    }
+
+    #[test]
+    fn run_active_file_with_no_open_file_records_feedback_and_does_not_spawn_terminal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        let term_count_before = app.terminals.len();
+        app.run_active_file();
+        assert_eq!(
+            app.terminals.len(),
+            term_count_before,
+            "no file open: must NOT spawn an extra terminal"
+        );
+        assert!(app.run_debug.feedback_is_error);
+        assert!(app.run_debug.feedback.is_some());
+    }
+
+    #[test]
+    fn run_active_file_with_unknown_extension_records_feedback_and_does_not_spawn_terminal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("notes.txt");
+        std::fs::write(&f, b"hi").unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.editor.open(&f).unwrap();
+        let term_count_before = app.terminals.len();
+        app.run_active_file();
+        assert_eq!(app.terminals.len(), term_count_before);
+        assert!(app.run_debug.feedback_is_error);
+    }
+
+    #[test]
+    fn run_active_file_with_python_file_spawns_a_new_terminal_and_focuses_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("hello.py");
+        std::fs::write(&f, b"print('hi')\n").unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.editor.open(&f).unwrap();
+        let term_count_before = app.terminals.len();
+        app.run_active_file();
+        assert_eq!(
+            app.terminals.len(),
+            term_count_before + 1,
+            "running a known extension must spawn a fresh terminal so the previous one's history isn't clobbered"
+        );
+        assert!(app.show_terminal, "terminal pane must become visible");
+        assert!(matches!(app.focus, Pane::Terminal));
+        assert!(!app.run_debug.feedback_is_error);
     }
 
     #[test]

@@ -266,11 +266,14 @@ src/
 ├── sheet.rs             CSV / TSV / XLSX / XLS / XLSB / ODS parsing via the csv and calamine crates
 └── widgets/
     ├── mod.rs
-    ├── file_tree.rs     ignore::WalkBuilder backed tree, lazy children, fs-watcher refresh, multi-select, drag-drop, bulk trash
+    ├── diff.rs          side-by-side file diff renderer used by the explorer's Compare action
     ├── editor.rs        tree-sitter highlighted editor with full write path, mouse-drag selection, OSC 52 copy/cut, plus image / PDF / spreadsheet preview tabs
-    ├── search.rs        sidebar search panel + .gitignore-aware substring walker
+    ├── file_tree.rs     ignore::WalkBuilder backed tree, lazy children, fs-watcher refresh, multi-select, drag-drop, bulk trash
     ├── remote.rs        Remote Explorer sidebar widget
+    ├── run_debug.rs     Run and Debug sidebar widget: empty state plus Run [filename] button that spawns the active file in a fresh terminal
     ├── scrollbar.rs     shared vertical-scrollbar geometry
+    ├── search.rs        sidebar search panel + .gitignore-aware substring walker
+    ├── source_control.rs Source Control sidebar widget: branch summary, commit input, change list, commit button
     └── terminal.rs      portable-pty + vt100 + ratatui integration with selection + scrollback
 tests/cli.rs             integration tests for the CLI surface
 ```
@@ -288,12 +291,13 @@ What works:
 * Inline preview tabs that render directly in the editor pane via OSC 1337: PNG / JPEG / GIF / BMP / WebP, PDFs (with page navigation, multi-page when poppler is installed), and CSV / TSV / XLSX / XLS / XLSB / ODS spreadsheets.
 * Search sidebar (live, `.gitignore`-aware, off the UI thread, regex / case / whole-word toggles).
 * Remote (SSH) sidebar that lists hosts from `~/.ssh/config` and launches a remote croft session.
+* Run and Debug sidebar (icon five): a Run [filename] button that picks a runner by file extension (Python, Node, Ruby, bash, zsh, fish, PHP, Perl, Lua, plus tsx for TS/TSX) and spawns the file in a fresh terminal, focusing the terminal pane so the output streams in immediately.
 * Embedded shell with full ANSI color, key forwarding, mouse-drag text selection, and 5000-row scrollback.
 * Git status pill in the bottom bar (branch, dirty bullet, ahead / behind).
 * Welcome recents fetched live via the anonymous git protocol so the panel works behind shared egress IPs (Tailscale, corporate NAT) where the Bitbucket / GitHub REST APIs are rate-limited.
 * `setup-terminal` and `setup-iterm2` AppleScript / plist helpers.
 
-The repo ships 441 unit tests plus CLI integration tests; run with `cargo test`.
+The repo ships 564 unit tests plus CLI integration tests; run with `cargo test`.
 
 What does not work yet: command palette, settings, LSP, debugger.
 
