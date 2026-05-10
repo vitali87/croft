@@ -441,10 +441,21 @@ pub struct App {
     /// it must not block `App::new`. None once installed.
     fs_watcher_init_rx: Option<std::sync::mpsc::Receiver<FsWatcherInit>>,
     git_status: crate::git::GitStatus,
-    /// Receives the initial `git::query` result from a background thread.
-    /// `git status --porcelain` on a huge dirty repo can take hundreds of
-    /// milliseconds, so it's deferred. None once installed.
-    git_status_init_rx: Option<std::sync::mpsc::Receiver<crate::git::GitStatus>>,
+    /// Outbox for `git status` / `git status --porcelain` requests sent
+    /// to the background worker (`git::git_worker_loop`). Sidebar-icon
+    /// clicks and FS-watcher ticks `send` a `GitRequest` here instead
+    /// of shelling out on the UI thread; the worker shells out on its
+    /// own thread and replies via `git_response_rx`. Sending is a
+    /// non-blocking unbounded mpsc push (~hundreds of ns), so the
+    /// hot-path cost on the click is "queue one request" rather than
+    /// "fork+exec git and wait 15-50 ms" — the entire reason croft is
+    /// in Rust.
+    git_request_tx: std::sync::mpsc::Sender<crate::git::GitRequest>,
+    /// Inbox for `GitResponse`s coming back from the worker. Drained
+    /// each tick by `drain_git_responses`; a non-empty drain forces
+    /// the next redraw so the new status / entries appear within one
+    /// frame of arrival.
+    git_response_rx: std::sync::mpsc::Receiver<crate::git::GitResponse>,
     last_git_check: std::time::Instant,
     /// Anchor instant for the cursor blink. `tick_cursor_visible()` reads
     /// this to compute whether the caret is currently in its on-half or
@@ -995,14 +1006,23 @@ impl App {
             }
         });
 
-        // `git status --porcelain` on a huge dirty repo can be hundreds of
-        // ms. Same treatment: kick it off, install when ready.
-        let (git_init_tx, git_init_rx) = std::sync::mpsc::channel();
-        let root_for_git = root.clone();
+        // Background git worker: every `git status` / `git status
+        // --porcelain` shell-out goes through this channel instead of
+        // running on the UI thread. The very first request seeds the
+        // status-bar badge; subsequent ones come from the FS watcher
+        // and from sidebar-icon clicks (see `refresh_source_control`,
+        // `refresh_git_status_debounced`). Removes the 15-50 ms
+        // input-to-paint stall that used to fire on every Source
+        // Control click.
+        let (git_request_tx, git_request_rx) =
+            std::sync::mpsc::channel::<crate::git::GitRequest>();
+        let (git_response_tx, git_response_rx) =
+            std::sync::mpsc::channel::<crate::git::GitResponse>();
+        let git_root = root.clone();
         std::thread::spawn(move || {
-            let s = crate::git::query(&root_for_git);
-            let _ = git_init_tx.send(s);
+            crate::git::git_worker_loop(git_root, git_request_rx, git_response_tx);
         });
+        let _ = git_request_tx.send(crate::git::GitRequest::Status);
 
         let (commits_tx, commits_rx) = std::sync::mpsc::channel();
         let recent_repo_remote = crate::git::croft_repository_remote();
@@ -1046,7 +1066,8 @@ impl App {
             fs_rx: None,
             fs_watcher_init_rx: Some(fs_init_rx),
             git_status: crate::git::GitStatus::default(),
-            git_status_init_rx: Some(git_init_rx),
+            git_request_tx,
+            git_response_rx,
             last_git_check: std::time::Instant::now(),
             cursor_blink_anchor: std::time::Instant::now(),
             activity_images: None,
@@ -1468,17 +1489,17 @@ impl App {
             return;
         }
         self.last_git_check = std::time::Instant::now();
-        self.git_status = crate::git::query(&self.tree.root);
-        // The Source Control panel reads `git status --porcelain` for its
-        // row list; refresh whenever git state changes so the user sees the
-        // tree reflect the same disk reality the badge in the status bar
-        // already shows.
-        if self.sidebar_view == SidebarView::SourceControl {
-            let entries = crate::git::query_changes(&self.tree.root);
-            self.source_control.set_status(self.git_status.clone(), entries);
+        // Off-thread: post a request and let the worker reply via
+        // `git_response_rx`. Used to shell out to `git status [+
+        // --porcelain]` synchronously here, blocking the UI thread for
+        // 15-50 ms on every FS-watcher tick — the same stall the
+        // Source Control click had until this was rewritten.
+        let req = if self.sidebar_view == SidebarView::SourceControl {
+            crate::git::GitRequest::StatusAndChanges
         } else {
-            self.source_control.status = self.git_status.clone();
-        }
+            crate::git::GitRequest::Status
+        };
+        let _ = self.git_request_tx.send(req);
     }
 
     fn spawn_fs_watcher(
@@ -1672,17 +1693,45 @@ impl App {
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}
             }
         }
-        if let Some(rx) = self.git_status_init_rx.as_ref() {
-            match rx.try_recv() {
-                Ok(s) => {
-                    self.git_status = s;
-                    self.git_status_init_rx = None;
+        if self.drain_git_responses() {
+            changed = true;
+        }
+        changed
+    }
+
+    /// Drain everything the git worker has shipped back since the last
+    /// tick and apply each response to the matching cache (`git_status`
+    /// for the status-bar badge, `source_control.entries` for the SC
+    /// panel rows). Returns true iff anything was applied so the main
+    /// loop knows to redraw. Cheap when the rx is empty: a single
+    /// non-blocking try_recv. Called from `try_install_pending_init`,
+    /// which already runs every tick.
+    pub fn drain_git_responses(&mut self) -> bool {
+        let mut changed = false;
+        loop {
+            match self.git_response_rx.try_recv() {
+                Ok(crate::git::GitResponse::Status(s)) => {
+                    if self.git_status != s {
+                        self.git_status = s.clone();
+                        // Mirror the FS-watcher path: the SC panel
+                        // header reads the status snapshot too, even
+                        // when the row list isn't being refreshed.
+                        self.source_control.status = s;
+                        changed = true;
+                    }
+                }
+                Ok(crate::git::GitResponse::Changes(entries)) => {
+                    self.source_control
+                        .set_status(self.git_status.clone(), entries);
                     changed = true;
                 }
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    self.git_status_init_rx = None;
+                Ok(crate::git::GitResponse::StatusAndChanges(s, entries)) => {
+                    self.git_status = s.clone();
+                    self.source_control.set_status(s, entries);
+                    changed = true;
                 }
-                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
             }
         }
         changed
@@ -3122,8 +3171,16 @@ impl App {
     }
 
     fn refresh_source_control(&mut self) {
-        let entries = crate::git::query_changes(&self.tree.root);
-        self.source_control.set_status(self.git_status.clone(), entries);
+        // Non-blocking: post a Changes request and let the worker reply
+        // via `git_response_rx`. The panel paints immediately from
+        // whatever entries the last drain installed (typically <400 ms
+        // old via the FS-watcher tick); the fresh entries land within
+        // one or two frames after the click. Removes the synchronous
+        // `git status --porcelain` shell-out that used to stall the UI
+        // thread on every Source Control click.
+        let _ = self
+            .git_request_tx
+            .send(crate::git::GitRequest::Changes);
     }
 
     fn handle_run_debug_key(&mut self, key: KeyEvent) {
@@ -6557,7 +6614,6 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(tmp.path().to_path_buf()).unwrap();
         app.fs_watcher_init_rx = None;
-        app.git_status_init_rx = None;
         for _ in 0..20 {
             let _ = app.drain_fs_events();
             std::thread::sleep(std::time::Duration::from_millis(10));
@@ -6634,7 +6690,6 @@ mod tests {
         app._fs_watcher = None;
         app.fs_rx = None;
         app.fs_watcher_init_rx = None;
-        app.git_status_init_rx = None;
         app.fs_poll_dir_mtimes.clear();
         app.fs_poll_last_check = std::time::Instant::now() - FS_POLL_INTERVAL;
 
@@ -6659,7 +6714,6 @@ mod tests {
         app._fs_watcher = None;
         app.fs_rx = None;
         app.fs_watcher_init_rx = None;
-        app.git_status_init_rx = None;
         app.fs_poll_last_check = std::time::Instant::now() - FS_POLL_INTERVAL;
 
         std::fs::write(&file, "new content\n").unwrap();
@@ -6696,7 +6750,6 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         app._fs_watcher = None;
         app.fs_watcher_init_rx = None;
-        app.git_status_init_rx = None;
         app.fs_rx = Some(rx);
         app.sync_open_file_poll_mtime();
 
@@ -6736,7 +6789,6 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         app._fs_watcher = None;
         app.fs_watcher_init_rx = None;
-        app.git_status_init_rx = None;
         app.fs_rx = Some(rx);
         app.sync_open_file_poll_mtime();
 
@@ -6776,7 +6828,6 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         app._fs_watcher = None;
         app.fs_watcher_init_rx = None;
-        app.git_status_init_rx = None;
         app.fs_rx = Some(rx);
         app.sync_open_file_poll_mtime();
 
@@ -8131,6 +8182,63 @@ mod tests {
         std::fs::write(&f, "hi").unwrap();
         app.editor.open_pinned(&f).unwrap();
         assert!(!app.consume_welcome_image_clear());
+    }
+
+    #[test]
+    fn clicking_source_control_does_not_block_on_git_and_posts_a_changes_request() {
+        // Regression for the user-reported "Source Control click feels
+        // sluggish vs the other sidebar icons" bug. The cause was a
+        // synchronous `git status --porcelain` shell-out from
+        // `refresh_source_control` running on the UI thread, costing
+        // 15-50 ms per click on a small repo and 100-300 ms on a large
+        // one. The fix routes every git status query through a
+        // background worker; the click path now does a single
+        // non-blocking `mpsc::Sender::send` and returns within the
+        // microsecond range.
+        let tmp = tempfile::tempdir().unwrap();
+        let _ = std::process::Command::new("git")
+            .args(["-C"]).arg(tmp.path()).args(["init", "-q", "-b", "main"]).output();
+        let _ = std::process::Command::new("git")
+            .args(["-C"]).arg(tmp.path()).args(["config", "user.email", "a@b"]).status();
+        let _ = std::process::Command::new("git")
+            .args(["-C"]).arg(tmp.path()).args(["config", "user.name", "a"]).status();
+        std::fs::write(tmp.path().join("dirty.txt"), "x").unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        // Pretend the worker is idle by draining its initial Status
+        // response (App::new posts one to seed the badge). This isn't
+        // strictly required for the assertion but keeps the test from
+        // racing with that startup reply.
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        let _ = app.drain_git_responses();
+        let started = std::time::Instant::now();
+        app.set_sidebar_view(SidebarView::SourceControl);
+        let elapsed = started.elapsed();
+        // The synchronous shell-out used to take 15-50 ms minimum on
+        // any real machine; an order of magnitude headroom catches the
+        // regression even on a fast CI box.
+        assert!(
+            elapsed < std::time::Duration::from_millis(5),
+            "Source Control click must not block on git; took {elapsed:?}",
+        );
+        // The Changes request must have landed on the worker — give it
+        // up to 2 s to respond, then drain. The response carries the
+        // single untracked file we wrote above.
+        let mut got_changes = false;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while std::time::Instant::now() < deadline {
+            if app.drain_git_responses() {
+                if !app.source_control.entries.is_empty() {
+                    got_changes = true;
+                    break;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            got_changes,
+            "the worker must reply with the dirty file's Changes entry; entries = {:?}",
+            app.source_control.entries,
+        );
     }
 
     #[test]

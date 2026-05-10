@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Snapshot of the workspace's git state, refreshed periodically and after
@@ -629,6 +629,79 @@ pub fn parse_ahead_behind(out: &str) -> (usize, usize) {
     (a, b)
 }
 
+/// Unit of work the App posts to the background git worker. Coalesced
+/// inside the loop so a burst of clicks / FS-watcher ticks turns into a
+/// single shell-out instead of N.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GitRequest {
+    Status,
+    Changes,
+    StatusAndChanges,
+}
+
+impl GitRequest {
+    /// Merge two pending requests into the strongest one. `StatusAndChanges`
+    /// dominates everything; mixing `Status` and `Changes` collapses to
+    /// `StatusAndChanges`; same+same is the same.
+    pub fn merge(self, other: Self) -> Self {
+        use GitRequest::*;
+        match (self, other) {
+            (StatusAndChanges, _) | (_, StatusAndChanges) => StatusAndChanges,
+            (Status, Changes) | (Changes, Status) => StatusAndChanges,
+            (Status, Status) => Status,
+            (Changes, Changes) => Changes,
+        }
+    }
+}
+
+/// Result the worker ships back. The variants mirror `GitRequest` 1:1
+/// so the App can route each response to the right consumer without an
+/// extra request-id channel.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GitResponse {
+    Status(GitStatus),
+    Changes(Vec<ChangeEntry>),
+    StatusAndChanges(GitStatus, Vec<ChangeEntry>),
+}
+
+/// Background worker loop. Reads `GitRequest`s from `rx`, coalesces a
+/// burst of pending requests into a single shell-out, runs `query` /
+/// `query_changes` off the UI thread, and ships the result back via
+/// `tx`. Terminates cleanly when either channel closes.
+///
+/// Croft was rewritten to Rust for raw input latency. `git status` on a
+/// fresh shell adds 15-50 ms (process spawn + scanning the tree) — fine
+/// off-thread, never on the hot path of a sidebar-icon click. The same
+/// channel gate is used by both the click path (`refresh_source_control`)
+/// and the FS-watcher tick (`refresh_git_status_debounced`).
+pub fn git_worker_loop(
+    root: PathBuf,
+    rx: std::sync::mpsc::Receiver<GitRequest>,
+    tx: std::sync::mpsc::Sender<GitResponse>,
+) {
+    while let Ok(mut req) = rx.recv() {
+        // Drain any other requests already queued so a burst collapses
+        // to one shell-out (the FS watcher fires once per debounce
+        // window; a fast click + tick can stack a Changes on top of a
+        // Status before the worker has woken up).
+        while let Ok(newer) = rx.try_recv() {
+            req = req.merge(newer);
+        }
+        let resp = match req {
+            GitRequest::Status => GitResponse::Status(query(&root)),
+            GitRequest::Changes => GitResponse::Changes(query_changes(&root)),
+            GitRequest::StatusAndChanges => {
+                let s = query(&root);
+                let c = query_changes(&root);
+                GitResponse::StatusAndChanges(s, c)
+            }
+        };
+        if tx.send(resp).is_err() {
+            return;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1014,5 +1087,94 @@ mod tests {
         let summary = commit_all_tracked(p, "second commit").expect("commit should succeed");
         assert!(summary.contains("second commit") || summary.contains("main"), "summary was: {summary}");
         assert!(query_changes(p).is_empty(), "post-commit working tree should be clean");
+    }
+
+    #[test]
+    fn git_request_merge_collapses_status_and_changes_into_status_and_changes() {
+        assert_eq!(
+            GitRequest::Status.merge(GitRequest::Changes),
+            GitRequest::StatusAndChanges,
+        );
+        assert_eq!(
+            GitRequest::Changes.merge(GitRequest::Status),
+            GitRequest::StatusAndChanges,
+        );
+        assert_eq!(
+            GitRequest::Status.merge(GitRequest::Status),
+            GitRequest::Status,
+        );
+        assert_eq!(
+            GitRequest::Changes.merge(GitRequest::Changes),
+            GitRequest::Changes,
+        );
+        assert_eq!(
+            GitRequest::StatusAndChanges.merge(GitRequest::Changes),
+            GitRequest::StatusAndChanges,
+        );
+    }
+
+    #[test]
+    fn git_worker_loop_processes_a_changes_request_and_returns_entries() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        let _ = Command::new("git").args(["-C"]).arg(p).args(["init", "-q", "-b", "main"]).output();
+        let _ = Command::new("git").args(["-C"]).arg(p).args(["config", "user.email", "a@b"]).status();
+        let _ = Command::new("git").args(["-C"]).arg(p).args(["config", "user.name", "a"]).status();
+        std::fs::write(p.join("untracked.txt"), "x").unwrap();
+        let (req_tx, req_rx) = std::sync::mpsc::channel::<GitRequest>();
+        let (resp_tx, resp_rx) = std::sync::mpsc::channel::<GitResponse>();
+        let root = p.to_path_buf();
+        let join = std::thread::spawn(move || git_worker_loop(root, req_rx, resp_tx));
+        req_tx.send(GitRequest::Changes).unwrap();
+        let resp = resp_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("worker must reply within 10s");
+        match resp {
+            GitResponse::Changes(entries) => {
+                assert_eq!(entries.len(), 1, "expected 1 untracked entry, got {entries:?}");
+                assert_eq!(entries[0].kind, ChangeKind::Untracked);
+            }
+            other => panic!("expected Changes, got {other:?}"),
+        }
+        drop(req_tx);
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn git_worker_loop_coalesces_a_burst_into_one_status_and_changes_response() {
+        // Two pending requests (Status + Changes) that arrive faster than
+        // the worker wakes up must collapse to a single
+        // StatusAndChanges response (the coalesce drains rx via
+        // try_recv before the second .recv()). Without the merge, the
+        // worker would shell out twice for what the App treats as one
+        // logical refresh.
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        let _ = Command::new("git").args(["-C"]).arg(p).args(["init", "-q", "-b", "main"]).output();
+        let _ = Command::new("git").args(["-C"]).arg(p).args(["config", "user.email", "a@b"]).status();
+        let _ = Command::new("git").args(["-C"]).arg(p).args(["config", "user.name", "a"]).status();
+        let (req_tx, req_rx) = std::sync::mpsc::channel::<GitRequest>();
+        let (resp_tx, resp_rx) = std::sync::mpsc::channel::<GitResponse>();
+        let root = p.to_path_buf();
+        // Queue two requests BEFORE the worker starts so the first
+        // recv() succeeds and the try_recv coalesce sees the second one.
+        req_tx.send(GitRequest::Status).unwrap();
+        req_tx.send(GitRequest::Changes).unwrap();
+        let join = std::thread::spawn(move || git_worker_loop(root, req_rx, resp_tx));
+        let first = resp_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("worker must reply within 10s");
+        assert!(
+            matches!(first, GitResponse::StatusAndChanges(_, _)),
+            "burst must coalesce into one StatusAndChanges response, got {first:?}",
+        );
+        // No second response — the two pending requests merged.
+        let second = resp_rx.recv_timeout(std::time::Duration::from_millis(200));
+        assert!(
+            second.is_err(),
+            "coalesce must produce exactly one response per burst, got an extra {second:?}",
+        );
+        drop(req_tx);
+        join.join().unwrap();
     }
 }
