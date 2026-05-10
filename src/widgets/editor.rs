@@ -959,8 +959,51 @@ impl Editor {
         self.pin_on_edit();
         self.push_undo(EditKind::Newline);
         self.delete_selection_inner();
-        self.insert_newline_raw();
+        self.smart_insert_newline_inner();
         self.recompute_highlights();
+    }
+
+    fn smart_insert_newline_inner(&mut self) {
+        if self.lines.is_empty() {
+            self.lines.push(String::new());
+        }
+        let row = self.cursor_row;
+        let col = self.cursor_col;
+        let line = self.lines[row].clone();
+
+        let leading: String = line
+            .chars()
+            .take(col)
+            .take_while(|c| *c == ' ' || *c == '\t')
+            .collect();
+
+        let prefix_chars: Vec<char> = line.chars().take(col).collect();
+        let last_non_ws = prefix_chars.iter().rev().find(|c| !c.is_whitespace()).copied();
+        let next_char = line.chars().nth(col);
+
+        let unit = indent_unit_for(self.lang);
+        let extra = if extra_indent_triggered(self.lang, last_non_ws) {
+            unit
+        } else {
+            ""
+        };
+        let pair_split = is_bracket_pair_split(self.lang, last_non_ws, next_char);
+
+        self.insert_newline_raw();
+
+        let new_indent = format!("{leading}{extra}");
+        for c in new_indent.chars() {
+            self.insert_char_raw(c);
+        }
+
+        if pair_split {
+            self.insert_newline_raw();
+            for c in leading.chars() {
+                self.insert_char_raw(c);
+            }
+            self.cursor_row -= 1;
+            self.cursor_col = new_indent.chars().count();
+        }
     }
 
     pub fn backspace(&mut self) {
@@ -1441,6 +1484,56 @@ fn is_word_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
 
+fn indent_unit_for(lang: Option<LangKind>) -> &'static str {
+    match lang {
+        Some(LangKind::Yaml) => "  ",
+        _ => "    ",
+    }
+}
+
+fn extra_indent_triggered(lang: Option<LangKind>, last_non_ws: Option<char>) -> bool {
+    let last = match last_non_ws {
+        Some(c) => c,
+        None => return false,
+    };
+    match lang {
+        Some(LangKind::Python) => matches!(last, ':' | '(' | '[' | '{'),
+        Some(LangKind::Rust)
+        | Some(LangKind::JavaScript)
+        | Some(LangKind::TypeScript)
+        | Some(LangKind::Tsx)
+        | Some(LangKind::Json)
+        | Some(LangKind::Go)
+        | Some(LangKind::Css) => matches!(last, '(' | '[' | '{'),
+        _ => false,
+    }
+}
+
+fn is_bracket_pair_split(
+    lang: Option<LangKind>,
+    prev: Option<char>,
+    next: Option<char>,
+) -> bool {
+    let bracket_aware = matches!(
+        lang,
+        Some(LangKind::Rust)
+            | Some(LangKind::Python)
+            | Some(LangKind::JavaScript)
+            | Some(LangKind::TypeScript)
+            | Some(LangKind::Tsx)
+            | Some(LangKind::Json)
+            | Some(LangKind::Go)
+            | Some(LangKind::Css)
+    );
+    if !bracket_aware {
+        return false;
+    }
+    matches!(
+        (prev, next),
+        (Some('{'), Some('}')) | (Some('['), Some(']')) | (Some('('), Some(')'))
+    )
+}
+
 fn is_binary(data: &[u8]) -> bool {
     let sample = &data[..data.len().min(4096)];
     if sample.contains(&0) {
@@ -1602,6 +1695,123 @@ mod tests {
         e.insert_newline();
         assert_eq!(e.lines, vec!["abc".to_string(), String::new()]);
         assert_eq!(e.cursor_row, 1);
+    }
+
+    #[test]
+    fn insert_newline_copies_previous_indent_for_unknown_language() {
+        let mut e = editor_with("    abc");
+        e.cursor_col = 7;
+        e.insert_newline();
+        assert_eq!(e.lines, vec!["    abc".to_string(), "    ".to_string()]);
+        assert_eq!(e.cursor_row, 1);
+        assert_eq!(e.cursor_col, 4);
+    }
+
+    #[test]
+    fn insert_newline_python_indents_one_step_after_colon() {
+        let mut e = editor_with("def hello():");
+        e.lang = Some(LangKind::Python);
+        e.cursor_col = e.line_char_len(0);
+        e.insert_newline();
+        assert_eq!(e.lines, vec!["def hello():".to_string(), "    ".to_string()]);
+        assert_eq!(e.cursor_row, 1);
+        assert_eq!(e.cursor_col, 4);
+    }
+
+    #[test]
+    fn insert_newline_python_no_extra_indent_without_colon() {
+        let mut e = editor_with("    print(x)");
+        e.lang = Some(LangKind::Python);
+        e.cursor_col = e.line_char_len(0);
+        e.insert_newline();
+        assert_eq!(e.lines, vec!["    print(x)".to_string(), "    ".to_string()]);
+        assert_eq!(e.cursor_col, 4);
+    }
+
+    #[test]
+    fn insert_newline_python_stacks_indent_on_nested_colon() {
+        let mut e = editor_with("    if x:");
+        e.lang = Some(LangKind::Python);
+        e.cursor_col = e.line_char_len(0);
+        e.insert_newline();
+        assert_eq!(e.lines, vec!["    if x:".to_string(), "        ".to_string()]);
+        assert_eq!(e.cursor_col, 8);
+    }
+
+    #[test]
+    fn insert_newline_rust_indents_after_open_brace() {
+        let mut e = editor_with("fn main() {");
+        e.lang = Some(LangKind::Rust);
+        e.cursor_col = e.line_char_len(0);
+        e.insert_newline();
+        assert_eq!(e.lines, vec!["fn main() {".to_string(), "    ".to_string()]);
+        assert_eq!(e.cursor_col, 4);
+    }
+
+    #[test]
+    fn insert_newline_typescript_indents_after_open_paren() {
+        let mut e = editor_with("foo(");
+        e.lang = Some(LangKind::TypeScript);
+        e.cursor_col = e.line_char_len(0);
+        e.insert_newline();
+        assert_eq!(e.lines, vec!["foo(".to_string(), "    ".to_string()]);
+        assert_eq!(e.cursor_col, 4);
+    }
+
+    #[test]
+    fn insert_newline_rust_bracket_pair_split_places_close_on_own_line() {
+        let mut e = editor_with("fn main() {}");
+        e.lang = Some(LangKind::Rust);
+        e.cursor_col = 11;
+        e.insert_newline();
+        assert_eq!(
+            e.lines,
+            vec!["fn main() {".to_string(), "    ".to_string(), "}".to_string()]
+        );
+        assert_eq!(e.cursor_row, 1);
+        assert_eq!(e.cursor_col, 4);
+    }
+
+    #[test]
+    fn insert_newline_rust_bracket_pair_split_preserves_outer_indent() {
+        let mut e = editor_with("    let v = vec![];");
+        e.lang = Some(LangKind::Rust);
+        e.cursor_col = 17;
+        e.insert_newline();
+        assert_eq!(
+            e.lines,
+            vec![
+                "    let v = vec![".to_string(),
+                "        ".to_string(),
+                "    ];".to_string(),
+            ]
+        );
+        assert_eq!(e.cursor_row, 1);
+        assert_eq!(e.cursor_col, 8);
+    }
+
+    #[test]
+    fn insert_newline_python_bracket_pair_split_places_close_on_own_line() {
+        let mut e = editor_with("foo()");
+        e.lang = Some(LangKind::Python);
+        e.cursor_col = 4;
+        e.insert_newline();
+        assert_eq!(
+            e.lines,
+            vec!["foo(".to_string(), "    ".to_string(), ")".to_string()]
+        );
+        assert_eq!(e.cursor_row, 1);
+        assert_eq!(e.cursor_col, 4);
+    }
+
+    #[test]
+    fn insert_newline_yaml_uses_two_space_indent() {
+        let mut e = editor_with("  key:");
+        e.lang = Some(LangKind::Yaml);
+        e.cursor_col = e.line_char_len(0);
+        e.insert_newline();
+        assert_eq!(e.lines, vec!["  key:".to_string(), "  ".to_string()]);
+        assert_eq!(e.cursor_col, 2);
     }
 
     #[test]
