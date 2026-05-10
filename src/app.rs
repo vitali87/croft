@@ -583,6 +583,14 @@ pub struct App {
     no_repo_hero_layout: Option<WelcomeLayout>,
     no_repo_hero_overlay_dirty: bool,
     no_repo_hero_displayed: bool,
+    /// One-shot flag: arm a `terminal.clear()` on the next render pass
+    /// after the source-control hero image was emitted and the user has
+    /// just navigated to a different sidebar view (or the workspace
+    /// transitioned into a git repo). Same eviction trick the welcome
+    /// wordmark and Run-Debug icon pipelines use - iTerm2 caches the
+    /// image cells outside ratatui's diff, so without this the PNG
+    /// stays painted under whatever sidebar replaces it.
+    no_repo_hero_image_clear_requested: bool,
     /// Pixel size of one terminal cell, captured in `init_graphics`.
     /// Required to bake OSC-1337 images at exact viewport pixel size so
     /// iTerm draws them with no stretching or letterboxing.
@@ -1118,6 +1126,7 @@ impl App {
             no_repo_hero_layout: None,
             no_repo_hero_overlay_dirty: true,
             no_repo_hero_displayed: false,
+            no_repo_hero_image_clear_requested: false,
             cell_pixel: None,
             clipboard_reader: read_system_clipboard,
             fs_poll_last_check: std::time::Instant::now(),
@@ -1427,6 +1436,20 @@ impl App {
     pub fn consume_run_debug_image_clear(&mut self) -> bool {
         if self.run_debug_image_clear_requested {
             self.run_debug_image_clear_requested = false;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// One-shot consumer for the "leaving Source Control after the no-repo
+    /// hero PNG was emitted" flag. Same shape as
+    /// `consume_run_debug_image_clear` - the main loop folds the result
+    /// into its `terminal.clear()` chain so iTerm2's cached image cells
+    /// are evicted on view change.
+    pub fn consume_no_repo_hero_image_clear(&mut self) -> bool {
+        if self.no_repo_hero_image_clear_requested {
+            self.no_repo_hero_image_clear_requested = false;
             true
         } else {
             false
@@ -2546,6 +2569,16 @@ impl App {
                 && self.run_debug_icon_last_emitted.is_some()
             {
                 self.run_debug_image_clear_requested = true;
+            }
+            // Same eviction trick for the Source Control no-repo hero
+            // PNG: leaving Source Control after the image was painted
+            // would otherwise leave the cached PNG under whatever
+            // sidebar replaces it.
+            if self.sidebar_view == SidebarView::SourceControl
+                && view != SidebarView::SourceControl
+                && self.no_repo_hero_displayed
+            {
+                self.no_repo_hero_image_clear_requested = true;
             }
         }
         self.sidebar_view = view;
@@ -10679,6 +10712,7 @@ fn main_loop(
             if app.consume_welcome_image_clear()
                 || app.consume_editor_image_clear()
                 || app.consume_run_debug_image_clear()
+                || app.consume_no_repo_hero_image_clear()
             {
                 terminal.clear()?;
                 // Activity-bar icons live outside ratatui too; re-emit
@@ -10691,6 +10725,7 @@ fn main_loop(
             if app.consume_welcome_image_clear()
                 || app.consume_editor_image_clear()
                 || app.consume_run_debug_image_clear()
+                || app.consume_no_repo_hero_image_clear()
             {
                 terminal.clear()?;
                 app.activity_overlay_dirty = true;
