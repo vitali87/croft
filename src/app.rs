@@ -2431,6 +2431,16 @@ impl App {
     fn set_sidebar_view(&mut self, view: SidebarView) {
         if self.sidebar_view != view {
             self.activity_overlay_dirty = true;
+            // Leaving Search while a scan is in flight: send an
+            // empty-query request so the worker cancels the live walker
+            // threads instead of letting them keep saturating every core
+            // until the scan finishes. The user's hits stay populated for
+            // when they come back; only the live work is dropped.
+            if self.sidebar_view == SidebarView::Search && view != SidebarView::Search {
+                let _ = self
+                    .search_query_tx
+                    .send((String::new(), self.search.opts));
+            }
             // Leaving Run-Debug after the headline icon was on screen:
             // arm a one-shot `terminal.clear()` so iTerm2 evicts the
             // cached OSC-1337 image cells. Plain SGR overwrites do not
