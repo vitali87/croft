@@ -4413,6 +4413,8 @@ impl App {
             && rect_contains(self.tree.last_scrollbar, m.column, m.row);
         let in_remote_scrollbar = self.sidebar_view == SidebarView::Remote
             && rect_contains(self.remote.last_scrollbar, m.column, m.row);
+        let in_search_scrollbar = self.sidebar_view == SidebarView::Search
+            && rect_contains(self.search.last_scrollbar, m.column, m.row);
         let in_editor_scrollbar = rect_contains(self.editor.last_scrollbar, m.column, m.row);
 
         match m.kind {
@@ -4551,6 +4553,13 @@ impl App {
                 if in_remote_scrollbar {
                     self.focus_pane(Pane::Tree);
                     self.remote.scroll_to_bar_y(m.row);
+                    self.scrollbar_drag = Some(Pane::Tree);
+                    self.last_tree_left_down = None;
+                    return;
+                }
+                if in_search_scrollbar {
+                    self.focus_pane(Pane::Tree);
+                    self.search.scroll_to_bar_y(m.row);
                     self.scrollbar_drag = Some(Pane::Tree);
                     self.last_tree_left_down = None;
                     return;
@@ -4813,7 +4822,9 @@ impl App {
                             SidebarView::SourceControl => {
                                 self.source_control.scroll_to_bar_y(m.row);
                             }
-                            SidebarView::Search => {}
+                            SidebarView::Search => {
+                                self.search.scroll_to_bar_y(m.row);
+                            }
                             SidebarView::RunDebug => {}
                         },
                         Pane::Editor => {
@@ -4945,7 +4956,8 @@ impl App {
                         SidebarView::Explorer => self.tree.scroll_down(3),
                         SidebarView::Remote => self.remote.scroll_down(3),
                         SidebarView::SourceControl => self.source_control.scroll_down(3),
-                        SidebarView::Search | SidebarView::RunDebug => {}
+                        SidebarView::Search => self.search.scroll_down(3),
+                        SidebarView::RunDebug => {}
                     }
                 } else if in_editor {
                     if let Some(diff) = self.editor.diff.as_mut() {
@@ -4968,7 +4980,8 @@ impl App {
                         SidebarView::Explorer => self.tree.scroll_up(3),
                         SidebarView::Remote => self.remote.scroll_up(3),
                         SidebarView::SourceControl => self.source_control.scroll_up(3),
-                        SidebarView::Search | SidebarView::RunDebug => {}
+                        SidebarView::Search => self.search.scroll_up(3),
+                        SidebarView::RunDebug => {}
                     }
                 } else if in_editor {
                     if let Some(diff) = self.editor.diff.as_mut() {
@@ -8032,6 +8045,75 @@ mod tests {
             modifiers: KeyModifiers::NONE,
         });
         assert_eq!(app.editor.diff.as_ref().unwrap().scroll_x, 0);
+    }
+
+    #[test]
+    fn mouse_wheel_over_search_panel_scrolls_the_results_list() {
+        // User report: search shows thousands of matches piling up but
+        // the panel can't be scrolled with the wheel - the user is stuck
+        // at the top. The result list must respond to ScrollUp/ScrollDown
+        // when the cursor is over the side panel and Search is the
+        // active view.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.sidebar_view = SidebarView::Search;
+        app.show_tree = true;
+        // Pretend a render captured the search panel at this rect.
+        app.search.last_area = Rect { x: 0, y: 0, width: 60, height: 30 };
+        app.search.last_inner = Rect { x: 1, y: 1, width: 58, height: 28 };
+        // 1000 hits, well past anything that can fit in 30 rows.
+        app.search.hits = (0..1000)
+            .map(|i| crate::widgets::search::SearchHit {
+                path: tmp.path().join("a.txt"),
+                line_no: i + 1,
+                line_text: format!("line {i}"),
+            })
+            .collect();
+        app.search.scroll = 0;
+        app.search.selected = 0;
+        app.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::ScrollDown,
+            column: 30,
+            row: 15,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(
+            app.search.scroll > 0,
+            "wheel-down on the search panel must advance the result list scroll"
+        );
+        let after_down = app.search.scroll;
+        app.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::ScrollUp,
+            column: 30,
+            row: 15,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(
+            app.search.scroll < after_down,
+            "wheel-up must reduce the scroll back toward the top"
+        );
+    }
+
+    #[test]
+    fn search_panel_paints_a_scrollbar_when_hits_exceed_visible_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.sidebar_view = SidebarView::Search;
+        app.show_tree = true;
+        app.search.hits = (0..500)
+            .map(|i| crate::widgets::search::SearchHit {
+                path: tmp.path().join("a.txt"),
+                line_no: i + 1,
+                line_text: format!("line {i}"),
+            })
+            .collect();
+        let area = Rect { x: 0, y: 0, width: 60, height: 30 };
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        ratatui::widgets::Widget::render(&mut app.search, area, &mut buf);
+        assert!(
+            app.search.last_scrollbar.width > 0 && app.search.last_scrollbar.height > 0,
+            "scrollbar rect must be tracked when results overflow the viewport"
+        );
     }
 
     #[test]

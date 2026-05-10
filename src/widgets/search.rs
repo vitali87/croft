@@ -432,6 +432,10 @@ pub struct SearchPanel {
     pub paste_button_y: u16,
     pub paste_button_w: u16,
     pub selection: Option<(usize, usize)>,
+    /// Hit-test rect captured during the last render of the result-list
+    /// scrollbar. Empty when there's no overflow. Used by the mouse
+    /// handler to route track clicks / drags to `scroll_to_bar_y`.
+    pub last_scrollbar: Rect,
 }
 
 impl SearchPanel {
@@ -454,6 +458,7 @@ impl SearchPanel {
             paste_button_y: 0,
             paste_button_w: 0,
             selection: None,
+            last_scrollbar: Rect::default(),
         }
     }
 
@@ -548,6 +553,47 @@ impl SearchPanel {
         if self.selected + 1 < self.hits.len() {
             self.selected += 1;
         }
+    }
+
+    pub fn scroll_up(&mut self, rows: usize) {
+        self.scroll = self.scroll.saturating_sub(rows);
+    }
+
+    pub fn scroll_down(&mut self, rows: usize) {
+        let viewport = self.results_viewport_height();
+        let max_scroll = self.hits.len().saturating_sub(viewport);
+        self.scroll = self.scroll.saturating_add(rows).min(max_scroll);
+    }
+
+    /// Map a track-y from a scrollbar click/drag back into a scroll offset.
+    pub fn scroll_to_bar_y(&mut self, y: u16) -> bool {
+        let viewport = self.results_viewport_height();
+        let Some(metrics) = crate::widgets::scrollbar::vertical_metrics(
+            self.last_scrollbar,
+            self.hits.len(),
+            viewport,
+            self.scroll,
+        ) else {
+            return false;
+        };
+        let new_scroll = crate::widgets::scrollbar::scroll_for_y(metrics, y);
+        let max_scroll = self.hits.len().saturating_sub(viewport);
+        self.scroll = new_scroll.min(max_scroll);
+        true
+    }
+
+    fn results_viewport_height(&self) -> usize {
+        // Results occupy rows from `inner.y + 7` to `inner.y + inner.height - 1`
+        // (header + blank + 3-row input box + separator + caption = 7 rows).
+        let inner = self.last_inner;
+        if inner.height == 0 {
+            return 0;
+        }
+        let results_top = 7u16;
+        if inner.height <= results_top {
+            return 0;
+        }
+        (inner.height - results_top) as usize
     }
 
     pub fn selected_hit(&self) -> Option<&SearchHit> {
@@ -789,6 +835,7 @@ impl Widget for &mut SearchPanel {
         }
 
         // Results
+        self.last_scrollbar = Rect::default();
         if results_start_y >= inner.y + inner.height {
             return;
         }
@@ -796,12 +843,37 @@ impl Widget for &mut SearchPanel {
         if visible == 0 {
             return;
         }
+        // Clamp scroll so the viewport is always full when there's enough
+        // content; otherwise the user can wheel past the end and see blanks.
+        let max_scroll = self.hits.len().saturating_sub(visible);
+        if self.scroll > max_scroll {
+            self.scroll = max_scroll;
+        }
         if self.selected >= self.scroll + visible {
             self.scroll = self.selected + 1 - visible;
         }
         if self.selected < self.scroll {
             self.scroll = self.selected;
         }
+        // Reserve the rightmost column for the scrollbar when the result
+        // list overflows the viewport. `vertical_metrics` returns None when
+        // there's no overflow, so the rightmost column is freed for content.
+        let scrollbar_area = Rect {
+            x: inner.x + inner.width.saturating_sub(1),
+            y: results_start_y,
+            width: 1,
+            height: inner.y + inner.height - results_start_y,
+        };
+        let scrollbar_metrics = crate::widgets::scrollbar::vertical_metrics(
+            scrollbar_area,
+            self.hits.len(),
+            visible,
+            self.scroll,
+        );
+        if let Some(metrics) = scrollbar_metrics {
+            self.last_scrollbar = metrics.area;
+        }
+        let row_width = inner.width.saturating_sub(u16::from(scrollbar_metrics.is_some()));
         let end = (self.scroll + visible).min(self.hits.len());
         for (row_idx, hit_idx) in (self.scroll..end).enumerate() {
             let y = results_start_y + row_idx as u16;
@@ -853,7 +925,10 @@ impl Widget for &mut SearchPanel {
                 ));
             }
             let line = Line::from(spans);
-            buf.set_line(inner.x, y, &line, inner.width);
+            buf.set_line(inner.x, y, &line, row_width);
+        }
+        if let Some(metrics) = scrollbar_metrics {
+            crate::widgets::scrollbar::render_vertical(buf, metrics, self.focused);
         }
     }
 }
