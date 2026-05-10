@@ -60,6 +60,7 @@ fn build_searcher() -> Searcher {
 struct HitSink<'a> {
     path: PathBuf,
     batch: &'a mut Vec<SearchHit>,
+    cancel: Option<Arc<AtomicBool>>,
 }
 
 impl<'a> Sink for HitSink<'a> {
@@ -69,6 +70,11 @@ impl<'a> Sink for HitSink<'a> {
         _searcher: &Searcher,
         mat: &SinkMatch<'_>,
     ) -> Result<bool, std::io::Error> {
+        if let Some(c) = self.cancel.as_ref() {
+            if c.load(Ordering::Relaxed) {
+                return Ok(false);
+            }
+        }
         let line_no = mat.line_number().unwrap_or(0) as usize;
         let line_str = std::str::from_utf8(mat.bytes()).unwrap_or("");
         let stripped = line_str.trim_end_matches(['\r', '\n']);
@@ -132,7 +138,11 @@ pub fn search_workspace_streaming<F>(
             let path = entry.path();
             let mut batch: Vec<SearchHit> = Vec::new();
             {
-                let mut sink = HitSink { path: path.to_path_buf(), batch: &mut batch };
+                let mut sink = HitSink {
+                    path: path.to_path_buf(),
+                    batch: &mut batch,
+                    cancel: Some(cancel.clone()),
+                };
                 let mut searcher = build_searcher();
                 let _ = searcher.search_path(&matcher, path, &mut sink);
             }
@@ -269,27 +279,52 @@ pub enum SearchEvent {
 /// re-fire the same query string with new opts.
 pub type SearchRequest = (String, SearchOpts);
 
-/// Background worker loop. Reads requests from `rx`, coalesces by always
-/// taking the most recent pending request, debounces ~120 ms so a fast
-/// typist doesn't trigger a search per keystroke, runs the streaming
-/// engine, and ships `Hits` events as files yield matches followed by a
-/// single `Done`. Empty queries short-circuit straight to `Done`. The
-/// thread exits cleanly when the channel closes.
+/// How long the user has to pause typing before the search fires. Each
+/// fresh keystroke restarts the timer, so a fast typist running through
+/// "cla" never triggers searches for "c" or "cl" - only the trailing
+/// query gets scanned. This is the standard search-as-you-type pattern
+/// (VS Code, GitHub, etc.). 200 ms is in the sweet spot: short enough
+/// to feel responsive, long enough that bursts of typing are silent.
+const SEARCH_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// Background worker loop. Implements trailing-edge debounce: blocks on
+/// `recv()` for the first input, then loops on `recv_timeout(200 ms)` -
+/// each fresh keystroke restarts the quiet window, so the search fires
+/// only after the user has actually paused. The scan runs on a dedicated
+/// thread so a new keystroke arriving DURING a scan can cancel it via
+/// the shared `Arc<AtomicBool>` and start fresh. Each scan emits per-file
+/// `Hits` batches followed by exactly one `Done`, even when canceled,
+/// so the receiver always sees a balanced event stream. The thread exits
+/// cleanly when the channel closes.
 pub fn search_worker_loop(
     root: PathBuf,
     rx: std::sync::mpsc::Receiver<SearchRequest>,
     tx: std::sync::mpsc::Sender<SearchEvent>,
 ) {
-    use std::time::Duration;
-    while let Ok(mut req) = rx.recv() {
-        while let Ok(newer) = rx.try_recv() {
-            req = newer;
+    use std::sync::mpsc::RecvTimeoutError;
+    let mut current: Option<(std::thread::JoinHandle<()>, Arc<AtomicBool>)> = None;
+    loop {
+        let mut latest = match rx.recv() {
+            Ok(r) => r,
+            Err(_) => break,
+        };
+        // A new keystroke landed: cancel the in-flight scan (if any) so
+        // its worker thread bails out before the user pauses long enough
+        // to trigger the next scan.
+        if let Some((handle, cancel)) = current.take() {
+            cancel.store(true, Ordering::Relaxed);
+            let _ = handle.join();
         }
-        std::thread::sleep(Duration::from_millis(120));
-        while let Ok(newer) = rx.try_recv() {
-            req = newer;
+        // Trailing-edge debounce: each new keystroke resets the timer.
+        // The search fires only after `SEARCH_DEBOUNCE` of silence.
+        loop {
+            match rx.recv_timeout(SEARCH_DEBOUNCE) {
+                Ok(newer) => latest = newer,
+                Err(RecvTimeoutError::Timeout) => break,
+                Err(RecvTimeoutError::Disconnected) => return,
+            }
         }
-        let (query, opts) = req;
+        let (query, opts) = latest;
         if query.trim().is_empty() {
             if tx.send(SearchEvent::Done(query, opts)).is_err() {
                 return;
@@ -297,16 +332,30 @@ pub fn search_worker_loop(
             continue;
         }
         let cancel = Arc::new(AtomicBool::new(false));
-        {
-            let tx_for_emit = tx.clone();
-            let q_for_emit = query.clone();
-            search_workspace_streaming(&root, &query, opts, &cancel, move |batch| {
-                let _ = tx_for_emit.send(SearchEvent::Hits(q_for_emit.clone(), opts, batch));
-            });
-        }
-        if tx.send(SearchEvent::Done(query, opts)).is_err() {
-            return;
-        }
+        let cancel_for_thread = cancel.clone();
+        let tx_for_thread = tx.clone();
+        let root_for_thread = root.clone();
+        let query_for_thread = query.clone();
+        let handle = std::thread::spawn(move || {
+            let q_for_emit = query_for_thread.clone();
+            let tx_for_emit = tx_for_thread.clone();
+            search_workspace_streaming(
+                &root_for_thread,
+                &query_for_thread,
+                opts,
+                &cancel_for_thread,
+                move |batch| {
+                    let _ = tx_for_emit
+                        .send(SearchEvent::Hits(q_for_emit.clone(), opts, batch));
+                },
+            );
+            let _ = tx_for_thread.send(SearchEvent::Done(query_for_thread, opts));
+        });
+        current = Some((handle, cancel));
+    }
+    if let Some((handle, cancel)) = current.take() {
+        cancel.store(true, Ordering::Relaxed);
+        let _ = handle.join();
     }
 }
 
@@ -329,7 +378,11 @@ pub fn collect_matches_in_text(
     let Some(matcher) = build_matcher(q, opts) else {
         return;
     };
-    let mut sink = HitSink { path: path.to_path_buf(), batch: out };
+    let mut sink = HitSink {
+        path: path.to_path_buf(),
+        batch: out,
+        cancel: None,
+    };
     let mut searcher = SearcherBuilder::new()
         .line_number(true)
         .binary_detection(BinaryDetection::quit(b'\x00'))
@@ -1275,6 +1328,92 @@ mod tests {
         assert!(done);
         drop(q_tx);
         join.join().unwrap();
+    }
+
+    #[test]
+    fn search_worker_loop_resets_debounce_on_each_keystroke() {
+        // Trailing-edge debounce: keys arriving within the quiet window
+        // (200 ms) restart the timer, so the user typing "one" with
+        // 100 ms between each keystroke must fire EXACTLY ONE search at
+        // the end - for "one" - not three searches for "o", "on", "one".
+        let tmp = TempDir::new().unwrap();
+        write(&tmp.path().join("a.txt"), "alpha one beta\nzeta\n");
+        let (q_tx, q_rx) = std::sync::mpsc::channel::<SearchRequest>();
+        let (e_tx, e_rx) = std::sync::mpsc::channel::<SearchEvent>();
+        let root = tmp.path().to_path_buf();
+        let join = std::thread::spawn(move || search_worker_loop(root, q_rx, e_tx));
+        // Each gap is well under SEARCH_DEBOUNCE (200 ms), so each new
+        // send resets the timer and no search should fire mid-burst.
+        q_tx.send(("o".into(), SearchOpts::default())).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        q_tx.send(("on".into(), SearchOpts::default())).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        q_tx.send(("one".into(), SearchOpts::default())).unwrap();
+        // Now stop typing and let the debounce expire + the scan finish.
+        let mut dones: Vec<String> = Vec::new();
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < until {
+            match e_rx.recv_timeout(std::time::Duration::from_millis(200)) {
+                Ok(SearchEvent::Done(q, _)) => dones.push(q),
+                _ => {}
+            }
+        }
+        drop(q_tx);
+        join.join().unwrap();
+        assert_eq!(
+            dones,
+            vec!["one".to_string()],
+            "exactly one search should have fired - for the trailing query - not one per keystroke"
+        );
+    }
+
+    #[test]
+    fn search_worker_loop_cancels_in_flight_scan_when_a_new_request_arrives() {
+        // User-reported "0 matches" bug: a fast typist hits "c", which
+        // matches almost every line of every file. The worker used to
+        // block on that giant scan and ignore "cl"/"cla" until "c"
+        // finished, so the user would stare at "0 matches" while typing.
+        // Workspace: 200 files × 20000 lines = 4M matches. Without
+        // cancellation, the "c" scan takes many seconds. With cancellation
+        // wired up, switching to a no-match query must produce Done within
+        // a tight window.
+        let tmp = TempDir::new().unwrap();
+        for i in 0..200 {
+            let many = (0..20000)
+                .map(|n| format!("ccc line {n}\n"))
+                .collect::<String>();
+            write(&tmp.path().join(format!("f{i}.txt")), &many);
+        }
+        let (q_tx, q_rx) = std::sync::mpsc::channel::<SearchRequest>();
+        let (e_tx, e_rx) = std::sync::mpsc::channel::<SearchEvent>();
+        let root = tmp.path().to_path_buf();
+        let join = std::thread::spawn(move || search_worker_loop(root, q_rx, e_tx));
+        q_tx.send(("c".into(), SearchOpts::default())).unwrap();
+        // Wait past the 120ms debounce so the worker is committed.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let switched_at = std::time::Instant::now();
+        q_tx.send(("zzznoneatall".into(), SearchOpts::default())).unwrap();
+        // Done for the new query must arrive within 1.5s of submission.
+        // Without cancellation, the worker would still be plowing through
+        // the 4M-match "c" scan and Done would not arrive for many seconds.
+        let deadline = switched_at + std::time::Duration::from_millis(1500);
+        let mut second_done = false;
+        while std::time::Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            match e_rx.recv_timeout(remaining.max(std::time::Duration::from_millis(50))) {
+                Ok(SearchEvent::Done(q, _)) if q == "zzznoneatall" => {
+                    second_done = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        drop(q_tx);
+        join.join().unwrap();
+        assert!(
+            second_done,
+            "worker must cancel the in-flight scan and emit Done for the new query within 1.5s"
+        );
     }
 
     #[test]
