@@ -36,6 +36,11 @@ pub struct SourceControlPanel {
     /// reads as a logo on plain terminals too. Empty when the panel is
     /// in a git repo or the empty-state card is too small to allocate.
     pub last_hero_area: Rect,
+    /// Set by `App` after probing the host terminal for OSC-1337 inline
+    /// image support. When true, the empty-state render leaves the hero
+    /// rect blank so the PNG owns those cells without competing with an
+    /// ASCII fallback that would briefly flash through during resize.
+    pub inline_hero_image_active: bool,
     pub scroll: usize,
     /// Index into `entries` of the currently-selected change, if any.
     /// Drives the row-highlight bg so the user can tell at a glance
@@ -63,6 +68,7 @@ impl SourceControlPanel {
             last_scrollbar: Rect::default(),
             last_init_repo_button_area: Rect::default(),
             last_hero_area: Rect::default(),
+            inline_hero_image_active: false,
             scroll: 0,
             selected_change: None,
             commit_feedback: None,
@@ -313,11 +319,17 @@ impl SourceControlPanel {
                 width: hero_w,
                 height: hero_h,
             };
-            // Fallback ASCII art inside the reserved rect for non-iTerm2.
-            if card_inner.width >= 13 && hero_h >= 7 {
-                paint_y_fork_illustration(buf, card_inner, y, dim_blue, blue);
-            } else {
-                paint_y_fork_compact(buf, card_inner, y, blue);
+            // Only paint the ASCII Y-fork when there's NO inline-image
+            // hero owning these cells. With OSC-1337 active, leave the
+            // rect blank: ratatui's text would briefly flash through the
+            // image during a resize, which the user (correctly) called
+            // out as old-logo glimpses peeking through the new one.
+            if !self.inline_hero_image_active {
+                if card_inner.width >= 13 && hero_h >= 7 {
+                    paint_y_fork_illustration(buf, card_inner, y, dim_blue, blue);
+                } else {
+                    paint_y_fork_compact(buf, card_inner, y, blue);
+                }
             }
             y += hero_h + 1;
         }

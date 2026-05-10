@@ -1174,6 +1174,10 @@ impl App {
             FALLBACK_CELL_PIXEL
         };
         self.cell_pixel = Some((cell_w, cell_h));
+        // OSC-1337 hero will own the no-repo illustration cells; the
+        // widget skips its ASCII fallback so resize doesn't flash old
+        // text through the image.
+        self.source_control.inline_hero_image_active = true;
         let canvas_w = cell_w * ACTIVITY_BAR_WIDTH as u32;
         let canvas_h = cell_h * ACTIVITY_ICON_HEIGHT as u32;
         let is_tmux = crate::iterm2_inline::detect_tmux();
