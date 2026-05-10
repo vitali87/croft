@@ -586,6 +586,12 @@ pub struct Editor {
     pub path: Option<PathBuf>,
     pub lines: Vec<String>,
     pub scroll: usize,
+    /// Horizontal scroll offset in CHARACTERS. Long lines (e.g. minified
+    /// JS, base64 blobs in HTML) need to scroll right so search hits and
+    /// cursor positions deep in a line are reachable. The render slices
+    /// each line at this column and `move_right`/`move_left` keep the
+    /// cursor visible.
+    pub scroll_col: usize,
     /// Cursor column as a CHARACTER index (not bytes), for the current line.
     pub cursor_row: usize,
     pub cursor_col: usize,
@@ -639,6 +645,7 @@ impl Editor {
             path: None,
             lines: Vec::new(),
             scroll: 0,
+            scroll_col: 0,
             cursor_row: 0,
             cursor_col: 0,
             focused: false,
@@ -1312,6 +1319,7 @@ impl Editor {
             self.cursor_row -= 1;
             self.cursor_col = self.line_char_len(self.cursor_row);
         }
+        self.ensure_cursor_col_visible();
         self.last_edit_kind = None;
     }
 
@@ -1322,7 +1330,44 @@ impl Editor {
             self.cursor_row += 1;
             self.cursor_col = 0;
         }
+        self.ensure_cursor_col_visible();
         self.last_edit_kind = None;
+    }
+
+    pub fn scroll_left_by(&mut self, n: usize) {
+        self.scroll_col = self.scroll_col.saturating_sub(n);
+    }
+
+    pub fn scroll_right_by(&mut self, n: usize) {
+        self.scroll_col = self.scroll_col.saturating_add(n);
+    }
+
+    /// Recompute the visible text width from `last_inner` / `last_gutter_width`
+    /// (set during the most recent render) and use it to decide whether the
+    /// current cursor column is on-screen. This is the same arithmetic the
+    /// renderer uses, kept in one place so move-and-scroll stays in lock-step.
+    fn visible_text_width(&self) -> usize {
+        let scrollbar_w = u16::from(self.last_scrollbar.width > 0);
+        self.last_inner
+            .width
+            .saturating_sub(self.last_gutter_width + 2 + scrollbar_w) as usize
+    }
+
+    /// Pull `scroll_col` so the cursor sits inside the current viewport.
+    /// Mirrors `ensure_cursor_visible` for vertical scroll - keyboard nav
+    /// follows; wheel scrolling does not call this so the user's wheel
+    /// position is sacrosanct. `pub(crate)` so callers like
+    /// `App::open_search_hit` can sync horizontal scroll after a jump.
+    pub(crate) fn ensure_cursor_col_visible(&mut self) {
+        let width = self.visible_text_width();
+        if width == 0 {
+            return;
+        }
+        if self.cursor_col < self.scroll_col {
+            self.scroll_col = self.cursor_col;
+        } else if self.cursor_col >= self.scroll_col + width {
+            self.scroll_col = self.cursor_col + 1 - width;
+        }
     }
 
     /// One screen worth of rows, derived from the editor's last rendered
@@ -1550,6 +1595,35 @@ fn is_binary(data: &[u8]) -> bool {
 }
 
 /// Build a Vec<Span> from a line and its byte-range highlight spans.
+/// Byte index of the character at character index `chars_in`, or the line's
+/// byte length when `chars_in` falls past the end. Used to slice a line at
+/// a horizontal scroll offset measured in characters.
+fn byte_index_of_char(line: &str, chars_in: usize) -> usize {
+    line.char_indices()
+        .nth(chars_in)
+        .map(|(b, _)| b)
+        .unwrap_or(line.len())
+}
+
+/// Shift highlight spans left by `byte_start`, dropping spans that fall
+/// entirely before the cut and clamping spans straddling the cut.
+fn shift_spans_for_view(spans: &[HiSpan], byte_start: usize) -> Vec<HiSpan> {
+    let mut out = Vec::with_capacity(spans.len());
+    for sp in spans {
+        if sp.end <= byte_start {
+            continue;
+        }
+        let new_start = sp.start.saturating_sub(byte_start);
+        let new_end = sp.end - byte_start;
+        out.push(HiSpan {
+            start: new_start,
+            end: new_end,
+            style: sp.style,
+        });
+    }
+    out
+}
+
 fn build_line_spans<'a>(line: &'a str, spans: &[HiSpan]) -> Vec<Span<'a>> {
     if spans.is_empty() {
         return vec![Span::raw(line)];
@@ -2704,6 +2778,70 @@ mod tests {
     }
 
     #[test]
+    fn editor_starts_with_zero_horizontal_scroll() {
+        let e = editor_with("abcdef");
+        assert_eq!(e.scroll_col, 0);
+    }
+
+    #[test]
+    fn scroll_right_by_advances_horizontal_offset() {
+        let mut e = editor_with("a".repeat(2000).as_str());
+        e.scroll_right_by(40);
+        assert_eq!(e.scroll_col, 40);
+        e.scroll_right_by(60);
+        assert_eq!(e.scroll_col, 100);
+        e.scroll_left_by(30);
+        assert_eq!(e.scroll_col, 70);
+        e.scroll_left_by(1000); // saturating
+        assert_eq!(e.scroll_col, 0);
+    }
+
+    #[test]
+    fn move_right_past_visible_edge_advances_horizontal_scroll() {
+        // User-reported bug: long-line files (HTML blob with base64 inline)
+        // had no horizontal scroll, so moving the cursor right past the
+        // viewport edge just clamped the visible cursor at the right
+        // border without actually advancing scroll_col.
+        let mut e = editor_with("a".repeat(500).as_str());
+        e.focused = true;
+        // Render once so last_inner / last_gutter_width are populated.
+        let area = Rect { x: 0, y: 0, width: 30, height: 5 };
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        (&mut e).render(area, &mut buf);
+        let text_width = e
+            .last_inner
+            .width
+            .saturating_sub(e.last_gutter_width + 2 + u16::from(e.last_scrollbar.width > 0))
+            as usize;
+        assert!(text_width > 0 && text_width < 500);
+        // Move cursor to the very first off-screen column.
+        e.cursor_col = text_width;
+        e.move_right();
+        assert!(
+            e.scroll_col > 0,
+            "moving the cursor past the visible edge must advance horizontal scroll"
+        );
+    }
+
+    #[test]
+    fn render_starts_line_from_scroll_col() {
+        // With scroll_col = 3, the line "ABCDEFGHIJ" should display starting
+        // from 'D' at the text origin, not from 'A'.
+        let mut e = editor_with("ABCDEFGHIJ");
+        e.scroll_col = 3;
+        e.focused = true;
+        let area = Rect { x: 0, y: 0, width: 30, height: 5 };
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        (&mut e).render(area, &mut buf);
+        let text_x = e.last_inner.x + e.last_gutter_width + 1;
+        assert_eq!(
+            buf[(text_x, e.last_inner.y)].symbol(),
+            "D",
+            "first visible column must be the (scroll_col)th character"
+        );
+    }
+
+    #[test]
     fn render_paints_selection_band_on_selected_cells() {
         use ratatui::buffer::Buffer;
         let mut e = editor_with("hello world");
@@ -3168,7 +3306,13 @@ impl Widget for &mut Editor {
             let raw = &self.lines[line_idx];
             let empty: Vec<HiSpan> = Vec::new();
             let line_spans = self.highlights.get(line_idx).unwrap_or(&empty);
-            let spans = build_line_spans(raw, line_spans);
+            // Apply horizontal scroll: take the substring starting at
+            // `scroll_col` characters in and shift the highlight ranges
+            // by the same byte offset so syntax colouring follows.
+            let byte_start = byte_index_of_char(raw, self.scroll_col);
+            let visible_raw = &raw[byte_start..];
+            let shifted = shift_spans_for_view(line_spans, byte_start);
+            let spans = build_line_spans(visible_raw, &shifted);
             let line = Line::from(spans);
             buf.set_line(text_x, y, &line, text_width);
 
@@ -3181,6 +3325,7 @@ impl Widget for &mut Editor {
                     raw,
                     term,
                     self.search_highlight_opts,
+                    self.scroll_col,
                 );
             }
 
@@ -3195,14 +3340,18 @@ impl Widget for &mut Editor {
                     } else {
                         line_chars + 1
                     };
-                    paint_selection_band(
-                        buf,
-                        text_x,
-                        y,
-                        text_width,
-                        row_start,
-                        row_end,
-                    );
+                    let visible_start = row_start.saturating_sub(self.scroll_col);
+                    let visible_end = row_end.saturating_sub(self.scroll_col);
+                    if visible_end > visible_start {
+                        paint_selection_band(
+                            buf,
+                            text_x,
+                            y,
+                            text_width,
+                            visible_start,
+                            visible_end,
+                        );
+                    }
                 }
             }
 
@@ -3240,8 +3389,14 @@ impl Editor {
         if text_width == 0 {
             return None;
         }
-        let col = (self.cursor_col as u16).min(text_width.saturating_sub(1));
-        let cx = text_x + col;
+        if self.cursor_col < self.scroll_col {
+            return None;
+        }
+        let visible_col = self.cursor_col - self.scroll_col;
+        if (visible_col as u16) >= text_width {
+            return None;
+        }
+        let cx = text_x + visible_col as u16;
         let cy = self.last_inner.y + row_in_view as u16;
         Some((cx, cy))
     }
@@ -3260,6 +3415,7 @@ fn paint_search_highlight(
     raw_line: &str,
     needle: &str,
     opts: crate::widgets::search::SearchOpts,
+    scroll_col: usize,
 ) {
     if needle.is_empty() {
         return;
@@ -3269,20 +3425,27 @@ fn paint_search_highlight(
         .bg(Color::Rgb(0xff, 0xd7, 0x4a))
         .add_modifier(Modifier::BOLD);
     let segments = crate::widgets::search::split_for_highlight(raw_line, needle, opts);
-    let mut col_cursor: u16 = 0;
+    // `abs_col` tracks the absolute character index in the original line.
+    // Visible columns are `abs_col - scroll_col`, painted only when
+    // non-negative and inside `text_width`.
+    let mut abs_col: usize = 0;
     for (chunk, is_match) in segments {
-        let chunk_cols = chunk.chars().count() as u16;
+        let chunk_cols = chunk.chars().count();
         if is_match {
             for c in 0..chunk_cols {
-                let col = col_cursor + c;
+                let absolute = abs_col + c;
+                if absolute < scroll_col {
+                    continue;
+                }
+                let col = (absolute - scroll_col) as u16;
                 if col >= text_width {
                     break;
                 }
                 buf[(text_x + col, y)].set_style(style);
             }
         }
-        col_cursor = col_cursor.saturating_add(chunk_cols);
-        if col_cursor >= text_width {
+        abs_col = abs_col.saturating_add(chunk_cols);
+        if abs_col >= scroll_col + text_width as usize {
             break;
         }
     }

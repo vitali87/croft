@@ -3448,12 +3448,37 @@ impl App {
         match self.editor.open_preview(&hit.path) {
             Ok(()) => {
                 self.sync_open_file_poll_mtime();
-                // Place the cursor on the matched line.
                 let row = hit.line_no.saturating_sub(1).min(
                     self.editor.lines.len().saturating_sub(1),
                 );
                 self.editor.cursor_row = row;
-                self.editor.cursor_col = 0;
+                // Drop the cursor at the first match column on this line so
+                // long lines (HTML with base64 blobs, minified JS) auto-scroll
+                // horizontally and the user lands on the match instead of the
+                // line's leftmost cell - which on a 200k-char line means
+                // never seeing the match without manual scrolling.
+                let needle = self.search.query.trim();
+                let opts = self.search.opts;
+                let line = self.editor.lines.get(row).cloned().unwrap_or_default();
+                let match_col = if needle.is_empty() {
+                    0
+                } else {
+                    let mut col = 0usize;
+                    let mut found = None;
+                    for (chunk, is_match) in
+                        crate::widgets::search::split_for_highlight(&line, needle, opts)
+                    {
+                        if is_match {
+                            found = Some(col);
+                            break;
+                        }
+                        col = col.saturating_add(chunk.chars().count());
+                    }
+                    found.unwrap_or(0)
+                };
+                self.editor.cursor_col = match_col;
+                self.editor.scroll_col = 0;
+                self.editor.ensure_cursor_col_visible();
                 self.status = format!(
                     "Opened {} at line {}",
                     hit.path.display(),
@@ -5000,6 +5025,8 @@ impl App {
                 if in_editor {
                     if let Some(diff) = self.editor.diff.as_mut() {
                         diff.scroll_left_by(4);
+                    } else {
+                        self.editor.scroll_left_by(4);
                     }
                 }
             }
@@ -5007,6 +5034,8 @@ impl App {
                 if in_editor {
                     if let Some(diff) = self.editor.diff.as_mut() {
                         diff.scroll_right_by(4);
+                    } else {
+                        self.editor.scroll_right_by(4);
                     }
                 }
             }
