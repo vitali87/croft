@@ -4674,18 +4674,6 @@ impl App {
                         self.initialize_repository();
                         return;
                     }
-                    if self.source_control.click_open_folder_button(m.column, m.row) {
-                        self.status = String::from(
-                            "Open folder: relaunch with `croft <path>` to switch workspace",
-                        );
-                        return;
-                    }
-                    if self.source_control.click_help_link(m.column, m.row) {
-                        if let Err(e) = open_url("https://git-scm.com/docs") {
-                            self.status = format!("Open browser failed: {e}");
-                        }
-                        return;
-                    }
                     if self.source_control.click_button(m.column, m.row) {
                         self.commit_source_control();
                         return;

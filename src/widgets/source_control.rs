@@ -30,10 +30,6 @@ pub struct SourceControlPanel {
     /// Empty when the panel is in a git repo or when the panel is too
     /// small to draw the empty-state card.
     pub last_init_repo_button_area: Rect,
-    /// Hit-test rect for the empty-state "Open Folder" button.
-    pub last_open_folder_button_area: Rect,
-    /// Hit-test rect for the empty-state "Learn more about Git" link.
-    pub last_help_link_area: Rect,
     pub scroll: usize,
     /// Index into `entries` of the currently-selected change, if any.
     /// Drives the row-highlight bg so the user can tell at a glance
@@ -60,8 +56,6 @@ impl SourceControlPanel {
             last_list_area: Rect::default(),
             last_scrollbar: Rect::default(),
             last_init_repo_button_area: Rect::default(),
-            last_open_folder_button_area: Rect::default(),
-            last_help_link_area: Rect::default(),
             scroll: 0,
             selected_change: None,
             commit_feedback: None,
@@ -193,14 +187,6 @@ impl SourceControlPanel {
         rect_hit(self.last_init_repo_button_area, x, y)
     }
 
-    pub fn click_open_folder_button(&self, x: u16, y: u16) -> bool {
-        rect_hit(self.last_open_folder_button_area, x, y)
-    }
-
-    pub fn click_help_link(&self, x: u16, y: u16) -> bool {
-        rect_hit(self.last_help_link_area, x, y)
-    }
-
     pub fn scroll_up(&mut self, rows: usize) {
         self.scroll = self.scroll.saturating_sub(rows);
     }
@@ -280,9 +266,6 @@ impl SourceControlPanel {
             width: card_w,
             height: card_h,
         };
-        // Card border: light-enough grey to read against the dark panel bg
-        // without competing with the focused-blue panel border. The earlier
-        // 0x40,0x48,0x58 rendered as effectively invisible.
         let card_border = Style::default().fg(Color::Rgb(0x60, 0x68, 0x78));
         let card_block = Block::default()
             .borders(Borders::ALL)
@@ -294,41 +277,31 @@ impl SourceControlPanel {
             return;
         }
 
-        let blue = Color::Rgb(0x4e, 0x9a, 0xff);
-        let dim_blue = Color::Rgb(0x60, 0x68, 0x78);
+        let blue = Color::Rgb(0x60, 0x9a, 0xfe);
+        let dim_blue = Color::Rgb(0x4b, 0x50, 0x5a);
+        let frame_grey = Color::Rgb(0x36, 0x3a, 0x45);
         let text_white = Color::Rgb(0xff, 0xff, 0xff);
         let text_dim = Color::Rgb(0x9d, 0xa5, 0xb4);
         let blue_bg = Color::Rgb(BUTTON_BG_RGB.0, BUTTON_BG_RGB.1, BUTTON_BG_RGB.2);
 
         let cx = card_inner.x + card_inner.width / 2;
-        let mut y = card_inner.y + 1;
+        let mut y = card_inner.y + 2;
         let bottom = card_inner.y + card_inner.height;
 
-        // Compact 3-row illustration: top arc of three dots, the source
-        // control branch glyph (Codicon U+EA68 - same one icons.rs pins as
-        // ACTIVITY_SOURCE_CONTROL) flanked by two side dots, bottom arc.
-        // Width is exactly 7 cells so it fits inside any card wider than
-        // the buttons. The earlier code used U+EAA1 - that's cod-arrow-up
-        // and rendered a literal up-arrow glyph instead of the branch.
-        if y + 3 <= bottom && card_inner.width >= 7 {
-            let dot = Style::default().fg(dim_blue);
-            let glyph = Style::default().fg(blue).add_modifier(Modifier::BOLD);
-            let arc = "· · ·";
-            let arc_w = arc.chars().count() as u16;
-            let arc_x = card_inner.x + (card_inner.width - arc_w) / 2;
-            buf.set_string(arc_x, y, arc, dot);
-            let middle_w: u16 = 7;
-            let mid_x = card_inner.x + (card_inner.width - middle_w) / 2;
-            buf.set_string(mid_x, y + 1, "·", dot);
-            buf.set_string(mid_x + 3, y + 1, "\u{ea68}", glyph);
-            buf.set_string(mid_x + 6, y + 1, "·", dot);
-            buf.set_string(arc_x, y + 2, arc, dot);
-            y += 3 + 1;
+        // Illustration: file silhouette with a corner fold and a 3-node
+        // git tree inside, surrounded by dashed dots and decorative `+`
+        // sigils echoing the SVG mockup. Two width tiers: the rich 7-row
+        // version when the card is at least 17 wide; otherwise a 3-row
+        // fallback so very narrow sidebars still render something.
+        if card_inner.width >= 17 && y + 7 <= bottom {
+            self.paint_illustration_rich(buf, card_inner, y, frame_grey, dim_blue, blue);
+            y += 7 + 2;
+        } else if card_inner.width >= 7 && y + 3 <= bottom {
+            self.paint_illustration_compact(buf, card_inner, y, dim_blue, blue);
+            y += 3 + 2;
         }
 
-        // Title: "No repository detected", centered, bold white. Falls
-        // back to a centred truncation when the card is too narrow rather
-        // than skipping the title entirely.
+        // Title: "No repository detected", centered, bold white.
         let title = "No repository detected";
         if y + 1 <= bottom {
             let lw = (title.chars().count() as u16).min(card_inner.width);
@@ -345,9 +318,12 @@ impl SourceControlPanel {
             y += 2;
         }
 
-        // Description: dim, centered, two lines (truncated per-line to
-        // card width when needed).
-        for line in ["Open a folder under Git or create a new", "repository to start tracking changes."] {
+        // Description: dim, centered, two lines (truncated per-line when
+        // narrower than the source string).
+        for line in [
+            "Open a folder under Git or create a new",
+            "repository to start tracking changes.",
+        ] {
             if y >= bottom {
                 break;
             }
@@ -358,16 +334,13 @@ impl SourceControlPanel {
             y += 1;
         }
         if y < bottom {
-            y += 1;
+            y += 2;
         }
 
-        // Buttons: centered, width grows to whatever fits the long label
-        // up to a max of 36, then shrinks the label if the panel is narrow.
-        let max_btn_w: u16 = 36;
-        let btn_w = card_inner
-            .width
-            .saturating_sub(2)
-            .min(max_btn_w);
+        // Single primary button, full card width minus 2-cell side gutter.
+        let _ = cx;
+        let max_btn_w: u16 = 40;
+        let btn_w = card_inner.width.saturating_sub(2).min(max_btn_w);
         let btn_x = card_inner.x + (card_inner.width.saturating_sub(btn_w)) / 2;
         let init_label: &str = if btn_w >= 23 {
             "Initialize Repository"
@@ -380,48 +353,107 @@ impl SourceControlPanel {
             let init_area = Rect { x: btn_x, y, width: btn_w, height: 3 };
             self.last_init_repo_button_area = init_area;
             render_rounded_button(buf, init_area, init_label, blue_bg, text_white);
-            y += 3 + 1;
+        }
+    }
+
+    /// 7-row "rich" illustration: file silhouette with corner fold, a
+    /// 3-node git tree inside, surrounded by dashed dots and `+` sigils.
+    /// Mirrors the SVG layout one TUI cell at a time.
+    fn paint_illustration_rich(
+        &self,
+        buf: &mut Buffer,
+        card_inner: Rect,
+        top_y: u16,
+        frame_grey: Color,
+        dim_blue: Color,
+        blue: Color,
+    ) {
+        let dot = Style::default().fg(dim_blue);
+        let frame = Style::default().fg(frame_grey);
+        let node = Style::default().fg(blue).add_modifier(Modifier::BOLD);
+        // The file silhouette is 9 cells wide (`╭` + 7 inner + `╮`), 5
+        // rows tall. Centre it on the card. Decorations on either side.
+        let file_w: u16 = 9;
+        let cx = card_inner.x + card_inner.width / 2;
+        let fx = cx.saturating_sub(file_w / 2);
+        let fy = top_y + 1;
+
+        // Top decorative `+` glyphs flanking the file's top edge.
+        if fx >= card_inner.x + 2 {
+            buf.set_string(fx.saturating_sub(2), top_y, "+", dot);
+        }
+        if fx + file_w + 1 < card_inner.x + card_inner.width {
+            buf.set_string(fx + file_w + 1, top_y, "+", dot);
         }
 
-        let open_label: &str = if btn_w >= 13 { "Open Folder" } else { "Open" };
-        if y + 3 <= bottom && btn_w >= 6 {
-            let open_area = Rect { x: btn_x, y, width: btn_w, height: 3 };
-            self.last_open_folder_button_area = open_area;
-            render_outlined_button(buf, open_area, open_label, blue, blue);
-            y += 3 + 1;
-        }
+        // File silhouette with corner fold at the top-left. Row layout:
+        //   ╭─────╮     <- top edge with fold "╮" two cells to the right
+        //   │     │
+        //   │     │
+        //   │     │
+        //   ╰─────╯
+        // We draw the fold with a small `╮` two cells in, and the top edge
+        // joins back to the right at the same row.
+        buf.set_string(fx, fy, "╭─\u{2533}─────╮", frame); // top with fold marker
+        buf.set_string(fx, fy + 1, "│ ╰╮    │", frame);
+        buf.set_string(fx, fy + 2, "│  │    │", frame);
+        buf.set_string(fx, fy + 3, "│       │", frame);
+        buf.set_string(fx, fy + 4, "╰───────╯", frame);
 
-        // Help link: "? Learn more about Git ↗". Uses ASCII fallbacks so
-        // it renders correctly without the codicons font; the earlier
-        // U+EA15 / U+EB15 ids weren't the question/link-external icons
-        // anyway.
-        let help_text = "? Learn more about Git \u{2197}";
-        let help_w = help_text.chars().count() as u16;
-        if y < bottom {
-            if help_w <= card_inner.width {
-                let hx = card_inner.x + (card_inner.width.saturating_sub(help_w)) / 2;
-                self.last_help_link_area = Rect { x: hx, y, width: help_w, height: 1 };
-                buf.set_string(
-                    hx,
-                    y,
-                    help_text,
-                    Style::default().fg(blue).add_modifier(Modifier::BOLD),
-                );
-            } else {
-                // Narrow panel: drop the trailing arrow.
-                let short = "Learn more about Git";
-                let lw = (short.chars().count() as u16).min(card_inner.width);
-                let visible: String = short.chars().take(lw as usize).collect();
-                let hx = card_inner.x + (card_inner.width.saturating_sub(lw)) / 2;
-                self.last_help_link_area = Rect { x: hx, y, width: lw, height: 1 };
-                buf.set_string(
-                    hx,
-                    y,
-                    &visible,
-                    Style::default().fg(blue).add_modifier(Modifier::BOLD),
-                );
+        // 3-node git tree inside the file: trunk on column fx+3 spanning
+        // rows fy+1..fy+3, branch out to fx+5 on row fy+2.
+        let trunk_x = fx + 3;
+        let branch_x = fx + 6;
+        // Trunk verticals.
+        buf.set_string(trunk_x, fy + 2, "│", node);
+        // Branch line: a corner glyph then a horizontal segment.
+        buf.set_string(trunk_x + 1, fy + 2, "─", node);
+        buf.set_string(trunk_x + 2, fy + 2, "─", node);
+        // Three nodes (top of trunk, end of branch, bottom of trunk).
+        buf.set_string(trunk_x, fy + 1, "●", node);
+        buf.set_string(branch_x, fy + 2, "●", node);
+        buf.set_string(trunk_x, fy + 3, "●", node);
+
+        // Bottom decorative dots and a small ring on the right of the file.
+        let bottom_y = fy + 5;
+        if bottom_y < card_inner.y + card_inner.height {
+            if fx >= card_inner.x + 2 {
+                buf.set_string(fx.saturating_sub(2), bottom_y - 1, "·", dot);
+            }
+            if fx + file_w + 2 <= card_inner.x + card_inner.width {
+                buf.set_string(fx + file_w + 1, bottom_y - 1, "·", dot);
+            }
+            if fx + file_w + 3 <= card_inner.x + card_inner.width {
+                buf.set_string(fx + file_w + 2, fy + 2, "○", dot);
+            }
+            if fx >= card_inner.x + 1 {
+                buf.set_string(fx.saturating_sub(1), bottom_y, "+", dot);
             }
         }
+    }
+
+    /// 3-row fallback illustration for very narrow side panels: top arc,
+    /// branch glyph flanked by side dots, bottom arc. Width: 7 cells.
+    fn paint_illustration_compact(
+        &self,
+        buf: &mut Buffer,
+        card_inner: Rect,
+        top_y: u16,
+        dim_blue: Color,
+        blue: Color,
+    ) {
+        let dot = Style::default().fg(dim_blue);
+        let glyph = Style::default().fg(blue).add_modifier(Modifier::BOLD);
+        let arc = "· · ·";
+        let arc_w = arc.chars().count() as u16;
+        let arc_x = card_inner.x + (card_inner.width - arc_w) / 2;
+        buf.set_string(arc_x, top_y, arc, dot);
+        let middle_w: u16 = 7;
+        let mid_x = card_inner.x + (card_inner.width - middle_w) / 2;
+        buf.set_string(mid_x, top_y + 1, "·", dot);
+        buf.set_string(mid_x + 3, top_y + 1, "\u{ea68}", glyph);
+        buf.set_string(mid_x + 6, top_y + 1, "·", dot);
+        buf.set_string(arc_x, top_y + 2, arc, dot);
     }
 }
 
@@ -456,38 +488,6 @@ fn rect_hit(rect: Rect, x: u16, y: u16) -> bool {
         && x < rect.x + rect.width
         && y >= rect.y
         && y < rect.y + rect.height
-}
-
-/// Outlined-rectangle button: rounded blue border, transparent body, blue
-/// bold label centered. Used for the "Open Folder" secondary action in
-/// the no-repo empty state.
-fn render_outlined_button(
-    buf: &mut Buffer,
-    area: Rect,
-    label: &str,
-    border: Color,
-    fg: Color,
-) {
-    if area.width < 4 || area.height < 3 {
-        return;
-    }
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(border));
-    block.render(area, buf);
-    let label_w = label.chars().count() as u16;
-    if label_w + 2 > area.width {
-        return;
-    }
-    let label_x = area.x + (area.width - label_w) / 2;
-    let label_y = area.y + area.height / 2;
-    buf.set_string(
-        label_x,
-        label_y,
-        label,
-        Style::default().fg(fg).add_modifier(Modifier::BOLD),
-    );
 }
 
 /// Shared between the Source Control commit button and the Run-and-Debug
@@ -601,8 +601,6 @@ impl Widget for &mut SourceControlPanel {
         // design the user supplied.
         if !self.status.in_repo {
             self.last_init_repo_button_area = Rect::default();
-            self.last_open_folder_button_area = Rect::default();
-            self.last_help_link_area = Rect::default();
             self.render_no_repo_empty_state(inner, buf);
             return;
         }
@@ -1145,17 +1143,25 @@ mod tests {
             "primary button label missing:\n{dump}"
         );
         assert!(
-            dump.contains("Open Folder"),
-            "secondary button label missing:\n{dump}"
+            dump.contains("Open a folder under Git"),
+            "first description line missing:\n{dump}"
         );
         assert!(
-            dump.contains("Learn more about Git"),
-            "help link missing:\n{dump}"
+            dump.contains("repository to start tracking"),
+            "second description line missing:\n{dump}"
+        );
+        assert!(
+            !dump.contains("Open Folder"),
+            "Open Folder button must be gone:\n{dump}"
+        );
+        assert!(
+            !dump.contains("Learn more about Git"),
+            "Learn more link must be gone:\n{dump}"
         );
     }
 
     #[test]
-    fn empty_state_records_button_rects_for_hit_testing() {
+    fn empty_state_records_button_rect_for_hit_testing() {
         use crate::git::GitStatus;
         let mut p = SourceControlPanel::new();
         p.status = GitStatus::default();
@@ -1166,15 +1172,6 @@ mod tests {
             p.last_init_repo_button_area.width > 0
                 && p.last_init_repo_button_area.height > 0,
             "Initialize Repository button rect must be tracked"
-        );
-        assert!(
-            p.last_open_folder_button_area.width > 0
-                && p.last_open_folder_button_area.height > 0,
-            "Open Folder button rect must be tracked"
-        );
-        assert!(
-            p.last_help_link_area.width > 0 && p.last_help_link_area.height > 0,
-            "Learn more link rect must be tracked"
         );
     }
 
@@ -1205,11 +1202,12 @@ mod tests {
     }
 
     #[test]
-    fn empty_state_uses_source_control_codicon_not_arrow_up() {
-        // Regression: the illustration used U+EAA1 (cod-arrow-up) which
-        // rendered a literal up-arrow glyph. The right codepoint for the
-        // Y-fork branch glyph is U+EA68, the same one the panel's branch
-        // row uses.
+    fn empty_state_illustration_does_not_use_arrow_up_codicon() {
+        // Regression: the earlier illustration used U+EAA1 (cod-arrow-up)
+        // which rendered a literal up-arrow glyph. The new rich
+        // illustration uses ● bullets for git nodes; the compact fallback
+        // uses U+EA68 (cod-source-control). Whichever variant renders,
+        // U+EAA1 must NEVER appear.
         use crate::git::GitStatus;
         let mut p = SourceControlPanel::new();
         p.status = GitStatus::default();
@@ -1218,12 +1216,13 @@ mod tests {
         (&mut p).render(area, &mut buf);
         let dump = buffer_to_string(&buf);
         assert!(
-            dump.contains('\u{ea68}'),
-            "empty-state illustration must carry the cod-source-control branch glyph U+EA68"
-        );
-        assert!(
             !dump.contains('\u{eaa1}'),
             "empty-state must NOT carry U+EAA1 (cod-arrow-up); that was the broken glyph"
+        );
+        // The rich illustration must surface git nodes (●).
+        assert!(
+            dump.contains('\u{25cf}'),
+            "rich illustration must paint ● git nodes"
         );
     }
 
@@ -1236,21 +1235,6 @@ mod tests {
         assert!(!p.click_init_repo_button(20, 20));
     }
 
-    #[test]
-    fn click_open_folder_button_returns_true_only_inside_the_rect() {
-        let mut p = SourceControlPanel::new();
-        p.last_open_folder_button_area = Rect { x: 5, y: 14, width: 30, height: 3 };
-        assert!(p.click_open_folder_button(20, 15));
-        assert!(!p.click_open_folder_button(50, 15));
-    }
-
-    #[test]
-    fn click_help_link_returns_true_only_inside_the_rect() {
-        let mut p = SourceControlPanel::new();
-        p.last_help_link_area = Rect { x: 10, y: 18, width: 22, height: 1 };
-        assert!(p.click_help_link(20, 18));
-        assert!(!p.click_help_link(20, 19));
-    }
 
     #[test]
     fn change_rows_use_a_subtle_row_tint_not_darker_than_panel_bg() {
