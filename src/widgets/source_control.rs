@@ -3,10 +3,10 @@ use crate::icons;
 use crate::widgets::scrollbar;
 use ratatui::{
     buffer::Buffer,
-    layout::Rect,
+    layout::{Alignment, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Paragraph, Widget},
+    widgets::{Block, BorderType, Borders, Paragraph, Widget, Wrap},
 };
 
 const INPUT_PROMPT_RGB: (u8, u8, u8) = (0x6c, 0x7d, 0x9c);
@@ -279,66 +279,55 @@ impl SourceControlPanel {
 
         let blue = Color::Rgb(0x60, 0x9a, 0xfe);
         let dim_blue = Color::Rgb(0x4b, 0x50, 0x5a);
-        let frame_grey = Color::Rgb(0x36, 0x3a, 0x45);
         let text_white = Color::Rgb(0xff, 0xff, 0xff);
         let text_dim = Color::Rgb(0x9d, 0xa5, 0xb4);
         let blue_bg = Color::Rgb(BUTTON_BG_RGB.0, BUTTON_BG_RGB.1, BUTTON_BG_RGB.2);
 
-        let cx = card_inner.x + card_inner.width / 2;
         let mut y = card_inner.y + 2;
         let bottom = card_inner.y + card_inner.height;
 
-        // Illustration: file silhouette with a corner fold and a 3-node
-        // git tree inside, surrounded by dashed dots and decorative `+`
-        // sigils echoing the SVG mockup. Two width tiers: the rich 7-row
-        // version when the card is at least 17 wide; otherwise a 3-row
-        // fallback so very narrow sidebars still render something.
-        if card_inner.width >= 17 && y + 7 <= bottom {
-            self.paint_illustration_rich(buf, card_inner, y, frame_grey, dim_blue, blue);
+        // Illustration: classic Git Y-fork - three nodes connected by a
+        // trunk and a single branch. The iconic source-control silhouette,
+        // no file outline, no decorative + sigils. Surrounded by a
+        // restrained dashed ring of dots when the card is wide enough.
+        if card_inner.width >= 13 && y + 7 <= bottom {
+            paint_y_fork_illustration(buf, card_inner, y, dim_blue, blue);
             y += 7 + 2;
-        } else if card_inner.width >= 7 && y + 3 <= bottom {
-            self.paint_illustration_compact(buf, card_inner, y, dim_blue, blue);
-            y += 3 + 2;
+        } else if card_inner.width >= 5 && y + 5 <= bottom {
+            paint_y_fork_compact(buf, card_inner, y, blue);
+            y += 5 + 2;
         }
 
-        // Title: "No repository detected", centered, bold white.
-        let title = "No repository detected";
-        if y + 1 <= bottom {
-            let lw = (title.chars().count() as u16).min(card_inner.width);
-            let visible: String = title.chars().take(lw as usize).collect();
-            let tx = card_inner.x + (card_inner.width.saturating_sub(lw)) / 2;
-            buf.set_string(
-                tx,
-                y,
-                &visible,
-                Style::default()
-                    .fg(text_white)
-                    .add_modifier(Modifier::BOLD),
-            );
-            y += 2;
+        // Title and description go through ratatui's `Paragraph` with
+        // word wrapping so a resized panel reflows the text instead of
+        // truncating mid-word - that's the "text inside is not even
+        // adjusted" bug from the user's screenshot.
+        let title_text = "No repository detected";
+        let title_h = paragraph_line_count(title_text, card_inner.width).min(3) as u16;
+        if y + title_h <= bottom && title_h > 0 {
+            let title_rect = Rect { x: card_inner.x, y, width: card_inner.width, height: title_h };
+            let title = Paragraph::new(title_text)
+                .alignment(Alignment::Center)
+                .wrap(Wrap { trim: true })
+                .style(Style::default().fg(text_white).add_modifier(Modifier::BOLD));
+            title.render(title_rect, buf);
+            y += title_h + 1;
         }
 
-        // Description: dim, centered, two lines (truncated per-line when
-        // narrower than the source string).
-        for line in [
-            "Open a folder under Git or create a new",
-            "repository to start tracking changes.",
-        ] {
-            if y >= bottom {
-                break;
-            }
-            let lw = (line.chars().count() as u16).min(card_inner.width);
-            let visible: String = line.chars().take(lw as usize).collect();
-            let lx = card_inner.x + (card_inner.width.saturating_sub(lw)) / 2;
-            buf.set_string(lx, y, &visible, Style::default().fg(text_dim));
-            y += 1;
-        }
-        if y < bottom {
-            y += 2;
+        let desc_text = "Open a folder under Git or create a new repository to start tracking changes.";
+        let desc_h = paragraph_line_count(desc_text, card_inner.width).min(6) as u16;
+        if y + desc_h <= bottom && desc_h > 0 {
+            let desc_rect = Rect { x: card_inner.x, y, width: card_inner.width, height: desc_h };
+            let desc = Paragraph::new(desc_text)
+                .alignment(Alignment::Center)
+                .wrap(Wrap { trim: true })
+                .style(Style::default().fg(text_dim));
+            desc.render(desc_rect, buf);
+            y += desc_h + 2;
         }
 
-        // Single primary button, full card width minus 2-cell side gutter.
-        let _ = cx;
+        // Primary button, centered, width capped so it doesn't sprawl on
+        // a wide sidebar.
         let max_btn_w: u16 = 40;
         let btn_w = card_inner.width.saturating_sub(2).min(max_btn_w);
         let btn_x = card_inner.x + (card_inner.width.saturating_sub(btn_w)) / 2;
@@ -355,106 +344,111 @@ impl SourceControlPanel {
             render_rounded_button(buf, init_area, init_label, blue_bg, text_white);
         }
     }
+}
 
-    /// 7-row "rich" illustration: file silhouette with corner fold, a
-    /// 3-node git tree inside, surrounded by dashed dots and `+` sigils.
-    /// Mirrors the SVG layout one TUI cell at a time.
-    fn paint_illustration_rich(
-        &self,
-        buf: &mut Buffer,
-        card_inner: Rect,
-        top_y: u16,
-        frame_grey: Color,
-        dim_blue: Color,
-        blue: Color,
-    ) {
-        let dot = Style::default().fg(dim_blue);
-        let frame = Style::default().fg(frame_grey);
-        let node = Style::default().fg(blue).add_modifier(Modifier::BOLD);
-        // The file silhouette is 9 cells wide (`╭` + 7 inner + `╮`), 5
-        // rows tall. Centre it on the card. Decorations on either side.
-        let file_w: u16 = 9;
-        let cx = card_inner.x + card_inner.width / 2;
-        let fx = cx.saturating_sub(file_w / 2);
-        let fy = top_y + 1;
-
-        // Top decorative `+` glyphs flanking the file's top edge.
-        if fx >= card_inner.x + 2 {
-            buf.set_string(fx.saturating_sub(2), top_y, "+", dot);
-        }
-        if fx + file_w + 1 < card_inner.x + card_inner.width {
-            buf.set_string(fx + file_w + 1, top_y, "+", dot);
-        }
-
-        // File silhouette with corner fold at the top-left. Row layout:
-        //   ╭─────╮     <- top edge with fold "╮" two cells to the right
-        //   │     │
-        //   │     │
-        //   │     │
-        //   ╰─────╯
-        // We draw the fold with a small `╮` two cells in, and the top edge
-        // joins back to the right at the same row.
-        buf.set_string(fx, fy, "╭─\u{2533}─────╮", frame); // top with fold marker
-        buf.set_string(fx, fy + 1, "│ ╰╮    │", frame);
-        buf.set_string(fx, fy + 2, "│  │    │", frame);
-        buf.set_string(fx, fy + 3, "│       │", frame);
-        buf.set_string(fx, fy + 4, "╰───────╯", frame);
-
-        // 3-node git tree inside the file: trunk on column fx+3 spanning
-        // rows fy+1..fy+3, branch out to fx+5 on row fy+2.
-        let trunk_x = fx + 3;
-        let branch_x = fx + 6;
-        // Trunk verticals.
-        buf.set_string(trunk_x, fy + 2, "│", node);
-        // Branch line: a corner glyph then a horizontal segment.
-        buf.set_string(trunk_x + 1, fy + 2, "─", node);
-        buf.set_string(trunk_x + 2, fy + 2, "─", node);
-        // Three nodes (top of trunk, end of branch, bottom of trunk).
-        buf.set_string(trunk_x, fy + 1, "●", node);
-        buf.set_string(branch_x, fy + 2, "●", node);
-        buf.set_string(trunk_x, fy + 3, "●", node);
-
-        // Bottom decorative dots and a small ring on the right of the file.
-        let bottom_y = fy + 5;
-        if bottom_y < card_inner.y + card_inner.height {
-            if fx >= card_inner.x + 2 {
-                buf.set_string(fx.saturating_sub(2), bottom_y - 1, "·", dot);
+/// How many rows ratatui needs to render `text` as a centered, wrapped
+/// `Paragraph` at `width`. Uses the same word-wrap rules as ratatui itself
+/// (whitespace-separated, no mid-word breaks unless a word exceeds the
+/// width). Returns at least 1 unless `width == 0`.
+fn paragraph_line_count(text: &str, width: u16) -> usize {
+    if width == 0 || text.is_empty() {
+        return 0;
+    }
+    let max = width as usize;
+    let mut lines: usize = 1;
+    let mut current: usize = 0;
+    for word in text.split_whitespace() {
+        let wlen = word.chars().count();
+        if current == 0 {
+            current = wlen.min(max);
+            if wlen > max {
+                lines += wlen / max;
+                current = wlen % max;
             }
-            if fx + file_w + 2 <= card_inner.x + card_inner.width {
-                buf.set_string(fx + file_w + 1, bottom_y - 1, "·", dot);
-            }
-            if fx + file_w + 3 <= card_inner.x + card_inner.width {
-                buf.set_string(fx + file_w + 2, fy + 2, "○", dot);
-            }
-            if fx >= card_inner.x + 1 {
-                buf.set_string(fx.saturating_sub(1), bottom_y, "+", dot);
+        } else if current + 1 + wlen <= max {
+            current += 1 + wlen;
+        } else {
+            lines += 1;
+            current = wlen.min(max);
+            if wlen > max {
+                lines += wlen / max;
+                current = wlen % max;
             }
         }
     }
+    lines
+}
 
-    /// 3-row fallback illustration for very narrow side panels: top arc,
-    /// branch glyph flanked by side dots, bottom arc. Width: 7 cells.
-    fn paint_illustration_compact(
-        &self,
-        buf: &mut Buffer,
-        card_inner: Rect,
-        top_y: u16,
-        dim_blue: Color,
-        blue: Color,
-    ) {
-        let dot = Style::default().fg(dim_blue);
-        let glyph = Style::default().fg(blue).add_modifier(Modifier::BOLD);
-        let arc = "· · ·";
-        let arc_w = arc.chars().count() as u16;
-        let arc_x = card_inner.x + (card_inner.width - arc_w) / 2;
-        buf.set_string(arc_x, top_y, arc, dot);
-        let middle_w: u16 = 7;
-        let mid_x = card_inner.x + (card_inner.width - middle_w) / 2;
-        buf.set_string(mid_x, top_y + 1, "·", dot);
-        buf.set_string(mid_x + 3, top_y + 1, "\u{ea68}", glyph);
-        buf.set_string(mid_x + 6, top_y + 1, "·", dot);
-        buf.set_string(arc_x, top_y + 2, arc, dot);
+/// 7-row "elegant" illustration: a Git Y-fork (top node, trunk vertical,
+/// branch row with side node, trunk vertical, bottom node) framed by a
+/// dashed ring of dots. The classic source-control silhouette - no file
+/// outline competing for attention.
+fn paint_y_fork_illustration(
+    buf: &mut Buffer,
+    card_inner: Rect,
+    top_y: u16,
+    dim_blue: Color,
+    blue: Color,
+) {
+    let dot = Style::default().fg(dim_blue);
+    let trunk = Style::default().fg(blue);
+    let node = Style::default().fg(blue).add_modifier(Modifier::BOLD);
+    let cx = card_inner.x + card_inner.width / 2;
+
+    // Top + bottom dashed arcs framing the tree.
+    let arc = "· · · · ·";
+    let arc_w = arc.chars().count() as u16;
+    let arc_x = card_inner.x + (card_inner.width - arc_w) / 2;
+    buf.set_string(arc_x, top_y, arc, dot);
+    buf.set_string(arc_x, top_y + 6, arc, dot);
+
+    // Side dots flanking the tree on the 5 inner rows, completing the
+    // dashed-ring silhouette of the SVG mockup.
+    let side_off: u16 = 5;
+    if cx >= card_inner.x + side_off + 1 {
+        buf.set_string(cx - side_off, top_y + 1, "·", dot);
+        buf.set_string(cx - side_off, top_y + 3, "·", dot);
+        buf.set_string(cx - side_off, top_y + 5, "·", dot);
     }
+    if cx + side_off < card_inner.x + card_inner.width {
+        buf.set_string(cx + side_off, top_y + 1, "·", dot);
+        buf.set_string(cx + side_off, top_y + 3, "·", dot);
+        buf.set_string(cx + side_off, top_y + 5, "·", dot);
+    }
+
+    // Y-fork tree - three nodes (●) on the trunk column, branch out on
+    // the middle row to a side node, trunk verticals between rows.
+    //     ●
+    //     │
+    //     ●─●
+    //     │
+    //     ●
+    buf.set_string(cx, top_y + 1, "●", node);
+    buf.set_string(cx, top_y + 2, "│", trunk);
+    buf.set_string(cx, top_y + 3, "●", node);
+    buf.set_string(cx + 1, top_y + 3, "─", trunk);
+    if cx + 2 < card_inner.x + card_inner.width {
+        buf.set_string(cx + 2, top_y + 3, "●", node);
+    }
+    buf.set_string(cx, top_y + 4, "│", trunk);
+    buf.set_string(cx, top_y + 5, "●", node);
+}
+
+/// 5-row compact fallback for narrow panels: just the Y-fork tree, no
+/// surrounding ring. Width: 5 cells.
+fn paint_y_fork_compact(buf: &mut Buffer, card_inner: Rect, top_y: u16, blue: Color) {
+    let trunk = Style::default().fg(blue);
+    let node = Style::default().fg(blue).add_modifier(Modifier::BOLD);
+    let cx = card_inner.x + card_inner.width / 2;
+    buf.set_string(cx, top_y, "●", node);
+    buf.set_string(cx, top_y + 1, "│", trunk);
+    buf.set_string(cx, top_y + 2, "●", node);
+    buf.set_string(cx + 1, top_y + 2, "─", trunk);
+    if cx + 2 < card_inner.x + card_inner.width {
+        buf.set_string(cx + 2, top_y + 2, "●", node);
+    }
+    buf.set_string(cx, top_y + 3, "│", trunk);
+    buf.set_string(cx, top_y + 4, "●", node);
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1144,11 +1138,11 @@ mod tests {
         );
         assert!(
             dump.contains("Open a folder under Git"),
-            "first description line missing:\n{dump}"
+            "description must mention 'Open a folder under Git':\n{dump}"
         );
         assert!(
-            dump.contains("repository to start tracking"),
-            "second description line missing:\n{dump}"
+            dump.contains("tracking changes"),
+            "description must mention 'tracking changes':\n{dump}"
         );
         assert!(
             !dump.contains("Open Folder"),
@@ -1184,7 +1178,7 @@ mod tests {
         use crate::git::GitStatus;
         let mut p = SourceControlPanel::new();
         p.status = GitStatus::default();
-        let area = Rect { x: 0, y: 0, width: 30, height: 30 };
+        let area = Rect { x: 0, y: 0, width: 30, height: 40 };
         let mut buf = Buffer::empty(area);
         (&mut p).render(area, &mut buf);
         let btn = p.last_init_repo_button_area;
@@ -1198,6 +1192,33 @@ mod tests {
         assert!(
             !trimmed.is_empty() && trimmed.chars().any(|c| c.is_alphabetic()),
             "init-repo button row must carry a visible label, got {row:?}"
+        );
+    }
+
+    #[test]
+    fn empty_state_description_wraps_to_card_width_no_mid_word_truncation() {
+        // Regression for "text inside is not even adjusted": the
+        // description used to be hard-truncated at card_inner.width
+        // chars, producing fragments like "Open a folder under G" /
+        // "repository to start t" when the card was narrow. With
+        // ratatui's Paragraph + Wrap, words must stay whole.
+        use crate::git::GitStatus;
+        let mut p = SourceControlPanel::new();
+        p.status = GitStatus::default();
+        // Width 30 puts the card_inner at ~24 - too narrow for
+        // "Open a folder under Git or create a new" but plenty for
+        // word-wrapped fragments.
+        let area = Rect { x: 0, y: 0, width: 30, height: 40 };
+        let mut buf = Buffer::empty(area);
+        (&mut p).render(area, &mut buf);
+        let dump = buffer_to_string(&buf);
+        assert!(
+            !dump.contains("Open a folder under G\n"),
+            "description must NOT be hard-truncated mid-word ('under G'):\n{dump}"
+        );
+        assert!(
+            !dump.contains("repository to start t\n"),
+            "description must NOT be hard-truncated mid-word ('start t'):\n{dump}"
         );
     }
 
