@@ -264,13 +264,17 @@ enum MenuAction {
 
 /// Return the macOS-style keyboard shortcut hint to display on the right
 /// side of a context-menu row, when one exists. Mirrors the bindings in
-/// `handle_tree_key` (Cut/Copy/Paste/Delete) so the menu is a discovery
-/// surface for the same accelerators the keyboard already accepts.
+/// `handle_tree_key` / `handle_explorer_shortcut` so the menu is a
+/// discovery surface for the same accelerators the keyboard accepts.
 fn shortcut_for(action: &MenuAction) -> Option<&'static str> {
     match action {
+        MenuAction::Create(CreateKind::File) => Some("⌘F"),
+        MenuAction::Create(CreateKind::Folder) => Some("⌘⇧F"),
         MenuAction::Cut(_) => Some("⌘X"),
         MenuAction::Copy(_) => Some("⌘C"),
         MenuAction::Paste(_) => Some("⌘V"),
+        MenuAction::Rename(_) => Some("⌘R"),
+        MenuAction::MakeRoot(_) => Some("⌘/"),
         MenuAction::Delete { .. } => Some("⌫"),
         _ => None,
     }
@@ -8294,18 +8298,27 @@ mod tests {
     }
 
     #[test]
-    fn shortcut_for_returns_expected_shortcuts_for_clipboard_and_delete_actions() {
+    fn shortcut_for_returns_expected_shortcuts_for_each_explorer_action() {
         let p = std::path::PathBuf::from("/x");
+        assert_eq!(
+            shortcut_for(&MenuAction::Create(CreateKind::File)),
+            Some("⌘F")
+        );
+        assert_eq!(
+            shortcut_for(&MenuAction::Create(CreateKind::Folder)),
+            Some("⌘⇧F")
+        );
         assert_eq!(shortcut_for(&MenuAction::Cut(vec![p.clone()])), Some("⌘X"));
         assert_eq!(shortcut_for(&MenuAction::Copy(vec![p.clone()])), Some("⌘C"));
         assert_eq!(shortcut_for(&MenuAction::Paste(p.clone())), Some("⌘V"));
+        assert_eq!(shortcut_for(&MenuAction::Rename(p.clone())), Some("⌘R"));
+        assert_eq!(shortcut_for(&MenuAction::MakeRoot(p.clone())), Some("⌘/"));
         assert_eq!(
             shortcut_for(&MenuAction::Delete { paths: vec![p.clone()] }),
             Some("⌫")
         );
-        // No shortcut for actions without a keybinding.
-        assert_eq!(shortcut_for(&MenuAction::Rename(p.clone())), None);
-        assert_eq!(shortcut_for(&MenuAction::MakeRoot(p)), None);
+        // Compare actions have no keybinding (no shortcut shown).
+        assert_eq!(shortcut_for(&MenuAction::SelectForCompare(p)), None);
     }
 
     #[test]
