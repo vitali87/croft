@@ -1,8 +1,8 @@
 [package]
 name = "croft"
-version = "0.1.75"
+version = "0.1.76"
 edition = "2024"
-description = "Terminal-based VS Code replica: file tree, editor, embedded shell"
+description = "VSCode-style TUI written in Rust"
 license = "MIT"
 repository = "https://codeberg.org/vitali87/croft"
 homepage = "https://croft.sh"
