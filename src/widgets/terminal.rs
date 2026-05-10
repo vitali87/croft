@@ -81,7 +81,7 @@ impl PtyTerminal {
             std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
         let mut cmd = CommandBuilder::new(&shell);
         cmd.cwd(cwd);
-        Self::spawn_with(cmd)
+        Self::spawn_with(cmd, None)
     }
 
     pub fn new_running(
@@ -94,10 +94,25 @@ impl PtyTerminal {
             cmd.arg(a);
         }
         cmd.cwd(cwd);
-        Self::spawn_with(cmd)
+        let label = if args.is_empty() {
+            program.to_string()
+        } else {
+            format!("{program} {}", args.join(" "))
+        };
+        Self::spawn_with(cmd, Some(label))
     }
 
-    fn spawn_with(mut cmd: CommandBuilder) -> Result<Self> {
+    pub fn visible_text(&self) -> String {
+        let term = self.term.lock();
+        let rows = term.screen_lines();
+        let cols = term.columns();
+        if rows == 0 || cols == 0 {
+            return String::new();
+        }
+        extract_selection_text(&term, 0, 0, rows - 1, cols - 1)
+    }
+
+    fn spawn_with(mut cmd: CommandBuilder, run_label: Option<String>) -> Result<Self> {
         let pty_system = native_pty_system();
         let cols = 80u16;
         let rows = 24u16;
@@ -124,6 +139,15 @@ impl PtyTerminal {
         let bracketed_paste_enabled = Arc::new(AtomicBool::new(false));
         let bracketed_paste_for_thread = bracketed_paste_enabled.clone();
 
+        if let Some(label) = run_label.as_deref() {
+            let header = format!("\x1b[2m▶ {label}\x1b[22m\r\n");
+            let mut p = Processor::<StdSyncHandler>::new();
+            let mut t = term.lock();
+            p.advance(&mut *t, header.as_bytes());
+        }
+
+        let script_mode = run_label.is_some();
+
         std::thread::spawn(move || {
             let mut processor = Processor::<StdSyncHandler>::new();
             let mut buf = [0u8; 65536];
@@ -142,6 +166,13 @@ impl PtyTerminal {
                     }
                     Err(_) => break,
                 }
+            }
+            if script_mode {
+                let footer = b"\r\n\x1b[2m[Process exited]\x1b[22m\r\n";
+                let mut t = term_for_thread.lock();
+                processor.advance(&mut *t, footer);
+                drop(t);
+                pty_dirty_for_thread.store(true, Ordering::Release);
             }
         });
 
@@ -574,6 +605,68 @@ mod tests {
         assert!(
             term.peek_dirty(),
             "direct-spawned /bin/echo must produce output without any write_input"
+        );
+    }
+
+    #[test]
+    fn new_running_renders_running_header_in_term_immediately() {
+        let tmp = tempfile::tempdir().unwrap();
+        let term = PtyTerminal::new_running(
+            "/bin/echo",
+            &[String::from("croft-header-probe")],
+            tmp.path(),
+        )
+        .unwrap();
+        let snapshot = term.visible_text();
+        assert!(
+            snapshot.contains("/bin/echo croft-header-probe"),
+            "expected the run command in the header line; got:\n{snapshot}"
+        );
+        assert!(
+            snapshot.starts_with('▶') || snapshot.contains("▶ "),
+            "expected a ▶ marker on the header line; got:\n{snapshot}"
+        );
+    }
+
+    #[test]
+    fn new_running_appends_exit_footer_when_child_finishes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let term = PtyTerminal::new_running(
+            "/bin/echo",
+            &[String::from("croft-exit-probe")],
+            tmp.path(),
+        )
+        .unwrap();
+        let mut waited_ms = 0u32;
+        let footer_needle = "[Process exited]";
+        loop {
+            if term.visible_text().contains(footer_needle) {
+                break;
+            }
+            if waited_ms >= 4000 {
+                let snap = term.visible_text();
+                panic!(
+                    "expected '{footer_needle}' to appear within 4s of the child exiting; got:\n{snap}"
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            waited_ms += 20;
+        }
+    }
+
+    #[test]
+    fn new_for_interactive_shell_does_not_render_running_header() {
+        let tmp = tempfile::tempdir().unwrap();
+        let term = PtyTerminal::new(tmp.path()).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let snapshot = term.visible_text();
+        assert!(
+            !snapshot.contains("▶ "),
+            "interactive shell must not render a one-shot script header; got:\n{snapshot}"
+        );
+        assert!(
+            !snapshot.contains("[Process exited]"),
+            "interactive shell must not render an exit footer; got:\n{snapshot}"
         );
     }
 
