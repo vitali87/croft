@@ -547,11 +547,29 @@ impl SearchPanel {
         if self.selected > 0 {
             self.selected -= 1;
         }
+        self.ensure_selected_visible();
     }
 
     pub fn move_down(&mut self) {
         if self.selected + 1 < self.hits.len() {
             self.selected += 1;
+        }
+        self.ensure_selected_visible();
+    }
+
+    /// Pull `scroll` so the current `selected` row sits inside the viewport.
+    /// Only invoked from keyboard-driven moves; wheel scroll and scrollbar
+    /// drag must NOT call this - the user's wheel position is sacrosanct
+    /// and selection trails wherever they put it.
+    fn ensure_selected_visible(&mut self) {
+        let viewport = self.results_viewport_height();
+        if viewport == 0 {
+            return;
+        }
+        if self.selected < self.scroll {
+            self.scroll = self.selected;
+        } else if self.selected >= self.scroll + viewport {
+            self.scroll = self.selected + 1 - viewport;
         }
     }
 
@@ -845,15 +863,13 @@ impl Widget for &mut SearchPanel {
         }
         // Clamp scroll so the viewport is always full when there's enough
         // content; otherwise the user can wheel past the end and see blanks.
+        // Critically, we do NOT auto-follow `selected` here: that would
+        // fight the user every time a streamed `Hits` batch lands and
+        // re-renders. Selection-follow lives in `move_up`/`move_down`,
+        // where it belongs - keyboard nav, not wheel scroll.
         let max_scroll = self.hits.len().saturating_sub(visible);
         if self.scroll > max_scroll {
             self.scroll = max_scroll;
-        }
-        if self.selected >= self.scroll + visible {
-            self.scroll = self.selected + 1 - visible;
-        }
-        if self.selected < self.scroll {
-            self.scroll = self.selected;
         }
         // Reserve the rightmost column for the scrollbar when the result
         // list overflows the viewport. `vertical_metrics` returns None when
@@ -1648,5 +1664,108 @@ mod tests {
         panel.move_down();
         panel.move_down(); // would go to 3, but clamped to 2
         assert_eq!(panel.selected, 2);
+    }
+
+    fn make_panel_with_hits(tmp: &TempDir, n: usize) -> SearchPanel {
+        let mut panel = SearchPanel::new(tmp.path().to_path_buf());
+        panel.query = "needle".into();
+        panel.hits = (0..n)
+            .map(|i| SearchHit {
+                path: tmp.path().join("a.txt"),
+                line_no: i + 1,
+                line_text: format!("line {i}"),
+            })
+            .collect();
+        panel
+    }
+
+    #[test]
+    fn render_preserves_user_scroll_when_selected_is_at_top() {
+        // User-reported bug: scroll appears to "come in batches" because
+        // every render yanks scroll back to selected=0. Wheel scrolling
+        // must be decoupled from selection auto-follow so streaming hits
+        // and re-renders never fight the user's scroll position.
+        let tmp = TempDir::new().unwrap();
+        let mut panel = make_panel_with_hits(&tmp, 100);
+        panel.selected = 0;
+        panel.scroll = 30;
+        let area = Rect { x: 0, y: 0, width: 60, height: 30 };
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        ratatui::widgets::Widget::render(&mut panel, area, &mut buf);
+        assert_eq!(
+            panel.scroll, 30,
+            "render must not pull scroll back to selected when the user has wheeled away"
+        );
+    }
+
+    #[test]
+    fn appending_streamed_hits_does_not_reset_user_scroll() {
+        // Simulates the streaming engine: user wheels down to row 30,
+        // then a new batch arrives via `hits.extend(batch)`. The next
+        // render must keep scroll at 30, not jump to 0.
+        let tmp = TempDir::new().unwrap();
+        let mut panel = make_panel_with_hits(&tmp, 80);
+        panel.selected = 0;
+        panel.scroll = 30;
+        let area = Rect { x: 0, y: 0, width: 60, height: 30 };
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        ratatui::widgets::Widget::render(&mut panel, area, &mut buf);
+        // Streaming batch: another 50 hits arrive.
+        let extra: Vec<SearchHit> = (80..130)
+            .map(|i| SearchHit {
+                path: tmp.path().join("a.txt"),
+                line_no: i + 1,
+                line_text: format!("line {i}"),
+            })
+            .collect();
+        panel.hits.extend(extra);
+        ratatui::widgets::Widget::render(&mut panel, area, &mut buf);
+        assert_eq!(
+            panel.scroll, 30,
+            "streaming hits must not reset the user's scroll offset"
+        );
+    }
+
+    #[test]
+    fn move_down_past_bottom_of_viewport_advances_scroll_to_keep_selection_visible() {
+        let tmp = TempDir::new().unwrap();
+        let mut panel = make_panel_with_hits(&tmp, 100);
+        // Pretend a 30-row panel was rendered: viewport = 30 - 7 = 23 rows.
+        panel.last_inner = Rect { x: 0, y: 0, width: 60, height: 30 };
+        panel.selected = 22;
+        panel.scroll = 0;
+        panel.move_down();
+        assert_eq!(panel.selected, 23);
+        assert_eq!(
+            panel.scroll, 1,
+            "arrow-down past the bottom row must scroll to keep selection visible"
+        );
+    }
+
+    #[test]
+    fn move_up_above_top_of_viewport_retreats_scroll_to_keep_selection_visible() {
+        let tmp = TempDir::new().unwrap();
+        let mut panel = make_panel_with_hits(&tmp, 100);
+        panel.last_inner = Rect { x: 0, y: 0, width: 60, height: 30 };
+        panel.selected = 50;
+        panel.scroll = 50;
+        panel.move_up();
+        assert_eq!(panel.selected, 49);
+        assert_eq!(
+            panel.scroll, 49,
+            "arrow-up above the first visible row must scroll back to keep selection visible"
+        );
+    }
+
+    #[test]
+    fn scroll_down_via_wheel_does_not_change_selection() {
+        let tmp = TempDir::new().unwrap();
+        let mut panel = make_panel_with_hits(&tmp, 100);
+        panel.last_inner = Rect { x: 0, y: 0, width: 60, height: 30 };
+        panel.selected = 0;
+        panel.scroll = 0;
+        panel.scroll_down(20);
+        assert_eq!(panel.selected, 0, "wheel-scrolling must not move selection");
+        assert_eq!(panel.scroll, 20);
     }
 }
