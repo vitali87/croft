@@ -338,11 +338,11 @@ fn build_tree_context_menu_items(
         // a folder click resolves to the folder itself, a file click
         // to the file's parent — same convention VS Code uses.
         items.push((
-            String::from("New File…"),
+            String::from("New File"),
             MenuAction::Create(CreateKind::File),
         ));
         items.push((
-            String::from("New Folder…"),
+            String::from("New Folder"),
             MenuAction::Create(CreateKind::Folder),
         ));
         let paths_for_action: Vec<PathBuf> = if selection.iter().any(|sp| sp == &p) {
@@ -356,7 +356,7 @@ fn build_tree_context_menu_items(
             items.push((String::from("Paste"), MenuAction::Paste(target_dir.to_path_buf())));
         }
         if paths_for_action.len() == 1 {
-            items.push((String::from("Rename…"), MenuAction::Rename(p.clone())));
+            items.push((String::from("Rename"), MenuAction::Rename(p.clone())));
         }
         // Compare actions only make sense for a single regular file.
         let single_file_target = paths_for_action
@@ -414,11 +414,11 @@ fn build_tree_context_menu_items(
         ));
     } else {
         items.push((
-            String::from("New File…"),
+            String::from("New File"),
             MenuAction::Create(CreateKind::File),
         ));
         items.push((
-            String::from("New Folder…"),
+            String::from("New Folder"),
             MenuAction::Create(CreateKind::Folder),
         ));
         if clipboard.is_some() {
@@ -5271,7 +5271,7 @@ impl App {
     fn menu_rect(&self) -> Option<Rect> {
         let menu = self.context_menu.as_ref()?;
         // Use char count (not byte len) so multi-byte glyphs in menu
-        // labels (e.g. the "…" in "Rename…", the arrow in "Compare with
+        // labels (e.g. the "…" in "Rename", the arrow in "Compare with
         // Selected") don't inflate the menu width past what's needed.
         // Width must also fit the shortcut hint on the right side, with
         // at least 2 cells of gap between label and shortcut.
@@ -8085,11 +8085,11 @@ mod tests {
         assert_eq!(
             labels,
             [
-                "New File…",
-                "New Folder…",
+                "New File",
+                "New Folder",
                 "Cut",
                 "Copy",
-                "Rename…",
+                "Rename",
                 "Select for Compare",
                 "Delete",
             ],
@@ -8209,7 +8209,7 @@ mod tests {
         let labels: Vec<&str> = items.iter().map(|(s, _)| s.as_str()).collect();
         assert_eq!(
             labels,
-            ["New File…", "New Folder…", "Cut", "Copy", "Rename…", "Make root", "Delete"],
+            ["New File", "New Folder", "Cut", "Copy", "Rename", "Make root", "Delete"],
         );
     }
 
@@ -8234,7 +8234,7 @@ mod tests {
         let labels: Vec<&str> = items.iter().map(|(s, _)| s.as_str()).collect();
         assert_eq!(
             labels,
-            ["New File…", "New Folder…", "Cut", "Copy", "Paste", "Rename…", "Make root", "Delete"],
+            ["New File", "New Folder", "Cut", "Copy", "Paste", "Rename", "Make root", "Delete"],
         );
     }
 
@@ -8266,11 +8266,11 @@ mod tests {
         );
         let labels: Vec<&str> = items.iter().map(|(s, _)| s.as_str()).collect();
         assert!(
-            labels.contains(&"New File…"),
+            labels.contains(&"New File"),
             "nested-folder right-click must offer New File…; labels = {labels:?}",
         );
         assert!(
-            labels.contains(&"New Folder…"),
+            labels.contains(&"New Folder"),
             "nested-folder right-click must offer New Folder…; labels = {labels:?}",
         );
     }
@@ -8525,7 +8525,7 @@ mod tests {
         // Repro: with a 5-item menu (Cut, Copy, Rename…, Select for
         // Compare, Delete), if the user right-clicks low enough that
         // the menu must shift up by 1 to fit on screen, a click on the
-        // visible "Select for Compare" row used to map to "Rename…"
+        // visible "Select for Compare" row used to map to "Rename"
         // because hit-testing used the unclipped rect while rendering
         // used the clipped one.
         let tmp = tempfile::tempdir().unwrap();
@@ -8636,7 +8636,7 @@ mod tests {
         let labels: Vec<&str> = items.iter().map(|(s, _)| s.as_str()).collect();
         assert_eq!(
             labels,
-            ["New File…", "New Folder…", "Cut", "Copy", "Delete 2 items"],
+            ["New File", "New Folder", "Cut", "Copy", "Delete 2 items"],
         );
     }
 
@@ -8652,7 +8652,7 @@ mod tests {
             None,
         );
         let labels: Vec<&str> = items.iter().map(|(s, _)| s.as_str()).collect();
-        assert_eq!(labels, ["New File…", "New Folder…"]);
+        assert_eq!(labels, ["New File", "New Folder"]);
         assert!(matches!(items[0].1, MenuAction::Create(CreateKind::File)));
         assert!(matches!(items[1].1, MenuAction::Create(CreateKind::Folder)));
     }
@@ -8673,7 +8673,7 @@ mod tests {
             None,
         );
         let labels: Vec<&str> = items.iter().map(|(s, _)| s.as_str()).collect();
-        assert_eq!(labels, ["New File…", "New Folder…", "Paste"]);
+        assert_eq!(labels, ["New File", "New Folder", "Paste"]);
     }
 
     #[test]
@@ -8865,7 +8865,7 @@ mod tests {
             None,
         );
         let labels: Vec<&str> = items.iter().map(|(s, _)| s.as_str()).collect();
-        assert_eq!(labels, ["New File…", "New Folder…"]);
+        assert_eq!(labels, ["New File", "New Folder"]);
     }
 
     #[test]
