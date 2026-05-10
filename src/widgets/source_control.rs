@@ -26,6 +26,14 @@ pub struct SourceControlPanel {
     pub last_button_area: Rect,
     pub last_list_area: Rect,
     pub last_scrollbar: Rect,
+    /// Hit-test rect for the empty-state "Initialize Repository" button.
+    /// Empty when the panel is in a git repo or when the panel is too
+    /// small to draw the empty-state card.
+    pub last_init_repo_button_area: Rect,
+    /// Hit-test rect for the empty-state "Open Folder" button.
+    pub last_open_folder_button_area: Rect,
+    /// Hit-test rect for the empty-state "Learn more about Git" link.
+    pub last_help_link_area: Rect,
     pub scroll: usize,
     /// Index into `entries` of the currently-selected change, if any.
     /// Drives the row-highlight bg so the user can tell at a glance
@@ -51,6 +59,9 @@ impl SourceControlPanel {
             last_button_area: Rect::default(),
             last_list_area: Rect::default(),
             last_scrollbar: Rect::default(),
+            last_init_repo_button_area: Rect::default(),
+            last_open_folder_button_area: Rect::default(),
+            last_help_link_area: Rect::default(),
             scroll: 0,
             selected_change: None,
             commit_feedback: None,
@@ -178,6 +189,18 @@ impl SourceControlPanel {
             && y < rect.y + rect.height
     }
 
+    pub fn click_init_repo_button(&self, x: u16, y: u16) -> bool {
+        rect_hit(self.last_init_repo_button_area, x, y)
+    }
+
+    pub fn click_open_folder_button(&self, x: u16, y: u16) -> bool {
+        rect_hit(self.last_open_folder_button_area, x, y)
+    }
+
+    pub fn click_help_link(&self, x: u16, y: u16) -> bool {
+        rect_hit(self.last_help_link_area, x, y)
+    }
+
     pub fn scroll_up(&mut self, rows: usize) {
         self.scroll = self.scroll.saturating_sub(rows);
     }
@@ -234,6 +257,141 @@ impl SourceControlPanel {
         }
         out
     }
+
+    /// Paint the "No repository detected" empty-state card. `inner` is the
+    /// panel's inner rect (border already drawn); the SOURCE CONTROL header
+    /// sits on `inner.y` so the card starts two rows below.
+    fn render_no_repo_empty_state(&mut self, inner: Rect, buf: &mut Buffer) {
+        if inner.height < 4 || inner.width < 8 {
+            return;
+        }
+        let card_top = inner.y + 2;
+        let card_bottom = inner.y + inner.height - 1;
+        let card_h = card_bottom.saturating_sub(card_top);
+        if card_h < 3 {
+            return;
+        }
+        let side_pad: u16 = if inner.width >= 20 { 2 } else { 1 };
+        let card_x = inner.x + side_pad;
+        let card_w = inner.width.saturating_sub(side_pad * 2);
+        let card_area = Rect {
+            x: card_x,
+            y: card_top,
+            width: card_w,
+            height: card_h,
+        };
+        let card_border = Style::default().fg(Color::Rgb(0x40, 0x48, 0x58));
+        let card_block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(card_border);
+        let card_inner = card_block.inner(card_area);
+        card_block.render(card_area, buf);
+        if card_inner.width < 4 || card_inner.height < 3 {
+            return;
+        }
+
+        let blue = Color::Rgb(0x4e, 0x9a, 0xff);
+        let dim_blue = Color::Rgb(0x60, 0x68, 0x78);
+        let text_white = Color::Rgb(0xff, 0xff, 0xff);
+        let text_dim = Color::Rgb(0x9d, 0xa5, 0xb4);
+        let blue_bg = Color::Rgb(BUTTON_BG_RGB.0, BUTTON_BG_RGB.1, BUTTON_BG_RGB.2);
+
+        // Layout from the top of the card. Each block knows its own height
+        // and bails out the first time the next block would overflow.
+        let cx = card_inner.x + card_inner.width / 2;
+        let mut y = card_inner.y + 1;
+        let bottom = card_inner.y + card_inner.height;
+
+        // Decorative illustration: dashed-circle echo around a centred
+        // git-branch glyph (Codicon U+EAA1 source-control / branch).
+        if y + 5 <= bottom && card_inner.width >= 13 {
+            let dot = Style::default().fg(dim_blue);
+            let glyph = Style::default()
+                .fg(blue)
+                .add_modifier(Modifier::BOLD);
+            // Top arc of dots.
+            buf.set_string(cx.saturating_sub(4), y, "·  ·  ·", dot);
+            // Side dots.
+            buf.set_string(cx.saturating_sub(6), y + 1, "·", dot);
+            buf.set_string(cx + 6, y + 1, "·", dot);
+            // Centred branch glyph.
+            buf.set_string(cx.saturating_sub(1), y + 2, "\u{eaa1}", glyph);
+            // Side dots, lower.
+            buf.set_string(cx.saturating_sub(6), y + 3, "·", dot);
+            buf.set_string(cx + 6, y + 3, "·", dot);
+            // Bottom arc of dots.
+            buf.set_string(cx.saturating_sub(4), y + 4, "·  ·  ·", dot);
+            y += 5 + 1;
+        }
+
+        // Title: "No repository detected".
+        let title = "No repository detected";
+        if y + 1 <= bottom && (title.chars().count() as u16) <= card_inner.width {
+            let tx = card_inner.x
+                + (card_inner.width.saturating_sub(title.chars().count() as u16)) / 2;
+            buf.set_string(
+                tx,
+                y,
+                title,
+                Style::default()
+                    .fg(text_white)
+                    .add_modifier(Modifier::BOLD),
+            );
+            y += 2;
+        }
+
+        // Description: two lines, centered, dim.
+        let desc1 = "Open a folder under Git or create a new";
+        let desc2 = "repository to start tracking changes.";
+        if y + 2 <= bottom {
+            for line in [desc1, desc2] {
+                let lw = line.chars().count() as u16;
+                if lw <= card_inner.width {
+                    let lx = card_inner.x + (card_inner.width.saturating_sub(lw)) / 2;
+                    buf.set_string(lx, y, line, Style::default().fg(text_dim));
+                }
+                y += 1;
+            }
+            y += 1;
+        }
+
+        // Primary button: Initialize Repository.
+        let max_btn_w: u16 = 36;
+        let btn_w = card_inner
+            .width
+            .saturating_sub(4)
+            .min(max_btn_w);
+        let btn_x = card_inner.x + (card_inner.width.saturating_sub(btn_w)) / 2;
+        if y + 3 <= bottom && btn_w >= 12 {
+            let init_area = Rect { x: btn_x, y, width: btn_w, height: 3 };
+            self.last_init_repo_button_area = init_area;
+            render_rounded_button(buf, init_area, "Initialize Repository", blue_bg, text_white);
+            y += 3 + 1;
+        }
+
+        // Secondary button: Open Folder (outlined blue).
+        if y + 3 <= bottom && btn_w >= 12 {
+            let open_area = Rect { x: btn_x, y, width: btn_w, height: 3 };
+            self.last_open_folder_button_area = open_area;
+            render_outlined_button(buf, open_area, "Open Folder", blue, blue);
+            y += 3 + 1;
+        }
+
+        // Help link: "(?) Learn more about Git ↗".
+        let help_text = "\u{ea15} Learn more about Git \u{eb15}";
+        let help_w = help_text.chars().count() as u16;
+        if y + 1 <= bottom && help_w <= card_inner.width {
+            let hx = card_inner.x + (card_inner.width.saturating_sub(help_w)) / 2;
+            self.last_help_link_area = Rect { x: hx, y, width: help_w, height: 1 };
+            buf.set_string(
+                hx,
+                y,
+                help_text,
+                Style::default().fg(blue).add_modifier(Modifier::BOLD),
+            );
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -260,6 +418,47 @@ fn section_label(section: ChangeSection) -> &'static str {
 /// Paint a chunky 3-row solid-bg button at `area`, with rounded corner
 /// glyphs that let the panel bg show through the four corner notches so
 /// the button reads as a rounded rectangle (matching the VS Code mockup).
+fn rect_hit(rect: Rect, x: u16, y: u16) -> bool {
+    rect.width > 0
+        && rect.height > 0
+        && x >= rect.x
+        && x < rect.x + rect.width
+        && y >= rect.y
+        && y < rect.y + rect.height
+}
+
+/// Outlined-rectangle button: rounded blue border, transparent body, blue
+/// bold label centered. Used for the "Open Folder" secondary action in
+/// the no-repo empty state.
+fn render_outlined_button(
+    buf: &mut Buffer,
+    area: Rect,
+    label: &str,
+    border: Color,
+    fg: Color,
+) {
+    if area.width < 4 || area.height < 3 {
+        return;
+    }
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(border));
+    block.render(area, buf);
+    let label_w = label.chars().count() as u16;
+    if label_w + 2 > area.width {
+        return;
+    }
+    let label_x = area.x + (area.width - label_w) / 2;
+    let label_y = area.y + area.height / 2;
+    buf.set_string(
+        label_x,
+        label_y,
+        label,
+        Style::default().fg(fg).add_modifier(Modifier::BOLD),
+    );
+}
+
 /// Shared between the Source Control commit button and the Run-and-Debug
 /// button — same style, same corner treatment.
 pub fn render_rounded_button(
@@ -358,20 +557,16 @@ impl Widget for &mut SourceControlPanel {
                 .add_modifier(Modifier::BOLD),
         );
 
-        // Non-repo workspace: clear empty state below the header.
+        // Non-repo workspace: render the "No repository detected" card -
+        // bordered card with illustration, title, description, primary
+        // (Initialize Repository) and secondary (Open Folder) buttons,
+        // plus a "Learn more about Git" help link. Mirrors the reference
+        // design the user supplied.
         if !self.status.in_repo {
-            let dim = Style::default().fg(Color::DarkGray);
-            if inner.height > 2 {
-                buf.set_string(inner.x, inner.y + 2, "Not a git repository", dim);
-            }
-            if inner.height > 3 {
-                buf.set_string(
-                    inner.x,
-                    inner.y + 3,
-                    "Open a folder under git to commit",
-                    dim,
-                );
-            }
+            self.last_init_repo_button_area = Rect::default();
+            self.last_open_folder_button_area = Rect::default();
+            self.last_help_link_area = Rect::default();
+            self.render_no_repo_empty_state(inner, buf);
             return;
         }
 
@@ -883,24 +1078,92 @@ mod tests {
     }
 
     #[test]
-    fn render_in_non_repo_hides_input_and_button() {
+    fn render_in_non_repo_hides_commit_input_and_button_and_list() {
         use crate::git::GitStatus;
         let mut p = SourceControlPanel::new();
         p.status = GitStatus::default(); // in_repo = false
-        let area = Rect { x: 0, y: 0, width: 40, height: 10 };
+        let area = Rect { x: 0, y: 0, width: 60, height: 30 };
         let mut buf = Buffer::empty(area);
         (&mut p).render(area, &mut buf);
         assert_eq!(p.last_input_area, Rect::default(), "input area must stay empty in non-repo");
-        assert_eq!(p.last_button_area, Rect::default(), "button area must stay empty in non-repo");
+        assert_eq!(p.last_button_area, Rect::default(), "commit button area must stay empty in non-repo");
         assert_eq!(p.last_list_area, Rect::default(), "list area must stay empty in non-repo");
-        // The empty-state message lives below the SOURCE CONTROL header
-        // (row 0 of inner = row 1 of buffer), at inner.y + 2 = buffer
-        // row 3.
-        let mut row = String::new();
-        for x in 0..area.width {
-            row.push_str(buf[(x, 3)].symbol());
-        }
-        assert!(row.contains("Not a git repository"), "row was: {row:?}");
+    }
+
+    #[test]
+    fn empty_state_renders_no_repository_detected_title_and_description() {
+        use crate::git::GitStatus;
+        let mut p = SourceControlPanel::new();
+        p.status = GitStatus::default();
+        let area = Rect { x: 0, y: 0, width: 60, height: 30 };
+        let mut buf = Buffer::empty(area);
+        (&mut p).render(area, &mut buf);
+        let dump = buffer_to_string(&buf);
+        assert!(
+            dump.contains("No repository detected"),
+            "empty-state title missing:\n{dump}"
+        );
+        assert!(
+            dump.contains("Initialize Repository"),
+            "primary button label missing:\n{dump}"
+        );
+        assert!(
+            dump.contains("Open Folder"),
+            "secondary button label missing:\n{dump}"
+        );
+        assert!(
+            dump.contains("Learn more about Git"),
+            "help link missing:\n{dump}"
+        );
+    }
+
+    #[test]
+    fn empty_state_records_button_rects_for_hit_testing() {
+        use crate::git::GitStatus;
+        let mut p = SourceControlPanel::new();
+        p.status = GitStatus::default();
+        let area = Rect { x: 0, y: 0, width: 60, height: 30 };
+        let mut buf = Buffer::empty(area);
+        (&mut p).render(area, &mut buf);
+        assert!(
+            p.last_init_repo_button_area.width > 0
+                && p.last_init_repo_button_area.height > 0,
+            "Initialize Repository button rect must be tracked"
+        );
+        assert!(
+            p.last_open_folder_button_area.width > 0
+                && p.last_open_folder_button_area.height > 0,
+            "Open Folder button rect must be tracked"
+        );
+        assert!(
+            p.last_help_link_area.width > 0 && p.last_help_link_area.height > 0,
+            "Learn more link rect must be tracked"
+        );
+    }
+
+    #[test]
+    fn click_init_repo_button_returns_true_only_inside_the_rect() {
+        let mut p = SourceControlPanel::new();
+        p.last_init_repo_button_area = Rect { x: 5, y: 10, width: 30, height: 3 };
+        assert!(p.click_init_repo_button(20, 11));
+        assert!(!p.click_init_repo_button(40, 11));
+        assert!(!p.click_init_repo_button(20, 20));
+    }
+
+    #[test]
+    fn click_open_folder_button_returns_true_only_inside_the_rect() {
+        let mut p = SourceControlPanel::new();
+        p.last_open_folder_button_area = Rect { x: 5, y: 14, width: 30, height: 3 };
+        assert!(p.click_open_folder_button(20, 15));
+        assert!(!p.click_open_folder_button(50, 15));
+    }
+
+    #[test]
+    fn click_help_link_returns_true_only_inside_the_rect() {
+        let mut p = SourceControlPanel::new();
+        p.last_help_link_area = Rect { x: 10, y: 18, width: 22, height: 1 };
+        assert!(p.click_help_link(20, 18));
+        assert!(!p.click_help_link(20, 19));
     }
 
     #[test]

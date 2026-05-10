@@ -3409,6 +3409,34 @@ impl App {
         }
     }
 
+    fn initialize_repository(&mut self) {
+        match std::process::Command::new("git")
+            .arg("-C")
+            .arg(&self.tree.root)
+            .arg("init")
+            .output()
+        {
+            Ok(out) if out.status.success() => {
+                self.status = format!(
+                    "Initialized empty Git repository in {}",
+                    self.tree.root.display()
+                );
+                self.last_git_check = std::time::Instant::now()
+                    .checked_sub(std::time::Duration::from_secs(1))
+                    .unwrap_or_else(std::time::Instant::now);
+                self.refresh_git_status_debounced();
+                self.refresh_source_control();
+            }
+            Ok(out) => {
+                let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                self.status = format!("git init failed: {err}");
+            }
+            Err(e) => {
+                self.status = format!("git init failed: {e}");
+            }
+        }
+    }
+
     fn commit_source_control(&mut self) {
         let message = self.source_control.message.trim().to_string();
         if message.is_empty() {
@@ -4642,6 +4670,22 @@ impl App {
                 }
                 if in_tree && self.sidebar_view == SidebarView::SourceControl {
                     self.focus_pane(Pane::Tree);
+                    if self.source_control.click_init_repo_button(m.column, m.row) {
+                        self.initialize_repository();
+                        return;
+                    }
+                    if self.source_control.click_open_folder_button(m.column, m.row) {
+                        self.status = String::from(
+                            "Open folder: relaunch with `croft <path>` to switch workspace",
+                        );
+                        return;
+                    }
+                    if self.source_control.click_help_link(m.column, m.row) {
+                        if let Err(e) = open_url("https://git-scm.com/docs") {
+                            self.status = format!("Open browser failed: {e}");
+                        }
+                        return;
+                    }
                     if self.source_control.click_button(m.column, m.row) {
                         self.commit_source_control();
                         return;
