@@ -5,8 +5,15 @@ use std::path::{Path, PathBuf};
 pub const ITERM2_PLIST_REL: &str = "Library/Preferences/com.googlecode.iterm2.plist";
 const CMD_SHIFT_F_KEY: &str = "0x46-0x120000-0x3";
 const CMD_SHIFT_F_HEX: &str = "0x1b 0x5b 0x37 0x30 0x3b 0x31 0x30 0x75";
+const CMD_F_KEY: &str = "0x66-0x100000-0x3";
+const CMD_F_HEX: &str = "0x1b 0x5b 0x31 0x30 0x32 0x3b 0x39 0x75";
+const CMD_R_KEY: &str = "0x72-0x100000-0xf";
+const CMD_R_HEX: &str = "0x1b 0x5b 0x31 0x31 0x34 0x3b 0x39 0x75";
+const CMD_SLASH_KEY: &str = "0x2f-0x100000-0x2c";
+const CMD_SLASH_HEX: &str = "0x1b 0x5b 0x34 0x37 0x3b 0x39 0x75";
 const CMD_V_KEY: &str = "0x76-0x100000-0x9";
 const FIND_GLOBALLY_MENU_EQUIV: &str = "@~^f";
+const FIND_MENU_EQUIV: &str = "@~f";
 
 /// PostScript name iTerm2 stores in `Normal Font` and `Non Ascii Font`.
 /// Format is "<PostScriptName> <size>".
@@ -79,10 +86,22 @@ pub fn apply_croft_key_settings(plist: &mut Value) -> Result<(), ITerm2Error> {
         "Find Globally...",
         FIND_GLOBALLY_MENU_EQUIV.to_string(),
     );
+    // Relocate iTerm's "Find" menu item off Cmd+F so the GlobalKeyMap
+    // binding below wins reliably. Users that still want iTerm's
+    // in-pane find can use Cmd+Opt+F.
+    set_string(menu, "Find...", FIND_MENU_EQUIV.to_string());
     menu.remove("Paste");
 
     let global = dict_entry_mut(dict, "GlobalKeyMap");
     global.insert(CMD_SHIFT_F_KEY.into(), send_hex_action(CMD_SHIFT_F_HEX, 0));
+    // Explorer shortcuts: forward Cmd+F / Cmd+R / Cmd+/ to croft as
+    // CSI-u sequences. Croft handles them only when the Explorer pane
+    // is focused; elsewhere the keys are passed through as raw input,
+    // which means giving up iTerm's own actions on those chords
+    // (Find / Clear Buffer) while croft is running. The user agreed.
+    global.insert(CMD_F_KEY.into(), send_hex_action(CMD_F_HEX, 0));
+    global.insert(CMD_R_KEY.into(), send_hex_action(CMD_R_HEX, 0));
+    global.insert(CMD_SLASH_KEY.into(), send_hex_action(CMD_SLASH_HEX, 0));
     global.remove(CMD_V_KEY);
 
     let bookmarks = dict

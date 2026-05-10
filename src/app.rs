@@ -3211,6 +3211,12 @@ impl App {
             }
             return Ok(());
         }
+        // Explorer-pane shortcuts get first refusal so Cmd+Shift+F creates
+        // a folder when the user is browsing the tree, rather than always
+        // jumping to Search. Outside Explorer the global Search-jump wins.
+        if self.is_explorer_focused() && self.handle_explorer_shortcut(key) {
+            return Ok(());
+        }
         if is_search_jump_key(key) {
             self.set_sidebar_view(SidebarView::Search);
             return Ok(());
@@ -5393,6 +5399,61 @@ impl App {
         self.status = format!("Workspace root: {display}");
     }
 
+    fn is_explorer_focused(&self) -> bool {
+        self.focus == Pane::Tree && self.sidebar_view == SidebarView::Explorer
+    }
+
+    /// Dispatch the Explorer-pane keyboard shortcuts (Cmd+F / Cmd+Shift+F /
+    /// Cmd+R / F2 / Cmd+/). Returns true if the key was handled. The
+    /// target node is whichever row the user has highlighted; folder-only
+    /// actions (Make root) are no-ops on file selections.
+    fn handle_explorer_shortcut(&mut self, key: KeyEvent) -> bool {
+        if is_tree_new_file_key(key) {
+            let target = self.explorer_create_target_dir();
+            self.open_create_prompt(CreateKind::File, target);
+            return true;
+        }
+        if is_tree_new_folder_key(key) {
+            let target = self.explorer_create_target_dir();
+            self.open_create_prompt(CreateKind::Folder, target);
+            return true;
+        }
+        if is_tree_rename_key(key) {
+            if let Some(path) = self.explorer_selected_path() {
+                self.open_rename_prompt(path);
+            }
+            return true;
+        }
+        if is_tree_make_root_key(key) {
+            if let Some(path) = self.explorer_selected_folder() {
+                self.change_workspace_root(path);
+            }
+            return true;
+        }
+        false
+    }
+
+    fn explorer_selected_path(&self) -> Option<PathBuf> {
+        self.tree
+            .nodes
+            .get(self.tree.selected)
+            .map(|n| n.path.clone())
+    }
+
+    fn explorer_selected_folder(&self) -> Option<PathBuf> {
+        let n = self.tree.nodes.get(self.tree.selected)?;
+        if n.is_dir && n.path != self.tree.root {
+            Some(n.path.clone())
+        } else {
+            None
+        }
+    }
+
+    fn explorer_create_target_dir(&self) -> PathBuf {
+        let node = self.tree.nodes.get(self.tree.selected);
+        crate::widgets::file_tree::create_target_dir_for(node, &self.tree.root)
+    }
+
     fn dispatch_menu_action(&mut self, action: MenuAction, target_dir: PathBuf) {
         match action {
             MenuAction::Create(kind) => self.open_create_prompt(kind, target_dir),
@@ -6195,6 +6256,61 @@ fn is_search_jump_key(key: KeyEvent) -> bool {
     let has_ctrl_or_super = key.modifiers.contains(KeyModifiers::CONTROL)
         || key.modifiers.contains(KeyModifiers::SUPER);
     has_shift && has_ctrl_or_super
+}
+
+/// Explorer-pane shortcut: `Cmd+F` / `Ctrl+F` (no Shift, no Alt) - "New File".
+fn is_tree_new_file_key(key: KeyEvent) -> bool {
+    let KeyCode::Char(c) = key.code else { return false };
+    if !c.eq_ignore_ascii_case(&'f') {
+        return false;
+    }
+    if key.modifiers.contains(KeyModifiers::SHIFT)
+        || key.modifiers.contains(KeyModifiers::ALT)
+    {
+        return false;
+    }
+    key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::SUPER)
+}
+
+/// Explorer-pane shortcut: `Cmd+Shift+F` / `Ctrl+Shift+F` - "New Folder".
+/// Same chord as `is_search_jump_key`; the global dispatcher gives the
+/// Explorer-context handler first refusal so this only fires when the
+/// tree is the focused pane.
+fn is_tree_new_folder_key(key: KeyEvent) -> bool {
+    is_search_jump_key(key)
+}
+
+/// Explorer-pane shortcut: `Cmd+R` / `Ctrl+R` (no Shift) OR plain `F2` -
+/// "Rename". F2 is the cross-IDE convention; Cmd+R matches the user-
+/// requested chord (overrides iTerm's "Clear buffer" via setup-iterm2).
+fn is_tree_rename_key(key: KeyEvent) -> bool {
+    if matches!(key.code, KeyCode::F(2)) {
+        return true;
+    }
+    let KeyCode::Char(c) = key.code else { return false };
+    if !c.eq_ignore_ascii_case(&'r') {
+        return false;
+    }
+    if key.modifiers.contains(KeyModifiers::SHIFT)
+        || key.modifiers.contains(KeyModifiers::ALT)
+    {
+        return false;
+    }
+    key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::SUPER)
+}
+
+/// Explorer-pane shortcut: `Cmd+/` / `Ctrl+/` - "Make root". Re-roots the
+/// workspace at the selected folder.
+fn is_tree_make_root_key(key: KeyEvent) -> bool {
+    if !matches!(key.code, KeyCode::Char('/')) {
+        return false;
+    }
+    if key.modifiers.contains(KeyModifiers::SHIFT)
+        || key.modifiers.contains(KeyModifiers::ALT)
+    {
+        return false;
+    }
+    key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::SUPER)
 }
 
 /// `Ctrl/Cmd+Shift+G`: jump to the Source Control sidebar view, matching
@@ -8108,6 +8224,73 @@ mod tests {
         assert!(matches!(&items[4].1, MenuAction::Rename(p) if p == &f));
         assert!(matches!(&items[5].1, MenuAction::SelectForCompare(p) if p == &f));
         assert!(matches!(&items[6].1, MenuAction::Delete { paths } if paths == &vec![f.clone()]));
+    }
+
+    #[test]
+    fn explorer_shortcut_predicates_recognise_expected_keys() {
+        assert!(is_tree_new_file_key(key(KeyCode::Char('f'), KeyModifiers::SUPER)));
+        assert!(is_tree_new_file_key(key(KeyCode::Char('F'), KeyModifiers::CONTROL)));
+        assert!(!is_tree_new_file_key(key(KeyCode::Char('f'), KeyModifiers::NONE)));
+        // Shift+Super disqualifies New File so Cmd+Shift+F routes to New Folder.
+        assert!(!is_tree_new_file_key(key(
+            KeyCode::Char('F'),
+            KeyModifiers::SUPER | KeyModifiers::SHIFT
+        )));
+
+        assert!(is_tree_new_folder_key(key(
+            KeyCode::Char('F'),
+            KeyModifiers::SUPER | KeyModifiers::SHIFT
+        )));
+        assert!(!is_tree_new_folder_key(key(
+            KeyCode::Char('f'),
+            KeyModifiers::SUPER
+        )));
+
+        assert!(is_tree_rename_key(key(KeyCode::Char('r'), KeyModifiers::SUPER)));
+        assert!(is_tree_rename_key(key(KeyCode::F(2), KeyModifiers::NONE)));
+        assert!(!is_tree_rename_key(key(KeyCode::Char('r'), KeyModifiers::NONE)));
+
+        assert!(is_tree_make_root_key(key(KeyCode::Char('/'), KeyModifiers::SUPER)));
+        assert!(is_tree_make_root_key(key(KeyCode::Char('/'), KeyModifiers::CONTROL)));
+        assert!(!is_tree_make_root_key(key(KeyCode::Char('/'), KeyModifiers::NONE)));
+    }
+
+    #[test]
+    fn cmd_shift_f_in_explorer_pane_creates_a_new_folder_not_search_jump() {
+        // With Explorer focused, Cmd+Shift+F must trigger the New Folder
+        // prompt (user-requested binding) instead of the default global
+        // Search-jump action. Outside Explorer the global behavior wins.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.focus_pane(Pane::Tree);
+        app.sidebar_view = SidebarView::Explorer;
+        app.handle_key(key(
+            KeyCode::Char('F'),
+            KeyModifiers::SUPER | KeyModifiers::SHIFT,
+        ))
+        .unwrap();
+        assert!(
+            matches!(
+                app.prompt.as_ref(),
+                Some(Prompt { kind: PromptKind::Create(CreateKind::Folder), .. })
+            ),
+            "Explorer-focused Cmd+Shift+F must open a New Folder prompt"
+        );
+        assert_eq!(app.sidebar_view, SidebarView::Explorer, "must NOT jump to Search");
+    }
+
+    #[test]
+    fn cmd_shift_f_outside_explorer_still_jumps_to_search() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.focus_pane(Pane::Editor);
+        app.sidebar_view = SidebarView::Explorer;
+        app.handle_key(key(
+            KeyCode::Char('F'),
+            KeyModifiers::SUPER | KeyModifiers::SHIFT,
+        ))
+        .unwrap();
+        assert_eq!(app.sidebar_view, SidebarView::Search);
     }
 
     #[test]
