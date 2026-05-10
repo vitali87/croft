@@ -5357,26 +5357,33 @@ impl App {
 
     /// Re-root the workspace at `new_root`. Resets the file tree, updates
     /// `workspace_root`, refreshes git status and the source-control
-    /// panel, and respawns the FS watcher so events fire under the new
-    /// root. Open editor tabs are NOT closed - a path that escapes the
-    /// new root still resolves on disk and the user may want to keep it
-    /// open. Compare anchor / clipboard / marks are reset because they
-    /// point into the old workspace.
+    /// panel, and respawns the FS watcher off-thread (a recursive stat
+    /// walk on a multi-GB monorepo is the dominant cost - blocking the
+    /// UI thread for it is what froze the app on "Make root"). The
+    /// polling fallback in `drain_fs_events` keeps the tree fresh until
+    /// the watcher comes online via `try_install_pending_init`. Open
+    /// editor tabs are NOT closed - a path that escapes the new root
+    /// still resolves on disk and the user may want to keep it open.
+    /// Compare anchor / clipboard / marks are reset because they point
+    /// into the old workspace.
     pub fn change_workspace_root(&mut self, new_root: PathBuf) {
         let display = new_root.display().to_string();
         self.workspace_root = new_root.clone();
         self.tree.set_root(new_root.clone());
         self.tree_clipboard = None;
         self.compare_anchor = None;
-        // Respawn the FS watcher so events under the new root flow into
-        // `drain_fs_events`. Dropping the old debouncer stops the old
-        // recursive watch.
+        // Drop the old watcher synchronously (free), spawn the new one
+        // on a worker thread. Same pattern App::new uses at startup.
         self._fs_watcher = None;
         self.fs_rx = None;
-        if let Ok((watcher, rx)) = Self::spawn_fs_watcher(&new_root) {
-            self._fs_watcher = Some(watcher);
-            self.fs_rx = Some(rx);
-        }
+        let (fs_init_tx, fs_init_rx) = std::sync::mpsc::channel();
+        let root_for_fs = new_root.clone();
+        std::thread::spawn(move || {
+            if let Ok(pair) = Self::spawn_fs_watcher(&root_for_fs) {
+                let _ = fs_init_tx.send(pair);
+            }
+        });
+        self.fs_watcher_init_rx = Some(fs_init_rx);
         self.fs_poll_dir_mtimes = Self::snapshot_expanded_dir_mtimes(&self.tree);
         self.last_git_check = std::time::Instant::now()
             .checked_sub(std::time::Duration::from_secs(1))
