@@ -555,7 +555,7 @@ pub struct App {
     /// Results coming back from the search worker: `(query, hits)`. The
     /// query is echoed so we can drop stale results when the user has
     /// typed past the query that produced them.
-    search_results_rx: std::sync::mpsc::Receiver<crate::widgets::search::SearchResult>,
+    search_results_rx: std::sync::mpsc::Receiver<crate::widgets::search::SearchEvent>,
     /// Pre-encoded OSC-1337 escape carrying the croft wordmark sized to the
     /// welcome banner block, painted on a canvas filled with the sRGB-
     /// equivalent of `EDITOR_BG_RGB` so its bg matches the SGR-painted
@@ -1757,7 +1757,12 @@ impl App {
     /// worker channel and keep the editor's match highlight synced to the
     /// same term so the active file lights up matches as the user types.
     /// Called whenever the search input or one of the toggles changes.
+    /// Clears the live result list so streamed `Hits` events accumulate
+    /// from zero rather than appending to leftover hits from the prior query.
     fn submit_search_query(&mut self) {
+        self.search.hits.clear();
+        self.search.selected = 0;
+        self.search.scroll = 0;
         let _ = self
             .search_query_tx
             .send((self.search.query.clone(), self.search.opts));
@@ -1769,18 +1774,23 @@ impl App {
         self.editor.set_search_highlight(term, self.search.opts);
     }
 
-    /// Apply any pending search results from the background worker. Drops
-    /// stale results whose query no longer matches the input field (the
-    /// user has typed past it). Returns true iff hits were updated, so
-    /// the main loop knows to redraw.
+    /// Apply any pending search events from the background worker. Drops
+    /// stale events whose query no longer matches the input field (the
+    /// user has typed past it). `Hits` events append to the live result
+    /// list as files yield matches; `Done` is informational. Returns true
+    /// iff hits were updated, so the main loop knows to redraw.
     pub fn drain_search_results(&mut self) -> bool {
+        use crate::widgets::search::SearchEvent;
         let mut applied = false;
-        while let Ok((q, opts, hits)) = self.search_results_rx.try_recv() {
-            if q == self.search.query && opts == self.search.opts {
-                self.search.hits = hits;
-                self.search.selected = 0;
-                self.search.scroll = 0;
-                applied = true;
+        while let Ok(event) = self.search_results_rx.try_recv() {
+            match event {
+                SearchEvent::Hits(q, opts, batch) => {
+                    if q == self.search.query && opts == self.search.opts {
+                        self.search.hits.extend(batch);
+                        applied = true;
+                    }
+                }
+                SearchEvent::Done(_, _) => {}
             }
         }
         applied

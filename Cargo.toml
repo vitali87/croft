@@ -1,6 +1,6 @@
 [package]
 name = "croft"
-version = "0.1.61"
+version = "0.1.62"
 edition = "2024"
 description = "Terminal-based VS Code replica: file tree, editor, embedded shell"
 license = "MIT"
@@ -39,6 +39,9 @@ tree-sitter-css = "0.25"
 tree-sitter-bash = "0.25"
 
 ignore = "0.4"
+grep-searcher = "0.1"
+grep-regex = "0.1"
+grep-matcher = "0.1"
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 thiserror = "2"

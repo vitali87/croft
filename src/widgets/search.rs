@@ -1,4 +1,8 @@
-use ignore::WalkBuilder;
+use grep_regex::{RegexMatcher, RegexMatcherBuilder};
+use grep_searcher::{
+    BinaryDetection, MmapChoice, Searcher, SearcherBuilder, Sink, SinkMatch,
+};
+use ignore::{WalkBuilder, WalkState};
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
@@ -7,10 +11,10 @@ use ratatui::{
     widgets::{Block, BorderType, Borders, Widget},
 };
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-const MAX_HITS: usize = 200;
 const MAX_LINE_LEN: usize = 200;
-const MAX_FILE_BYTES: u64 = 5 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SearchHit {
@@ -34,37 +38,128 @@ pub struct SearchOpts {
     pub use_regex: bool,
 }
 
-/// Search the workspace rooted at `root` for `query` honouring `opts`
-/// (case-sensitivity, whole-word boundaries, regex). Honours `.gitignore`
-/// (via the `ignore` crate) so generated files don't dominate. Capped at
-/// `MAX_HITS`.
-pub fn search_workspace(root: &Path, query: &str, opts: SearchOpts) -> Vec<SearchHit> {
+fn build_matcher(query: &str, opts: SearchOpts) -> Option<RegexMatcher> {
+    if query.is_empty() {
+        return None;
+    }
+    let mut b = RegexMatcherBuilder::new();
+    b.case_insensitive(!opts.case_sensitive);
+    b.word(opts.whole_word);
+    b.fixed_strings(!opts.use_regex);
+    b.build(query).ok()
+}
+
+fn build_searcher() -> Searcher {
+    SearcherBuilder::new()
+        .line_number(true)
+        .binary_detection(BinaryDetection::quit(b'\x00'))
+        .memory_map(MmapChoice::never())
+        .build()
+}
+
+struct HitSink<'a> {
+    path: PathBuf,
+    batch: &'a mut Vec<SearchHit>,
+}
+
+impl<'a> Sink for HitSink<'a> {
+    type Error = std::io::Error;
+    fn matched(
+        &mut self,
+        _searcher: &Searcher,
+        mat: &SinkMatch<'_>,
+    ) -> Result<bool, std::io::Error> {
+        let line_no = mat.line_number().unwrap_or(0) as usize;
+        let line_str = std::str::from_utf8(mat.bytes()).unwrap_or("");
+        let stripped = line_str.trim_end_matches(['\r', '\n']);
+        let trimmed = stripped.trim_start();
+        let cut = if trimmed.chars().count() > MAX_LINE_LEN {
+            let mut s: String = trimmed.chars().take(MAX_LINE_LEN).collect();
+            s.push('…');
+            s
+        } else {
+            trimmed.to_string()
+        };
+        self.batch.push(SearchHit {
+            path: self.path.clone(),
+            line_no,
+            line_text: cut,
+        });
+        Ok(true)
+    }
+}
+
+/// Stream every match for `query` under `root` into `on_batch`, one batch
+/// per file. Honours `.gitignore` and skips binaries via NUL detection.
+/// Walks in parallel using `WalkBuilder::build_parallel` and uses
+/// `grep-searcher` + `grep-regex` (the same engine that powers ripgrep).
+/// Set `cancel` to abort an in-flight scan.
+pub fn search_workspace_streaming<F>(
+    root: &Path,
+    query: &str,
+    opts: SearchOpts,
+    cancel: &Arc<AtomicBool>,
+    on_batch: F,
+) where
+    F: FnMut(Vec<SearchHit>) + Send + Clone,
+{
     let q = query.trim();
     if q.is_empty() {
-        return Vec::new();
+        return;
     }
-    let mut hits: Vec<SearchHit> = Vec::new();
+    let Some(matcher) = build_matcher(q, opts) else {
+        return;
+    };
     let walker = WalkBuilder::new(root)
         .git_ignore(true)
         .hidden(true)
-        .build();
-    for entry in walker.flatten() {
-        if hits.len() >= MAX_HITS {
-            break;
+        .build_parallel();
+    walker.run(|| {
+        let matcher = matcher.clone();
+        let cancel = cancel.clone();
+        let mut on_batch = on_batch.clone();
+        Box::new(move |entry| {
+            if cancel.load(Ordering::Relaxed) {
+                return WalkState::Quit;
+            }
+            let entry = match entry {
+                Ok(e) => e,
+                Err(_) => return WalkState::Continue,
+            };
+            if !entry.file_type().is_some_and(|t| t.is_file()) {
+                return WalkState::Continue;
+            }
+            let path = entry.path();
+            let mut batch: Vec<SearchHit> = Vec::new();
+            {
+                let mut sink = HitSink { path: path.to_path_buf(), batch: &mut batch };
+                let mut searcher = build_searcher();
+                let _ = searcher.search_path(&matcher, path, &mut sink);
+            }
+            if !batch.is_empty() {
+                on_batch(batch);
+            }
+            WalkState::Continue
+        })
+    });
+}
+
+/// Aggregating wrapper around `search_workspace_streaming`. Returns every
+/// match - no arbitrary cap. Honours `.gitignore`. Order is non-deterministic
+/// because the walker is parallel; callers that need ordering must sort.
+pub fn search_workspace(root: &Path, query: &str, opts: SearchOpts) -> Vec<SearchHit> {
+    let cancel = Arc::new(AtomicBool::new(false));
+    let collected: Arc<std::sync::Mutex<Vec<SearchHit>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let collected_for_cb = collected.clone();
+    search_workspace_streaming(root, query, opts, &cancel, move |batch| {
+        if let Ok(mut g) = collected_for_cb.lock() {
+            g.extend(batch);
         }
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        if !is_searchable_size(path) {
-            continue;
-        }
-        match std::fs::read_to_string(path) {
-            Ok(content) => collect_matches_in_text(path, &content, q, opts, &mut hits),
-            Err(_) => {} // binary or unreadable; skip silently
-        }
-    }
-    hits
+    });
+    Arc::try_unwrap(collected)
+        .map(|m| m.into_inner().unwrap_or_default())
+        .unwrap_or_default()
 }
 
 /// Split `line` into `(segment, is_match)` runs against `needle` honouring
@@ -156,10 +251,18 @@ fn split_for_highlight_regex(line: &str, needle: &str, opts: SearchOpts) -> Vec<
     out
 }
 
-/// `(query_that_was_run, opts_used, hits)`. The query and opts are echoed
-/// back so the receiver can drop stale results when the user has typed
-/// past or flipped a toggle since the search started.
-pub type SearchResult = (String, SearchOpts, Vec<SearchHit>);
+/// One unit of streamed output from the search worker. The query and opts
+/// are echoed back on every event so the receiver can drop stale events
+/// when the user has typed past or flipped a toggle since the scan started.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SearchEvent {
+    /// A batch of hits, one batch per file as the parallel walker finds them.
+    Hits(String, SearchOpts, Vec<SearchHit>),
+    /// Sentinel emitted exactly once per submitted request when the scan
+    /// finishes (or short-circuits on an empty query). UI uses this to flip
+    /// the "(searching…)" caption off.
+    Done(String, SearchOpts),
+}
 
 /// Submitted unit of work: the query string and the toggle state at the
 /// moment of submission. Bundling them lets the user flip a toggle and
@@ -168,14 +271,14 @@ pub type SearchRequest = (String, SearchOpts);
 
 /// Background worker loop. Reads requests from `rx`, coalesces by always
 /// taking the most recent pending request, debounces ~120 ms so a fast
-/// typist doesn't trigger a search per keystroke, runs `search_workspace`,
-/// and ships `(query, opts, hits)` back via `tx`. Empty queries
-/// short-circuit to empty hits without walking the tree. The thread
-/// exits cleanly when the channel closes.
+/// typist doesn't trigger a search per keystroke, runs the streaming
+/// engine, and ships `Hits` events as files yield matches followed by a
+/// single `Done`. Empty queries short-circuit straight to `Done`. The
+/// thread exits cleanly when the channel closes.
 pub fn search_worker_loop(
     root: PathBuf,
     rx: std::sync::mpsc::Receiver<SearchRequest>,
-    tx: std::sync::mpsc::Sender<SearchResult>,
+    tx: std::sync::mpsc::Sender<SearchEvent>,
 ) {
     use std::time::Duration;
     while let Ok(mut req) = rx.recv() {
@@ -187,26 +290,31 @@ pub fn search_worker_loop(
             req = newer;
         }
         let (query, opts) = req;
-        let hits = if query.trim().is_empty() {
-            Vec::new()
-        } else {
-            search_workspace(&root, &query, opts)
-        };
-        if tx.send((query, opts, hits)).is_err() {
+        if query.trim().is_empty() {
+            if tx.send(SearchEvent::Done(query, opts)).is_err() {
+                return;
+            }
+            continue;
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        {
+            let tx_for_emit = tx.clone();
+            let q_for_emit = query.clone();
+            search_workspace_streaming(&root, &query, opts, &cancel, move |batch| {
+                let _ = tx_for_emit.send(SearchEvent::Hits(q_for_emit.clone(), opts, batch));
+            });
+        }
+        if tx.send(SearchEvent::Done(query, opts)).is_err() {
             return;
         }
     }
 }
 
-fn is_searchable_size(path: &Path) -> bool {
-    std::fs::metadata(path)
-        .map(|m| m.len() <= MAX_FILE_BYTES)
-        .unwrap_or(false)
-}
-
-/// Pure helper used by `search_workspace` and unit-tested directly. Honours
-/// the three `SearchOpts` toggles. Regex compilation failure for invalid
-/// patterns is silent: returns no matches rather than crashing.
+/// Test-friendly per-text helper. Wraps `grep-searcher` so the matching
+/// logic is identical to the file-walking engine. Honours the three
+/// `SearchOpts` toggles. Regex compilation failure for invalid patterns
+/// is silent: returns no matches rather than crashing.
+#[cfg(test)]
 pub fn collect_matches_in_text(
     path: &Path,
     content: &str,
@@ -214,80 +322,19 @@ pub fn collect_matches_in_text(
     opts: SearchOpts,
     out: &mut Vec<SearchHit>,
 ) {
-    let regex = if opts.use_regex {
-        let mut pattern = String::new();
-        if !opts.case_sensitive {
-            pattern.push_str("(?i)");
-        }
-        if opts.whole_word {
-            pattern.push_str("\\b(?:");
-            pattern.push_str(query);
-            pattern.push_str(")\\b");
-        } else {
-            pattern.push_str(query);
-        }
-        match regex::Regex::new(&pattern) {
-            Ok(r) => Some(r),
-            Err(_) => return, // invalid regex: silently yield zero hits
-        }
-    } else {
-        None
-    };
-    let lowered_needle = if opts.case_sensitive {
-        query.to_string()
-    } else {
-        query.to_lowercase()
-    };
-    for (idx, line) in content.lines().enumerate() {
-        if out.len() >= MAX_HITS {
-            return;
-        }
-        let matched = if let Some(r) = regex.as_ref() {
-            r.is_match(line)
-        } else {
-            line_contains_needle(line, query, &lowered_needle, opts)
-        };
-        if matched {
-            let trimmed = line.trim_start().trim_end();
-            let cut: String = if trimmed.len() > MAX_LINE_LEN {
-                let mut s: String = trimmed.chars().take(MAX_LINE_LEN).collect();
-                s.push('…');
-                s
-            } else {
-                trimmed.to_string()
-            };
-            out.push(SearchHit {
-                path: path.to_path_buf(),
-                line_no: idx + 1,
-                line_text: cut,
-            });
-        }
+    let q = query.trim();
+    if q.is_empty() {
+        return;
     }
-}
-
-/// Literal-mode line match: case-sensitive direct contains when the flag
-/// is on, lowercase-folded otherwise. Whole-word check inspects the
-/// characters bounding each match position so partial-word hits get
-/// filtered out.
-fn line_contains_needle(line: &str, query: &str, lowered_needle: &str, opts: SearchOpts) -> bool {
-    let (haystack, needle): (String, &str) = if opts.case_sensitive {
-        (line.to_string(), query)
-    } else {
-        (line.to_lowercase(), &lowered_needle[..])
+    let Some(matcher) = build_matcher(q, opts) else {
+        return;
     };
-    if needle.is_empty() {
-        return false;
-    }
-    let mut start = 0;
-    while let Some(rel) = haystack[start..].find(needle) {
-        let abs = start + rel;
-        let end = abs + needle.len();
-        if !opts.whole_word || is_whole_word_match(&haystack, abs, end) {
-            return true;
-        }
-        start = end;
-    }
-    false
+    let mut sink = HitSink { path: path.to_path_buf(), batch: out };
+    let mut searcher = SearcherBuilder::new()
+        .line_number(true)
+        .binary_detection(BinaryDetection::quit(b'\x00'))
+        .build();
+    let _ = searcher.search_slice(&matcher, content.as_bytes(), &mut sink);
 }
 
 fn is_whole_word_match(haystack: &str, start: usize, end: usize) -> bool {
@@ -825,15 +872,21 @@ mod tests {
     }
 
     #[test]
-    fn search_workspace_caps_at_max_hits() {
+    fn search_workspace_returns_every_match_with_no_arbitrary_cap() {
+        // Regression: the engine used to silently truncate at 200 matches,
+        // which the user (correctly) called rubbish. Five files, each with
+        // 100 lines containing the needle, must all show up.
         let tmp = TempDir::new().unwrap();
-        // 5 files, each with 100 matches → 500 lines. Cap is 200.
         for i in 0..5 {
             let many = (0..100).map(|_| "needle\n").collect::<String>();
             write(&tmp.path().join(format!("f{i}.txt")), &many);
         }
         let hits = search_workspace(tmp.path(), "needle", SearchOpts::default());
-        assert_eq!(hits.len(), MAX_HITS);
+        assert_eq!(
+            hits.len(),
+            500,
+            "engine must surface every match - silent truncation is unacceptable"
+        );
     }
 
     #[test]
@@ -1121,22 +1174,85 @@ mod tests {
         assert_eq!(segs.last().map(|(_, m)| *m), Some(true), "last seg is match");
     }
 
+    fn collect_until_done(
+        rx: &std::sync::mpsc::Receiver<SearchEvent>,
+        deadline: std::time::Duration,
+    ) -> (Option<String>, Vec<SearchHit>, bool) {
+        let until = std::time::Instant::now() + deadline;
+        let mut last_q: Option<String> = None;
+        let mut hits: Vec<SearchHit> = Vec::new();
+        let mut saw_done = false;
+        while std::time::Instant::now() < until {
+            let remaining = until.saturating_duration_since(std::time::Instant::now());
+            match rx.recv_timeout(remaining.max(std::time::Duration::from_millis(50))) {
+                Ok(SearchEvent::Hits(q, _, batch)) => {
+                    last_q = Some(q);
+                    hits.extend(batch);
+                }
+                Ok(SearchEvent::Done(q, _)) => {
+                    last_q = Some(q);
+                    saw_done = true;
+                    break;
+                }
+                Err(_) => break,
+            }
+        }
+        (last_q, hits, saw_done)
+    }
+
     #[test]
     fn search_worker_loop_returns_hits_for_a_typed_query() {
         let tmp = TempDir::new().unwrap();
         write(&tmp.path().join("a.txt"), "one\nneedle\nthree\n");
         let (q_tx, q_rx) = std::sync::mpsc::channel::<SearchRequest>();
-        let (r_tx, r_rx) = std::sync::mpsc::channel::<SearchResult>();
+        let (e_tx, e_rx) = std::sync::mpsc::channel::<SearchEvent>();
         let root = tmp.path().to_path_buf();
-        let join = std::thread::spawn(move || search_worker_loop(root, q_rx, r_tx));
+        let join = std::thread::spawn(move || search_worker_loop(root, q_rx, e_tx));
         q_tx.send(("needle".into(), SearchOpts::default())).unwrap();
-        let (q, _opts, hits) = r_rx
-            .recv_timeout(std::time::Duration::from_secs(2))
-            .expect("worker should ship a result");
-        assert_eq!(q, "needle");
+        let (q, hits, done) = collect_until_done(&e_rx, std::time::Duration::from_secs(2));
+        assert_eq!(q.as_deref(), Some("needle"));
         assert_eq!(hits.len(), 1);
+        assert!(done, "worker must terminate the stream with a Done event");
         drop(q_tx);
         join.join().unwrap();
+    }
+
+    #[test]
+    fn search_worker_loop_streams_per_file_batches_for_a_typed_query() {
+        // Three files each containing matches must surface as separate Hits
+        // batches followed by exactly one Done. This pins the streaming
+        // protocol so the UI can show "N matches (still searching)".
+        let tmp = TempDir::new().unwrap();
+        write(&tmp.path().join("a.txt"), "needle\n");
+        write(&tmp.path().join("b.txt"), "needle\nneedle\n");
+        write(&tmp.path().join("c.txt"), "needle\n");
+        let (q_tx, q_rx) = std::sync::mpsc::channel::<SearchRequest>();
+        let (e_tx, e_rx) = std::sync::mpsc::channel::<SearchEvent>();
+        let root = tmp.path().to_path_buf();
+        let join = std::thread::spawn(move || search_worker_loop(root, q_rx, e_tx));
+        q_tx.send(("needle".into(), SearchOpts::default())).unwrap();
+        let mut total = 0usize;
+        let mut hits_events = 0usize;
+        let mut done_events = 0usize;
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while std::time::Instant::now() < until {
+            match e_rx.recv_timeout(std::time::Duration::from_millis(500)) {
+                Ok(SearchEvent::Hits(_, _, batch)) => {
+                    hits_events += 1;
+                    total += batch.len();
+                }
+                Ok(SearchEvent::Done(_, _)) => {
+                    done_events += 1;
+                    break;
+                }
+                Err(_) => break,
+            }
+        }
+        drop(q_tx);
+        join.join().unwrap();
+        assert_eq!(total, 4, "every match across all files must arrive");
+        assert!(hits_events >= 3, "expected per-file batches, got {hits_events}");
+        assert_eq!(done_events, 1, "exactly one Done sentinel per request");
     }
 
     #[test]
@@ -1147,25 +1263,16 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         write(&tmp.path().join("a.txt"), "alpha one beta\nzeta\n");
         let (q_tx, q_rx) = std::sync::mpsc::channel::<SearchRequest>();
-        let (r_tx, r_rx) = std::sync::mpsc::channel::<SearchResult>();
+        let (e_tx, e_rx) = std::sync::mpsc::channel::<SearchEvent>();
         let root = tmp.path().to_path_buf();
-        let join = std::thread::spawn(move || search_worker_loop(root, q_rx, r_tx));
+        let join = std::thread::spawn(move || search_worker_loop(root, q_rx, e_tx));
         q_tx.send(("o".into(), SearchOpts::default())).unwrap();
         q_tx.send(("on".into(), SearchOpts::default())).unwrap();
         q_tx.send(("one".into(), SearchOpts::default())).unwrap();
-        let mut last: Option<SearchResult> = None;
-        while let Ok(r) = r_rx.recv_timeout(std::time::Duration::from_secs(2)) {
-            last = Some(r);
-            if r_rx
-                .recv_timeout(std::time::Duration::from_millis(200))
-                .is_err()
-            {
-                break;
-            }
-        }
-        let (q, _opts, hits) = last.expect("worker must produce at least one result");
-        assert_eq!(q, "one", "coalesce must drop intermediate prefixes");
+        let (q, hits, done) = collect_until_done(&e_rx, std::time::Duration::from_secs(2));
+        assert_eq!(q.as_deref(), Some("one"), "coalesce must drop intermediate prefixes");
         assert_eq!(hits.len(), 1);
+        assert!(done);
         drop(q_tx);
         join.join().unwrap();
     }
@@ -1175,15 +1282,14 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         write(&tmp.path().join("a.txt"), "anything\n");
         let (q_tx, q_rx) = std::sync::mpsc::channel::<SearchRequest>();
-        let (r_tx, r_rx) = std::sync::mpsc::channel::<SearchResult>();
+        let (e_tx, e_rx) = std::sync::mpsc::channel::<SearchEvent>();
         let root = tmp.path().to_path_buf();
-        let join = std::thread::spawn(move || search_worker_loop(root, q_rx, r_tx));
+        let join = std::thread::spawn(move || search_worker_loop(root, q_rx, e_tx));
         q_tx.send(("".into(), SearchOpts::default())).unwrap();
-        let (q, _opts, hits) = r_rx
-            .recv_timeout(std::time::Duration::from_secs(2))
-            .unwrap();
-        assert_eq!(q, "");
+        let (q, hits, done) = collect_until_done(&e_rx, std::time::Duration::from_secs(2));
+        assert_eq!(q.as_deref(), Some(""));
         assert!(hits.is_empty());
+        assert!(done, "empty query still emits a Done sentinel");
         drop(q_tx);
         join.join().unwrap();
     }
