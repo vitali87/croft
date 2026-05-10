@@ -639,14 +639,15 @@ pub struct App {
     /// without recomputing layout outside of `render`.
     sidebar_splitter_x: Option<u16>,
     terminal_splitter_y: Option<u16>,
-    /// Hit-test rectangle of the "[+]" button on the terminal pane's top
-    /// border. None when the pane is hidden or too narrow for the label.
-    terminal_add_button: Option<Rect>,
-    /// Hit-test rectangle of the "[-]" button on the terminal pane's top
-    /// border. None when the pane is hidden, the label can't fit, or only
-    /// one terminal is open (closing the last one would leave the pane
-    /// empty, which we explicitly forbid).
-    terminal_close_button: Option<Rect>,
+    /// Hit-test rectangles of the "[+]" buttons - one per terminal pane,
+    /// indexed in lock-step with `terminals`. Empty when the pane is hidden
+    /// or every pane is too narrow for the label.
+    terminal_add_buttons: Vec<Rect>,
+    /// Hit-test rectangles of the "[-]" buttons - one per terminal pane,
+    /// indexed in lock-step with `terminals`. Empty when only one terminal
+    /// is open (closing the last one would leave the pane empty, which we
+    /// explicitly forbid) or the pane is hidden.
+    terminal_close_buttons: Vec<Rect>,
     /// When the activity-bar OSC-1337 overlay was last written to stdout.
     /// Re-emitting on every redraw (the previous behaviour) flickered the
     /// editor caret at the PTY redraw rate; we now refresh on dirty plus a
@@ -1126,8 +1127,8 @@ impl App {
             splitter_drag: None,
             sidebar_splitter_x: None,
             terminal_splitter_y: None,
-            terminal_add_button: None,
-            terminal_close_button: None,
+            terminal_add_buttons: Vec::new(),
+            terminal_close_buttons: Vec::new(),
             last_activity_overlay_emit: None,
             last_content_width: 0,
             last_content_height: 0,
@@ -2509,20 +2510,33 @@ impl App {
         Ok(())
     }
 
-    /// Drop the active terminal. Returns false (and does nothing) when only
-    /// one terminal is left, since hiding the pane is the user's job
-    /// (Ctrl+J), not ours.
-    pub fn close_active_terminal(&mut self) -> bool {
-        if self.terminals.len() <= 1 {
+    /// Drop the terminal at `idx`. Returns false (and does nothing) when
+    /// only one terminal is left or `idx` is out of range. Hiding the pane
+    /// is the user's job (Ctrl+J), not ours, so the last terminal stays.
+    /// The active index shifts so the same logical terminal remains active
+    /// when an inactive pane is closed; closing the active pane reseats the
+    /// focus on the neighbour to the left (or the new last if we removed
+    /// the right edge).
+    pub fn close_terminal_at(&mut self, idx: usize) -> bool {
+        if self.terminals.len() <= 1 || idx >= self.terminals.len() {
             return false;
         }
-        let idx = self.active_terminal;
         self.terminals.remove(idx);
-        if self.active_terminal >= self.terminals.len() {
-            self.active_terminal = self.terminals.len() - 1;
+        if self.active_terminal == idx {
+            if self.active_terminal >= self.terminals.len() {
+                self.active_terminal = self.terminals.len() - 1;
+            }
+        } else if self.active_terminal > idx {
+            self.active_terminal -= 1;
         }
         self.sync_focus_flags();
         true
+    }
+
+    /// Drop the currently-active terminal. Thin wrapper kept for the
+    /// keyboard shortcut and existing callers.
+    pub fn close_active_terminal(&mut self) -> bool {
+        self.close_terminal_at(self.active_terminal)
     }
 
     /// Cycle the active terminal forward by one slot, wrapping at the end.
@@ -2717,13 +2731,21 @@ impl App {
                 frame.render_widget(t, cols[i]);
             }
             let show_close = self.terminals.len() > 1;
-            let (add_rect, close_rect) =
-                paint_terminal_pane_buttons(frame, area, show_close);
-            self.terminal_add_button = add_rect;
-            self.terminal_close_button = close_rect;
+            self.terminal_add_buttons.clear();
+            self.terminal_close_buttons.clear();
+            for col in cols.iter().take(self.terminals.len()) {
+                let (add_rect, close_rect) =
+                    paint_terminal_pane_buttons(frame, *col, show_close);
+                if let Some(r) = add_rect {
+                    self.terminal_add_buttons.push(r);
+                }
+                if let Some(r) = close_rect {
+                    self.terminal_close_buttons.push(r);
+                }
+            }
         } else {
-            self.terminal_add_button = None;
-            self.terminal_close_button = None;
+            self.terminal_add_buttons.clear();
+            self.terminal_close_buttons.clear();
         }
 
         let mut spans: Vec<Span> = Vec::with_capacity(20);
@@ -4443,29 +4465,34 @@ impl App {
                 // The "[+]" / "[-]" buttons sit on the same row as the
                 // editor/terminal splitter, so they have to win the
                 // hit-test before the splitter-drag handler claims this
-                // click.
-                if let Some(rect) = self.terminal_close_button {
-                    if rect_contains(rect, m.column, m.row) {
-                        if self.close_active_terminal() {
-                            self.status =
-                                format!("Closed terminal: {} remaining", self.terminals.len());
-                        }
-                        return;
+                // click. Each terminal pane has its own pair so the user
+                // can kill any pane, not only the active one.
+                if let Some(idx) = self
+                    .terminal_close_buttons
+                    .iter()
+                    .position(|r| rect_contains(*r, m.column, m.row))
+                {
+                    if self.close_terminal_at(idx) {
+                        self.status =
+                            format!("Closed terminal: {} remaining", self.terminals.len());
                     }
+                    return;
                 }
-                if let Some(rect) = self.terminal_add_button {
-                    if rect_contains(rect, m.column, m.row) {
-                        match self.split_terminal() {
-                            Ok(()) => {
-                                self.status =
-                                    format!("Split terminal: {} active", self.terminals.len());
-                            }
-                            Err(e) => {
-                                self.status = format!("Split terminal failed: {e}");
-                            }
+                if self
+                    .terminal_add_buttons
+                    .iter()
+                    .any(|r| rect_contains(*r, m.column, m.row))
+                {
+                    match self.split_terminal() {
+                        Ok(()) => {
+                            self.status =
+                                format!("Split terminal: {} active", self.terminals.len());
                         }
-                        return;
+                        Err(e) => {
+                            self.status = format!("Split terminal failed: {e}");
+                        }
                     }
+                    return;
                 }
                 if let Some(y) = self.terminal_splitter_y {
                     // Two-row hit-zone: the terminal's top border (`y`) and
@@ -9700,7 +9727,7 @@ mod tests {
     fn clicking_terminal_add_button_splits() {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-        app.terminal_add_button = Some(Rect { x: 50, y: 30, width: 3, height: 1 });
+        app.terminal_add_buttons = vec![Rect { x: 50, y: 30, width: 3, height: 1 }];
         app.handle_mouse(crossterm::event::MouseEvent {
             kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
             column: 51,
@@ -9717,7 +9744,11 @@ mod tests {
         let mut app = App::new(tmp.path().to_path_buf()).unwrap();
         app.split_terminal().unwrap();
         assert_eq!(app.terminals.len(), 2);
-        app.terminal_close_button = Some(Rect { x: 50, y: 30, width: 3, height: 1 });
+        assert_eq!(app.active_terminal, 1);
+        app.terminal_close_buttons = vec![
+            Rect { x: 10, y: 30, width: 3, height: 1 },
+            Rect { x: 50, y: 30, width: 3, height: 1 },
+        ];
         app.handle_mouse(crossterm::event::MouseEvent {
             kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
             column: 51,
@@ -9725,6 +9756,76 @@ mod tests {
             modifiers: KeyModifiers::NONE,
         });
         assert_eq!(app.terminals.len(), 1);
+    }
+
+    #[test]
+    fn clicking_close_button_on_non_active_terminal_drops_that_specific_terminal() {
+        // The user has three terminals open with the rightmost (idx 2) active;
+        // clicking the [-] on the leftmost terminal must close idx 0, not the
+        // active one. Regression for "I would like to kill any of them, not
+        // only the right one."
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.split_terminal().unwrap();
+        app.split_terminal().unwrap();
+        assert_eq!(app.terminals.len(), 3);
+        assert_eq!(app.active_terminal, 2);
+        let pid_left = app.terminals[0].pid();
+        let pid_right = app.terminals[2].pid();
+        app.terminal_close_buttons = vec![
+            Rect { x: 10, y: 30, width: 3, height: 1 },
+            Rect { x: 30, y: 30, width: 3, height: 1 },
+            Rect { x: 50, y: 30, width: 3, height: 1 },
+        ];
+        app.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: 11,
+            row: 30,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.terminals.len(), 2);
+        assert!(
+            app.terminals.iter().all(|t| t.pid() != pid_left),
+            "the leftmost terminal (the one whose [-] was clicked) must be gone"
+        );
+        assert_eq!(
+            app.terminals[1].pid(),
+            pid_right,
+            "the formerly-rightmost terminal must remain"
+        );
+        assert_eq!(
+            app.active_terminal, 1,
+            "active terminal index must shift down so the same terminal stays active"
+        );
+    }
+
+    #[test]
+    fn each_terminal_paints_its_own_add_close_buttons_when_multiple_open() {
+        // Per-pane chrome: with N terminals visible there should be N [+] hit
+        // rects (one per pane) and, when N > 1, N [-] hit rects so the user
+        // can kill any one of them.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.split_terminal().unwrap();
+        app.split_terminal().unwrap();
+        assert_eq!(app.terminals.len(), 3);
+        let backend = ratatui::backend::TestBackend::new(180, 40);
+        let mut term = ratatui::Terminal::new(backend).unwrap();
+        term.draw(|f| app.render(f)).unwrap();
+        assert_eq!(
+            app.terminal_add_buttons.len(),
+            3,
+            "each terminal pane must record its own [+] hit rect"
+        );
+        assert_eq!(
+            app.terminal_close_buttons.len(),
+            3,
+            "each terminal pane must record its own [-] hit rect when more than one is open"
+        );
+        // Distinct columns: the buttons must sit on different panes.
+        let xs: std::collections::HashSet<u16> =
+            app.terminal_add_buttons.iter().map(|r| r.x).collect();
+        assert_eq!(xs.len(), 3, "add-button rects must be on three distinct columns");
     }
 
     #[test]
@@ -9750,7 +9851,7 @@ mod tests {
         let mut app = App::new(tmp.path().to_path_buf()).unwrap();
         // Splitter and button share the row, as they do in real layout.
         app.terminal_splitter_y = Some(30);
-        app.terminal_add_button = Some(Rect { x: 50, y: 30, width: 3, height: 1 });
+        app.terminal_add_buttons = vec![Rect { x: 50, y: 30, width: 3, height: 1 }];
         app.handle_mouse(crossterm::event::MouseEvent {
             kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
             column: 51,
