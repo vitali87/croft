@@ -29,130 +29,6 @@ pub const WELCOME_LOGO_PNG: &[u8] =
 pub const NO_REPO_HERO_PNG: &[u8] =
     include_bytes!("../assets/icons/no_repo_src.png");
 
-/// Bake the canonical Source Control icon (Codicon `source-control`,
-/// U+EB14) into a 192x192 RGBA PNG matching the other activity-bar source
-/// PNGs. Drawing it programmatically avoids shipping a separate asset file
-/// and guarantees the shape doesn't drift under SVG rasterizer differences.
-///
-/// Geometry follows the codicon SVG: a left-side trunk with rings at top
-/// and bottom, plus a third ring at the upper-right reached by a smooth
-/// curve sprouting from the trunk's midpoint. The curve (not a 90-degree
-/// elbow) is what gives the glyph its Y-fork silhouette; without it the
-/// shape reads as an inverted T.
-pub fn bake_source_control_src_png() -> Vec<u8> {
-    let canvas_size: u32 = 192;
-    let mut img: RgbaImage =
-        ImageBuffer::from_pixel(canvas_size, canvas_size, Rgba([0, 0, 0, 0]));
-    let white = Rgba([0xff, 0xff, 0xff, 0xff]);
-
-    let trunk_x: i32 = 56;
-    let top_y: i32 = 40;
-    let bot_y: i32 = 152;
-    let branch_x: i32 = 148;
-    let branch_y: i32 = 60;
-    let r: i32 = 22;
-    let stroke: i32 = 12;
-
-    // Vertical trunk between the two trunk rings.
-    fill_rect(
-        &mut img,
-        trunk_x - stroke / 2,
-        top_y,
-        stroke,
-        bot_y - top_y,
-        white,
-    );
-    // Branch sprouts from the midpoint of the trunk and curves up-and-right
-    // to the side ring. Quadratic Bezier with the control point at the
-    // (branch_x, trunk_mid) corner makes the stroke leave the trunk
-    // horizontally and arrive at the side ring vertically — same
-    // tangents the codicon SVG draws.
-    let trunk_mid_y = (top_y + bot_y) / 2;
-    draw_quadratic_bezier(
-        &mut img,
-        (trunk_x, trunk_mid_y),
-        (branch_x, trunk_mid_y),
-        (branch_x, branch_y),
-        stroke,
-        white,
-    );
-
-    // Three outlined rings, knocked out at the centre so they don't read as
-    // solid dots.
-    fill_circle(&mut img, trunk_x, top_y, r, white);
-    fill_circle(&mut img, trunk_x, bot_y, r, white);
-    fill_circle(&mut img, branch_x, branch_y, r, white);
-    let inner_hole = Rgba([0, 0, 0, 0]);
-    let inner_r = r - stroke / 2 - 1;
-    fill_circle(&mut img, trunk_x, top_y, inner_r, inner_hole);
-    fill_circle(&mut img, trunk_x, bot_y, inner_r, inner_hole);
-    fill_circle(&mut img, branch_x, branch_y, inner_r, inner_hole);
-
-    let mut out = Vec::with_capacity(8192);
-    image::DynamicImage::ImageRgba8(img)
-        .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
-        .expect("encoding a 192x192 RGBA buffer to PNG cannot fail");
-    out
-}
-
-/// Stroke a quadratic Bezier with a round pen of diameter `thickness`.
-fn draw_quadratic_bezier(
-    img: &mut RgbaImage,
-    p0: (i32, i32),
-    pc: (i32, i32),
-    p1: (i32, i32),
-    thickness: i32,
-    color: Rgba<u8>,
-) {
-    let steps = 96;
-    let r = thickness / 2;
-    for i in 0..=steps {
-        let t = i as f32 / steps as f32;
-        let omt = 1.0 - t;
-        let x = (omt * omt * p0.0 as f32
-            + 2.0 * omt * t * pc.0 as f32
-            + t * t * p1.0 as f32) as i32;
-        let y = (omt * omt * p0.1 as f32
-            + 2.0 * omt * t * pc.1 as f32
-            + t * t * p1.1 as f32) as i32;
-        fill_circle(img, x, y, r, color);
-    }
-}
-
-fn fill_rect(img: &mut RgbaImage, x: i32, y: i32, w: i32, h: i32, color: Rgba<u8>) {
-    let (cw, ch) = (img.width() as i32, img.height() as i32);
-    let x0 = x.max(0);
-    let y0 = y.max(0);
-    let x1 = (x + w).min(cw);
-    let y1 = (y + h).min(ch);
-    for yy in y0..y1 {
-        for xx in x0..x1 {
-            img.put_pixel(xx as u32, yy as u32, color);
-        }
-    }
-}
-
-fn fill_circle(img: &mut RgbaImage, cx: i32, cy: i32, r: i32, color: Rgba<u8>) {
-    if r <= 0 {
-        return;
-    }
-    let (cw, ch) = (img.width() as i32, img.height() as i32);
-    let r2 = r * r;
-    let x0 = (cx - r).max(0);
-    let y0 = (cy - r).max(0);
-    let x1 = (cx + r + 1).min(cw);
-    let y1 = (cy + r + 1).min(ch);
-    for yy in y0..y1 {
-        let dy = yy - cy;
-        for xx in x0..x1 {
-            let dx = xx - cx;
-            if dx * dx + dy * dy <= r2 {
-                img.put_pixel(xx as u32, yy as u32, color);
-            }
-        }
-    }
-}
-
 const ACTIVE_PILL: Rgba<u8> = Rgba([0x4e, 0x9a, 0xff, 0xff]);
 const ACTIVE_TINT: Rgba<u8> = Rgba([0xff, 0xff, 0xff, 0xff]);
 const INACTIVE_TINT: Rgba<u8> = Rgba([0x9d, 0xa5, 0xb4, 0xff]);
@@ -176,23 +52,36 @@ pub fn compose_icon(
         image::ImageFormat::Png,
     )?
     .to_rgba8();
-    let icon_size = (canvas_w.min(canvas_h).saturating_sub(4) * 9 / 10).max(8);
-    let scaled =
-        image::imageops::resize(&codicon, icon_size, icon_size, image::imageops::FilterType::Lanczos3);
+    let target_max = (canvas_w.min(canvas_h).saturating_sub(4) * 9 / 10).max(8);
+    let (src_w, src_h) = (codicon.width().max(1), codicon.height().max(1));
+    let (icon_w, icon_h) = if src_w <= src_h {
+        let scaled_h = ((target_max * src_h) / src_w).max(1);
+        let capped_h = scaled_h.min(canvas_h.saturating_sub(2).max(1));
+        let final_w = ((capped_h * src_w) / src_h).max(1);
+        (final_w, capped_h)
+    } else {
+        let scaled_w = ((target_max * src_w) / src_h).max(1);
+        let capped_w = scaled_w.min(canvas_w.saturating_sub(2).max(1));
+        let final_h = ((capped_w * src_h) / src_w).max(1);
+        (capped_w, final_h)
+    };
+    let scaled = image::imageops::resize(
+        &codicon,
+        icon_w,
+        icon_h,
+        image::imageops::FilterType::Lanczos3,
+    );
     let tint = if is_active { ACTIVE_TINT } else { INACTIVE_TINT };
     let tinted = tint_rgba(&scaled, tint);
     let mut canvas: RgbaImage =
         ImageBuffer::from_pixel(canvas_w, canvas_h, bg);
-    let off_x = ((canvas_w - icon_size) / 2) as i64;
-    let off_y: u32 = 1;
-    image::imageops::overlay(&mut canvas, &tinted, off_x, off_y as i64);
+    let off_x = ((canvas_w.saturating_sub(icon_w)) / 2) as i64;
+    let off_y = ((canvas_h.saturating_sub(icon_h)) / 2) as i64;
+    image::imageops::overlay(&mut canvas, &tinted, off_x, off_y);
     if is_active {
         let pill_w: u32 = if canvas_w >= 8 { 2 } else { 1 };
-        // Pill height = the codicon's vertical extent so the pill visually
-        // brackets the icon and doesn't drift to the empty bottom-canvas
-        // bg the way a centered pill would.
-        let pill_y_start = off_y;
-        let pill_y_end = (off_y + icon_size).min(canvas_h);
+        let pill_y_start = off_y.max(0) as u32;
+        let pill_y_end = (pill_y_start + icon_h).min(canvas_h);
         for y in pill_y_start..pill_y_end {
             for x in 0..pill_w {
                 canvas.put_pixel(x, y, ACTIVE_PILL);
@@ -439,57 +328,47 @@ mod tests {
     }
 
     #[test]
-    fn bake_source_control_src_png_is_192x192_with_visible_strokes() {
-        let bytes = bake_source_control_src_png();
-        let decoded = image::load_from_memory_with_format(&bytes, image::ImageFormat::Png)
-            .expect("baked source-control icon must decode")
+    fn source_control_activity_bar_icon_is_the_no_repo_hero_png() {
+        let baked = NO_REPO_HERO_PNG;
+        let decoded = image::load_from_memory_with_format(baked, image::ImageFormat::Png)
+            .expect("the shipped source-control PNG must decode")
             .to_rgba8();
-        assert_eq!(decoded.width(), 192);
-        assert_eq!(decoded.height(), 192);
-        // Centroid of the trunk: should hit a fully opaque white stroke.
-        let trunk_pixel = decoded.get_pixel(56, 96).0;
-        assert_eq!(
-            trunk_pixel[3], 0xff,
-            "trunk midpoint must be drawn (alpha 255)"
-        );
-        // Branch ring (upper-right) must be drawn — guards against the
-        // curve drifting off-canvas under future tweaks.
-        let branch_ring = decoded.get_pixel(148, 60).0;
+        let (w, h) = (decoded.width(), decoded.height());
         assert!(
-            branch_ring[3] == 0x00 || branch_ring[3] == 0xff,
-            "branch ring center is either the knocked-out hole or filled stroke"
+            h > w,
+            "the asset the user supplied is a portrait Y-fork; if the file gets swapped for a square one the activity-bar render will read squashed"
         );
-        // The ring's stroke (one pen-radius outside the centre) must hit
-        // an opaque pixel.
-        let ring_edge = decoded.get_pixel(148 + 22, 60).0;
-        assert_eq!(
-            ring_edge[3], 0xff,
-            "branch ring edge at (170, 60) must be drawn"
-        );
-        // Corner: should still be transparent so compose_icon's bg fills it.
         let corner = decoded.get_pixel(0, 0).0;
-        assert_eq!(corner[3], 0x00, "outside the icon must stay transparent");
+        assert_eq!(
+            corner[3], 0x00,
+            "the asset must have a transparent background so compose_icon's bg fill stays clean"
+        );
     }
 
     #[test]
-    fn baked_source_control_curve_leaves_trunk_midpoint_with_higher_branch_endpoint() {
-        // Regression on "inverted T": the branch must terminate ABOVE the
-        // trunk's midpoint, otherwise the silhouette reads as a T not a Y.
-        let bytes = bake_source_control_src_png();
-        let decoded = image::load_from_memory_with_format(&bytes, image::ImageFormat::Png)
+    fn compose_icon_preserves_source_aspect_ratio_for_a_portrait_png() {
+        let bg = Rgba([0x1e, 0x22, 0x2e, 0xff]);
+        let baked = compose_icon(NO_REPO_HERO_PNG, 32, 16, false, bg)
+            .expect("compose_icon must accept the portrait source-control PNG");
+        let decoded = image::load_from_memory_with_format(&baked, image::ImageFormat::Png)
             .unwrap()
             .to_rgba8();
-        let branch_y = 60u32;
-        let trunk_mid_y = ((40 + 152) / 2) as u32;
-        assert!(
-            branch_y < trunk_mid_y,
-            "branch ring at y={branch_y} must sit higher than the trunk midpoint at y={trunk_mid_y}"
-        );
-        // Pixel just inside the branch ring's stroke at its top edge.
-        let top_of_branch_ring = decoded.get_pixel(148, branch_y - 22).0;
         assert_eq!(
-            top_of_branch_ring[3], 0xff,
-            "branch ring's top edge must be drawn",
+            (decoded.width(), decoded.height()),
+            (32, 16),
+            "canvas dimensions must match the requested size regardless of source aspect"
+        );
+        let left_corner = decoded.get_pixel(0, 0).0;
+        let right_corner = decoded.get_pixel(31, 0).0;
+        assert_eq!(
+            left_corner,
+            [bg[0], bg[1], bg[2], bg[3]],
+            "a portrait source must leave bar-bg fill on the left of the icon (no squash to fill the square)"
+        );
+        assert_eq!(
+            right_corner,
+            [bg[0], bg[1], bg[2], bg[3]],
+            "and on the right too"
         );
     }
 
@@ -537,15 +416,37 @@ mod tests {
     }
 
     #[test]
-    fn baked_source_control_icon_composes_through_icon_pipeline() {
-        let src = bake_source_control_src_png();
+    fn portrait_icon_paints_at_least_as_tall_as_a_square_icon_in_the_same_cell() {
+        // Activity-bar cells are roughly square (4 cells × 2 cells, with cell
+        // pixel ratio ≈ 1:2). Under the old fit-inside-target_max math a 2:3
+        // portrait source painted only target_max × (target_max·2/3), so the
+        // glyph looked visibly smaller than the square sibling icons. Allow
+        // the portrait icon to extend beyond the inner target square (still
+        // capped at the canvas itself) so its painted height matches the
+        // square baseline.
         let bg = Rgba([0x1e, 0x22, 0x2e, 0xff]);
-        let baked =
-            compose_icon(&src, 32, 16, false, bg).expect("compose_icon must accept the baked PNG");
+        let canvas_w = 40u32;
+        let canvas_h = 40u32;
+        let baked = compose_icon(NO_REPO_HERO_PNG, canvas_w, canvas_h, false, bg)
+            .expect("portrait source must compose into the activity-bar cell");
         let decoded = image::load_from_memory_with_format(&baked, image::ImageFormat::Png)
             .unwrap()
             .to_rgba8();
-        assert_eq!((decoded.width(), decoded.height()), (32, 16));
+        let opaque_rows: u32 = (0..canvas_h)
+            .filter(|&y| {
+                (0..canvas_w).any(|x| {
+                    let p = decoded.get_pixel(x, y).0;
+                    [p[0], p[1], p[2], p[3]] != [bg[0], bg[1], bg[2], bg[3]]
+                })
+            })
+            .count() as u32;
+        let target_max = (canvas_w.min(canvas_h).saturating_sub(4) * 9 / 10).max(8);
+        let alpha_edge_slack = 2;
+        assert!(
+            opaque_rows + alpha_edge_slack >= target_max,
+            "portrait icon painted {} rows in a {}x{} cell; expected close to target_max ({}) (within {} rows of slack for the Lanczos alpha edges) so it visually matches the square sibling icons",
+            opaque_rows, canvas_w, canvas_h, target_max, alpha_edge_slack
+        );
     }
 
     #[test]

@@ -1274,9 +1274,10 @@ impl App {
         let explorer_inactive = encode(crate::iterm2_inline::EXPLORER_SRC_PNG, false);
         let search_active = encode(crate::iterm2_inline::SEARCH_SRC_PNG, true);
         let search_inactive = encode(crate::iterm2_inline::SEARCH_SRC_PNG, false);
-        let source_control_png = crate::iterm2_inline::bake_source_control_src_png();
-        let source_control_active = encode(&source_control_png, true);
-        let source_control_inactive = encode(&source_control_png, false);
+        let source_control_active =
+            encode(crate::iterm2_inline::NO_REPO_HERO_PNG, true);
+        let source_control_inactive =
+            encode(crate::iterm2_inline::NO_REPO_HERO_PNG, false);
         let remote_active = encode(crate::iterm2_inline::REMOTE_SRC_PNG, true);
         let remote_inactive = encode(crate::iterm2_inline::REMOTE_SRC_PNG, false);
         let run_debug_active = encode(crate::iterm2_inline::RUN_DEBUG_SRC_PNG, true);
