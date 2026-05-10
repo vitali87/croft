@@ -10716,8 +10716,13 @@ fn main_loop(
             {
                 terminal.clear()?;
                 // Activity-bar icons live outside ratatui too; re-emit
-                // them on the next post-draw flush.
+                // them on the next post-draw flush. The welcome wordmark
+                // and the source-control hero also live in iTerm's image
+                // cache that just got wiped - re-arm them so the next
+                // render re-emits whichever one is currently visible.
                 app.activity_overlay_dirty = true;
+                app.welcome_overlay_dirty = true;
+                app.no_repo_hero_overlay_dirty = true;
             }
             terminal.draw(|f| {
                 app.render(f);
@@ -10729,6 +10734,8 @@ fn main_loop(
             {
                 terminal.clear()?;
                 app.activity_overlay_dirty = true;
+                app.welcome_overlay_dirty = true;
+                app.no_repo_hero_overlay_dirty = true;
                 terminal.draw(|f| {
                     app.render(f);
                 })?;
