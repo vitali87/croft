@@ -77,6 +77,27 @@ pub struct PtyTerminal {
 
 impl PtyTerminal {
     pub fn new(cwd: &std::path::Path) -> Result<Self> {
+        let shell =
+            std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
+        let mut cmd = CommandBuilder::new(&shell);
+        cmd.cwd(cwd);
+        Self::spawn_with(cmd)
+    }
+
+    pub fn new_running(
+        program: &str,
+        args: &[String],
+        cwd: &std::path::Path,
+    ) -> Result<Self> {
+        let mut cmd = CommandBuilder::new(program);
+        for a in args {
+            cmd.arg(a);
+        }
+        cmd.cwd(cwd);
+        Self::spawn_with(cmd)
+    }
+
+    fn spawn_with(mut cmd: CommandBuilder) -> Result<Self> {
         let pty_system = native_pty_system();
         let cols = 80u16;
         let rows = 24u16;
@@ -84,13 +105,9 @@ impl PtyTerminal {
             .openpty(PtySize { cols, rows, pixel_width: 0, pixel_height: 0 })
             .context("openpty")?;
 
-        let shell =
-            std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
-        let mut cmd = CommandBuilder::new(&shell);
-        cmd.cwd(cwd);
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
-        let child = pair.slave.spawn_command(cmd).context("spawn shell")?;
+        let child = pair.slave.spawn_command(cmd).context("spawn child")?;
         drop(pair.slave);
 
         let writer = pair.master.take_writer().context("take writer")?;
@@ -538,6 +555,26 @@ mod tests {
         let _ = term.take_dirty();
         term.write_input(b"echo hi\r");
         assert!(term.take_dirty(), "write_input must mark the terminal dirty");
+    }
+
+    #[test]
+    fn new_running_spawns_program_directly_and_produces_output() {
+        let tmp = tempfile::tempdir().unwrap();
+        let term = PtyTerminal::new_running(
+            "/bin/echo",
+            &[String::from("croft-direct-spawn")],
+            tmp.path(),
+        )
+        .unwrap();
+        let mut waited_ms = 0u32;
+        while waited_ms < 4000 && !term.peek_dirty() {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            waited_ms += 20;
+        }
+        assert!(
+            term.peek_dirty(),
+            "direct-spawned /bin/echo must produce output without any write_input"
+        );
     }
 
     #[test]

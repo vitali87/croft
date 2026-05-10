@@ -3231,18 +3231,19 @@ impl App {
             .and_then(|e| e.to_str())
             .unwrap_or("")
             .to_ascii_lowercase();
-        let quoted_file = shell_single_quote(&file.to_string_lossy());
+        let file_str = file.to_string_lossy().into_owned();
         let file_dir = file.parent().unwrap_or(Path::new(".")).to_path_buf();
         if matches!(ext.as_str(), "py" | "pyi" | "pyw") {
             if let Some((py, venv_dir)) = find_python_venv(&file_dir, workspace_root) {
-                let quoted_py = shell_single_quote(&py.to_string_lossy());
                 return Some(RunSpec {
-                    cmd: format!("{quoted_py} {quoted_file}\n"),
+                    program: py.to_string_lossy().into_owned(),
+                    args: vec![file_str],
                     cwd: venv_dir,
                 });
             }
             return Some(RunSpec {
-                cmd: format!("python3 {quoted_file}\n"),
+                program: String::from("python3"),
+                args: vec![file_str],
                 cwd: file_dir,
             });
         }
@@ -3259,7 +3260,8 @@ impl App {
             _ => return None,
         };
         Some(RunSpec {
-            cmd: format!("{runner} {quoted_file}\n"),
+            program: String::from(runner),
+            args: vec![file_str],
             cwd: file_dir,
         })
     }
@@ -3283,9 +3285,8 @@ impl App {
             self.run_debug.feedback_is_error = true;
             return;
         };
-        match PtyTerminal::new(&spec.cwd) {
-            Ok(mut term) => {
-                term.write_input(spec.cmd.as_bytes());
+        match PtyTerminal::new_running(&spec.program, &spec.args, &spec.cwd) {
+            Ok(term) => {
                 self.terminals.push(term);
                 self.active_terminal = self.terminals.len() - 1;
                 if !self.show_terminal {
@@ -6281,14 +6282,10 @@ fn rect_contains(r: Rect, x: u16, y: u16) -> bool {
         && y < r.y + r.height
 }
 
-/// What `App::run_active_file` needs to spawn one PTY: the literal command
-/// line to feed the shell (terminated with a newline so the shell executes
-/// it) and the directory the PTY should `chdir` to. Two fields instead of
-/// one tuple because each one has a load-bearing invariant — see the docs
-/// on `App::run_spec_for`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RunSpec {
-    pub cmd: String,
+    pub program: String,
+    pub args: Vec<String>,
     pub cwd: PathBuf,
 }
 
@@ -6322,22 +6319,6 @@ fn find_python_venv(start: &Path, workspace_root: &Path) -> Option<(PathBuf, Pat
             _ => return None,
         }
     }
-}
-
-/// POSIX-shell single-quote `s` so it round-trips through `bash -c` etc.
-/// Embedded `'` characters are closed, escaped via `'\''`, and reopened.
-fn shell_single_quote(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('\'');
-    for c in s.chars() {
-        if c == '\'' {
-            out.push_str("'\\''");
-        } else {
-            out.push(c);
-        }
-    }
-    out.push('\'');
-    out
 }
 
 const TERMINAL_ADD_LABEL: &str = " + ";
@@ -9857,8 +9838,8 @@ mod tests {
         let f = tmp.path().join("script.py");
         std::fs::write(&f, b"").unwrap();
         let spec = App::run_spec_for(&f, tmp.path()).unwrap();
-        assert!(spec.cmd.starts_with("python3 "), "got cmd: {}", spec.cmd);
-        assert!(spec.cmd.ends_with('\n'));
+        assert_eq!(spec.program, "python3");
+        assert_eq!(spec.args, vec![f.to_string_lossy().into_owned()]);
         assert_eq!(spec.cwd, tmp.path());
     }
 
@@ -9868,7 +9849,8 @@ mod tests {
         let f = tmp.path().join("server.js");
         std::fs::write(&f, b"").unwrap();
         let spec = App::run_spec_for(&f, tmp.path()).unwrap();
-        assert!(spec.cmd.starts_with("node "));
+        assert_eq!(spec.program, "node");
+        assert_eq!(spec.args, vec![f.to_string_lossy().into_owned()]);
     }
 
     #[test]
@@ -9877,7 +9859,8 @@ mod tests {
         let f = tmp.path().join("build.sh");
         std::fs::write(&f, b"").unwrap();
         let spec = App::run_spec_for(&f, tmp.path()).unwrap();
-        assert!(spec.cmd.starts_with("bash "));
+        assert_eq!(spec.program, "bash");
+        assert_eq!(spec.args, vec![f.to_string_lossy().into_owned()]);
     }
 
     #[test]
@@ -9889,15 +9872,15 @@ mod tests {
     }
 
     #[test]
-    fn run_spec_quotes_apostrophes_safely() {
+    fn run_spec_passes_apostrophe_paths_through_argv_unescaped() {
         let tmp = tempfile::tempdir().unwrap();
         let f = tmp.path().join("O'Reilly.py");
         std::fs::write(&f, b"").unwrap();
         let spec = App::run_spec_for(&f, tmp.path()).unwrap();
-        assert!(
-            spec.cmd.contains("O'\\''Reilly.py"),
-            "apostrophe must be POSIX-escaped via '\\'' in: {}",
-            spec.cmd
+        assert_eq!(
+            spec.args,
+            vec![f.to_string_lossy().into_owned()],
+            "argv carries the path verbatim — no shell quoting because no shell is invoked"
         );
     }
 
@@ -9931,12 +9914,13 @@ mod tests {
         let f = project.join("main.py");
         std::fs::write(&f, b"").unwrap();
         let spec = App::run_spec_for(&f, tmp.path()).unwrap();
-        assert!(
-            spec.cmd.contains(venv_python.to_string_lossy().as_ref()),
-            "venv interpreter must be invoked: {} (looked for {})",
-            spec.cmd,
+        assert_eq!(
+            spec.program,
+            venv_python.to_string_lossy().into_owned(),
+            "venv interpreter must be the spawned program (looked for {})",
             venv_python.display()
         );
+        assert_eq!(spec.args, vec![f.to_string_lossy().into_owned()]);
         assert_eq!(
             spec.cwd, project,
             "cwd must be the directory that owns the venv so relative imports / .env files resolve"
@@ -9953,7 +9937,11 @@ mod tests {
         let f = nested.join("main.py");
         std::fs::write(&f, b"").unwrap();
         let spec = App::run_spec_for(&f, tmp.path()).unwrap();
-        assert!(spec.cmd.contains(".venv/bin/python"));
+        assert!(
+            spec.program.ends_with(".venv/bin/python"),
+            "expected venv python program, got: {}",
+            spec.program
+        );
         assert_eq!(spec.cwd, project);
     }
 
@@ -9964,7 +9952,11 @@ mod tests {
         let f = tmp.path().join("main.py");
         std::fs::write(&f, b"").unwrap();
         let spec = App::run_spec_for(&f, tmp.path()).unwrap();
-        assert!(spec.cmd.contains("venv/bin/python"));
+        assert!(
+            spec.program.ends_with("venv/bin/python"),
+            "expected plain-venv python program, got: {}",
+            spec.program
+        );
     }
 
     #[test]
@@ -9977,10 +9969,10 @@ mod tests {
         let f = workspace.join("main.py");
         std::fs::write(&f, b"").unwrap();
         let spec = App::run_spec_for(&f, &workspace).unwrap();
-        assert!(
-            spec.cmd.starts_with("python3 "),
-            "must NOT use a venv that sits above the workspace root: {}",
-            spec.cmd
+        assert_eq!(
+            spec.program, "python3",
+            "must NOT use a venv that sits above the workspace root, got: {}",
+            spec.program
         );
     }
 
