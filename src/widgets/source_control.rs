@@ -271,7 +271,7 @@ impl SourceControlPanel {
         if card_h < 3 {
             return;
         }
-        let side_pad: u16 = if inner.width >= 20 { 2 } else { 1 };
+        let side_pad: u16 = if inner.width >= 24 { 2 } else { 1 };
         let card_x = inner.x + side_pad;
         let card_w = inner.width.saturating_sub(side_pad * 2);
         let card_area = Rect {
@@ -280,7 +280,10 @@ impl SourceControlPanel {
             width: card_w,
             height: card_h,
         };
-        let card_border = Style::default().fg(Color::Rgb(0x40, 0x48, 0x58));
+        // Card border: light-enough grey to read against the dark panel bg
+        // without competing with the focused-blue panel border. The earlier
+        // 0x40,0x48,0x58 rendered as effectively invisible.
+        let card_border = Style::default().fg(Color::Rgb(0x60, 0x68, 0x78));
         let card_block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
@@ -297,43 +300,44 @@ impl SourceControlPanel {
         let text_dim = Color::Rgb(0x9d, 0xa5, 0xb4);
         let blue_bg = Color::Rgb(BUTTON_BG_RGB.0, BUTTON_BG_RGB.1, BUTTON_BG_RGB.2);
 
-        // Layout from the top of the card. Each block knows its own height
-        // and bails out the first time the next block would overflow.
         let cx = card_inner.x + card_inner.width / 2;
         let mut y = card_inner.y + 1;
         let bottom = card_inner.y + card_inner.height;
 
-        // Decorative illustration: dashed-circle echo around a centred
-        // git-branch glyph (Codicon U+EAA1 source-control / branch).
-        if y + 5 <= bottom && card_inner.width >= 13 {
+        // Compact 3-row illustration: top arc of three dots, the source
+        // control branch glyph (Codicon U+EA68 - same one icons.rs pins as
+        // ACTIVITY_SOURCE_CONTROL) flanked by two side dots, bottom arc.
+        // Width is exactly 7 cells so it fits inside any card wider than
+        // the buttons. The earlier code used U+EAA1 - that's cod-arrow-up
+        // and rendered a literal up-arrow glyph instead of the branch.
+        if y + 3 <= bottom && card_inner.width >= 7 {
             let dot = Style::default().fg(dim_blue);
-            let glyph = Style::default()
-                .fg(blue)
-                .add_modifier(Modifier::BOLD);
-            // Top arc of dots.
-            buf.set_string(cx.saturating_sub(4), y, "·  ·  ·", dot);
-            // Side dots.
-            buf.set_string(cx.saturating_sub(6), y + 1, "·", dot);
-            buf.set_string(cx + 6, y + 1, "·", dot);
-            // Centred branch glyph.
-            buf.set_string(cx.saturating_sub(1), y + 2, "\u{eaa1}", glyph);
-            // Side dots, lower.
-            buf.set_string(cx.saturating_sub(6), y + 3, "·", dot);
-            buf.set_string(cx + 6, y + 3, "·", dot);
-            // Bottom arc of dots.
-            buf.set_string(cx.saturating_sub(4), y + 4, "·  ·  ·", dot);
-            y += 5 + 1;
+            let glyph = Style::default().fg(blue).add_modifier(Modifier::BOLD);
+            let arc = "· · ·";
+            let arc_w = arc.chars().count() as u16;
+            let arc_x = card_inner.x + (card_inner.width - arc_w) / 2;
+            buf.set_string(arc_x, y, arc, dot);
+            let middle_w: u16 = 7;
+            let mid_x = card_inner.x + (card_inner.width - middle_w) / 2;
+            buf.set_string(mid_x, y + 1, "·", dot);
+            buf.set_string(mid_x + 3, y + 1, "\u{ea68}", glyph);
+            buf.set_string(mid_x + 6, y + 1, "·", dot);
+            buf.set_string(arc_x, y + 2, arc, dot);
+            y += 3 + 1;
         }
 
-        // Title: "No repository detected".
+        // Title: "No repository detected", centered, bold white. Falls
+        // back to a centred truncation when the card is too narrow rather
+        // than skipping the title entirely.
         let title = "No repository detected";
-        if y + 1 <= bottom && (title.chars().count() as u16) <= card_inner.width {
-            let tx = card_inner.x
-                + (card_inner.width.saturating_sub(title.chars().count() as u16)) / 2;
+        if y + 1 <= bottom {
+            let lw = (title.chars().count() as u16).min(card_inner.width);
+            let visible: String = title.chars().take(lw as usize).collect();
+            let tx = card_inner.x + (card_inner.width.saturating_sub(lw)) / 2;
             buf.set_string(
                 tx,
                 y,
-                title,
+                &visible,
                 Style::default()
                     .fg(text_white)
                     .add_modifier(Modifier::BOLD),
@@ -341,55 +345,82 @@ impl SourceControlPanel {
             y += 2;
         }
 
-        // Description: two lines, centered, dim.
-        let desc1 = "Open a folder under Git or create a new";
-        let desc2 = "repository to start tracking changes.";
-        if y + 2 <= bottom {
-            for line in [desc1, desc2] {
-                let lw = line.chars().count() as u16;
-                if lw <= card_inner.width {
-                    let lx = card_inner.x + (card_inner.width.saturating_sub(lw)) / 2;
-                    buf.set_string(lx, y, line, Style::default().fg(text_dim));
-                }
-                y += 1;
+        // Description: dim, centered, two lines (truncated per-line to
+        // card width when needed).
+        for line in ["Open a folder under Git or create a new", "repository to start tracking changes."] {
+            if y >= bottom {
+                break;
             }
+            let lw = (line.chars().count() as u16).min(card_inner.width);
+            let visible: String = line.chars().take(lw as usize).collect();
+            let lx = card_inner.x + (card_inner.width.saturating_sub(lw)) / 2;
+            buf.set_string(lx, y, &visible, Style::default().fg(text_dim));
+            y += 1;
+        }
+        if y < bottom {
             y += 1;
         }
 
-        // Primary button: Initialize Repository.
+        // Buttons: centered, width grows to whatever fits the long label
+        // up to a max of 36, then shrinks the label if the panel is narrow.
         let max_btn_w: u16 = 36;
         let btn_w = card_inner
             .width
-            .saturating_sub(4)
+            .saturating_sub(2)
             .min(max_btn_w);
         let btn_x = card_inner.x + (card_inner.width.saturating_sub(btn_w)) / 2;
-        if y + 3 <= bottom && btn_w >= 12 {
+        let init_label: &str = if btn_w >= 23 {
+            "Initialize Repository"
+        } else if btn_w >= 12 {
+            "Initialize"
+        } else {
+            "Init"
+        };
+        if y + 3 <= bottom && btn_w >= 6 {
             let init_area = Rect { x: btn_x, y, width: btn_w, height: 3 };
             self.last_init_repo_button_area = init_area;
-            render_rounded_button(buf, init_area, "Initialize Repository", blue_bg, text_white);
+            render_rounded_button(buf, init_area, init_label, blue_bg, text_white);
             y += 3 + 1;
         }
 
-        // Secondary button: Open Folder (outlined blue).
-        if y + 3 <= bottom && btn_w >= 12 {
+        let open_label: &str = if btn_w >= 13 { "Open Folder" } else { "Open" };
+        if y + 3 <= bottom && btn_w >= 6 {
             let open_area = Rect { x: btn_x, y, width: btn_w, height: 3 };
             self.last_open_folder_button_area = open_area;
-            render_outlined_button(buf, open_area, "Open Folder", blue, blue);
+            render_outlined_button(buf, open_area, open_label, blue, blue);
             y += 3 + 1;
         }
 
-        // Help link: "(?) Learn more about Git ↗".
-        let help_text = "\u{ea15} Learn more about Git \u{eb15}";
+        // Help link: "? Learn more about Git ↗". Uses ASCII fallbacks so
+        // it renders correctly without the codicons font; the earlier
+        // U+EA15 / U+EB15 ids weren't the question/link-external icons
+        // anyway.
+        let help_text = "? Learn more about Git \u{2197}";
         let help_w = help_text.chars().count() as u16;
-        if y + 1 <= bottom && help_w <= card_inner.width {
-            let hx = card_inner.x + (card_inner.width.saturating_sub(help_w)) / 2;
-            self.last_help_link_area = Rect { x: hx, y, width: help_w, height: 1 };
-            buf.set_string(
-                hx,
-                y,
-                help_text,
-                Style::default().fg(blue).add_modifier(Modifier::BOLD),
-            );
+        if y < bottom {
+            if help_w <= card_inner.width {
+                let hx = card_inner.x + (card_inner.width.saturating_sub(help_w)) / 2;
+                self.last_help_link_area = Rect { x: hx, y, width: help_w, height: 1 };
+                buf.set_string(
+                    hx,
+                    y,
+                    help_text,
+                    Style::default().fg(blue).add_modifier(Modifier::BOLD),
+                );
+            } else {
+                // Narrow panel: drop the trailing arrow.
+                let short = "Learn more about Git";
+                let lw = (short.chars().count() as u16).min(card_inner.width);
+                let visible: String = short.chars().take(lw as usize).collect();
+                let hx = card_inner.x + (card_inner.width.saturating_sub(lw)) / 2;
+                self.last_help_link_area = Rect { x: hx, y, width: lw, height: 1 };
+                buf.set_string(
+                    hx,
+                    y,
+                    &visible,
+                    Style::default().fg(blue).add_modifier(Modifier::BOLD),
+                );
+            }
         }
     }
 }
@@ -500,16 +531,22 @@ pub fn render_rounded_button(
             .set_symbol("╯")
             .set_style(corner_style);
     }
-    let label_w = label.chars().count() as u16;
-    if label_w > area.width {
+    // Truncate the label rather than dropping it entirely when the button
+    // is narrower than `label.chars().count()`. The earlier silent-drop
+    // path produced a blank blue rectangle in narrow side panels — the
+    // user-visible "WTF is this" bug from the no-repo empty state.
+    let max_w = area.width as usize;
+    let visible_label: String = label.chars().take(max_w).collect();
+    if visible_label.is_empty() {
         return;
     }
+    let label_w = visible_label.chars().count() as u16;
     let label_x = area.x + (area.width - label_w) / 2;
     let label_y = area.y + area.height / 2;
     buf.set_string(
         label_x,
         label_y,
-        label,
+        &visible_label,
         Style::default().fg(fg).bg(bg).add_modifier(Modifier::BOLD),
     );
 }
@@ -1138,6 +1175,55 @@ mod tests {
         assert!(
             p.last_help_link_area.width > 0 && p.last_help_link_area.height > 0,
             "Learn more link rect must be tracked"
+        );
+    }
+
+    #[test]
+    fn empty_state_init_button_paints_a_visible_label_at_narrow_widths() {
+        // Regression for "WTF is this": a narrow side panel produced a
+        // blank blue rectangle because render_rounded_button used to
+        // silently drop the label when label.chars().count() > area.width.
+        // The button must always carry SOME visible label.
+        use crate::git::GitStatus;
+        let mut p = SourceControlPanel::new();
+        p.status = GitStatus::default();
+        let area = Rect { x: 0, y: 0, width: 30, height: 30 };
+        let mut buf = Buffer::empty(area);
+        (&mut p).render(area, &mut buf);
+        let btn = p.last_init_repo_button_area;
+        assert!(btn.width > 0 && btn.height > 0, "init-repo button must be tracked");
+        let label_y = btn.y + btn.height / 2;
+        let mut row = String::new();
+        for x in btn.x..btn.x + btn.width {
+            row.push_str(buf[(x, label_y)].symbol());
+        }
+        let trimmed = row.trim();
+        assert!(
+            !trimmed.is_empty() && trimmed.chars().any(|c| c.is_alphabetic()),
+            "init-repo button row must carry a visible label, got {row:?}"
+        );
+    }
+
+    #[test]
+    fn empty_state_uses_source_control_codicon_not_arrow_up() {
+        // Regression: the illustration used U+EAA1 (cod-arrow-up) which
+        // rendered a literal up-arrow glyph. The right codepoint for the
+        // Y-fork branch glyph is U+EA68, the same one the panel's branch
+        // row uses.
+        use crate::git::GitStatus;
+        let mut p = SourceControlPanel::new();
+        p.status = GitStatus::default();
+        let area = Rect { x: 0, y: 0, width: 60, height: 30 };
+        let mut buf = Buffer::empty(area);
+        (&mut p).render(area, &mut buf);
+        let dump = buffer_to_string(&buf);
+        assert!(
+            dump.contains('\u{ea68}'),
+            "empty-state illustration must carry the cod-source-control branch glyph U+EA68"
+        );
+        assert!(
+            !dump.contains('\u{eaa1}'),
+            "empty-state must NOT carry U+EAA1 (cod-arrow-up); that was the broken glyph"
         );
     }
 
