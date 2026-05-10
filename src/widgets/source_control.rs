@@ -30,6 +30,12 @@ pub struct SourceControlPanel {
     /// Empty when the panel is in a git repo or when the panel is too
     /// small to draw the empty-state card.
     pub last_init_repo_button_area: Rect,
+    /// Cell rect reserved for the no-repo empty-state hero illustration.
+    /// `App` paints an OSC-1337 inline PNG here on iTerm2-class terminals;
+    /// the widget paints an ASCII Y-fork as fallback so the same rect
+    /// reads as a logo on plain terminals too. Empty when the panel is
+    /// in a git repo or the empty-state card is too small to allocate.
+    pub last_hero_area: Rect,
     pub scroll: usize,
     /// Index into `entries` of the currently-selected change, if any.
     /// Drives the row-highlight bg so the user can tell at a glance
@@ -56,6 +62,7 @@ impl SourceControlPanel {
             last_list_area: Rect::default(),
             last_scrollbar: Rect::default(),
             last_init_repo_button_area: Rect::default(),
+            last_hero_area: Rect::default(),
             scroll: 0,
             selected_change: None,
             commit_feedback: None,
@@ -286,16 +293,33 @@ impl SourceControlPanel {
         let mut y = card_inner.y + 2;
         let bottom = card_inner.y + card_inner.height;
 
-        // Illustration: classic Git Y-fork - three nodes connected by a
-        // trunk and a single branch. The iconic source-control silhouette,
-        // no file outline, no decorative + sigils. Surrounded by a
-        // restrained dashed ring of dots when the card is wide enough.
-        if card_inner.width >= 13 && y + 7 <= bottom {
-            paint_y_fork_illustration(buf, card_inner, y, dim_blue, blue);
-            y += 7 + 2;
-        } else if card_inner.width >= 5 && y + 5 <= bottom {
-            paint_y_fork_compact(buf, card_inner, y, blue);
-            y += 5 + 2;
+        // Illustration: reserve a centred block for the OSC-1337 hero
+        // image (App paints the PNG over these cells on iTerm2-class
+        // terminals). Paint the ASCII Y-fork as a fallback inside the
+        // same rect so non-iTerm2 terminals still see a logo.
+        let hero_h: u16 = if card_inner.height >= 18 {
+            8
+        } else if card_inner.height >= 14 {
+            7
+        } else {
+            5
+        };
+        let hero_w: u16 = (hero_h * 2).min(card_inner.width).max(7);
+        let hero_x = card_inner.x + (card_inner.width.saturating_sub(hero_w)) / 2;
+        if y + hero_h <= bottom {
+            self.last_hero_area = Rect {
+                x: hero_x,
+                y,
+                width: hero_w,
+                height: hero_h,
+            };
+            // Fallback ASCII art inside the reserved rect for non-iTerm2.
+            if card_inner.width >= 13 && hero_h >= 7 {
+                paint_y_fork_illustration(buf, card_inner, y, dim_blue, blue);
+            } else {
+                paint_y_fork_compact(buf, card_inner, y, blue);
+            }
+            y += hero_h + 1;
         }
 
         // Title and description go through ratatui's `Paragraph` with
@@ -595,9 +619,12 @@ impl Widget for &mut SourceControlPanel {
         // design the user supplied.
         if !self.status.in_repo {
             self.last_init_repo_button_area = Rect::default();
+            self.last_hero_area = Rect::default();
             self.render_no_repo_empty_state(inner, buf);
             return;
         }
+        // Repo path: hero is only for the empty state.
+        self.last_hero_area = Rect::default();
 
         // Row 2: branch row — a green branch glyph plus the branch name.
         let mut y = inner.y + 2;

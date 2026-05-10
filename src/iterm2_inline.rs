@@ -21,6 +21,13 @@ pub const RUN_DEBUG_SRC_PNG: &[u8] =
     include_bytes!("../assets/icons/run_debug_src.png");
 pub const WELCOME_LOGO_PNG: &[u8] =
     include_bytes!("../assets/logo-tight-removebg-preview.png");
+/// Hero illustration shown in the Source Control sidebar when the
+/// workspace isn't a git repo: a stylised file silhouette with the Git
+/// Y-fork (three blue rings + curved branch) and a dashed circle, framed
+/// by decorative `+` and dot motifs. Bundled as a raster so it renders
+/// identically across terminals that support OSC-1337 inline images.
+pub const NO_REPO_HERO_PNG: &[u8] =
+    include_bytes!("../assets/icons/no_repo_src.png");
 
 /// Bake the canonical Source Control icon (Codicon `source-control`,
 /// U+EB14) into a 192x192 RGBA PNG matching the other activity-bar source

@@ -577,6 +577,12 @@ pub struct App {
     /// pane is still visible. This is needed when async recents or a resize
     /// move the logo; otherwise iTerm keeps the old image cached too.
     welcome_image_clear_requested: bool,
+    /// OSC-1337 escape carrying the no-repo hero PNG (the file-with-git-tree
+    /// illustration). Re-baked when the hero rect's cell size changes.
+    no_repo_hero_image: Option<String>,
+    no_repo_hero_layout: Option<WelcomeLayout>,
+    no_repo_hero_overlay_dirty: bool,
+    no_repo_hero_displayed: bool,
     /// Pixel size of one terminal cell, captured in `init_graphics`.
     /// Required to bake OSC-1337 images at exact viewport pixel size so
     /// iTerm draws them with no stretching or letterboxing.
@@ -1108,6 +1114,10 @@ impl App {
             welcome_overlay_dirty: true,
             welcome_image_displayed: false,
             welcome_image_clear_requested: false,
+            no_repo_hero_image: None,
+            no_repo_hero_layout: None,
+            no_repo_hero_overlay_dirty: true,
+            no_repo_hero_displayed: false,
             cell_pixel: None,
             clipboard_reader: read_system_clipboard,
             fs_poll_last_check: std::time::Instant::now(),
@@ -1326,6 +1336,84 @@ impl App {
         }
         let _ = out.flush();
         self.run_debug_icon_last_emitted = Some((cx, cy));
+    }
+
+    /// Re-bake (when needed) and re-emit the OSC-1337 inline image for
+    /// the no-repo source-control hero. Pure no-op when the sidebar isn't
+    /// on Source Control, the workspace IS a git repo, or the host
+    /// terminal can't render inline images. Called from the post-draw
+    /// flush each frame so iTerm2 keeps the image painted even after
+    /// surrounding cells redraw.
+    pub fn flush_no_repo_hero_overlay(&mut self) {
+        use std::io::Write;
+        let panel_visible = self.show_tree
+            && self.sidebar_view == SidebarView::SourceControl
+            && !self.source_control.status.in_repo;
+        if !panel_visible {
+            if self.no_repo_hero_displayed {
+                self.no_repo_hero_displayed = false;
+                self.no_repo_hero_overlay_dirty = true;
+            }
+            return;
+        }
+        let hero = self.source_control.last_hero_area;
+        if hero.width == 0 || hero.height == 0 {
+            return;
+        }
+        let Some((cw, ch)) = self.cell_pixel else {
+            return;
+        };
+        let desired = WelcomeLayout {
+            cell_x: hero.x,
+            cell_y: hero.y,
+            cell_w: hero.width,
+            cell_h: hero.height,
+        };
+        if self.no_repo_hero_layout != Some(desired) || self.no_repo_hero_image.is_none() {
+            let canvas_w = (hero.width as u32) * cw;
+            let canvas_h = (hero.height as u32) * ch;
+            let bg = image::Rgba([
+                EDITOR_BG_RGB.0,
+                EDITOR_BG_RGB.1,
+                EDITOR_BG_RGB.2,
+                0xff,
+            ]);
+            if let Ok(baked) = crate::iterm2_inline::fit_image(
+                crate::iterm2_inline::NO_REPO_HERO_PNG,
+                canvas_w,
+                canvas_h,
+                bg,
+            ) {
+                let raw = crate::iterm2_inline::build_inline_image_osc(
+                    &baked,
+                    hero.width,
+                    hero.height,
+                    false,
+                );
+                let osc = if crate::iterm2_inline::detect_tmux() {
+                    crate::iterm2_inline::tmux_passthrough_wrap(&raw)
+                } else {
+                    raw
+                };
+                self.no_repo_hero_image = Some(osc);
+                self.no_repo_hero_layout = Some(desired);
+            }
+        }
+        let Some(osc) = self.no_repo_hero_image.as_deref() else {
+            return;
+        };
+        let mut out = stdout();
+        let cursor_on = self.cursor_should_be_visible();
+        let _ = write!(out, "\x1b[?25l\x1b[s");
+        let _ = write!(out, "\x1b[{};{}H", hero.y + 1, hero.x + 1);
+        let _ = out.write_all(osc.as_bytes());
+        let _ = write!(out, "\x1b[u");
+        if cursor_on {
+            let _ = write!(out, "\x1b[?25h");
+        }
+        let _ = out.flush();
+        self.no_repo_hero_displayed = true;
+        self.no_repo_hero_overlay_dirty = false;
     }
 
     /// One-shot consumer for the "leaving Run-Debug after the icon was
@@ -10680,6 +10768,7 @@ fn main_loop(
             // already armed `terminal.clear()`, evicting the cached
             // image cells before the next sidebar paints.
             app.flush_run_debug_icon_overlay();
+            app.flush_no_repo_hero_overlay();
             // Welcome-screen logo: same OSC-1337 trick, gated by its own
             // dirty flag and only emitted while the editor pane is in its
             // blank initial state.
