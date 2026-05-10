@@ -312,6 +312,21 @@ fn build_tree_context_menu_items(
     let entry_target = crate::widgets::file_tree::delete_target_for(node, root);
     let mut items: Vec<(String, MenuAction)> = Vec::new();
     if let Some(p) = entry_target {
+        // Right-click on any node (file or folder, nested or not):
+        // surface New File… / New Folder… at the top so the user can
+        // create a new entry next to / inside whatever they clicked,
+        // without having to scroll up to the workspace root first.
+        // `target_dir` is already routed by `create_target_dir_for`:
+        // a folder click resolves to the folder itself, a file click
+        // to the file's parent — same convention VS Code uses.
+        items.push((
+            String::from("New File…"),
+            MenuAction::Create(CreateKind::File),
+        ));
+        items.push((
+            String::from("New Folder…"),
+            MenuAction::Create(CreateKind::Folder),
+        ));
         let paths_for_action: Vec<PathBuf> = if selection.iter().any(|sp| sp == &p) {
             selection.to_vec()
         } else {
@@ -7733,7 +7748,7 @@ mod tests {
     }
 
     #[test]
-    fn tree_context_menu_on_file_offers_cut_copy_rename_delete() {
+    fn tree_context_menu_on_file_offers_new_file_new_folder_then_cut_copy_rename_delete() {
         let tmp = tempfile::tempdir().unwrap();
         let f = tmp.path().join("hello.txt");
         std::fs::write(&f, "hi").unwrap();
@@ -7750,17 +7765,27 @@ mod tests {
         let labels: Vec<&str> = items.iter().map(|(s, _)| s.as_str()).collect();
         assert_eq!(
             labels,
-            ["Cut", "Copy", "Rename…", "Select for Compare", "Delete"]
+            [
+                "New File…",
+                "New Folder…",
+                "Cut",
+                "Copy",
+                "Rename…",
+                "Select for Compare",
+                "Delete",
+            ],
         );
-        assert!(matches!(&items[0].1, MenuAction::Cut(ps) if ps == &vec![f.clone()]));
-        assert!(matches!(&items[1].1, MenuAction::Copy(ps) if ps == &vec![f.clone()]));
-        assert!(matches!(&items[2].1, MenuAction::Rename(p) if p == &f));
-        assert!(matches!(&items[3].1, MenuAction::SelectForCompare(p) if p == &f));
-        assert!(matches!(&items[4].1, MenuAction::Delete { paths } if paths == &vec![f.clone()]));
+        assert!(matches!(&items[0].1, MenuAction::Create(CreateKind::File)));
+        assert!(matches!(&items[1].1, MenuAction::Create(CreateKind::Folder)));
+        assert!(matches!(&items[2].1, MenuAction::Cut(ps) if ps == &vec![f.clone()]));
+        assert!(matches!(&items[3].1, MenuAction::Copy(ps) if ps == &vec![f.clone()]));
+        assert!(matches!(&items[4].1, MenuAction::Rename(p) if p == &f));
+        assert!(matches!(&items[5].1, MenuAction::SelectForCompare(p) if p == &f));
+        assert!(matches!(&items[6].1, MenuAction::Delete { paths } if paths == &vec![f.clone()]));
     }
 
     #[test]
-    fn tree_context_menu_on_subfolder_offers_cut_copy_rename_delete() {
+    fn tree_context_menu_on_subfolder_offers_new_file_new_folder_then_cut_copy_rename_delete() {
         let tmp = tempfile::tempdir().unwrap();
         let d = tmp.path().join("sub");
         std::fs::create_dir(&d).unwrap();
@@ -7775,7 +7800,10 @@ mod tests {
             None,
         );
         let labels: Vec<&str> = items.iter().map(|(s, _)| s.as_str()).collect();
-        assert_eq!(labels, ["Cut", "Copy", "Rename…", "Delete"]);
+        assert_eq!(
+            labels,
+            ["New File…", "New Folder…", "Cut", "Copy", "Rename…", "Delete"],
+        );
     }
 
     #[test]
@@ -7797,7 +7825,47 @@ mod tests {
             None,
         );
         let labels: Vec<&str> = items.iter().map(|(s, _)| s.as_str()).collect();
-        assert_eq!(labels, ["Cut", "Copy", "Paste", "Rename…", "Delete"]);
+        assert_eq!(
+            labels,
+            ["New File…", "New Folder…", "Cut", "Copy", "Paste", "Rename…", "Delete"],
+        );
+    }
+
+    #[test]
+    fn tree_context_menu_on_a_deeply_nested_folder_creates_inside_that_folder() {
+        // Regression for the user-reported "right-click on nested
+        // folders only shows Cut/Copy/Rename/Delete; I cannot create a
+        // new file or folder inside the folder I clicked". The menu
+        // must surface New File… / New Folder…, and the resolved
+        // target_dir must be the right-clicked folder itself so the
+        // create lands inside it (not at the workspace root).
+        let tmp = tempfile::tempdir().unwrap();
+        let nested = tmp.path().join("a").join("b").join("c");
+        std::fs::create_dir_all(&nested).unwrap();
+        let n = dir_node(&nested);
+        let resolved_target =
+            crate::widgets::file_tree::create_target_dir_for(Some(&n), tmp.path());
+        assert_eq!(
+            resolved_target, nested,
+            "right-click on a nested folder must target the folder itself, not the workspace root",
+        );
+        let items = build_tree_context_menu_items(
+            Some(&n),
+            tmp.path(),
+            &[nested.clone()],
+            &resolved_target,
+            None,
+            None,
+        );
+        let labels: Vec<&str> = items.iter().map(|(s, _)| s.as_str()).collect();
+        assert!(
+            labels.contains(&"New File…"),
+            "nested-folder right-click must offer New File…; labels = {labels:?}",
+        );
+        assert!(
+            labels.contains(&"New Folder…"),
+            "nested-folder right-click must offer New Folder…; labels = {labels:?}",
+        );
     }
 
     #[test]
@@ -7986,11 +8054,11 @@ mod tests {
         // used the clipped one.
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-        // Frame is 60 wide, 10 tall.
-        app.last_frame_area = Rect { x: 0, y: 0, width: 60, height: 10 };
-        // Menu height = items.len() + 2 borders = 7. Origin at y=4 would
-        // make the menu run from row 4 to row 11 (off-screen). The
-        // renderer (and now hit-test) clamp y to 10 - 7 = 3.
+        // Frame is 60 wide, 12 tall. Menu has 7 items + 2 borders = 9
+        // rows. Origin at y=6 would make the menu run from row 6 to row
+        // 14 (off-screen). The renderer (and hit-test) clamp y to
+        // 12 - 9 = 3.
+        app.last_frame_area = Rect { x: 0, y: 0, width: 60, height: 12 };
         let f = tmp.path().join("file.txt");
         std::fs::write(&f, "x").unwrap();
         let n = crate::widgets::file_tree::Node {
@@ -8009,17 +8077,19 @@ mod tests {
             None,
             None,
         );
-        // Sanity: items[3] is the new "Select for Compare".
-        assert!(matches!(&items[3].1, MenuAction::SelectForCompare(_)));
+        // Sanity: items[5] is "Select for Compare" after the New
+        // File… / New Folder… prefix lifted everything down by two.
+        assert!(matches!(&items[5].1, MenuAction::SelectForCompare(_)));
         app.context_menu = Some(ContextMenu {
-            origin: (10, 4),
+            origin: (10, 6),
             items,
             selected: 0,
             target_dir: target,
         });
-        // The visible "Select for Compare" row sits at clipped.y + 1 + 3 = 3 + 4 = 7.
-        let idx = app.menu_item_at(11, 7).expect("hit must land inside the menu");
-        assert_eq!(idx, 3, "click on visible row 7 must map to item 3, not 2");
+        // The visible "Select for Compare" row sits at clipped.y + 1
+        // (top border) + 5 (item index) = 3 + 1 + 5 = 9.
+        let idx = app.menu_item_at(11, 9).expect("hit must land inside the menu");
+        assert_eq!(idx, 5, "click on visible row 9 must map to item 5 (Select for Compare)");
     }
 
     #[test]
@@ -8088,7 +8158,10 @@ mod tests {
             None,
         );
         let labels: Vec<&str> = items.iter().map(|(s, _)| s.as_str()).collect();
-        assert_eq!(labels, ["Cut", "Copy", "Delete 2 items"]);
+        assert_eq!(
+            labels,
+            ["New File…", "New Folder…", "Cut", "Copy", "Delete 2 items"],
+        );
     }
 
     #[test]
