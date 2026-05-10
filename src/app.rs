@@ -256,6 +256,24 @@ enum MenuAction {
     /// Open a side-by-side diff between the previously-selected anchor and
     /// the file the user just right-clicked.
     CompareWithSelected { anchor: PathBuf, other: PathBuf },
+    /// Re-root the workspace at the right-clicked folder. Folder-only -
+    /// files can't be roots. Used to dive into a nested git repo without
+    /// relaunching croft.
+    MakeRoot(PathBuf),
+}
+
+/// Return the macOS-style keyboard shortcut hint to display on the right
+/// side of a context-menu row, when one exists. Mirrors the bindings in
+/// `handle_tree_key` (Cut/Copy/Paste/Delete) so the menu is a discovery
+/// surface for the same accelerators the keyboard already accepts.
+fn shortcut_for(action: &MenuAction) -> Option<&'static str> {
+    match action {
+        MenuAction::Cut(_) => Some("⌘X"),
+        MenuAction::Copy(_) => Some("⌘C"),
+        MenuAction::Paste(_) => Some("⌘V"),
+        MenuAction::Delete { .. } => Some("⌫"),
+        _ => None,
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -367,6 +385,20 @@ fn build_tree_context_menu_items(
             items.push((
                 String::from("Select for Compare"),
                 MenuAction::SelectForCompare(file.clone()),
+            ));
+        }
+        // "Make root" appears only for non-root folders. Re-roots the
+        // workspace at the clicked folder so the user can dive into a
+        // nested git repo without relaunching croft.
+        let single_folder_target: Option<&PathBuf> = paths_for_action
+            .first()
+            .filter(|_| paths_for_action.len() == 1)
+            .filter(|pp| node.map(|n| n.is_dir).unwrap_or(false))
+            .filter(|pp| pp.as_path() != root);
+        if let Some(folder) = single_folder_target {
+            items.push((
+                String::from("Make root"),
+                MenuAction::MakeRoot(folder.clone()),
             ));
         }
         let label = if paths_for_action.len() > 1 {
@@ -2958,7 +2990,7 @@ impl App {
             width: clipped.width.saturating_sub(2),
             height: clipped.height.saturating_sub(2),
         };
-        for (i, (label, _)) in menu.items.iter().enumerate() {
+        for (i, (label, action)) in menu.items.iter().enumerate() {
             if i as u16 >= inner.height {
                 break;
             }
@@ -2968,18 +3000,36 @@ impl App {
                 width: inner.width,
                 height: 1,
             };
-            let style = if i == menu.selected {
+            let selected = i == menu.selected;
+            let row_style = if selected {
                 Style::default()
                     .fg(Color::Black)
                     .bg(Color::Rgb(0x4e, 0x9a, 0xff))
             } else {
                 Style::default().fg(Color::White)
             };
+            // Paint the label, then right-align the shortcut hint on the
+            // same row so the menu reads like VS Code's: action on the
+            // left, accelerator on the right.
             let line = ratatui::text::Line::from(format!(" {label}"));
             frame.render_widget(
-                ratatui::widgets::Paragraph::new(line).style(style),
+                ratatui::widgets::Paragraph::new(line).style(row_style),
                 row,
             );
+            if let Some(sc) = shortcut_for(action) {
+                let sc_w = sc.chars().count() as u16;
+                if sc_w + 2 <= inner.width {
+                    let sc_x = inner.x + inner.width - sc_w - 1;
+                    let sc_style = if selected {
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(Color::Rgb(0x4e, 0x9a, 0xff))
+                    } else {
+                        Style::default().fg(Color::Rgb(0x9d, 0xa5, 0xb4))
+                    };
+                    frame.buffer_mut().set_string(sc_x, row.y, sc, sc_style);
+                }
+            }
         }
     }
 
@@ -5223,10 +5273,18 @@ impl App {
         // Use char count (not byte len) so multi-byte glyphs in menu
         // labels (e.g. the "…" in "Rename…", the arrow in "Compare with
         // Selected") don't inflate the menu width past what's needed.
+        // Width must also fit the shortcut hint on the right side, with
+        // at least 2 cells of gap between label and shortcut.
         let widest = menu
             .items
             .iter()
-            .map(|(s, _)| s.chars().count())
+            .map(|(label, action)| {
+                let label_w = label.chars().count();
+                let shortcut_w = shortcut_for(action)
+                    .map(|s| s.chars().count() + 2)
+                    .unwrap_or(0);
+                label_w + shortcut_w
+            })
             .max()
             .unwrap_or(0);
         let width = (widest + 4).max(18) as u16;
@@ -5297,6 +5355,37 @@ impl App {
         }
     }
 
+    /// Re-root the workspace at `new_root`. Resets the file tree, updates
+    /// `workspace_root`, refreshes git status and the source-control
+    /// panel, and respawns the FS watcher so events fire under the new
+    /// root. Open editor tabs are NOT closed - a path that escapes the
+    /// new root still resolves on disk and the user may want to keep it
+    /// open. Compare anchor / clipboard / marks are reset because they
+    /// point into the old workspace.
+    pub fn change_workspace_root(&mut self, new_root: PathBuf) {
+        let display = new_root.display().to_string();
+        self.workspace_root = new_root.clone();
+        self.tree.set_root(new_root.clone());
+        self.tree_clipboard = None;
+        self.compare_anchor = None;
+        // Respawn the FS watcher so events under the new root flow into
+        // `drain_fs_events`. Dropping the old debouncer stops the old
+        // recursive watch.
+        self._fs_watcher = None;
+        self.fs_rx = None;
+        if let Ok((watcher, rx)) = Self::spawn_fs_watcher(&new_root) {
+            self._fs_watcher = Some(watcher);
+            self.fs_rx = Some(rx);
+        }
+        self.fs_poll_dir_mtimes = Self::snapshot_expanded_dir_mtimes(&self.tree);
+        self.last_git_check = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(1))
+            .unwrap_or_else(std::time::Instant::now);
+        self.refresh_git_status_debounced();
+        self.refresh_source_control();
+        self.status = format!("Workspace root: {display}");
+    }
+
     fn dispatch_menu_action(&mut self, action: MenuAction, target_dir: PathBuf) {
         match action {
             MenuAction::Create(kind) => self.open_create_prompt(kind, target_dir),
@@ -5334,6 +5423,9 @@ impl App {
                     .unwrap_or_else(|| path.display().to_string());
                 self.compare_anchor = Some(path);
                 self.status = format!("Selected {label} for compare");
+            }
+            MenuAction::MakeRoot(folder) => {
+                self.change_workspace_root(folder);
             }
             MenuAction::CompareWithSelected { anchor, other } => {
                 match self.editor.open_diff(&anchor, &other) {
@@ -8012,6 +8104,94 @@ mod tests {
     }
 
     #[test]
+    fn shortcut_for_returns_expected_shortcuts_for_clipboard_and_delete_actions() {
+        let p = std::path::PathBuf::from("/x");
+        assert_eq!(shortcut_for(&MenuAction::Cut(vec![p.clone()])), Some("⌘X"));
+        assert_eq!(shortcut_for(&MenuAction::Copy(vec![p.clone()])), Some("⌘C"));
+        assert_eq!(shortcut_for(&MenuAction::Paste(p.clone())), Some("⌘V"));
+        assert_eq!(
+            shortcut_for(&MenuAction::Delete { paths: vec![p.clone()] }),
+            Some("⌫")
+        );
+        // No shortcut for actions without a keybinding.
+        assert_eq!(shortcut_for(&MenuAction::Rename(p.clone())), None);
+        assert_eq!(shortcut_for(&MenuAction::MakeRoot(p)), None);
+    }
+
+    #[test]
+    fn tree_context_menu_on_subfolder_offers_make_root_between_rename_and_delete() {
+        // "Make root" should appear on folder right-click so the user can
+        // re-root the workspace into that folder (e.g., a nested git repo).
+        // It must NOT appear on file right-clicks - files can't be a
+        // workspace root.
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path().join("project_a");
+        std::fs::create_dir(&d).unwrap();
+        let n = dir_node(&d);
+        let items = build_tree_context_menu_items(
+            Some(&n),
+            tmp.path(),
+            &[d.clone()],
+            &d,
+            None,
+            None,
+        );
+        let labels: Vec<&str> = items.iter().map(|(s, _)| s.as_str()).collect();
+        assert!(
+            labels.contains(&"Make root"),
+            "folder right-click must include Make root, got {labels:?}"
+        );
+        let mr = items
+            .iter()
+            .find_map(|(_, a)| match a {
+                MenuAction::MakeRoot(p) => Some(p),
+                _ => None,
+            })
+            .expect("Make root action must carry the folder path");
+        assert_eq!(mr, &d);
+    }
+
+    #[test]
+    fn tree_context_menu_on_file_does_not_offer_make_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("hello.txt");
+        std::fs::write(&f, "hi").unwrap();
+        let n = file_node(&f);
+        let target = f.parent().unwrap().to_path_buf();
+        let items = build_tree_context_menu_items(
+            Some(&n),
+            tmp.path(),
+            &[f.clone()],
+            &target,
+            None,
+            None,
+        );
+        let labels: Vec<&str> = items.iter().map(|(s, _)| s.as_str()).collect();
+        assert!(
+            !labels.contains(&"Make root"),
+            "files cannot be roots; Make root must be hidden for files: {labels:?}"
+        );
+    }
+
+    #[test]
+    fn dispatch_make_root_changes_tree_root_and_workspace_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project_b");
+        std::fs::create_dir(&project).unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        let original_root = app.tree.root.clone();
+        app.dispatch_menu_action(
+            MenuAction::MakeRoot(project.clone()),
+            project.clone(),
+        );
+        assert_ne!(app.tree.root, original_root);
+        assert_eq!(app.tree.root, project);
+        assert_eq!(app.workspace_root, project);
+        // The tree's root node must reflect the new path.
+        assert_eq!(app.tree.nodes[0].path, project);
+    }
+
+    #[test]
     fn tree_context_menu_on_subfolder_offers_new_file_new_folder_then_cut_copy_rename_delete() {
         let tmp = tempfile::tempdir().unwrap();
         let d = tmp.path().join("sub");
@@ -8029,7 +8209,7 @@ mod tests {
         let labels: Vec<&str> = items.iter().map(|(s, _)| s.as_str()).collect();
         assert_eq!(
             labels,
-            ["New File…", "New Folder…", "Cut", "Copy", "Rename…", "Delete"],
+            ["New File…", "New Folder…", "Cut", "Copy", "Rename…", "Make root", "Delete"],
         );
     }
 
@@ -8054,7 +8234,7 @@ mod tests {
         let labels: Vec<&str> = items.iter().map(|(s, _)| s.as_str()).collect();
         assert_eq!(
             labels,
-            ["New File…", "New Folder…", "Cut", "Copy", "Paste", "Rename…", "Delete"],
+            ["New File…", "New Folder…", "Cut", "Copy", "Paste", "Rename…", "Make root", "Delete"],
         );
     }
 

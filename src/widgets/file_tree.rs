@@ -61,6 +61,26 @@ impl FileTree {
         tree
     }
 
+    /// Replace the workspace root with `new_root` and reload from scratch.
+    /// Drops the existing selection, scroll, marks, and drag state - the
+    /// new tree is a fresh tree rooted at the supplied directory.
+    pub fn set_root(&mut self, new_root: PathBuf) {
+        self.root = new_root.clone();
+        self.nodes = vec![Node {
+            path: new_root,
+            depth: 0,
+            is_dir: true,
+            expanded: true,
+            loaded: false,
+        }];
+        self.selected = 0;
+        self.scroll = 0;
+        self.anchor = 0;
+        self.marked.clear();
+        self.drag_target = None;
+        self.load_children(0);
+    }
+
     /// Map a screen y coordinate to a node index, if any.
     pub fn node_at_y(&self, y: u16) -> Option<usize> {
         if y < self.last_inner.y || y >= self.last_inner.y + self.last_inner.height {
