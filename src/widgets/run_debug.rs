@@ -2,7 +2,7 @@ use ratatui::{
     buffer::Buffer,
     layout::{Alignment, Rect},
     style::{Color, Modifier, Style},
-    text::Line,
+    text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Widget, Wrap},
 };
 use std::path::PathBuf;
@@ -13,35 +13,26 @@ const BODY_FG_RGB: (u8, u8, u8) = (0xb0, 0xb8, 0xc8);
 const TITLE_FG_RGB: (u8, u8, u8) = (0xff, 0xff, 0xff);
 const FOCUS_BORDER_RGB: (u8, u8, u8) = (0x4e, 0x9a, 0xff);
 
-/// Cells reserved above the headline for the bug+play emblem. Twelve
-/// cells wide × three cells tall. Each cell encodes two vertical pixels
-/// via Unicode half-block characters (`▀`, `▄`, `█`), giving a 12×6
-/// pixel grid that's recognisable as a bug-on-the-left + play-triangle-
-/// on-the-right silhouette without requiring an OSC-1337 inline image
-/// (which iTerm2 refuses to evict on view changes).
-pub const RUN_DEBUG_ICON_CELLS_W: u16 = 12;
+/// Cells reserved above the headline for the OSC-1337 debug-alt icon
+/// overlay. Six cells wide × three cells tall lands a roughly 60×60-pixel
+/// codicon at typical iTerm2 cell sizes (10×20 px), matching the VS Code
+/// empty-state proportions the user supplied. The image is painted post-
+/// frame by `App::flush_run_debug_icon_overlay`; on view change away from
+/// Run-Debug the App's `terminal.clear()` evicts the cached image cells
+/// (the same pipeline the welcome wordmark and editor preview use).
+pub const RUN_DEBUG_ICON_CELLS_W: u16 = 6;
 pub const RUN_DEBUG_ICON_CELLS_H: u16 = 3;
-
-/// Three-row half-block-pixel rendering of the codicon `debug-alt`
-/// silhouette: bug body (lower-left) + play triangle (right). Painted
-/// directly into ratatui's buffer at the panel's icon area; ratatui's
-/// diff evicts every cell cleanly when the sidebar view changes.
-const RUN_DEBUG_ICON_ART: [&str; 3] = [
-    "       █▄   ",
-    "▄██▄   ███▄ ",
-    "▀███▀  ██▀  ",
-];
 
 pub struct RunDebugPanel {
     pub focused: bool,
     pub active_file: Option<PathBuf>,
     pub last_area: Rect,
     pub last_button_area: Rect,
-    /// Vestigial — kept to preserve the public field on the panel struct
-    /// for any external callers that touched it before the icon was
-    /// switched off OSC-1337. Always `None`: the codicon glyph is now
-    /// painted through ratatui directly, no post-draw overlay is
-    /// needed.
+    /// Top-left cell of the OSC-1337 icon overlay block. The post-draw
+    /// flush in `App` reads this to emit the rasterised debug-alt PNG
+    /// above the headline. `None` when the panel hasn't been laid out,
+    /// or when the panel is too short for the icon to fit alongside
+    /// the rest of the cluster.
     pub last_icon_cell: Option<(u16, u16)>,
     pub feedback: Option<String>,
     pub feedback_is_error: bool,
@@ -144,19 +135,26 @@ impl Widget for &mut RunDebugPanel {
 
         if icon_h > 0 && y + icon_h <= inner.y + inner.height {
             let icon_x = inner.x + (inner.width.saturating_sub(icon_w)) / 2;
-            // Paint the half-block bug+play silhouette into ratatui's
-            // buffer one row at a time. Each row is exactly icon_w
-            // cells wide; the next sidebar's render overwrites them
-            // through the diff with no special handling required.
-            let icon_style = Style::default()
+            self.last_icon_cell = Some((icon_x, y));
+            // Glyph fallback: paint the cod-debug-alt codicon centred
+            // inside the reserved icon block so terminals without
+            // OSC-1337 image support still see a recognisable shape.
+            // On iTerm2 the post-draw `flush_run_debug_icon_overlay`
+            // overwrites these cells with the proper rasterised PNG.
+            let glyph_style = Style::default()
                 .fg(Color::Rgb(BODY_FG_RGB.0, BODY_FG_RGB.1, BODY_FG_RGB.2))
                 .add_modifier(Modifier::BOLD);
-            for (row_idx, art_row) in RUN_DEBUG_ICON_ART.iter().enumerate() {
-                if (row_idx as u16) >= icon_h {
-                    break;
-                }
-                buf.set_string(icon_x, y + row_idx as u16, *art_row, icon_style);
-            }
+            let glyph_x = icon_x + icon_w / 2;
+            let glyph_y = y + icon_h / 2;
+            buf.set_span(
+                glyph_x,
+                glyph_y,
+                &Span::styled(
+                    crate::icons::ACTIVITY_RUN_DEBUG.to_string(),
+                    glyph_style,
+                ),
+                1,
+            );
             y += icon_h + gap_after_icon;
         }
 
@@ -319,52 +317,41 @@ mod tests {
             "button must be at least 3 rows tall to feel chunky like the mockup; got height={}",
             button.height
         );
-        // The block-art icon must sit ABOVE the button.
-        let mut icon_top: Option<u16> = None;
-        for y in 0..area.height {
-            for x in 0..area.width {
-                if matches!(buf[(x, y)].symbol(), "█" | "▀" | "▄") {
-                    icon_top = Some(icon_top.map_or(y, |existing| existing.min(y)));
-                }
-            }
-        }
-        let icon_top = icon_top.expect("block-art icon must render");
+        // The OSC-1337 icon block must be reserved ABOVE the button.
+        let icon = panel.last_icon_cell.expect("icon block must be reserved");
         assert!(
-            button.y > icon_top,
-            "button must sit below the icon (icon_top={icon_top}, button.y={})",
+            button.y > icon.1,
+            "button must sit below the icon (icon top y={}, button.y={})",
+            icon.1,
             button.y
         );
     }
 
     #[test]
-    fn icon_area_renders_block_art_through_ratatui_not_via_osc_overlay() {
-        // Three prior wipe attempts (space-stamp, terminal.clear,
-        // same-rect OSC-1337 replace) all left visible image cells
-        // ghosting on top of whichever panel came next, and the single-
-        // cell codicon glyph the user saw next was visibly too small.
-        // The icon is now half-block pixel art across 12 cells × 3
-        // rows — bigger than the codicon glyph, paints through ratatui
-        // like every other widget, evicts cleanly via the buffer diff.
+    fn icon_block_reserves_an_osc_1337_overlay_cell_with_a_glyph_fallback() {
+        // The headline icon is a 6x3-cell OSC-1337 image overlay (the
+        // codicon `debug-alt` PNG, same one the activity-bar slot uses),
+        // emitted post-frame by App::flush_run_debug_icon_overlay. The
+        // widget's job is to (1) reserve the icon block via
+        // last_icon_cell and (2) paint the codicon glyph as a text
+        // fallback for terminals without OSC-1337 support; iTerm2
+        // overwrites those cells with the rasterised image.
         let mut panel = RunDebugPanel::new();
         let area = Rect { x: 0, y: 0, width: 36, height: 24 };
         let mut buf = Buffer::empty(area);
         Widget::render(&mut panel, area, &mut buf);
-        let mut found_blocks = 0usize;
-        for y in 0..area.height {
-            for x in 0..area.width {
-                let s = buf[(x, y)].symbol();
-                if matches!(s, "█" | "▀" | "▄") {
-                    found_blocks += 1;
-                }
-            }
-        }
-        assert!(
-            found_blocks >= 8,
-            "icon must be a multi-cell block-art rendering (got {found_blocks} block cells); the panel must NOT shrink back to a single 1x1 codicon glyph the user already called too small"
-        );
-        assert!(
-            panel.last_icon_cell.is_none(),
-            "no OSC-1337 overlay cell should be reserved — the icon is now plain text"
+        let (ix, iy) = panel
+            .last_icon_cell
+            .expect("icon overlay cell must be reserved on a tall enough panel");
+        let icon_w = RUN_DEBUG_ICON_CELLS_W;
+        let icon_h = RUN_DEBUG_ICON_CELLS_H;
+        let glyph_x = ix + icon_w / 2;
+        let glyph_y = iy + icon_h / 2;
+        let cell = buf[(glyph_x, glyph_y)].symbol().to_string();
+        assert_eq!(
+            cell,
+            crate::icons::ACTIVITY_RUN_DEBUG.to_string(),
+            "glyph fallback must be the cod-debug-alt codicon at the centre of the icon block"
         );
     }
 

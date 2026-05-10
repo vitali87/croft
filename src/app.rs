@@ -460,6 +460,27 @@ pub struct App {
     /// ratatui flushes the welcome panel, at `welcome_codeberg_badge_cell`.
     /// `None` when the host terminal lacks OSC-1337 image support.
     welcome_codeberg_badge_osc: Option<String>,
+    /// Pre-encoded OSC-1337 image of the codicon `debug-alt` glyph sized
+    /// to the run-debug panel's headline icon block. `None` when the host
+    /// terminal lacks OSC-1337 support; the panel falls back to the codicon
+    /// glyph painted directly into ratatui's buffer.
+    run_debug_icon_osc: Option<String>,
+    /// Cell where the run-debug headline image was actually painted on
+    /// the previous post-draw flush. Read by `set_sidebar_view` to decide
+    /// whether the user is leaving Run-Debug after the icon was on
+    /// screen, in which case a one-shot `terminal.clear()` is armed
+    /// to evict iTerm2's cached image cells (plain SGR overwrites do
+    /// not reliably evict OSC-1337 image cells).
+    run_debug_icon_last_emitted: Option<(u16, u16)>,
+    /// One-shot flag: arm a `terminal.clear()` on the next render pass
+    /// when the run-debug headline icon was last emitted but the panel
+    /// is no longer the active sidebar view. Identical pattern to
+    /// `welcome_image_clear_requested` and `editor_image_clear_requested` —
+    /// the main loop folds all three into the same clear+redraw gate
+    /// that nukes iTerm2's image cache. Without this, switching sidebar
+    /// views away from Run-Debug leaves the bug+play picture ghosting
+    /// in the middle of whichever panel comes next.
+    run_debug_image_clear_requested: bool,
     /// Absolute terminal cell where the Codeberg badge image goes. Recorded
     /// during welcome render; consumed post-draw. `None` when the welcome
     /// panel isn't visible or the open repo isn't on Codeberg.
@@ -1030,6 +1051,9 @@ impl App {
             cursor_blink_anchor: std::time::Instant::now(),
             activity_images: None,
             welcome_codeberg_badge_osc: None,
+            run_debug_icon_osc: None,
+            run_debug_icon_last_emitted: None,
+            run_debug_image_clear_requested: false,
             welcome_codeberg_badge_cell: None,
             welcome_codeberg_badge_last_emitted: None,
             last_editor_left_down: None,
@@ -1194,6 +1218,89 @@ impl App {
             } else {
                 raw
             });
+        }
+        // Run-and-Debug headline icon: the same debug-alt PNG used in the
+        // activity bar, fitted to the panel's icon block (RUN_DEBUG_ICON_CELLS_W
+        // cells wide × RUN_DEBUG_ICON_CELLS_H cells tall) and tinted at icon-
+        // inactive grey so it reads as the same monochrome family as the rest
+        // of the activity-bar icons. Encoded once at init; emitted post-frame
+        // by `flush_run_debug_icon_overlay` while the panel is visible.
+        let rd_icon_w_cells = crate::widgets::run_debug::RUN_DEBUG_ICON_CELLS_W as u32;
+        let rd_icon_h_cells = crate::widgets::run_debug::RUN_DEBUG_ICON_CELLS_H as u32;
+        let rd_icon_w_px = cell_w * rd_icon_w_cells;
+        let rd_icon_h_px = cell_h * rd_icon_h_cells;
+        if let Ok(baked) = crate::iterm2_inline::compose_icon(
+            crate::iterm2_inline::RUN_DEBUG_SRC_PNG,
+            rd_icon_w_px,
+            rd_icon_h_px,
+            false,
+            icon_bg,
+        ) {
+            let raw = crate::iterm2_inline::build_inline_image_osc(
+                &baked,
+                crate::widgets::run_debug::RUN_DEBUG_ICON_CELLS_W,
+                crate::widgets::run_debug::RUN_DEBUG_ICON_CELLS_H,
+                false,
+            );
+            self.run_debug_icon_osc = Some(if is_tmux {
+                crate::iterm2_inline::tmux_passthrough_wrap(&raw)
+            } else {
+                raw
+            });
+        }
+    }
+
+    /// Emit the OSC-1337 image carrying the run-debug headline icon at the
+    /// cell the panel reserved on its most recent render. No-op when the
+    /// panel isn't the active sidebar view, when the icon hasn't been
+    /// baked (non-iTerm2 host), or when the panel didn't reserve a cell
+    /// (too short to fit the icon). Critically, the panel-hidden case
+    /// does NOT stamp blanks or any other "wipe" payload here: doing so
+    /// after `terminal.clear()` + redraw stomps freshly-painted text in
+    /// the next sidebar (this was the bug in the prior space-stamp wipe
+    /// attempt). Eviction of iTerm2's cached image cells is handled
+    /// exclusively by the `consume_run_debug_image_clear` →
+    /// `terminal.clear()` gate in the main loop, the same pipeline the
+    /// welcome wordmark and editor preview image use.
+    pub fn flush_run_debug_icon_overlay(&mut self) {
+        use std::io::Write;
+        let panel_visible = self.show_tree
+            && self.sidebar_view == SidebarView::RunDebug
+            && self.run_debug_icon_osc.is_some();
+        if !panel_visible {
+            self.run_debug_icon_last_emitted = None;
+            return;
+        }
+        let Some((cx, cy)) = self.run_debug.last_icon_cell else {
+            self.run_debug_icon_last_emitted = None;
+            return;
+        };
+        let Some(osc) = self.run_debug_icon_osc.as_deref() else {
+            return;
+        };
+        let mut out = stdout();
+        let cursor_on = self.cursor_should_be_visible();
+        let _ = write!(out, "\x1b[?25l\x1b[s");
+        let _ = write!(out, "\x1b[{};{}H", cy + 1, cx + 1);
+        let _ = out.write_all(osc.as_bytes());
+        let _ = write!(out, "\x1b[u");
+        if cursor_on {
+            let _ = write!(out, "\x1b[?25h");
+        }
+        let _ = out.flush();
+        self.run_debug_icon_last_emitted = Some((cx, cy));
+    }
+
+    /// One-shot consumer for the "leaving Run-Debug after the icon was
+    /// emitted" flag. The main loop folds the result into the same OR
+    /// chain that fires `terminal.clear()` for the welcome wordmark and
+    /// editor preview image.
+    pub fn consume_run_debug_image_clear(&mut self) -> bool {
+        if self.run_debug_image_clear_requested {
+            self.run_debug_image_clear_requested = false;
+            true
+        } else {
+            false
         }
     }
 
@@ -2249,6 +2356,20 @@ impl App {
     fn set_sidebar_view(&mut self, view: SidebarView) {
         if self.sidebar_view != view {
             self.activity_overlay_dirty = true;
+            // Leaving Run-Debug after the headline icon was on screen:
+            // arm a one-shot `terminal.clear()` so iTerm2 evicts the
+            // cached OSC-1337 image cells. Plain SGR overwrites do not
+            // reliably evict those cells, but `\x1b[2J` (which
+            // `terminal.clear()` emits) does — same gate the welcome
+            // wordmark and editor preview pipelines use. The post-draw
+            // flush function is silent on the non-Run-Debug path, so
+            // nothing stomps the freshly-drawn next sidebar.
+            if self.sidebar_view == SidebarView::RunDebug
+                && view != SidebarView::RunDebug
+                && self.run_debug_icon_last_emitted.is_some()
+            {
+                self.run_debug_image_clear_requested = true;
+            }
         }
         self.sidebar_view = view;
         if self.sidebar_view == SidebarView::Remote && self.remote.refresh_if_config_changed() {
@@ -2830,7 +2951,20 @@ impl App {
                 return Ok(());
             }
             (KeyCode::Char('b'), KeyModifiers::CONTROL) => {
+                let was_visible = self.show_tree;
                 self.show_tree = !self.show_tree;
+                // Hiding the sidebar while Run-Debug was on screen: arm
+                // the same OSC-1337 image-cell evict gate that fires on
+                // a sidebar-view change. Without this the bug+play icon
+                // ghosts on top of the editor / terminal that fills the
+                // space the panel just vacated.
+                if was_visible
+                    && !self.show_tree
+                    && self.sidebar_view == SidebarView::RunDebug
+                    && self.run_debug_icon_last_emitted.is_some()
+                {
+                    self.run_debug_image_clear_requested = true;
+                }
                 return Ok(());
             }
             (KeyCode::F(6), _) => {
@@ -8000,6 +8134,66 @@ mod tests {
     }
 
     #[test]
+    fn leaving_run_debug_after_emitting_the_icon_arms_a_one_shot_terminal_clear() {
+        // Regression for the bug+play headline icon ghosting on top of
+        // whichever sidebar replaced Run-Debug. iTerm2's OSC-1337 image
+        // cells survive plain SGR overwrites, so the welcome / editor
+        // pipelines arm a `terminal.clear()` on the next render to evict
+        // them. Run-Debug needs the same gate.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        // Pretend init_graphics succeeded and the panel emitted the icon
+        // while the user was on Run-Debug.
+        app.run_debug_icon_osc = Some("\x1b]1337;File=...\x07".to_string());
+        app.set_sidebar_view(SidebarView::RunDebug);
+        app.run_debug.last_icon_cell = Some((10, 5));
+        app.flush_run_debug_icon_overlay();
+        assert!(
+            app.run_debug_icon_last_emitted.is_some(),
+            "test setup: the flush must record the emit position"
+        );
+        // Switch away. The clear flag must be armed so the main loop's
+        // OR chain fires `terminal.clear()` once before the next draw.
+        app.set_sidebar_view(SidebarView::Explorer);
+        assert!(
+            app.consume_run_debug_image_clear(),
+            "leaving Run-Debug after emitting the icon must arm exactly one terminal.clear() so iTerm2's image cells are evicted",
+        );
+        assert!(
+            !app.consume_run_debug_image_clear(),
+            "the clear request must be one-shot — consuming twice in a row returns false",
+        );
+    }
+
+    #[test]
+    fn flush_run_debug_icon_overlay_is_silent_when_panel_is_not_visible() {
+        // Critical invariant: when the user has switched away from
+        // Run-Debug, the post-draw flush MUST NOT write any wipe payload
+        // (no spaces, no replacement OSC). The prior space-stamp wipe
+        // fired AFTER the redraw and erased the freshly-painted next
+        // sidebar in those cells. Eviction is now handled exclusively
+        // by `terminal.clear()` via `consume_run_debug_image_clear`.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.run_debug_icon_osc = Some("\x1b]1337;File=...\x07".to_string());
+        app.set_sidebar_view(SidebarView::RunDebug);
+        app.run_debug.last_icon_cell = Some((10, 5));
+        app.flush_run_debug_icon_overlay();
+        assert_eq!(app.run_debug_icon_last_emitted, Some((10, 5)));
+        // Switch away.
+        app.set_sidebar_view(SidebarView::Explorer);
+        // The flush in this state must clear last_emitted but emit
+        // nothing (we can only assert the bookkeeping side effect here;
+        // the absence of stdout writes is asserted indirectly by the
+        // function returning early before the write_all call).
+        app.flush_run_debug_icon_overlay();
+        assert_eq!(
+            app.run_debug_icon_last_emitted, None,
+            "flush on a hidden panel must reset last_emitted so a re-entry primes a fresh emit",
+        );
+    }
+
+    #[test]
     fn tree_context_menu_on_workspace_root_offers_new_file_and_new_folder_only() {
         // Right-clicking the workspace root row must NOT offer Rename/Delete
         // (the root cannot be renamed or moved to trash from inside croft).
@@ -9953,7 +10147,10 @@ fn main_loop(
             // its cached image cells AND ratatui repaints every cell on
             // the next draw (its diff alone misses cells whose content
             // didn't change between welcome and editor buffers).
-            if app.consume_welcome_image_clear() || app.consume_editor_image_clear() {
+            if app.consume_welcome_image_clear()
+                || app.consume_editor_image_clear()
+                || app.consume_run_debug_image_clear()
+            {
                 terminal.clear()?;
                 // Activity-bar icons live outside ratatui too; re-emit
                 // them on the next post-draw flush.
@@ -9962,7 +10159,10 @@ fn main_loop(
             terminal.draw(|f| {
                 app.render(f);
             })?;
-            if app.consume_welcome_image_clear() || app.consume_editor_image_clear() {
+            if app.consume_welcome_image_clear()
+                || app.consume_editor_image_clear()
+                || app.consume_run_debug_image_clear()
+            {
                 terminal.clear()?;
                 app.activity_overlay_dirty = true;
                 terminal.draw(|f| {
@@ -10036,6 +10236,13 @@ fn main_loop(
             // welcome panel is visible, the open repo is on Codeberg, and
             // we successfully baked the icon at init time.
             app.flush_welcome_codeberg_badge_overlay();
+            // Run-and-Debug headline icon: same re-emit-every-frame trick.
+            // Only fires while the sidebar is on the Run-Debug view and the
+            // panel reserved a cell for the icon on its last render. On
+            // view change the `consume_run_debug_image_clear` gate above
+            // already armed `terminal.clear()`, evicting the cached
+            // image cells before the next sidebar paints.
+            app.flush_run_debug_icon_overlay();
             // Welcome-screen logo: same OSC-1337 trick, gated by its own
             // dirty flag and only emitted while the editor pane is in its
             // blank initial state.
