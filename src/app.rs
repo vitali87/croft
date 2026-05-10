@@ -292,6 +292,20 @@ struct ExplorerClipboard {
     paths: Vec<PathBuf>,
 }
 
+/// Accumulated type-to-jump state for the Explorer. `prefix` lowercase
+/// only; `last` is the instant of the most recent keystroke.
+#[derive(Clone, Debug)]
+struct TreeTypeahead {
+    prefix: String,
+    last: std::time::Instant,
+}
+
+/// Inter-keystroke gap that keeps the typeahead buffer alive. Anything
+/// longer than this resets the prefix to a single character and cycles
+/// past the current selection so repeating the same letter walks
+/// through matches.
+const TREE_TYPEAHEAD_WINDOW: std::time::Duration = std::time::Duration::from_millis(750);
+
 /// State for an in-progress drag inside the explorer pane. The drag is only
 /// "armed" once the pointer has actually moved off the original cell, so a
 /// stationary mouse-down → mouse-up still behaves like a click.
@@ -645,6 +659,11 @@ pub struct App {
     /// (which carries text), this stores filesystem paths and the intent
     /// (move vs. copy) until the next Paste consumes it.
     tree_clipboard: Option<ExplorerClipboard>,
+    /// Explorer type-to-jump buffer. Each printable keystroke within
+    /// `TREE_TYPEAHEAD_WINDOW` of the previous one accumulates; a
+    /// keystroke after the gap resets the buffer and cycles past the
+    /// current selection. Matches VS Code's tree typeahead.
+    tree_typeahead: Option<TreeTypeahead>,
     /// File the user picked via the explorer's "Select for Compare" menu
     /// action. None until they pick one; cleared once they invoke
     /// "Compare with Selected" against another file.
@@ -1170,6 +1189,7 @@ impl App {
             fs_poll_open_file_mtime: None,
             remote_launch: None,
             tree_clipboard: None,
+            tree_typeahead: None,
             compare_anchor: None,
             last_frame_area: Rect::default(),
             tree_drag: None,
@@ -3844,6 +3864,13 @@ impl App {
             KeyCode::Left => {
                 self.tree.collapse_selected();
             }
+            KeyCode::Char(c)
+                if !key.modifiers.intersects(
+                    KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                ) =>
+            {
+                self.apply_tree_typeahead(c, std::time::Instant::now());
+            }
             _ => {}
         }
     }
@@ -5456,6 +5483,42 @@ impl App {
     fn explorer_create_target_dir(&self) -> PathBuf {
         let node = self.tree.nodes.get(self.tree.selected);
         crate::widgets::file_tree::create_target_dir_for(node, &self.tree.root)
+    }
+
+    /// VS Code-style type-to-jump for the Explorer. Each printable
+    /// keystroke arriving while the file tree is focused appends to a
+    /// short-lived prefix buffer and snaps selection to the first
+    /// visible node whose name starts with that prefix. Keystrokes
+    /// further apart than `TREE_TYPEAHEAD_WINDOW` reset the buffer to
+    /// a single character and cycle to the next match, so re-pressing
+    /// the same letter walks through siblings beginning with it.
+    /// `now` is injected for deterministic tests.
+    fn apply_tree_typeahead(&mut self, c: char, now: std::time::Instant) {
+        let within_window = self
+            .tree_typeahead
+            .as_ref()
+            .is_some_and(|t| now.duration_since(t.last) < TREE_TYPEAHEAD_WINDOW);
+        let prefix = if within_window {
+            let mut p = self.tree_typeahead.as_ref().unwrap().prefix.clone();
+            p.push(c.to_ascii_lowercase());
+            p
+        } else {
+            c.to_ascii_lowercase().to_string()
+        };
+        let n = self.tree.nodes.len();
+        if n > 0 {
+            let start = if within_window {
+                self.tree.selected
+            } else {
+                (self.tree.selected + 1) % n
+            };
+            if let Some(idx) = self.tree.find_prefix(&prefix, start) {
+                self.tree.selected = idx;
+                self.tree.anchor = idx;
+                self.tree.marked.clear();
+            }
+        }
+        self.tree_typeahead = Some(TreeTypeahead { prefix, last: now });
     }
 
     fn dispatch_menu_action(&mut self, action: MenuAction, target_dir: PathBuf) {
@@ -8257,6 +8320,133 @@ mod tests {
         assert!(is_tree_make_root_key(key(KeyCode::Char('/'), KeyModifiers::SUPER)));
         assert!(is_tree_make_root_key(key(KeyCode::Char('/'), KeyModifiers::CONTROL)));
         assert!(!is_tree_make_root_key(key(KeyCode::Char('/'), KeyModifiers::NONE)));
+    }
+
+    #[test]
+    fn tree_typeahead_first_keystroke_jumps_to_first_matching_visible_node() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("apple")).unwrap();
+        std::fs::write(tmp.path().join("banana.txt"), "").unwrap();
+        std::fs::write(tmp.path().join("cherry.txt"), "").unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.apply_tree_typeahead('b', std::time::Instant::now());
+        let picked = app.tree.nodes[app.tree.selected]
+            .path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(picked, "banana.txt", "typing 'b' must select banana.txt");
+    }
+
+    #[test]
+    fn tree_typeahead_accumulates_prefix_within_window() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("test")).unwrap();
+        std::fs::create_dir(tmp.path().join("toolbox")).unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        let t0 = std::time::Instant::now();
+        app.apply_tree_typeahead('t', t0);
+        app.apply_tree_typeahead('e', t0 + std::time::Duration::from_millis(100));
+        let name = app.tree.nodes[app.tree.selected]
+            .path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(
+            name, "test",
+            "'te' typed within the window must land on 'test', not 'toolbox'"
+        );
+    }
+
+    #[test]
+    fn tree_typeahead_resets_after_window_expires_and_cycles() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("test")).unwrap();
+        std::fs::create_dir(tmp.path().join("toolbox")).unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        let t0 = std::time::Instant::now();
+        app.apply_tree_typeahead('t', t0);
+        let first = app.tree.selected;
+        let first_name = app.tree.nodes[first]
+            .path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        app.apply_tree_typeahead('t', t0 + std::time::Duration::from_millis(1000));
+        let second = app.tree.selected;
+        let second_name = app.tree.nodes[second]
+            .path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert_ne!(
+            first, second,
+            "the second 't' after the window expires must cycle to the next 't' match"
+        );
+        assert!(
+            first_name.starts_with('t') && second_name.starts_with('t'),
+            "both cycle stops must start with 't'"
+        );
+    }
+
+    #[test]
+    fn tree_typeahead_is_case_insensitive() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("README.md"), "").unwrap();
+        std::fs::write(tmp.path().join("zzz.txt"), "").unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.apply_tree_typeahead('r', std::time::Instant::now());
+        let picked = app.tree.nodes[app.tree.selected]
+            .path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(picked, "README.md");
+    }
+
+    #[test]
+    fn tree_typeahead_via_handle_tree_key_jumps_selection() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("apple")).unwrap();
+        std::fs::write(tmp.path().join("banana.txt"), "").unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.focus_pane(Pane::Tree);
+        app.sidebar_view = SidebarView::Explorer;
+        app.handle_tree_key(key(KeyCode::Char('b'), KeyModifiers::NONE));
+        let picked = app.tree.nodes[app.tree.selected]
+            .path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(
+            picked, "banana.txt",
+            "a plain letter routed through handle_tree_key must drive typeahead"
+        );
+    }
+
+    #[test]
+    fn tree_typeahead_does_not_fire_when_modifier_held() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("banana.txt"), "").unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        let before = app.tree.selected;
+        app.focus_pane(Pane::Tree);
+        app.sidebar_view = SidebarView::Explorer;
+        app.handle_tree_key(key(KeyCode::Char('b'), KeyModifiers::CONTROL));
+        assert_eq!(
+            app.tree.selected, before,
+            "Ctrl+letter must not be consumed as typeahead"
+        );
+        assert!(
+            app.tree_typeahead.is_none(),
+            "Ctrl-modified keys must not seed the typeahead buffer"
+        );
     }
 
     #[test]

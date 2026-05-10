@@ -426,6 +426,32 @@ impl FileTree {
         self.nodes.get(self.selected).map(|n| n.path.as_path())
     }
 
+    /// Locate the next visible node whose filename starts with `prefix`
+    /// (ASCII case-insensitive). The search begins at `start` and wraps
+    /// to 0 so a prefix that exists earlier in the list is still found
+    /// when the caller is partway down. Returns `None` for an empty
+    /// prefix, an empty tree, or no match.
+    pub fn find_prefix(&self, prefix: &str, start: usize) -> Option<usize> {
+        if prefix.is_empty() || self.nodes.is_empty() {
+            return None;
+        }
+        let needle = prefix.to_ascii_lowercase();
+        let n = self.nodes.len();
+        let start = start.min(n - 1);
+        for off in 0..n {
+            let idx = (start + off) % n;
+            let name = self.nodes[idx]
+                .path
+                .file_name()
+                .map(|s| s.to_string_lossy().to_ascii_lowercase())
+                .unwrap_or_default();
+            if name.starts_with(&needle) {
+                return Some(idx);
+            }
+        }
+        None
+    }
+
     /// Reload the children of the directory node at `idx`. Preserves the
     /// node's existing `expanded` state — an FS event arriving inside a
     /// folder the user just collapsed must not pop it back open. When the
@@ -1510,6 +1536,70 @@ mod tests {
             "deep"
         );
         assert!(src.exists(), "copy must leave source intact");
+    }
+
+    #[test]
+    fn find_prefix_matches_visible_nodes_from_start() {
+        let (_tmp, tree) = fixture();
+        let idx_src = tree
+            .nodes
+            .iter()
+            .position(|n| n.path.file_name().is_some_and(|s| s == "src"))
+            .unwrap();
+        let idx_readme = tree
+            .nodes
+            .iter()
+            .position(|n| n.path.file_name().is_some_and(|s| s == "README.md"))
+            .unwrap();
+        let idx_main = tree
+            .nodes
+            .iter()
+            .position(|n| n.path.file_name().is_some_and(|s| s == "main.rs"))
+            .unwrap();
+        assert_eq!(tree.find_prefix("s", 0), Some(idx_src));
+        assert_eq!(tree.find_prefix("r", 0), Some(idx_readme));
+        assert_eq!(tree.find_prefix("m", 0), Some(idx_main));
+    }
+
+    #[test]
+    fn find_prefix_is_case_insensitive() {
+        let (_tmp, tree) = fixture();
+        let want = tree
+            .nodes
+            .iter()
+            .position(|n| n.path.file_name().is_some_and(|s| s == "README.md"))
+            .unwrap();
+        assert_eq!(tree.find_prefix("README", 0), Some(want));
+        assert_eq!(tree.find_prefix("readme", 0), Some(want));
+        assert_eq!(tree.find_prefix("ReAdMe", 0), Some(want));
+    }
+
+    #[test]
+    fn find_prefix_wraps_around_to_find_earlier_match() {
+        let (_tmp, tree) = fixture();
+        let want = tree
+            .nodes
+            .iter()
+            .position(|n| n.path.file_name().is_some_and(|s| s == "README.md"))
+            .unwrap();
+        let after = tree.nodes.len() - 1;
+        assert_eq!(
+            tree.find_prefix("r", after),
+            Some(want),
+            "wrap-around must find the only 'r' node when start is past it"
+        );
+    }
+
+    #[test]
+    fn find_prefix_returns_none_when_no_match() {
+        let (_tmp, tree) = fixture();
+        assert_eq!(tree.find_prefix("zzzz", 0), None);
+    }
+
+    #[test]
+    fn find_prefix_returns_none_for_empty_prefix() {
+        let (_tmp, tree) = fixture();
+        assert_eq!(tree.find_prefix("", 0), None);
     }
 
     #[test]
