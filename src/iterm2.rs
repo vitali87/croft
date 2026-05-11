@@ -11,9 +11,45 @@ const CMD_R_KEY: &str = "0x72-0x100000-0xf";
 const CMD_R_HEX: &str = "0x1b 0x5b 0x31 0x31 0x34 0x3b 0x39 0x75";
 const CMD_SLASH_KEY: &str = "0x2f-0x100000-0x2c";
 const CMD_SLASH_HEX: &str = "0x1b 0x5b 0x34 0x37 0x3b 0x39 0x75";
+/// `Cmd+Shift+Return`. Serialized identifier follows iTerm2's
+/// iTermKeystroke format `0x<char>-0x<modifiers>-0x<virtualKeyCode>`:
+/// character = 0xd (CR, the same unmodified value Return reports under
+/// Shift), modifiers = 0x120000 (Cmd 0x100000 | Shift 0x20000),
+/// virtualKeyCode = 0x24 (kVK_Return). Without this entry iTerm2 simply
+/// drops the chord on the floor, which is why croft never saw it.
+const CMD_SHIFT_ENTER_KEY: &str = "0xd-0x120000-0x24";
+/// CSI-u sequence `ESC [ 13 ; 10 u` = Enter (codepoint 13) with kitty
+/// modifier byte 10 (= 1 base + Shift(1) + Super(8)). Crossterm parses
+/// this back into `KeyEvent { code: Enter, modifiers: SHIFT | SUPER }`,
+/// which the Explorer's plain Enter handler already routes through
+/// `tree.activate()` to toggle expand/collapse on folders.
+const CMD_SHIFT_ENTER_HEX: &str = "0x1b 0x5b 0x31 0x33 0x3b 0x31 0x30 0x75";
 const CMD_V_KEY: &str = "0x76-0x100000-0x9";
+/// `Cmd+Shift+/`. Character is the *shifted* glyph `?` (0x3f), modifiers
+/// are Cmd+Shift (0x120000), virtualKeyCode is `kVK_ANSI_Slash` (0x2c).
+/// macOS reserves this chord for the Help-menu Search field (Apple
+/// writes it as Cmd+?). The `NSUserKeyEquivalents` override below
+/// repoints "Show Help Menu" away from Cmd+?, freeing the chord so this
+/// GlobalKeyMap forwarder can fire.
+const CMD_SHIFT_SLASH_KEY: &str = "0x3f-0x120000-0x2c";
+/// CSI-u sequence `ESC [ 63 ; 10 u` = '?' (codepoint 63) with kitty
+/// modifier byte 10 (= 1 base + Shift(1) + Super(8)). Crossterm decodes
+/// this back to `KeyEvent { code: Char('?'), modifiers: SHIFT | SUPER }`,
+/// which `is_tree_make_parent_root_key` accepts via its `Char('?')`
+/// branch.
+const CMD_SHIFT_SLASH_HEX: &str = "0x1b 0x5b 0x36 0x33 0x3b 0x31 0x30 0x75";
 const FIND_GLOBALLY_MENU_EQUIV: &str = "@~^f";
 const FIND_MENU_EQUIV: &str = "@~f";
+/// macOS calls the Help-menu Cmd+? Search shortcut "Show Help Menu" in
+/// its keyboard-shortcuts UI; that is the menu-item title NSUserKeyEquivalents
+/// recognizes. Setting it here in iTerm2's plist overrides the system
+/// binding for iTerm2 only.
+const HELP_MENU_KEY: &str = "Show Help Menu";
+/// Cmd+Opt+? (i.e., Cmd+Opt+Shift+/). Picked because it is unbound by
+/// default on macOS and Opt being held neutralizes croft's Explorer
+/// predicate (which rejects ALT), so the chord can no longer fall back
+/// into croft's parent-folder action either.
+const HELP_MENU_EQUIV: &str = "@~?";
 
 /// PostScript name iTerm2 stores in `Normal Font` and `Non Ascii Font`.
 /// Format is "<PostScriptName> <size>".
@@ -90,6 +126,12 @@ pub fn apply_croft_key_settings(plist: &mut Value) -> Result<(), ITerm2Error> {
     // binding below wins reliably. Users that still want iTerm's
     // in-pane find can use Cmd+Opt+F.
     set_string(menu, "Find...", FIND_MENU_EQUIV.to_string());
+    // Reclaim Cmd+Shift+/ from the macOS Help-menu Search field.
+    // AppKit binds Cmd+? to the Help menu at the app level, ahead of
+    // iTerm2's GlobalKeyMap; without this override the chord opens
+    // Help instead of reaching croft. Pointing "Show Help Menu" at
+    // Cmd+Opt+? leaves Help reachable on a chord croft does not use.
+    set_string(menu, HELP_MENU_KEY, HELP_MENU_EQUIV.to_string());
     menu.remove("Paste");
 
     let global = dict_entry_mut(dict, "GlobalKeyMap");
@@ -102,6 +144,14 @@ pub fn apply_croft_key_settings(plist: &mut Value) -> Result<(), ITerm2Error> {
     global.insert(CMD_F_KEY.into(), send_hex_action(CMD_F_HEX, 0));
     global.insert(CMD_R_KEY.into(), send_hex_action(CMD_R_HEX, 0));
     global.insert(CMD_SLASH_KEY.into(), send_hex_action(CMD_SLASH_HEX, 0));
+    global.insert(
+        CMD_SHIFT_SLASH_KEY.into(),
+        send_hex_action(CMD_SHIFT_SLASH_HEX, 0),
+    );
+    global.insert(
+        CMD_SHIFT_ENTER_KEY.into(),
+        send_hex_action(CMD_SHIFT_ENTER_HEX, 0),
+    );
     global.remove(CMD_V_KEY);
 
     let bookmarks = dict
@@ -397,6 +447,45 @@ mod tests {
         assert!(
             menu.get("Paste").is_none(),
             "Paste must remain on its default Cmd+V menu shortcut so iTerm2 fires its native bracketed-paste action when Cmd+V is pressed; remapping it off Cmd+V breaks paste over SSH because the resulting key event has no clipboard reachable from the remote process"
+        );
+    }
+
+    #[test]
+    fn apply_croft_key_settings_relocates_help_menu_off_cmd_shift_slash() {
+        let mut plist = synth_plist("GUID-1", &["GUID-1"]);
+        apply_croft_key_settings(&mut plist).unwrap();
+        let top = plist.as_dictionary().unwrap();
+        let menu = dict_in(top, "NSUserKeyEquivalents");
+        assert_eq!(
+            menu.get(HELP_MENU_KEY).and_then(|v| v.as_string()),
+            Some(HELP_MENU_EQUIV),
+            "Cmd+Shift+/ is reserved by macOS as Cmd+? for the Help menu's Search field; AppKit captures the chord at the app level before iTerm2's GlobalKeyMap is consulted. Re-pointing the 'Show Help Menu' NSUserKeyEquivalents item at Cmd+Opt+? frees the chord so the GlobalKeyMap CSI-u forwarder below can forward it to croft."
+        );
+    }
+
+    #[test]
+    fn apply_croft_key_settings_forwards_cmd_shift_slash_as_csi_u_so_explorer_make_parent_root_fires() {
+        let mut plist = synth_plist("GUID-1", &["GUID-1"]);
+        apply_croft_key_settings(&mut plist).unwrap();
+        let top = plist.as_dictionary().unwrap();
+        let global = dict_in(top, "GlobalKeyMap");
+        assert_eq!(
+            action_text(global, CMD_SHIFT_SLASH_KEY),
+            CMD_SHIFT_SLASH_HEX,
+            "GlobalKeyMap must forward Cmd+Shift+/ as a CSI-u sequence so croft's `is_tree_make_parent_root_key` predicate fires from the Explorer pane. Encoding: '?' (shifted '/', codepoint 0x3f = 63) with kitty modifier byte 10 = 1+Shift(1)+Super(8), giving `ESC [ 63 ; 10 u`."
+        );
+    }
+
+    #[test]
+    fn apply_croft_key_settings_forwards_cmd_shift_enter_as_csi_u_so_iterm_does_not_swallow_it() {
+        let mut plist = synth_plist("GUID-1", &["GUID-1"]);
+        apply_croft_key_settings(&mut plist).unwrap();
+        let top = plist.as_dictionary().unwrap();
+        let global = dict_in(top, "GlobalKeyMap");
+        assert_eq!(
+            action_text(global, CMD_SHIFT_ENTER_KEY),
+            CMD_SHIFT_ENTER_HEX,
+            "Cmd+Shift+Return must be hex-bound at the iTerm2 level: with no binding, iTerm2 never forwards the chord to the TUI, so croft never sees the keystroke. The CSI-u payload encodes Enter (codepoint 13) with kitty modifier byte 10 = 1+Shift(1)+Super(8), which crossterm decodes back to KeyEvent {{ code: Enter, modifiers: SHIFT|SUPER }}."
         );
     }
 

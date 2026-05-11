@@ -5844,7 +5844,24 @@ impl App {
             }
             return true;
         }
+        if is_tree_make_parent_root_key(key) {
+            if let Some(path) = self.explorer_parent_for_make_root() {
+                self.change_workspace_root(path);
+            }
+            return true;
+        }
         false
+    }
+
+    /// Resolve the parent folder of the highlighted node for the
+    /// `Cmd+Shift+/` "Make root at parent" gesture. Works on files
+    /// (parent = containing directory), folders (parent = its parent),
+    /// and the tree root itself (parent = one filesystem level up).
+    /// Returns `None` when the selected path has no parent (filesystem
+    /// root) or no node is currently selected.
+    fn explorer_parent_for_make_root(&self) -> Option<PathBuf> {
+        let n = self.tree.nodes.get(self.tree.selected)?;
+        n.path.parent().map(|p| p.to_path_buf())
     }
 
     fn explorer_selected_path(&self) -> Option<PathBuf> {
@@ -6782,6 +6799,28 @@ fn is_tree_make_root_key(key: KeyEvent) -> bool {
         return false;
     }
     key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::SUPER)
+}
+
+/// Explorer-pane shortcut: `Cmd+Shift+/` / `Ctrl+Shift+/` - "Make root at
+/// parent". Re-roots the workspace at the parent of the selected node
+/// (file or folder). The selected node itself remains on disk and the
+/// new root is one filesystem level up. Terminals that strip Shift on
+/// shifted punctuation report `?`; we accept both `/+Shift` and `?` to
+/// cover the spread.
+fn is_tree_make_parent_root_key(key: KeyEvent) -> bool {
+    if key.modifiers.contains(KeyModifiers::ALT) {
+        return false;
+    }
+    let has_ctrl_or_super = key.modifiers.contains(KeyModifiers::CONTROL)
+        || key.modifiers.contains(KeyModifiers::SUPER);
+    if !has_ctrl_or_super {
+        return false;
+    }
+    match key.code {
+        KeyCode::Char('/') => key.modifiers.contains(KeyModifiers::SHIFT),
+        KeyCode::Char('?') => true,
+        _ => false,
+    }
 }
 
 /// `Ctrl/Cmd+Shift+G`: jump to the Source Control sidebar view, matching
@@ -8779,6 +8818,18 @@ mod tests {
         assert!(is_tree_make_root_key(key(KeyCode::Char('/'), KeyModifiers::SUPER)));
         assert!(is_tree_make_root_key(key(KeyCode::Char('/'), KeyModifiers::CONTROL)));
         assert!(!is_tree_make_root_key(key(KeyCode::Char('/'), KeyModifiers::NONE)));
+
+        let cmd_shift = KeyModifiers::SUPER | KeyModifiers::SHIFT;
+        let ctrl_shift = KeyModifiers::CONTROL | KeyModifiers::SHIFT;
+        assert!(is_tree_make_parent_root_key(key(KeyCode::Char('/'), cmd_shift)));
+        assert!(is_tree_make_parent_root_key(key(KeyCode::Char('/'), ctrl_shift)));
+        assert!(is_tree_make_parent_root_key(key(KeyCode::Char('?'), KeyModifiers::SUPER)));
+        assert!(is_tree_make_parent_root_key(key(KeyCode::Char('?'), KeyModifiers::CONTROL)));
+        assert!(is_tree_make_parent_root_key(key(KeyCode::Char('?'), cmd_shift)));
+        assert!(!is_tree_make_parent_root_key(key(KeyCode::Char('/'), KeyModifiers::SUPER)));
+        assert!(!is_tree_make_parent_root_key(key(KeyCode::Char('/'), KeyModifiers::NONE)));
+        assert!(!is_tree_make_parent_root_key(key(KeyCode::Char('?'), KeyModifiers::NONE)));
+        assert!(!is_tree_make_root_key(key(KeyCode::Char('/'), cmd_shift)));
     }
 
     #[test]
@@ -9023,6 +9074,90 @@ mod tests {
             !labels.contains(&"Make root"),
             "files cannot be roots; Make root must be hidden for files: {labels:?}"
         );
+    }
+
+    #[test]
+    fn cmd_shift_slash_on_a_file_changes_workspace_root_to_the_file_s_parent_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let inner = tmp.path().join("inner");
+        std::fs::create_dir(&inner).unwrap();
+        let file = inner.join("note.txt");
+        std::fs::write(&file, "").unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        let target_idx = app
+            .tree
+            .nodes
+            .iter()
+            .position(|n| n.path == file)
+            .or_else(|| {
+                let i = app.tree.nodes.iter().position(|n| n.path == inner).unwrap();
+                app.tree.selected = i;
+                app.tree.expand_selected();
+                app.tree.nodes.iter().position(|n| n.path == file)
+            })
+            .expect("file node must be visible after expanding inner/");
+        app.tree.selected = target_idx;
+        app.focus = Pane::Tree;
+        app.sidebar_view = SidebarView::Explorer;
+
+        let handled = app.handle_explorer_shortcut(key(
+            KeyCode::Char('/'),
+            KeyModifiers::SUPER | KeyModifiers::SHIFT,
+        ));
+
+        assert!(handled, "Cmd+Shift+/ must be handled by the Explorer dispatcher");
+        assert_eq!(app.workspace_root, inner);
+        assert_eq!(app.tree.root, inner);
+    }
+
+    #[test]
+    fn cmd_shift_slash_on_a_folder_changes_workspace_root_to_that_folder_s_parent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mid = tmp.path().join("mid");
+        let leaf = mid.join("leaf");
+        std::fs::create_dir_all(&leaf).unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        let mid_idx = app.tree.nodes.iter().position(|n| n.path == mid).unwrap();
+        app.tree.selected = mid_idx;
+        app.tree.expand_selected();
+        let leaf_idx = app
+            .tree
+            .nodes
+            .iter()
+            .position(|n| n.path == leaf)
+            .expect("leaf must be visible after expanding mid/");
+        app.tree.selected = leaf_idx;
+        app.focus = Pane::Tree;
+        app.sidebar_view = SidebarView::Explorer;
+
+        let handled = app.handle_explorer_shortcut(key(
+            KeyCode::Char('?'),
+            KeyModifiers::SUPER,
+        ));
+
+        assert!(handled);
+        assert_eq!(app.workspace_root, mid);
+        assert_eq!(app.tree.root, mid);
+    }
+
+    #[test]
+    fn cmd_shift_slash_on_the_tree_root_walks_up_one_filesystem_level() {
+        let tmp = tempfile::tempdir().unwrap();
+        let inner = tmp.path().join("inner");
+        std::fs::create_dir(&inner).unwrap();
+        let mut app = App::new(inner.clone()).unwrap();
+        app.tree.selected = 0;
+        app.focus = Pane::Tree;
+        app.sidebar_view = SidebarView::Explorer;
+
+        let handled = app.handle_explorer_shortcut(key(
+            KeyCode::Char('/'),
+            KeyModifiers::SUPER | KeyModifiers::SHIFT,
+        ));
+
+        assert!(handled);
+        assert_eq!(app.workspace_root, tmp.path());
+        assert_eq!(app.tree.root, tmp.path());
     }
 
     #[test]
