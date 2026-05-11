@@ -1334,6 +1334,67 @@ impl Editor {
         self.last_edit_kind = None;
     }
 
+    /// Word-step right (Option+Right on macOS, Ctrl+Right elsewhere). Skips
+    /// any non-word run starting at the cursor — across line boundaries —
+    /// then skips the following word run on the line where it landed and
+    /// stops. Word chars are ASCII alphanumerics + underscore; everything
+    /// else (whitespace, punctuation, EOL) is non-word. Mirrors readline
+    /// `forward-word` and VS Code's "Cursor Word Right" command.
+    pub fn move_word_right(&mut self) {
+        loop {
+            let chars: Vec<char> = self.lines[self.cursor_row].chars().collect();
+            while self.cursor_col < chars.len() && !is_word_char(chars[self.cursor_col]) {
+                self.cursor_col += 1;
+            }
+            if self.cursor_col < chars.len() {
+                break;
+            }
+            if self.cursor_row + 1 < self.lines.len() {
+                self.cursor_row += 1;
+                self.cursor_col = 0;
+            } else {
+                self.ensure_cursor_col_visible();
+                self.last_edit_kind = None;
+                return;
+            }
+        }
+        let chars: Vec<char> = self.lines[self.cursor_row].chars().collect();
+        while self.cursor_col < chars.len() && is_word_char(chars[self.cursor_col]) {
+            self.cursor_col += 1;
+        }
+        self.ensure_cursor_col_visible();
+        self.last_edit_kind = None;
+    }
+
+    /// Word-step left (Option+Left on macOS). Symmetric to `move_word_right`:
+    /// skips non-word chars backwards across line boundaries, then walks
+    /// back over the preceding word run, landing on its first char.
+    pub fn move_word_left(&mut self) {
+        loop {
+            let chars: Vec<char> = self.lines[self.cursor_row].chars().collect();
+            while self.cursor_col > 0 && !is_word_char(chars[self.cursor_col - 1]) {
+                self.cursor_col -= 1;
+            }
+            if self.cursor_col > 0 {
+                break;
+            }
+            if self.cursor_row > 0 {
+                self.cursor_row -= 1;
+                self.cursor_col = self.line_char_len(self.cursor_row);
+            } else {
+                self.ensure_cursor_col_visible();
+                self.last_edit_kind = None;
+                return;
+            }
+        }
+        let chars: Vec<char> = self.lines[self.cursor_row].chars().collect();
+        while self.cursor_col > 0 && is_word_char(chars[self.cursor_col - 1]) {
+            self.cursor_col -= 1;
+        }
+        self.ensure_cursor_col_visible();
+        self.last_edit_kind = None;
+    }
+
     pub fn scroll_left_by(&mut self, n: usize) {
         self.scroll_col = self.scroll_col.saturating_sub(n);
     }
@@ -2011,6 +2072,115 @@ mod tests {
         let mut e = Editor::new();
         e.lines = (0..n).map(|i| format!("line {i}")).collect();
         e
+    }
+
+    #[test]
+    fn move_word_right_jumps_to_end_of_current_word() {
+        let mut e = editor_with("hello world");
+        e.cursor_row = 0;
+        e.cursor_col = 0;
+        e.move_word_right();
+        assert_eq!((e.cursor_row, e.cursor_col), (0, 5));
+    }
+
+    #[test]
+    fn move_word_right_skips_intervening_whitespace_and_lands_at_end_of_next_word() {
+        let mut e = editor_with("hello   world!!!end");
+        e.cursor_row = 0;
+        e.cursor_col = 5;
+        e.move_word_right();
+        assert_eq!(
+            (e.cursor_row, e.cursor_col),
+            (0, 13),
+            "from end of 'hello' the next forward-word skips the spaces and stops at end of 'world'"
+        );
+        e.move_word_right();
+        assert_eq!(
+            (e.cursor_row, e.cursor_col),
+            (0, 19),
+            "second forward-word skips '!!!' and lands at end of 'end'"
+        );
+    }
+
+    #[test]
+    fn move_word_right_at_eol_advances_to_first_word_boundary_on_next_line() {
+        let mut e = editor_with("foo\n  bar baz");
+        e.cursor_row = 0;
+        e.cursor_col = 3;
+        e.move_word_right();
+        assert_eq!((e.cursor_row, e.cursor_col), (1, 5));
+    }
+
+    #[test]
+    fn move_word_right_at_eof_is_a_noop() {
+        let mut e = editor_with("hi");
+        e.cursor_row = 0;
+        e.cursor_col = 2;
+        e.move_word_right();
+        assert_eq!((e.cursor_row, e.cursor_col), (0, 2));
+    }
+
+    #[test]
+    fn move_word_right_treats_underscore_as_part_of_the_word() {
+        let mut e = editor_with("snake_case rest");
+        e.cursor_row = 0;
+        e.cursor_col = 0;
+        e.move_word_right();
+        assert_eq!(
+            (e.cursor_row, e.cursor_col),
+            (0, 10),
+            "underscore is a word char so the whole identifier is one word"
+        );
+    }
+
+    #[test]
+    fn move_word_left_jumps_to_start_of_current_word() {
+        let mut e = editor_with("hello world");
+        e.cursor_row = 0;
+        e.cursor_col = 11;
+        e.move_word_left();
+        assert_eq!((e.cursor_row, e.cursor_col), (0, 6));
+    }
+
+    #[test]
+    fn move_word_left_skips_back_over_whitespace_and_punctuation() {
+        let mut e = editor_with("hello   world!!!end");
+        e.cursor_row = 0;
+        e.cursor_col = 19;
+        e.move_word_left();
+        assert_eq!(
+            (e.cursor_row, e.cursor_col),
+            (0, 16),
+            "from end of 'end' the backward-word lands at start of 'end'"
+        );
+        e.move_word_left();
+        assert_eq!(
+            (e.cursor_row, e.cursor_col),
+            (0, 8),
+            "next backward-word skips '!!!' and lands at start of 'world'"
+        );
+    }
+
+    #[test]
+    fn move_word_left_at_bol_jumps_to_end_of_previous_line() {
+        let mut e = editor_with("foo bar\nbaz");
+        e.cursor_row = 1;
+        e.cursor_col = 0;
+        e.move_word_left();
+        assert_eq!(
+            (e.cursor_row, e.cursor_col),
+            (0, 4),
+            "backward-word from start of line 1 should cross the boundary and land at start of 'bar' on line 0"
+        );
+    }
+
+    #[test]
+    fn move_word_left_at_bof_is_a_noop() {
+        let mut e = editor_with("hi");
+        e.cursor_row = 0;
+        e.cursor_col = 0;
+        e.move_word_left();
+        assert_eq!((e.cursor_row, e.cursor_col), (0, 0));
     }
 
     #[test]

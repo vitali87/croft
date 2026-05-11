@@ -3985,6 +3985,7 @@ impl App {
                 | KeyCode::PageUp
                 | KeyCode::PageDown
         );
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
         if is_motion && shift {
             if self.editor.selection.is_none() {
                 self.editor.start_selection_at_cursor();
@@ -3992,6 +3993,8 @@ impl App {
             match key.code {
                 KeyCode::Up => self.editor.move_up(),
                 KeyCode::Down => self.editor.move_down(),
+                KeyCode::Left if alt => self.editor.move_word_left(),
+                KeyCode::Right if alt => self.editor.move_word_right(),
                 KeyCode::Left => self.editor.move_left(),
                 KeyCode::Right => self.editor.move_right(),
                 KeyCode::Home => self.editor.home_line(),
@@ -4012,6 +4015,8 @@ impl App {
         match key.code {
             KeyCode::Up => self.editor.move_up(),
             KeyCode::Down => self.editor.move_down(),
+            KeyCode::Left if alt => self.editor.move_word_left(),
+            KeyCode::Right if alt => self.editor.move_word_right(),
             KeyCode::Left => self.editor.move_left(),
             KeyCode::Right => self.editor.move_right(),
             KeyCode::PageUp => self.editor.page_up_one_screen(),
@@ -7039,6 +7044,8 @@ fn key_to_bytes(key: KeyEvent) -> Vec<u8> {
         Esc => vec![0x1b],
         Up => b"\x1b[A".to_vec(),
         Down => b"\x1b[B".to_vec(),
+        Right if alt => b"\x1bf".to_vec(),
+        Left if alt => b"\x1bb".to_vec(),
         Right => b"\x1b[C".to_vec(),
         Left => b"\x1b[D".to_vec(),
         Home => b"\x1b[H".to_vec(),
@@ -7789,6 +7796,30 @@ mod tests {
     fn key_to_bytes_alt_letter_prefixes_esc() {
         let bytes = key_to_bytes(key(KeyCode::Char('x'), KeyModifiers::ALT));
         assert_eq!(bytes, vec![0x1b, b'x']);
+    }
+
+    #[test]
+    fn key_to_bytes_alt_left_emits_esc_b_for_readline_backward_word() {
+        let bytes = key_to_bytes(key(KeyCode::Left, KeyModifiers::ALT));
+        assert_eq!(
+            bytes, b"\x1bb",
+            "Option+Left in the terminal must send ESC b so zsh/bash readline runs backward-word"
+        );
+    }
+
+    #[test]
+    fn key_to_bytes_alt_right_emits_esc_f_for_readline_forward_word() {
+        let bytes = key_to_bytes(key(KeyCode::Right, KeyModifiers::ALT));
+        assert_eq!(
+            bytes, b"\x1bf",
+            "Option+Right in the terminal must send ESC f so zsh/bash readline runs forward-word"
+        );
+    }
+
+    #[test]
+    fn key_to_bytes_plain_arrows_unchanged_when_alt_not_held() {
+        assert_eq!(key_to_bytes(key(KeyCode::Left, KeyModifiers::NONE)), b"\x1b[D");
+        assert_eq!(key_to_bytes(key(KeyCode::Right, KeyModifiers::NONE)), b"\x1b[C");
     }
 
     #[test]
@@ -9333,6 +9364,51 @@ mod tests {
             .unwrap();
 
         assert_eq!(app.search.query, "needle");
+    }
+
+    #[test]
+    fn editor_alt_right_jumps_one_word_forward() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.focus_pane(Pane::Editor);
+        app.editor.lines = vec![String::from("hello world rest")];
+        app.editor.cursor_row = 0;
+        app.editor.cursor_col = 0;
+        app.handle_key(key(KeyCode::Right, KeyModifiers::ALT)).unwrap();
+        assert_eq!(app.editor.cursor_col, 5);
+        app.handle_key(key(KeyCode::Right, KeyModifiers::ALT)).unwrap();
+        assert_eq!(app.editor.cursor_col, 11);
+    }
+
+    #[test]
+    fn editor_alt_left_jumps_one_word_backward() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.focus_pane(Pane::Editor);
+        app.editor.lines = vec![String::from("hello world rest")];
+        app.editor.cursor_row = 0;
+        app.editor.cursor_col = 16;
+        app.handle_key(key(KeyCode::Left, KeyModifiers::ALT)).unwrap();
+        assert_eq!(app.editor.cursor_col, 12);
+        app.handle_key(key(KeyCode::Left, KeyModifiers::ALT)).unwrap();
+        assert_eq!(app.editor.cursor_col, 6);
+    }
+
+    #[test]
+    fn editor_shift_alt_right_extends_selection_by_word() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.focus_pane(Pane::Editor);
+        app.editor.lines = vec![String::from("hello world")];
+        app.editor.cursor_row = 0;
+        app.editor.cursor_col = 0;
+        app.handle_key(key(KeyCode::Right, KeyModifiers::ALT | KeyModifiers::SHIFT))
+            .unwrap();
+        assert_eq!(
+            app.editor.selection_text(),
+            "hello",
+            "Shift+Option+Right should select from cursor to the next word boundary"
+        );
     }
 
     #[test]
