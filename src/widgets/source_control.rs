@@ -14,6 +14,17 @@ const BUTTON_BG_RGB: (u8, u8, u8) = (0x09, 0x67, 0xb8);
 const BUTTON_FG_RGB: (u8, u8, u8) = (0xff, 0xff, 0xff);
 const SECTION_HEADER_RGB: (u8, u8, u8) = (0xcc, 0xcc, 0xcc);
 
+pub const DISCARD_GLYPH: char = '\u{21b6}';
+pub const STAGE_GLYPH: char = '+';
+const ROW_ACTIONS_WIDTH: u16 = 4;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RowActionAreas {
+    pub entry_idx: usize,
+    pub discard: Rect,
+    pub stage: Rect,
+}
+
 pub struct SourceControlPanel {
     pub focused: bool,
     pub message: String,
@@ -50,6 +61,11 @@ pub struct SourceControlPanel {
     /// Cleared on the next refresh.
     pub commit_feedback: Option<String>,
     pub commit_feedback_is_error: bool,
+    /// Hit-test rects for the inline action icons (Discard, Stage) painted
+    /// on the selected unstaged row. `None` when no row is selected or the
+    /// selected row is already staged. Cleared at the top of each render
+    /// and re-populated for the visible selected row.
+    pub last_row_actions: Option<RowActionAreas>,
 }
 
 impl SourceControlPanel {
@@ -73,7 +89,24 @@ impl SourceControlPanel {
             selected_change: None,
             commit_feedback: None,
             commit_feedback_is_error: false,
+            last_row_actions: None,
         }
+    }
+
+    /// Returns the entry index when (x, y) lands inside the Discard icon
+    /// of the currently-selected row. The widget only paints this icon on
+    /// the selected unstaged row, so a hit implies that row is the action
+    /// target.
+    pub fn click_discard_action(&self, x: u16, y: u16) -> Option<usize> {
+        let a = self.last_row_actions?;
+        rect_hit(a.discard, x, y).then_some(a.entry_idx)
+    }
+
+    /// Returns the entry index when (x, y) lands inside the Stage icon of
+    /// the currently-selected row. Mirrors `click_discard_action`.
+    pub fn click_stage_action(&self, x: u16, y: u16) -> Option<usize> {
+        let a = self.last_row_actions?;
+        rect_hit(a.stage, x, y).then_some(a.entry_idx)
     }
 
     pub fn set_status(&mut self, status: GitStatus, entries: Vec<ChangeEntry>) {
@@ -634,6 +667,7 @@ impl Widget for &mut SourceControlPanel {
         self.last_button_area = Rect::default();
         self.last_list_area = Rect::default();
         self.last_scrollbar = Rect::default();
+        self.last_row_actions = None;
 
         if inner.height == 0 || inner.width == 0 {
             return;
@@ -927,13 +961,45 @@ impl Widget for &mut SourceControlPanel {
                     let icon_x = row_rect.x + 1;
                     buf.set_string(icon_x, row_y, icon.glyph.to_string(), icon_style);
                     let text_x = icon_x + 2;
-                    let text_w = badge_x.saturating_sub(text_x).saturating_sub(1);
+                    // Reserve a 4-cell strip before the badge for inline
+                    // action icons on the selected unstaged row:
+                    //   [discard][gap][stage][gap-before-badge]
+                    // Already-staged entries get no icons (stage would be a
+                    // no-op; we deliberately don't show unstage to keep the
+                    // surface to the two actions the user asked for).
+                    let text_w_unreserved = badge_x.saturating_sub(text_x).saturating_sub(1);
+                    let show_actions = is_selected
+                        && entry.kind.section() != ChangeSection::Staged
+                        && text_w_unreserved > ROW_ACTIONS_WIDTH;
+                    let text_w_reserved = if show_actions { ROW_ACTIONS_WIDTH } else { 0 };
+                    let text_w = text_w_unreserved.saturating_sub(text_w_reserved);
                     if text_w > 0 {
                         let path_para = Paragraph::new(path_str).style(path_style);
                         path_para.render(
                             Rect { x: text_x, y: row_y, width: text_w, height: 1 },
                             buf,
                         );
+                    }
+                    if show_actions {
+                        let discard_x = badge_x - 4;
+                        let stage_x = badge_x - 2;
+                        let action_fg = Color::Rgb(0xd4, 0xd9, 0xe2);
+                        let mut action_style = Style::default().fg(action_fg);
+                        if let Some(bg) = row_bg {
+                            action_style = action_style.bg(bg);
+                        }
+                        buf.set_string(
+                            discard_x,
+                            row_y,
+                            DISCARD_GLYPH.to_string(),
+                            action_style,
+                        );
+                        buf.set_string(stage_x, row_y, STAGE_GLYPH.to_string(), action_style);
+                        self.last_row_actions = Some(RowActionAreas {
+                            entry_idx: *entry_idx,
+                            discard: Rect { x: discard_x, y: row_y, width: 1, height: 1 },
+                            stage: Rect { x: stage_x, y: row_y, width: 1, height: 1 },
+                        });
                     }
                 }
             }
@@ -1508,6 +1574,145 @@ mod tests {
             p.cursor_screen_pos(),
             None,
             "caret must hide before the first render (last_input_area is still default)"
+        );
+    }
+
+    #[test]
+    fn selected_unstaged_row_paints_discard_and_stage_icons_before_the_badge() {
+        let mut p = SourceControlPanel::new();
+        p.set_status(
+            dummy_status_with_branch("main"),
+            vec![ChangeEntry { path: "ch.py".into(), kind: ChangeKind::Modified }],
+        );
+        let area = Rect { x: 0, y: 0, width: 60, height: 20 };
+        let mut buf = Buffer::empty(area);
+        ratatui::widgets::Widget::render(&mut p, area, &mut buf);
+        // First render learns the row coordinate; click-select it.
+        let row_y = (area.y..area.y + area.height)
+            .find(|y| {
+                let mut row = String::new();
+                for x in area.x..area.x + area.width {
+                    row.push_str(buf[(x, *y)].symbol());
+                }
+                row.contains("ch.py")
+            })
+            .expect("ch.py row must render");
+        p.select_change_at(row_y);
+        let mut buf = Buffer::empty(area);
+        ratatui::widgets::Widget::render(&mut p, area, &mut buf);
+        let actions = p
+            .last_row_actions
+            .expect("selected unstaged row must record action hit rects");
+        assert_eq!(actions.entry_idx, 0);
+        assert_eq!(
+            buf[(actions.discard.x, actions.discard.y)].symbol(),
+            DISCARD_GLYPH.to_string().as_str(),
+            "discard icon must paint at the recorded hit cell"
+        );
+        assert_eq!(
+            buf[(actions.stage.x, actions.stage.y)].symbol(),
+            STAGE_GLYPH.to_string().as_str(),
+            "stage icon must paint at the recorded hit cell"
+        );
+        // Stage sits to the right of discard, both before the badge.
+        assert!(actions.discard.x < actions.stage.x);
+    }
+
+    #[test]
+    fn unselected_rows_paint_no_action_icons() {
+        let mut p = SourceControlPanel::new();
+        p.set_status(
+            dummy_status_with_branch("main"),
+            vec![
+                ChangeEntry { path: "a.py".into(), kind: ChangeKind::Modified },
+                ChangeEntry { path: "b.py".into(), kind: ChangeKind::Modified },
+            ],
+        );
+        // No selection ⇒ no row should sprout action icons.
+        let area = Rect { x: 0, y: 0, width: 60, height: 20 };
+        let mut buf = Buffer::empty(area);
+        ratatui::widgets::Widget::render(&mut p, area, &mut buf);
+        assert!(p.last_row_actions.is_none(), "no selection ⇒ no action icons");
+        let dump = buffer_to_string(&buf);
+        assert!(
+            !dump.contains(DISCARD_GLYPH),
+            "discard glyph must not paint on any row when nothing is selected: {dump}"
+        );
+    }
+
+    #[test]
+    fn selected_staged_row_paints_no_action_icons() {
+        let mut p = SourceControlPanel::new();
+        p.set_status(
+            dummy_status_with_branch("main"),
+            vec![ChangeEntry { path: "s.py".into(), kind: ChangeKind::StagedModified }],
+        );
+        let area = Rect { x: 0, y: 0, width: 60, height: 20 };
+        let mut buf = Buffer::empty(area);
+        ratatui::widgets::Widget::render(&mut p, area, &mut buf);
+        let row_y = (area.y..area.y + area.height)
+            .find(|y| {
+                let mut row = String::new();
+                for x in area.x..area.x + area.width {
+                    row.push_str(buf[(x, *y)].symbol());
+                }
+                row.contains("s.py")
+            })
+            .expect("s.py row must render");
+        p.select_change_at(row_y);
+        let mut buf = Buffer::empty(area);
+        ratatui::widgets::Widget::render(&mut p, area, &mut buf);
+        assert!(
+            p.last_row_actions.is_none(),
+            "Staged rows expose neither Discard nor Stage (no-op); the user asked for these two icons only"
+        );
+    }
+
+    #[test]
+    fn click_discard_action_returns_entry_idx_only_inside_the_rect() {
+        let mut p = SourceControlPanel::new();
+        p.last_row_actions = Some(RowActionAreas {
+            entry_idx: 7,
+            discard: Rect { x: 10, y: 5, width: 1, height: 1 },
+            stage: Rect { x: 12, y: 5, width: 1, height: 1 },
+        });
+        assert_eq!(p.click_discard_action(10, 5), Some(7));
+        assert_eq!(p.click_discard_action(12, 5), None, "stage cell is not discard");
+        assert_eq!(p.click_discard_action(11, 5), None, "gap cell is not discard");
+        assert_eq!(p.click_discard_action(10, 6), None, "wrong row");
+    }
+
+    #[test]
+    fn click_stage_action_returns_entry_idx_only_inside_the_rect() {
+        let mut p = SourceControlPanel::new();
+        p.last_row_actions = Some(RowActionAreas {
+            entry_idx: 3,
+            discard: Rect { x: 10, y: 5, width: 1, height: 1 },
+            stage: Rect { x: 12, y: 5, width: 1, height: 1 },
+        });
+        assert_eq!(p.click_stage_action(12, 5), Some(3));
+        assert_eq!(p.click_stage_action(10, 5), None, "discard cell is not stage");
+        assert_eq!(p.click_stage_action(13, 5), None, "outside stage rect");
+    }
+
+    #[test]
+    fn action_icons_are_suppressed_at_narrow_widths_so_the_path_stays_legible() {
+        let mut p = SourceControlPanel::new();
+        p.set_status(
+            dummy_status_with_branch("main"),
+            vec![ChangeEntry { path: "a.py".into(), kind: ChangeKind::Modified }],
+        );
+        // Width 10 leaves only a few cells for the path; reserving 4 cells
+        // for icons would clobber it. The widget must skip icons rather
+        // than overlap. Force selection directly since the row may sit
+        // below the visible viewport at this tiny size.
+        p.selected_change = Some(0);
+        let area = Rect { x: 0, y: 0, width: 10, height: 60 };
+        let mut buf = Buffer::empty(area);
+        ratatui::widgets::Widget::render(&mut p, area, &mut buf);
+        assert!(
+            p.last_row_actions.is_none(),
+            "narrow rows must skip the action icons rather than overlap the path"
         );
     }
 

@@ -473,6 +473,12 @@ struct Prompt {
     error: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingDiscard {
+    rel_path: String,
+    untracked: bool,
+}
+
 pub struct App {
     pub tree: FileTree,
     pub search: SearchPanel,
@@ -688,6 +694,12 @@ pub struct App {
     /// launched croft only). When `Some`, a modal asks Y/A/N and all
     /// other keys are swallowed.
     pending_local_open: Option<String>,
+    /// Source Control entry awaiting Y/N confirmation for destructive
+    /// `Discard Changes`. Holds the relative path and whether it was an
+    /// Untracked entry (Untracked discard deletes the file from disk;
+    /// tracked discard runs `git checkout HEAD -- <path>`). Both paths
+    /// destroy uncommitted work, so the modal must always run first.
+    pending_discard: Option<PendingDiscard>,
     /// True after the user has chosen "Always for this session" on the
     /// local-browser confirmation. Subsequent link clicks dispatch to
     /// the relay silently.
@@ -1194,6 +1206,7 @@ impl App {
             pending_scp_uploads: Vec::new(),
             pending_remote_pulls: Vec::new(),
             pending_local_open: None,
+            pending_discard: None,
             trust_local_browser: false,
             sidebar_width: SIDEBAR_WIDTH_DEFAULT,
             terminal_height: None,
@@ -2974,6 +2987,7 @@ impl App {
         self.render_context_menu(frame);
         self.render_prompt(frame);
         self.render_local_open_confirm(frame);
+        self.render_discard_confirm(frame);
 
         // Show the host terminal's hardware caret only when the editor is
         // focused and has no modal overlay. The DECSCUSR style is set to
@@ -3065,6 +3079,66 @@ impl App {
                 }
             }
         }
+    }
+
+    fn render_discard_confirm(&self, frame: &mut ratatui::Frame) {
+        let Some(pd) = self.pending_discard.as_ref() else { return };
+        let area = frame.area();
+        let width = area.width.saturating_sub(8).min(96).max(50);
+        let height: u16 = 8;
+        let x = (area.width.saturating_sub(width)) / 2 + area.x;
+        let y = (area.height.saturating_sub(height)) / 2 + area.y;
+        let rect = Rect { x, y, width, height };
+        let warn = Color::Rgb(0xe7, 0x70, 0x70);
+        let block = ratatui::widgets::Block::default()
+            .borders(ratatui::widgets::Borders::ALL)
+            .border_style(Style::default().fg(warn))
+            .style(Style::default().bg(Color::Rgb(0x1e, 0x1e, 0x1e)))
+            .title(ratatui::text::Span::styled(
+                " DISCARD CHANGES? ",
+                Style::default()
+                    .fg(Color::White)
+                    .bg(warn)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        frame.render_widget(ratatui::widgets::Clear, rect);
+        frame.render_widget(block, rect);
+        let inner = Rect {
+            x: rect.x + 2,
+            y: rect.y + 1,
+            width: rect.width.saturating_sub(4),
+            height: rect.height.saturating_sub(2),
+        };
+        let warn_text = if pd.untracked {
+            "This will permanently delete the file from disk."
+        } else {
+            "This will overwrite your local changes from HEAD."
+        };
+        let body = ratatui::text::Text::from(vec![
+            ratatui::text::Line::from(ratatui::text::Span::styled(
+                warn_text,
+                Style::default().fg(Color::White),
+            )),
+            ratatui::text::Line::from(""),
+            ratatui::text::Line::from(ratatui::text::Span::styled(
+                truncate_for_display(&pd.rel_path, inner.width as usize),
+                Style::default().fg(Color::Rgb(0xeb, 0xcb, 0x8b)),
+            )),
+            ratatui::text::Line::from(""),
+            ratatui::text::Line::from(vec![
+                ratatui::text::Span::styled(
+                    "[Y]",
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                ),
+                ratatui::text::Span::raw("es, discard   "),
+                ratatui::text::Span::styled(
+                    "[N]",
+                    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                ),
+                ratatui::text::Span::raw("o / Esc"),
+            ]),
+        ]);
+        frame.render_widget(ratatui::widgets::Paragraph::new(body), inner);
     }
 
     fn render_local_open_confirm(&self, frame: &mut ratatui::Frame) {
@@ -3217,6 +3291,21 @@ impl App {
         // Modal layer: local-browser confirmation eats every key.
         if self.pending_local_open.is_some() {
             self.handle_local_open_confirm_key(key);
+            return Ok(());
+        }
+        // Modal layer: discard-changes confirmation eats every key. Y/Enter
+        // discards; N/Esc cancels. Anything else is swallowed so the user
+        // can't accidentally type-through into the editor below.
+        if self.pending_discard.is_some() {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                    self.confirm_pending_discard();
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    self.cancel_pending_discard();
+                }
+                _ => {}
+            }
             return Ok(());
         }
         // Modal layer: open context menu eats keyboard navigation.
@@ -3667,6 +3756,62 @@ impl App {
                 self.status = format!("git init failed: {e}");
             }
         }
+    }
+
+    pub fn stage_source_control_entry(&mut self, entry_idx: usize) {
+        let Some(entry) = self.source_control.entries.get(entry_idx).cloned() else {
+            return;
+        };
+        match crate::git::stage_path(&self.tree.root, &entry.path) {
+            Ok(()) => {
+                self.status = format!("Staged {}", entry.path);
+                self.last_git_check = std::time::Instant::now()
+                    .checked_sub(std::time::Duration::from_secs(1))
+                    .unwrap_or_else(std::time::Instant::now);
+                self.refresh_git_status_debounced();
+                self.refresh_source_control();
+            }
+            Err(err) => {
+                self.status = format!("Stage failed: {err}");
+                self.source_control.commit_feedback = Some(err);
+                self.source_control.commit_feedback_is_error = true;
+            }
+        }
+    }
+
+    pub fn request_discard_source_control_entry(&mut self, entry_idx: usize) {
+        use crate::git::ChangeKind;
+        let Some(entry) = self.source_control.entries.get(entry_idx).cloned() else {
+            return;
+        };
+        let untracked = matches!(entry.kind, ChangeKind::Untracked);
+        self.pending_discard = Some(PendingDiscard {
+            rel_path: entry.path,
+            untracked,
+        });
+    }
+
+    pub fn confirm_pending_discard(&mut self) {
+        let Some(pd) = self.pending_discard.take() else { return };
+        match crate::git::discard_path(&self.tree.root, &pd.rel_path, pd.untracked) {
+            Ok(()) => {
+                self.status = format!("Discarded {}", pd.rel_path);
+                self.last_git_check = std::time::Instant::now()
+                    .checked_sub(std::time::Duration::from_secs(1))
+                    .unwrap_or_else(std::time::Instant::now);
+                self.refresh_git_status_debounced();
+                self.refresh_source_control();
+            }
+            Err(err) => {
+                self.status = format!("Discard failed: {err}");
+                self.source_control.commit_feedback = Some(err);
+                self.source_control.commit_feedback_is_error = true;
+            }
+        }
+    }
+
+    pub fn cancel_pending_discard(&mut self) {
+        self.pending_discard = None;
     }
 
     fn commit_source_control(&mut self) {
@@ -4931,6 +5076,18 @@ impl App {
                         return;
                     }
                     if self.source_control.click_input(m.column, m.row) {
+                        return;
+                    }
+                    if let Some(idx) =
+                        self.source_control.click_discard_action(m.column, m.row)
+                    {
+                        self.request_discard_source_control_entry(idx);
+                        return;
+                    }
+                    if let Some(idx) =
+                        self.source_control.click_stage_action(m.column, m.row)
+                    {
+                        self.stage_source_control_entry(idx);
                         return;
                     }
                     if let Some(idx) = self.source_control.entry_at_y(m.row) {
@@ -9491,6 +9648,285 @@ mod tests {
             app.source_control.status,
         );
         assert_eq!(app.source_control.status.branch.as_deref(), Some("main"));
+    }
+
+    fn make_committed_repo() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path();
+        let _ = std::process::Command::new("git")
+            .args(["-C"]).arg(p)
+            .args(["init", "-q", "-b", "main"])
+            .output();
+        let _ = std::process::Command::new("git")
+            .args(["-C"]).arg(p)
+            .args(["config", "user.email", "a@b"])
+            .status();
+        let _ = std::process::Command::new("git")
+            .args(["-C"]).arg(p)
+            .args(["config", "user.name", "a"])
+            .status();
+        std::fs::write(p.join("seed.txt"), b"seed\n").unwrap();
+        let _ = std::process::Command::new("git")
+            .args(["-C"]).arg(p)
+            .args(["add", "seed.txt"])
+            .status();
+        let _ = std::process::Command::new("git")
+            .args(["-C"]).arg(p)
+            .args(["commit", "-q", "-m", "init"])
+            .status();
+        tmp
+    }
+
+    fn wait_for_changes(app: &mut App, predicate: impl Fn(&App) -> bool) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let mut next_kick = std::time::Instant::now();
+        while std::time::Instant::now() < deadline {
+            if std::time::Instant::now() >= next_kick {
+                app.refresh_source_control();
+                next_kick = std::time::Instant::now() + std::time::Duration::from_millis(200);
+            }
+            app.drain_git_responses();
+            if predicate(app) {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        predicate(app)
+    }
+
+    #[test]
+    fn stage_source_control_entry_runs_git_add_and_flips_kind_to_staged() {
+        let tmp = make_committed_repo();
+        std::fs::write(tmp.path().join("seed.txt"), b"changed\n").unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        assert!(
+            wait_for_changes(&mut app, |a| a
+                .source_control
+                .entries
+                .iter()
+                .any(|e| e.path == "seed.txt"
+                    && e.kind == crate::git::ChangeKind::Modified)),
+            "preconditions: seed.txt must appear as Modified"
+        );
+        let idx = app
+            .source_control
+            .entries
+            .iter()
+            .position(|e| e.path == "seed.txt")
+            .unwrap();
+        app.stage_source_control_entry(idx);
+        assert!(
+            wait_for_changes(&mut app, |a| a
+                .source_control
+                .entries
+                .iter()
+                .any(|e| e.path == "seed.txt"
+                    && e.kind == crate::git::ChangeKind::StagedModified)),
+            "after stage_source_control_entry the file must read as StagedModified; saw {:?}",
+            app.source_control.entries,
+        );
+    }
+
+    #[test]
+    fn request_discard_source_control_entry_only_opens_a_confirm_modal_without_touching_disk() {
+        let tmp = make_committed_repo();
+        std::fs::write(tmp.path().join("seed.txt"), b"changed\n").unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        wait_for_changes(&mut app, |a| {
+            a.source_control
+                .entries
+                .iter()
+                .any(|e| e.path == "seed.txt")
+        });
+        let idx = app
+            .source_control
+            .entries
+            .iter()
+            .position(|e| e.path == "seed.txt")
+            .unwrap();
+        app.request_discard_source_control_entry(idx);
+        assert!(
+            app.pending_discard.is_some(),
+            "Discard click must request user confirmation rather than discarding immediately"
+        );
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("seed.txt")).unwrap(),
+            "changed\n",
+            "request alone must not touch the working tree"
+        );
+    }
+
+    #[test]
+    fn confirming_discard_for_modified_file_restores_head_content() {
+        let tmp = make_committed_repo();
+        std::fs::write(tmp.path().join("seed.txt"), b"changed\n").unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        wait_for_changes(&mut app, |a| {
+            a.source_control
+                .entries
+                .iter()
+                .any(|e| e.path == "seed.txt")
+        });
+        let idx = app
+            .source_control
+            .entries
+            .iter()
+            .position(|e| e.path == "seed.txt")
+            .unwrap();
+        app.request_discard_source_control_entry(idx);
+        app.confirm_pending_discard();
+        assert!(app.pending_discard.is_none(), "modal must close after confirm");
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("seed.txt")).unwrap(),
+            "seed\n",
+            "discard must restore HEAD content of a Modified file"
+        );
+    }
+
+    #[test]
+    fn confirming_discard_for_untracked_file_deletes_it_from_disk() {
+        let tmp = make_committed_repo();
+        let new_file = tmp.path().join("scratch.txt");
+        std::fs::write(&new_file, b"untracked\n").unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        wait_for_changes(&mut app, |a| {
+            a.source_control
+                .entries
+                .iter()
+                .any(|e| e.path == "scratch.txt"
+                    && e.kind == crate::git::ChangeKind::Untracked)
+        });
+        let idx = app
+            .source_control
+            .entries
+            .iter()
+            .position(|e| e.path == "scratch.txt")
+            .unwrap();
+        app.request_discard_source_control_entry(idx);
+        assert!(matches!(
+            app.pending_discard.as_ref(),
+            Some(pd) if pd.untracked
+        ));
+        app.confirm_pending_discard();
+        assert!(
+            !new_file.exists(),
+            "discard on an Untracked entry must delete the file from disk"
+        );
+    }
+
+    #[test]
+    fn cancel_pending_discard_clears_modal_without_acting() {
+        let tmp = make_committed_repo();
+        std::fs::write(tmp.path().join("seed.txt"), b"changed\n").unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        wait_for_changes(&mut app, |a| {
+            a.source_control
+                .entries
+                .iter()
+                .any(|e| e.path == "seed.txt")
+        });
+        let idx = app
+            .source_control
+            .entries
+            .iter()
+            .position(|e| e.path == "seed.txt")
+            .unwrap();
+        app.request_discard_source_control_entry(idx);
+        app.cancel_pending_discard();
+        assert!(app.pending_discard.is_none());
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("seed.txt")).unwrap(),
+            "changed\n",
+            "cancel must NOT touch the working tree"
+        );
+    }
+
+    #[test]
+    fn clicking_the_stage_icon_on_a_selected_unstaged_row_stages_that_entry() {
+        let tmp = make_committed_repo();
+        std::fs::write(tmp.path().join("seed.txt"), b"changed\n").unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        wait_for_changes(&mut app, |a| {
+            a.source_control
+                .entries
+                .iter()
+                .any(|e| e.path == "seed.txt")
+        });
+        app.set_sidebar_view(SidebarView::SourceControl);
+        let backend = ratatui::backend::TestBackend::new(80, 30);
+        let mut term = ratatui::Terminal::new(backend).unwrap();
+        term.draw(|f| app.render(f)).unwrap();
+        let idx = app
+            .source_control
+            .entries
+            .iter()
+            .position(|e| e.path == "seed.txt")
+            .unwrap();
+        app.source_control.selected_change = Some(idx);
+        term.draw(|f| app.render(f)).unwrap();
+        let actions = app
+            .source_control
+            .last_row_actions
+            .expect("selected unstaged row must expose action rects");
+        app.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: actions.stage.x,
+            row: actions.stage.y,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(
+            wait_for_changes(&mut app, |a| a
+                .source_control
+                .entries
+                .iter()
+                .any(|e| e.path == "seed.txt"
+                    && e.kind == crate::git::ChangeKind::StagedModified)),
+            "clicking the stage cell must run `git add` against that entry"
+        );
+    }
+
+    #[test]
+    fn clicking_the_discard_icon_on_a_selected_unstaged_row_opens_the_confirm_modal() {
+        let tmp = make_committed_repo();
+        std::fs::write(tmp.path().join("seed.txt"), b"changed\n").unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        wait_for_changes(&mut app, |a| {
+            a.source_control
+                .entries
+                .iter()
+                .any(|e| e.path == "seed.txt")
+        });
+        app.set_sidebar_view(SidebarView::SourceControl);
+        let backend = ratatui::backend::TestBackend::new(80, 30);
+        let mut term = ratatui::Terminal::new(backend).unwrap();
+        term.draw(|f| app.render(f)).unwrap();
+        let idx = app
+            .source_control
+            .entries
+            .iter()
+            .position(|e| e.path == "seed.txt")
+            .unwrap();
+        app.source_control.selected_change = Some(idx);
+        term.draw(|f| app.render(f)).unwrap();
+        let actions = app
+            .source_control
+            .last_row_actions
+            .expect("selected unstaged row must expose action rects");
+        app.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: actions.discard.x,
+            row: actions.discard.y,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(
+            app.pending_discard.is_some(),
+            "discard click must arm the confirm modal (NEVER discard silently)"
+        );
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("seed.txt")).unwrap(),
+            "changed\n",
+            "discard click alone must NOT touch the working tree until the user confirms"
+        );
     }
 
     #[test]

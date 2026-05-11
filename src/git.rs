@@ -276,6 +276,66 @@ pub fn commit_all_tracked(root: &Path, message: &str) -> Result<String, String> 
     }
 }
 
+/// Stage a single path. Maps the user's Source Control "+" click onto
+/// `git add -- <path>`, which handles Modified, Deleted, Untracked, and
+/// Conflicted (merge-resolved) entries uniformly. Errors propagate
+/// verbatim so the caller can surface them in the status bar.
+pub fn stage_path(root: &Path, rel_path: &str) -> Result<(), String> {
+    let path_str = root.to_str().ok_or_else(|| "non-utf8 workspace path".to_string())?;
+    let output = Command::new("git")
+        .args(["-C", path_str, "add", "--", rel_path])
+        .output()
+        .map_err(|e| format!("failed to spawn git: {e}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let msg = if !stderr.is_empty() { stderr } else { stdout };
+        Err(if msg.is_empty() {
+            format!("git add failed with code {:?}", output.status.code())
+        } else {
+            msg
+        })
+    }
+}
+
+/// Discard a single path. For tracked entries this restores the working
+/// tree to HEAD via `git checkout HEAD -- <path>`; for Untracked entries
+/// the file (or directory) is removed from disk. Destructive: callers
+/// MUST confirm with the user before invoking — the Source Control panel
+/// shows a Y/N modal before reaching this function.
+pub fn discard_path(root: &Path, rel_path: &str, untracked: bool) -> Result<(), String> {
+    if untracked {
+        let abs = root.join(rel_path);
+        if abs.is_dir() {
+            std::fs::remove_dir_all(&abs)
+                .map_err(|e| format!("failed to remove {}: {e}", abs.display()))
+        } else {
+            std::fs::remove_file(&abs)
+                .map_err(|e| format!("failed to remove {}: {e}", abs.display()))
+        }
+    } else {
+        let path_str = root.to_str().ok_or_else(|| "non-utf8 workspace path".to_string())?;
+        let output = Command::new("git")
+            .args(["-C", path_str, "checkout", "HEAD", "--", rel_path])
+            .output()
+            .map_err(|e| format!("failed to spawn git: {e}"))?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let msg = if !stderr.is_empty() { stderr } else { stdout };
+            Err(if msg.is_empty() {
+                format!("git checkout failed with code {:?}", output.status.code())
+            } else {
+                msg
+            })
+        }
+    }
+}
+
 /// One row in the welcome-screen recent-commits panel: the short hash, a
 /// human-readable relative date (e.g. "2 hours ago"), and the commit
 /// subject.
