@@ -700,6 +700,10 @@ pub struct App {
     /// tracked discard runs `git checkout HEAD -- <path>`). Both paths
     /// destroy uncommitted work, so the modal must always run first.
     pending_discard: Option<PendingDiscard>,
+    /// True while the Source Control commit dropdown (▾ caret) is open.
+    /// The caret button toggles this; clicking the single menu row, the
+    /// commit button, or anywhere outside the menu closes it.
+    commit_menu_open: bool,
     /// True after the user has chosen "Always for this session" on the
     /// local-browser confirmation. Subsequent link clicks dispatch to
     /// the relay silently.
@@ -1207,6 +1211,7 @@ impl App {
             pending_remote_pulls: Vec::new(),
             pending_local_open: None,
             pending_discard: None,
+            commit_menu_open: false,
             trust_local_browser: false,
             sidebar_width: SIDEBAR_WIDTH_DEFAULT,
             terminal_height: None,
@@ -2985,6 +2990,7 @@ impl App {
 
         // Overlays render last so they sit on top of everything else.
         self.render_context_menu(frame);
+        self.render_commit_dropdown(frame);
         self.render_prompt(frame);
         self.render_local_open_confirm(frame);
         self.render_discard_confirm(frame);
@@ -3079,6 +3085,41 @@ impl App {
                 }
             }
         }
+    }
+
+    fn render_commit_dropdown(&mut self, frame: &mut ratatui::Frame) {
+        if !self.commit_menu_open {
+            self.source_control.last_commit_menu_item_area = Rect::default();
+            return;
+        }
+        let caret = self.source_control.last_commit_caret_area;
+        let main = self.source_control.last_button_area;
+        if caret.width == 0 || main.width == 0 {
+            return;
+        }
+        // Anchor under the button row; expand left so the menu's right
+        // edge aligns with the caret's right edge (mirrors VS Code).
+        let label = " Commit & Push ";
+        let item_w: u16 = (label.chars().count() as u16 + 2).max(caret.width);
+        let item_x = (caret.x + caret.width).saturating_sub(item_w).max(main.x);
+        let item_y = caret.y + caret.height;
+        let item_rect = Rect { x: item_x, y: item_y, width: item_w, height: 1 };
+        let bg = Color::Rgb(0x25, 0x2b, 0x37);
+        let fg = Color::White;
+        let style = Style::default().fg(fg).bg(bg);
+        frame.render_widget(ratatui::widgets::Clear, item_rect);
+        for rx in 0..item_rect.width {
+            frame.buffer_mut()[(item_rect.x + rx, item_rect.y)]
+                .set_symbol(" ")
+                .set_style(style);
+        }
+        frame.buffer_mut().set_string(
+            item_rect.x + 1,
+            item_rect.y,
+            label,
+            style,
+        );
+        self.source_control.last_commit_menu_item_area = item_rect;
     }
 
     fn render_discard_confirm(&self, frame: &mut ratatui::Frame) {
@@ -3313,8 +3354,14 @@ impl App {
             self.handle_menu_key(key);
             return Ok(());
         }
-        // App-wide shortcuts (priority).
-        if is_save_key(key) {
+        // App-wide shortcuts (priority). Skip Cmd+S when the Source
+        // Control pane is focused so the SC handler can use it as the
+        // stage shortcut — saving an editor file with no editor focus
+        // doesn't make sense anyway, and globally swallowing Cmd+S here
+        // is what made the user's first attempt feel inert.
+        let sc_focused = self.focus == Pane::Tree
+            && self.sidebar_view == SidebarView::SourceControl;
+        if is_save_key(key) && !sc_focused {
             self.save();
             return Ok(());
         }
@@ -3500,8 +3547,35 @@ impl App {
         }
         let cmd_or_ctrl = key.modifiers.contains(KeyModifiers::SUPER)
             || key.modifiers.contains(KeyModifiers::CONTROL);
-        if cmd_or_ctrl && matches!(key.code, KeyCode::Enter) {
-            self.commit_source_control();
+        // Ctrl+Enter: commit & push. We deliberately match ONLY Control
+        // here (not Super). iTerm2's default keymap binds Cmd+Enter to
+        // "Toggle Fullscreen" and never delivers the chord to the TUI,
+        // which made the original Cmd+Enter wiring feel inert; Ctrl is
+        // unintercepted across every terminal we target.
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Enter)
+        {
+            self.commit_and_push_source_control();
+            return;
+        }
+        // Cmd+A: select every entry row in the panel so a follow-up Cmd+S
+        // stages them all in one go. Distinct from the editor's Cmd+A
+        // (select-all text) which the user kept hitting in the SC pane
+        // and getting the wrong scope.
+        if cmd_or_ctrl
+            && matches!(key.code, KeyCode::Char('a') | KeyCode::Char('A'))
+        {
+            let n = self.source_control.select_all_changes();
+            self.status = format!("Selected {n} change(s)");
+            return;
+        }
+        // Cmd+S: stage the selected entry, or every entry in the
+        // multi-selection. Mirrors clicking the inline "+" icon but
+        // sweeps across the whole selection.
+        if cmd_or_ctrl
+            && matches!(key.code, KeyCode::Char('s') | KeyCode::Char('S'))
+        {
+            self.stage_selected_source_control_entries();
             return;
         }
         if is_clipboard_paste_key(key) {
@@ -3756,6 +3830,91 @@ impl App {
                 self.status = format!("git init failed: {e}");
             }
         }
+    }
+
+    pub fn stage_selected_source_control_entries(&mut self) {
+        let indices: Vec<usize> = if self.source_control.multi_selection.is_empty() {
+            self.source_control.selected_change.iter().copied().collect()
+        } else {
+            self.source_control.multi_selection.iter().copied().collect()
+        };
+        if indices.is_empty() {
+            self.status = String::from("No change selected to stage");
+            return;
+        }
+        let paths: Vec<String> = indices
+            .iter()
+            .filter_map(|i| self.source_control.entries.get(*i))
+            .filter(|e| e.kind.section() != crate::git::ChangeSection::Staged)
+            .map(|e| e.path.clone())
+            .collect();
+        if paths.is_empty() {
+            self.status = String::from("Selection is already staged");
+            return;
+        }
+        match crate::git::stage_paths(&self.tree.root, &paths) {
+            Ok(()) => {
+                self.status = if paths.len() == 1 {
+                    format!("Staged {}", paths[0])
+                } else {
+                    format!("Staged {} files", paths.len())
+                };
+            }
+            Err(err) => {
+                self.status = format!("Stage failed: {err}");
+                self.source_control.commit_feedback = Some(err);
+                self.source_control.commit_feedback_is_error = true;
+            }
+        }
+        self.last_git_check = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(1))
+            .unwrap_or_else(std::time::Instant::now);
+        self.refresh_git_status_debounced();
+        self.refresh_source_control();
+    }
+
+    pub fn commit_and_push_source_control(&mut self) {
+        let message = self.source_control.message.trim().to_string();
+        if message.is_empty() {
+            self.source_control.commit_feedback =
+                Some(String::from("Empty commit message"));
+            self.source_control.commit_feedback_is_error = true;
+            return;
+        }
+        let commit_summary = match crate::git::commit_all_tracked(&self.tree.root, &message) {
+            Ok(s) => s,
+            Err(err) => {
+                self.source_control.commit_feedback = Some(err.clone());
+                self.source_control.commit_feedback_is_error = true;
+                self.status = format!("Commit failed: {err}");
+                return;
+            }
+        };
+        self.source_control.clear_message();
+        self.status = format!("Committed: {commit_summary}");
+        match crate::git::push_current_branch(&self.tree.root) {
+            Ok(push_summary) => {
+                let combined = if push_summary.is_empty() {
+                    commit_summary
+                } else {
+                    format!("{commit_summary} | pushed: {push_summary}")
+                };
+                self.source_control.commit_feedback = Some(combined.clone());
+                self.source_control.commit_feedback_is_error = false;
+                self.status = format!("Committed & pushed: {combined}");
+            }
+            Err(err) => {
+                self.source_control.commit_feedback =
+                    Some(format!("commit ok; push failed: {err}"));
+                self.source_control.commit_feedback_is_error = true;
+                self.status = format!("Commit ok; push failed: {err}");
+            }
+        }
+        self.last_git_check = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(1))
+            .unwrap_or_else(std::time::Instant::now);
+        self.refresh_git_status_debounced();
+        self.refresh_source_control();
     }
 
     pub fn stage_source_control_entry(&mut self, entry_idx: usize) {
@@ -5067,6 +5226,25 @@ impl App {
                 }
                 if in_tree && self.sidebar_view == SidebarView::SourceControl {
                     self.focus_pane(Pane::Tree);
+                    if self.commit_menu_open
+                        && self.source_control.click_commit_menu_item(m.column, m.row)
+                    {
+                        self.commit_menu_open = false;
+                        self.commit_and_push_source_control();
+                        return;
+                    }
+                    if self.source_control.click_commit_caret(m.column, m.row) {
+                        self.commit_menu_open = !self.commit_menu_open;
+                        return;
+                    }
+                    if self.commit_menu_open {
+                        // Any click outside the caret/menu closes the
+                        // dropdown without firing its action; fall through
+                        // so the underlying gesture still applies (the
+                        // user can dismiss-by-clicking-elsewhere instead
+                        // of needing Esc + click).
+                        self.commit_menu_open = false;
+                    }
                     if self.source_control.click_init_repo_button(m.column, m.row) {
                         self.initialize_repository();
                         return;
@@ -5916,6 +6094,27 @@ impl App {
         let Some(diff) = self.editor.diff.as_mut() else {
             return;
         };
+        // F7 / Shift+F7: jump to next / previous change hunk. Matches the
+        // VS Code keybinding for "Next/Previous Change in Diff Editor" so
+        // users can scan a long diff without scrolling line-by-line.
+        if matches!(key.code, KeyCode::F(7)) {
+            // `scroll_to_row` parks the viewport 2 rows above the target,
+            // so the hunk currently in view sits at row `scroll + 2`.
+            // Anchoring next/prev queries at that row, not at `scroll`,
+            // means F7 reliably jumps PAST the hunk the user is reading
+            // — otherwise next_change_row(scroll) returns the same hunk
+            // and `scroll_to_row` re-parks at the same `scroll`.
+            let anchor = diff.scroll.saturating_add(2);
+            let target = if key.modifiers.contains(KeyModifiers::SHIFT) {
+                diff.prev_change_row(anchor)
+            } else {
+                diff.next_change_row(anchor)
+            };
+            if let Some(row) = target {
+                diff.scroll_to_row(row);
+            }
+            return;
+        }
         match key.code {
             KeyCode::Up => diff.scroll_up_by(1),
             KeyCode::Down => diff.scroll_down_by(1),
@@ -9926,6 +10125,343 @@ mod tests {
             std::fs::read_to_string(tmp.path().join("seed.txt")).unwrap(),
             "changed\n",
             "discard click alone must NOT touch the working tree until the user confirms"
+        );
+    }
+
+    #[test]
+    fn cmd_a_in_source_control_pane_selects_every_change_row() {
+        let tmp = make_committed_repo();
+        std::fs::write(tmp.path().join("seed.txt"), b"changed\n").unwrap();
+        std::fs::write(tmp.path().join("scratch.txt"), b"new\n").unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        wait_for_changes(&mut app, |a| a.source_control.entries.len() >= 2);
+        app.set_sidebar_view(SidebarView::SourceControl);
+        let n = app.source_control.entries.len();
+        app.handle_source_control_key(key(KeyCode::Char('a'), KeyModifiers::SUPER));
+        assert_eq!(
+            app.source_control.multi_selection.len(),
+            n,
+            "Cmd+A in SC must populate multi_selection with every entry"
+        );
+    }
+
+    #[test]
+    fn cmd_s_through_handle_key_dispatches_to_source_control_not_to_editor_save() {
+        // Regression for the user's "Cmd+S didn't react" report: the
+        // global `is_save_key` intercept used to fire BEFORE the SC
+        // handler, so Cmd+S called `App::save` (a no-op when no editor
+        // file was open) and the user's selected change never moved to
+        // the index. Route through `handle_key` (not `handle_source_control_key`)
+        // to exercise the full dispatcher.
+        let tmp = make_committed_repo();
+        std::fs::write(tmp.path().join("seed.txt"), b"changed\n").unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        wait_for_changes(&mut app, |a| {
+            a.source_control
+                .entries
+                .iter()
+                .any(|e| e.path == "seed.txt")
+        });
+        app.set_sidebar_view(SidebarView::SourceControl);
+        app.source_control.select_all_changes();
+        app.handle_key(key(KeyCode::Char('s'), KeyModifiers::SUPER))
+            .unwrap();
+        assert!(
+            wait_for_changes(&mut app, |a| a
+                .source_control
+                .entries
+                .iter()
+                .any(|e| e.path == "seed.txt"
+                    && e.kind.section() == crate::git::ChangeSection::Staged)),
+            "Cmd+S routed through handle_key must reach the SC stage handler, not the global save key intercept"
+        );
+    }
+
+    #[test]
+    fn staging_a_filename_with_a_space_works_after_porcelain_dequoting() {
+        // Regression for "fatal: pathspec '\"linked_list copy.py\"' did
+        // not match any files": porcelain output wraps filenames with
+        // spaces in double quotes, and we used to feed those quotes
+        // straight into `git add`. The parser now dequotes; the staging
+        // path must end at the real filename.
+        let tmp = make_committed_repo();
+        std::fs::write(tmp.path().join("linked_list copy.py"), b"x\n").unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        wait_for_changes(&mut app, |a| {
+            a.source_control
+                .entries
+                .iter()
+                .any(|e| e.path == "linked_list copy.py")
+        });
+        assert!(
+            !app.source_control
+                .entries
+                .iter()
+                .any(|e| e.path.starts_with('"') || e.path.ends_with('"')),
+            "no entry's path may still carry the porcelain quoting wrapper"
+        );
+        let idx = app
+            .source_control
+            .entries
+            .iter()
+            .position(|e| e.path == "linked_list copy.py")
+            .unwrap();
+        app.stage_source_control_entry(idx);
+        assert!(
+            wait_for_changes(&mut app, |a| a
+                .source_control
+                .entries
+                .iter()
+                .any(|e| e.path == "linked_list copy.py"
+                    && e.kind.section() == crate::git::ChangeSection::Staged)),
+            "Staging a file whose name contains a space must succeed; saw status={:?}",
+            app.status,
+        );
+    }
+
+    #[test]
+    fn cmd_s_in_source_control_pane_stages_every_multi_selected_entry() {
+        let tmp = make_committed_repo();
+        std::fs::write(tmp.path().join("seed.txt"), b"changed\n").unwrap();
+        std::fs::write(tmp.path().join("scratch.txt"), b"new\n").unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        wait_for_changes(&mut app, |a| a.source_control.entries.len() >= 2);
+        app.set_sidebar_view(SidebarView::SourceControl);
+        app.source_control.select_all_changes();
+        app.handle_source_control_key(key(KeyCode::Char('s'), KeyModifiers::SUPER));
+        assert!(
+            wait_for_changes(&mut app, |a| {
+                let kinds: Vec<_> = a
+                    .source_control
+                    .entries
+                    .iter()
+                    .map(|e| e.kind.section())
+                    .collect();
+                !kinds.is_empty()
+                    && kinds
+                        .iter()
+                        .all(|s| *s == crate::git::ChangeSection::Staged)
+            }),
+            "Cmd+S with multi-selection must stage every selected entry; saw {:?}",
+            app.source_control.entries,
+        );
+    }
+
+    #[test]
+    fn cmd_s_with_single_selection_stages_only_that_entry() {
+        let tmp = make_committed_repo();
+        std::fs::write(tmp.path().join("seed.txt"), b"changed\n").unwrap();
+        std::fs::write(tmp.path().join("scratch.txt"), b"new\n").unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        wait_for_changes(&mut app, |a| a.source_control.entries.len() >= 2);
+        app.set_sidebar_view(SidebarView::SourceControl);
+        let scratch_idx = app
+            .source_control
+            .entries
+            .iter()
+            .position(|e| e.path == "scratch.txt")
+            .unwrap();
+        // Single click resets multi_selection to just this row.
+        app.source_control.multi_selection.clear();
+        app.source_control.multi_selection.insert(scratch_idx);
+        app.source_control.selected_change = Some(scratch_idx);
+        app.handle_source_control_key(key(KeyCode::Char('s'), KeyModifiers::SUPER));
+        assert!(
+            wait_for_changes(&mut app, |a| a
+                .source_control
+                .entries
+                .iter()
+                .any(|e| e.path == "scratch.txt"
+                    && e.kind.section() == crate::git::ChangeSection::Staged)),
+            "scratch.txt must have been staged"
+        );
+        assert!(
+            app.source_control
+                .entries
+                .iter()
+                .any(|e| e.path == "seed.txt"
+                    && e.kind == crate::git::ChangeKind::Modified),
+            "seed.txt must remain unstaged (single-row stage scope)"
+        );
+    }
+
+    #[test]
+    fn cmd_enter_in_source_control_falls_back_to_plain_commit_without_pushing() {
+        // iTerm2 swallows Cmd+Enter as Toggle Fullscreen so the chord never
+        // reaches croft. Terminals that DO deliver it should treat Cmd as
+        // a no-op modifier — Enter alone commits, Ctrl+Enter pushes. The
+        // SC handler's plain `KeyCode::Enter` match arm catches the
+        // residual Cmd+Enter and calls `commit_source_control` (no push).
+        let tmp = make_committed_repo();
+        std::fs::write(tmp.path().join("seed.txt"), b"changed\n").unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        wait_for_changes(&mut app, |a| {
+            a.source_control
+                .entries
+                .iter()
+                .any(|e| e.path == "seed.txt")
+        });
+        app.set_sidebar_view(SidebarView::SourceControl);
+        app.source_control.message = "fix: plain cmd-enter".to_string();
+        app.source_control.message_cursor = app.source_control.message.chars().count();
+        app.handle_source_control_key(key(KeyCode::Enter, KeyModifiers::SUPER));
+        let log = std::process::Command::new("git")
+            .args(["-C"]).arg(tmp.path())
+            .args(["log", "--oneline"])
+            .output()
+            .unwrap();
+        let log_out = String::from_utf8_lossy(&log.stdout);
+        assert!(
+            log_out.contains("fix: plain cmd-enter"),
+            "Cmd+Enter must still commit locally (push is bound to Ctrl+Enter only): log={log_out:?}"
+        );
+    }
+
+    #[test]
+    fn ctrl_enter_in_source_control_commits_and_pushes() {
+        let tmp = make_committed_repo();
+        // Wire a bare remote and set it as origin so `git push` has
+        // somewhere to send.
+        let remote = tempfile::tempdir().unwrap();
+        let _ = std::process::Command::new("git")
+            .args(["-C"]).arg(remote.path())
+            .args(["init", "--bare", "-q", "-b", "main"])
+            .status();
+        let _ = std::process::Command::new("git")
+            .args(["-C"]).arg(tmp.path())
+            .args(["remote", "add", "origin"])
+            .arg(remote.path())
+            .status();
+        let _ = std::process::Command::new("git")
+            .args(["-C"]).arg(tmp.path())
+            .args(["push", "-u", "origin", "main"])
+            .status();
+        // Make a tracked change and stage it so commit-all-tracked has
+        // something to commit.
+        std::fs::write(tmp.path().join("seed.txt"), b"changed\n").unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        wait_for_changes(&mut app, |a| {
+            a.source_control
+                .entries
+                .iter()
+                .any(|e| e.path == "seed.txt")
+        });
+        app.set_sidebar_view(SidebarView::SourceControl);
+        app.source_control.message = "fix: bump seed".to_string();
+        app.source_control.message_cursor = app.source_control.message.chars().count();
+        app.handle_source_control_key(key(KeyCode::Enter, KeyModifiers::CONTROL));
+        // Verify the remote received the commit (its log now reports two
+        // commits — the initial push + our new one).
+        let log = std::process::Command::new("git")
+            .args(["-C"]).arg(remote.path())
+            .args(["log", "--oneline"])
+            .output()
+            .unwrap();
+        let log_out = String::from_utf8_lossy(&log.stdout);
+        assert!(
+            log_out.lines().count() >= 2,
+            "Cmd+Enter must have committed AND pushed (remote log: {log_out:?})"
+        );
+        assert!(
+            log_out.contains("fix: bump seed"),
+            "remote's log must include the new commit's subject"
+        );
+    }
+
+    #[test]
+    fn opening_a_modified_file_diff_parks_scroll_on_the_first_change_hunk() {
+        let tmp = make_committed_repo();
+        let big = (0..50)
+            .map(|i| format!("line {i}\n"))
+            .collect::<String>();
+        std::fs::write(tmp.path().join("seed.txt"), &big).unwrap();
+        let _ = std::process::Command::new("git")
+            .args(["-C"]).arg(tmp.path())
+            .args(["add", "seed.txt"])
+            .status();
+        let _ = std::process::Command::new("git")
+            .args(["-C"]).arg(tmp.path())
+            .args(["commit", "-q", "-m", "big seed"])
+            .status();
+        // Now change a line deep in the file so the first hunk lives well
+        // past row 0.
+        let mut lines: Vec<String> = big.lines().map(str::to_string).collect();
+        lines[30] = "edited-30".to_string();
+        std::fs::write(tmp.path().join("seed.txt"), lines.join("\n") + "\n").unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        wait_for_changes(&mut app, |a| {
+            a.source_control
+                .entries
+                .iter()
+                .any(|e| e.path == "seed.txt")
+        });
+        let idx = app
+            .source_control
+            .entries
+            .iter()
+            .position(|e| e.path == "seed.txt")
+            .unwrap();
+        app.open_source_control_entry(idx);
+        let diff = app
+            .editor
+            .diff
+            .as_ref()
+            .expect("opening a Modified entry must build a diff");
+        assert!(
+            diff.scroll >= 25 && diff.scroll <= 30,
+            "diff must auto-scroll near the change (row ~30, with 2-row context above); saw scroll={}",
+            diff.scroll,
+        );
+    }
+
+    #[test]
+    fn f7_in_the_diff_view_jumps_to_the_next_change_hunk() {
+        let tmp = make_committed_repo();
+        // Build a multi-hunk file: edits at lines 10 and 40.
+        let original: String = (0..50)
+            .map(|i| format!("line {i}\n"))
+            .collect();
+        std::fs::write(tmp.path().join("seed.txt"), &original).unwrap();
+        let _ = std::process::Command::new("git")
+            .args(["-C"]).arg(tmp.path())
+            .args(["add", "seed.txt"])
+            .status();
+        let _ = std::process::Command::new("git")
+            .args(["-C"]).arg(tmp.path())
+            .args(["commit", "-q", "-m", "seed"])
+            .status();
+        let mut edited: Vec<String> = original.lines().map(str::to_string).collect();
+        edited[10] = "edited-10".to_string();
+        edited[40] = "edited-40".to_string();
+        std::fs::write(tmp.path().join("seed.txt"), edited.join("\n") + "\n").unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        wait_for_changes(&mut app, |a| {
+            a.source_control
+                .entries
+                .iter()
+                .any(|e| e.path == "seed.txt")
+        });
+        let idx = app
+            .source_control
+            .entries
+            .iter()
+            .position(|e| e.path == "seed.txt")
+            .unwrap();
+        app.open_source_control_entry(idx);
+        let first_scroll = app.editor.diff.as_ref().unwrap().scroll;
+        // F7 jumps to the next hunk.
+        app.handle_editor_key(key(KeyCode::F(7), KeyModifiers::NONE));
+        let next_scroll = app.editor.diff.as_ref().unwrap().scroll;
+        assert!(
+            next_scroll > first_scroll,
+            "F7 must advance scroll past the current hunk (saw first={first_scroll}, next={next_scroll})"
+        );
+        // Shift+F7 walks back.
+        app.handle_editor_key(key(KeyCode::F(7), KeyModifiers::SHIFT));
+        let prev_scroll = app.editor.diff.as_ref().unwrap().scroll;
+        assert!(
+            prev_scroll < next_scroll,
+            "Shift+F7 must walk back to the prior hunk (saw next={next_scroll}, prev={prev_scroll})"
         );
     }
 

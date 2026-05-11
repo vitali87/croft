@@ -146,10 +146,72 @@ impl ChangeKind {
     }
 }
 
+/// Undo the C-style quoting `git status --porcelain` applies to paths
+/// containing unusual characters (space, control chars, double-quote,
+/// backslash, or — when `core.quotepath = true`, which is the default —
+/// any non-ASCII byte). Plain ASCII paths pass through unchanged.
+///
+/// Quoted form: surrounded by `"`, with `\a \b \t \n \v \f \r \" \\`
+/// single-char escapes and `\NNN` 3-digit octal escapes for any other
+/// byte. Octal escapes are collected into a byte buffer first so that
+/// multi-byte UTF-8 sequences (e.g. `\303\244` for `ä`) decode back to
+/// the original character.
+pub fn unquote_porcelain_path(raw: &str) -> String {
+    if !raw.starts_with('"') {
+        return raw.to_string();
+    }
+    let bytes = raw.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i: usize = 1;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'"' {
+            break;
+        }
+        if b == b'\\' && i + 1 < bytes.len() {
+            let n = bytes[i + 1];
+            match n {
+                b'a' => { out.push(0x07); i += 2; }
+                b'b' => { out.push(0x08); i += 2; }
+                b't' => { out.push(b'\t'); i += 2; }
+                b'n' => { out.push(b'\n'); i += 2; }
+                b'v' => { out.push(0x0B); i += 2; }
+                b'f' => { out.push(0x0C); i += 2; }
+                b'r' => { out.push(b'\r'); i += 2; }
+                b'"' => { out.push(b'"'); i += 2; }
+                b'\\' => { out.push(b'\\'); i += 2; }
+                b'0'..=b'7' => {
+                    // Consume a run of `\NNN` triplets so multi-byte
+                    // UTF-8 sequences land in `out` as raw bytes ready
+                    // for the lossy decode below.
+                    while i + 3 < bytes.len()
+                        && bytes[i] == b'\\'
+                        && (b'0'..=b'7').contains(&bytes[i + 1])
+                        && (b'0'..=b'7').contains(&bytes[i + 2])
+                        && (b'0'..=b'7').contains(&bytes[i + 3])
+                    {
+                        let val = ((bytes[i + 1] - b'0') as u16) * 64
+                            + ((bytes[i + 2] - b'0') as u16) * 8
+                            + ((bytes[i + 3] - b'0') as u16);
+                        out.push(val as u8);
+                        i += 4;
+                    }
+                }
+                _ => { out.push(b'\\'); i += 1; }
+            }
+        } else {
+            out.push(b);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 /// Parse `git status --porcelain` (v1) into the change entries the Source
 /// Control panel renders. Each line is `XY <path>` where `X` is the index
 /// status and `Y` is the worktree status; renames carry both old and new
-/// paths separated by ` -> `.
+/// paths separated by ` -> `. Paths with special characters arrive in
+/// C-style quoted form — see `unquote_porcelain_path`.
 pub fn parse_porcelain_changes(out: &str) -> Vec<ChangeEntry> {
     let mut entries = Vec::new();
     for line in out.lines() {
@@ -161,9 +223,9 @@ pub fn parse_porcelain_changes(out: &str) -> Vec<ChangeEntry> {
         let y = bytes[1] as char;
         let path_part = &line[3..];
         let path = if let Some((_, dst)) = path_part.split_once(" -> ") {
-            dst.to_string()
+            unquote_porcelain_path(dst)
         } else {
-            path_part.to_string()
+            unquote_porcelain_path(path_part)
         };
         // Conflicts: AA, DD, AU, UA, DU, UD, UU.
         let conflict = matches!((x, y),
@@ -276,16 +338,55 @@ pub fn commit_all_tracked(root: &Path, message: &str) -> Result<String, String> 
     }
 }
 
-/// Stage a single path. Maps the user's Source Control "+" click onto
-/// `git add -- <path>`, which handles Modified, Deleted, Untracked, and
-/// Conflicted (merge-resolved) entries uniformly. Errors propagate
-/// verbatim so the caller can surface them in the status bar.
-pub fn stage_path(root: &Path, rel_path: &str) -> Result<(), String> {
+/// Push the current branch to its upstream. Used by Commit & Push
+/// (Cmd+Enter in the SC message box). Returns the trimmed stdout/stderr
+/// summary verbatim so the panel can surface the host's full message —
+/// `git push` typically reports the ref update on stderr even on success.
+pub fn push_current_branch(root: &Path) -> Result<String, String> {
     let path_str = root.to_str().ok_or_else(|| "non-utf8 workspace path".to_string())?;
     let output = Command::new("git")
-        .args(["-C", path_str, "add", "--", rel_path])
+        .args(["-C", path_str, "push"])
         .output()
         .map_err(|e| format!("failed to spawn git: {e}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if output.status.success() {
+        let summary = if !stderr.is_empty() { stderr } else { stdout };
+        Ok(summary)
+    } else {
+        let msg = if !stderr.is_empty() { stderr } else { stdout };
+        Err(if msg.is_empty() {
+            format!("git push failed with code {:?}", output.status.code())
+        } else {
+            msg
+        })
+    }
+}
+
+/// Stage a single path. Convenience wrapper over `stage_paths` for the
+/// inline "+" icon click path; multi-select staging goes through
+/// `stage_paths` directly so all paths land in one atomic `git add`
+/// invocation (the index.lock is held only once, so the background
+/// status worker can't race us between adds).
+pub fn stage_path(root: &Path, rel_path: &str) -> Result<(), String> {
+    stage_paths(root, std::slice::from_ref(&rel_path.to_string()))
+}
+
+/// Stage all listed paths in a single `git add -- p1 p2 ...` invocation.
+/// Atomic with respect to the index lock — running N separate `git add`
+/// commands lets the background `git status` worker grab the lock
+/// between them and fail later adds with "Unable to create index.lock".
+pub fn stage_paths(root: &Path, rel_paths: &[String]) -> Result<(), String> {
+    if rel_paths.is_empty() {
+        return Ok(());
+    }
+    let path_str = root.to_str().ok_or_else(|| "non-utf8 workspace path".to_string())?;
+    let mut cmd = Command::new("git");
+    cmd.args(["-C", path_str, "add", "--"]);
+    for p in rel_paths {
+        cmd.arg(p);
+    }
+    let output = cmd.output().map_err(|e| format!("failed to spawn git: {e}"))?;
     if output.status.success() {
         Ok(())
     } else {
@@ -1133,6 +1234,50 @@ mod tests {
         assert_eq!(entries, vec![ChangeEntry {
             path: "new.txt".to_string(),
             kind: ChangeKind::StagedRenamed,
+        }]);
+    }
+
+    #[test]
+    fn unquote_porcelain_path_passes_plain_ascii_paths_through() {
+        assert_eq!(unquote_porcelain_path("README.md"), "README.md");
+        assert_eq!(unquote_porcelain_path("src/main.rs"), "src/main.rs");
+    }
+
+    #[test]
+    fn unquote_porcelain_path_strips_double_quotes_and_unescapes_spaces() {
+        // `git status --porcelain` wraps filenames containing spaces in
+        // double quotes. The user's repro: a Finder "Duplicate" producing
+        // `linked_list copy.py`, which arrives as `"linked_list copy.py"`.
+        assert_eq!(
+            unquote_porcelain_path("\"linked_list copy.py\""),
+            "linked_list copy.py",
+        );
+    }
+
+    #[test]
+    fn unquote_porcelain_path_decodes_c_style_escapes() {
+        assert_eq!(unquote_porcelain_path(r#""line\nbreak.txt""#), "line\nbreak.txt");
+        assert_eq!(unquote_porcelain_path(r#""quote\"inside.txt""#), "quote\"inside.txt");
+        assert_eq!(unquote_porcelain_path(r#""back\\slash.txt""#), "back\\slash.txt");
+    }
+
+    #[test]
+    fn unquote_porcelain_path_decodes_octal_utf8_sequences() {
+        // `core.quotepath = true` (default) escapes non-ASCII bytes as
+        // 3-digit octal. `ä` is UTF-8 0xC3 0xA4 → `\303\244`.
+        assert_eq!(unquote_porcelain_path(r#""f\303\244.txt""#), "fä.txt");
+    }
+
+    #[test]
+    fn parse_porcelain_changes_de_quotes_paths_with_spaces() {
+        // Regression for the user's "Stage failed: fatal: pathspec
+        // '"linked_list copy.py"' did not match any files" report.
+        // The parser must strip the surrounding double quotes so the
+        // downstream `git add -- <path>` call hits the real filename.
+        let entries = parse_porcelain_changes("?? \"linked_list copy.py\"\n");
+        assert_eq!(entries, vec![ChangeEntry {
+            path: "linked_list copy.py".to_string(),
+            kind: ChangeKind::Untracked,
         }]);
     }
 

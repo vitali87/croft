@@ -1,6 +1,7 @@
 use crate::git::{ChangeEntry, ChangeKind, ChangeSection, GitStatus};
 use crate::icons;
 use crate::widgets::scrollbar;
+use std::collections::BTreeSet;
 use ratatui::{
     buffer::Buffer,
     layout::{Alignment, Rect},
@@ -35,6 +36,15 @@ pub struct SourceControlPanel {
     pub last_inner: Rect,
     pub last_input_area: Rect,
     pub last_button_area: Rect,
+    /// Hit-test rect for the chevron split-button that opens the Commit
+    /// dropdown (Commit & Push). Empty when the panel is in the no-repo
+    /// state or the button row was clipped.
+    pub last_commit_caret_area: Rect,
+    /// Hit-test rect for the single dropdown item ("Commit & Push") that
+    /// pops below the caret. Empty when the menu is closed. The App owns
+    /// the open/closed flag (`commit_menu_open`) so menu state survives
+    /// re-renders.
+    pub last_commit_menu_item_area: Rect,
     pub last_list_area: Rect,
     pub last_scrollbar: Rect,
     /// Hit-test rect for the empty-state "Initialize Repository" button.
@@ -57,6 +67,12 @@ pub struct SourceControlPanel {
     /// Drives the row-highlight bg so the user can tell at a glance
     /// which entry the editor is showing the diff for.
     pub selected_change: Option<usize>,
+    /// Indices of all rows currently selected (multi-select). Always
+    /// includes `selected_change` when that is `Some`. Cmd+A populates this
+    /// with every entry; a plain click resets it to the single clicked row.
+    /// The Stage shortcut (Cmd+S) acts on this set; click on an action icon
+    /// still acts on just that row.
+    pub multi_selection: BTreeSet<usize>,
     /// Status / error line painted below the button after a commit attempt.
     /// Cleared on the next refresh.
     pub commit_feedback: Option<String>,
@@ -80,6 +96,8 @@ impl SourceControlPanel {
             last_inner: Rect::default(),
             last_input_area: Rect::default(),
             last_button_area: Rect::default(),
+            last_commit_caret_area: Rect::default(),
+            last_commit_menu_item_area: Rect::default(),
             last_list_area: Rect::default(),
             last_scrollbar: Rect::default(),
             last_init_repo_button_area: Rect::default(),
@@ -87,6 +105,7 @@ impl SourceControlPanel {
             inline_hero_image_active: false,
             scroll: 0,
             selected_change: None,
+            multi_selection: BTreeSet::new(),
             commit_feedback: None,
             commit_feedback_is_error: false,
             last_row_actions: None,
@@ -112,21 +131,37 @@ impl SourceControlPanel {
     pub fn set_status(&mut self, status: GitStatus, entries: Vec<ChangeEntry>) {
         self.status = status;
         self.entries = entries;
-        // A change set refresh can re-order entries; clear the selection
-        // rather than risk pointing it at the wrong file.
+        // A change set refresh can re-order entries; clear stale selection
+        // state rather than risk pointing it at the wrong file.
         if let Some(idx) = self.selected_change {
             if idx >= self.entries.len() {
                 self.selected_change = None;
             }
         }
+        self.multi_selection.retain(|i| *i < self.entries.len());
     }
 
     /// Click-to-select: returns the entry index now selected, if the
-    /// click landed on an entry row.
+    /// click landed on an entry row. Resets the multi-selection to just
+    /// this row — Cmd+A is the way to opt into multi.
     pub fn select_change_at(&mut self, y: u16) -> Option<usize> {
         let idx = self.entry_at_y(y)?;
         self.selected_change = Some(idx);
+        self.multi_selection.clear();
+        self.multi_selection.insert(idx);
         Some(idx)
+    }
+
+    /// Cmd+A in the SC pane: every entry row is now in `multi_selection`,
+    /// so the Stage shortcut acts on all of them at once. Leaves
+    /// `selected_change` alone so the diff editor keeps showing the same
+    /// file. Returns the new selection count.
+    pub fn select_all_changes(&mut self) -> usize {
+        self.multi_selection = (0..self.entries.len()).collect();
+        if self.selected_change.is_none() && !self.entries.is_empty() {
+            self.selected_change = Some(0);
+        }
+        self.multi_selection.len()
     }
 
     pub fn changes_count(&self) -> usize {
@@ -210,13 +245,15 @@ impl SourceControlPanel {
     }
 
     pub fn click_button(&self, x: u16, y: u16) -> bool {
-        let rect = self.last_button_area;
-        rect.width > 0
-            && rect.height > 0
-            && x >= rect.x
-            && x < rect.x + rect.width
-            && y >= rect.y
-            && y < rect.y + rect.height
+        rect_hit(self.last_button_area, x, y)
+    }
+
+    pub fn click_commit_caret(&self, x: u16, y: u16) -> bool {
+        rect_hit(self.last_commit_caret_area, x, y)
+    }
+
+    pub fn click_commit_menu_item(&self, x: u16, y: u16) -> bool {
+        rect_hit(self.last_commit_menu_item_area, x, y)
     }
 
     pub fn click_input(&self, x: u16, y: u16) -> bool {
@@ -665,6 +702,8 @@ impl Widget for &mut SourceControlPanel {
         self.last_inner = inner;
         self.last_input_area = Rect::default();
         self.last_button_area = Rect::default();
+        self.last_commit_caret_area = Rect::default();
+        self.last_commit_menu_item_area = Rect::default();
         self.last_list_area = Rect::default();
         self.last_scrollbar = Rect::default();
         self.last_row_actions = None;
@@ -760,7 +799,7 @@ impl Widget for &mut SourceControlPanel {
                 buf.set_string(
                     input_inner.x + 1,
                     content_y,
-                    "Message (\u{2318}Enter to commit)",
+                    "Message (Enter = commit, \u{2303}Enter = push)",
                     Style::default()
                         .fg(Color::Rgb(
                             INPUT_PROMPT_RGB.0,
@@ -780,15 +819,36 @@ impl Widget for &mut SourceControlPanel {
         }
         y += 3 + 1; // input box + 1-row gap
 
-        // Rows y..y+3: chunky commit button with rounded corners.
+        // Rows y..y+3: chunky split-button — wide "Commit" main + narrow
+        // chevron caret. The caret reveals a "Commit & Push" dropdown so
+        // users have the same affordance VS Code surfaces. Narrow panels
+        // skip the split and render a plain Commit button so the caret
+        // never collides with the label.
         if y + 3 > inner.y + inner.height {
             return;
         }
-        let button_area = Rect { x: inner.x, y, width: inner.width, height: 3 };
-        self.last_button_area = button_area;
         let blue = Color::Rgb(BUTTON_BG_RGB.0, BUTTON_BG_RGB.1, BUTTON_BG_RGB.2);
         let white = Color::Rgb(BUTTON_FG_RGB.0, BUTTON_FG_RGB.1, BUTTON_FG_RGB.2);
-        render_rounded_button(buf, button_area, "Commit", blue, white);
+        let split_caret_w: u16 = 3;
+        let split_gap_w: u16 = 1;
+        if inner.width >= 16 + split_caret_w + split_gap_w {
+            let main_w = inner.width.saturating_sub(split_caret_w + split_gap_w);
+            let main_area = Rect { x: inner.x, y, width: main_w, height: 3 };
+            let caret_area = Rect {
+                x: inner.x + main_w + split_gap_w,
+                y,
+                width: split_caret_w,
+                height: 3,
+            };
+            self.last_button_area = main_area;
+            self.last_commit_caret_area = caret_area;
+            render_rounded_button(buf, main_area, "✓ Commit", blue, white);
+            render_rounded_button(buf, caret_area, "▾", blue, white);
+        } else {
+            let button_area = Rect { x: inner.x, y, width: inner.width, height: 3 };
+            self.last_button_area = button_area;
+            render_rounded_button(buf, button_area, "Commit", blue, white);
+        }
         y += 3 + 1; // button + 1-row gap
 
         // Optional feedback line.
@@ -905,16 +965,22 @@ impl Widget for &mut SourceControlPanel {
                         width: row_width,
                         height: 1,
                     };
-                    let is_selected = self.selected_change == Some(*entry_idx);
-                    // Selected rows carry the VS Code list-active-blue bg
-                    // so the user can see which entry the editor's diff
-                    // is currently bound to. Unselected rows inherit the
-                    // panel bg so the list reads cleanly.
-                    let row_bg = if is_selected {
+                    let is_primary = self.selected_change == Some(*entry_idx);
+                    let is_in_multi = self.multi_selection.contains(entry_idx);
+                    // Multi-selected rows all carry the VS Code list-active
+                    // blue bg so a Cmd+A → Cmd+S sweep makes its scope
+                    // visible; the primary row (the one driving the diff)
+                    // keeps the brightest tone, secondary rows a slightly
+                    // dimmer one so the user still sees which file the
+                    // editor is bound to.
+                    let row_bg = if is_primary {
                         Some(selected_bg)
+                    } else if is_in_multi {
+                        Some(Color::Rgb(0x1f, 0x3a, 0x5c))
                     } else {
                         None
                     };
+                    let is_selected = is_primary;
                     if let Some(bg) = row_bg {
                         let row_bg_style = Style::default().bg(bg);
                         for rx in 0..row_rect.width {
@@ -1714,6 +1780,119 @@ mod tests {
             p.last_row_actions.is_none(),
             "narrow rows must skip the action icons rather than overlap the path"
         );
+    }
+
+    #[test]
+    fn select_all_changes_loads_every_entry_into_multi_selection() {
+        let mut p = SourceControlPanel::new();
+        p.set_status(
+            dummy_status_with_branch("main"),
+            vec![
+                ChangeEntry { path: "a".into(), kind: ChangeKind::Modified },
+                ChangeEntry { path: "b".into(), kind: ChangeKind::Modified },
+                ChangeEntry { path: "c".into(), kind: ChangeKind::Untracked },
+            ],
+        );
+        let n = p.select_all_changes();
+        assert_eq!(n, 3);
+        assert!(p.multi_selection.contains(&0));
+        assert!(p.multi_selection.contains(&1));
+        assert!(p.multi_selection.contains(&2));
+    }
+
+    #[test]
+    fn clicking_a_row_resets_multi_selection_to_just_that_row() {
+        let mut p = SourceControlPanel::new();
+        p.set_status(
+            dummy_status_with_branch("main"),
+            vec![
+                ChangeEntry { path: "a".into(), kind: ChangeKind::Modified },
+                ChangeEntry { path: "b".into(), kind: ChangeKind::Modified },
+            ],
+        );
+        p.select_all_changes();
+        assert_eq!(p.multi_selection.len(), 2);
+        // Render to populate hit areas, then "click" the second row.
+        let area = Rect { x: 0, y: 0, width: 60, height: 20 };
+        let mut buf = Buffer::empty(area);
+        ratatui::widgets::Widget::render(&mut p, area, &mut buf);
+        let row_y = (area.y..area.y + area.height)
+            .find(|y| {
+                let mut row = String::new();
+                for x in area.x..area.x + area.width {
+                    row.push_str(buf[(x, *y)].symbol());
+                }
+                row.contains("b") && !row.contains("a")
+            })
+            .expect("b row must render");
+        p.select_change_at(row_y);
+        assert_eq!(p.multi_selection.len(), 1, "single click narrows to one row");
+    }
+
+    #[test]
+    fn multi_selected_rows_paint_a_visible_row_bg_even_when_not_primary() {
+        let mut p = SourceControlPanel::new();
+        p.set_status(
+            dummy_status_with_branch("main"),
+            vec![
+                ChangeEntry { path: "a".into(), kind: ChangeKind::Modified },
+                ChangeEntry { path: "b".into(), kind: ChangeKind::Modified },
+            ],
+        );
+        p.select_all_changes();
+        p.selected_change = Some(0); // only row 0 is primary
+        let area = Rect { x: 0, y: 0, width: 60, height: 20 };
+        let mut buf = Buffer::empty(area);
+        ratatui::widgets::Widget::render(&mut p, area, &mut buf);
+        // Both rows must carry SOME bg distinct from panel bg.
+        let row_b_y = (area.y..area.y + area.height)
+            .find(|y| {
+                let mut row = String::new();
+                for x in area.x..area.x + area.width {
+                    row.push_str(buf[(x, *y)].symbol());
+                }
+                row.contains('b') && !row.contains('a')
+            })
+            .expect("b row must render");
+        let mut secondary_has_bg = false;
+        for x in 0..area.width {
+            if let Some(bg) = buf[(x, row_b_y)].style().bg {
+                if bg != Color::Reset {
+                    secondary_has_bg = true;
+                    break;
+                }
+            }
+        }
+        assert!(
+            secondary_has_bg,
+            "secondary multi-selected rows must paint a visible row bg so the Cmd+S scope is obvious"
+        );
+    }
+
+    #[test]
+    fn split_commit_button_records_a_separate_caret_rect_at_default_widths() {
+        let mut p = SourceControlPanel::new();
+        p.set_status(dummy_status_with_branch("main"), Vec::new());
+        let area = Rect { x: 0, y: 0, width: 60, height: 20 };
+        let mut buf = Buffer::empty(area);
+        ratatui::widgets::Widget::render(&mut p, area, &mut buf);
+        assert!(p.last_button_area.width > 0, "main commit button must paint");
+        assert!(
+            p.last_commit_caret_area.width > 0,
+            "split caret must paint alongside the main button at panel widths >= 20"
+        );
+        // Caret sits to the RIGHT of the main button with a 1-cell gap.
+        assert_eq!(
+            p.last_commit_caret_area.x,
+            p.last_button_area.x + p.last_button_area.width + 1
+        );
+        // Hit-test rejects clicks landing on the caret cell.
+        let caret_mid = (
+            p.last_commit_caret_area.x + p.last_commit_caret_area.width / 2,
+            p.last_commit_caret_area.y + 1,
+        );
+        assert!(!p.click_button(caret_mid.0, caret_mid.1));
+        assert!(p.click_commit_caret(caret_mid.0, caret_mid.1));
     }
 
     #[test]

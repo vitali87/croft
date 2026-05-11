@@ -93,6 +93,50 @@ impl DiffData {
         let max = self.longest_line_chars();
         self.scroll_x = (self.scroll_x + n).min(max);
     }
+
+    /// Indices into `rows` where each contiguous change hunk begins (an
+    /// Added / Removed / Replaced row preceded by either start-of-file or
+    /// an Equal row). Drives Next / Prev change navigation in the diff
+    /// view and the "jump to first change on open" behaviour the Source
+    /// Control panel relies on.
+    pub fn hunk_starts(&self) -> Vec<usize> {
+        let mut out = Vec::new();
+        let mut in_hunk = false;
+        for (i, r) in self.rows.iter().enumerate() {
+            let is_change = !matches!(r, DiffRow::Equal { .. });
+            if is_change && !in_hunk {
+                out.push(i);
+                in_hunk = true;
+            } else if !is_change {
+                in_hunk = false;
+            }
+        }
+        out
+    }
+
+    /// First-row index of the first change hunk, or `None` when the two
+    /// sides are identical.
+    pub fn first_change_row(&self) -> Option<usize> {
+        self.hunk_starts().into_iter().next()
+    }
+
+    /// First-row index of the next hunk strictly past `current`, or
+    /// `None` when `current` is already in/past the last hunk.
+    pub fn next_change_row(&self, current: usize) -> Option<usize> {
+        self.hunk_starts().into_iter().find(|&s| s > current)
+    }
+
+    /// First-row index of the hunk that starts strictly before `current`,
+    /// or `None` when `current` is already at/before the first hunk.
+    pub fn prev_change_row(&self, current: usize) -> Option<usize> {
+        self.hunk_starts().into_iter().rev().find(|&s| s < current)
+    }
+
+    /// Park `scroll` two rows above `target` so the change row lands with
+    /// a slice of context above it, the way users read diffs.
+    pub fn scroll_to_row(&mut self, target: usize) {
+        self.scroll = target.saturating_sub(2);
+    }
 }
 
 /// Run a line-level diff over `left` vs `right` and emit one DiffRow per
@@ -278,5 +322,86 @@ mod tests {
         assert_eq!(d.left_lines, lines(&["x", "y"]));
         assert_eq!(d.right_lines, lines(&["x", "Y"]));
         assert_eq!(d.scroll, 0);
+    }
+
+    #[test]
+    fn first_change_row_skips_leading_equal_rows() {
+        let d = DiffData::build(
+            PathBuf::new(),
+            PathBuf::new(),
+            lines(&["a", "b", "c", "d"]),
+            lines(&["a", "b", "X", "d"]),
+        );
+        assert_eq!(
+            d.first_change_row(),
+            Some(2),
+            "first change must skip the two leading Equal rows"
+        );
+    }
+
+    #[test]
+    fn first_change_row_is_none_for_identical_inputs() {
+        let d = DiffData::build(
+            PathBuf::new(),
+            PathBuf::new(),
+            lines(&["a", "b"]),
+            lines(&["a", "b"]),
+        );
+        assert_eq!(d.first_change_row(), None);
+    }
+
+    #[test]
+    fn hunk_starts_lists_one_index_per_contiguous_change_block() {
+        let d = DiffData::build(
+            PathBuf::new(),
+            PathBuf::new(),
+            lines(&["a", "b", "c", "d", "e", "f"]),
+            lines(&["a", "B", "c", "d", "E", "F"]),
+        );
+        // Hunk 1: row 1 (Replaced b→B), Hunk 2: rows 4-5 (Replaced e→E, f→F).
+        let starts = d.hunk_starts();
+        assert_eq!(starts.len(), 2);
+        assert_eq!(starts[0], 1);
+        assert_eq!(starts[1], 4);
+    }
+
+    #[test]
+    fn next_change_row_jumps_to_the_next_hunk_after_the_cursor() {
+        let d = DiffData::build(
+            PathBuf::new(),
+            PathBuf::new(),
+            lines(&["a", "b", "c", "d", "e"]),
+            lines(&["a", "B", "c", "d", "E"]),
+        );
+        assert_eq!(d.next_change_row(0), Some(1));
+        assert_eq!(d.next_change_row(1), Some(4), "must skip past the current hunk");
+        assert_eq!(d.next_change_row(4), None);
+    }
+
+    #[test]
+    fn prev_change_row_jumps_to_the_previous_hunk_before_the_cursor() {
+        let d = DiffData::build(
+            PathBuf::new(),
+            PathBuf::new(),
+            lines(&["a", "b", "c", "d", "e"]),
+            lines(&["a", "B", "c", "d", "E"]),
+        );
+        assert_eq!(d.prev_change_row(4), Some(1));
+        assert_eq!(d.prev_change_row(1), None);
+        assert_eq!(d.prev_change_row(0), None);
+    }
+
+    #[test]
+    fn scroll_to_row_parks_two_rows_of_context_above_the_target() {
+        let mut d = DiffData::build(
+            PathBuf::new(),
+            PathBuf::new(),
+            lines(&["a", "b", "c", "d", "e"]),
+            lines(&["a", "b", "C", "d", "e"]),
+        );
+        d.scroll_to_row(2);
+        assert_eq!(d.scroll, 0, "row 2 with 2-row context lands scroll at 0");
+        d.scroll_to_row(7);
+        assert_eq!(d.scroll, 5);
     }
 }

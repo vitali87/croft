@@ -4121,12 +4121,18 @@ impl EditorTabs {
             .with_context(|| format!("reading {}", right.display()))?;
         let left_lines: Vec<String> = left_text.lines().map(str::to_string).collect();
         let right_lines: Vec<String> = right_text.lines().map(str::to_string).collect();
-        let data = crate::widgets::diff::DiffData::build(
+        let mut data = crate::widgets::diff::DiffData::build(
             left_label,
             right.to_path_buf(),
             left_lines,
             right_lines,
         );
+        // Park the viewport on the first change hunk so the user lands on
+        // the first edit instead of reading through unchanged leading
+        // lines. Identical files stay at scroll 0.
+        if let Some(row) = data.first_change_row() {
+            data.scroll_to_row(row);
+        }
         let mut e = Editor::new();
         e.focused = self.editors[self.active].focused;
         e.preview = false;
