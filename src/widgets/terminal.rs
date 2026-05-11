@@ -75,11 +75,42 @@ pub struct PtyTerminal {
     selection: Option<Selection>,
 }
 
+/// Pick the program + args to spawn the user's interactive shell so it
+/// behaves like the one iTerm2 / Terminal.app launches. Both run the
+/// shell as a *login* shell (`Login shell` is iTerm2's default Command
+/// setting), which sources `~/.zprofile` / `~/.profile` in addition to
+/// the interactive rc file. Without that, anything the user puts in
+/// `.zprofile` — PATH munging, framework loaders, plugin managers like
+/// zinit/oh-my-zsh that install keybindings, vi-mode toggles — is
+/// silently absent inside croft. For mainstream POSIX shells we pass
+/// `-l`; for anything exotic we leave argv empty rather than risk
+/// breaking the spawn with an unknown flag.
+pub fn interactive_shell_invocation(shell_path: &str) -> (String, Vec<String>) {
+    let basename = std::path::Path::new(shell_path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(shell_path);
+    let supports_login_flag = matches!(
+        basename,
+        "zsh" | "bash" | "fish" | "ksh" | "mksh" | "dash" | "tcsh" | "sh"
+    );
+    let args = if supports_login_flag {
+        vec!["-l".to_string()]
+    } else {
+        Vec::new()
+    };
+    (shell_path.to_string(), args)
+}
+
 impl PtyTerminal {
     pub fn new(cwd: &std::path::Path) -> Result<Self> {
         let shell =
             std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
-        let mut cmd = CommandBuilder::new(&shell);
+        let (program, args) = interactive_shell_invocation(&shell);
+        let mut cmd = CommandBuilder::new(&program);
+        for a in &args {
+            cmd.arg(a);
+        }
         cmd.cwd(cwd);
         Self::spawn_with(cmd, None)
     }
@@ -546,6 +577,39 @@ mod tests {
     fn feed(term: &mut Term<VoidListener>, bytes: &[u8]) {
         let mut p = Processor::<StdSyncHandler>::new();
         p.advance(term, bytes);
+    }
+
+    #[test]
+    fn interactive_shell_invocation_passes_login_flag_for_zsh() {
+        let (program, args) = interactive_shell_invocation("/bin/zsh");
+        assert_eq!(program, "/bin/zsh");
+        assert_eq!(
+            args,
+            vec!["-l".to_string()],
+            "zsh must be spawned as a login shell so ~/.zprofile is sourced and the embedded terminal inherits the same env / keybindings as the user's native iTerm2 shell"
+        );
+    }
+
+    #[test]
+    fn interactive_shell_invocation_passes_login_flag_for_bash_fish_ksh() {
+        for path in ["/bin/bash", "/usr/local/bin/fish", "/bin/ksh", "/usr/bin/tcsh"] {
+            let (_, args) = interactive_shell_invocation(path);
+            assert_eq!(
+                args,
+                vec!["-l".to_string()],
+                "{} must be spawned with -l so its login-shell rc files are sourced",
+                path
+            );
+        }
+    }
+
+    #[test]
+    fn interactive_shell_invocation_skips_login_flag_for_unknown_shells() {
+        let (_, args) = interactive_shell_invocation("/opt/exotic/myshell");
+        assert!(
+            args.is_empty(),
+            "an unknown shell must be spawned without -l in case the flag means something else there"
+        );
     }
 
     #[test]
