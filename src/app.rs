@@ -947,8 +947,6 @@ fn welcome_recents_height(
 }
 
 const WELCOME_TAGLINE: &str = "LIGHTWEIGHT.  BLAZINGLY FAST.  BUILT FOR DEVELOPERS.";
-const WELCOME_FOOTER: &str =
-    "\u{2039}  Blazingly fast by design.  Secure by default.  Loved by developers.  \u{203a}";
 
 const GRAD_TL: (u8, u8, u8) = (0x5c, 0xd6, 0xc8);
 const GRAD_TR: (u8, u8, u8) = (0xec, 0x8c, 0x5a);
@@ -2471,18 +2469,6 @@ impl App {
             }
         }
 
-        // Footer chevron line, centred on the bottom of the stack.
-        let footer_y = box_y + box_h + 1;
-        if footer_y < area.y + area.height {
-            let footer_w = WELCOME_FOOTER.chars().count() as u16;
-            let footer_x = area.x + area.width.saturating_sub(footer_w) / 2;
-            frame.buffer_mut().set_string(
-                footer_x,
-                footer_y,
-                WELCOME_FOOTER,
-                Style::default().fg(Color::Rgb(0x6c, 0x7d, 0x9c)),
-            );
-        }
     }
 
     fn render_activity_bar(&mut self, frame: &mut ratatui::Frame, area: Rect) {
@@ -7772,6 +7758,37 @@ mod tests {
     }
 
     #[test]
+    fn welcome_panel_does_not_paint_the_blazingly_fast_slogan_footer() {
+        // The user asked to drop the chevron-bracketed
+        // "Blazingly fast by design. Secure by default. Loved by developers."
+        // line. Render the welcome panel into a buffer and confirm none
+        // of the slogan fragments appear anywhere on the canvas.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        let area = Rect { x: 0, y: 0, width: 120, height: 40 };
+        let backend = ratatui::backend::TestBackend::new(area.width, area.height);
+        let mut term = ratatui::Terminal::new(backend).unwrap();
+        term.draw(|f| app.render_welcome(f, area)).unwrap();
+        let buffer = term.backend().buffer();
+        for y in 0..area.height {
+            let mut row = String::new();
+            for x in 0..area.width {
+                row.push_str(buffer[(x, y)].symbol());
+            }
+            for needle in [
+                "Blazingly fast by design",
+                "Secure by default",
+                "Loved by developers",
+            ] {
+                assert!(
+                    !row.contains(needle),
+                    "welcome row {y} still carries removed slogan {needle:?}: {row:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn render_welcome_does_not_panic_in_default_80x25_with_many_commits() {
         // Repro for the index-(41,70) panic at startup: ratatui's initial
         // backend size is 80x25 before the alt-screen reflow. With a long
@@ -7815,12 +7832,10 @@ mod tests {
     }
 
     #[test]
-    fn welcome_tagline_and_footer_constants_are_present() {
+    fn welcome_tagline_constant_is_present() {
         assert!(WELCOME_TAGLINE.contains("LIGHTWEIGHT"));
         assert!(WELCOME_TAGLINE.contains("BLAZINGLY FAST"));
         assert!(WELCOME_TAGLINE.contains("DEVELOPERS"));
-        assert!(WELCOME_FOOTER.contains("Blazingly fast by design"));
-        assert!(WELCOME_FOOTER.contains("Loved by developers"));
     }
 
     #[test]
