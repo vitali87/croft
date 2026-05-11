@@ -631,21 +631,30 @@ pub fn parse_ahead_behind(out: &str) -> (usize, usize) {
 
 /// Unit of work the App posts to the background git worker. Coalesced
 /// inside the loop so a burst of clicks / FS-watcher ticks turns into a
-/// single shell-out instead of N.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// single shell-out instead of N. `SetRoot` rebinds the worker's working
+/// directory in-place — used by `App::change_workspace_root` so a Make
+/// Root that lands inside a git repo can flip the Source Control panel
+/// out of its no-repo empty state without recreating the worker thread.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GitRequest {
     Status,
     Changes,
     StatusAndChanges,
+    SetRoot(PathBuf),
 }
 
 impl GitRequest {
-    /// Merge two pending requests into the strongest one. `StatusAndChanges`
-    /// dominates everything; mixing `Status` and `Changes` collapses to
-    /// `StatusAndChanges`; same+same is the same.
+    /// Merge two pending *query* requests into the strongest one.
+    /// `StatusAndChanges` dominates everything; mixing `Status` and
+    /// `Changes` collapses to `StatusAndChanges`; same+same is the same.
+    /// `SetRoot` is never a query and the worker drains it inline before
+    /// merging, so it must not appear here.
     pub fn merge(self, other: Self) -> Self {
         use GitRequest::*;
         match (self, other) {
+            (SetRoot(_), _) | (_, SetRoot(_)) => {
+                unreachable!("SetRoot is drained inline before merge; it cannot reach the query merge")
+            }
             (StatusAndChanges, _) | (_, StatusAndChanges) => StatusAndChanges,
             (Status, Changes) | (Changes, Status) => StatusAndChanges,
             (Status, Status) => Status,
@@ -675,18 +684,35 @@ pub enum GitResponse {
 /// channel gate is used by both the click path (`refresh_source_control`)
 /// and the FS-watcher tick (`refresh_git_status_debounced`).
 pub fn git_worker_loop(
-    root: PathBuf,
+    initial_root: PathBuf,
     rx: std::sync::mpsc::Receiver<GitRequest>,
     tx: std::sync::mpsc::Sender<GitResponse>,
 ) {
-    while let Ok(mut req) = rx.recv() {
-        // Drain any other requests already queued so a burst collapses
-        // to one shell-out (the FS watcher fires once per debounce
-        // window; a fast click + tick can stack a Changes on top of a
-        // Status before the worker has woken up).
+    let mut root = initial_root;
+    while let Ok(first) = rx.recv() {
+        let mut pending: Option<GitRequest> = match first {
+            GitRequest::SetRoot(p) => {
+                root = p;
+                None
+            }
+            other => Some(other),
+        };
         while let Ok(newer) = rx.try_recv() {
-            req = req.merge(newer);
+            match newer {
+                GitRequest::SetRoot(p) => {
+                    root = p;
+                }
+                other => {
+                    pending = Some(match pending {
+                        Some(prev) => prev.merge(other),
+                        None => other,
+                    });
+                }
+            }
         }
+        let Some(req) = pending else {
+            continue;
+        };
         let resp = match req {
             GitRequest::Status => GitResponse::Status(query(&root)),
             GitRequest::Changes => GitResponse::Changes(query_changes(&root)),
@@ -695,6 +721,7 @@ pub fn git_worker_loop(
                 let c = query_changes(&root);
                 GitResponse::StatusAndChanges(s, c)
             }
+            GitRequest::SetRoot(_) => unreachable!("SetRoot was drained inline"),
         };
         if tx.send(resp).is_err() {
             return;
@@ -1135,6 +1162,51 @@ mod tests {
                 assert_eq!(entries[0].kind, ChangeKind::Untracked);
             }
             other => panic!("expected Changes, got {other:?}"),
+        }
+        drop(req_tx);
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn git_worker_loop_set_root_redirects_subsequent_query_to_the_new_root() {
+        let tmp_no_repo = TempDir::new().unwrap();
+        let tmp_repo = TempDir::new().unwrap();
+        let p_repo = tmp_repo.path();
+        let _ = Command::new("git")
+            .args(["-C"])
+            .arg(p_repo)
+            .args(["init", "-q", "-b", "feature-x"])
+            .output();
+        let _ = Command::new("git")
+            .args(["-C"])
+            .arg(p_repo)
+            .args(["config", "user.email", "a@b"])
+            .status();
+        let _ = Command::new("git")
+            .args(["-C"])
+            .arg(p_repo)
+            .args(["config", "user.name", "a"])
+            .status();
+        let (req_tx, req_rx) = std::sync::mpsc::channel::<GitRequest>();
+        let (resp_tx, resp_rx) = std::sync::mpsc::channel::<GitResponse>();
+        let initial_root = tmp_no_repo.path().to_path_buf();
+        let join = std::thread::spawn(move || git_worker_loop(initial_root, req_rx, resp_tx));
+        req_tx
+            .send(GitRequest::SetRoot(p_repo.to_path_buf()))
+            .unwrap();
+        req_tx.send(GitRequest::Status).unwrap();
+        let resp = resp_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("worker must reply within 10s after SetRoot+Status");
+        match resp {
+            GitResponse::Status(status) => {
+                assert!(
+                    status.in_repo,
+                    "after SetRoot to a real git repo the next Status must report in_repo=true (the bug was that SetRoot didn't exist, so queries kept hitting the stale root captured at thread spawn)"
+                );
+                assert_eq!(status.branch.as_deref(), Some("feature-x"));
+            }
+            other => panic!("expected Status, got {other:?}"),
         }
         drop(req_tx);
         join.join().unwrap();

@@ -5439,6 +5439,14 @@ impl App {
         self.last_git_check = std::time::Instant::now()
             .checked_sub(std::time::Duration::from_secs(1))
             .unwrap_or_else(std::time::Instant::now);
+        // Rebind the worker's root before any query, otherwise the next
+        // Status / Changes request runs against the stale root captured
+        // at App::new and the Source Control panel keeps reporting the
+        // OLD repo's state (or "no repo") even after a Make Root that
+        // landed inside a real git tree.
+        let _ = self
+            .git_request_tx
+            .send(crate::git::GitRequest::SetRoot(new_root.clone()));
         self.refresh_git_status_debounced();
         self.refresh_source_control();
         self.status = format!("Workspace root: {display}");
@@ -9372,6 +9380,62 @@ mod tests {
             .unwrap();
 
         assert_eq!(app.search.query, "needle");
+    }
+
+    #[test]
+    fn change_workspace_root_into_a_git_subdir_flips_source_control_into_repo_state() {
+        // Regression for the user's "Make Root into a .git-bearing folder
+        // doesn't update Source Control" bug: the git worker thread was
+        // spawned ONCE with the initial root captured by value. After
+        // change_workspace_root, the worker kept shelling git status
+        // against the OLD root, so the Source Control panel stayed in
+        // its no-repo empty state even though the new root was a real
+        // git tree.
+        let outer = tempfile::tempdir().unwrap();
+        let repo = outer.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let _ = std::process::Command::new("git")
+            .args(["-C"])
+            .arg(&repo)
+            .args(["init", "-q", "-b", "main"])
+            .output();
+        let _ = std::process::Command::new("git")
+            .args(["-C"])
+            .arg(&repo)
+            .args(["config", "user.email", "a@b"])
+            .status();
+        let _ = std::process::Command::new("git")
+            .args(["-C"])
+            .arg(&repo)
+            .args(["config", "user.name", "a"])
+            .status();
+        let mut app = App::new(outer.path().to_path_buf()).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        let _ = app.drain_git_responses();
+        assert!(
+            !app.source_control.status.in_repo,
+            "preconditions: outer dir must NOT be a git repo"
+        );
+
+        app.change_workspace_root(repo.clone());
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let mut flipped = false;
+        while std::time::Instant::now() < deadline {
+            if app.drain_git_responses() {
+                if app.source_control.status.in_repo {
+                    flipped = true;
+                    break;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            flipped,
+            "after Make Root into a real git tree the worker must re-query against the new root and the Source Control panel must report in_repo=true; saw status={:?}",
+            app.source_control.status,
+        );
+        assert_eq!(app.source_control.status.branch.as_deref(), Some("main"));
     }
 
     #[test]
