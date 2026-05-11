@@ -3986,6 +3986,14 @@ impl App {
                 | KeyCode::PageDown
         );
         let alt = key.modifiers.contains(KeyModifiers::ALT);
+        if shift && alt && matches!(key.code, KeyCode::Up | KeyCode::Down) {
+            match key.code {
+                KeyCode::Up => self.editor.duplicate_lines_up(),
+                KeyCode::Down => self.editor.duplicate_lines_down(),
+                _ => unreachable!(),
+            }
+            return;
+        }
         if is_motion && shift {
             if self.editor.selection.is_none() {
                 self.editor.start_selection_at_cursor();
@@ -9364,6 +9372,38 @@ mod tests {
             .unwrap();
 
         assert_eq!(app.search.query, "needle");
+    }
+
+    #[test]
+    fn editor_shift_alt_down_duplicates_the_current_line_via_handle_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.focus_pane(Pane::Editor);
+        app.editor.lines = vec![String::from("alpha"), String::from("beta")];
+        app.editor.cursor_row = 0;
+        app.editor.cursor_col = 3;
+        app.handle_key(key(KeyCode::Down, KeyModifiers::ALT | KeyModifiers::SHIFT))
+            .unwrap();
+        assert_eq!(app.editor.lines, vec!["alpha", "alpha", "beta"]);
+        assert_eq!(
+            (app.editor.cursor_row, app.editor.cursor_col),
+            (1, 3),
+            "cursor must follow onto the duplicated line"
+        );
+    }
+
+    #[test]
+    fn editor_shift_alt_up_duplicates_the_current_line_via_handle_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.focus_pane(Pane::Editor);
+        app.editor.lines = vec![String::from("alpha"), String::from("beta")];
+        app.editor.cursor_row = 1;
+        app.editor.cursor_col = 2;
+        app.handle_key(key(KeyCode::Up, KeyModifiers::ALT | KeyModifiers::SHIFT))
+            .unwrap();
+        assert_eq!(app.editor.lines, vec!["alpha", "beta", "beta"]);
+        assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (1, 2));
     }
 
     #[test]

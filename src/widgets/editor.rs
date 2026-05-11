@@ -569,6 +569,7 @@ enum EditKind {
     DeleteForward,
     Paste,
     DeleteSelection,
+    DuplicateLines,
 }
 
 #[derive(Clone, Debug)]
@@ -1364,6 +1365,55 @@ impl Editor {
         }
         self.ensure_cursor_col_visible();
         self.last_edit_kind = None;
+    }
+
+    /// VS Code's "Copy Line Down" (Shift+Option+Down on macOS). Duplicates
+    /// the current line — or, when a selection is active, every line the
+    /// selection touches as one block — directly below the original, then
+    /// moves the cursor (and the selection, if any) onto the duplicate so
+    /// the next keystroke acts on the copy. Recorded as a single undo
+    /// step via the dedicated `EditKind::DuplicateLines`.
+    pub fn duplicate_lines_down(&mut self) {
+        self.push_undo(EditKind::DuplicateLines);
+        let (start_row, end_row) = self.selected_or_cursor_row_range();
+        let block: Vec<String> = self.lines[start_row..=end_row].to_vec();
+        let block_len = block.len();
+        let insert_at = end_row + 1;
+        for (i, line) in block.into_iter().enumerate() {
+            self.lines.insert(insert_at + i, line);
+        }
+        self.cursor_row += block_len;
+        if let Some(sel) = self.selection.as_mut() {
+            sel.anchor.0 += block_len;
+            sel.head.0 += block_len;
+        }
+        self.dirty = true;
+        self.ensure_cursor_col_visible();
+    }
+
+    /// VS Code's "Copy Line Up" (Shift+Option+Up on macOS). Mirror of
+    /// `duplicate_lines_down`: inserts the copy *above* the original
+    /// block, leaving the cursor on the upper copy at the same row index
+    /// it started at (the original is pushed down by `block_len`).
+    pub fn duplicate_lines_up(&mut self) {
+        self.push_undo(EditKind::DuplicateLines);
+        let (start_row, end_row) = self.selected_or_cursor_row_range();
+        let block: Vec<String> = self.lines[start_row..=end_row].to_vec();
+        for (i, line) in block.into_iter().enumerate() {
+            self.lines.insert(start_row + i, line);
+        }
+        self.dirty = true;
+        self.ensure_cursor_col_visible();
+    }
+
+    fn selected_or_cursor_row_range(&self) -> (usize, usize) {
+        match &self.selection {
+            Some(sel) => {
+                let (start, end) = sel.normalised();
+                (start.0, end.0)
+            }
+            None => (self.cursor_row, self.cursor_row),
+        }
     }
 
     /// Word-step left (Option+Left on macOS). Symmetric to `move_word_right`:
@@ -2181,6 +2231,97 @@ mod tests {
         e.cursor_col = 0;
         e.move_word_left();
         assert_eq!((e.cursor_row, e.cursor_col), (0, 0));
+    }
+
+    #[test]
+    fn duplicate_lines_down_with_no_selection_copies_the_current_line_below_and_moves_cursor_to_it() {
+        let mut e = editor_with("alpha\nbeta\ngamma");
+        e.cursor_row = 1;
+        e.cursor_col = 2;
+        e.duplicate_lines_down();
+        assert_eq!(e.lines, vec!["alpha", "beta", "beta", "gamma"]);
+        assert_eq!((e.cursor_row, e.cursor_col), (2, 2));
+        assert!(e.dirty);
+    }
+
+    #[test]
+    fn duplicate_lines_up_with_no_selection_copies_the_current_line_above_and_keeps_cursor_on_the_copy() {
+        let mut e = editor_with("alpha\nbeta\ngamma");
+        e.cursor_row = 1;
+        e.cursor_col = 3;
+        e.duplicate_lines_up();
+        assert_eq!(e.lines, vec!["alpha", "beta", "beta", "gamma"]);
+        assert_eq!(
+            (e.cursor_row, e.cursor_col),
+            (1, 3),
+            "cursor stays at the same row index — that row is now the upper copy, the original was pushed to row 2"
+        );
+    }
+
+    #[test]
+    fn duplicate_lines_down_with_multiline_selection_duplicates_the_whole_block() {
+        let mut e = editor_with("a\nb\nc\nd");
+        e.cursor_row = 2;
+        e.cursor_col = 1;
+        e.selection = Some(EditorSelection {
+            anchor: (1, 0),
+            head: (2, 1),
+        });
+        e.duplicate_lines_down();
+        assert_eq!(e.lines, vec!["a", "b", "c", "b", "c", "d"]);
+        assert_eq!(
+            (e.cursor_row, e.cursor_col),
+            (4, 1),
+            "cursor follows the duplicated block — it was at (2,1) over the original 'c', now it's at (4,1) over the duplicate"
+        );
+        assert_eq!(
+            e.selection.unwrap(),
+            EditorSelection {
+                anchor: (3, 0),
+                head: (4, 1),
+            },
+            "the selection migrates onto the duplicated block too so the next gesture acts on the copy"
+        );
+    }
+
+    #[test]
+    fn duplicate_lines_up_with_multiline_selection_keeps_the_cursor_on_the_upper_copy() {
+        let mut e = editor_with("a\nb\nc\nd");
+        e.cursor_row = 2;
+        e.cursor_col = 0;
+        e.selection = Some(EditorSelection {
+            anchor: (1, 0),
+            head: (2, 1),
+        });
+        e.duplicate_lines_up();
+        assert_eq!(e.lines, vec!["a", "b", "c", "b", "c", "d"]);
+        assert_eq!(
+            (e.cursor_row, e.cursor_col),
+            (2, 0),
+            "the duplicate sits at rows 1-2 and the original was pushed down to rows 3-4; cursor at (2,0) is on the upper copy"
+        );
+    }
+
+    #[test]
+    fn duplicate_lines_down_then_undo_restores_the_buffer_in_one_step() {
+        let mut e = editor_with("alpha\nbeta\ngamma");
+        e.cursor_row = 1;
+        e.cursor_col = 0;
+        e.duplicate_lines_down();
+        assert_eq!(e.lines.len(), 4);
+        assert!(e.undo());
+        assert_eq!(e.lines, vec!["alpha", "beta", "gamma"]);
+        assert_eq!((e.cursor_row, e.cursor_col), (1, 0));
+    }
+
+    #[test]
+    fn duplicate_lines_up_at_first_row_inserts_the_copy_at_row_zero() {
+        let mut e = editor_with("alpha\nbeta");
+        e.cursor_row = 0;
+        e.cursor_col = 4;
+        e.duplicate_lines_up();
+        assert_eq!(e.lines, vec!["alpha", "alpha", "beta"]);
+        assert_eq!((e.cursor_row, e.cursor_col), (0, 4));
     }
 
     #[test]
