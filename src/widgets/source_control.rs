@@ -232,6 +232,31 @@ impl SourceControlPanel {
             .unwrap_or_else(|| self.message.len())
     }
 
+    /// Absolute (col, row) of the commit-message caret in screen
+    /// coordinates, matching the pattern `Editor::cursor_screen_pos` uses
+    /// to drive the host terminal's hardware caret. Returns `None` when
+    /// the panel isn't focused, isn't in a repo (no input box painted),
+    /// hasn't been laid out yet, or the cursor would land outside the
+    /// visible inner width of the input box. The render path paints the
+    /// message at `input_inner.x + 1` on `input_inner.y`, so the caret
+    /// sits at column `input_box.x + 2 + message_cursor`, row
+    /// `input_box.y + 1` (rounded border occupies one cell on each side).
+    pub fn cursor_screen_pos(&self) -> Option<(u16, u16)> {
+        if !self.focused {
+            return None;
+        }
+        let r = self.last_input_area;
+        if r.width < 3 || r.height < 3 {
+            return None;
+        }
+        let cursor_col = self.message_cursor as u16;
+        let max_col = r.width.saturating_sub(3);
+        if cursor_col > max_col {
+            return None;
+        }
+        Some((r.x + 2 + cursor_col, r.y + 1))
+    }
+
     /// Compute the visual layout of the change list as a flat sequence of
     /// rows: section headers and entry rows. Used for hit-testing and
     /// scrollbar metrics.
@@ -1406,6 +1431,84 @@ mod tests {
         (&mut p).render(area, &mut buf);
         assert!(p.last_input_area.height > 0, "input area must paint when in_repo");
         assert!(p.last_button_area.height > 0, "button area must paint when in_repo");
+    }
+
+    #[test]
+    fn cursor_screen_pos_is_none_when_not_focused() {
+        let mut p = SourceControlPanel::new();
+        p.status = GitStatus { in_repo: true, branch: Some("main".into()), ..Default::default() };
+        p.focused = false;
+        let area = Rect { x: 0, y: 0, width: 40, height: 16 };
+        let mut buf = Buffer::empty(area);
+        (&mut p).render(area, &mut buf);
+        assert_eq!(
+            p.cursor_screen_pos(),
+            None,
+            "caret must hide when the panel is not focused"
+        );
+    }
+
+    #[test]
+    fn cursor_screen_pos_is_none_when_no_repo() {
+        let mut p = SourceControlPanel::new();
+        p.status = GitStatus::default();
+        p.focused = true;
+        let area = Rect { x: 0, y: 0, width: 40, height: 30 };
+        let mut buf = Buffer::empty(area);
+        (&mut p).render(area, &mut buf);
+        assert_eq!(
+            p.cursor_screen_pos(),
+            None,
+            "caret must hide when the panel is in the no-repo empty state (no input box painted)"
+        );
+    }
+
+    #[test]
+    fn cursor_screen_pos_lands_at_first_text_cell_when_message_is_empty() {
+        let mut p = SourceControlPanel::new();
+        p.status = GitStatus { in_repo: true, branch: Some("main".into()), ..Default::default() };
+        p.focused = true;
+        let area = Rect { x: 0, y: 0, width: 40, height: 16 };
+        let mut buf = Buffer::empty(area);
+        (&mut p).render(area, &mut buf);
+        let r = p.last_input_area;
+        assert!(r.width >= 3 && r.height == 3, "input must be laid out");
+        let (cx, cy) = p.cursor_screen_pos().expect("focused, in repo → caret must report a cell");
+        assert_eq!(
+            (cx, cy),
+            (r.x + 2, r.y + 1),
+            "empty message caret sits at the input's first inner text cell (one pad cell after the rounded left border)"
+        );
+    }
+
+    #[test]
+    fn cursor_screen_pos_advances_one_cell_per_inserted_char() {
+        let mut p = SourceControlPanel::new();
+        p.status = GitStatus { in_repo: true, branch: Some("main".into()), ..Default::default() };
+        p.focused = true;
+        let area = Rect { x: 0, y: 0, width: 40, height: 16 };
+        let mut buf = Buffer::empty(area);
+        (&mut p).render(area, &mut buf);
+        p.insert_str("fix");
+        let r = p.last_input_area;
+        let (cx, cy) = p.cursor_screen_pos().expect("caret must report a cell");
+        assert_eq!(
+            (cx, cy),
+            (r.x + 2 + 3, r.y + 1),
+            "after typing 3 chars the caret sits 3 cells past the first text cell"
+        );
+    }
+
+    #[test]
+    fn cursor_screen_pos_is_none_before_first_render() {
+        let mut p = SourceControlPanel::new();
+        p.status = GitStatus { in_repo: true, branch: Some("main".into()), ..Default::default() };
+        p.focused = true;
+        assert_eq!(
+            p.cursor_screen_pos(),
+            None,
+            "caret must hide before the first render (last_input_area is still default)"
+        );
     }
 
     #[test]

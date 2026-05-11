@@ -1648,11 +1648,19 @@ impl App {
     /// it can re-Show the caret after the OSC-1337 image emit only when the
     /// editor would have shown it this frame.
     fn cursor_should_be_visible(&self) -> bool {
-        self.focus == Pane::Editor
-            && self.context_menu.is_none()
-            && self.prompt.is_none()
-            && self.cursor_visible_phase()
-            && self.editor.cursor_screen_pos().is_some()
+        if self.context_menu.is_some() || self.prompt.is_some() || !self.cursor_visible_phase() {
+            return false;
+        }
+        if self.focus == Pane::Editor && self.editor.cursor_screen_pos().is_some() {
+            return true;
+        }
+        if self.focus == Pane::Tree
+            && self.sidebar_view == SidebarView::SourceControl
+            && self.source_control.cursor_screen_pos().is_some()
+        {
+            return true;
+        }
+        false
     }
 
     /// True iff the caret is currently in its visible half of the blink
@@ -2994,6 +3002,21 @@ impl App {
                 frame.set_cursor_position((cx, cy));
             }
         }
+
+        // Source-control commit-message caret. Same software-blink rule:
+        // the user can't see where they're typing in the message box
+        // without a visible caret, since `set_string` just lays the text
+        // flat with no native caret cell.
+        if self.focus == Pane::Tree
+            && self.sidebar_view == SidebarView::SourceControl
+            && self.context_menu.is_none()
+            && self.prompt.is_none()
+            && self.cursor_visible_phase()
+        {
+            if let Some((cx, cy)) = self.source_control.cursor_screen_pos() {
+                frame.set_cursor_position((cx, cy));
+            }
+        }
     }
 
     fn render_context_menu(&self, frame: &mut ratatui::Frame) {
@@ -3409,15 +3432,31 @@ impl App {
         if is_clipboard_paste_key(key) {
             if let Some(text) = (self.clipboard_reader)() {
                 self.source_control.insert_str(&text);
+                self.poke_cursor();
             }
             return;
         }
         match key.code {
-            KeyCode::Backspace => self.source_control.backspace(),
-            KeyCode::Left => self.source_control.move_cursor_left(),
-            KeyCode::Right => self.source_control.move_cursor_right(),
-            KeyCode::Home => self.source_control.home(),
-            KeyCode::End => self.source_control.end(),
+            KeyCode::Backspace => {
+                self.source_control.backspace();
+                self.poke_cursor();
+            }
+            KeyCode::Left => {
+                self.source_control.move_cursor_left();
+                self.poke_cursor();
+            }
+            KeyCode::Right => {
+                self.source_control.move_cursor_right();
+                self.poke_cursor();
+            }
+            KeyCode::Home => {
+                self.source_control.home();
+                self.poke_cursor();
+            }
+            KeyCode::End => {
+                self.source_control.end();
+                self.poke_cursor();
+            }
             KeyCode::Up => self.source_control.scroll_up(1),
             KeyCode::Down => self.source_control.scroll_down(1),
             KeyCode::Enter => self.commit_source_control(),
@@ -3427,6 +3466,7 @@ impl App {
                     && !key.modifiers.contains(KeyModifiers::SUPER)
                 {
                     self.source_control.insert_char(c);
+                    self.poke_cursor();
                 }
             }
             _ => {}
@@ -9436,6 +9476,62 @@ mod tests {
             app.source_control.status,
         );
         assert_eq!(app.source_control.status.branch.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn focused_source_control_input_drives_a_visible_caret_at_the_message_cursor() {
+        // Regression for the user's "I don't see the caret blinking in the
+        // Source Control message box, so I have no clue where it is at any
+        // point in time" report. After focusing the SC panel in a real
+        // repo, `cursor_should_be_visible()` must report true and the
+        // caret cell must point inside the rendered input box.
+        let tmp = tempfile::tempdir().unwrap();
+        let _ = std::process::Command::new("git")
+            .args(["-C"])
+            .arg(tmp.path())
+            .args(["init", "-q", "-b", "main"])
+            .output();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while std::time::Instant::now() < deadline {
+            app.drain_git_responses();
+            if app.source_control.status.in_repo {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            app.source_control.status.in_repo,
+            "preconditions: tempdir must register as a git repo"
+        );
+
+        app.set_sidebar_view(SidebarView::SourceControl);
+        let backend = ratatui::backend::TestBackend::new(80, 30);
+        let mut term = ratatui::Terminal::new(backend).unwrap();
+        term.draw(|f| app.render(f)).unwrap();
+        app.handle_source_control_key(key(KeyCode::Char('f'), KeyModifiers::NONE));
+        app.handle_source_control_key(key(KeyCode::Char('i'), KeyModifiers::NONE));
+        app.handle_source_control_key(key(KeyCode::Char('x'), KeyModifiers::NONE));
+        term.draw(|f| app.render(f)).unwrap();
+
+        assert!(
+            app.cursor_should_be_visible(),
+            "caret must be visible when the Source Control panel owns focus and the input is laid out"
+        );
+        let (cx, cy) = app
+            .source_control
+            .cursor_screen_pos()
+            .expect("focused SC panel must expose a caret cell");
+        let r = app.source_control.last_input_area;
+        assert!(
+            cx >= r.x + 2 && cx < r.x + r.width - 1 && cy == r.y + 1,
+            "caret cell ({cx},{cy}) must sit inside the input's text row (input rect {r:?})"
+        );
+        assert_eq!(
+            cx,
+            r.x + 2 + 3,
+            "caret must advance one cell per typed char (3 chars typed → +3 cells past the first text cell)"
+        );
     }
 
     #[test]
