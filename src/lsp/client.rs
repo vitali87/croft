@@ -56,6 +56,27 @@ impl ClientState {
                 ));
                 ControlFlow::Continue(())
             });
+        router.unhandled_notification(|this, notif| {
+            log_file::log(&format!(
+                "lsp[{}] ignored notification {}",
+                this.name, notif.method
+            ));
+            ControlFlow::Continue(())
+        });
+        router.unhandled_request(|this, req| {
+            let method = req.method.clone();
+            let name = this.name.clone();
+            Box::pin(async move {
+                log_file::log(&format!(
+                    "lsp[{name}] declined unsupported request {method}"
+                ));
+                Err(async_lsp::ResponseError::new(
+                    async_lsp::ErrorCode::METHOD_NOT_FOUND,
+                    format!("No such method {method}"),
+                )
+                .into())
+            })
+        });
         router
     }
 }
@@ -245,6 +266,42 @@ impl LspClient {
 mod tests {
     use super::*;
     use crate::lsp::runtime::LspRuntime;
+    use async_lsp::{AnyNotification, LspService};
+    use serde_json::json;
+
+    #[test]
+    fn router_continues_past_unhandled_vendor_notification_like_pyright_begin_progress() {
+        let mut router = ClientState::router("basedpyright".into());
+        let notif: AnyNotification = serde_json::from_value(json!({
+            "method": "pyright/beginProgress",
+            "params": {}
+        }))
+        .expect("AnyNotification deserialization");
+        match router.notify(notif) {
+            ControlFlow::Continue(()) => {}
+            ControlFlow::Break(result) => {
+                panic!(
+                    "router must absorb vendor-specific notifications (basedpyright streams pyright/beginProgress / pyright/endProgress / pyright/reportProgress during workspace indexing) instead of breaking the mainloop; got Break({result:?})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn router_continues_past_arbitrary_unhandled_notification_methods() {
+        let mut router = ClientState::router("any".into());
+        for method in ["foo/bar", "experimental/dap", "rust-analyzer/serverStatus"] {
+            let notif: AnyNotification = serde_json::from_value(json!({
+                "method": method,
+                "params": {}
+            }))
+            .expect("AnyNotification deserialization");
+            assert!(
+                matches!(router.notify(notif), ControlFlow::Continue(())),
+                "router must absorb the vendor notification {method} instead of killing the mainloop with an Unhandled-notification routing error"
+            );
+        }
+    }
 
     fn server_on_path(cmd: &str) -> bool {
         let Some(path) = std::env::var_os("PATH") else {
