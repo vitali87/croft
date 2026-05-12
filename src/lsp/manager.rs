@@ -3,20 +3,16 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::mpsc as std_mpsc;
-use std::time::Duration;
 
 use anyhow::Result;
 use lsp_types::{ClientCapabilities, CompletionItemKind, CompletionResponse, Url};
 use tokio::sync::{Mutex as TokioMutex, mpsc as tokio_mpsc};
-use tokio::task::AbortHandle;
 
 use crate::lsp::client::LspClient;
 use crate::lsp::config::{Language, ServerConfig};
 use crate::lsp::log_file;
 use crate::lsp::registry::ServerRegistry;
 use crate::lsp::runtime::LspRuntime;
-
-const DEBOUNCE_MS: u64 = 150;
 
 #[derive(Debug, Clone)]
 pub struct CompletionItem {
@@ -120,7 +116,6 @@ struct WorkerState {
     registry: ServerRegistry,
     clients: HashMap<Language, Arc<TokioMutex<LspClient>>>,
     docs: HashMap<PathBuf, DocState>,
-    debounce: HashMap<PathBuf, AbortHandle>,
 }
 
 struct DocState {
@@ -139,7 +134,6 @@ async fn worker_loop(
         registry,
         clients: HashMap::new(),
         docs: HashMap::new(),
-        debounce: HashMap::new(),
     };
     while let Some(cmd) = cmd_rx.recv().await {
         match cmd {
@@ -212,9 +206,6 @@ impl WorkerState {
     }
 
     async fn change_doc(&mut self, path: PathBuf, text: String) {
-        if let Some(prev) = self.debounce.remove(&path) {
-            prev.abort();
-        }
         let Some(doc) = self.docs.get_mut(&path) else {
             return;
         };
@@ -224,24 +215,16 @@ impl WorkerState {
         let Some(client_arc) = self.clients.get(&lang).cloned() else {
             return;
         };
-        let path_clone = path.clone();
-        let handle = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(DEBOUNCE_MS)).await;
-            let Ok(uri) = Url::from_file_path(&path_clone) else {
-                return;
-            };
-            let mut client = client_arc.lock().await;
-            if let Err(e) = client.did_change_full(uri, version, text) {
-                log_file::log(&format!("lsp did_change failed: {e}"));
-            }
-        });
-        self.debounce.insert(path, handle.abort_handle());
+        let Ok(uri) = Url::from_file_path(&path) else {
+            return;
+        };
+        let mut client = client_arc.lock().await;
+        if let Err(e) = client.did_change_full(uri, version, text) {
+            log_file::log(&format!("lsp did_change failed: {e}"));
+        }
     }
 
     async fn close_doc(&mut self, path: PathBuf) {
-        if let Some(prev) = self.debounce.remove(&path) {
-            prev.abort();
-        }
         let Some(doc) = self.docs.remove(&path) else {
             return;
         };
@@ -330,7 +313,7 @@ fn is_on_path(cmd: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     fn drain_completion_blocking(
         manager: &LspManager,
