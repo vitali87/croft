@@ -12,6 +12,7 @@ use tokio::task::AbortHandle;
 
 use crate::lsp::client::LspClient;
 use crate::lsp::config::{Language, ServerConfig};
+use crate::lsp::log_file;
 use crate::lsp::registry::ServerRegistry;
 use crate::lsp::runtime::LspRuntime;
 
@@ -178,7 +179,7 @@ impl WorkerState {
                     return Some(arc);
                 }
                 Err(e) => {
-                    eprintln!("lsp[{}] spawn failed: {e}", config.name);
+                    log_file::log(&format!("lsp[{}] spawn failed: {e}", config.name));
                     continue;
                 }
             }
@@ -198,7 +199,7 @@ impl WorkerState {
         };
         let mut client = client_arc.lock().await;
         if let Err(e) = client.did_open(uri, lang.lsp_id(), 0, text) {
-            eprintln!("lsp did_open failed: {e}");
+            log_file::log(&format!("lsp did_open failed: {e}"));
             return;
         }
         self.docs.insert(
@@ -231,7 +232,7 @@ impl WorkerState {
             };
             let mut client = client_arc.lock().await;
             if let Err(e) = client.did_change_full(uri, version, text) {
-                eprintln!("lsp did_change failed: {e}");
+                log_file::log(&format!("lsp did_change failed: {e}"));
             }
         });
         self.debounce.insert(path, handle.abort_handle());
@@ -252,7 +253,7 @@ impl WorkerState {
         };
         let mut client = client_arc.lock().await;
         if let Err(e) = client.did_close(uri) {
-            eprintln!("lsp did_close failed: {e}");
+            log_file::log(&format!("lsp did_close failed: {e}"));
         }
     }
 
@@ -288,7 +289,7 @@ impl WorkerState {
                 }
                 Ok(None) => Vec::new(),
                 Err(e) => {
-                    eprintln!("lsp completion error: {e}");
+                    log_file::log(&format!("lsp completion error: {e}"));
                     Vec::new()
                 }
             };

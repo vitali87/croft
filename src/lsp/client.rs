@@ -22,6 +22,7 @@ use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use tower::ServiceBuilder;
 
 use crate::lsp::config::ServerConfig;
+use crate::lsp::log_file;
 
 struct ClientState {
     name: String,
@@ -32,23 +33,26 @@ impl ClientState {
         let mut router = Router::new(ClientState { name });
         router
             .notification::<PublishDiagnostics>(|this, params| {
-                eprintln!(
+                log_file::log(&format!(
                     "lsp[{}] diagnostics for {}: {} item(s)",
                     this.name,
                     params.uri,
                     params.diagnostics.len()
-                );
+                ));
                 ControlFlow::Continue(())
             })
             .notification::<ShowMessage>(|this, params| {
-                eprintln!("lsp[{}] {:?}: {}", this.name, params.typ, params.message);
+                log_file::log(&format!(
+                    "lsp[{}] {:?}: {}",
+                    this.name, params.typ, params.message
+                ));
                 ControlFlow::Continue(())
             })
             .notification::<LogMessage>(|this, params| {
-                eprintln!(
+                log_file::log(&format!(
                     "lsp[{}] log {:?}: {}",
                     this.name, params.typ, params.message
-                );
+                ));
                 ControlFlow::Continue(())
             });
         router
@@ -118,14 +122,14 @@ impl LspClient {
         tokio::spawn(async move {
             let mut lines = BufReader::new(stderr).lines();
             while let Ok(Some(line)) = lines.next_line().await {
-                eprintln!("lsp[{stderr_name}] stderr: {line}");
+                log_file::log(&format!("lsp[{stderr_name}] stderr: {line}"));
             }
         });
 
         let mainloop_name = name.clone();
         tokio::spawn(async move {
             if let Err(e) = mainloop.run_buffered(stdout, stdin).await {
-                eprintln!("lsp[{mainloop_name}] mainloop exited: {e}");
+                log_file::log(&format!("lsp[{mainloop_name}] mainloop exited: {e}"));
             }
         });
 
