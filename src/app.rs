@@ -2140,13 +2140,19 @@ impl App {
             let Some((cx, cy)) = self.editor.cursor_screen_pos() else {
                 continue;
             };
-            self.completion_popup =
-                Some(crate::widgets::completion_popup::CompletionPopup::new(
-                    result.items,
-                    (cx, cy),
-                    result.path,
-                    result.request_id,
-                ));
+            let prefix = self.editor.word_before_cursor();
+            let popup = crate::widgets::completion_popup::CompletionPopup::new(
+                result.items,
+                prefix,
+                (cx, cy),
+                result.path,
+                result.request_id,
+            );
+            if popup.visible_is_empty() {
+                self.completion_popup = None;
+            } else {
+                self.completion_popup = Some(popup);
+            }
             changed = true;
         }
         changed
@@ -2172,10 +2178,11 @@ impl App {
     }
 
     /// Route the key through the completion popup when one is open.
-    /// Returns true when the popup consumed the key (caller should stop
-    /// further dispatch); returns false when the popup was dismissed but
-    /// the key should still flow to the normal editor handler (e.g. a
-    /// printable character typed with the popup open).
+    /// Up/Down navigate, Enter/Tab accept and replace the typed prefix
+    /// with the chosen completion's full text, Esc dismisses. Printable
+    /// chars and Backspace pass through to the editor and refresh the
+    /// popup's filter prefix in place; if no items match the new prefix
+    /// the popup dismisses on the next tick.
     fn handle_completion_popup_key(&mut self, key: KeyEvent) -> bool {
         if self.completion_popup.is_none() {
             return false;
@@ -2194,13 +2201,21 @@ impl App {
                 true
             }
             KeyCode::Enter | KeyCode::Tab => {
+                let prefix_len = self
+                    .completion_popup
+                    .as_ref()
+                    .map(|p| p.prefix.chars().count())
+                    .unwrap_or(0);
                 let text = self
                     .completion_popup
                     .as_ref()
-                    .and_then(|p| p.insertion_text());
+                    .and_then(|p| p.selected_label());
                 self.completion_popup = None;
                 self.completion_request_id = None;
                 if let Some(t) = text {
+                    for _ in 0..prefix_len {
+                        self.editor.backspace();
+                    }
                     self.editor.insert_str(&t);
                 }
                 true
@@ -2210,11 +2225,45 @@ impl App {
                 self.completion_request_id = None;
                 true
             }
+            KeyCode::Backspace => {
+                self.editor.backspace();
+                self.refresh_completion_prefix();
+                true
+            }
+            KeyCode::Char(c) => {
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    || key.modifiers.contains(KeyModifiers::ALT)
+                    || key.modifiers.contains(KeyModifiers::SUPER)
+                {
+                    self.completion_popup = None;
+                    self.completion_request_id = None;
+                    return false;
+                }
+                self.editor.insert_char(c);
+                self.refresh_completion_prefix();
+                if !is_word_continuation(c) {
+                    self.completion_popup = None;
+                    self.completion_request_id = None;
+                }
+                true
+            }
             _ => {
                 self.completion_popup = None;
                 self.completion_request_id = None;
                 false
             }
+        }
+    }
+
+    fn refresh_completion_prefix(&mut self) {
+        let prefix = self.editor.word_before_cursor();
+        let Some(popup) = self.completion_popup.as_mut() else {
+            return;
+        };
+        popup.set_prefix(prefix);
+        if popup.visible_is_empty() {
+            self.completion_popup = None;
+            self.completion_request_id = None;
         }
     }
 
@@ -7133,6 +7182,10 @@ fn is_delete_node_key(key: KeyEvent) -> bool {
 /// Returns true if the given key event should trigger "Save".
 /// Recognises Ctrl+S (cross-platform) and Cmd/Super+S (macOS-style).
 /// Case-insensitive on the letter so Shift+Ctrl+S also works.
+fn is_word_continuation(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
 fn is_completion_trigger_key(key: KeyEvent) -> bool {
     let KeyCode::Char(c) = key.code else {
         return false;

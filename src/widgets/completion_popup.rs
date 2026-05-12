@@ -16,6 +16,7 @@ const MAX_WIDTH: u16 = 60;
 
 pub struct CompletionPopup {
     pub items: Vec<CompletionItem>,
+    pub prefix: String,
     pub selected: usize,
     pub anchor: (u16, u16),
     pub path: PathBuf,
@@ -25,12 +26,14 @@ pub struct CompletionPopup {
 impl CompletionPopup {
     pub fn new(
         items: Vec<CompletionItem>,
+        prefix: String,
         anchor: (u16, u16),
         path: PathBuf,
         request_id: u64,
     ) -> Self {
         Self {
             items,
+            prefix,
             selected: 0,
             anchor,
             path,
@@ -38,37 +41,79 @@ impl CompletionPopup {
         }
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.items.is_empty()
+    pub fn set_prefix(&mut self, prefix: String) {
+        self.prefix = prefix;
+        self.selected = 0;
     }
 
-    pub fn len(&self) -> usize {
-        self.items.len()
+    pub fn visible_indices(&self) -> Vec<usize> {
+        if self.prefix.is_empty() {
+            return (0..self.items.len()).collect();
+        }
+        let needle = self.prefix.to_ascii_lowercase();
+        self.items
+            .iter()
+            .enumerate()
+            .filter_map(|(i, item)| {
+                let hay = item
+                    .insert_text
+                    .as_deref()
+                    .unwrap_or(item.label.as_str())
+                    .to_ascii_lowercase();
+                if hay.starts_with(&needle) {
+                    Some(i)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    pub fn visible_is_empty(&self) -> bool {
+        if self.prefix.is_empty() {
+            return self.items.is_empty();
+        }
+        let needle = self.prefix.to_ascii_lowercase();
+        !self.items.iter().any(|item| {
+            item.insert_text
+                .as_deref()
+                .unwrap_or(item.label.as_str())
+                .to_ascii_lowercase()
+                .starts_with(&needle)
+        })
     }
 
     pub fn move_up(&mut self) {
-        if self.items.is_empty() {
+        let visible = self.visible_indices();
+        if visible.is_empty() {
             return;
         }
         if self.selected == 0 {
-            self.selected = self.items.len() - 1;
+            self.selected = visible.len() - 1;
         } else {
             self.selected -= 1;
         }
     }
 
     pub fn move_down(&mut self) {
-        if self.items.is_empty() {
+        let visible = self.visible_indices();
+        if visible.is_empty() {
             return;
         }
-        self.selected = (self.selected + 1) % self.items.len();
+        self.selected = (self.selected + 1) % visible.len();
     }
 
     pub fn selected_item(&self) -> Option<&CompletionItem> {
-        self.items.get(self.selected)
+        let visible = self.visible_indices();
+        visible.get(self.selected).and_then(|&i| self.items.get(i))
     }
 
-    pub fn insertion_text(&self) -> Option<String> {
+    /// Full insertion text for the selected item. The caller is expected
+    /// to first backspace `prefix.chars().count()` chars from the editor
+    /// so that an already-typed prefix is replaced (handles the typo case
+    /// `calX` -> `calc_n_gram` correctly, where simply appending would
+    /// leave the X behind).
+    pub fn selected_label(&self) -> Option<String> {
         self.selected_item().map(|item| {
             item.insert_text
                 .clone()
@@ -77,15 +122,17 @@ impl CompletionPopup {
     }
 
     pub fn area_for(&self, viewport: Rect) -> Rect {
-        let width = self
-            .items
+        let visible = self.visible_indices();
+        let count = visible.len().max(1).min(MAX_VISIBLE_ITEMS);
+        let max_label = visible
             .iter()
-            .map(|i| i.label.chars().count() as u16)
+            .map(|&i| self.items[i].label.chars().count() as u16)
             .max()
-            .unwrap_or(MIN_WIDTH)
-            .saturating_add(2)
+            .unwrap_or(MIN_WIDTH);
+        let width = max_label
+            .saturating_add(6)
             .clamp(MIN_WIDTH, MAX_WIDTH);
-        let height = (self.items.len().min(MAX_VISIBLE_ITEMS) as u16).saturating_add(2);
+        let height = (count as u16).saturating_add(2);
         let (cx, cy) = self.anchor;
         let mut x = cx;
         let mut y = cy.saturating_add(1);
@@ -106,10 +153,11 @@ impl CompletionPopup {
 
 impl Widget for &CompletionPopup {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        let items: Vec<ListItem> = self
-            .items
+        let visible = self.visible_indices();
+        let items: Vec<ListItem> = visible
             .iter()
-            .map(|item| {
+            .map(|&i| {
+                let item = &self.items[i];
                 let kind_glyph = kind_glyph(item.kind);
                 let mut spans = vec![
                     Span::styled(
@@ -183,22 +231,54 @@ mod tests {
         }
     }
 
-    #[test]
-    fn move_up_wraps_to_last() {
-        let mut p = CompletionPopup::new(
-            vec![item("a"), item("b"), item("c")],
-            (0, 0),
-            PathBuf::new(),
-            1,
-        );
-        assert_eq!(p.selected, 0);
-        p.move_up();
-        assert_eq!(p.selected, 2);
+    fn popup(items: Vec<CompletionItem>, prefix: &str) -> CompletionPopup {
+        CompletionPopup::new(items, prefix.to_string(), (0, 0), PathBuf::new(), 1)
     }
 
     #[test]
-    fn move_down_wraps_to_first() {
-        let mut p = CompletionPopup::new(vec![item("a"), item("b")], (0, 0), PathBuf::new(), 1);
+    fn empty_prefix_shows_every_item() {
+        let p = popup(vec![item("a"), item("b"), item("c")], "");
+        assert_eq!(p.visible_indices(), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn prefix_filters_to_matching_labels() {
+        let p = popup(
+            vec![item("False"), item("calc_n_gram"), item("candidate")],
+            "calc",
+        );
+        assert_eq!(p.visible_indices(), vec![1]);
+    }
+
+    #[test]
+    fn prefix_match_is_case_insensitive() {
+        let p = popup(vec![item("Calc"), item("calc"), item("CALC")], "ca");
+        assert_eq!(p.visible_indices(), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn visible_is_empty_when_no_match() {
+        let p = popup(vec![item("foo"), item("bar")], "z");
+        assert!(p.visible_is_empty());
+    }
+
+    #[test]
+    fn move_up_wraps_over_visible_only() {
+        let mut p = popup(
+            vec![item("aardvark"), item("calc_one"), item("calc_two")],
+            "calc",
+        );
+        assert_eq!(p.selected, 0);
+        p.move_up();
+        assert_eq!(p.selected, 1);
+    }
+
+    #[test]
+    fn move_down_wraps_over_visible_only() {
+        let mut p = popup(
+            vec![item("aardvark"), item("calc_one"), item("calc_two")],
+            "calc",
+        );
         p.move_down();
         assert_eq!(p.selected, 1);
         p.move_down();
@@ -206,29 +286,50 @@ mod tests {
     }
 
     #[test]
-    fn insertion_prefers_insert_text_over_label() {
-        let p = CompletionPopup::new(
+    fn selected_item_indexes_visible() {
+        let p = popup(
+            vec![item("aardvark"), item("calc_one"), item("calc_two")],
+            "calc",
+        );
+        assert_eq!(p.selected_item().map(|i| i.label.as_str()), Some("calc_one"));
+    }
+
+    #[test]
+    fn selected_label_returns_full_text() {
+        let p = popup(vec![item("calc_n_gram")], "calc_");
+        assert_eq!(p.selected_label(), Some(String::from("calc_n_gram")));
+    }
+
+    #[test]
+    fn selected_label_prefers_insert_text_over_label() {
+        let p = popup(
             vec![CompletionItem {
                 label: "os.getcwd".into(),
                 detail: None,
                 insert_text: Some("getcwd".into()),
                 kind: None,
             }],
-            (0, 0),
-            PathBuf::new(),
-            1,
+            "",
         );
-        assert_eq!(p.insertion_text(), Some(String::from("getcwd")));
+        assert_eq!(p.selected_label(), Some(String::from("getcwd")));
+    }
+
+    #[test]
+    fn set_prefix_resets_selected() {
+        let mut p = popup(
+            vec![item("alpha"), item("beta"), item("calc")],
+            "",
+        );
+        p.move_down();
+        p.move_down();
+        assert_eq!(p.selected, 2);
+        p.set_prefix(String::from("c"));
+        assert_eq!(p.selected, 0);
     }
 
     #[test]
     fn area_fits_within_viewport_when_anchor_is_near_right_edge() {
-        let p = CompletionPopup::new(
-            vec![item("aaaaaaaaaaaaaaaaaaaaaaaaa")],
-            (100, 5),
-            PathBuf::new(),
-            1,
-        );
+        let p = popup(vec![item("aaaaaaaaaaaaaaaaaaaaaaaaa")], "");
         let viewport = Rect {
             x: 0,
             y: 0,
@@ -241,7 +342,7 @@ mod tests {
 
     #[test]
     fn render_does_not_panic() {
-        let p = CompletionPopup::new(vec![item("foo"), item("bar")], (0, 0), PathBuf::new(), 1);
+        let p = popup(vec![item("foo"), item("bar")], "");
         let area = Rect {
             x: 0,
             y: 0,

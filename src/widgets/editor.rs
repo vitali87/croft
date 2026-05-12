@@ -686,6 +686,22 @@ impl Editor {
         self.edit_seq = self.edit_seq.wrapping_add(1);
     }
 
+    /// Identifier chars immediately to the left of the cursor on the
+    /// current line. Used as the LSP completion popup's filter prefix
+    /// so the menu narrows to items the user is actually typing toward.
+    pub fn word_before_cursor(&self) -> String {
+        let Some(line) = self.lines.get(self.cursor_row) else {
+            return String::new();
+        };
+        let chars: Vec<char> = line.chars().collect();
+        let end = self.cursor_col.min(chars.len());
+        let mut start = end;
+        while start > 0 && is_word_char(chars[start - 1]) {
+            start -= 1;
+        }
+        chars[start..end].iter().collect()
+    }
+
     pub fn open(&mut self, path: &Path) -> Result<()> {
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
         if extension_is_image(ext) {
