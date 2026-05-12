@@ -17,6 +17,16 @@ pub struct RemotePanel {
     pub last_inner: Rect,
     pub last_list_area: Rect,
     pub last_scrollbar: Rect,
+    /// Header-row `+` (add host) hit rect. Empty when not rendered.
+    pub header_add_btn: Rect,
+    /// Header-row gear (settings / refresh) hit rect.
+    pub header_gear_btn: Rect,
+    /// Empty-state primary `+ Add New Host` button hit rect.
+    pub empty_primary_btn: Rect,
+    /// Empty-state secondary `Open SSH Config` button hit rect.
+    pub empty_secondary_btn: Rect,
+    /// Empty-state `? Learn more about SSH` link hit rect.
+    pub empty_learn_link: Rect,
     ssh_config_state: SshConfigState,
 }
 
@@ -32,6 +42,11 @@ impl RemotePanel {
             last_inner: Rect::default(),
             last_list_area: Rect::default(),
             last_scrollbar: Rect::default(),
+            header_add_btn: Rect::default(),
+            header_gear_btn: Rect::default(),
+            empty_primary_btn: Rect::default(),
+            empty_secondary_btn: Rect::default(),
+            empty_learn_link: Rect::default(),
             ssh_config_state,
         }
     }
@@ -134,6 +149,173 @@ impl Default for RemotePanel {
     }
 }
 
+const CARD_BORDER: Color = Color::Rgb(0x33, 0xb0, 0xc8);
+const CARD_BG: Color = Color::Rgb(0x12, 0x1a, 0x24);
+const PRIMARY_BG: Color = Color::Rgb(0x16, 0x9b, 0xba);
+const LINK_FG: Color = Color::Rgb(0x4e, 0xc6, 0xff);
+
+fn render_section_header(panel: &mut RemotePanel, buf: &mut Buffer, inner: Rect) {
+    let header_style = Style::default()
+        .fg(Color::Rgb(0xcc, 0xcc, 0xcc))
+        .add_modifier(Modifier::BOLD);
+    buf.set_line(
+        inner.x,
+        inner.y,
+        &Line::from(vec![
+            Span::styled("▾ ", Style::default().fg(Color::Gray)),
+            Span::styled("SSH", header_style),
+        ]),
+        inner.width,
+    );
+    if inner.width < 6 {
+        return;
+    }
+    let icon_fg = Style::default().fg(Color::Rgb(0x9d, 0xa5, 0xb4));
+    let gear_x = inner.x + inner.width.saturating_sub(2);
+    let plus_x = gear_x.saturating_sub(3);
+    if plus_x > inner.x + 4 {
+        buf.set_string(plus_x, inner.y, "+", icon_fg);
+        panel.header_add_btn = Rect { x: plus_x, y: inner.y, width: 1, height: 1 };
+    }
+    if gear_x > inner.x + 4 {
+        buf.set_string(gear_x, inner.y, "⚙", icon_fg);
+        panel.header_gear_btn = Rect { x: gear_x, y: inner.y, width: 1, height: 1 };
+    }
+}
+
+fn render_empty_state(panel: &mut RemotePanel, buf: &mut Buffer, area: Rect) {
+    if area.height < 12 || area.width < 22 {
+        return;
+    }
+    let card_width = area.width.min(34);
+    let card_x = area.x + (area.width.saturating_sub(card_width)) / 2;
+    let card_y = area.y;
+    let card_height = area.height.min(24);
+    let card_rect = Rect {
+        x: card_x,
+        y: card_y,
+        width: card_width,
+        height: card_height,
+    };
+    let card_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(ratatui::widgets::BorderType::Rounded)
+        .border_style(Style::default().fg(CARD_BORDER))
+        .style(Style::default().bg(CARD_BG));
+    let card_inner = card_block.inner(card_rect);
+    card_block.render(card_rect, buf);
+
+    let mut y = card_inner.y;
+    let illustration = [
+        "  +                    ",
+        "  ╭───────╮            ",
+        "  │── ── ●│            ",
+        "  ╰───────╯  ╭────╮    ",
+        "  ╭───────╮──┤ >_ │    ",
+        "  │── ── ●│  ╰────╯    ",
+        "  ╰───────╯       +    ",
+    ];
+    let illus_w = illustration[0].chars().count() as u16;
+    let illus_x = card_inner.x + (card_inner.width.saturating_sub(illus_w)) / 2;
+    let illus_fg = Style::default().fg(CARD_BORDER).bg(CARD_BG);
+    for line in illustration.iter() {
+        if y >= card_inner.y + card_inner.height {
+            break;
+        }
+        buf.set_string(illus_x, y, *line, illus_fg);
+        y += 1;
+    }
+    y = y.saturating_add(1);
+
+    let title = "No SSH hosts yet";
+    let title_w = title.chars().count() as u16;
+    if y < card_inner.y + card_inner.height {
+        let tx = card_inner.x + (card_inner.width.saturating_sub(title_w)) / 2;
+        buf.set_string(
+            tx,
+            y,
+            title,
+            Style::default()
+                .fg(Color::White)
+                .bg(CARD_BG)
+                .add_modifier(Modifier::BOLD),
+        );
+        y += 2;
+    }
+
+    let body = [
+        "Add SSH host entries to securely",
+        "connect to your remote servers",
+        "and start exploring.",
+    ];
+    let body_fg = Style::default().fg(Color::Rgb(0x9d, 0xa5, 0xb4)).bg(CARD_BG);
+    for line in body.iter() {
+        if y >= card_inner.y + card_inner.height {
+            break;
+        }
+        let w = line.chars().count() as u16;
+        let lx = card_inner.x + (card_inner.width.saturating_sub(w)) / 2;
+        buf.set_string(lx, y, *line, body_fg);
+        y += 1;
+    }
+    y = y.saturating_add(1);
+
+    let btn_width = card_inner.width.saturating_sub(4).min(28);
+    let btn_x = card_inner.x + (card_inner.width.saturating_sub(btn_width)) / 2;
+    if y + 1 < card_inner.y + card_inner.height {
+        let label = "  +  Add New Host";
+        let pad = (btn_width as usize).saturating_sub(label.chars().count());
+        let padded = format!("{label}{}", " ".repeat(pad));
+        buf.set_string(
+            btn_x,
+            y,
+            &padded,
+            Style::default()
+                .fg(Color::White)
+                .bg(PRIMARY_BG)
+                .add_modifier(Modifier::BOLD),
+        );
+        panel.empty_primary_btn = Rect { x: btn_x, y, width: btn_width, height: 1 };
+        y += 2;
+    }
+
+    if y < card_inner.y + card_inner.height {
+        let label = "   Open SSH Config";
+        let pad = (btn_width as usize).saturating_sub(label.chars().count());
+        let padded = format!("{label}{}", " ".repeat(pad));
+        buf.set_string(
+            btn_x,
+            y,
+            &padded,
+            Style::default()
+                .fg(CARD_BORDER)
+                .bg(CARD_BG)
+                .add_modifier(Modifier::BOLD),
+        );
+        for dx in 0..btn_width {
+            let bx = btn_x + dx;
+            if dx == 0 || dx + 1 == btn_width {
+                buf[(bx, y)].set_char('│').set_style(Style::default().fg(CARD_BORDER).bg(CARD_BG));
+            }
+        }
+        panel.empty_secondary_btn = Rect { x: btn_x, y, width: btn_width, height: 1 };
+        y += 2;
+    }
+
+    if y < card_inner.y + card_inner.height {
+        let link = "?  Learn more about SSH  ↗";
+        let w = link.chars().count() as u16;
+        let lx = card_inner.x + (card_inner.width.saturating_sub(w)) / 2;
+        buf.set_string(
+            lx,
+            y,
+            link,
+            Style::default().fg(LINK_FG).bg(CARD_BG).add_modifier(Modifier::UNDERLINED),
+        );
+        panel.empty_learn_link = Rect { x: lx, y, width: w, height: 1 };
+    }
+}
+
 impl Widget for &mut RemotePanel {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let block_style = if self.focused {
@@ -162,42 +344,20 @@ impl Widget for &mut RemotePanel {
             width: inner.width,
             height: inner.height.saturating_sub(1),
         };
+        self.header_add_btn = Rect::default();
+        self.header_gear_btn = Rect::default();
+        self.empty_primary_btn = Rect::default();
+        self.empty_secondary_btn = Rect::default();
+        self.empty_learn_link = Rect::default();
 
         if inner.height == 0 || inner.width == 0 {
             return;
         }
 
-        let header_style = Style::default()
-            .fg(Color::Rgb(0xcc, 0xcc, 0xcc))
-            .add_modifier(Modifier::BOLD);
-        buf.set_line(
-            inner.x,
-            inner.y,
-            &Line::from(vec![
-                Span::styled("▾ ", Style::default().fg(Color::Gray)),
-                Span::styled("SSH", header_style),
-            ]),
-            inner.width,
-        );
+        render_section_header(self, buf, inner);
 
         if self.targets.is_empty() {
-            let dim = Style::default().fg(Color::DarkGray);
-            if self.last_list_area.height > 0 {
-                buf.set_string(
-                    self.last_list_area.x,
-                    self.last_list_area.y,
-                    "No SSH hosts found",
-                    dim,
-                );
-            }
-            if self.last_list_area.height > 1 {
-                buf.set_string(
-                    self.last_list_area.x,
-                    self.last_list_area.y + 1,
-                    "Add Host entries to ~/.ssh/config",
-                    dim,
-                );
-            }
+            render_empty_state(self, buf, self.last_list_area);
             return;
         }
 
@@ -269,5 +429,96 @@ impl Widget for &mut RemotePanel {
         if let Some(metrics) = scrollbar_metrics {
             scrollbar::render_vertical(buf, metrics, self.focused);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::buffer::Buffer;
+
+    fn empty_panel() -> RemotePanel {
+        let mut p = RemotePanel::new();
+        p.targets.clear();
+        p
+    }
+
+    #[test]
+    fn empty_state_registers_hit_rects_for_every_actionable_affordance() {
+        let mut p = empty_panel();
+        let area = Rect { x: 0, y: 0, width: 40, height: 40 };
+        let mut buf = Buffer::empty(area);
+        (&mut p).render(area, &mut buf);
+        assert!(
+            p.header_add_btn.width > 0,
+            "header + button must register a hit rect so clicking it opens the ssh config"
+        );
+        assert!(
+            p.header_gear_btn.width > 0,
+            "header gear must register a hit rect"
+        );
+        assert!(
+            p.empty_primary_btn.width > 0,
+            "primary 'Add New Host' button must register a hit rect — the whole point of the empty state is that this is clickable"
+        );
+        assert!(
+            p.empty_secondary_btn.width > 0,
+            "secondary 'Open SSH Config' button must register a hit rect"
+        );
+        assert!(
+            p.empty_learn_link.width > 0,
+            "learn-more link must register a hit rect"
+        );
+    }
+
+    #[test]
+    fn populated_state_does_not_register_empty_state_hit_rects() {
+        let mut p = RemotePanel::new();
+        p.targets = vec![RemoteTarget {
+            alias: "dev".into(),
+            host_name: Some("example.com".into()),
+            user: None,
+        }];
+        let area = Rect { x: 0, y: 0, width: 40, height: 40 };
+        let mut buf = Buffer::empty(area);
+        (&mut p).render(area, &mut buf);
+        assert_eq!(
+            p.empty_primary_btn,
+            Rect::default(),
+            "populated state must zero out the empty-state hit rects so a click on the host list does not accidentally fire 'Add New Host'"
+        );
+        assert_eq!(p.empty_secondary_btn, Rect::default());
+        assert_eq!(p.empty_learn_link, Rect::default());
+    }
+
+    #[test]
+    fn empty_state_renders_the_no_hosts_heading_so_the_user_knows_what_state_they_are_in() {
+        let mut p = empty_panel();
+        let area = Rect { x: 0, y: 0, width: 40, height: 40 };
+        let mut buf = Buffer::empty(area);
+        (&mut p).render(area, &mut buf);
+        let mut joined = String::new();
+        for y in area.top()..area.bottom() {
+            for x in area.left()..area.right() {
+                joined.push_str(buf[(x, y)].symbol());
+            }
+            joined.push('\n');
+        }
+        assert!(
+            joined.contains("No SSH hosts yet"),
+            "rendered buffer must contain the empty-state heading; got:\n{joined}"
+        );
+        assert!(
+            joined.contains("Add New Host"),
+            "rendered buffer must contain the primary button label"
+        );
+        assert!(
+            joined.contains("Open SSH Config"),
+            "rendered buffer must contain the secondary button label"
+        );
+        assert!(
+            joined.contains("Learn more about SSH"),
+            "rendered buffer must contain the learn-more link"
+        );
     }
 }

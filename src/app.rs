@@ -4336,6 +4336,48 @@ impl App {
         self.quit = true;
     }
 
+    fn open_ssh_config_in_editor(&mut self) {
+        let Some(path) = crate::remote::primary_ssh_config_path() else {
+            self.status = String::from("Cannot find $HOME/.ssh/config");
+            return;
+        };
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if !path.exists() {
+            if let Err(e) = std::fs::write(&path, "") {
+                self.status = format!("Could not create {}: {e}", path.display());
+                return;
+            }
+        }
+        match self.editor.open_pinned(&path) {
+            Ok(()) => {
+                self.focus_pane(Pane::Editor);
+                self.status = format!("Opened {}", path.display());
+            }
+            Err(e) => {
+                self.status = format!("Open {} failed: {e}", path.display());
+            }
+        }
+    }
+
+    fn open_ssh_learn_more(&mut self) {
+        let url = "https://man.openbsd.org/ssh_config";
+        if self.drop_relay_active() {
+            if self.trust_local_browser {
+                self.request_remote_url_open(url.to_string());
+                self.status = String::from("Opening ssh_config(5) on your local Mac…");
+            } else {
+                self.pending_local_open = Some(url.to_string());
+            }
+            return;
+        }
+        match open_url(url) {
+            Ok(()) => self.status = String::from("Opened ssh_config(5) docs"),
+            Err(e) => self.status = format!("Open link failed: {e}"),
+        }
+    }
+
     fn refresh_remote_if_config_changed(&mut self) -> bool {
         if self.sidebar_view != SidebarView::Remote {
             return false;
@@ -5869,6 +5911,22 @@ impl App {
                 }
                 if in_tree && self.sidebar_view == SidebarView::Remote {
                     self.focus_pane(Pane::Tree);
+                    if rect_contains(self.remote.header_add_btn, m.column, m.row)
+                        || rect_contains(self.remote.empty_primary_btn, m.column, m.row)
+                        || rect_contains(self.remote.empty_secondary_btn, m.column, m.row)
+                    {
+                        self.open_ssh_config_in_editor();
+                        return;
+                    }
+                    if rect_contains(self.remote.header_gear_btn, m.column, m.row) {
+                        self.remote.refresh();
+                        self.status = String::from("Reloaded SSH hosts from ~/.ssh/config");
+                        return;
+                    }
+                    if rect_contains(self.remote.empty_learn_link, m.column, m.row) {
+                        self.open_ssh_learn_more();
+                        return;
+                    }
                     if let Some(idx) = self.remote.target_at_y(m.row) {
                         self.remote.select(idx);
                         let now = std::time::Instant::now();

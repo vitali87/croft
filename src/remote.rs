@@ -86,6 +86,10 @@ fn ssh_config_paths() -> Vec<PathBuf> {
     paths
 }
 
+pub fn primary_ssh_config_path() -> Option<PathBuf> {
+    ssh_config_paths().into_iter().next()
+}
+
 pub fn parse_ssh_config(input: &str) -> Vec<RemoteTarget> {
     let mut targets = Vec::new();
     let mut block = HostBlock::default();
