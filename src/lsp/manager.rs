@@ -19,6 +19,7 @@ pub struct CompletionItem {
     pub label: String,
     pub detail: Option<String>,
     pub insert_text: Option<String>,
+    pub filter_text: Option<String>,
     pub kind: Option<CompletionItemKind>,
 }
 
@@ -259,11 +260,15 @@ impl WorkerState {
         };
         let tx = tx.clone();
         let path_clone = path.clone();
+        log_file::log(&format!(
+            "completion request id={request_id} path={} line={line} char={character}",
+            path.display()
+        ));
         tokio::spawn(async move {
             let mut client = client_arc.lock().await;
             let resp = client.completion(uri, line, character).await;
             drop(client);
-            let items = match resp {
+            let items: Vec<CompletionItem> = match resp {
                 Ok(Some(CompletionResponse::Array(items))) => {
                     items.into_iter().map(into_item).collect()
                 }
@@ -276,6 +281,16 @@ impl WorkerState {
                     Vec::new()
                 }
             };
+            let preview: Vec<&str> = items
+                .iter()
+                .take(25)
+                .map(|i| i.label.as_str())
+                .collect();
+            log_file::log(&format!(
+                "completion response id={request_id} count={} first={:?}",
+                items.len(),
+                preview
+            ));
             let _ = tx.send(CompletionResult {
                 request_id,
                 path: path_clone,
@@ -290,6 +305,7 @@ fn into_item(item: lsp_types::CompletionItem) -> CompletionItem {
         label: item.label,
         detail: item.detail,
         insert_text: item.insert_text,
+        filter_text: item.filter_text,
         kind: item.kind,
     }
 }

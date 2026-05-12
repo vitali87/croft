@@ -55,12 +55,7 @@ impl CompletionPopup {
             .iter()
             .enumerate()
             .filter_map(|(i, item)| {
-                let hay = item
-                    .insert_text
-                    .as_deref()
-                    .unwrap_or(item.label.as_str())
-                    .to_ascii_lowercase();
-                if hay.starts_with(&needle) {
+                if filter_haystack(item).to_ascii_lowercase().starts_with(&needle) {
                     Some(i)
                 } else {
                     None
@@ -75,9 +70,7 @@ impl CompletionPopup {
         }
         let needle = self.prefix.to_ascii_lowercase();
         !self.items.iter().any(|item| {
-            item.insert_text
-                .as_deref()
-                .unwrap_or(item.label.as_str())
+            filter_haystack(item)
                 .to_ascii_lowercase()
                 .starts_with(&needle)
         })
@@ -196,6 +189,13 @@ impl Widget for &CompletionPopup {
     }
 }
 
+fn filter_haystack(item: &CompletionItem) -> &str {
+    item.filter_text
+        .as_deref()
+        .or(item.insert_text.as_deref())
+        .unwrap_or(item.label.as_str())
+}
+
 fn kind_glyph(kind: Option<lsp_types::CompletionItemKind>) -> char {
     use lsp_types::CompletionItemKind as K;
     match kind {
@@ -227,6 +227,7 @@ mod tests {
             label: label.to_string(),
             detail: None,
             insert_text: None,
+            filter_text: None,
             kind: None,
         }
     }
@@ -307,11 +308,27 @@ mod tests {
                 label: "os.getcwd".into(),
                 detail: None,
                 insert_text: Some("getcwd".into()),
+                filter_text: None,
                 kind: None,
             }],
             "",
         );
         assert_eq!(p.selected_label(), Some(String::from("getcwd")));
+    }
+
+    #[test]
+    fn filter_uses_filter_text_when_present() {
+        let p = popup(
+            vec![CompletionItem {
+                label: "displayed".into(),
+                detail: None,
+                insert_text: None,
+                filter_text: Some("matchme".into()),
+                kind: None,
+            }],
+            "match",
+        );
+        assert_eq!(p.visible_indices(), vec![0]);
     }
 
     #[test]
