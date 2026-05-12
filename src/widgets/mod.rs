@@ -6,5 +6,6 @@ pub mod remote;
 pub mod run_debug;
 pub mod scrollbar;
 pub mod search;
+pub mod shortcuts;
 pub mod source_control;
 pub mod terminal;

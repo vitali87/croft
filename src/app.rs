@@ -411,7 +411,7 @@ fn build_tree_context_menu_items(
         let single_folder_target: Option<&PathBuf> = paths_for_action
             .first()
             .filter(|_| paths_for_action.len() == 1)
-            .filter(|pp| node.map(|n| n.is_dir).unwrap_or(false))
+            .filter(|_| node.map(|n| n.is_dir).unwrap_or(false))
             .filter(|pp| pp.as_path() != root);
         if let Some(folder) = single_folder_target {
             items.push((
@@ -780,6 +780,14 @@ pub struct App {
     /// one (e.g. user already moved past the original trigger).
     completion_request_id: Option<u64>,
     editor_vim_chord: EditorVimChord,
+    shortcuts_modal: Option<crate::widgets::shortcuts::ShortcutsModal>,
+    shortcuts_hit_rect: Option<Rect>,
+    /// One-shot flag the driver consumes to fire `terminal.clear()` so
+    /// iTerm2 evicts the OSC-1337 image cells (activity bar icons,
+    /// welcome wordmark, editor image preview) that would otherwise
+    /// bleed through the modal's text. Armed on open AND on close so
+    /// the modal's own cells get wiped when it dismisses too.
+    shortcuts_image_clear_requested: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1281,6 +1289,9 @@ impl App {
             lsp_last_seen: std::collections::HashMap::new(),
             completion_popup: None,
             editor_vim_chord: EditorVimChord::default(),
+            shortcuts_modal: None,
+            shortcuts_hit_rect: None,
+            shortcuts_image_clear_requested: false,
             completion_request_id: None,
         })
     }
@@ -1452,6 +1463,9 @@ impl App {
     /// welcome wordmark and editor preview image use.
     pub fn flush_run_debug_icon_overlay(&mut self) {
         use std::io::Write;
+        if self.shortcuts_modal.is_some() {
+            return;
+        }
         let panel_visible = self.show_tree
             && self.sidebar_view == SidebarView::RunDebug
             && self.run_debug_icon_osc.is_some();
@@ -1487,6 +1501,9 @@ impl App {
     /// surrounding cells redraw.
     pub fn flush_no_repo_hero_overlay(&mut self) {
         use std::io::Write;
+        if self.shortcuts_modal.is_some() {
+            return;
+        }
         let panel_visible = self.show_tree
             && self.sidebar_view == SidebarView::SourceControl
             && !self.source_control.status.in_repo;
@@ -1589,6 +1606,9 @@ impl App {
     /// (just past the active-pill column). Empty when image rendering is
     /// disabled or the activity bar hasn't been laid out yet.
     pub fn pending_activity_image_overlays(&self) -> Vec<((u16, u16), &str)> {
+        if self.shortcuts_modal.is_some() {
+            return Vec::new();
+        }
         let Some(images) = self.activity_images.as_ref() else {
             return Vec::new();
         };
@@ -1649,6 +1669,9 @@ impl App {
     /// outlast iTerm2's image-cache eviction under heavy SGR traffic.
     pub fn flush_welcome_codeberg_badge_overlay(&mut self) {
         use std::io::Write;
+        if self.shortcuts_modal.is_some() {
+            return;
+        }
         if !self.editor.is_blank_initial() {
             // Welcome panel hidden: clear any previous emit and stop
             // re-emitting until we're back on the welcome screen.
@@ -3264,7 +3287,23 @@ impl App {
         spans.push(Span::styled("^b", Style::default().fg(Color::Yellow)));
         spans.push(Span::raw(" Tree  "));
         spans.push(Span::styled("^j", Style::default().fg(Color::Yellow)));
-        spans.push(Span::raw(" Term"));
+        spans.push(Span::raw(" Term  "));
+        let shortcuts_label_start_col: u16 = spans
+            .iter()
+            .map(|s| s.content.chars().count() as u16)
+            .sum();
+        spans.push(Span::styled("F1", Style::default().fg(Color::Yellow)));
+        spans.push(Span::raw(" Shortcuts"));
+        let shortcuts_label_len: u16 = "F1 Shortcuts".chars().count() as u16;
+        let status_rect = outer[1];
+        let hit_x = status_rect.x.saturating_add(shortcuts_label_start_col);
+        let hit_end = hit_x.saturating_add(shortcuts_label_len).min(status_rect.right());
+        self.shortcuts_hit_rect = (hit_end > hit_x).then(|| Rect {
+            x: hit_x,
+            y: status_rect.y,
+            width: hit_end - hit_x,
+            height: 1,
+        });
         let status = Paragraph::new(Line::from(spans))
             .style(Style::default().bg(Color::Rgb(0x1e, 0x3a, 0x6e)));
         frame.render_widget(status, outer[1]);
@@ -3275,6 +3314,7 @@ impl App {
         self.render_prompt(frame);
         self.render_local_open_confirm(frame);
         self.render_discard_confirm(frame);
+        self.render_shortcuts_modal(frame);
 
         // Show the host terminal's hardware caret only when the editor is
         // focused and has no modal overlay. The DECSCUSR style is set to
@@ -3603,6 +3643,14 @@ impl App {
 
     fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
         if key.kind != KeyEventKind::Press && key.kind != KeyEventKind::Repeat {
+            return Ok(());
+        }
+        if self.shortcuts_modal.is_some() {
+            self.handle_shortcuts_modal_key(key);
+            return Ok(());
+        }
+        if matches!(key.code, KeyCode::F(1)) {
+            self.open_shortcuts_modal();
             return Ok(());
         }
         // Modal layer: prompt eats every key while it's open.
@@ -5441,7 +5489,85 @@ impl App {
         }
     }
 
+    fn open_shortcuts_modal(&mut self) {
+        if self.shortcuts_modal.is_none() {
+            self.shortcuts_modal =
+                Some(crate::widgets::shortcuts::ShortcutsModal::default());
+            self.shortcuts_image_clear_requested = true;
+            self.status = String::from("Shortcuts: Esc to close");
+        }
+    }
+
+    fn close_shortcuts_modal(&mut self) {
+        if self.shortcuts_modal.take().is_some() {
+            self.shortcuts_image_clear_requested = true;
+            self.activity_overlay_dirty = true;
+            self.welcome_overlay_dirty = true;
+            self.no_repo_hero_overlay_dirty = true;
+            self.editor_image_layout = None;
+            self.status.clear();
+        }
+    }
+
+    pub fn consume_shortcuts_image_clear(&mut self) -> bool {
+        if self.shortcuts_image_clear_requested {
+            self.shortcuts_image_clear_requested = false;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn handle_shortcuts_modal_key(&mut self, key: KeyEvent) {
+        let Some(modal) = self.shortcuts_modal.as_mut() else { return };
+        match (key.code, key.modifiers) {
+            (KeyCode::Esc, _) | (KeyCode::F(1), _) => self.close_shortcuts_modal(),
+            (KeyCode::Char('q'), KeyModifiers::NONE) => self.close_shortcuts_modal(),
+            (KeyCode::Down, _) | (KeyCode::Char('j'), _) => modal.scroll_down(1),
+            (KeyCode::Up, _) | (KeyCode::Char('k'), _) => modal.scroll_up(1),
+            (KeyCode::PageDown, _) | (KeyCode::Char(' '), _) => modal.scroll_down(10),
+            (KeyCode::PageUp, _) => modal.scroll_up(10),
+            (KeyCode::Home, _) | (KeyCode::Char('g'), _) => modal.scroll_to_top(),
+            (KeyCode::End, _) | (KeyCode::Char('G'), _) => modal.scroll_to_bottom(),
+            _ => {}
+        }
+    }
+
+    fn handle_shortcuts_modal_mouse(&mut self, m: MouseEvent) {
+        let Some(modal) = self.shortcuts_modal.as_mut() else { return };
+        let inside = rect_contains(modal.last_rect, m.column, m.row);
+        match m.kind {
+            MouseEventKind::ScrollDown => modal.scroll_down(3),
+            MouseEventKind::ScrollUp => modal.scroll_up(3),
+            MouseEventKind::Down(MouseButton::Left)
+            | MouseEventKind::Down(MouseButton::Right) => {
+                if !inside {
+                    self.close_shortcuts_modal();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn render_shortcuts_modal(&mut self, frame: &mut ratatui::Frame) {
+        let Some(modal) = self.shortcuts_modal.as_mut() else { return };
+        let area = frame.area();
+        crate::widgets::shortcuts::render_shortcuts_modal(modal, area, frame.buffer_mut());
+    }
+
     fn handle_mouse(&mut self, m: MouseEvent) {
+        if self.shortcuts_modal.is_some() {
+            self.handle_shortcuts_modal_mouse(m);
+            return;
+        }
+        if matches!(m.kind, MouseEventKind::Down(MouseButton::Left))
+            && self
+                .shortcuts_hit_rect
+                .is_some_and(|r| rect_contains(r, m.column, m.row))
+        {
+            self.open_shortcuts_modal();
+            return;
+        }
         // While a prompt is open, mouse events are ignored.
         if self.prompt.is_some() {
             return;
@@ -6569,6 +6695,9 @@ impl App {
     }
 
     pub fn editor_image_payload(&self) -> Option<(&str, &EditorImageLayout)> {
+        if self.shortcuts_modal.is_some() {
+            return None;
+        }
         let osc = self.editor_image_osc.as_deref()?;
         let layout = self.editor_image_layout.as_ref()?;
         Some((osc, layout))
@@ -11533,6 +11662,101 @@ mod tests {
     }
 
     #[test]
+    fn f1_opens_the_shortcuts_modal_from_any_focus() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.focus_pane(Pane::Editor);
+        app.handle_key(key(KeyCode::F(1), KeyModifiers::NONE)).unwrap();
+        assert!(app.shortcuts_modal.is_some(), "F1 must open the shortcuts panel");
+    }
+
+    #[test]
+    fn esc_closes_the_shortcuts_modal_and_restores_normal_input() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.handle_key(key(KeyCode::F(1), KeyModifiers::NONE)).unwrap();
+        app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
+        assert!(app.shortcuts_modal.is_none(), "Esc must dismiss the shortcuts panel");
+    }
+
+    #[test]
+    fn shortcuts_modal_swallows_keys_so_editor_does_not_receive_them() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.focus_pane(Pane::Editor);
+        app.editor.lines = vec![String::from("hello")];
+        app.editor.cursor_col = 5;
+        app.handle_key(key(KeyCode::F(1), KeyModifiers::NONE)).unwrap();
+        app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE)).unwrap();
+        assert_eq!(
+            app.editor.lines,
+            vec!["hello"],
+            "while the shortcuts modal is open, typed letters must not leak into the editor buffer"
+        );
+    }
+
+    #[test]
+    fn opening_the_shortcuts_modal_arms_one_image_clear_so_iterm_evicts_cached_osc_1337_cells() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.handle_key(key(KeyCode::F(1), KeyModifiers::NONE)).unwrap();
+        assert!(
+            app.consume_shortcuts_image_clear(),
+            "F1 must arm terminal.clear() so iTerm2's image cache (activity bar icons, welcome wordmark, editor preview) is wiped before the modal paints, otherwise those cached image cells bleed through the modal text"
+        );
+        assert!(
+            !app.consume_shortcuts_image_clear(),
+            "the flag is one-shot — a second consume call must return false so the driver does not re-clear every frame"
+        );
+    }
+
+    #[test]
+    fn closing_the_shortcuts_modal_arms_image_clear_and_re_dirties_overlays() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.handle_key(key(KeyCode::F(1), KeyModifiers::NONE)).unwrap();
+        let _ = app.consume_shortcuts_image_clear();
+        app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
+        assert!(
+            app.consume_shortcuts_image_clear(),
+            "Esc must also arm terminal.clear() so the modal's text cells get wiped and the activity bar / welcome wordmark / hero icons can be re-emitted cleanly"
+        );
+        assert!(app.activity_overlay_dirty);
+        assert!(app.welcome_overlay_dirty);
+        assert!(app.no_repo_hero_overlay_dirty);
+    }
+
+    #[test]
+    fn activity_overlay_emission_is_suppressed_while_the_shortcuts_modal_is_open() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        let backend = ratatui::backend::TestBackend::new(120, 40);
+        let mut term = ratatui::Terminal::new(backend).unwrap();
+        term.draw(|f| app.render(f)).unwrap();
+        let before = app.pending_activity_image_overlays().len();
+        app.handle_key(key(KeyCode::F(1), KeyModifiers::NONE)).unwrap();
+        let during = app.pending_activity_image_overlays().len();
+        assert_eq!(
+            during, 0,
+            "while the modal is open the activity-bar OSC-1337 emitter must return an empty overlay list, otherwise the icons re-paint over the modal every 2 seconds via the keep-alive timer; before opening saw {before} overlays"
+        );
+    }
+
+    #[test]
+    fn shortcuts_modal_scrolls_down_then_back_to_top_via_keys() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.handle_key(key(KeyCode::F(1), KeyModifiers::NONE)).unwrap();
+        let modal = app.shortcuts_modal.as_mut().unwrap();
+        modal.last_inner_height = 5;
+        modal.last_content_height = 50;
+        app.handle_key(key(KeyCode::PageDown, KeyModifiers::NONE)).unwrap();
+        assert_eq!(app.shortcuts_modal.as_ref().unwrap().scroll, 10);
+        app.handle_key(key(KeyCode::Home, KeyModifiers::NONE)).unwrap();
+        assert_eq!(app.shortcuts_modal.as_ref().unwrap().scroll, 0);
+    }
+
+    #[test]
     fn editor_cmd_a_still_selects_all() {
         let mut app = editor_app_with_lines(&["hello", "world"]);
         app.handle_key(key(KeyCode::Char('a'), KeyModifiers::SUPER)).unwrap();
@@ -13525,6 +13749,7 @@ fn main_loop(
                 || app.consume_editor_image_clear()
                 || app.consume_run_debug_image_clear()
                 || app.consume_no_repo_hero_image_clear()
+                || app.consume_shortcuts_image_clear()
             {
                 terminal.clear()?;
                 // Activity-bar icons live outside ratatui too; re-emit
@@ -13543,6 +13768,7 @@ fn main_loop(
                 || app.consume_editor_image_clear()
                 || app.consume_run_debug_image_clear()
                 || app.consume_no_repo_hero_image_clear()
+                || app.consume_shortcuts_image_clear()
             {
                 terminal.clear()?;
                 app.activity_overlay_dirty = true;
@@ -13630,7 +13856,10 @@ fn main_loop(
             // Welcome-screen logo: same OSC-1337 trick, gated by its own
             // dirty flag and only emitted while the editor pane is in its
             // blank initial state.
-            if app.editor.is_blank_initial() && app.welcome_overlay_dirty {
+            if app.shortcuts_modal.is_none()
+                && app.editor.is_blank_initial()
+                && app.welcome_overlay_dirty
+            {
                 if let (Some(img), Some(layout)) =
                     (app.welcome_image.as_ref(), app.welcome_layout)
                 {
