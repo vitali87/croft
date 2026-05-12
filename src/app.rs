@@ -585,6 +585,10 @@ pub struct App {
     /// the existing preview-style behaviour (replace active tab, keep tree
     /// focused).
     last_tree_left_down: Option<(std::time::Instant, u16, u16)>,
+    /// Same idea as `last_editor_left_down` but for the terminal pane:
+    /// two left-downs at the same cell within `DOUBLE_CLICK_WINDOW`
+    /// trigger word-select via `PtyTerminal::select_word_at`.
+    last_terminal_left_down: Option<(std::time::Instant, u16, u16)>,
     /// Pane whose scrollbar is currently being dragged with the left mouse button.
     scrollbar_drag: Option<Pane>,
     /// True when the activity-bar OSC-1337 images need to be (re)written on
@@ -1178,6 +1182,7 @@ impl App {
             welcome_codeberg_badge_last_emitted: None,
             last_editor_left_down: None,
             last_tree_left_down: None,
+            last_terminal_left_down: None,
             scrollbar_drag: None,
             activity_overlay_dirty: true,
             recent_repo_remote,
@@ -5452,11 +5457,25 @@ impl App {
                         self.active_terminal = idx;
                     }
                     self.focus_pane(Pane::Terminal);
-                    // Begin a fresh selection at the click cell. Without a
-                    // drag this is a single cell (no area), so the selection
-                    // ends up cleared on mouse-up. With a drag, this is the
-                    // selection anchor.
-                    self.terminal_mut().start_selection_at(m.column, m.row);
+                    let now = std::time::Instant::now();
+                    let is_double = matches!(
+                        self.last_terminal_left_down,
+                        Some((t, x, y))
+                            if m.row == y
+                                && m.column.abs_diff(x) <= 1
+                                && now.duration_since(t) <= DOUBLE_CLICK_WINDOW
+                    );
+                    if is_double {
+                        self.terminal_mut().select_word_at(m.column, m.row);
+                        self.last_terminal_left_down = None;
+                    } else {
+                        // Begin a fresh selection at the click cell. Without a
+                        // drag this is a single cell (no area), so the selection
+                        // ends up cleared on mouse-up. With a drag, this is the
+                        // selection anchor.
+                        self.terminal_mut().start_selection_at(m.column, m.row);
+                        self.last_terminal_left_down = Some((now, m.column, m.row));
+                    }
                 }
             }
             MouseEventKind::Drag(MouseButton::Left) => {
@@ -5500,6 +5519,11 @@ impl App {
                 if let Some((_, x, y)) = self.last_tree_left_down {
                     if m.column != x || m.row != y {
                         self.last_tree_left_down = None;
+                    }
+                }
+                if let Some((_, x, y)) = self.last_terminal_left_down {
+                    if m.column != x || m.row != y {
+                        self.last_terminal_left_down = None;
                     }
                 }
                 if in_editor {

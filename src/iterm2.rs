@@ -25,6 +25,31 @@ const CMD_SHIFT_ENTER_KEY: &str = "0xd-0x120000-0x24";
 /// `tree.activate()` to toggle expand/collapse on folders.
 const CMD_SHIFT_ENTER_HEX: &str = "0x1b 0x5b 0x31 0x33 0x3b 0x31 0x30 0x75";
 const CMD_V_KEY: &str = "0x76-0x100000-0x9";
+/// GlobalKeyMap keys + CSI-u payloads for the five Mac-style Cmd+letter
+/// chords croft uses across panes (terminal copy / source-control
+/// select-all / editor save / editor cut / editor undo). iTerm2's
+/// `iTermApplication.sendEvent:` checks `GlobalKeyMap` ahead of the
+/// NSResponder chain, so a forwarder here intercepts Cmd+letter before
+/// AppKit's default copy:/cut:/selectAll:/undo: bindings consume it.
+/// Each payload is `ESC [ <codepoint> ; 9 u`, where 9 = 1 base + Super(8)
+/// in kitty's CSI-u modifier byte, which crossterm decodes into a
+/// `KeyEvent { code: Char(letter), modifiers: SUPER }` that croft's
+/// terminal/editor/tree handlers already accept.
+const CMD_A_KEY: &str = "0x61-0x100000-0x0";
+const CMD_A_HEX: &str = "0x1b 0x5b 0x39 0x37 0x3b 0x39 0x75";
+const CMD_C_KEY: &str = "0x63-0x100000-0x8";
+const CMD_C_HEX: &str = "0x1b 0x5b 0x39 0x39 0x3b 0x39 0x75";
+const CMD_S_KEY: &str = "0x73-0x100000-0x1";
+const CMD_S_HEX: &str = "0x1b 0x5b 0x31 0x31 0x35 0x3b 0x39 0x75";
+const CMD_X_KEY: &str = "0x78-0x100000-0x7";
+const CMD_X_HEX: &str = "0x1b 0x5b 0x31 0x32 0x30 0x3b 0x39 0x75";
+const CMD_Z_KEY: &str = "0x7a-0x100000-0x6";
+const CMD_Z_HEX: &str = "0x1b 0x5b 0x31 0x32 0x32 0x3b 0x39 0x75";
+/// Top-level plist key that disables iTerm2's mouse-reporting-frustration
+/// banner. Backed by iTermAdvancedSettingsModel's
+/// `noSyncNeverAskAboutMouseReportingFrustration` property whose plist
+/// storage key is PascalCase per `DEFINE_SETTABLE_BOOL`.
+const MOUSE_REPORTING_FRUSTRATION_KEY: &str = "NoSyncNeverAskAboutMouseReportingFrustration";
 /// `Cmd+Shift+/`. Character is the *shifted* glyph `?` (0x3f), modifiers
 /// are Cmd+Shift (0x120000), virtualKeyCode is `kVK_ANSI_Slash` (0x2c).
 /// macOS reserves this chord for the Help-menu Search field (Apple
@@ -132,6 +157,16 @@ pub fn apply_croft_key_settings(plist: &mut Value) -> Result<(), ITerm2Error> {
     // Help instead of reaching croft. Pointing "Show Help Menu" at
     // Cmd+Opt+? leaves Help reachable on a chord croft does not use.
     set_string(menu, HELP_MENU_KEY, HELP_MENU_EQUIV.to_string());
+    // Relocate iTerm2's Edit menu items off the standard Cmd+letter
+    // shortcuts so croft's terminal-pane Cmd+C (copy via OSC 52),
+    // editor Cmd+S / Cmd+X / Cmd+Z, and Source Control / editor Cmd+A
+    // can all reach their handlers. Without this, even after stripping
+    // the profile-level Send-Hex bindings below, AppKit's standard
+    // Edit menu would still claim the chord at the menu layer.
+    set_string(menu, "Copy", "@~c".to_string());
+    set_string(menu, "Cut", "@~x".to_string());
+    set_string(menu, "Select All", "@~a".to_string());
+    set_string(menu, "Undo", "@~z".to_string());
     menu.remove("Paste");
 
     let global = dict_entry_mut(dict, "GlobalKeyMap");
@@ -152,7 +187,27 @@ pub fn apply_croft_key_settings(plist: &mut Value) -> Result<(), ITerm2Error> {
         CMD_SHIFT_ENTER_KEY.into(),
         send_hex_action(CMD_SHIFT_ENTER_HEX, 0),
     );
+    // Mac-style Cmd+letter chords: forward each as a CSI-u sequence so
+    // AppKit's NSResponder defaults (copy: / cut: / selectAll: / undo:)
+    // don't consume them at the textview layer. Without these, even
+    // with the Edit menu items relocated via NSUserKeyEquivalents above,
+    // Cmd+C still never reaches croft because PTYTextView still answers
+    // copy: from the default key bindings dictionary.
+    for (key, hex) in [
+        (CMD_A_KEY, CMD_A_HEX),
+        (CMD_C_KEY, CMD_C_HEX),
+        (CMD_S_KEY, CMD_S_HEX),
+        (CMD_X_KEY, CMD_X_HEX),
+        (CMD_Z_KEY, CMD_Z_HEX),
+    ] {
+        global.insert(key.into(), send_hex_action(hex, 0));
+    }
     global.remove(CMD_V_KEY);
+
+    dict.insert(
+        MOUSE_REPORTING_FRUSTRATION_KEY.into(),
+        Value::Boolean(true),
+    );
 
     let bookmarks = dict
         .get_mut("New Bookmarks")
@@ -448,6 +503,59 @@ mod tests {
             menu.get("Paste").is_none(),
             "Paste must remain on its default Cmd+V menu shortcut so iTerm2 fires its native bracketed-paste action when Cmd+V is pressed; remapping it off Cmd+V breaks paste over SSH because the resulting key event has no clipboard reachable from the remote process"
         );
+    }
+
+    #[test]
+    fn apply_croft_key_settings_forwards_cmd_letter_chords_as_csi_u_so_iterm_responder_chain_does_not_consume_them() {
+        let mut plist = synth_plist("GUID-1", &["GUID-1"]);
+        apply_croft_key_settings(&mut plist).unwrap();
+        let top = plist.as_dictionary().unwrap();
+        let global = dict_in(top, "GlobalKeyMap");
+        for (key, hex, label) in [
+            (CMD_A_KEY, CMD_A_HEX, "Cmd+A (select all / multi-select)"),
+            (CMD_C_KEY, CMD_C_HEX, "Cmd+C (copy via OSC 52)"),
+            (CMD_S_KEY, CMD_S_HEX, "Cmd+S (editor save / source control stage)"),
+            (CMD_X_KEY, CMD_X_HEX, "Cmd+X (editor cut)"),
+            (CMD_Z_KEY, CMD_Z_HEX, "Cmd+Z (editor undo)"),
+        ] {
+            assert_eq!(
+                action_text(global, key),
+                hex,
+                "GlobalKeyMap is missing the CSI-u forwarder for {label}; without it, AppKit's NSResponder default key bindings catch the chord (Cmd+C -> copy: on PTYTextView) before croft's terminal handler sees a Char-with-Super key event, which is why Cmd+C silently fails to copy the croft selection even with the NSUserKeyEquivalents Edit-menu relocations in place"
+            );
+        }
+    }
+
+    #[test]
+    fn apply_croft_key_settings_silences_iterm_mouse_reporting_frustration_banner() {
+        let mut plist = synth_plist("GUID-1", &["GUID-1"]);
+        apply_croft_key_settings(&mut plist).unwrap();
+        let top = plist.as_dictionary().unwrap();
+        assert_eq!(
+            top.get(MOUSE_REPORTING_FRUSTRATION_KEY).and_then(|v| v.as_boolean()),
+            Some(true),
+            "iTerm2's iTermMouseReportingFrustrationDetector watches raw Cmd+C keyDown and pops the 'Looks like you're trying to copy to the pasteboard...' banner whenever mouse reporting is on and iTerm2 has no selection (which is the steady state under croft, since croft owns the mouse). The advanced setting NoSyncNeverAskAboutMouseReportingFrustration suppresses that detector entirely."
+        );
+    }
+
+    #[test]
+    fn apply_croft_key_settings_relocates_edit_menu_items_off_cmd_letter_so_iterm_does_not_steal_them_back() {
+        let mut plist = synth_plist("GUID-1", &["GUID-1"]);
+        apply_croft_key_settings(&mut plist).unwrap();
+        let top = plist.as_dictionary().unwrap();
+        let menu = dict_in(top, "NSUserKeyEquivalents");
+        for (item, expected) in [
+            ("Copy", "@~c"),
+            ("Cut", "@~x"),
+            ("Select All", "@~a"),
+            ("Undo", "@~z"),
+        ] {
+            assert_eq!(
+                menu.get(item).and_then(|v| v.as_string()),
+                Some(expected),
+                "iTerm2's Edit > {item} menu item must be relocated off its default Cmd-letter shortcut, otherwise once the profile-level Send-Hex bindings are stripped the menu shortcut would still claim the chord and croft would never see the keystroke"
+            );
+        }
     }
 
     #[test]

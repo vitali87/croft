@@ -272,6 +272,21 @@ impl PtyTerminal {
         self.selection = None;
     }
 
+    /// Double-click word-select: expand the selection to cover the word
+    /// under the screen coordinate `(col, row)`. No-op when the click
+    /// lands on whitespace / punctuation or outside the live area.
+    pub fn select_word_at(&mut self, col: u16, row: u16) {
+        let Some((r, c)) = self.cell_at(col, row) else { return };
+        let term = self.term.lock();
+        let Some((anchor, head)) =
+            select_word_at_in_term(&term, r as usize, c as usize)
+        else {
+            return;
+        };
+        drop(term);
+        self.selection = Some(Selection { anchor, head });
+    }
+
     pub fn selection(&self) -> Option<Selection> {
         self.selection
     }
@@ -385,6 +400,47 @@ pub fn extract_selection_text(
         }
     }
     out
+}
+
+/// Inspect a row of `term` around `(row, col)` (both viewport-relative)
+/// and return the anchor/head pair that brackets the contiguous run of
+/// word characters covering the pivot. Returns `None` when the pivot
+/// sits on a non-word character (whitespace, punctuation), so a double
+/// click between words is a no-op rather than a spurious selection.
+/// Word semantics match `widgets::editor::is_word_char`: alphanumeric +
+/// underscore. Pure function so the test suite can exercise it without
+/// spawning a PTY.
+pub fn select_word_at_in_term(
+    term: &Term<VoidListener>,
+    row: usize,
+    col: usize,
+) -> Option<((u16, u16), (u16, u16))> {
+    let cols = term.columns();
+    if col >= cols {
+        return None;
+    }
+    let row_idx = row as i32;
+    let cell_char = |c: usize| -> char {
+        let p = Point::new(Line(row_idx), Column(c));
+        let ch = term.grid()[p].c;
+        if ch == '\0' { ' ' } else { ch }
+    };
+    if !is_terminal_word_char(cell_char(col)) {
+        return None;
+    }
+    let mut start = col;
+    while start > 0 && is_terminal_word_char(cell_char(start - 1)) {
+        start -= 1;
+    }
+    let mut end = col;
+    while end + 1 < cols && is_terminal_word_char(cell_char(end + 1)) {
+        end += 1;
+    }
+    Some(((row as u16, start as u16), (row as u16, end as u16)))
+}
+
+fn is_terminal_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
 }
 
 /// Walk a chunk of PTY output and toggle the bracketed-paste flag when
@@ -796,6 +852,41 @@ mod tests {
         let decoded =
             base64::engine::general_purpose::STANDARD.decode(body).unwrap();
         assert_eq!(decoded, "héllo".as_bytes());
+    }
+
+    #[test]
+    fn select_word_at_in_term_brackets_the_alphanumeric_run_around_the_pivot() {
+        let mut t = fresh_term(40, 5);
+        feed(&mut t, b"hello world from croft");
+        let got = select_word_at_in_term(&t, 0, 8);
+        assert_eq!(got, Some(((0, 6), (0, 10))), "pivot inside 'world' must select cols 6..=10");
+    }
+
+    #[test]
+    fn select_word_at_in_term_returns_none_when_pivot_is_on_whitespace() {
+        let mut t = fresh_term(40, 5);
+        feed(&mut t, b"hello world");
+        assert_eq!(
+            select_word_at_in_term(&t, 0, 5),
+            None,
+            "pivot on the space between 'hello' and 'world' must yield no selection"
+        );
+    }
+
+    #[test]
+    fn select_word_at_in_term_treats_underscores_as_word_chars_and_dots_as_boundaries() {
+        let mut t = fresh_term(40, 5);
+        feed(&mut t, b"foo_bar.baz");
+        assert_eq!(
+            select_word_at_in_term(&t, 0, 2),
+            Some(((0, 0), (0, 6))),
+            "'foo_bar' is one word (underscore is a word char), '.baz' is separate"
+        );
+        assert_eq!(
+            select_word_at_in_term(&t, 0, 9),
+            Some(((0, 8), (0, 10))),
+            "pivot inside 'baz' must select cols 8..=10"
+        );
     }
 
     #[test]
