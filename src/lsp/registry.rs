@@ -15,8 +15,12 @@ impl ServerRegistry {
 
     pub fn with_defaults() -> Self {
         let mut r = Self::new();
-        r.register(Language::Python, ServerConfig::ty());
+        // basedpyright first so the completion-capability filter routes
+        // textDocument/completion to it (full type inference, locals,
+        // member completion). ty 0.0.35 still spawns alongside for
+        // typecheck-driven diagnostics; ruff spawns for lint diagnostics.
         r.register(Language::Python, ServerConfig::basedpyright());
+        r.register(Language::Python, ServerConfig::ty());
         r.register(Language::Python, ServerConfig::ruff());
         for lang in [
             Language::TypeScript,
@@ -76,9 +80,7 @@ mod tests {
         let r = ServerRegistry::with_defaults();
         let servers = r.for_extension("py");
         let names: Vec<_> = servers.iter().map(|s| s.name).collect();
-        assert!(names.contains(&"ty"));
-        assert!(names.contains(&"basedpyright"));
-        assert!(names.contains(&"ruff"));
+        assert_eq!(names, vec!["basedpyright", "ty", "ruff"]);
     }
 
     #[test]

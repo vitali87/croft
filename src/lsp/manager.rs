@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::mpsc as std_mpsc;
 
@@ -112,10 +111,16 @@ impl LspManager {
     }
 }
 
+struct ManagedClient {
+    name: String,
+    client: Arc<TokioMutex<LspClient>>,
+    supports_completion: bool,
+}
+
 struct WorkerState {
     workspace_root: PathBuf,
     registry: ServerRegistry,
-    clients: HashMap<Language, Arc<TokioMutex<LspClient>>>,
+    clients: HashMap<Language, Vec<ManagedClient>>,
     docs: HashMap<PathBuf, DocState>,
 }
 
@@ -156,46 +161,63 @@ async fn worker_loop(
 }
 
 impl WorkerState {
-    async fn ensure_client(&mut self, lang: Language) -> Option<Arc<TokioMutex<LspClient>>> {
-        if let Some(c) = self.clients.get(&lang) {
-            return Some(c.clone());
-        }
-        let configs: Vec<ServerConfig> = self.registry.for_language(lang).to_vec();
-        for config in configs.iter() {
-            if !is_on_path(&config.command) {
-                continue;
-            }
-            match LspClient::spawn(config, &self.workspace_root, ClientCapabilities::default())
-                .await
-            {
-                Ok(client) => {
-                    let arc = Arc::new(TokioMutex::new(client));
-                    self.clients.insert(lang, arc.clone());
-                    return Some(arc);
-                }
-                Err(e) => {
-                    log_file::log(&format!("lsp[{}] spawn failed: {e}", config.name));
+    async fn ensure_clients(&mut self, lang: Language) -> &[ManagedClient] {
+        if !self.clients.contains_key(&lang) {
+            let configs: Vec<ServerConfig> = self.registry.for_language(lang).to_vec();
+            let mut spawned: Vec<ManagedClient> = Vec::new();
+            for config in configs.iter() {
+                if !is_on_path(&config.command) {
+                    log_file::log(&format!(
+                        "lsp[{}] skip: `{}` not on PATH",
+                        config.name, config.command
+                    ));
                     continue;
                 }
+                match LspClient::spawn(config, &self.workspace_root, ClientCapabilities::default())
+                    .await
+                {
+                    Ok(client) => {
+                        let supports = client.capabilities().completion_provider.is_some();
+                        log_file::log(&format!(
+                            "lsp[{}] spawned, supports_completion={supports}",
+                            config.name
+                        ));
+                        spawned.push(ManagedClient {
+                            name: config.name.to_string(),
+                            client: Arc::new(TokioMutex::new(client)),
+                            supports_completion: supports,
+                        });
+                    }
+                    Err(e) => {
+                        log_file::log(&format!("lsp[{}] spawn failed: {e}", config.name));
+                    }
+                }
             }
+            self.clients.insert(lang, spawned);
         }
-        None
+        self.clients.get(&lang).map(Vec::as_slice).unwrap_or(&[])
     }
 
     async fn open_doc(&mut self, path: PathBuf, text: String) {
         let Some(lang) = path_to_language(&path) else {
             return;
         };
-        let Some(client_arc) = self.ensure_client(lang).await else {
+        let clients = self.ensure_clients(lang).await;
+        if clients.is_empty() {
             return;
-        };
+        }
         let Ok(uri) = Url::from_file_path(&path) else {
             return;
         };
-        let mut client = client_arc.lock().await;
-        if let Err(e) = client.did_open(uri, lang.lsp_id(), 0, text) {
-            log_file::log(&format!("lsp did_open failed: {e}"));
-            return;
+        let arcs: Vec<(String, Arc<TokioMutex<LspClient>>)> = clients
+            .iter()
+            .map(|c| (c.name.clone(), c.client.clone()))
+            .collect();
+        for (name, client_arc) in arcs {
+            let mut client = client_arc.lock().await;
+            if let Err(e) = client.did_open(uri.clone(), lang.lsp_id(), 0, text.clone()) {
+                log_file::log(&format!("lsp[{name}] did_open failed: {e}"));
+            }
         }
         self.docs.insert(
             path,
@@ -213,15 +235,21 @@ impl WorkerState {
         doc.version += 1;
         let version = doc.version;
         let lang = doc.language;
-        let Some(client_arc) = self.clients.get(&lang).cloned() else {
-            return;
-        };
         let Ok(uri) = Url::from_file_path(&path) else {
             return;
         };
-        let mut client = client_arc.lock().await;
-        if let Err(e) = client.did_change_full(uri, version, text) {
-            log_file::log(&format!("lsp did_change failed: {e}"));
+        let arcs: Vec<(String, Arc<TokioMutex<LspClient>>)> = match self.clients.get(&lang) {
+            Some(cs) => cs
+                .iter()
+                .map(|c| (c.name.clone(), c.client.clone()))
+                .collect(),
+            None => return,
+        };
+        for (name, client_arc) in arcs {
+            let mut client = client_arc.lock().await;
+            if let Err(e) = client.did_change_full(uri.clone(), version, text.clone()) {
+                log_file::log(&format!("lsp[{name}] did_change failed: {e}"));
+            }
         }
     }
 
@@ -229,15 +257,22 @@ impl WorkerState {
         let Some(doc) = self.docs.remove(&path) else {
             return;
         };
-        let Some(client_arc) = self.clients.get(&doc.language).cloned() else {
-            return;
-        };
         let Ok(uri) = Url::from_file_path(&path) else {
             return;
         };
-        let mut client = client_arc.lock().await;
-        if let Err(e) = client.did_close(uri) {
-            log_file::log(&format!("lsp did_close failed: {e}"));
+        let arcs: Vec<(String, Arc<TokioMutex<LspClient>>)> = match self.clients.get(&doc.language)
+        {
+            Some(cs) => cs
+                .iter()
+                .map(|c| (c.name.clone(), c.client.clone()))
+                .collect(),
+            None => return,
+        };
+        for (name, client_arc) in arcs {
+            let mut client = client_arc.lock().await;
+            if let Err(e) = client.did_close(uri.clone()) {
+                log_file::log(&format!("lsp[{name}] did_close failed: {e}"));
+            }
         }
     }
 
@@ -252,7 +287,23 @@ impl WorkerState {
         let Some(doc) = self.docs.get(&path) else {
             return;
         };
-        let Some(client_arc) = self.clients.get(&doc.language).cloned() else {
+        let lang = doc.language;
+        let Some(clients) = self.clients.get(&lang) else {
+            return;
+        };
+        let picked = clients
+            .iter()
+            .find(|c| c.supports_completion)
+            .map(|c| (c.name.clone(), c.client.clone()));
+        let Some((server_name, client_arc)) = picked else {
+            log_file::log(&format!(
+                "completion request id={request_id} dropped: no client advertises completion_provider for {lang:?}"
+            ));
+            let _ = tx.send(CompletionResult {
+                request_id,
+                path,
+                items: Vec::new(),
+            });
             return;
         };
         let Ok(uri) = Url::from_file_path(&path) else {
@@ -261,7 +312,7 @@ impl WorkerState {
         let tx = tx.clone();
         let path_clone = path.clone();
         log_file::log(&format!(
-            "completion request id={request_id} path={} line={line} char={character}",
+            "completion request id={request_id} server={server_name} path={} line={line} char={character}",
             path.display()
         ));
         tokio::spawn(async move {
@@ -277,17 +328,13 @@ impl WorkerState {
                 }
                 Ok(None) => Vec::new(),
                 Err(e) => {
-                    log_file::log(&format!("lsp completion error: {e}"));
+                    log_file::log(&format!("lsp[{server_name}] completion error: {e}"));
                     Vec::new()
                 }
             };
-            let preview: Vec<&str> = items
-                .iter()
-                .take(200)
-                .map(|i| i.label.as_str())
-                .collect();
+            let preview: Vec<&str> = items.iter().take(200).map(|i| i.label.as_str()).collect();
             log_file::log(&format!(
-                "completion response id={request_id} count={} labels={:?}",
+                "completion response id={request_id} server={server_name} count={} labels={:?}",
                 items.len(),
                 preview
             ));
@@ -316,14 +363,35 @@ fn path_to_language(path: &Path) -> Option<Language> {
         .and_then(Language::from_extension)
 }
 
+/// Walk `$PATH` looking for an executable file named `cmd`. Avoids
+/// invoking the binary with `--help` or `--version` because LSP servers
+/// are JSON-RPC daemons with no consistent CLI flags (basedpyright-
+/// langserver exits 1 on --help and crashes on --version, rustup shims
+/// pretend to exist even when their component isn't installed).
 fn is_on_path(cmd: &str) -> bool {
-    std::process::Command::new(cmd)
-        .arg("--help")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    for entry in std::env::split_paths(&path) {
+        let candidate = entry.join(cmd);
+        if !candidate.is_file() {
+            continue;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(meta) = std::fs::metadata(&candidate) {
+                if meta.permissions().mode() & 0o111 != 0 {
+                    return true;
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            return true;
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -347,16 +415,10 @@ mod tests {
         }
     }
 
-    fn first_completion_python_config() -> Option<ServerConfig> {
-        if is_on_path("ty") {
-            Some(ServerConfig::ty())
-        } else if is_on_path("basedpyright-langserver") {
-            Some(ServerConfig::basedpyright())
-        } else if is_on_path("pyright-langserver") {
-            Some(ServerConfig::pyright())
-        } else {
-            None
-        }
+    fn any_python_completion_server_on_path() -> bool {
+        is_on_path("basedpyright-langserver")
+            || is_on_path("pyright-langserver")
+            || is_on_path("ty")
     }
 
     #[test]
@@ -372,39 +434,41 @@ mod tests {
 
         let manager = LspManager::new(root).expect("manager");
         manager.open_doc(file.clone(), String::from("x = 1\n"));
-        std::thread::sleep(Duration::from_millis(400));
+        std::thread::sleep(Duration::from_millis(800));
         manager.change_doc(file.clone(), String::from("x = 2\n"));
-        std::thread::sleep(Duration::from_millis(400));
+        std::thread::sleep(Duration::from_millis(800));
         manager.close_doc(file.clone());
-        std::thread::sleep(Duration::from_millis(200));
+        std::thread::sleep(Duration::from_millis(400));
         drop(manager);
     }
 
     #[test]
     fn manager_completion_against_python_lsp() {
-        let Some(config) = first_completion_python_config() else {
-            eprintln!("SKIPPED: no ty/basedpyright/pyright on PATH");
+        if !any_python_completion_server_on_path() {
+            eprintln!("SKIPPED: no basedpyright/pyright/ty on PATH");
             return;
-        };
-        let server_name = config.name;
+        }
         let tmp = tempfile::tempdir().expect("tempdir");
         let root = tmp.path().canonicalize().expect("canonicalize");
         let file = root.join("demo.py");
-        let text = String::from("import os\nos.\n");
+        let text = String::from(
+            "def f(input, num):\n    input_split = input.split()\n    inp\n",
+        );
         std::fs::write(&file, &text).expect("write demo");
 
         let mut manager = LspManager::new(root).expect("manager");
         manager.open_doc(file.clone(), text);
-        std::thread::sleep(Duration::from_millis(1500));
+        std::thread::sleep(Duration::from_millis(2500));
 
-        let id = manager.request_completion(file.clone(), 1, 3);
-        let result = drain_completion_blocking(&manager, Duration::from_secs(8))
+        let id = manager.request_completion(file.clone(), 2, 7);
+        let result = drain_completion_blocking(&manager, Duration::from_secs(10))
             .expect("completion arrived");
         assert_eq!(result.request_id, id);
         assert_eq!(result.path, file);
+        let labels: Vec<&str> = result.items.iter().map(|i| i.label.as_str()).collect();
         assert!(
-            !result.items.is_empty(),
-            "expected {server_name} to return completions for os."
+            labels.iter().any(|l| l.starts_with("input")),
+            "expected at least one item starting with `input`, got: {labels:?}"
         );
     }
 }
