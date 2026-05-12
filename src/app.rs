@@ -2141,15 +2141,23 @@ impl App {
                 continue;
             };
             let prefix = self.editor.word_before_cursor();
+            let server_count = result.items.len();
             let popup = crate::widgets::completion_popup::CompletionPopup::new(
                 result.items,
-                prefix,
+                prefix.clone(),
                 (cx, cy),
                 result.path,
                 result.request_id,
             );
+            let filtered = popup.visible_indices().len();
+            crate::lsp::log_file::log(&format!(
+                "popup filter: prefix={prefix:?} server={server_count} visible={filtered}"
+            ));
             if popup.visible_is_empty() {
                 self.completion_popup = None;
+                self.status = format!(
+                    "No completions match '{prefix}' ({server_count} from server)"
+                );
             } else {
                 self.completion_popup = Some(popup);
             }

@@ -283,11 +283,11 @@ impl WorkerState {
             };
             let preview: Vec<&str> = items
                 .iter()
-                .take(25)
+                .take(200)
                 .map(|i| i.label.as_str())
                 .collect();
             log_file::log(&format!(
-                "completion response id={request_id} count={} first={:?}",
+                "completion response id={request_id} count={} labels={:?}",
                 items.len(),
                 preview
             ));
