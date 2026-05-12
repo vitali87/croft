@@ -570,6 +570,10 @@ enum EditKind {
     Paste,
     DeleteSelection,
     DuplicateLines,
+    DeleteLines,
+    KillToEol,
+    KillToBol,
+    OpenLine,
 }
 
 #[derive(Clone, Debug)]
@@ -1338,6 +1342,152 @@ impl Editor {
             self.cursor_col = self.cursor_col.min(self.line_char_len(self.cursor_row));
         }
         self.last_edit_kind = None;
+    }
+
+    pub fn goto_top(&mut self) {
+        self.clear_selection();
+        self.cursor_row = 0;
+        self.cursor_col = 0;
+        self.last_edit_kind = None;
+    }
+
+    pub fn goto_bottom(&mut self) {
+        self.clear_selection();
+        if self.lines.is_empty() {
+            self.lines.push(String::new());
+        }
+        self.cursor_row = self.lines.len() - 1;
+        self.cursor_col = 0;
+        self.last_edit_kind = None;
+    }
+
+    pub fn goto_line(&mut self, one_based: usize) {
+        self.clear_selection();
+        if self.lines.is_empty() {
+            self.lines.push(String::new());
+        }
+        let max = self.lines.len() - 1;
+        let target = one_based.saturating_sub(1).min(max);
+        self.cursor_row = target;
+        self.cursor_col = 0;
+        self.last_edit_kind = None;
+    }
+
+    pub fn yank_lines(&self, count: usize) -> String {
+        let n = count.max(1);
+        let start = self.cursor_row;
+        self.lines_slice_text(start, n)
+    }
+
+    pub fn delete_lines(&mut self, count: usize) -> String {
+        self.pin_on_edit();
+        if self.lines.is_empty() {
+            return String::new();
+        }
+        self.push_undo(EditKind::DeleteLines);
+        self.clear_selection();
+        let n = count.max(1);
+        let start = self.cursor_row;
+        let end = (start + n).min(self.lines.len());
+        let yanked = self.lines_slice_text(start, end - start);
+        self.lines.drain(start..end);
+        if self.lines.is_empty() {
+            self.lines.push(String::new());
+        }
+        self.cursor_row = start.min(self.lines.len() - 1);
+        self.cursor_col = 0;
+        self.mark_buffer_changed();
+        self.recompute_highlights();
+        yanked
+    }
+
+    pub fn kill_to_bol(&mut self) -> String {
+        self.pin_on_edit();
+        if self.lines.is_empty() {
+            return String::new();
+        }
+        self.clear_selection();
+        let row = self.cursor_row;
+        if self.cursor_col == 0 {
+            return String::new();
+        }
+        self.push_undo(EditKind::KillToBol);
+        let from = self.byte_index(row, 0);
+        let to = self.byte_index(row, self.cursor_col);
+        let killed = self.lines[row][from..to].to_string();
+        self.lines[row].replace_range(from..to, "");
+        self.cursor_col = 0;
+        self.mark_buffer_changed();
+        self.recompute_highlights();
+        killed
+    }
+
+    pub fn open_line_below(&mut self) {
+        self.pin_on_edit();
+        if self.lines.is_empty() {
+            self.lines.push(String::new());
+        }
+        self.push_undo(EditKind::OpenLine);
+        self.clear_selection();
+        let row = self.cursor_row;
+        let indent: String = self.lines[row]
+            .chars()
+            .take_while(|c| *c == ' ' || *c == '\t')
+            .collect();
+        self.lines.insert(row + 1, indent.clone());
+        self.cursor_row = row + 1;
+        self.cursor_col = indent.chars().count();
+        self.mark_buffer_changed();
+        self.recompute_highlights();
+    }
+
+    pub fn open_line_above(&mut self) {
+        self.pin_on_edit();
+        if self.lines.is_empty() {
+            self.lines.push(String::new());
+        }
+        self.push_undo(EditKind::OpenLine);
+        self.clear_selection();
+        let row = self.cursor_row;
+        let indent: String = self.lines[row]
+            .chars()
+            .take_while(|c| *c == ' ' || *c == '\t')
+            .collect();
+        self.lines.insert(row, indent.clone());
+        self.cursor_col = indent.chars().count();
+        self.mark_buffer_changed();
+        self.recompute_highlights();
+    }
+
+    pub fn kill_to_eol(&mut self) -> String {
+        self.pin_on_edit();
+        if self.lines.is_empty() {
+            return String::new();
+        }
+        self.clear_selection();
+        let row = self.cursor_row;
+        let line_len = self.line_char_len(row);
+        if self.cursor_col >= line_len {
+            return String::new();
+        }
+        self.push_undo(EditKind::KillToEol);
+        let from = self.byte_index(row, self.cursor_col);
+        let to = self.byte_index(row, line_len);
+        let killed = self.lines[row][from..to].to_string();
+        self.lines[row].replace_range(from..to, "");
+        self.mark_buffer_changed();
+        self.recompute_highlights();
+        killed
+    }
+
+    fn lines_slice_text(&self, start: usize, count: usize) -> String {
+        if count == 0 || start >= self.lines.len() {
+            return String::new();
+        }
+        let end = (start + count).min(self.lines.len());
+        let mut out = self.lines[start..end].join("\n");
+        out.push('\n');
+        out
     }
 
     pub fn move_left(&mut self) {
@@ -2349,6 +2499,173 @@ mod tests {
         e.duplicate_lines_up();
         assert_eq!(e.lines, vec!["alpha", "alpha", "beta"]);
         assert_eq!((e.cursor_row, e.cursor_col), (0, 4));
+    }
+
+    #[test]
+    fn goto_top_lands_on_row_zero_col_zero() {
+        let mut e = editor_with("alpha\nbeta\ngamma");
+        e.cursor_row = 2;
+        e.cursor_col = 4;
+        e.goto_top();
+        assert_eq!((e.cursor_row, e.cursor_col), (0, 0));
+    }
+
+    #[test]
+    fn goto_bottom_lands_on_last_row_col_zero() {
+        let mut e = editor_with("alpha\nbeta\ngamma");
+        e.cursor_row = 0;
+        e.cursor_col = 3;
+        e.goto_bottom();
+        assert_eq!((e.cursor_row, e.cursor_col), (2, 0));
+    }
+
+    #[test]
+    fn goto_line_uses_one_based_indexing_and_clamps_to_last_row() {
+        let mut e = editor_with("alpha\nbeta\ngamma");
+        e.goto_line(2);
+        assert_eq!((e.cursor_row, e.cursor_col), (1, 0));
+        e.goto_line(999);
+        assert_eq!((e.cursor_row, e.cursor_col), (2, 0));
+        e.goto_line(0);
+        assert_eq!((e.cursor_row, e.cursor_col), (0, 0));
+    }
+
+    #[test]
+    fn yank_lines_one_returns_current_line_with_trailing_newline() {
+        let mut e = editor_with("alpha\nbeta\ngamma");
+        e.cursor_row = 1;
+        let yanked = e.yank_lines(1);
+        assert_eq!(yanked, "beta\n");
+        assert_eq!(e.lines, vec!["alpha", "beta", "gamma"]);
+    }
+
+    #[test]
+    fn yank_lines_n_grabs_current_plus_below() {
+        let mut e = editor_with("alpha\nbeta\ngamma\ndelta");
+        e.cursor_row = 1;
+        let yanked = e.yank_lines(3);
+        assert_eq!(yanked, "beta\ngamma\ndelta\n");
+    }
+
+    #[test]
+    fn delete_lines_one_drops_current_row() {
+        let mut e = editor_with("alpha\nbeta\ngamma");
+        e.cursor_row = 1;
+        let yanked = e.delete_lines(1);
+        assert_eq!(yanked, "beta\n");
+        assert_eq!(e.lines, vec!["alpha", "gamma"]);
+        assert_eq!((e.cursor_row, e.cursor_col), (1, 0));
+    }
+
+    #[test]
+    fn delete_lines_n_clamps_at_end_of_buffer() {
+        let mut e = editor_with("alpha\nbeta\ngamma");
+        e.cursor_row = 1;
+        let yanked = e.delete_lines(99);
+        assert_eq!(yanked, "beta\ngamma\n");
+        assert_eq!(e.lines, vec!["alpha"]);
+        assert_eq!((e.cursor_row, e.cursor_col), (0, 0));
+    }
+
+    #[test]
+    fn delete_lines_leaves_an_empty_line_when_buffer_emptied() {
+        let mut e = editor_with("alpha\nbeta");
+        e.cursor_row = 0;
+        e.delete_lines(2);
+        assert_eq!(e.lines, vec![""]);
+        assert_eq!((e.cursor_row, e.cursor_col), (0, 0));
+    }
+
+    #[test]
+    fn delete_lines_is_undoable_in_one_step() {
+        let mut e = editor_with("alpha\nbeta\ngamma");
+        e.cursor_row = 1;
+        e.delete_lines(1);
+        assert!(e.undo());
+        assert_eq!(e.lines, vec!["alpha", "beta", "gamma"]);
+        assert_eq!((e.cursor_row, e.cursor_col), (1, 0));
+    }
+
+    #[test]
+    fn kill_to_bol_removes_head_of_current_line() {
+        let mut e = editor_with("hello world\nnext");
+        e.cursor_row = 0;
+        e.cursor_col = 6;
+        let killed = e.kill_to_bol();
+        assert_eq!(killed, "hello ");
+        assert_eq!(e.lines, vec!["world", "next"]);
+        assert_eq!((e.cursor_row, e.cursor_col), (0, 0));
+    }
+
+    #[test]
+    fn kill_to_bol_at_col_zero_is_noop() {
+        let mut e = editor_with("hello\nnext");
+        e.cursor_row = 0;
+        e.cursor_col = 0;
+        let killed = e.kill_to_bol();
+        assert_eq!(killed, "");
+        assert_eq!(e.lines, vec!["hello", "next"]);
+    }
+
+    #[test]
+    fn open_line_below_inserts_empty_line_after_current() {
+        let mut e = editor_with("alpha\nbeta");
+        e.cursor_row = 0;
+        e.cursor_col = 3;
+        e.open_line_below();
+        assert_eq!(e.lines, vec!["alpha", "", "beta"]);
+        assert_eq!((e.cursor_row, e.cursor_col), (1, 0));
+    }
+
+    #[test]
+    fn open_line_below_inherits_indent_from_current_row() {
+        let mut e = editor_with("    alpha\nbeta");
+        e.cursor_row = 0;
+        e.cursor_col = 6;
+        e.open_line_below();
+        assert_eq!(e.lines, vec!["    alpha", "    ", "beta"]);
+        assert_eq!((e.cursor_row, e.cursor_col), (1, 4));
+    }
+
+    #[test]
+    fn open_line_above_inserts_empty_line_before_current() {
+        let mut e = editor_with("alpha\nbeta");
+        e.cursor_row = 1;
+        e.cursor_col = 2;
+        e.open_line_above();
+        assert_eq!(e.lines, vec!["alpha", "", "beta"]);
+        assert_eq!((e.cursor_row, e.cursor_col), (1, 0));
+    }
+
+    #[test]
+    fn open_line_above_inherits_indent_from_current_row() {
+        let mut e = editor_with("alpha\n        beta");
+        e.cursor_row = 1;
+        e.cursor_col = 10;
+        e.open_line_above();
+        assert_eq!(e.lines, vec!["alpha", "        ", "        beta"]);
+        assert_eq!((e.cursor_row, e.cursor_col), (1, 8));
+    }
+
+    #[test]
+    fn kill_to_eol_removes_tail_of_current_line() {
+        let mut e = editor_with("hello world\nnext");
+        e.cursor_row = 0;
+        e.cursor_col = 5;
+        let killed = e.kill_to_eol();
+        assert_eq!(killed, " world");
+        assert_eq!(e.lines, vec!["hello", "next"]);
+        assert_eq!((e.cursor_row, e.cursor_col), (0, 5));
+    }
+
+    #[test]
+    fn kill_to_eol_at_eol_is_noop() {
+        let mut e = editor_with("hello\nnext");
+        e.cursor_row = 0;
+        e.cursor_col = 5;
+        let killed = e.kill_to_eol();
+        assert_eq!(killed, "");
+        assert_eq!(e.lines, vec!["hello", "next"]);
     }
 
     #[test]

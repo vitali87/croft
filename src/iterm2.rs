@@ -45,6 +45,40 @@ const CMD_X_KEY: &str = "0x78-0x100000-0x7";
 const CMD_X_HEX: &str = "0x1b 0x5b 0x31 0x32 0x30 0x3b 0x39 0x75";
 const CMD_Z_KEY: &str = "0x7a-0x100000-0x6";
 const CMD_Z_HEX: &str = "0x1b 0x5b 0x31 0x32 0x32 0x3b 0x39 0x75";
+/// Vim-style chord starts and goto-bottom that the editor consumes.
+/// CSI-u `ESC [ <codepoint> ; 9 u` for Cmd+letter and
+/// `ESC [ <shifted-glyph> ; 10 u` for Cmd+Shift+letter; modifier byte
+/// 9 = 1 base + Super(8), 10 adds Shift(1).
+const CMD_D_KEY: &str = "0x64-0x100000-0x2";
+const CMD_D_HEX: &str = "0x1b 0x5b 0x31 0x30 0x30 0x3b 0x39 0x75";
+const CMD_G_KEY: &str = "0x67-0x100000-0x5";
+const CMD_G_HEX: &str = "0x1b 0x5b 0x31 0x30 0x33 0x3b 0x39 0x75";
+const CMD_Y_KEY: &str = "0x79-0x100000-0x10";
+const CMD_Y_HEX: &str = "0x1b 0x5b 0x31 0x32 0x31 0x3b 0x39 0x75";
+const CMD_O_KEY: &str = "0x6f-0x100000-0x1f";
+const CMD_O_HEX: &str = "0x1b 0x5b 0x31 0x31 0x31 0x3b 0x39 0x75";
+const CMD_SHIFT_G_KEY: &str = "0x47-0x120000-0x5";
+const CMD_SHIFT_G_HEX: &str = "0x1b 0x5b 0x37 0x31 0x3b 0x31 0x30 0x75";
+const CMD_SHIFT_O_KEY: &str = "0x4f-0x120000-0x1f";
+const CMD_SHIFT_O_HEX: &str = "0x1b 0x5b 0x37 0x39 0x3b 0x31 0x30 0x75";
+/// Cmd+0..Cmd+9 forward as CSI-u so the editor's vim chord can use them
+/// as count digits (e.g. `Cmd+5 Cmd+g g` jumps to line 5). Without these,
+/// iTerm2 catches Cmd+digit for its own "Select Tab N" action and croft
+/// never sees the keystroke. Mac virtual key codes for the number row
+/// are non-contiguous: `kVK_ANSI_1=0x12 … kVK_ANSI_5=0x17`, with 0 last
+/// at `kVK_ANSI_0=0x1d`.
+const CMD_DIGIT_CHORDS: &[(&str, &str)] = &[
+    ("0x30-0x100000-0x1d", "0x1b 0x5b 0x34 0x38 0x3b 0x39 0x75"),
+    ("0x31-0x100000-0x12", "0x1b 0x5b 0x34 0x39 0x3b 0x39 0x75"),
+    ("0x32-0x100000-0x13", "0x1b 0x5b 0x35 0x30 0x3b 0x39 0x75"),
+    ("0x33-0x100000-0x14", "0x1b 0x5b 0x35 0x31 0x3b 0x39 0x75"),
+    ("0x34-0x100000-0x15", "0x1b 0x5b 0x35 0x32 0x3b 0x39 0x75"),
+    ("0x35-0x100000-0x17", "0x1b 0x5b 0x35 0x33 0x3b 0x39 0x75"),
+    ("0x36-0x100000-0x16", "0x1b 0x5b 0x35 0x34 0x3b 0x39 0x75"),
+    ("0x37-0x100000-0x1a", "0x1b 0x5b 0x35 0x35 0x3b 0x39 0x75"),
+    ("0x38-0x100000-0x1c", "0x1b 0x5b 0x35 0x36 0x3b 0x39 0x75"),
+    ("0x39-0x100000-0x19", "0x1b 0x5b 0x35 0x37 0x3b 0x39 0x75"),
+];
 /// Top-level plist key that disables iTerm2's mouse-reporting-frustration
 /// banner. Backed by iTermAdvancedSettingsModel's
 /// `noSyncNeverAskAboutMouseReportingFrustration` property whose plist
@@ -168,6 +202,32 @@ pub fn apply_croft_key_settings(plist: &mut Value) -> Result<(), ITerm2Error> {
     set_string(menu, "Select All", "@~a".to_string());
     set_string(menu, "Undo", "@~z".to_string());
     menu.remove("Paste");
+    // Relocate iTerm2 menu items that would otherwise catch the editor's
+    // vim chords at the menu-bar layer. Each is moved to Cmd+Opt+<key>
+    // so the original action stays reachable, but the bare Cmd+<key>
+    // chord is freed for the GlobalKeyMap forwarder below.
+    set_string(menu, "Split Vertically with Same Profile", "@~d".to_string());
+    set_string(menu, "Find Next", "@~g".to_string());
+    set_string(menu, "Find Previous", "@~G".to_string());
+    set_string(menu, "Jump to Selection", "@~y".to_string());
+    // iTerm2's Window menu binds Cmd+1..Cmd+9 to Select Tab. Move each
+    // to Cmd+Opt+digit so croft can capture Cmd+digit as a vim count.
+    for (i, label) in [
+        "Select Tab 1",
+        "Select Tab 2",
+        "Select Tab 3",
+        "Select Tab 4",
+        "Select Tab 5",
+        "Select Tab 6",
+        "Select Tab 7",
+        "Select Tab 8",
+        "Select Tab 9",
+    ]
+    .iter()
+    .enumerate()
+    {
+        set_string(menu, label, format!("@~{}", i + 1));
+    }
 
     let global = dict_entry_mut(dict, "GlobalKeyMap");
     global.insert(CMD_SHIFT_F_KEY.into(), send_hex_action(CMD_SHIFT_F_HEX, 0));
@@ -199,8 +259,17 @@ pub fn apply_croft_key_settings(plist: &mut Value) -> Result<(), ITerm2Error> {
         (CMD_S_KEY, CMD_S_HEX),
         (CMD_X_KEY, CMD_X_HEX),
         (CMD_Z_KEY, CMD_Z_HEX),
+        (CMD_D_KEY, CMD_D_HEX),
+        (CMD_G_KEY, CMD_G_HEX),
+        (CMD_Y_KEY, CMD_Y_HEX),
+        (CMD_O_KEY, CMD_O_HEX),
+        (CMD_SHIFT_G_KEY, CMD_SHIFT_G_HEX),
+        (CMD_SHIFT_O_KEY, CMD_SHIFT_O_HEX),
     ] {
         global.insert(key.into(), send_hex_action(hex, 0));
+    }
+    for (key, hex) in CMD_DIGIT_CHORDS {
+        global.insert((*key).into(), send_hex_action(hex, 0));
     }
     global.remove(CMD_V_KEY);
 
@@ -522,6 +591,56 @@ mod tests {
                 action_text(global, key),
                 hex,
                 "GlobalKeyMap is missing the CSI-u forwarder for {label}; without it, AppKit's NSResponder default key bindings catch the chord (Cmd+C -> copy: on PTYTextView) before croft's terminal handler sees a Char-with-Super key event, which is why Cmd+C silently fails to copy the croft selection even with the NSUserKeyEquivalents Edit-menu relocations in place"
+            );
+        }
+    }
+
+    #[test]
+    fn apply_croft_key_settings_forwards_editor_vim_chord_starts_and_count_digits() {
+        let mut plist = synth_plist("GUID-1", &["GUID-1"]);
+        apply_croft_key_settings(&mut plist).unwrap();
+        let top = plist.as_dictionary().unwrap();
+        let global = dict_in(top, "GlobalKeyMap");
+        for (key, hex, label) in [
+            (CMD_D_KEY, CMD_D_HEX, "Cmd+D (vim dd chord start)"),
+            (CMD_G_KEY, CMD_G_HEX, "Cmd+G (vim gg chord start)"),
+            (CMD_Y_KEY, CMD_Y_HEX, "Cmd+Y (vim yy chord start)"),
+            (CMD_O_KEY, CMD_O_HEX, "Cmd+O (open line below)"),
+            (CMD_SHIFT_G_KEY, CMD_SHIFT_G_HEX, "Cmd+Shift+G (goto bottom)"),
+            (CMD_SHIFT_O_KEY, CMD_SHIFT_O_HEX, "Cmd+Shift+O (open line above)"),
+        ] {
+            assert_eq!(
+                action_text(global, key),
+                hex,
+                "GlobalKeyMap missing CSI-u forwarder for {label}; without it, iTerm2 swallows the chord at the menu/responder layer (e.g. Cmd+D = Split Pane) and the editor's chord state never advances"
+            );
+        }
+        for (key, hex) in CMD_DIGIT_CHORDS {
+            assert_eq!(
+                action_text(global, key),
+                *hex,
+                "GlobalKeyMap missing CSI-u forwarder for Cmd+digit {key}; without it, iTerm2 catches Cmd+digit for Select Tab N and the editor's vim count chord cannot start with a leading digit"
+            );
+        }
+    }
+
+    #[test]
+    fn apply_croft_key_settings_relocates_iterm_menu_items_off_vim_chord_letters() {
+        let mut plist = synth_plist("GUID-1", &["GUID-1"]);
+        apply_croft_key_settings(&mut plist).unwrap();
+        let top = plist.as_dictionary().unwrap();
+        let menu = dict_in(top, "NSUserKeyEquivalents");
+        for (item, expected) in [
+            ("Split Vertically with Same Profile", "@~d"),
+            ("Find Next", "@~g"),
+            ("Find Previous", "@~G"),
+            ("Select Tab 1", "@~1"),
+            ("Select Tab 9", "@~9"),
+        ] {
+            assert_eq!(
+                menu.get(item).and_then(|v| v.as_string()),
+                Some(expected),
+                "iTerm2 menu item {item} must be relocated off its default Cmd-chord, otherwise the menu bar catches the chord before the GlobalKeyMap forwarder fires"
             );
         }
     }

@@ -779,6 +779,29 @@ pub struct App {
     /// id are dropped so a slow earlier response cannot clobber a fresh
     /// one (e.g. user already moved past the original trigger).
     completion_request_id: Option<u64>,
+    editor_vim_chord: EditorVimChord,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum VimOp {
+    #[default]
+    None,
+    G,
+    D,
+    Y,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct EditorVimChord {
+    op: VimOp,
+    count: usize,
+}
+
+impl EditorVimChord {
+    fn reset(&mut self) {
+        self.op = VimOp::None;
+        self.count = 0;
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1257,6 +1280,7 @@ impl App {
             },
             lsp_last_seen: std::collections::HashMap::new(),
             completion_popup: None,
+            editor_vim_chord: EditorVimChord::default(),
             completion_request_id: None,
         })
     }
@@ -3648,7 +3672,7 @@ impl App {
             self.set_sidebar_view(SidebarView::Search);
             return Ok(());
         }
-        if is_source_control_jump_key(key) {
+        if is_source_control_jump_key(key) && self.focus != Pane::Editor {
             self.set_sidebar_view(SidebarView::SourceControl);
             return Ok(());
         }
@@ -4516,6 +4540,45 @@ impl App {
             }
             return;
         }
+        if self.handle_editor_vim_chord(key) {
+            return;
+        }
+        if is_editor_line_home_key(key) {
+            self.editor.clear_selection();
+            self.editor.home_line();
+            return;
+        }
+        if is_editor_line_end_key(key) {
+            self.editor.clear_selection();
+            self.editor.end_line();
+            return;
+        }
+        if is_editor_kill_to_eol_key(key) {
+            let killed = self.editor.kill_to_eol();
+            if !killed.is_empty() {
+                write_osc52(&killed);
+                self.status = format!("Killed {} chars", killed.chars().count());
+            }
+            return;
+        }
+        if is_editor_kill_to_bol_key(key) {
+            let killed = self.editor.kill_to_bol();
+            if !killed.is_empty() {
+                write_osc52(&killed);
+                self.status = format!("Killed {} chars", killed.chars().count());
+            }
+            return;
+        }
+        if is_editor_open_line_below_key(key) {
+            self.editor.open_line_below();
+            self.status = String::from("Opened line below");
+            return;
+        }
+        if is_editor_open_line_above_key(key) {
+            self.editor.open_line_above();
+            self.status = String::from("Opened line above");
+            return;
+        }
         // Clipboard gestures take precedence over text input. They never
         // conflict with normal typing (Ctrl/Cmd + C/X/A) so the order is
         // safe even when the user is in the middle of editing.
@@ -4651,6 +4714,128 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// Vim-style chord layer for the editor: `cmd+gg` jumps to top, `cmd+G`
+    /// jumps to bottom, `cmd+dd` deletes a line, `cmd+yy` yanks a line.
+    /// Counts go between the chord start and the completion key
+    /// (`cmd+g 12 g` jumps to line 12; `cmd+d 3 d` deletes three lines).
+    /// Returns true when the key was consumed; false means the caller
+    /// should continue with normal editor handling.
+    fn handle_editor_vim_chord(&mut self, key: KeyEvent) -> bool {
+        if is_vim_goto_bottom(key) {
+            let count = self.editor_vim_chord.count;
+            self.editor_vim_chord.reset();
+            if count > 0 {
+                self.editor.goto_line(count);
+                self.status = format!("Line {count}");
+            } else {
+                self.editor.goto_bottom();
+                self.status = String::from("Bottom of file");
+            }
+            return true;
+        }
+
+        let count_pending = self.editor_vim_chord.count > 0;
+        let op_pending = self.editor_vim_chord.op != VimOp::None;
+
+        if op_pending || count_pending {
+            if let Some(d) = chord_digit_value(key) {
+                self.editor_vim_chord.count = self
+                    .editor_vim_chord
+                    .count
+                    .saturating_mul(10)
+                    .saturating_add(d);
+                let op = match self.editor_vim_chord.op {
+                    VimOp::G => 'g',
+                    VimOp::D => 'd',
+                    VimOp::Y => 'y',
+                    VimOp::None => ' ',
+                };
+                self.status = chord_status_text(op, self.editor_vim_chord.count);
+                return true;
+            }
+        }
+
+        if !op_pending {
+            if is_vim_chord_g(key) {
+                self.editor_vim_chord.op = VimOp::G;
+                self.status = chord_status_text('g', self.editor_vim_chord.count);
+                return true;
+            }
+            if is_vim_chord_d(key) {
+                self.editor_vim_chord.op = VimOp::D;
+                self.status = chord_status_text('d', self.editor_vim_chord.count);
+                return true;
+            }
+            if is_vim_chord_y(key) {
+                self.editor_vim_chord.op = VimOp::Y;
+                self.status = chord_status_text('y', self.editor_vim_chord.count);
+                return true;
+            }
+            if !count_pending {
+                if let Some(d) = cmd_only_digit_value(key) {
+                    self.editor_vim_chord.count = d;
+                    self.status = chord_status_text(' ', self.editor_vim_chord.count);
+                    return true;
+                }
+                return false;
+            }
+            self.editor_vim_chord.reset();
+            self.status = String::from("Chord cancelled");
+            return false;
+        }
+
+        let completes = match self.editor_vim_chord.op {
+            VimOp::G => is_plain_letter(key, 'g') || is_vim_chord_g(key),
+            VimOp::D => is_plain_letter(key, 'd') || is_vim_chord_d(key),
+            VimOp::Y => is_plain_letter(key, 'y') || is_vim_chord_y(key),
+            VimOp::None => false,
+        };
+
+        if completes {
+            let count = self.editor_vim_chord.count;
+            match self.editor_vim_chord.op {
+                VimOp::G => {
+                    if count > 0 {
+                        self.editor.goto_line(count);
+                        self.status = format!("Line {count}");
+                    } else {
+                        self.editor.goto_top();
+                        self.status = String::from("Top of file");
+                    }
+                }
+                VimOp::D => {
+                    let n = count.max(1);
+                    let yanked = self.editor.delete_lines(n);
+                    if !yanked.is_empty() {
+                        write_osc52(&yanked);
+                    }
+                    self.status = format!(
+                        "Deleted {n} {}",
+                        if n == 1 { "line" } else { "lines" }
+                    );
+                }
+                VimOp::Y => {
+                    let n = count.max(1);
+                    let yanked = self.editor.yank_lines(n);
+                    if !yanked.is_empty() {
+                        write_osc52(&yanked);
+                    }
+                    self.status = format!(
+                        "Yanked {n} {}",
+                        if n == 1 { "line" } else { "lines" }
+                    );
+                }
+                VimOp::None => {}
+            }
+            self.editor_vim_chord.reset();
+            return true;
+        }
+
+        self.editor_vim_chord.reset();
+        self.status = String::from("Chord cancelled");
+        false
     }
 
     fn handle_terminal_key(&mut self, key: KeyEvent) {
@@ -7300,6 +7485,142 @@ fn is_editor_undo_key(key: KeyEvent) -> bool {
         return false;
     }
     key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::SUPER)
+}
+
+fn chord_status_text(op: char, count: usize) -> String {
+    if count > 0 {
+        format!("Pending: {op} (count {count})")
+    } else {
+        format!("Pending: {op}")
+    }
+}
+
+fn is_vim_chord_letter(key: KeyEvent, letter: char) -> bool {
+    let KeyCode::Char(c) = key.code else { return false };
+    if c != letter {
+        return false;
+    }
+    if key.modifiers.contains(KeyModifiers::SHIFT)
+        || key.modifiers.contains(KeyModifiers::ALT)
+    {
+        return false;
+    }
+    key.modifiers.contains(KeyModifiers::SUPER) || key.modifiers.contains(KeyModifiers::CONTROL)
+}
+
+fn is_vim_chord_g(key: KeyEvent) -> bool {
+    is_vim_chord_letter(key, 'g')
+}
+
+fn is_vim_chord_d(key: KeyEvent) -> bool {
+    is_vim_chord_letter(key, 'd')
+}
+
+fn is_vim_chord_y(key: KeyEvent) -> bool {
+    is_vim_chord_letter(key, 'y')
+}
+
+fn is_vim_goto_bottom(key: KeyEvent) -> bool {
+    let KeyCode::Char(c) = key.code else { return false };
+    if !c.eq_ignore_ascii_case(&'g') {
+        return false;
+    }
+    if !key.modifiers.contains(KeyModifiers::SHIFT) {
+        return false;
+    }
+    key.modifiers.contains(KeyModifiers::SUPER) || key.modifiers.contains(KeyModifiers::CONTROL)
+}
+
+fn chord_digit_value(key: KeyEvent) -> Option<usize> {
+    let KeyCode::Char(c) = key.code else { return None };
+    let d = c.to_digit(10)? as usize;
+    if key.modifiers.contains(KeyModifiers::ALT) || key.modifiers.contains(KeyModifiers::SHIFT) {
+        return None;
+    }
+    Some(d)
+}
+
+fn cmd_only_digit_value(key: KeyEvent) -> Option<usize> {
+    let d = chord_digit_value(key)?;
+    if !key.modifiers.contains(KeyModifiers::SUPER) {
+        return None;
+    }
+    Some(d)
+}
+
+fn is_plain_letter(key: KeyEvent, letter: char) -> bool {
+    let KeyCode::Char(c) = key.code else { return false };
+    if c != letter {
+        return false;
+    }
+    !(key.modifiers.contains(KeyModifiers::CONTROL)
+        || key.modifiers.contains(KeyModifiers::SUPER)
+        || key.modifiers.contains(KeyModifiers::ALT))
+}
+
+fn is_editor_line_home_key(key: KeyEvent) -> bool {
+    let KeyCode::Char(c) = key.code else { return false };
+    if !c.eq_ignore_ascii_case(&'a') {
+        return false;
+    }
+    key.modifiers.contains(KeyModifiers::CONTROL)
+        && !key.modifiers.contains(KeyModifiers::SUPER)
+        && !key.modifiers.contains(KeyModifiers::ALT)
+}
+
+fn is_editor_line_end_key(key: KeyEvent) -> bool {
+    let KeyCode::Char(c) = key.code else { return false };
+    if !c.eq_ignore_ascii_case(&'e') {
+        return false;
+    }
+    key.modifiers.contains(KeyModifiers::CONTROL)
+        && !key.modifiers.contains(KeyModifiers::SUPER)
+        && !key.modifiers.contains(KeyModifiers::ALT)
+}
+
+fn is_editor_kill_to_eol_key(key: KeyEvent) -> bool {
+    let KeyCode::Char(c) = key.code else { return false };
+    if !c.eq_ignore_ascii_case(&'k') {
+        return false;
+    }
+    key.modifiers.contains(KeyModifiers::CONTROL)
+        && !key.modifiers.contains(KeyModifiers::SUPER)
+        && !key.modifiers.contains(KeyModifiers::ALT)
+}
+
+fn is_editor_kill_to_bol_key(key: KeyEvent) -> bool {
+    let KeyCode::Char(c) = key.code else { return false };
+    if !c.eq_ignore_ascii_case(&'u') {
+        return false;
+    }
+    key.modifiers.contains(KeyModifiers::CONTROL)
+        && !key.modifiers.contains(KeyModifiers::SUPER)
+        && !key.modifiers.contains(KeyModifiers::ALT)
+}
+
+fn is_editor_open_line_below_key(key: KeyEvent) -> bool {
+    let KeyCode::Char(c) = key.code else { return false };
+    if c != 'o' {
+        return false;
+    }
+    if key.modifiers.contains(KeyModifiers::SHIFT) || key.modifiers.contains(KeyModifiers::ALT) {
+        return false;
+    }
+    key.modifiers.contains(KeyModifiers::SUPER) || key.modifiers.contains(KeyModifiers::CONTROL)
+}
+
+fn is_editor_open_line_above_key(key: KeyEvent) -> bool {
+    let KeyCode::Char(c) = key.code else { return false };
+    if !c.eq_ignore_ascii_case(&'o') {
+        return false;
+    }
+    if !key.modifiers.contains(KeyModifiers::SHIFT) {
+        return false;
+    }
+    if key.modifiers.contains(KeyModifiers::ALT) {
+        return false;
+    }
+    key.modifiers.contains(KeyModifiers::SUPER) || key.modifiers.contains(KeyModifiers::CONTROL)
 }
 
 /// Close active tab: `Ctrl+W` / `Cmd+W`.
@@ -11009,6 +11330,213 @@ mod tests {
         assert_eq!(app.editor.cursor_col, 5);
         app.handle_key(key(KeyCode::Right, KeyModifiers::ALT)).unwrap();
         assert_eq!(app.editor.cursor_col, 11);
+    }
+
+    fn editor_app_with_lines(lines: &[&str]) -> App {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.focus_pane(Pane::Editor);
+        app.editor.lines = lines.iter().map(|s| (*s).to_string()).collect();
+        app.editor.cursor_row = 0;
+        app.editor.cursor_col = 0;
+        app
+    }
+
+    #[test]
+    fn editor_cmd_gg_jumps_to_top_of_file() {
+        let mut app = editor_app_with_lines(&["a", "b", "c", "d"]);
+        app.editor.cursor_row = 3;
+        app.handle_key(key(KeyCode::Char('g'), KeyModifiers::SUPER)).unwrap();
+        app.handle_key(key(KeyCode::Char('g'), KeyModifiers::SUPER)).unwrap();
+        assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (0, 0));
+    }
+
+    #[test]
+    fn editor_cmd_g_then_plain_g_also_jumps_to_top() {
+        let mut app = editor_app_with_lines(&["a", "b", "c", "d"]);
+        app.editor.cursor_row = 3;
+        app.handle_key(key(KeyCode::Char('g'), KeyModifiers::SUPER)).unwrap();
+        app.handle_key(key(KeyCode::Char('g'), KeyModifiers::NONE)).unwrap();
+        assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (0, 0));
+    }
+
+    #[test]
+    fn editor_cmd_g_count_g_jumps_to_specific_line() {
+        let mut app = editor_app_with_lines(&["a", "b", "c", "d", "e"]);
+        app.handle_key(key(KeyCode::Char('g'), KeyModifiers::SUPER)).unwrap();
+        app.handle_key(key(KeyCode::Char('3'), KeyModifiers::NONE)).unwrap();
+        app.handle_key(key(KeyCode::Char('g'), KeyModifiers::NONE)).unwrap();
+        assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (2, 0));
+    }
+
+    #[test]
+    fn editor_cmd_g_multidigit_count_g_jumps_to_specific_line() {
+        let mut app = editor_app_with_lines(&(0..30).map(|_| "x").collect::<Vec<_>>());
+        app.handle_key(key(KeyCode::Char('g'), KeyModifiers::SUPER)).unwrap();
+        app.handle_key(key(KeyCode::Char('1'), KeyModifiers::NONE)).unwrap();
+        app.handle_key(key(KeyCode::Char('2'), KeyModifiers::NONE)).unwrap();
+        app.handle_key(key(KeyCode::Char('g'), KeyModifiers::NONE)).unwrap();
+        assert_eq!(app.editor.cursor_row, 11);
+    }
+
+    #[test]
+    fn editor_cmd_shift_g_jumps_to_bottom_of_file() {
+        let mut app = editor_app_with_lines(&["a", "b", "c", "d"]);
+        app.handle_key(key(
+            KeyCode::Char('G'),
+            KeyModifiers::SUPER | KeyModifiers::SHIFT,
+        ))
+        .unwrap();
+        assert_eq!(app.editor.cursor_row, 3);
+        assert_ne!(
+            app.sidebar_view,
+            SidebarView::SourceControl,
+            "cmd+shift+g in editor pane must NOT hijack to source control"
+        );
+    }
+
+    #[test]
+    fn editor_cmd_dd_deletes_current_line() {
+        let mut app = editor_app_with_lines(&["alpha", "beta", "gamma"]);
+        app.editor.cursor_row = 1;
+        app.handle_key(key(KeyCode::Char('d'), KeyModifiers::SUPER)).unwrap();
+        app.handle_key(key(KeyCode::Char('d'), KeyModifiers::SUPER)).unwrap();
+        assert_eq!(app.editor.lines, vec!["alpha", "gamma"]);
+    }
+
+    #[test]
+    fn editor_cmd_d_count_d_deletes_n_lines() {
+        let mut app = editor_app_with_lines(&["a", "b", "c", "d", "e"]);
+        app.editor.cursor_row = 1;
+        app.handle_key(key(KeyCode::Char('d'), KeyModifiers::SUPER)).unwrap();
+        app.handle_key(key(KeyCode::Char('3'), KeyModifiers::NONE)).unwrap();
+        app.handle_key(key(KeyCode::Char('d'), KeyModifiers::NONE)).unwrap();
+        assert_eq!(app.editor.lines, vec!["a", "e"]);
+    }
+
+    #[test]
+    fn editor_cmd_yy_does_not_modify_buffer() {
+        let mut app = editor_app_with_lines(&["alpha", "beta", "gamma"]);
+        app.editor.cursor_row = 1;
+        app.handle_key(key(KeyCode::Char('y'), KeyModifiers::SUPER)).unwrap();
+        app.handle_key(key(KeyCode::Char('y'), KeyModifiers::SUPER)).unwrap();
+        assert_eq!(app.editor.lines, vec!["alpha", "beta", "gamma"]);
+        assert!(app.status.starts_with("Yanked"));
+    }
+
+    #[test]
+    fn editor_chord_cancels_on_unrelated_key() {
+        let mut app = editor_app_with_lines(&["alpha"]);
+        app.editor.cursor_col = 5;
+        app.handle_key(key(KeyCode::Char('d'), KeyModifiers::SUPER)).unwrap();
+        app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE)).unwrap();
+        assert_eq!(app.editor.lines, vec!["alphax"]);
+    }
+
+    #[test]
+    fn editor_ctrl_a_jumps_to_start_of_line() {
+        let mut app = editor_app_with_lines(&["hello world"]);
+        app.editor.cursor_col = 7;
+        app.handle_key(key(KeyCode::Char('a'), KeyModifiers::CONTROL)).unwrap();
+        assert_eq!(app.editor.cursor_col, 0);
+    }
+
+    #[test]
+    fn editor_ctrl_e_jumps_to_end_of_line() {
+        let mut app = editor_app_with_lines(&["hello world"]);
+        app.editor.cursor_col = 3;
+        app.handle_key(key(KeyCode::Char('e'), KeyModifiers::CONTROL)).unwrap();
+        assert_eq!(app.editor.cursor_col, 11);
+    }
+
+    #[test]
+    fn editor_ctrl_k_kills_to_end_of_line() {
+        let mut app = editor_app_with_lines(&["hello world", "next"]);
+        app.editor.cursor_col = 5;
+        app.handle_key(key(KeyCode::Char('k'), KeyModifiers::CONTROL)).unwrap();
+        assert_eq!(app.editor.lines, vec!["hello", "next"]);
+    }
+
+    #[test]
+    fn editor_cmd_count_gg_jumps_to_line_with_leading_count() {
+        let mut app = editor_app_with_lines(&["a", "b", "c", "d", "e"]);
+        app.handle_key(key(KeyCode::Char('3'), KeyModifiers::SUPER)).unwrap();
+        app.handle_key(key(KeyCode::Char('g'), KeyModifiers::SUPER)).unwrap();
+        app.handle_key(key(KeyCode::Char('g'), KeyModifiers::SUPER)).unwrap();
+        assert_eq!(app.editor.cursor_row, 2);
+    }
+
+    #[test]
+    fn editor_cmd_count_dd_deletes_n_lines_with_leading_count() {
+        let mut app = editor_app_with_lines(&["a", "b", "c", "d", "e"]);
+        app.editor.cursor_row = 1;
+        app.handle_key(key(KeyCode::Char('2'), KeyModifiers::SUPER)).unwrap();
+        app.handle_key(key(KeyCode::Char('d'), KeyModifiers::SUPER)).unwrap();
+        app.handle_key(key(KeyCode::Char('d'), KeyModifiers::SUPER)).unwrap();
+        assert_eq!(app.editor.lines, vec!["a", "d", "e"]);
+    }
+
+    #[test]
+    fn editor_cmd_count_yy_yanks_n_lines_with_leading_count() {
+        let mut app = editor_app_with_lines(&["a", "b", "c", "d"]);
+        app.editor.cursor_row = 0;
+        app.handle_key(key(KeyCode::Char('2'), KeyModifiers::SUPER)).unwrap();
+        app.handle_key(key(KeyCode::Char('y'), KeyModifiers::SUPER)).unwrap();
+        app.handle_key(key(KeyCode::Char('y'), KeyModifiers::SUPER)).unwrap();
+        assert_eq!(app.editor.lines, vec!["a", "b", "c", "d"]);
+        assert!(app.status.contains("Yanked 2"));
+    }
+
+    #[test]
+    fn editor_cmd_count_then_shift_g_jumps_to_specific_line() {
+        let mut app = editor_app_with_lines(&["a", "b", "c", "d", "e"]);
+        app.handle_key(key(KeyCode::Char('4'), KeyModifiers::SUPER)).unwrap();
+        app.handle_key(key(
+            KeyCode::Char('G'),
+            KeyModifiers::SUPER | KeyModifiers::SHIFT,
+        ))
+        .unwrap();
+        assert_eq!(app.editor.cursor_row, 3);
+    }
+
+    #[test]
+    fn editor_ctrl_u_kills_to_start_of_line() {
+        let mut app = editor_app_with_lines(&["hello world"]);
+        app.editor.cursor_col = 6;
+        app.handle_key(key(KeyCode::Char('u'), KeyModifiers::CONTROL)).unwrap();
+        assert_eq!(app.editor.lines, vec!["world"]);
+        assert_eq!(app.editor.cursor_col, 0);
+    }
+
+    #[test]
+    fn editor_cmd_o_opens_line_below_with_indent() {
+        let mut app = editor_app_with_lines(&["    foo", "bar"]);
+        app.editor.cursor_row = 0;
+        app.editor.cursor_col = 4;
+        app.handle_key(key(KeyCode::Char('o'), KeyModifiers::SUPER)).unwrap();
+        assert_eq!(app.editor.lines, vec!["    foo", "    ", "bar"]);
+        assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (1, 4));
+    }
+
+    #[test]
+    fn editor_cmd_shift_o_opens_line_above_with_indent() {
+        let mut app = editor_app_with_lines(&["foo", "    bar"]);
+        app.editor.cursor_row = 1;
+        app.editor.cursor_col = 6;
+        app.handle_key(key(
+            KeyCode::Char('O'),
+            KeyModifiers::SUPER | KeyModifiers::SHIFT,
+        ))
+        .unwrap();
+        assert_eq!(app.editor.lines, vec!["foo", "    ", "    bar"]);
+        assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (1, 4));
+    }
+
+    #[test]
+    fn editor_cmd_a_still_selects_all() {
+        let mut app = editor_app_with_lines(&["hello", "world"]);
+        app.handle_key(key(KeyCode::Char('a'), KeyModifiers::SUPER)).unwrap();
+        assert_eq!(app.editor.selection_text(), "hello\nworld");
     }
 
     #[test]

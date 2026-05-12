@@ -139,7 +139,20 @@ croft setup-terminal --help
 | `Ctrl`+`X` / `Cmd`+`X` | Cut the selection |
 | `Ctrl`+`V` / `Cmd`+`V` | Paste at the cursor; replaces selection if any |
 | `Ctrl`+`Z` / `Cmd`+`Z` | Undo (typing bursts coalesce into one step; backspace, paste, cut, replace are each their own step) |
-| `Ctrl`+`A` / `Cmd`+`A` | Select the entire buffer |
+| `Cmd`+`A` | Select the entire buffer |
+| `Ctrl`+`A` | Move to the start of the current line (readline-style) |
+| `Ctrl`+`E` | Move to the end of the current line |
+| `Ctrl`+`K` | Kill from cursor to end of line (yanks to the system clipboard) |
+| `Ctrl`+`U` | Kill from cursor to start of line (yanks to the system clipboard) |
+| `Cmd`+`o` | Open a new line below the current row, inheriting its indent |
+| `Cmd`+`Shift`+`O` | Open a new line above the current row, inheriting its indent |
+| `Cmd`+`g` `g` | Go to the top of the file |
+| `Cmd`+`N` `Cmd`+`g` `g` | Go to line `N` (count can lead, `Cmd`+`5` `Cmd`+`g` `g` → line 5; count can also go after the first `Cmd`+`g`) |
+| `Cmd`+`Shift`+`G` | Go to the bottom of the file (with a leading count, jumps to that line) |
+| `Cmd`+`d` `d` | Delete the current line (yanks to the system clipboard) |
+| `Cmd`+`N` `Cmd`+`d` `d` | Delete `N` lines |
+| `Cmd`+`y` `y` | Yank (copy) the current line to the system clipboard |
+| `Cmd`+`N` `Cmd`+`y` `y` | Yank `N` lines |
 | `Esc` | Clear the current selection |
 
 ### Editor: image preview (`.png`, `.jpg`, `.jpeg`, `.gif`, `.bmp`, `.webp`)
