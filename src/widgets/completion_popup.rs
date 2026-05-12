@@ -5,7 +5,7 @@ use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, ListState, StatefulWidget, Widget},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, StatefulWidget, Widget},
 };
 
 use crate::lsp::CompletionItem;
@@ -183,6 +183,7 @@ impl Widget for &CompletionPopup {
                 .add_modifier(Modifier::BOLD),
         );
 
+        Widget::render(Clear, area, buf);
         let mut state = ListState::default();
         state.select(Some(self.selected));
         StatefulWidget::render(list, area, buf, &mut state);
@@ -368,5 +369,43 @@ mod tests {
         };
         let mut buf = Buffer::empty(area);
         (&p).render(area, &mut buf);
+    }
+
+    #[test]
+    fn render_paints_opaque_popup_background_over_editor_text_so_buffer_does_not_bleed_through() {
+        let area = Rect { x: 0, y: 0, width: 30, height: 6 };
+        let mut buf = Buffer::empty(area);
+        // Sentinel: a character that cannot appear in any popup content
+        // (border glyphs, kind glyphs, item labels 'alpha' / 'beta').
+        // If it survives the popup render, the popup left an editor cell
+        // un-cleared — that's the bug the user saw in their screenshot.
+        let sentinel = '#';
+        let editor_bg = Color::Rgb(0x1a, 0x1c, 0x22);
+        let editor_fg = Color::Rgb(0xd0, 0xd0, 0xd0);
+        for y in area.top()..area.bottom() {
+            for x in area.left()..area.right() {
+                let cell = &mut buf[(x, y)];
+                cell.set_char(sentinel);
+                cell.set_style(Style::default().fg(editor_fg).bg(editor_bg));
+            }
+        }
+        let p = popup(vec![item("alpha"), item("beta")], "");
+        (&p).render(area, &mut buf);
+        let inner = Rect {
+            x: area.left() + 1,
+            y: area.top() + 1,
+            width: area.width.saturating_sub(2),
+            height: area.height.saturating_sub(2),
+        };
+        for y in inner.top()..inner.bottom() {
+            for x in inner.left()..inner.right() {
+                let cell = &buf[(x, y)];
+                let ch = cell.symbol().chars().next().unwrap_or(' ');
+                assert_ne!(
+                    ch, sentinel,
+                    "popup inner cell ({x},{y}) still shows the editor's sentinel '{sentinel}'; Block.render only set_style's the area without clearing characters, so a Clear widget pass is needed before the List renders, otherwise editor glyphs bleed through past each suggestion label"
+                );
+            }
+        }
     }
 }
