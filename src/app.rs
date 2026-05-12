@@ -4581,6 +4581,15 @@ impl App {
                     && !key.modifiers.contains(KeyModifiers::SUPER)
                 {
                     self.editor.insert_char(c);
+                    // `.` is the canonical LSP trigger character for member
+                    // access in Python / TS / Rust. Fire a completion request
+                    // immediately so the popup pops without a Ctrl+Space.
+                    // The popup's fallthrough already dismissed any prior
+                    // popup when this char arrived, so the new request just
+                    // populates a fresh popup when the response lands.
+                    if c == '.' {
+                        self.trigger_completion();
+                    }
                 }
             }
             _ => {}

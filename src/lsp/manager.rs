@@ -349,7 +349,9 @@ mod tests {
     }
 
     fn first_completion_python_config() -> Option<ServerConfig> {
-        if is_on_path("basedpyright-langserver") {
+        if is_on_path("ty") {
+            Some(ServerConfig::ty())
+        } else if is_on_path("basedpyright-langserver") {
             Some(ServerConfig::basedpyright())
         } else if is_on_path("pyright-langserver") {
             Some(ServerConfig::pyright())
@@ -380,12 +382,12 @@ mod tests {
     }
 
     #[test]
-    fn manager_completion_against_pyright() {
+    fn manager_completion_against_python_lsp() {
         let Some(config) = first_completion_python_config() else {
-            eprintln!("SKIPPED: no basedpyright/pyright on PATH");
+            eprintln!("SKIPPED: no ty/basedpyright/pyright on PATH");
             return;
         };
-        let _ = config;
+        let server_name = config.name;
         let tmp = tempfile::tempdir().expect("tempdir");
         let root = tmp.path().canonicalize().expect("canonicalize");
         let file = root.join("demo.py");
@@ -394,7 +396,7 @@ mod tests {
 
         let mut manager = LspManager::new(root).expect("manager");
         manager.open_doc(file.clone(), text);
-        std::thread::sleep(Duration::from_millis(1200));
+        std::thread::sleep(Duration::from_millis(1500));
 
         let id = manager.request_completion(file.clone(), 1, 3);
         let result = drain_completion_blocking(&manager, Duration::from_secs(8))
@@ -403,7 +405,7 @@ mod tests {
         assert_eq!(result.path, file);
         assert!(
             !result.items.is_empty(),
-            "expected pyright to return completions for os."
+            "expected {server_name} to return completions for os."
         );
     }
 }
