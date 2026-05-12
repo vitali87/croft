@@ -4,7 +4,11 @@ use std::sync::Arc;
 use std::sync::mpsc as std_mpsc;
 
 use anyhow::Result;
-use lsp_types::{ClientCapabilities, CompletionItemKind, CompletionResponse, Url};
+use lsp_types::{
+    ClientCapabilities, CompletionClientCapabilities, CompletionItemCapability,
+    CompletionItemKind, CompletionItemKindCapability, CompletionResponse, MarkupKind,
+    TextDocumentClientCapabilities, Url,
+};
 use tokio::sync::{Mutex as TokioMutex, mpsc as tokio_mpsc};
 
 use crate::lsp::client::LspClient;
@@ -173,7 +177,7 @@ impl WorkerState {
                     ));
                     continue;
                 }
-                match LspClient::spawn(config, &self.workspace_root, ClientCapabilities::default())
+                match LspClient::spawn(config, &self.workspace_root, build_client_capabilities())
                     .await
                 {
                     Ok(client) => {
@@ -319,25 +323,41 @@ impl WorkerState {
             let mut client = client_arc.lock().await;
             let resp = client.completion(uri, line, character).await;
             drop(client);
-            let items: Vec<CompletionItem> = match resp {
+            let (is_incomplete, items): (Option<bool>, Vec<CompletionItem>) = match resp {
                 Ok(Some(CompletionResponse::Array(items))) => {
-                    items.into_iter().map(into_item).collect()
+                    (None, items.into_iter().map(into_item).collect())
                 }
-                Ok(Some(CompletionResponse::List(list))) => {
-                    list.items.into_iter().map(into_item).collect()
-                }
-                Ok(None) => Vec::new(),
+                Ok(Some(CompletionResponse::List(list))) => (
+                    Some(list.is_incomplete),
+                    list.items.into_iter().map(into_item).collect(),
+                ),
+                Ok(None) => (None, Vec::new()),
                 Err(e) => {
                     log_file::log(&format!("lsp[{server_name}] completion error: {e}"));
-                    Vec::new()
+                    (None, Vec::new())
                 }
             };
             let preview: Vec<&str> = items.iter().take(200).map(|i| i.label.as_str()).collect();
+            let sample: Vec<String> = items
+                .iter()
+                .take(5)
+                .map(|i| {
+                    format!(
+                        "{{label={:?} kind={:?} detail={:?} filter_text={:?} insert_text={:?}}}",
+                        i.label, i.kind, i.detail, i.filter_text, i.insert_text
+                    )
+                })
+                .collect();
             log_file::log(&format!(
-                "completion response id={request_id} server={server_name} count={} labels={:?}",
+                "completion response id={request_id} server={server_name} is_incomplete={is_incomplete:?} count={} labels={:?}",
                 items.len(),
                 preview
             ));
+            if !sample.is_empty() {
+                log_file::log(&format!(
+                    "completion response id={request_id} server={server_name} sample={sample:?}"
+                ));
+            }
             let _ = tx.send(CompletionResult {
                 request_id,
                 path: path_clone,
@@ -354,6 +374,62 @@ fn into_item(item: lsp_types::CompletionItem) -> CompletionItem {
         insert_text: item.insert_text,
         filter_text: item.filter_text,
         kind: item.kind,
+    }
+}
+
+fn build_client_capabilities() -> ClientCapabilities {
+    ClientCapabilities {
+        text_document: Some(TextDocumentClientCapabilities {
+            completion: Some(CompletionClientCapabilities {
+                dynamic_registration: Some(false),
+                context_support: Some(true),
+                completion_item: Some(CompletionItemCapability {
+                    snippet_support: Some(false),
+                    commit_characters_support: Some(false),
+                    documentation_format: Some(vec![
+                        MarkupKind::Markdown,
+                        MarkupKind::PlainText,
+                    ]),
+                    deprecated_support: Some(true),
+                    preselect_support: Some(true),
+                    insert_replace_support: Some(false),
+                    label_details_support: Some(true),
+                    ..Default::default()
+                }),
+                completion_item_kind: Some(CompletionItemKindCapability {
+                    value_set: Some(vec![
+                        CompletionItemKind::TEXT,
+                        CompletionItemKind::METHOD,
+                        CompletionItemKind::FUNCTION,
+                        CompletionItemKind::CONSTRUCTOR,
+                        CompletionItemKind::FIELD,
+                        CompletionItemKind::VARIABLE,
+                        CompletionItemKind::CLASS,
+                        CompletionItemKind::INTERFACE,
+                        CompletionItemKind::MODULE,
+                        CompletionItemKind::PROPERTY,
+                        CompletionItemKind::UNIT,
+                        CompletionItemKind::VALUE,
+                        CompletionItemKind::ENUM,
+                        CompletionItemKind::KEYWORD,
+                        CompletionItemKind::SNIPPET,
+                        CompletionItemKind::COLOR,
+                        CompletionItemKind::FILE,
+                        CompletionItemKind::REFERENCE,
+                        CompletionItemKind::FOLDER,
+                        CompletionItemKind::ENUM_MEMBER,
+                        CompletionItemKind::CONSTANT,
+                        CompletionItemKind::STRUCT,
+                        CompletionItemKind::EVENT,
+                        CompletionItemKind::OPERATOR,
+                        CompletionItemKind::TYPE_PARAMETER,
+                    ]),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
     }
 }
 

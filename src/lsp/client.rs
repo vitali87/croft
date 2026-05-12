@@ -10,11 +10,12 @@ use async_lsp::tracing::TracingLayer;
 use async_lsp::{LanguageServer, MainLoop, ServerSocket};
 use lsp_types::notification::{LogMessage, PublishDiagnostics, ShowMessage};
 use lsp_types::{
-    ClientCapabilities, CompletionParams, CompletionResponse, DidChangeTextDocumentParams,
-    DidCloseTextDocumentParams, DidOpenTextDocumentParams, InitializeParams, InitializedParams,
-    PartialResultParams, Position, ServerCapabilities, TextDocumentContentChangeEvent,
-    TextDocumentIdentifier, TextDocumentItem, TextDocumentPositionParams, Url,
-    VersionedTextDocumentIdentifier, WorkDoneProgressParams, WorkspaceFolder,
+    ClientCapabilities, CompletionContext, CompletionParams, CompletionResponse,
+    CompletionTriggerKind, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
+    DidOpenTextDocumentParams, InitializeParams, InitializedParams, PartialResultParams, Position,
+    ServerCapabilities, TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem,
+    TextDocumentPositionParams, Url, VersionedTextDocumentIdentifier, WorkDoneProgressParams,
+    WorkspaceFolder,
 };
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
@@ -223,7 +224,10 @@ impl LspClient {
                 },
                 work_done_progress_params: WorkDoneProgressParams::default(),
                 partial_result_params: PartialResultParams::default(),
-                context: None,
+                context: Some(CompletionContext {
+                    trigger_kind: CompletionTriggerKind::INVOKED,
+                    trigger_character: None,
+                }),
             })
             .await
             .context("completion")
