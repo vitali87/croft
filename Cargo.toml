@@ -1,6 +1,6 @@
 [package]
 name = "croft"
-version = "0.1.103"
+version = "0.1.104"
 edition = "2024"
 description = "VSCode-style TUI written in Rust"
 license = "MIT"
@@ -45,8 +45,16 @@ grep-matcher = "0.1"
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 thiserror = "2"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "io-util", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "io-util", "time", "process"] }
+tokio-util = { version = "0.7", features = ["compat"] }
 futures = "0.3"
+
+# LSP client stack. async-lsp 0.2.4 (Apr 2026) pins lsp-types ^0.95
+# because of gluon-lang/lsp-types#284, so we follow that pin. 0.95
+# already covers LSP 3.17. tower is needed for ServiceBuilder layers.
+async-lsp = { version = "0.2", features = ["client-monitor", "omni-trait", "stdio", "tracing", "tokio"] }
+lsp-types = "0.95"
+tower = "0.5"
 tui-input = "0.15"
 plist = "1.9"
 notify = "8.2"

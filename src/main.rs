@@ -6,6 +6,7 @@ mod highlight;
 mod icons;
 mod iterm2;
 mod iterm2_inline;
+mod lsp;
 mod pdf;
 mod remote;
 mod sheet;

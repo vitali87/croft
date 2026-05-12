@@ -1,0 +1,240 @@
+use std::ops::ControlFlow;
+use std::path::Path;
+use std::process::Stdio;
+
+use anyhow::{Context, Result, anyhow};
+use async_lsp::concurrency::ConcurrencyLayer;
+use async_lsp::panic::CatchUnwindLayer;
+use async_lsp::router::Router;
+use async_lsp::tracing::TracingLayer;
+use async_lsp::{LanguageServer, MainLoop, ServerSocket};
+use lsp_types::notification::{LogMessage, PublishDiagnostics, ShowMessage};
+use lsp_types::{
+    ClientCapabilities, InitializeParams, InitializedParams, ServerCapabilities, Url,
+    WorkspaceFolder,
+};
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::process::{Child, Command};
+use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
+use tower::ServiceBuilder;
+
+use crate::lsp::config::ServerConfig;
+
+struct ClientState {
+    name: String,
+}
+
+impl ClientState {
+    fn router(name: String) -> Router<Self> {
+        let mut router = Router::new(ClientState { name });
+        router
+            .notification::<PublishDiagnostics>(|this, params| {
+                eprintln!(
+                    "lsp[{}] diagnostics for {}: {} item(s)",
+                    this.name,
+                    params.uri,
+                    params.diagnostics.len()
+                );
+                ControlFlow::Continue(())
+            })
+            .notification::<ShowMessage>(|this, params| {
+                eprintln!("lsp[{}] {:?}: {}", this.name, params.typ, params.message);
+                ControlFlow::Continue(())
+            })
+            .notification::<LogMessage>(|this, params| {
+                eprintln!(
+                    "lsp[{}] log {:?}: {}",
+                    this.name, params.typ, params.message
+                );
+                ControlFlow::Continue(())
+            });
+        router
+    }
+}
+
+pub struct LspClient {
+    server: ServerSocket,
+    capabilities: ServerCapabilities,
+    name: String,
+    // Holds the process so kill_on_drop only fires when this client is
+    // dropped, not when spawn() returns. Without this the server is
+    // SIGKILLed mid-handshake and the mainloop reader sees EOF.
+    child: Child,
+}
+
+impl LspClient {
+    pub async fn spawn(
+        config: &ServerConfig,
+        workspace_root: &Path,
+        client_capabilities: ClientCapabilities,
+    ) -> Result<Self> {
+        let workspace_uri = Url::from_file_path(workspace_root).map_err(|_| {
+            anyhow!(
+                "workspace root must be absolute: {}",
+                workspace_root.display()
+            )
+        })?;
+        let workspace_name = workspace_root
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "root".to_string());
+
+        let mut child = Command::new(&config.command)
+            .args(&config.args)
+            .current_dir(workspace_root)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .with_context(|| format!("spawn lsp server `{}`", config.command))?;
+
+        let stdout = child
+            .stdout
+            .take()
+            .context("server stdout missing")?
+            .compat();
+        let stdin = child
+            .stdin
+            .take()
+            .context("server stdin missing")?
+            .compat_write();
+        let stderr = child.stderr.take().context("server stderr missing")?;
+
+        let name = config.name.to_string();
+        let router_name = name.clone();
+        let (mainloop, mut server) = MainLoop::new_client(move |_server_socket| {
+            ServiceBuilder::new()
+                .layer(TracingLayer::default())
+                .layer(CatchUnwindLayer::default())
+                .layer(ConcurrencyLayer::default())
+                .service(ClientState::router(router_name))
+        });
+
+        let stderr_name = name.clone();
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                eprintln!("lsp[{stderr_name}] stderr: {line}");
+            }
+        });
+
+        let mainloop_name = name.clone();
+        tokio::spawn(async move {
+            if let Err(e) = mainloop.run_buffered(stdout, stdin).await {
+                eprintln!("lsp[{mainloop_name}] mainloop exited: {e}");
+            }
+        });
+
+        let init = server
+            .initialize(InitializeParams {
+                process_id: Some(std::process::id()),
+                capabilities: client_capabilities,
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: workspace_uri,
+                    name: workspace_name,
+                }]),
+                ..InitializeParams::default()
+            })
+            .await
+            .context("lsp initialize")?;
+        server
+            .initialized(InitializedParams {})
+            .context("lsp initialized notification")?;
+
+        Ok(Self {
+            server,
+            capabilities: init.capabilities,
+            name,
+            child,
+        })
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn capabilities(&self) -> &ServerCapabilities {
+        &self.capabilities
+    }
+
+    pub fn server_mut(&mut self) -> &mut ServerSocket {
+        &mut self.server
+    }
+
+    pub async fn shutdown(mut self) -> Result<()> {
+        self.server.shutdown(()).await.context("lsp shutdown")?;
+        self.server.exit(()).context("lsp exit")?;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), self.child.wait()).await;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lsp::runtime::LspRuntime;
+    use std::process::Command as StdCommand;
+
+    fn server_on_path(cmd: &str) -> bool {
+        StdCommand::new(cmd)
+            .arg("--help")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    fn first_available_python_server() -> Option<ServerConfig> {
+        if server_on_path("basedpyright-langserver") {
+            Some(ServerConfig::basedpyright())
+        } else if server_on_path("pyright-langserver") {
+            Some(ServerConfig::pyright())
+        } else {
+            None
+        }
+    }
+
+    fn run_initialize_shutdown(config: ServerConfig) {
+        let rt = LspRuntime::new().expect("runtime");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().canonicalize().expect("canonicalize tempdir");
+        let expected_name = config.name;
+
+        let result: Result<()> = rt.handle().block_on(async move {
+            let client = LspClient::spawn(&config, &root, ClientCapabilities::default()).await?;
+            assert_eq!(client.name(), expected_name);
+            client.shutdown().await
+        });
+
+        result.expect("initialize+shutdown");
+    }
+
+    #[test]
+    fn initialize_and_shutdown_python_server() {
+        let Some(config) = first_available_python_server() else {
+            eprintln!("SKIPPED: no basedpyright/pyright on PATH");
+            return;
+        };
+        run_initialize_shutdown(config);
+    }
+
+    #[test]
+    fn initialize_and_shutdown_rust_analyzer() {
+        if !server_on_path("rust-analyzer") {
+            eprintln!("SKIPPED: rust-analyzer not on PATH");
+            return;
+        }
+        run_initialize_shutdown(ServerConfig::rust_analyzer());
+    }
+
+    #[test]
+    fn initialize_and_shutdown_ruff_server() {
+        if !server_on_path("ruff") {
+            eprintln!("SKIPPED: ruff not on PATH");
+            return;
+        }
+        run_initialize_shutdown(ServerConfig::ruff());
+    }
+}
