@@ -10,8 +10,11 @@ use async_lsp::tracing::TracingLayer;
 use async_lsp::{LanguageServer, MainLoop, ServerSocket};
 use lsp_types::notification::{LogMessage, PublishDiagnostics, ShowMessage};
 use lsp_types::{
-    ClientCapabilities, InitializeParams, InitializedParams, ServerCapabilities, Url,
-    WorkspaceFolder,
+    ClientCapabilities, CompletionParams, CompletionResponse, DidChangeTextDocumentParams,
+    DidCloseTextDocumentParams, DidOpenTextDocumentParams, InitializeParams, InitializedParams,
+    PartialResultParams, Position, ServerCapabilities, TextDocumentContentChangeEvent,
+    TextDocumentIdentifier, TextDocumentItem, TextDocumentPositionParams, Url,
+    VersionedTextDocumentIdentifier, WorkDoneProgressParams, WorkspaceFolder,
 };
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
@@ -160,6 +163,66 @@ impl LspClient {
 
     pub fn server_mut(&mut self) -> &mut ServerSocket {
         &mut self.server
+    }
+
+    pub fn did_open(
+        &mut self,
+        uri: Url,
+        language_id: &str,
+        version: i32,
+        text: String,
+    ) -> Result<()> {
+        self.server
+            .did_open(DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri,
+                    language_id: language_id.to_string(),
+                    version,
+                    text,
+                },
+            })
+            .context("did_open")
+    }
+
+    pub fn did_change_full(&mut self, uri: Url, version: i32, text: String) -> Result<()> {
+        self.server
+            .did_change(DidChangeTextDocumentParams {
+                text_document: VersionedTextDocumentIdentifier { uri, version },
+                content_changes: vec![TextDocumentContentChangeEvent {
+                    range: None,
+                    range_length: None,
+                    text,
+                }],
+            })
+            .context("did_change")
+    }
+
+    pub fn did_close(&mut self, uri: Url) -> Result<()> {
+        self.server
+            .did_close(DidCloseTextDocumentParams {
+                text_document: TextDocumentIdentifier { uri },
+            })
+            .context("did_close")
+    }
+
+    pub async fn completion(
+        &mut self,
+        uri: Url,
+        line: u32,
+        character: u32,
+    ) -> Result<Option<CompletionResponse>> {
+        self.server
+            .completion(CompletionParams {
+                text_document_position: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri },
+                    position: Position { line, character },
+                },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+                context: None,
+            })
+            .await
+            .context("completion")
     }
 
     pub async fn shutdown(mut self) -> Result<()> {

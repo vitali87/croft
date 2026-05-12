@@ -763,6 +763,22 @@ pub struct App {
     /// switches to a non-image tab, closes the image, or the editor area
     /// shrinks).
     editor_image_clear_requested: bool,
+    /// Optional LSP orchestrator. None when LspManager::new failed at
+    /// startup (e.g. the background tokio runtime couldn't spawn); the
+    /// rest of the editor stays fully functional without it.
+    pub lsp: Option<crate::lsp::LspManager>,
+    /// Per-path snapshot of the last edit_seq we forwarded to the LSP
+    /// manager. sync_lsp diffs every tick against the current tabs to
+    /// emit did_open / did_change / did_close.
+    lsp_last_seen: std::collections::HashMap<PathBuf, u64>,
+    /// Active completion popup, when a completion request has been issued
+    /// and the user hasn't dismissed the result. Populated by drain_lsp_completion
+    /// once the worker sends a CompletionResult back.
+    pub completion_popup: Option<crate::widgets::completion_popup::CompletionPopup>,
+    /// Most recent completion request id; later responses with a stale
+    /// id are dropped so a slow earlier response cannot clobber a fresh
+    /// one (e.g. user already moved past the original trigger).
+    completion_request_id: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1232,6 +1248,16 @@ impl App {
             editor_image_layout: None,
             editor_image_displayed: false,
             editor_image_clear_requested: false,
+            lsp: match crate::lsp::LspManager::new(root.clone()) {
+                Ok(m) => Some(m),
+                Err(e) => {
+                    eprintln!("lsp manager init failed: {e}");
+                    None
+                }
+            },
+            lsp_last_seen: std::collections::HashMap::new(),
+            completion_popup: None,
+            completion_request_id: None,
         })
     }
 
@@ -2030,6 +2056,163 @@ impl App {
             Err(std::sync::mpsc::TryRecvError::Empty) => false,
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 self.recent_commits_rx = None;
+                false
+            }
+        }
+    }
+
+    /// Per-tick LSP doc sync. Diffs every text-buffer tab's edit_seq
+    /// against `lsp_last_seen` and forwards did_open / did_change /
+    /// did_close to the LspManager. Building `lines.join("\n")` only
+    /// happens when a tab's edit_seq has actually moved, so the cost
+    /// scales with edits, not with frames.
+    pub fn sync_lsp(&mut self) {
+        if self.lsp.is_none() {
+            return;
+        }
+        let mut current: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+        let mut to_send: Vec<(bool, PathBuf, String, u64)> = Vec::new();
+        for tab in self.editor.iter_tabs() {
+            if tab.image.is_some() || tab.sheet.is_some() || tab.diff.is_some() {
+                continue;
+            }
+            let Some(path) = tab.path.as_ref() else {
+                continue;
+            };
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+            if crate::lsp::Language::from_extension(ext).is_none() {
+                continue;
+            }
+            current.insert(path.clone());
+            let seq = tab.edit_seq;
+            let prev = self.lsp_last_seen.get(path).copied();
+            match prev {
+                None => to_send.push((true, path.clone(), tab.lines.join("\n"), seq)),
+                Some(p) if p != seq => {
+                    to_send.push((false, path.clone(), tab.lines.join("\n"), seq))
+                }
+                _ => {}
+            }
+        }
+        let lsp = match self.lsp.as_ref() {
+            Some(l) => l,
+            None => return,
+        };
+        for (is_open, path, text, seq) in to_send {
+            if is_open {
+                lsp.open_doc(path.clone(), text);
+            } else {
+                lsp.change_doc(path.clone(), text);
+            }
+            self.lsp_last_seen.insert(path, seq);
+        }
+        let closed: Vec<PathBuf> = self
+            .lsp_last_seen
+            .keys()
+            .filter(|p| !current.contains(*p))
+            .cloned()
+            .collect();
+        for p in closed {
+            lsp.close_doc(p.clone());
+            self.lsp_last_seen.remove(&p);
+        }
+    }
+
+    /// Drain LSP completion responses. Drops responses with stale request
+    /// ids so a slow earlier reply cannot clobber a fresher popup. Returns
+    /// true when the popup state changed and the next frame should redraw.
+    pub fn drain_lsp_completion(&mut self) -> bool {
+        let Some(lsp) = self.lsp.as_ref() else {
+            return false;
+        };
+        let mut changed = false;
+        while let Some(result) = lsp.drain_completion() {
+            if Some(result.request_id) != self.completion_request_id {
+                continue;
+            }
+            if result.items.is_empty() {
+                if self.completion_popup.is_some() {
+                    self.completion_popup = None;
+                    changed = true;
+                }
+                continue;
+            }
+            let Some((cx, cy)) = self.editor.cursor_screen_pos() else {
+                continue;
+            };
+            self.completion_popup =
+                Some(crate::widgets::completion_popup::CompletionPopup::new(
+                    result.items,
+                    (cx, cy),
+                    result.path,
+                    result.request_id,
+                ));
+            changed = true;
+        }
+        changed
+    }
+
+    pub fn trigger_completion(&mut self) {
+        if self.editor.diff.is_some()
+            || self.editor.sheet.is_some()
+            || self.editor.image.is_some()
+        {
+            return;
+        }
+        let Some(path) = self.editor.path.clone() else {
+            return;
+        };
+        let line = self.editor.cursor_row as u32;
+        let character = self.editor.cursor_col as u32;
+        let Some(lsp) = self.lsp.as_mut() else {
+            return;
+        };
+        let id = lsp.request_completion(path, line, character);
+        self.completion_request_id = Some(id);
+    }
+
+    /// Route the key through the completion popup when one is open.
+    /// Returns true when the popup consumed the key (caller should stop
+    /// further dispatch); returns false when the popup was dismissed but
+    /// the key should still flow to the normal editor handler (e.g. a
+    /// printable character typed with the popup open).
+    fn handle_completion_popup_key(&mut self, key: KeyEvent) -> bool {
+        if self.completion_popup.is_none() {
+            return false;
+        }
+        match key.code {
+            KeyCode::Up => {
+                if let Some(p) = self.completion_popup.as_mut() {
+                    p.move_up();
+                }
+                true
+            }
+            KeyCode::Down => {
+                if let Some(p) = self.completion_popup.as_mut() {
+                    p.move_down();
+                }
+                true
+            }
+            KeyCode::Enter | KeyCode::Tab => {
+                let text = self
+                    .completion_popup
+                    .as_ref()
+                    .and_then(|p| p.insertion_text());
+                self.completion_popup = None;
+                self.completion_request_id = None;
+                if let Some(t) = text {
+                    self.editor.insert_str(&t);
+                }
+                true
+            }
+            KeyCode::Esc => {
+                self.completion_popup = None;
+                self.completion_request_id = None;
+                true
+            }
+            _ => {
+                self.completion_popup = None;
+                self.completion_request_id = None;
                 false
             }
         }
@@ -2936,6 +3119,18 @@ impl App {
             self.welcome_overlay_dirty = true;
             self.welcome_codeberg_badge_cell = None;
             self.update_editor_image_overlay(editor_area);
+            if self.focus == Pane::Editor && self.completion_popup.is_some() {
+                if let Some((cx, cy)) = self.editor.cursor_screen_pos() {
+                    if let Some(popup) = self.completion_popup.as_mut() {
+                        popup.anchor = (cx, cy);
+                    }
+                    let popup_ref = self.completion_popup.as_ref().unwrap();
+                    let area = popup_ref.area_for(editor_area);
+                    if area.width > 0 && area.height > 0 {
+                        frame.render_widget(popup_ref, area);
+                    }
+                }
+            }
         }
         if let Some(area) = terminal_area {
             let n = self.terminals.len().max(1);
@@ -4212,6 +4407,16 @@ impl App {
     }
 
     fn handle_editor_key(&mut self, key: KeyEvent) {
+        // Completion popup intercepts navigation / accept / dismiss keys
+        // before normal editor handling. Any other key dismisses the popup
+        // and falls through so the character lands in the buffer.
+        if self.handle_completion_popup_key(key) {
+            return;
+        }
+        if is_completion_trigger_key(key) {
+            self.trigger_completion();
+            return;
+        }
         if self.editor.diff.is_some() {
             self.handle_diff_key(key);
             return;
@@ -6919,6 +7124,16 @@ fn is_delete_node_key(key: KeyEvent) -> bool {
 /// Returns true if the given key event should trigger "Save".
 /// Recognises Ctrl+S (cross-platform) and Cmd/Super+S (macOS-style).
 /// Case-insensitive on the letter so Shift+Ctrl+S also works.
+fn is_completion_trigger_key(key: KeyEvent) -> bool {
+    let KeyCode::Char(c) = key.code else {
+        return false;
+    };
+    if c != ' ' {
+        return false;
+    }
+    key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::SUPER)
+}
+
 fn is_save_key(key: KeyEvent) -> bool {
     let KeyCode::Char(c) = key.code else {
         return false;
@@ -12676,6 +12891,8 @@ fn main_loop(
         let search_changed = app.drain_search_results();
         let remote_changed = app.refresh_remote_if_config_changed();
         let pulls_changed = app.drain_remote_pulls();
+        app.sync_lsp();
+        let lsp_changed = app.drain_lsp_completion();
 
         let non_pty_dirty = needs_redraw
             || fs_changed
@@ -12683,7 +12900,8 @@ fn main_loop(
             || commits_changed
             || search_changed
             || remote_changed
-            || pulls_changed;
+            || pulls_changed
+            || lsp_changed;
         let pty_eligible =
             pty_pending && last_pty_redraw.elapsed() >= pty_min_interval;
         let do_redraw = non_pty_dirty || pty_eligible;

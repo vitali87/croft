@@ -586,6 +586,11 @@ const UNDO_STACK_LIMIT: usize = 500;
 pub struct Editor {
     pub path: Option<PathBuf>,
     pub lines: Vec<String>,
+    /// Monotonic counter that bumps on every buffer mutation. The App's
+    /// per-tick sync_lsp diff reads this to know when to forward a
+    /// did_change to the LSP server, so building lines.join("\n") only
+    /// happens on actual changes, not every frame.
+    pub edit_seq: u64,
     pub scroll: usize,
     /// Horizontal scroll offset in CHARACTERS. Long lines (e.g. minified
     /// JS, base64 blobs in HTML) need to scroll right so search hits and
@@ -645,6 +650,7 @@ impl Editor {
         Self {
             path: None,
             lines: Vec::new(),
+            edit_seq: 0,
             scroll: 0,
             scroll_col: 0,
             cursor_row: 0,
@@ -673,6 +679,11 @@ impl Editor {
 
     pub fn set_search_highlight(&mut self, term: Option<String>) {
         self.search_highlight = term.filter(|s| !s.is_empty());
+    }
+
+    fn mark_buffer_changed(&mut self) {
+        self.dirty = true;
+        self.edit_seq = self.edit_seq.wrapping_add(1);
     }
 
     pub fn open(&mut self, path: &Path) -> Result<()> {
@@ -917,7 +928,7 @@ impl Editor {
         let byte = self.byte_index(row, col);
         self.lines[row].insert(byte, c);
         self.cursor_col += 1;
-        self.dirty = true;
+        self.mark_buffer_changed();
         self.recompute_highlights();
     }
 
@@ -946,7 +957,7 @@ impl Editor {
         let byte = self.byte_index(row, col);
         self.lines[row].insert(byte, c);
         self.cursor_col += 1;
-        self.dirty = true;
+        self.mark_buffer_changed();
     }
 
     fn insert_newline_raw(&mut self) {
@@ -960,7 +971,7 @@ impl Editor {
         self.lines.insert(row + 1, right);
         self.cursor_row += 1;
         self.cursor_col = 0;
-        self.dirty = true;
+        self.mark_buffer_changed();
     }
 
     pub fn insert_newline(&mut self) {
@@ -1028,13 +1039,13 @@ impl Editor {
             let to = self.byte_index(row, col + 1);
             self.lines[row].replace_range(from..to, "");
             self.cursor_col -= 1;
-            self.dirty = true;
+            self.mark_buffer_changed();
         } else if self.cursor_row > 0 {
             let cur = self.lines.remove(self.cursor_row);
             self.cursor_row -= 1;
             self.cursor_col = self.line_char_len(self.cursor_row);
             self.lines[self.cursor_row].push_str(&cur);
-            self.dirty = true;
+            self.mark_buffer_changed();
         }
         self.recompute_highlights();
     }
@@ -1052,11 +1063,11 @@ impl Editor {
             let from = self.byte_index(row, self.cursor_col);
             let to = self.byte_index(row, self.cursor_col + 1);
             self.lines[row].replace_range(from..to, "");
-            self.dirty = true;
+            self.mark_buffer_changed();
         } else if row + 1 < self.lines.len() {
             let next = self.lines.remove(row + 1);
             self.lines[row].push_str(&next);
-            self.dirty = true;
+            self.mark_buffer_changed();
         }
         self.recompute_highlights();
     }
@@ -1174,7 +1185,7 @@ impl Editor {
         self.cursor_row = sr;
         self.cursor_col = sc;
         self.selection = None;
-        self.dirty = true;
+        self.mark_buffer_changed();
         true
     }
 
@@ -1387,7 +1398,7 @@ impl Editor {
             sel.anchor.0 += block_len;
             sel.head.0 += block_len;
         }
-        self.dirty = true;
+        self.mark_buffer_changed();
         self.ensure_cursor_col_visible();
     }
 
@@ -1402,7 +1413,7 @@ impl Editor {
         for (i, line) in block.into_iter().enumerate() {
             self.lines.insert(start_row + i, line);
         }
-        self.dirty = true;
+        self.mark_buffer_changed();
         self.ensure_cursor_col_visible();
     }
 

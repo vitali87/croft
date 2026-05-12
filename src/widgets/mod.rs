@@ -1,3 +1,4 @@
+pub mod completion_popup;
 pub mod diff;
 pub mod editor;
 pub mod file_tree;

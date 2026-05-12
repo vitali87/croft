@@ -4,10 +4,12 @@
 
 pub mod client;
 pub mod config;
+pub mod manager;
 pub mod registry;
 pub mod runtime;
 
 pub use client::LspClient;
 pub use config::{Language, ServerConfig};
+pub use manager::{CompletionItem, CompletionResult, LspManager};
 pub use registry::ServerRegistry;
 pub use runtime::LspRuntime;
