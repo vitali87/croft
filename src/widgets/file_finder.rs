@@ -19,9 +19,19 @@ pub struct FileEntry {
     pub filename_start: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum MatchTier {
+    Subsequence = 1,
+    PathSubstring = 2,
+    FilenameSubstring = 3,
+    FilenamePrefix = 4,
+    ExactFilename = 5,
+}
+
 #[derive(Clone, Debug)]
 pub struct ScoredResult {
     pub entry: FileEntry,
+    pub tier: MatchTier,
     pub score: i32,
 }
 
@@ -105,11 +115,12 @@ impl FileFinder {
 
     fn refresh_results(&mut self) {
         let needle: String = self.query.trim().to_lowercase();
-        let mut scored: Vec<ScoredResult> = Vec::with_capacity(MAX_RESULTS);
         if needle.is_empty() {
+            let mut scored: Vec<ScoredResult> = Vec::with_capacity(MAX_RESULTS);
             for entry in self.entries.iter().take(MAX_RESULTS) {
                 scored.push(ScoredResult {
                     entry: entry.clone(),
+                    tier: MatchTier::Subsequence,
                     score: 0,
                 });
             }
@@ -117,29 +128,56 @@ impl FileFinder {
             self.results = scored;
             return;
         }
-        let mut top: Vec<(i32, usize)> = Vec::new();
+        let mut top: Vec<(MatchTier, i32, usize)> = Vec::new();
         for (idx, entry) in self.entries.iter().enumerate() {
-            if let Some(score) = fuzzy_score(&needle, &entry.rel_lower, entry.filename_start) {
-                top.push((score, idx));
+            if let Some((tier, score)) =
+                score_entry(&needle, &entry.rel_lower, entry.filename_start)
+            {
+                top.push((tier, score, idx));
             }
         }
+        let entries = &self.entries;
         top.sort_by(|a, b| {
-            b.0.cmp(&a.0).then_with(|| {
-                self.entries[a.1]
-                    .rel
-                    .len()
-                    .cmp(&self.entries[b.1].rel.len())
-            })
+            b.0.cmp(&a.0)
+                .then_with(|| entries[a.2].rel.len().cmp(&entries[b.2].rel.len()))
+                .then_with(|| b.1.cmp(&a.1))
+                .then_with(|| entries[a.2].rel.cmp(&entries[b.2].rel))
         });
         top.truncate(MAX_RESULTS);
         self.results = top
             .into_iter()
-            .map(|(score, idx)| ScoredResult {
+            .map(|(tier, score, idx)| ScoredResult {
                 entry: self.entries[idx].clone(),
+                tier,
                 score,
             })
             .collect();
     }
+}
+
+pub fn score_entry(
+    needle: &str,
+    hay_lower: &str,
+    filename_start: usize,
+) -> Option<(MatchTier, i32)> {
+    if needle.is_empty() {
+        return Some((MatchTier::Subsequence, 0));
+    }
+    let filename = &hay_lower[filename_start..];
+    if filename == needle {
+        return Some((MatchTier::ExactFilename, 10_000));
+    }
+    if filename.starts_with(needle) {
+        return Some((MatchTier::FilenamePrefix, 5_000));
+    }
+    if filename.contains(needle) {
+        return Some((MatchTier::FilenameSubstring, 2_500));
+    }
+    if hay_lower.contains(needle) {
+        return Some((MatchTier::PathSubstring, 1_000));
+    }
+    fuzzy_score(needle, hay_lower, filename_start)
+        .map(|s| (MatchTier::Subsequence, s))
 }
 
 pub fn fuzzy_score(needle: &str, hay_lower: &str, filename_start: usize) -> Option<i32> {
@@ -492,6 +530,67 @@ mod tests {
         assert!(names.contains(&"alpha.rs"));
         assert!(names.contains(&"sub/beta.rs"));
         assert!(!names.contains(&"ignored.txt"), "gitignored files must be excluded from the Cmd+P index");
+    }
+
+    #[test]
+    fn exact_filename_match_beats_every_substring_or_subsequence_match() {
+        let entries = Arc::new(vec![
+            entry("packages/anterior-dev-py/tests/test_citations_storage.py"),
+            entry("app/oncohealth/tasks/main/tests/test_configure_agent_v1.py"),
+            entry("packages/anterior-dev-py/src/anterior/dev/citations/storage.py"),
+        ]);
+        let mut finder = FileFinder::new(entries);
+        finder.set_query("storage.py");
+        let rels: Vec<&str> = finder.visible_results().iter().map(|r| r.entry.rel.as_str()).collect();
+        assert_eq!(
+            rels.first().copied(),
+            Some("packages/anterior-dev-py/src/anterior/dev/citations/storage.py"),
+            "exact filename match 'storage.py' MUST come before test_citations_storage.py (filename-substring) and test_configure_agent_v1.py (only a scattered subsequence) — got {rels:?}. Subsequence tier swamping exact match is the bug the user yelled about at 10:54 on 2026-05-13."
+        );
+    }
+
+    #[test]
+    fn filename_prefix_beats_filename_substring_which_beats_path_substring_which_beats_subsequence() {
+        let entries = Arc::new(vec![
+            entry("zzz_other/random_storage_thing.py"),
+            entry("dir_with_storage_in_name/other.py"),
+            entry("a/test_storage.py"),
+            entry("b/storage_helper.py"),
+        ]);
+        let mut finder = FileFinder::new(entries);
+        finder.set_query("storage");
+        let rels: Vec<&str> = finder.visible_results().iter().map(|r| r.entry.rel.as_str()).collect();
+        assert_eq!(
+            rels,
+            vec![
+                "b/storage_helper.py",
+                "a/test_storage.py",
+                "zzz_other/random_storage_thing.py",
+                "dir_with_storage_in_name/other.py",
+            ],
+            "tier order must be: filename starts-with > filename contains > path contains > scattered subsequence — got {rels:?}"
+        );
+    }
+
+    #[test]
+    fn within_the_same_tier_the_shorter_relative_path_wins() {
+        let entries = Arc::new(vec![
+            entry("a/very/deeply/nested/dir/structure/storage.py"),
+            entry("storage.py"),
+            entry("b/c/storage.py"),
+        ]);
+        let mut finder = FileFinder::new(entries);
+        finder.set_query("storage.py");
+        let rels: Vec<&str> = finder.visible_results().iter().map(|r| r.entry.rel.as_str()).collect();
+        assert_eq!(
+            rels,
+            vec![
+                "storage.py",
+                "b/c/storage.py",
+                "a/very/deeply/nested/dir/structure/storage.py",
+            ],
+            "all three are exact-filename matches; tie-break must be ascending rel.len() so the workspace-root storage.py wins — got {rels:?}"
+        );
     }
 
     #[test]
