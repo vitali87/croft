@@ -5923,6 +5923,7 @@ impl App {
         );
         if state.query.is_empty() {
             state.match_index = None;
+            self.editor.active_search_match = None;
             self.editor.set_search_highlight(None, opts);
             return;
         }
@@ -5985,6 +5986,7 @@ impl App {
     fn jump_editor_to_match(&mut self, m: crate::widgets::editor_find::MatchPos) {
         self.editor.cursor_row = m.row;
         self.editor.cursor_col = m.col_chars;
+        self.editor.active_search_match = Some((m.row, m.col_chars, m.len_chars));
         let viewport = self.editor.last_inner.height as usize;
         if viewport > 0 {
             if self.editor.cursor_row < self.editor.scroll {
@@ -12605,16 +12607,50 @@ mod tests {
     }
 
     #[test]
+    fn jumping_to_a_match_records_an_active_search_match_so_the_renderer_can_paint_it_orange() {
+        let mut app = editor_app_with_lines(&["alpha beta alpha"]);
+        app.editor.cursor_row = 0;
+        app.editor.cursor_col = 0;
+        app.handle_key(key(KeyCode::Char('f'), KeyModifiers::SUPER)).unwrap();
+        app.handle_key(key(KeyCode::Char('a'), KeyModifiers::NONE)).unwrap();
+        app.handle_key(key(KeyCode::Char('l'), KeyModifiers::NONE)).unwrap();
+        app.handle_key(key(KeyCode::Char('p'), KeyModifiers::NONE)).unwrap();
+        app.handle_key(key(KeyCode::Char('h'), KeyModifiers::NONE)).unwrap();
+        app.handle_key(key(KeyCode::Char('a'), KeyModifiers::NONE)).unwrap();
+        let first = app.editor.active_search_match;
+        assert_eq!(
+            first,
+            Some((0, 0, 5)),
+            "typing 'alpha' lands the cursor on the first match (col 0, len 5); active_search_match must record exactly that so the renderer can paint just those 5 cells orange while the other 'alpha' at col 11 keeps the regular yellow — got {first:?}"
+        );
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE)).unwrap();
+        let second = app.editor.active_search_match;
+        assert_eq!(
+            second,
+            Some((0, 11, 5)),
+            "Enter walks to the next match at col 11; the active marker must follow so the previously-orange match resets to yellow and the new cursor row gets the orange band"
+        );
+    }
+
+    #[test]
     fn esc_closes_the_editor_find_overlay_and_clears_the_highlight() {
         let mut app = editor_app_with_lines(&["alpha"]);
         app.handle_key(key(KeyCode::Char('f'), KeyModifiers::SUPER)).unwrap();
         app.handle_key(key(KeyCode::Char('a'), KeyModifiers::NONE)).unwrap();
         assert!(app.editor.search_highlight.is_some());
+        assert!(
+            app.editor.active_search_match.is_some(),
+            "typing should land the cursor on a match and arm the active-match marker"
+        );
         app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
         assert!(app.editor_find.is_none(), "Esc must close the find bar");
         assert!(
             app.editor.search_highlight.is_none(),
             "Esc must clear the editor's match highlight so leftover dim cells don't survive into normal typing"
+        );
+        assert!(
+            app.editor.active_search_match.is_none(),
+            "Esc must also clear the active-match marker so the orange band does not survive the overlay closing"
         );
     }
 

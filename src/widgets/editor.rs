@@ -633,6 +633,13 @@ pub struct Editor {
     /// so the editor's yellow highlight stays consistent with what the
     /// search panel claims is a match.
     pub search_highlight_opts: crate::widgets::search::SearchOpts,
+    /// When the inline editor Find overlay (Cmd+F) is open and the cursor
+    /// has landed on a match, this records (row, col_chars, len_chars) so
+    /// the renderer can paint the active match in a stronger orange while
+    /// every other match keeps the regular yellow. Mirrors VS Code's
+    /// "current match" highlight. Cleared when the find bar closes or when
+    /// the highlight term is cleared.
+    pub active_search_match: Option<(usize, usize, usize)>,
     /// Some when this tab is a read-only image preview rather than a text
     /// buffer. The text fields (`lines`, undo, highlights, …) are left in
     /// their default empty state and the renderer paints metadata only;
@@ -675,6 +682,7 @@ impl Editor {
             registry: LangRegistry::new(),
             search_highlight: None,
             search_highlight_opts: crate::widgets::search::SearchOpts::default(),
+            active_search_match: None,
             image: None,
             sheet: None,
             diff: None,
@@ -3972,6 +3980,10 @@ impl Widget for &mut Editor {
             buf.set_line(text_x, y, &line, text_width);
 
             if let Some(term) = self.search_highlight.as_deref() {
+                let active_on_line = self
+                    .active_search_match
+                    .filter(|(r, _, _)| *r == line_idx)
+                    .map(|(_, c, l)| (c, l));
                 paint_search_highlight(
                     buf,
                     text_x,
@@ -3981,6 +3993,7 @@ impl Widget for &mut Editor {
                     term,
                     self.search_highlight_opts,
                     self.scroll_col,
+                    active_on_line,
                 );
             }
 
@@ -4071,13 +4084,18 @@ fn paint_search_highlight(
     needle: &str,
     opts: crate::widgets::search::SearchOpts,
     scroll_col: usize,
+    active_match_on_line: Option<(usize, usize)>,
 ) {
     if needle.is_empty() {
         return;
     }
-    let style = Style::default()
+    let inactive_style = Style::default()
         .fg(Color::Black)
         .bg(Color::Rgb(0xff, 0xd7, 0x4a))
+        .add_modifier(Modifier::BOLD);
+    let active_style = Style::default()
+        .fg(Color::Black)
+        .bg(Color::Rgb(0xff, 0x8c, 0x2a))
         .add_modifier(Modifier::BOLD);
     let segments = crate::widgets::search::split_for_highlight(raw_line, needle, opts);
     // `abs_col` tracks the absolute character index in the original line.
@@ -4087,6 +4105,9 @@ fn paint_search_highlight(
     for (chunk, is_match) in segments {
         let chunk_cols = chunk.chars().count();
         if is_match {
+            let is_active = active_match_on_line
+                .is_some_and(|(c, l)| c == abs_col && l == chunk_cols);
+            let style = if is_active { active_style } else { inactive_style };
             for c in 0..chunk_cols {
                 let absolute = abs_col + c;
                 if absolute < scroll_col {
@@ -4192,11 +4213,15 @@ impl EditorTabs {
         opts: crate::widgets::search::SearchOpts,
     ) {
         let normalised = term.filter(|s| !s.is_empty());
+        let cleared = normalised.is_none();
         self.search_highlight_term = normalised.clone();
         self.search_highlight_opts = opts;
         for ed in &mut self.editors {
             ed.search_highlight = normalised.clone();
             ed.search_highlight_opts = opts;
+            if cleared {
+                ed.active_search_match = None;
+            }
         }
     }
 
