@@ -426,6 +426,59 @@ impl FileTree {
         self.nodes.get(self.selected).map(|n| n.path.as_path())
     }
 
+    /// Expand every ancestor directory of `target` (relative to `self.root`)
+    /// so the target row becomes visible in the flattened node list, then
+    /// select that row and scroll it into view. No-op when `target` does
+    /// not live under the workspace root or does not exist as a node after
+    /// the parent walk (e.g. the FS changed underneath the open file). Used
+    /// by the Cmd+P Quick Open finder so picking a file matches VS Code's
+    /// `explorer.autoReveal` behaviour — picking a deeply-nested file pops
+    /// open every parent and parks the cursor on the row.
+    pub fn reveal_path(&mut self, target: &Path) -> bool {
+        let Ok(rel) = target.strip_prefix(&self.root) else {
+            return false;
+        };
+        let mut current_path = self.root.clone();
+        for component in rel.components() {
+            current_path.push(component.as_os_str());
+            let is_last = current_path == target;
+            let Some(idx) = self.nodes.iter().position(|n| n.path == current_path) else {
+                return false;
+            };
+            if !is_last && self.nodes[idx].is_dir && !self.nodes[idx].expanded {
+                self.nodes[idx].expanded = true;
+                self.load_children(idx);
+            }
+        }
+        let Some(final_idx) = self.nodes.iter().position(|n| n.path == target) else {
+            return false;
+        };
+        self.selected = final_idx;
+        self.anchor = final_idx;
+        self.marked.clear();
+        self.make_selected_visible();
+        true
+    }
+
+    /// Scroll so the currently-selected row is in view. Caller invokes this
+    /// after `selected` is set programmatically (vs. via a keystroke that
+    /// already scrolls in `scroll_to`).
+    pub fn make_selected_visible(&mut self) {
+        let viewport = self.last_inner.height as usize;
+        if viewport == 0 {
+            return;
+        }
+        if self.selected < self.scroll {
+            self.scroll = self.selected;
+        } else if self.selected >= self.scroll + viewport {
+            self.scroll = self.selected + 1 - viewport;
+        }
+        let max_scroll = self.nodes.len().saturating_sub(viewport);
+        if self.scroll > max_scroll {
+            self.scroll = max_scroll;
+        }
+    }
+
     /// Locate the next visible node whose filename starts with `prefix`
     /// (ASCII case-insensitive). The search begins at `start` and wraps
     /// to 0 so a prefix that exists earlier in the list is still found

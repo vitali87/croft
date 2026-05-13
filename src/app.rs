@@ -5768,6 +5768,11 @@ impl App {
                     match self.editor.open_preview(&path) {
                         Ok(()) => {
                             self.sync_open_file_poll_mtime();
+                            // VS Code's `explorer.autoReveal` analogue:
+                            // expand every parent dir of the picked file
+                            // and park the cursor on its row so the user
+                            // sees where in the workspace the file lives.
+                            self.tree.reveal_path(&path);
                             self.focus_pane(Pane::Editor);
                             self.status = format!("Opened {}", path.display());
                         }
@@ -12271,6 +12276,48 @@ mod tests {
             !app.consume_file_finder_image_clear(),
             "the flag is one-shot — a second consume call must return false so the driver does not re-clear every frame"
         );
+    }
+
+    #[test]
+    fn picking_a_nested_file_via_cmd_p_expands_every_parent_dir_in_the_explorer_and_selects_the_row() {
+        let tmp = tempfile::tempdir().unwrap();
+        let nested_dir = tmp.path().join("packages").join("inner").join("citations");
+        std::fs::create_dir_all(&nested_dir).unwrap();
+        let target = nested_dir.join("storage.py");
+        std::fs::write(&target, "").unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.tree.last_inner.height = 20;
+        app.handle_key(key(KeyCode::Char('p'), KeyModifiers::SUPER)).unwrap();
+        app.handle_key(key(KeyCode::Char('s'), KeyModifiers::NONE)).unwrap();
+        app.handle_key(key(KeyCode::Char('t'), KeyModifiers::NONE)).unwrap();
+        app.handle_key(key(KeyCode::Char('o'), KeyModifiers::NONE)).unwrap();
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE)).unwrap();
+        let selected = app
+            .tree
+            .selected_path()
+            .map(|p| p.to_path_buf())
+            .expect("a row must be selected after Enter on the finder");
+        assert_eq!(
+            selected, target,
+            "the explorer cursor must land on the picked file, not stay on whichever row was selected before — got {selected:?}"
+        );
+        let visible_paths: Vec<String> = app
+            .tree
+            .nodes
+            .iter()
+            .map(|n| n.path.display().to_string())
+            .collect();
+        for expected_parent in [
+            tmp.path().join("packages"),
+            tmp.path().join("packages").join("inner"),
+            tmp.path().join("packages").join("inner").join("citations"),
+        ] {
+            let s = expected_parent.display().to_string();
+            assert!(
+                visible_paths.contains(&s),
+                "parent dir {s} must appear in the flattened node list — i.e. every ancestor of the picked file must be expanded so the row is reachable: got {visible_paths:?}"
+            );
+        }
     }
 
     #[test]
