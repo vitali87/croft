@@ -281,10 +281,21 @@ fn render_diff(
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| diff.right_path.display().to_string());
-    let header = format!(" diff: {left_name}  \u{2194}  {right_name} ");
+    let header = if diff.bytes_differ_but_lines_equal {
+        format!(
+            " diff: {left_name}  \u{2194}  {right_name}   \u{2022} whitespace-only change (trailing newline / CRLF / BOM) — no line-level diff "
+        )
+    } else {
+        format!(" diff: {left_name}  \u{2194}  {right_name} ")
+    };
+    let head_bg = if diff.bytes_differ_but_lines_equal {
+        Color::Rgb(0x8a, 0x4a, 0x10)
+    } else {
+        Color::Rgb(0x09, 0x4d, 0x77)
+    };
     let head_style = Style::default()
         .fg(Color::White)
-        .bg(Color::Rgb(0x09, 0x4d, 0x77))
+        .bg(head_bg)
         .add_modifier(Modifier::BOLD);
     for x in inner.x..inner.x + inner.width {
         buf[(x, inner.y)].set_style(head_style);
@@ -4490,11 +4501,13 @@ impl EditorTabs {
             .with_context(|| format!("reading {}", right.display()))?;
         let left_lines: Vec<String> = left_text.lines().map(str::to_string).collect();
         let right_lines: Vec<String> = right_text.lines().map(str::to_string).collect();
-        let mut data = crate::widgets::diff::DiffData::build(
+        let mut data = crate::widgets::diff::DiffData::build_with_byte_check(
             left_label,
             right.to_path_buf(),
             left_lines,
             right_lines,
+            Some(left_text),
+            Some(&right_text),
         );
         // Park the viewport on the first change hunk so the user lands on
         // the first edit instead of reading through unchanged leading

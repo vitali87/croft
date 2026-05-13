@@ -14,6 +14,13 @@ pub struct DiffData {
     /// user can pan horizontally past long lines. Same value applies to
     /// both columns so the side-by-side rows stay aligned.
     pub scroll_x: usize,
+    /// True when the raw byte contents differ but `build_diff_rows`
+    /// produced zero non-Equal rows — meaning the difference is invisible
+    /// at the line level (trailing newline, CRLF↔LF, BOM, or whitespace
+    /// the `.lines()` splitter normalises). Surfaces in the diff header
+    /// so the user understands why no red/green bands are painted even
+    /// though git reports the file as modified.
+    pub bytes_differ_but_lines_equal: bool,
 }
 
 /// One visual row in a side-by-side diff view. The left column shows
@@ -38,7 +45,30 @@ impl DiffData {
         left_lines: Vec<String>,
         right_lines: Vec<String>,
     ) -> Self {
+        Self::build_with_byte_check(left_path, right_path, left_lines, right_lines, None, None)
+    }
+
+    /// Like `build`, but also takes the raw byte contents so the
+    /// constructor can detect the "byte-different but line-identical"
+    /// case (trailing newline, CRLF, BOM, etc.) and set
+    /// `bytes_differ_but_lines_equal` accordingly. Pass `None` for the
+    /// raw texts when the caller doesn't have them (synthetic / test
+    /// diffs); the flag stays false and the renderer behaves as before.
+    pub fn build_with_byte_check(
+        left_path: PathBuf,
+        right_path: PathBuf,
+        left_lines: Vec<String>,
+        right_lines: Vec<String>,
+        left_raw: Option<&str>,
+        right_raw: Option<&str>,
+    ) -> Self {
         let rows = build_diff_rows(&left_lines, &right_lines);
+        let bytes_differ_but_lines_equal = match (left_raw, right_raw) {
+            (Some(l), Some(r)) => {
+                l != r && rows.iter().all(|r| matches!(r, DiffRow::Equal { .. }))
+            }
+            _ => false,
+        };
         Self {
             left_path,
             right_path,
@@ -47,6 +77,7 @@ impl DiffData {
             rows,
             scroll: 0,
             scroll_x: 0,
+            bytes_differ_but_lines_equal,
         }
     }
 
@@ -403,5 +434,67 @@ mod tests {
         assert_eq!(d.scroll, 0, "row 2 with 2-row context lands scroll at 0");
         d.scroll_to_row(7);
         assert_eq!(d.scroll, 5);
+    }
+
+    #[test]
+    fn build_with_byte_check_flags_trailing_newline_only_difference() {
+        // Same lines on both sides but the working copy lost its trailing
+        // newline. `.lines()` collapses the difference; the byte check
+        // catches it so the renderer can surface a banner.
+        let left_text = "alpha\nbeta\n";
+        let right_text = "alpha\nbeta";
+        let left_lines: Vec<String> = left_text.lines().map(str::to_string).collect();
+        let right_lines: Vec<String> = right_text.lines().map(str::to_string).collect();
+        let d = DiffData::build_with_byte_check(
+            PathBuf::from("/x"),
+            PathBuf::from("/x"),
+            left_lines,
+            right_lines,
+            Some(left_text),
+            Some(right_text),
+        );
+        assert!(
+            d.bytes_differ_but_lines_equal,
+            "trailing-newline difference must set bytes_differ_but_lines_equal so the diff header explains why no red/green band paints"
+        );
+        assert!(
+            d.rows.iter().all(|r| matches!(r, DiffRow::Equal { .. })),
+            "the line-level diff is still entirely Equal rows — the flag is what tells the user the file is byte-different"
+        );
+    }
+
+    #[test]
+    fn build_with_byte_check_leaves_flag_false_when_a_real_line_changes() {
+        let left_text = "alpha\nbeta\n";
+        let right_text = "alpha\nBETA\n";
+        let left_lines: Vec<String> = left_text.lines().map(str::to_string).collect();
+        let right_lines: Vec<String> = right_text.lines().map(str::to_string).collect();
+        let d = DiffData::build_with_byte_check(
+            PathBuf::from("/x"),
+            PathBuf::from("/x"),
+            left_lines,
+            right_lines,
+            Some(left_text),
+            Some(right_text),
+        );
+        assert!(
+            !d.bytes_differ_but_lines_equal,
+            "the flag must stay false when the diff has real Replaced rows — otherwise the header would lie that there's no line-level change"
+        );
+    }
+
+    #[test]
+    fn build_with_byte_check_leaves_flag_false_when_bytes_are_identical() {
+        let text = "alpha\nbeta\n";
+        let lines_vec: Vec<String> = text.lines().map(str::to_string).collect();
+        let d = DiffData::build_with_byte_check(
+            PathBuf::from("/x"),
+            PathBuf::from("/x"),
+            lines_vec.clone(),
+            lines_vec,
+            Some(text),
+            Some(text),
+        );
+        assert!(!d.bytes_differ_but_lines_equal);
     }
 }
