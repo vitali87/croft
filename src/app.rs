@@ -8451,6 +8451,7 @@ pub fn parse_dropped_paths(s: &str) -> Vec<PathBuf> {
     parsed_drop_tokens(s)
         .into_iter()
         .filter(|p| p.is_absolute() && p.exists())
+        .filter(|p| !is_iterm2_inline_image_drop(p))
         .collect()
 }
 
@@ -8462,7 +8463,46 @@ pub fn parse_foreign_dropped_paths(s: &str) -> Vec<PathBuf> {
     parsed_drop_tokens(s)
         .into_iter()
         .filter(|p| p.is_absolute())
+        .filter(|p| !is_iterm2_inline_image_drop(p))
         .collect()
+}
+
+/// True when the dropped path is iTerm2's temp file for an inline-image
+/// drag. iTerm2 lets the user drag any OSC-1337 inline image out of the
+/// terminal; on mouse-up it writes the image bytes to `$TMPDIR/iTerm2.<rand>.png`
+/// and re-injects the path into the same terminal as a bracketed paste.
+/// Croft renders the activity-bar icons, welcome wordmark, run-debug
+/// hero, no-repo hero, and SSH empty-state hero as OSC-1337 image cells,
+/// so a click-with-microdrag on any of those triggers iTerm2's drag-
+/// handler and croft would otherwise open the resulting PNG as an image
+/// preview tab or import it into the Explorer. Filtering these paths is
+/// always safe — the user has no legitimate reason to drop iTerm2's own
+/// temp image into croft, and matching by filename pattern is iTerm2-
+/// specific enough that it cannot collide with real user assets.
+fn is_iterm2_inline_image_drop(p: &Path) -> bool {
+    let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    if !name.starts_with("iTerm2.") || !name.ends_with(".png") {
+        return false;
+    }
+    let middle = &name["iTerm2.".len()..name.len() - ".png".len()];
+    if middle.is_empty() || !middle.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return false;
+    }
+    // Defence in depth: only treat it as an iTerm2 drag artefact when
+    // the file lives under a temp directory. macOS puts iTerm2's drag
+    // temp under `/var/folders/.../TemporaryItems/` or `$TMPDIR`; both
+    // resolve through `std::env::temp_dir()` ancestry. The starts_with
+    // chain is forgiving because the path may be a symlinked variant
+    // (e.g. `/private/var/...` vs `/var/...`).
+    let parent = p.parent().unwrap_or(p);
+    let parent_str = parent.to_string_lossy();
+    parent_str.contains("/T/")
+        || parent_str.contains("/TemporaryItems")
+        || parent_str.starts_with("/tmp")
+        || parent_str.starts_with("/var/folders")
+        || parent_str.starts_with("/private/var/folders")
 }
 
 fn parsed_drop_tokens(s: &str) -> Vec<PathBuf> {
@@ -13448,6 +13488,49 @@ mod tests {
         std::fs::write(&f, "hi").unwrap();
         let parsed = parse_dropped_paths(&format!("{}\n", f.display()));
         assert_eq!(parsed, vec![f]);
+    }
+
+    #[test]
+    fn parse_dropped_paths_drops_iterm2_inline_image_drag_artefact() {
+        // iTerm2 lets the user drag any OSC-1337 inline image (which is
+        // how croft paints activity-bar icons / welcome wordmark / SSH
+        // hero) out of the terminal. On mouse-up iTerm2 writes the bytes
+        // to $TMPDIR/iTerm2.<rand>.png and re-injects the path as a
+        // bracketed paste, which croft would otherwise see as "the user
+        // dragged a file into the editor" and open as an image preview.
+        // That has happened to the user accidentally when they tried to
+        // click a sidebar icon and the click drifted into a drag — the
+        // file `iTerm2.5AO7K5.png` opened as a tab showing the Explorer
+        // glyph. The drop must be silently filtered.
+        let tmp = tempfile::tempdir().unwrap();
+        let temp_dir = tmp.path().join("T").join("com.googlecode.iterm2");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let fake = temp_dir.join("iTerm2.5AO7K5.png");
+        std::fs::write(&fake, b"\x89PNG\r\n\x1a\n").unwrap();
+        let parsed = parse_dropped_paths(&format!("{}\n", fake.display()));
+        assert!(
+            parsed.is_empty(),
+            "iTerm2's inline-image drag temp file must be filtered out so a stray click-drag on an activity-bar icon does not open a phantom PNG tab — got {parsed:?}"
+        );
+    }
+
+    #[test]
+    fn parse_dropped_paths_keeps_user_pngs_that_happen_to_share_a_temp_dir() {
+        // The filter must key on the `iTerm2.<rand>.png` filename
+        // pattern, not just "anything under /tmp". A real user-authored
+        // PNG that happens to live under a temp directory must still be
+        // accepted, otherwise the heuristic over-fires.
+        let tmp = tempfile::tempdir().unwrap();
+        let temp_dir = tmp.path().join("T");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let user_png = temp_dir.join("my_screenshot.png");
+        std::fs::write(&user_png, b"\x89PNG\r\n\x1a\n").unwrap();
+        let parsed = parse_dropped_paths(&format!("{}\n", user_png.display()));
+        assert_eq!(
+            parsed,
+            vec![user_png.clone()],
+            "a user-named PNG under a temp dir must still be droppable — only the literal iTerm2.<rand>.png pattern is the artefact"
+        );
     }
 
     #[test]
