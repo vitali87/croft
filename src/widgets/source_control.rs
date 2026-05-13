@@ -795,11 +795,21 @@ impl Widget for &mut SourceControlPanel {
         input_block.render(input_box, buf);
         if input_inner.width > 0 && input_inner.height > 0 {
             let content_y = input_inner.y;
+            // 1-cell left padding inside the rounded border, and clamp the
+            // available text width to `input_inner.width - 2` so the
+            // string can never overflow past the right border into the
+            // editor pane. The previous `buf.set_string` call had no width
+            // cap and bled "r = push)" past the sidebar's right edge into
+            // the editor area on narrow sidebar widths, which the user
+            // reported as the placeholder visibly leaking out of the box.
+            let text_x = input_inner.x + 1;
+            let text_max = (input_inner.width as usize).saturating_sub(2);
             if self.message.is_empty() {
-                buf.set_string(
-                    input_inner.x + 1,
+                buf.set_stringn(
+                    text_x,
                     content_y,
                     "Message (Enter = commit, \u{2303}Enter = push)",
+                    text_max,
                     Style::default()
                         .fg(Color::Rgb(
                             INPUT_PROMPT_RGB.0,
@@ -809,10 +819,11 @@ impl Widget for &mut SourceControlPanel {
                         .add_modifier(Modifier::ITALIC),
                 );
             } else {
-                buf.set_string(
-                    input_inner.x + 1,
+                buf.set_stringn(
+                    text_x,
                     content_y,
                     self.message.as_str(),
+                    text_max,
                     Style::default().fg(Color::White),
                 );
             }
@@ -1165,6 +1176,55 @@ mod tests {
             !outer.contains("SOURCE CONTROL"),
             "outer border must not carry the title chip: {outer:?}"
         );
+    }
+
+    #[test]
+    fn placeholder_text_never_overflows_past_the_input_box_right_border() {
+        use ratatui::buffer::Buffer;
+        // Render the SC panel in a region that is *narrower* than the
+        // buffer, leaving an empty band to the right where leaks would
+        // show up. The placeholder is 41 chars; the input-box inner is
+        // only ~22 cells wide at a 28-col panel, so a missing width cap
+        // would write 'r = push)' into the empty band — exactly the
+        // 'leak past the right border into the editor pane' the user
+        // reported.
+        let mut p = SourceControlPanel::new();
+        p.set_status(dummy_status_with_branch("main"), Vec::new());
+        let panel_area = Rect { x: 0, y: 0, width: 28, height: 30 };
+        let buf_area = Rect { x: 0, y: 0, width: 80, height: 30 };
+        let mut buf = Buffer::empty(buf_area);
+        ratatui::widgets::Widget::render(&mut p, panel_area, &mut buf);
+        let placeholder_row = p.last_input_area.y + 1;
+        // Every cell past the panel's right edge must be blank — the
+        // panel area is 0..28, so columns 28..80 are the editor band.
+        for x in panel_area.right()..buf_area.right() {
+            let sym = buf[(x, placeholder_row)].symbol().to_string();
+            assert!(
+                sym == " " || sym.is_empty(),
+                "column {x} (past the SC panel's right edge at {}) carries content: {sym:?} — the placeholder string overflowed the input box and bled into the editor band, exactly the bug the user reported. Use set_stringn with a width cap.",
+                panel_area.right(),
+            );
+        }
+    }
+
+    #[test]
+    fn typed_message_text_never_overflows_past_the_input_box_right_border() {
+        use ratatui::buffer::Buffer;
+        let mut p = SourceControlPanel::new();
+        p.set_status(dummy_status_with_branch("main"), Vec::new());
+        p.message = "this is a very long commit message that should not overflow the input box at all".to_string();
+        let panel_area = Rect { x: 0, y: 0, width: 28, height: 30 };
+        let buf_area = Rect { x: 0, y: 0, width: 80, height: 30 };
+        let mut buf = Buffer::empty(buf_area);
+        ratatui::widgets::Widget::render(&mut p, panel_area, &mut buf);
+        let row = p.last_input_area.y + 1;
+        for x in panel_area.right()..buf_area.right() {
+            let sym = buf[(x, row)].symbol().to_string();
+            assert!(
+                sym == " " || sym.is_empty(),
+                "typed message overflowed past the SC panel's right edge at column {x}: {sym:?} — same root cause as the placeholder leak"
+            );
+        }
     }
 
     #[test]
