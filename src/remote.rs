@@ -815,6 +815,24 @@ fn run_remote_croft(
 }
 
 fn install_remote_croft(ssh: &SshControl, source_stamp: &str) -> Result<()> {
+    // Fast path: cross-compile a static musl binary on the local Mac and
+    // rsync it directly into the remote's ~/.cargo/bin. Skips the
+    // crates.io index update, the dependency walk, and the release-mode
+    // codegen+link of the croft crate on the remote. Falls back to the
+    // legacy source-rsync + `cargo install` path when the tooling isn't
+    // present (zig + cargo-zigbuild + the matching rust target), when
+    // we can't detect the remote arch, or when the build fails for any
+    // reason — the user sees a one-line note and the slower install
+    // continues so the connect succeeds.
+    match try_local_cross_install(ssh, source_stamp) {
+        Ok(true) => return Ok(()),
+        Ok(false) => {}
+        Err(e) => {
+            eprintln!(
+                "Local cross-build failed ({e}); falling back to remote `cargo install`"
+            );
+        }
+    }
     sync_local_source_to_remote(ssh)?;
     let status = ssh
         .command()
@@ -826,6 +844,140 @@ fn install_remote_croft(ssh: &SshControl, source_stamp: &str) -> Result<()> {
         anyhow::bail!("remote croft install failed with {status}");
     }
     Ok(())
+}
+
+fn cross_compile_available() -> bool {
+    Command::new("cargo")
+        .args(["zigbuild", "--version"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+fn remote_target_triple(ssh: &SshControl) -> Result<Option<&'static str>> {
+    let output = ssh
+        .command()
+        .arg(&ssh.host)
+        .arg("uname -m")
+        .output()
+        .context("probing remote architecture")?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let arch = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    Ok(arch_to_musl_triple(&arch))
+}
+
+pub fn arch_to_musl_triple(arch: &str) -> Option<&'static str> {
+    match arch {
+        "x86_64" | "amd64" => Some("x86_64-unknown-linux-musl"),
+        "aarch64" | "arm64" => Some("aarch64-unknown-linux-musl"),
+        _ => None,
+    }
+}
+
+fn rust_target_installed(triple: &str) -> bool {
+    let Ok(output) = Command::new("rustup").args(["target", "list", "--installed"]).output() else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .any(|line| line.trim() == triple)
+}
+
+fn try_local_cross_install(ssh: &SshControl, source_stamp: &str) -> Result<bool> {
+    if !cross_compile_available() {
+        return Ok(false);
+    }
+    let Some(triple) = remote_target_triple(ssh)? else {
+        return Ok(false);
+    };
+    if !rust_target_installed(triple) {
+        eprintln!(
+            "Local cross-build skipped: rustup target `{triple}` not installed (run `rustup target add {triple}` once to enable the fast path)"
+        );
+        return Ok(false);
+    }
+
+    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    println!("Cross-compiling croft locally for {triple}...");
+    let status = Command::new("cargo")
+        .args([
+            "zigbuild",
+            "--profile",
+            "remote-fast",
+            "--locked",
+            "--bin",
+            "croft",
+            "--target",
+            triple,
+        ])
+        .current_dir(&source)
+        .status()
+        .context("running cargo zigbuild")?;
+    if !status.success() {
+        anyhow::bail!("cargo zigbuild exited with {status}");
+    }
+
+    let binary = source
+        .join("target")
+        .join(triple)
+        .join("remote-fast")
+        .join("croft");
+    if !binary.exists() {
+        anyhow::bail!(
+            "cargo zigbuild reported success but {} is missing",
+            binary.display()
+        );
+    }
+
+    let mkdir = ssh
+        .command()
+        .arg(&ssh.host)
+        .arg("mkdir -p \"$HOME/.cargo/bin\" \"$HOME/.cache/croft\"")
+        .status()
+        .context("creating remote install dirs")?;
+    if !mkdir.success() {
+        anyhow::bail!("remote mkdir exited with {mkdir}");
+    }
+
+    let ssh_e = format!(
+        "ssh -S {} -o ControlMaster=no",
+        shell_quote_for_e_arg(&ssh.socket_path),
+    );
+    let dest = format!("{}:.cargo/bin/croft.new", ssh.host);
+    let rsync_status = Command::new("rsync")
+        .args(["-az", "--checksum", "-e"])
+        .arg(&ssh_e)
+        .arg(&binary)
+        .arg(&dest)
+        .status()
+        .context("rsyncing croft binary to remote")?;
+    if !rsync_status.success() {
+        anyhow::bail!("rsync exited with {rsync_status}");
+    }
+
+    // Atomic-swap the freshly-shipped binary into place. `mv` on the
+    // same filesystem is the standard way to avoid the race where a
+    // mid-flight process opens a half-written executable.
+    let activate = format!(
+        "chmod 755 \"$HOME/.cargo/bin/croft.new\" && mv \"$HOME/.cargo/bin/croft.new\" \"$HOME/.cargo/bin/croft\" && printf %s {} > \"$HOME/.cache/croft/install-stamp\"",
+        shell_quote(source_stamp)
+    );
+    let activate_status = ssh
+        .command()
+        .arg(&ssh.host)
+        .arg(activate)
+        .status()
+        .context("activating remote croft binary")?;
+    if !activate_status.success() {
+        anyhow::bail!("remote activation exited with {activate_status}");
+    }
+    println!("Installed croft on remote via local cross-build.");
+    Ok(true)
 }
 
 pub fn remote_croft_command(path: Option<&str>, env: &[(String, String)]) -> String {
@@ -1208,6 +1360,39 @@ Host !blocked *.internal
         assert!(command.contains("cargo install --path \"$HOME/.cache/croft/source\""));
         assert!(command.contains("rustup.rs"));
         assert!(command.contains("printf %s 'abc123' > \"$HOME/.cache/croft/install-stamp\""));
+    }
+
+    #[test]
+    fn arch_to_musl_triple_maps_every_arch_uname_reports_for_supported_targets() {
+        assert_eq!(
+            arch_to_musl_triple("x86_64"),
+            Some("x86_64-unknown-linux-musl")
+        );
+        assert_eq!(
+            arch_to_musl_triple("amd64"),
+            Some("x86_64-unknown-linux-musl"),
+            "BSD-style `uname -m` reports amd64 for the same machine class linux reports as x86_64; the fast-install path must accept both"
+        );
+        assert_eq!(
+            arch_to_musl_triple("aarch64"),
+            Some("aarch64-unknown-linux-musl")
+        );
+        assert_eq!(
+            arch_to_musl_triple("arm64"),
+            Some("aarch64-unknown-linux-musl"),
+            "Apple Silicon Linux VMs report arm64; same triple as aarch64"
+        );
+    }
+
+    #[test]
+    fn arch_to_musl_triple_returns_none_for_unsupported_archs_so_caller_falls_back() {
+        for arch in ["i686", "armv7l", "ppc64le", "riscv64", "mips", ""] {
+            assert_eq!(
+                arch_to_musl_triple(arch),
+                None,
+                "{arch} has no statically-known musl target in croft's bundled toolchain; caller must fall back to remote cargo install"
+            );
+        }
     }
 
     #[test]

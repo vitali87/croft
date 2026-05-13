@@ -27,6 +27,10 @@ pub struct RemotePanel {
     pub empty_secondary_btn: Rect,
     /// Empty-state `? Learn more about SSH` link hit rect.
     pub empty_learn_link: Rect,
+    /// Cell where the SSH-empty-state PNG should be emitted via OSC-1337,
+    /// sized to (SSH_EMPTY_STATE_CELLS_W, SSH_EMPTY_STATE_CELLS_H). None
+    /// when the panel isn't in empty-state or doesn't fit the image.
+    pub last_image_cell: Option<(u16, u16)>,
     ssh_config_state: SshConfigState,
 }
 
@@ -47,6 +51,7 @@ impl RemotePanel {
             empty_primary_btn: Rect::default(),
             empty_secondary_btn: Rect::default(),
             empty_learn_link: Rect::default(),
+            last_image_cell: None,
             ssh_config_state,
         }
     }
@@ -149,10 +154,21 @@ impl Default for RemotePanel {
     }
 }
 
-const CARD_BORDER: Color = Color::Rgb(0x33, 0xb0, 0xc8);
-const CARD_BG: Color = Color::Rgb(0x12, 0x1a, 0x24);
-const PRIMARY_BG: Color = Color::Rgb(0x16, 0x9b, 0xba);
-const LINK_FG: Color = Color::Rgb(0x4e, 0xc6, 0xff);
+/// Teal/cyan accent color sampled from the `v0.1.122` version chip in the
+/// croft mockup — the same color is used for the empty-state card border,
+/// the secondary button outline, the illustration line art, and the
+/// learn-more link. NOT the same as the blue used in `REMOTE EXPLORER`'s
+/// title chip; the two palettes coexist by design.
+const CARD_BORDER: Color = Color::Rgb(0x3e, 0xd8, 0xc4);
+const PRIMARY_BG: Color = Color::Rgb(0x0e, 0x7e, 0x76);
+const LINK_FG: Color = Color::Rgb(0x3e, 0xd8, 0xc4);
+const BODY_FG: Color = Color::Rgb(0xb4, 0xbe, 0xc8);
+
+/// Cell dimensions used to bake the SSH empty-state PNG via OSC-1337.
+/// Public so `app.rs` can size the canvas at startup to match the cells
+/// the renderer reserves.
+pub const SSH_EMPTY_STATE_CELLS_W: u16 = 18;
+pub const SSH_EMPTY_STATE_CELLS_H: u16 = 8;
 
 fn render_section_header(panel: &mut RemotePanel, buf: &mut Buffer, inner: Rect) {
     let header_style = Style::default()
@@ -184,13 +200,14 @@ fn render_section_header(panel: &mut RemotePanel, buf: &mut Buffer, inner: Rect)
 }
 
 fn render_empty_state(panel: &mut RemotePanel, buf: &mut Buffer, area: Rect) {
-    if area.height < 12 || area.width < 22 {
+    panel.last_image_cell = None;
+    if area.height < 14 || area.width < 22 {
         return;
     }
-    let card_width = area.width.min(34);
-    let card_x = area.x + (area.width.saturating_sub(card_width)) / 2;
+    let card_width = area.width;
+    let card_x = area.x;
     let card_y = area.y;
-    let card_height = area.height.min(24);
+    let card_height = area.height;
     let card_rect = Rect {
         x: card_x,
         y: card_y,
@@ -200,120 +217,199 @@ fn render_empty_state(panel: &mut RemotePanel, buf: &mut Buffer, area: Rect) {
     let card_block = Block::default()
         .borders(Borders::ALL)
         .border_type(ratatui::widgets::BorderType::Rounded)
-        .border_style(Style::default().fg(CARD_BORDER))
-        .style(Style::default().bg(CARD_BG));
+        .border_style(Style::default().fg(CARD_BORDER));
     let card_inner = card_block.inner(card_rect);
     card_block.render(card_rect, buf);
 
-    let mut y = card_inner.y;
-    let illustration = [
-        "  +                    ",
-        "  ╭───────╮            ",
-        "  │── ── ●│            ",
-        "  ╰───────╯  ╭────╮    ",
-        "  ╭───────╮──┤ >_ │    ",
-        "  │── ── ●│  ╰────╯    ",
-        "  ╰───────╯       +    ",
-    ];
-    let illus_w = illustration[0].chars().count() as u16;
-    let illus_x = card_inner.x + (card_inner.width.saturating_sub(illus_w)) / 2;
-    let illus_fg = Style::default().fg(CARD_BORDER).bg(CARD_BG);
-    for line in illustration.iter() {
-        if y >= card_inner.y + card_inner.height {
-            break;
+    let content_x = card_inner.x;
+    let content_w = card_inner.width;
+    let content_end_y = card_inner.y + card_inner.height;
+    let mut y = card_inner.y.saturating_add(1);
+
+    // Reserve cells for the OSC-1337 illustration. Cells are blanked
+    // with default style (no explicit bg) so the host terminal's session
+    // bg shows through the illustration's transparent letterbox — the
+    // user explicitly does NOT want a dark rectangle behind the PNG.
+    let img_w = SSH_EMPTY_STATE_CELLS_W.min(content_w);
+    let img_h = SSH_EMPTY_STATE_CELLS_H.min(content_end_y.saturating_sub(y));
+    if img_w > 0 && img_h > 0 {
+        let img_x = content_x + (content_w.saturating_sub(img_w)) / 2;
+        for dy in 0..img_h {
+            for dx in 0..img_w {
+                let cell = &mut buf[(img_x + dx, y + dy)];
+                cell.set_char(' ');
+                cell.set_style(Style::default());
+            }
         }
-        buf.set_string(illus_x, y, *line, illus_fg);
-        y += 1;
+        panel.last_image_cell = Some((img_x, y));
+        y += img_h;
     }
     y = y.saturating_add(1);
 
     let title = "No SSH hosts yet";
     let title_w = title.chars().count() as u16;
-    if y < card_inner.y + card_inner.height {
-        let tx = card_inner.x + (card_inner.width.saturating_sub(title_w)) / 2;
+    if y < content_end_y {
+        let tx = content_x + (content_w.saturating_sub(title_w)) / 2;
         buf.set_string(
             tx,
             y,
             title,
             Style::default()
                 .fg(Color::White)
-                .bg(CARD_BG)
                 .add_modifier(Modifier::BOLD),
         );
         y += 2;
     }
 
-    let body = [
-        "Add SSH host entries to securely",
-        "connect to your remote servers",
-        "and start exploring.",
-    ];
-    let body_fg = Style::default().fg(Color::Rgb(0x9d, 0xa5, 0xb4)).bg(CARD_BG);
-    for line in body.iter() {
-        if y >= card_inner.y + card_inner.height {
+    let body_lines = wrap_body(content_w as usize);
+    let body_fg = Style::default().fg(BODY_FG);
+    for line in body_lines.iter() {
+        if y >= content_end_y {
             break;
         }
         let w = line.chars().count() as u16;
-        let lx = card_inner.x + (card_inner.width.saturating_sub(w)) / 2;
-        buf.set_string(lx, y, *line, body_fg);
+        let lx = content_x + (content_w.saturating_sub(w)) / 2;
+        buf.set_string(lx, y, line, body_fg);
         y += 1;
     }
     y = y.saturating_add(1);
 
-    let btn_width = card_inner.width.saturating_sub(4).min(28);
-    let btn_x = card_inner.x + (card_inner.width.saturating_sub(btn_width)) / 2;
-    if y + 1 < card_inner.y + card_inner.height {
-        let label = "  +  Add New Host";
-        let pad = (btn_width as usize).saturating_sub(label.chars().count());
-        let padded = format!("{label}{}", " ".repeat(pad));
-        buf.set_string(
-            btn_x,
-            y,
-            &padded,
-            Style::default()
-                .fg(Color::White)
-                .bg(PRIMARY_BG)
-                .add_modifier(Modifier::BOLD),
-        );
-        panel.empty_primary_btn = Rect { x: btn_x, y, width: btn_width, height: 1 };
-        y += 2;
+    let btn_width = content_w.saturating_sub(2).min(28);
+    let btn_x = content_x + (content_w.saturating_sub(btn_width)) / 2;
+
+    if y + 3 <= content_end_y {
+        panel.empty_primary_btn =
+            render_filled_button(buf, btn_x, y, btn_width, "+  Add New Host", PRIMARY_BG);
+        y += 4;
     }
 
-    if y < card_inner.y + card_inner.height {
-        let label = "   Open SSH Config";
-        let pad = (btn_width as usize).saturating_sub(label.chars().count());
-        let padded = format!("{label}{}", " ".repeat(pad));
-        buf.set_string(
-            btn_x,
-            y,
-            &padded,
-            Style::default()
-                .fg(CARD_BORDER)
-                .bg(CARD_BG)
-                .add_modifier(Modifier::BOLD),
-        );
-        for dx in 0..btn_width {
-            let bx = btn_x + dx;
-            if dx == 0 || dx + 1 == btn_width {
-                buf[(bx, y)].set_char('│').set_style(Style::default().fg(CARD_BORDER).bg(CARD_BG));
-            }
+    if y + 3 <= content_end_y {
+        panel.empty_secondary_btn =
+            render_outlined_button(buf, btn_x, y, btn_width, "Open SSH Config");
+        y += 4;
+    }
+
+    if y < content_end_y {
+        let full_link = "?  Learn more about SSH  ↗";
+        let short_link = "? Learn more ↗";
+        let link = if content_w >= full_link.chars().count() as u16 {
+            full_link
+        } else if content_w >= short_link.chars().count() as u16 {
+            short_link
+        } else {
+            ""
+        };
+        if !link.is_empty() {
+            let w = link.chars().count() as u16;
+            let lx = content_x + (content_w.saturating_sub(w)) / 2;
+            buf.set_string(
+                lx,
+                y,
+                link,
+                Style::default().fg(LINK_FG).add_modifier(Modifier::UNDERLINED),
+            );
+            panel.empty_learn_link = Rect { x: lx, y, width: w, height: 1 };
         }
-        panel.empty_secondary_btn = Rect { x: btn_x, y, width: btn_width, height: 1 };
-        y += 2;
     }
+}
 
-    if y < card_inner.y + card_inner.height {
-        let link = "?  Learn more about SSH  ↗";
-        let w = link.chars().count() as u16;
-        let lx = card_inner.x + (card_inner.width.saturating_sub(w)) / 2;
-        buf.set_string(
-            lx,
-            y,
-            link,
-            Style::default().fg(LINK_FG).bg(CARD_BG).add_modifier(Modifier::UNDERLINED),
-        );
-        panel.empty_learn_link = Rect { x: lx, y, width: w, height: 1 };
+const BODY_TEXT: &str =
+    "Add SSH host entries to securely connect to your remote servers and start exploring.";
+
+fn wrap_body(max_width: usize) -> Vec<String> {
+    if max_width == 0 {
+        return Vec::new();
     }
+    let mut out: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for word in BODY_TEXT.split_whitespace() {
+        let extra = if current.is_empty() {
+            word.chars().count()
+        } else {
+            word.chars().count() + 1
+        };
+        if current.chars().count() + extra > max_width && !current.is_empty() {
+            out.push(std::mem::take(&mut current));
+        }
+        if !current.is_empty() {
+            current.push(' ');
+        }
+        current.push_str(word);
+    }
+    if !current.is_empty() {
+        out.push(current);
+    }
+    out
+}
+
+/// Render a 3-row filled rounded button at (x, y), width cells wide, with
+/// `label` centred on the middle row. Returns the clickable rect covering
+/// all three rows so the caller can hit-test the full button area.
+fn render_filled_button(
+    buf: &mut Buffer,
+    x: u16,
+    y: u16,
+    width: u16,
+    label: &str,
+    fill: Color,
+) -> Rect {
+    let fill_style = Style::default().bg(fill);
+    let label_style = Style::default()
+        .fg(Color::White)
+        .bg(fill)
+        .add_modifier(Modifier::BOLD);
+    for dx in 0..width {
+        for dy in 0..3 {
+            let cell = &mut buf[(x + dx, y + dy)];
+            cell.set_char(' ');
+            cell.set_style(fill_style);
+        }
+    }
+    // Rounded corners painted over the fill so the button reads as a pill.
+    let right = x + width.saturating_sub(1);
+    buf[(x, y)].set_char('╭');
+    buf[(right, y)].set_char('╮');
+    buf[(x, y + 2)].set_char('╰');
+    buf[(right, y + 2)].set_char('╯');
+    let lbl_w = label.chars().count() as u16;
+    let lbl_x = x + (width.saturating_sub(lbl_w)) / 2;
+    buf.set_string(lbl_x, y + 1, label, label_style);
+    Rect { x, y, width, height: 3 }
+}
+
+/// Render a 3-row outlined rounded button (transparent fill, teal border)
+/// with `label` centred on the middle row. The interior cells are blanked
+/// with default style so the host terminal's session bg shows through —
+/// no explicit bg color is set anywhere.
+fn render_outlined_button(buf: &mut Buffer, x: u16, y: u16, width: u16, label: &str) -> Rect {
+    for dx in 0..width {
+        for dy in 0..3 {
+            let cell = &mut buf[(x + dx, y + dy)];
+            cell.set_char(' ');
+            cell.set_style(Style::default());
+        }
+    }
+    let right = x + width.saturating_sub(1);
+    let border_style = Style::default().fg(CARD_BORDER);
+    buf[(x, y)].set_char('╭').set_style(border_style);
+    for dx in 1..width.saturating_sub(1) {
+        buf[(x + dx, y)].set_char('─').set_style(border_style);
+    }
+    buf[(right, y)].set_char('╮').set_style(border_style);
+    buf[(x, y + 1)].set_char('│').set_style(border_style);
+    buf[(right, y + 1)].set_char('│').set_style(border_style);
+    buf[(x, y + 2)].set_char('╰').set_style(border_style);
+    for dx in 1..width.saturating_sub(1) {
+        buf[(x + dx, y + 2)].set_char('─').set_style(border_style);
+    }
+    buf[(right, y + 2)].set_char('╯').set_style(border_style);
+    let label_style = Style::default()
+        .fg(CARD_BORDER)
+        .add_modifier(Modifier::BOLD);
+    let lbl_w = label.chars().count() as u16;
+    let lbl_x = x + (width.saturating_sub(lbl_w)) / 2;
+    buf.set_string(lbl_x, y + 1, label, label_style);
+    Rect { x, y, width, height: 3 }
 }
 
 impl Widget for &mut RemotePanel {
@@ -489,6 +585,65 @@ mod tests {
         );
         assert_eq!(p.empty_secondary_btn, Rect::default());
         assert_eq!(p.empty_learn_link, Rect::default());
+    }
+
+    #[test]
+    fn empty_state_body_text_never_overflows_card_width_at_real_sidebar_sizes() {
+        for sidebar_w in 24u16..=44 {
+            let mut p = empty_panel();
+            let area = Rect { x: 0, y: 0, width: sidebar_w, height: 40 };
+            let mut buf = Buffer::empty(area);
+            (&mut p).render(area, &mut buf);
+            for y in area.top()..area.bottom() {
+                let mut row = String::new();
+                for x in area.left()..area.right() {
+                    row.push_str(buf[(x, y)].symbol());
+                }
+                let chars: Vec<char> = row.chars().collect();
+                let cw = sidebar_w as usize;
+                if chars.len() < cw {
+                    continue;
+                }
+                let last = chars[cw - 1];
+                let last_non_space = chars.iter().rposition(|c| !c.is_whitespace());
+                if let Some(pos) = last_non_space {
+                    let is_border = matches!(
+                        last,
+                        '╮' | '╯' | '│' | '─' | '┌' | '┐' | '└' | '┘'
+                    );
+                    assert!(
+                        pos < cw - 1 || is_border,
+                        "body text overflows the sidebar at width {sidebar_w}: row='{row}', last non-space '{last}' at col {pos} >= card right edge {}",
+                        cw - 1
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn empty_state_buttons_are_three_rows_tall_for_a_proper_click_target() {
+        let mut p = empty_panel();
+        let area = Rect { x: 0, y: 0, width: 40, height: 40 };
+        let mut buf = Buffer::empty(area);
+        (&mut p).render(area, &mut buf);
+        assert_eq!(
+            p.empty_primary_btn.height, 3,
+            "primary button must be 3 rows tall so the rounded corners fit and the click target is comfortable"
+        );
+        assert_eq!(p.empty_secondary_btn.height, 3);
+    }
+
+    #[test]
+    fn empty_state_reserves_a_cell_for_the_osc_1337_illustration() {
+        let mut p = empty_panel();
+        let area = Rect { x: 0, y: 0, width: 40, height: 40 };
+        let mut buf = Buffer::empty(area);
+        (&mut p).render(area, &mut buf);
+        assert!(
+            p.last_image_cell.is_some(),
+            "render_empty_state must publish the cell where the SSH PNG should be emitted via OSC-1337; without this the post-draw flush has nowhere to land the image and the empty state shows a blank box"
+        );
     }
 
     #[test]

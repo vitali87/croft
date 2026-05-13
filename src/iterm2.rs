@@ -61,6 +61,23 @@ const CMD_SHIFT_G_KEY: &str = "0x47-0x120000-0x5";
 const CMD_SHIFT_G_HEX: &str = "0x1b 0x5b 0x37 0x31 0x3b 0x31 0x30 0x75";
 const CMD_SHIFT_O_KEY: &str = "0x4f-0x120000-0x1f";
 const CMD_SHIFT_O_HEX: &str = "0x1b 0x5b 0x37 0x39 0x3b 0x31 0x30 0x75";
+/// `Cmd+P`: VS Code-style Quick Open file finder. macOS binds Cmd+P to the
+/// standard File > Print menu item across virtually every app (iTerm2
+/// included), so AppKit catches the chord at the menu layer before
+/// iTerm2's `GlobalKeyMap` is consulted. The NSUserKeyEquivalents
+/// override below repoints File > Print at Cmd+Opt+P so this
+/// GlobalKeyMap forwarder can fire.
+/// Encoding: 'p' (codepoint 0x70 = 112) with Cmd, virtualKeyCode
+/// `kVK_ANSI_P` = 0x23.
+const CMD_P_KEY: &str = "0x70-0x100000-0x23";
+/// CSI-u `ESC [ 112 ; 9 u` (= 0x1b 0x5b '1' '1' '2' ';' '9' 'u') so
+/// crossterm decodes it back to `KeyEvent { code: Char('p'), modifiers: SUPER }`.
+const CMD_P_HEX: &str = "0x1b 0x5b 0x31 0x31 0x32 0x3b 0x39 0x75";
+/// Menu-item title macOS / iTerm2 expose for File > Print.
+const PRINT_MENU_KEY: &str = "Print";
+/// Cmd+Opt+P. Unbound by default in iTerm2; gives the user a path back to
+/// the Print dialog when they need it without sacrificing the file finder.
+const PRINT_MENU_EQUIV: &str = "@~p";
 /// Cmd+0..Cmd+9 forward as CSI-u so the editor's vim chord can use them
 /// as count digits (e.g. `Cmd+5 Cmd+g g` jumps to line 5). Without these,
 /// iTerm2 catches Cmd+digit for its own "Select Tab N" action and croft
@@ -210,6 +227,12 @@ pub fn apply_croft_key_settings(plist: &mut Value) -> Result<(), ITerm2Error> {
     set_string(menu, "Find Next", "@~g".to_string());
     set_string(menu, "Find Previous", "@~G".to_string());
     set_string(menu, "Jump to Selection", "@~y".to_string());
+    // Relocate File > Print off Cmd+P so croft's Quick Open finder can
+    // receive the chord. Without this AppKit's app-level Print menu
+    // binding opens the macOS Print dialog before iTerm2's GlobalKeyMap
+    // is consulted. Cmd+Opt+P keeps Print reachable on a chord croft
+    // does not use.
+    set_string(menu, PRINT_MENU_KEY, PRINT_MENU_EQUIV.to_string());
     // iTerm2's Window menu binds Cmd+1..Cmd+9 to Select Tab. Move each
     // to Cmd+Opt+digit so croft can capture Cmd+digit as a vim count.
     for (i, label) in [
@@ -263,6 +286,7 @@ pub fn apply_croft_key_settings(plist: &mut Value) -> Result<(), ITerm2Error> {
         (CMD_G_KEY, CMD_G_HEX),
         (CMD_Y_KEY, CMD_Y_HEX),
         (CMD_O_KEY, CMD_O_HEX),
+        (CMD_P_KEY, CMD_P_HEX),
         (CMD_SHIFT_G_KEY, CMD_SHIFT_G_HEX),
         (CMD_SHIFT_O_KEY, CMD_SHIFT_O_HEX),
     ] {
@@ -622,6 +646,32 @@ mod tests {
                 "GlobalKeyMap missing CSI-u forwarder for Cmd+digit {key}; without it, iTerm2 catches Cmd+digit for Select Tab N and the editor's vim count chord cannot start with a leading digit"
             );
         }
+    }
+
+    #[test]
+    fn apply_croft_key_settings_forwards_cmd_p_as_csi_u_so_iterm_print_menu_does_not_eat_quick_open() {
+        let mut plist = synth_plist("GUID-1", &["GUID-1"]);
+        apply_croft_key_settings(&mut plist).unwrap();
+        let top = plist.as_dictionary().unwrap();
+        let global = dict_in(top, "GlobalKeyMap");
+        assert_eq!(
+            action_text(global, CMD_P_KEY),
+            CMD_P_HEX,
+            "GlobalKeyMap must forward Cmd+P as a CSI-u sequence so croft's Quick Open file finder fires. Without it, AppKit's app-level File > Print binding opens the macOS Print dialog before iTerm2 forwards anything to the TUI — exactly what the user reported on 2026-05-13."
+        );
+    }
+
+    #[test]
+    fn apply_croft_key_settings_relocates_print_menu_off_cmd_p_so_appkit_does_not_steal_quick_open() {
+        let mut plist = synth_plist("GUID-1", &["GUID-1"]);
+        apply_croft_key_settings(&mut plist).unwrap();
+        let top = plist.as_dictionary().unwrap();
+        let menu = dict_in(top, "NSUserKeyEquivalents");
+        assert_eq!(
+            menu.get(PRINT_MENU_KEY).and_then(|v| v.as_string()),
+            Some(PRINT_MENU_EQUIV),
+            "NSUserKeyEquivalents must repoint File > Print at Cmd+Opt+P; otherwise AppKit's app-level Print binding catches Cmd+P at the menu layer and the macOS Print dialog opens instead of croft's Quick Open finder. Cmd+Opt+P keeps Print reachable on a chord croft does not use."
+        );
     }
 
     #[test]

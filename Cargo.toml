@@ -1,6 +1,6 @@
 [package]
 name = "croft"
-version = "0.1.122"
+version = "0.1.130"
 edition = "2024"
 description = "VSCode-style TUI written in Rust"
 license = "MIT"
@@ -80,3 +80,17 @@ opt-level = 3
 lto = "thin"
 codegen-units = 1
 strip = true
+
+# Profile used by the local cross-build fast path in `croft <host>`. Drops
+# thin-LTO and bumps codegen-units back to 16 so the croft crate's codegen
+# parallelises and the link step is a no-op merge instead of a full LTO
+# pass; opt-level 2 keeps the resulting binary close-enough in runtime
+# perf for a TUI tool while cutting incremental compile time roughly in
+# half versus release.
+[profile.remote-fast]
+inherits = "release"
+opt-level = 2
+lto = false
+codegen-units = 16
+debug = false
+strip = "symbols"

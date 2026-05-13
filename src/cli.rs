@@ -64,6 +64,16 @@ pub enum CliCommand {
         /// Remote workspace folder to open.
         path: Option<String>,
     },
+    /// One-time setup for the cross-compile fast path used by `croft <host>`:
+    /// installs cargo-zigbuild and adds the two rustup targets croft ships
+    /// binaries for (x86_64 / aarch64 musl). After this finishes, the
+    /// remote install on every connect ships a pre-built static binary
+    /// instead of recompiling on the box (~2 s vs ~30 s).
+    SetupCross {
+        /// Skip confirmation prompt
+        #[arg(short, long, default_value_t = false)]
+        yes: bool,
+    },
 }
 
 impl Cli {
@@ -79,6 +89,7 @@ impl Cli {
             Some(CliCommand::Remote { host, path }) => {
                 crate::remote::launch_croft(&host, path.as_deref())
             }
+            Some(CliCommand::SetupCross { yes }) => setup_cross(yes),
             None => {
                 let path = self
                     .path
@@ -443,5 +454,117 @@ fn setup_iterm2(font: &str, nonascii: &str, size: u32, yes: bool) -> Result<()> 
     println!(
         "Quit iTerm2 entirely (cmd+Q) and reopen it. macOS caches plists; iTerm2 must be relaunched to pick up the change."
     );
+    Ok(())
+}
+
+const CROSS_TARGETS: &[&str] = &[
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-musl",
+];
+
+fn setup_cross(yes: bool) -> Result<()> {
+    println!(
+        "This installs the local-cross-build fast path used by `croft <host>`:\n  - homebrew package: zig (the linker)\n  - cargo subcommand: cargo-zigbuild\n  - rustup targets: {}",
+        CROSS_TARGETS.join(", ")
+    );
+    println!(
+        "After this finishes, every remote connect rsyncs a pre-built static binary instead of recompiling croft on the box."
+    );
+    if !yes {
+        print!("Apply this change? [y/N] ");
+        use std::io::Write;
+        std::io::stdout().flush()?;
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer)?;
+        if !matches!(answer.trim().to_lowercase().as_str(), "y" | "yes") {
+            println!("Aborted.");
+            return Ok(());
+        }
+    }
+    install_zig_if_missing()?;
+    install_cargo_zigbuild_if_missing()?;
+    for triple in CROSS_TARGETS {
+        install_rust_target_if_missing(triple)?;
+    }
+    println!("Cross-compile fast path ready. Next `croft <host>` will ship a pre-built binary.");
+    Ok(())
+}
+
+fn install_zig_if_missing() -> Result<()> {
+    if std::process::Command::new("zig")
+        .arg("version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+    {
+        println!("zig is already installed.");
+        return Ok(());
+    }
+    if std::process::Command::new("brew")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+    {
+        println!("Installing zig via Homebrew...");
+        let status = std::process::Command::new("brew")
+            .args(["install", "zig"])
+            .status()
+            .context("running brew install zig")?;
+        if !status.success() {
+            anyhow::bail!("brew install zig exited with {status}");
+        }
+    } else {
+        anyhow::bail!(
+            "zig is not installed and Homebrew is not available; install zig manually (https://ziglang.org/download/) and rerun this command"
+        );
+    }
+    Ok(())
+}
+
+fn install_cargo_zigbuild_if_missing() -> Result<()> {
+    if std::process::Command::new("cargo")
+        .args(["zigbuild", "--version"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+    {
+        println!("cargo-zigbuild is already installed.");
+        return Ok(());
+    }
+    println!("Installing cargo-zigbuild via cargo...");
+    let status = std::process::Command::new("cargo")
+        .args(["install", "cargo-zigbuild", "--locked"])
+        .status()
+        .context("running cargo install cargo-zigbuild")?;
+    if !status.success() {
+        anyhow::bail!("cargo install cargo-zigbuild exited with {status}");
+    }
+    Ok(())
+}
+
+fn install_rust_target_if_missing(triple: &str) -> Result<()> {
+    let installed = std::process::Command::new("rustup")
+        .args(["target", "list", "--installed"])
+        .output()
+        .context("rustup target list --installed")?;
+    if !installed.status.success() {
+        anyhow::bail!("rustup not available; install Rust via https://rustup.rs and rerun");
+    }
+    if String::from_utf8_lossy(&installed.stdout)
+        .lines()
+        .any(|line| line.trim() == triple)
+    {
+        println!("rustup target {triple} is already installed.");
+        return Ok(());
+    }
+    println!("Adding rustup target {triple}...");
+    let status = std::process::Command::new("rustup")
+        .args(["target", "add", triple])
+        .status()
+        .context("rustup target add")?;
+    if !status.success() {
+        anyhow::bail!("rustup target add {triple} exited with {status}");
+    }
     Ok(())
 }

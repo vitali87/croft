@@ -788,6 +788,29 @@ pub struct App {
     /// bleed through the modal's text. Armed on open AND on close so
     /// the modal's own cells get wiped when it dismisses too.
     shortcuts_image_clear_requested: bool,
+    /// Pre-baked OSC-1337 sequence for the SSH-empty-state illustration,
+    /// sized to a fixed cell box. None when the host terminal can't
+    /// render inline images.
+    ssh_empty_state_osc: Option<String>,
+    /// Latch: true between the moment the SSH-empty-state PNG is written
+    /// to the terminal and the moment we explicitly clear it. iTerm2
+    /// caches the image bytes outside ratatui's buffer, so without an
+    /// explicit terminal.clear() the illustration ghosts onto whatever
+    /// view the user navigates to next (Explorer, Search, …).
+    ssh_empty_state_displayed: bool,
+    /// One-shot: armed when the illustration was displayed and the panel
+    /// is no longer the active sidebar view (or has gained hosts).
+    /// Consumed in the driver's terminal.clear() OR chain.
+    ssh_empty_state_image_clear_requested: bool,
+    /// VS Code-style Cmd+P / Ctrl+P quick-open file finder. None when
+    /// the modal is closed.
+    pub file_finder: Option<crate::widgets::file_finder::FileFinder>,
+    /// Cached workspace file index. Built lazily on first Cmd+P and
+    /// shared across reopens so repeated invocations are instant.
+    file_finder_index: Option<std::sync::Arc<Vec<crate::widgets::file_finder::FileEntry>>>,
+    /// One-shot: armed on open and close to evict iTerm2's image cache
+    /// behind the finder, same pipeline as the shortcuts modal.
+    file_finder_image_clear_requested: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1292,6 +1315,12 @@ impl App {
             shortcuts_modal: None,
             shortcuts_hit_rect: None,
             shortcuts_image_clear_requested: false,
+            ssh_empty_state_osc: None,
+            ssh_empty_state_displayed: false,
+            ssh_empty_state_image_clear_requested: false,
+            file_finder: None,
+            file_finder_index: None,
+            file_finder_image_clear_requested: false,
             completion_request_id: None,
         })
     }
@@ -1447,6 +1476,38 @@ impl App {
                 raw
             });
         }
+        // SSH empty-state illustration baked to a fixed cell box (18 × 8
+        // cells). Letterboxed onto the card's dark bg so iTerm2 has no
+        // transparent edge to ghost the underlying buffer. Emitted post-
+        // draw by `flush_ssh_empty_state_overlay` while the SSH section
+        // shows no hosts.
+        let ssh_cells_w: u16 = crate::widgets::remote::SSH_EMPTY_STATE_CELLS_W;
+        let ssh_cells_h: u16 = crate::widgets::remote::SSH_EMPTY_STATE_CELLS_H;
+        let ssh_w_px = cell_w * ssh_cells_w as u32;
+        let ssh_h_px = cell_h * ssh_cells_h as u32;
+        // Transparent letterbox so the host terminal's session bg shows
+        // through the empty padding around the illustration. Any opaque
+        // fill here would render as a visible darker rectangle behind the
+        // PNG, which is exactly what the user told us to remove.
+        let card_bg = ::image::Rgba([0x00, 0x00, 0x00, 0x00]);
+        if let Ok(baked) = crate::iterm2_inline::fit_image_auto(
+            crate::iterm2_inline::SSH_EMPTY_STATE_PNG,
+            ssh_w_px,
+            ssh_h_px,
+            card_bg,
+        ) {
+            let raw = crate::iterm2_inline::build_inline_image_osc(
+                &baked,
+                ssh_cells_w,
+                ssh_cells_h,
+                false,
+            );
+            self.ssh_empty_state_osc = Some(if is_tmux {
+                crate::iterm2_inline::tmux_passthrough_wrap(&raw)
+            } else {
+                raw
+            });
+        }
     }
 
     /// Emit the OSC-1337 image carrying the run-debug headline icon at the
@@ -1463,7 +1524,7 @@ impl App {
     /// welcome wordmark and editor preview image use.
     pub fn flush_run_debug_icon_overlay(&mut self) {
         use std::io::Write;
-        if self.shortcuts_modal.is_some() {
+        if self.shortcuts_modal.is_some() || self.file_finder.is_some() {
             return;
         }
         let panel_visible = self.show_tree
@@ -1501,7 +1562,7 @@ impl App {
     /// surrounding cells redraw.
     pub fn flush_no_repo_hero_overlay(&mut self) {
         use std::io::Write;
-        if self.shortcuts_modal.is_some() {
+        if self.shortcuts_modal.is_some() || self.file_finder.is_some() {
             return;
         }
         let panel_visible = self.show_tree
@@ -1574,6 +1635,58 @@ impl App {
         self.no_repo_hero_overlay_dirty = false;
     }
 
+    /// Emit the OSC-1337 SSH-empty-state illustration at the cell the
+    /// remote panel reserved on its most recent render. When the panel
+    /// is no longer the active view (or has hosts, or the shortcuts
+    /// modal is open), this arms a one-shot terminal.clear() via
+    /// `consume_ssh_empty_state_image_clear()` so iTerm2 evicts the
+    /// cached image cells — otherwise the illustration ghosts onto
+    /// whatever view (Explorer / Search / …) replaces it.
+    pub fn flush_ssh_empty_state_overlay(&mut self) {
+        use std::io::Write;
+        let should_show = self.shortcuts_modal.is_none()
+            && self.file_finder.is_none()
+            && self.show_tree
+            && self.sidebar_view == SidebarView::Remote
+            && self.remote.targets.is_empty();
+        if !should_show {
+            if self.ssh_empty_state_displayed {
+                self.ssh_empty_state_displayed = false;
+                self.ssh_empty_state_image_clear_requested = true;
+            }
+            return;
+        }
+        let Some((cx, cy)) = self.remote.last_image_cell else {
+            return;
+        };
+        let Some(osc) = self.ssh_empty_state_osc.as_deref() else {
+            return;
+        };
+        let mut out = stdout();
+        let cursor_on = self.cursor_should_be_visible();
+        let _ = write!(out, "\x1b[?25l\x1b[s");
+        let _ = write!(out, "\x1b[{};{}H", cy + 1, cx + 1);
+        let _ = out.write_all(osc.as_bytes());
+        let _ = write!(out, "\x1b[u");
+        if cursor_on {
+            let _ = write!(out, "\x1b[?25h");
+        }
+        let _ = out.flush();
+        self.ssh_empty_state_displayed = true;
+    }
+
+    /// One-shot consumer paired with `flush_ssh_empty_state_overlay`. The
+    /// main loop ORs the result into its `terminal.clear()` chain so
+    /// iTerm2's cached image cells are evicted on view change.
+    pub fn consume_ssh_empty_state_image_clear(&mut self) -> bool {
+        if self.ssh_empty_state_image_clear_requested {
+            self.ssh_empty_state_image_clear_requested = false;
+            true
+        } else {
+            false
+        }
+    }
+
     /// One-shot consumer for the "leaving Run-Debug after the icon was
     /// emitted" flag. The main loop folds the result into the same OR
     /// chain that fires `terminal.clear()` for the welcome wordmark and
@@ -1606,7 +1719,7 @@ impl App {
     /// (just past the active-pill column). Empty when image rendering is
     /// disabled or the activity bar hasn't been laid out yet.
     pub fn pending_activity_image_overlays(&self) -> Vec<((u16, u16), &str)> {
-        if self.shortcuts_modal.is_some() {
+        if self.shortcuts_modal.is_some() || self.file_finder.is_some() {
             return Vec::new();
         }
         let Some(images) = self.activity_images.as_ref() else {
@@ -1669,7 +1782,7 @@ impl App {
     /// outlast iTerm2's image-cache eviction under heavy SGR traffic.
     pub fn flush_welcome_codeberg_badge_overlay(&mut self) {
         use std::io::Write;
-        if self.shortcuts_modal.is_some() {
+        if self.shortcuts_modal.is_some() || self.file_finder.is_some() {
             return;
         }
         if !self.editor.is_blank_initial() {
@@ -3314,6 +3427,7 @@ impl App {
         self.render_prompt(frame);
         self.render_local_open_confirm(frame);
         self.render_discard_confirm(frame);
+        self.render_file_finder(frame);
         self.render_shortcuts_modal(frame);
 
         // Show the host terminal's hardware caret only when the editor is
@@ -3649,8 +3763,16 @@ impl App {
             self.handle_shortcuts_modal_key(key);
             return Ok(());
         }
+        if self.file_finder.is_some() {
+            self.handle_file_finder_key(key);
+            return Ok(());
+        }
         if matches!(key.code, KeyCode::F(1)) {
             self.open_shortcuts_modal();
+            return Ok(());
+        }
+        if is_file_finder_key(key) {
+            self.open_file_finder();
             return Ok(());
         }
         // Modal layer: prompt eats every key while it's open.
@@ -5078,6 +5200,20 @@ impl App {
     }
 
     fn handle_paste(&mut self, s: &str) {
+        // Modal overlays own paste entirely while open — paste lands in
+        // the modal's input field, never in the editor / tree / terminal
+        // behind it. Without this, hitting Cmd+V right after Cmd+P pastes
+        // into whatever pane was last focused instead of into the finder
+        // query, which makes the "open + paste a filename" path that the
+        // VS Code Quick Open is meant to support unusable.
+        if let Some(finder) = self.file_finder.as_mut() {
+            for c in s.chars() {
+                if !c.is_control() {
+                    finder.push_char(c);
+                }
+            }
+            return;
+        }
         // Finder drag-and-drop into croft arrives via the host terminal as
         // a bracketed paste containing absolute filesystem path(s). The
         // drop in iTerm2 does NOT shift mouse focus, so we cannot require
@@ -5560,6 +5696,150 @@ impl App {
         }
     }
 
+    pub fn consume_file_finder_image_clear(&mut self) -> bool {
+        if self.file_finder_image_clear_requested {
+            self.file_finder_image_clear_requested = false;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn open_file_finder(&mut self) {
+        if self.file_finder.is_some() {
+            return;
+        }
+        if self.file_finder_index.is_none() {
+            let entries =
+                crate::widgets::file_finder::build_file_index(&self.workspace_root);
+            self.file_finder_index = Some(std::sync::Arc::new(entries));
+        }
+        let entries = self
+            .file_finder_index
+            .clone()
+            .unwrap_or_else(|| std::sync::Arc::new(Vec::new()));
+        let count = entries.len();
+        self.file_finder = Some(crate::widgets::file_finder::FileFinder::new(entries));
+        self.file_finder_image_clear_requested = true;
+        self.status = format!("Go to File: {count} files indexed — Esc to close");
+    }
+
+    fn close_file_finder(&mut self) {
+        if self.file_finder.take().is_some() {
+            self.file_finder_image_clear_requested = true;
+            self.activity_overlay_dirty = true;
+            self.welcome_overlay_dirty = true;
+            self.no_repo_hero_overlay_dirty = true;
+            self.editor_image_layout = None;
+            self.status.clear();
+        }
+    }
+
+    fn handle_file_finder_key(&mut self, key: KeyEvent) {
+        // Cmd+V / Ctrl+V: paste the system clipboard into the query as if
+        // each character had been typed. Hosts that route Cmd+V through
+        // bracketed paste (iTerm2 default) deliver an `Event::Paste(s)`
+        // instead, which `handle_paste` forwards to the finder — but if
+        // the user re-bound Cmd+V to a CSI-u Cmd+V sequence or is running
+        // in a terminal that disables bracketed paste, the chord arrives
+        // here as a key event, and reading the clipboard ourselves keeps
+        // the "open finder, paste a filename" gesture working everywhere.
+        if is_clipboard_paste_key(key) {
+            if let Some(text) = (self.clipboard_reader)() {
+                if let Some(finder) = self.file_finder.as_mut() {
+                    for c in text.chars() {
+                        if !c.is_control() {
+                            finder.push_char(c);
+                        }
+                    }
+                }
+            }
+            return;
+        }
+        let Some(finder) = self.file_finder.as_mut() else { return };
+        match (key.code, key.modifiers) {
+            (KeyCode::Esc, _) => {
+                self.close_file_finder();
+            }
+            (KeyCode::Enter, _) => {
+                let path = finder.selected_entry().map(|e| e.path.clone());
+                if let Some(path) = path {
+                    self.close_file_finder();
+                    match self.editor.open_preview(&path) {
+                        Ok(()) => {
+                            self.sync_open_file_poll_mtime();
+                            self.focus_pane(Pane::Editor);
+                            self.status = format!("Opened {}", path.display());
+                        }
+                        Err(e) => {
+                            self.status = format!("Open failed: {e}");
+                        }
+                    }
+                }
+            }
+            (KeyCode::Up, _) => finder.select_prev(),
+            (KeyCode::Down, _) => finder.select_next(),
+            (KeyCode::PageUp, _) => {
+                for _ in 0..10 {
+                    finder.select_prev();
+                }
+            }
+            (KeyCode::PageDown, _) => {
+                for _ in 0..10 {
+                    finder.select_next();
+                }
+            }
+            (KeyCode::Home, _) => {
+                while finder.selected_index() > 0 {
+                    finder.select_prev();
+                }
+            }
+            (KeyCode::End, _) => {
+                let total = finder.visible_results().len();
+                while finder.selected_index() + 1 < total {
+                    finder.select_next();
+                }
+            }
+            (KeyCode::Backspace, _) => finder.pop_char(),
+            (KeyCode::Char(c), m)
+                if !m.intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER) =>
+            {
+                finder.push_char(c);
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_file_finder_mouse(&mut self, m: MouseEvent) {
+        let Some(finder) = self.file_finder.as_mut() else { return };
+        let inside = rect_contains(finder.last_rect, m.column, m.row);
+        match m.kind {
+            MouseEventKind::ScrollDown => {
+                for _ in 0..3 {
+                    finder.select_next();
+                }
+            }
+            MouseEventKind::ScrollUp => {
+                for _ in 0..3 {
+                    finder.select_prev();
+                }
+            }
+            MouseEventKind::Down(MouseButton::Left)
+            | MouseEventKind::Down(MouseButton::Right) => {
+                if !inside {
+                    self.close_file_finder();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn render_file_finder(&mut self, frame: &mut ratatui::Frame) {
+        let Some(finder) = self.file_finder.as_mut() else { return };
+        let area = frame.area();
+        crate::widgets::file_finder::render_file_finder(finder, area, frame.buffer_mut());
+    }
+
     fn handle_shortcuts_modal_key(&mut self, key: KeyEvent) {
         let Some(modal) = self.shortcuts_modal.as_mut() else { return };
         match (key.code, key.modifiers) {
@@ -5600,6 +5880,10 @@ impl App {
     fn handle_mouse(&mut self, m: MouseEvent) {
         if self.shortcuts_modal.is_some() {
             self.handle_shortcuts_modal_mouse(m);
+            return;
+        }
+        if self.file_finder.is_some() {
+            self.handle_file_finder_mouse(m);
             return;
         }
         if matches!(m.kind, MouseEventKind::Down(MouseButton::Left))
@@ -6753,7 +7037,7 @@ impl App {
     }
 
     pub fn editor_image_payload(&self) -> Option<(&str, &EditorImageLayout)> {
-        if self.shortcuts_modal.is_some() {
+        if self.shortcuts_modal.is_some() || self.file_finder.is_some() {
             return None;
         }
         let osc = self.editor_image_osc.as_deref()?;
@@ -7411,6 +7695,22 @@ fn is_search_jump_key(key: KeyEvent) -> bool {
     let has_ctrl_or_super = key.modifiers.contains(KeyModifiers::CONTROL)
         || key.modifiers.contains(KeyModifiers::SUPER);
     has_shift && has_ctrl_or_super
+}
+
+/// VS Code-style `Cmd+P` / `Ctrl+P`: open the Quick Open file finder.
+/// Plain `p` with no modifier (or with Shift / Alt only) falls through so
+/// the editor still receives literal `p` keystrokes.
+fn is_file_finder_key(key: KeyEvent) -> bool {
+    let KeyCode::Char(c) = key.code else { return false };
+    if !c.eq_ignore_ascii_case(&'p') {
+        return false;
+    }
+    if key.modifiers.contains(KeyModifiers::SHIFT)
+        || key.modifiers.contains(KeyModifiers::ALT)
+    {
+        return false;
+    }
+    key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::SUPER)
 }
 
 /// Explorer-pane shortcut: `Cmd+F` / `Ctrl+F` (no Shift, no Alt) - "New File".
@@ -11785,6 +12085,35 @@ mod tests {
     }
 
     #[test]
+    fn ssh_empty_state_overlay_arms_image_clear_when_user_switches_off_remote_view() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        // Simulate the post-emit state without actually writing OSC bytes.
+        app.ssh_empty_state_displayed = true;
+        app.set_sidebar_view(SidebarView::Explorer);
+        app.flush_ssh_empty_state_overlay();
+        assert!(
+            app.consume_ssh_empty_state_image_clear(),
+            "leaving the Remote view after the illustration was painted must arm one terminal.clear() so iTerm2 evicts the cached image cells — otherwise the server-rack PNG ghosts onto the Explorer tree the user just clicked to"
+        );
+        assert!(!app.ssh_empty_state_displayed);
+    }
+
+    #[test]
+    fn ssh_empty_state_overlay_arms_image_clear_when_modal_opens_on_top() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.set_sidebar_view(SidebarView::Remote);
+        app.ssh_empty_state_displayed = true;
+        app.handle_key(key(KeyCode::F(1), KeyModifiers::NONE)).unwrap();
+        app.flush_ssh_empty_state_overlay();
+        assert!(
+            app.consume_ssh_empty_state_image_clear(),
+            "F1 opening the shortcuts modal over the SSH empty state must arm an image-clear so the illustration doesn't bleed through the modal text"
+        );
+    }
+
+    #[test]
     fn activity_overlay_emission_is_suppressed_while_the_shortcuts_modal_is_open() {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(tmp.path().to_path_buf()).unwrap();
@@ -11812,6 +12141,208 @@ mod tests {
         assert_eq!(app.shortcuts_modal.as_ref().unwrap().scroll, 10);
         app.handle_key(key(KeyCode::Home, KeyModifiers::NONE)).unwrap();
         assert_eq!(app.shortcuts_modal.as_ref().unwrap().scroll, 0);
+    }
+
+    #[test]
+    fn cmd_p_opens_the_file_finder_modal_for_quick_open() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("alpha.rs"), "").unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.handle_key(key(KeyCode::Char('p'), KeyModifiers::SUPER)).unwrap();
+        assert!(
+            app.file_finder.is_some(),
+            "Cmd+P must open the Quick Open file finder modal so the user can type a name and jump to a file the way VS Code does"
+        );
+    }
+
+    #[test]
+    fn ctrl_p_opens_the_file_finder_modal_on_systems_without_super() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("alpha.rs"), "").unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.handle_key(key(KeyCode::Char('p'), KeyModifiers::CONTROL)).unwrap();
+        assert!(
+            app.file_finder.is_some(),
+            "Ctrl+P must also open the Quick Open finder so the chord works on Linux / iTerm2 sessions that report CONTROL rather than SUPER"
+        );
+    }
+
+    #[test]
+    fn plain_p_keystroke_does_not_open_the_file_finder() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("alpha.rs"), "").unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.handle_key(key(KeyCode::Char('p'), KeyModifiers::NONE)).unwrap();
+        assert!(
+            app.file_finder.is_none(),
+            "an unmodified 'p' must reach the editor / tree typeahead and never trigger the modal"
+        );
+    }
+
+    #[test]
+    fn esc_closes_the_file_finder_modal() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("alpha.rs"), "").unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.handle_key(key(KeyCode::Char('p'), KeyModifiers::SUPER)).unwrap();
+        app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
+        assert!(app.file_finder.is_none(), "Esc must dismiss the file finder");
+    }
+
+    #[test]
+    fn typing_in_file_finder_fuzzy_filters_the_result_list() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("alpha.rs"), "").unwrap();
+        std::fs::create_dir(tmp.path().join("sub")).unwrap();
+        std::fs::write(tmp.path().join("sub").join("beta.rs"), "").unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.handle_key(key(KeyCode::Char('p'), KeyModifiers::SUPER)).unwrap();
+        app.handle_key(key(KeyCode::Char('b'), KeyModifiers::NONE)).unwrap();
+        app.handle_key(key(KeyCode::Char('e'), KeyModifiers::NONE)).unwrap();
+        let finder = app.file_finder.as_ref().expect("finder must still be open while typing");
+        let names: Vec<String> = finder
+            .visible_results()
+            .iter()
+            .map(|r| r.entry.rel.clone())
+            .collect();
+        assert!(
+            names.iter().any(|n| n == "sub/beta.rs"),
+            "typing 'be' must keep sub/beta.rs in the result list — got {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n == "alpha.rs"),
+            "typing 'be' must drop alpha.rs because 'be' is not a subsequence of 'alpha.rs' — got {names:?}"
+        );
+    }
+
+    #[test]
+    fn enter_in_file_finder_opens_the_selected_file_and_closes_the_modal() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("alpha.rs"), "fn main() {}").unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.handle_key(key(KeyCode::Char('p'), KeyModifiers::SUPER)).unwrap();
+        app.handle_key(key(KeyCode::Char('a'), KeyModifiers::NONE)).unwrap();
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE)).unwrap();
+        assert!(app.file_finder.is_none(), "Enter must close the modal after opening the file");
+        let opened = app.editor.path.as_ref().expect("the active tab must now have a path");
+        assert_eq!(
+            opened.file_name().and_then(|n| n.to_str()),
+            Some("alpha.rs"),
+            "Enter must open the highlighted entry (alpha.rs) into the active editor tab"
+        );
+    }
+
+    #[test]
+    fn down_arrow_moves_selection_in_the_file_finder() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("a1.rs"), "").unwrap();
+        std::fs::write(tmp.path().join("a2.rs"), "").unwrap();
+        std::fs::write(tmp.path().join("a3.rs"), "").unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.handle_key(key(KeyCode::Char('p'), KeyModifiers::SUPER)).unwrap();
+        let before = app.file_finder.as_ref().unwrap().selected_index();
+        app.handle_key(key(KeyCode::Down, KeyModifiers::NONE)).unwrap();
+        let after = app.file_finder.as_ref().unwrap().selected_index();
+        assert_eq!(after, before + 1, "Down arrow must move the selection cursor one row");
+    }
+
+    #[test]
+    fn backspace_removes_a_character_from_the_finder_query() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("alpha.rs"), "").unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.handle_key(key(KeyCode::Char('p'), KeyModifiers::SUPER)).unwrap();
+        app.handle_key(key(KeyCode::Char('a'), KeyModifiers::NONE)).unwrap();
+        app.handle_key(key(KeyCode::Char('b'), KeyModifiers::NONE)).unwrap();
+        app.handle_key(key(KeyCode::Backspace, KeyModifiers::NONE)).unwrap();
+        assert_eq!(app.file_finder.as_ref().unwrap().query, "a");
+    }
+
+    #[test]
+    fn opening_the_file_finder_arms_one_image_clear_so_iterm_evicts_cached_osc_1337_cells() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.handle_key(key(KeyCode::Char('p'), KeyModifiers::SUPER)).unwrap();
+        assert!(
+            app.consume_file_finder_image_clear(),
+            "Cmd+P must arm terminal.clear() so iTerm2's image cache (activity bar icons, welcome wordmark, editor preview) is wiped before the modal paints, otherwise those cached image cells bleed through the file list"
+        );
+        assert!(
+            !app.consume_file_finder_image_clear(),
+            "the flag is one-shot — a second consume call must return false so the driver does not re-clear every frame"
+        );
+    }
+
+    #[test]
+    fn bracketed_paste_into_open_file_finder_appends_to_the_query_not_the_editor() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("alpha.rs"), "").unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.focus_pane(Pane::Editor);
+        app.editor.lines = vec![String::from("hello")];
+        app.handle_key(key(KeyCode::Char('p'), KeyModifiers::SUPER)).unwrap();
+        app.handle_paste("alpha");
+        assert_eq!(
+            app.file_finder.as_ref().unwrap().query,
+            "alpha",
+            "an iTerm2 bracketed paste while the finder is open must land in the finder query so the user can Cmd+P then Cmd+V a filename"
+        );
+        assert_eq!(
+            app.editor.lines,
+            vec!["hello"],
+            "the editor pane behind the modal must not receive the pasted text"
+        );
+    }
+
+    #[test]
+    fn cmd_v_keystroke_in_file_finder_reads_clipboard_into_the_query() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("alpha.rs"), "").unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.clipboard_reader = || Some(String::from("alpha"));
+        app.handle_key(key(KeyCode::Char('p'), KeyModifiers::SUPER)).unwrap();
+        app.handle_key(key(KeyCode::Char('v'), KeyModifiers::SUPER)).unwrap();
+        assert_eq!(
+            app.file_finder.as_ref().unwrap().query,
+            "alpha",
+            "Cmd+V inside the finder must read the system clipboard and append every char to the query — this covers terminals that disable bracketed paste or route Cmd+V via CSI-u"
+        );
+    }
+
+    #[test]
+    fn file_finder_paste_strips_control_chars_so_a_pasted_newline_does_not_submit_garbage() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("alpha.rs"), "").unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.handle_key(key(KeyCode::Char('p'), KeyModifiers::SUPER)).unwrap();
+        app.handle_paste("al\nph\ta");
+        assert_eq!(
+            app.file_finder.as_ref().unwrap().query,
+            "alpha",
+            "control chars in pasted text must be filtered out — a stray newline must not end the line and a tab must not navigate"
+        );
+    }
+
+    #[test]
+    fn file_finder_modal_swallows_typed_characters_so_editor_does_not_receive_them() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("alpha.rs"), "").unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.focus_pane(Pane::Editor);
+        app.editor.lines = vec![String::from("hello")];
+        app.editor.cursor_col = 5;
+        app.handle_key(key(KeyCode::Char('p'), KeyModifiers::SUPER)).unwrap();
+        app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE)).unwrap();
+        assert_eq!(
+            app.editor.lines,
+            vec!["hello"],
+            "while the file finder is open, typed letters must not leak into the editor buffer"
+        );
+        assert_eq!(
+            app.file_finder.as_ref().unwrap().query,
+            "x",
+            "typed letters must go into the finder query instead"
+        );
     }
 
     #[test]
@@ -13808,6 +14339,8 @@ fn main_loop(
                 || app.consume_run_debug_image_clear()
                 || app.consume_no_repo_hero_image_clear()
                 || app.consume_shortcuts_image_clear()
+                || app.consume_file_finder_image_clear()
+                || app.consume_ssh_empty_state_image_clear()
             {
                 terminal.clear()?;
                 // Activity-bar icons live outside ratatui too; re-emit
@@ -13827,6 +14360,8 @@ fn main_loop(
                 || app.consume_run_debug_image_clear()
                 || app.consume_no_repo_hero_image_clear()
                 || app.consume_shortcuts_image_clear()
+                || app.consume_file_finder_image_clear()
+                || app.consume_ssh_empty_state_image_clear()
             {
                 terminal.clear()?;
                 app.activity_overlay_dirty = true;
@@ -13911,10 +14446,12 @@ fn main_loop(
             // image cells before the next sidebar paints.
             app.flush_run_debug_icon_overlay();
             app.flush_no_repo_hero_overlay();
+            app.flush_ssh_empty_state_overlay();
             // Welcome-screen logo: same OSC-1337 trick, gated by its own
             // dirty flag and only emitted while the editor pane is in its
             // blank initial state.
             if app.shortcuts_modal.is_none()
+                && app.file_finder.is_none()
                 && app.editor.is_blank_initial()
                 && app.welcome_overlay_dirty
             {

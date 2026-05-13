@@ -28,6 +28,14 @@ pub const WELCOME_LOGO_PNG: &[u8] =
 /// identically across terminals that support OSC-1337 inline images.
 pub const NO_REPO_HERO_PNG: &[u8] =
     include_bytes!("../assets/icons/no_repo_src.png");
+/// Illustration shown inside the Remote Explorer panel's SSH section when
+/// no Host entries are present: three stylised server units stacked
+/// vertically with a dashed connector to a small terminal box, framed by
+/// decorative `+` motifs. Same teal/cyan palette as the rest of the
+/// empty-state card. Bundled as a raster so we can paint it via OSC-1337
+/// instead of fighting box-drawing characters that never look quite right.
+pub const SSH_EMPTY_STATE_PNG: &[u8] =
+    include_bytes!("../assets/icons/ssh_empty_state.png");
 
 const ACTIVE_PILL: Rgba<u8> = Rgba([0x4e, 0x9a, 0xff, 0xff]);
 const ACTIVE_TINT: Rgba<u8> = Rgba([0xff, 0xff, 0xff, 0xff]);
