@@ -802,6 +802,8 @@ pub struct App {
     /// is no longer the active sidebar view (or has gained hosts).
     /// Consumed in the driver's terminal.clear() OR chain.
     ssh_empty_state_image_clear_requested: bool,
+    /// VS Code-style Cmd+F in-editor find overlay. None when closed.
+    pub editor_find: Option<crate::widgets::editor_find::EditorFind>,
     /// VS Code-style Cmd+P / Ctrl+P quick-open file finder. None when
     /// the modal is closed.
     pub file_finder: Option<crate::widgets::file_finder::FileFinder>,
@@ -1318,6 +1320,7 @@ impl App {
             ssh_empty_state_osc: None,
             ssh_empty_state_displayed: false,
             ssh_empty_state_image_clear_requested: false,
+            editor_find: None,
             file_finder: None,
             file_finder_index: None,
             file_finder_image_clear_requested: false,
@@ -3427,6 +3430,7 @@ impl App {
         self.render_prompt(frame);
         self.render_local_open_confirm(frame);
         self.render_discard_confirm(frame);
+        self.render_editor_find(frame);
         self.render_file_finder(frame);
         self.render_shortcuts_modal(frame);
 
@@ -4700,6 +4704,15 @@ impl App {
     }
 
     fn handle_editor_key(&mut self, key: KeyEvent) {
+        // Inline find bar (Cmd+F / Ctrl+F) eats every key while open.
+        if self.editor_find.is_some() {
+            self.handle_editor_find_key(key);
+            return;
+        }
+        if is_editor_find_key(key) {
+            self.open_editor_find();
+            return;
+        }
         // Completion popup intercepts navigation / accept / dismiss keys
         // before normal editor handling. Any other key dismisses the popup
         // and falls through so the character lands in the buffer.
@@ -5212,6 +5225,20 @@ impl App {
                     finder.push_char(c);
                 }
             }
+            return;
+        }
+        if self.editor_find.is_some() {
+            let mut new_q = self
+                .editor_find
+                .as_ref()
+                .map(|st| st.query.clone())
+                .unwrap_or_default();
+            for c in s.chars() {
+                if !c.is_control() {
+                    new_q.push(c);
+                }
+            }
+            self.editor_find_set_query(new_q);
             return;
         }
         // Finder drag-and-drop into croft arrives via the host terminal as
@@ -5843,6 +5870,211 @@ impl App {
         let Some(finder) = self.file_finder.as_mut() else { return };
         let area = frame.area();
         crate::widgets::file_finder::render_file_finder(finder, area, frame.buffer_mut());
+    }
+
+    fn open_editor_find(&mut self) {
+        if self.editor_find.is_some() {
+            return;
+        }
+        let opts = self.search.opts;
+        let initial = if !self.editor.selection_text().is_empty()
+            && !self.editor.selection_text().contains('\n')
+        {
+            self.editor.selection_text()
+        } else {
+            self.editor.word_before_cursor()
+        };
+        let mut state = crate::widgets::editor_find::EditorFind {
+            query: initial.clone(),
+            opts,
+            ..Default::default()
+        };
+        if !initial.is_empty() {
+            state.match_count = crate::widgets::editor_find::count_matches(
+                &self.editor.lines,
+                &initial,
+                opts,
+            );
+            self.editor.set_search_highlight(Some(initial.clone()), opts);
+        }
+        self.editor_find = Some(state);
+        self.status = String::from("Find: type to search, Enter next, Shift+Enter prev, Esc close");
+    }
+
+    fn close_editor_find(&mut self) {
+        if self.editor_find.take().is_some() {
+            self.editor
+                .set_search_highlight(None, self.search.opts);
+            self.status.clear();
+        }
+    }
+
+    fn editor_find_set_query(&mut self, new_query: String) {
+        let Some(state) = self.editor_find.as_mut() else { return };
+        if state.query == new_query {
+            return;
+        }
+        state.query = new_query;
+        let opts = state.opts;
+        state.match_count = crate::widgets::editor_find::count_matches(
+            &self.editor.lines,
+            &state.query,
+            opts,
+        );
+        if state.query.is_empty() {
+            state.match_index = None;
+            self.editor.set_search_highlight(None, opts);
+            return;
+        }
+        self.editor.set_search_highlight(Some(state.query.clone()), opts);
+        let from_row = self.editor.cursor_row;
+        let from_col = self.editor.cursor_col;
+        if let Some(m) = crate::widgets::editor_find::find_next_match(
+            &self.editor.lines,
+            &state.query,
+            opts,
+            from_row,
+            from_col,
+            false,
+        ) {
+            self.jump_editor_to_match(m);
+        }
+        self.refresh_editor_find_index();
+    }
+
+    fn editor_find_jump_next(&mut self) {
+        let Some(state) = self.editor_find.as_ref() else { return };
+        if state.query.is_empty() {
+            return;
+        }
+        let opts = state.opts;
+        let needle = state.query.clone();
+        if let Some(m) = crate::widgets::editor_find::find_next_match(
+            &self.editor.lines,
+            &needle,
+            opts,
+            self.editor.cursor_row,
+            self.editor.cursor_col,
+            true,
+        ) {
+            self.jump_editor_to_match(m);
+            self.refresh_editor_find_index();
+        }
+    }
+
+    fn editor_find_jump_prev(&mut self) {
+        let Some(state) = self.editor_find.as_ref() else { return };
+        if state.query.is_empty() {
+            return;
+        }
+        let opts = state.opts;
+        let needle = state.query.clone();
+        if let Some(m) = crate::widgets::editor_find::find_prev_match(
+            &self.editor.lines,
+            &needle,
+            opts,
+            self.editor.cursor_row,
+            self.editor.cursor_col,
+            true,
+        ) {
+            self.jump_editor_to_match(m);
+            self.refresh_editor_find_index();
+        }
+    }
+
+    fn jump_editor_to_match(&mut self, m: crate::widgets::editor_find::MatchPos) {
+        self.editor.cursor_row = m.row;
+        self.editor.cursor_col = m.col_chars;
+        let viewport = self.editor.last_inner.height as usize;
+        if viewport > 0 {
+            if self.editor.cursor_row < self.editor.scroll {
+                self.editor.scroll = self.editor.cursor_row;
+            } else if self.editor.cursor_row >= self.editor.scroll + viewport {
+                self.editor.scroll = self.editor.cursor_row + 1 - viewport;
+            }
+        }
+        self.editor.ensure_cursor_col_visible();
+    }
+
+    fn refresh_editor_find_index(&mut self) {
+        let Some(state) = self.editor_find.as_mut() else { return };
+        let opts = state.opts;
+        let needle = state.query.clone();
+        state.match_index = crate::widgets::editor_find::match_index_at(
+            &self.editor.lines,
+            &needle,
+            opts,
+            self.editor.cursor_row,
+            self.editor.cursor_col,
+        );
+    }
+
+    fn handle_editor_find_key(&mut self, key: KeyEvent) {
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        match (key.code, key.modifiers) {
+            (KeyCode::Esc, _) => self.close_editor_find(),
+            (KeyCode::Enter, _) => {
+                if shift {
+                    self.editor_find_jump_prev();
+                } else {
+                    self.editor_find_jump_next();
+                }
+            }
+            (KeyCode::F(3), _) => {
+                if shift {
+                    self.editor_find_jump_prev();
+                } else {
+                    self.editor_find_jump_next();
+                }
+            }
+            (KeyCode::Backspace, _) => {
+                let mut new_q = self
+                    .editor_find
+                    .as_ref()
+                    .map(|s| s.query.clone())
+                    .unwrap_or_default();
+                new_q.pop();
+                self.editor_find_set_query(new_q);
+            }
+            (KeyCode::Char('v'), m)
+                if m.contains(KeyModifiers::CONTROL) || m.contains(KeyModifiers::SUPER) =>
+            {
+                if let Some(text) = (self.clipboard_reader)() {
+                    let mut new_q = self
+                        .editor_find
+                        .as_ref()
+                        .map(|s| s.query.clone())
+                        .unwrap_or_default();
+                    for c in text.chars() {
+                        if !c.is_control() {
+                            new_q.push(c);
+                        }
+                    }
+                    self.editor_find_set_query(new_q);
+                }
+            }
+            (KeyCode::Char(c), m)
+                if !m.intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER) =>
+            {
+                let mut new_q = self
+                    .editor_find
+                    .as_ref()
+                    .map(|s| s.query.clone())
+                    .unwrap_or_default();
+                new_q.push(c);
+                self.editor_find_set_query(new_q);
+            }
+            _ => {}
+        }
+    }
+
+    fn render_editor_find(&mut self, frame: &mut ratatui::Frame) {
+        let Some(state) = self.editor_find.as_mut() else { return };
+        let area = self.editor.last_full_area;
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+        crate::widgets::editor_find::render_editor_find(state, area, frame.buffer_mut());
     }
 
     fn handle_shortcuts_modal_key(&mut self, key: KeyEvent) {
@@ -7700,6 +7932,23 @@ fn is_search_jump_key(key: KeyEvent) -> bool {
     let has_ctrl_or_super = key.modifiers.contains(KeyModifiers::CONTROL)
         || key.modifiers.contains(KeyModifiers::SUPER);
     has_shift && has_ctrl_or_super
+}
+
+/// VS Code-style `Cmd+F` / `Ctrl+F` inside the editor: open the inline
+/// Find bar. Same chord as the Explorer's "New File" — the dispatch in
+/// `handle_key` gives the Explorer handler first refusal so this only
+/// fires when the editor is the focused pane.
+fn is_editor_find_key(key: KeyEvent) -> bool {
+    let KeyCode::Char(c) = key.code else { return false };
+    if !c.eq_ignore_ascii_case(&'f') {
+        return false;
+    }
+    if key.modifiers.contains(KeyModifiers::SHIFT)
+        || key.modifiers.contains(KeyModifiers::ALT)
+    {
+        return false;
+    }
+    key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::SUPER)
 }
 
 /// VS Code-style `Cmd+P` / `Ctrl+P`: open the Quick Open file finder.
@@ -12275,6 +12524,123 @@ mod tests {
         assert!(
             !app.consume_file_finder_image_clear(),
             "the flag is one-shot — a second consume call must return false so the driver does not re-clear every frame"
+        );
+    }
+
+    #[test]
+    fn cmd_f_in_editor_opens_the_inline_find_overlay_not_the_new_file_prompt() {
+        let mut app = editor_app_with_lines(&["alpha beta", "alpha gamma"]);
+        app.handle_key(key(KeyCode::Char('f'), KeyModifiers::SUPER)).unwrap();
+        assert!(
+            app.editor_find.is_some(),
+            "Cmd+F with the editor focused must open the VS Code-style inline Find bar over the editor pane, not the Explorer 'new file' prompt"
+        );
+        assert!(
+            app.prompt.is_none(),
+            "Cmd+F in editor must NOT open the new-file Prompt — that is reserved for the Explorer pane"
+        );
+    }
+
+    #[test]
+    fn cmd_f_in_explorer_still_opens_the_new_file_prompt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.focus_pane(Pane::Tree);
+        app.handle_key(key(KeyCode::Char('f'), KeyModifiers::SUPER)).unwrap();
+        assert!(
+            app.prompt.is_some(),
+            "Cmd+F in the Explorer pane must keep creating a new file — the existing behaviour the user asked us to preserve"
+        );
+        assert!(
+            app.editor_find.is_none(),
+            "Cmd+F in the Explorer must NOT open the editor Find overlay; the chord is overloaded by pane"
+        );
+    }
+
+    #[test]
+    fn typing_in_editor_find_jumps_the_cursor_to_the_next_match() {
+        let mut app = editor_app_with_lines(&["alpha beta", "alpha gamma"]);
+        app.editor.cursor_row = 0;
+        app.editor.cursor_col = 0;
+        app.handle_key(key(KeyCode::Char('f'), KeyModifiers::SUPER)).unwrap();
+        app.handle_key(key(KeyCode::Char('b'), KeyModifiers::NONE)).unwrap();
+        app.handle_key(key(KeyCode::Char('e'), KeyModifiers::NONE)).unwrap();
+        app.handle_key(key(KeyCode::Char('t'), KeyModifiers::NONE)).unwrap();
+        app.handle_key(key(KeyCode::Char('a'), KeyModifiers::NONE)).unwrap();
+        assert_eq!(
+            (app.editor.cursor_row, app.editor.cursor_col),
+            (0, 6),
+            "typing 'beta' must jump the cursor to the first 'beta' occurrence — got ({}, {})",
+            app.editor.cursor_row,
+            app.editor.cursor_col
+        );
+    }
+
+    #[test]
+    fn enter_in_editor_find_jumps_to_the_next_match_and_shift_enter_walks_back() {
+        let mut app = editor_app_with_lines(&["alpha", "beta alpha", "alpha"]);
+        app.editor.cursor_row = 0;
+        app.editor.cursor_col = 0;
+        app.handle_key(key(KeyCode::Char('f'), KeyModifiers::SUPER)).unwrap();
+        app.handle_key(key(KeyCode::Char('a'), KeyModifiers::NONE)).unwrap();
+        app.handle_key(key(KeyCode::Char('l'), KeyModifiers::NONE)).unwrap();
+        app.handle_key(key(KeyCode::Char('p'), KeyModifiers::NONE)).unwrap();
+        app.handle_key(key(KeyCode::Char('h'), KeyModifiers::NONE)).unwrap();
+        app.handle_key(key(KeyCode::Char('a'), KeyModifiers::NONE)).unwrap();
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE)).unwrap();
+        assert_eq!(
+            app.editor.cursor_row, 1,
+            "Enter must jump to the next 'alpha' match on row 1"
+        );
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE)).unwrap();
+        assert_eq!(
+            app.editor.cursor_row, 2,
+            "Enter again must walk forward to the row 2 match"
+        );
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::SHIFT)).unwrap();
+        assert_eq!(
+            app.editor.cursor_row, 1,
+            "Shift+Enter must walk back one match to row 1"
+        );
+    }
+
+    #[test]
+    fn esc_closes_the_editor_find_overlay_and_clears_the_highlight() {
+        let mut app = editor_app_with_lines(&["alpha"]);
+        app.handle_key(key(KeyCode::Char('f'), KeyModifiers::SUPER)).unwrap();
+        app.handle_key(key(KeyCode::Char('a'), KeyModifiers::NONE)).unwrap();
+        assert!(app.editor.search_highlight.is_some());
+        app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
+        assert!(app.editor_find.is_none(), "Esc must close the find bar");
+        assert!(
+            app.editor.search_highlight.is_none(),
+            "Esc must clear the editor's match highlight so leftover dim cells don't survive into normal typing"
+        );
+    }
+
+    #[test]
+    fn editor_find_pre_fills_the_query_from_word_under_cursor_on_open() {
+        let mut app = editor_app_with_lines(&["alphabet"]);
+        app.editor.cursor_row = 0;
+        app.editor.cursor_col = 5;
+        app.handle_key(key(KeyCode::Char('f'), KeyModifiers::SUPER)).unwrap();
+        assert_eq!(
+            app.editor_find.as_ref().unwrap().query,
+            "alpha",
+            "opening Cmd+F with the cursor mid-word must pre-fill the query with the identifier chars to the left of the cursor, matching VS Code"
+        );
+    }
+
+    #[test]
+    fn editor_find_paste_appends_clipboard_to_the_query() {
+        let mut app = editor_app_with_lines(&["alpha needle beta"]);
+        app.clipboard_reader = || Some(String::from("needle"));
+        app.handle_key(key(KeyCode::Char('f'), KeyModifiers::SUPER)).unwrap();
+        app.handle_key(key(KeyCode::Char('v'), KeyModifiers::SUPER)).unwrap();
+        assert_eq!(
+            app.editor_find.as_ref().unwrap().query,
+            "needle",
+            "Cmd+V inside the find bar must paste from the system clipboard"
         );
     }
 

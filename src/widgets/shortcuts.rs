@@ -57,6 +57,7 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
     ShortcutGroup {
         title: "Editor: text",
         entries: &[
+            ShortcutEntry { keys: "Cmd/Ctrl+F", description: "Find in current file (Enter next, Shift+Enter prev, Esc close)" },
             ShortcutEntry { keys: "Arrows / Home / End", description: "Navigate; clears any active selection" },
             ShortcutEntry { keys: "Shift+arrows / Home / End / PgUp / PgDn", description: "Extend the selection" },
             ShortcutEntry { keys: "PgUp / PgDn", description: "Scroll exactly one viewport" },
