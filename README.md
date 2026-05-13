@@ -89,11 +89,18 @@ croft setup-terminal --help
 |------|--------|
 | `Ctrl+s` | Save the open file |
 | `Ctrl+q` | Quit |
+| `F1` | Open the shortcuts modal (every binding grouped by pane, scrollable) |
 | `F6` | Cycle focus across panes (tree → editor → terminal → tree) |
 | `Ctrl+b` | Toggle the file tree / side panel |
 | `Ctrl+j` | Toggle the terminal pane |
-| `Ctrl+Shift+f` (or `Cmd+Shift+f` with the iTerm2 setup below) | Jump to the Search sidebar view |
-| Click activity-bar icons (left edge) | Switch between Explorer, Search, and Remote (SSH) sidebar views |
+| `Ctrl+p` (or `Cmd+p` with the iTerm2 setup below) | Quick Open: fuzzy-search workspace files by name and jump to the picked file (auto-expands the Explorer to reveal it) |
+| `Ctrl+Shift+e` / `Cmd+Shift+e` | Jump to the Explorer sidebar from any pane |
+| `Ctrl+Shift+f` / `Cmd+Shift+f` | Jump to the Search sidebar |
+| `Ctrl+Shift+s` / `Cmd+Shift+s` | Jump to Source Control (works from the editor too) |
+| `Ctrl+Shift+g` / `Cmd+Shift+g` | Jump to Source Control (when the editor is not focused; `Cmd+Shift+G` in the editor is goto-bottom) |
+| `Ctrl+Shift+d` / `Cmd+Shift+d` | Jump to Run and Debug |
+| `Ctrl+Shift+r` / `Cmd+Shift+r` | Jump to Remote (SSH) |
+| Click activity-bar icons (left edge) | Switch between Explorer, Search, Source Control, Run-Debug, and Remote sidebar views |
 | Drag the vertical seam between sidebar and editor | Resize the sidebar |
 | Drag the horizontal seam between editor and terminal | Resize the terminal pane |
 | Mouse wheel | Scroll the pane under the pointer |
@@ -140,6 +147,7 @@ croft setup-terminal --help
 | `Ctrl`+`V` / `Cmd`+`V` | Paste at the cursor; replaces selection if any |
 | `Ctrl`+`Z` / `Cmd`+`Z` | Undo (typing bursts coalesce into one step; backspace, paste, cut, replace are each their own step) |
 | `Cmd`+`A` | Select the entire buffer |
+| `Ctrl`+`f` / `Cmd`+`f` | Open the inline Find bar at the top-right of the editor — pre-fills the query from the selection (single line) or the word under the cursor; typing jumps the cursor to the first match at-or-after the cursor and highlights the active match in orange and the rest in yellow; `Enter` / `F3` walks forward, `Shift+Enter` / `Shift+F3` walks back, `Esc` closes |
 | `Ctrl`+`A` | Move to the start of the current line (readline-style) |
 | `Ctrl`+`E` | Move to the end of the current line |
 | `Ctrl`+`K` | Kill from cursor to end of line (yanks to the system clipboard) |
@@ -202,10 +210,16 @@ This writes the default-profile font settings plus Croft's iTerm2 keyboard setup
 
 | iTerm2 keystroke | Installed mapping | What croft does |
 |------------------|-------------------|-----------------|
+| `⌘P` | `\x1b[112;9u` | Quick Open: fuzzy-search workspace files |
+| `⌘F` | `\x1b[102;9u` | In-editor Find (jumps to next match as you type) |
+| `⌘⇧E` | `\x1b[69;10u` | Jump to the Explorer sidebar |
 | `⌘⇧F` | `\x1b[70;10u` | Jump to the Search sidebar |
+| `⌘⇧S` | `\x1b[83;10u` | Jump to Source Control |
+| `⌘⇧D` | `\x1b[68;10u` | Jump to Run and Debug |
+| `⌘⇧R` | `\x1b[82;10u` | Jump to Remote (SSH) |
 | `⌘V` | `\x1b[118;9u` in global and profile key maps | Read the system clipboard and paste into the focused editor, or into Search when Search is active |
 
-It moves iTerm2's **Edit → Find → Find Globally...** and **Edit → Paste** menu shortcuts out of the way so macOS does not consume `⌘⇧F` or `⌘V` before iTerm2's key maps can deliver them to croft. Fully quit iTerm2 with `⌘Q` and reopen it after setup; iTerm2 caches its plist while running.
+It also moves the following iTerm2 / macOS menu shortcuts out of the way (each goes to `Cmd+Opt+<letter>` so the original iTerm2 action stays reachable on a chord croft does not use): **Edit → Find → Find Globally...** off `⌘⇧F`, **Edit → Paste** off `⌘V`, **Shell → Split Vertically with Same Profile** off `⌘D`, **Shell → Split Horizontally with Same Profile** off `⌘⇧D`, **Edit → Find Next / Find Previous / Jump to Selection**, **File → Print** off `⌘P`, **Window → Select Tab 1..9** off `⌘1..⌘9`, and the macOS **Help → Show Help Menu** off `⌘⇧/`. Fully quit iTerm2 with `⌘Q` and reopen it after setup; iTerm2 caches its plist while running.
 
 ### 1. Right-click reaches croft
 
@@ -273,21 +287,33 @@ src/
 ├── highlight.rs         tree-sitter highlight registry per language
 ├── icons.rs             Codicon / Devicon / Seti glyphs and per-language colors
 ├── iterm2.rs            iTerm2 plist mutation helpers for fonts and Croft key mappings
-├── iterm2_inline.rs     OSC 1337 inline-image baking pipeline (welcome wordmark, image / PDF preview)
+├── iterm2_inline.rs     OSC 1337 inline-image baking pipeline (welcome wordmark, image / PDF preview, activity-bar icons, SSH empty-state hero)
 ├── pdf.rs               PDF rasteriser: prefers pdftoppm (poppler), falls back to macOS sips
 ├── remote.rs            remote (SSH) target metadata and launch dispatch
 ├── sheet.rs             CSV / TSV / XLSX / XLS / XLSB / ODS parsing via the csv and calamine crates
+├── lsp/                 LSP client stack
+│   ├── mod.rs
+│   ├── client.rs        async-lsp client wrapper with router for unhandled notifications
+│   ├── config.rs        per-language LSP config (basedpyright, ruff, ty, rust-analyzer)
+│   ├── log_file.rs      LSP stderr / debug log sink at ~/.croft/lsp.log
+│   ├── manager.rs       lifecycle: spawn / did_open / did_change / completion / shutdown
+│   ├── registry.rs      language detection from file extension and shebang
+│   └── runtime.rs       Tokio runtime owned by the LSP manager
 └── widgets/
     ├── mod.rs
+    ├── completion_popup.rs  LSP completion popup (anchored at the cursor, filterable)
     ├── diff.rs          side-by-side file diff renderer used by the explorer's Compare action
     ├── editor.rs        tree-sitter highlighted editor with full write path, mouse-drag selection, OSC 52 copy/cut, plus image / PDF / spreadsheet preview tabs
-    ├── file_tree.rs     ignore::WalkBuilder backed tree, lazy children, fs-watcher refresh, multi-select, drag-drop, bulk trash
-    ├── remote.rs        Remote Explorer sidebar widget
+    ├── editor_find.rs   VS Code-style inline Find bar (Cmd+F) with active-match orange highlight, Enter / Shift+Enter walk, case-sensitive / whole-word / regex toggles
+    ├── file_finder.rs   VS Code-style Quick Open (Cmd+P) fuzzy file picker with tiered match ranking (exact filename > prefix > substring > path > subsequence)
+    ├── file_tree.rs     ignore::WalkBuilder backed tree, lazy children, fs-watcher refresh, multi-select, drag-drop, bulk trash, reveal-path on Cmd+P open
+    ├── remote.rs        Remote (SSH) sidebar widget with empty-state hero illustration
     ├── run_debug.rs     Run and Debug sidebar widget: empty state plus Run [filename] button that spawns the active file in a fresh terminal
     ├── scrollbar.rs     shared vertical-scrollbar geometry
     ├── search.rs        sidebar search panel + .gitignore-aware substring walker
-    ├── source_control.rs Source Control sidebar widget: branch summary, commit input, change list, commit button
-    └── terminal.rs      portable-pty + vt100 + ratatui integration with selection + scrollback
+    ├── shortcuts.rs     F1 shortcuts modal: every binding grouped by pane, scrollable
+    ├── source_control.rs Source Control sidebar widget: branch summary, commit input, change list, commit button, no-repo hero
+    └── terminal.rs      portable-pty + alacritty_terminal + ratatui integration with selection + scrollback
 tests/cli.rs             integration tests for the CLI surface
 ```
 
