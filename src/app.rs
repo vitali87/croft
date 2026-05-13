@@ -3850,6 +3850,26 @@ impl App {
             self.set_sidebar_view(SidebarView::SourceControl);
             return Ok(());
         }
+        if is_explorer_jump_key(key) {
+            self.show_tree = true;
+            self.set_sidebar_view(SidebarView::Explorer);
+            return Ok(());
+        }
+        if is_source_control_jump_via_s_key(key) {
+            self.show_tree = true;
+            self.set_sidebar_view(SidebarView::SourceControl);
+            return Ok(());
+        }
+        if is_run_debug_jump_key(key) {
+            self.show_tree = true;
+            self.set_sidebar_view(SidebarView::RunDebug);
+            return Ok(());
+        }
+        if is_remote_jump_key(key) {
+            self.show_tree = true;
+            self.set_sidebar_view(SidebarView::Remote);
+            return Ok(());
+        }
         if self.sidebar_view == SidebarView::Search
             && self.focus != Pane::Editor
             && is_search_editing_shortcut(key)
@@ -5255,6 +5275,24 @@ impl App {
         //     focus is on the tree, otherwise we keep the current
         //     behaviour (typing a path string into the focused editor or
         //     terminal command line) because that is a legitimate use.
+        // iTerm2's inline-image drag artefact ALWAYS short-circuits the
+        // paste pipeline: a stray click-and-microdrag on an OSC-1337 cell
+        // (activity-bar icon, welcome wordmark, no-repo / run-debug / SSH
+        // hero) makes iTerm2 write the decoded PNG to $TMPDIR/iTerm2.<rand>.png
+        // and re-inject the path as a bracketed paste. parse_dropped_paths
+        // already filters those paths out of the import list, but without
+        // an early-return here the fallthrough would still paste the raw
+        // path string into the editor body (the user reported this as
+        // "Pasted 67 chars" appearing in a freshly-opened CLAUDE.local.md
+        // tab while they were trying to resize the sidebar near the
+        // Explorer icon). Detect the artefact at the payload level and
+        // silently drop the entire paste — no text, no import, no status.
+        if parsed_drop_tokens(s)
+            .iter()
+            .any(|p| p.is_absolute() && is_iterm2_inline_image_drop(p))
+        {
+            return;
+        }
         let dropped = parse_dropped_paths(s);
         if !dropped.is_empty() {
             match self.sidebar_view {
@@ -8046,6 +8084,49 @@ fn is_tree_make_parent_root_key(key: KeyEvent) -> bool {
     }
 }
 
+/// `Ctrl/Cmd+Shift+E`: jump to the Explorer sidebar view from any pane.
+/// Matches VS Code's "View: Show Explorer" command.
+fn is_explorer_jump_key(key: KeyEvent) -> bool {
+    is_cmd_shift_letter(key, 'e')
+}
+
+/// `Ctrl/Cmd+Shift+S`: jump to the Source Control sidebar from any pane.
+/// Companion to the older `Cmd+Shift+G` chord (which has the `focus != Editor`
+/// guard because Cmd+Shift+G in the editor is goto-bottom). Croft has no
+/// Save-As, so claiming Cmd+Shift+S across every pane is collision-free.
+fn is_source_control_jump_via_s_key(key: KeyEvent) -> bool {
+    is_cmd_shift_letter(key, 's')
+}
+
+/// `Ctrl/Cmd+Shift+D`: jump to the Run and Debug sidebar view from any pane.
+/// Matches VS Code's "View: Show Run and Debug" command. iTerm2 binds the
+/// same chord to "Split Horizontally with Same Profile" — `setup-iterm2`
+/// relocates that menu item to Cmd+Opt+Shift+D so this chord reaches croft.
+fn is_run_debug_jump_key(key: KeyEvent) -> bool {
+    is_cmd_shift_letter(key, 'd')
+}
+
+/// `Ctrl/Cmd+Shift+R`: jump to the Remote (SSH) sidebar view from any pane.
+/// VS Code uses this for "Remote Explorer" in the Remote Development pack —
+/// same intent.
+fn is_remote_jump_key(key: KeyEvent) -> bool {
+    is_cmd_shift_letter(key, 'r')
+}
+
+fn is_cmd_shift_letter(key: KeyEvent, letter: char) -> bool {
+    let KeyCode::Char(c) = key.code else { return false };
+    if !c.eq_ignore_ascii_case(&letter) {
+        return false;
+    }
+    if key.modifiers.contains(KeyModifiers::ALT) {
+        return false;
+    }
+    let has_shift = key.modifiers.contains(KeyModifiers::SHIFT);
+    let has_ctrl_or_super = key.modifiers.contains(KeyModifiers::CONTROL)
+        || key.modifiers.contains(KeyModifiers::SUPER);
+    has_shift && has_ctrl_or_super
+}
+
 /// `Ctrl/Cmd+Shift+G`: jump to the Source Control sidebar view, matching
 /// VS Code's "Show Source Control" gesture.
 fn is_source_control_jump_key(key: KeyEvent) -> bool {
@@ -8139,7 +8220,22 @@ fn is_save_key(key: KeyEvent) -> bool {
     if !c.eq_ignore_ascii_case(&'s') {
         return false;
     }
-    key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::SUPER)
+    if key.modifiers.contains(KeyModifiers::ALT) {
+        return false;
+    }
+    let has_super = key.modifiers.contains(KeyModifiers::SUPER);
+    let has_ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let has_shift = key.modifiers.contains(KeyModifiers::SHIFT);
+    // Cmd+Shift+S is reserved for the Source Control sidebar jump
+    // (`is_source_control_jump_via_s_key`), so reject Shift when Super is
+    // held. Ctrl+Shift+S still triggers Save because some terminals
+    // capitalise the letter when Ctrl is held and the user genuinely
+    // means Ctrl+S — that's the existing `shift_ctrl_s_is_save_key`
+    // contract we want to preserve.
+    if has_super && has_shift {
+        return false;
+    }
+    has_super || has_ctrl
 }
 
 /// Read the system clipboard. Used by the search input when Cmd+V arrives as
@@ -12566,6 +12662,69 @@ mod tests {
         assert!(
             !app.consume_file_finder_image_clear(),
             "the flag is one-shot — a second consume call must return false so the driver does not re-clear every frame"
+        );
+    }
+
+    #[test]
+    fn cmd_shift_e_jumps_to_explorer_from_any_pane() {
+        let mut app = editor_app_with_lines(&["x"]);
+        app.set_sidebar_view(SidebarView::Search);
+        app.show_tree = false;
+        app.handle_key(key(KeyCode::Char('e'), KeyModifiers::SUPER | KeyModifiers::SHIFT)).unwrap();
+        assert_eq!(app.sidebar_view, SidebarView::Explorer);
+        assert!(app.show_tree, "Cmd+Shift+E must un-collapse the sidebar if it was hidden");
+    }
+
+    #[test]
+    fn cmd_shift_s_jumps_to_source_control_even_when_editor_is_focused() {
+        let mut app = editor_app_with_lines(&["x"]);
+        app.focus_pane(Pane::Editor);
+        app.handle_key(key(KeyCode::Char('s'), KeyModifiers::SUPER | KeyModifiers::SHIFT)).unwrap();
+        assert_eq!(
+            app.sidebar_view,
+            SidebarView::SourceControl,
+            "Cmd+Shift+S must jump to Source Control even from the editor (unlike Cmd+Shift+G, which is overloaded by goto-bottom in the editor)"
+        );
+    }
+
+    #[test]
+    fn cmd_shift_d_jumps_to_run_and_debug_from_any_pane() {
+        let mut app = editor_app_with_lines(&["x"]);
+        app.focus_pane(Pane::Editor);
+        app.handle_key(key(KeyCode::Char('d'), KeyModifiers::SUPER | KeyModifiers::SHIFT)).unwrap();
+        assert_eq!(app.sidebar_view, SidebarView::RunDebug);
+    }
+
+    #[test]
+    fn cmd_shift_r_jumps_to_remote_from_any_pane() {
+        let mut app = editor_app_with_lines(&["x"]);
+        app.focus_pane(Pane::Editor);
+        app.handle_key(key(KeyCode::Char('r'), KeyModifiers::SUPER | KeyModifiers::SHIFT)).unwrap();
+        assert_eq!(app.sidebar_view, SidebarView::Remote);
+    }
+
+    #[test]
+    fn iterm2_image_drag_artefact_does_not_paste_its_path_into_the_editor() {
+        // Root cause of the user's "Pasted 67 chars" surprise: when iTerm2
+        // hijacks a click-drag on an OSC-1337 activity-bar icon, it writes
+        // the decoded PNG to $TMPDIR/iTerm2.<rand>.png and re-injects the
+        // path as a bracketed paste. parse_dropped_paths filters those
+        // paths out of the IMPORT list, but without an early-return in
+        // handle_paste the fallthrough would still insert the raw path
+        // text into the focused editor.
+        let mut app = editor_app_with_lines(&[""]);
+        app.focus_pane(Pane::Editor);
+        let tmp = tempfile::tempdir().unwrap();
+        let temp_dir = tmp.path().join("T").join("com.googlecode.iterm2");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let fake = temp_dir.join("iTerm2.5AO7K5.png");
+        std::fs::write(&fake, b"\x89PNG\r\n\x1a\n").unwrap();
+        let payload = format!("{}\n", fake.display());
+        app.handle_paste(&payload);
+        assert_eq!(
+            app.editor.lines,
+            vec![""],
+            "iTerm2 inline-image drag artefact must be silently dropped at every level — the path string must NOT be pasted as text into the editor body (the user reported a CLAUDE.local.md tab opening with 'Pasted 67 chars' after trying to resize the sidebar near the Explorer icon)"
         );
     }
 

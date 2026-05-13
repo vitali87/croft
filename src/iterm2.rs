@@ -61,6 +61,26 @@ const CMD_SHIFT_G_KEY: &str = "0x47-0x120000-0x5";
 const CMD_SHIFT_G_HEX: &str = "0x1b 0x5b 0x37 0x31 0x3b 0x31 0x30 0x75";
 const CMD_SHIFT_O_KEY: &str = "0x4f-0x120000-0x1f";
 const CMD_SHIFT_O_HEX: &str = "0x1b 0x5b 0x37 0x39 0x3b 0x31 0x30 0x75";
+/// `Cmd+Shift+E` — jump to Explorer sidebar from any pane. Codepoint 'E'
+/// (0x45 = 69), virtualKeyCode `kVK_ANSI_E` = 0x0e, modifier byte 10 =
+/// 1 base + Shift(1) + Super(8). CSI-u payload `ESC [ 69 ; 10 u`.
+const CMD_SHIFT_E_KEY: &str = "0x45-0x120000-0xe";
+const CMD_SHIFT_E_HEX: &str = "0x1b 0x5b 0x36 0x39 0x3b 0x31 0x30 0x75";
+/// `Cmd+Shift+S` — jump to Source Control. Codepoint 'S' (0x53 = 83),
+/// virtualKeyCode `kVK_ANSI_S` = 0x01. CSI-u `ESC [ 83 ; 10 u`.
+const CMD_SHIFT_S_KEY: &str = "0x53-0x120000-0x1";
+const CMD_SHIFT_S_HEX: &str = "0x1b 0x5b 0x38 0x33 0x3b 0x31 0x30 0x75";
+/// `Cmd+Shift+D` — jump to Run and Debug. iTerm2 binds the bare chord to
+/// "Split Horizontally with Same Profile"; the NSUserKeyEquivalents
+/// override below relocates that menu item to Cmd+Opt+Shift+D so this
+/// forwarder fires instead. Codepoint 'D' (0x44 = 68), virtualKeyCode
+/// `kVK_ANSI_D` = 0x02. CSI-u `ESC [ 68 ; 10 u`.
+const CMD_SHIFT_D_KEY: &str = "0x44-0x120000-0x2";
+const CMD_SHIFT_D_HEX: &str = "0x1b 0x5b 0x36 0x38 0x3b 0x31 0x30 0x75";
+/// `Cmd+Shift+R` — jump to Remote sidebar. Codepoint 'R' (0x52 = 82),
+/// virtualKeyCode `kVK_ANSI_R` = 0x0f. CSI-u `ESC [ 82 ; 10 u`.
+const CMD_SHIFT_R_KEY: &str = "0x52-0x120000-0xf";
+const CMD_SHIFT_R_HEX: &str = "0x1b 0x5b 0x38 0x32 0x3b 0x31 0x30 0x75";
 /// `Cmd+P`: VS Code-style Quick Open file finder. macOS binds Cmd+P to the
 /// standard File > Print menu item across virtually every app (iTerm2
 /// included), so AppKit catches the chord at the menu layer before
@@ -224,6 +244,7 @@ pub fn apply_croft_key_settings(plist: &mut Value) -> Result<(), ITerm2Error> {
     // so the original action stays reachable, but the bare Cmd+<key>
     // chord is freed for the GlobalKeyMap forwarder below.
     set_string(menu, "Split Vertically with Same Profile", "@~d".to_string());
+    set_string(menu, "Split Horizontally with Same Profile", "@~D".to_string());
     set_string(menu, "Find Next", "@~g".to_string());
     set_string(menu, "Find Previous", "@~G".to_string());
     set_string(menu, "Jump to Selection", "@~y".to_string());
@@ -289,6 +310,10 @@ pub fn apply_croft_key_settings(plist: &mut Value) -> Result<(), ITerm2Error> {
         (CMD_P_KEY, CMD_P_HEX),
         (CMD_SHIFT_G_KEY, CMD_SHIFT_G_HEX),
         (CMD_SHIFT_O_KEY, CMD_SHIFT_O_HEX),
+        (CMD_SHIFT_E_KEY, CMD_SHIFT_E_HEX),
+        (CMD_SHIFT_S_KEY, CMD_SHIFT_S_HEX),
+        (CMD_SHIFT_D_KEY, CMD_SHIFT_D_HEX),
+        (CMD_SHIFT_R_KEY, CMD_SHIFT_R_HEX),
     ] {
         global.insert(key.into(), send_hex_action(hex, 0));
     }
@@ -646,6 +671,39 @@ mod tests {
                 "GlobalKeyMap missing CSI-u forwarder for Cmd+digit {key}; without it, iTerm2 catches Cmd+digit for Select Tab N and the editor's vim count chord cannot start with a leading digit"
             );
         }
+    }
+
+    #[test]
+    fn apply_croft_key_settings_forwards_cmd_shift_sidebar_jumps_as_csi_u() {
+        let mut plist = synth_plist("GUID-1", &["GUID-1"]);
+        apply_croft_key_settings(&mut plist).unwrap();
+        let top = plist.as_dictionary().unwrap();
+        let global = dict_in(top, "GlobalKeyMap");
+        for (key, hex, label) in [
+            (CMD_SHIFT_E_KEY, CMD_SHIFT_E_HEX, "Cmd+Shift+E (jump to Explorer)"),
+            (CMD_SHIFT_S_KEY, CMD_SHIFT_S_HEX, "Cmd+Shift+S (jump to Source Control)"),
+            (CMD_SHIFT_D_KEY, CMD_SHIFT_D_HEX, "Cmd+Shift+D (jump to Run and Debug)"),
+            (CMD_SHIFT_R_KEY, CMD_SHIFT_R_HEX, "Cmd+Shift+R (jump to Remote)"),
+        ] {
+            assert_eq!(
+                action_text(global, key),
+                hex,
+                "GlobalKeyMap must forward {label} as a CSI-u sequence so the sidebar-jump chord reaches croft; without it, AppKit / iTerm2 menu bindings (most notably Cmd+Shift+D = Split Horizontally) would swallow the chord at the menu layer"
+            );
+        }
+    }
+
+    #[test]
+    fn apply_croft_key_settings_relocates_split_horizontally_menu_off_cmd_shift_d() {
+        let mut plist = synth_plist("GUID-1", &["GUID-1"]);
+        apply_croft_key_settings(&mut plist).unwrap();
+        let top = plist.as_dictionary().unwrap();
+        let menu = dict_in(top, "NSUserKeyEquivalents");
+        assert_eq!(
+            menu.get("Split Horizontally with Same Profile").and_then(|v| v.as_string()),
+            Some("@~D"),
+            "iTerm2's Split Horizontally with Same Profile must be relocated off Cmd+Shift+D so croft's Run-and-Debug jump can claim the chord; @~D = Cmd+Opt+Shift+D keeps the iTerm2 split reachable on a chord croft does not use"
+        );
     }
 
     #[test]
