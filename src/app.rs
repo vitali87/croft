@@ -494,6 +494,11 @@ pub struct App {
     focus: Pane,
     show_tree: bool,
     show_terminal: bool,
+    /// `Ctrl+Shift+J` maximizes the terminal pane: the editor / welcome
+    /// collapses to zero height and the terminal fills the entire right
+    /// column next to the Explorer. Pressing the chord again, or hiding
+    /// the terminal entirely with `Ctrl+J`, clears the flag.
+    terminal_maximized: bool,
     status: String,
     quit: bool,
     context_menu: Option<ContextMenu>,
@@ -1233,6 +1238,7 @@ impl App {
             focus: Pane::Tree,
             show_tree: true,
             show_terminal: true,
+            terminal_maximized: false,
             status: String::from("Ready"),
             quit: false,
             context_menu: None,
@@ -3092,6 +3098,13 @@ impl App {
 
     fn toggle_terminal(&mut self) {
         self.show_terminal = !self.show_terminal;
+        // Hiding the terminal must also clear the maximize flag, otherwise
+        // the next time the user reopens the terminal it would still hide
+        // the editor — which is surprising because Ctrl+J is the user's
+        // mental "show my normal layout again" key.
+        if !self.show_terminal {
+            self.terminal_maximized = false;
+        }
         // If we just hid the terminal while it was focused, fall back to editor.
         if !self.show_terminal && self.focus == Pane::Terminal {
             self.focus_pane(Pane::Editor);
@@ -3099,6 +3112,25 @@ impl App {
         // If we just showed the terminal, optionally jump focus to it for quick use.
         if self.show_terminal {
             self.focus_pane(Pane::Terminal);
+        }
+    }
+
+    /// `Ctrl+Shift+J`: flip the maximize-terminal flag. When turning ON,
+    /// also ensure the terminal pane is visible and focused so the user
+    /// can start typing immediately. When turning OFF, re-arm the welcome
+    /// wordmark so it re-paints in the restored editor area.
+    fn toggle_terminal_maximize(&mut self) {
+        self.terminal_maximized = !self.terminal_maximized;
+        if self.terminal_maximized {
+            if !self.show_terminal {
+                self.show_terminal = true;
+            }
+            self.focus_pane(Pane::Terminal);
+            if self.welcome_image_displayed {
+                self.welcome_image_clear_requested = true;
+            }
+        } else {
+            self.welcome_overlay_dirty = true;
         }
     }
 
@@ -3273,30 +3305,44 @@ impl App {
         self.last_content_height = right_area.height;
 
         let (editor_area, terminal_area) = if self.show_terminal {
-            let total_h = right_area.height;
-            let pinned = self.terminal_height.map(|h| {
-                h.clamp(
-                    TERMINAL_HEIGHT_MIN,
-                    total_h.saturating_sub(EDITOR_HEIGHT_MIN).max(TERMINAL_HEIGHT_MIN),
-                )
-            });
-            let right = if let Some(term_h) = pinned {
-                self.terminal_height = Some(term_h);
-                Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([
-                        Constraint::Min(EDITOR_HEIGHT_MIN),
-                        Constraint::Length(term_h),
-                    ])
-                    .split(right_area)
+            if self.terminal_maximized {
+                // Editor / welcome collapses; terminal fills the entire
+                // right column next to the Explorer. Splitter is hidden
+                // because there is nothing to drag against.
+                let zero_editor = Rect {
+                    x: right_area.x,
+                    y: right_area.y,
+                    width: right_area.width,
+                    height: 0,
+                };
+                self.terminal_splitter_y = None;
+                (zero_editor, Some(right_area))
             } else {
-                Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([Constraint::Percentage(65), Constraint::Percentage(35)])
-                    .split(right_area)
-            };
-            self.terminal_splitter_y = Some(right[1].y);
-            (right[0], Some(right[1]))
+                let total_h = right_area.height;
+                let pinned = self.terminal_height.map(|h| {
+                    h.clamp(
+                        TERMINAL_HEIGHT_MIN,
+                        total_h.saturating_sub(EDITOR_HEIGHT_MIN).max(TERMINAL_HEIGHT_MIN),
+                    )
+                });
+                let right = if let Some(term_h) = pinned {
+                    self.terminal_height = Some(term_h);
+                    Layout::default()
+                        .direction(Direction::Vertical)
+                        .constraints([
+                            Constraint::Min(EDITOR_HEIGHT_MIN),
+                            Constraint::Length(term_h),
+                        ])
+                        .split(right_area)
+                } else {
+                    Layout::default()
+                        .direction(Direction::Vertical)
+                        .constraints([Constraint::Percentage(65), Constraint::Percentage(35)])
+                        .split(right_area)
+                };
+                self.terminal_splitter_y = Some(right[1].y);
+                (right[0], Some(right[1]))
+            }
         } else {
             self.terminal_splitter_y = None;
             (right_area, None)
@@ -3822,6 +3868,10 @@ impl App {
         }
         if is_terminal_toggle_key(key) {
             self.toggle_terminal();
+            return Ok(());
+        }
+        if is_terminal_maximize_key(key) {
+            self.toggle_terminal_maximize();
             return Ok(());
         }
         if is_terminal_split_key(key) {
@@ -8152,7 +8202,9 @@ fn is_source_control_jump_key(key: KeyEvent) -> bool {
 /// Returns true if the given key event should toggle the terminal pane.
 /// VS Code uses `Ctrl+`` ` `` (backtick); we use `Ctrl+J` to match its
 /// "Toggle Terminal Panel" shortcut, which is more reliable to type on
-/// non-US keyboards. Case-insensitive on the letter so Shift+Ctrl+J works too.
+/// non-US keyboards. Case-insensitive on the letter. SHIFT must NOT be
+/// held — Ctrl+Shift+J is reserved for the maximize-terminal chord and
+/// must not double-fire as a toggle.
 fn is_terminal_toggle_key(key: KeyEvent) -> bool {
     let KeyCode::Char(c) = key.code else {
         return false;
@@ -8161,6 +8213,23 @@ fn is_terminal_toggle_key(key: KeyEvent) -> bool {
         return false;
     }
     key.modifiers.contains(KeyModifiers::CONTROL)
+        && !key.modifiers.contains(KeyModifiers::SHIFT)
+}
+
+/// `Ctrl+Shift+J`: toggle "maximize terminal" — the editor / welcome pane
+/// collapses and the terminal fills the right column next to the Explorer.
+/// Pressing it again restores the previous editor↔terminal split.
+fn is_terminal_maximize_key(key: KeyEvent) -> bool {
+    let KeyCode::Char(c) = key.code else {
+        return false;
+    };
+    if !c.eq_ignore_ascii_case(&'j') {
+        return false;
+    }
+    key.modifiers.contains(KeyModifiers::CONTROL)
+        && key.modifiers.contains(KeyModifiers::SHIFT)
+        && !key.modifiers.contains(KeyModifiers::ALT)
+        && !key.modifiers.contains(KeyModifiers::SUPER)
 }
 
 /// `Ctrl+Shift+T`: spawn an additional terminal next to the active one.
@@ -10028,14 +10097,187 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_shift_j_is_also_terminal_toggle() {
+    fn ctrl_shift_j_is_not_terminal_toggle_anymore() {
+        // Ctrl+Shift+J is now reserved for the terminal-maximize chord, so
+        // the terminal-toggle matcher must reject it. Ctrl+J alone (with no
+        // shift) still toggles.
         let mods = KeyModifiers::CONTROL | KeyModifiers::SHIFT;
-        assert!(is_terminal_toggle_key(key(KeyCode::Char('J'), mods)));
+        assert!(!is_terminal_toggle_key(key(KeyCode::Char('J'), mods)));
+        assert!(!is_terminal_toggle_key(key(KeyCode::Char('j'), mods)));
     }
 
     #[test]
     fn plain_j_is_not_terminal_toggle() {
         assert!(!is_terminal_toggle_key(key(KeyCode::Char('j'), KeyModifiers::NONE)));
+    }
+
+    #[test]
+    fn ctrl_shift_j_is_terminal_maximize_key() {
+        let mods = KeyModifiers::CONTROL | KeyModifiers::SHIFT;
+        assert!(is_terminal_maximize_key(key(KeyCode::Char('J'), mods)));
+        assert!(is_terminal_maximize_key(key(KeyCode::Char('j'), mods)));
+    }
+
+    #[test]
+    fn plain_ctrl_j_is_not_terminal_maximize_key() {
+        assert!(!is_terminal_maximize_key(key(KeyCode::Char('j'), KeyModifiers::CONTROL)));
+    }
+
+    #[test]
+    fn plain_shift_j_is_not_terminal_maximize_key() {
+        assert!(!is_terminal_maximize_key(key(KeyCode::Char('J'), KeyModifiers::SHIFT)));
+    }
+
+    #[test]
+    fn alt_or_super_blocks_terminal_maximize_key() {
+        let with_alt = KeyModifiers::CONTROL | KeyModifiers::SHIFT | KeyModifiers::ALT;
+        let with_super = KeyModifiers::CONTROL | KeyModifiers::SHIFT | KeyModifiers::SUPER;
+        assert!(!is_terminal_maximize_key(key(KeyCode::Char('J'), with_alt)));
+        assert!(!is_terminal_maximize_key(key(KeyCode::Char('J'), with_super)));
+    }
+
+    #[test]
+    fn ctrl_shift_j_toggles_terminal_maximize_state_via_handle_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        assert!(!app.terminal_maximized, "fresh app starts un-maximized");
+        let chord = key(
+            KeyCode::Char('J'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        );
+        app.handle_key(chord).unwrap();
+        assert!(app.terminal_maximized, "first chord maximizes");
+        assert!(app.show_terminal, "maximize forces terminal visible");
+        assert!(
+            matches!(app.focus, Pane::Terminal),
+            "maximize focuses the terminal"
+        );
+        app.handle_key(chord).unwrap();
+        assert!(!app.terminal_maximized, "second chord restores split");
+    }
+
+    #[test]
+    fn ctrl_j_clears_maximize_when_hiding_terminal() {
+        // Mental contract: Ctrl+J means "give me my normal layout back."
+        // Hiding the terminal must clear the maximize flag so the next
+        // Ctrl+J reopen restores the editor+terminal split, not a stuck
+        // maximized terminal.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        let max_chord = key(
+            KeyCode::Char('J'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        );
+        let toggle_chord = key(KeyCode::Char('j'), KeyModifiers::CONTROL);
+        app.handle_key(max_chord).unwrap();
+        assert!(app.terminal_maximized);
+        app.handle_key(toggle_chord).unwrap();
+        assert!(!app.show_terminal, "Ctrl+J hides the terminal");
+        assert!(
+            !app.terminal_maximized,
+            "hiding the terminal also clears maximize"
+        );
+        app.handle_key(toggle_chord).unwrap();
+        assert!(app.show_terminal, "Ctrl+J reshows the terminal");
+        assert!(
+            !app.terminal_maximized,
+            "reopened terminal stays in normal split, not maximized"
+        );
+    }
+
+    #[test]
+    fn maximized_terminal_collapses_editor_in_render_layout() {
+        // Drive an actual frame and assert the editor pane received zero
+        // height while the terminal occupies the full right column. This
+        // pins the user-visible behavior, not just the flag.
+        use ratatui::{Terminal, backend::TestBackend};
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        let max_chord = key(
+            KeyCode::Char('J'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        );
+        app.handle_key(max_chord).unwrap();
+        let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        term.draw(|f| app.render(f)).unwrap();
+        assert_eq!(
+            app.editor.last_area.height, 0,
+            "maximized terminal must collapse editor to zero rows"
+        );
+        assert!(
+            app.editor.last_full_area.width > 0,
+            "editor still tracks its column for hit-testing"
+        );
+    }
+
+    #[test]
+    fn maximizing_terminal_requests_welcome_image_clear_when_image_was_displayed() {
+        // Repro for "wordmark + icon bleed through the maximized terminal":
+        // the welcome OSC-1337 image was painted at the editor pane's cells
+        // before maximize. Maximizing collapses the editor to zero height
+        // and the terminal pane now covers those cells, but iTerm2 still
+        // has the image cached at the old cell positions. ratatui's text
+        // writes do NOT evict that cache - only a one-shot terminal.clear()
+        // does, gated by consume_welcome_image_clear().
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.welcome_image_displayed = true;
+        let chord = key(
+            KeyCode::Char('J'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        );
+        app.handle_key(chord).unwrap();
+        assert!(app.terminal_maximized, "first chord maximizes");
+        assert!(
+            app.consume_welcome_image_clear(),
+            "maximize must arm a one-shot welcome image clear"
+        );
+    }
+
+    #[test]
+    fn maximizing_terminal_is_noop_for_welcome_clear_when_image_was_not_displayed() {
+        // No prior emit means iTerm has no cached cells to evict; the clear
+        // chain must stay silent so the main loop doesn't pointlessly
+        // CSI-2J the screen every time the user toggles maximize before
+        // they ever land on the welcome panel.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.welcome_image_displayed = false;
+        let chord = key(
+            KeyCode::Char('J'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        );
+        app.handle_key(chord).unwrap();
+        assert!(app.terminal_maximized);
+        assert!(
+            !app.consume_welcome_image_clear(),
+            "maximize must NOT arm a clear when no image was ever emitted"
+        );
+    }
+
+    #[test]
+    fn restoring_terminal_from_maximize_rearms_welcome_overlay_dirty() {
+        // After a clear, the post-draw emitter re-paints the welcome only
+        // when welcome_overlay_dirty is true. render_welcome only sets it
+        // when the layout *changes*, so if the restored editor area is
+        // bit-identical to the pre-maximize area the dirty flag would
+        // stay false and the wordmark would never come back. Exit must
+        // arm it explicitly.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        let chord = key(
+            KeyCode::Char('J'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        );
+        app.handle_key(chord).unwrap();
+        assert!(app.terminal_maximized);
+        app.welcome_overlay_dirty = false;
+        app.handle_key(chord).unwrap();
+        assert!(!app.terminal_maximized);
+        assert!(
+            app.welcome_overlay_dirty,
+            "exiting maximize must re-arm welcome_overlay_dirty so the wordmark re-paints"
+        );
     }
 
     #[test]
@@ -15187,6 +15429,7 @@ fn main_loop(
                 && app.file_finder.is_none()
                 && app.editor.is_blank_initial()
                 && app.welcome_overlay_dirty
+                && !app.terminal_maximized
             {
                 if let (Some(img), Some(layout)) =
                     (app.welcome_image.as_ref(), app.welcome_layout)

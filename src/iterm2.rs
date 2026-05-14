@@ -87,6 +87,19 @@ const CMD_SHIFT_R_HEX: &str = "0x1b 0x5b 0x38 0x32 0x3b 0x31 0x30 0x75";
 /// layer before croft's Explorer-pane handler sees it.
 const CMD_SHIFT_N_KEY: &str = "0x4e-0x120000-0x2d";
 const CMD_SHIFT_N_HEX: &str = "0x1b 0x5b 0x37 0x38 0x3b 0x31 0x30 0x75";
+/// `Ctrl+Shift+J` — toggle "maximize terminal" so the editor / welcome
+/// pane collapses and the terminal fills the right column. Codepoint 'J'
+/// (0x4a = 74), modifier mask 0x60000 = NSEventModifierFlagControl(0x40000)
+/// + NSEventModifierFlagShift(0x20000), virtualKeyCode `kVK_ANSI_J` = 0x26.
+/// CSI-u `ESC [ 74 ; 6 u` where modifier byte 6 = 1 base + Shift(1) +
+/// Control(4). Crossterm decodes it back to
+/// `KeyEvent { code: Char('J'), modifiers: CONTROL | SHIFT }`, which
+/// `is_terminal_maximize_key` accepts case-insensitively. Forwarded
+/// defensively to mirror the Cmd-chord pattern even though Ctrl+Shift+J
+/// is not bound by AppKit / iTerm2 menus today, so a future iTerm2 build
+/// that adds a default cannot silently swallow the chord.
+const CTRL_SHIFT_J_KEY: &str = "0x4a-0x60000-0x26";
+const CTRL_SHIFT_J_HEX: &str = "0x1b 0x5b 0x37 0x34 0x3b 0x36 0x75";
 /// `Cmd+P`: VS Code-style Quick Open file finder. macOS binds Cmd+P to the
 /// standard File > Print menu item across virtually every app (iTerm2
 /// included), so AppKit catches the chord at the menu layer before
@@ -321,6 +334,7 @@ pub fn apply_croft_key_settings(plist: &mut Value) -> Result<(), ITerm2Error> {
         (CMD_SHIFT_D_KEY, CMD_SHIFT_D_HEX),
         (CMD_SHIFT_R_KEY, CMD_SHIFT_R_HEX),
         (CMD_SHIFT_N_KEY, CMD_SHIFT_N_HEX),
+        (CTRL_SHIFT_J_KEY, CTRL_SHIFT_J_HEX),
     ] {
         global.insert(key.into(), send_hex_action(hex, 0));
     }
@@ -711,6 +725,19 @@ mod tests {
                 "GlobalKeyMap must forward {label} as a CSI-u sequence so the sidebar-jump chord reaches croft; without it, AppKit / iTerm2 menu bindings (most notably Cmd+Shift+D = Split Horizontally) would swallow the chord at the menu layer"
             );
         }
+    }
+
+    #[test]
+    fn apply_croft_key_settings_forwards_ctrl_shift_j_for_terminal_maximize() {
+        let mut plist = synth_plist("GUID-1", &["GUID-1"]);
+        apply_croft_key_settings(&mut plist).unwrap();
+        let top = plist.as_dictionary().unwrap();
+        let global = dict_in(top, "GlobalKeyMap");
+        assert_eq!(
+            action_text(global, CTRL_SHIFT_J_KEY),
+            CTRL_SHIFT_J_HEX,
+            "GlobalKeyMap must forward Ctrl+Shift+J as a CSI-u sequence so the maximize-terminal chord reaches croft as Char('J') + CONTROL+SHIFT regardless of any future AppKit / iTerm2 default that might bind the chord and swallow it at the menu layer"
+        );
     }
 
     #[test]

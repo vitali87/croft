@@ -27,6 +27,7 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
             ShortcutEntry { keys: "F6", description: "Cycle focus across panes" },
             ShortcutEntry { keys: "Ctrl+B", description: "Toggle the sidebar" },
             ShortcutEntry { keys: "Ctrl+J", description: "Toggle the terminal pane" },
+            ShortcutEntry { keys: "Ctrl+Shift+J", description: "Maximize the terminal pane (collapses editor; press again to restore)" },
             ShortcutEntry { keys: "Cmd/Ctrl+P", description: "Quick Open: fuzzy-search workspace files by name" },
             ShortcutEntry { keys: "Cmd/Ctrl+Shift+E", description: "Jump to the Explorer sidebar" },
             ShortcutEntry { keys: "Cmd/Ctrl+Shift+F", description: "Jump to the Search sidebar" },
