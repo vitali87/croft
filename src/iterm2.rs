@@ -81,6 +81,12 @@ const CMD_SHIFT_D_HEX: &str = "0x1b 0x5b 0x36 0x38 0x3b 0x31 0x30 0x75";
 /// virtualKeyCode `kVK_ANSI_R` = 0x0f. CSI-u `ESC [ 82 ; 10 u`.
 const CMD_SHIFT_R_KEY: &str = "0x52-0x120000-0xf";
 const CMD_SHIFT_R_HEX: &str = "0x1b 0x5b 0x38 0x32 0x3b 0x31 0x30 0x75";
+/// `Cmd+Shift+N` — Explorer "New Folder". Codepoint 'N' (0x4e = 78),
+/// virtualKeyCode `kVK_ANSI_N` = 0x2d. CSI-u `ESC [ 78 ; 10 u`. Forwarded
+/// defensively so AppKit / iTerm2 cannot consume the chord at the menu
+/// layer before croft's Explorer-pane handler sees it.
+const CMD_SHIFT_N_KEY: &str = "0x4e-0x120000-0x2d";
+const CMD_SHIFT_N_HEX: &str = "0x1b 0x5b 0x37 0x38 0x3b 0x31 0x30 0x75";
 /// `Cmd+P`: VS Code-style Quick Open file finder. macOS binds Cmd+P to the
 /// standard File > Print menu item across virtually every app (iTerm2
 /// included), so AppKit catches the chord at the menu layer before
@@ -314,6 +320,7 @@ pub fn apply_croft_key_settings(plist: &mut Value) -> Result<(), ITerm2Error> {
         (CMD_SHIFT_S_KEY, CMD_SHIFT_S_HEX),
         (CMD_SHIFT_D_KEY, CMD_SHIFT_D_HEX),
         (CMD_SHIFT_R_KEY, CMD_SHIFT_R_HEX),
+        (CMD_SHIFT_N_KEY, CMD_SHIFT_N_HEX),
     ] {
         global.insert(key.into(), send_hex_action(hex, 0));
     }
@@ -671,6 +678,19 @@ mod tests {
                 "GlobalKeyMap missing CSI-u forwarder for Cmd+digit {key}; without it, iTerm2 catches Cmd+digit for Select Tab N and the editor's vim count chord cannot start with a leading digit"
             );
         }
+    }
+
+    #[test]
+    fn apply_croft_key_settings_forwards_cmd_shift_n_for_explorer_new_folder() {
+        let mut plist = synth_plist("GUID-1", &["GUID-1"]);
+        apply_croft_key_settings(&mut plist).unwrap();
+        let top = plist.as_dictionary().unwrap();
+        let global = dict_in(top, "GlobalKeyMap");
+        assert_eq!(
+            action_text(global, CMD_SHIFT_N_KEY),
+            CMD_SHIFT_N_HEX,
+            "GlobalKeyMap must forward Cmd+Shift+N as a CSI-u sequence so the Explorer's New Folder chord reaches croft regardless of any AppKit / iTerm2 menu binding that might otherwise consume it at the menu layer"
+        );
     }
 
     #[test]

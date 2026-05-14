@@ -269,7 +269,7 @@ enum MenuAction {
 fn shortcut_for(action: &MenuAction) -> Option<&'static str> {
     match action {
         MenuAction::Create(CreateKind::File) => Some("⌘F"),
-        MenuAction::Create(CreateKind::Folder) => Some("⌘⇧F"),
+        MenuAction::Create(CreateKind::Folder) => Some("⌘⇧N"),
         MenuAction::Cut(_) => Some("⌘X"),
         MenuAction::Copy(_) => Some("⌘C"),
         MenuAction::Paste(_) => Some("⌘V"),
@@ -8021,12 +8021,21 @@ fn is_tree_new_file_key(key: KeyEvent) -> bool {
     key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::SUPER)
 }
 
-/// Explorer-pane shortcut: `Cmd+Shift+F` / `Ctrl+Shift+F` - "New Folder".
-/// Same chord as `is_search_jump_key`; the global dispatcher gives the
-/// Explorer-context handler first refusal so this only fires when the
-/// tree is the focused pane.
+/// Explorer-pane shortcut: `Cmd+Shift+N` / `Ctrl+Shift+N` - "New Folder".
+/// The global dispatcher gives the Explorer-context handler first refusal
+/// so this only fires when the tree is the focused pane; outside Explorer
+/// the chord is unbound and falls through to the focused pane.
 fn is_tree_new_folder_key(key: KeyEvent) -> bool {
-    is_search_jump_key(key)
+    let KeyCode::Char(c) = key.code else { return false };
+    if !c.eq_ignore_ascii_case(&'n') {
+        return false;
+    }
+    if !key.modifiers.contains(KeyModifiers::SHIFT)
+        || key.modifiers.contains(KeyModifiers::ALT)
+    {
+        return false;
+    }
+    key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::SUPER)
 }
 
 /// Explorer-pane shortcut: `Cmd+R` / `Ctrl+R` (no Shift) OR plain `F2` -
@@ -10305,20 +10314,32 @@ mod tests {
         assert!(is_tree_new_file_key(key(KeyCode::Char('f'), KeyModifiers::SUPER)));
         assert!(is_tree_new_file_key(key(KeyCode::Char('F'), KeyModifiers::CONTROL)));
         assert!(!is_tree_new_file_key(key(KeyCode::Char('f'), KeyModifiers::NONE)));
-        // Shift+Super disqualifies New File so Cmd+Shift+F routes to New Folder.
+        // Shift+Super disqualifies New File so Cmd+Shift+F can fall through to
+        // the global Search jump (New Folder now lives on Cmd+Shift+N).
         assert!(!is_tree_new_file_key(key(
             KeyCode::Char('F'),
             KeyModifiers::SUPER | KeyModifiers::SHIFT
         )));
 
         assert!(is_tree_new_folder_key(key(
-            KeyCode::Char('F'),
+            KeyCode::Char('N'),
             KeyModifiers::SUPER | KeyModifiers::SHIFT
         )));
+        assert!(is_tree_new_folder_key(key(
+            KeyCode::Char('N'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT
+        )));
         assert!(!is_tree_new_folder_key(key(
-            KeyCode::Char('f'),
+            KeyCode::Char('n'),
             KeyModifiers::SUPER
         )));
+        assert!(
+            !is_tree_new_folder_key(key(
+                KeyCode::Char('F'),
+                KeyModifiers::SUPER | KeyModifiers::SHIFT
+            )),
+            "Cmd+Shift+F is no longer the New Folder chord — it must fall through to the global Search jump"
+        );
 
         assert!(is_tree_rename_key(key(KeyCode::Char('r'), KeyModifiers::SUPER)));
         assert!(is_tree_rename_key(key(KeyCode::F(2), KeyModifiers::NONE)));
@@ -10469,10 +10490,34 @@ mod tests {
     }
 
     #[test]
-    fn cmd_shift_f_in_explorer_pane_creates_a_new_folder_not_search_jump() {
-        // With Explorer focused, Cmd+Shift+F must trigger the New Folder
-        // prompt (user-requested binding) instead of the default global
-        // Search-jump action. Outside Explorer the global behavior wins.
+    fn cmd_shift_n_in_explorer_pane_creates_a_new_folder() {
+        // With Explorer focused, Cmd+Shift+N opens the New Folder prompt
+        // (the user-requested binding, moved off Cmd+Shift+F so that chord
+        // can always reach the global Search jump).
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.focus_pane(Pane::Tree);
+        app.sidebar_view = SidebarView::Explorer;
+        app.handle_key(key(
+            KeyCode::Char('N'),
+            KeyModifiers::SUPER | KeyModifiers::SHIFT,
+        ))
+        .unwrap();
+        assert!(
+            matches!(
+                app.prompt.as_ref(),
+                Some(Prompt { kind: PromptKind::Create(CreateKind::Folder), .. })
+            ),
+            "Explorer-focused Cmd+Shift+N must open a New Folder prompt"
+        );
+        assert_eq!(app.sidebar_view, SidebarView::Explorer, "must NOT jump to Search");
+    }
+
+    #[test]
+    fn cmd_shift_f_in_explorer_pane_jumps_to_search_not_new_folder() {
+        // Cmd+Shift+F is no longer the Explorer's New Folder chord — it
+        // now always jumps to the Search sidebar, even when Explorer is
+        // focused. New Folder lives on Cmd+Shift+N.
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(tmp.path().to_path_buf()).unwrap();
         app.focus_pane(Pane::Tree);
@@ -10483,13 +10528,10 @@ mod tests {
         ))
         .unwrap();
         assert!(
-            matches!(
-                app.prompt.as_ref(),
-                Some(Prompt { kind: PromptKind::Create(CreateKind::Folder), .. })
-            ),
-            "Explorer-focused Cmd+Shift+F must open a New Folder prompt"
+            app.prompt.is_none(),
+            "Cmd+Shift+F must NOT open the New Folder prompt anymore"
         );
-        assert_eq!(app.sidebar_view, SidebarView::Explorer, "must NOT jump to Search");
+        assert_eq!(app.sidebar_view, SidebarView::Search);
     }
 
     #[test]
@@ -10515,7 +10557,7 @@ mod tests {
         );
         assert_eq!(
             shortcut_for(&MenuAction::Create(CreateKind::Folder)),
-            Some("⌘⇧F")
+            Some("⌘⇧N")
         );
         assert_eq!(shortcut_for(&MenuAction::Cut(vec![p.clone()])), Some("⌘X"));
         assert_eq!(shortcut_for(&MenuAction::Copy(vec![p.clone()])), Some("⌘C"));

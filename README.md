@@ -217,6 +217,7 @@ This writes the default-profile font settings plus Croft's iTerm2 keyboard setup
 | `⌘⇧S` | `\x1b[83;10u` | Jump to Source Control |
 | `⌘⇧D` | `\x1b[68;10u` | Jump to Run and Debug |
 | `⌘⇧R` | `\x1b[82;10u` | Jump to Remote (SSH) |
+| `⌘⇧N` | `\x1b[78;10u` | Explorer "New folder" prompt (when the tree is focused) |
 | `⌘V` | `\x1b[118;9u` in global and profile key maps | Read the system clipboard and paste into the focused editor, or into Search when Search is active |
 
 It also moves the following iTerm2 / macOS menu shortcuts out of the way (each goes to `Cmd+Opt+<letter>` so the original iTerm2 action stays reachable on a chord croft does not use): **Edit → Find → Find Globally...** off `⌘⇧F`, **Edit → Paste** off `⌘V`, **Shell → Split Vertically with Same Profile** off `⌘D`, **Shell → Split Horizontally with Same Profile** off `⌘⇧D`, **Edit → Find Next / Find Previous / Jump to Selection**, **File → Print** off `⌘P`, **Window → Select Tab 1..9** off `⌘1..⌘9`, and the macOS **Help → Show Help Menu** off `⌘⇧/`. Fully quit iTerm2 with `⌘Q` and reopen it after setup; iTerm2 caches its plist while running.

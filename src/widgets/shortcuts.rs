@@ -49,7 +49,7 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
             ShortcutEntry { keys: "Cmd/Ctrl+A", description: "Select every visible row" },
             ShortcutEntry { keys: "Cmd/Ctrl+C / X / V", description: "Copy / cut / paste paths in the explorer clipboard" },
             ShortcutEntry { keys: "Cmd/Ctrl+F", description: "New file in selected folder" },
-            ShortcutEntry { keys: "Cmd/Ctrl+Shift+F", description: "New folder in selected folder" },
+            ShortcutEntry { keys: "Cmd/Ctrl+Shift+N", description: "New folder in selected folder" },
             ShortcutEntry { keys: "Cmd/Ctrl+R or F2", description: "Rename" },
             ShortcutEntry { keys: "Cmd/Ctrl+/", description: "Re-root the workspace at the selected folder" },
             ShortcutEntry { keys: "Cmd/Ctrl+Shift+/", description: "Re-root at parent of the selected node" },
@@ -332,6 +332,23 @@ mod tests {
         };
         modal.scroll_up(100);
         assert_eq!(modal.scroll, 0);
+    }
+
+    #[test]
+    fn explorer_new_folder_entry_documents_cmd_shift_n_not_cmd_shift_f() {
+        let explorer = SHORTCUT_GROUPS
+            .iter()
+            .find(|g| g.title == "Explorer")
+            .expect("Explorer group must be present in the shortcuts modal");
+        let new_folder = explorer
+            .entries
+            .iter()
+            .find(|e| e.description == "New folder in selected folder")
+            .expect("Explorer group must list a 'New folder in selected folder' entry");
+        assert_eq!(
+            new_folder.keys, "Cmd/Ctrl+Shift+N",
+            "New Folder lives on Cmd+Shift+N — Cmd+Shift+F now always jumps to the Search sidebar, so the modal must document the new chord"
+        );
     }
 
     #[test]
