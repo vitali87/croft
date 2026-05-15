@@ -31,8 +31,6 @@ pub enum MatchTier {
 #[derive(Clone, Debug)]
 pub struct ScoredResult {
     pub entry: FileEntry,
-    pub tier: MatchTier,
-    pub score: i32,
 }
 
 #[derive(Default)]
@@ -61,6 +59,7 @@ impl FileFinder {
         me
     }
 
+    #[cfg(test)]
     pub fn set_query(&mut self, q: &str) {
         if q == self.query {
             return;
@@ -120,8 +119,6 @@ impl FileFinder {
             for entry in self.entries.iter().take(MAX_RESULTS) {
                 scored.push(ScoredResult {
                     entry: entry.clone(),
-                    tier: MatchTier::Subsequence,
-                    score: 0,
                 });
             }
             scored.sort_by(|a, b| a.entry.rel.cmp(&b.entry.rel));
@@ -146,10 +143,8 @@ impl FileFinder {
         top.truncate(MAX_RESULTS);
         self.results = top
             .into_iter()
-            .map(|(tier, score, idx)| ScoredResult {
+            .map(|(_, _, idx)| ScoredResult {
                 entry: self.entries[idx].clone(),
-                tier,
-                score,
             })
             .collect();
     }
