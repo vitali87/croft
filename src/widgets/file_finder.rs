@@ -73,6 +73,22 @@ impl FileFinder {
         self.scroll = 0;
     }
 
+    pub fn replace_entries(&mut self, entries: Arc<Vec<FileEntry>>) {
+        if Arc::ptr_eq(&self.entries, &entries) {
+            return;
+        }
+        self.entries = entries;
+        self.refresh_results();
+        if self.results.is_empty() {
+            self.selected = 0;
+        } else if self.selected >= self.results.len() {
+            self.selected = self.results.len() - 1;
+        }
+        if self.scroll > self.selected {
+            self.scroll = self.selected;
+        }
+    }
+
     pub fn push_char(&mut self, c: char) {
         self.query.push(c);
         self.refresh_results();
@@ -921,6 +937,41 @@ mod tests {
                 ms
             );
         }
+    }
+
+    #[test]
+    fn replace_entries_re_ranks_results_against_the_new_index() {
+        let entries = Arc::new(vec![entry("alpha.rs"), entry("beta.rs")]);
+        let mut finder = FileFinder::new(entries);
+        finder.set_query("resolver.ts");
+        assert!(finder.visible_results().is_empty(), "no resolver.ts in initial index");
+        let new_entries = Arc::new(vec![
+            entry("alpha.rs"),
+            entry("beta.rs"),
+            entry("packages/ant-ts-lib-noggin/src/entities/files/resolver.ts"),
+        ]);
+        finder.replace_entries(new_entries);
+        let rels: Vec<&str> = finder
+            .visible_results()
+            .iter()
+            .map(|r| r.entry.rel.as_str())
+            .collect();
+        assert_eq!(
+            rels.first().copied(),
+            Some("packages/ant-ts-lib-noggin/src/entities/files/resolver.ts"),
+            "after replace_entries the new index must drive the result list; got {rels:?}"
+        );
+    }
+
+    #[test]
+    fn replace_entries_clamps_selection_when_results_shrink() {
+        let entries = Arc::new(vec![entry("alpha.rs"), entry("beta.rs"), entry("gamma.rs")]);
+        let mut finder = FileFinder::new(entries);
+        finder.select_next();
+        finder.select_next();
+        assert_eq!(finder.selected_index(), 2);
+        finder.replace_entries(Arc::new(vec![entry("alpha.rs")]));
+        assert_eq!(finder.selected_index(), 0, "selection must clamp to last visible row when the index shrinks");
     }
 
     #[test]

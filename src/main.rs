@@ -9,6 +9,7 @@ mod iterm2_inline;
 mod lsp;
 mod pdf;
 mod remote;
+mod remote_connect;
 mod sheet;
 mod widgets;
 

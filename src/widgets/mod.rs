@@ -1,4 +1,5 @@
 pub mod completion_popup;
+pub mod connect_dialog;
 pub mod diff;
 pub mod editor;
 pub mod editor_find;

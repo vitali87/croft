@@ -146,8 +146,23 @@ fn is_explicit_host_alias(alias: &str) -> bool {
 }
 
 pub fn launch_croft(host: &str, path: Option<&str>) -> Result<()> {
+    launch_croft_with(host, path, None)
+}
+
+/// Same as `launch_croft` but reuses an already-established SSH ControlMaster
+/// socket so the in-TUI auth flow (PTY-driven password dialog) doesn't need
+/// to prompt the user a second time when the post-quit path hands off the
+/// connection.
+pub fn launch_croft_with(
+    host: &str,
+    path: Option<&str>,
+    adopted: Option<AdoptedMaster>,
+) -> Result<()> {
     println!("Connecting to {host}...");
-    let ssh = SshControl::start(host)?;
+    let ssh = match adopted {
+        Some(a) => SshControl::adopt(a),
+        None => SshControl::start(host)?,
+    };
     let local_stamp = local_source_stamp()?;
     if remote_install_needed(&ssh, &local_stamp)? {
         println!("Installing/updating Croft on {host}...");
@@ -178,13 +193,30 @@ pub fn launch_croft(host: &str, path: Option<&str>) -> Result<()> {
     anyhow::bail!("ssh exited with {status}");
 }
 
-struct SshControl {
+pub struct SshControl {
     host: String,
     socket_dir: PathBuf,
     socket_path: PathBuf,
 }
 
+/// Hand-off bundle for an already-established SSH ControlMaster, used by
+/// the in-TUI password dialog to avoid re-prompting the user when the
+/// post-quit flow takes over the connection.
+pub struct AdoptedMaster {
+    pub host: String,
+    pub socket_dir: PathBuf,
+    pub socket_path: PathBuf,
+}
+
 impl SshControl {
+    pub fn adopt(a: AdoptedMaster) -> Self {
+        Self {
+            host: a.host,
+            socket_dir: a.socket_dir,
+            socket_path: a.socket_path,
+        }
+    }
+
     fn start(host: &str) -> Result<Self> {
         let socket_dir = ssh_control_dir()?;
         std::fs::create_dir_all(&socket_dir)
@@ -790,7 +822,7 @@ fn relay_session_id() -> String {
     format!("{}-{now}", std::process::id())
 }
 
-fn ssh_control_dir() -> Result<PathBuf> {
+pub fn ssh_control_dir() -> Result<PathBuf> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .context("system clock before unix epoch")?

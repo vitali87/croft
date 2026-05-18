@@ -670,6 +670,8 @@ pub struct App {
     fs_poll_dir_mtimes: std::collections::BTreeMap<PathBuf, Option<std::time::SystemTime>>,
     fs_poll_open_file_mtime: Option<(PathBuf, Option<(std::time::SystemTime, u64)>)>,
     remote_launch: Option<RemoteLaunch>,
+    pending_remote_launch_host: Option<String>,
+    pending_remote_launch_path: Option<String>,
     /// Explorer-scoped Cut/Copy buffer. Independent from the OS clipboard
     /// (which carries text), this stores filesystem paths and the intent
     /// (move vs. copy) until the next Paste consumes it.
@@ -787,6 +789,8 @@ pub struct App {
     editor_vim_chord: EditorVimChord,
     shortcuts_modal: Option<crate::widgets::shortcuts::ShortcutsModal>,
     shortcuts_hit_rect: Option<Rect>,
+    connect_dialog: Option<crate::widgets::connect_dialog::ConnectDialog>,
+    connect_auth: Option<crate::remote_connect::SshAuth>,
     /// One-shot flag the driver consumes to fire `terminal.clear()` so
     /// iTerm2 evicts the OSC-1337 image cells (activity bar icons,
     /// welcome wordmark, editor image preview) that would otherwise
@@ -824,6 +828,11 @@ pub struct App {
     /// One-shot: armed on open and close to evict iTerm2's image cache
     /// behind the finder, same pipeline as the shortcuts modal.
     file_finder_image_clear_requested: bool,
+    /// Set when a rebuild was requested while one was already in flight.
+    /// poll_file_finder_index drains it on completion and re-kicks the
+    /// background walker so a long-running rebuild (multi-GB monorepo)
+    /// can never miss a later FS event that landed mid-walk.
+    file_finder_index_dirty: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -908,10 +917,10 @@ pub enum RemotePullKind {
 
 const REMOTE_PULL_TIMEOUT: Duration = Duration::from_secs(120);
 
-#[derive(Clone, Debug, PartialEq, Eq)]
 struct RemoteLaunch {
     host: String,
     path: Option<String>,
+    adopted: Option<crate::remote::AdoptedMaster>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1302,6 +1311,8 @@ impl App {
             fs_poll_dir_mtimes,
             fs_poll_open_file_mtime: None,
             remote_launch: None,
+            pending_remote_launch_host: None,
+            pending_remote_launch_path: None,
             tree_clipboard: None,
             tree_typeahead: None,
             compare_anchor: None,
@@ -1339,6 +1350,8 @@ impl App {
             editor_vim_chord: EditorVimChord::default(),
             shortcuts_modal: None,
             shortcuts_hit_rect: None,
+            connect_dialog: None,
+            connect_auth: None,
             shortcuts_image_clear_requested: false,
             ssh_empty_state_osc: None,
             ssh_empty_state_displayed: false,
@@ -1348,6 +1361,7 @@ impl App {
             file_finder_index: None,
             file_finder_index_rx: Some(file_finder_index_rx),
             file_finder_image_clear_requested: false,
+            file_finder_index_dirty: false,
             completion_request_id: None,
         })
     }
@@ -2094,6 +2108,11 @@ impl App {
         }
         self.fs_poll_dir_mtimes = Self::snapshot_expanded_dir_mtimes(&self.tree);
         self.refresh_git_status_debounced();
+        // Polling fallback fires when the watcher missed events
+        // (no-watcher mode, or notify on a network FS). Kick the index
+        // rebuild the same way the watcher path does so Cmd+P stays in
+        // sync without a croft restart.
+        self.kick_file_finder_index_rebuild();
         changed = true;
         changed
     }
@@ -2527,6 +2546,13 @@ impl App {
         }
         if !affected.is_empty() {
             self.refresh_git_status_debounced();
+            // A directory's children changed: files were created, deleted,
+            // or renamed (or git swapped them on a checkout). Kick a
+            // background rebuild of the Cmd+P index so the next Cmd+P
+            // reflects what is actually on disk. Coalesces via the dirty
+            // flag so a 10k-file checkout produces one trailing rebuild,
+            // not 10k of them.
+            self.kick_file_finder_index_rebuild();
         }
         if touched_open_file {
             self.reload_open_file_after_external_change();
@@ -3502,6 +3528,7 @@ impl App {
         self.render_editor_find(frame);
         self.render_file_finder(frame);
         self.render_shortcuts_modal(frame);
+        self.render_connect_dialog(frame);
 
         // Show the host terminal's hardware caret only when the editor is
         // focused and has no modal overlay. The DECSCUSR style is set to
@@ -3832,6 +3859,10 @@ impl App {
         if key.kind != KeyEventKind::Press && key.kind != KeyEventKind::Repeat {
             return Ok(());
         }
+        if self.connect_dialog.is_some() {
+            self.handle_connect_dialog_key(key);
+            return Ok(());
+        }
         if self.shortcuts_modal.is_some() {
             self.handle_shortcuts_modal_key(key);
             return Ok(());
@@ -4076,21 +4107,33 @@ impl App {
     }
 
     fn handle_remote_key(&mut self, key: KeyEvent) {
+        let has_mod = key.modifiers.intersects(
+            KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+        );
         match key.code {
             KeyCode::Up => self.remote.move_up(),
             KeyCode::Down => self.remote.move_down(),
             KeyCode::PageUp => self.remote.scroll_up(10),
             KeyCode::PageDown => self.remote.scroll_down(10),
-            KeyCode::Char('r') | KeyCode::Char('R') => {
-                self.remote.refresh();
-                self.status = String::from("Refreshed SSH remotes");
+            KeyCode::Backspace => {
+                if !self.remote.filter.is_empty() {
+                    self.remote.pop_filter_char();
+                }
+            }
+            KeyCode::Char(' ') if has_mod => {}
+            KeyCode::Char(c) if !has_mod => {
+                self.remote.push_filter_char(c);
             }
             KeyCode::Enter => {
                 if let Some(target) = self.remote.selected_target().cloned() {
                     self.request_remote_launch(target.alias, None);
                 }
             }
-            KeyCode::Esc => self.set_sidebar_view(SidebarView::Explorer),
+            KeyCode::Esc => {
+                if !self.remote.clear_filter() {
+                    self.set_sidebar_view(SidebarView::Explorer);
+                }
+            }
             _ => {}
         }
     }
@@ -4558,8 +4601,147 @@ impl App {
 
     fn request_remote_launch(&mut self, host: String, path: Option<String>) {
         self.status = format!("Connecting to {host}");
-        self.remote_launch = Some(RemoteLaunch { host, path });
-        self.quit = true;
+        match crate::remote_connect::SshAuth::start(&host) {
+            Ok(auth) => {
+                self.connect_auth = Some(auth);
+                self.connect_dialog =
+                    Some(crate::widgets::connect_dialog::ConnectDialog::new(host.clone()));
+                self.pending_remote_launch_path = path;
+                self.pending_remote_launch_host = Some(host);
+            }
+            Err(e) => {
+                self.status = format!("Could not start ssh: {e}");
+            }
+        }
+    }
+
+    pub fn poll_connect_dialog(&mut self) -> bool {
+        let Some(auth) = self.connect_auth.as_mut() else {
+            return false;
+        };
+        let events = auth.drain_events();
+        if events.is_empty() {
+            return false;
+        }
+        let Some(dialog) = self.connect_dialog.as_mut() else {
+            return false;
+        };
+        let mut authenticated = false;
+        let mut failed: Option<String> = None;
+        for ev in events {
+            match ev {
+                crate::remote_connect::SshAuthEvent::Log(chunk) => {
+                    dialog.push_log(&chunk);
+                }
+                crate::remote_connect::SshAuthEvent::Prompt { kind, line } => {
+                    dialog.set_prompt(kind, line);
+                }
+                crate::remote_connect::SshAuthEvent::Authenticated => {
+                    dialog.set_authenticated();
+                    authenticated = true;
+                }
+                crate::remote_connect::SshAuthEvent::Failed(detail) => {
+                    failed = Some(detail);
+                }
+            }
+        }
+        if let Some(detail) = failed {
+            dialog.set_failed(detail);
+            self.tear_down_connect_auth();
+        }
+        if authenticated {
+            if let (Some(auth), Some(host)) = (
+                self.connect_auth.take(),
+                self.pending_remote_launch_host.take(),
+            ) {
+                let adopted = auth.hand_off();
+                self.remote_launch = Some(RemoteLaunch {
+                    host: host.clone(),
+                    path: self.pending_remote_launch_path.take(),
+                    adopted: Some(adopted),
+                });
+                self.status = format!("Authenticated to {host}");
+                self.connect_dialog = None;
+                self.quit = true;
+            }
+        }
+        true
+    }
+
+    fn tear_down_connect_auth(&mut self) {
+        if let Some(mut auth) = self.connect_auth.take() {
+            auth.cancel();
+        }
+        self.pending_remote_launch_host = None;
+        self.pending_remote_launch_path = None;
+    }
+
+    pub fn handle_connect_dialog_key(&mut self, key: KeyEvent) {
+        let Some(dialog) = self.connect_dialog.as_mut() else {
+            return;
+        };
+        if dialog.phase.is_terminal() {
+            if matches!(
+                key.code,
+                KeyCode::Esc | KeyCode::Enter | KeyCode::Char(' ')
+            ) {
+                self.connect_dialog = None;
+                self.tear_down_connect_auth();
+            }
+            return;
+        }
+        let has_mod = key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER);
+        match key.code {
+            KeyCode::Esc => {
+                self.connect_dialog = None;
+                self.tear_down_connect_auth();
+                self.status = String::from("Connect cancelled");
+            }
+            KeyCode::Enter => {
+                if !dialog.phase.awaits_input() {
+                    return;
+                }
+                let payload = dialog.input_for_submit();
+                dialog.status_line =
+                    format!("Sending {} chars to {}…", payload.chars().count(), dialog.host);
+                dialog.clear_input();
+                if let Some(auth) = self.connect_auth.as_mut() {
+                    auth.respond_password(&payload);
+                }
+            }
+            KeyCode::Backspace => dialog.pop_input_char(),
+            KeyCode::Tab => dialog.toggle_logs(),
+            KeyCode::Char('l') | KeyCode::Char('L') if has_mod => dialog.toggle_logs(),
+            KeyCode::Char(c) if !has_mod => dialog.push_input_char(c),
+            _ => {}
+        }
+    }
+
+    pub fn handle_connect_dialog_click(&mut self, col: u16, row: u16) -> bool {
+        let Some(dialog) = self.connect_dialog.as_mut() else {
+            return false;
+        };
+        if rect_contains(dialog.toggle_logs_btn, col, row) {
+            dialog.toggle_logs();
+            return true;
+        }
+        if rect_contains(dialog.cancel_btn, col, row) {
+            self.connect_dialog = None;
+            self.tear_down_connect_auth();
+            self.status = String::from("Connect cancelled");
+            return true;
+        }
+        if rect_contains(dialog.submit_btn, col, row) && dialog.phase.awaits_input() {
+            let payload = dialog.input_for_submit();
+            dialog.clear_input();
+            if let Some(auth) = self.connect_auth.as_mut() {
+                auth.respond_password(&payload);
+            }
+            return true;
+        }
+        rect_contains(dialog.last_area, col, row)
     }
 
     fn open_ssh_config_in_editor(&mut self) {
@@ -5852,26 +6034,59 @@ impl App {
 
     /// Drain the background-build receiver into `file_finder_index`
     /// without blocking. Called from `open_file_finder` and from the
-    /// main loop tick so the index lands the moment the worker thread
-    /// finishes, even before the user opens Cmd+P.
+    /// main loop tick. Accepts REPLACEMENT results too: when the FS
+    /// watcher or a workspace re-root has triggered a rebuild, the
+    /// fresh index swaps in here and is pushed into the open finder
+    /// (if any) so an in-progress Cmd+P session immediately re-ranks
+    /// against the new file set. If a follow-up rebuild was queued
+    /// while this one was in flight (the `file_finder_index_dirty`
+    /// flag), it is re-kicked here so a long-running build on a
+    /// multi-GB monorepo can never miss a later FS event.
     fn poll_file_finder_index(&mut self) {
-        if self.file_finder_index.is_some() {
-            self.file_finder_index_rx = None;
-            return;
-        }
         let Some(rx) = self.file_finder_index_rx.as_ref() else {
             return;
         };
         match rx.try_recv() {
             Ok(entries) => {
-                self.file_finder_index = Some(std::sync::Arc::new(entries));
+                let arc = std::sync::Arc::new(entries);
+                self.file_finder_index = Some(arc.clone());
                 self.file_finder_index_rx = None;
+                if let Some(finder) = self.file_finder.as_mut() {
+                    finder.replace_entries(arc);
+                }
+                if self.file_finder_index_dirty {
+                    self.kick_file_finder_index_rebuild();
+                }
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {}
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 self.file_finder_index_rx = None;
             }
         }
+    }
+
+    /// Spawn a background walker that rebuilds the Cmd+P file index
+    /// against the current `workspace_root`. If a rebuild is already
+    /// in flight, sets the dirty flag instead; `poll_file_finder_index`
+    /// will re-kick on completion. Called from `change_workspace_root`
+    /// so Cmd+P reflects the new project, and from `drain_fs_events`
+    /// so creates, deletes, and git-checkout-driven swaps land in the
+    /// index without a croft restart.
+    fn kick_file_finder_index_rebuild(&mut self) {
+        if self.file_finder_index_rx.is_some() {
+            self.file_finder_index_dirty = true;
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel::<
+            Vec<crate::widgets::file_finder::FileEntry>,
+        >();
+        let root = self.workspace_root.clone();
+        std::thread::spawn(move || {
+            let entries = crate::widgets::file_finder::build_file_index(&root);
+            let _ = tx.send(entries);
+        });
+        self.file_finder_index_rx = Some(rx);
+        self.file_finder_index_dirty = false;
     }
 
     fn open_file_finder(&mut self) {
@@ -6265,7 +6480,26 @@ impl App {
         crate::widgets::shortcuts::render_shortcuts_modal(modal, area, frame.buffer_mut());
     }
 
+    fn render_connect_dialog(&mut self, frame: &mut ratatui::Frame) {
+        let visible = self.cursor_visible_phase();
+        let Some(dialog) = self.connect_dialog.as_mut() else { return };
+        let area = frame.area();
+        use ratatui::widgets::Widget as _;
+        dialog.render(area, frame.buffer_mut());
+        if visible {
+            if let Some((cx, cy)) = dialog.cursor_screen_pos() {
+                frame.set_cursor_position((cx, cy));
+            }
+        }
+    }
+
     fn handle_mouse(&mut self, m: MouseEvent) {
+        if self.connect_dialog.is_some() {
+            if matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
+                self.handle_connect_dialog_click(m.column, m.row);
+            }
+            return;
+        }
         if self.shortcuts_modal.is_some() {
             self.handle_shortcuts_modal_mouse(m);
             return;
@@ -6595,6 +6829,15 @@ impl App {
                 }
                 if in_tree && self.sidebar_view == SidebarView::Remote {
                     self.focus_pane(Pane::Tree);
+                    if rect_contains(self.remote.header_chevron_btn, m.column, m.row) {
+                        self.remote.toggle_collapsed();
+                        self.status = if self.remote.collapsed {
+                            String::from("Collapsed SSH section")
+                        } else {
+                            String::from("Expanded SSH section")
+                        };
+                        return;
+                    }
                     if rect_contains(self.remote.header_add_btn, m.column, m.row)
                         || rect_contains(self.remote.empty_primary_btn, m.column, m.row)
                         || rect_contains(self.remote.empty_secondary_btn, m.column, m.row)
@@ -6602,7 +6845,7 @@ impl App {
                         self.open_ssh_config_in_editor();
                         return;
                     }
-                    if rect_contains(self.remote.header_gear_btn, m.column, m.row) {
+                    if rect_contains(self.remote.header_refresh_btn, m.column, m.row) {
                         self.remote.refresh();
                         self.status = String::from("Reloaded SSH hosts from ~/.ssh/config");
                         return;
@@ -7161,6 +7404,14 @@ impl App {
             .send(crate::git::GitRequest::SetRoot(new_root.clone()));
         self.refresh_git_status_debounced();
         self.refresh_source_control();
+        // Drop any in-flight walker for the OLD root so its result is
+        // discarded when it tries to send. Then kick a fresh walk
+        // against the new root. file_finder_index keeps the old entries
+        // for now so a Cmd+P press during the rebuild window shows
+        // stale-but-immediate results instead of a UI freeze.
+        self.file_finder_index_rx = None;
+        self.file_finder_index_dirty = false;
+        self.kick_file_finder_index_rebuild();
         self.status = format!("Workspace root: {display}");
     }
 
@@ -13757,6 +14008,208 @@ mod tests {
     }
 
     #[test]
+    fn cmd_p_index_refreshes_after_a_new_file_lands_on_disk() {
+        // Regression: the Cmd+P index was built once at App::new and
+        // never refreshed, so files created later (by another process,
+        // by a git checkout that swapped the working tree, or by an
+        // in-app create) stayed invisible to Cmd+P until croft was
+        // restarted. drain_fs_events now triggers kick_file_finder_index_rebuild
+        // so creates and deletes propagate into the haystack the
+        // finder ranks against.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+        std::fs::write(tmp.path().join("alpha.rs"), b"").unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        // Wait for the initial background index to land.
+        let mut waited = 0u32;
+        loop {
+            app.poll_file_finder_index();
+            if app.file_finder_index.is_some() {
+                break;
+            }
+            if waited >= 5000 {
+                panic!("initial index must land within 5s");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            waited += 20;
+        }
+        // Drain any startup FS-watcher noise so the next loop reacts
+        // only to the file we are about to create.
+        for _ in 0..20 {
+            let _ = app.drain_fs_events();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let new_dir = tmp.path().join("packages/ant-ts-lib-noggin/src/entities/files");
+        std::fs::create_dir_all(&new_dir).unwrap();
+        std::fs::write(new_dir.join("resolver.ts"), b"export {};\n").unwrap();
+        let started = std::time::Instant::now();
+        let mut saw = false;
+        for _ in 0..400 {
+            let _ = app.drain_fs_events();
+            app.poll_file_finder_index();
+            if let Some(idx) = app.file_finder_index.as_ref() {
+                if idx
+                    .iter()
+                    .any(|e| e.rel == "packages/ant-ts-lib-noggin/src/entities/files/resolver.ts")
+                {
+                    saw = true;
+                    break;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            saw,
+            "Cmd+P index must include resolver.ts within a few seconds of it being written to disk; without this, branch-new files stay invisible to Cmd+P until croft restarts"
+        );
+        assert!(
+            started.elapsed() <= std::time::Duration::from_secs(5),
+            "index refresh must finish within 5s of the FS event on a 2-file workspace"
+        );
+    }
+
+    #[test]
+    fn cmd_p_index_drops_a_file_deleted_off_disk() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+        std::fs::write(tmp.path().join("alpha.rs"), b"").unwrap();
+        let target = tmp.path().join("doomed.rs");
+        std::fs::write(&target, b"").unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        let mut waited = 0u32;
+        loop {
+            app.poll_file_finder_index();
+            if let Some(idx) = app.file_finder_index.as_ref() {
+                if idx.iter().any(|e| e.rel == "doomed.rs") {
+                    break;
+                }
+            }
+            if waited >= 5000 {
+                panic!("initial index must contain doomed.rs within 5s");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            waited += 20;
+        }
+        for _ in 0..20 {
+            let _ = app.drain_fs_events();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        std::fs::remove_file(&target).unwrap();
+        let mut gone = false;
+        for _ in 0..400 {
+            let _ = app.drain_fs_events();
+            app.poll_file_finder_index();
+            if let Some(idx) = app.file_finder_index.as_ref() {
+                if !idx.iter().any(|e| e.rel == "doomed.rs") {
+                    gone = true;
+                    break;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            gone,
+            "deleted file must drop out of the Cmd+P index after the FS-event-driven rebuild lands"
+        );
+    }
+
+    #[test]
+    fn change_workspace_root_rebuilds_cmd_p_index_against_the_new_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("root_a");
+        let b = tmp.path().join("root_b");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        std::fs::write(a.join("only_in_a.rs"), b"").unwrap();
+        std::fs::write(b.join("only_in_b.rs"), b"").unwrap();
+        let mut app = App::new(a.clone()).unwrap();
+        let mut waited = 0u32;
+        loop {
+            app.poll_file_finder_index();
+            if let Some(idx) = app.file_finder_index.as_ref() {
+                if idx.iter().any(|e| e.rel == "only_in_a.rs") {
+                    break;
+                }
+            }
+            if waited >= 5000 {
+                panic!("initial index against root_a must land within 5s");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            waited += 20;
+        }
+        app.change_workspace_root(b.clone());
+        let mut saw_b = false;
+        for _ in 0..400 {
+            app.poll_file_finder_index();
+            if let Some(idx) = app.file_finder_index.as_ref() {
+                let rels: Vec<&str> = idx.iter().map(|e| e.rel.as_str()).collect();
+                if rels.contains(&"only_in_b.rs") && !rels.contains(&"only_in_a.rs") {
+                    saw_b = true;
+                    break;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            saw_b,
+            "after change_workspace_root(b), the Cmd+P index must reflect root_b's files (only_in_b.rs present, only_in_a.rs gone); without this, Cmd+/ leaves Cmd+P searching the previous project"
+        );
+    }
+
+    #[test]
+    fn open_cmd_p_finder_re_ranks_in_place_when_the_index_swaps() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+        std::fs::write(tmp.path().join("alpha.rs"), b"").unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        let mut waited = 0u32;
+        loop {
+            app.poll_file_finder_index();
+            if app.file_finder_index.is_some() {
+                break;
+            }
+            if waited >= 5000 {
+                panic!("initial index must land within 5s");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            waited += 20;
+        }
+        // Open Cmd+P, type the new filename — initially zero results.
+        app.open_file_finder();
+        for c in "resolver.ts".chars() {
+            app.file_finder.as_mut().unwrap().push_char(c);
+        }
+        assert!(
+            app.file_finder
+                .as_ref()
+                .unwrap()
+                .visible_results()
+                .is_empty(),
+            "resolver.ts is not on disk yet; finder must show no matches before the file is created"
+        );
+        let new_dir = tmp.path().join("packages/ant-ts-lib-noggin/src/entities/files");
+        std::fs::create_dir_all(&new_dir).unwrap();
+        std::fs::write(new_dir.join("resolver.ts"), b"").unwrap();
+        let mut surfaced = false;
+        for _ in 0..400 {
+            let _ = app.drain_fs_events();
+            app.poll_file_finder_index();
+            let finder = app.file_finder.as_ref().unwrap();
+            if finder.visible_results().iter().any(|r| {
+                r.entry.rel == "packages/ant-ts-lib-noggin/src/entities/files/resolver.ts"
+            }) {
+                surfaced = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            surfaced,
+            "an open Cmd+P finder must re-rank against the rebuilt index without the user closing and reopening it"
+        );
+    }
+
+    #[test]
     fn click_on_tree_row_aligned_with_terminal_splitter_y_selects_the_row_not_the_splitter() {
         // Regression for the user's "I can't click on the last two files,
         // but arrow+Enter opens them" report. Root cause: the editor /
@@ -15414,7 +15867,11 @@ pub fn run(root: PathBuf) -> Result<()> {
         app._fs_watcher = None;
         app.fs_rx = None;
         app.fs_watcher_init_rx = None;
-        crate::remote::launch_croft(&remote.host, remote.path.as_deref())?;
+        crate::remote::launch_croft_with(
+            &remote.host,
+            remote.path.as_deref(),
+            remote.adopted,
+        )?;
     }
     Ok(())
 }
@@ -15577,6 +16034,7 @@ fn main_loop(
         let search_changed = app.drain_search_results();
         let remote_changed = app.refresh_remote_if_config_changed();
         let pulls_changed = app.drain_remote_pulls();
+        let connect_changed = app.poll_connect_dialog();
         app.sync_lsp();
         let lsp_changed = app.drain_lsp_completion();
 
@@ -15587,6 +16045,7 @@ fn main_loop(
             || search_changed
             || remote_changed
             || pulls_changed
+            || connect_changed
             || lsp_changed;
         let pty_eligible =
             pty_pending && last_pty_redraw.elapsed() >= pty_min_interval;

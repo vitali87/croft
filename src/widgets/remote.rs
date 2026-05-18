@@ -13,24 +13,20 @@ pub struct RemotePanel {
     pub selected: usize,
     pub scroll: usize,
     pub focused: bool,
+    pub collapsed: bool,
+    pub filter: String,
     pub last_area: Rect,
     pub last_inner: Rect,
     pub last_list_area: Rect,
     pub last_scrollbar: Rect,
-    /// Header-row `+` (add host) hit rect. Empty when not rendered.
+    pub header_chevron_btn: Rect,
     pub header_add_btn: Rect,
-    /// Header-row gear (settings / refresh) hit rect.
-    pub header_gear_btn: Rect,
-    /// Empty-state primary `+ Add New Host` button hit rect.
+    pub header_refresh_btn: Rect,
     pub empty_primary_btn: Rect,
-    /// Empty-state secondary `Open SSH Config` button hit rect.
     pub empty_secondary_btn: Rect,
-    /// Empty-state `? Learn more about SSH` link hit rect.
     pub empty_learn_link: Rect,
-    /// Cell where the SSH-empty-state PNG should be emitted via OSC-1337,
-    /// sized to (SSH_EMPTY_STATE_CELLS_W, SSH_EMPTY_STATE_CELLS_H). None
-    /// when the panel isn't in empty-state or doesn't fit the image.
     pub last_image_cell: Option<(u16, u16)>,
+    visible: Vec<usize>,
     ssh_config_state: SshConfigState,
 }
 
@@ -42,16 +38,20 @@ impl RemotePanel {
             selected: 0,
             scroll: 0,
             focused: false,
+            collapsed: false,
+            filter: String::new(),
             last_area: Rect::default(),
             last_inner: Rect::default(),
             last_list_area: Rect::default(),
             last_scrollbar: Rect::default(),
+            header_chevron_btn: Rect::default(),
             header_add_btn: Rect::default(),
-            header_gear_btn: Rect::default(),
+            header_refresh_btn: Rect::default(),
             empty_primary_btn: Rect::default(),
             empty_secondary_btn: Rect::default(),
             empty_learn_link: Rect::default(),
             last_image_cell: None,
+            visible: Vec::new(),
             ssh_config_state,
         }
     }
@@ -74,11 +74,61 @@ impl RemotePanel {
     fn reload_targets(&mut self) {
         let selected_alias = self.selected_target().map(|t| t.alias.clone());
         self.targets = discover_ssh_targets();
+        self.recompute_visible();
         self.selected = selected_alias
             .and_then(|alias| self.targets.iter().position(|t| t.alias == alias))
             .unwrap_or(0)
             .min(self.targets.len().saturating_sub(1));
         self.scroll_to(self.scroll);
+    }
+
+    fn recompute_visible(&mut self) {
+        let needle: String = self.filter.to_lowercase();
+        self.visible.clear();
+        for (i, t) in self.targets.iter().enumerate() {
+            if needle.is_empty() {
+                self.visible.push(i);
+                continue;
+            }
+            let alias_l = t.alias.to_lowercase();
+            let detail_l = t.detail().to_lowercase();
+            if alias_l.contains(&needle) || detail_l.contains(&needle) {
+                self.visible.push(i);
+            }
+        }
+    }
+
+    pub fn toggle_collapsed(&mut self) {
+        self.collapsed = !self.collapsed;
+    }
+
+    pub fn push_filter_char(&mut self, c: char) {
+        self.filter.push(c);
+        self.recompute_visible();
+        self.selected = self.visible.first().copied().unwrap_or(0);
+        self.scroll = 0;
+    }
+
+    pub fn pop_filter_char(&mut self) {
+        self.filter.pop();
+        self.recompute_visible();
+        if !self.visible.contains(&self.selected) {
+            self.selected = self.visible.first().copied().unwrap_or(0);
+        }
+        self.scroll = 0;
+    }
+
+    pub fn clear_filter(&mut self) -> bool {
+        if self.filter.is_empty() {
+            return false;
+        }
+        self.filter.clear();
+        self.recompute_visible();
+        true
+    }
+
+    pub fn visible_indices(&self) -> &[usize] {
+        &self.visible
     }
 
     pub fn selected_target(&self) -> Option<&RemoteTarget> {
@@ -91,22 +141,32 @@ impl RemotePanel {
         }
         let row = (y - self.last_list_area.y) as usize;
         let idx = self.scroll + row;
-        (idx < self.targets.len()).then_some(idx)
+        self.visible.get(idx).copied()
     }
 
     pub fn select(&mut self, idx: usize) {
-        if idx < self.targets.len() {
+        if idx < self.targets.len() && self.visible.contains(&idx) {
             self.selected = idx;
         }
     }
 
     pub fn move_up(&mut self) {
-        self.selected = self.selected.saturating_sub(1);
+        let Some(pos) = self.visible.iter().position(|&i| i == self.selected) else {
+            self.selected = self.visible.first().copied().unwrap_or(0);
+            return;
+        };
+        if pos > 0 {
+            self.selected = self.visible[pos - 1];
+        }
     }
 
     pub fn move_down(&mut self) {
-        if self.selected + 1 < self.targets.len() {
-            self.selected += 1;
+        let Some(pos) = self.visible.iter().position(|&i| i == self.selected) else {
+            self.selected = self.visible.first().copied().unwrap_or(0);
+            return;
+        };
+        if pos + 1 < self.visible.len() {
+            self.selected = self.visible[pos + 1];
         }
     }
 
@@ -121,7 +181,7 @@ impl RemotePanel {
     pub fn scroll_to_bar_y(&mut self, y: u16) -> bool {
         let Some(metrics) = scrollbar::vertical_metrics(
             self.last_scrollbar,
-            self.targets.len(),
+            self.visible.len(),
             self.last_list_area.height as usize,
             self.scroll,
         ) else {
@@ -133,17 +193,25 @@ impl RemotePanel {
 
     fn scroll_to(&mut self, top: usize) {
         let viewport = self.last_list_area.height as usize;
-        if viewport == 0 || self.targets.is_empty() {
+        if viewport == 0 || self.visible.is_empty() {
             self.scroll = 0;
-            self.selected = 0;
+            self.selected = self.visible.first().copied().unwrap_or(0);
             return;
         }
-        self.scroll = top.min(self.targets.len().saturating_sub(viewport));
-        let last_visible = (self.scroll + viewport - 1).min(self.targets.len().saturating_sub(1));
-        if self.selected < self.scroll {
-            self.selected = self.scroll;
-        } else if self.selected > last_visible {
-            self.selected = last_visible;
+        self.scroll = top.min(self.visible.len().saturating_sub(viewport));
+        let last_visible = (self.scroll + viewport - 1).min(self.visible.len().saturating_sub(1));
+        let cur_pos = self.visible.iter().position(|&i| i == self.selected);
+        match cur_pos {
+            Some(pos) if pos < self.scroll => {
+                self.selected = self.visible[self.scroll];
+            }
+            Some(pos) if pos > last_visible => {
+                self.selected = self.visible[last_visible];
+            }
+            None => {
+                self.selected = self.visible[self.scroll];
+            }
+            _ => {}
         }
     }
 }
@@ -155,48 +223,112 @@ impl Default for RemotePanel {
 }
 
 /// Teal/cyan accent color sampled from the `v0.1.122` version chip in the
-/// croft mockup — the same color is used for the empty-state card border,
-/// the secondary button outline, the illustration line art, and the
-/// learn-more link. NOT the same as the blue used in `REMOTE EXPLORER`'s
-/// title chip; the two palettes coexist by design.
+/// croft mockup. Used by the empty-state card, the secondary button outline,
+/// the illustration line art, and the learn-more link.
 const CARD_BORDER: Color = Color::Rgb(0x3e, 0xd8, 0xc4);
 const PRIMARY_BG: Color = Color::Rgb(0x0e, 0x7e, 0x76);
 const LINK_FG: Color = Color::Rgb(0x3e, 0xd8, 0xc4);
 const BODY_FG: Color = Color::Rgb(0xb4, 0xbe, 0xc8);
 
-/// Cell dimensions used to bake the SSH empty-state PNG via OSC-1337.
-/// Public so `app.rs` can size the canvas at startup to match the cells
-/// the renderer reserves.
+/// Background colour painted under the header `+` / refresh pill buttons so
+/// they read as touch targets, not naked single glyphs. Matches the chip
+/// behind the `REMOTE EXPLORER` title.
+const HEADER_BTN_BG: Color = Color::Rgb(0x1e, 0x3a, 0x6e);
+const HEADER_BTN_FG: Color = Color::Rgb(0xe6, 0xed, 0xf5);
+
 pub const SSH_EMPTY_STATE_CELLS_W: u16 = 18;
 pub const SSH_EMPTY_STATE_CELLS_H: u16 = 8;
+
+/// Codicon `cod-refresh` — the circular-arrow glyph VS Code paints on the
+/// Remote Explorer refresh affordance. Verified against the Nerd Font cmap.
+pub const REFRESH_GLYPH: char = '\u{eb37}';
+pub const ADD_GLYPH: char = '\u{ea60}';
 
 fn render_section_header(panel: &mut RemotePanel, buf: &mut Buffer, inner: Rect) {
     let header_style = Style::default()
         .fg(Color::Rgb(0xcc, 0xcc, 0xcc))
         .add_modifier(Modifier::BOLD);
+    let chevron = if panel.collapsed { '▸' } else { '▾' };
     buf.set_line(
         inner.x,
         inner.y,
         &Line::from(vec![
-            Span::styled("▾ ", Style::default().fg(Color::Gray)),
+            Span::styled(
+                format!("{chevron} "),
+                Style::default().fg(Color::Gray),
+            ),
             Span::styled("SSH", header_style),
         ]),
         inner.width,
     );
-    if inner.width < 6 {
+    panel.header_chevron_btn = Rect {
+        x: inner.x,
+        y: inner.y,
+        width: 5.min(inner.width),
+        height: 1,
+    };
+    if inner.width < 10 {
         return;
     }
-    let icon_fg = Style::default().fg(Color::Rgb(0x9d, 0xa5, 0xb4));
-    let gear_x = inner.x + inner.width.saturating_sub(2);
-    let plus_x = gear_x.saturating_sub(3);
-    if plus_x > inner.x + 4 {
-        buf.set_string(plus_x, inner.y, "+", icon_fg);
-        panel.header_add_btn = Rect { x: plus_x, y: inner.y, width: 1, height: 1 };
+    let pill_w: u16 = 2;
+    let right = inner.x + inner.width;
+    let refresh_x = right.saturating_sub(pill_w + 1);
+    let add_x = refresh_x.saturating_sub(pill_w + 1);
+    if add_x > inner.x + 5 {
+        render_header_pill(buf, add_x, inner.y, pill_w, ADD_GLYPH);
+        panel.header_add_btn = Rect { x: add_x, y: inner.y, width: pill_w, height: 1 };
     }
-    if gear_x > inner.x + 4 {
-        buf.set_string(gear_x, inner.y, "⚙", icon_fg);
-        panel.header_gear_btn = Rect { x: gear_x, y: inner.y, width: 1, height: 1 };
+    if refresh_x > inner.x + 5 {
+        render_header_pill(buf, refresh_x, inner.y, pill_w, REFRESH_GLYPH);
+        panel.header_refresh_btn = Rect {
+            x: refresh_x,
+            y: inner.y,
+            width: pill_w,
+            height: 1,
+        };
     }
+}
+
+fn render_header_pill(buf: &mut Buffer, x: u16, y: u16, width: u16, glyph: char) {
+    let bg = Style::default().bg(HEADER_BTN_BG);
+    for dx in 0..width {
+        let cell = &mut buf[(x + dx, y)];
+        cell.set_char(' ');
+        cell.set_style(bg);
+    }
+    let centre = x + width / 2;
+    let style = Style::default()
+        .bg(HEADER_BTN_BG)
+        .fg(HEADER_BTN_FG)
+        .add_modifier(Modifier::BOLD);
+    buf.set_string(centre, y, glyph.to_string(), style);
+}
+
+fn render_filter_row(buf: &mut Buffer, area: Rect, filter: &str) {
+    if area.width < 4 {
+        return;
+    }
+    for dx in 0..area.width {
+        let cell = &mut buf[(area.x + dx, area.y)];
+        cell.set_char(' ');
+        cell.set_style(Style::default());
+    }
+    let label_style = Style::default()
+        .fg(Color::Rgb(0x9d, 0xa5, 0xb4))
+        .add_modifier(Modifier::ITALIC);
+    let val_style = Style::default()
+        .fg(Color::White)
+        .add_modifier(Modifier::BOLD);
+    let prefix = "filter: ";
+    buf.set_string(area.x, area.y, prefix, label_style);
+    let avail = area.width as usize - prefix.chars().count();
+    let shown: String = filter.chars().take(avail).collect();
+    buf.set_string(
+        area.x + prefix.chars().count() as u16,
+        area.y,
+        &shown,
+        val_style,
+    );
 }
 
 fn render_empty_state(panel: &mut RemotePanel, buf: &mut Buffer, area: Rect) {
@@ -226,10 +358,6 @@ fn render_empty_state(panel: &mut RemotePanel, buf: &mut Buffer, area: Rect) {
     let content_end_y = card_inner.y + card_inner.height;
     let mut y = card_inner.y.saturating_add(1);
 
-    // Reserve cells for the OSC-1337 illustration. Cells are blanked
-    // with default style (no explicit bg) so the host terminal's session
-    // bg shows through the illustration's transparent letterbox — the
-    // user explicitly does NOT want a dark rectangle behind the PNG.
     let img_w = SSH_EMPTY_STATE_CELLS_W.min(content_w);
     let img_h = SSH_EMPTY_STATE_CELLS_H.min(content_end_y.saturating_sub(y));
     if img_w > 0 && img_h > 0 {
@@ -342,9 +470,6 @@ fn wrap_body(max_width: usize) -> Vec<String> {
     out
 }
 
-/// Render a 3-row filled rounded button at (x, y), width cells wide, with
-/// `label` centred on the middle row. Returns the clickable rect covering
-/// all three rows so the caller can hit-test the full button area.
 fn render_filled_button(
     buf: &mut Buffer,
     x: u16,
@@ -365,7 +490,6 @@ fn render_filled_button(
             cell.set_style(fill_style);
         }
     }
-    // Rounded corners painted over the fill so the button reads as a pill.
     let right = x + width.saturating_sub(1);
     buf[(x, y)].set_char('╭');
     buf[(right, y)].set_char('╮');
@@ -377,10 +501,6 @@ fn render_filled_button(
     Rect { x, y, width, height: 3 }
 }
 
-/// Render a 3-row outlined rounded button (transparent fill, teal border)
-/// with `label` centred on the middle row. The interior cells are blanked
-/// with default style so the host terminal's session bg shows through —
-/// no explicit bg color is set anywhere.
 fn render_outlined_button(buf: &mut Buffer, x: u16, y: u16, width: u16, label: &str) -> Rect {
     for dx in 0..width {
         for dy in 0..3 {
@@ -434,14 +554,9 @@ impl Widget for &mut RemotePanel {
         self.last_area = area;
         self.last_inner = inner;
         self.last_scrollbar = Rect::default();
-        self.last_list_area = Rect {
-            x: inner.x,
-            y: inner.y.saturating_add(1),
-            width: inner.width,
-            height: inner.height.saturating_sub(1),
-        };
+        self.header_chevron_btn = Rect::default();
         self.header_add_btn = Rect::default();
-        self.header_gear_btn = Rect::default();
+        self.header_refresh_btn = Rect::default();
         self.empty_primary_btn = Rect::default();
         self.empty_secondary_btn = Rect::default();
         self.empty_learn_link = Rect::default();
@@ -452,8 +567,49 @@ impl Widget for &mut RemotePanel {
 
         render_section_header(self, buf, inner);
 
-        if self.targets.is_empty() {
-            render_empty_state(self, buf, self.last_list_area);
+        if self.collapsed {
+            self.last_list_area = Rect {
+                x: inner.x,
+                y: inner.y.saturating_add(1),
+                width: inner.width,
+                height: 0,
+            };
+            return;
+        }
+
+        self.recompute_visible();
+
+        let mut body_y = inner.y.saturating_add(1);
+        let body_end = inner.y + inner.height;
+        if !self.filter.is_empty() && body_y < body_end {
+            render_filter_row(
+                buf,
+                Rect { x: inner.x, y: body_y, width: inner.width, height: 1 },
+                &self.filter,
+            );
+            body_y = body_y.saturating_add(1);
+        }
+        self.last_list_area = Rect {
+            x: inner.x,
+            y: body_y,
+            width: inner.width,
+            height: body_end.saturating_sub(body_y),
+        };
+
+        if self.visible.is_empty() {
+            if self.targets.is_empty() {
+                render_empty_state(self, buf, self.last_list_area);
+            } else if !self.filter.is_empty() && self.last_list_area.height > 0 {
+                let msg = format!("No hosts match \"{}\"", self.filter);
+                let w = msg.chars().count() as u16;
+                let cx = inner.x + inner.width.saturating_sub(w) / 2;
+                buf.set_string(
+                    cx,
+                    self.last_list_area.y,
+                    &msg,
+                    Style::default().fg(BODY_FG).add_modifier(Modifier::ITALIC),
+                );
+            }
             return;
         }
 
@@ -461,10 +617,15 @@ impl Widget for &mut RemotePanel {
         if viewport == 0 {
             return;
         }
-        if self.selected < self.scroll {
-            self.scroll = self.selected;
-        } else if self.selected >= self.scroll + viewport {
-            self.scroll = self.selected + 1 - viewport;
+        let sel_pos = self
+            .visible
+            .iter()
+            .position(|&i| i == self.selected)
+            .unwrap_or(0);
+        if sel_pos < self.scroll {
+            self.scroll = sel_pos;
+        } else if sel_pos >= self.scroll + viewport {
+            self.scroll = sel_pos + 1 - viewport;
         }
 
         let scrollbar_area = Rect {
@@ -474,7 +635,7 @@ impl Widget for &mut RemotePanel {
             height: self.last_list_area.height,
         };
         let scrollbar_metrics =
-            scrollbar::vertical_metrics(scrollbar_area, self.targets.len(), viewport, self.scroll);
+            scrollbar::vertical_metrics(scrollbar_area, self.visible.len(), viewport, self.scroll);
         if let Some(metrics) = scrollbar_metrics {
             self.last_scrollbar = metrics.area;
         }
@@ -483,8 +644,9 @@ impl Widget for &mut RemotePanel {
             .width
             .saturating_sub(u16::from(scrollbar_metrics.is_some()));
 
-        let end = (self.scroll + viewport).min(self.targets.len());
-        for (row, idx) in (self.scroll..end).enumerate() {
+        let end = (self.scroll + viewport).min(self.visible.len());
+        for (row, vis_idx) in (self.scroll..end).enumerate() {
+            let idx = self.visible[vis_idx];
             let target = &self.targets[idx];
             let y = self.last_list_area.y + row as u16;
             let selected = idx == self.selected;
@@ -536,7 +698,169 @@ mod tests {
     fn empty_panel() -> RemotePanel {
         let mut p = RemotePanel::new();
         p.targets.clear();
+        p.recompute_visible();
         p
+    }
+
+    fn populated_panel(aliases: &[&str]) -> RemotePanel {
+        let mut p = RemotePanel::new();
+        p.targets = aliases
+            .iter()
+            .map(|a| RemoteTarget {
+                alias: (*a).to_string(),
+                host_name: None,
+                user: None,
+            })
+            .collect();
+        p.recompute_visible();
+        p
+    }
+
+    #[test]
+    fn header_uses_cod_refresh_glyph_not_gear() {
+        assert_eq!(
+            REFRESH_GLYPH, '\u{eb37}',
+            "header refresh button must use cod-refresh (the circular-arrow glyph VS Code uses on the Remote Explorer refresh affordance)"
+        );
+        assert_ne!(
+            REFRESH_GLYPH, '\u{2699}',
+            "U+2699 is the gear symbol; this is the bug the user reported — the header was painting a settings gear next to the + icon"
+        );
+    }
+
+    #[test]
+    fn header_paints_refresh_glyph_in_buffer_when_panel_renders() {
+        let mut p = populated_panel(&["a", "b"]);
+        let area = Rect { x: 0, y: 0, width: 40, height: 10 };
+        let mut buf = Buffer::empty(area);
+        (&mut p).render(area, &mut buf);
+        let header_y = p.header_refresh_btn.y;
+        let mut header_row = String::new();
+        for x in area.left()..area.right() {
+            header_row.push_str(buf[(x, header_y)].symbol());
+        }
+        assert!(
+            header_row.contains(REFRESH_GLYPH),
+            "section-header row must contain the cod-refresh glyph U+EB37 (got: {header_row:?})"
+        );
+        assert!(
+            !header_row.contains('\u{2699}'),
+            "header must not paint the gear U+2699 anywhere"
+        );
+    }
+
+    #[test]
+    fn header_icon_buttons_are_two_cells_wide_so_they_read_as_compact_chips() {
+        let mut p = populated_panel(&["a"]);
+        let area = Rect { x: 0, y: 0, width: 40, height: 10 };
+        let mut buf = Buffer::empty(area);
+        (&mut p).render(area, &mut buf);
+        assert_eq!(
+            p.header_add_btn.width, 2,
+            "header + pill must be 2 cells wide — the 3-cell version felt oversized next to the SSH label per user feedback on 2026-05-18"
+        );
+        assert_eq!(p.header_refresh_btn.width, 2);
+        assert!(
+            p.header_add_btn.x + p.header_add_btn.width <= p.header_refresh_btn.x
+                || p.header_refresh_btn.x + p.header_refresh_btn.width <= p.header_add_btn.x,
+            "header pills must not overlap"
+        );
+    }
+
+    #[test]
+    fn chevron_click_rect_is_registered_at_header_origin() {
+        let mut p = populated_panel(&["a"]);
+        let area = Rect { x: 0, y: 0, width: 40, height: 10 };
+        let mut buf = Buffer::empty(area);
+        (&mut p).render(area, &mut buf);
+        assert!(
+            p.header_chevron_btn.width > 0,
+            "chevron must register a hit rect so clicking the ▾ collapses the SSH section"
+        );
+        assert_eq!(p.header_chevron_btn.y, 1);
+    }
+
+    #[test]
+    fn toggle_collapsed_hides_list_rows_but_keeps_header_buttons_clickable() {
+        let mut p = populated_panel(&["a", "b", "c"]);
+        let area = Rect { x: 0, y: 0, width: 40, height: 10 };
+        let mut buf = Buffer::empty(area);
+        p.toggle_collapsed();
+        (&mut p).render(area, &mut buf);
+        assert!(p.collapsed);
+        assert_eq!(
+            p.last_list_area.height, 0,
+            "collapsed section must reserve zero rows for the host list"
+        );
+        assert!(
+            p.header_add_btn.width > 0,
+            "collapsed header still needs to be able to add a host"
+        );
+        assert!(p.header_refresh_btn.width > 0);
+        assert!(p.header_chevron_btn.width > 0);
+    }
+
+    #[test]
+    fn type_to_filter_narrows_visible_aliases_case_insensitively() {
+        let mut p = populated_panel(&["genesis-cloud", "github.com", "vllm-server"]);
+        p.push_filter_char('G');
+        p.push_filter_char('e');
+        let aliases: Vec<&str> = p
+            .visible_indices()
+            .iter()
+            .map(|&i| p.targets[i].alias.as_str())
+            .collect();
+        assert_eq!(aliases, vec!["genesis-cloud"]);
+    }
+
+    #[test]
+    fn type_to_filter_empty_query_shows_every_host() {
+        let mut p = populated_panel(&["alpha", "beta"]);
+        p.push_filter_char('a');
+        p.pop_filter_char();
+        let n = p.visible_indices().len();
+        assert_eq!(
+            n, 2,
+            "after backspacing the only filter char the panel must show every host again"
+        );
+    }
+
+    #[test]
+    fn type_to_filter_keeps_selection_within_visible_set() {
+        let mut p = populated_panel(&["alpha", "bravo", "charlie"]);
+        p.selected = 2;
+        p.push_filter_char('a');
+        let sel = p.selected;
+        assert!(
+            p.visible_indices().contains(&sel),
+            "after applying a filter the selected index must still belong to the visible set; otherwise Enter would launch a hidden host"
+        );
+    }
+
+    #[test]
+    fn target_at_y_resolves_against_filtered_rows_not_raw_targets() {
+        let mut p = populated_panel(&["alpha", "bravo", "charlie"]);
+        let area = Rect { x: 0, y: 0, width: 40, height: 10 };
+        let mut buf = Buffer::empty(area);
+        p.push_filter_char('b');
+        (&mut p).render(area, &mut buf);
+        let first_row_y = p.last_list_area.y;
+        let idx = p
+            .target_at_y(first_row_y)
+            .expect("first row must resolve to a target");
+        assert_eq!(
+            p.targets[idx].alias, "bravo",
+            "clicking the first visible row under a filter must select the matching host, not raw targets[0]"
+        );
+    }
+
+    #[test]
+    fn clear_filter_returns_true_when_filter_had_chars() {
+        let mut p = populated_panel(&["alpha"]);
+        p.push_filter_char('x');
+        assert!(p.clear_filter());
+        assert!(!p.clear_filter());
+        assert!(p.filter.is_empty());
     }
 
     #[test]
@@ -545,44 +869,20 @@ mod tests {
         let area = Rect { x: 0, y: 0, width: 40, height: 40 };
         let mut buf = Buffer::empty(area);
         (&mut p).render(area, &mut buf);
-        assert!(
-            p.header_add_btn.width > 0,
-            "header + button must register a hit rect so clicking it opens the ssh config"
-        );
-        assert!(
-            p.header_gear_btn.width > 0,
-            "header gear must register a hit rect"
-        );
-        assert!(
-            p.empty_primary_btn.width > 0,
-            "primary 'Add New Host' button must register a hit rect — the whole point of the empty state is that this is clickable"
-        );
-        assert!(
-            p.empty_secondary_btn.width > 0,
-            "secondary 'Open SSH Config' button must register a hit rect"
-        );
-        assert!(
-            p.empty_learn_link.width > 0,
-            "learn-more link must register a hit rect"
-        );
+        assert!(p.header_add_btn.width > 0);
+        assert!(p.header_refresh_btn.width > 0);
+        assert!(p.empty_primary_btn.width > 0);
+        assert!(p.empty_secondary_btn.width > 0);
+        assert!(p.empty_learn_link.width > 0);
     }
 
     #[test]
     fn populated_state_does_not_register_empty_state_hit_rects() {
-        let mut p = RemotePanel::new();
-        p.targets = vec![RemoteTarget {
-            alias: "dev".into(),
-            host_name: Some("example.com".into()),
-            user: None,
-        }];
+        let mut p = populated_panel(&["dev"]);
         let area = Rect { x: 0, y: 0, width: 40, height: 40 };
         let mut buf = Buffer::empty(area);
         (&mut p).render(area, &mut buf);
-        assert_eq!(
-            p.empty_primary_btn,
-            Rect::default(),
-            "populated state must zero out the empty-state hit rects so a click on the host list does not accidentally fire 'Add New Host'"
-        );
+        assert_eq!(p.empty_primary_btn, Rect::default());
         assert_eq!(p.empty_secondary_btn, Rect::default());
         assert_eq!(p.empty_learn_link, Rect::default());
     }
@@ -627,10 +927,7 @@ mod tests {
         let area = Rect { x: 0, y: 0, width: 40, height: 40 };
         let mut buf = Buffer::empty(area);
         (&mut p).render(area, &mut buf);
-        assert_eq!(
-            p.empty_primary_btn.height, 3,
-            "primary button must be 3 rows tall so the rounded corners fit and the click target is comfortable"
-        );
+        assert_eq!(p.empty_primary_btn.height, 3);
         assert_eq!(p.empty_secondary_btn.height, 3);
     }
 
@@ -640,10 +937,7 @@ mod tests {
         let area = Rect { x: 0, y: 0, width: 40, height: 40 };
         let mut buf = Buffer::empty(area);
         (&mut p).render(area, &mut buf);
-        assert!(
-            p.last_image_cell.is_some(),
-            "render_empty_state must publish the cell where the SSH PNG should be emitted via OSC-1337; without this the post-draw flush has nowhere to land the image and the empty state shows a blank box"
-        );
+        assert!(p.last_image_cell.is_some());
     }
 
     #[test]
@@ -659,21 +953,9 @@ mod tests {
             }
             joined.push('\n');
         }
-        assert!(
-            joined.contains("No SSH hosts yet"),
-            "rendered buffer must contain the empty-state heading; got:\n{joined}"
-        );
-        assert!(
-            joined.contains("Add New Host"),
-            "rendered buffer must contain the primary button label"
-        );
-        assert!(
-            joined.contains("Open SSH Config"),
-            "rendered buffer must contain the secondary button label"
-        );
-        assert!(
-            joined.contains("Learn more about SSH"),
-            "rendered buffer must contain the learn-more link"
-        );
+        assert!(joined.contains("No SSH hosts yet"));
+        assert!(joined.contains("Add New Host"));
+        assert!(joined.contains("Open SSH Config"));
+        assert!(joined.contains("Learn more about SSH"));
     }
 }
