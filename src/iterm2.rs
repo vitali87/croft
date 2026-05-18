@@ -87,6 +87,13 @@ const CMD_SHIFT_R_HEX: &str = "0x1b 0x5b 0x38 0x32 0x3b 0x31 0x30 0x75";
 /// layer before croft's Explorer-pane handler sees it.
 const CMD_SHIFT_N_KEY: &str = "0x4e-0x120000-0x2d";
 const CMD_SHIFT_N_HEX: &str = "0x1b 0x5b 0x37 0x38 0x3b 0x31 0x30 0x75";
+/// `Cmd+Shift+T` — focus the Terminal pane from any pane. iTerm2 binds
+/// the bare chord to "Restore Closed Session"; the NSUserKeyEquivalents
+/// override below relocates that menu item to Cmd+Opt+Shift+T so this
+/// forwarder fires instead. Codepoint 'T' (0x54 = 84), virtualKeyCode
+/// `kVK_ANSI_T` = 0x11. CSI-u `ESC [ 84 ; 10 u`.
+const CMD_SHIFT_T_KEY: &str = "0x54-0x120000-0x11";
+const CMD_SHIFT_T_HEX: &str = "0x1b 0x5b 0x38 0x34 0x3b 0x31 0x30 0x75";
 /// `Ctrl+Shift+J` — toggle "maximize terminal" so the editor / welcome
 /// pane collapses and the terminal fills the right column. Codepoint 'J'
 /// (0x4a = 74), modifier mask 0x60000 = NSEventModifierFlagControl(0x40000)
@@ -273,6 +280,10 @@ pub fn apply_croft_key_settings(plist: &mut Value) -> Result<(), ITerm2Error> {
     // is consulted. Cmd+Opt+P keeps Print reachable on a chord croft
     // does not use.
     set_string(menu, PRINT_MENU_KEY, PRINT_MENU_EQUIV.to_string());
+    // Relocate iTerm2's "Restore Closed Session" off Cmd+Shift+T so
+    // croft's terminal-focus chord can claim it. Cmd+Opt+Shift+T keeps
+    // the iTerm2 action reachable on a chord croft does not use.
+    set_string(menu, "Restore Closed Session", "@~T".to_string());
     // iTerm2's Window menu binds Cmd+1..Cmd+9 to Select Tab. Move each
     // to Cmd+Opt+digit so croft can capture Cmd+digit as a vim count.
     for (i, label) in [
@@ -334,6 +345,7 @@ pub fn apply_croft_key_settings(plist: &mut Value) -> Result<(), ITerm2Error> {
         (CMD_SHIFT_D_KEY, CMD_SHIFT_D_HEX),
         (CMD_SHIFT_R_KEY, CMD_SHIFT_R_HEX),
         (CMD_SHIFT_N_KEY, CMD_SHIFT_N_HEX),
+        (CMD_SHIFT_T_KEY, CMD_SHIFT_T_HEX),
         (CTRL_SHIFT_J_KEY, CTRL_SHIFT_J_HEX),
     ] {
         global.insert(key.into(), send_hex_action(hex, 0));
@@ -750,6 +762,32 @@ mod tests {
             menu.get("Split Horizontally with Same Profile").and_then(|v| v.as_string()),
             Some("@~D"),
             "iTerm2's Split Horizontally with Same Profile must be relocated off Cmd+Shift+D so croft's Run-and-Debug jump can claim the chord; @~D = Cmd+Opt+Shift+D keeps the iTerm2 split reachable on a chord croft does not use"
+        );
+    }
+
+    #[test]
+    fn apply_croft_key_settings_forwards_cmd_shift_t_for_terminal_focus() {
+        let mut plist = synth_plist("GUID-1", &["GUID-1"]);
+        apply_croft_key_settings(&mut plist).unwrap();
+        let top = plist.as_dictionary().unwrap();
+        let global = dict_in(top, "GlobalKeyMap");
+        assert_eq!(
+            action_text(global, CMD_SHIFT_T_KEY),
+            CMD_SHIFT_T_HEX,
+            "GlobalKeyMap must forward Cmd+Shift+T as a CSI-u sequence so croft's `is_terminal_focus_key` fires from any pane. Encoding: 'T' (codepoint 0x54 = 84) with kitty modifier byte 10 = 1 base + Shift(1) + Super(8), giving `ESC [ 84 ; 10 u`"
+        );
+    }
+
+    #[test]
+    fn apply_croft_key_settings_relocates_restore_closed_session_menu_off_cmd_shift_t() {
+        let mut plist = synth_plist("GUID-1", &["GUID-1"]);
+        apply_croft_key_settings(&mut plist).unwrap();
+        let top = plist.as_dictionary().unwrap();
+        let menu = dict_in(top, "NSUserKeyEquivalents");
+        assert_eq!(
+            menu.get("Restore Closed Session").and_then(|v| v.as_string()),
+            Some("@~T"),
+            "iTerm2's Restore Closed Session must be relocated off Cmd+Shift+T so croft's terminal-focus chord can claim it; @~T = Cmd+Opt+Shift+T keeps the iTerm2 action reachable on a chord croft does not use"
         );
     }
 

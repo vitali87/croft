@@ -1,6 +1,6 @@
 [package]
 name = "croft"
-version = "0.1.143"
+version = "0.1.145"
 edition = "2024"
 description = "VSCode-style TUI written in Rust"
 license = "MIT"
@@ -69,6 +69,7 @@ serde_json = "1"
 csv = "1.4"
 calamine = "0.34"
 similar = "3.1"
+rayon = "1.12"
 
 [dev-dependencies]
 tempfile = "3.27"

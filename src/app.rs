@@ -3886,6 +3886,13 @@ impl App {
             }
             return Ok(());
         }
+        if is_terminal_focus_key(key) {
+            if !self.show_terminal {
+                self.show_terminal = true;
+            }
+            self.focus_pane(Pane::Terminal);
+            return Ok(());
+        }
         // Explorer-pane shortcuts get first refusal so Cmd+Shift+F creates
         // a folder when the user is browsing the tree, rather than always
         // jumping to Search. Outside Explorer the global Search-jump wins.
@@ -7055,6 +7062,9 @@ impl App {
     /// into the old workspace.
     pub fn change_workspace_root(&mut self, new_root: PathBuf) {
         let display = new_root.display().to_string();
+        if let Some(active) = self.terminals.get_mut(self.active_terminal) {
+            active.change_cwd(&new_root);
+        }
         self.workspace_root = new_root.clone();
         self.tree.set_root(new_root.clone());
         self.tree_clipboard = None;
@@ -8233,12 +8243,36 @@ fn is_terminal_maximize_key(key: KeyEvent) -> bool {
 }
 
 /// `Ctrl+Shift+T`: spawn an additional terminal next to the active one.
+/// Rejects SUPER so the Mac-side `Cmd+Shift+T` focus chord (see
+/// `is_terminal_focus_key`) does not double-fire as a split when the
+/// user happens to be holding both modifiers.
 fn is_terminal_split_key(key: KeyEvent) -> bool {
     let KeyCode::Char(c) = key.code else { return false };
     if !c.eq_ignore_ascii_case(&'t') {
         return false;
     }
+    if key.modifiers.contains(KeyModifiers::SUPER) {
+        return false;
+    }
     key.modifiers.contains(KeyModifiers::CONTROL) && key.modifiers.contains(KeyModifiers::SHIFT)
+}
+
+/// `Cmd+Shift+T` (Mac SUPER+SHIFT+T): focus the Terminal pane from any
+/// pane, un-hiding it if it was collapsed via Ctrl+J. SUPER-only so the
+/// cross-platform `Ctrl+Shift+T` (split-terminal) chord keeps its
+/// historical meaning - the two chords share the same letter but are
+/// disambiguated by the modifier.
+fn is_terminal_focus_key(key: KeyEvent) -> bool {
+    let KeyCode::Char(c) = key.code else { return false };
+    if !c.eq_ignore_ascii_case(&'t') {
+        return false;
+    }
+    if key.modifiers.contains(KeyModifiers::ALT)
+        || key.modifiers.contains(KeyModifiers::CONTROL)
+    {
+        return false;
+    }
+    key.modifiers.contains(KeyModifiers::SUPER) && key.modifiers.contains(KeyModifiers::SHIFT)
 }
 
 /// `Ctrl+Shift+W`: close the active terminal (no-op if it's the only one).
@@ -10972,6 +11006,31 @@ mod tests {
     }
 
     #[test]
+    fn change_workspace_root_writes_cd_into_active_terminal_pty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target_dir = tmp.path().join("seeded");
+        std::fs::create_dir(&target_dir).unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+
+        // Clear the freshly-spawned shell's "first paint" dirty bit so
+        // the next take_dirty() exclusively reflects bytes written by
+        // change_workspace_root itself. change_workspace_root performs
+        // no other write_input on the terminal, so a dirty flag after
+        // the call can only have come from the change_cwd seed.
+        let _ = app.terminal_mut().take_dirty();
+        app.change_workspace_root(target_dir.clone());
+
+        assert!(
+            app.terminal_mut().take_dirty(),
+            "change_workspace_root must seed the active terminal's PTY with a cd command so the shell follows the Explorer; nothing was written"
+        );
+        assert_eq!(
+            app.workspace_root, target_dir,
+            "workspace_root must still flip to the new path"
+        );
+    }
+
+    #[test]
     fn tree_context_menu_on_subfolder_offers_new_file_new_folder_then_cut_copy_rename_delete() {
         let tmp = tempfile::tempdir().unwrap();
         let d = tmp.path().join("sub");
@@ -12985,6 +13044,76 @@ mod tests {
         app.focus_pane(Pane::Editor);
         app.handle_key(key(KeyCode::Char('r'), KeyModifiers::SUPER | KeyModifiers::SHIFT)).unwrap();
         assert_eq!(app.sidebar_view, SidebarView::Remote);
+    }
+
+    #[test]
+    fn cmd_shift_t_focuses_the_terminal_pane_from_the_editor() {
+        let mut app = editor_app_with_lines(&["x"]);
+        app.focus_pane(Pane::Editor);
+        app.handle_key(key(KeyCode::Char('t'), KeyModifiers::SUPER | KeyModifiers::SHIFT)).unwrap();
+        assert!(
+            matches!(app.focus, Pane::Terminal),
+            "Cmd+Shift+T must move focus to the Terminal pane from the editor so the user can start typing in the shell without reaching for the mouse"
+        );
+    }
+
+    #[test]
+    fn cmd_shift_t_focuses_the_terminal_pane_from_the_tree() {
+        let mut app = editor_app_with_lines(&["x"]);
+        app.focus_pane(Pane::Tree);
+        app.handle_key(key(KeyCode::Char('t'), KeyModifiers::SUPER | KeyModifiers::SHIFT)).unwrap();
+        assert!(
+            matches!(app.focus, Pane::Terminal),
+            "Cmd+Shift+T must move focus to the Terminal pane even when the Explorer is focused"
+        );
+    }
+
+    #[test]
+    fn cmd_shift_t_unhides_the_terminal_if_it_was_collapsed() {
+        let mut app = editor_app_with_lines(&["x"]);
+        app.focus_pane(Pane::Editor);
+        app.show_terminal = false;
+        app.handle_key(key(KeyCode::Char('T'), KeyModifiers::SUPER | KeyModifiers::SHIFT)).unwrap();
+        assert!(
+            app.show_terminal,
+            "Cmd+Shift+T must un-hide the terminal if it was collapsed (Ctrl+J) — otherwise the focus jump lands in a zero-row pane"
+        );
+        assert!(matches!(app.focus, Pane::Terminal));
+    }
+
+    #[test]
+    fn ctrl_shift_t_still_splits_the_terminal_and_does_not_double_fire_as_focus() {
+        let mut app = editor_app_with_lines(&["x"]);
+        app.focus_pane(Pane::Editor);
+        let before = app.terminals.len();
+        app.handle_key(key(KeyCode::Char('t'), KeyModifiers::CONTROL | KeyModifiers::SHIFT)).unwrap();
+        assert_eq!(
+            app.terminals.len(),
+            before + 1,
+            "Ctrl+Shift+T must remain bound to split_terminal — the new Cmd+Shift+T focus chord must not steal it"
+        );
+    }
+
+    #[test]
+    fn terminal_focus_key_predicate_accepts_cmd_shift_t_and_rejects_neighbours() {
+        let cmd_shift = KeyModifiers::SUPER | KeyModifiers::SHIFT;
+        assert!(is_terminal_focus_key(key(KeyCode::Char('t'), cmd_shift)));
+        assert!(is_terminal_focus_key(key(KeyCode::Char('T'), cmd_shift)));
+        assert!(
+            !is_terminal_focus_key(key(KeyCode::Char('t'), KeyModifiers::SUPER)),
+            "Cmd+T (no Shift) is reserved by macOS for New Tab; the focus chord requires Shift"
+        );
+        assert!(
+            !is_terminal_focus_key(key(KeyCode::Char('t'), KeyModifiers::CONTROL | KeyModifiers::SHIFT)),
+            "Ctrl+Shift+T must stay routed to is_terminal_split_key, not focus"
+        );
+        assert!(
+            !is_terminal_focus_key(key(
+                KeyCode::Char('t'),
+                KeyModifiers::SUPER | KeyModifiers::SHIFT | KeyModifiers::ALT
+            )),
+            "Cmd+Opt+Shift+T must not focus — that chord is reserved (we relocate iTerm2's Restore Closed Session onto it)"
+        );
     }
 
     #[test]

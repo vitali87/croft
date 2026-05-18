@@ -305,6 +305,15 @@ impl PtyTerminal {
         self.pty_dirty.store(true, Ordering::Release);
     }
 
+    /// Seed a `cd <path>` into the embedded shell so the terminal
+    /// follows an Explorer-side workspace-root change. Sent verbatim to
+    /// the PTY input - the shell parses it like a typed command. See
+    /// `format_cd_command` for the line-clearing prefix and the path
+    /// quoting strategy.
+    pub fn change_cwd(&mut self, path: &std::path::Path) {
+        self.write_input(&format_cd_command(path));
+    }
+
     /// Paste a payload into the embedded shell. Bracketed-paste markers
     /// are added only if the inner program asked for them; otherwise the
     /// payload is sent raw so simple shells don't see literal `\e[200~`.
@@ -441,6 +450,29 @@ pub fn select_word_at_in_term(
 
 fn is_terminal_word_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
+}
+
+/// Build the byte sequence that retargets a POSIX shell's working
+/// directory to `path`. Prefixed with `\x05\x15` so cursor moves to end
+/// of line and the existing line is killed backward before the `cd` is
+/// typed - that way a half-typed command at the prompt does not
+/// concatenate with our `cd`. Path is single-quoted with embedded
+/// quotes escaped via the standard `'\''` sleight-of-hand so paths
+/// containing spaces or apostrophes round-trip safely.
+pub fn format_cd_command(path: &std::path::Path) -> Vec<u8> {
+    let s = path.to_string_lossy();
+    let mut out = Vec::with_capacity(s.len() + 8);
+    out.extend_from_slice(b"\x05\x15cd '");
+    for c in s.chars() {
+        if c == '\'' {
+            out.extend_from_slice(b"'\\''");
+        } else {
+            let mut buf = [0u8; 4];
+            out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+        }
+    }
+    out.extend_from_slice(b"'\n");
+    out
 }
 
 /// Walk a chunk of PTY output and toggle the bracketed-paste flag when
@@ -707,6 +739,50 @@ mod tests {
         term.write_input(b"echo hi\r");
         assert!(term.take_dirty(), "write_input must mark the terminal dirty");
     }
+
+    #[test]
+    fn format_cd_command_single_quotes_plain_path() {
+        let bytes = format_cd_command(std::path::Path::new("/tmp/foo"));
+        assert_eq!(
+            bytes,
+            b"\x05\x15cd '/tmp/foo'\n".to_vec(),
+            "Ctrl-E + Ctrl-U must precede the cd so a half-typed prompt line is cleared first, then the path is single-quoted and newline-terminated to fire immediately"
+        );
+    }
+
+    #[test]
+    fn format_cd_command_escapes_embedded_apostrophe() {
+        let bytes = format_cd_command(std::path::Path::new("/tmp/it's a dir"));
+        assert_eq!(
+            bytes,
+            b"\x05\x15cd '/tmp/it'\\''s a dir'\n".to_vec(),
+            "embedded ' must be escaped as '\\'' so the cd does not break out of single quotes when the path contains an apostrophe (POSIX-standard quoting)"
+        );
+    }
+
+    #[test]
+    fn format_cd_command_quotes_paths_with_spaces() {
+        let bytes = format_cd_command(std::path::Path::new("/tmp/a b/c d"));
+        assert_eq!(
+            bytes,
+            b"\x05\x15cd '/tmp/a b/c d'\n".to_vec(),
+            "single-quoting must preserve spaces verbatim so cd lands at the right directory"
+        );
+    }
+
+    #[test]
+    fn change_cwd_writes_cd_command_to_pty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut term = PtyTerminal::new(tmp.path()).unwrap();
+        let _ = term.take_dirty();
+        let target = tempfile::tempdir().unwrap();
+        term.change_cwd(target.path());
+        assert!(
+            term.take_dirty(),
+            "change_cwd must mark the terminal dirty so the next frame paints the new prompt"
+        );
+    }
+
 
     #[test]
     fn new_running_spawns_program_directly_and_produces_output() {
