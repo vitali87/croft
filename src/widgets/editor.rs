@@ -14,7 +14,15 @@ use crate::highlight::{
 };
 use crate::widgets::scrollbar;
 
-const MAX_FILE_BYTES: u64 = 5 * 1024 * 1024;
+/// Hard cap on the size of a single text file the editor will load.
+/// 50MB comfortably accommodates real-world LSP / build / debug logs
+/// (the user hit "File too large" on a 7.4MB lsp.log under the old 5MB
+/// cap) while still capping pathological inputs that would freeze the
+/// UI thread during initial `Vec<String>` allocation + tree-sitter
+/// highlight recompute. The cap applies AFTER the dedicated image /
+/// PDF / spreadsheet branches in `open`, so larger media keep their
+/// own per-format limits.
+const MAX_FILE_BYTES: u64 = 50 * 1024 * 1024;
 const MAX_IMAGE_BYTES: u64 = 25 * 1024 * 1024;
 const IMAGE_EXTENSIONS: &[&str] =
     &["png", "jpg", "jpeg", "gif", "bmp", "webp"];
@@ -1994,6 +2002,34 @@ mod tests {
     fn is_binary_accepts_normal_text() {
         let txt = "fn main() { println!(\"hello\"); }\n// this is fine\n";
         assert!(!is_binary(txt.as_bytes()));
+    }
+
+    #[test]
+    fn open_loads_a_real_world_sized_log_file_above_the_old_5mb_cap() {
+        // Regression for the user's "I can't open .croft/lsp.log" report:
+        // the LSP log grew past 5MB during normal use (their copy was
+        // 7.4MB) and the old cap silently bailed with "File too large".
+        // The current cap MUST accommodate at least 8MB of ASCII text so
+        // a typical LSP log session round-trips.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("big.log");
+        let line = "1778548312.915 lsp[ruff] stderr: 2026-05-12 02:11:52 INFO some workspace setting\n";
+        let line_bytes = line.len();
+        let target_bytes = 8 * 1024 * 1024;
+        let line_count = target_bytes / line_bytes + 1;
+        let mut buf = String::with_capacity(line_count * line_bytes);
+        for _ in 0..line_count {
+            buf.push_str(line);
+        }
+        std::fs::write(&path, &buf).unwrap();
+        assert!(
+            std::fs::metadata(&path).unwrap().len() > 5 * 1024 * 1024,
+            "test setup must produce a file larger than the historical 5MB cap"
+        );
+        let mut e = Editor::new();
+        e.open(&path)
+            .expect("editor.open must accept an 8MB plain-text log; the user reported lsp.log (7.4MB) being unopenable");
+        assert_eq!(e.lines.len(), line_count);
     }
 
     #[test]

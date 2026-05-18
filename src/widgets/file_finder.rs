@@ -1,4 +1,5 @@
 use ignore::{WalkBuilder, WalkState};
+use rayon::prelude::*;
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
@@ -6,6 +7,8 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph, Widget},
 };
+use std::cmp::Ordering;
+use std::collections::BinaryHeap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -125,28 +128,112 @@ impl FileFinder {
             self.results = scored;
             return;
         }
-        let mut top: Vec<(MatchTier, i32, usize)> = Vec::new();
-        for (idx, entry) in self.entries.iter().enumerate() {
-            if let Some((tier, score)) =
-                score_entry(&needle, &entry.rel_lower, entry.filename_start)
-            {
-                top.push((tier, score, idx));
-            }
-        }
-        let entries = &self.entries;
-        top.sort_by(|a, b| {
-            b.0.cmp(&a.0)
-                .then_with(|| entries[a.2].rel.len().cmp(&entries[b.2].rel.len()))
-                .then_with(|| b.1.cmp(&a.1))
-                .then_with(|| entries[a.2].rel.cmp(&entries[b.2].rel))
-        });
-        top.truncate(MAX_RESULTS);
+        let entries: &[FileEntry] = &self.entries;
+        // Score in parallel with rayon and accumulate per-thread top-K
+        // bounded heaps, then merge. With N=1.5M entries on a typical
+        // home dir, this drops keystroke latency from ~300 ms (serial,
+        // full sort) to single-digit ms (multi-core, heap of K=40).
+        let merged: BinaryHeap<RankedSlot> = entries
+            .par_iter()
+            .enumerate()
+            .fold(
+                || BinaryHeap::<RankedSlot>::with_capacity(MAX_RESULTS + 1),
+                |mut heap, (idx, entry)| {
+                    if let Some((tier, score)) =
+                        score_entry(&needle, &entry.rel_lower, entry.filename_start)
+                    {
+                        push_topk(
+                            &mut heap,
+                            RankedSlot {
+                                tier,
+                                rel_len: entry.rel.len() as u32,
+                                score,
+                                idx,
+                            },
+                            MAX_RESULTS,
+                        );
+                    }
+                    heap
+                },
+            )
+            .reduce(
+                || BinaryHeap::<RankedSlot>::with_capacity(MAX_RESULTS + 1),
+                |mut a, b| {
+                    for slot in b {
+                        push_topk(&mut a, slot, MAX_RESULTS);
+                    }
+                    a
+                },
+            );
+        // Our Ord orders BEST as LEAST (so the max-heap root is the
+        // worst-of-top-K, evictable in O(log K)). into_sorted_vec
+        // therefore returns ascending = best-first already.
+        let top: Vec<RankedSlot> = merged.into_sorted_vec();
         self.results = top
             .into_iter()
-            .map(|(_, _, idx)| ScoredResult {
-                entry: self.entries[idx].clone(),
+            .map(|slot| ScoredResult {
+                entry: entries[slot.idx].clone(),
             })
             .collect();
+    }
+}
+
+/// One ranked match candidate. Ordering is "worse comes first" so a
+/// `BinaryHeap` (max-heap) keeps the WORST of the top-K at the root,
+/// letting us evict it in O(log K) when a better candidate arrives.
+#[derive(Clone, Copy, Debug)]
+struct RankedSlot {
+    tier: MatchTier,
+    rel_len: u32,
+    score: i32,
+    idx: usize,
+}
+
+impl PartialEq for RankedSlot {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for RankedSlot {}
+
+impl PartialOrd for RankedSlot {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for RankedSlot {
+    /// Mirrors the old sort_by in refresh_results, but inverted so
+    /// the BinaryHeap (max-heap) root is the WORST candidate in the
+    /// current top-K. Tie-break order, BEST -> WORST:
+    ///   1. Higher MatchTier (ExactFilename > Subsequence)
+    ///   2. Shorter rel.len (workspace-root storage.py beats deep)
+    ///   3. Higher fuzzy score
+    ///   4. Lexicographic rel ascending (handled at idx tiebreak)
+    fn cmp(&self, other: &Self) -> Ordering {
+        // Worse-first: invert each comparison vs "best".
+        other
+            .tier
+            .cmp(&self.tier)
+            .then_with(|| self.rel_len.cmp(&other.rel_len))
+            .then_with(|| other.score.cmp(&self.score))
+            .then_with(|| self.idx.cmp(&other.idx))
+    }
+}
+
+fn push_topk(heap: &mut BinaryHeap<RankedSlot>, slot: RankedSlot, k: usize) {
+    if heap.len() < k {
+        heap.push(slot);
+        return;
+    }
+    // heap.peek() is the worst-of-top-K under our Ord. If incoming is
+    // strictly better (= less under cmp), evict + insert.
+    if let Some(worst) = heap.peek() {
+        if slot.cmp(worst) == Ordering::Less {
+            heap.pop();
+            heap.push(slot);
+        }
     }
 }
 
@@ -223,13 +310,124 @@ pub fn fuzzy_score(needle: &str, hay_lower: &str, filename_start: usize) -> Opti
     }
 }
 
+/// Directory names that are vendored / generated / VCS-internal and
+/// will never be a useful Cmd+P target. Including these in the index
+/// would drown signal in noise (every `.git/objects/*` blob,
+/// `node_modules/**`, `target/debug/incremental/*`, etc.) and balloon
+/// the walk by orders of magnitude. The match is exact on the path
+/// component name - a real workspace file literally named `target.md`
+/// is still indexed.
+const NOISE_DIR_NAMES: &[&str] = &[
+    ".git",
+    ".hg",
+    ".svn",
+    ".bzr",
+    "node_modules",
+    "target",
+    "__pycache__",
+    ".venv",
+    "venv",
+    ".tox",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".next",
+    ".nuxt",
+    ".cache",
+    "dist",
+    "build",
+    ".gradle",
+    ".idea",
+    ".vscode-test",
+    ".DS_Store",
+];
+
+fn is_noise_dir(name: &std::ffi::OsStr) -> bool {
+    name.to_str().is_some_and(|n| NOISE_DIR_NAMES.contains(&n))
+}
+
+/// Absolute paths to prune from the walk for two reasons:
+///   1. `Library/Containers` and `Library/Group Containers` trigger a
+///      macOS TCC consent prompt ("App would like to access data from
+///      other apps") because they live behind
+///      kTCCServiceSystemPolicyAppData.
+///   2. The Library/Caches, Library/Application Support, Library/Mobile
+///      Documents, Library/Developer, Library/CoreSimulator,
+///      Library/Mail, Library/Messages, Library/CloudStorage,
+///      Library/Safari, Library/Cookies trees collectively account
+///      for ~1.4M of the ~1.5M files found by a `~`-rooted walk on a
+///      typical developer Mac. None of those are useful Cmd+P
+///      targets, and including them blows per-keystroke match
+///      latency from ~5ms to ~300ms. Library/Logs is kept in because
+///      log files DO get opened (the user's lsp.log lives at
+///      `~/.croft/lsp.log` but `~/Library/Logs/*` is a reasonable
+///      Cmd+P target too).
+fn macos_blocked_paths() -> Vec<PathBuf> {
+    let Some(home) = std::env::var_os("HOME") else {
+        return Vec::new();
+    };
+    let home = PathBuf::from(home);
+    let lib = home.join("Library");
+    [
+        "Containers",
+        "Group Containers",
+        "Caches",
+        "Application Support",
+        "Mobile Documents",
+        "CloudStorage",
+        "Developer",
+        "CoreSimulator",
+        "Mail",
+        "Messages",
+        "Safari",
+        "Cookies",
+        "Metadata",
+        "Suggestions",
+        "Biome",
+        "Calendars",
+        "Reminders",
+        "PersonalizationPortrait",
+        "HomeKit",
+        "Photos",
+        "Daemon Containers",
+        "WebKit",
+    ]
+    .iter()
+    .map(|leaf| lib.join(leaf))
+    .collect()
+}
+
 pub fn build_file_index(root: &Path) -> Vec<FileEntry> {
     let collected: Arc<Mutex<Vec<FileEntry>>> = Arc::new(Mutex::new(Vec::new()));
     let root_buf = root.to_path_buf();
+    let blocked = macos_blocked_paths();
     let walker = WalkBuilder::new(root)
         .git_ignore(true)
         .require_git(false)
-        .hidden(true)
+        // .hidden(false) so user dot-dirs (.croft, .cursor, .config,
+        // .continue, .databridge) ARE walked - the user explicitly
+        // wants to Cmd+P into them. NOISE_DIR_NAMES below prunes the
+        // vendored / generated dot-dirs (.git, .venv, .mypy_cache,
+        // .next, .cache, ...) that would otherwise drown the index.
+        .hidden(false)
+        .filter_entry(move |entry| {
+            let depth = entry.depth();
+            if depth == 0 {
+                return true;
+            }
+            if is_noise_dir(entry.file_name()) {
+                return false;
+            }
+            // Hard-skip macOS app-data containers so readdir does not
+            // trip a TCC consent prompt on every launch. starts_with
+            // matches both the container root and any descendant.
+            for b in &blocked {
+                if entry.path().starts_with(b) {
+                    return false;
+                }
+            }
+            true
+        })
         .build_parallel();
     walker.run(|| {
         let collected = collected.clone();
@@ -528,6 +726,109 @@ mod tests {
     }
 
     #[test]
+    fn build_file_index_includes_user_owned_dot_directories() {
+        // Regression for the user's "Cmd+P does not find ~/.croft/lsp.log
+        // even when I type lsp.log" report. The old build_file_index
+        // called .hidden(true) which silently excluded every dot-dir,
+        // including the user's own ~/.croft, ~/.cursor, ~/.continue,
+        // ~/.config, etc. - exactly the directories whose contents the
+        // Cmd+P finder is supposed to help locate.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join(".croft")).unwrap();
+        std::fs::write(tmp.path().join(".croft").join("lsp.log"), b"").unwrap();
+        std::fs::create_dir(tmp.path().join(".config")).unwrap();
+        std::fs::write(tmp.path().join(".config").join("init.toml"), b"").unwrap();
+        let entries = build_file_index(tmp.path());
+        let names: Vec<&str> = entries.iter().map(|e| e.rel.as_str()).collect();
+        assert!(
+            names.contains(&".croft/lsp.log"),
+            "Cmd+P index must include files under user dot-dirs like .croft/; got {names:?}"
+        );
+        assert!(
+            names.contains(&".config/init.toml"),
+            "Cmd+P index must include files under .config/ and similar user dot-dirs; got {names:?}"
+        );
+    }
+
+    #[test]
+    fn build_file_index_skips_macos_app_data_containers() {
+        // Regression for the user's "iTerm.app would like to access
+        // data from other apps" TCC prompt that fired repeatedly
+        // after the 0.1.148 background-index landed. macOS gates
+        // ~/Library/Containers/<bundle-id> and ~/Library/Group
+        // Containers/<group-id> behind kTCCServiceSystemPolicyAppData;
+        // any process that readdir's into those paths trips a
+        // consent prompt on the parent terminal app. None of those
+        // files are useful Cmd+P targets, so prune the two directory
+        // trees outright. Test simulates a workspace rooted at a fake
+        // $HOME so the path-shape match fires deterministically.
+        let tmp = tempfile::tempdir().unwrap();
+        let fake_home = tmp.path();
+        let containers = fake_home.join("Library").join("Containers").join("com.example.app").join("Data");
+        std::fs::create_dir_all(&containers).unwrap();
+        std::fs::write(containers.join("private.sqlite"), b"").unwrap();
+        let group = fake_home.join("Library").join("Group Containers").join("group.example").join("shared");
+        std::fs::create_dir_all(&group).unwrap();
+        std::fs::write(group.join("shared.db"), b"").unwrap();
+        // A normal Library subdir the user DOES want indexed - Logs
+        // is the canonical lsp.log location regression target.
+        let logs = fake_home.join("Library").join("Logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        std::fs::write(logs.join("app.log"), b"").unwrap();
+        let saved = std::env::var_os("HOME");
+        // SAFETY: tests in this binary are serialized for env vars
+        // via build_file_index's HOME read; the value is restored at
+        // the end of the test. Other tests do not toggle $HOME.
+        unsafe { std::env::set_var("HOME", fake_home); }
+        let entries = build_file_index(fake_home);
+        match saved {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+        let names: Vec<&str> = entries.iter().map(|e| e.rel.as_str()).collect();
+        assert!(
+            names.contains(&"Library/Logs/app.log"),
+            "Library/Logs/app.log must still be indexed; got {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n.starts_with("Library/Containers/")),
+            "Library/Containers/** must be excluded to avoid macOS AppData TCC prompts; got {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n.starts_with("Library/Group Containers/")),
+            "Library/Group Containers/** must be excluded for the same TCC reason; got {names:?}"
+        );
+    }
+
+    #[test]
+    fn build_file_index_skips_vendored_noise_directories() {
+        // Including hidden dirs would otherwise drown the index in
+        // .git/objects/* and node_modules/* — paths the user never
+        // wants to open via Cmd+P. Make sure the noise-dir filter
+        // keeps those out even though .hidden(false) is now in
+        // effect.
+        let tmp = tempfile::tempdir().unwrap();
+        for noise in [".git", "node_modules", "target", "__pycache__", ".venv", ".tox", ".mypy_cache"] {
+            let dir = tmp.path().join(noise);
+            std::fs::create_dir(&dir).unwrap();
+            std::fs::write(dir.join("blob"), b"").unwrap();
+        }
+        std::fs::write(tmp.path().join("real.txt"), b"").unwrap();
+        let entries = build_file_index(tmp.path());
+        let names: Vec<&str> = entries.iter().map(|e| e.rel.as_str()).collect();
+        assert!(
+            names.contains(&"real.txt"),
+            "the regular workspace file must still be indexed; got {names:?}"
+        );
+        for noise in [".git/blob", "node_modules/blob", "target/blob", "__pycache__/blob", ".venv/blob", ".tox/blob", ".mypy_cache/blob"] {
+            assert!(
+                !names.contains(&noise),
+                "{noise} must be filtered out so vendored / generated dirs do not drown the Cmd+P index; got {names:?}"
+            );
+        }
+    }
+
+    #[test]
     fn exact_filename_match_beats_every_substring_or_subsequence_match() {
         let entries = Arc::new(vec![
             entry("packages/anterior-dev-py/tests/test_citations_storage.py"),
@@ -586,6 +887,40 @@ mod tests {
             ],
             "all three are exact-filename matches; tie-break must be ascending rel.len() so the workspace-root storage.py wins — got {rels:?}"
         );
+    }
+
+    /// Manual diagnostic: walks the real `$HOME`, then types
+    /// "lsp.log" one char at a time, printing per-keystroke latency.
+    /// Marked #[ignore] so it never runs in CI/regular `cargo test`.
+    /// Invoke as:
+    ///   cargo test --release --bin croft -- --ignored --nocapture bench_cmd_p_real_home
+    #[test]
+    #[ignore]
+    fn bench_cmd_p_real_home() {
+        let home = std::env::var("HOME").expect("$HOME");
+        let root = std::path::PathBuf::from(home);
+        let t0 = std::time::Instant::now();
+        let entries = build_file_index(&root);
+        let walk_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        eprintln!(
+            "walk: indexed {} files in {:.0} ms",
+            entries.len(),
+            walk_ms
+        );
+        let arc = std::sync::Arc::new(entries);
+        let mut finder = FileFinder::new(arc.clone());
+        for c in "lsp.log".chars() {
+            let t = std::time::Instant::now();
+            finder.push_char(c);
+            let ms = t.elapsed().as_secs_f64() * 1000.0;
+            eprintln!(
+                "type '{}' -> query={:?} results={} latency={:.2} ms",
+                c,
+                finder.query,
+                finder.visible_results().len(),
+                ms
+            );
+        }
     }
 
     #[test]

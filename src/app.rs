@@ -815,6 +815,12 @@ pub struct App {
     /// Cached workspace file index. Built lazily on first Cmd+P and
     /// shared across reopens so repeated invocations are instant.
     file_finder_index: Option<std::sync::Arc<Vec<crate::widgets::file_finder::FileEntry>>>,
+    /// Background-build receiver: App::new spawns a thread that walks
+    /// the workspace and sends the index here; Cmd+P opens against the
+    /// hot index instead of walking on the UI thread. None once the
+    /// index has been received (or if a build was never kicked off).
+    file_finder_index_rx:
+        Option<std::sync::mpsc::Receiver<Vec<crate::widgets::file_finder::FileEntry>>>,
     /// One-shot: armed on open and close to evict iTerm2's image cache
     /// behind the finder, same pipeline as the shortcuts modal.
     file_finder_image_clear_requested: bool,
@@ -1222,6 +1228,17 @@ impl App {
                 search_results_tx,
             );
         });
+        // Pre-build the Cmd+P file index on a background thread so the
+        // first Cmd+P keystroke does not stall the UI for the length
+        // of a workspace walk. The result is delivered via channel;
+        // open_file_finder calls poll_file_finder_index to consume it.
+        let (file_finder_index_tx, file_finder_index_rx) =
+            std::sync::mpsc::channel::<Vec<crate::widgets::file_finder::FileEntry>>();
+        let index_root = root.clone();
+        std::thread::spawn(move || {
+            let entries = crate::widgets::file_finder::build_file_index(&index_root);
+            let _ = file_finder_index_tx.send(entries);
+        });
         let fs_poll_dir_mtimes = Self::snapshot_expanded_dir_mtimes(&tree);
         Ok(Self {
             tree,
@@ -1329,6 +1346,7 @@ impl App {
             editor_find: None,
             file_finder: None,
             file_finder_index: None,
+            file_finder_index_rx: Some(file_finder_index_rx),
             file_finder_image_clear_requested: false,
             completion_request_id: None,
         })
@@ -2108,6 +2126,11 @@ impl App {
         if self.drain_git_responses() {
             changed = true;
         }
+        // Land the background-built Cmd+P file index the moment the
+        // walker thread finishes, so the very next Cmd+P opens
+        // against a hot index instead of triggering the synchronous
+        // fallback walk.
+        self.poll_file_finder_index();
         changed
     }
 
@@ -5827,14 +5850,45 @@ impl App {
         }
     }
 
+    /// Drain the background-build receiver into `file_finder_index`
+    /// without blocking. Called from `open_file_finder` and from the
+    /// main loop tick so the index lands the moment the worker thread
+    /// finishes, even before the user opens Cmd+P.
+    fn poll_file_finder_index(&mut self) {
+        if self.file_finder_index.is_some() {
+            self.file_finder_index_rx = None;
+            return;
+        }
+        let Some(rx) = self.file_finder_index_rx.as_ref() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(entries) => {
+                self.file_finder_index = Some(std::sync::Arc::new(entries));
+                self.file_finder_index_rx = None;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.file_finder_index_rx = None;
+            }
+        }
+    }
+
     fn open_file_finder(&mut self) {
         if self.file_finder.is_some() {
             return;
         }
+        // Drain the background-built index if it has landed.
+        self.poll_file_finder_index();
+        // Fallback: the worker thread has not finished yet AND no
+        // index has ever been cached. Walk synchronously this once
+        // rather than open an empty finder; this only fires when
+        // Cmd+P is pressed within the first few hundred ms of launch.
         if self.file_finder_index.is_none() {
             let entries =
                 crate::widgets::file_finder::build_file_index(&self.workspace_root);
             self.file_finder_index = Some(std::sync::Arc::new(entries));
+            self.file_finder_index_rx = None;
         }
         let entries = self
             .file_finder_index
@@ -6377,7 +6431,19 @@ impl App {
                     // the editor / welcome's bottom border (`y - 1`).
                     // Symmetric with the sidebar drag — either edge of the
                     // visible seam grabs the splitter.
-                    if m.row == y || m.row == y.saturating_sub(1) {
+                    //
+                    // Gate by column too: the editor / terminal splitter
+                    // only spans the RIGHT column (everything at or past
+                    // `sidebar_splitter_x`). Without this gate, a click
+                    // on a tree row in the LEFT column whose y lines up
+                    // with the splitter is silently hijacked into a
+                    // splitter-drag and never reaches `node_at_y` -
+                    // exactly the dead-zone the user hit on the last
+                    // two files in the Explorer.
+                    let in_splitter_x_range = self
+                        .sidebar_splitter_x
+                        .is_none_or(|x| m.column >= x);
+                    if in_splitter_x_range && (m.row == y || m.row == y.saturating_sub(1)) {
                         self.splitter_drag = Some(SplitterDrag::Terminal);
                         return;
                     }
@@ -10506,8 +10572,8 @@ mod tests {
             "status bar should advertise ^j as the terminal-toggle shortcut"
         );
         assert!(
-            src.contains("\" Term\""),
-            "status bar should label the ^j shortcut 'Term'"
+            src.contains("Span::raw(\" Term"),
+            "status bar should label the ^j shortcut 'Term' (matched a `Span::raw(\" Term` prefix so cosmetic trailing-whitespace tweaks do not break the assertion)"
         );
     }
 
@@ -13640,6 +13706,111 @@ mod tests {
         assert_ne!(
             app.status, original_status,
             "click on Paste button must invoke the clipboard paste path (status updates whether clipboard read succeeds, fails, or returns empty)"
+        );
+    }
+
+    #[test]
+    fn cmd_p_index_is_built_in_the_background_so_open_does_not_walk_synchronously() {
+        // Regression for the user's "Cmd+P is so slow" report. The old
+        // open_file_finder ran build_file_index synchronously on the
+        // UI thread on first invocation; for a sizeable workspace
+        // that stalled the TUI for the entire walk. The fix kicks
+        // off the walk in App::new and delivers the index via
+        // channel - by the time the user reaches for Cmd+P, the
+        // index is already cached.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("alpha.rs"), b"").unwrap();
+        std::fs::create_dir(tmp.path().join(".croft")).unwrap();
+        std::fs::write(tmp.path().join(".croft").join("lsp.log"), b"").unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        // Poll for the background-built index to land. With this tiny
+        // workspace it should arrive within a couple of hundred ms.
+        let mut waited_ms = 0u32;
+        loop {
+            app.poll_file_finder_index();
+            if app.file_finder_index.is_some() {
+                break;
+            }
+            if waited_ms >= 5000 {
+                panic!(
+                    "background walker thread must deliver the file index within 5s of App::new on a 2-file workspace"
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            waited_ms += 20;
+        }
+        // Once the index has landed, open_file_finder must consume it
+        // without falling back to the synchronous walk - and the index
+        // MUST contain the .croft/lsp.log entry the user expected to
+        // find via Cmd+P typing 'lsp.log'.
+        let rels: Vec<String> = app
+            .file_finder_index
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|e| e.rel.clone())
+            .collect();
+        assert!(
+            rels.iter().any(|r| r == ".croft/lsp.log"),
+            "background index must contain .croft/lsp.log; got {rels:?}"
+        );
+    }
+
+    #[test]
+    fn click_on_tree_row_aligned_with_terminal_splitter_y_selects_the_row_not_the_splitter() {
+        // Regression for the user's "I can't click on the last two files,
+        // but arrow+Enter opens them" report. Root cause: the editor /
+        // terminal splitter handler at handle_mouse checks `m.row == y
+        // || m.row == y.saturating_sub(1)` WITHOUT gating by column, so
+        // a click on a tree row in the LEFT column whose y happens to
+        // line up with the editor/terminal splitter (which only lives
+        // in the RIGHT column) was hijacked into a splitter-drag and
+        // never reached the Explorer's `node_at_y` branch.
+        let tmp = tempfile::tempdir().unwrap();
+        for name in [
+            "alpha.txt",
+            "beta.txt",
+            "gamma.txt",
+            "delta.txt",
+            "epsilon.txt",
+            "zeta.txt",
+        ] {
+            std::fs::write(tmp.path().join(name), b"").unwrap();
+        }
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        // Layout: activity-bar(4) + tree-pane on the left, editor +
+        // terminal stacked on the right. Pick a splitter row that
+        // intersects one of the rendered tree rows.
+        app.tree.last_area = Rect { x: 4, y: 0, width: 32, height: 12 };
+        app.tree.last_inner = Rect { x: 5, y: 1, width: 30, height: 10 };
+        app.sidebar_splitter_x = Some(36);
+        // Splitter sits inside the tree's rendered row band.
+        app.terminal_splitter_y = Some(6);
+        // The clicked tree row's y MUST equal terminal_splitter_y to
+        // trigger the bug; column stays well inside tree.last_inner.x..
+        let click_row = 6u16;
+        let click_col = app.tree.last_inner.x + 2;
+        let target_idx = (click_row - app.tree.last_inner.y) as usize;
+        assert!(
+            target_idx < app.tree.nodes.len(),
+            "test setup must put a real tree row at the splitter y"
+        );
+        let click = crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(
+                crossterm::event::MouseButton::Left,
+            ),
+            column: click_col,
+            row: click_row,
+            modifiers: KeyModifiers::NONE,
+        };
+        app.handle_mouse(click);
+        assert!(
+            app.splitter_drag.is_none(),
+            "click in the LEFT (tree) column must never arm a splitter drag, even when the row y lines up with the editor/terminal splitter that lives in the RIGHT column"
+        );
+        assert_eq!(
+            app.tree.selected, target_idx,
+            "the tree row under the click must become selected; the user reported the bottom rows of the tree being unclickable even though they were plainly visible"
         );
     }
 

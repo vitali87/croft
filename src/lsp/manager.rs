@@ -537,7 +537,13 @@ mod tests {
         std::thread::sleep(Duration::from_millis(2500));
 
         let id = manager.request_completion(file.clone(), 2, 7);
-        let result = drain_completion_blocking(&manager, Duration::from_secs(10))
+        // 30s: basedpyright is a Node.js process that initialises slowly
+        // under heavy parallel `cargo test` load (the suite spawns ~900
+        // tests, many of which open PTYs). 10s was reliable in isolation
+        // but flaked under that load; 30s leaves plenty of headroom
+        // without slowing the happy path (the loop returns the moment
+        // the completion arrives).
+        let result = drain_completion_blocking(&manager, Duration::from_secs(30))
             .expect("completion arrived");
         assert_eq!(result.request_id, id);
         assert_eq!(result.path, file);

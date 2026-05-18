@@ -13,8 +13,6 @@ A VS Code style three pane workspace that runs entirely inside your terminal. Wr
 
 Built on [ratatui](https://ratatui.rs/) + [crossterm](https://github.com/crossterm-rs/crossterm), with [portable-pty](https://docs.rs/portable-pty/) for the embedded shell, [vt100](https://docs.rs/vt100/) for terminal-state parsing, [tree-sitter](https://tree-sitter.github.io/tree-sitter/) for incremental, AST-based syntax highlighting, [calamine](https://docs.rs/calamine/) for spreadsheet parsing, and the iTerm2 OSC 1337 inline-image protocol for image / PDF previews.
 
-> A previous Python prototype (Textual + pyte) lives on the `python-archive` branch. The Rust rewrite is the canonical implementation.
-
 ## Requirements
 
 | Requirement | Why |
@@ -50,7 +48,7 @@ If you prefer to do it by hand: Terminal.app → Settings → Profiles → your 
 
 **Why MesloLGS NF specifically:** macOS Terminal.app does not perform CoreText style font fallback for Private Use Area glyphs the way iTerm2 does. The Nerd Font glyphs only render if the *primary* terminal font has them. MesloLGS NF ships every Codicon, Devicon, and Seti glyph the explorer uses.
 
-> **PostScript name vs display name.** AppleScript needs the *PostScript* name, which is what's embedded in the .ttf, not what Terminal.app's font picker displays. The PostScript name for `MesloLGSNerdFontMono-Regular.ttf` is `MesloLGSNFM-Regular`. This was a real bug in the Python prototype: the wrong name silently no-ops in AppleScript and Terminal.app keeps the previous font, which is why the icons appeared broken even after running the setup command.
+> **PostScript name vs display name.** AppleScript needs the *PostScript* name, which is what's embedded in the .ttf, not what Terminal.app's font picker displays. The PostScript name for `MesloLGSNerdFontMono-Regular.ttf` is `MesloLGSNFM-Regular`. Passing the display name silently no-ops in AppleScript and Terminal.app keeps the previous font, which is why icons appear broken even after running the setup command.
 
 ## Install
 
