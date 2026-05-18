@@ -40,6 +40,16 @@ const fn rgb(r: u8, g: u8, b: u8) -> Color {
     Color::Rgb(r, g, b)
 }
 
+/// JSX-specific captures appended onto the shared TypeScript/TSX
+/// highlights query. The bundled query has none of these, so JSX
+/// tags and attribute names land in default foreground without it.
+const TSX_JSX_OVERLAY_QUERY: &str = r#"
+(jsx_opening_element name: (_) @tag)
+(jsx_closing_element name: (_) @tag)
+(jsx_self_closing_element name: (_) @tag)
+(jsx_attribute (property_identifier) @attribute)
+"#;
+
 /// Base16-Ocean-Dark inspired palette, indexed by HIGHLIGHT_NAMES position.
 fn style_for(idx: usize) -> Style {
     let name = HIGHLIGHT_NAMES.get(idx).copied().unwrap_or("");
@@ -131,22 +141,55 @@ fn build_config(kind: LangKind) -> Option<HighlightConfiguration> {
             tree_sitter_javascript::LOCALS_QUERY,
         )
         .ok()?,
-        LangKind::TypeScript => HighlightConfiguration::new(
-            tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
-            "typescript",
-            tree_sitter_typescript::HIGHLIGHTS_QUERY,
-            "",
-            tree_sitter_typescript::LOCALS_QUERY,
-        )
-        .ok()?,
-        LangKind::Tsx => HighlightConfiguration::new(
-            tree_sitter_typescript::LANGUAGE_TSX.into(),
-            "tsx",
-            tree_sitter_typescript::HIGHLIGHTS_QUERY,
-            "",
-            tree_sitter_typescript::LOCALS_QUERY,
-        )
-        .ok()?,
+        LangKind::TypeScript => {
+            // The bundled TypeScript highlights.scm captures only @type,
+            // @type.builtin, @variable.parameter, @punctuation.bracket,
+            // and @keyword. All the @function / @function.method /
+            // @property / @constructor / @constant captures live in the
+            // tree-sitter-javascript highlights.scm; the TypeScript
+            // grammar inherits from the JavaScript one but the Rust
+            // tree-sitter-highlight crate does not auto-resolve the
+            // `; inherits:` directive, so the queries have to be
+            // concatenated by hand. JS first so the TS file overrides
+            // it where they overlap (capitalized identifiers as @type
+            // rather than @constructor, etc.). Tree-sitter-highlight
+            // applies last-matching capture on overlapping ranges.
+            let combined = format!(
+                "{}\n{}",
+                tree_sitter_javascript::HIGHLIGHT_QUERY,
+                tree_sitter_typescript::HIGHLIGHTS_QUERY,
+            );
+            HighlightConfiguration::new(
+                tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+                "typescript",
+                &combined,
+                "",
+                tree_sitter_typescript::LOCALS_QUERY,
+            )
+            .ok()?
+        }
+        LangKind::Tsx => {
+            // Same fix as TypeScript above (JS query prepended for
+            // @function / @property / etc.), plus a JSX overlay
+            // appended LAST so its (jsx_attribute (property_identifier)
+            // @attribute) capture wins over the JS query's broad
+            // (property_identifier) @property capture under
+            // tree-sitter-highlight's last-match-wins rule.
+            let combined = format!(
+                "{}\n{}\n{}",
+                tree_sitter_javascript::HIGHLIGHT_QUERY,
+                tree_sitter_typescript::HIGHLIGHTS_QUERY,
+                TSX_JSX_OVERLAY_QUERY,
+            );
+            HighlightConfiguration::new(
+                tree_sitter_typescript::LANGUAGE_TSX.into(),
+                "tsx",
+                &combined,
+                "",
+                tree_sitter_typescript::LOCALS_QUERY,
+            )
+            .ok()?
+        }
         LangKind::Json => HighlightConfiguration::new(
             tree_sitter_json::LANGUAGE.into(),
             "json",
@@ -455,6 +498,178 @@ mod tests {
         assert_eq!(per_line[0][0].start, 1);
         assert_eq!(per_line[0][0].end, 4);
         assert!(per_line[1].is_empty());
+    }
+
+    fn span_at<'a>(
+        spans: &'a [HiSpan],
+        line: &str,
+        needle: &str,
+    ) -> Option<&'a HiSpan> {
+        let off = line.find(needle)?;
+        let end = off + needle.len();
+        spans
+            .iter()
+            .find(|sp| sp.start <= off && sp.end >= end)
+    }
+
+    const TAG_COLOR: Color = Color::Rgb(0xbf, 0x61, 0x6a);
+    const ATTRIBUTE_COLOR: Color = Color::Rgb(0xbf, 0x61, 0x6a);
+    const FUNCTION_COLOR: Color = Color::Rgb(0x8f, 0xa1, 0xb3);
+    const PROPERTY_COLOR: Color = Color::Rgb(0x8f, 0xa1, 0xb3);
+
+    #[test]
+    fn tsx_jsx_opening_tag_identifier_gets_tag_color() {
+        let mut reg = LangRegistry::new();
+        let src = "const x = <div className=\"y\">hi</div>;\n";
+        let line_starts = compute_line_starts(src.as_bytes());
+        let h = highlight_text(&mut reg, LangKind::Tsx, src.as_bytes(), &line_starts);
+        let line0 = src.lines().next().unwrap();
+        let div_span = span_at(&h[0], line0, "div")
+            .expect("the 'div' tag identifier in <div ...> must produce at least one highlight span");
+        assert_eq!(
+            div_span.style.fg,
+            Some(TAG_COLOR),
+            "JSX opening-tag identifier must render in the @tag colour ({TAG_COLOR:?}); a missing or default-foreground span means the TSX query has no jsx_opening_element capture"
+        );
+    }
+
+    #[test]
+    fn tsx_jsx_closing_tag_identifier_gets_tag_color() {
+        let mut reg = LangRegistry::new();
+        let src = "const x = <div>hi</div>;\n";
+        let line_starts = compute_line_starts(src.as_bytes());
+        let h = highlight_text(&mut reg, LangKind::Tsx, src.as_bytes(), &line_starts);
+        let line0 = src.lines().next().unwrap();
+        // Two occurrences of "div" on the line: opening and closing. The
+        // closing tag starts after "</", so find the second one.
+        let first = line0.find("div").unwrap();
+        let second_off = line0[first + 3..].find("div").unwrap() + first + 3;
+        let span = h[0]
+            .iter()
+            .find(|sp| sp.start <= second_off && sp.end >= second_off + 3)
+            .expect("the closing-tag 'div' in </div> must produce a highlight span");
+        assert_eq!(span.style.fg, Some(TAG_COLOR));
+    }
+
+    #[test]
+    fn tsx_jsx_self_closing_tag_identifier_gets_tag_color() {
+        let mut reg = LangRegistry::new();
+        let src = "const x = <Icon name=\"plus\" />;\n";
+        let line_starts = compute_line_starts(src.as_bytes());
+        let h = highlight_text(&mut reg, LangKind::Tsx, src.as_bytes(), &line_starts);
+        let line0 = src.lines().next().unwrap();
+        let span = span_at(&h[0], line0, "Icon")
+            .expect("self-closing <Icon ... /> must produce a tag-name highlight span");
+        assert_eq!(span.style.fg, Some(TAG_COLOR));
+    }
+
+    #[test]
+    fn tsx_jsx_attribute_name_gets_attribute_color() {
+        let mut reg = LangRegistry::new();
+        let src = "const x = <div className=\"y\" onClick={f}>hi</div>;\n";
+        let line_starts = compute_line_starts(src.as_bytes());
+        let h = highlight_text(&mut reg, LangKind::Tsx, src.as_bytes(), &line_starts);
+        let line0 = src.lines().next().unwrap();
+        for name in ["className", "onClick"] {
+            let span = span_at(&h[0], line0, name)
+                .unwrap_or_else(|| panic!("JSX attribute '{name}' must produce a highlight span"));
+            assert_eq!(
+                span.style.fg,
+                Some(ATTRIBUTE_COLOR),
+                "JSX attribute name '{name}' must render in the @attribute colour"
+            );
+        }
+    }
+
+    #[test]
+    fn typescript_call_expression_function_name_gets_function_color() {
+        let mut reg = LangRegistry::new();
+        let src = "const x = useMemo(() => 1);\n";
+        let line_starts = compute_line_starts(src.as_bytes());
+        let h = highlight_text(&mut reg, LangKind::TypeScript, src.as_bytes(), &line_starts);
+        let line0 = src.lines().next().unwrap();
+        let span = span_at(&h[0], line0, "useMemo")
+            .expect("call_expression function name 'useMemo' must produce a highlight span");
+        assert_eq!(
+            span.style.fg,
+            Some(FUNCTION_COLOR),
+            "the bundled TS highlights.scm has no @function capture; without concatenating the JS query, call sites like 'useMemo(...)' render in default foreground"
+        );
+    }
+
+    #[test]
+    fn typescript_member_expression_property_gets_property_color() {
+        let mut reg = LangRegistry::new();
+        let src = "const x = styles.sectionHeader;\n";
+        let line_starts = compute_line_starts(src.as_bytes());
+        let h = highlight_text(&mut reg, LangKind::TypeScript, src.as_bytes(), &line_starts);
+        let line0 = src.lines().next().unwrap();
+        let span = span_at(&h[0], line0, "sectionHeader")
+            .expect("property_identifier in member_expression must produce a highlight span");
+        assert_eq!(span.style.fg, Some(PROPERTY_COLOR));
+    }
+
+    #[test]
+    fn typescript_method_call_property_gets_function_method_color() {
+        let mut reg = LangRegistry::new();
+        let src = "const x = arr.map(f);\n";
+        let line_starts = compute_line_starts(src.as_bytes());
+        let h = highlight_text(&mut reg, LangKind::TypeScript, src.as_bytes(), &line_starts);
+        let line0 = src.lines().next().unwrap();
+        let span = span_at(&h[0], line0, "map")
+            .expect("method call 'arr.map' must produce a highlight span on 'map'");
+        assert_eq!(
+            span.style.fg,
+            Some(FUNCTION_COLOR),
+            "method-call property must take @function.method (which shares the function colour), not the bare @property colour"
+        );
+    }
+
+    #[test]
+    fn tsx_call_expression_function_name_gets_function_color() {
+        let mut reg = LangRegistry::new();
+        let src = "const x = useMemo(() => 1);\n";
+        let line_starts = compute_line_starts(src.as_bytes());
+        let h = highlight_text(&mut reg, LangKind::Tsx, src.as_bytes(), &line_starts);
+        let line0 = src.lines().next().unwrap();
+        let span = span_at(&h[0], line0, "useMemo")
+            .expect("TSX call_expression function name 'useMemo' must produce a highlight span");
+        assert_eq!(span.style.fg, Some(FUNCTION_COLOR));
+    }
+
+    #[test]
+    fn tsx_member_expression_property_gets_property_color() {
+        let mut reg = LangRegistry::new();
+        let src = "const x = styles.sectionHeader;\n";
+        let line_starts = compute_line_starts(src.as_bytes());
+        let h = highlight_text(&mut reg, LangKind::Tsx, src.as_bytes(), &line_starts);
+        let line0 = src.lines().next().unwrap();
+        let span = span_at(&h[0], line0, "sectionHeader")
+            .expect("TSX property_identifier in member_expression must produce a highlight span");
+        assert_eq!(span.style.fg, Some(PROPERTY_COLOR));
+    }
+
+    #[test]
+    fn tsx_jsx_attribute_capture_still_wins_over_generic_property_capture() {
+        // Regression guard for the query-ordering choice: the JS query
+        // (now concatenated before the TS query and JSX overlay) has a
+        // broad `(property_identifier) @property` rule. The JSX overlay
+        // must come AFTER so that on a `jsx_attribute`'s property_identifier
+        // the @attribute capture wins over @property — otherwise JSX
+        // attribute names would silently drift from orange-red to the
+        // slate-blue @property colour.
+        let mut reg = LangRegistry::new();
+        let src = "const x = <div className=\"y\" />;\n";
+        let line_starts = compute_line_starts(src.as_bytes());
+        let h = highlight_text(&mut reg, LangKind::Tsx, src.as_bytes(), &line_starts);
+        let line0 = src.lines().next().unwrap();
+        let span = span_at(&h[0], line0, "className")
+            .expect("'className' must still produce a highlight span");
+        assert_eq!(
+            span.style.fg,
+            Some(ATTRIBUTE_COLOR),
+            "JSX attribute name must keep the @attribute colour; if it renders in @property colour, the overlay is ordered before the JS query and needs to move after"
+        );
     }
 
     #[test]
