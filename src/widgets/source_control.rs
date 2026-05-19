@@ -26,6 +26,40 @@ pub struct RowActionAreas {
     pub stage: Rect,
 }
 
+/// Items in the chevron-opened dropdown next to the Commit button.
+/// Ordered top-to-bottom in render order; the click handler in `App`
+/// dispatches on the variant returned by `click_commit_menu_item`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CommitMenuItem {
+    CommitAndPush,
+    Push,
+    ViewStagedDiff,
+    ViewDefaultBranchDiff,
+}
+
+impl CommitMenuItem {
+    pub const ALL: [CommitMenuItem; 4] = [
+        CommitMenuItem::CommitAndPush,
+        CommitMenuItem::Push,
+        CommitMenuItem::ViewStagedDiff,
+        CommitMenuItem::ViewDefaultBranchDiff,
+    ];
+
+    /// Display label rendered in the dropdown. `default_branch` is the
+    /// repo's default branch, inlined into the "View Changes vs <name>"
+    /// label so the user sees exactly which branch is being compared.
+    pub fn label(&self, default_branch: &str) -> String {
+        match self {
+            CommitMenuItem::CommitAndPush => "Commit & Push".to_string(),
+            CommitMenuItem::Push => "Push".to_string(),
+            CommitMenuItem::ViewStagedDiff => "View Staged Changes".to_string(),
+            CommitMenuItem::ViewDefaultBranchDiff => {
+                format!("View Changes vs {default_branch}")
+            }
+        }
+    }
+}
+
 pub struct SourceControlPanel {
     pub focused: bool,
     pub message: String,
@@ -37,14 +71,14 @@ pub struct SourceControlPanel {
     pub last_input_area: Rect,
     pub last_button_area: Rect,
     /// Hit-test rect for the chevron split-button that opens the Commit
-    /// dropdown (Commit & Push). Empty when the panel is in the no-repo
-    /// state or the button row was clipped.
+    /// dropdown (Commit & Push, Push, View …). Empty when the panel is in
+    /// the no-repo state or the button row was clipped.
     pub last_commit_caret_area: Rect,
-    /// Hit-test rect for the single dropdown item ("Commit & Push") that
-    /// pops below the caret. Empty when the menu is closed. The App owns
-    /// the open/closed flag (`commit_menu_open`) so menu state survives
-    /// re-renders.
-    pub last_commit_menu_item_area: Rect,
+    /// Hit-test rects for the dropdown items (Commit & Push, Push, …)
+    /// that pop below the caret. Empty when the menu is closed. The App
+    /// owns the open/closed flag (`commit_menu_open`) so menu state
+    /// survives re-renders.
+    pub commit_menu_item_areas: Vec<(Rect, CommitMenuItem)>,
     pub last_list_area: Rect,
     pub last_scrollbar: Rect,
     /// Hit-test rect for the empty-state "Initialize Repository" button.
@@ -97,7 +131,7 @@ impl SourceControlPanel {
             last_input_area: Rect::default(),
             last_button_area: Rect::default(),
             last_commit_caret_area: Rect::default(),
-            last_commit_menu_item_area: Rect::default(),
+            commit_menu_item_areas: Vec::new(),
             last_list_area: Rect::default(),
             last_scrollbar: Rect::default(),
             last_init_repo_button_area: Rect::default(),
@@ -252,8 +286,11 @@ impl SourceControlPanel {
         rect_hit(self.last_commit_caret_area, x, y)
     }
 
-    pub fn click_commit_menu_item(&self, x: u16, y: u16) -> bool {
-        rect_hit(self.last_commit_menu_item_area, x, y)
+    pub fn click_commit_menu_item(&self, x: u16, y: u16) -> Option<CommitMenuItem> {
+        self.commit_menu_item_areas
+            .iter()
+            .find(|(rect, _)| rect_hit(*rect, x, y))
+            .map(|(_, item)| *item)
     }
 
     pub fn click_input(&self, x: u16, y: u16) -> bool {
@@ -703,7 +740,7 @@ impl Widget for &mut SourceControlPanel {
         self.last_input_area = Rect::default();
         self.last_button_area = Rect::default();
         self.last_commit_caret_area = Rect::default();
-        self.last_commit_menu_item_area = Rect::default();
+        self.commit_menu_item_areas.clear();
         self.last_list_area = Rect::default();
         self.last_scrollbar = Rect::default();
         self.last_row_actions = None;
@@ -1953,6 +1990,61 @@ mod tests {
         );
         assert!(!p.click_button(caret_mid.0, caret_mid.1));
         assert!(p.click_commit_caret(caret_mid.0, caret_mid.1));
+    }
+
+    #[test]
+    fn click_commit_menu_item_dispatches_on_recorded_rects() {
+        let mut p = SourceControlPanel::new();
+        p.commit_menu_item_areas = vec![
+            (
+                Rect { x: 10, y: 5, width: 20, height: 1 },
+                CommitMenuItem::CommitAndPush,
+            ),
+            (
+                Rect { x: 10, y: 6, width: 20, height: 1 },
+                CommitMenuItem::Push,
+            ),
+            (
+                Rect { x: 10, y: 7, width: 20, height: 1 },
+                CommitMenuItem::ViewStagedDiff,
+            ),
+            (
+                Rect { x: 10, y: 8, width: 20, height: 1 },
+                CommitMenuItem::ViewDefaultBranchDiff,
+            ),
+        ];
+        assert_eq!(
+            p.click_commit_menu_item(15, 5),
+            Some(CommitMenuItem::CommitAndPush)
+        );
+        assert_eq!(p.click_commit_menu_item(15, 6), Some(CommitMenuItem::Push));
+        assert_eq!(
+            p.click_commit_menu_item(15, 7),
+            Some(CommitMenuItem::ViewStagedDiff)
+        );
+        assert_eq!(
+            p.click_commit_menu_item(15, 8),
+            Some(CommitMenuItem::ViewDefaultBranchDiff)
+        );
+        assert_eq!(p.click_commit_menu_item(5, 5), None, "outside the rects");
+        assert_eq!(p.click_commit_menu_item(15, 9), None, "below the menu");
+    }
+
+    #[test]
+    fn commit_menu_item_label_inlines_default_branch_for_view_diff_item() {
+        assert_eq!(
+            CommitMenuItem::ViewDefaultBranchDiff.label("trunk"),
+            "View Changes vs trunk"
+        );
+        assert_eq!(
+            CommitMenuItem::CommitAndPush.label("anything"),
+            "Commit & Push"
+        );
+        assert_eq!(CommitMenuItem::Push.label("anything"), "Push");
+        assert_eq!(
+            CommitMenuItem::ViewStagedDiff.label("anything"),
+            "View Staged Changes"
+        );
     }
 
     #[test]

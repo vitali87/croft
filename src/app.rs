@@ -712,9 +712,14 @@ pub struct App {
     /// destroy uncommitted work, so the modal must always run first.
     pending_discard: Option<PendingDiscard>,
     /// True while the Source Control commit dropdown (▾ caret) is open.
-    /// The caret button toggles this; clicking the single menu row, the
-    /// commit button, or anywhere outside the menu closes it.
+    /// The caret button toggles this; clicking a menu row, the commit
+    /// button, or anywhere outside the menu closes it.
     commit_menu_open: bool,
+    /// Cached default-branch name (e.g. "main" / "master"), refreshed
+    /// when the workspace root changes. Surfaced in the commit dropdown's
+    /// "View Changes vs <name>" label so users know which branch the
+    /// diff compares against. `None` until the resolver succeeds.
+    default_branch_label: Option<String>,
     /// True after the user has chosen "Always for this session" on the
     /// local-browser confirmation. Subsequent link clicks dispatch to
     /// the relay silently.
@@ -1323,6 +1328,7 @@ impl App {
             pending_local_open: None,
             pending_discard: None,
             commit_menu_open: false,
+            default_branch_label: None,
             trust_local_browser: false,
             sidebar_width: SIDEBAR_WIDTH_DEFAULT,
             terminal_height: None,
@@ -2187,6 +2193,9 @@ impl App {
                 Err(std::sync::mpsc::TryRecvError::Empty) => break,
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
             }
+        }
+        if changed && self.git_status.in_repo && self.default_branch_label.is_none() {
+            self.default_branch_label = crate::git::default_branch(&self.tree.root).ok();
         }
         changed
     }
@@ -3623,8 +3632,9 @@ impl App {
     }
 
     fn render_commit_dropdown(&mut self, frame: &mut ratatui::Frame) {
+        use crate::widgets::source_control::CommitMenuItem;
         if !self.commit_menu_open {
-            self.source_control.last_commit_menu_item_area = Rect::default();
+            self.source_control.commit_menu_item_areas.clear();
             return;
         }
         let caret = self.source_control.last_commit_caret_area;
@@ -3632,29 +3642,63 @@ impl App {
         if caret.width == 0 || main.width == 0 {
             return;
         }
-        // Anchor under the button row; expand left so the menu's right
-        // edge aligns with the caret's right edge (mirrors VS Code).
-        let label = " Commit & Push ";
-        let item_w: u16 = (label.chars().count() as u16 + 2).max(caret.width);
+        let default_branch = self
+            .default_branch_label
+            .clone()
+            .unwrap_or_else(|| "default".to_string());
+        let items: Vec<(CommitMenuItem, String)> = CommitMenuItem::ALL
+            .iter()
+            .map(|item| (*item, format!(" {} ", item.label(&default_branch))))
+            .collect();
+        let label_w = items
+            .iter()
+            .map(|(_, l)| l.chars().count() as u16)
+            .max()
+            .unwrap_or(0);
+        let item_w: u16 = label_w.max(caret.width);
         let item_x = (caret.x + caret.width).saturating_sub(item_w).max(main.x);
-        let item_y = caret.y + caret.height;
-        let item_rect = Rect { x: item_x, y: item_y, width: item_w, height: 1 };
+        let item_y_top = caret.y + caret.height;
+        let menu_rect = Rect {
+            x: item_x,
+            y: item_y_top,
+            width: item_w,
+            height: items.len() as u16,
+        };
         let bg = Color::Rgb(0x25, 0x2b, 0x37);
         let fg = Color::White;
         let style = Style::default().fg(fg).bg(bg);
-        frame.render_widget(ratatui::widgets::Clear, item_rect);
-        for rx in 0..item_rect.width {
-            frame.buffer_mut()[(item_rect.x + rx, item_rect.y)]
-                .set_symbol(" ")
-                .set_style(style);
+        frame.render_widget(ratatui::widgets::Clear, menu_rect);
+        self.source_control.commit_menu_item_areas.clear();
+        for (i, (item, label)) in items.into_iter().enumerate() {
+            let row_y = item_y_top + i as u16;
+            let row_rect = Rect { x: item_x, y: row_y, width: item_w, height: 1 };
+            for rx in 0..row_rect.width {
+                frame.buffer_mut()[(row_rect.x + rx, row_rect.y)]
+                    .set_symbol(" ")
+                    .set_style(style);
+            }
+            frame.buffer_mut().set_string(
+                row_rect.x,
+                row_rect.y,
+                &label,
+                style,
+            );
+            self.source_control
+                .commit_menu_item_areas
+                .push((row_rect, item));
         }
-        frame.buffer_mut().set_string(
-            item_rect.x + 1,
-            item_rect.y,
-            label,
-            style,
-        );
-        self.source_control.last_commit_menu_item_area = item_rect;
+    }
+
+    fn dispatch_commit_menu_item(&mut self, item: crate::widgets::source_control::CommitMenuItem) {
+        use crate::widgets::source_control::CommitMenuItem;
+        match item {
+            CommitMenuItem::CommitAndPush => self.commit_and_push_source_control(),
+            CommitMenuItem::Push => self.push_source_control(),
+            CommitMenuItem::ViewStagedDiff => self.view_staged_diff_source_control(),
+            CommitMenuItem::ViewDefaultBranchDiff => {
+                self.view_default_branch_diff_source_control()
+            }
+        }
     }
 
     fn render_discard_confirm(&self, frame: &mut ratatui::Frame) {
@@ -4491,6 +4535,96 @@ impl App {
             .unwrap_or_else(std::time::Instant::now);
         self.refresh_git_status_debounced();
         self.refresh_source_control();
+    }
+
+    /// Push the current branch without committing. Sibling of
+    /// `commit_and_push_source_control`, called from the commit dropdown's
+    /// "Push" item so users can ship already-committed work without
+    /// having to type a no-op commit message first.
+    pub fn push_source_control(&mut self) {
+        match crate::git::push_current_branch(&self.tree.root) {
+            Ok(summary) => {
+                self.source_control.commit_feedback = Some(if summary.is_empty() {
+                    "pushed".to_string()
+                } else {
+                    format!("pushed: {summary}")
+                });
+                self.source_control.commit_feedback_is_error = false;
+                self.status = format!("Pushed: {summary}");
+            }
+            Err(err) => {
+                self.source_control.commit_feedback = Some(format!("push failed: {err}"));
+                self.source_control.commit_feedback_is_error = true;
+                self.status = format!("Push failed: {err}");
+            }
+        }
+        self.last_git_check = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(1))
+            .unwrap_or_else(std::time::Instant::now);
+        self.refresh_git_status_debounced();
+    }
+
+    /// Open the staged-changes diff (`git diff --staged`) in a read-only
+    /// editor tab. Mirrors VS Code's "View Staged Changes" — users hit
+    /// the dropdown, click View Staged Changes, and the editor tab pops up
+    /// with every `+`/`-` line of the staged hunks highlighted.
+    pub fn view_staged_diff_source_control(&mut self) {
+        let raw = match crate::git::diff_staged(&self.tree.root) {
+            Ok(r) => r,
+            Err(err) => {
+                self.source_control.commit_feedback = Some(format!("diff failed: {err}"));
+                self.source_control.commit_feedback_is_error = true;
+                self.status = format!("View Staged Changes failed: {err}");
+                return;
+            }
+        };
+        let label = std::path::PathBuf::from("git diff --staged");
+        if let Err(err) = self.editor.open_git_diff_side_by_side(&label, &raw) {
+            self.source_control.commit_feedback = Some(format!("open failed: {err}"));
+            self.source_control.commit_feedback_is_error = true;
+            self.status = format!("Could not open staged diff: {err}");
+            return;
+        }
+        self.source_control.commit_feedback = None;
+        self.status = String::from("Showing git diff --staged");
+        self.focus_pane(Pane::Editor);
+    }
+
+    /// Open `git diff <default-branch>` in a read-only editor tab. The
+    /// default branch is resolved via `git::default_branch` (origin/HEAD
+    /// first, then common local names). If resolution fails the error
+    /// surfaces in the commit-feedback line so the user can fix the
+    /// upstream-HEAD config instead of getting a silent no-op.
+    pub fn view_default_branch_diff_source_control(&mut self) {
+        let branch = match crate::git::default_branch(&self.tree.root) {
+            Ok(b) => b,
+            Err(err) => {
+                self.source_control.commit_feedback = Some(err.clone());
+                self.source_control.commit_feedback_is_error = true;
+                self.status = format!("Default branch: {err}");
+                return;
+            }
+        };
+        let raw = match crate::git::diff_against_branch(&self.tree.root, &branch) {
+            Ok(r) => r,
+            Err(err) => {
+                self.source_control.commit_feedback = Some(format!("diff failed: {err}"));
+                self.source_control.commit_feedback_is_error = true;
+                self.status = format!("View Changes vs {branch} failed: {err}");
+                return;
+            }
+        };
+        let label = std::path::PathBuf::from(format!("git diff {branch}"));
+        if let Err(err) = self.editor.open_git_diff_side_by_side(&label, &raw) {
+            self.source_control.commit_feedback = Some(format!("open failed: {err}"));
+            self.source_control.commit_feedback_is_error = true;
+            self.status = format!("Could not open diff vs {branch}: {err}");
+            return;
+        }
+        self.default_branch_label = Some(branch.clone());
+        self.source_control.commit_feedback = None;
+        self.status = format!("Showing git diff {branch}");
+        self.focus_pane(Pane::Editor);
     }
 
     pub fn commit_and_push_source_control(&mut self) {
@@ -6795,12 +6929,14 @@ impl App {
                 }
                 if in_tree && self.sidebar_view == SidebarView::SourceControl {
                     self.focus_pane(Pane::Tree);
-                    if self.commit_menu_open
-                        && self.source_control.click_commit_menu_item(m.column, m.row)
-                    {
-                        self.commit_menu_open = false;
-                        self.commit_and_push_source_control();
-                        return;
+                    if self.commit_menu_open {
+                        if let Some(item) =
+                            self.source_control.click_commit_menu_item(m.column, m.row)
+                        {
+                            self.commit_menu_open = false;
+                            self.dispatch_commit_menu_item(item);
+                            return;
+                        }
                     }
                     if self.source_control.click_commit_caret(m.column, m.row) {
                         self.commit_menu_open = !self.commit_menu_open;

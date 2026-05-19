@@ -363,6 +363,82 @@ pub fn push_current_branch(root: &Path) -> Result<String, String> {
     }
 }
 
+/// Raw `git diff --staged` text — everything currently in the index that
+/// would land in the next commit. Empty string when nothing is staged
+/// (matches git's own zero-output behaviour). Errors carry stderr verbatim
+/// so the panel can surface "fatal: not a git repository" etc.
+pub fn diff_staged(root: &Path) -> Result<String, String> {
+    diff_text(root, &["diff", "--staged"])
+}
+
+/// Raw `git diff <branch>` text — working-tree state versus the tip of
+/// `branch`. Used by the Source Control dropdown's "View Changes vs
+/// <default>" so users can preview every uncommitted-plus-committed change
+/// on the current branch in one view.
+pub fn diff_against_branch(root: &Path, branch: &str) -> Result<String, String> {
+    diff_text(root, &["diff", branch])
+}
+
+fn diff_text(root: &Path, args: &[&str]) -> Result<String, String> {
+    let path_str = root.to_str().ok_or_else(|| "non-utf8 workspace path".to_string())?;
+    let mut cmd = Command::new("git");
+    cmd.args(["-C", path_str]).args(args);
+    let output = cmd.output().map_err(|e| format!("failed to spawn git: {e}"))?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let msg = if !stderr.is_empty() { stderr } else { stdout };
+        Err(if msg.is_empty() {
+            format!("git {args:?} failed with code {:?}", output.status.code())
+        } else {
+            msg
+        })
+    }
+}
+
+/// Repo's default branch name. Tries `origin/HEAD` first (set by
+/// `git clone` / `git remote set-head -a origin`), then falls back to
+/// common local names (`main`, `master`, `develop`, `trunk`) by checking
+/// `git rev-parse --verify <name>`. Returns `Err` when none resolves so
+/// the caller can surface the precise failure instead of guessing.
+pub fn default_branch(root: &Path) -> Result<String, String> {
+    let path_str = root.to_str().ok_or_else(|| "non-utf8 workspace path".to_string())?;
+    if let Ok(out) = Command::new("git")
+        .args([
+            "-C",
+            path_str,
+            "symbolic-ref",
+            "--short",
+            "refs/remotes/origin/HEAD",
+        ])
+        .output()
+    {
+        if out.status.success() {
+            let raw = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if let Some(short) = raw.strip_prefix("origin/") {
+                if !short.is_empty() {
+                    return Ok(short.to_string());
+                }
+            } else if !raw.is_empty() {
+                return Ok(raw);
+            }
+        }
+    }
+    for candidate in ["main", "master", "develop", "trunk"] {
+        let out = Command::new("git")
+            .args(["-C", path_str, "rev-parse", "--verify", "--quiet", candidate])
+            .output();
+        if let Ok(o) = out {
+            if o.status.success() {
+                return Ok(candidate.to_string());
+            }
+        }
+    }
+    Err("Could not resolve a default branch (tried origin/HEAD, main, master, develop, trunk)".to_string())
+}
+
 /// Stage a single path. Convenience wrapper over `stage_paths` for the
 /// inline "+" icon click path; multi-select staging goes through
 /// `stage_paths` directly so all paths land in one atomic `git add`
@@ -1453,5 +1529,55 @@ mod tests {
         );
         drop(req_tx);
         join.join().unwrap();
+    }
+
+    fn init_repo_with_commit(p: &Path) {
+        let _ = Command::new("git").args(["-C"]).arg(p).args(["init", "-q", "-b", "main"]).output();
+        let _ = Command::new("git").args(["-C"]).arg(p).args(["config", "user.email", "a@b"]).status();
+        let _ = Command::new("git").args(["-C"]).arg(p).args(["config", "user.name", "a"]).status();
+        std::fs::write(p.join("seed.txt"), "one\ntwo\n").unwrap();
+        let _ = Command::new("git").args(["-C"]).arg(p).args(["add", "."]).status();
+        let _ = Command::new("git").args(["-C"]).arg(p).args(["commit", "-m", "init", "--quiet"]).status();
+    }
+
+    #[test]
+    fn diff_staged_returns_only_indexed_changes() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        init_repo_with_commit(p);
+        std::fs::write(p.join("seed.txt"), "one\ntwo\nthree\n").unwrap();
+        let _ = Command::new("git").args(["-C"]).arg(p).args(["add", "seed.txt"]).status();
+        std::fs::write(p.join("untracked.txt"), "z").unwrap();
+        let out = diff_staged(p).expect("git diff --staged should succeed");
+        assert!(
+            out.contains("+three"),
+            "staged diff must include the +three line that was indexed: {out}"
+        );
+        assert!(
+            !out.contains("untracked.txt"),
+            "untracked file must NOT appear in staged diff: {out}"
+        );
+    }
+
+    #[test]
+    fn default_branch_resolves_main_when_only_local() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        init_repo_with_commit(p);
+        let b = default_branch(p).expect("default branch must resolve");
+        assert_eq!(b, "main", "freshly init -b main repo must resolve to main");
+    }
+
+    #[test]
+    fn diff_against_branch_shows_working_tree_versus_branch() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        init_repo_with_commit(p);
+        std::fs::write(p.join("seed.txt"), "one\ntwo\nthree\n").unwrap();
+        let out = diff_against_branch(p, "main").expect("diff main should succeed");
+        assert!(
+            out.contains("+three"),
+            "diff vs branch must include the new +three line: {out}"
+        );
     }
 }

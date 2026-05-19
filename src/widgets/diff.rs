@@ -111,6 +111,122 @@ impl DiffData {
         }
     }
 
+    /// Build a side-by-side diff from the raw stdout of `git diff` (or
+    /// `git diff --staged`, etc.) by separating the parsed text into a
+    /// left (old) and right (new) stream and emitting the same
+    /// Equal/Removed/Added/Replaced rows the two-column renderer uses
+    /// for file-vs-file diffs. The result has `unified = false` so the
+    /// editor pane renders it through the standard side-by-side path.
+    ///
+    /// Parsing rules per line of `raw`:
+    /// * `diff --git …` and `@@ … @@` → Equal row in both columns
+    ///   (acts as a visible file / hunk header).
+    /// * `index …`, `--- …`, `+++ …`, `\ No newline at end of file`
+    ///   → skipped (redundant after the `diff --git` header).
+    /// * `-xxx` → push body to `left_lines`, buffer as pending removed.
+    /// * `+xxx` → push body to `right_lines`, buffer as pending added.
+    /// * any other line (context, blank) → flush buffered runs (pairing
+    ///   removed+added into Replaced rows), then push the body to both
+    ///   sides as an Equal row.
+    ///
+    /// Empty `raw` produces a single Equal row carrying "(no changes)"
+    /// so the renderer always has something to paint.
+    pub fn build_side_by_side_from_git_text(label: PathBuf, raw: &str) -> Self {
+        let mut left_lines: Vec<String> = Vec::new();
+        let mut right_lines: Vec<String> = Vec::new();
+        let mut rows: Vec<DiffRow> = Vec::new();
+        if raw.trim().is_empty() {
+            left_lines.push(String::from("(no changes)"));
+            right_lines.push(String::from("(no changes)"));
+            rows.push(DiffRow::Equal { left: 0, right: 0 });
+            return Self {
+                left_path: label,
+                right_path: PathBuf::new(),
+                left_lines,
+                right_lines,
+                rows,
+                scroll: 0,
+                scroll_x: 0,
+                bytes_differ_but_lines_equal: false,
+                unified: false,
+            };
+        }
+        let mut pending_remove: Vec<usize> = Vec::new();
+        let mut pending_add: Vec<usize> = Vec::new();
+        let flush = |pending_remove: &mut Vec<usize>,
+                     pending_add: &mut Vec<usize>,
+                     rows: &mut Vec<DiffRow>| {
+            let pair = pending_remove.len().min(pending_add.len());
+            for k in 0..pair {
+                rows.push(DiffRow::Replaced {
+                    left: pending_remove[k],
+                    right: pending_add[k],
+                });
+            }
+            for k in pair..pending_remove.len() {
+                rows.push(DiffRow::Removed { left: pending_remove[k] });
+            }
+            for k in pair..pending_add.len() {
+                rows.push(DiffRow::Added { right: pending_add[k] });
+            }
+            pending_remove.clear();
+            pending_add.clear();
+        };
+        for line in raw.split('\n') {
+            if line.starts_with("diff --git") || line.starts_with("@@") {
+                flush(&mut pending_remove, &mut pending_add, &mut rows);
+                let i = left_lines.len();
+                let j = right_lines.len();
+                left_lines.push(line.to_string());
+                right_lines.push(line.to_string());
+                rows.push(DiffRow::Equal { left: i, right: j });
+            } else if line.starts_with("index ")
+                || line.starts_with("--- ")
+                || line.starts_with("+++ ")
+                || line == "---"
+                || line == "+++"
+                || line.starts_with("\\ No newline")
+                || line.starts_with("new file mode")
+                || line.starts_with("deleted file mode")
+                || line.starts_with("similarity index")
+                || line.starts_with("rename from")
+                || line.starts_with("rename to")
+            {
+                // Header / metadata noise — skip; the `diff --git` line
+                // already names the file pair.
+                continue;
+            } else if let Some(rest) = line.strip_prefix('-') {
+                let i = left_lines.len();
+                left_lines.push(rest.to_string());
+                pending_remove.push(i);
+            } else if let Some(rest) = line.strip_prefix('+') {
+                let j = right_lines.len();
+                right_lines.push(rest.to_string());
+                pending_add.push(j);
+            } else {
+                flush(&mut pending_remove, &mut pending_add, &mut rows);
+                let body = line.strip_prefix(' ').unwrap_or(line);
+                let i = left_lines.len();
+                let j = right_lines.len();
+                left_lines.push(body.to_string());
+                right_lines.push(body.to_string());
+                rows.push(DiffRow::Equal { left: i, right: j });
+            }
+        }
+        flush(&mut pending_remove, &mut pending_add, &mut rows);
+        Self {
+            left_path: label,
+            right_path: PathBuf::new(),
+            left_lines,
+            right_lines,
+            rows,
+            scroll: 0,
+            scroll_x: 0,
+            bytes_differ_but_lines_equal: false,
+            unified: false,
+        }
+    }
+
     /// Length (in chars) of the longest line across both files. Used to
     /// clamp horizontal scrolling so the user can't pan into empty space
     /// past the end of the longest content.
@@ -557,5 +673,99 @@ mod tests {
             Some(text),
         );
         assert!(!d.bytes_differ_but_lines_equal);
+    }
+
+    #[test]
+    fn build_side_by_side_from_git_text_pairs_remove_add_into_replaced() {
+        // A one-line edit (- old / + new) must collapse into a single
+        // Replaced row so the two sides align visually instead of
+        // producing a zigzag of Removed-above-Added.
+        let raw = "diff --git a/x b/x\nindex 1..2 100644\n--- a/x\n+++ b/x\n@@ -1,3 +1,3 @@\n keep\n-old\n+new\n";
+        let d = DiffData::build_side_by_side_from_git_text(PathBuf::from("staged"), raw);
+        assert!(
+            !d.unified,
+            "side-by-side builder must clear the unified flag so the two-column renderer takes over"
+        );
+        let tags: Vec<&'static str> = d
+            .rows
+            .iter()
+            .map(|r| match r {
+                DiffRow::Equal { .. } => "eq",
+                DiffRow::Added { .. } => "add",
+                DiffRow::Removed { .. } => "rm",
+                DiffRow::Replaced { .. } => "rep",
+            })
+            .collect();
+        // Expected after skipping index/---/+++ noise:
+        //   diff --git → Equal (file header)
+        //   @@ ...     → Equal (hunk header)
+        //    keep      → Equal (context)
+        //   -old / +new → paired into Replaced
+        //   trailing empty line → Equal
+        assert_eq!(
+            tags,
+            vec!["eq", "eq", "eq", "rep", "eq"],
+            "remove+add pair must collapse into one Replaced row; file/hunk headers stay as Equal markers"
+        );
+        assert!(
+            d.left_lines.iter().any(|s| s == "old"),
+            "removed body (without leading -) belongs in left_lines"
+        );
+        assert!(
+            d.right_lines.iter().any(|s| s == "new"),
+            "added body (without leading +) belongs in right_lines"
+        );
+    }
+
+    #[test]
+    fn build_side_by_side_from_git_text_overflow_runs_emit_extra_removed_or_added() {
+        // 3 removed + 1 added → 1 Replaced + 2 Removed (added side runs out).
+        let raw = "diff --git a/x b/x\n@@ -1,4 +1,2 @@\n keep\n-a\n-b\n-c\n+A\n other\n";
+        let d = DiffData::build_side_by_side_from_git_text(PathBuf::from("staged"), raw);
+        let change_tags: Vec<&'static str> = d
+            .rows
+            .iter()
+            .filter_map(|r| match r {
+                DiffRow::Replaced { .. } => Some("rep"),
+                DiffRow::Removed { .. } => Some("rm"),
+                DiffRow::Added { .. } => Some("add"),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            change_tags,
+            vec!["rep", "rm", "rm"],
+            "unequal runs pair what they can then overflow with the longer side"
+        );
+    }
+
+    #[test]
+    fn build_side_by_side_from_git_text_skips_index_and_dashdash_headers() {
+        let raw = "diff --git a/x b/x\nindex 1..2 100644\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-old\n+new\n";
+        let d = DiffData::build_side_by_side_from_git_text(PathBuf::from("staged"), raw);
+        // No row may carry "index ", "--- a/x", or "+++ b/x" in either side.
+        assert!(
+            !d.left_lines.iter().any(|s| s.starts_with("index ")
+                || s.starts_with("--- a/")
+                || s.starts_with("+++ b/")),
+            "index / --- / +++ noise must be skipped from left_lines: {:?}",
+            d.left_lines
+        );
+        assert!(
+            !d.right_lines.iter().any(|s| s.starts_with("index ")
+                || s.starts_with("--- a/")
+                || s.starts_with("+++ b/")),
+            "index / --- / +++ noise must be skipped from right_lines: {:?}",
+            d.right_lines
+        );
+    }
+
+    #[test]
+    fn build_side_by_side_from_git_text_empty_input_paints_placeholder_row() {
+        let d = DiffData::build_side_by_side_from_git_text(PathBuf::from("staged"), "");
+        assert_eq!(d.rows.len(), 1);
+        assert!(matches!(d.rows[0], DiffRow::Equal { .. }));
+        assert_eq!(d.left_lines, vec!["(no changes)".to_string()]);
+        assert!(!d.unified);
     }
 }

@@ -288,17 +288,26 @@ fn render_diff(
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| diff.left_path.display().to_string());
-    let right_name = diff
-        .right_path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| diff.right_path.display().to_string());
-    let header = if diff.bytes_differ_but_lines_equal {
-        format!(
-            " diff: {left_name}  \u{2194}  {right_name}   \u{2022} whitespace-only change (trailing newline / CRLF / BOM) — no line-level diff "
+    let right_is_real = diff.right_path != std::path::Path::new("/dev/null")
+        && !diff.right_path.as_os_str().is_empty();
+    let right_name = if right_is_real {
+        Some(
+            diff.right_path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| diff.right_path.display().to_string()),
         )
     } else {
-        format!(" diff: {left_name}  \u{2194}  {right_name} ")
+        None
+    };
+    let header = match (&right_name, diff.bytes_differ_but_lines_equal) {
+        (Some(r), true) => format!(
+            " diff: {left_name}  \u{2194}  {r}   \u{2022} whitespace-only change (trailing newline / CRLF / BOM) — no line-level diff "
+        ),
+        (Some(r), false) => format!(" diff: {left_name}  \u{2194}  {r} "),
+        // Synthetic git-diff text view: no real right-side path, so the
+        // header reads as the diff command instead of trailing "↔ null".
+        (None, _) => format!(" {left_name} "),
     };
     let head_bg = if diff.bytes_differ_but_lines_equal {
         Color::Rgb(0x8a, 0x4a, 0x10)
@@ -3522,6 +3531,26 @@ mod tests {
     }
 
     #[test]
+    fn git_diff_text_tab_label_omits_arrow_when_right_side_is_synthetic() {
+        // Regression for "git diff master ↔ null" in the tab strip:
+        // synthetic single-sided diffs (raw `git diff` text view, full-
+        // file deletion view) leave `right_path` empty; the tab label
+        // must collapse to just the left label rather than trailing the
+        // misleading "↔ null".
+        let mut t = EditorTabs::new();
+        t.open_git_diff_side_by_side(
+            std::path::Path::new("git diff master"),
+            "diff --git a/x b/x\n@@ -1 +1 @@\n-old\n+new\n",
+        )
+        .unwrap();
+        let label = tab_label(&t.editors[t.active_index()]);
+        assert_eq!(
+            label, "git diff master",
+            "synthetic git-diff tab must not show '↔ null' — the right side is virtual"
+        );
+    }
+
+    #[test]
     fn editor_tabs_search_highlight_survives_close_then_open_via_preview() {
         // Reported bug: after closing the first tab with X, the next file
         // opened from search lost the yellow highlights. The new editor
@@ -4731,6 +4760,39 @@ impl EditorTabs {
         Ok(())
     }
 
+    /// Open a side-by-side view of raw `git diff` text (e.g. the stdout
+    /// of `git diff --staged` or `git diff <branch>`). `label` is a
+    /// synthetic path used as the tab title and as the dedup key so a
+    /// repeat invocation reuses the existing tab instead of stacking new
+    /// ones. The text is parsed into separate left/right streams so the
+    /// standard two-column renderer takes over — every `+`/`-` pair in a
+    /// hunk lines up horizontally instead of zigzagging vertically.
+    pub fn open_git_diff_side_by_side(&mut self, label: &Path, raw_diff: &str) -> Result<()> {
+        let data = crate::widgets::diff::DiffData::build_side_by_side_from_git_text(
+            label.to_path_buf(),
+            raw_diff,
+        );
+        let mut e = Editor::new();
+        e.focused = self.editors[self.active].focused;
+        e.preview = false;
+        e.path = Some(label.to_path_buf());
+        e.diff = Some(data);
+        if self.is_blank_initial() {
+            self.editors[self.active] = e;
+            return Ok(());
+        }
+        if let Some(idx) = self.find_tab_with_path(label) {
+            self.editors[idx] = e;
+            self.select(idx);
+            return Ok(());
+        }
+        let pos = self.active + 1;
+        self.editors.insert(pos, e);
+        self.editors[self.active].focused = false;
+        self.active = pos;
+        Ok(())
+    }
+
     /// Pinned-tab open: if the file is already in some tab, pin and switch
     /// to it. Otherwise create a fresh pinned tab next to the active one.
     /// Used by double-click in the explorer and Ctrl+Enter on a tree row.
@@ -4892,13 +4954,22 @@ fn tab_label(e: &Editor) -> String {
             .left_path
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| String::from("?"));
-        let r = diff
-            .right_path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| String::from("?"));
-        return format!("{l} \u{2194} {r}");
+            .unwrap_or_else(|| diff.left_path.to_string_lossy().into_owned());
+        // Synthetic single-sided diffs (deletion view, raw `git diff`
+        // text view) leave `right_path` empty / `/dev/null` so the tab
+        // label collapses to just the left label instead of trailing a
+        // misleading "↔ null".
+        let r_is_real = diff.right_path != std::path::Path::new("/dev/null")
+            && !diff.right_path.as_os_str().is_empty();
+        if r_is_real {
+            let r = diff
+                .right_path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| diff.right_path.to_string_lossy().into_owned());
+            return format!("{l} \u{2194} {r}");
+        }
+        return l;
     }
     let name = match &e.path {
         Some(p) => p
