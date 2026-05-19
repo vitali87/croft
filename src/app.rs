@@ -2150,8 +2150,14 @@ impl App {
         // Polling fallback fires when the watcher missed events
         // (no-watcher mode, or notify on a network FS). Kick the index
         // rebuild the same way the watcher path does so Cmd+P stays in
-        // sync without a croft restart.
-        self.kick_file_finder_index_rebuild();
+        // sync without a croft restart. Same noise-dir gate as the
+        // watcher path — see drain_fs_events for the diagnosis.
+        let finder_relevant = changed_dirs
+            .iter()
+            .any(|p| !crate::widgets::file_finder::is_path_under_noise_dir(p));
+        if finder_relevant {
+            self.kick_file_finder_index_rebuild();
+        }
         changed = true;
         changed
     }
@@ -2593,8 +2599,21 @@ impl App {
             // background rebuild of the Cmd+P index so the next Cmd+P
             // reflects what is actually on disk. Coalesces via the dirty
             // flag so a 10k-file checkout produces one trailing rebuild,
-            // not 10k of them.
-            self.kick_file_finder_index_rebuild();
+            // not 10k of them. Skip rebuild when EVERY affected dir is
+            // inside a noise dir (target/, node_modules/, .git/, …) —
+            // those paths are excluded from the finder's walk anyway, so
+            // a rebuild would re-walk the workspace just to re-emit the
+            // same set. Without this gate, a sustained `cargo build`
+            // pegged every core via the parallel walker firing
+            // back-to-back. Root-caused empirically with
+            // `sample $(pgrep -x croft) 5` showing ~50 worker threads in
+            // `ignore::WalkBuilder::build_parallel`.
+            let finder_relevant = affected
+                .iter()
+                .any(|p| !crate::widgets::file_finder::is_path_under_noise_dir(p));
+            if finder_relevant {
+                self.kick_file_finder_index_rebuild();
+            }
         }
         if touched_open_file {
             self.reload_open_file_after_external_change();

@@ -362,6 +362,22 @@ fn is_noise_dir(name: &std::ffi::OsStr) -> bool {
     name.to_str().is_some_and(|n| NOISE_DIR_NAMES.contains(&n))
 }
 
+/// True when `path` sits inside (or names) one of the noise dirs the
+/// finder index already excludes from its walk. Callers use this to
+/// avoid kicking a full index rebuild for FS events the finder would
+/// have ignored anyway — e.g. cargo writing into `target/`, npm into
+/// `node_modules/`, git into `.git/`. Without this gate, a sustained
+/// cargo build produces a continuous index-rebuild storm that pegs
+/// every core via the parallel walker.
+pub fn is_path_under_noise_dir(path: &Path) -> bool {
+    path.components()
+        .filter_map(|c| match c {
+            std::path::Component::Normal(s) => Some(s),
+            _ => None,
+        })
+        .any(is_noise_dir)
+}
+
 /// Absolute paths to prune from the walk for two reasons:
 ///   1. `Library/Containers` and `Library/Group Containers` trigger a
 ///      macOS TCC consent prompt ("App would like to access data from
@@ -981,5 +997,39 @@ mod tests {
         let filename_start = rel.rfind('/').map(|i| i + 1).unwrap_or(0);
         let score = fuzzy_score("beta", &rel_lower, filename_start);
         assert!(score.is_some());
+    }
+
+    #[test]
+    fn is_path_under_noise_dir_flags_cargo_and_npm_output_paths() {
+        // Root-cause guard: a sample run on a live croft pegged ~150%
+        // CPU showed 50+ workers in `ignore::WalkBuilder::build_parallel`
+        // because every cargo write into `target/` triggered a Cmd+P
+        // index rebuild — even though the rebuild itself skips target/.
+        // The gate lives in this helper; if it ever stops recognising
+        // cargo/npm/git output paths, the storm comes back.
+        assert!(is_path_under_noise_dir(Path::new(
+            "/Users/v/proj/target/debug/build/croft-abcd"
+        )));
+        assert!(is_path_under_noise_dir(Path::new(
+            "/Users/v/proj/node_modules/foo/bar.js"
+        )));
+        assert!(is_path_under_noise_dir(Path::new(
+            "/Users/v/proj/.git/objects/ff/abcd"
+        )));
+    }
+
+    #[test]
+    fn is_path_under_noise_dir_does_not_flag_workspace_source_paths() {
+        assert!(!is_path_under_noise_dir(Path::new(
+            "/Users/v/proj/src/app.rs"
+        )));
+        assert!(!is_path_under_noise_dir(Path::new(
+            "/Users/v/proj/README.md"
+        )));
+        // A file literally named "target.md" must NOT be classified as
+        // noise — the gate matches whole path components, not substrings.
+        assert!(!is_path_under_noise_dir(Path::new(
+            "/Users/v/proj/docs/target.md"
+        )));
     }
 }
