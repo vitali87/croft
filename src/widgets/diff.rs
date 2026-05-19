@@ -21,6 +21,13 @@ pub struct DiffData {
     /// so the user understands why no red/green bands are painted even
     /// though git reports the file as modified.
     pub bytes_differ_but_lines_equal: bool,
+    /// True when the diff should render as a single-column unified view
+    /// instead of the two-column side-by-side. Set by
+    /// `build_unified_deletion` so a tombstone for a file the source-
+    /// control panel reports as deleted can show every removed line with
+    /// a `-` sign and a red band — visually identical to `git diff` for a
+    /// removed file.
+    pub unified: bool,
 }
 
 /// One visual row in a side-by-side diff view. The left column shows
@@ -78,6 +85,29 @@ impl DiffData {
             scroll: 0,
             scroll_x: 0,
             bytes_differ_but_lines_equal,
+            unified: false,
+        }
+    }
+
+    /// Build a single-column unified diff that represents a fully-deleted
+    /// file: every line of `text` becomes a `Removed` row keyed off
+    /// `left_lines`. The right side is empty; the renderer keys off
+    /// `unified == true` to draw a one-column view instead of two.
+    pub fn build_unified_deletion(label: PathBuf, text: &str) -> Self {
+        let left_lines: Vec<String> = text.lines().map(str::to_string).collect();
+        let rows: Vec<DiffRow> = (0..left_lines.len())
+            .map(|i| DiffRow::Removed { left: i })
+            .collect();
+        Self {
+            left_path: label,
+            right_path: PathBuf::from("/dev/null"),
+            left_lines,
+            right_lines: Vec::new(),
+            rows,
+            scroll: 0,
+            scroll_x: 0,
+            bytes_differ_but_lines_equal: false,
+            unified: true,
         }
     }
 
@@ -481,6 +511,37 @@ mod tests {
             !d.bytes_differ_but_lines_equal,
             "the flag must stay false when the diff has real Replaced rows — otherwise the header would lie that there's no line-level change"
         );
+    }
+
+    #[test]
+    fn build_unified_deletion_emits_only_removed_rows_and_sets_unified_flag() {
+        let d = DiffData::build_unified_deletion(
+            PathBuf::from("doomed.rs"),
+            "fn main() {\n    println!(\"bye\");\n}\n",
+        );
+        assert!(d.unified, "unified flag must be set so the renderer picks the single-column path");
+        assert_eq!(d.left_lines.len(), 3, "three source lines must produce three rows");
+        assert!(d.right_lines.is_empty(), "deletion view has no right side");
+        assert_eq!(
+            d.rows,
+            vec![
+                DiffRow::Removed { left: 0 },
+                DiffRow::Removed { left: 1 },
+                DiffRow::Removed { left: 2 },
+            ],
+            "every row must be Removed so all lines paint red with a `-` sign"
+        );
+    }
+
+    #[test]
+    fn standard_diff_builders_leave_unified_flag_off() {
+        let d = DiffData::build(
+            PathBuf::new(),
+            PathBuf::new(),
+            lines(&["a"]),
+            lines(&["b"]),
+        );
+        assert!(!d.unified, "side-by-side diffs must stay non-unified");
     }
 
     #[test]

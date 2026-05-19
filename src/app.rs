@@ -4382,6 +4382,28 @@ impl App {
                     }
                 }
             }
+            ChangeKind::Deleted | ChangeKind::StagedDeleted => {
+                // No working-tree file to diff against — show the HEAD
+                // blob as a one-sided unified diff so every removed
+                // line is visible in red, matching `git diff` output
+                // for a deletion.
+                match crate::git::read_file_at_head(&self.tree.root, &entry.path) {
+                    Ok(head_text) => {
+                        let label = std::path::PathBuf::from(&entry.path);
+                        match self.editor.open_deleted_diff_with_text(&label, &head_text) {
+                            Ok(()) => true,
+                            Err(e) => {
+                                self.status = format!("Open deletion view failed: {e}");
+                                false
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        self.status = format!("git show HEAD failed: {e}");
+                        false
+                    }
+                }
+            }
             _ => {
                 if abs.is_file() {
                     match self.editor.open_pinned(&abs) {
@@ -9932,6 +9954,68 @@ mod tests {
         assert!(
             app.source_control.selected_change.is_some(),
             "click on an SCM entry below the stale tree.last_area must still select it"
+        );
+    }
+
+    #[test]
+    fn click_on_a_deleted_source_control_entry_opens_unified_diff_with_head_lines_all_removed() {
+        // A file that's tracked in HEAD but missing from the working
+        // tree (or staged for deletion) used to leave the editor empty
+        // when clicked, because `open_source_control_entry` fell into
+        // the generic open-from-disk branch and the path doesn't exist
+        // any more. New behaviour: clicking the row opens a one-pane
+        // unified diff that paints every line of the HEAD blob as a
+        // removed line — visually identical to `git diff` for a deletion.
+        use crate::git::{ChangeEntry, ChangeKind};
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let init = std::process::Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .current_dir(root)
+            .status()
+            .unwrap();
+        assert!(init.success());
+        let _ = std::process::Command::new("git")
+            .args(["config", "user.email", "t@t"])
+            .current_dir(root)
+            .status();
+        let _ = std::process::Command::new("git")
+            .args(["config", "user.name", "t"])
+            .current_dir(root)
+            .status();
+        let f = root.join("doomed.txt");
+        std::fs::write(&f, b"alpha\nbeta\ngamma\n").unwrap();
+        let _ = std::process::Command::new("git")
+            .args(["add", "doomed.txt"])
+            .current_dir(root)
+            .status();
+        let _ = std::process::Command::new("git")
+            .args(["commit", "-q", "-m", "seed"])
+            .current_dir(root)
+            .status();
+        // Delete in the working tree but leave it tracked in HEAD/index
+        // — that's exactly the `Deleted` (unstaged) state.
+        std::fs::remove_file(&f).unwrap();
+        let mut app = App::new(root.to_path_buf()).unwrap();
+        app.source_control.entries =
+            vec![ChangeEntry { path: "doomed.txt".into(), kind: ChangeKind::Deleted }];
+        app.set_sidebar_view(SidebarView::SourceControl);
+        app.open_source_control_entry(0);
+        let diff = app
+            .editor
+            .diff
+            .as_ref()
+            .expect("clicking a Deleted entry must open a diff view, not a blank tab");
+        assert!(
+            diff.unified,
+            "the deletion view must be the single-column unified flavour, not side-by-side"
+        );
+        assert_eq!(diff.left_lines, vec!["alpha", "beta", "gamma"]);
+        assert!(
+            diff.rows
+                .iter()
+                .all(|r| matches!(r, crate::widgets::diff::DiffRow::Removed { .. })),
+            "every visible row must be Removed so the whole pane paints red"
         );
     }
 

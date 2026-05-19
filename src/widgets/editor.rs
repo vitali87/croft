@@ -279,6 +279,10 @@ fn render_diff(
     if inner.height < 3 || inner.width < 16 {
         return;
     }
+    if diff.unified {
+        render_unified_deletion(diff, inner, buf);
+        return;
+    }
     let left_name = diff
         .left_path
         .file_name()
@@ -488,6 +492,122 @@ fn render_diff(
     let visible_last = end;
     let status = format!(
         " {visible_first}–{visible_last} of {total}  ·  ↑/↓ PgUp/PgDn to scroll "
+    );
+    buf.set_string(
+        inner.x,
+        status_y,
+        &status,
+        Style::default()
+            .fg(Color::Gray)
+            .bg(Color::Rgb(0x14, 0x18, 0x22)),
+    );
+}
+
+/// One-column unified diff for a deleted file. Every visible row is a
+/// `Removed` row painted with a red band, `-` sign, and the HEAD line
+/// number in the gutter — visually identical to `git diff` for a
+/// removed file, but rendered inside the editor pane.
+fn render_unified_deletion(
+    diff: &mut crate::widgets::diff::DiffData,
+    inner: Rect,
+    buf: &mut Buffer,
+) {
+    use crate::widgets::diff::DiffRow;
+    let name = diff
+        .left_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| diff.left_path.display().to_string());
+    let header = format!(" diff: {name}  \u{2022} deleted (HEAD \u{2192} /dev/null) ");
+    let head_style = Style::default()
+        .fg(Color::White)
+        .bg(Color::Rgb(0x6b, 0x1f, 0x1f))
+        .add_modifier(Modifier::BOLD);
+    for x in inner.x..inner.x + inner.width {
+        buf[(x, inner.y)].set_style(head_style);
+        buf[(x, inner.y)].set_symbol(" ");
+    }
+    buf.set_string(inner.x, inner.y, &header, head_style);
+
+    let body_top = inner.y + 1;
+    let body_height = inner.height.saturating_sub(2);
+    let status_y = inner.y + inner.height - 1;
+    if body_height == 0 {
+        return;
+    }
+    let left_max = diff.left_lines.len();
+    let gutter = (left_max + 1).to_string().len() as u16 + 1;
+    let sign_x = inner.x + gutter;
+    let text_x = sign_x + 2;
+    let text_w = inner.width.saturating_sub(gutter + 2);
+
+    let total = diff.rows.len();
+    let viewport = body_height as usize;
+    let max_scroll = total.saturating_sub(viewport);
+    if diff.scroll > max_scroll {
+        diff.scroll = max_scroll;
+    }
+
+    let removed_bg = Color::Rgb(0x4a, 0x1f, 0x1f);
+    let removed_fg = Color::Rgb(0xff, 0xb3, 0xb3);
+    let gutter_fg = Color::Rgb(0x6c, 0x7d, 0x9c);
+
+    let end = (diff.scroll + viewport).min(total);
+    for (vis_row, row_idx) in (diff.scroll..end).enumerate() {
+        let y = body_top + vis_row as u16;
+        let row = diff.rows[row_idx];
+        let (left_idx, sign, cell_bg) = match row {
+            DiffRow::Removed { left } | DiffRow::Replaced { left, .. } => {
+                (Some(left), '-', removed_bg)
+            }
+            DiffRow::Equal { left, .. } => (Some(left), ' ', Color::Reset),
+            DiffRow::Added { .. } => (None, ' ', Color::Reset),
+        };
+        let label = left_idx
+            .map(|i| format!("{:>width$} ", i + 1, width = gutter as usize - 1))
+            .unwrap_or_else(|| " ".repeat(gutter as usize));
+        buf.set_string(
+            inner.x,
+            y,
+            &label,
+            Style::default().fg(gutter_fg).bg(cell_bg),
+        );
+        buf.set_string(
+            sign_x,
+            y,
+            &format!("{sign} "),
+            Style::default()
+                .fg(if cell_bg == removed_bg { removed_fg } else { gutter_fg })
+                .bg(cell_bg)
+                .add_modifier(Modifier::BOLD),
+        );
+        let text = left_idx
+            .and_then(|i| diff.left_lines.get(i).cloned())
+            .unwrap_or_default();
+        let clipped: String = text
+            .chars()
+            .skip(diff.scroll_x)
+            .take(text_w as usize)
+            .collect();
+        let mut padded = clipped;
+        let pad = (text_w as usize).saturating_sub(padded.chars().count());
+        for _ in 0..pad {
+            padded.push(' ');
+        }
+        buf.set_string(
+            text_x,
+            y,
+            &padded,
+            Style::default()
+                .fg(if cell_bg == removed_bg { removed_fg } else { Color::Rgb(0xc5, 0xcd, 0xd9) })
+                .bg(cell_bg),
+        );
+    }
+
+    let visible_first = diff.scroll + 1;
+    let visible_last = end;
+    let status = format!(
+        " {visible_first}\u{2013}{visible_last} of {total}  \u{00b7}  every line removed at HEAD  \u{00b7}  \u{2191}/\u{2193} PgUp/PgDn to scroll "
     );
     buf.set_string(
         inner.x,
@@ -4564,6 +4684,42 @@ impl EditorTabs {
         // diff), reuse it so we don't pile up duplicate tabs as the
         // user clicks through the change list.
         if let Some(idx) = self.find_tab_with_path(right) {
+            self.editors[idx] = e;
+            self.select(idx);
+            return Ok(());
+        }
+        let pos = self.active + 1;
+        self.editors.insert(pos, e);
+        self.editors[self.active].focused = false;
+        self.active = pos;
+        Ok(())
+    }
+
+    /// Open a single-pane unified diff that paints every line of
+    /// `head_text` as a removed line. `path` is the workspace-relative
+    /// path that no longer exists on disk; it doubles as the display
+    /// label in the diff header and as the tab dedup key so repeated
+    /// clicks on the same Source-Control row reuse the tab rather than
+    /// stacking new ones.
+    pub fn open_deleted_diff_with_text(
+        &mut self,
+        path: &Path,
+        head_text: &str,
+    ) -> Result<()> {
+        let data = crate::widgets::diff::DiffData::build_unified_deletion(
+            path.to_path_buf(),
+            head_text,
+        );
+        let mut e = Editor::new();
+        e.focused = self.editors[self.active].focused;
+        e.preview = false;
+        e.path = Some(path.to_path_buf());
+        e.diff = Some(data);
+        if self.is_blank_initial() {
+            self.editors[self.active] = e;
+            return Ok(());
+        }
+        if let Some(idx) = self.find_tab_with_path(path) {
             self.editors[idx] = e;
             self.select(idx);
             return Ok(());
