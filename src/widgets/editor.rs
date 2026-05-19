@@ -4021,6 +4021,80 @@ mod tests {
     }
 
     #[test]
+    fn close_others_keeps_only_the_chosen_tab_and_makes_it_active() {
+        let mut t = EditorTabs::new();
+        t.editors[0].path = Some(std::path::PathBuf::from("/a"));
+        t.add_tab_with_path(std::path::PathBuf::from("/b"));
+        t.add_tab_with_path(std::path::PathBuf::from("/c"));
+        // Keep "b" (originally index 1). The other two must go.
+        let removed = t.close_others(1);
+        assert_eq!(removed, 2, "close_others must report how many were dropped");
+        assert_eq!(t.tab_count(), 1);
+        assert_eq!(t.active_index(), 0);
+        assert_eq!(t.path.as_deref(), Some(std::path::Path::new("/b")));
+        assert!(t.focused, "the surviving tab takes focus");
+    }
+
+    #[test]
+    fn close_others_is_a_noop_when_only_one_tab_is_open() {
+        let mut t = EditorTabs::new();
+        t.editors[0].path = Some(std::path::PathBuf::from("/only"));
+        let removed = t.close_others(0);
+        assert_eq!(removed, 0, "nothing to drop");
+        assert_eq!(t.tab_count(), 1);
+        assert_eq!(t.path.as_deref(), Some(std::path::Path::new("/only")));
+    }
+
+    #[test]
+    fn close_to_right_drops_only_tabs_past_the_pivot_and_keeps_left_side() {
+        let mut t = EditorTabs::new();
+        t.editors[0].path = Some(std::path::PathBuf::from("/a"));
+        t.add_tab_with_path(std::path::PathBuf::from("/b"));
+        t.add_tab_with_path(std::path::PathBuf::from("/c"));
+        t.add_tab_with_path(std::path::PathBuf::from("/d"));
+        // Pivot on "b" (index 1). c and d disappear; a and b stay.
+        let removed = t.close_to_right(1);
+        assert_eq!(removed, 2);
+        assert_eq!(t.tab_count(), 2);
+        assert_eq!(
+            t.editors[0].path.as_deref(),
+            Some(std::path::Path::new("/a")),
+            "left-side tabs are untouched"
+        );
+        assert_eq!(
+            t.editors[1].path.as_deref(),
+            Some(std::path::Path::new("/b"))
+        );
+        assert!(
+            t.active_index() < t.tab_count(),
+            "active must still point at a valid tab"
+        );
+    }
+
+    #[test]
+    fn close_to_right_at_last_tab_is_a_noop() {
+        let mut t = EditorTabs::new();
+        t.editors[0].path = Some(std::path::PathBuf::from("/a"));
+        t.add_tab_with_path(std::path::PathBuf::from("/b"));
+        let before = t.tab_count();
+        let removed = t.close_to_right(1);
+        assert_eq!(removed, 0);
+        assert_eq!(t.tab_count(), before);
+    }
+
+    #[test]
+    fn close_all_collapses_to_a_single_blank_tab() {
+        let mut t = EditorTabs::new();
+        t.editors[0].path = Some(std::path::PathBuf::from("/a"));
+        t.add_tab_with_path(std::path::PathBuf::from("/b"));
+        t.add_tab_with_path(std::path::PathBuf::from("/c"));
+        let removed = t.close_all();
+        assert_eq!(removed, 3, "report how many tabs were collapsed");
+        assert_eq!(t.tab_count(), 1, "always at least one tab survives");
+        assert!(t.path.is_none(), "the surviving tab is a fresh blank slot");
+    }
+
+    #[test]
     fn close_tab_on_last_remaining_tab_resets_to_blank_buffer() {
         let mut t = EditorTabs::new();
         t.editors[0].path = Some(std::path::PathBuf::from("/only.rs"));
@@ -4629,6 +4703,59 @@ impl EditorTabs {
             ed.focused = i == self.active;
         }
         true
+    }
+
+    /// Close every tab whose index ≠ `keep_idx`. The kept tab stays
+    /// active. Returns how many tabs were actually removed (0 when
+    /// `keep_idx` is out of range or only one tab is open). Mirrors VS
+    /// Code's "Close Others" context-menu action.
+    pub fn close_others(&mut self, keep_idx: usize) -> usize {
+        if keep_idx >= self.editors.len() || self.editors.len() <= 1 {
+            return 0;
+        }
+        let kept = self.editors.remove(keep_idx);
+        let removed = self.editors.len();
+        self.editors.clear();
+        self.editors.push(kept);
+        self.active = 0;
+        self.editors[0].focused = true;
+        removed
+    }
+
+    /// Close every tab whose index > `from_idx`. The tab at `from_idx`
+    /// stays active; tabs to the left are untouched. Returns the number
+    /// of tabs removed. Matches VS Code's "Close to the Right".
+    pub fn close_to_right(&mut self, from_idx: usize) -> usize {
+        if from_idx >= self.editors.len() {
+            return 0;
+        }
+        let target_len = from_idx + 1;
+        if self.editors.len() <= target_len {
+            return 0;
+        }
+        let removed = self.editors.len() - target_len;
+        self.editors.truncate(target_len);
+        if self.active >= self.editors.len() {
+            self.active = self.editors.len() - 1;
+        }
+        for (i, ed) in self.editors.iter_mut().enumerate() {
+            ed.focused = i == self.active;
+        }
+        removed
+    }
+
+    /// Close every tab, resetting the editor pane to the single blank
+    /// just-launched state — mirrors `close_tab` on the last remaining
+    /// tab. Returns how many tabs were collapsed away (always ≥ 1 when
+    /// the editor had any content). Matches VS Code's "Close All".
+    pub fn close_all(&mut self) -> usize {
+        let n = self.editors.len();
+        let was_focused = self.editors[self.active].focused;
+        let mut fresh = Editor::new();
+        fresh.focused = was_focused;
+        self.editors = vec![fresh];
+        self.active = 0;
+        n
     }
 
     /// Map a mouse cell `(col, row)` to a tab index, or `None` if the click

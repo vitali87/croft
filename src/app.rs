@@ -260,6 +260,16 @@ enum MenuAction {
     /// files can't be roots. Used to dive into a nested git repo without
     /// relaunching croft.
     MakeRoot(PathBuf),
+    /// Close the editor tab at `idx`. Mirrors clicking the tab's `×`
+    /// glyph; surfaces in the tab-strip right-click menu so the four
+    /// close actions (Close / Others / Right / All) live in one place.
+    CloseTab(usize),
+    /// Close every editor tab whose index ≠ `keep_idx`.
+    CloseOtherTabs(usize),
+    /// Close every editor tab whose index > `from_idx`.
+    CloseTabsToRight(usize),
+    /// Close every editor tab and reset the pane to a blank state.
+    CloseAllTabs,
 }
 
 /// Return the macOS-style keyboard shortcut hint to display on the right
@@ -276,6 +286,9 @@ fn shortcut_for(action: &MenuAction) -> Option<&'static str> {
         MenuAction::Rename(_) => Some("⌘R"),
         MenuAction::MakeRoot(_) => Some("⌘/"),
         MenuAction::Delete { .. } => Some("⌫"),
+        MenuAction::CloseTab(_) => Some("⌘W"),
+        MenuAction::CloseOtherTabs(_) => Some("⌥⌘T"),
+        MenuAction::CloseAllTabs => Some("⌘K W"),
         _ => None,
     }
 }
@@ -328,6 +341,26 @@ struct ExplorerDrag {
     /// non-armed release toggles the start row's mark; an armed release
     /// performs a copy-drop instead of the default move-drop.
     toggle_on_release: bool,
+}
+
+/// Build the right-click context-menu items for an editor tab strip
+/// click on tab `idx`. `tab_count` is the total number of open tabs;
+/// used to gate "Close Others" / "Close to the Right" so they don't
+/// surface when they would be no-ops.
+fn build_tab_context_menu_items(idx: usize, tab_count: usize) -> Vec<(String, MenuAction)> {
+    let mut items: Vec<(String, MenuAction)> = Vec::new();
+    items.push((String::from("Close"), MenuAction::CloseTab(idx)));
+    if tab_count > 1 {
+        items.push((String::from("Close Others"), MenuAction::CloseOtherTabs(idx)));
+    }
+    if idx + 1 < tab_count {
+        items.push((
+            String::from("Close to the Right"),
+            MenuAction::CloseTabsToRight(idx),
+        ));
+    }
+    items.push((String::from("Close All"), MenuAction::CloseAllTabs));
+    items
 }
 
 /// Build the right-click context-menu items for the explorer.
@@ -6729,6 +6762,23 @@ impl App {
 
         match m.kind {
             MouseEventKind::Down(MouseButton::Right) => {
+                // Editor tab strip: right-click on a tab opens the
+                // Close / Close Others / Close to the Right / Close All
+                // menu. Routed here BEFORE the explorer branch so the
+                // hit-test wins even when the editor pane shares its
+                // column with the sidebar.
+                if let Some(tab_idx) = self.editor.tab_at(m.column, m.row) {
+                    self.focus_pane(Pane::Editor);
+                    let items =
+                        build_tab_context_menu_items(tab_idx, self.editor.tab_count());
+                    self.context_menu = Some(ContextMenu {
+                        origin: (m.column, m.row),
+                        items,
+                        selected: 0,
+                        target_dir: self.tree.root.clone(),
+                    });
+                    return;
+                }
                 if in_tree && self.sidebar_view == SidebarView::Explorer {
                     self.focus_pane(Pane::Tree);
                     let node_idx = self.tree.node_at_y(m.row);
@@ -7734,6 +7784,47 @@ impl App {
             }
             MenuAction::MakeRoot(folder) => {
                 self.change_workspace_root(folder);
+            }
+            MenuAction::CloseTab(idx) => {
+                if self.editor.close_tab(idx) {
+                    self.sync_open_file_poll_mtime();
+                    self.status = String::from("Closed tab");
+                    self.poke_cursor();
+                }
+            }
+            MenuAction::CloseOtherTabs(keep_idx) => {
+                let removed = self.editor.close_others(keep_idx);
+                if removed > 0 {
+                    self.sync_open_file_poll_mtime();
+                    self.status = if removed == 1 {
+                        String::from("Closed 1 other tab")
+                    } else {
+                        format!("Closed {removed} other tabs")
+                    };
+                    self.poke_cursor();
+                }
+            }
+            MenuAction::CloseTabsToRight(from_idx) => {
+                let removed = self.editor.close_to_right(from_idx);
+                if removed > 0 {
+                    self.sync_open_file_poll_mtime();
+                    self.status = if removed == 1 {
+                        String::from("Closed 1 tab to the right")
+                    } else {
+                        format!("Closed {removed} tabs to the right")
+                    };
+                    self.poke_cursor();
+                }
+            }
+            MenuAction::CloseAllTabs => {
+                let removed = self.editor.close_all();
+                self.sync_open_file_poll_mtime();
+                self.status = if removed == 1 {
+                    String::from("Closed 1 tab")
+                } else {
+                    format!("Closed {removed} tabs")
+                };
+                self.poke_cursor();
             }
             MenuAction::CompareWithSelected { anchor, other } => {
                 match self.editor.open_diff(&anchor, &other) {
@@ -16029,6 +16120,47 @@ mod tests {
         for t in &app.terminals {
             assert!(!t.focused);
         }
+    }
+
+    #[test]
+    fn build_tab_context_menu_items_includes_all_four_close_actions_in_the_middle_of_a_strip() {
+        // Right-click on tab 1 of 3 (i.e. a middle tab) should surface
+        // every close action — there's at least one tab on each side.
+        let items = build_tab_context_menu_items(1, 3);
+        let labels: Vec<&str> = items.iter().map(|(s, _)| s.as_str()).collect();
+        assert_eq!(
+            labels,
+            ["Close", "Close Others", "Close to the Right", "Close All"],
+            "all four close actions must appear and in this order — mirrors VS Code's tab strip"
+        );
+        assert!(matches!(&items[0].1, MenuAction::CloseTab(1)));
+        assert!(matches!(&items[1].1, MenuAction::CloseOtherTabs(1)));
+        assert!(matches!(&items[2].1, MenuAction::CloseTabsToRight(1)));
+        assert!(matches!(&items[3].1, MenuAction::CloseAllTabs));
+    }
+
+    #[test]
+    fn build_tab_context_menu_items_hides_close_to_the_right_on_the_last_tab() {
+        // Last tab → "Close to the Right" would close zero tabs, so it
+        // must be suppressed (matches VS Code).
+        let items = build_tab_context_menu_items(2, 3);
+        let labels: Vec<&str> = items.iter().map(|(s, _)| s.as_str()).collect();
+        assert_eq!(
+            labels,
+            ["Close", "Close Others", "Close All"],
+            "Close to the Right must be suppressed on the rightmost tab"
+        );
+    }
+
+    #[test]
+    fn build_tab_context_menu_items_hides_close_others_when_only_one_tab_is_open() {
+        let items = build_tab_context_menu_items(0, 1);
+        let labels: Vec<&str> = items.iter().map(|(s, _)| s.as_str()).collect();
+        assert_eq!(
+            labels,
+            ["Close", "Close All"],
+            "with a single tab, Close Others and Close to the Right are both no-ops and must be suppressed"
+        );
     }
 }
 
