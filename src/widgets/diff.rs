@@ -309,6 +309,39 @@ impl DiffData {
         self.hunk_starts().into_iter().rev().find(|&s| s < current)
     }
 
+    /// Like `next_change_row`, but wraps around to the first hunk when
+    /// `current` is at/past the last one. Used by the diff-pane ›
+    /// arrow and F7 so a user reading bottom-to-top can keep clicking
+    /// the same arrow to cycle through every hunk. Returns `None` only
+    /// when the diff has no change rows at all.
+    pub fn next_change_row_wrap(&self, current: usize) -> Option<usize> {
+        let starts = self.hunk_starts();
+        if starts.is_empty() {
+            return None;
+        }
+        starts
+            .iter()
+            .find(|&&s| s > current)
+            .copied()
+            .or_else(|| starts.first().copied())
+    }
+
+    /// Mirror of `next_change_row_wrap` going the other way: when
+    /// `current` sits at/before the first hunk, the next call wraps to
+    /// the last hunk instead of stalling.
+    pub fn prev_change_row_wrap(&self, current: usize) -> Option<usize> {
+        let starts = self.hunk_starts();
+        if starts.is_empty() {
+            return None;
+        }
+        starts
+            .iter()
+            .rev()
+            .find(|&&s| s < current)
+            .copied()
+            .or_else(|| starts.last().copied())
+    }
+
     /// Park `scroll` two rows above `target` so the change row lands with
     /// a slice of context above it, the way users read diffs.
     pub fn scroll_to_row(&mut self, target: usize) {
@@ -566,6 +599,54 @@ mod tests {
         assert_eq!(d.prev_change_row(4), Some(1));
         assert_eq!(d.prev_change_row(1), None);
         assert_eq!(d.prev_change_row(0), None);
+    }
+
+    #[test]
+    fn next_change_row_wrap_loops_from_last_hunk_back_to_first() {
+        let d = DiffData::build(
+            PathBuf::new(),
+            PathBuf::new(),
+            lines(&["a", "b", "c", "d", "e"]),
+            lines(&["a", "B", "c", "d", "E"]),
+        );
+        assert_eq!(d.next_change_row_wrap(0), Some(1));
+        assert_eq!(d.next_change_row_wrap(1), Some(4));
+        // Past the last hunk: wrap to the first instead of stalling.
+        assert_eq!(
+            d.next_change_row_wrap(4),
+            Some(1),
+            "at/past the last hunk the next ⟶ click must loop back to the first"
+        );
+        assert_eq!(d.next_change_row_wrap(999), Some(1));
+    }
+
+    #[test]
+    fn prev_change_row_wrap_loops_from_first_hunk_back_to_last() {
+        let d = DiffData::build(
+            PathBuf::new(),
+            PathBuf::new(),
+            lines(&["a", "b", "c", "d", "e"]),
+            lines(&["a", "B", "c", "d", "E"]),
+        );
+        assert_eq!(d.prev_change_row_wrap(4), Some(1));
+        assert_eq!(
+            d.prev_change_row_wrap(1),
+            Some(4),
+            "at/before the first hunk the previous ⟵ click must loop to the last"
+        );
+        assert_eq!(d.prev_change_row_wrap(0), Some(4));
+    }
+
+    #[test]
+    fn change_row_wrap_returns_none_when_diff_has_no_changes() {
+        let d = DiffData::build(
+            PathBuf::new(),
+            PathBuf::new(),
+            lines(&["a", "b", "c"]),
+            lines(&["a", "b", "c"]),
+        );
+        assert_eq!(d.next_change_row_wrap(0), None);
+        assert_eq!(d.prev_change_row_wrap(0), None);
     }
 
     #[test]

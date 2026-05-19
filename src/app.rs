@@ -7159,6 +7159,19 @@ impl App {
                     }
                 } else if in_editor {
                     self.focus_pane(Pane::Editor);
+                    // Diff header arrows: take precedence over selection so a
+                    // click on the ‹ / › glyph jumps to prev/next change
+                    // instead of anchoring a selection at the header row.
+                    if self.editor.diff.is_some() {
+                        if rect_contains(self.editor.diff_prev_arrow, m.column, m.row) {
+                            self.jump_diff_change(false);
+                            return;
+                        }
+                        if rect_contains(self.editor.diff_next_arrow, m.column, m.row) {
+                            self.jump_diff_change(true);
+                            return;
+                        }
+                    }
                     let now = std::time::Instant::now();
                     let is_double = matches!(
                         self.last_editor_left_down,
@@ -7866,6 +7879,26 @@ impl App {
     /// full viewport, Home/End jump to the first/last row, Tab/Shift+Tab
     /// switch worksheets. Anything else is swallowed so a stray keystroke
     /// can't insert characters into a buffer the user can't see.
+    /// Scroll the active diff to the next change hunk (forward=true) or
+    /// the previous one (forward=false), wrapping around the ends so a
+    /// user can keep clicking the same arrow to cycle through every
+    /// hunk. Mirrors the F7 / Shift+F7 key path so click and keybinding
+    /// stay in sync.
+    fn jump_diff_change(&mut self, forward: bool) {
+        let Some(diff) = self.editor.diff.as_mut() else {
+            return;
+        };
+        let anchor = diff.scroll.saturating_add(2);
+        let target = if forward {
+            diff.next_change_row_wrap(anchor)
+        } else {
+            diff.prev_change_row_wrap(anchor)
+        };
+        if let Some(row) = target {
+            diff.scroll_to_row(row);
+        }
+    }
+
     fn handle_diff_key(&mut self, key: KeyEvent) {
         // Page = inner viewport rows minus the header + footer the diff
         // renderer reserves. Falls back to a sane default when the editor
@@ -7881,14 +7914,14 @@ impl App {
             // `scroll_to_row` parks the viewport 2 rows above the target,
             // so the hunk currently in view sits at row `scroll + 2`.
             // Anchoring next/prev queries at that row, not at `scroll`,
-            // means F7 reliably jumps PAST the hunk the user is reading
-            // — otherwise next_change_row(scroll) returns the same hunk
-            // and `scroll_to_row` re-parks at the same `scroll`.
+            // means F7 reliably jumps PAST the hunk the user is reading.
+            // Use the wrap variants so F7 at the last hunk loops back to
+            // the first, matching the click-arrow behaviour.
             let anchor = diff.scroll.saturating_add(2);
             let target = if key.modifiers.contains(KeyModifiers::SHIFT) {
-                diff.prev_change_row(anchor)
+                diff.prev_change_row_wrap(anchor)
             } else {
-                diff.next_change_row(anchor)
+                diff.next_change_row_wrap(anchor)
             };
             if let Some(row) = target {
                 diff.scroll_to_row(row);

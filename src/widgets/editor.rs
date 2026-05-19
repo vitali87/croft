@@ -262,11 +262,14 @@ fn render_sheet(
     );
 }
 
+/// Returns the hit-test rects of the prev / next change arrows painted
+/// in the diff header (in that order). Both are `Rect::default()` when
+/// the header was too narrow to allocate them.
 fn render_diff(
     diff: &mut crate::widgets::diff::DiffData,
     inner: Rect,
     buf: &mut Buffer,
-) {
+) -> (Rect, Rect) {
     use crate::widgets::diff::DiffRow;
     // Background fill so the diff sits on a clean canvas.
     let bg_style = Style::default().bg(Color::Rgb(0x1e, 0x22, 0x2e));
@@ -277,11 +280,10 @@ fn render_diff(
         }
     }
     if inner.height < 3 || inner.width < 16 {
-        return;
+        return (Rect::default(), Rect::default());
     }
     if diff.unified {
-        render_unified_deletion(diff, inner, buf);
-        return;
+        return render_unified_deletion(diff, inner, buf);
     }
     let left_name = diff
         .left_path
@@ -323,6 +325,7 @@ fn render_diff(
         buf[(x, inner.y)].set_symbol(" ");
     }
     buf.set_string(inner.x, inner.y, &header, head_style);
+    let (prev_arrow, next_arrow) = paint_diff_nav_arrows(inner, head_bg, buf);
 
     // Two columns split exactly down the middle. Each column has a small
     // line-number gutter on its left and a 1-cell sign column showing
@@ -331,11 +334,11 @@ fn render_diff(
     let body_height = inner.height.saturating_sub(2);
     let status_y = inner.y + inner.height - 1;
     if body_height == 0 {
-        return;
+        return (prev_arrow, next_arrow);
     }
     let half = inner.width / 2;
     if half < 8 {
-        return;
+        return (prev_arrow, next_arrow);
     }
     let left_max = diff.left_lines.len();
     let right_max = diff.right_lines.len();
@@ -500,7 +503,7 @@ fn render_diff(
     let visible_first = diff.scroll + 1;
     let visible_last = end;
     let status = format!(
-        " {visible_first}–{visible_last} of {total}  ·  ↑/↓ PgUp/PgDn to scroll "
+        " {visible_first}–{visible_last} of {total}  ·  ↑/↓ PgUp/PgDn  ·  ‹/› click arrows or F7 for next/prev change "
     );
     buf.set_string(
         inner.x,
@@ -510,17 +513,48 @@ fn render_diff(
             .fg(Color::Gray)
             .bg(Color::Rgb(0x14, 0x18, 0x22)),
     );
+    (prev_arrow, next_arrow)
+}
+
+/// Paint `‹` and `›` glyphs at the right edge of a diff header so the
+/// user can click between change hunks without scrolling. Returns the
+/// hit-test rects (prev, next) so the click handler can route mouse
+/// events back to `prev_change_row` / `next_change_row`. Returns two
+/// empty rects when the header doesn't have room for the glyphs (very
+/// narrow editor pane).
+fn paint_diff_nav_arrows(inner: Rect, head_bg: Color, buf: &mut Buffer) -> (Rect, Rect) {
+    // Reserve a 7-cell strip on the right: " ‹  ›  ".
+    let strip_w: u16 = 7;
+    if inner.width < strip_w + 4 {
+        return (Rect::default(), Rect::default());
+    }
+    let strip_right = inner.x + inner.width;
+    let prev_x = strip_right - strip_w + 1;
+    let next_x = strip_right - 3;
+    let y = inner.y;
+    let arrow_style = Style::default()
+        .fg(Color::White)
+        .bg(head_bg)
+        .add_modifier(Modifier::BOLD);
+    buf.set_string(prev_x, y, "\u{2039}", arrow_style);
+    buf.set_string(next_x, y, "\u{203a}", arrow_style);
+    (
+        Rect { x: prev_x, y, width: 1, height: 1 },
+        Rect { x: next_x, y, width: 1, height: 1 },
+    )
 }
 
 /// One-column unified diff for a deleted file. Every visible row is a
 /// `Removed` row painted with a red band, `-` sign, and the HEAD line
 /// number in the gutter — visually identical to `git diff` for a
-/// removed file, but rendered inside the editor pane.
+/// removed file, but rendered inside the editor pane. Returns the
+/// header-arrow hit rects the same way `render_diff` does so the click
+/// handler can navigate deletion-view changes too.
 fn render_unified_deletion(
     diff: &mut crate::widgets::diff::DiffData,
     inner: Rect,
     buf: &mut Buffer,
-) {
+) -> (Rect, Rect) {
     use crate::widgets::diff::DiffRow;
     let name = diff
         .left_path
@@ -537,12 +571,14 @@ fn render_unified_deletion(
         buf[(x, inner.y)].set_symbol(" ");
     }
     buf.set_string(inner.x, inner.y, &header, head_style);
+    let (prev_arrow, next_arrow) =
+        paint_diff_nav_arrows(inner, Color::Rgb(0x6b, 0x1f, 0x1f), buf);
 
     let body_top = inner.y + 1;
     let body_height = inner.height.saturating_sub(2);
     let status_y = inner.y + inner.height - 1;
     if body_height == 0 {
-        return;
+        return (prev_arrow, next_arrow);
     }
     let left_max = diff.left_lines.len();
     let gutter = (left_max + 1).to_string().len() as u16 + 1;
@@ -626,6 +662,7 @@ fn render_unified_deletion(
             .fg(Color::Gray)
             .bg(Color::Rgb(0x14, 0x18, 0x22)),
     );
+    (prev_arrow, next_arrow)
 }
 
 fn write_cell(
@@ -802,6 +839,13 @@ pub struct Editor {
     /// path, `image`, and `sheet` — when set the renderer paints two
     /// columns based on `diff.rows` and ignores `lines`.
     pub diff: Option<crate::widgets::diff::DiffData>,
+    /// Hit-test rect for the "previous change" arrow painted in the diff
+    /// header. Empty when the tab isn't a diff or the header was clipped.
+    /// `App` consults this on left-click to jump to the previous hunk.
+    pub diff_prev_arrow: Rect,
+    /// Hit-test rect for the "next change" arrow painted in the diff
+    /// header. Mirror of `diff_prev_arrow`.
+    pub diff_next_arrow: Rect,
 }
 
 impl Editor {
@@ -834,6 +878,8 @@ impl Editor {
             image: None,
             sheet: None,
             diff: None,
+            diff_prev_arrow: Rect::default(),
+            diff_next_arrow: Rect::default(),
         }
     }
 
@@ -3501,6 +3547,72 @@ mod tests {
     }
 
     #[test]
+    fn diff_header_paints_prev_next_arrows_at_the_right_edge() {
+        // Regression: the user asked for clickable arrows in the diff
+        // header so they can hop between change hunks without
+        // hand-scrolling. The arrows must paint at the rightmost cells
+        // of the header row AND must populate the editor's hit-test
+        // fields so the click handler can route mouse events to
+        // prev/next-change navigation.
+        let f1 = NamedTempFile::new().unwrap();
+        let f2 = NamedTempFile::new().unwrap();
+        std::fs::write(f1.path(), "alpha\nbravo\ncharlie\n").unwrap();
+        std::fs::write(f2.path(), "alpha\nBRAVO\ncharlie\n").unwrap();
+        let mut t = EditorTabs::new();
+        t.open_diff(f1.path(), f2.path()).unwrap();
+        let active_idx = t.active_index();
+        t.editors[active_idx].focused = true;
+        let area = Rect { x: 0, y: 0, width: 80, height: 20 };
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        ratatui::widgets::Widget::render(&mut t.editors[active_idx], area, &mut buf);
+        let ed = &t.editors[active_idx];
+        assert!(
+            ed.diff_prev_arrow.width > 0,
+            "prev arrow rect must be tracked so a click can navigate to the previous hunk"
+        );
+        assert!(
+            ed.diff_next_arrow.width > 0,
+            "next arrow rect must be tracked so a click can navigate to the next hunk"
+        );
+        // Glyphs land where the rects say they do.
+        assert_eq!(
+            buf[(ed.diff_prev_arrow.x, ed.diff_prev_arrow.y)].symbol(),
+            "\u{2039}",
+            "prev arrow cell must paint ‹"
+        );
+        assert_eq!(
+            buf[(ed.diff_next_arrow.x, ed.diff_next_arrow.y)].symbol(),
+            "\u{203a}",
+            "next arrow cell must paint ›"
+        );
+        // Next sits to the right of prev on the same header row.
+        assert_eq!(ed.diff_prev_arrow.y, ed.diff_next_arrow.y);
+        assert!(ed.diff_prev_arrow.x < ed.diff_next_arrow.x);
+        // Both arrows sit inside the editor's inner rect's right band.
+        let right_edge = ed.last_inner.x + ed.last_inner.width;
+        assert!(ed.diff_next_arrow.x < right_edge);
+    }
+
+    #[test]
+    fn non_diff_tab_clears_diff_arrow_hit_rects_on_render() {
+        // Regression guard: switching from a diff tab to a regular file
+        // tab must NOT leave the stale arrow rects in place — otherwise
+        // a click at those cells on the new tab would mis-route as a
+        // change-navigation event.
+        let f = NamedTempFile::new().unwrap();
+        std::fs::write(f.path(), "alpha\nbravo\ncharlie\n").unwrap();
+        let mut ed = Editor::new();
+        ed.open(f.path()).unwrap();
+        ed.diff_prev_arrow = Rect { x: 30, y: 0, width: 1, height: 1 };
+        ed.diff_next_arrow = Rect { x: 32, y: 0, width: 1, height: 1 };
+        let area = Rect { x: 0, y: 0, width: 40, height: 10 };
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        ratatui::widgets::Widget::render(&mut ed, area, &mut buf);
+        assert_eq!(ed.diff_prev_arrow, Rect::default());
+        assert_eq!(ed.diff_next_arrow, Rect::default());
+    }
+
+    #[test]
     fn open_diff_inserts_a_new_tab_when_an_open_file_already_exists() {
         let existing = NamedTempFile::new().unwrap();
         std::fs::write(existing.path(), "x\n").unwrap();
@@ -4124,9 +4236,15 @@ impl Widget for &mut Editor {
             return;
         }
         if let Some(diff) = self.diff.as_mut() {
-            render_diff(diff, inner, buf);
+            let (prev_arrow, next_arrow) = render_diff(diff, inner, buf);
+            self.diff_prev_arrow = prev_arrow;
+            self.diff_next_arrow = next_arrow;
             return;
         }
+        // Non-diff tabs: clear the hit rects so a stale arrow click on a
+        // tab the user just switched away from can't fire.
+        self.diff_prev_arrow = Rect::default();
+        self.diff_next_arrow = Rect::default();
         if self.cursor_row < self.scroll {
             self.scroll = self.cursor_row;
         } else if self.cursor_row >= self.scroll + height {
