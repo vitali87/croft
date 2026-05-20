@@ -16,3 +16,10 @@ preview*.svg
 # Added by cargo
 
 /target
+
+# macOS
+.DS_Store
+
+# Local caches and scratch
+.cgr-hash-cache.json
+.tmp/
