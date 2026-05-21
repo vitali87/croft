@@ -3271,6 +3271,12 @@ impl App {
     /// new terminal's cwd is the *live* cwd of the active terminal's shell
     /// (so a `cd somewhere` inside the user's prompt is reflected), with
     /// the workspace root as a fallback if we can't resolve it.
+    ///
+    /// The new terminal lands immediately to the right of the currently
+    /// active one, not at the far end of the strip, so the user's mental
+    /// model of "the new tab sits next to where I was" matches what they
+    /// see. Inserting at the end would scatter related splits across the
+    /// row whenever the active terminal wasn't already on the right edge.
     pub fn split_terminal(&mut self) -> Result<()> {
         let cwd = self
             .terminal()
@@ -3279,8 +3285,9 @@ impl App {
             .filter(|p| p.is_dir())
             .unwrap_or_else(|| self.workspace_root.clone());
         let term = PtyTerminal::new(&cwd).context("spawning terminal")?;
-        self.terminals.push(term);
-        self.active_terminal = self.terminals.len() - 1;
+        let target = self.active_terminal + 1;
+        self.terminals.insert(target, term);
+        self.active_terminal = target;
         if !self.show_terminal {
             self.show_terminal = true;
         }
@@ -3323,6 +3330,17 @@ impl App {
             return;
         }
         self.active_terminal = (self.active_terminal + 1) % self.terminals.len();
+        self.sync_focus_flags();
+    }
+
+    /// Cycle the active terminal backward by one slot, wrapping at the
+    /// front. Mirror of `cycle_terminal` for the Ctrl+Shift+[ binding.
+    pub fn cycle_terminal_back(&mut self) {
+        let n = self.terminals.len();
+        if n <= 1 {
+            return;
+        }
+        self.active_terminal = (self.active_terminal + n - 1) % n;
         self.sync_focus_flags();
     }
 
@@ -4432,8 +4450,9 @@ impl App {
         };
         match PtyTerminal::new_running(&spec.program, &spec.args, &spec.cwd) {
             Ok(term) => {
-                self.terminals.push(term);
-                self.active_terminal = self.terminals.len() - 1;
+                let target = self.active_terminal + 1;
+                self.terminals.insert(target, term);
+                self.active_terminal = target;
                 if !self.show_terminal {
                     self.show_terminal = true;
                 }
@@ -5591,9 +5610,13 @@ impl App {
             }
             return;
         }
-        // Ctrl+Shift+] / Ctrl+Shift+[: cycle to the next terminal.
+        // Ctrl+Shift+]: next terminal. Ctrl+Shift+[: previous terminal.
         if is_terminal_cycle_key(key) {
             self.cycle_terminal();
+            return;
+        }
+        if is_terminal_cycle_back_key(key) {
+            self.cycle_terminal_back();
             return;
         }
         // Ctrl+Shift+C / Cmd+C: copy current selection.
@@ -9006,6 +9029,18 @@ fn is_terminal_close_key(key: KeyEvent) -> bool {
 fn is_terminal_cycle_key(key: KeyEvent) -> bool {
     let KeyCode::Char(c) = key.code else { return false };
     if c != ']' && c != '}' {
+        return false;
+    }
+    key.modifiers.contains(KeyModifiers::CONTROL) && key.modifiers.contains(KeyModifiers::SHIFT)
+}
+
+/// `Ctrl+Shift+[`: cycle to the previous terminal in the pane. Mirror of
+/// `is_terminal_cycle_key` for the reverse direction. Accepts both the
+/// raw `[` keycode and the shift-applied `{` since crossterm reports one
+/// or the other depending on terminal flavour.
+fn is_terminal_cycle_back_key(key: KeyEvent) -> bool {
+    let KeyCode::Char(c) = key.code else { return false };
+    if c != '[' && c != '{' {
         return false;
     }
     key.modifiers.contains(KeyModifiers::CONTROL) && key.modifiers.contains(KeyModifiers::SHIFT)
@@ -16678,6 +16713,45 @@ mod tests {
     }
 
     #[test]
+    fn split_terminal_inserts_to_the_right_of_the_active_terminal_not_at_the_end() {
+        // Open three terminals so the strip is [T0, T1, T2] with T2
+        // active. Focus T0 (the left-most), split. The new terminal must
+        // land at index 1 — immediately to the right of where the user
+        // was looking — and T1/T2 must shift right to indices 2 and 3,
+        // matching the user's mental model that a new pane appears next
+        // to the one they're working in, not at the far right edge.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.split_terminal().unwrap();
+        app.split_terminal().unwrap();
+        let pid_t0 = app.terminals[0].pid();
+        let pid_t1 = app.terminals[1].pid();
+        let pid_t2 = app.terminals[2].pid();
+        app.active_terminal = 0;
+        app.split_terminal().unwrap();
+        assert_eq!(app.terminals.len(), 4);
+        assert_eq!(
+            app.active_terminal, 1,
+            "a split from the left-most terminal must focus the new one at index 1, not at the far right"
+        );
+        assert_eq!(
+            app.terminals[0].pid(),
+            pid_t0,
+            "the originally-active terminal must keep its slot"
+        );
+        assert_eq!(
+            app.terminals[2].pid(),
+            pid_t1,
+            "the old neighbour to the right must shift one slot right, not stay put"
+        );
+        assert_eq!(
+            app.terminals[3].pid(),
+            pid_t2,
+            "the right-most terminal must shift to the new right edge"
+        );
+    }
+
+    #[test]
     fn close_active_terminal_drops_the_active_one() {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(tmp.path().to_path_buf()).unwrap();
@@ -16714,6 +16788,50 @@ mod tests {
         assert_eq!(app.active_terminal, 2);
         app.cycle_terminal();
         assert_eq!(app.active_terminal, 0);
+    }
+
+    #[test]
+    fn cycle_terminal_back_wraps_around_to_the_left() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.split_terminal().unwrap();
+        app.split_terminal().unwrap();
+        app.active_terminal = 0;
+        app.cycle_terminal_back();
+        assert_eq!(
+            app.active_terminal, 2,
+            "cycle-back from the left edge must wrap to the right-most slot"
+        );
+        app.cycle_terminal_back();
+        assert_eq!(app.active_terminal, 1);
+        app.cycle_terminal_back();
+        assert_eq!(app.active_terminal, 0);
+    }
+
+    #[test]
+    fn ctrl_shift_open_bracket_cycles_to_the_previous_terminal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.split_terminal().unwrap();
+        app.split_terminal().unwrap();
+        app.focus = Pane::Terminal;
+        app.active_terminal = 2;
+        app.handle_key(key(
+            KeyCode::Char('['),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ));
+        assert_eq!(
+            app.active_terminal, 1,
+            "Ctrl+Shift+[ must move focus one terminal to the left"
+        );
+        app.handle_key(key(
+            KeyCode::Char('{'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ));
+        assert_eq!(
+            app.active_terminal, 0,
+            "Ctrl+Shift+{{ (shift-applied codepoint) must also cycle back so the binding works under crossterm flavours that pre-apply the shift"
+        );
     }
 
     #[test]
