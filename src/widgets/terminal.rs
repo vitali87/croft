@@ -140,7 +140,8 @@ impl PtyTerminal {
         if rows == 0 || cols == 0 {
             return String::new();
         }
-        extract_selection_text(&term, 0, 0, rows - 1, cols - 1)
+        let display_offset = term.grid().display_offset();
+        extract_selection_text(&term, display_offset, 0, 0, rows - 1, cols - 1)
     }
 
     fn spawn_with(mut cmd: CommandBuilder, run_label: Option<String>) -> Result<Self> {
@@ -278,8 +279,9 @@ impl PtyTerminal {
     pub fn select_word_at(&mut self, col: u16, row: u16) {
         let Some((r, c)) = self.cell_at(col, row) else { return };
         let term = self.term.lock();
+        let display_offset = term.grid().display_offset();
         let Some((anchor, head)) =
-            select_word_at_in_term(&term, r as usize, c as usize)
+            select_word_at_in_term(&term, display_offset, r as usize, c as usize)
         else {
             return;
         };
@@ -295,7 +297,15 @@ impl PtyTerminal {
         let Some(sel) = self.selection else { return String::new() };
         let (sr, sc, er, ec) = sel.normalised();
         let term = self.term.lock();
-        extract_selection_text(&term, sr as usize, sc as usize, er as usize, ec as usize)
+        let display_offset = term.grid().display_offset();
+        extract_selection_text(
+            &term,
+            display_offset,
+            sr as usize,
+            sc as usize,
+            er as usize,
+            ec as usize,
+        )
     }
 
     pub fn write_input(&mut self, data: &[u8]) {
@@ -377,9 +387,20 @@ impl PtyTerminal {
 
 /// Walk the visible grid from (sr, sc) to (er, ec) inclusive, joining
 /// cell contents row-by-row, trimming trailing whitespace per row, and
-/// inserting `\n` between rows. Coordinates are viewport-relative.
+/// inserting `\n` between rows. Coordinates are viewport-relative;
+/// `display_offset` is the alacritty grid's current scrollback offset
+/// (number of rows the viewport has been scrolled back from the live
+/// bottom). The grid line we read is `row - display_offset`, which is
+/// negative when the user has scrolled into history — alacritty's
+/// `Grid::index<Point>` accepts those negative `Line` values and
+/// returns the scrollback cell, so the extracted text matches exactly
+/// what the user sees highlighted on screen. Without the subtraction
+/// the function silently re-reads the live grid at the viewport row,
+/// which is a different cell entirely once `display_offset > 0` and
+/// the user gets the wrong line on the clipboard.
 pub fn extract_selection_text(
     term: &Term<VoidListener>,
+    display_offset: usize,
     sr: usize,
     sc: usize,
     er: usize,
@@ -391,9 +412,10 @@ pub fn extract_selection_text(
     for row in sr..=er.min(rows.saturating_sub(1)) {
         let row_start = if row == sr { sc } else { 0 };
         let row_end = if row == er { ec.min(cols.saturating_sub(1)) } else { cols.saturating_sub(1) };
+        let line_idx = row as i32 - display_offset as i32;
         let mut line = String::new();
         for col in row_start..=row_end {
-            let p = Point::new(Line(row as i32), Column(col));
+            let p = Point::new(Line(line_idx), Column(col));
             let cell = &term.grid()[p];
             let c = cell.c;
             if c == '\0' {
@@ -413,14 +435,24 @@ pub fn extract_selection_text(
 
 /// Inspect a row of `term` around `(row, col)` (both viewport-relative)
 /// and return the anchor/head pair that brackets the contiguous run of
-/// word characters covering the pivot. Returns `None` when the pivot
-/// sits on a non-word character (whitespace, punctuation), so a double
-/// click between words is a no-op rather than a spurious selection.
-/// Word semantics match `widgets::editor::is_word_char`: alphanumeric +
-/// underscore. Pure function so the test suite can exercise it without
-/// spawning a PTY.
+/// word characters covering the pivot. `display_offset` is the
+/// alacritty grid's current scroll-back offset so the lookup
+/// `Line(row - display_offset)` resolves to the scrollback cell when
+/// the user has scrolled into history. Without this, a double-click
+/// on text the user sees on screen but lives in scrollback would read
+/// the live grid at the same viewport y, which is usually blank — so
+/// `is_terminal_word_char` returns false and the function returns
+/// `None`, giving the user-visible symptom "double-click doesn't
+/// auto-select."
+///
+/// Returns `None` when the pivot sits on a non-word character
+/// (whitespace, punctuation), so a double click between words is a
+/// no-op rather than a spurious selection. Word semantics match
+/// `widgets::editor::is_word_char`: alphanumeric + underscore. Pure
+/// function so the test suite can exercise it without spawning a PTY.
 pub fn select_word_at_in_term(
     term: &Term<VoidListener>,
+    display_offset: usize,
     row: usize,
     col: usize,
 ) -> Option<((u16, u16), (u16, u16))> {
@@ -428,7 +460,7 @@ pub fn select_word_at_in_term(
     if col >= cols {
         return None;
     }
-    let row_idx = row as i32;
+    let row_idx = row as i32 - display_offset as i32;
     let cell_char = |c: usize| -> char {
         let p = Point::new(Line(row_idx), Column(c));
         let ch = term.grid()[p].c;
@@ -934,7 +966,7 @@ mod tests {
     fn select_word_at_in_term_brackets_the_alphanumeric_run_around_the_pivot() {
         let mut t = fresh_term(40, 5);
         feed(&mut t, b"hello world from croft");
-        let got = select_word_at_in_term(&t, 0, 8);
+        let got = select_word_at_in_term(&t, 0, 0, 8);
         assert_eq!(got, Some(((0, 6), (0, 10))), "pivot inside 'world' must select cols 6..=10");
     }
 
@@ -943,7 +975,7 @@ mod tests {
         let mut t = fresh_term(40, 5);
         feed(&mut t, b"hello world");
         assert_eq!(
-            select_word_at_in_term(&t, 0, 5),
+            select_word_at_in_term(&t, 0, 0, 5),
             None,
             "pivot on the space between 'hello' and 'world' must yield no selection"
         );
@@ -954,14 +986,56 @@ mod tests {
         let mut t = fresh_term(40, 5);
         feed(&mut t, b"foo_bar.baz");
         assert_eq!(
-            select_word_at_in_term(&t, 0, 2),
+            select_word_at_in_term(&t, 0, 0, 2),
             Some(((0, 0), (0, 6))),
             "'foo_bar' is one word (underscore is a word char), '.baz' is separate"
         );
         assert_eq!(
-            select_word_at_in_term(&t, 0, 9),
+            select_word_at_in_term(&t, 0, 0, 9),
             Some(((0, 8), (0, 10))),
             "pivot inside 'baz' must select cols 8..=10"
+        );
+    }
+
+    /// Double-click on a word that lives in scrollback must still
+    /// word-select. Pre-fix, `select_word_at_in_term` ignored the
+    /// scrollback offset and read the live grid at the same viewport
+    /// row, which was usually blank — the lookup returned None and
+    /// the user saw "double-click doesn't auto-select."
+    #[test]
+    fn select_word_at_in_term_word_selects_in_scrollback_when_display_offset_is_nonzero() {
+        let mut t = fresh_term(20, 3);
+        // Push three lines into scrollback by feeding six rows into a
+        // three-row viewport.
+        feed(
+            &mut t,
+            b"scroll-A row\r\nscroll-B row\r\nscroll-C row\r\nlive-D row\r\nlive-E row\r\nlive-F row",
+        );
+        t.scroll_display(alacritty_terminal::grid::Scroll::Delta(2));
+        let display_offset = t.grid().display_offset();
+        assert_eq!(
+            display_offset, 2,
+            "precondition: Scroll::Delta(2) must move the viewport into scrollback"
+        );
+        // Viewport row 0 with display_offset=2 = grid Line(-2) =
+        // "scroll-B row". Pivot at column 2 sits inside "scroll-B".
+        let got = select_word_at_in_term(&t, display_offset, 0, 2);
+        assert!(
+            got.is_some(),
+            "double-click on a scrolled-back row must return a real anchor/head, not None - if this is None the user sees the double-click 'do nothing'"
+        );
+        let (anchor, head) = got.unwrap();
+        // "scroll-B" spans cols 0..=7 (s=0, c=1, r=2, o=3, l=4, l=5,
+        // -=… actually '-' is not a word char, so the word is
+        // "scroll" at cols 0..=5). The pivot is at col 2, which
+        // lives inside "scroll". The selection must cover that run.
+        assert_eq!(
+            anchor, (0, 0),
+            "anchor must mark the start of the word run on viewport row 0"
+        );
+        assert_eq!(
+            head, (0, 5),
+            "head must mark the last char of 'scroll' before the hyphen breaks the word run"
         );
     }
 
@@ -969,7 +1043,7 @@ mod tests {
     fn extract_selection_text_single_line() {
         let mut t = fresh_term(20, 5);
         feed(&mut t, b"hello world");
-        let txt = extract_selection_text(&t, 0, 6, 0, 10);
+        let txt = extract_selection_text(&t, 0, 0, 6, 0, 10);
         assert_eq!(txt, "world");
     }
 
@@ -977,8 +1051,75 @@ mod tests {
     fn extract_selection_text_multi_line_trims_trailing_spaces() {
         let mut t = fresh_term(20, 5);
         feed(&mut t, b"first line\r\nsecond line");
-        let txt = extract_selection_text(&t, 0, 6, 1, 5);
+        let txt = extract_selection_text(&t, 0, 0, 6, 1, 5);
         assert_eq!(txt, "line\nsecond");
+    }
+
+    /// User-visible regression: when the terminal is scrolled back into
+    /// history and the user selects a row in the scrollback, the
+    /// clipboard must contain that scrollback row, not whatever happens
+    /// to be at the same viewport y on the live grid. This is the bug
+    /// the user hit in production where selecting "useUploadArtifact is"
+    /// pasted "▎ 3000 and 2000 are u" and selecting a row from a
+    /// scrolled-back file:line marker pasted a different file:line —
+    /// `extract_selection_text` was reading `Line(viewport_row)`
+    /// regardless of `display_offset`, so once the user scrolled the
+    /// painted highlight and the extracted text diverged.
+    /// User-visible regression test: feed enough rows to a 3-row
+    /// viewport that the first three lines spill into scrollback, then
+    /// scroll the viewport back and confirm that
+    /// `extract_selection_text` returns the scrollback row the user
+    /// sees, not the live-grid row at the same viewport y.
+    #[test]
+    fn extract_selection_text_reads_scrollback_when_display_offset_is_nonzero() {
+        let mut t = fresh_term(20, 3);
+        // Six lines into a 3-row viewport. Each `\r\n` past the bottom
+        // pushes the topmost row into scrollback. End-state:
+        //   scrollback (oldest → newest): scroll-A, scroll-B, scroll-C
+        //   live (top → bottom):          live-D,   live-E,   live-F
+        // Cursor parks at the end of live-F, display_offset = 0.
+        feed(
+            &mut t,
+            b"scroll-A row\r\nscroll-B row\r\nscroll-C row\r\nlive-D row\r\nlive-E row\r\nlive-F row",
+        );
+
+        // Sanity-check the live screen before scrolling: viewport row 0
+        // is `live-D` because the three older rows already moved to
+        // scrollback.
+        let live_top_before = extract_selection_text(&t, 0, 0, 0, 0, 19);
+        assert_eq!(
+            live_top_before, "live-D row",
+            "precondition: with no scroll, viewport row 0 must read 'live-D row' from the live grid - if this fails the scrollback never filled, so the scrolled-back assertion below would prove nothing"
+        );
+
+        // Scroll the viewport up by 2 rows into history. The cells the
+        // user now sees at viewport y=0,1,2 correspond to scrollback
+        // lines −2, −1 and live line 0 respectively. (alacritty's
+        // `Scroll::Delta(n>0)` moves the viewport into history.)
+        t.scroll_display(alacritty_terminal::grid::Scroll::Delta(2));
+        let display_offset = t.grid().display_offset();
+        assert_eq!(
+            display_offset, 2,
+            "precondition: Scroll::Delta(2) must produce display_offset=2 once scrollback has at least two lines in it"
+        );
+
+        // With the fix in place: viewport row 0 + display_offset=2
+        // reads grid `Line(-2)`, the OLDER of the two scrollback rows
+        // currently shown — that's `scroll-B row`.
+        let scrollback = extract_selection_text(&t, display_offset, 0, 0, 0, 19);
+        assert_eq!(
+            scrollback, "scroll-B row",
+            "viewport row 0 with display_offset=2 must surface the scrollback row the user actually sees highlighted, NOT the live grid row at the same y - this is the non-negotiable invariant the user lost when selection_text forgot to subtract display_offset, and the symptom was selecting one terminal row and pasting the contents of a completely different row"
+        );
+
+        // Without the offset (the pre-fix behaviour), the same call
+        // would still report 'live-D row' because Line(0) names the
+        // live first line. We assert that by passing 0 explicitly:
+        let still_live = extract_selection_text(&t, 0, 0, 0, 0, 19);
+        assert_eq!(
+            still_live, "live-D row",
+            "passing display_offset=0 must still read the live grid - the function must be honest in BOTH directions so future callers (snapshot helpers, tests) can opt into either semantic without ambiguity"
+        );
     }
 }
 
