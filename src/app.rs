@@ -4143,7 +4143,7 @@ impl App {
         if is_editor_copy_key(key) {
             let text = self.search.selection_text();
             if !text.is_empty() {
-                write_osc52(&text);
+                copy_to_clipboard(&text);
                 self.status = format!("Copied {} chars to clipboard", text.chars().count());
             }
             return;
@@ -4151,7 +4151,7 @@ impl App {
         if is_editor_cut_key(key) {
             let text = self.search.selection_text();
             if !text.is_empty() {
-                write_osc52(&text);
+                copy_to_clipboard(&text);
                 let n = text.chars().count();
                 self.search.delete_selection();
                 self.submit_search_query();
@@ -5271,7 +5271,7 @@ impl App {
         if is_editor_kill_to_eol_key(key) {
             let killed = self.editor.kill_to_eol();
             if !killed.is_empty() {
-                write_osc52(&killed);
+                copy_to_clipboard(&killed);
                 self.status = format!("Killed {} chars", killed.chars().count());
             }
             return;
@@ -5279,7 +5279,7 @@ impl App {
         if is_editor_kill_to_bol_key(key) {
             let killed = self.editor.kill_to_bol();
             if !killed.is_empty() {
-                write_osc52(&killed);
+                copy_to_clipboard(&killed);
                 self.status = format!("Killed {} chars", killed.chars().count());
             }
             return;
@@ -5524,7 +5524,7 @@ impl App {
                     let n = count.max(1);
                     let yanked = self.editor.delete_lines(n);
                     if !yanked.is_empty() {
-                        write_osc52(&yanked);
+                        copy_to_clipboard(&yanked);
                     }
                     self.status = format!(
                         "Deleted {n} {}",
@@ -5535,7 +5535,7 @@ impl App {
                     let n = count.max(1);
                     let yanked = self.editor.yank_lines(n);
                     if !yanked.is_empty() {
-                        write_osc52(&yanked);
+                        copy_to_clipboard(&yanked);
                     }
                     self.status = format!(
                         "Yanked {n} {}",
@@ -5632,7 +5632,7 @@ impl App {
         if text.is_empty() {
             return;
         }
-        write_osc52(&text);
+        copy_to_clipboard(&text);
         self.status = format!("Copied {} chars to clipboard", text.chars().count());
     }
 
@@ -5645,7 +5645,7 @@ impl App {
         if text.is_empty() {
             return;
         }
-        write_osc52(&text);
+        copy_to_clipboard(&text);
         self.status = format!("Copied {} chars to clipboard", text.chars().count());
     }
 
@@ -5659,7 +5659,7 @@ impl App {
             self.editor.clear_selection();
             return;
         }
-        write_osc52(&text);
+        copy_to_clipboard(&text);
         let n = text.chars().count();
         self.editor.delete_selection();
         self.status = format!("Cut {n} chars to clipboard");
@@ -8974,15 +8974,37 @@ fn read_system_clipboard() -> Option<String> {
     crate::clipboard::read_string()
 }
 
-/// Send an OSC 52 sequence to put `text` on the host terminal's system
-/// clipboard. Best-effort; failures are silent because there's nothing
-/// useful the user could do about them.
-fn write_osc52(text: &str) {
+/// Copy `text` to the host system clipboard.
+///
+/// Order of attempts:
+///   1. **macOS native** — `clipboard::write_string` posts directly to
+///      `NSPasteboard.generalPasteboard` (with `pbcopy` as a process-level
+///      fall-back inside the same helper). This is the canonical Cocoa
+///      clipboard API and is the *only* path that survives every iTerm2
+///      configuration we have seen in the wild. OSC 52 is, empirically,
+///      silently dropped by iTerm2 in some setups even with
+///      `AllowClipboardAccess` enabled in `com.googlecode.iterm2` — and
+///      writing escape bytes directly to the alt-screen stdout always
+///      risks racing with the next ratatui frame.
+///   2. **OSC 52 fall-back** — only if the native write returned false
+///      (non-macOS croft binary on a Linux remote host, where the only
+///      hand-shake with the user's local terminal is via escape bytes
+///      through the SSH PTY). The fall-back is best-effort.
+///
+/// Returns true when the native path acknowledged the write so the call
+/// site can downgrade the status message if it ever needs to. Today all
+/// call sites discard the boolean; the return value is here so future
+/// code can branch on it.
+fn copy_to_clipboard(text: &str) -> bool {
+    if crate::clipboard::write_string(text) {
+        return true;
+    }
     use std::io::Write;
     let bytes = crate::widgets::terminal::osc52_copy_seq(text);
     let mut out = std::io::stdout();
     let _ = out.write_all(&bytes);
     let _ = out.flush();
+    false
 }
 
 /// Returns true if the given key event should copy the editor's current
@@ -10803,6 +10825,117 @@ mod tests {
         // Ctrl+C must remain SIGINT in the embedded shell; it must not be
         // intercepted as the croft copy gesture.
         assert!(!is_terminal_copy_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL)));
+    }
+
+    /// Cmd+C from the croft terminal pane must land the selection on the
+    /// real macOS clipboard. This is the user-visible regression test
+    /// for the long-standing "I copied from croft and pbpaste shows the
+    /// previous value" bug, where the old OSC 52 path was silently
+    /// dropped by the host terminal. The contract: writing through
+    /// `copy_to_clipboard` puts the text on the system pasteboard such
+    /// that `clipboard::read_string` (which is what Cmd+V uses) returns
+    /// the same bytes. If this ever fails again, copy/paste between
+    /// croft and other apps is broken and the test must catch it before
+    /// the binary ships.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn copy_to_clipboard_writes_text_to_the_macos_system_pasteboard() {
+        let _g = crate::clipboard::lock_clipboard_for_test();
+        let sentinel = format!(
+            "croft-copy-helper-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        let used_native = copy_to_clipboard(&sentinel);
+        assert!(
+            used_native,
+            "on macOS, copy_to_clipboard must succeed via NSPasteboard and return true so the call site can skip the OSC 52 fallback (and the host terminal's quirks can't silently drop the write)"
+        );
+        let got = crate::clipboard::read_string()
+            .expect("read_string must see what we just wrote");
+        assert_eq!(
+            got, sentinel,
+            "round-trip through the system pasteboard must be byte-exact - if this ever drifts, every Cmd+C from croft is silently lossy"
+        );
+    }
+
+    /// Tighter regression: a real `App` with a real `PtyTerminal`, a
+    /// terminal-pane selection, and `App::copy_terminal_selection` must
+    /// land the text on the macOS system clipboard. Exercises the full
+    /// wire from PTY bytes → alacritty grid → `selection_text` →
+    /// `copy_to_clipboard` → `NSPasteboard.setString:forType:` → what
+    /// `pbpaste` / `NSPasteboard.stringForType:` returns. A refactor
+    /// that reintroduces an OSC-52-only path in the terminal copy
+    /// handler would fail this test even if `copy_to_clipboard` itself
+    /// still resolved to the native path elsewhere.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn cmd_c_on_terminal_selection_lands_text_on_macos_clipboard() {
+        let _g = crate::clipboard::lock_clipboard_for_test();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+
+        // Render once so `terminal.last_inner` is populated and the
+        // `start_selection_at` / `extend_selection_to` chord can map
+        // viewport coordinates to cell coordinates the way the live
+        // input handler does on a real keystroke.
+        let backend = ratatui::backend::TestBackend::new(120, 40);
+        let mut term = ratatui::Terminal::new(backend).unwrap();
+        app.terminal_mut().focused = true;
+        term.draw(|f| app.render(f)).unwrap();
+
+        let probe = format!("croft-terminal-cmdc-{}", std::process::id());
+        app.terminal_mut()
+            .write_input(format!("printf '{probe}\\n'\r").as_bytes());
+
+        // Wait for the shell to push bytes through the PTY and the
+        // background reader thread to drain them into the grid.
+        let started = std::time::Instant::now();
+        while started.elapsed() < std::time::Duration::from_millis(3000) {
+            if app.terminal().visible_text().contains(&probe) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        // Re-render to refresh `last_inner` after the grid has grown.
+        term.draw(|f| app.render(f)).unwrap();
+
+        let snapshot = app.terminal().visible_text();
+        assert!(
+            snapshot.contains(&probe),
+            "shell must echo the probe within 3s; got:\n{snapshot}"
+        );
+
+        let row_idx = snapshot
+            .lines()
+            .position(|l| l.contains(&probe))
+            .expect("probe row must exist");
+        let line = snapshot.lines().nth(row_idx).unwrap();
+        let col_start = line.find(&probe).unwrap();
+        let col_end = col_start + probe.len() - 1;
+
+        let inner = app.terminal().last_inner;
+        let screen_y = inner.y + row_idx as u16;
+        let screen_x_a = inner.x + col_start as u16;
+        let screen_x_b = inner.x + col_end as u16;
+        app.terminal_mut().start_selection_at(screen_x_a, screen_y);
+        app.terminal_mut().extend_selection_to(screen_x_b, screen_y);
+        assert_eq!(
+            app.terminal().selection_text(),
+            probe,
+            "selection_text must reproduce the probe exactly so a Cmd+C copy is byte-faithful"
+        );
+
+        app.copy_terminal_selection();
+        let got = crate::clipboard::read_string()
+            .expect("read_string must surface what copy_terminal_selection just wrote");
+        assert_eq!(
+            got, probe,
+            "after a Cmd+C on a terminal selection, the system clipboard must contain the exact selection text - this is the non-negotiable round-trip the user relies on for every copy out of croft"
+        );
     }
 
     #[test]
