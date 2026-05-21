@@ -358,7 +358,7 @@ const NOISE_DIR_NAMES: &[&str] = &[
     ".DS_Store",
 ];
 
-fn is_noise_dir(name: &std::ffi::OsStr) -> bool {
+pub fn is_noise_dir(name: &std::ffi::OsStr) -> bool {
     name.to_str().is_some_and(|n| NOISE_DIR_NAMES.contains(&n))
 }
 

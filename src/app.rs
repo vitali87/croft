@@ -24,6 +24,7 @@ use std::time::Duration;
 
 use crate::widgets::{
     editor::{Editor, EditorTabs},
+    file_finder::is_noise_dir,
     file_tree::FileTree,
     remote::RemotePanel,
     run_debug::RunDebugPanel,
@@ -2001,30 +2002,43 @@ impl App {
         let mut debouncer = new_debouncer(Duration::from_millis(100), None, tx)
             .context("creating filesystem watcher")?;
         // notify_debouncer_full's FileIdMap walks `WalkDir(usize::MAX)` on
-        // watcher creation and `stat()`s every file. When the workspace is
-        // `$HOME`, that descent enters `~/Library/Containers/<bundle>/Data`
-        // and `~/Library/Group Containers/...`, which macOS Sonoma's
-        // App Management TCC class flags as "iTerm.app accessing data
-        // from other apps." Diagnostic-confirmed root cause; verified by
-        // disabling the watcher and watching the prompt stop.
+        // watcher creation and `stat()`s every file, then keeps a per-event
+        // FileId cache that does a memcmp lookup on every FSEvent. Two
+        // distinct problems land in the same split-watch fix:
         //
-        // Workaround: if any TCC-protected directory sits at the top level
-        // of the workspace, watch the root non-recursively and recursively-
-        // watch each safe sibling instead. Identical event coverage minus
-        // the protected subtrees.
+        // 1. TCC: a $HOME-rooted recursive walk descends into
+        //    ~/Library/Containers/<bundle>/Data and Group Containers,
+        //    which macOS Sonoma's App Management class flags as "iTerm.app
+        //    accessing data from other apps."
+        //
+        // 2. Noise-dir storms: `target/`, `node_modules/`, `.git/`, etc.
+        //    are written to thousands of times per cargo/npm/git
+        //    invocation. The debouncer's FileIdMap memcmp loop dominates
+        //    CPU during a build (≈60% of the FSEvents thread's samples,
+        //    confirmed by `sample` in 2026-05). Post-event filtering via
+        //    `is_path_under_noise_dir` runs AFTER the debouncer's
+        //    bookkeeping, so it doesn't help that hot path; the only fix
+        //    is to never subscribe to the subtree in the first place.
+        //    Same pattern Zed uses for gitignored dirs.
+        //
+        // Workaround: if any protected OR noise dir sits at the top level
+        // of the workspace, watch the root non-recursively and
+        // recursively-watch each safe sibling instead. Equivalent event
+        // coverage of source paths, minus the storm-generating subtrees.
         let entries: Vec<std::fs::DirEntry> = std::fs::read_dir(root)
             .map(|rd| rd.filter_map(Result::ok).collect())
             .unwrap_or_default();
-        let needs_split = entries
-            .iter()
-            .any(|e| FS_WATCH_PROTECTED_NAMES.iter().any(|n| e.file_name() == *n));
+        let is_skippable = |name: &std::ffi::OsStr| -> bool {
+            FS_WATCH_PROTECTED_NAMES.iter().any(|n| name == *n) || is_noise_dir(name)
+        };
+        let needs_split = entries.iter().any(|e| is_skippable(&e.file_name()));
         if needs_split {
             debouncer
                 .watch(root, RecursiveMode::NonRecursive)
                 .context("starting non-recursive watch on workspace root")?;
             for entry in entries {
                 let name = entry.file_name();
-                if FS_WATCH_PROTECTED_NAMES.iter().any(|n| name == *n) {
+                if is_skippable(&name) {
                     continue;
                 }
                 let path = entry.path();
@@ -5637,6 +5651,16 @@ impl App {
     }
 
     fn copy_editor_selection(&mut self) {
+        if let Some(diff) = self.editor.diff.as_ref() {
+            if let Some(text) = diff.selection_text() {
+                if !text.is_empty() {
+                    copy_to_clipboard(&text);
+                    self.status =
+                        format!("Copied {} chars to clipboard", text.chars().count());
+                }
+            }
+            return;
+        }
         let Some(sel) = self.editor.selection else { return };
         if !sel.has_area() {
             return;
@@ -5793,6 +5817,21 @@ impl App {
         if self.sidebar_view == SidebarView::Search && self.focus != Pane::Editor {
             self.search.insert_str_into_query(s);
             self.submit_search_query();
+            self.status = format!("Pasted {} chars", s.chars().count());
+            return;
+        }
+        // Source Control commit message box: bracketed paste must
+        // populate it the same way Cmd+V via the key path does
+        // (`handle_source_control_key` -> `source_control.insert_str`).
+        // Without this branch, in the production setup where iTerm2
+        // emits Cmd+V as a bracketed paste rather than a key event,
+        // the payload silently vanishes when the user has the SC
+        // sidebar focused.
+        if self.sidebar_view == SidebarView::SourceControl
+            && self.focus != Pane::Editor
+            && self.focus != Pane::Terminal
+        {
+            self.source_control.insert_str(s);
             self.status = format!("Pasted {} chars", s.chars().count());
             return;
         }
@@ -7240,6 +7279,40 @@ impl App {
                             self.jump_diff_change(true);
                             return;
                         }
+                        let now = std::time::Instant::now();
+                        let is_double = matches!(
+                            self.last_editor_left_down,
+                            Some((t, x, y))
+                                if m.row == y
+                                    && m.column.abs_diff(x) <= 1
+                                    && now.duration_since(t) <= DOUBLE_CLICK_WINDOW
+                        );
+                        let last_inner = self.editor.last_inner;
+                        if let Some(diff) = self.editor.diff.as_mut() {
+                            if let Some((side, row_idx, char_col)) =
+                                crate::widgets::editor::diff_hit_test(
+                                    diff,
+                                    last_inner,
+                                    m.column,
+                                    m.row,
+                                )
+                            {
+                                if is_double {
+                                    diff.select_word_at(side, row_idx, char_col);
+                                } else {
+                                    diff.start_selection(side, row_idx, char_col);
+                                }
+                            } else {
+                                diff.clear_selection();
+                            }
+                        }
+                        self.last_editor_left_down = if is_double {
+                            None
+                        } else {
+                            Some((now, m.column, m.row))
+                        };
+                        self.poke_cursor();
+                        return;
                     }
                     let now = std::time::Instant::now();
                     let is_double = matches!(
@@ -7334,6 +7407,23 @@ impl App {
                     }
                 }
                 if in_editor {
+                    if self.editor.diff.is_some() {
+                        let last_inner = self.editor.last_inner;
+                        if let Some(diff) = self.editor.diff.as_mut() {
+                            if let Some((_, row_idx, char_col)) =
+                                crate::widgets::editor::diff_hit_test(
+                                    diff,
+                                    last_inner,
+                                    m.column,
+                                    m.row,
+                                )
+                            {
+                                diff.extend_selection_to(row_idx, char_col);
+                            }
+                        }
+                        self.poke_cursor();
+                        return;
+                    }
                     self.editor.mouse_drag(m.column, m.row);
                     self.poke_cursor();
                 } else if in_tree {
@@ -8010,6 +8100,16 @@ impl App {
     }
 
     fn handle_diff_key(&mut self, key: KeyEvent) {
+        // Cmd+C / Ctrl+Shift+C on a diff selection: copy the dragged
+        // substring of whichever column the selection is anchored on.
+        // Must run BEFORE the scroll match below so the keystroke isn't
+        // dropped as "no scroll mapping". The general editor key handler
+        // short-circuits to this function when a diff is open, so without
+        // this branch Cmd+C in a diff view literally never copies.
+        if is_editor_copy_key(key) {
+            self.copy_editor_selection();
+            return;
+        }
         // Page = inner viewport rows minus the header + footer the diff
         // renderer reserves. Falls back to a sane default when the editor
         // hasn't laid out yet.
@@ -9840,6 +9940,83 @@ mod tests {
     }
 
     #[test]
+    fn fs_watcher_does_not_deliver_events_from_target_or_node_modules_subtrees() {
+        // Regression for the M4 CPU storm: when the workspace contains
+        // `target/` or `node_modules/` at the top level, the FSEvents
+        // thread used to spend ~60% of its samples inside
+        // notify_debouncer_full's FileIdMap memcmp loop processing cargo
+        // and npm writes that we then discarded post-event. The fix is to
+        // never subscribe to those subtrees in the first place (same
+        // split-watch pattern already used for Library/.Trash, extended
+        // to NOISE_DIR_NAMES). This test asserts the contract by writing
+        // a burst of files into `target/` and verifying the debouncer
+        // channel receives zero events for those paths, while writes
+        // under a normal sibling like `src/` still come through.
+        let tmp = tempfile::tempdir().unwrap();
+        let src_raw = tmp.path().join("src");
+        let target_raw = tmp.path().join("target");
+        let node_modules_raw = tmp.path().join("node_modules");
+        std::fs::create_dir(&src_raw).unwrap();
+        std::fs::create_dir(&target_raw).unwrap();
+        std::fs::create_dir(&node_modules_raw).unwrap();
+        let src = src_raw.canonicalize().unwrap();
+        let target = target_raw.canonicalize().unwrap();
+        let node_modules = node_modules_raw.canonicalize().unwrap();
+
+        let (_debouncer, rx) = App::spawn_fs_watcher(tmp.path())
+            .expect("watcher must start cleanly with noise dirs present");
+
+        for _ in 0..30 {
+            while rx.try_recv().is_ok() {}
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        for i in 0..50 {
+            std::fs::write(target.join(format!("cargo_{i}.o")), b"x").unwrap();
+            std::fs::write(node_modules.join(format!("pkg_{i}.js")), b"x").unwrap();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(400));
+
+        let mut noise_events: Vec<std::path::PathBuf> = Vec::new();
+        while let Ok(batch) = rx.try_recv() {
+            for ev in batch.unwrap_or_default() {
+                for path in &ev.event.paths {
+                    if path.starts_with(&target) || path.starts_with(&node_modules) {
+                        noise_events.push(path.clone());
+                    }
+                }
+            }
+        }
+        assert!(
+            noise_events.is_empty(),
+            "writes under target/ and node_modules/ must not produce debouncer events; got {noise_events:?}"
+        );
+
+        std::fs::write(src.join("a.rs"), b"fn main() {}").unwrap();
+        let started = std::time::Instant::now();
+        let mut signal_events: Vec<std::path::PathBuf> = Vec::new();
+        while started.elapsed() < std::time::Duration::from_millis(1500) {
+            while let Ok(batch) = rx.try_recv() {
+                for ev in batch.unwrap_or_default() {
+                    for path in &ev.event.paths {
+                        if path.starts_with(&src) {
+                            signal_events.push(path.clone());
+                        }
+                    }
+                }
+            }
+            if !signal_events.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            !signal_events.is_empty(),
+            "writes under src/ must still produce debouncer events after the noise-dir split"
+        );
+    }
+
+    #[test]
     fn drain_fs_events_returns_false_when_nothing_pending() {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(tmp.path().to_path_buf()).unwrap();
@@ -10939,6 +11116,174 @@ mod tests {
     }
 
     #[test]
+    fn cmd_c_on_side_by_side_diff_selection_lands_text_on_macos_clipboard() {
+        let _g = crate::clipboard::lock_clipboard_for_test();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        let f1 = tmp.path().join("a.txt");
+        let f2 = tmp.path().join("b.txt");
+        std::fs::write(&f1, "alpha\nbravo\ncharlie\n").unwrap();
+        std::fs::write(&f2, "alpha\nBRAVO\ncharlie\n").unwrap();
+        app.editor.open_diff(&f1, &f2).unwrap();
+        app.focus = Pane::Editor;
+        let backend = ratatui::backend::TestBackend::new(120, 30);
+        let mut term = ratatui::Terminal::new(backend).unwrap();
+        term.draw(|f| app.render(f)).unwrap();
+
+        let diff = app.editor.diff.as_ref().unwrap();
+        let l_gutter = (diff.left_lines.len() + 1).to_string().len() as u16 + 1;
+        let l_text_x = app.editor.last_inner.x + l_gutter + 2;
+        let body_top = app.editor.last_inner.y + 1;
+        // Row 1 in the diff (after the @@/header rows) holds "bravo" on the
+        // left. Click at col 0, drag to col 5 to select all five chars.
+        let click_y = body_top + 1;
+        app.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(MouseButton::Left),
+            column: l_text_x,
+            row: click_y,
+            modifiers: KeyModifiers::NONE,
+        });
+        app.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Drag(MouseButton::Left),
+            column: l_text_x + 5,
+            row: click_y,
+            modifiers: KeyModifiers::NONE,
+        });
+        let sel = app
+            .editor
+            .diff
+            .as_ref()
+            .unwrap()
+            .selection
+            .expect("drag must have produced a diff selection");
+        assert!(sel.has_area(), "drag must produce a non-zero-area selection");
+
+        // Drive the actual Cmd+C keystroke through handle_key. This is the
+        // path the live app takes when the user presses Cmd+C; the
+        // editor's main key handler short-circuits to handle_diff_key when
+        // a diff is open, so a copy keybinding must be wired explicitly
+        // INSIDE handle_diff_key. Without that branch, this assertion
+        // fails — which is exactly the regression the user just reported:
+        // selecting text in a diff and pressing Cmd+C did nothing,
+        // leaving stale test sentinels on the system clipboard for the
+        // next paste to surface.
+        app.handle_key(key(KeyCode::Char('c'), KeyModifiers::SUPER));
+        let got = crate::clipboard::read_string()
+            .expect("Cmd+C on a diff selection must put text on the clipboard");
+        assert_eq!(
+            got, "bravo",
+            "selecting cols 0..5 of the left column of row 1 and pressing Cmd+C must copy the exact left-side text via handle_diff_key's copy branch"
+        );
+    }
+
+    #[test]
+    fn double_click_in_diff_selects_word_and_cmd_c_copies_it() {
+        // End-to-end: two left-clicks in quick succession on a word in
+        // the left column must snap a word-bounded selection (same UX
+        // as VS Code / standard text editors), and the very next Cmd+C
+        // keystroke must put exactly that word on the clipboard.
+        let _g = crate::clipboard::lock_clipboard_for_test();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        let f1 = tmp.path().join("a.txt");
+        let f2 = tmp.path().join("b.txt");
+        std::fs::write(&f1, "alpha bravo charlie\nsecond\n").unwrap();
+        std::fs::write(&f2, "alpha BRAVO charlie\nsecond\n").unwrap();
+        app.editor.open_diff(&f1, &f2).unwrap();
+        app.focus = Pane::Editor;
+        let backend = ratatui::backend::TestBackend::new(120, 30);
+        let mut term = ratatui::Terminal::new(backend).unwrap();
+        term.draw(|f| app.render(f)).unwrap();
+
+        let diff = app.editor.diff.as_ref().unwrap();
+        let l_gutter = (diff.left_lines.len() + 1).to_string().len() as u16 + 1;
+        let l_text_x = app.editor.last_inner.x + l_gutter + 2;
+        let body_top = app.editor.last_inner.y + 1;
+        // "alpha bravo charlie" — "bravo" starts at char col 6.
+        let bravo_x = l_text_x + 8;
+        let click_y = body_top;
+        let first = crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(MouseButton::Left),
+            column: bravo_x,
+            row: click_y,
+            modifiers: KeyModifiers::NONE,
+        };
+        app.handle_mouse(first);
+        let second = crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(MouseButton::Left),
+            column: bravo_x,
+            row: click_y,
+            modifiers: KeyModifiers::NONE,
+        };
+        app.handle_mouse(second);
+        let sel = app
+            .editor
+            .diff
+            .as_ref()
+            .unwrap()
+            .selection
+            .expect("double-click must produce a word selection");
+        assert!(sel.has_area(), "word selection must span >0 chars");
+
+        app.handle_key(key(KeyCode::Char('c'), KeyModifiers::SUPER));
+        let got = crate::clipboard::read_string()
+            .expect("Cmd+C after double-click must put the word on the clipboard");
+        assert_eq!(
+            got, "bravo",
+            "double-click word selection + Cmd+C must copy exactly the clicked word"
+        );
+    }
+
+    #[test]
+    fn lock_clipboard_for_test_restores_prior_clipboard_text_on_drop() {
+        // Tests that hit the real NSPasteboard must never leave their
+        // sentinels behind. This test simulates a user already having
+        // text on the clipboard, runs a guarded section that writes a
+        // sentinel, drops the guard, and asserts the clipboard now
+        // reads back the simulated "user" text rather than the test
+        // sentinel.
+        //
+        // To avoid leaking the simulated text into the developer's real
+        // clipboard, capture the genuine pre-test contents first and
+        // restore them at the very end via a Drop guard so even a panic
+        // in the middle leaves the host clipboard untouched.
+        struct RestoreClip(Option<String>);
+        impl Drop for RestoreClip {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(s) => {
+                        crate::clipboard::macos::write_string_native(&s);
+                    }
+                    None => crate::clipboard::macos::clear_native(),
+                }
+            }
+        }
+        let _restore = RestoreClip(crate::clipboard::macos::read_string_native());
+
+        let pre = format!("user-preexisting-clip-{}", std::process::id());
+        crate::clipboard::macos::write_string_native(&pre);
+        {
+            let _g = crate::clipboard::lock_clipboard_for_test();
+            let sentinel = "test-sentinel-should-not-leak";
+            assert!(
+                crate::clipboard::write_string(sentinel),
+                "guard-held write must hit the real NSPasteboard"
+            );
+            assert_eq!(
+                crate::clipboard::read_string().as_deref(),
+                Some(sentinel),
+                "while the guard is held the test reads what it just wrote"
+            );
+        }
+        let after = crate::clipboard::macos::read_string_native();
+        assert_eq!(
+            after.as_deref(),
+            Some(pre.as_str()),
+            "dropping the guard MUST restore the pre-test clipboard so a cargo test run never leaves a test sentinel on the developer's system clipboard for the next paste to surface"
+        );
+    }
+
+    #[test]
     fn ctrl_j_is_recognized_as_terminal_toggle() {
         assert!(is_terminal_toggle_key(key(KeyCode::Char('j'), KeyModifiers::CONTROL)));
     }
@@ -11001,6 +11346,548 @@ mod tests {
         );
         app.handle_key(chord).unwrap();
         assert!(!app.terminal_maximized, "second chord restores split");
+    }
+
+    /// User-visible regression: with the terminal maximised via
+    /// Ctrl+Shift+J, a mouse drag inside the (now fullscreen) terminal
+    /// pane must reach `PtyTerminal::extend_selection_to` so the user
+    /// can highlight terminal text. Before this fix `EditorTabs::render`
+    /// returned early on `area.height == 0` without zeroing the active
+    /// editor's `last_area`, so `handle_mouse`'s `in_editor` hit-test
+    /// (`rect_contains(self.editor.last_area, ...)`) still matched the
+    /// pre-maximise rectangle and the dispatch at app.rs:7229 / 7336
+    /// routed the click into `editor.mouse_down` / `editor.mouse_drag`.
+    /// The user saw the file caret jump instead of a selection
+    /// appearing in the terminal — symptom: "the cursor is jumping up
+    /// and down as I go back and forth."
+    #[test]
+    fn maximised_terminal_owns_mouse_drag_for_selection_not_the_collapsed_editor() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Seed a real file and open it so the editor actually claims a
+        // non-empty rectangle on the first render (the blank-initial
+        // branch zeroes `last_area.height` to skip welcome-pane
+        // overdraw, which would mask the bug we're probing).
+        let f = tmp.path().join("probe.txt");
+        std::fs::write(&f, "alpha\nbeta\ngamma\n").unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.editor.open_pinned(&f).unwrap();
+
+        // Render once in split layout so the editor's `last_area` ends
+        // up pointing at the right-hand pane — the exact stale
+        // rectangle the bug would later read from.
+        let backend = ratatui::backend::TestBackend::new(120, 40);
+        let mut term = ratatui::Terminal::new(backend).unwrap();
+        term.draw(|f| app.render(f)).unwrap();
+        let editor_area_before_maximise = app.editor.last_area;
+        assert!(
+            editor_area_before_maximise.width > 0
+                && editor_area_before_maximise.height > 0,
+            "precondition: in split layout with an open file the editor must claim a real rectangle, otherwise the bug we're testing for can't manifest"
+        );
+
+        // Trigger the maximize chord.
+        let chord = key(
+            KeyCode::Char('J'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        );
+        app.handle_key(chord).unwrap();
+        assert!(app.terminal_maximized);
+
+        // Re-render in the maximised layout — this is the frame that
+        // used to leave `editor.last_area` stale.
+        term.draw(|f| app.render(f)).unwrap();
+        assert_eq!(
+            app.editor.last_area.height, 0,
+            "after maximise, the editor's hit-test rectangle must have height 0 so `in_editor` cannot match a click that lands on the maximised terminal"
+        );
+
+        // Drive a real Left-Drag through the production key/mouse
+        // dispatch: anywhere inside the maximised terminal pane. With
+        // the fix in place the drag must end up extending the terminal
+        // selection, not poking the editor caret.
+        let term_area = app.terminal().last_area;
+        assert!(
+            term_area.width > 4 && term_area.height > 4,
+            "precondition: the maximised terminal must own a real rect for the drag to land in"
+        );
+        let click_col = term_area.x + 2;
+        let click_row = term_area.y + 2;
+        let drag_col = click_col + 5;
+        let drag_row = click_row;
+        app.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: click_col,
+            row: click_row,
+            modifiers: KeyModifiers::NONE,
+        });
+        app.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+            column: drag_col,
+            row: drag_row,
+            modifiers: KeyModifiers::NONE,
+        });
+        let sel = app.terminal().selection();
+        assert!(
+            sel.is_some_and(|s| s.has_area()),
+            "drag inside the maximised terminal must seed a non-empty selection on the PtyTerminal - if this is None or zero-area the click was eaten by the stale editor hit-test"
+        );
+    }
+
+    /// Cross-pane paste matrix. In production, Cmd+V on macOS does NOT
+    /// arrive as a key event — `setup-iterm2` deliberately leaves Cmd+V
+    /// unbound (src/iterm2.rs:225-235) so iTerm2's native Paste action
+    /// fires and emits a bracketed-paste sequence carrying the OS
+    /// clipboard into the PTY. crossterm surfaces that as
+    /// `Event::Paste(s)`, dispatched by `main_loop` to
+    /// `App::handle_paste(&s)` (src/app.rs:17131).
+    ///
+    /// This matrix therefore drives `handle_paste` directly with the
+    /// payload that iTerm2 would have delivered. Every destination
+    /// (editor, editor-find, search query, file-finder query,
+    /// terminal, source-control commit box) must consume the payload
+    /// in BOTH terminal layouts (split + maximised). If a case
+    /// silently fails here, that's the exact production symptom the
+    /// user described: "I copied from one place, pasted in another,
+    /// nothing happened."
+    #[test]
+    fn cross_pane_paste_via_bracketed_paste_works_in_every_destination_and_terminal_layout() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        fn seed_app() -> (tempfile::TempDir, App) {
+            let tmp = tempfile::tempdir().unwrap();
+            let f = tmp.path().join("probe.txt");
+            std::fs::write(&f, "alpha\nbeta\ngamma\n").unwrap();
+            let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+            app.editor.open_pinned(&f).unwrap();
+            (tmp, app)
+        }
+
+        fn render(app: &mut App) -> ratatui::Terminal<ratatui::backend::TestBackend> {
+            let backend = ratatui::backend::TestBackend::new(140, 50);
+            let mut term = ratatui::Terminal::new(backend).unwrap();
+            term.draw(|f| app.render(f)).unwrap();
+            term
+        }
+
+        // Drive a bracketed paste from a non-path token, which is what
+        // iTerm2 emits when the user presses Cmd+V with terminal text
+        // on the clipboard. Non-path so the drop-handler branches in
+        // handle_paste don't divert us into "import into Explorer / scp
+        // to Remote / fetch via drop-relay".
+        let payload_editor_split = "clip-into-editor-split";
+        let payload_editor_max = "clip-into-editor-maximised";
+        let payload_find_split = "clip-into-find-split";
+        let payload_find_max = "clip-into-find-maximised";
+        let payload_search_split = "clip-into-search-split";
+        let payload_search_max = "clip-into-search-maximised";
+        let payload_finder = "clip-into-file-finder";
+        let payload_sc = "clip-into-source-control";
+
+        // -- Case 1: paste into the editor while terminal is split.
+        {
+            let (_tmp, mut app) = seed_app();
+            let _draw = render(&mut app);
+            app.focus_pane(Pane::Editor);
+            app.handle_paste(payload_editor_split);
+            assert!(
+                app.editor.lines.iter().any(|l| l.contains(payload_editor_split)),
+                "bracketed paste with editor focus + terminal split must insert into the editor buffer; lines={:?}",
+                app.editor.lines
+            );
+        }
+
+        // -- Case 2: paste into the editor while terminal is maximised.
+        {
+            let (_tmp, mut app) = seed_app();
+            let _draw = render(&mut app);
+            app.toggle_terminal_maximize();
+            let _draw = render(&mut app);
+            app.focus_pane(Pane::Editor);
+            app.handle_paste(payload_editor_max);
+            assert!(
+                app.editor.lines.iter().any(|l| l.contains(payload_editor_max)),
+                "bracketed paste with editor focus + terminal maximised must still insert into the editor; lines={:?}",
+                app.editor.lines
+            );
+        }
+
+        // -- Case 3: paste into the editor-find bar while terminal is
+        //    split. The user explicitly named this as broken.
+        {
+            let (_tmp, mut app) = seed_app();
+            let _draw = render(&mut app);
+            app.focus_pane(Pane::Editor);
+            app.open_editor_find();
+            app.handle_paste(payload_find_split);
+            let q = app
+                .editor_find
+                .as_ref()
+                .map(|s| s.query.clone())
+                .unwrap_or_default();
+            assert!(
+                q.contains(payload_find_split),
+                "bracketed paste with editor-find open + terminal split must append to the query; query={q:?}"
+            );
+        }
+
+        // -- Case 4: paste into the editor-find bar while terminal is
+        //    maximised.
+        {
+            let (_tmp, mut app) = seed_app();
+            let _draw = render(&mut app);
+            app.toggle_terminal_maximize();
+            let _draw = render(&mut app);
+            app.focus_pane(Pane::Editor);
+            app.open_editor_find();
+            app.handle_paste(payload_find_max);
+            let q = app
+                .editor_find
+                .as_ref()
+                .map(|s| s.query.clone())
+                .unwrap_or_default();
+            assert!(
+                q.contains(payload_find_max),
+                "bracketed paste with editor-find open + terminal maximised must append to the query - this is the path the user named explicitly; query={q:?}"
+            );
+        }
+
+        // -- Case 5: paste into the Search sidebar query while
+        //    terminal is split.
+        {
+            let (_tmp, mut app) = seed_app();
+            let _draw = render(&mut app);
+            app.set_sidebar_view(SidebarView::Search);
+            let _draw = render(&mut app);
+            app.handle_paste(payload_search_split);
+            assert!(
+                app.search.query.contains(payload_search_split),
+                "bracketed paste in Search sidebar + terminal split must append to the search query; query={:?}",
+                app.search.query
+            );
+        }
+
+        // -- Case 6: paste into Search sidebar while terminal is
+        //    maximised. The user explicitly named the split layout as
+        //    failing while maximised worked; both must succeed.
+        {
+            let (_tmp, mut app) = seed_app();
+            let _draw = render(&mut app);
+            app.toggle_terminal_maximize();
+            let _draw = render(&mut app);
+            app.set_sidebar_view(SidebarView::Search);
+            let _draw = render(&mut app);
+            app.handle_paste(payload_search_max);
+            assert!(
+                app.search.query.contains(payload_search_max),
+                "bracketed paste in Search sidebar + terminal maximised must also append; query={:?}",
+                app.search.query
+            );
+        }
+
+        // -- Case 7: paste into the embedded terminal while it is
+        //    split. The terminal pane consumes the bracketed paste by
+        //    writing the bytes back into the PTY.
+        {
+            let (_tmp, mut app) = seed_app();
+            let _draw = render(&mut app);
+            app.focus_pane(Pane::Terminal);
+            // No panic + handler completes is enough. Verifying the
+            // PTY received the bytes requires polling the shell which
+            // is too timing-fragile for CI.
+            app.handle_paste("clip-into-terminal-split");
+        }
+
+        // -- Case 8: paste into the embedded terminal while
+        //    maximised.
+        {
+            let (_tmp, mut app) = seed_app();
+            let _draw = render(&mut app);
+            app.toggle_terminal_maximize();
+            let _draw = render(&mut app);
+            app.focus_pane(Pane::Terminal);
+            app.handle_paste("clip-into-terminal-maximised");
+        }
+
+        // -- Case 9: paste into the Source Control commit message
+        //    box while terminal split. NOTE: at the time of writing,
+        //    handle_paste has no SourceControl branch — this case
+        //    will FAIL until handle_paste learns to route into the
+        //    commit message when sidebar_view == SourceControl.
+        {
+            let (_tmp, mut app) = seed_app();
+            let _draw = render(&mut app);
+            app.set_sidebar_view(SidebarView::SourceControl);
+            let _draw = render(&mut app);
+            app.handle_paste(payload_sc);
+            assert!(
+                app.source_control.message.contains(payload_sc),
+                "bracketed paste in the Source Control commit box must append the clipboard; got: {:?}",
+                app.source_control.message
+            );
+        }
+
+        // -- Case 10: paste into the file-finder (Cmd+P quick-open).
+        {
+            let (_tmp, mut app) = seed_app();
+            let _draw = render(&mut app);
+            app.open_file_finder();
+            app.handle_paste(payload_finder);
+            let q = app
+                .file_finder
+                .as_ref()
+                .map(|f| f.query.clone())
+                .unwrap_or_default();
+            assert!(
+                q.contains(payload_finder),
+                "bracketed paste in the file finder (Cmd+P) must append to the query; query={q:?}"
+            );
+        }
+    }
+
+    /// Double-clicking a word in the terminal pane must word-select
+    /// in BOTH terminal layouts. The user reported that double-click
+    /// "doesn't auto-select" in some state. The detection logic in
+    /// `handle_mouse` keys off `last_terminal_left_down` + window;
+    /// the test sends two consecutive Down events on the same cell
+    /// within DOUBLE_CLICK_WINDOW and asserts a non-empty word
+    /// selection appears.
+    #[test]
+    fn double_click_in_terminal_word_selects_in_split_and_maximised_layout() {
+        for maximise in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+            let backend = ratatui::backend::TestBackend::new(140, 50);
+            let mut term = ratatui::Terminal::new(backend).unwrap();
+            term.draw(|f| app.render(f)).unwrap();
+            if maximise {
+                app.toggle_terminal_maximize();
+                term.draw(|f| app.render(f)).unwrap();
+            }
+            app.focus_pane(Pane::Terminal);
+            let probe = format!("croft-dclick-{}", std::process::id());
+            app.terminal_mut()
+                .write_input(format!("printf '{probe}\\n'\r").as_bytes());
+            let started = std::time::Instant::now();
+            while started.elapsed() < std::time::Duration::from_millis(3000) {
+                if app.terminal().visible_text().contains(&probe) {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            term.draw(|f| app.render(f)).unwrap();
+            let snap = app.terminal().visible_text();
+            let row_idx = snap
+                .lines()
+                .position(|l| l.contains(&probe))
+                .expect("probe must render");
+            let line = snap.lines().nth(row_idx).unwrap();
+            let mid_col = line.find(&probe).unwrap() + probe.len() / 2;
+            let inner = app.terminal().last_inner;
+            let screen_y = inner.y + row_idx as u16;
+            let screen_x = inner.x + mid_col as u16;
+
+            // Two clicks within the DOUBLE_CLICK_WINDOW on the same
+            // cell — same path a real macOS double-click takes.
+            for _ in 0..2 {
+                app.handle_mouse(crossterm::event::MouseEvent {
+                    kind: crossterm::event::MouseEventKind::Down(
+                        crossterm::event::MouseButton::Left,
+                    ),
+                    column: screen_x,
+                    row: screen_y,
+                    modifiers: KeyModifiers::NONE,
+                });
+            }
+
+            let sel_text = app.terminal().selection_text();
+            assert!(
+                sel_text.contains(&probe) || probe.contains(&sel_text),
+                "double-click on the middle of the probe word must word-select the run that contains it in {} layout; got selection={sel_text:?}",
+                if maximise { "maximised" } else { "split" }
+            );
+        }
+    }
+
+    /// End-to-end variant of the matrix that exercises the user's
+    /// exact gesture chain: text on screen in the embedded terminal →
+    /// real Cmd+C through the terminal pane handler → switch to the
+    /// destination pane → paste. The clipboard is the per-thread mock
+    /// (see `crate::clipboard::test_clip`) so both ends ride the same
+    /// transport every croft Cmd+C / Cmd+V hits in production. Every
+    /// pair below must succeed in BOTH terminal layouts because the
+    /// user explicitly demands identical behaviour ("the terminal
+    /// size should not matter").
+    #[test]
+    fn terminal_copy_paste_into_other_panes_works_in_split_and_maximised_layout() {
+        // Seed a PtyTerminal grid with a known string, set a selection
+        // over it, and trigger the production Cmd+C path so the mock
+        // clipboard ends up with the payload. Returns the payload that
+        // landed on the clipboard.
+        fn copy_terminal_word(app: &mut App) -> String {
+            let probe = format!("croft-e2e-{}", std::process::id());
+            app.terminal_mut()
+                .write_input(format!("printf '{probe}\\n'\r").as_bytes());
+            let started = std::time::Instant::now();
+            while started.elapsed() < std::time::Duration::from_millis(3000) {
+                if app.terminal().visible_text().contains(&probe) {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            let snap = app.terminal().visible_text();
+            let row_idx = snap.lines().position(|l| l.contains(&probe)).unwrap();
+            let line = snap.lines().nth(row_idx).unwrap();
+            let col_start = line.find(&probe).unwrap();
+            let col_end = col_start + probe.len() - 1;
+            let inner = app.terminal().last_inner;
+            let screen_y = inner.y + row_idx as u16;
+            let screen_x_a = inner.x + col_start as u16;
+            let screen_x_b = inner.x + col_end as u16;
+            app.terminal_mut().start_selection_at(screen_x_a, screen_y);
+            app.terminal_mut().extend_selection_to(screen_x_b, screen_y);
+            assert_eq!(
+                app.terminal().selection_text(),
+                probe,
+                "terminal selection_text must reproduce the probe before we copy"
+            );
+            app.copy_terminal_selection();
+            probe
+        }
+
+        // Drive every destination/layout pair. The clipboard lives on
+        // the test thread, so cross-pane wiring is the only thing
+        // that can fail here.
+        let layouts: &[bool] = &[false, true]; // false = split, true = maximised
+        for &maximise in layouts {
+            // ---- Destination: Search sidebar ----
+            {
+                let _g = crate::clipboard::lock_clipboard_for_test();
+                let tmp = tempfile::tempdir().unwrap();
+                let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+                let backend = ratatui::backend::TestBackend::new(140, 50);
+                let mut term = ratatui::Terminal::new(backend).unwrap();
+                term.draw(|f| app.render(f)).unwrap();
+                if maximise {
+                    app.toggle_terminal_maximize();
+                    term.draw(|f| app.render(f)).unwrap();
+                }
+                app.focus_pane(Pane::Terminal);
+                let probe = copy_terminal_word(&mut app);
+                // Switch to Search like a real user would (Cmd+Shift+F
+                // through the production key path).
+                let cmd_shift_f = key(
+                    KeyCode::Char('F'),
+                    KeyModifiers::SUPER | KeyModifiers::SHIFT,
+                );
+                app.handle_key(cmd_shift_f).unwrap();
+                term.draw(|f| app.render(f)).unwrap();
+                // Simulate the bracketed paste iTerm2 would send on
+                // Cmd+V (production path with setup-iterm2 applied).
+                let clip = crate::clipboard::read_string()
+                    .expect("clipboard must hold what copy_terminal_selection just wrote");
+                assert_eq!(clip, probe);
+                app.handle_paste(&clip);
+                assert!(
+                    app.search.query.contains(&probe),
+                    "terminal copy -> Search paste must work in {} layout; got query={:?}",
+                    if maximise { "maximised" } else { "split" },
+                    app.search.query
+                );
+            }
+
+            // ---- Destination: editor-find ----
+            {
+                let _g = crate::clipboard::lock_clipboard_for_test();
+                let tmp = tempfile::tempdir().unwrap();
+                let f = tmp.path().join("probe.txt");
+                std::fs::write(&f, "alpha\nbeta\ngamma\n").unwrap();
+                let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+                app.editor.open_pinned(&f).unwrap();
+                let backend = ratatui::backend::TestBackend::new(140, 50);
+                let mut term = ratatui::Terminal::new(backend).unwrap();
+                term.draw(|f| app.render(f)).unwrap();
+                if maximise {
+                    app.toggle_terminal_maximize();
+                    term.draw(|f| app.render(f)).unwrap();
+                }
+                app.focus_pane(Pane::Terminal);
+                let probe = copy_terminal_word(&mut app);
+                // Switch back to editor + open find.
+                app.focus_pane(Pane::Editor);
+                app.open_editor_find();
+                term.draw(|f| app.render(f)).unwrap();
+                let clip = crate::clipboard::read_string().unwrap();
+                assert_eq!(clip, probe);
+                app.handle_paste(&clip);
+                let q = app
+                    .editor_find
+                    .as_ref()
+                    .map(|s| s.query.clone())
+                    .unwrap_or_default();
+                assert!(
+                    q.contains(&probe),
+                    "terminal copy -> editor-find paste must work in {} layout; got query={q:?}",
+                    if maximise { "maximised" } else { "split" }
+                );
+            }
+
+            // ---- Destination: editor body ----
+            {
+                let _g = crate::clipboard::lock_clipboard_for_test();
+                let tmp = tempfile::tempdir().unwrap();
+                let f = tmp.path().join("probe.txt");
+                std::fs::write(&f, "alpha\nbeta\ngamma\n").unwrap();
+                let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+                app.editor.open_pinned(&f).unwrap();
+                let backend = ratatui::backend::TestBackend::new(140, 50);
+                let mut term = ratatui::Terminal::new(backend).unwrap();
+                term.draw(|f| app.render(f)).unwrap();
+                if maximise {
+                    app.toggle_terminal_maximize();
+                    term.draw(|f| app.render(f)).unwrap();
+                }
+                app.focus_pane(Pane::Terminal);
+                let probe = copy_terminal_word(&mut app);
+                app.focus_pane(Pane::Editor);
+                term.draw(|f| app.render(f)).unwrap();
+                let clip = crate::clipboard::read_string().unwrap();
+                assert_eq!(clip, probe);
+                app.handle_paste(&clip);
+                assert!(
+                    app.editor.lines.iter().any(|l| l.contains(&probe)),
+                    "terminal copy -> editor body paste must work in {} layout; lines={:?}",
+                    if maximise { "maximised" } else { "split" },
+                    app.editor.lines
+                );
+            }
+
+            // ---- Destination: source-control commit box ----
+            {
+                let _g = crate::clipboard::lock_clipboard_for_test();
+                let tmp = tempfile::tempdir().unwrap();
+                let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+                let backend = ratatui::backend::TestBackend::new(140, 50);
+                let mut term = ratatui::Terminal::new(backend).unwrap();
+                term.draw(|f| app.render(f)).unwrap();
+                if maximise {
+                    app.toggle_terminal_maximize();
+                    term.draw(|f| app.render(f)).unwrap();
+                }
+                app.focus_pane(Pane::Terminal);
+                let probe = copy_terminal_word(&mut app);
+                app.set_sidebar_view(SidebarView::SourceControl);
+                term.draw(|f| app.render(f)).unwrap();
+                let clip = crate::clipboard::read_string().unwrap();
+                assert_eq!(clip, probe);
+                app.handle_paste(&clip);
+                assert!(
+                    app.source_control.message.contains(&probe),
+                    "terminal copy -> Source Control paste must work in {} layout; msg={:?}",
+                    if maximise { "maximised" } else { "split" },
+                    app.source_control.message
+                );
+            }
+        }
     }
 
     #[test]

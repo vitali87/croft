@@ -96,7 +96,7 @@ fn write_pbcopy(text: &str) -> bool {
 }
 
 #[cfg(target_os = "macos")]
-mod macos {
+pub(crate) mod macos {
     use std::ffi::CStr;
     use std::os::raw::{c_char, c_void};
 
@@ -226,6 +226,38 @@ mod macos {
         }
     }
 
+    /// Wipe NSPasteboard's contents. Used by the test guard's drop path
+    /// to wipe a leftover test sentinel when no prior clipboard text was
+    /// snapshotted at acquire-time.
+    #[cfg(test)]
+    pub fn clear_native() {
+        unsafe {
+            let pool = objc_autoreleasePoolPush();
+            clear_inner();
+            objc_autoreleasePoolPop(pool);
+        }
+    }
+
+    #[cfg(test)]
+    unsafe fn clear_inner() {
+        unsafe {
+            let Some(pb_class) = class(b"NSPasteboard\0") else {
+                return;
+            };
+            let Some(general_sel) = sel(b"generalPasteboard\0") else {
+                return;
+            };
+            let pasteboard = msg_send_id(pb_class, general_sel);
+            if pasteboard.is_null() {
+                return;
+            }
+            let Some(clear_sel) = sel(b"clearContents\0") else {
+                return;
+            };
+            let _ = msg_send_isize(pasteboard, clear_sel);
+        }
+    }
+
     unsafe fn write_string_inner(text: &str) -> bool {
         unsafe {
             let Some(pb_class) = class(b"NSPasteboard\0") else {
@@ -343,20 +375,44 @@ pub(crate) mod test_clip {
     /// current thread's `write_string` / `read_string` calls bypass the
     /// per-thread mock and exercise the real macOS pasteboard, and no
     /// other thread can hold the lock concurrently.
+    ///
+    /// On macOS the guard also snapshots the system clipboard at
+    /// acquire-time and restores it on drop, so a `cargo test` run never
+    /// leaves a test sentinel (e.g. `croft-terminal-cmdc-<pid>`) sitting
+    /// on the developer's real clipboard for the next paste to surface.
     pub(crate) struct ClipboardTestGuard {
         _mutex: MutexGuard<'static, ()>,
+        #[cfg(target_os = "macos")]
+        snapshot: Option<String>,
     }
 
     impl ClipboardTestGuard {
         pub(crate) fn acquire() -> Self {
             let mutex = CLIP_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+            #[cfg(target_os = "macos")]
+            let snapshot = super::macos::read_string_native();
             REAL_OPT_IN.with(|c| c.set(true));
-            Self { _mutex: mutex }
+            Self {
+                _mutex: mutex,
+                #[cfg(target_os = "macos")]
+                snapshot,
+            }
         }
     }
 
     impl Drop for ClipboardTestGuard {
         fn drop(&mut self) {
+            #[cfg(target_os = "macos")]
+            {
+                match self.snapshot.take() {
+                    Some(prev) => {
+                        let _ = super::macos::write_string_native(&prev);
+                    }
+                    None => {
+                        super::macos::clear_native();
+                    }
+                }
+            }
             REAL_OPT_IN.with(|c| c.set(false));
         }
     }

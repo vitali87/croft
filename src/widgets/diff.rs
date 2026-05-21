@@ -28,6 +28,43 @@ pub struct DiffData {
     /// a `-` sign and a red band — visually identical to `git diff` for a
     /// removed file.
     pub unified: bool,
+    /// Active drag-select on one of the two columns. None when no
+    /// selection is in flight; anchor==head is a zero-area selection
+    /// (just a click). Side stays fixed for the lifetime of the
+    /// selection so dragging across the seam doesn't flip sides
+    /// mid-stream.
+    pub selection: Option<DiffSelection>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DiffSide {
+    Left,
+    Right,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DiffSelection {
+    pub side: DiffSide,
+    pub anchor_row: usize,
+    pub anchor_col: usize,
+    pub head_row: usize,
+    pub head_col: usize,
+}
+
+impl DiffSelection {
+    pub fn has_area(&self) -> bool {
+        !(self.anchor_row == self.head_row && self.anchor_col == self.head_col)
+    }
+
+    pub fn normalized(&self) -> ((usize, usize), (usize, usize)) {
+        let a = (self.anchor_row, self.anchor_col);
+        let h = (self.head_row, self.head_col);
+        if a <= h { (a, h) } else { (h, a) }
+    }
+}
+
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
 }
 
 /// One visual row in a side-by-side diff view. The left column shows
@@ -86,6 +123,7 @@ impl DiffData {
             scroll_x: 0,
             bytes_differ_but_lines_equal,
             unified: false,
+            selection: None,
         }
     }
 
@@ -108,6 +146,7 @@ impl DiffData {
             scroll_x: 0,
             bytes_differ_but_lines_equal: false,
             unified: true,
+            selection: None,
         }
     }
 
@@ -149,6 +188,7 @@ impl DiffData {
                 scroll_x: 0,
                 bytes_differ_but_lines_equal: false,
                 unified: false,
+                selection: None,
             };
         }
         let mut pending_remove: Vec<usize> = Vec::new();
@@ -224,7 +264,151 @@ impl DiffData {
             scroll_x: 0,
             bytes_differ_but_lines_equal: false,
             unified: false,
+            selection: None,
         }
+    }
+
+    pub fn start_selection(&mut self, side: DiffSide, row: usize, col: usize) {
+        let row = row.min(self.rows.len().saturating_sub(1));
+        self.selection = Some(DiffSelection {
+            side,
+            anchor_row: row,
+            anchor_col: col,
+            head_row: row,
+            head_col: col,
+        });
+    }
+
+    pub fn extend_selection_to(&mut self, row: usize, col: usize) {
+        if let Some(sel) = self.selection.as_mut() {
+            sel.head_row = row.min(self.rows.len().saturating_sub(1));
+            sel.head_col = col;
+        }
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.selection = None;
+    }
+
+    /// Double-click word selection. Snaps the selection to the word
+    /// boundaries containing `col` on the source line that backs
+    /// `row` on the chosen side. Same word-boundary semantics as the
+    /// regular text editor: a "word" is a maximal run of
+    /// alphanumeric-or-underscore characters. A click on whitespace
+    /// or punctuation clears the selection and returns without anchoring
+    /// anything, matching VS Code / standard text-editor behaviour.
+    pub fn select_word_at(&mut self, side: DiffSide, row: usize, col: usize) {
+        let Some(row_data) = self.rows.get(row).copied() else {
+            self.selection = None;
+            return;
+        };
+        let line_idx = match (side, row_data) {
+            (DiffSide::Left, DiffRow::Equal { left, .. })
+            | (DiffSide::Left, DiffRow::Removed { left })
+            | (DiffSide::Left, DiffRow::Replaced { left, .. }) => Some(left),
+            (DiffSide::Right, DiffRow::Equal { right, .. })
+            | (DiffSide::Right, DiffRow::Added { right })
+            | (DiffSide::Right, DiffRow::Replaced { right, .. }) => Some(right),
+            _ => None,
+        };
+        let Some(line_idx) = line_idx else {
+            self.selection = None;
+            return;
+        };
+        let lines = match side {
+            DiffSide::Left => &self.left_lines,
+            DiffSide::Right => &self.right_lines,
+        };
+        let Some(text) = lines.get(line_idx) else {
+            self.selection = None;
+            return;
+        };
+        let chars: Vec<char> = text.chars().collect();
+        if chars.is_empty() {
+            self.selection = None;
+            return;
+        }
+        let c = col.min(chars.len());
+        let pivot = if c < chars.len() && is_word_char(chars[c]) {
+            Some(c)
+        } else if c == chars.len() && c > 0 && is_word_char(chars[c - 1]) {
+            Some(c - 1)
+        } else {
+            None
+        };
+        let Some(p) = pivot else {
+            self.selection = None;
+            return;
+        };
+        let mut start = p;
+        while start > 0 && is_word_char(chars[start - 1]) {
+            start -= 1;
+        }
+        let mut end = p + 1;
+        while end < chars.len() && is_word_char(chars[end]) {
+            end += 1;
+        }
+        self.selection = Some(DiffSelection {
+            side,
+            anchor_row: row,
+            anchor_col: start,
+            head_row: row,
+            head_col: end,
+        });
+    }
+
+    /// Linearise the active selection into a copyable string. Walks the
+    /// chosen side's source-line texts for the selected `diff.rows` range,
+    /// clipping the first and last lines to the selection's char bounds.
+    /// Rows that are blank on the selected side (Added rows when Left is
+    /// selected, or Removed rows when Right is selected) contribute an
+    /// empty line so the row geometry the user sees matches the copied
+    /// payload.
+    pub fn selection_text(&self) -> Option<String> {
+        let sel = self.selection?;
+        if !sel.has_area() {
+            return None;
+        }
+        let (start, end) = sel.normalized();
+        let lines = match sel.side {
+            DiffSide::Left => &self.left_lines,
+            DiffSide::Right => &self.right_lines,
+        };
+        let mut out = String::new();
+        let mut emitted = 0usize;
+        for row_idx in start.0..=end.0 {
+            let Some(row) = self.rows.get(row_idx).copied() else {
+                break;
+            };
+            let line_idx = match (sel.side, row) {
+                (DiffSide::Left, DiffRow::Equal { left, .. })
+                | (DiffSide::Left, DiffRow::Removed { left })
+                | (DiffSide::Left, DiffRow::Replaced { left, .. }) => Some(left),
+                (DiffSide::Right, DiffRow::Equal { right, .. })
+                | (DiffSide::Right, DiffRow::Added { right })
+                | (DiffSide::Right, DiffRow::Replaced { right, .. }) => Some(right),
+                _ => None,
+            };
+            let text = line_idx
+                .and_then(|i| lines.get(i).cloned())
+                .unwrap_or_default();
+            let chars: Vec<char> = text.chars().collect();
+            let (cs, ce) = if start.0 == end.0 {
+                (start.1.min(chars.len()), end.1.min(chars.len()))
+            } else if row_idx == start.0 {
+                (start.1.min(chars.len()), chars.len())
+            } else if row_idx == end.0 {
+                (0, end.1.min(chars.len()))
+            } else {
+                (0, chars.len())
+            };
+            if emitted > 0 {
+                out.push('\n');
+            }
+            out.extend(chars[cs..ce].iter());
+            emitted += 1;
+        }
+        if out.is_empty() { None } else { Some(out) }
     }
 
     /// Length (in chars) of the longest line across both files. Used to
@@ -848,5 +1032,134 @@ mod tests {
         assert!(matches!(d.rows[0], DiffRow::Equal { .. }));
         assert_eq!(d.left_lines, vec!["(no changes)".to_string()]);
         assert!(!d.unified);
+    }
+
+    #[test]
+    fn selection_text_returns_substring_of_left_column_for_single_row_selection() {
+        let mut d = DiffData::build(
+            PathBuf::from("x"),
+            PathBuf::from("y"),
+            lines(&["alpha", "beta", "gamma"]),
+            lines(&["alpha", "BETA", "gamma"]),
+        );
+        // Row 1 is Replaced { left: 1, right: 1 }.
+        d.start_selection(DiffSide::Left, 1, 0);
+        d.extend_selection_to(1, 4);
+        assert_eq!(
+            d.selection_text().as_deref(),
+            Some("beta"),
+            "selecting cols 0..4 on the left column of a Replaced row must return the left line's first 4 chars"
+        );
+    }
+
+    #[test]
+    fn selection_text_returns_right_column_lines_across_multiple_rows() {
+        let mut d = DiffData::build(
+            PathBuf::from("x"),
+            PathBuf::from("y"),
+            lines(&["alpha", "beta", "gamma"]),
+            lines(&["alpha", "BETA", "GAMMA"]),
+        );
+        d.start_selection(DiffSide::Right, 0, 0);
+        d.extend_selection_to(2, 5);
+        assert_eq!(
+            d.selection_text().as_deref(),
+            Some("alpha\nBETA\nGAMMA"),
+            "multi-row right-column selection must concatenate the right_lines with newlines"
+        );
+    }
+
+    #[test]
+    fn selection_text_skips_added_row_content_when_left_side_is_selected() {
+        let mut d = DiffData::build(
+            PathBuf::from("x"),
+            PathBuf::from("y"),
+            lines(&["alpha", "gamma"]),
+            lines(&["alpha", "delta", "gamma"]),
+        );
+        let added_row_idx = d
+            .rows
+            .iter()
+            .position(|r| matches!(r, DiffRow::Added { .. }))
+            .expect("test fixture must contain an Added row");
+        d.start_selection(DiffSide::Left, added_row_idx, 0);
+        d.extend_selection_to(added_row_idx, 999);
+        assert!(
+            matches!(d.selection_text().as_deref(), None | Some("")),
+            "left-side selection over an Added row must yield no text — the left column is blank there"
+        );
+    }
+
+    #[test]
+    fn select_word_at_snaps_to_left_column_word_boundaries() {
+        let mut d = DiffData::build(
+            PathBuf::from("x"),
+            PathBuf::from("y"),
+            lines(&["alpha bravo charlie", "second"]),
+            lines(&["alpha BRAVO charlie", "second"]),
+        );
+        // Click inside "bravo" on the left side, row 0.
+        d.select_word_at(DiffSide::Left, 0, 8);
+        let sel = d.selection.expect("word click must produce a selection");
+        assert_eq!(sel.side, DiffSide::Left);
+        assert_eq!(sel.anchor_row, 0);
+        assert_eq!(sel.head_row, 0);
+        assert_eq!(sel.anchor_col, 6);
+        assert_eq!(sel.head_col, 11);
+        assert_eq!(
+            d.selection_text().as_deref(),
+            Some("bravo"),
+            "word selection must copy exactly the clicked word"
+        );
+    }
+
+    #[test]
+    fn select_word_at_on_punctuation_clears_selection() {
+        let mut d = DiffData::build(
+            PathBuf::from("x"),
+            PathBuf::from("y"),
+            lines(&["foo, bar"]),
+            lines(&["foo, bar"]),
+        );
+        d.select_word_at(DiffSide::Left, 0, 3);
+        assert!(
+            d.selection.is_none(),
+            "click on a non-word char (',') must NOT anchor a selection"
+        );
+    }
+
+    #[test]
+    fn select_word_at_on_added_row_left_side_clears() {
+        let mut d = DiffData::build(
+            PathBuf::from("x"),
+            PathBuf::from("y"),
+            lines(&["alpha", "gamma"]),
+            lines(&["alpha", "BETA", "gamma"]),
+        );
+        let added_row_idx = d
+            .rows
+            .iter()
+            .position(|r| matches!(r, DiffRow::Added { .. }))
+            .expect("fixture must contain an Added row");
+        d.select_word_at(DiffSide::Left, added_row_idx, 0);
+        assert!(
+            d.selection.is_none(),
+            "double-clicking on the (blank) left side of an Added row must NOT anchor a phantom selection"
+        );
+    }
+
+    #[test]
+    fn zero_area_selection_yields_no_text() {
+        let mut d = DiffData::build(
+            PathBuf::from("x"),
+            PathBuf::from("y"),
+            lines(&["alpha"]),
+            lines(&["alpha"]),
+        );
+        d.start_selection(DiffSide::Left, 0, 2);
+        assert!(
+            d.selection_text().is_none(),
+            "a click without a drag must not produce copyable text"
+        );
     }
 }

@@ -499,6 +499,18 @@ fn render_diff(
         );
     }
 
+    paint_diff_selection_band(
+        diff,
+        body_top,
+        body_height,
+        l_text_x,
+        l_text_w,
+        r_text_x,
+        r_text_w,
+        end,
+        buf,
+    );
+
     // Status footer.
     let visible_first = diff.scroll + 1;
     let visible_last = end;
@@ -514,6 +526,130 @@ fn render_diff(
             .bg(Color::Rgb(0x14, 0x18, 0x22)),
     );
     (prev_arrow, next_arrow)
+}
+
+/// Overlay the diff's drag-select highlight on top of whatever the row
+/// loop just painted. Walks the visible window once and paints the same
+/// `paint_selection_band` overlay the regular text editor uses, so the
+/// user sees an identical blue band over selected cells on whichever
+/// column they're dragging in.
+fn paint_diff_selection_band(
+    diff: &crate::widgets::diff::DiffData,
+    body_top: u16,
+    body_height: u16,
+    l_text_x: u16,
+    l_text_w: u16,
+    r_text_x: u16,
+    r_text_w: u16,
+    end: usize,
+    buf: &mut Buffer,
+) {
+    use crate::widgets::diff::DiffSide;
+    let Some(sel) = diff.selection else {
+        return;
+    };
+    if !sel.has_area() {
+        return;
+    }
+    let (start, stop) = sel.normalized();
+    let (text_x, text_w) = match sel.side {
+        DiffSide::Left => (l_text_x, l_text_w),
+        DiffSide::Right => (r_text_x, r_text_w),
+    };
+    if text_w == 0 {
+        return;
+    }
+    let first_visible = diff.scroll;
+    let last_visible = end;
+    let row_start = start.0.max(first_visible);
+    let row_end = stop.0.min(last_visible.saturating_sub(1));
+    if row_end < row_start {
+        return;
+    }
+    for row_idx in row_start..=row_end {
+        let y = body_top + (row_idx - first_visible) as u16;
+        if y >= body_top + body_height {
+            break;
+        }
+        let (cs, ce) = if start.0 == stop.0 {
+            (start.1, stop.1)
+        } else if row_idx == start.0 {
+            (start.1, usize::MAX)
+        } else if row_idx == stop.0 {
+            (0, stop.1)
+        } else {
+            (0, usize::MAX)
+        };
+        let cs_screen = cs.saturating_sub(diff.scroll_x);
+        let ce_screen = ce.saturating_sub(diff.scroll_x);
+        paint_selection_band(buf, text_x, y, text_w, cs_screen, ce_screen);
+    }
+}
+
+/// Hit-test a click against the side-by-side diff body. Returns
+/// `Some((side, diff_row_idx, char_col))` when the click landed inside
+/// either column's text area; `None` when the click was in the header,
+/// status footer, seam, gutter outside the body, or when the diff isn't
+/// renderable at this size. The math mirrors `render_diff` exactly so a
+/// click on a character returns the char column the user can see at that
+/// cell.
+pub fn diff_hit_test(
+    diff: &crate::widgets::diff::DiffData,
+    last_inner: Rect,
+    col: u16,
+    row: u16,
+) -> Option<(crate::widgets::diff::DiffSide, usize, usize)> {
+    use crate::widgets::diff::DiffSide;
+    if diff.unified {
+        return None;
+    }
+    if last_inner.width < 16 || last_inner.height < 3 {
+        return None;
+    }
+    let body_top = last_inner.y + 1;
+    let body_height = last_inner.height.saturating_sub(2);
+    if body_height == 0 {
+        return None;
+    }
+    if row < body_top || row >= body_top + body_height {
+        return None;
+    }
+    let half = last_inner.width / 2;
+    if half < 8 {
+        return None;
+    }
+    let l_gutter = (diff.left_lines.len() + 1).to_string().len() as u16 + 1;
+    let r_gutter = (diff.right_lines.len() + 1).to_string().len() as u16 + 1;
+    let l_x = last_inner.x;
+    let l_sign_x = l_x + l_gutter;
+    let l_text_x = l_sign_x + 2;
+    let l_text_w = half.saturating_sub(l_gutter + 2 + 1);
+    let r_x = last_inner.x + half + 1;
+    let r_sign_x = r_x + r_gutter;
+    let r_text_x = r_sign_x + 2;
+    let r_text_w = (last_inner.width - (half + 1)).saturating_sub(r_gutter + 2);
+    let seam_x = last_inner.x + half;
+
+    let vis_row = (row - body_top) as usize;
+    let row_idx = diff.scroll + vis_row;
+    if row_idx >= diff.rows.len() {
+        return None;
+    }
+
+    let (side, text_x, text_w) = if col < seam_x {
+        (DiffSide::Left, l_text_x, l_text_w)
+    } else if col > seam_x {
+        (DiffSide::Right, r_text_x, r_text_w)
+    } else {
+        return None;
+    };
+    let screen_col = if col >= text_x {
+        (col - text_x).min(text_w.saturating_sub(1)) as usize
+    } else {
+        0
+    };
+    let char_col = screen_col + diff.scroll_x;
+    Some((side, row_idx, char_col))
 }
 
 /// Paint `‹` and `›` glyphs at the right edge of a diff header so the
@@ -3613,6 +3749,105 @@ mod tests {
     }
 
     #[test]
+    fn diff_hit_test_maps_click_in_left_text_column_to_left_side_and_char_col() {
+        use crate::widgets::diff::DiffSide;
+        let f1 = NamedTempFile::new().unwrap();
+        let f2 = NamedTempFile::new().unwrap();
+        std::fs::write(f1.path(), "alpha\nbravo\ncharlie\n").unwrap();
+        std::fs::write(f2.path(), "alpha\nBRAVO\ncharlie\n").unwrap();
+        let mut t = EditorTabs::new();
+        t.open_diff(f1.path(), f2.path()).unwrap();
+        let active_idx = t.active_index();
+        t.editors[active_idx].focused = true;
+        let area = Rect { x: 0, y: 0, width: 80, height: 10 };
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        ratatui::widgets::Widget::render(&mut t.editors[active_idx], area, &mut buf);
+        let ed = &t.editors[active_idx];
+        let diff = ed.diff.as_ref().unwrap();
+        // Header is at ed.last_inner.y; body starts at last_inner.y + 1.
+        let body_top = ed.last_inner.y + 1;
+        // Left text column begins at l_text_x = inner.x + l_gutter + 2.
+        let l_gutter = (diff.left_lines.len() + 1).to_string().len() as u16 + 1;
+        let l_text_x = ed.last_inner.x + l_gutter + 2;
+        let hit = crate::widgets::editor::diff_hit_test(
+            diff,
+            ed.last_inner,
+            l_text_x + 2,
+            body_top + 1,
+        );
+        assert_eq!(
+            hit,
+            Some((DiffSide::Left, 1, 2)),
+            "a click two cells into the left text column of the second body row must map to Left, row 1, char col 2"
+        );
+    }
+
+    #[test]
+    fn diff_hit_test_maps_click_in_right_text_column_to_right_side() {
+        use crate::widgets::diff::DiffSide;
+        let f1 = NamedTempFile::new().unwrap();
+        let f2 = NamedTempFile::new().unwrap();
+        std::fs::write(f1.path(), "alpha\nbravo\n").unwrap();
+        std::fs::write(f2.path(), "alpha\nBRAVO\n").unwrap();
+        let mut t = EditorTabs::new();
+        t.open_diff(f1.path(), f2.path()).unwrap();
+        let active_idx = t.active_index();
+        t.editors[active_idx].focused = true;
+        let area = Rect { x: 0, y: 0, width: 80, height: 10 };
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        ratatui::widgets::Widget::render(&mut t.editors[active_idx], area, &mut buf);
+        let ed = &t.editors[active_idx];
+        let diff = ed.diff.as_ref().unwrap();
+        let body_top = ed.last_inner.y + 1;
+        let half = ed.last_inner.width / 2;
+        let r_gutter = (diff.right_lines.len() + 1).to_string().len() as u16 + 1;
+        let r_text_x = ed.last_inner.x + half + 1 + r_gutter + 2;
+        let hit = crate::widgets::editor::diff_hit_test(
+            diff,
+            ed.last_inner,
+            r_text_x + 3,
+            body_top + 1,
+        );
+        assert!(
+            matches!(hit, Some((DiffSide::Right, 1, 3))),
+            "a click three cells into the right text column of the second body row must map to Right, row 1, char col 3; got {hit:?}"
+        );
+    }
+
+    #[test]
+    fn render_diff_paints_selection_band_over_selected_cells() {
+        use crate::widgets::diff::DiffSide;
+        let f1 = NamedTempFile::new().unwrap();
+        let f2 = NamedTempFile::new().unwrap();
+        std::fs::write(f1.path(), "alpha\nbravo\n").unwrap();
+        std::fs::write(f2.path(), "alpha\nBRAVO\n").unwrap();
+        let mut t = EditorTabs::new();
+        t.open_diff(f1.path(), f2.path()).unwrap();
+        let active_idx = t.active_index();
+        t.editors[active_idx].focused = true;
+        let area = Rect { x: 0, y: 0, width: 80, height: 10 };
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        ratatui::widgets::Widget::render(&mut t.editors[active_idx], area, &mut buf);
+        let diff_mut = t.editors[active_idx].diff.as_mut().unwrap();
+        diff_mut.start_selection(DiffSide::Left, 1, 0);
+        diff_mut.extend_selection_to(1, 5);
+        ratatui::widgets::Widget::render(&mut t.editors[active_idx], area, &mut buf);
+        let ed = &t.editors[active_idx];
+        let diff = ed.diff.as_ref().unwrap();
+        let l_gutter = (diff.left_lines.len() + 1).to_string().len() as u16 + 1;
+        let l_text_x = ed.last_inner.x + l_gutter + 2;
+        let y = ed.last_inner.y + 2;
+        let band_bg = Color::Rgb(0x26, 0x4f, 0x78);
+        for col in 0..5u16 {
+            assert_eq!(
+                buf[(l_text_x + col, y)].bg,
+                band_bg,
+                "cell {col} of the second body row must paint the selection band on the left column"
+            );
+        }
+    }
+
+    #[test]
     fn open_diff_inserts_a_new_tab_when_an_open_file_already_exists() {
         let existing = NamedTempFile::new().unwrap();
         std::fs::write(existing.path(), "x\n").unwrap();
@@ -5134,6 +5369,28 @@ impl Widget for &mut EditorTabs {
     fn render(self, area: Rect, buf: &mut Buffer) {
         self.last_full_area = area;
         if area.height == 0 || area.width == 0 {
+            // Ctrl+Shift+J maximises the terminal pane, which collapses
+            // the editor area to height 0. The inner editor's `render`
+            // is never reached on this branch, so its `last_area` would
+            // otherwise keep the rectangle from the pre-maximise frame
+            // and `App::handle_mouse`'s `in_editor` hit-test
+            // (rect_contains(self.editor.last_area, ...)) would still
+            // win against the terminal in the dispatch chain at
+            // app.rs:7229 / 7336 — clicks meant to begin a terminal
+            // selection get routed to the editor's mouse_down and the
+            // file caret jumps instead. Zero the inner editor's
+            // hit-test rectangle here so the terminal pane wins
+            // unambiguously while the editor is collapsed.
+            for ed in self.editors.iter_mut() {
+                ed.last_area = Rect {
+                    x: area.x,
+                    y: area.y,
+                    width: area.width,
+                    height: 0,
+                };
+                ed.last_inner = ed.last_area;
+                ed.last_scrollbar = Rect::default();
+            }
             return;
         }
         let strip_h: u16 = 1;
