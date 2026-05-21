@@ -47,13 +47,55 @@ impl Selection {
     }
 }
 
-/// Listener that swallows events from the embedded `Term`. We don't act
-/// on title changes / cursor blink / clipboard requests etc. — the outer
-/// croft TUI owns all of those.
+/// Listener for events the embedded `Term` emits. Most variants (title
+/// changes, cursor-blink toggles, clipboard load/store, child exit, etc.)
+/// are owned by the outer croft TUI and ignored here, but two of them
+/// MUST be reflected back into the shell's stdin or interactive TUIs
+/// running inside the embedded terminal hang waiting for replies:
+///
+///   * `PtyWrite(text)` — DSR (`ESC[6n`), DA1/DA2 (`ESC[c`, `ESC[>c`),
+///     keyboard modifier reports, sixel/synchronised-output queries,
+///     and OSC 52 read backs all surface here. atuin times out with
+///     "The cursor position could not be read within a normal duration"
+///     when the DSR reply never lands on the PTY; helix, fzf, btop and
+///     other Rust/Go TUIs do the same.
+///   * `TextAreaSizeRequest(cb)` — `CSI 14 t` / `CSI 18 t` pixel/cell
+///     size queries from TUIs that scale glyph cells (e.g. helix's
+///     terminal-size detection, sixel-aware viewers). The callback
+///     builds the reply string from the supplied `WindowSize`.
+///
+/// In tests we use `VoidListener::default()` (both channels `None`) so
+/// the listener silently drops every event — the test helpers exercise
+/// the parser, not the round-trip.
 #[derive(Clone, Default)]
-pub struct VoidListener;
+pub struct VoidListener {
+    pty_response_tx: Option<std::sync::mpsc::Sender<String>>,
+    size: Option<Arc<std::sync::Mutex<(u16, u16)>>>,
+}
+
 impl EventListener for VoidListener {
-    fn send_event(&self, _event: AlacEvent) {}
+    fn send_event(&self, event: AlacEvent) {
+        let Some(tx) = self.pty_response_tx.as_ref() else {
+            return;
+        };
+        match event {
+            AlacEvent::PtyWrite(text) => {
+                let _ = tx.send(text);
+            }
+            AlacEvent::TextAreaSizeRequest(cb) => {
+                let Some(size) = self.size.as_ref() else { return };
+                let (cols, rows) = *size.lock().unwrap();
+                let ws = alacritty_terminal::event::WindowSize {
+                    num_lines: rows,
+                    num_cols: cols,
+                    cell_width: 1,
+                    cell_height: 1,
+                };
+                let _ = tx.send(cb(ws));
+            }
+            _ => {}
+        }
+    }
 }
 
 pub struct PtyTerminal {
@@ -65,10 +107,20 @@ pub struct PtyTerminal {
     /// paste). Sniffed off the byte stream; not all parsers expose it.
     bracketed_paste_enabled: Arc<AtomicBool>,
     master: Box<dyn MasterPty + Send>,
-    writer: Box<dyn Write + Send>,
+    /// Shared between this struct's user-input path (`write_input`,
+    /// `paste_*`, `cd_into`) and the background responder thread that
+    /// ships alacritty's reply bytes (`PtyWrite`, `TextAreaSizeRequest`)
+    /// back to the shell's stdin. portable-pty rejects a second
+    /// `take_writer` call, so there is exactly one underlying writer
+    /// and both paths funnel through this mutex.
+    writer: Arc<std::sync::Mutex<Box<dyn Write + Send>>>,
     _child: Box<dyn portable_pty::Child + Send + Sync>,
     cols: u16,
     rows: u16,
+    /// Shared with the `VoidListener` so `TextAreaSizeRequest` callbacks
+    /// see the live geometry without us having to thread a fresh
+    /// listener instance through every `resize` call.
+    size_shared: Arc<std::sync::Mutex<(u16, u16)>>,
     pub focused: bool,
     pub last_area: Rect,
     pub last_inner: Rect,
@@ -157,14 +209,37 @@ impl PtyTerminal {
         let child = pair.slave.spawn_command(cmd).context("spawn child")?;
         drop(pair.slave);
 
-        let writer = pair.master.take_writer().context("take writer")?;
+        let writer: Arc<std::sync::Mutex<Box<dyn Write + Send>>> = Arc::new(
+            std::sync::Mutex::new(pair.master.take_writer().context("take writer")?),
+        );
         let mut reader = pair.master.try_clone_reader().context("clone reader")?;
 
         let term_size = TermSize::new(cols as usize, rows as usize);
         let cfg = Config { scrolling_history: SCROLLBACK_LINES, ..Config::default() };
-        let term = Term::new(cfg, &term_size, VoidListener);
+        let size_shared = Arc::new(std::sync::Mutex::new((cols, rows)));
+        let (response_tx, response_rx) = std::sync::mpsc::channel::<String>();
+        let listener = VoidListener {
+            pty_response_tx: Some(response_tx),
+            size: Some(size_shared.clone()),
+        };
+        let term = Term::new(cfg, &term_size, listener);
         let term = Arc::new(FairMutex::new(term));
         let term_for_thread = term.clone();
+        let writer_for_responder = writer.clone();
+
+        std::thread::spawn(move || {
+            while let Ok(text) = response_rx.recv() {
+                let Ok(mut w) = writer_for_responder.lock() else {
+                    break;
+                };
+                if w.write_all(text.as_bytes()).is_err() {
+                    break;
+                }
+                if w.flush().is_err() {
+                    break;
+                }
+            }
+        });
 
         let pty_dirty = Arc::new(AtomicBool::new(true));
         let pty_dirty_for_thread = pty_dirty.clone();
@@ -217,6 +292,7 @@ impl PtyTerminal {
             _child: child,
             cols,
             rows,
+            size_shared,
             focused: false,
             last_area: Rect::default(),
             last_inner: Rect::default(),
@@ -310,8 +386,10 @@ impl PtyTerminal {
 
     pub fn write_input(&mut self, data: &[u8]) {
         self.reset_scrollback();
-        let _ = self.writer.write_all(data);
-        let _ = self.writer.flush();
+        if let Ok(mut w) = self.writer.lock() {
+            let _ = w.write_all(data);
+            let _ = w.flush();
+        }
         self.pty_dirty.store(true, Ordering::Release);
     }
 
@@ -372,6 +450,7 @@ impl PtyTerminal {
         }
         self.cols = cols;
         self.rows = rows;
+        *self.size_shared.lock().unwrap() = (cols, rows);
         let _ = self.master.resize(PtySize {
             cols,
             rows,
@@ -691,12 +770,70 @@ mod tests {
     fn fresh_term(cols: usize, rows: usize) -> Term<VoidListener> {
         let cfg = Config { scrolling_history: 1000, ..Config::default() };
         let size = TermSize::new(cols, rows);
-        Term::new(cfg, &size, VoidListener)
+        Term::new(cfg, &size, VoidListener::default())
     }
 
     fn feed(term: &mut Term<VoidListener>, bytes: &[u8]) {
         let mut p = Processor::<StdSyncHandler>::new();
         p.advance(term, bytes);
+    }
+
+    #[test]
+    fn dsr_cursor_position_query_round_trips_into_the_pty_response_channel() {
+        // Regression for atuin reverse-search (Ctrl+R) panicking with
+        // "Error: The cursor position could not be read within a normal
+        // duration": atuin sends DSR (`ESC[6n`) and waits for the
+        // terminal to write back `ESC[<row>;<col>R` on stdin. Before
+        // this fix, croft's `VoidListener` discarded every event
+        // alacritty emitted, so the reply never reached the shell and
+        // atuin timed out. With the responder wiring in place, the
+        // listener must publish the reply on the channel that the
+        // background thread forwards to the PTY master.
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        let listener = VoidListener {
+            pty_response_tx: Some(tx),
+            size: Some(Arc::new(std::sync::Mutex::new((80, 24)))),
+        };
+        let cfg = Config::default();
+        let size = TermSize::new(80, 24);
+        let mut term = Term::new(cfg, &size, listener);
+        let mut processor = Processor::<StdSyncHandler>::new();
+        processor.advance(&mut term, b"\x1b[6n");
+        let response = rx
+            .recv_timeout(std::time::Duration::from_millis(500))
+            .expect("DSR cursor-position query must produce a PtyWrite event");
+        assert_eq!(
+            response, "\x1b[1;1R",
+            "a fresh terminal's cursor is at row 1, column 1 (1-based), so the reply must be ESC[1;1R"
+        );
+    }
+
+    #[test]
+    fn text_area_size_request_replies_with_the_current_grid_geometry() {
+        // CSI 18 t ("report text area size in characters") is what
+        // helix, neovim, and other modern TUIs use to learn the
+        // viewport size beyond what TIOCGWINSZ surfaces. The reply
+        // must echo the live cols/rows held in `size_shared` so a
+        // resize inside croft propagates to the embedded program
+        // without a fresh listener instance.
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        let size = Arc::new(std::sync::Mutex::new((120u16, 40u16)));
+        let listener = VoidListener {
+            pty_response_tx: Some(tx),
+            size: Some(size),
+        };
+        let cfg = Config::default();
+        let term_size = TermSize::new(120, 40);
+        let mut term = Term::new(cfg, &term_size, listener);
+        let mut processor = Processor::<StdSyncHandler>::new();
+        processor.advance(&mut term, b"\x1b[18t");
+        let response = rx
+            .recv_timeout(std::time::Duration::from_millis(500))
+            .expect("CSI 18 t must produce a TextAreaSizeRequest reply on the channel");
+        assert_eq!(
+            response, "\x1b[8;40;120t",
+            "CSI 18 t reply format is ESC[8;<rows>;<cols>t per xterm convention"
+        );
     }
 
     #[test]
