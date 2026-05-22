@@ -10435,6 +10435,7 @@ mod tests {
             .map(|i| ChangeEntry {
                 path: format!("file{i}.py"),
                 kind: ChangeKind::Untracked,
+                ..Default::default()
             })
             .collect();
 
@@ -10511,7 +10512,7 @@ mod tests {
         std::fs::remove_file(&f).unwrap();
         let mut app = App::new(root.to_path_buf()).unwrap();
         app.source_control.entries =
-            vec![ChangeEntry { path: "doomed.txt".into(), kind: ChangeKind::Deleted }];
+            vec![ChangeEntry { path: "doomed.txt".into(), kind: ChangeKind::Deleted, ..Default::default() }];
         app.set_sidebar_view(SidebarView::SourceControl);
         app.open_source_control_entry(0);
         let diff = app
@@ -10570,7 +10571,7 @@ mod tests {
         std::fs::write(&f, b"print(2)\n").unwrap();
         let mut app = App::new(root.to_path_buf()).unwrap();
         app.source_control.entries =
-            vec![ChangeEntry { path: "a.py".into(), kind: ChangeKind::Modified }];
+            vec![ChangeEntry { path: "a.py".into(), kind: ChangeKind::Modified, ..Default::default() }];
         app.set_sidebar_view(SidebarView::SourceControl);
         app.open_source_control_entry(0);
         assert!(

@@ -14,6 +14,8 @@ const INPUT_PROMPT_RGB: (u8, u8, u8) = (0x6c, 0x7d, 0x9c);
 const BUTTON_BG_RGB: (u8, u8, u8) = (0x09, 0x67, 0xb8);
 const BUTTON_FG_RGB: (u8, u8, u8) = (0xff, 0xff, 0xff);
 const SECTION_HEADER_RGB: (u8, u8, u8) = (0xcc, 0xcc, 0xcc);
+const ADDITIONS_RGB: (u8, u8, u8) = (0xa3, 0xbe, 0x8c);
+const DELETIONS_RGB: (u8, u8, u8) = (0xe7, 0x70, 0x70);
 
 pub const DISCARD_GLYPH: char = '\u{21b6}';
 pub const STAGE_GLYPH: char = '+';
@@ -974,12 +976,14 @@ impl Widget for &mut SourceControlPanel {
             let row_y = list_area.y + row as u16;
             match &lines[idx] {
                 ListLine::Header(section) => {
-                    let count = self
+                    let (count, sec_add, sec_del) = self
                         .entries
                         .iter()
                         .filter(|e| e.kind.section() == *section)
-                        .count();
-                    let header_spans = vec![
+                        .fold((0usize, 0usize, 0usize), |(c, a, d), e| {
+                            (c + 1, a + e.additions, d + e.deletions)
+                        });
+                    let mut header_spans = vec![
                         Span::styled(
                             "\u{25be} ",
                             Style::default().fg(Color::Rgb(0xb0, 0xb8, 0xc8)),
@@ -1003,6 +1007,36 @@ impl Widget for &mut SourceControlPanel {
                                 .add_modifier(Modifier::BOLD),
                         ),
                     ];
+                    if sec_add > 0 || sec_del > 0 {
+                        header_spans.push(Span::raw("  "));
+                        if sec_add > 0 {
+                            header_spans.push(Span::styled(
+                                format!("+{sec_add}"),
+                                Style::default()
+                                    .fg(Color::Rgb(
+                                        ADDITIONS_RGB.0,
+                                        ADDITIONS_RGB.1,
+                                        ADDITIONS_RGB.2,
+                                    ))
+                                    .add_modifier(Modifier::BOLD),
+                            ));
+                        }
+                        if sec_add > 0 && sec_del > 0 {
+                            header_spans.push(Span::raw(" "));
+                        }
+                        if sec_del > 0 {
+                            header_spans.push(Span::styled(
+                                format!("-{sec_del}"),
+                                Style::default()
+                                    .fg(Color::Rgb(
+                                        DELETIONS_RGB.0,
+                                        DELETIONS_RGB.1,
+                                        DELETIONS_RGB.2,
+                                    ))
+                                    .add_modifier(Modifier::BOLD),
+                            ));
+                        }
+                    }
                     buf.set_line(list_area.x, row_y, &Line::from(header_spans), row_width);
                 }
                 ListLine::Entry(entry_idx) => {
@@ -1158,10 +1192,10 @@ mod tests {
     fn list_layout_orders_conflicts_staged_changes_untracked() {
         let mut p = SourceControlPanel::new();
         p.entries = vec![
-            ChangeEntry { path: "u.txt".into(), kind: ChangeKind::Untracked },
-            ChangeEntry { path: "m.txt".into(), kind: ChangeKind::Modified },
-            ChangeEntry { path: "s.txt".into(), kind: ChangeKind::StagedAdded },
-            ChangeEntry { path: "c.txt".into(), kind: ChangeKind::Conflicted },
+            ChangeEntry { path: "u.txt".into(), kind: ChangeKind::Untracked, ..Default::default() },
+            ChangeEntry { path: "m.txt".into(), kind: ChangeKind::Modified, ..Default::default() },
+            ChangeEntry { path: "s.txt".into(), kind: ChangeKind::StagedAdded, ..Default::default() },
+            ChangeEntry { path: "c.txt".into(), kind: ChangeKind::Conflicted, ..Default::default() },
         ];
         let lines = p.list_layout();
         assert!(matches!(lines[0], ListLine::Header(ChangeSection::Conflicts)));
@@ -1376,9 +1410,9 @@ mod tests {
         p.set_status(
             dummy_status_with_branch("main"),
             vec![
-                ChangeEntry { path: "a.py".into(), kind: ChangeKind::Modified },
-                ChangeEntry { path: "b.py".into(), kind: ChangeKind::Modified },
-                ChangeEntry { path: "c.py".into(), kind: ChangeKind::Modified },
+                ChangeEntry { path: "a.py".into(), kind: ChangeKind::Modified, ..Default::default() },
+                ChangeEntry { path: "b.py".into(), kind: ChangeKind::Modified, ..Default::default() },
+                ChangeEntry { path: "c.py".into(), kind: ChangeKind::Modified, ..Default::default() },
             ],
         );
         let area = Rect { x: 0, y: 0, width: 60, height: 40 };
@@ -1396,6 +1430,66 @@ mod tests {
         assert!(
             dump.contains('▾') || dump.contains('▿'),
             "section header must carry a down chevron:\n{dump}"
+        );
+    }
+
+    #[test]
+    fn section_header_shows_green_plus_additions_and_red_minus_deletions() {
+        use ratatui::buffer::Buffer;
+        let mut p = SourceControlPanel::new();
+        p.set_status(
+            dummy_status_with_branch("main"),
+            vec![
+                ChangeEntry {
+                    path: "a.py".into(),
+                    kind: ChangeKind::Modified,
+                    additions: 12,
+                    deletions: 3,
+                },
+                ChangeEntry {
+                    path: "b.py".into(),
+                    kind: ChangeKind::Modified,
+                    additions: 5,
+                    deletions: 7,
+                },
+            ],
+        );
+        let area = Rect { x: 0, y: 0, width: 60, height: 40 };
+        let mut buf = Buffer::empty(area);
+        ratatui::widgets::Widget::render(&mut p, area, &mut buf);
+        let dump = buffer_to_string(&buf);
+        assert!(
+            dump.contains("+17"),
+            "section header must show total additions +17:\n{dump}"
+        );
+        assert!(
+            dump.contains("-10"),
+            "section header must show total deletions -10:\n{dump}"
+        );
+
+        let mut plus_cell_is_green = false;
+        let mut minus_cell_is_red = false;
+        for y in 0..area.height {
+            for x in 0..area.width {
+                let cell = &buf[(x, y)];
+                let sym = cell.symbol();
+                let Some(fg) = cell.style().fg else { continue };
+                let Color::Rgb(r, g, b) = fg else { continue };
+                if sym == "+" && g > r && g > b {
+                    plus_cell_is_green = true;
+                }
+                if sym == "-" && r > g && r > b {
+                    minus_cell_is_red = true;
+                }
+            }
+        }
+        assert!(
+            plus_cell_is_green,
+            "the '+' glyph in the section header must be painted green"
+        );
+        assert!(
+            minus_cell_is_red,
+            "the '-' glyph in the section header must be painted red"
         );
     }
 
@@ -1561,7 +1655,7 @@ mod tests {
         let mut p = SourceControlPanel::new();
         p.set_status(
             dummy_status_with_branch("main"),
-            vec![ChangeEntry { path: "a.py".into(), kind: ChangeKind::Modified }],
+            vec![ChangeEntry { path: "a.py".into(), kind: ChangeKind::Modified, ..Default::default() }],
         );
         let area = Rect { x: 0, y: 0, width: 60, height: 30 };
         let mut buf = Buffer::empty(area);
@@ -1585,8 +1679,8 @@ mod tests {
         p.set_status(
             dummy_status_with_branch("main"),
             vec![
-                ChangeEntry { path: "a.py".into(), kind: ChangeKind::Modified },
-                ChangeEntry { path: "b.py".into(), kind: ChangeKind::Modified },
+                ChangeEntry { path: "a.py".into(), kind: ChangeKind::Modified, ..Default::default() },
+                ChangeEntry { path: "b.py".into(), kind: ChangeKind::Modified, ..Default::default() },
             ],
         );
         // Render once to learn the row coordinates.
@@ -1633,8 +1727,8 @@ mod tests {
                 p.set_status(
                     dummy_status_with_branch("main"),
                     vec![
-                        ChangeEntry { path: "a.py".into(), kind: ChangeKind::Modified },
-                        ChangeEntry { path: ".idea/".into(), kind: ChangeKind::Untracked },
+                        ChangeEntry { path: "a.py".into(), kind: ChangeKind::Modified, ..Default::default() },
+                        ChangeEntry { path: ".idea/".into(), kind: ChangeKind::Untracked, ..Default::default() },
                     ],
                 );
                 let area = Rect { x: 0, y: 0, width, height };
@@ -1745,7 +1839,7 @@ mod tests {
         let mut p = SourceControlPanel::new();
         p.set_status(
             dummy_status_with_branch("main"),
-            vec![ChangeEntry { path: "ch.py".into(), kind: ChangeKind::Modified }],
+            vec![ChangeEntry { path: "ch.py".into(), kind: ChangeKind::Modified, ..Default::default() }],
         );
         let area = Rect { x: 0, y: 0, width: 60, height: 20 };
         let mut buf = Buffer::empty(area);
@@ -1787,8 +1881,8 @@ mod tests {
         p.set_status(
             dummy_status_with_branch("main"),
             vec![
-                ChangeEntry { path: "a.py".into(), kind: ChangeKind::Modified },
-                ChangeEntry { path: "b.py".into(), kind: ChangeKind::Modified },
+                ChangeEntry { path: "a.py".into(), kind: ChangeKind::Modified, ..Default::default() },
+                ChangeEntry { path: "b.py".into(), kind: ChangeKind::Modified, ..Default::default() },
             ],
         );
         // No selection ⇒ no row should sprout action icons.
@@ -1808,7 +1902,7 @@ mod tests {
         let mut p = SourceControlPanel::new();
         p.set_status(
             dummy_status_with_branch("main"),
-            vec![ChangeEntry { path: "s.py".into(), kind: ChangeKind::StagedModified }],
+            vec![ChangeEntry { path: "s.py".into(), kind: ChangeKind::StagedModified, ..Default::default() }],
         );
         let area = Rect { x: 0, y: 0, width: 60, height: 20 };
         let mut buf = Buffer::empty(area);
@@ -1863,7 +1957,7 @@ mod tests {
         let mut p = SourceControlPanel::new();
         p.set_status(
             dummy_status_with_branch("main"),
-            vec![ChangeEntry { path: "a.py".into(), kind: ChangeKind::Modified }],
+            vec![ChangeEntry { path: "a.py".into(), kind: ChangeKind::Modified, ..Default::default() }],
         );
         // Width 10 leaves only a few cells for the path; reserving 4 cells
         // for icons would clobber it. The widget must skip icons rather
@@ -1885,9 +1979,9 @@ mod tests {
         p.set_status(
             dummy_status_with_branch("main"),
             vec![
-                ChangeEntry { path: "a".into(), kind: ChangeKind::Modified },
-                ChangeEntry { path: "b".into(), kind: ChangeKind::Modified },
-                ChangeEntry { path: "c".into(), kind: ChangeKind::Untracked },
+                ChangeEntry { path: "a".into(), kind: ChangeKind::Modified, ..Default::default() },
+                ChangeEntry { path: "b".into(), kind: ChangeKind::Modified, ..Default::default() },
+                ChangeEntry { path: "c".into(), kind: ChangeKind::Untracked, ..Default::default() },
             ],
         );
         let n = p.select_all_changes();
@@ -1903,8 +1997,8 @@ mod tests {
         p.set_status(
             dummy_status_with_branch("main"),
             vec![
-                ChangeEntry { path: "a".into(), kind: ChangeKind::Modified },
-                ChangeEntry { path: "b".into(), kind: ChangeKind::Modified },
+                ChangeEntry { path: "a".into(), kind: ChangeKind::Modified, ..Default::default() },
+                ChangeEntry { path: "b".into(), kind: ChangeKind::Modified, ..Default::default() },
             ],
         );
         p.select_all_changes();
@@ -1932,8 +2026,8 @@ mod tests {
         p.set_status(
             dummy_status_with_branch("main"),
             vec![
-                ChangeEntry { path: "a".into(), kind: ChangeKind::Modified },
-                ChangeEntry { path: "b".into(), kind: ChangeKind::Modified },
+                ChangeEntry { path: "a".into(), kind: ChangeKind::Modified, ..Default::default() },
+                ChangeEntry { path: "b".into(), kind: ChangeKind::Modified, ..Default::default() },
             ],
         );
         p.select_all_changes();
@@ -2051,8 +2145,8 @@ mod tests {
     fn changes_count_returns_entry_total() {
         let mut p = SourceControlPanel::new();
         assert_eq!(p.changes_count(), 0);
-        p.entries.push(ChangeEntry { path: "x".into(), kind: ChangeKind::Modified });
-        p.entries.push(ChangeEntry { path: "y".into(), kind: ChangeKind::Untracked });
+        p.entries.push(ChangeEntry { path: "x".into(), kind: ChangeKind::Modified, ..Default::default() });
+        p.entries.push(ChangeEntry { path: "y".into(), kind: ChangeKind::Untracked, ..Default::default() });
         assert_eq!(p.changes_count(), 2);
     }
 }

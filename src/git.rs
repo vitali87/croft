@@ -99,6 +99,14 @@ pub struct ChangeEntry {
     /// Workspace-relative path. For renames this is the destination path.
     pub path: String,
     pub kind: ChangeKind,
+    pub additions: usize,
+    pub deletions: usize,
+}
+
+impl Default for ChangeEntry {
+    fn default() -> Self {
+        Self { path: String::new(), kind: ChangeKind::Modified, additions: 0, deletions: 0 }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -232,11 +240,11 @@ pub fn parse_porcelain_changes(out: &str) -> Vec<ChangeEntry> {
             ('A', 'A') | ('D', 'D') | ('A', 'U') | ('U', 'A')
             | ('D', 'U') | ('U', 'D') | ('U', 'U'));
         if conflict {
-            entries.push(ChangeEntry { path, kind: ChangeKind::Conflicted });
+            entries.push(ChangeEntry { path, kind: ChangeKind::Conflicted, ..Default::default() });
             continue;
         }
         if x == '?' && y == '?' {
-            entries.push(ChangeEntry { path, kind: ChangeKind::Untracked });
+            entries.push(ChangeEntry { path, kind: ChangeKind::Untracked, ..Default::default() });
             continue;
         }
         if x != ' ' && x != '?' {
@@ -247,7 +255,7 @@ pub fn parse_porcelain_changes(out: &str) -> Vec<ChangeEntry> {
                 'R' | 'C' => ChangeKind::StagedRenamed,
                 _ => ChangeKind::StagedModified,
             };
-            entries.push(ChangeEntry { path: path.clone(), kind });
+            entries.push(ChangeEntry { path: path.clone(), kind, ..Default::default() });
         }
         if y != ' ' && y != '?' {
             let kind = match y {
@@ -255,7 +263,7 @@ pub fn parse_porcelain_changes(out: &str) -> Vec<ChangeEntry> {
                 'D' => ChangeKind::Deleted,
                 _ => ChangeKind::Modified,
             };
-            entries.push(ChangeEntry { path, kind });
+            entries.push(ChangeEntry { path, kind, ..Default::default() });
         }
     }
     entries
@@ -284,7 +292,75 @@ pub fn query_changes(root: &Path) -> Vec<ChangeEntry> {
         _ => return Vec::new(),
     };
     let raw = String::from_utf8_lossy(&output.stdout);
-    parse_porcelain_changes(&raw)
+    let mut entries = parse_porcelain_changes(&raw);
+    let staged = numstat_map(path_str, &["diff", "--cached", "--numstat"]);
+    let unstaged = numstat_map(path_str, &["diff", "--numstat"]);
+    for entry in &mut entries {
+        let stats = match entry.kind.section() {
+            ChangeSection::Staged => staged.get(&entry.path),
+            ChangeSection::Changes => unstaged.get(&entry.path),
+            ChangeSection::Untracked => None,
+            ChangeSection::Conflicts => None,
+        };
+        if let Some((a, d)) = stats {
+            entry.additions = *a;
+            entry.deletions = *d;
+        }
+    }
+    for entry in &mut entries {
+        if matches!(entry.kind, ChangeKind::Untracked) {
+            entry.additions = count_lines_in_file(root, &entry.path);
+        }
+    }
+    entries
+}
+
+/// Parse `git diff --numstat` output into a path→(additions, deletions)
+/// map. Each line is `\d+\t\d+\t<path>` for text diffs, or `-\t-\t<path>`
+/// for binary files (which we map to (0, 0) — there's no meaningful line
+/// count). Rename lines arrive as `add\tdel\told -> new` and we key on
+/// the destination path so the lookup matches what porcelain emitted.
+pub fn parse_numstat(out: &str) -> std::collections::HashMap<String, (usize, usize)> {
+    let mut map = std::collections::HashMap::new();
+    for line in out.lines() {
+        let mut parts = line.splitn(3, '\t');
+        let Some(adds) = parts.next() else { continue };
+        let Some(dels) = parts.next() else { continue };
+        let Some(path_part) = parts.next() else { continue };
+        let additions = adds.parse::<usize>().unwrap_or(0);
+        let deletions = dels.parse::<usize>().unwrap_or(0);
+        let path = if let Some((_, dst)) = path_part.split_once(" -> ") {
+            unquote_porcelain_path(dst)
+        } else {
+            unquote_porcelain_path(path_part)
+        };
+        map.insert(path, (additions, deletions));
+    }
+    map
+}
+
+fn numstat_map(
+    workdir: &str,
+    args: &[&str],
+) -> std::collections::HashMap<String, (usize, usize)> {
+    let output = match Command::new("git").args(["-C", workdir]).args(args).output() {
+        Ok(o) if o.status.success() => o,
+        _ => return std::collections::HashMap::new(),
+    };
+    parse_numstat(&String::from_utf8_lossy(&output.stdout))
+}
+
+fn count_lines_in_file(root: &Path, rel_path: &str) -> usize {
+    let abs = root.join(rel_path);
+    let Ok(bytes) = std::fs::read(&abs) else { return 0 };
+    if bytes.is_empty() {
+        return 0;
+    }
+    let mut lines = bytes.iter().filter(|b| **b == b'\n').count();
+    if !bytes.ends_with(b"\n") {
+        lines += 1;
+    }
+    lines
 }
 
 /// Result of an attempted commit. `Ok(summary)` carries git's stdout/stderr
@@ -1270,6 +1346,7 @@ mod tests {
         assert_eq!(entries, vec![ChangeEntry {
             path: "src/app.rs".to_string(),
             kind: ChangeKind::Modified,
+            ..Default::default()
         }]);
     }
 
@@ -1279,6 +1356,7 @@ mod tests {
         assert_eq!(entries, vec![ChangeEntry {
             path: "src/app.rs".to_string(),
             kind: ChangeKind::StagedModified,
+            ..Default::default()
         }]);
     }
 
@@ -1289,8 +1367,8 @@ mod tests {
         assert_eq!(
             entries,
             vec![
-                ChangeEntry { path: "src/app.rs".to_string(), kind: ChangeKind::StagedModified },
-                ChangeEntry { path: "src/app.rs".to_string(), kind: ChangeKind::Modified },
+                ChangeEntry { path: "src/app.rs".to_string(), kind: ChangeKind::StagedModified, ..Default::default() },
+                ChangeEntry { path: "src/app.rs".to_string(), kind: ChangeKind::Modified, ..Default::default() },
             ]
         );
     }
@@ -1301,6 +1379,7 @@ mod tests {
         assert_eq!(entries, vec![ChangeEntry {
             path: "scratch.txt".to_string(),
             kind: ChangeKind::Untracked,
+            ..Default::default()
         }]);
     }
 
@@ -1310,6 +1389,7 @@ mod tests {
         assert_eq!(entries, vec![ChangeEntry {
             path: "new.txt".to_string(),
             kind: ChangeKind::StagedRenamed,
+            ..Default::default()
         }]);
     }
 
@@ -1354,6 +1434,7 @@ mod tests {
         assert_eq!(entries, vec![ChangeEntry {
             path: "linked_list copy.py".to_string(),
             kind: ChangeKind::Untracked,
+            ..Default::default()
         }]);
     }
 
@@ -1363,7 +1444,25 @@ mod tests {
         assert_eq!(entries, vec![ChangeEntry {
             path: "merge.txt".to_string(),
             kind: ChangeKind::Conflicted,
+            ..Default::default()
         }]);
+    }
+
+    #[test]
+    fn parse_numstat_extracts_additions_deletions_per_path() {
+        let out = "12\t3\tsrc/app.rs\n5\t0\tREADME.md\n-\t-\tassets/logo.png\n";
+        let map = parse_numstat(out);
+        assert_eq!(map.get("src/app.rs"), Some(&(12, 3)));
+        assert_eq!(map.get("README.md"), Some(&(5, 0)));
+        assert_eq!(map.get("assets/logo.png"), Some(&(0, 0)));
+    }
+
+    #[test]
+    fn parse_numstat_keys_renames_on_destination_path() {
+        let out = "2\t1\told.rs -> new.rs\n";
+        let map = parse_numstat(out);
+        assert_eq!(map.get("new.rs"), Some(&(2, 1)));
+        assert!(map.get("old.rs").is_none());
     }
 
     #[test]
