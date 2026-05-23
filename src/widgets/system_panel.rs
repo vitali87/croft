@@ -151,7 +151,7 @@ fn fmt_temp(t: Option<u8>) -> String {
 impl Widget for &mut SystemPanel {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let block = Block::default()
-            .borders(Borders::TOP)
+            .borders(Borders::BOTTOM)
             .border_style(Style::default().fg(COLOR_DIM));
         let inner = block.inner(area);
         block.render(area, buf);
@@ -453,6 +453,42 @@ mod tests {
     fn fmt_temp_handles_missing() {
         assert_eq!(fmt_temp(Some(48)), "48°C");
         assert_eq!(fmt_temp(None), "--°C");
+    }
+
+    #[test]
+    fn temp_row_sits_just_above_bottom_border() {
+        let mut p = SystemPanel::new();
+        p.apply_sample(SystemSample {
+            cpu_pct: 10,
+            mem_pct: 20,
+            net_bps: 0,
+            disk_pct: 30,
+            temp_c: Some(52),
+        });
+        let area = Rect {
+            x: 0,
+            y: 5,
+            width: 30,
+            height: EXPANDED_HEIGHT,
+        };
+        let mut buf = Buffer::empty(area);
+        (&mut p).render(area, &mut buf);
+        let bottom_row = area.y + area.height - 1;
+        let temp_row = bottom_row - 1;
+        let mut temp_text = String::new();
+        let mut border_text = String::new();
+        for x in 0..area.width {
+            temp_text.push(buf[(x, temp_row)].symbol().chars().next().unwrap_or(' '));
+            border_text.push(buf[(x, bottom_row)].symbol().chars().next().unwrap_or(' '));
+        }
+        assert!(
+            temp_text.contains("TEMP") && temp_text.contains("52°C"),
+            "temp row was {temp_text:?}"
+        );
+        assert!(
+            border_text.chars().any(|c| c == '─'),
+            "bottom border row was {border_text:?}"
+        );
     }
 
     #[test]
