@@ -30,6 +30,7 @@ use crate::widgets::{
     run_debug::RunDebugPanel,
     search::SearchPanel,
     source_control::SourceControlPanel,
+    system_panel::SystemPanel,
     terminal::PtyTerminal,
 };
 
@@ -519,6 +520,7 @@ pub struct App {
     pub remote: RemotePanel,
     pub source_control: SourceControlPanel,
     pub run_debug: RunDebugPanel,
+    pub system_panel: SystemPanel,
     pub editor: EditorTabs,
     pub terminals: Vec<PtyTerminal>,
     pub active_terminal: usize,
@@ -566,6 +568,13 @@ pub struct App {
     /// the next redraw so the new status / entries appear within one
     /// frame of arrival.
     git_response_rx: std::sync::mpsc::Receiver<crate::git::GitResponse>,
+    /// Inbox for `SystemSample`s from the background sampler thread
+    /// (`sysmon::system_monitor_loop`). Drained each tick by
+    /// `drain_sysmon`; a non-empty drain forces a redraw so the SYSTEM
+    /// panel's sparklines advance within one frame of arrival. Sampling
+    /// stays off the render thread because sysinfo's CPU refresh holds
+    /// for the platform's minimum-interval to compute accurate %.
+    sysmon_rx: std::sync::mpsc::Receiver<crate::sysmon::SystemSample>,
     last_git_check: std::time::Instant,
     /// Anchor instant for the cursor blink. `tick_cursor_visible()` reads
     /// this to compute whether the caret is currently in its on-half or
@@ -1258,6 +1267,17 @@ impl App {
         });
         let _ = git_request_tx.send(crate::git::GitRequest::Status);
 
+        // Background system-metrics sampler: CPU / MEM / NET / DISK / TEMP
+        // refresh once per second on a dedicated thread and arrive via
+        // `sysmon_rx`. The render path never touches sysinfo because
+        // its CPU refresh needs MINIMUM_CPU_UPDATE_INTERVAL between
+        // reads to produce accurate percentages.
+        let (sysmon_tx, sysmon_rx) =
+            std::sync::mpsc::channel::<crate::sysmon::SystemSample>();
+        std::thread::spawn(move || {
+            crate::sysmon::system_monitor_loop(sysmon_tx);
+        });
+
         let (commits_tx, commits_rx) = std::sync::mpsc::channel();
         let recent_repo_remote = crate::git::croft_repository_remote();
         std::thread::spawn(move || {
@@ -1294,6 +1314,20 @@ impl App {
             remote,
             source_control,
             run_debug,
+            system_panel: {
+                let mut p = SystemPanel::new();
+                // Pre-existing app/SC tests assume the sidebar column
+                // has the full main-pane height. The SYSTEM panel
+                // would otherwise eat ~3 rows from the activity
+                // widget and shrink the SCM list under its
+                // entry-rendering threshold. Hide it by default in
+                // test builds; tests that exercise the panel itself
+                // call `set_hidden(false)`.
+                if cfg!(test) {
+                    p.set_hidden(true);
+                }
+                p
+            },
             editor,
             terminals: vec![term],
             active_terminal: 0,
@@ -1314,6 +1348,7 @@ impl App {
             git_status: crate::git::GitStatus::default(),
             git_request_tx,
             git_response_rx,
+            sysmon_rx,
             last_git_check: std::time::Instant::now(),
             cursor_blink_anchor: std::time::Instant::now(),
             activity_images: None,
@@ -2249,6 +2284,26 @@ impl App {
         }
         if changed && self.git_status.in_repo && self.default_branch_label.is_none() {
             self.default_branch_label = crate::git::default_branch(&self.tree.root).ok();
+        }
+        changed
+    }
+
+    /// Drain every SystemSample the background sampler has produced
+    /// since the last tick and feed the freshest one into the SYSTEM
+    /// panel's history. Returns true iff at least one sample was
+    /// applied so the main loop knows to redraw. Cheap when the rx is
+    /// empty: a single non-blocking try_recv.
+    pub fn drain_sysmon(&mut self) -> bool {
+        let mut changed = false;
+        loop {
+            match self.sysmon_rx.try_recv() {
+                Ok(sample) => {
+                    self.system_panel.apply_sample(sample);
+                    changed = true;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+            }
         }
         changed
     }
@@ -3493,12 +3548,36 @@ impl App {
         self.render_activity_bar(frame, activity_area);
 
         if let Some(area) = side_area {
+            let usable_area = area;
+            // Pin the SYSTEM panel to the bottom of the usable strip,
+            // beneath whichever activity is showing. The active widget
+            // gets the remaining space and scrolls within it; the panel
+            // shrinks to a 1-row chevron strip when collapsed, and
+            // hides entirely when the column is too short to leave the
+            // activity widget enough room to be usable.
+            let panel_h = self.system_panel.desired_height(usable_area.height);
+            let (activity_area, panel_area) = if panel_h > 0 {
+                let split = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Min(1), Constraint::Length(panel_h)])
+                    .split(usable_area);
+                (split[0], Some(split[1]))
+            } else {
+                (usable_area, None)
+            };
             match self.sidebar_view {
-                SidebarView::Explorer => frame.render_widget(&mut self.tree, area),
-                SidebarView::Search => frame.render_widget(&mut self.search, area),
-                SidebarView::SourceControl => frame.render_widget(&mut self.source_control, area),
-                SidebarView::Remote => frame.render_widget(&mut self.remote, area),
-                SidebarView::RunDebug => frame.render_widget(&mut self.run_debug, area),
+                SidebarView::Explorer => frame.render_widget(&mut self.tree, activity_area),
+                SidebarView::Search => frame.render_widget(&mut self.search, activity_area),
+                SidebarView::SourceControl => {
+                    frame.render_widget(&mut self.source_control, activity_area)
+                }
+                SidebarView::Remote => frame.render_widget(&mut self.remote, activity_area),
+                SidebarView::RunDebug => frame.render_widget(&mut self.run_debug, activity_area),
+            }
+            if let Some(pa) = panel_area {
+                frame.render_widget(&mut self.system_panel, pa);
+            } else {
+                self.system_panel.last_area = Rect::default();
             }
         }
         if self.editor.is_blank_initial() {
@@ -6914,6 +6993,18 @@ impl App {
                         self.splitter_drag = Some(SplitterDrag::Sidebar);
                         return;
                     }
+                }
+                // SYSTEM panel sits at the bottom of the sidebar column.
+                // A click on its header row toggles collapse; any other
+                // click inside its rect is swallowed so it doesn't fall
+                // through to the activity widget above (which would
+                // otherwise see the click as occurring on a row that's
+                // visually covered by the panel).
+                if rect_contains(self.system_panel.last_area, m.column, m.row) {
+                    if self.system_panel.hit_header(m.column, m.row) {
+                        self.system_panel.toggle_collapse();
+                    }
+                    return;
                 }
                 // The "[+]" / "[-]" buttons sit on the same row as the
                 // editor/terminal splitter, so they have to win the
@@ -17580,6 +17671,7 @@ fn main_loop(
         let connect_changed = app.poll_connect_dialog();
         app.sync_lsp();
         let lsp_changed = app.drain_lsp_completion();
+        let sysmon_changed = app.drain_sysmon();
 
         let non_pty_dirty = needs_redraw
             || fs_changed
@@ -17589,7 +17681,8 @@ fn main_loop(
             || remote_changed
             || pulls_changed
             || connect_changed
-            || lsp_changed;
+            || lsp_changed
+            || sysmon_changed;
         let pty_eligible =
             pty_pending && last_pty_redraw.elapsed() >= pty_min_interval;
         let do_redraw = non_pty_dirty || pty_eligible;

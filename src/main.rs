@@ -11,6 +11,7 @@ mod pdf;
 mod remote;
 mod remote_connect;
 mod sheet;
+mod sysmon;
 mod widgets;
 
 use anyhow::Result;
