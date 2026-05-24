@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
@@ -16,6 +18,7 @@ pub enum DialogPhase {
     AwaitingVerificationCode,
     AwaitingHostKeyConfirmation,
     AwaitingGeneric,
+    Installing,
     Authenticated,
     Failed,
 }
@@ -53,6 +56,8 @@ pub struct ConnectDialog {
     pub submit_btn: Rect,
     pub field_rect: Rect,
     pub caret_pos: Option<(u16, u16)>,
+    pub submitted: bool,
+    pub install_started_at: Option<Instant>,
 }
 
 const SPINNER_FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
@@ -82,6 +87,8 @@ impl ConnectDialog {
             submit_btn: Rect::default(),
             field_rect: Rect::default(),
             caret_pos: None,
+            submitted: false,
+            install_started_at: None,
         }
     }
 
@@ -113,31 +120,52 @@ impl ConnectDialog {
     }
 
     pub fn set_prompt(&mut self, kind: PromptKind, line: String) {
-        self.prompt_text = line.trim().to_string();
-        self.phase = match kind {
+        let trimmed = line.trim().to_string();
+        let new_phase = match kind {
             PromptKind::Password => DialogPhase::AwaitingPassword,
             PromptKind::Passphrase => DialogPhase::AwaitingPassphrase,
             PromptKind::VerificationCode => DialogPhase::AwaitingVerificationCode,
             PromptKind::HostKeyConfirmation => DialogPhase::AwaitingHostKeyConfirmation,
             PromptKind::Generic => DialogPhase::AwaitingGeneric,
         };
-        self.input.clear();
-        self.status_line = match self.phase {
-            DialogPhase::AwaitingPassword => format!("{} wants your password", self.host),
-            DialogPhase::AwaitingPassphrase => String::from("Enter the key passphrase"),
-            DialogPhase::AwaitingVerificationCode => String::from("Enter the 2FA code"),
-            DialogPhase::AwaitingHostKeyConfirmation => {
-                String::from("First-time host key — type yes to continue")
-            }
-            DialogPhase::AwaitingGeneric => String::from("Server prompt"),
-            _ => String::new(),
-        };
+        let same_prompt = self.phase == new_phase && self.prompt_text == trimmed;
+        self.prompt_text = trimmed;
+        self.phase = new_phase;
+        if !same_prompt {
+            self.input.clear();
+            self.status_line = default_status_for(&self.phase, &self.host);
+            self.submitted = false;
+        } else if self.submitted {
+            self.input.clear();
+            self.status_line = match self.phase {
+                DialogPhase::AwaitingPassword => {
+                    String::from("Authentication failed, type the password again")
+                }
+                DialogPhase::AwaitingPassphrase => {
+                    String::from("Passphrase rejected, try again")
+                }
+                DialogPhase::AwaitingVerificationCode => {
+                    String::from("Code rejected, try again")
+                }
+                _ => default_status_for(&self.phase, &self.host),
+            };
+            self.submitted = false;
+        }
     }
 
     pub fn set_authenticated(&mut self) {
         self.phase = DialogPhase::Authenticated;
         self.status_line = format!("Authenticated to {}", self.host);
         self.input.clear();
+    }
+
+    pub fn set_installing(&mut self) {
+        self.phase = DialogPhase::Installing;
+        self.status_line = format!("Preparing remote croft on {}…", self.host);
+        self.input.clear();
+        self.show_logs = true;
+        self.submitted = false;
+        self.install_started_at = Some(Instant::now());
     }
 
     pub fn set_failed(&mut self, detail: String) {
@@ -188,11 +216,68 @@ impl ConnectDialog {
     }
 }
 
+fn log_line_color(line: &str) -> Color {
+    let lower = line.to_ascii_lowercase();
+    if lower.contains("error")
+        || lower.contains("failed")
+        || lower.contains("permission denied")
+    {
+        return RED;
+    }
+    if lower.contains("warning") || lower.contains("warn:") {
+        return Color::Rgb(0xf9, 0xc8, 0x5b);
+    }
+    if lower.starts_with("installed ")
+        || lower.contains("install complete")
+        || lower.contains("up to date")
+        || lower.contains("authenticated")
+    {
+        return TEAL;
+    }
+    if lower.starts_with("compiling ")
+        || lower.starts_with("downloading ")
+        || lower.starts_with("downloaded ")
+        || lower.starts_with("updating ")
+        || lower.starts_with("running ")
+        || lower.starts_with("installing ")
+        || lower.starts_with("syncing ")
+        || lower.starts_with("rsyncing ")
+        || lower.starts_with("cross-compiling ")
+        || lower.starts_with("hashing ")
+        || lower.starts_with("checking ")
+        || lower.starts_with("adopting ")
+        || lower.starts_with("local source stamp")
+    {
+        return ACCENT;
+    }
+    Color::Rgb(0xb4, 0xbe, 0xc8)
+}
+
+fn default_status_for(phase: &DialogPhase, host: &str) -> String {
+    match phase {
+        DialogPhase::AwaitingPassword => format!("{} wants your password", host),
+        DialogPhase::AwaitingPassphrase => String::from("Enter the key passphrase"),
+        DialogPhase::AwaitingVerificationCode => String::from("Enter the 2FA code"),
+        DialogPhase::AwaitingHostKeyConfirmation => {
+            String::from("First-time host key, type yes to continue")
+        }
+        DialogPhase::AwaitingGeneric => String::from("Server prompt"),
+        _ => String::new(),
+    }
+}
+
 impl Widget for &mut ConnectDialog {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        let width = area.width.min(72).max(48);
-        let logs_h: u16 = if self.show_logs { 12 } else { 0 };
-        let base_h: u16 = 12;
+        let installing = matches!(self.phase, DialogPhase::Installing);
+        let target_width: u16 = if installing { 100 } else { 72 };
+        let width = area.width.min(target_width).max(48);
+        let (base_h, logs_h): (u16, u16) = if installing {
+            (5, 24)
+        } else if self.show_logs {
+            (12, 12)
+        } else {
+            (12, 0)
+        };
         let height = (base_h + logs_h).min(area.height.saturating_sub(2));
         let x = area.x + area.width.saturating_sub(width) / 2;
         let y = area.y + area.height.saturating_sub(height) / 2;
@@ -236,6 +321,7 @@ impl Widget for &mut ConnectDialog {
             DialogPhase::AwaitingVerificationCode => "2FA",
             DialogPhase::AwaitingHostKeyConfirmation => "Host key",
             DialogPhase::AwaitingGeneric => "Prompt",
+            DialogPhase::Installing => "Installing",
             DialogPhase::Authenticated => "Done",
             DialogPhase::Failed => "Failed",
         };
@@ -249,33 +335,39 @@ impl Widget for &mut ConnectDialog {
         } else {
             self.spinner_glyph()
         };
-        buf.set_line(
-            inner.x,
-            cy,
-            &Line::from(vec![
-                Span::styled(
-                    format!(" {indicator} "),
-                    Style::default().fg(phase_color).bg(PANEL_BG),
-                ),
-                Span::styled(
-                    phase_label,
-                    Style::default()
-                        .fg(Color::White)
-                        .bg(PANEL_BG)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    format!("  {}", self.status_line),
-                    Style::default()
-                        .fg(Color::Rgb(0xb4, 0xbe, 0xc8))
-                        .bg(PANEL_BG),
-                ),
-            ]),
-            inner.width,
-        );
+        let mut header_spans: Vec<Span<'_>> = vec![
+            Span::styled(
+                format!(" {indicator} "),
+                Style::default().fg(phase_color).bg(PANEL_BG),
+            ),
+            Span::styled(
+                phase_label,
+                Style::default()
+                    .fg(Color::White)
+                    .bg(PANEL_BG)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("  {}", self.status_line),
+                Style::default()
+                    .fg(Color::Rgb(0xb4, 0xbe, 0xc8))
+                    .bg(PANEL_BG),
+            ),
+        ];
+        if installing {
+            if let Some(started) = self.install_started_at {
+                let secs = started.elapsed().as_secs();
+                let label = format!("  {:02}:{:02}", secs / 60, secs % 60);
+                header_spans.push(Span::styled(
+                    label,
+                    Style::default().fg(TEAL).bg(PANEL_BG).add_modifier(Modifier::BOLD),
+                ));
+            }
+        }
+        buf.set_line(inner.x, cy, &Line::from(header_spans), inner.width);
         cy = cy.saturating_add(2);
 
-        if cy < inner.y + inner.height {
+        if !installing && cy < inner.y + inner.height {
             buf.set_line(
                 inner.x,
                 cy,
@@ -480,13 +572,12 @@ impl Widget for &mut ConnectDialog {
                             cell.set_char(' ');
                             cell.set_style(Style::default().bg(PANEL_BG));
                         }
+                        let fg = log_line_color(line);
                         buf.set_string(
                             inner_log.x,
                             y,
                             txt,
-                            Style::default()
-                                .fg(Color::Rgb(0xb4, 0xbe, 0xc8))
-                                .bg(PANEL_BG),
+                            Style::default().fg(fg).bg(PANEL_BG),
                         );
                     }
                 }

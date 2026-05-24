@@ -10,6 +10,7 @@ mod lsp;
 mod pdf;
 mod remote;
 mod remote_connect;
+mod install_session;
 mod sheet;
 mod sysmon;
 mod widgets;

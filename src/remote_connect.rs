@@ -38,6 +38,7 @@ pub struct SshAuth {
     cancelled: Arc<AtomicBool>,
     finished: bool,
     handed_off: bool,
+    authenticated_signaled: bool,
     started: Instant,
 }
 
@@ -95,6 +96,7 @@ impl SshAuth {
             cancelled,
             finished: false,
             handed_off: false,
+            authenticated_signaled: false,
             started: Instant::now(),
         })
     }
@@ -120,10 +122,18 @@ impl SshAuth {
     }
 
     fn poll_child_for_completion(&mut self, out: &mut Vec<SshAuthEvent>) {
+        if !self.authenticated_signaled && self.socket_path.exists() {
+            self.authenticated_signaled = true;
+            out.push(SshAuthEvent::Authenticated);
+            return;
+        }
         if let Ok(Some(status)) = self.child.try_wait() {
             self.finished = true;
             if status.success() && self.socket_path.exists() {
-                out.push(SshAuthEvent::Authenticated);
+                if !self.authenticated_signaled {
+                    self.authenticated_signaled = true;
+                    out.push(SshAuthEvent::Authenticated);
+                }
             } else {
                 let detail = if !self.socket_path.exists() {
                     format!(
@@ -161,13 +171,17 @@ impl SshAuth {
         self.writer.take();
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let _ = std::process::Command::new("ssh")
-            .arg("-S")
-            .arg(&self.socket_path)
-            .arg("-O")
-            .arg("exit")
-            .arg(&self.host)
-            .status();
+        if self.socket_path.exists() {
+            let _ = std::process::Command::new("ssh")
+                .arg("-S")
+                .arg(&self.socket_path)
+                .arg("-O")
+                .arg("exit")
+                .arg(&self.host)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
         let _ = std::fs::remove_dir_all(&self.socket_dir);
         self.finished = true;
     }
@@ -177,11 +191,13 @@ impl SshAuth {
     /// this call the SshAuth no longer cleans the socket up on drop.
     pub fn hand_off(mut self) -> AdoptedMaster {
         self.handed_off = true;
-        AdoptedMaster {
-            host: std::mem::take(&mut self.host),
-            socket_dir: std::mem::replace(&mut self.socket_dir, PathBuf::new()),
-            socket_path: std::mem::replace(&mut self.socket_path, PathBuf::new()),
-        }
+        let adopted = AdoptedMaster {
+            host: self.host.clone(),
+            socket_dir: self.socket_dir.clone(),
+            socket_path: self.socket_path.clone(),
+        };
+        std::mem::forget(self);
+        adopted
     }
 }
 
@@ -202,6 +218,8 @@ impl Drop for SshAuth {
                 .arg("-O")
                 .arg("exit")
                 .arg(&self.host)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
                 .status();
         }
         if !self.handed_off && self.socket_dir.as_os_str().len() > 0 {
@@ -311,7 +329,6 @@ pub fn peel_prompt(tail: &mut String) -> Option<SshAuthEvent> {
     let kind = classify_prompt(active)?;
     let line = active.to_string();
     tail.drain(nl..);
-    tail.push_str(&line);
     Some(SshAuthEvent::Prompt { kind, line })
 }
 
@@ -421,5 +438,29 @@ mod tests {
     fn peel_prompt_returns_none_when_only_log_lines() {
         let mut tail = String::from("debug1: client_loop: send disconnect: Broken pipe\n");
         assert!(peel_prompt(&mut tail).is_none());
+    }
+
+    #[test]
+    fn control_socket_existence_is_a_valid_authenticated_signal() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let sock = tmp.path().join("ctl");
+        assert!(!sock.exists());
+        std::fs::write(&sock, b"").expect("touch fake socket");
+        assert!(
+            sock.exists(),
+            "ssh -M -N keeps the child running after auth, so the socket file appearing is the only reliable success signal"
+        );
+    }
+
+    #[test]
+    fn peel_prompt_consumes_the_prompt_so_repeated_calls_do_not_loop() {
+        let mut tail = String::from("debug1: connected\nuser@host's password: ");
+        let first = peel_prompt(&mut tail);
+        assert!(matches!(first, Some(SshAuthEvent::Prompt { .. })));
+        let second = peel_prompt(&mut tail);
+        assert!(
+            second.is_none(),
+            "second call must return None or the reader thread spams the channel forever"
+        );
     }
 }

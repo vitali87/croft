@@ -839,6 +839,7 @@ pub struct App {
     shortcuts_hit_rect: Option<Rect>,
     connect_dialog: Option<crate::widgets::connect_dialog::ConnectDialog>,
     connect_auth: Option<crate::remote_connect::SshAuth>,
+    install_session: Option<crate::install_session::InstallSession>,
     /// One-shot flag the driver consumes to fire `terminal.clear()` so
     /// iTerm2 evicts the OSC-1337 image cells (activity bar icons,
     /// welcome wordmark, editor image preview) that would otherwise
@@ -1427,6 +1428,7 @@ impl App {
             shortcuts_hit_rect: None,
             connect_dialog: None,
             connect_auth: None,
+            install_session: None,
             shortcuts_image_clear_requested: false,
             ssh_empty_state_osc: None,
             ssh_empty_state_displayed: false,
@@ -1898,7 +1900,21 @@ impl App {
     /// outlast iTerm2's image-cache eviction under heavy SGR traffic.
     pub fn flush_welcome_codeberg_badge_overlay(&mut self) {
         use std::io::Write;
-        if self.shortcuts_modal.is_some() || self.file_finder.is_some() {
+        if self.shortcuts_modal.is_some()
+            || self.file_finder.is_some()
+            || self.connect_dialog.is_some()
+        {
+            if let Some((px, py)) = self.welcome_codeberg_badge_last_emitted.take() {
+                let mut out = stdout();
+                let cursor_on = self.cursor_should_be_visible();
+                let _ = write!(out, "\x1b[?25l\x1b[s");
+                let _ = write!(out, "\x1b[{};{}H  ", py + 1, px + 1);
+                let _ = write!(out, "\x1b[u");
+                if cursor_on {
+                    let _ = write!(out, "\x1b[?25h");
+                }
+                let _ = out.flush();
+            }
             return;
         }
         if !self.editor.is_blank_initial() {
@@ -4928,6 +4944,7 @@ impl App {
                     Some(crate::widgets::connect_dialog::ConnectDialog::new(host.clone()));
                 self.pending_remote_launch_path = path;
                 self.pending_remote_launch_host = Some(host);
+                self.welcome_image_clear_requested = true;
             }
             Err(e) => {
                 self.status = format!("Could not start ssh: {e}");
@@ -4957,7 +4974,7 @@ impl App {
                     dialog.set_prompt(kind, line);
                 }
                 crate::remote_connect::SshAuthEvent::Authenticated => {
-                    dialog.set_authenticated();
+                    dialog.set_installing();
                     authenticated = true;
                 }
                 crate::remote_connect::SshAuthEvent::Failed(detail) => {
@@ -4975,23 +4992,81 @@ impl App {
                 self.pending_remote_launch_host.take(),
             ) {
                 let adopted = auth.hand_off();
-                self.remote_launch = Some(RemoteLaunch {
-                    host: host.clone(),
-                    path: self.pending_remote_launch_path.take(),
-                    adopted: Some(adopted),
-                });
-                self.status = format!("Authenticated to {host}");
-                self.connect_dialog = None;
-                self.quit = true;
+                let path = self.pending_remote_launch_path.take();
+                self.install_session = Some(
+                    crate::install_session::InstallSession::start(adopted, host.clone(), path),
+                );
+                self.status = format!("Preparing remote croft on {host}…");
             }
         }
         true
+    }
+
+    pub fn poll_install_session(&mut self) -> bool {
+        let Some(session) = self.install_session.as_mut() else {
+            return false;
+        };
+        let events = session.drain_events();
+        let mut changed = !events.is_empty();
+        let mut done = false;
+        let mut failure: Option<String> = None;
+        if let Some(dialog) = self.connect_dialog.as_mut() {
+            for ev in events {
+                match ev {
+                    crate::install_session::InstallEvent::Log(line) => {
+                        dialog.push_log(&line);
+                    }
+                    crate::install_session::InstallEvent::Done(Ok(())) => {
+                        done = true;
+                    }
+                    crate::install_session::InstallEvent::Done(Err(detail)) => {
+                        failure = Some(detail);
+                    }
+                }
+            }
+        } else {
+            for ev in events {
+                match ev {
+                    crate::install_session::InstallEvent::Done(Ok(())) => done = true,
+                    crate::install_session::InstallEvent::Done(Err(detail)) => {
+                        failure = Some(detail)
+                    }
+                    crate::install_session::InstallEvent::Log(_) => {}
+                }
+            }
+        }
+        if let Some(detail) = failure {
+            if let Some(dialog) = self.connect_dialog.as_mut() {
+                dialog.set_failed(detail.clone());
+            }
+            self.install_session = None;
+            self.status = format!("Remote install failed: {detail}");
+            changed = true;
+        } else if done {
+            if let Some(mut session) = self.install_session.take() {
+                if let Some(adopted) = session.take_adopted() {
+                    let host = session.host.clone();
+                    let path = session.path.clone();
+                    self.remote_launch = Some(RemoteLaunch {
+                        host: host.clone(),
+                        path,
+                        adopted: Some(adopted),
+                    });
+                    self.status = format!("Launching croft on {host}…");
+                    self.connect_dialog = None;
+                    self.quit = true;
+                }
+            }
+            changed = true;
+        }
+        changed
     }
 
     fn tear_down_connect_auth(&mut self) {
         if let Some(mut auth) = self.connect_auth.take() {
             auth.cancel();
         }
+        self.install_session = None;
         self.pending_remote_launch_host = None;
         self.pending_remote_launch_path = None;
     }
@@ -5024,16 +5099,19 @@ impl App {
                     return;
                 }
                 let payload = dialog.input_for_submit();
-                dialog.status_line =
-                    format!("Sending {} chars to {}…", payload.chars().count(), dialog.host);
+                dialog.submitted = true;
+                dialog.status_line = format!("Verifying credentials with {}…", dialog.host);
                 dialog.clear_input();
                 if let Some(auth) = self.connect_auth.as_mut() {
                     auth.respond_password(&payload);
                 }
             }
             KeyCode::Backspace => dialog.pop_input_char(),
-            KeyCode::Tab => dialog.toggle_logs(),
-            KeyCode::Char('l') | KeyCode::Char('L') if has_mod => dialog.toggle_logs(),
+            KeyCode::Char('l') | KeyCode::Char('L')
+                if has_mod || !dialog.phase.awaits_input() =>
+            {
+                dialog.toggle_logs();
+            }
             KeyCode::Char(c) if !has_mod => dialog.push_input_char(c),
             _ => {}
         }
@@ -5055,6 +5133,9 @@ impl App {
         }
         if rect_contains(dialog.submit_btn, col, row) && dialog.phase.awaits_input() {
             let payload = dialog.input_for_submit();
+            dialog.submitted = true;
+            dialog.status_line =
+                format!("Sending {} chars to {}…", payload.chars().count(), dialog.host);
             dialog.clear_input();
             if let Some(auth) = self.connect_auth.as_mut() {
                 auth.respond_password(&payload);
@@ -17490,24 +17571,41 @@ pub fn run(root: PathBuf) -> Result<()> {
 
     result?;
     if let Some(remote) = app.remote_launch.take() {
-        // Tear down the local croft's background workers BEFORE we hand
-        // the terminal to the remote-launched croft. Otherwise the
-        // fs-watcher thread keeps firing FSEvents callbacks and pushing
-        // into an unbounded mpsc channel that nobody drains (main loop
-        // has exited), and the embedded shell's PTY reader keeps feeding
-        // alacritty_terminal — both leak heap for the duration of the
-        // SSH session. Closing them here pegs the local process at a
-        // few MB while the user lives inside the remote croft.
         app._fs_watcher = None;
         app.fs_rx = None;
         app.fs_watcher_init_rx = None;
-        crate::remote::launch_croft_with(
-            &remote.host,
-            remote.path.as_deref(),
-            remote.adopted,
-        )?;
+        let launch_result = if let Some(adopted) = remote.adopted {
+            crate::remote::launch_only(adopted, remote.path.as_deref())
+        } else {
+            crate::remote::launch_croft_with(
+                &remote.host,
+                remote.path.as_deref(),
+                None,
+            )
+        };
+        restore_host_terminal_state();
+        launch_result?;
     }
     Ok(())
+}
+
+/// Re-send the terminal-restore escape sequences after a remote ssh
+/// session ends. The remote croft enables alt-screen, mouse tracking,
+/// and bracketed paste on the local tty; if it crashed or exited
+/// abnormally those modes can leak back into the user's shell. Re-
+/// emitting the disable sequences here ensures the host shell is
+/// always returned to a clean state.
+fn restore_host_terminal_state() {
+    use std::io::Write;
+    let mut out = stdout();
+    // Disable every mouse-tracking mode crossterm knows about, plus
+    // bracketed paste, plus exit any leftover alt-screen, plus reset
+    // the cursor style. Written directly because crossterm's execute!
+    // requires a Backend handle that we no longer have here.
+    let _ = out.write_all(
+        b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l\x1b[?2004l\x1b[?1049l\x1b[ q",
+    );
+    let _ = out.flush();
 }
 
 /// Suspend the alt-screen, run every queued scp upload with the host
@@ -17669,6 +17767,7 @@ fn main_loop(
         let remote_changed = app.refresh_remote_if_config_changed();
         let pulls_changed = app.drain_remote_pulls();
         let connect_changed = app.poll_connect_dialog();
+        let install_changed = app.poll_install_session();
         app.sync_lsp();
         let lsp_changed = app.drain_lsp_completion();
         let sysmon_changed = app.drain_sysmon();
@@ -17681,6 +17780,7 @@ fn main_loop(
             || remote_changed
             || pulls_changed
             || connect_changed
+            || install_changed
             || lsp_changed
             || sysmon_changed;
         let pty_eligible =
@@ -17822,6 +17922,7 @@ fn main_loop(
             // blank initial state.
             if app.shortcuts_modal.is_none()
                 && app.file_finder.is_none()
+                && app.connect_dialog.is_none()
                 && app.editor.is_blank_initial()
                 && app.welcome_overlay_dirty
                 && !app.terminal_maximized

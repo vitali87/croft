@@ -149,6 +149,259 @@ pub fn launch_croft(host: &str, path: Option<&str>) -> Result<()> {
     launch_croft_with(host, path, None)
 }
 
+/// Run any required remote-install work inside the current process,
+/// streaming all subprocess stdout/stderr lines through `log_tx` so the
+/// in-TUI connect dialog can render them in its log panel. Returns the
+/// adopted master untouched so the caller can hand it to
+/// `launch_only` once it has surrendered the alt-screen.
+pub fn install_only_streaming(
+    adopted: AdoptedMaster,
+    log_tx: std::sync::mpsc::Sender<String>,
+) -> Result<AdoptedMaster> {
+    let host_label = adopted.host.clone();
+    let _ = log_tx.send(format!("Adopting control socket for {host_label}…"));
+    let ssh = SshControl::adopt(adopted.clone());
+    let _ = log_tx.send("Hashing local source tree…".to_string());
+    let local_stamp = local_source_stamp()?;
+    let _ = log_tx.send(format!("Local source stamp: {local_stamp}"));
+    let _ = log_tx.send(format!("Checking installed croft version on {host_label}…"));
+    if !remote_install_needed(&ssh, &local_stamp)? {
+        let _ = log_tx.send(format!("Croft on {host_label} is already up to date."));
+        std::mem::forget(ssh);
+        return Ok(adopted);
+    }
+    let _ = log_tx.send(format!("Installing/updating Croft on {host_label}…"));
+    install_remote_croft_streaming(&ssh, &local_stamp, &log_tx)?;
+    let _ = log_tx.send("Install complete.".to_string());
+    std::mem::forget(ssh);
+    Ok(adopted)
+}
+
+/// Counterpart to `install_only_streaming`: skips the install check and
+/// runs the actual remote croft. Must be called only after the terminal
+/// has been returned to cooked mode and the alt-screen surrendered, since
+/// the spawned ssh shares stdin/stdout/stderr with the user's terminal.
+pub fn launch_only(adopted: AdoptedMaster, path: Option<&str>) -> Result<()> {
+    let ssh = SshControl::adopt(adopted);
+    let pump = match DropPump::start(&ssh) {
+        Ok(p) => Some(p),
+        Err(e) => {
+            eprintln!("Drag-drop relay disabled: {e}");
+            None
+        }
+    };
+    let env = pump.as_ref().map(DropPump::remote_env).unwrap_or_default();
+    let status = run_remote_croft(&ssh, path, &env)?;
+    if status.success() {
+        return Ok(());
+    }
+    if status.code() == Some(127) {
+        eprintln!("Croft is not installed on {}; bootstrapping...", ssh.host);
+        let stamp = local_source_stamp()?;
+        install_remote_croft(&ssh, &stamp)?;
+        let status = run_remote_croft(&ssh, path, &env)?;
+        if status.success() {
+            return Ok(());
+        }
+        anyhow::bail!("ssh exited with {status}");
+    }
+    anyhow::bail!("ssh exited with {status}");
+}
+
+fn run_command_streaming(
+    mut cmd: Command,
+    log_tx: &std::sync::mpsc::Sender<String>,
+) -> Result<std::process::ExitStatus> {
+    use std::io::{BufRead, BufReader};
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = cmd.spawn().context("spawning streaming subprocess")?;
+    let stdout = child.stdout.take().expect("stdout pipe");
+    let stderr = child.stderr.take().expect("stderr pipe");
+    let tx1 = log_tx.clone();
+    let h1 = std::thread::spawn(move || {
+        let r = BufReader::new(stdout);
+        for line in r.lines().map_while(|l| l.ok()) {
+            let _ = tx1.send(line);
+        }
+    });
+    let tx2 = log_tx.clone();
+    let h2 = std::thread::spawn(move || {
+        let r = BufReader::new(stderr);
+        for line in r.lines().map_while(|l| l.ok()) {
+            let _ = tx2.send(line);
+        }
+    });
+    let status = child.wait().context("waiting for subprocess")?;
+    let _ = h1.join();
+    let _ = h2.join();
+    Ok(status)
+}
+
+fn install_remote_croft_streaming(
+    ssh: &SshControl,
+    source_stamp: &str,
+    log_tx: &std::sync::mpsc::Sender<String>,
+) -> Result<()> {
+    match try_local_cross_install_streaming(ssh, source_stamp, log_tx) {
+        Ok(true) => return Ok(()),
+        Ok(false) => {}
+        Err(e) => {
+            let _ = log_tx.send(format!(
+                "Local cross-build skipped ({e}); falling back to remote cargo install"
+            ));
+        }
+    }
+    let _ = log_tx.send("Syncing source tree to remote…".to_string());
+    sync_local_source_to_remote_streaming(ssh, log_tx)?;
+    let _ = log_tx.send(
+        "Running cargo install on remote (first time can take several minutes)…".to_string(),
+    );
+    let mut cmd = ssh.command();
+    cmd.arg(&ssh.host).arg(remote_install_command(source_stamp));
+    let status =
+        run_command_streaming(cmd, log_tx).context("installing croft on remote")?;
+    if !status.success() {
+        anyhow::bail!("remote croft install failed with {status}");
+    }
+    Ok(())
+}
+
+fn try_local_cross_install_streaming(
+    ssh: &SshControl,
+    source_stamp: &str,
+    log_tx: &std::sync::mpsc::Sender<String>,
+) -> Result<bool> {
+    if !cross_compile_available() {
+        return Ok(false);
+    }
+    let Some(triple) = remote_target_triple(ssh)? else {
+        return Ok(false);
+    };
+    if !rust_target_installed(triple) {
+        let _ = log_tx.send(format!(
+            "Local cross-build skipped: rustup target `{triple}` missing (run `rustup target add {triple}` once to enable the fast path)"
+        ));
+        return Ok(false);
+    }
+
+    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let _ = log_tx.send(format!("Cross-compiling croft locally for {triple}…"));
+    let mut zigbuild = Command::new("cargo");
+    zigbuild
+        .args([
+            "zigbuild",
+            "--profile",
+            "remote-fast",
+            "--locked",
+            "--bin",
+            "croft",
+            "--target",
+            triple,
+        ])
+        .current_dir(&source);
+    let status = run_command_streaming(zigbuild, log_tx).context("running cargo zigbuild")?;
+    if !status.success() {
+        anyhow::bail!("cargo zigbuild exited with {status}");
+    }
+
+    let binary = source
+        .join("target")
+        .join(triple)
+        .join("remote-fast")
+        .join("croft");
+    if !binary.exists() {
+        anyhow::bail!(
+            "cargo zigbuild reported success but {} is missing",
+            binary.display()
+        );
+    }
+
+    let mut mkdir = ssh.command();
+    mkdir
+        .arg(&ssh.host)
+        .arg("mkdir -p \"$HOME/.cargo/bin\" \"$HOME/.cache/croft\"");
+    let mkdir_status =
+        run_command_streaming(mkdir, log_tx).context("creating remote install dirs")?;
+    if !mkdir_status.success() {
+        anyhow::bail!("remote mkdir exited with {mkdir_status}");
+    }
+
+    let ssh_e = format!(
+        "ssh -S {} -o ControlMaster=no",
+        shell_quote_for_e_arg(&ssh.socket_path),
+    );
+    let dest = format!("{}:.cargo/bin/croft.new", ssh.host);
+    let _ = log_tx.send(format!("Rsyncing binary to {dest}…"));
+    let mut rsync = Command::new("rsync");
+    rsync
+        .args(["-az", "--checksum", "-e"])
+        .arg(&ssh_e)
+        .arg(&binary)
+        .arg(&dest);
+    let rsync_status =
+        run_command_streaming(rsync, log_tx).context("rsyncing croft binary to remote")?;
+    if !rsync_status.success() {
+        anyhow::bail!("rsync exited with {rsync_status}");
+    }
+
+    let activate = format!(
+        "chmod 755 \"$HOME/.cargo/bin/croft.new\" && mv \"$HOME/.cargo/bin/croft.new\" \"$HOME/.cargo/bin/croft\" && printf %s {} > \"$HOME/.cache/croft/install-stamp\"",
+        shell_quote(source_stamp)
+    );
+    let mut act = ssh.command();
+    act.arg(&ssh.host).arg(activate);
+    let act_status =
+        run_command_streaming(act, log_tx).context("activating remote croft binary")?;
+    if !act_status.success() {
+        anyhow::bail!("remote activation exited with {act_status}");
+    }
+    let _ = log_tx.send("Installed croft on remote via local cross-build.".to_string());
+    Ok(true)
+}
+
+fn sync_local_source_to_remote_streaming(
+    ssh: &SshControl,
+    log_tx: &std::sync::mpsc::Sender<String>,
+) -> Result<()> {
+    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let mut mkdir = ssh.command();
+    mkdir
+        .arg(&ssh.host)
+        .arg("mkdir -p \"$HOME/.cache/croft/source\"");
+    let mkdir_status =
+        run_command_streaming(mkdir, log_tx).context("creating remote source dir")?;
+    if !mkdir_status.success() {
+        anyhow::bail!("remote mkdir exited with {mkdir_status}");
+    }
+    let ssh_e = format!(
+        "ssh -S {} -o ControlMaster=no",
+        shell_quote_for_e_arg(&ssh.socket_path),
+    );
+    let mut source_arg: std::ffi::OsString = source.clone().into_os_string();
+    source_arg.push("/");
+    let dest = format!("{}:.cache/croft/source/", ssh.host);
+    let mut rsync = Command::new("rsync");
+    rsync
+        .args([
+            "-a",
+            "-z",
+            "--delete",
+            "--exclude=target",
+            "--exclude=.git",
+            "--exclude=.DS_Store",
+            "--exclude=assets/.DS_Store",
+            "-e",
+        ])
+        .arg(&ssh_e)
+        .arg(&source_arg)
+        .arg(&dest);
+    let status = run_command_streaming(rsync, log_tx).context("running rsync to remote")?;
+    if !status.success() {
+        anyhow::bail!("rsync exited with {status}");
+    }
+    Ok(())
+}
+
 /// Same as `launch_croft` but reuses an already-established SSH ControlMaster
 /// socket so the in-TUI auth flow (PTY-driven password dialog) doesn't need
 /// to prompt the user a second time when the post-quit path hands off the
@@ -202,6 +455,7 @@ pub struct SshControl {
 /// Hand-off bundle for an already-established SSH ControlMaster, used by
 /// the in-TUI password dialog to avoid re-prompting the user when the
 /// post-quit flow takes over the connection.
+#[derive(Clone)]
 pub struct AdoptedMaster {
     pub host: String,
     pub socket_dir: PathBuf,
@@ -248,7 +502,13 @@ impl SshControl {
             .arg("-S")
             .arg(&self.socket_path)
             .arg("-o")
-            .arg("ControlMaster=no");
+            .arg("ControlMaster=no")
+            .arg("-o")
+            .arg("ConnectTimeout=10")
+            .arg("-o")
+            .arg("ServerAliveInterval=10")
+            .arg("-o")
+            .arg("ServerAliveCountMax=3");
         command
     }
 }
