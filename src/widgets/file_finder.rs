@@ -39,6 +39,7 @@ pub struct ScoredResult {
 #[derive(Default)]
 pub struct FileFinder {
     pub query: String,
+    pub cursor: usize,
     pub entries: Arc<Vec<FileEntry>>,
     pub results: Vec<ScoredResult>,
     pub selected: usize,
@@ -51,6 +52,7 @@ impl FileFinder {
     pub fn new(entries: Arc<Vec<FileEntry>>) -> Self {
         let mut me = Self {
             query: String::new(),
+            cursor: 0,
             entries,
             results: Vec::new(),
             selected: 0,
@@ -68,9 +70,22 @@ impl FileFinder {
             return;
         }
         self.query = q.to_string();
+        self.cursor = self.query.chars().count();
         self.refresh_results();
         self.selected = 0;
         self.scroll = 0;
+    }
+
+    fn char_count(&self) -> usize {
+        self.query.chars().count()
+    }
+
+    fn byte_offset(&self, char_idx: usize) -> usize {
+        self.query
+            .char_indices()
+            .nth(char_idx)
+            .map(|(b, _)| b)
+            .unwrap_or(self.query.len())
     }
 
     pub fn replace_entries(&mut self, entries: Arc<Vec<FileEntry>>) {
@@ -90,18 +105,51 @@ impl FileFinder {
     }
 
     pub fn push_char(&mut self, c: char) {
-        self.query.push(c);
+        let at = self.byte_offset(self.cursor);
+        self.query.insert(at, c);
+        self.cursor += 1;
         self.refresh_results();
         self.selected = 0;
         self.scroll = 0;
     }
 
     pub fn pop_char(&mut self) {
-        if self.query.pop().is_some() {
-            self.refresh_results();
-            self.selected = 0;
-            self.scroll = 0;
+        if self.cursor == 0 {
+            return;
         }
+        let at = self.byte_offset(self.cursor - 1);
+        self.query.remove(at);
+        self.cursor -= 1;
+        self.refresh_results();
+        self.selected = 0;
+        self.scroll = 0;
+    }
+
+    pub fn delete_char(&mut self) {
+        if self.cursor >= self.char_count() {
+            return;
+        }
+        let at = self.byte_offset(self.cursor);
+        self.query.remove(at);
+        self.refresh_results();
+        self.selected = 0;
+        self.scroll = 0;
+    }
+
+    pub fn move_cursor_left(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    pub fn move_cursor_right(&mut self) {
+        self.cursor = (self.cursor + 1).min(self.char_count());
+    }
+
+    pub fn move_cursor_home(&mut self) {
+        self.cursor = 0;
+    }
+
+    pub fn move_cursor_end(&mut self) {
+        self.cursor = self.char_count();
     }
 
     pub fn select_next(&mut self) {
@@ -531,18 +579,23 @@ pub fn render_file_finder(finder: &mut FileFinder, area: Rect, buf: &mut Buffer)
         return;
     }
 
+    let query_style = Style::default()
+        .fg(Color::Rgb(0xec, 0xef, 0xf4))
+        .add_modifier(Modifier::BOLD);
+    let caret_style = Style::default()
+        .fg(Color::Rgb(0x16, 0x18, 0x1f))
+        .bg(Color::Rgb(0xec, 0xef, 0xf4))
+        .add_modifier(Modifier::SLOW_BLINK);
+    let cursor = finder.cursor.min(finder.query.chars().count());
+    let before: String = finder.query.chars().take(cursor).collect();
+    let at: String = finder.query.chars().skip(cursor).take(1).collect();
+    let after: String = finder.query.chars().skip(cursor + 1).collect();
+    let caret_glyph = if at.is_empty() { String::from(" ") } else { at };
     let prompt_line = Line::from(vec![
         Span::styled("> ", Style::default().fg(Color::Rgb(0x88, 0xc0, 0xd0))),
-        Span::styled(
-            finder.query.clone(),
-            Style::default().fg(Color::Rgb(0xec, 0xef, 0xf4)).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            "_",
-            Style::default()
-                .fg(Color::Rgb(0xec, 0xef, 0xf4))
-                .add_modifier(Modifier::SLOW_BLINK),
-        ),
+        Span::styled(before, query_style),
+        Span::styled(caret_glyph, caret_style),
+        Span::styled(after, query_style),
     ]);
     let prompt_rect = Rect {
         x: inner.x,
@@ -698,6 +751,48 @@ mod tests {
         let finder = FileFinder::new(entries);
         let names: Vec<&str> = finder.visible_results().iter().map(|r| r.entry.rel.as_str()).collect();
         assert_eq!(names, vec!["alpha.rs", "mid/beta.rs", "zeta.rs"]);
+    }
+
+    #[test]
+    fn cursor_supports_mid_string_insert_and_delete() {
+        let finder_entries = Arc::new(vec![entry("a.rs")]);
+        let mut f = FileFinder::new(finder_entries);
+        for c in "abc".chars() {
+            f.push_char(c);
+        }
+        assert_eq!((f.query.as_str(), f.cursor), ("abc", 3));
+        f.move_cursor_left();
+        f.move_cursor_left();
+        assert_eq!(f.cursor, 1);
+        f.push_char('X');
+        assert_eq!((f.query.as_str(), f.cursor), ("aXbc", 2));
+        f.pop_char();
+        assert_eq!((f.query.as_str(), f.cursor), ("abc", 1));
+        f.delete_char();
+        assert_eq!((f.query.as_str(), f.cursor), ("ac", 1));
+        f.move_cursor_home();
+        assert_eq!(f.cursor, 0);
+        f.move_cursor_end();
+        assert_eq!(f.cursor, 2);
+        f.move_cursor_right();
+        assert_eq!(f.cursor, 2, "cursor must not move past the end of the query");
+    }
+
+    #[test]
+    fn query_with_path_separator_matches_the_relative_path() {
+        let entries = Arc::new(vec![
+            entry("md2pdf/core.py"),
+            entry("other/core.py"),
+            entry("core.py"),
+        ]);
+        let mut finder = FileFinder::new(entries);
+        finder.set_query("md2pdf/core.py");
+        let names: Vec<&str> = finder.visible_results().iter().map(|r| r.entry.rel.as_str()).collect();
+        assert_eq!(
+            names.first().copied(),
+            Some("md2pdf/core.py"),
+            "a query containing '/' must match against the relative path; got {names:?}"
+        );
     }
 
     #[test]

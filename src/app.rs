@@ -6615,18 +6615,12 @@ impl App {
                     finder.select_next();
                 }
             }
-            (KeyCode::Home, _) => {
-                while finder.selected_index() > 0 {
-                    finder.select_prev();
-                }
-            }
-            (KeyCode::End, _) => {
-                let total = finder.visible_results().len();
-                while finder.selected_index() + 1 < total {
-                    finder.select_next();
-                }
-            }
+            (KeyCode::Left, _) => finder.move_cursor_left(),
+            (KeyCode::Right, _) => finder.move_cursor_right(),
+            (KeyCode::Home, _) => finder.move_cursor_home(),
+            (KeyCode::End, _) => finder.move_cursor_end(),
             (KeyCode::Backspace, _) => finder.pop_char(),
+            (KeyCode::Delete, _) => finder.delete_char(),
             (KeyCode::Char(c), m)
                 if !m.intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER) =>
             {
