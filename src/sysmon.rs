@@ -97,5 +97,73 @@ fn peak_temp(comps: &Components) -> Option<u8> {
             hottest = Some(hottest.map_or(t, |h| h.max(t)));
         }
     }
+    if let Some(t) = hottest {
+        return Some(t.clamp(0.0, 250.0).round() as u8);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(t) = linux_peak_temp() {
+            return Some(t);
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn linux_peak_temp() -> Option<u8> {
+    let mut hottest: Option<f32> = None;
+    let candidates = [
+        std::path::PathBuf::from("/sys/class/thermal"),
+        std::path::PathBuf::from("/sys/class/hwmon"),
+    ];
+    for root in &candidates {
+        let Ok(entries) = std::fs::read_dir(root) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let dir = entry.path();
+            let temp_files: Vec<std::path::PathBuf> = if dir
+                .file_name()
+                .and_then(|s| s.to_str())
+                .is_some_and(|s| s.starts_with("thermal_zone"))
+            {
+                vec![dir.join("temp")]
+            } else if dir
+                .file_name()
+                .and_then(|s| s.to_str())
+                .is_some_and(|s| s.starts_with("hwmon"))
+            {
+                let Ok(inner) = std::fs::read_dir(&dir) else {
+                    continue;
+                };
+                inner
+                    .flatten()
+                    .filter_map(|e| {
+                        let name = e.file_name();
+                        let s = name.to_str()?;
+                        if s.starts_with("temp") && s.ends_with("_input") {
+                            Some(e.path())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            } else {
+                continue;
+            };
+            for path in temp_files {
+                let Ok(contents) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                let Ok(millis) = contents.trim().parse::<i32>() else {
+                    continue;
+                };
+                let celsius = millis as f32 / 1000.0;
+                if celsius.is_finite() && (5.0..200.0).contains(&celsius) {
+                    hottest = Some(hottest.map_or(celsius, |h| h.max(celsius)));
+                }
+            }
+        }
+    }
     hottest.map(|t| t.clamp(0.0, 250.0).round() as u8)
 }
