@@ -4205,7 +4205,7 @@ impl App {
             return Ok(());
         }
         if self.sidebar_view == SidebarView::Search
-            && self.focus != Pane::Editor
+            && self.focus == Pane::Tree
             && is_search_editing_shortcut(key)
         {
             self.handle_search_key(key);
@@ -12098,6 +12098,74 @@ mod tests {
         }
     }
 
+    /// User-reported root cause: with the Search sidebar open, Cmd+C /
+    /// Cmd+V in the terminal silently no-op because the search-editing
+    /// shortcut guard fired on `focus != Editor`, swallowing the keys
+    /// into the (empty) search query instead of the focused terminal.
+    /// Copying from the terminal must work regardless of which sidebar
+    /// view is showing.
+    #[test]
+    fn terminal_cmd_c_copies_even_when_search_sidebar_is_open() {
+        let _g = crate::clipboard::lock_clipboard_for_test();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        let backend = ratatui::backend::TestBackend::new(140, 50);
+        let mut term = ratatui::Terminal::new(backend).unwrap();
+        term.draw(|f| app.render(f)).unwrap();
+        app.set_sidebar_view(SidebarView::Search);
+        term.draw(|f| app.render(f)).unwrap();
+
+        let probe = format!("croft-search-open-{}", std::process::id());
+        app.terminal_mut()
+            .write_input(format!("printf '{probe}\\n'\r").as_bytes());
+        let started = std::time::Instant::now();
+        while started.elapsed() < std::time::Duration::from_millis(3000) {
+            if app.terminal().visible_text().contains(&probe) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        term.draw(|f| app.render(f)).unwrap();
+        let snap = app.terminal().visible_text();
+        let row_idx = snap.lines().position(|l| l.contains(&probe)).unwrap();
+        let line = snap.lines().nth(row_idx).unwrap();
+        let col_start = line.find(&probe).unwrap();
+        let col_end = col_start + probe.len() - 1;
+        let inner = app.terminal().last_inner;
+        let screen_y = inner.y + row_idx as u16;
+        app.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(MouseButton::Left),
+            column: inner.x + col_start as u16,
+            row: screen_y,
+            modifiers: KeyModifiers::NONE,
+        });
+        app.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Drag(MouseButton::Left),
+            column: inner.x + col_end as u16,
+            row: screen_y,
+            modifiers: KeyModifiers::NONE,
+        });
+        app.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Up(MouseButton::Left),
+            column: inner.x + col_end as u16,
+            row: screen_y,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(app.focus == Pane::Terminal, "terminal click must focus terminal");
+        app.handle_key(key(KeyCode::Char('c'), KeyModifiers::SUPER))
+            .unwrap();
+        assert_eq!(
+            crate::clipboard::read_string().as_deref(),
+            Some(probe.as_str()),
+            "Cmd+C in the terminal must copy the terminal selection even when the Search sidebar is the active view"
+        );
+        assert!(
+            app.search.query.is_empty(),
+            "Cmd+C in the terminal must NOT leak into the search query; query={:?}",
+            app.search.query
+        );
+    }
+
     #[test]
     fn ctrl_j_clears_maximize_when_hiding_terminal() {
         // Mental contract: Ctrl+J means "give me my normal layout back."
@@ -13661,7 +13729,19 @@ mod tests {
     }
 
     #[test]
-    fn search_visible_routes_editing_shortcuts_to_search_even_if_terminal_focused() {
+    fn search_editing_shortcuts_route_to_search_only_when_the_search_input_is_focused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.set_sidebar_view(SidebarView::Search);
+        assert!(app.focus == Pane::Tree, "Search view focuses the side panel");
+        app.search.query = String::from("alpha");
+        app.handle_key(key(KeyCode::Char('a'), KeyModifiers::SUPER))
+            .unwrap();
+        assert_eq!(app.search.selection_range(), Some((0, 5)));
+    }
+
+    #[test]
+    fn search_visible_does_not_steal_editing_shortcuts_from_a_focused_terminal() {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(tmp.path().to_path_buf()).unwrap();
         app.set_sidebar_view(SidebarView::Search);
@@ -13670,11 +13750,28 @@ mod tests {
         app.search.query = String::from("alpha");
         app.handle_key(key(KeyCode::Char('a'), KeyModifiers::SUPER))
             .unwrap();
-        assert_eq!(app.search.selection_range(), Some((0, 5)));
+        assert_eq!(
+            app.search.selection_range(),
+            None,
+            "Cmd+A must act on the focused terminal, not the search query"
+        );
     }
 
     #[test]
-    fn search_visible_routes_cmd_v_to_search_if_terminal_focused() {
+    fn search_visible_routes_cmd_v_to_search_only_when_search_input_focused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.clipboard_reader = || Some(String::from("needle"));
+        app.set_sidebar_view(SidebarView::Search);
+
+        app.handle_key(key(KeyCode::Char('v'), KeyModifiers::SUPER))
+            .unwrap();
+
+        assert_eq!(app.search.query, "needle");
+    }
+
+    #[test]
+    fn search_visible_routes_cmd_v_to_terminal_not_search_when_terminal_focused() {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(tmp.path().to_path_buf()).unwrap();
         app.clipboard_reader = || Some(String::from("needle"));
@@ -13685,7 +13782,10 @@ mod tests {
         app.handle_key(key(KeyCode::Char('v'), KeyModifiers::SUPER))
             .unwrap();
 
-        assert_eq!(app.search.query, "needle");
+        assert_eq!(
+            app.search.query, "",
+            "Cmd+V must paste into the focused terminal, not leak into the search query"
+        );
     }
 
     #[test]
