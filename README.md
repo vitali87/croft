@@ -339,11 +339,13 @@ What works:
 
 The repo ships 568 unit tests plus CLI integration tests; run with `cargo test`.
 
-What does not work yet: command palette, settings, LSP, debugger.
+Already working: the three-pane layout, file explorer, multi-tab editor with syntax highlighting, live embedded terminals, git status, fuzzy file finder, remote launch over SSH, and LSP-backed completion and diagnostics (Python, TypeScript/TSX, JavaScript, Rust, Go).
 
-## Limitations
+On the roadmap: command palette, settings, a stepping debugger, and a plugin system.
 
-This is not an IDE. There is no LSP, no debugger, no plugin system. If you want those, use VS Code, Neovim, or Helix. This project's goal is the three-pane experience as a single fast binary and a building block for embeddable Rust TUI products.
+## Goal
+
+A complete VS Code replacement in the terminal: the full IDE experience as a single fast Rust binary. Everything VS Code does, croft will do, without leaving the TUI.
 
 ## License
 
