@@ -171,10 +171,12 @@ impl FileFinder {
         self.results.get(self.selected).map(|r| &r.entry)
     }
 
+    #[cfg(test)]
     pub fn selected_index(&self) -> usize {
         self.selected
     }
 
+    #[cfg(test)]
     pub fn visible_results(&self) -> &[ScoredResult] {
         &self.results
     }
@@ -404,6 +406,28 @@ const NOISE_DIR_NAMES: &[&str] = &[
     ".idea",
     ".vscode-test",
     ".DS_Store",
+    // Package-manager, language-toolchain, and agent caches that live in
+    // $HOME. Never edit targets, and several (.cargo, .claude, .npm) are
+    // written to continuously, so watching them turns a home-dir workspace
+    // into a perpetual FS-event storm. Measured on a Linux remote opened at
+    // /root: ~7000 inotify watches and 39% of CPU stuck in readlink
+    // path-walks re-scanning these trees (~200% CPU total). They dominate
+    // both the watch count and the churn, so excluding them is the fix.
+    ".cargo",
+    ".rustup",
+    ".npm",
+    ".nvm",
+    ".bun",
+    ".pnpm-store",
+    ".deno",
+    ".gem",
+    ".pyenv",
+    ".rbenv",
+    ".m2",
+    ".local",
+    ".docker",
+    ".claude",
+    ".codex",
 ];
 
 pub fn is_noise_dir(name: &std::ffi::OsStr) -> bool {
@@ -1111,6 +1135,24 @@ mod tests {
         assert!(is_path_under_noise_dir(Path::new(
             "/Users/v/proj/.git/objects/ff/abcd"
         )));
+    }
+
+    #[test]
+    fn is_path_under_noise_dir_flags_home_tool_caches() {
+        // Root-cause guard: a Linux remote opened at /root pegged ~200% CPU
+        // because .cargo/.npm/.nvm/.bun/.claude under $HOME were watched and
+        // re-walked on every cache write. If these stop being recognised,
+        // the home-dir FS-event storm comes back.
+        for p in [
+            "/root/.cargo/registry/src/index/foo-1.0/src/lib.rs",
+            "/root/.claude/projects/x/session.jsonl",
+            "/root/.npm/_cacache/index-v5/aa/bb",
+            "/root/.nvm/versions/node/v20/lib/x.js",
+            "/root/.bun/install/cache/pkg/index.js",
+            "/root/.local/share/pipx/venvs/tool/bin/x",
+        ] {
+            assert!(is_path_under_noise_dir(Path::new(p)), "{p}");
+        }
     }
 
     #[test]

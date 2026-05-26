@@ -524,6 +524,15 @@ pub struct App {
     pub editor: EditorTabs,
     pub terminals: Vec<PtyTerminal>,
     pub active_terminal: usize,
+    perf_hud: bool,
+    perf_bytes: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+    last_draw_us: u128,
+    last_frame_bytes: usize,
+    last_fps: u32,
+    last_kps: u32,
+    last_ips: u32,
+    last_work_us: u128,
+    last_poll_us: u128,
     workspace_root: PathBuf,
     sidebar_view: SidebarView,
     sidebar_areas: SidebarAreas,
@@ -710,6 +719,7 @@ pub struct App {
     /// backstop for events missed while the async watcher is still starting,
     /// and for host watcher failures.
     fs_poll_last_check: std::time::Instant,
+    fs_poll_interval: Duration,
     fs_poll_dir_mtimes: std::collections::BTreeMap<PathBuf, Option<std::time::SystemTime>>,
     fs_poll_open_file_mtime: Option<(PathBuf, Option<(std::time::SystemTime, u64)>)>,
     remote_launch: Option<RemoteLaunch>,
@@ -1332,6 +1342,15 @@ impl App {
             editor,
             terminals: vec![term],
             active_terminal: 0,
+            perf_hud: false,
+            perf_bytes: None,
+            last_draw_us: 0,
+            last_frame_bytes: 0,
+            last_fps: 0,
+            last_kps: 0,
+            last_ips: 0,
+            last_work_us: 0,
+            last_poll_us: 0,
             workspace_root: root.clone(),
             sidebar_view: SidebarView::Explorer,
             sidebar_areas: SidebarAreas::default(),
@@ -1383,6 +1402,7 @@ impl App {
             cell_pixel: None,
             clipboard_reader: read_system_clipboard,
             fs_poll_last_check: std::time::Instant::now(),
+            fs_poll_interval: FS_POLL_INTERVAL,
             fs_poll_dir_mtimes,
             fs_poll_open_file_mtime: None,
             remote_launch: None,
@@ -2052,59 +2072,93 @@ impl App {
         let (tx, rx) = std::sync::mpsc::channel();
         let mut debouncer = new_debouncer(Duration::from_millis(100), None, tx)
             .context("creating filesystem watcher")?;
-        // notify_debouncer_full's FileIdMap walks `WalkDir(usize::MAX)` on
-        // watcher creation and `stat()`s every file, then keeps a per-event
-        // FileId cache that does a memcmp lookup on every FSEvent. Two
-        // distinct problems land in the same split-watch fix:
+        // The watcher backend is fundamentally different on the two
+        // first-class targets, so the install strategy MUST differ too -
+        // a single uniform strategy is pathological on one of them:
         //
-        // 1. TCC: a $HOME-rooted recursive walk descends into
-        //    ~/Library/Containers/<bundle>/Data and Group Containers,
-        //    which macOS Sonoma's App Management class flags as "iTerm.app
-        //    accessing data from other apps."
+        //  * macOS / FSEvents is per-TREE. One recursive watch covers an
+        //    entire subtree in a single stream with no kernel watch limit,
+        //    and every `watch()` call tears down and rebuilds that stream.
+        //    Calling `watch()` once per directory therefore fires thousands
+        //    of FSEventStreamCreate calls and pins a core at ~100% forever
+        //    (confirmed by `sample` 2026-05: the FSEvents thread sits in
+        //    FSEventStreamCreate). So on macOS we make as FEW calls as
+        //    possible.
         //
-        // 2. Noise-dir storms: `target/`, `node_modules/`, `.git/`, etc.
-        //    are written to thousands of times per cargo/npm/git
-        //    invocation. The debouncer's FileIdMap memcmp loop dominates
-        //    CPU during a build (≈60% of the FSEvents thread's samples,
-        //    confirmed by `sample` in 2026-05). Post-event filtering via
-        //    `is_path_under_noise_dir` runs AFTER the debouncer's
-        //    bookkeeping, so it doesn't help that hot path; the only fix
-        //    is to never subscribe to the subtree in the first place.
-        //    Same pattern Zed uses for gitignored dirs.
+        //  * Linux / inotify is per-DIRECTORY. A recursive watch installs
+        //    one watch per dir in the subtree, and a real repo's
+        //    node_modules/target/.git push past
+        //    /proc/sys/fs/inotify/max_user_watches (often 8192 on a VPS),
+        //    returning ENOSPC so NO watcher installs and the main loop
+        //    falls back to a blocking stat-walk that freezes typing over
+        //    SSH. Each inotify_add_watch is cheap and independent (no
+        //    stream rebuild), so on Linux we add MANY non-recursive watches.
         //
-        // Workaround: if any protected OR noise dir sits at the top level
-        // of the workspace, watch the root non-recursively and
-        // recursively-watch each safe sibling instead. Equivalent event
-        // coverage of source paths, minus the storm-generating subtrees.
-        let entries: Vec<std::fs::DirEntry> = std::fs::read_dir(root)
-            .map(|rd| rd.filter_map(Result::ok).collect())
-            .unwrap_or_default();
+        // Both branches prune the same protected + noise dirs (target/,
+        // node_modules/, .git/, ~/Library Containers) which generate
+        // cargo/npm/git write storms the debouncer's FileIdMap memcmp loop
+        // can't keep up with, and which on macOS also trip Sonoma's App
+        // Management TCC class.
         let is_skippable = |name: &std::ffi::OsStr| -> bool {
             FS_WATCH_PROTECTED_NAMES.iter().any(|n| name == *n) || is_noise_dir(name)
         };
-        let needs_split = entries.iter().any(|e| is_skippable(&e.file_name()));
-        if needs_split {
-            debouncer
-                .watch(root, RecursiveMode::NonRecursive)
-                .context("starting non-recursive watch on workspace root")?;
-            for entry in entries {
-                let name = entry.file_name();
-                if is_skippable(&name) {
-                    continue;
+        #[cfg(target_os = "macos")]
+        {
+            let entries: Vec<std::fs::DirEntry> = std::fs::read_dir(root)
+                .map(|rd| rd.filter_map(Result::ok).collect())
+                .unwrap_or_default();
+            if entries.iter().any(|e| is_skippable(&e.file_name())) {
+                debouncer
+                    .watch(root, RecursiveMode::NonRecursive)
+                    .context("starting non-recursive watch on workspace root")?;
+                for entry in entries {
+                    if is_skippable(&entry.file_name()) {
+                        continue;
+                    }
+                    let path = entry.path();
+                    if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+                        let _ = debouncer.watch(&path, RecursiveMode::Recursive);
+                    }
                 }
-                let path = entry.path();
-                let is_dir = entry
-                    .file_type()
-                    .map(|ft| ft.is_dir())
-                    .unwrap_or_else(|_| path.is_dir());
-                if is_dir {
-                    let _ = debouncer.watch(&path, RecursiveMode::Recursive);
+            } else {
+                debouncer
+                    .watch(root, RecursiveMode::Recursive)
+                    .context("starting watch on workspace root")?;
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            // Hard ceiling so a pathological tree can't spend forever
+            // issuing inotify_add_watch syscalls on the init thread;
+            // anything beyond is covered by the adaptive-backoff poll
+            // fallback. Per-dir failures are tolerated (we keep going), so
+            // a tree that still exceeds the limit installs with partial
+            // coverage instead of nothing.
+            const MAX_WATCHES: usize = 50_000;
+            let mut stack = vec![root.to_path_buf()];
+            let mut watched = 0usize;
+            while let Some(dir) = stack.pop() {
+                if debouncer.watch(&dir, RecursiveMode::NonRecursive).is_ok() {
+                    watched += 1;
+                }
+                if watched >= MAX_WATCHES {
+                    break;
+                }
+                let Ok(rd) = std::fs::read_dir(&dir) else {
+                    continue;
+                };
+                for entry in rd.filter_map(Result::ok) {
+                    if is_skippable(&entry.file_name()) {
+                        continue;
+                    }
+                    // `file_type()` does not follow symlinks, so a symlinked
+                    // directory reports `is_dir() == false` and we never
+                    // descend into it - that also rules out symlink cycles.
+                    if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+                        stack.push(entry.path());
+                    }
                 }
             }
-        } else {
-            debouncer
-                .watch(root, RecursiveMode::Recursive)
-                .context("starting watch on workspace root")?;
         }
         Ok((debouncer, rx))
     }
@@ -2185,10 +2239,21 @@ impl App {
     }
 
     fn poll_filesystem_changes(&mut self) -> bool {
-        if self.fs_poll_last_check.elapsed() < FS_POLL_INTERVAL {
+        if self.fs_poll_last_check.elapsed() < self.fs_poll_interval {
             return false;
         }
-        self.fs_poll_last_check = std::time::Instant::now();
+        // This walk runs on the render/input thread. When the inotify
+        // watcher failed to install (common on remotes: ENOSPC on
+        // max_user_watches, or a slow recursive init), it is the only
+        // way the tree learns about disk changes — but on a remote
+        // filesystem the stat walk can cost hundreds of ms, and at a
+        // fixed 50ms cadence it dominates the loop and starves typing
+        // (measured: a single iteration > 600ms over SSH). Back the next
+        // poll off to a multiple of how long this one actually took, so a
+        // cheap local FS still polls at ~20Hz while a slow remote FS polls
+        // rarely enough that the loop stays responsive.
+        let poll_start = std::time::Instant::now();
+        self.fs_poll_last_check = poll_start;
         let mut changed = self.poll_open_file_change();
         let current = Self::snapshot_expanded_dir_mtimes(&self.tree);
         let changed_dirs: Vec<PathBuf> = current
@@ -2203,6 +2268,10 @@ impl App {
             .collect();
         if changed_dirs.is_empty() {
             self.fs_poll_dir_mtimes = current;
+            self.fs_poll_interval = poll_start
+                .elapsed()
+                .saturating_mul(10)
+                .clamp(FS_POLL_INTERVAL, Duration::from_secs(10));
             return changed;
         }
         for dir in changed_dirs.iter().rev() {
@@ -2223,6 +2292,10 @@ impl App {
         if finder_relevant {
             self.kick_file_finder_index_rebuild();
         }
+        self.fs_poll_interval = poll_start
+            .elapsed()
+            .saturating_mul(10)
+            .clamp(FS_POLL_INTERVAL, Duration::from_secs(10));
         changed = true;
         changed
     }
@@ -3429,6 +3502,14 @@ impl App {
         self.terminals.iter().any(|t| t.peek_dirty())
     }
 
+    /// Total bytes the PTY reader threads have advanced into their grids
+    /// since the last redraw. The main loop uses this to bypass the PTY
+    /// redraw cap for small interactive echo while keeping bulk streams
+    /// capped. Peeks without clearing; `drain_terminals_dirty` resets it.
+    pub fn peek_terminals_pending_bytes(&self) -> usize {
+        self.terminals.iter().map(|t| t.peek_pending_bytes()).sum()
+    }
+
     fn terminal_at_pos(&self, col: u16, row: u16) -> Option<usize> {
         self.terminals
             .iter()
@@ -3673,6 +3754,22 @@ impl App {
                 .fg(Color::Black)
                 .add_modifier(Modifier::BOLD),
         ));
+        if self.perf_hud {
+            spans.push(Span::styled(
+                format!(
+                    " ⚡d{}µs w{}µs p{}µs {}ips {}kps ",
+                    self.last_draw_us,
+                    self.last_work_us,
+                    self.last_poll_us,
+                    self.last_ips,
+                    self.last_kps
+                ),
+                Style::default()
+                    .bg(Color::Rgb(0x7a, 0x1f, 0x1f))
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
         spans.extend(git_status_spans(&self.git_status));
         spans.push(Span::raw("  "));
         spans.push(Span::raw(&self.status));
@@ -4096,6 +4193,10 @@ impl App {
         }
         if matches!(key.code, KeyCode::F(1)) {
             self.open_shortcuts_modal();
+            return Ok(());
+        }
+        if matches!(key.code, KeyCode::F(8)) {
+            self.perf_hud = !self.perf_hud;
             return Ok(());
         }
         if is_file_finder_key(key) {
@@ -17588,6 +17689,29 @@ mod tests {
     }
 }
 
+/// Stdout wrapper that tallies every byte ratatui flushes through the
+/// backend. The main loop reads + resets the counter once per frame to
+/// surface the per-frame payload size in the F8 perf HUD.
+struct CountingWriter {
+    inner: Stdout,
+    bytes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl std::io::Write for CountingWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.bytes
+            .fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+type CroftTerminal = Terminal<CrosstermBackend<CountingWriter>>;
+
 pub fn run(root: PathBuf) -> Result<()> {
     let title = build_title(&root);
     let mut app = App::new(root)?;
@@ -17606,6 +17730,13 @@ pub fn run(root: PathBuf) -> Result<()> {
         crossterm::cursor::SetCursorStyle::SteadyBar,
     )
     .context("enter alt screen")?;
+    // From here the tty is in raw mode + alt-screen + mouse + bracketed
+    // paste. The normal teardown below restores all of it, but a panic
+    // unwinds straight past it and would drop the user back to a shell
+    // with mouse-tracking still on (stray `^[[<35;…M` on every mouse
+    // move). Install a hook that restores the tty first, then chains to
+    // the original so the panic message + backtrace still print.
+    install_terminal_restore_panic_hook();
     // Best-effort: terminals that don't speak the kitty keyboard protocol just
     // ignore this; ones that do (iTerm2 >=3.5, Ghostty, kitty, WezTerm) start
     // delivering Cmd/Super as a real modifier so cmd+s reaches the app.
@@ -17632,9 +17763,17 @@ pub fn run(root: PathBuf) -> Result<()> {
     // contend with the crossterm event reader.
     app.init_graphics();
 
-    let backend = CrosstermBackend::new(out);
-    let mut terminal: Terminal<CrosstermBackend<Stdout>> =
-        Terminal::new(backend).context("create terminal")?;
+    // Wrap stdout so we can count exactly how many bytes ratatui's diff
+    // ships per frame — over SSH that byte count, alongside the per-frame
+    // render time, is the signal that tells a fat repaint from a slow
+    // remote CPU. Toggled on screen with F8.
+    let perf_bytes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    app.perf_bytes = Some(perf_bytes.clone());
+    let backend = CrosstermBackend::new(CountingWriter {
+        inner: out,
+        bytes: perf_bytes,
+    });
+    let mut terminal: CroftTerminal = Terminal::new(backend).context("create terminal")?;
 
     let result = main_loop(&mut app, &mut terminal);
 
@@ -17692,14 +17831,30 @@ pub fn run(root: PathBuf) -> Result<()> {
 fn restore_host_terminal_state() {
     use std::io::Write;
     let mut out = stdout();
-    // Disable every mouse-tracking mode crossterm knows about, plus
-    // bracketed paste, plus exit any leftover alt-screen, plus reset
-    // the cursor style. Written directly because crossterm's execute!
-    // requires a Backend handle that we no longer have here.
-    let _ = out.write_all(
-        b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l\x1b[?2004l\x1b[?1049l\x1b[ q",
-    );
+    let _ = out.write_all(TERMINAL_RESTORE_SEQ);
     let _ = out.flush();
+}
+
+// Disable every mouse-tracking mode crossterm knows about (1000/1002/1003
+// normal+button+any-motion, 1015/1006 urxvt+SGR encodings), bracketed
+// paste (2004), exit any leftover alt-screen (1049l), and reset the
+// cursor style. Written as raw bytes because the callers that need it
+// (the panic hook, the post-remote-ssh restore) no longer hold a
+// crossterm Backend handle for `execute!`.
+const TERMINAL_RESTORE_SEQ: &[u8] =
+    b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l\x1b[?2004l\x1b[?1049l\x1b[ q";
+
+fn install_terminal_restore_panic_hook() {
+    let original = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        use std::io::Write;
+        let _ = disable_raw_mode();
+        let mut out = stdout();
+        let _ = out.write_all(TERMINAL_RESTORE_SEQ);
+        let _ = out.write_all(b"\x1b[?25h");
+        let _ = out.flush();
+        original(info);
+    }));
 }
 
 /// Suspend the alt-screen, run every queued scp upload with the host
@@ -17708,10 +17863,7 @@ fn restore_host_terminal_state() {
 /// and restore the alt-screen. The local source is removed only on a
 /// successful upload — if scp fails, the local copy stays put so the
 /// user can retry without losing data.
-fn run_pending_scp_uploads(
-    app: &mut App,
-    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
-) -> Result<()> {
+fn run_pending_scp_uploads(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
     use std::io::Write;
     let uploads = app.take_pending_scp_uploads();
     if uploads.is_empty() {
@@ -17815,14 +17967,20 @@ fn run_pending_scp_uploads(
     Ok(())
 }
 
-fn main_loop(
-    app: &mut App,
-    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
-) -> Result<()> {
+fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
     // Force the very first frame to render so the user sees the UI even
     // before the first event arrives or any timer fires.
     let mut needs_redraw = true;
     let mut last_blink_visible = app.cursor_visible_phase();
+    // Frame-rate accounting for the F8 HUD: count draws over a rolling 1s
+    // window so a high idle FPS (always-dirty redraw loop saturating the
+    // SSH link) is visible at a glance.
+    let mut fps_window_start = std::time::Instant::now();
+    let mut frames_in_window: u32 = 0;
+    let mut keys_in_window: u32 = 0;
+    let mut iters_in_window: u32 = 0;
+    let mut work_max_us: u128 = 0;
+    let mut poll_max_us: u128 = 0;
     // PTY-only redraws are capped so a chatty embedded shell (Claude Code,
     // npm install, log streams) cannot saturate stdout and starve mouse /
     // key events on the same thread. Input + FS + search + git + remote
@@ -17834,11 +17992,35 @@ fn main_loop(
     } else {
         Duration::from_millis(33)
     };
+    // A keystroke echo, a shell line-rewrite, or an input-box update
+    // advances only a handful of bytes into the grid; a bulk stream (cat,
+    // build logs, a full-pane scroll, a TUI's streaming output) advances
+    // many. We let small updates redraw immediately so echo feels native
+    // even when croft itself is the remote end of an SSH link, and keep
+    // the cap on large updates so a flood can't saturate the pipe and
+    // starve input. A full-pane repaint runs tens of KB; interactive
+    // echo stays well under this, so the two never alias.
+    const PTY_SMALL_UPDATE_BYTES: usize = 4096;
     let mut last_pty_redraw = std::time::Instant::now()
         .checked_sub(pty_min_interval)
         .unwrap_or_else(std::time::Instant::now);
 
     while !app.quit {
+        iters_in_window += 1;
+        if fps_window_start.elapsed() >= Duration::from_secs(1) {
+            app.last_fps = frames_in_window;
+            app.last_kps = keys_in_window;
+            app.last_ips = iters_in_window;
+            app.last_work_us = work_max_us;
+            app.last_poll_us = poll_max_us;
+            frames_in_window = 0;
+            keys_in_window = 0;
+            iters_in_window = 0;
+            work_max_us = 0;
+            poll_max_us = 0;
+            fps_window_start = std::time::Instant::now();
+        }
+        let iter_start = std::time::Instant::now();
         // If the user dropped files onto the Remote Explorer, suspend the
         // alt-screen and run scp in the host shell so the user sees its
         // progress, can answer password / FIDO / known_hosts prompts,
@@ -17877,8 +18059,9 @@ fn main_loop(
             || install_changed
             || lsp_changed
             || sysmon_changed;
-        let pty_eligible =
-            pty_pending && last_pty_redraw.elapsed() >= pty_min_interval;
+        let pty_eligible = pty_pending
+            && (app.peek_terminals_pending_bytes() <= PTY_SMALL_UPDATE_BYTES
+                || last_pty_redraw.elapsed() >= pty_min_interval);
         let do_redraw = non_pty_dirty || pty_eligible;
         // Consume the PTY dirty flags only when we are actually redrawing.
         // Skipping a frame must leave them set so the next eligible tick
@@ -17916,9 +18099,17 @@ fn main_loop(
                 app.welcome_overlay_dirty = true;
                 app.no_repo_hero_overlay_dirty = true;
             }
+            let draw_start = std::time::Instant::now();
             terminal.draw(|f| {
                 app.render(f);
             })?;
+            // Record render+flush time and the bytes ratatui shipped this
+            // frame so the F8 HUD can show where remote latency goes.
+            app.last_draw_us = draw_start.elapsed().as_micros();
+            if let Some(counter) = app.perf_bytes.as_ref() {
+                app.last_frame_bytes = counter.swap(0, std::sync::atomic::Ordering::Relaxed);
+            }
+            frames_in_window += 1;
             if app.consume_welcome_image_clear()
                 || app.consume_editor_image_clear()
                 || app.consume_run_debug_image_clear()
@@ -18052,6 +18243,8 @@ fn main_loop(
         // hot path (remote-launched croft over SSH). Idle cost is still
         // negligible because the redraw branch above gates on dirty flags;
         // this poll just decides how often we wake up to *check*.
+        work_max_us = work_max_us.max(iter_start.elapsed().as_micros());
+        let poll_start = std::time::Instant::now();
         if event::poll(Duration::from_millis(8))? {
             // Drain every event already queued so a click burst (Down + zero-
             // movement Drag + Up, all delivered in <50ms by the terminal)
@@ -18061,7 +18254,12 @@ fn main_loop(
             // rapidly before settling into the normal 530ms blink.
             loop {
                 match event::read()? {
-                    Event::Key(key) => app.handle_key(key)?,
+                    Event::Key(key) => {
+                        if key.kind == KeyEventKind::Press || key.kind == KeyEventKind::Repeat {
+                            keys_in_window += 1;
+                        }
+                        app.handle_key(key)?;
+                    }
                     Event::Mouse(m) => app.handle_mouse(m),
                     Event::Paste(s) => app.handle_paste(&s),
                     Event::Resize(_, _) => {
@@ -18077,6 +18275,7 @@ fn main_loop(
             }
             needs_redraw = true;
         }
+        poll_max_us = poll_max_us.max(poll_start.elapsed().as_micros());
     }
     Ok(())
 }

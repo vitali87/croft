@@ -17,7 +17,7 @@ use ratatui::{
     widgets::{Block, Borders, Widget},
 };
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 const SCROLLBACK_LINES: usize = 5000;
@@ -103,6 +103,14 @@ pub struct PtyTerminal {
     /// Set by the PTY reader thread on every chunk and by `write_input`;
     /// cleared by `take_dirty`. The main loop only redraws when set.
     pty_dirty: Arc<AtomicBool>,
+    /// Bytes the reader thread has advanced into the grid since the last
+    /// redraw (reset by `take_dirty`). The main loop reads this to tell an
+    /// interactive echo (a few bytes: a keystroke, a shell line-rewrite,
+    /// an input-box update) from a bulk stream (cat / build logs / a
+    /// full-pane scroll). Small updates bypass the PTY redraw cap so echo
+    /// stays native; large ones stay capped so they can't saturate the
+    /// ssh pipe and starve input.
+    pty_pending_bytes: Arc<AtomicUsize>,
     /// Tracks whether the inner program has enabled DECSET 2004 (bracketed
     /// paste). Sniffed off the byte stream; not all parsers expose it.
     bracketed_paste_enabled: Arc<AtomicBool>,
@@ -243,6 +251,8 @@ impl PtyTerminal {
 
         let pty_dirty = Arc::new(AtomicBool::new(true));
         let pty_dirty_for_thread = pty_dirty.clone();
+        let pty_pending_bytes = Arc::new(AtomicUsize::new(0));
+        let pty_pending_bytes_for_thread = pty_pending_bytes.clone();
         let bracketed_paste_enabled = Arc::new(AtomicBool::new(false));
         let bracketed_paste_for_thread = bracketed_paste_enabled.clone();
 
@@ -269,6 +279,7 @@ impl PtyTerminal {
                         let mut t = term_for_thread.lock();
                         processor.advance(&mut *t, &buf[..n]);
                         drop(t);
+                        pty_pending_bytes_for_thread.fetch_add(n, Ordering::Relaxed);
                         pty_dirty_for_thread.store(true, Ordering::Release);
                     }
                     Err(_) => break,
@@ -286,6 +297,7 @@ impl PtyTerminal {
         Ok(Self {
             term,
             pty_dirty,
+            pty_pending_bytes,
             bracketed_paste_enabled,
             master: pair.master,
             writer,
@@ -301,7 +313,16 @@ impl PtyTerminal {
     }
 
     pub fn take_dirty(&self) -> bool {
+        self.pty_pending_bytes.store(0, Ordering::Relaxed);
         self.pty_dirty.swap(false, Ordering::AcqRel)
+    }
+
+    /// Bytes advanced into the grid since the last redraw, without
+    /// clearing. The main loop uses this to classify a PTY-only redraw as
+    /// interactive echo (small, redraw now) or bulk stream (large, stay
+    /// capped). Reset on the next `take_dirty`.
+    pub fn peek_pending_bytes(&self) -> usize {
+        self.pty_pending_bytes.load(Ordering::Relaxed)
     }
 
     /// Process ID of the shell running inside this terminal, when the
@@ -970,6 +991,36 @@ mod tests {
         assert!(
             term.peek_dirty(),
             "direct-spawned /bin/echo must produce output without any write_input"
+        );
+    }
+
+    #[test]
+    fn pending_bytes_counts_advanced_output_and_resets_on_take_dirty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let term = PtyTerminal::new_running(
+            "/bin/echo",
+            &[String::from("croft-pending-bytes-probe")],
+            tmp.path(),
+        )
+        .unwrap();
+        let mut waited_ms = 0u32;
+        while waited_ms < 4000 && term.peek_pending_bytes() == 0 {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            waited_ms += 20;
+        }
+        assert!(
+            term.peek_pending_bytes() > 0,
+            "the reader thread must accumulate the bytes it advanced so the main loop can tell echo from a bulk stream"
+        );
+        assert!(
+            term.peek_pending_bytes() <= 4096,
+            "a one-line echo must stay under the small-update threshold so it bypasses the redraw cap"
+        );
+        let _ = term.take_dirty();
+        assert_eq!(
+            term.peek_pending_bytes(),
+            0,
+            "take_dirty must reset the byte accumulator so the next window starts from zero"
         );
     }
 
