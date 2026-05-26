@@ -3477,7 +3477,7 @@ impl App {
     }
 
     /// Cycle the active terminal backward by one slot, wrapping at the
-    /// front. Mirror of `cycle_terminal` for the Ctrl+Shift+[ binding.
+    /// front. Mirror of `cycle_terminal` for the Cmd+[ binding.
     pub fn cycle_terminal_back(&mut self) {
         let n = self.terminals.len();
         if n <= 1 {
@@ -5905,7 +5905,7 @@ impl App {
             }
             return;
         }
-        // Ctrl+Shift+]: next terminal. Ctrl+Shift+[: previous terminal.
+        // Cmd+]: next terminal. Cmd+[: previous terminal.
         if is_terminal_cycle_key(key) {
             self.cycle_terminal();
             return;
@@ -9269,10 +9269,12 @@ fn is_terminal_maximize_key(key: KeyEvent) -> bool {
         && !key.modifiers.contains(KeyModifiers::SUPER)
 }
 
-/// `Ctrl+Shift+T`: spawn an additional terminal next to the active one.
-/// Rejects SUPER so the Mac-side `Cmd+Shift+T` focus chord (see
-/// `is_terminal_focus_key`) does not double-fire as a split when the
-/// user happens to be holding both modifiers.
+/// `Cmd+T` (or legacy `Ctrl+Shift+T`): spawn an additional terminal next
+/// to the active one. iTerm2's GlobalKeyMap forwards `Cmd+T` as
+/// `ESC [ 116 ; 9 u`, which crossterm decodes to `Char('t') + SUPER`.
+/// In the SUPER branch we reject SHIFT so the `Cmd+Shift+T` focus chord
+/// (see `is_terminal_focus_key`) does not double-fire as a split, and
+/// reject ALT so `Cmd+Opt+T` (iTerm2's relocated New Tab) is left alone.
 fn is_terminal_split_key(key: KeyEvent) -> bool {
     let KeyCode::Char(c) = key.code else {
         return false;
@@ -9281,7 +9283,8 @@ fn is_terminal_split_key(key: KeyEvent) -> bool {
         return false;
     }
     if key.modifiers.contains(KeyModifiers::SUPER) {
-        return false;
+        return !key.modifiers.contains(KeyModifiers::SHIFT)
+            && !key.modifiers.contains(KeyModifiers::ALT);
     }
     key.modifiers.contains(KeyModifiers::CONTROL) && key.modifiers.contains(KeyModifiers::SHIFT)
 }
@@ -9315,29 +9318,27 @@ fn is_terminal_close_key(key: KeyEvent) -> bool {
     key.modifiers.contains(KeyModifiers::CONTROL) && key.modifiers.contains(KeyModifiers::SHIFT)
 }
 
-/// `Ctrl+Shift+]`: cycle to the next terminal in the pane.
+/// `Cmd+]`: cycle to the next (right) terminal in the pane. iTerm2's
+/// GlobalKeyMap forwards it as `ESC [ 93 ; 9 u` (modifier 9 = base +
+/// Super), which crossterm decodes to `Char(']') + SUPER`. Brackets are
+/// used because every arrow option is blocked: Ctrl+arrows by macOS
+/// Spaces, Option+arrows by shell word-motion, Cmd+arrows by user choice.
+/// Accepts the shifted glyph `}` defensively in case a terminal pre-applies
+/// the shift.
 fn is_terminal_cycle_key(key: KeyEvent) -> bool {
     let KeyCode::Char(c) = key.code else {
         return false;
     };
-    if c != ']' && c != '}' {
-        return false;
-    }
-    key.modifiers.contains(KeyModifiers::CONTROL) && key.modifiers.contains(KeyModifiers::SHIFT)
+    (c == ']' || c == '}') && key.modifiers.contains(KeyModifiers::SUPER)
 }
 
-/// `Ctrl+Shift+[`: cycle to the previous terminal in the pane. Mirror of
-/// `is_terminal_cycle_key` for the reverse direction. Accepts both the
-/// raw `[` keycode and the shift-applied `{` since crossterm reports one
-/// or the other depending on terminal flavour.
+/// `Cmd+[`: cycle to the previous (left) terminal in the pane. Mirror of
+/// `is_terminal_cycle_key` for the reverse direction.
 fn is_terminal_cycle_back_key(key: KeyEvent) -> bool {
     let KeyCode::Char(c) = key.code else {
         return false;
     };
-    if c != '[' && c != '{' {
-        return false;
-    }
-    key.modifiers.contains(KeyModifiers::CONTROL) && key.modifiers.contains(KeyModifiers::SHIFT)
+    (c == '[' || c == '{') && key.modifiers.contains(KeyModifiers::SUPER)
 }
 
 /// Returns true if the given key event should trash the currently-selected
@@ -15667,6 +15668,34 @@ mod tests {
     }
 
     #[test]
+    fn cmd_t_globally_splits_the_terminal_and_does_not_double_fire_as_focus() {
+        let mut app = editor_app_with_lines(&["x"]);
+        app.focus_pane(Pane::Editor);
+        let before = app.terminals.len();
+        app.handle_key(key(KeyCode::Char('t'), KeyModifiers::SUPER))
+            .unwrap();
+        assert_eq!(
+            app.terminals.len(),
+            before + 1,
+            "Cmd+T must split the terminal from any pane; Cmd+Shift+T (focus) must not steal the bare Cmd+T chord"
+        );
+        assert!(
+            !is_terminal_split_key(key(
+                KeyCode::Char('t'),
+                KeyModifiers::SUPER | KeyModifiers::SHIFT
+            )),
+            "Cmd+Shift+T is focus, not split"
+        );
+        assert!(
+            !is_terminal_split_key(key(
+                KeyCode::Char('t'),
+                KeyModifiers::SUPER | KeyModifiers::ALT
+            )),
+            "Cmd+Opt+T is iTerm2's relocated New Tab, not split"
+        );
+    }
+
+    #[test]
     fn ctrl_shift_t_still_splits_the_terminal_and_does_not_double_fire_as_focus() {
         let mut app = editor_app_with_lines(&["x"]);
         app.focus_pane(Pane::Editor);
@@ -15690,7 +15719,7 @@ mod tests {
         assert!(is_terminal_focus_key(key(KeyCode::Char('T'), cmd_shift)));
         assert!(
             !is_terminal_focus_key(key(KeyCode::Char('t'), KeyModifiers::SUPER)),
-            "Cmd+T (no Shift) is reserved by macOS for New Tab; the focus chord requires Shift"
+            "Cmd+T (no Shift) is the split/new-terminal chord, not focus; the focus chord requires Shift"
         );
         assert!(
             !is_terminal_focus_key(key(
@@ -17830,28 +17859,42 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_shift_open_bracket_cycles_to_the_previous_terminal() {
+    fn cmd_left_bracket_cycles_to_the_previous_terminal() {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(tmp.path().to_path_buf()).unwrap();
         app.split_terminal().unwrap();
         app.split_terminal().unwrap();
         app.focus = Pane::Terminal;
         app.active_terminal = 2;
-        app.handle_key(key(
-            KeyCode::Char('['),
-            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
-        ));
+        let _ = app.handle_key(key(KeyCode::Char('['), KeyModifiers::SUPER));
         assert_eq!(
             app.active_terminal, 1,
-            "Ctrl+Shift+[ must move focus one terminal to the left"
+            "Cmd+[ must move focus one terminal to the left"
         );
-        app.handle_key(key(
-            KeyCode::Char('{'),
-            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
-        ));
+        let _ = app.handle_key(key(KeyCode::Char('{'), KeyModifiers::SUPER));
         assert_eq!(
             app.active_terminal, 0,
-            "Ctrl+Shift+{{ (shift-applied codepoint) must also cycle back so the binding works under crossterm flavours that pre-apply the shift"
+            "Cmd+{{ (shift-applied glyph) must also cycle back"
+        );
+    }
+
+    #[test]
+    fn cmd_right_bracket_cycles_to_the_next_terminal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.split_terminal().unwrap();
+        app.split_terminal().unwrap();
+        app.focus = Pane::Terminal;
+        app.active_terminal = 0;
+        let _ = app.handle_key(key(KeyCode::Char(']'), KeyModifiers::SUPER));
+        assert_eq!(
+            app.active_terminal, 1,
+            "Cmd+] must move focus one terminal to the right"
+        );
+        let _ = app.handle_key(key(KeyCode::Char('}'), KeyModifiers::SUPER));
+        assert_eq!(
+            app.active_terminal, 2,
+            "Cmd+}} (shift-applied glyph) must also cycle forward"
         );
     }
 

@@ -338,7 +338,7 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 description: "Copy current selection",
             },
             ShortcutEntry {
-                keys: "Ctrl+Shift+T",
+                keys: "Cmd+T",
                 description: "Open another terminal next to the active one",
             },
             ShortcutEntry {
@@ -346,8 +346,8 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 description: "Close the active terminal",
             },
             ShortcutEntry {
-                keys: "Ctrl+Shift+]",
-                description: "Cycle to the next terminal",
+                keys: "Cmd+[ / Cmd+]",
+                description: "Cycle to the previous / next terminal",
             },
             ShortcutEntry {
                 keys: "Cmd+V / Ctrl+V",

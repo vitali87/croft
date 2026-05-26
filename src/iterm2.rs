@@ -94,6 +94,55 @@ const CMD_SHIFT_N_HEX: &str = "0x1b 0x5b 0x37 0x38 0x3b 0x31 0x30 0x75";
 /// `kVK_ANSI_T` = 0x11. CSI-u `ESC [ 84 ; 10 u`.
 const CMD_SHIFT_T_KEY: &str = "0x54-0x120000-0x11";
 const CMD_SHIFT_T_HEX: &str = "0x1b 0x5b 0x38 0x34 0x3b 0x31 0x30 0x75";
+/// `Cmd+T` — open another terminal next to the active one (croft's
+/// `is_terminal_split_key`). iTerm2 binds the bare chord to the "New Tab"
+/// menu item (MainMenu.xib: `keyEquivalent="t"`); the NSUserKeyEquivalents
+/// override below relocates it to Cmd+Ctrl+T so this forwarder wins.
+/// Codepoint 't' (0x74 = 116), virtualKeyCode `kVK_ANSI_T` = 0x11. CSI-u
+/// `ESC [ 116 ; 9 u`, modifier byte 9 = 1 base + Super(8), which crossterm
+/// decodes back to `KeyEvent { code: Char('t'), modifiers: SUPER }`.
+const CMD_T_KEY: &str = "0x74-0x100000-0x11";
+const CMD_T_HEX: &str = "0x1b 0x5b 0x31 0x31 0x36 0x3b 0x39 0x75";
+/// iTerm2's "New Tab" menu item title (MainMenu.xib id 867) and the chord
+/// it is relocated to so croft can claim the bare Cmd+T. `@^t` = Cmd+Ctrl+T,
+/// unbound by default and clear of the Cmd+Opt+T alternate ("New Tab Next
+/// to Current Tab"), keeps the iTerm2 action reachable.
+const NEW_TAB_MENU_KEY: &str = "New Tab";
+const NEW_TAB_MENU_EQUIV: &str = "@^t";
+/// `Cmd+[` / `Cmd+]` — cycle to the previous / next terminal (croft's
+/// `is_terminal_cycle_back_key` / `is_terminal_cycle_key`). iTerm2 binds
+/// the bare chords to "Previous Pane" / "Next Pane" (MainMenu.xib ids
+/// 1251/1250, Command-only); the NSUserKeyEquivalents overrides below
+/// relocate them to Cmd+Opt+[ / Cmd+Opt+] so these forwarders win.
+/// Brackets are normal keys, so they use the 3-part `char-modifiers-keycode`
+/// form (like Cmd+T), not the 2-part function-key form arrows use. '[' =
+/// 0x5b, virtualKeyCode `kVK_ANSI_LeftBracket` = 0x21; ']' = 0x5d, vkc
+/// `kVK_ANSI_RightBracket` = 0x1e. CSI-u `ESC [ 91 ; 9 u` / `ESC [ 93 ; 9 u`
+/// (modifier byte 9 = 1 base + Super(8)), which crossterm decodes to
+/// `Char('[' / ']') + SUPER`. Arrows are unusable for cycling: Ctrl+arrows
+/// are eaten by the macOS Spaces shortcuts, Option+arrows are shell
+/// word-motion, and Cmd+arrows are reserved by the user.
+const CMD_LBRACKET_KEY: &str = "0x5b-0x100000-0x21";
+const CMD_LBRACKET_HEX: &str = "0x1b 0x5b 0x39 0x31 0x3b 0x39 0x75";
+const CMD_RBRACKET_KEY: &str = "0x5d-0x100000-0x1e";
+const CMD_RBRACKET_HEX: &str = "0x1b 0x5b 0x39 0x33 0x3b 0x39 0x75";
+/// iTerm2 menu items that own bare `Cmd+[` / `Cmd+]`, relocated so the
+/// bracket forwarders above reach croft. Cmd+Opt+[ / Cmd+Opt+] keep pane
+/// navigation reachable.
+const PREV_PANE_MENU_KEY: &str = "Previous Pane";
+const PREV_PANE_MENU_EQUIV: &str = "@~[";
+const NEXT_PANE_MENU_KEY: &str = "Next Pane";
+const NEXT_PANE_MENU_EQUIV: &str = "@~]";
+/// GlobalKeyMap arrow keys an earlier croft build hijacked for cycling
+/// (both the 2-part form iTerm2 matches and the dead 3-part form). Cycling
+/// now lives on Cmd+[ / Cmd+], so these are removed on apply to hand
+/// Cmd+Left/Right back to iTerm2's defaults.
+const CMD_ARROW_CLEANUP_KEYS: &[&str] = &[
+    "0xf702-0x300000",
+    "0xf703-0x300000",
+    "0xf702-0x300000-0x7b",
+    "0xf703-0x300000-0x7c",
+];
 /// `Ctrl+Shift+J` — toggle "maximize terminal" so the editor / welcome
 /// pane collapses and the terminal fills the right column. Codepoint 'J'
 /// (0x4a = 74), modifier mask 0x60000 = NSEventModifierFlagControl(0x40000)
@@ -292,6 +341,15 @@ pub fn apply_croft_key_settings(plist: &mut Value) -> Result<(), ITerm2Error> {
     // croft's terminal-focus chord can claim it. Cmd+Opt+Shift+T keeps
     // the iTerm2 action reachable on a chord croft does not use.
     set_string(menu, "Restore Closed Session", "@~T".to_string());
+    // Relocate iTerm2's "New Tab" off Cmd+T so croft's new-terminal chord
+    // can claim it. Cmd+Ctrl+T keeps the iTerm2 action reachable and stays
+    // clear of the Cmd+Opt+T "New Tab Next to Current Tab" alternate.
+    set_string(menu, NEW_TAB_MENU_KEY, NEW_TAB_MENU_EQUIV.to_string());
+    // Relocate iTerm2's "Previous Pane" / "Next Pane" off Cmd+[ / Cmd+] so
+    // croft's terminal-cycle chords can claim them. Cmd+Opt+[ / Cmd+Opt+]
+    // keep pane navigation reachable.
+    set_string(menu, PREV_PANE_MENU_KEY, PREV_PANE_MENU_EQUIV.to_string());
+    set_string(menu, NEXT_PANE_MENU_KEY, NEXT_PANE_MENU_EQUIV.to_string());
     // iTerm2's Window menu binds Cmd+1..Cmd+9 to Select Tab. Move each
     // to Cmd+Opt+digit so croft can capture Cmd+digit as a vim count.
     for (i, label) in [
@@ -354,6 +412,9 @@ pub fn apply_croft_key_settings(plist: &mut Value) -> Result<(), ITerm2Error> {
         (CMD_SHIFT_R_KEY, CMD_SHIFT_R_HEX),
         (CMD_SHIFT_N_KEY, CMD_SHIFT_N_HEX),
         (CMD_SHIFT_T_KEY, CMD_SHIFT_T_HEX),
+        (CMD_T_KEY, CMD_T_HEX),
+        (CMD_LBRACKET_KEY, CMD_LBRACKET_HEX),
+        (CMD_RBRACKET_KEY, CMD_RBRACKET_HEX),
         (CTRL_SHIFT_J_KEY, CTRL_SHIFT_J_HEX),
     ] {
         global.insert(key.into(), send_hex_action(hex, 0));
@@ -362,6 +423,9 @@ pub fn apply_croft_key_settings(plist: &mut Value) -> Result<(), ITerm2Error> {
         global.insert((*key).into(), send_hex_action(hex, 0));
     }
     global.remove(CMD_V_KEY);
+    for key in CMD_ARROW_CLEANUP_KEYS {
+        global.remove(*key);
+    }
 
     dict.insert(MOUSE_REPORTING_FRUSTRATION_KEY.into(), Value::Boolean(true));
 
@@ -825,6 +889,93 @@ mod tests {
             Some("@~T"),
             "iTerm2's Restore Closed Session must be relocated off Cmd+Shift+T so croft's terminal-focus chord can claim it; @~T = Cmd+Opt+Shift+T keeps the iTerm2 action reachable on a chord croft does not use"
         );
+    }
+
+    #[test]
+    fn apply_croft_key_settings_forwards_cmd_t_for_new_terminal() {
+        let mut plist = synth_plist("GUID-1", &["GUID-1"]);
+        apply_croft_key_settings(&mut plist).unwrap();
+        let top = plist.as_dictionary().unwrap();
+        let global = dict_in(top, "GlobalKeyMap");
+        assert_eq!(
+            action_text(global, CMD_T_KEY),
+            CMD_T_HEX,
+            "GlobalKeyMap must forward Cmd+T as a CSI-u sequence so croft's `is_terminal_split_key` fires and opens a new terminal. Encoding: 't' (codepoint 0x74 = 116) with kitty modifier byte 9 = 1 base + Super(8), giving `ESC [ 116 ; 9 u`"
+        );
+    }
+
+    #[test]
+    fn apply_croft_key_settings_relocates_new_tab_menu_off_cmd_t() {
+        let mut plist = synth_plist("GUID-1", &["GUID-1"]);
+        apply_croft_key_settings(&mut plist).unwrap();
+        let top = plist.as_dictionary().unwrap();
+        let menu = dict_in(top, "NSUserKeyEquivalents");
+        assert_eq!(
+            menu.get(NEW_TAB_MENU_KEY).and_then(|v| v.as_string()),
+            Some(NEW_TAB_MENU_EQUIV),
+            "iTerm2's New Tab must be relocated off Cmd+T so croft's new-terminal chord can claim it; @^t = Cmd+Ctrl+T keeps the iTerm2 action reachable on a chord croft does not use"
+        );
+    }
+
+    #[test]
+    fn apply_croft_key_settings_forwards_cmd_brackets_for_terminal_cycle() {
+        let mut plist = synth_plist("GUID-1", &["GUID-1"]);
+        apply_croft_key_settings(&mut plist).unwrap();
+        let top = plist.as_dictionary().unwrap();
+        let global = dict_in(top, "GlobalKeyMap");
+        for (key, hex, label) in [
+            (
+                CMD_LBRACKET_KEY,
+                CMD_LBRACKET_HEX,
+                "Cmd+[ (previous terminal)",
+            ),
+            (CMD_RBRACKET_KEY, CMD_RBRACKET_HEX, "Cmd+] (next terminal)"),
+        ] {
+            assert_eq!(
+                action_text(global, key),
+                hex,
+                "GlobalKeyMap must forward {label} as a CSI-u sequence so croft's terminal-cycle predicate fires as Char('[' / ']') + SUPER. Arrows cannot be used: Ctrl+arrows are eaten by macOS Spaces, Option+arrows are shell word-motion, Cmd+arrows are reserved by the user"
+            );
+        }
+    }
+
+    #[test]
+    fn apply_croft_key_settings_relocates_pane_nav_menus_off_cmd_brackets() {
+        let mut plist = synth_plist("GUID-1", &["GUID-1"]);
+        apply_croft_key_settings(&mut plist).unwrap();
+        let top = plist.as_dictionary().unwrap();
+        let menu = dict_in(top, "NSUserKeyEquivalents");
+        for (item, expected) in [
+            (PREV_PANE_MENU_KEY, PREV_PANE_MENU_EQUIV),
+            (NEXT_PANE_MENU_KEY, NEXT_PANE_MENU_EQUIV),
+        ] {
+            assert_eq!(
+                menu.get(item).and_then(|v| v.as_string()),
+                Some(expected),
+                "iTerm2's {item} must be relocated off bare Cmd+[ / Cmd+] so croft's terminal-cycle chord can claim it; Cmd+Opt+brackets keep pane navigation reachable"
+            );
+        }
+    }
+
+    #[test]
+    fn apply_croft_key_settings_drops_earlier_cmd_arrow_cycle_overrides() {
+        let mut plist = synth_plist("GUID-1", &["GUID-1"]);
+        {
+            let top = plist.as_dictionary_mut().unwrap();
+            let global = dict_entry_mut(top, "GlobalKeyMap");
+            for key in CMD_ARROW_CLEANUP_KEYS {
+                global.insert((*key).into(), send_hex_action("0x99", 0));
+            }
+        }
+        apply_croft_key_settings(&mut plist).unwrap();
+        let top = plist.as_dictionary().unwrap();
+        let global = dict_in(top, "GlobalKeyMap");
+        for key in CMD_ARROW_CLEANUP_KEYS {
+            assert!(
+                global.get(*key).is_none(),
+                "an earlier croft build hijacked {key} for cycling; now that cycling lives on Cmd+[ / Cmd+], that override must be removed so Cmd+Left/Right return to iTerm2's defaults"
+            );
+        }
     }
 
     #[test]
