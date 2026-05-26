@@ -743,6 +743,8 @@ pub enum RecentCommitsError {
     NoEndpoint,
 }
 
+const RECENT_COMMITS_FETCH_ATTEMPTS: u32 = 3;
+
 pub fn fetch_croft_recent_commits_full(
     timeout: std::time::Duration,
 ) -> (RecentCommits, RecentCommitsError) {
@@ -757,25 +759,27 @@ pub fn fetch_croft_recent_commits_full(
         );
     };
     let now = current_unix_seconds();
-    match fetch_recent_commits_via_clone(&https_url, 5, timeout) {
-        Ok(commits) => (
-            RecentCommits {
-                remote,
-                commits: commits
-                    .into_iter()
-                    .map(|c| commit_info_from_log(c, now))
-                    .collect(),
-            },
-            RecentCommitsError::None,
-        ),
-        Err(_) => (
-            RecentCommits {
-                remote,
-                commits: Vec::new(),
-            },
-            RecentCommitsError::Network,
-        ),
+    for _ in 0..RECENT_COMMITS_FETCH_ATTEMPTS {
+        if let Ok(commits) = fetch_recent_commits_via_clone(&https_url, 5, timeout) {
+            return (
+                RecentCommits {
+                    remote,
+                    commits: commits
+                        .into_iter()
+                        .map(|c| commit_info_from_log(c, now))
+                        .collect(),
+                },
+                RecentCommitsError::None,
+            );
+        }
     }
+    (
+        RecentCommits {
+            remote,
+            commits: Vec::new(),
+        },
+        RecentCommitsError::Network,
+    )
 }
 
 /// One row from `git log --pretty=...`. `committer_unix` is seconds since

@@ -1333,7 +1333,7 @@ impl App {
         let (commits_tx, commits_rx) = std::sync::mpsc::channel();
         let recent_repo_remote = crate::git::croft_repository_remote();
         std::thread::spawn(move || {
-            let timeout = std::time::Duration::from_secs(3);
+            let timeout = std::time::Duration::from_secs(5);
             let result = crate::git::fetch_croft_recent_commits_full(timeout);
             let _ = commits_tx.send(result);
         });
