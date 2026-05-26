@@ -11,8 +11,10 @@ mod lsp;
 mod pdf;
 mod remote;
 mod remote_connect;
+mod session_state;
 mod sheet;
 mod sysmon;
+mod update_watch;
 mod widgets;
 
 use anyhow::Result;

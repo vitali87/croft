@@ -17,6 +17,11 @@ pub struct Cli {
     #[arg(value_name = "PATH")]
     pub path: Option<PathBuf>,
 
+    /// Internal: restore tabs/layout from a session file written just
+    /// before a self-update re-exec. Not intended for manual use.
+    #[arg(long, hide = true)]
+    pub restore_session: Option<PathBuf>,
+
     #[command(subcommand)]
     pub command: Option<CliCommand>,
 }
@@ -100,7 +105,7 @@ impl Cli {
                 if !path.is_dir() {
                     anyhow::bail!("{} is not a directory", path.display());
                 }
-                crate::app::run(path)
+                crate::app::run(path, self.restore_session)
             }
         }
     }
@@ -533,8 +538,8 @@ fn install_zig_if_missing() -> Result<()> {
 }
 
 fn install_cargo_zigbuild_if_missing() -> Result<()> {
-    if std::process::Command::new("cargo")
-        .args(["zigbuild", "--version"])
+    if std::process::Command::new("cargo-zigbuild")
+        .arg("--version")
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)

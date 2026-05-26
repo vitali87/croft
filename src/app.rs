@@ -235,6 +235,16 @@ enum CreateKind {
     Folder,
 }
 
+/// State of a background self-update observed by a remote-launched croft.
+/// `Idle` is the steady state; `InProgress` paints an "Updating…" hint in
+/// the status bar; `Ready` arms the re-exec into the freshly-shipped binary.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum UpdateStatus {
+    Idle,
+    InProgress,
+    Ready,
+}
+
 #[derive(Clone, PartialEq, Eq, Debug)]
 enum MenuAction {
     Create(CreateKind),
@@ -867,6 +877,15 @@ pub struct App {
     connect_dialog: Option<crate::widgets::connect_dialog::ConnectDialog>,
     connect_auth: Option<crate::remote_connect::SshAuth>,
     install_session: Option<crate::install_session::InstallSession>,
+    /// Background self-update watcher, present only on a remote-launched
+    /// croft (gated by `CROFT_REMOTE_AUTOUPDATE`). Polls the install-stamp
+    /// the local cross-build writes when it finishes shipping a newer
+    /// binary, so the running croft can re-exec into it in place.
+    update_watch: Option<crate::update_watch::UpdateWatch>,
+    update_status: UpdateStatus,
+    /// Set when an update landed and croft should re-exec after the main
+    /// loop unwinds and the alt-screen is surrendered. Read by `run`.
+    pending_reexec: bool,
     /// One-shot flag the driver consumes to fire `terminal.clear()` so
     /// iTerm2 evicts the OSC-1337 image cells (activity bar icons,
     /// welcome wordmark, editor image preview) that would otherwise
@@ -1469,6 +1488,9 @@ impl App {
             connect_dialog: None,
             connect_auth: None,
             install_session: None,
+            update_watch: None,
+            update_status: UpdateStatus::Idle,
+            pending_reexec: false,
             shortcuts_image_clear_requested: false,
             ssh_empty_state_osc: None,
             ssh_empty_state_displayed: false,
@@ -3771,6 +3793,15 @@ impl App {
                     .add_modifier(Modifier::BOLD),
             ));
         }
+        if self.update_status == UpdateStatus::Ready {
+            spans.push(Span::styled(
+                " ⟳ Update ready - F9 to relaunch ",
+                Style::default()
+                    .bg(Color::Rgb(0x1f, 0x7a, 0x33))
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
         spans.extend(git_status_spans(&self.git_status));
         spans.push(Span::raw("  "));
         spans.push(Span::raw(&self.status));
@@ -4239,6 +4270,14 @@ impl App {
         }
         if matches!(key.code, KeyCode::F(8)) {
             self.perf_hud = !self.perf_hud;
+            return Ok(());
+        }
+        // A background update has landed and is waiting: F9 triggers the
+        // re-exec into the new binary. Gated on Ready so F9 passes through
+        // untouched the rest of the time.
+        if matches!(key.code, KeyCode::F(9)) && self.update_status == UpdateStatus::Ready {
+            self.pending_reexec = true;
+            self.quit = true;
             return Ok(());
         }
         if is_file_finder_key(key) {
@@ -5156,32 +5195,48 @@ impl App {
         };
         let events = session.drain_events();
         let mut changed = !events.is_empty();
+        let mut can_launch = false;
         let mut done = false;
         let mut failure: Option<String> = None;
-        if let Some(dialog) = self.connect_dialog.as_mut() {
-            for ev in events {
-                match ev {
-                    crate::install_session::InstallEvent::Log(line) => {
+        for ev in events {
+            match ev {
+                crate::install_session::InstallEvent::Log(line) => {
+                    if let Some(dialog) = self.connect_dialog.as_mut() {
                         dialog.push_log(&line);
                     }
-                    crate::install_session::InstallEvent::Done(Ok(())) => {
-                        done = true;
-                    }
-                    crate::install_session::InstallEvent::Done(Err(detail)) => {
-                        failure = Some(detail);
-                    }
+                }
+                crate::install_session::InstallEvent::CanLaunch => can_launch = true,
+                crate::install_session::InstallEvent::Done(Ok(())) => done = true,
+                crate::install_session::InstallEvent::Done(Err(detail)) => {
+                    failure = Some(detail);
                 }
             }
-        } else {
-            for ev in events {
-                match ev {
-                    crate::install_session::InstallEvent::Done(Ok(())) => done = true,
-                    crate::install_session::InstallEvent::Done(Err(detail)) => {
-                        failure = Some(detail)
-                    }
-                    crate::install_session::InstallEvent::Log(_) => {}
+        }
+        // Once we've handed the terminal to the remote croft, the install
+        // keeps running in a detached thread and signals completion to that
+        // remote process via the install-stamp it watches; nothing here.
+        if self.remote_launch.is_some() {
+            return changed;
+        }
+        // A croft is already on the remote: drop the user into it now and
+        // let the (re)install finish in the background. The running remote
+        // croft re-execs into the new binary when the stamp advances.
+        if can_launch {
+            if let Some(session) = self.install_session.as_mut() {
+                if let Some(adopted) = session.take_adopted() {
+                    let host = session.host.clone();
+                    let path = session.path.clone();
+                    self.remote_launch = Some(RemoteLaunch {
+                        host: host.clone(),
+                        path,
+                        adopted: Some(adopted),
+                    });
+                    self.status = format!("Launching croft on {host}…");
+                    self.connect_dialog = None;
+                    self.quit = true;
                 }
             }
+            return true;
         }
         if let Some(detail) = failure {
             if let Some(dialog) = self.connect_dialog.as_mut() {
@@ -5208,6 +5263,140 @@ impl App {
             changed = true;
         }
         changed
+    }
+
+    /// Start the background self-update watcher on a remote-launched croft.
+    /// No-op unless `CROFT_REMOTE_AUTOUPDATE` is set (it is, by the remote
+    /// launch command) and an install-stamp exists to compare against.
+    fn start_update_watch_if_remote(&mut self) {
+        if std::env::var_os("CROFT_REMOTE_AUTOUPDATE").is_none() {
+            return;
+        }
+        let cache_dir = croft_cache_dir();
+        let launch_stamp = std::fs::read_to_string(cache_dir.join("install-stamp"))
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+        self.update_watch = Some(crate::update_watch::UpdateWatch::start(
+            cache_dir,
+            launch_stamp,
+        ));
+    }
+
+    pub fn poll_update_watch(&mut self) -> bool {
+        let Some(watch) = self.update_watch.as_ref() else {
+            return false;
+        };
+        let mut changed = false;
+        for ev in watch.drain() {
+            changed = true;
+            match ev {
+                crate::update_watch::UpdateEvent::InProgress => {
+                    self.update_status = UpdateStatus::InProgress;
+                    self.status = String::from("Updating croft in the background…");
+                }
+                crate::update_watch::UpdateEvent::Failed => {
+                    self.update_status = UpdateStatus::Idle;
+                    self.status =
+                        String::from("Background croft update failed; staying on current version");
+                }
+                crate::update_watch::UpdateEvent::Ready => {
+                    // Do NOT yank the user mid-work: surface a persistent
+                    // "Update ready - F9 to relaunch" prompt in the status
+                    // bar and let them pick the moment. The re-exec only
+                    // fires when they press F9 (handle_key).
+                    self.update_status = UpdateStatus::Ready;
+                    self.status = String::from(
+                        "Update ready - press F9 to relaunch croft (terminals will reset)",
+                    );
+                }
+            }
+        }
+        changed
+    }
+
+    pub fn capture_session_state(&self) -> crate::session_state::SessionState {
+        let mut tabs = Vec::new();
+        let mut active_tab = 0;
+        for (idx, ed) in self.editor.editors.iter().enumerate() {
+            // Only plain text file tabs survive a re-exec; diff / sheet /
+            // image tabs are derived views with no path to reopen from.
+            if ed.diff.is_some() || ed.sheet.is_some() || ed.image.is_some() {
+                continue;
+            }
+            let Some(path) = ed.path.clone() else {
+                continue;
+            };
+            if idx == self.editor.active_index() {
+                active_tab = tabs.len();
+            }
+            let unsaved_text = if ed.dirty {
+                Some(ed.lines.join("\n"))
+            } else {
+                None
+            };
+            tabs.push(crate::session_state::OpenTabState {
+                path,
+                cursor_row: ed.cursor_row,
+                cursor_col: ed.cursor_col,
+                scroll: ed.scroll,
+                scroll_col: ed.scroll_col,
+                dirty: ed.dirty,
+                unsaved_text,
+            });
+        }
+        crate::session_state::SessionState {
+            workspace_root: self.workspace_root.clone(),
+            tabs,
+            active_tab,
+            sidebar_view: sidebar_view_label(self.sidebar_view).to_string(),
+            sidebar_width: self.sidebar_width,
+            terminal_height: self.terminal_height,
+            focus_editor: self.focus == Pane::Editor,
+        }
+    }
+
+    fn apply_session_state(&mut self, state: &crate::session_state::SessionState) {
+        for tab in &state.tabs {
+            if self.editor.open_pinned(&tab.path).is_err() {
+                continue;
+            }
+            let Some(ed) = self
+                .editor
+                .editors
+                .iter_mut()
+                .find(|e| e.path.as_deref() == Some(tab.path.as_path()))
+            else {
+                continue;
+            };
+            if tab.dirty {
+                if let Some(text) = &tab.unsaved_text {
+                    ed.lines = text.split('\n').map(str::to_string).collect();
+                    if ed.lines.is_empty() {
+                        ed.lines.push(String::new());
+                    }
+                    ed.dirty = true;
+                }
+            }
+            let max_row = ed.lines.len().saturating_sub(1);
+            ed.cursor_row = tab.cursor_row.min(max_row);
+            let max_col = ed.lines.get(ed.cursor_row).map_or(0, |l| l.chars().count());
+            ed.cursor_col = tab.cursor_col.min(max_col);
+            ed.scroll = tab.scroll;
+            ed.scroll_col = tab.scroll_col;
+        }
+        if state.active_tab < self.editor.tab_count() {
+            self.editor.select(state.active_tab);
+        }
+        if let Some(view) = sidebar_view_from_label(&state.sidebar_view) {
+            self.set_sidebar_view(view);
+        }
+        self.sidebar_width = state.sidebar_width;
+        self.terminal_height = state.terminal_height;
+        self.focus = if state.focus_editor {
+            Pane::Editor
+        } else {
+            Pane::Tree
+        };
     }
 
     fn tear_down_connect_auth(&mut self) {
@@ -10027,6 +10216,48 @@ fn is_remote_session() -> bool {
     std::env::var_os("SSH_CONNECTION").is_some()
         || std::env::var_os("SSH_TTY").is_some()
         || std::env::var_os("SSH_CLIENT").is_some()
+}
+
+fn croft_cache_dir() -> PathBuf {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    home.join(".cache").join("croft")
+}
+
+/// Resolve the binary to re-exec into after an update. The remote install
+/// always lands at `~/.cargo/bin/croft`; preferring that path (over
+/// `current_exe`, which may resolve to the now-replaced inode) guarantees
+/// the swap picks up the freshly-shipped file.
+fn reexec_binary_path() -> PathBuf {
+    if let Some(home) = std::env::var_os("HOME") {
+        let p = PathBuf::from(home).join(".cargo").join("bin").join("croft");
+        if p.exists() {
+            return p;
+        }
+    }
+    std::env::current_exe().unwrap_or_else(|_| PathBuf::from("croft"))
+}
+
+fn sidebar_view_label(view: SidebarView) -> &'static str {
+    match view {
+        SidebarView::Explorer => "Explorer",
+        SidebarView::Search => "Search",
+        SidebarView::SourceControl => "SourceControl",
+        SidebarView::Remote => "Remote",
+        SidebarView::RunDebug => "RunDebug",
+    }
+}
+
+fn sidebar_view_from_label(label: &str) -> Option<SidebarView> {
+    match label {
+        "Explorer" => Some(SidebarView::Explorer),
+        "Search" => Some(SidebarView::Search),
+        "SourceControl" => Some(SidebarView::SourceControl),
+        "Remote" => Some(SidebarView::Remote),
+        "RunDebug" => Some(SidebarView::RunDebug),
+        _ => None,
+    }
 }
 
 /// Live cwd of a running process by PID, or None when the platform doesn't
@@ -18400,6 +18631,99 @@ mod tests {
     }
 
     #[test]
+    fn f9_relaunches_only_when_update_is_ready() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+
+        // Not ready: F9 must not arm the re-exec.
+        let _ = app.handle_key(key(KeyCode::F(9), KeyModifiers::empty()));
+        assert!(!app.pending_reexec);
+        assert!(!app.quit);
+
+        // Ready: F9 arms the re-exec and quits the loop so `run` can exec.
+        app.update_status = UpdateStatus::Ready;
+        let _ = app.handle_key(key(KeyCode::F(9), KeyModifiers::empty()));
+        assert!(app.pending_reexec);
+        assert!(app.quit);
+    }
+
+    #[test]
+    fn session_state_round_trip_reopens_tabs_at_saved_cursor_and_active() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file_a = tmp.path().join("a.txt");
+        let file_b = tmp.path().join("b.txt");
+        std::fs::write(&file_a, "line0\nline1\nline2\n").unwrap();
+        std::fs::write(&file_b, "only\n").unwrap();
+
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.editor.open_pinned(&file_a).unwrap();
+        app.editor.open_pinned(&file_b).unwrap();
+        // Park the cursor on a.txt and make it the active tab.
+        let idx_a = app
+            .editor
+            .editors
+            .iter()
+            .position(|e| e.path.as_deref() == Some(file_a.as_path()))
+            .unwrap();
+        app.editor.editors[idx_a].cursor_row = 2;
+        app.editor.editors[idx_a].cursor_col = 3;
+        app.editor.select(idx_a);
+
+        let state = app.capture_session_state();
+        assert_eq!(state.tabs.len(), 2);
+        assert_eq!(
+            state.tabs[state.active_tab].path.as_path(),
+            file_a.as_path()
+        );
+
+        let mut restored = App::new(tmp.path().to_path_buf()).unwrap();
+        restored.apply_session_state(&state);
+        let restored_paths: Vec<_> = restored
+            .editor
+            .editors
+            .iter()
+            .filter_map(|e| e.path.clone())
+            .collect();
+        assert!(restored_paths.contains(&file_a));
+        assert!(restored_paths.contains(&file_b));
+        let active = &restored.editor.editors[restored.editor.active_index()];
+        assert_eq!(active.path.as_deref(), Some(file_a.as_path()));
+        assert_eq!(active.cursor_row, 2);
+        assert_eq!(active.cursor_col, 3);
+    }
+
+    #[test]
+    fn session_state_preserves_unsaved_buffer_contents() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("dirty.txt");
+        std::fs::write(&file, "saved\n").unwrap();
+
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.editor.open_pinned(&file).unwrap();
+        let idx = app.editor.active_index();
+        app.editor.editors[idx].lines = vec![String::from("edited unsaved")];
+        app.editor.editors[idx].dirty = true;
+
+        let state = app.capture_session_state();
+        let tab = state.tabs.iter().find(|t| t.path == file).unwrap();
+        assert!(tab.dirty);
+        assert_eq!(tab.unsaved_text.as_deref(), Some("edited unsaved"));
+
+        let mut restored = App::new(tmp.path().to_path_buf()).unwrap();
+        restored.apply_session_state(&state);
+        let ed = restored
+            .editor
+            .editors
+            .iter()
+            .find(|e| e.path.as_deref() == Some(file.as_path()))
+            .unwrap();
+        assert!(ed.dirty);
+        assert_eq!(ed.lines, vec![String::from("edited unsaved")]);
+        // On-disk file must be untouched by the capture/restore.
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "saved\n");
+    }
+
+    #[test]
     fn build_tab_context_menu_items_includes_all_four_close_actions_in_the_middle_of_a_strip() {
         // Right-click on tab 1 of 3 (i.e. a middle tab) should surface
         // every close action — there's at least one tab on each side.
@@ -18464,9 +18788,18 @@ impl std::io::Write for CountingWriter {
 
 type CroftTerminal = Terminal<CrosstermBackend<CountingWriter>>;
 
-pub fn run(root: PathBuf) -> Result<()> {
+pub fn run(root: PathBuf, restore_session: Option<PathBuf>) -> Result<()> {
     let title = build_title(&root);
     let mut app = App::new(root)?;
+    // Restore the tabs / layout carried across a self-update re-exec, then
+    // delete the handoff file so a later normal launch starts clean.
+    if let Some(session_path) = restore_session.as_ref() {
+        if let Ok(state) = crate::session_state::SessionState::load(session_path) {
+            app.apply_session_state(&state);
+        }
+        let _ = std::fs::remove_file(session_path);
+    }
+    app.start_update_watch_if_remote();
 
     enable_raw_mode().context("enable raw mode")?;
     let mut out = stdout();
@@ -18556,6 +18889,24 @@ pub fn run(root: PathBuf) -> Result<()> {
     terminal.show_cursor().ok();
 
     result?;
+    // A background self-update landed: serialize the session and replace
+    // this process image with the freshly-installed binary. The unix
+    // process-image swap keeps the same controlling tty (the ssh PTY), so
+    // there is no reconnect - the user sees a redraw, not a dropped
+    // session. No shell is involved; args are passed as an argv vector.
+    if app.pending_reexec {
+        let state = app.capture_session_state();
+        let session_path = crate::session_state::handoff_path();
+        let _ = state.save(&session_path);
+        use std::os::unix::process::CommandExt;
+        let mut cmd = std::process::Command::new(reexec_binary_path());
+        cmd.arg(&app.workspace_root)
+            .arg("--restore-session")
+            .arg(&session_path);
+        let err = CommandExt::exec(&mut cmd);
+        eprintln!("croft self-relaunch failed: {err}");
+        return Ok(());
+    }
     if let Some(remote) = app.remote_launch.take() {
         app._fs_watcher = None;
         app.fs_rx = None;
@@ -18793,6 +19144,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let pulls_changed = app.drain_remote_pulls();
         let connect_changed = app.poll_connect_dialog();
         let install_changed = app.poll_install_session();
+        let update_changed = app.poll_update_watch();
         app.sync_lsp();
         let lsp_changed = app.drain_lsp_completion();
         let sysmon_changed = app.drain_sysmon();
@@ -18806,6 +19158,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             || pulls_changed
             || connect_changed
             || install_changed
+            || update_changed
             || lsp_changed
             || sysmon_changed;
         let pty_eligible = pty_pending

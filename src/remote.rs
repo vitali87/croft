@@ -157,6 +157,7 @@ pub fn launch_croft(host: &str, path: Option<&str>) -> Result<()> {
 pub fn install_only_streaming(
     adopted: AdoptedMaster,
     log_tx: std::sync::mpsc::Sender<String>,
+    can_launch_tx: std::sync::mpsc::Sender<()>,
 ) -> Result<AdoptedMaster> {
     let host_label = adopted.host.clone();
     let _ = log_tx.send(format!("Adopting control socket for {host_label}…"));
@@ -165,13 +166,31 @@ pub fn install_only_streaming(
     let local_stamp = local_source_stamp()?;
     let _ = log_tx.send(format!("Local source stamp: {local_stamp}"));
     let _ = log_tx.send(format!("Checking installed croft version on {host_label}…"));
+    // If a croft is already on the remote, the user gets dropped into it
+    // immediately and the (re)install proceeds in the background. The
+    // running croft re-execs into the new binary once the stamp advances.
+    let present = remote_croft_present(&ssh).unwrap_or(false);
+    if present {
+        let _ = can_launch_tx.send(());
+    }
     if !remote_install_needed(&ssh, &local_stamp)? {
         let _ = log_tx.send(format!("Croft on {host_label} is already up to date."));
+        if !present {
+            let _ = can_launch_tx.send(());
+        }
         std::mem::forget(ssh);
         return Ok(adopted);
     }
+    // Mark the remote as updating before the local cross-compile so the
+    // running croft shows "Updating…" for the whole build+ship, not just
+    // the final remote activation.
+    mark_remote_updating(&ssh);
     let _ = log_tx.send(format!("Installing/updating Croft on {host_label}…"));
-    install_remote_croft_streaming(&ssh, &local_stamp, &log_tx)?;
+    if let Err(e) = install_remote_croft_streaming(&ssh, &local_stamp, &log_tx) {
+        clear_remote_updating(&ssh);
+        std::mem::forget(ssh);
+        return Err(e);
+    }
     let _ = log_tx.send("Install complete.".to_string());
     std::mem::forget(ssh);
     Ok(adopted)
@@ -283,14 +302,32 @@ fn try_local_cross_install_streaming(
     }
 
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let _ = log_tx.send(format!("Cross-compiling croft locally for {triple}…"));
-    let mut zigbuild = Command::new("cargo");
+    // This build runs *concurrently* with the live remote session, whose
+    // keystrokes are relayed by this same local machine. A default `-j N`
+    // rustc build pins every core and starves the ssh relay + terminal
+    // render, dropping the user's input. Run it niced and capped to half
+    // the cores so the interactive session always preempts the compile -
+    // the build is background, input latency is not. `nice` exists on both
+    // macOS and Linux, so this stays identical on both launch targets.
+    let jobs = std::thread::available_parallelism()
+        .map(|n| (n.get() / 2).max(1))
+        .unwrap_or(1)
+        .to_string();
+    let _ = log_tx.send(format!(
+        "Cross-compiling croft locally for {triple} (niced, {jobs} jobs)…"
+    ));
+    let mut zigbuild = Command::new("nice");
     zigbuild
         .args([
+            "-n",
+            "19",
+            "cargo",
             "zigbuild",
             "--profile",
             "remote-fast",
             "--locked",
+            "--jobs",
+            &jobs,
             "--bin",
             "croft",
             "--target",
@@ -342,12 +379,8 @@ fn try_local_cross_install_streaming(
         anyhow::bail!("rsync exited with {rsync_status}");
     }
 
-    let activate = format!(
-        "chmod 755 \"$HOME/.cargo/bin/croft.new\" && mv \"$HOME/.cargo/bin/croft.new\" \"$HOME/.cargo/bin/croft\" && printf %s {} > \"$HOME/.cache/croft/install-stamp\"",
-        shell_quote(source_stamp)
-    );
     let mut act = ssh.command();
-    act.arg(&ssh.host).arg(activate);
+    act.arg(&ssh.host).arg(activate_command(source_stamp));
     let act_status =
         run_command_streaming(act, log_tx).context("activating remote croft binary")?;
     if !act_status.success() {
@@ -1135,8 +1168,13 @@ fn install_remote_croft(ssh: &SshControl, source_stamp: &str) -> Result<()> {
 }
 
 fn cross_compile_available() -> bool {
-    Command::new("cargo")
-        .args(["zigbuild", "--version"])
+    // Probe the cargo-zigbuild binary directly: `cargo zigbuild --version`
+    // is rejected by cargo-zigbuild >=0.22 (the `zigbuild` subcommand has
+    // no `--version`, exit 2), which silently disabled the fast path and
+    // forced every remote install onto the slow from-scratch `cargo
+    // install`. `cargo-zigbuild --version` exits 0 when installed.
+    Command::new("cargo-zigbuild")
+        .arg("--version")
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
@@ -1254,14 +1292,10 @@ fn try_local_cross_install(ssh: &SshControl, source_stamp: &str) -> Result<bool>
     // Atomic-swap the freshly-shipped binary into place. `mv` on the
     // same filesystem is the standard way to avoid the race where a
     // mid-flight process opens a half-written executable.
-    let activate = format!(
-        "chmod 755 \"$HOME/.cargo/bin/croft.new\" && mv \"$HOME/.cargo/bin/croft.new\" \"$HOME/.cargo/bin/croft\" && printf %s {} > \"$HOME/.cache/croft/install-stamp\"",
-        shell_quote(source_stamp)
-    );
     let activate_status = ssh
         .command()
         .arg(&ssh.host)
-        .arg(activate)
+        .arg(activate_command(source_stamp))
         .status()
         .context("activating remote croft binary")?;
     if !activate_status.success() {
@@ -1280,7 +1314,7 @@ fn remote_croft_command_for_terminal(
     term_program: Option<&str>,
     env: &[(String, String)],
 ) -> String {
-    let mut prefix = String::new();
+    let mut prefix = String::from("export CROFT_REMOTE_AUTOUPDATE=1; ");
     if let Some(term_program) =
         term_program.filter(|value| crate::iterm2_inline::is_iterm2_term_program(Some(value)))
     {
@@ -1469,12 +1503,71 @@ if ! command -v cargo >/dev/null 2>&1; then
   . "$HOME/.cargo/env"
 fi
 export PATH="$HOME/.cargo/bin:$PATH"
-cargo install --path "$HOME/.cache/croft/source" --force --locked
+# Cap the host build to ~half its cores and run it niced: this fallback
+# compiles on the shared remote (often while other workloads run and,
+# with launch-now, while a live croft session is using the box), so the
+# default `cargo install -j <all cores>` would pin the machine. (nproc+1)/2
+# stays >=1 even on a single core; nice is best-effort if present.
+CROFT_JOBS=$(( ( $(nproc 2>/dev/null || echo 2) + 1 ) / 2 ))
+CROFT_NICE=""
+if command -v nice >/dev/null 2>&1; then CROFT_NICE="nice -n 19"; fi
+$CROFT_NICE cargo install --path "$HOME/.cache/croft/source" --jobs "$CROFT_JOBS" --force --locked
 mkdir -p "$HOME/.cache/croft"
 printf %s {stamp} > "$HOME/.cache/croft/install-stamp"
+rm -f "$HOME/.cache/croft/updating"
 "#,
         stamp = shell_quote(source_stamp)
     )
+}
+
+/// Final swap step shared by the cross-build and rsync fast paths: chmod
+/// the staged binary, atomically `mv` it over the live one, write the new
+/// install-stamp, then clear the `updating` marker. The stamp is written
+/// only after the binary is in place, so a remote-launched croft that
+/// watches the stamp never re-execs into a half-shipped binary.
+fn activate_command(source_stamp: &str) -> String {
+    format!(
+        "chmod 755 \"$HOME/.cargo/bin/croft.new\" && mv \"$HOME/.cargo/bin/croft.new\" \"$HOME/.cargo/bin/croft\" && printf %s {stamp} > \"$HOME/.cache/croft/install-stamp\" && rm -f \"$HOME/.cache/croft/updating\"",
+        stamp = shell_quote(source_stamp)
+    )
+}
+
+/// Drop the `updating` marker so a remote-launched croft shows its
+/// "Updating…" indicator for the whole build+ship, not just the final
+/// remote-side activation. Written before the (long) local cross-compile.
+fn mark_remote_updating(ssh: &SshControl) {
+    let _ = ssh
+        .command()
+        .arg(&ssh.host)
+        .arg("mkdir -p \"$HOME/.cache/croft\" && : > \"$HOME/.cache/croft/updating\"")
+        .status();
+}
+
+/// Clear the marker after a failed install so the indicator resolves to a
+/// brief "update failed" rather than hanging on "Updating…" forever.
+fn clear_remote_updating(ssh: &SshControl) {
+    let _ = ssh
+        .command()
+        .arg(&ssh.host)
+        .arg("rm -f \"$HOME/.cache/croft/updating\"")
+        .status();
+}
+
+/// True when a croft binary is already resolvable on the remote PATH,
+/// regardless of version. Drives the launch-now path: an existing binary
+/// can be launched immediately while a newer one installs underneath it.
+fn remote_croft_present(ssh: &SshControl) -> Result<bool> {
+    let output = ssh
+        .command()
+        .arg(&ssh.host)
+        .arg(
+            r#"if [ -f "$HOME/.cargo/env" ]; then . "$HOME/.cargo/env"; fi
+export PATH="$HOME/.cargo/bin:$PATH"
+command -v croft >/dev/null 2>&1 && echo yes"#,
+        )
+        .output()
+        .context("probing remote croft presence")?;
+    Ok(String::from_utf8_lossy(&output.stdout).trim() == "yes")
 }
 
 fn local_source_stamp() -> Result<String> {
@@ -1564,7 +1657,7 @@ Host !blocked *.internal
     fn remote_croft_command_quotes_paths() {
         assert_eq!(
             remote_croft_command_for_terminal(Some("/tmp/it's here"), None, &[]),
-            "export PATH=\"$HOME/.cargo/bin:$PATH\"; command -v croft >/dev/null 2>&1 || { echo 'croft not found on remote PATH' >&2; exit 127; }; exec croft '/tmp/it'\"'\"'s here'"
+            "export CROFT_REMOTE_AUTOUPDATE=1; export PATH=\"$HOME/.cargo/bin:$PATH\"; command -v croft >/dev/null 2>&1 || { echo 'croft not found on remote PATH' >&2; exit 127; }; exec croft '/tmp/it'\"'\"'s here'"
         );
     }
 
@@ -1572,7 +1665,7 @@ Host !blocked *.internal
     fn remote_croft_command_forwards_supported_terminal_program() {
         assert_eq!(
             remote_croft_command_for_terminal(None, Some("iTerm.app"), &[]),
-            "export CROFT_FORCE_INLINE_IMAGES=1 TERM_PROGRAM='iTerm.app'; export PATH=\"$HOME/.cargo/bin:$PATH\"; command -v croft >/dev/null 2>&1 || { echo 'croft not found on remote PATH' >&2; exit 127; }; exec croft"
+            "export CROFT_REMOTE_AUTOUPDATE=1; export CROFT_FORCE_INLINE_IMAGES=1 TERM_PROGRAM='iTerm.app'; export PATH=\"$HOME/.cargo/bin:$PATH\"; command -v croft >/dev/null 2>&1 || { echo 'croft not found on remote PATH' >&2; exit 127; }; exec croft"
         );
     }
 
@@ -1602,6 +1695,22 @@ Host !blocked *.internal
             }
             other => panic!("expected Pull, got {:?}", matches!(other, Some(_))),
         }
+    }
+
+    #[test]
+    fn activate_command_writes_stamp_then_clears_updating_marker() {
+        let command = super::activate_command("deadbeef");
+        assert!(command.contains("mv \"$HOME/.cargo/bin/croft.new\" \"$HOME/.cargo/bin/croft\""));
+        let stamp_at = command
+            .find("printf %s 'deadbeef' > \"$HOME/.cache/croft/install-stamp\"")
+            .expect("stamp write present");
+        let clear_at = command
+            .find("rm -f \"$HOME/.cache/croft/updating\"")
+            .expect("marker clear present");
+        assert!(
+            stamp_at < clear_at,
+            "stamp must be written before marker clear"
+        );
     }
 
     #[test]
