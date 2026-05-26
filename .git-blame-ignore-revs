@@ -1,0 +1,7 @@
+# Bulk reformats to skip in `git blame`.
+# Enable locally with:
+#   git config blame.ignoreRevsFile .git-blame-ignore-revs
+# Codeberg/Forgejo and GitHub honor this file automatically.
+
+# style: format entire codebase with cargo fmt
+ee3da15811f250904a72f953ef4744e4e2205c36
