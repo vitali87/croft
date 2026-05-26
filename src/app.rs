@@ -28,7 +28,7 @@ use crate::widgets::{
     file_tree::FileTree,
     remote::RemotePanel,
     run_debug::RunDebugPanel,
-    search::SearchPanel,
+    search::{SearchPanel, SearchRequest},
     source_control::SourceControlPanel,
     system_panel::SystemPanel,
     terminal::PtyTerminal,
@@ -573,6 +573,8 @@ pub struct App {
     terminal_maximized: bool,
     status: String,
     quit: bool,
+    drop_to_local: bool,
+    is_remote: bool,
     context_menu: Option<ContextMenu>,
     prompt: Option<Prompt>,
     /// Filesystem watcher; held to keep it alive. Events flow into `fs_rx`.
@@ -1399,6 +1401,8 @@ impl App {
             terminal_maximized: false,
             status: String::from("Ready"),
             quit: false,
+            drop_to_local: false,
+            is_remote: is_remote_session(),
             context_menu: None,
             prompt: None,
             _fs_watcher: None,
@@ -2436,9 +2440,10 @@ impl App {
         self.search.hits.clear();
         self.search.selected = 0;
         self.search.scroll = 0;
-        let _ = self
-            .search_query_tx
-            .send((self.search.query.clone(), self.search.opts));
+        let _ = self.search_query_tx.send(SearchRequest::Query(
+            self.search.query.clone(),
+            self.search.opts,
+        ));
         let term = if self.search.query.trim().is_empty() {
             None
         } else {
@@ -3326,7 +3331,9 @@ impl App {
             // until the scan finishes. The user's hits stay populated for
             // when they come back; only the live work is dropped.
             if self.sidebar_view == SidebarView::Search && view != SidebarView::Search {
-                let _ = self.search_query_tx.send((String::new(), self.search.opts));
+                let _ = self
+                    .search_query_tx
+                    .send(SearchRequest::Query(String::new(), self.search.opts));
             }
             // Leaving Run-Debug after the headline icon was on screen:
             // arm a one-shot `terminal.clear()` so iTerm2 evicts the
@@ -3364,6 +3371,7 @@ impl App {
             SidebarView::Explorer => self.focus_pane(Pane::Tree),
             SidebarView::Search => {
                 self.focus_pane(Pane::Tree); // tree pane = side panel; dispatch by view
+                self.search.select_all_query();
             }
             SidebarView::SourceControl => {
                 self.refresh_source_control();
@@ -4370,9 +4378,9 @@ impl App {
             self.set_sidebar_view(SidebarView::Explorer);
             return Ok(());
         }
-        if is_source_control_jump_via_s_key(key) {
+        if is_search_activate_key(key) {
             self.show_tree = true;
-            self.set_sidebar_view(SidebarView::SourceControl);
+            self.set_sidebar_view(SidebarView::Search);
             return Ok(());
         }
         if is_run_debug_jump_key(key) {
@@ -4383,6 +4391,11 @@ impl App {
         if is_remote_jump_key(key) {
             self.show_tree = true;
             self.set_sidebar_view(SidebarView::Remote);
+            return Ok(());
+        }
+        if self.is_remote && is_drop_to_local_key(key) {
+            self.drop_to_local = true;
+            self.quit = true;
             return Ok(());
         }
         if self.sidebar_view == SidebarView::Search
@@ -5570,6 +5583,7 @@ impl App {
                 self.editor.scroll_col = 0;
                 self.editor.ensure_cursor_col_visible();
                 self.status = format!("Opened {} at line {}", hit.path.display(), hit.line_no);
+                self.focus_pane(Pane::Editor);
             }
             Err(e) => {
                 self.status = format!("Open failed: {e}");
@@ -6326,7 +6340,7 @@ impl App {
                 return;
             }
         }
-        if self.sidebar_view == SidebarView::Search && self.focus != Pane::Editor {
+        if self.sidebar_view == SidebarView::Search && self.focus == Pane::Tree {
             self.search.insert_str_into_query(s);
             self.submit_search_query();
             self.status = format!("Pasted {} chars", s.chars().count());
@@ -8244,6 +8258,17 @@ impl App {
             .send(crate::git::GitRequest::SetRoot(new_root.clone()));
         self.refresh_git_status_debounced();
         self.refresh_source_control();
+        // Rebind the search worker and the panel's display root to the new
+        // Explorer root so the next search targets this directory and its
+        // subdirectories, not the root captured when the worker was spawned.
+        // Drop the old root's hits so nothing stale lingers in the panel.
+        let _ = self
+            .search_query_tx
+            .send(SearchRequest::SetRoot(new_root.clone()));
+        self.search.root = new_root.clone();
+        self.search.hits.clear();
+        self.search.selected = 0;
+        self.search.scroll = 0;
         // Drop any in-flight walker for the OLD root so its result is
         // discarded when it tries to send. Then kick a fresh walk
         // against the new root. file_finder_index keeps the old entries
@@ -9372,11 +9397,12 @@ fn is_explorer_jump_key(key: KeyEvent) -> bool {
     is_cmd_shift_letter(key, 'e')
 }
 
-/// `Ctrl/Cmd+Shift+S`: jump to the Source Control sidebar from any pane.
-/// Companion to the older `Cmd+Shift+G` chord (which has the `focus != Editor`
-/// guard because Cmd+Shift+G in the editor is goto-bottom). Croft has no
-/// Save-As, so claiming Cmd+Shift+S across every pane is collision-free.
-fn is_source_control_jump_via_s_key(key: KeyEvent) -> bool {
+/// `Ctrl/Cmd+Shift+S`: activate Search from any pane — reveal the panel, focus
+/// the input, and select the existing query (so the next keystroke or paste
+/// replaces it rather than appending). Source Control stays reachable on
+/// `Cmd+Shift+G`. Croft has no Save-As, so claiming Cmd+Shift+S is
+/// collision-free.
+fn is_search_activate_key(key: KeyEvent) -> bool {
     is_cmd_shift_letter(key, 's')
 }
 
@@ -9393,6 +9419,10 @@ fn is_run_debug_jump_key(key: KeyEvent) -> bool {
 /// same intent.
 fn is_remote_jump_key(key: KeyEvent) -> bool {
     is_cmd_shift_letter(key, 'r')
+}
+
+fn is_drop_to_local_key(key: KeyEvent) -> bool {
+    is_cmd_shift_letter(key, 'l')
 }
 
 fn is_cmd_shift_letter(key: KeyEvent, letter: char) -> bool {
@@ -9575,8 +9605,8 @@ fn is_save_key(key: KeyEvent) -> bool {
     let has_super = key.modifiers.contains(KeyModifiers::SUPER);
     let has_ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let has_shift = key.modifiers.contains(KeyModifiers::SHIFT);
-    // Cmd+Shift+S is reserved for the Source Control sidebar jump
-    // (`is_source_control_jump_via_s_key`), so reject Shift when Super is
+    // Cmd+Shift+S is reserved for Search activation
+    // (`is_search_activate_key`), so reject Shift when Super is
     // held. Ctrl+Shift+S still triggers Save because some terminals
     // capitalise the letter when Ctrl is held and the user genuinely
     // means Ctrl+S — that's the existing `shift_ctrl_s_is_save_key`
@@ -10494,6 +10524,93 @@ mod tests {
 
     fn key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, mods)
+    }
+
+    #[test]
+    fn opening_a_search_hit_moves_focus_to_the_editor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("hit.txt");
+        std::fs::write(&f, "needle here\n").unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.set_sidebar_view(SidebarView::Search);
+        app.search.query = String::from("needle");
+        app.search.run_query();
+        assert!(
+            matches!(app.focus, Pane::Tree),
+            "precondition: search holds focus"
+        );
+        let hit = app.search.selected_hit().cloned().expect("a hit");
+        app.open_search_hit(&hit);
+        assert!(
+            matches!(app.focus, Pane::Editor),
+            "opening a search result must hand keyboard focus to the editor so typing no longer leaks into the search box"
+        );
+        assert!(!app.search.focused);
+    }
+
+    #[test]
+    fn cmd_shift_s_activates_search_and_selects_existing_query() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.set_sidebar_view(SidebarView::Search);
+        app.search.query = String::from("oldterm");
+        app.search.clear_selection();
+        app.focus_pane(Pane::Editor);
+        app.handle_key(key(
+            KeyCode::Char('S'),
+            KeyModifiers::SUPER | KeyModifiers::SHIFT,
+        ))
+        .unwrap();
+        assert_eq!(app.sidebar_view, SidebarView::Search);
+        assert!(
+            matches!(app.focus, Pane::Tree),
+            "Cmd+Shift+S focuses the search box"
+        );
+        assert_eq!(
+            app.search.selection_range(),
+            Some((0, "oldterm".len())),
+            "re-entering search must select the previous query so the next keystroke replaces it"
+        );
+    }
+
+    #[test]
+    fn typing_after_reactivating_search_replaces_instead_of_appending() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.set_sidebar_view(SidebarView::Search);
+        app.search.query = String::from("oldterm");
+        app.search.clear_selection();
+        app.focus_pane(Pane::Editor);
+        app.handle_key(key(
+            KeyCode::Char('S'),
+            KeyModifiers::SUPER | KeyModifiers::SHIFT,
+        ))
+        .unwrap();
+        app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(
+            app.search.query, "x",
+            "the previous query was selected, so the first keystroke replaces it"
+        );
+    }
+
+    #[test]
+    fn paste_while_terminal_focused_does_not_leak_into_search_box() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.set_sidebar_view(SidebarView::Search);
+        app.search.query = String::from("hello");
+        app.search.clear_selection();
+        app.focus_pane(Pane::Terminal);
+        app.handle_paste("machi");
+        assert_eq!(
+            app.search.query, "hello",
+            "a bracketed paste must NOT append to the search box when the terminal is focused, even though the Search panel is visible"
+        );
+        assert!(
+            matches!(app.focus, Pane::Terminal),
+            "focus must stay on the terminal"
+        );
     }
 
     #[test]
@@ -13534,6 +13651,30 @@ mod tests {
     }
 
     #[test]
+    fn changing_workspace_root_retargets_search_at_the_new_explorer_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let inner = tmp.path().join("inner");
+        std::fs::create_dir_all(&inner).unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.search.hits.push(crate::widgets::search::SearchHit {
+            path: tmp.path().join("stale.txt"),
+            line_no: 1,
+            line_text: String::from("stale"),
+        });
+
+        app.change_workspace_root(inner.clone());
+
+        assert_eq!(
+            app.search.root, inner,
+            "the search panel must point at the Explorer's new root so its target and the path-stripping match"
+        );
+        assert!(
+            app.search.hits.is_empty(),
+            "hits from the previous root must be dropped when the Explorer root changes"
+        );
+    }
+
+    #[test]
     fn cmd_shift_slash_on_a_folder_changes_workspace_root_to_that_folder_s_parent() {
         let tmp = tempfile::tempdir().unwrap();
         let mid = tmp.path().join("mid");
@@ -15812,7 +15953,7 @@ mod tests {
     }
 
     #[test]
-    fn cmd_shift_s_jumps_to_source_control_even_when_editor_is_focused() {
+    fn cmd_shift_s_activates_search_even_when_editor_is_focused() {
         let mut app = editor_app_with_lines(&["x"]);
         app.focus_pane(Pane::Editor);
         app.handle_key(key(
@@ -15822,8 +15963,12 @@ mod tests {
         .unwrap();
         assert_eq!(
             app.sidebar_view,
-            SidebarView::SourceControl,
-            "Cmd+Shift+S must jump to Source Control even from the editor (unlike Cmd+Shift+G, which is overloaded by goto-bottom in the editor)"
+            SidebarView::Search,
+            "Cmd+Shift+S must activate Search even from the editor; Source Control stays reachable on Cmd+Shift+G"
+        );
+        assert!(
+            matches!(app.focus, Pane::Tree),
+            "Cmd+Shift+S must move keyboard focus into the search box"
         );
     }
 
@@ -15849,6 +15994,60 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(app.sidebar_view, SidebarView::Remote);
+    }
+
+    #[test]
+    fn is_drop_to_local_key_matches_only_cmd_shift_l() {
+        assert!(is_drop_to_local_key(key(
+            KeyCode::Char('l'),
+            KeyModifiers::SUPER | KeyModifiers::SHIFT
+        )));
+        assert!(is_drop_to_local_key(key(
+            KeyCode::Char('L'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT
+        )));
+        assert!(!is_drop_to_local_key(key(
+            KeyCode::Char('l'),
+            KeyModifiers::SUPER
+        )));
+        assert!(!is_drop_to_local_key(key(
+            KeyCode::Char('q'),
+            KeyModifiers::CONTROL
+        )));
+        assert!(!is_drop_to_local_key(key(
+            KeyCode::Char('r'),
+            KeyModifiers::SUPER | KeyModifiers::SHIFT
+        )));
+    }
+
+    #[test]
+    fn cmd_shift_l_on_remote_requests_drop_to_local() {
+        let mut app = editor_app_with_lines(&["x"]);
+        app.is_remote = true;
+        app.handle_key(key(
+            KeyCode::Char('l'),
+            KeyModifiers::SUPER | KeyModifiers::SHIFT,
+        ))
+        .unwrap();
+        assert!(
+            app.drop_to_local && app.quit,
+            "Cmd+Shift+L on a remote-launched croft must request a clean hand-back to the local croft"
+        );
+    }
+
+    #[test]
+    fn cmd_shift_l_on_local_is_inert() {
+        let mut app = editor_app_with_lines(&["x"]);
+        app.is_remote = false;
+        app.handle_key(key(
+            KeyCode::Char('l'),
+            KeyModifiers::SUPER | KeyModifiers::SHIFT,
+        ))
+        .unwrap();
+        assert!(
+            !app.drop_to_local && !app.quit,
+            "Cmd+Shift+L on a local croft must do nothing - there is no remote session to leave"
+        );
     }
 
     #[test]
@@ -18790,7 +18989,7 @@ type CroftTerminal = Terminal<CrosstermBackend<CountingWriter>>;
 
 pub fn run(root: PathBuf, restore_session: Option<PathBuf>) -> Result<()> {
     let title = build_title(&root);
-    let mut app = App::new(root)?;
+    let mut app = App::new(root.clone())?;
     // Restore the tabs / layout carried across a self-update re-exec, then
     // delete the handoff file so a later normal launch starts clean.
     if let Some(session_path) = restore_session.as_ref() {
@@ -18889,6 +19088,9 @@ pub fn run(root: PathBuf, restore_session: Option<PathBuf>) -> Result<()> {
     terminal.show_cursor().ok();
 
     result?;
+    if app.drop_to_local {
+        std::process::exit(crate::remote::DROP_TO_LOCAL_EXIT_CODE);
+    }
     // A background self-update landed: serialize the session and replace
     // this process image with the freshly-installed binary. The unix
     // process-image swap keeps the same controlling tty (the ssh PTY), so
@@ -18917,7 +19119,10 @@ pub fn run(root: PathBuf, restore_session: Option<PathBuf>) -> Result<()> {
             crate::remote::launch_croft_with(&remote.host, remote.path.as_deref(), None)
         };
         restore_host_terminal_state();
-        launch_result?;
+        match launch_result? {
+            crate::remote::RemoteOutcome::ReturnToLocal => return run(root, None),
+            crate::remote::RemoteOutcome::Exited => return Ok(()),
+        }
     }
     Ok(())
 }
@@ -18945,16 +19150,19 @@ const TERMINAL_RESTORE_SEQ: &[u8] =
     b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l\x1b[?2004l\x1b[?1049l\x1b[ q";
 
 fn install_terminal_restore_panic_hook() {
-    let original = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        use std::io::Write;
-        let _ = disable_raw_mode();
-        let mut out = stdout();
-        let _ = out.write_all(TERMINAL_RESTORE_SEQ);
-        let _ = out.write_all(b"\x1b[?25h");
-        let _ = out.flush();
-        original(info);
-    }));
+    static HOOK: std::sync::Once = std::sync::Once::new();
+    HOOK.call_once(|| {
+        let original = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            use std::io::Write;
+            let _ = disable_raw_mode();
+            let mut out = stdout();
+            let _ = out.write_all(TERMINAL_RESTORE_SEQ);
+            let _ = out.write_all(b"\x1b[?25h");
+            let _ = out.flush();
+            original(info);
+        }));
+    });
 }
 
 /// Suspend the alt-screen, run every queued scp upload with the host

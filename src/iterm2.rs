@@ -66,7 +66,7 @@ const CMD_SHIFT_O_HEX: &str = "0x1b 0x5b 0x37 0x39 0x3b 0x31 0x30 0x75";
 /// 1 base + Shift(1) + Super(8). CSI-u payload `ESC [ 69 ; 10 u`.
 const CMD_SHIFT_E_KEY: &str = "0x45-0x120000-0xe";
 const CMD_SHIFT_E_HEX: &str = "0x1b 0x5b 0x36 0x39 0x3b 0x31 0x30 0x75";
-/// `Cmd+Shift+S` — jump to Source Control. Codepoint 'S' (0x53 = 83),
+/// `Cmd+Shift+S` — activate Search. Codepoint 'S' (0x53 = 83),
 /// virtualKeyCode `kVK_ANSI_S` = 0x01. CSI-u `ESC [ 83 ; 10 u`.
 const CMD_SHIFT_S_KEY: &str = "0x53-0x120000-0x1";
 const CMD_SHIFT_S_HEX: &str = "0x1b 0x5b 0x38 0x33 0x3b 0x31 0x30 0x75";
@@ -81,6 +81,12 @@ const CMD_SHIFT_D_HEX: &str = "0x1b 0x5b 0x36 0x38 0x3b 0x31 0x30 0x75";
 /// virtualKeyCode `kVK_ANSI_R` = 0x0f. CSI-u `ESC [ 82 ; 10 u`.
 const CMD_SHIFT_R_KEY: &str = "0x52-0x120000-0xf";
 const CMD_SHIFT_R_HEX: &str = "0x1b 0x5b 0x38 0x32 0x3b 0x31 0x30 0x75";
+/// `Cmd+Shift+L` — disconnect a remote session and drop back into the local
+/// croft. Codepoint 'L' (0x4c = 76), virtualKeyCode `kVK_ANSI_L` = 0x25.
+/// CSI-u `ESC [ 76 ; 10 u`. Forwarded defensively so AppKit / iTerm2 cannot
+/// consume the chord before the remote croft's handler sees it.
+const CMD_SHIFT_L_KEY: &str = "0x4c-0x120000-0x25";
+const CMD_SHIFT_L_HEX: &str = "0x1b 0x5b 0x37 0x36 0x3b 0x31 0x30 0x75";
 /// `Cmd+Shift+N` — Explorer "New Folder". Codepoint 'N' (0x4e = 78),
 /// virtualKeyCode `kVK_ANSI_N` = 0x2d. CSI-u `ESC [ 78 ; 10 u`. Forwarded
 /// defensively so AppKit / iTerm2 cannot consume the chord at the menu
@@ -410,6 +416,7 @@ pub fn apply_croft_key_settings(plist: &mut Value) -> Result<(), ITerm2Error> {
         (CMD_SHIFT_S_KEY, CMD_SHIFT_S_HEX),
         (CMD_SHIFT_D_KEY, CMD_SHIFT_D_HEX),
         (CMD_SHIFT_R_KEY, CMD_SHIFT_R_HEX),
+        (CMD_SHIFT_L_KEY, CMD_SHIFT_L_HEX),
         (CMD_SHIFT_N_KEY, CMD_SHIFT_N_HEX),
         (CMD_SHIFT_T_KEY, CMD_SHIFT_T_HEX),
         (CMD_T_KEY, CMD_T_HEX),
@@ -816,7 +823,7 @@ mod tests {
             (
                 CMD_SHIFT_S_KEY,
                 CMD_SHIFT_S_HEX,
-                "Cmd+Shift+S (jump to Source Control)",
+                "Cmd+Shift+S (activate Search)",
             ),
             (
                 CMD_SHIFT_D_KEY,
@@ -827,6 +834,11 @@ mod tests {
                 CMD_SHIFT_R_KEY,
                 CMD_SHIFT_R_HEX,
                 "Cmd+Shift+R (jump to Remote)",
+            ),
+            (
+                CMD_SHIFT_L_KEY,
+                CMD_SHIFT_L_HEX,
+                "Cmd+Shift+L (disconnect remote, drop to local)",
             ),
         ] {
             assert_eq!(

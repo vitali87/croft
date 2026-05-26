@@ -272,10 +272,17 @@ pub enum SearchEvent {
     Done(String, SearchOpts),
 }
 
-/// Submitted unit of work: the query string and the toggle state at the
-/// moment of submission. Bundling them lets the user flip a toggle and
-/// re-fire the same query string with new opts.
-pub type SearchRequest = (String, SearchOpts);
+/// Work submitted to the search worker. `Query` carries the query string and
+/// the toggle state at the moment of submission, so the user can flip a toggle
+/// and re-fire the same string with new opts. `SetRoot` rebinds the directory
+/// the worker scans, so search always targets the Explorer's current root and
+/// its subdirectories after a Make-root / open-folder, never the root captured
+/// when the worker was spawned.
+#[derive(Clone, Debug)]
+pub enum SearchRequest {
+    Query(String, SearchOpts),
+    SetRoot(PathBuf),
+}
 
 /// How long the user has to pause typing before the search fires. Each
 /// fresh keystroke restarts the timer, so a fast typist running through
@@ -295,7 +302,7 @@ const SEARCH_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(20
 /// so the receiver always sees a balanced event stream. The thread exits
 /// cleanly when the channel closes.
 pub fn search_worker_loop(
-    root: PathBuf,
+    mut root: PathBuf,
     rx: std::sync::mpsc::Receiver<SearchRequest>,
     tx: std::sync::mpsc::Sender<SearchEvent>,
 ) {
@@ -306,23 +313,34 @@ pub fn search_worker_loop(
             Ok(r) => r,
             Err(_) => break,
         };
-        // A new keystroke landed: cancel the in-flight scan (if any) so
-        // its worker thread bails out before the user pauses long enough
-        // to trigger the next scan.
+        // A new message landed: cancel the in-flight scan (if any) so its
+        // worker thread bails out before the user pauses long enough to
+        // trigger the next scan.
         if let Some((handle, cancel)) = current.take() {
             cancel.store(true, Ordering::Relaxed);
             let _ = handle.join();
         }
+        // A root rebind is not a query and does not debounce: apply it and
+        // wait for the next message.
+        if let SearchRequest::SetRoot(new_root) = latest {
+            root = new_root;
+            continue;
+        }
         // Trailing-edge debounce: each new keystroke resets the timer.
-        // The search fires only after `SEARCH_DEBOUNCE` of silence.
+        // The search fires only after `SEARCH_DEBOUNCE` of silence. A
+        // root rebind arriving mid-debounce updates the target without
+        // displacing the pending query.
         loop {
             match rx.recv_timeout(SEARCH_DEBOUNCE) {
+                Ok(SearchRequest::SetRoot(new_root)) => root = new_root,
                 Ok(newer) => latest = newer,
                 Err(RecvTimeoutError::Timeout) => break,
                 Err(RecvTimeoutError::Disconnected) => return,
             }
         }
-        let (query, opts) = latest;
+        let SearchRequest::Query(query, opts) = latest else {
+            continue;
+        };
         if query.trim().is_empty() {
             if tx.send(SearchEvent::Done(query, opts)).is_err() {
                 return;
@@ -1448,7 +1466,8 @@ mod tests {
         let (e_tx, e_rx) = std::sync::mpsc::channel::<SearchEvent>();
         let root = tmp.path().to_path_buf();
         let join = std::thread::spawn(move || search_worker_loop(root, q_rx, e_tx));
-        q_tx.send(("needle".into(), SearchOpts::default())).unwrap();
+        q_tx.send(SearchRequest::Query("needle".into(), SearchOpts::default()))
+            .unwrap();
         let (q, hits, done) = collect_until_done(&e_rx, std::time::Duration::from_secs(2));
         assert_eq!(q.as_deref(), Some("needle"));
         assert_eq!(hits.len(), 1);
@@ -1470,7 +1489,8 @@ mod tests {
         let (e_tx, e_rx) = std::sync::mpsc::channel::<SearchEvent>();
         let root = tmp.path().to_path_buf();
         let join = std::thread::spawn(move || search_worker_loop(root, q_rx, e_tx));
-        q_tx.send(("needle".into(), SearchOpts::default())).unwrap();
+        q_tx.send(SearchRequest::Query("needle".into(), SearchOpts::default()))
+            .unwrap();
         let mut total = 0usize;
         let mut hits_events = 0usize;
         let mut done_events = 0usize;
@@ -1509,9 +1529,12 @@ mod tests {
         let (e_tx, e_rx) = std::sync::mpsc::channel::<SearchEvent>();
         let root = tmp.path().to_path_buf();
         let join = std::thread::spawn(move || search_worker_loop(root, q_rx, e_tx));
-        q_tx.send(("o".into(), SearchOpts::default())).unwrap();
-        q_tx.send(("on".into(), SearchOpts::default())).unwrap();
-        q_tx.send(("one".into(), SearchOpts::default())).unwrap();
+        q_tx.send(SearchRequest::Query("o".into(), SearchOpts::default()))
+            .unwrap();
+        q_tx.send(SearchRequest::Query("on".into(), SearchOpts::default()))
+            .unwrap();
+        q_tx.send(SearchRequest::Query("one".into(), SearchOpts::default()))
+            .unwrap();
         let (q, hits, done) = collect_until_done(&e_rx, std::time::Duration::from_secs(2));
         assert_eq!(
             q.as_deref(),
@@ -1538,11 +1561,14 @@ mod tests {
         let join = std::thread::spawn(move || search_worker_loop(root, q_rx, e_tx));
         // Each gap is well under SEARCH_DEBOUNCE (200 ms), so each new
         // send resets the timer and no search should fire mid-burst.
-        q_tx.send(("o".into(), SearchOpts::default())).unwrap();
+        q_tx.send(SearchRequest::Query("o".into(), SearchOpts::default()))
+            .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(100));
-        q_tx.send(("on".into(), SearchOpts::default())).unwrap();
+        q_tx.send(SearchRequest::Query("on".into(), SearchOpts::default()))
+            .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(100));
-        q_tx.send(("one".into(), SearchOpts::default())).unwrap();
+        q_tx.send(SearchRequest::Query("one".into(), SearchOpts::default()))
+            .unwrap();
         // Now stop typing and let the debounce expire + the scan finish.
         let mut dones: Vec<String> = Vec::new();
         let until = std::time::Instant::now() + std::time::Duration::from_secs(2);
@@ -1582,12 +1608,16 @@ mod tests {
         let (e_tx, e_rx) = std::sync::mpsc::channel::<SearchEvent>();
         let root = tmp.path().to_path_buf();
         let join = std::thread::spawn(move || search_worker_loop(root, q_rx, e_tx));
-        q_tx.send(("c".into(), SearchOpts::default())).unwrap();
+        q_tx.send(SearchRequest::Query("c".into(), SearchOpts::default()))
+            .unwrap();
         // Wait past the 120ms debounce so the worker is committed.
         std::thread::sleep(std::time::Duration::from_millis(200));
         let switched_at = std::time::Instant::now();
-        q_tx.send(("zzznoneatall".into(), SearchOpts::default()))
-            .unwrap();
+        q_tx.send(SearchRequest::Query(
+            "zzznoneatall".into(),
+            SearchOpts::default(),
+        ))
+        .unwrap();
         // Done for the new query must arrive within 1.5s of submission.
         // Without cancellation, the worker would still be plowing through
         // the 4M-match "c" scan and Done would not arrive for many seconds.
@@ -1619,11 +1649,42 @@ mod tests {
         let (e_tx, e_rx) = std::sync::mpsc::channel::<SearchEvent>();
         let root = tmp.path().to_path_buf();
         let join = std::thread::spawn(move || search_worker_loop(root, q_rx, e_tx));
-        q_tx.send(("".into(), SearchOpts::default())).unwrap();
+        q_tx.send(SearchRequest::Query("".into(), SearchOpts::default()))
+            .unwrap();
         let (q, hits, done) = collect_until_done(&e_rx, std::time::Duration::from_secs(2));
         assert_eq!(q.as_deref(), Some(""));
         assert!(hits.is_empty());
         assert!(done, "empty query still emits a Done sentinel");
+        drop(q_tx);
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn search_worker_loop_targets_the_directory_set_by_the_latest_set_root() {
+        let dir_a = TempDir::new().unwrap();
+        write(&dir_a.path().join("a.txt"), "alpha only\n");
+        let dir_b = TempDir::new().unwrap();
+        write(&dir_b.path().join("b.txt"), "the needle is here\n");
+        let (q_tx, q_rx) = std::sync::mpsc::channel::<SearchRequest>();
+        let (e_tx, e_rx) = std::sync::mpsc::channel::<SearchEvent>();
+        let start_root = dir_a.path().to_path_buf();
+        let join = std::thread::spawn(move || search_worker_loop(start_root, q_rx, e_tx));
+        q_tx.send(SearchRequest::SetRoot(dir_b.path().to_path_buf()))
+            .unwrap();
+        q_tx.send(SearchRequest::Query("needle".into(), SearchOpts::default()))
+            .unwrap();
+        let (q, hits, done) = collect_until_done(&e_rx, std::time::Duration::from_secs(2));
+        assert_eq!(q.as_deref(), Some("needle"));
+        assert_eq!(
+            hits.len(),
+            1,
+            "after SetRoot, the worker must search the new directory, not the one captured at spawn"
+        );
+        assert!(
+            hits[0].path.starts_with(dir_b.path()),
+            "the hit must come from the directory the Explorer now points at"
+        );
+        assert!(done);
         drop(q_tx);
         join.join().unwrap();
     }

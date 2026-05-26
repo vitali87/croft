@@ -145,7 +145,7 @@ fn is_explicit_host_alias(alias: &str) -> bool {
     !alias.starts_with('!') && !alias.contains('*') && !alias.contains('?')
 }
 
-pub fn launch_croft(host: &str, path: Option<&str>) -> Result<()> {
+pub fn launch_croft(host: &str, path: Option<&str>) -> Result<RemoteOutcome> {
     launch_croft_with(host, path, None)
 }
 
@@ -196,11 +196,44 @@ pub fn install_only_streaming(
     Ok(adopted)
 }
 
+pub const DROP_TO_LOCAL_EXIT_CODE: i32 = 88;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteOutcome {
+    ReturnToLocal,
+    Exited,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemoteStatusClass {
+    ReturnToLocal,
+    Exited,
+    NotInstalled,
+    Failed,
+}
+
+fn classify_remote_status(code: Option<i32>) -> RemoteStatusClass {
+    match code {
+        Some(DROP_TO_LOCAL_EXIT_CODE) => RemoteStatusClass::ReturnToLocal,
+        Some(0) => RemoteStatusClass::Exited,
+        Some(127) => RemoteStatusClass::NotInstalled,
+        _ => RemoteStatusClass::Failed,
+    }
+}
+
+fn outcome_or_bail(status: ExitStatus) -> Result<RemoteOutcome> {
+    match classify_remote_status(status.code()) {
+        RemoteStatusClass::ReturnToLocal => Ok(RemoteOutcome::ReturnToLocal),
+        RemoteStatusClass::Exited => Ok(RemoteOutcome::Exited),
+        _ => anyhow::bail!("ssh exited with {status}"),
+    }
+}
+
 /// Counterpart to `install_only_streaming`: skips the install check and
 /// runs the actual remote croft. Must be called only after the terminal
 /// has been returned to cooked mode and the alt-screen surrendered, since
 /// the spawned ssh shares stdin/stdout/stderr with the user's terminal.
-pub fn launch_only(adopted: AdoptedMaster, path: Option<&str>) -> Result<()> {
+pub fn launch_only(adopted: AdoptedMaster, path: Option<&str>) -> Result<RemoteOutcome> {
     let ssh = SshControl::adopt(adopted);
     let pump = match DropPump::start(&ssh) {
         Ok(p) => Some(p),
@@ -211,20 +244,14 @@ pub fn launch_only(adopted: AdoptedMaster, path: Option<&str>) -> Result<()> {
     };
     let env = pump.as_ref().map(DropPump::remote_env).unwrap_or_default();
     let status = run_remote_croft(&ssh, path, &env)?;
-    if status.success() {
-        return Ok(());
-    }
-    if status.code() == Some(127) {
+    if classify_remote_status(status.code()) == RemoteStatusClass::NotInstalled {
         eprintln!("Croft is not installed on {}; bootstrapping...", ssh.host);
         let stamp = local_source_stamp()?;
         install_remote_croft(&ssh, &stamp)?;
         let status = run_remote_croft(&ssh, path, &env)?;
-        if status.success() {
-            return Ok(());
-        }
-        anyhow::bail!("ssh exited with {status}");
+        return outcome_or_bail(status);
     }
-    anyhow::bail!("ssh exited with {status}");
+    outcome_or_bail(status)
 }
 
 fn run_command_streaming(
@@ -441,7 +468,7 @@ pub fn launch_croft_with(
     host: &str,
     path: Option<&str>,
     adopted: Option<AdoptedMaster>,
-) -> Result<()> {
+) -> Result<RemoteOutcome> {
     println!("Connecting to {host}...");
     let ssh = match adopted {
         Some(a) => SshControl::adopt(a),
@@ -461,20 +488,14 @@ pub fn launch_croft_with(
     };
     let env = pump.as_ref().map(DropPump::remote_env).unwrap_or_default();
     let status = run_remote_croft(&ssh, path, &env)?;
-    if status.success() {
-        return Ok(());
-    }
-    if status.code() == Some(127) {
+    if classify_remote_status(status.code()) == RemoteStatusClass::NotInstalled {
         println!("Croft is not installed on {host}; bootstrapping from local source...");
         install_remote_croft(&ssh, &local_stamp)?;
         println!("Reconnecting to {host}...");
         let status = run_remote_croft(&ssh, path, &env)?;
-        if status.success() {
-            return Ok(());
-        }
-        anyhow::bail!("ssh exited with {status}");
+        return outcome_or_bail(status);
     }
-    anyhow::bail!("ssh exited with {status}");
+    outcome_or_bail(status)
 }
 
 pub struct SshControl {
@@ -1620,6 +1641,21 @@ fn ssh_control_socket_path_for_test(dir: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn drop_to_local_exit_code_maps_to_return_to_local() {
+        assert_eq!(
+            classify_remote_status(Some(DROP_TO_LOCAL_EXIT_CODE)),
+            RemoteStatusClass::ReturnToLocal
+        );
+        assert_eq!(classify_remote_status(Some(0)), RemoteStatusClass::Exited);
+        assert_eq!(
+            classify_remote_status(Some(127)),
+            RemoteStatusClass::NotInstalled
+        );
+        assert_eq!(classify_remote_status(Some(1)), RemoteStatusClass::Failed);
+        assert_eq!(classify_remote_status(None), RemoteStatusClass::Failed);
+    }
 
     #[test]
     fn parse_ssh_config_extracts_explicit_hosts() {

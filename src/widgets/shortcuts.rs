@@ -75,6 +75,10 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 description: "Jump to Remote (SSH)",
             },
             ShortcutEntry {
+                keys: "Cmd/Ctrl+Shift+L",
+                description: "Disconnect a remote session and drop back into the local croft",
+            },
+            ShortcutEntry {
                 keys: "Cmd+Shift+T",
                 description: "Focus the Terminal pane (un-hides it if collapsed)",
             },

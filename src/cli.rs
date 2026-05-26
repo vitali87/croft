@@ -93,7 +93,13 @@ impl Cli {
                 yes,
             }) => setup_iterm2(&font, &nonascii, size, yes),
             Some(CliCommand::Remote { host, path }) => {
-                crate::remote::launch_croft(&host, path.as_deref())
+                match crate::remote::launch_croft(&host, path.as_deref())? {
+                    crate::remote::RemoteOutcome::ReturnToLocal => {
+                        let cwd = std::env::current_dir().context("resolving workspace path")?;
+                        crate::app::run(cwd, None)
+                    }
+                    crate::remote::RemoteOutcome::Exited => Ok(()),
+                }
             }
             Some(CliCommand::SetupCross { yes }) => setup_cross(yes),
             None => {

@@ -99,6 +99,7 @@ croft setup-terminal --help
 | `Ctrl+Shift+g` / `Cmd+Shift+g` | Jump to Source Control (when the editor is not focused; `Cmd+Shift+G` in the editor is goto-bottom) |
 | `Ctrl+Shift+d` / `Cmd+Shift+d` | Jump to Run and Debug |
 | `Ctrl+Shift+r` / `Cmd+Shift+r` | Jump to Remote (SSH) |
+| `Ctrl+Shift+l` / `Cmd+Shift+l` | While connected to a remote, disconnect and drop back into the local croft at the directory you connected from (`Ctrl+q` still fully exits) |
 | Click activity-bar icons (left edge) | Switch between Explorer, Search, Source Control, Run-Debug, and Remote sidebar views |
 | Drag the vertical seam between sidebar and editor | Resize the sidebar |
 | Drag the horizontal seam between editor and terminal | Resize the terminal pane |
@@ -216,6 +217,7 @@ This writes the default-profile font settings plus Croft's iTerm2 keyboard setup
 | `⌘⇧S` | `\x1b[83;10u` | Jump to Source Control |
 | `⌘⇧D` | `\x1b[68;10u` | Jump to Run and Debug |
 | `⌘⇧R` | `\x1b[82;10u` | Jump to Remote (SSH) |
+| `⌘⇧L` | `\x1b[76;10u` | Disconnect a remote session and drop back into the local croft |
 | `⌘⇧N` | `\x1b[78;10u` | Explorer "New folder" prompt (when the tree is focused) |
 | `⌃⇧J` | `\x1b[74;6u` | Maximize the terminal pane (collapses the editor / welcome; press again to restore the previous editor↔terminal split) |
 | `⌘V` | `\x1b[118;9u` in global and profile key maps | Read the system clipboard and paste into the focused editor, or into Search when Search is active |
