@@ -22,123 +22,354 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
     ShortcutGroup {
         title: "Global",
         entries: &[
-            ShortcutEntry { keys: "Ctrl+S", description: "Save the open file (also stages selected source-control entry)" },
-            ShortcutEntry { keys: "Ctrl+Q", description: "Quit" },
-            ShortcutEntry { keys: "F6", description: "Cycle focus across panes" },
-            ShortcutEntry { keys: "Ctrl+B", description: "Toggle the sidebar" },
-            ShortcutEntry { keys: "Ctrl+J", description: "Toggle the terminal pane" },
-            ShortcutEntry { keys: "Ctrl+Shift+J", description: "Maximize the terminal pane (collapses editor; press again to restore)" },
-            ShortcutEntry { keys: "Cmd/Ctrl+P", description: "Quick Open: fuzzy-search workspace files by name" },
-            ShortcutEntry { keys: "Cmd/Ctrl+Shift+E", description: "Jump to the Explorer sidebar" },
-            ShortcutEntry { keys: "Cmd/Ctrl+Shift+F", description: "Jump to the Search sidebar" },
-            ShortcutEntry { keys: "Cmd/Ctrl+Shift+S", description: "Jump to Source Control (from any pane)" },
-            ShortcutEntry { keys: "Cmd/Ctrl+Shift+G", description: "Jump to Source Control (when editor not focused)" },
-            ShortcutEntry { keys: "Cmd/Ctrl+Shift+D", description: "Jump to Run and Debug" },
-            ShortcutEntry { keys: "Cmd/Ctrl+Shift+R", description: "Jump to Remote (SSH)" },
-            ShortcutEntry { keys: "Cmd+Shift+T", description: "Focus the Terminal pane (un-hides it if collapsed)" },
-            ShortcutEntry { keys: "F1", description: "Open this shortcuts panel" },
-            ShortcutEntry { keys: "Esc", description: "Close this panel (or clear selection / dismiss menus)" },
+            ShortcutEntry {
+                keys: "Ctrl+S",
+                description: "Save the open file (also stages selected source-control entry)",
+            },
+            ShortcutEntry {
+                keys: "Ctrl+Q",
+                description: "Quit",
+            },
+            ShortcutEntry {
+                keys: "F6",
+                description: "Cycle focus across panes",
+            },
+            ShortcutEntry {
+                keys: "Ctrl+B",
+                description: "Toggle the sidebar",
+            },
+            ShortcutEntry {
+                keys: "Ctrl+J",
+                description: "Toggle the terminal pane",
+            },
+            ShortcutEntry {
+                keys: "Ctrl+Shift+J",
+                description: "Maximize the terminal pane (collapses editor; press again to restore)",
+            },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+P",
+                description: "Quick Open: fuzzy-search workspace files by name",
+            },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+Shift+E",
+                description: "Jump to the Explorer sidebar",
+            },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+Shift+F",
+                description: "Jump to the Search sidebar",
+            },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+Shift+S",
+                description: "Jump to Source Control (from any pane)",
+            },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+Shift+G",
+                description: "Jump to Source Control (when editor not focused)",
+            },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+Shift+D",
+                description: "Jump to Run and Debug",
+            },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+Shift+R",
+                description: "Jump to Remote (SSH)",
+            },
+            ShortcutEntry {
+                keys: "Cmd+Shift+T",
+                description: "Focus the Terminal pane (un-hides it if collapsed)",
+            },
+            ShortcutEntry {
+                keys: "F1",
+                description: "Open this shortcuts panel",
+            },
+            ShortcutEntry {
+                keys: "Esc",
+                description: "Close this panel (or clear selection / dismiss menus)",
+            },
         ],
     },
     ShortcutGroup {
         title: "Explorer",
         entries: &[
-            ShortcutEntry { keys: "Up / Down", description: "Move selection" },
-            ShortcutEntry { keys: "Enter / Right", description: "Open file or expand folder" },
-            ShortcutEntry { keys: "Left", description: "Collapse folder" },
-            ShortcutEntry { keys: "Shift+Up/Down/PgUp/PgDn/Home/End", description: "Extend multi-selection" },
-            ShortcutEntry { keys: "Alt-click / Ctrl-click", description: "Toggle a row in or out of the multi-selection" },
-            ShortcutEntry { keys: "Cmd/Ctrl+A", description: "Select every visible row" },
-            ShortcutEntry { keys: "Cmd/Ctrl+C / X / V", description: "Copy / cut / paste paths in the explorer clipboard" },
-            ShortcutEntry { keys: "Cmd/Ctrl+F", description: "New file in selected folder" },
-            ShortcutEntry { keys: "Cmd/Ctrl+Shift+N", description: "New folder in selected folder" },
-            ShortcutEntry { keys: "Cmd/Ctrl+R or F2", description: "Rename" },
-            ShortcutEntry { keys: "Cmd/Ctrl+/", description: "Re-root the workspace at the selected folder (also cd's the active terminal)" },
-            ShortcutEntry { keys: "Cmd/Ctrl+Shift+/", description: "Re-root at parent of the selected node (also cd's the active terminal)" },
-            ShortcutEntry { keys: "Cmd/Ctrl+D", description: "Compare-anchor / diff toggle on file" },
-            ShortcutEntry { keys: "Delete / Backspace", description: "Move every selected path to OS Trash" },
-            ShortcutEntry { keys: "Drag onto folder", description: "Move (Alt-drag copies)" },
+            ShortcutEntry {
+                keys: "Up / Down",
+                description: "Move selection",
+            },
+            ShortcutEntry {
+                keys: "Enter / Right",
+                description: "Open file or expand folder",
+            },
+            ShortcutEntry {
+                keys: "Left",
+                description: "Collapse folder",
+            },
+            ShortcutEntry {
+                keys: "Shift+Up/Down/PgUp/PgDn/Home/End",
+                description: "Extend multi-selection",
+            },
+            ShortcutEntry {
+                keys: "Alt-click / Ctrl-click",
+                description: "Toggle a row in or out of the multi-selection",
+            },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+A",
+                description: "Select every visible row",
+            },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+C / X / V",
+                description: "Copy / cut / paste paths in the explorer clipboard",
+            },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+F",
+                description: "New file in selected folder",
+            },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+Shift+N",
+                description: "New folder in selected folder",
+            },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+R or F2",
+                description: "Rename",
+            },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+/",
+                description: "Re-root the workspace at the selected folder (also cd's the active terminal)",
+            },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+Shift+/",
+                description: "Re-root at parent of the selected node (also cd's the active terminal)",
+            },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+D",
+                description: "Compare-anchor / diff toggle on file",
+            },
+            ShortcutEntry {
+                keys: "Delete / Backspace",
+                description: "Move every selected path to OS Trash",
+            },
+            ShortcutEntry {
+                keys: "Drag onto folder",
+                description: "Move (Alt-drag copies)",
+            },
         ],
     },
     ShortcutGroup {
         title: "Editor: text",
         entries: &[
-            ShortcutEntry { keys: "Cmd/Ctrl+F", description: "Find in current file (Enter next, Shift+Enter prev, Esc close)" },
-            ShortcutEntry { keys: "Arrows / Home / End", description: "Navigate; clears any active selection" },
-            ShortcutEntry { keys: "Shift+arrows / Home / End / PgUp / PgDn", description: "Extend the selection" },
-            ShortcutEntry { keys: "PgUp / PgDn", description: "Scroll exactly one viewport" },
-            ShortcutEntry { keys: "Alt+Left / Right", description: "Word-step left / right" },
-            ShortcutEntry { keys: "Shift+Alt+Up / Down", description: "Duplicate the current line or selection" },
-            ShortcutEntry { keys: "Cmd/Ctrl+C", description: "Copy the selection (OSC 52 to system clipboard)" },
-            ShortcutEntry { keys: "Cmd/Ctrl+X", description: "Cut the selection" },
-            ShortcutEntry { keys: "Cmd/Ctrl+V", description: "Paste at the cursor" },
-            ShortcutEntry { keys: "Cmd/Ctrl+Z", description: "Undo" },
-            ShortcutEntry { keys: "Cmd+A", description: "Select the entire buffer" },
-            ShortcutEntry { keys: "Cmd/Ctrl+W", description: "Close the active tab" },
-            ShortcutEntry { keys: "Cmd/Ctrl+1..9", description: "Jump to that tab (when no vim chord is pending)" },
-            ShortcutEntry { keys: "Ctrl+Space", description: "Trigger LSP completion" },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+F",
+                description: "Find in current file (Enter next, Shift+Enter prev, Esc close)",
+            },
+            ShortcutEntry {
+                keys: "Arrows / Home / End",
+                description: "Navigate; clears any active selection",
+            },
+            ShortcutEntry {
+                keys: "Shift+arrows / Home / End / PgUp / PgDn",
+                description: "Extend the selection",
+            },
+            ShortcutEntry {
+                keys: "PgUp / PgDn",
+                description: "Scroll exactly one viewport",
+            },
+            ShortcutEntry {
+                keys: "Alt+Left / Right",
+                description: "Word-step left / right",
+            },
+            ShortcutEntry {
+                keys: "Shift+Alt+Up / Down",
+                description: "Duplicate the current line or selection",
+            },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+C",
+                description: "Copy the selection (OSC 52 to system clipboard)",
+            },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+X",
+                description: "Cut the selection",
+            },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+V",
+                description: "Paste at the cursor",
+            },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+Z",
+                description: "Undo",
+            },
+            ShortcutEntry {
+                keys: "Cmd+A",
+                description: "Select the entire buffer",
+            },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+W",
+                description: "Close the active tab",
+            },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+1..9",
+                description: "Jump to that tab (when no vim chord is pending)",
+            },
+            ShortcutEntry {
+                keys: "Ctrl+Space",
+                description: "Trigger LSP completion",
+            },
         ],
     },
     ShortcutGroup {
         title: "Editor: line motion",
         entries: &[
-            ShortcutEntry { keys: "Ctrl+A", description: "Move to start of current line (readline-style)" },
-            ShortcutEntry { keys: "Ctrl+E", description: "Move to end of current line" },
-            ShortcutEntry { keys: "Ctrl+K", description: "Kill from cursor to end of line" },
-            ShortcutEntry { keys: "Ctrl+U", description: "Kill from cursor to start of line" },
+            ShortcutEntry {
+                keys: "Ctrl+A",
+                description: "Move to start of current line (readline-style)",
+            },
+            ShortcutEntry {
+                keys: "Ctrl+E",
+                description: "Move to end of current line",
+            },
+            ShortcutEntry {
+                keys: "Ctrl+K",
+                description: "Kill from cursor to end of line",
+            },
+            ShortcutEntry {
+                keys: "Ctrl+U",
+                description: "Kill from cursor to start of line",
+            },
         ],
     },
     ShortcutGroup {
         title: "Editor: vim chords",
         entries: &[
-            ShortcutEntry { keys: "Cmd+g g", description: "Go to the top of the file" },
-            ShortcutEntry { keys: "Cmd+g N g", description: "Go to line N (digits between the chord keys)" },
-            ShortcutEntry { keys: "Cmd+N Cmd+g g", description: "Same as above with the count first" },
-            ShortcutEntry { keys: "Cmd+Shift+G", description: "Go to the bottom (or line N with a leading count)" },
-            ShortcutEntry { keys: "Cmd+d d", description: "Delete the current line (yanks to system clipboard)" },
-            ShortcutEntry { keys: "Cmd+N Cmd+d d", description: "Delete N lines" },
-            ShortcutEntry { keys: "Cmd+y y", description: "Yank (copy) the current line" },
-            ShortcutEntry { keys: "Cmd+N Cmd+y y", description: "Yank N lines" },
-            ShortcutEntry { keys: "Cmd+o", description: "Open a new line below, inheriting indent" },
-            ShortcutEntry { keys: "Cmd+Shift+O", description: "Open a new line above, inheriting indent" },
+            ShortcutEntry {
+                keys: "Cmd+g g",
+                description: "Go to the top of the file",
+            },
+            ShortcutEntry {
+                keys: "Cmd+g N g",
+                description: "Go to line N (digits between the chord keys)",
+            },
+            ShortcutEntry {
+                keys: "Cmd+N Cmd+g g",
+                description: "Same as above with the count first",
+            },
+            ShortcutEntry {
+                keys: "Cmd+Shift+G",
+                description: "Go to the bottom (or line N with a leading count)",
+            },
+            ShortcutEntry {
+                keys: "Cmd+d d",
+                description: "Delete the current line (yanks to system clipboard)",
+            },
+            ShortcutEntry {
+                keys: "Cmd+N Cmd+d d",
+                description: "Delete N lines",
+            },
+            ShortcutEntry {
+                keys: "Cmd+y y",
+                description: "Yank (copy) the current line",
+            },
+            ShortcutEntry {
+                keys: "Cmd+N Cmd+y y",
+                description: "Yank N lines",
+            },
+            ShortcutEntry {
+                keys: "Cmd+o",
+                description: "Open a new line below, inheriting indent",
+            },
+            ShortcutEntry {
+                keys: "Cmd+Shift+O",
+                description: "Open a new line above, inheriting indent",
+            },
         ],
     },
     ShortcutGroup {
         title: "Editor: PDF preview",
         entries: &[
-            ShortcutEntry { keys: "Right / PgDn / Space", description: "Next page" },
-            ShortcutEntry { keys: "Left / PgUp", description: "Previous page" },
-            ShortcutEntry { keys: "Home", description: "First page" },
-            ShortcutEntry { keys: "End", description: "Last page" },
+            ShortcutEntry {
+                keys: "Right / PgDn / Space",
+                description: "Next page",
+            },
+            ShortcutEntry {
+                keys: "Left / PgUp",
+                description: "Previous page",
+            },
+            ShortcutEntry {
+                keys: "Home",
+                description: "First page",
+            },
+            ShortcutEntry {
+                keys: "End",
+                description: "Last page",
+            },
         ],
     },
     ShortcutGroup {
         title: "Editor: spreadsheet preview",
         entries: &[
-            ShortcutEntry { keys: "Arrows", description: "Pan one row / column" },
-            ShortcutEntry { keys: "PgUp / PgDn", description: "Pan a full viewport vertically" },
-            ShortcutEntry { keys: "Home", description: "Jump to row 1, column 1" },
-            ShortcutEntry { keys: "End", description: "Jump to the last visible page" },
-            ShortcutEntry { keys: "Tab / Shift+Tab", description: "Switch worksheet (multi-sheet workbooks)" },
+            ShortcutEntry {
+                keys: "Arrows",
+                description: "Pan one row / column",
+            },
+            ShortcutEntry {
+                keys: "PgUp / PgDn",
+                description: "Pan a full viewport vertically",
+            },
+            ShortcutEntry {
+                keys: "Home",
+                description: "Jump to row 1, column 1",
+            },
+            ShortcutEntry {
+                keys: "End",
+                description: "Jump to the last visible page",
+            },
+            ShortcutEntry {
+                keys: "Tab / Shift+Tab",
+                description: "Switch worksheet (multi-sheet workbooks)",
+            },
         ],
     },
     ShortcutGroup {
         title: "Terminal",
         entries: &[
-            ShortcutEntry { keys: "Any key", description: "Forwarded to the shell PTY" },
-            ShortcutEntry { keys: "Ctrl+Shift+C / Cmd+C", description: "Copy current selection" },
-            ShortcutEntry { keys: "Ctrl+Shift+T", description: "Open another terminal next to the active one" },
-            ShortcutEntry { keys: "Ctrl+Shift+W", description: "Close the active terminal" },
-            ShortcutEntry { keys: "Ctrl+Shift+]", description: "Cycle to the next terminal" },
-            ShortcutEntry { keys: "Cmd+V / Ctrl+V", description: "Paste local clipboard into the shell" },
+            ShortcutEntry {
+                keys: "Any key",
+                description: "Forwarded to the shell PTY",
+            },
+            ShortcutEntry {
+                keys: "Ctrl+Shift+C / Cmd+C",
+                description: "Copy current selection",
+            },
+            ShortcutEntry {
+                keys: "Ctrl+Shift+T",
+                description: "Open another terminal next to the active one",
+            },
+            ShortcutEntry {
+                keys: "Ctrl+Shift+W",
+                description: "Close the active terminal",
+            },
+            ShortcutEntry {
+                keys: "Ctrl+Shift+]",
+                description: "Cycle to the next terminal",
+            },
+            ShortcutEntry {
+                keys: "Cmd+V / Ctrl+V",
+                description: "Paste local clipboard into the shell",
+            },
         ],
     },
     ShortcutGroup {
         title: "Search sidebar",
         entries: &[
-            ShortcutEntry { keys: "Type", description: "Live gitignore-aware workspace search" },
-            ShortcutEntry { keys: "Click Aa / ab / .*", description: "Case-sensitive / whole-word / regex toggles" },
-            ShortcutEntry { keys: "Up / Down + Enter", description: "Open the file at the matched line" },
+            ShortcutEntry {
+                keys: "Type",
+                description: "Live gitignore-aware workspace search",
+            },
+            ShortcutEntry {
+                keys: "Click Aa / ab / .*",
+                description: "Case-sensitive / whole-word / regex toggles",
+            },
+            ShortcutEntry {
+                keys: "Up / Down + Enter",
+                description: "Open the file at the matched line",
+            },
         ],
     },
 ];
@@ -206,18 +437,19 @@ impl ShortcutsModal {
     }
 }
 
-pub fn render_shortcuts_modal(
-    modal: &mut ShortcutsModal,
-    area: Rect,
-    buf: &mut Buffer,
-) {
+pub fn render_shortcuts_modal(modal: &mut ShortcutsModal, area: Rect, buf: &mut Buffer) {
     let width = area.width.saturating_mul(8) / 10;
     let width = width.clamp(40, 110.min(area.width));
     let height = area.height.saturating_mul(8) / 10;
     let height = height.clamp(10, area.height);
     let x = area.x + (area.width.saturating_sub(width)) / 2;
     let y = area.y + (area.height.saturating_sub(height)) / 2;
-    let rect = Rect { x, y, width, height };
+    let rect = Rect {
+        x,
+        y,
+        width,
+        height,
+    };
     modal.last_rect = rect;
 
     Widget::render(Clear, rect, buf);
@@ -242,9 +474,7 @@ pub fn render_shortcuts_modal(
     let lines = modal.lines();
     modal.last_content_height = lines.len() as u16;
     modal.last_inner_height = inner.height;
-    let max_scroll = modal
-        .last_content_height
-        .saturating_sub(inner.height);
+    let max_scroll = modal.last_content_height.saturating_sub(inner.height);
     if modal.scroll > max_scroll {
         modal.scroll = max_scroll;
     }

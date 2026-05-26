@@ -1,24 +1,24 @@
 use anyhow::{Context, Result};
 use crossterm::{
     event::{
-        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste,
-        EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
-        KeyboardEnhancementFlags, MouseButton, MouseEvent, MouseEventKind,
-        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
+        MouseButton, MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags,
+        PushKeyboardEnhancementFlags,
     },
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{
+    Terminal,
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::Paragraph,
-    Terminal,
 };
 use std::collections::BTreeSet;
-use std::io::{stdout, Stdout};
+use std::io::{Stdout, stdout};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -192,10 +192,7 @@ fn git_status_spans<'a>(status: &'a crate::git::GitStatus) -> Vec<Span<'a>> {
     // Codicon `cod-source-control` (U+EA68): the Y-fork that matches the
     // activity-bar Source Control icon, so the status-bar branch indicator
     // and the SCM panel share the same visual mark.
-    spans.push(Span::styled(
-        "\u{ea68} ",
-        Style::default().fg(pill_color),
-    ));
+    spans.push(Span::styled("\u{ea68} ", Style::default().fg(pill_color)));
     let label: &str = match (&status.branch, &status.detached_hash) {
         (Some(b), _) => b.as_str(),
         (None, Some(h)) => h.as_str(),
@@ -243,7 +240,9 @@ enum MenuAction {
     Create(CreateKind),
     /// Move every path in `paths` to the OS trash (recoverable). One entry
     /// for a single right-click, more when a multi-selection is active.
-    Delete { paths: Vec<PathBuf> },
+    Delete {
+        paths: Vec<PathBuf>,
+    },
     /// Open the rename prompt pre-filled with the entry's current name.
     Rename(PathBuf),
     /// Cut the listed paths to the explorer clipboard for later Paste.
@@ -257,7 +256,10 @@ enum MenuAction {
     SelectForCompare(PathBuf),
     /// Open a side-by-side diff between the previously-selected anchor and
     /// the file the user just right-clicked.
-    CompareWithSelected { anchor: PathBuf, other: PathBuf },
+    CompareWithSelected {
+        anchor: PathBuf,
+        other: PathBuf,
+    },
     /// Re-root the workspace at the right-clicked folder. Folder-only -
     /// files can't be roots. Used to dive into a nested git repo without
     /// relaunching croft.
@@ -353,7 +355,10 @@ fn build_tab_context_menu_items(idx: usize, tab_count: usize) -> Vec<(String, Me
     let mut items: Vec<(String, MenuAction)> = Vec::new();
     items.push((String::from("Close"), MenuAction::CloseTab(idx)));
     if tab_count > 1 {
-        items.push((String::from("Close Others"), MenuAction::CloseOtherTabs(idx)));
+        items.push((
+            String::from("Close Others"),
+            MenuAction::CloseOtherTabs(idx),
+        ));
     }
     if idx + 1 < tab_count {
         items.push((
@@ -403,10 +408,19 @@ fn build_tree_context_menu_items(
         } else {
             vec![p.clone()]
         };
-        items.push((String::from("Cut"), MenuAction::Cut(paths_for_action.clone())));
-        items.push((String::from("Copy"), MenuAction::Copy(paths_for_action.clone())));
+        items.push((
+            String::from("Cut"),
+            MenuAction::Cut(paths_for_action.clone()),
+        ));
+        items.push((
+            String::from("Copy"),
+            MenuAction::Copy(paths_for_action.clone()),
+        ));
         if clipboard.is_some() {
-            items.push((String::from("Paste"), MenuAction::Paste(target_dir.to_path_buf())));
+            items.push((
+                String::from("Paste"),
+                MenuAction::Paste(target_dir.to_path_buf()),
+            ));
         }
         if paths_for_action.len() == 1 {
             items.push((String::from("Rename"), MenuAction::Rename(p.clone())));
@@ -475,7 +489,10 @@ fn build_tree_context_menu_items(
             MenuAction::Create(CreateKind::Folder),
         ));
         if clipboard.is_some() {
-            items.push((String::from("Paste"), MenuAction::Paste(target_dir.to_path_buf())));
+            items.push((
+                String::from("Paste"),
+                MenuAction::Paste(target_dir.to_path_buf()),
+            ));
         }
     }
     items
@@ -1040,7 +1057,11 @@ fn wrap_cells_variable_width(text: &str, first_width: u16, rest_width: u16) -> V
     for word in trimmed.split_whitespace() {
         let mut remaining = word.to_string();
         while !remaining.is_empty() {
-            let width = if lines.is_empty() { first_width } else { rest_width };
+            let width = if lines.is_empty() {
+                first_width
+            } else {
+                rest_width
+            };
             let sep = usize::from(!current.is_empty());
             let remaining_len = remaining.chars().count();
             let current_len = current.chars().count();
@@ -1070,10 +1091,7 @@ fn wrap_cells_variable_width(text: &str, first_width: u16, rest_width: u16) -> V
     }
 }
 
-fn welcome_commit_widths(
-    commit: &crate::git::CommitInfo,
-    block_w: u16,
-) -> (u16, u16) {
+fn welcome_commit_widths(commit: &crate::git::CommitInfo, block_w: u16) -> (u16, u16) {
     let hash_w = commit.hash.chars().count() as u16;
     let when_w = commit.when.chars().count() as u16;
     let prefix_w = hash_w.saturating_add(1);
@@ -1085,10 +1103,7 @@ fn welcome_commit_widths(
     (first, rest)
 }
 
-fn wrapped_welcome_commit_subject(
-    commit: &crate::git::CommitInfo,
-    block_w: u16,
-) -> Vec<String> {
+fn wrapped_welcome_commit_subject(commit: &crate::git::CommitInfo, block_w: u16) -> Vec<String> {
     let (first, rest) = welcome_commit_widths(commit, block_w);
     wrap_cells_variable_width(&commit.subject, first, rest)
 }
@@ -1157,7 +1172,11 @@ fn paint_gradient_box(buf: &mut ratatui::buffer::Buffer, rect: Rect) {
     let max_x = rect.width - 1;
     let max_y = rect.height - 1;
     for x in 0..rect.width {
-        let u = if max_x > 0 { x as f32 / max_x as f32 } else { 0.0 };
+        let u = if max_x > 0 {
+            x as f32 / max_x as f32
+        } else {
+            0.0
+        };
         let top = lerp_rgb(GRAD_TL, GRAD_TR, u);
         let bot = lerp_rgb(GRAD_BL, GRAD_BR, u);
         let top_ch = if x == 0 {
@@ -1188,7 +1207,11 @@ fn paint_gradient_box(buf: &mut ratatui::buffer::Buffer, rect: Rect) {
         );
     }
     for y in 1..max_y {
-        let v = if max_y > 0 { y as f32 / max_y as f32 } else { 0.0 };
+        let v = if max_y > 0 {
+            y as f32 / max_y as f32
+        } else {
+            0.0
+        };
         let left = lerp_rgb(GRAD_TL, GRAD_BL, v);
         let right = lerp_rgb(GRAD_TR, GRAD_BR, v);
         buf.set_string(
@@ -1231,8 +1254,7 @@ fn open_url(url: &str) -> Result<()> {
         c.arg(url);
         c
     };
-    cmd.spawn()
-        .with_context(|| format!("opening {url}"))?;
+    cmd.spawn().with_context(|| format!("opening {url}"))?;
     Ok(())
 }
 
@@ -1268,8 +1290,7 @@ impl App {
         // `refresh_git_status_debounced`). Removes the 15-50 ms
         // input-to-paint stall that used to fire on every Source
         // Control click.
-        let (git_request_tx, git_request_rx) =
-            std::sync::mpsc::channel::<crate::git::GitRequest>();
+        let (git_request_tx, git_request_rx) = std::sync::mpsc::channel::<crate::git::GitRequest>();
         let (git_response_tx, git_response_rx) =
             std::sync::mpsc::channel::<crate::git::GitResponse>();
         let git_root = root.clone();
@@ -1283,8 +1304,7 @@ impl App {
         // `sysmon_rx`. The render path never touches sysinfo because
         // its CPU refresh needs MINIMUM_CPU_UPDATE_INTERVAL between
         // reads to produce accurate percentages.
-        let (sysmon_tx, sysmon_rx) =
-            std::sync::mpsc::channel::<crate::sysmon::SystemSample>();
+        let (sysmon_tx, sysmon_rx) = std::sync::mpsc::channel::<crate::sysmon::SystemSample>();
         std::thread::spawn(move || {
             crate::sysmon::system_monitor_loop(sysmon_tx);
         });
@@ -1497,12 +1517,7 @@ impl App {
         let is_tmux = crate::iterm2_inline::detect_tmux();
         let w_cells = ACTIVITY_BAR_WIDTH;
         let h_cells = ACTIVITY_ICON_HEIGHT;
-        let icon_bg = image::Rgba([
-            EDITOR_BG_RGB.0,
-            EDITOR_BG_RGB.1,
-            EDITOR_BG_RGB.2,
-            0xff,
-        ]);
+        let icon_bg = image::Rgba([EDITOR_BG_RGB.0, EDITOR_BG_RGB.1, EDITOR_BG_RGB.2, 0xff]);
         let encode = |src: &[u8], is_active: bool| -> Option<String> {
             let baked =
                 crate::iterm2_inline::compose_icon(src, canvas_w, canvas_h, is_active, icon_bg)
@@ -1511,8 +1526,7 @@ impl App {
             // Since the PNG was composed at exactly that pixel size,
             // there's no actual scaling and the codicon's square area
             // remains a true square on screen.
-            let raw =
-                crate::iterm2_inline::build_inline_image_osc(&baked, w_cells, h_cells, false);
+            let raw = crate::iterm2_inline::build_inline_image_osc(&baked, w_cells, h_cells, false);
             Some(if is_tmux {
                 crate::iterm2_inline::tmux_passthrough_wrap(&raw)
             } else {
@@ -1523,10 +1537,8 @@ impl App {
         let explorer_inactive = encode(crate::iterm2_inline::EXPLORER_SRC_PNG, false);
         let search_active = encode(crate::iterm2_inline::SEARCH_SRC_PNG, true);
         let search_inactive = encode(crate::iterm2_inline::SEARCH_SRC_PNG, false);
-        let source_control_active =
-            encode(crate::iterm2_inline::NO_REPO_HERO_PNG, true);
-        let source_control_inactive =
-            encode(crate::iterm2_inline::NO_REPO_HERO_PNG, false);
+        let source_control_active = encode(crate::iterm2_inline::NO_REPO_HERO_PNG, true);
+        let source_control_inactive = encode(crate::iterm2_inline::NO_REPO_HERO_PNG, false);
         let remote_active = encode(crate::iterm2_inline::REMOTE_SRC_PNG, true);
         let remote_inactive = encode(crate::iterm2_inline::REMOTE_SRC_PNG, false);
         let run_debug_active = encode(crate::iterm2_inline::RUN_DEBUG_SRC_PNG, true);
@@ -1729,12 +1741,7 @@ impl App {
         if self.no_repo_hero_layout != Some(desired) || self.no_repo_hero_image.is_none() {
             let canvas_w = (hero.width as u32) * cw;
             let canvas_h = (hero.height as u32) * ch;
-            let bg = image::Rgba([
-                EDITOR_BG_RGB.0,
-                EDITOR_BG_RGB.1,
-                EDITOR_BG_RGB.2,
-                0xff,
-            ]);
+            let bg = image::Rgba([EDITOR_BG_RGB.0, EDITOR_BG_RGB.1, EDITOR_BG_RGB.2, 0xff]);
             if let Ok(baked) = crate::iterm2_inline::fit_image(
                 crate::iterm2_inline::NO_REPO_HERO_PNG,
                 canvas_w,
@@ -2460,8 +2467,7 @@ impl App {
                 match err {
                     crate::git::RecentCommitsError::None => {}
                     crate::git::RecentCommitsError::Network => {
-                        self.status =
-                            String::from("Recent commits unavailable: git fetch failed");
+                        self.status = String::from("Recent commits unavailable: git fetch failed");
                     }
                     crate::git::RecentCommitsError::NoEndpoint => {
                         self.status =
@@ -2572,9 +2578,8 @@ impl App {
             ));
             if popup.visible_is_empty() {
                 self.completion_popup = None;
-                self.status = format!(
-                    "No completions match '{prefix}' ({server_count} from server)"
-                );
+                self.status =
+                    format!("No completions match '{prefix}' ({server_count} from server)");
             } else {
                 self.completion_popup = Some(popup);
             }
@@ -2584,9 +2589,7 @@ impl App {
     }
 
     pub fn trigger_completion(&mut self) {
-        if self.editor.diff.is_some()
-            || self.editor.sheet.is_some()
-            || self.editor.image.is_some()
+        if self.editor.diff.is_some() || self.editor.sheet.is_some() || self.editor.image.is_some()
         {
             return;
         }
@@ -2699,8 +2702,7 @@ impl App {
             let polled = self.poll_filesystem_changes();
             return init_changed || polled;
         };
-        let mut affected: std::collections::BTreeSet<PathBuf> =
-            std::collections::BTreeSet::new();
+        let mut affected: std::collections::BTreeSet<PathBuf> = std::collections::BTreeSet::new();
         let mut touched_open_file = false;
         let mut got_any = false;
         while let Ok(result) = rx.try_recv() {
@@ -2724,10 +2726,9 @@ impl App {
                     if mutates_content && self.editor.matches_open_path(path) {
                         touched_open_file = true;
                     }
-                    if let Some(dir) = crate::widgets::file_tree::affected_dir_for_event(
-                        path,
-                        &self.tree.root,
-                    ) {
+                    if let Some(dir) =
+                        crate::widgets::file_tree::affected_dir_for_event(path, &self.tree.root)
+                    {
                         affected.insert(dir);
                     } else if path == &self.tree.root
                         || path.canonicalize().ok().as_deref()
@@ -2864,8 +2865,7 @@ impl App {
         // The gradient box's content area is 2 cells narrower (the box
         // border itself).
         let inner_w = block_w.saturating_sub(2);
-        let has_recent_panel =
-            self.recent_repo_remote.is_some() || !self.recent_commits.is_empty();
+        let has_recent_panel = self.recent_repo_remote.is_some() || !self.recent_commits.is_empty();
         let recents_inner_h = welcome_recents_height(
             self.recent_repo_remote.as_deref(),
             &self.recent_commits,
@@ -2895,7 +2895,11 @@ impl App {
             .saturating_sub(used_below_box);
         // Box content needs at least the 4-cell border+inset envelope to be
         // worth drawing.
-        let desired_box_h = if has_recent_panel { recents_inner_h.saturating_add(4) } else { 0 };
+        let desired_box_h = if has_recent_panel {
+            recents_inner_h.saturating_add(4)
+        } else {
+            0
+        };
         let box_h = desired_box_h.min(max_box_h);
 
         let total_h = used_above_box + box_h + used_below_box;
@@ -2926,12 +2930,7 @@ impl App {
             if let Some((cw, ch)) = self.cell_pixel {
                 let canvas_w = (logo_w_cells as u32) * cw;
                 let canvas_h = (logo_h_cells as u32) * ch;
-                let bg = image::Rgba([
-                    EDITOR_BG_RGB.0,
-                    EDITOR_BG_RGB.1,
-                    EDITOR_BG_RGB.2,
-                    0xff,
-                ]);
+                let bg = image::Rgba([EDITOR_BG_RGB.0, EDITOR_BG_RGB.1, EDITOR_BG_RGB.2, 0xff]);
                 if let Ok(baked) = crate::iterm2_inline::fit_image(
                     crate::iterm2_inline::WELCOME_LOGO_PNG,
                     canvas_w,
@@ -2978,9 +2977,7 @@ impl App {
         let version_w = version_label.chars().count() as u16;
         let badge_x = logo_x + logo_w_cells + 1;
         let badge_y = logo_y + (logo_h_cells * 5) / 6;
-        if badge_x + version_w + 2 <= area.x + area.width
-            && badge_y + 2 < area_max_y
-        {
+        if badge_x + version_w + 2 <= area.x + area.width && badge_y + 2 < area_max_y {
             let badge_style = Style::default()
                 .fg(rgb_color(GRAD_TL))
                 .add_modifier(Modifier::BOLD);
@@ -2988,12 +2985,9 @@ impl App {
                 .buffer_mut()
                 .set_string(badge_x, badge_y, "\u{256d}", badge_style);
             for i in 0..version_w {
-                frame.buffer_mut().set_string(
-                    badge_x + 1 + i,
-                    badge_y,
-                    "\u{2500}",
-                    badge_style,
-                );
+                frame
+                    .buffer_mut()
+                    .set_string(badge_x + 1 + i, badge_y, "\u{2500}", badge_style);
             }
             frame.buffer_mut().set_string(
                 badge_x + 1 + version_w,
@@ -3051,11 +3045,7 @@ impl App {
         }
 
         let box_y = tagline_y + tagline_h + 1;
-        if has_recent_panel
-            && box_h >= 4
-            && block_w >= 4
-            && box_y + box_h <= area_max_y
-        {
+        if has_recent_panel && box_h >= 4 && block_w >= 4 && box_y + box_h <= area_max_y {
             let box_rect = Rect {
                 x: block_left,
                 y: box_y,
@@ -3113,8 +3103,7 @@ impl App {
                     };
                 let badge_w = badge.chars().count() as u16;
                 let remote_x = inner_x + badge_w + 2;
-                let room = (inner_x + inner_w_actual)
-                    .saturating_sub(remote_x) as usize;
+                let room = (inner_x + inner_w_actual).saturating_sub(remote_x) as usize;
                 let clipped: String = remote.chars().take(room).collect();
                 frame.buffer_mut().set_string(remote_x, row_y, clipped, dim);
                 let link_w = badge_w
@@ -3122,7 +3111,12 @@ impl App {
                     .saturating_add(room.min(remote.chars().count()) as u16)
                     .min(inner_w_actual);
                 self.welcome_links.push(WelcomeLink {
-                    rect: Rect { x: inner_x, y: row_y, width: link_w, height: 1 },
+                    rect: Rect {
+                        x: inner_x,
+                        y: row_y,
+                        width: link_w,
+                        height: 1,
+                    },
                     url: remote.clone(),
                     label: format!("Open {provider} repository"),
                 });
@@ -3133,7 +3127,9 @@ impl App {
                 if y >= box_rect.y + box_rect.height - 1 {
                     break;
                 }
-                frame.buffer_mut().set_string(inner_x, y, &c.hash, link_style);
+                frame
+                    .buffer_mut()
+                    .set_string(inner_x, y, &c.hash, link_style);
                 let subject_x = inner_x + c.hash.chars().count() as u16 + 2;
                 let when_w = c.when.chars().count() as u16;
                 let row_end = inner_x + inner_w_actual;
@@ -3159,7 +3155,12 @@ impl App {
                     if let Some(url) = crate::git::commit_url_for_remote(remote, &c.full_hash) {
                         let height = subject_lines.len().max(1) as u16;
                         self.welcome_links.push(WelcomeLink {
-                            rect: Rect { x: inner_x, y, width: inner_w_actual, height },
+                            rect: Rect {
+                                x: inner_x,
+                                y,
+                                width: inner_w_actual,
+                                height,
+                            },
                             url,
                             label: format!("Open commit {}", c.hash),
                         });
@@ -3168,7 +3169,6 @@ impl App {
                 row_y = row_y.saturating_add(subject_lines.len().max(1) as u16);
             }
         }
-
     }
 
     fn render_activity_bar(&mut self, frame: &mut ratatui::Frame, area: Rect) {
@@ -3182,7 +3182,11 @@ impl App {
         let bg = if self.activity_images.is_some() {
             Style::default().bg(Color::Reset)
         } else {
-            Style::default().bg(Color::Rgb(EDITOR_BG_RGB.0, EDITOR_BG_RGB.1, EDITOR_BG_RGB.2))
+            Style::default().bg(Color::Rgb(
+                EDITOR_BG_RGB.0,
+                EDITOR_BG_RGB.1,
+                EDITOR_BG_RGB.2,
+            ))
         };
         // In images mode the icon PNG owns the entire activity-bar block —
         // background, codicon, and active pill are baked in. Rendering a bg
@@ -3191,10 +3195,7 @@ impl App {
         // are visible to the user. So in images mode we leave the cells
         // untouched and let the post-draw OSC writer paint them once.
         if self.activity_images.is_none() {
-            frame.render_widget(
-                ratatui::widgets::Block::default().style(bg),
-                area,
-            );
+            frame.render_widget(ratatui::widgets::Block::default().style(bg), area);
         }
         let active_bar = Color::Rgb(0x4e, 0x9a, 0xff);
         let bg_color = bg.bg.unwrap_or(Color::Reset);
@@ -3303,9 +3304,7 @@ impl App {
             // until the scan finishes. The user's hits stay populated for
             // when they come back; only the live work is dropped.
             if self.sidebar_view == SidebarView::Search && view != SidebarView::Search {
-                let _ = self
-                    .search_query_tx
-                    .send((String::new(), self.search.opts));
+                let _ = self.search_query_tx.send((String::new(), self.search.opts));
             }
             // Leaving Run-Debug after the headline icon was on screen:
             // arm a one-shot `terminal.clear()` so iTerm2 evicts the
@@ -3492,7 +3491,9 @@ impl App {
     /// (not `||`) so every terminal's flag is consumed even after the first
     /// dirty one is found.
     pub fn drain_terminals_dirty(&mut self) -> bool {
-        self.terminals.iter().fold(false, |acc, t| acc | t.take_dirty())
+        self.terminals
+            .iter()
+            .fold(false, |acc, t| acc | t.take_dirty())
     }
 
     /// Like `drain_terminals_dirty` but does not clear the underlying flags.
@@ -3616,7 +3617,9 @@ impl App {
                 let pinned = self.terminal_height.map(|h| {
                     h.clamp(
                         TERMINAL_HEIGHT_MIN,
-                        total_h.saturating_sub(EDITOR_HEIGHT_MIN).max(TERMINAL_HEIGHT_MIN),
+                        total_h
+                            .saturating_sub(EDITOR_HEIGHT_MIN)
+                            .max(TERMINAL_HEIGHT_MIN),
                     )
                 });
                 let right = if let Some(term_h) = pinned {
@@ -3718,9 +3721,8 @@ impl App {
         }
         if let Some(area) = terminal_area {
             let n = self.terminals.len().max(1);
-            let constraints: Vec<Constraint> = (0..n)
-                .map(|_| Constraint::Ratio(1, n as u32))
-                .collect();
+            let constraints: Vec<Constraint> =
+                (0..n).map(|_| Constraint::Ratio(1, n as u32)).collect();
             let cols = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints(constraints)
@@ -3732,8 +3734,7 @@ impl App {
             self.terminal_add_buttons.clear();
             self.terminal_close_buttons.clear();
             for col in cols.iter().take(self.terminals.len()) {
-                let (add_rect, close_rect) =
-                    paint_terminal_pane_buttons(frame, *col, show_close);
+                let (add_rect, close_rect) = paint_terminal_pane_buttons(frame, *col, show_close);
                 if let Some(r) = add_rect {
                     self.terminal_add_buttons.push(r);
                 }
@@ -3784,16 +3785,16 @@ impl App {
         spans.push(Span::raw(" Tree  "));
         spans.push(Span::styled("^j", Style::default().fg(Color::Yellow)));
         spans.push(Span::raw(" Term  "));
-        let shortcuts_label_start_col: u16 = spans
-            .iter()
-            .map(|s| s.content.chars().count() as u16)
-            .sum();
+        let shortcuts_label_start_col: u16 =
+            spans.iter().map(|s| s.content.chars().count() as u16).sum();
         spans.push(Span::styled("F1", Style::default().fg(Color::Yellow)));
         spans.push(Span::raw(" Shortcuts"));
         let shortcuts_label_len: u16 = "F1 Shortcuts".chars().count() as u16;
         let status_rect = outer[1];
         let hit_x = status_rect.x.saturating_add(shortcuts_label_start_col);
-        let hit_end = hit_x.saturating_add(shortcuts_label_len).min(status_rect.right());
+        let hit_end = hit_x
+            .saturating_add(shortcuts_label_len)
+            .min(status_rect.right());
         self.shortcuts_hit_rect = (hit_end > hit_x).then(|| Rect {
             x: hit_x,
             y: status_rect.y,
@@ -3846,12 +3847,16 @@ impl App {
     }
 
     fn render_context_menu(&self, frame: &mut ratatui::Frame) {
-        let Some(menu) = &self.context_menu else { return };
+        let Some(menu) = &self.context_menu else {
+            return;
+        };
         // `menu_rect` already clamps against `last_frame_area`, so the
         // rect we draw here is the same rect `menu_item_at` hit-tests
         // against. Keeping the two in lock-step is what prevents the
         // off-by-N row dispatch when the menu has to shift up to fit.
-        let Some(clipped) = self.menu_rect() else { return };
+        let Some(clipped) = self.menu_rect() else {
+            return;
+        };
         let block = ratatui::widgets::Block::default()
             .borders(ratatui::widgets::Borders::ALL)
             .border_style(Style::default().fg(Color::Rgb(0x4e, 0x9a, 0xff)))
@@ -3886,10 +3891,7 @@ impl App {
             // same row so the menu reads like VS Code's: action on the
             // left, accelerator on the right.
             let line = ratatui::text::Line::from(format!(" {label}"));
-            frame.render_widget(
-                ratatui::widgets::Paragraph::new(line).style(row_style),
-                row,
-            );
+            frame.render_widget(ratatui::widgets::Paragraph::new(line).style(row_style), row);
             if let Some(sc) = shortcut_for(action) {
                 let sc_w = sc.chars().count() as u16;
                 if sc_w + 2 <= inner.width {
@@ -3947,18 +3949,20 @@ impl App {
         self.source_control.commit_menu_item_areas.clear();
         for (i, (item, label)) in items.into_iter().enumerate() {
             let row_y = item_y_top + i as u16;
-            let row_rect = Rect { x: item_x, y: row_y, width: item_w, height: 1 };
+            let row_rect = Rect {
+                x: item_x,
+                y: row_y,
+                width: item_w,
+                height: 1,
+            };
             for rx in 0..row_rect.width {
                 frame.buffer_mut()[(row_rect.x + rx, row_rect.y)]
                     .set_symbol(" ")
                     .set_style(style);
             }
-            frame.buffer_mut().set_string(
-                row_rect.x,
-                row_rect.y,
-                &label,
-                style,
-            );
+            frame
+                .buffer_mut()
+                .set_string(row_rect.x, row_rect.y, &label, style);
             self.source_control
                 .commit_menu_item_areas
                 .push((row_rect, item));
@@ -3971,20 +3975,25 @@ impl App {
             CommitMenuItem::CommitAndPush => self.commit_and_push_source_control(),
             CommitMenuItem::Push => self.push_source_control(),
             CommitMenuItem::ViewStagedDiff => self.view_staged_diff_source_control(),
-            CommitMenuItem::ViewDefaultBranchDiff => {
-                self.view_default_branch_diff_source_control()
-            }
+            CommitMenuItem::ViewDefaultBranchDiff => self.view_default_branch_diff_source_control(),
         }
     }
 
     fn render_discard_confirm(&self, frame: &mut ratatui::Frame) {
-        let Some(pd) = self.pending_discard.as_ref() else { return };
+        let Some(pd) = self.pending_discard.as_ref() else {
+            return;
+        };
         let area = frame.area();
         let width = area.width.saturating_sub(8).min(96).max(50);
         let height: u16 = 8;
         let x = (area.width.saturating_sub(width)) / 2 + area.x;
         let y = (area.height.saturating_sub(height)) / 2 + area.y;
-        let rect = Rect { x, y, width, height };
+        let rect = Rect {
+            x,
+            y,
+            width,
+            height,
+        };
         let warn = Color::Rgb(0xe7, 0x70, 0x70);
         let block = ratatui::widgets::Block::default()
             .borders(ratatui::widgets::Borders::ALL)
@@ -4029,7 +4038,9 @@ impl App {
                 ratatui::text::Span::raw("es, discard   "),
                 ratatui::text::Span::styled(
                     "[N]",
-                    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 ratatui::text::Span::raw("o / Esc"),
             ]),
@@ -4038,13 +4049,20 @@ impl App {
     }
 
     fn render_local_open_confirm(&self, frame: &mut ratatui::Frame) {
-        let Some(url) = &self.pending_local_open else { return };
+        let Some(url) = &self.pending_local_open else {
+            return;
+        };
         let area = frame.area();
         let width = area.width.saturating_sub(8).min(96).max(50);
         let height: u16 = 8;
         let x = (area.width.saturating_sub(width)) / 2 + area.x;
         let y = (area.height.saturating_sub(height)) / 2 + area.y;
-        let rect = Rect { x, y, width, height };
+        let rect = Rect {
+            x,
+            y,
+            width,
+            height,
+        };
         let block = ratatui::widgets::Block::default()
             .borders(ratatui::widgets::Borders::ALL)
             .border_style(Style::default().fg(Color::Rgb(0xff, 0xa5, 0x00)))
@@ -4078,12 +4096,16 @@ impl App {
             ratatui::text::Line::from(vec![
                 ratatui::text::Span::styled(
                     "[Y]",
-                    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 ratatui::text::Span::raw("es once   "),
                 ratatui::text::Span::styled(
                     "[A]",
-                    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 ratatui::text::Span::raw("lways for this session   "),
                 ratatui::text::Span::styled(
@@ -4103,7 +4125,12 @@ impl App {
         let height = if p.error.is_some() { 6 } else { 5 };
         let x = (area.width.saturating_sub(width)) / 2 + area.x;
         let y = (area.height.saturating_sub(height)) / 2 + area.y;
-        let rect = Rect { x, y, width, height };
+        let rect = Rect {
+            x,
+            y,
+            width,
+            height,
+        };
         let block = ratatui::widgets::Block::default()
             .borders(ratatui::widgets::Borders::ALL)
             .border_style(Style::default().fg(Color::Rgb(0x4e, 0x9a, 0xff)))
@@ -4155,13 +4182,23 @@ impl App {
         };
         frame.render_widget(
             ratatui::widgets::Paragraph::new(top_line),
-            Rect { x: inner.x, y: inner.y, width: inner.width, height: 1 },
+            Rect {
+                x: inner.x,
+                y: inner.y,
+                width: inner.width,
+                height: 1,
+            },
         );
         let hint = ratatui::widgets::Paragraph::new(ratatui::text::Line::from(hint_text))
             .style(Style::default().fg(Color::DarkGray));
         frame.render_widget(
             hint,
-            Rect { x: inner.x, y: inner.y + 2, width: inner.width, height: 1 },
+            Rect {
+                x: inner.x,
+                y: inner.y + 2,
+                width: inner.width,
+                height: 1,
+            },
         );
         if let Some(err) = &p.error {
             let line = ratatui::widgets::Paragraph::new(ratatui::text::Line::from(format!(
@@ -4170,7 +4207,12 @@ impl App {
             .style(Style::default().fg(Color::Rgb(0xe8, 0x27, 0x4b)));
             frame.render_widget(
                 line,
-                Rect { x: inner.x, y: inner.y + 3, width: inner.width, height: 1 },
+                Rect {
+                    x: inner.x,
+                    y: inner.y + 3,
+                    width: inner.width,
+                    height: 1,
+                },
             );
         }
     }
@@ -4238,8 +4280,8 @@ impl App {
         // stage shortcut — saving an editor file with no editor focus
         // doesn't make sense anyway, and globally swallowing Cmd+S here
         // is what made the user's first attempt feel inert.
-        let sc_focused = self.focus == Pane::Tree
-            && self.sidebar_view == SidebarView::SourceControl;
+        let sc_focused =
+            self.focus == Pane::Tree && self.sidebar_view == SidebarView::SourceControl;
         if is_save_key(key) && !sc_focused {
             self.save();
             return Ok(());
@@ -4255,8 +4297,7 @@ impl App {
         if is_terminal_split_key(key) {
             match self.split_terminal() {
                 Ok(()) => {
-                    self.status =
-                        format!("Split terminal: {} active", self.terminals.len());
+                    self.status = format!("Split terminal: {} active", self.terminals.len());
                 }
                 Err(e) => {
                     self.status = format!("Split terminal failed: {e}");
@@ -4431,9 +4472,9 @@ impl App {
     }
 
     fn handle_remote_key(&mut self, key: KeyEvent) {
-        let has_mod = key.modifiers.intersects(
-            KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
-        );
+        let has_mod = key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER);
         match key.code {
             KeyCode::Up => self.remote.move_up(),
             KeyCode::Down => self.remote.move_down(),
@@ -4474,9 +4515,7 @@ impl App {
         // "Toggle Fullscreen" and never delivers the chord to the TUI,
         // which made the original Cmd+Enter wiring feel inert; Ctrl is
         // unintercepted across every terminal we target.
-        if key.modifiers.contains(KeyModifiers::CONTROL)
-            && matches!(key.code, KeyCode::Enter)
-        {
+        if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Enter) {
             self.commit_and_push_source_control();
             return;
         }
@@ -4484,9 +4523,7 @@ impl App {
         // stages them all in one go. Distinct from the editor's Cmd+A
         // (select-all text) which the user kept hitting in the SC pane
         // and getting the wrong scope.
-        if cmd_or_ctrl
-            && matches!(key.code, KeyCode::Char('a') | KeyCode::Char('A'))
-        {
+        if cmd_or_ctrl && matches!(key.code, KeyCode::Char('a') | KeyCode::Char('A')) {
             let n = self.source_control.select_all_changes();
             self.status = format!("Selected {n} change(s)");
             return;
@@ -4494,9 +4531,7 @@ impl App {
         // Cmd+S: stage the selected entry, or every entry in the
         // multi-selection. Mirrors clicking the inline "+" icon but
         // sweeps across the whole selection.
-        if cmd_or_ctrl
-            && matches!(key.code, KeyCode::Char('s') | KeyCode::Char('S'))
-        {
+        if cmd_or_ctrl && matches!(key.code, KeyCode::Char('s') | KeyCode::Char('S')) {
             self.stage_selected_source_control_entries();
             return;
         }
@@ -4552,9 +4587,7 @@ impl App {
         // one or two frames after the click. Removes the synchronous
         // `git status --porcelain` shell-out that used to stall the UI
         // thread on every Source Control click.
-        let _ = self
-            .git_request_tx
-            .send(crate::git::GitRequest::Changes);
+        let _ = self.git_request_tx.send(crate::git::GitRequest::Changes);
     }
 
     fn handle_run_debug_key(&mut self, key: KeyEvent) {
@@ -4687,7 +4720,10 @@ impl App {
                 match crate::git::read_file_at_head(&self.tree.root, &entry.path) {
                     Ok(head_text) => {
                         let label = std::path::PathBuf::from(format!("{} (HEAD)", entry.path));
-                        match self.editor.open_head_diff_with_text(label, &head_text, &abs) {
+                        match self
+                            .editor
+                            .open_head_diff_with_text(label, &head_text, &abs)
+                        {
                             Ok(()) => true,
                             Err(e) => {
                                 self.status = format!("Diff failed: {e}");
@@ -4779,9 +4815,17 @@ impl App {
 
     pub fn stage_selected_source_control_entries(&mut self) {
         let indices: Vec<usize> = if self.source_control.multi_selection.is_empty() {
-            self.source_control.selected_change.iter().copied().collect()
+            self.source_control
+                .selected_change
+                .iter()
+                .copied()
+                .collect()
         } else {
-            self.source_control.multi_selection.iter().copied().collect()
+            self.source_control
+                .multi_selection
+                .iter()
+                .copied()
+                .collect()
         };
         if indices.is_empty() {
             self.status = String::from("No change selected to stage");
@@ -4911,8 +4955,7 @@ impl App {
     pub fn commit_and_push_source_control(&mut self) {
         let message = self.source_control.message.trim().to_string();
         if message.is_empty() {
-            self.source_control.commit_feedback =
-                Some(String::from("Empty commit message"));
+            self.source_control.commit_feedback = Some(String::from("Empty commit message"));
             self.source_control.commit_feedback_is_error = true;
             return;
         }
@@ -4986,7 +5029,9 @@ impl App {
     }
 
     pub fn confirm_pending_discard(&mut self) {
-        let Some(pd) = self.pending_discard.take() else { return };
+        let Some(pd) = self.pending_discard.take() else {
+            return;
+        };
         match crate::git::discard_path(&self.tree.root, &pd.rel_path, pd.untracked) {
             Ok(()) => {
                 self.status = format!("Discarded {}", pd.rel_path);
@@ -5011,8 +5056,7 @@ impl App {
     fn commit_source_control(&mut self) {
         let message = self.source_control.message.trim().to_string();
         if message.is_empty() {
-            self.source_control.commit_feedback =
-                Some(String::from("Empty commit message"));
+            self.source_control.commit_feedback = Some(String::from("Empty commit message"));
             self.source_control.commit_feedback_is_error = true;
             return;
         }
@@ -5041,8 +5085,9 @@ impl App {
         match crate::remote_connect::SshAuth::start(&host) {
             Ok(auth) => {
                 self.connect_auth = Some(auth);
-                self.connect_dialog =
-                    Some(crate::widgets::connect_dialog::ConnectDialog::new(host.clone()));
+                self.connect_dialog = Some(crate::widgets::connect_dialog::ConnectDialog::new(
+                    host.clone(),
+                ));
                 self.pending_remote_launch_path = path;
                 self.pending_remote_launch_host = Some(host);
                 self.welcome_image_clear_requested = true;
@@ -5094,9 +5139,11 @@ impl App {
             ) {
                 let adopted = auth.hand_off();
                 let path = self.pending_remote_launch_path.take();
-                self.install_session = Some(
-                    crate::install_session::InstallSession::start(adopted, host.clone(), path),
-                );
+                self.install_session = Some(crate::install_session::InstallSession::start(
+                    adopted,
+                    host.clone(),
+                    path,
+                ));
                 self.status = format!("Preparing remote croft on {host}…");
             }
         }
@@ -5177,10 +5224,7 @@ impl App {
             return;
         };
         if dialog.phase.is_terminal() {
-            if matches!(
-                key.code,
-                KeyCode::Esc | KeyCode::Enter | KeyCode::Char(' ')
-            ) {
+            if matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char(' ')) {
                 self.connect_dialog = None;
                 self.tear_down_connect_auth();
             }
@@ -5208,9 +5252,7 @@ impl App {
                 }
             }
             KeyCode::Backspace => dialog.pop_input_char(),
-            KeyCode::Char('l') | KeyCode::Char('L')
-                if has_mod || !dialog.phase.awaits_input() =>
-            {
+            KeyCode::Char('l') | KeyCode::Char('L') if has_mod || !dialog.phase.awaits_input() => {
                 dialog.toggle_logs();
             }
             KeyCode::Char(c) if !has_mod => dialog.push_input_char(c),
@@ -5235,8 +5277,11 @@ impl App {
         if rect_contains(dialog.submit_btn, col, row) && dialog.phase.awaits_input() {
             let payload = dialog.input_for_submit();
             dialog.submitted = true;
-            dialog.status_line =
-                format!("Sending {} chars to {}…", payload.chars().count(), dialog.host);
+            dialog.status_line = format!(
+                "Sending {} chars to {}…",
+                payload.chars().count(),
+                dialog.host
+            );
             dialog.clear_input();
             if let Some(auth) = self.connect_auth.as_mut() {
                 auth.respond_password(&payload);
@@ -5303,9 +5348,10 @@ impl App {
         match self.editor.open_preview(&hit.path) {
             Ok(()) => {
                 self.sync_open_file_poll_mtime();
-                let row = hit.line_no.saturating_sub(1).min(
-                    self.editor.lines.len().saturating_sub(1),
-                );
+                let row = hit
+                    .line_no
+                    .saturating_sub(1)
+                    .min(self.editor.lines.len().saturating_sub(1));
                 self.editor.cursor_row = row;
                 // Drop the cursor at the first match column on this line so
                 // long lines (HTML with base64 blobs, minified JS) auto-scroll
@@ -5334,11 +5380,7 @@ impl App {
                 self.editor.cursor_col = match_col;
                 self.editor.scroll_col = 0;
                 self.editor.ensure_cursor_col_visible();
-                self.status = format!(
-                    "Opened {} at line {}",
-                    hit.path.display(),
-                    hit.line_no
-                );
+                self.status = format!("Opened {} at line {}", hit.path.display(), hit.line_no);
             }
             Err(e) => {
                 self.status = format!("Open failed: {e}");
@@ -5820,10 +5862,7 @@ impl App {
                     if !yanked.is_empty() {
                         copy_to_clipboard(&yanked);
                     }
-                    self.status = format!(
-                        "Deleted {n} {}",
-                        if n == 1 { "line" } else { "lines" }
-                    );
+                    self.status = format!("Deleted {n} {}", if n == 1 { "line" } else { "lines" });
                 }
                 VimOp::Y => {
                     let n = count.max(1);
@@ -5831,10 +5870,7 @@ impl App {
                     if !yanked.is_empty() {
                         copy_to_clipboard(&yanked);
                     }
-                    self.status = format!(
-                        "Yanked {n} {}",
-                        if n == 1 { "line" } else { "lines" }
-                    );
+                    self.status = format!("Yanked {n} {}", if n == 1 { "line" } else { "lines" });
                 }
                 VimOp::None => {}
             }
@@ -5852,8 +5888,7 @@ impl App {
         if is_terminal_split_key(key) {
             match self.split_terminal() {
                 Ok(()) => {
-                    self.status =
-                        format!("Split terminal: {} active", self.terminals.len());
+                    self.status = format!("Split terminal: {} active", self.terminals.len());
                 }
                 Err(e) => {
                     self.status = format!("Split terminal failed: {e}");
@@ -5864,8 +5899,7 @@ impl App {
         // Ctrl+Shift+W: close the active terminal (no-op when only one is left).
         if is_terminal_close_key(key) {
             if self.close_active_terminal() {
-                self.status =
-                    format!("Closed terminal: {} remaining", self.terminals.len());
+                self.status = format!("Closed terminal: {} remaining", self.terminals.len());
             } else {
                 self.status = String::from("Cannot close the last terminal; press Ctrl+J to hide");
             }
@@ -5922,7 +5956,9 @@ impl App {
     /// OSC 52.  Selection stays visible so the user can verify what was
     /// copied. No-op when the selection is empty / zero-area.
     fn copy_terminal_selection(&mut self) {
-        let Some(sel) = self.terminal().selection() else { return };
+        let Some(sel) = self.terminal().selection() else {
+            return;
+        };
         if !sel.has_area() {
             return;
         }
@@ -5939,13 +5975,14 @@ impl App {
             if let Some(text) = diff.selection_text() {
                 if !text.is_empty() {
                     copy_to_clipboard(&text);
-                    self.status =
-                        format!("Copied {} chars to clipboard", text.chars().count());
+                    self.status = format!("Copied {} chars to clipboard", text.chars().count());
                 }
             }
             return;
         }
-        let Some(sel) = self.editor.selection else { return };
+        let Some(sel) = self.editor.selection else {
+            return;
+        };
         if !sel.has_area() {
             return;
         }
@@ -5958,7 +5995,9 @@ impl App {
     }
 
     fn cut_editor_selection(&mut self) {
-        let Some(sel) = self.editor.selection else { return };
+        let Some(sel) = self.editor.selection else {
+            return;
+        };
         if !sel.has_area() {
             return;
         }
@@ -6174,7 +6213,11 @@ impl App {
                 errors.join("; ")
             )
         } else if total == 1 {
-            format!("Imported {} into {}", paths[0].display(), dest_dir.display())
+            format!(
+                "Imported {} into {}",
+                paths[0].display(),
+                dest_dir.display()
+            )
         } else {
             format!("Imported {total} items into {}", dest_dir.display())
         };
@@ -6190,8 +6233,7 @@ impl App {
     /// croft prompts for Enter and resumes the TUI.
     fn import_paths_into_remote(&mut self, paths: &[PathBuf]) {
         let Some(target) = self.remote.selected_target().cloned() else {
-            self.status =
-                String::from("Drop ignored: no Remote Explorer host selected");
+            self.status = String::from("Drop ignored: no Remote Explorer host selected");
             return;
         };
         if paths.is_empty() {
@@ -6292,8 +6334,7 @@ impl App {
                     started_at: std::time::Instant::now(),
                     kind: RemotePullKind::Clipboard,
                 });
-                self.status =
-                    String::from("Cmd+V: fetching local Mac clipboard via croft relay…");
+                self.status = String::from("Cmd+V: fetching local Mac clipboard via croft relay…");
             }
             Err(e) => {
                 self.status = format!("Cmd+V: relay write failed: {e}");
@@ -6347,8 +6388,8 @@ impl App {
                 }
                 let _ = std::fs::remove_dir_all(&request_dir);
             } else if err.exists() {
-                let msg = std::fs::read_to_string(&err)
-                    .unwrap_or_else(|_| String::from("relay error"));
+                let msg =
+                    std::fs::read_to_string(&err).unwrap_or_else(|_| String::from("relay error"));
                 errors.push(format!("{}: {}", pull.src_display, msg.trim()));
                 let _ = std::fs::remove_dir_all(&request_dir);
             } else if pull.started_at.elapsed() > REMOTE_PULL_TIMEOUT {
@@ -6363,8 +6404,7 @@ impl App {
                 self.terminal_mut().paste_input(&bytes);
             }
         }
-        let resolved_any =
-            !placed.is_empty() || !opened_urls.is_empty() || !errors.is_empty();
+        let resolved_any = !placed.is_empty() || !opened_urls.is_empty() || !errors.is_empty();
         self.pending_remote_pulls = still_pending;
         for dir in &affected {
             if let Some(idx) = self.tree.index_of_dir(dir) {
@@ -6513,9 +6553,7 @@ impl App {
                 self.pending_local_open = None;
                 self.trust_local_browser = true;
                 self.request_remote_url_open(url.clone());
-                self.status = format!(
-                    "Trusted local browser for this session. Opening {url}…"
-                );
+                self.status = format!("Trusted local browser for this session. Opening {url}…");
             }
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                 self.pending_local_open = None;
@@ -6527,8 +6565,7 @@ impl App {
 
     fn open_shortcuts_modal(&mut self) {
         if self.shortcuts_modal.is_none() {
-            self.shortcuts_modal =
-                Some(crate::widgets::shortcuts::ShortcutsModal::default());
+            self.shortcuts_modal = Some(crate::widgets::shortcuts::ShortcutsModal::default());
             self.shortcuts_image_clear_requested = true;
             self.status = String::from("Shortcuts: Esc to close");
         }
@@ -6608,9 +6645,7 @@ impl App {
             self.file_finder_index_dirty = true;
             return;
         }
-        let (tx, rx) = std::sync::mpsc::channel::<
-            Vec<crate::widgets::file_finder::FileEntry>,
-        >();
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<crate::widgets::file_finder::FileEntry>>();
         let root = self.workspace_root.clone();
         std::thread::spawn(move || {
             let entries = crate::widgets::file_finder::build_file_index(&root);
@@ -6631,8 +6666,7 @@ impl App {
         // rather than open an empty finder; this only fires when
         // Cmd+P is pressed within the first few hundred ms of launch.
         if self.file_finder_index.is_none() {
-            let entries =
-                crate::widgets::file_finder::build_file_index(&self.workspace_root);
+            let entries = crate::widgets::file_finder::build_file_index(&self.workspace_root);
             self.file_finder_index = Some(std::sync::Arc::new(entries));
             self.file_finder_index_rx = None;
         }
@@ -6678,7 +6712,9 @@ impl App {
             }
             return;
         }
-        let Some(finder) = self.file_finder.as_mut() else { return };
+        let Some(finder) = self.file_finder.as_mut() else {
+            return;
+        };
         match (key.code, key.modifiers) {
             (KeyCode::Esc, _) => {
                 self.close_file_finder();
@@ -6722,9 +6758,7 @@ impl App {
             (KeyCode::End, _) => finder.move_cursor_end(),
             (KeyCode::Backspace, _) => finder.pop_char(),
             (KeyCode::Delete, _) => finder.delete_char(),
-            (KeyCode::Char(c), m)
-                if !m.intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER) =>
-            {
+            (KeyCode::Char(c), m) if !m.intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER) => {
                 finder.push_char(c);
             }
             _ => {}
@@ -6732,7 +6766,9 @@ impl App {
     }
 
     fn handle_file_finder_mouse(&mut self, m: MouseEvent) {
-        let Some(finder) = self.file_finder.as_mut() else { return };
+        let Some(finder) = self.file_finder.as_mut() else {
+            return;
+        };
         let inside = rect_contains(finder.last_rect, m.column, m.row);
         match m.kind {
             MouseEventKind::ScrollDown => {
@@ -6745,8 +6781,7 @@ impl App {
                     finder.select_prev();
                 }
             }
-            MouseEventKind::Down(MouseButton::Left)
-            | MouseEventKind::Down(MouseButton::Right) => {
+            MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Down(MouseButton::Right) => {
                 if !inside {
                     self.close_file_finder();
                 }
@@ -6756,7 +6791,9 @@ impl App {
     }
 
     fn render_file_finder(&mut self, frame: &mut ratatui::Frame) {
-        let Some(finder) = self.file_finder.as_mut() else { return };
+        let Some(finder) = self.file_finder.as_mut() else {
+            return;
+        };
         let area = frame.area();
         crate::widgets::file_finder::render_file_finder(finder, area, frame.buffer_mut());
     }
@@ -6779,12 +6816,10 @@ impl App {
             ..Default::default()
         };
         if !initial.is_empty() {
-            state.match_count = crate::widgets::editor_find::count_matches(
-                &self.editor.lines,
-                &initial,
-                opts,
-            );
-            self.editor.set_search_highlight(Some(initial.clone()), opts);
+            state.match_count =
+                crate::widgets::editor_find::count_matches(&self.editor.lines, &initial, opts);
+            self.editor
+                .set_search_highlight(Some(initial.clone()), opts);
         }
         self.editor_find = Some(state);
         self.status = String::from("Find: type to search, Enter next, Shift+Enter prev, Esc close");
@@ -6792,31 +6827,30 @@ impl App {
 
     fn close_editor_find(&mut self) {
         if self.editor_find.take().is_some() {
-            self.editor
-                .set_search_highlight(None, self.search.opts);
+            self.editor.set_search_highlight(None, self.search.opts);
             self.status.clear();
         }
     }
 
     fn editor_find_set_query(&mut self, new_query: String) {
-        let Some(state) = self.editor_find.as_mut() else { return };
+        let Some(state) = self.editor_find.as_mut() else {
+            return;
+        };
         if state.query == new_query {
             return;
         }
         state.query = new_query;
         let opts = state.opts;
-        state.match_count = crate::widgets::editor_find::count_matches(
-            &self.editor.lines,
-            &state.query,
-            opts,
-        );
+        state.match_count =
+            crate::widgets::editor_find::count_matches(&self.editor.lines, &state.query, opts);
         if state.query.is_empty() {
             state.match_index = None;
             self.editor.active_search_match = None;
             self.editor.set_search_highlight(None, opts);
             return;
         }
-        self.editor.set_search_highlight(Some(state.query.clone()), opts);
+        self.editor
+            .set_search_highlight(Some(state.query.clone()), opts);
         let from_row = self.editor.cursor_row;
         let from_col = self.editor.cursor_col;
         if let Some(m) = crate::widgets::editor_find::find_next_match(
@@ -6833,7 +6867,9 @@ impl App {
     }
 
     fn editor_find_jump_next(&mut self) {
-        let Some(state) = self.editor_find.as_ref() else { return };
+        let Some(state) = self.editor_find.as_ref() else {
+            return;
+        };
         if state.query.is_empty() {
             return;
         }
@@ -6853,7 +6889,9 @@ impl App {
     }
 
     fn editor_find_jump_prev(&mut self) {
-        let Some(state) = self.editor_find.as_ref() else { return };
+        let Some(state) = self.editor_find.as_ref() else {
+            return;
+        };
         if state.query.is_empty() {
             return;
         }
@@ -6888,7 +6926,9 @@ impl App {
     }
 
     fn refresh_editor_find_index(&mut self) {
-        let Some(state) = self.editor_find.as_mut() else { return };
+        let Some(state) = self.editor_find.as_mut() else {
+            return;
+        };
         let opts = state.opts;
         let needle = state.query.clone();
         state.match_index = crate::widgets::editor_find::match_index_at(
@@ -6944,9 +6984,7 @@ impl App {
                     self.editor_find_set_query(new_q);
                 }
             }
-            (KeyCode::Char(c), m)
-                if !m.intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER) =>
-            {
+            (KeyCode::Char(c), m) if !m.intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER) => {
                 let mut new_q = self
                     .editor_find
                     .as_ref()
@@ -6960,7 +6998,9 @@ impl App {
     }
 
     fn render_editor_find(&mut self, frame: &mut ratatui::Frame) {
-        let Some(state) = self.editor_find.as_mut() else { return };
+        let Some(state) = self.editor_find.as_mut() else {
+            return;
+        };
         let area = self.editor.last_full_area;
         if area.width == 0 || area.height == 0 {
             return;
@@ -6969,7 +7009,9 @@ impl App {
     }
 
     fn handle_shortcuts_modal_key(&mut self, key: KeyEvent) {
-        let Some(modal) = self.shortcuts_modal.as_mut() else { return };
+        let Some(modal) = self.shortcuts_modal.as_mut() else {
+            return;
+        };
         match (key.code, key.modifiers) {
             (KeyCode::Esc, _) | (KeyCode::F(1), _) => self.close_shortcuts_modal(),
             (KeyCode::Char('q'), KeyModifiers::NONE) => self.close_shortcuts_modal(),
@@ -6984,13 +7026,14 @@ impl App {
     }
 
     fn handle_shortcuts_modal_mouse(&mut self, m: MouseEvent) {
-        let Some(modal) = self.shortcuts_modal.as_mut() else { return };
+        let Some(modal) = self.shortcuts_modal.as_mut() else {
+            return;
+        };
         let inside = rect_contains(modal.last_rect, m.column, m.row);
         match m.kind {
             MouseEventKind::ScrollDown => modal.scroll_down(3),
             MouseEventKind::ScrollUp => modal.scroll_up(3),
-            MouseEventKind::Down(MouseButton::Left)
-            | MouseEventKind::Down(MouseButton::Right) => {
+            MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Down(MouseButton::Right) => {
                 if !inside {
                     self.close_shortcuts_modal();
                 }
@@ -7000,14 +7043,18 @@ impl App {
     }
 
     fn render_shortcuts_modal(&mut self, frame: &mut ratatui::Frame) {
-        let Some(modal) = self.shortcuts_modal.as_mut() else { return };
+        let Some(modal) = self.shortcuts_modal.as_mut() else {
+            return;
+        };
         let area = frame.area();
         crate::widgets::shortcuts::render_shortcuts_modal(modal, area, frame.buffer_mut());
     }
 
     fn render_connect_dialog(&mut self, frame: &mut ratatui::Frame) {
         let visible = self.cursor_visible_phase();
-        let Some(dialog) = self.connect_dialog.as_mut() else { return };
+        let Some(dialog) = self.connect_dialog.as_mut() else {
+            return;
+        };
         let area = frame.area();
         use ratatui::widgets::Widget as _;
         dialog.render(area, frame.buffer_mut());
@@ -7105,8 +7152,7 @@ impl App {
                 // column with the sidebar.
                 if let Some(tab_idx) = self.editor.tab_at(m.column, m.row) {
                     self.focus_pane(Pane::Editor);
-                    let items =
-                        build_tab_context_menu_items(tab_idx, self.editor.tab_count());
+                    let items = build_tab_context_menu_items(tab_idx, self.editor.tab_count());
                     self.context_menu = Some(ContextMenu {
                         origin: (m.column, m.row),
                         items,
@@ -7128,9 +7174,8 @@ impl App {
                         }
                     }
                     let node = node_idx.and_then(|i| self.tree.nodes.get(i));
-                    let target_dir = crate::widgets::file_tree::create_target_dir_for(
-                        node, &self.tree.root,
-                    );
+                    let target_dir =
+                        crate::widgets::file_tree::create_target_dir_for(node, &self.tree.root);
                     let selection = self.tree.action_paths();
                     let items = build_tree_context_menu_items(
                         node,
@@ -7228,9 +7273,7 @@ impl App {
                     // splitter-drag and never reaches `node_at_y` -
                     // exactly the dead-zone the user hit on the last
                     // two files in the Explorer.
-                    let in_splitter_x_range = self
-                        .sidebar_splitter_x
-                        .is_none_or(|x| m.column >= x);
+                    let in_splitter_x_range = self.sidebar_splitter_x.is_none_or(|x| m.column >= x);
                     if in_splitter_x_range && (m.row == y || m.row == y.saturating_sub(1)) {
                         self.splitter_drag = Some(SplitterDrag::Terminal);
                         return;
@@ -7359,15 +7402,11 @@ impl App {
                     if self.source_control.click_input(m.column, m.row) {
                         return;
                     }
-                    if let Some(idx) =
-                        self.source_control.click_discard_action(m.column, m.row)
-                    {
+                    if let Some(idx) = self.source_control.click_discard_action(m.column, m.row) {
                         self.request_discard_source_control_entry(idx);
                         return;
                     }
-                    if let Some(idx) =
-                        self.source_control.click_stage_action(m.column, m.row)
-                    {
+                    if let Some(idx) = self.source_control.click_stage_action(m.column, m.row) {
                         self.stage_source_control_entry(idx);
                         return;
                     }
@@ -7484,19 +7523,15 @@ impl App {
                         // keep the marks intact so a subsequent drag carries
                         // every selected entry; otherwise collapse selection
                         // to this single row.
-                        let already_marked =
-                            self.tree.marked.contains(&self.tree.nodes[idx].path);
+                        let already_marked = self.tree.marked.contains(&self.tree.nodes[idx].path);
                         if !already_marked {
                             self.tree.select_replace(idx);
                         } else {
                             self.tree.selected = idx;
                             self.tree.anchor = idx;
                         }
-                        let clicked_is_dir = self
-                            .tree
-                            .nodes
-                            .get(idx)
-                            .is_some_and(|node| node.is_dir);
+                        let clicked_is_dir =
+                            self.tree.nodes.get(idx).is_some_and(|node| node.is_dir);
                         if clicked_is_dir && is_double {
                             self.last_tree_left_down = None;
                             self.tree_drag = None;
@@ -7581,10 +7616,7 @@ impl App {
                         if let Some(diff) = self.editor.diff.as_mut() {
                             if let Some((side, row_idx, char_col)) =
                                 crate::widgets::editor::diff_hit_test(
-                                    diff,
-                                    last_inner,
-                                    m.column,
-                                    m.row,
+                                    diff, last_inner, m.column, m.row,
                                 )
                             {
                                 if is_double {
@@ -7702,10 +7734,7 @@ impl App {
                         if let Some(diff) = self.editor.diff.as_mut() {
                             if let Some((_, row_idx, char_col)) =
                                 crate::widgets::editor::diff_hit_test(
-                                    diff,
-                                    last_inner,
-                                    m.column,
-                                    m.row,
+                                    diff, last_inner, m.column, m.row,
                                 )
                             {
                                 diff.extend_selection_to(row_idx, char_col);
@@ -7727,11 +7756,8 @@ impl App {
                                     drag.armed = true;
                                 }
                                 if drag.armed {
-                                    drag.target_idx = drag_target_index(
-                                        &self.tree,
-                                        m.row,
-                                        &drag.paths,
-                                    );
+                                    drag.target_idx =
+                                        drag_target_index(&self.tree, m.row, &drag.paths);
                                     self.tree.drag_target = drag.target_idx;
                                 }
                             }
@@ -7927,7 +7953,12 @@ impl App {
         } else {
             menu.origin.1
         };
-        Some(Rect { x, y, width, height })
+        Some(Rect {
+            x,
+            y,
+            width,
+            height,
+        })
     }
 
     /// If (x, y) hits a menu item row, return its index.
@@ -8308,18 +8339,11 @@ impl App {
         }
         let canvas_w = cell_w as u32 * cw_px;
         let canvas_h = cell_h as u32 * ch_px;
-        let bg = image::Rgba([
-            EDITOR_BG_RGB.0,
-            EDITOR_BG_RGB.1,
-            EDITOR_BG_RGB.2,
-            0xff,
-        ]);
+        let bg = image::Rgba([EDITOR_BG_RGB.0, EDITOR_BG_RGB.1, EDITOR_BG_RGB.2, 0xff]);
         if let Ok(baked) =
             crate::iterm2_inline::fit_image_auto(&image.bytes, canvas_w, canvas_h, bg)
         {
-            let raw = crate::iterm2_inline::build_inline_image_osc(
-                &baked, cell_w, cell_h, false,
-            );
+            let raw = crate::iterm2_inline::build_inline_image_osc(&baked, cell_w, cell_h, false);
             let osc = if crate::iterm2_inline::detect_tmux() {
                 crate::iterm2_inline::tmux_passthrough_wrap(&raw)
             } else {
@@ -8403,7 +8427,9 @@ impl App {
         // Page = inner viewport rows minus the header + footer the diff
         // renderer reserves. Falls back to a sane default when the editor
         // hasn't laid out yet.
-        let page = (self.editor.last_inner.height as usize).saturating_sub(2).max(1);
+        let page = (self.editor.last_inner.height as usize)
+            .saturating_sub(2)
+            .max(1);
         let Some(diff) = self.editor.diff.as_mut() else {
             return;
         };
@@ -8535,8 +8561,7 @@ impl App {
                     .last_content_height
                     .saturating_sub(EDITOR_HEIGHT_MIN)
                     .max(TERMINAL_HEIGHT_MIN);
-                self.terminal_height =
-                    Some(new_h.clamp(TERMINAL_HEIGHT_MIN, max_h));
+                self.terminal_height = Some(new_h.clamp(TERMINAL_HEIGHT_MIN, max_h));
             }
         }
     }
@@ -8720,12 +8745,7 @@ impl App {
 
     /// Shared implementation for explorer paste and drag-drop. `mode`
     /// distinguishes a move (Cut/drag) from a copy (Copy/Alt-drag).
-    fn apply_paste_or_drop(
-        &mut self,
-        dest_dir: &Path,
-        paths: &[PathBuf],
-        mode: ExplorerClipMode,
-    ) {
+    fn apply_paste_or_drop(&mut self, dest_dir: &Path, paths: &[PathBuf], mode: ExplorerClipMode) {
         let mut affected: BTreeSet<PathBuf> = BTreeSet::new();
         affected.insert(dest_dir.to_path_buf());
         let mut placed: Vec<PathBuf> = Vec::new();
@@ -8740,15 +8760,11 @@ impl App {
                     affected.insert(parent);
                     crate::widgets::file_tree::move_into(dest_dir, src)
                 }
-                ExplorerClipMode::Copy => {
-                    crate::widgets::file_tree::copy_into(dest_dir, src)
-                }
+                ExplorerClipMode::Copy => crate::widgets::file_tree::copy_into(dest_dir, src),
             };
             match result {
                 Ok(p) => {
-                    if matches!(mode, ExplorerClipMode::Cut)
-                        && self.editor.matches_open_path(src)
-                    {
+                    if matches!(mode, ExplorerClipMode::Cut) && self.editor.matches_open_path(src) {
                         self.editor.rename_open_path(src, &p);
                     }
                     placed.push(p);
@@ -9019,20 +9035,22 @@ fn is_terminal_copy_key(key: KeyEvent) -> bool {
 ///   * anchor + different file → open a side-by-side diff;
 ///   * anchor + same file → clear the anchor (toggle off).
 fn is_compare_key(key: KeyEvent) -> bool {
-    let KeyCode::Char(c) = key.code else { return false };
+    let KeyCode::Char(c) = key.code else {
+        return false;
+    };
     if !c.eq_ignore_ascii_case(&'d') {
         return false;
     }
-    if key.modifiers.contains(KeyModifiers::SHIFT)
-        || key.modifiers.contains(KeyModifiers::ALT)
-    {
+    if key.modifiers.contains(KeyModifiers::SHIFT) || key.modifiers.contains(KeyModifiers::ALT) {
         return false;
     }
     key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::SUPER)
 }
 
 fn is_search_jump_key(key: KeyEvent) -> bool {
-    let KeyCode::Char(c) = key.code else { return false };
+    let KeyCode::Char(c) = key.code else {
+        return false;
+    };
     if !c.eq_ignore_ascii_case(&'f') {
         return false;
     }
@@ -9047,13 +9065,13 @@ fn is_search_jump_key(key: KeyEvent) -> bool {
 /// `handle_key` gives the Explorer handler first refusal so this only
 /// fires when the editor is the focused pane.
 fn is_editor_find_key(key: KeyEvent) -> bool {
-    let KeyCode::Char(c) = key.code else { return false };
+    let KeyCode::Char(c) = key.code else {
+        return false;
+    };
     if !c.eq_ignore_ascii_case(&'f') {
         return false;
     }
-    if key.modifiers.contains(KeyModifiers::SHIFT)
-        || key.modifiers.contains(KeyModifiers::ALT)
-    {
+    if key.modifiers.contains(KeyModifiers::SHIFT) || key.modifiers.contains(KeyModifiers::ALT) {
         return false;
     }
     key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::SUPER)
@@ -9063,13 +9081,13 @@ fn is_editor_find_key(key: KeyEvent) -> bool {
 /// Plain `p` with no modifier (or with Shift / Alt only) falls through so
 /// the editor still receives literal `p` keystrokes.
 fn is_file_finder_key(key: KeyEvent) -> bool {
-    let KeyCode::Char(c) = key.code else { return false };
+    let KeyCode::Char(c) = key.code else {
+        return false;
+    };
     if !c.eq_ignore_ascii_case(&'p') {
         return false;
     }
-    if key.modifiers.contains(KeyModifiers::SHIFT)
-        || key.modifiers.contains(KeyModifiers::ALT)
-    {
+    if key.modifiers.contains(KeyModifiers::SHIFT) || key.modifiers.contains(KeyModifiers::ALT) {
         return false;
     }
     key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::SUPER)
@@ -9077,13 +9095,13 @@ fn is_file_finder_key(key: KeyEvent) -> bool {
 
 /// Explorer-pane shortcut: `Cmd+F` / `Ctrl+F` (no Shift, no Alt) - "New File".
 fn is_tree_new_file_key(key: KeyEvent) -> bool {
-    let KeyCode::Char(c) = key.code else { return false };
+    let KeyCode::Char(c) = key.code else {
+        return false;
+    };
     if !c.eq_ignore_ascii_case(&'f') {
         return false;
     }
-    if key.modifiers.contains(KeyModifiers::SHIFT)
-        || key.modifiers.contains(KeyModifiers::ALT)
-    {
+    if key.modifiers.contains(KeyModifiers::SHIFT) || key.modifiers.contains(KeyModifiers::ALT) {
         return false;
     }
     key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::SUPER)
@@ -9094,13 +9112,13 @@ fn is_tree_new_file_key(key: KeyEvent) -> bool {
 /// so this only fires when the tree is the focused pane; outside Explorer
 /// the chord is unbound and falls through to the focused pane.
 fn is_tree_new_folder_key(key: KeyEvent) -> bool {
-    let KeyCode::Char(c) = key.code else { return false };
+    let KeyCode::Char(c) = key.code else {
+        return false;
+    };
     if !c.eq_ignore_ascii_case(&'n') {
         return false;
     }
-    if !key.modifiers.contains(KeyModifiers::SHIFT)
-        || key.modifiers.contains(KeyModifiers::ALT)
-    {
+    if !key.modifiers.contains(KeyModifiers::SHIFT) || key.modifiers.contains(KeyModifiers::ALT) {
         return false;
     }
     key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::SUPER)
@@ -9113,13 +9131,13 @@ fn is_tree_rename_key(key: KeyEvent) -> bool {
     if matches!(key.code, KeyCode::F(2)) {
         return true;
     }
-    let KeyCode::Char(c) = key.code else { return false };
+    let KeyCode::Char(c) = key.code else {
+        return false;
+    };
     if !c.eq_ignore_ascii_case(&'r') {
         return false;
     }
-    if key.modifiers.contains(KeyModifiers::SHIFT)
-        || key.modifiers.contains(KeyModifiers::ALT)
-    {
+    if key.modifiers.contains(KeyModifiers::SHIFT) || key.modifiers.contains(KeyModifiers::ALT) {
         return false;
     }
     key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::SUPER)
@@ -9131,9 +9149,7 @@ fn is_tree_make_root_key(key: KeyEvent) -> bool {
     if !matches!(key.code, KeyCode::Char('/')) {
         return false;
     }
-    if key.modifiers.contains(KeyModifiers::SHIFT)
-        || key.modifiers.contains(KeyModifiers::ALT)
-    {
+    if key.modifiers.contains(KeyModifiers::SHIFT) || key.modifiers.contains(KeyModifiers::ALT) {
         return false;
     }
     key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::SUPER)
@@ -9191,7 +9207,9 @@ fn is_remote_jump_key(key: KeyEvent) -> bool {
 }
 
 fn is_cmd_shift_letter(key: KeyEvent, letter: char) -> bool {
-    let KeyCode::Char(c) = key.code else { return false };
+    let KeyCode::Char(c) = key.code else {
+        return false;
+    };
     if !c.eq_ignore_ascii_case(&letter) {
         return false;
     }
@@ -9207,7 +9225,9 @@ fn is_cmd_shift_letter(key: KeyEvent, letter: char) -> bool {
 /// `Ctrl/Cmd+Shift+G`: jump to the Source Control sidebar view, matching
 /// VS Code's "Show Source Control" gesture.
 fn is_source_control_jump_key(key: KeyEvent) -> bool {
-    let KeyCode::Char(c) = key.code else { return false };
+    let KeyCode::Char(c) = key.code else {
+        return false;
+    };
     if !c.eq_ignore_ascii_case(&'g') {
         return false;
     }
@@ -9230,8 +9250,7 @@ fn is_terminal_toggle_key(key: KeyEvent) -> bool {
     if !c.eq_ignore_ascii_case(&'j') {
         return false;
     }
-    key.modifiers.contains(KeyModifiers::CONTROL)
-        && !key.modifiers.contains(KeyModifiers::SHIFT)
+    key.modifiers.contains(KeyModifiers::CONTROL) && !key.modifiers.contains(KeyModifiers::SHIFT)
 }
 
 /// `Ctrl+Shift+J`: toggle "maximize terminal" — the editor / welcome pane
@@ -9255,7 +9274,9 @@ fn is_terminal_maximize_key(key: KeyEvent) -> bool {
 /// `is_terminal_focus_key`) does not double-fire as a split when the
 /// user happens to be holding both modifiers.
 fn is_terminal_split_key(key: KeyEvent) -> bool {
-    let KeyCode::Char(c) = key.code else { return false };
+    let KeyCode::Char(c) = key.code else {
+        return false;
+    };
     if !c.eq_ignore_ascii_case(&'t') {
         return false;
     }
@@ -9271,13 +9292,13 @@ fn is_terminal_split_key(key: KeyEvent) -> bool {
 /// historical meaning - the two chords share the same letter but are
 /// disambiguated by the modifier.
 fn is_terminal_focus_key(key: KeyEvent) -> bool {
-    let KeyCode::Char(c) = key.code else { return false };
+    let KeyCode::Char(c) = key.code else {
+        return false;
+    };
     if !c.eq_ignore_ascii_case(&'t') {
         return false;
     }
-    if key.modifiers.contains(KeyModifiers::ALT)
-        || key.modifiers.contains(KeyModifiers::CONTROL)
-    {
+    if key.modifiers.contains(KeyModifiers::ALT) || key.modifiers.contains(KeyModifiers::CONTROL) {
         return false;
     }
     key.modifiers.contains(KeyModifiers::SUPER) && key.modifiers.contains(KeyModifiers::SHIFT)
@@ -9285,7 +9306,9 @@ fn is_terminal_focus_key(key: KeyEvent) -> bool {
 
 /// `Ctrl+Shift+W`: close the active terminal (no-op if it's the only one).
 fn is_terminal_close_key(key: KeyEvent) -> bool {
-    let KeyCode::Char(c) = key.code else { return false };
+    let KeyCode::Char(c) = key.code else {
+        return false;
+    };
     if !c.eq_ignore_ascii_case(&'w') {
         return false;
     }
@@ -9294,7 +9317,9 @@ fn is_terminal_close_key(key: KeyEvent) -> bool {
 
 /// `Ctrl+Shift+]`: cycle to the next terminal in the pane.
 fn is_terminal_cycle_key(key: KeyEvent) -> bool {
-    let KeyCode::Char(c) = key.code else { return false };
+    let KeyCode::Char(c) = key.code else {
+        return false;
+    };
     if c != ']' && c != '}' {
         return false;
     }
@@ -9306,7 +9331,9 @@ fn is_terminal_cycle_key(key: KeyEvent) -> bool {
 /// raw `[` keycode and the shift-applied `{` since crossterm reports one
 /// or the other depending on terminal flavour.
 fn is_terminal_cycle_back_key(key: KeyEvent) -> bool {
-    let KeyCode::Char(c) = key.code else { return false };
+    let KeyCode::Char(c) = key.code else {
+        return false;
+    };
     if c != '[' && c != '{' {
         return false;
     }
@@ -9413,7 +9440,9 @@ fn copy_to_clipboard(text: &str) -> bool {
 /// selection to the system clipboard. Recognises plain `Ctrl+C` and `Cmd+C`
 /// — there's no SIGINT collision since the editor pane is not a shell.
 fn is_editor_copy_key(key: KeyEvent) -> bool {
-    let KeyCode::Char(c) = key.code else { return false };
+    let KeyCode::Char(c) = key.code else {
+        return false;
+    };
     if !c.eq_ignore_ascii_case(&'c') {
         return false;
     }
@@ -9422,7 +9451,9 @@ fn is_editor_copy_key(key: KeyEvent) -> bool {
 
 /// Cut: `Ctrl+X` / `Cmd+X`.
 fn is_editor_cut_key(key: KeyEvent) -> bool {
-    let KeyCode::Char(c) = key.code else { return false };
+    let KeyCode::Char(c) = key.code else {
+        return false;
+    };
     if !c.eq_ignore_ascii_case(&'x') {
         return false;
     }
@@ -9441,7 +9472,9 @@ fn is_editor_paste_key(key: KeyEvent) -> bool {
 }
 
 fn is_clipboard_paste_key(key: KeyEvent) -> bool {
-    let KeyCode::Char(c) = key.code else { return false };
+    let KeyCode::Char(c) = key.code else {
+        return false;
+    };
     if c == '\u{16}' {
         return true;
     }
@@ -9460,7 +9493,9 @@ fn is_search_editing_shortcut(key: KeyEvent) -> bool {
 
 /// Select-all: `Ctrl+A` / `Cmd+A`.
 fn is_editor_select_all_key(key: KeyEvent) -> bool {
-    let KeyCode::Char(c) = key.code else { return false };
+    let KeyCode::Char(c) = key.code else {
+        return false;
+    };
     if !c.eq_ignore_ascii_case(&'a') {
         return false;
     }
@@ -9470,7 +9505,9 @@ fn is_editor_select_all_key(key: KeyEvent) -> bool {
 /// Undo: `Ctrl+Z` / `Cmd+Z`. Plain Shift is ignored (Shift+Cmd+Z is reserved
 /// for redo, which croft does not implement yet).
 fn is_editor_undo_key(key: KeyEvent) -> bool {
-    let KeyCode::Char(c) = key.code else { return false };
+    let KeyCode::Char(c) = key.code else {
+        return false;
+    };
     if !c.eq_ignore_ascii_case(&'z') {
         return false;
     }
@@ -9489,13 +9526,13 @@ fn chord_status_text(op: char, count: usize) -> String {
 }
 
 fn is_vim_chord_letter(key: KeyEvent, letter: char) -> bool {
-    let KeyCode::Char(c) = key.code else { return false };
+    let KeyCode::Char(c) = key.code else {
+        return false;
+    };
     if c != letter {
         return false;
     }
-    if key.modifiers.contains(KeyModifiers::SHIFT)
-        || key.modifiers.contains(KeyModifiers::ALT)
-    {
+    if key.modifiers.contains(KeyModifiers::SHIFT) || key.modifiers.contains(KeyModifiers::ALT) {
         return false;
     }
     key.modifiers.contains(KeyModifiers::SUPER) || key.modifiers.contains(KeyModifiers::CONTROL)
@@ -9514,7 +9551,9 @@ fn is_vim_chord_y(key: KeyEvent) -> bool {
 }
 
 fn is_vim_goto_bottom(key: KeyEvent) -> bool {
-    let KeyCode::Char(c) = key.code else { return false };
+    let KeyCode::Char(c) = key.code else {
+        return false;
+    };
     if !c.eq_ignore_ascii_case(&'g') {
         return false;
     }
@@ -9525,7 +9564,9 @@ fn is_vim_goto_bottom(key: KeyEvent) -> bool {
 }
 
 fn chord_digit_value(key: KeyEvent) -> Option<usize> {
-    let KeyCode::Char(c) = key.code else { return None };
+    let KeyCode::Char(c) = key.code else {
+        return None;
+    };
     let d = c.to_digit(10)? as usize;
     if key.modifiers.contains(KeyModifiers::ALT) || key.modifiers.contains(KeyModifiers::SHIFT) {
         return None;
@@ -9542,7 +9583,9 @@ fn cmd_only_digit_value(key: KeyEvent) -> Option<usize> {
 }
 
 fn is_plain_letter(key: KeyEvent, letter: char) -> bool {
-    let KeyCode::Char(c) = key.code else { return false };
+    let KeyCode::Char(c) = key.code else {
+        return false;
+    };
     if c != letter {
         return false;
     }
@@ -9552,7 +9595,9 @@ fn is_plain_letter(key: KeyEvent, letter: char) -> bool {
 }
 
 fn is_editor_line_home_key(key: KeyEvent) -> bool {
-    let KeyCode::Char(c) = key.code else { return false };
+    let KeyCode::Char(c) = key.code else {
+        return false;
+    };
     if !c.eq_ignore_ascii_case(&'a') {
         return false;
     }
@@ -9562,7 +9607,9 @@ fn is_editor_line_home_key(key: KeyEvent) -> bool {
 }
 
 fn is_editor_line_end_key(key: KeyEvent) -> bool {
-    let KeyCode::Char(c) = key.code else { return false };
+    let KeyCode::Char(c) = key.code else {
+        return false;
+    };
     if !c.eq_ignore_ascii_case(&'e') {
         return false;
     }
@@ -9572,7 +9619,9 @@ fn is_editor_line_end_key(key: KeyEvent) -> bool {
 }
 
 fn is_editor_kill_to_eol_key(key: KeyEvent) -> bool {
-    let KeyCode::Char(c) = key.code else { return false };
+    let KeyCode::Char(c) = key.code else {
+        return false;
+    };
     if !c.eq_ignore_ascii_case(&'k') {
         return false;
     }
@@ -9582,7 +9631,9 @@ fn is_editor_kill_to_eol_key(key: KeyEvent) -> bool {
 }
 
 fn is_editor_kill_to_bol_key(key: KeyEvent) -> bool {
-    let KeyCode::Char(c) = key.code else { return false };
+    let KeyCode::Char(c) = key.code else {
+        return false;
+    };
     if !c.eq_ignore_ascii_case(&'u') {
         return false;
     }
@@ -9592,7 +9643,9 @@ fn is_editor_kill_to_bol_key(key: KeyEvent) -> bool {
 }
 
 fn is_editor_open_line_below_key(key: KeyEvent) -> bool {
-    let KeyCode::Char(c) = key.code else { return false };
+    let KeyCode::Char(c) = key.code else {
+        return false;
+    };
     if c != 'o' {
         return false;
     }
@@ -9603,7 +9656,9 @@ fn is_editor_open_line_below_key(key: KeyEvent) -> bool {
 }
 
 fn is_editor_open_line_above_key(key: KeyEvent) -> bool {
-    let KeyCode::Char(c) = key.code else { return false };
+    let KeyCode::Char(c) = key.code else {
+        return false;
+    };
     if !c.eq_ignore_ascii_case(&'o') {
         return false;
     }
@@ -9618,7 +9673,9 @@ fn is_editor_open_line_above_key(key: KeyEvent) -> bool {
 
 /// Close active tab: `Ctrl+W` / `Cmd+W`.
 fn is_close_tab_key(key: KeyEvent) -> bool {
-    let KeyCode::Char(c) = key.code else { return false };
+    let KeyCode::Char(c) = key.code else {
+        return false;
+    };
     if !c.eq_ignore_ascii_case(&'w') {
         return false;
     }
@@ -9630,7 +9687,9 @@ fn is_close_tab_key(key: KeyEvent) -> bool {
 /// Cmd+1..9 / Ctrl+1..9 — jump straight to that tab (1-based; returns the
 /// 0-based index). Anything outside that range returns `None`.
 fn jump_to_tab_index(key: KeyEvent) -> Option<usize> {
-    let KeyCode::Char(c) = key.code else { return None };
+    let KeyCode::Char(c) = key.code else {
+        return None;
+    };
     if !key.modifiers.contains(KeyModifiers::SUPER)
         && !key.modifiers.contains(KeyModifiers::META)
         && !key.modifiers.contains(KeyModifiers::CONTROL)
@@ -9680,10 +9739,7 @@ fn drag_target_index(
     Some(dir_idx)
 }
 
-fn drop_target_dir(
-    tree: &crate::widgets::file_tree::FileTree,
-    target_idx: usize,
-) -> PathBuf {
+fn drop_target_dir(tree: &crate::widgets::file_tree::FileTree, target_idx: usize) -> PathBuf {
     tree.nodes
         .get(target_idx)
         .map(|n| n.path.clone())
@@ -9799,10 +9855,7 @@ fn shell_split_drop_payload(s: &str) -> Vec<String> {
             cur.push(c);
             continue;
         }
-        if (c == ' ' || c == '\t' || c == '\n' || c == '\r')
-            && !in_single
-            && !in_double
-        {
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\r') && !in_single && !in_double {
             if !cur.is_empty() {
                 tokens.push(std::mem::take(&mut cur));
             }
@@ -9833,9 +9886,7 @@ fn normalise_dropped_token(raw: &str) -> Option<PathBuf> {
         let mut i = 0;
         while i < bytes.len() {
             if bytes[i] == b'%' && i + 2 < bytes.len() {
-                if let (Some(h), Some(l)) =
-                    (hex_digit(bytes[i + 1]), hex_digit(bytes[i + 2]))
-                {
+                if let (Some(h), Some(l)) = (hex_digit(bytes[i + 1]), hex_digit(bytes[i + 2])) {
                     path.push((h * 16 + l) as char);
                     i += 3;
                     continue;
@@ -9908,12 +9959,7 @@ fn sheet_visible_rows(inner: Rect) -> usize {
 }
 
 fn rect_contains(r: Rect, x: u16, y: u16) -> bool {
-    r.width > 0
-        && r.height > 0
-        && x >= r.x
-        && x < r.x + r.width
-        && y >= r.y
-        && y < r.y + r.height
+    r.width > 0 && r.height > 0 && x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -9964,8 +10010,8 @@ const TERMINAL_CLOSE_LABEL: &str = " - ";
 /// not trigger an editor reload, otherwise the open buffer's selection
 /// is wiped on every benign indexer/atime update on Linux remotes.
 fn event_mutates_content(kind: &notify::EventKind) -> bool {
-    use notify::event::ModifyKind;
     use notify::EventKind;
+    use notify::event::ModifyKind;
     match kind {
         EventKind::Access(_) => false,
         EventKind::Modify(ModifyKind::Metadata(_)) => false,
@@ -10120,14 +10166,28 @@ fn paint_terminal_pane_buttons(
 
     if area.width >= add_w + 2 {
         let x = area.x + area.width - add_w - 1;
-        frame.buffer_mut().set_string(x, y, TERMINAL_ADD_LABEL, style);
-        add_rect = Some(Rect { x, y, width: add_w, height: 1 });
+        frame
+            .buffer_mut()
+            .set_string(x, y, TERMINAL_ADD_LABEL, style);
+        add_rect = Some(Rect {
+            x,
+            y,
+            width: add_w,
+            height: 1,
+        });
     }
     if show_close_button && area.width >= add_w + close_w + 2 {
         // Sit just to the left of the add button.
         let x = area.x + area.width - add_w - close_w - 1;
-        frame.buffer_mut().set_string(x, y, TERMINAL_CLOSE_LABEL, style);
-        close_rect = Some(Rect { x, y, width: close_w, height: 1 });
+        frame
+            .buffer_mut()
+            .set_string(x, y, TERMINAL_CLOSE_LABEL, style);
+        close_rect = Some(Rect {
+            x,
+            y,
+            width: close_w,
+            height: 1,
+        });
     }
     (add_rect, close_rect)
 }
@@ -10232,8 +10292,7 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ =
-                std::fs::set_permissions(&library, std::fs::Permissions::from_mode(0o755));
+            let _ = std::fs::set_permissions(&library, std::fs::Permissions::from_mode(0o755));
         }
         assert!(
             result.is_ok(),
@@ -10356,7 +10415,10 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert!(saw, "workspace write should propagate as a dirty signal");
-        assert!(saw_tree, "workspace write should refresh the tree with the created file");
+        assert!(
+            saw_tree,
+            "workspace write should refresh the tree with the created file"
+        );
         assert!(
             started.elapsed() <= std::time::Duration::from_millis(200),
             "created file should appear in Explorer within 200ms"
@@ -10440,8 +10502,8 @@ mod tests {
     /// reload must only fire for events that mutate content.
     #[test]
     fn drain_fs_events_preserves_editor_selection_on_access_only_event() {
-        use notify::event::{AccessKind, AccessMode, EventKind};
         use notify::Event as NotifyEvent;
+        use notify::event::{AccessKind, AccessMode, EventKind};
         use notify_debouncer_full::DebouncedEvent;
         use std::sync::mpsc;
 
@@ -10483,8 +10545,8 @@ mod tests {
     /// so none should trigger an editor reload that wipes selection.
     #[test]
     fn drain_fs_events_preserves_editor_selection_on_metadata_event() {
-        use notify::event::{EventKind, MetadataKind, ModifyKind};
         use notify::Event as NotifyEvent;
+        use notify::event::{EventKind, MetadataKind, ModifyKind};
         use notify_debouncer_full::DebouncedEvent;
         use std::sync::mpsc;
 
@@ -10523,8 +10585,8 @@ mod tests {
     /// buffer. Guards against an over-broad fix that drops legitimate events.
     #[test]
     fn drain_fs_events_reloads_on_modify_data_event() {
-        use notify::event::{DataChange, EventKind, ModifyKind};
         use notify::Event as NotifyEvent;
+        use notify::event::{DataChange, EventKind, ModifyKind};
         use notify_debouncer_full::DebouncedEvent;
         use std::sync::mpsc;
 
@@ -10556,7 +10618,12 @@ mod tests {
 
     #[test]
     fn rect_contains_basic() {
-        let r = Rect { x: 5, y: 5, width: 10, height: 10 };
+        let r = Rect {
+            x: 5,
+            y: 5,
+            width: 10,
+            height: 10,
+        };
         assert!(rect_contains(r, 5, 5));
         assert!(rect_contains(r, 14, 14));
         assert!(!rect_contains(r, 4, 5));
@@ -10566,7 +10633,12 @@ mod tests {
 
     #[test]
     fn rect_contains_zero_sized_is_empty() {
-        let r = Rect { x: 0, y: 0, width: 0, height: 0 };
+        let r = Rect {
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 0,
+        };
         assert!(!rect_contains(r, 0, 0));
     }
 
@@ -10586,7 +10658,10 @@ mod tests {
             "3 hours ago",
         );
         let (first, rest) = welcome_commit_widths(&c, 42);
-        assert!(first < rest, "first line should reserve room for the timestamp");
+        assert!(
+            first < rest,
+            "first line should reserve room for the timestamp"
+        );
         let lines = wrapped_welcome_commit_subject(&c, 42);
         assert!(lines.len() > 1, "long commit subjects should wrap");
         assert!(lines[0].chars().count() <= first as usize);
@@ -10600,7 +10675,10 @@ mod tests {
             "3 hours ago",
         );
         let compact = welcome_recents_height(Some("https://bitbucket.org/a/b"), &[c], 42);
-        assert!(compact > 1 + 1 + 1, "height must include wrapped commit continuation rows");
+        assert!(
+            compact > 1 + 1 + 1,
+            "height must include wrapped commit continuation rows"
+        );
     }
 
     #[test]
@@ -10654,12 +10732,27 @@ mod tests {
     fn paint_gradient_box_skips_when_rect_runs_off_buffer() {
         // The panic that motivated the bounds clip: an 80x25 buffer asked
         // to render a tall recents box that extended past row 25.
-        let buf_area = Rect { x: 0, y: 0, width: 80, height: 25 };
+        let buf_area = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 25,
+        };
         let mut buf = ratatui::buffer::Buffer::empty(buf_area);
-        let oversized = Rect { x: 0, y: 0, width: 80, height: 60 };
+        let oversized = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 60,
+        };
         // Must not panic; the no-op clip is the contract.
         paint_gradient_box(&mut buf, oversized);
-        let off_top_left = Rect { x: 0, y: 0, width: 80, height: 25 };
+        let off_top_left = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 25,
+        };
         // Sanity: a fitting rect still draws.
         paint_gradient_box(&mut buf, off_top_left);
         assert_eq!(buf[(0, 0)].symbol(), "\u{256d}");
@@ -10691,7 +10784,12 @@ mod tests {
         // switched to Source Control. Set tree.last_area to the OLD,
         // taller rectangle so we can prove the SCM click-handler is no
         // longer dependent on it.
-        app.tree.last_area = Rect { x: 4, y: 1, width: 30, height: 6 };
+        app.tree.last_area = Rect {
+            x: 4,
+            y: 1,
+            width: 30,
+            height: 6,
+        };
         app.set_sidebar_view(SidebarView::SourceControl);
         // Set entries AFTER set_sidebar_view because that path calls
         // refresh_source_control which overwrites entries with the live
@@ -10778,8 +10876,11 @@ mod tests {
         // — that's exactly the `Deleted` (unstaged) state.
         std::fs::remove_file(&f).unwrap();
         let mut app = App::new(root.to_path_buf()).unwrap();
-        app.source_control.entries =
-            vec![ChangeEntry { path: "doomed.txt".into(), kind: ChangeKind::Deleted, ..Default::default() }];
+        app.source_control.entries = vec![ChangeEntry {
+            path: "doomed.txt".into(),
+            kind: ChangeKind::Deleted,
+            ..Default::default()
+        }];
         app.set_sidebar_view(SidebarView::SourceControl);
         app.open_source_control_entry(0);
         let diff = app
@@ -10837,8 +10938,11 @@ mod tests {
             .status();
         std::fs::write(&f, b"print(2)\n").unwrap();
         let mut app = App::new(root.to_path_buf()).unwrap();
-        app.source_control.entries =
-            vec![ChangeEntry { path: "a.py".into(), kind: ChangeKind::Modified, ..Default::default() }];
+        app.source_control.entries = vec![ChangeEntry {
+            path: "a.py".into(),
+            kind: ChangeKind::Modified,
+            ..Default::default()
+        }];
         app.set_sidebar_view(SidebarView::SourceControl);
         app.open_source_control_entry(0);
         assert!(
@@ -10903,7 +11007,12 @@ mod tests {
         app.recent_repo_remote = Some("https://codeberg.org/vitali87/croft".to_string());
         app.welcome_codeberg_badge_osc = Some("\x1b]1337;File=...\x07".to_string());
 
-        let tall = Rect { x: 0, y: 0, width: 120, height: 30 };
+        let tall = Rect {
+            x: 0,
+            y: 0,
+            width: 120,
+            height: 30,
+        };
         let backend = ratatui::backend::TestBackend::new(tall.width, tall.height);
         let mut term = ratatui::Terminal::new(backend).unwrap();
         term.draw(|f| app.render_welcome(f, tall)).unwrap();
@@ -10912,7 +11021,12 @@ mod tests {
             "with a tall welcome area the recents box must fit and the badge cell must be set so the flush emits the OSC-1337 image"
         );
 
-        let tight = Rect { x: 0, y: 0, width: 120, height: 10 };
+        let tight = Rect {
+            x: 0,
+            y: 0,
+            width: 120,
+            height: 10,
+        };
         let backend = ratatui::backend::TestBackend::new(tight.width, tight.height);
         let mut term = ratatui::Terminal::new(backend).unwrap();
         term.draw(|f| app.render_welcome(f, tight)).unwrap();
@@ -10938,7 +11052,12 @@ mod tests {
             when: "1 hour ago".to_string(),
             subject: "feat: do thing".to_string(),
         }];
-        let area = Rect { x: 0, y: 0, width: 120, height: 30 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 120,
+            height: 30,
+        };
         let backend = ratatui::backend::TestBackend::new(area.width, area.height);
         let mut term = ratatui::Terminal::new(backend).unwrap();
         term.draw(|f| app.render_welcome(f, area)).unwrap();
@@ -10963,7 +11082,12 @@ mod tests {
         // of the slogan fragments appear anywhere on the canvas.
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-        let area = Rect { x: 0, y: 0, width: 120, height: 40 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 120,
+            height: 40,
+        };
         let backend = ratatui::backend::TestBackend::new(area.width, area.height);
         let mut term = ratatui::Terminal::new(backend).unwrap();
         term.draw(|f| app.render_welcome(f, area)).unwrap();
@@ -11005,7 +11129,12 @@ mod tests {
                         .to_string(),
             })
             .collect();
-        let area = Rect { x: 0, y: 0, width: 80, height: 25 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 25,
+        };
         let backend = ratatui::backend::TestBackend::new(area.width, area.height);
         let mut term = ratatui::Terminal::new(backend).unwrap();
         term.draw(|f| app.render_welcome(f, area)).unwrap();
@@ -11013,7 +11142,12 @@ mod tests {
 
     #[test]
     fn paint_gradient_box_draws_rounded_corners_with_corner_colours() {
-        let rect = Rect { x: 0, y: 0, width: 8, height: 4 };
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            width: 8,
+            height: 4,
+        };
         let mut buf = ratatui::buffer::Buffer::empty(rect);
         paint_gradient_box(&mut buf, rect);
         assert_eq!(buf[(0, 0)].symbol(), "\u{256d}", "top-left rounded");
@@ -11038,17 +11172,32 @@ mod tests {
 
     #[test]
     fn key_to_bytes_arrows() {
-        assert_eq!(key_to_bytes(key(KeyCode::Up, KeyModifiers::NONE)), b"\x1b[A");
-        assert_eq!(key_to_bytes(key(KeyCode::Down, KeyModifiers::NONE)), b"\x1b[B");
-        assert_eq!(key_to_bytes(key(KeyCode::Right, KeyModifiers::NONE)), b"\x1b[C");
-        assert_eq!(key_to_bytes(key(KeyCode::Left, KeyModifiers::NONE)), b"\x1b[D");
+        assert_eq!(
+            key_to_bytes(key(KeyCode::Up, KeyModifiers::NONE)),
+            b"\x1b[A"
+        );
+        assert_eq!(
+            key_to_bytes(key(KeyCode::Down, KeyModifiers::NONE)),
+            b"\x1b[B"
+        );
+        assert_eq!(
+            key_to_bytes(key(KeyCode::Right, KeyModifiers::NONE)),
+            b"\x1b[C"
+        );
+        assert_eq!(
+            key_to_bytes(key(KeyCode::Left, KeyModifiers::NONE)),
+            b"\x1b[D"
+        );
     }
 
     #[test]
     fn key_to_bytes_enter_tab_backspace() {
         assert_eq!(key_to_bytes(key(KeyCode::Enter, KeyModifiers::NONE)), b"\r");
         assert_eq!(key_to_bytes(key(KeyCode::Tab, KeyModifiers::NONE)), b"\t");
-        assert_eq!(key_to_bytes(key(KeyCode::Backspace, KeyModifiers::NONE)), &[0x7f]);
+        assert_eq!(
+            key_to_bytes(key(KeyCode::Backspace, KeyModifiers::NONE)),
+            &[0x7f]
+        );
     }
 
     #[test]
@@ -11087,13 +11236,22 @@ mod tests {
 
     #[test]
     fn key_to_bytes_plain_arrows_unchanged_when_alt_not_held() {
-        assert_eq!(key_to_bytes(key(KeyCode::Left, KeyModifiers::NONE)), b"\x1b[D");
-        assert_eq!(key_to_bytes(key(KeyCode::Right, KeyModifiers::NONE)), b"\x1b[C");
+        assert_eq!(
+            key_to_bytes(key(KeyCode::Left, KeyModifiers::NONE)),
+            b"\x1b[D"
+        );
+        assert_eq!(
+            key_to_bytes(key(KeyCode::Right, KeyModifiers::NONE)),
+            b"\x1b[C"
+        );
     }
 
     #[test]
     fn key_to_bytes_plain_char_utf8() {
-        assert_eq!(key_to_bytes(key(KeyCode::Char('a'), KeyModifiers::NONE)), b"a");
+        assert_eq!(
+            key_to_bytes(key(KeyCode::Char('a'), KeyModifiers::NONE)),
+            b"a"
+        );
         assert_eq!(
             key_to_bytes(key(KeyCode::Char('é'), KeyModifiers::NONE)),
             "é".as_bytes()
@@ -11102,9 +11260,18 @@ mod tests {
 
     #[test]
     fn key_to_bytes_function_keys() {
-        assert_eq!(key_to_bytes(key(KeyCode::F(1), KeyModifiers::NONE)), b"\x1bOP");
-        assert_eq!(key_to_bytes(key(KeyCode::F(5), KeyModifiers::NONE)), b"\x1b[15~");
-        assert_eq!(key_to_bytes(key(KeyCode::F(12), KeyModifiers::NONE)), b"\x1b[24~");
+        assert_eq!(
+            key_to_bytes(key(KeyCode::F(1), KeyModifiers::NONE)),
+            b"\x1bOP"
+        );
+        assert_eq!(
+            key_to_bytes(key(KeyCode::F(5), KeyModifiers::NONE)),
+            b"\x1b[15~"
+        );
+        assert_eq!(
+            key_to_bytes(key(KeyCode::F(12), KeyModifiers::NONE)),
+            b"\x1b[24~"
+        );
     }
 
     #[test]
@@ -11184,7 +11351,10 @@ mod tests {
         };
         let spans = git_status_spans(&st);
         let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(!joined.contains('●'), "no red bullet — colour signals dirtiness");
+        assert!(
+            !joined.contains('●'),
+            "no red bullet — colour signals dirtiness"
+        );
         let main_span = spans
             .iter()
             .find(|s| s.content.contains("main"))
@@ -11237,47 +11407,86 @@ mod tests {
 
     #[test]
     fn plain_f_does_not_jump_to_search() {
-        assert!(!is_search_jump_key(key(KeyCode::Char('f'), KeyModifiers::NONE)));
+        assert!(!is_search_jump_key(key(
+            KeyCode::Char('f'),
+            KeyModifiers::NONE
+        )));
     }
 
     #[test]
     fn ctrl_c_is_editor_copy_key() {
-        assert!(is_editor_copy_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL)));
+        assert!(is_editor_copy_key(key(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL
+        )));
     }
 
     #[test]
     fn cmd_c_is_editor_copy_key() {
-        assert!(is_editor_copy_key(key(KeyCode::Char('c'), KeyModifiers::SUPER)));
+        assert!(is_editor_copy_key(key(
+            KeyCode::Char('c'),
+            KeyModifiers::SUPER
+        )));
     }
 
     #[test]
     fn plain_c_is_not_editor_copy_key() {
-        assert!(!is_editor_copy_key(key(KeyCode::Char('c'), KeyModifiers::NONE)));
+        assert!(!is_editor_copy_key(key(
+            KeyCode::Char('c'),
+            KeyModifiers::NONE
+        )));
     }
 
     #[test]
     fn ctrl_x_is_editor_cut_key() {
-        assert!(is_editor_cut_key(key(KeyCode::Char('x'), KeyModifiers::CONTROL)));
-        assert!(is_editor_cut_key(key(KeyCode::Char('x'), KeyModifiers::SUPER)));
-        assert!(!is_editor_cut_key(key(KeyCode::Char('x'), KeyModifiers::NONE)));
+        assert!(is_editor_cut_key(key(
+            KeyCode::Char('x'),
+            KeyModifiers::CONTROL
+        )));
+        assert!(is_editor_cut_key(key(
+            KeyCode::Char('x'),
+            KeyModifiers::SUPER
+        )));
+        assert!(!is_editor_cut_key(key(
+            KeyCode::Char('x'),
+            KeyModifiers::NONE
+        )));
     }
 
     #[test]
     fn ctrl_a_is_editor_select_all_key() {
-        assert!(is_editor_select_all_key(key(KeyCode::Char('a'), KeyModifiers::CONTROL)));
-        assert!(is_editor_select_all_key(key(KeyCode::Char('a'), KeyModifiers::SUPER)));
-        assert!(!is_editor_select_all_key(key(KeyCode::Char('a'), KeyModifiers::NONE)));
+        assert!(is_editor_select_all_key(key(
+            KeyCode::Char('a'),
+            KeyModifiers::CONTROL
+        )));
+        assert!(is_editor_select_all_key(key(
+            KeyCode::Char('a'),
+            KeyModifiers::SUPER
+        )));
+        assert!(!is_editor_select_all_key(key(
+            KeyCode::Char('a'),
+            KeyModifiers::NONE
+        )));
     }
 
     #[test]
     fn ctrl_z_is_editor_undo_key() {
-        assert!(is_editor_undo_key(key(KeyCode::Char('z'), KeyModifiers::CONTROL)));
-        assert!(is_editor_undo_key(key(KeyCode::Char('z'), KeyModifiers::SUPER)));
+        assert!(is_editor_undo_key(key(
+            KeyCode::Char('z'),
+            KeyModifiers::CONTROL
+        )));
+        assert!(is_editor_undo_key(key(
+            KeyCode::Char('z'),
+            KeyModifiers::SUPER
+        )));
     }
 
     #[test]
     fn plain_z_is_not_editor_undo_key() {
-        assert!(!is_editor_undo_key(key(KeyCode::Char('z'), KeyModifiers::NONE)));
+        assert!(!is_editor_undo_key(key(
+            KeyCode::Char('z'),
+            KeyModifiers::NONE
+        )));
     }
 
     #[test]
@@ -11297,14 +11506,20 @@ mod tests {
         // For terminals that pass Cmd via the kitty protocol; iTerm2 users
         // can also remap ⌘C → Send Hex Code 0x03 for terminal-pane copies,
         // but for keyboard-protocol-aware terminals we accept Super here.
-        assert!(is_terminal_copy_key(key(KeyCode::Char('c'), KeyModifiers::SUPER)));
+        assert!(is_terminal_copy_key(key(
+            KeyCode::Char('c'),
+            KeyModifiers::SUPER
+        )));
     }
 
     #[test]
     fn plain_ctrl_c_is_not_terminal_copy() {
         // Ctrl+C must remain SIGINT in the embedded shell; it must not be
         // intercepted as the croft copy gesture.
-        assert!(!is_terminal_copy_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL)));
+        assert!(!is_terminal_copy_key(key(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL
+        )));
     }
 
     /// Cmd+C from the croft terminal pane must land the selection on the
@@ -11334,8 +11549,7 @@ mod tests {
             used_native,
             "on macOS, copy_to_clipboard must succeed via NSPasteboard and return true so the call site can skip the OSC 52 fallback (and the host terminal's quirks can't silently drop the write)"
         );
-        let got = crate::clipboard::read_string()
-            .expect("read_string must see what we just wrote");
+        let got = crate::clipboard::read_string().expect("read_string must see what we just wrote");
         assert_eq!(
             got, sentinel,
             "round-trip through the system pasteboard must be byte-exact - if this ever drifts, every Cmd+C from croft is silently lossy"
@@ -11459,7 +11673,10 @@ mod tests {
             .unwrap()
             .selection
             .expect("drag must have produced a diff selection");
-        assert!(sel.has_area(), "drag must produce a non-zero-area selection");
+        assert!(
+            sel.has_area(),
+            "drag must produce a non-zero-area selection"
+        );
 
         // Drive the actual Cmd+C keystroke through handle_key. This is the
         // path the live app takes when the user presses Cmd+C; the
@@ -11588,7 +11805,10 @@ mod tests {
 
     #[test]
     fn ctrl_j_is_recognized_as_terminal_toggle() {
-        assert!(is_terminal_toggle_key(key(KeyCode::Char('j'), KeyModifiers::CONTROL)));
+        assert!(is_terminal_toggle_key(key(
+            KeyCode::Char('j'),
+            KeyModifiers::CONTROL
+        )));
     }
 
     #[test]
@@ -11603,7 +11823,10 @@ mod tests {
 
     #[test]
     fn plain_j_is_not_terminal_toggle() {
-        assert!(!is_terminal_toggle_key(key(KeyCode::Char('j'), KeyModifiers::NONE)));
+        assert!(!is_terminal_toggle_key(key(
+            KeyCode::Char('j'),
+            KeyModifiers::NONE
+        )));
     }
 
     #[test]
@@ -11615,12 +11838,18 @@ mod tests {
 
     #[test]
     fn plain_ctrl_j_is_not_terminal_maximize_key() {
-        assert!(!is_terminal_maximize_key(key(KeyCode::Char('j'), KeyModifiers::CONTROL)));
+        assert!(!is_terminal_maximize_key(key(
+            KeyCode::Char('j'),
+            KeyModifiers::CONTROL
+        )));
     }
 
     #[test]
     fn plain_shift_j_is_not_terminal_maximize_key() {
-        assert!(!is_terminal_maximize_key(key(KeyCode::Char('J'), KeyModifiers::SHIFT)));
+        assert!(!is_terminal_maximize_key(key(
+            KeyCode::Char('J'),
+            KeyModifiers::SHIFT
+        )));
     }
 
     #[test]
@@ -11628,7 +11857,10 @@ mod tests {
         let with_alt = KeyModifiers::CONTROL | KeyModifiers::SHIFT | KeyModifiers::ALT;
         let with_super = KeyModifiers::CONTROL | KeyModifiers::SHIFT | KeyModifiers::SUPER;
         assert!(!is_terminal_maximize_key(key(KeyCode::Char('J'), with_alt)));
-        assert!(!is_terminal_maximize_key(key(KeyCode::Char('J'), with_super)));
+        assert!(!is_terminal_maximize_key(key(
+            KeyCode::Char('J'),
+            with_super
+        )));
     }
 
     #[test]
@@ -11683,8 +11915,7 @@ mod tests {
         term.draw(|f| app.render(f)).unwrap();
         let editor_area_before_maximise = app.editor.last_area;
         assert!(
-            editor_area_before_maximise.width > 0
-                && editor_area_before_maximise.height > 0,
+            editor_area_before_maximise.width > 0 && editor_area_before_maximise.height > 0,
             "precondition: in split layout with an open file the editor must claim a real rectangle, otherwise the bug we're testing for can't manifest"
         );
 
@@ -11793,7 +12024,10 @@ mod tests {
             app.focus_pane(Pane::Editor);
             app.handle_paste(payload_editor_split);
             assert!(
-                app.editor.lines.iter().any(|l| l.contains(payload_editor_split)),
+                app.editor
+                    .lines
+                    .iter()
+                    .any(|l| l.contains(payload_editor_split)),
                 "bracketed paste with editor focus + terminal split must insert into the editor buffer; lines={:?}",
                 app.editor.lines
             );
@@ -11808,7 +12042,10 @@ mod tests {
             app.focus_pane(Pane::Editor);
             app.handle_paste(payload_editor_max);
             assert!(
-                app.editor.lines.iter().any(|l| l.contains(payload_editor_max)),
+                app.editor
+                    .lines
+                    .iter()
+                    .any(|l| l.contains(payload_editor_max)),
                 "bracketed paste with editor focus + terminal maximised must still insert into the editor; lines={:?}",
                 app.editor.lines
             );
@@ -12246,7 +12483,10 @@ mod tests {
             row: screen_y,
             modifiers: KeyModifiers::NONE,
         });
-        assert!(app.focus == Pane::Terminal, "terminal click must focus terminal");
+        assert!(
+            app.focus == Pane::Terminal,
+            "terminal click must focus terminal"
+        );
         app.handle_key(key(KeyCode::Char('c'), KeyModifiers::SUPER))
             .unwrap();
         assert_eq!(
@@ -12393,7 +12633,10 @@ mod tests {
     #[test]
     fn cmd_backspace_is_recognized_as_delete_node() {
         // macOS Finder convention: ⌘⌫ moves the selection to the Trash.
-        assert!(is_delete_node_key(key(KeyCode::Backspace, KeyModifiers::SUPER)));
+        assert!(is_delete_node_key(key(
+            KeyCode::Backspace,
+            KeyModifiers::SUPER
+        )));
     }
 
     #[test]
@@ -12401,12 +12644,18 @@ mod tests {
         // On Mac keyboards the key labeled "delete" reports as Backspace; in
         // the tree pane (the only context this helper is called from) it must
         // trigger deletion to match the user's expectation.
-        assert!(is_delete_node_key(key(KeyCode::Backspace, KeyModifiers::NONE)));
+        assert!(is_delete_node_key(key(
+            KeyCode::Backspace,
+            KeyModifiers::NONE
+        )));
     }
 
     #[test]
     fn ctrl_d_is_not_delete_node() {
-        assert!(!is_delete_node_key(key(KeyCode::Char('d'), KeyModifiers::CONTROL)));
+        assert!(!is_delete_node_key(key(
+            KeyCode::Char('d'),
+            KeyModifiers::CONTROL
+        )));
     }
 
     #[test]
@@ -12414,9 +12663,7 @@ mod tests {
         // We can't easily build a full App in a test (PtyTerminal spawns a real
         // shell), so we exercise the Prompt struct directly via the public
         // helpers it relies on.  This guards the data the prompt carries.
-        use crate::widgets::file_tree::{
-            create_file_in, create_folder_in, validate_new_name,
-        };
+        use crate::widgets::file_tree::{create_file_in, create_folder_in, validate_new_name};
         use tempfile::TempDir;
         let tmp = TempDir::new().unwrap();
         // commit_prompt path: validate → create → returns path on success.
@@ -12504,12 +12751,7 @@ mod tests {
         // or fail the byte assertions.
         let canvas_w = 48u32 * 8; // approx welcome cell w * cell pixel w
         let canvas_h = 14u32 * 16;
-        let bg = image::Rgba([
-            EDITOR_BG_RGB.0,
-            EDITOR_BG_RGB.1,
-            EDITOR_BG_RGB.2,
-            0xff,
-        ]);
+        let bg = image::Rgba([EDITOR_BG_RGB.0, EDITOR_BG_RGB.1, EDITOR_BG_RGB.2, 0xff]);
         let baked = crate::iterm2_inline::fit_image(
             crate::iterm2_inline::WELCOME_LOGO_PNG,
             canvas_w,
@@ -12517,7 +12759,11 @@ mod tests {
             bg,
         )
         .expect("baked welcome PNG");
-        assert_eq!(&baked[..8], b"\x89PNG\r\n\x1a\n", "fit_image must emit a PNG");
+        assert_eq!(
+            &baked[..8],
+            b"\x89PNG\r\n\x1a\n",
+            "fit_image must emit a PNG"
+        );
         let osc = crate::iterm2_inline::build_inline_image_osc(&baked, 48, 14, false);
         assert!(osc.starts_with("\x1b]1337;File=inline=1"));
         assert!(osc.ends_with('\x07'));
@@ -12564,7 +12810,9 @@ mod tests {
         // We only need the disambiguation bit, not the all-keys bit.
         let f = keyboard_enhancement_flags();
         assert!(
-            !f.contains(crossterm::event::KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES),
+            !f.contains(
+                crossterm::event::KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
+            ),
             "we should not opt into REPORT_ALL_KEYS_AS_ESCAPE_CODES"
         );
     }
@@ -12626,14 +12874,8 @@ mod tests {
         std::fs::write(&f, "hi").unwrap();
         let n = file_node(&f);
         let target = f.parent().unwrap().to_path_buf();
-        let items = build_tree_context_menu_items(
-            Some(&n),
-            tmp.path(),
-            &[f.clone()],
-            &target,
-            None,
-            None,
-        );
+        let items =
+            build_tree_context_menu_items(Some(&n), tmp.path(), &[f.clone()], &target, None, None);
         let labels: Vec<&str> = items.iter().map(|(s, _)| s.as_str()).collect();
         assert_eq!(
             labels,
@@ -12648,7 +12890,10 @@ mod tests {
             ],
         );
         assert!(matches!(&items[0].1, MenuAction::Create(CreateKind::File)));
-        assert!(matches!(&items[1].1, MenuAction::Create(CreateKind::Folder)));
+        assert!(matches!(
+            &items[1].1,
+            MenuAction::Create(CreateKind::Folder)
+        ));
         assert!(matches!(&items[2].1, MenuAction::Cut(ps) if ps == &vec![f.clone()]));
         assert!(matches!(&items[3].1, MenuAction::Copy(ps) if ps == &vec![f.clone()]));
         assert!(matches!(&items[4].1, MenuAction::Rename(p) if p == &f));
@@ -12658,9 +12903,18 @@ mod tests {
 
     #[test]
     fn explorer_shortcut_predicates_recognise_expected_keys() {
-        assert!(is_tree_new_file_key(key(KeyCode::Char('f'), KeyModifiers::SUPER)));
-        assert!(is_tree_new_file_key(key(KeyCode::Char('F'), KeyModifiers::CONTROL)));
-        assert!(!is_tree_new_file_key(key(KeyCode::Char('f'), KeyModifiers::NONE)));
+        assert!(is_tree_new_file_key(key(
+            KeyCode::Char('f'),
+            KeyModifiers::SUPER
+        )));
+        assert!(is_tree_new_file_key(key(
+            KeyCode::Char('F'),
+            KeyModifiers::CONTROL
+        )));
+        assert!(!is_tree_new_file_key(key(
+            KeyCode::Char('f'),
+            KeyModifiers::NONE
+        )));
         // Shift+Super disqualifies New File so Cmd+Shift+F can fall through to
         // the global Search jump (New Folder now lives on Cmd+Shift+N).
         assert!(!is_tree_new_file_key(key(
@@ -12688,24 +12942,63 @@ mod tests {
             "Cmd+Shift+F is no longer the New Folder chord — it must fall through to the global Search jump"
         );
 
-        assert!(is_tree_rename_key(key(KeyCode::Char('r'), KeyModifiers::SUPER)));
+        assert!(is_tree_rename_key(key(
+            KeyCode::Char('r'),
+            KeyModifiers::SUPER
+        )));
         assert!(is_tree_rename_key(key(KeyCode::F(2), KeyModifiers::NONE)));
-        assert!(!is_tree_rename_key(key(KeyCode::Char('r'), KeyModifiers::NONE)));
+        assert!(!is_tree_rename_key(key(
+            KeyCode::Char('r'),
+            KeyModifiers::NONE
+        )));
 
-        assert!(is_tree_make_root_key(key(KeyCode::Char('/'), KeyModifiers::SUPER)));
-        assert!(is_tree_make_root_key(key(KeyCode::Char('/'), KeyModifiers::CONTROL)));
-        assert!(!is_tree_make_root_key(key(KeyCode::Char('/'), KeyModifiers::NONE)));
+        assert!(is_tree_make_root_key(key(
+            KeyCode::Char('/'),
+            KeyModifiers::SUPER
+        )));
+        assert!(is_tree_make_root_key(key(
+            KeyCode::Char('/'),
+            KeyModifiers::CONTROL
+        )));
+        assert!(!is_tree_make_root_key(key(
+            KeyCode::Char('/'),
+            KeyModifiers::NONE
+        )));
 
         let cmd_shift = KeyModifiers::SUPER | KeyModifiers::SHIFT;
         let ctrl_shift = KeyModifiers::CONTROL | KeyModifiers::SHIFT;
-        assert!(is_tree_make_parent_root_key(key(KeyCode::Char('/'), cmd_shift)));
-        assert!(is_tree_make_parent_root_key(key(KeyCode::Char('/'), ctrl_shift)));
-        assert!(is_tree_make_parent_root_key(key(KeyCode::Char('?'), KeyModifiers::SUPER)));
-        assert!(is_tree_make_parent_root_key(key(KeyCode::Char('?'), KeyModifiers::CONTROL)));
-        assert!(is_tree_make_parent_root_key(key(KeyCode::Char('?'), cmd_shift)));
-        assert!(!is_tree_make_parent_root_key(key(KeyCode::Char('/'), KeyModifiers::SUPER)));
-        assert!(!is_tree_make_parent_root_key(key(KeyCode::Char('/'), KeyModifiers::NONE)));
-        assert!(!is_tree_make_parent_root_key(key(KeyCode::Char('?'), KeyModifiers::NONE)));
+        assert!(is_tree_make_parent_root_key(key(
+            KeyCode::Char('/'),
+            cmd_shift
+        )));
+        assert!(is_tree_make_parent_root_key(key(
+            KeyCode::Char('/'),
+            ctrl_shift
+        )));
+        assert!(is_tree_make_parent_root_key(key(
+            KeyCode::Char('?'),
+            KeyModifiers::SUPER
+        )));
+        assert!(is_tree_make_parent_root_key(key(
+            KeyCode::Char('?'),
+            KeyModifiers::CONTROL
+        )));
+        assert!(is_tree_make_parent_root_key(key(
+            KeyCode::Char('?'),
+            cmd_shift
+        )));
+        assert!(!is_tree_make_parent_root_key(key(
+            KeyCode::Char('/'),
+            KeyModifiers::SUPER
+        )));
+        assert!(!is_tree_make_parent_root_key(key(
+            KeyCode::Char('/'),
+            KeyModifiers::NONE
+        )));
+        assert!(!is_tree_make_parent_root_key(key(
+            KeyCode::Char('?'),
+            KeyModifiers::NONE
+        )));
         assert!(!is_tree_make_root_key(key(KeyCode::Char('/'), cmd_shift)));
     }
 
@@ -12853,11 +13146,18 @@ mod tests {
         assert!(
             matches!(
                 app.prompt.as_ref(),
-                Some(Prompt { kind: PromptKind::Create(CreateKind::Folder), .. })
+                Some(Prompt {
+                    kind: PromptKind::Create(CreateKind::Folder),
+                    ..
+                })
             ),
             "Explorer-focused Cmd+Shift+N must open a New Folder prompt"
         );
-        assert_eq!(app.sidebar_view, SidebarView::Explorer, "must NOT jump to Search");
+        assert_eq!(
+            app.sidebar_view,
+            SidebarView::Explorer,
+            "must NOT jump to Search"
+        );
     }
 
     #[test]
@@ -12912,7 +13212,9 @@ mod tests {
         assert_eq!(shortcut_for(&MenuAction::Rename(p.clone())), Some("⌘R"));
         assert_eq!(shortcut_for(&MenuAction::MakeRoot(p.clone())), Some("⌘/"));
         assert_eq!(
-            shortcut_for(&MenuAction::Delete { paths: vec![p.clone()] }),
+            shortcut_for(&MenuAction::Delete {
+                paths: vec![p.clone()]
+            }),
             Some("⌫")
         );
         // Compare actions have no keybinding (no shortcut shown).
@@ -12929,14 +13231,8 @@ mod tests {
         let d = tmp.path().join("project_a");
         std::fs::create_dir(&d).unwrap();
         let n = dir_node(&d);
-        let items = build_tree_context_menu_items(
-            Some(&n),
-            tmp.path(),
-            &[d.clone()],
-            &d,
-            None,
-            None,
-        );
+        let items =
+            build_tree_context_menu_items(Some(&n), tmp.path(), &[d.clone()], &d, None, None);
         let labels: Vec<&str> = items.iter().map(|(s, _)| s.as_str()).collect();
         assert!(
             labels.contains(&"Make root"),
@@ -12959,14 +13255,8 @@ mod tests {
         std::fs::write(&f, "hi").unwrap();
         let n = file_node(&f);
         let target = f.parent().unwrap().to_path_buf();
-        let items = build_tree_context_menu_items(
-            Some(&n),
-            tmp.path(),
-            &[f.clone()],
-            &target,
-            None,
-            None,
-        );
+        let items =
+            build_tree_context_menu_items(Some(&n), tmp.path(), &[f.clone()], &target, None, None);
         let labels: Vec<&str> = items.iter().map(|(s, _)| s.as_str()).collect();
         assert!(
             !labels.contains(&"Make root"),
@@ -13003,7 +13293,10 @@ mod tests {
             KeyModifiers::SUPER | KeyModifiers::SHIFT,
         ));
 
-        assert!(handled, "Cmd+Shift+/ must be handled by the Explorer dispatcher");
+        assert!(
+            handled,
+            "Cmd+Shift+/ must be handled by the Explorer dispatcher"
+        );
         assert_eq!(app.workspace_root, inner);
         assert_eq!(app.tree.root, inner);
     }
@@ -13028,10 +13321,7 @@ mod tests {
         app.focus = Pane::Tree;
         app.sidebar_view = SidebarView::Explorer;
 
-        let handled = app.handle_explorer_shortcut(key(
-            KeyCode::Char('?'),
-            KeyModifiers::SUPER,
-        ));
+        let handled = app.handle_explorer_shortcut(key(KeyCode::Char('?'), KeyModifiers::SUPER));
 
         assert!(handled);
         assert_eq!(app.workspace_root, mid);
@@ -13065,10 +13355,7 @@ mod tests {
         std::fs::create_dir(&project).unwrap();
         let mut app = App::new(tmp.path().to_path_buf()).unwrap();
         let original_root = app.tree.root.clone();
-        app.dispatch_menu_action(
-            MenuAction::MakeRoot(project.clone()),
-            project.clone(),
-        );
+        app.dispatch_menu_action(MenuAction::MakeRoot(project.clone()), project.clone());
         assert_ne!(app.tree.root, original_root);
         assert_eq!(app.tree.root, project);
         assert_eq!(app.workspace_root, project);
@@ -13108,18 +13395,20 @@ mod tests {
         std::fs::create_dir(&d).unwrap();
         let n = dir_node(&d);
         let target = d.clone();
-        let items = build_tree_context_menu_items(
-            Some(&n),
-            tmp.path(),
-            &[d.clone()],
-            &target,
-            None,
-            None,
-        );
+        let items =
+            build_tree_context_menu_items(Some(&n), tmp.path(), &[d.clone()], &target, None, None);
         let labels: Vec<&str> = items.iter().map(|(s, _)| s.as_str()).collect();
         assert_eq!(
             labels,
-            ["New File", "New Folder", "Cut", "Copy", "Rename", "Make root", "Delete"],
+            [
+                "New File",
+                "New Folder",
+                "Cut",
+                "Copy",
+                "Rename",
+                "Make root",
+                "Delete"
+            ],
         );
     }
 
@@ -13144,7 +13433,16 @@ mod tests {
         let labels: Vec<&str> = items.iter().map(|(s, _)| s.as_str()).collect();
         assert_eq!(
             labels,
-            ["New File", "New Folder", "Cut", "Copy", "Paste", "Rename", "Make root", "Delete"],
+            [
+                "New File",
+                "New Folder",
+                "Cut",
+                "Copy",
+                "Paste",
+                "Rename",
+                "Make root",
+                "Delete"
+            ],
         );
     }
 
@@ -13199,26 +13497,37 @@ mod tests {
         app.editor.open_diff(&f1, &f2).unwrap();
         // Pretend the editor inner is 12 rows tall (page = 10 after the
         // header + footer reservation).
-        app.editor.last_inner = Rect { x: 0, y: 0, width: 80, height: 12 };
+        app.editor.last_inner = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 12,
+        };
         app.focus_pane(Pane::Editor);
 
         // Down once → +1.
-        app.handle_key(key(KeyCode::Down, KeyModifiers::NONE)).unwrap();
+        app.handle_key(key(KeyCode::Down, KeyModifiers::NONE))
+            .unwrap();
         assert_eq!(app.editor.diff.as_ref().unwrap().scroll, 1);
         // PageDown → +page (10).
-        app.handle_key(key(KeyCode::PageDown, KeyModifiers::NONE)).unwrap();
+        app.handle_key(key(KeyCode::PageDown, KeyModifiers::NONE))
+            .unwrap();
         assert_eq!(app.editor.diff.as_ref().unwrap().scroll, 11);
         // Up once → -1.
-        app.handle_key(key(KeyCode::Up, KeyModifiers::NONE)).unwrap();
+        app.handle_key(key(KeyCode::Up, KeyModifiers::NONE))
+            .unwrap();
         assert_eq!(app.editor.diff.as_ref().unwrap().scroll, 10);
         // PageUp → -page.
-        app.handle_key(key(KeyCode::PageUp, KeyModifiers::NONE)).unwrap();
+        app.handle_key(key(KeyCode::PageUp, KeyModifiers::NONE))
+            .unwrap();
         assert_eq!(app.editor.diff.as_ref().unwrap().scroll, 0);
         // Home / End.
-        app.handle_key(key(KeyCode::End, KeyModifiers::NONE)).unwrap();
+        app.handle_key(key(KeyCode::End, KeyModifiers::NONE))
+            .unwrap();
         let total = app.editor.diff.as_ref().unwrap().rows.len();
         assert_eq!(app.editor.diff.as_ref().unwrap().scroll, total);
-        app.handle_key(key(KeyCode::Home, KeyModifiers::NONE)).unwrap();
+        app.handle_key(key(KeyCode::Home, KeyModifiers::NONE))
+            .unwrap();
         assert_eq!(app.editor.diff.as_ref().unwrap().scroll, 0);
     }
 
@@ -13274,10 +13583,7 @@ mod tests {
         app.handle_key(key(KeyCode::Char('d'), KeyModifiers::CONTROL))
             .unwrap();
         assert!(app.compare_anchor.is_none(), "anchor consumed by compare");
-        assert!(
-            app.editor.diff.is_some(),
-            "editor must now hold a diff tab"
-        );
+        assert!(app.editor.diff.is_some(), "editor must now hold a diff tab");
     }
 
     #[test]
@@ -13290,18 +13596,27 @@ mod tests {
         std::fs::write(&f1, format!("{long_line}\n")).unwrap();
         std::fs::write(&f2, format!("{long_line}y\n")).unwrap();
         app.editor.open_diff(&f1, &f2).unwrap();
-        app.editor.last_inner = Rect { x: 0, y: 0, width: 80, height: 12 };
+        app.editor.last_inner = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 12,
+        };
         app.focus_pane(Pane::Editor);
 
-        app.handle_key(key(KeyCode::Right, KeyModifiers::NONE)).unwrap();
+        app.handle_key(key(KeyCode::Right, KeyModifiers::NONE))
+            .unwrap();
         assert_eq!(app.editor.diff.as_ref().unwrap().scroll_x, 4);
-        app.handle_key(key(KeyCode::Right, KeyModifiers::NONE)).unwrap();
+        app.handle_key(key(KeyCode::Right, KeyModifiers::NONE))
+            .unwrap();
         assert_eq!(app.editor.diff.as_ref().unwrap().scroll_x, 8);
-        app.handle_key(key(KeyCode::Left, KeyModifiers::NONE)).unwrap();
+        app.handle_key(key(KeyCode::Left, KeyModifiers::NONE))
+            .unwrap();
         assert_eq!(app.editor.diff.as_ref().unwrap().scroll_x, 4);
         // Vertical Up/Down still go to diff.scroll, not scroll_x.
         let before_y = app.editor.diff.as_ref().unwrap().scroll;
-        app.handle_key(key(KeyCode::Down, KeyModifiers::NONE)).unwrap();
+        app.handle_key(key(KeyCode::Down, KeyModifiers::NONE))
+            .unwrap();
         assert!(app.editor.diff.as_ref().unwrap().scroll >= before_y);
     }
 
@@ -13315,7 +13630,12 @@ mod tests {
         std::fs::write(&f1, format!("{long}\n")).unwrap();
         std::fs::write(&f2, format!("{long}\n")).unwrap();
         app.editor.open_diff(&f1, &f2).unwrap();
-        app.editor.last_area = Rect { x: 0, y: 0, width: 80, height: 20 };
+        app.editor.last_area = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 20,
+        };
         app.editor.last_full_area = app.editor.last_area;
         app.handle_mouse(crossterm::event::MouseEvent {
             kind: crossterm::event::MouseEventKind::ScrollRight,
@@ -13345,8 +13665,18 @@ mod tests {
         app.sidebar_view = SidebarView::Search;
         app.show_tree = true;
         // Pretend a render captured the search panel at this rect.
-        app.search.last_area = Rect { x: 0, y: 0, width: 60, height: 30 };
-        app.search.last_inner = Rect { x: 1, y: 1, width: 58, height: 28 };
+        app.search.last_area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 30,
+        };
+        app.search.last_inner = Rect {
+            x: 1,
+            y: 1,
+            width: 58,
+            height: 28,
+        };
         // 1000 hits, well past anything that can fit in 30 rows.
         app.search.hits = (0..1000)
             .map(|i| crate::widgets::search::SearchHit {
@@ -13393,7 +13723,12 @@ mod tests {
                 line_text: format!("line {i}"),
             })
             .collect();
-        let area = Rect { x: 0, y: 0, width: 60, height: 30 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 30,
+        };
         let mut buf = ratatui::buffer::Buffer::empty(area);
         ratatui::widgets::Widget::render(&mut app.search, area, &mut buf);
         assert!(
@@ -13412,7 +13747,12 @@ mod tests {
         std::fs::write(&f2, "1\n2\n3\n4\n5\n6\n").unwrap();
         app.editor.open_diff(&f1, &f2).unwrap();
         // Place the editor pane somewhere the mouse can hit it.
-        app.editor.last_area = Rect { x: 0, y: 0, width: 80, height: 20 };
+        app.editor.last_area = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 20,
+        };
         app.editor.last_full_area = app.editor.last_area;
         app.handle_mouse(crossterm::event::MouseEvent {
             kind: crossterm::event::MouseEventKind::ScrollDown,
@@ -13444,7 +13784,12 @@ mod tests {
         // rows. Origin at y=6 would make the menu run from row 6 to row
         // 14 (off-screen). The renderer (and hit-test) clamp y to
         // 12 - 9 = 3.
-        app.last_frame_area = Rect { x: 0, y: 0, width: 60, height: 12 };
+        app.last_frame_area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 12,
+        };
         let f = tmp.path().join("file.txt");
         std::fs::write(&f, "x").unwrap();
         let n = crate::widgets::file_tree::Node {
@@ -13455,14 +13800,8 @@ mod tests {
             loaded: true,
         };
         let target = f.parent().unwrap().to_path_buf();
-        let items = build_tree_context_menu_items(
-            Some(&n),
-            tmp.path(),
-            &[f.clone()],
-            &target,
-            None,
-            None,
-        );
+        let items =
+            build_tree_context_menu_items(Some(&n), tmp.path(), &[f.clone()], &target, None, None);
         // Sanity: items[5] is "Select for Compare" after the New
         // File… / New Folder… prefix lifted everything down by two.
         assert!(matches!(&items[5].1, MenuAction::SelectForCompare(_)));
@@ -13474,8 +13813,13 @@ mod tests {
         });
         // The visible "Select for Compare" row sits at clipped.y + 1
         // (top border) + 5 (item index) = 3 + 1 + 5 = 9.
-        let idx = app.menu_item_at(11, 9).expect("hit must land inside the menu");
-        assert_eq!(idx, 5, "click on visible row 9 must map to item 5 (Select for Compare)");
+        let idx = app
+            .menu_item_at(11, 9)
+            .expect("hit must land inside the menu");
+        assert_eq!(
+            idx, 5,
+            "click on visible row 9 must map to item 5 (Select for Compare)"
+        );
     }
 
     #[test]
@@ -13496,11 +13840,15 @@ mod tests {
         );
         let kinds: Vec<&MenuAction> = items.iter().map(|(_, a)| a).collect();
         assert!(
-            kinds.iter().any(|a| matches!(a, MenuAction::CompareWithSelected { .. })),
+            kinds
+                .iter()
+                .any(|a| matches!(a, MenuAction::CompareWithSelected { .. })),
             "Compare with Selected must be offered when an anchor is set"
         );
         assert!(
-            kinds.iter().any(|a| matches!(a, MenuAction::SelectForCompare(_))),
+            kinds
+                .iter()
+                .any(|a| matches!(a, MenuAction::SelectForCompare(_))),
             "Select for Compare must always be offered for single files"
         );
     }
@@ -13521,7 +13869,9 @@ mod tests {
         );
         let kinds: Vec<&MenuAction> = items.iter().map(|(_, a)| a).collect();
         assert!(
-            !kinds.iter().any(|a| matches!(a, MenuAction::CompareWithSelected { .. })),
+            !kinds
+                .iter()
+                .any(|a| matches!(a, MenuAction::CompareWithSelected { .. })),
             "Compare with Selected must not appear against itself"
         );
     }
@@ -13553,14 +13903,7 @@ mod tests {
     #[test]
     fn tree_context_menu_on_empty_space_offers_new_file_and_new_folder_only() {
         let tmp = tempfile::tempdir().unwrap();
-        let items = build_tree_context_menu_items(
-            None,
-            tmp.path(),
-            &[],
-            tmp.path(),
-            None,
-            None,
-        );
+        let items = build_tree_context_menu_items(None, tmp.path(), &[], tmp.path(), None, None);
         let labels: Vec<&str> = items.iter().map(|(s, _)| s.as_str()).collect();
         assert_eq!(labels, ["New File", "New Folder"]);
         assert!(matches!(items[0].1, MenuAction::Create(CreateKind::File)));
@@ -13574,14 +13917,8 @@ mod tests {
             mode: ExplorerClipMode::Copy,
             paths: vec![tmp.path().join("x.txt")],
         };
-        let items = build_tree_context_menu_items(
-            None,
-            tmp.path(),
-            &[],
-            tmp.path(),
-            Some(&clip),
-            None,
-        );
+        let items =
+            build_tree_context_menu_items(None, tmp.path(), &[], tmp.path(), Some(&clip), None);
         let labels: Vec<&str> = items.iter().map(|(s, _)| s.as_str()).collect();
         assert_eq!(labels, ["New File", "New Folder", "Paste"]);
     }
@@ -13600,7 +13937,10 @@ mod tests {
         std::fs::write(&f, "hi").unwrap();
         app.editor.open_pinned(&f).unwrap();
         assert!(app.consume_welcome_image_clear(), "first call must fire");
-        assert!(!app.welcome_image_displayed, "flag must reset after consume");
+        assert!(
+            !app.welcome_image_displayed,
+            "flag must reset after consume"
+        );
         assert!(
             !app.consume_welcome_image_clear(),
             "second call must be a no-op until welcome is re-shown"
@@ -13656,11 +13996,20 @@ mod tests {
         // microsecond range.
         let tmp = tempfile::tempdir().unwrap();
         let _ = std::process::Command::new("git")
-            .args(["-C"]).arg(tmp.path()).args(["init", "-q", "-b", "main"]).output();
+            .args(["-C"])
+            .arg(tmp.path())
+            .args(["init", "-q", "-b", "main"])
+            .output();
         let _ = std::process::Command::new("git")
-            .args(["-C"]).arg(tmp.path()).args(["config", "user.email", "a@b"]).status();
+            .args(["-C"])
+            .arg(tmp.path())
+            .args(["config", "user.email", "a@b"])
+            .status();
         let _ = std::process::Command::new("git")
-            .args(["-C"]).arg(tmp.path()).args(["config", "user.name", "a"]).status();
+            .args(["-C"])
+            .arg(tmp.path())
+            .args(["config", "user.name", "a"])
+            .status();
         std::fs::write(tmp.path().join("dirty.txt"), "x").unwrap();
         let mut app = App::new(tmp.path().to_path_buf()).unwrap();
         // Pretend the worker is idle by draining its initial Status
@@ -13766,14 +14115,8 @@ mod tests {
         // (the root cannot be renamed or moved to trash from inside croft).
         let tmp = tempfile::tempdir().unwrap();
         let n = dir_node(tmp.path());
-        let items = build_tree_context_menu_items(
-            Some(&n),
-            tmp.path(),
-            &[],
-            tmp.path(),
-            None,
-            None,
-        );
+        let items =
+            build_tree_context_menu_items(Some(&n), tmp.path(), &[], tmp.path(), None, None);
         let labels: Vec<&str> = items.iter().map(|(s, _)| s.as_str()).collect();
         assert_eq!(labels, ["New File", "New Folder"]);
     }
@@ -13828,7 +14171,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(tmp.path().to_path_buf()).unwrap();
         app.set_sidebar_view(SidebarView::Search);
-        assert!(app.focus == Pane::Tree, "Search view focuses the side panel");
+        assert!(
+            app.focus == Pane::Tree,
+            "Search view focuses the side panel"
+        );
         app.search.query = String::from("alpha");
         app.handle_key(key(KeyCode::Char('a'), KeyModifiers::SUPER))
             .unwrap();
@@ -13943,24 +14289,29 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let p = tmp.path();
         let _ = std::process::Command::new("git")
-            .args(["-C"]).arg(p)
+            .args(["-C"])
+            .arg(p)
             .args(["init", "-q", "-b", "main"])
             .output();
         let _ = std::process::Command::new("git")
-            .args(["-C"]).arg(p)
+            .args(["-C"])
+            .arg(p)
             .args(["config", "user.email", "a@b"])
             .status();
         let _ = std::process::Command::new("git")
-            .args(["-C"]).arg(p)
+            .args(["-C"])
+            .arg(p)
             .args(["config", "user.name", "a"])
             .status();
         std::fs::write(p.join("seed.txt"), b"seed\n").unwrap();
         let _ = std::process::Command::new("git")
-            .args(["-C"]).arg(p)
+            .args(["-C"])
+            .arg(p)
             .args(["add", "seed.txt"])
             .status();
         let _ = std::process::Command::new("git")
-            .args(["-C"]).arg(p)
+            .args(["-C"])
+            .arg(p)
             .args(["commit", "-q", "-m", "init"])
             .status();
         tmp
@@ -13993,8 +14344,9 @@ mod tests {
                 .source_control
                 .entries
                 .iter()
-                .any(|e| e.path == "seed.txt"
-                    && e.kind == crate::git::ChangeKind::Modified)),
+                .any(
+                    |e| e.path == "seed.txt" && e.kind == crate::git::ChangeKind::Modified
+                )),
             "preconditions: seed.txt must appear as Modified"
         );
         let idx = app
@@ -14009,8 +14361,9 @@ mod tests {
                 .source_control
                 .entries
                 .iter()
-                .any(|e| e.path == "seed.txt"
-                    && e.kind == crate::git::ChangeKind::StagedModified)),
+                .any(
+                    |e| e.path == "seed.txt" && e.kind == crate::git::ChangeKind::StagedModified
+                )),
             "after stage_source_control_entry the file must read as StagedModified; saw {:?}",
             app.source_control.entries,
         );
@@ -14064,7 +14417,10 @@ mod tests {
             .unwrap();
         app.request_discard_source_control_entry(idx);
         app.confirm_pending_discard();
-        assert!(app.pending_discard.is_none(), "modal must close after confirm");
+        assert!(
+            app.pending_discard.is_none(),
+            "modal must close after confirm"
+        );
         assert_eq!(
             std::fs::read_to_string(tmp.path().join("seed.txt")).unwrap(),
             "seed\n",
@@ -14082,8 +14438,7 @@ mod tests {
             a.source_control
                 .entries
                 .iter()
-                .any(|e| e.path == "scratch.txt"
-                    && e.kind == crate::git::ChangeKind::Untracked)
+                .any(|e| e.path == "scratch.txt" && e.kind == crate::git::ChangeKind::Untracked)
         });
         let idx = app
             .source_control
@@ -14168,8 +14523,9 @@ mod tests {
                 .source_control
                 .entries
                 .iter()
-                .any(|e| e.path == "seed.txt"
-                    && e.kind == crate::git::ChangeKind::StagedModified)),
+                .any(
+                    |e| e.path == "seed.txt" && e.kind == crate::git::ChangeKind::StagedModified
+                )),
             "clicking the stage cell must run `git add` against that entry"
         );
     }
@@ -14369,8 +14725,7 @@ mod tests {
             app.source_control
                 .entries
                 .iter()
-                .any(|e| e.path == "seed.txt"
-                    && e.kind == crate::git::ChangeKind::Modified),
+                .any(|e| e.path == "seed.txt" && e.kind == crate::git::ChangeKind::Modified),
             "seed.txt must remain unstaged (single-row stage scope)"
         );
     }
@@ -14396,7 +14751,8 @@ mod tests {
         app.source_control.message_cursor = app.source_control.message.chars().count();
         app.handle_source_control_key(key(KeyCode::Enter, KeyModifiers::SUPER));
         let log = std::process::Command::new("git")
-            .args(["-C"]).arg(tmp.path())
+            .args(["-C"])
+            .arg(tmp.path())
             .args(["log", "--oneline"])
             .output()
             .unwrap();
@@ -14414,16 +14770,19 @@ mod tests {
         // somewhere to send.
         let remote = tempfile::tempdir().unwrap();
         let _ = std::process::Command::new("git")
-            .args(["-C"]).arg(remote.path())
+            .args(["-C"])
+            .arg(remote.path())
             .args(["init", "--bare", "-q", "-b", "main"])
             .status();
         let _ = std::process::Command::new("git")
-            .args(["-C"]).arg(tmp.path())
+            .args(["-C"])
+            .arg(tmp.path())
             .args(["remote", "add", "origin"])
             .arg(remote.path())
             .status();
         let _ = std::process::Command::new("git")
-            .args(["-C"]).arg(tmp.path())
+            .args(["-C"])
+            .arg(tmp.path())
             .args(["push", "-u", "origin", "main"])
             .status();
         // Make a tracked change and stage it so commit-all-tracked has
@@ -14443,7 +14802,8 @@ mod tests {
         // Verify the remote received the commit (its log now reports two
         // commits — the initial push + our new one).
         let log = std::process::Command::new("git")
-            .args(["-C"]).arg(remote.path())
+            .args(["-C"])
+            .arg(remote.path())
             .args(["log", "--oneline"])
             .output()
             .unwrap();
@@ -14461,16 +14821,16 @@ mod tests {
     #[test]
     fn opening_a_modified_file_diff_parks_scroll_on_the_first_change_hunk() {
         let tmp = make_committed_repo();
-        let big = (0..50)
-            .map(|i| format!("line {i}\n"))
-            .collect::<String>();
+        let big = (0..50).map(|i| format!("line {i}\n")).collect::<String>();
         std::fs::write(tmp.path().join("seed.txt"), &big).unwrap();
         let _ = std::process::Command::new("git")
-            .args(["-C"]).arg(tmp.path())
+            .args(["-C"])
+            .arg(tmp.path())
             .args(["add", "seed.txt"])
             .status();
         let _ = std::process::Command::new("git")
-            .args(["-C"]).arg(tmp.path())
+            .args(["-C"])
+            .arg(tmp.path())
             .args(["commit", "-q", "-m", "big seed"])
             .status();
         // Now change a line deep in the file so the first hunk lives well
@@ -14508,16 +14868,16 @@ mod tests {
     fn f7_in_the_diff_view_jumps_to_the_next_change_hunk() {
         let tmp = make_committed_repo();
         // Build a multi-hunk file: edits at lines 10 and 40.
-        let original: String = (0..50)
-            .map(|i| format!("line {i}\n"))
-            .collect();
+        let original: String = (0..50).map(|i| format!("line {i}\n")).collect();
         std::fs::write(tmp.path().join("seed.txt"), &original).unwrap();
         let _ = std::process::Command::new("git")
-            .args(["-C"]).arg(tmp.path())
+            .args(["-C"])
+            .arg(tmp.path())
             .args(["add", "seed.txt"])
             .status();
         let _ = std::process::Command::new("git")
-            .args(["-C"]).arg(tmp.path())
+            .args(["-C"])
+            .arg(tmp.path())
             .args(["commit", "-q", "-m", "seed"])
             .status();
         let mut edited: Vec<String> = original.lines().map(str::to_string).collect();
@@ -14651,9 +15011,11 @@ mod tests {
         app.editor.lines = vec![String::from("hello world rest")];
         app.editor.cursor_row = 0;
         app.editor.cursor_col = 0;
-        app.handle_key(key(KeyCode::Right, KeyModifiers::ALT)).unwrap();
+        app.handle_key(key(KeyCode::Right, KeyModifiers::ALT))
+            .unwrap();
         assert_eq!(app.editor.cursor_col, 5);
-        app.handle_key(key(KeyCode::Right, KeyModifiers::ALT)).unwrap();
+        app.handle_key(key(KeyCode::Right, KeyModifiers::ALT))
+            .unwrap();
         assert_eq!(app.editor.cursor_col, 11);
     }
 
@@ -14671,8 +15033,10 @@ mod tests {
     fn editor_cmd_gg_jumps_to_top_of_file() {
         let mut app = editor_app_with_lines(&["a", "b", "c", "d"]);
         app.editor.cursor_row = 3;
-        app.handle_key(key(KeyCode::Char('g'), KeyModifiers::SUPER)).unwrap();
-        app.handle_key(key(KeyCode::Char('g'), KeyModifiers::SUPER)).unwrap();
+        app.handle_key(key(KeyCode::Char('g'), KeyModifiers::SUPER))
+            .unwrap();
+        app.handle_key(key(KeyCode::Char('g'), KeyModifiers::SUPER))
+            .unwrap();
         assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (0, 0));
     }
 
@@ -14680,27 +15044,36 @@ mod tests {
     fn editor_cmd_g_then_plain_g_also_jumps_to_top() {
         let mut app = editor_app_with_lines(&["a", "b", "c", "d"]);
         app.editor.cursor_row = 3;
-        app.handle_key(key(KeyCode::Char('g'), KeyModifiers::SUPER)).unwrap();
-        app.handle_key(key(KeyCode::Char('g'), KeyModifiers::NONE)).unwrap();
+        app.handle_key(key(KeyCode::Char('g'), KeyModifiers::SUPER))
+            .unwrap();
+        app.handle_key(key(KeyCode::Char('g'), KeyModifiers::NONE))
+            .unwrap();
         assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (0, 0));
     }
 
     #[test]
     fn editor_cmd_g_count_g_jumps_to_specific_line() {
         let mut app = editor_app_with_lines(&["a", "b", "c", "d", "e"]);
-        app.handle_key(key(KeyCode::Char('g'), KeyModifiers::SUPER)).unwrap();
-        app.handle_key(key(KeyCode::Char('3'), KeyModifiers::NONE)).unwrap();
-        app.handle_key(key(KeyCode::Char('g'), KeyModifiers::NONE)).unwrap();
+        app.handle_key(key(KeyCode::Char('g'), KeyModifiers::SUPER))
+            .unwrap();
+        app.handle_key(key(KeyCode::Char('3'), KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key(key(KeyCode::Char('g'), KeyModifiers::NONE))
+            .unwrap();
         assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (2, 0));
     }
 
     #[test]
     fn editor_cmd_g_multidigit_count_g_jumps_to_specific_line() {
         let mut app = editor_app_with_lines(&(0..30).map(|_| "x").collect::<Vec<_>>());
-        app.handle_key(key(KeyCode::Char('g'), KeyModifiers::SUPER)).unwrap();
-        app.handle_key(key(KeyCode::Char('1'), KeyModifiers::NONE)).unwrap();
-        app.handle_key(key(KeyCode::Char('2'), KeyModifiers::NONE)).unwrap();
-        app.handle_key(key(KeyCode::Char('g'), KeyModifiers::NONE)).unwrap();
+        app.handle_key(key(KeyCode::Char('g'), KeyModifiers::SUPER))
+            .unwrap();
+        app.handle_key(key(KeyCode::Char('1'), KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key(key(KeyCode::Char('2'), KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key(key(KeyCode::Char('g'), KeyModifiers::NONE))
+            .unwrap();
         assert_eq!(app.editor.cursor_row, 11);
     }
 
@@ -14724,8 +15097,10 @@ mod tests {
     fn editor_cmd_dd_deletes_current_line() {
         let mut app = editor_app_with_lines(&["alpha", "beta", "gamma"]);
         app.editor.cursor_row = 1;
-        app.handle_key(key(KeyCode::Char('d'), KeyModifiers::SUPER)).unwrap();
-        app.handle_key(key(KeyCode::Char('d'), KeyModifiers::SUPER)).unwrap();
+        app.handle_key(key(KeyCode::Char('d'), KeyModifiers::SUPER))
+            .unwrap();
+        app.handle_key(key(KeyCode::Char('d'), KeyModifiers::SUPER))
+            .unwrap();
         assert_eq!(app.editor.lines, vec!["alpha", "gamma"]);
     }
 
@@ -14733,9 +15108,12 @@ mod tests {
     fn editor_cmd_d_count_d_deletes_n_lines() {
         let mut app = editor_app_with_lines(&["a", "b", "c", "d", "e"]);
         app.editor.cursor_row = 1;
-        app.handle_key(key(KeyCode::Char('d'), KeyModifiers::SUPER)).unwrap();
-        app.handle_key(key(KeyCode::Char('3'), KeyModifiers::NONE)).unwrap();
-        app.handle_key(key(KeyCode::Char('d'), KeyModifiers::NONE)).unwrap();
+        app.handle_key(key(KeyCode::Char('d'), KeyModifiers::SUPER))
+            .unwrap();
+        app.handle_key(key(KeyCode::Char('3'), KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key(key(KeyCode::Char('d'), KeyModifiers::NONE))
+            .unwrap();
         assert_eq!(app.editor.lines, vec!["a", "e"]);
     }
 
@@ -14743,8 +15121,10 @@ mod tests {
     fn editor_cmd_yy_does_not_modify_buffer() {
         let mut app = editor_app_with_lines(&["alpha", "beta", "gamma"]);
         app.editor.cursor_row = 1;
-        app.handle_key(key(KeyCode::Char('y'), KeyModifiers::SUPER)).unwrap();
-        app.handle_key(key(KeyCode::Char('y'), KeyModifiers::SUPER)).unwrap();
+        app.handle_key(key(KeyCode::Char('y'), KeyModifiers::SUPER))
+            .unwrap();
+        app.handle_key(key(KeyCode::Char('y'), KeyModifiers::SUPER))
+            .unwrap();
         assert_eq!(app.editor.lines, vec!["alpha", "beta", "gamma"]);
         assert!(app.status.starts_with("Yanked"));
     }
@@ -14753,8 +15133,10 @@ mod tests {
     fn editor_chord_cancels_on_unrelated_key() {
         let mut app = editor_app_with_lines(&["alpha"]);
         app.editor.cursor_col = 5;
-        app.handle_key(key(KeyCode::Char('d'), KeyModifiers::SUPER)).unwrap();
-        app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE)).unwrap();
+        app.handle_key(key(KeyCode::Char('d'), KeyModifiers::SUPER))
+            .unwrap();
+        app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE))
+            .unwrap();
         assert_eq!(app.editor.lines, vec!["alphax"]);
     }
 
@@ -14762,7 +15144,8 @@ mod tests {
     fn editor_ctrl_a_jumps_to_start_of_line() {
         let mut app = editor_app_with_lines(&["hello world"]);
         app.editor.cursor_col = 7;
-        app.handle_key(key(KeyCode::Char('a'), KeyModifiers::CONTROL)).unwrap();
+        app.handle_key(key(KeyCode::Char('a'), KeyModifiers::CONTROL))
+            .unwrap();
         assert_eq!(app.editor.cursor_col, 0);
     }
 
@@ -14770,7 +15153,8 @@ mod tests {
     fn editor_ctrl_e_jumps_to_end_of_line() {
         let mut app = editor_app_with_lines(&["hello world"]);
         app.editor.cursor_col = 3;
-        app.handle_key(key(KeyCode::Char('e'), KeyModifiers::CONTROL)).unwrap();
+        app.handle_key(key(KeyCode::Char('e'), KeyModifiers::CONTROL))
+            .unwrap();
         assert_eq!(app.editor.cursor_col, 11);
     }
 
@@ -14778,16 +15162,20 @@ mod tests {
     fn editor_ctrl_k_kills_to_end_of_line() {
         let mut app = editor_app_with_lines(&["hello world", "next"]);
         app.editor.cursor_col = 5;
-        app.handle_key(key(KeyCode::Char('k'), KeyModifiers::CONTROL)).unwrap();
+        app.handle_key(key(KeyCode::Char('k'), KeyModifiers::CONTROL))
+            .unwrap();
         assert_eq!(app.editor.lines, vec!["hello", "next"]);
     }
 
     #[test]
     fn editor_cmd_count_gg_jumps_to_line_with_leading_count() {
         let mut app = editor_app_with_lines(&["a", "b", "c", "d", "e"]);
-        app.handle_key(key(KeyCode::Char('3'), KeyModifiers::SUPER)).unwrap();
-        app.handle_key(key(KeyCode::Char('g'), KeyModifiers::SUPER)).unwrap();
-        app.handle_key(key(KeyCode::Char('g'), KeyModifiers::SUPER)).unwrap();
+        app.handle_key(key(KeyCode::Char('3'), KeyModifiers::SUPER))
+            .unwrap();
+        app.handle_key(key(KeyCode::Char('g'), KeyModifiers::SUPER))
+            .unwrap();
+        app.handle_key(key(KeyCode::Char('g'), KeyModifiers::SUPER))
+            .unwrap();
         assert_eq!(app.editor.cursor_row, 2);
     }
 
@@ -14795,9 +15183,12 @@ mod tests {
     fn editor_cmd_count_dd_deletes_n_lines_with_leading_count() {
         let mut app = editor_app_with_lines(&["a", "b", "c", "d", "e"]);
         app.editor.cursor_row = 1;
-        app.handle_key(key(KeyCode::Char('2'), KeyModifiers::SUPER)).unwrap();
-        app.handle_key(key(KeyCode::Char('d'), KeyModifiers::SUPER)).unwrap();
-        app.handle_key(key(KeyCode::Char('d'), KeyModifiers::SUPER)).unwrap();
+        app.handle_key(key(KeyCode::Char('2'), KeyModifiers::SUPER))
+            .unwrap();
+        app.handle_key(key(KeyCode::Char('d'), KeyModifiers::SUPER))
+            .unwrap();
+        app.handle_key(key(KeyCode::Char('d'), KeyModifiers::SUPER))
+            .unwrap();
         assert_eq!(app.editor.lines, vec!["a", "d", "e"]);
     }
 
@@ -14805,9 +15196,12 @@ mod tests {
     fn editor_cmd_count_yy_yanks_n_lines_with_leading_count() {
         let mut app = editor_app_with_lines(&["a", "b", "c", "d"]);
         app.editor.cursor_row = 0;
-        app.handle_key(key(KeyCode::Char('2'), KeyModifiers::SUPER)).unwrap();
-        app.handle_key(key(KeyCode::Char('y'), KeyModifiers::SUPER)).unwrap();
-        app.handle_key(key(KeyCode::Char('y'), KeyModifiers::SUPER)).unwrap();
+        app.handle_key(key(KeyCode::Char('2'), KeyModifiers::SUPER))
+            .unwrap();
+        app.handle_key(key(KeyCode::Char('y'), KeyModifiers::SUPER))
+            .unwrap();
+        app.handle_key(key(KeyCode::Char('y'), KeyModifiers::SUPER))
+            .unwrap();
         assert_eq!(app.editor.lines, vec!["a", "b", "c", "d"]);
         assert!(app.status.contains("Yanked 2"));
     }
@@ -14815,7 +15209,8 @@ mod tests {
     #[test]
     fn editor_cmd_count_then_shift_g_jumps_to_specific_line() {
         let mut app = editor_app_with_lines(&["a", "b", "c", "d", "e"]);
-        app.handle_key(key(KeyCode::Char('4'), KeyModifiers::SUPER)).unwrap();
+        app.handle_key(key(KeyCode::Char('4'), KeyModifiers::SUPER))
+            .unwrap();
         app.handle_key(key(
             KeyCode::Char('G'),
             KeyModifiers::SUPER | KeyModifiers::SHIFT,
@@ -14828,7 +15223,8 @@ mod tests {
     fn editor_ctrl_u_kills_to_start_of_line() {
         let mut app = editor_app_with_lines(&["hello world"]);
         app.editor.cursor_col = 6;
-        app.handle_key(key(KeyCode::Char('u'), KeyModifiers::CONTROL)).unwrap();
+        app.handle_key(key(KeyCode::Char('u'), KeyModifiers::CONTROL))
+            .unwrap();
         assert_eq!(app.editor.lines, vec!["world"]);
         assert_eq!(app.editor.cursor_col, 0);
     }
@@ -14838,7 +15234,8 @@ mod tests {
         let mut app = editor_app_with_lines(&["    foo", "bar"]);
         app.editor.cursor_row = 0;
         app.editor.cursor_col = 4;
-        app.handle_key(key(KeyCode::Char('o'), KeyModifiers::SUPER)).unwrap();
+        app.handle_key(key(KeyCode::Char('o'), KeyModifiers::SUPER))
+            .unwrap();
         assert_eq!(app.editor.lines, vec!["    foo", "    ", "bar"]);
         assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (1, 4));
     }
@@ -14862,17 +15259,26 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(tmp.path().to_path_buf()).unwrap();
         app.focus_pane(Pane::Editor);
-        app.handle_key(key(KeyCode::F(1), KeyModifiers::NONE)).unwrap();
-        assert!(app.shortcuts_modal.is_some(), "F1 must open the shortcuts panel");
+        app.handle_key(key(KeyCode::F(1), KeyModifiers::NONE))
+            .unwrap();
+        assert!(
+            app.shortcuts_modal.is_some(),
+            "F1 must open the shortcuts panel"
+        );
     }
 
     #[test]
     fn esc_closes_the_shortcuts_modal_and_restores_normal_input() {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-        app.handle_key(key(KeyCode::F(1), KeyModifiers::NONE)).unwrap();
-        app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
-        assert!(app.shortcuts_modal.is_none(), "Esc must dismiss the shortcuts panel");
+        app.handle_key(key(KeyCode::F(1), KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+        assert!(
+            app.shortcuts_modal.is_none(),
+            "Esc must dismiss the shortcuts panel"
+        );
     }
 
     #[test]
@@ -14882,8 +15288,10 @@ mod tests {
         app.focus_pane(Pane::Editor);
         app.editor.lines = vec![String::from("hello")];
         app.editor.cursor_col = 5;
-        app.handle_key(key(KeyCode::F(1), KeyModifiers::NONE)).unwrap();
-        app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE)).unwrap();
+        app.handle_key(key(KeyCode::F(1), KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE))
+            .unwrap();
         assert_eq!(
             app.editor.lines,
             vec!["hello"],
@@ -14895,7 +15303,8 @@ mod tests {
     fn opening_the_shortcuts_modal_arms_one_image_clear_so_iterm_evicts_cached_osc_1337_cells() {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-        app.handle_key(key(KeyCode::F(1), KeyModifiers::NONE)).unwrap();
+        app.handle_key(key(KeyCode::F(1), KeyModifiers::NONE))
+            .unwrap();
         assert!(
             app.consume_shortcuts_image_clear(),
             "F1 must arm terminal.clear() so iTerm2's image cache (activity bar icons, welcome wordmark, editor preview) is wiped before the modal paints, otherwise those cached image cells bleed through the modal text"
@@ -14910,9 +15319,11 @@ mod tests {
     fn closing_the_shortcuts_modal_arms_image_clear_and_re_dirties_overlays() {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-        app.handle_key(key(KeyCode::F(1), KeyModifiers::NONE)).unwrap();
+        app.handle_key(key(KeyCode::F(1), KeyModifiers::NONE))
+            .unwrap();
         let _ = app.consume_shortcuts_image_clear();
-        app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
+        app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
         assert!(
             app.consume_shortcuts_image_clear(),
             "Esc must also arm terminal.clear() so the modal's text cells get wiped and the activity bar / welcome wordmark / hero icons can be re-emitted cleanly"
@@ -14943,7 +15354,8 @@ mod tests {
         let mut app = App::new(tmp.path().to_path_buf()).unwrap();
         app.set_sidebar_view(SidebarView::Remote);
         app.ssh_empty_state_displayed = true;
-        app.handle_key(key(KeyCode::F(1), KeyModifiers::NONE)).unwrap();
+        app.handle_key(key(KeyCode::F(1), KeyModifiers::NONE))
+            .unwrap();
         app.flush_ssh_empty_state_overlay();
         assert!(
             app.consume_ssh_empty_state_image_clear(),
@@ -14959,7 +15371,8 @@ mod tests {
         let mut term = ratatui::Terminal::new(backend).unwrap();
         term.draw(|f| app.render(f)).unwrap();
         let before = app.pending_activity_image_overlays().len();
-        app.handle_key(key(KeyCode::F(1), KeyModifiers::NONE)).unwrap();
+        app.handle_key(key(KeyCode::F(1), KeyModifiers::NONE))
+            .unwrap();
         let during = app.pending_activity_image_overlays().len();
         assert_eq!(
             during, 0,
@@ -14971,13 +15384,16 @@ mod tests {
     fn shortcuts_modal_scrolls_down_then_back_to_top_via_keys() {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-        app.handle_key(key(KeyCode::F(1), KeyModifiers::NONE)).unwrap();
+        app.handle_key(key(KeyCode::F(1), KeyModifiers::NONE))
+            .unwrap();
         let modal = app.shortcuts_modal.as_mut().unwrap();
         modal.last_inner_height = 5;
         modal.last_content_height = 50;
-        app.handle_key(key(KeyCode::PageDown, KeyModifiers::NONE)).unwrap();
+        app.handle_key(key(KeyCode::PageDown, KeyModifiers::NONE))
+            .unwrap();
         assert_eq!(app.shortcuts_modal.as_ref().unwrap().scroll, 10);
-        app.handle_key(key(KeyCode::Home, KeyModifiers::NONE)).unwrap();
+        app.handle_key(key(KeyCode::Home, KeyModifiers::NONE))
+            .unwrap();
         assert_eq!(app.shortcuts_modal.as_ref().unwrap().scroll, 0);
     }
 
@@ -14986,7 +15402,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("alpha.rs"), "").unwrap();
         let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-        app.handle_key(key(KeyCode::Char('p'), KeyModifiers::SUPER)).unwrap();
+        app.handle_key(key(KeyCode::Char('p'), KeyModifiers::SUPER))
+            .unwrap();
         assert!(
             app.file_finder.is_some(),
             "Cmd+P must open the Quick Open file finder modal so the user can type a name and jump to a file the way VS Code does"
@@ -14998,7 +15415,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("alpha.rs"), "").unwrap();
         let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-        app.handle_key(key(KeyCode::Char('p'), KeyModifiers::CONTROL)).unwrap();
+        app.handle_key(key(KeyCode::Char('p'), KeyModifiers::CONTROL))
+            .unwrap();
         assert!(
             app.file_finder.is_some(),
             "Ctrl+P must also open the Quick Open finder so the chord works on Linux / iTerm2 sessions that report CONTROL rather than SUPER"
@@ -15010,7 +15428,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("alpha.rs"), "").unwrap();
         let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-        app.handle_key(key(KeyCode::Char('p'), KeyModifiers::NONE)).unwrap();
+        app.handle_key(key(KeyCode::Char('p'), KeyModifiers::NONE))
+            .unwrap();
         assert!(
             app.file_finder.is_none(),
             "an unmodified 'p' must reach the editor / tree typeahead and never trigger the modal"
@@ -15022,9 +15441,14 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("alpha.rs"), "").unwrap();
         let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-        app.handle_key(key(KeyCode::Char('p'), KeyModifiers::SUPER)).unwrap();
-        app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
-        assert!(app.file_finder.is_none(), "Esc must dismiss the file finder");
+        app.handle_key(key(KeyCode::Char('p'), KeyModifiers::SUPER))
+            .unwrap();
+        app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+        assert!(
+            app.file_finder.is_none(),
+            "Esc must dismiss the file finder"
+        );
     }
 
     #[test]
@@ -15034,10 +15458,16 @@ mod tests {
         std::fs::create_dir(tmp.path().join("sub")).unwrap();
         std::fs::write(tmp.path().join("sub").join("beta.rs"), "").unwrap();
         let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-        app.handle_key(key(KeyCode::Char('p'), KeyModifiers::SUPER)).unwrap();
-        app.handle_key(key(KeyCode::Char('b'), KeyModifiers::NONE)).unwrap();
-        app.handle_key(key(KeyCode::Char('e'), KeyModifiers::NONE)).unwrap();
-        let finder = app.file_finder.as_ref().expect("finder must still be open while typing");
+        app.handle_key(key(KeyCode::Char('p'), KeyModifiers::SUPER))
+            .unwrap();
+        app.handle_key(key(KeyCode::Char('b'), KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key(key(KeyCode::Char('e'), KeyModifiers::NONE))
+            .unwrap();
+        let finder = app
+            .file_finder
+            .as_ref()
+            .expect("finder must still be open while typing");
         let names: Vec<String> = finder
             .visible_results()
             .iter()
@@ -15058,11 +15488,21 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("alpha.rs"), "fn main() {}").unwrap();
         let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-        app.handle_key(key(KeyCode::Char('p'), KeyModifiers::SUPER)).unwrap();
-        app.handle_key(key(KeyCode::Char('a'), KeyModifiers::NONE)).unwrap();
-        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE)).unwrap();
-        assert!(app.file_finder.is_none(), "Enter must close the modal after opening the file");
-        let opened = app.editor.path.as_ref().expect("the active tab must now have a path");
+        app.handle_key(key(KeyCode::Char('p'), KeyModifiers::SUPER))
+            .unwrap();
+        app.handle_key(key(KeyCode::Char('a'), KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert!(
+            app.file_finder.is_none(),
+            "Enter must close the modal after opening the file"
+        );
+        let opened = app
+            .editor
+            .path
+            .as_ref()
+            .expect("the active tab must now have a path");
         assert_eq!(
             opened.file_name().and_then(|n| n.to_str()),
             Some("alpha.rs"),
@@ -15077,11 +15517,17 @@ mod tests {
         std::fs::write(tmp.path().join("a2.rs"), "").unwrap();
         std::fs::write(tmp.path().join("a3.rs"), "").unwrap();
         let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-        app.handle_key(key(KeyCode::Char('p'), KeyModifiers::SUPER)).unwrap();
+        app.handle_key(key(KeyCode::Char('p'), KeyModifiers::SUPER))
+            .unwrap();
         let before = app.file_finder.as_ref().unwrap().selected_index();
-        app.handle_key(key(KeyCode::Down, KeyModifiers::NONE)).unwrap();
+        app.handle_key(key(KeyCode::Down, KeyModifiers::NONE))
+            .unwrap();
         let after = app.file_finder.as_ref().unwrap().selected_index();
-        assert_eq!(after, before + 1, "Down arrow must move the selection cursor one row");
+        assert_eq!(
+            after,
+            before + 1,
+            "Down arrow must move the selection cursor one row"
+        );
     }
 
     #[test]
@@ -15089,10 +15535,14 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("alpha.rs"), "").unwrap();
         let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-        app.handle_key(key(KeyCode::Char('p'), KeyModifiers::SUPER)).unwrap();
-        app.handle_key(key(KeyCode::Char('a'), KeyModifiers::NONE)).unwrap();
-        app.handle_key(key(KeyCode::Char('b'), KeyModifiers::NONE)).unwrap();
-        app.handle_key(key(KeyCode::Backspace, KeyModifiers::NONE)).unwrap();
+        app.handle_key(key(KeyCode::Char('p'), KeyModifiers::SUPER))
+            .unwrap();
+        app.handle_key(key(KeyCode::Char('a'), KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key(key(KeyCode::Char('b'), KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key(key(KeyCode::Backspace, KeyModifiers::NONE))
+            .unwrap();
         assert_eq!(app.file_finder.as_ref().unwrap().query, "a");
     }
 
@@ -15100,7 +15550,8 @@ mod tests {
     fn opening_the_file_finder_arms_one_image_clear_so_iterm_evicts_cached_osc_1337_cells() {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-        app.handle_key(key(KeyCode::Char('p'), KeyModifiers::SUPER)).unwrap();
+        app.handle_key(key(KeyCode::Char('p'), KeyModifiers::SUPER))
+            .unwrap();
         assert!(
             app.consume_file_finder_image_clear(),
             "Cmd+P must arm terminal.clear() so iTerm2's image cache (activity bar icons, welcome wordmark, editor preview) is wiped before the modal paints, otherwise those cached image cells bleed through the file list"
@@ -15116,16 +15567,27 @@ mod tests {
         let mut app = editor_app_with_lines(&["x"]);
         app.set_sidebar_view(SidebarView::Search);
         app.show_tree = false;
-        app.handle_key(key(KeyCode::Char('e'), KeyModifiers::SUPER | KeyModifiers::SHIFT)).unwrap();
+        app.handle_key(key(
+            KeyCode::Char('e'),
+            KeyModifiers::SUPER | KeyModifiers::SHIFT,
+        ))
+        .unwrap();
         assert_eq!(app.sidebar_view, SidebarView::Explorer);
-        assert!(app.show_tree, "Cmd+Shift+E must un-collapse the sidebar if it was hidden");
+        assert!(
+            app.show_tree,
+            "Cmd+Shift+E must un-collapse the sidebar if it was hidden"
+        );
     }
 
     #[test]
     fn cmd_shift_s_jumps_to_source_control_even_when_editor_is_focused() {
         let mut app = editor_app_with_lines(&["x"]);
         app.focus_pane(Pane::Editor);
-        app.handle_key(key(KeyCode::Char('s'), KeyModifiers::SUPER | KeyModifiers::SHIFT)).unwrap();
+        app.handle_key(key(
+            KeyCode::Char('s'),
+            KeyModifiers::SUPER | KeyModifiers::SHIFT,
+        ))
+        .unwrap();
         assert_eq!(
             app.sidebar_view,
             SidebarView::SourceControl,
@@ -15137,7 +15599,11 @@ mod tests {
     fn cmd_shift_d_jumps_to_run_and_debug_from_any_pane() {
         let mut app = editor_app_with_lines(&["x"]);
         app.focus_pane(Pane::Editor);
-        app.handle_key(key(KeyCode::Char('d'), KeyModifiers::SUPER | KeyModifiers::SHIFT)).unwrap();
+        app.handle_key(key(
+            KeyCode::Char('d'),
+            KeyModifiers::SUPER | KeyModifiers::SHIFT,
+        ))
+        .unwrap();
         assert_eq!(app.sidebar_view, SidebarView::RunDebug);
     }
 
@@ -15145,7 +15611,11 @@ mod tests {
     fn cmd_shift_r_jumps_to_remote_from_any_pane() {
         let mut app = editor_app_with_lines(&["x"]);
         app.focus_pane(Pane::Editor);
-        app.handle_key(key(KeyCode::Char('r'), KeyModifiers::SUPER | KeyModifiers::SHIFT)).unwrap();
+        app.handle_key(key(
+            KeyCode::Char('r'),
+            KeyModifiers::SUPER | KeyModifiers::SHIFT,
+        ))
+        .unwrap();
         assert_eq!(app.sidebar_view, SidebarView::Remote);
     }
 
@@ -15153,7 +15623,11 @@ mod tests {
     fn cmd_shift_t_focuses_the_terminal_pane_from_the_editor() {
         let mut app = editor_app_with_lines(&["x"]);
         app.focus_pane(Pane::Editor);
-        app.handle_key(key(KeyCode::Char('t'), KeyModifiers::SUPER | KeyModifiers::SHIFT)).unwrap();
+        app.handle_key(key(
+            KeyCode::Char('t'),
+            KeyModifiers::SUPER | KeyModifiers::SHIFT,
+        ))
+        .unwrap();
         assert!(
             matches!(app.focus, Pane::Terminal),
             "Cmd+Shift+T must move focus to the Terminal pane from the editor so the user can start typing in the shell without reaching for the mouse"
@@ -15164,7 +15638,11 @@ mod tests {
     fn cmd_shift_t_focuses_the_terminal_pane_from_the_tree() {
         let mut app = editor_app_with_lines(&["x"]);
         app.focus_pane(Pane::Tree);
-        app.handle_key(key(KeyCode::Char('t'), KeyModifiers::SUPER | KeyModifiers::SHIFT)).unwrap();
+        app.handle_key(key(
+            KeyCode::Char('t'),
+            KeyModifiers::SUPER | KeyModifiers::SHIFT,
+        ))
+        .unwrap();
         assert!(
             matches!(app.focus, Pane::Terminal),
             "Cmd+Shift+T must move focus to the Terminal pane even when the Explorer is focused"
@@ -15176,7 +15654,11 @@ mod tests {
         let mut app = editor_app_with_lines(&["x"]);
         app.focus_pane(Pane::Editor);
         app.show_terminal = false;
-        app.handle_key(key(KeyCode::Char('T'), KeyModifiers::SUPER | KeyModifiers::SHIFT)).unwrap();
+        app.handle_key(key(
+            KeyCode::Char('T'),
+            KeyModifiers::SUPER | KeyModifiers::SHIFT,
+        ))
+        .unwrap();
         assert!(
             app.show_terminal,
             "Cmd+Shift+T must un-hide the terminal if it was collapsed (Ctrl+J) — otherwise the focus jump lands in a zero-row pane"
@@ -15189,7 +15671,11 @@ mod tests {
         let mut app = editor_app_with_lines(&["x"]);
         app.focus_pane(Pane::Editor);
         let before = app.terminals.len();
-        app.handle_key(key(KeyCode::Char('t'), KeyModifiers::CONTROL | KeyModifiers::SHIFT)).unwrap();
+        app.handle_key(key(
+            KeyCode::Char('t'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ))
+        .unwrap();
         assert_eq!(
             app.terminals.len(),
             before + 1,
@@ -15207,7 +15693,10 @@ mod tests {
             "Cmd+T (no Shift) is reserved by macOS for New Tab; the focus chord requires Shift"
         );
         assert!(
-            !is_terminal_focus_key(key(KeyCode::Char('t'), KeyModifiers::CONTROL | KeyModifiers::SHIFT)),
+            !is_terminal_focus_key(key(
+                KeyCode::Char('t'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT
+            )),
             "Ctrl+Shift+T must stay routed to is_terminal_split_key, not focus"
         );
         assert!(
@@ -15247,7 +15736,8 @@ mod tests {
     #[test]
     fn cmd_f_in_editor_opens_the_inline_find_overlay_not_the_new_file_prompt() {
         let mut app = editor_app_with_lines(&["alpha beta", "alpha gamma"]);
-        app.handle_key(key(KeyCode::Char('f'), KeyModifiers::SUPER)).unwrap();
+        app.handle_key(key(KeyCode::Char('f'), KeyModifiers::SUPER))
+            .unwrap();
         assert!(
             app.editor_find.is_some(),
             "Cmd+F with the editor focused must open the VS Code-style inline Find bar over the editor pane, not the Explorer 'new file' prompt"
@@ -15263,7 +15753,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(tmp.path().to_path_buf()).unwrap();
         app.focus_pane(Pane::Tree);
-        app.handle_key(key(KeyCode::Char('f'), KeyModifiers::SUPER)).unwrap();
+        app.handle_key(key(KeyCode::Char('f'), KeyModifiers::SUPER))
+            .unwrap();
         assert!(
             app.prompt.is_some(),
             "Cmd+F in the Explorer pane must keep creating a new file — the existing behaviour the user asked us to preserve"
@@ -15279,11 +15770,16 @@ mod tests {
         let mut app = editor_app_with_lines(&["alpha beta", "alpha gamma"]);
         app.editor.cursor_row = 0;
         app.editor.cursor_col = 0;
-        app.handle_key(key(KeyCode::Char('f'), KeyModifiers::SUPER)).unwrap();
-        app.handle_key(key(KeyCode::Char('b'), KeyModifiers::NONE)).unwrap();
-        app.handle_key(key(KeyCode::Char('e'), KeyModifiers::NONE)).unwrap();
-        app.handle_key(key(KeyCode::Char('t'), KeyModifiers::NONE)).unwrap();
-        app.handle_key(key(KeyCode::Char('a'), KeyModifiers::NONE)).unwrap();
+        app.handle_key(key(KeyCode::Char('f'), KeyModifiers::SUPER))
+            .unwrap();
+        app.handle_key(key(KeyCode::Char('b'), KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key(key(KeyCode::Char('e'), KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key(key(KeyCode::Char('t'), KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key(key(KeyCode::Char('a'), KeyModifiers::NONE))
+            .unwrap();
         assert_eq!(
             (app.editor.cursor_row, app.editor.cursor_col),
             (0, 6),
@@ -15298,23 +15794,32 @@ mod tests {
         let mut app = editor_app_with_lines(&["alpha", "beta alpha", "alpha"]);
         app.editor.cursor_row = 0;
         app.editor.cursor_col = 0;
-        app.handle_key(key(KeyCode::Char('f'), KeyModifiers::SUPER)).unwrap();
-        app.handle_key(key(KeyCode::Char('a'), KeyModifiers::NONE)).unwrap();
-        app.handle_key(key(KeyCode::Char('l'), KeyModifiers::NONE)).unwrap();
-        app.handle_key(key(KeyCode::Char('p'), KeyModifiers::NONE)).unwrap();
-        app.handle_key(key(KeyCode::Char('h'), KeyModifiers::NONE)).unwrap();
-        app.handle_key(key(KeyCode::Char('a'), KeyModifiers::NONE)).unwrap();
-        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE)).unwrap();
+        app.handle_key(key(KeyCode::Char('f'), KeyModifiers::SUPER))
+            .unwrap();
+        app.handle_key(key(KeyCode::Char('a'), KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key(key(KeyCode::Char('l'), KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key(key(KeyCode::Char('p'), KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key(key(KeyCode::Char('h'), KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key(key(KeyCode::Char('a'), KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
         assert_eq!(
             app.editor.cursor_row, 1,
             "Enter must jump to the next 'alpha' match on row 1"
         );
-        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE)).unwrap();
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
         assert_eq!(
             app.editor.cursor_row, 2,
             "Enter again must walk forward to the row 2 match"
         );
-        app.handle_key(key(KeyCode::Enter, KeyModifiers::SHIFT)).unwrap();
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::SHIFT))
+            .unwrap();
         assert_eq!(
             app.editor.cursor_row, 1,
             "Shift+Enter must walk back one match to row 1"
@@ -15326,19 +15831,26 @@ mod tests {
         let mut app = editor_app_with_lines(&["alpha beta alpha"]);
         app.editor.cursor_row = 0;
         app.editor.cursor_col = 0;
-        app.handle_key(key(KeyCode::Char('f'), KeyModifiers::SUPER)).unwrap();
-        app.handle_key(key(KeyCode::Char('a'), KeyModifiers::NONE)).unwrap();
-        app.handle_key(key(KeyCode::Char('l'), KeyModifiers::NONE)).unwrap();
-        app.handle_key(key(KeyCode::Char('p'), KeyModifiers::NONE)).unwrap();
-        app.handle_key(key(KeyCode::Char('h'), KeyModifiers::NONE)).unwrap();
-        app.handle_key(key(KeyCode::Char('a'), KeyModifiers::NONE)).unwrap();
+        app.handle_key(key(KeyCode::Char('f'), KeyModifiers::SUPER))
+            .unwrap();
+        app.handle_key(key(KeyCode::Char('a'), KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key(key(KeyCode::Char('l'), KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key(key(KeyCode::Char('p'), KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key(key(KeyCode::Char('h'), KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key(key(KeyCode::Char('a'), KeyModifiers::NONE))
+            .unwrap();
         let first = app.editor.active_search_match;
         assert_eq!(
             first,
             Some((0, 0, 5)),
             "typing 'alpha' lands the cursor on the first match (col 0, len 5); active_search_match must record exactly that so the renderer can paint just those 5 cells orange while the other 'alpha' at col 11 keeps the regular yellow — got {first:?}"
         );
-        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE)).unwrap();
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
         let second = app.editor.active_search_match;
         assert_eq!(
             second,
@@ -15350,14 +15862,17 @@ mod tests {
     #[test]
     fn esc_closes_the_editor_find_overlay_and_clears_the_highlight() {
         let mut app = editor_app_with_lines(&["alpha"]);
-        app.handle_key(key(KeyCode::Char('f'), KeyModifiers::SUPER)).unwrap();
-        app.handle_key(key(KeyCode::Char('a'), KeyModifiers::NONE)).unwrap();
+        app.handle_key(key(KeyCode::Char('f'), KeyModifiers::SUPER))
+            .unwrap();
+        app.handle_key(key(KeyCode::Char('a'), KeyModifiers::NONE))
+            .unwrap();
         assert!(app.editor.search_highlight.is_some());
         assert!(
             app.editor.active_search_match.is_some(),
             "typing should land the cursor on a match and arm the active-match marker"
         );
-        app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
+        app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
         assert!(app.editor_find.is_none(), "Esc must close the find bar");
         assert!(
             app.editor.search_highlight.is_none(),
@@ -15374,7 +15889,8 @@ mod tests {
         let mut app = editor_app_with_lines(&["alphabet"]);
         app.editor.cursor_row = 0;
         app.editor.cursor_col = 5;
-        app.handle_key(key(KeyCode::Char('f'), KeyModifiers::SUPER)).unwrap();
+        app.handle_key(key(KeyCode::Char('f'), KeyModifiers::SUPER))
+            .unwrap();
         assert_eq!(
             app.editor_find.as_ref().unwrap().query,
             "alpha",
@@ -15386,8 +15902,10 @@ mod tests {
     fn editor_find_paste_appends_clipboard_to_the_query() {
         let mut app = editor_app_with_lines(&["alpha needle beta"]);
         app.clipboard_reader = || Some(String::from("needle"));
-        app.handle_key(key(KeyCode::Char('f'), KeyModifiers::SUPER)).unwrap();
-        app.handle_key(key(KeyCode::Char('v'), KeyModifiers::SUPER)).unwrap();
+        app.handle_key(key(KeyCode::Char('f'), KeyModifiers::SUPER))
+            .unwrap();
+        app.handle_key(key(KeyCode::Char('v'), KeyModifiers::SUPER))
+            .unwrap();
         assert_eq!(
             app.editor_find.as_ref().unwrap().query,
             "needle",
@@ -15396,7 +15914,8 @@ mod tests {
     }
 
     #[test]
-    fn picking_a_nested_file_via_cmd_p_expands_every_parent_dir_in_the_explorer_and_selects_the_row() {
+    fn picking_a_nested_file_via_cmd_p_expands_every_parent_dir_in_the_explorer_and_selects_the_row()
+     {
         let tmp = tempfile::tempdir().unwrap();
         let nested_dir = tmp.path().join("packages").join("inner").join("citations");
         std::fs::create_dir_all(&nested_dir).unwrap();
@@ -15404,11 +15923,16 @@ mod tests {
         std::fs::write(&target, "").unwrap();
         let mut app = App::new(tmp.path().to_path_buf()).unwrap();
         app.tree.last_inner.height = 20;
-        app.handle_key(key(KeyCode::Char('p'), KeyModifiers::SUPER)).unwrap();
-        app.handle_key(key(KeyCode::Char('s'), KeyModifiers::NONE)).unwrap();
-        app.handle_key(key(KeyCode::Char('t'), KeyModifiers::NONE)).unwrap();
-        app.handle_key(key(KeyCode::Char('o'), KeyModifiers::NONE)).unwrap();
-        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE)).unwrap();
+        app.handle_key(key(KeyCode::Char('p'), KeyModifiers::SUPER))
+            .unwrap();
+        app.handle_key(key(KeyCode::Char('s'), KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key(key(KeyCode::Char('t'), KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key(key(KeyCode::Char('o'), KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
         let selected = app
             .tree
             .selected_path()
@@ -15444,7 +15968,8 @@ mod tests {
         let mut app = App::new(tmp.path().to_path_buf()).unwrap();
         app.focus_pane(Pane::Editor);
         app.editor.lines = vec![String::from("hello")];
-        app.handle_key(key(KeyCode::Char('p'), KeyModifiers::SUPER)).unwrap();
+        app.handle_key(key(KeyCode::Char('p'), KeyModifiers::SUPER))
+            .unwrap();
         app.handle_paste("alpha");
         assert_eq!(
             app.file_finder.as_ref().unwrap().query,
@@ -15464,8 +15989,10 @@ mod tests {
         std::fs::write(tmp.path().join("alpha.rs"), "").unwrap();
         let mut app = App::new(tmp.path().to_path_buf()).unwrap();
         app.clipboard_reader = || Some(String::from("alpha"));
-        app.handle_key(key(KeyCode::Char('p'), KeyModifiers::SUPER)).unwrap();
-        app.handle_key(key(KeyCode::Char('v'), KeyModifiers::SUPER)).unwrap();
+        app.handle_key(key(KeyCode::Char('p'), KeyModifiers::SUPER))
+            .unwrap();
+        app.handle_key(key(KeyCode::Char('v'), KeyModifiers::SUPER))
+            .unwrap();
         assert_eq!(
             app.file_finder.as_ref().unwrap().query,
             "alpha",
@@ -15478,7 +16005,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("alpha.rs"), "").unwrap();
         let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-        app.handle_key(key(KeyCode::Char('p'), KeyModifiers::SUPER)).unwrap();
+        app.handle_key(key(KeyCode::Char('p'), KeyModifiers::SUPER))
+            .unwrap();
         app.handle_paste("al\nph\ta");
         assert_eq!(
             app.file_finder.as_ref().unwrap().query,
@@ -15495,8 +16023,10 @@ mod tests {
         app.focus_pane(Pane::Editor);
         app.editor.lines = vec![String::from("hello")];
         app.editor.cursor_col = 5;
-        app.handle_key(key(KeyCode::Char('p'), KeyModifiers::SUPER)).unwrap();
-        app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE)).unwrap();
+        app.handle_key(key(KeyCode::Char('p'), KeyModifiers::SUPER))
+            .unwrap();
+        app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE))
+            .unwrap();
         assert_eq!(
             app.editor.lines,
             vec!["hello"],
@@ -15512,7 +16042,8 @@ mod tests {
     #[test]
     fn editor_cmd_a_still_selects_all() {
         let mut app = editor_app_with_lines(&["hello", "world"]);
-        app.handle_key(key(KeyCode::Char('a'), KeyModifiers::SUPER)).unwrap();
+        app.handle_key(key(KeyCode::Char('a'), KeyModifiers::SUPER))
+            .unwrap();
         assert_eq!(app.editor.selection_text(), "hello\nworld");
     }
 
@@ -15524,9 +16055,11 @@ mod tests {
         app.editor.lines = vec![String::from("hello world rest")];
         app.editor.cursor_row = 0;
         app.editor.cursor_col = 16;
-        app.handle_key(key(KeyCode::Left, KeyModifiers::ALT)).unwrap();
+        app.handle_key(key(KeyCode::Left, KeyModifiers::ALT))
+            .unwrap();
         assert_eq!(app.editor.cursor_col, 12);
-        app.handle_key(key(KeyCode::Left, KeyModifiers::ALT)).unwrap();
+        app.handle_key(key(KeyCode::Left, KeyModifiers::ALT))
+            .unwrap();
         assert_eq!(app.editor.cursor_col, 6);
     }
 
@@ -15705,20 +16238,50 @@ mod tests {
 
     #[test]
     fn cmd_v_is_recognised_as_search_paste_key() {
-        assert!(is_search_paste_key(key(KeyCode::Char('v'), KeyModifiers::SUPER)));
-        assert!(is_search_paste_key(key(KeyCode::Char('v'), KeyModifiers::CONTROL)));
-        assert!(is_search_paste_key(key(KeyCode::Char('\u{16}'), KeyModifiers::NONE)));
-        assert!(!is_search_paste_key(key(KeyCode::Char('v'), KeyModifiers::NONE)));
-        assert!(!is_search_paste_key(key(KeyCode::Char('a'), KeyModifiers::SUPER)));
+        assert!(is_search_paste_key(key(
+            KeyCode::Char('v'),
+            KeyModifiers::SUPER
+        )));
+        assert!(is_search_paste_key(key(
+            KeyCode::Char('v'),
+            KeyModifiers::CONTROL
+        )));
+        assert!(is_search_paste_key(key(
+            KeyCode::Char('\u{16}'),
+            KeyModifiers::NONE
+        )));
+        assert!(!is_search_paste_key(key(
+            KeyCode::Char('v'),
+            KeyModifiers::NONE
+        )));
+        assert!(!is_search_paste_key(key(
+            KeyCode::Char('a'),
+            KeyModifiers::SUPER
+        )));
     }
 
     #[test]
     fn cmd_v_is_recognised_as_editor_paste_key() {
-        assert!(is_editor_paste_key(key(KeyCode::Char('v'), KeyModifiers::SUPER)));
-        assert!(is_editor_paste_key(key(KeyCode::Char('v'), KeyModifiers::CONTROL)));
-        assert!(is_editor_paste_key(key(KeyCode::Char('\u{16}'), KeyModifiers::NONE)));
-        assert!(!is_editor_paste_key(key(KeyCode::Char('v'), KeyModifiers::NONE)));
-        assert!(!is_editor_paste_key(key(KeyCode::Char('a'), KeyModifiers::SUPER)));
+        assert!(is_editor_paste_key(key(
+            KeyCode::Char('v'),
+            KeyModifiers::SUPER
+        )));
+        assert!(is_editor_paste_key(key(
+            KeyCode::Char('v'),
+            KeyModifiers::CONTROL
+        )));
+        assert!(is_editor_paste_key(key(
+            KeyCode::Char('\u{16}'),
+            KeyModifiers::NONE
+        )));
+        assert!(!is_editor_paste_key(key(
+            KeyCode::Char('v'),
+            KeyModifiers::NONE
+        )));
+        assert!(!is_editor_paste_key(key(
+            KeyCode::Char('a'),
+            KeyModifiers::SUPER
+        )));
     }
 
     #[test]
@@ -15726,9 +16289,24 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(tmp.path().to_path_buf()).unwrap();
         app.set_sidebar_view(SidebarView::Search);
-        app.tree.last_area = Rect { x: 0, y: 0, width: 60, height: 12 };
-        app.search.last_area = Rect { x: 0, y: 0, width: 60, height: 12 };
-        app.search.last_inner = Rect { x: 1, y: 1, width: 58, height: 10 };
+        app.tree.last_area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 12,
+        };
+        app.search.last_area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 12,
+        };
+        app.search.last_inner = Rect {
+            x: 1,
+            y: 1,
+            width: 58,
+            height: 10,
+        };
         app.search.paste_button_x = 40;
         app.search.paste_button_y = 1;
         app.search.paste_button_w = 5;
@@ -15825,7 +16403,9 @@ mod tests {
             let _ = app.drain_fs_events();
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        let new_dir = tmp.path().join("packages/ant-ts-lib-noggin/src/entities/files");
+        let new_dir = tmp
+            .path()
+            .join("packages/ant-ts-lib-noggin/src/entities/files");
         std::fs::create_dir_all(&new_dir).unwrap();
         std::fs::write(new_dir.join("resolver.ts"), b"export {};\n").unwrap();
         let started = std::time::Instant::now();
@@ -15973,7 +16553,9 @@ mod tests {
                 .is_empty(),
             "resolver.ts is not on disk yet; finder must show no matches before the file is created"
         );
-        let new_dir = tmp.path().join("packages/ant-ts-lib-noggin/src/entities/files");
+        let new_dir = tmp
+            .path()
+            .join("packages/ant-ts-lib-noggin/src/entities/files");
         std::fs::create_dir_all(&new_dir).unwrap();
         std::fs::write(new_dir.join("resolver.ts"), b"").unwrap();
         let mut surfaced = false;
@@ -15981,9 +16563,11 @@ mod tests {
             let _ = app.drain_fs_events();
             app.poll_file_finder_index();
             let finder = app.file_finder.as_ref().unwrap();
-            if finder.visible_results().iter().any(|r| {
-                r.entry.rel == "packages/ant-ts-lib-noggin/src/entities/files/resolver.ts"
-            }) {
+            if finder
+                .visible_results()
+                .iter()
+                .any(|r| r.entry.rel == "packages/ant-ts-lib-noggin/src/entities/files/resolver.ts")
+            {
                 surfaced = true;
                 break;
             }
@@ -16020,8 +16604,18 @@ mod tests {
         // Layout: activity-bar(4) + tree-pane on the left, editor +
         // terminal stacked on the right. Pick a splitter row that
         // intersects one of the rendered tree rows.
-        app.tree.last_area = Rect { x: 4, y: 0, width: 32, height: 12 };
-        app.tree.last_inner = Rect { x: 5, y: 1, width: 30, height: 10 };
+        app.tree.last_area = Rect {
+            x: 4,
+            y: 0,
+            width: 32,
+            height: 12,
+        };
+        app.tree.last_inner = Rect {
+            x: 5,
+            y: 1,
+            width: 30,
+            height: 10,
+        };
         app.sidebar_splitter_x = Some(36);
         // Splitter sits inside the tree's rendered row band.
         app.terminal_splitter_y = Some(6);
@@ -16035,9 +16629,7 @@ mod tests {
             "test setup must put a real tree row at the splitter y"
         );
         let click = crossterm::event::MouseEvent {
-            kind: crossterm::event::MouseEventKind::Down(
-                crossterm::event::MouseButton::Left,
-            ),
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
             column: click_col,
             row: click_row,
             modifiers: KeyModifiers::NONE,
@@ -16059,8 +16651,18 @@ mod tests {
         std::fs::create_dir(tmp.path().join("sub")).unwrap();
         std::fs::write(tmp.path().join("sub").join("child.txt"), "hi").unwrap();
         let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-        app.tree.last_area = Rect { x: 0, y: 0, width: 40, height: 8 };
-        app.tree.last_inner = Rect { x: 1, y: 1, width: 38, height: 6 };
+        app.tree.last_area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 8,
+        };
+        app.tree.last_inner = Rect {
+            x: 1,
+            y: 1,
+            width: 38,
+            height: 6,
+        };
         let sub_idx = app
             .tree
             .nodes
@@ -16069,9 +16671,7 @@ mod tests {
             .unwrap();
         let row = app.tree.last_inner.y + sub_idx as u16;
         let click = crossterm::event::MouseEvent {
-            kind: crossterm::event::MouseEventKind::Down(
-                crossterm::event::MouseButton::Left,
-            ),
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
             column: 6,
             row,
             modifiers: KeyModifiers::NONE,
@@ -16237,8 +16837,18 @@ mod tests {
         std::fs::write(tmp.path().join("src.txt"), "x").unwrap();
         std::fs::create_dir(tmp.path().join("dest")).unwrap();
         let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-        app.tree.last_area = Rect { x: 0, y: 0, width: 40, height: 8 };
-        app.tree.last_inner = Rect { x: 1, y: 1, width: 38, height: 6 };
+        app.tree.last_area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 8,
+        };
+        app.tree.last_inner = Rect {
+            x: 1,
+            y: 1,
+            width: 38,
+            height: 6,
+        };
         let src_idx = app
             .tree
             .nodes
@@ -16281,8 +16891,18 @@ mod tests {
         std::fs::write(tmp.path().join("src.txt"), "x").unwrap();
         std::fs::create_dir(tmp.path().join("dest")).unwrap();
         let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-        app.tree.last_area = Rect { x: 0, y: 0, width: 40, height: 8 };
-        app.tree.last_inner = Rect { x: 1, y: 1, width: 38, height: 6 };
+        app.tree.last_area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 8,
+        };
+        app.tree.last_inner = Rect {
+            x: 1,
+            y: 1,
+            width: 38,
+            height: 6,
+        };
         let src_idx = app
             .tree
             .nodes
@@ -16329,8 +16949,18 @@ mod tests {
         std::fs::write(tmp.path().join("b.txt"), "").unwrap();
         std::fs::write(tmp.path().join("c.txt"), "").unwrap();
         let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-        app.tree.last_area = Rect { x: 0, y: 0, width: 40, height: 8 };
-        app.tree.last_inner = Rect { x: 1, y: 1, width: 38, height: 6 };
+        app.tree.last_area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 8,
+        };
+        app.tree.last_inner = Rect {
+            x: 1,
+            y: 1,
+            width: 38,
+            height: 6,
+        };
         let first_idx = 1usize;
         let last_idx = app.tree.nodes.len() - 1;
         let first_row = app.tree.last_inner.y + first_idx as u16;
@@ -16363,8 +16993,18 @@ mod tests {
         std::fs::write(tmp.path().join("a.txt"), "").unwrap();
         std::fs::write(tmp.path().join("b.txt"), "").unwrap();
         let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-        app.tree.last_area = Rect { x: 0, y: 0, width: 40, height: 8 };
-        app.tree.last_inner = Rect { x: 1, y: 1, width: 38, height: 6 };
+        app.tree.last_area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 8,
+        };
+        app.tree.last_inner = Rect {
+            x: 1,
+            y: 1,
+            width: 38,
+            height: 6,
+        };
         let a_idx = app
             .tree
             .nodes
@@ -16381,17 +17021,13 @@ mod tests {
         let b_row = app.tree.last_inner.y + b_idx as u16;
         for row in [a_row, b_row] {
             app.handle_mouse(crossterm::event::MouseEvent {
-                kind: crossterm::event::MouseEventKind::Down(
-                    crossterm::event::MouseButton::Left,
-                ),
+                kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
                 column: 6,
                 row,
                 modifiers: KeyModifiers::ALT,
             });
             app.handle_mouse(crossterm::event::MouseEvent {
-                kind: crossterm::event::MouseEventKind::Up(
-                    crossterm::event::MouseButton::Left,
-                ),
+                kind: crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
                 column: 6,
                 row,
                 modifiers: KeyModifiers::ALT,
@@ -16407,8 +17043,18 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("a.txt"), "").unwrap();
         let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-        app.tree.last_area = Rect { x: 0, y: 0, width: 40, height: 8 };
-        app.tree.last_inner = Rect { x: 1, y: 1, width: 38, height: 6 };
+        app.tree.last_area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 8,
+        };
+        app.tree.last_inner = Rect {
+            x: 1,
+            y: 1,
+            width: 38,
+            height: 6,
+        };
         let a_idx = app
             .tree
             .nodes
@@ -16439,14 +17085,19 @@ mod tests {
         let f = tmp.path().join("a.txt");
         std::fs::write(&f, "hi").unwrap();
         let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-        app.tree.last_area = Rect { x: 0, y: 0, width: 40, height: 8 };
-        app.tree.last_inner = Rect { x: 1, y: 1, width: 38, height: 6 };
-        let idx = app
-            .tree
-            .nodes
-            .iter()
-            .position(|n| n.path == f)
-            .unwrap();
+        app.tree.last_area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 8,
+        };
+        app.tree.last_inner = Rect {
+            x: 1,
+            y: 1,
+            width: 38,
+            height: 6,
+        };
+        let idx = app.tree.nodes.iter().position(|n| n.path == f).unwrap();
         let row = app.tree.last_inner.y + idx as u16;
         app.handle_mouse(crossterm::event::MouseEvent {
             kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
@@ -16460,7 +17111,10 @@ mod tests {
             row,
             modifiers: KeyModifiers::ALT,
         });
-        assert!(app.editor.is_blank_initial(), "alt-click must not open the file");
+        assert!(
+            app.editor.is_blank_initial(),
+            "alt-click must not open the file"
+        );
     }
 
     #[test]
@@ -16520,10 +17174,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let f = tmp.path().join("with space.txt");
         std::fs::write(&f, "hi").unwrap();
-        let url = format!(
-            "file://{}/with%20space.txt",
-            tmp.path().to_string_lossy()
-        );
+        let url = format!("file://{}/with%20space.txt", tmp.path().to_string_lossy());
         let parsed = parse_dropped_paths(&url);
         assert_eq!(parsed, vec![f]);
     }
@@ -16533,10 +17184,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let f = tmp.path().join("with space.txt");
         std::fs::write(&f, "hi").unwrap();
-        let escaped = format!(
-            "{}/with\\ space.txt",
-            tmp.path().to_string_lossy()
-        );
+        let escaped = format!("{}/with\\ space.txt", tmp.path().to_string_lossy());
         let parsed = parse_dropped_paths(&escaped);
         assert_eq!(parsed, vec![f]);
     }
@@ -16594,11 +17242,7 @@ mod tests {
         let b = tmp.path().join("with space.txt");
         std::fs::write(&a, "x").unwrap();
         std::fs::write(&b, "y").unwrap();
-        let payload = format!(
-            "{} \"{}\"",
-            a.display(),
-            b.display(),
-        );
+        let payload = format!("{} \"{}\"", a.display(), b.display(),);
         let parsed = parse_dropped_paths(&payload);
         assert_eq!(parsed.len(), 2, "got {parsed:?}");
         assert!(parsed.contains(&a));
@@ -16967,8 +17611,14 @@ mod tests {
             }
         }
         let inner_h = (bot - top - 1) as usize;
-        assert!(left_bars >= inner_h / 2, "left edge underpainted: {left_bars}");
-        assert!(right_bars >= inner_h / 2, "right edge underpainted: {right_bars}");
+        assert!(
+            left_bars >= inner_h / 2,
+            "left edge underpainted: {left_bars}"
+        );
+        assert!(
+            right_bars >= inner_h / 2,
+            "right edge underpainted: {right_bars}"
+        );
         // Horizontal edges: top and bottom rows must be horizontal bars on
         // most columns.
         let mut top_bars = 0;
@@ -16983,7 +17633,10 @@ mod tests {
         }
         let inner_w = (right - left - 1) as usize;
         assert!(top_bars >= inner_w / 2, "top edge underpainted: {top_bars}");
-        assert!(bot_bars >= inner_w / 2, "bottom edge underpainted: {bot_bars}");
+        assert!(
+            bot_bars >= inner_w / 2,
+            "bottom edge underpainted: {bot_bars}"
+        );
         // Corners.
         assert_eq!(buf[(left, top)].symbol(), "┌");
         assert_eq!(buf[(right, top)].symbol(), "┐");
@@ -17234,7 +17887,12 @@ mod tests {
     fn clicking_terminal_add_button_splits() {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-        app.terminal_add_buttons = vec![Rect { x: 50, y: 30, width: 3, height: 1 }];
+        app.terminal_add_buttons = vec![Rect {
+            x: 50,
+            y: 30,
+            width: 3,
+            height: 1,
+        }];
         app.handle_mouse(crossterm::event::MouseEvent {
             kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
             column: 51,
@@ -17253,8 +17911,18 @@ mod tests {
         assert_eq!(app.terminals.len(), 2);
         assert_eq!(app.active_terminal, 1);
         app.terminal_close_buttons = vec![
-            Rect { x: 10, y: 30, width: 3, height: 1 },
-            Rect { x: 50, y: 30, width: 3, height: 1 },
+            Rect {
+                x: 10,
+                y: 30,
+                width: 3,
+                height: 1,
+            },
+            Rect {
+                x: 50,
+                y: 30,
+                width: 3,
+                height: 1,
+            },
         ];
         app.handle_mouse(crossterm::event::MouseEvent {
             kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
@@ -17280,9 +17948,24 @@ mod tests {
         let pid_left = app.terminals[0].pid();
         let pid_right = app.terminals[2].pid();
         app.terminal_close_buttons = vec![
-            Rect { x: 10, y: 30, width: 3, height: 1 },
-            Rect { x: 30, y: 30, width: 3, height: 1 },
-            Rect { x: 50, y: 30, width: 3, height: 1 },
+            Rect {
+                x: 10,
+                y: 30,
+                width: 3,
+                height: 1,
+            },
+            Rect {
+                x: 30,
+                y: 30,
+                width: 3,
+                height: 1,
+            },
+            Rect {
+                x: 50,
+                y: 30,
+                width: 3,
+                height: 1,
+            },
         ];
         app.handle_mouse(crossterm::event::MouseEvent {
             kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
@@ -17332,7 +18015,11 @@ mod tests {
         // Distinct columns: the buttons must sit on different panes.
         let xs: std::collections::HashSet<u16> =
             app.terminal_add_buttons.iter().map(|r| r.x).collect();
-        assert_eq!(xs.len(), 3, "add-button rects must be on three distinct columns");
+        assert_eq!(
+            xs.len(),
+            3,
+            "add-button rects must be on three distinct columns"
+        );
     }
 
     #[test]
@@ -17343,7 +18030,10 @@ mod tests {
         // the live cwd of the shell that started the test runner.
         let pid = std::process::id();
         match cwd_of_pid(pid) {
-            Some(p) => assert!(p.is_dir(), "cwd lookup must return a real directory, got {p:?}"),
+            Some(p) => assert!(
+                p.is_dir(),
+                "cwd lookup must return a real directory, got {p:?}"
+            ),
             None => {
                 // Acceptable on platforms where neither /proc nor lsof
                 // resolve the cwd in the sandbox. The fallback in
@@ -17358,14 +18048,22 @@ mod tests {
         let mut app = App::new(tmp.path().to_path_buf()).unwrap();
         // Splitter and button share the row, as they do in real layout.
         app.terminal_splitter_y = Some(30);
-        app.terminal_add_buttons = vec![Rect { x: 50, y: 30, width: 3, height: 1 }];
+        app.terminal_add_buttons = vec![Rect {
+            x: 50,
+            y: 30,
+            width: 3,
+            height: 1,
+        }];
         app.handle_mouse(crossterm::event::MouseEvent {
             kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
             column: 51,
             row: 30,
             modifiers: KeyModifiers::NONE,
         });
-        assert!(app.splitter_drag.is_none(), "click on [+] must not start a splitter drag");
+        assert!(
+            app.splitter_drag.is_none(),
+            "click on [+] must not start a splitter drag"
+        );
         assert_eq!(app.terminals.len(), 2);
     }
 
@@ -17376,11 +18074,17 @@ mod tests {
         // Fresh App starts dirty so the first frame paints.
         assert!(app.peek_terminals_dirty(), "fresh app should be dirty");
         // Two consecutive peeks must both see the flag - peek must not clear.
-        assert!(app.peek_terminals_dirty(), "peek must not consume the dirty flag");
+        assert!(
+            app.peek_terminals_dirty(),
+            "peek must not consume the dirty flag"
+        );
         // Drain consumes it.
         let drained = app.drain_terminals_dirty();
         assert!(drained, "drain after peek should still report dirty once");
-        assert!(!app.peek_terminals_dirty(), "after drain, peek must be clean");
+        assert!(
+            !app.peek_terminals_dirty(),
+            "after drain, peek must be clean"
+        );
     }
 
     #[test]
@@ -17400,7 +18104,12 @@ mod tests {
     fn activity_bar_render_lays_out_run_debug_between_source_control_and_remote() {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-        let bar = Rect { x: 0, y: 0, width: ACTIVITY_BAR_WIDTH, height: 30 };
+        let bar = Rect {
+            x: 0,
+            y: 0,
+            width: ACTIVITY_BAR_WIDTH,
+            height: 30,
+        };
         let backend = ratatui::backend::TestBackend::new(40, 30);
         let mut term = ratatui::Terminal::new(backend).unwrap();
         term.draw(|f| app.render_activity_bar(f, bar)).unwrap();
@@ -17755,7 +18464,8 @@ pub fn run(root: PathBuf) -> Result<()> {
         // surrounding pane bg pixel-for-pixel
         // (https://gitlab.com/gnachman/iterm2/-/issues/12529).
         if crate::iterm2_inline::detect_iterm2_inline_support() {
-            out.write_all(set_session_bg_srgb_seq(EDITOR_BG_RGB).as_bytes()).ok();
+            out.write_all(set_session_bg_srgb_seq(EDITOR_BG_RGB).as_bytes())
+                .ok();
         }
         out.flush().ok();
     }
@@ -17810,11 +18520,7 @@ pub fn run(root: PathBuf) -> Result<()> {
         let launch_result = if let Some(adopted) = remote.adopted {
             crate::remote::launch_only(adopted, remote.path.as_deref())
         } else {
-            crate::remote::launch_croft_with(
-                &remote.host,
-                remote.path.as_deref(),
-                None,
-            )
+            crate::remote::launch_croft_with(&remote.host, remote.path.as_deref(), None)
         };
         restore_host_terminal_state();
         launch_result?;
@@ -17888,11 +18594,11 @@ fn run_pending_scp_uploads(app: &mut App, terminal: &mut CroftTerminal) -> Resul
     {
         let mut out = stdout();
         let _ = writeln!(out);
+        let _ = writeln!(out, "── croft: uploading {total} item(s) via scp ──");
         let _ = writeln!(
             out,
-            "── croft: uploading {total} item(s) via scp ──"
+            "(scp prompts for password / passphrase / host-key will appear below)"
         );
-        let _ = writeln!(out, "(scp prompts for password / passphrase / host-key will appear below)");
         let _ = writeln!(out);
         let _ = out.flush();
     }
@@ -18212,19 +18918,13 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
                 && app.welcome_overlay_dirty
                 && !app.terminal_maximized
             {
-                if let (Some(img), Some(layout)) =
-                    (app.welcome_image.as_ref(), app.welcome_layout)
+                if let (Some(img), Some(layout)) = (app.welcome_image.as_ref(), app.welcome_layout)
                 {
                     use std::io::Write;
                     let mut out = stdout();
                     let cursor_on = app.cursor_should_be_visible();
                     let _ = write!(out, "\x1b[?25l\x1b[s");
-                    let _ = write!(
-                        out,
-                        "\x1b[{};{}H",
-                        layout.cell_y + 1,
-                        layout.cell_x + 1
-                    );
+                    let _ = write!(out, "\x1b[{};{}H", layout.cell_y + 1, layout.cell_x + 1);
                     let _ = out.write_all(img.as_bytes());
                     let _ = write!(out, "\x1b[u");
                     if cursor_on {

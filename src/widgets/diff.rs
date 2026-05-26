@@ -72,14 +72,24 @@ fn is_word_char(c: char) -> bool {
 /// `right_lines[right]` (or blank when `Removed`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DiffRow {
-    Equal { left: usize, right: usize },
-    Removed { left: usize },
-    Added { right: usize },
+    Equal {
+        left: usize,
+        right: usize,
+    },
+    Removed {
+        left: usize,
+    },
+    Added {
+        right: usize,
+    },
     /// A line that was replaced: both columns paint, left in `left_lines`
     /// and right in `right_lines`. Produced by pairing consecutive
     /// Delete + Insert hunks so the visual rows align without forcing a
     /// pure-add or pure-remove zigzag.
-    Replaced { left: usize, right: usize },
+    Replaced {
+        left: usize,
+        right: usize,
+    },
 }
 
 impl DiffData {
@@ -108,9 +118,7 @@ impl DiffData {
     ) -> Self {
         let rows = build_diff_rows(&left_lines, &right_lines);
         let bytes_differ_but_lines_equal = match (left_raw, right_raw) {
-            (Some(l), Some(r)) => {
-                l != r && rows.iter().all(|r| matches!(r, DiffRow::Equal { .. }))
-            }
+            (Some(l), Some(r)) => l != r && rows.iter().all(|r| matches!(r, DiffRow::Equal { .. })),
             _ => false,
         };
         Self {
@@ -204,10 +212,14 @@ impl DiffData {
                 });
             }
             for k in pair..pending_remove.len() {
-                rows.push(DiffRow::Removed { left: pending_remove[k] });
+                rows.push(DiffRow::Removed {
+                    left: pending_remove[k],
+                });
             }
             for k in pair..pending_add.len() {
-                rows.push(DiffRow::Added { right: pending_add[k] });
+                rows.push(DiffRow::Added {
+                    right: pending_add[k],
+                });
             }
             pending_remove.clear();
             pending_add.clear();
@@ -550,7 +562,10 @@ pub fn build_diff_rows(left: &[String], right: &[String]) -> Vec<DiffRow> {
     while i < changes.len() {
         match changes[i].tag() {
             ChangeTag::Equal => {
-                rows.push(DiffRow::Equal { left: li, right: ri });
+                rows.push(DiffRow::Equal {
+                    left: li,
+                    right: ri,
+                });
                 li += 1;
                 ri += 1;
                 i += 1;
@@ -570,7 +585,10 @@ pub fn build_diff_rows(left: &[String], right: &[String]) -> Vec<DiffRow> {
                 }
                 let pair = removed.len().min(added.len());
                 for k in 0..pair {
-                    rows.push(DiffRow::Replaced { left: removed[k], right: added[k] });
+                    rows.push(DiffRow::Replaced {
+                        left: removed[k],
+                        right: added[k],
+                    });
                 }
                 for k in pair..removed.len() {
                     rows.push(DiffRow::Removed { left: removed[k] });
@@ -606,26 +624,20 @@ mod tests {
 
     #[test]
     fn pure_addition_emits_added_rows() {
-        let rows = build_diff_rows(
-            &lines(&[]),
-            &lines(&["new1", "new2"]),
+        let rows = build_diff_rows(&lines(&[]), &lines(&["new1", "new2"]));
+        assert_eq!(
+            rows,
+            vec![DiffRow::Added { right: 0 }, DiffRow::Added { right: 1 },]
         );
-        assert_eq!(rows, vec![
-            DiffRow::Added { right: 0 },
-            DiffRow::Added { right: 1 },
-        ]);
     }
 
     #[test]
     fn pure_removal_emits_removed_rows() {
-        let rows = build_diff_rows(
-            &lines(&["old1", "old2"]),
-            &lines(&[]),
+        let rows = build_diff_rows(&lines(&["old1", "old2"]), &lines(&[]));
+        assert_eq!(
+            rows,
+            vec![DiffRow::Removed { left: 0 }, DiffRow::Removed { left: 1 },]
         );
-        assert_eq!(rows, vec![
-            DiffRow::Removed { left: 0 },
-            DiffRow::Removed { left: 1 },
-        ]);
     }
 
     #[test]
@@ -647,10 +659,7 @@ mod tests {
     #[test]
     fn unequal_run_lengths_pair_what_they_can_then_overflow() {
         // 3 removed + 1 added → 1 replaced + 2 removed (added-side runs out).
-        let rows = build_diff_rows(
-            &lines(&["a", "b", "c", "d"]),
-            &lines(&["A"]),
-        );
+        let rows = build_diff_rows(&lines(&["a", "b", "c", "d"]), &lines(&["A"]));
         let kinds: Vec<&'static str> = rows
             .iter()
             .map(|r| match r {
@@ -768,7 +777,11 @@ mod tests {
             lines(&["a", "B", "c", "d", "E"]),
         );
         assert_eq!(d.next_change_row(0), Some(1));
-        assert_eq!(d.next_change_row(1), Some(4), "must skip past the current hunk");
+        assert_eq!(
+            d.next_change_row(1),
+            Some(4),
+            "must skip past the current hunk"
+        );
         assert_eq!(d.next_change_row(4), None);
     }
 
@@ -900,8 +913,15 @@ mod tests {
             PathBuf::from("doomed.rs"),
             "fn main() {\n    println!(\"bye\");\n}\n",
         );
-        assert!(d.unified, "unified flag must be set so the renderer picks the single-column path");
-        assert_eq!(d.left_lines.len(), 3, "three source lines must produce three rows");
+        assert!(
+            d.unified,
+            "unified flag must be set so the renderer picks the single-column path"
+        );
+        assert_eq!(
+            d.left_lines.len(),
+            3,
+            "three source lines must produce three rows"
+        );
         assert!(d.right_lines.is_empty(), "deletion view has no right side");
         assert_eq!(
             d.rows,
@@ -916,12 +936,7 @@ mod tests {
 
     #[test]
     fn standard_diff_builders_leave_unified_flag_off() {
-        let d = DiffData::build(
-            PathBuf::new(),
-            PathBuf::new(),
-            lines(&["a"]),
-            lines(&["b"]),
-        );
+        let d = DiffData::build(PathBuf::new(), PathBuf::new(), lines(&["a"]), lines(&["b"]));
         assert!(!d.unified, "side-by-side diffs must stay non-unified");
     }
 
@@ -1006,7 +1021,8 @@ mod tests {
 
     #[test]
     fn build_side_by_side_from_git_text_skips_index_and_dashdash_headers() {
-        let raw = "diff --git a/x b/x\nindex 1..2 100644\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-old\n+new\n";
+        let raw =
+            "diff --git a/x b/x\nindex 1..2 100644\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-old\n+new\n";
         let d = DiffData::build_side_by_side_from_git_text(PathBuf::from("staged"), raw);
         // No row may carry "index ", "--- a/x", or "+++ b/x" in either side.
         assert!(

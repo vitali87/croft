@@ -9,9 +9,18 @@ const fn rgb(r: u8, g: u8, b: u8) -> Color {
     Color::Rgb(r, g, b)
 }
 
-pub const FOLDER_CLOSED: Icon = Icon { glyph: '\u{ea83}', color: rgb(0xdc, 0xb6, 0x7a) };
-pub const FOLDER_OPEN: Icon = Icon { glyph: '\u{eaf7}', color: rgb(0xdc, 0xb6, 0x7a) };
-pub const DEFAULT_FILE: Icon = Icon { glyph: '\u{ea7b}', color: rgb(0xcc, 0xcc, 0xcc) };
+pub const FOLDER_CLOSED: Icon = Icon {
+    glyph: '\u{ea83}',
+    color: rgb(0xdc, 0xb6, 0x7a),
+};
+pub const FOLDER_OPEN: Icon = Icon {
+    glyph: '\u{eaf7}',
+    color: rgb(0xdc, 0xb6, 0x7a),
+};
+pub const DEFAULT_FILE: Icon = Icon {
+    glyph: '\u{ea7b}',
+    color: rgb(0xcc, 0xcc, 0xcc),
+};
 pub const CHEVRON_CLOSED: char = '▸';
 pub const CHEVRON_OPEN: char = '▾';
 
@@ -45,7 +54,10 @@ pub fn for_path(name: &str, suffix: &str) -> Icon {
 }
 
 fn name_icon(n: &str) -> Option<Icon> {
-    let i = |g, r, gr, b| Icon { glyph: g, color: rgb(r, gr, b) };
+    let i = |g, r, gr, b| Icon {
+        glyph: g,
+        color: rgb(r, gr, b),
+    };
     Some(match n {
         // fa-git_alt official Git logo (red)
         ".gitignore" | ".gitattributes" | ".gitmodules" => i('\u{f841}', 0xe8, 0x27, 0x4b),
@@ -149,8 +161,14 @@ mod tests {
         // U+EAE5 was `cod-exclude` (a "no entry" circle); it made every
         // unknown file look like a stop sign. The proper sheet-of-paper
         // glyph is `cod-file` at U+EA7B.
-        assert_eq!(DEFAULT_FILE.glyph, '\u{ea7b}', "DEFAULT_FILE must be cod-file");
-        assert_ne!(DEFAULT_FILE.glyph, '\u{eae5}', "U+EAE5 is cod-exclude, not a file glyph");
+        assert_eq!(
+            DEFAULT_FILE.glyph, '\u{ea7b}',
+            "DEFAULT_FILE must be cod-file"
+        );
+        assert_ne!(
+            DEFAULT_FILE.glyph, '\u{eae5}',
+            "U+EAE5 is cod-exclude, not a file glyph"
+        );
     }
 
     #[test]
@@ -169,7 +187,10 @@ mod tests {
         // the user saw in the activity bar. Activity-bar Explorer must be
         // `cod-files` (multi-page stack) at U+EAF0.
         assert_eq!(ACTIVITY_EXPLORER, '\u{eaf0}');
-        assert_ne!(ACTIVITY_EXPLORER, '\u{eaeb}', "U+EAEB is cod-file_pdf, not cod-files");
+        assert_ne!(
+            ACTIVITY_EXPLORER, '\u{eaeb}',
+            "U+EAEB is cod-file_pdf, not cod-files"
+        );
     }
 
     #[test]
@@ -180,7 +201,10 @@ mod tests {
     #[test]
     fn activity_bar_remote_glyph_is_cod_remote_explorer() {
         assert_eq!(ACTIVITY_REMOTE, '\u{eb39}');
-        assert_ne!(ACTIVITY_REMOTE, '\u{eb3c}', "U+EB3C is not the Remote Explorer glyph");
+        assert_ne!(
+            ACTIVITY_REMOTE, '\u{eb3c}',
+            "U+EB3C is not the Remote Explorer glyph"
+        );
     }
 
     #[test]
@@ -193,7 +217,10 @@ mod tests {
         // no triangle); both are wrong for the Run-and-Debug entry.
         assert_eq!(ACTIVITY_RUN_DEBUG, '\u{eb91}');
         assert_ne!(ACTIVITY_RUN_DEBUG, '\u{ead1}', "U+EAD1 is debug-pause");
-        assert_ne!(ACTIVITY_RUN_DEBUG, '\u{ead8}', "U+EAD8 is debug, no triangle");
+        assert_ne!(
+            ACTIVITY_RUN_DEBUG, '\u{ead8}',
+            "U+EAD8 is debug, no triangle"
+        );
     }
 
     #[test]
@@ -220,7 +247,10 @@ mod tests {
     fn archive_glyph_is_cod_file_zip_not_cod_filter() {
         // U+EAF1 is cod-filter (a funnel). Archives need cod-file_zip U+EAEF.
         let icon = for_path("foo.zip", ".zip");
-        assert_ne!(icon.glyph, '\u{eaf1}', "U+EAF1 is cod-filter, not an archive");
+        assert_ne!(
+            icon.glyph, '\u{eaf1}',
+            "U+EAF1 is cod-filter, not an archive"
+        );
         assert_eq!(icon.glyph, '\u{eaef}');
     }
 
@@ -228,7 +258,10 @@ mod tests {
     fn image_glyph_is_cod_file_media_not_cod_mail() {
         // U+EB1C is cod-mail (an envelope). Images need cod-file_media U+EAEA.
         let icon = for_path("logo.png", ".png");
-        assert_ne!(icon.glyph, '\u{eb1c}', "U+EB1C is cod-mail, not an image glyph");
+        assert_ne!(
+            icon.glyph, '\u{eb1c}',
+            "U+EB1C is cod-mail, not an image glyph"
+        );
         assert_eq!(icon.glyph, '\u{eaea}');
     }
 
@@ -236,7 +269,10 @@ mod tests {
     fn log_glyph_is_cod_output_not_cod_mention() {
         // U+EB1F is cod-mention (the @ sign). Logs need cod-output U+EB9D.
         let icon = for_path("debug.log", ".log");
-        assert_ne!(icon.glyph, '\u{eb1f}', "U+EB1F is cod-mention, not a log glyph");
+        assert_ne!(
+            icon.glyph, '\u{eb1f}',
+            "U+EB1F is cod-mention, not a log glyph"
+        );
         assert_eq!(icon.glyph, '\u{eb9d}');
     }
 
@@ -245,7 +281,10 @@ mod tests {
         // U+EB6E is cod-triangle_down (a downward arrow). CSV/TSV need
         // cod-table U+EBB7.
         let icon = for_path("data.csv", ".csv");
-        assert_ne!(icon.glyph, '\u{eb6e}', "U+EB6E is cod-triangle_down, not a table");
+        assert_ne!(
+            icon.glyph, '\u{eb6e}',
+            "U+EB6E is cod-triangle_down, not a table"
+        );
         assert_eq!(icon.glyph, '\u{ebb7}');
     }
 
@@ -316,7 +355,10 @@ mod tests {
 }
 
 fn ext_icon(s: &str) -> Option<Icon> {
-    let i = |g, r, gr, b| Icon { glyph: g, color: rgb(r, gr, b) };
+    let i = |g, r, gr, b| Icon {
+        glyph: g,
+        color: rgb(r, gr, b),
+    };
     Some(match s {
         ".py" | ".pyi" | ".pyc" | ".ipynb" => i('\u{e235}', 0x35, 0x72, 0xa5),
         ".js" | ".mjs" | ".cjs" => i('\u{e74e}', 0xcb, 0xcb, 0x41),

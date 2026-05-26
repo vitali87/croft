@@ -57,7 +57,12 @@ impl RunDebugPanel {
 
     pub fn click_button(&self, x: u16, y: u16) -> bool {
         let r = self.last_button_area;
-        r.width > 0 && r.height > 0 && x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height
+        r.width > 0
+            && r.height > 0
+            && x >= r.x
+            && x < r.x + r.width
+            && y >= r.y
+            && y < r.y + r.height
     }
 
     pub fn button_label(&self) -> String {
@@ -85,7 +90,9 @@ impl Widget for &mut RunDebugPanel {
         } else {
             Style::default().fg(Color::DarkGray)
         };
-        let block = Block::default().borders(Borders::ALL).border_style(border_style);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(border_style);
         let inner = block.inner(area);
         block.render(area, buf);
         self.last_area = area;
@@ -149,10 +156,7 @@ impl Widget for &mut RunDebugPanel {
             buf.set_span(
                 glyph_x,
                 glyph_y,
-                &Span::styled(
-                    crate::icons::ACTIVITY_RUN_DEBUG.to_string(),
-                    glyph_style,
-                ),
+                &Span::styled(crate::icons::ACTIVITY_RUN_DEBUG.to_string(), glyph_style),
                 1,
             );
             y += icon_h + gap_after_icon;
@@ -169,7 +173,12 @@ impl Widget for &mut RunDebugPanel {
                     .add_modifier(Modifier::BOLD),
             );
         title.render(
-            Rect { x: inner.x, y, width: inner.width, height: TITLE_H },
+            Rect {
+                x: inner.x,
+                y,
+                width: inner.width,
+                height: TITLE_H,
+            },
             buf,
         );
         y += TITLE_H + GAP_AFTER_TITLE;
@@ -261,7 +270,12 @@ mod tests {
     #[test]
     fn click_button_is_inside_recorded_button_area() {
         let mut panel = RunDebugPanel::new();
-        panel.last_button_area = Rect { x: 10, y: 5, width: 12, height: 3 };
+        panel.last_button_area = Rect {
+            x: 10,
+            y: 5,
+            width: 12,
+            height: 3,
+        };
         assert!(panel.click_button(10, 5));
         assert!(panel.click_button(21, 7));
         assert!(!panel.click_button(22, 5));
@@ -272,7 +286,12 @@ mod tests {
     fn rendering_lays_out_button_area_inside_panel() {
         let mut panel = RunDebugPanel::new();
         panel.set_active_file(Some(PathBuf::from("/work/run_me.rs")));
-        let area = Rect { x: 0, y: 0, width: 40, height: 24 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 24,
+        };
         let mut buf = Buffer::empty(area);
         Widget::render(&mut panel, area, &mut buf);
         let b = panel.last_button_area;
@@ -295,7 +314,12 @@ mod tests {
     #[test]
     fn empty_state_renders_centred_title_and_description_and_chunky_button() {
         let mut panel = RunDebugPanel::new();
-        let area = Rect { x: 0, y: 0, width: 36, height: 24 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 36,
+            height: 24,
+        };
         let mut buf = Buffer::empty(area);
         Widget::render(&mut panel, area, &mut buf);
         let dump = buffer_to_string(&buf);
@@ -337,7 +361,12 @@ mod tests {
         // fallback for terminals without OSC-1337 support; iTerm2
         // overwrites those cells with the rasterised image.
         let mut panel = RunDebugPanel::new();
-        let area = Rect { x: 0, y: 0, width: 36, height: 24 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 36,
+            height: 24,
+        };
         let mut buf = Buffer::empty(area);
         Widget::render(&mut panel, area, &mut buf);
         let (ix, iy) = panel
@@ -358,7 +387,12 @@ mod tests {
     #[test]
     fn run_and_debug_button_uses_rounded_border_corners() {
         let mut panel = RunDebugPanel::new();
-        let area = Rect { x: 0, y: 0, width: 36, height: 24 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 36,
+            height: 24,
+        };
         let mut buf = Buffer::empty(area);
         Widget::render(&mut panel, area, &mut buf);
         let b = panel.last_button_area;
@@ -366,11 +400,25 @@ mod tests {
         let tl = buf[(b.x, b.y)].symbol().to_string();
         let tr = buf[(b.x + b.width - 1, b.y)].symbol().to_string();
         let bl = buf[(b.x, b.y + b.height - 1)].symbol().to_string();
-        let br = buf[(b.x + b.width - 1, b.y + b.height - 1)].symbol().to_string();
-        assert_eq!(tl, "╭", "top-left button corner must be rounded; got {tl:?}");
-        assert_eq!(tr, "╮", "top-right button corner must be rounded; got {tr:?}");
-        assert_eq!(bl, "╰", "bottom-left button corner must be rounded; got {bl:?}");
-        assert_eq!(br, "╯", "bottom-right button corner must be rounded; got {br:?}");
+        let br = buf[(b.x + b.width - 1, b.y + b.height - 1)]
+            .symbol()
+            .to_string();
+        assert_eq!(
+            tl, "╭",
+            "top-left button corner must be rounded; got {tl:?}"
+        );
+        assert_eq!(
+            tr, "╮",
+            "top-right button corner must be rounded; got {tr:?}"
+        );
+        assert_eq!(
+            bl, "╰",
+            "bottom-left button corner must be rounded; got {bl:?}"
+        );
+        assert_eq!(
+            br, "╯",
+            "bottom-right button corner must be rounded; got {br:?}"
+        );
     }
 
     #[test]
@@ -386,7 +434,12 @@ mod tests {
             for height in 0u16..30 {
                 let mut panel = RunDebugPanel::new();
                 panel.set_active_file(Some(PathBuf::from("/work/run_me.rs")));
-                let area = Rect { x: 0, y: 0, width, height };
+                let area = Rect {
+                    x: 0,
+                    y: 0,
+                    width,
+                    height,
+                };
                 if area.width == 0 || area.height == 0 {
                     continue;
                 }
@@ -399,7 +452,12 @@ mod tests {
     #[test]
     fn small_panel_skips_icon_block_to_keep_button_visible() {
         let mut panel = RunDebugPanel::new();
-        let area = Rect { x: 0, y: 0, width: 30, height: 12 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 30,
+            height: 12,
+        };
         let mut buf = Buffer::empty(area);
         Widget::render(&mut panel, area, &mut buf);
         assert!(

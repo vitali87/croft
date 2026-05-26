@@ -1,4 +1,4 @@
-use crate::widgets::search::{split_for_highlight, SearchOpts};
+use crate::widgets::search::{SearchOpts, split_for_highlight};
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
@@ -64,12 +64,20 @@ pub fn find_next_match(
         let matches = line_matches(&lines[row], opts, needle);
         for (col, len) in matches {
             if delta == 0 && row == from_row {
-                let cmp = if skip_current { col <= from_col_chars } else { col < from_col_chars };
+                let cmp = if skip_current {
+                    col <= from_col_chars
+                } else {
+                    col < from_col_chars
+                };
                 if cmp {
                     continue;
                 }
             }
-            return Some(MatchPos { row, col_chars: col, len_chars: len });
+            return Some(MatchPos {
+                row,
+                col_chars: col,
+                len_chars: len,
+            });
         }
         if delta == n {
             break;
@@ -96,7 +104,11 @@ pub fn find_prev_match(
         let mut best: Option<(usize, usize)> = None;
         for (col, len) in matches {
             if delta == 0 && row == from_row {
-                let cmp = if skip_current { col >= from_col_chars } else { col > from_col_chars };
+                let cmp = if skip_current {
+                    col >= from_col_chars
+                } else {
+                    col > from_col_chars
+                };
                 if cmp {
                     continue;
                 }
@@ -104,7 +116,11 @@ pub fn find_prev_match(
             best = Some((col, len));
         }
         if let Some((col, len)) = best {
-            return Some(MatchPos { row, col_chars: col, len_chars: len });
+            return Some(MatchPos {
+                row,
+                col_chars: col,
+                len_chars: len,
+            });
         }
         if delta == n {
             break;
@@ -150,7 +166,12 @@ pub fn render_editor_find(state: &mut EditorFind, editor_area: Rect, buf: &mut B
         .x
         .saturating_add(editor_area.width.saturating_sub(width).saturating_sub(1));
     let y = editor_area.y.saturating_add(1);
-    let rect = Rect { x, y, width, height };
+    let rect = Rect {
+        x,
+        y,
+        width,
+        height,
+    };
     state.last_rect = rect;
 
     Widget::render(Clear, rect, buf);
@@ -263,8 +284,14 @@ mod tests {
     #[test]
     fn case_sensitive_opt_distinguishes_cases() {
         let buf = lines(&["Alpha alpha"]);
-        let opts = SearchOpts { case_sensitive: true, ..SearchOpts::default() };
+        let opts = SearchOpts {
+            case_sensitive: true,
+            ..SearchOpts::default()
+        };
         let m = find_next_match(&buf, "alpha", opts, 0, 0, false).unwrap();
-        assert_eq!(m.col_chars, 6, "case-sensitive 'alpha' must skip the leading 'Alpha'");
+        assert_eq!(
+            m.col_chars, 6,
+            "case-sensitive 'alpha' must skip the leading 'Alpha'"
+        );
     }
 }

@@ -32,11 +32,13 @@ pub fn query(root: &Path) -> GitStatus {
     };
     let porcelain = run_git(root, &["status", "--porcelain"]).unwrap_or_default();
     let dirty = parse_porcelain_dirty(&porcelain);
-    let (ahead, behind) =
-        match run_git(root, &["rev-list", "--left-right", "--count", "HEAD...@{u}"]) {
-            Ok(s) => parse_ahead_behind(&s),
-            Err(_) => (0, 0),
-        };
+    let (ahead, behind) = match run_git(
+        root,
+        &["rev-list", "--left-right", "--count", "HEAD...@{u}"],
+    ) {
+        Ok(s) => parse_ahead_behind(&s),
+        Err(_) => (0, 0),
+    };
     GitStatus {
         in_repo: true,
         branch,
@@ -105,7 +107,12 @@ pub struct ChangeEntry {
 
 impl Default for ChangeEntry {
     fn default() -> Self {
-        Self { path: String::new(), kind: ChangeKind::Modified, additions: 0, deletions: 0 }
+        Self {
+            path: String::new(),
+            kind: ChangeKind::Modified,
+            additions: 0,
+            deletions: 0,
+        }
     }
 }
 
@@ -179,15 +186,42 @@ pub fn unquote_porcelain_path(raw: &str) -> String {
         if b == b'\\' && i + 1 < bytes.len() {
             let n = bytes[i + 1];
             match n {
-                b'a' => { out.push(0x07); i += 2; }
-                b'b' => { out.push(0x08); i += 2; }
-                b't' => { out.push(b'\t'); i += 2; }
-                b'n' => { out.push(b'\n'); i += 2; }
-                b'v' => { out.push(0x0B); i += 2; }
-                b'f' => { out.push(0x0C); i += 2; }
-                b'r' => { out.push(b'\r'); i += 2; }
-                b'"' => { out.push(b'"'); i += 2; }
-                b'\\' => { out.push(b'\\'); i += 2; }
+                b'a' => {
+                    out.push(0x07);
+                    i += 2;
+                }
+                b'b' => {
+                    out.push(0x08);
+                    i += 2;
+                }
+                b't' => {
+                    out.push(b'\t');
+                    i += 2;
+                }
+                b'n' => {
+                    out.push(b'\n');
+                    i += 2;
+                }
+                b'v' => {
+                    out.push(0x0B);
+                    i += 2;
+                }
+                b'f' => {
+                    out.push(0x0C);
+                    i += 2;
+                }
+                b'r' => {
+                    out.push(b'\r');
+                    i += 2;
+                }
+                b'"' => {
+                    out.push(b'"');
+                    i += 2;
+                }
+                b'\\' => {
+                    out.push(b'\\');
+                    i += 2;
+                }
                 b'0'..=b'7' => {
                     // Consume a run of `\NNN` triplets so multi-byte
                     // UTF-8 sequences land in `out` as raw bytes ready
@@ -205,7 +239,10 @@ pub fn unquote_porcelain_path(raw: &str) -> String {
                         i += 4;
                     }
                 }
-                _ => { out.push(b'\\'); i += 1; }
+                _ => {
+                    out.push(b'\\');
+                    i += 1;
+                }
             }
         } else {
             out.push(b);
@@ -236,15 +273,30 @@ pub fn parse_porcelain_changes(out: &str) -> Vec<ChangeEntry> {
             unquote_porcelain_path(path_part)
         };
         // Conflicts: AA, DD, AU, UA, DU, UD, UU.
-        let conflict = matches!((x, y),
-            ('A', 'A') | ('D', 'D') | ('A', 'U') | ('U', 'A')
-            | ('D', 'U') | ('U', 'D') | ('U', 'U'));
+        let conflict = matches!(
+            (x, y),
+            ('A', 'A')
+                | ('D', 'D')
+                | ('A', 'U')
+                | ('U', 'A')
+                | ('D', 'U')
+                | ('U', 'D')
+                | ('U', 'U')
+        );
         if conflict {
-            entries.push(ChangeEntry { path, kind: ChangeKind::Conflicted, ..Default::default() });
+            entries.push(ChangeEntry {
+                path,
+                kind: ChangeKind::Conflicted,
+                ..Default::default()
+            });
             continue;
         }
         if x == '?' && y == '?' {
-            entries.push(ChangeEntry { path, kind: ChangeKind::Untracked, ..Default::default() });
+            entries.push(ChangeEntry {
+                path,
+                kind: ChangeKind::Untracked,
+                ..Default::default()
+            });
             continue;
         }
         if x != ' ' && x != '?' {
@@ -255,7 +307,11 @@ pub fn parse_porcelain_changes(out: &str) -> Vec<ChangeEntry> {
                 'R' | 'C' => ChangeKind::StagedRenamed,
                 _ => ChangeKind::StagedModified,
             };
-            entries.push(ChangeEntry { path: path.clone(), kind, ..Default::default() });
+            entries.push(ChangeEntry {
+                path: path.clone(),
+                kind,
+                ..Default::default()
+            });
         }
         if y != ' ' && y != '?' {
             let kind = match y {
@@ -263,7 +319,11 @@ pub fn parse_porcelain_changes(out: &str) -> Vec<ChangeEntry> {
                 'D' => ChangeKind::Deleted,
                 _ => ChangeKind::Modified,
             };
-            entries.push(ChangeEntry { path, kind, ..Default::default() });
+            entries.push(ChangeEntry {
+                path,
+                kind,
+                ..Default::default()
+            });
         }
     }
     entries
@@ -326,7 +386,9 @@ pub fn parse_numstat(out: &str) -> std::collections::HashMap<String, (usize, usi
         let mut parts = line.splitn(3, '\t');
         let Some(adds) = parts.next() else { continue };
         let Some(dels) = parts.next() else { continue };
-        let Some(path_part) = parts.next() else { continue };
+        let Some(path_part) = parts.next() else {
+            continue;
+        };
         let additions = adds.parse::<usize>().unwrap_or(0);
         let deletions = dels.parse::<usize>().unwrap_or(0);
         let path = if let Some((_, dst)) = path_part.split_once(" -> ") {
@@ -339,11 +401,12 @@ pub fn parse_numstat(out: &str) -> std::collections::HashMap<String, (usize, usi
     map
 }
 
-fn numstat_map(
-    workdir: &str,
-    args: &[&str],
-) -> std::collections::HashMap<String, (usize, usize)> {
-    let output = match Command::new("git").args(["-C", workdir]).args(args).output() {
+fn numstat_map(workdir: &str, args: &[&str]) -> std::collections::HashMap<String, (usize, usize)> {
+    let output = match Command::new("git")
+        .args(["-C", workdir])
+        .args(args)
+        .output()
+    {
         Ok(o) if o.status.success() => o,
         _ => return std::collections::HashMap::new(),
     };
@@ -352,7 +415,9 @@ fn numstat_map(
 
 fn count_lines_in_file(root: &Path, rel_path: &str) -> usize {
     let abs = root.join(rel_path);
-    let Ok(bytes) = std::fs::read(&abs) else { return 0 };
+    let Ok(bytes) = std::fs::read(&abs) else {
+        return 0;
+    };
     if bytes.is_empty() {
         return 0;
     }
@@ -372,7 +437,9 @@ fn count_lines_in_file(root: &Path, rel_path: &str) -> usize {
 /// non-UTF8 content (binary file) is reported as an error so the caller
 /// can fall back to opening the file directly.
 pub fn read_file_at_head(root: &Path, rel_path: &str) -> Result<String, String> {
-    let path_str = root.to_str().ok_or_else(|| "non-utf8 workspace path".to_string())?;
+    let path_str = root
+        .to_str()
+        .ok_or_else(|| "non-utf8 workspace path".to_string())?;
     let spec = format!("HEAD:{rel_path}");
     let output = Command::new("git")
         .args(["-C", path_str, "show", &spec])
@@ -381,7 +448,10 @@ pub fn read_file_at_head(root: &Path, rel_path: &str) -> Result<String, String> 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         return Err(if stderr.is_empty() {
-            format!("git show {spec} failed with code {:?}", output.status.code())
+            format!(
+                "git show {spec} failed with code {:?}",
+                output.status.code()
+            )
         } else {
             stderr
         });
@@ -394,7 +464,9 @@ pub fn commit_all_tracked(root: &Path, message: &str) -> Result<String, String> 
     if message.trim().is_empty() {
         return Err("Commit message is empty".to_string());
     }
-    let path_str = root.to_str().ok_or_else(|| "non-utf8 workspace path".to_string())?;
+    let path_str = root
+        .to_str()
+        .ok_or_else(|| "non-utf8 workspace path".to_string())?;
     let output = Command::new("git")
         .args(["-C", path_str, "commit", "-am", message])
         .output()
@@ -419,7 +491,9 @@ pub fn commit_all_tracked(root: &Path, message: &str) -> Result<String, String> 
 /// summary verbatim so the panel can surface the host's full message —
 /// `git push` typically reports the ref update on stderr even on success.
 pub fn push_current_branch(root: &Path) -> Result<String, String> {
-    let path_str = root.to_str().ok_or_else(|| "non-utf8 workspace path".to_string())?;
+    let path_str = root
+        .to_str()
+        .ok_or_else(|| "non-utf8 workspace path".to_string())?;
     let output = Command::new("git")
         .args(["-C", path_str, "push"])
         .output()
@@ -456,10 +530,14 @@ pub fn diff_against_branch(root: &Path, branch: &str) -> Result<String, String> 
 }
 
 fn diff_text(root: &Path, args: &[&str]) -> Result<String, String> {
-    let path_str = root.to_str().ok_or_else(|| "non-utf8 workspace path".to_string())?;
+    let path_str = root
+        .to_str()
+        .ok_or_else(|| "non-utf8 workspace path".to_string())?;
     let mut cmd = Command::new("git");
     cmd.args(["-C", path_str]).args(args);
-    let output = cmd.output().map_err(|e| format!("failed to spawn git: {e}"))?;
+    let output = cmd
+        .output()
+        .map_err(|e| format!("failed to spawn git: {e}"))?;
     if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     } else {
@@ -480,7 +558,9 @@ fn diff_text(root: &Path, args: &[&str]) -> Result<String, String> {
 /// `git rev-parse --verify <name>`. Returns `Err` when none resolves so
 /// the caller can surface the precise failure instead of guessing.
 pub fn default_branch(root: &Path) -> Result<String, String> {
-    let path_str = root.to_str().ok_or_else(|| "non-utf8 workspace path".to_string())?;
+    let path_str = root
+        .to_str()
+        .ok_or_else(|| "non-utf8 workspace path".to_string())?;
     if let Ok(out) = Command::new("git")
         .args([
             "-C",
@@ -504,7 +584,14 @@ pub fn default_branch(root: &Path) -> Result<String, String> {
     }
     for candidate in ["main", "master", "develop", "trunk"] {
         let out = Command::new("git")
-            .args(["-C", path_str, "rev-parse", "--verify", "--quiet", candidate])
+            .args([
+                "-C",
+                path_str,
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                candidate,
+            ])
             .output();
         if let Ok(o) = out {
             if o.status.success() {
@@ -512,7 +599,10 @@ pub fn default_branch(root: &Path) -> Result<String, String> {
             }
         }
     }
-    Err("Could not resolve a default branch (tried origin/HEAD, main, master, develop, trunk)".to_string())
+    Err(
+        "Could not resolve a default branch (tried origin/HEAD, main, master, develop, trunk)"
+            .to_string(),
+    )
 }
 
 /// Stage a single path. Convenience wrapper over `stage_paths` for the
@@ -532,13 +622,17 @@ pub fn stage_paths(root: &Path, rel_paths: &[String]) -> Result<(), String> {
     if rel_paths.is_empty() {
         return Ok(());
     }
-    let path_str = root.to_str().ok_or_else(|| "non-utf8 workspace path".to_string())?;
+    let path_str = root
+        .to_str()
+        .ok_or_else(|| "non-utf8 workspace path".to_string())?;
     let mut cmd = Command::new("git");
     cmd.args(["-C", path_str, "add", "--"]);
     for p in rel_paths {
         cmd.arg(p);
     }
-    let output = cmd.output().map_err(|e| format!("failed to spawn git: {e}"))?;
+    let output = cmd
+        .output()
+        .map_err(|e| format!("failed to spawn git: {e}"))?;
     if output.status.success() {
         Ok(())
     } else {
@@ -569,7 +663,9 @@ pub fn discard_path(root: &Path, rel_path: &str, untracked: bool) -> Result<(), 
                 .map_err(|e| format!("failed to remove {}: {e}", abs.display()))
         }
     } else {
-        let path_str = root.to_str().ok_or_else(|| "non-utf8 workspace path".to_string())?;
+        let path_str = root
+            .to_str()
+            .ok_or_else(|| "non-utf8 workspace path".to_string())?;
         let output = Command::new("git")
             .args(["-C", path_str, "checkout", "HEAD", "--", rel_path])
             .output()
@@ -653,7 +749,10 @@ pub fn fetch_croft_recent_commits_full(
     let remote = croft_repository_remote();
     let Some(https_url) = remote.as_deref().and_then(https_clone_url_for_remote) else {
         return (
-            RecentCommits { remote, commits: Vec::new() },
+            RecentCommits {
+                remote,
+                commits: Vec::new(),
+            },
             RecentCommitsError::NoEndpoint,
         );
     };
@@ -670,7 +769,10 @@ pub fn fetch_croft_recent_commits_full(
             RecentCommitsError::None,
         ),
         Err(_) => (
-            RecentCommits { remote, commits: Vec::new() },
+            RecentCommits {
+                remote,
+                commits: Vec::new(),
+            },
             RecentCommitsError::Network,
         ),
     }
@@ -966,7 +1068,9 @@ impl GitRequest {
         use GitRequest::*;
         match (self, other) {
             (SetRoot(_), _) | (_, SetRoot(_)) => {
-                unreachable!("SetRoot is drained inline before merge; it cannot reach the query merge")
+                unreachable!(
+                    "SetRoot is drained inline before merge; it cannot reach the query merge"
+                )
             }
             (StatusAndChanges, _) | (_, StatusAndChanges) => StatusAndChanges,
             (Status, Changes) | (Changes, Status) => StatusAndChanges,
@@ -1103,7 +1207,11 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let p = tmp.path();
         // Init the repo non-interactively.
-        let _ = Command::new("git").args(["-C"]).arg(p).args(["init", "-q", "-b", "main"]).output();
+        let _ = Command::new("git")
+            .args(["-C"])
+            .arg(p)
+            .args(["init", "-q", "-b", "main"])
+            .output();
         // Empty repo: HEAD points at unborn branch "main", but symbolic-ref
         // still works.
         let s = query(p);
@@ -1116,7 +1224,11 @@ mod tests {
     fn query_reports_dirty_after_a_file_appears() {
         let tmp = TempDir::new().unwrap();
         let p = tmp.path();
-        let _ = Command::new("git").args(["-C"]).arg(p).args(["init", "-q", "-b", "main"]).output();
+        let _ = Command::new("git")
+            .args(["-C"])
+            .arg(p)
+            .args(["init", "-q", "-b", "main"])
+            .output();
         // Make a working-tree change.
         std::fs::write(p.join("hello.txt"), "hi").unwrap();
         let s = query(p);
@@ -1168,8 +1280,7 @@ mod tests {
     #[test]
     fn commits_api_endpoint_for_remote_supports_bitbucket_and_github() {
         let bitbucket =
-            commits_api_endpoint_for_remote("https://bitbucket.org/vitali_avagyan/croft")
-                .unwrap();
+            commits_api_endpoint_for_remote("https://bitbucket.org/vitali_avagyan/croft").unwrap();
         assert_eq!(bitbucket.provider, CommitApiProvider::Bitbucket);
         assert_eq!(
             bitbucket.url,
@@ -1178,7 +1289,10 @@ mod tests {
 
         let github = commits_api_endpoint_for_remote("git@github.com:example/croft.git").unwrap();
         assert_eq!(github.provider, CommitApiProvider::GitHub);
-        assert_eq!(github.url, "https://api.github.com/repos/example/croft/commits?per_page=5");
+        assert_eq!(
+            github.url,
+            "https://api.github.com/repos/example/croft/commits?per_page=5"
+        );
     }
 
     #[test]
@@ -1193,8 +1307,7 @@ mod tests {
     #[test]
     fn commits_api_endpoint_for_remote_supports_codeberg_ssh_url() {
         let endpoint =
-            commits_api_endpoint_for_remote("ssh://git@codeberg.org/vitali87/croft.git")
-                .unwrap();
+            commits_api_endpoint_for_remote("ssh://git@codeberg.org/vitali87/croft.git").unwrap();
         assert_eq!(endpoint.provider, CommitApiProvider::Codeberg);
         assert_eq!(
             endpoint.url,
@@ -1266,7 +1379,10 @@ mod tests {
         let rows = parse_git_log_lines(out).unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].short_hash, "abc1234");
-        assert_eq!(rows[0].full_hash, "abc1234fffffffffffffffffffffffffffffffffff");
+        assert_eq!(
+            rows[0].full_hash,
+            "abc1234fffffffffffffffffffffffffffffffffff"
+        );
         assert_eq!(rows[0].committer_unix, 1762348800);
         assert_eq!(rows[0].subject, "feat: do thing");
         assert_eq!(rows[1].subject, "fix: another");
@@ -1317,21 +1433,43 @@ mod tests {
             .status()
             .unwrap();
         Command::new("git")
-            .args(["-C"]).arg(upstream.path())
+            .args(["-C"])
+            .arg(upstream.path())
             .args(["config", "user.email", "test@example.com"])
-            .status().unwrap();
+            .status()
+            .unwrap();
         Command::new("git")
-            .args(["-C"]).arg(upstream.path())
+            .args(["-C"])
+            .arg(upstream.path())
             .args(["config", "user.name", "test"])
-            .status().unwrap();
+            .status()
+            .unwrap();
         std::fs::write(upstream.path().join("a.txt"), "1").unwrap();
-        Command::new("git").args(["-C"]).arg(upstream.path()).args(["add", "."]).status().unwrap();
-        Command::new("git").args(["-C"]).arg(upstream.path())
-            .args(["commit", "-m", "first commit", "--quiet"]).status().unwrap();
+        Command::new("git")
+            .args(["-C"])
+            .arg(upstream.path())
+            .args(["add", "."])
+            .status()
+            .unwrap();
+        Command::new("git")
+            .args(["-C"])
+            .arg(upstream.path())
+            .args(["commit", "-m", "first commit", "--quiet"])
+            .status()
+            .unwrap();
         std::fs::write(upstream.path().join("a.txt"), "2").unwrap();
-        Command::new("git").args(["-C"]).arg(upstream.path()).args(["add", "."]).status().unwrap();
-        Command::new("git").args(["-C"]).arg(upstream.path())
-            .args(["commit", "-m", "second commit", "--quiet"]).status().unwrap();
+        Command::new("git")
+            .args(["-C"])
+            .arg(upstream.path())
+            .args(["add", "."])
+            .status()
+            .unwrap();
+        Command::new("git")
+            .args(["-C"])
+            .arg(upstream.path())
+            .args(["commit", "-m", "second commit", "--quiet"])
+            .status()
+            .unwrap();
         let url = format!("file://{}", upstream.path().display());
         let rows = fetch_recent_commits_via_clone(&url, 5, std::time::Duration::from_secs(10))
             .expect("local clone must succeed");
@@ -1343,21 +1481,27 @@ mod tests {
     #[test]
     fn parse_porcelain_changes_handles_unstaged_modified() {
         let entries = parse_porcelain_changes(" M src/app.rs\n");
-        assert_eq!(entries, vec![ChangeEntry {
-            path: "src/app.rs".to_string(),
-            kind: ChangeKind::Modified,
-            ..Default::default()
-        }]);
+        assert_eq!(
+            entries,
+            vec![ChangeEntry {
+                path: "src/app.rs".to_string(),
+                kind: ChangeKind::Modified,
+                ..Default::default()
+            }]
+        );
     }
 
     #[test]
     fn parse_porcelain_changes_handles_staged_modified() {
         let entries = parse_porcelain_changes("M  src/app.rs\n");
-        assert_eq!(entries, vec![ChangeEntry {
-            path: "src/app.rs".to_string(),
-            kind: ChangeKind::StagedModified,
-            ..Default::default()
-        }]);
+        assert_eq!(
+            entries,
+            vec![ChangeEntry {
+                path: "src/app.rs".to_string(),
+                kind: ChangeKind::StagedModified,
+                ..Default::default()
+            }]
+        );
     }
 
     #[test]
@@ -1367,8 +1511,16 @@ mod tests {
         assert_eq!(
             entries,
             vec![
-                ChangeEntry { path: "src/app.rs".to_string(), kind: ChangeKind::StagedModified, ..Default::default() },
-                ChangeEntry { path: "src/app.rs".to_string(), kind: ChangeKind::Modified, ..Default::default() },
+                ChangeEntry {
+                    path: "src/app.rs".to_string(),
+                    kind: ChangeKind::StagedModified,
+                    ..Default::default()
+                },
+                ChangeEntry {
+                    path: "src/app.rs".to_string(),
+                    kind: ChangeKind::Modified,
+                    ..Default::default()
+                },
             ]
         );
     }
@@ -1376,21 +1528,27 @@ mod tests {
     #[test]
     fn parse_porcelain_changes_handles_untracked() {
         let entries = parse_porcelain_changes("?? scratch.txt\n");
-        assert_eq!(entries, vec![ChangeEntry {
-            path: "scratch.txt".to_string(),
-            kind: ChangeKind::Untracked,
-            ..Default::default()
-        }]);
+        assert_eq!(
+            entries,
+            vec![ChangeEntry {
+                path: "scratch.txt".to_string(),
+                kind: ChangeKind::Untracked,
+                ..Default::default()
+            }]
+        );
     }
 
     #[test]
     fn parse_porcelain_changes_handles_rename_takes_destination_path() {
         let entries = parse_porcelain_changes("R  old.txt -> new.txt\n");
-        assert_eq!(entries, vec![ChangeEntry {
-            path: "new.txt".to_string(),
-            kind: ChangeKind::StagedRenamed,
-            ..Default::default()
-        }]);
+        assert_eq!(
+            entries,
+            vec![ChangeEntry {
+                path: "new.txt".to_string(),
+                kind: ChangeKind::StagedRenamed,
+                ..Default::default()
+            }]
+        );
     }
 
     #[test]
@@ -1412,9 +1570,18 @@ mod tests {
 
     #[test]
     fn unquote_porcelain_path_decodes_c_style_escapes() {
-        assert_eq!(unquote_porcelain_path(r#""line\nbreak.txt""#), "line\nbreak.txt");
-        assert_eq!(unquote_porcelain_path(r#""quote\"inside.txt""#), "quote\"inside.txt");
-        assert_eq!(unquote_porcelain_path(r#""back\\slash.txt""#), "back\\slash.txt");
+        assert_eq!(
+            unquote_porcelain_path(r#""line\nbreak.txt""#),
+            "line\nbreak.txt"
+        );
+        assert_eq!(
+            unquote_porcelain_path(r#""quote\"inside.txt""#),
+            "quote\"inside.txt"
+        );
+        assert_eq!(
+            unquote_porcelain_path(r#""back\\slash.txt""#),
+            "back\\slash.txt"
+        );
     }
 
     #[test]
@@ -1431,21 +1598,27 @@ mod tests {
         // The parser must strip the surrounding double quotes so the
         // downstream `git add -- <path>` call hits the real filename.
         let entries = parse_porcelain_changes("?? \"linked_list copy.py\"\n");
-        assert_eq!(entries, vec![ChangeEntry {
-            path: "linked_list copy.py".to_string(),
-            kind: ChangeKind::Untracked,
-            ..Default::default()
-        }]);
+        assert_eq!(
+            entries,
+            vec![ChangeEntry {
+                path: "linked_list copy.py".to_string(),
+                kind: ChangeKind::Untracked,
+                ..Default::default()
+            }]
+        );
     }
 
     #[test]
     fn parse_porcelain_changes_handles_conflict() {
         let entries = parse_porcelain_changes("UU merge.txt\n");
-        assert_eq!(entries, vec![ChangeEntry {
-            path: "merge.txt".to_string(),
-            kind: ChangeKind::Conflicted,
-            ..Default::default()
-        }]);
+        assert_eq!(
+            entries,
+            vec![ChangeEntry {
+                path: "merge.txt".to_string(),
+                kind: ChangeKind::Conflicted,
+                ..Default::default()
+            }]
+        );
     }
 
     #[test]
@@ -1484,16 +1657,42 @@ mod tests {
     fn commit_all_tracked_creates_a_commit_in_a_real_repo() {
         let tmp = TempDir::new().unwrap();
         let p = tmp.path();
-        let _ = Command::new("git").args(["-C"]).arg(p).args(["init", "-q", "-b", "main"]).output();
-        let _ = Command::new("git").args(["-C"]).arg(p).args(["config", "user.email", "a@b"]).status();
-        let _ = Command::new("git").args(["-C"]).arg(p).args(["config", "user.name", "a"]).status();
+        let _ = Command::new("git")
+            .args(["-C"])
+            .arg(p)
+            .args(["init", "-q", "-b", "main"])
+            .output();
+        let _ = Command::new("git")
+            .args(["-C"])
+            .arg(p)
+            .args(["config", "user.email", "a@b"])
+            .status();
+        let _ = Command::new("git")
+            .args(["-C"])
+            .arg(p)
+            .args(["config", "user.name", "a"])
+            .status();
         std::fs::write(p.join("hello.txt"), "hi").unwrap();
-        let _ = Command::new("git").args(["-C"]).arg(p).args(["add", "."]).status();
-        let _ = Command::new("git").args(["-C"]).arg(p).args(["commit", "-m", "init", "--quiet"]).status();
+        let _ = Command::new("git")
+            .args(["-C"])
+            .arg(p)
+            .args(["add", "."])
+            .status();
+        let _ = Command::new("git")
+            .args(["-C"])
+            .arg(p)
+            .args(["commit", "-m", "init", "--quiet"])
+            .status();
         std::fs::write(p.join("hello.txt"), "hi v2").unwrap();
         let summary = commit_all_tracked(p, "second commit").expect("commit should succeed");
-        assert!(summary.contains("second commit") || summary.contains("main"), "summary was: {summary}");
-        assert!(query_changes(p).is_empty(), "post-commit working tree should be clean");
+        assert!(
+            summary.contains("second commit") || summary.contains("main"),
+            "summary was: {summary}"
+        );
+        assert!(
+            query_changes(p).is_empty(),
+            "post-commit working tree should be clean"
+        );
     }
 
     #[test]
@@ -1524,9 +1723,21 @@ mod tests {
     fn git_worker_loop_processes_a_changes_request_and_returns_entries() {
         let tmp = TempDir::new().unwrap();
         let p = tmp.path();
-        let _ = Command::new("git").args(["-C"]).arg(p).args(["init", "-q", "-b", "main"]).output();
-        let _ = Command::new("git").args(["-C"]).arg(p).args(["config", "user.email", "a@b"]).status();
-        let _ = Command::new("git").args(["-C"]).arg(p).args(["config", "user.name", "a"]).status();
+        let _ = Command::new("git")
+            .args(["-C"])
+            .arg(p)
+            .args(["init", "-q", "-b", "main"])
+            .output();
+        let _ = Command::new("git")
+            .args(["-C"])
+            .arg(p)
+            .args(["config", "user.email", "a@b"])
+            .status();
+        let _ = Command::new("git")
+            .args(["-C"])
+            .arg(p)
+            .args(["config", "user.name", "a"])
+            .status();
         std::fs::write(p.join("untracked.txt"), "x").unwrap();
         let (req_tx, req_rx) = std::sync::mpsc::channel::<GitRequest>();
         let (resp_tx, resp_rx) = std::sync::mpsc::channel::<GitResponse>();
@@ -1538,7 +1749,11 @@ mod tests {
             .expect("worker must reply within 10s");
         match resp {
             GitResponse::Changes(entries) => {
-                assert_eq!(entries.len(), 1, "expected 1 untracked entry, got {entries:?}");
+                assert_eq!(
+                    entries.len(),
+                    1,
+                    "expected 1 untracked entry, got {entries:?}"
+                );
                 assert_eq!(entries[0].kind, ChangeKind::Untracked);
             }
             other => panic!("expected Changes, got {other:?}"),
@@ -1602,9 +1817,21 @@ mod tests {
         // logical refresh.
         let tmp = TempDir::new().unwrap();
         let p = tmp.path();
-        let _ = Command::new("git").args(["-C"]).arg(p).args(["init", "-q", "-b", "main"]).output();
-        let _ = Command::new("git").args(["-C"]).arg(p).args(["config", "user.email", "a@b"]).status();
-        let _ = Command::new("git").args(["-C"]).arg(p).args(["config", "user.name", "a"]).status();
+        let _ = Command::new("git")
+            .args(["-C"])
+            .arg(p)
+            .args(["init", "-q", "-b", "main"])
+            .output();
+        let _ = Command::new("git")
+            .args(["-C"])
+            .arg(p)
+            .args(["config", "user.email", "a@b"])
+            .status();
+        let _ = Command::new("git")
+            .args(["-C"])
+            .arg(p)
+            .args(["config", "user.name", "a"])
+            .status();
         let (req_tx, req_rx) = std::sync::mpsc::channel::<GitRequest>();
         let (resp_tx, resp_rx) = std::sync::mpsc::channel::<GitResponse>();
         let root = p.to_path_buf();
@@ -1631,12 +1858,32 @@ mod tests {
     }
 
     fn init_repo_with_commit(p: &Path) {
-        let _ = Command::new("git").args(["-C"]).arg(p).args(["init", "-q", "-b", "main"]).output();
-        let _ = Command::new("git").args(["-C"]).arg(p).args(["config", "user.email", "a@b"]).status();
-        let _ = Command::new("git").args(["-C"]).arg(p).args(["config", "user.name", "a"]).status();
+        let _ = Command::new("git")
+            .args(["-C"])
+            .arg(p)
+            .args(["init", "-q", "-b", "main"])
+            .output();
+        let _ = Command::new("git")
+            .args(["-C"])
+            .arg(p)
+            .args(["config", "user.email", "a@b"])
+            .status();
+        let _ = Command::new("git")
+            .args(["-C"])
+            .arg(p)
+            .args(["config", "user.name", "a"])
+            .status();
         std::fs::write(p.join("seed.txt"), "one\ntwo\n").unwrap();
-        let _ = Command::new("git").args(["-C"]).arg(p).args(["add", "."]).status();
-        let _ = Command::new("git").args(["-C"]).arg(p).args(["commit", "-m", "init", "--quiet"]).status();
+        let _ = Command::new("git")
+            .args(["-C"])
+            .arg(p)
+            .args(["add", "."])
+            .status();
+        let _ = Command::new("git")
+            .args(["-C"])
+            .arg(p)
+            .args(["commit", "-m", "init", "--quiet"])
+            .status();
     }
 
     #[test]
@@ -1645,7 +1892,11 @@ mod tests {
         let p = tmp.path();
         init_repo_with_commit(p);
         std::fs::write(p.join("seed.txt"), "one\ntwo\nthree\n").unwrap();
-        let _ = Command::new("git").args(["-C"]).arg(p).args(["add", "seed.txt"]).status();
+        let _ = Command::new("git")
+            .args(["-C"])
+            .arg(p)
+            .args(["add", "seed.txt"])
+            .status();
         std::fs::write(p.join("untracked.txt"), "z").unwrap();
         let out = diff_staged(p).expect("git diff --staged should succeed");
         assert!(

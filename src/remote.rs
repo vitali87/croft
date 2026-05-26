@@ -4,8 +4,8 @@ use std::hash::Hasher;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -253,13 +253,11 @@ fn install_remote_croft_streaming(
     }
     let _ = log_tx.send("Syncing source tree to remote…".to_string());
     sync_local_source_to_remote_streaming(ssh, log_tx)?;
-    let _ = log_tx.send(
-        "Running cargo install on remote (first time can take several minutes)…".to_string(),
-    );
+    let _ = log_tx
+        .send("Running cargo install on remote (first time can take several minutes)…".to_string());
     let mut cmd = ssh.command();
     cmd.arg(&ssh.host).arg(remote_install_command(source_stamp));
-    let status =
-        run_command_streaming(cmd, log_tx).context("installing croft on remote")?;
+    let status = run_command_streaming(cmd, log_tx).context("installing croft on remote")?;
     if !status.success() {
         anyhow::bail!("remote croft install failed with {status}");
     }
@@ -632,8 +630,14 @@ impl DropPump {
 
     fn remote_env(&self) -> Vec<(String, String)> {
         vec![
-            (String::from("CROFT_DROP_RELAY_LOG"), self.requests_log.clone()),
-            (String::from("CROFT_DROP_RELAY_INBOX"), self.inbox_dir.clone()),
+            (
+                String::from("CROFT_DROP_RELAY_LOG"),
+                self.requests_log.clone(),
+            ),
+            (
+                String::from("CROFT_DROP_RELAY_INBOX"),
+                self.inbox_dir.clone(),
+            ),
         ]
     }
 }
@@ -702,7 +706,13 @@ fn handle_clipboard_request(host: &str, socket: &Path, inbox_dir: &str, request_
     let payload = match crate::clipboard::read_string() {
         Some(s) => s,
         None => {
-            write_relay_err(host, socket, inbox_dir, request_id, "local clipboard unavailable");
+            write_relay_err(
+                host,
+                socket,
+                inbox_dir,
+                request_id,
+                "local clipboard unavailable",
+            );
             return;
         }
     };
@@ -810,25 +820,22 @@ fn parse_relay_request(line: &str) -> Option<RelayRequest> {
 /// mailto — so a hostile remote can't smuggle `file://` or shell metachars
 /// through the relay log.
 fn url_is_safe_to_open(url: &str) -> bool {
-    let lower: String = url.chars().take(16).collect::<String>().to_ascii_lowercase();
+    let lower: String = url
+        .chars()
+        .take(16)
+        .collect::<String>()
+        .to_ascii_lowercase();
     let scheme_ok = lower.starts_with("https://")
         || lower.starts_with("http://")
         || lower.starts_with("mailto:");
     if !scheme_ok {
         return false;
     }
-    !url.chars().any(|c| {
-        c == '\0' || c == '\n' || c == '\r' || c == '\t'
-    })
+    !url.chars()
+        .any(|c| c == '\0' || c == '\n' || c == '\r' || c == '\t')
 }
 
-fn handle_pull_request(
-    host: &str,
-    socket: &Path,
-    inbox_dir: &str,
-    request_id: &str,
-    src: &str,
-) {
+fn handle_pull_request(host: &str, socket: &Path, inbox_dir: &str, request_id: &str, src: &str) {
     let src_path = PathBuf::from(src);
     let dest_dir = format!("{inbox_dir}/{request_id}");
     if !src_path.exists() {
@@ -846,7 +853,13 @@ fn handle_pull_request(
         return;
     };
     let Some(basename) = src_path.file_name() else {
-        write_relay_err(host, socket, inbox_dir, request_id, "source has no basename");
+        write_relay_err(
+            host,
+            socket,
+            inbox_dir,
+            request_id,
+            "source has no basename",
+        );
         return;
     };
     // Pipe a tar of the source through ssh into a remote tar -x. This
@@ -956,13 +969,7 @@ fn handle_pull_request(
     }
 }
 
-fn handle_open_request(
-    host: &str,
-    socket: &Path,
-    inbox_dir: &str,
-    request_id: &str,
-    url: &str,
-) {
+fn handle_open_request(host: &str, socket: &Path, inbox_dir: &str, request_id: &str, url: &str) {
     if !url_is_safe_to_open(url) {
         write_relay_err(
             host,
@@ -1046,13 +1053,7 @@ fn handle_open_request(
     }
 }
 
-fn write_relay_err(
-    host: &str,
-    socket: &Path,
-    inbox_dir: &str,
-    request_id: &str,
-    message: &str,
-) {
+fn write_relay_err(host: &str, socket: &Path, inbox_dir: &str, request_id: &str, message: &str) {
     let dest_dir = format!("{inbox_dir}/{request_id}");
     let err_path = format!("{dest_dir}/.err");
     let cmd = format!(
@@ -1087,10 +1088,7 @@ pub fn ssh_control_dir() -> Result<PathBuf> {
         .duration_since(std::time::UNIX_EPOCH)
         .context("system clock before unix epoch")?
         .as_millis();
-    Ok(std::env::temp_dir().join(format!(
-        "croft-ssh-{}-{now}",
-        std::process::id()
-    )))
+    Ok(std::env::temp_dir().join(format!("croft-ssh-{}-{now}", std::process::id())))
 }
 
 fn run_remote_croft(
@@ -1120,9 +1118,7 @@ fn install_remote_croft(ssh: &SshControl, source_stamp: &str) -> Result<()> {
         Ok(true) => return Ok(()),
         Ok(false) => {}
         Err(e) => {
-            eprintln!(
-                "Local cross-build failed ({e}); falling back to remote `cargo install`"
-            );
+            eprintln!("Local cross-build failed ({e}); falling back to remote `cargo install`");
         }
     }
     sync_local_source_to_remote(ssh)?;
@@ -1169,7 +1165,10 @@ pub fn arch_to_musl_triple(arch: &str) -> Option<&'static str> {
 }
 
 fn rust_target_installed(triple: &str) -> bool {
-    let Ok(output) = Command::new("rustup").args(["target", "list", "--installed"]).output() else {
+    let Ok(output) = Command::new("rustup")
+        .args(["target", "list", "--installed"])
+        .output()
+    else {
         return false;
     };
     if !output.status.success() {
@@ -1273,11 +1272,7 @@ fn try_local_cross_install(ssh: &SshControl, source_stamp: &str) -> Result<bool>
 }
 
 pub fn remote_croft_command(path: Option<&str>, env: &[(String, String)]) -> String {
-    remote_croft_command_for_terminal(
-        path,
-        std::env::var("TERM_PROGRAM").ok().as_deref(),
-        env,
-    )
+    remote_croft_command_for_terminal(path, std::env::var("TERM_PROGRAM").ok().as_deref(), env)
 }
 
 fn remote_croft_command_for_terminal(
@@ -1443,7 +1438,9 @@ fn sync_via_tar(ssh: &SshControl) -> Result<()> {
 /// than trust the format.
 fn shell_quote_for_e_arg(p: &std::path::Path) -> String {
     let s = p.to_string_lossy();
-    if s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-')) {
+    if s.chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-'))
+    {
         s.into_owned()
     } else {
         format!("'{}'", s.replace('\'', r"'\''"))
@@ -1510,9 +1507,9 @@ fn hash_source_dir(root: &PathBuf, dir: &PathBuf, hasher: &mut impl Hasher) -> R
             hash_source_dir(root, &path, hasher)?;
         } else if meta.is_file() {
             hasher.write_u64(meta.len());
-            hasher.write(&std::fs::read(&path).with_context(|| {
-                format!("reading {}", path.display())
-            })?);
+            hasher.write(
+                &std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?,
+            );
         }
     }
     Ok(())
@@ -1582,8 +1579,14 @@ Host !blocked *.internal
     #[test]
     fn remote_croft_command_exports_drop_relay_env() {
         let env = vec![
-            (String::from("CROFT_DROP_RELAY_LOG"), String::from("/tmp/r/log")),
-            (String::from("CROFT_DROP_RELAY_INBOX"), String::from("/tmp/r/inbox")),
+            (
+                String::from("CROFT_DROP_RELAY_LOG"),
+                String::from("/tmp/r/log"),
+            ),
+            (
+                String::from("CROFT_DROP_RELAY_INBOX"),
+                String::from("/tmp/r/inbox"),
+            ),
         ];
         let command = remote_croft_command_for_terminal(None, None, &env);
         assert!(command.contains("export CROFT_DROP_RELAY_LOG='/tmp/r/log'"));
@@ -1690,7 +1693,9 @@ Host !blocked *.internal
     #[test]
     fn remote_install_check_uses_cargo_path_before_probe() {
         let command = remote_install_check_command();
-        let path_pos = command.find("export PATH=\"$HOME/.cargo/bin:$PATH\"").unwrap();
+        let path_pos = command
+            .find("export PATH=\"$HOME/.cargo/bin:$PATH\"")
+            .unwrap();
         let probe_pos = command.find("command -v croft").unwrap();
         assert!(command.contains(". \"$HOME/.cargo/env\""));
         assert!(path_pos < probe_pos);

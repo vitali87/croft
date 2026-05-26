@@ -1,3 +1,4 @@
+use alacritty_terminal::Term;
 use alacritty_terminal::event::{Event as AlacEvent, EventListener};
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Line, Point};
@@ -6,9 +7,8 @@ use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::test::TermSize;
 use alacritty_terminal::term::{Config, TermMode};
 use alacritty_terminal::vte::ansi::{Color as AnsiColor, NamedColor, Processor, StdSyncHandler};
-use alacritty_terminal::Term;
 use anyhow::{Context, Result};
-use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
+use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
@@ -17,8 +17,8 @@ use ratatui::{
     widgets::{Block, Borders, Widget},
 };
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 const SCROLLBACK_LINES: usize = 5000;
 
@@ -30,7 +30,10 @@ pub struct Selection {
 
 impl Selection {
     pub fn new(row: u16, col: u16) -> Self {
-        Self { anchor: (row, col), head: (row, col) }
+        Self {
+            anchor: (row, col),
+            head: (row, col),
+        }
     }
     pub fn normalised(&self) -> (u16, u16, u16, u16) {
         let (a_r, a_c) = self.anchor;
@@ -83,7 +86,9 @@ impl EventListener for VoidListener {
                 let _ = tx.send(text);
             }
             AlacEvent::TextAreaSizeRequest(cb) => {
-                let Some(size) = self.size.as_ref() else { return };
+                let Some(size) = self.size.as_ref() else {
+                    return;
+                };
                 let (cols, rows) = *size.lock().unwrap();
                 let ws = alacritty_terminal::event::WindowSize {
                     num_lines: rows,
@@ -164,8 +169,7 @@ pub fn interactive_shell_invocation(shell_path: &str) -> (String, Vec<String>) {
 
 impl PtyTerminal {
     pub fn new(cwd: &std::path::Path) -> Result<Self> {
-        let shell =
-            std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
         let (program, args) = interactive_shell_invocation(&shell);
         let mut cmd = CommandBuilder::new(&program);
         for a in &args {
@@ -175,11 +179,7 @@ impl PtyTerminal {
         Self::spawn_with(cmd, None)
     }
 
-    pub fn new_running(
-        program: &str,
-        args: &[String],
-        cwd: &std::path::Path,
-    ) -> Result<Self> {
+    pub fn new_running(program: &str, args: &[String], cwd: &std::path::Path) -> Result<Self> {
         let mut cmd = CommandBuilder::new(program);
         for a in args {
             cmd.arg(a);
@@ -209,7 +209,12 @@ impl PtyTerminal {
         let cols = 80u16;
         let rows = 24u16;
         let pair = pty_system
-            .openpty(PtySize { cols, rows, pixel_width: 0, pixel_height: 0 })
+            .openpty(PtySize {
+                cols,
+                rows,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
             .context("openpty")?;
 
         cmd.env("TERM", "xterm-256color");
@@ -217,13 +222,16 @@ impl PtyTerminal {
         let child = pair.slave.spawn_command(cmd).context("spawn child")?;
         drop(pair.slave);
 
-        let writer: Arc<std::sync::Mutex<Box<dyn Write + Send>>> = Arc::new(
-            std::sync::Mutex::new(pair.master.take_writer().context("take writer")?),
-        );
+        let writer: Arc<std::sync::Mutex<Box<dyn Write + Send>>> = Arc::new(std::sync::Mutex::new(
+            pair.master.take_writer().context("take writer")?,
+        ));
         let mut reader = pair.master.try_clone_reader().context("clone reader")?;
 
         let term_size = TermSize::new(cols as usize, rows as usize);
-        let cfg = Config { scrolling_history: SCROLLBACK_LINES, ..Config::default() };
+        let cfg = Config {
+            scrolling_history: SCROLLBACK_LINES,
+            ..Config::default()
+        };
         let size_shared = Arc::new(std::sync::Mutex::new((cols, rows)));
         let (response_tx, response_rx) = std::sync::mpsc::channel::<String>();
         let listener = VoidListener {
@@ -272,10 +280,7 @@ impl PtyTerminal {
                 match reader.read(&mut buf) {
                     Ok(0) => break,
                     Ok(n) => {
-                        sniff_bracketed_paste_mode(
-                            &buf[..n],
-                            &bracketed_paste_for_thread,
-                        );
+                        sniff_bracketed_paste_mode(&buf[..n], &bracketed_paste_for_thread);
                         let mut t = term_for_thread.lock();
                         processor.advance(&mut *t, &buf[..n]);
                         drop(t);
@@ -374,7 +379,9 @@ impl PtyTerminal {
     /// under the screen coordinate `(col, row)`. No-op when the click
     /// lands on whitespace / punctuation or outside the live area.
     pub fn select_word_at(&mut self, col: u16, row: u16) {
-        let Some((r, c)) = self.cell_at(col, row) else { return };
+        let Some((r, c)) = self.cell_at(col, row) else {
+            return;
+        };
         let term = self.term.lock();
         let display_offset = term.grid().display_offset();
         let Some((anchor, head)) =
@@ -391,7 +398,9 @@ impl PtyTerminal {
     }
 
     pub fn selection_text(&self) -> String {
-        let Some(sel) = self.selection else { return String::new() };
+        let Some(sel) = self.selection else {
+            return String::new();
+        };
         let (sr, sc, er, ec) = sel.normalised();
         let term = self.term.lock();
         let display_offset = term.grid().display_offset();
@@ -511,7 +520,11 @@ pub fn extract_selection_text(
     let mut out = String::new();
     for row in sr..=er.min(rows.saturating_sub(1)) {
         let row_start = if row == sr { sc } else { 0 };
-        let row_end = if row == er { ec.min(cols.saturating_sub(1)) } else { cols.saturating_sub(1) };
+        let row_end = if row == er {
+            ec.min(cols.saturating_sub(1))
+        } else {
+            cols.saturating_sub(1)
+        };
         let line_idx = row as i32 - display_offset as i32;
         let mut line = String::new();
         for col in row_start..=row_end {
@@ -789,7 +802,10 @@ mod tests {
     use super::*;
 
     fn fresh_term(cols: usize, rows: usize) -> Term<VoidListener> {
-        let cfg = Config { scrolling_history: 1000, ..Config::default() };
+        let cfg = Config {
+            scrolling_history: 1000,
+            ..Config::default()
+        };
         let size = TermSize::new(cols, rows);
         Term::new(cfg, &size, VoidListener::default())
     }
@@ -870,7 +886,12 @@ mod tests {
 
     #[test]
     fn interactive_shell_invocation_passes_login_flag_for_bash_fish_ksh() {
-        for path in ["/bin/bash", "/usr/local/bin/fish", "/bin/ksh", "/usr/bin/tcsh"] {
+        for path in [
+            "/bin/bash",
+            "/usr/local/bin/fish",
+            "/bin/ksh",
+            "/usr/bin/tcsh",
+        ] {
             let (_, args) = interactive_shell_invocation(path);
             assert_eq!(
                 args,
@@ -910,7 +931,10 @@ mod tests {
     fn pty_starts_dirty_so_first_frame_renders() {
         let tmp = tempfile::tempdir().unwrap();
         let term = PtyTerminal::new(tmp.path()).unwrap();
-        assert!(term.take_dirty(), "first take_dirty must be true so we draw the initial state");
+        assert!(
+            term.take_dirty(),
+            "first take_dirty must be true so we draw the initial state"
+        );
     }
 
     #[test]
@@ -918,7 +942,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let term = PtyTerminal::new(tmp.path()).unwrap();
         let _ = term.take_dirty();
-        assert!(!term.take_dirty(), "second take_dirty without new bytes must be false");
+        assert!(
+            !term.take_dirty(),
+            "second take_dirty without new bytes must be false"
+        );
     }
 
     #[test]
@@ -927,7 +954,10 @@ mod tests {
         let mut term = PtyTerminal::new(tmp.path()).unwrap();
         let _ = term.take_dirty();
         term.write_input(b"echo hi\r");
-        assert!(term.take_dirty(), "write_input must mark the terminal dirty");
+        assert!(
+            term.take_dirty(),
+            "write_input must mark the terminal dirty"
+        );
     }
 
     #[test]
@@ -972,7 +1002,6 @@ mod tests {
             "change_cwd must mark the terminal dirty so the next frame paints the new prompt"
         );
     }
-
 
     #[test]
     fn new_running_spawns_program_directly_and_produces_output() {
@@ -1047,12 +1076,9 @@ mod tests {
     #[test]
     fn new_running_appends_exit_footer_when_child_finishes() {
         let tmp = tempfile::tempdir().unwrap();
-        let term = PtyTerminal::new_running(
-            "/bin/echo",
-            &[String::from("croft-exit-probe")],
-            tmp.path(),
-        )
-        .unwrap();
+        let term =
+            PtyTerminal::new_running("/bin/echo", &[String::from("croft-exit-probe")], tmp.path())
+                .unwrap();
         let mut waited_ms = 0u32;
         let footer_needle = "[Process exited]";
         loop {
@@ -1088,13 +1114,19 @@ mod tests {
 
     #[test]
     fn selection_normalised_handles_anchor_after_head() {
-        let s = Selection { anchor: (5, 4), head: (2, 1) };
+        let s = Selection {
+            anchor: (5, 4),
+            head: (2, 1),
+        };
         assert_eq!(s.normalised(), (2, 1, 5, 4));
     }
 
     #[test]
     fn selection_normalised_handles_same_row() {
-        let s = Selection { anchor: (3, 9), head: (3, 2) };
+        let s = Selection {
+            anchor: (3, 9),
+            head: (3, 2),
+        };
         assert_eq!(s.normalised(), (3, 2, 3, 9));
     }
 
@@ -1102,7 +1134,10 @@ mod tests {
     fn selection_has_area_only_when_endpoints_differ() {
         let s = Selection::new(2, 5);
         assert!(!s.has_area());
-        let s2 = Selection { anchor: (2, 5), head: (2, 6) };
+        let s2 = Selection {
+            anchor: (2, 5),
+            head: (2, 6),
+        };
         assert!(s2.has_area());
     }
 
@@ -1145,8 +1180,9 @@ mod tests {
         assert_eq!(*bytes.last().unwrap(), 0x07);
         let body = &bytes[7..bytes.len() - 1];
         use base64::Engine;
-        let decoded =
-            base64::engine::general_purpose::STANDARD.decode(body).unwrap();
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(body)
+            .unwrap();
         assert_eq!(decoded, "héllo".as_bytes());
     }
 
@@ -1155,7 +1191,11 @@ mod tests {
         let mut t = fresh_term(40, 5);
         feed(&mut t, b"hello world from croft");
         let got = select_word_at_in_term(&t, 0, 0, 8);
-        assert_eq!(got, Some(((0, 6), (0, 10))), "pivot inside 'world' must select cols 6..=10");
+        assert_eq!(
+            got,
+            Some(((0, 6), (0, 10))),
+            "pivot inside 'world' must select cols 6..=10"
+        );
     }
 
     #[test]
@@ -1218,11 +1258,13 @@ mod tests {
         // "scroll" at cols 0..=5). The pivot is at col 2, which
         // lives inside "scroll". The selection must cover that run.
         assert_eq!(
-            anchor, (0, 0),
+            anchor,
+            (0, 0),
             "anchor must mark the start of the word run on viewport row 0"
         );
         assert_eq!(
-            head, (0, 5),
+            head,
+            (0, 5),
             "head must mark the last char of 'scroll' before the hyphen breaks the word run"
         );
     }
@@ -1310,4 +1352,3 @@ mod tests {
         );
     }
 }
-

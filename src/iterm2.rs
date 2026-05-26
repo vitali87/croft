@@ -269,8 +269,16 @@ pub fn apply_croft_key_settings(plist: &mut Value) -> Result<(), ITerm2Error> {
     // vim chords at the menu-bar layer. Each is moved to Cmd+Opt+<key>
     // so the original action stays reachable, but the bare Cmd+<key>
     // chord is freed for the GlobalKeyMap forwarder below.
-    set_string(menu, "Split Vertically with Same Profile", "@~d".to_string());
-    set_string(menu, "Split Horizontally with Same Profile", "@~D".to_string());
+    set_string(
+        menu,
+        "Split Vertically with Same Profile",
+        "@~d".to_string(),
+    );
+    set_string(
+        menu,
+        "Split Horizontally with Same Profile",
+        "@~D".to_string(),
+    );
     set_string(menu, "Find Next", "@~g".to_string());
     set_string(menu, "Find Previous", "@~G".to_string());
     set_string(menu, "Jump to Selection", "@~y".to_string());
@@ -355,10 +363,7 @@ pub fn apply_croft_key_settings(plist: &mut Value) -> Result<(), ITerm2Error> {
     }
     global.remove(CMD_V_KEY);
 
-    dict.insert(
-        MOUSE_REPORTING_FRUSTRATION_KEY.into(),
-        Value::Boolean(true),
-    );
+    dict.insert(MOUSE_REPORTING_FRUSTRATION_KEY.into(), Value::Boolean(true));
 
     let bookmarks = dict
         .get_mut("New Bookmarks")
@@ -657,7 +662,8 @@ mod tests {
     }
 
     #[test]
-    fn apply_croft_key_settings_forwards_cmd_letter_chords_as_csi_u_so_iterm_responder_chain_does_not_consume_them() {
+    fn apply_croft_key_settings_forwards_cmd_letter_chords_as_csi_u_so_iterm_responder_chain_does_not_consume_them()
+     {
         let mut plist = synth_plist("GUID-1", &["GUID-1"]);
         apply_croft_key_settings(&mut plist).unwrap();
         let top = plist.as_dictionary().unwrap();
@@ -665,7 +671,11 @@ mod tests {
         for (key, hex, label) in [
             (CMD_A_KEY, CMD_A_HEX, "Cmd+A (select all / multi-select)"),
             (CMD_C_KEY, CMD_C_HEX, "Cmd+C (copy via OSC 52)"),
-            (CMD_S_KEY, CMD_S_HEX, "Cmd+S (editor save / source control stage)"),
+            (
+                CMD_S_KEY,
+                CMD_S_HEX,
+                "Cmd+S (editor save / source control stage)",
+            ),
             (CMD_X_KEY, CMD_X_HEX, "Cmd+X (editor cut)"),
             (CMD_Z_KEY, CMD_Z_HEX, "Cmd+Z (editor undo)"),
         ] {
@@ -688,8 +698,16 @@ mod tests {
             (CMD_G_KEY, CMD_G_HEX, "Cmd+G (vim gg chord start)"),
             (CMD_Y_KEY, CMD_Y_HEX, "Cmd+Y (vim yy chord start)"),
             (CMD_O_KEY, CMD_O_HEX, "Cmd+O (open line below)"),
-            (CMD_SHIFT_G_KEY, CMD_SHIFT_G_HEX, "Cmd+Shift+G (goto bottom)"),
-            (CMD_SHIFT_O_KEY, CMD_SHIFT_O_HEX, "Cmd+Shift+O (open line above)"),
+            (
+                CMD_SHIFT_G_KEY,
+                CMD_SHIFT_G_HEX,
+                "Cmd+Shift+G (goto bottom)",
+            ),
+            (
+                CMD_SHIFT_O_KEY,
+                CMD_SHIFT_O_HEX,
+                "Cmd+Shift+O (open line above)",
+            ),
         ] {
             assert_eq!(
                 action_text(global, key),
@@ -726,10 +744,26 @@ mod tests {
         let top = plist.as_dictionary().unwrap();
         let global = dict_in(top, "GlobalKeyMap");
         for (key, hex, label) in [
-            (CMD_SHIFT_E_KEY, CMD_SHIFT_E_HEX, "Cmd+Shift+E (jump to Explorer)"),
-            (CMD_SHIFT_S_KEY, CMD_SHIFT_S_HEX, "Cmd+Shift+S (jump to Source Control)"),
-            (CMD_SHIFT_D_KEY, CMD_SHIFT_D_HEX, "Cmd+Shift+D (jump to Run and Debug)"),
-            (CMD_SHIFT_R_KEY, CMD_SHIFT_R_HEX, "Cmd+Shift+R (jump to Remote)"),
+            (
+                CMD_SHIFT_E_KEY,
+                CMD_SHIFT_E_HEX,
+                "Cmd+Shift+E (jump to Explorer)",
+            ),
+            (
+                CMD_SHIFT_S_KEY,
+                CMD_SHIFT_S_HEX,
+                "Cmd+Shift+S (jump to Source Control)",
+            ),
+            (
+                CMD_SHIFT_D_KEY,
+                CMD_SHIFT_D_HEX,
+                "Cmd+Shift+D (jump to Run and Debug)",
+            ),
+            (
+                CMD_SHIFT_R_KEY,
+                CMD_SHIFT_R_HEX,
+                "Cmd+Shift+R (jump to Remote)",
+            ),
         ] {
             assert_eq!(
                 action_text(global, key),
@@ -759,7 +793,8 @@ mod tests {
         let top = plist.as_dictionary().unwrap();
         let menu = dict_in(top, "NSUserKeyEquivalents");
         assert_eq!(
-            menu.get("Split Horizontally with Same Profile").and_then(|v| v.as_string()),
+            menu.get("Split Horizontally with Same Profile")
+                .and_then(|v| v.as_string()),
             Some("@~D"),
             "iTerm2's Split Horizontally with Same Profile must be relocated off Cmd+Shift+D so croft's Run-and-Debug jump can claim the chord; @~D = Cmd+Opt+Shift+D keeps the iTerm2 split reachable on a chord croft does not use"
         );
@@ -785,14 +820,16 @@ mod tests {
         let top = plist.as_dictionary().unwrap();
         let menu = dict_in(top, "NSUserKeyEquivalents");
         assert_eq!(
-            menu.get("Restore Closed Session").and_then(|v| v.as_string()),
+            menu.get("Restore Closed Session")
+                .and_then(|v| v.as_string()),
             Some("@~T"),
             "iTerm2's Restore Closed Session must be relocated off Cmd+Shift+T so croft's terminal-focus chord can claim it; @~T = Cmd+Opt+Shift+T keeps the iTerm2 action reachable on a chord croft does not use"
         );
     }
 
     #[test]
-    fn apply_croft_key_settings_forwards_cmd_p_as_csi_u_so_iterm_print_menu_does_not_eat_quick_open() {
+    fn apply_croft_key_settings_forwards_cmd_p_as_csi_u_so_iterm_print_menu_does_not_eat_quick_open()
+     {
         let mut plist = synth_plist("GUID-1", &["GUID-1"]);
         apply_croft_key_settings(&mut plist).unwrap();
         let top = plist.as_dictionary().unwrap();
@@ -805,7 +842,8 @@ mod tests {
     }
 
     #[test]
-    fn apply_croft_key_settings_relocates_print_menu_off_cmd_p_so_appkit_does_not_steal_quick_open() {
+    fn apply_croft_key_settings_relocates_print_menu_off_cmd_p_so_appkit_does_not_steal_quick_open()
+    {
         let mut plist = synth_plist("GUID-1", &["GUID-1"]);
         apply_croft_key_settings(&mut plist).unwrap();
         let top = plist.as_dictionary().unwrap();
@@ -844,14 +882,16 @@ mod tests {
         apply_croft_key_settings(&mut plist).unwrap();
         let top = plist.as_dictionary().unwrap();
         assert_eq!(
-            top.get(MOUSE_REPORTING_FRUSTRATION_KEY).and_then(|v| v.as_boolean()),
+            top.get(MOUSE_REPORTING_FRUSTRATION_KEY)
+                .and_then(|v| v.as_boolean()),
             Some(true),
             "iTerm2's iTermMouseReportingFrustrationDetector watches raw Cmd+C keyDown and pops the 'Looks like you're trying to copy to the pasteboard...' banner whenever mouse reporting is on and iTerm2 has no selection (which is the steady state under croft, since croft owns the mouse). The advanced setting NoSyncNeverAskAboutMouseReportingFrustration suppresses that detector entirely."
         );
     }
 
     #[test]
-    fn apply_croft_key_settings_relocates_edit_menu_items_off_cmd_letter_so_iterm_does_not_steal_them_back() {
+    fn apply_croft_key_settings_relocates_edit_menu_items_off_cmd_letter_so_iterm_does_not_steal_them_back()
+     {
         let mut plist = synth_plist("GUID-1", &["GUID-1"]);
         apply_croft_key_settings(&mut plist).unwrap();
         let top = plist.as_dictionary().unwrap();
@@ -884,7 +924,8 @@ mod tests {
     }
 
     #[test]
-    fn apply_croft_key_settings_forwards_cmd_shift_slash_as_csi_u_so_explorer_make_parent_root_fires() {
+    fn apply_croft_key_settings_forwards_cmd_shift_slash_as_csi_u_so_explorer_make_parent_root_fires()
+     {
         let mut plist = synth_plist("GUID-1", &["GUID-1"]);
         apply_croft_key_settings(&mut plist).unwrap();
         let top = plist.as_dictionary().unwrap();

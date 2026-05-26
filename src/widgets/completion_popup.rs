@@ -55,7 +55,10 @@ impl CompletionPopup {
             .iter()
             .enumerate()
             .filter_map(|(i, item)| {
-                if filter_haystack(item).to_ascii_lowercase().starts_with(&needle) {
+                if filter_haystack(item)
+                    .to_ascii_lowercase()
+                    .starts_with(&needle)
+                {
                     Some(i)
                 } else {
                     None
@@ -122,9 +125,7 @@ impl CompletionPopup {
             .map(|&i| self.items[i].label.chars().count() as u16)
             .max()
             .unwrap_or(MIN_WIDTH);
-        let width = max_label
-            .saturating_add(6)
-            .clamp(MIN_WIDTH, MAX_WIDTH);
+        let width = max_label.saturating_add(6).clamp(MIN_WIDTH, MAX_WIDTH);
         let height = (count as u16).saturating_add(2);
         let (cx, cy) = self.anchor;
         let mut x = cx;
@@ -293,7 +294,10 @@ mod tests {
             vec![item("aardvark"), item("calc_one"), item("calc_two")],
             "calc",
         );
-        assert_eq!(p.selected_item().map(|i| i.label.as_str()), Some("calc_one"));
+        assert_eq!(
+            p.selected_item().map(|i| i.label.as_str()),
+            Some("calc_one")
+        );
     }
 
     #[test]
@@ -334,10 +338,7 @@ mod tests {
 
     #[test]
     fn set_prefix_resets_selected() {
-        let mut p = popup(
-            vec![item("alpha"), item("beta"), item("calc")],
-            "",
-        );
+        let mut p = popup(vec![item("alpha"), item("beta"), item("calc")], "");
         p.move_down();
         p.move_down();
         assert_eq!(p.selected, 2);
@@ -373,7 +374,12 @@ mod tests {
 
     #[test]
     fn render_paints_opaque_popup_background_over_editor_text_so_buffer_does_not_bleed_through() {
-        let area = Rect { x: 0, y: 0, width: 30, height: 6 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 30,
+            height: 6,
+        };
         let mut buf = Buffer::empty(area);
         // Sentinel: a character that cannot appear in any popup content
         // (border glyphs, kind glyphs, item labels 'alpha' / 'beta').

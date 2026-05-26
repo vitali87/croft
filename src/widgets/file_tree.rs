@@ -144,7 +144,11 @@ impl FileTree {
             return;
         }
         let anchor = self.anchor.min(self.nodes.len().saturating_sub(1));
-        let (lo, hi) = if anchor <= idx { (anchor, idx) } else { (idx, anchor) };
+        let (lo, hi) = if anchor <= idx {
+            (anchor, idx)
+        } else {
+            (idx, anchor)
+        };
         self.marked.clear();
         for i in lo..=hi {
             self.marked.insert(self.nodes[i].path.clone());
@@ -206,7 +210,10 @@ impl FileTree {
             .flat_map(|rd| rd.filter_map(Result::ok))
             .map(|e| {
                 let p = e.path();
-                let is_dir = e.file_type().map(|ft| ft.is_dir()).unwrap_or_else(|_| p.is_dir());
+                let is_dir = e
+                    .file_type()
+                    .map(|ft| ft.is_dir())
+                    .unwrap_or_else(|_| p.is_dir());
                 (p, is_dir)
             })
             .collect();
@@ -558,8 +565,7 @@ impl FileTree {
         if self.marked.is_empty() {
             return;
         }
-        let visible: BTreeSet<PathBuf> =
-            self.nodes.iter().map(|n| n.path.clone()).collect();
+        let visible: BTreeSet<PathBuf> = self.nodes.iter().map(|n| n.path.clone()).collect();
         self.marked.retain(|p| visible.contains(p));
     }
 
@@ -690,11 +696,7 @@ pub fn move_to_trash_bulk(paths: &[PathBuf]) -> std::io::Result<()> {
 /// entry, and returns the new absolute path on success. A no-op rename
 /// (same name) returns Ok with the original path unchanged so the user
 /// can hit Enter on the prompt without typing.
-pub fn rename_in(
-    parent: &Path,
-    old_path: &Path,
-    new_name: &str,
-) -> std::io::Result<PathBuf> {
+pub fn rename_in(parent: &Path, old_path: &Path, new_name: &str) -> std::io::Result<PathBuf> {
     let trimmed = new_name.trim();
     if let Err(msg) = validate_new_name(trimmed) {
         return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, msg));
@@ -744,9 +746,7 @@ pub fn unique_destination_in(dest_dir: &Path, source: &Path) -> PathBuf {
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let ext = source
-        .extension()
-        .map(|s| s.to_string_lossy().into_owned());
+    let ext = source.extension().map(|s| s.to_string_lossy().into_owned());
     let original_name = source
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
@@ -778,8 +778,12 @@ pub fn unique_destination_in(dest_dir: &Path, source: &Path) -> PathBuf {
 /// a descendant of itself (which would either error or, worse, produce an
 /// infinite-recursion copy on filesystems that follow symlinks).
 pub fn is_descendant_or_same(target: &Path, source: &Path) -> bool {
-    let canon_target = target.canonicalize().unwrap_or_else(|_| target.to_path_buf());
-    let canon_source = source.canonicalize().unwrap_or_else(|_| source.to_path_buf());
+    let canon_target = target
+        .canonicalize()
+        .unwrap_or_else(|_| target.to_path_buf());
+    let canon_source = source
+        .canonicalize()
+        .unwrap_or_else(|_| source.to_path_buf());
     canon_target == canon_source || canon_target.starts_with(&canon_source)
 }
 
@@ -1197,7 +1201,10 @@ mod tests {
         std::fs::write(&f, "see ya").unwrap();
         assert!(f.exists());
         move_to_trash(&f).unwrap();
-        assert!(!f.exists(), "file should be gone from the workspace after trash");
+        assert!(
+            !f.exists(),
+            "file should be gone from the workspace after trash"
+        );
     }
 
     #[test]
@@ -1208,7 +1215,10 @@ mod tests {
         std::fs::write(d.join("inner.txt"), "x").unwrap();
         assert!(d.exists());
         move_to_trash(&d).unwrap();
-        assert!(!d.exists(), "folder should be gone from the workspace after trash");
+        assert!(
+            !d.exists(),
+            "folder should be gone from the workspace after trash"
+        );
     }
 
     #[test]
@@ -1306,7 +1316,10 @@ mod tests {
             .unwrap();
         tree.selected = sub_idx;
         tree.activate();
-        assert!(!tree.nodes[sub_idx].expanded, "precondition: sub is collapsed");
+        assert!(
+            !tree.nodes[sub_idx].expanded,
+            "precondition: sub is collapsed"
+        );
         // External write fires a watcher event for `sub`.
         std::fs::write(sub.join("b.txt"), "").unwrap();
         tree.refresh_children(sub_idx);
@@ -1716,7 +1729,9 @@ impl Widget for &mut FileTree {
         if let Some(metrics) = scrollbar_metrics {
             self.last_scrollbar = metrics.area;
         }
-        let row_width = inner.width.saturating_sub(u16::from(scrollbar_metrics.is_some()));
+        let row_width = inner
+            .width
+            .saturating_sub(u16::from(scrollbar_metrics.is_some()));
 
         let end = (self.scroll + visible_height).min(self.nodes.len());
         for (row, idx) in (self.scroll..end).enumerate() {
@@ -1786,7 +1801,15 @@ impl Widget for &mut FileTree {
             } else {
                 Style::default()
             };
-            buf.set_style(Rect { x: inner.x, y, width: row_width, height: 1 }, line_style);
+            buf.set_style(
+                Rect {
+                    x: inner.x,
+                    y,
+                    width: row_width,
+                    height: 1,
+                },
+                line_style,
+            );
             buf.set_line(inner.x, y, &line, row_width);
         }
         if let Some(metrics) = scrollbar_metrics {

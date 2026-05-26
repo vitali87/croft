@@ -1,7 +1,5 @@
 use grep_regex::{RegexMatcher, RegexMatcherBuilder};
-use grep_searcher::{
-    BinaryDetection, MmapChoice, Searcher, SearcherBuilder, Sink, SinkMatch,
-};
+use grep_searcher::{BinaryDetection, MmapChoice, Searcher, SearcherBuilder, Sink, SinkMatch};
 use ignore::{WalkBuilder, WalkState};
 use ratatui::{
     buffer::Buffer,
@@ -345,8 +343,7 @@ pub fn search_worker_loop(
                 opts,
                 &cancel_for_thread,
                 move |batch| {
-                    let _ = tx_for_emit
-                        .send(SearchEvent::Hits(q_for_emit.clone(), opts, batch));
+                    let _ = tx_for_emit.send(SearchEvent::Hits(q_for_emit.clone(), opts, batch));
                 },
             );
             let _ = tx_for_thread.send(SearchEvent::Done(query_for_thread, opts));
@@ -487,7 +484,9 @@ impl SearchPanel {
     }
 
     pub fn delete_selection(&mut self) -> bool {
-        let Some((a, b)) = self.selection_range() else { return false };
+        let Some((a, b)) = self.selection_range() else {
+            return false;
+        };
         if a == b {
             self.selection = None;
             return false;
@@ -653,7 +652,9 @@ impl Widget for &mut SearchPanel {
         } else {
             Style::default().fg(Color::DarkGray)
         };
-        let outer = Block::default().borders(Borders::ALL).border_style(outer_style);
+        let outer = Block::default()
+            .borders(Borders::ALL)
+            .border_style(outer_style);
         let inner = outer.inner(area);
         outer.render(area, buf);
         self.last_area = area;
@@ -716,12 +717,18 @@ impl Widget for &mut SearchPanel {
         };
 
         // Chevron, vertically aligned with the input content row.
-        let chevron_color = if self.focused { focus_blue } else { Color::DarkGray };
+        let chevron_color = if self.focused {
+            focus_blue
+        } else {
+            Color::DarkGray
+        };
         buf.set_string(
             chevron_x,
             content_y,
             "▾",
-            Style::default().fg(chevron_color).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(chevron_color)
+                .add_modifier(Modifier::BOLD),
         );
 
         // Input box border (rounded so it reads softer than the outer
@@ -742,7 +749,11 @@ impl Widget for &mut SearchPanel {
         // Magnifier glyph on the left of the input content, matching the
         // codicon `search` U+EA6D used in the activity bar.
         let magnifier_glyph = "\u{ea6d}";
-        let magnifier_color = if self.focused { focus_blue } else { Color::Rgb(0x9d, 0xa5, 0xb4) };
+        let magnifier_color = if self.focused {
+            focus_blue
+        } else {
+            Color::Rgb(0x9d, 0xa5, 0xb4)
+        };
         let magnifier_w: u16 = 2; // glyph + 1-cell gap
         if input_inner.width > magnifier_w {
             buf.set_string(
@@ -889,7 +900,9 @@ impl Widget for &mut SearchPanel {
         if let Some(metrics) = scrollbar_metrics {
             self.last_scrollbar = metrics.area;
         }
-        let row_width = inner.width.saturating_sub(u16::from(scrollbar_metrics.is_some()));
+        let row_width = inner
+            .width
+            .saturating_sub(u16::from(scrollbar_metrics.is_some()));
         let end = (self.scroll + visible).min(self.hits.len());
         for (row_idx, hit_idx) in (self.scroll..end).enumerate() {
             let y = results_start_y + row_idx as u16;
@@ -937,7 +950,11 @@ impl Widget for &mut SearchPanel {
             for (chunk, is_match) in split_for_highlight(&hit.line_text, needle, self.opts) {
                 spans.push(Span::styled(
                     chunk,
-                    if is_match { highlight_style } else { plain_style },
+                    if is_match {
+                        highlight_style
+                    } else {
+                        plain_style
+                    },
                 ));
             }
             let line = Line::from(spans);
@@ -963,7 +980,13 @@ mod tests {
     fn collect_matches_substring_case_insensitive() {
         let mut out = Vec::new();
         let content = "Hello World\nfoo bar\nHELLO again\nno match here";
-        collect_matches_in_text(Path::new("a.txt"), content, "hello", SearchOpts::default(), &mut out);
+        collect_matches_in_text(
+            Path::new("a.txt"),
+            content,
+            "hello",
+            SearchOpts::default(),
+            &mut out,
+        );
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].line_no, 1);
         assert_eq!(out[0].line_text, "Hello World");
@@ -975,7 +998,13 @@ mod tests {
     fn collect_matches_truncates_very_long_lines() {
         let mut out = Vec::new();
         let long_line = "x".repeat(MAX_LINE_LEN + 50) + "needle";
-        collect_matches_in_text(Path::new("a.txt"), &long_line, "needle", SearchOpts::default(), &mut out);
+        collect_matches_in_text(
+            Path::new("a.txt"),
+            &long_line,
+            "needle",
+            SearchOpts::default(),
+            &mut out,
+        );
         assert_eq!(out.len(), 1);
         assert!(out[0].line_text.ends_with('…'));
         assert!(out[0].line_text.chars().count() <= MAX_LINE_LEN + 1);
@@ -1058,7 +1087,12 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut panel = SearchPanel::new(tmp.path().to_path_buf());
         panel.focused = true;
-        let area = Rect { x: 0, y: 0, width: 60, height: 12 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 12,
+        };
         let mut buf = Buffer::empty(area);
         ratatui::widgets::Widget::render(&mut panel, area, &mut buf);
         let inner_x = panel.last_inner.x;
@@ -1077,7 +1111,12 @@ mod tests {
         let mut panel = SearchPanel::new(tmp.path().to_path_buf());
         panel.focused = true;
         panel.query = String::from("foo");
-        let area = Rect { x: 0, y: 0, width: 60, height: 12 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 12,
+        };
         let mut buf = Buffer::empty(area);
         ratatui::widgets::Widget::render(&mut panel, area, &mut buf);
         let inner_x = panel.last_inner.x;
@@ -1110,7 +1149,12 @@ mod tests {
         use ratatui::buffer::Buffer;
         let tmp = TempDir::new().unwrap();
         let mut panel = SearchPanel::new(tmp.path().to_path_buf());
-        let area = Rect { x: 0, y: 0, width: 60, height: 10 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 10,
+        };
         let mut buf = Buffer::empty(area);
         ratatui::widgets::Widget::render(&mut panel, area, &mut buf);
         let inner_x = panel.last_inner.x;
@@ -1141,7 +1185,12 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut panel = SearchPanel::new(tmp.path().to_path_buf());
         panel.focused = true;
-        let area = Rect { x: 0, y: 0, width: 60, height: 12 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 12,
+        };
         let mut buf = Buffer::empty(area);
         ratatui::widgets::Widget::render(&mut panel, area, &mut buf);
         let dump = buffer_to_string(&buf);
@@ -1164,7 +1213,12 @@ mod tests {
         for width in 0u16..40 {
             for height in 0u16..20 {
                 let mut panel = SearchPanel::new(tmp.path().to_path_buf());
-                let area = Rect { x: 0, y: 0, width, height };
+                let area = Rect {
+                    x: 0,
+                    y: 0,
+                    width,
+                    height,
+                };
                 if area.width == 0 || area.height == 0 {
                     continue;
                 }
@@ -1184,7 +1238,12 @@ mod tests {
         use ratatui::buffer::Buffer;
         let tmp = TempDir::new().unwrap();
         let mut panel = SearchPanel::new(tmp.path().to_path_buf());
-        let area = Rect { x: 0, y: 0, width: 60, height: 12 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 12,
+        };
         let mut buf = Buffer::empty(area);
         ratatui::widgets::Widget::render(&mut panel, area, &mut buf);
         let inner = panel.last_inner;
@@ -1203,7 +1262,12 @@ mod tests {
         use ratatui::buffer::Buffer;
         let tmp = TempDir::new().unwrap();
         let mut panel = SearchPanel::new(tmp.path().to_path_buf());
-        let area = Rect { x: 0, y: 0, width: 60, height: 10 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 10,
+        };
         let mut buf = Buffer::empty(area);
         ratatui::widgets::Widget::render(&mut panel, area, &mut buf);
         let dump = buffer_to_string(&buf);
@@ -1234,7 +1298,12 @@ mod tests {
         panel.query = String::from("needle");
         panel.run_query();
         assert_eq!(panel.hits.len(), 1);
-        let area = Rect { x: 0, y: 0, width: 60, height: 14 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 14,
+        };
         let mut buf = Buffer::empty(area);
         ratatui::widgets::Widget::render(&mut panel, area, &mut buf);
         let dump = buffer_to_string(&buf);
@@ -1254,10 +1323,18 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut panel = SearchPanel::new(tmp.path().to_path_buf());
         panel.focused = true;
-        let area = Rect { x: 0, y: 0, width: 60, height: 5 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 5,
+        };
         let mut buf = Buffer::empty(area);
         ratatui::widgets::Widget::render(&mut panel, area, &mut buf);
-        assert_eq!(panel.paste_button_w, 0, "paste button should not reserve cells");
+        assert_eq!(
+            panel.paste_button_w, 0,
+            "paste button should not reserve cells"
+        );
         let mut collected = String::new();
         for x in area.x..area.x + area.width {
             collected.push_str(buf[(x, 1)].symbol());
@@ -1274,7 +1351,12 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut panel = SearchPanel::new(tmp.path().to_path_buf());
         panel.focused = true;
-        let area = Rect { x: 0, y: 0, width: 60, height: 5 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 5,
+        };
         let mut buf = Buffer::empty(area);
         ratatui::widgets::Widget::render(&mut panel, area, &mut buf);
         assert_eq!(panel.paste_button_w, 0);
@@ -1296,10 +1378,16 @@ mod tests {
 
     #[test]
     fn split_highlight_marks_each_match_run_case_insensitive() {
-        let segs = split_for_highlight("The Quick brown fox jumps over the QUICK fence", "quick", SearchOpts::default());
+        let segs = split_for_highlight(
+            "The Quick brown fox jumps over the QUICK fence",
+            "quick",
+            SearchOpts::default(),
+        );
         // Two runs of "quick" (mixed case), three non-match tails.
-        let matches: Vec<&String> =
-            segs.iter().filter_map(|(s, m)| if *m { Some(s) } else { None }).collect();
+        let matches: Vec<&String> = segs
+            .iter()
+            .filter_map(|(s, m)| if *m { Some(s) } else { None })
+            .collect();
         assert_eq!(matches.len(), 2);
         // Original-case slice must be preserved in the matched segment.
         assert_eq!(matches[0], "Quick");
@@ -1314,8 +1402,16 @@ mod tests {
         let segs = split_for_highlight("foo bar foo", "foo", SearchOpts::default());
         let joined: String = segs.iter().map(|(s, _)| s.as_str()).collect();
         assert_eq!(joined, "foo bar foo");
-        assert_eq!(segs.first().map(|(_, m)| *m), Some(true), "first seg is match");
-        assert_eq!(segs.last().map(|(_, m)| *m), Some(true), "last seg is match");
+        assert_eq!(
+            segs.first().map(|(_, m)| *m),
+            Some(true),
+            "first seg is match"
+        );
+        assert_eq!(
+            segs.last().map(|(_, m)| *m),
+            Some(true),
+            "last seg is match"
+        );
     }
 
     fn collect_until_done(
@@ -1395,7 +1491,10 @@ mod tests {
         drop(q_tx);
         join.join().unwrap();
         assert_eq!(total, 4, "every match across all files must arrive");
-        assert!(hits_events >= 3, "expected per-file batches, got {hits_events}");
+        assert!(
+            hits_events >= 3,
+            "expected per-file batches, got {hits_events}"
+        );
         assert_eq!(done_events, 1, "exactly one Done sentinel per request");
     }
 
@@ -1414,7 +1513,11 @@ mod tests {
         q_tx.send(("on".into(), SearchOpts::default())).unwrap();
         q_tx.send(("one".into(), SearchOpts::default())).unwrap();
         let (q, hits, done) = collect_until_done(&e_rx, std::time::Duration::from_secs(2));
-        assert_eq!(q.as_deref(), Some("one"), "coalesce must drop intermediate prefixes");
+        assert_eq!(
+            q.as_deref(),
+            Some("one"),
+            "coalesce must drop intermediate prefixes"
+        );
         assert_eq!(hits.len(), 1);
         assert!(done);
         drop(q_tx);
@@ -1483,7 +1586,8 @@ mod tests {
         // Wait past the 120ms debounce so the worker is committed.
         std::thread::sleep(std::time::Duration::from_millis(200));
         let switched_at = std::time::Instant::now();
-        q_tx.send(("zzznoneatall".into(), SearchOpts::default())).unwrap();
+        q_tx.send(("zzznoneatall".into(), SearchOpts::default()))
+            .unwrap();
         // Done for the new query must arrive within 1.5s of submission.
         // Without cancellation, the worker would still be plowing through
         // the 4M-match "c" scan and Done would not arrive for many seconds.
@@ -1541,7 +1645,10 @@ mod tests {
     #[test]
     fn search_opts_case_sensitive_excludes_different_case() {
         let mut out = Vec::new();
-        let opts = SearchOpts { case_sensitive: true, ..Default::default() };
+        let opts = SearchOpts {
+            case_sensitive: true,
+            ..Default::default()
+        };
         collect_matches_in_text(
             Path::new("a.txt"),
             "Hello World\nhello again\nHELLO loud",
@@ -1556,7 +1663,10 @@ mod tests {
     #[test]
     fn search_opts_whole_word_excludes_partial_matches() {
         let mut out = Vec::new();
-        let opts = SearchOpts { whole_word: true, ..Default::default() };
+        let opts = SearchOpts {
+            whole_word: true,
+            ..Default::default()
+        };
         collect_matches_in_text(
             Path::new("a.txt"),
             "cat sat\ncategory animal\ncat\nbobcat sleeps",
@@ -1572,7 +1682,10 @@ mod tests {
     #[test]
     fn search_opts_regex_finds_pattern_class() {
         let mut out = Vec::new();
-        let opts = SearchOpts { use_regex: true, ..Default::default() };
+        let opts = SearchOpts {
+            use_regex: true,
+            ..Default::default()
+        };
         collect_matches_in_text(
             Path::new("a.txt"),
             "let x = 42;\nlet y = abc;\nlet z = 13;\nno number",
@@ -1587,14 +1700,12 @@ mod tests {
     #[test]
     fn search_opts_regex_honours_case_sensitive_flag() {
         let mut out = Vec::new();
-        let opts = SearchOpts { use_regex: true, case_sensitive: true, ..Default::default() };
-        collect_matches_in_text(
-            Path::new("a.txt"),
-            "Foo\nfoo\nFOO",
-            r"foo",
-            opts,
-            &mut out,
-        );
+        let opts = SearchOpts {
+            use_regex: true,
+            case_sensitive: true,
+            ..Default::default()
+        };
+        collect_matches_in_text(Path::new("a.txt"), "Foo\nfoo\nFOO", r"foo", opts, &mut out);
         let texts: Vec<&str> = out.iter().map(|h| h.line_text.as_str()).collect();
         assert_eq!(texts, vec!["foo"], "regex must respect case-sensitive flag");
     }
@@ -1602,7 +1713,10 @@ mod tests {
     #[test]
     fn search_opts_invalid_regex_returns_empty_quietly() {
         let mut out = Vec::new();
-        let opts = SearchOpts { use_regex: true, ..Default::default() };
+        let opts = SearchOpts {
+            use_regex: true,
+            ..Default::default()
+        };
         collect_matches_in_text(
             Path::new("a.txt"),
             "anything\nat all",
@@ -1610,7 +1724,10 @@ mod tests {
             opts,
             &mut out,
         );
-        assert!(out.is_empty(), "invalid regex must not crash, just yield no hits");
+        assert!(
+            out.is_empty(),
+            "invalid regex must not crash, just yield no hits"
+        );
     }
 
     #[test]
@@ -1619,7 +1736,12 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut panel = SearchPanel::new(tmp.path().to_path_buf());
         panel.focused = true;
-        let area = Rect { x: 0, y: 0, width: 60, height: 12 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 12,
+        };
         let mut buf = Buffer::empty(area);
         ratatui::widgets::Widget::render(&mut panel, area, &mut buf);
         let y = panel.toggle_y;
@@ -1650,10 +1772,7 @@ mod tests {
     #[test]
     fn search_panel_navigation_clamps() {
         let tmp = TempDir::new().unwrap();
-        write(
-            &tmp.path().join("x.txt"),
-            "a needle\nb needle\nc needle\n",
-        );
+        write(&tmp.path().join("x.txt"), "a needle\nb needle\nc needle\n");
         let mut panel = SearchPanel::new(tmp.path().to_path_buf());
         panel.query = "needle".into();
         panel.run_query();
@@ -1689,7 +1808,12 @@ mod tests {
         let mut panel = make_panel_with_hits(&tmp, 100);
         panel.selected = 0;
         panel.scroll = 30;
-        let area = Rect { x: 0, y: 0, width: 60, height: 30 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 30,
+        };
         let mut buf = ratatui::buffer::Buffer::empty(area);
         ratatui::widgets::Widget::render(&mut panel, area, &mut buf);
         assert_eq!(
@@ -1707,7 +1831,12 @@ mod tests {
         let mut panel = make_panel_with_hits(&tmp, 80);
         panel.selected = 0;
         panel.scroll = 30;
-        let area = Rect { x: 0, y: 0, width: 60, height: 30 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 30,
+        };
         let mut buf = ratatui::buffer::Buffer::empty(area);
         ratatui::widgets::Widget::render(&mut panel, area, &mut buf);
         // Streaming batch: another 50 hits arrive.
@@ -1731,7 +1860,12 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut panel = make_panel_with_hits(&tmp, 100);
         // Pretend a 30-row panel was rendered: viewport = 30 - 7 = 23 rows.
-        panel.last_inner = Rect { x: 0, y: 0, width: 60, height: 30 };
+        panel.last_inner = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 30,
+        };
         panel.selected = 22;
         panel.scroll = 0;
         panel.move_down();
@@ -1746,7 +1880,12 @@ mod tests {
     fn move_up_above_top_of_viewport_retreats_scroll_to_keep_selection_visible() {
         let tmp = TempDir::new().unwrap();
         let mut panel = make_panel_with_hits(&tmp, 100);
-        panel.last_inner = Rect { x: 0, y: 0, width: 60, height: 30 };
+        panel.last_inner = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 30,
+        };
         panel.selected = 50;
         panel.scroll = 50;
         panel.move_up();
@@ -1761,7 +1900,12 @@ mod tests {
     fn scroll_down_via_wheel_does_not_change_selection() {
         let tmp = TempDir::new().unwrap();
         let mut panel = make_panel_with_hits(&tmp, 100);
-        panel.last_inner = Rect { x: 0, y: 0, width: 60, height: 30 };
+        panel.last_inner = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 30,
+        };
         panel.selected = 0;
         panel.scroll = 0;
         panel.scroll_down(20);

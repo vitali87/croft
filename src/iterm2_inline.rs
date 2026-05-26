@@ -1,14 +1,10 @@
 use base64::Engine;
 use image::{ImageBuffer, Rgba, RgbaImage};
 
-pub const EXPLORER_SRC_PNG: &[u8] =
-    include_bytes!("../assets/icons/explorer_src.png");
-pub const SEARCH_SRC_PNG: &[u8] =
-    include_bytes!("../assets/icons/search_src.png");
-pub const REMOTE_SRC_PNG: &[u8] =
-    include_bytes!("../assets/icons/remote_src.png");
-pub const CODEBERG_SRC_PNG: &[u8] =
-    include_bytes!("../assets/icons/codeberg_src.png");
+pub const EXPLORER_SRC_PNG: &[u8] = include_bytes!("../assets/icons/explorer_src.png");
+pub const SEARCH_SRC_PNG: &[u8] = include_bytes!("../assets/icons/search_src.png");
+pub const REMOTE_SRC_PNG: &[u8] = include_bytes!("../assets/icons/remote_src.png");
+pub const CODEBERG_SRC_PNG: &[u8] = include_bytes!("../assets/icons/codeberg_src.png");
 /// 192x192 white-on-transparent rasterisation of `assets/icons/debug-alt.svg`,
 /// the upstream codicon `debug-alt` glyph (bug + play triangle). Rendered
 /// once with `rsvg-convert -w 192 -h 192 -b transparent`; the resulting PNG
@@ -17,25 +13,21 @@ pub const CODEBERG_SRC_PNG: &[u8] =
 /// detail under the activity-bar's downsample (the bug stops reading as a
 /// bug at ~30px); the SVG render keeps the silhouette legible at every
 /// cell-size croft is likely to see.
-pub const RUN_DEBUG_SRC_PNG: &[u8] =
-    include_bytes!("../assets/icons/run_debug_src.png");
-pub const WELCOME_LOGO_PNG: &[u8] =
-    include_bytes!("../assets/logo-tight-removebg-preview.png");
+pub const RUN_DEBUG_SRC_PNG: &[u8] = include_bytes!("../assets/icons/run_debug_src.png");
+pub const WELCOME_LOGO_PNG: &[u8] = include_bytes!("../assets/logo-tight-removebg-preview.png");
 /// Hero illustration shown in the Source Control sidebar when the
 /// workspace isn't a git repo: a stylised file silhouette with the Git
 /// Y-fork (three blue rings + curved branch) and a dashed circle, framed
 /// by decorative `+` and dot motifs. Bundled as a raster so it renders
 /// identically across terminals that support OSC-1337 inline images.
-pub const NO_REPO_HERO_PNG: &[u8] =
-    include_bytes!("../assets/icons/no_repo_src.png");
+pub const NO_REPO_HERO_PNG: &[u8] = include_bytes!("../assets/icons/no_repo_src.png");
 /// Illustration shown inside the Remote Explorer panel's SSH section when
 /// no Host entries are present: three stylised server units stacked
 /// vertically with a dashed connector to a small terminal box, framed by
 /// decorative `+` motifs. Same teal/cyan palette as the rest of the
 /// empty-state card. Bundled as a raster so we can paint it via OSC-1337
 /// instead of fighting box-drawing characters that never look quite right.
-pub const SSH_EMPTY_STATE_PNG: &[u8] =
-    include_bytes!("../assets/icons/ssh_empty_state.png");
+pub const SSH_EMPTY_STATE_PNG: &[u8] = include_bytes!("../assets/icons/ssh_empty_state.png");
 
 const ACTIVE_PILL: Rgba<u8> = Rgba([0x4e, 0x9a, 0xff, 0xff]);
 const ACTIVE_TINT: Rgba<u8> = Rgba([0xff, 0xff, 0xff, 0xff]);
@@ -55,11 +47,8 @@ pub fn compose_icon(
     is_active: bool,
     bg: Rgba<u8>,
 ) -> Result<Vec<u8>, image::ImageError> {
-    let codicon = image::load_from_memory_with_format(
-        src_codicon_png,
-        image::ImageFormat::Png,
-    )?
-    .to_rgba8();
+    let codicon =
+        image::load_from_memory_with_format(src_codicon_png, image::ImageFormat::Png)?.to_rgba8();
     let target_max = (canvas_w.min(canvas_h).saturating_sub(4) * 9 / 10).max(8);
     let (src_w, src_h) = (codicon.width().max(1), codicon.height().max(1));
     let (icon_w, icon_h) = if src_w <= src_h {
@@ -79,10 +68,13 @@ pub fn compose_icon(
         icon_h,
         image::imageops::FilterType::Lanczos3,
     );
-    let tint = if is_active { ACTIVE_TINT } else { INACTIVE_TINT };
+    let tint = if is_active {
+        ACTIVE_TINT
+    } else {
+        INACTIVE_TINT
+    };
     let tinted = tint_rgba(&scaled, tint);
-    let mut canvas: RgbaImage =
-        ImageBuffer::from_pixel(canvas_w, canvas_h, bg);
+    let mut canvas: RgbaImage = ImageBuffer::from_pixel(canvas_w, canvas_h, bg);
     let off_x = ((canvas_w.saturating_sub(icon_w)) / 2) as i64;
     let off_y = ((canvas_h.saturating_sub(icon_h)) / 2) as i64;
     image::imageops::overlay(&mut canvas, &tinted, off_x, off_y);
@@ -97,10 +89,8 @@ pub fn compose_icon(
         }
     }
     let mut out = Vec::with_capacity(2048);
-    image::DynamicImage::ImageRgba8(canvas).write_to(
-        &mut std::io::Cursor::new(&mut out),
-        image::ImageFormat::Png,
-    )?;
+    image::DynamicImage::ImageRgba8(canvas)
+        .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)?;
     Ok(out)
 }
 
@@ -118,12 +108,7 @@ pub fn is_iterm2_term_program(value: Option<&str>) -> bool {
 }
 
 pub fn force_inline_images(value: Option<&str>) -> bool {
-    value.is_some_and(|v| {
-        matches!(
-            v.to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        )
-    })
+    value.is_some_and(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
 }
 
 pub fn is_tmux_env(term: Option<&str>, tmux_var: Option<&str>) -> bool {
@@ -177,21 +162,14 @@ pub fn fit_image_auto(
     );
     let new_w = ((sw as f64 * scale).round() as u32).max(1);
     let new_h = ((sh as f64 * scale).round() as u32).max(1);
-    let scaled = image::imageops::resize(
-        &img,
-        new_w,
-        new_h,
-        image::imageops::FilterType::Lanczos3,
-    );
+    let scaled = image::imageops::resize(&img, new_w, new_h, image::imageops::FilterType::Lanczos3);
     let mut canvas: RgbaImage = ImageBuffer::from_pixel(canvas_w_px, canvas_h_px, bg);
     let off_x = ((canvas_w_px as i64) - (new_w as i64)) / 2;
     let off_y = ((canvas_h_px as i64) - (new_h as i64)) / 2;
     image::imageops::overlay(&mut canvas, &scaled, off_x, off_y);
     let mut out = Vec::with_capacity(8192);
-    image::DynamicImage::ImageRgba8(canvas).write_to(
-        &mut std::io::Cursor::new(&mut out),
-        image::ImageFormat::Png,
-    )?;
+    image::DynamicImage::ImageRgba8(canvas)
+        .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)?;
     Ok(out)
 }
 
@@ -453,7 +431,11 @@ mod tests {
         assert!(
             opaque_rows + alpha_edge_slack >= target_max,
             "portrait icon painted {} rows in a {}x{} cell; expected close to target_max ({}) (within {} rows of slack for the Lanczos alpha edges) so it visually matches the square sibling icons",
-            opaque_rows, canvas_w, canvas_h, target_max, alpha_edge_slack
+            opaque_rows,
+            canvas_w,
+            canvas_h,
+            target_max,
+            alpha_edge_slack
         );
     }
 
@@ -463,6 +445,9 @@ mod tests {
         let wrapped = tmux_passthrough_wrap(inner);
         assert!(wrapped.starts_with("\x1bPtmux;"), "DCS prefix");
         assert!(wrapped.ends_with("\x1b\\"), "ST terminator");
-        assert!(wrapped.contains("\x1b\x1b]1337"), "inner ESC must be doubled");
+        assert!(
+            wrapped.contains("\x1b\x1b]1337"),
+            "inner ESC must be doubled"
+        );
     }
 }

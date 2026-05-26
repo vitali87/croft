@@ -88,18 +88,12 @@ fn page_count_via_mdls(pdf: &Path) -> Option<u32> {
 /// the encoded PNG. The caller is responsible for cleaning up no temp
 /// files — every backend writes to a per-call temp path that we delete
 /// before returning.
-pub fn rasterize_page(
-    pdf: &Path,
-    page: u32,
-    backend: PdfBackend,
-) -> std::io::Result<Vec<u8>> {
+pub fn rasterize_page(pdf: &Path, page: u32, backend: PdfBackend) -> std::io::Result<Vec<u8>> {
     match backend {
         PdfBackend::PdftoppmCli => rasterize_with_pdftoppm(pdf, page),
         PdfBackend::SipsCli => {
             if page != 1 {
-                return Err(std::io::Error::other(
-                    "sips backend can only render page 1",
-                ));
+                return Err(std::io::Error::other("sips backend can only render page 1"));
             }
             rasterize_with_sips(pdf)
         }
@@ -111,9 +105,12 @@ fn rasterize_with_pdftoppm(pdf: &Path, page: u32) -> std::io::Result<Vec<u8>> {
     let _guard = TempDirGuard(dir.clone());
     let prefix = dir.join("page");
     let status = Command::new("pdftoppm")
-        .arg("-f").arg(page.to_string())
-        .arg("-l").arg(page.to_string())
-        .arg("-r").arg("144")
+        .arg("-f")
+        .arg(page.to_string())
+        .arg("-l")
+        .arg(page.to_string())
+        .arg("-r")
+        .arg("144")
         .args(["-png", "-singlefile"])
         .arg(pdf)
         .arg(&prefix)

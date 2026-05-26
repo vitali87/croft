@@ -388,7 +388,9 @@ pub(crate) mod test_clip {
 
     impl ClipboardTestGuard {
         pub(crate) fn acquire() -> Self {
-            let mutex = CLIP_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+            let mutex = CLIP_LOCK
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
             #[cfg(target_os = "macos")]
             let snapshot = super::macos::read_string_native();
             REAL_OPT_IN.with(|c| c.set(true));

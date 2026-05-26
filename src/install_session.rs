@@ -35,10 +35,8 @@ impl InstallSession {
         };
         let done_tx = tx.clone();
         let handle = std::thread::spawn(move || {
-            let result = crate::remote::install_only_streaming(
-                adopted_for_thread,
-                log_tx_for_install,
-            );
+            let result =
+                crate::remote::install_only_streaming(adopted_for_thread, log_tx_for_install);
             let payload = match result {
                 Ok(_) => Ok(()),
                 Err(e) => Err(format!("{e:#}")),

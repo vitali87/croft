@@ -1,4 +1,4 @@
-use crate::remote::{discover_ssh_targets, ssh_config_state, RemoteTarget, SshConfigState};
+use crate::remote::{RemoteTarget, SshConfigState, discover_ssh_targets, ssh_config_state};
 use crate::widgets::scrollbar;
 use ratatui::{
     buffer::Buffer,
@@ -253,10 +253,7 @@ fn render_section_header(panel: &mut RemotePanel, buf: &mut Buffer, inner: Rect)
         inner.x,
         inner.y,
         &Line::from(vec![
-            Span::styled(
-                format!("{chevron} "),
-                Style::default().fg(Color::Gray),
-            ),
+            Span::styled(format!("{chevron} "), Style::default().fg(Color::Gray)),
             Span::styled("SSH", header_style),
         ]),
         inner.width,
@@ -276,7 +273,12 @@ fn render_section_header(panel: &mut RemotePanel, buf: &mut Buffer, inner: Rect)
     let add_x = refresh_x.saturating_sub(pill_w + 1);
     if add_x > inner.x + 5 {
         render_header_pill(buf, add_x, inner.y, pill_w, ADD_GLYPH);
-        panel.header_add_btn = Rect { x: add_x, y: inner.y, width: pill_w, height: 1 };
+        panel.header_add_btn = Rect {
+            x: add_x,
+            y: inner.y,
+            width: pill_w,
+            height: 1,
+        };
     }
     if refresh_x > inner.x + 5 {
         render_header_pill(buf, refresh_x, inner.y, pill_w, REFRESH_GLYPH);
@@ -434,9 +436,16 @@ fn render_empty_state(panel: &mut RemotePanel, buf: &mut Buffer, area: Rect) {
                 lx,
                 y,
                 link,
-                Style::default().fg(LINK_FG).add_modifier(Modifier::UNDERLINED),
+                Style::default()
+                    .fg(LINK_FG)
+                    .add_modifier(Modifier::UNDERLINED),
             );
-            panel.empty_learn_link = Rect { x: lx, y, width: w, height: 1 };
+            panel.empty_learn_link = Rect {
+                x: lx,
+                y,
+                width: w,
+                height: 1,
+            };
         }
     }
 }
@@ -498,7 +507,12 @@ fn render_filled_button(
     let lbl_w = label.chars().count() as u16;
     let lbl_x = x + (width.saturating_sub(lbl_w)) / 2;
     buf.set_string(lbl_x, y + 1, label, label_style);
-    Rect { x, y, width, height: 3 }
+    Rect {
+        x,
+        y,
+        width,
+        height: 3,
+    }
 }
 
 fn render_outlined_button(buf: &mut Buffer, x: u16, y: u16, width: u16, label: &str) -> Rect {
@@ -529,7 +543,12 @@ fn render_outlined_button(buf: &mut Buffer, x: u16, y: u16, width: u16, label: &
     let lbl_w = label.chars().count() as u16;
     let lbl_x = x + (width.saturating_sub(lbl_w)) / 2;
     buf.set_string(lbl_x, y + 1, label, label_style);
-    Rect { x, y, width, height: 3 }
+    Rect {
+        x,
+        y,
+        width,
+        height: 3,
+    }
 }
 
 impl Widget for &mut RemotePanel {
@@ -584,7 +603,12 @@ impl Widget for &mut RemotePanel {
         if !self.filter.is_empty() && body_y < body_end {
             render_filter_row(
                 buf,
-                Rect { x: inner.x, y: body_y, width: inner.width, height: 1 },
+                Rect {
+                    x: inner.x,
+                    y: body_y,
+                    width: inner.width,
+                    height: 1,
+                },
                 &self.filter,
             );
             body_y = body_y.saturating_add(1);
@@ -731,7 +755,12 @@ mod tests {
     #[test]
     fn header_paints_refresh_glyph_in_buffer_when_panel_renders() {
         let mut p = populated_panel(&["a", "b"]);
-        let area = Rect { x: 0, y: 0, width: 40, height: 10 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 10,
+        };
         let mut buf = Buffer::empty(area);
         (&mut p).render(area, &mut buf);
         let header_y = p.header_refresh_btn.y;
@@ -752,7 +781,12 @@ mod tests {
     #[test]
     fn header_icon_buttons_are_two_cells_wide_so_they_read_as_compact_chips() {
         let mut p = populated_panel(&["a"]);
-        let area = Rect { x: 0, y: 0, width: 40, height: 10 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 10,
+        };
         let mut buf = Buffer::empty(area);
         (&mut p).render(area, &mut buf);
         assert_eq!(
@@ -770,7 +804,12 @@ mod tests {
     #[test]
     fn chevron_click_rect_is_registered_at_header_origin() {
         let mut p = populated_panel(&["a"]);
-        let area = Rect { x: 0, y: 0, width: 40, height: 10 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 10,
+        };
         let mut buf = Buffer::empty(area);
         (&mut p).render(area, &mut buf);
         assert!(
@@ -783,7 +822,12 @@ mod tests {
     #[test]
     fn toggle_collapsed_hides_list_rows_but_keeps_header_buttons_clickable() {
         let mut p = populated_panel(&["a", "b", "c"]);
-        let area = Rect { x: 0, y: 0, width: 40, height: 10 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 10,
+        };
         let mut buf = Buffer::empty(area);
         p.toggle_collapsed();
         (&mut p).render(area, &mut buf);
@@ -840,7 +884,12 @@ mod tests {
     #[test]
     fn target_at_y_resolves_against_filtered_rows_not_raw_targets() {
         let mut p = populated_panel(&["alpha", "bravo", "charlie"]);
-        let area = Rect { x: 0, y: 0, width: 40, height: 10 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 10,
+        };
         let mut buf = Buffer::empty(area);
         p.push_filter_char('b');
         (&mut p).render(area, &mut buf);
@@ -866,7 +915,12 @@ mod tests {
     #[test]
     fn empty_state_registers_hit_rects_for_every_actionable_affordance() {
         let mut p = empty_panel();
-        let area = Rect { x: 0, y: 0, width: 40, height: 40 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 40,
+        };
         let mut buf = Buffer::empty(area);
         (&mut p).render(area, &mut buf);
         assert!(p.header_add_btn.width > 0);
@@ -879,7 +933,12 @@ mod tests {
     #[test]
     fn populated_state_does_not_register_empty_state_hit_rects() {
         let mut p = populated_panel(&["dev"]);
-        let area = Rect { x: 0, y: 0, width: 40, height: 40 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 40,
+        };
         let mut buf = Buffer::empty(area);
         (&mut p).render(area, &mut buf);
         assert_eq!(p.empty_primary_btn, Rect::default());
@@ -891,7 +950,12 @@ mod tests {
     fn empty_state_body_text_never_overflows_card_width_at_real_sidebar_sizes() {
         for sidebar_w in 24u16..=44 {
             let mut p = empty_panel();
-            let area = Rect { x: 0, y: 0, width: sidebar_w, height: 40 };
+            let area = Rect {
+                x: 0,
+                y: 0,
+                width: sidebar_w,
+                height: 40,
+            };
             let mut buf = Buffer::empty(area);
             (&mut p).render(area, &mut buf);
             for y in area.top()..area.bottom() {
@@ -907,10 +971,7 @@ mod tests {
                 let last = chars[cw - 1];
                 let last_non_space = chars.iter().rposition(|c| !c.is_whitespace());
                 if let Some(pos) = last_non_space {
-                    let is_border = matches!(
-                        last,
-                        '╮' | '╯' | '│' | '─' | '┌' | '┐' | '└' | '┘'
-                    );
+                    let is_border = matches!(last, '╮' | '╯' | '│' | '─' | '┌' | '┐' | '└' | '┘');
                     assert!(
                         pos < cw - 1 || is_border,
                         "body text overflows the sidebar at width {sidebar_w}: row='{row}', last non-space '{last}' at col {pos} >= card right edge {}",
@@ -924,7 +985,12 @@ mod tests {
     #[test]
     fn empty_state_buttons_are_three_rows_tall_for_a_proper_click_target() {
         let mut p = empty_panel();
-        let area = Rect { x: 0, y: 0, width: 40, height: 40 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 40,
+        };
         let mut buf = Buffer::empty(area);
         (&mut p).render(area, &mut buf);
         assert_eq!(p.empty_primary_btn.height, 3);
@@ -934,7 +1000,12 @@ mod tests {
     #[test]
     fn empty_state_reserves_a_cell_for_the_osc_1337_illustration() {
         let mut p = empty_panel();
-        let area = Rect { x: 0, y: 0, width: 40, height: 40 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 40,
+        };
         let mut buf = Buffer::empty(area);
         (&mut p).render(area, &mut buf);
         assert!(p.last_image_cell.is_some());
@@ -943,7 +1014,12 @@ mod tests {
     #[test]
     fn empty_state_renders_the_no_hosts_heading_so_the_user_knows_what_state_they_are_in() {
         let mut p = empty_panel();
-        let area = Rect { x: 0, y: 0, width: 40, height: 40 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 40,
+        };
         let mut buf = Buffer::empty(area);
         (&mut p).render(area, &mut buf);
         let mut joined = String::new();

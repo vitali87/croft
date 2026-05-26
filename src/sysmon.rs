@@ -84,7 +84,11 @@ fn root_disk_pct(disks: &Disks) -> Option<u8> {
         return None;
     }
     let used = total.saturating_sub(root.available_space());
-    Some(((used as f64 / total as f64) * 100.0).clamp(0.0, 100.0).round() as u8)
+    Some(
+        ((used as f64 / total as f64) * 100.0)
+            .clamp(0.0, 100.0)
+            .round() as u8,
+    )
 }
 
 fn peak_temp(comps: &Components) -> Option<u8> {

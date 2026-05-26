@@ -79,13 +79,14 @@ pub enum CliCommand {
 impl Cli {
     pub fn run(self) -> Result<()> {
         match self.command {
-            Some(CliCommand::SetupTerminal { font, size, yes }) => {
-                setup_terminal(&font, size, yes)
-            }
+            Some(CliCommand::SetupTerminal { font, size, yes }) => setup_terminal(&font, size, yes),
             Some(CliCommand::Keys { mouse }) => keys_diagnostic(mouse),
-            Some(CliCommand::SetupIterm2 { font, nonascii, size, yes }) => {
-                setup_iterm2(&font, &nonascii, size, yes)
-            }
+            Some(CliCommand::SetupIterm2 {
+                font,
+                nonascii,
+                size,
+                yes,
+            }) => setup_iterm2(&font, &nonascii, size, yes),
             Some(CliCommand::Remote { host, path }) => {
                 crate::remote::launch_croft(&host, path.as_deref())
             }
@@ -171,20 +172,31 @@ mod tests {
     #[test]
     fn parses_keys_subcommand() {
         let cli = Cli::parse_from(["croft", "keys"]);
-        assert!(matches!(cli.command, Some(CliCommand::Keys { mouse: false })));
+        assert!(matches!(
+            cli.command,
+            Some(CliCommand::Keys { mouse: false })
+        ));
     }
 
     #[test]
     fn parses_keys_subcommand_with_mouse() {
         let cli = Cli::parse_from(["croft", "keys", "--mouse"]);
-        assert!(matches!(cli.command, Some(CliCommand::Keys { mouse: true })));
+        assert!(matches!(
+            cli.command,
+            Some(CliCommand::Keys { mouse: true })
+        ));
     }
 
     #[test]
     fn parses_setup_iterm2_with_defaults() {
         let cli = Cli::parse_from(["croft", "setup-iterm2"]);
         match cli.command {
-            Some(CliCommand::SetupIterm2 { font, nonascii, size, yes }) => {
+            Some(CliCommand::SetupIterm2 {
+                font,
+                nonascii,
+                size,
+                yes,
+            }) => {
                 assert_eq!(font, ITERM2_FONT_PS_NAME);
                 assert_eq!(nonascii, ITERM2_NONASCII_PS_NAME);
                 assert_eq!(size, ITERM2_FONT_SIZE);
@@ -208,7 +220,12 @@ mod tests {
             "-y",
         ]);
         match cli.command {
-            Some(CliCommand::SetupIterm2 { font, nonascii, size, yes }) => {
+            Some(CliCommand::SetupIterm2 {
+                font,
+                nonascii,
+                size,
+                yes,
+            }) => {
                 assert_eq!(font, "FiraCodeNFM-Reg");
                 assert_eq!(nonascii, "SymbolsNFM");
                 assert_eq!(size, 15);
@@ -235,9 +252,7 @@ fn setup_terminal(font: &str, size: u32, yes: bool) -> Result<()> {
     if !cfg!(target_os = "macos") {
         anyhow::bail!("setup-terminal is macOS-only");
     }
-    println!(
-        "This will set Terminal.app's default profile font to '{font}' at {size}pt."
-    );
+    println!("This will set Terminal.app's default profile font to '{font}' at {size}pt.");
     println!("Existing custom profiles are not modified.");
     if !yes {
         print!("Apply this change? [y/N] ");
@@ -343,9 +358,7 @@ fn keys_diagnostic(mouse: bool) -> Result<()> {
                         }
                         let clipboard_probe = if is_paste_probe_key(k.code, k.modifiers) {
                             match crate::clipboard::read_string() {
-                                Some(s) if s.is_empty() => {
-                                    String::from("  clipboard=empty")
-                                }
+                                Some(s) if s.is_empty() => String::from("  clipboard=empty"),
                                 Some(s) => format!(
                                     "  clipboard=ok chars={} bytes={}",
                                     s.chars().count(),
@@ -457,10 +470,7 @@ fn setup_iterm2(font: &str, nonascii: &str, size: u32, yes: bool) -> Result<()> 
     Ok(())
 }
 
-const CROSS_TARGETS: &[&str] = &[
-    "x86_64-unknown-linux-musl",
-    "aarch64-unknown-linux-musl",
-];
+const CROSS_TARGETS: &[&str] = &["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"];
 
 fn setup_cross(yes: bool) -> Result<()> {
     println!(

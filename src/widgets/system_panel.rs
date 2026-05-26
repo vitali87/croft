@@ -173,7 +173,9 @@ impl Widget for &mut SystemPanel {
                 Span::styled(format!("{chevron} "), Style::default().fg(COLOR_DIM)),
                 Span::styled(
                     "SYSTEM ",
-                    Style::default().fg(COLOR_HEADER).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(COLOR_HEADER)
+                        .add_modifier(Modifier::BOLD),
                 ),
             ];
             spans.extend(collapsed_summary(self.latest.as_ref()));
@@ -194,7 +196,9 @@ impl Widget for &mut SystemPanel {
             Span::styled(format!("{chevron} "), Style::default().fg(COLOR_DIM)),
             Span::styled(
                 "SYSTEM",
-                Style::default().fg(COLOR_HEADER).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(COLOR_HEADER)
+                    .add_modifier(Modifier::BOLD),
             ),
         ]));
         let header_area = Rect {

@@ -54,8 +54,12 @@ const TSX_JSX_OVERLAY_QUERY: &str = r#"
 fn style_for(idx: usize) -> Style {
     let name = HIGHLIGHT_NAMES.get(idx).copied().unwrap_or("");
     match name {
-        "comment" => Style::default().fg(rgb(0x65, 0x73, 0x7e)).add_modifier(Modifier::ITALIC),
-        "keyword" | "label" => Style::default().fg(rgb(0xb4, 0x8e, 0xad)).add_modifier(Modifier::BOLD),
+        "comment" => Style::default()
+            .fg(rgb(0x65, 0x73, 0x7e))
+            .add_modifier(Modifier::ITALIC),
+        "keyword" | "label" => Style::default()
+            .fg(rgb(0xb4, 0x8e, 0xad))
+            .add_modifier(Modifier::BOLD),
         "string" | "string.escape" | "string.special" => Style::default().fg(rgb(0xa3, 0xbe, 0x8c)),
         "number" | "boolean" | "constant" | "constant.builtin" => {
             Style::default().fg(rgb(0xd0, 0x87, 0x70))
@@ -273,7 +277,9 @@ pub struct LangRegistry {
 
 impl LangRegistry {
     pub fn new() -> Self {
-        Self { cache: HashMap::new() }
+        Self {
+            cache: HashMap::new(),
+        }
     }
 
     pub fn get(&mut self, kind: LangKind) -> Option<&HighlightConfiguration> {
@@ -457,8 +463,18 @@ mod tests {
         // Spans on line 0 should be within line 0's length.
         let line0_len = "fn main() {".len();
         for sp in &highlights[0] {
-            assert!(sp.start <= line0_len, "span start {} > line len {}", sp.start, line0_len);
-            assert!(sp.end <= line0_len, "span end {} > line len {}", sp.end, line0_len);
+            assert!(
+                sp.start <= line0_len,
+                "span start {} > line len {}",
+                sp.start,
+                line0_len
+            );
+            assert!(
+                sp.end <= line0_len,
+                "span end {} > line len {}",
+                sp.end,
+                line0_len
+            );
             assert!(sp.start <= sp.end);
         }
     }
@@ -500,16 +516,10 @@ mod tests {
         assert!(per_line[1].is_empty());
     }
 
-    fn span_at<'a>(
-        spans: &'a [HiSpan],
-        line: &str,
-        needle: &str,
-    ) -> Option<&'a HiSpan> {
+    fn span_at<'a>(spans: &'a [HiSpan], line: &str, needle: &str) -> Option<&'a HiSpan> {
         let off = line.find(needle)?;
         let end = off + needle.len();
-        spans
-            .iter()
-            .find(|sp| sp.start <= off && sp.end >= end)
+        spans.iter().find(|sp| sp.start <= off && sp.end >= end)
     }
 
     const TAG_COLOR: Color = Color::Rgb(0xbf, 0x61, 0x6a);
@@ -524,8 +534,9 @@ mod tests {
         let line_starts = compute_line_starts(src.as_bytes());
         let h = highlight_text(&mut reg, LangKind::Tsx, src.as_bytes(), &line_starts);
         let line0 = src.lines().next().unwrap();
-        let div_span = span_at(&h[0], line0, "div")
-            .expect("the 'div' tag identifier in <div ...> must produce at least one highlight span");
+        let div_span = span_at(&h[0], line0, "div").expect(
+            "the 'div' tag identifier in <div ...> must produce at least one highlight span",
+        );
         assert_eq!(
             div_span.style.fg,
             Some(TAG_COLOR),

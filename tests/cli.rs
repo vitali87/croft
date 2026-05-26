@@ -11,7 +11,10 @@ fn help_flag_prints_usage_and_exits_zero() {
 
 #[test]
 fn version_flag_prints_version() {
-    let out = Command::cargo_bin("croft").unwrap().arg("--version").assert();
+    let out = Command::cargo_bin("croft")
+        .unwrap()
+        .arg("--version")
+        .assert();
     let out = out.success();
     let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
     assert!(stdout.contains("croft"));

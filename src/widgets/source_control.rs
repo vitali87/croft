@@ -1,7 +1,6 @@
 use crate::git::{ChangeEntry, ChangeKind, ChangeSection, GitStatus};
 use crate::icons;
 use crate::widgets::scrollbar;
-use std::collections::BTreeSet;
 use ratatui::{
     buffer::Buffer,
     layout::{Alignment, Rect},
@@ -9,6 +8,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Paragraph, Widget, Wrap},
 };
+use std::collections::BTreeSet;
 
 const INPUT_PROMPT_RGB: (u8, u8, u8) = (0x6c, 0x7d, 0x9c);
 const BUTTON_BG_RGB: (u8, u8, u8) = (0x09, 0x67, 0xb8);
@@ -235,7 +235,10 @@ impl SourceControlPanel {
                 break;
             }
         }
-        let next_byte = iter.next().map(|(b, _)| b).unwrap_or_else(|| self.message.len());
+        let next_byte = iter
+            .next()
+            .map(|(b, _)| b)
+            .unwrap_or_else(|| self.message.len());
         self.message.replace_range(prev_byte..next_byte, "");
         self.message_cursor = target;
     }
@@ -475,7 +478,12 @@ impl SourceControlPanel {
         let title_text = "No repository detected";
         let title_h = paragraph_line_count(title_text, card_inner.width).min(3) as u16;
         if y + title_h <= bottom && title_h > 0 {
-            let title_rect = Rect { x: card_inner.x, y, width: card_inner.width, height: title_h };
+            let title_rect = Rect {
+                x: card_inner.x,
+                y,
+                width: card_inner.width,
+                height: title_h,
+            };
             let title = Paragraph::new(title_text)
                 .alignment(Alignment::Center)
                 .wrap(Wrap { trim: true })
@@ -484,10 +492,16 @@ impl SourceControlPanel {
             y += title_h + 1;
         }
 
-        let desc_text = "Open a folder under Git or create a new repository to start tracking changes.";
+        let desc_text =
+            "Open a folder under Git or create a new repository to start tracking changes.";
         let desc_h = paragraph_line_count(desc_text, card_inner.width).min(6) as u16;
         if y + desc_h <= bottom && desc_h > 0 {
-            let desc_rect = Rect { x: card_inner.x, y, width: card_inner.width, height: desc_h };
+            let desc_rect = Rect {
+                x: card_inner.x,
+                y,
+                width: card_inner.width,
+                height: desc_h,
+            };
             let desc = Paragraph::new(desc_text)
                 .alignment(Alignment::Center)
                 .wrap(Wrap { trim: true })
@@ -509,7 +523,12 @@ impl SourceControlPanel {
             "Init"
         };
         if y + 3 <= bottom && btn_w >= 6 {
-            let init_area = Rect { x: btn_x, y, width: btn_w, height: 3 };
+            let init_area = Rect {
+                x: btn_x,
+                y,
+                width: btn_w,
+                height: 3,
+            };
             self.last_init_repo_button_area = init_area;
             render_rounded_button(buf, init_area, init_label, blue_bg, text_white);
         }
@@ -656,13 +675,7 @@ fn rect_hit(rect: Rect, x: u16, y: u16) -> bool {
 
 /// Shared between the Source Control commit button and the Run-and-Debug
 /// button — same style, same corner treatment.
-pub fn render_rounded_button(
-    buf: &mut Buffer,
-    area: Rect,
-    label: &str,
-    bg: Color,
-    fg: Color,
-) {
+pub fn render_rounded_button(buf: &mut Buffer, area: Rect, label: &str, bg: Color, fg: Color) {
     if area.width < 2 || area.height < 1 {
         return;
     }
@@ -734,7 +747,9 @@ impl Widget for &mut SourceControlPanel {
         } else {
             Style::default().fg(Color::DarkGray)
         };
-        let outer = Block::default().borders(Borders::ALL).border_style(outer_style);
+        let outer = Block::default()
+            .borders(Borders::ALL)
+            .border_style(outer_style);
         let inner = outer.inner(area);
         outer.render(area, buf);
         self.last_area = area;
@@ -798,7 +813,9 @@ impl Widget for &mut SourceControlPanel {
         };
         spans.push(Span::styled(
             label,
-            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
         ));
         if self.status.ahead > 0 {
             spans.push(Span::styled(
@@ -819,7 +836,12 @@ impl Widget for &mut SourceControlPanel {
         if y + 3 > inner.y + inner.height {
             return;
         }
-        let input_box = Rect { x: inner.x, y, width: inner.width, height: 3 };
+        let input_box = Rect {
+            x: inner.x,
+            y,
+            width: inner.width,
+            height: 3,
+        };
         self.last_input_area = input_box;
         let input_border_style = if self.focused {
             Style::default().fg(focus_blue)
@@ -883,7 +905,12 @@ impl Widget for &mut SourceControlPanel {
         let split_gap_w: u16 = 1;
         if inner.width >= 16 + split_caret_w + split_gap_w {
             let main_w = inner.width.saturating_sub(split_caret_w + split_gap_w);
-            let main_area = Rect { x: inner.x, y, width: main_w, height: 3 };
+            let main_area = Rect {
+                x: inner.x,
+                y,
+                width: main_w,
+                height: 3,
+            };
             let caret_area = Rect {
                 x: inner.x + main_w + split_gap_w,
                 y,
@@ -895,7 +922,12 @@ impl Widget for &mut SourceControlPanel {
             render_rounded_button(buf, main_area, "✓ Commit", blue, white);
             render_rounded_button(buf, caret_area, "▾", blue, white);
         } else {
-            let button_area = Rect { x: inner.x, y, width: inner.width, height: 3 };
+            let button_area = Rect {
+                x: inner.x,
+                y,
+                width: inner.width,
+                height: 3,
+            };
             self.last_button_area = button_area;
             render_rounded_button(buf, button_area, "Commit", blue, white);
         }
@@ -1124,7 +1156,12 @@ impl Widget for &mut SourceControlPanel {
                     if text_w > 0 {
                         let path_para = Paragraph::new(path_str).style(path_style);
                         path_para.render(
-                            Rect { x: text_x, y: row_y, width: text_w, height: 1 },
+                            Rect {
+                                x: text_x,
+                                y: row_y,
+                                width: text_w,
+                                height: 1,
+                            },
                             buf,
                         );
                     }
@@ -1136,17 +1173,22 @@ impl Widget for &mut SourceControlPanel {
                         if let Some(bg) = row_bg {
                             action_style = action_style.bg(bg);
                         }
-                        buf.set_string(
-                            discard_x,
-                            row_y,
-                            DISCARD_GLYPH.to_string(),
-                            action_style,
-                        );
+                        buf.set_string(discard_x, row_y, DISCARD_GLYPH.to_string(), action_style);
                         buf.set_string(stage_x, row_y, STAGE_GLYPH.to_string(), action_style);
                         self.last_row_actions = Some(RowActionAreas {
                             entry_idx: *entry_idx,
-                            discard: Rect { x: discard_x, y: row_y, width: 1, height: 1 },
-                            stage: Rect { x: stage_x, y: row_y, width: 1, height: 1 },
+                            discard: Rect {
+                                x: discard_x,
+                                y: row_y,
+                                width: 1,
+                                height: 1,
+                            },
+                            stage: Rect {
+                                x: stage_x,
+                                y: row_y,
+                                width: 1,
+                                height: 1,
+                            },
                         });
                     }
                 }
@@ -1192,16 +1234,38 @@ mod tests {
     fn list_layout_orders_conflicts_staged_changes_untracked() {
         let mut p = SourceControlPanel::new();
         p.entries = vec![
-            ChangeEntry { path: "u.txt".into(), kind: ChangeKind::Untracked, ..Default::default() },
-            ChangeEntry { path: "m.txt".into(), kind: ChangeKind::Modified, ..Default::default() },
-            ChangeEntry { path: "s.txt".into(), kind: ChangeKind::StagedAdded, ..Default::default() },
-            ChangeEntry { path: "c.txt".into(), kind: ChangeKind::Conflicted, ..Default::default() },
+            ChangeEntry {
+                path: "u.txt".into(),
+                kind: ChangeKind::Untracked,
+                ..Default::default()
+            },
+            ChangeEntry {
+                path: "m.txt".into(),
+                kind: ChangeKind::Modified,
+                ..Default::default()
+            },
+            ChangeEntry {
+                path: "s.txt".into(),
+                kind: ChangeKind::StagedAdded,
+                ..Default::default()
+            },
+            ChangeEntry {
+                path: "c.txt".into(),
+                kind: ChangeKind::Conflicted,
+                ..Default::default()
+            },
         ];
         let lines = p.list_layout();
-        assert!(matches!(lines[0], ListLine::Header(ChangeSection::Conflicts)));
+        assert!(matches!(
+            lines[0],
+            ListLine::Header(ChangeSection::Conflicts)
+        ));
         assert!(matches!(lines[2], ListLine::Header(ChangeSection::Staged)));
         assert!(matches!(lines[4], ListLine::Header(ChangeSection::Changes)));
-        assert!(matches!(lines[6], ListLine::Header(ChangeSection::Untracked)));
+        assert!(matches!(
+            lines[6],
+            ListLine::Header(ChangeSection::Untracked)
+        ));
     }
 
     fn buffer_to_string(buf: &Buffer) -> String {
@@ -1231,7 +1295,12 @@ mod tests {
         use ratatui::buffer::Buffer;
         let mut p = SourceControlPanel::new();
         p.set_status(dummy_status_with_branch("main"), Vec::new());
-        let area = Rect { x: 0, y: 0, width: 60, height: 30 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 30,
+        };
         let mut buf = Buffer::empty(area);
         ratatui::widgets::Widget::render(&mut p, area, &mut buf);
         let dump = buffer_to_string(&buf);
@@ -1261,8 +1330,18 @@ mod tests {
         // reported.
         let mut p = SourceControlPanel::new();
         p.set_status(dummy_status_with_branch("main"), Vec::new());
-        let panel_area = Rect { x: 0, y: 0, width: 28, height: 30 };
-        let buf_area = Rect { x: 0, y: 0, width: 80, height: 30 };
+        let panel_area = Rect {
+            x: 0,
+            y: 0,
+            width: 28,
+            height: 30,
+        };
+        let buf_area = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 30,
+        };
         let mut buf = Buffer::empty(buf_area);
         ratatui::widgets::Widget::render(&mut p, panel_area, &mut buf);
         let placeholder_row = p.last_input_area.y + 1;
@@ -1283,9 +1362,21 @@ mod tests {
         use ratatui::buffer::Buffer;
         let mut p = SourceControlPanel::new();
         p.set_status(dummy_status_with_branch("main"), Vec::new());
-        p.message = "this is a very long commit message that should not overflow the input box at all".to_string();
-        let panel_area = Rect { x: 0, y: 0, width: 28, height: 30 };
-        let buf_area = Rect { x: 0, y: 0, width: 80, height: 30 };
+        p.message =
+            "this is a very long commit message that should not overflow the input box at all"
+                .to_string();
+        let panel_area = Rect {
+            x: 0,
+            y: 0,
+            width: 28,
+            height: 30,
+        };
+        let buf_area = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 30,
+        };
         let mut buf = Buffer::empty(buf_area);
         ratatui::widgets::Widget::render(&mut p, panel_area, &mut buf);
         let row = p.last_input_area.y + 1;
@@ -1304,7 +1395,12 @@ mod tests {
         let mut p = SourceControlPanel::new();
         p.set_status(dummy_status_with_branch("main"), Vec::new());
         p.focused = true;
-        let area = Rect { x: 0, y: 0, width: 60, height: 30 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 30,
+        };
         let mut buf = Buffer::empty(area);
         ratatui::widgets::Widget::render(&mut p, area, &mut buf);
         assert_eq!(
@@ -1319,7 +1415,12 @@ mod tests {
         use ratatui::buffer::Buffer;
         let mut p = SourceControlPanel::new();
         p.set_status(dummy_status_with_branch("main"), Vec::new());
-        let area = Rect { x: 0, y: 0, width: 60, height: 30 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 30,
+        };
         let mut buf = Buffer::empty(area);
         ratatui::widgets::Widget::render(&mut p, area, &mut buf);
         assert_eq!(
@@ -1340,7 +1441,12 @@ mod tests {
         use ratatui::buffer::Buffer;
         let mut p = SourceControlPanel::new();
         p.set_status(dummy_status_with_branch("main"), Vec::new());
-        let area = Rect { x: 0, y: 0, width: 60, height: 20 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 20,
+        };
         let mut buf = Buffer::empty(area);
         ratatui::widgets::Widget::render(&mut p, area, &mut buf);
         let inner = p.last_inner;
@@ -1388,7 +1494,12 @@ mod tests {
         use ratatui::buffer::Buffer;
         let mut p = SourceControlPanel::new();
         p.set_status(dummy_status_with_branch("main"), Vec::new());
-        let area = Rect { x: 0, y: 0, width: 40, height: 20 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 20,
+        };
         let mut buf = Buffer::empty(area);
         ratatui::widgets::Widget::render(&mut p, area, &mut buf);
         let b = p.last_button_area;
@@ -1396,11 +1507,25 @@ mod tests {
         let tl = buf[(b.x, b.y)].symbol().to_string();
         let tr = buf[(b.x + b.width - 1, b.y)].symbol().to_string();
         let bl = buf[(b.x, b.y + b.height - 1)].symbol().to_string();
-        let br = buf[(b.x + b.width - 1, b.y + b.height - 1)].symbol().to_string();
-        assert_eq!(tl, "╭", "top-left commit-button corner must be rounded; got {tl:?}");
-        assert_eq!(tr, "╮", "top-right commit-button corner must be rounded; got {tr:?}");
-        assert_eq!(bl, "╰", "bottom-left commit-button corner must be rounded; got {bl:?}");
-        assert_eq!(br, "╯", "bottom-right commit-button corner must be rounded; got {br:?}");
+        let br = buf[(b.x + b.width - 1, b.y + b.height - 1)]
+            .symbol()
+            .to_string();
+        assert_eq!(
+            tl, "╭",
+            "top-left commit-button corner must be rounded; got {tl:?}"
+        );
+        assert_eq!(
+            tr, "╮",
+            "top-right commit-button corner must be rounded; got {tr:?}"
+        );
+        assert_eq!(
+            bl, "╰",
+            "bottom-left commit-button corner must be rounded; got {bl:?}"
+        );
+        assert_eq!(
+            br, "╯",
+            "bottom-right commit-button corner must be rounded; got {br:?}"
+        );
     }
 
     #[test]
@@ -1410,12 +1535,29 @@ mod tests {
         p.set_status(
             dummy_status_with_branch("main"),
             vec![
-                ChangeEntry { path: "a.py".into(), kind: ChangeKind::Modified, ..Default::default() },
-                ChangeEntry { path: "b.py".into(), kind: ChangeKind::Modified, ..Default::default() },
-                ChangeEntry { path: "c.py".into(), kind: ChangeKind::Modified, ..Default::default() },
+                ChangeEntry {
+                    path: "a.py".into(),
+                    kind: ChangeKind::Modified,
+                    ..Default::default()
+                },
+                ChangeEntry {
+                    path: "b.py".into(),
+                    kind: ChangeKind::Modified,
+                    ..Default::default()
+                },
+                ChangeEntry {
+                    path: "c.py".into(),
+                    kind: ChangeKind::Modified,
+                    ..Default::default()
+                },
             ],
         );
-        let area = Rect { x: 0, y: 0, width: 60, height: 40 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 40,
+        };
         let mut buf = Buffer::empty(area);
         ratatui::widgets::Widget::render(&mut p, area, &mut buf);
         let dump = buffer_to_string(&buf);
@@ -1454,7 +1596,12 @@ mod tests {
                 },
             ],
         );
-        let area = Rect { x: 0, y: 0, width: 60, height: 40 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 40,
+        };
         let mut buf = Buffer::empty(area);
         ratatui::widgets::Widget::render(&mut p, area, &mut buf);
         let dump = buffer_to_string(&buf);
@@ -1498,12 +1645,29 @@ mod tests {
         use crate::git::GitStatus;
         let mut p = SourceControlPanel::new();
         p.status = GitStatus::default(); // in_repo = false
-        let area = Rect { x: 0, y: 0, width: 60, height: 30 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 30,
+        };
         let mut buf = Buffer::empty(area);
         (&mut p).render(area, &mut buf);
-        assert_eq!(p.last_input_area, Rect::default(), "input area must stay empty in non-repo");
-        assert_eq!(p.last_button_area, Rect::default(), "commit button area must stay empty in non-repo");
-        assert_eq!(p.last_list_area, Rect::default(), "list area must stay empty in non-repo");
+        assert_eq!(
+            p.last_input_area,
+            Rect::default(),
+            "input area must stay empty in non-repo"
+        );
+        assert_eq!(
+            p.last_button_area,
+            Rect::default(),
+            "commit button area must stay empty in non-repo"
+        );
+        assert_eq!(
+            p.last_list_area,
+            Rect::default(),
+            "list area must stay empty in non-repo"
+        );
     }
 
     #[test]
@@ -1511,7 +1675,12 @@ mod tests {
         use crate::git::GitStatus;
         let mut p = SourceControlPanel::new();
         p.status = GitStatus::default();
-        let area = Rect { x: 0, y: 0, width: 60, height: 30 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 30,
+        };
         let mut buf = Buffer::empty(area);
         (&mut p).render(area, &mut buf);
         let dump = buffer_to_string(&buf);
@@ -1546,12 +1715,16 @@ mod tests {
         use crate::git::GitStatus;
         let mut p = SourceControlPanel::new();
         p.status = GitStatus::default();
-        let area = Rect { x: 0, y: 0, width: 60, height: 30 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 30,
+        };
         let mut buf = Buffer::empty(area);
         (&mut p).render(area, &mut buf);
         assert!(
-            p.last_init_repo_button_area.width > 0
-                && p.last_init_repo_button_area.height > 0,
+            p.last_init_repo_button_area.width > 0 && p.last_init_repo_button_area.height > 0,
             "Initialize Repository button rect must be tracked"
         );
     }
@@ -1565,11 +1738,19 @@ mod tests {
         use crate::git::GitStatus;
         let mut p = SourceControlPanel::new();
         p.status = GitStatus::default();
-        let area = Rect { x: 0, y: 0, width: 30, height: 40 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 30,
+            height: 40,
+        };
         let mut buf = Buffer::empty(area);
         (&mut p).render(area, &mut buf);
         let btn = p.last_init_repo_button_area;
-        assert!(btn.width > 0 && btn.height > 0, "init-repo button must be tracked");
+        assert!(
+            btn.width > 0 && btn.height > 0,
+            "init-repo button must be tracked"
+        );
         let label_y = btn.y + btn.height / 2;
         let mut row = String::new();
         for x in btn.x..btn.x + btn.width {
@@ -1595,7 +1776,12 @@ mod tests {
         // Width 30 puts the card_inner at ~24 - too narrow for
         // "Open a folder under Git or create a new" but plenty for
         // word-wrapped fragments.
-        let area = Rect { x: 0, y: 0, width: 30, height: 40 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 30,
+            height: 40,
+        };
         let mut buf = Buffer::empty(area);
         (&mut p).render(area, &mut buf);
         let dump = buffer_to_string(&buf);
@@ -1619,7 +1805,12 @@ mod tests {
         use crate::git::GitStatus;
         let mut p = SourceControlPanel::new();
         p.status = GitStatus::default();
-        let area = Rect { x: 0, y: 0, width: 60, height: 30 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 30,
+        };
         let mut buf = Buffer::empty(area);
         (&mut p).render(area, &mut buf);
         let dump = buffer_to_string(&buf);
@@ -1637,12 +1828,16 @@ mod tests {
     #[test]
     fn click_init_repo_button_returns_true_only_inside_the_rect() {
         let mut p = SourceControlPanel::new();
-        p.last_init_repo_button_area = Rect { x: 5, y: 10, width: 30, height: 3 };
+        p.last_init_repo_button_area = Rect {
+            x: 5,
+            y: 10,
+            width: 30,
+            height: 3,
+        };
         assert!(p.click_init_repo_button(20, 11));
         assert!(!p.click_init_repo_button(40, 11));
         assert!(!p.click_init_repo_button(20, 20));
     }
-
 
     #[test]
     fn change_rows_use_a_subtle_row_tint_not_darker_than_panel_bg() {
@@ -1655,9 +1850,18 @@ mod tests {
         let mut p = SourceControlPanel::new();
         p.set_status(
             dummy_status_with_branch("main"),
-            vec![ChangeEntry { path: "a.py".into(), kind: ChangeKind::Modified, ..Default::default() }],
+            vec![ChangeEntry {
+                path: "a.py".into(),
+                kind: ChangeKind::Modified,
+                ..Default::default()
+            }],
         );
-        let area = Rect { x: 0, y: 0, width: 60, height: 30 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 30,
+        };
         let mut buf = Buffer::empty(area);
         ratatui::widgets::Widget::render(&mut p, area, &mut buf);
         let bad = ratatui::style::Color::Rgb(0x16, 0x1b, 0x25);
@@ -1679,12 +1883,25 @@ mod tests {
         p.set_status(
             dummy_status_with_branch("main"),
             vec![
-                ChangeEntry { path: "a.py".into(), kind: ChangeKind::Modified, ..Default::default() },
-                ChangeEntry { path: "b.py".into(), kind: ChangeKind::Modified, ..Default::default() },
+                ChangeEntry {
+                    path: "a.py".into(),
+                    kind: ChangeKind::Modified,
+                    ..Default::default()
+                },
+                ChangeEntry {
+                    path: "b.py".into(),
+                    kind: ChangeKind::Modified,
+                    ..Default::default()
+                },
             ],
         );
         // Render once to learn the row coordinates.
-        let area = Rect { x: 0, y: 0, width: 60, height: 30 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 30,
+        };
         let mut buf = Buffer::empty(area);
         ratatui::widgets::Widget::render(&mut p, area, &mut buf);
         // Pretend the user clicked the second change row.
@@ -1727,11 +1944,24 @@ mod tests {
                 p.set_status(
                     dummy_status_with_branch("main"),
                     vec![
-                        ChangeEntry { path: "a.py".into(), kind: ChangeKind::Modified, ..Default::default() },
-                        ChangeEntry { path: ".idea/".into(), kind: ChangeKind::Untracked, ..Default::default() },
+                        ChangeEntry {
+                            path: "a.py".into(),
+                            kind: ChangeKind::Modified,
+                            ..Default::default()
+                        },
+                        ChangeEntry {
+                            path: ".idea/".into(),
+                            kind: ChangeKind::Untracked,
+                            ..Default::default()
+                        },
                     ],
                 );
-                let area = Rect { x: 0, y: 0, width, height };
+                let area = Rect {
+                    x: 0,
+                    y: 0,
+                    width,
+                    height,
+                };
                 if area.width == 0 || area.height == 0 {
                     continue;
                 }
@@ -1745,23 +1975,47 @@ mod tests {
     fn render_in_repo_paints_input_and_button() {
         use crate::git::GitStatus;
         let mut p = SourceControlPanel::new();
-        p.status = GitStatus { in_repo: true, branch: Some("main".into()), ..Default::default() };
+        p.status = GitStatus {
+            in_repo: true,
+            branch: Some("main".into()),
+            ..Default::default()
+        };
         // Need at least: header + blank + branch + blank + 3-row input +
         // blank + 3-row button = 11 rows of inner area, so 13 rows of
         // outer area to clear the borders.
-        let area = Rect { x: 0, y: 0, width: 40, height: 16 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 16,
+        };
         let mut buf = Buffer::empty(area);
         (&mut p).render(area, &mut buf);
-        assert!(p.last_input_area.height > 0, "input area must paint when in_repo");
-        assert!(p.last_button_area.height > 0, "button area must paint when in_repo");
+        assert!(
+            p.last_input_area.height > 0,
+            "input area must paint when in_repo"
+        );
+        assert!(
+            p.last_button_area.height > 0,
+            "button area must paint when in_repo"
+        );
     }
 
     #[test]
     fn cursor_screen_pos_is_none_when_not_focused() {
         let mut p = SourceControlPanel::new();
-        p.status = GitStatus { in_repo: true, branch: Some("main".into()), ..Default::default() };
+        p.status = GitStatus {
+            in_repo: true,
+            branch: Some("main".into()),
+            ..Default::default()
+        };
         p.focused = false;
-        let area = Rect { x: 0, y: 0, width: 40, height: 16 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 16,
+        };
         let mut buf = Buffer::empty(area);
         (&mut p).render(area, &mut buf);
         assert_eq!(
@@ -1776,7 +2030,12 @@ mod tests {
         let mut p = SourceControlPanel::new();
         p.status = GitStatus::default();
         p.focused = true;
-        let area = Rect { x: 0, y: 0, width: 40, height: 30 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 30,
+        };
         let mut buf = Buffer::empty(area);
         (&mut p).render(area, &mut buf);
         assert_eq!(
@@ -1789,14 +2048,25 @@ mod tests {
     #[test]
     fn cursor_screen_pos_lands_at_first_text_cell_when_message_is_empty() {
         let mut p = SourceControlPanel::new();
-        p.status = GitStatus { in_repo: true, branch: Some("main".into()), ..Default::default() };
+        p.status = GitStatus {
+            in_repo: true,
+            branch: Some("main".into()),
+            ..Default::default()
+        };
         p.focused = true;
-        let area = Rect { x: 0, y: 0, width: 40, height: 16 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 16,
+        };
         let mut buf = Buffer::empty(area);
         (&mut p).render(area, &mut buf);
         let r = p.last_input_area;
         assert!(r.width >= 3 && r.height == 3, "input must be laid out");
-        let (cx, cy) = p.cursor_screen_pos().expect("focused, in repo → caret must report a cell");
+        let (cx, cy) = p
+            .cursor_screen_pos()
+            .expect("focused, in repo → caret must report a cell");
         assert_eq!(
             (cx, cy),
             (r.x + 2, r.y + 1),
@@ -1807,9 +2077,18 @@ mod tests {
     #[test]
     fn cursor_screen_pos_advances_one_cell_per_inserted_char() {
         let mut p = SourceControlPanel::new();
-        p.status = GitStatus { in_repo: true, branch: Some("main".into()), ..Default::default() };
+        p.status = GitStatus {
+            in_repo: true,
+            branch: Some("main".into()),
+            ..Default::default()
+        };
         p.focused = true;
-        let area = Rect { x: 0, y: 0, width: 40, height: 16 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 16,
+        };
         let mut buf = Buffer::empty(area);
         (&mut p).render(area, &mut buf);
         p.insert_str("fix");
@@ -1825,7 +2104,11 @@ mod tests {
     #[test]
     fn cursor_screen_pos_is_none_before_first_render() {
         let mut p = SourceControlPanel::new();
-        p.status = GitStatus { in_repo: true, branch: Some("main".into()), ..Default::default() };
+        p.status = GitStatus {
+            in_repo: true,
+            branch: Some("main".into()),
+            ..Default::default()
+        };
         p.focused = true;
         assert_eq!(
             p.cursor_screen_pos(),
@@ -1839,9 +2122,18 @@ mod tests {
         let mut p = SourceControlPanel::new();
         p.set_status(
             dummy_status_with_branch("main"),
-            vec![ChangeEntry { path: "ch.py".into(), kind: ChangeKind::Modified, ..Default::default() }],
+            vec![ChangeEntry {
+                path: "ch.py".into(),
+                kind: ChangeKind::Modified,
+                ..Default::default()
+            }],
         );
-        let area = Rect { x: 0, y: 0, width: 60, height: 20 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 20,
+        };
         let mut buf = Buffer::empty(area);
         ratatui::widgets::Widget::render(&mut p, area, &mut buf);
         // First render learns the row coordinate; click-select it.
@@ -1881,15 +2173,31 @@ mod tests {
         p.set_status(
             dummy_status_with_branch("main"),
             vec![
-                ChangeEntry { path: "a.py".into(), kind: ChangeKind::Modified, ..Default::default() },
-                ChangeEntry { path: "b.py".into(), kind: ChangeKind::Modified, ..Default::default() },
+                ChangeEntry {
+                    path: "a.py".into(),
+                    kind: ChangeKind::Modified,
+                    ..Default::default()
+                },
+                ChangeEntry {
+                    path: "b.py".into(),
+                    kind: ChangeKind::Modified,
+                    ..Default::default()
+                },
             ],
         );
         // No selection ⇒ no row should sprout action icons.
-        let area = Rect { x: 0, y: 0, width: 60, height: 20 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 20,
+        };
         let mut buf = Buffer::empty(area);
         ratatui::widgets::Widget::render(&mut p, area, &mut buf);
-        assert!(p.last_row_actions.is_none(), "no selection ⇒ no action icons");
+        assert!(
+            p.last_row_actions.is_none(),
+            "no selection ⇒ no action icons"
+        );
         let dump = buffer_to_string(&buf);
         assert!(
             !dump.contains(DISCARD_GLYPH),
@@ -1902,9 +2210,18 @@ mod tests {
         let mut p = SourceControlPanel::new();
         p.set_status(
             dummy_status_with_branch("main"),
-            vec![ChangeEntry { path: "s.py".into(), kind: ChangeKind::StagedModified, ..Default::default() }],
+            vec![ChangeEntry {
+                path: "s.py".into(),
+                kind: ChangeKind::StagedModified,
+                ..Default::default()
+            }],
         );
-        let area = Rect { x: 0, y: 0, width: 60, height: 20 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 20,
+        };
         let mut buf = Buffer::empty(area);
         ratatui::widgets::Widget::render(&mut p, area, &mut buf);
         let row_y = (area.y..area.y + area.height)
@@ -1930,12 +2247,30 @@ mod tests {
         let mut p = SourceControlPanel::new();
         p.last_row_actions = Some(RowActionAreas {
             entry_idx: 7,
-            discard: Rect { x: 10, y: 5, width: 1, height: 1 },
-            stage: Rect { x: 12, y: 5, width: 1, height: 1 },
+            discard: Rect {
+                x: 10,
+                y: 5,
+                width: 1,
+                height: 1,
+            },
+            stage: Rect {
+                x: 12,
+                y: 5,
+                width: 1,
+                height: 1,
+            },
         });
         assert_eq!(p.click_discard_action(10, 5), Some(7));
-        assert_eq!(p.click_discard_action(12, 5), None, "stage cell is not discard");
-        assert_eq!(p.click_discard_action(11, 5), None, "gap cell is not discard");
+        assert_eq!(
+            p.click_discard_action(12, 5),
+            None,
+            "stage cell is not discard"
+        );
+        assert_eq!(
+            p.click_discard_action(11, 5),
+            None,
+            "gap cell is not discard"
+        );
         assert_eq!(p.click_discard_action(10, 6), None, "wrong row");
     }
 
@@ -1944,11 +2279,25 @@ mod tests {
         let mut p = SourceControlPanel::new();
         p.last_row_actions = Some(RowActionAreas {
             entry_idx: 3,
-            discard: Rect { x: 10, y: 5, width: 1, height: 1 },
-            stage: Rect { x: 12, y: 5, width: 1, height: 1 },
+            discard: Rect {
+                x: 10,
+                y: 5,
+                width: 1,
+                height: 1,
+            },
+            stage: Rect {
+                x: 12,
+                y: 5,
+                width: 1,
+                height: 1,
+            },
         });
         assert_eq!(p.click_stage_action(12, 5), Some(3));
-        assert_eq!(p.click_stage_action(10, 5), None, "discard cell is not stage");
+        assert_eq!(
+            p.click_stage_action(10, 5),
+            None,
+            "discard cell is not stage"
+        );
         assert_eq!(p.click_stage_action(13, 5), None, "outside stage rect");
     }
 
@@ -1957,14 +2306,23 @@ mod tests {
         let mut p = SourceControlPanel::new();
         p.set_status(
             dummy_status_with_branch("main"),
-            vec![ChangeEntry { path: "a.py".into(), kind: ChangeKind::Modified, ..Default::default() }],
+            vec![ChangeEntry {
+                path: "a.py".into(),
+                kind: ChangeKind::Modified,
+                ..Default::default()
+            }],
         );
         // Width 10 leaves only a few cells for the path; reserving 4 cells
         // for icons would clobber it. The widget must skip icons rather
         // than overlap. Force selection directly since the row may sit
         // below the visible viewport at this tiny size.
         p.selected_change = Some(0);
-        let area = Rect { x: 0, y: 0, width: 10, height: 60 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 60,
+        };
         let mut buf = Buffer::empty(area);
         ratatui::widgets::Widget::render(&mut p, area, &mut buf);
         assert!(
@@ -1979,9 +2337,21 @@ mod tests {
         p.set_status(
             dummy_status_with_branch("main"),
             vec![
-                ChangeEntry { path: "a".into(), kind: ChangeKind::Modified, ..Default::default() },
-                ChangeEntry { path: "b".into(), kind: ChangeKind::Modified, ..Default::default() },
-                ChangeEntry { path: "c".into(), kind: ChangeKind::Untracked, ..Default::default() },
+                ChangeEntry {
+                    path: "a".into(),
+                    kind: ChangeKind::Modified,
+                    ..Default::default()
+                },
+                ChangeEntry {
+                    path: "b".into(),
+                    kind: ChangeKind::Modified,
+                    ..Default::default()
+                },
+                ChangeEntry {
+                    path: "c".into(),
+                    kind: ChangeKind::Untracked,
+                    ..Default::default()
+                },
             ],
         );
         let n = p.select_all_changes();
@@ -1997,14 +2367,27 @@ mod tests {
         p.set_status(
             dummy_status_with_branch("main"),
             vec![
-                ChangeEntry { path: "a".into(), kind: ChangeKind::Modified, ..Default::default() },
-                ChangeEntry { path: "b".into(), kind: ChangeKind::Modified, ..Default::default() },
+                ChangeEntry {
+                    path: "a".into(),
+                    kind: ChangeKind::Modified,
+                    ..Default::default()
+                },
+                ChangeEntry {
+                    path: "b".into(),
+                    kind: ChangeKind::Modified,
+                    ..Default::default()
+                },
             ],
         );
         p.select_all_changes();
         assert_eq!(p.multi_selection.len(), 2);
         // Render to populate hit areas, then "click" the second row.
-        let area = Rect { x: 0, y: 0, width: 60, height: 20 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 20,
+        };
         let mut buf = Buffer::empty(area);
         ratatui::widgets::Widget::render(&mut p, area, &mut buf);
         let row_y = (area.y..area.y + area.height)
@@ -2017,7 +2400,11 @@ mod tests {
             })
             .expect("b row must render");
         p.select_change_at(row_y);
-        assert_eq!(p.multi_selection.len(), 1, "single click narrows to one row");
+        assert_eq!(
+            p.multi_selection.len(),
+            1,
+            "single click narrows to one row"
+        );
     }
 
     #[test]
@@ -2026,13 +2413,26 @@ mod tests {
         p.set_status(
             dummy_status_with_branch("main"),
             vec![
-                ChangeEntry { path: "a".into(), kind: ChangeKind::Modified, ..Default::default() },
-                ChangeEntry { path: "b".into(), kind: ChangeKind::Modified, ..Default::default() },
+                ChangeEntry {
+                    path: "a".into(),
+                    kind: ChangeKind::Modified,
+                    ..Default::default()
+                },
+                ChangeEntry {
+                    path: "b".into(),
+                    kind: ChangeKind::Modified,
+                    ..Default::default()
+                },
             ],
         );
         p.select_all_changes();
         p.selected_change = Some(0); // only row 0 is primary
-        let area = Rect { x: 0, y: 0, width: 60, height: 20 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 20,
+        };
         let mut buf = Buffer::empty(area);
         ratatui::widgets::Widget::render(&mut p, area, &mut buf);
         // Both rows must carry SOME bg distinct from panel bg.
@@ -2064,10 +2464,18 @@ mod tests {
     fn split_commit_button_records_a_separate_caret_rect_at_default_widths() {
         let mut p = SourceControlPanel::new();
         p.set_status(dummy_status_with_branch("main"), Vec::new());
-        let area = Rect { x: 0, y: 0, width: 60, height: 20 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 20,
+        };
         let mut buf = Buffer::empty(area);
         ratatui::widgets::Widget::render(&mut p, area, &mut buf);
-        assert!(p.last_button_area.width > 0, "main commit button must paint");
+        assert!(
+            p.last_button_area.width > 0,
+            "main commit button must paint"
+        );
         assert!(
             p.last_commit_caret_area.width > 0,
             "split caret must paint alongside the main button at panel widths >= 20"
@@ -2091,19 +2499,39 @@ mod tests {
         let mut p = SourceControlPanel::new();
         p.commit_menu_item_areas = vec![
             (
-                Rect { x: 10, y: 5, width: 20, height: 1 },
+                Rect {
+                    x: 10,
+                    y: 5,
+                    width: 20,
+                    height: 1,
+                },
                 CommitMenuItem::CommitAndPush,
             ),
             (
-                Rect { x: 10, y: 6, width: 20, height: 1 },
+                Rect {
+                    x: 10,
+                    y: 6,
+                    width: 20,
+                    height: 1,
+                },
                 CommitMenuItem::Push,
             ),
             (
-                Rect { x: 10, y: 7, width: 20, height: 1 },
+                Rect {
+                    x: 10,
+                    y: 7,
+                    width: 20,
+                    height: 1,
+                },
                 CommitMenuItem::ViewStagedDiff,
             ),
             (
-                Rect { x: 10, y: 8, width: 20, height: 1 },
+                Rect {
+                    x: 10,
+                    y: 8,
+                    width: 20,
+                    height: 1,
+                },
                 CommitMenuItem::ViewDefaultBranchDiff,
             ),
         ];
@@ -2145,8 +2573,16 @@ mod tests {
     fn changes_count_returns_entry_total() {
         let mut p = SourceControlPanel::new();
         assert_eq!(p.changes_count(), 0);
-        p.entries.push(ChangeEntry { path: "x".into(), kind: ChangeKind::Modified, ..Default::default() });
-        p.entries.push(ChangeEntry { path: "y".into(), kind: ChangeKind::Untracked, ..Default::default() });
+        p.entries.push(ChangeEntry {
+            path: "x".into(),
+            kind: ChangeKind::Modified,
+            ..Default::default()
+        });
+        p.entries.push(ChangeEntry {
+            path: "y".into(),
+            kind: ChangeKind::Untracked,
+            ..Default::default()
+        });
         assert_eq!(p.changes_count(), 2);
     }
 }

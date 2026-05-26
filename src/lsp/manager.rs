@@ -5,9 +5,9 @@ use std::sync::mpsc as std_mpsc;
 
 use anyhow::Result;
 use lsp_types::{
-    ClientCapabilities, CompletionClientCapabilities, CompletionItemCapability,
-    CompletionItemKind, CompletionItemKindCapability, CompletionResponse, MarkupKind,
-    TextDocumentClientCapabilities, Url,
+    ClientCapabilities, CompletionClientCapabilities, CompletionItemCapability, CompletionItemKind,
+    CompletionItemKindCapability, CompletionResponse, MarkupKind, TextDocumentClientCapabilities,
+    Url,
 };
 use tokio::sync::{Mutex as TokioMutex, mpsc as tokio_mpsc};
 
@@ -386,10 +386,7 @@ fn build_client_capabilities() -> ClientCapabilities {
                 completion_item: Some(CompletionItemCapability {
                     snippet_support: Some(false),
                     commit_characters_support: Some(false),
-                    documentation_format: Some(vec![
-                        MarkupKind::Markdown,
-                        MarkupKind::PlainText,
-                    ]),
+                    documentation_format: Some(vec![MarkupKind::Markdown, MarkupKind::PlainText]),
                     deprecated_support: Some(true),
                     preselect_support: Some(true),
                     insert_replace_support: Some(false),
@@ -527,9 +524,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let root = tmp.path().canonicalize().expect("canonicalize");
         let file = root.join("demo.py");
-        let text = String::from(
-            "def f(input, num):\n    input_split = input.split()\n    inp\n",
-        );
+        let text = String::from("def f(input, num):\n    input_split = input.split()\n    inp\n");
         std::fs::write(&file, &text).expect("write demo");
 
         let mut manager = LspManager::new(root).expect("manager");

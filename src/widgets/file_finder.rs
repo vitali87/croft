@@ -1,5 +1,4 @@
 use ignore::{WalkBuilder, WalkState};
-use rayon::prelude::*;
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
@@ -7,6 +6,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph, Widget},
 };
+use rayon::prelude::*;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::path::{Path, PathBuf};
@@ -324,8 +324,7 @@ pub fn score_entry(
     if hay_lower.contains(needle) {
         return Some((MatchTier::PathSubstring, 1_000));
     }
-    fuzzy_score(needle, hay_lower, filename_start)
-        .map(|s| (MatchTier::Subsequence, s))
+    fuzzy_score(needle, hay_lower, filename_start).map(|s| (MatchTier::Subsequence, s))
 }
 
 pub fn fuzzy_score(needle: &str, hay_lower: &str, filename_start: usize) -> Option<i32> {
@@ -350,7 +349,10 @@ pub fn fuzzy_score(needle: &str, hay_lower: &str, filename_start: usize) -> Opti
             let prev_byte = if i == 0 { None } else { Some(hay_bytes[i - 1]) };
             let at_word_boundary = i == 0
                 || i == filename_start
-                || matches!(prev_byte, Some(b'/') | Some(b'_') | Some(b'-') | Some(b'.') | Some(b' '));
+                || matches!(
+                    prev_byte,
+                    Some(b'/') | Some(b'_') | Some(b'-') | Some(b'.') | Some(b' ')
+                );
             if at_word_boundary {
                 bonus += 5;
             }
@@ -577,7 +579,12 @@ pub fn render_file_finder(finder: &mut FileFinder, area: Rect, buf: &mut Buffer)
     let height = height.clamp(10, area.height);
     let x = area.x + (area.width.saturating_sub(width)) / 2;
     let y = area.y + (area.height.saturating_sub(height)) / 4;
-    let rect = Rect { x, y, width, height };
+    let rect = Rect {
+        x,
+        y,
+        width,
+        height,
+    };
     finder.last_rect = rect;
 
     Widget::render(Clear, rect, buf);
@@ -700,9 +707,16 @@ pub fn render_file_finder(finder: &mut FileFinder, area: Rect, buf: &mut Buffer)
         let prefix = if is_selected { "> " } else { "  " };
         let spans: Vec<Span<'static>> = vec![
             Span::styled(prefix.to_string(), row_style),
-            Span::styled(file_part.to_string(), row_style.add_modifier(Modifier::BOLD)),
             Span::styled(
-                if dir_part.is_empty() { String::new() } else { format!("  {dir_part}") },
+                file_part.to_string(),
+                row_style.add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                if dir_part.is_empty() {
+                    String::new()
+                } else {
+                    format!("  {dir_part}")
+                },
                 dir_style,
             ),
         ];
@@ -738,8 +752,15 @@ mod tests {
 
     #[test]
     fn fuzzy_score_returns_some_for_subsequence_match() {
-        let score = fuzzy_score("ab", "alpha/beta.rs", "alpha/beta.rs".rfind('/').unwrap() + 1);
-        assert!(score.is_some(), "'ab' must subsequence-match 'alpha/beta.rs'");
+        let score = fuzzy_score(
+            "ab",
+            "alpha/beta.rs",
+            "alpha/beta.rs".rfind('/').unwrap() + 1,
+        );
+        assert!(
+            score.is_some(),
+            "'ab' must subsequence-match 'alpha/beta.rs'"
+        );
     }
 
     #[test]
@@ -750,7 +771,11 @@ mod tests {
 
     #[test]
     fn filename_matches_rank_above_directory_matches() {
-        let dir_match = fuzzy_score("be", "beta_dir/zoom.rs", "beta_dir/zoom.rs".rfind('/').unwrap() + 1);
+        let dir_match = fuzzy_score(
+            "be",
+            "beta_dir/zoom.rs",
+            "beta_dir/zoom.rs".rfind('/').unwrap() + 1,
+        );
         let file_match = fuzzy_score("be", "zoom/beta.rs", "zoom/beta.rs".rfind('/').unwrap() + 1);
         assert!(
             file_match > dir_match,
@@ -762,7 +787,10 @@ mod tests {
     fn consecutive_chars_score_higher_than_split_chars() {
         let consec = fuzzy_score("alp", "alpha.rs", 0).unwrap();
         let split = fuzzy_score("alp", "a_l_p_xx.rs", 0).unwrap();
-        assert!(consec > split, "'alp' against 'alpha.rs' must score higher than against 'a_l_p_xx.rs'");
+        assert!(
+            consec > split,
+            "'alp' against 'alpha.rs' must score higher than against 'a_l_p_xx.rs'"
+        );
     }
 
     #[test]
@@ -773,7 +801,11 @@ mod tests {
             entry("mid/beta.rs"),
         ]);
         let finder = FileFinder::new(entries);
-        let names: Vec<&str> = finder.visible_results().iter().map(|r| r.entry.rel.as_str()).collect();
+        let names: Vec<&str> = finder
+            .visible_results()
+            .iter()
+            .map(|r| r.entry.rel.as_str())
+            .collect();
         assert_eq!(names, vec!["alpha.rs", "mid/beta.rs", "zeta.rs"]);
     }
 
@@ -799,7 +831,10 @@ mod tests {
         f.move_cursor_end();
         assert_eq!(f.cursor, 2);
         f.move_cursor_right();
-        assert_eq!(f.cursor, 2, "cursor must not move past the end of the query");
+        assert_eq!(
+            f.cursor, 2,
+            "cursor must not move past the end of the query"
+        );
     }
 
     #[test]
@@ -811,7 +846,11 @@ mod tests {
         ]);
         let mut finder = FileFinder::new(entries);
         finder.set_query("md2pdf/core.py");
-        let names: Vec<&str> = finder.visible_results().iter().map(|r| r.entry.rel.as_str()).collect();
+        let names: Vec<&str> = finder
+            .visible_results()
+            .iter()
+            .map(|r| r.entry.rel.as_str())
+            .collect();
         assert_eq!(
             names.first().copied(),
             Some("md2pdf/core.py"),
@@ -828,8 +867,16 @@ mod tests {
         ]);
         let mut finder = FileFinder::new(entries);
         finder.set_query("be");
-        let names: Vec<&str> = finder.visible_results().iter().map(|r| r.entry.rel.as_str()).collect();
-        assert_eq!(names, vec!["sub/beta.rs"], "filter 'be' must keep only beta.rs");
+        let names: Vec<&str> = finder
+            .visible_results()
+            .iter()
+            .map(|r| r.entry.rel.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["sub/beta.rs"],
+            "filter 'be' must keep only beta.rs"
+        );
     }
 
     #[test]
@@ -839,7 +886,11 @@ mod tests {
         finder.select_next();
         assert_eq!(finder.selected_index(), 1);
         finder.set_query("alp");
-        assert_eq!(finder.selected_index(), 0, "selection must reset to 0 when the result list changes shape");
+        assert_eq!(
+            finder.selected_index(),
+            0,
+            "selection must reset to 0 when the result list changes shape"
+        );
     }
 
     #[test]
@@ -849,7 +900,11 @@ mod tests {
         finder.select_next();
         finder.select_next();
         finder.select_next();
-        assert_eq!(finder.selected_index(), 1, "select_next must not overshoot the last index");
+        assert_eq!(
+            finder.selected_index(),
+            1,
+            "select_next must not overshoot the last index"
+        );
     }
 
     #[test]
@@ -873,7 +928,10 @@ mod tests {
         let names: Vec<&str> = entries.iter().map(|e| e.rel.as_str()).collect();
         assert!(names.contains(&"alpha.rs"));
         assert!(names.contains(&"sub/beta.rs"));
-        assert!(!names.contains(&"ignored.txt"), "gitignored files must be excluded from the Cmd+P index");
+        assert!(
+            !names.contains(&"ignored.txt"),
+            "gitignored files must be excluded from the Cmd+P index"
+        );
     }
 
     #[test]
@@ -915,10 +973,18 @@ mod tests {
         // $HOME so the path-shape match fires deterministically.
         let tmp = tempfile::tempdir().unwrap();
         let fake_home = tmp.path();
-        let containers = fake_home.join("Library").join("Containers").join("com.example.app").join("Data");
+        let containers = fake_home
+            .join("Library")
+            .join("Containers")
+            .join("com.example.app")
+            .join("Data");
         std::fs::create_dir_all(&containers).unwrap();
         std::fs::write(containers.join("private.sqlite"), b"").unwrap();
-        let group = fake_home.join("Library").join("Group Containers").join("group.example").join("shared");
+        let group = fake_home
+            .join("Library")
+            .join("Group Containers")
+            .join("group.example")
+            .join("shared");
         std::fs::create_dir_all(&group).unwrap();
         std::fs::write(group.join("shared.db"), b"").unwrap();
         // A normal Library subdir the user DOES want indexed - Logs
@@ -930,7 +996,9 @@ mod tests {
         // SAFETY: tests in this binary are serialized for env vars
         // via build_file_index's HOME read; the value is restored at
         // the end of the test. Other tests do not toggle $HOME.
-        unsafe { std::env::set_var("HOME", fake_home); }
+        unsafe {
+            std::env::set_var("HOME", fake_home);
+        }
         let entries = build_file_index(fake_home);
         match saved {
             Some(v) => unsafe { std::env::set_var("HOME", v) },
@@ -946,7 +1014,9 @@ mod tests {
             "Library/Containers/** must be excluded to avoid macOS AppData TCC prompts; got {names:?}"
         );
         assert!(
-            !names.iter().any(|n| n.starts_with("Library/Group Containers/")),
+            !names
+                .iter()
+                .any(|n| n.starts_with("Library/Group Containers/")),
             "Library/Group Containers/** must be excluded for the same TCC reason; got {names:?}"
         );
     }
@@ -959,7 +1029,15 @@ mod tests {
         // keeps those out even though .hidden(false) is now in
         // effect.
         let tmp = tempfile::tempdir().unwrap();
-        for noise in [".git", "node_modules", "target", "__pycache__", ".venv", ".tox", ".mypy_cache"] {
+        for noise in [
+            ".git",
+            "node_modules",
+            "target",
+            "__pycache__",
+            ".venv",
+            ".tox",
+            ".mypy_cache",
+        ] {
             let dir = tmp.path().join(noise);
             std::fs::create_dir(&dir).unwrap();
             std::fs::write(dir.join("blob"), b"").unwrap();
@@ -971,7 +1049,15 @@ mod tests {
             names.contains(&"real.txt"),
             "the regular workspace file must still be indexed; got {names:?}"
         );
-        for noise in [".git/blob", "node_modules/blob", "target/blob", "__pycache__/blob", ".venv/blob", ".tox/blob", ".mypy_cache/blob"] {
+        for noise in [
+            ".git/blob",
+            "node_modules/blob",
+            "target/blob",
+            "__pycache__/blob",
+            ".venv/blob",
+            ".tox/blob",
+            ".mypy_cache/blob",
+        ] {
             assert!(
                 !names.contains(&noise),
                 "{noise} must be filtered out so vendored / generated dirs do not drown the Cmd+P index; got {names:?}"
@@ -988,7 +1074,11 @@ mod tests {
         ]);
         let mut finder = FileFinder::new(entries);
         finder.set_query("storage.py");
-        let rels: Vec<&str> = finder.visible_results().iter().map(|r| r.entry.rel.as_str()).collect();
+        let rels: Vec<&str> = finder
+            .visible_results()
+            .iter()
+            .map(|r| r.entry.rel.as_str())
+            .collect();
         assert_eq!(
             rels.first().copied(),
             Some("packages/anterior-dev-py/src/anterior/dev/citations/storage.py"),
@@ -997,7 +1087,8 @@ mod tests {
     }
 
     #[test]
-    fn filename_prefix_beats_filename_substring_which_beats_path_substring_which_beats_subsequence() {
+    fn filename_prefix_beats_filename_substring_which_beats_path_substring_which_beats_subsequence()
+    {
         let entries = Arc::new(vec![
             entry("zzz_other/random_storage_thing.py"),
             entry("dir_with_storage_in_name/other.py"),
@@ -1006,7 +1097,11 @@ mod tests {
         ]);
         let mut finder = FileFinder::new(entries);
         finder.set_query("storage");
-        let rels: Vec<&str> = finder.visible_results().iter().map(|r| r.entry.rel.as_str()).collect();
+        let rels: Vec<&str> = finder
+            .visible_results()
+            .iter()
+            .map(|r| r.entry.rel.as_str())
+            .collect();
         assert_eq!(
             rels,
             vec![
@@ -1028,7 +1123,11 @@ mod tests {
         ]);
         let mut finder = FileFinder::new(entries);
         finder.set_query("storage.py");
-        let rels: Vec<&str> = finder.visible_results().iter().map(|r| r.entry.rel.as_str()).collect();
+        let rels: Vec<&str> = finder
+            .visible_results()
+            .iter()
+            .map(|r| r.entry.rel.as_str())
+            .collect();
         assert_eq!(
             rels,
             vec![
@@ -1053,11 +1152,7 @@ mod tests {
         let t0 = std::time::Instant::now();
         let entries = build_file_index(&root);
         let walk_ms = t0.elapsed().as_secs_f64() * 1000.0;
-        eprintln!(
-            "walk: indexed {} files in {:.0} ms",
-            entries.len(),
-            walk_ms
-        );
+        eprintln!("walk: indexed {} files in {:.0} ms", entries.len(), walk_ms);
         let arc = std::sync::Arc::new(entries);
         let mut finder = FileFinder::new(arc.clone());
         for c in "lsp.log".chars() {
@@ -1079,7 +1174,10 @@ mod tests {
         let entries = Arc::new(vec![entry("alpha.rs"), entry("beta.rs")]);
         let mut finder = FileFinder::new(entries);
         finder.set_query("resolver.ts");
-        assert!(finder.visible_results().is_empty(), "no resolver.ts in initial index");
+        assert!(
+            finder.visible_results().is_empty(),
+            "no resolver.ts in initial index"
+        );
         let new_entries = Arc::new(vec![
             entry("alpha.rs"),
             entry("beta.rs"),
@@ -1106,7 +1204,11 @@ mod tests {
         finder.select_next();
         assert_eq!(finder.selected_index(), 2);
         finder.replace_entries(Arc::new(vec![entry("alpha.rs")]));
-        assert_eq!(finder.selected_index(), 0, "selection must clamp to last visible row when the index shrinks");
+        assert_eq!(
+            finder.selected_index(),
+            0,
+            "selection must clamp to last visible row when the index shrinks"
+        );
     }
 
     #[test]

@@ -1,14 +1,14 @@
 use anyhow::{Context, Result};
-use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use crate::remote::{ssh_control_dir, AdoptedMaster};
+use crate::remote::{AdoptedMaster, ssh_control_dir};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PromptKind {
@@ -292,7 +292,11 @@ pub fn strip_ansi(input: &[u8]) -> String {
                 while i < input.len() && input[i] != 0x07 && input[i] != 0x1b {
                     i += 1;
                 }
-                if i < input.len() && input[i] == 0x1b && i + 1 < input.len() && input[i + 1] == b'\\' {
+                if i < input.len()
+                    && input[i] == 0x1b
+                    && i + 1 < input.len()
+                    && input[i + 1] == b'\\'
+                {
                     i += 2;
                 } else if i < input.len() {
                     i += 1;
@@ -344,9 +348,7 @@ pub fn classify_prompt(line: &str) -> Option<PromptKind> {
     {
         return None;
     }
-    if lower.contains("are you sure you want to continue connecting")
-        || lower.contains("(yes/no")
-    {
+    if lower.contains("are you sure you want to continue connecting") || lower.contains("(yes/no") {
         return Some(PromptKind::HostKeyConfirmation);
     }
     if lower.contains("verification code") {
@@ -391,12 +393,8 @@ mod tests {
 
     #[test]
     fn classifies_known_hosts_confirmation() {
-        let line =
-            "Are you sure you want to continue connecting (yes/no/[fingerprint])? ";
-        assert_eq!(
-            classify_prompt(line),
-            Some(PromptKind::HostKeyConfirmation)
-        );
+        let line = "Are you sure you want to continue connecting (yes/no/[fingerprint])? ";
+        assert_eq!(classify_prompt(line), Some(PromptKind::HostKeyConfirmation));
     }
 
     #[test]
@@ -427,7 +425,10 @@ mod tests {
         let mut tail = String::from("Last login: foo\nuser@host's password: ");
         let ev = peel_prompt(&mut tail).expect("password tail must produce a prompt event");
         match ev {
-            SshAuthEvent::Prompt { kind: PromptKind::Password, line } => {
+            SshAuthEvent::Prompt {
+                kind: PromptKind::Password,
+                line,
+            } => {
                 assert!(line.contains("password"));
             }
             other => panic!("expected Password prompt, got {other:?}"),

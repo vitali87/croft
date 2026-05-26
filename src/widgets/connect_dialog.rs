@@ -141,12 +141,8 @@ impl ConnectDialog {
                 DialogPhase::AwaitingPassword => {
                     String::from("Authentication failed, type the password again")
                 }
-                DialogPhase::AwaitingPassphrase => {
-                    String::from("Passphrase rejected, try again")
-                }
-                DialogPhase::AwaitingVerificationCode => {
-                    String::from("Code rejected, try again")
-                }
+                DialogPhase::AwaitingPassphrase => String::from("Passphrase rejected, try again"),
+                DialogPhase::AwaitingVerificationCode => String::from("Code rejected, try again"),
                 _ => default_status_for(&self.phase, &self.host),
             };
             self.submitted = false;
@@ -198,8 +194,7 @@ impl ConnectDialog {
     }
 
     pub fn input_for_submit(&self) -> String {
-        if matches!(self.phase, DialogPhase::AwaitingHostKeyConfirmation) && self.input.is_empty()
-        {
+        if matches!(self.phase, DialogPhase::AwaitingHostKeyConfirmation) && self.input.is_empty() {
             String::from("yes")
         } else {
             self.input.clone()
@@ -218,10 +213,7 @@ impl ConnectDialog {
 
 fn log_line_color(line: &str) -> Color {
     let lower = line.to_ascii_lowercase();
-    if lower.contains("error")
-        || lower.contains("failed")
-        || lower.contains("permission denied")
-    {
+    if lower.contains("error") || lower.contains("failed") || lower.contains("permission denied") {
         return RED;
     }
     if lower.contains("warning") || lower.contains("warn:") {
@@ -281,7 +273,12 @@ impl Widget for &mut ConnectDialog {
         let height = (base_h + logs_h).min(area.height.saturating_sub(2));
         let x = area.x + area.width.saturating_sub(width) / 2;
         let y = area.y + area.height.saturating_sub(height) / 2;
-        let rect = Rect { x, y, width, height };
+        let rect = Rect {
+            x,
+            y,
+            width,
+            height,
+        };
         Clear.render(rect, buf);
         for dy in 0..rect.height {
             for dx in 0..rect.width {
@@ -360,7 +357,10 @@ impl Widget for &mut ConnectDialog {
                 let label = format!("  {:02}:{:02}", secs / 60, secs % 60);
                 header_spans.push(Span::styled(
                     label,
-                    Style::default().fg(TEAL).bg(PANEL_BG).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(TEAL)
+                        .bg(PANEL_BG)
+                        .add_modifier(Modifier::BOLD),
                 ));
             }
         }
@@ -417,15 +417,15 @@ impl Widget for &mut ConnectDialog {
                     DialogPhase::AwaitingPassword => "  type your password and press Enter",
                     DialogPhase::AwaitingPassphrase => "  type your key passphrase and press Enter",
                     DialogPhase::AwaitingVerificationCode => "  type the 2FA code and press Enter",
-                    DialogPhase::AwaitingHostKeyConfirmation => "  type yes and press Enter to trust this host",
+                    DialogPhase::AwaitingHostKeyConfirmation => {
+                        "  type yes and press Enter to trust this host"
+                    }
                     DialogPhase::AwaitingGeneric => "  type a response and press Enter",
                     _ => "",
                 };
                 if !placeholder.is_empty() {
-                    let truncated = truncate(
-                        placeholder,
-                        field_rect.width.saturating_sub(2) as usize,
-                    );
+                    let truncated =
+                        truncate(placeholder, field_rect.width.saturating_sub(2) as usize);
                     buf.set_string(
                         caret_col + 1,
                         field_rect.y,
@@ -518,8 +518,7 @@ impl Widget for &mut ConnectDialog {
             width: toggle_label.chars().count() as u16,
             height: 1,
         };
-        let cancel_x =
-            inner.x + (toggle_label.chars().count() as u16) + 4;
+        let cancel_x = inner.x + (toggle_label.chars().count() as u16) + 4;
         self.cancel_btn = Rect {
             x: cancel_x,
             y: cy,
@@ -573,12 +572,7 @@ impl Widget for &mut ConnectDialog {
                             cell.set_style(Style::default().bg(PANEL_BG));
                         }
                         let fg = log_line_color(line);
-                        buf.set_string(
-                            inner_log.x,
-                            y,
-                            txt,
-                            Style::default().fg(fg).bg(PANEL_BG),
-                        );
+                        buf.set_string(inner_log.x, y, txt, Style::default().fg(fg).bg(PANEL_BG));
                     }
                 }
             }
@@ -693,7 +687,12 @@ mod tests {
         for c in "hunter2".chars() {
             d.push_input_char(c);
         }
-        let area = Rect { x: 0, y: 0, width: 60, height: 18 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 18,
+        };
         let mut buf = Buffer::empty(area);
         (&mut d).render(area, &mut buf);
         let mut joined = String::new();
@@ -717,7 +716,12 @@ mod tests {
     fn awaiting_phase_publishes_caret_position_inside_the_field() {
         let mut d = ConnectDialog::new("h".to_string());
         d.set_prompt(PromptKind::Password, "p".into());
-        let area = Rect { x: 0, y: 0, width: 60, height: 18 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 18,
+        };
         let mut buf = Buffer::empty(area);
         (&mut d).render(area, &mut buf);
         let (cx, cy) =
@@ -731,7 +735,12 @@ mod tests {
     fn empty_field_still_shows_a_caret_and_a_placeholder_so_the_user_can_tell_typing_is_alive() {
         let mut d = ConnectDialog::new("h".to_string());
         d.set_prompt(PromptKind::Password, "p".into());
-        let area = Rect { x: 0, y: 0, width: 60, height: 18 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 18,
+        };
         let mut buf = Buffer::empty(area);
         (&mut d).render(area, &mut buf);
         let mut field_row = String::new();
@@ -752,7 +761,12 @@ mod tests {
     fn caret_position_advances_as_the_user_types_into_the_field() {
         let mut d = ConnectDialog::new("h".to_string());
         d.set_prompt(PromptKind::Password, "p".into());
-        let area = Rect { x: 0, y: 0, width: 60, height: 18 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 18,
+        };
         let mut buf = Buffer::empty(area);
         (&mut d).render(area, &mut buf);
         let initial = d.cursor_screen_pos().unwrap();
@@ -770,7 +784,12 @@ mod tests {
     #[test]
     fn toggle_logs_button_registers_hit_rect_so_mouse_can_click_it() {
         let mut d = ConnectDialog::new("h".to_string());
-        let area = Rect { x: 0, y: 0, width: 60, height: 18 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 18,
+        };
         let mut buf = Buffer::empty(area);
         (&mut d).render(area, &mut buf);
         assert!(

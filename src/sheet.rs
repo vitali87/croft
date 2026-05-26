@@ -95,7 +95,11 @@ pub fn open_sheet(path: &Path) -> std::io::Result<SheetView> {
                 )));
             }
             let bytes = std::fs::read(path)?;
-            let delim = if matches!(kind, SheetKind::Tsv) { b'\t' } else { b',' };
+            let delim = if matches!(kind, SheetKind::Tsv) {
+                b'\t'
+            } else {
+                b','
+            };
             let sheet = parse_delimited(&bytes, delim, "Sheet1")
                 .map_err(|e| std::io::Error::other(format!("CSV parse: {e}")))?;
             Ok(SheetView {
@@ -127,11 +131,7 @@ pub fn open_sheet(path: &Path) -> std::io::Result<SheetView> {
     }
 }
 
-pub fn parse_delimited(
-    bytes: &[u8],
-    delim: u8,
-    sheet_name: &str,
-) -> Result<SheetData, csv::Error> {
+pub fn parse_delimited(bytes: &[u8], delim: u8, sheet_name: &str) -> Result<SheetData, csv::Error> {
     let mut reader = csv::ReaderBuilder::new()
         .has_headers(false)
         .flexible(true)

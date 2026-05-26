@@ -10,7 +10,7 @@ use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 
 use crate::highlight::{
-    compute_line_starts, highlight_text, lang_for_extension, HiSpan, LangKind, LangRegistry,
+    HiSpan, LangKind, LangRegistry, compute_line_starts, highlight_text, lang_for_extension,
 };
 use crate::widgets::scrollbar;
 
@@ -24,8 +24,7 @@ use crate::widgets::scrollbar;
 /// own per-format limits.
 const MAX_FILE_BYTES: u64 = 50 * 1024 * 1024;
 const MAX_IMAGE_BYTES: u64 = 25 * 1024 * 1024;
-const IMAGE_EXTENSIONS: &[&str] =
-    &["png", "jpg", "jpeg", "gif", "bmp", "webp"];
+const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "bmp", "webp"];
 
 /// Read-only image preview attached to a tab. Holds the raw file bytes so
 /// the OSC-1337 inline-image bake can re-fit on resize without rereading
@@ -53,12 +52,7 @@ pub struct PdfState {
     pub source_byte_size: u64,
 }
 
-fn render_image_placeholder(
-    image: &ImageView,
-    path: Option<&Path>,
-    inner: Rect,
-    buf: &mut Buffer,
-) {
+fn render_image_placeholder(image: &ImageView, path: Option<&Path>, inner: Rect, buf: &mut Buffer) {
     // Solid bg fill so the OSC-1337 inline image (emitted post-frame on
     // capable terminals) sits on a clean canvas; on non-capable terminals
     // the metadata header below is the only content the user sees.
@@ -189,12 +183,7 @@ fn render_sheet(
     // out of horizontal space.
     let mut visible: Vec<(usize, u16)> = Vec::new(); // (col_idx, x_offset)
     let mut x_off = 0u16;
-    for (c, w) in sheet
-        .col_widths
-        .iter()
-        .enumerate()
-        .skip(sheet.scroll_col)
-    {
+    for (c, w) in sheet.col_widths.iter().enumerate().skip(sheet.scroll_col) {
         if x_off + w + 1 > body_w {
             break;
         }
@@ -204,11 +193,7 @@ fn render_sheet(
 
     // Header text.
     for (c, x_off) in &visible {
-        let label = sheet
-            .headers
-            .get(*c)
-            .map(|s| s.as_str())
-            .unwrap_or("");
+        let label = sheet.headers.get(*c).map(|s| s.as_str()).unwrap_or("");
         let cell_x = body_x + *x_off;
         let w = sheet.col_widths[*c];
         write_cell(buf, cell_x, header_y, w, label, head_style);
@@ -225,13 +210,22 @@ fn render_sheet(
     let gutter_style = Style::default().fg(Color::DarkGray);
     for (display_row, row_idx) in (sheet.scroll_row..row_end).enumerate() {
         let y = data_top + display_row as u16;
-        let style = if display_row % 2 == 0 { row_style } else { alt_row_style };
+        let style = if display_row % 2 == 0 {
+            row_style
+        } else {
+            alt_row_style
+        };
         for x in inner.x..inner.x + inner.width {
             buf[(x, y)].set_style(style);
             buf[(x, y)].set_symbol(" ");
         }
         let row_label = format!(" {:>width$} ", row_idx + 1, width = (gutter_w - 2) as usize);
-        buf.set_string(inner.x, y, &row_label, gutter_style.bg(style.bg.unwrap_or(Color::Reset)));
+        buf.set_string(
+            inner.x,
+            y,
+            &row_label,
+            gutter_style.bg(style.bg.unwrap_or(Color::Reset)),
+        );
         let row = &sheet.rows[row_idx];
         for (c, x_off) in &visible {
             let cell_text = row.get(*c).map(|s| s.as_str()).unwrap_or("");
@@ -380,15 +374,21 @@ fn render_diff(
         let y = body_top + vis_row as u16;
         let row = diff.rows[row_idx];
         let (l_cell_bg, l_sign, l_text) = match row {
-            DiffRow::Equal { left, .. } => {
-                (Color::Reset, ' ', diff.left_lines.get(left).cloned().unwrap_or_default())
-            }
-            DiffRow::Removed { left } => {
-                (removed_bg, '-', diff.left_lines.get(left).cloned().unwrap_or_default())
-            }
-            DiffRow::Replaced { left, .. } => {
-                (removed_bg, '-', diff.left_lines.get(left).cloned().unwrap_or_default())
-            }
+            DiffRow::Equal { left, .. } => (
+                Color::Reset,
+                ' ',
+                diff.left_lines.get(left).cloned().unwrap_or_default(),
+            ),
+            DiffRow::Removed { left } => (
+                removed_bg,
+                '-',
+                diff.left_lines.get(left).cloned().unwrap_or_default(),
+            ),
+            DiffRow::Replaced { left, .. } => (
+                removed_bg,
+                '-',
+                diff.left_lines.get(left).cloned().unwrap_or_default(),
+            ),
             DiffRow::Added { .. } => (added_bg, ' ', String::new()),
         };
         let (r_cell_bg, r_sign, r_text) = match row {
@@ -431,7 +431,11 @@ fn render_diff(
             y,
             &format!("{l_sign} "),
             Style::default()
-                .fg(if l_cell_bg == removed_bg { removed_fg } else { equal_fg })
+                .fg(if l_cell_bg == removed_bg {
+                    removed_fg
+                } else {
+                    equal_fg
+                })
                 .bg(l_cell_bg)
                 .add_modifier(Modifier::BOLD),
         );
@@ -450,7 +454,11 @@ fn render_diff(
             y,
             &l_padded,
             Style::default()
-                .fg(if l_cell_bg == removed_bg { removed_fg } else { equal_fg })
+                .fg(if l_cell_bg == removed_bg {
+                    removed_fg
+                } else {
+                    equal_fg
+                })
                 .bg(l_cell_bg),
         );
 
@@ -475,7 +483,11 @@ fn render_diff(
             y,
             &format!("{r_sign} "),
             Style::default()
-                .fg(if r_cell_bg == added_bg { added_fg } else { equal_fg })
+                .fg(if r_cell_bg == added_bg {
+                    added_fg
+                } else {
+                    equal_fg
+                })
                 .bg(r_cell_bg)
                 .add_modifier(Modifier::BOLD),
         );
@@ -494,7 +506,11 @@ fn render_diff(
             y,
             &r_padded,
             Style::default()
-                .fg(if r_cell_bg == added_bg { added_fg } else { equal_fg })
+                .fg(if r_cell_bg == added_bg {
+                    added_fg
+                } else {
+                    equal_fg
+                })
                 .bg(r_cell_bg),
         );
     }
@@ -675,8 +691,18 @@ fn paint_diff_nav_arrows(inner: Rect, head_bg: Color, buf: &mut Buffer) -> (Rect
     buf.set_string(prev_x, y, "\u{2039}", arrow_style);
     buf.set_string(next_x, y, "\u{203a}", arrow_style);
     (
-        Rect { x: prev_x, y, width: 1, height: 1 },
-        Rect { x: next_x, y, width: 1, height: 1 },
+        Rect {
+            x: prev_x,
+            y,
+            width: 1,
+            height: 1,
+        },
+        Rect {
+            x: next_x,
+            y,
+            width: 1,
+            height: 1,
+        },
     )
 }
 
@@ -707,8 +733,7 @@ fn render_unified_deletion(
         buf[(x, inner.y)].set_symbol(" ");
     }
     buf.set_string(inner.x, inner.y, &header, head_style);
-    let (prev_arrow, next_arrow) =
-        paint_diff_nav_arrows(inner, Color::Rgb(0x6b, 0x1f, 0x1f), buf);
+    let (prev_arrow, next_arrow) = paint_diff_nav_arrows(inner, Color::Rgb(0x6b, 0x1f, 0x1f), buf);
 
     let body_top = inner.y + 1;
     let body_height = inner.height.saturating_sub(2);
@@ -758,7 +783,11 @@ fn render_unified_deletion(
             y,
             &format!("{sign} "),
             Style::default()
-                .fg(if cell_bg == removed_bg { removed_fg } else { gutter_fg })
+                .fg(if cell_bg == removed_bg {
+                    removed_fg
+                } else {
+                    gutter_fg
+                })
                 .bg(cell_bg)
                 .add_modifier(Modifier::BOLD),
         );
@@ -780,7 +809,11 @@ fn render_unified_deletion(
             y,
             &padded,
             Style::default()
-                .fg(if cell_bg == removed_bg { removed_fg } else { Color::Rgb(0xc5, 0xcd, 0xd9) })
+                .fg(if cell_bg == removed_bg {
+                    removed_fg
+                } else {
+                    Color::Rgb(0xc5, 0xcd, 0xd9)
+                })
                 .bg(cell_bg),
         );
     }
@@ -801,14 +834,7 @@ fn render_unified_deletion(
     (prev_arrow, next_arrow)
 }
 
-fn write_cell(
-    buf: &mut Buffer,
-    x: u16,
-    y: u16,
-    w: u16,
-    text: &str,
-    style: Style,
-) {
+fn write_cell(buf: &mut Buffer, x: u16, y: u16, w: u16, text: &str, style: Style) {
     let max_chars = w as usize;
     let mut content: String = text.chars().take(max_chars).collect();
     if text.chars().count() > max_chars && max_chars >= 1 {
@@ -865,7 +891,10 @@ pub struct EditorSelection {
 
 impl EditorSelection {
     pub fn new(row: usize, col: usize) -> Self {
-        Self { anchor: (row, col), head: (row, col) }
+        Self {
+            anchor: (row, col),
+            head: (row, col),
+        }
     }
     pub fn normalised(&self) -> ((usize, usize), (usize, usize)) {
         if self.anchor <= self.head {
@@ -1208,14 +1237,13 @@ impl Editor {
         if new_page == pdf.current_page {
             return false;
         }
-        let bytes =
-            match crate::pdf::rasterize_page(&pdf.source_path, new_page, pdf.backend) {
-                Ok(b) => b,
-                Err(e) => {
-                    self.status = format!("PDF page {new_page} failed: {e}");
-                    return false;
-                }
-            };
+        let bytes = match crate::pdf::rasterize_page(&pdf.source_path, new_page, pdf.backend) {
+            Ok(b) => b,
+            Err(e) => {
+                self.status = format!("PDF page {new_page} failed: {e}");
+                return false;
+            }
+        };
         let (pixel_w, pixel_h) = match image::load_from_memory(&bytes) {
             Ok(img) => (img.width(), img.height()),
             Err(_) => return false,
@@ -1267,10 +1295,7 @@ impl Editor {
         // Selection-replace counts as one logical edit (Replace), not two.
         // Coalesce subsequent typed chars onto the same step only when the
         // previous edit was also a single-char insert with no selection.
-        let had_selection = self
-            .selection
-            .map(|s| s.has_area())
-            .unwrap_or(false);
+        let had_selection = self.selection.map(|s| s.has_area()).unwrap_or(false);
         let kind = if had_selection {
             EditKind::DeleteSelection
         } else {
@@ -1355,7 +1380,11 @@ impl Editor {
             .collect();
 
         let prefix_chars: Vec<char> = line.chars().take(col).collect();
-        let last_non_ws = prefix_chars.iter().rev().find(|c| !c.is_whitespace()).copied();
+        let last_non_ws = prefix_chars
+            .iter()
+            .rev()
+            .find(|c| !c.is_whitespace())
+            .copied();
         let next_char = line.chars().nth(col);
 
         let unit = indent_unit_for(self.lang);
@@ -1465,7 +1494,9 @@ impl Editor {
     /// editor's char-indexed coordinates.  Returns "" when there's no
     /// selection or the selection is zero-area.
     pub fn selection_text(&self) -> String {
-        let Some(sel) = self.selection else { return String::new() };
+        let Some(sel) = self.selection else {
+            return String::new();
+        };
         if !sel.has_area() {
             return String::new();
         }
@@ -1498,11 +1529,7 @@ impl Editor {
     /// was removed.  Cursor lands at the start of the deleted range and the
     /// selection is cleared.  Pushes an undo step.
     pub fn delete_selection(&mut self) -> bool {
-        if !self
-            .selection
-            .map(|s| s.has_area())
-            .unwrap_or(false)
-        {
+        if !self.selection.map(|s| s.has_area()).unwrap_or(false) {
             self.selection = None;
             return false;
         }
@@ -1518,7 +1545,9 @@ impl Editor {
     /// recompute highlights — used by other public mutators that have
     /// already snapshotted state and will recompute themselves.
     fn delete_selection_inner(&mut self) -> bool {
-        let Some(sel) = self.selection else { return false };
+        let Some(sel) = self.selection else {
+            return false;
+        };
         if !sel.has_area() {
             self.selection = None;
             return false;
@@ -1561,8 +1590,8 @@ impl Editor {
     /// Coalesces consecutive `InsertChar` ops into one step so a typing
     /// burst is undone as one unit; everything else opens a new step.
     fn push_undo(&mut self, kind: EditKind) {
-        let coalesce = kind == EditKind::InsertChar
-            && self.last_edit_kind == Some(EditKind::InsertChar);
+        let coalesce =
+            kind == EditKind::InsertChar && self.last_edit_kind == Some(EditKind::InsertChar);
         if !coalesce {
             self.undo_stack.push(self.snapshot());
             if self.undo_stack.len() > UNDO_STACK_LIMIT {
@@ -1574,17 +1603,15 @@ impl Editor {
 
     /// Undo the most recent edit step. Returns true iff state was changed.
     pub fn undo(&mut self) -> bool {
-        let Some(snap) = self.undo_stack.pop() else { return false };
+        let Some(snap) = self.undo_stack.pop() else {
+            return false;
+        };
         self.lines = snap.lines;
         if self.lines.is_empty() {
             self.lines.push(String::new());
         }
-        self.cursor_row = snap
-            .cursor_row
-            .min(self.lines.len().saturating_sub(1));
-        self.cursor_col = snap
-            .cursor_col
-            .min(self.line_char_len(self.cursor_row));
+        self.cursor_row = snap.cursor_row.min(self.lines.len().saturating_sub(1));
+        self.cursor_col = snap.cursor_col.min(self.line_char_len(self.cursor_row));
         self.selection = snap.selection;
         self.dirty = snap.dirty;
         self.last_edit_kind = None;
@@ -2001,11 +2028,7 @@ impl Editor {
     /// render (when `last_inner.height` is still 0).
     pub fn page_size(&self) -> usize {
         let from_inner = self.last_inner.height as usize;
-        if from_inner > 0 {
-            from_inner
-        } else {
-            20
-        }
+        if from_inner > 0 { from_inner } else { 20 }
     }
 
     /// Move the viewport down by exactly one screen so the first
@@ -2148,7 +2171,10 @@ impl Editor {
 
 /// Convert a char index within `s` to a byte index, saturating at `s.len()`.
 fn char_byte(s: &str, char_idx: usize) -> usize {
-    s.char_indices().nth(char_idx).map(|(i, _)| i).unwrap_or(s.len())
+    s.char_indices()
+        .nth(char_idx)
+        .map(|(i, _)| i)
+        .unwrap_or(s.len())
 }
 
 fn is_word_char(c: char) -> bool {
@@ -2180,11 +2206,7 @@ fn extra_indent_triggered(lang: Option<LangKind>, last_non_ws: Option<char>) -> 
     }
 }
 
-fn is_bracket_pair_split(
-    lang: Option<LangKind>,
-    prev: Option<char>,
-    next: Option<char>,
-) -> bool {
+fn is_bracket_pair_split(lang: Option<LangKind>, prev: Option<char>, next: Option<char>) -> bool {
     let bracket_aware = matches!(
         lang,
         Some(LangKind::Rust)
@@ -2324,7 +2346,8 @@ mod tests {
         // a typical LSP log session round-trips.
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("big.log");
-        let line = "1778548312.915 lsp[ruff] stderr: 2026-05-12 02:11:52 INFO some workspace setting\n";
+        let line =
+            "1778548312.915 lsp[ruff] stderr: 2026-05-12 02:11:52 INFO some workspace setting\n";
         let line_bytes = line.len();
         let target_bytes = 8 * 1024 * 1024;
         let line_count = target_bytes / line_bytes + 1;
@@ -2441,7 +2464,10 @@ mod tests {
         e.lang = Some(LangKind::Python);
         e.cursor_col = e.line_char_len(0);
         e.insert_newline();
-        assert_eq!(e.lines, vec!["def hello():".to_string(), "    ".to_string()]);
+        assert_eq!(
+            e.lines,
+            vec!["def hello():".to_string(), "    ".to_string()]
+        );
         assert_eq!(e.cursor_row, 1);
         assert_eq!(e.cursor_col, 4);
     }
@@ -2452,7 +2478,10 @@ mod tests {
         e.lang = Some(LangKind::Python);
         e.cursor_col = e.line_char_len(0);
         e.insert_newline();
-        assert_eq!(e.lines, vec!["    print(x)".to_string(), "    ".to_string()]);
+        assert_eq!(
+            e.lines,
+            vec!["    print(x)".to_string(), "    ".to_string()]
+        );
         assert_eq!(e.cursor_col, 4);
     }
 
@@ -2462,7 +2491,10 @@ mod tests {
         e.lang = Some(LangKind::Python);
         e.cursor_col = e.line_char_len(0);
         e.insert_newline();
-        assert_eq!(e.lines, vec!["    if x:".to_string(), "        ".to_string()]);
+        assert_eq!(
+            e.lines,
+            vec!["    if x:".to_string(), "        ".to_string()]
+        );
         assert_eq!(e.cursor_col, 8);
     }
 
@@ -2494,7 +2526,11 @@ mod tests {
         e.insert_newline();
         assert_eq!(
             e.lines,
-            vec!["fn main() {".to_string(), "    ".to_string(), "}".to_string()]
+            vec![
+                "fn main() {".to_string(),
+                "    ".to_string(),
+                "}".to_string()
+            ]
         );
         assert_eq!(e.cursor_row, 1);
         assert_eq!(e.cursor_col, 4);
@@ -2597,18 +2633,34 @@ mod tests {
         // lines. After PageDown the cursor should land on row 25 (line 26 in
         // 1-indexed terms) and that row should be the new top of the view.
         let mut e = editor_with_lines(100);
-        e.last_inner = Rect { x: 0, y: 0, width: 80, height: 25 };
+        e.last_inner = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 25,
+        };
         assert_eq!(e.scroll, 0);
         assert_eq!(e.cursor_row, 0);
         e.page_down_one_screen();
-        assert_eq!(e.cursor_row, 25, "cursor should jump to first previously-unseen row");
-        assert_eq!(e.scroll, 25, "scroll should align with new cursor at top of viewport");
+        assert_eq!(
+            e.cursor_row, 25,
+            "cursor should jump to first previously-unseen row"
+        );
+        assert_eq!(
+            e.scroll, 25,
+            "scroll should align with new cursor at top of viewport"
+        );
     }
 
     #[test]
     fn page_down_repeats_advance_one_viewport_at_a_time() {
         let mut e = editor_with_lines(100);
-        e.last_inner = Rect { x: 0, y: 0, width: 80, height: 20 };
+        e.last_inner = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 20,
+        };
         e.page_down_one_screen();
         e.page_down_one_screen();
         assert_eq!(e.cursor_row, 40);
@@ -2618,7 +2670,12 @@ mod tests {
     #[test]
     fn page_down_clamps_at_end_of_file() {
         let mut e = editor_with_lines(30);
-        e.last_inner = Rect { x: 0, y: 0, width: 80, height: 25 };
+        e.last_inner = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 25,
+        };
         // Realistic state: scroll = 4 means rows 4..=28 are on screen, with
         // line 29 (cursor_row 28) visible at the bottom.
         e.scroll = 4;
@@ -2632,7 +2689,12 @@ mod tests {
     #[test]
     fn page_up_rewinds_one_full_viewport() {
         let mut e = editor_with_lines(200);
-        e.last_inner = Rect { x: 0, y: 0, width: 80, height: 25 };
+        e.last_inner = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 25,
+        };
         e.scroll = 100;
         e.cursor_row = 100;
         e.page_up_one_screen();
@@ -2643,7 +2705,12 @@ mod tests {
     #[test]
     fn page_up_clamps_at_top_of_file() {
         let mut e = editor_with_lines(50);
-        e.last_inner = Rect { x: 0, y: 0, width: 80, height: 25 };
+        e.last_inner = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 25,
+        };
         e.scroll = 5;
         e.cursor_row = 5;
         e.page_up_one_screen();
@@ -2777,7 +2844,8 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_lines_down_with_no_selection_copies_the_current_line_below_and_moves_cursor_to_it() {
+    fn duplicate_lines_down_with_no_selection_copies_the_current_line_below_and_moves_cursor_to_it()
+    {
         let mut e = editor_with("alpha\nbeta\ngamma");
         e.cursor_row = 1;
         e.cursor_col = 2;
@@ -2788,7 +2856,8 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_lines_up_with_no_selection_copies_the_current_line_above_and_keeps_cursor_on_the_copy() {
+    fn duplicate_lines_up_with_no_selection_copies_the_current_line_above_and_keeps_cursor_on_the_copy()
+     {
         let mut e = editor_with("alpha\nbeta\ngamma");
         e.cursor_row = 1;
         e.cursor_col = 3;
@@ -3082,7 +3151,10 @@ mod tests {
         write!(tmp, "gamma").unwrap();
         let mut e = Editor::new();
         e.open(tmp.path()).unwrap();
-        assert_eq!(e.lines, vec!["alpha".to_string(), "beta".to_string(), "gamma".to_string()]);
+        assert_eq!(
+            e.lines,
+            vec!["alpha".to_string(), "beta".to_string(), "gamma".to_string()]
+        );
         assert_eq!(e.cursor_row, 0);
         assert_eq!(e.cursor_col, 0);
         assert!(!e.dirty);
@@ -3192,7 +3264,10 @@ mod tests {
 
         std::fs::write(tmp.path(), "external change\n").unwrap();
         let outcome = e.reload_if_clean();
-        assert!(outcome.is_none(), "should refuse to reload over dirty buffer");
+        assert!(
+            outcome.is_none(),
+            "should refuse to reload over dirty buffer"
+        );
         assert!(e.lines[0].contains("local edit"));
     }
 
@@ -3221,7 +3296,10 @@ mod tests {
     fn insert_str_inserts_newlines() {
         let mut e = editor_with("");
         e.insert_str("a\nb\nc");
-        assert_eq!(e.lines, vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+        assert_eq!(
+            e.lines,
+            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
         assert_eq!(e.cursor_row, 2);
         assert_eq!(e.cursor_col, 1);
     }
@@ -3234,14 +3312,22 @@ mod tests {
 
     #[test]
     fn build_line_spans_full_line_highlighted() {
-        let hi = vec![HiSpan { start: 0, end: 5, style: Style::default() }];
+        let hi = vec![HiSpan {
+            start: 0,
+            end: 5,
+            style: Style::default(),
+        }];
         let spans = build_line_spans("hello", &hi);
         assert_eq!(spans.len(), 1);
     }
 
     #[test]
     fn build_line_spans_partial_highlights() {
-        let hi = vec![HiSpan { start: 1, end: 3, style: Style::default() }];
+        let hi = vec![HiSpan {
+            start: 1,
+            end: 3,
+            style: Style::default(),
+        }];
         let spans = build_line_spans("abcde", &hi);
         // Expect: "a", "bc", "de"
         assert_eq!(spans.len(), 3);
@@ -3249,13 +3335,19 @@ mod tests {
 
     #[test]
     fn editor_selection_normalised_handles_anchor_after_head() {
-        let s = EditorSelection { anchor: (5, 4), head: (2, 1) };
+        let s = EditorSelection {
+            anchor: (5, 4),
+            head: (2, 1),
+        };
         assert_eq!(s.normalised(), ((2, 1), (5, 4)));
     }
 
     #[test]
     fn editor_selection_normalised_handles_same_row() {
-        let s = EditorSelection { anchor: (3, 9), head: (3, 2) };
+        let s = EditorSelection {
+            anchor: (3, 9),
+            head: (3, 2),
+        };
         assert_eq!(s.normalised(), ((3, 2), (3, 9)));
     }
 
@@ -3263,7 +3355,10 @@ mod tests {
     fn editor_selection_has_area_only_when_endpoints_differ() {
         let s = EditorSelection::new(2, 5);
         assert!(!s.has_area());
-        let s2 = EditorSelection { anchor: (2, 5), head: (2, 6) };
+        let s2 = EditorSelection {
+            anchor: (2, 5),
+            head: (2, 6),
+        };
         assert!(s2.has_area());
     }
 
@@ -3452,7 +3547,12 @@ mod tests {
     #[test]
     fn mouse_down_starts_zero_area_selection_at_click() {
         let mut e = editor_with("hello");
-        e.last_inner = Rect { x: 0, y: 0, width: 80, height: 25 };
+        e.last_inner = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 25,
+        };
         e.last_gutter_width = 2;
         e.mouse_down(3 + 0, 0); // text_x = 0 + 2 + 1 = 3, click col 3 → editor col 0
         assert_eq!(e.cursor_col, 0);
@@ -3471,19 +3571,33 @@ mod tests {
         e.cursor_col = 2;
         e.focused = true;
 
-        let area = Rect { x: 0, y: 0, width: 30, height: 5 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 30,
+            height: 5,
+        };
         let mut buf = Buffer::empty(area);
         (&mut e).render(area, &mut buf);
 
         let text_x = e.last_inner.x + e.last_gutter_width + 1;
         let cell = &buf[(text_x + 2, e.last_inner.y)];
-        assert_eq!(cell.symbol(), "l", "editor render must leave the underlying glyph alone");
+        assert_eq!(
+            cell.symbol(),
+            "l",
+            "editor render must leave the underlying glyph alone"
+        );
     }
 
     #[test]
     fn cursor_screen_pos_inside_viewport() {
         let mut e = editor_with("hello\nworld");
-        e.last_inner = Rect { x: 5, y: 7, width: 80, height: 25 };
+        e.last_inner = Rect {
+            x: 5,
+            y: 7,
+            width: 80,
+            height: 25,
+        };
         e.last_gutter_width = 2;
         e.cursor_row = 1;
         e.cursor_col = 3;
@@ -3495,7 +3609,12 @@ mod tests {
     #[test]
     fn cursor_screen_pos_returns_none_when_scrolled_off() {
         let mut e = editor_with_lines(50);
-        e.last_inner = Rect { x: 0, y: 0, width: 40, height: 10 };
+        e.last_inner = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 10,
+        };
         e.last_gutter_width = 3;
         e.scroll = 30;
         e.cursor_row = 5; // above viewport
@@ -3600,7 +3719,12 @@ mod tests {
         let mut e = editor_with("alpha needle bravo needle zulu");
         e.set_search_highlight(Some(String::from("needle")));
         e.focused = true;
-        let area = Rect { x: 0, y: 0, width: 60, height: 3 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 3,
+        };
         let mut buf = Buffer::empty(area);
         (&mut e).render(area, &mut buf);
         let text_x = e.last_inner.x + e.last_gutter_width + 1;
@@ -3609,7 +3733,8 @@ mod tests {
         // First "needle" starts at char index 6 ("alpha "), 6 chars long.
         for col in 6..12u16 {
             assert_eq!(
-                buf[(text_x + col, y)].bg, yellow,
+                buf[(text_x + col, y)].bg,
+                yellow,
                 "first match cell {col} must have yellow bg"
             );
         }
@@ -3619,7 +3744,8 @@ mod tests {
         // Second "needle" starts at char index 19 ("alpha needle bravo "), 6 chars.
         for col in 19..25u16 {
             assert_eq!(
-                buf[(text_x + col, y)].bg, yellow,
+                buf[(text_x + col, y)].bg,
+                yellow,
                 "second match cell {col} must have yellow bg"
             );
         }
@@ -3631,7 +3757,12 @@ mod tests {
         let mut e = editor_with("alpha needle bravo");
         e.set_search_highlight(None);
         e.focused = true;
-        let area = Rect { x: 0, y: 0, width: 40, height: 3 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 3,
+        };
         let mut buf = Buffer::empty(area);
         (&mut e).render(area, &mut buf);
         let text_x = e.last_inner.x + e.last_gutter_width + 1;
@@ -3639,7 +3770,8 @@ mod tests {
         let yellow = Color::Rgb(0xff, 0xd7, 0x4a);
         for col in 0..18u16 {
             assert_ne!(
-                buf[(text_x + col, y)].bg, yellow,
+                buf[(text_x + col, y)].bg,
+                yellow,
                 "no cell should be highlighted when search_highlight is None"
             );
         }
@@ -3651,7 +3783,12 @@ mod tests {
         let mut e = editor_with("Foo bar FOO baz");
         e.set_search_highlight(Some(String::from("foo")));
         e.focused = true;
-        let area = Rect { x: 0, y: 0, width: 40, height: 3 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 3,
+        };
         let mut buf = Buffer::empty(area);
         (&mut e).render(area, &mut buf);
         let text_x = e.last_inner.x + e.last_gutter_width + 1;
@@ -3698,7 +3835,12 @@ mod tests {
         t.open_diff(f1.path(), f2.path()).unwrap();
         let active_idx = t.active_index();
         t.editors[active_idx].focused = true;
-        let area = Rect { x: 0, y: 0, width: 80, height: 20 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 20,
+        };
         let mut buf = ratatui::buffer::Buffer::empty(area);
         ratatui::widgets::Widget::render(&mut t.editors[active_idx], area, &mut buf);
         let ed = &t.editors[active_idx];
@@ -3739,9 +3881,24 @@ mod tests {
         std::fs::write(f.path(), "alpha\nbravo\ncharlie\n").unwrap();
         let mut ed = Editor::new();
         ed.open(f.path()).unwrap();
-        ed.diff_prev_arrow = Rect { x: 30, y: 0, width: 1, height: 1 };
-        ed.diff_next_arrow = Rect { x: 32, y: 0, width: 1, height: 1 };
-        let area = Rect { x: 0, y: 0, width: 40, height: 10 };
+        ed.diff_prev_arrow = Rect {
+            x: 30,
+            y: 0,
+            width: 1,
+            height: 1,
+        };
+        ed.diff_next_arrow = Rect {
+            x: 32,
+            y: 0,
+            width: 1,
+            height: 1,
+        };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 10,
+        };
         let mut buf = ratatui::buffer::Buffer::empty(area);
         ratatui::widgets::Widget::render(&mut ed, area, &mut buf);
         assert_eq!(ed.diff_prev_arrow, Rect::default());
@@ -3759,7 +3916,12 @@ mod tests {
         t.open_diff(f1.path(), f2.path()).unwrap();
         let active_idx = t.active_index();
         t.editors[active_idx].focused = true;
-        let area = Rect { x: 0, y: 0, width: 80, height: 10 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 10,
+        };
         let mut buf = ratatui::buffer::Buffer::empty(area);
         ratatui::widgets::Widget::render(&mut t.editors[active_idx], area, &mut buf);
         let ed = &t.editors[active_idx];
@@ -3769,12 +3931,8 @@ mod tests {
         // Left text column begins at l_text_x = inner.x + l_gutter + 2.
         let l_gutter = (diff.left_lines.len() + 1).to_string().len() as u16 + 1;
         let l_text_x = ed.last_inner.x + l_gutter + 2;
-        let hit = crate::widgets::editor::diff_hit_test(
-            diff,
-            ed.last_inner,
-            l_text_x + 2,
-            body_top + 1,
-        );
+        let hit =
+            crate::widgets::editor::diff_hit_test(diff, ed.last_inner, l_text_x + 2, body_top + 1);
         assert_eq!(
             hit,
             Some((DiffSide::Left, 1, 2)),
@@ -3793,7 +3951,12 @@ mod tests {
         t.open_diff(f1.path(), f2.path()).unwrap();
         let active_idx = t.active_index();
         t.editors[active_idx].focused = true;
-        let area = Rect { x: 0, y: 0, width: 80, height: 10 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 10,
+        };
         let mut buf = ratatui::buffer::Buffer::empty(area);
         ratatui::widgets::Widget::render(&mut t.editors[active_idx], area, &mut buf);
         let ed = &t.editors[active_idx];
@@ -3802,12 +3965,8 @@ mod tests {
         let half = ed.last_inner.width / 2;
         let r_gutter = (diff.right_lines.len() + 1).to_string().len() as u16 + 1;
         let r_text_x = ed.last_inner.x + half + 1 + r_gutter + 2;
-        let hit = crate::widgets::editor::diff_hit_test(
-            diff,
-            ed.last_inner,
-            r_text_x + 3,
-            body_top + 1,
-        );
+        let hit =
+            crate::widgets::editor::diff_hit_test(diff, ed.last_inner, r_text_x + 3, body_top + 1);
         assert!(
             matches!(hit, Some((DiffSide::Right, 1, 3))),
             "a click three cells into the right text column of the second body row must map to Right, row 1, char col 3; got {hit:?}"
@@ -3825,7 +3984,12 @@ mod tests {
         t.open_diff(f1.path(), f2.path()).unwrap();
         let active_idx = t.active_index();
         t.editors[active_idx].focused = true;
-        let area = Rect { x: 0, y: 0, width: 80, height: 10 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 10,
+        };
         let mut buf = ratatui::buffer::Buffer::empty(area);
         ratatui::widgets::Widget::render(&mut t.editors[active_idx], area, &mut buf);
         let diff_mut = t.editors[active_idx].diff.as_mut().unwrap();
@@ -3872,8 +4036,18 @@ mod tests {
         let mut t = EditorTabs::new();
         t.open_diff(f1.path(), f2.path()).unwrap();
         let label = tab_label(&t.editors[t.active_index()]);
-        let l = f1.path().file_name().unwrap().to_string_lossy().into_owned();
-        let r = f2.path().file_name().unwrap().to_string_lossy().into_owned();
+        let l = f1
+            .path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let r = f2
+            .path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
         assert_eq!(label, format!("{l} \u{2194} {r}"));
     }
 
@@ -3923,7 +4097,11 @@ mod tests {
         // Now open a different file via preview, mirroring "click on a
         // search hit" in the running app.
         t.open_preview(f2.path()).unwrap();
-        let active = t.editors.iter().find(|e| e.path.as_deref() == Some(f2.path())).unwrap();
+        let active = t
+            .editors
+            .iter()
+            .find(|e| e.path.as_deref() == Some(f2.path()))
+            .unwrap();
         assert_eq!(
             active.search_highlight.as_deref(),
             Some("needle"),
@@ -3957,7 +4135,11 @@ mod tests {
             .unwrap();
         assert!(t.close_tab(close_idx));
         t.open_pinned(f3.path()).unwrap();
-        let third = t.editors.iter().find(|e| e.path.as_deref() == Some(f3.path())).unwrap();
+        let third = t
+            .editors
+            .iter()
+            .find(|e| e.path.as_deref() == Some(f3.path()))
+            .unwrap();
         assert_eq!(third.search_highlight.as_deref(), Some("needle"));
     }
 
@@ -4011,7 +4193,12 @@ mod tests {
         let mut e = editor_with("a".repeat(500).as_str());
         e.focused = true;
         // Render once so last_inner / last_gutter_width are populated.
-        let area = Rect { x: 0, y: 0, width: 30, height: 5 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 30,
+            height: 5,
+        };
         let mut buf = ratatui::buffer::Buffer::empty(area);
         (&mut e).render(area, &mut buf);
         let text_width = e
@@ -4036,7 +4223,12 @@ mod tests {
         let mut e = editor_with("ABCDEFGHIJ");
         e.scroll_col = 3;
         e.focused = true;
-        let area = Rect { x: 0, y: 0, width: 30, height: 5 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 30,
+            height: 5,
+        };
         let mut buf = ratatui::buffer::Buffer::empty(area);
         (&mut e).render(area, &mut buf);
         let text_x = e.last_inner.x + e.last_gutter_width + 1;
@@ -4057,7 +4249,12 @@ mod tests {
         e.extend_selection_to_cursor();
         e.focused = true;
 
-        let area = Rect { x: 0, y: 0, width: 30, height: 5 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 30,
+            height: 5,
+        };
         let mut buf = Buffer::empty(area);
         (&mut e).render(area, &mut buf);
 
@@ -4089,7 +4286,12 @@ mod tests {
         e.extend_selection_to_cursor();
         e.focused = true;
 
-        let area = Rect { x: 0, y: 0, width: 30, height: 6 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 30,
+            height: 6,
+        };
         let mut buf = Buffer::empty(area);
         (&mut e).render(area, &mut buf);
 
@@ -4100,7 +4302,11 @@ mod tests {
         let row0_y = e.last_inner.y;
         assert_eq!(buf[(text_x + 2, row0_y)].bg, selected_bg, "row 0 col 2");
         assert_eq!(buf[(text_x + 4, row0_y)].bg, selected_bg, "row 0 col 4");
-        assert_ne!(buf[(text_x, row0_y)].bg, selected_bg, "row 0 col 0 not selected");
+        assert_ne!(
+            buf[(text_x, row0_y)].bg,
+            selected_bg,
+            "row 0 col 0 not selected"
+        );
 
         // Row 1 (full line "second"): all cells in selection
         let row1_y = e.last_inner.y + 1;
@@ -4111,13 +4317,22 @@ mod tests {
         let row2_y = e.last_inner.y + 2;
         assert_eq!(buf[(text_x, row2_y)].bg, selected_bg, "row 2 col 0");
         assert_eq!(buf[(text_x + 1, row2_y)].bg, selected_bg, "row 2 col 1");
-        assert_ne!(buf[(text_x + 2, row2_y)].bg, selected_bg, "row 2 col 2 not selected");
+        assert_ne!(
+            buf[(text_x + 2, row2_y)].bg,
+            selected_bg,
+            "row 2 col 2 not selected"
+        );
     }
 
     #[test]
     fn double_click_selects_word_and_moves_cursor_to_end() {
         let mut e = editor_with("hello world");
-        e.last_inner = Rect { x: 0, y: 0, width: 80, height: 25 };
+        e.last_inner = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 25,
+        };
         e.last_gutter_width = 2;
         let text_x: u16 = 3;
         e.select_word_at(text_x + 7, 0);
@@ -4129,7 +4344,12 @@ mod tests {
     #[test]
     fn double_click_on_first_word_selects_it_from_column_zero() {
         let mut e = editor_with("foo bar");
-        e.last_inner = Rect { x: 0, y: 0, width: 80, height: 25 };
+        e.last_inner = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 25,
+        };
         e.last_gutter_width = 2;
         let text_x: u16 = 3;
         e.select_word_at(text_x + 1, 0);
@@ -4141,7 +4361,12 @@ mod tests {
     #[test]
     fn double_click_on_whitespace_does_not_create_a_selection() {
         let mut e = editor_with("hello world");
-        e.last_inner = Rect { x: 0, y: 0, width: 80, height: 25 };
+        e.last_inner = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 25,
+        };
         e.last_gutter_width = 2;
         let text_x: u16 = 3;
         e.select_word_at(text_x + 5, 0);
@@ -4154,7 +4379,12 @@ mod tests {
     #[test]
     fn double_click_past_end_of_line_extends_last_word() {
         let mut e = editor_with("foo");
-        e.last_inner = Rect { x: 0, y: 0, width: 80, height: 25 };
+        e.last_inner = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 25,
+        };
         e.last_gutter_width = 2;
         let text_x: u16 = 3;
         e.select_word_at(text_x + 12, 0);
@@ -4215,7 +4445,10 @@ mod tests {
     fn editor_tabs_close_last_tab_resets_buffer_to_blank() {
         let mut t = EditorTabs::new();
         t.editors[0].path = Some(std::path::PathBuf::from("/a"));
-        assert!(t.close_active(), "closing the only tab resets it instead of refusing");
+        assert!(
+            t.close_active(),
+            "closing the only tab resets it instead of refusing"
+        );
         assert_eq!(t.tab_count(), 1);
         assert!(t.path.is_none());
     }
@@ -4226,10 +4459,17 @@ mod tests {
         let mut t = EditorTabs::new();
         t.editors[0].path = Some(std::path::PathBuf::from("/foo.rs"));
         t.add_tab_with_path(std::path::PathBuf::from("/bar.rs"));
-        let area = Rect { x: 0, y: 0, width: 80, height: 10 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 10,
+        };
         let mut buf = Buffer::empty(area);
         (&mut t).render(area, &mut buf);
-        let cx0 = t.close_screen_x(0).expect("tab 0 has a close button when count > 1");
+        let cx0 = t
+            .close_screen_x(0)
+            .expect("tab 0 has a close button when count > 1");
         let cx1 = t.close_screen_x(1).expect("tab 1 has a close button");
         assert_eq!(t.close_at(cx0, area.y), Some(0));
         assert_eq!(t.close_at(cx1, area.y), Some(1));
@@ -4347,7 +4587,12 @@ mod tests {
         use ratatui::buffer::Buffer;
         let mut t = EditorTabs::new();
         t.editors[0].path = Some(std::path::PathBuf::from("/only.rs"));
-        let area = Rect { x: 0, y: 0, width: 60, height: 5 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 5,
+        };
         let mut buf = Buffer::empty(area);
         (&mut t).render(area, &mut buf);
         let close_x = t.close_screen_x(0).expect("single tab still shows X");
@@ -4360,7 +4605,12 @@ mod tests {
         let mut t = EditorTabs::new();
         t.editors[0].path = Some(std::path::PathBuf::from("/long_name.rs"));
         t.add_tab_with_path(std::path::PathBuf::from("/b.rs"));
-        let area = Rect { x: 0, y: 0, width: 60, height: 10 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 10,
+        };
         let mut buf = Buffer::empty(area);
         (&mut t).render(area, &mut buf);
         let first = t.tab_screen_x(0).expect("tab 0 laid out");
@@ -4416,7 +4666,10 @@ mod tests {
         write!(f, "hello").unwrap();
         t.open_pinned(f.path()).unwrap();
         assert_eq!(t.tab_count(), 1, "blank initial tab must be reused");
-        assert!(t.preview_index().is_none(), "pinned open must not leave preview state");
+        assert!(
+            t.preview_index().is_none(),
+            "pinned open must not leave preview state"
+        );
     }
 
     #[test]
@@ -4426,11 +4679,11 @@ mod tests {
         write!(f1, "a").unwrap();
         let mut f2 = NamedTempFile::new().unwrap();
         write!(f2, "b").unwrap();
-        t.open_preview(f1.path()).unwrap();   // preview slot = f1, only tab
-        t.pin_active();                       // f1 pinned
-        t.open_preview(f2.path()).unwrap();   // preview tab for f2 alongside pinned f1
+        t.open_preview(f1.path()).unwrap(); // preview slot = f1, only tab
+        t.pin_active(); // f1 pinned
+        t.open_preview(f2.path()).unwrap(); // preview tab for f2 alongside pinned f1
         assert_eq!(t.tab_count(), 2);
-        t.open_preview(f1.path()).unwrap();   // back to f1 → stale f2 preview must vanish
+        t.open_preview(f1.path()).unwrap(); // back to f1 → stale f2 preview must vanish
         assert_eq!(t.tab_count(), 1);
         assert!(t.preview_index().is_none());
         assert_eq!(t.path.as_deref(), Some(f1.path()));
@@ -4443,7 +4696,10 @@ mod tests {
         t.add_preview_tab_with_path(std::path::PathBuf::from("/b"));
         assert_eq!(t.preview_index(), Some(1));
         t.pin_active();
-        assert!(t.preview_index().is_none(), "no tab should be in preview state");
+        assert!(
+            t.preview_index().is_none(),
+            "no tab should be in preview state"
+        );
         assert!(!t.editors[1].preview);
     }
 
@@ -4472,7 +4728,12 @@ mod tests {
     #[test]
     fn mouse_drag_extends_selection() {
         let mut e = editor_with("hello world");
-        e.last_inner = Rect { x: 0, y: 0, width: 80, height: 25 };
+        e.last_inner = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 25,
+        };
         e.last_gutter_width = 2;
         let text_x: u16 = 3;
         e.mouse_down(text_x + 0, 0);
@@ -4575,7 +4836,9 @@ impl Widget for &mut Editor {
         }
         let scrollbar_width = u16::from(scrollbar_metrics.is_some());
         let text_x = inner.x + gutter_width + 1;
-        let text_width = inner.width.saturating_sub(gutter_width + 2 + scrollbar_width);
+        let text_width = inner
+            .width
+            .saturating_sub(gutter_width + 2 + scrollbar_width);
 
         let sel_norm = self
             .selection
@@ -4585,7 +4848,11 @@ impl Widget for &mut Editor {
         let end = (self.scroll + height).min(self.lines.len());
         for (row_idx, line_idx) in (self.scroll..end).enumerate() {
             let y = inner.y + row_idx as u16;
-            let line_no = format!("{:>width$} ", line_idx + 1, width = gutter_width as usize - 1);
+            let line_no = format!(
+                "{:>width$} ",
+                line_idx + 1,
+                width = gutter_width as usize - 1
+            );
             let gutter = Line::from(Span::styled(line_no, Style::default().fg(Color::DarkGray)));
             buf.set_line(inner.x, y, &gutter, gutter_width);
 
@@ -4626,11 +4893,7 @@ impl Widget for &mut Editor {
                     let row_start = if line_idx == sr { sc } else { 0 };
                     // For non-final selected rows, paint past the line content
                     // by one cell to make the trailing newline visible.
-                    let row_end = if line_idx == er {
-                        ec
-                    } else {
-                        line_chars + 1
-                    };
+                    let row_end = if line_idx == er { ec } else { line_chars + 1 };
                     let visible_start = row_start.saturating_sub(self.scroll_col);
                     let visible_end = row_end.saturating_sub(self.scroll_col);
                     if visible_end > visible_start {
@@ -4728,9 +4991,13 @@ fn paint_search_highlight(
     for (chunk, is_match) in segments {
         let chunk_cols = chunk.chars().count();
         if is_match {
-            let is_active = active_match_on_line
-                .is_some_and(|(c, l)| c == abs_col && l == chunk_cols);
-            let style = if is_active { active_style } else { inactive_style };
+            let is_active =
+                active_match_on_line.is_some_and(|(c, l)| c == abs_col && l == chunk_cols);
+            let style = if is_active {
+                active_style
+            } else {
+                inactive_style
+            };
             for c in 0..chunk_cols {
                 let absolute = abs_col + c;
                 if absolute < scroll_col {
@@ -5024,9 +5291,7 @@ impl EditorTabs {
         if row != self.tab_strip_y {
             return None;
         }
-        self.tab_close_x
-            .iter()
-            .position(|&x| x != 0 && x == col)
+        self.tab_close_x.iter().position(|&x| x != 0 && x == col)
     }
 
     /// Index of the first tab whose `path` matches `target` either by
@@ -5036,7 +5301,9 @@ impl EditorTabs {
     pub fn find_tab_with_path(&self, target: &Path) -> Option<usize> {
         let canon_target = target.canonicalize().ok();
         self.editors.iter().position(|e| {
-            let Some(p) = e.path.as_ref() else { return false };
+            let Some(p) = e.path.as_ref() else {
+                return false;
+            };
             if p == target {
                 return true;
             }
@@ -5116,14 +5383,12 @@ impl EditorTabs {
     /// text-rendering path are all bypassed via the `diff: Some(...)` flag
     /// on the underlying Editor.
     pub fn open_diff(&mut self, left: &Path, right: &Path) -> Result<()> {
-        let left_text = std::fs::read_to_string(left)
-            .with_context(|| format!("reading {}", left.display()))?;
+        let left_text =
+            std::fs::read_to_string(left).with_context(|| format!("reading {}", left.display()))?;
         let right_text = std::fs::read_to_string(right)
             .with_context(|| format!("reading {}", right.display()))?;
-        let left_lines: Vec<String> =
-            left_text.lines().map(str::to_string).collect();
-        let right_lines: Vec<String> =
-            right_text.lines().map(str::to_string).collect();
+        let left_lines: Vec<String> = left_text.lines().map(str::to_string).collect();
+        let right_lines: Vec<String> = right_text.lines().map(str::to_string).collect();
         let data = crate::widgets::diff::DiffData::build(
             left.to_path_buf(),
             right.to_path_buf(),
@@ -5210,15 +5475,9 @@ impl EditorTabs {
     /// label in the diff header and as the tab dedup key so repeated
     /// clicks on the same Source-Control row reuse the tab rather than
     /// stacking new ones.
-    pub fn open_deleted_diff_with_text(
-        &mut self,
-        path: &Path,
-        head_text: &str,
-    ) -> Result<()> {
-        let data = crate::widgets::diff::DiffData::build_unified_deletion(
-            path.to_path_buf(),
-            head_text,
-        );
+    pub fn open_deleted_diff_with_text(&mut self, path: &Path, head_text: &str) -> Result<()> {
+        let data =
+            crate::widgets::diff::DiffData::build_unified_deletion(path.to_path_buf(), head_text);
         let mut e = Editor::new();
         e.focused = self.editors[self.active].focused;
         e.preview = false;
@@ -5394,7 +5653,12 @@ impl Widget for &mut EditorTabs {
             return;
         }
         let strip_h: u16 = 1;
-        let strip = Rect { x: area.x, y: area.y, width: area.width, height: strip_h };
+        let strip = Rect {
+            x: area.x,
+            y: area.y,
+            width: area.width,
+            height: strip_h,
+        };
         let body = Rect {
             x: area.x,
             y: area.y + strip_h,
@@ -5420,15 +5684,25 @@ impl Widget for &mut EditorTabs {
             let label_chars = label_text.chars().count() as u16;
             let pad: u16 = 1;
             let close_pad: u16 = 2;
-            let width = label_chars.saturating_add(pad * 2).saturating_add(close_pad);
+            let width = label_chars
+                .saturating_add(pad * 2)
+                .saturating_add(close_pad);
             if cursor_x.saturating_add(width) > strip.x + strip.width {
                 self.tab_screen_ranges.push((cursor_x, 0));
                 self.tab_close_x.push(0);
                 continue;
             }
             let is_active = i == active;
-            let bg = if is_active { TAB_ACTIVE_BG } else { TAB_INACTIVE_BG };
-            let fg = if is_active { TAB_ACTIVE_FG } else { TAB_INACTIVE_FG };
+            let bg = if is_active {
+                TAB_ACTIVE_BG
+            } else {
+                TAB_INACTIVE_BG
+            };
+            let fg = if is_active {
+                TAB_ACTIVE_FG
+            } else {
+                TAB_INACTIVE_FG
+            };
             let mut modifiers = Modifier::empty();
             if is_active {
                 modifiers |= Modifier::BOLD;
