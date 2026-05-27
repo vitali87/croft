@@ -103,6 +103,38 @@ fn tint_rgba(src: &RgbaImage, tint: Rgba<u8>) -> RgbaImage {
     out
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InlineImageProtocol {
+    ITerm2,
+    Kitty,
+    None,
+}
+
+pub fn inline_image_protocol_for(
+    term_program: Option<&str>,
+    term: Option<&str>,
+) -> InlineImageProtocol {
+    match term_program {
+        Some("iTerm.app") | Some("WezTerm") => InlineImageProtocol::ITerm2,
+        Some("ghostty") => InlineImageProtocol::Kitty,
+        _ if term.is_some_and(|t| t.contains("kitty")) => InlineImageProtocol::Kitty,
+        _ => InlineImageProtocol::None,
+    }
+}
+
+pub fn detect_inline_image_protocol() -> InlineImageProtocol {
+    let term_program = std::env::var("TERM_PROGRAM").ok();
+    let term = std::env::var("TERM").ok();
+    let protocol = inline_image_protocol_for(term_program.as_deref(), term.as_deref());
+    if protocol != InlineImageProtocol::None {
+        return protocol;
+    }
+    if force_inline_images(std::env::var("CROFT_FORCE_INLINE_IMAGES").ok().as_deref()) {
+        return InlineImageProtocol::ITerm2;
+    }
+    InlineImageProtocol::None
+}
+
 pub fn is_iterm2_term_program(value: Option<&str>) -> bool {
     matches!(value, Some("iTerm.app") | Some("WezTerm") | Some("ghostty"))
 }
@@ -185,6 +217,42 @@ pub fn build_inline_image_osc(
     format!(
         "\x1b]1337;File=inline=1;size={size};width={width_cells};height={height_cells};preserveAspectRatio={aspect}:{b64}\x07"
     )
+}
+
+pub fn build_inline_image_kitty(
+    png: &[u8],
+    width_cells: u16,
+    height_cells: u16,
+    image_id: u32,
+) -> String {
+    let b64 = base64::engine::general_purpose::STANDARD.encode(png);
+    let len = b64.len();
+    let mut out = String::with_capacity(len + 64);
+    let mut start = 0usize;
+    let mut first = true;
+    loop {
+        let end = (start + 4096).min(len);
+        let more = u8::from(end < len);
+        if first {
+            out.push_str(&format!(
+                "\x1b_Gf=100,a=T,c={width_cells},r={height_cells},C=1,q=2,i={image_id},m={more};"
+            ));
+            first = false;
+        } else {
+            out.push_str(&format!("\x1b_Gm={more};"));
+        }
+        out.push_str(&b64[start..end]);
+        out.push_str("\x1b\\");
+        start = end;
+        if start >= len {
+            break;
+        }
+    }
+    out
+}
+
+pub fn delete_kitty_image(image_id: u32) -> String {
+    format!("\x1b_Ga=d,d=i,i={image_id},q=2\x1b\\")
 }
 
 pub fn tmux_passthrough_wrap(seq: &str) -> String {
@@ -449,5 +517,115 @@ mod tests {
             wrapped.contains("\x1b\x1b]1337"),
             "inner ESC must be doubled"
         );
+    }
+
+    #[test]
+    fn kitty_graphics_starts_with_apc_introducer() {
+        let seq = build_inline_image_kitty(b"PNGDATA", 4, 3, 7);
+        assert!(seq.starts_with("\x1b_G"), "wrong prefix: {seq:?}");
+    }
+
+    #[test]
+    fn kitty_graphics_terminates_with_st() {
+        let seq = build_inline_image_kitty(b"PNGDATA", 4, 3, 7);
+        assert!(seq.ends_with("\x1b\\"), "must end with ST: {seq:?}");
+    }
+
+    #[test]
+    fn kitty_first_chunk_carries_png_format_action_and_cells() {
+        let seq = build_inline_image_kitty(b"PNGDATA", 4, 3, 7);
+        assert!(seq.contains("f=100"), "PNG format: {seq:?}");
+        assert!(seq.contains("a=T"), "transmit+display: {seq:?}");
+        assert!(seq.contains("c=4"), "width in cells: {seq:?}");
+        assert!(seq.contains("r=3"), "height in cells: {seq:?}");
+        assert!(seq.contains("i=7"), "image id: {seq:?}");
+    }
+
+    #[test]
+    fn kitty_sets_cursor_and_response_suppression_flags() {
+        let seq = build_inline_image_kitty(b"PNGDATA", 4, 3, 7);
+        assert!(seq.contains("C=1"), "cursor must not advance: {seq:?}");
+        assert!(seq.contains("q=2"), "responses must be suppressed: {seq:?}");
+    }
+
+    #[test]
+    fn kitty_payload_is_base64_encoded_png() {
+        let seq = build_inline_image_kitty(b"PNGDATA", 4, 3, 7);
+        assert!(
+            seq.contains(";UE5HREFUQQ=="),
+            "expected base64 payload after the control-data semicolon: {seq:?}"
+        );
+    }
+
+    #[test]
+    fn kitty_chunks_payload_larger_than_4096_base64_bytes() {
+        let png = vec![0xABu8; 4000];
+        let seq = build_inline_image_kitty(&png, 4, 3, 7);
+        let chunks: Vec<&str> = seq.split("\x1b\\").filter(|s| !s.is_empty()).collect();
+        assert!(chunks.len() >= 2, "4000 raw bytes must span >1 chunk, got {}", chunks.len());
+        assert!(
+            chunks[0].contains("m=1") && chunks[0].contains("f=100"),
+            "first chunk carries full control data and m=1: {:?}",
+            chunks[0]
+        );
+        assert!(
+            chunks.last().unwrap().contains("m=0"),
+            "final chunk must carry m=0: {:?}",
+            chunks.last().unwrap()
+        );
+        for mid in &chunks[1..chunks.len() - 1] {
+            assert!(
+                mid.contains("m=1") && !mid.contains("f=100"),
+                "middle chunks carry only m=, no repeated control data: {mid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn iterm2_and_wezterm_speak_the_iterm2_protocol() {
+        assert_eq!(
+            inline_image_protocol_for(Some("iTerm.app"), None),
+            InlineImageProtocol::ITerm2
+        );
+        assert_eq!(
+            inline_image_protocol_for(Some("WezTerm"), None),
+            InlineImageProtocol::ITerm2
+        );
+    }
+
+    #[test]
+    fn ghostty_speaks_the_kitty_protocol_not_iterm2() {
+        assert_eq!(
+            inline_image_protocol_for(Some("ghostty"), None),
+            InlineImageProtocol::Kitty
+        );
+    }
+
+    #[test]
+    fn kitty_term_is_detected_via_term_env() {
+        assert_eq!(
+            inline_image_protocol_for(None, Some("xterm-kitty")),
+            InlineImageProtocol::Kitty
+        );
+    }
+
+    #[test]
+    fn apple_terminal_and_unknown_have_no_inline_protocol() {
+        assert_eq!(
+            inline_image_protocol_for(Some("Apple_Terminal"), Some("xterm-256color")),
+            InlineImageProtocol::None
+        );
+        assert_eq!(inline_image_protocol_for(None, None), InlineImageProtocol::None);
+    }
+
+    #[test]
+    fn delete_kitty_image_deletes_by_id_quietly() {
+        let seq = delete_kitty_image(7);
+        assert!(seq.starts_with("\x1b_G"), "APC prefix: {seq:?}");
+        assert!(seq.ends_with("\x1b\\"), "ST terminator: {seq:?}");
+        assert!(seq.contains("a=d"), "delete action: {seq:?}");
+        assert!(seq.contains("d=i"), "delete by id selector: {seq:?}");
+        assert!(seq.contains("i=7"), "target id: {seq:?}");
+        assert!(seq.contains("q=2"), "delete must be quiet too: {seq:?}");
     }
 }
