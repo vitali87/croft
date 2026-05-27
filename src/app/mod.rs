@@ -773,23 +773,6 @@ pub struct App {
     /// every render so a splitter drag can clamp to the live viewport.
     last_content_width: u16,
     last_content_height: u16,
-    /// Pre-encoded OSC-1337 escape carrying a fitted PNG of the active
-    /// image-preview tab. Re-baked when the tab path or its target cell
-    /// rect changes; emitted post-frame the same way the welcome wordmark
-    /// is. None when the active tab is text.
-    editor_image_osc: Option<String>,
-    /// Cell rectangle the OSC was last baked at: (x, y, w, h, path-key).
-    /// Drives the "needs re-bake" check and tells the post-frame writer
-    /// where to position the cursor before sending the escape.
-    editor_image_layout: Option<EditorImageLayout>,
-    /// True from the moment we send the OSC bytes to iTerm until we
-    /// explicitly clear them; gates the redraw-clearing so we don't keep
-    /// re-emitting the same image every tick.
-    editor_image_displayed: bool,
-    /// One-shot request to wipe the cached image cells (set when the user
-    /// switches to a non-image tab, closes the image, or the editor area
-    /// shrinks).
-    editor_image_clear_requested: bool,
     /// Optional LSP orchestrator. None when LspManager::new failed at
     /// startup (e.g. the background tokio runtime couldn't spawn); the
     /// rest of the editor stays fully functional without it.
@@ -1333,10 +1316,6 @@ impl App {
             last_activity_overlay_emit: None,
             last_content_width: 0,
             last_content_height: 0,
-            editor_image_osc: None,
-            editor_image_layout: None,
-            editor_image_displayed: false,
-            editor_image_clear_requested: false,
             lsp: match crate::lsp::LspManager::new(root.clone()) {
                 Ok(m) => Some(m),
                 Err(e) => {
@@ -5266,7 +5245,7 @@ impl App {
                     };
                     if stepped {
                         // Force the OSC overlay to re-bake on next render.
-                        self.editor_image_layout = None;
+                        self.overlays.editor.invalidate_layout();
                     }
                 }
             }
@@ -6259,7 +6238,7 @@ impl App {
             self.activity_overlay_dirty = true;
             self.welcome_overlay_dirty = true;
             self.no_repo_hero_overlay_dirty = true;
-            self.editor_image_layout = None;
+            self.overlays.editor.invalidate_layout();
             self.status.clear();
         }
     }
@@ -6358,7 +6337,7 @@ impl App {
             self.activity_overlay_dirty = true;
             self.welcome_overlay_dirty = true;
             self.no_repo_hero_overlay_dirty = true;
-            self.editor_image_layout = None;
+            self.overlays.editor.invalidate_layout();
             self.status.clear();
         }
     }
@@ -7956,12 +7935,10 @@ impl App {
             cell_h,
             path,
         };
-        if self.editor_image_layout.as_ref() == Some(&desired) {
+        if self.overlays.editor.layout_matches(&desired) {
             return;
         }
-        if self.editor_image_displayed {
-            self.editor_image_clear_requested = true;
-        }
+        self.overlays.editor.request_clear_if_displayed();
         let canvas_w = cell_w as u32 * cw_px;
         let canvas_h = cell_h as u32 * ch_px;
         let bg = image::Rgba([EDITOR_BG_RGB.0, EDITOR_BG_RGB.1, EDITOR_BG_RGB.2, 0xff]);
@@ -7974,17 +7951,12 @@ impl App {
             } else {
                 raw
             };
-            self.editor_image_osc = Some(osc);
-            self.editor_image_layout = Some(desired);
+            self.overlays.editor.set(osc, desired);
         }
     }
 
     fn disable_editor_image(&mut self) {
-        if self.editor_image_displayed {
-            self.editor_image_clear_requested = true;
-        }
-        self.editor_image_osc = None;
-        self.editor_image_layout = None;
+        self.overlays.editor.disable();
     }
 
     /// Returns true if the cached editor-image cells need to be repainted
@@ -7992,25 +7964,18 @@ impl App {
     /// the image, or the layout changed). Called from the main loop to
     /// force a full redraw before re-emitting.
     pub fn consume_editor_image_clear(&mut self) -> bool {
-        if self.editor_image_clear_requested {
-            self.editor_image_clear_requested = false;
-            self.editor_image_displayed = false;
-            return true;
-        }
-        false
+        self.overlays.editor.consume_clear()
     }
 
     pub fn editor_image_payload(&self) -> Option<(&str, &EditorImageLayout)> {
         if self.shortcuts_modal.is_some() || self.file_finder.is_some() {
             return None;
         }
-        let osc = self.editor_image_osc.as_deref()?;
-        let layout = self.editor_image_layout.as_ref()?;
-        Some((osc, layout))
+        self.overlays.editor.payload()
     }
 
     pub fn mark_editor_image_displayed(&mut self) {
-        self.editor_image_displayed = true;
+        self.overlays.editor.mark_displayed();
     }
 
     /// Keyboard navigation for spreadsheet preview tabs. All gestures are

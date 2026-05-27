@@ -7416,21 +7416,23 @@ fn closing_image_tab_requests_overlay_clear_on_next_render() {
     // for clearing so the main loop wipes the screen.
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app.editor_image_displayed = true;
-    app.editor_image_osc = Some(String::from("dummy-osc"));
-    app.editor_image_layout = Some(EditorImageLayout {
-        cell_x: 0,
-        cell_y: 0,
-        cell_w: 10,
-        cell_h: 10,
-        path: tmp.path().join("doomed.png"),
-    });
+    app.overlays.editor.set_test_state(
+        Some(String::from("dummy-osc")),
+        Some(EditorImageLayout {
+            cell_x: 0,
+            cell_y: 0,
+            cell_w: 10,
+            cell_h: 10,
+            path: tmp.path().join("doomed.png"),
+        }),
+        true,
+    );
     // Editor is blank-initial right after construction, so calling
     // disable_editor_image directly mimics what render() does on
     // the welcome branch.
     app.disable_editor_image();
-    assert!(app.editor_image_osc.is_none());
-    assert!(app.editor_image_layout.is_none());
+    assert!(app.overlays.editor.image_is_none());
+    assert!(app.overlays.editor.layout_is_none());
     assert!(
         app.consume_editor_image_clear(),
         "first call must report a pending clear"
