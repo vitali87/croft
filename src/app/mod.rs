@@ -22,7 +22,9 @@ use std::io::{Stdout, stdout};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+mod click;
 mod perf_hud;
+use click::ClickTracker;
 use perf_hud::PerfHud;
 
 use crate::widgets::{
@@ -655,21 +657,9 @@ pub struct App {
     /// stamping blanks at the old cell pair the logo "ghosts" mid-screen
     /// when the welcome layout shifts.
     welcome_codeberg_badge_last_emitted: Option<(u16, u16)>,
-    /// Last mouse-down on the editor pane: `(when, column, row)`. Used to
-    /// detect a double-click as two left-down events at the same cell within
-    /// `DOUBLE_CLICK_WINDOW`. Cleared when the next click lands elsewhere or
-    /// after the double-click fires.
-    last_editor_left_down: Option<(std::time::Instant, u16, u16)>,
-    /// Same idea as `last_editor_left_down` but for the file-tree pane.
-    /// Double-click on a tree row (within `DOUBLE_CLICK_WINDOW`) opens the
-    /// file in a new editor tab and moves focus to it; a single click keeps
-    /// the existing preview-style behaviour (replace active tab, keep tree
-    /// focused).
-    last_tree_left_down: Option<(std::time::Instant, u16, u16)>,
-    /// Same idea as `last_editor_left_down` but for the terminal pane:
-    /// two left-downs at the same cell within `DOUBLE_CLICK_WINDOW`
-    /// trigger word-select via `PtyTerminal::select_word_at`.
-    last_terminal_left_down: Option<(std::time::Instant, u16, u16)>,
+    editor_click: ClickTracker,
+    tree_click: ClickTracker,
+    terminal_click: ClickTracker,
     /// Pane whose scrollbar is currently being dragged with the left mouse button.
     scrollbar_drag: Option<Pane>,
     /// True when the activity-bar OSC-1337 images need to be (re)written on
@@ -1021,8 +1011,6 @@ struct WelcomeLink {
     url: String,
     label: String,
 }
-
-const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(500);
 
 type FsWatcherInit = (
     notify_debouncer_full::Debouncer<
@@ -1408,9 +1396,9 @@ impl App {
             run_debug_image_clear_requested: false,
             welcome_codeberg_badge_cell: None,
             welcome_codeberg_badge_last_emitted: None,
-            last_editor_left_down: None,
-            last_tree_left_down: None,
-            last_terminal_left_down: None,
+            editor_click: ClickTracker::default(),
+            tree_click: ClickTracker::default(),
+            terminal_click: ClickTracker::default(),
             scrollbar_drag: None,
             activity_overlay_dirty: true,
             recent_repo_remote,
@@ -7372,10 +7360,10 @@ impl App {
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 if !in_editor {
-                    self.last_editor_left_down = None;
+                    self.editor_click.clear();
                 }
                 if !in_tree {
-                    self.last_tree_left_down = None;
+                    self.tree_click.clear();
                 }
                 // Splitter hit-test runs before everything else: clicking the
                 // single-column seam between sidebar and editor (or the
@@ -7487,28 +7475,28 @@ impl App {
                     self.focus_pane(Pane::Tree);
                     self.tree.scroll_to_bar_y(m.row);
                     self.scrollbar_drag = Some(Pane::Tree);
-                    self.last_tree_left_down = None;
+                    self.tree_click.clear();
                     return;
                 }
                 if in_remote_scrollbar {
                     self.focus_pane(Pane::Tree);
                     self.remote.scroll_to_bar_y(m.row);
                     self.scrollbar_drag = Some(Pane::Tree);
-                    self.last_tree_left_down = None;
+                    self.tree_click.clear();
                     return;
                 }
                 if in_search_scrollbar {
                     self.focus_pane(Pane::Tree);
                     self.search.scroll_to_bar_y(m.row);
                     self.scrollbar_drag = Some(Pane::Tree);
-                    self.last_tree_left_down = None;
+                    self.tree_click.clear();
                     return;
                 }
                 if in_editor_scrollbar {
                     self.focus_pane(Pane::Editor);
                     self.editor.scroll_to_bar_y(m.row);
                     self.scrollbar_drag = Some(Pane::Editor);
-                    self.last_editor_left_down = None;
+                    self.editor_click.clear();
                     self.poke_cursor();
                     return;
                 }
@@ -7629,20 +7617,14 @@ impl App {
                     if let Some(idx) = self.remote.target_at_y(m.row) {
                         self.remote.select(idx);
                         let now = std::time::Instant::now();
-                        let is_double = matches!(
-                            self.last_tree_left_down,
-                            Some((t, x, y))
-                                if m.row == y
-                                    && m.column.abs_diff(x) <= 1
-                                    && now.duration_since(t) <= DOUBLE_CLICK_WINDOW
-                        );
+                        let is_double = self.tree_click.is_double(now, m.column, m.row);
                         if is_double {
                             if let Some(target) = self.remote.selected_target().cloned() {
                                 self.request_remote_launch(target.alias, None);
                             }
-                            self.last_tree_left_down = None;
+                            self.tree_click.clear();
                         } else {
-                            self.last_tree_left_down = Some((now, m.column, m.row));
+                            self.tree_click.record(now, m.column, m.row);
                         }
                     }
                     return;
@@ -7651,13 +7633,7 @@ impl App {
                     self.focus_pane(Pane::Tree);
                     if let Some(idx) = self.tree.node_at_y(m.row) {
                         let now = std::time::Instant::now();
-                        let is_double = matches!(
-                            self.last_tree_left_down,
-                            Some((t, x, y))
-                                if m.row == y
-                                    && m.column.abs_diff(x) <= 1
-                                    && now.duration_since(t) <= DOUBLE_CLICK_WINDOW
-                        );
+                        let is_double = self.tree_click.is_double(now, m.column, m.row);
                         let has_shift = m.modifiers.contains(KeyModifiers::SHIFT);
                         // macOS terminals (iTerm2, Terminal.app) never put the
                         // Cmd bit on mouse events — the SGR mouse encoding only
@@ -7670,7 +7646,7 @@ impl App {
                         // activation, no drag.
                         if has_shift {
                             self.tree.extend_to(idx);
-                            self.last_tree_left_down = None;
+                            self.tree_click.clear();
                             self.tree_drag = None;
                             return;
                         }
@@ -7680,7 +7656,7 @@ impl App {
                         // open, no folder toggle) and don't include the row
                         // in the multi-selection yet.
                         if has_toggle_mod {
-                            self.last_tree_left_down = None;
+                            self.tree_click.clear();
                             let mut drag_paths = self.tree.action_paths();
                             let path_clicked = self.tree.nodes[idx].path.clone();
                             if !drag_paths.iter().any(|p| p == &path_clicked) {
@@ -7710,7 +7686,7 @@ impl App {
                         let clicked_is_dir =
                             self.tree.nodes.get(idx).is_some_and(|node| node.is_dir);
                         if clicked_is_dir && is_double {
-                            self.last_tree_left_down = None;
+                            self.tree_click.clear();
                             self.tree_drag = None;
                             return;
                         }
@@ -7747,9 +7723,9 @@ impl App {
                             }
                         }
                         if is_double {
-                            self.last_tree_left_down = None;
+                            self.tree_click.clear();
                         } else {
-                            self.last_tree_left_down = Some((now, m.column, m.row));
+                            self.tree_click.record(now, m.column, m.row);
                         }
                     }
                 } else if in_editor_pane && !in_editor {
@@ -7782,13 +7758,7 @@ impl App {
                             return;
                         }
                         let now = std::time::Instant::now();
-                        let is_double = matches!(
-                            self.last_editor_left_down,
-                            Some((t, x, y))
-                                if m.row == y
-                                    && m.column.abs_diff(x) <= 1
-                                    && now.duration_since(t) <= DOUBLE_CLICK_WINDOW
-                        );
+                        let is_double = self.editor_click.is_double(now, m.column, m.row);
                         let last_inner = self.editor.last_inner;
                         if let Some(diff) = self.editor.diff.as_mut() {
                             if let Some((side, row_idx, char_col)) =
@@ -7805,30 +7775,24 @@ impl App {
                                 diff.clear_selection();
                             }
                         }
-                        self.last_editor_left_down = if is_double {
-                            None
+                        if is_double {
+                            self.editor_click.clear();
                         } else {
-                            Some((now, m.column, m.row))
-                        };
+                            self.editor_click.record(now, m.column, m.row);
+                        }
                         self.poke_cursor();
                         return;
                     }
                     let now = std::time::Instant::now();
-                    let is_double = matches!(
-                        self.last_editor_left_down,
-                        Some((t, x, y))
-                            if m.row == y
-                                && m.column.abs_diff(x) <= 1
-                                && now.duration_since(t) <= DOUBLE_CLICK_WINDOW
-                    );
+                    let is_double = self.editor_click.is_double(now, m.column, m.row);
                     if is_double {
                         self.editor.select_word_at(m.column, m.row);
-                        self.last_editor_left_down = None;
+                        self.editor_click.clear();
                     } else {
                         // Anchor a fresh selection at the click; a drag widens it,
                         // a clean click ends up cleared on mouse-up.
                         self.editor.mouse_down(m.column, m.row);
-                        self.last_editor_left_down = Some((now, m.column, m.row));
+                        self.editor_click.record(now, m.column, m.row);
                     }
                     self.poke_cursor();
                 } else if let Some(idx) = terminal_hit {
@@ -7837,23 +7801,17 @@ impl App {
                     }
                     self.focus_pane(Pane::Terminal);
                     let now = std::time::Instant::now();
-                    let is_double = matches!(
-                        self.last_terminal_left_down,
-                        Some((t, x, y))
-                            if m.row == y
-                                && m.column.abs_diff(x) <= 1
-                                && now.duration_since(t) <= DOUBLE_CLICK_WINDOW
-                    );
+                    let is_double = self.terminal_click.is_double(now, m.column, m.row);
                     if is_double {
                         self.terminal_mut().select_word_at(m.column, m.row);
-                        self.last_terminal_left_down = None;
+                        self.terminal_click.clear();
                     } else {
                         // Begin a fresh selection at the click cell. Without a
                         // drag this is a single cell (no area), so the selection
                         // ends up cleared on mouse-up. With a drag, this is the
                         // selection anchor.
                         self.terminal_mut().start_selection_at(m.column, m.row);
-                        self.last_terminal_left_down = Some((now, m.column, m.row));
+                        self.terminal_click.record(now, m.column, m.row);
                     }
                 }
             }
@@ -7890,21 +7848,9 @@ impl App {
                 // Some terminals emit a Drag at the same cell as the Down even
                 // when the user hasn't actually dragged. Only forget the prior
                 // click when the pointer has truly moved off that cell.
-                if let Some((_, x, y)) = self.last_editor_left_down {
-                    if m.column != x || m.row != y {
-                        self.last_editor_left_down = None;
-                    }
-                }
-                if let Some((_, x, y)) = self.last_tree_left_down {
-                    if m.column != x || m.row != y {
-                        self.last_tree_left_down = None;
-                    }
-                }
-                if let Some((_, x, y)) = self.last_terminal_left_down {
-                    if m.column != x || m.row != y {
-                        self.last_terminal_left_down = None;
-                    }
-                }
+                self.editor_click.clear_if_moved(m.column, m.row);
+                self.tree_click.clear_if_moved(m.column, m.row);
+                self.terminal_click.clear_if_moved(m.column, m.row);
                 if in_editor {
                     if self.editor.diff.is_some() {
                         let last_inner = self.editor.last_inner;
