@@ -775,22 +775,24 @@ fn flush_welcome_codeberg_badge_overlay_tracks_last_emitted_cell_across_resizes(
     // Stub a baked OSC so the flush has something to "emit". The
     // bytes never reach a real terminal in tests — we're checking
     // the bookkeeping, not the wire format.
-    app.welcome_codeberg_badge_osc = Some("\x1b]1337;File=...\x07".to_string());
+    app.overlays
+        .badge
+        .set_image("\x1b]1337;File=...\x07".to_string());
 
     // Initial render of welcome panel: badge anchored at (10, 5).
-    app.welcome_codeberg_badge_cell = Some((10, 5));
+    app.overlays.badge.set_target(Some((10, 5)));
     app.flush_welcome_codeberg_badge_overlay();
     assert_eq!(
-        app.welcome_codeberg_badge_last_emitted,
+        app.overlays.badge.last_emitted(),
         Some((10, 5)),
         "after the first flush the last-emitted cell must match the target cell"
     );
 
     // Simulate a window resize that shifts the welcome panel right.
-    app.welcome_codeberg_badge_cell = Some((20, 8));
+    app.overlays.badge.set_target(Some((20, 8)));
     app.flush_welcome_codeberg_badge_overlay();
     assert_eq!(
-        app.welcome_codeberg_badge_last_emitted,
+        app.overlays.badge.last_emitted(),
         Some((20, 8)),
         "after a resize the last-emitted cell must update to the new target so the next resize knows where to wipe"
     );
@@ -798,7 +800,7 @@ fn flush_welcome_codeberg_badge_overlay_tracks_last_emitted_cell_across_resizes(
     // Repeated flush at the same cell is a no-op for tracking.
     app.flush_welcome_codeberg_badge_overlay();
     assert_eq!(
-        app.welcome_codeberg_badge_last_emitted,
+        app.overlays.badge.last_emitted(),
         Some((20, 8)),
         "re-emitting at the same cell must not change tracking"
     );
@@ -809,10 +811,11 @@ fn flush_welcome_codeberg_badge_overlay_tracks_last_emitted_cell_across_resizes(
     let file = tmp.path().join("README.md");
     std::fs::write(&file, "hi").unwrap();
     app.editor.open_pinned(&file).unwrap();
-    app.welcome_codeberg_badge_cell = None;
+    app.overlays.badge.set_target(None);
     app.flush_welcome_codeberg_badge_overlay();
     assert_eq!(
-        app.welcome_codeberg_badge_last_emitted, None,
+        app.overlays.badge.last_emitted(),
+        None,
         "leaving the welcome panel must clear the last-emitted record so a future welcome render starts fresh"
     );
 }
@@ -823,7 +826,9 @@ fn render_welcome_clears_codeberg_badge_cell_when_recents_box_collapses() {
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.welcome
         .set_test_remote(Some("https://codeberg.org/vitali87/croft".to_string()));
-    app.welcome_codeberg_badge_osc = Some("\x1b]1337;File=...\x07".to_string());
+    app.overlays
+        .badge
+        .set_image("\x1b]1337;File=...\x07".to_string());
 
     let tall = Rect {
         x: 0,
@@ -835,7 +840,7 @@ fn render_welcome_clears_codeberg_badge_cell_when_recents_box_collapses() {
     let mut term = ratatui::Terminal::new(backend).unwrap();
     term.draw(|f| app.render_welcome(f, tall)).unwrap();
     assert!(
-        app.welcome_codeberg_badge_cell.is_some(),
+        app.overlays.badge.target().is_some(),
         "with a tall welcome area the recents box must fit and the badge cell must be set so the flush emits the OSC-1337 image"
     );
 
@@ -849,7 +854,8 @@ fn render_welcome_clears_codeberg_badge_cell_when_recents_box_collapses() {
     let mut term = ratatui::Terminal::new(backend).unwrap();
     term.draw(|f| app.render_welcome(f, tight)).unwrap();
     assert_eq!(
-        app.welcome_codeberg_badge_cell, None,
+        app.overlays.badge.target(),
+        None,
         "when the recents box can't fit, the badge cell must reset to None so the post-draw flush wipes the stale image instead of re-emitting at the prior anchor"
     );
 }
@@ -3891,12 +3897,14 @@ fn leaving_run_debug_after_emitting_the_icon_arms_a_one_shot_terminal_clear() {
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     // Pretend init_graphics succeeded and the panel emitted the icon
     // while the user was on Run-Debug.
-    app.run_debug_icon_osc = Some("\x1b]1337;File=...\x07".to_string());
+    app.overlays
+        .run_debug
+        .set_image("\x1b]1337;File=...\x07".to_string());
     app.set_sidebar_view(SidebarView::RunDebug);
     app.run_debug.last_icon_cell = Some((10, 5));
     app.flush_run_debug_icon_overlay();
     assert!(
-        app.run_debug_icon_last_emitted.is_some(),
+        app.overlays.run_debug.was_emitted(),
         "test setup: the flush must record the emit position"
     );
     // Switch away. The clear flag must be armed so the main loop's
@@ -3922,11 +3930,13 @@ fn flush_run_debug_icon_overlay_is_silent_when_panel_is_not_visible() {
     // by `terminal.clear()` via `consume_run_debug_image_clear`.
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app.run_debug_icon_osc = Some("\x1b]1337;File=...\x07".to_string());
+    app.overlays
+        .run_debug
+        .set_image("\x1b]1337;File=...\x07".to_string());
     app.set_sidebar_view(SidebarView::RunDebug);
     app.run_debug.last_icon_cell = Some((10, 5));
     app.flush_run_debug_icon_overlay();
-    assert_eq!(app.run_debug_icon_last_emitted, Some((10, 5)));
+    assert_eq!(app.overlays.run_debug.last_emitted(), Some((10, 5)));
     // Switch away.
     app.set_sidebar_view(SidebarView::Explorer);
     // The flush in this state must clear last_emitted but emit
@@ -3935,7 +3945,8 @@ fn flush_run_debug_icon_overlay_is_silent_when_panel_is_not_visible() {
     // function returning early before the write_all call).
     app.flush_run_debug_icon_overlay();
     assert_eq!(
-        app.run_debug_icon_last_emitted, None,
+        app.overlays.run_debug.last_emitted(),
+        None,
         "flush on a hidden panel must reset last_emitted so a re-entry primes a fresh emit",
     );
 }

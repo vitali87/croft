@@ -585,43 +585,6 @@ pub struct App {
     /// when the host terminal can't render OSC-1337 (we then fall back to
     /// the codicon glyph rendered inside the same multi-row block).
     activity_images: Option<ActivityBarImages>,
-    /// Pre-encoded OSC-1337 image for the Codeberg "Recent Activity" badge,
-    /// sized to a 2x1 cell rectangle. Painted by the main loop right after
-    /// ratatui flushes the welcome panel, at `welcome_codeberg_badge_cell`.
-    /// `None` when the host terminal lacks OSC-1337 image support.
-    welcome_codeberg_badge_osc: Option<String>,
-    /// Pre-encoded OSC-1337 image of the codicon `debug-alt` glyph sized
-    /// to the run-debug panel's headline icon block. `None` when the host
-    /// terminal lacks OSC-1337 support; the panel falls back to the codicon
-    /// glyph painted directly into ratatui's buffer.
-    run_debug_icon_osc: Option<String>,
-    /// Cell where the run-debug headline image was actually painted on
-    /// the previous post-draw flush. Read by `set_sidebar_view` to decide
-    /// whether the user is leaving Run-Debug after the icon was on
-    /// screen, in which case a one-shot `terminal.clear()` is armed
-    /// to evict iTerm2's cached image cells (plain SGR overwrites do
-    /// not reliably evict OSC-1337 image cells).
-    run_debug_icon_last_emitted: Option<(u16, u16)>,
-    /// One-shot flag: arm a `terminal.clear()` on the next render pass
-    /// when the run-debug headline icon was last emitted but the panel
-    /// is no longer the active sidebar view. Identical pattern to
-    /// `welcome_image_clear_requested` and `editor_image_clear_requested` —
-    /// the main loop folds all three into the same clear+redraw gate
-    /// that nukes iTerm2's image cache. Without this, switching sidebar
-    /// views away from Run-Debug leaves the bug+play picture ghosting
-    /// in the middle of whichever panel comes next.
-    run_debug_image_clear_requested: bool,
-    /// Absolute terminal cell where the Codeberg badge image goes. Recorded
-    /// during welcome render; consumed post-draw. `None` when the welcome
-    /// panel isn't visible or the open repo isn't on Codeberg.
-    welcome_codeberg_badge_cell: Option<(u16, u16)>,
-    /// Cell where the Codeberg badge image was actually painted on the
-    /// previous redraw. Used to wipe the OLD position before re-emitting
-    /// at a new one after a resize: iTerm2's OSC-1337 image cells survive
-    /// `terminal.clear()` and a plain SGR overwrite, so without explicitly
-    /// stamping blanks at the old cell pair the logo "ghosts" mid-screen
-    /// when the welcome layout shifts.
-    welcome_codeberg_badge_last_emitted: Option<(u16, u16)>,
     editor_click: ClickTracker,
     tree_click: ClickTracker,
     terminal_click: ClickTracker,
@@ -1216,12 +1179,6 @@ impl App {
             sysmon,
             cursor_blink: CursorBlink::new(),
             activity_images: None,
-            welcome_codeberg_badge_osc: None,
-            run_debug_icon_osc: None,
-            run_debug_icon_last_emitted: None,
-            run_debug_image_clear_requested: false,
-            welcome_codeberg_badge_cell: None,
-            welcome_codeberg_badge_last_emitted: None,
             editor_click: ClickTracker::default(),
             tree_click: ClickTracker::default(),
             terminal_click: ClickTracker::default(),
@@ -1398,7 +1355,7 @@ impl App {
             icon_bg,
         ) {
             let raw = crate::iterm2_inline::build_inline_image_osc(&baked, 2, 1, false);
-            self.welcome_codeberg_badge_osc = Some(if is_tmux {
+            self.overlays.badge.set_image(if is_tmux {
                 crate::iterm2_inline::tmux_passthrough_wrap(&raw)
             } else {
                 raw
@@ -1427,7 +1384,7 @@ impl App {
                 crate::widgets::run_debug::RUN_DEBUG_ICON_CELLS_H,
                 false,
             );
-            self.run_debug_icon_osc = Some(if is_tmux {
+            self.overlays.run_debug.set_image(if is_tmux {
                 crate::iterm2_inline::tmux_passthrough_wrap(&raw)
             } else {
                 raw
@@ -1486,16 +1443,16 @@ impl App {
         }
         let panel_visible = self.show_tree
             && self.sidebar_view == SidebarView::RunDebug
-            && self.run_debug_icon_osc.is_some();
+            && self.overlays.run_debug.has_image();
         if !panel_visible {
-            self.run_debug_icon_last_emitted = None;
+            self.overlays.run_debug.clear_emitted();
             return;
         }
         let Some((cx, cy)) = self.run_debug.last_icon_cell else {
-            self.run_debug_icon_last_emitted = None;
+            self.overlays.run_debug.clear_emitted();
             return;
         };
-        let Some(osc) = self.run_debug_icon_osc.as_deref() else {
+        let Some(osc) = self.overlays.run_debug.image() else {
             return;
         };
         let mut out = stdout();
@@ -1508,7 +1465,7 @@ impl App {
             let _ = write!(out, "\x1b[?25h");
         }
         let _ = out.flush();
-        self.run_debug_icon_last_emitted = Some((cx, cy));
+        self.overlays.run_debug.mark_emitted_at((cx, cy));
     }
 
     /// Re-bake (when needed) and re-emit the OSC-1337 inline image for
@@ -1631,12 +1588,7 @@ impl App {
     /// chain that fires `terminal.clear()` for the welcome wordmark and
     /// editor preview image.
     pub fn consume_run_debug_image_clear(&mut self) -> bool {
-        if self.run_debug_image_clear_requested {
-            self.run_debug_image_clear_requested = false;
-            true
-        } else {
-            false
-        }
+        self.overlays.run_debug.consume_clear()
     }
 
     /// One-shot consumer for the "leaving Source Control after the no-repo
@@ -1714,58 +1666,47 @@ impl App {
     /// unless we explicitly stamp blanks over it. Idempotent: when the
     /// badge cell hasn't moved we just re-emit at the same position to
     /// outlast iTerm2's image-cache eviction under heavy SGR traffic.
+    fn stamp_blank_pair(&self, px: u16, py: u16) {
+        use std::io::Write;
+        let mut out = stdout();
+        let cursor_on = self.cursor_should_be_visible();
+        let _ = write!(out, "\x1b[?25l\x1b[s");
+        let _ = write!(out, "\x1b[{};{}H  ", py + 1, px + 1);
+        let _ = write!(out, "\x1b[u");
+        if cursor_on {
+            let _ = write!(out, "\x1b[?25h");
+        }
+        let _ = out.flush();
+    }
+
     pub fn flush_welcome_codeberg_badge_overlay(&mut self) {
         use std::io::Write;
         if self.shortcuts_modal.is_some()
             || self.file_finder.is_some()
             || self.connect_dialog.is_some()
         {
-            if let Some((px, py)) = self.welcome_codeberg_badge_last_emitted.take() {
-                let mut out = stdout();
-                let cursor_on = self.cursor_should_be_visible();
-                let _ = write!(out, "\x1b[?25l\x1b[s");
-                let _ = write!(out, "\x1b[{};{}H  ", py + 1, px + 1);
-                let _ = write!(out, "\x1b[u");
-                if cursor_on {
-                    let _ = write!(out, "\x1b[?25h");
-                }
-                let _ = out.flush();
+            if let Some((px, py)) = self.overlays.badge.take_last_emitted() {
+                self.stamp_blank_pair(px, py);
             }
             return;
         }
         if !self.editor.is_blank_initial() {
             // Welcome panel hidden: clear any previous emit and stop
             // re-emitting until we're back on the welcome screen.
-            if let Some((px, py)) = self.welcome_codeberg_badge_last_emitted.take() {
-                let mut out = stdout();
-                let cursor_on = self.cursor_should_be_visible();
-                let _ = write!(out, "\x1b[?25l\x1b[s");
-                let _ = write!(out, "\x1b[{};{}H  ", py + 1, px + 1);
-                let _ = write!(out, "\x1b[u");
-                if cursor_on {
-                    let _ = write!(out, "\x1b[?25h");
-                }
-                let _ = out.flush();
+            if let Some((px, py)) = self.overlays.badge.take_last_emitted() {
+                self.stamp_blank_pair(px, py);
             }
             return;
         }
-        let Some(osc) = self.welcome_codeberg_badge_osc.as_deref() else {
+        let Some(osc) = self.overlays.badge.image() else {
             return;
         };
-        let Some((cx, cy)) = self.welcome_codeberg_badge_cell else {
+        let Some((cx, cy)) = self.overlays.badge.target() else {
             // Welcome visible but provider isn't Codeberg: still need to
             // wipe a stale prior emit (e.g. user just changed providers
             // without restart, or layout collapsed the badge row).
-            if let Some((px, py)) = self.welcome_codeberg_badge_last_emitted.take() {
-                let mut out = stdout();
-                let cursor_on = self.cursor_should_be_visible();
-                let _ = write!(out, "\x1b[?25l\x1b[s");
-                let _ = write!(out, "\x1b[{};{}H  ", py + 1, px + 1);
-                let _ = write!(out, "\x1b[u");
-                if cursor_on {
-                    let _ = write!(out, "\x1b[?25h");
-                }
-                let _ = out.flush();
+            if let Some((px, py)) = self.overlays.badge.take_last_emitted() {
+                self.stamp_blank_pair(px, py);
             }
             return;
         };
@@ -1775,7 +1716,7 @@ impl App {
         // If the cell moved since the last emit, stamp blanks over the
         // previous position first so the old logo doesn't ghost-overlay
         // the freshly-drawn welcome layout.
-        if let Some((px, py)) = self.welcome_codeberg_badge_last_emitted {
+        if let Some((px, py)) = self.overlays.badge.last_emitted() {
             if (px, py) != (cx, cy) {
                 let _ = write!(out, "\x1b[{};{}H  ", py + 1, px + 1);
             }
@@ -1787,7 +1728,7 @@ impl App {
             let _ = write!(out, "\x1b[?25h");
         }
         let _ = out.flush();
-        self.welcome_codeberg_badge_last_emitted = Some((cx, cy));
+        self.overlays.badge.mark_emitted_at((cx, cy));
     }
 
     /// Reset the blink phase so the caret is solidly visible for the next
@@ -2245,7 +2186,7 @@ impl App {
 
     fn render_welcome(&mut self, frame: &mut ratatui::Frame, outer_area: Rect) {
         self.welcome.clear_links();
-        self.welcome_codeberg_badge_cell = None;
+        self.overlays.badge.set_target(None);
         if outer_area.width == 0 || outer_area.height == 0 {
             return;
         }
@@ -2522,12 +2463,12 @@ impl App {
                     crate::git::commit_api_provider_for_remote(remote),
                     Some(crate::git::CommitApiProvider::Codeberg)
                 );
-                self.welcome_codeberg_badge_cell =
-                    if is_codeberg && self.welcome_codeberg_badge_osc.is_some() {
-                        Some((inner_x, row_y))
-                    } else {
-                        None
-                    };
+                let badge_target = if is_codeberg && self.overlays.badge.has_image() {
+                    Some((inner_x, row_y))
+                } else {
+                    None
+                };
+                self.overlays.badge.set_target(badge_target);
                 let badge_w = badge.chars().count() as u16;
                 let remote_x = inner_x + badge_w + 2;
                 let room = (inner_x + inner_w_actual).saturating_sub(remote_x) as usize;
@@ -2745,9 +2686,9 @@ impl App {
             // nothing stomps the freshly-drawn next sidebar.
             if self.sidebar_view == SidebarView::RunDebug
                 && view != SidebarView::RunDebug
-                && self.run_debug_icon_last_emitted.is_some()
+                && self.overlays.run_debug.was_emitted()
             {
-                self.run_debug_image_clear_requested = true;
+                self.overlays.run_debug.request_clear();
             }
             // Same eviction trick for the Source Control no-repo hero
             // PNG: leaving Source Control after the image was painted
@@ -3130,7 +3071,7 @@ impl App {
             // occupied; if the user reopens the welcome screen we'll need
             // to re-emit it.
             self.overlays.welcome.mark_dirty();
-            self.welcome_codeberg_badge_cell = None;
+            self.overlays.badge.set_target(None);
             self.update_editor_image_overlay(editor_area);
             if self.focus == Pane::Editor && self.completion_popup.is_some() {
                 if let Some((cx, cy)) = self.editor.cursor_screen_pos() {
@@ -3804,9 +3745,9 @@ impl App {
                 if was_visible
                     && !self.show_tree
                     && self.sidebar_view == SidebarView::RunDebug
-                    && self.run_debug_icon_last_emitted.is_some()
+                    && self.overlays.run_debug.was_emitted()
                 {
-                    self.run_debug_image_clear_requested = true;
+                    self.overlays.run_debug.request_clear();
                 }
                 return Ok(());
             }
