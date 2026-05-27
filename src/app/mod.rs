@@ -26,6 +26,7 @@ mod click;
 mod cursor_blink;
 mod fs_watch;
 mod git_worker;
+mod overlay;
 mod perf_hud;
 mod sys_monitor;
 mod welcome;
@@ -33,6 +34,7 @@ use click::ClickTracker;
 use cursor_blink::CursorBlink;
 use fs_watch::FsWatch;
 use git_worker::GitWorker;
+use overlay::OverlayManager;
 use perf_hud::PerfHud;
 use sys_monitor::SysMonitor;
 use welcome::WelcomeState;
@@ -819,12 +821,7 @@ pub struct App {
     /// Set when an update landed and croft should re-exec after the main
     /// loop unwinds and the alt-screen is surrendered. Read by `run`.
     pending_reexec: bool,
-    /// One-shot flag the driver consumes to fire `terminal.clear()` so
-    /// iTerm2 evicts the OSC-1337 image cells (activity bar icons,
-    /// welcome wordmark, editor image preview) that would otherwise
-    /// bleed through the modal's text. Armed on open AND on close so
-    /// the modal's own cells get wiped when it dismisses too.
-    shortcuts_image_clear_requested: bool,
+    overlays: OverlayManager,
     /// Pre-baked OSC-1337 sequence for the SSH-empty-state illustration,
     /// sized to a fixed cell box. None when the host terminal can't
     /// render inline images.
@@ -853,9 +850,6 @@ pub struct App {
     /// index has been received (or if a build was never kicked off).
     file_finder_index_rx:
         Option<std::sync::mpsc::Receiver<Vec<crate::widgets::file_finder::FileEntry>>>,
-    /// One-shot: armed on open and close to evict iTerm2's image cache
-    /// behind the finder, same pipeline as the shortcuts modal.
-    file_finder_image_clear_requested: bool,
     /// Set when a rebuild was requested while one was already in flight.
     /// poll_file_finder_index drains it on completion and re-kicks the
     /// background walker so a long-running rebuild (multi-GB monorepo)
@@ -1361,7 +1355,7 @@ impl App {
             update_watch: None,
             update_status: UpdateStatus::Idle,
             pending_reexec: false,
-            shortcuts_image_clear_requested: false,
+            overlays: OverlayManager::default(),
             ssh_empty_state_osc: None,
             ssh_empty_state_displayed: false,
             ssh_empty_state_image_clear_requested: false,
@@ -1369,7 +1363,6 @@ impl App {
             file_finder: None,
             file_finder_index: None,
             file_finder_index_rx: Some(file_finder_index_rx),
-            file_finder_image_clear_requested: false,
             file_finder_index_dirty: false,
             completion_request_id: None,
         })
@@ -6255,14 +6248,14 @@ impl App {
     fn open_shortcuts_modal(&mut self) {
         if self.shortcuts_modal.is_none() {
             self.shortcuts_modal = Some(crate::widgets::shortcuts::ShortcutsModal::default());
-            self.shortcuts_image_clear_requested = true;
+            self.overlays.shortcuts_clear.request();
             self.status = String::from("Shortcuts: Esc to close");
         }
     }
 
     fn close_shortcuts_modal(&mut self) {
         if self.shortcuts_modal.take().is_some() {
-            self.shortcuts_image_clear_requested = true;
+            self.overlays.shortcuts_clear.request();
             self.activity_overlay_dirty = true;
             self.welcome_overlay_dirty = true;
             self.no_repo_hero_overlay_dirty = true;
@@ -6272,21 +6265,11 @@ impl App {
     }
 
     pub fn consume_shortcuts_image_clear(&mut self) -> bool {
-        if self.shortcuts_image_clear_requested {
-            self.shortcuts_image_clear_requested = false;
-            true
-        } else {
-            false
-        }
+        self.overlays.shortcuts_clear.consume()
     }
 
     pub fn consume_file_finder_image_clear(&mut self) -> bool {
-        if self.file_finder_image_clear_requested {
-            self.file_finder_image_clear_requested = false;
-            true
-        } else {
-            false
-        }
+        self.overlays.file_finder_clear.consume()
     }
 
     /// Drain the background-build receiver into `file_finder_index`
@@ -6365,13 +6348,13 @@ impl App {
             .unwrap_or_else(|| std::sync::Arc::new(Vec::new()));
         let count = entries.len();
         self.file_finder = Some(crate::widgets::file_finder::FileFinder::new(entries));
-        self.file_finder_image_clear_requested = true;
+        self.overlays.file_finder_clear.request();
         self.status = format!("Go to File: {count} files indexed — Esc to close");
     }
 
     fn close_file_finder(&mut self) {
         if self.file_finder.take().is_some() {
-            self.file_finder_image_clear_requested = true;
+            self.overlays.file_finder_clear.request();
             self.activity_overlay_dirty = true;
             self.welcome_overlay_dirty = true;
             self.no_repo_hero_overlay_dirty = true;
