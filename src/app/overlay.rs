@@ -240,6 +240,50 @@ impl CellOverlay {
 }
 
 #[derive(Default)]
+pub struct ActivityOverlay {
+    images: Option<super::ActivityBarImages>,
+    dirty: bool,
+    last_emit: Option<std::time::Instant>,
+}
+
+impl ActivityOverlay {
+    const KEEPALIVE: std::time::Duration = std::time::Duration::from_secs(2);
+
+    pub fn set_images(&mut self, images: super::ActivityBarImages) {
+        self.images = Some(images);
+    }
+
+    pub fn images(&self) -> Option<&super::ActivityBarImages> {
+        self.images.as_ref()
+    }
+
+    pub fn has_images(&self) -> bool {
+        self.images.is_some()
+    }
+
+    pub fn mark_dirty(&mut self) {
+        self.dirty = true;
+    }
+
+    pub fn should_refresh(&self) -> bool {
+        self.dirty
+            || self
+                .last_emit
+                .map_or(true, |t| t.elapsed() >= Self::KEEPALIVE)
+    }
+
+    pub fn mark_emitted(&mut self) {
+        self.dirty = false;
+        self.last_emit = Some(std::time::Instant::now());
+    }
+
+    #[cfg(test)]
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
+    }
+}
+
+#[derive(Default)]
 pub struct OverlayManager {
     pub shortcuts_clear: ClearLatch,
     pub file_finder_clear: ClearLatch,
@@ -249,4 +293,5 @@ pub struct OverlayManager {
     pub ssh: ImageOverlay<()>,
     pub badge: CellOverlay,
     pub run_debug: CellOverlay,
+    pub activity: ActivityOverlay,
 }

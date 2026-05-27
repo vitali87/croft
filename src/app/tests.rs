@@ -5170,7 +5170,7 @@ fn closing_the_shortcuts_modal_arms_image_clear_and_re_dirties_overlays() {
         app.consume_shortcuts_image_clear(),
         "Esc must also arm terminal.clear() so the modal's text cells get wiped and the activity bar / welcome wordmark / hero icons can be re-emitted cleanly"
     );
-    assert!(app.activity_overlay_dirty);
+    assert!(app.overlays.activity.is_dirty());
     assert!(app.overlays.welcome.is_dirty());
     assert!(app.overlays.hero.is_dirty());
 }

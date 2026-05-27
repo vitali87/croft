@@ -161,7 +161,7 @@ struct SidebarAreas {
 /// state. Encoded once in `App::init_graphics` (no PNG re-encoding per
 /// frame) and rewritten under the activity-bar block after every ratatui
 /// frame draw, since ratatui's bg-clear overdraws the image.
-struct ActivityBarImages {
+pub struct ActivityBarImages {
     explorer_active: String,
     explorer_inactive: String,
     search_active: String,
@@ -581,21 +581,11 @@ pub struct App {
     git: GitWorker,
     sysmon: SysMonitor,
     cursor_blink: CursorBlink,
-    /// Pre-encoded inline-image escapes for the activity-bar icons. `None`
-    /// when the host terminal can't render OSC-1337 (we then fall back to
-    /// the codicon glyph rendered inside the same multi-row block).
-    activity_images: Option<ActivityBarImages>,
     editor_click: ClickTracker,
     tree_click: ClickTracker,
     terminal_click: ClickTracker,
     /// Pane whose scrollbar is currently being dragged with the left mouse button.
     scrollbar_drag: Option<Pane>,
-    /// True when the activity-bar OSC-1337 images need to be (re)written on
-    /// the next post-draw flush. Set initially, on sidebar-view change, and
-    /// on terminal resize. Cleared after emit. Without this gate every
-    /// redraw repaints the PNGs and you see the cursor blink each time iTerm
-    /// processes the image.
-    activity_overlay_dirty: bool,
     welcome: WelcomeState,
     /// Channel to the background search worker. Each keystroke or toggle
     /// flip pushes a `(query, opts)` request here; the worker debounces
@@ -692,11 +682,6 @@ pub struct App {
     /// is open (closing the last one would leave the pane empty, which we
     /// explicitly forbid) or the pane is hidden.
     terminal_close_buttons: Vec<Rect>,
-    /// When the activity-bar OSC-1337 overlay was last written to stdout.
-    /// Re-emitting on every redraw (the previous behaviour) flickered the
-    /// editor caret at the PTY redraw rate; we now refresh on dirty plus a
-    /// periodic keep-alive to defeat iTerm2's image-cell eviction.
-    last_activity_overlay_emit: Option<std::time::Instant>,
     /// Total width / height of the right-hand content area, captured on
     /// every render so a splitter drag can clamp to the live viewport.
     last_content_width: u16,
@@ -1178,12 +1163,10 @@ impl App {
             git,
             sysmon,
             cursor_blink: CursorBlink::new(),
-            activity_images: None,
             editor_click: ClickTracker::default(),
             tree_click: ClickTracker::default(),
             terminal_click: ClickTracker::default(),
             scrollbar_drag: None,
-            activity_overlay_dirty: true,
             welcome,
             search_query_tx,
             search_results_rx,
@@ -1211,7 +1194,6 @@ impl App {
             terminal_splitter_y: None,
             terminal_add_buttons: Vec::new(),
             terminal_close_buttons: Vec::new(),
-            last_activity_overlay_emit: None,
             last_content_width: 0,
             last_content_height: 0,
             lsp: match crate::lsp::LspManager::new(root.clone()) {
@@ -1236,6 +1218,7 @@ impl App {
                 let mut overlays = OverlayManager::default();
                 overlays.welcome.mark_dirty();
                 overlays.hero.mark_dirty();
+                overlays.activity.mark_dirty();
                 overlays
             },
             editor_find: None,
@@ -1330,7 +1313,7 @@ impl App {
             run_debug_active,
             run_debug_inactive,
         ) {
-            self.activity_images = Some(ActivityBarImages {
+            self.overlays.activity.set_images(ActivityBarImages {
                 explorer_active: ea,
                 explorer_inactive: ei,
                 search_active: sa,
@@ -1608,7 +1591,7 @@ impl App {
         if self.shortcuts_modal.is_some() || self.file_finder.is_some() {
             return Vec::new();
         }
-        let Some(images) = self.activity_images.as_ref() else {
+        let Some(images) = self.overlays.activity.images() else {
             return Vec::new();
         };
         let exp_block = self.sidebar_areas.explorer_icon;
@@ -2547,7 +2530,7 @@ impl App {
         // (forced to sRGB(EDITOR_BG_RGB) via SetColors), matching the rest
         // of the panes. The glyph-fallback path keeps a solid bg for
         // terminals that can't render OSC-1337.
-        let bg = if self.activity_images.is_some() {
+        let bg = if self.overlays.activity.has_images() {
             Style::default().bg(Color::Reset)
         } else {
             Style::default().bg(Color::Rgb(
@@ -2562,7 +2545,7 @@ impl App {
         // would force us to re-emit the OSC-1337 images on every draw. Both
         // are visible to the user. So in images mode we leave the cells
         // untouched and let the post-draw OSC writer paint them once.
-        if self.activity_images.is_none() {
+        if !self.overlays.activity.has_images() {
             frame.render_widget(ratatui::widgets::Block::default().style(bg), area);
         }
         let active_bar = Color::Rgb(0x4e, 0x9a, 0xff);
@@ -2619,7 +2602,7 @@ impl App {
                 );
             };
 
-        if self.activity_images.is_none() {
+        if !self.overlays.activity.has_images() {
             // Glyph fallback path: render the codicon and a separate active
             // pill on the leftmost column. iTerm2's image path bakes the
             // pill into the PNG itself, so this branch is only used on
@@ -2665,7 +2648,7 @@ impl App {
 
     fn set_sidebar_view(&mut self, view: SidebarView) {
         if self.sidebar_view != view {
-            self.activity_overlay_dirty = true;
+            self.overlays.activity.mark_dirty();
             // Leaving Search while a scan is in flight: send an
             // empty-query request so the worker cancels the live walker
             // threads instead of letting them keep saturating every core
@@ -6088,7 +6071,7 @@ impl App {
     fn close_shortcuts_modal(&mut self) {
         if self.shortcuts_modal.take().is_some() {
             self.overlays.shortcuts_clear.request();
-            self.activity_overlay_dirty = true;
+            self.overlays.activity.mark_dirty();
             self.overlays.welcome.mark_dirty();
             self.overlays.hero.mark_dirty();
             self.overlays.editor.invalidate_layout();
@@ -6187,7 +6170,7 @@ impl App {
     fn close_file_finder(&mut self) {
         if self.file_finder.take().is_some() {
             self.overlays.file_finder_clear.request();
-            self.activity_overlay_dirty = true;
+            self.overlays.activity.mark_dirty();
             self.overlays.welcome.mark_dirty();
             self.overlays.hero.mark_dirty();
             self.overlays.editor.invalidate_layout();
@@ -10053,7 +10036,7 @@ fn run_pending_scp_uploads(app: &mut App, terminal: &mut CroftTerminal) -> Resul
     )
     .ok();
     terminal.clear().ok();
-    app.activity_overlay_dirty = true;
+    app.overlays.activity.mark_dirty();
     app.overlays.welcome.mark_dirty();
     app.report_scp_results(moved, total, error_count, &affected_dirs);
     Ok(())
@@ -10191,7 +10174,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
                 // and the source-control hero also live in iTerm's image
                 // cache that just got wiped - re-arm them so the next
                 // render re-emits whichever one is currently visible.
-                app.activity_overlay_dirty = true;
+                app.overlays.activity.mark_dirty();
                 app.overlays.welcome.mark_dirty();
                 app.overlays.hero.mark_dirty();
             }
@@ -10212,7 +10195,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
                 || app.consume_ssh_empty_state_image_clear()
             {
                 terminal.clear()?;
-                app.activity_overlay_dirty = true;
+                app.overlays.activity.mark_dirty();
                 app.overlays.welcome.mark_dirty();
                 app.overlays.hero.mark_dirty();
                 terminal.draw(|f| {
@@ -10230,16 +10213,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             // buffer in image-mode, ratatui's diff produces zero per-cell
             // writes here — re-emitting the pre-encoded OSC bytes every
             // frame is cheap and locks the images in.
-            // Keep-alive interval for the activity overlay refresh. Long
-            // enough that the editor caret never flickers at the PTY redraw
-            // cadence, short enough that iTerm2's image-cell eviction is
-            // imperceptible if it ever fires.
-            const ACTIVITY_OVERLAY_KEEPALIVE: Duration = Duration::from_secs(2);
-            let must_refresh_activity = app.activity_overlay_dirty
-                || app
-                    .last_activity_overlay_emit
-                    .map_or(true, |t| t.elapsed() >= ACTIVITY_OVERLAY_KEEPALIVE);
-            let overlays = if must_refresh_activity {
+            let overlays = if app.overlays.activity.should_refresh() {
                 app.pending_activity_image_overlays()
             } else {
                 Vec::new()
@@ -10258,8 +10232,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
                     let _ = write!(out, "\x1b[?25h");
                 }
                 let _ = out.flush();
-                app.activity_overlay_dirty = false;
-                app.last_activity_overlay_emit = Some(std::time::Instant::now());
+                app.overlays.activity.mark_emitted();
             }
             // Active editor image preview: bake-once-emit-each-frame
             // overlay, just like the welcome wordmark. Sent after ratatui
@@ -10342,7 +10315,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
                     Event::Resize(_, _) => {
                         // Alt-screen reflow blanks the activity bar cells; the
                         // OSC images need to be re-emitted on the next draw.
-                        app.activity_overlay_dirty = true;
+                        app.overlays.activity.mark_dirty();
                     }
                     _ => {}
                 }
