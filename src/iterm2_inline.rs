@@ -562,7 +562,11 @@ mod tests {
         let png = vec![0xABu8; 4000];
         let seq = build_inline_image_kitty(&png, 4, 3, 7);
         let chunks: Vec<&str> = seq.split("\x1b\\").filter(|s| !s.is_empty()).collect();
-        assert!(chunks.len() >= 2, "4000 raw bytes must span >1 chunk, got {}", chunks.len());
+        assert!(
+            chunks.len() >= 2,
+            "4000 raw bytes must span >1 chunk, got {}",
+            chunks.len()
+        );
         assert!(
             chunks[0].contains("m=1") && chunks[0].contains("f=100"),
             "first chunk carries full control data and m=1: {:?}",
@@ -615,7 +619,10 @@ mod tests {
             inline_image_protocol_for(Some("Apple_Terminal"), Some("xterm-256color")),
             InlineImageProtocol::None
         );
-        assert_eq!(inline_image_protocol_for(None, None), InlineImageProtocol::None);
+        assert_eq!(
+            inline_image_protocol_for(None, None),
+            InlineImageProtocol::None
+        );
     }
 
     #[test]
