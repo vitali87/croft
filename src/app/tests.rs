@@ -2384,7 +2384,7 @@ fn maximizing_terminal_requests_welcome_image_clear_when_image_was_displayed() {
     // does, gated by consume_welcome_image_clear().
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app.welcome_image_displayed = true;
+    app.overlays.welcome.set_displayed(true);
     let chord = key(
         KeyCode::Char('J'),
         KeyModifiers::CONTROL | KeyModifiers::SHIFT,
@@ -2405,7 +2405,7 @@ fn maximizing_terminal_is_noop_for_welcome_clear_when_image_was_not_displayed() 
     // they ever land on the welcome panel.
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app.welcome_image_displayed = false;
+    app.overlays.welcome.set_displayed(false);
     let chord = key(
         KeyCode::Char('J'),
         KeyModifiers::CONTROL | KeyModifiers::SHIFT,
@@ -2434,11 +2434,11 @@ fn restoring_terminal_from_maximize_rearms_welcome_overlay_dirty() {
     );
     app.handle_key(chord).unwrap();
     assert!(app.terminal_maximized);
-    app.welcome_overlay_dirty = false;
+    app.overlays.welcome.set_dirty(false);
     app.handle_key(chord).unwrap();
     assert!(!app.terminal_maximized);
     assert!(
-        app.welcome_overlay_dirty,
+        app.overlays.welcome.is_dirty(),
         "exiting maximize must re-arm welcome_overlay_dirty so the wordmark re-paints"
     );
 }
@@ -3763,13 +3763,13 @@ fn consume_welcome_image_clear_fires_once_when_editor_opens_a_file() {
     // cells is wiped.
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app.welcome_image_displayed = true;
+    app.overlays.welcome.set_displayed(true);
     let f = tmp.path().join("hi.txt");
     std::fs::write(&f, "hi").unwrap();
     app.editor.open_pinned(&f).unwrap();
     assert!(app.consume_welcome_image_clear(), "first call must fire");
     assert!(
-        !app.welcome_image_displayed,
+        !app.overlays.welcome.is_displayed(),
         "flag must reset after consume"
     );
     assert!(
@@ -3783,10 +3783,10 @@ fn consume_welcome_image_clear_is_noop_while_editor_pane_is_blank() {
     // The image is still meant to be visible, so don't clear.
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app.welcome_image_displayed = true;
+    app.overlays.welcome.set_displayed(true);
     assert!(!app.consume_welcome_image_clear());
     assert!(
-        app.welcome_image_displayed,
+        app.overlays.welcome.is_displayed(),
         "flag must NOT reset while image is still meant to show"
     );
 }
@@ -3795,19 +3795,19 @@ fn consume_welcome_image_clear_is_noop_while_editor_pane_is_blank() {
 fn consume_welcome_image_clear_handles_reposition_request_while_blank() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app.welcome_image_displayed = true;
-    app.welcome_image_clear_requested = true;
+    app.overlays.welcome.set_displayed(true);
+    app.overlays.welcome.request_clear();
 
     assert!(app.consume_welcome_image_clear());
-    assert!(!app.welcome_image_displayed);
-    assert!(!app.welcome_image_clear_requested);
+    assert!(!app.overlays.welcome.is_displayed());
+    assert!(!app.overlays.welcome.clear_requested());
 }
 
 #[test]
 fn consume_welcome_image_clear_is_noop_when_image_was_never_shown() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app.welcome_image_displayed = false;
+    app.overlays.welcome.set_displayed(false);
     let f = tmp.path().join("hi.txt");
     std::fs::write(&f, "hi").unwrap();
     app.editor.open_pinned(&f).unwrap();
@@ -5160,7 +5160,7 @@ fn closing_the_shortcuts_modal_arms_image_clear_and_re_dirties_overlays() {
         "Esc must also arm terminal.clear() so the modal's text cells get wiped and the activity bar / welcome wordmark / hero icons can be re-emitted cleanly"
     );
     assert!(app.activity_overlay_dirty);
-    assert!(app.welcome_overlay_dirty);
+    assert!(app.overlays.welcome.is_dirty());
     assert!(app.no_repo_hero_overlay_dirty);
 }
 

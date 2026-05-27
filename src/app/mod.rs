@@ -642,27 +642,6 @@ pub struct App {
     /// query is echoed so we can drop stale results when the user has
     /// typed past the query that produced them.
     search_results_rx: std::sync::mpsc::Receiver<crate::widgets::search::SearchEvent>,
-    /// Pre-encoded OSC-1337 escape carrying the croft wordmark sized to the
-    /// welcome banner block, painted on a canvas filled with the sRGB-
-    /// equivalent of `EDITOR_BG_RGB` so its bg matches the SGR-painted
-    /// editor pane pixel-for-pixel. None when the host terminal can't
-    /// render inline images.
-    welcome_image: Option<String>,
-    /// Cell `(x, y, width, height)` the welcome image was last baked at.
-    /// A change here triggers a re-bake on the next render.
-    welcome_layout: Option<WelcomeLayout>,
-    welcome_overlay_dirty: bool,
-    /// True between the moment the welcome OSC-1337 image is written to the
-    /// terminal and the moment we explicitly clear it. iTerm caches the
-    /// image bytes outside ratatui's buffer, so when the user opens a file
-    /// ratatui's diff misses cells whose buffer content didn't change and
-    /// the image bleeds through under the editor. `consume_welcome_image_clear`
-    /// returns true once when this needs to be wiped.
-    welcome_image_displayed: bool,
-    /// One-shot request to clear the cached welcome image while the welcome
-    /// pane is still visible. This is needed when async recents or a resize
-    /// move the logo; otherwise iTerm keeps the old image cached too.
-    welcome_image_clear_requested: bool,
     /// OSC-1337 escape carrying the no-repo hero PNG (the file-with-git-tree
     /// illustration). Re-baked when the hero rect's cell size changes.
     no_repo_hero_image: Option<String>,
@@ -884,7 +863,7 @@ const EDITOR_HEIGHT_MIN: u16 = 3;
 const RIGHT_PANE_MIN: u16 = 20;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct WelcomeLayout {
+pub struct WelcomeLayout {
     cell_x: u16,
     cell_y: u16,
     cell_w: u16,
@@ -1279,11 +1258,6 @@ impl App {
             welcome,
             search_query_tx,
             search_results_rx,
-            welcome_image: None,
-            welcome_layout: None,
-            welcome_overlay_dirty: true,
-            welcome_image_displayed: false,
-            welcome_image_clear_requested: false,
             no_repo_hero_image: None,
             no_repo_hero_layout: None,
             no_repo_hero_overlay_dirty: true,
@@ -1334,7 +1308,11 @@ impl App {
             update_watch: None,
             update_status: UpdateStatus::Idle,
             pending_reexec: false,
-            overlays: OverlayManager::default(),
+            overlays: {
+                let mut overlays = OverlayManager::default();
+                overlays.welcome.mark_dirty();
+                overlays
+            },
             ssh_empty_state_osc: None,
             ssh_empty_state_displayed: false,
             ssh_empty_state_image_clear_requested: false,
@@ -2056,10 +2034,10 @@ impl App {
         if !drain.installed {
             return false;
         }
-        if self.editor.is_blank_initial() && self.welcome_image_displayed {
-            self.welcome_image_clear_requested = true;
+        if self.editor.is_blank_initial() {
+            self.overlays.welcome.request_clear_if_displayed();
         }
-        self.welcome_overlay_dirty = true;
+        self.overlays.welcome.mark_dirty();
         if let Some(msg) = drain.status {
             self.status = msg;
         }
@@ -2314,15 +2292,8 @@ impl App {
     /// invalidating the prev buffer so ratatui repaints every cell on the
     /// next draw, wiping iTerm's image cache for the welcome region.
     pub fn consume_welcome_image_clear(&mut self) -> bool {
-        if self.welcome_image_clear_requested
-            || (self.welcome_image_displayed && !self.editor.is_blank_initial())
-        {
-            self.welcome_image_displayed = false;
-            self.welcome_image_clear_requested = false;
-            true
-        } else {
-            false
-        }
+        let opened_file = !self.editor.is_blank_initial();
+        self.overlays.welcome.consume_clear_or(opened_file)
     }
 
     fn render_welcome(&mut self, frame: &mut ratatui::Frame, outer_area: Rect) {
@@ -2432,10 +2403,8 @@ impl App {
         // we force to the same sRGB hex via `SetColors=bg=srgb:…` at
         // startup. Both surfaces therefore display the same physical
         // pixel pair-for-pair.
-        if self.welcome_layout != Some(desired) {
-            if self.welcome_image_displayed {
-                self.welcome_image_clear_requested = true;
-            }
+        if !self.overlays.welcome.layout_matches(&desired) {
+            self.overlays.welcome.request_clear_if_displayed();
             if let Some((cw, ch)) = self.cell_pixel {
                 let canvas_w = (logo_w_cells as u32) * cw;
                 let canvas_h = (logo_h_cells as u32) * ch;
@@ -2457,14 +2426,14 @@ impl App {
                     } else {
                         raw
                     };
-                    self.welcome_image = Some(osc);
+                    self.overlays.welcome.set_image(osc);
                 }
             }
-            self.welcome_layout = Some(desired);
-            self.welcome_overlay_dirty = true;
+            self.overlays.welcome.set_layout(desired);
+            self.overlays.welcome.mark_dirty();
         }
 
-        if self.welcome_image.is_none() {
+        if !self.overlays.welcome.has_image() {
             // Text fallback for non-iTerm2 terminals.
             let label = " croft ";
             let lx = logo_x
@@ -2907,11 +2876,9 @@ impl App {
                 self.show_terminal = true;
             }
             self.focus_pane(Pane::Terminal);
-            if self.welcome_image_displayed {
-                self.welcome_image_clear_requested = true;
-            }
+            self.overlays.welcome.request_clear_if_displayed();
         } else {
-            self.welcome_overlay_dirty = true;
+            self.overlays.welcome.mark_dirty();
         }
     }
 
@@ -3217,7 +3184,7 @@ impl App {
             // The editor just overdrew whatever cells the welcome image
             // occupied; if the user reopens the welcome screen we'll need
             // to re-emit it.
-            self.welcome_overlay_dirty = true;
+            self.overlays.welcome.mark_dirty();
             self.welcome_codeberg_badge_cell = None;
             self.update_editor_image_overlay(editor_area);
             if self.focus == Pane::Editor && self.completion_popup.is_some() {
@@ -4599,7 +4566,7 @@ impl App {
                 ));
                 self.pending_remote_launch_path = path;
                 self.pending_remote_launch_host = Some(host);
-                self.welcome_image_clear_requested = true;
+                self.overlays.welcome.request_clear();
             }
             Err(e) => {
                 self.status = format!("Could not start ssh: {e}");
@@ -6236,7 +6203,7 @@ impl App {
         if self.shortcuts_modal.take().is_some() {
             self.overlays.shortcuts_clear.request();
             self.activity_overlay_dirty = true;
-            self.welcome_overlay_dirty = true;
+            self.overlays.welcome.mark_dirty();
             self.no_repo_hero_overlay_dirty = true;
             self.overlays.editor.invalidate_layout();
             self.status.clear();
@@ -6335,7 +6302,7 @@ impl App {
         if self.file_finder.take().is_some() {
             self.overlays.file_finder_clear.request();
             self.activity_overlay_dirty = true;
-            self.welcome_overlay_dirty = true;
+            self.overlays.welcome.mark_dirty();
             self.no_repo_hero_overlay_dirty = true;
             self.overlays.editor.invalidate_layout();
             self.status.clear();
@@ -7976,6 +7943,22 @@ impl App {
 
     pub fn mark_editor_image_displayed(&mut self) {
         self.overlays.editor.mark_displayed();
+    }
+
+    pub fn welcome_image_emit_payload(&self) -> Option<(&str, &WelcomeLayout)> {
+        if self.shortcuts_modal.is_some()
+            || self.file_finder.is_some()
+            || self.connect_dialog.is_some()
+            || !self.editor.is_blank_initial()
+            || self.terminal_maximized
+        {
+            return None;
+        }
+        self.overlays.welcome.emit_payload()
+    }
+
+    pub fn mark_welcome_image_emitted(&mut self) {
+        self.overlays.welcome.mark_emitted();
     }
 
     /// Keyboard navigation for spreadsheet preview tabs. All gestures are
@@ -10185,7 +10168,7 @@ fn run_pending_scp_uploads(app: &mut App, terminal: &mut CroftTerminal) -> Resul
     .ok();
     terminal.clear().ok();
     app.activity_overlay_dirty = true;
-    app.welcome_overlay_dirty = true;
+    app.overlays.welcome.mark_dirty();
     app.report_scp_results(moved, total, error_count, &affected_dirs);
     Ok(())
 }
@@ -10323,7 +10306,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
                 // cache that just got wiped - re-arm them so the next
                 // render re-emits whichever one is currently visible.
                 app.activity_overlay_dirty = true;
-                app.welcome_overlay_dirty = true;
+                app.overlays.welcome.mark_dirty();
                 app.no_repo_hero_overlay_dirty = true;
             }
             let draw_start = std::time::Instant::now();
@@ -10344,7 +10327,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             {
                 terminal.clear()?;
                 app.activity_overlay_dirty = true;
-                app.welcome_overlay_dirty = true;
+                app.overlays.welcome.mark_dirty();
                 app.no_repo_hero_overlay_dirty = true;
                 terminal.draw(|f| {
                     app.render(f);
@@ -10429,29 +10412,19 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             // Welcome-screen logo: same OSC-1337 trick, gated by its own
             // dirty flag and only emitted while the editor pane is in its
             // blank initial state.
-            if app.shortcuts_modal.is_none()
-                && app.file_finder.is_none()
-                && app.connect_dialog.is_none()
-                && app.editor.is_blank_initial()
-                && app.welcome_overlay_dirty
-                && !app.terminal_maximized
-            {
-                if let (Some(img), Some(layout)) = (app.welcome_image.as_ref(), app.welcome_layout)
-                {
-                    use std::io::Write;
-                    let mut out = stdout();
-                    let cursor_on = app.cursor_should_be_visible();
-                    let _ = write!(out, "\x1b[?25l\x1b[s");
-                    let _ = write!(out, "\x1b[{};{}H", layout.cell_y + 1, layout.cell_x + 1);
-                    let _ = out.write_all(img.as_bytes());
-                    let _ = write!(out, "\x1b[u");
-                    if cursor_on {
-                        let _ = write!(out, "\x1b[?25h");
-                    }
-                    let _ = out.flush();
-                    app.welcome_overlay_dirty = false;
-                    app.welcome_image_displayed = true;
+            if let Some((img, layout)) = app.welcome_image_emit_payload() {
+                use std::io::Write;
+                let mut out = stdout();
+                let cursor_on = app.cursor_should_be_visible();
+                let _ = write!(out, "\x1b[?25l\x1b[s");
+                let _ = write!(out, "\x1b[{};{}H", layout.cell_y + 1, layout.cell_x + 1);
+                let _ = out.write_all(img.as_bytes());
+                let _ = write!(out, "\x1b[u");
+                if cursor_on {
+                    let _ = write!(out, "\x1b[?25h");
                 }
+                let _ = out.flush();
+                app.mark_welcome_image_emitted();
             }
             needs_redraw = false;
             last_blink_visible = blink_visible;
