@@ -72,6 +72,13 @@ impl<L: PartialEq> ImageOverlay<L> {
         }
     }
 
+    pub fn hide_and_request_clear(&mut self) {
+        if self.displayed {
+            self.displayed = false;
+            self.clear.request();
+        }
+    }
+
     pub fn request_clear(&mut self) {
         self.clear.request();
     }
@@ -181,4 +188,5 @@ pub struct OverlayManager {
     pub editor: ImageOverlay<super::EditorImageLayout>,
     pub welcome: ImageOverlay<super::WelcomeLayout>,
     pub hero: ImageOverlay<super::WelcomeLayout>,
+    pub ssh: ImageOverlay<()>,
 }

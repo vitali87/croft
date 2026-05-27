@@ -5169,14 +5169,14 @@ fn ssh_empty_state_overlay_arms_image_clear_when_user_switches_off_remote_view()
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     // Simulate the post-emit state without actually writing OSC bytes.
-    app.ssh_empty_state_displayed = true;
+    app.overlays.ssh.set_displayed(true);
     app.set_sidebar_view(SidebarView::Explorer);
     app.flush_ssh_empty_state_overlay();
     assert!(
         app.consume_ssh_empty_state_image_clear(),
         "leaving the Remote view after the illustration was painted must arm one terminal.clear() so iTerm2 evicts the cached image cells — otherwise the server-rack PNG ghosts onto the Explorer tree the user just clicked to"
     );
-    assert!(!app.ssh_empty_state_displayed);
+    assert!(!app.overlays.ssh.is_displayed());
 }
 
 #[test]
@@ -5184,7 +5184,7 @@ fn ssh_empty_state_overlay_arms_image_clear_when_modal_opens_on_top() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.set_sidebar_view(SidebarView::Remote);
-    app.ssh_empty_state_displayed = true;
+    app.overlays.ssh.set_displayed(true);
     app.handle_key(key(KeyCode::F(1), KeyModifiers::NONE))
         .unwrap();
     app.flush_ssh_empty_state_overlay();

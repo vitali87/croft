@@ -770,20 +770,6 @@ pub struct App {
     /// loop unwinds and the alt-screen is surrendered. Read by `run`.
     pending_reexec: bool,
     overlays: OverlayManager,
-    /// Pre-baked OSC-1337 sequence for the SSH-empty-state illustration,
-    /// sized to a fixed cell box. None when the host terminal can't
-    /// render inline images.
-    ssh_empty_state_osc: Option<String>,
-    /// Latch: true between the moment the SSH-empty-state PNG is written
-    /// to the terminal and the moment we explicitly clear it. iTerm2
-    /// caches the image bytes outside ratatui's buffer, so without an
-    /// explicit terminal.clear() the illustration ghosts onto whatever
-    /// view the user navigates to next (Explorer, Search, …).
-    ssh_empty_state_displayed: bool,
-    /// One-shot: armed when the illustration was displayed and the panel
-    /// is no longer the active sidebar view (or has gained hosts).
-    /// Consumed in the driver's terminal.clear() OR chain.
-    ssh_empty_state_image_clear_requested: bool,
     /// VS Code-style Cmd+F in-editor find overlay. None when closed.
     pub editor_find: Option<crate::widgets::editor_find::EditorFind>,
     /// VS Code-style Cmd+P / Ctrl+P quick-open file finder. None when
@@ -1295,9 +1281,6 @@ impl App {
                 overlays.hero.mark_dirty();
                 overlays
             },
-            ssh_empty_state_osc: None,
-            ssh_empty_state_displayed: false,
-            ssh_empty_state_image_clear_requested: false,
             editor_find: None,
             file_finder: None,
             file_finder_index: None,
@@ -1476,7 +1459,7 @@ impl App {
                 ssh_cells_h,
                 false,
             );
-            self.ssh_empty_state_osc = Some(if is_tmux {
+            self.overlays.ssh.set_image(if is_tmux {
                 crate::iterm2_inline::tmux_passthrough_wrap(&raw)
             } else {
                 raw
@@ -1614,16 +1597,13 @@ impl App {
             && self.sidebar_view == SidebarView::Remote
             && self.remote.targets.is_empty();
         if !should_show {
-            if self.ssh_empty_state_displayed {
-                self.ssh_empty_state_displayed = false;
-                self.ssh_empty_state_image_clear_requested = true;
-            }
+            self.overlays.ssh.hide_and_request_clear();
             return;
         }
         let Some((cx, cy)) = self.remote.last_image_cell else {
             return;
         };
-        let Some(osc) = self.ssh_empty_state_osc.as_deref() else {
+        let Some(osc) = self.overlays.ssh.image() else {
             return;
         };
         let mut out = stdout();
@@ -1636,19 +1616,14 @@ impl App {
             let _ = write!(out, "\x1b[?25h");
         }
         let _ = out.flush();
-        self.ssh_empty_state_displayed = true;
+        self.overlays.ssh.mark_displayed();
     }
 
     /// One-shot consumer paired with `flush_ssh_empty_state_overlay`. The
     /// main loop ORs the result into its `terminal.clear()` chain so
     /// iTerm2's cached image cells are evicted on view change.
     pub fn consume_ssh_empty_state_image_clear(&mut self) -> bool {
-        if self.ssh_empty_state_image_clear_requested {
-            self.ssh_empty_state_image_clear_requested = false;
-            true
-        } else {
-            false
-        }
+        self.overlays.ssh.consume_clear_latch()
     }
 
     /// One-shot consumer for the "leaving Run-Debug after the icon was
