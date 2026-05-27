@@ -24,9 +24,11 @@ use std::time::Duration;
 
 mod click;
 mod fs_watch;
+mod git_worker;
 mod perf_hud;
 use click::ClickTracker;
 use fs_watch::FsWatch;
+use git_worker::GitWorker;
 use perf_hud::PerfHud;
 
 use crate::widgets::{
@@ -568,22 +570,7 @@ pub struct App {
     context_menu: Option<ContextMenu>,
     prompt: Option<Prompt>,
     fs_watch: FsWatch,
-    git_status: crate::git::GitStatus,
-    /// Outbox for `git status` / `git status --porcelain` requests sent
-    /// to the background worker (`git::git_worker_loop`). Sidebar-icon
-    /// clicks and FS-watcher ticks `send` a `GitRequest` here instead
-    /// of shelling out on the UI thread; the worker shells out on its
-    /// own thread and replies via `git_response_rx`. Sending is a
-    /// non-blocking unbounded mpsc push (~hundreds of ns), so the
-    /// hot-path cost on the click is "queue one request" rather than
-    /// "fork+exec git and wait 15-50 ms" — the entire reason croft is
-    /// in Rust.
-    git_request_tx: std::sync::mpsc::Sender<crate::git::GitRequest>,
-    /// Inbox for `GitResponse`s coming back from the worker. Drained
-    /// each tick by `drain_git_responses`; a non-empty drain forces
-    /// the next redraw so the new status / entries appear within one
-    /// frame of arrival.
-    git_response_rx: std::sync::mpsc::Receiver<crate::git::GitResponse>,
+    git: GitWorker,
     /// Inbox for `SystemSample`s from the background sampler thread
     /// (`sysmon::system_monitor_loop`). Drained each tick by
     /// `drain_sysmon`; a non-empty drain forces a redraw so the SYSTEM
@@ -591,7 +578,6 @@ pub struct App {
     /// stays off the render thread because sysinfo's CPU refresh holds
     /// for the platform's minimum-interval to compute accurate %.
     sysmon_rx: std::sync::mpsc::Receiver<crate::sysmon::SystemSample>,
-    last_git_check: std::time::Instant,
     /// Anchor instant for the cursor blink. `tick_cursor_visible()` reads
     /// this to compute whether the caret is currently in its on-half or
     /// off-half. `poke_cursor()` resets it so the caret stays solidly
@@ -1246,14 +1232,7 @@ impl App {
         // `refresh_git_status_debounced`). Removes the 15-50 ms
         // input-to-paint stall that used to fire on every Source
         // Control click.
-        let (git_request_tx, git_request_rx) = std::sync::mpsc::channel::<crate::git::GitRequest>();
-        let (git_response_tx, git_response_rx) =
-            std::sync::mpsc::channel::<crate::git::GitResponse>();
-        let git_root = root.clone();
-        std::thread::spawn(move || {
-            crate::git::git_worker_loop(git_root, git_request_rx, git_response_tx);
-        });
-        let _ = git_request_tx.send(crate::git::GitRequest::Status);
+        let git = GitWorker::spawn(root.clone());
 
         // Background system-metrics sampler: CPU / MEM / NET / DISK / TEMP
         // refresh once per second on a dedicated thread and arrive via
@@ -1333,11 +1312,8 @@ impl App {
             context_menu: None,
             prompt: None,
             fs_watch,
-            git_status: crate::git::GitStatus::default(),
-            git_request_tx,
-            git_response_rx,
+            git,
             sysmon_rx,
-            last_git_check: std::time::Instant::now(),
             cursor_blink_anchor: std::time::Instant::now(),
             activity_images: None,
             welcome_codeberg_badge_osc: None,
@@ -1993,22 +1969,8 @@ impl App {
     /// spawning a `git` process on every keystroke.  Called after the file
     /// watcher reports any changes.
     fn refresh_git_status_debounced(&mut self) {
-        let min_gap = std::time::Duration::from_millis(400);
-        if self.last_git_check.elapsed() < min_gap {
-            return;
-        }
-        self.last_git_check = std::time::Instant::now();
-        // Off-thread: post a request and let the worker reply via
-        // `git_response_rx`. Used to shell out to `git status [+
-        // --porcelain]` synchronously here, blocking the UI thread for
-        // 15-50 ms on every FS-watcher tick — the same stall the
-        // Source Control click had until this was rewritten.
-        let req = if self.sidebar_view == SidebarView::SourceControl {
-            crate::git::GitRequest::StatusAndChanges
-        } else {
-            crate::git::GitRequest::Status
-        };
-        let _ = self.git_request_tx.send(req);
+        self.git
+            .request_status_debounced(self.sidebar_view == SidebarView::SourceControl);
     }
 
     fn sync_open_file_poll_mtime(&mut self) {
@@ -2087,34 +2049,8 @@ impl App {
     /// non-blocking try_recv. Called from `try_install_pending_init`,
     /// which already runs every tick.
     pub fn drain_git_responses(&mut self) -> bool {
-        let mut changed = false;
-        loop {
-            match self.git_response_rx.try_recv() {
-                Ok(crate::git::GitResponse::Status(s)) => {
-                    if self.git_status != s {
-                        self.git_status = s.clone();
-                        // Mirror the FS-watcher path: the SC panel
-                        // header reads the status snapshot too, even
-                        // when the row list isn't being refreshed.
-                        self.source_control.status = s;
-                        changed = true;
-                    }
-                }
-                Ok(crate::git::GitResponse::Changes(entries)) => {
-                    self.source_control
-                        .set_status(self.git_status.clone(), entries);
-                    changed = true;
-                }
-                Ok(crate::git::GitResponse::StatusAndChanges(s, entries)) => {
-                    self.git_status = s.clone();
-                    self.source_control.set_status(s, entries);
-                    changed = true;
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
-            }
-        }
-        if changed && self.git_status.in_repo && self.default_branch_label.is_none() {
+        let changed = self.git.drain(&mut self.source_control);
+        if changed && self.git.status().in_repo && self.default_branch_label.is_none() {
             self.default_branch_label = crate::git::default_branch(&self.tree.root).ok();
         }
         changed
@@ -3437,7 +3373,7 @@ impl App {
                     .add_modifier(Modifier::BOLD),
             ));
         }
-        spans.extend(git_status_spans(&self.git_status));
+        spans.extend(git_status_spans(self.git.status()));
         spans.push(Span::raw("  "));
         spans.push(Span::raw(&self.status));
         spans.push(Span::raw("  "));
@@ -4266,7 +4202,7 @@ impl App {
         // one or two frames after the click. Removes the synchronous
         // `git status --porcelain` shell-out that used to stall the UI
         // thread on every Source Control click.
-        let _ = self.git_request_tx.send(crate::git::GitRequest::Changes);
+        self.git.request_changes();
     }
 
     fn handle_run_debug_key(&mut self, key: KeyEvent) {
@@ -4476,9 +4412,7 @@ impl App {
                     "Initialized empty Git repository in {}",
                     self.tree.root.display()
                 );
-                self.last_git_check = std::time::Instant::now()
-                    .checked_sub(std::time::Duration::from_secs(1))
-                    .unwrap_or_else(std::time::Instant::now);
+                self.git.bypass_debounce();
                 self.refresh_git_status_debounced();
                 self.refresh_source_control();
             }
@@ -4534,9 +4468,7 @@ impl App {
                 self.source_control.commit_feedback_is_error = true;
             }
         }
-        self.last_git_check = std::time::Instant::now()
-            .checked_sub(std::time::Duration::from_secs(1))
-            .unwrap_or_else(std::time::Instant::now);
+        self.git.bypass_debounce();
         self.refresh_git_status_debounced();
         self.refresh_source_control();
     }
@@ -4562,9 +4494,7 @@ impl App {
                 self.status = format!("Push failed: {err}");
             }
         }
-        self.last_git_check = std::time::Instant::now()
-            .checked_sub(std::time::Duration::from_secs(1))
-            .unwrap_or_else(std::time::Instant::now);
+        self.git.bypass_debounce();
         self.refresh_git_status_debounced();
     }
 
@@ -4667,9 +4597,7 @@ impl App {
                 self.status = format!("Commit ok; push failed: {err}");
             }
         }
-        self.last_git_check = std::time::Instant::now()
-            .checked_sub(std::time::Duration::from_secs(1))
-            .unwrap_or_else(std::time::Instant::now);
+        self.git.bypass_debounce();
         self.refresh_git_status_debounced();
         self.refresh_source_control();
     }
@@ -4681,9 +4609,7 @@ impl App {
         match crate::git::stage_path(&self.tree.root, &entry.path) {
             Ok(()) => {
                 self.status = format!("Staged {}", entry.path);
-                self.last_git_check = std::time::Instant::now()
-                    .checked_sub(std::time::Duration::from_secs(1))
-                    .unwrap_or_else(std::time::Instant::now);
+                self.git.bypass_debounce();
                 self.refresh_git_status_debounced();
                 self.refresh_source_control();
             }
@@ -4714,9 +4640,7 @@ impl App {
         match crate::git::discard_path(&self.tree.root, &pd.rel_path, pd.untracked) {
             Ok(()) => {
                 self.status = format!("Discarded {}", pd.rel_path);
-                self.last_git_check = std::time::Instant::now()
-                    .checked_sub(std::time::Duration::from_secs(1))
-                    .unwrap_or_else(std::time::Instant::now);
+                self.git.bypass_debounce();
                 self.refresh_git_status_debounced();
                 self.refresh_source_control();
             }
@@ -4745,9 +4669,7 @@ impl App {
                 self.source_control.commit_feedback = Some(summary.clone());
                 self.source_control.commit_feedback_is_error = false;
                 self.status = format!("Committed: {summary}");
-                self.last_git_check = std::time::Instant::now()
-                    .checked_sub(std::time::Duration::from_secs(1))
-                    .unwrap_or_else(std::time::Instant::now);
+                self.git.bypass_debounce();
                 self.refresh_git_status_debounced();
                 self.refresh_source_control();
             }
@@ -7818,17 +7740,13 @@ impl App {
         self.tree_clipboard = None;
         self.compare_anchor = None;
         self.fs_watch.rebind(&new_root, &self.tree);
-        self.last_git_check = std::time::Instant::now()
-            .checked_sub(std::time::Duration::from_secs(1))
-            .unwrap_or_else(std::time::Instant::now);
+        self.git.bypass_debounce();
         // Rebind the worker's root before any query, otherwise the next
         // Status / Changes request runs against the stale root captured
         // at App::new and the Source Control panel keeps reporting the
         // OLD repo's state (or "no repo") even after a Make Root that
         // landed inside a real git tree.
-        let _ = self
-            .git_request_tx
-            .send(crate::git::GitRequest::SetRoot(new_root.clone()));
+        self.git.set_root(new_root.clone());
         self.refresh_git_status_debounced();
         self.refresh_source_control();
         // Rebind the search worker and the panel's display root to the new
