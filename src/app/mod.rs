@@ -22,6 +22,9 @@ use std::io::{Stdout, stdout};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+mod perf_hud;
+use perf_hud::PerfHud;
+
 use crate::widgets::{
     editor::{Editor, EditorTabs},
     file_finder::is_noise_dir,
@@ -551,15 +554,7 @@ pub struct App {
     pub editor: EditorTabs,
     pub terminals: Vec<PtyTerminal>,
     pub active_terminal: usize,
-    perf_hud: bool,
-    perf_bytes: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
-    last_draw_us: u128,
-    last_frame_bytes: usize,
-    last_fps: u32,
-    last_kps: u32,
-    last_ips: u32,
-    last_work_us: u128,
-    last_poll_us: u128,
+    perf: PerfHud,
     workspace_root: PathBuf,
     sidebar_view: SidebarView,
     sidebar_areas: SidebarAreas,
@@ -1383,15 +1378,7 @@ impl App {
             editor,
             terminals: vec![term],
             active_terminal: 0,
-            perf_hud: false,
-            perf_bytes: None,
-            last_draw_us: 0,
-            last_frame_bytes: 0,
-            last_fps: 0,
-            last_kps: 0,
-            last_ips: 0,
-            last_work_us: 0,
-            last_poll_us: 0,
+            perf: PerfHud::default(),
             workspace_root: root.clone(),
             sidebar_view: SidebarView::Explorer,
             sidebar_areas: SidebarAreas::default(),
@@ -3785,21 +3772,8 @@ impl App {
                 .fg(Color::Black)
                 .add_modifier(Modifier::BOLD),
         ));
-        if self.perf_hud {
-            spans.push(Span::styled(
-                format!(
-                    " ⚡d{}µs w{}µs p{}µs {}ips {}kps ",
-                    self.last_draw_us,
-                    self.last_work_us,
-                    self.last_poll_us,
-                    self.last_ips,
-                    self.last_kps
-                ),
-                Style::default()
-                    .bg(Color::Rgb(0x7a, 0x1f, 0x1f))
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
-            ));
+        if let Some(span) = self.perf.status_span() {
+            spans.push(span);
         }
         if self.update_status == UpdateStatus::Ready {
             spans.push(Span::styled(
@@ -4277,7 +4251,7 @@ impl App {
             return Ok(());
         }
         if matches!(key.code, KeyCode::F(8)) {
-            self.perf_hud = !self.perf_hud;
+            self.perf.toggle();
             return Ok(());
         }
         // A background update has landed and is waiting: F9 triggers the
@@ -10609,7 +10583,7 @@ pub fn run(root: PathBuf, restore_session: Option<PathBuf>) -> Result<()> {
     // render time, is the signal that tells a fat repaint from a slow
     // remote CPU. Toggled on screen with F8.
     let perf_bytes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    app.perf_bytes = Some(perf_bytes.clone());
+    app.perf.attach_counter(perf_bytes.clone());
     let backend = CrosstermBackend::new(CountingWriter {
         inner: out,
         bytes: perf_bytes,
@@ -10872,11 +10846,13 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
     while !app.quit {
         iters_in_window += 1;
         if fps_window_start.elapsed() >= Duration::from_secs(1) {
-            app.last_fps = frames_in_window;
-            app.last_kps = keys_in_window;
-            app.last_ips = iters_in_window;
-            app.last_work_us = work_max_us;
-            app.last_poll_us = poll_max_us;
+            app.perf.record_window(
+                frames_in_window,
+                keys_in_window,
+                iters_in_window,
+                work_max_us,
+                poll_max_us,
+            );
             frames_in_window = 0;
             keys_in_window = 0;
             iters_in_window = 0;
@@ -10971,10 +10947,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             })?;
             // Record render+flush time and the bytes ratatui shipped this
             // frame so the F8 HUD can show where remote latency goes.
-            app.last_draw_us = draw_start.elapsed().as_micros();
-            if let Some(counter) = app.perf_bytes.as_ref() {
-                app.last_frame_bytes = counter.swap(0, std::sync::atomic::Ordering::Relaxed);
-            }
+            app.perf.record_draw(draw_start.elapsed().as_micros());
             frames_in_window += 1;
             if app.consume_welcome_image_clear()
                 || app.consume_editor_image_clear()
