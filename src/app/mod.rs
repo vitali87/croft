@@ -642,20 +642,6 @@ pub struct App {
     /// query is echoed so we can drop stale results when the user has
     /// typed past the query that produced them.
     search_results_rx: std::sync::mpsc::Receiver<crate::widgets::search::SearchEvent>,
-    /// OSC-1337 escape carrying the no-repo hero PNG (the file-with-git-tree
-    /// illustration). Re-baked when the hero rect's cell size changes.
-    no_repo_hero_image: Option<String>,
-    no_repo_hero_layout: Option<WelcomeLayout>,
-    no_repo_hero_overlay_dirty: bool,
-    no_repo_hero_displayed: bool,
-    /// One-shot flag: arm a `terminal.clear()` on the next render pass
-    /// after the source-control hero image was emitted and the user has
-    /// just navigated to a different sidebar view (or the workspace
-    /// transitioned into a git repo). Same eviction trick the welcome
-    /// wordmark and Run-Debug icon pipelines use - iTerm2 caches the
-    /// image cells outside ratatui's diff, so without this the PNG
-    /// stays painted under whatever sidebar replaces it.
-    no_repo_hero_image_clear_requested: bool,
     /// Pixel size of one terminal cell, captured in `init_graphics`.
     /// Required to bake OSC-1337 images at exact viewport pixel size so
     /// iTerm draws them with no stretching or letterboxing.
@@ -1258,11 +1244,6 @@ impl App {
             welcome,
             search_query_tx,
             search_results_rx,
-            no_repo_hero_image: None,
-            no_repo_hero_layout: None,
-            no_repo_hero_overlay_dirty: true,
-            no_repo_hero_displayed: false,
-            no_repo_hero_image_clear_requested: false,
             cell_pixel: None,
             clipboard_reader: read_system_clipboard,
             remote_launch: None,
@@ -1311,6 +1292,7 @@ impl App {
             overlays: {
                 let mut overlays = OverlayManager::default();
                 overlays.welcome.mark_dirty();
+                overlays.hero.mark_dirty();
                 overlays
             },
             ssh_empty_state_osc: None,
@@ -1561,10 +1543,7 @@ impl App {
             && self.sidebar_view == SidebarView::SourceControl
             && !self.source_control.status.in_repo;
         if !panel_visible {
-            if self.no_repo_hero_displayed {
-                self.no_repo_hero_displayed = false;
-                self.no_repo_hero_overlay_dirty = true;
-            }
+            self.overlays.hero.mark_hidden();
             return;
         }
         let hero = self.source_control.last_hero_area;
@@ -1580,7 +1559,7 @@ impl App {
             cell_w: hero.width,
             cell_h: hero.height,
         };
-        if self.no_repo_hero_layout != Some(desired) || self.no_repo_hero_image.is_none() {
+        if !self.overlays.hero.layout_matches(&desired) || !self.overlays.hero.has_image() {
             let canvas_w = (hero.width as u32) * cw;
             let canvas_h = (hero.height as u32) * ch;
             let bg = image::Rgba([EDITOR_BG_RGB.0, EDITOR_BG_RGB.1, EDITOR_BG_RGB.2, 0xff]);
@@ -1601,11 +1580,10 @@ impl App {
                 } else {
                     raw
                 };
-                self.no_repo_hero_image = Some(osc);
-                self.no_repo_hero_layout = Some(desired);
+                self.overlays.hero.set(osc, desired);
             }
         }
-        let Some(osc) = self.no_repo_hero_image.as_deref() else {
+        let Some(osc) = self.overlays.hero.image() else {
             return;
         };
         let mut out = stdout();
@@ -1618,8 +1596,7 @@ impl App {
             let _ = write!(out, "\x1b[?25h");
         }
         let _ = out.flush();
-        self.no_repo_hero_displayed = true;
-        self.no_repo_hero_overlay_dirty = false;
+        self.overlays.hero.mark_emitted();
     }
 
     /// Emit the OSC-1337 SSH-empty-state illustration at the cell the
@@ -1693,12 +1670,7 @@ impl App {
     /// into its `terminal.clear()` chain so iTerm2's cached image cells
     /// are evicted on view change.
     pub fn consume_no_repo_hero_image_clear(&mut self) -> bool {
-        if self.no_repo_hero_image_clear_requested {
-            self.no_repo_hero_image_clear_requested = false;
-            true
-        } else {
-            false
-        }
+        self.overlays.hero.consume_clear_latch()
     }
 
     /// Returns the post-frame OSC-1337 escapes to write under the activity
@@ -2806,11 +2778,9 @@ impl App {
             // PNG: leaving Source Control after the image was painted
             // would otherwise leave the cached PNG under whatever
             // sidebar replaces it.
-            if self.sidebar_view == SidebarView::SourceControl
-                && view != SidebarView::SourceControl
-                && self.no_repo_hero_displayed
+            if self.sidebar_view == SidebarView::SourceControl && view != SidebarView::SourceControl
             {
-                self.no_repo_hero_image_clear_requested = true;
+                self.overlays.hero.request_clear_if_displayed();
             }
         }
         self.sidebar_view = view;
@@ -6204,7 +6174,7 @@ impl App {
             self.overlays.shortcuts_clear.request();
             self.activity_overlay_dirty = true;
             self.overlays.welcome.mark_dirty();
-            self.no_repo_hero_overlay_dirty = true;
+            self.overlays.hero.mark_dirty();
             self.overlays.editor.invalidate_layout();
             self.status.clear();
         }
@@ -6303,7 +6273,7 @@ impl App {
             self.overlays.file_finder_clear.request();
             self.activity_overlay_dirty = true;
             self.overlays.welcome.mark_dirty();
-            self.no_repo_hero_overlay_dirty = true;
+            self.overlays.hero.mark_dirty();
             self.overlays.editor.invalidate_layout();
             self.status.clear();
         }
@@ -10307,7 +10277,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
                 // render re-emits whichever one is currently visible.
                 app.activity_overlay_dirty = true;
                 app.overlays.welcome.mark_dirty();
-                app.no_repo_hero_overlay_dirty = true;
+                app.overlays.hero.mark_dirty();
             }
             let draw_start = std::time::Instant::now();
             terminal.draw(|f| {
@@ -10328,7 +10298,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
                 terminal.clear()?;
                 app.activity_overlay_dirty = true;
                 app.overlays.welcome.mark_dirty();
-                app.no_repo_hero_overlay_dirty = true;
+                app.overlays.hero.mark_dirty();
                 terminal.draw(|f| {
                     app.render(f);
                 })?;

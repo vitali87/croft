@@ -57,8 +57,19 @@ impl<L: PartialEq> ImageOverlay<L> {
         self.image.is_some()
     }
 
+    pub fn image(&self) -> Option<&str> {
+        self.image.as_deref()
+    }
+
     pub fn mark_dirty(&mut self) {
         self.dirty = true;
+    }
+
+    pub fn mark_hidden(&mut self) {
+        if self.displayed {
+            self.displayed = false;
+            self.dirty = true;
+        }
     }
 
     pub fn request_clear(&mut self) {
@@ -88,6 +99,10 @@ impl<L: PartialEq> ImageOverlay<L> {
         } else {
             false
         }
+    }
+
+    pub fn consume_clear_latch(&mut self) -> bool {
+        self.clear.consume()
     }
 
     pub fn consume_clear_or(&mut self, also: bool) -> bool {
@@ -165,4 +180,5 @@ pub struct OverlayManager {
     pub file_finder_clear: ClearLatch,
     pub editor: ImageOverlay<super::EditorImageLayout>,
     pub welcome: ImageOverlay<super::WelcomeLayout>,
+    pub hero: ImageOverlay<super::WelcomeLayout>,
 }

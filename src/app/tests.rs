@@ -5161,7 +5161,7 @@ fn closing_the_shortcuts_modal_arms_image_clear_and_re_dirties_overlays() {
     );
     assert!(app.activity_overlay_dirty);
     assert!(app.overlays.welcome.is_dirty());
-    assert!(app.no_repo_hero_overlay_dirty);
+    assert!(app.overlays.hero.is_dirty());
 }
 
 #[test]
