@@ -23,14 +23,18 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 mod click;
+mod cursor_blink;
 mod fs_watch;
 mod git_worker;
 mod perf_hud;
+mod sys_monitor;
 mod welcome;
 use click::ClickTracker;
+use cursor_blink::CursorBlink;
 use fs_watch::FsWatch;
 use git_worker::GitWorker;
 use perf_hud::PerfHud;
+use sys_monitor::SysMonitor;
 use welcome::WelcomeState;
 
 use crate::widgets::{
@@ -573,18 +577,8 @@ pub struct App {
     prompt: Option<Prompt>,
     fs_watch: FsWatch,
     git: GitWorker,
-    /// Inbox for `SystemSample`s from the background sampler thread
-    /// (`sysmon::system_monitor_loop`). Drained each tick by
-    /// `drain_sysmon`; a non-empty drain forces a redraw so the SYSTEM
-    /// panel's sparklines advance within one frame of arrival. Sampling
-    /// stays off the render thread because sysinfo's CPU refresh holds
-    /// for the platform's minimum-interval to compute accurate %.
-    sysmon_rx: std::sync::mpsc::Receiver<crate::sysmon::SystemSample>,
-    /// Anchor instant for the cursor blink. `tick_cursor_visible()` reads
-    /// this to compute whether the caret is currently in its on-half or
-    /// off-half. `poke_cursor()` resets it so the caret stays solidly
-    /// visible right after any user activity.
-    cursor_blink_anchor: std::time::Instant,
+    sysmon: SysMonitor,
+    cursor_blink: CursorBlink,
     /// Pre-encoded inline-image escapes for the activity-bar icons. `None`
     /// when the host terminal can't render OSC-1337 (we then fall back to
     /// the codicon glyph rendered inside the same multi-row block).
@@ -1226,15 +1220,7 @@ impl App {
         // Control click.
         let git = GitWorker::spawn(root.clone());
 
-        // Background system-metrics sampler: CPU / MEM / NET / DISK / TEMP
-        // refresh once per second on a dedicated thread and arrive via
-        // `sysmon_rx`. The render path never touches sysinfo because
-        // its CPU refresh needs MINIMUM_CPU_UPDATE_INTERVAL between
-        // reads to produce accurate percentages.
-        let (sysmon_tx, sysmon_rx) = std::sync::mpsc::channel::<crate::sysmon::SystemSample>();
-        std::thread::spawn(move || {
-            crate::sysmon::system_monitor_loop(sysmon_tx);
-        });
+        let sysmon = SysMonitor::spawn();
 
         let welcome = WelcomeState::spawn();
 
@@ -1299,8 +1285,8 @@ impl App {
             prompt: None,
             fs_watch,
             git,
-            sysmon_rx,
-            cursor_blink_anchor: std::time::Instant::now(),
+            sysmon,
+            cursor_blink: CursorBlink::new(),
             activity_images: None,
             welcome_codeberg_badge_osc: None,
             run_debug_icon_osc: None,
@@ -1912,7 +1898,7 @@ impl App {
     /// user always sees where the cursor just landed before it starts to
     /// blink off.
     fn poke_cursor(&mut self) {
-        self.cursor_blink_anchor = std::time::Instant::now();
+        self.cursor_blink.poke();
     }
 
     /// Mirrors the predicate used in `App::render` to decide whether to call
@@ -1942,10 +1928,7 @@ impl App {
     /// support, which iTerm2 / Terminal.app may have disabled in user
     /// preferences.
     fn cursor_visible_phase(&self) -> bool {
-        const HALF: std::time::Duration = std::time::Duration::from_millis(530);
-        let elapsed = self.cursor_blink_anchor.elapsed();
-        let phases = (elapsed.as_millis() / HALF.as_millis()) as u64;
-        phases % 2 == 0
+        self.cursor_blink.visible_phase()
     }
 
     /// Re-query git status, but no more than once every ~400ms to avoid
@@ -2045,18 +2028,7 @@ impl App {
     /// applied so the main loop knows to redraw. Cheap when the rx is
     /// empty: a single non-blocking try_recv.
     pub fn drain_sysmon(&mut self) -> bool {
-        let mut changed = false;
-        loop {
-            match self.sysmon_rx.try_recv() {
-                Ok(sample) => {
-                    self.system_panel.apply_sample(sample);
-                    changed = true;
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
-            }
-        }
-        changed
+        self.sysmon.drain(&mut self.system_panel)
     }
 
     /// Push the current search query string and toggle state onto the
