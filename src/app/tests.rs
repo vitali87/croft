@@ -821,7 +821,8 @@ fn flush_welcome_codeberg_badge_overlay_tracks_last_emitted_cell_across_resizes(
 fn render_welcome_clears_codeberg_badge_cell_when_recents_box_collapses() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app.recent_repo_remote = Some("https://codeberg.org/vitali87/croft".to_string());
+    app.welcome
+        .set_test_remote(Some("https://codeberg.org/vitali87/croft".to_string()));
     app.welcome_codeberg_badge_osc = Some("\x1b]1337;File=...\x07".to_string());
 
     let tall = Rect {
@@ -862,13 +863,14 @@ fn render_welcome_clears_codeberg_badge_cell_when_recents_box_collapses() {
 fn welcome_panel_renders_without_any_underlined_cells() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app.recent_repo_remote = Some("https://codeberg.org/vitali87/croft".to_string());
-    app.recent_commits = vec![crate::git::CommitInfo {
+    app.welcome
+        .set_test_remote(Some("https://codeberg.org/vitali87/croft".to_string()));
+    app.welcome.set_test_commits(vec![crate::git::CommitInfo {
         hash: "abc1234".to_string(),
         full_hash: "abc1234fffffffffffffffffffffffffffffffffff".to_string(),
         when: "1 hour ago".to_string(),
         subject: "feat: do thing".to_string(),
-    }];
+    }]);
     let area = Rect {
         x: 0,
         y: 0,
@@ -935,8 +937,9 @@ fn render_welcome_does_not_panic_in_default_80x25_with_many_commits() {
     // ran past the buffer, and panicked inside set_string.
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app.recent_repo_remote = Some("https://bitbucket.org/u/repo".to_string());
-    app.recent_commits = (0..40)
+    app.welcome
+        .set_test_remote(Some("https://bitbucket.org/u/repo".to_string()));
+    app.welcome.set_test_commits((0..40)
             .map(|i| crate::git::CommitInfo {
                 hash: format!("hash{i:04}"),
                 full_hash: format!("fullhash{i:040}"),
@@ -945,7 +948,7 @@ fn render_welcome_does_not_panic_in_default_80x25_with_many_commits() {
                     "this is a long subject line that will wrap to multiple lines on a narrow recents column"
                         .to_string(),
             })
-            .collect();
+            .collect());
     let area = Rect {
         x: 0,
         y: 0,

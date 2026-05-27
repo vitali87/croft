@@ -26,10 +26,12 @@ mod click;
 mod fs_watch;
 mod git_worker;
 mod perf_hud;
+mod welcome;
 use click::ClickTracker;
 use fs_watch::FsWatch;
 use git_worker::GitWorker;
 use perf_hud::PerfHud;
+use welcome::WelcomeState;
 
 use crate::widgets::{
     editor::{Editor, EditorTabs},
@@ -635,17 +637,7 @@ pub struct App {
     /// redraw repaints the PNGs and you see the cursor blink each time iTerm
     /// processes the image.
     activity_overlay_dirty: bool,
-    /// Drives the welcome screen's "Recent" list. Always sourced from the
-    /// croft repository remote baked into this binary at build time, never
-    /// from the workspace the user opened.
-    recent_repo_remote: Option<String>,
-    recent_commits: Vec<crate::git::CommitInfo>,
-    welcome_links: Vec<WelcomeLink>,
-    /// Receiver for the background HTTP fetch of croft's recent commits.
-    /// `None` once the fetch has completed (or failed) and been drained.
-    recent_commits_rx: Option<
-        std::sync::mpsc::Receiver<(crate::git::RecentCommits, crate::git::RecentCommitsError)>,
-    >,
+    welcome: WelcomeState,
     /// Channel to the background search worker. Each keystroke or toggle
     /// flip pushes a `(query, opts)` request here; the worker debounces
     /// and runs `search_workspace` off the UI thread.
@@ -1244,13 +1236,7 @@ impl App {
             crate::sysmon::system_monitor_loop(sysmon_tx);
         });
 
-        let (commits_tx, commits_rx) = std::sync::mpsc::channel();
-        let recent_repo_remote = crate::git::croft_repository_remote();
-        std::thread::spawn(move || {
-            let timeout = std::time::Duration::from_secs(5);
-            let result = crate::git::fetch_croft_recent_commits_full(timeout);
-            let _ = commits_tx.send(result);
-        });
+        let welcome = WelcomeState::spawn();
 
         let (search_query_tx, search_query_rx) = std::sync::mpsc::channel();
         let (search_results_tx, search_results_rx) = std::sync::mpsc::channel();
@@ -1327,10 +1313,7 @@ impl App {
             terminal_click: ClickTracker::default(),
             scrollbar_drag: None,
             activity_overlay_dirty: true,
-            recent_repo_remote,
-            recent_commits: Vec::new(),
-            welcome_links: Vec::new(),
-            recent_commits_rx: Some(commits_rx),
+            welcome,
             search_query_tx,
             search_results_rx,
             welcome_image: None,
@@ -2125,36 +2108,18 @@ impl App {
     /// installed (so the welcome panel repaints), false otherwise. Drops
     /// the receiver after consuming so subsequent calls are cheap no-ops.
     pub fn drain_recent_commits(&mut self) -> bool {
-        let Some(rx) = self.recent_commits_rx.as_ref() else {
+        let drain = self.welcome.drain();
+        if !drain.installed {
             return false;
-        };
-        match rx.try_recv() {
-            Ok((commits, err)) => {
-                self.recent_repo_remote = commits.remote;
-                self.recent_commits = commits.commits;
-                self.recent_commits_rx = None;
-                if self.editor.is_blank_initial() && self.welcome_image_displayed {
-                    self.welcome_image_clear_requested = true;
-                }
-                self.welcome_overlay_dirty = true;
-                match err {
-                    crate::git::RecentCommitsError::None => {}
-                    crate::git::RecentCommitsError::Network => {
-                        self.status = String::from("Recent commits unavailable: git fetch failed");
-                    }
-                    crate::git::RecentCommitsError::NoEndpoint => {
-                        self.status =
-                            String::from("Recent commits unavailable: no remote configured");
-                    }
-                }
-                true
-            }
-            Err(std::sync::mpsc::TryRecvError::Empty) => false,
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                self.recent_commits_rx = None;
-                false
-            }
         }
+        if self.editor.is_blank_initial() && self.welcome_image_displayed {
+            self.welcome_image_clear_requested = true;
+        }
+        self.welcome_overlay_dirty = true;
+        if let Some(msg) = drain.status {
+            self.status = msg;
+        }
+        true
     }
 
     /// Per-tick LSP doc sync. Diffs every text-buffer tab's edit_seq
@@ -2417,7 +2382,7 @@ impl App {
     }
 
     fn render_welcome(&mut self, frame: &mut ratatui::Frame, outer_area: Rect) {
-        self.welcome_links.clear();
+        self.welcome.clear_links();
         self.welcome_codeberg_badge_cell = None;
         if outer_area.width == 0 || outer_area.height == 0 {
             return;
@@ -2468,12 +2433,9 @@ impl App {
         // The gradient box's content area is 2 cells narrower (the box
         // border itself).
         let inner_w = block_w.saturating_sub(2);
-        let has_recent_panel = self.recent_repo_remote.is_some() || !self.recent_commits.is_empty();
-        let recents_inner_h = welcome_recents_height(
-            self.recent_repo_remote.as_deref(),
-            &self.recent_commits,
-            inner_w,
-        );
+        let has_recent_panel = self.welcome.has_recent_panel();
+        let recents_inner_h =
+            welcome_recents_height(self.welcome.remote(), self.welcome.commits(), inner_w);
         let tagline_h = 1u16;
         let footer_h = 1u16;
         // Gaps: blank row after logo, after tagline, after box.
@@ -2687,8 +2649,10 @@ impl App {
                     .add_modifier(Modifier::BOLD),
             );
 
+            let recent_remote = self.welcome.remote().map(String::from);
+            let recent_commits = self.welcome.commits().to_vec();
             let mut row_y = header_y + 2;
-            if let Some(remote) = self.recent_repo_remote.as_ref() {
+            if let Some(remote) = recent_remote.as_ref() {
                 let provider = welcome_provider_label(remote);
                 let badge = welcome_provider_badge(remote);
                 frame
@@ -2713,7 +2677,7 @@ impl App {
                     .saturating_add(2)
                     .saturating_add(room.min(remote.chars().count()) as u16)
                     .min(inner_w_actual);
-                self.welcome_links.push(WelcomeLink {
+                self.welcome.push_link(WelcomeLink {
                     rect: Rect {
                         x: inner_x,
                         y: row_y,
@@ -2725,7 +2689,7 @@ impl App {
                 });
                 row_y += 2;
             }
-            for c in &self.recent_commits {
+            for c in &recent_commits {
                 let y = row_y;
                 if y >= box_rect.y + box_rect.height - 1 {
                     break;
@@ -2754,10 +2718,10 @@ impl App {
                         .set_string(subject_x, line_y, clipped, row_style);
                 }
                 frame.buffer_mut().set_string(when_x, y, &c.when, dim);
-                if let Some(remote) = self.recent_repo_remote.as_ref() {
+                if let Some(remote) = recent_remote.as_ref() {
                     if let Some(url) = crate::git::commit_url_for_remote(remote, &c.full_hash) {
                         let height = subject_lines.len().max(1) as u16;
-                        self.welcome_links.push(WelcomeLink {
+                        self.welcome.push_link(WelcomeLink {
                             rect: Rect {
                                 x: inner_x,
                                 y,
@@ -6222,7 +6186,8 @@ impl App {
     }
 
     fn welcome_link_at(&self, col: u16, row: u16) -> Option<&WelcomeLink> {
-        self.welcome_links
+        self.welcome
+            .links()
             .iter()
             .find(|link| rect_contains(link.rect, col, row))
     }
