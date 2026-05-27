@@ -23,13 +23,14 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 mod click;
+mod fs_watch;
 mod perf_hud;
 use click::ClickTracker;
+use fs_watch::FsWatch;
 use perf_hud::PerfHud;
 
 use crate::widgets::{
     editor::{Editor, EditorTabs},
-    file_finder::is_noise_dir,
     file_tree::FileTree,
     remote::RemotePanel,
     run_debug::RunDebugPanel,
@@ -170,14 +171,6 @@ pub const APP_NAME: &str = "croft";
 /// (modified, staged, or untracked) flips the pill to yellow/orange.
 const GIT_CLEAN_COLOR: Color = Color::Rgb(0xa3, 0xbe, 0x8c);
 const GIT_DIRTY_COLOR: Color = Color::Rgb(0xeb, 0xcb, 0x8b);
-const FS_POLL_INTERVAL: Duration = Duration::from_millis(50);
-
-/// Top-level directory names that the FS watcher must NOT descend into.
-/// Each lives behind a macOS TCC class (`kTCCServiceSystemPolicyAppData`,
-/// `kTCCServiceSystemPolicyContainersGroups`, etc.); statting their
-/// contents from a non-owning process trips the App Management privacy
-/// prompt for the responsible parent terminal.
-const FS_WATCH_PROTECTED_NAMES: &[&str] = &["Library", ".Trash"];
 
 /// Build the status-bar spans for the git pill: branch glyph, branch name,
 /// optional ahead/behind counts.  Colour alone carries clean/dirty state, in
@@ -574,19 +567,7 @@ pub struct App {
     is_remote: bool,
     context_menu: Option<ContextMenu>,
     prompt: Option<Prompt>,
-    /// Filesystem watcher; held to keep it alive. Events flow into `fs_rx`.
-    _fs_watcher: Option<
-        notify_debouncer_full::Debouncer<
-            notify::RecommendedWatcher,
-            notify_debouncer_full::RecommendedCache,
-        >,
-    >,
-    fs_rx: Option<std::sync::mpsc::Receiver<notify_debouncer_full::DebounceEventResult>>,
-    /// Receives the debouncer + event channel from a background thread once
-    /// notify_debouncer_full finishes its initial recursive cache walk. On
-    /// large monorepos this walk is the dominant startup cost (≥1 s), so
-    /// it must not block `App::new`. None once installed.
-    fs_watcher_init_rx: Option<std::sync::mpsc::Receiver<FsWatcherInit>>,
+    fs_watch: FsWatch,
     git_status: crate::git::GitStatus,
     /// Outbox for `git status` / `git status --porcelain` requests sent
     /// to the background worker (`git::git_worker_loop`). Sidebar-icon
@@ -729,13 +710,6 @@ pub struct App {
     /// Clipboard read entrypoint. Production uses the host clipboard; tests
     /// can swap in a deterministic reader for Cmd+V routing assertions.
     clipboard_reader: fn() -> Option<String>,
-    /// Last low-frequency reconciliation of expanded directories. This is a
-    /// backstop for events missed while the async watcher is still starting,
-    /// and for host watcher failures.
-    fs_poll_last_check: std::time::Instant,
-    fs_poll_interval: Duration,
-    fs_poll_dir_mtimes: std::collections::BTreeMap<PathBuf, Option<std::time::SystemTime>>,
-    fs_poll_open_file_mtime: Option<(PathBuf, Option<(std::time::SystemTime, u64)>)>,
     remote_launch: Option<RemoteLaunch>,
     pending_remote_launch_host: Option<String>,
     pending_remote_launch_path: Option<String>,
@@ -1012,14 +986,6 @@ struct WelcomeLink {
     label: String,
 }
 
-type FsWatcherInit = (
-    notify_debouncer_full::Debouncer<
-        notify::RecommendedWatcher,
-        notify_debouncer_full::RecommendedCache,
-    >,
-    std::sync::mpsc::Receiver<notify_debouncer_full::DebounceEventResult>,
-);
-
 fn welcome_provider_label(remote: &str) -> &'static str {
     crate::git::commit_api_provider_for_remote(remote)
         .map(crate::git::CommitApiProvider::label)
@@ -1272,20 +1238,6 @@ impl App {
         let editor = EditorTabs::new();
         let term = PtyTerminal::new(&root).context("spawning terminal")?;
 
-        // notify_debouncer_full's RecommendedCache walks the entire watched
-        // subtree to populate its path↔inode map; on a multi-GB monorepo
-        // that's >1 s. Defer to a background thread; install via
-        // `try_install_pending_init` once it completes. The user sees the
-        // UI immediately; the 50ms polling fallback below reconciles the
-        // visible tree and active editor while the watcher starts.
-        let (fs_init_tx, fs_init_rx) = std::sync::mpsc::channel();
-        let root_for_fs = root.clone();
-        std::thread::spawn(move || {
-            if let Ok(pair) = Self::spawn_fs_watcher(&root_for_fs) {
-                let _ = fs_init_tx.send(pair);
-            }
-        });
-
         // Background git worker: every `git status` / `git status
         // --porcelain` shell-out goes through this channel instead of
         // running on the UI thread. The very first request seeds the
@@ -1342,7 +1294,7 @@ impl App {
             let entries = crate::widgets::file_finder::build_file_index(&index_root);
             let _ = file_finder_index_tx.send(entries);
         });
-        let fs_poll_dir_mtimes = Self::snapshot_expanded_dir_mtimes(&tree);
+        let fs_watch = FsWatch::spawn(&root, &tree);
         Ok(Self {
             tree,
             search,
@@ -1380,9 +1332,7 @@ impl App {
             is_remote: is_remote_session(),
             context_menu: None,
             prompt: None,
-            _fs_watcher: None,
-            fs_rx: None,
-            fs_watcher_init_rx: Some(fs_init_rx),
+            fs_watch,
             git_status: crate::git::GitStatus::default(),
             git_request_tx,
             git_response_rx,
@@ -1419,10 +1369,6 @@ impl App {
             no_repo_hero_image_clear_requested: false,
             cell_pixel: None,
             clipboard_reader: read_system_clipboard,
-            fs_poll_last_check: std::time::Instant::now(),
-            fs_poll_interval: FS_POLL_INTERVAL,
-            fs_poll_dir_mtimes,
-            fs_poll_open_file_mtime: None,
             remote_launch: None,
             pending_remote_launch_host: None,
             pending_remote_launch_path: None,
@@ -2065,141 +2011,9 @@ impl App {
         let _ = self.git_request_tx.send(req);
     }
 
-    fn spawn_fs_watcher(
-        root: &Path,
-    ) -> Result<(
-        notify_debouncer_full::Debouncer<
-            notify::RecommendedWatcher,
-            notify_debouncer_full::RecommendedCache,
-        >,
-        std::sync::mpsc::Receiver<notify_debouncer_full::DebounceEventResult>,
-    )> {
-        use notify::RecursiveMode;
-        use notify_debouncer_full::new_debouncer;
-        use std::time::Duration;
-        let (tx, rx) = std::sync::mpsc::channel();
-        let mut debouncer = new_debouncer(Duration::from_millis(100), None, tx)
-            .context("creating filesystem watcher")?;
-        // The watcher backend is fundamentally different on the two
-        // first-class targets, so the install strategy MUST differ too -
-        // a single uniform strategy is pathological on one of them:
-        //
-        //  * macOS / FSEvents is per-TREE. One recursive watch covers an
-        //    entire subtree in a single stream with no kernel watch limit,
-        //    and every `watch()` call tears down and rebuilds that stream.
-        //    Calling `watch()` once per directory therefore fires thousands
-        //    of FSEventStreamCreate calls and pins a core at ~100% forever
-        //    (confirmed by `sample` 2026-05: the FSEvents thread sits in
-        //    FSEventStreamCreate). So on macOS we make as FEW calls as
-        //    possible.
-        //
-        //  * Linux / inotify is per-DIRECTORY. A recursive watch installs
-        //    one watch per dir in the subtree, and a real repo's
-        //    node_modules/target/.git push past
-        //    /proc/sys/fs/inotify/max_user_watches (often 8192 on a VPS),
-        //    returning ENOSPC so NO watcher installs and the main loop
-        //    falls back to a blocking stat-walk that freezes typing over
-        //    SSH. Each inotify_add_watch is cheap and independent (no
-        //    stream rebuild), so on Linux we add MANY non-recursive watches.
-        //
-        // Both branches prune the same protected + noise dirs (target/,
-        // node_modules/, .git/, ~/Library Containers) which generate
-        // cargo/npm/git write storms the debouncer's FileIdMap memcmp loop
-        // can't keep up with, and which on macOS also trip Sonoma's App
-        // Management TCC class.
-        let is_skippable = |name: &std::ffi::OsStr| -> bool {
-            FS_WATCH_PROTECTED_NAMES.iter().any(|n| name == *n) || is_noise_dir(name)
-        };
-        #[cfg(target_os = "macos")]
-        {
-            let entries: Vec<std::fs::DirEntry> = std::fs::read_dir(root)
-                .map(|rd| rd.filter_map(Result::ok).collect())
-                .unwrap_or_default();
-            if entries.iter().any(|e| is_skippable(&e.file_name())) {
-                debouncer
-                    .watch(root, RecursiveMode::NonRecursive)
-                    .context("starting non-recursive watch on workspace root")?;
-                for entry in entries {
-                    if is_skippable(&entry.file_name()) {
-                        continue;
-                    }
-                    let path = entry.path();
-                    if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
-                        let _ = debouncer.watch(&path, RecursiveMode::Recursive);
-                    }
-                }
-            } else {
-                debouncer
-                    .watch(root, RecursiveMode::Recursive)
-                    .context("starting watch on workspace root")?;
-            }
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            // Hard ceiling so a pathological tree can't spend forever
-            // issuing inotify_add_watch syscalls on the init thread;
-            // anything beyond is covered by the adaptive-backoff poll
-            // fallback. Per-dir failures are tolerated (we keep going), so
-            // a tree that still exceeds the limit installs with partial
-            // coverage instead of nothing.
-            const MAX_WATCHES: usize = 50_000;
-            let mut stack = vec![root.to_path_buf()];
-            let mut watched = 0usize;
-            while let Some(dir) = stack.pop() {
-                if debouncer.watch(&dir, RecursiveMode::NonRecursive).is_ok() {
-                    watched += 1;
-                }
-                if watched >= MAX_WATCHES {
-                    break;
-                }
-                let Ok(rd) = std::fs::read_dir(&dir) else {
-                    continue;
-                };
-                for entry in rd.filter_map(Result::ok) {
-                    if is_skippable(&entry.file_name()) {
-                        continue;
-                    }
-                    // `file_type()` does not follow symlinks, so a symlinked
-                    // directory reports `is_dir() == false` and we never
-                    // descend into it - that also rules out symlink cycles.
-                    if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
-                        stack.push(entry.path());
-                    }
-                }
-            }
-        }
-        Ok((debouncer, rx))
-    }
-
-    fn dir_modified(path: &Path) -> Option<std::time::SystemTime> {
-        std::fs::metadata(path).and_then(|m| m.modified()).ok()
-    }
-
-    fn file_stamp(path: &Path) -> Option<(std::time::SystemTime, u64)> {
-        let meta = std::fs::metadata(path).ok()?;
-        let modified = meta.modified().ok()?;
-        Some((modified, meta.len()))
-    }
-
-    fn snapshot_open_file_mtime(&self) -> Option<(PathBuf, Option<(std::time::SystemTime, u64)>)> {
-        self.editor
-            .path
-            .as_ref()
-            .map(|path| (path.clone(), Self::file_stamp(path)))
-    }
-
     fn sync_open_file_poll_mtime(&mut self) {
-        self.fs_poll_open_file_mtime = self.snapshot_open_file_mtime();
-    }
-
-    fn snapshot_expanded_dir_mtimes(
-        tree: &FileTree,
-    ) -> std::collections::BTreeMap<PathBuf, Option<std::time::SystemTime>> {
-        tree.nodes
-            .iter()
-            .filter(|n| n.is_dir && n.expanded)
-            .map(|n| (n.path.clone(), Self::dir_modified(&n.path)))
-            .collect()
+        self.fs_watch
+            .sync_open_file_mtime(self.editor.path.as_deref());
     }
 
     fn reload_open_file_after_external_change(&mut self) -> bool {
@@ -2227,85 +2041,20 @@ impl App {
         true
     }
 
-    fn poll_open_file_change(&mut self) -> bool {
-        let current = self.snapshot_open_file_mtime();
-        let changed = match (&self.fs_poll_open_file_mtime, &current) {
-            (Some((old_path, old_stamp)), Some((path, stamp))) if old_path == path => {
-                old_stamp != stamp
-            }
-            _ => {
-                self.fs_poll_open_file_mtime = current;
-                return false;
-            }
-        };
-        self.fs_poll_open_file_mtime = current;
-        if changed {
-            self.reload_open_file_after_external_change()
-        } else {
-            false
-        }
-    }
-
     fn poll_filesystem_changes(&mut self) -> bool {
-        if self.fs_poll_last_check.elapsed() < self.fs_poll_interval {
-            return false;
+        let poll = self
+            .fs_watch
+            .poll(&mut self.tree, self.editor.path.as_deref());
+        if poll.open_file_changed {
+            self.reload_open_file_after_external_change();
         }
-        // This walk runs on the render/input thread. When the inotify
-        // watcher failed to install (common on remotes: ENOSPC on
-        // max_user_watches, or a slow recursive init), it is the only
-        // way the tree learns about disk changes — but on a remote
-        // filesystem the stat walk can cost hundreds of ms, and at a
-        // fixed 50ms cadence it dominates the loop and starves typing
-        // (measured: a single iteration > 600ms over SSH). Back the next
-        // poll off to a multiple of how long this one actually took, so a
-        // cheap local FS still polls at ~20Hz while a slow remote FS polls
-        // rarely enough that the loop stays responsive.
-        let poll_start = std::time::Instant::now();
-        self.fs_poll_last_check = poll_start;
-        let mut changed = self.poll_open_file_change();
-        let current = Self::snapshot_expanded_dir_mtimes(&self.tree);
-        let changed_dirs: Vec<PathBuf> = current
-            .iter()
-            .filter_map(|(path, stamp)| {
-                if self.fs_poll_dir_mtimes.get(path) == Some(stamp) {
-                    None
-                } else {
-                    Some(path.clone())
-                }
-            })
-            .collect();
-        if changed_dirs.is_empty() {
-            self.fs_poll_dir_mtimes = current;
-            self.fs_poll_interval = poll_start
-                .elapsed()
-                .saturating_mul(10)
-                .clamp(FS_POLL_INTERVAL, Duration::from_secs(10));
-            return changed;
-        }
-        for dir in changed_dirs.iter().rev() {
-            if let Some(idx) = self.tree.index_of_dir(dir) {
-                self.tree.refresh_children(idx);
+        if poll.dirs_changed {
+            self.refresh_git_status_debounced();
+            if poll.finder_relevant {
+                self.kick_file_finder_index_rebuild();
             }
         }
-        self.fs_poll_dir_mtimes = Self::snapshot_expanded_dir_mtimes(&self.tree);
-        self.refresh_git_status_debounced();
-        // Polling fallback fires when the watcher missed events
-        // (no-watcher mode, or notify on a network FS). Kick the index
-        // rebuild the same way the watcher path does so Cmd+P stays in
-        // sync without a croft restart. Same noise-dir gate as the
-        // watcher path — see drain_fs_events for the diagnosis.
-        let finder_relevant = changed_dirs
-            .iter()
-            .any(|p| !crate::widgets::file_finder::is_path_under_noise_dir(p));
-        if finder_relevant {
-            self.kick_file_finder_index_rebuild();
-        }
-        self.fs_poll_interval = poll_start
-            .elapsed()
-            .saturating_mul(10)
-            .clamp(FS_POLL_INTERVAL, Duration::from_secs(10));
-        changed = true;
-        changed
+        poll.open_file_changed || poll.dirs_changed
     }
 
     /// Drain any pending filesystem events from the watcher and refresh the
@@ -2318,21 +2067,7 @@ impl App {
     /// their threads have finished. Returns true if any were installed this
     /// tick (so the caller redraws). Cheap no-op once both are installed.
     pub fn try_install_pending_init(&mut self) -> bool {
-        let mut changed = false;
-        if let Some(rx) = self.fs_watcher_init_rx.as_ref() {
-            match rx.try_recv() {
-                Ok((w, evrx)) => {
-                    self._fs_watcher = Some(w);
-                    self.fs_rx = Some(evrx);
-                    self.fs_watcher_init_rx = None;
-                    changed = true;
-                }
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    self.fs_watcher_init_rx = None;
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => {}
-            }
-        }
+        let mut changed = self.fs_watch.try_install_watcher();
         if self.drain_git_responses() {
             changed = true;
         }
@@ -2698,89 +2433,19 @@ impl App {
     }
 
     fn drain_fs_events(&mut self) -> bool {
-        // Pick up the watcher if its background init has just finished.
         let init_changed = self.try_install_pending_init();
-        let Some(rx) = self.fs_rx.as_ref() else {
-            let polled = self.poll_filesystem_changes();
-            return init_changed || polled;
-        };
-        let mut affected: std::collections::BTreeSet<PathBuf> = std::collections::BTreeSet::new();
-        let mut touched_open_file = false;
-        let mut got_any = false;
-        while let Ok(result) = rx.try_recv() {
-            got_any = true;
-            let events = match result {
-                Ok(evs) => evs,
-                Err(_) => continue,
-            };
-            for ev in events {
-                let mutates_content = event_mutates_content(&ev.event.kind);
-                for path in &ev.event.paths {
-                    // Editor reload trigger: only events that mutate the
-                    // file's content. Access reads and metadata-only changes
-                    // (atime updates from `cat` / indexers / containerised
-                    // overlay filesystems) used to flip this flag too, which
-                    // reloaded the editor and wiped any in-flight selection
-                    // — confirmed empirically on a Linux remote where the
-                    // status bar repeatedly read "Reloaded README.md
-                    // (external change)" while the user was trying to
-                    // Cmd+A / Shift+Right / mouse-drag.
-                    if mutates_content && self.editor.matches_open_path(path) {
-                        touched_open_file = true;
-                    }
-                    if let Some(dir) =
-                        crate::widgets::file_tree::affected_dir_for_event(path, &self.tree.root)
-                    {
-                        affected.insert(dir);
-                    } else if path == &self.tree.root
-                        || path.canonicalize().ok().as_deref()
-                            == self.tree.root.canonicalize().ok().as_deref()
-                    {
-                        affected.insert(self.tree.root.clone());
-                    }
-                }
-            }
-        }
-        if !affected.is_empty() {
-            for dir in affected.iter().rev() {
-                if let Some(idx) = self.tree.index_of_dir(dir) {
-                    self.tree.refresh_children(idx);
-                } else if let Some(c) = dir.canonicalize().ok() {
-                    if let Some(idx) = self.tree.index_of_dir(&c) {
-                        self.tree.refresh_children(idx);
-                    }
-                }
-            }
-            self.fs_poll_dir_mtimes = Self::snapshot_expanded_dir_mtimes(&self.tree);
-        }
-        if !affected.is_empty() {
+        let drain = self.fs_watch.drain(&mut self.tree, &self.editor);
+        if drain.dirs_changed {
             self.refresh_git_status_debounced();
-            // A directory's children changed: files were created, deleted,
-            // or renamed (or git swapped them on a checkout). Kick a
-            // background rebuild of the Cmd+P index so the next Cmd+P
-            // reflects what is actually on disk. Coalesces via the dirty
-            // flag so a 10k-file checkout produces one trailing rebuild,
-            // not 10k of them. Skip rebuild when EVERY affected dir is
-            // inside a noise dir (target/, node_modules/, .git/, …) —
-            // those paths are excluded from the finder's walk anyway, so
-            // a rebuild would re-walk the workspace just to re-emit the
-            // same set. Without this gate, a sustained `cargo build`
-            // pegged every core via the parallel walker firing
-            // back-to-back. Root-caused empirically with
-            // `sample $(pgrep -x croft) 5` showing ~50 worker threads in
-            // `ignore::WalkBuilder::build_parallel`.
-            let finder_relevant = affected
-                .iter()
-                .any(|p| !crate::widgets::file_finder::is_path_under_noise_dir(p));
-            if finder_relevant {
+            if drain.finder_relevant {
                 self.kick_file_finder_index_rebuild();
             }
         }
-        if touched_open_file {
+        if drain.touched_open_file {
             self.reload_open_file_after_external_change();
         }
         let polled = self.poll_filesystem_changes();
-        got_any || init_changed || polled
+        drain.got_any || init_changed || polled
     }
 
     fn cycle_focus(&mut self) {
@@ -8152,19 +7817,7 @@ impl App {
         self.tree.set_root(new_root.clone());
         self.tree_clipboard = None;
         self.compare_anchor = None;
-        // Drop the old watcher synchronously (free), spawn the new one
-        // on a worker thread. Same pattern App::new uses at startup.
-        self._fs_watcher = None;
-        self.fs_rx = None;
-        let (fs_init_tx, fs_init_rx) = std::sync::mpsc::channel();
-        let root_for_fs = new_root.clone();
-        std::thread::spawn(move || {
-            if let Ok(pair) = Self::spawn_fs_watcher(&root_for_fs) {
-                let _ = fs_init_tx.send(pair);
-            }
-        });
-        self.fs_watcher_init_rx = Some(fs_init_rx);
-        self.fs_poll_dir_mtimes = Self::snapshot_expanded_dir_mtimes(&self.tree);
+        self.fs_watch.rebind(&new_root, &self.tree);
         self.last_git_check = std::time::Instant::now()
             .checked_sub(std::time::Duration::from_secs(1))
             .unwrap_or_else(std::time::Instant::now);
@@ -10144,21 +9797,6 @@ fn find_python_venv(start: &Path, workspace_root: &Path) -> Option<(PathBuf, Pat
 const TERMINAL_ADD_LABEL: &str = " + ";
 const TERMINAL_CLOSE_LABEL: &str = " - ";
 
-/// Classify a notify `EventKind` as touching file content. Pure reads
-/// (`Access(_)`) and metadata-only mutations (`Modify(Metadata(_))` —
-/// chmod, chown, atime, xattr) leave bytes on disk unchanged and must
-/// not trigger an editor reload, otherwise the open buffer's selection
-/// is wiped on every benign indexer/atime update on Linux remotes.
-fn event_mutates_content(kind: &notify::EventKind) -> bool {
-    use notify::EventKind;
-    use notify::event::ModifyKind;
-    match kind {
-        EventKind::Access(_) => false,
-        EventKind::Modify(ModifyKind::Metadata(_)) => false,
-        _ => true,
-    }
-}
-
 /// True when croft was invoked over an SSH login (or otherwise inside a
 /// remote shell). Used to throttle PTY-driven redraws further so the SSH
 /// pipe never saturates and starves input handling on the same thread.
@@ -10586,9 +10224,7 @@ pub fn run(root: PathBuf, restore_session: Option<PathBuf>) -> Result<()> {
         return Ok(());
     }
     if let Some(remote) = app.remote_launch.take() {
-        app._fs_watcher = None;
-        app.fs_rx = None;
-        app.fs_watcher_init_rx = None;
+        app.fs_watch.disable();
         let launch_result = if let Some(adopted) = remote.adopted {
             crate::remote::launch_only(adopted, remote.path.as_deref())
         } else {

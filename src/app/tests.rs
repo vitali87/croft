@@ -115,7 +115,7 @@ fn fs_watcher_does_not_descend_into_protected_top_level_dirs() {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&library, std::fs::Permissions::from_mode(0o000)).unwrap();
     }
-    let result = App::spawn_fs_watcher(tmp.path());
+    let result = super::fs_watch::FsWatch::spawn_watcher(tmp.path());
     // Restore perms so tempdir cleanup works.
     #[cfg(unix)]
     {
@@ -152,7 +152,7 @@ fn fs_watcher_does_not_deliver_events_from_target_or_node_modules_subtrees() {
     let target = target_raw.canonicalize().unwrap();
     let node_modules = node_modules_raw.canonicalize().unwrap();
 
-    let (_debouncer, rx) = App::spawn_fs_watcher(tmp.path())
+    let (_debouncer, rx) = super::fs_watch::FsWatch::spawn_watcher(tmp.path())
         .expect("watcher must start cleanly with noise dirs present");
 
     for _ in 0..30 {
@@ -209,7 +209,7 @@ fn fs_watcher_does_not_deliver_events_from_target_or_node_modules_subtrees() {
 fn drain_fs_events_returns_false_when_nothing_pending() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app.fs_watcher_init_rx = None;
+    app.fs_watch.disable();
     for _ in 0..20 {
         let _ = app.drain_fs_events();
         std::thread::sleep(std::time::Duration::from_millis(10));
@@ -286,11 +286,9 @@ fn drain_fs_events_removes_deleted_root_file_from_tree() {
 fn drain_fs_events_polling_fallback_refreshes_tree_without_watcher_event() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app._fs_watcher = None;
-    app.fs_rx = None;
-    app.fs_watcher_init_rx = None;
-    app.fs_poll_dir_mtimes.clear();
-    app.fs_poll_last_check = std::time::Instant::now() - FS_POLL_INTERVAL;
+    app.fs_watch.disable();
+    app.fs_watch.clear_dir_mtimes();
+    app.fs_watch.force_poll_due();
 
     let new_file = tmp.path().join("new.txt");
     std::fs::write(&new_file, "hi").unwrap();
@@ -310,10 +308,8 @@ fn drain_fs_events_polling_fallback_reloads_clean_open_file_without_watcher_even
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.editor.open_pinned(&file).unwrap();
     app.sync_open_file_poll_mtime();
-    app._fs_watcher = None;
-    app.fs_rx = None;
-    app.fs_watcher_init_rx = None;
-    app.fs_poll_last_check = std::time::Instant::now() - FS_POLL_INTERVAL;
+    app.fs_watch.disable();
+    app.fs_watch.force_poll_due();
 
     std::fs::write(&file, "new content\n").unwrap();
 
@@ -347,9 +343,7 @@ fn drain_fs_events_preserves_editor_selection_on_access_only_event() {
     );
 
     let (tx, rx) = mpsc::channel();
-    app._fs_watcher = None;
-    app.fs_watcher_init_rx = None;
-    app.fs_rx = Some(rx);
+    app.fs_watch.set_test_events(rx);
     app.sync_open_file_poll_mtime();
 
     let access_event = NotifyEvent::new(EventKind::Access(AccessKind::Open(AccessMode::Read)))
@@ -386,9 +380,7 @@ fn drain_fs_events_preserves_editor_selection_on_metadata_event() {
     app.editor.select_all();
 
     let (tx, rx) = mpsc::channel();
-    app._fs_watcher = None;
-    app.fs_watcher_init_rx = None;
-    app.fs_rx = Some(rx);
+    app.fs_watch.set_test_events(rx);
     app.sync_open_file_poll_mtime();
 
     let metadata_event = NotifyEvent::new(EventKind::Modify(ModifyKind::Metadata(
@@ -425,9 +417,7 @@ fn drain_fs_events_reloads_on_modify_data_event() {
     app.editor.open_pinned(&file).unwrap();
 
     let (tx, rx) = mpsc::channel();
-    app._fs_watcher = None;
-    app.fs_watcher_init_rx = None;
-    app.fs_rx = Some(rx);
+    app.fs_watch.set_test_events(rx);
     app.sync_open_file_poll_mtime();
 
     std::fs::write(&file, "new content\n").unwrap();
