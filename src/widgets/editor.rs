@@ -369,6 +369,10 @@ fn render_diff(
     let equal_fg = Color::Rgb(0xc5, 0xcd, 0xd9);
     let gutter_fg = Color::Rgb(0x6c, 0x7d, 0x9c);
 
+    let find_needle = diff.find.needle.clone();
+    let find_opts = diff.find.opts;
+    let find_active = diff.find.active;
+
     let end = (diff.scroll + viewport).min(total);
     for (vis_row, row_idx) in (diff.scroll..end).enumerate() {
         let y = body_top + vis_row as u16;
@@ -513,6 +517,46 @@ fn render_diff(
                 })
                 .bg(r_cell_bg),
         );
+
+        // Inline-find highlight: overpaint every occurrence of the needle
+        // on top of the text just laid down, lighting the active match in
+        // a stronger colour. Reuses the plain editor's painter so the diff
+        // and text views look identical under Cmd+F.
+        if let Some(needle) = find_needle.as_deref() {
+            use crate::widgets::diff::DiffSide;
+            if l_left_idx.is_some() && l_text_w > 0 {
+                let active = find_active
+                    .filter(|a| a.row == row_idx && a.side == DiffSide::Left)
+                    .map(|a| (a.col_chars, a.len_chars));
+                paint_search_highlight(
+                    buf,
+                    l_text_x,
+                    y,
+                    l_text_w,
+                    &l_text,
+                    needle,
+                    find_opts,
+                    diff.scroll_x,
+                    active,
+                );
+            }
+            if r_right_idx.is_some() && r_text_w > 0 {
+                let active = find_active
+                    .filter(|a| a.row == row_idx && a.side == DiffSide::Right)
+                    .map(|a| (a.col_chars, a.len_chars));
+                paint_search_highlight(
+                    buf,
+                    r_text_x,
+                    y,
+                    r_text_w,
+                    &r_text,
+                    needle,
+                    find_opts,
+                    diff.scroll_x,
+                    active,
+                );
+            }
+        }
     }
 
     paint_diff_selection_band(

@@ -1523,6 +1523,72 @@ fn cmd_c_on_side_by_side_diff_selection_lands_text_on_macos_clipboard() {
 }
 
 #[test]
+fn editor_find_in_side_by_side_diff_counts_matches_in_diff_content() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let f1 = tmp.path().join("a.txt");
+    let f2 = tmp.path().join("b.txt");
+    std::fs::write(&f1, "alpha\nbravo\ncharlie\n").unwrap();
+    std::fs::write(&f2, "alpha\nbravo\ncharlie\nlogger.info here\n").unwrap();
+    app.editor.open_diff(&f1, &f2).unwrap();
+    app.focus = Pane::Editor;
+    let backend = ratatui::backend::TestBackend::new(120, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+
+    app.open_editor_find();
+    app.editor_find_set_query(String::from("logger"));
+
+    let count = app.editor_find.as_ref().map(|s| s.match_count).unwrap_or(0);
+    assert!(
+        count >= 1,
+        "Find must search the content rendered in a diff tab: 'logger' is visible in the right column yet match_count={count}"
+    );
+    let active = app
+        .editor
+        .diff
+        .as_ref()
+        .and_then(|d| d.find.active)
+        .expect("a match in a diff must set an active find position for highlighting");
+    assert_eq!(
+        active.side,
+        crate::widgets::diff::DiffSide::Right,
+        "the 'logger' match lives on the added (right) side and must be selected as active"
+    );
+}
+
+#[test]
+fn editor_find_in_diff_next_prev_cycle_through_both_columns() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let f1 = tmp.path().join("a.txt");
+    let f2 = tmp.path().join("b.txt");
+    std::fs::write(&f1, "needle one\nplain\n").unwrap();
+    std::fs::write(&f2, "needle one\nplain\nneedle two\n").unwrap();
+    app.editor.open_diff(&f1, &f2).unwrap();
+    app.focus = Pane::Editor;
+    let backend = ratatui::backend::TestBackend::new(120, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+
+    app.open_editor_find();
+    app.editor_find_set_query(String::from("needle"));
+    let count = app.editor_find.as_ref().map(|s| s.match_count).unwrap_or(0);
+    assert!(
+        count >= 2,
+        "an equal line counts on both columns plus the added line: expected >=2, got {count}"
+    );
+    let first = app.editor_find.as_ref().and_then(|s| s.match_index);
+    assert_eq!(first, Some(1), "opening find selects the first match");
+    app.editor_find_jump_next();
+    let second = app.editor_find.as_ref().and_then(|s| s.match_index);
+    assert_eq!(second, Some(2), "Enter advances to the second match");
+    app.editor_find_jump_prev();
+    let back = app.editor_find.as_ref().and_then(|s| s.match_index);
+    assert_eq!(back, Some(1), "Shift+Enter walks back to the first match");
+}
+
+#[test]
 fn double_click_in_diff_selects_word_and_cmd_c_copies_it() {
     // End-to-end: two left-clicks in quick succession on a word in
     // the left column must snap a word-bounded selection (same UX

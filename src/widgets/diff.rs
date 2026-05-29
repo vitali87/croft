@@ -1,5 +1,8 @@
 use std::path::PathBuf;
 
+use crate::widgets::editor_find::line_matches;
+use crate::widgets::search::SearchOpts;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DiffData {
     pub left_path: PathBuf,
@@ -34,6 +37,30 @@ pub struct DiffData {
     /// selection so dragging across the seam doesn't flip sides
     /// mid-stream.
     pub selection: Option<DiffSelection>,
+    /// Inline-find state for the diff view. Holds the active needle, its
+    /// search options, and the currently-selected match so the renderer
+    /// can light up every occurrence and paint the active one in a
+    /// stronger colour, mirroring the plain-text editor's Cmd+F highlight.
+    pub find: DiffFindState,
+}
+
+/// A single occurrence of the find needle inside a diff, located by the
+/// visual row index (into `rows`), the column it lives in, and the
+/// character span it covers. `col_chars`/`len_chars` are character
+/// offsets into that side's source line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DiffMatch {
+    pub row: usize,
+    pub side: DiffSide,
+    pub col_chars: usize,
+    pub len_chars: usize,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DiffFindState {
+    pub needle: Option<String>,
+    pub opts: SearchOpts,
+    pub active: Option<DiffMatch>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -132,6 +159,7 @@ impl DiffData {
             bytes_differ_but_lines_equal,
             unified: false,
             selection: None,
+            find: DiffFindState::default(),
         }
     }
 
@@ -155,6 +183,7 @@ impl DiffData {
             bytes_differ_but_lines_equal: false,
             unified: true,
             selection: None,
+            find: DiffFindState::default(),
         }
     }
 
@@ -197,6 +226,7 @@ impl DiffData {
                 bytes_differ_but_lines_equal: false,
                 unified: false,
                 selection: None,
+                find: DiffFindState::default(),
             };
         }
         let mut pending_remove: Vec<usize> = Vec::new();
@@ -277,6 +307,74 @@ impl DiffData {
             bytes_differ_but_lines_equal: false,
             unified: false,
             selection: None,
+            find: DiffFindState::default(),
+        }
+    }
+
+    /// Every occurrence of `needle` across both columns, in reading order
+    /// (top to bottom, left column before right within a row). An Equal
+    /// row carries the same text on both sides, so a hit there is reported
+    /// twice — once per visible column — matching what the user sees.
+    pub fn find_matches(&self, needle: &str, opts: SearchOpts) -> Vec<DiffMatch> {
+        let mut out: Vec<DiffMatch> = Vec::new();
+        if needle.is_empty() {
+            return out;
+        }
+        for (row_idx, row) in self.rows.iter().enumerate() {
+            let left_idx = match row {
+                DiffRow::Equal { left, .. }
+                | DiffRow::Removed { left }
+                | DiffRow::Replaced { left, .. } => Some(*left),
+                DiffRow::Added { .. } => None,
+            };
+            if let Some(line) = left_idx.and_then(|i| self.left_lines.get(i)) {
+                for (col, len) in line_matches(line, opts, needle) {
+                    out.push(DiffMatch {
+                        row: row_idx,
+                        side: DiffSide::Left,
+                        col_chars: col,
+                        len_chars: len,
+                    });
+                }
+            }
+            let right_idx = match row {
+                DiffRow::Equal { right, .. }
+                | DiffRow::Added { right }
+                | DiffRow::Replaced { right, .. } => Some(*right),
+                DiffRow::Removed { .. } => None,
+            };
+            if let Some(line) = right_idx.and_then(|i| self.right_lines.get(i)) {
+                for (col, len) in line_matches(line, opts, needle) {
+                    out.push(DiffMatch {
+                        row: row_idx,
+                        side: DiffSide::Right,
+                        col_chars: col,
+                        len_chars: len,
+                    });
+                }
+            }
+        }
+        out
+    }
+
+    /// Scroll the viewport so `m` is visible both vertically (its row lands
+    /// inside `viewport_rows`) and horizontally (its char span lands inside
+    /// `text_cols`). Mirrors the plain-editor `jump_editor_to_match` logic.
+    pub fn scroll_to_match(&mut self, m: DiffMatch, viewport_rows: usize, text_cols: usize) {
+        if viewport_rows > 0 {
+            if m.row < self.scroll {
+                self.scroll = m.row;
+            } else if m.row >= self.scroll + viewport_rows {
+                self.scroll = m.row + 1 - viewport_rows;
+            }
+        }
+        if text_cols > 0 {
+            let end = m.col_chars + m.len_chars;
+            if m.col_chars < self.scroll_x {
+                self.scroll_x = m.col_chars;
+            } else if end > self.scroll_x + text_cols {
+                self.scroll_x = end - text_cols;
+            }
         }
     }
 

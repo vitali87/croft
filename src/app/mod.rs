@@ -6290,6 +6290,26 @@ impl App {
             return;
         }
         let opts = self.search.opts;
+        if self.editor.diff.is_some() {
+            let initial = self
+                .editor
+                .diff
+                .as_ref()
+                .and_then(|d| d.selection_text())
+                .filter(|s| !s.contains('\n'))
+                .unwrap_or_default();
+            self.editor_find = Some(crate::widgets::editor_find::EditorFind {
+                query: String::new(),
+                opts,
+                ..Default::default()
+            });
+            if !initial.is_empty() {
+                self.diff_find_set_query(initial);
+            }
+            self.status =
+                String::from("Find: type to search, Enter next, Shift+Enter prev, Esc close");
+            return;
+        }
         let initial = if !self.editor.selection_text().is_empty()
             && !self.editor.selection_text().contains('\n')
         {
@@ -6315,17 +6335,109 @@ impl App {
     fn close_editor_find(&mut self) {
         if self.editor_find.take().is_some() {
             self.editor.set_search_highlight(None, self.search.opts);
+            if let Some(diff) = self.editor.diff.as_mut() {
+                diff.find.needle = None;
+                diff.find.active = None;
+            }
             self.status.clear();
         }
     }
 
+    /// Viewport geometry (visible rows, visible text columns) of the diff
+    /// body, derived from the last rendered inner rect the same way
+    /// `render_diff` lays the columns out. Used to keep a jumped-to match
+    /// on screen.
+    fn diff_find_viewport(&self) -> (usize, usize) {
+        let inner = self.editor.last_inner;
+        let viewport_rows = (inner.height as usize).saturating_sub(2);
+        let half = inner.width / 2;
+        let text_cols = match self.editor.diff.as_ref() {
+            Some(diff) => {
+                let r_gutter = (diff.right_lines.len() + 1).to_string().len() as u16 + 1;
+                inner
+                    .width
+                    .saturating_sub(half + 1)
+                    .saturating_sub(r_gutter + 2) as usize
+            }
+            None => 0,
+        };
+        (viewport_rows, text_cols)
+    }
+
+    /// Recompute the diff's matches for the current query, select the
+    /// match at `target` (wrapping), scroll it into view, and sync the
+    /// find bar's count / index. Drives every diff find action.
+    fn diff_find_apply(&mut self, target: usize) {
+        let (needle, opts) = match self.editor_find.as_ref() {
+            Some(s) => (s.query.clone(), s.opts),
+            None => return,
+        };
+        let (viewport_rows, text_cols) = self.diff_find_viewport();
+        let Some(diff) = self.editor.diff.as_mut() else {
+            return;
+        };
+        diff.find.opts = opts;
+        if needle.is_empty() {
+            diff.find.needle = None;
+            diff.find.active = None;
+            if let Some(s) = self.editor_find.as_mut() {
+                s.match_count = 0;
+                s.match_index = None;
+            }
+            return;
+        }
+        diff.find.needle = Some(needle.clone());
+        let matches = diff.find_matches(&needle, opts);
+        let count = matches.len();
+        if count == 0 {
+            diff.find.active = None;
+            if let Some(s) = self.editor_find.as_mut() {
+                s.match_count = 0;
+                s.match_index = None;
+            }
+            return;
+        }
+        let pos = target % count;
+        let m = matches[pos];
+        diff.find.active = Some(m);
+        diff.scroll_to_match(m, viewport_rows, text_cols);
+        if let Some(s) = self.editor_find.as_mut() {
+            s.match_count = count;
+            s.match_index = Some(pos + 1);
+        }
+    }
+
+    fn diff_find_set_query(&mut self, new_query: String) {
+        if let Some(s) = self.editor_find.as_mut() {
+            s.query = new_query;
+        }
+        self.diff_find_apply(0);
+    }
+
+    fn diff_find_current_pos(&self) -> usize {
+        self.editor_find
+            .as_ref()
+            .and_then(|s| s.match_index)
+            .map(|i| i.saturating_sub(1))
+            .unwrap_or(0)
+    }
+
     fn editor_find_set_query(&mut self, new_query: String) {
+        let unchanged = self
+            .editor_find
+            .as_ref()
+            .map(|s| s.query == new_query)
+            .unwrap_or(true);
+        if unchanged {
+            return;
+        }
+        if self.editor.diff.is_some() {
+            self.diff_find_set_query(new_query);
+            return;
+        }
         let Some(state) = self.editor_find.as_mut() else {
             return;
         };
-        if state.query == new_query {
-            return;
-        }
         state.query = new_query;
         let opts = state.opts;
         state.match_count =
@@ -6360,6 +6472,10 @@ impl App {
         if state.query.is_empty() {
             return;
         }
+        if self.editor.diff.is_some() {
+            self.diff_find_apply(self.diff_find_current_pos() + 1);
+            return;
+        }
         let opts = state.opts;
         let needle = state.query.clone();
         if let Some(m) = crate::widgets::editor_find::find_next_match(
@@ -6380,6 +6496,14 @@ impl App {
             return;
         };
         if state.query.is_empty() {
+            return;
+        }
+        if self.editor.diff.is_some() {
+            let count = state.match_count;
+            if count == 0 {
+                return;
+            }
+            self.diff_find_apply(self.diff_find_current_pos() + count - 1);
             return;
         }
         let opts = state.opts;

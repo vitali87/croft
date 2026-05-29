@@ -23,7 +23,7 @@ pub struct MatchPos {
     pub len_chars: usize,
 }
 
-fn line_matches(line: &str, opts: SearchOpts, needle: &str) -> Vec<(usize, usize)> {
+pub fn line_matches(line: &str, opts: SearchOpts, needle: &str) -> Vec<(usize, usize)> {
     let mut out: Vec<(usize, usize)> = Vec::new();
     let mut col_chars = 0usize;
     for (chunk, is_match) in split_for_highlight(line, needle, opts) {
