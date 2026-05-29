@@ -4018,6 +4018,43 @@ mod tests {
     }
 
     #[test]
+    fn diff_caret_screen_pos_inverts_the_right_column_hit_test() {
+        use crate::widgets::diff::DiffSide;
+        let f1 = NamedTempFile::new().unwrap();
+        let f2 = NamedTempFile::new().unwrap();
+        std::fs::write(f1.path(), "alpha\nbravo\n").unwrap();
+        std::fs::write(f2.path(), "alpha\nBRAVO\n").unwrap();
+        let mut t = EditorTabs::new();
+        t.open_diff(f1.path(), f2.path()).unwrap();
+        let active_idx = t.active_index();
+        t.editors[active_idx].focused = true;
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 10,
+        };
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        ratatui::widgets::Widget::render(&mut t.editors[active_idx], area, &mut buf);
+        let body_top = t.editors[active_idx].last_inner.y + 1;
+        let half = t.editors[active_idx].last_inner.width / 2;
+        let diff = t.editors[active_idx].diff.as_ref().unwrap();
+        let r_gutter = (diff.right_lines.len() + 1).to_string().len() as u16 + 1;
+        let r_text_x = t.editors[active_idx].last_inner.x + half + 1 + r_gutter + 2;
+        t.editors[active_idx]
+            .diff
+            .as_mut()
+            .unwrap()
+            .start_selection(DiffSide::Right, 1, 3);
+        let pos = t.editors[active_idx].diff_caret_screen_pos();
+        assert_eq!(
+            pos,
+            Some((r_text_x + 3, body_top + 1)),
+            "caret at right row 1 col 3 must land on the cell diff_hit_test maps that screen point back to"
+        );
+    }
+
+    #[test]
     fn render_diff_paints_selection_band_over_selected_cells() {
         use crate::widgets::diff::DiffSide;
         let f1 = NamedTempFile::new().unwrap();
@@ -4998,6 +5035,57 @@ impl Editor {
         let cy = self.last_inner.y + row_in_view as u16;
         Some((cx, cy))
     }
+
+    /// Screen cell of the diff view's read-only caret (its selection head),
+    /// clamped to the viewport. The exact inverse of `diff_hit_test`: feed
+    /// it the same layout (`last_inner`, gutters, seam, scroll) so the
+    /// blinking caret lands on the cell a click there would map back to.
+    /// `None` when there's no diff, no caret, or the caret is scrolled out.
+    pub fn diff_caret_screen_pos(&self) -> Option<(u16, u16)> {
+        use crate::widgets::diff::DiffSide;
+        let diff = self.diff.as_ref()?;
+        if diff.unified {
+            return None;
+        }
+        let (side, row_idx, char_col) = diff.caret()?;
+        let inner = self.last_inner;
+        if inner.width < 16 || inner.height < 3 {
+            return None;
+        }
+        let body_top = inner.y + 1;
+        let body_height = inner.height.saturating_sub(2);
+        if body_height == 0 || row_idx < diff.scroll {
+            return None;
+        }
+        let vis_row = row_idx - diff.scroll;
+        if vis_row as u16 >= body_height {
+            return None;
+        }
+        let half = inner.width / 2;
+        if half < 8 {
+            return None;
+        }
+        let l_gutter = (diff.left_lines.len() + 1).to_string().len() as u16 + 1;
+        let r_gutter = (diff.right_lines.len() + 1).to_string().len() as u16 + 1;
+        let (text_x, text_w) = match side {
+            DiffSide::Left => (
+                inner.x + l_gutter + 2,
+                half.saturating_sub(l_gutter + 2 + 1),
+            ),
+            DiffSide::Right => (
+                inner.x + half + 1 + r_gutter + 2,
+                (inner.width - (half + 1)).saturating_sub(r_gutter + 2),
+            ),
+        };
+        if text_w == 0 || char_col < diff.scroll_x {
+            return None;
+        }
+        let vis_col = char_col - diff.scroll_x;
+        if vis_col as u16 >= text_w {
+            return None;
+        }
+        Some((text_x + vis_col as u16, body_top + vis_row as u16))
+    }
 }
 
 /// Overpaint every match of `needle` in `raw_line` with the search-match
@@ -5343,8 +5431,15 @@ impl EditorTabs {
     /// path aliases dedupe to the same tab). Returns `None` if no tab is
     /// currently holding that file.
     pub fn find_tab_with_path(&self, target: &Path) -> Option<usize> {
+        self.find_tab_matching(target, |_| true)
+    }
+
+    fn find_tab_matching(&self, target: &Path, extra: impl Fn(&Editor) -> bool) -> Option<usize> {
         let canon_target = target.canonicalize().ok();
         self.editors.iter().position(|e| {
+            if !extra(e) {
+                return false;
+            }
             let Some(p) = e.path.as_ref() else {
                 return false;
             };
@@ -5433,12 +5528,13 @@ impl EditorTabs {
             .with_context(|| format!("reading {}", right.display()))?;
         let left_lines: Vec<String> = left_text.lines().map(str::to_string).collect();
         let right_lines: Vec<String> = right_text.lines().map(str::to_string).collect();
-        let data = crate::widgets::diff::DiffData::build(
+        let mut data = crate::widgets::diff::DiffData::build(
             left.to_path_buf(),
             right.to_path_buf(),
             left_lines,
             right_lines,
         );
+        data.left_is_real_file = true;
 
         let mut e = Editor::new();
         e.focused = self.editors[self.active].focused;
@@ -5580,7 +5676,11 @@ impl EditorTabs {
     /// to it. Otherwise create a fresh pinned tab next to the active one.
     /// Used by double-click in the explorer and Ctrl+Enter on a tree row.
     pub fn open_pinned(&mut self, path: &Path) -> Result<()> {
-        if let Some(idx) = self.find_tab_with_path(path) {
+        // A diff tab can carry the working file's `path` yet is not an
+        // editable view of it, so skip diffs here: Enter on a diff (or a
+        // double-click) opens the real file beside the diff rather than just
+        // re-selecting the diff tab.
+        if let Some(idx) = self.find_tab_matching(path, |e| e.diff.is_none()) {
             self.editors[idx].preview = false;
             self.select(idx);
             return Ok(());

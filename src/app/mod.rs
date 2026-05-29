@@ -1588,9 +1588,6 @@ impl App {
     /// (just past the active-pill column). Empty when image rendering is
     /// disabled or the activity bar hasn't been laid out yet.
     pub fn pending_activity_image_overlays(&self) -> Vec<((u16, u16), &str)> {
-        if self.shortcuts_modal.is_some() || self.file_finder.is_some() {
-            return Vec::new();
-        }
         let Some(images) = self.overlays.activity.images() else {
             return Vec::new();
         };
@@ -1632,13 +1629,34 @@ impl App {
         } else {
             &images.run_debug_inactive
         };
-        vec![
-            ((exp_block.x, exp_block.y), exp_state.as_str()),
-            ((sea_block.x, sea_block.y), sea_state.as_str()),
-            ((scm_block.x, scm_block.y), scm_state.as_str()),
-            ((rem_block.x, rem_block.y), rem_state.as_str()),
-            ((rdb_block.x, rdb_block.y), rdb_state.as_str()),
+        // The shortcuts modal and file finder are centered over the editor
+        // column, not the far-left activity bar, so the icons stay visible
+        // beside them. Suppress an icon only when its block actually
+        // intersects an open panel (possible only when the terminal is
+        // narrow enough that the centered panel reaches column 0); otherwise
+        // a terminal.clear() armed by the modal wipes iTerm2's cached image
+        // cells and they never repaint while the panel is up.
+        let occluders = [
+            self.shortcuts_modal.as_ref().map(|m| m.last_rect),
+            self.file_finder.as_ref().map(|f| f.last_rect),
+        ];
+        let visible = |block: Rect| {
+            occluders
+                .iter()
+                .flatten()
+                .all(|panel| !block.intersects(*panel))
+        };
+        [
+            (exp_block, exp_state.as_str()),
+            (sea_block, sea_state.as_str()),
+            (scm_block, scm_state.as_str()),
+            (rem_block, rem_state.as_str()),
+            (rdb_block, rdb_state.as_str()),
         ]
+        .into_iter()
+        .filter(|(block, _)| visible(*block))
+        .map(|(block, state)| ((block.x, block.y), state))
+        .collect()
     }
 
     /// Paint the Codeberg badge OSC-1337 image at its current welcome-panel
@@ -1730,7 +1748,12 @@ impl App {
         if self.context_menu.is_some() || self.prompt.is_some() || !self.cursor_visible_phase() {
             return false;
         }
-        if self.focus == Pane::Editor && self.editor.cursor_screen_pos().is_some() {
+        let editor_caret = if self.editor.diff.is_some() {
+            self.editor.diff_caret_screen_pos()
+        } else {
+            self.editor.cursor_screen_pos()
+        };
+        if self.focus == Pane::Editor && editor_caret.is_some() {
             return true;
         }
         if self.focus == Pane::Tree
@@ -3171,7 +3194,12 @@ impl App {
             && self.prompt.is_none()
             && self.cursor_visible_phase()
         {
-            if let Some((cx, cy)) = self.editor.cursor_screen_pos() {
+            let pos = if self.editor.diff.is_some() {
+                self.editor.diff_caret_screen_pos()
+            } else {
+                self.editor.cursor_screen_pos()
+            };
+            if let Some((cx, cy)) = pos {
                 frame.set_cursor_position((cx, cy));
             }
         }
@@ -7979,6 +8007,36 @@ impl App {
         }
     }
 
+    /// Open the working-tree file the diff caret sits on at its line, the
+    /// Enter action in the diff view. Resolves the row to a (file, line)
+    /// via `DiffData::jump_target`, then reuses the explorer's pinned-tab
+    /// open so the diff tab is left intact beside the opened file.
+    fn jump_to_diff_file_under_caret(&mut self) {
+        let root = self.tree.root.clone();
+        let target = {
+            let Some(diff) = self.editor.diff.as_ref() else {
+                return;
+            };
+            let row = diff.caret_row().unwrap_or(diff.scroll);
+            diff.jump_target(row, &root)
+        };
+        let Some(j) = target else {
+            return;
+        };
+        match self.editor.open_pinned(&j.path) {
+            Ok(()) => {
+                self.editor.goto_line(j.line);
+                self.focus_pane(Pane::Editor);
+                self.sync_open_file_poll_mtime();
+                self.poke_cursor();
+                self.status = format!("{}:{}", j.path.display(), j.line);
+            }
+            Err(err) => {
+                self.status = format!("Could not open {}: {err}", j.path.display());
+            }
+        }
+    }
+
     fn handle_diff_key(&mut self, key: KeyEvent) {
         // Cmd+C / Ctrl+Shift+C on a diff selection: copy the dragged
         // substring of whichever column the selection is anchored on.
@@ -7988,6 +8046,13 @@ impl App {
         // this branch Cmd+C in a diff view literally never copies.
         if is_editor_copy_key(key) {
             self.copy_editor_selection();
+            return;
+        }
+        // Enter opens the file under the caret at the matching line. The
+        // caret is the selection head a click leaves behind; with no
+        // selection yet we fall back to the top visible row.
+        if matches!(key.code, KeyCode::Enter) {
+            self.jump_to_diff_file_under_caret();
             return;
         }
         // Page = inner viewport rows minus the header + footer the diff

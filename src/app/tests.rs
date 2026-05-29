@@ -5,6 +5,22 @@ fn key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
     KeyEvent::new(code, mods)
 }
 
+fn dummy_activity_images() -> ActivityBarImages {
+    let s = || String::from("\x1b]1337;File=inline=1:Zm9v\x07");
+    ActivityBarImages {
+        explorer_active: s(),
+        explorer_inactive: s(),
+        search_active: s(),
+        search_inactive: s(),
+        source_control_active: s(),
+        source_control_inactive: s(),
+        remote_active: s(),
+        remote_inactive: s(),
+        run_debug_active: s(),
+        run_debug_inactive: s(),
+    }
+}
+
 #[test]
 fn opening_a_search_hit_moves_focus_to_the_editor() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1520,6 +1536,117 @@ fn cmd_c_on_side_by_side_diff_selection_lands_text_on_macos_clipboard() {
         got, "bravo",
         "selecting cols 0..5 of the left column of row 1 and pressing Cmd+C must copy the exact left-side text via handle_diff_key's copy branch"
     );
+}
+
+#[test]
+fn enter_in_diff_view_opens_the_file_under_the_caret_at_its_line() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let f1 = tmp.path().join("a.txt");
+    let f2 = tmp.path().join("b.txt");
+    std::fs::write(&f1, "alpha\nbravo\n").unwrap();
+    std::fs::write(&f2, "alpha\nBRAVO\ncharlie\n").unwrap();
+    app.editor.open_diff(&f1, &f2).unwrap();
+    app.focus = Pane::Editor;
+    // Row 2 is the Added "charlie" row on the right side: new-file line 3.
+    app.editor
+        .diff
+        .as_mut()
+        .unwrap()
+        .start_selection(crate::widgets::diff::DiffSide::Right, 2, 0);
+
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+
+    assert!(
+        app.editor.diff.is_none(),
+        "Enter must leave the diff and land in a real editable file tab"
+    );
+    assert_eq!(
+        app.editor.path.as_deref(),
+        Some(f2.as_path()),
+        "the caret was on the right (working-tree) side, so Enter opens b.txt"
+    );
+    assert_eq!(
+        app.editor.cursor_row, 2,
+        "goto_line(3) puts the zero-based cursor on row 2 (the 'charlie' line)"
+    );
+}
+
+#[test]
+fn enter_on_a_removed_line_in_a_source_control_diff_opens_the_working_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let foo = tmp.path().join("foo.txt");
+    // Working tree dropped "bravo"; HEAD still has it.
+    std::fs::write(&foo, "alpha\ncharlie\n").unwrap();
+    // Mirror open_source_control_entry's Modified branch: synthetic HEAD
+    // label on the left, the real working file on the right.
+    let label = std::path::PathBuf::from("foo.txt (HEAD)");
+    app.editor
+        .open_head_diff_with_text(label, "alpha\nbravo\ncharlie\n", &foo)
+        .unwrap();
+    app.focus = Pane::Editor;
+    // Rows: 0 Equal alpha, 1 Removed bravo, 2 Equal charlie. Click row 1.
+    app.editor
+        .diff
+        .as_mut()
+        .unwrap()
+        .start_selection(crate::widgets::diff::DiffSide::Left, 1, 0);
+
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+
+    assert!(
+        app.editor.diff.is_none(),
+        "Enter on a removed line must leave the diff for the real working \
+         file, not stay parked on the diff tab; status was {:?}",
+        app.status
+    );
+    assert_eq!(app.editor.path.as_deref(), Some(foo.as_path()));
+}
+
+#[test]
+fn enter_in_multifile_git_diff_opens_the_real_file_under_the_caret() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let src_dir = tmp.path().join("src");
+    std::fs::create_dir_all(&src_dir).unwrap();
+    let foo = src_dir.join("foo.rs");
+    std::fs::write(&foo, "keep1\nold\nkeep2\n").unwrap();
+    let raw = concat!(
+        "diff --git a/src/foo.rs b/src/foo.rs\n",
+        "index 1111111..2222222 100644\n",
+        "--- a/src/foo.rs\n",
+        "+++ b/src/foo.rs\n",
+        "@@ -1,3 +1,4 @@\n",
+        " keep1\n",
+        "-old\n",
+        "+new1\n",
+        "+new2\n",
+        " keep2\n",
+    );
+    let label = std::path::PathBuf::from("git diff --staged");
+    app.editor.open_git_diff_side_by_side(&label, raw).unwrap();
+    app.focus = Pane::Editor;
+    // Row 3 is "+new1" on the right side (new-file line 2).
+    app.editor
+        .diff
+        .as_mut()
+        .unwrap()
+        .start_selection(crate::widgets::diff::DiffSide::Right, 3, 0);
+
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+
+    assert_eq!(
+        app.editor.path.as_deref(),
+        Some(foo.as_path()),
+        "Enter on a row in the multi-file git diff must open the real file the \
+         `diff --git` header names, resolved against the workspace root; status was {:?}",
+        app.status
+    );
+    assert_eq!(app.editor.cursor_row, 1, "+new1 is new-file line 2");
 }
 
 #[test]
@@ -5272,19 +5399,41 @@ fn ssh_empty_state_overlay_arms_image_clear_when_modal_opens_on_top() {
 }
 
 #[test]
-fn activity_overlay_emission_is_suppressed_while_the_shortcuts_modal_is_open() {
+fn activity_icons_stay_visible_beside_the_centered_shortcuts_modal() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.overlays.activity.set_images(dummy_activity_images());
     let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let before = app.pending_activity_image_overlays().len();
+    assert_eq!(before, 5, "precondition: all five activity-bar icons emit");
+    app.handle_key(key(KeyCode::F(1), KeyModifiers::NONE))
+        .unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let during = app.pending_activity_image_overlays().len();
+    assert_eq!(
+        during, before,
+        "the shortcuts modal is centered over the editor column, so the far-left activity-bar icons it does not cover must keep re-emitting — otherwise the terminal.clear() armed by F1 wipes iTerm2's cached cells and the icons vanish for the whole time the modal is up; saw {before} icons before opening"
+    );
+}
+
+#[test]
+fn activity_icons_behind_a_modal_that_reaches_the_left_edge_are_suppressed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.overlays.activity.set_images(dummy_activity_images());
+    let backend = ratatui::backend::TestBackend::new(40, 40);
     let mut term = ratatui::Terminal::new(backend).unwrap();
     term.draw(|f| app.render(f)).unwrap();
     let before = app.pending_activity_image_overlays().len();
     app.handle_key(key(KeyCode::F(1), KeyModifiers::NONE))
         .unwrap();
+    term.draw(|f| app.render(f)).unwrap();
     let during = app.pending_activity_image_overlays().len();
-    assert_eq!(
-        during, 0,
-        "while the modal is open the activity-bar OSC-1337 emitter must return an empty overlay list, otherwise the icons re-paint over the modal every 2 seconds via the keep-alive timer; before opening saw {before} overlays"
+    assert!(
+        during < before || before == 0,
+        "on a terminal narrow enough that the centered modal reaches column 0, icons whose blocks intersect the modal must be suppressed so they don't ghost over the modal text; saw {before} icons before, {during} during"
     );
 }
 

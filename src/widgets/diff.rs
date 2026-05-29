@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::widgets::editor_find::line_matches;
 use crate::widgets::search::SearchOpts;
@@ -7,6 +7,12 @@ use crate::widgets::search::SearchOpts;
 pub struct DiffData {
     pub left_path: PathBuf,
     pub right_path: PathBuf,
+    /// True only when `left_path` is a real file on disk (a two-file
+    /// `open_diff`), so Enter on a `Removed` row can open it at that line.
+    /// False for synthetic-left diffs (the HEAD-vs-working view, where the
+    /// left side is a `"foo (HEAD)"` label) so a `Removed` row falls back to
+    /// the real working file on the right instead of a path that ENOENTs.
+    pub left_is_real_file: bool,
     pub left_lines: Vec<String>,
     pub right_lines: Vec<String>,
     pub rows: Vec<DiffRow>,
@@ -67,6 +73,14 @@ pub struct DiffFindState {
 pub enum DiffSide {
     Left,
     Right,
+}
+
+/// The file and one-based line a diff row points at, used by Enter in the
+/// diff view to open the underlying file at the right place.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DiffJump {
+    pub path: PathBuf,
+    pub line: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -151,6 +165,7 @@ impl DiffData {
         Self {
             left_path,
             right_path,
+            left_is_real_file: false,
             left_lines,
             right_lines,
             rows,
@@ -175,6 +190,7 @@ impl DiffData {
         Self {
             left_path: label,
             right_path: PathBuf::from("/dev/null"),
+            left_is_real_file: false,
             left_lines,
             right_lines: Vec::new(),
             rows,
@@ -218,6 +234,7 @@ impl DiffData {
             return Self {
                 left_path: label,
                 right_path: PathBuf::new(),
+                left_is_real_file: false,
                 left_lines,
                 right_lines,
                 rows,
@@ -299,6 +316,7 @@ impl DiffData {
         Self {
             left_path: label,
             right_path: PathBuf::new(),
+            left_is_real_file: false,
             left_lines,
             right_lines,
             rows,
@@ -537,6 +555,111 @@ impl DiffData {
         self.rows.len()
     }
 
+    /// The caret cell, i.e. the head of the active selection. A single
+    /// click leaves a zero-area selection whose head is exactly where the
+    /// user clicked, so this doubles as a read-only text cursor the
+    /// renderer can blink.
+    pub fn caret(&self) -> Option<(DiffSide, usize, usize)> {
+        self.selection.map(|s| (s.side, s.head_row, s.head_col))
+    }
+
+    pub fn caret_row(&self) -> Option<usize> {
+        self.selection.map(|s| s.head_row)
+    }
+
+    fn row_left_text(&self, row_idx: usize) -> Option<&str> {
+        match self.rows.get(row_idx)? {
+            DiffRow::Equal { left, .. }
+            | DiffRow::Removed { left }
+            | DiffRow::Replaced { left, .. } => self.left_lines.get(*left).map(String::as_str),
+            DiffRow::Added { .. } => None,
+        }
+    }
+
+    /// Resolve a diff row to the file and one-based line it represents so
+    /// Enter can open the working-tree file there.
+    ///
+    /// A single-file diff (built from two real paths) stores real file
+    /// line numbers in each row, so the answer is `right_path` plus the
+    /// row's new-side index. A multi-file `git diff` view stores the
+    /// `diff --git` and `@@` headers as ordinary rows and indexes into a
+    /// synthetic line array, so the file comes from the nearest preceding
+    /// `diff --git` header and the line from the nearest `@@` hunk header
+    /// plus a count of the right-bearing rows down to `row_idx`.
+    fn nearest_right_line0(&self, row_idx: usize) -> Option<usize> {
+        let right_of = |r: &DiffRow| match r {
+            DiffRow::Equal { right, .. }
+            | DiffRow::Added { right }
+            | DiffRow::Replaced { right, .. } => Some(*right),
+            DiffRow::Removed { .. } => None,
+        };
+        (row_idx + 1..self.rows.len())
+            .find_map(|i| self.rows.get(i).and_then(right_of))
+            .or_else(|| {
+                (0..row_idx)
+                    .rev()
+                    .find_map(|i| self.rows.get(i).and_then(right_of))
+            })
+    }
+
+    pub fn jump_target(&self, row_idx: usize, root: &Path) -> Option<DiffJump> {
+        let row = *self.rows.get(row_idx)?;
+        if !self.right_path.as_os_str().is_empty() {
+            let (path, line0) = match row {
+                DiffRow::Equal { right, .. }
+                | DiffRow::Added { right }
+                | DiffRow::Replaced { right, .. } => (self.right_path.clone(), right),
+                // A removed line lives only on the left. When the left side
+                // is a real file (two-file compare) open it there; when it's
+                // a synthetic HEAD label the line is gone from the working
+                // tree, so open the real right file at the nearest surviving
+                // line instead of a label path that ENOENTs.
+                DiffRow::Removed { left } => {
+                    if self.left_is_real_file {
+                        (self.left_path.clone(), left)
+                    } else if self.right_path != Path::new("/dev/null") {
+                        (self.right_path.clone(), self.nearest_right_line0(row_idx)?)
+                    } else {
+                        return None;
+                    }
+                }
+            };
+            return Some(DiffJump {
+                path,
+                line: line0 + 1,
+            });
+        }
+        let mut file: Option<PathBuf> = None;
+        let mut hunk_row: Option<usize> = None;
+        let mut hunk_start: usize = 1;
+        for i in (0..=row_idx).rev() {
+            let Some(text) = self.row_left_text(i) else {
+                continue;
+            };
+            if hunk_row.is_none() && text.starts_with("@@") {
+                hunk_row = Some(i);
+                if let Some(n) = parse_hunk_new_start(text) {
+                    hunk_start = n;
+                }
+            }
+            if let Some(rel) = parse_diff_git_new_path(text) {
+                file = Some(root.join(rel));
+                break;
+            }
+        }
+        let path = file?;
+        let start = hunk_row.unwrap_or(row_idx);
+        let right_count = (start + 1..=row_idx)
+            .filter(|&i| self.rows.get(i).is_some_and(row_has_right))
+            .count();
+        let line = if right_count == 0 {
+            hunk_start
+        } else {
+            hunk_start + right_count - 1
+        };
+        Some(DiffJump { path, line })
+    }
+
     pub fn scroll_up_by(&mut self, n: usize) {
         self.scroll = self.scroll.saturating_sub(n);
     }
@@ -641,6 +764,30 @@ impl DiffData {
     pub fn scroll_to_row(&mut self, target: usize) {
         self.scroll = target.saturating_sub(2);
     }
+}
+
+fn row_has_right(row: &DiffRow) -> bool {
+    matches!(
+        row,
+        DiffRow::Equal { .. } | DiffRow::Added { .. } | DiffRow::Replaced { .. }
+    )
+}
+
+/// New-file start line from a `@@ -a,b +c,d @@` header, i.e. the `c`.
+fn parse_hunk_new_start(text: &str) -> Option<usize> {
+    let plus = text.find('+')?;
+    let after = &text[plus + 1..];
+    let end = after
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(after.len());
+    after[..end].parse().ok()
+}
+
+/// The new-side path from a `diff --git a/<old> b/<new>` header line.
+fn parse_diff_git_new_path(text: &str) -> Option<&str> {
+    let rest = text.strip_prefix("diff --git ")?;
+    let idx = rest.find(" b/")?;
+    Some(&rest[idx + 3..])
 }
 
 /// Run a line-level diff over `left` vs `right` and emit one DiffRow per
@@ -823,6 +970,95 @@ mod tests {
         assert_eq!(d.left_lines, lines(&["x", "y"]));
         assert_eq!(d.right_lines, lines(&["x", "Y"]));
         assert_eq!(d.scroll, 0);
+    }
+
+    #[test]
+    fn caret_reports_the_selection_head_side_row_and_col() {
+        let mut d = DiffData::build(
+            PathBuf::new(),
+            PathBuf::new(),
+            lines(&["alpha", "bravo"]),
+            lines(&["alpha", "BRAVO"]),
+        );
+        assert_eq!(d.caret(), None, "no selection means no caret");
+        d.start_selection(DiffSide::Right, 1, 3);
+        assert_eq!(d.caret(), Some((DiffSide::Right, 1, 3)));
+        assert_eq!(d.caret_row(), Some(1));
+    }
+
+    #[test]
+    fn jump_target_single_file_maps_row_to_right_path_and_one_based_line() {
+        let d = DiffData::build(
+            PathBuf::from("/tmp/a.txt"),
+            PathBuf::from("/tmp/b.txt"),
+            lines(&["x", "y"]),
+            lines(&["x", "Y"]),
+        );
+        // Row 1 is the Replaced y -> Y row; its new-file line is index 1 + 1.
+        let j = d.jump_target(1, std::path::Path::new("/repo")).unwrap();
+        assert_eq!(j.path, PathBuf::from("/tmp/b.txt"));
+        assert_eq!(j.line, 2);
+    }
+
+    #[test]
+    fn jump_target_git_text_resolves_file_from_header_and_line_from_hunk() {
+        let raw = concat!(
+            "diff --git a/src/foo.rs b/src/foo.rs\n",
+            "index 1111111..2222222 100644\n",
+            "--- a/src/foo.rs\n",
+            "+++ b/src/foo.rs\n",
+            "@@ -10,3 +10,4 @@ fn x() {\n",
+            " keep1\n",
+            "-old\n",
+            "+new1\n",
+            "+new2\n",
+            " keep2\n",
+        );
+        let d = DiffData::build_side_by_side_from_git_text(PathBuf::from("git diff"), raw);
+        // Rows: 0 diff-header, 1 @@-header, 2 keep1(10), 3 old->new1(11),
+        // 4 +new2(12), 5 keep2(13).
+        let root = std::path::Path::new("/repo");
+        let added = d.jump_target(4, root).unwrap();
+        assert_eq!(added.path, PathBuf::from("/repo/src/foo.rs"));
+        assert_eq!(added.line, 12, "the +new2 row is new-file line 12");
+        let keep = d.jump_target(2, root).unwrap();
+        assert_eq!(keep.line, 10, "the first kept row is new-file line 10");
+        let replaced = d.jump_target(3, root).unwrap();
+        assert_eq!(replaced.line, 11);
+    }
+
+    #[test]
+    fn jump_target_removed_row_with_real_left_opens_the_left_file() {
+        let mut d = DiffData::build(
+            PathBuf::from("/tmp/a.txt"),
+            PathBuf::from("/tmp/b.txt"),
+            lines(&["keep", "gone"]),
+            lines(&["keep"]),
+        );
+        d.left_is_real_file = true;
+        // Rows: 0 Equal keep, 1 Removed gone (left index 1).
+        let j = d.jump_target(1, std::path::Path::new("/repo")).unwrap();
+        assert_eq!(j.path, PathBuf::from("/tmp/a.txt"));
+        assert_eq!(j.line, 2, "the removed line is left-file line 2");
+    }
+
+    #[test]
+    fn jump_target_removed_row_with_synthetic_left_opens_the_working_right_file() {
+        // HEAD-vs-working diff: the left "path" is only a label, the right is
+        // the real file. A removed line is gone from the working tree, so
+        // Enter must land in the real right file, not the label that ENOENTs.
+        let d = DiffData::build(
+            PathBuf::from("foo.txt (HEAD)"),
+            PathBuf::from("/tmp/foo.txt"),
+            lines(&["keep", "gone"]),
+            lines(&["keep"]),
+        );
+        let j = d.jump_target(1, std::path::Path::new("/repo")).unwrap();
+        assert_eq!(
+            j.path,
+            PathBuf::from("/tmp/foo.txt"),
+            "left_is_real_file is false for a HEAD label, so the removed row resolves to the working file on the right"
+        );
     }
 
     #[test]
