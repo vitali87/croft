@@ -3908,6 +3908,55 @@ fn tree_context_menu_hides_compare_when_anchor_is_the_same_file() {
 }
 
 #[test]
+fn tree_context_menu_with_two_files_offers_compare_selected() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    std::fs::write(&a, "v1").unwrap();
+    let b = tmp.path().join("b.txt");
+    std::fs::write(&b, "v2").unwrap();
+    let n = file_node(&a);
+    let items = build_tree_context_menu_items(
+        Some(&n),
+        tmp.path(),
+        &[a.clone(), b.clone()],
+        tmp.path(),
+        None,
+        None,
+    );
+    let compare = items
+        .iter()
+        .find(|(s, _)| s == "Compare Selected")
+        .expect("Compare Selected must be offered for a two-file selection");
+    assert!(matches!(
+        compare.1,
+        MenuAction::CompareWithSelected { ref anchor, ref other }
+            if anchor == &a && other == &b
+    ));
+}
+
+#[test]
+fn tree_context_menu_hides_compare_selected_when_a_folder_is_selected() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    std::fs::write(&a, "v1").unwrap();
+    let d = tmp.path().join("dir");
+    std::fs::create_dir(&d).unwrap();
+    let n = file_node(&a);
+    let items = build_tree_context_menu_items(
+        Some(&n),
+        tmp.path(),
+        &[a.clone(), d.clone()],
+        tmp.path(),
+        None,
+        None,
+    );
+    assert!(
+        !items.iter().any(|(s, _)| s == "Compare Selected"),
+        "Compare Selected must not appear when the selection includes a folder"
+    );
+}
+
+#[test]
 fn tree_context_menu_with_multi_selection_promotes_delete_count() {
     let tmp = tempfile::tempdir().unwrap();
     let f = tmp.path().join("hello.txt");
@@ -3927,7 +3976,14 @@ fn tree_context_menu_with_multi_selection_promotes_delete_count() {
     let labels: Vec<&str> = items.iter().map(|(s, _)| s.as_str()).collect();
     assert_eq!(
         labels,
-        ["New File", "New Folder", "Cut", "Copy", "Delete 2 items"],
+        [
+            "New File",
+            "New Folder",
+            "Cut",
+            "Copy",
+            "Compare Selected",
+            "Delete 2 items"
+        ],
     );
 }
 

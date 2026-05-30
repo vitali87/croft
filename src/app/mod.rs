@@ -472,6 +472,18 @@ fn build_tree_context_menu_items(
                 MenuAction::SelectForCompare(file.clone()),
             ));
         }
+        // Two regular files selected: offer a direct diff between them,
+        // skipping the two-step Select-for-Compare anchor dance. Folders
+        // can't be diffed, so any folder in the selection suppresses it.
+        if paths_for_action.len() == 2 && paths_for_action.iter().all(|p| p.is_file()) {
+            items.push((
+                String::from("Compare Selected"),
+                MenuAction::CompareWithSelected {
+                    anchor: paths_for_action[0].clone(),
+                    other: paths_for_action[1].clone(),
+                },
+            ));
+        }
         // "Make root" appears only for non-root folders. Re-roots the
         // workspace at the clicked folder so the user can dive into a
         // nested git repo without relaunching croft.
