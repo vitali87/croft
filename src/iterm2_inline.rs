@@ -104,12 +104,14 @@ fn tint_rgba(src: &RgbaImage, tint: Rgba<u8>) -> RgbaImage {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum InlineImageProtocol {
     ITerm2,
     Kitty,
     None,
 }
 
+#[allow(dead_code)]
 pub fn inline_image_protocol_for(
     term_program: Option<&str>,
     term: Option<&str>,
@@ -122,6 +124,7 @@ pub fn inline_image_protocol_for(
     }
 }
 
+#[allow(dead_code)]
 pub fn detect_inline_image_protocol() -> InlineImageProtocol {
     let term_program = std::env::var("TERM_PROGRAM").ok();
     let term = std::env::var("TERM").ok();
@@ -219,6 +222,7 @@ pub fn build_inline_image_osc(
     )
 }
 
+#[allow(dead_code)]
 pub fn build_inline_image_kitty(
     png: &[u8],
     width_cells: u16,
@@ -251,6 +255,7 @@ pub fn build_inline_image_kitty(
     out
 }
 
+#[allow(dead_code)]
 pub fn delete_kitty_image(image_id: u32) -> String {
     format!("\x1b_Ga=d,d=i,i={image_id},q=2\x1b\\")
 }
