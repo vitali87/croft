@@ -3946,6 +3946,10 @@ impl App {
                 self.source_control.backspace();
                 self.poke_cursor();
             }
+            KeyCode::Delete => {
+                self.source_control.delete_char();
+                self.poke_cursor();
+            }
             KeyCode::Left => {
                 self.source_control.move_cursor_left();
                 self.poke_cursor();

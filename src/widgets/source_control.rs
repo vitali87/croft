@@ -66,6 +66,11 @@ pub struct SourceControlPanel {
     pub focused: bool,
     pub message: String,
     pub message_cursor: usize,
+    /// Leading characters scrolled out of view on the left of the
+    /// commit-message input so the caret stays visible when the message is
+    /// wider than the box. Recomputed every render from the cursor and the
+    /// box width.
+    pub message_scroll: usize,
     pub status: GitStatus,
     pub entries: Vec<ChangeEntry>,
     pub last_area: Rect,
@@ -126,6 +131,7 @@ impl SourceControlPanel {
             focused: false,
             message: String::new(),
             message_cursor: 0,
+            message_scroll: 0,
             status: GitStatus::default(),
             entries: Vec::new(),
             last_area: Rect::default(),
@@ -243,6 +249,19 @@ impl SourceControlPanel {
         self.message_cursor = target;
     }
 
+    pub fn delete_char(&mut self) {
+        if self.message_cursor >= self.message.chars().count() {
+            return;
+        }
+        let at = self.byte_index_at_cursor();
+        let next = self.message[at..]
+            .char_indices()
+            .nth(1)
+            .map(|(b, _)| at + b)
+            .unwrap_or_else(|| self.message.len());
+        self.message.replace_range(at..next, "");
+    }
+
     pub fn move_cursor_left(&mut self) {
         if self.message_cursor > 0 {
             self.message_cursor -= 1;
@@ -266,6 +285,7 @@ impl SourceControlPanel {
     pub fn clear_message(&mut self) {
         self.message.clear();
         self.message_cursor = 0;
+        self.message_scroll = 0;
     }
 
     pub fn entry_at_y(&self, y: u16) -> Option<usize> {
@@ -361,7 +381,7 @@ impl SourceControlPanel {
         if r.width < 3 || r.height < 3 {
             return None;
         }
-        let cursor_col = self.message_cursor as u16;
+        let cursor_col = self.message_cursor.saturating_sub(self.message_scroll) as u16;
         let max_col = r.width.saturating_sub(3);
         if cursor_col > max_col {
             return None;
@@ -866,6 +886,7 @@ impl Widget for &mut SourceControlPanel {
             let text_x = input_inner.x + 1;
             let text_max = (input_inner.width as usize).saturating_sub(2);
             if self.message.is_empty() {
+                self.message_scroll = 0;
                 buf.set_stringn(
                     text_x,
                     content_y,
@@ -880,10 +901,28 @@ impl Widget for &mut SourceControlPanel {
                         .add_modifier(Modifier::ITALIC),
                 );
             } else {
+                // Horizontal scroll: keep the caret inside the box so a
+                // message wider than the input (e.g. a pasted path) stays
+                // editable. Without this the box always shows byte 0, the
+                // caret falls off the right edge, and edits at the tail are
+                // invisible — the field reads as frozen.
+                let len = self.message.chars().count();
+                let cursor = self.message_cursor.min(len);
+                if cursor < self.message_scroll {
+                    self.message_scroll = cursor;
+                } else if text_max > 0 && cursor > self.message_scroll + text_max {
+                    self.message_scroll = cursor - text_max;
+                }
+                let visible: String = self
+                    .message
+                    .chars()
+                    .skip(self.message_scroll)
+                    .take(text_max)
+                    .collect();
                 buf.set_stringn(
                     text_x,
                     content_y,
-                    self.message.as_str(),
+                    &visible,
                     text_max,
                     Style::default().fg(Color::White),
                 );
@@ -1387,6 +1426,47 @@ mod tests {
                 "typed message overflowed past the SC panel's right edge at column {x}: {sym:?} — same root cause as the placeholder leak"
             );
         }
+    }
+
+    #[test]
+    fn long_commit_message_keeps_the_caret_visible_and_scrolls_to_show_the_tail() {
+        use ratatui::buffer::Buffer;
+        let mut p = SourceControlPanel::new();
+        p.set_status(dummy_status_with_branch("main"), Vec::new());
+        p.focused = true;
+        // A workspace temp path is far longer than the ~22-cell input box.
+        // Typing it leaves the cursor at the end.
+        let long = "/var/folders/8r/rz52gwd56wz0yw3sqc7xprgm0000gn/T/croft";
+        p.insert_str(long);
+        let panel_area = Rect {
+            x: 0,
+            y: 0,
+            width: 28,
+            height: 30,
+        };
+        let mut buf = Buffer::empty(panel_area);
+        ratatui::widgets::Widget::render(&mut p, panel_area, &mut buf);
+        assert!(
+            p.cursor_screen_pos().is_some(),
+            "the caret must stay visible when the message is longer than the input box; otherwise the user can't see what they're editing and the box feels frozen"
+        );
+        let row = p.last_input_area.y + 1;
+        let rendered: String = (p.last_input_area.x..p.last_input_area.right())
+            .map(|x| buf[(x, row)].symbol().to_string())
+            .collect();
+        assert!(
+            rendered.contains("croft"),
+            "the box must scroll horizontally to reveal the tail near the cursor; rendered window was {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn delete_key_forward_deletes_in_the_commit_message() {
+        let mut p = SourceControlPanel::new();
+        p.insert_str("abc");
+        p.home();
+        p.delete_char();
+        assert_eq!((p.message.as_str(), p.message_cursor), ("bc", 0));
     }
 
     #[test]
