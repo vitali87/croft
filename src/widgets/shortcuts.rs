@@ -23,7 +23,7 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
         title: "Global",
         entries: &[
             ShortcutEntry {
-                keys: "Ctrl+S",
+                keys: "Cmd/Ctrl+S",
                 description: "Save the open file (also stages selected source-control entry)",
             },
             ShortcutEntry {
@@ -61,10 +61,6 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
             ShortcutEntry {
                 keys: "Cmd/Ctrl+Shift+S",
                 description: "Jump to Source Control (from any pane)",
-            },
-            ShortcutEntry {
-                keys: "Cmd/Ctrl+Shift+G",
-                description: "Jump to Source Control (when editor not focused)",
             },
             ShortcutEntry {
                 keys: "Cmd/Ctrl+Shift+D",
@@ -190,7 +186,7 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
             },
             ShortcutEntry {
                 keys: "Cmd/Ctrl+C",
-                description: "Copy the selection (OSC 52 to system clipboard)",
+                description: "Copy the selection (native system clipboard; OSC 52 fallback on remote)",
             },
             ShortcutEntry {
                 keys: "Cmd/Ctrl+X",
@@ -205,7 +201,7 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 description: "Undo",
             },
             ShortcutEntry {
-                keys: "Cmd+A",
+                keys: "Cmd/Ctrl+A",
                 description: "Select the entire buffer",
             },
             ShortcutEntry {

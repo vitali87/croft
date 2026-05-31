@@ -96,7 +96,6 @@ croft setup-terminal --help
 | `Ctrl+Shift+e` / `Cmd+Shift+e` | Jump to the Explorer sidebar from any pane |
 | `Ctrl+Shift+f` / `Cmd+Shift+f` | Jump to the Search sidebar |
 | `Ctrl+Shift+s` / `Cmd+Shift+s` | Jump to Source Control (works from the editor too) |
-| `Ctrl+Shift+g` / `Cmd+Shift+g` | Jump to Source Control (when the editor is not focused; `Cmd+Shift+G` in the editor is goto-bottom) |
 | `Ctrl+Shift+d` / `Cmd+Shift+d` | Jump to Run and Debug |
 | `Ctrl+Shift+r` / `Cmd+Shift+r` | Jump to Remote (SSH) |
 | `Ctrl+Shift+l` / `Cmd+Shift+l` | While connected to a remote, disconnect and drop back into the local croft at the directory you connected from (`Ctrl+q` still fully exits) |
@@ -143,7 +142,7 @@ croft setup-terminal --help
 | `PageUp` / `PageDown` (`fn`+`↑` / `fn`+`↓` on Mac) | Scroll exactly one viewport |
 | Any printable char, Enter, Backspace, Delete, Tab | Edit (typing or deleting with an active selection replaces it) |
 | Mouse drag | Select text; selection stays highlighted until you copy or click elsewhere |
-| `Ctrl`+`C` / `Cmd`+`C` | Copy the selection to the system clipboard via OSC 52 |
+| `Ctrl`+`C` / `Cmd`+`C` | Copy the selection to the system clipboard (native NSPasteboard on macOS; OSC 52 fallback on remote) |
 | `Ctrl`+`X` / `Cmd`+`X` | Cut the selection |
 | `Ctrl`+`V` / `Cmd`+`V` | Paste at the cursor; replaces selection if any |
 | `Ctrl`+`Z` / `Cmd`+`Z` | Undo (typing bursts coalesce into one step; backspace, paste, cut, replace are each their own step) |
@@ -246,7 +245,7 @@ iTerm2 → Settings → **Profiles** → Default → **Keys** tab → **Key Mapp
 | `⌘S` | `0x13` | Save |
 | `⌘Q` | `0x11` | Quit |
 | `⌘B` | `0x02` | Toggle file tree |
-| `⌘C` | `0x03` | Copy current selection (editor or terminal) to the system clipboard via OSC 52 |
+| `⌘C` | `0x03` | Copy current selection (editor or terminal) to the system clipboard (native NSPasteboard on macOS; OSC 52 fallback on remote) |
 | `⌘X` | `0x18` | Cut the editor selection |
 | `⌘Z` | `0x1a` | Undo the last editor edit |
 | `⌘A` | `0x01` | Select all in the focused pane (editor: select whole buffer). Without this map iTerm2 runs **Edit → Select All** on the whole iTerm2 window instead. |
