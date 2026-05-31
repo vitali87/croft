@@ -746,6 +746,10 @@ pub struct App {
     /// VS Code-style Cmd+P / Ctrl+P quick-open file finder. None when
     /// the modal is closed.
     pub file_finder: Option<crate::widgets::file_finder::FileFinder>,
+    /// zoxide-backed Explorer jump popup (Cmd+Z). None when closed. Opens
+    /// only from the Explorer pane, so it never collides with the editor's
+    /// Cmd+Z undo.
+    pub zoxide_jump: Option<crate::widgets::zoxide_jump::ZoxideJump>,
     /// Cached workspace file index. Built lazily on first Cmd+P and
     /// shared across reopens so repeated invocations are instant.
     file_finder_index: Option<std::sync::Arc<Vec<crate::widgets::file_finder::FileEntry>>>,
@@ -1246,6 +1250,7 @@ impl App {
             },
             editor_find: None,
             file_finder: None,
+            zoxide_jump: None,
             file_finder_index: None,
             file_finder_index_rx: Some(file_finder_index_rx),
             file_finder_index_dirty: false,
@@ -1451,7 +1456,10 @@ impl App {
     /// welcome wordmark and editor preview image use.
     pub fn flush_run_debug_icon_overlay(&mut self) {
         use std::io::Write;
-        if self.shortcuts_modal.is_some() || self.file_finder.is_some() {
+        if self.shortcuts_modal.is_some()
+            || self.file_finder.is_some()
+            || self.zoxide_jump.is_some()
+        {
             return;
         }
         let panel_visible = self.show_tree
@@ -1489,7 +1497,10 @@ impl App {
     /// surrounding cells redraw.
     pub fn flush_no_repo_hero_overlay(&mut self) {
         use std::io::Write;
-        if self.shortcuts_modal.is_some() || self.file_finder.is_some() {
+        if self.shortcuts_modal.is_some()
+            || self.file_finder.is_some()
+            || self.zoxide_jump.is_some()
+        {
             return;
         }
         let panel_visible = self.show_tree
@@ -1563,6 +1574,7 @@ impl App {
         use std::io::Write;
         let should_show = self.shortcuts_modal.is_none()
             && self.file_finder.is_none()
+            && self.zoxide_jump.is_none()
             && self.show_tree
             && self.sidebar_view == SidebarView::Remote
             && self.remote.targets.is_empty();
@@ -1714,6 +1726,7 @@ impl App {
         use std::io::Write;
         if self.shortcuts_modal.is_some()
             || self.file_finder.is_some()
+            || self.zoxide_jump.is_some()
             || self.connect_dialog.is_some()
         {
             if let Some((px, py)) = self.overlays.badge.take_last_emitted() {
@@ -3393,6 +3406,7 @@ impl App {
         self.render_discard_confirm(frame);
         self.render_editor_find(frame);
         self.render_file_finder(frame);
+        self.render_zoxide_jump(frame);
         self.render_shortcuts_modal(frame);
         self.render_connect_dialog(frame);
 
@@ -3820,6 +3834,10 @@ impl App {
             self.handle_file_finder_key(key);
             return Ok(());
         }
+        if self.zoxide_jump.is_some() {
+            self.handle_zoxide_jump_key(key);
+            return Ok(());
+        }
         if matches!(key.code, KeyCode::F(1)) {
             self.open_shortcuts_modal();
             return Ok(());
@@ -3917,18 +3935,16 @@ impl App {
             self.set_sidebar_view(SidebarView::Search);
             return Ok(());
         }
-        if is_source_control_jump_key(key) && self.focus != Pane::Editor {
+        // Cmd+Shift+S jumps to Source Control from any pane — croft's Source
+        // Control gesture. There is no editor Save-As to collide with (Cmd+S
+        // alone saves), so it fires even while the editor is focused.
+        if is_source_control_jump_key(key) {
             self.set_sidebar_view(SidebarView::SourceControl);
             return Ok(());
         }
         if is_explorer_jump_key(key) {
             self.show_tree = true;
             self.set_sidebar_view(SidebarView::Explorer);
-            return Ok(());
-        }
-        if is_search_activate_key(key) {
-            self.show_tree = true;
-            self.set_sidebar_view(SidebarView::Search);
             return Ok(());
         }
         if is_run_debug_jump_key(key) {
@@ -6530,6 +6546,137 @@ impl App {
         crate::widgets::file_finder::render_file_finder(finder, area, frame.buffer_mut());
     }
 
+    pub fn consume_zoxide_jump_image_clear(&mut self) -> bool {
+        self.overlays.zoxide_jump_clear.consume()
+    }
+
+    /// Open the zoxide jump popup and seed it with the full frecency list
+    /// (`zoxide query -l`), so it shows the user's top directories before
+    /// they type anything — like pressing `j<Tab>` in the shell.
+    fn open_zoxide_jump(&mut self) {
+        if self.zoxide_jump.is_some() {
+            return;
+        }
+        let mut jump = crate::widgets::zoxide_jump::ZoxideJump::new();
+        jump.set_results(crate::zoxide::query(""));
+        let status = if jump.available {
+            format!(
+                "Jump: {} directories — type to filter, Esc to close",
+                jump.results.len()
+            )
+        } else {
+            String::from(
+                "Jump: zoxide not installed — installing in the background, try again shortly",
+            )
+        };
+        self.zoxide_jump = Some(jump);
+        self.overlays.zoxide_jump_clear.request();
+        self.status = status;
+    }
+
+    fn close_zoxide_jump(&mut self) {
+        if self.zoxide_jump.take().is_some() {
+            self.overlays.zoxide_jump_clear.request();
+            self.overlays.activity.mark_dirty();
+            self.overlays.welcome.mark_dirty();
+            self.overlays.hero.mark_dirty();
+            self.overlays.editor.invalidate_layout();
+            self.status.clear();
+        }
+    }
+
+    /// Re-run `zoxide query` for the popup's current text and feed the
+    /// ranked matches back to the widget. The one subprocess per keystroke
+    /// is cheap (zoxide reads a small frecency DB; single-digit ms) and
+    /// fires only on input, never on the render hot path.
+    fn refresh_zoxide_results(&mut self) {
+        let Some(jump) = self.zoxide_jump.as_mut() else {
+            return;
+        };
+        let needle = jump.query.clone();
+        jump.set_results(crate::zoxide::query(&needle));
+    }
+
+    fn handle_zoxide_jump_key(&mut self, key: KeyEvent) {
+        let Some(jump) = self.zoxide_jump.as_mut() else {
+            return;
+        };
+        match (key.code, key.modifiers) {
+            (KeyCode::Esc, _) => {
+                self.close_zoxide_jump();
+            }
+            (KeyCode::Enter, _) => {
+                let path = jump.selected_path().map(|p| p.to_path_buf());
+                if let Some(path) = path {
+                    self.close_zoxide_jump();
+                    self.change_workspace_root(path);
+                }
+            }
+            (KeyCode::Up, _) => jump.select_prev(),
+            (KeyCode::Down, _) => jump.select_next(),
+            (KeyCode::PageUp, _) => {
+                for _ in 0..10 {
+                    jump.select_prev();
+                }
+            }
+            (KeyCode::PageDown, _) => {
+                for _ in 0..10 {
+                    jump.select_next();
+                }
+            }
+            (KeyCode::Left, _) => jump.move_cursor_left(),
+            (KeyCode::Right, _) => jump.move_cursor_right(),
+            (KeyCode::Home, _) => jump.move_cursor_home(),
+            (KeyCode::End, _) => jump.move_cursor_end(),
+            (KeyCode::Backspace, _) => {
+                jump.pop_char();
+                self.refresh_zoxide_results();
+            }
+            (KeyCode::Delete, _) => {
+                jump.delete_char();
+                self.refresh_zoxide_results();
+            }
+            (KeyCode::Char(c), m) if !m.intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER) => {
+                jump.push_char(c);
+                self.refresh_zoxide_results();
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_zoxide_jump_mouse(&mut self, m: MouseEvent) {
+        let Some(jump) = self.zoxide_jump.as_mut() else {
+            return;
+        };
+        let inside = rect_contains(jump.last_rect, m.column, m.row);
+        match m.kind {
+            MouseEventKind::ScrollDown => {
+                for _ in 0..3 {
+                    jump.select_next();
+                }
+            }
+            MouseEventKind::ScrollUp => {
+                for _ in 0..3 {
+                    jump.select_prev();
+                }
+            }
+            MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Down(MouseButton::Right) => {
+                if !inside {
+                    self.close_zoxide_jump();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn render_zoxide_jump(&mut self, frame: &mut ratatui::Frame) {
+        let Some(jump) = self.zoxide_jump.as_mut() else {
+            return;
+        };
+        let area = frame.area();
+        crate::widgets::zoxide_jump::render_zoxide_jump(jump, area, frame.buffer_mut());
+    }
+
     fn open_editor_find(&mut self) {
         if self.editor_find.is_some() {
             return;
@@ -6934,6 +7081,10 @@ impl App {
         }
         if self.file_finder.is_some() {
             self.handle_file_finder_mouse(m);
+            return;
+        }
+        if self.zoxide_jump.is_some() {
+            self.handle_zoxide_jump_mouse(m);
             return;
         }
         if matches!(m.kind, MouseEventKind::Down(MouseButton::Left))
@@ -7909,6 +8060,10 @@ impl App {
     /// target node is whichever row the user has highlighted; folder-only
     /// actions (Make root) are no-ops on file selections.
     fn handle_explorer_shortcut(&mut self, key: KeyEvent) -> bool {
+        if is_tree_zoxide_jump_key(key) {
+            self.open_zoxide_jump();
+            return true;
+        }
         if is_tree_new_file_key(key) {
             let target = self.explorer_create_target_dir();
             self.open_create_prompt(CreateKind::File, target);
@@ -8198,7 +8353,10 @@ impl App {
     }
 
     pub fn editor_image_payload(&self) -> Option<(&str, &EditorImageLayout)> {
-        if self.shortcuts_modal.is_some() || self.file_finder.is_some() {
+        if self.shortcuts_modal.is_some()
+            || self.file_finder.is_some()
+            || self.zoxide_jump.is_some()
+        {
             return None;
         }
         self.overlays.editor.payload()
@@ -8211,6 +8369,7 @@ impl App {
     pub fn welcome_image_emit_payload(&self) -> Option<(&str, &WelcomeLayout)> {
         if self.shortcuts_modal.is_some()
             || self.file_finder.is_some()
+            || self.zoxide_jump.is_some()
             || self.connect_dialog.is_some()
             || !self.editor.is_blank_initial()
             || self.terminal_maximized
@@ -8957,6 +9116,32 @@ fn is_file_finder_key(key: KeyEvent) -> bool {
     key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::SUPER)
 }
 
+/// Explorer-pane shortcut: `Cmd+Z` — open the zoxide jump popup. `z` for
+/// **z**oxide; the user's shell still uses `j` for the same jump. Requires
+/// SUPER (iTerm2 already forwards Cmd+Z as `Char('z') + SUPER` for the
+/// editor's undo via the `CMD_Z` GlobalKeyMap entry), and explicitly
+/// rejects CONTROL so a terminal `Ctrl+Z` suspend never reaches it and so
+/// it stays distinct from the Ctrl-based terminal-toggle chords on `j`.
+/// SHIFT is rejected because `Cmd+Shift+Z` is the reserved redo chord.
+/// Editor-pane `Cmd+Z` is untouched: this predicate is only consulted from
+/// `handle_explorer_shortcut`, which runs solely when the Explorer is
+/// focused (and gets first refusal in the dispatch chain).
+fn is_tree_zoxide_jump_key(key: KeyEvent) -> bool {
+    let KeyCode::Char(c) = key.code else {
+        return false;
+    };
+    if !c.eq_ignore_ascii_case(&'z') {
+        return false;
+    }
+    if key.modifiers.contains(KeyModifiers::SHIFT)
+        || key.modifiers.contains(KeyModifiers::ALT)
+        || key.modifiers.contains(KeyModifiers::CONTROL)
+    {
+        return false;
+    }
+    key.modifiers.contains(KeyModifiers::SUPER)
+}
+
 /// Explorer-pane shortcut: `Cmd+F` / `Ctrl+F` (no Shift, no Alt) - "New File".
 fn is_tree_new_file_key(key: KeyEvent) -> bool {
     let KeyCode::Char(c) = key.code else {
@@ -9047,12 +9232,10 @@ fn is_explorer_jump_key(key: KeyEvent) -> bool {
     is_cmd_shift_letter(key, 'e')
 }
 
-/// `Ctrl/Cmd+Shift+S`: activate Search from any pane — reveal the panel, focus
-/// the input, and select the existing query (so the next keystroke or paste
-/// replaces it rather than appending). Source Control stays reachable on
-/// `Cmd+Shift+G`. Croft has no Save-As, so claiming Cmd+Shift+S is
-/// collision-free.
-fn is_search_activate_key(key: KeyEvent) -> bool {
+/// `Ctrl/Cmd+Shift+S`: jump to the Source Control sidebar view from any pane.
+/// This is croft's Source Control gesture. Croft has no editor Save-As (Cmd+S
+/// alone saves), so claiming Cmd+Shift+S is collision-free even while editing.
+fn is_source_control_jump_key(key: KeyEvent) -> bool {
     is_cmd_shift_letter(key, 's')
 }
 
@@ -9083,21 +9266,6 @@ fn is_cmd_shift_letter(key: KeyEvent, letter: char) -> bool {
         return false;
     }
     if key.modifiers.contains(KeyModifiers::ALT) {
-        return false;
-    }
-    let has_shift = key.modifiers.contains(KeyModifiers::SHIFT);
-    let has_ctrl_or_super = key.modifiers.contains(KeyModifiers::CONTROL)
-        || key.modifiers.contains(KeyModifiers::SUPER);
-    has_shift && has_ctrl_or_super
-}
-
-/// `Ctrl/Cmd+Shift+G`: jump to the Source Control sidebar view, matching
-/// VS Code's "Show Source Control" gesture.
-fn is_source_control_jump_key(key: KeyEvent) -> bool {
-    let KeyCode::Char(c) = key.code else {
-        return false;
-    };
-    if !c.eq_ignore_ascii_case(&'g') {
         return false;
     }
     let has_shift = key.modifiers.contains(KeyModifiers::SHIFT);
@@ -9255,8 +9423,8 @@ fn is_save_key(key: KeyEvent) -> bool {
     let has_super = key.modifiers.contains(KeyModifiers::SUPER);
     let has_ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let has_shift = key.modifiers.contains(KeyModifiers::SHIFT);
-    // Cmd+Shift+S is reserved for Search activation
-    // (`is_search_activate_key`), so reject Shift when Super is
+    // Cmd+Shift+S is reserved for the Source Control jump
+    // (`is_source_control_jump_key`), so reject Shift when Super is
     // held. Ctrl+Shift+S still triggers Save because some terminals
     // capitalise the letter when Ctrl is held and the user genuinely
     // means Ctrl+S — that's the existing `shift_ctrl_s_is_save_key`
@@ -10179,6 +10347,12 @@ impl std::io::Write for CountingWriter {
 type CroftTerminal = Terminal<CrosstermBackend<CountingWriter>>;
 
 pub fn run(root: PathBuf, restore_session: Option<PathBuf>) -> Result<()> {
+    // zoxide is a hard dependency of the Cmd+Z jump popup. Probe for it
+    // and install it in the background if missing, off the launch path so
+    // the first frame is never blocked. Runs on every host croft starts
+    // on — the local Mac and the remote Linux box both reach `run` — so
+    // the dependency is satisfied identically on both (GOLDEN RULE).
+    crate::zoxide::ensure_installed_in_background();
     let title = build_title(&root);
     let mut app = App::new(root.clone())?;
     // Restore the tabs / layout carried across a self-update re-exec, then
@@ -10593,6 +10767,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
                 || app.consume_no_repo_hero_image_clear()
                 || app.consume_shortcuts_image_clear()
                 || app.consume_file_finder_image_clear()
+                || app.consume_zoxide_jump_image_clear()
                 || app.consume_ssh_empty_state_image_clear()
             {
                 terminal.clear()?;
@@ -10619,6 +10794,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
                 || app.consume_no_repo_hero_image_clear()
                 || app.consume_shortcuts_image_clear()
                 || app.consume_file_finder_image_clear()
+                || app.consume_zoxide_jump_image_clear()
                 || app.consume_ssh_empty_state_image_clear()
             {
                 terminal.clear()?;

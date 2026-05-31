@@ -66,7 +66,7 @@ const CMD_SHIFT_O_HEX: &str = "0x1b 0x5b 0x37 0x39 0x3b 0x31 0x30 0x75";
 /// 1 base + Shift(1) + Super(8). CSI-u payload `ESC [ 69 ; 10 u`.
 const CMD_SHIFT_E_KEY: &str = "0x45-0x120000-0xe";
 const CMD_SHIFT_E_HEX: &str = "0x1b 0x5b 0x36 0x39 0x3b 0x31 0x30 0x75";
-/// `Cmd+Shift+S` — activate Search. Codepoint 'S' (0x53 = 83),
+/// `Cmd+Shift+S` — jump to Source Control. Codepoint 'S' (0x53 = 83),
 /// virtualKeyCode `kVK_ANSI_S` = 0x01. CSI-u `ESC [ 83 ; 10 u`.
 const CMD_SHIFT_S_KEY: &str = "0x53-0x120000-0x1";
 const CMD_SHIFT_S_HEX: &str = "0x1b 0x5b 0x38 0x33 0x3b 0x31 0x30 0x75";
@@ -840,7 +840,7 @@ mod tests {
             (
                 CMD_SHIFT_S_KEY,
                 CMD_SHIFT_S_HEX,
-                "Cmd+Shift+S (activate Search)",
+                "Cmd+Shift+S (jump to Source Control)",
             ),
             (
                 CMD_SHIFT_D_KEY,

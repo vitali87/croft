@@ -14,3 +14,4 @@ pub mod shortcuts;
 pub mod source_control;
 pub mod system_panel;
 pub mod terminal;
+pub mod zoxide_jump;

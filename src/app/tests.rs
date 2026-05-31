@@ -125,27 +125,22 @@ fn go_back_with_empty_history_stays_put() {
 }
 
 #[test]
-fn cmd_shift_s_activates_search_and_selects_existing_query() {
+fn cmd_shift_s_jumps_to_source_control_from_explorer() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app.set_sidebar_view(SidebarView::Search);
-    app.search.query = String::from("oldterm");
-    app.search.clear_selection();
-    app.focus_pane(Pane::Editor);
     app.handle_key(key(
         KeyCode::Char('S'),
         KeyModifiers::SUPER | KeyModifiers::SHIFT,
     ))
     .unwrap();
-    assert_eq!(app.sidebar_view, SidebarView::Search);
+    assert_eq!(
+        app.sidebar_view,
+        SidebarView::SourceControl,
+        "Cmd+Shift+S must jump to Source Control, not Search"
+    );
     assert!(
         matches!(app.focus, Pane::Tree),
-        "Cmd+Shift+S focuses the search box"
-    );
-    assert_eq!(
-        app.search.selection_range(),
-        Some((0, "oldterm".len())),
-        "re-entering search must select the previous query so the next keystroke replaces it"
+        "Cmd+Shift+S focuses the Source Control panel"
     );
 }
 
@@ -158,7 +153,7 @@ fn typing_after_reactivating_search_replaces_instead_of_appending() {
     app.search.clear_selection();
     app.focus_pane(Pane::Editor);
     app.handle_key(key(
-        KeyCode::Char('S'),
+        KeyCode::Char('F'),
         KeyModifiers::SUPER | KeyModifiers::SHIFT,
     ))
     .unwrap();
@@ -5881,7 +5876,7 @@ fn cmd_shift_e_jumps_to_explorer_from_any_pane() {
 }
 
 #[test]
-fn cmd_shift_s_activates_search_even_when_editor_is_focused() {
+fn cmd_shift_s_jumps_to_source_control_even_when_editor_is_focused() {
     let mut app = editor_app_with_lines(&["x"]);
     app.focus_pane(Pane::Editor);
     app.handle_key(key(
@@ -5891,12 +5886,12 @@ fn cmd_shift_s_activates_search_even_when_editor_is_focused() {
     .unwrap();
     assert_eq!(
         app.sidebar_view,
-        SidebarView::Search,
-        "Cmd+Shift+S must activate Search even from the editor; Source Control stays reachable on Cmd+Shift+G"
+        SidebarView::SourceControl,
+        "Cmd+Shift+S must jump to Source Control even from the editor (no Save-As to collide with); Search stays on Cmd+Shift+F"
     );
     assert!(
         matches!(app.focus, Pane::Tree),
-        "Cmd+Shift+S must move keyboard focus into the search box"
+        "Cmd+Shift+S must move keyboard focus into the Source Control panel"
     );
 }
 
@@ -8489,16 +8484,22 @@ fn peek_terminals_dirty_does_not_clear_flags() {
 }
 
 #[test]
-fn ctrl_shift_g_jumps_to_source_control() {
+fn cmd_shift_g_no_longer_jumps_to_source_control() {
+    // Source Control is reached via Cmd+Shift+S; the old Cmd+Shift+G alias
+    // was removed so the chord stays free for the editor's vim-style
+    // "go to bottom of file".
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.handle_key(key(
         KeyCode::Char('G'),
-        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        KeyModifiers::SUPER | KeyModifiers::SHIFT,
     ))
     .unwrap();
-    assert_eq!(app.sidebar_view, SidebarView::SourceControl);
-    assert!(app.source_control.focused);
+    assert_ne!(
+        app.sidebar_view,
+        SidebarView::SourceControl,
+        "Cmd+Shift+G must no longer route to Source Control"
+    );
 }
 
 #[test]
@@ -8889,4 +8890,58 @@ fn build_tab_context_menu_items_hides_close_others_when_only_one_tab_is_open() {
         ["Close", "Close All"],
         "with a single tab, Close Others and Close to the Right are both no-ops and must be suppressed"
     );
+}
+
+#[test]
+fn zoxide_jump_key_is_cmd_z_only_and_never_ctrl_z_or_redo() {
+    // Cmd+Z (SUPER) opens the Explorer jump popup. Ctrl+Z must NOT — it
+    // is the shell suspend in the terminal, and the editor's undo lives on
+    // Ctrl/Cmd+Z in its own (editor-focused) path. Cmd+Shift+Z is the
+    // reserved redo chord. Cmd+J stays free for terminal manipulation.
+    assert!(is_tree_zoxide_jump_key(key(
+        KeyCode::Char('z'),
+        KeyModifiers::SUPER
+    )));
+    assert!(
+        is_tree_zoxide_jump_key(key(KeyCode::Char('Z'), KeyModifiers::SUPER)),
+        "letter match must be case-insensitive"
+    );
+    assert!(
+        !is_tree_zoxide_jump_key(key(KeyCode::Char('z'), KeyModifiers::CONTROL)),
+        "Ctrl+Z must not open the popup; it is shell suspend / editor undo"
+    );
+    assert!(
+        !is_tree_zoxide_jump_key(key(
+            KeyCode::Char('z'),
+            KeyModifiers::SUPER | KeyModifiers::SHIFT
+        )),
+        "Cmd+Shift+Z is reserved for redo and must not open the popup"
+    );
+    assert!(
+        !is_tree_zoxide_jump_key(key(KeyCode::Char('j'), KeyModifiers::SUPER)),
+        "Cmd+J must stay free for terminal manipulation"
+    );
+}
+
+#[test]
+fn cmd_z_in_explorer_opens_the_zoxide_jump_popup() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    assert!(
+        app.is_explorer_focused(),
+        "precondition: a fresh app is focused on the Explorer pane"
+    );
+    assert!(app.zoxide_jump.is_none(), "popup starts closed");
+    let handled = app.handle_explorer_shortcut(key(KeyCode::Char('z'), KeyModifiers::SUPER));
+    assert!(
+        handled,
+        "Cmd+Z must be consumed by the Explorer shortcut layer"
+    );
+    assert!(
+        app.zoxide_jump.is_some(),
+        "Cmd+Z in the Explorer must open the zoxide jump popup"
+    );
+    // Esc closes it again.
+    app.handle_zoxide_jump_key(key(KeyCode::Esc, KeyModifiers::NONE));
+    assert!(app.zoxide_jump.is_none(), "Esc must close the jump popup");
 }

@@ -16,6 +16,7 @@ mod sheet;
 mod sysmon;
 mod update_watch;
 mod widgets;
+mod zoxide;
 
 use anyhow::Result;
 use clap::Parser;

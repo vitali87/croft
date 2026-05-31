@@ -287,6 +287,7 @@ impl ActivityOverlay {
 pub struct OverlayManager {
     pub shortcuts_clear: ClearLatch,
     pub file_finder_clear: ClearLatch,
+    pub zoxide_jump_clear: ClearLatch,
     pub editor: ImageOverlay<super::EditorImageLayout>,
     pub welcome: ImageOverlay<super::WelcomeLayout>,
     pub hero: ImageOverlay<super::WelcomeLayout>,
