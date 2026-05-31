@@ -5125,6 +5125,76 @@ fn f7_in_the_diff_view_jumps_to_the_next_change_hunk() {
 }
 
 #[test]
+fn forward_diff_jump_wraps_from_the_last_hunk_back_to_the_first() {
+    // Regression: the › arrow / F7 used to stick on the last hunk when
+    // that hunk lived in the bottom-clamped region of the diff. The cause
+    // was that `render_diff` clamps `diff.scroll` to `max_scroll` and
+    // writes it back, so the next forward jump re-derived an anchor BELOW
+    // the last hunk and kept re-selecting it instead of wrapping. Backward
+    // (‹) was unaffected because a too-low anchor still has earlier hunks
+    // to step through. This test drives forward jumps with a render between
+    // each (to trigger the clamp) and asserts the forward arrow eventually
+    // wraps to the first hunk.
+    let tmp = make_committed_repo();
+    let original: String = (0..60).map(|i| format!("line {i}\n")).collect();
+    std::fs::write(tmp.path().join("seed.txt"), &original).unwrap();
+    let _ = std::process::Command::new("git")
+        .args(["-C"])
+        .arg(tmp.path())
+        .args(["add", "seed.txt"])
+        .status();
+    let _ = std::process::Command::new("git")
+        .args(["-C"])
+        .arg(tmp.path())
+        .args(["commit", "-q", "-m", "seed"])
+        .status();
+    // Two hunks: one near the top, one near the very bottom so the bottom
+    // hunk falls inside the clamped viewport region.
+    let mut edited: Vec<String> = original.lines().map(str::to_string).collect();
+    edited[5] = "edited-5".to_string();
+    edited[58] = "edited-58".to_string();
+    std::fs::write(tmp.path().join("seed.txt"), edited.join("\n") + "\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    wait_for_changes(&mut app, |a| {
+        a.source_control
+            .entries
+            .iter()
+            .any(|e| e.path == "seed.txt")
+    });
+    let idx = app
+        .source_control
+        .entries
+        .iter()
+        .position(|e| e.path == "seed.txt")
+        .unwrap();
+    app.open_source_control_entry(idx);
+
+    // A small viewport forces render_diff to clamp scroll at the bottom.
+    let backend = ratatui::backend::TestBackend::new(120, 24);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+
+    let first_scroll = app.editor.diff.as_ref().unwrap().scroll;
+    // Forward to the bottom hunk; render to trigger the clamp writeback.
+    app.handle_editor_key(key(KeyCode::F(7), KeyModifiers::NONE));
+    term.draw(|f| app.render(f)).unwrap();
+    let bottom_scroll = app.editor.diff.as_ref().unwrap().scroll;
+    assert!(
+        bottom_scroll > first_scroll,
+        "F7 must advance to the bottom hunk (first={first_scroll}, bottom={bottom_scroll})"
+    );
+    // Forward again from the last hunk MUST wrap back to the first, not
+    // stick on the bottom hunk.
+    app.handle_editor_key(key(KeyCode::F(7), KeyModifiers::NONE));
+    term.draw(|f| app.render(f)).unwrap();
+    let wrapped_scroll = app.editor.diff.as_ref().unwrap().scroll;
+    assert_eq!(
+        wrapped_scroll, first_scroll,
+        "forward from the last hunk must wrap to the first (saw {wrapped_scroll}, expected {first_scroll})"
+    );
+}
+
+#[test]
 fn focused_source_control_input_drives_a_visible_caret_at_the_message_cursor() {
     // Regression for the user's "I don't see the caret blinking in the
     // Source Control message box, so I have no clue where it is at any

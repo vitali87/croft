@@ -8238,14 +8238,10 @@ impl App {
         let Some(diff) = self.editor.diff.as_mut() else {
             return;
         };
-        let anchor = diff.scroll.saturating_add(2);
-        let target = if forward {
-            diff.next_change_row_wrap(anchor)
+        if forward {
+            diff.jump_next_change();
         } else {
-            diff.prev_change_row_wrap(anchor)
-        };
-        if let Some(row) = target {
-            diff.scroll_to_row(row);
+            diff.jump_prev_change();
         }
     }
 
@@ -8310,20 +8306,15 @@ impl App {
         // VS Code keybinding for "Next/Previous Change in Diff Editor" so
         // users can scan a long diff without scrolling line-by-line.
         if matches!(key.code, KeyCode::F(7)) {
-            // `scroll_to_row` parks the viewport 2 rows above the target,
-            // so the hunk currently in view sits at row `scroll + 2`.
-            // Anchoring next/prev queries at that row, not at `scroll`,
-            // means F7 reliably jumps PAST the hunk the user is reading.
-            // Use the wrap variants so F7 at the last hunk loops back to
-            // the first, matching the click-arrow behaviour.
-            let anchor = diff.scroll.saturating_add(2);
-            let target = if key.modifiers.contains(KeyModifiers::SHIFT) {
-                diff.prev_change_row_wrap(anchor)
+            // Shared backend with the click arrows: the jump anchors on the
+            // hunk the previous jump landed on (tracked in `nav_anchor`),
+            // not on `scroll` — `render_diff` clamps `scroll` at the bottom,
+            // which used to pin the forward arrow on the last hunk. Both
+            // directions wrap so F7 at the last hunk loops to the first.
+            if key.modifiers.contains(KeyModifiers::SHIFT) {
+                diff.jump_prev_change();
             } else {
-                diff.next_change_row_wrap(anchor)
-            };
-            if let Some(row) = target {
-                diff.scroll_to_row(row);
+                diff.jump_next_change();
             }
             return;
         }

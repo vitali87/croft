@@ -48,6 +48,15 @@ pub struct DiffData {
     /// can light up every occurrence and paint the active one in a
     /// stronger colour, mirroring the plain-text editor's Cmd+F highlight.
     pub find: DiffFindState,
+    /// Row of the hunk the last `‹`/`›` (or Shift+F7 / F7) jump landed on.
+    /// Hunk-to-hunk navigation anchors on THIS, not on `scroll`, because
+    /// `render_diff` clamps `scroll` to `max_scroll` and writes it back:
+    /// once the last hunk sits in the bottom-clamped region, a
+    /// scroll-derived anchor lands below it and the forward arrow re-selects
+    /// the same hunk forever instead of wrapping. Cleared on any manual
+    /// vertical scroll so the next jump re-anchors on what the user is
+    /// actually looking at.
+    pub nav_anchor: Option<usize>,
 }
 
 /// A single occurrence of the find needle inside a diff, located by the
@@ -175,6 +184,7 @@ impl DiffData {
             unified: false,
             selection: None,
             find: DiffFindState::default(),
+            nav_anchor: None,
         }
     }
 
@@ -200,6 +210,7 @@ impl DiffData {
             unified: true,
             selection: None,
             find: DiffFindState::default(),
+            nav_anchor: None,
         }
     }
 
@@ -244,6 +255,7 @@ impl DiffData {
                 unified: false,
                 selection: None,
                 find: DiffFindState::default(),
+                nav_anchor: None,
             };
         }
         let mut pending_remove: Vec<usize> = Vec::new();
@@ -326,6 +338,7 @@ impl DiffData {
             unified: false,
             selection: None,
             find: DiffFindState::default(),
+            nav_anchor: None,
         }
     }
 
@@ -379,6 +392,10 @@ impl DiffData {
     /// inside `viewport_rows`) and horizontally (its char span lands inside
     /// `text_cols`). Mirrors the plain-editor `jump_editor_to_match` logic.
     pub fn scroll_to_match(&mut self, m: DiffMatch, viewport_rows: usize, text_cols: usize) {
+        // A find jump relocates the viewport independently of hunk
+        // navigation, so the next ‹/› should re-anchor on the match, not
+        // on the stale hunk we last stepped to.
+        self.nav_anchor = None;
         if viewport_rows > 0 {
             if m.row < self.scroll {
                 self.scroll = m.row;
@@ -662,6 +679,7 @@ impl DiffData {
 
     pub fn scroll_up_by(&mut self, n: usize) {
         self.scroll = self.scroll.saturating_sub(n);
+        self.nav_anchor = None;
     }
 
     pub fn scroll_down_by(&mut self, n: usize) {
@@ -669,14 +687,17 @@ impl DiffData {
         // Clamp loosely here; render_diff also re-clamps against the live
         // viewport, so we don't need to know it at scroll time.
         self.scroll = (self.scroll + n).min(max);
+        self.nav_anchor = None;
     }
 
     pub fn scroll_home(&mut self) {
         self.scroll = 0;
+        self.nav_anchor = None;
     }
 
     pub fn scroll_end(&mut self) {
         self.scroll = self.rows.len();
+        self.nav_anchor = None;
     }
 
     pub fn scroll_left_by(&mut self, n: usize) {
@@ -763,6 +784,37 @@ impl DiffData {
     /// a slice of context above it, the way users read diffs.
     pub fn scroll_to_row(&mut self, target: usize) {
         self.scroll = target.saturating_sub(2);
+    }
+
+    /// Row to anchor the next hunk-to-hunk jump on. Prefers `nav_anchor`
+    /// (the row the previous jump landed on), which is immune to the
+    /// `render_diff` scroll clamp. Falls back to the row currently sitting
+    /// two below the top of the viewport (the hunk `scroll_to_row` parks in
+    /// view) when no jump is in flight, e.g. right after the diff opens or
+    /// after a manual scroll cleared the anchor.
+    fn jump_anchor(&self) -> usize {
+        self.nav_anchor
+            .unwrap_or_else(|| self.scroll.saturating_add(2))
+    }
+
+    /// Scroll to the next change hunk, wrapping from the last hunk back to
+    /// the first. Tracks the landed row in `nav_anchor` so repeated forward
+    /// jumps keep advancing even after the renderer clamps `scroll`. The
+    /// shared backend for the diff-pane › arrow and the F7 keybinding.
+    pub fn jump_next_change(&mut self) {
+        if let Some(row) = self.next_change_row_wrap(self.jump_anchor()) {
+            self.scroll_to_row(row);
+            self.nav_anchor = Some(row);
+        }
+    }
+
+    /// Mirror of `jump_next_change`: previous hunk, wrapping from the first
+    /// back to the last. Backs the ‹ arrow and Shift+F7.
+    pub fn jump_prev_change(&mut self) {
+        if let Some(row) = self.prev_change_row_wrap(self.jump_anchor()) {
+            self.scroll_to_row(row);
+            self.nav_anchor = Some(row);
+        }
     }
 }
 
