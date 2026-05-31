@@ -9015,3 +9015,211 @@ fn cmd_z_in_explorer_opens_the_zoxide_jump_popup() {
     app.handle_zoxide_jump_key(key(KeyCode::Esc, KeyModifiers::NONE));
     assert!(app.zoxide_jump.is_none(), "Esc must close the jump popup");
 }
+
+// --- Native modal (vim) editing -------------------------------------------
+
+fn vim_app(content: &str) -> (App, tempfile::TempDir) {
+    let tmp = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("buf.txt");
+    std::fs::write(&f, content).unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&f).unwrap();
+    app.focus = Pane::Editor;
+    app.vim.enabled = true;
+    (app, tmp)
+}
+
+fn vim_feed(app: &mut App, c: char) {
+    app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
+        .unwrap();
+}
+
+fn vim_feed_str(app: &mut App, s: &str) {
+    for c in s.chars() {
+        vim_feed(app, c);
+    }
+}
+
+#[test]
+fn vim_dd_deletes_the_current_line() {
+    let (mut app, _t) = vim_app("alpha\nbeta\ngamma");
+    vim_feed_str(&mut app, "dd");
+    assert_eq!(app.editor.lines, vec!["beta", "gamma"]);
+}
+
+#[test]
+fn vim_count_dd_deletes_multiple_lines() {
+    let (mut app, _t) = vim_app("a\nb\nc\nd");
+    vim_feed_str(&mut app, "2dd");
+    assert_eq!(app.editor.lines, vec!["c", "d"]);
+}
+
+#[test]
+fn vim_x_deletes_char_under_cursor() {
+    let (mut app, _t) = vim_app("hello");
+    vim_feed(&mut app, 'x');
+    assert_eq!(app.editor.lines, vec!["ello"]);
+}
+
+#[test]
+fn vim_dw_deletes_word_and_trailing_space() {
+    let (mut app, _t) = vim_app("foo bar");
+    vim_feed_str(&mut app, "dw");
+    assert_eq!(app.editor.lines, vec!["bar"]);
+}
+
+#[test]
+fn vim_de_deletes_to_word_end_inclusive() {
+    let (mut app, _t) = vim_app("foo bar");
+    vim_feed_str(&mut app, "de");
+    assert_eq!(app.editor.lines, vec![" bar"]);
+}
+
+#[test]
+fn vim_diw_deletes_inner_word() {
+    let (mut app, _t) = vim_app("foo bar baz");
+    // cursor on "foo"
+    vim_feed_str(&mut app, "diw");
+    assert_eq!(app.editor.lines, vec![" bar baz"]);
+}
+
+#[test]
+fn vim_dollar_then_d_deletes_to_end_of_line() {
+    let (mut app, _t) = vim_app("hello world");
+    vim_feed_str(&mut app, "wd$");
+    assert_eq!(app.editor.lines, vec!["hello "]);
+}
+
+#[test]
+fn vim_insert_types_text_then_esc_returns_to_normal() {
+    let (mut app, _t) = vim_app("bc");
+    vim_feed(&mut app, 'i');
+    vim_feed(&mut app, 'a');
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.lines, vec!["abc"]);
+    assert_eq!(app.vim.mode(), crate::vim::VimMode::Normal);
+}
+
+#[test]
+fn vim_append_inserts_after_cursor() {
+    let (mut app, _t) = vim_app("ac");
+    vim_feed(&mut app, 'a'); // insert after the 'a'
+    vim_feed(&mut app, 'b');
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.lines, vec!["abc"]);
+}
+
+#[test]
+fn vim_open_line_below_enters_insert_on_fresh_line() {
+    let (mut app, _t) = vim_app("first");
+    vim_feed(&mut app, 'o');
+    vim_feed_str(&mut app, "second");
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.lines, vec!["first", "second"]);
+}
+
+#[test]
+fn vim_yank_line_then_paste_duplicates_it() {
+    let (mut app, _t) = vim_app("dup\ntail");
+    vim_feed_str(&mut app, "yy");
+    vim_feed(&mut app, 'p');
+    assert_eq!(app.editor.lines, vec!["dup", "dup", "tail"]);
+}
+
+#[test]
+fn vim_visual_select_then_delete_removes_selection() {
+    let (mut app, _t) = vim_app("abcdef");
+    vim_feed(&mut app, 'v'); // visual at col 0 (covers 'a')
+    vim_feed(&mut app, 'l'); // extend to 'b'
+    vim_feed(&mut app, 'l'); // extend to 'c'
+    vim_feed(&mut app, 'd'); // delete a,b,c inclusive
+    assert_eq!(app.editor.lines, vec!["def"]);
+}
+
+#[test]
+fn vim_normal_mode_swallows_plain_letters() {
+    let (mut app, _t) = vim_app("text");
+    vim_feed(&mut app, 'z'); // unmapped in Normal: must not be inserted
+    assert_eq!(app.editor.lines, vec!["text"]);
+}
+
+#[test]
+fn vim_search_moves_cursor_to_match() {
+    let (mut app, _t) = vim_app("alpha needle omega");
+    vim_feed(&mut app, '/');
+    vim_feed_str(&mut app, "needle");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.cursor_row, 0);
+    assert_eq!(
+        app.editor.cursor_col, 6,
+        "cursor lands on the 'n' of needle"
+    );
+}
+
+#[test]
+fn vim_gg_and_capital_g_jump_between_ends() {
+    let (mut app, _t) = vim_app("one\ntwo\nthree");
+    app.handle_key(key(KeyCode::Char('G'), KeyModifiers::SHIFT))
+        .unwrap();
+    assert_eq!(app.editor.cursor_row, 2);
+    vim_feed_str(&mut app, "gg");
+    assert_eq!(app.editor.cursor_row, 0);
+}
+
+#[test]
+fn vim_toggle_off_restores_plain_typing() {
+    let (mut app, _t) = vim_app("");
+    // Cmd+E turns modal editing off.
+    app.handle_key(key(KeyCode::Char('e'), KeyModifiers::SUPER))
+        .unwrap();
+    assert!(!app.vim.enabled);
+    vim_feed_str(&mut app, "hi");
+    assert_eq!(app.editor.lines, vec!["hi"]);
+}
+
+#[test]
+fn vim_toggle_on_with_cmd_e_enables_modal_editing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("buf.txt");
+    std::fs::write(&f, "abc").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&f).unwrap();
+    app.focus = Pane::Editor;
+    // Cmd+E from a plain editor turns modal editing on.
+    app.handle_key(key(KeyCode::Char('e'), KeyModifiers::SUPER))
+        .unwrap();
+    assert!(app.vim.enabled);
+    assert_eq!(app.vim.mode(), crate::vim::VimMode::Normal);
+    // A plain letter is now a Normal-mode command, not inserted text.
+    vim_feed(&mut app, 'x');
+    assert_eq!(app.editor.lines, vec!["bc"]);
+}
+
+#[test]
+fn vim_ex_goto_line_number() {
+    let (mut app, _t) = vim_app("l1\nl2\nl3\nl4");
+    vim_feed(&mut app, ':');
+    vim_feed(&mut app, '3');
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.cursor_row, 2);
+}
+
+#[test]
+fn vim_cmd_save_shortcut_still_works_in_normal_mode() {
+    // A Cmd-modified key must pass through to the editor's own handling
+    // rather than being swallowed by Normal mode.
+    let (mut app, _t) = vim_app("data");
+    vim_feed(&mut app, 'x'); // edit so the buffer is dirty: "ata"
+    app.handle_key(key(KeyCode::Char('s'), KeyModifiers::SUPER))
+        .unwrap();
+    assert_eq!(app.editor.lines, vec!["ata"]);
+    assert!(
+        !app.editor.dirty,
+        "Cmd+S should have saved through Normal mode"
+    );
+}

@@ -15,6 +15,7 @@ mod session_state;
 mod sheet;
 mod sysmon;
 mod update_watch;
+mod vim;
 mod widgets;
 mod zoxide;
 

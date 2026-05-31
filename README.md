@@ -7,7 +7,7 @@
 A VS Code style three pane workspace that runs entirely inside your terminal. Written in Rust for performance and ships as a single static binary.
 
 * **Left pane (sidebar):** Explorer with multi-select, cut / copy / paste, drag and drop file moves, and VS Code style icons (Codicons / Devicons / Seti). Two more sidebar views switch in via the activity bar: full-text Search and a Remote (SSH) explorer.
-* **Top right pane (editor):** code editor with `tree-sitter` syntax highlighting plus inline preview tabs for PNG / JPEG / GIF / BMP / WebP, PDFs (with page navigation), and CSV / TSV / XLSX / XLS / ODS spreadsheets.
+* **Top right pane (editor):** code editor with `tree-sitter` syntax highlighting plus inline preview tabs for PNG / JPEG / GIF / BMP / WebP, PDFs (with page navigation), and CSV / TSV / XLSX / XLS / ODS spreadsheets. An optional native modal (vim) editing mode toggles on with `Cmd`+`E`.
 * **Bottom right pane (terminal):** a real interactive shell, your `$SHELL` running on a real PTY.
 * All three panes resize by dragging the seams between them.
 
@@ -162,6 +162,32 @@ croft setup-terminal --help
 | `Cmd`+`y` `y` | Yank (copy) the current line to the system clipboard |
 | `Cmd`+`N` `Cmd`+`y` `y` | Yank `N` lines |
 | `Esc` | Clear the current selection |
+| `Cmd`+`E` | Toggle native modal (vim) editing for the editor pane (see below) |
+
+### Editor: vim mode (modal editing)
+
+`Cmd`+`E` toggles a native, Rust-implemented modal layer over the editor pane. It is an emulation of the common daily-driver subset, not embedded neovim, so it carries no `nvim` dependency, behaves identically on local and remote, and stays on the input hot path. When it is on, a coloured mode pill (`NORMAL` blue, `INSERT` green, `VISUAL` purple) and the active `:`/`/` line show in the status bar. While it is off the editor behaves exactly as the tables above describe, and every `Cmd`/`Ctrl` shortcut keeps working in Normal mode because modal editing only claims unmodified keys. For full vim with your own plugins and `init.lua`, run real `nvim` in the shell pane.
+
+| Keys | Action |
+|------|--------|
+| `i` `a` `I` `A` `o` `O` | Enter Insert mode (at cursor, after, first non-blank, end of line, open below, open above) |
+| `Esc` | Leave Insert/Visual; clear a pending operator or count |
+| `h` `j` `k` `l`, arrows | Move by one cell |
+| `w` `b` `e` | Word forward / back / end (vim word classes, not VS Code word stops) |
+| `0` `^` `$` | Line start / first non-blank / line end |
+| `gg` `G` `{n}G` | File start / file end / absolute line |
+| `f`/`t`/`F`/`T` `{char}`, `;` `,` | Find char on the line (on / till, forward / back), repeat / repeat-reversed |
+| `{n}` prefix | Count for the next motion or operator (`3j`, `2dw`, `5G`) |
+| `x` | Delete `{count}` chars under the cursor (yanks them) |
+| `d` `y` `c` + motion / text object | Delete / yank / change over a motion (`dw`, `d$`, `dfx`), or `iw`/`aw` (`diw`, `ciw`, `daw`) |
+| `dd` `yy` `cc` | Linewise delete / yank / change (`{n}dd` for several lines) |
+| `p` `P` | Paste after / before (linewise when the yank was a whole line) |
+| `u` | Undo |
+| `v` `V` | Charwise / linewise Visual; then a motion extends and `d` `y` `c` operate |
+| `/` `?` then `Enter`, `n` `N` | Search forward / back in the buffer, jump to next / previous match |
+| `:w` `:q` `:wq` `:x` `:q!` `:qa`, `:{n}` | Write, close tab, write-and-close, quit-all, or jump to line `n` |
+
+When vim mode is on it supersedes the always-on `Cmd`+`d` `d` / `Cmd`+`g` `g` chord shortcuts listed above; turn it off to get those back.
 
 ### Editor: image preview (`.png`, `.jpg`, `.jpeg`, `.gif`, `.bmp`, `.webp`)
 
@@ -298,6 +324,7 @@ src/
 ├── sheet.rs             CSV / TSV / XLSX / XLS / XLSB / ODS parsing via the csv and calamine crates
 ├── sysmon.rs            system-metrics sampler loop (CPU / memory / network / disk / temp)
 ├── update_watch.rs      remote self-update: watch for a newer binary installed under a running remote croft
+├── vim.rs               native modal (vim-style) editing: a pure key state machine (modes, counts, operators, text objects, f/t, search, ex-commands) that emits editing intents the app applies; toggled with Cmd+E
 ├── zoxide.rs            zoxide integration: strict query + typo-tolerant fuzzy fallback (Damerau-Levenshtein) + cross-platform ensure-install backing the Cmd+Z jump popup
 ├── app/                 event loop, three-pane layout + activity bar, key dispatch, status bar, mouse, clipboard, splitters, preview overlays
 │   ├── mod.rs           the main App: render, key / mouse dispatch, status bar, splitters

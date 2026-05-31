@@ -734,6 +734,14 @@ pub struct App {
     definition_request_id: Option<u64>,
     nav: NavHistory,
     editor_vim_chord: EditorVimChord,
+    /// Native modal (vim-style) editing for the editor pane. When enabled it
+    /// supersedes the always-on `editor_vim_chord` convenience layer.
+    vim: crate::vim::VimState,
+    /// Last `f`/`t`/`F`/`T` target, replayed by `;` and `,`.
+    vim_last_find: Option<(crate::vim::FindKind, char)>,
+    /// Whether the active visual selection is linewise (`V`), so the pending
+    /// visual operator deletes/yanks whole lines.
+    vim_visual_line: bool,
     shortcuts_modal: Option<crate::widgets::shortcuts::ShortcutsModal>,
     shortcuts_hit_rect: Option<Rect>,
     connect_dialog: Option<crate::widgets::connect_dialog::ConnectDialog>,
@@ -1249,6 +1257,9 @@ impl App {
             lsp_last_seen: std::collections::HashMap::new(),
             completion_popup: None,
             editor_vim_chord: EditorVimChord::default(),
+            vim: crate::vim::VimState::new(),
+            vim_last_find: None,
+            vim_visual_line: false,
             shortcuts_modal: None,
             shortcuts_hit_rect: None,
             connect_dialog: None,
@@ -3397,6 +3408,30 @@ impl App {
                     .add_modifier(Modifier::BOLD),
             ));
         }
+        if self.vim.enabled {
+            let (text, bg) = match self.vim.command_line() {
+                Some(cmd) => (format!(" {cmd} "), Color::Rgb(0x33, 0x33, 0x33)),
+                None => {
+                    let label = self.vim.mode_label().unwrap_or("NORMAL");
+                    let bg = match self.vim.mode() {
+                        crate::vim::VimMode::Insert => Color::Rgb(0x1f, 0x7a, 0x33),
+                        crate::vim::VimMode::Visual | crate::vim::VimMode::VisualLine => {
+                            Color::Rgb(0x8a, 0x4f, 0xbf)
+                        }
+                        _ => Color::Rgb(0x4e, 0x9a, 0xff),
+                    };
+                    (format!(" {label} "), bg)
+                }
+            };
+            spans.push(Span::styled(
+                text,
+                Style::default()
+                    .bg(bg)
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::raw(" "));
+        }
         spans.extend(git_status_spans(self.git.status()));
         spans.push(Span::raw("  "));
         spans.push(Span::raw(&self.status));
@@ -5381,7 +5416,31 @@ impl App {
             }
             return;
         }
-        if self.handle_editor_vim_chord(key) {
+        if is_vim_toggle_key(key) {
+            self.vim.toggle();
+            self.status = if self.vim.enabled {
+                String::from("vim mode on")
+            } else {
+                String::from("vim mode off")
+            };
+            return;
+        }
+        // When modal editing is on it fully owns the editor pane and the
+        // always-on `editor_vim_chord` convenience layer is bypassed. A
+        // PassThrough means the key is not claimed by vim (Insert-mode typing,
+        // or any Cmd/Ctrl shortcut in Normal mode) and falls through to the
+        // editor's normal handling below.
+        if self.vim.enabled {
+            match self.vim.on_key(key) {
+                crate::vim::VimKeyResult::Consumed(actions) => {
+                    for action in actions {
+                        self.apply_vim_action(action);
+                    }
+                    return;
+                }
+                crate::vim::VimKeyResult::PassThrough => {}
+            }
+        } else if self.handle_editor_vim_chord(key) {
             return;
         }
         if is_editor_line_home_key(key) {
@@ -5671,6 +5730,617 @@ impl App {
         self.editor_vim_chord.reset();
         self.status = String::from("Chord cancelled");
         false
+    }
+
+    /// Apply one resolved vim intent to the editor. The vim state machine has
+    /// already advanced its own mode; this only mutates the buffer/cursor.
+    fn apply_vim_action(&mut self, action: crate::vim::VimAction) {
+        use crate::vim::{Target, VimAction};
+        match action {
+            VimAction::Move(motion, count) => {
+                self.vim_apply_motion(motion, count);
+                self.vim_sync_visual_selection();
+            }
+            VimAction::Operate { op, target, count } => match target {
+                Target::Lines => self.vim_operate_lines(op, self.editor.cursor_row, count),
+                Target::Object(obj) => self.vim_operate_textobject(op, obj),
+                Target::Motion(m) => self.vim_operate_motion(op, m, count),
+            },
+            VimAction::DeleteChar(count) => self.vim_delete_chars(count),
+            VimAction::Insert(at) => self.vim_enter_insert(at),
+            VimAction::Paste(at, count) => self.vim_paste(at, count),
+            VimAction::Undo => {
+                self.status = if self.editor.undo() {
+                    String::from("Undo")
+                } else {
+                    String::from("Nothing to undo")
+                };
+            }
+            VimAction::EnterVisual { line } => {
+                self.editor.break_undo_coalescing();
+                self.vim_visual_line = line;
+                self.vim
+                    .set_visual_anchor(self.editor.cursor_row, self.editor.cursor_col);
+                self.editor.start_selection_at_cursor();
+                self.status = String::from(if line {
+                    "-- VISUAL LINE --"
+                } else {
+                    "-- VISUAL --"
+                });
+            }
+            VimAction::ExitVisual => {
+                self.editor.clear_selection();
+                self.vim_visual_line = false;
+                self.status.clear();
+            }
+            VimAction::VisualOperate(op) => self.vim_visual_operate(op),
+            VimAction::ExitInsert => {
+                self.editor.break_undo_coalescing();
+                if self.editor.cursor_col > 0 {
+                    self.editor.cursor_col -= 1;
+                }
+                self.status.clear();
+            }
+            VimAction::RunEx(cmd) => self.vim_run_ex(&cmd),
+            VimAction::Search(dir, term) => self.vim_search(dir, &term),
+            VimAction::ClearPending => {
+                self.editor.clear_selection();
+                self.vim_visual_line = false;
+            }
+        }
+    }
+
+    fn vim_line_len(&self, row: usize) -> usize {
+        self.editor
+            .lines
+            .get(row)
+            .map(|l| l.chars().count())
+            .unwrap_or(0)
+    }
+
+    fn vim_first_non_blank(&self, row: usize) -> usize {
+        self.editor
+            .lines
+            .get(row)
+            .map(|l| l.chars().take_while(|c| c.is_whitespace()).count())
+            .unwrap_or(0)
+    }
+
+    fn vim_apply_motion(&mut self, motion: crate::vim::Motion, count: usize) {
+        use crate::vim::Motion;
+        let n = count.max(1);
+        match motion {
+            Motion::Left => {
+                self.editor.cursor_col = self.editor.cursor_col.saturating_sub(n);
+            }
+            Motion::Right => {
+                let len = self.vim_line_len(self.editor.cursor_row);
+                self.editor.cursor_col = (self.editor.cursor_col + n).min(len);
+            }
+            Motion::Up => {
+                for _ in 0..n {
+                    self.editor.move_up();
+                }
+            }
+            Motion::Down => {
+                for _ in 0..n {
+                    self.editor.move_down();
+                }
+            }
+            Motion::WordForward => {
+                for _ in 0..n {
+                    self.vim_word_forward();
+                }
+            }
+            Motion::WordBackward => {
+                for _ in 0..n {
+                    self.vim_word_backward();
+                }
+            }
+            Motion::WordEnd => {
+                for _ in 0..n {
+                    self.vim_word_end();
+                }
+            }
+            Motion::LineStart => self.editor.cursor_col = 0,
+            Motion::FirstNonBlank => {
+                self.editor.cursor_col = self.vim_first_non_blank(self.editor.cursor_row);
+            }
+            Motion::LineEnd => {
+                self.editor.cursor_col = self.vim_line_len(self.editor.cursor_row);
+            }
+            Motion::FileStart => self.editor.goto_top(),
+            Motion::FileEnd => self.editor.goto_bottom(),
+            Motion::GotoLine(line) => self.editor.goto_line(line),
+            Motion::Find(kind, ch) => {
+                self.vim_last_find = Some((kind, ch));
+                self.vim_find_char(kind, ch, n);
+            }
+            Motion::RepeatFind => {
+                if let Some((kind, ch)) = self.vim_last_find {
+                    self.vim_find_char(kind, ch, n);
+                }
+            }
+            Motion::RepeatFindRev => {
+                if let Some((kind, ch)) = self.vim_last_find {
+                    self.vim_find_char(reverse_find(kind), ch, n);
+                }
+            }
+        }
+        self.editor.ensure_cursor_col_visible();
+    }
+
+    fn vim_find_char(&mut self, kind: crate::vim::FindKind, ch: char, count: usize) {
+        use crate::vim::FindKind;
+        let row = self.editor.cursor_row;
+        let Some(line) = self.editor.lines.get(row) else {
+            return;
+        };
+        let chars: Vec<char> = line.chars().collect();
+        let mut col = self.editor.cursor_col;
+        for _ in 0..count.max(1) {
+            match kind {
+                FindKind::CharForward => match (col + 1..chars.len()).find(|&i| chars[i] == ch) {
+                    Some(idx) => col = idx,
+                    None => return,
+                },
+                FindKind::TillForward => match (col + 1..chars.len()).find(|&i| chars[i] == ch) {
+                    Some(idx) if idx > 0 => col = idx - 1,
+                    _ => return,
+                },
+                FindKind::CharBackward => match (0..col).rev().find(|&i| chars[i] == ch) {
+                    Some(idx) => col = idx,
+                    None => return,
+                },
+                FindKind::TillBackward => match (0..col).rev().find(|&i| chars[i] == ch) {
+                    Some(idx) => col = idx + 1,
+                    None => return,
+                },
+            }
+        }
+        self.editor.cursor_col = col;
+    }
+
+    /// Character class for vim word motions: 0 = blank (or past line end),
+    /// 1 = keyword (alphanumeric/underscore), 2 = punctuation. A `w`/`b`/`e`
+    /// word is a maximal run of one non-blank class.
+    fn vim_class_at(&self, row: usize, col: usize) -> u8 {
+        match self.editor.lines.get(row).and_then(|l| l.chars().nth(col)) {
+            None => 0,
+            Some(c) if c.is_whitespace() => 0,
+            Some(c) if c.is_alphanumeric() || c == '_' => 1,
+            Some(_) => 2,
+        }
+    }
+
+    fn vim_next_pos(&self, row: usize, col: usize) -> Option<(usize, usize)> {
+        if col < self.vim_line_len(row) {
+            Some((row, col + 1))
+        } else if row + 1 < self.editor.lines.len() {
+            Some((row + 1, 0))
+        } else {
+            None
+        }
+    }
+
+    fn vim_prev_pos(&self, row: usize, col: usize) -> Option<(usize, usize)> {
+        if col > 0 {
+            Some((row, col - 1))
+        } else if row > 0 {
+            Some((row - 1, self.vim_line_len(row - 1)))
+        } else {
+            None
+        }
+    }
+
+    fn vim_word_forward(&mut self) {
+        let mut row = self.editor.cursor_row;
+        let mut col = self.editor.cursor_col;
+        let start = self.vim_class_at(row, col);
+        if start != 0 {
+            while self.vim_class_at(row, col) == start {
+                match self.vim_next_pos(row, col) {
+                    Some((r, c)) => {
+                        row = r;
+                        col = c;
+                    }
+                    None => {
+                        self.editor.cursor_row = row;
+                        self.editor.cursor_col = col;
+                        return;
+                    }
+                }
+            }
+        }
+        while self.vim_class_at(row, col) == 0 {
+            match self.vim_next_pos(row, col) {
+                Some((r, c)) => {
+                    row = r;
+                    col = c;
+                }
+                None => break,
+            }
+        }
+        self.editor.cursor_row = row;
+        self.editor.cursor_col = col;
+    }
+
+    fn vim_word_backward(&mut self) {
+        let mut row = self.editor.cursor_row;
+        let mut col = self.editor.cursor_col;
+        let Some((r, c)) = self.vim_prev_pos(row, col) else {
+            return;
+        };
+        row = r;
+        col = c;
+        while self.vim_class_at(row, col) == 0 {
+            match self.vim_prev_pos(row, col) {
+                Some((r, c)) => {
+                    row = r;
+                    col = c;
+                }
+                None => {
+                    self.editor.cursor_row = row;
+                    self.editor.cursor_col = col;
+                    return;
+                }
+            }
+        }
+        let class = self.vim_class_at(row, col);
+        while let Some((pr, pc)) = self.vim_prev_pos(row, col) {
+            if self.vim_class_at(pr, pc) != class {
+                break;
+            }
+            row = pr;
+            col = pc;
+        }
+        self.editor.cursor_row = row;
+        self.editor.cursor_col = col;
+    }
+
+    fn vim_word_end(&mut self) {
+        let mut row = self.editor.cursor_row;
+        let mut col = self.editor.cursor_col;
+        let Some((r, c)) = self.vim_next_pos(row, col) else {
+            return;
+        };
+        row = r;
+        col = c;
+        while self.vim_class_at(row, col) == 0 {
+            match self.vim_next_pos(row, col) {
+                Some((r, c)) => {
+                    row = r;
+                    col = c;
+                }
+                None => {
+                    self.editor.cursor_row = row;
+                    self.editor.cursor_col = col;
+                    return;
+                }
+            }
+        }
+        let class = self.vim_class_at(row, col);
+        while let Some((nr, nc)) = self.vim_next_pos(row, col) {
+            if self.vim_class_at(nr, nc) != class {
+                break;
+            }
+            row = nr;
+            col = nc;
+        }
+        self.editor.cursor_row = row;
+        self.editor.cursor_col = col;
+    }
+
+    fn vim_operate_lines(&mut self, op: crate::vim::Op, start_row: usize, count: usize) {
+        use crate::vim::Op;
+        self.editor.cursor_row = start_row.min(self.editor.lines.len().saturating_sub(1));
+        let n = count.max(1);
+        match op {
+            Op::Delete => {
+                let text = self.editor.delete_lines(n);
+                copy_to_clipboard(&text);
+                self.status = format!("Deleted {n} line(s)");
+            }
+            Op::Yank => {
+                let text = self.editor.yank_lines(n);
+                copy_to_clipboard(&text);
+                self.status = format!("Yanked {n} line(s)");
+            }
+            Op::Change => {
+                let text = self.editor.delete_lines(n);
+                copy_to_clipboard(&text);
+                self.editor.open_line_above();
+                self.vim.enter_insert_mode();
+                self.status = String::from("-- INSERT --");
+            }
+        }
+    }
+
+    fn vim_operate_motion(&mut self, op: crate::vim::Op, motion: crate::vim::Motion, count: usize) {
+        if vim_motion_is_linewise(motion) {
+            let (first, last) = self.vim_line_range_for_motion(motion, count);
+            self.vim_operate_lines(op, first, last + 1 - first);
+            return;
+        }
+        let start = (self.editor.cursor_row, self.editor.cursor_col);
+        self.vim_apply_motion(motion, count);
+        let end = (self.editor.cursor_row, self.editor.cursor_col);
+        let (lo, hi) = if start <= end {
+            (start, end)
+        } else {
+            (end, start)
+        };
+        // Forward-inclusive motions (f/t/e) cover the char they land on.
+        let head = if start <= end && vim_motion_is_forward_inclusive(motion) {
+            let len = self.vim_line_len(hi.0);
+            (hi.0, (hi.1 + 1).min(len))
+        } else {
+            hi
+        };
+        self.editor.selection = Some(crate::widgets::editor::EditorSelection { anchor: lo, head });
+        self.vim_apply_operator_to_selection(op, lo);
+    }
+
+    fn vim_operate_textobject(&mut self, op: crate::vim::Op, obj: crate::vim::TextObject) {
+        use crate::vim::TextObject;
+        let row = self.editor.cursor_row;
+        let Some((start, mut end)) = self.editor.word_at(row, self.editor.cursor_col) else {
+            return;
+        };
+        if obj == TextObject::AWord
+            && let Some(line) = self.editor.lines.get(row)
+        {
+            let chars: Vec<char> = line.chars().collect();
+            while end < chars.len() && chars[end].is_whitespace() {
+                end += 1;
+            }
+        }
+        self.editor.selection = Some(crate::widgets::editor::EditorSelection {
+            anchor: (row, start),
+            head: (row, end),
+        });
+        self.vim_apply_operator_to_selection(op, (row, start));
+    }
+
+    /// Delete / yank / change whatever the editor selection currently spans,
+    /// leaving the cursor at `start` and entering Insert mode for a change.
+    fn vim_apply_operator_to_selection(&mut self, op: crate::vim::Op, start: (usize, usize)) {
+        use crate::vim::Op;
+        let text = self.editor.selection_text();
+        copy_to_clipboard(&text);
+        match op {
+            Op::Yank => {
+                self.editor.clear_selection();
+                self.editor.cursor_row = start.0;
+                self.editor.cursor_col = start.1;
+            }
+            Op::Delete => {
+                self.editor.delete_selection();
+            }
+            Op::Change => {
+                self.editor.delete_selection();
+                self.vim.enter_insert_mode();
+                self.status = String::from("-- INSERT --");
+            }
+        }
+    }
+
+    fn vim_line_range_for_motion(
+        &self,
+        motion: crate::vim::Motion,
+        count: usize,
+    ) -> (usize, usize) {
+        use crate::vim::Motion;
+        let row = self.editor.cursor_row;
+        let last = self.editor.lines.len().saturating_sub(1);
+        let n = count.max(1);
+        match motion {
+            Motion::Down => (row, (row + n).min(last)),
+            Motion::Up => (row.saturating_sub(n), row),
+            Motion::FileStart => (0, row),
+            Motion::FileEnd => (row, last),
+            Motion::GotoLine(line) => {
+                let target = line.saturating_sub(1).min(last);
+                if target >= row {
+                    (row, target)
+                } else {
+                    (target, row)
+                }
+            }
+            _ => (row, row),
+        }
+    }
+
+    fn vim_delete_chars(&mut self, count: usize) {
+        let row = self.editor.cursor_row;
+        let Some(line) = self.editor.lines.get(row) else {
+            return;
+        };
+        let chars: Vec<char> = line.chars().collect();
+        let col = self.editor.cursor_col;
+        let end = (col + count.max(1)).min(chars.len());
+        if col < end {
+            let deleted: String = chars[col..end].iter().collect();
+            copy_to_clipboard(&deleted);
+            for _ in col..end {
+                self.editor.delete_forward();
+            }
+        }
+    }
+
+    fn vim_enter_insert(&mut self, at: crate::vim::InsertAt) {
+        use crate::vim::InsertAt;
+        let row = self.editor.cursor_row;
+        match at {
+            InsertAt::Cursor => {}
+            InsertAt::After => {
+                let len = self.vim_line_len(row);
+                if self.editor.cursor_col < len {
+                    self.editor.cursor_col += 1;
+                }
+            }
+            InsertAt::LineStart => self.editor.cursor_col = self.vim_first_non_blank(row),
+            InsertAt::LineEnd => self.editor.cursor_col = self.vim_line_len(row),
+            InsertAt::Below => self.editor.open_line_below(),
+            InsertAt::Above => self.editor.open_line_above(),
+        }
+        self.editor.break_undo_coalescing();
+        self.status = String::from("-- INSERT --");
+    }
+
+    fn vim_paste(&mut self, at: crate::vim::PasteAt, count: usize) {
+        use crate::vim::PasteAt;
+        let Some(text) = (self.clipboard_reader)() else {
+            return;
+        };
+        if text.is_empty() {
+            return;
+        }
+        let n = count.max(1);
+        if let Some(body) = text.strip_suffix('\n') {
+            // Linewise paste: the yank ended on a newline, so it lands on
+            // fresh lines rather than inside the current one.
+            let block = std::iter::repeat_n(body, n).collect::<Vec<_>>().join("\n");
+            match at {
+                PasteAt::After => {
+                    self.editor.cursor_col = self.vim_line_len(self.editor.cursor_row);
+                    self.editor.insert_str(&format!("\n{block}"));
+                }
+                PasteAt::Before => {
+                    self.editor.cursor_col = 0;
+                    self.editor.insert_str(&format!("{block}\n"));
+                }
+            }
+        } else {
+            let block = text.repeat(n);
+            if at == PasteAt::After {
+                let len = self.vim_line_len(self.editor.cursor_row);
+                if self.editor.cursor_col < len {
+                    self.editor.cursor_col += 1;
+                }
+            }
+            self.editor.insert_str(&block);
+        }
+        self.status = String::from("Pasted");
+    }
+
+    fn vim_visual_operate(&mut self, op: crate::vim::Op) {
+        use crate::vim::Op;
+        let Some(sel) = self.editor.selection else {
+            return;
+        };
+        if self.vim_visual_line {
+            let ((sr, _), (er, _)) = sel.normalised();
+            self.vim_operate_lines(op, sr, er + 1 - sr);
+            self.vim_visual_line = false;
+            return;
+        }
+        // Charwise visual is inclusive of the cell under the cursor, so extend
+        // the high end one char before operating.
+        let ((sr, sc), (er, ec)) = sel.normalised();
+        let len = self.vim_line_len(er);
+        self.editor.selection = Some(crate::widgets::editor::EditorSelection {
+            anchor: (sr, sc),
+            head: (er, (ec + 1).min(len)),
+        });
+        self.vim_apply_operator_to_selection(op, (sr, sc));
+        self.vim_visual_line = false;
+        if !matches!(op, Op::Change) {
+            self.status.clear();
+        }
+    }
+
+    fn vim_run_ex(&mut self, cmd: &str) {
+        let cmd = cmd.trim();
+        if let Ok(line) = cmd.parse::<usize>() {
+            self.editor.goto_line(line);
+            return;
+        }
+        match cmd {
+            "w" | "write" => self.save(),
+            "q" | "q!" | "quit" => {
+                if self.editor.close_active() {
+                    self.sync_open_file_poll_mtime();
+                    self.status = String::from("Closed tab");
+                } else {
+                    self.quit = true;
+                }
+            }
+            "wq" | "x" | "wq!" => {
+                self.save();
+                if !self.editor.close_active() {
+                    self.quit = true;
+                }
+            }
+            "qa" | "qa!" | "quitall" => self.quit = true,
+            other => self.status = format!("Unknown command: {other}"),
+        }
+    }
+
+    fn vim_search(&mut self, dir: crate::vim::SearchDir, term: &str) {
+        self.editor.set_search_highlight(
+            Some(term.to_string()),
+            crate::widgets::search::SearchOpts::default(),
+        );
+        match self.vim_find_match(dir, term) {
+            Some((row, col)) => {
+                self.editor.cursor_row = row;
+                self.editor.cursor_col = col;
+                self.editor.ensure_cursor_col_visible();
+                self.status = match dir {
+                    crate::vim::SearchDir::Forward => format!("/{term}"),
+                    crate::vim::SearchDir::Backward => format!("?{term}"),
+                };
+            }
+            None => self.status = format!("Pattern not found: {term}"),
+        }
+    }
+
+    fn vim_find_match(&self, dir: crate::vim::SearchDir, term: &str) -> Option<(usize, usize)> {
+        use crate::vim::SearchDir;
+        let lines = &self.editor.lines;
+        if term.is_empty() || lines.is_empty() {
+            return None;
+        }
+        let (cr, cc) = (self.editor.cursor_row, self.editor.cursor_col);
+        let total = lines.len();
+        match dir {
+            SearchDir::Forward => {
+                for off in 0..=total {
+                    let row = (cr + off) % total;
+                    let from = if off == 0 { cc + 1 } else { 0 };
+                    if let Some(col) = find_char_index(&lines[row], term, from) {
+                        return Some((row, col));
+                    }
+                }
+                None
+            }
+            SearchDir::Backward => {
+                for off in 0..=total {
+                    let row = (cr + total - off) % total;
+                    let limit = if off == 0 { cc } else { usize::MAX };
+                    if let Some(col) = rfind_char_index(&lines[row], term, limit) {
+                        return Some((row, col));
+                    }
+                }
+                None
+            }
+        }
+    }
+
+    fn vim_sync_visual_selection(&mut self) {
+        if !matches!(
+            self.vim.mode(),
+            crate::vim::VimMode::Visual | crate::vim::VimMode::VisualLine
+        ) {
+            return;
+        }
+        if let Some(anchor) = self.vim.visual_anchor() {
+            self.editor.selection = Some(crate::widgets::editor::EditorSelection {
+                anchor,
+                head: (self.editor.cursor_row, self.editor.cursor_col),
+            });
+        }
     }
 
     fn handle_terminal_key(&mut self, key: KeyEvent) {
@@ -9725,6 +10395,72 @@ fn cmd_only_digit_value(key: KeyEvent) -> Option<usize> {
         return None;
     }
     Some(d)
+}
+
+/// Cmd+E toggles native modal (vim) editing in the editor pane. A plain
+/// Cmd+letter reaches croft reliably as SUPER (the same path as Cmd+S / Cmd+C),
+/// unlike Option+letter which emits a glyph on macOS; and it stays out of the
+/// Cmd+Shift+letter space reserved for activity-bar view jumps.
+fn is_vim_toggle_key(key: KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char('e') | KeyCode::Char('E'))
+        && key.modifiers.contains(KeyModifiers::SUPER)
+        && !key.modifiers.contains(KeyModifiers::SHIFT)
+}
+
+fn reverse_find(kind: crate::vim::FindKind) -> crate::vim::FindKind {
+    use crate::vim::FindKind;
+    match kind {
+        FindKind::CharForward => FindKind::CharBackward,
+        FindKind::CharBackward => FindKind::CharForward,
+        FindKind::TillForward => FindKind::TillBackward,
+        FindKind::TillBackward => FindKind::TillForward,
+    }
+}
+
+/// Vertical / whole-file motions operate linewise under an operator (`dj`,
+/// `dG`), unlike the charwise horizontal and word motions.
+fn vim_motion_is_linewise(motion: crate::vim::Motion) -> bool {
+    use crate::vim::Motion;
+    matches!(
+        motion,
+        Motion::Up | Motion::Down | Motion::FileStart | Motion::FileEnd | Motion::GotoLine(_)
+    )
+}
+
+/// `f`/`t`/`e` land on a char that the operator should include, so the
+/// deletion range needs to extend one past the landing column.
+fn vim_motion_is_forward_inclusive(motion: crate::vim::Motion) -> bool {
+    use crate::vim::{FindKind, Motion};
+    matches!(
+        motion,
+        Motion::WordEnd
+            | Motion::Find(FindKind::CharForward, _)
+            | Motion::Find(FindKind::TillForward, _)
+    )
+}
+
+/// First char index `>= from` where `term` begins in `line`, comparing by
+/// char (not byte) so the result indexes the editor's char-based cursor.
+fn find_char_index(line: &str, term: &str, from: usize) -> Option<usize> {
+    let chars: Vec<char> = line.chars().collect();
+    let needle: Vec<char> = term.chars().collect();
+    let tlen = needle.len();
+    if tlen == 0 || chars.len() < tlen {
+        return None;
+    }
+    (from..=chars.len() - tlen).find(|&i| chars[i..i + tlen] == needle[..])
+}
+
+/// Last char index `< limit` where `term` begins in `line`.
+fn rfind_char_index(line: &str, term: &str, limit: usize) -> Option<usize> {
+    let chars: Vec<char> = line.chars().collect();
+    let needle: Vec<char> = term.chars().collect();
+    let tlen = needle.len();
+    if tlen == 0 || chars.len() < tlen {
+        return None;
+    }
+    let upper = limit.min(chars.len() - tlen + 1);
+    (0..upper).rev().find(|&i| chars[i..i + tlen] == needle[..])
 }
 
 fn is_plain_letter(key: KeyEvent, letter: char) -> bool {
