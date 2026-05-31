@@ -120,6 +120,7 @@ croft setup-terminal --help
 | `Ctrl`+`C` / `Cmd`+`C` | Copy selected paths to the explorer clipboard |
 | `Ctrl`+`X` / `Cmd`+`X` | Cut selected paths to the explorer clipboard |
 | `Ctrl`+`V` / `Cmd`+`V` | Paste clipboard paths into the focused folder (move on Cut, copy on Copy) |
+| `Cmd`+`Z` | Jump to a directory via zoxide: opens a fuzzy popup over your frecency-ranked dirs, then re-roots the workspace there and `cd`s the active terminal (same jump as `j` in the shell; `j` stays free, `Cmd`/`Ctrl`+`J` still does terminal toggle/maximize) |
 | Drag a row onto a folder | Move the selection into that folder |
 | `Alt`-drag a row onto a folder | Copy the selection into that folder instead of moving |
 | `Delete` / `Backspace` (or `Cmd`+`Backspace`) | Move every selected path to the OS Trash. On macOS the trash sound plays once for the whole batch. |

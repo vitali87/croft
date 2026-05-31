@@ -144,6 +144,10 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 description: "Re-root at parent of the selected node (also cd's the active terminal)",
             },
             ShortcutEntry {
+                keys: "Cmd+Z",
+                description: "Jump to a directory via zoxide; re-roots the workspace and cd's the active terminal",
+            },
+            ShortcutEntry {
                 keys: "Cmd/Ctrl+D",
                 description: "Compare-anchor / diff toggle on file",
             },
