@@ -119,7 +119,7 @@ croft setup-terminal --help
 | `Ctrl`+`C` / `Cmd`+`C` | Copy selected paths to the explorer clipboard |
 | `Ctrl`+`X` / `Cmd`+`X` | Cut selected paths to the explorer clipboard |
 | `Ctrl`+`V` / `Cmd`+`V` | Paste clipboard paths into the focused folder (move on Cut, copy on Copy) |
-| `Cmd`+`Z` | Jump to a directory via zoxide: opens a fuzzy popup over your frecency-ranked dirs, then re-roots the workspace there and `cd`s the active terminal (same jump as `j` in the shell; `j` stays free, `Cmd`/`Ctrl`+`J` still does terminal toggle/maximize) |
+| `Cmd`+`Z` | Jump to a directory via zoxide: opens a fuzzy popup over your frecency-ranked dirs, then re-roots the workspace there and `cd`s the active terminal (same jump as `j` in the shell; `j` stays free, `Cmd`/`Ctrl`+`J` still does terminal toggle/maximize). When a strict zoxide query finds nothing, a typo-tolerant fallback kicks in: it edit-distance-matches your last keyword against directory names (forgiving transpositions like `spilt` → `pr-split`, which zoxide's own matcher cannot) and flags the list as approximate |
 | Drag a row onto a folder | Move the selection into that folder |
 | `Alt`-drag a row onto a folder | Copy the selection into that folder instead of moving |
 | `Delete` / `Backspace` (or `Cmd`+`Backspace`) | Move every selected path to the OS Trash. On macOS the trash sound plays once for the whole batch. |
@@ -298,7 +298,7 @@ src/
 ├── sheet.rs             CSV / TSV / XLSX / XLS / XLSB / ODS parsing via the csv and calamine crates
 ├── sysmon.rs            system-metrics sampler loop (CPU / memory / network / disk / temp)
 ├── update_watch.rs      remote self-update: watch for a newer binary installed under a running remote croft
-├── zoxide.rs            zoxide integration: query + cross-platform ensure-install backing the Cmd+Z jump popup
+├── zoxide.rs            zoxide integration: strict query + typo-tolerant fuzzy fallback (Damerau-Levenshtein) + cross-platform ensure-install backing the Cmd+Z jump popup
 ├── app/                 event loop, three-pane layout + activity bar, key dispatch, status bar, mouse, clipboard, splitters, preview overlays
 │   ├── mod.rs           the main App: render, key / mouse dispatch, status bar, splitters
 │   ├── click.rs         double / triple click detection

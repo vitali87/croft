@@ -30,6 +30,15 @@ pub struct ZoxideJump {
     /// False once a `set_results(None)` reports the zoxide binary could
     /// not be found on this host; drives the "unavailable" message.
     pub available: bool,
+    /// The full frecency-ranked database, captured once when the popup
+    /// opens (`zoxide query -l`). The app layer reads this to run the
+    /// typo-tolerant fuzzy fallback without re-spawning zoxide on every
+    /// keystroke that misses.
+    pub all_dirs: Vec<PathBuf>,
+    /// True when `results` came from the fuzzy fallback rather than a
+    /// strict zoxide match; drives the "no exact match" hint so an
+    /// approximate result is never mistaken for a real frecency hit.
+    pub approximate: bool,
 }
 
 impl Default for ZoxideJump {
@@ -43,6 +52,8 @@ impl Default for ZoxideJump {
             last_rect: Rect::default(),
             last_inner_height: 0,
             available: true,
+            all_dirs: Vec::new(),
+            approximate: false,
         }
     }
 }
@@ -79,6 +90,23 @@ impl ZoxideJump {
                 self.results = Vec::new();
             }
         }
+        self.approximate = false;
+        self.selected = 0;
+        self.scroll = 0;
+    }
+
+    /// Cache the full frecency database so the fuzzy fallback can rank
+    /// against it without re-querying zoxide. Called once at popup open.
+    pub fn set_all_dirs(&mut self, dirs: Vec<PathBuf>) {
+        self.all_dirs = dirs;
+    }
+
+    /// Install fuzzy-fallback results, marking the list approximate so the
+    /// UI flags that no strict match existed. Selection/scroll reset.
+    pub fn set_approximate_results(&mut self, paths: Vec<PathBuf>) {
+        self.available = true;
+        self.results = paths;
+        self.approximate = true;
         self.selected = 0;
         self.scroll = 0;
     }
@@ -228,10 +256,19 @@ pub fn render_zoxide_jump(jump: &mut ZoxideJump, rect: Rect, buf: &mut Buffer) {
         width: inner.width,
         height: 1,
     };
-    let sep_line = Line::from(Span::styled(
-        "─".repeat(separator_rect.width as usize),
-        Style::default().fg(Color::Rgb(0x3b, 0x42, 0x52)),
-    ));
+    let sep_line = if jump.approximate {
+        Line::from(Span::styled(
+            "≈ no exact match — closest by spelling",
+            Style::default()
+                .fg(Color::Rgb(0xe5, 0xc0, 0x7b))
+                .add_modifier(Modifier::ITALIC),
+        ))
+    } else {
+        Line::from(Span::styled(
+            "─".repeat(separator_rect.width as usize),
+            Style::default().fg(Color::Rgb(0x3b, 0x42, 0x52)),
+        ))
+    };
     Widget::render(Paragraph::new(sep_line), separator_rect, buf);
 
     let list_rect = Rect {
@@ -324,6 +361,24 @@ mod tests {
             "new result list must reset selection"
         );
         assert_eq!(j.results.len(), 1);
+    }
+
+    #[test]
+    fn approximate_flag_tracks_fallback_vs_strict_results() {
+        let mut j = ZoxideJump::new();
+        j.set_approximate_results(paths(&["/a/pr-split"]));
+        assert!(
+            j.approximate,
+            "fallback results must mark the list approximate"
+        );
+        assert!(j.available);
+        assert_eq!(j.selected_index(), 0);
+        // A subsequent strict result must clear the approximate flag.
+        j.set_results(Some(paths(&["/a/exact"])));
+        assert!(
+            !j.approximate,
+            "a strict result must reset the approximate flag"
+        );
     }
 
     #[test]

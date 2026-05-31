@@ -103,6 +103,88 @@ pub fn query(needle: &str) -> Option<Vec<PathBuf>> {
     Some(parse_query_output(&String::from_utf8_lossy(&output.stdout)))
 }
 
+/// Optimal-string-alignment (restricted Damerau-Levenshtein) distance of
+/// `pattern` against `text`, but with a *free* text prefix and suffix so
+/// `pattern` is matched as an approximate *substring* of `text`. A single
+/// adjacent transposition costs 1 edit, which is the whole point: it is
+/// what recovers a typo like `spilt` against the `split` inside
+/// `pr-split`, something plain subsequence matching (zoxide's own
+/// algorithm, fzf, croft's Cmd+P matcher) can never do because a
+/// transposition reorders characters.
+///
+/// `pattern`/`text` are expected pre-lowercased by the caller.
+fn osa_substring_distance(pattern: &[char], text: &[char]) -> usize {
+    let n = pattern.len();
+    let m = text.len();
+    if n == 0 {
+        return 0;
+    }
+    // d[i][j] = best edits to match pattern[..i] ending anywhere within
+    // text[..j]. Row 0 is all-zero (skipping any text prefix is free);
+    // column 0 is i (the pattern char has no text to match against).
+    let mut d = vec![vec![0usize; m + 1]; n + 1];
+    for (i, row) in d.iter_mut().enumerate() {
+        row[0] = i;
+    }
+    for i in 1..=n {
+        for j in 1..=m {
+            let cost = usize::from(pattern[i - 1] != text[j - 1]);
+            let mut best = (d[i - 1][j] + 1)
+                .min(d[i][j - 1] + 1)
+                .min(d[i - 1][j - 1] + cost);
+            if i >= 2 && j >= 2 && pattern[i - 1] == text[j - 2] && pattern[i - 2] == text[j - 1] {
+                best = best.min(d[i - 2][j - 2] + 1);
+            }
+            d[i][j] = best;
+        }
+    }
+    // Free text suffix: the match may end at any column of the last row.
+    d[n].iter().copied().min().unwrap_or(n)
+}
+
+/// Maximum edit distance tolerated for a needle of `len` characters. Kept
+/// deliberately tight (≈ one edit per three chars, never more than three)
+/// so this *fallback* surfaces genuine typos without flooding the popup
+/// with loosely-related directories.
+fn fuzzy_threshold(len: usize) -> usize {
+    (len / 3).clamp(1, 3)
+}
+
+/// The basename used for fuzzy matching: the final path component,
+/// lowercased into a `char` vector. zoxide matches its last keyword
+/// against the final component, so the fallback mirrors that — fuzzing the
+/// whole absolute path would let the long shared prefix dominate the score.
+fn basename_chars(path: &std::path::Path) -> Vec<char> {
+    path.file_name()
+        .map(|n| n.to_string_lossy().to_lowercase().chars().collect())
+        .unwrap_or_default()
+}
+
+/// Typo-tolerant fallback ranking over the cached zoxide database `dirs`
+/// (already in frecency order). Used only when the strict `query` returns
+/// no matches: the last whitespace token of `needle` is matched against
+/// each directory's basename with `osa_substring_distance`, entries within
+/// `fuzzy_threshold` are kept, and the survivors are sorted by edit
+/// distance ascending, breaking ties by the original frecency order so the
+/// most-used directory wins an equal-distance tie.
+pub fn fuzzy_rank(needle: &str, dirs: &[PathBuf]) -> Vec<PathBuf> {
+    let Some(token) = needle.split_whitespace().last() else {
+        return Vec::new();
+    };
+    let pattern: Vec<char> = token.to_lowercase().chars().collect();
+    let threshold = fuzzy_threshold(pattern.len());
+    let mut scored: Vec<(usize, usize, PathBuf)> = dirs
+        .iter()
+        .enumerate()
+        .filter_map(|(rank, path)| {
+            let dist = osa_substring_distance(&pattern, &basename_chars(path));
+            (dist <= threshold).then(|| (dist, rank, path.clone()))
+        })
+        .collect();
+    scored.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    scored.into_iter().map(|(_, _, path)| path).collect()
+}
+
 /// Probe for `zoxide` and, if it is missing, install it via the official
 /// script on a detached thread so launch is never blocked. Best-effort:
 /// any failure leaves the popup in its "unavailable" state. Invoked once
@@ -162,5 +244,82 @@ mod tests {
     fn parse_query_output_is_empty_for_no_matches() {
         assert!(parse_query_output("").is_empty());
         assert!(parse_query_output("\n  \n").is_empty());
+    }
+
+    #[test]
+    fn osa_substring_distance_treats_adjacent_transposition_as_one_edit() {
+        let p: Vec<char> = "spilt".chars().collect();
+        let t: Vec<char> = "split".chars().collect();
+        assert_eq!(
+            osa_substring_distance(&p, &t),
+            1,
+            "a single adjacent swap (i<->l) must cost exactly one edit"
+        );
+    }
+
+    #[test]
+    fn osa_substring_distance_matches_token_inside_longer_basename() {
+        // The free prefix/suffix means `spilt` is found against the
+        // `split` buried in `pr-split` at the cost of the one transposition.
+        let p: Vec<char> = "spilt".chars().collect();
+        let t: Vec<char> = "pr-split".chars().collect();
+        assert_eq!(osa_substring_distance(&p, &t), 1);
+        // Exact substring is free.
+        let exact: Vec<char> = "split".chars().collect();
+        assert_eq!(osa_substring_distance(&exact, &t), 0);
+    }
+
+    #[test]
+    fn fuzzy_rank_recovers_transposed_typo_and_drops_unrelated_dirs() {
+        let dirs = vec![
+            PathBuf::from("/home/u/documents"),
+            PathBuf::from("/home/u/pr-split"),
+            PathBuf::from("/home/u/node_modules"),
+        ];
+        let ranked = fuzzy_rank("spilt", &dirs);
+        assert_eq!(
+            ranked,
+            vec![PathBuf::from("/home/u/pr-split")],
+            "the transposed needle must surface pr-split and only pr-split"
+        );
+    }
+
+    #[test]
+    fn fuzzy_rank_orders_by_distance_then_frecency() {
+        // `docs` is an exact substring (distance 0) of the first two; the
+        // earlier (more frecent) one must win the tie. `dosc` is a
+        // transposition (distance 1) so the exact hits rank ahead of it.
+        let dirs = vec![
+            PathBuf::from("/a/docs"),       // rank 0, dist 0
+            PathBuf::from("/b/my-docs"),    // rank 1, dist 0
+            PathBuf::from("/c/dosc-stuff"), // rank 2, dist 1
+            PathBuf::from("/d/unrelated"),  // dropped
+        ];
+        let ranked = fuzzy_rank("docs", &dirs);
+        assert_eq!(
+            ranked,
+            vec![
+                PathBuf::from("/a/docs"),
+                PathBuf::from("/b/my-docs"),
+                PathBuf::from("/c/dosc-stuff"),
+            ],
+            "distance ascending, frecency order breaking equal-distance ties"
+        );
+    }
+
+    #[test]
+    fn fuzzy_rank_uses_only_the_last_whitespace_token() {
+        // Mirrors zoxide's "last keyword matches the final component":
+        // the leading `pr` token is ignored, `spilt` drives the match.
+        let dirs = vec![PathBuf::from("/home/u/pr-split")];
+        assert_eq!(fuzzy_rank("pr spilt", &dirs), dirs);
+    }
+
+    #[test]
+    fn fuzzy_threshold_is_tight_and_capped() {
+        assert_eq!(fuzzy_threshold(0), 1, "never below one edit");
+        assert_eq!(fuzzy_threshold(5), 1);
+        assert_eq!(fuzzy_threshold(9), 3);
+        assert_eq!(fuzzy_threshold(30), 3, "capped at three edits");
     }
 }

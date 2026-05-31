@@ -6592,6 +6592,10 @@ impl App {
         }
         let mut jump = crate::widgets::zoxide_jump::ZoxideJump::new();
         jump.set_results(crate::zoxide::query(""));
+        // Snapshot the full frecency list so the typo-tolerant fuzzy
+        // fallback can rank against it without re-spawning zoxide on every
+        // missed keystroke.
+        jump.set_all_dirs(jump.results.clone());
         let status = if jump.available {
             format!(
                 "Jump: {} directories — type to filter, Esc to close",
@@ -6622,12 +6626,29 @@ impl App {
     /// ranked matches back to the widget. The one subprocess per keystroke
     /// is cheap (zoxide reads a small frecency DB; single-digit ms) and
     /// fires only on input, never on the render hot path.
+    ///
+    /// Two layers: the strict `zoxide query` is authoritative and handles
+    /// the common case. Only when it returns zero matches for a non-empty
+    /// needle does the typo-tolerant `fuzzy_rank` fallback run, ranking the
+    /// cached frecency DB by edit distance so a transposition like `spilt`
+    /// still finds `pr-split` (zoxide's own subsequence matcher cannot).
+    /// The fallback is purely in-memory, so it never spawns zoxide twice.
     fn refresh_zoxide_results(&mut self) {
         let Some(jump) = self.zoxide_jump.as_mut() else {
             return;
         };
         let needle = jump.query.clone();
-        jump.set_results(crate::zoxide::query(&needle));
+        match crate::zoxide::query(&needle) {
+            Some(paths) if paths.is_empty() && !needle.trim().is_empty() => {
+                let ranked = crate::zoxide::fuzzy_rank(&needle, &jump.all_dirs);
+                if ranked.is_empty() {
+                    jump.set_results(Some(Vec::new()));
+                } else {
+                    jump.set_approximate_results(ranked);
+                }
+            }
+            other => jump.set_results(other),
+        }
     }
 
     fn handle_zoxide_jump_key(&mut self, key: KeyEvent) {
