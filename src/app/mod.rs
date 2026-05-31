@@ -26,6 +26,7 @@ mod click;
 mod cursor_blink;
 mod fs_watch;
 mod git_worker;
+mod hover;
 mod overlay;
 mod perf_hud;
 mod sys_monitor;
@@ -34,6 +35,7 @@ use click::ClickTracker;
 use cursor_blink::CursorBlink;
 use fs_watch::FsWatch;
 use git_worker::GitWorker;
+use hover::{HOVER_DELAY, HoverDwell};
 use overlay::OverlayManager;
 use perf_hud::PerfHud;
 use sys_monitor::SysMonitor;
@@ -714,6 +716,12 @@ pub struct App {
     /// id are dropped so a slow earlier response cannot clobber a fresh
     /// one (e.g. user already moved past the original trigger).
     completion_request_id: Option<u64>,
+    hover: HoverDwell,
+    hover_popup: Option<crate::widgets::hover_popup::HoverPopup>,
+    hover_request_id: Option<u64>,
+    hover_anchor: Option<(u16, u16)>,
+    hover_word: Option<(usize, usize, usize)>,
+    definition_request_id: Option<u64>,
     editor_vim_chord: EditorVimChord,
     shortcuts_modal: Option<crate::widgets::shortcuts::ShortcutsModal>,
     shortcuts_hit_rect: Option<Rect>,
@@ -1239,6 +1247,12 @@ impl App {
             file_finder_index_rx: Some(file_finder_index_rx),
             file_finder_index_dirty: false,
             completion_request_id: None,
+            hover: HoverDwell::default(),
+            hover_popup: None,
+            hover_request_id: None,
+            hover_anchor: None,
+            hover_word: None,
+            definition_request_id: None,
         })
     }
 
@@ -2069,6 +2083,159 @@ impl App {
         };
         let id = lsp.request_completion(path, line, character);
         self.completion_request_id = Some(id);
+    }
+
+    fn on_mouse_moved(&mut self, col: u16, row: u16, in_editor: bool) {
+        if !in_editor {
+            self.hover.clear();
+            self.hover_popup = None;
+            self.hover_word = None;
+            self.hover_request_id = None;
+            return;
+        }
+        self.hover.on_move(std::time::Instant::now(), col, row);
+        if self.hover_popup.is_some() {
+            let current = self
+                .editor
+                .buffer_pos_at(col, row)
+                .and_then(|(line, c)| self.editor.word_at(line, c).map(|(s, e)| (line, s, e)));
+            if current != self.hover_word {
+                self.hover_popup = None;
+                self.hover_word = None;
+                self.hover_request_id = None;
+            }
+        }
+    }
+
+    fn poll_hover(&mut self) {
+        if !self.hover.due(std::time::Instant::now(), HOVER_DELAY) {
+            return;
+        }
+        self.hover.mark_fired();
+        if self.completion_popup.is_some() {
+            return;
+        }
+        if self.editor.diff.is_some() || self.editor.sheet.is_some() || self.editor.image.is_some()
+        {
+            return;
+        }
+        let Some((col, row)) = self.hover.cell() else {
+            return;
+        };
+        let Some((line, c)) = self.editor.buffer_pos_at(col, row) else {
+            return;
+        };
+        let Some((start, end)) = self.editor.word_at(line, c) else {
+            return;
+        };
+        let Some(path) = self.editor.path.clone() else {
+            return;
+        };
+        let Some(lsp) = self.lsp.as_mut() else {
+            return;
+        };
+        let id = lsp.request_hover(path, line as u32, c as u32);
+        self.hover_request_id = Some(id);
+        self.hover_anchor = Some((col, row));
+        self.hover_word = Some((line, start, end));
+    }
+
+    pub fn drain_lsp_hover(&mut self) -> bool {
+        let Some(lsp) = self.lsp.as_ref() else {
+            return false;
+        };
+        let mut changed = false;
+        while let Some(result) = lsp.drain_hover() {
+            if Some(result.request_id) != self.hover_request_id {
+                continue;
+            }
+            let current = self
+                .hover
+                .cell()
+                .and_then(|(c, r)| self.editor.buffer_pos_at(c, r))
+                .and_then(|(line, ch)| self.editor.word_at(line, ch).map(|(s, e)| (line, s, e)));
+            if current != self.hover_word {
+                continue;
+            }
+            match result.text {
+                Some(text) => {
+                    let anchor = self.hover_anchor.unwrap_or((0, 0));
+                    self.hover_popup =
+                        Some(crate::widgets::hover_popup::HoverPopup::new(text, anchor));
+                }
+                None => self.hover_popup = None,
+            }
+            changed = true;
+        }
+        changed
+    }
+
+    fn go_to_definition(&mut self, path: PathBuf, line: u32, col: u32) {
+        self.hover_popup = None;
+        match self.editor.open_preview(&path) {
+            Ok(()) => {
+                self.sync_open_file_poll_mtime();
+                let row = (line as usize).min(self.editor.lines.len().saturating_sub(1));
+                let max_col = self
+                    .editor
+                    .lines
+                    .get(row)
+                    .map(|l| l.chars().count())
+                    .unwrap_or(0);
+                self.editor.cursor_row = row;
+                self.editor.cursor_col = (col as usize).min(max_col);
+                let page = self.editor.page_size().max(1);
+                self.editor.scroll = row.saturating_sub(page / 2);
+                self.editor.scroll_col = 0;
+                self.editor.ensure_cursor_col_visible();
+                self.status = format!("Jumped to {} line {}", path.display(), line + 1);
+                self.focus_pane(Pane::Editor);
+                self.poke_cursor();
+            }
+            Err(e) => {
+                self.status = format!("Go to definition failed: {e}");
+            }
+        }
+    }
+
+    pub fn drain_lsp_definition(&mut self) -> bool {
+        let mut target = None;
+        {
+            let Some(lsp) = self.lsp.as_ref() else {
+                return false;
+            };
+            while let Some(result) = lsp.drain_definition() {
+                if Some(result.request_id) != self.definition_request_id {
+                    continue;
+                }
+                target = result.target;
+            }
+        }
+        match target {
+            Some((path, line, col)) => {
+                self.go_to_definition(path, line, col);
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn trigger_definition_at(&mut self, col: u16, row: u16) {
+        if self.editor.diff.is_some() || self.editor.sheet.is_some() || self.editor.image.is_some()
+        {
+            return;
+        }
+        let Some((line, c)) = self.editor.buffer_pos_at(col, row) else {
+            return;
+        };
+        let Some(path) = self.editor.path.clone() else {
+            return;
+        };
+        let Some(lsp) = self.lsp.as_mut() else {
+            return;
+        };
+        let id = lsp.request_definition(path, line as u32, c as u32);
+        self.definition_request_id = Some(id);
     }
 
     /// Route the key through the completion popup when one is open.
@@ -3103,6 +3270,12 @@ impl App {
                     }
                 }
             }
+            if let Some(popup) = self.hover_popup.as_ref() {
+                let area = popup.area_for(editor_area);
+                if area.width > 0 && area.height > 0 {
+                    frame.render_widget(popup, area);
+                }
+            }
         }
         if let Some(area) = terminal_area {
             let n = self.terminals.len().max(1);
@@ -3607,6 +3780,8 @@ impl App {
         if key.kind != KeyEventKind::Press && key.kind != KeyEventKind::Repeat {
             return Ok(());
         }
+        self.hover_popup = None;
+        self.hover_request_id = None;
         if self.connect_dialog.is_some() {
             self.handle_connect_dialog_key(key);
             return Ok(());
@@ -6798,6 +6973,12 @@ impl App {
             && rect_contains(self.search.last_scrollbar, m.column, m.row);
         let in_editor_scrollbar = rect_contains(self.editor.last_scrollbar, m.column, m.row);
 
+        if matches!(m.kind, MouseEventKind::Moved) {
+            self.on_mouse_moved(m.column, m.row, in_editor);
+            return;
+        }
+        self.hover_popup = None;
+
         match m.kind {
             MouseEventKind::Down(MouseButton::Right) => {
                 // Editor tab strip: right-click on a tab opens the
@@ -6849,6 +7030,12 @@ impl App {
                 }
             }
             MouseEventKind::Down(MouseButton::Left) => {
+                // (H) iTerm2 folds Cmd onto the Meta bit, so a Cmd+click in the
+                // editor arrives here as ALT — that is the Go to Definition gesture.
+                if in_editor && m.modifiers.contains(KeyModifiers::ALT) {
+                    self.trigger_definition_at(m.column, m.row);
+                    return;
+                }
                 if !in_editor {
                     self.editor_click.clear();
                 }
@@ -10329,6 +10516,9 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let update_changed = app.poll_update_watch();
         app.sync_lsp();
         let lsp_changed = app.drain_lsp_completion();
+        app.poll_hover();
+        let hover_changed = app.drain_lsp_hover();
+        let definition_changed = app.drain_lsp_definition();
         let sysmon_changed = app.drain_sysmon();
 
         let non_pty_dirty = needs_redraw
@@ -10342,6 +10532,8 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             || install_changed
             || update_changed
             || lsp_changed
+            || hover_changed
+            || definition_changed
             || sysmon_changed;
         let pty_eligible = pty_pending
             && (app.peek_terminals_pending_bytes() <= PTY_SMALL_UPDATE_BYTES

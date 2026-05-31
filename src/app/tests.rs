@@ -44,6 +44,32 @@ fn opening_a_search_hit_moves_focus_to_the_editor() {
 }
 
 #[test]
+fn go_to_definition_opens_the_target_file_and_moves_the_caret() {
+    let tmp = tempfile::tempdir().unwrap();
+    let target = tmp.path().join("target.rs");
+    std::fs::write(&target, "fn a() {}\nfn b() {}\nfn c() {}\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.go_to_definition(target.clone(), 2, 3);
+    assert_eq!(
+        app.editor.path.as_deref(),
+        Some(target.as_path()),
+        "the definition's file is opened in the editor"
+    );
+    assert_eq!(
+        app.editor.cursor_row, 2,
+        "caret lands on the definition line"
+    );
+    assert_eq!(
+        app.editor.cursor_col, 3,
+        "caret lands at the definition column"
+    );
+    assert!(
+        matches!(app.focus, Pane::Editor),
+        "focus moves to the editor"
+    );
+}
+
+#[test]
 fn cmd_shift_s_activates_search_and_selects_existing_query() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();

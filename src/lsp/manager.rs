@@ -6,8 +6,8 @@ use std::sync::mpsc as std_mpsc;
 use anyhow::Result;
 use lsp_types::{
     ClientCapabilities, CompletionClientCapabilities, CompletionItemCapability, CompletionItemKind,
-    CompletionItemKindCapability, CompletionResponse, MarkupKind, TextDocumentClientCapabilities,
-    Url,
+    CompletionItemKindCapability, CompletionResponse, GotoDefinitionResponse, HoverContents,
+    MarkedString, MarkupKind, TextDocumentClientCapabilities, Url,
 };
 use tokio::sync::{Mutex as TokioMutex, mpsc as tokio_mpsc};
 
@@ -33,6 +33,20 @@ pub struct CompletionResult {
     pub items: Vec<CompletionItem>,
 }
 
+#[derive(Debug)]
+pub struct HoverResult {
+    pub request_id: u64,
+    pub path: PathBuf,
+    pub text: Option<String>,
+}
+
+#[derive(Debug)]
+pub struct DefinitionResult {
+    pub request_id: u64,
+    pub path: PathBuf,
+    pub target: Option<(PathBuf, u32, u32)>,
+}
+
 enum Cmd {
     OpenDoc {
         path: PathBuf,
@@ -51,11 +65,25 @@ enum Cmd {
         line: u32,
         character: u32,
     },
+    RequestHover {
+        request_id: u64,
+        path: PathBuf,
+        line: u32,
+        character: u32,
+    },
+    RequestDefinition {
+        request_id: u64,
+        path: PathBuf,
+        line: u32,
+        character: u32,
+    },
 }
 
 pub struct LspManager {
     cmd_tx: tokio_mpsc::UnboundedSender<Cmd>,
     completion_rx: std_mpsc::Receiver<CompletionResult>,
+    hover_rx: std_mpsc::Receiver<HoverResult>,
+    def_rx: std_mpsc::Receiver<DefinitionResult>,
     next_request_id: u64,
     workspace_root: PathBuf,
     _runtime: LspRuntime,
@@ -66,16 +94,22 @@ impl LspManager {
         let runtime = LspRuntime::new()?;
         let (cmd_tx, cmd_rx) = tokio_mpsc::unbounded_channel();
         let (completion_tx, completion_rx) = std_mpsc::channel();
+        let (hover_tx, hover_rx) = std_mpsc::channel();
+        let (def_tx, def_rx) = std_mpsc::channel();
         let root = workspace_root.clone();
         runtime.handle().spawn(worker_loop(
             root,
             ServerRegistry::with_defaults(),
             cmd_rx,
             completion_tx,
+            hover_tx,
+            def_tx,
         ));
         Ok(Self {
             cmd_tx,
             completion_rx,
+            hover_rx,
+            def_rx,
             next_request_id: 1,
             workspace_root,
             _runtime: runtime,
@@ -113,12 +147,46 @@ impl LspManager {
     pub fn drain_completion(&self) -> Option<CompletionResult> {
         self.completion_rx.try_recv().ok()
     }
+
+    pub fn request_hover(&mut self, path: PathBuf, line: u32, character: u32) -> u64 {
+        let id = self.next_request_id;
+        self.next_request_id += 1;
+        let _ = self.cmd_tx.send(Cmd::RequestHover {
+            request_id: id,
+            path,
+            line,
+            character,
+        });
+        id
+    }
+
+    pub fn drain_hover(&self) -> Option<HoverResult> {
+        self.hover_rx.try_recv().ok()
+    }
+
+    pub fn request_definition(&mut self, path: PathBuf, line: u32, character: u32) -> u64 {
+        let id = self.next_request_id;
+        self.next_request_id += 1;
+        let _ = self.cmd_tx.send(Cmd::RequestDefinition {
+            request_id: id,
+            path,
+            line,
+            character,
+        });
+        id
+    }
+
+    pub fn drain_definition(&self) -> Option<DefinitionResult> {
+        self.def_rx.try_recv().ok()
+    }
 }
 
 struct ManagedClient {
     name: String,
     client: Arc<TokioMutex<LspClient>>,
     supports_completion: bool,
+    supports_hover: bool,
+    supports_definition: bool,
 }
 
 struct WorkerState {
@@ -138,6 +206,8 @@ async fn worker_loop(
     registry: ServerRegistry,
     mut cmd_rx: tokio_mpsc::UnboundedReceiver<Cmd>,
     completion_tx: std_mpsc::Sender<CompletionResult>,
+    hover_tx: std_mpsc::Sender<HoverResult>,
+    def_tx: std_mpsc::Sender<DefinitionResult>,
 ) {
     let mut state = WorkerState {
         workspace_root,
@@ -158,6 +228,26 @@ async fn worker_loop(
             } => {
                 state
                     .request_completion(request_id, path, line, character, &completion_tx)
+                    .await
+            }
+            Cmd::RequestHover {
+                request_id,
+                path,
+                line,
+                character,
+            } => {
+                state
+                    .request_hover(request_id, path, line, character, &hover_tx)
+                    .await
+            }
+            Cmd::RequestDefinition {
+                request_id,
+                path,
+                line,
+                character,
+            } => {
+                state
+                    .request_definition(request_id, path, line, character, &def_tx)
                     .await
             }
         }
@@ -182,14 +272,19 @@ impl WorkerState {
                 {
                     Ok(client) => {
                         let supports = client.capabilities().completion_provider.is_some();
+                        let supports_hover = client.capabilities().hover_provider.is_some();
+                        let supports_definition =
+                            client.capabilities().definition_provider.is_some();
                         log_file::log(&format!(
-                            "lsp[{}] spawned, supports_completion={supports}",
+                            "lsp[{}] spawned, supports_completion={supports} supports_hover={supports_hover} supports_definition={supports_definition}",
                             config.name
                         ));
                         spawned.push(ManagedClient {
                             name: config.name.to_string(),
                             client: Arc::new(TokioMutex::new(client)),
                             supports_completion: supports,
+                            supports_hover,
+                            supports_definition,
                         });
                     }
                     Err(e) => {
@@ -365,6 +460,126 @@ impl WorkerState {
             });
         });
     }
+
+    async fn request_hover(
+        &mut self,
+        request_id: u64,
+        path: PathBuf,
+        line: u32,
+        character: u32,
+        tx: &std_mpsc::Sender<HoverResult>,
+    ) {
+        let Some(doc) = self.docs.get(&path) else {
+            return;
+        };
+        let lang = doc.language;
+        let Some(clients) = self.clients.get(&lang) else {
+            return;
+        };
+        let picked = clients
+            .iter()
+            .find(|c| c.supports_hover)
+            .map(|c| (c.name.clone(), c.client.clone()));
+        let Some((server_name, client_arc)) = picked else {
+            let _ = tx.send(HoverResult {
+                request_id,
+                path,
+                text: None,
+            });
+            return;
+        };
+        let Ok(uri) = Url::from_file_path(&path) else {
+            return;
+        };
+        let tx = tx.clone();
+        let path_clone = path.clone();
+        log_file::log(&format!(
+            "hover request id={request_id} server={server_name} path={} line={line} char={character}",
+            path.display()
+        ));
+        tokio::spawn(async move {
+            let mut client = client_arc.lock().await;
+            let resp = client.hover(uri, line, character).await;
+            drop(client);
+            let text = match resp {
+                Ok(Some(h)) => hover_text(&h.contents),
+                Ok(None) => None,
+                Err(e) => {
+                    log_file::log(&format!("lsp[{server_name}] hover error: {e}"));
+                    None
+                }
+            };
+            log_file::log(&format!(
+                "hover response id={request_id} server={server_name} has_text={}",
+                text.is_some()
+            ));
+            let _ = tx.send(HoverResult {
+                request_id,
+                path: path_clone,
+                text,
+            });
+        });
+    }
+
+    async fn request_definition(
+        &mut self,
+        request_id: u64,
+        path: PathBuf,
+        line: u32,
+        character: u32,
+        tx: &std_mpsc::Sender<DefinitionResult>,
+    ) {
+        let Some(doc) = self.docs.get(&path) else {
+            return;
+        };
+        let lang = doc.language;
+        let Some(clients) = self.clients.get(&lang) else {
+            return;
+        };
+        let picked = clients
+            .iter()
+            .find(|c| c.supports_definition)
+            .map(|c| (c.name.clone(), c.client.clone()));
+        let Some((server_name, client_arc)) = picked else {
+            let _ = tx.send(DefinitionResult {
+                request_id,
+                path,
+                target: None,
+            });
+            return;
+        };
+        let Ok(uri) = Url::from_file_path(&path) else {
+            return;
+        };
+        let tx = tx.clone();
+        let path_clone = path.clone();
+        log_file::log(&format!(
+            "definition request id={request_id} server={server_name} path={} line={line} char={character}",
+            path.display()
+        ));
+        tokio::spawn(async move {
+            let mut client = client_arc.lock().await;
+            let resp = client.definition(uri, line, character).await;
+            drop(client);
+            let target = match resp {
+                Ok(Some(r)) => def_location(&r),
+                Ok(None) => None,
+                Err(e) => {
+                    log_file::log(&format!("lsp[{server_name}] definition error: {e}"));
+                    None
+                }
+            };
+            log_file::log(&format!(
+                "definition response id={request_id} server={server_name} has_target={}",
+                target.is_some()
+            ));
+            let _ = tx.send(DefinitionResult {
+                request_id,
+                path: path_clone,
+                target,
+            });
+        });
+    }
 }
 
 fn into_item(item: lsp_types::CompletionItem) -> CompletionItem {
@@ -375,6 +590,44 @@ fn into_item(item: lsp_types::CompletionItem) -> CompletionItem {
         filter_text: item.filter_text,
         kind: item.kind,
     }
+}
+
+fn marked_string_text(m: &MarkedString) -> &str {
+    match m {
+        MarkedString::String(s) => s,
+        MarkedString::LanguageString(ls) => &ls.value,
+    }
+}
+
+fn hover_text(contents: &HoverContents) -> Option<String> {
+    let text = match contents {
+        HoverContents::Scalar(m) => marked_string_text(m).to_string(),
+        HoverContents::Markup(mc) => mc.value.clone(),
+        HoverContents::Array(items) => items
+            .iter()
+            .map(marked_string_text)
+            .filter(|s| !s.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n"),
+    };
+    let text = text.trim().to_string();
+    if text.is_empty() { None } else { Some(text) }
+}
+
+fn def_location(resp: &GotoDefinitionResponse) -> Option<(PathBuf, u32, u32)> {
+    let (uri, pos) = match resp {
+        GotoDefinitionResponse::Scalar(loc) => (&loc.uri, loc.range.start),
+        GotoDefinitionResponse::Array(locs) => {
+            let loc = locs.first()?;
+            (&loc.uri, loc.range.start)
+        }
+        GotoDefinitionResponse::Link(links) => {
+            let link = links.first()?;
+            (&link.target_uri, link.target_selection_range.start)
+        }
+    };
+    let path = uri.to_file_path().ok()?;
+    Some((path, pos.line, pos.character))
 }
 
 fn build_client_capabilities() -> ClientCapabilities {
@@ -470,7 +723,119 @@ fn is_on_path(cmd: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lsp_types::{LanguageString, Location, LocationLink, MarkupContent};
     use std::time::{Duration, Instant};
+
+    fn def_range(line: u32, ch: u32) -> lsp_types::Range {
+        let p = lsp_types::Position {
+            line,
+            character: ch,
+        };
+        lsp_types::Range { start: p, end: p }
+    }
+
+    #[test]
+    fn def_location_reads_scalar() {
+        let uri = Url::from_file_path("/tmp/foo.rs").unwrap();
+        let resp = GotoDefinitionResponse::Scalar(Location {
+            uri,
+            range: def_range(3, 5),
+        });
+        assert_eq!(
+            def_location(&resp),
+            Some((PathBuf::from("/tmp/foo.rs"), 3, 5))
+        );
+    }
+
+    #[test]
+    fn def_location_reads_first_of_array() {
+        let resp = GotoDefinitionResponse::Array(vec![
+            Location {
+                uri: Url::from_file_path("/tmp/a.rs").unwrap(),
+                range: def_range(1, 0),
+            },
+            Location {
+                uri: Url::from_file_path("/tmp/b.rs").unwrap(),
+                range: def_range(9, 9),
+            },
+        ]);
+        assert_eq!(
+            def_location(&resp),
+            Some((PathBuf::from("/tmp/a.rs"), 1, 0))
+        );
+    }
+
+    #[test]
+    fn def_location_reads_link_target_selection_range() {
+        let resp = GotoDefinitionResponse::Link(vec![LocationLink {
+            origin_selection_range: None,
+            target_uri: Url::from_file_path("/tmp/c.rs").unwrap(),
+            target_range: def_range(10, 0),
+            target_selection_range: def_range(12, 4),
+        }]);
+        assert_eq!(
+            def_location(&resp),
+            Some((PathBuf::from("/tmp/c.rs"), 12, 4))
+        );
+    }
+
+    #[test]
+    fn def_location_is_none_for_empty_array() {
+        let resp = GotoDefinitionResponse::Array(vec![]);
+        assert_eq!(def_location(&resp), None);
+    }
+
+    #[test]
+    fn hover_text_reads_plain_markup() {
+        let c = HoverContents::Markup(MarkupContent {
+            kind: MarkupKind::Markdown,
+            value: "fn foo(x: i32) -> i32".into(),
+        });
+        assert_eq!(hover_text(&c).as_deref(), Some("fn foo(x: i32) -> i32"));
+    }
+
+    #[test]
+    fn hover_text_reads_scalar_language_string() {
+        let c = HoverContents::Scalar(MarkedString::LanguageString(LanguageString {
+            language: "rust".into(),
+            value: "fn foo()".into(),
+        }));
+        assert_eq!(hover_text(&c).as_deref(), Some("fn foo()"));
+    }
+
+    #[test]
+    fn hover_text_reads_scalar_plain_string() {
+        let c = HoverContents::Scalar(MarkedString::String("just text".into()));
+        assert_eq!(hover_text(&c).as_deref(), Some("just text"));
+    }
+
+    #[test]
+    fn hover_text_joins_array_entries_and_skips_blanks() {
+        let c = HoverContents::Array(vec![
+            MarkedString::String("line one".into()),
+            MarkedString::String("   ".into()),
+            MarkedString::LanguageString(LanguageString {
+                language: "rust".into(),
+                value: "line two".into(),
+            }),
+        ]);
+        assert_eq!(hover_text(&c).as_deref(), Some("line one\n\nline two"));
+    }
+
+    #[test]
+    fn hover_text_is_none_when_blank() {
+        let c = HoverContents::Markup(MarkupContent {
+            kind: MarkupKind::PlainText,
+            value: "   ".into(),
+        });
+        assert_eq!(hover_text(&c), None);
+    }
+
+    #[test]
+    fn hover_text_is_none_for_empty_array() {
+        let c = HoverContents::Array(vec![]);
+        assert_eq!(hover_text(&c), None);
+    }
 
     fn drain_completion_blocking(
         manager: &LspManager,
@@ -547,5 +912,87 @@ mod tests {
             labels.iter().any(|l| l.starts_with("input")),
             "expected at least one item starting with `input`, got: {labels:?}"
         );
+    }
+
+    fn drain_hover_blocking(manager: &LspManager, timeout: Duration) -> Option<HoverResult> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(r) = manager.drain_hover() {
+                return Some(r);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn manager_hover_against_python_lsp() {
+        if !any_python_completion_server_on_path() {
+            eprintln!("SKIPPED: no basedpyright/pyright/ty on PATH");
+            return;
+        }
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().canonicalize().expect("canonicalize");
+        let file = root.join("demo.py");
+        let text = String::from("def greet(name):\n    return 'hi ' + name\n\ngreet('x')\n");
+        std::fs::write(&file, &text).expect("write demo");
+
+        let mut manager = LspManager::new(root).expect("manager");
+        manager.open_doc(file.clone(), text);
+        std::thread::sleep(Duration::from_millis(2500));
+
+        let id = manager.request_hover(file.clone(), 3, 0);
+        let result =
+            drain_hover_blocking(&manager, Duration::from_secs(30)).expect("hover arrived");
+        assert_eq!(result.request_id, id);
+        assert_eq!(result.path, file);
+        let hover = result.text.expect("hover text for the greet call");
+        assert!(
+            hover.contains("greet"),
+            "hover over the greet call should name the function, got: {hover:?}"
+        );
+    }
+
+    fn drain_definition_blocking(
+        manager: &LspManager,
+        timeout: Duration,
+    ) -> Option<DefinitionResult> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(r) = manager.drain_definition() {
+                return Some(r);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn manager_definition_against_python_lsp() {
+        if !any_python_completion_server_on_path() {
+            eprintln!("SKIPPED: no basedpyright/pyright/ty on PATH");
+            return;
+        }
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().canonicalize().expect("canonicalize");
+        let file = root.join("demo.py");
+        let text = String::from("def greet(name):\n    return name\n\ngreet('x')\n");
+        std::fs::write(&file, &text).expect("write demo");
+
+        let mut manager = LspManager::new(root).expect("manager");
+        manager.open_doc(file.clone(), text);
+        std::thread::sleep(Duration::from_millis(2500));
+
+        let id = manager.request_definition(file.clone(), 3, 0);
+        let result = drain_definition_blocking(&manager, Duration::from_secs(30))
+            .expect("definition arrived");
+        assert_eq!(result.request_id, id);
+        let (target_path, target_line, _col) = result.target.expect("definition target found");
+        assert_eq!(target_path, file, "greet is defined in the same file");
+        assert_eq!(target_line, 0, "greet is defined on line 0");
     }
 }

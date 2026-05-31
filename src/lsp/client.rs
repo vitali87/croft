@@ -12,8 +12,9 @@ use lsp_types::notification::{LogMessage, PublishDiagnostics, ShowMessage};
 use lsp_types::{
     ClientCapabilities, CompletionContext, CompletionParams, CompletionResponse,
     CompletionTriggerKind, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
-    DidOpenTextDocumentParams, InitializeParams, InitializedParams, PartialResultParams, Position,
-    ServerCapabilities, TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem,
+    DidOpenTextDocumentParams, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverParams,
+    InitializeParams, InitializedParams, PartialResultParams, Position, ServerCapabilities,
+    TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem,
     TextDocumentPositionParams, Url, VersionedTextDocumentIdentifier, WorkDoneProgressParams,
     WorkspaceFolder,
 };
@@ -252,6 +253,38 @@ impl LspClient {
             })
             .await
             .context("completion")
+    }
+
+    pub async fn hover(&mut self, uri: Url, line: u32, character: u32) -> Result<Option<Hover>> {
+        self.server
+            .hover(HoverParams {
+                text_document_position_params: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri },
+                    position: Position { line, character },
+                },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+            })
+            .await
+            .context("hover")
+    }
+
+    pub async fn definition(
+        &mut self,
+        uri: Url,
+        line: u32,
+        character: u32,
+    ) -> Result<Option<GotoDefinitionResponse>> {
+        self.server
+            .definition(GotoDefinitionParams {
+                text_document_position_params: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri },
+                    position: Position { line, character },
+                },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+            })
+            .await
+            .context("definition")
     }
 
     pub async fn shutdown(mut self) -> Result<()> {

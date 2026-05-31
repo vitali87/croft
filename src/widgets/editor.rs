@@ -2211,6 +2211,49 @@ impl Editor {
         self.cursor_col = target_col.min(self.line_char_len(target_line));
         self.last_edit_kind = None;
     }
+
+    pub fn buffer_pos_at(&self, col: u16, row: u16) -> Option<(usize, usize)> {
+        if self.last_inner.height == 0 || self.lines.is_empty() {
+            return None;
+        }
+        if row < self.last_inner.y || row >= self.last_inner.y + self.last_inner.height {
+            return None;
+        }
+        let line = self.scroll + (row - self.last_inner.y) as usize;
+        if line >= self.lines.len() {
+            return None;
+        }
+        let text_x = self.last_inner.x + self.last_gutter_width + 1;
+        if col < text_x {
+            return None;
+        }
+        let text_width = self
+            .last_inner
+            .width
+            .saturating_sub(self.last_gutter_width + 2 + u16::from(self.last_scrollbar.width > 0));
+        let visible_col = (col - text_x) as usize;
+        if visible_col >= text_width as usize {
+            return None;
+        }
+        let char_col = (visible_col + self.scroll_col).min(self.line_char_len(line));
+        Some((line, char_col))
+    }
+
+    pub fn word_at(&self, line: usize, col: usize) -> Option<(usize, usize)> {
+        let chars: Vec<char> = self.lines.get(line)?.chars().collect();
+        if col >= chars.len() || !is_word_char(chars[col]) {
+            return None;
+        }
+        let mut start = col;
+        while start > 0 && is_word_char(chars[start - 1]) {
+            start -= 1;
+        }
+        let mut end = col + 1;
+        while end < chars.len() && is_word_char(chars[end]) {
+            end += 1;
+        }
+        Some((start, end))
+    }
 }
 
 /// Convert a char index within `s` to a byte index, saturating at `s.len()`.
@@ -2669,6 +2712,177 @@ mod tests {
         assert_eq!(e.lines, vec!["helloworld".to_string()]);
         assert_eq!(e.cursor_row, 0);
         assert_eq!(e.cursor_col, 5);
+    }
+
+    #[test]
+    fn buffer_pos_at_maps_cells_to_line_and_char() {
+        let mut e = editor_with("fn main() {}\nlet x = 1;");
+        e.last_inner = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 25,
+        };
+        e.last_gutter_width = 2;
+        assert_eq!(
+            e.buffer_pos_at(3, 0),
+            Some((0, 0)),
+            "first text cell (text_x = x + gutter + 1 = 3) is char 0 of line 0"
+        );
+        assert_eq!(
+            e.buffer_pos_at(6, 0),
+            Some((0, 3)),
+            "three cells into the text is char 3"
+        );
+        assert_eq!(
+            e.buffer_pos_at(3, 1),
+            Some((1, 0)),
+            "the second screen row is the second buffer line"
+        );
+    }
+
+    #[test]
+    fn buffer_pos_at_returns_none_over_the_gutter() {
+        let mut e = editor_with("hello");
+        e.last_inner = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 25,
+        };
+        e.last_gutter_width = 2;
+        assert_eq!(e.buffer_pos_at(0, 0), None, "column 0 is in the gutter");
+        assert_eq!(e.buffer_pos_at(2, 0), None, "still left of text_x");
+    }
+
+    #[test]
+    fn buffer_pos_at_accounts_for_vertical_scroll() {
+        let mut e = editor_with("a\nbb\nccc\ndddd\neeeee");
+        e.last_inner = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 25,
+        };
+        e.last_gutter_width = 2;
+        e.scroll = 2;
+        assert_eq!(
+            e.buffer_pos_at(3, 0),
+            Some((2, 0)),
+            "the top visible row is buffer line scroll = 2"
+        );
+    }
+
+    #[test]
+    fn buffer_pos_at_accounts_for_horizontal_scroll() {
+        let mut e = editor_with("abcdefghijklmnop");
+        e.last_inner = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 25,
+        };
+        e.last_gutter_width = 2;
+        e.scroll_col = 5;
+        assert_eq!(
+            e.buffer_pos_at(3, 0),
+            Some((0, 5)),
+            "the leftmost text cell maps to char scroll_col, not char 0"
+        );
+        assert_eq!(
+            e.buffer_pos_at(5, 0),
+            Some((0, 7)),
+            "two cells right of the left edge is char scroll_col + 2"
+        );
+    }
+
+    #[test]
+    fn buffer_pos_at_honours_pane_offset() {
+        let mut e = editor_with("hello");
+        e.last_inner = Rect {
+            x: 10,
+            y: 4,
+            width: 40,
+            height: 10,
+        };
+        e.last_gutter_width = 3;
+        assert_eq!(e.buffer_pos_at(14, 4), Some((0, 0)), "text_x = 10 + 3 + 1");
+        assert_eq!(e.buffer_pos_at(16, 4), Some((0, 2)));
+        assert_eq!(e.buffer_pos_at(13, 4), None, "one cell left of text_x");
+    }
+
+    #[test]
+    fn buffer_pos_at_returns_none_outside_viewport_and_past_content() {
+        let mut e = editor_with("one\ntwo");
+        e.last_inner = Rect {
+            x: 0,
+            y: 2,
+            width: 80,
+            height: 4,
+        };
+        e.last_gutter_width = 2;
+        assert_eq!(e.buffer_pos_at(3, 1), None, "row above the pane");
+        assert_eq!(e.buffer_pos_at(3, 6), None, "row below the pane");
+        assert_eq!(
+            e.buffer_pos_at(3, 4),
+            None,
+            "row maps past the last line of content"
+        );
+    }
+
+    #[test]
+    fn buffer_pos_at_clamps_past_end_of_line() {
+        let mut e = editor_with("hi");
+        e.last_inner = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 25,
+        };
+        e.last_gutter_width = 2;
+        assert_eq!(
+            e.buffer_pos_at(40, 0),
+            Some((0, 2)),
+            "a cell past the line's text clamps to the line length"
+        );
+    }
+
+    #[test]
+    fn word_at_returns_identifier_bounds() {
+        let e = editor_with("fn main() {}");
+        assert_eq!(e.word_at(0, 0), Some((0, 2)), "fn");
+        assert_eq!(e.word_at(0, 1), Some((0, 2)), "still within fn");
+        assert_eq!(e.word_at(0, 3), Some((3, 7)), "main starts at char 3");
+        assert_eq!(e.word_at(0, 6), Some((3, 7)), "last char of main");
+    }
+
+    #[test]
+    fn word_at_returns_none_off_a_word() {
+        let e = editor_with("fn main() {}");
+        assert_eq!(e.word_at(0, 2), None, "the space between fn and main");
+        assert_eq!(e.word_at(0, 7), None, "the open paren");
+        assert_eq!(e.word_at(0, 99), None, "past the end of the line");
+    }
+
+    #[test]
+    fn word_at_includes_underscores_and_digits() {
+        let e = editor_with("let foo_bar2 = 1");
+        assert_eq!(
+            e.word_at(0, 4),
+            Some((4, 12)),
+            "foo_bar2 is a single identifier"
+        );
+        assert_eq!(
+            e.word_at(0, 11),
+            Some((4, 12)),
+            "a trailing digit is part of the identifier"
+        );
+    }
+
+    #[test]
+    fn word_at_handles_missing_line() {
+        let e = editor_with("only one line");
+        assert_eq!(e.word_at(5, 0), None, "no such line");
     }
 
     #[test]

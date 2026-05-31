@@ -228,6 +228,12 @@ const HELP_MENU_KEY: &str = "Show Help Menu";
 /// into croft's parent-folder action either.
 const HELP_MENU_EQUIV: &str = "@~?";
 
+// (H) Pointer key earlier croft versions wrote to route Cmd+click to Go to
+// Definition via a bracketed-paste sentinel; that transport never fired under
+// croft's mouse reporting, so go-to-definition now keys on the Meta/Alt bit
+// iTerm2 reports for Cmd+click. Re-running setup purges any stale copy.
+const STALE_GOTO_DEF_POINTER_KEY: &str = "Button,0,1,c,";
+
 /// PostScript name iTerm2 stores in `Normal Font` and `Non Ascii Font`.
 /// Format is "<PostScriptName> <size>".
 pub fn primary_font_value(font_ps: &str, size: u32) -> String {
@@ -444,6 +450,17 @@ pub fn apply_croft_key_settings(plist: &mut Value) -> Result<(), ITerm2Error> {
         if let Some(Value::Dictionary(profile_keys)) = profile.get_mut("Keyboard Map") {
             profile_keys.remove(CMD_V_KEY);
         }
+    }
+
+    let drop_pointer_actions =
+        if let Some(Value::Dictionary(pointer)) = dict.get_mut("PointerActions") {
+            pointer.remove(STALE_GOTO_DEF_POINTER_KEY);
+            pointer.is_empty()
+        } else {
+            false
+        };
+    if drop_pointer_actions {
+        dict.remove("PointerActions");
     }
 
     Ok(())
@@ -926,6 +943,51 @@ mod tests {
             menu.get(NEW_TAB_MENU_KEY).and_then(|v| v.as_string()),
             Some(NEW_TAB_MENU_EQUIV),
             "iTerm2's New Tab must be relocated off Cmd+T so croft's new-terminal chord can claim it; @^t = Cmd+Ctrl+T keeps the iTerm2 action reachable on a chord croft does not use"
+        );
+    }
+
+    #[test]
+    fn apply_croft_key_settings_purges_stale_goto_definition_pointer_binding() {
+        let mut plist = synth_plist("GUID-1", &["GUID-1"]);
+        {
+            let top = plist.as_dictionary_mut().unwrap();
+            let pa = dict_entry_mut(top, "PointerActions");
+            let mut ctx = Dictionary::new();
+            ctx.insert(
+                "Action".into(),
+                Value::String("kContextMenuPointerAction".into()),
+            );
+            pa.insert("Button,1,1,,".into(), Value::Dictionary(ctx));
+            let mut goto = Dictionary::new();
+            goto.insert(
+                "Action".into(),
+                Value::String("kSendHexCodePointerAction".into()),
+            );
+            pa.insert("Button,0,1,c,".into(), Value::Dictionary(goto));
+        }
+        apply_croft_key_settings(&mut plist).unwrap();
+        let pointer = dict_in(plist.as_dictionary().unwrap(), "PointerActions");
+        assert!(
+            pointer.get("Button,0,1,c,").is_none(),
+            "re-running setup must purge the dead Cmd+click sentinel binding earlier croft versions wrote"
+        );
+        assert!(
+            pointer.get("Button,1,1,,").is_some(),
+            "unrelated pointer actions such as the right-click context menu must survive the purge"
+        );
+    }
+
+    #[test]
+    fn apply_croft_key_settings_does_not_synthesize_pointer_actions_when_absent() {
+        let mut plist = synth_plist("GUID-1", &["GUID-1"]);
+        apply_croft_key_settings(&mut plist).unwrap();
+        assert!(
+            plist
+                .as_dictionary()
+                .unwrap()
+                .get("PointerActions")
+                .is_none(),
+            "with no PointerActions in the plist, setup must not create one (an empty dict would suppress iTerm2's built-in right-click menu)"
         );
     }
 
