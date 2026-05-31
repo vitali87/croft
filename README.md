@@ -282,18 +282,36 @@ Keystrokes from `crossterm`'s `Event::Key` are translated back to the byte seque
 
 ```
 src/
-├── main.rs              entry point
-├── cli.rs               clap CLI: open path, setup-terminal / setup-iterm2 / keys subcommands
-├── app.rs               event loop, three-pane layout + activity bar, key dispatch, status bar, mouse, clipboard, splitters, preview overlays
-├── clipboard.rs         native macOS clipboard read path with pbpaste fallback
+├── main.rs              entry point + module declarations
+├── cli.rs               clap CLI: open path, setup-terminal / setup-iterm2 / setup-cross / remote / keys subcommands
+├── clipboard.rs         native macOS clipboard read/write (NSPasteboard) with pbpaste fallback
 ├── git.rs               branch / dirty / ahead-behind status, plus anonymous git-protocol fetch for the welcome screen recents
 ├── highlight.rs         tree-sitter highlight registry per language
 ├── icons.rs             Codicon / Devicon / Seti glyphs and per-language colors
+├── install_session.rs   streams install-progress events while a remote host builds / installs the croft binary
 ├── iterm2.rs            iTerm2 plist mutation helpers for fonts and Croft key mappings
 ├── iterm2_inline.rs     OSC 1337 inline-image baking pipeline (welcome wordmark, image / PDF preview, activity-bar icons, SSH empty-state hero)
 ├── pdf.rs               PDF rasteriser: prefers pdftoppm (poppler), falls back to macOS sips
 ├── remote.rs            remote (SSH) target metadata and launch dispatch
+├── remote_connect.rs    interactive SSH connect flow (host + password prompt phases) behind the connect dialog
+├── session_state.rs     captures open tabs / layout so a self-update re-exec can restore them
 ├── sheet.rs             CSV / TSV / XLSX / XLS / XLSB / ODS parsing via the csv and calamine crates
+├── sysmon.rs            system-metrics sampler loop (CPU / memory / network / disk / temp)
+├── update_watch.rs      remote self-update: watch for a newer binary installed under a running remote croft
+├── zoxide.rs            zoxide integration: query + cross-platform ensure-install backing the Cmd+Z jump popup
+├── app/                 event loop, three-pane layout + activity bar, key dispatch, status bar, mouse, clipboard, splitters, preview overlays
+│   ├── mod.rs           the main App: render, key / mouse dispatch, status bar, splitters
+│   ├── click.rs         double / triple click detection
+│   ├── cursor_blink.rs  caret blink timing
+│   ├── fs_watch.rs      filesystem watch + poll fallback feeding tree / editor / terminal refresh
+│   ├── git_worker.rs    off-thread git status / changes worker
+│   ├── hover.rs         LSP hover dwell timing
+│   ├── nav.rs           editor back / forward navigation history
+│   ├── overlay.rs       OSC 1337 inline-image overlay state + clear-on-hide latches
+│   ├── perf_hud.rs      F8 performance HUD
+│   ├── sys_monitor.rs   background system-metrics poller driving the SYSTEM panel
+│   ├── welcome.rs       welcome-screen state + async recent-repos drain
+│   └── tests.rs         unit / integration tests
 ├── lsp/                 LSP client stack
 │   ├── mod.rs
 │   ├── client.rs        async-lsp client wrapper with router for unhandled notifications
@@ -305,18 +323,22 @@ src/
 └── widgets/
     ├── mod.rs
     ├── completion_popup.rs  LSP completion popup (anchored at the cursor, filterable)
+    ├── connect_dialog.rs    remote SSH connect modal (host + auth prompt phases)
     ├── diff.rs          side-by-side file diff renderer used by the explorer's Compare action
-    ├── editor.rs        tree-sitter highlighted editor with full write path, mouse-drag selection, OSC 52 copy/cut, plus image / PDF / spreadsheet preview tabs
+    ├── editor.rs        tree-sitter highlighted editor with full write path, mouse-drag selection, native-clipboard copy / cut, plus image / PDF / spreadsheet preview tabs
     ├── editor_find.rs   VS Code-style inline Find bar (Cmd+F) with active-match orange highlight, Enter / Shift+Enter walk, case-sensitive / whole-word / regex toggles
     ├── file_finder.rs   VS Code-style Quick Open (Cmd+P) fuzzy file picker with tiered match ranking (exact filename > prefix > substring > path > subsequence)
     ├── file_tree.rs     ignore::WalkBuilder backed tree, lazy children, fs-watcher refresh, multi-select, drag-drop, bulk trash, reveal-path on Cmd+P open
+    ├── hover_popup.rs   LSP hover popup (300 ms dwell, anchored at the cursor)
     ├── remote.rs        Remote (SSH) sidebar widget with empty-state hero illustration
     ├── run_debug.rs     Run and Debug sidebar widget: empty state plus Run [filename] button that spawns the active file in a fresh terminal
     ├── scrollbar.rs     shared vertical-scrollbar geometry
     ├── search.rs        sidebar search panel + .gitignore-aware substring walker
     ├── shortcuts.rs     F1 shortcuts modal: every binding grouped by pane, scrollable
     ├── source_control.rs Source Control sidebar widget: branch summary, commit input, change list, commit button, no-repo hero
-    └── terminal.rs      portable-pty + alacritty_terminal + ratatui integration with selection + scrollback
+    ├── system_panel.rs  collapsible SYSTEM metrics panel pinned to the sidebar bottom
+    ├── terminal.rs      portable-pty + alacritty_terminal + ratatui integration with selection + scrollback
+    └── zoxide_jump.rs   Cmd+Z zoxide jump popup: fuzzy directory jumper that re-roots + cd's the terminal
 tests/cli.rs             integration tests for the CLI surface
 ```
 
@@ -329,7 +351,7 @@ What works:
 * Right-click context menu with Cut, Copy, Paste, Rename, count-aware Delete, plus New File / New Folder on empty space.
 * Live filesystem watcher with a 50 ms polling fallback for missed startup or host events.
 * File open with tree-sitter highlighting (Rust, Python, JS, TS, TSX, JSON, TOML, YAML, Markdown, Go, HTML, CSS, Bash).
-* Full editor write path: insert / delete / Enter / Tab / Backspace / save round-trip with `●` dirty marker, auto-reload on external write when buffer is clean, OSC 52 copy / cut, undo with intelligent edit-step coalescing.
+* Full editor write path: insert / delete / Enter / Tab / Backspace / save round-trip with `●` dirty marker, auto-reload on external write when buffer is clean, native-clipboard copy / cut (OSC 52 fallback on remote), undo with intelligent edit-step coalescing.
 * Inline preview tabs that render directly in the editor pane via OSC 1337: PNG / JPEG / GIF / BMP / WebP, PDFs (with page navigation, multi-page when poppler is installed), and CSV / TSV / XLSX / XLS / XLSB / ODS spreadsheets.
 * Search sidebar (live, `.gitignore`-aware, off the UI thread, regex / case / whole-word toggles).
 * Remote (SSH) sidebar that lists hosts from `~/.ssh/config` and launches a remote croft session.
