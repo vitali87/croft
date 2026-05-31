@@ -166,19 +166,11 @@ fn display_path(path: &Path) -> String {
     full.into_owned()
 }
 
-pub fn render_zoxide_jump(jump: &mut ZoxideJump, area: Rect, buf: &mut Buffer) {
-    let width = area.width.saturating_mul(7) / 10;
-    let width = width.clamp(40, 100.min(area.width));
-    let height = area.height.saturating_mul(6) / 10;
-    let height = height.clamp(10, area.height);
-    let x = area.x + (area.width.saturating_sub(width)) / 2;
-    let y = area.y + (area.height.saturating_sub(height)) / 4;
-    let rect = Rect {
-        x,
-        y,
-        width,
-        height,
-    };
+/// Draw the popup into `rect` exactly as given. Placement (anchoring over
+/// the Explorer column vs. a centered fallback) is decided by the caller
+/// in `App::render_zoxide_jump`, which knows the pane layout; this widget
+/// just fills the box it is handed.
+pub fn render_zoxide_jump(jump: &mut ZoxideJump, rect: Rect, buf: &mut Buffer) {
     jump.last_rect = rect;
 
     Widget::render(Clear, rect, buf);

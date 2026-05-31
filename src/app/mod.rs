@@ -639,6 +639,10 @@ pub struct App {
     /// same way the renderer does, so a menu that gets shifted up to fit
     /// on screen still maps clicks to the right item.
     last_frame_area: Rect,
+    /// The Explorer/sidebar column rect from the last render (`None` when
+    /// the sidebar is collapsed). The zoxide jump popup anchors over this
+    /// so it drops from the Explorer rather than centering on the frame.
+    last_sidebar_area: Option<Rect>,
     /// Active explorer drag-and-drop, if any.
     tree_drag: Option<ExplorerDrag>,
     /// Pending SCP uploads queued by a Finder drag-drop onto the Remote
@@ -808,6 +812,12 @@ const SIDEBAR_WIDTH_MIN: u16 = 12;
 const TERMINAL_HEIGHT_MIN: u16 = 3;
 const EDITOR_HEIGHT_MIN: u16 = 3;
 const RIGHT_PANE_MIN: u16 = 20;
+/// Minimum width of the zoxide jump popup. The Explorer column it anchors
+/// over is typically ~32 cells, too narrow to read frecency paths like
+/// `~/Documents/platform/app/...`, so the box widens rightward to at least
+/// this many cells (capped to the frame) while staying left-anchored on
+/// the Explorer.
+const ZOXIDE_JUMP_MIN_WIDTH: u16 = 56;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WelcomeLayout {
@@ -1206,6 +1216,7 @@ impl App {
             tree_typeahead: None,
             compare_anchor: None,
             last_frame_area: Rect::default(),
+            last_sidebar_area: None,
             tree_drag: None,
             pending_scp_uploads: Vec::new(),
             pending_remote_pulls: Vec::new(),
@@ -3178,6 +3189,9 @@ impl App {
         } else {
             (main[0], None, main[1])
         };
+        // Remember the Explorer column so the zoxide jump popup can anchor
+        // over it instead of centering on the whole frame.
+        self.last_sidebar_area = side_area;
 
         // Splitter column is the leftmost cell of the right (editor) pane —
         // i.e. the seam where the sidebar's border meets the editor's
@@ -6670,11 +6684,41 @@ impl App {
     }
 
     fn render_zoxide_jump(&mut self, frame: &mut ratatui::Frame) {
+        let sidebar = self.last_sidebar_area;
+        let full = frame.area();
         let Some(jump) = self.zoxide_jump.as_mut() else {
             return;
         };
-        let area = frame.area();
-        crate::widgets::zoxide_jump::render_zoxide_jump(jump, area, frame.buffer_mut());
+        // Anchor the popup over the Explorer column (it is an Explorer
+        // action), dropping from the sidebar's top-left. The sidebar is
+        // narrow, so widen the box rightward over the editor for readable
+        // paths, capped to the frame. When the sidebar is collapsed there
+        // is nothing to anchor to, so fall back to a centered box.
+        let rect = match sidebar {
+            Some(side) if side.width >= 2 && side.height >= 4 => {
+                let width = side
+                    .width
+                    .max(ZOXIDE_JUMP_MIN_WIDTH)
+                    .min(full.width.saturating_sub(side.x));
+                Rect {
+                    x: side.x,
+                    y: side.y,
+                    width,
+                    height: side.height,
+                }
+            }
+            _ => {
+                let width = (full.width.saturating_mul(7) / 10).clamp(40, 100.min(full.width));
+                let height = (full.height.saturating_mul(6) / 10).clamp(10, full.height);
+                Rect {
+                    x: full.x + (full.width.saturating_sub(width)) / 2,
+                    y: full.y + (full.height.saturating_sub(height)) / 4,
+                    width,
+                    height,
+                }
+            }
+        };
+        crate::widgets::zoxide_jump::render_zoxide_jump(jump, rect, frame.buffer_mut());
     }
 
     fn open_editor_find(&mut self) {

@@ -8924,6 +8924,32 @@ fn zoxide_jump_key_is_cmd_z_only_and_never_ctrl_z_or_redo() {
 }
 
 #[test]
+fn zoxide_jump_popup_anchors_over_the_explorer_column_not_centered() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.handle_explorer_shortcut(key(KeyCode::Char('z'), KeyModifiers::SUPER));
+    assert!(app.zoxide_jump.is_some(), "precondition: popup is open");
+
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+
+    let popup = app.zoxide_jump.as_ref().unwrap().last_rect;
+    // The Explorer tree renders inside the sidebar column; the popup must
+    // share that column's left edge (anchored over the Explorer), not be
+    // centered on the 120-wide frame (which would put x near ~30).
+    assert_eq!(
+        popup.x, app.tree.last_area.x,
+        "jump popup must be left-anchored to the Explorer column, got x={} vs sidebar x={}",
+        popup.x, app.tree.last_area.x
+    );
+    assert!(
+        popup.y <= app.tree.last_area.y,
+        "jump popup must drop from the top of the Explorer, not be vertically centered"
+    );
+}
+
+#[test]
 fn cmd_z_in_explorer_opens_the_zoxide_jump_popup() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
