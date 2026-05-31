@@ -8,6 +8,7 @@ use ratatui::{
 };
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use crate::highlight::{
     HiSpan, LangKind, LangRegistry, compute_line_starts, highlight_text, lang_for_extension,
@@ -981,6 +982,46 @@ struct Snapshot {
 
 const UNDO_STACK_LIMIT: usize = 500;
 
+/// Outcome of an FS-sync sweep over a single tab (`reload_or_flag_conflict`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExternalChange {
+    /// Disk matches the buffer's last-synced stamp; nothing to do.
+    Unchanged,
+    /// The buffer was clean and has been reloaded from disk.
+    Reloaded,
+    /// Disk changed but the reload failed (e.g. the file became unreadable).
+    ReloadFailed,
+    /// The buffer had unsaved edits, so the external change was flagged as a
+    /// conflict instead of being applied.
+    Conflict,
+}
+
+/// Outcome of a guarded `save_to_disk`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SaveOutcome {
+    /// The buffer was written to disk.
+    Saved,
+    /// The file changed on disk since we last synced; the save was refused
+    /// to avoid clobbering the external edit. The caller must force it.
+    DiskConflict,
+}
+
+/// Per-tab results of an FS-sync sweep across all open tabs
+/// (`EditorTabs::reload_externally_changed_tabs`).
+#[derive(Debug, Default)]
+pub struct ExternalReloadReport {
+    /// Paths of clean tabs that were silently reloaded from disk.
+    pub reloaded: Vec<PathBuf>,
+    /// Paths of dirty tabs flagged as conflicts (not reloaded, not saved).
+    pub conflicts: Vec<PathBuf>,
+}
+
+impl ExternalReloadReport {
+    pub fn is_empty(&self) -> bool {
+        self.reloaded.is_empty() && self.conflicts.is_empty()
+    }
+}
+
 pub struct Editor {
     pub path: Option<PathBuf>,
     pub lines: Vec<String>,
@@ -1055,6 +1096,18 @@ pub struct Editor {
     /// Hit-test rect for the "next change" arrow painted in the diff
     /// header. Mirror of `diff_prev_arrow`.
     pub diff_next_arrow: Rect,
+    /// Disk identity (mtime, len) captured the last time this tab was in
+    /// sync with disk — i.e. at open and after a successful save. The FS
+    /// sync sweep compares the file's current stamp against this to decide
+    /// whether an external process changed the file underneath us. `None`
+    /// for a tab with no file (the blank initial buffer).
+    disk_stamp: Option<(SystemTime, u64)>,
+    /// Set when an external on-disk change is detected while this buffer has
+    /// unsaved edits. Reloading would discard the user's edits and saving
+    /// would clobber the external change, so neither happens automatically:
+    /// the flag drives the conflict warning and makes `save_to_disk` refuse
+    /// to overwrite until the user forces it.
+    pub disk_conflict: bool,
 }
 
 impl Editor {
@@ -1089,6 +1142,8 @@ impl Editor {
             diff: None,
             diff_prev_arrow: Rect::default(),
             diff_next_arrow: Rect::default(),
+            disk_stamp: None,
+            disk_conflict: false,
         }
     }
 
@@ -1142,6 +1197,8 @@ impl Editor {
             self.lines.push(String::new());
         }
         self.path = Some(path.to_path_buf());
+        self.disk_stamp = Self::disk_stamp_of(path);
+        self.disk_conflict = false;
         self.lang = path
             .extension()
             .and_then(|e| e.to_str())
@@ -1172,6 +1229,8 @@ impl Editor {
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
         let format_label = image_format_label_from_ext(ext);
         self.path = Some(path.to_path_buf());
+        self.disk_stamp = Self::disk_stamp_of(path);
+        self.disk_conflict = false;
         self.lines = vec![String::new()];
         self.lang = None;
         self.scroll = 0;
@@ -1199,6 +1258,8 @@ impl Editor {
         let view = crate::sheet::open_sheet(path)
             .map_err(|e| anyhow::anyhow!("Spreadsheet open failed: {e}"))?;
         self.path = Some(path.to_path_buf());
+        self.disk_stamp = Self::disk_stamp_of(path);
+        self.disk_conflict = false;
         self.lines = vec![String::new()];
         self.lang = None;
         self.scroll = 0;
@@ -1226,6 +1287,8 @@ impl Editor {
             .map(|img| (img.width(), img.height()))
             .map_err(|e| anyhow::anyhow!("Could not decode rasterised PDF: {e}"))?;
         self.path = Some(path.to_path_buf());
+        self.disk_stamp = Self::disk_stamp_of(path);
+        self.disk_conflict = false;
         self.lines = vec![String::new()];
         self.lang = None;
         self.scroll = 0;
@@ -1703,15 +1766,55 @@ impl Editor {
         false
     }
 
+    /// Read the file's identity (mtime, len) for change detection. `None`
+    /// when there is no path or the file can't be stat'd (e.g. it was
+    /// deleted out from under us).
+    fn disk_stamp_of(path: &Path) -> Option<(SystemTime, u64)> {
+        let meta = std::fs::metadata(path).ok()?;
+        Some((meta.modified().ok()?, meta.len()))
+    }
+
+    /// Record that this buffer is now in sync with disk. Called at open and
+    /// after a successful save so the next external write is detected.
+    fn mark_synced_with_disk(&mut self) {
+        self.disk_stamp = self.path.as_deref().and_then(Self::disk_stamp_of);
+        self.disk_conflict = false;
+    }
+
+    /// True when the file on disk no longer matches the (mtime, len) we last
+    /// loaded or saved — i.e. some other process wrote it. A file with no
+    /// recorded stamp (blank buffer, or never synced) is treated as
+    /// unchanged so we never reload or block on a phantom diff.
+    pub fn disk_changed_externally(&self) -> bool {
+        let Some(path) = self.path.as_deref() else {
+            return false;
+        };
+        match self.disk_stamp {
+            Some(known) => Self::disk_stamp_of(path) != Some(known),
+            None => false,
+        }
+    }
+
     /// Reload from disk *only if* there are no unsaved local edits. Returns
     /// `Some(Ok(()))` if a reload happened, `Some(Err(_))` if reload failed,
     /// `None` if reload was skipped because the buffer is dirty (caller
-    /// should surface a "file changed on disk" warning instead).
+    /// should surface a "file changed on disk" warning instead). Retained
+    /// for the explicit-revert path; the FS sync sweep uses
+    /// `reload_or_flag_conflict`.
     pub fn reload_if_clean(&mut self) -> Option<Result<()>> {
         if self.dirty {
             return None;
         }
-        let path = self.path.as_ref().cloned()?;
+        Some(self.reload_from_disk())
+    }
+
+    /// Reload the buffer from disk, preserving the cursor/scroll position as
+    /// far as the new contents allow. Updates the disk stamp so the reloaded
+    /// state is the new sync point.
+    fn reload_from_disk(&mut self) -> Result<()> {
+        let Some(path) = self.path.as_ref().cloned() else {
+            return Ok(());
+        };
         let prev_row = self.cursor_row;
         let prev_col = self.cursor_col;
         let prev_scroll = self.scroll;
@@ -1721,10 +1824,57 @@ impl Editor {
         self.cursor_row = prev_row.min(self.lines.len().saturating_sub(1));
         self.cursor_col = prev_col.min(self.line_char_len(self.cursor_row));
         self.scroll = prev_scroll.min(self.lines.len().saturating_sub(1));
-        Some(result)
+        result
     }
 
-    pub fn save_to_disk(&mut self) -> Result<()> {
+    /// Discard local edits and reload from disk unconditionally — the
+    /// "Revert" half of a conflict resolution.
+    pub fn revert_to_disk(&mut self) -> Result<()> {
+        self.dirty = false;
+        self.reload_from_disk()
+    }
+
+    /// FS-sync sweep entry point, applied to every open tab. Compares the
+    /// file's current disk stamp against the buffer's last-synced stamp and:
+    ///   * clean buffer + external change -> silently reload (VS Code's
+    ///     non-dirty auto-revert behaviour),
+    ///   * dirty buffer + external change -> flag a conflict so neither the
+    ///     buffer nor the disk is clobbered,
+    ///   * no change -> nothing.
+    pub fn reload_or_flag_conflict(&mut self) -> ExternalChange {
+        if !self.disk_changed_externally() {
+            return ExternalChange::Unchanged;
+        }
+        if self.dirty {
+            self.disk_conflict = true;
+            return ExternalChange::Conflict;
+        }
+        match self.reload_from_disk() {
+            Ok(()) => ExternalChange::Reloaded,
+            Err(_) => ExternalChange::ReloadFailed,
+        }
+    }
+
+    /// Save, refusing to overwrite if the file changed on disk since we last
+    /// synced (an external edit would be silently lost otherwise). Returns
+    /// `DiskConflict` instead of writing in that case; the caller surfaces
+    /// the conflict and may call `save_to_disk_force` to overwrite anyway.
+    pub fn save_to_disk(&mut self) -> Result<SaveOutcome> {
+        if self.disk_changed_externally() {
+            self.disk_conflict = true;
+            return Ok(SaveOutcome::DiskConflict);
+        }
+        self.write_buffer_to_disk()?;
+        Ok(SaveOutcome::Saved)
+    }
+
+    /// Save unconditionally, overwriting any external change. The "Overwrite"
+    /// half of a conflict resolution.
+    pub fn save_to_disk_force(&mut self) -> Result<()> {
+        self.write_buffer_to_disk()
+    }
+
+    fn write_buffer_to_disk(&mut self) -> Result<()> {
         let path = self
             .path
             .as_ref()
@@ -1734,6 +1884,9 @@ impl Editor {
         std::fs::write(&path, content)?;
         self.dirty = false;
         self.status = format!("Saved {}", path.display());
+        // The buffer now matches disk, so this is the new sync point and any
+        // prior conflict is resolved.
+        self.mark_synced_with_disk();
         Ok(())
     }
 
@@ -3548,6 +3701,94 @@ mod tests {
         assert!(!e.dirty);
         e.insert_char('z');
         assert!(e.dirty);
+    }
+
+    #[test]
+    fn reload_or_flag_conflict_reloads_clean_buffer() {
+        let tmp = NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), "old\n").unwrap();
+        let mut e = Editor::new();
+        e.open(tmp.path()).unwrap();
+        // External edit grows the file so mtime and len both move.
+        std::fs::write(tmp.path(), "new content here\n").unwrap();
+        assert_eq!(e.reload_or_flag_conflict(), ExternalChange::Reloaded);
+        assert_eq!(e.lines[0], "new content here");
+        assert!(!e.disk_conflict);
+        // A second sweep with no further change is a no-op.
+        assert_eq!(e.reload_or_flag_conflict(), ExternalChange::Unchanged);
+    }
+
+    #[test]
+    fn reload_or_flag_conflict_flags_dirty_buffer_without_clobbering() {
+        let tmp = NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), "original\n").unwrap();
+        let mut e = Editor::new();
+        e.open(tmp.path()).unwrap();
+        e.insert_str("my unsaved edit");
+        std::fs::write(tmp.path(), "external change\n").unwrap();
+        assert_eq!(e.reload_or_flag_conflict(), ExternalChange::Conflict);
+        assert!(
+            e.lines[0].contains("my unsaved edit"),
+            "dirty buffer must NOT be reloaded over"
+        );
+        assert!(e.disk_conflict);
+    }
+
+    #[test]
+    fn reload_or_flag_conflict_unchanged_when_disk_matches() {
+        let tmp = NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), "stable\n").unwrap();
+        let mut e = Editor::new();
+        e.open(tmp.path()).unwrap();
+        assert_eq!(e.reload_or_flag_conflict(), ExternalChange::Unchanged);
+    }
+
+    #[test]
+    fn save_refuses_to_clobber_external_change_then_force_overwrites() {
+        let tmp = NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), "original\n").unwrap();
+        let mut e = Editor::new();
+        e.open(tmp.path()).unwrap();
+        e.insert_str("local");
+        // Someone else writes the file after we opened it.
+        std::fs::write(tmp.path(), "theirs\n").unwrap();
+        assert_eq!(e.save_to_disk().unwrap(), SaveOutcome::DiskConflict);
+        assert_eq!(
+            std::fs::read_to_string(tmp.path()).unwrap(),
+            "theirs\n",
+            "a guarded save must NOT clobber the external change"
+        );
+        assert!(e.disk_conflict);
+        // Explicit force overwrites with our buffer and clears the conflict.
+        e.save_to_disk_force().unwrap();
+        assert!(
+            std::fs::read_to_string(tmp.path())
+                .unwrap()
+                .contains("local")
+        );
+        assert!(!e.disk_conflict);
+    }
+
+    #[test]
+    fn reload_externally_changed_tabs_reloads_background_tab() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.txt");
+        let b = dir.path().join("b.txt");
+        std::fs::write(&a, "a old\n").unwrap();
+        std::fs::write(&b, "b old\n").unwrap();
+        let mut tabs = EditorTabs::new();
+        tabs.open_pinned(&a).unwrap(); // tab for a
+        tabs.open_pinned(&b).unwrap(); // tab for b is now active; a is in the background
+        // External edit to the BACKGROUND file.
+        std::fs::write(&a, "a NEW\n").unwrap();
+        let report = tabs.reload_externally_changed_tabs();
+        assert_eq!(report.reloaded, vec![a.clone()]);
+        assert!(report.conflicts.is_empty());
+        let a_tab = tabs
+            .iter_tabs()
+            .find(|e| e.path.as_deref() == Some(a.as_path()))
+            .unwrap();
+        assert_eq!(a_tab.lines[0], "a NEW");
     }
 
     #[test]
@@ -5479,6 +5720,36 @@ impl EditorTabs {
         true
     }
 
+    /// Sweep EVERY open tab (not just the active one) for external on-disk
+    /// changes. Clean tabs are silently reloaded; dirty tabs are flagged as
+    /// conflicts. This is the core of the FS-sync invariant: a file open in
+    /// a background tab must reflect disk reality just like the focused one.
+    pub fn reload_externally_changed_tabs(&mut self) -> ExternalReloadReport {
+        let mut report = ExternalReloadReport::default();
+        for ed in &mut self.editors {
+            // Diff/image/sheet views don't carry an editable text buffer to
+            // reload, and a path-less blank tab has nothing to sync.
+            if ed.path.is_none() || ed.diff.is_some() {
+                continue;
+            }
+            let path = ed.path.clone();
+            match ed.reload_or_flag_conflict() {
+                ExternalChange::Reloaded => {
+                    if let Some(p) = path {
+                        report.reloaded.push(p);
+                    }
+                }
+                ExternalChange::Conflict => {
+                    if let Some(p) = path {
+                        report.conflicts.push(p);
+                    }
+                }
+                ExternalChange::Unchanged | ExternalChange::ReloadFailed => {}
+            }
+        }
+        report
+    }
+
     /// If any tab currently points at `old`, repoint it to `new`. The on-
     /// disk file has already been moved; this only updates the in-memory
     /// path so subsequent saves and the tab label track the new name.
@@ -5486,6 +5757,10 @@ impl EditorTabs {
         for e in &mut self.editors {
             if e.path.as_deref() == Some(old) {
                 e.path = Some(new.to_path_buf());
+                // Re-anchor the disk stamp to the new path so the rename
+                // isn't mistaken for an external content change on the next
+                // FS-sync sweep.
+                e.mark_synced_with_disk();
             }
         }
     }

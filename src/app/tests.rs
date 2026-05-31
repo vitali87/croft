@@ -525,6 +525,50 @@ fn drain_fs_events_reloads_on_modify_data_event() {
     assert_eq!(app.editor.lines, vec!["new content"]);
 }
 
+/// The reported bug: a file open in a NON-active tab changed on disk and the
+/// tab never reloaded, so it looked like another project's content had leaked
+/// in. FS sync must cover every open tab, not just the focused one.
+#[test]
+fn drain_fs_events_reloads_background_tab_on_external_change() {
+    use notify::Event as NotifyEvent;
+    use notify::event::{DataChange, EventKind, ModifyKind};
+    use notify_debouncer_full::DebouncedEvent;
+    use std::sync::mpsc;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let bg = tmp.path().join("background.txt");
+    let fg = tmp.path().join("foreground.txt");
+    std::fs::write(&bg, "bg old\n").unwrap();
+    std::fs::write(&fg, "fg old\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&bg).unwrap(); // background tab
+    app.editor.open_pinned(&fg).unwrap(); // active tab
+
+    let (tx, rx) = mpsc::channel();
+    app.fs_watch.set_test_events(rx);
+    app.sync_open_file_poll_mtime();
+
+    std::fs::write(&bg, "bg NEW\n").unwrap();
+    let ev = NotifyEvent::new(EventKind::Modify(ModifyKind::Data(DataChange::Content)))
+        .add_path(bg.clone());
+    tx.send(Ok(vec![DebouncedEvent::new(ev, std::time::Instant::now())]))
+        .unwrap();
+
+    app.drain_fs_events();
+
+    let bg_tab = app
+        .editor
+        .iter_tabs()
+        .find(|e| e.path.as_deref() == Some(bg.as_path()))
+        .unwrap();
+    assert_eq!(
+        bg_tab.lines,
+        vec!["bg NEW"],
+        "a background tab must reload when its file changes on disk"
+    );
+    assert_eq!(app.editor.lines, vec!["fg old"], "active tab untouched");
+}
+
 #[test]
 fn rect_contains_basic() {
     let r = Rect {

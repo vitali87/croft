@@ -351,7 +351,7 @@ What works:
 * Right-click context menu with Cut, Copy, Paste, Rename, count-aware Delete, plus New File / New Folder on empty space.
 * Live filesystem watcher with a 50 ms polling fallback for missed startup or host events.
 * File open with tree-sitter highlighting (Rust, Python, JS, TS, TSX, JSON, TOML, YAML, Markdown, Go, HTML, CSS, Bash).
-* Full editor write path: insert / delete / Enter / Tab / Backspace / save round-trip with `●` dirty marker, auto-reload on external write when buffer is clean, native-clipboard copy / cut (OSC 52 fallback on remote), undo with intelligent edit-step coalescing.
+* Full editor write path: insert / delete / Enter / Tab / Backspace / save round-trip with `●` dirty marker, auto-reload on external write when the buffer is clean (across every open tab, not just the focused one), a save-conflict guard that refuses to clobber an external change to a dirty buffer until you press Cmd+S again to overwrite, native-clipboard copy / cut (OSC 52 fallback on remote), undo with intelligent edit-step coalescing.
 * Inline preview tabs that render directly in the editor pane via OSC 1337: PNG / JPEG / GIF / BMP / WebP, PDFs (with page navigation, multi-page when poppler is installed), and CSV / TSV / XLSX / XLS / XLSB / ODS spreadsheets.
 * Search sidebar (live, `.gitignore`-aware, off the UI thread, regex / case / whole-word toggles).
 * Remote (SSH) sidebar that lists hosts from `~/.ssh/config` and launches a remote croft session.

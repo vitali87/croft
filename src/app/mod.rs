@@ -573,6 +573,10 @@ pub struct App {
     pub run_debug: RunDebugPanel,
     pub system_panel: SystemPanel,
     pub editor: EditorTabs,
+    /// One-shot latch armed when a save is refused because the file changed
+    /// on disk. The next `save()` overwrites anyway, giving the user a
+    /// "press Cmd+S again to overwrite" escape hatch without a modal.
+    force_save_armed: bool,
     pub terminals: Vec<PtyTerminal>,
     pub active_terminal: usize,
     perf: PerfHud,
@@ -1180,6 +1184,7 @@ impl App {
                 p
             },
             editor,
+            force_save_armed: false,
             terminals: vec![term],
             active_terminal: 0,
             perf: PerfHud::default(),
@@ -1842,27 +1847,33 @@ impl App {
             .sync_open_file_mtime(self.editor.path.as_deref());
     }
 
+    /// Sweep EVERY open tab for external on-disk changes, not just the
+    /// focused one. Clean tabs reload silently; dirty tabs are flagged as
+    /// conflicts (the buffer and the disk are both preserved). Returns true
+    /// if any tab reloaded or entered conflict, so the caller redraws.
     fn reload_open_file_after_external_change(&mut self) -> bool {
+        let report = self.editor.reload_externally_changed_tabs();
+        if report.is_empty() {
+            return false;
+        }
         self.refresh_git_status_debounced();
-        match self.editor.reload_if_clean() {
-            Some(Ok(())) => {
-                let path_disp = self
-                    .editor
-                    .path
-                    .as_ref()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_default();
-                self.status = format!("Reloaded {path_disp} (external change)");
+        match (report.reloaded.len(), report.conflicts.len()) {
+            (n, 0) if n == 1 => {
+                let p = report.reloaded[0].display();
+                self.status = format!("Reloaded {p} (external change)");
             }
-            Some(Err(e)) => {
-                self.status = format!("External change but reload failed: {e}");
+            (n, 0) => {
+                self.status = format!("Reloaded {n} files changed on disk");
             }
-            None => {
-                self.status = String::from(
-                    "Open file changed on disk; you have unsaved edits, save or revert to reload",
+            (_, _) => {
+                let p = report.conflicts[0].display();
+                self.status = format!(
+                    "{p} changed on disk and has unsaved edits - save to overwrite, or close the tab to keep the disk version"
                 );
             }
         }
+        // Keep the watcher's active-file baseline aligned with the reload so
+        // a just-applied change doesn't re-trigger on the next poll.
         self.sync_open_file_poll_mtime();
         true
     }
@@ -1871,7 +1882,10 @@ impl App {
         let poll = self
             .fs_watch
             .poll(&mut self.tree, self.editor.path.as_deref());
-        if poll.open_file_changed {
+        // Any directory change can also be a write to a file open in some
+        // tab (background or active), so sweep all tabs whenever the poll
+        // saw activity, not only when the active file's own stat moved.
+        if poll.open_file_changed || poll.dirs_changed {
             self.reload_open_file_after_external_change();
         }
         if poll.dirs_changed {
@@ -2387,7 +2401,12 @@ impl App {
                 self.kick_file_finder_index_rebuild();
             }
         }
-        if drain.touched_open_file {
+        // `touched_open_file` only tracks the ACTIVE tab; a background tab's
+        // file change still arrives as a watcher event (got_any), so sweep
+        // every tab whenever any event lands. The sweep is stamp-based, so
+        // a benign Access/Metadata event that didn't move mtime+len is a
+        // no-op and won't clobber selection or reload spuriously.
+        if drain.got_any {
             self.reload_open_file_after_external_change();
         }
         let polled = self.poll_filesystem_changes();
@@ -7935,8 +7954,31 @@ impl App {
     }
 
     fn save(&mut self) {
+        use crate::widgets::editor::SaveOutcome;
+        // A previously-refused save arms a one-shot override: the very next
+        // Cmd+S overwrites the external change. Consume it here so it never
+        // lingers past the press it was meant for.
+        if std::mem::take(&mut self.force_save_armed) {
+            match self.editor.save_to_disk_force() {
+                Ok(()) => self.status = self.editor.status.clone(),
+                Err(e) => self.status = format!("Save failed: {e}"),
+            }
+            return;
+        }
         match self.editor.save_to_disk() {
-            Ok(()) => self.status = self.editor.status.clone(),
+            Ok(SaveOutcome::Saved) => self.status = self.editor.status.clone(),
+            Ok(SaveOutcome::DiskConflict) => {
+                self.force_save_armed = true;
+                let name = self
+                    .editor
+                    .path
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default();
+                self.status = format!(
+                    "{name} changed on disk since you opened it - press Cmd+S again to overwrite, or close the tab to keep the disk version"
+                );
+            }
             Err(e) => self.status = format!("Save failed: {e}"),
         }
     }
