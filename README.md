@@ -166,7 +166,7 @@ croft setup-terminal --help
 
 ### Editor: vim mode (modal editing)
 
-`Cmd`+`E` toggles a native, Rust-implemented modal layer over the editor pane. It is an emulation of the common daily-driver subset, not embedded neovim, so it carries no `nvim` dependency, behaves identically on local and remote, and stays on the input hot path. When it is on, a coloured mode pill (`NORMAL` blue, `INSERT` green, `VISUAL` purple) and the active `:`/`/` line show in the status bar. While it is off the editor behaves exactly as the tables above describe, and every `Cmd`/`Ctrl` shortcut keeps working in Normal mode because modal editing only claims unmodified keys. For full vim with your own plugins and `init.lua`, run real `nvim` in the shell pane.
+`Cmd`+`E` toggles a native, Rust-implemented modal layer over the editor pane. It is an emulation of the common daily-driver subset, not embedded neovim, so it carries no `nvim` dependency, behaves identically on local and remote, and stays on the input hot path. When it is on, a coloured mode pill (`NORMAL` blue, `INSERT` green, `VISUAL` purple) and the active `:`/`/` line show in the status bar. While it is off the editor behaves exactly as the tables above describe, and every `Cmd`/`Ctrl` shortcut keeps working in Normal mode because modal editing only claims unmodified keys. For full vim with your own plugins and `init.lua`, run real `nvim` in the shell pane. The `Cmd`+`E` toggle reaches croft only after `croft setup-iterm2` and an iTerm2 relaunch: macOS otherwise binds the chord to Edit > Find > Use Selection for Find, so the setup step relocates that menu item to `Cmd`+`Opt`+`E` and forwards `Cmd`+`E` as CSI-u, exactly as it does for the other Mac-style Cmd chords.
 
 | Keys | Action |
 |------|--------|

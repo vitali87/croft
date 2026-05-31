@@ -57,6 +57,22 @@ const CMD_Y_KEY: &str = "0x79-0x100000-0x10";
 const CMD_Y_HEX: &str = "0x1b 0x5b 0x31 0x32 0x31 0x3b 0x39 0x75";
 const CMD_O_KEY: &str = "0x6f-0x100000-0x1f";
 const CMD_O_HEX: &str = "0x1b 0x5b 0x31 0x31 0x31 0x3b 0x39 0x75";
+/// `Cmd+E` — toggle native modal (vim) editing in the editor pane (croft's
+/// `is_vim_toggle_key`). iTerm2 inherits AppKit's standard Edit > Find
+/// submenu, which binds the bare chord to "Use Selection for Find"; the
+/// NSUserKeyEquivalents override below relocates that item to Cmd+Opt+E so
+/// this GlobalKeyMap forwarder fires instead, exactly as Cmd+F (a sibling in
+/// the same submenu) is handled. Codepoint 'e' (0x65 = 101), virtualKeyCode
+/// `kVK_ANSI_E` = 0xe, modifier mask 0x100000 (Cmd). CSI-u `ESC [ 101 ; 9 u`
+/// (modifier byte 9 = 1 base + Super(8)), which crossterm decodes back to
+/// `KeyEvent { code: Char('e'), modifiers: SUPER }`.
+const CMD_E_KEY: &str = "0x65-0x100000-0xe";
+const CMD_E_HEX: &str = "0x1b 0x5b 0x31 0x30 0x31 0x3b 0x39 0x75";
+/// AppKit / iTerm2 menu item that owns bare Cmd+E (Edit > Find > Use
+/// Selection for Find) and the chord it is relocated to so croft can claim
+/// Cmd+E. Cmd+Opt+E keeps the find-from-selection action reachable.
+const USE_SELECTION_FOR_FIND_MENU_KEY: &str = "Use Selection for Find";
+const USE_SELECTION_FOR_FIND_MENU_EQUIV: &str = "@~e";
 const CMD_SHIFT_G_KEY: &str = "0x47-0x120000-0x5";
 const CMD_SHIFT_G_HEX: &str = "0x1b 0x5b 0x37 0x31 0x3b 0x31 0x30 0x75";
 const CMD_SHIFT_O_KEY: &str = "0x4f-0x120000-0x1f";
@@ -349,6 +365,16 @@ pub fn apply_croft_key_settings(plist: &mut Value) -> Result<(), ITerm2Error> {
     // is consulted. Cmd+Opt+P keeps Print reachable on a chord croft
     // does not use.
     set_string(menu, PRINT_MENU_KEY, PRINT_MENU_EQUIV.to_string());
+    // Relocate AppKit's Edit > Find > "Use Selection for Find" off Cmd+E so
+    // croft's native-modal (vim) toggle can receive the chord. Like Cmd+F in
+    // the same submenu, the bare chord is otherwise claimed at the menu layer
+    // before iTerm2's GlobalKeyMap is consulted. Cmd+Opt+E keeps the
+    // find-from-selection action reachable on a chord croft does not use.
+    set_string(
+        menu,
+        USE_SELECTION_FOR_FIND_MENU_KEY,
+        USE_SELECTION_FOR_FIND_MENU_EQUIV.to_string(),
+    );
     // Relocate iTerm2's "Restore Closed Session" off Cmd+Shift+T so
     // croft's terminal-focus chord can claim it. Cmd+Opt+Shift+T keeps
     // the iTerm2 action reachable on a chord croft does not use.
@@ -415,6 +441,7 @@ pub fn apply_croft_key_settings(plist: &mut Value) -> Result<(), ITerm2Error> {
         (CMD_G_KEY, CMD_G_HEX),
         (CMD_Y_KEY, CMD_Y_HEX),
         (CMD_O_KEY, CMD_O_HEX),
+        (CMD_E_KEY, CMD_E_HEX),
         (CMD_P_KEY, CMD_P_HEX),
         (CMD_SHIFT_G_KEY, CMD_SHIFT_G_HEX),
         (CMD_SHIFT_O_KEY, CMD_SHIFT_O_HEX),
@@ -773,6 +800,32 @@ mod tests {
                 "GlobalKeyMap is missing the CSI-u forwarder for {label}; without it, AppKit's NSResponder default key bindings catch the chord (Cmd+C -> copy: on PTYTextView) before croft's terminal handler sees a Char-with-Super key event, which is why Cmd+C silently fails to copy the croft selection even with the NSUserKeyEquivalents Edit-menu relocations in place"
             );
         }
+    }
+
+    #[test]
+    fn apply_croft_key_settings_forwards_cmd_e_for_vim_mode_toggle() {
+        let mut plist = synth_plist("GUID-1", &["GUID-1"]);
+        apply_croft_key_settings(&mut plist).unwrap();
+        let top = plist.as_dictionary().unwrap();
+        let global = dict_in(top, "GlobalKeyMap");
+        assert_eq!(
+            action_text(global, CMD_E_KEY),
+            CMD_E_HEX,
+            "GlobalKeyMap must forward Cmd+E as a CSI-u sequence so croft's `is_vim_toggle_key` fires and toggles native modal editing. Without it, iTerm2's Edit > Find > Use Selection for Find owns the bare chord at the menu layer and croft never sees a Char('e') + SUPER key event, so the toggle is inert"
+        );
+    }
+
+    #[test]
+    fn apply_croft_key_settings_relocates_use_selection_for_find_off_cmd_e() {
+        let mut plist = synth_plist("GUID-1", &["GUID-1"]);
+        apply_croft_key_settings(&mut plist).unwrap();
+        let top = plist.as_dictionary().unwrap();
+        let menu = dict_in(top, "NSUserKeyEquivalents");
+        assert_eq!(
+            menu.get(USE_SELECTION_FOR_FIND_MENU_KEY).and_then(|v| v.as_string()),
+            Some(USE_SELECTION_FOR_FIND_MENU_EQUIV),
+            "iTerm2's Use Selection for Find must be relocated off bare Cmd+E so croft's vim-mode toggle can claim the chord; @~e = Cmd+Opt+E keeps the find-from-selection action reachable on a chord croft does not use"
+        );
     }
 
     #[test]
