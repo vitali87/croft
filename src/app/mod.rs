@@ -27,6 +27,7 @@ mod cursor_blink;
 mod fs_watch;
 mod git_worker;
 mod hover;
+mod nav;
 mod overlay;
 mod perf_hud;
 mod sys_monitor;
@@ -36,6 +37,7 @@ use cursor_blink::CursorBlink;
 use fs_watch::FsWatch;
 use git_worker::GitWorker;
 use hover::{HOVER_DELAY, HoverDwell};
+use nav::{NavHistory, NavLoc};
 use overlay::OverlayManager;
 use perf_hud::PerfHud;
 use sys_monitor::SysMonitor;
@@ -722,6 +724,7 @@ pub struct App {
     hover_anchor: Option<(u16, u16)>,
     hover_word: Option<(usize, usize, usize)>,
     definition_request_id: Option<u64>,
+    nav: NavHistory,
     editor_vim_chord: EditorVimChord,
     shortcuts_modal: Option<crate::widgets::shortcuts::ShortcutsModal>,
     shortcuts_hit_rect: Option<Rect>,
@@ -1253,6 +1256,7 @@ impl App {
             hover_anchor: None,
             hover_word: None,
             definition_request_id: None,
+            nav: NavHistory::default(),
         })
     }
 
@@ -2171,30 +2175,16 @@ impl App {
     }
 
     fn go_to_definition(&mut self, path: PathBuf, line: u32, col: u32) {
-        self.hover_popup = None;
-        match self.editor.open_preview(&path) {
-            Ok(()) => {
-                self.sync_open_file_poll_mtime();
-                let row = (line as usize).min(self.editor.lines.len().saturating_sub(1));
-                let max_col = self
-                    .editor
-                    .lines
-                    .get(row)
-                    .map(|l| l.chars().count())
-                    .unwrap_or(0);
-                self.editor.cursor_row = row;
-                self.editor.cursor_col = (col as usize).min(max_col);
-                let page = self.editor.page_size().max(1);
-                self.editor.scroll = row.saturating_sub(page / 2);
-                self.editor.scroll_col = 0;
-                self.editor.ensure_cursor_col_visible();
-                self.status = format!("Jumped to {} line {}", path.display(), line + 1);
-                self.focus_pane(Pane::Editor);
-                self.poke_cursor();
-            }
-            Err(e) => {
-                self.status = format!("Go to definition failed: {e}");
-            }
+        if let Some(from) = self.editor.path.clone() {
+            self.nav.record(NavLoc {
+                path: from,
+                row: self.editor.cursor_row,
+                col: self.editor.cursor_col,
+            });
+        }
+        match self.open_at(&path, line as usize, col as usize) {
+            Ok(()) => self.status = format!("Jumped to {} line {}", path.display(), line + 1),
+            Err(e) => self.status = format!("Go to definition failed: {e}"),
         }
     }
 
@@ -2220,6 +2210,40 @@ impl App {
         }
     }
 
+    fn open_at(&mut self, path: &Path, row: usize, col: usize) -> Result<()> {
+        self.hover_popup = None;
+        self.editor.open_preview(path)?;
+        self.sync_open_file_poll_mtime();
+        let row = row.min(self.editor.lines.len().saturating_sub(1));
+        let max_col = self
+            .editor
+            .lines
+            .get(row)
+            .map(|l| l.chars().count())
+            .unwrap_or(0);
+        self.editor.cursor_row = row;
+        self.editor.cursor_col = col.min(max_col);
+        let page = self.editor.page_size().max(1);
+        self.editor.scroll = row.saturating_sub(page / 2);
+        self.editor.scroll_col = 0;
+        self.editor.ensure_cursor_col_visible();
+        self.focus_pane(Pane::Editor);
+        self.poke_cursor();
+        Ok(())
+    }
+
+    fn nav_back(&mut self) {
+        let Some(loc) = self.nav.back() else {
+            self.status = "No previous location".to_string();
+            return;
+        };
+        let line = loc.row;
+        match self.open_at(&loc.path, loc.row, loc.col) {
+            Ok(()) => self.status = format!("Back to {} line {}", loc.path.display(), line + 1),
+            Err(e) => self.status = format!("Go back failed: {e}"),
+        }
+    }
+
     fn trigger_definition_at(&mut self, col: u16, row: u16) {
         if self.editor.diff.is_some() || self.editor.sheet.is_some() || self.editor.image.is_some()
         {
@@ -2228,6 +2252,8 @@ impl App {
         let Some((line, c)) = self.editor.buffer_pos_at(col, row) else {
             return;
         };
+        self.editor.cursor_row = line;
+        self.editor.cursor_col = c;
         let Some(path) = self.editor.path.clone() else {
             return;
         };
@@ -7030,10 +7056,14 @@ impl App {
                 }
             }
             MouseEventKind::Down(MouseButton::Left) => {
-                // (H) iTerm2 folds Cmd onto the Meta bit, so a Cmd+click in the
-                // editor arrives here as ALT — that is the Go to Definition gesture.
+                // (H) iTerm2 folds Cmd onto the Meta bit, so Cmd+click arrives as
+                // ALT (Go to Definition) and Cmd+Shift+click as ALT|SHIFT (navigate back).
                 if in_editor && m.modifiers.contains(KeyModifiers::ALT) {
-                    self.trigger_definition_at(m.column, m.row);
+                    if m.modifiers.contains(KeyModifiers::SHIFT) {
+                        self.nav_back();
+                    } else {
+                        self.trigger_definition_at(m.column, m.row);
+                    }
                     return;
                 }
                 if !in_editor {
@@ -7822,8 +7852,13 @@ impl App {
     /// into the old workspace.
     pub fn change_workspace_root(&mut self, new_root: PathBuf) {
         let display = new_root.display().to_string();
+        let mut shell_synced = true;
         if let Some(active) = self.terminals.get_mut(self.active_terminal) {
-            active.change_cwd(&new_root);
+            if active.foreground_is_shell() {
+                active.change_cwd(&new_root);
+            } else {
+                shell_synced = false;
+            }
         }
         self.workspace_root = new_root.clone();
         self.tree.set_root(new_root.clone());
@@ -7858,7 +7893,11 @@ impl App {
         self.file_finder_index_rx = None;
         self.file_finder_index_dirty = false;
         self.kick_file_finder_index_rebuild();
-        self.status = format!("Workspace root: {display}");
+        self.status = if shell_synced {
+            format!("Workspace root: {display}")
+        } else {
+            format!("Workspace root: {display} (terminal busy; shell not moved)")
+        };
     }
 
     fn is_explorer_focused(&self) -> bool {

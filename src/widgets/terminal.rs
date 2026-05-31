@@ -128,6 +128,10 @@ pub struct PtyTerminal {
     /// and both paths funnel through this mutex.
     writer: Arc<std::sync::Mutex<Box<dyn Write + Send>>>,
     _child: Box<dyn portable_pty::Child + Send + Sync>,
+    /// The interactive shell's pid, captured at spawn. A shell at its
+    /// prompt is its own foreground process-group leader, so this is the
+    /// value `foreground_is_shell` compares `tcgetpgrp(master)` against.
+    shell_pid: Option<i32>,
     cols: u16,
     rows: u16,
     /// Shared with the `VoidListener` so `TextAreaSizeRequest` callbacks
@@ -220,6 +224,7 @@ impl PtyTerminal {
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
         let child = pair.slave.spawn_command(cmd).context("spawn child")?;
+        let shell_pid = child.process_id().map(|p| p as i32);
         drop(pair.slave);
 
         let writer: Arc<std::sync::Mutex<Box<dyn Write + Send>>> = Arc::new(std::sync::Mutex::new(
@@ -307,6 +312,7 @@ impl PtyTerminal {
             master: pair.master,
             writer,
             _child: child,
+            shell_pid,
             cols,
             rows,
             size_shared,
@@ -442,6 +448,25 @@ impl PtyTerminal {
             self.write_input(b"\x1b[201~");
         } else {
             self.write_input(payload);
+        }
+    }
+
+    /// True when the embedded shell is sitting at its prompt rather than
+    /// running a foreground application (an editor, a pager, or an agent
+    /// like Claude Code). Compares the PTY's foreground process group
+    /// against the shell's own pid: a shell at its prompt is its own
+    /// process-group leader, so `tcgetpgrp(master) == shell_pid`. Once
+    /// the shell forks a command, that command owns a new foreground
+    /// group and the two diverge. The only case that must suppress a
+    /// `cd` seed is a foreground group that exists AND is not the shell,
+    /// because that is an app reading the tty in raw mode; a missing
+    /// foreground group (the brief window after spawn, before the shell
+    /// claims the tty) means nothing has grabbed input, so a `cd` is
+    /// still safe. `tcgetpgrp` is identical on macOS and Linux.
+    pub fn foreground_is_shell(&self) -> bool {
+        match (self.master.process_group_leader(), self.shell_pid) {
+            (Some(fg), Some(pid)) => fg as i32 == pid,
+            _ => true,
         }
     }
 
@@ -987,6 +1012,33 @@ mod tests {
             bytes,
             b"\x05\x15cd '/tmp/a b/c d'\n".to_vec(),
             "single-quoting must preserve spaces verbatim so cd lands at the right directory"
+        );
+    }
+
+    #[test]
+    fn foreground_is_shell_flips_false_while_a_foreground_command_runs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut term = PtyTerminal::new(tmp.path()).unwrap();
+
+        let mut waited = 0u32;
+        while waited < 4000 && !term.foreground_is_shell() {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            waited += 20;
+        }
+        assert!(
+            term.foreground_is_shell(),
+            "a shell at its prompt is the tty's foreground process group, so a cd is safe to inject"
+        );
+
+        term.write_input(b"sleep 10\n");
+        let mut waited = 0u32;
+        while waited < 4000 && term.foreground_is_shell() {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            waited += 20;
+        }
+        assert!(
+            !term.foreground_is_shell(),
+            "while a foreground command owns the tty, the foreground group is the command not the shell, so a cd must not be injected"
         );
     }
 

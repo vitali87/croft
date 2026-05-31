@@ -70,6 +70,61 @@ fn go_to_definition_opens_the_target_file_and_moves_the_caret() {
 }
 
 #[test]
+fn go_back_returns_to_the_location_before_a_definition_jump() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.rs");
+    let b = tmp.path().join("b.rs");
+    std::fs::write(&a, "fn main() {}\nlet x = helper();\n").unwrap();
+    std::fs::write(&b, "fn helper() {}\nfn other() {}\nfn third() {}\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&a).unwrap();
+    app.editor.cursor_row = 1;
+    app.editor.cursor_col = 8;
+
+    app.go_to_definition(b.clone(), 0, 3);
+    assert_eq!(
+        app.editor.path.as_deref(),
+        Some(b.as_path()),
+        "the definition jump opens B"
+    );
+    assert_eq!(
+        app.editor.cursor_row, 0,
+        "caret lands on the definition line"
+    );
+
+    app.nav_back();
+    assert_eq!(
+        app.editor.path.as_deref(),
+        Some(a.as_path()),
+        "go back returns to file A"
+    );
+    assert_eq!(
+        app.editor.cursor_row, 1,
+        "caret returns to the line we jumped from"
+    );
+    assert_eq!(
+        app.editor.cursor_col, 8,
+        "caret returns to the column we jumped from"
+    );
+}
+
+#[test]
+fn go_back_with_empty_history_stays_put() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.rs");
+    std::fs::write(&a, "fn main() {}\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&a).unwrap();
+    app.editor.cursor_row = 0;
+    app.nav_back();
+    assert_eq!(
+        app.editor.path.as_deref(),
+        Some(a.as_path()),
+        "with nothing to go back to, go back is a no-op"
+    );
+}
+
+#[test]
 fn cmd_shift_s_activates_search_and_selects_existing_query() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
@@ -3449,6 +3504,43 @@ fn change_workspace_root_writes_cd_into_active_terminal_pty() {
     assert_eq!(
         app.workspace_root, target_dir,
         "workspace_root must still flip to the new path"
+    );
+}
+
+#[test]
+fn change_workspace_root_skips_cd_when_terminal_runs_a_foreground_app() {
+    let tmp = tempfile::tempdir().unwrap();
+    let target_dir = tmp.path().join("seeded");
+    std::fs::create_dir(&target_dir).unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+
+    // Put the active terminal into a long-lived foreground command so its
+    // foreground process group is the command, not the shell.
+    app.terminal_mut().write_input(b"sleep 10\n");
+    let mut waited = 0u32;
+    while waited < 4000 && app.terminal_mut().foreground_is_shell() {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        waited += 20;
+    }
+    assert!(
+        !app.terminal_mut().foreground_is_shell(),
+        "precondition: the terminal must be running a foreground command"
+    );
+
+    app.change_workspace_root(target_dir.clone());
+
+    // The "terminal busy" status is set by the very branch that skips
+    // change_cwd, so it is a deterministic proxy for "no cd was injected"
+    // - far more reliable than the async PTY dirty bit, which the running
+    // sleep and residual echo can flip independently of any cd seed.
+    assert!(
+        app.status.contains("terminal busy"),
+        "a busy terminal must take the suppress-cd branch and say so; injecting a cd would type the path into the running app. status was: {}",
+        app.status
+    );
+    assert_eq!(
+        app.workspace_root, target_dir,
+        "the Explorer root must still flip even when the shell cannot be synced"
     );
 }
 
