@@ -2055,6 +2055,19 @@ impl App {
         self.search.hits.clear();
         self.search.selected = 0;
         self.search.scroll = 0;
+        // Snapshot unsaved editor buffers so the worker searches their live
+        // content (and skips the stale disk copy). This is what makes an
+        // unsaved edit — e.g. a Rename Symbol — findable before save, matching
+        // VS Code / Zed. Sent before the query so the next scan sees it.
+        let dirty: Vec<(PathBuf, String)> = self
+            .editor
+            .iter_tabs()
+            .filter(|t| t.dirty)
+            .filter_map(|t| t.path.clone().map(|p| (p, t.lines.join("\n"))))
+            .collect();
+        let _ = self
+            .search_query_tx
+            .send(SearchRequest::SetDirtyBuffers(dirty));
         let _ = self.search_query_tx.send(SearchRequest::Query(
             self.search.query.clone(),
             self.search.opts,

@@ -132,7 +132,7 @@ croft setup-terminal --help
 
 | Keys | Action |
 |------|--------|
-| Type | Live `.gitignore`-aware search across the workspace; refreshes per keystroke (~120 ms debounce, off the UI thread). Capped at 200 hits. |
+| Type | Live `.gitignore`-aware search across the workspace; refreshes per keystroke (~120 ms debounce, off the UI thread). Capped at 200 hits. Dirty-aware: files open with unsaved edits are searched from their in-memory buffer (and their stale disk copy is skipped), so an unsaved change such as a Rename Symbol is findable before you save, just like VS Code / Zed. |
 | Click `Aa`, `ab`, `.*` toggles | Flip case-sensitive / whole-word / regex; re-runs immediately. Active toggles render with a yellow background. |
 | `↑` / `↓` + `Enter`, or click a result | Open the file at the matched line |
 
@@ -391,7 +391,7 @@ What works:
 * Multi-cursor "Change All Occurrences" (`Cmd`/`Ctrl`+`F2`): selects every textual match of the word in the current file and edits them simultaneously as one undo step.
 * LSP "Rename Symbol" (`F2`): renames the identifier under the cursor across every file the language server reports, in-memory for open tabs and on disk for closed ones.
 * Inline preview tabs that render directly in the editor pane via OSC 1337: PNG / JPEG / GIF / BMP / WebP, PDFs (with page navigation, multi-page when poppler is installed), and CSV / TSV / XLSX / XLS / XLSB / ODS spreadsheets.
-* Search sidebar (live, `.gitignore`-aware, off the UI thread, regex / case / whole-word toggles).
+* Search sidebar (live, `.gitignore`-aware, off the UI thread, regex / case / whole-word toggles, dirty-aware so unsaved buffer edits are findable before save).
 * Remote (SSH) sidebar that lists hosts from `~/.ssh/config` and launches a remote croft session.
 * Run and Debug sidebar (icon four): a Run [filename] button that picks a runner by file extension (Python, Node, Ruby, bash, zsh, fish, PHP, Perl, Lua, plus tsx for TS/TSX) and spawns the file in a fresh terminal at the right cwd. Python is venv-aware: walks from the file's directory up to the workspace root looking for `.venv/bin/python`, `venv/bin/python`, or `.env/bin/python` and uses the project's interpreter when found, falling back to system `python3` only when nothing is in scope.
 * Embedded shell with full ANSI color, key forwarding, mouse-drag text selection, and 5000-row scrollback.

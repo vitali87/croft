@@ -8,6 +8,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Widget},
 };
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -108,6 +109,23 @@ pub fn search_workspace_streaming<F>(
 ) where
     F: FnMut(Vec<SearchHit>) + Send + Clone,
 {
+    search_workspace_streaming_skipping(root, query, opts, cancel, &HashSet::new(), on_batch);
+}
+
+/// Like `search_workspace_streaming` but skips any walked file whose
+/// canonical path is in `skip`. Used for dirty-aware search: files open in
+/// unsaved editors are searched from their in-memory buffer instead, so the
+/// stale on-disk copy must not also contribute (duplicate / outdated) hits.
+pub fn search_workspace_streaming_skipping<F>(
+    root: &Path,
+    query: &str,
+    opts: SearchOpts,
+    cancel: &Arc<AtomicBool>,
+    skip: &HashSet<PathBuf>,
+    on_batch: F,
+) where
+    F: FnMut(Vec<SearchHit>) + Send + Clone,
+{
     let q = query.trim();
     if q.is_empty() {
         return;
@@ -122,6 +140,7 @@ pub fn search_workspace_streaming<F>(
     walker.run(|| {
         let matcher = matcher.clone();
         let cancel = cancel.clone();
+        let skip = skip.clone();
         let mut on_batch = on_batch.clone();
         Box::new(move |entry| {
             if cancel.load(Ordering::Relaxed) {
@@ -135,6 +154,12 @@ pub fn search_workspace_streaming<F>(
                 return WalkState::Continue;
             }
             let path = entry.path();
+            // Dirty files are searched from their in-memory buffer elsewhere;
+            // skip the stale disk copy. Only pay the canonicalize syscall when
+            // there is actually something to skip.
+            if !skip.is_empty() && path.canonicalize().is_ok_and(|canon| skip.contains(&canon)) {
+                return WalkState::Continue;
+            }
             let mut batch: Vec<SearchHit> = Vec::new();
             {
                 let mut sink = HitSink {
@@ -283,6 +308,12 @@ pub enum SearchEvent {
 pub enum SearchRequest {
     Query(String, SearchOpts),
     SetRoot(PathBuf),
+    /// Snapshot of files open in unsaved (dirty) editors as `(path, content)`
+    /// where `content` is the buffer's current text. The worker searches these
+    /// in-memory copies and skips their stale disk versions, so an unsaved edit
+    /// (e.g. a Rename Symbol) is findable immediately. Like `SetRoot`, this is
+    /// state, not a query: it updates the snapshot used by the next scan.
+    SetDirtyBuffers(Vec<(PathBuf, String)>),
 }
 
 /// How long the user has to pause typing before the search fires. Each
@@ -309,6 +340,8 @@ pub fn search_worker_loop(
 ) {
     use std::sync::mpsc::RecvTimeoutError;
     let mut current: Option<(std::thread::JoinHandle<()>, Arc<AtomicBool>)> = None;
+    // Latest snapshot of unsaved editor buffers, refreshed by SetDirtyBuffers.
+    let mut dirty: Vec<(PathBuf, String)> = Vec::new();
     while let Ok(mut latest) = rx.recv() {
         // A new message landed: cancel the in-flight scan (if any) so its
         // worker thread bails out before the user pauses long enough to
@@ -317,19 +350,27 @@ pub fn search_worker_loop(
             cancel.store(true, Ordering::Relaxed);
             let _ = handle.join();
         }
-        // A root rebind is not a query and does not debounce: apply it and
-        // wait for the next message.
-        if let SearchRequest::SetRoot(new_root) = latest {
-            root = new_root;
-            continue;
+        // State updates (root rebind, dirty-buffer snapshot) are not queries
+        // and do not debounce: apply and wait for the next message.
+        match latest {
+            SearchRequest::SetRoot(new_root) => {
+                root = new_root;
+                continue;
+            }
+            SearchRequest::SetDirtyBuffers(buffers) => {
+                dirty = buffers;
+                continue;
+            }
+            SearchRequest::Query(..) => {}
         }
         // Trailing-edge debounce: each new keystroke resets the timer.
         // The search fires only after `SEARCH_DEBOUNCE` of silence. A
-        // root rebind arriving mid-debounce updates the target without
-        // displacing the pending query.
+        // root rebind or dirty-buffer snapshot arriving mid-debounce updates
+        // the state without displacing the pending query.
         loop {
             match rx.recv_timeout(SEARCH_DEBOUNCE) {
                 Ok(SearchRequest::SetRoot(new_root)) => root = new_root,
+                Ok(SearchRequest::SetDirtyBuffers(buffers)) => dirty = buffers,
                 Ok(newer) => latest = newer,
                 Err(RecvTimeoutError::Timeout) => break,
                 Err(RecvTimeoutError::Disconnected) => return,
@@ -349,14 +390,29 @@ pub fn search_worker_loop(
         let tx_for_thread = tx.clone();
         let root_for_thread = root.clone();
         let query_for_thread = query.clone();
+        let dirty_for_thread = dirty.clone();
         let handle = std::thread::spawn(move || {
             let q_for_emit = query_for_thread.clone();
             let tx_for_emit = tx_for_thread.clone();
-            search_workspace_streaming(
+            // First, search the unsaved buffers in-memory and collect the set
+            // of their canonical paths so the disk walk skips the stale copies.
+            let mut skip: HashSet<PathBuf> = HashSet::new();
+            let mut buf_hits: Vec<SearchHit> = Vec::new();
+            for (path, content) in &dirty_for_thread {
+                if let Ok(canon) = path.canonicalize() {
+                    skip.insert(canon);
+                }
+                collect_matches_in_text(path, content, &query_for_thread, opts, &mut buf_hits);
+            }
+            if !buf_hits.is_empty() {
+                let _ = tx_for_emit.send(SearchEvent::Hits(q_for_emit.clone(), opts, buf_hits));
+            }
+            search_workspace_streaming_skipping(
                 &root_for_thread,
                 &query_for_thread,
                 opts,
                 &cancel_for_thread,
+                &skip,
                 move |batch| {
                     let _ = tx_for_emit.send(SearchEvent::Hits(q_for_emit.clone(), opts, batch));
                 },
@@ -371,11 +427,11 @@ pub fn search_worker_loop(
     }
 }
 
-/// Test-friendly per-text helper. Wraps `grep-searcher` so the matching
-/// logic is identical to the file-walking engine. Honours the three
-/// `SearchOpts` toggles. Regex compilation failure for invalid patterns
-/// is silent: returns no matches rather than crashing.
-#[cfg(test)]
+/// Per-text search helper. Wraps `grep-searcher` so the matching logic is
+/// identical to the file-walking engine (same regex, line numbers, trimming).
+/// Honours the three `SearchOpts` toggles. Used both by tests and by the
+/// dirty-aware worker to search unsaved in-memory buffers. Regex compilation
+/// failure for invalid patterns is silent: returns no matches.
 pub fn collect_matches_in_text(
     path: &Path,
     content: &str,
@@ -1453,6 +1509,53 @@ mod tests {
             }
         }
         (last_q, hits, saw_done)
+    }
+
+    #[test]
+    fn search_worker_loop_searches_dirty_buffer_and_skips_stale_disk_copy() {
+        // Disk holds the OLD name; the unsaved editor buffer holds the NEW
+        // name. Dirty-aware search must find the new name (from the buffer)
+        // and must NOT find the old name (the dirty file's stale disk copy is
+        // skipped). This is the VS Code / Zed behavior the reported bug lacked.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("a.txt");
+        write(&path, "oldname\n");
+        let (q_tx, q_rx) = std::sync::mpsc::channel::<SearchRequest>();
+        let (e_tx, e_rx) = std::sync::mpsc::channel::<SearchEvent>();
+        let root = tmp.path().to_path_buf();
+        let join = std::thread::spawn(move || search_worker_loop(root, q_rx, e_tx));
+
+        q_tx.send(SearchRequest::SetDirtyBuffers(vec![(
+            path.clone(),
+            "newname\n".into(),
+        )]))
+        .unwrap();
+
+        q_tx.send(SearchRequest::Query(
+            "newname".into(),
+            SearchOpts::default(),
+        ))
+        .unwrap();
+        let (_, hits, done) = collect_until_done(&e_rx, std::time::Duration::from_secs(2));
+        assert!(done);
+        assert_eq!(hits.len(), 1, "the unsaved buffer's new name must be found");
+        assert_eq!(hits[0].line_text, "newname");
+
+        q_tx.send(SearchRequest::Query(
+            "oldname".into(),
+            SearchOpts::default(),
+        ))
+        .unwrap();
+        let (_, stale, done2) = collect_until_done(&e_rx, std::time::Duration::from_secs(2));
+        assert!(done2);
+        assert_eq!(
+            stale.len(),
+            0,
+            "the stale on-disk copy of a dirty file must be skipped"
+        );
+
+        drop(q_tx);
+        join.join().unwrap();
     }
 
     #[test]
