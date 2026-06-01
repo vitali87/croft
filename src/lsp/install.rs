@@ -39,13 +39,11 @@ pub fn take_status() -> Option<String> {
 /// or `None` when `node` is already on croft's PATH (nothing to add) or none
 /// could be discovered. Cached: discovery runs at most once.
 ///
-/// Version managers (nvm, volta, …) keep node off croft's inherited PATH (they
-/// add it only when a shell sources its init files). croft is exec'd without a
-/// shell, so it discovers the directory by reading the well-known on-disk
-/// layouts directly. We deliberately do NOT spawn an interactive shell to probe
-/// for node: an interactive shell does terminal job control on croft's
-/// controlling tty (tcsetpgrp), which backgrounds croft and corrupts the
-/// terminal — so filesystem discovery is the only safe option here.
+/// Version managers (nvm, fnm, asdf, volta) keep node off croft's inherited
+/// PATH (they add it only when a shell sources its init files). croft is exec'd
+/// without a shell, so [`discover_node_dir`] finds it — first by reading the
+/// well-known on-disk layouts, then by asking the user's shell in a detached
+/// session that can't touch croft's terminal.
 pub(crate) fn node_path_prepend() -> Option<PathBuf> {
     static NODE_DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
     NODE_DIR
@@ -65,16 +63,96 @@ fn node_available() -> bool {
         || node_path_prepend().is_some()
 }
 
-/// Find a directory containing real `node` + `npm` binaries by inspecting the
-/// well-known version-manager and package-manager layouts. Filesystem-only, so
-/// it never touches croft's terminal.
+/// Find a directory containing real `node` + `npm` binaries.
+///
+/// Fast path first: read the well-known on-disk layouts (nvm versions dir,
+/// Volta, Homebrew) with no process spawn. Universal fallback: ask the user's
+/// own login+interactive shell where `node` resolves — detached from croft's
+/// controlling terminal so it can never do tty job control. The fallback is
+/// what makes fnm / asdf / volta-shim / custom setups work, not just the ones
+/// with a guessable directory.
 fn discover_node_dir() -> Option<PathBuf> {
     if let Some(dir) = nvm_node_dir() {
         return Some(dir);
     }
-    well_known_node_dirs()
+    if let Some(dir) = well_known_node_dirs()
         .into_iter()
         .find(|dir| dir.join("node").is_file() && dir.join("npm").exists())
+    {
+        return Some(dir);
+    }
+    detached_shell_node_dir()
+}
+
+/// Marker the probe wraps `process.execPath` in, so the real path is
+/// recoverable even if the user's shell init prints noise to stdout first.
+const NODE_PROBE_MARKER: &str = "__CROFT_NODE__";
+
+/// Ask the user's login+interactive shell where `node` lives, detached from
+/// croft's controlling terminal. Runs `node -e` (so it works whether `node` is
+/// a real binary or a version-manager shell function) and reports the absolute
+/// `process.execPath`. Returns its directory.
+///
+/// SAFETY / why detached: an interactive shell does terminal job control
+/// (`tcsetpgrp`) on its controlling tty. Sharing croft's tty would background
+/// croft and corrupt the terminal. `setsid` in `pre_exec` puts the child in a
+/// brand-new session with NO controlling terminal, so it physically cannot
+/// touch croft's tty; stdin is `/dev/null` and stdout is captured. A timeout
+/// guards against a pathological init file that never returns.
+fn detached_shell_node_dir() -> Option<PathBuf> {
+    use std::sync::mpsc;
+    use std::time::Duration;
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(run_detached_node_probe());
+    });
+    match rx.recv_timeout(Duration::from_secs(15)) {
+        Ok(result) => result,
+        Err(_) => {
+            log_file::log("lsp[vtsls] node shell-probe timed out");
+            None
+        }
+    }
+}
+
+fn run_detached_node_probe() -> Option<PathBuf> {
+    use std::os::unix::process::CommandExt;
+    use std::process::Stdio;
+
+    let shell = std::env::var_os("SHELL").unwrap_or_else(|| OsString::from("/bin/sh"));
+    let script =
+        format!("node -e 'process.stdout.write(\"{NODE_PROBE_MARKER}\"+process.execPath)'");
+    let mut cmd = Command::new(shell);
+    cmd.args(["-l", "-i", "-c", &script])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    // Detach from croft's controlling terminal before exec so the interactive
+    // shell's job control can never reach croft's tty.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    let out = cmd.output().ok()?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let path = parse_node_probe(&stdout)?;
+    let node = Path::new(path);
+    if !node.is_file() {
+        return None;
+    }
+    node.parent().map(Path::to_path_buf)
+}
+
+/// Recover the node path from probe stdout: the absolute path written right
+/// after the last marker. Returns `None` if the marker is absent (the probe
+/// didn't run node) or the text after it isn't an absolute path. Tolerates
+/// arbitrary shell-init noise printed before the marker.
+fn parse_node_probe(stdout: &str) -> Option<&str> {
+    let after = &stdout[stdout.rfind(NODE_PROBE_MARKER)? + NODE_PROBE_MARKER.len()..];
+    let path = after.trim();
+    (path.starts_with('/') && !path.is_empty()).then_some(path)
 }
 
 /// Highest installed nvm node's `bin` dir: `$NVM_DIR/versions/node/vX.Y.Z/bin`
@@ -324,6 +402,24 @@ mod tests {
     fn nvm_node_dir_is_none_when_no_versions_have_node() {
         let tmp = TempDir::new().unwrap();
         assert!(nvm_node_dir_in(tmp.path()).is_none());
+    }
+
+    #[test]
+    fn parse_node_probe_extracts_path_after_marker_ignoring_init_noise() {
+        // Shell init may print noise before the marker; the path is what
+        // follows the last marker.
+        let stdout = "Welcome to your shell!\nnvm loaded\n__CROFT_NODE__/Users/x/.nvm/versions/node/v23.7.0/bin/node";
+        assert_eq!(
+            parse_node_probe(stdout),
+            Some("/Users/x/.nvm/versions/node/v23.7.0/bin/node")
+        );
+    }
+
+    #[test]
+    fn parse_node_probe_rejects_missing_marker_or_non_absolute() {
+        assert_eq!(parse_node_probe("no marker here"), None);
+        assert_eq!(parse_node_probe("__CROFT_NODE__"), None);
+        assert_eq!(parse_node_probe("__CROFT_NODE__relative/path"), None);
     }
 
     #[test]

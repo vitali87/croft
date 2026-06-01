@@ -454,7 +454,7 @@ dependencies = [
 
 [[package]]
 name = "croft"
-version = "0.1.264"
+version = "0.1.265"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -471,6 +471,7 @@ dependencies = [
  "grep-searcher",
  "ignore",
  "image",
+ "libc",
  "lsp-types",
  "notify",
  "notify-debouncer-full",

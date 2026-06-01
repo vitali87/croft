@@ -1,6 +1,6 @@
 [package]
 name = "croft"
-version = "0.1.264"
+version = "0.1.265"
 edition = "2024"
 description = "VSCode-style TUI written in Rust"
 license = "MIT"
@@ -13,6 +13,9 @@ path = "src/main.rs"
 
 # Versions verified against crates.io max_stable_version on 2026-05-02.
 [dependencies]
+# Unix process control: `setsid` to detach a probe subprocess from croft's
+# controlling terminal so it can never hijack the tty (see lsp/install.rs).
+libc = "0.2"
 ratatui = "0.30"
 crossterm = { version = "0.29", features = ["event-stream"] }
 portable-pty = "0.9"
