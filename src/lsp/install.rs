@@ -35,6 +35,17 @@ pub fn take_status() -> Option<String> {
     STATUS.lock().ok().and_then(|mut g| g.take())
 }
 
+/// Set when a managed install finishes successfully. The app consumes this to
+/// re-open its TypeScript documents to the LSP, which makes the manager
+/// re-probe and spawn the freshly-installed server without waiting for the
+/// user's next action ("installed" should mean "now working").
+static JUST_INSTALLED: AtomicBool = AtomicBool::new(false);
+
+/// One-shot: true exactly once after a successful managed install.
+pub fn take_just_installed() -> bool {
+    JUST_INSTALLED.swap(false, Ordering::SeqCst)
+}
+
 /// A directory to PREPEND to PATH so a non-shell `exec` can find `node`/`npm`,
 /// or `None` when `node` is already on croft's PATH (nothing to add) or none
 /// could be discovered. Cached: discovery runs at most once.
@@ -331,6 +342,7 @@ pub fn ensure_vtsls_in_background() {
         {
             Ok(out) if out.status.success() => {
                 log_file::log("lsp[vtsls] managed install complete");
+                JUST_INSTALLED.store(true, Ordering::SeqCst);
                 set_status("TypeScript server installed");
             }
             Ok(out) => {

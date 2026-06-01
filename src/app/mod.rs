@@ -10811,6 +10811,21 @@ fn is_rename_symbol_key(key: KeyEvent) -> bool {
         && !key.modifiers.contains(KeyModifiers::ALT)
 }
 
+/// True for `.ts`/`.tsx`/`.js`/`.jsx` paths — the languages served by the
+/// croft-managed vtsls, used to re-open just those docs after vtsls installs.
+fn is_typescript_family(path: &Path) -> bool {
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    matches!(
+        crate::lsp::Language::from_extension(ext),
+        Some(
+            crate::lsp::Language::TypeScript
+                | crate::lsp::Language::Tsx
+                | crate::lsp::Language::JavaScript
+                | crate::lsp::Language::Jsx
+        )
+    )
+}
+
 /// Editor-pane Change All Occurrences: `Cmd+F2` (macOS) or `Ctrl+F2` (Linux),
 /// matching VS Code on each platform so local and remote behave identically.
 /// iTerm2 may deliver Cmd folded onto the Meta/ALT bit (the same reason
@@ -12075,6 +12090,14 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             }
             None => false,
         };
+        // When the managed install finishes, forget the LSP sync state for the
+        // TypeScript-family docs so the next `sync_lsp` re-opens them. That
+        // re-open makes the manager re-probe and spawn the just-installed
+        // server, so "installed" becomes "working" without a further action.
+        if crate::lsp::install::take_just_installed() {
+            app.lsp_last_seen
+                .retain(|path, _| !is_typescript_family(path));
+        }
 
         let non_pty_dirty = needs_redraw
             || fs_changed
