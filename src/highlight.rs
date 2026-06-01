@@ -98,6 +98,7 @@ pub enum LangKind {
     Html,
     Css,
     Bash,
+    C,
     Cpp,
 }
 
@@ -116,6 +117,7 @@ pub fn lang_for_extension(ext: &str) -> Option<LangKind> {
         "html" | "htm" => LangKind::Html,
         "css" | "scss" | "sass" => LangKind::Css,
         "sh" | "bash" | "zsh" => LangKind::Bash,
+        "c" | "h" => LangKind::C,
         "cpp" | "cc" | "cxx" | "c++" | "C" | "hpp" | "hxx" | "h++" => LangKind::Cpp,
         _ => return None,
     })
@@ -260,6 +262,14 @@ fn build_config(kind: LangKind) -> Option<HighlightConfiguration> {
             "",
         )
         .ok()?,
+        LangKind::C => HighlightConfiguration::new(
+            tree_sitter_c::LANGUAGE.into(),
+            "c",
+            tree_sitter_c::HIGHLIGHT_QUERY,
+            "",
+            "",
+        )
+        .ok()?,
         LangKind::Cpp => HighlightConfiguration::new(
             tree_sitter_cpp::LANGUAGE.into(),
             "cpp",
@@ -398,6 +408,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn highlight_c_produces_spans() {
+        let mut reg = LangRegistry::new();
+        let src = "int main() {\n    return 0;\n}\n";
+        let line_starts = compute_line_starts(src.as_bytes());
+        let h = highlight_text(&mut reg, LangKind::C, src.as_bytes(), &line_starts);
+        assert!(!h[0].is_empty(), "line 0 of C source should have highlight spans");
+    }
+
+    #[test]
     fn highlight_cpp_produces_spans() {
         let mut reg = LangRegistry::new();
         let src = "int main() {\n    return 0;\n}\n";
@@ -425,6 +444,8 @@ mod tests {
         assert_eq!(lang_for_extension("css"), Some(LangKind::Css));
         assert_eq!(lang_for_extension("scss"), Some(LangKind::Css));
         assert_eq!(lang_for_extension("sh"), Some(LangKind::Bash));
+        assert_eq!(lang_for_extension("c"), Some(LangKind::C));
+        assert_eq!(lang_for_extension("h"), Some(LangKind::C));
         assert_eq!(lang_for_extension("cpp"), Some(LangKind::Cpp));
         assert_eq!(lang_for_extension("cc"), Some(LangKind::Cpp));
         assert_eq!(lang_for_extension("cxx"), Some(LangKind::Cpp));
