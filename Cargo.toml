@@ -73,6 +73,7 @@ rayon = "1.12"
 # Cross-platform system metrics for the sidebar SYSTEM panel. Sampled on
 # a dedicated thread once per second; never touched on the render path.
 sysinfo = { version = "0.38", default-features = false, features = ["system", "disk", "network", "component"] }
+tree-sitter-cpp = "0.23.4"
 
 [dev-dependencies]
 tempfile = "3.27"

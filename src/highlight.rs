@@ -98,6 +98,7 @@ pub enum LangKind {
     Html,
     Css,
     Bash,
+    Cpp,
 }
 
 pub fn lang_for_extension(ext: &str) -> Option<LangKind> {
@@ -115,6 +116,7 @@ pub fn lang_for_extension(ext: &str) -> Option<LangKind> {
         "html" | "htm" => LangKind::Html,
         "css" | "scss" | "sass" => LangKind::Css,
         "sh" | "bash" | "zsh" => LangKind::Bash,
+        "cpp" | "cc" | "cxx" | "c++" | "C" | "hpp" | "hxx" | "h++" => LangKind::Cpp,
         _ => return None,
     })
 }
@@ -258,6 +260,14 @@ fn build_config(kind: LangKind) -> Option<HighlightConfiguration> {
             "",
         )
         .ok()?,
+        LangKind::Cpp => HighlightConfiguration::new(
+            tree_sitter_cpp::LANGUAGE.into(),
+            "cpp",
+            tree_sitter_cpp::HIGHLIGHT_QUERY,
+            "",
+            "",
+        )
+        .ok()?,
     };
     cfg.configure(HIGHLIGHT_NAMES);
     Some(cfg)
@@ -388,6 +398,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn highlight_cpp_produces_spans() {
+        let mut reg = LangRegistry::new();
+        let src = "int main() {\n    return 0;\n}\n";
+        let line_starts = compute_line_starts(src.as_bytes());
+        let h = highlight_text(&mut reg, LangKind::Cpp, src.as_bytes(), &line_starts);
+        assert!(!h[0].is_empty(), "line 0 of C++ source should have highlight spans");
+    }
+
+    #[test]
     fn lang_for_extension_known() {
         assert_eq!(lang_for_extension("rs"), Some(LangKind::Rust));
         assert_eq!(lang_for_extension("py"), Some(LangKind::Python));
@@ -406,6 +425,11 @@ mod tests {
         assert_eq!(lang_for_extension("css"), Some(LangKind::Css));
         assert_eq!(lang_for_extension("scss"), Some(LangKind::Css));
         assert_eq!(lang_for_extension("sh"), Some(LangKind::Bash));
+        assert_eq!(lang_for_extension("cpp"), Some(LangKind::Cpp));
+        assert_eq!(lang_for_extension("cc"), Some(LangKind::Cpp));
+        assert_eq!(lang_for_extension("cxx"), Some(LangKind::Cpp));
+        assert_eq!(lang_for_extension("hpp"), Some(LangKind::Cpp));
+        assert_eq!(lang_for_extension("hxx"), Some(LangKind::Cpp));
     }
 
     #[test]
