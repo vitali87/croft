@@ -3956,6 +3956,15 @@ impl App {
             self.handle_menu_key(key);
             return Ok(());
         }
+        // Cmd+E toggles native modal (vim) editing. Global (above the focus
+        // dispatch) so it works from any pane and even with no file open: the
+        // mode is a single app-wide flag that only affects the editor, but it
+        // can be pre-armed from the tree or terminal and stays on as you open
+        // and switch between files.
+        if is_vim_toggle_key(key) {
+            self.toggle_vim_mode();
+            return Ok(());
+        }
         // App-wide shortcuts (priority). Skip Cmd+S when the Source
         // Control pane is focused so the SC handler can use it as the
         // stage shortcut — saving an editor file with no editor focus
@@ -5354,6 +5363,21 @@ impl App {
         }
     }
 
+    /// Flip native modal (vim) editing on or off. Driven by the global Cmd+E
+    /// shortcut, so it can fire from any pane. Turning it off also dismisses
+    /// any lingering `/` `?` search-match highlights, since the modal layer is
+    /// the only place that clears them.
+    fn toggle_vim_mode(&mut self) {
+        self.vim.toggle();
+        if self.vim.enabled {
+            self.status = String::from("vim mode on");
+        } else {
+            self.editor
+                .set_search_highlight(None, crate::widgets::search::SearchOpts::default());
+            self.status = String::from("vim mode off");
+        }
+    }
+
     fn handle_editor_key(&mut self, key: KeyEvent) {
         // Inline find bar (Cmd+F / Ctrl+F) eats every key while open.
         if self.editor_find.is_some() {
@@ -5414,20 +5438,6 @@ impl App {
                     }
                 }
             }
-            return;
-        }
-        if is_vim_toggle_key(key) {
-            self.vim.toggle();
-            self.status = if self.vim.enabled {
-                String::from("vim mode on")
-            } else {
-                // Turning modal editing off dismisses any vim search match
-                // highlights; the `/` `?` flow has no other clear gesture, so
-                // the toggle is the way out.
-                self.editor
-                    .set_search_highlight(None, crate::widgets::search::SearchOpts::default());
-                String::from("vim mode off")
-            };
             return;
         }
         // When modal editing is on it fully owns the editor pane and the

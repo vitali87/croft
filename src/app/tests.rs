@@ -9192,6 +9192,26 @@ fn vim_gg_and_capital_g_jump_between_ends() {
 }
 
 #[test]
+fn vim_toggle_works_from_any_pane_even_with_no_editor_focus() {
+    let (mut app, _t) = vim_app("abc");
+    app.vim.enabled = false;
+    // Focus the file tree, not the editor.
+    app.focus = Pane::Tree;
+    app.handle_key(key(KeyCode::Char('e'), KeyModifiers::SUPER))
+        .unwrap();
+    assert!(
+        app.vim.enabled,
+        "Cmd+E must toggle vim mode globally, from any pane, so it can be pre-armed before opening or focusing a file"
+    );
+    app.handle_key(key(KeyCode::Char('e'), KeyModifiers::SUPER))
+        .unwrap();
+    assert!(
+        !app.vim.enabled,
+        "a second Cmd+E from the tree toggles it back off"
+    );
+}
+
+#[test]
 fn vim_toggle_off_clears_search_highlights() {
     let (mut app, _t) = vim_app("x needle y needle z");
     vim_feed(&mut app, '/');
