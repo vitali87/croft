@@ -328,11 +328,16 @@ impl WorkerState {
             let configs: Vec<ServerConfig> = self.registry.for_language(lang).to_vec();
             let mut spawned: Vec<ManagedClient> = Vec::new();
             for config in configs.iter() {
-                let Some(config) = resolve_config(config, first_attempt) else {
+                let Some((config, extra_path)) = resolve_config(config, first_attempt) else {
                     continue;
                 };
-                match LspClient::spawn(&config, &self.workspace_root, build_client_capabilities())
-                    .await
+                match LspClient::spawn(
+                    &config,
+                    &self.workspace_root,
+                    build_client_capabilities(),
+                    &extra_path,
+                )
+                .await
                 {
                     Ok(client) => {
                         let supports = client.capabilities().completion_provider.is_some();
@@ -907,12 +912,18 @@ fn path_to_language(path: &Path) -> Option<Language> {
 /// against `~/.croft/servers` rather than PATH. Every other server is resolved
 /// against PATH unchanged. `log_skip` gates the "not available" log so empty
 /// re-probes don't spam the log on every request.
-fn resolve_config(config: &ServerConfig, log_skip: bool) -> Option<ServerConfig> {
+fn resolve_config(config: &ServerConfig, log_skip: bool) -> Option<(ServerConfig, Vec<PathBuf>)> {
     if config.name == crate::lsp::install::VTSLS_SERVER_NAME {
         if let Some(command) = crate::lsp::install::vtsls_command() {
             let mut resolved = config.clone();
             resolved.command = command;
-            return Some(resolved);
+            // vtsls is a Node script; its `env node` shebang needs node on the
+            // spawned process's PATH, which (for version managers) means the
+            // discovered node dir, not croft's inherited PATH.
+            let extra: Vec<PathBuf> = crate::lsp::install::node_path_prepend()
+                .into_iter()
+                .collect();
+            return Some((resolved, extra));
         }
         // Not installed yet: start the one-shot managed install. This open
         // skips TS LSP; a later request re-probes once the install lands.
@@ -923,7 +934,7 @@ fn resolve_config(config: &ServerConfig, log_skip: bool) -> Option<ServerConfig>
         return None;
     }
     if is_on_path(&config.command) {
-        return Some(config.clone());
+        return Some((config.clone(), Vec::new()));
     }
     if log_skip {
         log_file::log(&format!(

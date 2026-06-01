@@ -25,7 +25,7 @@ Built on [ratatui](https://ratatui.rs/) + [crossterm](https://github.com/crosste
 | A 256 color or truecolor terminal | macOS Terminal.app, iTerm2, Alacritty, kitty, WezTerm, Ghostty all qualify. |
 | iTerm2, WezTerm, Ghostty, or kitty (optional) | Required for inline image / PDF / sheet preview rendering via OSC 1337. Other terminals fall back to a metadata header line so the feature is still informative. |
 | `pdftoppm` from poppler-utils (optional) | Multi-page PDF preview. Install with `brew install poppler` (macOS) or `apt install poppler-utils` (Linux). Without it, croft falls back to macOS `sips` for page 1 only. |
-| Node.js + npm (optional) | TypeScript / JavaScript LSP. croft auto-installs the `vtsls` server into `~/.croft/servers` the first time you open a `.ts`/`.tsx`/`.js` file (node is also needed to run it). Other language servers (`basedpyright`, `ruff`, `ty`, `rust-analyzer`, `gopls`) are used from your PATH if present. |
+| Node.js + npm (optional) | TypeScript / JavaScript LSP. croft auto-installs the `vtsls` server into `~/.croft/servers` the first time you open a `.ts`/`.tsx`/`.js` file. Version managers work out of the box: croft asks your login shell where `node` lives (`process.execPath`), so nvm / fnm / asdf / volta node is found even though it isn't on croft's own PATH, and used for both the install and running the server. Other language servers (`basedpyright`, `ruff`, `ty`, `rust-analyzer`, `gopls`) are used from your PATH if present. |
 
 ### Install Rust
 

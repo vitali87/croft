@@ -12066,6 +12066,15 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let definition_changed = app.drain_lsp_definition();
         let rename_changed = app.drain_lsp_rename();
         let sysmon_changed = app.drain_sysmon();
+        // Surface the managed TypeScript-server install progress in the status
+        // bar so the background work (which can take a few seconds) is visible.
+        let install_status_changed = match crate::lsp::install::take_status() {
+            Some(msg) => {
+                app.status = msg;
+                true
+            }
+            None => false,
+        };
 
         let non_pty_dirty = needs_redraw
             || fs_changed
@@ -12082,6 +12091,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             || hover_changed
             || definition_changed
             || rename_changed
+            || install_status_changed
             || sysmon_changed;
         let pty_eligible = pty_pending
             && (app.peek_terminals_pending_bytes() <= PTY_SMALL_UPDATE_BYTES

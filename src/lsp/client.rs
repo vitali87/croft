@@ -96,6 +96,7 @@ impl LspClient {
         config: &ServerConfig,
         workspace_root: &Path,
         client_capabilities: ClientCapabilities,
+        extra_path: &[std::path::PathBuf],
     ) -> Result<Self> {
         let workspace_uri = Url::from_file_path(workspace_root).map_err(|_| {
             anyhow!(
@@ -108,9 +109,14 @@ impl LspClient {
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| "root".to_string());
 
-        let mut child = Command::new(&config.command)
-            .args(&config.args)
-            .current_dir(workspace_root)
+        let mut command = Command::new(&config.command);
+        command.args(&config.args).current_dir(workspace_root);
+        // Version-manager node dirs aren't on croft's inherited PATH; prepend
+        // them so a server like vtsls can find `node` for its shebang.
+        if !extra_path.is_empty() {
+            command.env("PATH", crate::lsp::install::prepend_paths(extra_path));
+        }
+        let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -399,7 +405,8 @@ mod tests {
         let display_name = config.name;
 
         let result: Result<()> = rt.handle().block_on(async move {
-            let client = LspClient::spawn(&config, &root, ClientCapabilities::default()).await?;
+            let client =
+                LspClient::spawn(&config, &root, ClientCapabilities::default(), &[]).await?;
             assert_eq!(client.name(), expected_name);
             client.shutdown().await
         });
