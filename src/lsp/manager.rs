@@ -314,18 +314,24 @@ async fn worker_loop(
 
 impl WorkerState {
     async fn ensure_clients(&mut self, lang: Language) -> &[ManagedClient] {
-        if !self.clients.contains_key(&lang) {
+        // Re-probe when the cached list is empty: a server (e.g. the managed
+        // vtsls) may have finished its background install since the first
+        // attempt, so this is how TS LSP comes alive without a relaunch.
+        // A non-empty list is stable and never re-probed.
+        let first_attempt = !self.clients.contains_key(&lang);
+        let should_try = first_attempt
+            || self
+                .clients
+                .get(&lang)
+                .is_some_and(|clients| clients.is_empty());
+        if should_try {
             let configs: Vec<ServerConfig> = self.registry.for_language(lang).to_vec();
             let mut spawned: Vec<ManagedClient> = Vec::new();
             for config in configs.iter() {
-                if !is_on_path(&config.command) {
-                    log_file::log(&format!(
-                        "lsp[{}] skip: `{}` not on PATH",
-                        config.name, config.command
-                    ));
+                let Some(config) = resolve_config(config, first_attempt) else {
                     continue;
-                }
-                match LspClient::spawn(config, &self.workspace_root, build_client_capabilities())
+                };
+                match LspClient::spawn(&config, &self.workspace_root, build_client_capabilities())
                     .await
                 {
                     Ok(client) => {
@@ -447,6 +453,10 @@ impl WorkerState {
             return;
         };
         let lang = doc.language;
+        // Re-probe so a server installed since the file was opened (e.g. the
+        // managed vtsls finishing its lazy background install) is picked up
+        // without reopening the file. Cheap once the list is non-empty.
+        self.ensure_clients(lang).await;
         let Some(clients) = self.clients.get(&lang) else {
             return;
         };
@@ -533,6 +543,10 @@ impl WorkerState {
             return;
         };
         let lang = doc.language;
+        // Re-probe so a server installed since the file was opened (e.g. the
+        // managed vtsls finishing its lazy background install) is picked up
+        // without reopening the file. Cheap once the list is non-empty.
+        self.ensure_clients(lang).await;
         let Some(clients) = self.clients.get(&lang) else {
             return;
         };
@@ -593,6 +607,10 @@ impl WorkerState {
             return;
         };
         let lang = doc.language;
+        // Re-probe so a server installed since the file was opened (e.g. the
+        // managed vtsls finishing its lazy background install) is picked up
+        // without reopening the file. Cheap once the list is non-empty.
+        self.ensure_clients(lang).await;
         let Some(clients) = self.clients.get(&lang) else {
             return;
         };
@@ -654,6 +672,10 @@ impl WorkerState {
             return;
         };
         let lang = doc.language;
+        // Re-probe so a server installed since the file was opened (e.g. the
+        // managed vtsls finishing its lazy background install) is picked up
+        // without reopening the file. Cheap once the list is non-empty.
+        self.ensure_clients(lang).await;
         let Some(clients) = self.clients.get(&lang) else {
             return;
         };
@@ -879,7 +901,40 @@ fn path_to_language(path: &Path) -> Option<Language> {
 /// are JSON-RPC daemons with no consistent CLI flags (basedpyright-
 /// langserver exits 1 on --help and crashes on --version, rustup shims
 /// pretend to exist even when their component isn't installed).
-fn is_on_path(cmd: &str) -> bool {
+/// Resolve a server config to a spawnable command, or `None` to skip it.
+/// `vtsls` is provisioned by croft's managed installer (absolute path; a lazy
+/// background install is kicked off when it's absent), so it is resolved
+/// against `~/.croft/servers` rather than PATH. Every other server is resolved
+/// against PATH unchanged. `log_skip` gates the "not available" log so empty
+/// re-probes don't spam the log on every request.
+fn resolve_config(config: &ServerConfig, log_skip: bool) -> Option<ServerConfig> {
+    if config.name == crate::lsp::install::VTSLS_SERVER_NAME {
+        if let Some(command) = crate::lsp::install::vtsls_command() {
+            let mut resolved = config.clone();
+            resolved.command = command;
+            return Some(resolved);
+        }
+        // Not installed yet: start the one-shot managed install. This open
+        // skips TS LSP; a later request re-probes once the install lands.
+        crate::lsp::install::ensure_vtsls_in_background();
+        if log_skip {
+            log_file::log("lsp[vtsls] not installed; starting croft-managed install");
+        }
+        return None;
+    }
+    if is_on_path(&config.command) {
+        return Some(config.clone());
+    }
+    if log_skip {
+        log_file::log(&format!(
+            "lsp[{}] skip: `{}` not on PATH",
+            config.name, config.command
+        ));
+    }
+    None
+}
+
+pub(crate) fn is_on_path(cmd: &str) -> bool {
     let Some(path) = std::env::var_os("PATH") else {
         return false;
     };
@@ -917,6 +972,30 @@ mod tests {
             character: ch,
         };
         lsp_types::Range { start: p, end: p }
+    }
+
+    #[test]
+    fn resolve_config_skips_a_server_not_on_path_and_keeps_one_that_is() {
+        let absent = ServerConfig {
+            name: "fake",
+            command: "definitely-not-a-real-binary-zzzqqq".into(),
+            args: vec![],
+            language: Language::Go,
+        };
+        assert!(
+            resolve_config(&absent, false).is_none(),
+            "a server whose command isn't on PATH must be skipped"
+        );
+        let present = ServerConfig {
+            name: "shell",
+            command: "sh".into(),
+            args: vec![],
+            language: Language::Bash,
+        };
+        assert!(
+            resolve_config(&present, false).is_some(),
+            "a server whose command is on PATH must resolve"
+        );
     }
 
     #[test]

@@ -25,6 +25,7 @@ Built on [ratatui](https://ratatui.rs/) + [crossterm](https://github.com/crosste
 | A 256 color or truecolor terminal | macOS Terminal.app, iTerm2, Alacritty, kitty, WezTerm, Ghostty all qualify. |
 | iTerm2, WezTerm, Ghostty, or kitty (optional) | Required for inline image / PDF / sheet preview rendering via OSC 1337. Other terminals fall back to a metadata header line so the feature is still informative. |
 | `pdftoppm` from poppler-utils (optional) | Multi-page PDF preview. Install with `brew install poppler` (macOS) or `apt install poppler-utils` (Linux). Without it, croft falls back to macOS `sips` for page 1 only. |
+| Node.js + npm (optional) | TypeScript / JavaScript LSP. croft auto-installs the `vtsls` server into `~/.croft/servers` the first time you open a `.ts`/`.tsx`/`.js` file (node is also needed to run it). Other language servers (`basedpyright`, `ruff`, `ty`, `rust-analyzer`, `gopls`) are used from your PATH if present. |
 
 ### Install Rust
 
@@ -351,7 +352,8 @@ src/
 ├── lsp/                 LSP client stack
 │   ├── mod.rs
 │   ├── client.rs        async-lsp client wrapper with router for unhandled notifications
-│   ├── config.rs        per-language LSP config (basedpyright, ruff, ty, rust-analyzer)
+│   ├── config.rs        per-language LSP config (basedpyright, ruff, ty, vtsls, rust-analyzer, gopls)
+│   ├── install.rs       croft-managed TypeScript server: lazy background install of vtsls into ~/.croft/servers
 │   ├── log_file.rs      LSP stderr / debug log sink at ~/.croft/lsp.log
 │   ├── manager.rs       lifecycle: spawn / did_open / did_change / completion / shutdown
 │   ├── registry.rs      language detection from file extension and shebang

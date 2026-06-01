@@ -104,8 +104,8 @@ impl ServerConfig {
 
     pub fn vtsls() -> Self {
         Self {
-            name: "vtsls",
-            command: "vtsls".into(),
+            name: crate::lsp::install::VTSLS_SERVER_NAME,
+            command: crate::lsp::install::VTSLS_SERVER_NAME.into(),
             args: vec!["--stdio".into()],
             language: Language::TypeScript,
         }
