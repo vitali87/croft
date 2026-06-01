@@ -9161,6 +9161,28 @@ fn vim_search_moves_cursor_to_match() {
 }
 
 #[test]
+fn update_spinner_frame_cycles_through_all_frames_and_wraps() {
+    // Frame 0 at the start, advances one frame per UPDATE_SPINNER_FRAME_MS.
+    assert_eq!(update_spinner_frame(0), UPDATE_SPINNER_FRAMES[0]);
+    assert_eq!(
+        update_spinner_frame(UPDATE_SPINNER_FRAME_MS),
+        UPDATE_SPINNER_FRAMES[1]
+    );
+    assert_eq!(
+        update_spinner_frame(UPDATE_SPINNER_FRAME_MS * 5 + 50),
+        UPDATE_SPINNER_FRAMES[5],
+        "mid-frame elapsed still maps to the floor frame"
+    );
+    // Wraps back to frame 0 after a full cycle of all six frames.
+    let cycle = UPDATE_SPINNER_FRAME_MS * UPDATE_SPINNER_FRAMES.len() as u128;
+    assert_eq!(update_spinner_frame(cycle), UPDATE_SPINNER_FRAMES[0]);
+    assert_eq!(
+        update_spinner_frame(cycle + UPDATE_SPINNER_FRAME_MS),
+        UPDATE_SPINNER_FRAMES[1]
+    );
+}
+
+#[test]
 fn vim_search_records_active_match_and_advances_with_n() {
     // Two matches on one line: "x needle y needle z" -> cols 2 and 11.
     let (mut app, _t) = vim_app("x needle y needle z");

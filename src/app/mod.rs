@@ -257,6 +257,22 @@ enum UpdateStatus {
     Ready,
 }
 
+/// Rotating-arc frames for the in-progress update glyph. Cycled to read as a
+/// spinning circular arrow, the universal "working" indicator.
+const UPDATE_SPINNER_FRAMES: [&str; 6] = [
+    "\u{25DC}", "\u{25E0}", "\u{25DD}", "\u{25DE}", "\u{25E1}", "\u{25DF}",
+];
+/// Milliseconds each spinner frame is held; ~10 frames/second reads as smooth
+/// motion while keeping the status-bar-only redraws light over SSH.
+const UPDATE_SPINNER_FRAME_MS: u128 = 100;
+
+/// Pick the spinner frame for a given elapsed time. Pure so the wrap-around
+/// is unit-testable without a clock.
+fn update_spinner_frame(elapsed_ms: u128) -> &'static str {
+    let n = UPDATE_SPINNER_FRAMES.len() as u128;
+    UPDATE_SPINNER_FRAMES[((elapsed_ms / UPDATE_SPINNER_FRAME_MS) % n) as usize]
+}
+
 #[derive(Clone, PartialEq, Eq, Debug)]
 enum MenuAction {
     Create(CreateKind),
@@ -753,6 +769,10 @@ pub struct App {
     /// binary, so the running croft can re-exec into it in place.
     update_watch: Option<crate::update_watch::UpdateWatch>,
     update_status: UpdateStatus,
+    /// When a background self-update is in progress, the instant it started.
+    /// Drives the spinning update glyph in the status bar (and the redraw
+    /// cadence that animates it). `None` whenever no update is running.
+    update_spinner_start: Option<std::time::Instant>,
     /// Set when an update landed and croft should re-exec after the main
     /// loop unwinds and the alt-screen is surrendered. Read by `run`.
     pending_reexec: bool,
@@ -1267,6 +1287,7 @@ impl App {
             install_session: None,
             update_watch: None,
             update_status: UpdateStatus::Idle,
+            update_spinner_start: None,
             pending_reexec: false,
             overlays: {
                 let mut overlays = OverlayManager::default();
@@ -3408,6 +3429,19 @@ impl App {
                     .add_modifier(Modifier::BOLD),
             ));
         }
+        if self.update_status == UpdateStatus::InProgress {
+            // Red + a spinning circular-arrow glyph to draw the eye to the
+            // in-progress background update.
+            spans.push(Span::styled(
+                format!(
+                    " {} Updating croft in the background ",
+                    self.update_spinner_glyph()
+                ),
+                Style::default()
+                    .fg(Color::Rgb(0xff, 0x45, 0x4d))
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
         if self.vim.enabled {
             let (text, bg) = match self.vim.command_line() {
                 Some(cmd) => (format!(" {cmd} "), Color::Rgb(0x33, 0x33, 0x33)),
@@ -4936,14 +4970,19 @@ impl App {
             match ev {
                 crate::update_watch::UpdateEvent::InProgress => {
                     self.update_status = UpdateStatus::InProgress;
-                    self.status = String::from("Updating croft in the background…");
+                    // The dedicated red, spinning status-bar span renders the
+                    // message now, so the generic status line stays clear.
+                    self.update_spinner_start = Some(std::time::Instant::now());
+                    self.status.clear();
                 }
                 crate::update_watch::UpdateEvent::Failed => {
                     self.update_status = UpdateStatus::Idle;
+                    self.update_spinner_start = None;
                     self.status =
                         String::from("Background croft update failed; staying on current version");
                 }
                 crate::update_watch::UpdateEvent::Ready => {
+                    self.update_spinner_start = None;
                     // Do NOT yank the user mid-work: surface a persistent
                     // "Update ready - F9 to relaunch" prompt in the status
                     // bar and let them pick the moment. The re-exec only
@@ -4956,6 +4995,24 @@ impl App {
             }
         }
         changed
+    }
+
+    /// Current spinner glyph for an in-progress update (frame 0 when idle).
+    fn update_spinner_glyph(&self) -> &'static str {
+        match self.update_spinner_start {
+            Some(t) => update_spinner_frame(t.elapsed().as_millis()),
+            None => UPDATE_SPINNER_FRAMES[0],
+        }
+    }
+
+    /// Monotonic spinner phase the main loop watches to force a redraw each
+    /// time the glyph should advance. Stays `0` whenever no update is running,
+    /// so it never wakes the renderer outside an active update.
+    fn update_spinner_phase(&self) -> u128 {
+        match self.update_spinner_start {
+            Some(t) => t.elapsed().as_millis() / UPDATE_SPINNER_FRAME_MS,
+            None => 0,
+        }
     }
 
     pub fn capture_session_state(&self) -> crate::session_state::SessionState {
@@ -11509,6 +11566,9 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
     // before the first event arrives or any timer fires.
     let mut needs_redraw = true;
     let mut last_blink_visible = app.cursor_visible_phase();
+    // Advances every UPDATE_SPINNER_FRAME_MS while a background update runs;
+    // forces a status-bar redraw so the spinner animates. Constant otherwise.
+    let mut last_spinner_phase = app.update_spinner_phase();
     // Frame-rate accounting for the F8 HUD: count draws over a rolling 1s
     // window so a high idle FPS (always-dirty redraw loop saturating the
     // SSH link) is visible at a glance.
@@ -11577,6 +11637,8 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let pty_pending = app.peek_terminals_dirty();
         let blink_visible = app.cursor_visible_phase();
         let blink_changed = blink_visible != last_blink_visible;
+        let spinner_phase = app.update_spinner_phase();
+        let spinner_changed = spinner_phase != last_spinner_phase;
         let commits_changed = app.drain_recent_commits();
         let search_changed = app.drain_search_results();
         let remote_changed = app.refresh_remote_if_config_changed();
@@ -11594,6 +11656,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let non_pty_dirty = needs_redraw
             || fs_changed
             || blink_changed
+            || spinner_changed
             || commits_changed
             || search_changed
             || remote_changed
@@ -11756,6 +11819,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             }
             needs_redraw = false;
             last_blink_visible = blink_visible;
+            last_spinner_phase = spinner_phase;
         }
 
         // 8 ms (~125 Hz) keeps echo lag tight when the embedded pty is the
