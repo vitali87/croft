@@ -413,7 +413,10 @@ mod tests {
         let src = "int main() {\n    return 0;\n}\n";
         let line_starts = compute_line_starts(src.as_bytes());
         let h = highlight_text(&mut reg, LangKind::C, src.as_bytes(), &line_starts);
-        assert!(!h[0].is_empty(), "line 0 of C source should have highlight spans");
+        assert!(
+            !h[0].is_empty(),
+            "line 0 of C source should have highlight spans"
+        );
     }
 
     #[test]
@@ -422,7 +425,10 @@ mod tests {
         let src = "int main() {\n    return 0;\n}\n";
         let line_starts = compute_line_starts(src.as_bytes());
         let h = highlight_text(&mut reg, LangKind::Cpp, src.as_bytes(), &line_starts);
-        assert!(!h[0].is_empty(), "line 0 of C++ source should have highlight spans");
+        assert!(
+            !h[0].is_empty(),
+            "line 0 of C++ source should have highlight spans"
+        );
     }
 
     #[test]
