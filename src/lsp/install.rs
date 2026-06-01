@@ -37,12 +37,15 @@ pub fn take_status() -> Option<String> {
 
 /// A directory to PREPEND to PATH so a non-shell `exec` can find `node`/`npm`,
 /// or `None` when `node` is already on croft's PATH (nothing to add) or none
-/// could be discovered. Cached: the login-shell probe runs at most once.
+/// could be discovered. Cached: discovery runs at most once.
 ///
-/// Version managers (nvm, fnm, asdf, volta) expose `node`/`npm` as shell
-/// functions that only put the real binaries on PATH after a shell sources its
-/// init files. croft is exec'd without a shell, so it asks the user's own
-/// login+interactive shell where `node` resolves and reuses that directory.
+/// Version managers (nvm, volta, …) keep node off croft's inherited PATH (they
+/// add it only when a shell sources its init files). croft is exec'd without a
+/// shell, so it discovers the directory by reading the well-known on-disk
+/// layouts directly. We deliberately do NOT spawn an interactive shell to probe
+/// for node: an interactive shell does terminal job control on croft's
+/// controlling tty (tcsetpgrp), which backgrounds croft and corrupts the
+/// terminal — so filesystem discovery is the only safe option here.
 pub(crate) fn node_path_prepend() -> Option<PathBuf> {
     static NODE_DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
     NODE_DIR
@@ -50,7 +53,7 @@ pub(crate) fn node_path_prepend() -> Option<PathBuf> {
             if crate::lsp::manager::is_on_path("node") && crate::lsp::manager::is_on_path("npm") {
                 return None;
             }
-            login_shell_node_dir()
+            discover_node_dir()
         })
         .clone()
 }
@@ -62,40 +65,69 @@ fn node_available() -> bool {
         || node_path_prepend().is_some()
 }
 
-/// Ask the user's login+interactive shell where `node` lives and return its
-/// directory. The interactive shell (`-i`) sources the init files where nvm /
-/// fnm / asdf hooks are defined, so this resolves the same `node` the user
-/// gets in their terminal.
-///
-/// It runs `node -e 'process.execPath'` rather than `command -v node`: version
-/// managers expose `node` as a shell *function*, for which `command -v` prints
-/// the name, not a path. Running node and asking for `process.execPath` returns
-/// the real absolute binary path regardless of how `node` is exposed.
-/// Best-effort: `None` on any failure.
-fn login_shell_node_dir() -> Option<PathBuf> {
-    let shell = std::env::var_os("SHELL").unwrap_or_else(|| OsString::from("/bin/sh"));
-    let out = Command::new(shell)
-        .args([
-            "-l",
-            "-i",
-            "-c",
-            "node -e 'process.stdout.write(process.execPath)'",
-        ])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
+/// Find a directory containing real `node` + `npm` binaries by inspecting the
+/// well-known version-manager and package-manager layouts. Filesystem-only, so
+/// it never touches croft's terminal.
+fn discover_node_dir() -> Option<PathBuf> {
+    if let Some(dir) = nvm_node_dir() {
+        return Some(dir);
     }
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    // `process.execPath` is an absolute path written without a trailing newline.
-    // Scan from the end for the last absolute-looking line in case an init file
-    // wrote noise to stdout first.
-    let path = stdout
-        .lines()
-        .rev()
-        .map(str::trim)
-        .find(|l| l.starts_with('/') && Path::new(l).is_file())?;
-    Path::new(path).parent().map(Path::to_path_buf)
+    well_known_node_dirs()
+        .into_iter()
+        .find(|dir| dir.join("node").is_file() && dir.join("npm").exists())
+}
+
+/// Highest installed nvm node's `bin` dir: `$NVM_DIR/versions/node/vX.Y.Z/bin`
+/// (defaulting `NVM_DIR` to `~/.nvm`). Picks the greatest semver so we get a
+/// recent, working node; we only need *a* functional node to install/run vtsls,
+/// not the user's exact `default` alias.
+fn nvm_node_dir() -> Option<PathBuf> {
+    let nvm = std::env::var_os("NVM_DIR")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".nvm")))?;
+    nvm_node_dir_in(&nvm.join("versions").join("node"))
+}
+
+/// Pure core of [`nvm_node_dir`], split out so it's testable against a temp
+/// directory without reading `$NVM_DIR`.
+fn nvm_node_dir_in(versions: &Path) -> Option<PathBuf> {
+    let mut best: Option<((u64, u64, u64), PathBuf)> = None;
+    for entry in std::fs::read_dir(versions).ok()?.flatten() {
+        let bin = entry.path().join("bin");
+        if !bin.join("node").is_file() {
+            continue;
+        }
+        let version = parse_node_version(&entry.file_name().to_string_lossy());
+        if best.as_ref().is_none_or(|(b, _)| version > *b) {
+            best = Some((version, bin));
+        }
+    }
+    best.map(|(_, bin)| bin)
+}
+
+/// Parse an nvm version dir name like `v23.7.0` into a comparable tuple;
+/// unparseable components become 0.
+fn parse_node_version(name: &str) -> (u64, u64, u64) {
+    let mut parts = name
+        .trim_start_matches('v')
+        .split('.')
+        .map(|p| p.parse::<u64>().unwrap_or(0));
+    (
+        parts.next().unwrap_or(0),
+        parts.next().unwrap_or(0),
+        parts.next().unwrap_or(0),
+    )
+}
+
+/// Static install locations for other managers, checked after nvm.
+fn well_known_node_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(home) = std::env::var_os("HOME") {
+        dirs.push(PathBuf::from(&home).join(".volta").join("bin"));
+    }
+    dirs.push(PathBuf::from("/opt/homebrew/bin"));
+    dirs.push(PathBuf::from("/usr/local/bin"));
+    dirs
 }
 
 /// Build a PATH value with `extra` prepended (so it wins over any stale entry),
@@ -262,6 +294,36 @@ mod tests {
             "the spec must pin an exact version for reproducible installs, got {}",
             install_spec()
         );
+    }
+
+    #[test]
+    fn parse_node_version_orders_by_semver_not_lexically() {
+        assert_eq!(parse_node_version("v23.7.0"), (23, 7, 0));
+        assert_eq!(parse_node_version("v8.17.1"), (8, 17, 1));
+        // The bug a lexical sort would hit: v8 must NOT outrank v18.
+        assert!(parse_node_version("v18.0.0") > parse_node_version("v8.17.1"));
+        assert_eq!(parse_node_version("garbage"), (0, 0, 0));
+    }
+
+    #[test]
+    fn nvm_node_dir_picks_highest_version_with_a_node_binary() {
+        let tmp = TempDir::new().unwrap();
+        let versions = tmp.path();
+        // Two versions with node, one stray dir without — highest wins.
+        for v in ["v18.19.0", "v23.7.0"] {
+            let bin = versions.join(v).join("bin");
+            std::fs::create_dir_all(&bin).unwrap();
+            std::fs::write(bin.join("node"), b"#!/bin/sh\n").unwrap();
+        }
+        std::fs::create_dir_all(versions.join("v20.0.0")).unwrap(); // no bin/node
+        let dir = nvm_node_dir_in(versions).unwrap();
+        assert_eq!(dir, versions.join("v23.7.0").join("bin"));
+    }
+
+    #[test]
+    fn nvm_node_dir_is_none_when_no_versions_have_node() {
+        let tmp = TempDir::new().unwrap();
+        assert!(nvm_node_dir_in(tmp.path()).is_none());
     }
 
     #[test]
