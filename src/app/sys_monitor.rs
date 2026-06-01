@@ -18,14 +18,9 @@ impl SysMonitor {
 
     pub fn drain(&self, panel: &mut SystemPanel) -> bool {
         let mut changed = false;
-        loop {
-            match self.rx.try_recv() {
-                Ok(sample) => {
-                    panel.apply_sample(sample);
-                    changed = true;
-                }
-                Err(_) => break,
-            }
+        while let Ok(sample) = self.rx.try_recv() {
+            panel.apply_sample(sample);
+            changed = true;
         }
         changed
     }

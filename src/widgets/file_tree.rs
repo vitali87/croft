@@ -122,12 +122,11 @@ impl FileTree {
             return;
         }
         let entering_multi = self.marked.is_empty();
-        if entering_multi {
-            if let Some(prev) = self.nodes.get(self.selected).map(|n| n.path.clone()) {
-                if self.selected != idx {
-                    self.marked.insert(prev);
-                }
-            }
+        if entering_multi
+            && let Some(prev) = self.nodes.get(self.selected).map(|n| n.path.clone())
+            && self.selected != idx
+        {
+            self.marked.insert(prev);
         }
         let path = self.nodes[idx].path.clone();
         if !self.marked.remove(&path) {
@@ -538,15 +537,15 @@ impl FileTree {
         if self.nodes[idx].expanded {
             self.load_children_preserving_expansion(idx, &expanded_paths);
         }
-        if let Some(path) = selected_path {
-            if let Some(new_idx) = self.nodes.iter().position(|n| n.path == path) {
-                self.selected = new_idx;
-                self.prune_marks();
-                if self.anchor >= self.nodes.len() {
-                    self.anchor = self.selected;
-                }
-                return;
+        if let Some(path) = selected_path
+            && let Some(new_idx) = self.nodes.iter().position(|n| n.path == path)
+        {
+            self.selected = new_idx;
+            self.prune_marks();
+            if self.anchor >= self.nodes.len() {
+                self.anchor = self.selected;
             }
+            return;
         }
         if self.selected >= self.nodes.len() {
             self.selected = self.nodes.len().saturating_sub(1);
@@ -581,12 +580,11 @@ impl FileTree {
             if n.path == path {
                 return true;
             }
-            if let Some(target) = canon_target.as_ref() {
-                if let Ok(canon_node) = n.path.canonicalize() {
-                    if &canon_node == target {
-                        return true;
-                    }
-                }
+            if let Some(target) = canon_target.as_ref()
+                && let Ok(canon_node) = n.path.canonicalize()
+                && &canon_node == target
+            {
+                return true;
             }
             false
         })
@@ -653,7 +651,7 @@ pub fn create_file_in(parent: &Path, name: &str) -> std::io::Result<PathBuf> {
 /// returns `None` if `node` is None (i.e. right-click on empty tree space).
 pub fn delete_target_for(node: Option<&Node>, root: &Path) -> Option<PathBuf> {
     let n = node?;
-    if &n.path == root {
+    if n.path == root {
         return None;
     }
     let canon_root = root.canonicalize().ok();
@@ -872,6 +870,142 @@ pub fn create_folder_in(parent: &Path, name: &str) -> std::io::Result<PathBuf> {
     }
     std::fs::create_dir(&target)?;
     Ok(target)
+}
+
+impl Widget for &mut FileTree {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        let block_style = if self.focused {
+            Style::default().fg(Color::Rgb(0x4e, 0x9a, 0xff))
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(block_style)
+            .title(Span::styled(
+                " EXPLORER ",
+                Style::default()
+                    .fg(Color::White)
+                    .bg(Color::Rgb(0x1e, 0x3a, 0x6e))
+                    .add_modifier(Modifier::BOLD),
+            ));
+        let inner = block.inner(area);
+        block.render(area, buf);
+        self.last_inner = inner;
+        self.last_area = area;
+        self.last_scrollbar = Rect::default();
+
+        let visible_height = inner.height as usize;
+        if visible_height == 0 {
+            return;
+        }
+        if self.selected < self.scroll {
+            self.scroll = self.selected;
+        } else if self.selected >= self.scroll + visible_height {
+            self.scroll = self.selected + 1 - visible_height;
+        }
+        let scrollbar_area = Rect {
+            x: inner.x + inner.width.saturating_sub(1),
+            y: inner.y,
+            width: u16::from(inner.width > 0),
+            height: inner.height,
+        };
+        let scrollbar_metrics = scrollbar::vertical_metrics(
+            scrollbar_area,
+            self.nodes.len(),
+            visible_height,
+            self.scroll,
+        );
+        if let Some(metrics) = scrollbar_metrics {
+            self.last_scrollbar = metrics.area;
+        }
+        let row_width = inner
+            .width
+            .saturating_sub(u16::from(scrollbar_metrics.is_some()));
+
+        let end = (self.scroll + visible_height).min(self.nodes.len());
+        for (row, idx) in (self.scroll..end).enumerate() {
+            let node = &self.nodes[idx];
+            let is_selected = idx == self.selected;
+            let is_marked = self.marked.contains(&node.path);
+            let is_drop_target = self.drag_target == Some(idx);
+            let y = inner.y + row as u16;
+
+            let indent = "  ".repeat(node.depth);
+            let mut spans: Vec<Span> = Vec::with_capacity(6);
+            spans.push(Span::raw(indent));
+
+            let name = node
+                .path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| node.path.display().to_string());
+
+            if node.is_dir {
+                let chev = if node.expanded {
+                    icons::CHEVRON_OPEN
+                } else {
+                    icons::CHEVRON_CLOSED
+                };
+                let icon = if node.expanded {
+                    icons::FOLDER_OPEN
+                } else {
+                    icons::FOLDER_CLOSED
+                };
+                spans.push(Span::styled(
+                    format!("{chev} "),
+                    Style::default().fg(Color::Gray),
+                ));
+                spans.push(Span::styled(
+                    format!("{} ", icon.glyph),
+                    Style::default().fg(icon.color),
+                ));
+                spans.push(Span::styled(
+                    name,
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            } else {
+                let suffix = node
+                    .path
+                    .extension()
+                    .map(|e| format!(".{}", e.to_string_lossy()))
+                    .unwrap_or_default();
+                let icon = icons::for_path(&name, &suffix);
+                spans.push(Span::raw("  "));
+                spans.push(Span::styled(
+                    format!("{} ", icon.glyph),
+                    Style::default().fg(icon.color),
+                ));
+                spans.push(Span::styled(name, Style::default().fg(Color::White)));
+            }
+
+            let line = Line::from(spans);
+            let line_style = if is_drop_target {
+                Style::default().bg(Color::Rgb(0x2c, 0x60, 0x2e))
+            } else if is_selected {
+                Style::default().bg(Color::Rgb(0x09, 0x4d, 0x77))
+            } else if is_marked {
+                Style::default().bg(Color::Rgb(0x07, 0x33, 0x55))
+            } else {
+                Style::default()
+            };
+            buf.set_style(
+                Rect {
+                    x: inner.x,
+                    y,
+                    width: row_width,
+                    height: 1,
+                },
+                line_style,
+            );
+            buf.set_line(inner.x, y, &line, row_width);
+        }
+        if let Some(metrics) = scrollbar_metrics {
+            scrollbar::render_vertical(buf, metrics, self.focused);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1679,141 +1813,5 @@ mod tests {
         let new_path = rename_in(tmp.path(), &a, "keep.txt").unwrap();
         assert_eq!(new_path, a);
         assert!(a.exists());
-    }
-}
-
-impl Widget for &mut FileTree {
-    fn render(self, area: Rect, buf: &mut Buffer) {
-        let block_style = if self.focused {
-            Style::default().fg(Color::Rgb(0x4e, 0x9a, 0xff))
-        } else {
-            Style::default().fg(Color::DarkGray)
-        };
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(block_style)
-            .title(Span::styled(
-                " EXPLORER ",
-                Style::default()
-                    .fg(Color::White)
-                    .bg(Color::Rgb(0x1e, 0x3a, 0x6e))
-                    .add_modifier(Modifier::BOLD),
-            ));
-        let inner = block.inner(area);
-        block.render(area, buf);
-        self.last_inner = inner;
-        self.last_area = area;
-        self.last_scrollbar = Rect::default();
-
-        let visible_height = inner.height as usize;
-        if visible_height == 0 {
-            return;
-        }
-        if self.selected < self.scroll {
-            self.scroll = self.selected;
-        } else if self.selected >= self.scroll + visible_height {
-            self.scroll = self.selected + 1 - visible_height;
-        }
-        let scrollbar_area = Rect {
-            x: inner.x + inner.width.saturating_sub(1),
-            y: inner.y,
-            width: u16::from(inner.width > 0),
-            height: inner.height,
-        };
-        let scrollbar_metrics = scrollbar::vertical_metrics(
-            scrollbar_area,
-            self.nodes.len(),
-            visible_height,
-            self.scroll,
-        );
-        if let Some(metrics) = scrollbar_metrics {
-            self.last_scrollbar = metrics.area;
-        }
-        let row_width = inner
-            .width
-            .saturating_sub(u16::from(scrollbar_metrics.is_some()));
-
-        let end = (self.scroll + visible_height).min(self.nodes.len());
-        for (row, idx) in (self.scroll..end).enumerate() {
-            let node = &self.nodes[idx];
-            let is_selected = idx == self.selected;
-            let is_marked = self.marked.contains(&node.path);
-            let is_drop_target = self.drag_target == Some(idx);
-            let y = inner.y + row as u16;
-
-            let indent = "  ".repeat(node.depth);
-            let mut spans: Vec<Span> = Vec::with_capacity(6);
-            spans.push(Span::raw(indent));
-
-            let name = node
-                .path
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| node.path.display().to_string());
-
-            if node.is_dir {
-                let chev = if node.expanded {
-                    icons::CHEVRON_OPEN
-                } else {
-                    icons::CHEVRON_CLOSED
-                };
-                let icon = if node.expanded {
-                    icons::FOLDER_OPEN
-                } else {
-                    icons::FOLDER_CLOSED
-                };
-                spans.push(Span::styled(
-                    format!("{chev} "),
-                    Style::default().fg(Color::Gray),
-                ));
-                spans.push(Span::styled(
-                    format!("{} ", icon.glyph),
-                    Style::default().fg(icon.color),
-                ));
-                spans.push(Span::styled(
-                    name,
-                    Style::default()
-                        .fg(Color::White)
-                        .add_modifier(Modifier::BOLD),
-                ));
-            } else {
-                let suffix = node
-                    .path
-                    .extension()
-                    .map(|e| format!(".{}", e.to_string_lossy()))
-                    .unwrap_or_default();
-                let icon = icons::for_path(&name, &suffix);
-                spans.push(Span::raw("  "));
-                spans.push(Span::styled(
-                    format!("{} ", icon.glyph),
-                    Style::default().fg(icon.color),
-                ));
-                spans.push(Span::styled(name, Style::default().fg(Color::White)));
-            }
-
-            let line = Line::from(spans);
-            let line_style = if is_drop_target {
-                Style::default().bg(Color::Rgb(0x2c, 0x60, 0x2e))
-            } else if is_selected {
-                Style::default().bg(Color::Rgb(0x09, 0x4d, 0x77))
-            } else if is_marked {
-                Style::default().bg(Color::Rgb(0x07, 0x33, 0x55))
-            } else {
-                Style::default()
-            };
-            buf.set_style(
-                Rect {
-                    x: inner.x,
-                    y,
-                    width: row_width,
-                    height: 1,
-                },
-                line_style,
-            );
-            buf.set_line(inner.x, y, &line, row_width);
-        }
-        if let Some(metrics) = scrollbar_metrics {
-            scrollbar::render_vertical(buf, metrics, self.focused);
-        }
     }
 }

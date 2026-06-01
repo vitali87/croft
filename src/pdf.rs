@@ -40,18 +40,16 @@ pub fn detect_page_count(pdf: &Path) -> Option<u32> {
     if let Some(n) = page_count_via_pdfinfo(pdf) {
         return Some(n);
     }
-    if cfg!(target_os = "macos") {
-        if let Some(n) = page_count_via_mdls(pdf) {
-            return Some(n);
-        }
+    if cfg!(target_os = "macos")
+        && let Some(n) = page_count_via_mdls(pdf)
+    {
+        return Some(n);
     }
     None
 }
 
 fn page_count_via_pdfinfo(pdf: &Path) -> Option<u32> {
-    if which("pdfinfo").is_none() {
-        return None;
-    }
+    which("pdfinfo")?;
     let out = Command::new("pdfinfo").arg(pdf).output().ok()?;
     if !out.status.success() {
         return None;
@@ -62,10 +60,10 @@ fn page_count_via_pdfinfo(pdf: &Path) -> Option<u32> {
 
 pub fn parse_pdfinfo_pages(out: &str) -> Option<u32> {
     for line in out.lines() {
-        if let Some(rest) = line.strip_prefix("Pages:") {
-            if let Ok(n) = rest.trim().parse::<u32>() {
-                return Some(n);
-            }
+        if let Some(rest) = line.strip_prefix("Pages:")
+            && let Ok(n) = rest.trim().parse::<u32>()
+        {
+            return Some(n);
         }
     }
     None

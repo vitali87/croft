@@ -270,15 +270,11 @@ impl DiffData {
                     right: pending_add[k],
                 });
             }
-            for k in pair..pending_remove.len() {
-                rows.push(DiffRow::Removed {
-                    left: pending_remove[k],
-                });
+            for &left in pending_remove.iter().skip(pair) {
+                rows.push(DiffRow::Removed { left });
             }
-            for k in pair..pending_add.len() {
-                rows.push(DiffRow::Added {
-                    right: pending_add[k],
-                });
+            for &right in pending_add.iter().skip(pair) {
+                rows.push(DiffRow::Added { right });
             }
             pending_remove.clear();
             pending_add.clear();
@@ -520,8 +516,7 @@ impl DiffData {
             DiffSide::Right => &self.right_lines,
         };
         let mut out = String::new();
-        let mut emitted = 0usize;
-        for row_idx in start.0..=end.0 {
+        for (emitted, row_idx) in (start.0..=end.0).enumerate() {
             let Some(row) = self.rows.get(row_idx).copied() else {
                 break;
             };
@@ -551,7 +546,6 @@ impl DiffData {
                 out.push('\n');
             }
             out.extend(chars[cs..ce].iter());
-            emitted += 1;
         }
         if out.is_empty() { None } else { Some(out) }
     }
@@ -887,11 +881,11 @@ pub fn build_diff_rows(left: &[String], right: &[String]) -> Vec<DiffRow> {
                         right: added[k],
                     });
                 }
-                for k in pair..removed.len() {
-                    rows.push(DiffRow::Removed { left: removed[k] });
+                for &left in removed.iter().skip(pair) {
+                    rows.push(DiffRow::Removed { left });
                 }
-                for k in pair..added.len() {
-                    rows.push(DiffRow::Added { right: added[k] });
+                for &right in added.iter().skip(pair) {
+                    rows.push(DiffRow::Added { right });
                 }
             }
         }

@@ -74,8 +74,7 @@ impl ClientState {
                 Err(async_lsp::ResponseError::new(
                     async_lsp::ErrorCode::METHOD_NOT_FOUND,
                     format!("No such method {method}"),
-                )
-                .into())
+                ))
             })
         });
         router
@@ -348,10 +347,10 @@ mod tests {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                if let Ok(meta) = std::fs::metadata(&candidate) {
-                    if meta.permissions().mode() & 0o111 != 0 {
-                        return true;
-                    }
+                if let Ok(meta) = std::fs::metadata(&candidate)
+                    && meta.permissions().mode() & 0o111 != 0
+                {
+                    return true;
                 }
             }
             #[cfg(not(unix))]

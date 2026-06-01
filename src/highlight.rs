@@ -283,9 +283,9 @@ impl LangRegistry {
     }
 
     pub fn get(&mut self, kind: LangKind) -> Option<&HighlightConfiguration> {
-        if !self.cache.contains_key(&kind) {
+        if let std::collections::hash_map::Entry::Vacant(e) = self.cache.entry(kind) {
             if let Some(cfg) = build_config(kind) {
-                self.cache.insert(kind, cfg);
+                e.insert(cfg);
             } else {
                 return None;
             }

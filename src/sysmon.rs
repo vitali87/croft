@@ -72,8 +72,8 @@ pub fn system_monitor_loop(tx: Sender<SystemSample>) {
 }
 
 fn sum_net_bytes(nets: &Networks) -> u64 {
-    nets.iter()
-        .map(|(_, d)| d.total_received().saturating_add(d.total_transmitted()))
+    nets.values()
+        .map(|d| d.total_received().saturating_add(d.total_transmitted()))
         .sum()
 }
 

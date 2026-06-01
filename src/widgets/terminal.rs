@@ -465,7 +465,7 @@ impl PtyTerminal {
     /// still safe. `tcgetpgrp` is identical on macOS and Linux.
     pub fn foreground_is_shell(&self) -> bool {
         match (self.master.process_group_leader(), self.shell_pid) {
-            (Some(fg), Some(pid)) => fg as i32 == pid,
+            (Some(fg), Some(pid)) => fg == pid,
             _ => true,
         }
     }
@@ -791,10 +791,10 @@ impl Widget for &mut PtyTerminal {
                 {
                     style = style.add_modifier(Modifier::REVERSED);
                 }
-                if let Some((sr, sc, er, ec)) = sel_norm {
-                    if cell_in_selection(y, x, sr, sc, er, ec) {
-                        style = style.bg(Color::Rgb(0x26, 0x4f, 0x78));
-                    }
+                if let Some((sr, sc, er, ec)) = sel_norm
+                    && cell_in_selection(y, x, sr, sc, er, ec)
+                {
+                    style = style.bg(Color::Rgb(0x26, 0x4f, 0x78));
                 }
                 let target_x = inner.x + x;
                 let target_y = inner.y + y;

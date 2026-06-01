@@ -161,7 +161,7 @@ impl Widget for &mut SystemPanel {
             return;
         }
 
-        let can_show_expanded = inner.height >= 1 + 5;
+        let can_show_expanded = inner.height > 5;
         let effective_collapsed = self.user_override.unwrap_or(!can_show_expanded);
         let effective_collapsed = effective_collapsed || !can_show_expanded;
         self.last_effective_collapsed = effective_collapsed;
@@ -304,7 +304,7 @@ fn render_metric_row(
 
     if label_w + value_w >= area.width {
         let mut spans = vec![Span::styled(label.to_string(), bold)];
-        if (label.chars().count() as u16) + (value.chars().count() as u16) + 1 <= area.width {
+        if (label.chars().count() as u16) + (value.chars().count() as u16) < area.width {
             let pad = area.width - label.chars().count() as u16 - value.chars().count() as u16;
             spans.push(Span::raw(" ".repeat(pad as usize)));
             spans.push(Span::styled(value.to_string(), bold));

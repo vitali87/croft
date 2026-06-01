@@ -27,10 +27,10 @@ impl ClickTracker {
     }
 
     pub fn clear_if_moved(&mut self, col: u16, row: u16) {
-        if let Some((_, x, y)) = self.last {
-            if col != x || row != y {
-                self.last = None;
-            }
+        if let Some((_, x, y)) = self.last
+            && (col != x || row != y)
+        {
+            self.last = None;
         }
     }
 }

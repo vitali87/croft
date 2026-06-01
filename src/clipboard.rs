@@ -62,7 +62,7 @@ pub fn write_string(text: &str) -> bool {
         if macos::write_string_native(text) {
             return true;
         }
-        return write_pbcopy(text);
+        write_pbcopy(text)
     }
     #[cfg(not(target_os = "macos"))]
     {

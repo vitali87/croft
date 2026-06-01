@@ -295,11 +295,11 @@ fn push_topk(heap: &mut BinaryHeap<RankedSlot>, slot: RankedSlot, k: usize) {
     }
     // heap.peek() is the worst-of-top-K under our Ord. If incoming is
     // strictly better (= less under cmp), evict + insert.
-    if let Some(worst) = heap.peek() {
-        if slot.cmp(worst) == Ordering::Less {
-            heap.pop();
-            heap.push(slot);
-        }
+    if let Some(worst) = heap.peek()
+        && slot.cmp(worst) == Ordering::Less
+    {
+        heap.pop();
+        heap.push(slot);
     }
 }
 

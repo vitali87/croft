@@ -269,7 +269,7 @@ impl ActivityOverlay {
         self.dirty
             || self
                 .last_emit
-                .map_or(true, |t| t.elapsed() >= Self::KEEPALIVE)
+                .is_none_or(|t| t.elapsed() >= Self::KEEPALIVE)
     }
 
     pub fn mark_emitted(&mut self) {

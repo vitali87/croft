@@ -175,10 +175,10 @@ impl SourceControlPanel {
         self.entries = entries;
         // A change set refresh can re-order entries; clear stale selection
         // state rather than risk pointing it at the wrong file.
-        if let Some(idx) = self.selected_change {
-            if idx >= self.entries.len() {
-                self.selected_change = None;
-            }
+        if let Some(idx) = self.selected_change
+            && idx >= self.entries.len()
+        {
+            self.selected_change = None;
         }
         self.multi_selection.retain(|i| *i < self.entries.len());
     }
@@ -614,7 +614,7 @@ fn paint_y_fork_illustration(
     // Side dots flanking the tree on the 5 inner rows, completing the
     // dashed-ring silhouette of the SVG mockup.
     let side_off: u16 = 5;
-    if cx >= card_inner.x + side_off + 1 {
+    if cx > card_inner.x + side_off {
         buf.set_string(cx - side_off, top_y + 1, "·", dot);
         buf.set_string(cx - side_off, top_y + 3, "·", dot);
         buf.set_string(cx - side_off, top_y + 5, "·", dot);
@@ -973,16 +973,16 @@ impl Widget for &mut SourceControlPanel {
         y += 3 + 1; // button + 1-row gap
 
         // Optional feedback line.
-        if let Some(msg) = self.commit_feedback.as_ref() {
-            if y < inner.y + inner.height {
-                let style = if self.commit_feedback_is_error {
-                    Style::default().fg(Color::Rgb(0xe7, 0x70, 0x70))
-                } else {
-                    Style::default().fg(Color::Rgb(0xa3, 0xbe, 0x8c))
-                };
-                buf.set_string(inner.x, y, msg.as_str(), style);
-                y += 2;
-            }
+        if let Some(msg) = self.commit_feedback.as_ref()
+            && y < inner.y + inner.height
+        {
+            let style = if self.commit_feedback_is_error {
+                Style::default().fg(Color::Rgb(0xe7, 0x70, 0x70))
+            } else {
+                Style::default().fg(Color::Rgb(0xa3, 0xbe, 0x8c))
+            };
+            buf.set_string(inner.x, y, msg.as_str(), style);
+            y += 2;
         }
 
         // Thin separator line.
@@ -2002,11 +2002,11 @@ mod tests {
         // unselected rows so the user can tell which entry is active.
         let mut selected_has_bg = false;
         for x in 0..area.width {
-            if let Some(bg) = buf[(x, target_y)].style().bg {
-                if bg != ratatui::style::Color::Reset {
-                    selected_has_bg = true;
-                    break;
-                }
+            if let Some(bg) = buf[(x, target_y)].style().bg
+                && bg != ratatui::style::Color::Reset
+            {
+                selected_has_bg = true;
+                break;
             }
         }
         assert!(
@@ -2527,11 +2527,11 @@ mod tests {
             .expect("b row must render");
         let mut secondary_has_bg = false;
         for x in 0..area.width {
-            if let Some(bg) = buf[(x, row_b_y)].style().bg {
-                if bg != Color::Reset {
-                    secondary_has_bg = true;
-                    break;
-                }
+            if let Some(bg) = buf[(x, row_b_y)].style().bg
+                && bg != Color::Reset
+            {
+                secondary_has_bg = true;
+                break;
             }
         }
         assert!(

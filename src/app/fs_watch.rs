@@ -133,10 +133,10 @@ impl FsWatch {
             for dir in affected.iter().rev() {
                 if let Some(idx) = tree.index_of_dir(dir) {
                     tree.refresh_children(idx);
-                } else if let Some(c) = dir.canonicalize().ok() {
-                    if let Some(idx) = tree.index_of_dir(&c) {
-                        tree.refresh_children(idx);
-                    }
+                } else if let Ok(c) = dir.canonicalize()
+                    && let Some(idx) = tree.index_of_dir(&c)
+                {
+                    tree.refresh_children(idx);
                 }
             }
             self.poll_dir_mtimes = Self::snapshot_expanded_dir_mtimes(tree);
@@ -353,9 +353,8 @@ impl FsWatch {
 fn event_mutates_content(kind: &notify::EventKind) -> bool {
     use notify::EventKind;
     use notify::event::ModifyKind;
-    match kind {
-        EventKind::Access(_) => false,
-        EventKind::Modify(ModifyKind::Metadata(_)) => false,
-        _ => true,
-    }
+    !matches!(
+        kind,
+        EventKind::Access(_) | EventKind::Modify(ModifyKind::Metadata(_))
+    )
 }

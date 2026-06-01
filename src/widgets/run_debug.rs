@@ -191,7 +191,7 @@ impl Widget for &mut RunDebugPanel {
             None => "Open a file that can be run or debugged, then press the button below.",
         };
         let body_h = BODY_MAX_H.min(inner.y + inner.height - y);
-        let body_x_pad = (inner.width / 12).max(1).min(4);
+        let body_x_pad = (inner.width / 12).clamp(1, 4);
         let body_area = Rect {
             x: inner.x + body_x_pad,
             y,
@@ -235,16 +235,16 @@ impl Widget for &mut RunDebugPanel {
         );
 
         let mut next_y = button_area.y + button_area.height + 1;
-        if let Some(msg) = self.feedback.as_ref() {
-            if next_y < inner.y + inner.height {
-                let style = if self.feedback_is_error {
-                    Style::default().fg(Color::Rgb(0xe7, 0x70, 0x70))
-                } else {
-                    Style::default().fg(Color::Rgb(0xa3, 0xbe, 0x8c))
-                };
-                buf.set_string(inner.x + 1, next_y, msg.as_str(), style);
-                next_y = next_y.saturating_add(1);
-            }
+        if let Some(msg) = self.feedback.as_ref()
+            && next_y < inner.y + inner.height
+        {
+            let style = if self.feedback_is_error {
+                Style::default().fg(Color::Rgb(0xe7, 0x70, 0x70))
+            } else {
+                Style::default().fg(Color::Rgb(0xa3, 0xbe, 0x8c))
+            };
+            buf.set_string(inner.x + 1, next_y, msg.as_str(), style);
+            next_y = next_y.saturating_add(1);
         }
         let _ = next_y;
     }

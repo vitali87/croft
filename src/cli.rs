@@ -117,148 +117,6 @@ impl Cli {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use clap::Parser;
-
-    #[test]
-    fn parses_no_args() {
-        let cli = Cli::parse_from(["croft"]);
-        assert!(cli.path.is_none());
-        assert!(cli.command.is_none());
-    }
-
-    #[test]
-    fn parses_path_argument() {
-        let cli = Cli::parse_from(["croft", "/tmp"]);
-        assert_eq!(cli.path, Some(PathBuf::from("/tmp")));
-        assert!(cli.command.is_none());
-    }
-
-    #[test]
-    fn parses_setup_terminal_subcommand_with_defaults() {
-        let cli = Cli::parse_from(["croft", "setup-terminal"]);
-        assert!(cli.path.is_none());
-        match cli.command {
-            Some(CliCommand::SetupTerminal { font, size, yes }) => {
-                assert_eq!(font, SETUP_FONT_PS_NAME);
-                assert_eq!(size, SETUP_FONT_SIZE);
-                assert!(!yes);
-            }
-            _ => panic!("expected SetupTerminal"),
-        }
-    }
-
-    #[test]
-    fn parses_setup_terminal_with_overrides() {
-        let cli = Cli::parse_from([
-            "croft",
-            "setup-terminal",
-            "--font",
-            "FiraCodeNFM-Regular",
-            "--size",
-            "14",
-            "--yes",
-        ]);
-        match cli.command {
-            Some(CliCommand::SetupTerminal { font, size, yes }) => {
-                assert_eq!(font, "FiraCodeNFM-Regular");
-                assert_eq!(size, 14);
-                assert!(yes);
-            }
-            _ => panic!("expected SetupTerminal"),
-        }
-    }
-
-    #[test]
-    fn parses_setup_terminal_with_short_yes() {
-        let cli = Cli::parse_from(["croft", "setup-terminal", "-y"]);
-        match cli.command {
-            Some(CliCommand::SetupTerminal { yes, .. }) => assert!(yes),
-            _ => panic!("expected SetupTerminal"),
-        }
-    }
-
-    #[test]
-    fn parses_keys_subcommand() {
-        let cli = Cli::parse_from(["croft", "keys"]);
-        assert!(matches!(
-            cli.command,
-            Some(CliCommand::Keys { mouse: false })
-        ));
-    }
-
-    #[test]
-    fn parses_keys_subcommand_with_mouse() {
-        let cli = Cli::parse_from(["croft", "keys", "--mouse"]);
-        assert!(matches!(
-            cli.command,
-            Some(CliCommand::Keys { mouse: true })
-        ));
-    }
-
-    #[test]
-    fn parses_setup_iterm2_with_defaults() {
-        let cli = Cli::parse_from(["croft", "setup-iterm2"]);
-        match cli.command {
-            Some(CliCommand::SetupIterm2 {
-                font,
-                nonascii,
-                size,
-                yes,
-            }) => {
-                assert_eq!(font, ITERM2_FONT_PS_NAME);
-                assert_eq!(nonascii, ITERM2_NONASCII_PS_NAME);
-                assert_eq!(size, ITERM2_FONT_SIZE);
-                assert!(!yes);
-            }
-            _ => panic!("expected SetupIterm2"),
-        }
-    }
-
-    #[test]
-    fn parses_setup_iterm2_with_overrides() {
-        let cli = Cli::parse_from([
-            "croft",
-            "setup-iterm2",
-            "--font",
-            "FiraCodeNFM-Reg",
-            "--nonascii",
-            "SymbolsNFM",
-            "--size",
-            "15",
-            "-y",
-        ]);
-        match cli.command {
-            Some(CliCommand::SetupIterm2 {
-                font,
-                nonascii,
-                size,
-                yes,
-            }) => {
-                assert_eq!(font, "FiraCodeNFM-Reg");
-                assert_eq!(nonascii, "SymbolsNFM");
-                assert_eq!(size, 15);
-                assert!(yes);
-            }
-            _ => panic!("expected SetupIterm2"),
-        }
-    }
-
-    #[test]
-    fn parses_remote_command() {
-        let cli = Cli::parse_from(["croft", "remote", "reasoner", "/work"]);
-        match cli.command {
-            Some(CliCommand::Remote { host, path }) => {
-                assert_eq!(host, "reasoner");
-                assert_eq!(path, Some(String::from("/work")));
-            }
-            _ => panic!("expected Remote"),
-        }
-    }
-}
-
 fn setup_terminal(font: &str, size: u32, yes: bool) -> Result<()> {
     if !cfg!(target_os = "macos") {
         anyhow::bail!("setup-terminal is macOS-only");
@@ -588,4 +446,146 @@ fn install_rust_target_if_missing(triple: &str) -> Result<()> {
         anyhow::bail!("rustup target add {triple} exited with {status}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn parses_no_args() {
+        let cli = Cli::parse_from(["croft"]);
+        assert!(cli.path.is_none());
+        assert!(cli.command.is_none());
+    }
+
+    #[test]
+    fn parses_path_argument() {
+        let cli = Cli::parse_from(["croft", "/tmp"]);
+        assert_eq!(cli.path, Some(PathBuf::from("/tmp")));
+        assert!(cli.command.is_none());
+    }
+
+    #[test]
+    fn parses_setup_terminal_subcommand_with_defaults() {
+        let cli = Cli::parse_from(["croft", "setup-terminal"]);
+        assert!(cli.path.is_none());
+        match cli.command {
+            Some(CliCommand::SetupTerminal { font, size, yes }) => {
+                assert_eq!(font, SETUP_FONT_PS_NAME);
+                assert_eq!(size, SETUP_FONT_SIZE);
+                assert!(!yes);
+            }
+            _ => panic!("expected SetupTerminal"),
+        }
+    }
+
+    #[test]
+    fn parses_setup_terminal_with_overrides() {
+        let cli = Cli::parse_from([
+            "croft",
+            "setup-terminal",
+            "--font",
+            "FiraCodeNFM-Regular",
+            "--size",
+            "14",
+            "--yes",
+        ]);
+        match cli.command {
+            Some(CliCommand::SetupTerminal { font, size, yes }) => {
+                assert_eq!(font, "FiraCodeNFM-Regular");
+                assert_eq!(size, 14);
+                assert!(yes);
+            }
+            _ => panic!("expected SetupTerminal"),
+        }
+    }
+
+    #[test]
+    fn parses_setup_terminal_with_short_yes() {
+        let cli = Cli::parse_from(["croft", "setup-terminal", "-y"]);
+        match cli.command {
+            Some(CliCommand::SetupTerminal { yes, .. }) => assert!(yes),
+            _ => panic!("expected SetupTerminal"),
+        }
+    }
+
+    #[test]
+    fn parses_keys_subcommand() {
+        let cli = Cli::parse_from(["croft", "keys"]);
+        assert!(matches!(
+            cli.command,
+            Some(CliCommand::Keys { mouse: false })
+        ));
+    }
+
+    #[test]
+    fn parses_keys_subcommand_with_mouse() {
+        let cli = Cli::parse_from(["croft", "keys", "--mouse"]);
+        assert!(matches!(
+            cli.command,
+            Some(CliCommand::Keys { mouse: true })
+        ));
+    }
+
+    #[test]
+    fn parses_setup_iterm2_with_defaults() {
+        let cli = Cli::parse_from(["croft", "setup-iterm2"]);
+        match cli.command {
+            Some(CliCommand::SetupIterm2 {
+                font,
+                nonascii,
+                size,
+                yes,
+            }) => {
+                assert_eq!(font, ITERM2_FONT_PS_NAME);
+                assert_eq!(nonascii, ITERM2_NONASCII_PS_NAME);
+                assert_eq!(size, ITERM2_FONT_SIZE);
+                assert!(!yes);
+            }
+            _ => panic!("expected SetupIterm2"),
+        }
+    }
+
+    #[test]
+    fn parses_setup_iterm2_with_overrides() {
+        let cli = Cli::parse_from([
+            "croft",
+            "setup-iterm2",
+            "--font",
+            "FiraCodeNFM-Reg",
+            "--nonascii",
+            "SymbolsNFM",
+            "--size",
+            "15",
+            "-y",
+        ]);
+        match cli.command {
+            Some(CliCommand::SetupIterm2 {
+                font,
+                nonascii,
+                size,
+                yes,
+            }) => {
+                assert_eq!(font, "FiraCodeNFM-Reg");
+                assert_eq!(nonascii, "SymbolsNFM");
+                assert_eq!(size, 15);
+                assert!(yes);
+            }
+            _ => panic!("expected SetupIterm2"),
+        }
+    }
+
+    #[test]
+    fn parses_remote_command() {
+        let cli = Cli::parse_from(["croft", "remote", "reasoner", "/work"]);
+        match cli.command {
+            Some(CliCommand::Remote { host, path }) => {
+                assert_eq!(host, "reasoner");
+                assert_eq!(path, Some(String::from("/work")));
+            }
+            _ => panic!("expected Remote"),
+        }
+    }
 }

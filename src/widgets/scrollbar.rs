@@ -27,7 +27,7 @@ pub fn vertical_metrics(
     // Model: coordinate compression from [0, max_scroll] into [0, track_travel].
     let track_len = area.height;
     let max_scroll = content_len.saturating_sub(viewport_len);
-    let thumb_len = ((viewport_len * track_len as usize) + content_len - 1) / content_len;
+    let thumb_len = (viewport_len * track_len as usize).div_ceil(content_len);
     let thumb_len = thumb_len.clamp(1, track_len as usize) as u16;
     let travel = track_len.saturating_sub(thumb_len);
     let thumb_start = if max_scroll == 0 || travel == 0 {

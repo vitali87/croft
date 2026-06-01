@@ -570,16 +570,15 @@ pub fn default_branch(root: &Path) -> Result<String, String> {
             "refs/remotes/origin/HEAD",
         ])
         .output()
+        && out.status.success()
     {
-        if out.status.success() {
-            let raw = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if let Some(short) = raw.strip_prefix("origin/") {
-                if !short.is_empty() {
-                    return Ok(short.to_string());
-                }
-            } else if !raw.is_empty() {
-                return Ok(raw);
+        let raw = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if let Some(short) = raw.strip_prefix("origin/") {
+            if !short.is_empty() {
+                return Ok(short.to_string());
             }
+        } else if !raw.is_empty() {
+            return Ok(raw);
         }
     }
     for candidate in ["main", "master", "develop", "trunk"] {
@@ -593,10 +592,10 @@ pub fn default_branch(root: &Path) -> Result<String, String> {
                 candidate,
             ])
             .output();
-        if let Ok(o) = out {
-            if o.status.success() {
-                return Ok(candidate.to_string());
-            }
+        if let Ok(o) = out
+            && o.status.success()
+        {
+            return Ok(candidate.to_string());
         }
     }
     Err(
@@ -1639,7 +1638,7 @@ mod tests {
         let out = "2\t1\told.rs -> new.rs\n";
         let map = parse_numstat(out);
         assert_eq!(map.get("new.rs"), Some(&(2, 1)));
-        assert!(map.get("old.rs").is_none());
+        assert!(!map.contains_key("old.rs"));
     }
 
     #[test]

@@ -28,6 +28,7 @@ pub struct SearchHit {
 ///   - `case_sensitive` (Aa)
 ///   - `whole_word` (ab with underline)
 ///   - `use_regex` (.*)
+///
 /// All-false matches the original case-insensitive substring behaviour.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct SearchOpts {
@@ -68,10 +69,10 @@ impl<'a> Sink for HitSink<'a> {
         _searcher: &Searcher,
         mat: &SinkMatch<'_>,
     ) -> Result<bool, std::io::Error> {
-        if let Some(c) = self.cancel.as_ref() {
-            if c.load(Ordering::Relaxed) {
-                return Ok(false);
-            }
+        if let Some(c) = self.cancel.as_ref()
+            && c.load(Ordering::Relaxed)
+        {
+            return Ok(false);
         }
         let line_no = mat.line_number().unwrap_or(0) as usize;
         let line_str = std::str::from_utf8(mat.bytes()).unwrap_or("");
@@ -308,11 +309,7 @@ pub fn search_worker_loop(
 ) {
     use std::sync::mpsc::RecvTimeoutError;
     let mut current: Option<(std::thread::JoinHandle<()>, Arc<AtomicBool>)> = None;
-    loop {
-        let mut latest = match rx.recv() {
-            Ok(r) => r,
-            Err(_) => break,
-        };
+    while let Ok(mut latest) = rx.recv() {
         // A new message landed: cancel the in-flight scan (if any) so its
         // worker thread bails out before the user pauses long enough to
         // trigger the next scan.
@@ -1573,9 +1570,10 @@ mod tests {
         let mut dones: Vec<String> = Vec::new();
         let until = std::time::Instant::now() + std::time::Duration::from_secs(2);
         while std::time::Instant::now() < until {
-            match e_rx.recv_timeout(std::time::Duration::from_millis(200)) {
-                Ok(SearchEvent::Done(q, _)) => dones.push(q),
-                _ => {}
+            if let Ok(SearchEvent::Done(q, _)) =
+                e_rx.recv_timeout(std::time::Duration::from_millis(200))
+            {
+                dones.push(q)
             }
         }
         drop(q_tx);

@@ -1729,7 +1729,7 @@ Host !blocked *.internal
                 assert_eq!(id, "abc-123");
                 assert_eq!(src, "/Users/v/foo.txt");
             }
-            other => panic!("expected Pull, got {:?}", matches!(other, Some(_))),
+            other => panic!("expected Pull, got {:?}", other.is_some()),
         }
     }
 

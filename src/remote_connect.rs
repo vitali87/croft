@@ -222,7 +222,7 @@ impl Drop for SshAuth {
                 .stderr(std::process::Stdio::null())
                 .status();
         }
-        if !self.handed_off && self.socket_dir.as_os_str().len() > 0 {
+        if !self.handed_off && !self.socket_dir.as_os_str().is_empty() {
             let _ = std::fs::remove_dir_all(&self.socket_dir);
         }
         if let Some(h) = self.reader_handle.take() {

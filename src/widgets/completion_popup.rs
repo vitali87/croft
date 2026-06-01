@@ -119,7 +119,7 @@ impl CompletionPopup {
 
     pub fn area_for(&self, viewport: Rect) -> Rect {
         let visible = self.visible_indices();
-        let count = visible.len().max(1).min(MAX_VISIBLE_ITEMS);
+        let count = visible.len().clamp(1, MAX_VISIBLE_ITEMS);
         let max_label = visible
             .iter()
             .map(|&i| self.items[i].label.chars().count() as u16)

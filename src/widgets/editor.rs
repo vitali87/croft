@@ -434,7 +434,7 @@ fn render_diff(
         buf.set_string(
             l_sign_x,
             y,
-            &format!("{l_sign} "),
+            format!("{l_sign} "),
             Style::default()
                 .fg(if l_cell_bg == removed_bg {
                     removed_fg
@@ -486,7 +486,7 @@ fn render_diff(
         buf.set_string(
             r_sign_x,
             y,
-            &format!("{r_sign} "),
+            format!("{r_sign} "),
             Style::default()
                 .fg(if r_cell_bg == added_bg {
                     added_fg
@@ -594,6 +594,10 @@ fn render_diff(
 /// `paint_selection_band` overlay the regular text editor uses, so the
 /// user sees an identical blue band over selected cells on whichever
 /// column they're dragging in.
+// Render helper: each argument is an independent painting input (data,
+// geometry, target buffer); bundling them into a struct would add indirection
+// without improving clarity.
+#[allow(clippy::too_many_arguments)]
 fn paint_diff_selection_band(
     diff: &crate::widgets::diff::DiffData,
     body_top: u16,
@@ -826,7 +830,7 @@ fn render_unified_deletion(
         buf.set_string(
             sign_x,
             y,
-            &format!("{sign} "),
+            format!("{sign} "),
             Style::default()
                 .fg(if cell_bg == removed_bg {
                     removed_fg
@@ -2538,6 +2542,1085 @@ fn build_line_spans<'a>(line: &'a str, spans: &[HiSpan]) -> Vec<Span<'a>> {
     out
 }
 
+impl Widget for &mut Editor {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        let block_style = if self.focused {
+            Style::default().fg(Color::Rgb(0x4e, 0x9a, 0xff))
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(block_style);
+        let inner = block.inner(area);
+        block.render(area, buf);
+        self.last_area = area;
+        self.last_inner = inner;
+        self.last_scrollbar = Rect::default();
+
+        let height = inner.height as usize;
+        if height == 0 {
+            return;
+        }
+        if let Some(image) = self.image.as_ref() {
+            render_image_placeholder(image, self.path.as_deref(), inner, buf);
+            return;
+        }
+        if let Some(view) = self.sheet.as_ref() {
+            render_sheet(view, self.path.as_deref(), inner, buf);
+            return;
+        }
+        if let Some(diff) = self.diff.as_mut() {
+            let (prev_arrow, next_arrow) = render_diff(diff, inner, buf);
+            self.diff_prev_arrow = prev_arrow;
+            self.diff_next_arrow = next_arrow;
+            return;
+        }
+        // Non-diff tabs: clear the hit rects so a stale arrow click on a
+        // tab the user just switched away from can't fire.
+        self.diff_prev_arrow = Rect::default();
+        self.diff_next_arrow = Rect::default();
+        if self.cursor_row < self.scroll {
+            self.scroll = self.cursor_row;
+        } else if self.cursor_row >= self.scroll + height {
+            self.scroll = self.cursor_row + 1 - height;
+        }
+
+        let gutter_width = (self.lines.len() + 1).to_string().len() as u16 + 1;
+        self.last_gutter_width = gutter_width;
+        let scrollbar_area = Rect {
+            x: inner.x + inner.width.saturating_sub(1),
+            y: inner.y,
+            width: u16::from(inner.width > 0),
+            height: inner.height,
+        };
+        let scrollbar_metrics =
+            scrollbar::vertical_metrics(scrollbar_area, self.lines.len(), height, self.scroll);
+        if let Some(metrics) = scrollbar_metrics {
+            self.last_scrollbar = metrics.area;
+        }
+        let scrollbar_width = u16::from(scrollbar_metrics.is_some());
+        let text_x = inner.x + gutter_width + 1;
+        let text_width = inner
+            .width
+            .saturating_sub(gutter_width + 2 + scrollbar_width);
+
+        let sel_norm = self
+            .selection
+            .filter(|s| s.has_area())
+            .map(|s| s.normalised());
+
+        let end = (self.scroll + height).min(self.lines.len());
+        for (row_idx, line_idx) in (self.scroll..end).enumerate() {
+            let y = inner.y + row_idx as u16;
+            let line_no = format!(
+                "{:>width$} ",
+                line_idx + 1,
+                width = gutter_width as usize - 1
+            );
+            let gutter = Line::from(Span::styled(line_no, Style::default().fg(Color::DarkGray)));
+            buf.set_line(inner.x, y, &gutter, gutter_width);
+
+            let raw = &self.lines[line_idx];
+            let empty: Vec<HiSpan> = Vec::new();
+            let line_spans = self.highlights.get(line_idx).unwrap_or(&empty);
+            // Apply horizontal scroll: take the substring starting at
+            // `scroll_col` characters in and shift the highlight ranges
+            // by the same byte offset so syntax colouring follows.
+            let byte_start = byte_index_of_char(raw, self.scroll_col);
+            let visible_raw = &raw[byte_start..];
+            let shifted = shift_spans_for_view(line_spans, byte_start);
+            let spans = build_line_spans(visible_raw, &shifted);
+            let line = Line::from(spans);
+            buf.set_line(text_x, y, &line, text_width);
+
+            if let Some(term) = self.search_highlight.as_deref() {
+                let active_on_line = self
+                    .active_search_match
+                    .filter(|(r, _, _)| *r == line_idx)
+                    .map(|(_, c, l)| (c, l));
+                paint_search_highlight(
+                    buf,
+                    text_x,
+                    y,
+                    text_width,
+                    raw,
+                    term,
+                    self.search_highlight_opts,
+                    self.scroll_col,
+                    active_on_line,
+                );
+            }
+
+            if let Some(((sr, sc), (er, ec))) = sel_norm
+                && line_idx >= sr
+                && line_idx <= er
+            {
+                let line_chars = self.line_char_len(line_idx);
+                let row_start = if line_idx == sr { sc } else { 0 };
+                // For non-final selected rows, paint past the line content
+                // by one cell to make the trailing newline visible.
+                let row_end = if line_idx == er { ec } else { line_chars + 1 };
+                let visible_start = row_start.saturating_sub(self.scroll_col);
+                let visible_end = row_end.saturating_sub(self.scroll_col);
+                if visible_end > visible_start {
+                    paint_selection_band(buf, text_x, y, text_width, visible_start, visible_end);
+                }
+            }
+
+            // The cursor itself is drawn by the host terminal as a hardware
+            // caret (DECSCUSR `BlinkingBar`); App calls
+            // `frame.set_cursor_position(...)` so the blink/overlay never
+            // hides the underlying character.
+        }
+        if let Some(metrics) = scrollbar_metrics {
+            scrollbar::render_vertical(buf, metrics, self.focused);
+        }
+    }
+}
+
+impl Editor {
+    /// Absolute (column, row) of the editor's cursor in screen coordinates,
+    /// or `None` if the cursor is outside the visible viewport. Used by
+    /// `App::render` to position the host terminal's hardware caret.
+    pub fn cursor_screen_pos(&self) -> Option<(u16, u16)> {
+        if self.last_inner.height == 0 {
+            return None;
+        }
+        if self.cursor_row < self.scroll {
+            return None;
+        }
+        let row_in_view = self.cursor_row - self.scroll;
+        if (row_in_view as u16) >= self.last_inner.height {
+            return None;
+        }
+        let text_x = self.last_inner.x + self.last_gutter_width + 1;
+        let text_width = self
+            .last_inner
+            .width
+            .saturating_sub(self.last_gutter_width + 2 + u16::from(self.last_scrollbar.width > 0));
+        if text_width == 0 {
+            return None;
+        }
+        if self.cursor_col < self.scroll_col {
+            return None;
+        }
+        let visible_col = self.cursor_col - self.scroll_col;
+        if (visible_col as u16) >= text_width {
+            return None;
+        }
+        let cx = text_x + visible_col as u16;
+        let cy = self.last_inner.y + row_in_view as u16;
+        Some((cx, cy))
+    }
+
+    /// Screen cell of the diff view's read-only caret (its selection head),
+    /// clamped to the viewport. The exact inverse of `diff_hit_test`: feed
+    /// it the same layout (`last_inner`, gutters, seam, scroll) so the
+    /// blinking caret lands on the cell a click there would map back to.
+    /// `None` when there's no diff, no caret, or the caret is scrolled out.
+    pub fn diff_caret_screen_pos(&self) -> Option<(u16, u16)> {
+        use crate::widgets::diff::DiffSide;
+        let diff = self.diff.as_ref()?;
+        if diff.unified {
+            return None;
+        }
+        let (side, row_idx, char_col) = diff.caret()?;
+        let inner = self.last_inner;
+        if inner.width < 16 || inner.height < 3 {
+            return None;
+        }
+        let body_top = inner.y + 1;
+        let body_height = inner.height.saturating_sub(2);
+        if body_height == 0 || row_idx < diff.scroll {
+            return None;
+        }
+        let vis_row = row_idx - diff.scroll;
+        if vis_row as u16 >= body_height {
+            return None;
+        }
+        let half = inner.width / 2;
+        if half < 8 {
+            return None;
+        }
+        let l_gutter = (diff.left_lines.len() + 1).to_string().len() as u16 + 1;
+        let r_gutter = (diff.right_lines.len() + 1).to_string().len() as u16 + 1;
+        let (text_x, text_w) = match side {
+            DiffSide::Left => (
+                inner.x + l_gutter + 2,
+                half.saturating_sub(l_gutter + 2 + 1),
+            ),
+            DiffSide::Right => (
+                inner.x + half + 1 + r_gutter + 2,
+                (inner.width - (half + 1)).saturating_sub(r_gutter + 2),
+            ),
+        };
+        if text_w == 0 || char_col < diff.scroll_x {
+            return None;
+        }
+        let vis_col = char_col - diff.scroll_x;
+        if vis_col as u16 >= text_w {
+            return None;
+        }
+        Some((text_x + vis_col as u16, body_top + vis_row as u16))
+    }
+}
+
+/// Overpaint every match of `needle` in `raw_line` with the search-match
+/// style, honouring `opts` (case-sensitive / whole-word / regex). Delegates
+/// to `split_for_highlight` so the highlight rule stays 1:1 with the
+/// search-engine matcher; column conversion uses `chars().count()` over
+/// the byte prefix to stay correct for Unicode.
+// Render helper: each argument is an independent painting input (buffer,
+// geometry, text, styling); bundling them into a struct would add indirection
+// without improving clarity.
+#[allow(clippy::too_many_arguments)]
+fn paint_search_highlight(
+    buf: &mut Buffer,
+    text_x: u16,
+    y: u16,
+    text_width: u16,
+    raw_line: &str,
+    needle: &str,
+    opts: crate::widgets::search::SearchOpts,
+    scroll_col: usize,
+    active_match_on_line: Option<(usize, usize)>,
+) {
+    if needle.is_empty() {
+        return;
+    }
+    let inactive_style = Style::default()
+        .fg(Color::Black)
+        .bg(Color::Rgb(0xff, 0xd7, 0x4a))
+        .add_modifier(Modifier::BOLD);
+    let active_style = Style::default()
+        .fg(Color::Black)
+        .bg(Color::Rgb(0xff, 0x8c, 0x2a))
+        .add_modifier(Modifier::BOLD);
+    let segments = crate::widgets::search::split_for_highlight(raw_line, needle, opts);
+    // `abs_col` tracks the absolute character index in the original line.
+    // Visible columns are `abs_col - scroll_col`, painted only when
+    // non-negative and inside `text_width`.
+    let mut abs_col: usize = 0;
+    for (chunk, is_match) in segments {
+        let chunk_cols = chunk.chars().count();
+        if is_match {
+            let is_active =
+                active_match_on_line.is_some_and(|(c, l)| c == abs_col && l == chunk_cols);
+            let style = if is_active {
+                active_style
+            } else {
+                inactive_style
+            };
+            for c in 0..chunk_cols {
+                let absolute = abs_col + c;
+                if absolute < scroll_col {
+                    continue;
+                }
+                let col = (absolute - scroll_col) as u16;
+                if col >= text_width {
+                    break;
+                }
+                buf[(text_x + col, y)].set_style(style);
+            }
+        }
+        abs_col = abs_col.saturating_add(chunk_cols);
+        if abs_col >= scroll_col + text_width as usize {
+            break;
+        }
+    }
+}
+
+/// Apply the selection background colour to columns `[start_char..end_char)`
+/// of row `y`, where columns are character indices within the editor's text
+/// area.  Clamps to the visible width.
+fn paint_selection_band(
+    buf: &mut Buffer,
+    text_x: u16,
+    y: u16,
+    text_width: u16,
+    start_char: usize,
+    end_char: usize,
+) {
+    let bg = Color::Rgb(0x26, 0x4f, 0x78);
+    let s = start_char.min(text_width as usize);
+    let e = end_char.min(text_width as usize);
+    if e <= s {
+        return;
+    }
+    for col in s..e {
+        let x = text_x + col as u16;
+        let cell = &mut buf[(x, y)];
+        cell.set_style(cell.style().bg(bg));
+    }
+}
+
+/// Multi-buffer editor: a stack of `Editor` instances with a single active
+/// one, plus a 1-row clickable tab strip rendered above the active editor.
+/// `Deref`/`DerefMut` aim at the active editor so existing call sites that
+/// were written for a single `Editor` continue to work without rewrites.
+pub struct EditorTabs {
+    pub editors: Vec<Editor>,
+    active: usize,
+    /// Per-tab on-screen `(x_start, width)` recorded by the most recent
+    /// render. `tab_at(col, row)` reads this to map mouse clicks to tab
+    /// indices.
+    tab_screen_ranges: Vec<(u16, u16)>,
+    /// Per-tab absolute column where the close `\u{2715}` glyph lives.
+    /// `0` means "no close button rendered for this tab" (e.g. when the
+    /// tab is the only one — closing it isn't allowed so we hide the X).
+    tab_close_x: Vec<u16>,
+    tab_strip_y: u16,
+    /// The full pane area (tab strip + body) from the most recent render.
+    /// Used by `App::handle_mouse` for hit-testing — the active editor's
+    /// own `last_area` only covers the body below the strip.
+    pub last_full_area: Rect,
+    /// Source of truth for the search-match term that's currently being
+    /// painted in every tab's body. Each `Editor.search_highlight` is a
+    /// copy kept in sync with this; storing it here lets a freshly-created
+    /// editor (e.g. after closing the previous tab and opening a new file
+    /// from a search hit) inherit the term without the App needing to
+    /// re-call `set_search_highlight` after every open.
+    search_highlight_term: Option<String>,
+    /// Toggle state matching `search_highlight_term`. Same propagation
+    /// strategy: every newly-created editor inherits these.
+    search_highlight_opts: crate::widgets::search::SearchOpts,
+}
+
+impl EditorTabs {
+    pub fn new() -> Self {
+        Self {
+            editors: vec![Editor::new()],
+            active: 0,
+            tab_screen_ranges: Vec::new(),
+            tab_close_x: Vec::new(),
+            tab_strip_y: 0,
+            last_full_area: Rect::default(),
+            search_highlight_term: None,
+            search_highlight_opts: crate::widgets::search::SearchOpts::default(),
+        }
+    }
+
+    pub fn tab_count(&self) -> usize {
+        self.editors.len()
+    }
+
+    /// Set (or clear) the search-match highlight term + opts for every
+    /// open tab, so opening another file from search keeps the same query
+    /// lit, clearing the search box wipes the highlights, and toggling a
+    /// search mode (case / whole-word / regex) re-paints the file with
+    /// the matching rule. Also persists term + opts so editors created
+    /// after this call (e.g. after a close + reopen) inherit them.
+    pub fn set_search_highlight(
+        &mut self,
+        term: Option<String>,
+        opts: crate::widgets::search::SearchOpts,
+    ) {
+        let normalised = term.filter(|s| !s.is_empty());
+        let cleared = normalised.is_none();
+        self.search_highlight_term = normalised.clone();
+        self.search_highlight_opts = opts;
+        for ed in &mut self.editors {
+            ed.search_highlight = normalised.clone();
+            ed.search_highlight_opts = opts;
+            if cleared {
+                ed.active_search_match = None;
+            }
+        }
+    }
+
+    pub fn active_index(&self) -> usize {
+        self.active
+    }
+
+    pub fn iter_tabs(&self) -> impl Iterator<Item = &Editor> {
+        self.editors.iter()
+    }
+
+    pub fn select(&mut self, idx: usize) -> bool {
+        if idx >= self.editors.len() {
+            return false;
+        }
+        self.editors[self.active].focused = false;
+        self.active = idx;
+        self.editors[self.active].focused = true;
+        true
+    }
+
+    /// Sweep EVERY open tab (not just the active one) for external on-disk
+    /// changes. Clean tabs are silently reloaded; dirty tabs are flagged as
+    /// conflicts. This is the core of the FS-sync invariant: a file open in
+    /// a background tab must reflect disk reality just like the focused one.
+    pub fn reload_externally_changed_tabs(&mut self) -> ExternalReloadReport {
+        let mut report = ExternalReloadReport::default();
+        for ed in &mut self.editors {
+            // Diff/image/sheet views don't carry an editable text buffer to
+            // reload, and a path-less blank tab has nothing to sync.
+            if ed.path.is_none() || ed.diff.is_some() {
+                continue;
+            }
+            let path = ed.path.clone();
+            match ed.reload_or_flag_conflict() {
+                ExternalChange::Reloaded => {
+                    if let Some(p) = path {
+                        report.reloaded.push(p);
+                    }
+                }
+                ExternalChange::Conflict => {
+                    if let Some(p) = path {
+                        report.conflicts.push(p);
+                    }
+                }
+                ExternalChange::Unchanged | ExternalChange::ReloadFailed => {}
+            }
+        }
+        report
+    }
+
+    /// If any tab currently points at `old`, repoint it to `new`. The on-
+    /// disk file has already been moved; this only updates the in-memory
+    /// path so subsequent saves and the tab label track the new name.
+    pub fn rename_open_path(&mut self, old: &Path, new: &Path) {
+        for e in &mut self.editors {
+            if e.path.as_deref() == Some(old) {
+                e.path = Some(new.to_path_buf());
+                // Re-anchor the disk stamp to the new path so the rename
+                // isn't mistaken for an external content change on the next
+                // FS-sync sweep.
+                e.mark_synced_with_disk();
+            }
+        }
+    }
+
+    /// Open `path` in a brand-new tab inserted directly after the active
+    /// one, then make that new tab active. Returns the result of the
+    /// underlying `Editor::open` so the caller can surface errors.
+    pub fn open_in_new_tab(&mut self, path: &Path) -> Result<()> {
+        let mut e = Editor::new();
+        e.focused = self.editors[self.active].focused;
+        e.open(path)?;
+        let pos = self.active + 1;
+        self.editors.insert(pos, e);
+        self.editors[self.active].focused = false;
+        self.active = pos;
+        Ok(())
+    }
+
+    /// Test-only / disk-less helper: insert a tab whose path is set but
+    /// whose contents are empty. Production code should call
+    /// `open_in_new_tab` so the file is actually loaded from disk.
+    pub fn add_tab_with_path(&mut self, path: PathBuf) {
+        let mut e = Editor::new();
+        e.path = Some(path);
+        e.focused = self.editors[self.active].focused;
+        let pos = self.active + 1;
+        self.editors.insert(pos, e);
+        self.editors[self.active].focused = false;
+        self.active = pos;
+    }
+
+    /// Close the currently active tab. Refuses (returns false) when only one
+    /// tab remains — closing the last would leave the editor pane empty.
+    pub fn close_active(&mut self) -> bool {
+        self.close_tab(self.active)
+    }
+
+    /// Close the tab at `idx`. When more than one tab is open the tab is
+    /// removed and `self.active` is shifted so it still points at a valid
+    /// tab. When this is the last remaining tab it is reset to the blank
+    /// just-launched state instead of being removed (so the editor pane
+    /// always has at least one buffer to render). Returns false only on an
+    /// out-of-range index.
+    pub fn close_tab(&mut self, idx: usize) -> bool {
+        if idx >= self.editors.len() {
+            return false;
+        }
+        if self.editors.len() == 1 {
+            let was_focused = self.editors[0].focused;
+            let mut fresh = Editor::new();
+            fresh.focused = was_focused;
+            self.editors[0] = fresh;
+            self.active = 0;
+            return true;
+        }
+        self.editors.remove(idx);
+        if self.active > idx {
+            self.active -= 1;
+        } else if self.active >= self.editors.len() {
+            self.active = self.editors.len() - 1;
+        }
+        for (i, ed) in self.editors.iter_mut().enumerate() {
+            ed.focused = i == self.active;
+        }
+        true
+    }
+
+    /// Close every tab whose index ≠ `keep_idx`. The kept tab stays
+    /// active. Returns how many tabs were actually removed (0 when
+    /// `keep_idx` is out of range or only one tab is open). Mirrors VS
+    /// Code's "Close Others" context-menu action.
+    pub fn close_others(&mut self, keep_idx: usize) -> usize {
+        if keep_idx >= self.editors.len() || self.editors.len() <= 1 {
+            return 0;
+        }
+        let kept = self.editors.remove(keep_idx);
+        let removed = self.editors.len();
+        self.editors.clear();
+        self.editors.push(kept);
+        self.active = 0;
+        self.editors[0].focused = true;
+        removed
+    }
+
+    /// Close every tab whose index > `from_idx`. The tab at `from_idx`
+    /// stays active; tabs to the left are untouched. Returns the number
+    /// of tabs removed. Matches VS Code's "Close to the Right".
+    pub fn close_to_right(&mut self, from_idx: usize) -> usize {
+        if from_idx >= self.editors.len() {
+            return 0;
+        }
+        let target_len = from_idx + 1;
+        if self.editors.len() <= target_len {
+            return 0;
+        }
+        let removed = self.editors.len() - target_len;
+        self.editors.truncate(target_len);
+        if self.active >= self.editors.len() {
+            self.active = self.editors.len() - 1;
+        }
+        for (i, ed) in self.editors.iter_mut().enumerate() {
+            ed.focused = i == self.active;
+        }
+        removed
+    }
+
+    /// Close every tab, resetting the editor pane to the single blank
+    /// just-launched state — mirrors `close_tab` on the last remaining
+    /// tab. Returns how many tabs were collapsed away (always ≥ 1 when
+    /// the editor had any content). Matches VS Code's "Close All".
+    pub fn close_all(&mut self) -> usize {
+        let n = self.editors.len();
+        let was_focused = self.editors[self.active].focused;
+        let mut fresh = Editor::new();
+        fresh.focused = was_focused;
+        self.editors = vec![fresh];
+        self.active = 0;
+        n
+    }
+
+    /// Map a mouse cell `(col, row)` to a tab index, or `None` if the click
+    /// missed every tab. Uses the on-screen ranges captured during the most
+    /// recent render.
+    pub fn tab_at(&self, col: u16, row: u16) -> Option<usize> {
+        if row != self.tab_strip_y {
+            return None;
+        }
+        for (i, &(x, w)) in self.tab_screen_ranges.iter().enumerate() {
+            if col >= x && col < x.saturating_add(w) {
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    pub fn tab_screen_x(&self, idx: usize) -> Option<(u16, u16)> {
+        self.tab_screen_ranges.get(idx).copied()
+    }
+
+    pub fn close_screen_x(&self, idx: usize) -> Option<u16> {
+        self.tab_close_x.get(idx).copied().filter(|&x| x != 0)
+    }
+
+    /// Map a mouse cell to the tab whose close `\u{2715}` glyph occupies it,
+    /// or `None` if the click missed every close button. Used by the App's
+    /// mouse handler to short-circuit ahead of `tab_at` so a click on the X
+    /// closes the tab instead of selecting it.
+    pub fn close_at(&self, col: u16, row: u16) -> Option<usize> {
+        if row != self.tab_strip_y {
+            return None;
+        }
+        self.tab_close_x.iter().position(|&x| x != 0 && x == col)
+    }
+
+    /// Index of the first tab whose `path` matches `target` either by
+    /// literal equality or by canonicalised equality (so symlink + relative
+    /// path aliases dedupe to the same tab). Returns `None` if no tab is
+    /// currently holding that file.
+    pub fn find_tab_with_path(&self, target: &Path) -> Option<usize> {
+        self.find_tab_matching(target, |_| true)
+    }
+
+    fn find_tab_matching(&self, target: &Path, extra: impl Fn(&Editor) -> bool) -> Option<usize> {
+        let canon_target = target.canonicalize().ok();
+        self.editors.iter().position(|e| {
+            if !extra(e) {
+                return false;
+            }
+            let Some(p) = e.path.as_ref() else {
+                return false;
+            };
+            if p == target {
+                return true;
+            }
+            match (canon_target.as_ref(), p.canonicalize().ok()) {
+                (Some(a), Some(b)) => *a == b,
+                _ => false,
+            }
+        })
+    }
+
+    pub fn preview_index(&self) -> Option<usize> {
+        self.editors.iter().position(|e| e.preview)
+    }
+
+    /// Mark the active tab as pinned (no longer the preview slot). Called
+    /// when the user double-clicks a file, hits Ctrl+Enter, or starts typing
+    /// inside a preview tab.
+    pub fn pin_active(&mut self) {
+        self.editors[self.active].preview = false;
+    }
+
+    /// VS Code "preview tab" semantics: open `path` in the single
+    /// replaceable preview slot. If the file is already in some tab, just
+    /// switch to it. Otherwise reuse the existing preview slot, or create a
+    /// fresh preview tab next to the active one when none exists.
+    pub fn open_preview(&mut self, path: &Path) -> Result<()> {
+        if let Some(idx) = self.find_tab_with_path(path) {
+            // Switching to an already-open file: if a stale preview tab
+            // exists for some OTHER file, drop it so the user doesn't
+            // accumulate ghost tabs from quick "peek" navigations.
+            if let Some(prev) = self.preview_index()
+                && prev != idx
+            {
+                self.editors.remove(prev);
+                let new_idx = if idx > prev { idx - 1 } else { idx };
+                // Bypass `select` here because the removal may have left
+                // `self.active` pointing past the end (when the active
+                // tab was the preview we just dropped).
+                self.active = new_idx;
+                for (i, ed) in self.editors.iter_mut().enumerate() {
+                    ed.focused = i == new_idx;
+                }
+                return Ok(());
+            }
+            self.select(idx);
+            return Ok(());
+        }
+        if let Some(idx) = self.preview_index() {
+            self.select(idx);
+            self.editors[idx].open(path)?;
+            self.editors[idx].preview = true;
+            return Ok(());
+        }
+        if self.is_blank_initial() {
+            let active = self.active;
+            self.editors[active].open(path)?;
+            self.editors[active].preview = true;
+            self.editors[active].search_highlight = self.search_highlight_term.clone();
+            self.editors[active].search_highlight_opts = self.search_highlight_opts;
+            return Ok(());
+        }
+        let mut e = Editor::new();
+        e.focused = self.editors[self.active].focused;
+        e.open(path)?;
+        e.preview = true;
+        e.search_highlight = self.search_highlight_term.clone();
+        e.search_highlight_opts = self.search_highlight_opts;
+        let pos = self.active + 1;
+        self.editors.insert(pos, e);
+        self.editors[self.active].focused = false;
+        self.active = pos;
+        Ok(())
+    }
+
+    /// Open a side-by-side diff of two files in a fresh pinned tab next
+    /// to the active one. The new tab is read-only: edits, save, and the
+    /// text-rendering path are all bypassed via the `diff: Some(...)` flag
+    /// on the underlying Editor.
+    pub fn open_diff(&mut self, left: &Path, right: &Path) -> Result<()> {
+        let left_text =
+            std::fs::read_to_string(left).with_context(|| format!("reading {}", left.display()))?;
+        let right_text = std::fs::read_to_string(right)
+            .with_context(|| format!("reading {}", right.display()))?;
+        let left_lines: Vec<String> = left_text.lines().map(str::to_string).collect();
+        let right_lines: Vec<String> = right_text.lines().map(str::to_string).collect();
+        let mut data = crate::widgets::diff::DiffData::build(
+            left.to_path_buf(),
+            right.to_path_buf(),
+            left_lines,
+            right_lines,
+        );
+        data.left_is_real_file = true;
+
+        let mut e = Editor::new();
+        e.focused = self.editors[self.active].focused;
+        e.preview = false;
+        // The path is set so close-by-path lookups work; `diff` being Some
+        // is what diverts the renderer onto the side-by-side path.
+        e.path = Some(left.to_path_buf());
+        e.diff = Some(data);
+        // Reuse the blank-initial slot if the editor pane was empty;
+        // otherwise insert a new tab next to the active one.
+        if self.is_blank_initial() {
+            self.editors[self.active] = e;
+            return Ok(());
+        }
+        let pos = self.active + 1;
+        self.editors.insert(pos, e);
+        self.editors[self.active].focused = false;
+        self.active = pos;
+        Ok(())
+    }
+
+    /// Open a side-by-side diff between an in-memory `left_text` (e.g.
+    /// the HEAD version of a file) and the working-tree file at `right`.
+    /// The left "path" is purely a label; nothing reads from it on disk.
+    /// Used by the Source Control panel to show working-tree-vs-HEAD
+    /// diffs when the user clicks a Modified entry.
+    pub fn open_head_diff_with_text(
+        &mut self,
+        left_label: PathBuf,
+        left_text: &str,
+        right: &Path,
+    ) -> Result<()> {
+        let right_text = std::fs::read_to_string(right)
+            .with_context(|| format!("reading {}", right.display()))?;
+        let left_lines: Vec<String> = left_text.lines().map(str::to_string).collect();
+        let right_lines: Vec<String> = right_text.lines().map(str::to_string).collect();
+        let mut data = crate::widgets::diff::DiffData::build_with_byte_check(
+            left_label,
+            right.to_path_buf(),
+            left_lines,
+            right_lines,
+            Some(left_text),
+            Some(&right_text),
+        );
+        // Park the viewport on the first change hunk so the user lands on
+        // the first edit instead of reading through unchanged leading
+        // lines. Identical files stay at scroll 0.
+        if let Some(row) = data.first_change_row() {
+            data.scroll_to_row(row);
+        }
+        let mut e = Editor::new();
+        e.focused = self.editors[self.active].focused;
+        e.preview = false;
+        e.path = Some(right.to_path_buf());
+        e.diff = Some(data);
+        if self.is_blank_initial() {
+            self.editors[self.active] = e;
+            return Ok(());
+        }
+        // If a tab is already showing this path (as a plain file or a
+        // diff), reuse it so we don't pile up duplicate tabs as the
+        // user clicks through the change list.
+        if let Some(idx) = self.find_tab_with_path(right) {
+            self.editors[idx] = e;
+            self.select(idx);
+            return Ok(());
+        }
+        let pos = self.active + 1;
+        self.editors.insert(pos, e);
+        self.editors[self.active].focused = false;
+        self.active = pos;
+        Ok(())
+    }
+
+    /// Open a single-pane unified diff that paints every line of
+    /// `head_text` as a removed line. `path` is the workspace-relative
+    /// path that no longer exists on disk; it doubles as the display
+    /// label in the diff header and as the tab dedup key so repeated
+    /// clicks on the same Source-Control row reuse the tab rather than
+    /// stacking new ones.
+    pub fn open_deleted_diff_with_text(&mut self, path: &Path, head_text: &str) -> Result<()> {
+        let data =
+            crate::widgets::diff::DiffData::build_unified_deletion(path.to_path_buf(), head_text);
+        let mut e = Editor::new();
+        e.focused = self.editors[self.active].focused;
+        e.preview = false;
+        e.path = Some(path.to_path_buf());
+        e.diff = Some(data);
+        if self.is_blank_initial() {
+            self.editors[self.active] = e;
+            return Ok(());
+        }
+        if let Some(idx) = self.find_tab_with_path(path) {
+            self.editors[idx] = e;
+            self.select(idx);
+            return Ok(());
+        }
+        let pos = self.active + 1;
+        self.editors.insert(pos, e);
+        self.editors[self.active].focused = false;
+        self.active = pos;
+        Ok(())
+    }
+
+    /// Open a side-by-side view of raw `git diff` text (e.g. the stdout
+    /// of `git diff --staged` or `git diff <branch>`). `label` is a
+    /// synthetic path used as the tab title and as the dedup key so a
+    /// repeat invocation reuses the existing tab instead of stacking new
+    /// ones. The text is parsed into separate left/right streams so the
+    /// standard two-column renderer takes over — every `+`/`-` pair in a
+    /// hunk lines up horizontally instead of zigzagging vertically.
+    pub fn open_git_diff_side_by_side(&mut self, label: &Path, raw_diff: &str) -> Result<()> {
+        let data = crate::widgets::diff::DiffData::build_side_by_side_from_git_text(
+            label.to_path_buf(),
+            raw_diff,
+        );
+        let mut e = Editor::new();
+        e.focused = self.editors[self.active].focused;
+        e.preview = false;
+        e.path = Some(label.to_path_buf());
+        e.diff = Some(data);
+        if self.is_blank_initial() {
+            self.editors[self.active] = e;
+            return Ok(());
+        }
+        if let Some(idx) = self.find_tab_with_path(label) {
+            self.editors[idx] = e;
+            self.select(idx);
+            return Ok(());
+        }
+        let pos = self.active + 1;
+        self.editors.insert(pos, e);
+        self.editors[self.active].focused = false;
+        self.active = pos;
+        Ok(())
+    }
+
+    /// Pinned-tab open: if the file is already in some tab, pin and switch
+    /// to it. Otherwise create a fresh pinned tab next to the active one.
+    /// Used by double-click in the explorer and Ctrl+Enter on a tree row.
+    pub fn open_pinned(&mut self, path: &Path) -> Result<()> {
+        // A diff tab can carry the working file's `path` yet is not an
+        // editable view of it, so skip diffs here: Enter on a diff (or a
+        // double-click) opens the real file beside the diff rather than just
+        // re-selecting the diff tab.
+        if let Some(idx) = self.find_tab_matching(path, |e| e.diff.is_none()) {
+            self.editors[idx].preview = false;
+            self.select(idx);
+            return Ok(());
+        }
+        if self.is_blank_initial() {
+            let active = self.active;
+            self.editors[active].open(path)?;
+            self.editors[active].preview = false;
+            self.editors[active].search_highlight = self.search_highlight_term.clone();
+            self.editors[active].search_highlight_opts = self.search_highlight_opts;
+            return Ok(());
+        }
+        let mut e = Editor::new();
+        e.focused = self.editors[self.active].focused;
+        e.open(path)?;
+        e.preview = false;
+        e.search_highlight = self.search_highlight_term.clone();
+        e.search_highlight_opts = self.search_highlight_opts;
+        let pos = self.active + 1;
+        self.editors.insert(pos, e);
+        self.editors[self.active].focused = false;
+        self.active = pos;
+        Ok(())
+    }
+
+    /// True iff the editor is in its just-launched state: a single tab with
+    /// no file loaded and no edits. `App::render` uses this to swap the
+    /// editor pane for the welcome screen, and `open_preview` /
+    /// `open_pinned` use it to reuse the placeholder tab rather than stack
+    /// a new one on top.
+    pub fn is_blank_initial(&self) -> bool {
+        self.editors.len() == 1
+            && self.editors[0].path.is_none()
+            && !self.editors[0].dirty
+            && self.editors[0].lines.iter().all(|l| l.is_empty())
+    }
+
+    /// Test-only helper that mirrors `open_preview` without going through
+    /// the disk: insert a preview tab whose path is set but whose buffer is
+    /// empty. Used by unit tests to exercise preview-slot bookkeeping in
+    /// isolation from filesystem I/O.
+    pub fn add_preview_tab_with_path(&mut self, path: PathBuf) {
+        let mut e = Editor::new();
+        e.path = Some(path);
+        e.preview = true;
+        e.focused = self.editors[self.active].focused;
+        let pos = self.active + 1;
+        self.editors.insert(pos, e);
+        self.editors[self.active].focused = false;
+        self.active = pos;
+    }
+
+    /// Test-only helper for the "single-click on a different file when a
+    /// preview tab already exists" path: rewrite the existing preview tab's
+    /// path without changing tab count.
+    pub fn repoint_preview_to(&mut self, path: PathBuf) {
+        if let Some(idx) = self.preview_index() {
+            self.editors[idx].path = Some(path);
+        }
+    }
+}
+
+impl Default for EditorTabs {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Deref for EditorTabs {
+    type Target = Editor;
+    fn deref(&self) -> &Editor {
+        &self.editors[self.active]
+    }
+}
+
+impl DerefMut for EditorTabs {
+    fn deref_mut(&mut self) -> &mut Editor {
+        &mut self.editors[self.active]
+    }
+}
+
+const TAB_STRIP_BG: Color = Color::Rgb(0x1f, 0x24, 0x36);
+const TAB_INACTIVE_BG: Color = Color::Rgb(0x2a, 0x2f, 0x3e);
+const TAB_ACTIVE_BG: Color = Color::Rgb(0x1e, 0x3a, 0x6e);
+const TAB_INACTIVE_FG: Color = Color::Rgb(0x9d, 0xa5, 0xb4);
+const TAB_ACTIVE_FG: Color = Color::White;
+
+impl Widget for &mut EditorTabs {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        self.last_full_area = area;
+        if area.height == 0 || area.width == 0 {
+            // Ctrl+Shift+J maximises the terminal pane, which collapses
+            // the editor area to height 0. The inner editor's `render`
+            // is never reached on this branch, so its `last_area` would
+            // otherwise keep the rectangle from the pre-maximise frame
+            // and `App::handle_mouse`'s `in_editor` hit-test
+            // (rect_contains(self.editor.last_area, ...)) would still
+            // win against the terminal in the dispatch chain at
+            // app.rs:7229 / 7336 — clicks meant to begin a terminal
+            // selection get routed to the editor's mouse_down and the
+            // file caret jumps instead. Zero the inner editor's
+            // hit-test rectangle here so the terminal pane wins
+            // unambiguously while the editor is collapsed.
+            for ed in self.editors.iter_mut() {
+                ed.last_area = Rect {
+                    x: area.x,
+                    y: area.y,
+                    width: area.width,
+                    height: 0,
+                };
+                ed.last_inner = ed.last_area;
+                ed.last_scrollbar = Rect::default();
+            }
+            return;
+        }
+        let strip_h: u16 = 1;
+        let strip = Rect {
+            x: area.x,
+            y: area.y,
+            width: area.width,
+            height: strip_h,
+        };
+        let body = Rect {
+            x: area.x,
+            y: area.y + strip_h,
+            width: area.width,
+            height: area.height - strip_h,
+        };
+
+        // Paint strip background first so the gap to the right of the last
+        // tab still reads as the tab-strip colour rather than terminal default.
+        let strip_bg_style = Style::default().bg(TAB_STRIP_BG);
+        for x in strip.x..strip.x + strip.width {
+            buf[(x, strip.y)].set_style(strip_bg_style);
+            buf[(x, strip.y)].set_symbol(" ");
+        }
+
+        self.tab_strip_y = strip.y;
+        self.tab_screen_ranges.clear();
+        self.tab_close_x.clear();
+        let mut cursor_x = strip.x;
+        let active = self.active;
+        for (i, ed) in self.editors.iter().enumerate() {
+            let label_text = tab_label(ed);
+            let label_chars = label_text.chars().count() as u16;
+            let pad: u16 = 1;
+            let close_pad: u16 = 2;
+            let width = label_chars
+                .saturating_add(pad * 2)
+                .saturating_add(close_pad);
+            if cursor_x.saturating_add(width) > strip.x + strip.width {
+                self.tab_screen_ranges.push((cursor_x, 0));
+                self.tab_close_x.push(0);
+                continue;
+            }
+            let is_active = i == active;
+            let bg = if is_active {
+                TAB_ACTIVE_BG
+            } else {
+                TAB_INACTIVE_BG
+            };
+            let fg = if is_active {
+                TAB_ACTIVE_FG
+            } else {
+                TAB_INACTIVE_FG
+            };
+            let mut modifiers = Modifier::empty();
+            if is_active {
+                modifiers |= Modifier::BOLD;
+            }
+            if ed.preview {
+                modifiers |= Modifier::ITALIC;
+            }
+            let style = Style::default().fg(fg).bg(bg).add_modifier(modifiers);
+            // Layout: " " + label + " " + ✕ + " "
+            let padded = format!(" {label_text} \u{2715} ");
+            buf.set_string(cursor_x, strip.y, &padded, style);
+            self.tab_screen_ranges.push((cursor_x, width));
+            self.tab_close_x.push(cursor_x + 1 + label_chars + 1);
+            cursor_x = cursor_x.saturating_add(width);
+        }
+
+        let active_editor = &mut self.editors[active];
+        Widget::render(active_editor, body, buf);
+    }
+}
+
+fn tab_label(e: &Editor) -> String {
+    if let Some(diff) = e.diff.as_ref() {
+        let l = diff
+            .left_path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| diff.left_path.to_string_lossy().into_owned());
+        // Synthetic single-sided diffs (deletion view, raw `git diff`
+        // text view) leave `right_path` empty / `/dev/null` so the tab
+        // label collapses to just the left label instead of trailing a
+        // misleading "↔ null".
+        let r_is_real = diff.right_path != std::path::Path::new("/dev/null")
+            && !diff.right_path.as_os_str().is_empty();
+        if r_is_real {
+            let r = diff
+                .right_path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| diff.right_path.to_string_lossy().into_owned());
+            return format!("{l} \u{2194} {r}");
+        }
+        return l;
+    }
+    let name = match &e.path {
+        Some(p) => p
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| String::from("untitled")),
+        None => String::from("untitled"),
+    };
+    if e.dirty {
+        format!("\u{25cf} {name}")
+    } else {
+        name
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4053,7 +5136,7 @@ mod tests {
             height: 25,
         };
         e.last_gutter_width = 2;
-        e.mouse_down(3 + 0, 0); // text_x = 0 + 2 + 1 = 3, click col 3 → editor col 0
+        e.mouse_down(3, 0); // text_x = 0 + 2 + 1 = 3, click col 3 → editor col 0
         assert_eq!(e.cursor_col, 0);
         let sel = e.selection.expect("anchor created on mouse down");
         assert_eq!(sel.anchor, (0, 0));
@@ -5272,7 +6355,7 @@ mod tests {
         };
         e.last_gutter_width = 2;
         let text_x: u16 = 3;
-        e.mouse_down(text_x + 0, 0);
+        e.mouse_down(text_x, 0);
         e.mouse_drag(text_x + 5, 0);
         let sel = e.selection.unwrap();
         assert_eq!(sel.anchor, (0, 0));
@@ -5310,1086 +6393,5 @@ mod tests {
         let after: Vec<Option<std::path::PathBuf>> =
             tabs.iter_tabs().map(|e| e.path.clone()).collect();
         assert_eq!(before, after);
-    }
-}
-
-impl Widget for &mut Editor {
-    fn render(self, area: Rect, buf: &mut Buffer) {
-        let block_style = if self.focused {
-            Style::default().fg(Color::Rgb(0x4e, 0x9a, 0xff))
-        } else {
-            Style::default().fg(Color::DarkGray)
-        };
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(block_style);
-        let inner = block.inner(area);
-        block.render(area, buf);
-        self.last_area = area;
-        self.last_inner = inner;
-        self.last_scrollbar = Rect::default();
-
-        let height = inner.height as usize;
-        if height == 0 {
-            return;
-        }
-        if let Some(image) = self.image.as_ref() {
-            render_image_placeholder(image, self.path.as_deref(), inner, buf);
-            return;
-        }
-        if let Some(view) = self.sheet.as_ref() {
-            render_sheet(view, self.path.as_deref(), inner, buf);
-            return;
-        }
-        if let Some(diff) = self.diff.as_mut() {
-            let (prev_arrow, next_arrow) = render_diff(diff, inner, buf);
-            self.diff_prev_arrow = prev_arrow;
-            self.diff_next_arrow = next_arrow;
-            return;
-        }
-        // Non-diff tabs: clear the hit rects so a stale arrow click on a
-        // tab the user just switched away from can't fire.
-        self.diff_prev_arrow = Rect::default();
-        self.diff_next_arrow = Rect::default();
-        if self.cursor_row < self.scroll {
-            self.scroll = self.cursor_row;
-        } else if self.cursor_row >= self.scroll + height {
-            self.scroll = self.cursor_row + 1 - height;
-        }
-
-        let gutter_width = (self.lines.len() + 1).to_string().len() as u16 + 1;
-        self.last_gutter_width = gutter_width;
-        let scrollbar_area = Rect {
-            x: inner.x + inner.width.saturating_sub(1),
-            y: inner.y,
-            width: u16::from(inner.width > 0),
-            height: inner.height,
-        };
-        let scrollbar_metrics =
-            scrollbar::vertical_metrics(scrollbar_area, self.lines.len(), height, self.scroll);
-        if let Some(metrics) = scrollbar_metrics {
-            self.last_scrollbar = metrics.area;
-        }
-        let scrollbar_width = u16::from(scrollbar_metrics.is_some());
-        let text_x = inner.x + gutter_width + 1;
-        let text_width = inner
-            .width
-            .saturating_sub(gutter_width + 2 + scrollbar_width);
-
-        let sel_norm = self
-            .selection
-            .filter(|s| s.has_area())
-            .map(|s| s.normalised());
-
-        let end = (self.scroll + height).min(self.lines.len());
-        for (row_idx, line_idx) in (self.scroll..end).enumerate() {
-            let y = inner.y + row_idx as u16;
-            let line_no = format!(
-                "{:>width$} ",
-                line_idx + 1,
-                width = gutter_width as usize - 1
-            );
-            let gutter = Line::from(Span::styled(line_no, Style::default().fg(Color::DarkGray)));
-            buf.set_line(inner.x, y, &gutter, gutter_width);
-
-            let raw = &self.lines[line_idx];
-            let empty: Vec<HiSpan> = Vec::new();
-            let line_spans = self.highlights.get(line_idx).unwrap_or(&empty);
-            // Apply horizontal scroll: take the substring starting at
-            // `scroll_col` characters in and shift the highlight ranges
-            // by the same byte offset so syntax colouring follows.
-            let byte_start = byte_index_of_char(raw, self.scroll_col);
-            let visible_raw = &raw[byte_start..];
-            let shifted = shift_spans_for_view(line_spans, byte_start);
-            let spans = build_line_spans(visible_raw, &shifted);
-            let line = Line::from(spans);
-            buf.set_line(text_x, y, &line, text_width);
-
-            if let Some(term) = self.search_highlight.as_deref() {
-                let active_on_line = self
-                    .active_search_match
-                    .filter(|(r, _, _)| *r == line_idx)
-                    .map(|(_, c, l)| (c, l));
-                paint_search_highlight(
-                    buf,
-                    text_x,
-                    y,
-                    text_width,
-                    raw,
-                    term,
-                    self.search_highlight_opts,
-                    self.scroll_col,
-                    active_on_line,
-                );
-            }
-
-            if let Some(((sr, sc), (er, ec))) = sel_norm {
-                if line_idx >= sr && line_idx <= er {
-                    let line_chars = self.line_char_len(line_idx);
-                    let row_start = if line_idx == sr { sc } else { 0 };
-                    // For non-final selected rows, paint past the line content
-                    // by one cell to make the trailing newline visible.
-                    let row_end = if line_idx == er { ec } else { line_chars + 1 };
-                    let visible_start = row_start.saturating_sub(self.scroll_col);
-                    let visible_end = row_end.saturating_sub(self.scroll_col);
-                    if visible_end > visible_start {
-                        paint_selection_band(
-                            buf,
-                            text_x,
-                            y,
-                            text_width,
-                            visible_start,
-                            visible_end,
-                        );
-                    }
-                }
-            }
-
-            // The cursor itself is drawn by the host terminal as a hardware
-            // caret (DECSCUSR `BlinkingBar`); App calls
-            // `frame.set_cursor_position(...)` so the blink/overlay never
-            // hides the underlying character.
-        }
-        if let Some(metrics) = scrollbar_metrics {
-            scrollbar::render_vertical(buf, metrics, self.focused);
-        }
-    }
-}
-
-impl Editor {
-    /// Absolute (column, row) of the editor's cursor in screen coordinates,
-    /// or `None` if the cursor is outside the visible viewport. Used by
-    /// `App::render` to position the host terminal's hardware caret.
-    pub fn cursor_screen_pos(&self) -> Option<(u16, u16)> {
-        if self.last_inner.height == 0 {
-            return None;
-        }
-        if self.cursor_row < self.scroll {
-            return None;
-        }
-        let row_in_view = self.cursor_row - self.scroll;
-        if (row_in_view as u16) >= self.last_inner.height {
-            return None;
-        }
-        let text_x = self.last_inner.x + self.last_gutter_width + 1;
-        let text_width = self
-            .last_inner
-            .width
-            .saturating_sub(self.last_gutter_width + 2 + u16::from(self.last_scrollbar.width > 0));
-        if text_width == 0 {
-            return None;
-        }
-        if self.cursor_col < self.scroll_col {
-            return None;
-        }
-        let visible_col = self.cursor_col - self.scroll_col;
-        if (visible_col as u16) >= text_width {
-            return None;
-        }
-        let cx = text_x + visible_col as u16;
-        let cy = self.last_inner.y + row_in_view as u16;
-        Some((cx, cy))
-    }
-
-    /// Screen cell of the diff view's read-only caret (its selection head),
-    /// clamped to the viewport. The exact inverse of `diff_hit_test`: feed
-    /// it the same layout (`last_inner`, gutters, seam, scroll) so the
-    /// blinking caret lands on the cell a click there would map back to.
-    /// `None` when there's no diff, no caret, or the caret is scrolled out.
-    pub fn diff_caret_screen_pos(&self) -> Option<(u16, u16)> {
-        use crate::widgets::diff::DiffSide;
-        let diff = self.diff.as_ref()?;
-        if diff.unified {
-            return None;
-        }
-        let (side, row_idx, char_col) = diff.caret()?;
-        let inner = self.last_inner;
-        if inner.width < 16 || inner.height < 3 {
-            return None;
-        }
-        let body_top = inner.y + 1;
-        let body_height = inner.height.saturating_sub(2);
-        if body_height == 0 || row_idx < diff.scroll {
-            return None;
-        }
-        let vis_row = row_idx - diff.scroll;
-        if vis_row as u16 >= body_height {
-            return None;
-        }
-        let half = inner.width / 2;
-        if half < 8 {
-            return None;
-        }
-        let l_gutter = (diff.left_lines.len() + 1).to_string().len() as u16 + 1;
-        let r_gutter = (diff.right_lines.len() + 1).to_string().len() as u16 + 1;
-        let (text_x, text_w) = match side {
-            DiffSide::Left => (
-                inner.x + l_gutter + 2,
-                half.saturating_sub(l_gutter + 2 + 1),
-            ),
-            DiffSide::Right => (
-                inner.x + half + 1 + r_gutter + 2,
-                (inner.width - (half + 1)).saturating_sub(r_gutter + 2),
-            ),
-        };
-        if text_w == 0 || char_col < diff.scroll_x {
-            return None;
-        }
-        let vis_col = char_col - diff.scroll_x;
-        if vis_col as u16 >= text_w {
-            return None;
-        }
-        Some((text_x + vis_col as u16, body_top + vis_row as u16))
-    }
-}
-
-/// Overpaint every match of `needle` in `raw_line` with the search-match
-/// style, honouring `opts` (case-sensitive / whole-word / regex). Delegates
-/// to `split_for_highlight` so the highlight rule stays 1:1 with the
-/// search-engine matcher; column conversion uses `chars().count()` over
-/// the byte prefix to stay correct for Unicode.
-fn paint_search_highlight(
-    buf: &mut Buffer,
-    text_x: u16,
-    y: u16,
-    text_width: u16,
-    raw_line: &str,
-    needle: &str,
-    opts: crate::widgets::search::SearchOpts,
-    scroll_col: usize,
-    active_match_on_line: Option<(usize, usize)>,
-) {
-    if needle.is_empty() {
-        return;
-    }
-    let inactive_style = Style::default()
-        .fg(Color::Black)
-        .bg(Color::Rgb(0xff, 0xd7, 0x4a))
-        .add_modifier(Modifier::BOLD);
-    let active_style = Style::default()
-        .fg(Color::Black)
-        .bg(Color::Rgb(0xff, 0x8c, 0x2a))
-        .add_modifier(Modifier::BOLD);
-    let segments = crate::widgets::search::split_for_highlight(raw_line, needle, opts);
-    // `abs_col` tracks the absolute character index in the original line.
-    // Visible columns are `abs_col - scroll_col`, painted only when
-    // non-negative and inside `text_width`.
-    let mut abs_col: usize = 0;
-    for (chunk, is_match) in segments {
-        let chunk_cols = chunk.chars().count();
-        if is_match {
-            let is_active =
-                active_match_on_line.is_some_and(|(c, l)| c == abs_col && l == chunk_cols);
-            let style = if is_active {
-                active_style
-            } else {
-                inactive_style
-            };
-            for c in 0..chunk_cols {
-                let absolute = abs_col + c;
-                if absolute < scroll_col {
-                    continue;
-                }
-                let col = (absolute - scroll_col) as u16;
-                if col >= text_width {
-                    break;
-                }
-                buf[(text_x + col, y)].set_style(style);
-            }
-        }
-        abs_col = abs_col.saturating_add(chunk_cols);
-        if abs_col >= scroll_col + text_width as usize {
-            break;
-        }
-    }
-}
-
-/// Apply the selection background colour to columns `[start_char..end_char)`
-/// of row `y`, where columns are character indices within the editor's text
-/// area.  Clamps to the visible width.
-fn paint_selection_band(
-    buf: &mut Buffer,
-    text_x: u16,
-    y: u16,
-    text_width: u16,
-    start_char: usize,
-    end_char: usize,
-) {
-    let bg = Color::Rgb(0x26, 0x4f, 0x78);
-    let s = start_char.min(text_width as usize);
-    let e = end_char.min(text_width as usize);
-    if e <= s {
-        return;
-    }
-    for col in s..e {
-        let x = text_x + col as u16;
-        let cell = &mut buf[(x, y)];
-        cell.set_style(cell.style().bg(bg));
-    }
-}
-
-/// Multi-buffer editor: a stack of `Editor` instances with a single active
-/// one, plus a 1-row clickable tab strip rendered above the active editor.
-/// `Deref`/`DerefMut` aim at the active editor so existing call sites that
-/// were written for a single `Editor` continue to work without rewrites.
-pub struct EditorTabs {
-    pub editors: Vec<Editor>,
-    active: usize,
-    /// Per-tab on-screen `(x_start, width)` recorded by the most recent
-    /// render. `tab_at(col, row)` reads this to map mouse clicks to tab
-    /// indices.
-    tab_screen_ranges: Vec<(u16, u16)>,
-    /// Per-tab absolute column where the close `\u{2715}` glyph lives.
-    /// `0` means "no close button rendered for this tab" (e.g. when the
-    /// tab is the only one — closing it isn't allowed so we hide the X).
-    tab_close_x: Vec<u16>,
-    tab_strip_y: u16,
-    /// The full pane area (tab strip + body) from the most recent render.
-    /// Used by `App::handle_mouse` for hit-testing — the active editor's
-    /// own `last_area` only covers the body below the strip.
-    pub last_full_area: Rect,
-    /// Source of truth for the search-match term that's currently being
-    /// painted in every tab's body. Each `Editor.search_highlight` is a
-    /// copy kept in sync with this; storing it here lets a freshly-created
-    /// editor (e.g. after closing the previous tab and opening a new file
-    /// from a search hit) inherit the term without the App needing to
-    /// re-call `set_search_highlight` after every open.
-    search_highlight_term: Option<String>,
-    /// Toggle state matching `search_highlight_term`. Same propagation
-    /// strategy: every newly-created editor inherits these.
-    search_highlight_opts: crate::widgets::search::SearchOpts,
-}
-
-impl EditorTabs {
-    pub fn new() -> Self {
-        Self {
-            editors: vec![Editor::new()],
-            active: 0,
-            tab_screen_ranges: Vec::new(),
-            tab_close_x: Vec::new(),
-            tab_strip_y: 0,
-            last_full_area: Rect::default(),
-            search_highlight_term: None,
-            search_highlight_opts: crate::widgets::search::SearchOpts::default(),
-        }
-    }
-
-    pub fn tab_count(&self) -> usize {
-        self.editors.len()
-    }
-
-    /// Set (or clear) the search-match highlight term + opts for every
-    /// open tab, so opening another file from search keeps the same query
-    /// lit, clearing the search box wipes the highlights, and toggling a
-    /// search mode (case / whole-word / regex) re-paints the file with
-    /// the matching rule. Also persists term + opts so editors created
-    /// after this call (e.g. after a close + reopen) inherit them.
-    pub fn set_search_highlight(
-        &mut self,
-        term: Option<String>,
-        opts: crate::widgets::search::SearchOpts,
-    ) {
-        let normalised = term.filter(|s| !s.is_empty());
-        let cleared = normalised.is_none();
-        self.search_highlight_term = normalised.clone();
-        self.search_highlight_opts = opts;
-        for ed in &mut self.editors {
-            ed.search_highlight = normalised.clone();
-            ed.search_highlight_opts = opts;
-            if cleared {
-                ed.active_search_match = None;
-            }
-        }
-    }
-
-    pub fn active_index(&self) -> usize {
-        self.active
-    }
-
-    pub fn iter_tabs(&self) -> impl Iterator<Item = &Editor> {
-        self.editors.iter()
-    }
-
-    pub fn select(&mut self, idx: usize) -> bool {
-        if idx >= self.editors.len() {
-            return false;
-        }
-        self.editors[self.active].focused = false;
-        self.active = idx;
-        self.editors[self.active].focused = true;
-        true
-    }
-
-    /// Sweep EVERY open tab (not just the active one) for external on-disk
-    /// changes. Clean tabs are silently reloaded; dirty tabs are flagged as
-    /// conflicts. This is the core of the FS-sync invariant: a file open in
-    /// a background tab must reflect disk reality just like the focused one.
-    pub fn reload_externally_changed_tabs(&mut self) -> ExternalReloadReport {
-        let mut report = ExternalReloadReport::default();
-        for ed in &mut self.editors {
-            // Diff/image/sheet views don't carry an editable text buffer to
-            // reload, and a path-less blank tab has nothing to sync.
-            if ed.path.is_none() || ed.diff.is_some() {
-                continue;
-            }
-            let path = ed.path.clone();
-            match ed.reload_or_flag_conflict() {
-                ExternalChange::Reloaded => {
-                    if let Some(p) = path {
-                        report.reloaded.push(p);
-                    }
-                }
-                ExternalChange::Conflict => {
-                    if let Some(p) = path {
-                        report.conflicts.push(p);
-                    }
-                }
-                ExternalChange::Unchanged | ExternalChange::ReloadFailed => {}
-            }
-        }
-        report
-    }
-
-    /// If any tab currently points at `old`, repoint it to `new`. The on-
-    /// disk file has already been moved; this only updates the in-memory
-    /// path so subsequent saves and the tab label track the new name.
-    pub fn rename_open_path(&mut self, old: &Path, new: &Path) {
-        for e in &mut self.editors {
-            if e.path.as_deref() == Some(old) {
-                e.path = Some(new.to_path_buf());
-                // Re-anchor the disk stamp to the new path so the rename
-                // isn't mistaken for an external content change on the next
-                // FS-sync sweep.
-                e.mark_synced_with_disk();
-            }
-        }
-    }
-
-    /// Open `path` in a brand-new tab inserted directly after the active
-    /// one, then make that new tab active. Returns the result of the
-    /// underlying `Editor::open` so the caller can surface errors.
-    pub fn open_in_new_tab(&mut self, path: &Path) -> Result<()> {
-        let mut e = Editor::new();
-        e.focused = self.editors[self.active].focused;
-        e.open(path)?;
-        let pos = self.active + 1;
-        self.editors.insert(pos, e);
-        self.editors[self.active].focused = false;
-        self.active = pos;
-        Ok(())
-    }
-
-    /// Test-only / disk-less helper: insert a tab whose path is set but
-    /// whose contents are empty. Production code should call
-    /// `open_in_new_tab` so the file is actually loaded from disk.
-    pub fn add_tab_with_path(&mut self, path: PathBuf) {
-        let mut e = Editor::new();
-        e.path = Some(path);
-        e.focused = self.editors[self.active].focused;
-        let pos = self.active + 1;
-        self.editors.insert(pos, e);
-        self.editors[self.active].focused = false;
-        self.active = pos;
-    }
-
-    /// Close the currently active tab. Refuses (returns false) when only one
-    /// tab remains — closing the last would leave the editor pane empty.
-    pub fn close_active(&mut self) -> bool {
-        self.close_tab(self.active)
-    }
-
-    /// Close the tab at `idx`. When more than one tab is open the tab is
-    /// removed and `self.active` is shifted so it still points at a valid
-    /// tab. When this is the last remaining tab it is reset to the blank
-    /// just-launched state instead of being removed (so the editor pane
-    /// always has at least one buffer to render). Returns false only on an
-    /// out-of-range index.
-    pub fn close_tab(&mut self, idx: usize) -> bool {
-        if idx >= self.editors.len() {
-            return false;
-        }
-        if self.editors.len() == 1 {
-            let was_focused = self.editors[0].focused;
-            let mut fresh = Editor::new();
-            fresh.focused = was_focused;
-            self.editors[0] = fresh;
-            self.active = 0;
-            return true;
-        }
-        self.editors.remove(idx);
-        if self.active > idx {
-            self.active -= 1;
-        } else if self.active >= self.editors.len() {
-            self.active = self.editors.len() - 1;
-        }
-        for (i, ed) in self.editors.iter_mut().enumerate() {
-            ed.focused = i == self.active;
-        }
-        true
-    }
-
-    /// Close every tab whose index ≠ `keep_idx`. The kept tab stays
-    /// active. Returns how many tabs were actually removed (0 when
-    /// `keep_idx` is out of range or only one tab is open). Mirrors VS
-    /// Code's "Close Others" context-menu action.
-    pub fn close_others(&mut self, keep_idx: usize) -> usize {
-        if keep_idx >= self.editors.len() || self.editors.len() <= 1 {
-            return 0;
-        }
-        let kept = self.editors.remove(keep_idx);
-        let removed = self.editors.len();
-        self.editors.clear();
-        self.editors.push(kept);
-        self.active = 0;
-        self.editors[0].focused = true;
-        removed
-    }
-
-    /// Close every tab whose index > `from_idx`. The tab at `from_idx`
-    /// stays active; tabs to the left are untouched. Returns the number
-    /// of tabs removed. Matches VS Code's "Close to the Right".
-    pub fn close_to_right(&mut self, from_idx: usize) -> usize {
-        if from_idx >= self.editors.len() {
-            return 0;
-        }
-        let target_len = from_idx + 1;
-        if self.editors.len() <= target_len {
-            return 0;
-        }
-        let removed = self.editors.len() - target_len;
-        self.editors.truncate(target_len);
-        if self.active >= self.editors.len() {
-            self.active = self.editors.len() - 1;
-        }
-        for (i, ed) in self.editors.iter_mut().enumerate() {
-            ed.focused = i == self.active;
-        }
-        removed
-    }
-
-    /// Close every tab, resetting the editor pane to the single blank
-    /// just-launched state — mirrors `close_tab` on the last remaining
-    /// tab. Returns how many tabs were collapsed away (always ≥ 1 when
-    /// the editor had any content). Matches VS Code's "Close All".
-    pub fn close_all(&mut self) -> usize {
-        let n = self.editors.len();
-        let was_focused = self.editors[self.active].focused;
-        let mut fresh = Editor::new();
-        fresh.focused = was_focused;
-        self.editors = vec![fresh];
-        self.active = 0;
-        n
-    }
-
-    /// Map a mouse cell `(col, row)` to a tab index, or `None` if the click
-    /// missed every tab. Uses the on-screen ranges captured during the most
-    /// recent render.
-    pub fn tab_at(&self, col: u16, row: u16) -> Option<usize> {
-        if row != self.tab_strip_y {
-            return None;
-        }
-        for (i, &(x, w)) in self.tab_screen_ranges.iter().enumerate() {
-            if col >= x && col < x.saturating_add(w) {
-                return Some(i);
-            }
-        }
-        None
-    }
-
-    pub fn tab_screen_x(&self, idx: usize) -> Option<(u16, u16)> {
-        self.tab_screen_ranges.get(idx).copied()
-    }
-
-    pub fn close_screen_x(&self, idx: usize) -> Option<u16> {
-        self.tab_close_x.get(idx).copied().filter(|&x| x != 0)
-    }
-
-    /// Map a mouse cell to the tab whose close `\u{2715}` glyph occupies it,
-    /// or `None` if the click missed every close button. Used by the App's
-    /// mouse handler to short-circuit ahead of `tab_at` so a click on the X
-    /// closes the tab instead of selecting it.
-    pub fn close_at(&self, col: u16, row: u16) -> Option<usize> {
-        if row != self.tab_strip_y {
-            return None;
-        }
-        self.tab_close_x.iter().position(|&x| x != 0 && x == col)
-    }
-
-    /// Index of the first tab whose `path` matches `target` either by
-    /// literal equality or by canonicalised equality (so symlink + relative
-    /// path aliases dedupe to the same tab). Returns `None` if no tab is
-    /// currently holding that file.
-    pub fn find_tab_with_path(&self, target: &Path) -> Option<usize> {
-        self.find_tab_matching(target, |_| true)
-    }
-
-    fn find_tab_matching(&self, target: &Path, extra: impl Fn(&Editor) -> bool) -> Option<usize> {
-        let canon_target = target.canonicalize().ok();
-        self.editors.iter().position(|e| {
-            if !extra(e) {
-                return false;
-            }
-            let Some(p) = e.path.as_ref() else {
-                return false;
-            };
-            if p == target {
-                return true;
-            }
-            match (canon_target.as_ref(), p.canonicalize().ok()) {
-                (Some(a), Some(b)) => *a == b,
-                _ => false,
-            }
-        })
-    }
-
-    pub fn preview_index(&self) -> Option<usize> {
-        self.editors.iter().position(|e| e.preview)
-    }
-
-    /// Mark the active tab as pinned (no longer the preview slot). Called
-    /// when the user double-clicks a file, hits Ctrl+Enter, or starts typing
-    /// inside a preview tab.
-    pub fn pin_active(&mut self) {
-        self.editors[self.active].preview = false;
-    }
-
-    /// VS Code "preview tab" semantics: open `path` in the single
-    /// replaceable preview slot. If the file is already in some tab, just
-    /// switch to it. Otherwise reuse the existing preview slot, or create a
-    /// fresh preview tab next to the active one when none exists.
-    pub fn open_preview(&mut self, path: &Path) -> Result<()> {
-        if let Some(idx) = self.find_tab_with_path(path) {
-            // Switching to an already-open file: if a stale preview tab
-            // exists for some OTHER file, drop it so the user doesn't
-            // accumulate ghost tabs from quick "peek" navigations.
-            if let Some(prev) = self.preview_index() {
-                if prev != idx {
-                    self.editors.remove(prev);
-                    let new_idx = if idx > prev { idx - 1 } else { idx };
-                    // Bypass `select` here because the removal may have left
-                    // `self.active` pointing past the end (when the active
-                    // tab was the preview we just dropped).
-                    self.active = new_idx;
-                    for (i, ed) in self.editors.iter_mut().enumerate() {
-                        ed.focused = i == new_idx;
-                    }
-                    return Ok(());
-                }
-            }
-            self.select(idx);
-            return Ok(());
-        }
-        if let Some(idx) = self.preview_index() {
-            self.select(idx);
-            self.editors[idx].open(path)?;
-            self.editors[idx].preview = true;
-            return Ok(());
-        }
-        if self.is_blank_initial() {
-            let active = self.active;
-            self.editors[active].open(path)?;
-            self.editors[active].preview = true;
-            self.editors[active].search_highlight = self.search_highlight_term.clone();
-            self.editors[active].search_highlight_opts = self.search_highlight_opts;
-            return Ok(());
-        }
-        let mut e = Editor::new();
-        e.focused = self.editors[self.active].focused;
-        e.open(path)?;
-        e.preview = true;
-        e.search_highlight = self.search_highlight_term.clone();
-        e.search_highlight_opts = self.search_highlight_opts;
-        let pos = self.active + 1;
-        self.editors.insert(pos, e);
-        self.editors[self.active].focused = false;
-        self.active = pos;
-        Ok(())
-    }
-
-    /// Open a side-by-side diff of two files in a fresh pinned tab next
-    /// to the active one. The new tab is read-only: edits, save, and the
-    /// text-rendering path are all bypassed via the `diff: Some(...)` flag
-    /// on the underlying Editor.
-    pub fn open_diff(&mut self, left: &Path, right: &Path) -> Result<()> {
-        let left_text =
-            std::fs::read_to_string(left).with_context(|| format!("reading {}", left.display()))?;
-        let right_text = std::fs::read_to_string(right)
-            .with_context(|| format!("reading {}", right.display()))?;
-        let left_lines: Vec<String> = left_text.lines().map(str::to_string).collect();
-        let right_lines: Vec<String> = right_text.lines().map(str::to_string).collect();
-        let mut data = crate::widgets::diff::DiffData::build(
-            left.to_path_buf(),
-            right.to_path_buf(),
-            left_lines,
-            right_lines,
-        );
-        data.left_is_real_file = true;
-
-        let mut e = Editor::new();
-        e.focused = self.editors[self.active].focused;
-        e.preview = false;
-        // The path is set so close-by-path lookups work; `diff` being Some
-        // is what diverts the renderer onto the side-by-side path.
-        e.path = Some(left.to_path_buf());
-        e.diff = Some(data);
-        // Reuse the blank-initial slot if the editor pane was empty;
-        // otherwise insert a new tab next to the active one.
-        if self.is_blank_initial() {
-            self.editors[self.active] = e;
-            return Ok(());
-        }
-        let pos = self.active + 1;
-        self.editors.insert(pos, e);
-        self.editors[self.active].focused = false;
-        self.active = pos;
-        Ok(())
-    }
-
-    /// Open a side-by-side diff between an in-memory `left_text` (e.g.
-    /// the HEAD version of a file) and the working-tree file at `right`.
-    /// The left "path" is purely a label; nothing reads from it on disk.
-    /// Used by the Source Control panel to show working-tree-vs-HEAD
-    /// diffs when the user clicks a Modified entry.
-    pub fn open_head_diff_with_text(
-        &mut self,
-        left_label: PathBuf,
-        left_text: &str,
-        right: &Path,
-    ) -> Result<()> {
-        let right_text = std::fs::read_to_string(right)
-            .with_context(|| format!("reading {}", right.display()))?;
-        let left_lines: Vec<String> = left_text.lines().map(str::to_string).collect();
-        let right_lines: Vec<String> = right_text.lines().map(str::to_string).collect();
-        let mut data = crate::widgets::diff::DiffData::build_with_byte_check(
-            left_label,
-            right.to_path_buf(),
-            left_lines,
-            right_lines,
-            Some(left_text),
-            Some(&right_text),
-        );
-        // Park the viewport on the first change hunk so the user lands on
-        // the first edit instead of reading through unchanged leading
-        // lines. Identical files stay at scroll 0.
-        if let Some(row) = data.first_change_row() {
-            data.scroll_to_row(row);
-        }
-        let mut e = Editor::new();
-        e.focused = self.editors[self.active].focused;
-        e.preview = false;
-        e.path = Some(right.to_path_buf());
-        e.diff = Some(data);
-        if self.is_blank_initial() {
-            self.editors[self.active] = e;
-            return Ok(());
-        }
-        // If a tab is already showing this path (as a plain file or a
-        // diff), reuse it so we don't pile up duplicate tabs as the
-        // user clicks through the change list.
-        if let Some(idx) = self.find_tab_with_path(right) {
-            self.editors[idx] = e;
-            self.select(idx);
-            return Ok(());
-        }
-        let pos = self.active + 1;
-        self.editors.insert(pos, e);
-        self.editors[self.active].focused = false;
-        self.active = pos;
-        Ok(())
-    }
-
-    /// Open a single-pane unified diff that paints every line of
-    /// `head_text` as a removed line. `path` is the workspace-relative
-    /// path that no longer exists on disk; it doubles as the display
-    /// label in the diff header and as the tab dedup key so repeated
-    /// clicks on the same Source-Control row reuse the tab rather than
-    /// stacking new ones.
-    pub fn open_deleted_diff_with_text(&mut self, path: &Path, head_text: &str) -> Result<()> {
-        let data =
-            crate::widgets::diff::DiffData::build_unified_deletion(path.to_path_buf(), head_text);
-        let mut e = Editor::new();
-        e.focused = self.editors[self.active].focused;
-        e.preview = false;
-        e.path = Some(path.to_path_buf());
-        e.diff = Some(data);
-        if self.is_blank_initial() {
-            self.editors[self.active] = e;
-            return Ok(());
-        }
-        if let Some(idx) = self.find_tab_with_path(path) {
-            self.editors[idx] = e;
-            self.select(idx);
-            return Ok(());
-        }
-        let pos = self.active + 1;
-        self.editors.insert(pos, e);
-        self.editors[self.active].focused = false;
-        self.active = pos;
-        Ok(())
-    }
-
-    /// Open a side-by-side view of raw `git diff` text (e.g. the stdout
-    /// of `git diff --staged` or `git diff <branch>`). `label` is a
-    /// synthetic path used as the tab title and as the dedup key so a
-    /// repeat invocation reuses the existing tab instead of stacking new
-    /// ones. The text is parsed into separate left/right streams so the
-    /// standard two-column renderer takes over — every `+`/`-` pair in a
-    /// hunk lines up horizontally instead of zigzagging vertically.
-    pub fn open_git_diff_side_by_side(&mut self, label: &Path, raw_diff: &str) -> Result<()> {
-        let data = crate::widgets::diff::DiffData::build_side_by_side_from_git_text(
-            label.to_path_buf(),
-            raw_diff,
-        );
-        let mut e = Editor::new();
-        e.focused = self.editors[self.active].focused;
-        e.preview = false;
-        e.path = Some(label.to_path_buf());
-        e.diff = Some(data);
-        if self.is_blank_initial() {
-            self.editors[self.active] = e;
-            return Ok(());
-        }
-        if let Some(idx) = self.find_tab_with_path(label) {
-            self.editors[idx] = e;
-            self.select(idx);
-            return Ok(());
-        }
-        let pos = self.active + 1;
-        self.editors.insert(pos, e);
-        self.editors[self.active].focused = false;
-        self.active = pos;
-        Ok(())
-    }
-
-    /// Pinned-tab open: if the file is already in some tab, pin and switch
-    /// to it. Otherwise create a fresh pinned tab next to the active one.
-    /// Used by double-click in the explorer and Ctrl+Enter on a tree row.
-    pub fn open_pinned(&mut self, path: &Path) -> Result<()> {
-        // A diff tab can carry the working file's `path` yet is not an
-        // editable view of it, so skip diffs here: Enter on a diff (or a
-        // double-click) opens the real file beside the diff rather than just
-        // re-selecting the diff tab.
-        if let Some(idx) = self.find_tab_matching(path, |e| e.diff.is_none()) {
-            self.editors[idx].preview = false;
-            self.select(idx);
-            return Ok(());
-        }
-        if self.is_blank_initial() {
-            let active = self.active;
-            self.editors[active].open(path)?;
-            self.editors[active].preview = false;
-            self.editors[active].search_highlight = self.search_highlight_term.clone();
-            self.editors[active].search_highlight_opts = self.search_highlight_opts;
-            return Ok(());
-        }
-        let mut e = Editor::new();
-        e.focused = self.editors[self.active].focused;
-        e.open(path)?;
-        e.preview = false;
-        e.search_highlight = self.search_highlight_term.clone();
-        e.search_highlight_opts = self.search_highlight_opts;
-        let pos = self.active + 1;
-        self.editors.insert(pos, e);
-        self.editors[self.active].focused = false;
-        self.active = pos;
-        Ok(())
-    }
-
-    /// True iff the editor is in its just-launched state: a single tab with
-    /// no file loaded and no edits. `App::render` uses this to swap the
-    /// editor pane for the welcome screen, and `open_preview` /
-    /// `open_pinned` use it to reuse the placeholder tab rather than stack
-    /// a new one on top.
-    pub fn is_blank_initial(&self) -> bool {
-        self.editors.len() == 1
-            && self.editors[0].path.is_none()
-            && !self.editors[0].dirty
-            && self.editors[0].lines.iter().all(|l| l.is_empty())
-    }
-
-    /// Test-only helper that mirrors `open_preview` without going through
-    /// the disk: insert a preview tab whose path is set but whose buffer is
-    /// empty. Used by unit tests to exercise preview-slot bookkeeping in
-    /// isolation from filesystem I/O.
-    pub fn add_preview_tab_with_path(&mut self, path: PathBuf) {
-        let mut e = Editor::new();
-        e.path = Some(path);
-        e.preview = true;
-        e.focused = self.editors[self.active].focused;
-        let pos = self.active + 1;
-        self.editors.insert(pos, e);
-        self.editors[self.active].focused = false;
-        self.active = pos;
-    }
-
-    /// Test-only helper for the "single-click on a different file when a
-    /// preview tab already exists" path: rewrite the existing preview tab's
-    /// path without changing tab count.
-    pub fn repoint_preview_to(&mut self, path: PathBuf) {
-        if let Some(idx) = self.preview_index() {
-            self.editors[idx].path = Some(path);
-        }
-    }
-}
-
-impl Default for EditorTabs {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Deref for EditorTabs {
-    type Target = Editor;
-    fn deref(&self) -> &Editor {
-        &self.editors[self.active]
-    }
-}
-
-impl DerefMut for EditorTabs {
-    fn deref_mut(&mut self) -> &mut Editor {
-        &mut self.editors[self.active]
-    }
-}
-
-const TAB_STRIP_BG: Color = Color::Rgb(0x1f, 0x24, 0x36);
-const TAB_INACTIVE_BG: Color = Color::Rgb(0x2a, 0x2f, 0x3e);
-const TAB_ACTIVE_BG: Color = Color::Rgb(0x1e, 0x3a, 0x6e);
-const TAB_INACTIVE_FG: Color = Color::Rgb(0x9d, 0xa5, 0xb4);
-const TAB_ACTIVE_FG: Color = Color::White;
-
-impl Widget for &mut EditorTabs {
-    fn render(self, area: Rect, buf: &mut Buffer) {
-        self.last_full_area = area;
-        if area.height == 0 || area.width == 0 {
-            // Ctrl+Shift+J maximises the terminal pane, which collapses
-            // the editor area to height 0. The inner editor's `render`
-            // is never reached on this branch, so its `last_area` would
-            // otherwise keep the rectangle from the pre-maximise frame
-            // and `App::handle_mouse`'s `in_editor` hit-test
-            // (rect_contains(self.editor.last_area, ...)) would still
-            // win against the terminal in the dispatch chain at
-            // app.rs:7229 / 7336 — clicks meant to begin a terminal
-            // selection get routed to the editor's mouse_down and the
-            // file caret jumps instead. Zero the inner editor's
-            // hit-test rectangle here so the terminal pane wins
-            // unambiguously while the editor is collapsed.
-            for ed in self.editors.iter_mut() {
-                ed.last_area = Rect {
-                    x: area.x,
-                    y: area.y,
-                    width: area.width,
-                    height: 0,
-                };
-                ed.last_inner = ed.last_area;
-                ed.last_scrollbar = Rect::default();
-            }
-            return;
-        }
-        let strip_h: u16 = 1;
-        let strip = Rect {
-            x: area.x,
-            y: area.y,
-            width: area.width,
-            height: strip_h,
-        };
-        let body = Rect {
-            x: area.x,
-            y: area.y + strip_h,
-            width: area.width,
-            height: area.height - strip_h,
-        };
-
-        // Paint strip background first so the gap to the right of the last
-        // tab still reads as the tab-strip colour rather than terminal default.
-        let strip_bg_style = Style::default().bg(TAB_STRIP_BG);
-        for x in strip.x..strip.x + strip.width {
-            buf[(x, strip.y)].set_style(strip_bg_style);
-            buf[(x, strip.y)].set_symbol(" ");
-        }
-
-        self.tab_strip_y = strip.y;
-        self.tab_screen_ranges.clear();
-        self.tab_close_x.clear();
-        let mut cursor_x = strip.x;
-        let active = self.active;
-        for (i, ed) in self.editors.iter().enumerate() {
-            let label_text = tab_label(ed);
-            let label_chars = label_text.chars().count() as u16;
-            let pad: u16 = 1;
-            let close_pad: u16 = 2;
-            let width = label_chars
-                .saturating_add(pad * 2)
-                .saturating_add(close_pad);
-            if cursor_x.saturating_add(width) > strip.x + strip.width {
-                self.tab_screen_ranges.push((cursor_x, 0));
-                self.tab_close_x.push(0);
-                continue;
-            }
-            let is_active = i == active;
-            let bg = if is_active {
-                TAB_ACTIVE_BG
-            } else {
-                TAB_INACTIVE_BG
-            };
-            let fg = if is_active {
-                TAB_ACTIVE_FG
-            } else {
-                TAB_INACTIVE_FG
-            };
-            let mut modifiers = Modifier::empty();
-            if is_active {
-                modifiers |= Modifier::BOLD;
-            }
-            if ed.preview {
-                modifiers |= Modifier::ITALIC;
-            }
-            let style = Style::default().fg(fg).bg(bg).add_modifier(modifiers);
-            // Layout: " " + label + " " + ✕ + " "
-            let padded = format!(" {label_text} \u{2715} ");
-            buf.set_string(cursor_x, strip.y, &padded, style);
-            self.tab_screen_ranges.push((cursor_x, width));
-            self.tab_close_x.push(cursor_x + 1 + label_chars + 1);
-            cursor_x = cursor_x.saturating_add(width);
-        }
-
-        let active_editor = &mut self.editors[active];
-        Widget::render(active_editor, body, buf);
-    }
-}
-
-fn tab_label(e: &Editor) -> String {
-    if let Some(diff) = e.diff.as_ref() {
-        let l = diff
-            .left_path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| diff.left_path.to_string_lossy().into_owned());
-        // Synthetic single-sided diffs (deletion view, raw `git diff`
-        // text view) leave `right_path` empty / `/dev/null` so the tab
-        // label collapses to just the left label instead of trailing a
-        // misleading "↔ null".
-        let r_is_real = diff.right_path != std::path::Path::new("/dev/null")
-            && !diff.right_path.as_os_str().is_empty();
-        if r_is_real {
-            let r = diff
-                .right_path
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| diff.right_path.to_string_lossy().into_owned());
-            return format!("{l} \u{2194} {r}");
-        }
-        return l;
-    }
-    let name = match &e.path {
-        Some(p) => p
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| String::from("untitled")),
-        None => String::from("untitled"),
-    };
-    if e.dirty {
-        format!("\u{25cf} {name}")
-    } else {
-        name
     }
 }

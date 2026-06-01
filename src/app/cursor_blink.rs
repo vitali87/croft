@@ -19,6 +19,6 @@ impl CursorBlink {
         const HALF: Duration = Duration::from_millis(530);
         let elapsed = self.anchor.elapsed();
         let phases = (elapsed.as_millis() / HALF.as_millis()) as u64;
-        phases % 2 == 0
+        phases.is_multiple_of(2)
     }
 }

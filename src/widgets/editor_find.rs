@@ -177,7 +177,7 @@ pub fn render_editor_find(state: &mut EditorFind, editor_area: Rect, buf: &mut B
     Widget::render(Clear, rect, buf);
     let title = match (state.match_count, state.match_index) {
         (0, _) if state.query.is_empty() => String::from(" Find "),
-        (0, _) => format!(" Find — No results "),
+        (0, _) => " Find — No results ".to_string(),
         (total, Some(idx)) => format!(" Find — {idx} of {total} "),
         (total, None) => format!(" Find — {total} matches "),
     };

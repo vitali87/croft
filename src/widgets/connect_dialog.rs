@@ -351,18 +351,16 @@ impl Widget for &mut ConnectDialog {
                     .bg(PANEL_BG),
             ),
         ];
-        if installing {
-            if let Some(started) = self.install_started_at {
-                let secs = started.elapsed().as_secs();
-                let label = format!("  {:02}:{:02}", secs / 60, secs % 60);
-                header_spans.push(Span::styled(
-                    label,
-                    Style::default()
-                        .fg(TEAL)
-                        .bg(PANEL_BG)
-                        .add_modifier(Modifier::BOLD),
-                ));
-            }
+        if installing && let Some(started) = self.install_started_at {
+            let secs = started.elapsed().as_secs();
+            let label = format!("  {:02}:{:02}", secs / 60, secs % 60);
+            header_spans.push(Span::styled(
+                label,
+                Style::default()
+                    .fg(TEAL)
+                    .bg(PANEL_BG)
+                    .add_modifier(Modifier::BOLD),
+            ));
         }
         buf.set_line(inner.x, cy, &Line::from(header_spans), inner.width);
         cy = cy.saturating_add(2);
@@ -451,19 +449,19 @@ impl Widget for &mut ConnectDialog {
             cy = cy.saturating_add(2);
         }
 
-        if let Some(err) = &self.error {
-            if cy < inner.y + inner.height {
-                buf.set_line(
-                    inner.x,
-                    cy,
-                    &Line::from(vec![Span::styled(
-                        truncate(err, inner.width as usize),
-                        Style::default().fg(RED).bg(PANEL_BG),
-                    )]),
-                    inner.width,
-                );
-                cy = cy.saturating_add(2);
-            }
+        if let Some(err) = &self.error
+            && cy < inner.y + inner.height
+        {
+            buf.set_line(
+                inner.x,
+                cy,
+                &Line::from(vec![Span::styled(
+                    truncate(err, inner.width as usize),
+                    Style::default().fg(RED).bg(PANEL_BG),
+                )]),
+                inner.width,
+            );
+            cy = cy.saturating_add(2);
         }
 
         let footer_y = inner.y + inner.height.saturating_sub(2);

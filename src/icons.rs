@@ -77,6 +77,66 @@ fn name_icon(n: &str) -> Option<Icon> {
     })
 }
 
+fn ext_icon(s: &str) -> Option<Icon> {
+    let i = |g, r, gr, b| Icon {
+        glyph: g,
+        color: rgb(r, gr, b),
+    };
+    Some(match s {
+        ".py" | ".pyi" | ".pyc" | ".ipynb" => i('\u{e235}', 0x35, 0x72, 0xa5),
+        ".js" | ".mjs" | ".cjs" => i('\u{e74e}', 0xcb, 0xcb, 0x41),
+        ".jsx" | ".tsx" => i('\u{e7ba}', 0x51, 0x9a, 0xba),
+        ".ts" => i('\u{e628}', 0x51, 0x9a, 0xba),
+        ".html" | ".htm" => i('\u{e736}', 0xe4, 0x4d, 0x26),
+        ".css" | ".tcss" => i('\u{e749}', 0x42, 0xa5, 0xf5),
+        ".scss" | ".sass" => i('\u{e603}', 0xcc, 0x66, 0x99),
+        ".json" | ".jsonc" => i('\u{ed0d}', 0xcb, 0xcb, 0x41),
+        ".md" | ".markdown" => i('\u{f48a}', 0x51, 0x9a, 0xba),
+        ".yaml" | ".yml" => i('\u{e6a8}', 0xcb, 0x17, 0x1e),
+        ".toml" => i('\u{e6b2}', 0x9c, 0x42, 0x21),
+        // cod-table — closest in-font match for a database/sql file
+        ".sql" => i('\u{ebb7}', 0xda, 0xd8, 0xd8),
+        ".sh" | ".bash" | ".zsh" | ".fish" => i('\u{ebca}', 0x4d, 0x5a, 0x5e),
+        ".go" => i('\u{e627}', 0x51, 0x9a, 0xba),
+        ".rs" => i('\u{e7a8}', 0xde, 0xa5, 0x84),
+        ".java" => i('\u{e738}', 0xcc, 0x3e, 0x44),
+        ".kt" | ".kts" => i('\u{e634}', 0x7f, 0x52, 0xff),
+        ".c" => i('\u{e61e}', 0x59, 0x9e, 0xff),
+        ".h" => i('\u{e61e}', 0xa0, 0x74, 0xc4),
+        ".cpp" => i('\u{e61d}', 0x51, 0x9a, 0xba),
+        ".hpp" => i('\u{e61d}', 0xa0, 0x74, 0xc4),
+        ".cs" => i('\u{e648}', 0x59, 0x67, 0x06),
+        ".rb" => i('\u{e739}', 0xcc, 0x34, 0x2d),
+        ".php" => i('\u{e73d}', 0xa0, 0x74, 0xc4),
+        ".swift" => i('\u{e755}', 0xe3, 0x79, 0x33),
+        ".lua" => i('\u{e620}', 0x00, 0x00, 0x80),
+        ".vim" => i('\u{e7c5}', 0x01, 0x98, 0x33),
+        ".xml" => i('\u{eabe}', 0xe3, 0x79, 0x33),
+        ".svg" => i('\u{eabe}', 0xff, 0xb1, 0x3b),
+        // cod-file_media (NOT cod-mail U+EB1C, which is an envelope)
+        ".png" | ".jpg" | ".jpeg" | ".gif" | ".webp" | ".bmp" | ".ico" => {
+            i('\u{eaea}', 0xa0, 0x74, 0xc4)
+        }
+        ".pdf" => i('\u{eaeb}', 0xb3, 0x0b, 0x00),
+        // cod-file_zip (NOT cod-filter U+EAF1, which is a funnel)
+        ".zip" | ".tar" | ".gz" => i('\u{eaef}', 0xcc, 0xa7, 0x00),
+        ".lock" => i('\u{ea75}', 0x51, 0x9a, 0xba),
+        // cod-output (NOT cod-mention U+EB1F, which is the @ glyph)
+        ".log" => i('\u{eb9d}', 0xda, 0xd8, 0xd8),
+        ".txt" => i('\u{f15c}', 0xcc, 0xcc, 0xcc),
+        // cod-table (NOT cod-triangle_down U+EB6E)
+        ".csv" | ".tsv" => i('\u{ebb7}', 0x7c, 0xb3, 0x42),
+        // Microsoft Excel green (#107c41) for .xlsx/.xls/.xlsb so the
+        // explorer reads spreadsheet-at-a-glance the same way the editor's
+        // sheet-preview pane does.
+        ".xlsx" | ".xls" | ".xlsb" => i('\u{ebb7}', 0x10, 0x7c, 0x41),
+        // LibreOffice Calc green for OpenDocument Spreadsheets.
+        ".ods" => i('\u{ebb7}', 0x18, 0xa3, 0x03),
+        ".env" => i('\u{eb51}', 0xfa, 0xf7, 0x43),
+        _ => return None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -352,64 +412,4 @@ mod tests {
         let icon = for_path("query.sql", ".sql");
         assert_ne!(icon.glyph, '\u{ebc1}');
     }
-}
-
-fn ext_icon(s: &str) -> Option<Icon> {
-    let i = |g, r, gr, b| Icon {
-        glyph: g,
-        color: rgb(r, gr, b),
-    };
-    Some(match s {
-        ".py" | ".pyi" | ".pyc" | ".ipynb" => i('\u{e235}', 0x35, 0x72, 0xa5),
-        ".js" | ".mjs" | ".cjs" => i('\u{e74e}', 0xcb, 0xcb, 0x41),
-        ".jsx" | ".tsx" => i('\u{e7ba}', 0x51, 0x9a, 0xba),
-        ".ts" => i('\u{e628}', 0x51, 0x9a, 0xba),
-        ".html" | ".htm" => i('\u{e736}', 0xe4, 0x4d, 0x26),
-        ".css" | ".tcss" => i('\u{e749}', 0x42, 0xa5, 0xf5),
-        ".scss" | ".sass" => i('\u{e603}', 0xcc, 0x66, 0x99),
-        ".json" | ".jsonc" => i('\u{ed0d}', 0xcb, 0xcb, 0x41),
-        ".md" | ".markdown" => i('\u{f48a}', 0x51, 0x9a, 0xba),
-        ".yaml" | ".yml" => i('\u{e6a8}', 0xcb, 0x17, 0x1e),
-        ".toml" => i('\u{e6b2}', 0x9c, 0x42, 0x21),
-        // cod-table — closest in-font match for a database/sql file
-        ".sql" => i('\u{ebb7}', 0xda, 0xd8, 0xd8),
-        ".sh" | ".bash" | ".zsh" | ".fish" => i('\u{ebca}', 0x4d, 0x5a, 0x5e),
-        ".go" => i('\u{e627}', 0x51, 0x9a, 0xba),
-        ".rs" => i('\u{e7a8}', 0xde, 0xa5, 0x84),
-        ".java" => i('\u{e738}', 0xcc, 0x3e, 0x44),
-        ".kt" | ".kts" => i('\u{e634}', 0x7f, 0x52, 0xff),
-        ".c" => i('\u{e61e}', 0x59, 0x9e, 0xff),
-        ".h" => i('\u{e61e}', 0xa0, 0x74, 0xc4),
-        ".cpp" => i('\u{e61d}', 0x51, 0x9a, 0xba),
-        ".hpp" => i('\u{e61d}', 0xa0, 0x74, 0xc4),
-        ".cs" => i('\u{e648}', 0x59, 0x67, 0x06),
-        ".rb" => i('\u{e739}', 0xcc, 0x34, 0x2d),
-        ".php" => i('\u{e73d}', 0xa0, 0x74, 0xc4),
-        ".swift" => i('\u{e755}', 0xe3, 0x79, 0x33),
-        ".lua" => i('\u{e620}', 0x00, 0x00, 0x80),
-        ".vim" => i('\u{e7c5}', 0x01, 0x98, 0x33),
-        ".xml" => i('\u{eabe}', 0xe3, 0x79, 0x33),
-        ".svg" => i('\u{eabe}', 0xff, 0xb1, 0x3b),
-        // cod-file_media (NOT cod-mail U+EB1C, which is an envelope)
-        ".png" | ".jpg" | ".jpeg" | ".gif" | ".webp" | ".bmp" | ".ico" => {
-            i('\u{eaea}', 0xa0, 0x74, 0xc4)
-        }
-        ".pdf" => i('\u{eaeb}', 0xb3, 0x0b, 0x00),
-        // cod-file_zip (NOT cod-filter U+EAF1, which is a funnel)
-        ".zip" | ".tar" | ".gz" => i('\u{eaef}', 0xcc, 0xa7, 0x00),
-        ".lock" => i('\u{ea75}', 0x51, 0x9a, 0xba),
-        // cod-output (NOT cod-mention U+EB1F, which is the @ glyph)
-        ".log" => i('\u{eb9d}', 0xda, 0xd8, 0xd8),
-        ".txt" => i('\u{f15c}', 0xcc, 0xcc, 0xcc),
-        // cod-table (NOT cod-triangle_down U+EB6E)
-        ".csv" | ".tsv" => i('\u{ebb7}', 0x7c, 0xb3, 0x42),
-        // Microsoft Excel green (#107c41) for .xlsx/.xls/.xlsb so the
-        // explorer reads spreadsheet-at-a-glance the same way the editor's
-        // sheet-preview pane does.
-        ".xlsx" | ".xls" | ".xlsb" => i('\u{ebb7}', 0x10, 0x7c, 0x41),
-        // LibreOffice Calc green for OpenDocument Spreadsheets.
-        ".ods" => i('\u{ebb7}', 0x18, 0xa3, 0x03),
-        ".env" => i('\u{eb51}', 0xfa, 0xf7, 0x43),
-        _ => return None,
-    })
 }
