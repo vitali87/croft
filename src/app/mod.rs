@@ -6287,12 +6287,20 @@ impl App {
                 self.editor.cursor_row = row;
                 self.editor.cursor_col = col;
                 self.editor.ensure_cursor_col_visible();
+                // Record the hit the cursor jumped to so the renderer paints it
+                // in the distinct active colour (orange) while the remaining
+                // matches keep the regular yellow. Literal search, so the match
+                // is exactly `term` long in characters.
+                self.editor.active_search_match = Some((row, col, term.chars().count()));
                 self.status = match dir {
                     crate::vim::SearchDir::Forward => format!("/{term}"),
                     crate::vim::SearchDir::Backward => format!("?{term}"),
                 };
             }
-            None => self.status = format!("Pattern not found: {term}"),
+            None => {
+                self.editor.active_search_match = None;
+                self.status = format!("Pattern not found: {term}");
+            }
         }
     }
 

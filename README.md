@@ -184,7 +184,7 @@ croft setup-terminal --help
 | `p` `P` | Paste after / before (linewise when the yank was a whole line) |
 | `u` | Undo |
 | `v` `V` | Charwise / linewise Visual; then a motion extends and `d` `y` `c` operate |
-| `/` `?` then `Enter`, `n` `N` | Search forward / back in the buffer, jump to next / previous match |
+| `/` `?` then `Enter`, `n` `N` | Search forward / back in the buffer, jump to next / previous match; the active match is highlighted in orange and the rest in yellow |
 | `:w` `:q` `:wq` `:x` `:q!` `:qa`, `:{n}` | Write, close tab, write-and-close, quit-all, or jump to line `n` |
 
 When vim mode is on it supersedes the always-on `Cmd`+`d` `d` / `Cmd`+`g` `g` chord shortcuts listed above; turn it off to get those back.

@@ -9161,6 +9161,27 @@ fn vim_search_moves_cursor_to_match() {
 }
 
 #[test]
+fn vim_search_records_active_match_and_advances_with_n() {
+    // Two matches on one line: "x needle y needle z" -> cols 2 and 11.
+    let (mut app, _t) = vim_app("x needle y needle z");
+    vim_feed(&mut app, '/');
+    vim_feed_str(&mut app, "needle");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(
+        app.editor.active_search_match,
+        Some((0, 2, 6)),
+        "the match the cursor jumped to must be recorded as (row, col_chars, len_chars) so the renderer paints it orange while the other 'needle' stays yellow"
+    );
+    vim_feed(&mut app, 'n');
+    assert_eq!(
+        app.editor.active_search_match,
+        Some((0, 11, 6)),
+        "`n` advances the active match to the next occurrence"
+    );
+}
+
+#[test]
 fn vim_gg_and_capital_g_jump_between_ends() {
     let (mut app, _t) = vim_app("one\ntwo\nthree");
     app.handle_key(key(KeyCode::Char('G'), KeyModifiers::SHIFT))
