@@ -1117,9 +1117,9 @@ pub struct Editor {
     pub selection: Option<EditorSelection>,
     /// Secondary carets for multi-cursor editing (VS Code "Change All
     /// Occurrences"). The primary caret stays in `cursor_row`/`cursor_col`
-    /// + `selection`; these are the *extra* carets. Empty in the common
+    /// plus `selection`; these are the *extra* carets. Empty in the common
     /// single-cursor case, which keeps every existing edit path unchanged.
-    /// Each entry is a full selection (anchor + head); head is that caret's
+    /// Each entry is a full selection (anchor and head); head is that caret's
     /// cursor. Edits apply to the primary and all of these as one undo step.
     pub carets: Vec<EditorSelection>,
     /// True when this tab is the single replaceable "preview" slot. Single-
