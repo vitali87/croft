@@ -10,6 +10,7 @@ A VS Code style three pane workspace that runs entirely inside your terminal. Wr
 * **Top right pane (editor):** code editor with `tree-sitter` syntax highlighting plus inline preview tabs for PNG / JPEG / GIF / BMP / WebP, PDFs (with page navigation), and CSV / TSV / XLSX / XLS / ODS spreadsheets. An optional native modal (vim) editing mode toggles on with `Cmd`+`E`.
 * **Bottom right pane (terminal):** a real interactive shell, your `$SHELL` running on a real PTY.
 * All three panes resize by dragging the seams between them.
+* **Local or remote, identical:** run croft on your own machine, or `croft remote <host>` to launch it over SSH on any Linux server. Both are first-class targets with no degraded "remote mode": the same speed, feel, and correctness whether the files live on your Mac or on a box across the world.
 
 Built on [ratatui](https://ratatui.rs/) + [crossterm](https://github.com/crossterm-rs/crossterm), with [portable-pty](https://docs.rs/portable-pty/) for the embedded shell, [vt100](https://docs.rs/vt100/) for terminal-state parsing, [tree-sitter](https://tree-sitter.github.io/tree-sitter/) for incremental, AST-based syntax highlighting, [calamine](https://docs.rs/calamine/) for spreadsheet parsing, and the iTerm2 OSC 1337 inline-image protocol for image / PDF previews.
 
