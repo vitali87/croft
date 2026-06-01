@@ -9192,6 +9192,33 @@ fn vim_gg_and_capital_g_jump_between_ends() {
 }
 
 #[test]
+fn vim_toggle_off_clears_search_highlights() {
+    let (mut app, _t) = vim_app("x needle y needle z");
+    vim_feed(&mut app, '/');
+    vim_feed_str(&mut app, "needle");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert!(
+        app.editor.search_highlight.is_some(),
+        "precondition: a vim search leaves the match-highlight term set"
+    );
+    assert!(app.editor.active_search_match.is_some());
+    // Toggling vim mode off with Cmd+E is the only way to dismiss vim search
+    // highlights, so it must clear both the highlight term and the active match.
+    app.handle_key(key(KeyCode::Char('e'), KeyModifiers::SUPER))
+        .unwrap();
+    assert!(!app.vim.enabled);
+    assert!(
+        app.editor.search_highlight.is_none(),
+        "toggling vim off must clear the search-match highlight term so no matches stay painted"
+    );
+    assert!(
+        app.editor.active_search_match.is_none(),
+        "toggling vim off must clear the active-match marker too"
+    );
+}
+
+#[test]
 fn vim_toggle_off_restores_plain_typing() {
     let (mut app, _t) = vim_app("");
     // Cmd+E turns modal editing off.

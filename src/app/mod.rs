@@ -5421,6 +5421,11 @@ impl App {
             self.status = if self.vim.enabled {
                 String::from("vim mode on")
             } else {
+                // Turning modal editing off dismisses any vim search match
+                // highlights; the `/` `?` flow has no other clear gesture, so
+                // the toggle is the way out.
+                self.editor
+                    .set_search_highlight(None, crate::widgets::search::SearchOpts::default());
                 String::from("vim mode off")
             };
             return;
