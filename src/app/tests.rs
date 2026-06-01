@@ -9468,3 +9468,67 @@ fn change_all_occurrences_key_accepts_cmd_ctrl_or_alt_f2() {
         KeyModifiers::NONE
     )));
 }
+
+#[test]
+fn go_to_definition_key_is_f12_without_shift() {
+    assert!(is_go_to_definition_key(key(
+        KeyCode::F(12),
+        KeyModifiers::NONE
+    )));
+    // Cmd/Ctrl/Alt+F12 (incl. iTerm2's Cmd-folded-to-Meta) still mean Definition.
+    assert!(is_go_to_definition_key(key(
+        KeyCode::F(12),
+        KeyModifiers::SUPER
+    )));
+    assert!(is_go_to_definition_key(key(
+        KeyCode::F(12),
+        KeyModifiers::ALT
+    )));
+    // Shift+F12 is Declaration, not Definition.
+    assert!(!is_go_to_definition_key(key(
+        KeyCode::F(12),
+        KeyModifiers::SHIFT
+    )));
+    assert!(!is_go_to_definition_key(key(
+        KeyCode::F(11),
+        KeyModifiers::NONE
+    )));
+}
+
+#[test]
+fn go_to_declaration_key_is_shift_f12() {
+    assert!(is_go_to_declaration_key(key(
+        KeyCode::F(12),
+        KeyModifiers::SHIFT
+    )));
+    // Plain F12 is Definition, not Declaration.
+    assert!(!is_go_to_declaration_key(key(
+        KeyCode::F(12),
+        KeyModifiers::NONE
+    )));
+    assert!(!is_go_to_declaration_key(key(
+        KeyCode::F(2),
+        KeyModifiers::SHIFT
+    )));
+}
+
+#[test]
+fn shortcut_for_returns_expected_shortcuts_for_editor_symbol_actions() {
+    // Every editor symbol-menu row must advertise a working accelerator.
+    assert_eq!(
+        shortcut_for(&MenuAction::GoToDefinitionAt { row: 0, col: 0 }),
+        Some("F12")
+    );
+    assert_eq!(
+        shortcut_for(&MenuAction::GoToDeclarationAt { row: 0, col: 0 }),
+        Some("⇧F12")
+    );
+    assert_eq!(
+        shortcut_for(&MenuAction::RenameSymbolAt { row: 0, col: 0 }),
+        Some("F2")
+    );
+    assert_eq!(
+        shortcut_for(&MenuAction::ChangeAllOccurrencesAt { row: 0, col: 0 }),
+        Some("⌘F2")
+    );
+}

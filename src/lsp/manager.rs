@@ -50,6 +50,13 @@ pub struct DefinitionResult {
 }
 
 #[derive(Debug)]
+pub struct DeclarationResult {
+    pub request_id: u64,
+    pub path: PathBuf,
+    pub target: Option<(PathBuf, u32, u32)>,
+}
+
+#[derive(Debug)]
 pub struct RenameResult {
     pub request_id: u64,
     pub path: PathBuf,
@@ -88,6 +95,12 @@ enum Cmd {
         line: u32,
         character: u32,
     },
+    RequestDeclaration {
+        request_id: u64,
+        path: PathBuf,
+        line: u32,
+        character: u32,
+    },
     RequestRename {
         request_id: u64,
         path: PathBuf,
@@ -102,6 +115,7 @@ pub struct LspManager {
     completion_rx: std_mpsc::Receiver<CompletionResult>,
     hover_rx: std_mpsc::Receiver<HoverResult>,
     def_rx: std_mpsc::Receiver<DefinitionResult>,
+    decl_rx: std_mpsc::Receiver<DeclarationResult>,
     rename_rx: std_mpsc::Receiver<RenameResult>,
     next_request_id: u64,
     workspace_root: PathBuf,
@@ -115,22 +129,27 @@ impl LspManager {
         let (completion_tx, completion_rx) = std_mpsc::channel();
         let (hover_tx, hover_rx) = std_mpsc::channel();
         let (def_tx, def_rx) = std_mpsc::channel();
+        let (decl_tx, decl_rx) = std_mpsc::channel();
         let (rename_tx, rename_rx) = std_mpsc::channel();
         let root = workspace_root.clone();
         runtime.handle().spawn(worker_loop(
             root,
             ServerRegistry::with_defaults(),
             cmd_rx,
-            completion_tx,
-            hover_tx,
-            def_tx,
-            rename_tx,
+            ResultSenders {
+                completion: completion_tx,
+                hover: hover_tx,
+                definition: def_tx,
+                declaration: decl_tx,
+                rename: rename_tx,
+            },
         ));
         Ok(Self {
             cmd_tx,
             completion_rx,
             hover_rx,
             def_rx,
+            decl_rx,
             rename_rx,
             next_request_id: 1,
             workspace_root,
@@ -202,6 +221,22 @@ impl LspManager {
         self.def_rx.try_recv().ok()
     }
 
+    pub fn request_declaration(&mut self, path: PathBuf, line: u32, character: u32) -> u64 {
+        let id = self.next_request_id;
+        self.next_request_id += 1;
+        let _ = self.cmd_tx.send(Cmd::RequestDeclaration {
+            request_id: id,
+            path,
+            line,
+            character,
+        });
+        id
+    }
+
+    pub fn drain_declaration(&self) -> Option<DeclarationResult> {
+        self.decl_rx.try_recv().ok()
+    }
+
     pub fn request_rename(
         &mut self,
         path: PathBuf,
@@ -232,6 +267,7 @@ struct ManagedClient {
     supports_completion: bool,
     supports_hover: bool,
     supports_definition: bool,
+    supports_declaration: bool,
     supports_rename: bool,
 }
 
@@ -247,14 +283,21 @@ struct DocState {
     version: i32,
 }
 
+/// The reply channels the worker sends results back on, bundled so
+/// `worker_loop` keeps a small argument list as request kinds grow.
+struct ResultSenders {
+    completion: std_mpsc::Sender<CompletionResult>,
+    hover: std_mpsc::Sender<HoverResult>,
+    definition: std_mpsc::Sender<DefinitionResult>,
+    declaration: std_mpsc::Sender<DeclarationResult>,
+    rename: std_mpsc::Sender<RenameResult>,
+}
+
 async fn worker_loop(
     workspace_root: PathBuf,
     registry: ServerRegistry,
     mut cmd_rx: tokio_mpsc::UnboundedReceiver<Cmd>,
-    completion_tx: std_mpsc::Sender<CompletionResult>,
-    hover_tx: std_mpsc::Sender<HoverResult>,
-    def_tx: std_mpsc::Sender<DefinitionResult>,
-    rename_tx: std_mpsc::Sender<RenameResult>,
+    tx: ResultSenders,
 ) {
     let mut state = WorkerState {
         workspace_root,
@@ -274,7 +317,7 @@ async fn worker_loop(
                 character,
             } => {
                 state
-                    .request_completion(request_id, path, line, character, &completion_tx)
+                    .request_completion(request_id, path, line, character, &tx.completion)
                     .await
             }
             Cmd::RequestHover {
@@ -284,7 +327,7 @@ async fn worker_loop(
                 character,
             } => {
                 state
-                    .request_hover(request_id, path, line, character, &hover_tx)
+                    .request_hover(request_id, path, line, character, &tx.hover)
                     .await
             }
             Cmd::RequestDefinition {
@@ -294,7 +337,17 @@ async fn worker_loop(
                 character,
             } => {
                 state
-                    .request_definition(request_id, path, line, character, &def_tx)
+                    .request_definition(request_id, path, line, character, &tx.definition)
+                    .await
+            }
+            Cmd::RequestDeclaration {
+                request_id,
+                path,
+                line,
+                character,
+            } => {
+                state
+                    .request_declaration(request_id, path, line, character, &tx.declaration)
                     .await
             }
             Cmd::RequestRename {
@@ -305,7 +358,7 @@ async fn worker_loop(
                 new_name,
             } => {
                 state
-                    .request_rename(request_id, path, line, character, new_name, &rename_tx)
+                    .request_rename(request_id, path, line, character, new_name, &tx.rename)
                     .await
             }
         }
@@ -344,9 +397,11 @@ impl WorkerState {
                         let supports_hover = client.capabilities().hover_provider.is_some();
                         let supports_definition =
                             client.capabilities().definition_provider.is_some();
+                        let supports_declaration =
+                            client.capabilities().declaration_provider.is_some();
                         let supports_rename = client.capabilities().rename_provider.is_some();
                         log_file::log(&format!(
-                            "lsp[{}] spawned, supports_completion={supports} supports_hover={supports_hover} supports_definition={supports_definition} supports_rename={supports_rename}",
+                            "lsp[{}] spawned, supports_completion={supports} supports_hover={supports_hover} supports_definition={supports_definition} supports_declaration={supports_declaration} supports_rename={supports_rename}",
                             config.name
                         ));
                         spawned.push(ManagedClient {
@@ -355,6 +410,7 @@ impl WorkerState {
                             supports_completion: supports,
                             supports_hover,
                             supports_definition,
+                            supports_declaration,
                             supports_rename,
                         });
                     }
@@ -657,6 +713,70 @@ impl WorkerState {
                 target.is_some()
             ));
             let _ = tx.send(DefinitionResult {
+                request_id,
+                path: path_clone,
+                target,
+            });
+        });
+    }
+
+    async fn request_declaration(
+        &mut self,
+        request_id: u64,
+        path: PathBuf,
+        line: u32,
+        character: u32,
+        tx: &std_mpsc::Sender<DeclarationResult>,
+    ) {
+        let Some(doc) = self.docs.get(&path) else {
+            return;
+        };
+        let lang = doc.language;
+        // Re-probe so a server installed since the file was opened (e.g. the
+        // managed vtsls finishing its lazy background install) is picked up
+        // without reopening the file. Cheap once the list is non-empty.
+        self.ensure_clients(lang).await;
+        let Some(clients) = self.clients.get(&lang) else {
+            return;
+        };
+        let picked = clients
+            .iter()
+            .find(|c| c.supports_declaration)
+            .map(|c| (c.name.clone(), c.client.clone()));
+        let Some((server_name, client_arc)) = picked else {
+            let _ = tx.send(DeclarationResult {
+                request_id,
+                path,
+                target: None,
+            });
+            return;
+        };
+        let Ok(uri) = Url::from_file_path(&path) else {
+            return;
+        };
+        let tx = tx.clone();
+        let path_clone = path.clone();
+        log_file::log(&format!(
+            "declaration request id={request_id} server={server_name} path={} line={line} char={character}",
+            path.display()
+        ));
+        tokio::spawn(async move {
+            let mut client = client_arc.lock().await;
+            let resp = client.declaration(uri, line, character).await;
+            drop(client);
+            let target = match resp {
+                Ok(Some(r)) => def_location(&r),
+                Ok(None) => None,
+                Err(e) => {
+                    log_file::log(&format!("lsp[{server_name}] declaration error: {e}"));
+                    None
+                }
+            };
+            log_file::log(&format!(
+                "declaration response id={request_id} server={server_name} has_target={}",
+                target.is_some()
+            ));
+            let _ = tx.send(DeclarationResult {
                 request_id,
                 path: path_clone,
                 target,

@@ -168,9 +168,10 @@ croft setup-terminal --help
 | `Esc` | Clear the current selection, or collapse multi-cursors back to one |
 | `F2` | Rename Symbol: LSP rename of the identifier under the cursor across every file it touches (open tabs edit in-memory and stay dirty; closed files are rewritten on disk) |
 | `Cmd`+`F2` / `Ctrl`+`F2` | Change All Occurrences: drop a cursor on every textual match of the word in the current file and edit them all at once; type to replace, `Esc` to finish |
-| `Cmd`/`Option`+click | Go to Definition (jumps via the language server); `Cmd`+`Shift`+click navigates back |
+| `F12` / `Cmd`/`Option`+click | Go to Definition (jumps via the language server); `Cmd`+`Shift`+click navigates back |
+| `Shift`+`F12` | Go to Declaration: jumps to where the symbol is declared (the header prototype in C/C++, the `.d.ts` signature in TypeScript); coincides with Definition in languages that have no separate declaration site |
 | Hover (300 ms dwell) | Show the LSP hover popup for the symbol under the pointer |
-| Right-click | Editor symbol menu: Go to Definition, Rename Symbol, Change All Occurrences |
+| Right-click | Editor symbol menu: Go to Definition, Go to Declaration, Rename Symbol, Change All Occurrences |
 | `Cmd`+`E` | Toggle native modal (vim) editing for the editor pane (see below) |
 
 ### Editor: vim mode (modal editing)
@@ -403,7 +404,7 @@ What works:
 
 The repo ships 568 unit tests plus CLI integration tests; run with `cargo test`.
 
-Already working: the three-pane layout, file explorer, multi-tab editor with syntax highlighting, live embedded terminals, git status, fuzzy file finder, remote launch over SSH, and LSP-backed completion, diagnostics, hover, go-to-definition, and rename-symbol (Python, TypeScript/TSX, JavaScript, Rust, Go).
+Already working: the three-pane layout, file explorer, multi-tab editor with syntax highlighting, live embedded terminals, git status, fuzzy file finder, remote launch over SSH, and LSP-backed completion, diagnostics, hover, go-to-definition, go-to-declaration, and rename-symbol (Python, TypeScript/TSX, JavaScript, Rust, Go).
 
 ## Goal
 

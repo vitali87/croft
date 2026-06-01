@@ -336,6 +336,13 @@ enum MenuAction {
         row: usize,
         col: usize,
     },
+    /// Editor body: LSP "Go to Declaration" of the identifier at buffer
+    /// `(row, col)`. Distinct from definition for languages that separate the
+    /// two (C/C++ header prototype vs `.c` body, TypeScript `.d.ts` vs source).
+    GoToDeclarationAt {
+        row: usize,
+        col: usize,
+    },
 }
 
 /// Return the macOS-style keyboard shortcut hint to display on the right
@@ -359,6 +366,7 @@ fn shortcut_for(action: &MenuAction) -> Option<&'static str> {
         MenuAction::RenameSymbolAt { .. } => Some("F2"),
         MenuAction::ChangeAllOccurrencesAt { .. } => Some("⌘F2"),
         MenuAction::GoToDefinitionAt { .. } => Some("F12"),
+        MenuAction::GoToDeclarationAt { .. } => Some("⇧F12"),
         _ => None,
     }
 }
@@ -816,6 +824,7 @@ pub struct App {
     hover_anchor: Option<(u16, u16)>,
     hover_word: Option<(usize, usize, usize)>,
     definition_request_id: Option<u64>,
+    declaration_request_id: Option<u64>,
     rename_request_id: Option<u64>,
     nav: NavHistory,
     editor_vim_chord: EditorVimChord,
@@ -1379,6 +1388,7 @@ impl App {
             hover_anchor: None,
             hover_word: None,
             definition_request_id: None,
+            declaration_request_id: None,
             nav: NavHistory::default(),
         })
     }
@@ -2363,6 +2373,30 @@ impl App {
         }
     }
 
+    pub fn drain_lsp_declaration(&mut self) -> bool {
+        let mut target = None;
+        {
+            let Some(lsp) = self.lsp.as_ref() else {
+                return false;
+            };
+            while let Some(result) = lsp.drain_declaration() {
+                if Some(result.request_id) != self.declaration_request_id {
+                    continue;
+                }
+                target = result.target;
+            }
+        }
+        match target {
+            // The jump itself is identical to definition: open the target file,
+            // move the caret, record nav history.
+            Some((path, line, col)) => {
+                self.go_to_definition(path, line, col);
+                true
+            }
+            None => false,
+        }
+    }
+
     fn open_at(&mut self, path: &Path, row: usize, col: usize) -> Result<()> {
         self.hover_popup = None;
         self.editor.open_preview(path)?;
@@ -2431,6 +2465,24 @@ impl App {
         };
         let id = lsp.request_definition(path, row as u32, col as u32);
         self.definition_request_id = Some(id);
+    }
+
+    /// Request the LSP declaration of the symbol at the current cursor (buffer)
+    /// position. Used by the editor right-click "Go to Declaration" item and the
+    /// `⇧F12` keybinding. Declaration and definition coincide for languages with
+    /// no separate declaration site (e.g. Python); they diverge for C/C++ (header
+    /// prototype) and TypeScript (`.d.ts`).
+    fn request_declaration_at_cursor(&mut self) {
+        let row = self.editor.cursor_row;
+        let col = self.editor.cursor_col;
+        let Some(path) = self.editor.path.clone() else {
+            return;
+        };
+        let Some(lsp) = self.lsp.as_mut() else {
+            return;
+        };
+        let id = lsp.request_declaration(path, row as u32, col as u32);
+        self.declaration_request_id = Some(id);
     }
 
     /// VS Code "Change All Occurrences" (Cmd/Ctrl+F2): select every textual
@@ -5686,6 +5738,28 @@ impl App {
             self.start_change_all_occurrences();
             return;
         }
+        // Go to Definition (F12) / Go to Declaration (Shift+F12), the VS Code
+        // F12-family bindings, also need a real text buffer. Both are no-ops on
+        // read-only diff / sheet / image tabs; the keystroke is still swallowed
+        // so it never leaks into the buffer.
+        if is_go_to_definition_key(key) {
+            if self.editor.diff.is_none()
+                && self.editor.sheet.is_none()
+                && self.editor.image.is_none()
+            {
+                self.request_definition_at_cursor();
+            }
+            return;
+        }
+        if is_go_to_declaration_key(key) {
+            if self.editor.diff.is_none()
+                && self.editor.sheet.is_none()
+                && self.editor.image.is_none()
+            {
+                self.request_declaration_at_cursor();
+            }
+            return;
+        }
         // While multi-cursor mode is live, printable typing / backspace /
         // delete fan out to every caret and Esc collapses back to one cursor.
         // Any other key collapses the carets and falls through to normal
@@ -8322,6 +8396,10 @@ impl App {
                             MenuAction::GoToDefinitionAt { row, col },
                         ),
                         (
+                            String::from("Go to Declaration"),
+                            MenuAction::GoToDeclarationAt { row, col },
+                        ),
+                        (
                             String::from("Rename Symbol"),
                             MenuAction::RenameSymbolAt { row, col },
                         ),
@@ -9447,6 +9525,12 @@ impl App {
                 self.editor.cursor_col = col;
                 self.focus_pane(Pane::Editor);
                 self.request_definition_at_cursor();
+            }
+            MenuAction::GoToDeclarationAt { row, col } => {
+                self.editor.cursor_row = row;
+                self.editor.cursor_col = col;
+                self.focus_pane(Pane::Editor);
+                self.request_declaration_at_cursor();
             }
         }
     }
@@ -10838,6 +10922,21 @@ fn is_change_all_occurrences_key(key: KeyEvent) -> bool {
             || key.modifiers.contains(KeyModifiers::ALT))
 }
 
+/// Editor-pane Go to Definition: plain `F12` (VS Code's binding). Shift is the
+/// one modifier iTerm2 never folds onto the Meta/ALT bit, so it cleanly splits
+/// this from Go to Declaration below: any `F12` without Shift is Definition.
+fn is_go_to_definition_key(key: KeyEvent) -> bool {
+    matches!(key.code, KeyCode::F(12)) && !key.modifiers.contains(KeyModifiers::SHIFT)
+}
+
+/// Editor-pane Go to Declaration: `Shift+F12`. VS Code leaves Declaration
+/// unbound, so croft assigns it within the F12 navigation family (Shift being
+/// the reliably-distinguishable modifier) rather than ship a menu row with no
+/// accelerator.
+fn is_go_to_declaration_key(key: KeyEvent) -> bool {
+    matches!(key.code, KeyCode::F(12)) && key.modifiers.contains(KeyModifiers::SHIFT)
+}
+
 fn chord_status_text(op: char, count: usize) -> String {
     if count > 0 {
         format!("Pending: {op} (count {count})")
@@ -12079,6 +12178,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         app.poll_hover();
         let hover_changed = app.drain_lsp_hover();
         let definition_changed = app.drain_lsp_definition();
+        let declaration_changed = app.drain_lsp_declaration();
         let rename_changed = app.drain_lsp_rename();
         let sysmon_changed = app.drain_sysmon();
         // Surface the managed TypeScript-server install progress in the status
@@ -12113,6 +12213,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             || lsp_changed
             || hover_changed
             || definition_changed
+            || declaration_changed
             || rename_changed
             || install_status_changed
             || sysmon_changed;
