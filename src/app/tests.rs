@@ -712,13 +712,6 @@ fn paint_gradient_box_skips_when_rect_runs_off_buffer() {
 }
 
 #[test]
-/// On terminal resize the welcome layout shifts, so
-/// `welcome_codeberg_badge_cell` moves. iTerm2's OSC-1337 image cells
-/// survive plain SGR redraws, so without explicit cleanup the old
-/// logo "ghosts" mid-screen. The flush method must record the last
-/// emit cell, wipe it on move, and clear it when the welcome panel
-/// goes away (file opened, or provider switches off Codeberg).
-#[test]
 fn clicking_an_scm_entry_below_a_stale_tree_last_area_still_selects_and_opens() {
     // User report: after the Source Control list got long enough to
     // reach below where the file tree had last rendered, the rows in
@@ -1649,7 +1642,7 @@ fn cmd_c_on_side_by_side_diff_selection_lands_text_on_macos_clipboard() {
     // selecting text in a diff and pressing Cmd+C did nothing,
     // leaving stale test sentinels on the system clipboard for the
     // next paste to surface.
-    app.handle_key(key(KeyCode::Char('c'), KeyModifiers::SUPER));
+    let _ = app.handle_key(key(KeyCode::Char('c'), KeyModifiers::SUPER));
     let got = crate::clipboard::read_string()
         .expect("Cmd+C on a diff selection must put text on the clipboard");
     assert_eq!(
@@ -1884,7 +1877,7 @@ fn double_click_in_diff_selects_word_and_cmd_c_copies_it() {
         .expect("double-click must produce a word selection");
     assert!(sel.has_area(), "word selection must span >0 chars");
 
-    app.handle_key(key(KeyCode::Char('c'), KeyModifiers::SUPER));
+    let _ = app.handle_key(key(KeyCode::Char('c'), KeyModifiers::SUPER));
     let got = crate::clipboard::read_string()
         .expect("Cmd+C after double-click must put the word on the clipboard");
     assert_eq!(
@@ -2124,8 +2117,6 @@ fn maximised_terminal_owns_mouse_drag_for_selection_not_the_collapsed_editor() {
 /// nothing happened."
 #[test]
 fn cross_pane_paste_via_bracketed_paste_works_in_every_destination_and_terminal_layout() {
-    use crossterm::event::{KeyCode, KeyModifiers};
-
     fn seed_app() -> (tempfile::TempDir, App) {
         let tmp = tempfile::tempdir().unwrap();
         let f = tmp.path().join("probe.txt");
@@ -3009,8 +3000,14 @@ fn tree_context_menu_on_file_offers_new_file_new_folder_then_cut_copy_rename_del
     std::fs::write(&f, "hi").unwrap();
     let n = file_node(&f);
     let target = f.parent().unwrap().to_path_buf();
-    let items =
-        build_tree_context_menu_items(Some(&n), tmp.path(), &[f.clone()], &target, None, None);
+    let items = build_tree_context_menu_items(
+        Some(&n),
+        tmp.path(),
+        std::slice::from_ref(&f),
+        &target,
+        None,
+        None,
+    );
     let labels: Vec<&str> = items.iter().map(|(s, _)| s.as_str()).collect();
     assert_eq!(
         labels,
@@ -3034,6 +3031,98 @@ fn tree_context_menu_on_file_offers_new_file_new_folder_then_cut_copy_rename_del
     assert!(matches!(&items[4].1, MenuAction::Rename(p) if p == &f));
     assert!(matches!(&items[5].1, MenuAction::SelectForCompare(p) if p == &f));
     assert!(matches!(&items[6].1, MenuAction::Delete { paths } if paths == &vec![f.clone()]));
+}
+
+#[test]
+fn tree_context_menu_adds_reveal_in_finder_when_local_macos() {
+    let tmp = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("hello.txt");
+    std::fs::write(&f, "hi").unwrap();
+    let n = file_node(&f);
+    let target = f.parent().unwrap().to_path_buf();
+    let mut items = build_tree_context_menu_items(
+        Some(&n),
+        tmp.path(),
+        std::slice::from_ref(&f),
+        &target,
+        None,
+        None,
+    );
+    maybe_add_reveal_in_finder(&mut items, Some(f.as_path()), true);
+    // Lands directly beneath the New File / New Folder block, mirroring VS
+    // Code's top "reveal" placement.
+    assert!(matches!(
+        &items[2].1,
+        MenuAction::RevealInFinder(p) if p == &f
+    ));
+    assert_eq!(items[2].0, "Reveal in Finder");
+}
+
+#[test]
+fn tree_context_menu_omits_reveal_in_finder_when_remote() {
+    let tmp = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("hello.txt");
+    std::fs::write(&f, "hi").unwrap();
+    let n = file_node(&f);
+    let target = f.parent().unwrap().to_path_buf();
+    let mut items = build_tree_context_menu_items(
+        Some(&n),
+        tmp.path(),
+        std::slice::from_ref(&f),
+        &target,
+        None,
+        None,
+    );
+    // A remote SSH session disables Finder: the entry must not appear at all,
+    // not even as a disabled no-op.
+    maybe_add_reveal_in_finder(&mut items, Some(f.as_path()), false);
+    assert!(
+        !items
+            .iter()
+            .any(|(_, a)| matches!(a, MenuAction::RevealInFinder(_)))
+    );
+}
+
+#[test]
+fn tree_context_menu_omits_reveal_in_finder_when_no_entry_clicked() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut items = build_tree_context_menu_items(None, tmp.path(), &[], tmp.path(), None, None);
+    // Right-clicking empty tree space has no path to reveal even on local macOS.
+    maybe_add_reveal_in_finder(&mut items, None, true);
+    assert!(
+        !items
+            .iter()
+            .any(|(_, a)| matches!(a, MenuAction::RevealInFinder(_)))
+    );
+}
+
+#[test]
+fn reveal_in_finder_shortcut_hint_is_opt_cmd_r() {
+    let action = MenuAction::RevealInFinder(PathBuf::from("/tmp/x"));
+    assert_eq!(shortcut_for(&action), Some("⌥⌘R"));
+}
+
+#[test]
+fn reveal_in_finder_key_is_opt_cmd_r_and_disjoint_from_rename() {
+    // Cmd+Opt+R (and Ctrl+Opt+R) reveal in Finder.
+    assert!(is_tree_reveal_in_finder_key(key(
+        KeyCode::Char('r'),
+        KeyModifiers::SUPER | KeyModifiers::ALT
+    )));
+    assert!(is_tree_reveal_in_finder_key(key(
+        KeyCode::Char('r'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT
+    )));
+    // Plain Cmd+R must NOT trigger reveal - that chord is Rename.
+    assert!(!is_tree_reveal_in_finder_key(key(
+        KeyCode::Char('r'),
+        KeyModifiers::SUPER
+    )));
+    // And Cmd+Opt+R must NOT trigger Rename, so the two R chords never collide.
+    assert!(!is_tree_rename_key(key(
+        KeyCode::Char('r'),
+        KeyModifiers::SUPER | KeyModifiers::ALT
+    )));
 }
 
 #[test]
@@ -3366,7 +3455,14 @@ fn tree_context_menu_on_subfolder_offers_make_root_between_rename_and_delete() {
     let d = tmp.path().join("project_a");
     std::fs::create_dir(&d).unwrap();
     let n = dir_node(&d);
-    let items = build_tree_context_menu_items(Some(&n), tmp.path(), &[d.clone()], &d, None, None);
+    let items = build_tree_context_menu_items(
+        Some(&n),
+        tmp.path(),
+        std::slice::from_ref(&d),
+        &d,
+        None,
+        None,
+    );
     let labels: Vec<&str> = items.iter().map(|(s, _)| s.as_str()).collect();
     assert!(
         labels.contains(&"Make root"),
@@ -3389,8 +3485,14 @@ fn tree_context_menu_on_file_does_not_offer_make_root() {
     std::fs::write(&f, "hi").unwrap();
     let n = file_node(&f);
     let target = f.parent().unwrap().to_path_buf();
-    let items =
-        build_tree_context_menu_items(Some(&n), tmp.path(), &[f.clone()], &target, None, None);
+    let items = build_tree_context_menu_items(
+        Some(&n),
+        tmp.path(),
+        std::slice::from_ref(&f),
+        &target,
+        None,
+        None,
+    );
     let labels: Vec<&str> = items.iter().map(|(s, _)| s.as_str()).collect();
     assert!(
         !labels.contains(&"Make root"),
@@ -3590,8 +3692,14 @@ fn tree_context_menu_on_subfolder_offers_new_file_new_folder_then_cut_copy_renam
     std::fs::create_dir(&d).unwrap();
     let n = dir_node(&d);
     let target = d.clone();
-    let items =
-        build_tree_context_menu_items(Some(&n), tmp.path(), &[d.clone()], &target, None, None);
+    let items = build_tree_context_menu_items(
+        Some(&n),
+        tmp.path(),
+        std::slice::from_ref(&d),
+        &target,
+        None,
+        None,
+    );
     let labels: Vec<&str> = items.iter().map(|(s, _)| s.as_str()).collect();
     assert_eq!(
         labels,
@@ -3617,8 +3725,14 @@ fn tree_context_menu_with_clipboard_offers_paste_on_directory() {
         mode: ExplorerClipMode::Cut,
         paths: vec![tmp.path().join("a.txt")],
     };
-    let items =
-        build_tree_context_menu_items(Some(&n), tmp.path(), &[d.clone()], &d, Some(&clip), None);
+    let items = build_tree_context_menu_items(
+        Some(&n),
+        tmp.path(),
+        std::slice::from_ref(&d),
+        &d,
+        Some(&clip),
+        None,
+    );
     let labels: Vec<&str> = items.iter().map(|(s, _)| s.as_str()).collect();
     assert_eq!(
         labels,
@@ -3655,7 +3769,7 @@ fn tree_context_menu_on_a_deeply_nested_folder_creates_inside_that_folder() {
     let items = build_tree_context_menu_items(
         Some(&n),
         tmp.path(),
-        &[nested.clone()],
+        std::slice::from_ref(&nested),
         &resolved_target,
         None,
         None,
@@ -3780,7 +3894,7 @@ fn left_right_arrows_pan_diff_horizontally() {
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     let f1 = tmp.path().join("a.txt");
     let f2 = tmp.path().join("b.txt");
-    let long_line: String = std::iter::repeat('x').take(200).collect();
+    let long_line: String = std::iter::repeat_n('x', 200).collect();
     std::fs::write(&f1, format!("{long_line}\n")).unwrap();
     std::fs::write(&f2, format!("{long_line}y\n")).unwrap();
     app.editor.open_diff(&f1, &f2).unwrap();
@@ -3814,7 +3928,7 @@ fn mouse_horizontal_wheel_over_diff_pans_horizontally() {
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     let f1 = tmp.path().join("a.txt");
     let f2 = tmp.path().join("b.txt");
-    let long: String = std::iter::repeat('z').take(120).collect();
+    let long: String = std::iter::repeat_n('z', 120).collect();
     std::fs::write(&f1, format!("{long}\n")).unwrap();
     std::fs::write(&f2, format!("{long}\n")).unwrap();
     app.editor.open_diff(&f1, &f2).unwrap();
@@ -3988,8 +4102,14 @@ fn menu_item_at_handles_clipped_menu_so_clicks_dispatch_the_visible_row() {
         loaded: true,
     };
     let target = f.parent().unwrap().to_path_buf();
-    let items =
-        build_tree_context_menu_items(Some(&n), tmp.path(), &[f.clone()], &target, None, None);
+    let items = build_tree_context_menu_items(
+        Some(&n),
+        tmp.path(),
+        std::slice::from_ref(&f),
+        &target,
+        None,
+        None,
+    );
     // Sanity: items[5] is "Select for Compare" after the New
     // File… / New Folder… prefix lifted everything down by two.
     assert!(matches!(&items[5].1, MenuAction::SelectForCompare(_)));
@@ -4021,7 +4141,7 @@ fn tree_context_menu_offers_compare_with_selected_when_anchor_is_present() {
     let items = build_tree_context_menu_items(
         Some(&n),
         tmp.path(),
-        &[b.clone()],
+        std::slice::from_ref(&b),
         tmp.path(),
         None,
         Some(a.as_path()),
@@ -4050,7 +4170,7 @@ fn tree_context_menu_hides_compare_when_anchor_is_the_same_file() {
     let items = build_tree_context_menu_items(
         Some(&n),
         tmp.path(),
-        &[a.clone()],
+        std::slice::from_ref(&a),
         tmp.path(),
         None,
         Some(a.as_path()),
@@ -4277,11 +4397,9 @@ fn clicking_source_control_does_not_block_on_git_and_posts_a_changes_request() {
     let mut got_changes = false;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
     while std::time::Instant::now() < deadline {
-        if app.drain_git_responses() {
-            if !app.source_control.entries.is_empty() {
-                got_changes = true;
-                break;
-            }
+        if app.drain_git_responses() && !app.source_control.entries.is_empty() {
+            got_changes = true;
+            break;
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
@@ -4516,11 +4634,9 @@ fn change_workspace_root_into_a_git_subdir_flips_source_control_into_repo_state(
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
     let mut flipped = false;
     while std::time::Instant::now() < deadline {
-        if app.drain_git_responses() {
-            if app.source_control.status.in_repo {
-                flipped = true;
-                break;
-            }
+        if app.drain_git_responses() && app.source_control.status.in_repo {
+            flipped = true;
+            break;
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
@@ -6838,14 +6954,13 @@ fn cmd_p_index_refreshes_after_a_new_file_lands_on_disk() {
     for _ in 0..400 {
         let _ = app.drain_fs_events();
         app.poll_file_finder_index();
-        if let Some(idx) = app.file_finder_index.as_ref() {
-            if idx
+        if let Some(idx) = app.file_finder_index.as_ref()
+            && idx
                 .iter()
                 .any(|e| e.rel == "packages/ant-ts-lib-noggin/src/entities/files/resolver.ts")
-            {
-                saw = true;
-                break;
-            }
+        {
+            saw = true;
+            break;
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
@@ -6870,10 +6985,10 @@ fn cmd_p_index_drops_a_file_deleted_off_disk() {
     let mut waited = 0u32;
     loop {
         app.poll_file_finder_index();
-        if let Some(idx) = app.file_finder_index.as_ref() {
-            if idx.iter().any(|e| e.rel == "doomed.rs") {
-                break;
-            }
+        if let Some(idx) = app.file_finder_index.as_ref()
+            && idx.iter().any(|e| e.rel == "doomed.rs")
+        {
+            break;
         }
         if waited >= 5000 {
             panic!("initial index must contain doomed.rs within 5s");
@@ -6890,11 +7005,11 @@ fn cmd_p_index_drops_a_file_deleted_off_disk() {
     for _ in 0..400 {
         let _ = app.drain_fs_events();
         app.poll_file_finder_index();
-        if let Some(idx) = app.file_finder_index.as_ref() {
-            if !idx.iter().any(|e| e.rel == "doomed.rs") {
-                gone = true;
-                break;
-            }
+        if let Some(idx) = app.file_finder_index.as_ref()
+            && !idx.iter().any(|e| e.rel == "doomed.rs")
+        {
+            gone = true;
+            break;
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
@@ -6917,10 +7032,10 @@ fn change_workspace_root_rebuilds_cmd_p_index_against_the_new_root() {
     let mut waited = 0u32;
     loop {
         app.poll_file_finder_index();
-        if let Some(idx) = app.file_finder_index.as_ref() {
-            if idx.iter().any(|e| e.rel == "only_in_a.rs") {
-                break;
-            }
+        if let Some(idx) = app.file_finder_index.as_ref()
+            && idx.iter().any(|e| e.rel == "only_in_a.rs")
+        {
+            break;
         }
         if waited >= 5000 {
             panic!("initial index against root_a must land within 5s");

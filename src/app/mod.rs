@@ -302,6 +302,11 @@ enum MenuAction {
     /// files can't be roots. Used to dive into a nested git repo without
     /// relaunching croft.
     MakeRoot(PathBuf),
+    /// Reveal the path in macOS Finder via `open -R`. Local-macOS only:
+    /// on a remote SSH session croft runs on the headless host where no
+    /// Finder exists, so the menu omits this entry entirely rather than
+    /// offering a no-op.
+    RevealInFinder(PathBuf),
     /// Close the editor tab at `idx`. Mirrors clicking the tab's `×`
     /// glyph; surfaces in the tab-strip right-click menu so the four
     /// close actions (Close / Others / Right / All) live in one place.
@@ -327,6 +332,7 @@ fn shortcut_for(action: &MenuAction) -> Option<&'static str> {
         MenuAction::Paste(_) => Some("⌘V"),
         MenuAction::Rename(_) => Some("⌘R"),
         MenuAction::MakeRoot(_) => Some("⌘/"),
+        MenuAction::RevealInFinder(_) => Some("⌥⌘R"),
         MenuAction::Delete { .. } => Some("⌫"),
         MenuAction::CloseTab(_) => Some("⌘W"),
         MenuAction::CloseOtherTabs(_) => Some("⌥⌘T"),
@@ -546,6 +552,38 @@ fn build_tree_context_menu_items(
         }
     }
     items
+}
+
+/// Insert "Reveal in Finder" into a freshly-built tree context menu, but only
+/// when the action can actually do something: `enabled` is true (a local macOS
+/// session) and a concrete entry was clicked (`clicked`). On a remote SSH
+/// session croft runs on the headless host where there is no Finder, so the
+/// item is omitted entirely rather than shown as a dead no-op, keeping the
+/// local and remote menus honest. The entry lands directly beneath the New
+/// File / New Folder block to mirror VS Code's top "reveal" placement.
+fn maybe_add_reveal_in_finder(
+    items: &mut Vec<(String, MenuAction)>,
+    clicked: Option<&Path>,
+    enabled: bool,
+) {
+    let Some(path) = clicked.filter(|_| enabled) else {
+        return;
+    };
+    // Insert directly after the leading New File / New Folder block: find the
+    // first non-Create entry and slot in ahead of it. Deriving the position
+    // this way (rather than a literal index) keeps the placement correct even
+    // if the Create block grows or the empty-area menu shape changes.
+    let pos = items
+        .iter()
+        .position(|(_, a)| !matches!(a, MenuAction::Create(_)))
+        .unwrap_or(items.len());
+    items.insert(
+        pos,
+        (
+            String::from("Reveal in Finder"),
+            MenuAction::RevealInFinder(path.to_path_buf()),
+        ),
+    );
 }
 
 struct ContextMenu {
@@ -1808,10 +1846,10 @@ impl App {
         // If the cell moved since the last emit, stamp blanks over the
         // previous position first so the old logo doesn't ghost-overlay
         // the freshly-drawn welcome layout.
-        if let Some((px, py)) = self.overlays.badge.last_emitted() {
-            if (px, py) != (cx, cy) {
-                let _ = write!(out, "\x1b[{};{}H  ", py + 1, px + 1);
-            }
+        if let Some((px, py)) = self.overlays.badge.last_emitted()
+            && (px, py) != (cx, cy)
+        {
+            let _ = write!(out, "\x1b[{};{}H  ", py + 1, px + 1);
         }
         let _ = write!(out, "\x1b[{};{}H", cy + 1, cx + 1);
         let _ = out.write_all(osc.as_bytes());
@@ -1890,7 +1928,7 @@ impl App {
         }
         self.refresh_git_status_debounced();
         match (report.reloaded.len(), report.conflicts.len()) {
-            (n, 0) if n == 1 => {
+            (1, 0) => {
                 let p = report.reloaded[0].display();
                 self.status = format!("Reloaded {p} (external change)");
             }
@@ -2531,7 +2569,7 @@ impl App {
         let gaps_h = 3u16;
 
         let logo_max_w = (area.width as u32).saturating_sub(4) as u16;
-        let logo_w_cells = logo_max_w.min(48).max(8);
+        let logo_w_cells = logo_max_w.clamp(8, 48);
         // Pick the logo height first, then size the recents box to fit
         // whatever's left. Without this a tall commit list would extend the
         // stack past the bottom of the welcome area and we'd panic painting
@@ -2539,8 +2577,7 @@ impl App {
         let logo_h_cells = area
             .height
             .saturating_sub(tagline_h + footer_h + gaps_h)
-            .min(14)
-            .max(4);
+            .clamp(4, 14);
         let used_above_box = logo_h_cells + 1 + tagline_h + 1; // logo, gap, tagline, gap
         let used_below_box = 1 + footer_h; // gap, footer
         let max_box_h = area
@@ -2805,20 +2842,20 @@ impl App {
                         .set_string(subject_x, line_y, clipped, row_style);
                 }
                 frame.buffer_mut().set_string(when_x, y, &c.when, dim);
-                if let Some(remote) = recent_remote.as_ref() {
-                    if let Some(url) = crate::git::commit_url_for_remote(remote, &c.full_hash) {
-                        let height = subject_lines.len().max(1) as u16;
-                        self.welcome.push_link(WelcomeLink {
-                            rect: Rect {
-                                x: inner_x,
-                                y,
-                                width: inner_w_actual,
-                                height,
-                            },
-                            url,
-                            label: format!("Open commit {}", c.hash),
-                        });
-                    }
+                if let Some(remote) = recent_remote.as_ref()
+                    && let Some(url) = crate::git::commit_url_for_remote(remote, &c.full_hash)
+                {
+                    let height = subject_lines.len().max(1) as u16;
+                    self.welcome.push_link(WelcomeLink {
+                        rect: Rect {
+                            x: inner_x,
+                            y,
+                            width: inner_w_actual,
+                            height,
+                        },
+                        url,
+                        label: format!("Open commit {}", c.hash),
+                    });
                 }
                 row_y = row_y.saturating_add(subject_lines.len().max(1) as u16);
             }
@@ -3362,16 +3399,17 @@ impl App {
             self.overlays.welcome.mark_dirty();
             self.overlays.badge.set_target(None);
             self.update_editor_image_overlay(editor_area);
-            if self.focus == Pane::Editor && self.completion_popup.is_some() {
-                if let Some((cx, cy)) = self.editor.cursor_screen_pos() {
-                    if let Some(popup) = self.completion_popup.as_mut() {
-                        popup.anchor = (cx, cy);
-                    }
-                    let popup_ref = self.completion_popup.as_ref().unwrap();
-                    let area = popup_ref.area_for(editor_area);
-                    if area.width > 0 && area.height > 0 {
-                        frame.render_widget(popup_ref, area);
-                    }
+            if self.focus == Pane::Editor
+                && self.completion_popup.is_some()
+                && let Some((cx, cy)) = self.editor.cursor_screen_pos()
+            {
+                if let Some(popup) = self.completion_popup.as_mut() {
+                    popup.anchor = (cx, cy);
+                }
+                let popup_ref = self.completion_popup.as_ref().unwrap();
+                let area = popup_ref.area_for(editor_area);
+                if area.width > 0 && area.height > 0 {
+                    frame.render_widget(popup_ref, area);
                 }
             }
             if let Some(popup) = self.hover_popup.as_ref() {
@@ -3540,10 +3578,9 @@ impl App {
             && self.context_menu.is_none()
             && self.prompt.is_none()
             && self.cursor_visible_phase()
+            && let Some((cx, cy)) = self.source_control.cursor_screen_pos()
         {
-            if let Some((cx, cy)) = self.source_control.cursor_screen_pos() {
-                frame.set_cursor_position((cx, cy));
-            }
+            frame.set_cursor_position((cx, cy));
         }
     }
 
@@ -3685,7 +3722,7 @@ impl App {
             return;
         };
         let area = frame.area();
-        let width = area.width.saturating_sub(8).min(96).max(50);
+        let width = area.width.saturating_sub(8).clamp(50, 96);
         let height: u16 = 8;
         let x = (area.width.saturating_sub(width)) / 2 + area.x;
         let y = (area.height.saturating_sub(height)) / 2 + area.y;
@@ -3754,7 +3791,7 @@ impl App {
             return;
         };
         let area = frame.area();
-        let width = area.width.saturating_sub(8).min(96).max(50);
+        let width = area.width.saturating_sub(8).clamp(50, 96);
         let height: u16 = 8;
         let x = (area.width.saturating_sub(width)) / 2 + area.x;
         let y = (area.height.saturating_sub(height)) / 2 + area.y;
@@ -3822,7 +3859,7 @@ impl App {
     fn render_prompt(&self, frame: &mut ratatui::Frame) {
         let Some(p) = &self.prompt else { return };
         let area = frame.area();
-        let width = area.width.saturating_sub(8).min(80).max(40);
+        let width = area.width.saturating_sub(8).clamp(40, 80);
         let height = if p.error.is_some() { 6 } else { 5 };
         let x = (area.width.saturating_sub(width)) / 2 + area.x;
         let y = (area.height.saturating_sub(height)) / 2 + area.y;
@@ -4172,9 +4209,7 @@ impl App {
                 }
             }
             KeyCode::Backspace => {
-                if self.search.delete_selection() {
-                    self.submit_search_query();
-                } else if self.search.query.pop().is_some() {
+                if self.search.delete_selection() || self.search.query.pop().is_some() {
                     self.submit_search_query();
                 }
             }
@@ -4849,20 +4884,20 @@ impl App {
             dialog.set_failed(detail);
             self.tear_down_connect_auth();
         }
-        if authenticated {
-            if let (Some(auth), Some(host)) = (
+        if authenticated
+            && let (Some(auth), Some(host)) = (
                 self.connect_auth.take(),
                 self.pending_remote_launch_host.take(),
-            ) {
-                let adopted = auth.hand_off();
-                let path = self.pending_remote_launch_path.take();
-                self.install_session = Some(crate::install_session::InstallSession::start(
-                    adopted,
-                    host.clone(),
-                    path,
-                ));
-                self.status = format!("Preparing remote croft on {host}…");
-            }
+            )
+        {
+            let adopted = auth.hand_off();
+            let path = self.pending_remote_launch_path.take();
+            self.install_session = Some(crate::install_session::InstallSession::start(
+                adopted,
+                host.clone(),
+                path,
+            ));
+            self.status = format!("Preparing remote croft on {host}…");
         }
         true
     }
@@ -4900,19 +4935,19 @@ impl App {
         // let the (re)install finish in the background. The running remote
         // croft re-execs into the new binary when the stamp advances.
         if can_launch {
-            if let Some(session) = self.install_session.as_mut() {
-                if let Some(adopted) = session.take_adopted() {
-                    let host = session.host.clone();
-                    let path = session.path.clone();
-                    self.remote_launch = Some(RemoteLaunch {
-                        host: host.clone(),
-                        path,
-                        adopted: Some(adopted),
-                    });
-                    self.status = format!("Launching croft on {host}…");
-                    self.connect_dialog = None;
-                    self.quit = true;
-                }
+            if let Some(session) = self.install_session.as_mut()
+                && let Some(adopted) = session.take_adopted()
+            {
+                let host = session.host.clone();
+                let path = session.path.clone();
+                self.remote_launch = Some(RemoteLaunch {
+                    host: host.clone(),
+                    path,
+                    adopted: Some(adopted),
+                });
+                self.status = format!("Launching croft on {host}…");
+                self.connect_dialog = None;
+                self.quit = true;
             }
             return true;
         }
@@ -4924,19 +4959,19 @@ impl App {
             self.status = format!("Remote install failed: {detail}");
             changed = true;
         } else if done {
-            if let Some(mut session) = self.install_session.take() {
-                if let Some(adopted) = session.take_adopted() {
-                    let host = session.host.clone();
-                    let path = session.path.clone();
-                    self.remote_launch = Some(RemoteLaunch {
-                        host: host.clone(),
-                        path,
-                        adopted: Some(adopted),
-                    });
-                    self.status = format!("Launching croft on {host}…");
-                    self.connect_dialog = None;
-                    self.quit = true;
-                }
+            if let Some(mut session) = self.install_session.take()
+                && let Some(adopted) = session.take_adopted()
+            {
+                let host = session.host.clone();
+                let path = session.path.clone();
+                self.remote_launch = Some(RemoteLaunch {
+                    host: host.clone(),
+                    path,
+                    adopted: Some(adopted),
+                });
+                self.status = format!("Launching croft on {host}…");
+                self.connect_dialog = None;
+                self.quit = true;
             }
             changed = true;
         }
@@ -5069,14 +5104,14 @@ impl App {
             else {
                 continue;
             };
-            if tab.dirty {
-                if let Some(text) = &tab.unsaved_text {
-                    ed.lines = text.split('\n').map(str::to_string).collect();
-                    if ed.lines.is_empty() {
-                        ed.lines.push(String::new());
-                    }
-                    ed.dirty = true;
+            if tab.dirty
+                && let Some(text) = &tab.unsaved_text
+            {
+                ed.lines = text.split('\n').map(str::to_string).collect();
+                if ed.lines.is_empty() {
+                    ed.lines.push(String::new());
                 }
+                ed.dirty = true;
             }
             let max_row = ed.lines.len().saturating_sub(1);
             ed.cursor_row = tab.cursor_row.min(max_row);
@@ -5189,11 +5224,11 @@ impl App {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        if !path.exists() {
-            if let Err(e) = std::fs::write(&path, "") {
-                self.status = format!("Could not create {}: {e}", path.display());
-                return;
-            }
+        if !path.exists()
+            && let Err(e) = std::fs::write(&path, "")
+        {
+            self.status = format!("Could not create {}: {e}", path.display());
+            return;
         }
         match self.editor.open_pinned(&path) {
             Ok(()) => {
@@ -5711,22 +5746,22 @@ impl App {
         let count_pending = self.editor_vim_chord.count > 0;
         let op_pending = self.editor_vim_chord.op != VimOp::None;
 
-        if op_pending || count_pending {
-            if let Some(d) = chord_digit_value(key) {
-                self.editor_vim_chord.count = self
-                    .editor_vim_chord
-                    .count
-                    .saturating_mul(10)
-                    .saturating_add(d);
-                let op = match self.editor_vim_chord.op {
-                    VimOp::G => 'g',
-                    VimOp::D => 'd',
-                    VimOp::Y => 'y',
-                    VimOp::None => ' ',
-                };
-                self.status = chord_status_text(op, self.editor_vim_chord.count);
-                return true;
-            }
+        if (op_pending || count_pending)
+            && let Some(d) = chord_digit_value(key)
+        {
+            self.editor_vim_chord.count = self
+                .editor_vim_chord
+                .count
+                .saturating_mul(10)
+                .saturating_add(d);
+            let op = match self.editor_vim_chord.op {
+                VimOp::G => 'g',
+                VimOp::D => 'd',
+                VimOp::Y => 'y',
+                VimOp::None => ' ',
+            };
+            self.status = chord_status_text(op, self.editor_vim_chord.count);
+            return true;
         }
 
         if !op_pending {
@@ -6512,11 +6547,11 @@ impl App {
 
     fn copy_editor_selection(&mut self) {
         if let Some(diff) = self.editor.diff.as_ref() {
-            if let Some(text) = diff.selection_text() {
-                if !text.is_empty() {
-                    copy_to_clipboard(&text);
-                    self.status = format!("Copied {} chars to clipboard", text.chars().count());
-                }
+            if let Some(text) = diff.selection_text()
+                && !text.is_empty()
+            {
+                copy_to_clipboard(&text);
+                self.status = format!("Copied {} chars to clipboard", text.chars().count());
             }
             return;
         }
@@ -6739,11 +6774,11 @@ impl App {
         for p in &placed {
             self.tree.marked.insert(p.clone());
         }
-        if let Some(first) = placed.first() {
-            if let Some(idx) = self.tree.nodes.iter().position(|n| &n.path == first) {
-                self.tree.selected = idx;
-                self.tree.anchor = idx;
-            }
+        if let Some(first) = placed.first()
+            && let Some(idx) = self.tree.nodes.iter().position(|n| &n.path == first)
+        {
+            self.tree.selected = idx;
+            self.tree.anchor = idx;
         }
         self.status = if !errors.is_empty() {
             format!(
@@ -6939,10 +6974,10 @@ impl App {
                 still_pending.push(pull);
             }
         }
-        if let Some(bytes) = clipboard_payload {
-            if !bytes.is_empty() {
-                self.terminal_mut().paste_input(&bytes);
-            }
+        if let Some(bytes) = clipboard_payload
+            && !bytes.is_empty()
+        {
+            self.terminal_mut().paste_input(&bytes);
         }
         let resolved_any = !placed.is_empty() || !opened_urls.is_empty() || !errors.is_empty();
         self.pending_remote_pulls = still_pending;
@@ -6956,11 +6991,11 @@ impl App {
             for p in &placed {
                 self.tree.marked.insert(p.clone());
             }
-            if let Some(first) = placed.first() {
-                if let Some(idx) = self.tree.nodes.iter().position(|n| &n.path == first) {
-                    self.tree.selected = idx;
-                    self.tree.anchor = idx;
-                }
+            if let Some(first) = placed.first()
+                && let Some(idx) = self.tree.nodes.iter().position(|n| &n.path == first)
+            {
+                self.tree.selected = idx;
+                self.tree.anchor = idx;
             }
         }
         if resolved_any {
@@ -7232,12 +7267,12 @@ impl App {
         // here as a key event, and reading the clipboard ourselves keeps
         // the "open finder, paste a filename" gesture working everywhere.
         if is_clipboard_paste_key(key) {
-            if let Some(text) = (self.clipboard_reader)() {
-                if let Some(finder) = self.file_finder.as_mut() {
-                    for c in text.chars() {
-                        if !c.is_control() {
-                            finder.push_char(c);
-                        }
+            if let Some(text) = (self.clipboard_reader)()
+                && let Some(finder) = self.file_finder.as_mut()
+            {
+                for c in text.chars() {
+                    if !c.is_control() {
+                        finder.push_char(c);
                     }
                 }
             }
@@ -7895,10 +7930,8 @@ impl App {
         let area = frame.area();
         use ratatui::widgets::Widget as _;
         dialog.render(area, frame.buffer_mut());
-        if visible {
-            if let Some((cx, cy)) = dialog.cursor_screen_pos() {
-                frame.set_cursor_position((cx, cy));
-            }
+        if visible && let Some((cx, cy)) = dialog.cursor_screen_pos() {
+            frame.set_cursor_position((cx, cy));
         }
     }
 
@@ -8024,13 +8057,19 @@ impl App {
                     let target_dir =
                         crate::widgets::file_tree::create_target_dir_for(node, &self.tree.root);
                     let selection = self.tree.action_paths();
-                    let items = build_tree_context_menu_items(
+                    let mut items = build_tree_context_menu_items(
                         node,
                         &self.tree.root,
                         &selection,
                         &target_dir,
                         self.tree_clipboard.as_ref(),
                         self.compare_anchor.as_deref(),
+                    );
+                    let clicked = node.map(|n| n.path.clone());
+                    maybe_add_reveal_in_finder(
+                        &mut items,
+                        clicked.as_deref(),
+                        !self.is_remote && cfg!(target_os = "macos"),
                     );
                     self.context_menu = Some(ContextMenu {
                         origin: (m.column, m.row),
@@ -8227,14 +8266,13 @@ impl App {
                 }
                 if in_tree && self.sidebar_view == SidebarView::SourceControl {
                     self.focus_pane(Pane::Tree);
-                    if self.commit_menu_open {
-                        if let Some(item) =
+                    if self.commit_menu_open
+                        && let Some(item) =
                             self.source_control.click_commit_menu_item(m.column, m.row)
-                        {
-                            self.commit_menu_open = false;
-                            self.dispatch_commit_menu_item(item);
-                            return;
-                        }
+                    {
+                        self.commit_menu_open = false;
+                        self.dispatch_commit_menu_item(item);
+                        return;
                     }
                     if self.source_control.click_commit_caret(m.column, m.row) {
                         self.commit_menu_open = !self.commit_menu_open;
@@ -8546,14 +8584,13 @@ impl App {
                 if in_editor {
                     if self.editor.diff.is_some() {
                         let last_inner = self.editor.last_inner;
-                        if let Some(diff) = self.editor.diff.as_mut() {
-                            if let Some((_, row_idx, char_col)) =
+                        if let Some(diff) = self.editor.diff.as_mut()
+                            && let Some((_, row_idx, char_col)) =
                                 crate::widgets::editor::diff_hit_test(
                                     diff, last_inner, m.column, m.row,
                                 )
-                            {
-                                diff.extend_selection_to(row_idx, char_col);
-                            }
+                        {
+                            diff.extend_selection_to(row_idx, char_col);
                         }
                         self.poke_cursor();
                         return;
@@ -8579,10 +8616,10 @@ impl App {
                             // While not dragging, treat continued movement as a
                             // range-extend from the initial anchor — just like
                             // VS Code's drag-to-select.
-                            if self.tree_drag.as_ref().is_none_or(|d| !d.armed) {
-                                if let Some(idx) = self.tree.node_at_y(m.row) {
-                                    self.tree.select(idx);
-                                }
+                            if self.tree_drag.as_ref().is_none_or(|d| !d.armed)
+                                && let Some(idx) = self.tree.node_at_y(m.row)
+                            {
+                                self.tree.select(idx);
                             }
                         }
                         SidebarView::Remote => {
@@ -8643,17 +8680,16 @@ impl App {
                 // so the user can hit Cmd/Ctrl+C themselves; a click without
                 // drag (zero-area selection) is silently dropped.
                 if in_terminal {
-                    if let Some(sel) = self.terminal().selection() {
-                        if !sel.has_area() {
-                            self.terminal_mut().clear_selection();
-                        }
+                    if let Some(sel) = self.terminal().selection()
+                        && !sel.has_area()
+                    {
+                        self.terminal_mut().clear_selection();
                     }
-                } else if in_editor {
-                    if let Some(sel) = self.editor.selection {
-                        if !sel.has_area() {
-                            self.editor.clear_selection();
-                        }
-                    }
+                } else if in_editor
+                    && let Some(sel) = self.editor.selection
+                    && !sel.has_area()
+                {
+                    self.editor.clear_selection();
                 }
             }
             MouseEventKind::ScrollDown => {
@@ -8822,17 +8858,17 @@ impl App {
                 self.context_menu = None;
             }
             KeyCode::Up => {
-                if let Some(menu) = self.context_menu.as_mut() {
-                    if menu.selected > 0 {
-                        menu.selected -= 1;
-                    }
+                if let Some(menu) = self.context_menu.as_mut()
+                    && menu.selected > 0
+                {
+                    menu.selected -= 1;
                 }
             }
             KeyCode::Down => {
-                if let Some(menu) = self.context_menu.as_mut() {
-                    if menu.selected + 1 < menu.items.len() {
-                        menu.selected += 1;
-                    }
+                if let Some(menu) = self.context_menu.as_mut()
+                    && menu.selected + 1 < menu.items.len()
+                {
+                    menu.selected += 1;
                 }
             }
             KeyCode::Enter => {
@@ -8934,6 +8970,15 @@ impl App {
         if is_tree_rename_key(key) {
             if let Some(path) = self.explorer_selected_path() {
                 self.open_rename_prompt(path);
+            }
+            return true;
+        }
+        // Reveal in Finder is a local-macOS-only host bridge: on a remote SSH
+        // session croft runs on a headless host with no Finder, so the chord
+        // falls through there exactly as the menu entry is withheld.
+        if !self.is_remote && cfg!(target_os = "macos") && is_tree_reveal_in_finder_key(key) {
+            if let Some(path) = self.explorer_selected_path() {
+                self.reveal_in_finder(path);
             }
             return true;
         }
@@ -9061,6 +9106,7 @@ impl App {
             MenuAction::MakeRoot(folder) => {
                 self.change_workspace_root(folder);
             }
+            MenuAction::RevealInFinder(path) => self.reveal_in_finder(path),
             MenuAction::CloseTab(idx) => {
                 if self.editor.close_tab(idx) {
                     self.sync_open_file_poll_mtime();
@@ -9123,6 +9169,32 @@ impl App {
                     }
                 }
             }
+        }
+    }
+
+    /// Reveal `path` in macOS Finder by spawning `open -R`, which selects the
+    /// entry inside its containing folder. Fire-and-forget: `open` hands off to
+    /// LaunchServices and returns immediately, so the TUI never blocks. Only
+    /// reachable on a local macOS session because `maybe_add_reveal_in_finder`
+    /// withholds the menu entry everywhere else; the `cfg` guard keeps the call
+    /// out of non-macOS builds entirely.
+    fn reveal_in_finder(&mut self, path: PathBuf) {
+        #[cfg(target_os = "macos")]
+        {
+            self.status = if std::process::Command::new("open")
+                .arg("-R")
+                .arg(&path)
+                .spawn()
+                .is_ok()
+            {
+                String::from("Revealed in Finder")
+            } else {
+                String::from("Could not reveal in Finder")
+            };
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = path;
         }
     }
 
@@ -9661,11 +9733,11 @@ impl App {
         for p in &placed {
             self.tree.marked.insert(p.clone());
         }
-        if let Some(first) = placed.first() {
-            if let Some(idx) = self.tree.nodes.iter().position(|n| &n.path == first) {
-                self.tree.selected = idx;
-                self.tree.anchor = idx;
-            }
+        if let Some(first) = placed.first()
+            && let Some(idx) = self.tree.nodes.iter().position(|n| &n.path == first)
+        {
+            self.tree.selected = idx;
+            self.tree.anchor = idx;
         }
         let verb = match mode {
             ExplorerClipMode::Cut => "Moved",
@@ -9735,11 +9807,10 @@ impl App {
                 if !key.modifiers.contains(KeyModifiers::CONTROL)
                     && !key.modifiers.contains(KeyModifiers::ALT)
                     && !key.modifiers.contains(KeyModifiers::SUPER)
+                    && let Some(p) = self.prompt.as_mut()
                 {
-                    if let Some(p) = self.prompt.as_mut() {
-                        p.buffer.push(c);
-                        p.error = None;
-                    }
+                    p.buffer.push(c);
+                    p.error = None;
                 }
             }
             _ => {}
@@ -10049,6 +10120,23 @@ fn is_tree_rename_key(key: KeyEvent) -> bool {
     key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::SUPER)
 }
 
+/// Explorer-pane shortcut: `Cmd+Opt+R` / `Ctrl+Opt+R` - "Reveal in Finder".
+/// The Alt requirement keeps this disjoint from `Cmd+R` (Rename), which
+/// rejects Alt, so the two R chords never collide. The caller additionally
+/// gates this to a local macOS session, matching the context-menu entry.
+fn is_tree_reveal_in_finder_key(key: KeyEvent) -> bool {
+    let KeyCode::Char(c) = key.code else {
+        return false;
+    };
+    if !c.eq_ignore_ascii_case(&'r') {
+        return false;
+    }
+    if !key.modifiers.contains(KeyModifiers::ALT) || key.modifiers.contains(KeyModifiers::SHIFT) {
+        return false;
+    }
+    key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::SUPER)
+}
+
 /// Explorer-pane shortcut: `Cmd+/` / `Ctrl+/` - "Make root". Re-roots the
 /// workspace at the selected folder.
 fn is_tree_make_root_key(key: KeyEvent) -> bool {
@@ -10237,12 +10325,14 @@ fn is_terminal_cycle_back_key(key: KeyEvent) -> bool {
 
 /// Returns true if the given key event should trash the currently-selected
 /// node in the file tree. Recognises:
-///   * `KeyCode::Delete`       — the Forward-Delete key on full-size keyboards
-///                                (and `fn+Delete` on Mac laptops).
-///   * `KeyCode::Backspace`    — the key labeled "delete" on every Mac keyboard.
-///                                The tree pane has no text input that needs
-///                                Backspace, so plain Backspace is safe here.
-///   * `Cmd+Backspace`         — the macOS Finder gesture for trashing.
+///
+/// * `KeyCode::Delete` — the Forward-Delete key on full-size keyboards
+///   (and `fn+Delete` on Mac laptops).
+/// * `KeyCode::Backspace` — the key labeled "delete" on every Mac keyboard.
+///   The tree pane has no text input that needs Backspace, so plain
+///   Backspace is safe here.
+/// * `Cmd+Backspace` — the macOS Finder gesture for trashing.
+///
 /// This helper is only called from `handle_tree_key`, so plain Backspace is
 /// only swallowed when the tree pane has focus; the editor and terminal panes
 /// continue to consume Backspace for their own purposes.
@@ -10689,12 +10779,13 @@ fn drag_target_index(
         if crate::widgets::file_tree::is_descendant_or_same(&dir_path, src) {
             return None;
         }
-        if let Some(parent) = src.parent() {
-            if parent == dir_path && drag_paths.len() == 1 {
-                // Dropping a single source onto its own parent is a no-op;
-                // don't show a highlight so the user knows nothing will move.
-                return None;
-            }
+        if let Some(parent) = src.parent()
+            && parent == dir_path
+            && drag_paths.len() == 1
+        {
+            // Dropping a single source onto its own parent is a no-op;
+            // don't show a highlight so the user knows nothing will move.
+            return None;
         }
     }
     Some(dir_idx)
@@ -10846,12 +10937,13 @@ fn normalise_dropped_token(raw: &str) -> Option<PathBuf> {
         let bytes = rest.as_bytes();
         let mut i = 0;
         while i < bytes.len() {
-            if bytes[i] == b'%' && i + 2 < bytes.len() {
-                if let (Some(h), Some(l)) = (hex_digit(bytes[i + 1]), hex_digit(bytes[i + 2])) {
-                    path.push((h * 16 + l) as char);
-                    i += 3;
-                    continue;
-                }
+            if bytes[i] == b'%'
+                && i + 2 < bytes.len()
+                && let (Some(h), Some(l)) = (hex_digit(bytes[i + 1]), hex_digit(bytes[i + 2]))
+            {
+                path.push((h * 16 + l) as char);
+                i += 3;
+                continue;
             }
             path.push(bytes[i] as char);
             i += 1;
@@ -10861,11 +10953,11 @@ fn normalise_dropped_token(raw: &str) -> Option<PathBuf> {
     let mut unescaped = String::with_capacity(s.len());
     let mut chars = s.chars();
     while let Some(c) = chars.next() {
-        if c == '\\' {
-            if let Some(next) = chars.next() {
-                unescaped.push(next);
-                continue;
-            }
+        if c == '\\'
+            && let Some(next) = chars.next()
+        {
+            unescaped.push(next);
+            continue;
         }
         unescaped.push(c);
     }
@@ -11220,7 +11312,7 @@ fn key_to_bytes(key: KeyEvent) -> Vec<u8> {
         Char(c) => {
             if ctrl {
                 let lc = c.to_ascii_lowercase();
-                if ('a'..='z').contains(&lc) {
+                if lc.is_ascii_lowercase() {
                     return vec![(lc as u8) - b'a' + 1];
                 }
                 match c {

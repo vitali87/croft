@@ -9,6 +9,14 @@ const CMD_F_KEY: &str = "0x66-0x100000-0x3";
 const CMD_F_HEX: &str = "0x1b 0x5b 0x31 0x30 0x32 0x3b 0x39 0x75";
 const CMD_R_KEY: &str = "0x72-0x100000-0xf";
 const CMD_R_HEX: &str = "0x1b 0x5b 0x31 0x31 0x34 0x3b 0x39 0x75";
+/// `Cmd+Opt+R` -> "Reveal in Finder" (Explorer). Modifier mask 0x180000
+/// (Cmd 0x100000 | Opt 0x80000), `kVK_ANSI_R` = 0xf. CSI-u `ESC [ 114 ; 11 u`
+/// (114 = 'r'; modbyte 11 = 1 + Alt(2) + Super(8)) so crossterm decodes it as
+/// ALT|SUPER, disjoint from plain Cmd+R (Rename). macOS does not bind this
+/// chord to a default menu item, so no NSUserKeyEquivalents relocation is
+/// needed for the forwarder to win.
+const CMD_OPT_R_KEY: &str = "0x72-0x180000-0xf";
+const CMD_OPT_R_HEX: &str = "0x1b 0x5b 0x31 0x31 0x34 0x3b 0x31 0x31 0x75";
 const CMD_SLASH_KEY: &str = "0x2f-0x100000-0x2c";
 const CMD_SLASH_HEX: &str = "0x1b 0x5b 0x34 0x37 0x3b 0x39 0x75";
 /// `Cmd+Shift+Return`. Serialized identifier follows iTerm2's
@@ -169,6 +177,7 @@ const CMD_ARROW_CLEANUP_KEYS: &[&str] = &[
 /// pane collapses and the terminal fills the right column. Codepoint 'J'
 /// (0x4a = 74), modifier mask 0x60000 = NSEventModifierFlagControl(0x40000)
 /// + NSEventModifierFlagShift(0x20000), virtualKeyCode `kVK_ANSI_J` = 0x26.
+///
 /// CSI-u `ESC [ 74 ; 6 u` where modifier byte 6 = 1 base + Shift(1) +
 /// Control(4). Crossterm decodes it back to
 /// `KeyEvent { code: Char('J'), modifiers: CONTROL | SHIFT }`, which
@@ -455,6 +464,7 @@ pub fn apply_croft_key_settings(plist: &mut Value) -> Result<(), ITerm2Error> {
         (CMD_T_KEY, CMD_T_HEX),
         (CMD_LBRACKET_KEY, CMD_LBRACKET_HEX),
         (CMD_RBRACKET_KEY, CMD_RBRACKET_HEX),
+        (CMD_OPT_R_KEY, CMD_OPT_R_HEX),
         (CTRL_SHIFT_J_KEY, CTRL_SHIFT_J_HEX),
     ] {
         global.insert(key.into(), send_hex_action(hex, 0));
@@ -464,7 +474,7 @@ pub fn apply_croft_key_settings(plist: &mut Value) -> Result<(), ITerm2Error> {
     }
     global.remove(CMD_V_KEY);
     for key in CMD_ARROW_CLEANUP_KEYS {
-        global.remove(*key);
+        global.remove(key);
     }
 
     dict.insert(MOUSE_REPORTING_FRUSTRATION_KEY.into(), Value::Boolean(true));
@@ -513,7 +523,7 @@ fn default_profile_mut(dict: &mut Dictionary) -> Result<&mut Dictionary, ITerm2E
         .iter_mut()
         .filter_map(|v| v.as_dictionary_mut())
         .find(|d| d.get("Guid").and_then(|g| g.as_string()) == Some(&default_guid))
-        .ok_or_else(|| ITerm2Error::NoMatchingProfile(default_guid))
+        .ok_or(ITerm2Error::NoMatchingProfile(default_guid))
 }
 
 fn dict_entry_mut<'a>(dict: &'a mut Dictionary, key: &str) -> &'a mut Dictionary {
@@ -988,6 +998,19 @@ mod tests {
     }
 
     #[test]
+    fn apply_croft_key_settings_forwards_cmd_opt_r_for_reveal_in_finder() {
+        let mut plist = synth_plist("GUID-1", &["GUID-1"]);
+        apply_croft_key_settings(&mut plist).unwrap();
+        let top = plist.as_dictionary().unwrap();
+        let global = dict_in(top, "GlobalKeyMap");
+        assert_eq!(
+            action_text(global, CMD_OPT_R_KEY),
+            CMD_OPT_R_HEX,
+            "GlobalKeyMap must forward Cmd+Opt+R as a CSI-u sequence so croft's `is_tree_reveal_in_finder_key` fires and reveals the selected entry in Finder. Encoding: 'r' (codepoint 0x72 = 114) with kitty modifier byte 11 = 1 base + Alt(2) + Super(8), giving `ESC [ 114 ; 11 u` (decoded as ALT|SUPER, disjoint from plain Cmd+R = Rename)"
+        );
+    }
+
+    #[test]
     fn apply_croft_key_settings_relocates_new_tab_menu_off_cmd_t() {
         let mut plist = synth_plist("GUID-1", &["GUID-1"]);
         apply_croft_key_settings(&mut plist).unwrap();
@@ -1100,7 +1123,7 @@ mod tests {
         let global = dict_in(top, "GlobalKeyMap");
         for key in CMD_ARROW_CLEANUP_KEYS {
             assert!(
-                global.get(*key).is_none(),
+                global.get(key).is_none(),
                 "an earlier croft build hijacked {key} for cycling; now that cycling lives on Cmd+[ / Cmd+], that override must be removed so Cmd+Left/Right return to iTerm2's defaults"
             );
         }

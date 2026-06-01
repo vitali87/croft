@@ -124,7 +124,8 @@ croft setup-terminal --help
 | Drag a row onto a folder | Move the selection into that folder |
 | `Alt`-drag a row onto a folder | Copy the selection into that folder instead of moving |
 | `Delete` / `Backspace` (or `Cmd`+`Backspace`) | Move every selected path to the OS Trash. On macOS the trash sound plays once for the whole batch. |
-| Right-click | Context menu: Cut, Copy, Paste, Rename, Delete (with item count when multi-selected), and on empty space New File / New Folder |
+| `Cmd`+`Opt`+`R` (local macOS only) | Reveal the selected entry in Finder (`open -R`). Omitted on remote SSH sessions, where the host is headless and has no Finder. |
+| Right-click | Context menu: Cut, Copy, Paste, Rename, Delete (with item count when multi-selected), Reveal in Finder (local macOS only), and on empty space New File / New Folder |
 
 ### Search sidebar
 
@@ -248,6 +249,7 @@ This writes the default-profile font settings plus Croft's iTerm2 keyboard setup
 | `⌘⇧N` | `\x1b[78;10u` | Explorer "New folder" prompt (when the tree is focused) |
 | `⌃⇧J` | `\x1b[74;6u` | Maximize the terminal pane (collapses the editor / welcome; press again to restore the previous editor↔terminal split) |
 | `⌘V` | `\x1b[118;9u` in global and profile key maps | Read the system clipboard and paste into the focused editor, or into Search when Search is active |
+| `⌥⌘R` | `\x1b[114;11u` | Reveal the selected Explorer entry in Finder (local macOS only) |
 
 It also moves the following iTerm2 / macOS menu shortcuts out of the way (each goes to `Cmd+Opt+<letter>` so the original iTerm2 action stays reachable on a chord croft does not use): **Edit → Find → Find Globally...** off `⌘⇧F`, **Edit → Paste** off `⌘V`, **Shell → Split Vertically with Same Profile** off `⌘D`, **Shell → Split Horizontally with Same Profile** off `⌘⇧D`, **Edit → Find Next / Find Previous / Jump to Selection**, **File → Print** off `⌘P`, **Window → Select Tab 1..9** off `⌘1..⌘9`, and the macOS **Help → Show Help Menu** off `⌘⇧/`. Fully quit iTerm2 with `⌘Q` and reopen it after setup; iTerm2 caches its plist while running.
 
@@ -376,7 +378,7 @@ What works:
 
 * Three-pane layout with draggable splitters between sidebar / editor / terminal.
 * File tree with expansion / collapse, multi-select (Shift+click range, Alt or Ctrl+click toggle), drag-and-drop file moves (Alt-drag for copy), explorer-scoped Cut / Copy / Paste, bulk delete to OS Trash with a single trash sound on macOS.
-* Right-click context menu with Cut, Copy, Paste, Rename, count-aware Delete, plus New File / New Folder on empty space.
+* Right-click context menu with Cut, Copy, Paste, Rename, count-aware Delete, Reveal in Finder (local macOS only, omitted on remote SSH sessions where the host is headless), plus New File / New Folder on empty space.
 * Live filesystem watcher with a 50 ms polling fallback for missed startup or host events.
 * File open with tree-sitter highlighting (Rust, Python, JS, TS, TSX, JSON, TOML, YAML, Markdown, Go, HTML, CSS, Bash).
 * Full editor write path: insert / delete / Enter / Tab / Backspace / save round-trip with `●` dirty marker, auto-reload on external write when the buffer is clean (across every open tab, not just the focused one), a save-conflict guard that refuses to clobber an external change to a dirty buffer until you press Cmd+S again to overwrite, native-clipboard copy / cut (OSC 52 fallback on remote), undo with intelligent edit-step coalescing.
