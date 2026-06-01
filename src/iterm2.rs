@@ -822,7 +822,8 @@ mod tests {
         let top = plist.as_dictionary().unwrap();
         let menu = dict_in(top, "NSUserKeyEquivalents");
         assert_eq!(
-            menu.get(USE_SELECTION_FOR_FIND_MENU_KEY).and_then(|v| v.as_string()),
+            menu.get(USE_SELECTION_FOR_FIND_MENU_KEY)
+                .and_then(|v| v.as_string()),
             Some(USE_SELECTION_FOR_FIND_MENU_EQUIV),
             "iTerm2's Use Selection for Find must be relocated off bare Cmd+E so croft's vim-mode toggle can claim the chord; @~e = Cmd+Opt+E keeps the find-from-selection action reachable on a chord croft does not use"
         );
