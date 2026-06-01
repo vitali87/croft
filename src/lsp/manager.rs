@@ -6,8 +6,9 @@ use std::sync::mpsc as std_mpsc;
 use anyhow::Result;
 use lsp_types::{
     ClientCapabilities, CompletionClientCapabilities, CompletionItemCapability, CompletionItemKind,
-    CompletionItemKindCapability, CompletionResponse, GotoDefinitionResponse, HoverContents,
-    MarkedString, MarkupKind, TextDocumentClientCapabilities, Url,
+    CompletionItemKindCapability, CompletionResponse, DocumentChangeOperation, DocumentChanges,
+    GotoDefinitionResponse, HoverContents, MarkedString, MarkupKind, OneOf,
+    TextDocumentClientCapabilities, TextEdit, Url, WorkspaceEdit,
 };
 use tokio::sync::{Mutex as TokioMutex, mpsc as tokio_mpsc};
 
@@ -16,6 +17,7 @@ use crate::lsp::config::{Language, ServerConfig};
 use crate::lsp::log_file;
 use crate::lsp::registry::ServerRegistry;
 use crate::lsp::runtime::LspRuntime;
+use crate::widgets::editor::TextSpanEdit;
 
 #[derive(Debug, Clone)]
 pub struct CompletionItem {
@@ -45,6 +47,15 @@ pub struct DefinitionResult {
     pub request_id: u64,
     pub path: PathBuf,
     pub target: Option<(PathBuf, u32, u32)>,
+}
+
+#[derive(Debug)]
+pub struct RenameResult {
+    pub request_id: u64,
+    pub path: PathBuf,
+    /// `None` when the server declined or returned no edits. Otherwise the
+    /// per-file, char-indexed spans to apply across the workspace.
+    pub edits: Option<Vec<(PathBuf, Vec<TextSpanEdit>)>>,
 }
 
 enum Cmd {
@@ -77,6 +88,13 @@ enum Cmd {
         line: u32,
         character: u32,
     },
+    RequestRename {
+        request_id: u64,
+        path: PathBuf,
+        line: u32,
+        character: u32,
+        new_name: String,
+    },
 }
 
 pub struct LspManager {
@@ -84,6 +102,7 @@ pub struct LspManager {
     completion_rx: std_mpsc::Receiver<CompletionResult>,
     hover_rx: std_mpsc::Receiver<HoverResult>,
     def_rx: std_mpsc::Receiver<DefinitionResult>,
+    rename_rx: std_mpsc::Receiver<RenameResult>,
     next_request_id: u64,
     workspace_root: PathBuf,
     _runtime: LspRuntime,
@@ -96,6 +115,7 @@ impl LspManager {
         let (completion_tx, completion_rx) = std_mpsc::channel();
         let (hover_tx, hover_rx) = std_mpsc::channel();
         let (def_tx, def_rx) = std_mpsc::channel();
+        let (rename_tx, rename_rx) = std_mpsc::channel();
         let root = workspace_root.clone();
         runtime.handle().spawn(worker_loop(
             root,
@@ -104,12 +124,14 @@ impl LspManager {
             completion_tx,
             hover_tx,
             def_tx,
+            rename_tx,
         ));
         Ok(Self {
             cmd_tx,
             completion_rx,
             hover_rx,
             def_rx,
+            rename_rx,
             next_request_id: 1,
             workspace_root,
             _runtime: runtime,
@@ -179,6 +201,29 @@ impl LspManager {
     pub fn drain_definition(&self) -> Option<DefinitionResult> {
         self.def_rx.try_recv().ok()
     }
+
+    pub fn request_rename(
+        &mut self,
+        path: PathBuf,
+        line: u32,
+        character: u32,
+        new_name: String,
+    ) -> u64 {
+        let id = self.next_request_id;
+        self.next_request_id += 1;
+        let _ = self.cmd_tx.send(Cmd::RequestRename {
+            request_id: id,
+            path,
+            line,
+            character,
+            new_name,
+        });
+        id
+    }
+
+    pub fn drain_rename(&self) -> Option<RenameResult> {
+        self.rename_rx.try_recv().ok()
+    }
 }
 
 struct ManagedClient {
@@ -187,6 +232,7 @@ struct ManagedClient {
     supports_completion: bool,
     supports_hover: bool,
     supports_definition: bool,
+    supports_rename: bool,
 }
 
 struct WorkerState {
@@ -208,6 +254,7 @@ async fn worker_loop(
     completion_tx: std_mpsc::Sender<CompletionResult>,
     hover_tx: std_mpsc::Sender<HoverResult>,
     def_tx: std_mpsc::Sender<DefinitionResult>,
+    rename_tx: std_mpsc::Sender<RenameResult>,
 ) {
     let mut state = WorkerState {
         workspace_root,
@@ -250,6 +297,17 @@ async fn worker_loop(
                     .request_definition(request_id, path, line, character, &def_tx)
                     .await
             }
+            Cmd::RequestRename {
+                request_id,
+                path,
+                line,
+                character,
+                new_name,
+            } => {
+                state
+                    .request_rename(request_id, path, line, character, new_name, &rename_tx)
+                    .await
+            }
         }
     }
 }
@@ -275,8 +333,9 @@ impl WorkerState {
                         let supports_hover = client.capabilities().hover_provider.is_some();
                         let supports_definition =
                             client.capabilities().definition_provider.is_some();
+                        let supports_rename = client.capabilities().rename_provider.is_some();
                         log_file::log(&format!(
-                            "lsp[{}] spawned, supports_completion={supports} supports_hover={supports_hover} supports_definition={supports_definition}",
+                            "lsp[{}] spawned, supports_completion={supports} supports_hover={supports_hover} supports_definition={supports_definition} supports_rename={supports_rename}",
                             config.name
                         ));
                         spawned.push(ManagedClient {
@@ -285,6 +344,7 @@ impl WorkerState {
                             supports_completion: supports,
                             supports_hover,
                             supports_definition,
+                            supports_rename,
                         });
                     }
                     Err(e) => {
@@ -580,6 +640,131 @@ impl WorkerState {
             });
         });
     }
+
+    async fn request_rename(
+        &mut self,
+        request_id: u64,
+        path: PathBuf,
+        line: u32,
+        character: u32,
+        new_name: String,
+        tx: &std_mpsc::Sender<RenameResult>,
+    ) {
+        let Some(doc) = self.docs.get(&path) else {
+            return;
+        };
+        let lang = doc.language;
+        let Some(clients) = self.clients.get(&lang) else {
+            return;
+        };
+        let picked = clients
+            .iter()
+            .find(|c| c.supports_rename)
+            .map(|c| (c.name.clone(), c.client.clone()));
+        let Some((server_name, client_arc)) = picked else {
+            let _ = tx.send(RenameResult {
+                request_id,
+                path,
+                edits: None,
+            });
+            return;
+        };
+        let Ok(uri) = Url::from_file_path(&path) else {
+            return;
+        };
+        let tx = tx.clone();
+        let path_clone = path.clone();
+        log_file::log(&format!(
+            "rename request id={request_id} server={server_name} path={} line={line} char={character} new_name={new_name}",
+            path.display()
+        ));
+        tokio::spawn(async move {
+            let mut client = client_arc.lock().await;
+            let resp = client.rename(uri, line, character, new_name).await;
+            drop(client);
+            let edits = match resp {
+                Ok(Some(we)) => Some(workspace_edits(&we)),
+                Ok(None) => None,
+                Err(e) => {
+                    log_file::log(&format!("lsp[{server_name}] rename error: {e}"));
+                    None
+                }
+            };
+            log_file::log(&format!(
+                "rename response id={request_id} server={server_name} files={}",
+                edits.as_ref().map(Vec::len).unwrap_or(0)
+            ));
+            let _ = tx.send(RenameResult {
+                request_id,
+                path: path_clone,
+                edits,
+            });
+        });
+    }
+}
+
+/// Normalise a `WorkspaceEdit` into per-file char-indexed spans. Handles both
+/// the `changes` map and the `document_changes` form (edit operations only;
+/// create/rename/delete file ops are ignored, which is correct for a symbol
+/// rename). LSP positions are treated as char indices, matching how croft's
+/// editor maps positions everywhere else.
+fn workspace_edits(edit: &WorkspaceEdit) -> Vec<(PathBuf, Vec<TextSpanEdit>)> {
+    let mut out: Vec<(PathBuf, Vec<TextSpanEdit>)> = Vec::new();
+    if let Some(changes) = edit.changes.as_ref() {
+        for (uri, edits) in changes {
+            if let Ok(path) = uri.to_file_path() {
+                out.push((path, edits.iter().map(text_edit_to_span).collect()));
+            }
+        }
+    }
+    if let Some(doc_changes) = edit.document_changes.as_ref() {
+        match doc_changes {
+            DocumentChanges::Edits(edits) => {
+                for tde in edits {
+                    if let Ok(path) = tde.text_document.uri.to_file_path() {
+                        let spans = tde
+                            .edits
+                            .iter()
+                            .map(|e| match e {
+                                OneOf::Left(te) => text_edit_to_span(te),
+                                OneOf::Right(ate) => text_edit_to_span(&ate.text_edit),
+                            })
+                            .collect();
+                        out.push((path, spans));
+                    }
+                }
+            }
+            DocumentChanges::Operations(ops) => {
+                for op in ops {
+                    if let DocumentChangeOperation::Edit(tde) = op
+                        && let Ok(path) = tde.text_document.uri.to_file_path()
+                    {
+                        let spans = tde
+                            .edits
+                            .iter()
+                            .map(|e| match e {
+                                OneOf::Left(te) => text_edit_to_span(te),
+                                OneOf::Right(ate) => text_edit_to_span(&ate.text_edit),
+                            })
+                            .collect();
+                        out.push((path, spans));
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+fn text_edit_to_span(te: &TextEdit) -> TextSpanEdit {
+    TextSpanEdit {
+        start: (
+            te.range.start.line as usize,
+            te.range.start.character as usize,
+        ),
+        end: (te.range.end.line as usize, te.range.end.character as usize),
+        new_text: te.new_text.clone(),
+    }
 }
 
 fn into_item(item: lsp_types::CompletionItem) -> CompletionItem {
@@ -732,6 +917,30 @@ mod tests {
             character: ch,
         };
         lsp_types::Range { start: p, end: p }
+    }
+
+    #[test]
+    fn workspace_edits_reads_changes_map() {
+        let uri = Url::from_file_path("/tmp/foo.rs").unwrap();
+        let mut changes = HashMap::new();
+        changes.insert(
+            uri,
+            vec![TextEdit {
+                range: def_range(2, 4),
+                new_text: "renamed".to_string(),
+            }],
+        );
+        let we = WorkspaceEdit {
+            changes: Some(changes),
+            document_changes: None,
+            change_annotations: None,
+        };
+        let out = workspace_edits(&we);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, PathBuf::from("/tmp/foo.rs"));
+        assert_eq!(out[0].1.len(), 1);
+        assert_eq!(out[0].1[0].new_text, "renamed");
+        assert_eq!(out[0].1[0].start, (2, 4));
     }
 
     #[test]

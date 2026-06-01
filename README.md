@@ -164,7 +164,12 @@ croft setup-terminal --help
 | `Cmd`+`N` `Cmd`+`d` `d` | Delete `N` lines |
 | `Cmd`+`y` `y` | Yank (copy) the current line to the system clipboard |
 | `Cmd`+`N` `Cmd`+`y` `y` | Yank `N` lines |
-| `Esc` | Clear the current selection |
+| `Esc` | Clear the current selection, or collapse multi-cursors back to one |
+| `F2` | Rename Symbol: LSP rename of the identifier under the cursor across every file it touches (open tabs edit in-memory and stay dirty; closed files are rewritten on disk) |
+| `Cmd`+`F2` / `Ctrl`+`F2` | Change All Occurrences: drop a cursor on every textual match of the word in the current file and edit them all at once; type to replace, `Esc` to finish |
+| `Cmd`/`Option`+click | Go to Definition (jumps via the language server); `Cmd`+`Shift`+click navigates back |
+| Hover (300 ms dwell) | Show the LSP hover popup for the symbol under the pointer |
+| Right-click | Editor symbol menu: Go to Definition, Rename Symbol, Change All Occurrences |
 | `Cmd`+`E` | Toggle native modal (vim) editing for the editor pane (see below) |
 
 ### Editor: vim mode (modal editing)
@@ -383,6 +388,8 @@ What works:
 * Live filesystem watcher with a 50 ms polling fallback for missed startup or host events.
 * File open with tree-sitter highlighting (Rust, Python, JS, TS, TSX, JSON, TOML, YAML, Markdown, Go, HTML, CSS, Bash).
 * Full editor write path: insert / delete / Enter / Tab / Backspace / save round-trip with `●` dirty marker, auto-reload on external write when the buffer is clean (across every open tab, not just the focused one), a save-conflict guard that refuses to clobber an external change to a dirty buffer until you press Cmd+S again to overwrite, native-clipboard copy / cut (OSC 52 fallback on remote), undo with intelligent edit-step coalescing.
+* Multi-cursor "Change All Occurrences" (`Cmd`/`Ctrl`+`F2`): selects every textual match of the word in the current file and edits them simultaneously as one undo step.
+* LSP "Rename Symbol" (`F2`): renames the identifier under the cursor across every file the language server reports, in-memory for open tabs and on disk for closed ones.
 * Inline preview tabs that render directly in the editor pane via OSC 1337: PNG / JPEG / GIF / BMP / WebP, PDFs (with page navigation, multi-page when poppler is installed), and CSV / TSV / XLSX / XLS / XLSB / ODS spreadsheets.
 * Search sidebar (live, `.gitignore`-aware, off the UI thread, regex / case / whole-word toggles).
 * Remote (SSH) sidebar that lists hosts from `~/.ssh/config` and launches a remote croft session.
@@ -394,9 +401,7 @@ What works:
 
 The repo ships 568 unit tests plus CLI integration tests; run with `cargo test`.
 
-Already working: the three-pane layout, file explorer, multi-tab editor with syntax highlighting, live embedded terminals, git status, fuzzy file finder, remote launch over SSH, and LSP-backed completion and diagnostics (Python, TypeScript/TSX, JavaScript, Rust, Go).
-
-On the roadmap: command palette, settings, a stepping debugger, and a plugin system.
+Already working: the three-pane layout, file explorer, multi-tab editor with syntax highlighting, live embedded terminals, git status, fuzzy file finder, remote launch over SSH, and LSP-backed completion, diagnostics, hover, go-to-definition, and rename-symbol (Python, TypeScript/TSX, JavaScript, Rust, Go).
 
 ## Goal
 

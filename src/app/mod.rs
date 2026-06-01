@@ -317,6 +317,25 @@ enum MenuAction {
     CloseTabsToRight(usize),
     /// Close every editor tab and reset the pane to a blank state.
     CloseAllTabs,
+    /// Editor body: LSP "Rename Symbol" of the identifier at buffer `(row,
+    /// col)`. Captured at right-click so the later dispatch targets the same
+    /// symbol the user clicked.
+    RenameSymbolAt {
+        row: usize,
+        col: usize,
+    },
+    /// Editor body: "Change All Occurrences" of the word at buffer `(row,
+    /// col)` (multi-cursor select within the current file).
+    ChangeAllOccurrencesAt {
+        row: usize,
+        col: usize,
+    },
+    /// Editor body: LSP "Go to Definition" of the identifier at buffer
+    /// `(row, col)`.
+    GoToDefinitionAt {
+        row: usize,
+        col: usize,
+    },
 }
 
 /// Return the macOS-style keyboard shortcut hint to display on the right
@@ -337,6 +356,9 @@ fn shortcut_for(action: &MenuAction) -> Option<&'static str> {
         MenuAction::CloseTab(_) => Some("⌘W"),
         MenuAction::CloseOtherTabs(_) => Some("⌥⌘T"),
         MenuAction::CloseAllTabs => Some("⌘K W"),
+        MenuAction::RenameSymbolAt { .. } => Some("F2"),
+        MenuAction::ChangeAllOccurrencesAt { .. } => Some("⌘F2"),
+        MenuAction::GoToDefinitionAt { .. } => Some("F12"),
         _ => None,
     }
 }
@@ -603,6 +625,14 @@ enum PromptKind {
     /// Rename the entry at `path`. The prompt's `target_dir` holds the
     /// entry's parent; `buffer` is pre-filled with the current basename.
     Rename(PathBuf),
+    /// LSP "Rename Symbol" (F2 in the editor): rename the identifier at
+    /// `(row, col)` in `path`. `buffer` is pre-filled with the symbol; on
+    /// commit the new name drives a `textDocument/rename` request.
+    RenameSymbol {
+        path: PathBuf,
+        row: usize,
+        col: usize,
+    },
 }
 
 struct Prompt {
@@ -786,6 +816,7 @@ pub struct App {
     hover_anchor: Option<(u16, u16)>,
     hover_word: Option<(usize, usize, usize)>,
     definition_request_id: Option<u64>,
+    rename_request_id: Option<u64>,
     nav: NavHistory,
     editor_vim_chord: EditorVimChord,
     /// Native modal (vim-style) editing for the editor pane. When enabled it
@@ -1341,6 +1372,7 @@ impl App {
             file_finder_index_rx: Some(file_finder_index_rx),
             file_finder_index_dirty: false,
             completion_request_id: None,
+            rename_request_id: None,
             hover: HoverDwell::default(),
             hover_popup: None,
             hover_request_id: None,
@@ -2370,6 +2402,132 @@ impl App {
         };
         let id = lsp.request_definition(path, line as u32, c as u32);
         self.definition_request_id = Some(id);
+    }
+
+    /// Request the LSP definition of the symbol at the current cursor (buffer)
+    /// position. Used by the editor right-click "Go to Definition" item, where
+    /// the cursor has already been moved to the click point.
+    fn request_definition_at_cursor(&mut self) {
+        let row = self.editor.cursor_row;
+        let col = self.editor.cursor_col;
+        let Some(path) = self.editor.path.clone() else {
+            return;
+        };
+        let Some(lsp) = self.lsp.as_mut() else {
+            return;
+        };
+        let id = lsp.request_definition(path, row as u32, col as u32);
+        self.definition_request_id = Some(id);
+    }
+
+    /// VS Code "Change All Occurrences" (Cmd/Ctrl+F2): select every textual
+    /// match of the word under the cursor in the current file as multi-cursor
+    /// carets so the next keystrokes edit them all at once.
+    fn start_change_all_occurrences(&mut self) {
+        if self.editor.diff.is_some() || self.editor.sheet.is_some() || self.editor.image.is_some()
+        {
+            return;
+        }
+        let n = self.editor.select_all_occurrences_of_word_at_cursor();
+        if n == 0 {
+            self.status = String::from("No symbol under cursor");
+        } else {
+            self.status = format!("Selected {n} occurrences (type to replace, Esc to cancel)");
+        }
+    }
+
+    /// VS Code "Rename Symbol" (F2): prompt for a new name pre-filled with the
+    /// identifier under the cursor; committing fires an LSP `rename` request.
+    fn start_rename_symbol(&mut self) {
+        if self.editor.diff.is_some() || self.editor.sheet.is_some() || self.editor.image.is_some()
+        {
+            return;
+        }
+        let Some(path) = self.editor.path.clone() else {
+            self.status = String::from("No file open");
+            return;
+        };
+        let row = self.editor.cursor_row;
+        let col = self.editor.cursor_col;
+        let Some((start, end)) = self.editor.word_at(row, col) else {
+            self.status = String::from("No symbol under cursor");
+            return;
+        };
+        if self.lsp.is_none() {
+            self.status = String::from("No language server for this file");
+            return;
+        }
+        let word: String = self.editor.lines[row]
+            .chars()
+            .skip(start)
+            .take(end - start)
+            .collect();
+        self.prompt = Some(Prompt {
+            label: format!("Rename Symbol '{word}'"),
+            buffer: word,
+            kind: PromptKind::RenameSymbol { path, row, col },
+            target_dir: PathBuf::new(),
+            error: None,
+        });
+    }
+
+    pub fn drain_lsp_rename(&mut self) -> bool {
+        let mut arrived = false;
+        let mut edits: Option<Vec<(PathBuf, Vec<crate::widgets::editor::TextSpanEdit>)>> = None;
+        {
+            let Some(lsp) = self.lsp.as_ref() else {
+                return false;
+            };
+            while let Some(result) = lsp.drain_rename() {
+                if Some(result.request_id) != self.rename_request_id {
+                    continue;
+                }
+                arrived = true;
+                edits = result.edits;
+            }
+        }
+        if !arrived {
+            return false;
+        }
+        self.rename_request_id = None;
+        match edits {
+            Some(files) => match self.apply_rename_edits(&files) {
+                Ok((file_count, occ)) => {
+                    self.status =
+                        format!("Renamed {occ} occurrence(s) across {file_count} file(s)");
+                }
+                Err(e) => self.status = format!("Rename failed: {e}"),
+            },
+            None => self.status = String::from("Rename produced no changes"),
+        }
+        true
+    }
+
+    /// Apply an LSP rename `WorkspaceEdit` (already normalised to per-file
+    /// char-indexed spans). Open tabs are edited in-memory as one undo step
+    /// and left dirty; closed files are rewritten on disk (the fs watcher
+    /// refreshes the tree). Returns (files touched, occurrences replaced).
+    fn apply_rename_edits(
+        &mut self,
+        files: &[(PathBuf, Vec<crate::widgets::editor::TextSpanEdit>)],
+    ) -> Result<(usize, usize)> {
+        let mut file_count = 0;
+        let mut occ_count = 0;
+        for (path, edits) in files {
+            if edits.is_empty() {
+                continue;
+            }
+            if let Some(n) = self.editor.apply_rename_to_open_tab(path, edits) {
+                occ_count += n;
+            } else {
+                let content = std::fs::read_to_string(path)?;
+                let mut lines: Vec<String> = content.split('\n').map(str::to_string).collect();
+                occ_count += crate::widgets::editor::apply_span_edits_to_lines(&mut lines, edits);
+                std::fs::write(path, lines.join("\n"))?;
+            }
+            file_count += 1;
+        }
+        Ok((file_count, occ_count))
     }
 
     /// Route the key through the completion popup when one is open.
@@ -3916,6 +4074,20 @@ impl App {
                     ),
                 ]),
                 "Enter to rename, Esc to cancel",
+            ),
+            PromptKind::RenameSymbol { .. } => (
+                ratatui::text::Line::from(vec![
+                    ratatui::text::Span::raw("> "),
+                    ratatui::text::Span::styled(
+                        p.buffer.as_str(),
+                        Style::default().fg(Color::White),
+                    ),
+                    ratatui::text::Span::styled(
+                        "█",
+                        Style::default().fg(Color::Rgb(0x4e, 0x9a, 0xff)),
+                    ),
+                ]),
+                "Enter to rename symbol, Esc to cancel",
             ),
         };
         frame.render_widget(
@@ -5489,6 +5661,47 @@ impl App {
         if is_completion_trigger_key(key) {
             self.trigger_completion();
             return;
+        }
+        // Rename Symbol (F2) and Change All Occurrences (Cmd/Ctrl+F2) are only
+        // meaningful on a text buffer, so they sit above the read-only diff /
+        // sheet / image guards below.
+        if is_rename_symbol_key(key) {
+            self.start_rename_symbol();
+            return;
+        }
+        if is_change_all_occurrences_key(key) {
+            self.start_change_all_occurrences();
+            return;
+        }
+        // While multi-cursor mode is live, printable typing / backspace /
+        // delete fan out to every caret and Esc collapses back to one cursor.
+        // Any other key collapses the carets and falls through to normal
+        // single-cursor handling (e.g. an arrow moves just the primary).
+        if self.editor.has_multi_cursor() {
+            match key.code {
+                KeyCode::Esc => {
+                    self.editor.collapse_carets();
+                    self.status = String::from("Cursors collapsed");
+                    return;
+                }
+                KeyCode::Backspace => {
+                    self.editor.multi_backspace();
+                    return;
+                }
+                KeyCode::Delete => {
+                    self.editor.multi_delete_forward();
+                    return;
+                }
+                KeyCode::Char(c)
+                    if !key.modifiers.contains(KeyModifiers::CONTROL)
+                        && !key.modifiers.contains(KeyModifiers::ALT)
+                        && !key.modifiers.contains(KeyModifiers::SUPER) =>
+                {
+                    self.editor.multi_insert_char(c);
+                    return;
+                }
+                _ => self.editor.collapse_carets(),
+            }
         }
         if self.editor.diff.is_some() {
             self.handle_diff_key(key);
@@ -8077,6 +8290,39 @@ impl App {
                         selected: 0,
                         target_dir,
                     });
+                    return;
+                }
+                // Editor body: right-click over a text buffer opens the symbol
+                // menu (Go to Definition / Rename Symbol / Change All
+                // Occurrences). Read-only diff / sheet / image tabs have no
+                // symbols, so they're excluded.
+                if in_editor
+                    && self.editor.diff.is_none()
+                    && self.editor.sheet.is_none()
+                    && self.editor.image.is_none()
+                    && let Some((row, col)) = self.editor.buffer_pos_at(m.column, m.row)
+                {
+                    self.focus_pane(Pane::Editor);
+                    let items = vec![
+                        (
+                            String::from("Go to Definition"),
+                            MenuAction::GoToDefinitionAt { row, col },
+                        ),
+                        (
+                            String::from("Rename Symbol"),
+                            MenuAction::RenameSymbolAt { row, col },
+                        ),
+                        (
+                            String::from("Change All Occurrences"),
+                            MenuAction::ChangeAllOccurrencesAt { row, col },
+                        ),
+                    ];
+                    self.context_menu = Some(ContextMenu {
+                        origin: (m.column, m.row),
+                        items,
+                        selected: 0,
+                        target_dir: self.tree.root.clone(),
+                    });
                 }
             }
             MouseEventKind::Down(MouseButton::Left) => {
@@ -9169,6 +9415,26 @@ impl App {
                     }
                 }
             }
+            MenuAction::RenameSymbolAt { row, col } => {
+                self.editor.collapse_carets();
+                self.editor.cursor_row = row;
+                self.editor.cursor_col = col;
+                self.focus_pane(Pane::Editor);
+                self.start_rename_symbol();
+            }
+            MenuAction::ChangeAllOccurrencesAt { row, col } => {
+                self.editor.collapse_carets();
+                self.editor.cursor_row = row;
+                self.editor.cursor_col = col;
+                self.focus_pane(Pane::Editor);
+                self.start_change_all_occurrences();
+            }
+            MenuAction::GoToDefinitionAt { row, col } => {
+                self.editor.cursor_row = row;
+                self.editor.cursor_col = col;
+                self.focus_pane(Pane::Editor);
+                self.request_definition_at_cursor();
+            }
         }
     }
 
@@ -9896,6 +10162,25 @@ impl App {
                     }
                 }
             }
+            PromptKind::RenameSymbol { path, row, col } => {
+                let new_name = prompt.buffer.trim().to_string();
+                if new_name.is_empty() {
+                    if let Some(p) = self.prompt.as_mut() {
+                        p.error = Some("Name cannot be empty".to_string());
+                    }
+                    return;
+                }
+                let Some(lsp) = self.lsp.as_mut() else {
+                    if let Some(p) = self.prompt.as_mut() {
+                        p.error = Some("No language server for this file".to_string());
+                    }
+                    return;
+                };
+                let id = lsp.request_rename(path, row as u32, col as u32, new_name);
+                self.rename_request_id = Some(id);
+                self.prompt = None;
+                self.status = String::from("Renaming symbol...");
+            }
         }
     }
 }
@@ -10500,6 +10785,29 @@ fn is_editor_undo_key(key: KeyEvent) -> bool {
         return false;
     }
     key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::SUPER)
+}
+
+/// Editor-pane Rename Symbol: plain `F2` (VS Code's binding). In the Explorer
+/// tree the same key renames the selected file (`is_tree_rename_key`); the
+/// pane in focus decides which fires.
+fn is_rename_symbol_key(key: KeyEvent) -> bool {
+    matches!(key.code, KeyCode::F(2))
+        && !key.modifiers.contains(KeyModifiers::SUPER)
+        && !key.modifiers.contains(KeyModifiers::CONTROL)
+        && !key.modifiers.contains(KeyModifiers::SHIFT)
+        && !key.modifiers.contains(KeyModifiers::ALT)
+}
+
+/// Editor-pane Change All Occurrences: `Cmd+F2` (macOS) or `Ctrl+F2` (Linux),
+/// matching VS Code on each platform so local and remote behave identically.
+/// iTerm2 may deliver Cmd folded onto the Meta/ALT bit (the same reason
+/// Cmd+click arrives as ALT for go-to-definition), so any of SUPER / CONTROL /
+/// ALT alongside F2 counts. Plain F2 (no modifiers) stays Rename Symbol.
+fn is_change_all_occurrences_key(key: KeyEvent) -> bool {
+    matches!(key.code, KeyCode::F(2))
+        && (key.modifiers.contains(KeyModifiers::SUPER)
+            || key.modifiers.contains(KeyModifiers::CONTROL)
+            || key.modifiers.contains(KeyModifiers::ALT))
 }
 
 fn chord_status_text(op: char, count: usize) -> String {
@@ -11743,6 +12051,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         app.poll_hover();
         let hover_changed = app.drain_lsp_hover();
         let definition_changed = app.drain_lsp_definition();
+        let rename_changed = app.drain_lsp_rename();
         let sysmon_changed = app.drain_sysmon();
 
         let non_pty_dirty = needs_redraw
@@ -11759,6 +12068,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             || lsp_changed
             || hover_changed
             || definition_changed
+            || rename_changed
             || sysmon_changed;
         let pty_eligible = pty_pending
             && (app.peek_terminals_pending_bytes() <= PTY_SMALL_UPDATE_BYTES

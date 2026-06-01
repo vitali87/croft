@@ -9428,3 +9428,43 @@ fn vim_cmd_save_shortcut_still_works_in_normal_mode() {
         "Cmd+S should have saved through Normal mode"
     );
 }
+
+#[test]
+fn rename_symbol_key_is_plain_f2_only() {
+    assert!(is_rename_symbol_key(key(KeyCode::F(2), KeyModifiers::NONE)));
+    // Modified F2 is Change All Occurrences, not Rename Symbol.
+    assert!(!is_rename_symbol_key(key(
+        KeyCode::F(2),
+        KeyModifiers::SUPER
+    )));
+    assert!(!is_rename_symbol_key(key(
+        KeyCode::F(2),
+        KeyModifiers::CONTROL
+    )));
+    assert!(!is_rename_symbol_key(key(
+        KeyCode::F(3),
+        KeyModifiers::NONE
+    )));
+}
+
+#[test]
+fn change_all_occurrences_key_accepts_cmd_ctrl_or_alt_f2() {
+    // macOS Cmd, Linux Ctrl, and iTerm2's Cmd-folded-to-Meta (ALT) all fire.
+    assert!(is_change_all_occurrences_key(key(
+        KeyCode::F(2),
+        KeyModifiers::SUPER
+    )));
+    assert!(is_change_all_occurrences_key(key(
+        KeyCode::F(2),
+        KeyModifiers::CONTROL
+    )));
+    assert!(is_change_all_occurrences_key(key(
+        KeyCode::F(2),
+        KeyModifiers::ALT
+    )));
+    // Plain F2 stays Rename Symbol.
+    assert!(!is_change_all_occurrences_key(key(
+        KeyCode::F(2),
+        KeyModifiers::NONE
+    )));
+}

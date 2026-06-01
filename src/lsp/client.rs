@@ -13,10 +13,10 @@ use lsp_types::{
     ClientCapabilities, CompletionContext, CompletionParams, CompletionResponse,
     CompletionTriggerKind, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
     DidOpenTextDocumentParams, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverParams,
-    InitializeParams, InitializedParams, PartialResultParams, Position, ServerCapabilities,
-    TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem,
+    InitializeParams, InitializedParams, PartialResultParams, Position, RenameParams,
+    ServerCapabilities, TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem,
     TextDocumentPositionParams, Url, VersionedTextDocumentIdentifier, WorkDoneProgressParams,
-    WorkspaceFolder,
+    WorkspaceEdit, WorkspaceFolder,
 };
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
@@ -284,6 +284,26 @@ impl LspClient {
             })
             .await
             .context("definition")
+    }
+
+    pub async fn rename(
+        &mut self,
+        uri: Url,
+        line: u32,
+        character: u32,
+        new_name: String,
+    ) -> Result<Option<WorkspaceEdit>> {
+        self.server
+            .rename(RenameParams {
+                text_document_position: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri },
+                    position: Position { line, character },
+                },
+                new_name,
+                work_done_progress_params: WorkDoneProgressParams::default(),
+            })
+            .await
+            .context("rename")
     }
 
     pub async fn shutdown(mut self) -> Result<()> {

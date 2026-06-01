@@ -957,6 +957,57 @@ impl EditorSelection {
     }
 }
 
+/// A single text replacement in char-indexed `(row, col)` coordinates, as
+/// produced by an LSP rename `WorkspaceEdit`. Applied by
+/// [`apply_span_edits_to_lines`] and [`Editor::apply_span_edits`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TextSpanEdit {
+    pub start: (usize, usize),
+    pub end: (usize, usize),
+    pub new_text: String,
+}
+
+/// Apply `edits` to `lines` (char-indexed coords), bottom-to-top so an
+/// earlier replacement never shifts the coordinates of a later one. Returns
+/// the number of edits applied. Out-of-range edits are skipped.
+pub fn apply_span_edits_to_lines(lines: &mut Vec<String>, edits: &[TextSpanEdit]) -> usize {
+    let mut order: Vec<&TextSpanEdit> = edits.iter().collect();
+    order.sort_by(|a, b| b.start.cmp(&a.start));
+    let mut applied = 0;
+    for e in order {
+        if replace_span(lines, e) {
+            applied += 1;
+        }
+    }
+    applied
+}
+
+fn replace_span(lines: &mut Vec<String>, e: &TextSpanEdit) -> bool {
+    let (sr, sc) = e.start;
+    let (er, ec) = e.end;
+    if sr >= lines.len() || er >= lines.len() || (er, ec) < (sr, sc) {
+        return false;
+    }
+    if sr == er {
+        let line = &mut lines[sr];
+        let from = char_byte(line, sc);
+        let to = char_byte(line, ec);
+        line.replace_range(from..to, &e.new_text);
+        return true;
+    }
+    let from = char_byte(&lines[sr], sc);
+    let to = char_byte(&lines[er], ec);
+    let tail = lines[er][to..].to_string();
+    lines[sr].truncate(from);
+    lines[sr].push_str(&e.new_text);
+    lines[sr].push_str(&tail);
+    // Drop the now-merged intermediate and end rows.
+    for _ in sr + 1..=er {
+        lines.remove(sr + 1);
+    }
+    true
+}
+
 /// Coarse classification of the most recent edit, used so consecutive
 /// `InsertChar` ops coalesce into a single undo step (typing burst) but
 /// any other edit kind always opens a new step.
@@ -973,6 +1024,17 @@ enum EditKind {
     KillToEol,
     KillToBol,
     OpenLine,
+    /// A single keystroke applied simultaneously across every multi-cursor
+    /// caret. Never coalesces, so each multi-edit is its own undo step.
+    MultiEdit,
+}
+
+/// A single keystroke to fan out across every multi-cursor caret.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CaretEdit {
+    Insert(char),
+    Backspace,
+    DeleteForward,
 }
 
 #[derive(Clone, Debug)]
@@ -981,6 +1043,7 @@ struct Snapshot {
     cursor_row: usize,
     cursor_col: usize,
     selection: Option<EditorSelection>,
+    carets: Vec<EditorSelection>,
     dirty: bool,
 }
 
@@ -1052,6 +1115,13 @@ pub struct Editor {
     pub last_scrollbar: Rect,
     pub last_gutter_width: u16,
     pub selection: Option<EditorSelection>,
+    /// Secondary carets for multi-cursor editing (VS Code "Change All
+    /// Occurrences"). The primary caret stays in `cursor_row`/`cursor_col`
+    /// + `selection`; these are the *extra* carets. Empty in the common
+    /// single-cursor case, which keeps every existing edit path unchanged.
+    /// Each entry is a full selection (anchor + head); head is that caret's
+    /// cursor. Edits apply to the primary and all of these as one undo step.
+    pub carets: Vec<EditorSelection>,
     /// True when this tab is the single replaceable "preview" slot. Single-
     /// click / plain-Enter opens replace the preview tab's contents in place;
     /// double-click / Ctrl+Enter / typing into the buffer pin the tab
@@ -1132,6 +1202,7 @@ impl Editor {
             last_scrollbar: Rect::default(),
             last_gutter_width: 0,
             selection: None,
+            carets: Vec::new(),
             preview: false,
             undo_stack: Vec::new(),
             last_edit_kind: None,
@@ -1426,6 +1497,23 @@ impl Editor {
         self.recompute_highlights();
     }
 
+    /// Apply LSP rename edits to this buffer in-memory as a single undo step,
+    /// marking the tab dirty (the user saves to persist). Returns the number
+    /// of edits applied.
+    pub fn apply_span_edits(&mut self, edits: &[TextSpanEdit]) -> usize {
+        if edits.is_empty() {
+            return 0;
+        }
+        self.pin_on_edit();
+        self.push_undo(EditKind::Paste);
+        let n = apply_span_edits_to_lines(&mut self.lines, edits);
+        if n > 0 {
+            self.mark_buffer_changed();
+            self.recompute_highlights();
+        }
+        n
+    }
+
     pub fn insert_str(&mut self, s: &str) {
         self.pin_on_edit();
         self.push_undo(EditKind::Paste);
@@ -1526,8 +1614,14 @@ impl Editor {
     pub fn backspace(&mut self) {
         self.pin_on_edit();
         self.push_undo(EditKind::Backspace);
+        self.backspace_raw();
+        self.recompute_highlights();
+    }
+
+    /// Backspace body without snapshotting or re-highlighting. Callers that
+    /// batch multiple edits (multi-cursor) snapshot once and recompute once.
+    fn backspace_raw(&mut self) {
         if self.delete_selection_inner() {
-            self.recompute_highlights();
             return;
         }
         if self.cursor_col > 0 {
@@ -1545,14 +1639,18 @@ impl Editor {
             self.lines[self.cursor_row].push_str(&cur);
             self.mark_buffer_changed();
         }
-        self.recompute_highlights();
     }
 
     pub fn delete_forward(&mut self) {
         self.pin_on_edit();
         self.push_undo(EditKind::DeleteForward);
+        self.delete_forward_raw();
+        self.recompute_highlights();
+    }
+
+    /// Forward-delete body without snapshotting or re-highlighting.
+    fn delete_forward_raw(&mut self) {
         if self.delete_selection_inner() {
-            self.recompute_highlights();
             return;
         }
         let row = self.cursor_row;
@@ -1567,7 +1665,153 @@ impl Editor {
             self.lines[row].push_str(&next);
             self.mark_buffer_changed();
         }
+    }
+
+    /// True while multi-cursor mode is active (one or more secondary carets
+    /// in addition to the primary cursor).
+    pub fn has_multi_cursor(&self) -> bool {
+        !self.carets.is_empty()
+    }
+
+    /// Drop every secondary caret, leaving just the primary cursor. Called on
+    /// Esc, mouse clicks, and any movement that isn't a multi-cursor edit.
+    pub fn collapse_carets(&mut self) {
+        self.carets.clear();
+    }
+
+    /// VS Code "Change All Occurrences" (Cmd+F2): select every whole-word,
+    /// case-sensitive textual match of the identifier under the cursor in the
+    /// current file and turn each into a caret. The match at the cursor (or
+    /// the first, if the cursor isn't on one) becomes the primary selection;
+    /// the rest become secondary carets. Returns the number of occurrences
+    /// selected (0 when the cursor isn't on a word, leaving state untouched).
+    pub fn select_all_occurrences_of_word_at_cursor(&mut self) -> usize {
+        let Some((start, end)) = self.word_at(self.cursor_row, self.cursor_col) else {
+            return 0;
+        };
+        let word: Vec<char> = self.lines[self.cursor_row]
+            .chars()
+            .skip(start)
+            .take(end - start)
+            .collect();
+        if word.is_empty() {
+            return 0;
+        }
+        let mut occ: Vec<EditorSelection> = Vec::new();
+        for (row, line) in self.lines.iter().enumerate() {
+            let chars: Vec<char> = line.chars().collect();
+            for col in find_word_occurrences(&chars, &word) {
+                occ.push(EditorSelection {
+                    anchor: (row, col),
+                    head: (row, col + word.len()),
+                });
+            }
+        }
+        if occ.is_empty() {
+            return 0;
+        }
+        // The occurrence containing the cursor becomes primary so typing
+        // continues where the user is looking; otherwise fall back to the
+        // first match in the file.
+        let primary_idx = occ
+            .iter()
+            .position(|s| {
+                s.anchor.0 == self.cursor_row
+                    && self.cursor_col >= s.anchor.1
+                    && self.cursor_col <= s.head.1
+            })
+            .unwrap_or(0);
+        let primary = occ[primary_idx];
+        self.selection = Some(primary);
+        self.cursor_row = primary.head.0;
+        self.cursor_col = primary.head.1;
+        self.carets = occ
+            .into_iter()
+            .enumerate()
+            .filter(|(i, _)| *i != primary_idx)
+            .map(|(_, s)| s)
+            .collect();
+        self.carets.len() + 1
+    }
+
+    /// Insert a character at every caret. One undo step.
+    pub fn multi_insert_char(&mut self, c: char) {
+        self.multi_apply(CaretEdit::Insert(c));
+    }
+
+    /// Backspace at every caret. One undo step.
+    pub fn multi_backspace(&mut self) {
+        self.multi_apply(CaretEdit::Backspace);
+    }
+
+    /// Forward-delete at every caret. One undo step.
+    pub fn multi_delete_forward(&mut self) {
+        self.multi_apply(CaretEdit::DeleteForward);
+    }
+
+    /// Apply `edit` at the primary caret and every secondary caret as a
+    /// single undo step. Carets are processed bottom-to-top so an edit never
+    /// shifts the coordinates of a caret still to be processed.
+    fn multi_apply(&mut self, edit: CaretEdit) {
+        self.pin_on_edit();
+        self.push_undo(EditKind::MultiEdit);
+
+        let primary = self
+            .selection
+            .unwrap_or_else(|| EditorSelection::new(self.cursor_row, self.cursor_col));
+        let mut items: Vec<(bool, EditorSelection)> = Vec::with_capacity(self.carets.len() + 1);
+        items.push((true, primary));
+        for s in &self.carets {
+            items.push((false, *s));
+        }
+        // Descending by start so the lowest caret is edited first.
+        items.sort_by(|a, b| b.1.normalised().0.cmp(&a.1.normalised().0));
+        // Clear so the per-caret raw ops can't see stale carets.
+        self.carets.clear();
+
+        let mut new_primary = (self.cursor_row, self.cursor_col);
+        let mut new_secondary: Vec<(usize, usize)> = Vec::new();
+        for (is_primary, sel) in items {
+            if sel.has_area() {
+                self.selection = Some(sel);
+            } else {
+                self.selection = None;
+            }
+            let last = self.lines.len().saturating_sub(1);
+            self.cursor_row = sel.head.0.min(last);
+            self.cursor_col = sel.head.1.min(self.line_char_len(self.cursor_row));
+            self.apply_caret_edit_raw(edit);
+            let pos = (self.cursor_row, self.cursor_col);
+            if is_primary {
+                new_primary = pos;
+            } else {
+                new_secondary.push(pos);
+            }
+        }
+
+        self.selection = None;
+        let last = self.lines.len().saturating_sub(1);
+        self.cursor_row = new_primary.0.min(last);
+        self.cursor_col = new_primary.1.min(self.line_char_len(self.cursor_row));
+        new_secondary.sort_unstable();
+        self.carets = new_secondary
+            .into_iter()
+            .map(|(r, c)| EditorSelection::new(r, c))
+            .collect();
         self.recompute_highlights();
+    }
+
+    /// One caret's worth of a multi-edit: no snapshot, no re-highlight (the
+    /// batching caller in `multi_apply` does both once).
+    fn apply_caret_edit_raw(&mut self, edit: CaretEdit) {
+        match edit {
+            CaretEdit::Insert(c) => {
+                self.delete_selection_inner();
+                self.insert_char_raw(c);
+            }
+            CaretEdit::Backspace => self.backspace_raw(),
+            CaretEdit::DeleteForward => self.delete_forward_raw(),
+        }
     }
 
     pub fn start_selection_at_cursor(&mut self) {
@@ -1693,6 +1937,7 @@ impl Editor {
             cursor_row: self.cursor_row,
             cursor_col: self.cursor_col,
             selection: self.selection,
+            carets: self.carets.clone(),
             dirty: self.dirty,
         }
     }
@@ -1724,6 +1969,7 @@ impl Editor {
         self.cursor_row = snap.cursor_row.min(self.lines.len().saturating_sub(1));
         self.cursor_col = snap.cursor_col.min(self.line_char_len(self.cursor_row));
         self.selection = snap.selection;
+        self.carets = snap.carets;
         self.dirty = snap.dirty;
         self.last_edit_kind = None;
         self.recompute_highlights();
@@ -2367,6 +2613,8 @@ impl Editor {
         self.cursor_row = target_line;
         self.cursor_col = target_col.min(self.line_char_len(target_line));
         self.last_edit_kind = None;
+        // A click is a deliberate reposition; any multi-cursor session ends.
+        self.carets.clear();
     }
 
     pub fn buffer_pos_at(&self, col: u16, row: u16) -> Option<(usize, usize)> {
@@ -2423,6 +2671,33 @@ fn char_byte(s: &str, char_idx: usize) -> usize {
 
 fn is_word_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
+}
+
+/// Start char-indices of every whole-word, case-sensitive occurrence of
+/// `word` within `chars`. "Whole-word" means the char immediately before and
+/// after the match is not a word char, so `foo` does not match inside
+/// `foobar`. Mirrors VS Code's "Change All Occurrences" matching.
+fn find_word_occurrences(chars: &[char], word: &[char]) -> Vec<usize> {
+    let mut out = Vec::new();
+    if word.is_empty() || word.len() > chars.len() {
+        return out;
+    }
+    let last_start = chars.len() - word.len();
+    let mut i = 0;
+    while i <= last_start {
+        if chars[i..i + word.len()] == *word {
+            let before_ok = i == 0 || !is_word_char(chars[i - 1]);
+            let after_idx = i + word.len();
+            let after_ok = after_idx >= chars.len() || !is_word_char(chars[after_idx]);
+            if before_ok && after_ok {
+                out.push(i);
+                i += word.len();
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
 }
 
 fn indent_unit_for(lang: Option<LangKind>) -> &'static str {
@@ -2668,6 +2943,27 @@ impl Widget for &mut Editor {
                 }
             }
 
+            // Secondary multi-cursor carets ("Change All Occurrences"): paint
+            // each one's selection band and a software block cursor at its
+            // head. The primary cursor is the hardware caret; these blocks
+            // mark the extra cursors so the user sees every edit point.
+            for caret in &self.carets {
+                let ((cr0, cc0), (cr1, cc1)) = caret.normalised();
+                if line_idx >= cr0 && line_idx <= cr1 {
+                    let line_chars = self.line_char_len(line_idx);
+                    let row_start = if line_idx == cr0 { cc0 } else { 0 };
+                    let row_end = if line_idx == cr1 { cc1 } else { line_chars + 1 };
+                    let vs = row_start.saturating_sub(self.scroll_col);
+                    let ve = row_end.saturating_sub(self.scroll_col);
+                    if ve > vs {
+                        paint_selection_band(buf, text_x, y, text_width, vs, ve);
+                    }
+                }
+                if caret.head.0 == line_idx {
+                    paint_block_cursor(buf, text_x, y, text_width, caret.head.1, self.scroll_col);
+                }
+            }
+
             // The cursor itself is drawn by the host terminal as a hardware
             // caret (DECSCUSR `BlinkingBar`); App calls
             // `frame.set_cursor_position(...)` so the blink/overlay never
@@ -2829,6 +3125,33 @@ fn paint_search_highlight(
             break;
         }
     }
+}
+
+/// Paint a software block cursor for a secondary multi-cursor caret at char
+/// column `col_char` of row `y`. Uses a reversed bar so it reads as a caret
+/// distinct from the host terminal's hardware caret on the primary cursor.
+fn paint_block_cursor(
+    buf: &mut Buffer,
+    text_x: u16,
+    y: u16,
+    text_width: u16,
+    col_char: usize,
+    scroll_col: usize,
+) {
+    if col_char < scroll_col {
+        return;
+    }
+    let col = col_char - scroll_col;
+    if col as u16 >= text_width {
+        return;
+    }
+    let cell = &mut buf[(text_x + col as u16, y)];
+    cell.set_style(
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Rgb(0xae, 0xc6, 0xff))
+            .add_modifier(Modifier::BOLD),
+    );
 }
 
 /// Apply the selection background colour to columns `[start_char..end_char)`
@@ -3148,6 +3471,18 @@ impl EditorTabs {
     /// currently holding that file.
     pub fn find_tab_with_path(&self, target: &Path) -> Option<usize> {
         self.find_tab_matching(target, |_| true)
+    }
+
+    /// If `path` is open in a tab, apply LSP rename `edits` to that buffer
+    /// in-memory (one undo step, marked dirty) and return the count applied.
+    /// `None` when no tab holds the file, so the caller can edit it on disk.
+    pub fn apply_rename_to_open_tab(
+        &mut self,
+        path: &Path,
+        edits: &[TextSpanEdit],
+    ) -> Option<usize> {
+        let idx = self.find_tab_with_path(path)?;
+        Some(self.editors[idx].apply_span_edits(edits))
     }
 
     fn find_tab_matching(&self, target: &Path, extra: impl Fn(&Editor) -> bool) -> Option<usize> {
@@ -3645,6 +3980,111 @@ mod tests {
         assert!(is_binary(b"hello\0world"));
         assert!(!is_binary(b"hello world"));
         assert!(!is_binary(b""));
+    }
+
+    #[test]
+    fn find_word_occurrences_matches_whole_words_only() {
+        let chars: Vec<char> = "foo foobar foo_ foo".chars().collect();
+        let word: Vec<char> = "foo".chars().collect();
+        // Only the standalone "foo" at col 0 and the final "foo" qualify;
+        // "foobar" and "foo_" are larger identifiers.
+        assert_eq!(find_word_occurrences(&chars, &word), vec![0, 16]);
+    }
+
+    #[test]
+    fn select_all_occurrences_picks_cursor_match_as_primary() {
+        let mut e = editor_with("foo bar foo\nfoo");
+        e.cursor_row = 0;
+        e.cursor_col = 8; // second "foo" on line 0
+        let n = e.select_all_occurrences_of_word_at_cursor();
+        assert_eq!(n, 3);
+        // Primary selection covers the occurrence under the cursor.
+        assert_eq!(e.selection.unwrap().normalised(), ((0, 8), (0, 11)));
+        // The other two become secondary carets.
+        assert_eq!(e.carets.len(), 2);
+        assert!(e.has_multi_cursor());
+    }
+
+    #[test]
+    fn multi_insert_replaces_every_occurrence_in_one_undo_step() {
+        let mut e = editor_with("foo bar foo\nfoo");
+        e.cursor_row = 0;
+        e.cursor_col = 0;
+        assert_eq!(e.select_all_occurrences_of_word_at_cursor(), 3);
+        e.multi_insert_char('X');
+        assert_eq!(e.lines, vec!["X bar X".to_string(), "X".to_string()]);
+        // One undo restores the whole batch at once.
+        assert!(e.undo());
+        assert_eq!(e.lines, vec!["foo bar foo".to_string(), "foo".to_string()]);
+    }
+
+    #[test]
+    fn multi_backspace_deletes_at_every_caret() {
+        let mut e = editor_with("ab ab ab");
+        e.cursor_row = 0;
+        e.cursor_col = 0;
+        assert_eq!(e.select_all_occurrences_of_word_at_cursor(), 3);
+        // Selections are active; backspace deletes each selected "ab".
+        e.multi_backspace();
+        assert_eq!(e.lines, vec!["  ".to_string()]);
+    }
+
+    #[test]
+    fn collapse_carets_drops_secondary_cursors() {
+        let mut e = editor_with("x x x");
+        e.cursor_col = 0;
+        e.select_all_occurrences_of_word_at_cursor();
+        assert!(e.has_multi_cursor());
+        e.collapse_carets();
+        assert!(!e.has_multi_cursor());
+        assert!(e.carets.is_empty());
+    }
+
+    #[test]
+    fn apply_span_edits_applies_bottom_to_top() {
+        let mut lines = vec!["foo bar foo".to_string()];
+        let edits = vec![
+            TextSpanEdit {
+                start: (0, 0),
+                end: (0, 3),
+                new_text: "baz".to_string(),
+            },
+            TextSpanEdit {
+                start: (0, 8),
+                end: (0, 11),
+                new_text: "baz".to_string(),
+            },
+        ];
+        assert_eq!(apply_span_edits_to_lines(&mut lines, &edits), 2);
+        assert_eq!(lines, vec!["baz bar baz".to_string()]);
+    }
+
+    #[test]
+    fn editor_apply_span_edits_marks_dirty_and_one_undo() {
+        let mut e = editor_with("name = 1\nprint(name)");
+        let edits = vec![
+            TextSpanEdit {
+                start: (0, 0),
+                end: (0, 4),
+                new_text: "label".to_string(),
+            },
+            TextSpanEdit {
+                start: (1, 6),
+                end: (1, 10),
+                new_text: "label".to_string(),
+            },
+        ];
+        assert_eq!(e.apply_span_edits(&edits), 2);
+        assert!(e.dirty);
+        assert_eq!(
+            e.lines,
+            vec!["label = 1".to_string(), "print(label)".to_string()]
+        );
+        assert!(e.undo());
+        assert_eq!(
+            e.lines,
+            vec!["name = 1".to_string(), "print(name)".to_string()]
+        );
     }
 
     #[test]
