@@ -10,7 +10,7 @@ use lsp_types::{
     CompletionItemKindCapability, CompletionResponse, DeclarationCapability,
     DocumentChangeOperation, DocumentChanges, GotoDefinitionResponse, HoverContents,
     HoverProviderCapability, MarkedString, MarkupKind, OneOf, TextDocumentClientCapabilities,
-    TextEdit, Url, WorkspaceEdit,
+    TextEdit, TypeDefinitionProviderCapability, Url, WorkspaceEdit,
 };
 use tokio::sync::{Mutex as TokioMutex, mpsc as tokio_mpsc};
 
@@ -63,6 +63,17 @@ pub struct DeclarationResult {
 }
 
 #[derive(Debug)]
+pub struct TypeDefinitionResult {
+    pub request_id: u64,
+    pub path: PathBuf,
+    pub target: Option<(PathBuf, u32, u32)>,
+    /// True when no spawned server advertises a usable `typeDefinitionProvider`.
+    /// Mirrors `DeclarationResult::unsupported` so the app can report it plainly
+    /// rather than silently no-op.
+    pub unsupported: bool,
+}
+
+#[derive(Debug)]
 pub struct RenameResult {
     pub request_id: u64,
     pub path: PathBuf,
@@ -107,6 +118,12 @@ enum Cmd {
         line: u32,
         character: u32,
     },
+    RequestTypeDefinition {
+        request_id: u64,
+        path: PathBuf,
+        line: u32,
+        character: u32,
+    },
     RequestRename {
         request_id: u64,
         path: PathBuf,
@@ -116,12 +133,18 @@ enum Cmd {
     },
 }
 
-/// Per-language declaration support, published by the worker once a server
-/// has spawned and read synchronously by the app at menu-build time. The app
-/// only shows "Go to Declaration" for languages whose server actually
-/// implements `textDocument/declaration` (so it is hidden for TypeScript,
-/// whose vtsls advertises `declarationProvider: false`), mirroring VS Code.
-type DeclarationSupport = Arc<StdMutex<HashMap<Language, bool>>>;
+/// Per-language support for the optional, capability-gated navigation methods,
+/// published by the worker once a server has spawned and read synchronously by
+/// the app at menu-build time. The app only shows "Go to Declaration" /
+/// "Go to Type Definition" for languages whose server actually implements the
+/// matching method (so Declaration is hidden for TypeScript, whose vtsls
+/// advertises `declarationProvider: false`), mirroring VS Code.
+#[derive(Default)]
+struct LangCapabilitySupport {
+    declaration: HashMap<Language, bool>,
+    type_definition: HashMap<Language, bool>,
+}
+type CapabilitySupport = Arc<StdMutex<LangCapabilitySupport>>;
 
 pub struct LspManager {
     cmd_tx: tokio_mpsc::UnboundedSender<Cmd>,
@@ -129,8 +152,9 @@ pub struct LspManager {
     hover_rx: std_mpsc::Receiver<HoverResult>,
     def_rx: std_mpsc::Receiver<DefinitionResult>,
     decl_rx: std_mpsc::Receiver<DeclarationResult>,
+    type_def_rx: std_mpsc::Receiver<TypeDefinitionResult>,
     rename_rx: std_mpsc::Receiver<RenameResult>,
-    declaration_support: DeclarationSupport,
+    capability_support: CapabilitySupport,
     next_request_id: u64,
     workspace_root: PathBuf,
     _runtime: LspRuntime,
@@ -144,8 +168,10 @@ impl LspManager {
         let (hover_tx, hover_rx) = std_mpsc::channel();
         let (def_tx, def_rx) = std_mpsc::channel();
         let (decl_tx, decl_rx) = std_mpsc::channel();
+        let (type_def_tx, type_def_rx) = std_mpsc::channel();
         let (rename_tx, rename_rx) = std_mpsc::channel();
-        let declaration_support: DeclarationSupport = Arc::new(StdMutex::new(HashMap::new()));
+        let capability_support: CapabilitySupport =
+            Arc::new(StdMutex::new(LangCapabilitySupport::default()));
         let root = workspace_root.clone();
         runtime.handle().spawn(worker_loop(
             root,
@@ -156,9 +182,10 @@ impl LspManager {
                 hover: hover_tx,
                 definition: def_tx,
                 declaration: decl_tx,
+                type_definition: type_def_tx,
                 rename: rename_tx,
             },
-            declaration_support.clone(),
+            capability_support.clone(),
         ));
         Ok(Self {
             cmd_tx,
@@ -166,8 +193,9 @@ impl LspManager {
             hover_rx,
             def_rx,
             decl_rx,
+            type_def_rx,
             rename_rx,
-            declaration_support,
+            capability_support,
             next_request_id: 1,
             workspace_root,
             _runtime: runtime,
@@ -254,11 +282,44 @@ impl LspManager {
         self.decl_rx.try_recv().ok()
     }
 
+    pub fn request_type_definition(&mut self, path: PathBuf, line: u32, character: u32) -> u64 {
+        let id = self.next_request_id;
+        self.next_request_id += 1;
+        let _ = self.cmd_tx.send(Cmd::RequestTypeDefinition {
+            request_id: id,
+            path,
+            line,
+            character,
+        });
+        id
+    }
+
+    pub fn drain_type_definition(&self) -> Option<TypeDefinitionResult> {
+        self.type_def_rx.try_recv().ok()
+    }
+
     /// Whether the server for `lang` implements `textDocument/declaration`.
     /// `None` means no server has reported yet (not spawned). Read synchronously
     /// by the app to decide whether to show the "Go to Declaration" menu item.
     pub fn language_supports_declaration(&self, lang: Language) -> Option<bool> {
-        self.declaration_support.lock().ok()?.get(&lang).copied()
+        self.capability_support
+            .lock()
+            .ok()?
+            .declaration
+            .get(&lang)
+            .copied()
+    }
+
+    /// Whether the server for `lang` implements `textDocument/typeDefinition`.
+    /// `None` means no server has reported yet. Read synchronously by the app to
+    /// decide whether to show the "Go to Type Definition" menu item.
+    pub fn language_supports_type_definition(&self, lang: Language) -> Option<bool> {
+        self.capability_support
+            .lock()
+            .ok()?
+            .type_definition
+            .get(&lang)
+            .copied()
     }
 
     pub fn request_rename(
@@ -292,6 +353,7 @@ struct ManagedClient {
     supports_hover: bool,
     supports_definition: bool,
     supports_declaration: bool,
+    supports_type_definition: bool,
     supports_rename: bool,
 }
 
@@ -308,7 +370,7 @@ struct WorkerState {
     registry: ServerRegistry,
     clients: HashMap<ClientKey, Vec<ManagedClient>>,
     docs: HashMap<PathBuf, DocState>,
-    declaration_support: DeclarationSupport,
+    capability_support: CapabilitySupport,
 }
 
 struct DocState {
@@ -324,6 +386,7 @@ struct ResultSenders {
     hover: std_mpsc::Sender<HoverResult>,
     definition: std_mpsc::Sender<DefinitionResult>,
     declaration: std_mpsc::Sender<DeclarationResult>,
+    type_definition: std_mpsc::Sender<TypeDefinitionResult>,
     rename: std_mpsc::Sender<RenameResult>,
 }
 
@@ -332,14 +395,14 @@ async fn worker_loop(
     registry: ServerRegistry,
     mut cmd_rx: tokio_mpsc::UnboundedReceiver<Cmd>,
     tx: ResultSenders,
-    declaration_support: DeclarationSupport,
+    capability_support: CapabilitySupport,
 ) {
     let mut state = WorkerState {
         workspace_root,
         registry,
         clients: HashMap::new(),
         docs: HashMap::new(),
-        declaration_support,
+        capability_support,
     };
     while let Some(cmd) = cmd_rx.recv().await {
         match cmd {
@@ -384,6 +447,16 @@ async fn worker_loop(
             } => {
                 state
                     .request_declaration(request_id, path, line, character, &tx.declaration)
+                    .await
+            }
+            Cmd::RequestTypeDefinition {
+                request_id,
+                path,
+                line,
+                character,
+            } => {
+                state
+                    .request_type_definition(request_id, path, line, character, &tx.type_definition)
                     .await
             }
             Cmd::RequestRename {
@@ -437,9 +510,11 @@ impl WorkerState {
                         let supports_definition = one_of_supported(&caps.definition_provider);
                         let supports_declaration =
                             declaration_supported(&caps.declaration_provider);
+                        let supports_type_definition =
+                            type_definition_supported(&caps.type_definition_provider);
                         let supports_rename = one_of_supported(&caps.rename_provider);
                         log_file::log(&format!(
-                            "lsp[{}] spawned, root={} supports_completion={supports} supports_hover={supports_hover} supports_definition={supports_definition} supports_declaration={supports_declaration} supports_rename={supports_rename}",
+                            "lsp[{}] spawned, root={} supports_completion={supports} supports_hover={supports_hover} supports_definition={supports_definition} supports_declaration={supports_declaration} supports_type_definition={supports_type_definition} supports_rename={supports_rename}",
                             config.name,
                             root.display()
                         ));
@@ -450,6 +525,7 @@ impl WorkerState {
                             supports_hover,
                             supports_definition,
                             supports_declaration,
+                            supports_type_definition,
                             supports_rename,
                         });
                     }
@@ -458,13 +534,18 @@ impl WorkerState {
                     }
                 }
             }
-            // Publish declaration support for this language so the app can show
-            // or hide the "Go to Declaration" menu item synchronously. Written
-            // even when empty (value false) so a missing entry means "not probed
-            // yet" rather than "unsupported".
+            // Publish declaration / type-definition support for this language so
+            // the app can show or hide the "Go to Declaration" / "Go to Type
+            // Definition" menu items synchronously. Written even when empty
+            // (value false) so a missing entry means "not probed yet" rather
+            // than "unsupported".
             let supports_declaration = spawned.iter().any(|c| c.supports_declaration);
-            if let Ok(mut map) = self.declaration_support.lock() {
-                map.insert(lang, supports_declaration);
+            let supports_type_definition = spawned.iter().any(|c| c.supports_type_definition);
+            if let Ok(mut support) = self.capability_support.lock() {
+                support.declaration.insert(lang, supports_declaration);
+                support
+                    .type_definition
+                    .insert(lang, supports_type_definition);
             }
             self.clients.insert(key.clone(), spawned);
         }
@@ -841,6 +922,75 @@ impl WorkerState {
         });
     }
 
+    async fn request_type_definition(
+        &mut self,
+        request_id: u64,
+        path: PathBuf,
+        line: u32,
+        character: u32,
+        tx: &std_mpsc::Sender<TypeDefinitionResult>,
+    ) {
+        let Some(doc) = self.docs.get(&path) else {
+            return;
+        };
+        let lang = doc.language;
+        let root = doc.project_root.clone();
+        // Re-probe so a server installed since the file was opened (e.g. the
+        // managed vtsls finishing its lazy background install) is picked up
+        // without reopening the file. Cheap once the list is non-empty.
+        self.ensure_clients(lang, &root).await;
+        let Some(clients) = self.clients.get(&(lang, root)) else {
+            return;
+        };
+        let picked = clients
+            .iter()
+            .find(|c| c.supports_type_definition)
+            .map(|c| (c.name.clone(), c.client.clone()));
+        let Some((server_name, client_arc)) = picked else {
+            let _ = tx.send(TypeDefinitionResult {
+                request_id,
+                path,
+                target: None,
+                unsupported: true,
+            });
+            return;
+        };
+        let Ok(uri) = Url::from_file_path(&path) else {
+            return;
+        };
+        let tx = tx.clone();
+        let path_clone = path.clone();
+        log_file::log(&format!(
+            "type_definition request id={request_id} server={server_name} path={} line={line} char={character}",
+            path.display()
+        ));
+        tokio::spawn(async move {
+            let mut client = client_arc.lock().await;
+            let resp = client.type_definition(uri, line, character).await;
+            drop(client);
+            let target = match resp {
+                Ok(Some(r)) => def_location(&r),
+                Ok(None) => None,
+                // `{e:#}` prints the full anyhow chain (the underlying JSON-RPC
+                // error), not just the "type_definition" context label.
+                Err(e) => {
+                    log_file::log(&format!("lsp[{server_name}] type_definition error: {e:#}"));
+                    None
+                }
+            };
+            log_file::log(&format!(
+                "type_definition response id={request_id} server={server_name} has_target={}",
+                target.is_some()
+            ));
+            let _ = tx.send(TypeDefinitionResult {
+                request_id,
+                path: path_clone,
+                target,
+                unsupported: false,
+            });
+        });
+    }
+
     async fn request_rename(
         &mut self,
         request_id: u64,
@@ -1034,6 +1184,18 @@ fn declaration_supported(cap: &Option<DeclarationCapability>) -> bool {
         Some(DeclarationCapability::RegistrationOptions(_) | DeclarationCapability::Options(_)) => {
             true
         }
+        None => false,
+    }
+}
+
+/// Type-definition capability (`boolean | TypeDefinitionOptions | ...`), same
+/// bare-`false` rule as hover/declaration. vtsls, basedpyright, rust-analyzer
+/// and gopls all advertise it, so the row is shown for those; a server that
+/// omits it (or sends `false`) gets the row hidden instead of a -32601.
+fn type_definition_supported(cap: &Option<TypeDefinitionProviderCapability>) -> bool {
+    match cap {
+        Some(TypeDefinitionProviderCapability::Simple(b)) => *b,
+        Some(TypeDefinitionProviderCapability::Options(_)) => true,
         None => false,
     }
 }
@@ -1364,6 +1526,17 @@ mod tests {
             true
         ))));
         assert!(!hover_supported(&None));
+    }
+
+    #[test]
+    fn type_definition_capability_false_reads_as_unsupported() {
+        assert!(!type_definition_supported(&Some(
+            TypeDefinitionProviderCapability::Simple(false)
+        )));
+        assert!(type_definition_supported(&Some(
+            TypeDefinitionProviderCapability::Simple(true)
+        )));
+        assert!(!type_definition_supported(&None));
     }
 
     #[test]

@@ -170,8 +170,9 @@ croft setup-terminal --help
 | `Cmd`+`F2` / `Ctrl`+`F2` | Change All Occurrences: drop a cursor on every textual match of the word in the current file and edit them all at once; type to replace, `Esc` to finish |
 | `F12` / `Cmd`/`Option`+click | Go to Definition (jumps via the language server); `Cmd`+`Shift`+click navigates back |
 | `Shift`+`F12` | Go to Declaration: jumps to where the symbol is declared, via the language server's `textDocument/declaration`. Shown in the right-click menu only for languages whose server implements it; hidden for TypeScript (vtsls advertises `declarationProvider: false`), exactly as VS Code does |
+| `Ctrl`+`F12` | Go to Type Definition: jumps to where the type of the expression under the cursor is defined, via the language server's `textDocument/typeDefinition`. Shown in the right-click menu only for languages whose server implements it (vtsls, basedpyright, rust-analyzer, gopls all do) |
 | Hover (300 ms dwell) | Show the LSP hover popup for the symbol under the pointer |
-| Right-click | Editor symbol menu: Go to Definition, Go to Declaration, Rename Symbol, Change All Occurrences |
+| Right-click | Editor symbol menu: Go to Definition, Go to Declaration, Go to Type Definition, Rename Symbol, Change All Occurrences |
 | `Cmd`+`E` | Toggle native modal (vim) editing for the editor pane (see below) |
 
 ### Editor: vim mode (modal editing)

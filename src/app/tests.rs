@@ -9475,7 +9475,7 @@ fn go_to_definition_key_is_f12_without_shift() {
         KeyCode::F(12),
         KeyModifiers::NONE
     )));
-    // Cmd/Ctrl/Alt+F12 (incl. iTerm2's Cmd-folded-to-Meta) still mean Definition.
+    // Cmd/Alt+F12 (incl. iTerm2's Cmd-folded-to-Meta) still mean Definition.
     assert!(is_go_to_definition_key(key(
         KeyCode::F(12),
         KeyModifiers::SUPER
@@ -9484,10 +9484,14 @@ fn go_to_definition_key_is_f12_without_shift() {
         KeyCode::F(12),
         KeyModifiers::ALT
     )));
-    // Shift+F12 is Declaration, not Definition.
+    // Shift+F12 is Declaration, Ctrl+F12 is Type Definition; neither is Definition.
     assert!(!is_go_to_definition_key(key(
         KeyCode::F(12),
         KeyModifiers::SHIFT
+    )));
+    assert!(!is_go_to_definition_key(key(
+        KeyCode::F(12),
+        KeyModifiers::CONTROL
     )));
     assert!(!is_go_to_definition_key(key(
         KeyCode::F(11),
@@ -9506,9 +9510,36 @@ fn go_to_declaration_key_is_shift_f12() {
         KeyCode::F(12),
         KeyModifiers::NONE
     )));
+    // Ctrl+F12 is Type Definition, not Declaration; the two must not collide
+    // when both modifiers are reported.
+    assert!(!is_go_to_declaration_key(key(
+        KeyCode::F(12),
+        KeyModifiers::CONTROL
+    )));
     assert!(!is_go_to_declaration_key(key(
         KeyCode::F(2),
         KeyModifiers::SHIFT
+    )));
+}
+
+#[test]
+fn go_to_type_definition_key_is_ctrl_f12() {
+    assert!(is_go_to_type_definition_key(key(
+        KeyCode::F(12),
+        KeyModifiers::CONTROL
+    )));
+    // Plain F12 (Definition) and Shift+F12 (Declaration) are not Type Definition.
+    assert!(!is_go_to_type_definition_key(key(
+        KeyCode::F(12),
+        KeyModifiers::NONE
+    )));
+    assert!(!is_go_to_type_definition_key(key(
+        KeyCode::F(12),
+        KeyModifiers::SHIFT
+    )));
+    assert!(!is_go_to_type_definition_key(key(
+        KeyCode::F(11),
+        KeyModifiers::CONTROL
     )));
 }
 
@@ -9522,6 +9553,10 @@ fn shortcut_for_returns_expected_shortcuts_for_editor_symbol_actions() {
     assert_eq!(
         shortcut_for(&MenuAction::GoToDeclarationAt { row: 0, col: 0 }),
         Some("⇧F12")
+    );
+    assert_eq!(
+        shortcut_for(&MenuAction::GoToTypeDefinitionAt { row: 0, col: 0 }),
+        Some("⌃F12")
     );
     assert_eq!(
         shortcut_for(&MenuAction::RenameSymbolAt { row: 0, col: 0 }),
