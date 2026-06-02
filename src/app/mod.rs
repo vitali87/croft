@@ -2375,6 +2375,7 @@ impl App {
 
     pub fn drain_lsp_declaration(&mut self) -> bool {
         let mut target = None;
+        let mut unsupported = false;
         {
             let Some(lsp) = self.lsp.as_ref() else {
                 return false;
@@ -2384,6 +2385,7 @@ impl App {
                     continue;
                 }
                 target = result.target;
+                unsupported = result.unsupported;
             }
         }
         match target {
@@ -2391,6 +2393,14 @@ impl App {
             // move the caret, record nav history.
             Some((path, line, col)) => {
                 self.go_to_definition(path, line, col);
+                true
+            }
+            // Be explicit rather than silently no-op: say when the language
+            // server has no declaration provider (e.g. TypeScript's vtsls) and
+            // when it simply found nothing at this position.
+            None if unsupported => {
+                self.status =
+                    String::from("Go to Declaration: not supported by this file's language server");
                 true
             }
             None => false,
@@ -2483,6 +2493,27 @@ impl App {
         };
         let id = lsp.request_declaration(path, row as u32, col as u32);
         self.declaration_request_id = Some(id);
+    }
+
+    /// Whether the current editor file's language server implements
+    /// `textDocument/declaration`. Drives whether the right-click menu shows the
+    /// "Go to Declaration" row. Unknown (server not yet spawned) or no server is
+    /// treated as unsupported, so the row only appears once support is confirmed.
+    fn editor_language_supports_declaration(&self) -> bool {
+        let Some(lang) = self
+            .editor
+            .path
+            .as_deref()
+            .and_then(|p| p.extension())
+            .and_then(|e| e.to_str())
+            .and_then(crate::lsp::Language::from_extension)
+        else {
+            return false;
+        };
+        self.lsp
+            .as_ref()
+            .and_then(|lsp| lsp.language_supports_declaration(lang))
+            .unwrap_or(false)
     }
 
     /// VS Code "Change All Occurrences" (Cmd/Ctrl+F2): select every textual
@@ -8390,24 +8421,28 @@ impl App {
                     && let Some((row, col)) = self.editor.buffer_pos_at(m.column, m.row)
                 {
                     self.focus_pane(Pane::Editor);
-                    let items = vec![
-                        (
-                            String::from("Go to Definition"),
-                            MenuAction::GoToDefinitionAt { row, col },
-                        ),
-                        (
+                    let mut items = vec![(
+                        String::from("Go to Definition"),
+                        MenuAction::GoToDefinitionAt { row, col },
+                    )];
+                    // Only offer "Go to Declaration" when this file's language
+                    // server actually implements `textDocument/declaration`.
+                    // TypeScript's vtsls advertises `declarationProvider: false`,
+                    // so the row is hidden there, exactly as VS Code does.
+                    if self.editor_language_supports_declaration() {
+                        items.push((
                             String::from("Go to Declaration"),
                             MenuAction::GoToDeclarationAt { row, col },
-                        ),
-                        (
-                            String::from("Rename Symbol"),
-                            MenuAction::RenameSymbolAt { row, col },
-                        ),
-                        (
-                            String::from("Change All Occurrences"),
-                            MenuAction::ChangeAllOccurrencesAt { row, col },
-                        ),
-                    ];
+                        ));
+                    }
+                    items.push((
+                        String::from("Rename Symbol"),
+                        MenuAction::RenameSymbolAt { row, col },
+                    ));
+                    items.push((
+                        String::from("Change All Occurrences"),
+                        MenuAction::ChangeAllOccurrencesAt { row, col },
+                    ));
                     self.context_menu = Some(ContextMenu {
                         origin: (m.column, m.row),
                         items,

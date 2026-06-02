@@ -1,14 +1,16 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::sync::mpsc as std_mpsc;
 
 use anyhow::Result;
 use lsp_types::{
     ClientCapabilities, CompletionClientCapabilities, CompletionItemCapability, CompletionItemKind,
-    CompletionItemKindCapability, CompletionResponse, DocumentChangeOperation, DocumentChanges,
-    GotoDefinitionResponse, HoverContents, MarkedString, MarkupKind, OneOf,
-    TextDocumentClientCapabilities, TextEdit, Url, WorkspaceEdit,
+    CompletionItemKindCapability, CompletionResponse, DeclarationCapability,
+    DocumentChangeOperation, DocumentChanges, GotoDefinitionResponse, HoverContents,
+    HoverProviderCapability, MarkedString, MarkupKind, OneOf, TextDocumentClientCapabilities,
+    TextEdit, Url, WorkspaceEdit,
 };
 use tokio::sync::{Mutex as TokioMutex, mpsc as tokio_mpsc};
 
@@ -54,6 +56,10 @@ pub struct DeclarationResult {
     pub request_id: u64,
     pub path: PathBuf,
     pub target: Option<(PathBuf, u32, u32)>,
+    /// True when no spawned server advertises a usable `declarationProvider`
+    /// (e.g. vtsls, which sends `declarationProvider: false`). Lets the app
+    /// say so plainly instead of silently doing nothing.
+    pub unsupported: bool,
 }
 
 #[derive(Debug)]
@@ -110,6 +116,13 @@ enum Cmd {
     },
 }
 
+/// Per-language declaration support, published by the worker once a server
+/// has spawned and read synchronously by the app at menu-build time. The app
+/// only shows "Go to Declaration" for languages whose server actually
+/// implements `textDocument/declaration` (so it is hidden for TypeScript,
+/// whose vtsls advertises `declarationProvider: false`), mirroring VS Code.
+type DeclarationSupport = Arc<StdMutex<HashMap<Language, bool>>>;
+
 pub struct LspManager {
     cmd_tx: tokio_mpsc::UnboundedSender<Cmd>,
     completion_rx: std_mpsc::Receiver<CompletionResult>,
@@ -117,6 +130,7 @@ pub struct LspManager {
     def_rx: std_mpsc::Receiver<DefinitionResult>,
     decl_rx: std_mpsc::Receiver<DeclarationResult>,
     rename_rx: std_mpsc::Receiver<RenameResult>,
+    declaration_support: DeclarationSupport,
     next_request_id: u64,
     workspace_root: PathBuf,
     _runtime: LspRuntime,
@@ -131,6 +145,7 @@ impl LspManager {
         let (def_tx, def_rx) = std_mpsc::channel();
         let (decl_tx, decl_rx) = std_mpsc::channel();
         let (rename_tx, rename_rx) = std_mpsc::channel();
+        let declaration_support: DeclarationSupport = Arc::new(StdMutex::new(HashMap::new()));
         let root = workspace_root.clone();
         runtime.handle().spawn(worker_loop(
             root,
@@ -143,6 +158,7 @@ impl LspManager {
                 declaration: decl_tx,
                 rename: rename_tx,
             },
+            declaration_support.clone(),
         ));
         Ok(Self {
             cmd_tx,
@@ -151,6 +167,7 @@ impl LspManager {
             def_rx,
             decl_rx,
             rename_rx,
+            declaration_support,
             next_request_id: 1,
             workspace_root,
             _runtime: runtime,
@@ -237,6 +254,13 @@ impl LspManager {
         self.decl_rx.try_recv().ok()
     }
 
+    /// Whether the server for `lang` implements `textDocument/declaration`.
+    /// `None` means no server has reported yet (not spawned). Read synchronously
+    /// by the app to decide whether to show the "Go to Declaration" menu item.
+    pub fn language_supports_declaration(&self, lang: Language) -> Option<bool> {
+        self.declaration_support.lock().ok()?.get(&lang).copied()
+    }
+
     pub fn request_rename(
         &mut self,
         path: PathBuf,
@@ -276,6 +300,7 @@ struct WorkerState {
     registry: ServerRegistry,
     clients: HashMap<Language, Vec<ManagedClient>>,
     docs: HashMap<PathBuf, DocState>,
+    declaration_support: DeclarationSupport,
 }
 
 struct DocState {
@@ -298,12 +323,14 @@ async fn worker_loop(
     registry: ServerRegistry,
     mut cmd_rx: tokio_mpsc::UnboundedReceiver<Cmd>,
     tx: ResultSenders,
+    declaration_support: DeclarationSupport,
 ) {
     let mut state = WorkerState {
         workspace_root,
         registry,
         clients: HashMap::new(),
         docs: HashMap::new(),
+        declaration_support,
     };
     while let Some(cmd) = cmd_rx.recv().await {
         match cmd {
@@ -393,13 +420,19 @@ impl WorkerState {
                 .await
                 {
                     Ok(client) => {
-                        let supports = client.capabilities().completion_provider.is_some();
-                        let supports_hover = client.capabilities().hover_provider.is_some();
-                        let supports_definition =
-                            client.capabilities().definition_provider.is_some();
+                        let caps = client.capabilities();
+                        // A capability that can be sent as a bare `false` (the
+                        // bool-or-options shapes) must be read as its inner bool:
+                        // `Option::is_some` treats `Some(false)` as supported,
+                        // which made croft call `textDocument/declaration` on
+                        // vtsls (which advertises `declarationProvider: false`)
+                        // and get a -32601 "Unhandled method" back.
+                        let supports = caps.completion_provider.is_some();
+                        let supports_hover = hover_supported(&caps.hover_provider);
+                        let supports_definition = one_of_supported(&caps.definition_provider);
                         let supports_declaration =
-                            client.capabilities().declaration_provider.is_some();
-                        let supports_rename = client.capabilities().rename_provider.is_some();
+                            declaration_supported(&caps.declaration_provider);
+                        let supports_rename = one_of_supported(&caps.rename_provider);
                         log_file::log(&format!(
                             "lsp[{}] spawned, supports_completion={supports} supports_hover={supports_hover} supports_definition={supports_definition} supports_declaration={supports_declaration} supports_rename={supports_rename}",
                             config.name
@@ -418,6 +451,14 @@ impl WorkerState {
                         log_file::log(&format!("lsp[{}] spawn failed: {e}", config.name));
                     }
                 }
+            }
+            // Publish declaration support for this language so the app can show
+            // or hide the "Go to Declaration" menu item synchronously. Written
+            // even when empty (value false) so a missing entry means "not probed
+            // yet" rather than "unsupported".
+            let supports_declaration = spawned.iter().any(|c| c.supports_declaration);
+            if let Ok(mut map) = self.declaration_support.lock() {
+                map.insert(lang, supports_declaration);
             }
             self.clients.insert(lang, spawned);
         }
@@ -704,7 +745,7 @@ impl WorkerState {
                 Ok(Some(r)) => def_location(&r),
                 Ok(None) => None,
                 Err(e) => {
-                    log_file::log(&format!("lsp[{server_name}] definition error: {e}"));
+                    log_file::log(&format!("lsp[{server_name}] definition error: {e:#}"));
                     None
                 }
             };
@@ -748,6 +789,7 @@ impl WorkerState {
                 request_id,
                 path,
                 target: None,
+                unsupported: true,
             });
             return;
         };
@@ -767,8 +809,10 @@ impl WorkerState {
             let target = match resp {
                 Ok(Some(r)) => def_location(&r),
                 Ok(None) => None,
+                // `{e:#}` prints the full anyhow chain (the underlying JSON-RPC
+                // error), not just the "declaration" context label.
                 Err(e) => {
-                    log_file::log(&format!("lsp[{server_name}] declaration error: {e}"));
+                    log_file::log(&format!("lsp[{server_name}] declaration error: {e:#}"));
                     None
                 }
             };
@@ -780,6 +824,7 @@ impl WorkerState {
                 request_id,
                 path: path_clone,
                 target,
+                unsupported: false,
             });
         });
     }
@@ -944,6 +989,40 @@ fn hover_text(contents: &HoverContents) -> Option<String> {
     };
     let text = text.trim().to_string();
     if text.is_empty() { None } else { Some(text) }
+}
+
+/// Whether a `boolean | <Options>`-shaped capability (definition, rename, ...)
+/// is actually supported. `None` is unsupported; a bare `false` is unsupported;
+/// `true` or an options object is supported. The bare-`false` case is the one
+/// `Option::is_some` got wrong.
+fn one_of_supported<B>(cap: &Option<OneOf<bool, B>>) -> bool {
+    match cap {
+        Some(OneOf::Left(b)) => *b,
+        Some(OneOf::Right(_)) => true,
+        None => false,
+    }
+}
+
+/// Hover capability (`boolean | HoverOptions`), same bare-`false` rule.
+fn hover_supported(cap: &Option<HoverProviderCapability>) -> bool {
+    match cap {
+        Some(HoverProviderCapability::Simple(b)) => *b,
+        Some(HoverProviderCapability::Options(_)) => true,
+        None => false,
+    }
+}
+
+/// Declaration capability (`boolean | DeclarationOptions | DeclarationRegistrationOptions`).
+/// vtsls sends `declarationProvider: false`, so the bare-`false` arm is what
+/// stops croft from calling the unhandled `textDocument/declaration`.
+fn declaration_supported(cap: &Option<DeclarationCapability>) -> bool {
+    match cap {
+        Some(DeclarationCapability::Simple(b)) => *b,
+        Some(DeclarationCapability::RegistrationOptions(_) | DeclarationCapability::Options(_)) => {
+            true
+        }
+        None => false,
+    }
 }
 
 fn def_location(resp: &GotoDefinitionResponse) -> Option<(PathBuf, u32, u32)> {
@@ -1151,6 +1230,42 @@ mod tests {
         assert_eq!(out[0].1.len(), 1);
         assert_eq!(out[0].1[0].new_text, "renamed");
         assert_eq!(out[0].1[0].start, (2, 4));
+    }
+
+    #[test]
+    fn declaration_capability_false_reads_as_unsupported() {
+        // The bug: vtsls sends `declarationProvider: false`, which lsp-types
+        // parses to `Some(DeclarationCapability::Simple(false))`. `Option::is_some`
+        // read that as supported and croft called the unhandled method.
+        assert!(!declaration_supported(&Some(
+            DeclarationCapability::Simple(false)
+        )));
+        assert!(declaration_supported(&Some(DeclarationCapability::Simple(
+            true
+        ))));
+        assert!(!declaration_supported(&None));
+    }
+
+    #[test]
+    fn one_of_capability_false_reads_as_unsupported() {
+        let off: Option<OneOf<bool, ()>> = Some(OneOf::Left(false));
+        let on: Option<OneOf<bool, ()>> = Some(OneOf::Left(true));
+        let opts: Option<OneOf<bool, ()>> = Some(OneOf::Right(()));
+        assert!(!one_of_supported(&off));
+        assert!(one_of_supported(&on));
+        assert!(one_of_supported(&opts));
+        assert!(!one_of_supported(&None::<OneOf<bool, ()>>));
+    }
+
+    #[test]
+    fn hover_capability_false_reads_as_unsupported() {
+        assert!(!hover_supported(&Some(HoverProviderCapability::Simple(
+            false
+        ))));
+        assert!(hover_supported(&Some(HoverProviderCapability::Simple(
+            true
+        ))));
+        assert!(!hover_supported(&None));
     }
 
     #[test]

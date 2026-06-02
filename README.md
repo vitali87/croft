@@ -169,7 +169,7 @@ croft setup-terminal --help
 | `F2` | Rename Symbol: LSP rename of the identifier under the cursor across every file it touches (open tabs edit in-memory and stay dirty; closed files are rewritten on disk) |
 | `Cmd`+`F2` / `Ctrl`+`F2` | Change All Occurrences: drop a cursor on every textual match of the word in the current file and edit them all at once; type to replace, `Esc` to finish |
 | `F12` / `Cmd`/`Option`+click | Go to Definition (jumps via the language server); `Cmd`+`Shift`+click navigates back |
-| `Shift`+`F12` | Go to Declaration: jumps to where the symbol is declared (the header prototype in C/C++, the `.d.ts` signature in TypeScript); coincides with Definition in languages that have no separate declaration site |
+| `Shift`+`F12` | Go to Declaration: jumps to where the symbol is declared, via the language server's `textDocument/declaration`. Shown in the right-click menu only for languages whose server implements it; hidden for TypeScript (vtsls advertises `declarationProvider: false`), exactly as VS Code does |
 | Hover (300 ms dwell) | Show the LSP hover popup for the symbol under the pointer |
 | Right-click | Editor symbol menu: Go to Definition, Go to Declaration, Rename Symbol, Change All Occurrences |
 | `Cmd`+`E` | Toggle native modal (vim) editing for the editor pane (see below) |
