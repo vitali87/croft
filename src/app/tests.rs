@@ -9475,16 +9475,14 @@ fn go_to_definition_key_is_f12_without_shift() {
         KeyCode::F(12),
         KeyModifiers::NONE
     )));
-    // Cmd/Alt+F12 (incl. iTerm2's Cmd-folded-to-Meta) still mean Definition.
-    assert!(is_go_to_definition_key(key(
-        KeyCode::F(12),
-        KeyModifiers::SUPER
-    )));
+    // Alt+F12 still means Definition (iTerm2 can fold a held Cmd onto the
+    // Meta/Alt bit, and Option+F12 is otherwise unused).
     assert!(is_go_to_definition_key(key(
         KeyCode::F(12),
         KeyModifiers::ALT
     )));
-    // Shift+F12 is Declaration, Ctrl+F12 is Type Definition; neither is Definition.
+    // Shift+F12 is Declaration, Ctrl+F12 is Type Definition, Cmd+F12 (SUPER) is
+    // Implementations; none of the three is Definition.
     assert!(!is_go_to_definition_key(key(
         KeyCode::F(12),
         KeyModifiers::SHIFT
@@ -9492,6 +9490,10 @@ fn go_to_definition_key_is_f12_without_shift() {
     assert!(!is_go_to_definition_key(key(
         KeyCode::F(12),
         KeyModifiers::CONTROL
+    )));
+    assert!(!is_go_to_definition_key(key(
+        KeyCode::F(12),
+        KeyModifiers::SUPER
     )));
     assert!(!is_go_to_definition_key(key(
         KeyCode::F(11),
@@ -9544,6 +9546,74 @@ fn go_to_type_definition_key_is_ctrl_f12() {
 }
 
 #[test]
+fn go_to_implementation_key_is_cmd_f12() {
+    assert!(is_go_to_implementation_key(key(
+        KeyCode::F(12),
+        KeyModifiers::SUPER
+    )));
+    // Plain F12 (Definition), Shift+F12 (Declaration) and Ctrl+F12 (Type
+    // Definition) are not Implementations.
+    assert!(!is_go_to_implementation_key(key(
+        KeyCode::F(12),
+        KeyModifiers::NONE
+    )));
+    assert!(!is_go_to_implementation_key(key(
+        KeyCode::F(12),
+        KeyModifiers::SHIFT
+    )));
+    assert!(!is_go_to_implementation_key(key(
+        KeyCode::F(12),
+        KeyModifiers::CONTROL
+    )));
+    assert!(!is_go_to_implementation_key(key(
+        KeyCode::F(11),
+        KeyModifiers::SUPER
+    )));
+}
+
+#[test]
+fn implementation_picker_lists_every_target_as_a_jump_item() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let a = tmp.path().join("foo.rs");
+    let b = tmp.path().join("sub").join("bar.rs");
+    app.open_implementation_picker(vec![(a.clone(), 4, 2), (b.clone(), 0, 0)]);
+
+    let menu = app
+        .context_menu
+        .as_ref()
+        .expect("multiple implementations must open a picker, not silently pick the first");
+    assert_eq!(
+        menu.items.len(),
+        2,
+        "every implementor must get its own selectable row"
+    );
+    // Labels are workspace-relative path + 1-based line; actions jump straight
+    // to the resolved location.
+    assert_eq!(menu.items[0].0, "foo.rs:5");
+    assert_eq!(
+        menu.items[0].1,
+        MenuAction::GoToLocation {
+            path: a,
+            line: 4,
+            col: 2
+        }
+    );
+    assert_eq!(
+        menu.items[1].0,
+        format!("sub{}bar.rs:1", std::path::MAIN_SEPARATOR)
+    );
+    assert_eq!(
+        menu.items[1].1,
+        MenuAction::GoToLocation {
+            path: b,
+            line: 0,
+            col: 0
+        }
+    );
+}
+
+#[test]
 fn shortcut_for_returns_expected_shortcuts_for_editor_symbol_actions() {
     // Every editor symbol-menu row must advertise a working accelerator.
     assert_eq!(
@@ -9557,6 +9627,10 @@ fn shortcut_for_returns_expected_shortcuts_for_editor_symbol_actions() {
     assert_eq!(
         shortcut_for(&MenuAction::GoToTypeDefinitionAt { row: 0, col: 0 }),
         Some("⌃F12")
+    );
+    assert_eq!(
+        shortcut_for(&MenuAction::GoToImplementationAt { row: 0, col: 0 }),
+        Some("⌘F12")
     );
     assert_eq!(
         shortcut_for(&MenuAction::RenameSymbolAt { row: 0, col: 0 }),

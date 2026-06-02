@@ -337,6 +337,31 @@ impl LspClient {
             .context("type_definition")
     }
 
+    pub async fn implementation(
+        &mut self,
+        uri: Url,
+        line: u32,
+        character: u32,
+    ) -> Result<Option<GotoDefinitionResponse>> {
+        // `GotoImplementationParams`/`GotoImplementationResponse` are type aliases
+        // for the definition variants in lsp-types, so the same params and the
+        // same `def_location` parser are reused; only the wire method differs
+        // (`textDocument/implementation`). Note this commonly returns an Array of
+        // locations (one abstraction, many implementors); `def_location` jumps to
+        // the first.
+        self.server
+            .implementation(GotoDefinitionParams {
+                text_document_position_params: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri },
+                    position: Position { line, character },
+                },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+            })
+            .await
+            .context("implementation")
+    }
+
     pub async fn rename(
         &mut self,
         uri: Url,

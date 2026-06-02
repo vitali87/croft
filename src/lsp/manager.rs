@@ -9,8 +9,9 @@ use lsp_types::{
     ClientCapabilities, CompletionClientCapabilities, CompletionItemCapability, CompletionItemKind,
     CompletionItemKindCapability, CompletionResponse, DeclarationCapability,
     DocumentChangeOperation, DocumentChanges, GotoDefinitionResponse, HoverContents,
-    HoverProviderCapability, MarkedString, MarkupKind, OneOf, TextDocumentClientCapabilities,
-    TextEdit, TypeDefinitionProviderCapability, Url, WorkspaceEdit,
+    HoverProviderCapability, ImplementationProviderCapability, MarkedString, MarkupKind, OneOf,
+    Position, TextDocumentClientCapabilities, TextEdit, TypeDefinitionProviderCapability, Url,
+    WorkspaceEdit,
 };
 use tokio::sync::{Mutex as TokioMutex, mpsc as tokio_mpsc};
 
@@ -74,6 +75,19 @@ pub struct TypeDefinitionResult {
 }
 
 #[derive(Debug)]
+pub struct ImplementationResult {
+    pub request_id: u64,
+    pub path: PathBuf,
+    /// Every implementation location the server returned. `textDocument/
+    /// implementation` is the 1:many goto (one abstraction, several
+    /// implementors), so all of them are carried through; the app jumps
+    /// directly when there is one and shows a picker when there are several.
+    pub targets: Vec<(PathBuf, u32, u32)>,
+    /// True when no spawned server advertises a usable `implementationProvider`.
+    pub unsupported: bool,
+}
+
+#[derive(Debug)]
 pub struct RenameResult {
     pub request_id: u64,
     pub path: PathBuf,
@@ -124,6 +138,12 @@ enum Cmd {
         line: u32,
         character: u32,
     },
+    RequestImplementation {
+        request_id: u64,
+        path: PathBuf,
+        line: u32,
+        character: u32,
+    },
     RequestRename {
         request_id: u64,
         path: PathBuf,
@@ -143,6 +163,7 @@ enum Cmd {
 struct LangCapabilitySupport {
     declaration: HashMap<Language, bool>,
     type_definition: HashMap<Language, bool>,
+    implementation: HashMap<Language, bool>,
 }
 type CapabilitySupport = Arc<StdMutex<LangCapabilitySupport>>;
 
@@ -153,6 +174,7 @@ pub struct LspManager {
     def_rx: std_mpsc::Receiver<DefinitionResult>,
     decl_rx: std_mpsc::Receiver<DeclarationResult>,
     type_def_rx: std_mpsc::Receiver<TypeDefinitionResult>,
+    impl_rx: std_mpsc::Receiver<ImplementationResult>,
     rename_rx: std_mpsc::Receiver<RenameResult>,
     capability_support: CapabilitySupport,
     next_request_id: u64,
@@ -169,6 +191,7 @@ impl LspManager {
         let (def_tx, def_rx) = std_mpsc::channel();
         let (decl_tx, decl_rx) = std_mpsc::channel();
         let (type_def_tx, type_def_rx) = std_mpsc::channel();
+        let (impl_tx, impl_rx) = std_mpsc::channel();
         let (rename_tx, rename_rx) = std_mpsc::channel();
         let capability_support: CapabilitySupport =
             Arc::new(StdMutex::new(LangCapabilitySupport::default()));
@@ -183,6 +206,7 @@ impl LspManager {
                 definition: def_tx,
                 declaration: decl_tx,
                 type_definition: type_def_tx,
+                implementation: impl_tx,
                 rename: rename_tx,
             },
             capability_support.clone(),
@@ -194,6 +218,7 @@ impl LspManager {
             def_rx,
             decl_rx,
             type_def_rx,
+            impl_rx,
             rename_rx,
             capability_support,
             next_request_id: 1,
@@ -298,6 +323,22 @@ impl LspManager {
         self.type_def_rx.try_recv().ok()
     }
 
+    pub fn request_implementation(&mut self, path: PathBuf, line: u32, character: u32) -> u64 {
+        let id = self.next_request_id;
+        self.next_request_id += 1;
+        let _ = self.cmd_tx.send(Cmd::RequestImplementation {
+            request_id: id,
+            path,
+            line,
+            character,
+        });
+        id
+    }
+
+    pub fn drain_implementation(&self) -> Option<ImplementationResult> {
+        self.impl_rx.try_recv().ok()
+    }
+
     /// Whether the server for `lang` implements `textDocument/declaration`.
     /// `None` means no server has reported yet (not spawned). Read synchronously
     /// by the app to decide whether to show the "Go to Declaration" menu item.
@@ -318,6 +359,18 @@ impl LspManager {
             .lock()
             .ok()?
             .type_definition
+            .get(&lang)
+            .copied()
+    }
+
+    /// Whether the server for `lang` implements `textDocument/implementation`.
+    /// `None` means no server has reported yet. Read synchronously by the app to
+    /// decide whether to show the "Go to Implementations" menu item.
+    pub fn language_supports_implementation(&self, lang: Language) -> Option<bool> {
+        self.capability_support
+            .lock()
+            .ok()?
+            .implementation
             .get(&lang)
             .copied()
     }
@@ -354,6 +407,7 @@ struct ManagedClient {
     supports_definition: bool,
     supports_declaration: bool,
     supports_type_definition: bool,
+    supports_implementation: bool,
     supports_rename: bool,
 }
 
@@ -387,6 +441,7 @@ struct ResultSenders {
     definition: std_mpsc::Sender<DefinitionResult>,
     declaration: std_mpsc::Sender<DeclarationResult>,
     type_definition: std_mpsc::Sender<TypeDefinitionResult>,
+    implementation: std_mpsc::Sender<ImplementationResult>,
     rename: std_mpsc::Sender<RenameResult>,
 }
 
@@ -459,6 +514,16 @@ async fn worker_loop(
                     .request_type_definition(request_id, path, line, character, &tx.type_definition)
                     .await
             }
+            Cmd::RequestImplementation {
+                request_id,
+                path,
+                line,
+                character,
+            } => {
+                state
+                    .request_implementation(request_id, path, line, character, &tx.implementation)
+                    .await
+            }
             Cmd::RequestRename {
                 request_id,
                 path,
@@ -512,9 +577,11 @@ impl WorkerState {
                             declaration_supported(&caps.declaration_provider);
                         let supports_type_definition =
                             type_definition_supported(&caps.type_definition_provider);
+                        let supports_implementation =
+                            implementation_supported(&caps.implementation_provider);
                         let supports_rename = one_of_supported(&caps.rename_provider);
                         log_file::log(&format!(
-                            "lsp[{}] spawned, root={} supports_completion={supports} supports_hover={supports_hover} supports_definition={supports_definition} supports_declaration={supports_declaration} supports_type_definition={supports_type_definition} supports_rename={supports_rename}",
+                            "lsp[{}] spawned, root={} supports_completion={supports} supports_hover={supports_hover} supports_definition={supports_definition} supports_declaration={supports_declaration} supports_type_definition={supports_type_definition} supports_implementation={supports_implementation} supports_rename={supports_rename}",
                             config.name,
                             root.display()
                         ));
@@ -526,6 +593,7 @@ impl WorkerState {
                             supports_definition,
                             supports_declaration,
                             supports_type_definition,
+                            supports_implementation,
                             supports_rename,
                         });
                     }
@@ -534,18 +602,19 @@ impl WorkerState {
                     }
                 }
             }
-            // Publish declaration / type-definition support for this language so
-            // the app can show or hide the "Go to Declaration" / "Go to Type
-            // Definition" menu items synchronously. Written even when empty
-            // (value false) so a missing entry means "not probed yet" rather
-            // than "unsupported".
+            // Publish declaration / type-definition / implementation support for
+            // this language so the app can show or hide the matching "Go to ..."
+            // menu items synchronously. Written even when empty (value false) so
+            // a missing entry means "not probed yet" rather than "unsupported".
             let supports_declaration = spawned.iter().any(|c| c.supports_declaration);
             let supports_type_definition = spawned.iter().any(|c| c.supports_type_definition);
+            let supports_implementation = spawned.iter().any(|c| c.supports_implementation);
             if let Ok(mut support) = self.capability_support.lock() {
                 support.declaration.insert(lang, supports_declaration);
                 support
                     .type_definition
                     .insert(lang, supports_type_definition);
+                support.implementation.insert(lang, supports_implementation);
             }
             self.clients.insert(key.clone(), spawned);
         }
@@ -991,6 +1060,75 @@ impl WorkerState {
         });
     }
 
+    async fn request_implementation(
+        &mut self,
+        request_id: u64,
+        path: PathBuf,
+        line: u32,
+        character: u32,
+        tx: &std_mpsc::Sender<ImplementationResult>,
+    ) {
+        let Some(doc) = self.docs.get(&path) else {
+            return;
+        };
+        let lang = doc.language;
+        let root = doc.project_root.clone();
+        // Re-probe so a server installed since the file was opened (e.g. the
+        // managed vtsls finishing its lazy background install) is picked up
+        // without reopening the file. Cheap once the list is non-empty.
+        self.ensure_clients(lang, &root).await;
+        let Some(clients) = self.clients.get(&(lang, root)) else {
+            return;
+        };
+        let picked = clients
+            .iter()
+            .find(|c| c.supports_implementation)
+            .map(|c| (c.name.clone(), c.client.clone()));
+        let Some((server_name, client_arc)) = picked else {
+            let _ = tx.send(ImplementationResult {
+                request_id,
+                path,
+                targets: Vec::new(),
+                unsupported: true,
+            });
+            return;
+        };
+        let Ok(uri) = Url::from_file_path(&path) else {
+            return;
+        };
+        let tx = tx.clone();
+        let path_clone = path.clone();
+        log_file::log(&format!(
+            "implementation request id={request_id} server={server_name} path={} line={line} char={character}",
+            path.display()
+        ));
+        tokio::spawn(async move {
+            let mut client = client_arc.lock().await;
+            let resp = client.implementation(uri, line, character).await;
+            drop(client);
+            let targets = match resp {
+                Ok(Some(r)) => def_locations(&r),
+                Ok(None) => Vec::new(),
+                // `{e:#}` prints the full anyhow chain (the underlying JSON-RPC
+                // error), not just the "implementation" context label.
+                Err(e) => {
+                    log_file::log(&format!("lsp[{server_name}] implementation error: {e:#}"));
+                    Vec::new()
+                }
+            };
+            log_file::log(&format!(
+                "implementation response id={request_id} server={server_name} count={}",
+                targets.len()
+            ));
+            let _ = tx.send(ImplementationResult {
+                request_id,
+                path: path_clone,
+                targets,
+                unsupported: false,
+            });
+        });
+    }
+
     async fn request_rename(
         &mut self,
         request_id: u64,
@@ -1200,6 +1338,18 @@ fn type_definition_supported(cap: &Option<TypeDefinitionProviderCapability>) -> 
     }
 }
 
+/// Implementation capability (`boolean | ImplementationOptions | ...`), same
+/// bare-`false` rule as hover/declaration/type-definition. rust-analyzer, gopls
+/// and vtsls advertise it; a server that omits it (or sends `false`) gets the
+/// "Go to Implementations" row hidden instead of a -32601.
+fn implementation_supported(cap: &Option<ImplementationProviderCapability>) -> bool {
+    match cap {
+        Some(ImplementationProviderCapability::Simple(b)) => *b,
+        Some(ImplementationProviderCapability::Options(_)) => true,
+        None => false,
+    }
+}
+
 fn def_location(resp: &GotoDefinitionResponse) -> Option<(PathBuf, u32, u32)> {
     let (uri, pos) = match resp {
         GotoDefinitionResponse::Scalar(loc) => (&loc.uri, loc.range.start),
@@ -1214,6 +1364,26 @@ fn def_location(resp: &GotoDefinitionResponse) -> Option<(PathBuf, u32, u32)> {
     };
     let path = uri.to_file_path().ok()?;
     Some((path, pos.line, pos.character))
+}
+
+/// Every location in a goto response, not just the first. Used by Go to
+/// Implementations, whose response is commonly an `Array` of every implementor
+/// (a Scalar collapses to one element). Locations whose URI is not a local file
+/// path are dropped.
+fn def_locations(resp: &GotoDefinitionResponse) -> Vec<(PathBuf, u32, u32)> {
+    let raw: Vec<(&Url, Position)> = match resp {
+        GotoDefinitionResponse::Scalar(loc) => vec![(&loc.uri, loc.range.start)],
+        GotoDefinitionResponse::Array(locs) => {
+            locs.iter().map(|l| (&l.uri, l.range.start)).collect()
+        }
+        GotoDefinitionResponse::Link(links) => links
+            .iter()
+            .map(|l| (&l.target_uri, l.target_selection_range.start))
+            .collect(),
+    };
+    raw.into_iter()
+        .filter_map(|(uri, pos)| Some((uri.to_file_path().ok()?, pos.line, pos.character)))
+        .collect()
 }
 
 fn build_client_capabilities() -> ClientCapabilities {
@@ -1540,6 +1710,17 @@ mod tests {
     }
 
     #[test]
+    fn implementation_capability_false_reads_as_unsupported() {
+        assert!(!implementation_supported(&Some(
+            ImplementationProviderCapability::Simple(false)
+        )));
+        assert!(implementation_supported(&Some(
+            ImplementationProviderCapability::Simple(true)
+        )));
+        assert!(!implementation_supported(&None));
+    }
+
+    #[test]
     fn def_location_reads_scalar() {
         let uri = Url::from_file_path("/tmp/foo.rs").unwrap();
         let resp = GotoDefinitionResponse::Scalar(Location {
@@ -1588,6 +1769,67 @@ mod tests {
     fn def_location_is_none_for_empty_array() {
         let resp = GotoDefinitionResponse::Array(vec![]);
         assert_eq!(def_location(&resp), None);
+    }
+
+    #[test]
+    fn def_locations_reads_every_entry_of_array() {
+        // Go to Implementations is 1:many: a trait with two implementors comes
+        // back as an Array of both, and `def_locations` must keep both (whereas
+        // `def_location` keeps only the first).
+        let resp = GotoDefinitionResponse::Array(vec![
+            Location {
+                uri: Url::from_file_path("/tmp/a.rs").unwrap(),
+                range: def_range(1, 0),
+            },
+            Location {
+                uri: Url::from_file_path("/tmp/b.rs").unwrap(),
+                range: def_range(9, 9),
+            },
+        ]);
+        assert_eq!(
+            def_locations(&resp),
+            vec![
+                (PathBuf::from("/tmp/a.rs"), 1, 0),
+                (PathBuf::from("/tmp/b.rs"), 9, 9),
+            ]
+        );
+    }
+
+    #[test]
+    fn def_locations_collapses_scalar_to_one_entry() {
+        let resp = GotoDefinitionResponse::Scalar(Location {
+            uri: Url::from_file_path("/tmp/foo.rs").unwrap(),
+            range: def_range(3, 5),
+        });
+        assert_eq!(
+            def_locations(&resp),
+            vec![(PathBuf::from("/tmp/foo.rs"), 3, 5)]
+        );
+    }
+
+    #[test]
+    fn def_locations_reads_all_links() {
+        let resp = GotoDefinitionResponse::Link(vec![
+            LocationLink {
+                origin_selection_range: None,
+                target_uri: Url::from_file_path("/tmp/c.rs").unwrap(),
+                target_range: def_range(10, 0),
+                target_selection_range: def_range(12, 4),
+            },
+            LocationLink {
+                origin_selection_range: None,
+                target_uri: Url::from_file_path("/tmp/d.rs").unwrap(),
+                target_range: def_range(20, 0),
+                target_selection_range: def_range(22, 2),
+            },
+        ]);
+        assert_eq!(
+            def_locations(&resp),
+            vec![
+                (PathBuf::from("/tmp/c.rs"), 12, 4),
+                (PathBuf::from("/tmp/d.rs"), 22, 2),
+            ]
+        );
     }
 
     #[test]

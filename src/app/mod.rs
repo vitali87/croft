@@ -351,6 +351,23 @@ enum MenuAction {
         row: usize,
         col: usize,
     },
+    /// Editor body: LSP "Go to Implementations" of the abstraction at buffer
+    /// `(row, col)`. Walks down from a trait / interface / abstract method to
+    /// the concrete implementors; the server often returns many, in which case
+    /// the results are offered as a picker built from `GoToLocation` items.
+    GoToImplementationAt {
+        row: usize,
+        col: usize,
+    },
+    /// Jump straight to an already-resolved location (LSP line/character). Used
+    /// for the entries of the multi-result "Go to Implementations" picker, where
+    /// each row is one concrete implementation; selecting it records nav history
+    /// and opens the file at that position.
+    GoToLocation {
+        path: PathBuf,
+        line: u32,
+        col: u32,
+    },
 }
 
 /// Return the macOS-style keyboard shortcut hint to display on the right
@@ -376,6 +393,7 @@ fn shortcut_for(action: &MenuAction) -> Option<&'static str> {
         MenuAction::GoToDefinitionAt { .. } => Some("F12"),
         MenuAction::GoToDeclarationAt { .. } => Some("⇧F12"),
         MenuAction::GoToTypeDefinitionAt { .. } => Some("⌃F12"),
+        MenuAction::GoToImplementationAt { .. } => Some("⌘F12"),
         _ => None,
     }
 }
@@ -835,6 +853,7 @@ pub struct App {
     definition_request_id: Option<u64>,
     declaration_request_id: Option<u64>,
     type_definition_request_id: Option<u64>,
+    implementation_request_id: Option<u64>,
     rename_request_id: Option<u64>,
     nav: NavHistory,
     editor_vim_chord: EditorVimChord,
@@ -1400,6 +1419,7 @@ impl App {
             definition_request_id: None,
             declaration_request_id: None,
             type_definition_request_id: None,
+            implementation_request_id: None,
             nav: NavHistory::default(),
         })
     }
@@ -2450,6 +2470,76 @@ impl App {
         }
     }
 
+    pub fn drain_lsp_implementation(&mut self) -> bool {
+        let mut targets: Vec<(PathBuf, u32, u32)> = Vec::new();
+        let mut unsupported = false;
+        let mut responded = false;
+        {
+            let Some(lsp) = self.lsp.as_ref() else {
+                return false;
+            };
+            while let Some(result) = lsp.drain_implementation() {
+                if Some(result.request_id) != self.implementation_request_id {
+                    continue;
+                }
+                targets = result.targets;
+                unsupported = result.unsupported;
+                responded = true;
+            }
+        }
+        if !responded {
+            return false;
+        }
+        if unsupported {
+            self.status =
+                String::from("Go to Implementations: not supported by this file's language server");
+            return true;
+        }
+        match targets.len() {
+            0 => self.status = String::from("No implementations found"),
+            // One implementor: behave exactly like Go to Definition.
+            1 => {
+                let (path, line, col) = targets.into_iter().next().expect("len == 1");
+                self.go_to_definition(path, line, col);
+            }
+            // Many implementors: offer a picker rather than silently choosing
+            // the first. This 1:many case is the whole point of the feature.
+            _ => self.open_implementation_picker(targets),
+        }
+        true
+    }
+
+    /// Build the multi-implementation picker as a `ContextMenu` anchored at the
+    /// editor cursor: one row per implementor, labelled `relative/path:line`,
+    /// each carrying a `GoToLocation` that jumps on select. Reuses the context
+    /// menu's existing keyboard (arrows + Enter) and mouse handling.
+    fn open_implementation_picker(&mut self, targets: Vec<(PathBuf, u32, u32)>) {
+        let root = self.tree.root.clone();
+        let items: Vec<(String, MenuAction)> = targets
+            .into_iter()
+            .map(|(path, line, col)| {
+                let label = format!(
+                    "{}:{}",
+                    path.strip_prefix(&root).unwrap_or(&path).display(),
+                    line + 1
+                );
+                (label, MenuAction::GoToLocation { path, line, col })
+            })
+            .collect();
+        self.status = format!("{} implementations", items.len());
+        let origin = self.editor.cursor_screen_pos().unwrap_or((
+            self.editor.last_full_area.x + 1,
+            self.editor.last_full_area.y + 1,
+        ));
+        self.focus_pane(Pane::Editor);
+        self.context_menu = Some(ContextMenu {
+            origin,
+            items,
+            selected: 0,
+            target_dir: root,
+        });
+    }
+
     fn open_at(&mut self, path: &Path, row: usize, col: usize) -> Result<()> {
         self.hover_popup = None;
         self.editor.open_preview(path)?;
@@ -2555,6 +2645,23 @@ impl App {
         self.type_definition_request_id = Some(id);
     }
 
+    /// Request the LSP implementations of the abstraction at the current cursor
+    /// (buffer) position. Used by the editor right-click "Go to Implementations"
+    /// item and the `⌘F12` keybinding. Meaningful on traits / interfaces /
+    /// abstract methods; the server may return many, and croft jumps to the first.
+    fn request_implementation_at_cursor(&mut self) {
+        let row = self.editor.cursor_row;
+        let col = self.editor.cursor_col;
+        let Some(path) = self.editor.path.clone() else {
+            return;
+        };
+        let Some(lsp) = self.lsp.as_mut() else {
+            return;
+        };
+        let id = lsp.request_implementation(path, row as u32, col as u32);
+        self.implementation_request_id = Some(id);
+    }
+
     /// Whether the current editor file's language server implements
     /// `textDocument/declaration`. Drives whether the right-click menu shows the
     /// "Go to Declaration" row. Unknown (server not yet spawned) or no server is
@@ -2595,6 +2702,28 @@ impl App {
         self.lsp
             .as_ref()
             .and_then(|lsp| lsp.language_supports_type_definition(lang))
+            .unwrap_or(false)
+    }
+
+    /// Whether the current editor file's language server implements
+    /// `textDocument/implementation`. Drives whether the right-click menu shows
+    /// the "Go to Implementations" row. Unknown (server not yet spawned) or no
+    /// server is treated as unsupported, so the row only appears once support is
+    /// confirmed.
+    fn editor_language_supports_implementation(&self) -> bool {
+        let Some(lang) = self
+            .editor
+            .path
+            .as_deref()
+            .and_then(|p| p.extension())
+            .and_then(|e| e.to_str())
+            .and_then(crate::lsp::Language::from_extension)
+        else {
+            return false;
+        };
+        self.lsp
+            .as_ref()
+            .and_then(|lsp| lsp.language_supports_implementation(lang))
             .unwrap_or(false)
     }
 
@@ -5882,6 +6011,15 @@ impl App {
             }
             return;
         }
+        if is_go_to_implementation_key(key) {
+            if self.editor.diff.is_none()
+                && self.editor.sheet.is_none()
+                && self.editor.image.is_none()
+            {
+                self.request_implementation_at_cursor();
+            }
+            return;
+        }
         // While multi-cursor mode is live, printable typing / backspace /
         // delete fan out to every caret and Esc collapses back to one cursor.
         // Any other key collapses the carets and falls through to normal
@@ -8536,6 +8674,16 @@ impl App {
                             MenuAction::GoToTypeDefinitionAt { row, col },
                         ));
                     }
+                    // "Go to Implementations" is offered only when the server
+                    // implements `textDocument/implementation` (rust-analyzer,
+                    // gopls, vtsls do), placed right after Type Definition to
+                    // mirror VS Code's Go To submenu order.
+                    if self.editor_language_supports_implementation() {
+                        items.push((
+                            String::from("Go to Implementations"),
+                            MenuAction::GoToImplementationAt { row, col },
+                        ));
+                    }
                     items.push((
                         String::from("Rename Symbol"),
                         MenuAction::RenameSymbolAt { row, col },
@@ -9673,6 +9821,15 @@ impl App {
                 self.editor.cursor_col = col;
                 self.focus_pane(Pane::Editor);
                 self.request_type_definition_at_cursor();
+            }
+            MenuAction::GoToImplementationAt { row, col } => {
+                self.editor.cursor_row = row;
+                self.editor.cursor_col = col;
+                self.focus_pane(Pane::Editor);
+                self.request_implementation_at_cursor();
+            }
+            MenuAction::GoToLocation { path, line, col } => {
+                self.go_to_definition(path, line, col);
             }
         }
     }
@@ -11065,13 +11222,17 @@ fn is_change_all_occurrences_key(key: KeyEvent) -> bool {
 }
 
 /// Editor-pane Go to Definition: plain `F12` (VS Code's binding). The F12
-/// navigation family splits on the modifier: bare F12 is Definition,
-/// `Shift+F12` is Declaration, `Ctrl+F12` is Type Definition, so Definition
-/// requires F12 with neither Shift nor Ctrl held.
+/// navigation family splits on the modifier, matching VS Code: bare F12 is
+/// Definition, `Shift+F12` is Declaration, `Ctrl+F12` is Type Definition, and
+/// `Cmd+F12` (SUPER) is Implementations. Definition therefore requires F12 with
+/// none of Shift / Ctrl / Super held. (Alt is still accepted: iTerm2 can fold a
+/// held Cmd onto the Meta/Alt bit for some events, and Option+F12 is otherwise
+/// unused, so leaving Alt on Definition is harmless.)
 fn is_go_to_definition_key(key: KeyEvent) -> bool {
     matches!(key.code, KeyCode::F(12))
         && !key.modifiers.contains(KeyModifiers::SHIFT)
         && !key.modifiers.contains(KeyModifiers::CONTROL)
+        && !key.modifiers.contains(KeyModifiers::SUPER)
 }
 
 /// Editor-pane Go to Declaration: `Shift+F12`. VS Code leaves Declaration
@@ -11093,6 +11254,19 @@ fn is_go_to_type_definition_key(key: KeyEvent) -> bool {
     matches!(key.code, KeyCode::F(12))
         && key.modifiers.contains(KeyModifiers::CONTROL)
         && !key.modifiers.contains(KeyModifiers::SHIFT)
+}
+
+/// Editor-pane Go to Implementations: `Cmd+F12` (SUPER), VS Code's real macOS
+/// binding for this action. Unlike its F12-family siblings, Cmd+F12 is captured
+/// by macOS, so `iterm2.rs` installs a GlobalKeyMap forwarder emitting
+/// `CSI 24 ; 9 ~`; crossterm decodes that to `F(12) + SUPER`. This must not
+/// collide with the three siblings: bare F12 is Definition, `Shift+F12` is
+/// Declaration, `Ctrl+F12` is Type Definition.
+fn is_go_to_implementation_key(key: KeyEvent) -> bool {
+    matches!(key.code, KeyCode::F(12))
+        && key.modifiers.contains(KeyModifiers::SUPER)
+        && !key.modifiers.contains(KeyModifiers::SHIFT)
+        && !key.modifiers.contains(KeyModifiers::CONTROL)
 }
 
 fn chord_status_text(op: char, count: usize) -> String {
@@ -12338,6 +12512,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let definition_changed = app.drain_lsp_definition();
         let declaration_changed = app.drain_lsp_declaration();
         let type_definition_changed = app.drain_lsp_type_definition();
+        let implementation_changed = app.drain_lsp_implementation();
         let rename_changed = app.drain_lsp_rename();
         let sysmon_changed = app.drain_sysmon();
         // Surface the managed TypeScript-server install progress in the status
@@ -12374,6 +12549,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             || definition_changed
             || declaration_changed
             || type_definition_changed
+            || implementation_changed
             || rename_changed
             || install_status_changed
             || sysmon_changed;

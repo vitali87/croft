@@ -187,6 +187,21 @@ const CMD_ARROW_CLEANUP_KEYS: &[&str] = &[
 /// that adds a default cannot silently swallow the chord.
 const CTRL_SHIFT_J_KEY: &str = "0x4a-0x60000-0x26";
 const CTRL_SHIFT_J_HEX: &str = "0x1b 0x5b 0x37 0x34 0x3b 0x36 0x75";
+/// `Cmd+F12` -> editor "Go to Implementations" (VS Code's real macOS binding).
+/// Function keys use the 2-part `0x<unicode>-0x<modmask>` iTermKeystroke form
+/// (like the arrow-cleanup keys), not the 3-part letter form: `NSF12FunctionKey`
+/// = 0xf70f, Cmd modifier mask 0x100000. The bare F12 family (plain / Shift /
+/// Ctrl) reaches croft as escape sequences without a forwarder, but Cmd+F12 is
+/// captured by macOS, so this forwarder is required.
+///
+/// Payload is the legacy modified-function-key sequence `ESC [ 24 ; 9 ~`
+/// (`24` = F12, modifier byte 9 = 1 base + Super(8)), which crossterm decodes
+/// back to `KeyEvent { code: F(12), modifiers: SUPER }` via the same
+/// `parse_csi_special_key_code` path that already delivers Shift+F12 as
+/// `ESC [ 24 ; 2 ~`. Cmd+F12 is not bound to any default macOS / iTerm2 menu
+/// item, so no NSUserKeyEquivalents relocation is needed.
+const CMD_F12_KEY: &str = "0xf70f-0x100000";
+const CMD_F12_HEX: &str = "0x1b 0x5b 0x32 0x34 0x3b 0x39 0x7e";
 /// `Cmd+P`: VS Code-style Quick Open file finder. macOS binds Cmd+P to the
 /// standard File > Print menu item across virtually every app (iTerm2
 /// included), so AppKit catches the chord at the menu layer before
@@ -466,6 +481,7 @@ pub fn apply_croft_key_settings(plist: &mut Value) -> Result<(), ITerm2Error> {
         (CMD_RBRACKET_KEY, CMD_RBRACKET_HEX),
         (CMD_OPT_R_KEY, CMD_OPT_R_HEX),
         (CTRL_SHIFT_J_KEY, CTRL_SHIFT_J_HEX),
+        (CMD_F12_KEY, CMD_F12_HEX),
     ] {
         global.insert(key.into(), send_hex_action(hex, 0));
     }
@@ -940,6 +956,19 @@ mod tests {
             action_text(global, CTRL_SHIFT_J_KEY),
             CTRL_SHIFT_J_HEX,
             "GlobalKeyMap must forward Ctrl+Shift+J as a CSI-u sequence so the maximize-terminal chord reaches croft as Char('J') + CONTROL+SHIFT regardless of any future AppKit / iTerm2 default that might bind the chord and swallow it at the menu layer"
+        );
+    }
+
+    #[test]
+    fn apply_croft_key_settings_forwards_cmd_f12_for_go_to_implementations() {
+        let mut plist = synth_plist("GUID-1", &["GUID-1"]);
+        apply_croft_key_settings(&mut plist).unwrap();
+        let top = plist.as_dictionary().unwrap();
+        let global = dict_in(top, "GlobalKeyMap");
+        assert_eq!(
+            action_text(global, CMD_F12_KEY),
+            CMD_F12_HEX,
+            "GlobalKeyMap must forward Cmd+F12 as the legacy modified-function-key sequence ESC[24;9~ so the editor's Go to Implementations chord reaches croft as F(12) + SUPER; unlike the bare-F12 family (plain / Shift / Ctrl) which passes through untouched, Cmd+F12 is captured by macOS and never reaches croft without this forwarder"
         );
     }
 
