@@ -6,19 +6,17 @@
 
 A VS Code style three pane workspace that runs entirely inside your terminal. Written in Rust for performance and ships as a single static binary.
 
-**Local or remote, identical:** run croft on your own machine, or `croft remote <host>` to launch it over SSH on any Linux server. Both are first-class targets with no degraded "remote mode": the same speed, feel, and correctness whether the files live on your Mac or on a box across the world.
-
 ## Tenets
 
 The non-negotiables that shape every decision in croft:
 
-* **Speed is a must.** Written in Rust, shipped as a single static binary. Every feature is weighed against its cost on the hot path before it lands.
-* **Low latency is non-negotiable.** Keystrokes and clicks register instantly. Rendering is coalesced so even a noisy shell can never starve input.
-* **Local and remote parity always binds.** Behaviour on your Mac and on a Linux box over SSH is identical. There is no second-class remote mode.
-* **The gap between terminal and GUI stays minimal.** croft should look and feel like VS Code, down to the icons and motion, never a stripped back approximation.
-* **Everything has a shortcut.** Every action is reachable from the keyboard, and no menu item ships without an accelerator.
-* **Correctness beats workarounds.** Bugs are fixed at the root cause, never papered over with a fallback, a downgrade, or an older dependency.
-* **One binary, no ceremony.** croft ships as a single static binary and stays that way. Features are emulated in process rather than bolted on as heavyweight dependencies, so there is nothing to wire up after you install it.
+1. **Speed is a must.** Written in Rust, shipped as a single static binary. Every feature is weighed against its cost on the hot path before it lands.
+2. **Low latency is non-negotiable.** Keystrokes and clicks register instantly. Rendering is coalesced so even a noisy shell can never starve input.
+3. **Local and remote parity always binds.** Behaviour on your Mac and on a Linux box over SSH is identical. There is no second-class remote mode.
+4. **The gap between terminal and GUI stays minimal.** croft should look and feel like VS Code, down to the icons and motion, never a stripped back approximation.
+5. **Everything has a shortcut.** Every action is reachable from the keyboard, and no menu item ships without an accelerator.
+6. **Correctness beats workarounds.** Bugs are fixed at the root cause, never papered over with a fallback, a downgrade, or an older dependency.
+7. **One binary, no ceremony.** croft ships as a single static binary and stays that way. Features are emulated in process rather than bolted on as heavyweight dependencies, so there is nothing to wire up after you install it.
 
 ## Layout
 
@@ -92,6 +90,7 @@ cargo install --path .
 ```bash
 croft                # opens the current directory
 croft ~/projects     # opens a specific folder
+croft remote <host>  # launch croft over SSH on a Linux server (host from ~/.ssh/config)
 croft --help
 croft setup-terminal --help
 ```
