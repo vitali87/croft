@@ -1048,6 +1048,9 @@ struct Snapshot {
 }
 
 const UNDO_STACK_LIMIT: usize = 500;
+/// Max selected-text length that still drives occurrence highlighting, matching
+/// VS Code's default `editor.selectionHighlightMaxLength`.
+const SELECTION_HIGHLIGHT_MAX_LEN: usize = 200;
 
 /// Outcome of an FS-sync sweep over a single tab (`reload_or_flag_conflict`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1878,6 +1881,33 @@ impl Editor {
         let to = char_byte(last, ec);
         out.push_str(&last[..to]);
         out
+    }
+
+    /// The literal text to light up as "other occurrences" of the current
+    /// selection (VS Code's selection highlight). Returns `None` when the
+    /// selection shouldn't drive occurrence highlighting at all. Computed once
+    /// per render and fed to `paint_selection_occurrences` for every visible
+    /// line.
+    fn selection_occurrence_needle(&self) -> Option<String> {
+        let sel = self.selection?;
+        if !sel.has_area() {
+            return None;
+        }
+        let ((sr, sc), (er, ec)) = sel.normalised();
+        if sr != er {
+            // VS Code only highlights occurrences for single-line selections.
+            return None;
+        }
+        let line = &self.lines[sr];
+        let text = &line[char_byte(line, sc)..char_byte(line, ec)];
+        // Mirror VS Code's non-empty-selection branch: skip whitespace-only
+        // selections and anything past the 200-char ceiling
+        // (`editor.selectionHighlightMaxLength`); otherwise highlight the
+        // literal substring. No minimum length, no whole-word filter.
+        if text.trim().is_empty() || text.chars().count() > SELECTION_HIGHLIGHT_MAX_LEN {
+            return None;
+        }
+        Some(text.to_string())
     }
 
     /// Delete the current selection if it has area.  Returns true iff content
@@ -2884,6 +2914,7 @@ impl Widget for &mut Editor {
             .selection
             .filter(|s| s.has_area())
             .map(|s| s.normalised());
+        let occ_needle = self.selection_occurrence_needle();
 
         let end = (self.scroll + height).min(self.lines.len());
         for (row_idx, line_idx) in (self.scroll..end).enumerate() {
@@ -2924,6 +2955,18 @@ impl Widget for &mut Editor {
                     self.search_highlight_opts,
                     self.scroll_col,
                     active_on_line,
+                );
+            }
+
+            if let Some(needle) = occ_needle.as_deref() {
+                paint_selection_occurrences(
+                    buf,
+                    text_x,
+                    y,
+                    text_width,
+                    raw,
+                    needle,
+                    self.scroll_col,
                 );
             }
 
@@ -3124,6 +3167,46 @@ fn paint_search_highlight(
         if abs_col >= scroll_col + text_width as usize {
             break;
         }
+    }
+}
+
+/// Paint VS Code-style "selection highlight": a muted blue box over every
+/// occurrence of `needle` on this line. Matches the literal selected text
+/// case-sensitively (like VS Code's `editor.selectionHighlight`). Only the
+/// background is repainted, so syntax foreground colours show through. The
+/// active selection itself is overpainted afterwards by
+/// `paint_selection_band` with a brighter blue, giving the two-tone look.
+fn paint_selection_occurrences(
+    buf: &mut Buffer,
+    text_x: u16,
+    y: u16,
+    text_width: u16,
+    raw_line: &str,
+    needle: &str,
+    scroll_col: usize,
+) {
+    if needle.is_empty() {
+        return;
+    }
+    let bg = Color::Rgb(0x37, 0x61, 0x8e);
+    let needle_cols = needle.chars().count();
+    let mut search_from = 0usize;
+    while let Some(rel) = raw_line[search_from..].find(needle) {
+        let byte_start = search_from + rel;
+        let char_start = raw_line[..byte_start].chars().count();
+        for c in 0..needle_cols {
+            let absolute = char_start + c;
+            if absolute < scroll_col {
+                continue;
+            }
+            let col = (absolute - scroll_col) as u16;
+            if col >= text_width {
+                break;
+            }
+            let cell = &mut buf[(text_x + col, y)];
+            cell.set_style(cell.style().bg(bg));
+        }
+        search_from = byte_start + needle.len();
     }
 }
 
@@ -5771,6 +5854,94 @@ mod tests {
                 "second match cell {col} must have yellow bg"
             );
         }
+    }
+
+    #[test]
+    fn editor_render_lights_other_occurrences_of_selection_in_blue() {
+        use ratatui::buffer::Buffer;
+        let mut e = editor_with("alpha needle bravo needle zulu");
+        // Select the first "needle" (chars 6..12).
+        e.selection = Some(EditorSelection {
+            anchor: (0, 6),
+            head: (0, 12),
+        });
+        e.focused = true;
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 3,
+        };
+        let mut buf = Buffer::empty(area);
+        (&mut e).render(area, &mut buf);
+        let text_x = e.last_inner.x + e.last_gutter_width + 1;
+        let y = e.last_inner.y;
+        let occurrence = Color::Rgb(0x37, 0x61, 0x8e);
+        let selection = Color::Rgb(0x26, 0x4f, 0x78);
+        // The selected occurrence wears the brighter selection band, not the
+        // dimmer occurrence blue.
+        for col in 6..12u16 {
+            assert_eq!(
+                buf[(text_x + col, y)].bg,
+                selection,
+                "selected occurrence cell {col} must show the selection band"
+            );
+        }
+        // The OTHER "needle" (chars 19..25) wears the occurrence blue.
+        for col in 19..25u16 {
+            assert_eq!(
+                buf[(text_x + col, y)].bg,
+                occurrence,
+                "other occurrence cell {col} must show the occurrence blue"
+            );
+        }
+        // A non-matching cell stays unpainted.
+        assert_ne!(buf[(text_x + 18, y)].bg, occurrence, "space before match");
+    }
+
+    #[test]
+    fn editor_render_skips_occurrence_highlight_for_whitespace_selection() {
+        use ratatui::buffer::Buffer;
+        let mut e = editor_with("a  b  c  d");
+        // Select two spaces (chars 1..3) — whitespace only.
+        e.selection = Some(EditorSelection {
+            anchor: (0, 1),
+            head: (0, 3),
+        });
+        e.focused = true;
+        assert_eq!(e.selection_occurrence_needle(), None);
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 3,
+        };
+        let mut buf = Buffer::empty(area);
+        (&mut e).render(area, &mut buf);
+        let text_x = e.last_inner.x + e.last_gutter_width + 1;
+        let y = e.last_inner.y;
+        let occurrence = Color::Rgb(0x37, 0x61, 0x8e);
+        for col in 0..10u16 {
+            assert_ne!(
+                buf[(text_x + col, y)].bg,
+                occurrence,
+                "whitespace-only selection must not light occurrences"
+            );
+        }
+    }
+
+    #[test]
+    fn editor_render_skips_occurrence_highlight_for_multiline_selection() {
+        let mut e = editor_with("needle\nneedle");
+        e.selection = Some(EditorSelection {
+            anchor: (0, 0),
+            head: (1, 6),
+        });
+        assert_eq!(
+            e.selection_occurrence_needle(),
+            None,
+            "multi-line selections do not drive occurrence highlighting"
+        );
     }
 
     #[test]

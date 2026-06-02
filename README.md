@@ -158,7 +158,7 @@ croft setup-terminal --help
 | `Shift`+arrows / `Shift`+`Home` / `End` / `PageUp` / `PageDown` | Extend the selection by the same motion |
 | `PageUp` / `PageDown` (`fn`+`↑` / `fn`+`↓` on Mac) | Scroll exactly one viewport |
 | Any printable char, Enter, Backspace, Delete, Tab | Edit (typing or deleting with an active selection replaces it) |
-| Mouse drag | Select text; selection stays highlighted until you copy or click elsewhere |
+| Mouse drag | Select text; selection stays highlighted until you copy or click elsewhere. Every other occurrence of the selected text lights up in blue (VS Code-style selection highlight), for single-line, non-whitespace selections up to 200 characters |
 | `Ctrl`+`C` / `Cmd`+`C` | Copy the selection to the system clipboard (native NSPasteboard on macOS; OSC 52 fallback on remote) |
 | `Ctrl`+`X` / `Cmd`+`X` | Cut the selection |
 | `Ctrl`+`V` / `Cmd`+`V` | Paste at the cursor; replaces selection if any |
