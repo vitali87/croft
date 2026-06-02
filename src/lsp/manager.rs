@@ -295,16 +295,25 @@ struct ManagedClient {
     supports_rename: bool,
 }
 
+/// Servers are keyed by language AND the file's project root, not language
+/// alone. A monorepo has one `.venv` (and `pyproject.toml`) per sub-project, so
+/// a single server rooted at croft's workspace root can't resolve any of them.
+/// Following Zed's model, croft runs a server instance per (language, project
+/// root); each is rooted at the project so basedpyright/rust-analyzer/gopls
+/// auto-detect that project's environment.
+type ClientKey = (Language, PathBuf);
+
 struct WorkerState {
     workspace_root: PathBuf,
     registry: ServerRegistry,
-    clients: HashMap<Language, Vec<ManagedClient>>,
+    clients: HashMap<ClientKey, Vec<ManagedClient>>,
     docs: HashMap<PathBuf, DocState>,
     declaration_support: DeclarationSupport,
 }
 
 struct DocState {
     language: Language,
+    project_root: PathBuf,
     version: i32,
 }
 
@@ -393,16 +402,17 @@ async fn worker_loop(
 }
 
 impl WorkerState {
-    async fn ensure_clients(&mut self, lang: Language) -> &[ManagedClient] {
+    async fn ensure_clients(&mut self, lang: Language, root: &Path) -> &[ManagedClient] {
         // Re-probe when the cached list is empty: a server (e.g. the managed
         // vtsls) may have finished its background install since the first
         // attempt, so this is how TS LSP comes alive without a relaunch.
         // A non-empty list is stable and never re-probed.
-        let first_attempt = !self.clients.contains_key(&lang);
+        let key: ClientKey = (lang, root.to_path_buf());
+        let first_attempt = !self.clients.contains_key(&key);
         let should_try = first_attempt
             || self
                 .clients
-                .get(&lang)
+                .get(&key)
                 .is_some_and(|clients| clients.is_empty());
         if should_try {
             let configs: Vec<ServerConfig> = self.registry.for_language(lang).to_vec();
@@ -411,13 +421,8 @@ impl WorkerState {
                 let Some((config, extra_path)) = resolve_config(config, first_attempt) else {
                     continue;
                 };
-                match LspClient::spawn(
-                    &config,
-                    &self.workspace_root,
-                    build_client_capabilities(),
-                    &extra_path,
-                )
-                .await
+                match LspClient::spawn(&config, root, build_client_capabilities(), &extra_path)
+                    .await
                 {
                     Ok(client) => {
                         let caps = client.capabilities();
@@ -434,8 +439,9 @@ impl WorkerState {
                             declaration_supported(&caps.declaration_provider);
                         let supports_rename = one_of_supported(&caps.rename_provider);
                         log_file::log(&format!(
-                            "lsp[{}] spawned, supports_completion={supports} supports_hover={supports_hover} supports_definition={supports_definition} supports_declaration={supports_declaration} supports_rename={supports_rename}",
-                            config.name
+                            "lsp[{}] spawned, root={} supports_completion={supports} supports_hover={supports_hover} supports_definition={supports_definition} supports_declaration={supports_declaration} supports_rename={supports_rename}",
+                            config.name,
+                            root.display()
                         ));
                         spawned.push(ManagedClient {
                             name: config.name.to_string(),
@@ -460,16 +466,17 @@ impl WorkerState {
             if let Ok(mut map) = self.declaration_support.lock() {
                 map.insert(lang, supports_declaration);
             }
-            self.clients.insert(lang, spawned);
+            self.clients.insert(key.clone(), spawned);
         }
-        self.clients.get(&lang).map(Vec::as_slice).unwrap_or(&[])
+        self.clients.get(&key).map(Vec::as_slice).unwrap_or(&[])
     }
 
     async fn open_doc(&mut self, path: PathBuf, text: String) {
         let Some(lang) = path_to_language(&path) else {
             return;
         };
-        let clients = self.ensure_clients(lang).await;
+        let project_root = project_root_for(&path, lang, &self.workspace_root);
+        let clients = self.ensure_clients(lang, &project_root).await;
         if clients.is_empty() {
             return;
         }
@@ -490,6 +497,7 @@ impl WorkerState {
             path,
             DocState {
                 language: lang,
+                project_root,
                 version: 0,
             },
         );
@@ -501,11 +509,11 @@ impl WorkerState {
         };
         doc.version += 1;
         let version = doc.version;
-        let lang = doc.language;
+        let key: ClientKey = (doc.language, doc.project_root.clone());
         let Ok(uri) = Url::from_file_path(&path) else {
             return;
         };
-        let arcs: Vec<(String, Arc<TokioMutex<LspClient>>)> = match self.clients.get(&lang) {
+        let arcs: Vec<(String, Arc<TokioMutex<LspClient>>)> = match self.clients.get(&key) {
             Some(cs) => cs
                 .iter()
                 .map(|c| (c.name.clone(), c.client.clone()))
@@ -527,8 +535,8 @@ impl WorkerState {
         let Ok(uri) = Url::from_file_path(&path) else {
             return;
         };
-        let arcs: Vec<(String, Arc<TokioMutex<LspClient>>)> = match self.clients.get(&doc.language)
-        {
+        let key: ClientKey = (doc.language, doc.project_root.clone());
+        let arcs: Vec<(String, Arc<TokioMutex<LspClient>>)> = match self.clients.get(&key) {
             Some(cs) => cs
                 .iter()
                 .map(|c| (c.name.clone(), c.client.clone()))
@@ -555,11 +563,12 @@ impl WorkerState {
             return;
         };
         let lang = doc.language;
+        let root = doc.project_root.clone();
         // Re-probe so a server installed since the file was opened (e.g. the
         // managed vtsls finishing its lazy background install) is picked up
         // without reopening the file. Cheap once the list is non-empty.
-        self.ensure_clients(lang).await;
-        let Some(clients) = self.clients.get(&lang) else {
+        self.ensure_clients(lang, &root).await;
+        let Some(clients) = self.clients.get(&(lang, root)) else {
             return;
         };
         let picked = clients
@@ -645,11 +654,12 @@ impl WorkerState {
             return;
         };
         let lang = doc.language;
+        let root = doc.project_root.clone();
         // Re-probe so a server installed since the file was opened (e.g. the
         // managed vtsls finishing its lazy background install) is picked up
         // without reopening the file. Cheap once the list is non-empty.
-        self.ensure_clients(lang).await;
-        let Some(clients) = self.clients.get(&lang) else {
+        self.ensure_clients(lang, &root).await;
+        let Some(clients) = self.clients.get(&(lang, root)) else {
             return;
         };
         let picked = clients
@@ -709,11 +719,12 @@ impl WorkerState {
             return;
         };
         let lang = doc.language;
+        let root = doc.project_root.clone();
         // Re-probe so a server installed since the file was opened (e.g. the
         // managed vtsls finishing its lazy background install) is picked up
         // without reopening the file. Cheap once the list is non-empty.
-        self.ensure_clients(lang).await;
-        let Some(clients) = self.clients.get(&lang) else {
+        self.ensure_clients(lang, &root).await;
+        let Some(clients) = self.clients.get(&(lang, root)) else {
             return;
         };
         let picked = clients
@@ -773,11 +784,12 @@ impl WorkerState {
             return;
         };
         let lang = doc.language;
+        let root = doc.project_root.clone();
         // Re-probe so a server installed since the file was opened (e.g. the
         // managed vtsls finishing its lazy background install) is picked up
         // without reopening the file. Cheap once the list is non-empty.
-        self.ensure_clients(lang).await;
-        let Some(clients) = self.clients.get(&lang) else {
+        self.ensure_clients(lang, &root).await;
+        let Some(clients) = self.clients.get(&(lang, root)) else {
             return;
         };
         let picked = clients
@@ -842,11 +854,12 @@ impl WorkerState {
             return;
         };
         let lang = doc.language;
+        let root = doc.project_root.clone();
         // Re-probe so a server installed since the file was opened (e.g. the
         // managed vtsls finishing its lazy background install) is picked up
         // without reopening the file. Cheap once the list is non-empty.
-        self.ensure_clients(lang).await;
-        let Some(clients) = self.clients.get(&lang) else {
+        self.ensure_clients(lang, &root).await;
+        let Some(clients) = self.clients.get(&(lang, root)) else {
             return;
         };
         let picked = clients
@@ -1100,6 +1113,53 @@ fn path_to_language(path: &Path) -> Option<Language> {
         .and_then(Language::from_extension)
 }
 
+/// Project-manifest filenames whose presence marks a directory as the root of a
+/// `lang` project. Used to anchor the language server at the right sub-project
+/// (so basedpyright finds that project's `.venv`, rust-analyzer its `Cargo.toml`,
+/// etc.). An empty slice means "no per-project rooting" → use the workspace root.
+fn manifest_names(lang: Language) -> &'static [&'static str] {
+    match lang {
+        Language::Python => &[
+            "pyproject.toml",
+            "setup.py",
+            "setup.cfg",
+            "pyrightconfig.json",
+            ".venv",
+        ],
+        Language::Rust => &["Cargo.toml"],
+        Language::Go => &["go.mod"],
+        Language::TypeScript | Language::Tsx | Language::JavaScript | Language::Jsx => {
+            &["tsconfig.json", "jsconfig.json", "package.json"]
+        }
+        _ => &[],
+    }
+}
+
+/// The project root a file's language server should be anchored at: the nearest
+/// ancestor holding a language manifest (e.g. `pyproject.toml`, `Cargo.toml`,
+/// `go.mod`, `package.json`), bounded by croft's workspace root. Falls back to
+/// the workspace root when none is found, so a plain single-project workspace
+/// behaves exactly as before.
+fn project_root_for(path: &Path, lang: Language, workspace_root: &Path) -> PathBuf {
+    let manifests = manifest_names(lang);
+    if !manifests.is_empty() {
+        let mut dir = path.parent();
+        while let Some(d) = dir {
+            if !d.starts_with(workspace_root) {
+                break;
+            }
+            if manifests.iter().any(|m| d.join(m).exists()) {
+                return d.to_path_buf();
+            }
+            if d == workspace_root {
+                break;
+            }
+            dir = d.parent();
+        }
+    }
+    workspace_root.to_path_buf()
+}
+
 /// Walk `$PATH` looking for an executable file named `cmd`. Avoids
 /// invoking the binary with `--help` or `--version` because LSP servers
 /// are JSON-RPC daemons with no consistent CLI flags (basedpyright-
@@ -1230,6 +1290,44 @@ mod tests {
         assert_eq!(out[0].1.len(), 1);
         assert_eq!(out[0].1[0].new_text, "renamed");
         assert_eq!(out[0].1[0].start, (2, 4));
+    }
+
+    #[test]
+    fn project_root_is_nearest_manifest_ancestor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // monorepo: root/app/svc is a Python sub-project with its own pyproject.
+        let svc = root.join("app").join("svc");
+        std::fs::create_dir_all(svc.join("src/pkg")).unwrap();
+        std::fs::write(svc.join("pyproject.toml"), b"[project]\n").unwrap();
+        let file = svc.join("src/pkg/mod.py");
+        assert_eq!(project_root_for(&file, Language::Python, root), svc);
+    }
+
+    #[test]
+    fn project_root_falls_back_to_workspace_root_without_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let file = root.join("a/b/loose.py");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        // No pyproject anywhere up the tree → workspace root.
+        assert_eq!(project_root_for(&file, Language::Python, root), root);
+    }
+
+    #[test]
+    fn project_root_ignores_manifest_of_other_languages() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let sub = root.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        // A Cargo.toml must not anchor a Python file; Python keeps walking to root.
+        std::fs::write(sub.join("Cargo.toml"), b"[package]\n").unwrap();
+        let file = sub.join("script.py");
+        assert_eq!(project_root_for(&file, Language::Python, root), root);
+        // ...but it does anchor a Rust file.
+        let rs = sub.join("src/main.rs");
+        std::fs::create_dir_all(rs.parent().unwrap()).unwrap();
+        assert_eq!(project_root_for(&rs, Language::Rust, root), sub);
     }
 
     #[test]
