@@ -8,6 +8,20 @@ A VS Code style three pane workspace that runs entirely inside your terminal. Wr
 
 **Local or remote, identical:** run croft on your own machine, or `croft remote <host>` to launch it over SSH on any Linux server. Both are first-class targets with no degraded "remote mode": the same speed, feel, and correctness whether the files live on your Mac or on a box across the world.
 
+## Tenets
+
+The non-negotiables that shape every decision in croft:
+
+* **Speed is a must.** Written in Rust, shipped as a single static binary. Every feature is weighed against its cost on the hot path before it lands.
+* **Low latency is non-negotiable.** Keystrokes and clicks register instantly. Rendering is coalesced so even a noisy shell can never starve input.
+* **Local and remote parity always binds.** Behaviour on your Mac and on a Linux box over SSH is identical. There is no second-class remote mode.
+* **The gap between terminal and GUI stays minimal.** croft should look and feel like VS Code, down to the icons and motion, never a stripped back approximation.
+* **Everything has a shortcut.** Every action is reachable from the keyboard, and no menu item ships without an accelerator.
+* **Correctness beats workarounds.** Bugs are fixed at the root cause, never papered over with a fallback, a downgrade, or an older dependency.
+* **One binary, no ceremony.** croft ships as a single static binary and stays that way. Features are emulated in process rather than bolted on as heavyweight dependencies, so there is nothing to wire up after you install it.
+
+## Layout
+
 * **Left pane (sidebar):** Explorer with multi-select, cut / copy / paste, drag and drop file moves, and VS Code style icons (Codicons / Devicons / Seti). Two more sidebar views switch in via the activity bar: full-text Search and a Remote (SSH) explorer.
 * **Top right pane (editor):** code editor with `tree-sitter` syntax highlighting plus inline preview tabs for PNG / JPEG / GIF / BMP / WebP, PDFs (with page navigation), and CSV / TSV / XLSX / XLS / ODS spreadsheets. An optional native modal (vim) editing mode toggles on with `Cmd`+`E`.
 * **Bottom right pane (terminal):** a real interactive shell, your `$SHELL` running on a real PTY.
@@ -171,8 +185,9 @@ croft setup-terminal --help
 | `F12` / `Cmd`/`Option`+click | Go to Definition (jumps via the language server); `Cmd`+`Shift`+click navigates back |
 | `Shift`+`F12` | Go to Declaration: jumps to where the symbol is declared, via the language server's `textDocument/declaration`. Shown in the right-click menu only for languages whose server implements it; hidden for TypeScript (vtsls advertises `declarationProvider: false`), exactly as VS Code does |
 | `Ctrl`+`F12` | Go to Type Definition: jumps to where the type of the expression under the cursor is defined, via the language server's `textDocument/typeDefinition`. Shown in the right-click menu only for languages whose server implements it (vtsls, basedpyright, rust-analyzer, gopls all do) |
+| `Cmd`+`F12` | Go to Implementations: jumps from a trait / interface / abstract method to its concrete implementors, via the language server's `textDocument/implementation` (often many; jumps to the first). Shown in the right-click menu only for languages whose server implements it (rust-analyzer, gopls, vtsls do). Requires `croft setup-iterm2` so iTerm2 forwards the Cmd chord |
 | Hover (300 ms dwell) | Show the LSP hover popup for the symbol under the pointer |
-| Right-click | Editor symbol menu: Go to Definition, Go to Declaration, Go to Type Definition, Rename Symbol, Change All Occurrences |
+| Right-click | Editor symbol menu: Go to Definition, Go to Declaration, Go to Type Definition, Go to Implementations, Rename Symbol, Change All Occurrences |
 | `Cmd`+`E` | Toggle native modal (vim) editing for the editor pane (see below) |
 
 ### Editor: vim mode (modal editing)
