@@ -9,9 +9,9 @@ use lsp_types::{
     ClientCapabilities, CompletionClientCapabilities, CompletionItemCapability, CompletionItemKind,
     CompletionItemKindCapability, CompletionResponse, DeclarationCapability,
     DocumentChangeOperation, DocumentChanges, GotoDefinitionResponse, HoverContents,
-    HoverProviderCapability, ImplementationProviderCapability, MarkedString, MarkupKind, OneOf,
-    Position, TextDocumentClientCapabilities, TextEdit, TypeDefinitionProviderCapability, Url,
-    WorkspaceEdit,
+    HoverProviderCapability, ImplementationProviderCapability, Location, MarkedString, MarkupKind,
+    OneOf, Position, TextDocumentClientCapabilities, TextEdit, TypeDefinitionProviderCapability,
+    Url, WorkspaceEdit,
 };
 use tokio::sync::{Mutex as TokioMutex, mpsc as tokio_mpsc};
 
@@ -88,6 +88,19 @@ pub struct ImplementationResult {
 }
 
 #[derive(Debug)]
+pub struct ReferencesResult {
+    pub request_id: u64,
+    pub path: PathBuf,
+    /// Every reference location the server returned. `textDocument/references`
+    /// is inherently 1:many (a symbol used in many places), so all of them are
+    /// carried through; the app jumps directly when there is one and shows a
+    /// picker when there are several, exactly like Go to Implementations.
+    pub targets: Vec<(PathBuf, u32, u32)>,
+    /// True when no spawned server advertises a usable `referencesProvider`.
+    pub unsupported: bool,
+}
+
+#[derive(Debug)]
 pub struct RenameResult {
     pub request_id: u64,
     pub path: PathBuf,
@@ -144,6 +157,12 @@ enum Cmd {
         line: u32,
         character: u32,
     },
+    RequestReferences {
+        request_id: u64,
+        path: PathBuf,
+        line: u32,
+        character: u32,
+    },
     RequestRename {
         request_id: u64,
         path: PathBuf,
@@ -164,6 +183,7 @@ struct LangCapabilitySupport {
     declaration: HashMap<Language, bool>,
     type_definition: HashMap<Language, bool>,
     implementation: HashMap<Language, bool>,
+    references: HashMap<Language, bool>,
 }
 type CapabilitySupport = Arc<StdMutex<LangCapabilitySupport>>;
 
@@ -175,6 +195,7 @@ pub struct LspManager {
     decl_rx: std_mpsc::Receiver<DeclarationResult>,
     type_def_rx: std_mpsc::Receiver<TypeDefinitionResult>,
     impl_rx: std_mpsc::Receiver<ImplementationResult>,
+    ref_rx: std_mpsc::Receiver<ReferencesResult>,
     rename_rx: std_mpsc::Receiver<RenameResult>,
     capability_support: CapabilitySupport,
     next_request_id: u64,
@@ -192,6 +213,7 @@ impl LspManager {
         let (decl_tx, decl_rx) = std_mpsc::channel();
         let (type_def_tx, type_def_rx) = std_mpsc::channel();
         let (impl_tx, impl_rx) = std_mpsc::channel();
+        let (ref_tx, ref_rx) = std_mpsc::channel();
         let (rename_tx, rename_rx) = std_mpsc::channel();
         let capability_support: CapabilitySupport =
             Arc::new(StdMutex::new(LangCapabilitySupport::default()));
@@ -207,6 +229,7 @@ impl LspManager {
                 declaration: decl_tx,
                 type_definition: type_def_tx,
                 implementation: impl_tx,
+                references: ref_tx,
                 rename: rename_tx,
             },
             capability_support.clone(),
@@ -219,6 +242,7 @@ impl LspManager {
             decl_rx,
             type_def_rx,
             impl_rx,
+            ref_rx,
             rename_rx,
             capability_support,
             next_request_id: 1,
@@ -339,6 +363,22 @@ impl LspManager {
         self.impl_rx.try_recv().ok()
     }
 
+    pub fn request_references(&mut self, path: PathBuf, line: u32, character: u32) -> u64 {
+        let id = self.next_request_id;
+        self.next_request_id += 1;
+        let _ = self.cmd_tx.send(Cmd::RequestReferences {
+            request_id: id,
+            path,
+            line,
+            character,
+        });
+        id
+    }
+
+    pub fn drain_references(&self) -> Option<ReferencesResult> {
+        self.ref_rx.try_recv().ok()
+    }
+
     /// Whether the server for `lang` implements `textDocument/declaration`.
     /// `None` means no server has reported yet (not spawned). Read synchronously
     /// by the app to decide whether to show the "Go to Declaration" menu item.
@@ -371,6 +411,18 @@ impl LspManager {
             .lock()
             .ok()?
             .implementation
+            .get(&lang)
+            .copied()
+    }
+
+    /// Whether the server for `lang` implements `textDocument/references`.
+    /// `None` means no server has reported yet. Read synchronously by the app to
+    /// decide whether to show the "Go to References" menu item.
+    pub fn language_supports_references(&self, lang: Language) -> Option<bool> {
+        self.capability_support
+            .lock()
+            .ok()?
+            .references
             .get(&lang)
             .copied()
     }
@@ -408,6 +460,7 @@ struct ManagedClient {
     supports_declaration: bool,
     supports_type_definition: bool,
     supports_implementation: bool,
+    supports_references: bool,
     supports_rename: bool,
 }
 
@@ -442,6 +495,7 @@ struct ResultSenders {
     declaration: std_mpsc::Sender<DeclarationResult>,
     type_definition: std_mpsc::Sender<TypeDefinitionResult>,
     implementation: std_mpsc::Sender<ImplementationResult>,
+    references: std_mpsc::Sender<ReferencesResult>,
     rename: std_mpsc::Sender<RenameResult>,
 }
 
@@ -524,6 +578,16 @@ async fn worker_loop(
                     .request_implementation(request_id, path, line, character, &tx.implementation)
                     .await
             }
+            Cmd::RequestReferences {
+                request_id,
+                path,
+                line,
+                character,
+            } => {
+                state
+                    .request_references(request_id, path, line, character, &tx.references)
+                    .await
+            }
             Cmd::RequestRename {
                 request_id,
                 path,
@@ -579,9 +643,10 @@ impl WorkerState {
                             type_definition_supported(&caps.type_definition_provider);
                         let supports_implementation =
                             implementation_supported(&caps.implementation_provider);
+                        let supports_references = one_of_supported(&caps.references_provider);
                         let supports_rename = one_of_supported(&caps.rename_provider);
                         log_file::log(&format!(
-                            "lsp[{}] spawned, root={} supports_completion={supports} supports_hover={supports_hover} supports_definition={supports_definition} supports_declaration={supports_declaration} supports_type_definition={supports_type_definition} supports_implementation={supports_implementation} supports_rename={supports_rename}",
+                            "lsp[{}] spawned, root={} supports_completion={supports} supports_hover={supports_hover} supports_definition={supports_definition} supports_declaration={supports_declaration} supports_type_definition={supports_type_definition} supports_implementation={supports_implementation} supports_references={supports_references} supports_rename={supports_rename}",
                             config.name,
                             root.display()
                         ));
@@ -594,6 +659,7 @@ impl WorkerState {
                             supports_declaration,
                             supports_type_definition,
                             supports_implementation,
+                            supports_references,
                             supports_rename,
                         });
                     }
@@ -609,12 +675,14 @@ impl WorkerState {
             let supports_declaration = spawned.iter().any(|c| c.supports_declaration);
             let supports_type_definition = spawned.iter().any(|c| c.supports_type_definition);
             let supports_implementation = spawned.iter().any(|c| c.supports_implementation);
+            let supports_references = spawned.iter().any(|c| c.supports_references);
             if let Ok(mut support) = self.capability_support.lock() {
                 support.declaration.insert(lang, supports_declaration);
                 support
                     .type_definition
                     .insert(lang, supports_type_definition);
                 support.implementation.insert(lang, supports_implementation);
+                support.references.insert(lang, supports_references);
             }
             self.clients.insert(key.clone(), spawned);
         }
@@ -1129,6 +1197,75 @@ impl WorkerState {
         });
     }
 
+    async fn request_references(
+        &mut self,
+        request_id: u64,
+        path: PathBuf,
+        line: u32,
+        character: u32,
+        tx: &std_mpsc::Sender<ReferencesResult>,
+    ) {
+        let Some(doc) = self.docs.get(&path) else {
+            return;
+        };
+        let lang = doc.language;
+        let root = doc.project_root.clone();
+        // Re-probe so a server installed since the file was opened (e.g. the
+        // managed vtsls finishing its lazy background install) is picked up
+        // without reopening the file. Cheap once the list is non-empty.
+        self.ensure_clients(lang, &root).await;
+        let Some(clients) = self.clients.get(&(lang, root)) else {
+            return;
+        };
+        let picked = clients
+            .iter()
+            .find(|c| c.supports_references)
+            .map(|c| (c.name.clone(), c.client.clone()));
+        let Some((server_name, client_arc)) = picked else {
+            let _ = tx.send(ReferencesResult {
+                request_id,
+                path,
+                targets: Vec::new(),
+                unsupported: true,
+            });
+            return;
+        };
+        let Ok(uri) = Url::from_file_path(&path) else {
+            return;
+        };
+        let tx = tx.clone();
+        let path_clone = path.clone();
+        log_file::log(&format!(
+            "references request id={request_id} server={server_name} path={} line={line} char={character}",
+            path.display()
+        ));
+        tokio::spawn(async move {
+            let mut client = client_arc.lock().await;
+            let resp = client.references(uri, line, character).await;
+            drop(client);
+            let targets = match resp {
+                Ok(Some(locs)) => reference_locations(&locs),
+                Ok(None) => Vec::new(),
+                // `{e:#}` prints the full anyhow chain (the underlying JSON-RPC
+                // error), not just the "references" context label.
+                Err(e) => {
+                    log_file::log(&format!("lsp[{server_name}] references error: {e:#}"));
+                    Vec::new()
+                }
+            };
+            log_file::log(&format!(
+                "references response id={request_id} server={server_name} count={}",
+                targets.len()
+            ));
+            let _ = tx.send(ReferencesResult {
+                request_id,
+                path: path_clone,
+                targets,
+                unsupported: false,
+            });
+        });
+    }
+
     async fn request_rename(
         &mut self,
         request_id: u64,
@@ -1383,6 +1520,23 @@ fn def_locations(resp: &GotoDefinitionResponse) -> Vec<(PathBuf, u32, u32)> {
     };
     raw.into_iter()
         .filter_map(|(uri, pos)| Some((uri.to_file_path().ok()?, pos.line, pos.character)))
+        .collect()
+}
+
+/// Every reference location the server returned, as local-file targets. Unlike
+/// the goto family, `textDocument/references` replies with a flat `Vec<Location>`
+/// (not a `GotoDefinitionResponse`), so it gets its own mapper rather than going
+/// through `def_locations`. Locations whose URI is not a local file path are
+/// dropped (the same rule `def_locations` applies).
+fn reference_locations(locs: &[Location]) -> Vec<(PathBuf, u32, u32)> {
+    locs.iter()
+        .filter_map(|l| {
+            Some((
+                l.uri.to_file_path().ok()?,
+                l.range.start.line,
+                l.range.start.character,
+            ))
+        })
         .collect()
 }
 
@@ -1718,6 +1872,40 @@ mod tests {
             ImplementationProviderCapability::Simple(true)
         )));
         assert!(!implementation_supported(&None));
+    }
+
+    #[test]
+    fn reference_locations_maps_every_location() {
+        // Go to References is 1:many: a symbol used in three places comes back
+        // as a flat `Vec<Location>` (not a `GotoDefinitionResponse`), and every
+        // one must survive the mapping, in order.
+        let locs = vec![
+            Location {
+                uri: Url::from_file_path("/tmp/a.rs").unwrap(),
+                range: def_range(2, 4),
+            },
+            Location {
+                uri: Url::from_file_path("/tmp/b.rs").unwrap(),
+                range: def_range(7, 1),
+            },
+            Location {
+                uri: Url::from_file_path("/tmp/a.rs").unwrap(),
+                range: def_range(11, 0),
+            },
+        ];
+        assert_eq!(
+            reference_locations(&locs),
+            vec![
+                (PathBuf::from("/tmp/a.rs"), 2, 4),
+                (PathBuf::from("/tmp/b.rs"), 7, 1),
+                (PathBuf::from("/tmp/a.rs"), 11, 0),
+            ]
+        );
+    }
+
+    #[test]
+    fn reference_locations_empty_is_empty() {
+        assert!(reference_locations(&[]).is_empty());
     }
 
     #[test]

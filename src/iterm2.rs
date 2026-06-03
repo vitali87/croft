@@ -202,6 +202,22 @@ const CTRL_SHIFT_J_HEX: &str = "0x1b 0x5b 0x37 0x34 0x3b 0x36 0x75";
 /// item, so no NSUserKeyEquivalents relocation is needed.
 const CMD_F12_KEY: &str = "0xf70f-0x100000";
 const CMD_F12_HEX: &str = "0x1b 0x5b 0x32 0x34 0x3b 0x39 0x7e";
+/// `Ctrl+Shift+F12` -> editor "Go to Declaration". VS Code leaves Declaration
+/// unbound, so croft keeps it in the F12 navigation family; it moved here off
+/// the bare `Shift+F12` it once held when Go to References (VS Code's real
+/// `Shift+F12`) was added. `NSF12FunctionKey` = 0xf70f, modifier mask 0x60000 =
+/// NSEventModifierFlagControl(0x40000) + NSEventModifierFlagShift(0x20000).
+///
+/// Payload is the legacy modified-function-key sequence `ESC [ 24 ; 6 ~`
+/// (`24` = F12, modifier byte 6 = 1 base + Shift(1) + Control(4)), which
+/// crossterm decodes back to `KeyEvent { code: F(12), modifiers: SHIFT |
+/// CONTROL }` via the same `parse_csi_special_key_code` path that delivers the
+/// rest of the family. Unlike `Cmd+F12`, macOS does not reserve this chord, so
+/// iTerm2 would already emit these exact bytes natively; the forwarder is
+/// installed defensively (mirroring `Ctrl+Shift+J`) so a future iTerm2 default
+/// cannot silently swallow the chord. No NSUserKeyEquivalents relocation needed.
+const CTRL_SHIFT_F12_KEY: &str = "0xf70f-0x60000";
+const CTRL_SHIFT_F12_HEX: &str = "0x1b 0x5b 0x32 0x34 0x3b 0x36 0x7e";
 /// `Cmd+B` — toggle the primary side bar (croft's `is_sidebar_toggle_key`),
 /// matching VS Code's "View: Toggle Primary Side Bar" macOS default. iTerm2
 /// does not bind the bare chord to any default menu item (newer builds only
@@ -524,6 +540,7 @@ pub fn apply_croft_key_settings(plist: &mut Value) -> Result<(), ITerm2Error> {
         (CMD_OPT_R_KEY, CMD_OPT_R_HEX),
         (CTRL_SHIFT_J_KEY, CTRL_SHIFT_J_HEX),
         (CMD_F12_KEY, CMD_F12_HEX),
+        (CTRL_SHIFT_F12_KEY, CTRL_SHIFT_F12_HEX),
         (CMD_B_KEY, CMD_B_HEX),
     ] {
         global.insert(key.into(), send_hex_action(hex, 0));
@@ -1059,6 +1076,19 @@ mod tests {
             action_text(global, CMD_F12_KEY),
             CMD_F12_HEX,
             "GlobalKeyMap must forward Cmd+F12 as the legacy modified-function-key sequence ESC[24;9~ so the editor's Go to Implementations chord reaches croft as F(12) + SUPER; unlike the bare-F12 family (plain / Shift / Ctrl) which passes through untouched, Cmd+F12 is captured by macOS and never reaches croft without this forwarder"
+        );
+    }
+
+    #[test]
+    fn apply_croft_key_settings_forwards_ctrl_shift_f12_for_go_to_declaration() {
+        let mut plist = synth_plist("GUID-1", &["GUID-1"]);
+        apply_croft_key_settings(&mut plist).unwrap();
+        let top = plist.as_dictionary().unwrap();
+        let global = dict_in(top, "GlobalKeyMap");
+        assert_eq!(
+            action_text(global, CTRL_SHIFT_F12_KEY),
+            CTRL_SHIFT_F12_HEX,
+            "GlobalKeyMap must forward Ctrl+Shift+F12 as the legacy modified-function-key sequence ESC[24;6~ so the editor's Go to Declaration chord reaches croft as F(12) + SHIFT + CONTROL; Declaration moved here off the bare Shift+F12 it once held when Go to References took that VS Code default, and the forwarder is installed defensively so a future iTerm2 default cannot swallow the chord"
         );
     }
 

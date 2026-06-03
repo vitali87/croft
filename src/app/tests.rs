@@ -9541,25 +9541,59 @@ fn go_to_definition_key_is_f12_without_shift() {
 }
 
 #[test]
-fn go_to_declaration_key_is_shift_f12() {
-    assert!(is_go_to_declaration_key(key(
+fn go_to_references_key_is_shift_f12() {
+    // VS Code's real binding: Shift+F12 = Go to References.
+    assert!(is_go_to_references_key(key(
         KeyCode::F(12),
         KeyModifiers::SHIFT
     )));
-    // Plain F12 is Definition, not Declaration.
+    // Plain F12 is Definition, not References.
+    assert!(!is_go_to_references_key(key(
+        KeyCode::F(12),
+        KeyModifiers::NONE
+    )));
+    // Ctrl+Shift+F12 is Declaration, not References; the Ctrl bit must split
+    // them when both Shift and Ctrl are reported.
+    assert!(!is_go_to_references_key(key(
+        KeyCode::F(12),
+        KeyModifiers::SHIFT | KeyModifiers::CONTROL
+    )));
+    // Cmd+F12 is Implementations.
+    assert!(!is_go_to_references_key(key(
+        KeyCode::F(12),
+        KeyModifiers::SHIFT | KeyModifiers::SUPER
+    )));
+    assert!(!is_go_to_references_key(key(
+        KeyCode::F(2),
+        KeyModifiers::SHIFT
+    )));
+}
+
+#[test]
+fn go_to_declaration_key_is_ctrl_shift_f12() {
+    // Declaration moved off bare Shift+F12 (now References) to Ctrl+Shift+F12.
+    assert!(is_go_to_declaration_key(key(
+        KeyCode::F(12),
+        KeyModifiers::SHIFT | KeyModifiers::CONTROL
+    )));
+    // Plain F12 is Definition.
     assert!(!is_go_to_declaration_key(key(
         KeyCode::F(12),
         KeyModifiers::NONE
     )));
-    // Ctrl+F12 is Type Definition, not Declaration; the two must not collide
-    // when both modifiers are reported.
+    // Bare Shift+F12 is now References, not Declaration.
+    assert!(!is_go_to_declaration_key(key(
+        KeyCode::F(12),
+        KeyModifiers::SHIFT
+    )));
+    // Ctrl+F12 (no Shift) is Type Definition, not Declaration.
     assert!(!is_go_to_declaration_key(key(
         KeyCode::F(12),
         KeyModifiers::CONTROL
     )));
     assert!(!is_go_to_declaration_key(key(
         KeyCode::F(2),
-        KeyModifiers::SHIFT
+        KeyModifiers::SHIFT | KeyModifiers::CONTROL
     )));
 }
 
@@ -9569,7 +9603,7 @@ fn go_to_type_definition_key_is_ctrl_f12() {
         KeyCode::F(12),
         KeyModifiers::CONTROL
     )));
-    // Plain F12 (Definition) and Shift+F12 (Declaration) are not Type Definition.
+    // Plain F12 (Definition) and Shift+F12 (References) are not Type Definition.
     assert!(!is_go_to_type_definition_key(key(
         KeyCode::F(12),
         KeyModifiers::NONE
@@ -9577,6 +9611,11 @@ fn go_to_type_definition_key_is_ctrl_f12() {
     assert!(!is_go_to_type_definition_key(key(
         KeyCode::F(12),
         KeyModifiers::SHIFT
+    )));
+    // Ctrl+Shift+F12 is Declaration, not Type Definition.
+    assert!(!is_go_to_type_definition_key(key(
+        KeyCode::F(12),
+        KeyModifiers::SHIFT | KeyModifiers::CONTROL
     )));
     assert!(!is_go_to_type_definition_key(key(
         KeyCode::F(11),
@@ -9590,7 +9629,7 @@ fn go_to_implementation_key_is_cmd_f12() {
         KeyCode::F(12),
         KeyModifiers::SUPER
     )));
-    // Plain F12 (Definition), Shift+F12 (Declaration) and Ctrl+F12 (Type
+    // Plain F12 (Definition), Shift+F12 (References) and Ctrl+F12 (Type
     // Definition) are not Implementations.
     assert!(!is_go_to_implementation_key(key(
         KeyCode::F(12),
@@ -9616,7 +9655,10 @@ fn implementation_picker_lists_every_target_as_a_jump_item() {
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     let a = tmp.path().join("foo.rs");
     let b = tmp.path().join("sub").join("bar.rs");
-    app.open_implementation_picker(vec![(a.clone(), 4, 2), (b.clone(), 0, 0)]);
+    app.open_location_picker(
+        vec![(a.clone(), 4, 2), (b.clone(), 0, 0)],
+        "implementations",
+    );
 
     let menu = app
         .context_menu
@@ -9660,8 +9702,12 @@ fn shortcut_for_returns_expected_shortcuts_for_editor_symbol_actions() {
         Some("F12")
     );
     assert_eq!(
-        shortcut_for(&MenuAction::GoToDeclarationAt { row: 0, col: 0 }),
+        shortcut_for(&MenuAction::GoToReferencesAt { row: 0, col: 0 }),
         Some("⇧F12")
+    );
+    assert_eq!(
+        shortcut_for(&MenuAction::GoToDeclarationAt { row: 0, col: 0 }),
+        Some("⌃⇧F12")
     );
     assert_eq!(
         shortcut_for(&MenuAction::GoToTypeDefinitionAt { row: 0, col: 0 }),

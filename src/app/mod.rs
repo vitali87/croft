@@ -359,10 +359,18 @@ enum MenuAction {
         row: usize,
         col: usize,
     },
+    /// Editor body: LSP "Go to References" of the symbol at buffer `(row, col)`.
+    /// Finds every use of the symbol project-wide (declaration included, like VS
+    /// Code); the server almost always returns many, which are offered as a
+    /// picker built from `GoToLocation` items.
+    GoToReferencesAt {
+        row: usize,
+        col: usize,
+    },
     /// Jump straight to an already-resolved location (LSP line/character). Used
-    /// for the entries of the multi-result "Go to Implementations" picker, where
-    /// each row is one concrete implementation; selecting it records nav history
-    /// and opens the file at that position.
+    /// for the entries of the multi-result "Go to Implementations" / "Go to
+    /// References" pickers, where each row is one location; selecting it records
+    /// nav history and opens the file at that position.
     GoToLocation {
         path: PathBuf,
         line: u32,
@@ -391,7 +399,8 @@ fn shortcut_for(action: &MenuAction) -> Option<&'static str> {
         MenuAction::RenameSymbolAt { .. } => Some("F2"),
         MenuAction::ChangeAllOccurrencesAt { .. } => Some("⌘F2"),
         MenuAction::GoToDefinitionAt { .. } => Some("F12"),
-        MenuAction::GoToDeclarationAt { .. } => Some("⇧F12"),
+        MenuAction::GoToReferencesAt { .. } => Some("⇧F12"),
+        MenuAction::GoToDeclarationAt { .. } => Some("⌃⇧F12"),
         MenuAction::GoToTypeDefinitionAt { .. } => Some("⌃F12"),
         MenuAction::GoToImplementationAt { .. } => Some("⌘F12"),
         _ => None,
@@ -854,6 +863,7 @@ pub struct App {
     declaration_request_id: Option<u64>,
     type_definition_request_id: Option<u64>,
     implementation_request_id: Option<u64>,
+    references_request_id: Option<u64>,
     rename_request_id: Option<u64>,
     nav: NavHistory,
     editor_vim_chord: EditorVimChord,
@@ -1420,6 +1430,7 @@ impl App {
             declaration_request_id: None,
             type_definition_request_id: None,
             implementation_request_id: None,
+            references_request_id: None,
             nav: NavHistory::default(),
         })
     }
@@ -2504,16 +2515,58 @@ impl App {
             }
             // Many implementors: offer a picker rather than silently choosing
             // the first. This 1:many case is the whole point of the feature.
-            _ => self.open_implementation_picker(targets),
+            _ => self.open_location_picker(targets, "implementations"),
         }
         true
     }
 
-    /// Build the multi-implementation picker as a `ContextMenu` anchored at the
-    /// editor cursor: one row per implementor, labelled `relative/path:line`,
-    /// each carrying a `GoToLocation` that jumps on select. Reuses the context
-    /// menu's existing keyboard (arrows + Enter) and mouse handling.
-    fn open_implementation_picker(&mut self, targets: Vec<(PathBuf, u32, u32)>) {
+    pub fn drain_lsp_references(&mut self) -> bool {
+        let mut targets: Vec<(PathBuf, u32, u32)> = Vec::new();
+        let mut unsupported = false;
+        let mut responded = false;
+        {
+            let Some(lsp) = self.lsp.as_ref() else {
+                return false;
+            };
+            while let Some(result) = lsp.drain_references() {
+                if Some(result.request_id) != self.references_request_id {
+                    continue;
+                }
+                targets = result.targets;
+                unsupported = result.unsupported;
+                responded = true;
+            }
+        }
+        if !responded {
+            return false;
+        }
+        if unsupported {
+            self.status =
+                String::from("Go to References: not supported by this file's language server");
+            return true;
+        }
+        match targets.len() {
+            0 => self.status = String::from("No references found"),
+            // A symbol used exactly once: jump straight there like Go to
+            // Definition rather than pop a one-row picker.
+            1 => {
+                let (path, line, col) = targets.into_iter().next().expect("len == 1");
+                self.go_to_definition(path, line, col);
+            }
+            // The common case: a symbol used in many places. Offer every use as
+            // a picker, exactly like Go to Implementations.
+            _ => self.open_location_picker(targets, "references"),
+        }
+        true
+    }
+
+    /// Build a multi-location picker as a `ContextMenu` anchored at the editor
+    /// cursor: one row per target, labelled `relative/path:line`, each carrying a
+    /// `GoToLocation` that jumps on select. Reuses the context menu's existing
+    /// keyboard (arrows + Enter) and mouse handling. Shared by Go to
+    /// Implementations and Go to References; `noun` is the status-line plural
+    /// ("implementations" / "references").
+    fn open_location_picker(&mut self, targets: Vec<(PathBuf, u32, u32)>, noun: &str) {
         let root = self.tree.root.clone();
         let items: Vec<(String, MenuAction)> = targets
             .into_iter()
@@ -2526,7 +2579,7 @@ impl App {
                 (label, MenuAction::GoToLocation { path, line, col })
             })
             .collect();
-        self.status = format!("{} implementations", items.len());
+        self.status = format!("{} {noun}", items.len());
         let origin = self.editor.cursor_screen_pos().unwrap_or((
             self.editor.last_full_area.x + 1,
             self.editor.last_full_area.y + 1,
@@ -2662,6 +2715,23 @@ impl App {
         self.implementation_request_id = Some(id);
     }
 
+    /// Request the LSP references of the symbol at the current cursor (buffer)
+    /// position. Used by the editor right-click "Go to References" item and the
+    /// `⇧F12` keybinding. The server almost always returns many uses, which
+    /// `drain_lsp_references` then offers as a picker.
+    fn request_references_at_cursor(&mut self) {
+        let row = self.editor.cursor_row;
+        let col = self.editor.cursor_col;
+        let Some(path) = self.editor.path.clone() else {
+            return;
+        };
+        let Some(lsp) = self.lsp.as_mut() else {
+            return;
+        };
+        let id = lsp.request_references(path, row as u32, col as u32);
+        self.references_request_id = Some(id);
+    }
+
     /// Whether the current editor file's language server implements
     /// `textDocument/declaration`. Drives whether the right-click menu shows the
     /// "Go to Declaration" row. Unknown (server not yet spawned) or no server is
@@ -2724,6 +2794,27 @@ impl App {
         self.lsp
             .as_ref()
             .and_then(|lsp| lsp.language_supports_implementation(lang))
+            .unwrap_or(false)
+    }
+
+    /// Whether the current editor file's language server implements
+    /// `textDocument/references`. Drives whether the right-click menu shows the
+    /// "Go to References" row. Unknown (server not yet spawned) or no server is
+    /// treated as unsupported, so the row only appears once support is confirmed.
+    fn editor_language_supports_references(&self) -> bool {
+        let Some(lang) = self
+            .editor
+            .path
+            .as_deref()
+            .and_then(|p| p.extension())
+            .and_then(|e| e.to_str())
+            .and_then(crate::lsp::Language::from_extension)
+        else {
+            return false;
+        };
+        self.lsp
+            .as_ref()
+            .and_then(|lsp| lsp.language_supports_references(lang))
             .unwrap_or(false)
     }
 
@@ -5980,10 +6071,11 @@ impl App {
             self.start_change_all_occurrences();
             return;
         }
-        // Go to Definition (F12) / Go to Declaration (Shift+F12), the VS Code
-        // F12-family bindings, also need a real text buffer. Both are no-ops on
-        // read-only diff / sheet / image tabs; the keystroke is still swallowed
-        // so it never leaks into the buffer.
+        // Go to Definition (F12) / References (Shift+F12) / Type Definition
+        // (Ctrl+F12) / Implementations (Cmd+F12) / Declaration (Ctrl+Shift+F12),
+        // the VS Code F12-family bindings, also need a real text buffer. All are
+        // no-ops on read-only diff / sheet / image tabs; the keystroke is still
+        // swallowed so it never leaks into the buffer.
         if is_go_to_definition_key(key) {
             if self.editor.diff.is_none()
                 && self.editor.sheet.is_none()
@@ -6017,6 +6109,15 @@ impl App {
                 && self.editor.image.is_none()
             {
                 self.request_implementation_at_cursor();
+            }
+            return;
+        }
+        if is_go_to_references_key(key) {
+            if self.editor.diff.is_none()
+                && self.editor.sheet.is_none()
+                && self.editor.image.is_none()
+            {
+                self.request_references_at_cursor();
             }
             return;
         }
@@ -8685,6 +8786,16 @@ impl App {
                             MenuAction::GoToImplementationAt { row, col },
                         ));
                     }
+                    // "Go to References" is offered only when the server
+                    // implements `textDocument/references` (every server croft
+                    // ships does), placed last in the Go To group to mirror VS
+                    // Code's submenu order.
+                    if self.editor_language_supports_references() {
+                        items.push((
+                            String::from("Go to References"),
+                            MenuAction::GoToReferencesAt { row, col },
+                        ));
+                    }
                     items.push((
                         String::from("Rename Symbol"),
                         MenuAction::RenameSymbolAt { row, col },
@@ -9828,6 +9939,12 @@ impl App {
                 self.editor.cursor_col = col;
                 self.focus_pane(Pane::Editor);
                 self.request_implementation_at_cursor();
+            }
+            MenuAction::GoToReferencesAt { row, col } => {
+                self.editor.cursor_row = row;
+                self.editor.cursor_col = col;
+                self.focus_pane(Pane::Editor);
+                self.request_references_at_cursor();
             }
             MenuAction::GoToLocation { path, line, col } => {
                 self.go_to_definition(path, line, col);
@@ -11263,14 +11380,31 @@ fn is_go_to_definition_key(key: KeyEvent) -> bool {
         && !key.modifiers.contains(KeyModifiers::SUPER)
 }
 
-/// Editor-pane Go to Declaration: `Shift+F12`. VS Code leaves Declaration
-/// unbound, so croft assigns it within the F12 navigation family (Shift being
-/// the reliably-distinguishable modifier) rather than ship a menu row with no
-/// accelerator.
-fn is_go_to_declaration_key(key: KeyEvent) -> bool {
+/// Editor-pane Go to References: `Shift+F12`, VS Code's real binding for this
+/// action. This is the chord croft previously gave to Go to Declaration; with
+/// References taking its rightful VS Code default, Declaration moved one
+/// modifier over to `Ctrl+Shift+F12`. References therefore requires F12 with
+/// Shift held but neither Ctrl (that is Declaration) nor Super (Implementations).
+fn is_go_to_references_key(key: KeyEvent) -> bool {
     matches!(key.code, KeyCode::F(12))
         && key.modifiers.contains(KeyModifiers::SHIFT)
         && !key.modifiers.contains(KeyModifiers::CONTROL)
+        && !key.modifiers.contains(KeyModifiers::SUPER)
+}
+
+/// Editor-pane Go to Declaration: `Ctrl+Shift+F12`. VS Code leaves Declaration
+/// unbound, so croft assigns it within the F12 navigation family. It moved off
+/// the bare `Shift+F12` it once held when Go to References (added later) claimed
+/// that VS Code default, so Declaration now needs both Shift and Ctrl (Super
+/// would be Implementations). iTerm2 emits `CSI 24 ; 6 ~` for Ctrl+Shift+F12,
+/// which crossterm decodes to `F(12) + SHIFT + CONTROL`; `iterm2.rs` also
+/// installs a defensive GlobalKeyMap forwarder emitting exactly those bytes so a
+/// future iTerm2 default cannot swallow the chord.
+fn is_go_to_declaration_key(key: KeyEvent) -> bool {
+    matches!(key.code, KeyCode::F(12))
+        && key.modifiers.contains(KeyModifiers::SHIFT)
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+        && !key.modifiers.contains(KeyModifiers::SUPER)
 }
 
 /// Editor-pane Go to Type Definition: `Ctrl+F12`. VS Code leaves Type
@@ -12541,6 +12675,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let declaration_changed = app.drain_lsp_declaration();
         let type_definition_changed = app.drain_lsp_type_definition();
         let implementation_changed = app.drain_lsp_implementation();
+        let references_changed = app.drain_lsp_references();
         let rename_changed = app.drain_lsp_rename();
         let sysmon_changed = app.drain_sysmon();
         // Surface the managed TypeScript-server install progress in the status
@@ -12578,6 +12713,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             || declaration_changed
             || type_definition_changed
             || implementation_changed
+            || references_changed
             || rename_changed
             || install_status_changed
             || sysmon_changed;

@@ -13,10 +13,10 @@ use lsp_types::{
     ClientCapabilities, CompletionContext, CompletionParams, CompletionResponse,
     CompletionTriggerKind, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
     DidOpenTextDocumentParams, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverParams,
-    InitializeParams, InitializedParams, PartialResultParams, Position, RenameParams,
-    ServerCapabilities, TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem,
-    TextDocumentPositionParams, Url, VersionedTextDocumentIdentifier, WorkDoneProgressParams,
-    WorkspaceEdit, WorkspaceFolder,
+    InitializeParams, InitializedParams, Location, PartialResultParams, Position, ReferenceContext,
+    ReferenceParams, RenameParams, ServerCapabilities, TextDocumentContentChangeEvent,
+    TextDocumentIdentifier, TextDocumentItem, TextDocumentPositionParams, Url,
+    VersionedTextDocumentIdentifier, WorkDoneProgressParams, WorkspaceEdit, WorkspaceFolder,
 };
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
@@ -360,6 +360,34 @@ impl LspClient {
             })
             .await
             .context("implementation")
+    }
+
+    pub async fn references(
+        &mut self,
+        uri: Url,
+        line: u32,
+        character: u32,
+    ) -> Result<Option<Vec<Location>>> {
+        // `textDocument/references` is the odd one out of the navigation family:
+        // it takes `ReferenceParams` (not `GotoDefinitionParams`) and returns a
+        // flat `Vec<Location>` rather than a `GotoDefinitionResponse`, so it has
+        // its own params and its own `reference_locations` mapper in the manager.
+        // `include_declaration: true` matches VS Code's "Go to References", whose
+        // peek list includes the declaration site alongside every use.
+        self.server
+            .references(ReferenceParams {
+                text_document_position: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri },
+                    position: Position { line, character },
+                },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+                context: ReferenceContext {
+                    include_declaration: true,
+                },
+            })
+            .await
+            .context("references")
     }
 
     pub async fn rename(
