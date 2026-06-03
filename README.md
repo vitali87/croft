@@ -25,14 +25,14 @@ The non-negotiables that shape every decision in croft:
 * **Bottom right pane (terminal):** a real interactive shell, your `$SHELL` running on a real PTY.
 * All three panes resize by dragging the seams between them.
 
-Built on [ratatui](https://ratatui.rs/) + [crossterm](https://github.com/crossterm-rs/crossterm), with [portable-pty](https://docs.rs/portable-pty/) for the embedded shell, [vt100](https://docs.rs/vt100/) for terminal-state parsing, [tree-sitter](https://tree-sitter.github.io/tree-sitter/) for incremental, AST-based syntax highlighting, [calamine](https://docs.rs/calamine/) for spreadsheet parsing, and the iTerm2 OSC 1337 inline-image protocol for image / PDF previews.
+Built on [ratatui](https://ratatui.rs/) + [crossterm](https://github.com/crossterm-rs/crossterm), with [portable-pty](https://docs.rs/portable-pty/) for the embedded shell, [alacritty_terminal](https://docs.rs/alacritty_terminal/) for terminal-state parsing, [tree-sitter](https://tree-sitter.github.io/tree-sitter/) for incremental, AST-based syntax highlighting, [calamine](https://docs.rs/calamine/) for spreadsheet parsing, and the iTerm2 OSC 1337 inline-image protocol for image / PDF previews.
 
 ## Requirements
 
 | Requirement | Why |
 |-------------|-----|
 | macOS or Linux | The PTY layer uses POSIX `forkpty`. Windows is not yet supported. |
-| Rust 1.78+ stable | To compile the binary. |
+| Rust 1.85+ stable | To compile the binary (the crate uses edition 2024, stabilized in Rust 1.85). |
 | A Nerd Font as your terminal font | The file explorer icons are Private Use Area glyphs (Codicons, Devicons, Seti). Without a Nerd Font, icons render as `[?]` boxes. |
 | A 256 color or truecolor terminal | macOS Terminal.app, iTerm2, Alacritty, kitty, WezTerm, Ghostty all qualify. |
 | iTerm2, WezTerm, Ghostty, or kitty (optional) | Required for inline image / PDF / sheet preview rendering via OSC 1337. Other terminals fall back to a metadata header line so the feature is still informative. |
@@ -105,7 +105,7 @@ croft setup-terminal --help
 | `Ctrl+q` | Quit |
 | `F1` | Open the shortcuts modal (every binding grouped by pane, scrollable) |
 | `F6` | Cycle focus across panes (tree → editor → terminal → tree) |
-| `Ctrl+b` | Toggle the file tree / side panel |
+| `Ctrl+b` / `Cmd+b` | Toggle the primary side bar (left pane) visibility, matching VS Code's "Toggle Primary Side Bar" |
 | `Ctrl+j` | Toggle the terminal pane |
 | `Ctrl+Shift+j` | Maximize the terminal pane (collapses the editor / welcome to zero rows so the terminal fills the right column next to the Explorer; press again to restore the previous split) |
 | `Ctrl+p` (or `Cmd+p` with the iTerm2 setup below) | Quick Open: fuzzy-search workspace files by name and jump to the picked file (auto-expands the Explorer to reveal it) |
@@ -188,6 +188,7 @@ croft setup-terminal --help
 | Hover (300 ms dwell) | Show the LSP hover popup for the symbol under the pointer |
 | Right-click | Editor symbol menu: Go to Definition, Go to Declaration, Go to Type Definition, Go to Implementations, Rename Symbol, Change All Occurrences |
 | `Cmd`+`E` | Toggle native modal (vim) editing for the editor pane (see below) |
+| `Ctrl`+`W` / `Cmd`+`W` | Close the active editor tab (no-op on the last tab). The `Cmd` chord reaches croft only after `croft setup-iterm2`: macOS otherwise binds it to iTerm2's File → Close, which closes the session and quits iTerm2 |
 
 ### Editor: vim mode (modal editing)
 
@@ -244,10 +245,10 @@ Tabs are read-only. Every keystroke is swallowed so a stray key cannot corrupt a
 | Any key | Forwarded to the shell PTY (arrows, `Ctrl+letter`, `Alt+x`, function keys all translated to the proper VT escape sequences) |
 | Mouse drag | Select text; selection stays highlighted until you copy or click elsewhere |
 | Mouse wheel | Scroll through 5000 rows of scrollback. In alternate-screen mode (vim / less / htop) the wheel forwards arrow keys so the running app handles it. Any keystroke snaps back to the live bottom. |
-| `Ctrl+Shift+c` (or `Cmd+c` with kitty-protocol terminals) | Explicit copy of the terminal's current selection |
-| `Ctrl+Shift+t` | Open another terminal next to the current one (works from any pane). Each terminal has its own PTY, scrollback, and selection. |
-| `Ctrl+Shift+w` | Close the active terminal (no-op when only one is left; use `Ctrl+J` to hide the pane). |
-| `Ctrl+Shift+]` | Cycle to the next terminal in the pane. Click any terminal to switch focus directly. |
+| `Cmd+C` / `Ctrl+Shift+c` | Explicit copy of the terminal's current selection (`Cmd+C` reaches croft after `croft setup-iterm2`; native NSPasteboard locally, OSC 52 over SSH) |
+| `Cmd+T` / `Ctrl+Shift+t` | Open another terminal next to the current one (works from any pane). `Cmd+T` is the primary chord (reaches croft after `croft setup-iterm2`, which relocates iTerm2's New Tab to `Cmd+Ctrl+T`). Each terminal has its own PTY, scrollback, and selection. |
+| `Cmd+W` / `Ctrl+Shift+w` | Close the active terminal (no-op when only one is left; use `Ctrl+J` to hide the pane). `Cmd+W` is the primary chord (reaches croft after `croft setup-iterm2`); plain `Ctrl+W` is left alone so the shell's delete-word-backward keeps working. |
+| `Cmd+]` / `Cmd+[` | Cycle to the next / previous terminal in the pane (reaches croft after `croft setup-iterm2`, which relocates iTerm2's Next/Previous Pane to `Cmd+Opt+]` / `Cmd+Opt+[`). Click any terminal to switch focus directly. |
 
 ## iTerm2 setup for macOS users
 
@@ -271,10 +272,11 @@ This writes the default-profile font settings plus Croft's iTerm2 keyboard setup
 | `⌘⇧L` | `\x1b[76;10u` | Disconnect a remote session and drop back into the local croft |
 | `⌘⇧N` | `\x1b[78;10u` | Explorer "New folder" prompt (when the tree is focused) |
 | `⌃⇧J` | `\x1b[74;6u` | Maximize the terminal pane (collapses the editor / welcome; press again to restore the previous editor↔terminal split) |
-| `⌘V` | `\x1b[118;9u` in global and profile key maps | Read the system clipboard and paste into the focused editor, or into Search when Search is active |
+| `⌘V` | left on iTerm2's native Paste (bracketed paste); any legacy croft `⌘V` hex binding is removed | iTerm2 sends a bracketed paste; croft reads the system clipboard and routes it by focus into the editor, or into Search when Search is active. Works identically over SSH, which is why it is not remapped to CSI-u |
 | `⌥⌘R` | `\x1b[114;11u` | Reveal the selected Explorer entry in Finder (local macOS only) |
+| `⌘B` | `\x1b[98;9u` | Toggle the primary side bar (left pane), matching VS Code |
 
-It also moves the following iTerm2 / macOS menu shortcuts out of the way (each goes to `Cmd+Opt+<letter>` so the original iTerm2 action stays reachable on a chord croft does not use): **Edit → Find → Find Globally...** off `⌘⇧F`, **Edit → Paste** off `⌘V`, **Shell → Split Vertically with Same Profile** off `⌘D`, **Shell → Split Horizontally with Same Profile** off `⌘⇧D`, **Edit → Find Next / Find Previous / Jump to Selection**, **File → Print** off `⌘P`, **Window → Select Tab 1..9** off `⌘1..⌘9`, and the macOS **Help → Show Help Menu** off `⌘⇧/`. Fully quit iTerm2 with `⌘Q` and reopen it after setup; iTerm2 caches its plist while running.
+It also moves several iTerm2 / macOS menu shortcuts out of the way, each relocated to an unused alternate chord so the original iTerm2 action stays reachable. Most are relocated to an unused `Cmd`-based chord (typically `Cmd+Opt+<key>`): **Edit → Find → Find...** off `⌘F` (to `⌘⌥F`) and **Find Globally...** off `⌘⇧F` (to `⌘⌥⌃F`), **Shell → Split Vertically / Horizontally with Same Profile** off `⌘D` / `⌘⇧D`, **Edit → Find Next / Find Previous / Jump to Selection**, **File → Print** off `⌘P`, **Edit → Find → Use Selection for Find** off `⌘E`, **Edit → Copy / Cut / Select All / Undo** off `⌘C` / `⌘X` / `⌘A` / `⌘Z`, **Window → Select Tab 1..9** off `⌘1..⌘9`, and the macOS **Help → Show Help Menu** off `⌘⇧/`. A few go elsewhere because `Cmd+Opt+<key>` is taken: **File → Close** off `⌘W` (to `⌘⌃W`, since `⌘⌥W` is already "Close All Panes in Tab"), **Window → New Tab** off `⌘T` (to `⌘⌃T`), and **Shell → Previous / Next Pane** off `⌘[` / `⌘]` (to `⌘⌥[` / `⌘⌥]`). `⌘V` is deliberately left on iTerm2's native Paste. Fully quit iTerm2 with `⌘Q` and reopen it after setup; iTerm2 caches its plist while running.
 
 ### 1. Right-click reaches croft
 
@@ -288,7 +290,9 @@ Terminal.app does not expose this toggle, so right-click is iTerm2-only.
 
 `Ctrl+S` saves out of the box in any terminal. Getting `Cmd+S` to save in croft on macOS takes one extra step that no terminal app can fix on its own. macOS reserves the Cmd modifier for application menus; both Terminal.app and iTerm2 follow this rule. iTerm2 ≥3.5 supports the kitty keyboard protocol (croft negotiates `\x1b[>3u` on startup), but iTerm2 still does not deliver `Cmd+letter` over CSI u even with **Apps can change how keys are reported** and **Report keys using CSI u** both enabled. Verified empirically.
 
-The standard fix is a one-line key mapping that rewrites `Cmd+letter` to the byte `Ctrl+letter` already sends. Croft's existing tested `Ctrl+S` handler does the rest.
+**`croft setup-iterm2` already does all of this for you** (it installs `⌘S` / `⌘C` / `⌘X` / `⌘Z` / `⌘A` and the rest as CSI-u GlobalKeyMap forwarders), so the manual recipe below is only needed if you choose not to run the setup command.
+
+The manual fix is a one-line key mapping per chord that rewrites `Cmd+letter` to the byte `Ctrl+letter` already sends. Croft's existing tested `Ctrl+S` handler does the rest.
 
 iTerm2 → Settings → **Profiles** → Default → **Keys** tab → **Key Mappings** sub-tab → click **+** → "Click to Set" → press **⌘S** → Action: **Send Hex Code** → Code: `0x13` → OK.
 
@@ -302,7 +306,7 @@ iTerm2 → Settings → **Profiles** → Default → **Keys** tab → **Key Mapp
 | `⌘Z` | `0x1a` | Undo the last editor edit |
 | `⌘A` | `0x01` | Select all in the focused pane (editor: select whole buffer). Without this map iTerm2 runs **Edit → Select All** on the whole iTerm2 window instead. |
 
-For `⌘⇧F` and `⌘V`, use `croft setup-iterm2`; it installs both mappings globally and into every profile.
+The sidebar-jump chords (`⌘⇧E` / `⌘⇧F` / `⌘⇧S` / `⌘⇧D` / `⌘⇧R`) and the rest of croft's Cmd chords are likewise installed by `croft setup-iterm2` globally and into every profile; `⌘V` is left on iTerm2's native Paste (see below).
 
 ### 3. Cmd+Shift+F to jump to the Search sidebar
 
@@ -404,7 +408,7 @@ What works:
 * File tree with expansion / collapse, multi-select (Shift+click range, Alt or Ctrl+click toggle), drag-and-drop file moves (Alt-drag for copy), explorer-scoped Cut / Copy / Paste, bulk delete to OS Trash with a single trash sound on macOS.
 * Right-click context menu with Cut, Copy, Paste, Rename, count-aware Delete, Reveal in Finder (local macOS only, omitted on remote SSH sessions where the host is headless), plus New File / New Folder on empty space.
 * Live filesystem watcher with a 50 ms polling fallback for missed startup or host events.
-* File open with tree-sitter highlighting (Rust, Python, JS, TS, TSX, JSON, TOML, YAML, Markdown, Go, HTML, CSS, Bash).
+* File open with tree-sitter highlighting (Rust, Python, JS, TS, TSX, JSON, TOML, YAML, Markdown, Go, HTML, CSS, Bash, C, C++).
 * Full editor write path: insert / delete / Enter / Tab / Backspace / save round-trip with `●` dirty marker, auto-reload on external write when the buffer is clean (across every open tab, not just the focused one), a save-conflict guard that refuses to clobber an external change to a dirty buffer until you press Cmd+S again to overwrite, native-clipboard copy / cut (OSC 52 fallback on remote), undo with intelligent edit-step coalescing.
 * Multi-cursor "Change All Occurrences" (`Cmd`/`Ctrl`+`F2`): selects every textual match of the word in the current file and edits them simultaneously as one undo step.
 * LSP "Rename Symbol" (`F2`): renames the identifier under the cursor across every file the language server reports, in-memory for open tabs and on disk for closed ones.
@@ -417,7 +421,7 @@ What works:
 * Welcome recents fetched live via the anonymous git protocol so the panel works behind shared egress IPs (Tailscale, corporate NAT) where the Bitbucket / GitHub REST APIs are rate-limited.
 * `setup-terminal` and `setup-iterm2` AppleScript / plist helpers.
 
-The repo ships 568 unit tests plus CLI integration tests; run with `cargo test`.
+The repo ships over 1,200 unit tests plus CLI integration tests; run with `cargo test`.
 
 Already working: the three-pane layout, file explorer, multi-tab editor with syntax highlighting, live embedded terminals, git status, fuzzy file finder, remote launch over SSH, and LSP-backed completion, diagnostics, hover, go-to-definition, go-to-declaration, and rename-symbol (Python, TypeScript/TSX, JavaScript, Rust, Go).
 
