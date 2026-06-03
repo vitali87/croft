@@ -35,7 +35,7 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 description: "Cycle focus across panes",
             },
             ShortcutEntry {
-                keys: "Ctrl+B",
+                keys: "Cmd/Ctrl+B",
                 description: "Toggle the sidebar",
             },
             ShortcutEntry {

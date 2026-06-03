@@ -4596,26 +4596,26 @@ impl App {
             self.handle_search_key(key);
             return Ok(());
         }
+        if is_sidebar_toggle_key(key) {
+            let was_visible = self.show_tree;
+            self.show_tree = !self.show_tree;
+            // Hiding the sidebar while Run-Debug was on screen: arm
+            // the same OSC-1337 image-cell evict gate that fires on
+            // a sidebar-view change. Without this the bug+play icon
+            // ghosts on top of the editor / terminal that fills the
+            // space the panel just vacated.
+            if was_visible
+                && !self.show_tree
+                && self.sidebar_view == SidebarView::RunDebug
+                && self.overlays.run_debug.was_emitted()
+            {
+                self.overlays.run_debug.request_clear();
+            }
+            return Ok(());
+        }
         match (key.code, key.modifiers) {
             (KeyCode::Char('q'), KeyModifiers::CONTROL) => {
                 self.quit = true;
-                return Ok(());
-            }
-            (KeyCode::Char('b'), KeyModifiers::CONTROL) => {
-                let was_visible = self.show_tree;
-                self.show_tree = !self.show_tree;
-                // Hiding the sidebar while Run-Debug was on screen: arm
-                // the same OSC-1337 image-cell evict gate that fires on
-                // a sidebar-view change. Without this the bug+play icon
-                // ghosts on top of the editor / terminal that fills the
-                // space the panel just vacated.
-                if was_visible
-                    && !self.show_tree
-                    && self.sidebar_view == SidebarView::RunDebug
-                    && self.overlays.run_debug.was_emitted()
-                {
-                    self.overlays.run_debug.request_clear();
-                }
                 return Ok(());
             }
             (KeyCode::F(6), _) => {
@@ -7031,7 +7031,8 @@ impl App {
             }
             return;
         }
-        // Ctrl+Shift+W: close the active terminal (no-op when only one is left).
+        // Cmd+W (or legacy Ctrl+Shift+W): close the active terminal (no-op when
+        // only one is left).
         if is_terminal_close_key(key) {
             if self.close_active_terminal() {
                 self.status = format!("Closed terminal: {} remaining", self.terminals.len());
@@ -10900,6 +10901,26 @@ fn is_cmd_shift_letter(key: KeyEvent, letter: char) -> bool {
     has_shift && has_ctrl_or_super
 }
 
+/// `Cmd+B` (macOS) / `Ctrl+B` (Linux): toggle the primary side bar (left
+/// pane) visibility, mirroring VS Code's "View: Toggle Primary Side Bar".
+/// Accepts SUPER *or* CONTROL so the chord behaves identically whether
+/// iTerm2 forwards `Cmd+B` as the CSI-u Super sequence (see `src/iterm2.rs`)
+/// or a raw `Ctrl+B` control byte arrives on a remote Linux session. SHIFT
+/// and ALT must not be held, so it never collides with a future bracketed
+/// or word-motion chord on `b`.
+fn is_sidebar_toggle_key(key: KeyEvent) -> bool {
+    let KeyCode::Char(c) = key.code else {
+        return false;
+    };
+    if !c.eq_ignore_ascii_case(&'b') {
+        return false;
+    }
+    if key.modifiers.contains(KeyModifiers::ALT) || key.modifiers.contains(KeyModifiers::SHIFT) {
+        return false;
+    }
+    key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::SUPER)
+}
+
 /// Returns true if the given key event should toggle the terminal pane.
 /// VS Code uses `Ctrl+`` ` `` (backtick); we use `Ctrl+J` to match its
 /// "Toggle Terminal Panel" shortcut, which is more reliable to type on
@@ -10970,7 +10991,10 @@ fn is_terminal_focus_key(key: KeyEvent) -> bool {
     key.modifiers.contains(KeyModifiers::SUPER) && key.modifiers.contains(KeyModifiers::SHIFT)
 }
 
-/// `Ctrl+Shift+W`: close the active terminal (no-op if it's the only one).
+/// `Cmd+W` (or legacy `Ctrl+Shift+W`): close the active terminal (no-op if
+/// it's the only one). Plain `Ctrl+W` is intentionally excluded so the shell's
+/// delete-word-backward keeps working; the close action requires either the
+/// Super (Cmd) modifier or the Ctrl+Shift pair.
 fn is_terminal_close_key(key: KeyEvent) -> bool {
     let KeyCode::Char(c) = key.code else {
         return false;
@@ -10978,7 +11002,11 @@ fn is_terminal_close_key(key: KeyEvent) -> bool {
     if !c.eq_ignore_ascii_case(&'w') {
         return false;
     }
-    key.modifiers.contains(KeyModifiers::CONTROL) && key.modifiers.contains(KeyModifiers::SHIFT)
+    let cmd_w =
+        key.modifiers.contains(KeyModifiers::SUPER) || key.modifiers.contains(KeyModifiers::META);
+    let ctrl_shift_w = key.modifiers.contains(KeyModifiers::CONTROL)
+        && key.modifiers.contains(KeyModifiers::SHIFT);
+    cmd_w || ctrl_shift_w
 }
 
 /// `Cmd+]`: cycle to the next (right) terminal in the pane. iTerm2's

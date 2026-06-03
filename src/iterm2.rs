@@ -202,6 +202,17 @@ const CTRL_SHIFT_J_HEX: &str = "0x1b 0x5b 0x37 0x34 0x3b 0x36 0x75";
 /// item, so no NSUserKeyEquivalents relocation is needed.
 const CMD_F12_KEY: &str = "0xf70f-0x100000";
 const CMD_F12_HEX: &str = "0x1b 0x5b 0x32 0x34 0x3b 0x39 0x7e";
+/// `Cmd+B` — toggle the primary side bar (croft's `is_sidebar_toggle_key`),
+/// matching VS Code's "View: Toggle Primary Side Bar" macOS default. iTerm2
+/// does not bind the bare chord to any default menu item (newer builds only
+/// *suggest* Cmd+B as an opt-in leader key, which the user must enable), so
+/// like Cmd+F12 no NSUserKeyEquivalents relocation is needed for this
+/// forwarder to win. Codepoint 'b' (0x62 = 98), virtualKeyCode `kVK_ANSI_B`
+/// = 0x0b, modifier mask 0x100000 (Cmd). CSI-u `ESC [ 98 ; 9 u` (modifier
+/// byte 9 = 1 base + Super(8)), which crossterm decodes back to
+/// `KeyEvent { code: Char('b'), modifiers: SUPER }`.
+const CMD_B_KEY: &str = "0x62-0x100000-0xb";
+const CMD_B_HEX: &str = "0x1b 0x5b 0x39 0x38 0x3b 0x39 0x75";
 /// `Cmd+P`: VS Code-style Quick Open file finder. macOS binds Cmd+P to the
 /// standard File > Print menu item across virtually every app (iTerm2
 /// included), so AppKit catches the chord at the menu layer before
@@ -219,6 +230,23 @@ const PRINT_MENU_KEY: &str = "Print";
 /// Cmd+Opt+P. Unbound by default in iTerm2; gives the user a path back to
 /// the Print dialog when they need it without sacrificing the file finder.
 const PRINT_MENU_EQUIV: &str = "@~p";
+/// `Cmd+W` — close the active editor tab (croft's `is_close_tab_key`). iTerm2's
+/// File menu binds the bare chord to "Close" (`closeCurrentSession:`), which
+/// closes the current session and quits iTerm2 when it is the last one; that
+/// menu key-equivalent is resolved by AppKit ahead of iTerm2's GlobalKeyMap,
+/// so without relocating it the chord never reaches croft. Codepoint 'w'
+/// (0x77 = 119), virtualKeyCode `kVK_ANSI_W` = 0xd, modifier mask 0x100000
+/// (Cmd). CSI-u `ESC [ 119 ; 9 u` (modifier byte 9 = 1 base + Super(8)), which
+/// crossterm decodes back to `KeyEvent { code: Char('w'), modifiers: SUPER }`.
+const CMD_W_KEY: &str = "0x77-0x100000-0xd";
+const CMD_W_HEX: &str = "0x1b 0x5b 0x31 0x31 0x39 0x3b 0x39 0x75";
+/// iTerm2's File > "Close" menu item title (MainMenu.xib id 1184) and the chord
+/// it is relocated to so croft can claim the bare Cmd+W. Cmd+Opt+W (`@~w`) is
+/// already "Close All Panes in Tab" and Cmd+Shift+W is "Close Terminal Window",
+/// so the close-session action moves to Cmd+Ctrl+W (`@^w`), unbound by default
+/// and mirroring the `New Tab -> @^t` relocation.
+const CLOSE_SESSION_MENU_KEY: &str = "Close";
+const CLOSE_SESSION_MENU_EQUIV: &str = "@^w";
 /// Cmd+0..Cmd+9 forward as CSI-u so the editor's vim chord can use them
 /// as count digits (e.g. `Cmd+5 Cmd+g g` jumps to line 5). Without these,
 /// iTerm2 catches Cmd+digit for its own "Select Tab N" action and croft
@@ -389,6 +417,19 @@ pub fn apply_croft_key_settings(plist: &mut Value) -> Result<(), ITerm2Error> {
     // is consulted. Cmd+Opt+P keeps Print reachable on a chord croft
     // does not use.
     set_string(menu, PRINT_MENU_KEY, PRINT_MENU_EQUIV.to_string());
+    // Relocate iTerm2's File > "Close" (closeCurrentSession:) off bare Cmd+W so
+    // croft's editor close-tab chord reaches the app instead of closing the
+    // iTerm2 session (which quits iTerm2 when it is the last one). The menu
+    // key-equivalent layer is consulted before GlobalKeyMap, so the forwarder
+    // alone is not enough; the menu item must move. Cmd+Opt+W is already
+    // iTerm2's "Close All Panes in Tab" and Cmd+Shift+W is "Close Terminal
+    // Window", so the close-session action moves to Cmd+Ctrl+W, unbound by
+    // default and reachable.
+    set_string(
+        menu,
+        CLOSE_SESSION_MENU_KEY,
+        CLOSE_SESSION_MENU_EQUIV.to_string(),
+    );
     // Relocate AppKit's Edit > Find > "Use Selection for Find" off Cmd+E so
     // croft's native-modal (vim) toggle can receive the chord. Like Cmd+F in
     // the same submenu, the bare chord is otherwise claimed at the menu layer
@@ -467,6 +508,7 @@ pub fn apply_croft_key_settings(plist: &mut Value) -> Result<(), ITerm2Error> {
         (CMD_O_KEY, CMD_O_HEX),
         (CMD_E_KEY, CMD_E_HEX),
         (CMD_P_KEY, CMD_P_HEX),
+        (CMD_W_KEY, CMD_W_HEX),
         (CMD_SHIFT_G_KEY, CMD_SHIFT_G_HEX),
         (CMD_SHIFT_O_KEY, CMD_SHIFT_O_HEX),
         (CMD_SHIFT_E_KEY, CMD_SHIFT_E_HEX),
@@ -482,6 +524,7 @@ pub fn apply_croft_key_settings(plist: &mut Value) -> Result<(), ITerm2Error> {
         (CMD_OPT_R_KEY, CMD_OPT_R_HEX),
         (CTRL_SHIFT_J_KEY, CTRL_SHIFT_J_HEX),
         (CMD_F12_KEY, CMD_F12_HEX),
+        (CMD_B_KEY, CMD_B_HEX),
     ] {
         global.insert(key.into(), send_hex_action(hex, 0));
     }
@@ -852,6 +895,53 @@ mod tests {
                 .and_then(|v| v.as_string()),
             Some(USE_SELECTION_FOR_FIND_MENU_EQUIV),
             "iTerm2's Use Selection for Find must be relocated off bare Cmd+E so croft's vim-mode toggle can claim the chord; @~e = Cmd+Opt+E keeps the find-from-selection action reachable on a chord croft does not use"
+        );
+    }
+
+    #[test]
+    fn apply_croft_key_settings_forwards_cmd_b_for_sidebar_toggle() {
+        let mut plist = synth_plist("GUID-1", &["GUID-1"]);
+        apply_croft_key_settings(&mut plist).unwrap();
+        let top = plist.as_dictionary().unwrap();
+        let global = dict_in(top, "GlobalKeyMap");
+        assert_eq!(
+            action_text(global, CMD_B_KEY),
+            CMD_B_HEX,
+            "GlobalKeyMap must forward Cmd+B as a CSI-u sequence so croft's `is_sidebar_toggle_key` fires and toggles the primary side bar, matching VS Code's Cmd+B. Without it the chord never reaches croft and the side bar can only be toggled with the raw Ctrl+B control byte"
+        );
+    }
+
+    #[test]
+    fn apply_croft_key_settings_forwards_cmd_w_for_close_tab() {
+        let mut plist = synth_plist("GUID-1", &["GUID-1"]);
+        apply_croft_key_settings(&mut plist).unwrap();
+        let top = plist.as_dictionary().unwrap();
+        let global = dict_in(top, "GlobalKeyMap");
+        assert_eq!(
+            action_text(global, CMD_W_KEY),
+            CMD_W_HEX,
+            "GlobalKeyMap must forward Cmd+W as a CSI-u sequence so croft's `is_close_tab_key` fires and closes the active editor tab. Without it, iTerm2's File > Close (closeCurrentSession:) owns the bare chord at the menu layer and the keystroke closes the iTerm2 session, quitting iTerm2 when it is the last one, instead of reaching croft"
+        );
+    }
+
+    #[test]
+    fn apply_croft_key_settings_relocates_close_off_cmd_w() {
+        let mut plist = synth_plist("GUID-1", &["GUID-1"]);
+        apply_croft_key_settings(&mut plist).unwrap();
+        let top = plist.as_dictionary().unwrap();
+        let menu = dict_in(top, "NSUserKeyEquivalents");
+        let equiv = menu
+            .get(CLOSE_SESSION_MENU_KEY)
+            .and_then(|v| v.as_string())
+            .filter(|s| !s.is_empty());
+        assert!(
+            equiv.is_some(),
+            "iTerm2's File > Close must be relocated off bare Cmd+W (a non-empty NSUserKeyEquivalents entry) so croft's close-tab forwarder reaches the app instead of the menu layer closing the session"
+        );
+        assert_eq!(
+            equiv,
+            Some(CLOSE_SESSION_MENU_EQUIV),
+            "the relocation chord must be Cmd+Ctrl+W (@^w): Cmd+Opt+W is already iTerm2's \"Close All Panes in Tab\" (MainMenu.xib id 635) and Cmd+Shift+W is \"Close Terminal Window\" (id 598), so neither can be reused"
         );
     }
 

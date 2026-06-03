@@ -1245,6 +1245,26 @@ fn cmd_s_is_save_key() {
 }
 
 #[test]
+fn cmd_w_and_ctrl_shift_w_close_terminal_but_plain_ctrl_w_does_not() {
+    // Cmd+W is the primary terminal-close chord; Ctrl+Shift+W stays as a
+    // legacy fallback.
+    assert!(is_terminal_close_key(key(
+        KeyCode::Char('w'),
+        KeyModifiers::SUPER
+    )));
+    assert!(is_terminal_close_key(key(
+        KeyCode::Char('w'),
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT
+    )));
+    // Plain Ctrl+W must NOT close the terminal: it is the shell's
+    // delete-word-backward, and hijacking it would break readline editing.
+    assert!(!is_terminal_close_key(key(
+        KeyCode::Char('w'),
+        KeyModifiers::CONTROL
+    )));
+}
+
+#[test]
 fn shift_ctrl_s_is_save_key() {
     // Some terminals report capital S with Ctrl pressed.
     let mods = KeyModifiers::CONTROL | KeyModifiers::SHIFT;
@@ -6033,6 +6053,25 @@ fn cmd_shift_e_jumps_to_explorer_from_any_pane() {
         app.show_tree,
         "Cmd+Shift+E must un-collapse the sidebar if it was hidden"
     );
+}
+
+#[test]
+fn cmd_b_and_ctrl_b_toggle_the_primary_side_bar() {
+    // VS Code's "Toggle Primary Side Bar" is Cmd+B on macOS (Ctrl+B on
+    // Linux); croft accepts both so the chord behaves identically whether
+    // iTerm2 forwards Cmd+B as a Super CSI-u sequence or a raw Ctrl+B byte
+    // arrives over SSH. The sidebar starts visible.
+    let mut app = editor_app_with_lines(&["x"]);
+    assert!(app.show_tree, "sidebar starts visible");
+    app.handle_key(key(KeyCode::Char('b'), KeyModifiers::SUPER))
+        .unwrap();
+    assert!(!app.show_tree, "Cmd+B hides the side bar");
+    app.handle_key(key(KeyCode::Char('b'), KeyModifiers::SUPER))
+        .unwrap();
+    assert!(app.show_tree, "Cmd+B again shows it");
+    app.handle_key(key(KeyCode::Char('b'), KeyModifiers::CONTROL))
+        .unwrap();
+    assert!(!app.show_tree, "Ctrl+B toggles the same state");
 }
 
 #[test]
