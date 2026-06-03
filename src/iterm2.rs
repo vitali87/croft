@@ -156,6 +156,29 @@ const CMD_LBRACKET_KEY: &str = "0x5b-0x100000-0x21";
 const CMD_LBRACKET_HEX: &str = "0x1b 0x5b 0x39 0x31 0x3b 0x39 0x75";
 const CMD_RBRACKET_KEY: &str = "0x5d-0x100000-0x1e";
 const CMD_RBRACKET_HEX: &str = "0x1b 0x5b 0x39 0x33 0x3b 0x39 0x75";
+/// `Cmd+\` -> split the editor into two side-by-side columns (VS Code's
+/// `workbench.action.splitEditor`, croft's `is_editor_split_key`). Normal
+/// key, so the 3-part `char-modifiers-keycode` form like Cmd+T: '\' = 0x5c,
+/// Cmd modifier mask 0x100000, `kVK_ANSI_Backslash` = 0x2a. CSI-u
+/// `ESC [ 92 ; 9 u` (modifier byte 9 = 1 base + Super(8)), which crossterm
+/// decodes to `Char('\\') + SUPER`. Cmd+\ is not bound to any default
+/// macOS / iTerm2 menu item, so no NSUserKeyEquivalents relocation is needed.
+const CMD_BACKSLASH_KEY: &str = "0x5c-0x100000-0x2a";
+const CMD_BACKSLASH_HEX: &str = "0x1b 0x5b 0x39 0x32 0x3b 0x39 0x75";
+/// `Cmd+Opt+Left` / `Cmd+Opt+Right` -> move focus to the left / right
+/// editor group while split (croft's `is_focus_group_left_key` /
+/// `is_focus_group_right_key`). Arrows use the 2-part function-key form
+/// `0x<unicode>-0x<modmask>`: `NSLeftArrowFunctionKey` = 0xf702,
+/// `NSRightArrowFunctionKey` = 0xf703, Cmd+Opt mask 0x180000 (Cmd 0x100000
+/// | Opt 0x80000). Payload is the legacy modified-arrow sequence
+/// `ESC [ 1 ; 11 (D|C)` (modifier byte 11 = 1 base + Alt(2) + Super(8)),
+/// which crossterm decodes to `KeyCode::Left/Right + ALT | SUPER` - the
+/// same ALT|SUPER mask proven by `CMD_OPT_R` above, disjoint from the bare
+/// `Opt+Left/Right` word-motion the shell consumes.
+const CMD_OPT_LEFT_KEY: &str = "0xf702-0x180000";
+const CMD_OPT_LEFT_HEX: &str = "0x1b 0x5b 0x31 0x3b 0x31 0x31 0x44";
+const CMD_OPT_RIGHT_KEY: &str = "0xf703-0x180000";
+const CMD_OPT_RIGHT_HEX: &str = "0x1b 0x5b 0x31 0x3b 0x31 0x31 0x43";
 /// iTerm2 menu items that own bare `Cmd+[` / `Cmd+]`, relocated so the
 /// bracket forwarders above reach croft. Cmd+Opt+[ / Cmd+Opt+] keep pane
 /// navigation reachable.
@@ -542,6 +565,9 @@ pub fn apply_croft_key_settings(plist: &mut Value) -> Result<(), ITerm2Error> {
         (CMD_F12_KEY, CMD_F12_HEX),
         (CTRL_SHIFT_F12_KEY, CTRL_SHIFT_F12_HEX),
         (CMD_B_KEY, CMD_B_HEX),
+        (CMD_BACKSLASH_KEY, CMD_BACKSLASH_HEX),
+        (CMD_OPT_LEFT_KEY, CMD_OPT_LEFT_HEX),
+        (CMD_OPT_RIGHT_KEY, CMD_OPT_RIGHT_HEX),
     ] {
         global.insert(key.into(), send_hex_action(hex, 0));
     }
@@ -1156,6 +1182,37 @@ mod tests {
             action_text(global, CMD_OPT_R_KEY),
             CMD_OPT_R_HEX,
             "GlobalKeyMap must forward Cmd+Opt+R as a CSI-u sequence so croft's `is_tree_reveal_in_finder_key` fires and reveals the selected entry in Finder. Encoding: 'r' (codepoint 0x72 = 114) with kitty modifier byte 11 = 1 base + Alt(2) + Super(8), giving `ESC [ 114 ; 11 u` (decoded as ALT|SUPER, disjoint from plain Cmd+R = Rename)"
+        );
+    }
+
+    #[test]
+    fn apply_croft_key_settings_forwards_cmd_backslash_for_editor_split() {
+        let mut plist = synth_plist("GUID-1", &["GUID-1"]);
+        apply_croft_key_settings(&mut plist).unwrap();
+        let top = plist.as_dictionary().unwrap();
+        let global = dict_in(top, "GlobalKeyMap");
+        assert_eq!(
+            action_text(global, CMD_BACKSLASH_KEY),
+            CMD_BACKSLASH_HEX,
+            "GlobalKeyMap must forward Cmd+\\ as a CSI-u sequence so croft's `is_editor_split_key` fires and splits the editor side by side. Encoding: '\\' (codepoint 0x5c = 92) with kitty modifier byte 9 = 1 base + Super(8), giving `ESC [ 92 ; 9 u`"
+        );
+    }
+
+    #[test]
+    fn apply_croft_key_settings_forwards_cmd_opt_arrows_for_editor_group_focus() {
+        let mut plist = synth_plist("GUID-1", &["GUID-1"]);
+        apply_croft_key_settings(&mut plist).unwrap();
+        let top = plist.as_dictionary().unwrap();
+        let global = dict_in(top, "GlobalKeyMap");
+        assert_eq!(
+            action_text(global, CMD_OPT_LEFT_KEY),
+            CMD_OPT_LEFT_HEX,
+            "GlobalKeyMap must forward Cmd+Opt+Left as `ESC [ 1 ; 11 D` so croft's `is_focus_group_left_key` moves focus to the left editor group. Modifier byte 11 = 1 base + Alt(2) + Super(8), decoded as Left + ALT | SUPER, disjoint from the bare Opt+Left word-motion"
+        );
+        assert_eq!(
+            action_text(global, CMD_OPT_RIGHT_KEY),
+            CMD_OPT_RIGHT_HEX,
+            "GlobalKeyMap must forward Cmd+Opt+Right as `ESC [ 1 ; 11 C` so croft's `is_focus_group_right_key` moves focus to the right editor group"
         );
     }
 

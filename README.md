@@ -21,9 +21,9 @@ The non-negotiables that shape every decision in croft:
 ## Layout
 
 * **Left pane (sidebar):** Explorer with multi-select, cut / copy / paste, drag and drop file moves, and VS Code style icons (Codicons / Devicons / Seti). Two more sidebar views switch in via the activity bar: full-text Search and a Remote (SSH) explorer.
-* **Top right pane (editor):** code editor with `tree-sitter` syntax highlighting plus inline preview tabs for PNG / JPEG / GIF / BMP / WebP, PDFs (with page navigation), and CSV / TSV / XLSX / XLS / ODS spreadsheets. An optional native modal (vim) editing mode toggles on with `Cmd`+`E`.
+* **Top right pane (editor):** code editor with `tree-sitter` syntax highlighting plus inline preview tabs for PNG / JPEG / GIF / BMP / WebP, PDFs (with page navigation), and CSV / TSV / XLSX / XLS / ODS spreadsheets. Splits into two side-by-side columns with `Cmd`+`\` to view files together, each column with its own tabs and cursor (images and PDFs render inline in both). An optional native modal (vim) editing mode toggles on with `Cmd`+`E`.
 * **Bottom right pane (terminal):** a real interactive shell, your `$SHELL` running on a real PTY.
-* All three panes resize by dragging the seams between them.
+* All three panes resize by dragging the seams between them, including the seam between the two editor columns when the editor is split.
 
 Built on [ratatui](https://ratatui.rs/) + [crossterm](https://github.com/crossterm-rs/crossterm), with [portable-pty](https://docs.rs/portable-pty/) for the embedded shell, [alacritty_terminal](https://docs.rs/alacritty_terminal/) for terminal-state parsing, [tree-sitter](https://tree-sitter.github.io/tree-sitter/) for incremental, AST-based syntax highlighting, [calamine](https://docs.rs/calamine/) for spreadsheet parsing, and the iTerm2 OSC 1337 inline-image protocol for image / PDF previews.
 
@@ -108,6 +108,8 @@ croft setup-terminal --help
 | `Ctrl+b` / `Cmd+b` | Toggle the primary side bar (left pane) visibility, matching VS Code's "Toggle Primary Side Bar" |
 | `Ctrl+j` | Toggle the terminal pane |
 | `Ctrl+Shift+j` | Maximize the terminal pane (collapses the editor / welcome to zero rows so the terminal fills the right column next to the Explorer; press again to restore the previous split) |
+| `Cmd+\` (after the iTerm2 setup below) | Split the editor into two side-by-side columns (VS Code's Split Editor). The new right group duplicates the active file at the same cursor position; each column keeps its own tabs, scroll, and cursor. Closing the last tab in a column collapses the split. |
+| `Cmd+Opt+←` / `Cmd+Opt+→` (after the iTerm2 setup below) | Move keyboard focus to the left / right editor group while split. Click either column to focus it directly. |
 | `Ctrl+p` (or `Cmd+p` with the iTerm2 setup below) | Quick Open: fuzzy-search workspace files by name and jump to the picked file (auto-expands the Explorer to reveal it) |
 | `Ctrl+Shift+e` / `Cmd+Shift+e` | Jump to the Explorer sidebar from any pane |
 | `Ctrl+Shift+f` / `Cmd+Shift+f` | Jump to the Search sidebar |
@@ -117,6 +119,7 @@ croft setup-terminal --help
 | `Ctrl+Shift+l` / `Cmd+Shift+l` | While connected to a remote, disconnect and drop back into the local croft at the directory you connected from (`Ctrl+q` still fully exits) |
 | Click activity-bar icons (left edge) | Switch between Explorer, Search, Source Control, Run-Debug, and Remote sidebar views |
 | Drag the vertical seam between sidebar and editor | Resize the sidebar |
+| Drag the vertical seam between the two editor columns (when split) | Rebalance the side-by-side split |
 | Drag the horizontal seam between editor and terminal | Resize the terminal pane |
 | Mouse wheel | Scroll the pane under the pointer |
 
@@ -280,6 +283,8 @@ This writes the default-profile font settings plus Croft's iTerm2 keyboard setup
 | `⌘B` | `\x1b[98;9u` | Toggle the primary side bar (left pane), matching VS Code |
 | `⌘F12` | `\x1b[24;9~` | Go to Implementations (`Cmd+F12` is captured by macOS, so it needs forwarding; the bare-F12 family below does not) |
 | `⌃⇧F12` | `\x1b[24;6~` | Go to Declaration (forwarded defensively; iTerm2 already emits this natively, like plain / `Shift` / `Ctrl` F12) |
+| `⌘\` | `\x1b[92;9u` | Split the editor into two side-by-side columns |
+| `⌥⌘←` / `⌥⌘→` | `\x1b[1;11D` / `\x1b[1;11C` | Focus the left / right editor group while split (modifier byte 11 = Alt+Super, disjoint from the bare `Opt+←/→` word-motion) |
 
 It also moves several iTerm2 / macOS menu shortcuts out of the way, each relocated to an unused alternate chord so the original iTerm2 action stays reachable. Most are relocated to an unused `Cmd`-based chord (typically `Cmd+Opt+<key>`): **Edit → Find → Find...** off `⌘F` (to `⌘⌥F`) and **Find Globally...** off `⌘⇧F` (to `⌘⌥⌃F`), **Shell → Split Vertically / Horizontally with Same Profile** off `⌘D` / `⌘⇧D`, **Edit → Find Next / Find Previous / Jump to Selection**, **File → Print** off `⌘P`, **Edit → Find → Use Selection for Find** off `⌘E`, **Edit → Copy / Cut / Select All / Undo** off `⌘C` / `⌘X` / `⌘A` / `⌘Z`, **Window → Select Tab 1..9** off `⌘1..⌘9`, and the macOS **Help → Show Help Menu** off `⌘⇧/`. A few go elsewhere because `Cmd+Opt+<key>` is taken: **File → Close** off `⌘W` (to `⌘⌃W`, since `⌘⌥W` is already "Close All Panes in Tab"), **Window → New Tab** off `⌘T` (to `⌘⌃T`), and **Shell → Previous / Next Pane** off `⌘[` / `⌘]` (to `⌘⌥[` / `⌘⌥]`). `⌘V` is deliberately left on iTerm2's native Paste. Fully quit iTerm2 with `⌘Q` and reopen it after setup; iTerm2 caches its plist while running.
 

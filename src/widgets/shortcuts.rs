@@ -79,6 +79,14 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 description: "Focus the Terminal pane (un-hides it if collapsed)",
             },
             ShortcutEntry {
+                keys: "Cmd+\\",
+                description: "Split the editor into two side-by-side columns (duplicates the active file)",
+            },
+            ShortcutEntry {
+                keys: "Cmd+Opt+Left / Right",
+                description: "Move focus to the left / right editor group while split",
+            },
+            ShortcutEntry {
                 keys: "F1",
                 description: "Open this shortcuts panel",
             },

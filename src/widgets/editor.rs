@@ -2431,6 +2431,24 @@ impl Editor {
         self.last_edit_kind = None;
     }
 
+    /// Copy the caret + scroll position from another editor onto this one,
+    /// clamped to this buffer's bounds. Used when the editor is split so
+    /// the duplicate opens exactly where the source was - including the
+    /// wrap sub-line offset (`scroll_sub`), which is private to this
+    /// module and can't be set from `App`.
+    pub fn copy_view_position_from(&mut self, src: &Editor) {
+        let max_row = self.lines.len().saturating_sub(1);
+        self.cursor_row = src.cursor_row.min(max_row);
+        let max_col = self
+            .lines
+            .get(self.cursor_row)
+            .map_or(0, |l| l.chars().count());
+        self.cursor_col = src.cursor_col.min(max_col);
+        self.scroll = src.scroll.min(max_row);
+        self.scroll_sub = src.scroll_sub;
+        self.scroll_col = src.scroll_col;
+    }
+
     pub fn goto_line(&mut self, one_based: usize) {
         self.clear_selection();
         if self.lines.is_empty() {
@@ -2952,7 +2970,9 @@ impl Editor {
             // a click lands on the right logical line/column even when wrapped.
             // The blank tail of a folded row maps to the segment end, letting
             // you click to end-of-visual-line.
-            let &(line, start, end) = self.last_wrap_rows.get((row - self.last_inner.y) as usize)?;
+            let &(line, start, end) = self
+                .last_wrap_rows
+                .get((row - self.last_inner.y) as usize)?;
             if col < text_x {
                 return None;
             }
@@ -3562,7 +3582,10 @@ impl Editor {
         if (visible_col as u16) >= text_width {
             return None;
         }
-        Some((text_x + visible_col as u16, self.last_inner.y + row_in_view as u16))
+        Some((
+            text_x + visible_col as u16,
+            self.last_inner.y + row_in_view as u16,
+        ))
     }
 
     /// Screen cell of the diff view's read-only caret (its selection head),

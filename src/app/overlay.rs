@@ -288,7 +288,12 @@ pub struct OverlayManager {
     pub shortcuts_clear: ClearLatch,
     pub file_finder_clear: ClearLatch,
     pub zoxide_jump_clear: ClearLatch,
-    pub editor: ImageOverlay<super::EditorImageLayout>,
+    /// Inline-image overlay state, one slot per editor split column
+    /// (`[0]` = left pane, `[1]` = right pane). When the editor is not
+    /// split only `[0]` is used and `[1]` stays disabled. Keyed by
+    /// physical side so the OSC-1337 coordinates stay stable across a
+    /// focus swap (a focus swap never moves a group's column).
+    pub editor: [ImageOverlay<super::EditorImageLayout>; 2],
     pub welcome: ImageOverlay<super::WelcomeLayout>,
     pub hero: ImageOverlay<super::WelcomeLayout>,
     pub ssh: ImageOverlay<()>,

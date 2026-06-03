@@ -8142,7 +8142,7 @@ fn closing_image_tab_requests_overlay_clear_on_next_render() {
     // for clearing so the main loop wipes the screen.
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app.overlays.editor.set_test_state(
+    app.overlays.editor[0].set_test_state(
         Some(String::from("dummy-osc")),
         Some(EditorImageLayout {
             cell_x: 0,
@@ -8156,9 +8156,9 @@ fn closing_image_tab_requests_overlay_clear_on_next_render() {
     // Editor is blank-initial right after construction, so calling
     // disable_editor_image directly mimics what render() does on
     // the welcome branch.
-    app.disable_editor_image();
-    assert!(app.overlays.editor.image_is_none());
-    assert!(app.overlays.editor.layout_is_none());
+    app.disable_editor_image(0);
+    assert!(app.overlays.editor[0].image_is_none());
+    assert!(app.overlays.editor[0].layout_is_none());
     assert!(
         app.consume_editor_image_clear(),
         "first call must report a pending clear"
@@ -9116,11 +9116,17 @@ fn session_state_preserves_unsaved_buffer_contents() {
 fn build_tab_context_menu_items_includes_all_four_close_actions_in_the_middle_of_a_strip() {
     // Right-click on tab 1 of 3 (i.e. a middle tab) should surface
     // every close action — there's at least one tab on each side.
-    let items = build_tab_context_menu_items(1, 3);
+    let items = build_tab_context_menu_items(1, 3, false);
     let labels: Vec<&str> = items.iter().map(|(s, _)| s.as_str()).collect();
     assert_eq!(
         labels,
-        ["Close", "Close Others", "Close to the Right", "Close All"],
+        [
+            "Close",
+            "Close Others",
+            "Close to the Right",
+            "Close All",
+            "Split Editor Right"
+        ],
         "all four close actions must appear and in this order — mirrors VS Code's tab strip"
     );
     assert!(matches!(&items[0].1, MenuAction::CloseTab(1)));
@@ -9133,22 +9139,22 @@ fn build_tab_context_menu_items_includes_all_four_close_actions_in_the_middle_of
 fn build_tab_context_menu_items_hides_close_to_the_right_on_the_last_tab() {
     // Last tab → "Close to the Right" would close zero tabs, so it
     // must be suppressed (matches VS Code).
-    let items = build_tab_context_menu_items(2, 3);
+    let items = build_tab_context_menu_items(2, 3, false);
     let labels: Vec<&str> = items.iter().map(|(s, _)| s.as_str()).collect();
     assert_eq!(
         labels,
-        ["Close", "Close Others", "Close All"],
+        ["Close", "Close Others", "Close All", "Split Editor Right"],
         "Close to the Right must be suppressed on the rightmost tab"
     );
 }
 
 #[test]
 fn build_tab_context_menu_items_hides_close_others_when_only_one_tab_is_open() {
-    let items = build_tab_context_menu_items(0, 1);
+    let items = build_tab_context_menu_items(0, 1, false);
     let labels: Vec<&str> = items.iter().map(|(s, _)| s.as_str()).collect();
     assert_eq!(
         labels,
-        ["Close", "Close All"],
+        ["Close", "Close All", "Split Editor Right"],
         "with a single tab, Close Others and Close to the Right are both no-ops and must be suppressed"
     );
 }
@@ -9788,4 +9794,228 @@ fn shortcut_for_returns_expected_shortcuts_for_editor_symbol_actions() {
         shortcut_for(&MenuAction::ChangeAllOccurrencesAt { row: 0, col: 0 }),
         Some("⌘F2")
     );
+}
+
+// --- Split editor (side-by-side panes) -----------------------------------
+
+/// Open a file into the focused editor group of a fresh App.
+fn app_with_open_file(tmp: &std::path::Path, name: &str, body: &str) -> App {
+    let f = tmp.join(name);
+    std::fs::write(&f, body).unwrap();
+    let mut app = App::new(tmp.to_path_buf()).unwrap();
+    app.editor.open_pinned(&f).unwrap();
+    app.focus_pane(Pane::Editor);
+    app
+}
+
+#[test]
+fn split_editor_duplicates_active_file_into_a_focused_right_group() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.txt", "hello\nworld\nthere");
+    let path = app.editor.path.clone().unwrap();
+    app.editor.cursor_row = 2;
+
+    app.split_editor();
+
+    assert!(
+        app.editor_split.is_some(),
+        "split must create a second group"
+    );
+    assert!(
+        !app.split_focus_left,
+        "the new (focused) group lands in the RIGHT column, mirroring VS Code"
+    );
+    // `editor` is always the focused group: it is the new right duplicate.
+    assert_eq!(
+        app.editor.path.as_deref(),
+        Some(path.as_path()),
+        "the duplicate shows the same file"
+    );
+    assert_eq!(
+        app.editor.cursor_row, 2,
+        "the duplicate opens at the source cursor position, not the top"
+    );
+    assert_eq!(
+        app.editor.tab_count(),
+        1,
+        "the new group holds exactly the file, with no stray blank tab"
+    );
+    // The original group survives in the left column.
+    assert_eq!(
+        app.editor_split.as_ref().unwrap().path.as_deref(),
+        Some(path.as_path())
+    );
+}
+
+#[test]
+fn split_editor_refuses_a_blank_unsaved_buffer() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.split_editor();
+    assert!(
+        app.editor_split.is_none(),
+        "a blank buffer has no path to mirror, so split is refused"
+    );
+}
+
+#[test]
+fn opening_a_file_in_the_split_replaces_the_duplicate_instead_of_stacking() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.txt", "first");
+    let b = tmp.path().join("b.txt");
+    std::fs::write(&b, "second").unwrap();
+
+    app.split_editor(); // right group = preview duplicate of a.txt
+    assert_eq!(app.editor.tab_count(), 1);
+
+    // Opening another file in the focused (right) column reuses the
+    // preview slot rather than leaving the duplicate pinned beside it.
+    app.editor.open_preview(&b).unwrap();
+    assert_eq!(
+        app.editor.tab_count(),
+        1,
+        "the right column swaps to the new file in place; the duplicate must not linger as a second tab"
+    );
+    assert_eq!(app.editor.path.as_deref(), Some(b.as_path()));
+    // The left column is untouched, giving a true side-by-side of two files.
+    let left = app.editor_split.as_ref().unwrap();
+    assert_eq!(left.tab_count(), 1);
+    assert_eq!(
+        left.path.as_deref(),
+        Some(tmp.path().join("a.txt").as_path())
+    );
+}
+
+#[test]
+fn focus_editor_group_swaps_focus_but_keeps_physical_columns_fixed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.txt", "left-original");
+    let original = app.editor.path.clone().unwrap();
+    app.split_editor(); // focus now on the right duplicate
+    assert!(!app.split_focus_left);
+
+    // Move focus to the LEFT group (the original).
+    app.focus_editor_group(true);
+    assert!(
+        app.split_focus_left,
+        "focusing left makes the focused group the left column"
+    );
+    assert_eq!(
+        app.editor.path.as_deref(),
+        Some(original.as_path()),
+        "after the swap `editor` is the original left group"
+    );
+    assert!(
+        app.editor.focused && !app.editor_split.as_ref().unwrap().focused,
+        "only the focused group's border lights up"
+    );
+
+    // Move focus back to the RIGHT group.
+    app.focus_editor_group(false);
+    assert!(!app.split_focus_left);
+    assert_eq!(
+        app.editor.path.as_deref(),
+        Some(original.as_path()),
+        "both columns hold the same duplicated file, so the path is unchanged; \
+         the point is the swap is symmetric and never loses a group"
+    );
+}
+
+#[test]
+fn closing_last_tab_in_focused_group_collapses_the_split() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.txt", "body");
+    app.split_editor();
+    assert!(app.editor_split.is_some());
+
+    // Cmd+W closes the focused group's only tab -> the group empties and
+    // the split collapses back to the surviving column.
+    app.handle_key(key(KeyCode::Char('w'), KeyModifiers::SUPER))
+        .unwrap();
+
+    assert!(
+        app.editor_split.is_none(),
+        "emptying the focused group collapses the split"
+    );
+    assert!(
+        app.split_focus_left,
+        "the collapsed state resets to the single-column default"
+    );
+    assert_eq!(app.editor_splitter_x, None);
+}
+
+#[test]
+fn editor_image_overlay_is_dual_slot_and_clear_ors_both_columns() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let layout = |name: &str| EditorImageLayout {
+        cell_x: 0,
+        cell_y: 0,
+        cell_w: 10,
+        cell_h: 10,
+        path: tmp.path().join(name),
+    };
+    // Both physical columns can hold an inline image at once.
+    app.overlays.editor[0].set_test_state(Some("left-osc".into()), Some(layout("l.png")), true);
+    app.overlays.editor[1].set_test_state(Some("right-osc".into()), Some(layout("r.png")), true);
+    assert_eq!(
+        app.editor_image_payload(0).map(|(o, _)| o),
+        Some("left-osc")
+    );
+    assert_eq!(
+        app.editor_image_payload(1).map(|(o, _)| o),
+        Some("right-osc")
+    );
+
+    // Disabling the right slot arms a clear; `consume_editor_image_clear`
+    // must report it even though the left slot is quiet.
+    app.disable_editor_image(1);
+    assert!(
+        app.consume_editor_image_clear(),
+        "a clear armed on either column must surface from the ORed consume"
+    );
+    assert!(
+        !app.consume_editor_image_clear(),
+        "the latch is one-shot and both slots were consumed"
+    );
+}
+
+#[test]
+fn editor_split_key_is_cmd_backslash_only() {
+    assert!(is_editor_split_key(key(
+        KeyCode::Char('\\'),
+        KeyModifiers::SUPER
+    )));
+    // Bare backslash is a literal character, not a split.
+    assert!(!is_editor_split_key(key(
+        KeyCode::Char('\\'),
+        KeyModifiers::NONE
+    )));
+    // Modified variants are reserved for other (future) chords.
+    assert!(!is_editor_split_key(key(
+        KeyCode::Char('\\'),
+        KeyModifiers::SUPER | KeyModifiers::SHIFT
+    )));
+}
+
+#[test]
+fn focus_group_keys_are_cmd_opt_arrows_disjoint_from_word_motion() {
+    assert!(is_focus_group_left_key(key(
+        KeyCode::Left,
+        KeyModifiers::SUPER | KeyModifiers::ALT
+    )));
+    assert!(is_focus_group_right_key(key(
+        KeyCode::Right,
+        KeyModifiers::SUPER | KeyModifiers::ALT
+    )));
+    // Plain Opt+Arrow is editor word-motion, NOT group focus.
+    assert!(!is_focus_group_left_key(key(
+        KeyCode::Left,
+        KeyModifiers::ALT
+    )));
+    assert!(!is_focus_group_right_key(key(
+        KeyCode::Right,
+        KeyModifiers::ALT
+    )));
 }

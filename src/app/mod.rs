@@ -317,6 +317,13 @@ enum MenuAction {
     CloseTabsToRight(usize),
     /// Close every editor tab and reset the pane to a blank state.
     CloseAllTabs,
+    /// Split the editor into two side-by-side columns, duplicating the
+    /// active file into the new (right) group.
+    SplitEditor,
+    /// Move keyboard focus to the left editor group (while split).
+    FocusGroupLeft,
+    /// Move keyboard focus to the right editor group (while split).
+    FocusGroupRight,
     /// Editor body: LSP "Rename Symbol" of the identifier at buffer `(row,
     /// col)`. Captured at right-click so the later dispatch targets the same
     /// symbol the user clicked.
@@ -396,6 +403,9 @@ fn shortcut_for(action: &MenuAction) -> Option<&'static str> {
         MenuAction::CloseTab(_) => Some("⌘W"),
         MenuAction::CloseOtherTabs(_) => Some("⌥⌘T"),
         MenuAction::CloseAllTabs => Some("⌘K W"),
+        MenuAction::SplitEditor => Some("⌘\\"),
+        MenuAction::FocusGroupLeft => Some("⌥⌘←"),
+        MenuAction::FocusGroupRight => Some("⌥⌘→"),
         MenuAction::RenameSymbolAt { .. } => Some("F2"),
         MenuAction::ChangeAllOccurrencesAt { .. } => Some("⌘F2"),
         MenuAction::GoToDefinitionAt { .. } => Some("F12"),
@@ -461,7 +471,11 @@ struct ExplorerDrag {
 /// click on tab `idx`. `tab_count` is the total number of open tabs;
 /// used to gate "Close Others" / "Close to the Right" so they don't
 /// surface when they would be no-ops.
-fn build_tab_context_menu_items(idx: usize, tab_count: usize) -> Vec<(String, MenuAction)> {
+fn build_tab_context_menu_items(
+    idx: usize,
+    tab_count: usize,
+    is_split: bool,
+) -> Vec<(String, MenuAction)> {
     let mut items: Vec<(String, MenuAction)> = Vec::new();
     items.push((String::from("Close"), MenuAction::CloseTab(idx)));
     if tab_count > 1 {
@@ -477,6 +491,17 @@ fn build_tab_context_menu_items(idx: usize, tab_count: usize) -> Vec<(String, Me
         ));
     }
     items.push((String::from("Close All"), MenuAction::CloseAllTabs));
+    // Editor-group actions: split is offered when not already split;
+    // focus-group navigation only once a second column exists.
+    if is_split {
+        items.push((String::from("Focus Left Group"), MenuAction::FocusGroupLeft));
+        items.push((
+            String::from("Focus Right Group"),
+            MenuAction::FocusGroupRight,
+        ));
+    } else {
+        items.push((String::from("Split Editor Right"), MenuAction::SplitEditor));
+    }
     items
 }
 
@@ -701,6 +726,20 @@ pub struct App {
     pub run_debug: RunDebugPanel,
     pub system_panel: SystemPanel,
     pub editor: EditorTabs,
+    /// The secondary editor group, shown side by side with `editor` when
+    /// the user splits the pane (`Cmd+\`). `None` = not split. Invariant:
+    /// `editor` is ALWAYS the focused group, so the 430-odd `self.editor`
+    /// call sites keep operating on whichever pane has focus. Moving focus
+    /// to the other group `mem::swap`s the two so the invariant holds.
+    pub editor_split: Option<EditorTabs>,
+    /// While split, `true` when the focused group (`editor`) occupies the
+    /// LEFT column and `editor_split` the right. A focus swap flips this so
+    /// the physical columns stay put. Meaningless when not split.
+    split_focus_left: bool,
+    /// Pinned width in cells of the LEFT editor column while split. `None`
+    /// = even 50/50 split. Set by dragging the seam between the two panes;
+    /// mirrors `sidebar_width` / `terminal_height`.
+    editor_split_left_width: Option<u16>,
     /// One-shot latch armed when a save is refused because the file changed
     /// on disk. The next `save()` overwrites anyway, giving the user a
     /// "press Cmd+S again to overwrite" escape hatch without a modal.
@@ -828,6 +867,10 @@ pub struct App {
     /// without recomputing layout outside of `render`.
     sidebar_splitter_x: Option<u16>,
     terminal_splitter_y: Option<u16>,
+    /// Last-rendered x of the seam between the two editor columns while
+    /// split. `None` when not split. Used to hit-test the editor-split
+    /// drag, mirroring `sidebar_splitter_x`.
+    editor_splitter_x: Option<u16>,
     /// Hit-test rectangles of the "[+]" buttons - one per terminal pane,
     /// indexed in lock-step with `terminals`. Empty when the pane is hidden
     /// or every pane is too narrow for the label.
@@ -957,7 +1000,14 @@ pub struct EditorImageLayout {
 enum SplitterDrag {
     Sidebar,
     Terminal,
+    /// Dragging the vertical seam between the two editor columns while
+    /// the editor is split side by side.
+    EditorSplit,
 }
+
+/// Minimum width in cells of either editor column while split, so a drag
+/// can't collapse a pane to nothing.
+const EDITOR_SPLIT_MIN: u16 = 10;
 
 const SIDEBAR_WIDTH_DEFAULT: u16 = 32;
 const SIDEBAR_WIDTH_MIN: u16 = 12;
@@ -1332,6 +1382,9 @@ impl App {
                 p
             },
             editor,
+            editor_split: None,
+            split_focus_left: true,
+            editor_split_left_width: None,
             force_save_armed: false,
             terminals: vec![term],
             active_terminal: 0,
@@ -1382,6 +1435,7 @@ impl App {
             sidebar_width: SIDEBAR_WIDTH_DEFAULT,
             terminal_height: None,
             splitter_drag: None,
+            editor_splitter_x: None,
             sidebar_splitter_x: None,
             terminal_splitter_y: None,
             terminal_add_buttons: Vec::new(),
@@ -3784,11 +3838,98 @@ impl App {
         self.run_debug.focused =
             self.focus == Pane::Tree && self.sidebar_view == SidebarView::RunDebug;
         self.editor.focused = self.focus == Pane::Editor;
+        // The split group is by definition the NON-focused editor group,
+        // so its border never lights up even while the editor pane holds
+        // focus. `editor` (the focused group) carries the highlight.
+        if let Some(split) = self.editor_split.as_mut() {
+            split.focused = false;
+        }
         let focused_pane = self.focus == Pane::Terminal;
         let active = self.active_terminal;
         for (i, t) in self.terminals.iter_mut().enumerate() {
             t.focused = focused_pane && i == active;
         }
+    }
+
+    /// Split the editor into two side-by-side columns (`Cmd+\`). The new
+    /// group duplicates the active file (re-opens its path, copies the
+    /// cursor/scroll position) and takes focus, landing in the right
+    /// column. No-op if already split or the active tab has no path on
+    /// disk (a blank/unsaved buffer has nothing to mirror).
+    fn split_editor(&mut self) {
+        if self.editor_split.is_some() {
+            return;
+        }
+        let Some(path) = self.editor.path.clone() else {
+            self.status = String::from("Cannot split: save the file first");
+            return;
+        };
+        // A fresh EditorTabs starts blank-initial; `open_preview` reuses
+        // that placeholder tab so the new group holds exactly the file
+        // (not a stray blank tab beside it). Opening it as the PREVIEW
+        // slot - not pinned - means the next file the user opens in this
+        // column swaps straight into it (clean "left = A, right = B"
+        // comparison) rather than stacking a second tab. Editing or
+        // double-clicking pins it, as everywhere else.
+        let mut group = EditorTabs::default();
+        if group.open_preview(&path).is_err() {
+            self.status = String::from("Cannot split: failed to open file");
+            return;
+        }
+        // Mirror the source view state (caret + scroll, incl. the wrap
+        // sub-line offset) so the duplicate opens exactly where the
+        // source was rather than at the top of the file.
+        group.copy_view_position_from(&self.editor);
+        // The existing group stays in the LEFT column; the new focused
+        // group renders on the RIGHT, so `editor` (always the focused
+        // group) is the right column → `split_focus_left = false`.
+        self.editor_split = Some(std::mem::replace(&mut self.editor, group));
+        self.split_focus_left = false;
+        self.editor_split_left_width = None;
+        self.focus_pane(Pane::Editor);
+    }
+
+    /// Move keyboard focus to the editor group in the given physical
+    /// column (`true` = left, `false` = right). Swaps `editor` and
+    /// `editor_split` so the focused group is always `editor`, keeping the
+    /// physical columns fixed. No-op when not split or already focused
+    /// there.
+    fn focus_editor_group(&mut self, want_left: bool) {
+        if self.editor_split.is_none() || self.split_focus_left == want_left {
+            // Still ensure the editor pane has focus even if the side is
+            // already correct, so the chord doubles as "focus editor".
+            if self.editor_split.is_some() && self.focus != Pane::Editor {
+                self.focus_pane(Pane::Editor);
+            }
+            return;
+        }
+        if let Some(split) = self.editor_split.as_mut() {
+            std::mem::swap(&mut self.editor, split);
+        }
+        self.split_focus_left = want_left;
+        self.focus_pane(Pane::Editor);
+    }
+
+    /// After a tab close, collapse the split if the focused group ran out
+    /// of real tabs. The surviving (other) group becomes the sole editor.
+    fn collapse_split_if_empty(&mut self) {
+        if self.editor_split.is_none() || !self.editor.is_blank_initial() {
+            return;
+        }
+        // The focused group is empty; promote the other group to be the
+        // single editor and tear the split down. Evict the right slot's
+        // image so it can't ghost after the column disappears.
+        if let Some(other) = self.editor_split.take() {
+            self.editor = other;
+        }
+        self.split_focus_left = true;
+        self.editor_split_left_width = None;
+        self.editor_splitter_x = None;
+        self.disable_editor_image(1);
+        // Focus stays on the editor pane; just re-light the promoted
+        // group's border. (No `focus_pane` so this is safe to call from
+        // any close path without re-poking the cursor mid-frame.)
+        self.sync_focus_flags();
     }
 
     fn render(&mut self, frame: &mut ratatui::Frame) {
@@ -3933,14 +4074,17 @@ impl App {
                 self.system_panel.last_area = Rect::default();
             }
         }
-        if self.editor.is_blank_initial() {
+        if self.editor_split.is_none() && self.editor.is_blank_initial() {
             self.render_welcome(frame, editor_area);
             // The previous frame may have rendered an image-preview tab
             // whose OSC-1337 pixels are still cached in iTerm's image
             // store. Closing that tab brings us here, but ratatui's diff
             // alone doesn't tell iTerm to drop the image — flag it so the
-            // main loop wipes the screen on the next pass.
-            self.disable_editor_image();
+            // main loop wipes the screen on the next pass. Both slots, in
+            // case a split was just collapsed back to the welcome screen.
+            self.disable_editor_image(0);
+            self.disable_editor_image(1);
+            self.editor_splitter_x = None;
             // Keep the editor's hit-test rectangles fresh so the activity-bar
             // / tree click logic still works even though we skipped the
             // EditorTabs widget this frame.
@@ -3952,13 +4096,61 @@ impl App {
                 height: 0,
             };
         } else {
-            frame.render_widget(&mut self.editor, editor_area);
             // The editor just overdrew whatever cells the welcome image
             // occupied; if the user reopens the welcome screen we'll need
             // to re-emit it.
             self.overlays.welcome.mark_dirty();
             self.overlays.badge.set_target(None);
-            self.update_editor_image_overlay(editor_area);
+            // Render either a single editor group or two side-by-side
+            // columns, and report which column has focus so the
+            // completion / hover popups anchor there.
+            let focused_area = if self.editor_split.is_some() {
+                let total = editor_area.width;
+                let max_left = total.saturating_sub(EDITOR_SPLIT_MIN).max(EDITOR_SPLIT_MIN);
+                let left_w = self
+                    .editor_split_left_width
+                    .unwrap_or(total / 2)
+                    .clamp(EDITOR_SPLIT_MIN, max_left);
+                let cols = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([
+                        Constraint::Length(left_w),
+                        Constraint::Min(EDITOR_SPLIT_MIN),
+                    ])
+                    .split(editor_area);
+                let (left_area, right_area) = (cols[0], cols[1]);
+                // The seam sits on the right column's left border; that
+                // single column is the drag hit target.
+                self.editor_splitter_x = Some(right_area.x);
+                // `editor` is always the focused group; `split_focus_left`
+                // says which physical column it occupies.
+                if self.split_focus_left {
+                    frame.render_widget(&mut self.editor, left_area);
+                    if let Some(split) = self.editor_split.as_mut() {
+                        frame.render_widget(split, right_area);
+                    }
+                } else {
+                    if let Some(split) = self.editor_split.as_mut() {
+                        frame.render_widget(split, left_area);
+                    }
+                    frame.render_widget(&mut self.editor, right_area);
+                }
+                // Image overlays are keyed by physical column.
+                self.update_editor_image_overlay(0, left_area);
+                self.update_editor_image_overlay(1, right_area);
+                if self.split_focus_left {
+                    left_area
+                } else {
+                    right_area
+                }
+            } else {
+                frame.render_widget(&mut self.editor, editor_area);
+                self.editor_splitter_x = None;
+                self.update_editor_image_overlay(0, editor_area);
+                // No right pane: make sure its slot can't ghost an image.
+                self.disable_editor_image(1);
+                editor_area
+            };
             if self.focus == Pane::Editor
                 && self.completion_popup.is_some()
                 && let Some((cx, cy)) = self.editor.cursor_screen_pos()
@@ -3967,13 +4159,13 @@ impl App {
                     popup.anchor = (cx, cy);
                 }
                 let popup_ref = self.completion_popup.as_ref().unwrap();
-                let area = popup_ref.area_for(editor_area);
+                let area = popup_ref.area_for(focused_area);
                 if area.width > 0 && area.height > 0 {
                     frame.render_widget(popup_ref, area);
                 }
             }
             if let Some(popup) = self.hover_popup.as_ref() {
-                let area = popup.area_for(editor_area);
+                let area = popup.area_for(focused_area);
                 if area.width > 0 && area.height > 0 {
                     frame.render_widget(popup, area);
                 }
@@ -4627,6 +4819,18 @@ impl App {
         }
         if is_terminal_maximize_key(key) {
             self.toggle_terminal_maximize();
+            return Ok(());
+        }
+        if is_editor_split_key(key) {
+            self.split_editor();
+            return Ok(());
+        }
+        if is_focus_group_left_key(key) {
+            self.focus_editor_group(true);
+            return Ok(());
+        }
+        if is_focus_group_right_key(key) {
+            self.focus_editor_group(false);
             return Ok(());
         }
         if is_terminal_split_key(key) {
@@ -6191,7 +6395,8 @@ impl App {
                     };
                     if stepped {
                         // Force the OSC overlay to re-bake on next render.
-                        self.overlays.editor.invalidate_layout();
+                        let side = self.focused_image_side();
+                        self.overlays.editor[side].invalidate_layout();
                     }
                 }
             }
@@ -6287,6 +6492,9 @@ impl App {
             if self.editor.close_active() {
                 self.sync_open_file_poll_mtime();
                 self.status = String::from("Closed tab");
+                // Closing the focused group's last tab while split closes
+                // the group: collapse back to the surviving column.
+                self.collapse_split_if_empty();
             } else {
                 self.status = String::from("Cannot close last tab");
             }
@@ -7819,7 +8027,7 @@ impl App {
             self.overlays.activity.mark_dirty();
             self.overlays.welcome.mark_dirty();
             self.overlays.hero.mark_dirty();
-            self.overlays.editor.invalidate_layout();
+            self.invalidate_editor_image_layouts();
             self.status.clear();
         }
     }
@@ -7918,7 +8126,7 @@ impl App {
             self.overlays.activity.mark_dirty();
             self.overlays.welcome.mark_dirty();
             self.overlays.hero.mark_dirty();
-            self.overlays.editor.invalidate_layout();
+            self.invalidate_editor_image_layouts();
             self.status.clear();
         }
     }
@@ -8068,7 +8276,7 @@ impl App {
             self.overlays.activity.mark_dirty();
             self.overlays.welcome.mark_dirty();
             self.overlays.hero.mark_dirty();
-            self.overlays.editor.invalidate_layout();
+            self.invalidate_editor_image_layouts();
             self.status.clear();
         }
     }
@@ -8656,6 +8864,22 @@ impl App {
             }
         }
 
+        // When the editor is split, a press anywhere in the NON-focused
+        // column (except its draggable seam) moves focus there first, so
+        // the rest of this handler - which all reads `self.editor` - then
+        // operates on the clicked group. The swap keeps the physical
+        // columns fixed.
+        if self.editor_split.is_some()
+            && matches!(m.kind, MouseEventKind::Down(_))
+            && self.editor_splitter_x != Some(m.column)
+            && self
+                .editor_split
+                .as_ref()
+                .is_some_and(|s| rect_contains(s.last_full_area, m.column, m.row))
+        {
+            self.focus_editor_group(!self.split_focus_left);
+        }
+
         // Hit-test the side panel against the ACTIVE widget's last_area
         // rather than always against `self.tree.last_area`. The tree is
         // only re-rendered when the Explorer view is active; switching
@@ -8699,7 +8923,11 @@ impl App {
                 // column with the sidebar.
                 if let Some(tab_idx) = self.editor.tab_at(m.column, m.row) {
                     self.focus_pane(Pane::Editor);
-                    let items = build_tab_context_menu_items(tab_idx, self.editor.tab_count());
+                    let items = build_tab_context_menu_items(
+                        tab_idx,
+                        self.editor.tab_count(),
+                        self.editor_split.is_some(),
+                    );
                     self.context_menu = Some(ContextMenu {
                         origin: (m.column, m.row),
                         items,
@@ -8848,6 +9076,14 @@ impl App {
                         self.splitter_drag = Some(SplitterDrag::Sidebar);
                         return;
                     }
+                }
+                // Seam between the two editor columns while split. Same
+                // two-column hit-zone as the sidebar seam.
+                if let Some(x) = self.editor_splitter_x
+                    && (m.column == x || m.column == x.saturating_sub(1))
+                {
+                    self.splitter_drag = Some(SplitterDrag::EditorSplit);
+                    return;
                 }
                 // SYSTEM panel sits at the bottom of the sidebar column.
                 // A click on its header row toggles collapse; any other
@@ -9210,6 +9446,7 @@ impl App {
                             self.sync_open_file_poll_mtime();
                             self.status = String::from("Closed tab");
                             self.poke_cursor();
+                            self.collapse_split_if_empty();
                         }
                     } else if let Some(idx) = self.editor.tab_at(m.column, m.row) {
                         self.focus_pane(Pane::Editor);
@@ -9866,6 +10103,7 @@ impl App {
                     self.sync_open_file_poll_mtime();
                     self.status = String::from("Closed tab");
                     self.poke_cursor();
+                    self.collapse_split_if_empty();
                 }
             }
             MenuAction::CloseOtherTabs(keep_idx) => {
@@ -9901,7 +10139,11 @@ impl App {
                     format!("Closed {removed} tabs")
                 };
                 self.poke_cursor();
+                self.collapse_split_if_empty();
             }
+            MenuAction::SplitEditor => self.split_editor(),
+            MenuAction::FocusGroupLeft => self.focus_editor_group(true),
+            MenuAction::FocusGroupRight => self.focus_editor_group(false),
             MenuAction::CompareWithSelected { anchor, other } => {
                 match self.editor.open_diff(&anchor, &other) {
                     Ok(()) => {
@@ -9999,26 +10241,58 @@ impl App {
         }
     }
 
-    /// Bake an OSC-1337 inline-image escape sized to the editor pane so
+    /// The editor group occupying physical column `side` (0 = left,
+    /// 1 = right). When not split only side 0 exists. `editor` is always
+    /// the focused group, so which physical column it sits in depends on
+    /// `split_focus_left`.
+    fn group_on_side(&self, side: usize) -> Option<&EditorTabs> {
+        match &self.editor_split {
+            None => (side == 0).then_some(&self.editor),
+            Some(split) => Some(if (side == 0) == self.split_focus_left {
+                &self.editor
+            } else {
+                split
+            }),
+        }
+    }
+
+    /// Physical overlay-slot index of the focused group: 0 when unsplit or
+    /// focused-left, 1 when focused-right.
+    fn focused_image_side(&self) -> usize {
+        if self.editor_split.is_some() && !self.split_focus_left {
+            1
+        } else {
+            0
+        }
+    }
+
+    /// Re-bake both editor image slots on the next render. Used when a
+    /// full-screen modal that covered both panes closes.
+    fn invalidate_editor_image_layouts(&mut self) {
+        self.overlays.editor[0].invalidate_layout();
+        self.overlays.editor[1].invalidate_layout();
+    }
+
+    /// Bake an OSC-1337 inline-image escape sized to one editor column so
     /// the active image tab can be painted on top of ratatui's text
-    /// buffer. Skipped when the active tab is text or when the host
+    /// buffer. `side` selects the physical column (and the overlay slot).
+    /// Skipped when that column's active tab is text or when the host
     /// terminal can't render inline images (Terminal.app, raw SSH); in
     /// those cases the metadata header line painted by the editor widget
     /// is the entire preview the user sees.
-    fn update_editor_image_overlay(&mut self, editor_area: Rect) {
-        let Some(image) = self.editor.image.clone() else {
-            self.disable_editor_image();
+    fn update_editor_image_overlay(&mut self, side: usize, editor_area: Rect) {
+        // Cheap pre-checks that don't touch the (large) image bytes, so
+        // the common per-frame path skips the clone+bake entirely.
+        if self.group_on_side(side).is_none_or(|g| g.image.is_none()) {
+            self.disable_editor_image(side);
+            return;
+        }
+        let Some(path) = self.group_on_side(side).and_then(|g| g.path.clone()) else {
+            self.disable_editor_image(side);
             return;
         };
-        let path = match self.editor.path.clone() {
-            Some(p) => p,
-            None => {
-                self.disable_editor_image();
-                return;
-            }
-        };
         if !crate::iterm2_inline::detect_iterm2_inline_support() {
-            self.disable_editor_image();
+            self.disable_editor_image(side);
             return;
         }
         let Some((cw_px, ch_px)) = self.cell_pixel else {
@@ -10034,7 +10308,7 @@ impl App {
         if editor_area.height < tab_strip + 2 * border + header + 2
             || editor_area.width < 2 * border + 4
         {
-            self.disable_editor_image();
+            self.disable_editor_image(side);
             return;
         }
         let cell_x = editor_area.x + border;
@@ -10050,50 +10324,71 @@ impl App {
             cell_h,
             path,
         };
-        if self.overlays.editor.layout_matches(&desired) {
+        // Skip the bake when nothing about the layout changed - this is
+        // the hot path on every frame an image is on screen.
+        if self.overlays.editor[side].layout_matches(&desired) {
             return;
         }
-        self.overlays.editor.request_clear_if_displayed();
+        self.overlays.editor[side].request_clear_if_displayed();
         let canvas_w = cell_w as u32 * cw_px;
         let canvas_h = cell_h as u32 * ch_px;
         let bg = image::Rgba([EDITOR_BG_RGB.0, EDITOR_BG_RGB.1, EDITOR_BG_RGB.2, 0xff]);
-        if let Ok(baked) =
+        // Borrow the image bytes from the group on this side directly (a
+        // disjoint-field borrow from `self.overlays`); the borrow ends at
+        // the last use inside the bake, before we store into the slot.
+        let baked = {
+            let Some(image) = (match &self.editor_split {
+                None => self.editor.image.as_ref(),
+                Some(split) => {
+                    if (side == 0) == self.split_focus_left {
+                        self.editor.image.as_ref()
+                    } else {
+                        split.image.as_ref()
+                    }
+                }
+            }) else {
+                return;
+            };
             crate::iterm2_inline::fit_image_auto(&image.bytes, canvas_w, canvas_h, bg)
-        {
+        };
+        if let Ok(baked) = baked {
             let raw = crate::iterm2_inline::build_inline_image_osc(&baked, cell_w, cell_h, false);
             let osc = if crate::iterm2_inline::detect_tmux() {
                 crate::iterm2_inline::tmux_passthrough_wrap(&raw)
             } else {
                 raw
             };
-            self.overlays.editor.set(osc, desired);
+            self.overlays.editor[side].set(osc, desired);
         }
     }
 
-    fn disable_editor_image(&mut self) {
-        self.overlays.editor.disable();
+    fn disable_editor_image(&mut self, side: usize) {
+        self.overlays.editor[side].disable();
     }
 
     /// Returns true if the cached editor-image cells need to be repainted
     /// by ratatui this frame (because the user closed/switched away from
     /// the image, or the layout changed). Called from the main loop to
-    /// force a full redraw before re-emitting.
+    /// force a full redraw before re-emitting. ORs both split slots and
+    /// consumes BOTH latches (never short-circuits).
     pub fn consume_editor_image_clear(&mut self) -> bool {
-        self.overlays.editor.consume_clear()
+        let left = self.overlays.editor[0].consume_clear();
+        let right = self.overlays.editor[1].consume_clear();
+        left || right
     }
 
-    pub fn editor_image_payload(&self) -> Option<(&str, &EditorImageLayout)> {
+    pub fn editor_image_payload(&self, side: usize) -> Option<(&str, &EditorImageLayout)> {
         if self.shortcuts_modal.is_some()
             || self.file_finder.is_some()
             || self.zoxide_jump.is_some()
         {
             return None;
         }
-        self.overlays.editor.payload()
+        self.overlays.editor[side].payload()
     }
 
-    pub fn mark_editor_image_displayed(&mut self) {
-        self.overlays.editor.mark_displayed();
+    pub fn mark_editor_image_displayed(&mut self, side: usize) {
+        self.overlays.editor[side].mark_displayed();
     }
 
     pub fn welcome_image_emit_payload(&self) -> Option<(&str, &WelcomeLayout)> {
@@ -10315,6 +10610,25 @@ impl App {
                     .saturating_sub(EDITOR_HEIGHT_MIN)
                     .max(TERMINAL_HEIGHT_MIN);
                 self.terminal_height = Some(new_h.clamp(TERMINAL_HEIGHT_MIN, max_h));
+            }
+            SplitterDrag::EditorSplit => {
+                if self.editor_split.is_none() {
+                    return;
+                }
+                // The editor area starts after the activity bar and (when
+                // shown) the sidebar. The pointer column minus that left
+                // edge is the new left-column width; the seam carries no
+                // dedicated cell so left + right == total editor width.
+                let editor_left = ACTIVITY_BAR_WIDTH
+                    + if self.show_tree {
+                        self.sidebar_width
+                    } else {
+                        0
+                    };
+                let total = self.last_content_width;
+                let new_left = column.saturating_sub(editor_left);
+                let max_left = total.saturating_sub(EDITOR_SPLIT_MIN).max(EDITOR_SPLIT_MIN);
+                self.editor_split_left_width = Some(new_left.clamp(EDITOR_SPLIT_MIN, max_left));
             }
         }
     }
@@ -11109,6 +11423,41 @@ fn is_terminal_split_key(key: KeyEvent) -> bool {
             && !key.modifiers.contains(KeyModifiers::ALT);
     }
     key.modifiers.contains(KeyModifiers::CONTROL) && key.modifiers.contains(KeyModifiers::SHIFT)
+}
+
+/// `Cmd+\`: split the editor into two side-by-side columns (VS Code's
+/// `workbench.action.splitEditor`). iTerm2's GlobalKeyMap forwards it as
+/// `ESC [ 92 ; 9 u`, which crossterm decodes to `Char('\\') + SUPER`.
+/// SUPER-only; reject SHIFT/ALT so it can't double-fire with a future
+/// modified backslash chord.
+fn is_editor_split_key(key: KeyEvent) -> bool {
+    let KeyCode::Char('\\') = key.code else {
+        return false;
+    };
+    key.modifiers.contains(KeyModifiers::SUPER)
+        && !key.modifiers.contains(KeyModifiers::SHIFT)
+        && !key.modifiers.contains(KeyModifiers::ALT)
+        && !key.modifiers.contains(KeyModifiers::CONTROL)
+}
+
+/// `Cmd+Opt+Left`: move keyboard focus to the LEFT editor group while
+/// split. Distinct from the plain `Opt+Left` word-left motion (no SUPER)
+/// by requiring both SUPER and ALT. iTerm2 forwards it as `ESC [ 1 ; 12 D`.
+fn is_focus_group_left_key(key: KeyEvent) -> bool {
+    let KeyCode::Left = key.code else {
+        return false;
+    };
+    key.modifiers.contains(KeyModifiers::SUPER) && key.modifiers.contains(KeyModifiers::ALT)
+}
+
+/// `Cmd+Opt+Right`: move keyboard focus to the RIGHT editor group while
+/// split. Mirror of `is_focus_group_left_key`. iTerm2 forwards it as
+/// `ESC [ 1 ; 12 C`.
+fn is_focus_group_right_key(key: KeyEvent) -> bool {
+    let KeyCode::Right = key.code else {
+        return false;
+    };
+    key.modifiers.contains(KeyModifiers::SUPER) && key.modifiers.contains(KeyModifiers::ALT)
 }
 
 /// `Cmd+Shift+T` (Mac SUPER+SHIFT+T): focus the Terminal pane from any
@@ -12839,20 +13188,24 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             // Active editor image preview: bake-once-emit-each-frame
             // overlay, just like the welcome wordmark. Sent after ratatui
             // has finished its diff so the image bytes land on cells
-            // ratatui won't repaint until layout changes again.
-            if let Some((osc, layout)) = app.editor_image_payload() {
-                use std::io::Write;
-                let mut out = stdout();
-                let cursor_on = app.cursor_should_be_visible();
-                let _ = write!(out, "\x1b[?25l\x1b[s");
-                let _ = write!(out, "\x1b[{};{}H", layout.cell_y + 1, layout.cell_x + 1);
-                let _ = out.write_all(osc.as_bytes());
-                let _ = write!(out, "\x1b[u");
-                if cursor_on {
-                    let _ = write!(out, "\x1b[?25h");
+            // ratatui won't repaint until layout changes again. One slot
+            // per editor split column (0 = left, 1 = right); when not
+            // split only slot 0 ever has a payload.
+            for side in 0..2 {
+                if let Some((osc, layout)) = app.editor_image_payload(side) {
+                    use std::io::Write;
+                    let mut out = stdout();
+                    let cursor_on = app.cursor_should_be_visible();
+                    let _ = write!(out, "\x1b[?25l\x1b[s");
+                    let _ = write!(out, "\x1b[{};{}H", layout.cell_y + 1, layout.cell_x + 1);
+                    let _ = out.write_all(osc.as_bytes());
+                    let _ = write!(out, "\x1b[u");
+                    if cursor_on {
+                        let _ = write!(out, "\x1b[?25h");
+                    }
+                    let _ = out.flush();
+                    app.mark_editor_image_displayed(side);
                 }
-                let _ = out.flush();
-                app.mark_editor_image_displayed();
             }
             // Codeberg badge image overlay on the welcome panel. Same
             // re-emit-every-frame strategy as the activity bar: ratatui
