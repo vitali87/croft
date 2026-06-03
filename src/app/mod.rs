@@ -734,6 +734,9 @@ pub struct App {
     terminal_click: ClickTracker,
     /// Pane whose scrollbar is currently being dragged with the left mouse button.
     scrollbar_drag: Option<Pane>,
+    /// True while the editor's horizontal scrollbar thumb is being dragged.
+    /// Only the editor has a horizontal bar, so a bool suffices.
+    editor_hscrollbar_drag: bool,
     welcome: WelcomeState,
     /// Channel to the background search worker. Each keystroke or toggle
     /// flip pushes a `(query, opts)` request here; the worker debounces
@@ -1354,6 +1357,7 @@ impl App {
             tree_click: ClickTracker::default(),
             terminal_click: ClickTracker::default(),
             scrollbar_drag: None,
+            editor_hscrollbar_drag: false,
             welcome,
             search_query_tx,
             search_results_rx,
@@ -8678,6 +8682,7 @@ impl App {
         let in_search_scrollbar = self.sidebar_view == SidebarView::Search
             && rect_contains(self.search.last_scrollbar, m.column, m.row);
         let in_editor_scrollbar = rect_contains(self.editor.last_scrollbar, m.column, m.row);
+        let in_editor_hscrollbar = rect_contains(self.editor.last_hscrollbar, m.column, m.row);
 
         if matches!(m.kind, MouseEventKind::Moved) {
             self.on_mouse_moved(m.column, m.row, in_editor);
@@ -8960,6 +8965,14 @@ impl App {
                     self.focus_pane(Pane::Editor);
                     self.editor.scroll_to_bar_y(m.row);
                     self.scrollbar_drag = Some(Pane::Editor);
+                    self.editor_click.clear();
+                    self.poke_cursor();
+                    return;
+                }
+                if in_editor_hscrollbar {
+                    self.focus_pane(Pane::Editor);
+                    self.editor.scroll_to_bar_x(m.column);
+                    self.editor_hscrollbar_drag = true;
                     self.editor_click.clear();
                     self.poke_cursor();
                     return;
@@ -9283,6 +9296,11 @@ impl App {
                     self.handle_splitter_drag(kind, m.column, m.row);
                     return;
                 }
+                if self.editor_hscrollbar_drag {
+                    self.editor.scroll_to_bar_x(m.column);
+                    self.poke_cursor();
+                    return;
+                }
                 if let Some(pane) = self.scrollbar_drag {
                     match pane {
                         Pane::Tree => match self.sidebar_view {
@@ -9381,6 +9399,9 @@ impl App {
                     return;
                 }
                 if self.scrollbar_drag.take().is_some() {
+                    return;
+                }
+                if std::mem::take(&mut self.editor_hscrollbar_drag) {
                     return;
                 }
                 if let Some(drag) = self.tree_drag.take() {

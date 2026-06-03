@@ -3976,6 +3976,69 @@ fn mouse_horizontal_wheel_over_diff_pans_horizontally() {
 }
 
 #[test]
+fn dragging_editor_horizontal_scrollbar_pans_the_buffer() {
+    // The editor paints a horizontal scrollbar on its bottom row when the
+    // longest line overflows the text column. Clicking and dragging its thumb
+    // must move scroll_col, and releasing must end the drag.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let f = tmp.path().join("long.txt");
+    let long: String = std::iter::repeat_n('z', 500).collect();
+    std::fs::write(&f, format!("{long}\n")).unwrap();
+    app.editor.open(&f).unwrap();
+    app.focus_pane(Pane::Editor);
+
+    let backend = ratatui::backend::TestBackend::new(80, 24);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+
+    let bar = app.editor.last_hscrollbar;
+    assert!(
+        bar.width > 0 && bar.height == 1,
+        "an overflowing line must paint a horizontal scrollbar"
+    );
+
+    // Click-drag the thumb to the far-right end of the track.
+    let right_x = bar.x + bar.width - 1;
+    app.handle_mouse(crossterm::event::MouseEvent {
+        kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        column: right_x,
+        row: bar.y,
+        modifiers: KeyModifiers::NONE,
+    });
+    assert!(
+        app.editor.scroll_col > 0,
+        "clicking the right of the track must pan right"
+    );
+    let after_down = app.editor.scroll_col;
+
+    // Dragging back to the left edge pans back to column 0.
+    app.handle_mouse(crossterm::event::MouseEvent {
+        kind: crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+        column: bar.x,
+        row: bar.y,
+        modifiers: KeyModifiers::NONE,
+    });
+    assert_eq!(
+        app.editor.scroll_col, 0,
+        "dragging to the left edge pans home"
+    );
+    assert_ne!(after_down, app.editor.scroll_col);
+
+    // Release ends the drag so later moves don't keep panning.
+    app.handle_mouse(crossterm::event::MouseEvent {
+        kind: crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
+        column: bar.x,
+        row: bar.y,
+        modifiers: KeyModifiers::NONE,
+    });
+    assert!(
+        !app.editor_hscrollbar_drag,
+        "releasing must clear the drag flag"
+    );
+}
+
+#[test]
 fn mouse_wheel_over_search_panel_scrolls_the_results_list() {
     // User report: search shows thousands of matches piling up but
     // the panel can't be scrolled with the wheel - the user is stuck

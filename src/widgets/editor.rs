@@ -1101,6 +1101,17 @@ pub struct Editor {
     /// happens on actual changes, not every frame.
     pub edit_seq: u64,
     pub scroll: usize,
+    /// In soft-wrap mode, the index of the first visible visual segment within
+    /// the top logical line (`self.scroll`). Lets the viewport start partway
+    /// through a paragraph that wraps to more rows than the pane is tall.
+    /// Always 0 outside wrap mode.
+    scroll_sub: usize,
+    /// Cached total visual-row counts for soft-wrap, one `(width, total)` entry
+    /// per width probed this frame (the renderer tests both the wide and the
+    /// vbar-narrowed width, so a single slot would thrash). Cleared when the
+    /// buffer changes (alongside `hscroll_content_cols`). Drives the vertical
+    /// scrollbar's extent in wrap mode without an O(total chars) sweep/frame.
+    wrap_total_cache: Vec<(usize, usize)>,
     /// Horizontal scroll offset in CHARACTERS. Long lines (e.g. minified
     /// JS, base64 blobs in HTML) need to scroll right so search hits and
     /// cursor positions deep in a line are reachable. The render slices
@@ -1116,6 +1127,27 @@ pub struct Editor {
     pub last_area: Rect,
     pub last_inner: Rect,
     pub last_scrollbar: Rect,
+    /// Hit-test rect for the horizontal scrollbar painted on the bottom inner
+    /// row when the longest line overflows the text column. `Rect::default()`
+    /// when no line overflows (the row is given back to text). `App` consults
+    /// this on click/drag to map an X coordinate onto `scroll_col`.
+    pub last_hscrollbar: Rect,
+    /// Number of rows actually used for text in the last render, i.e.
+    /// `inner.height` minus the horizontal scrollbar row when present. The
+    /// vertical viewport math (page size, vertical thumb) reads this so the
+    /// cursor never hides behind the horizontal bar.
+    last_text_rows: u16,
+    /// Cached longest-line width in CHARACTERS. Recomputing it every frame is
+    /// O(total chars), so it is invalidated (set `None`) only when the buffer
+    /// content changes (`open`/`mark_buffer_changed`) and recomputed lazily.
+    hscroll_content_cols: Option<usize>,
+    /// Visual-row layout captured by the most recent render: one entry per
+    /// painted screen row, each `(logical_line, char_start, char_end)`. In
+    /// soft-wrap mode a logical line spans several entries; otherwise there is
+    /// one entry per visible line with the range `[scroll_col, scroll_col +
+    /// text_width)`. `cursor_screen_pos`/`buffer_pos_at` invert it so the
+    /// cursor and clicks land on the right cell regardless of wrapping.
+    last_wrap_rows: Vec<(usize, usize, usize)>,
     pub last_gutter_width: u16,
     pub selection: Option<EditorSelection>,
     /// Secondary carets for multi-cursor editing (VS Code "Change All
@@ -1194,6 +1226,8 @@ impl Editor {
             lines: Vec::new(),
             edit_seq: 0,
             scroll: 0,
+            scroll_sub: 0,
+            wrap_total_cache: Vec::new(),
             scroll_col: 0,
             cursor_row: 0,
             cursor_col: 0,
@@ -1203,6 +1237,10 @@ impl Editor {
             last_area: Rect::default(),
             last_inner: Rect::default(),
             last_scrollbar: Rect::default(),
+            last_hscrollbar: Rect::default(),
+            last_text_rows: 0,
+            hscroll_content_cols: None,
+            last_wrap_rows: Vec::new(),
             last_gutter_width: 0,
             selection: None,
             carets: Vec::new(),
@@ -1232,6 +1270,189 @@ impl Editor {
     fn mark_buffer_changed(&mut self) {
         self.dirty = true;
         self.edit_seq = self.edit_seq.wrapping_add(1);
+        self.hscroll_content_cols = None;
+        self.wrap_total_cache.clear();
+    }
+
+    /// Soft-wrap mode: long lines fold onto multiple visual rows instead of
+    /// scrolling horizontally. Matches VS Code, which ships word-wrap on by
+    /// default for Markdown only (`"[markdown]": { "editor.wordWrap": "on" }`).
+    pub fn wrap_enabled(&self) -> bool {
+        matches!(self.lang, Some(LangKind::Markdown))
+    }
+
+    /// Longest line width in characters, cached until the buffer changes.
+    /// Drives the horizontal scrollbar's content extent and the `scroll_col`
+    /// clamp. `&mut self` so the lazy recompute can populate the cache.
+    fn content_cols(&mut self) -> usize {
+        if let Some(cols) = self.hscroll_content_cols {
+            return cols;
+        }
+        let cols = self
+            .lines
+            .iter()
+            .map(|l| l.chars().count())
+            .max()
+            .unwrap_or(0);
+        self.hscroll_content_cols = Some(cols);
+        cols
+    }
+
+    // -- Soft-wrap visual-row geometry ------------------------------------
+    // In wrap mode a logical line maps to one or more visual rows. These
+    // helpers convert between logical positions and the flattened visual-row
+    // space the viewport scrolls over. They are only called on the wrap path;
+    // the non-wrap path keeps its cheap one-row-per-line arithmetic.
+
+    /// Wrap segments of a single logical line at the given text width.
+    fn line_segments(&self, line: usize, width: usize) -> Vec<(usize, usize)> {
+        let chars: Vec<char> = self
+            .lines
+            .get(line)
+            .map(|l| l.chars().collect())
+            .unwrap_or_default();
+        wrap_segments(&chars, width)
+    }
+
+    /// Number of visual rows a logical line occupies. Avoids allocating the
+    /// segment vector for the common case of a line that already fits.
+    fn line_visual_rows(&self, line: usize, width: usize) -> usize {
+        if width == 0 {
+            return 1;
+        }
+        let len = self.line_char_len(line);
+        if len <= width {
+            1
+        } else {
+            self.line_segments(line, width).len()
+        }
+    }
+
+    /// Total visual rows across the whole buffer, cached per text width.
+    fn total_visual_rows(&mut self, width: usize) -> usize {
+        if let Some(&(_, total)) = self.wrap_total_cache.iter().find(|&&(w, _)| w == width) {
+            return total;
+        }
+        let total: usize = (0..self.lines.len())
+            .map(|l| self.line_visual_rows(l, width))
+            .sum();
+        self.wrap_total_cache.push((width, total));
+        total
+    }
+
+    /// Visual-row index of the current viewport top `(scroll, scroll_sub)`.
+    fn top_visual_row(&self, width: usize) -> usize {
+        (0..self.scroll)
+            .map(|l| self.line_visual_rows(l, width))
+            .sum::<usize>()
+            + self.scroll_sub
+    }
+
+    /// Visual-row index of the segment containing the cursor.
+    fn cursor_visual_row(&self, width: usize) -> usize {
+        let before: usize = (0..self.cursor_row)
+            .map(|l| self.line_visual_rows(l, width))
+            .sum();
+        before + self.segment_index_of_col(self.cursor_row, self.cursor_col, width)
+    }
+
+    /// Which segment of `line` holds character column `col`. A column sitting
+    /// exactly on a wrap boundary belongs to the *next* segment (its start),
+    /// matching where `cursor_screen_pos` paints the caret; only the true line
+    /// end maps to the final segment. Keeping this predicate identical to the
+    /// one in `cursor_screen_pos` is what keeps vertical motion consistent with
+    /// where the caret actually renders.
+    fn segment_index_of_col(&self, line: usize, col: usize, width: usize) -> usize {
+        let segs = self.line_segments(line, width);
+        let line_len = self.line_char_len(line);
+        segs.iter()
+            .position(|&(s, e)| col >= s && (col < e || (col == e && e == line_len)))
+            .unwrap_or(segs.len().saturating_sub(1))
+    }
+
+    /// Point the viewport top at a global visual-row index, decomposing it back
+    /// into `(scroll, scroll_sub)`. Parks at the last segment when `target`
+    /// runs past the end of the buffer.
+    fn set_top_to_visual_row(&mut self, target: usize, width: usize) {
+        let mut acc = 0;
+        for line in 0..self.lines.len() {
+            let n = self.line_visual_rows(line, width);
+            if acc + n > target {
+                self.scroll = line;
+                self.scroll_sub = target - acc;
+                return;
+            }
+            acc += n;
+        }
+        self.scroll = self.lines.len().saturating_sub(1);
+        self.scroll_sub = self.line_visual_rows(self.scroll, width).saturating_sub(1);
+    }
+
+    /// Logical `(line, char_col)` at the start of a global visual row -
+    /// the inverse of `cursor_visual_row` for the row's first column.
+    fn logical_pos_at_visual_row(&self, target: usize, width: usize) -> (usize, usize) {
+        let mut acc = 0;
+        for line in 0..self.lines.len() {
+            let segs = self.line_segments(line, width);
+            if acc + segs.len() > target {
+                return (line, segs[target - acc].0);
+            }
+            acc += segs.len();
+        }
+        (self.lines.len().saturating_sub(1), 0)
+    }
+
+    /// Move the wrap viewport so the given visual row is at the top, clamped to
+    /// the document, then pull the cursor into the new viewport so the render's
+    /// cursor-visibility clamp doesn't immediately undo the scroll. Used by the
+    /// wheel and the vertical scrollbar in wrap mode.
+    fn wrap_set_top(&mut self, top_target: usize) {
+        let width = self.visible_text_width();
+        let viewport = self.text_rows();
+        if width == 0 || viewport == 0 {
+            return;
+        }
+        let total = self.total_visual_rows(width);
+        let new_top = top_target.min(total.saturating_sub(viewport));
+        self.set_top_to_visual_row(new_top, width);
+        let cursor_vrow = self.cursor_visual_row(width);
+        let target_row = if cursor_vrow < new_top {
+            Some(new_top)
+        } else if cursor_vrow >= new_top + viewport {
+            Some(new_top + viewport - 1)
+        } else {
+            None
+        };
+        if let Some(vrow) = target_row {
+            let (line, col) = self.logical_pos_at_visual_row(vrow, width);
+            self.cursor_row = line;
+            self.cursor_col = col.min(self.line_char_len(line));
+        }
+        self.last_edit_kind = None;
+    }
+
+    /// Move the cursor one visual row up (`dir = -1`) or down (`dir = 1`) in
+    /// wrap mode, preserving the visual column within the row. Unlike the
+    /// logical `move_up`/`move_down`, this steps through wrapped segments of a
+    /// paragraph rather than skipping the whole logical line.
+    fn wrap_move_vertical(&mut self, dir: isize) {
+        let width = self.visible_text_width().max(1);
+        let segs = self.line_segments(self.cursor_row, width);
+        let seg_idx = self.segment_index_of_col(self.cursor_row, self.cursor_col, width);
+        let goal_col = self.cursor_col - segs[seg_idx].0;
+        let current = self.cursor_visual_row(width) as isize;
+        let target = current + dir;
+        if target < 0 || target as usize >= self.total_visual_rows(width) {
+            return;
+        }
+        let (line, seg_start) = self.logical_pos_at_visual_row(target as usize, width);
+        let (s, e) = self
+            .line_segments(line, width)
+            .into_iter()
+            .find(|&(s, _)| s == seg_start)
+            .unwrap_or((seg_start, seg_start));
+        self.cursor_row = line;
+        self.cursor_col = (s + goal_col).min(e).min(self.line_char_len(line));
     }
 
     /// Identifier chars immediately to the left of the cursor on the
@@ -1274,6 +1495,9 @@ impl Editor {
         if self.lines.is_empty() {
             self.lines.push(String::new());
         }
+        self.hscroll_content_cols = None;
+        self.wrap_total_cache.clear();
+        self.scroll_sub = 0;
         self.path = Some(path.to_path_buf());
         self.disk_stamp = Self::disk_stamp_of(path);
         self.disk_conflict = false;
@@ -2171,7 +2395,9 @@ impl Editor {
     }
 
     pub fn move_up(&mut self) {
-        if self.cursor_row > 0 {
+        if self.wrap_enabled() {
+            self.wrap_move_vertical(-1);
+        } else if self.cursor_row > 0 {
             self.cursor_row -= 1;
             self.cursor_col = self.cursor_col.min(self.line_char_len(self.cursor_row));
         }
@@ -2179,7 +2405,9 @@ impl Editor {
     }
 
     pub fn move_down(&mut self) {
-        if self.cursor_row + 1 < self.lines.len() {
+        if self.wrap_enabled() {
+            self.wrap_move_vertical(1);
+        } else if self.cursor_row + 1 < self.lines.len() {
             self.cursor_row += 1;
             self.cursor_col = self.cursor_col.min(self.line_char_len(self.cursor_row));
         }
@@ -2489,6 +2717,9 @@ impl Editor {
     /// position is sacrosanct. `pub(crate)` so callers like
     /// `App::open_search_hit` can sync horizontal scroll after a jump.
     pub(crate) fn ensure_cursor_col_visible(&mut self) {
+        if self.wrap_enabled() {
+            return;
+        }
         let width = self.visible_text_width();
         if width == 0 {
             return;
@@ -2504,8 +2735,8 @@ impl Editor {
     /// inner height.  Falls back to a sensible default before the first
     /// render (when `last_inner.height` is still 0).
     pub fn page_size(&self) -> usize {
-        let from_inner = self.last_inner.height as usize;
-        if from_inner > 0 { from_inner } else { 20 }
+        let from_rows = self.text_rows();
+        if from_rows > 0 { from_rows } else { 20 }
     }
 
     /// Move the viewport down by exactly one screen so the first
@@ -2513,6 +2744,11 @@ impl Editor {
     /// the cursor on that new top row.  Clamps at end of file.
     pub fn page_down_one_screen(&mut self) {
         let page = self.page_size();
+        if self.wrap_enabled() {
+            let top = self.top_visual_row(self.visible_text_width());
+            self.wrap_set_top(top + page);
+            return;
+        }
         let max_row = self.lines.len().saturating_sub(1);
         let new_top = (self.scroll + page).min(max_row);
         self.scroll = new_top;
@@ -2526,6 +2762,11 @@ impl Editor {
     /// Clamps at the start of file.
     pub fn page_up_one_screen(&mut self) {
         let page = self.page_size();
+        if self.wrap_enabled() {
+            let top = self.top_visual_row(self.visible_text_width());
+            self.wrap_set_top(top.saturating_sub(page));
+            return;
+        }
         let new_top = self.scroll.saturating_sub(page);
         self.scroll = new_top;
         self.cursor_row = new_top;
@@ -2544,24 +2785,78 @@ impl Editor {
     }
 
     pub fn scroll_up(&mut self, n: usize) {
-        self.scroll_view_to(self.scroll.saturating_sub(n));
+        if self.wrap_enabled() {
+            let top = self.top_visual_row(self.visible_text_width());
+            self.wrap_set_top(top.saturating_sub(n));
+        } else {
+            self.scroll_view_to(self.scroll.saturating_sub(n));
+        }
     }
 
     pub fn scroll_down(&mut self, n: usize) {
-        self.scroll_view_to(self.scroll.saturating_add(n));
+        if self.wrap_enabled() {
+            let top = self.top_visual_row(self.visible_text_width());
+            self.wrap_set_top(top.saturating_add(n));
+        } else {
+            self.scroll_view_to(self.scroll.saturating_add(n));
+        }
     }
 
     pub fn scroll_to_bar_y(&mut self, y: u16) -> bool {
+        let viewport = self.text_rows();
+        if self.wrap_enabled() {
+            let width = self.visible_text_width();
+            let total = self.total_visual_rows(width);
+            let Some(metrics) = scrollbar::vertical_metrics(
+                self.last_scrollbar,
+                total,
+                viewport,
+                self.top_visual_row(width),
+            ) else {
+                return false;
+            };
+            self.wrap_set_top(scrollbar::scroll_for_y(metrics, y));
+            return true;
+        }
         let Some(metrics) = scrollbar::vertical_metrics(
             self.last_scrollbar,
             self.lines.len(),
-            self.last_inner.height as usize,
+            viewport,
             self.scroll,
         ) else {
             return false;
         };
         self.scroll_view_to(scrollbar::scroll_for_y(metrics, y));
         true
+    }
+
+    /// Map a click/drag X coordinate on the horizontal scrollbar onto
+    /// `scroll_col`. Returns false when there is no horizontal bar (no
+    /// overflow), so the caller can fall through to other hit-tests.
+    pub fn scroll_to_bar_x(&mut self, x: u16) -> bool {
+        let width = self.visible_text_width();
+        let Some(metrics) = scrollbar::horizontal_metrics(
+            self.last_hscrollbar,
+            self.content_cols(),
+            width,
+            self.scroll_col,
+        ) else {
+            return false;
+        };
+        self.scroll_col = scrollbar::scroll_for_x(metrics, x);
+        true
+    }
+
+    /// Rows used for text in the last render (inner height minus the
+    /// horizontal scrollbar row when present). Falls back to the full inner
+    /// height before the first render populates `last_text_rows`.
+    fn text_rows(&self) -> usize {
+        let rows = self.last_text_rows as usize;
+        if rows > 0 {
+            rows
+        } else {
+            self.last_inner.height as usize
+        }
     }
 
     fn scroll_view_to(&mut self, top: usize) {
@@ -2648,18 +2943,29 @@ impl Editor {
     }
 
     pub fn buffer_pos_at(&self, col: u16, row: u16) -> Option<(usize, usize)> {
-        if self.last_inner.height == 0 || self.lines.is_empty() {
-            return None;
-        }
-        if row < self.last_inner.y || row >= self.last_inner.y + self.last_inner.height {
-            return None;
-        }
-        let line = self.scroll + (row - self.last_inner.y) as usize;
-        if line >= self.lines.len() {
+        if self.last_inner.height == 0 || self.lines.is_empty() || row < self.last_inner.y {
             return None;
         }
         let text_x = self.last_inner.x + self.last_gutter_width + 1;
-        if col < text_x {
+        if self.wrap_enabled() {
+            // Map the screen row through the last render's visual-row layout so
+            // a click lands on the right logical line/column even when wrapped.
+            // The blank tail of a folded row maps to the segment end, letting
+            // you click to end-of-visual-line.
+            let &(line, start, end) = self.last_wrap_rows.get((row - self.last_inner.y) as usize)?;
+            if col < text_x {
+                return None;
+            }
+            let visible_col = (col - text_x) as usize;
+            let char_col = (start + visible_col).min(end).min(self.line_char_len(line));
+            return Some((line, char_col));
+        }
+        // Non-wrap: one row per line, horizontally scrolled by `scroll_col`.
+        if row >= self.last_inner.y + self.last_inner.height {
+            return None;
+        }
+        let line = self.scroll + (row - self.last_inner.y) as usize;
+        if line >= self.lines.len() || col < text_x {
             return None;
         }
         let text_width = self
@@ -2802,6 +3108,59 @@ fn byte_index_of_char(line: &str, chars_in: usize) -> usize {
         .unwrap_or(line.len())
 }
 
+/// A character VS Code breaks a wrapped line *after* (a subset of its default
+/// `editor.wordWrapBreakAfterCharacters` that matters for Latin/Markdown
+/// prose): whitespace plus trailing punctuation, so the next word starts a
+/// fresh visual row.
+fn is_wrap_break_after(c: char) -> bool {
+    c.is_whitespace()
+        || matches!(
+            c,
+            ')' | ']' | '}' | '-' | '/' | ',' | '.' | ';' | ':' | '?' | '!'
+        )
+}
+
+/// Soft-wrap a logical line into visual segments for word-wrap mode.
+///
+/// Each segment is a half-open `(start_char, end_char)` range over `chars`;
+/// the segments tile the line with no gaps or overlaps, so the inverse maps
+/// (cursor -> screen, click -> cursor) stay exact. Breaks after the last
+/// break-after character at or before `width` when one exists (word wrap), and
+/// hard-breaks a single token longer than `width` at the column. A line that
+/// already fits, an empty line, or `width == 0` yields one segment so the line
+/// still occupies a row. Mirrors VS Code's monospace wrap: pick the rightmost
+/// break opportunity within the column, else split the over-long token.
+fn wrap_segments(chars: &[char], width: usize) -> Vec<(usize, usize)> {
+    if width == 0 || chars.len() <= width {
+        return vec![(0, chars.len())];
+    }
+    let mut segs = Vec::new();
+    let mut start = 0;
+    while start < chars.len() {
+        if chars.len() - start <= width {
+            segs.push((start, chars.len()));
+            break;
+        }
+        let limit = start + width;
+        // Scan back from the hard limit for the rightmost break-after char;
+        // `i` is the char count, so the char sits at `chars[i - 1]` and the
+        // segment becomes `[start, i)`. Stop at `start + 1` so a break right
+        // at the segment start can't produce a one-char row (or stall).
+        let mut brk = limit;
+        let mut i = limit;
+        while i > start + 1 {
+            if is_wrap_break_after(chars[i - 1]) {
+                brk = i;
+                break;
+            }
+            i -= 1;
+        }
+        segs.push((start, brk));
+        start = brk;
+    }
+    segs
+}
+
 /// Shift highlight spans left by `byte_start`, dropping spans that fall
 /// entirely before the cut and clamping spans straddling the cut.
 fn shift_spans_for_view(spans: &[HiSpan], byte_start: usize) -> Vec<HiSpan> {
@@ -2862,6 +3221,7 @@ impl Widget for &mut Editor {
         self.last_area = area;
         self.last_inner = inner;
         self.last_scrollbar = Rect::default();
+        self.last_hscrollbar = Rect::default();
 
         let height = inner.height as usize;
         if height == 0 {
@@ -2885,30 +3245,144 @@ impl Widget for &mut Editor {
         // tab the user just switched away from can't fire.
         self.diff_prev_arrow = Rect::default();
         self.diff_next_arrow = Rect::default();
-        if self.cursor_row < self.scroll {
-            self.scroll = self.cursor_row;
-        } else if self.cursor_row >= self.scroll + height {
-            self.scroll = self.cursor_row + 1 - height;
-        }
 
         let gutter_width = (self.lines.len() + 1).to_string().len() as u16 + 1;
         self.last_gutter_width = gutter_width;
+        let wrap = self.wrap_enabled();
+        if wrap {
+            // Wrapped text folds onto extra rows instead of scrolling sideways.
+            self.scroll_col = 0;
+        }
+        let text_x = inner.x + gutter_width + 1;
+        let content_cols = self.content_cols();
+
+        // Layout has a small cycle: the horizontal bar takes the bottom row
+        // only when a line overflows the text column, but the text column's
+        // width depends on whether the vertical bar takes a column. Break it
+        // in one pass: provisionally reserve the vertical bar's column from
+        // the FULL height to decide the horizontal bar, then recompute the
+        // vertical thumb against the real (possibly shortened) viewport.
+        // Reserving the horizontal row can only ever narrow the text column,
+        // never widen it, so a line that overflows under the provisional
+        // width still overflows under the final one - the decision is stable.
+        // The horizontal bar never appears in wrap mode (lines fold instead).
+        let provisional_text_width = inner
+            .width
+            .saturating_sub(gutter_width + 2 + u16::from(self.lines.len() > height))
+            as usize;
+        let hbar_present =
+            !wrap && provisional_text_width > 0 && content_cols > provisional_text_width;
+        let text_height = height - usize::from(hbar_present);
+        self.last_text_rows = text_height as u16;
+
         let scrollbar_area = Rect {
             x: inner.x + inner.width.saturating_sub(1),
             y: inner.y,
             width: u16::from(inner.width > 0),
-            height: inner.height,
+            height: text_height as u16,
         };
-        let scrollbar_metrics =
-            scrollbar::vertical_metrics(scrollbar_area, self.lines.len(), height, self.scroll);
+
+        // Decide the vertical scrollbar and final text width, then clamp the
+        // scroll so the cursor stays visible. In wrap mode the content extent
+        // and scroll position are measured in VISUAL rows (a logical line may
+        // span several); otherwise in logical lines, one per row.
+        let (text_width, scrollbar_metrics) = if wrap {
+            let wide = inner.width.saturating_sub(gutter_width + 2) as usize;
+            // Overflow at the wide width forces the vbar, which narrows the
+            // column and only ever adds rows, so the decision is stable.
+            let vbar = self.total_visual_rows(wide) > text_height;
+            let tw = if vbar { wide.saturating_sub(1) } else { wide };
+            let content_rows = self.total_visual_rows(tw);
+
+            // Keep the cursor's visual row inside the viewport.
+            if text_height > 0 {
+                let cursor_vrow = self.cursor_visual_row(tw);
+                let mut top = self.top_visual_row(tw);
+                if cursor_vrow < top {
+                    top = cursor_vrow;
+                } else if cursor_vrow >= top + text_height {
+                    top = cursor_vrow + 1 - text_height;
+                }
+                top = top.min(content_rows.saturating_sub(text_height));
+                self.set_top_to_visual_row(top, tw);
+            }
+            let metrics = scrollbar::vertical_metrics(
+                scrollbar_area,
+                content_rows,
+                text_height,
+                self.top_visual_row(tw),
+            );
+            (tw as u16, metrics)
+        } else {
+            self.scroll_sub = 0;
+            if text_height > 0 {
+                if self.cursor_row < self.scroll {
+                    self.scroll = self.cursor_row;
+                } else if self.cursor_row >= self.scroll + text_height {
+                    self.scroll = self.cursor_row + 1 - text_height;
+                }
+            }
+            let metrics = scrollbar::vertical_metrics(
+                scrollbar_area,
+                self.lines.len(),
+                text_height,
+                self.scroll,
+            );
+            let sw = u16::from(metrics.is_some());
+            let tw = inner.width.saturating_sub(gutter_width + 2 + sw);
+            (tw, metrics)
+        };
         if let Some(metrics) = scrollbar_metrics {
             self.last_scrollbar = metrics.area;
         }
-        let scrollbar_width = u16::from(scrollbar_metrics.is_some());
-        let text_x = inner.x + gutter_width + 1;
-        let text_width = inner
-            .width
-            .saturating_sub(gutter_width + 2 + scrollbar_width);
+
+        // Clamp horizontal scroll (non-wrap only) so a wheel swipe can't
+        // strand the buffer off-screen, then lay out the horizontal bar.
+        let max_scroll_col = content_cols.saturating_sub(text_width as usize);
+        self.scroll_col = self.scroll_col.min(max_scroll_col);
+        let hbar_metrics = scrollbar::horizontal_metrics(
+            Rect {
+                x: text_x,
+                y: inner.y + text_height as u16,
+                width: text_width,
+                height: u16::from(hbar_present),
+            },
+            content_cols,
+            text_width as usize,
+            self.scroll_col,
+        );
+        self.last_hscrollbar = hbar_metrics.map(|m| m.area).unwrap_or_default();
+
+        // Build the visual-row layout the loop paints and the inverse maps
+        // (cursor/click) read back. Each entry is (logical_line, char_start,
+        // char_end). Non-wrap: one row per visible line, range [scroll_col,
+        // scroll_col + text_width). Wrap: the wrapped segments from
+        // (scroll, scroll_sub) down, capped at the viewport height.
+        let mut visual_rows: Vec<(usize, usize, usize)> = Vec::with_capacity(text_height);
+        if wrap {
+            let tw = text_width as usize;
+            let mut line = self.scroll;
+            let mut skip = self.scroll_sub;
+            while line < self.lines.len() && visual_rows.len() < text_height {
+                for (i, &(s, e)) in self.line_segments(line, tw).iter().enumerate() {
+                    if i < skip {
+                        continue;
+                    }
+                    visual_rows.push((line, s, e));
+                    if visual_rows.len() >= text_height {
+                        break;
+                    }
+                }
+                skip = 0;
+                line += 1;
+            }
+        } else {
+            let end = (self.scroll + text_height).min(self.lines.len());
+            for line in self.scroll..end {
+                visual_rows.push((line, self.scroll_col, self.scroll_col + text_width as usize));
+            }
+        }
+        self.last_wrap_rows = visual_rows.clone();
 
         let sel_norm = self
             .selection
@@ -2916,29 +3390,56 @@ impl Widget for &mut Editor {
             .map(|s| s.normalised());
         let occ_needle = self.selection_occurrence_needle();
 
-        let end = (self.scroll + height).min(self.lines.len());
-        for (row_idx, line_idx) in (self.scroll..end).enumerate() {
+        for (row_idx, &(line_idx, row_start, row_end)) in visual_rows.iter().enumerate() {
             let y = inner.y + row_idx as u16;
-            let line_no = format!(
-                "{:>width$} ",
-                line_idx + 1,
-                width = gutter_width as usize - 1
-            );
-            let gutter = Line::from(Span::styled(line_no, Style::default().fg(Color::DarkGray)));
-            buf.set_line(inner.x, y, &gutter, gutter_width);
+            // The line number shows once per logical line - on its first visual
+            // row; wrapped continuation rows get a blank gutter, like VS Code.
+            if !wrap || row_start == 0 {
+                let line_no = format!(
+                    "{:>width$} ",
+                    line_idx + 1,
+                    width = gutter_width as usize - 1
+                );
+                let gutter =
+                    Line::from(Span::styled(line_no, Style::default().fg(Color::DarkGray)));
+                buf.set_line(inner.x, y, &gutter, gutter_width);
+            } else {
+                buf.set_line(
+                    inner.x,
+                    y,
+                    &Line::from(" ".repeat(gutter_width as usize)),
+                    gutter_width,
+                );
+            }
 
+            // Per-row window: the segment [row_start, row_end). For non-wrap
+            // this is exactly the horizontally-scrolled view; for wrap it is
+            // one folded segment. The overlay painters treat `row_start` as
+            // the scroll offset and `row_width` as the text width, so the
+            // same code paints both modes.
             let raw = &self.lines[line_idx];
+            let line_len = self.line_char_len(line_idx);
+            let row_width = (row_end - row_start) as u16;
+            let byte_start = byte_index_of_char(raw, row_start);
+            let byte_end = byte_index_of_char(raw, row_end);
+            let visible_raw = &raw[byte_start..byte_end];
+            let seg_bytes = byte_end - byte_start;
             let empty: Vec<HiSpan> = Vec::new();
             let line_spans = self.highlights.get(line_idx).unwrap_or(&empty);
-            // Apply horizontal scroll: take the substring starting at
-            // `scroll_col` characters in and shift the highlight ranges
-            // by the same byte offset so syntax colouring follows.
-            let byte_start = byte_index_of_char(raw, self.scroll_col);
-            let visible_raw = &raw[byte_start..];
-            let shifted = shift_spans_for_view(line_spans, byte_start);
+            // Shift highlight spans to the row origin and clip them to the
+            // segment so build_line_spans never slices past `visible_raw`.
+            let shifted: Vec<HiSpan> = shift_spans_for_view(line_spans, byte_start)
+                .into_iter()
+                .filter_map(|mut sp| {
+                    if sp.start >= seg_bytes {
+                        return None;
+                    }
+                    sp.end = sp.end.min(seg_bytes);
+                    Some(sp)
+                })
+                .collect();
             let spans = build_line_spans(visible_raw, &shifted);
-            let line = Line::from(spans);
-            buf.set_line(text_x, y, &line, text_width);
+            buf.set_line(text_x, y, &Line::from(spans), row_width);
 
             if let Some(term) = self.search_highlight.as_deref() {
                 let active_on_line = self
@@ -2949,40 +3450,31 @@ impl Widget for &mut Editor {
                     buf,
                     text_x,
                     y,
-                    text_width,
+                    row_width,
                     raw,
                     term,
                     self.search_highlight_opts,
-                    self.scroll_col,
+                    row_start,
                     active_on_line,
                 );
             }
 
             if let Some(needle) = occ_needle.as_deref() {
-                paint_selection_occurrences(
-                    buf,
-                    text_x,
-                    y,
-                    text_width,
-                    raw,
-                    needle,
-                    self.scroll_col,
-                );
+                paint_selection_occurrences(buf, text_x, y, row_width, raw, needle, row_start);
             }
 
             if let Some(((sr, sc), (er, ec))) = sel_norm
                 && line_idx >= sr
                 && line_idx <= er
             {
-                let line_chars = self.line_char_len(line_idx);
-                let row_start = if line_idx == sr { sc } else { 0 };
-                // For non-final selected rows, paint past the line content
-                // by one cell to make the trailing newline visible.
-                let row_end = if line_idx == er { ec } else { line_chars + 1 };
-                let visible_start = row_start.saturating_sub(self.scroll_col);
-                let visible_end = row_end.saturating_sub(self.scroll_col);
+                let sel_start = if line_idx == sr { sc } else { 0 };
+                // For non-final selected rows, paint past the content by one
+                // cell to make the trailing newline visible.
+                let sel_end = if line_idx == er { ec } else { line_len + 1 };
+                let visible_start = sel_start.saturating_sub(row_start);
+                let visible_end = sel_end.saturating_sub(row_start);
                 if visible_end > visible_start {
-                    paint_selection_band(buf, text_x, y, text_width, visible_start, visible_end);
+                    paint_selection_band(buf, text_x, y, row_width, visible_start, visible_end);
                 }
             }
 
@@ -2993,17 +3485,21 @@ impl Widget for &mut Editor {
             for caret in &self.carets {
                 let ((cr0, cc0), (cr1, cc1)) = caret.normalised();
                 if line_idx >= cr0 && line_idx <= cr1 {
-                    let line_chars = self.line_char_len(line_idx);
-                    let row_start = if line_idx == cr0 { cc0 } else { 0 };
-                    let row_end = if line_idx == cr1 { cc1 } else { line_chars + 1 };
-                    let vs = row_start.saturating_sub(self.scroll_col);
-                    let ve = row_end.saturating_sub(self.scroll_col);
+                    let cs = if line_idx == cr0 { cc0 } else { 0 };
+                    let ce = if line_idx == cr1 { cc1 } else { line_len + 1 };
+                    let vs = cs.saturating_sub(row_start);
+                    let ve = ce.saturating_sub(row_start);
                     if ve > vs {
-                        paint_selection_band(buf, text_x, y, text_width, vs, ve);
+                        paint_selection_band(buf, text_x, y, row_width, vs, ve);
                     }
                 }
-                if caret.head.0 == line_idx {
-                    paint_block_cursor(buf, text_x, y, text_width, caret.head.1, self.scroll_col);
+                // Only paint the block on the visual row that holds the caret.
+                let c = caret.head.1;
+                let on_row = caret.head.0 == line_idx
+                    && c >= row_start
+                    && (c < row_end || (c == row_end && row_end == line_len));
+                if on_row {
+                    paint_block_cursor(buf, text_x, y, row_width, c, row_start);
                 }
             }
 
@@ -3014,6 +3510,9 @@ impl Widget for &mut Editor {
         }
         if let Some(metrics) = scrollbar_metrics {
             scrollbar::render_vertical(buf, metrics, self.focused);
+        }
+        if let Some(metrics) = hbar_metrics {
+            scrollbar::render_horizontal(buf, metrics, self.focused);
         }
     }
 }
@@ -3026,6 +3525,25 @@ impl Editor {
         if self.last_inner.height == 0 {
             return None;
         }
+        let text_x = self.last_inner.x + self.last_gutter_width + 1;
+        if self.wrap_enabled() {
+            // Find the visual row holding the cursor in the layout the last
+            // render captured (a logical line spans several wrapped rows). A
+            // column on a wrap boundary belongs to the next row's start.
+            let idx = self.last_wrap_rows.iter().position(|&(line, start, end)| {
+                line == self.cursor_row
+                    && self.cursor_col >= start
+                    && (self.cursor_col < end
+                        || (self.cursor_col == end && end == self.line_char_len(line)))
+            })?;
+            let (_, start, end) = self.last_wrap_rows[idx];
+            let visible_col = self.cursor_col - start;
+            if end == start || visible_col >= end - start {
+                return None;
+            }
+            return Some((text_x + visible_col as u16, self.last_inner.y + idx as u16));
+        }
+        // Non-wrap: one row per line, horizontally scrolled by `scroll_col`.
         if self.cursor_row < self.scroll {
             return None;
         }
@@ -3033,24 +3551,18 @@ impl Editor {
         if (row_in_view as u16) >= self.last_inner.height {
             return None;
         }
-        let text_x = self.last_inner.x + self.last_gutter_width + 1;
         let text_width = self
             .last_inner
             .width
             .saturating_sub(self.last_gutter_width + 2 + u16::from(self.last_scrollbar.width > 0));
-        if text_width == 0 {
-            return None;
-        }
-        if self.cursor_col < self.scroll_col {
+        if text_width == 0 || self.cursor_col < self.scroll_col {
             return None;
         }
         let visible_col = self.cursor_col - self.scroll_col;
         if (visible_col as u16) >= text_width {
             return None;
         }
-        let cx = text_x + visible_col as u16;
-        let cy = self.last_inner.y + row_in_view as u16;
-        Some((cx, cy))
+        Some((text_x + visible_col as u16, self.last_inner.y + row_in_view as u16))
     }
 
     /// Screen cell of the diff view's read-only caret (its selection head),
@@ -5415,6 +5927,51 @@ mod tests {
         assert_eq!(spans.len(), 1);
     }
 
+    fn chars(s: &str) -> Vec<char> {
+        s.chars().collect()
+    }
+
+    #[test]
+    fn wrap_segments_short_line_is_one_segment() {
+        assert_eq!(wrap_segments(&chars("hello"), 20), vec![(0, 5)]);
+        assert_eq!(wrap_segments(&chars(""), 20), vec![(0, 0)]);
+        // width 0 must not loop forever - one segment covering the line.
+        assert_eq!(wrap_segments(&chars("abc"), 0), vec![(0, 3)]);
+    }
+
+    #[test]
+    fn wrap_segments_breaks_after_a_space() {
+        // "the quick brown" at width 10 breaks after "the quick " (10 chars).
+        let segs = wrap_segments(&chars("the quick brown"), 10);
+        assert_eq!(segs, vec![(0, 10), (10, 15)]);
+    }
+
+    #[test]
+    fn wrap_segments_hard_breaks_a_too_long_word() {
+        // No space in the first 6 chars, so the word is split at the column.
+        let segs = wrap_segments(&chars("abcdefghij"), 6);
+        assert_eq!(segs, vec![(0, 6), (6, 10)]);
+    }
+
+    #[test]
+    fn wrap_segments_breaks_after_punctuation_like_vscode() {
+        // VS Code breaks after `/` (a break-after char), so a path folds at
+        // the slash rather than mid-segment.
+        let segs = wrap_segments(&chars("abc/defgh"), 6);
+        assert_eq!(segs, vec![(0, 4), (4, 9)]);
+    }
+
+    #[test]
+    fn wrap_segments_tile_the_line_without_gaps() {
+        let line = "alpha beta gamma delta epsilon zeta eta theta";
+        let segs = wrap_segments(&chars(line), 12);
+        assert_eq!(segs.first().unwrap().0, 0);
+        assert_eq!(segs.last().unwrap().1, line.chars().count());
+        for pair in segs.windows(2) {
+            assert_eq!(pair[0].1, pair[1].0, "segments must be contiguous");
+        }
+    }
+
     #[test]
     fn build_line_spans_full_line_highlighted() {
         let hi = vec![HiSpan {
@@ -6448,9 +7005,11 @@ mod tests {
 
     #[test]
     fn render_starts_line_from_scroll_col() {
-        // With scroll_col = 3, the line "ABCDEFGHIJ" should display starting
-        // from 'D' at the text origin, not from 'A'.
-        let mut e = editor_with("ABCDEFGHIJ");
+        // With scroll_col = 3, a long line should display starting from its
+        // 4th character ('D') at the text origin, not from 'A'. The line must
+        // overflow the viewport, otherwise render clamps scroll_col to 0 (a
+        // line that fits has nothing to scroll past).
+        let mut e = editor_with("ABCDEFGHIJ".repeat(10).as_str());
         e.scroll_col = 3;
         e.focused = true;
         let area = Rect {
@@ -6466,6 +7025,206 @@ mod tests {
             buf[(text_x, e.last_inner.y)].symbol(),
             "D",
             "first visible column must be the (scroll_col)th character"
+        );
+    }
+
+    #[test]
+    fn render_clamps_scroll_col_to_content_width() {
+        // A trackpad swipe can push scroll_col arbitrarily far right via
+        // scroll_right_by (no clamp of its own). Render must pull it back so
+        // the buffer can never be stranded entirely off-screen.
+        let mut e = editor_with("a".repeat(40).as_str());
+        e.focused = true;
+        e.scroll_right_by(10_000);
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 30,
+            height: 5,
+        };
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        (&mut e).render(area, &mut buf);
+        let text_width = e
+            .last_inner
+            .width
+            .saturating_sub(e.last_gutter_width + 2 + u16::from(e.last_scrollbar.width > 0))
+            as usize;
+        assert!(text_width > 0);
+        assert_eq!(
+            e.scroll_col,
+            40usize.saturating_sub(text_width),
+            "scroll_col must clamp to (content cols - text width)"
+        );
+    }
+
+    #[test]
+    fn render_shows_horizontal_scrollbar_only_on_overflow() {
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 30,
+            height: 6,
+        };
+
+        // Short line: no horizontal overflow, no bar.
+        let mut short = editor_with("abc");
+        short.focused = true;
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        (&mut short).render(area, &mut buf);
+        assert_eq!(
+            short.last_hscrollbar,
+            Rect::default(),
+            "a line that fits must not reserve a horizontal scrollbar row"
+        );
+
+        // Long line: overflow, bar painted on the bottom inner row.
+        let mut long = editor_with("a".repeat(500).as_str());
+        long.focused = true;
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        (&mut long).render(area, &mut buf);
+        assert!(
+            long.last_hscrollbar.width > 0 && long.last_hscrollbar.height == 1,
+            "an overflowing line must paint a one-row horizontal scrollbar"
+        );
+        assert_eq!(
+            long.last_hscrollbar.y,
+            long.last_inner.y + long.last_inner.height - 1,
+            "the horizontal scrollbar sits on the bottom inner row"
+        );
+    }
+
+    #[test]
+    fn scroll_to_bar_x_jumps_horizontal_offset() {
+        let mut e = editor_with("a".repeat(500).as_str());
+        e.focused = true;
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 30,
+            height: 6,
+        };
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        (&mut e).render(area, &mut buf);
+        assert!(e.last_hscrollbar.width > 0);
+        // Click the far-right end of the track → scroll to (near) max.
+        let right_x = e.last_hscrollbar.x + e.last_hscrollbar.width - 1;
+        assert!(e.scroll_to_bar_x(right_x));
+        assert!(
+            e.scroll_col > 0,
+            "dragging the thumb to the right edge must advance scroll_col"
+        );
+        // Click the far-left end → scroll back to 0.
+        assert!(e.scroll_to_bar_x(e.last_hscrollbar.x));
+        assert_eq!(e.scroll_col, 0);
+    }
+
+    fn md_editor(text: &str) -> Editor {
+        let mut e = editor_with(text);
+        e.lang = Some(LangKind::Markdown);
+        e
+    }
+
+    fn render_at(e: &mut Editor, w: u16, h: u16) {
+        e.focused = true;
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: w,
+            height: h,
+        };
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        (e as &mut Editor).render(area, &mut buf);
+    }
+
+    #[test]
+    fn markdown_wraps_long_line_without_horizontal_scrollbar() {
+        let mut e = md_editor(&"word ".repeat(40)); // 200 chars, one logical line
+        render_at(&mut e, 30, 10);
+        assert_eq!(
+            e.last_hscrollbar,
+            Rect::default(),
+            "wrapped markdown must not show a horizontal scrollbar"
+        );
+        assert_eq!(e.scroll_col, 0, "wrap mode never scrolls horizontally");
+        let rows_for_line0 = e.last_wrap_rows.iter().filter(|&&(l, _, _)| l == 0).count();
+        assert!(
+            rows_for_line0 > 1,
+            "a 200-char paragraph must fold onto multiple visual rows"
+        );
+    }
+
+    #[test]
+    fn non_markdown_long_line_still_scrolls_horizontally() {
+        let mut e = editor_with(&"a".repeat(200));
+        e.lang = Some(LangKind::Rust);
+        render_at(&mut e, 30, 10);
+        assert!(
+            e.last_hscrollbar.width > 0,
+            "code keeps the horizontal scrollbar instead of wrapping"
+        );
+    }
+
+    #[test]
+    fn markdown_cursor_screen_pos_lands_on_the_wrapped_row() {
+        let mut e = md_editor(&"a".repeat(100));
+        render_at(&mut e, 30, 10);
+        let (_, seg0_start, seg0_end) = e.last_wrap_rows[0];
+        assert_eq!(seg0_start, 0);
+        // A column just past the first visual row's content sits on row 2.
+        e.cursor_row = 0;
+        e.cursor_col = seg0_end + 1;
+        let (_, cy) = e.cursor_screen_pos().expect("cursor must be visible");
+        assert_eq!(
+            cy,
+            e.last_inner.y + 1,
+            "a column past the first segment renders on the second visual row"
+        );
+    }
+
+    #[test]
+    fn markdown_click_on_second_visual_row_maps_into_the_line() {
+        let mut e = md_editor(&"a".repeat(100));
+        render_at(&mut e, 30, 10);
+        let seg0_end = e.last_wrap_rows[0].2;
+        let text_x = e.last_inner.x + e.last_gutter_width + 1;
+        let (line, col) = e
+            .buffer_pos_at(text_x, e.last_inner.y + 1)
+            .expect("a click on the second visual row is a text hit");
+        assert_eq!(line, 0, "still the same logical line");
+        assert_eq!(
+            col, seg0_end,
+            "the first column of the second visual row is where segment one ended"
+        );
+    }
+
+    #[test]
+    fn markdown_move_down_steps_within_a_wrapped_paragraph() {
+        let mut e = md_editor(&"a".repeat(100));
+        render_at(&mut e, 30, 10);
+        e.cursor_row = 0;
+        e.cursor_col = 0;
+        e.move_down();
+        assert_eq!(
+            e.cursor_row, 0,
+            "move_down stays on the same logical line - it steps to the next wrapped segment"
+        );
+        assert!(e.cursor_col > 0, "and advances into that next segment");
+    }
+
+    #[test]
+    fn markdown_scrolls_to_reveal_tail_of_a_tall_paragraph() {
+        // One logical line taller than the viewport must still be scrollable
+        // via sub-line (segment) scroll.
+        let mut e = md_editor(&"a".repeat(400));
+        render_at(&mut e, 30, 6);
+        let before = e.last_wrap_rows[0];
+        e.scroll_down(3);
+        render_at(&mut e, 30, 6);
+        let after = e.last_wrap_rows[0];
+        assert_eq!(after.0, 0, "still the single logical line");
+        assert!(
+            after.1 > before.1,
+            "scrolling down advances into the paragraph (sub-line scroll)"
         );
     }
 

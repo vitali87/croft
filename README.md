@@ -157,6 +157,8 @@ croft setup-terminal --help
 | Arrows, Home, End | Navigate (clears any active selection) |
 | `Shift`+arrows / `Shift`+`Home` / `End` / `PageUp` / `PageDown` | Extend the selection by the same motion |
 | `PageUp` / `PageDown` (`fn`+`↑` / `fn`+`↓` on Mac) | Scroll exactly one viewport |
+| Two-finger horizontal swipe, or drag the bar | In code files, long lines that overflow the text column get a horizontal scrollbar on the editor's bottom row; swipe sideways to pan, or click and drag the thumb. Moving the cursor past either edge pans to follow it, and the scroll position can never strand the buffer off-screen. |
+| (Markdown only) soft word-wrap | Markdown files wrap long lines onto the next visual row instead of scrolling sideways (VS Code default for Markdown); no horizontal scrollbar appears. `↑`/`↓` move by visual row, the line number shows once per paragraph, and a single paragraph taller than the pane still scrolls. |
 | Any printable char, Enter, Backspace, Delete, Tab | Edit (typing or deleting with an active selection replaces it) |
 | Mouse drag | Select text; selection stays highlighted until you copy or click elsewhere. Every other occurrence of the selected text lights up in blue (VS Code-style selection highlight), for single-line, non-whitespace selections up to 200 characters |
 | `Ctrl`+`C` / `Cmd`+`C` | Copy the selection to the system clipboard (native NSPasteboard on macOS; OSC 52 fallback on remote) |
@@ -393,7 +395,7 @@ src/
     ├── hover_popup.rs   LSP hover popup (300 ms dwell, anchored at the cursor)
     ├── remote.rs        Remote (SSH) sidebar widget with empty-state hero illustration
     ├── run_debug.rs     Run and Debug sidebar widget: empty state plus Run [filename] button that spawns the active file in a fresh terminal
-    ├── scrollbar.rs     shared vertical-scrollbar geometry
+    ├── scrollbar.rs     shared vertical- and horizontal-scrollbar geometry
     ├── search.rs        sidebar search panel + .gitignore-aware substring walker
     ├── shortcuts.rs     F1 shortcuts modal: every binding grouped by pane, scrollable
     ├── source_control.rs Source Control sidebar widget: branch summary, commit input, change list, commit button, no-repo hero
