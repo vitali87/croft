@@ -3,6 +3,8 @@
 /// On macOS, prefer NSPasteboard directly. That avoids spawning `pbpaste`
 /// from croft's already-threaded TUI process, which is both slower and more
 /// brittle under macOS's fork-safety rules.
+///
+/// On Linux, try `wl-paste` (Wayland) then `xclip` then `xsel` (X11).
 pub fn read_string() -> Option<String> {
     #[cfg(test)]
     {
@@ -15,11 +17,15 @@ pub fn read_string() -> Option<String> {
         if let Some(s) = macos::read_string_native() {
             return Some(s);
         }
+        return read_pbpaste();
     }
-
-    read_pbpaste()
+    #[cfg(not(target_os = "macos"))]
+    {
+        linux::read_string()
+    }
 }
 
+#[cfg(target_os = "macos")]
 fn read_pbpaste() -> Option<String> {
     let out = std::process::Command::new("pbpaste").output().ok()?;
     if !out.status.success() {
@@ -38,10 +44,11 @@ fn read_pbpaste() -> Option<String> {
 /// it does not in every environment even with `AllowClipboardAccess` set.
 /// `pbcopy` is the second fall-back so we cover the case where the
 /// objc runtime resolves but `NSPasteboard` rejects the write for some
-/// sandboxing reason. On non-macOS targets the function returns `false`
-/// and the caller is expected to fall back to OSC 52, which is the only
-/// option when croft runs on a remote Linux host inside an SSH-launched
-/// iTerm2.
+/// sandboxing reason.
+///
+/// On Linux, try `wl-copy` (Wayland) then `xclip` then `xsel` (X11).
+/// Returns `false` only when none of those tools are available, in which
+/// case the caller falls back to OSC 52 (useful for remote SSH sessions).
 pub fn write_string(text: &str) -> bool {
     // NSPasteboard / NSString cannot carry an embedded NUL — `stringWithUTF8String:`
     // truncates at the first 0x00 — and silently truncating user data is far
@@ -62,12 +69,72 @@ pub fn write_string(text: &str) -> bool {
         if macos::write_string_native(text) {
             return true;
         }
-        write_pbcopy(text)
+        return write_pbcopy(text);
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = text;
-        false
+        linux::write_string(text)
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+mod linux {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    /// Write `text` to the system clipboard on Linux.
+    ///
+    /// Tries `wl-copy` (Wayland), then `xclip`, then `xsel`. Returns `true`
+    /// when one of them succeeded. Returns `false` when none are installed,
+    /// which happens in headless SSH sessions — the caller sends OSC 52 then.
+    pub fn write_string(text: &str) -> bool {
+        write_via(&["wl-copy"], text)
+            || write_via(&["xclip", "-selection", "clipboard"], text)
+            || write_via(&["xsel", "--clipboard", "--input"], text)
+    }
+
+    fn write_via(argv: &[&str], text: &str) -> bool {
+        let Ok(mut child) = Command::new(argv[0])
+            .args(&argv[1..])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        else {
+            return false;
+        };
+        let Some(mut stdin) = child.stdin.take() else {
+            let _ = child.wait();
+            return false;
+        };
+        if stdin.write_all(text.as_bytes()).is_err() {
+            let _ = child.wait();
+            return false;
+        }
+        drop(stdin);
+        child.wait().map(|s| s.success()).unwrap_or(false)
+    }
+
+    /// Read text from the system clipboard on Linux.
+    ///
+    /// Tries `wl-paste --no-newline` (Wayland), then `xclip`, then `xsel`.
+    pub fn read_string() -> Option<String> {
+        read_via(&["wl-paste", "--no-newline"])
+            .or_else(|| read_via(&["xclip", "-selection", "clipboard", "-o"]))
+            .or_else(|| read_via(&["xsel", "--clipboard", "--output"]))
+    }
+
+    fn read_via(argv: &[&str]) -> Option<String> {
+        let out = Command::new(argv[0])
+            .args(&argv[1..])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        Some(String::from_utf8_lossy(&out.stdout).to_string())
     }
 }
 
