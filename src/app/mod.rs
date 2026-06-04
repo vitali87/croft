@@ -6127,8 +6127,7 @@ impl App {
                     found
                 };
                 let match_col = first_match.map(|(c, _)| c).unwrap_or(0);
-                self.editor.active_search_match =
-                    first_match.map(|(c, len)| (row, c, len));
+                self.editor.active_search_match = first_match.map(|(c, len)| (row, c, len));
                 self.editor.cursor_col = match_col;
                 self.editor.scroll_col = 0;
                 self.editor.ensure_cursor_col_visible();
@@ -6623,7 +6622,15 @@ impl App {
             KeyCode::Backspace => self.editor.backspace(),
             KeyCode::Delete => self.editor.delete_forward(),
             KeyCode::Enter => self.editor.insert_newline(),
-            KeyCode::Tab => self.editor.insert_str("    "),
+            // Tab over a multi-line selection indents the whole block (VS
+            // Code); otherwise it inserts indentation to the next tab stop.
+            KeyCode::Tab if self.editor.selection_is_multiline() => {
+                self.editor.indent_lines();
+            }
+            KeyCode::Tab => self.editor.indent_at_cursor(),
+            // Shift+Tab arrives as BackTab. Outdent the current line, or every
+            // line a selection touches, mirroring VS Code's Shift+Tab.
+            KeyCode::BackTab => self.editor.dedent_lines(),
             KeyCode::Char(c)
                 if !key.modifiers.contains(KeyModifiers::CONTROL)
                     && !key.modifiers.contains(KeyModifiers::ALT)

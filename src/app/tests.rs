@@ -9910,6 +9910,36 @@ fn app_with_open_file(tmp: &std::path::Path, name: &str, body: &str) -> App {
 }
 
 #[test]
+fn shift_tab_in_editor_dedents_the_current_python_line() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "snippet.py", "def f():\n        pass\n");
+    app.editor.cursor_row = 1;
+    app.editor.cursor_col = 8;
+    // Shift+Tab reaches the editor as BackTab.
+    app.handle_editor_key(key(KeyCode::BackTab, KeyModifiers::SHIFT));
+    assert_eq!(
+        app.editor.lines[1], "    pass",
+        "Shift+Tab must outdent the line one level"
+    );
+    assert_eq!(app.editor.cursor_col, 4);
+}
+
+#[test]
+fn tab_in_editor_indents_a_multiline_python_selection() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "block.py", "a = 1\nb = 2\n");
+    app.editor.cursor_row = 1;
+    app.editor.cursor_col = 5;
+    app.editor.selection = Some(crate::widgets::editor::EditorSelection {
+        anchor: (0, 0),
+        head: (1, 5),
+    });
+    app.handle_editor_key(key(KeyCode::Tab, KeyModifiers::NONE));
+    assert_eq!(app.editor.lines[0], "    a = 1");
+    assert_eq!(app.editor.lines[1], "    b = 2");
+}
+
+#[test]
 fn split_editor_duplicates_active_file_into_a_focused_right_group() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = app_with_open_file(tmp.path(), "a.txt", "hello\nworld\nthere");

@@ -162,7 +162,9 @@ croft setup-terminal --help
 | `PageUp` / `PageDown` (`fn`+`↑` / `fn`+`↓` on Mac) | Scroll exactly one viewport |
 | Two-finger horizontal swipe, or drag the bar | In code files, long lines that overflow the text column get a horizontal scrollbar on the editor's bottom row; swipe sideways to pan, or click and drag the thumb. Moving the cursor past either edge pans to follow it, and the scroll position can never strand the buffer off-screen. |
 | (Markdown only) soft word-wrap | Markdown files wrap long lines onto the next visual row instead of scrolling sideways (VS Code default for Markdown); no horizontal scrollbar appears. `↑`/`↓` move by visual row, the line number shows once per paragraph, and a single paragraph taller than the pane still scrolls. |
-| Any printable char, Enter, Backspace, Delete, Tab | Edit (typing or deleting with an active selection replaces it) |
+| Any printable char, Enter, Backspace, Delete | Edit (typing or deleting with an active selection replaces it) |
+| `Tab` | Indent: with a multi-line selection, indents every line the selection touches one level (empty lines untouched, VS Code-style); otherwise inserts spaces to the next tab stop (4, or 2 in YAML) |
+| `Shift`+`Tab` | Outdent: strips one indent level from the current line, or from every line a selection touches; tab-stop aligned (6 spaces → 4, 3 spaces → 0), and a single leading tab counts as one level |
 | Mouse drag | Select text; selection stays highlighted until you copy or click elsewhere. Every other occurrence of the selected text lights up in blue (VS Code-style selection highlight), for single-line, non-whitespace selections up to 200 characters |
 | `Ctrl`+`C` / `Cmd`+`C` | Copy the selection to the system clipboard (native NSPasteboard on macOS; OSC 52 fallback on remote) |
 | `Ctrl`+`X` / `Cmd`+`X` | Cut the selection |

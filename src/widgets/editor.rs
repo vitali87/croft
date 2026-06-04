@@ -1024,6 +1024,9 @@ enum EditKind {
     KillToEol,
     KillToBol,
     OpenLine,
+    /// Block indent / outdent (Tab / Shift+Tab over a line range). Never
+    /// coalesces, so each Tab press is its own undo step like VS Code.
+    Indent,
     /// A single keystroke applied simultaneously across every multi-cursor
     /// caret. Never coalesces, so each multi-edit is its own undo step.
     MultiEdit,
@@ -2681,6 +2684,128 @@ impl Editor {
         }
     }
 
+    /// True when the active selection spans more than one row, so Tab should
+    /// indent the whole block (VS Code) rather than replace the selection
+    /// with a single indentation unit.
+    pub fn selection_is_multiline(&self) -> bool {
+        match &self.selection {
+            Some(sel) => {
+                let (start, end) = sel.normalised();
+                start.0 != end.0
+            }
+            None => false,
+        }
+    }
+
+    /// VS Code's plain-Tab indent (no multi-line selection): insert spaces up
+    /// to the next tab stop from the cursor column, replacing any single-line
+    /// selection first. With `editor.insertSpaces` + `editor.useTabStops`
+    /// (both on by default) a Tab at column 2 with a width-4 unit adds 2
+    /// spaces to reach column 4, not a flat 4.
+    pub fn indent_at_cursor(&mut self) {
+        self.pin_on_edit();
+        self.push_undo(EditKind::Indent);
+        if self.selection.is_some() {
+            self.delete_selection_inner();
+        }
+        if self.lines.is_empty() {
+            self.lines.push(String::new());
+        }
+        let unit_w = indent_unit_for(self.lang).chars().count();
+        let pad = unit_w - (self.cursor_col % unit_w);
+        let row = self.cursor_row;
+        let byte = self.byte_index(row, self.cursor_col);
+        self.lines[row].insert_str(byte, &" ".repeat(pad));
+        self.cursor_col += pad;
+        self.mark_buffer_changed();
+        self.recompute_highlights();
+        self.ensure_cursor_col_visible();
+    }
+
+    /// VS Code "Indent Lines" (Tab with a multi-line selection): prepend one
+    /// indentation unit to every line the selection touches. Empty lines are
+    /// left untouched, matching VS Code's "do not indent empty lines" rule
+    /// for block indent. Cursor and selection columns shift right by the unit
+    /// width on the lines that actually gained indentation so the same text
+    /// stays highlighted.
+    pub fn indent_lines(&mut self) {
+        self.pin_on_edit();
+        self.push_undo(EditKind::Indent);
+        let unit = indent_unit_for(self.lang);
+        let unit_w = unit.chars().count();
+        let (start_row, end_row) = self.selected_or_cursor_row_range();
+        for row in start_row..=end_row {
+            if !self.lines[row].is_empty() {
+                self.lines[row].insert_str(0, unit);
+            }
+        }
+        // A row gained indentation iff it was non-empty (empty lines were
+        // skipped and stay empty), so a row that is non-empty now is exactly
+        // one that shifted right by `unit_w`.
+        let shift = |row: usize, col: usize, lines: &[String]| -> usize {
+            if row >= start_row && row <= end_row && !lines[row].is_empty() {
+                col + unit_w
+            } else {
+                col
+            }
+        };
+        self.cursor_col = shift(self.cursor_row, self.cursor_col, &self.lines);
+        if let Some(mut sel) = self.selection {
+            sel.anchor.1 = shift(sel.anchor.0, sel.anchor.1, &self.lines);
+            sel.head.1 = shift(sel.head.0, sel.head.1, &self.lines);
+            self.selection = Some(sel);
+        }
+        self.mark_buffer_changed();
+        self.recompute_highlights();
+        self.ensure_cursor_col_visible();
+    }
+
+    /// VS Code "Outdent" (Shift+Tab): strip one indentation level from every
+    /// line the selection touches, or just the current line when there is no
+    /// selection. Removal is tab-stop aligned (the `useTabStops` default): a
+    /// line indented 6 spaces drops to 4, a line indented 3 drops to 0. A
+    /// single leading tab counts as one level. Cursor and selection columns
+    /// follow the removal on their own row.
+    pub fn dedent_lines(&mut self) {
+        self.pin_on_edit();
+        self.push_undo(EditKind::Indent);
+        let unit_w = indent_unit_for(self.lang).chars().count();
+        let (start_row, end_row) = self.selected_or_cursor_row_range();
+        let mut removed = vec![0usize; self.lines.len()];
+        let mut any = false;
+        for (row, slot) in removed
+            .iter_mut()
+            .enumerate()
+            .take(end_row + 1)
+            .skip(start_row)
+        {
+            let n = leading_outdent_chars(&self.lines[row], unit_w);
+            if n > 0 {
+                self.lines[row].replace_range(0..n, "");
+                *slot = n;
+                any = true;
+            }
+        }
+        let pull = |row: usize, col: usize, removed: &[usize]| -> usize {
+            if row < removed.len() {
+                col.saturating_sub(removed[row])
+            } else {
+                col
+            }
+        };
+        self.cursor_col = pull(self.cursor_row, self.cursor_col, &removed);
+        if let Some(mut sel) = self.selection {
+            sel.anchor.1 = pull(sel.anchor.0, sel.anchor.1, &removed);
+            sel.head.1 = pull(sel.head.0, sel.head.1, &removed);
+            self.selection = Some(sel);
+        }
+        if any {
+            self.mark_buffer_changed();
+            self.recompute_highlights();
+        }
+        self.ensure_cursor_col_visible();
+    }
+
     /// Word-step left (Option+Left on macOS). Symmetric to `move_word_right`:
     /// skips non-word chars backwards across line boundaries, then walks
     /// back over the preceding word run, landing on its first char.
@@ -3060,6 +3185,27 @@ fn indent_unit_for(lang: Option<LangKind>) -> &'static str {
     match lang {
         Some(LangKind::Yaml) => "  ",
         _ => "    ",
+    }
+}
+
+/// Number of leading whitespace bytes to strip for one outdent step, matching
+/// VS Code's tab-stop-aligned `unshiftIndent`. A leading tab counts as one
+/// level (strip it). For spaces, strip back to the previous tab stop: with a
+/// width-4 unit, 4 -> remove 4, 6 -> remove 2, 3 -> remove 3, 1 -> remove 1.
+/// All leading whitespace here is ASCII (`' '` / `'\t'`), so byte count equals
+/// char count.
+fn leading_outdent_chars(line: &str, unit_w: usize) -> usize {
+    if unit_w == 0 {
+        return 0;
+    }
+    if line.starts_with('\t') {
+        return 1;
+    }
+    let spaces = line.chars().take_while(|c| *c == ' ').count();
+    if spaces == 0 {
+        0
+    } else {
+        ((spaces - 1) % unit_w) + 1
     }
 }
 
@@ -4877,6 +5023,141 @@ mod tests {
             vec!["    if x:".to_string(), "        ".to_string()]
         );
         assert_eq!(e.cursor_col, 8);
+    }
+
+    #[test]
+    fn shift_tab_dedents_current_line_when_no_selection() {
+        let mut e = editor_with("        pass");
+        e.lang = Some(LangKind::Python);
+        e.cursor_row = 0;
+        e.cursor_col = 8;
+        e.dedent_lines();
+        assert_eq!(e.lines, vec!["    pass".to_string()]);
+        assert_eq!(e.cursor_col, 4, "cursor follows the four stripped spaces");
+    }
+
+    #[test]
+    fn shift_tab_dedent_aligns_to_previous_tab_stop() {
+        // Six leading spaces drop to four (the previous width-4 tab stop),
+        // removing two, not a flat four.
+        let mut e = editor_with("      x = 1");
+        e.lang = Some(LangKind::Python);
+        e.cursor_col = 6;
+        e.dedent_lines();
+        assert_eq!(e.lines, vec!["    x = 1".to_string()]);
+        assert_eq!(e.cursor_col, 4);
+    }
+
+    #[test]
+    fn shift_tab_dedent_partial_indent_removes_all_leading_spaces() {
+        let mut e = editor_with("   y");
+        e.lang = Some(LangKind::Python);
+        e.cursor_col = 3;
+        e.dedent_lines();
+        assert_eq!(e.lines, vec!["y".to_string()]);
+        assert_eq!(e.cursor_col, 0);
+    }
+
+    #[test]
+    fn shift_tab_dedent_on_flush_left_line_is_a_noop() {
+        let mut e = editor_with("x");
+        e.lang = Some(LangKind::Python);
+        e.cursor_col = 1;
+        e.dedent_lines();
+        assert_eq!(e.lines, vec!["x".to_string()]);
+        assert_eq!(e.cursor_col, 1);
+    }
+
+    #[test]
+    fn shift_tab_dedent_strips_a_single_leading_tab() {
+        let mut e = editor_with("\tpass");
+        e.lang = Some(LangKind::Python);
+        e.cursor_col = 1;
+        e.dedent_lines();
+        assert_eq!(e.lines, vec!["pass".to_string()]);
+        assert_eq!(e.cursor_col, 0);
+    }
+
+    #[test]
+    fn shift_tab_dedents_every_line_a_selection_touches() {
+        let mut e = editor_with("    a\n    b\n    c");
+        e.lang = Some(LangKind::Python);
+        e.cursor_row = 2;
+        e.cursor_col = 5;
+        e.selection = Some(EditorSelection {
+            anchor: (0, 4),
+            head: (2, 5),
+        });
+        e.dedent_lines();
+        assert_eq!(
+            e.lines,
+            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
+        assert_eq!(
+            e.selection.unwrap(),
+            EditorSelection {
+                anchor: (0, 0),
+                head: (2, 1),
+            }
+        );
+    }
+
+    #[test]
+    fn tab_indents_every_line_a_multiline_selection_touches() {
+        let mut e = editor_with("a\nb");
+        e.lang = Some(LangKind::Python);
+        e.cursor_row = 1;
+        e.cursor_col = 1;
+        e.selection = Some(EditorSelection {
+            anchor: (0, 0),
+            head: (1, 1),
+        });
+        e.indent_lines();
+        assert_eq!(e.lines, vec!["    a".to_string(), "    b".to_string()]);
+        assert_eq!(
+            e.selection.unwrap(),
+            EditorSelection {
+                anchor: (0, 4),
+                head: (1, 5),
+            }
+        );
+    }
+
+    #[test]
+    fn tab_indent_block_leaves_empty_lines_untouched() {
+        let mut e = editor_with("a\n\nb");
+        e.lang = Some(LangKind::Python);
+        e.selection = Some(EditorSelection {
+            anchor: (0, 0),
+            head: (2, 1),
+        });
+        e.indent_lines();
+        assert_eq!(
+            e.lines,
+            vec!["    a".to_string(), String::new(), "    b".to_string()]
+        );
+    }
+
+    #[test]
+    fn tab_at_cursor_pads_to_the_next_tab_stop() {
+        // Cursor at column 2 inserts two spaces to reach column 4, not four.
+        let mut e = editor_with("ab");
+        e.lang = Some(LangKind::Python);
+        e.cursor_col = 2;
+        e.indent_at_cursor();
+        assert_eq!(e.lines, vec!["ab  ".to_string()]);
+        assert_eq!(e.cursor_col, 4);
+    }
+
+    #[test]
+    fn dedent_then_undo_restores_the_buffer_in_one_step() {
+        let mut e = editor_with("        pass");
+        e.lang = Some(LangKind::Python);
+        e.cursor_col = 8;
+        e.dedent_lines();
+        assert_eq!(e.lines, vec!["    pass".to_string()]);
+        assert!(e.undo());
+        assert_eq!(e.lines, vec!["        pass".to_string()]);
     }
 
     #[test]
