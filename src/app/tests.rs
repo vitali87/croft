@@ -4551,6 +4551,45 @@ fn clicking_source_control_does_not_block_on_git_and_posts_a_changes_request() {
 }
 
 #[test]
+fn resize_arms_a_one_shot_terminal_clear_to_evict_stale_activity_icons() {
+    // Regression for the activity-bar icon ghosting after a pane reshape.
+    // iTerm2 keeps OSC-1337 image cells in a layer that survives plain SGR
+    // overwrites, so on resize the previously-painted icon bitmaps linger and
+    // the re-emit stamps a second copy on top (the doubled Run/Debug icon).
+    // A resize must arm the same one-shot `terminal.clear()` the view-change
+    // path uses, so iTerm2 drops the stale layer before the icons re-emit.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    // Pretend init_graphics baked the activity-bar icon images — images mode
+    // is the only state in which the stale layer can exist.
+    app.overlays.activity.set_images(ActivityBarImages {
+        explorer_active: String::new(),
+        explorer_inactive: String::new(),
+        search_active: String::new(),
+        search_inactive: String::new(),
+        source_control_active: String::new(),
+        source_control_inactive: String::new(),
+        remote_active: String::new(),
+        remote_inactive: String::new(),
+        run_debug_active: String::new(),
+        run_debug_inactive: String::new(),
+    });
+    app.on_resize();
+    assert!(
+        app.consume_activity_image_clear(),
+        "a pane resize must arm exactly one terminal.clear() so iTerm2 evicts the stale OSC-1337 activity-bar image layer",
+    );
+    assert!(
+        !app.consume_activity_image_clear(),
+        "the clear request must be one-shot — consuming twice in a row returns false",
+    );
+    assert!(
+        app.overlays.activity.is_dirty(),
+        "resize must also re-mark the icons dirty so the post-draw flush re-emits them after the clear",
+    );
+}
+
+#[test]
 fn leaving_run_debug_after_emitting_the_icon_arms_a_one_shot_terminal_clear() {
     // Regression for the bug+play headline icon ghosting on top of
     // whichever sidebar replaced Run-Debug. iTerm2's OSC-1337 image

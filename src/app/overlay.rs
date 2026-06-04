@@ -244,6 +244,7 @@ pub struct ActivityOverlay {
     images: Option<super::ActivityBarImages>,
     dirty: bool,
     last_emit: Option<std::time::Instant>,
+    clear: ClearLatch,
 }
 
 impl ActivityOverlay {
@@ -275,6 +276,18 @@ impl ActivityOverlay {
     pub fn mark_emitted(&mut self) {
         self.dirty = false;
         self.last_emit = Some(std::time::Instant::now());
+    }
+
+    /// Arm a one-shot `terminal.clear()` (consumed by the main loop's clear
+    /// chain) so iTerm2 evicts the cached OSC-1337 icon bitmaps. Needed
+    /// whenever a reflow could leave a stale image layer that a plain SGR
+    /// re-emit would stack a fresh copy on top of (the doubled-icon ghost).
+    pub fn request_clear(&mut self) {
+        self.clear.request();
+    }
+
+    pub fn consume_clear(&mut self) -> bool {
+        self.clear.consume()
     }
 
     #[cfg(test)]

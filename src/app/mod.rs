@@ -1844,6 +1844,28 @@ impl App {
         self.overlays.run_debug.consume_clear()
     }
 
+    /// One-shot consumer for the "a resize may have left stale activity-bar
+    /// icon bitmaps in iTerm2's image layer" flag, armed by `on_resize`. The
+    /// main loop folds the result into the same OR chain that fires
+    /// `terminal.clear()` for the welcome wordmark and editor preview image,
+    /// evicting the ghost before the icons re-emit on the next draw.
+    pub fn consume_activity_image_clear(&mut self) -> bool {
+        self.overlays.activity.consume_clear()
+    }
+
+    /// Handle a terminal/pane resize. The alt-screen reflow blanks the SGR
+    /// cells but iTerm2's OSC-1337 image layer survives, so a plain re-emit
+    /// would stack a fresh icon on top of the stale one (the doubled-icon
+    /// ghost). Re-mark the icons dirty so they re-emit, and — in images mode,
+    /// the only state the stale layer can exist in — arm a one-shot
+    /// `terminal.clear()` so iTerm2 drops the cached bitmaps first.
+    pub fn on_resize(&mut self) {
+        self.overlays.activity.mark_dirty();
+        if self.overlays.activity.has_images() {
+            self.overlays.activity.request_clear();
+        }
+    }
+
     /// One-shot consumer for the "leaving Source Control after the no-repo
     /// hero PNG was emitted" flag. Same shape as
     /// `consume_run_debug_image_clear` - the main loop folds the result
@@ -13173,6 +13195,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
                 || app.consume_file_finder_image_clear()
                 || app.consume_zoxide_jump_image_clear()
                 || app.consume_ssh_empty_state_image_clear()
+                || app.consume_activity_image_clear()
             {
                 terminal.clear()?;
                 // Activity-bar icons live outside ratatui too; re-emit
@@ -13200,6 +13223,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
                 || app.consume_file_finder_image_clear()
                 || app.consume_zoxide_jump_image_clear()
                 || app.consume_ssh_empty_state_image_clear()
+                || app.consume_activity_image_clear()
             {
                 terminal.clear()?;
                 app.overlays.activity.mark_dirty();
@@ -13325,9 +13349,11 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
                     Event::Mouse(m) => app.handle_mouse(m),
                     Event::Paste(s) => app.handle_paste(&s),
                     Event::Resize(_, _) => {
-                        // Alt-screen reflow blanks the activity bar cells; the
-                        // OSC images need to be re-emitted on the next draw.
-                        app.overlays.activity.mark_dirty();
+                        // Alt-screen reflow blanks the activity bar's SGR cells
+                        // but iTerm2's OSC-1337 image layer survives, so a plain
+                        // re-emit ghosts a fresh icon over the stale one. Re-mark
+                        // dirty AND arm a one-shot terminal.clear() to evict it.
+                        app.on_resize();
                     }
                     _ => {}
                 }
