@@ -4465,6 +4465,9 @@ impl App {
             CommitMenuItem::CommitAndPush => self.commit_and_push_source_control(),
             CommitMenuItem::Push => self.push_source_control(),
             CommitMenuItem::ViewStagedDiff => self.view_staged_diff_source_control(),
+            CommitMenuItem::ViewPreviousCommitDiff => {
+                self.view_previous_commit_diff_source_control()
+            }
             CommitMenuItem::ViewDefaultBranchDiff => self.view_default_branch_diff_source_control(),
         }
     }
@@ -5487,6 +5490,34 @@ impl App {
         self.default_branch_label = Some(branch.clone());
         self.source_control.commit_feedback = None;
         self.status = format!("Showing git diff {branch}");
+        self.focus_pane(Pane::Editor);
+    }
+
+    /// Open `git diff HEAD~1` (working tree versus the commit before HEAD)
+    /// in a read-only editor tab. Mirrors "View Changes vs <default>" but
+    /// anchored on the previous commit, so the user can review everything
+    /// that changed since the last commit. A single-commit repo has no
+    /// `HEAD~1`; that error surfaces in the commit-feedback line rather
+    /// than as a silent no-op.
+    pub fn view_previous_commit_diff_source_control(&mut self) {
+        let raw = match crate::git::diff_previous_commit(&self.tree.root) {
+            Ok(r) => r,
+            Err(err) => {
+                self.source_control.commit_feedback = Some(format!("diff failed: {err}"));
+                self.source_control.commit_feedback_is_error = true;
+                self.status = format!("View Changes vs previous failed: {err}");
+                return;
+            }
+        };
+        let label = std::path::PathBuf::from("git diff HEAD~1");
+        if let Err(err) = self.editor.open_git_diff_side_by_side(&label, &raw) {
+            self.source_control.commit_feedback = Some(format!("open failed: {err}"));
+            self.source_control.commit_feedback_is_error = true;
+            self.status = format!("Could not open diff vs previous: {err}");
+            return;
+        }
+        self.source_control.commit_feedback = None;
+        self.status = String::from("Showing git diff HEAD~1");
         self.focus_pane(Pane::Editor);
     }
 

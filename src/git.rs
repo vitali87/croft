@@ -529,6 +529,16 @@ pub fn diff_against_branch(root: &Path, branch: &str) -> Result<String, String> 
     diff_text(root, &["diff", branch])
 }
 
+/// Raw `git diff HEAD~1` text — working-tree state versus the commit
+/// before HEAD. Used by the Source Control dropdown's "View Changes vs
+/// previous" so users can preview everything that changed since the last
+/// commit. Errors (e.g. "fatal: ambiguous argument 'HEAD~1'" on a repo
+/// with a single commit) carry stderr verbatim so the panel can surface
+/// the reason instead of a silent no-op.
+pub fn diff_previous_commit(root: &Path) -> Result<String, String> {
+    diff_text(root, &["diff", "HEAD~1"])
+}
+
 fn diff_text(root: &Path, args: &[&str]) -> Result<String, String> {
     let path_str = root
         .to_str()
@@ -1237,6 +1247,39 @@ mod tests {
         let s = query(p);
         assert!(s.in_repo);
         assert!(s.dirty);
+    }
+
+    #[test]
+    fn diff_previous_commit_shows_the_delta_since_the_last_commit() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .arg("-C")
+                .arg(p)
+                .args(["-c", "user.email=t@t", "-c", "user.name=t"])
+                .args(args)
+                .output()
+                .unwrap();
+        };
+        git(&["init", "-q", "-b", "main"]);
+        std::fs::write(p.join("f.txt"), "one\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "first"]);
+        std::fs::write(p.join("f.txt"), "two\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "second"]);
+        // Working tree matches HEAD (the second commit), so `git diff HEAD~1`
+        // is exactly the first->second delta.
+        let raw = diff_previous_commit(p).unwrap();
+        assert!(
+            raw.contains("-one"),
+            "diff vs previous commit must show the removed line; got: {raw}"
+        );
+        assert!(
+            raw.contains("+two"),
+            "diff vs previous commit must show the added line; got: {raw}"
+        );
     }
 
     #[test]

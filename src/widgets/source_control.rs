@@ -36,14 +36,16 @@ pub enum CommitMenuItem {
     CommitAndPush,
     Push,
     ViewStagedDiff,
+    ViewPreviousCommitDiff,
     ViewDefaultBranchDiff,
 }
 
 impl CommitMenuItem {
-    pub const ALL: [CommitMenuItem; 4] = [
+    pub const ALL: [CommitMenuItem; 5] = [
         CommitMenuItem::CommitAndPush,
         CommitMenuItem::Push,
         CommitMenuItem::ViewStagedDiff,
+        CommitMenuItem::ViewPreviousCommitDiff,
         CommitMenuItem::ViewDefaultBranchDiff,
     ];
 
@@ -55,6 +57,7 @@ impl CommitMenuItem {
             CommitMenuItem::CommitAndPush => "Commit & Push".to_string(),
             CommitMenuItem::Push => "Push".to_string(),
             CommitMenuItem::ViewStagedDiff => "View Staged Changes".to_string(),
+            CommitMenuItem::ViewPreviousCommitDiff => "View Changes vs previous".to_string(),
             CommitMenuItem::ViewDefaultBranchDiff => {
                 format!("View Changes vs {default_branch}")
             }
