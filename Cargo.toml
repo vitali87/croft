@@ -5,7 +5,7 @@ edition = "2024"
 description = "VSCode-style TUI written in Rust"
 license = "MIT"
 repository = "https://codeberg.org/vitali87/croft"
-homepage = "https://croft.sh"
+homepage = "https://croft.software"
 
 [[bin]]
 name = "croft"
