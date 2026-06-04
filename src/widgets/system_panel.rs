@@ -262,8 +262,7 @@ impl Widget for &mut SystemPanel {
             ),
         ];
 
-        let mut y = header_y + 1;
-        for (color, label, hist, scale_max, value) in rows {
+        for (y, (color, label, hist, scale_max, value)) in (header_y + 1..).zip(rows) {
             if y >= inner.y + inner.height {
                 break;
             }
@@ -281,7 +280,6 @@ impl Widget for &mut SystemPanel {
                 scale_max,
                 &value,
             );
-            y += 1;
         }
     }
 }

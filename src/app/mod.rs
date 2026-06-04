@@ -5037,10 +5037,8 @@ impl App {
                     self.request_remote_launch(target.alias, None);
                 }
             }
-            KeyCode::Esc => {
-                if !self.remote.clear_filter() {
-                    self.set_sidebar_view(SidebarView::Explorer);
-                }
+            KeyCode::Esc if !self.remote.clear_filter() => {
+                self.set_sidebar_view(SidebarView::Explorer);
             }
             _ => {}
         }
@@ -5113,14 +5111,13 @@ impl App {
             KeyCode::Up => self.source_control.scroll_up(1),
             KeyCode::Down => self.source_control.scroll_down(1),
             KeyCode::Enter => self.commit_source_control(),
-            KeyCode::Char(c) => {
+            KeyCode::Char(c)
                 if !key.modifiers.contains(KeyModifiers::CONTROL)
                     && !key.modifiers.contains(KeyModifiers::ALT)
-                    && !key.modifiers.contains(KeyModifiers::SUPER)
-                {
-                    self.source_control.insert_char(c);
-                    self.poke_cursor();
-                }
+                    && !key.modifiers.contains(KeyModifiers::SUPER) =>
+            {
+                self.source_control.insert_char(c);
+                self.poke_cursor();
             }
             _ => {}
         }
@@ -6606,21 +6603,20 @@ impl App {
             KeyCode::Delete => self.editor.delete_forward(),
             KeyCode::Enter => self.editor.insert_newline(),
             KeyCode::Tab => self.editor.insert_str("    "),
-            KeyCode::Char(c) => {
+            KeyCode::Char(c)
                 if !key.modifiers.contains(KeyModifiers::CONTROL)
                     && !key.modifiers.contains(KeyModifiers::ALT)
-                    && !key.modifiers.contains(KeyModifiers::SUPER)
-                {
-                    self.editor.insert_char(c);
-                    // `.` is the canonical LSP trigger character for member
-                    // access in Python / TS / Rust. Fire a completion request
-                    // immediately so the popup pops without a Ctrl+Space.
-                    // The popup's fallthrough already dismissed any prior
-                    // popup when this char arrived, so the new request just
-                    // populates a fresh popup when the response lands.
-                    if c == '.' {
-                        self.trigger_completion();
-                    }
+                    && !key.modifiers.contains(KeyModifiers::SUPER) =>
+            {
+                self.editor.insert_char(c);
+                // `.` is the canonical LSP trigger character for member
+                // access in Python / TS / Rust. Fire a completion request
+                // immediately so the popup pops without a Ctrl+Space.
+                // The popup's fallthrough already dismissed any prior
+                // popup when this char arrived, so the new request just
+                // populates a fresh popup when the response lands.
+                if c == '.' {
+                    self.trigger_completion();
                 }
             }
             _ => {}
@@ -8252,10 +8248,10 @@ impl App {
                     finder.select_prev();
                 }
             }
-            MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Down(MouseButton::Right) => {
-                if !inside {
-                    self.close_file_finder();
-                }
+            MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Down(MouseButton::Right)
+                if !inside =>
+            {
+                self.close_file_finder();
             }
             _ => {}
         }
@@ -8404,10 +8400,10 @@ impl App {
                     jump.select_prev();
                 }
             }
-            MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Down(MouseButton::Right) => {
-                if !inside {
-                    self.close_zoxide_jump();
-                }
+            MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Down(MouseButton::Right)
+                if !inside =>
+            {
+                self.close_zoxide_jump();
             }
             _ => {}
         }
@@ -8810,10 +8806,10 @@ impl App {
         match m.kind {
             MouseEventKind::ScrollDown => modal.scroll_down(3),
             MouseEventKind::ScrollUp => modal.scroll_up(3),
-            MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Down(MouseButton::Right) => {
-                if !inside {
-                    self.close_shortcuts_modal();
-                }
+            MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Down(MouseButton::Right)
+                if !inside =>
+            {
+                self.close_shortcuts_modal();
             }
             _ => {}
         }
@@ -9769,13 +9765,11 @@ impl App {
                     }
                 }
             }
-            MouseEventKind::ScrollRight => {
-                if in_editor {
-                    if let Some(diff) = self.editor.diff.as_mut() {
-                        diff.scroll_right_by(4);
-                    } else {
-                        self.editor.scroll_right_by(4);
-                    }
+            MouseEventKind::ScrollRight if in_editor => {
+                if let Some(diff) = self.editor.diff.as_mut() {
+                    diff.scroll_right_by(4);
+                } else {
+                    self.editor.scroll_right_by(4);
                 }
             }
             _ => {}
@@ -10594,10 +10588,8 @@ impl App {
                     sheet.current_sheet = (current + 1) % total_sheets;
                 }
             }
-            KeyCode::BackTab => {
-                if total_sheets > 1 {
-                    sheet.current_sheet = (current + total_sheets - 1) % total_sheets;
-                }
+            KeyCode::BackTab if total_sheets > 1 => {
+                sheet.current_sheet = (current + total_sheets - 1) % total_sheets;
             }
             _ => {}
         }

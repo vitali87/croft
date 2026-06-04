@@ -972,7 +972,7 @@ pub struct TextSpanEdit {
 /// the number of edits applied. Out-of-range edits are skipped.
 pub fn apply_span_edits_to_lines(lines: &mut Vec<String>, edits: &[TextSpanEdit]) -> usize {
     let mut order: Vec<&TextSpanEdit> = edits.iter().collect();
-    order.sort_by(|a, b| b.start.cmp(&a.start));
+    order.sort_by_key(|e| std::cmp::Reverse(e.start));
     let mut applied = 0;
     for e in order {
         if replace_span(lines, e) {
@@ -1992,7 +1992,7 @@ impl Editor {
             items.push((false, *s));
         }
         // Descending by start so the lowest caret is edited first.
-        items.sort_by(|a, b| b.1.normalised().0.cmp(&a.1.normalised().0));
+        items.sort_by_key(|item| std::cmp::Reverse(item.1.normalised().0));
         // Clear so the per-caret raw ops can't see stale carets.
         self.carets.clear();
 
