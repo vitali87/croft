@@ -44,6 +44,31 @@ fn opening_a_search_hit_moves_focus_to_the_editor() {
 }
 
 #[test]
+fn opening_a_search_hit_marks_the_active_match_so_the_renderer_paints_it_orange() {
+    // Global search (Cmd+Shift+F) result navigation must mark the occurrence
+    // it lands on as the *active* match, the same way the in-file Cmd+F path
+    // does, so the editor paints that one occurrence orange while the sibling
+    // matches stay yellow. Without active_search_match every match renders the
+    // same uniform yellow and the user can't tell which result they are on.
+    let tmp = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("hit.rs");
+    // Line 2 (index 1) has two "alpha" matches: "let " is 4 chars, so the
+    // first "alpha" starts at char col 4, and the second is later on the line.
+    std::fs::write(&f, "fn main() {}\nlet alpha = alpha + 1;\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.set_sidebar_view(SidebarView::Search);
+    app.search.query = String::from("alpha");
+    app.search.run_query();
+    let hit = app.search.selected_hit().cloned().expect("a hit");
+    app.open_search_hit(&hit);
+    assert_eq!(
+        app.editor.active_search_match,
+        Some((1, 4, 5)),
+        "opening a global-search hit must record the first match on the line as the active match (row 1, col 4, len 5) so the renderer paints exactly those cells orange; the second 'alpha' stays yellow"
+    );
+}
+
+#[test]
 fn go_to_definition_opens_the_target_file_and_moves_the_caret() {
     let tmp = tempfile::tempdir().unwrap();
     let target = tmp.path().join("target.rs");
@@ -6406,6 +6431,35 @@ fn cmd_f_in_explorer_still_opens_the_new_file_prompt() {
     assert!(
         app.editor_find.is_none(),
         "Cmd+F in the Explorer must NOT open the editor Find overlay; the chord is overloaded by pane"
+    );
+}
+
+#[test]
+fn cmd_shift_f_global_search_closes_the_local_editor_find_bar() {
+    // With the in-file Find bar (Cmd+F) open, jumping to global Search
+    // (Cmd+Shift+F) must dismiss the local bar. render_editor_find paints
+    // whenever editor_find is Some regardless of focus, so a lingering bar
+    // shadows the global search input on the left pane.
+    let mut app = editor_app_with_lines(&["alpha beta", "alpha gamma"]);
+    app.handle_key(key(KeyCode::Char('f'), KeyModifiers::SUPER))
+        .unwrap();
+    assert!(
+        app.editor_find.is_some(),
+        "precondition: Cmd+F opens the inline editor Find bar"
+    );
+    app.handle_key(key(
+        KeyCode::Char('f'),
+        KeyModifiers::SUPER | KeyModifiers::SHIFT,
+    ))
+    .unwrap();
+    assert_eq!(
+        app.sidebar_view,
+        SidebarView::Search,
+        "Cmd+Shift+F must switch the sidebar to global Search"
+    );
+    assert!(
+        app.editor_find.is_none(),
+        "Cmd+Shift+F must close the local editor Find bar so it cannot shadow the global search input"
     );
 }
 

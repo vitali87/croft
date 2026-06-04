@@ -4868,6 +4868,11 @@ impl App {
             return Ok(());
         }
         if is_search_jump_key(key) {
+            // Jumping to global Search supersedes the in-file find: tear the
+            // local find bar down first, otherwise its overlay keeps painting
+            // over the editor (render_editor_find only gates on editor_find
+            // being Some, not on focus) and shadows the global search input.
+            self.close_editor_find();
             self.set_sidebar_view(SidebarView::Search);
             return Ok(());
         }
@@ -6099,8 +6104,14 @@ impl App {
                 let needle = self.search.query.trim();
                 let opts = self.search.opts;
                 let line = self.editor.lines.get(row).cloned().unwrap_or_default();
-                let match_col = if needle.is_empty() {
-                    0
+                // Locate the first match on the line: its start column and
+                // length (in chars). The length lets us mark this occurrence
+                // as the *active* match so the renderer paints it the stronger
+                // orange while sibling matches stay yellow - mirroring the
+                // Cmd+F path's `active_search_match` behaviour and VS Code's
+                // "current match" highlight.
+                let first_match = if needle.is_empty() {
+                    None
                 } else {
                     let mut col = 0usize;
                     let mut found = None;
@@ -6108,13 +6119,16 @@ impl App {
                         crate::widgets::search::split_for_highlight(&line, needle, opts)
                     {
                         if is_match {
-                            found = Some(col);
+                            found = Some((col, chunk.chars().count()));
                             break;
                         }
                         col = col.saturating_add(chunk.chars().count());
                     }
-                    found.unwrap_or(0)
+                    found
                 };
+                let match_col = first_match.map(|(c, _)| c).unwrap_or(0);
+                self.editor.active_search_match =
+                    first_match.map(|(c, len)| (row, c, len));
                 self.editor.cursor_col = match_col;
                 self.editor.scroll_col = 0;
                 self.editor.ensure_cursor_col_visible();
