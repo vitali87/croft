@@ -3635,6 +3635,10 @@ impl App {
             {
                 self.overlays.hero.request_clear_if_displayed();
             }
+            // The Source Control commit dropdown is anchored to that view;
+            // close it on any view change so it can't linger over the next
+            // sidebar.
+            self.commit_menu_open = false;
         }
         self.sidebar_view = view;
         if self.sidebar_view == SidebarView::Remote && self.remote.refresh_if_config_changed() {
@@ -4401,7 +4405,10 @@ impl App {
 
     fn render_commit_dropdown(&mut self, frame: &mut ratatui::Frame) {
         use crate::widgets::source_control::CommitMenuItem;
-        if !self.commit_menu_open {
+        // The dropdown belongs to the Source Control view only. Gate on it
+        // so a stale `commit_menu_open` flag can never paint the menu over
+        // another sidebar view (e.g. Run-Debug) after a view switch.
+        if !self.commit_menu_open || self.sidebar_view != SidebarView::SourceControl {
             self.source_control.commit_menu_item_areas.clear();
             return;
         }

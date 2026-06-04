@@ -9796,6 +9796,21 @@ fn shortcut_for_returns_expected_shortcuts_for_editor_symbol_actions() {
     );
 }
 
+#[test]
+fn switching_sidebar_view_closes_the_open_commit_dropdown() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.set_sidebar_view(SidebarView::SourceControl);
+    app.commit_menu_open = true;
+    // Leaving Source Control must close the dropdown so it can't paint
+    // over the Run-Debug (or any other) sidebar view.
+    app.set_sidebar_view(SidebarView::RunDebug);
+    assert!(
+        !app.commit_menu_open,
+        "the commit dropdown must close when the sidebar view changes"
+    );
+}
+
 // --- Split editor (side-by-side panes) -----------------------------------
 
 /// Open a file into the focused editor group of a fresh App.
