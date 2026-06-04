@@ -50,6 +50,27 @@ const TSX_JSX_OVERLAY_QUERY: &str = r#"
 (jsx_attribute (property_identifier) @attribute)
 "#;
 
+/// Parameter captures appended onto the bundled Python highlights
+/// query. tree-sitter-python emits no @variable.parameter, so every
+/// function and lambda parameter falls through to the broad
+/// (identifier) @variable rule and renders in default foreground.
+/// Appended LAST so these win over that rule under
+/// tree-sitter-highlight's last-match-wins rule. Covers plain,
+/// typed, defaulted, and *args / **kwargs forms.
+const PYTHON_PARAM_OVERLAY_QUERY: &str = r#"
+(parameters (identifier) @variable.parameter)
+(lambda_parameters (identifier) @variable.parameter)
+(typed_parameter (identifier) @variable.parameter)
+(default_parameter name: (identifier) @variable.parameter)
+(typed_default_parameter name: (identifier) @variable.parameter)
+(parameters (list_splat_pattern (identifier) @variable.parameter))
+(parameters (dictionary_splat_pattern (identifier) @variable.parameter))
+(lambda_parameters (list_splat_pattern (identifier) @variable.parameter))
+(lambda_parameters (dictionary_splat_pattern (identifier) @variable.parameter))
+(typed_parameter (list_splat_pattern (identifier) @variable.parameter))
+(typed_parameter (dictionary_splat_pattern (identifier) @variable.parameter))
+"#;
+
 /// Base16-Ocean-Dark inspired palette, indexed by HIGHLIGHT_NAMES position.
 fn style_for(idx: usize) -> Style {
     let name = HIGHLIGHT_NAMES.get(idx).copied().unwrap_or("");
@@ -71,7 +92,7 @@ fn style_for(idx: usize) -> Style {
         "attribute" | "tag" => Style::default().fg(rgb(0xbf, 0x61, 0x6a)),
         "property" => Style::default().fg(rgb(0x8f, 0xa1, 0xb3)),
         "variable.builtin" => Style::default().fg(rgb(0xbf, 0x61, 0x6a)),
-        "variable.parameter" => Style::default().fg(rgb(0xd0, 0x87, 0x70)),
+        "variable.parameter" => Style::default().fg(rgb(0x96, 0xb5, 0xb4)),
         "module" => Style::default().fg(rgb(0xeb, 0xcb, 0x8b)),
         "operator"
         | "punctuation"
@@ -133,14 +154,26 @@ fn build_config(kind: LangKind) -> Option<HighlightConfiguration> {
             "",
         )
         .ok()?,
-        LangKind::Python => HighlightConfiguration::new(
-            tree_sitter_python::LANGUAGE.into(),
-            "python",
-            tree_sitter_python::HIGHLIGHTS_QUERY,
-            "",
-            "",
-        )
-        .ok()?,
+        LangKind::Python => {
+            // The bundled Python highlights.scm emits no
+            // @variable.parameter, so parameters render as plain
+            // @variable. Append the overlay LAST so its parameter
+            // captures override the broad (identifier) @variable rule
+            // under tree-sitter-highlight's last-match-wins rule.
+            let combined = format!(
+                "{}\n{}",
+                tree_sitter_python::HIGHLIGHTS_QUERY,
+                PYTHON_PARAM_OVERLAY_QUERY,
+            );
+            HighlightConfiguration::new(
+                tree_sitter_python::LANGUAGE.into(),
+                "python",
+                &combined,
+                "",
+                "",
+            )
+            .ok()?
+        }
         LangKind::JavaScript => HighlightConfiguration::new(
             tree_sitter_javascript::LANGUAGE.into(),
             "javascript",
@@ -527,6 +560,36 @@ mod tests {
                 line0_len
             );
             assert!(sp.start <= sp.end);
+        }
+    }
+
+    #[test]
+    fn highlight_python_colors_parameters() {
+        // The bundled Python query emits no @variable.parameter; the
+        // appended overlay should color def/lambda parameters with the
+        // parameter style rather than leaving them as default @variable.
+        let mut reg = LangRegistry::new();
+        let src = "def f(text, n=1, *args, **kw):\n    return text\n";
+        let line_starts = compute_line_starts(src.as_bytes());
+        let h = highlight_text(&mut reg, LangKind::Python, src.as_bytes(), &line_starts);
+
+        let param_fg = Some(rgb(0x96, 0xb5, 0xb4));
+        let default_fg = Some(rgb(0xc0, 0xc5, 0xce));
+        let line0 = "def f(text, n=1, *args, **kw):";
+
+        // Each parameter name on line 0 should carry the parameter color.
+        for name in ["text", "n", "args", "kw"] {
+            let col = line0.find(name).expect("param in source");
+            let span = h[0]
+                .iter()
+                .find(|s| s.start <= col && col < s.end)
+                .unwrap_or_else(|| panic!("no span covers parameter `{name}`"));
+            assert_eq!(
+                span.style.fg, param_fg,
+                "parameter `{name}` should use the parameter color, not {:?}",
+                span.style.fg
+            );
+            assert_ne!(span.style.fg, default_fg);
         }
     }
 
