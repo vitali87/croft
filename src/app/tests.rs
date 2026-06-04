@@ -4655,6 +4655,44 @@ fn flush_run_debug_icon_overlay_is_silent_when_panel_is_not_visible() {
 }
 
 #[test]
+fn run_debug_icon_moving_within_a_visible_panel_arms_a_one_shot_terminal_clear() {
+    // Regression for the doubled/stacked headline-icon ghost: when the
+    // panel stays on Run-Debug but a layout change (terminal resize OR an
+    // internal pane-drag, which never fires Event::Resize) recenters the
+    // icon, the next flush would emit a fresh OSC-1337 image at the new
+    // cell while iTerm2 still caches the old one — two overlapping icons.
+    // The flush must instead detect the move, arm exactly one
+    // terminal.clear() to evict the stale cells, and skip re-emitting until
+    // the clear has run (last_emitted reset to None primes a fresh emit).
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.overlays
+        .run_debug
+        .set_image("\x1b]1337;File=...\x07".to_string());
+    app.set_sidebar_view(SidebarView::RunDebug);
+    app.run_debug.last_icon_cell = Some((10, 5));
+    app.flush_run_debug_icon_overlay();
+    assert_eq!(app.overlays.run_debug.last_emitted(), Some((10, 5)));
+    // A resize / pane-drag recenters the icon to a new cell while the panel
+    // is still the active, visible Run-Debug view.
+    app.run_debug.last_icon_cell = Some((3, 2));
+    app.flush_run_debug_icon_overlay();
+    assert!(
+        app.consume_run_debug_image_clear(),
+        "an icon that moved within the visible panel must arm one terminal.clear() to evict the stale image cells",
+    );
+    assert!(
+        !app.consume_run_debug_image_clear(),
+        "the clear request must be one-shot",
+    );
+    assert_eq!(
+        app.overlays.run_debug.last_emitted(),
+        None,
+        "the move branch must reset last_emitted so the post-clear frame re-emits a single clean icon",
+    );
+}
+
+#[test]
 fn tree_context_menu_on_workspace_root_offers_new_file_and_new_folder_only() {
     // Right-clicking the workspace root row must NOT offer Rename/Delete
     // (the root cannot be renamed or moved to trash from inside croft).

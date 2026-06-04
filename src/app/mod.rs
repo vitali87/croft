@@ -1701,6 +1701,23 @@ impl App {
             self.overlays.run_debug.clear_emitted();
             return;
         };
+        // The icon moved since the last emit (terminal resize OR an internal
+        // pane-drag, which never fires Event::Resize and so escapes
+        // `on_resize`). A plain re-emit at the new cell stacks a fresh
+        // OSC-1337 image on top of the one iTerm2 still caches at the old
+        // cell — the doubled/garbled headline-icon ghost. Plain SGR
+        // overwrites don't evict those cells, so reuse the proven
+        // `terminal.clear()` latch: arm one clear, drop the stale emit
+        // position, and skip painting this frame. Next frame the main loop's
+        // OR chain fires `\x1b[2J`, full-redraws, and this flush re-emits a
+        // single clean icon at the new cell.
+        if let Some(prev) = self.overlays.run_debug.last_emitted()
+            && prev != (cx, cy)
+        {
+            self.overlays.run_debug.request_clear();
+            self.overlays.run_debug.clear_emitted();
+            return;
+        }
         let Some(osc) = self.overlays.run_debug.image() else {
             return;
         };
