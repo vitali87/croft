@@ -7561,7 +7561,12 @@ impl App {
             }
             return;
         }
-        if self.editor_find.is_some() {
+        // The in-file find bar is a pane-scoped widget, not a modal: it only
+        // owns the paste while the editor itself is focused. Without the focus
+        // guard, an open find bar would swallow a paste meant for the terminal
+        // (or tree) the user has since clicked into — the keystroke path is
+        // already focus-gated via `match self.focus`, so paste must match it.
+        if self.focus == Pane::Editor && self.editor_find.is_some() {
             let mut new_q = self
                 .editor_find
                 .as_ref()

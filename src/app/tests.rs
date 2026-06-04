@@ -210,6 +210,38 @@ fn paste_while_terminal_focused_does_not_leak_into_search_box() {
 }
 
 #[test]
+fn paste_while_terminal_focused_does_not_leak_into_editor_find_bar() {
+    // Sibling of paste_while_terminal_focused_does_not_leak_into_search_box,
+    // but for the in-file Find bar (Cmd+F). The find bar is pane-scoped, not a
+    // modal: once the user clicks into the terminal, a paste meant for the
+    // shell must reach the terminal, not get swallowed by the still-open find
+    // query. Focus is the deciding factor, not whether editor_find is Some.
+    let mut app = editor_app_with_lines(&["alpha beta", "alpha gamma"]);
+    app.handle_key(key(KeyCode::Char('f'), KeyModifiers::SUPER))
+        .unwrap();
+    assert!(
+        app.editor_find.is_some(),
+        "precondition: Cmd+F opens the inline editor Find bar"
+    );
+    let query_before = app
+        .editor_find
+        .as_ref()
+        .map(|s| s.query.clone())
+        .unwrap_or_default();
+    app.focus_pane(Pane::Terminal);
+    app.handle_paste("ls -la");
+    assert_eq!(
+        app.editor_find.as_ref().map(|s| s.query.clone()),
+        Some(query_before),
+        "a paste must NOT append to the editor Find query when the terminal is focused, even though the find bar is still open"
+    );
+    assert!(
+        matches!(app.focus, Pane::Terminal),
+        "focus must stay on the terminal"
+    );
+}
+
+#[test]
 fn fs_watcher_does_not_descend_into_protected_top_level_dirs() {
     // Regression for the macOS App Management TCC prompt: when the
     // workspace contains a `Library` subdir at the top level (as $HOME
