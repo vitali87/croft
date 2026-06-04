@@ -1,6 +1,6 @@
 [package]
 name = "croft"
-version = "0.1.283"
+version = "0.1.284"
 edition = "2024"
 description = "VSCode-style TUI written in Rust"
 license = "MIT"
@@ -67,7 +67,6 @@ tui-input = "0.15"
 plist = "1.9"
 notify = "8.2"
 notify-debouncer-full = "0.7"
-trash = "5.2"
 base64 = "0.22"
 regex = "1.12"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp", "webp"] }
@@ -83,6 +82,14 @@ rayon = "1.12"
 sysinfo = { version = "0.38", default-features = false, features = ["system", "disk", "network", "component"] }
 tree-sitter-cpp = "0.23.4"
 tree-sitter-c = "0.24.2"
+
+# `trash` has no android backend: its freedesktop backend is gated
+# `not(target_os = "android")`, so on android the crate fails to compile
+# (no `platform` module). croft implements the freedesktop home-trash spec
+# itself for android (see widgets::file_tree::move_to_trash), so the crate
+# is only a dependency off-android.
+[target.'cfg(not(target_os = "android"))'.dependencies]
+trash = "5.2"
 
 [dev-dependencies]
 tempfile = "3.27"
