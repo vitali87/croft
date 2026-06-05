@@ -125,6 +125,65 @@ const PYTHON_LOCALS_QUERY: &str = r#"
 (identifier) @local.reference
 "#;
 
+/// Locals overlay appended to the bundled `tree-sitter-typescript`
+/// locals query (used for both TypeScript and TSX). The bundled query
+/// captures `required_parameter` / `optional_parameter` as
+/// `@local.definition` but ships NO `@local.scope` and NO
+/// `@local.reference`, so without this overlay a parameter is coloured
+/// only at its declaration and its body references stay default-coloured
+/// until the language server's semantic-token overlay arrives. Adds the
+/// missing scopes, single-identifier arrow parameters, `const`/`let`/`var`
+/// declarators, and the broad reference capture so tree-sitter links body
+/// references to their in-scope definition and colours them instantly.
+/// Bundled definition patterns precede this overlay's `@local.reference`,
+/// so a definition node is recorded as a definition, not re-resolved as a
+/// reference. Bare capture names only (the Rust highlighter matches them
+/// exactly).
+const TS_LOCALS_OVERLAY_QUERY: &str = r#"
+[
+  (statement_block)
+  (function_declaration)
+  (function_expression)
+  (arrow_function)
+  (method_definition)
+] @local.scope
+
+(arrow_function parameter: (identifier) @local.definition)
+(variable_declarator name: (identifier) @local.definition)
+
+(identifier) @local.reference
+"#;
+
+/// Locals overlay PREPENDED to the bundled `tree-sitter-javascript`
+/// locals query. That bundled query already has scopes, `variable_declarator`
+/// definitions, and a broad `(identifier) @local.reference`, but it captures
+/// only `(pattern/identifier)` as a definition, which a plain
+/// `(formal_parameters (identifier))` parameter is NOT, so function
+/// parameters were never recorded and their body references stayed
+/// default-coloured until the language server replied. Prepending these
+/// parameter-definition patterns (so they precede the bundled reference
+/// capture) records parameters as definitions, letting body references
+/// inherit the parameter colour instantly. Bare capture names only.
+const JS_PARAM_LOCALS_OVERLAY_QUERY: &str = r#"
+(formal_parameters (identifier) @local.definition)
+(arrow_function parameter: (identifier) @local.definition)
+(rest_pattern (identifier) @local.definition)
+"#;
+
+/// Highlights overlay appended to the bundled `tree-sitter-javascript`
+/// highlights query. That query captures no `@variable.parameter` at all
+/// (function parameters fall through to the broad `(identifier) @variable`
+/// and render in default foreground), so unlike Python and TypeScript a JS
+/// parameter was not even coloured at its declaration. Appended LAST so it
+/// wins over the broad `@variable` rule under tree-sitter-highlight's
+/// last-match-wins rule, matching the Python parameter overlay and giving
+/// the locals query a parameter colour to propagate to body references.
+const JS_PARAM_HIGHLIGHTS_OVERLAY_QUERY: &str = r#"
+(formal_parameters (identifier) @variable.parameter)
+(arrow_function parameter: (identifier) @variable.parameter)
+(rest_pattern (identifier) @variable.parameter)
+"#;
+
 /// Base16-Ocean-Dark inspired palette, indexed by HIGHLIGHT_NAMES position.
 fn style_for(idx: usize) -> Style {
     style_for_name(HIGHLIGHT_NAMES.get(idx).copied().unwrap_or(""))
@@ -234,14 +293,34 @@ fn build_config(kind: LangKind) -> Option<HighlightConfiguration> {
             )
             .ok()?
         }
-        LangKind::JavaScript => HighlightConfiguration::new(
-            tree_sitter_javascript::LANGUAGE.into(),
-            "javascript",
-            tree_sitter_javascript::HIGHLIGHT_QUERY,
-            tree_sitter_javascript::INJECTIONS_QUERY,
-            tree_sitter_javascript::LOCALS_QUERY,
-        )
-        .ok()?,
+        LangKind::JavaScript => {
+            // Prepend parameter-definition captures so plain
+            // `(formal_parameters (identifier))` params (which the bundled
+            // query's `(pattern/identifier)` does not match) are recorded as
+            // definitions and their body references inherit the parameter
+            // colour instantly.
+            let locals = format!(
+                "{}\n{}",
+                JS_PARAM_LOCALS_OVERLAY_QUERY,
+                tree_sitter_javascript::LOCALS_QUERY,
+            );
+            // Append the parameter highlights overlay so JS parameters are
+            // coloured `@variable.parameter` (the bundled query has none); the
+            // locals query then propagates that colour to body references.
+            let highlights = format!(
+                "{}\n{}",
+                tree_sitter_javascript::HIGHLIGHT_QUERY,
+                JS_PARAM_HIGHLIGHTS_OVERLAY_QUERY,
+            );
+            HighlightConfiguration::new(
+                tree_sitter_javascript::LANGUAGE.into(),
+                "javascript",
+                &highlights,
+                tree_sitter_javascript::INJECTIONS_QUERY,
+                &locals,
+            )
+            .ok()?
+        }
         LangKind::TypeScript => {
             // The bundled TypeScript highlights.scm captures only @type,
             // @type.builtin, @variable.parameter, @punctuation.bracket,
@@ -260,12 +339,20 @@ fn build_config(kind: LangKind) -> Option<HighlightConfiguration> {
                 tree_sitter_javascript::HIGHLIGHT_QUERY,
                 tree_sitter_typescript::HIGHLIGHTS_QUERY,
             );
+            // The bundled TS locals query has only parameter definitions; the
+            // overlay adds the scopes and reference capture it lacks so body
+            // references colour instantly.
+            let locals = format!(
+                "{}\n{}",
+                tree_sitter_typescript::LOCALS_QUERY,
+                TS_LOCALS_OVERLAY_QUERY,
+            );
             HighlightConfiguration::new(
                 tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
                 "typescript",
                 &combined,
                 "",
-                tree_sitter_typescript::LOCALS_QUERY,
+                &locals,
             )
             .ok()?
         }
@@ -282,12 +369,19 @@ fn build_config(kind: LangKind) -> Option<HighlightConfiguration> {
                 tree_sitter_typescript::HIGHLIGHTS_QUERY,
                 TSX_JSX_OVERLAY_QUERY,
             );
+            // Same locals overlay as TypeScript: bundled param definitions
+            // plus the scopes and reference capture they lack.
+            let locals = format!(
+                "{}\n{}",
+                tree_sitter_typescript::LOCALS_QUERY,
+                TS_LOCALS_OVERLAY_QUERY,
+            );
             HighlightConfiguration::new(
                 tree_sitter_typescript::LANGUAGE_TSX.into(),
                 "tsx",
                 &combined,
                 "",
-                tree_sitter_typescript::LOCALS_QUERY,
+                &locals,
             )
             .ok()?
         }
@@ -857,6 +951,55 @@ mod tests {
             );
             assert_ne!(span.style.fg, default_fg);
         }
+    }
+
+    fn assert_body_param_ref_is_param_colored(lang: LangKind, src: &str, line1: &str) {
+        let mut reg = LangRegistry::new();
+        let line_starts = compute_line_starts(src.as_bytes());
+        let h = highlight_text(&mut reg, lang, src.as_bytes(), &line_starts);
+        let param_fg = Some(rgb(0xd0, 0x87, 0x70));
+        let default_fg = Some(rgb(0xc0, 0xc5, 0xce));
+        let first = line1.find("text").expect("first body ref");
+        let second = line1[first + 4..].find("text").expect("second body ref") + first + 4;
+        for col in [first, second] {
+            let span = h[1]
+                .iter()
+                .find(|s| s.start <= col && col < s.end)
+                .unwrap_or_else(|| panic!("{lang:?}: no span covers body reference at col {col}"));
+            assert_eq!(
+                span.style.fg, param_fg,
+                "{lang:?}: body parameter reference at col {col} should use the parameter colour, not {:?}",
+                span.style.fg
+            );
+            assert_ne!(span.style.fg, default_fg);
+        }
+    }
+
+    #[test]
+    fn highlight_typescript_colors_parameter_references_in_body_via_locals() {
+        assert_body_param_ref_is_param_colored(
+            LangKind::TypeScript,
+            "function f(text: string) {\n    return text + text;\n}\n",
+            "    return text + text;",
+        );
+    }
+
+    #[test]
+    fn highlight_tsx_colors_parameter_references_in_body_via_locals() {
+        assert_body_param_ref_is_param_colored(
+            LangKind::Tsx,
+            "function f(text: string) {\n    return text + text;\n}\n",
+            "    return text + text;",
+        );
+    }
+
+    #[test]
+    fn highlight_javascript_colors_parameter_references_in_body_via_locals() {
+        assert_body_param_ref_is_param_colored(
+            LangKind::JavaScript,
+            "function f(text) {\n    return text + text;\n}\n",
+            "    return text + text;",
+        );
     }
 
     #[test]
