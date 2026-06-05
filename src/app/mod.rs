@@ -2583,6 +2583,37 @@ impl App {
         changed
     }
 
+    /// Re-pull semantic tokens when a server asked us to via
+    /// `workspace/semanticTokens/refresh`. rust-analyzer answers the first
+    /// request from partial syntax analysis, then sends refresh once its
+    /// cargo/crate-graph analysis resolves the richer type-aware tokens; this
+    /// is how that upgraded set reaches the editor without an edit. Only the
+    /// visible editor(s) are re-requested (matching VS Code), and only for
+    /// files the manager has open. The fresh full batch replaces the partial
+    /// one via the editor's `is_full` guard.
+    pub fn refresh_semantic_tokens_if_requested(&self) {
+        let Some(lsp) = self.lsp.as_ref() else {
+            return;
+        };
+        if !lsp.take_semantic_refresh() {
+            return;
+        }
+        let mut paths: Vec<PathBuf> = Vec::new();
+        if let Some(p) = self.editor.path.clone() {
+            paths.push(p);
+        }
+        if let Some(split) = self.editor_split.as_ref()
+            && let Some(p) = split.path.clone()
+        {
+            paths.push(p);
+        }
+        for p in paths {
+            if self.lsp_last_seen.contains_key(&p) {
+                lsp.request_semantic_tokens(p);
+            }
+        }
+    }
+
     fn go_to_definition(&mut self, path: PathBuf, line: u32, col: u32) {
         if let Some(from) = self.editor.path.clone() {
             self.nav.record(NavLoc {
@@ -13240,6 +13271,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let install_changed = app.poll_install_session();
         let update_changed = app.poll_update_watch();
         app.sync_lsp();
+        app.refresh_semantic_tokens_if_requested();
         let lsp_changed = app.drain_lsp_completion();
         app.poll_hover();
         let hover_changed = app.drain_lsp_hover();

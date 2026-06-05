@@ -1,6 +1,8 @@
 use std::ops::ControlFlow;
 use std::path::Path;
 use std::process::Stdio;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result, anyhow};
 use async_lsp::concurrency::ConcurrencyLayer;
@@ -9,6 +11,7 @@ use async_lsp::router::Router;
 use async_lsp::tracing::TracingLayer;
 use async_lsp::{LanguageServer, MainLoop, ServerSocket};
 use lsp_types::notification::{LogMessage, PublishDiagnostics, ShowMessage};
+use lsp_types::request::SemanticTokensRefresh;
 use lsp_types::{
     ClientCapabilities, CompletionContext, CompletionParams, CompletionResponse,
     CompletionTriggerKind, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
@@ -30,12 +33,29 @@ use crate::lsp::log_file;
 
 struct ClientState {
     name: String,
+    // Set when the server sends `workspace/semanticTokens/refresh`. The app
+    // polls and clears it, then re-pulls tokens for the visible editor(s).
+    // rust-analyzer relies on this: it answers the first request from partial
+    // syntax analysis, then sends refresh once the cargo/crate-graph analysis
+    // resolves the richer type-aware tokens. (ty/basedpyright never send it.)
+    semantic_refresh: Arc<AtomicBool>,
 }
 
 impl ClientState {
-    fn router(name: String) -> Router<Self> {
-        let mut router = Router::new(ClientState { name });
+    fn router(name: String, semantic_refresh: Arc<AtomicBool>) -> Router<Self> {
+        let mut router = Router::new(ClientState {
+            name,
+            semantic_refresh,
+        });
         router
+            .request::<SemanticTokensRefresh, _>(|this, _params| {
+                this.semantic_refresh.store(true, Ordering::Relaxed);
+                log_file::log(&format!(
+                    "lsp[{}] semanticTokens/refresh -> re-pull queued",
+                    this.name
+                ));
+                std::future::ready(Ok(()))
+            })
             .notification::<PublishDiagnostics>(|this, params| {
                 log_file::log(&format!(
                     "lsp[{}] diagnostics for {}: {} item(s)",
@@ -99,6 +119,7 @@ impl LspClient {
         workspace_root: &Path,
         client_capabilities: ClientCapabilities,
         extra_path: &[std::path::PathBuf],
+        semantic_refresh: Arc<AtomicBool>,
     ) -> Result<Self> {
         let workspace_uri = Url::from_file_path(workspace_root).map_err(|_| {
             anyhow!(
@@ -145,7 +166,7 @@ impl LspClient {
                 .layer(TracingLayer::default())
                 .layer(CatchUnwindLayer::default())
                 .layer(ConcurrencyLayer::default())
-                .service(ClientState::router(router_name))
+                .service(ClientState::router(router_name, semantic_refresh))
         });
 
         let stderr_name = name.clone();
@@ -470,8 +491,32 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn semantic_tokens_refresh_request_sets_the_repull_flag() {
+        use async_lsp::AnyRequest;
+        use tower::Service;
+        // rust-analyzer sends `workspace/semanticTokens/refresh` once its
+        // analysis upgrades the token set; the router must acknowledge it AND
+        // raise the shared flag so the app re-pulls (vs the old behaviour of
+        // declining it with METHOD_NOT_FOUND and never updating).
+        let flag = Arc::new(AtomicBool::new(false));
+        let mut router = ClientState::router("rust-analyzer".into(), flag.clone());
+        let req: AnyRequest = serde_json::from_value(json!({
+            "id": 1,
+            "method": "workspace/semanticTokens/refresh",
+            "params": null
+        }))
+        .expect("AnyRequest deserialization");
+        let _ = futures::executor::block_on(router.call(req));
+        assert!(
+            flag.load(Ordering::Relaxed),
+            "a workspace/semanticTokens/refresh request must set the re-pull flag"
+        );
+    }
+
+    #[test]
     fn router_continues_past_unhandled_vendor_notification_like_pyright_begin_progress() {
-        let mut router = ClientState::router("basedpyright".into());
+        let mut router =
+            ClientState::router("basedpyright".into(), Arc::new(AtomicBool::new(false)));
         let notif: AnyNotification = serde_json::from_value(json!({
             "method": "pyright/beginProgress",
             "params": {}
@@ -489,7 +534,7 @@ mod tests {
 
     #[test]
     fn router_continues_past_arbitrary_unhandled_notification_methods() {
-        let mut router = ClientState::router("any".into());
+        let mut router = ClientState::router("any".into(), Arc::new(AtomicBool::new(false)));
         for method in ["foo/bar", "experimental/dap", "rust-analyzer/serverStatus"] {
             let notif: AnyNotification = serde_json::from_value(json!({
                 "method": method,
@@ -547,8 +592,14 @@ mod tests {
         let display_name = config.name;
 
         let result: Result<()> = rt.handle().block_on(async move {
-            let client =
-                LspClient::spawn(&config, &root, ClientCapabilities::default(), &[]).await?;
+            let client = LspClient::spawn(
+                &config,
+                &root,
+                ClientCapabilities::default(),
+                &[],
+                Arc::new(AtomicBool::new(false)),
+            )
+            .await?;
             assert_eq!(client.name(), expected_name);
             client.shutdown().await
         });

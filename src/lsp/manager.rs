@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc as std_mpsc;
 
 use anyhow::Result;
@@ -230,6 +231,7 @@ pub struct LspManager {
     rename_rx: std_mpsc::Receiver<RenameResult>,
     semantic_rx: std_mpsc::Receiver<SemanticTokensUpdate>,
     capability_support: CapabilitySupport,
+    semantic_refresh: Arc<AtomicBool>,
     next_request_id: u64,
     workspace_root: PathBuf,
     _runtime: LspRuntime,
@@ -250,6 +252,7 @@ impl LspManager {
         let (semantic_tx, semantic_rx) = std_mpsc::channel();
         let capability_support: CapabilitySupport =
             Arc::new(StdMutex::new(LangCapabilitySupport::default()));
+        let semantic_refresh = Arc::new(AtomicBool::new(false));
         let root = workspace_root.clone();
         runtime.handle().spawn(worker_loop(
             root,
@@ -267,6 +270,7 @@ impl LspManager {
                 semantic_tokens: semantic_tx,
             },
             capability_support.clone(),
+            semantic_refresh.clone(),
         ));
         Ok(Self {
             cmd_tx,
@@ -280,6 +284,7 @@ impl LspManager {
             rename_rx,
             semantic_rx,
             capability_support,
+            semantic_refresh,
             next_request_id: 1,
             workspace_root,
             _runtime: runtime,
@@ -355,6 +360,14 @@ impl LspManager {
 
     pub fn drain_semantic_tokens(&self) -> Option<SemanticTokensUpdate> {
         self.semantic_rx.try_recv().ok()
+    }
+
+    /// Returns and clears the "a server asked us to re-pull semantic tokens"
+    /// flag, set by any client that received `workspace/semanticTokens/refresh`
+    /// (rust-analyzer does this once its analysis upgrades the token set). The
+    /// app re-requests tokens for the visible editor(s) when this is true.
+    pub fn take_semantic_refresh(&self) -> bool {
+        self.semantic_refresh.swap(false, Ordering::Relaxed)
     }
 
     pub fn request_definition(&mut self, path: PathBuf, line: u32, character: u32) -> u64 {
@@ -547,6 +560,9 @@ struct WorkerState {
     clients: HashMap<ClientKey, Vec<ManagedClient>>,
     docs: HashMap<PathBuf, DocState>,
     capability_support: CapabilitySupport,
+    // Shared with every spawned client's router; a client sets it on a
+    // `workspace/semanticTokens/refresh` and the app polls + clears it.
+    semantic_refresh: Arc<AtomicBool>,
 }
 
 struct DocState {
@@ -575,6 +591,7 @@ async fn worker_loop(
     mut cmd_rx: tokio_mpsc::UnboundedReceiver<Cmd>,
     tx: ResultSenders,
     capability_support: CapabilitySupport,
+    semantic_refresh: Arc<AtomicBool>,
 ) {
     let mut state = WorkerState {
         workspace_root,
@@ -582,6 +599,7 @@ async fn worker_loop(
         clients: HashMap::new(),
         docs: HashMap::new(),
         capability_support,
+        semantic_refresh,
     };
     while let Some(cmd) = cmd_rx.recv().await {
         match cmd {
@@ -715,8 +733,10 @@ impl WorkerState {
             let outcomes =
                 futures::future::join_all(resolved.into_iter().map(|(config, extra_path)| {
                     let caps = build_client_capabilities();
+                    let refresh = self.semantic_refresh.clone();
                     async move {
-                        let result = LspClient::spawn(&config, root, caps, &extra_path).await;
+                        let result =
+                            LspClient::spawn(&config, root, caps, &extra_path, refresh).await;
                         (config, result)
                     }
                 }))
