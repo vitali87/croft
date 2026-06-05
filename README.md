@@ -21,7 +21,7 @@ The non-negotiables that shape every decision in croft:
 ## Layout
 
 * **Left pane (sidebar):** Explorer with multi-select, cut / copy / paste, drag and drop file moves, and VS Code style icons (Codicons / Devicons / Seti). Two more sidebar views switch in via the activity bar: full-text Search and a Remote (SSH) explorer.
-* **Top right pane (editor):** code editor with `tree-sitter` syntax highlighting plus inline preview tabs for PNG / JPEG / GIF / BMP / WebP, PDFs (with page navigation), and CSV / TSV / XLSX / XLS / ODS spreadsheets. Splits into two side-by-side columns with `Cmd`+`\` to view files together, each column with its own tabs and cursor (images and PDFs render inline in both). An optional native modal (vim) editing mode toggles on with `Cmd`+`E`.
+* **Top right pane (editor):** code editor with `tree-sitter` syntax highlighting, enriched by an LSP semantic-token overlay (Zed's "combined" model: the language server repaints resolved symbols, so a function parameter keeps its color everywhere it is used, not just at the declaration, with tree-sitter as the instant base and fallback), plus inline preview tabs for PNG / JPEG / GIF / BMP / WebP, PDFs (with page navigation), and CSV / TSV / XLSX / XLS / ODS spreadsheets. Splits into two side-by-side columns with `Cmd`+`\` to view files together, each column with its own tabs and cursor (images and PDFs render inline in both). An optional native modal (vim) editing mode toggles on with `Cmd`+`E`.
 * **Bottom right pane (terminal):** a real interactive shell, your `$SHELL` running on a real PTY.
 * All three panes resize by dragging the seams between them, including the seam between the two editor columns when the editor is split.
 
@@ -421,6 +421,7 @@ What works:
 * Right-click context menu with Cut, Copy, Paste, Rename, count-aware Delete, Reveal in Finder (local macOS only, omitted on remote SSH sessions where the host is headless), plus New File / New Folder on empty space.
 * Live filesystem watcher with a 50 ms polling fallback for missed startup or host events.
 * File open with tree-sitter highlighting (Rust, Python, JS, TS, TSX, JSON, TOML, YAML, Markdown, Go, HTML, CSS, Bash, C, C++).
+* LSP semantic-token overlay over the tree-sitter base (`textDocument/semanticTokens/full`): for any language whose server advertises a `semanticTokensProvider`, resolved symbols are recolored project-aware, so a parameter referenced in a function body is colored the same as at its declaration (which syntax alone cannot know). Tree-sitter paints instantly and remains the fallback; semantic tokens refine on top once the server replies and re-request, debounced, after edits. When several servers are available, croft prefers a range-capable, incremental highlighter (e.g. Astral's `ty`, which answers in tens of milliseconds even on a huge cold workspace) over a full-only one that first pays a slow whole-tree enumeration, so colors appear effectively instantly without giving up `basedpyright` for completion. Buffers are split into lines on `\r\n`, lone `\r`, and `\n` (matching the LSP / VS Code line model) so token positions stay aligned with the server on files with mixed line endings.
 * Full editor write path: insert / delete / Enter / Tab / Backspace / save round-trip with `●` dirty marker, auto-reload on external write when the buffer is clean (across every open tab, not just the focused one), a save-conflict guard that refuses to clobber an external change to a dirty buffer until you press Cmd+S again to overwrite, native-clipboard copy / cut (OSC 52 fallback on remote), undo with intelligent edit-step coalescing.
 * Multi-cursor "Change All Occurrences" (`Cmd`/`Ctrl`+`F2`): selects every textual match of the word in the current file and edits them simultaneously as one undo step.
 * LSP "Rename Symbol" (`F2`): renames the identifier under the cursor across every file the language server reports, in-memory for open tabs and on disk for closed ones.
@@ -435,7 +436,7 @@ What works:
 
 The repo ships over 1,200 unit tests plus CLI integration tests; run with `cargo test`.
 
-Already working: the three-pane layout, file explorer, multi-tab editor with syntax highlighting, live embedded terminals, git status, fuzzy file finder, remote launch over SSH, and LSP-backed completion, diagnostics, hover, go-to-definition, go-to-declaration, and rename-symbol (Python, TypeScript/TSX, JavaScript, Rust, Go).
+Already working: the three-pane layout, file explorer, multi-tab editor with syntax highlighting, live embedded terminals, git status, fuzzy file finder, remote launch over SSH, and LSP-backed completion, diagnostics, hover, go-to-definition, go-to-declaration, semantic-token highlighting, and rename-symbol (Python, TypeScript/TSX, JavaScript, Rust, Go).
 
 ## Goal
 

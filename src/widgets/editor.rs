@@ -11,7 +11,8 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use crate::highlight::{
-    HiSpan, LangKind, LangRegistry, compute_line_starts, highlight_text, lang_for_extension,
+    HiSpan, LangKind, LangRegistry, compute_line_starts, decode_semantic_tokens, highlight_text,
+    lang_for_extension,
 };
 use crate::widgets::scrollbar;
 
@@ -1169,6 +1170,19 @@ pub struct Editor {
     last_edit_kind: Option<EditKind>,
     lang: Option<LangKind>,
     highlights: Vec<Vec<HiSpan>>,
+    /// LSP semantic-token overlay decoded per line (byte offsets within
+    /// the line), painted over `highlights` at render so a parameter (and
+    /// other resolved symbols) keep their color everywhere they appear,
+    /// not just at the declaration. Empty until the server replies. This
+    /// is the editor half of the VS Code / Zed "combined" model.
+    semantic_overlay: Vec<Vec<HiSpan>>,
+    /// The raw last semantic-token batch (relative-encoded data + the
+    /// server legend), retained so the overlay can be re-decoded against
+    /// the buffer after each edit. `semantic_path` records which file the
+    /// batch is for, so a stale batch is ignored after a tab switch.
+    semantic_data: Vec<u32>,
+    semantic_legend: Option<std::sync::Arc<Vec<String>>>,
+    semantic_path: Option<PathBuf>,
     registry: LangRegistry,
     /// When set, every occurrence of this string in the visible portion of
     /// the buffer is overpainted with the search-match style after the
@@ -1252,6 +1266,10 @@ impl Editor {
             last_edit_kind: None,
             lang: None,
             highlights: Vec::new(),
+            semantic_overlay: Vec::new(),
+            semantic_data: Vec::new(),
+            semantic_legend: None,
+            semantic_path: None,
             registry: LangRegistry::new(),
             search_highlight: None,
             search_highlight_opts: crate::widgets::search::SearchOpts::default(),
@@ -1494,7 +1512,7 @@ impl Editor {
             anyhow::bail!("Binary file");
         }
         let text = String::from_utf8_lossy(&bytes).into_owned();
-        self.lines = text.lines().map(|s| s.to_string()).collect();
+        self.lines = split_into_lines(&text);
         if self.lines.is_empty() {
             self.lines.push(String::new());
         }
@@ -1681,6 +1699,53 @@ impl Editor {
                 self.highlights = vec![Vec::new(); self.lines.len()];
             }
         }
+        self.recompute_semantic_overlay();
+    }
+
+    /// Store a fresh semantic-token batch from the LSP and decode it into
+    /// the per-line overlay. Called by the app when `drain_semantic_tokens`
+    /// yields a batch for this editor's file.
+    pub fn apply_semantic_tokens(
+        &mut self,
+        path: PathBuf,
+        data: Vec<u32>,
+        legend: std::sync::Arc<Vec<String>>,
+    ) {
+        self.semantic_path = Some(path);
+        self.semantic_data = data;
+        self.semantic_legend = Some(legend);
+        self.recompute_semantic_overlay();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn semantic_overlay_for_test(&self) -> &[Vec<HiSpan>] {
+        &self.semantic_overlay
+    }
+
+    #[cfg(test)]
+    pub(crate) fn lines_for_test(&self) -> &[String] {
+        &self.lines
+    }
+
+    /// Re-decode the retained semantic-token batch against the current
+    /// buffer. A no-op (clears the overlay) unless the batch belongs to
+    /// the file currently loaded, so a stale batch never colors the wrong
+    /// file after a tab switch.
+    fn recompute_semantic_overlay(&mut self) {
+        let same_file = self.semantic_path.as_deref() == self.path.as_deref();
+        let Some(legend) = self.semantic_legend.as_ref().filter(|_| same_file) else {
+            self.semantic_overlay = Vec::new();
+            return;
+        };
+        if self.semantic_data.is_empty() {
+            self.semantic_overlay = Vec::new();
+            return;
+        }
+        let text = self.lines.join("\n");
+        let bytes = text.as_bytes();
+        let line_starts = compute_line_starts(bytes);
+        self.semantic_overlay =
+            decode_semantic_tokens(&self.semantic_data, legend, bytes, &line_starts);
     }
 
     fn line_char_len(&self, row: usize) -> usize {
@@ -3329,6 +3394,18 @@ fn wrap_segments(chars: &[char], width: usize) -> Vec<(usize, usize)> {
 
 /// Shift highlight spans left by `byte_start`, dropping spans that fall
 /// entirely before the cut and clamping spans straddling the cut.
+/// Split file text into buffer lines the way the LSP spec / VS Code / Zed do:
+/// `\r\n`, a lone `\r`, and `\n` are all line terminators. Rust's `str::lines`
+/// only breaks on `\n` (stripping a trailing `\r`), so a stray lone `\r` would
+/// leave croft's line count one short of the language server's. Every LSP
+/// position past that `\r` (semantic tokens, diagnostics, hover, definition)
+/// would then resolve one row off. Normalizing first keeps the two in lockstep
+/// and is a no-op for clean `\n`-only files.
+fn split_into_lines(text: &str) -> Vec<String> {
+    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+    normalized.lines().map(|s| s.to_string()).collect()
+}
+
 fn shift_spans_for_view(spans: &[HiSpan], byte_start: usize) -> Vec<HiSpan> {
     let mut out = Vec::with_capacity(spans.len());
     for sp in spans {
@@ -3343,6 +3420,46 @@ fn shift_spans_for_view(spans: &[HiSpan], byte_start: usize) -> Vec<HiSpan> {
             style: sp.style,
         });
     }
+    out
+}
+
+/// Overlay `over` onto `base` (both sorted, non-overlapping, byte offsets
+/// within one line) and return a sorted, non-overlapping span list. Where
+/// the two cover the same bytes, `over` wins; `base` shows through in the
+/// gaps. This is the per-line realization of the VS Code / Zed "combined"
+/// rule: semantic tokens repaint the bytes they resolve, tree-sitter
+/// syntax fills the rest.
+fn merge_overlay(base: &[HiSpan], over: &[HiSpan]) -> Vec<HiSpan> {
+    if over.is_empty() {
+        return base.to_vec();
+    }
+    let mut out: Vec<HiSpan> = Vec::with_capacity(base.len() + over.len());
+    for b in base {
+        // Emit the parts of this base span not covered by any overlay span.
+        let mut cur = b.start;
+        for o in over.iter().filter(|o| o.end > b.start && o.start < b.end) {
+            if o.start > cur {
+                out.push(HiSpan {
+                    start: cur,
+                    end: o.start,
+                    style: b.style,
+                });
+            }
+            cur = cur.max(o.end);
+            if cur >= b.end {
+                break;
+            }
+        }
+        if cur < b.end {
+            out.push(HiSpan {
+                start: cur,
+                end: b.end,
+                style: b.style,
+            });
+        }
+    }
+    out.extend_from_slice(over);
+    out.sort_by_key(|s| s.start);
     out
 }
 
@@ -3592,9 +3709,14 @@ impl Widget for &mut Editor {
             let seg_bytes = byte_end - byte_start;
             let empty: Vec<HiSpan> = Vec::new();
             let line_spans = self.highlights.get(line_idx).unwrap_or(&empty);
+            // Paint the LSP semantic overlay over the tree-sitter base so
+            // resolved symbols (parameters, etc.) win wherever the server
+            // has an opinion, syntax fills the gaps (the "combined" model).
+            let sem_spans = self.semantic_overlay.get(line_idx).unwrap_or(&empty);
+            let merged = merge_overlay(line_spans, sem_spans);
             // Shift highlight spans to the row origin and clip them to the
             // segment so build_line_spans never slices past `visible_raw`.
-            let shifted: Vec<HiSpan> = shift_spans_for_view(line_spans, byte_start)
+            let shifted: Vec<HiSpan> = shift_spans_for_view(&merged, byte_start)
                 .into_iter()
                 .filter_map(|mut sp| {
                     if sp.start >= seg_bytes {
@@ -5994,6 +6116,30 @@ mod tests {
     }
 
     #[test]
+    fn open_splits_on_lone_cr_to_match_lsp_line_numbering() {
+        // A file with a stray lone `\r` (mixed line endings). The LSP/VS Code
+        // treat `\r`, `\r\n`, and `\n` all as line breaks, so its token
+        // positions count this as a line boundary. Rust's `str::lines` only
+        // breaks on `\n`, so croft must split the same way or every LSP
+        // position past the stray CR lands one row off.
+        let mut tmp = NamedTempFile::new().unwrap();
+        // "a" <LF> "" (the lone CR) "b" <CRLF> "c"
+        write!(tmp, "a\n\rb\r\nc").unwrap();
+        let mut e = Editor::new();
+        e.open(tmp.path()).unwrap();
+        assert_eq!(
+            e.lines,
+            vec![
+                "a".to_string(),
+                String::new(),
+                "b".to_string(),
+                "c".to_string()
+            ],
+            "lone CR and CRLF must each split a line, matching the LSP"
+        );
+    }
+
+    #[test]
     fn open_png_populates_image_view_and_skips_text_buffer() {
         // 1×1 transparent PNG, hand-crafted via the image crate.
         let img: image::RgbaImage = image::ImageBuffer::from_pixel(1, 1, image::Rgba([0, 0, 0, 0]));
@@ -6297,6 +6443,47 @@ mod tests {
         let spans = build_line_spans("abcde", &hi);
         // Expect: "a", "bc", "de"
         assert_eq!(spans.len(), 3);
+    }
+
+    #[test]
+    fn merge_overlay_semantic_wins_and_base_fills_gaps() {
+        use ratatui::style::Color;
+        let base_style = Style::default().fg(Color::Rgb(1, 1, 1));
+        let over_style = Style::default().fg(Color::Rgb(2, 2, 2));
+        // Base covers the whole 0..10 line; overlay repaints 3..6.
+        let base = vec![HiSpan {
+            start: 0,
+            end: 10,
+            style: base_style,
+        }];
+        let over = vec![HiSpan {
+            start: 3,
+            end: 6,
+            style: over_style,
+        }];
+        let merged = merge_overlay(&base, &over);
+        // Expect base[0..3], over[3..6], base[6..10], sorted and gapless.
+        assert_eq!(merged.len(), 3);
+        assert_eq!((merged[0].start, merged[0].end), (0, 3));
+        assert_eq!(merged[0].style.fg, Some(Color::Rgb(1, 1, 1)));
+        assert_eq!((merged[1].start, merged[1].end), (3, 6));
+        assert_eq!(
+            merged[1].style.fg,
+            Some(Color::Rgb(2, 2, 2)),
+            "overlay must win over base where they overlap"
+        );
+        assert_eq!((merged[2].start, merged[2].end), (6, 10));
+        assert_eq!(merged[2].style.fg, Some(Color::Rgb(1, 1, 1)));
+    }
+
+    #[test]
+    fn merge_overlay_empty_overlay_returns_base() {
+        let base = vec![HiSpan {
+            start: 0,
+            end: 4,
+            style: Style::default(),
+        }];
+        assert_eq!(merge_overlay(&base, &[]).len(), 1);
     }
 
     #[test]

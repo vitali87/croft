@@ -15,12 +15,18 @@ impl ServerRegistry {
 
     pub fn with_defaults() -> Self {
         let mut r = Self::new();
-        // basedpyright first so the completion-capability filter routes
-        // textDocument/completion to it (full type inference, locals,
-        // member completion). ty 0.0.35 still spawns alongside for
-        // typecheck-driven diagnostics; ruff spawns for lint diagnostics.
-        r.register(Language::Python, ServerConfig::basedpyright());
+        // ty (Astral) first: every per-capability selector picks the first
+        // registered server that advertises the capability, so ty handles all
+        // the type-aware LSP features it supports (completion, hover,
+        // definition, declaration, type-definition, references, rename,
+        // semantic tokens, diagnostics). ty is a fast incremental Rust server
+        // that answers in tens of ms even on a huge cold workspace, where
+        // basedpyright pays a slow whole-tree enumeration first. basedpyright
+        // stays registered as the fallback for the capabilities ty does not
+        // yet advertise (go-to-implementation, inlay hints). ruff spawns for
+        // lint diagnostics.
         r.register(Language::Python, ServerConfig::ty());
+        r.register(Language::Python, ServerConfig::basedpyright());
         r.register(Language::Python, ServerConfig::ruff());
         for lang in [
             Language::TypeScript,
@@ -80,7 +86,7 @@ mod tests {
         let r = ServerRegistry::with_defaults();
         let servers = r.for_extension("py");
         let names: Vec<_> = servers.iter().map(|s| s.name).collect();
-        assert_eq!(names, vec!["basedpyright", "ty", "ruff"]);
+        assert_eq!(names, vec!["ty", "basedpyright", "ruff"]);
     }
 
     #[test]

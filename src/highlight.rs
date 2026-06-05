@@ -73,7 +73,13 @@ const PYTHON_PARAM_OVERLAY_QUERY: &str = r#"
 
 /// Base16-Ocean-Dark inspired palette, indexed by HIGHLIGHT_NAMES position.
 fn style_for(idx: usize) -> Style {
-    let name = HIGHLIGHT_NAMES.get(idx).copied().unwrap_or("");
+    style_for_name(HIGHLIGHT_NAMES.get(idx).copied().unwrap_or(""))
+}
+
+/// The palette keyed by capture name. Shared by tree-sitter highlighting
+/// (via `style_for`) and by the LSP semantic-token overlay (via
+/// `semantic_style_for`) so both layers paint the same colors.
+fn style_for_name(name: &str) -> Style {
     match name {
         "comment" => Style::default()
             .fg(rgb(0x65, 0x73, 0x7e))
@@ -92,7 +98,7 @@ fn style_for(idx: usize) -> Style {
         "attribute" | "tag" => Style::default().fg(rgb(0xbf, 0x61, 0x6a)),
         "property" => Style::default().fg(rgb(0x8f, 0xa1, 0xb3)),
         "variable.builtin" => Style::default().fg(rgb(0xbf, 0x61, 0x6a)),
-        "variable.parameter" => Style::default().fg(rgb(0x96, 0xb5, 0xb4)),
+        "variable.parameter" => Style::default().fg(rgb(0xd0, 0x87, 0x70)),
         "module" => Style::default().fg(rgb(0xeb, 0xcb, 0x8b)),
         "operator"
         | "punctuation"
@@ -425,6 +431,126 @@ fn project_range(
     }
 }
 
+/// Map a standard LSP semantic-token type name onto a croft capture
+/// name, then to its `Style`. Returns `None` for token types we do not
+/// recolor, so the underlying tree-sitter highlight shows through, which
+/// is the VS Code / Zed "combined" fallback model: semantic wins only
+/// where it has an opinion, otherwise syntax prevails.
+fn semantic_style_for(token_type: &str) -> Option<Style> {
+    let capture = match token_type {
+        // `selfParameter`/`clsParameter` are ty's split of `self`/`cls` out of
+        // the generic `parameter` type; color them like any other parameter.
+        "parameter" | "selfParameter" | "clsParameter" => "variable.parameter",
+        "variable" => "variable",
+        "property" => "property",
+        "function" | "method" => "function",
+        "macro" => "function.macro",
+        "namespace" => "module",
+        "type" | "class" | "enum" | "interface" | "struct" | "typeParameter" => "type",
+        // `builtinConstant` is ty's type for `True`/`False`/`None`/`...`.
+        "enumMember" | "builtinConstant" => "constant",
+        "keyword" | "modifier" => "keyword",
+        "comment" => "comment",
+        "string" => "string",
+        "number" => "number",
+        "regexp" => "string.special",
+        "operator" => "operator",
+        "decorator" => "attribute",
+        "event" | "label" => "label",
+        _ => return None,
+    };
+    Some(style_for_name(capture))
+}
+
+/// Decode an LSP `textDocument/semanticTokens/full` `data` array into
+/// per-line byte-offset spans, ready to overlay on the tree-sitter
+/// highlights. The array is flat groups of 5 u32:
+/// `[deltaLine, deltaStartChar, length, tokenType, tokenModifiers]`,
+/// each field relative to the previous token. `token_type_names` is the
+/// server's legend in index order. LSP positions are UTF-16 code units;
+/// we convert to byte offsets against `text`. Tokens whose type maps to
+/// no croft style are skipped (tree-sitter base shows through).
+pub fn decode_semantic_tokens(
+    data: &[u32],
+    token_type_names: &[String],
+    text: &[u8],
+    line_starts: &[usize],
+) -> Vec<Vec<HiSpan>> {
+    let mut per_line: Vec<Vec<HiSpan>> = vec![Vec::new(); line_starts.len()];
+    let src = match std::str::from_utf8(text) {
+        Ok(s) => s,
+        Err(_) => return per_line,
+    };
+    let mut line: usize = 0;
+    let mut col_u16: u32 = 0;
+    for group in data.chunks_exact(5) {
+        let (delta_line, delta_start, length, ttype) = (group[0], group[1], group[2], group[3]);
+        if delta_line > 0 {
+            line += delta_line as usize;
+            col_u16 = delta_start;
+        } else {
+            col_u16 += delta_start;
+        }
+        if line >= line_starts.len() {
+            continue;
+        }
+        let name = match token_type_names.get(ttype as usize) {
+            Some(n) => n.as_str(),
+            None => continue,
+        };
+        let style = match semantic_style_for(name) {
+            Some(s) => s,
+            None => continue,
+        };
+        let line_start = line_starts[line];
+        let content_end = match line_starts.get(line + 1) {
+            Some(&next) => next.saturating_sub(1).max(line_start),
+            None => src.len(),
+        };
+        let line_str = &src[line_start..content_end];
+        if let Some((b0, b1)) = utf16_span_to_bytes(line_str, col_u16, length)
+            && b1 > b0
+        {
+            per_line[line].push(HiSpan {
+                start: b0,
+                end: b1,
+                style,
+            });
+        }
+    }
+    per_line
+}
+
+/// Convert a UTF-16 `[start, start+len)` column range within a single
+/// line into a byte `[start, end)` range. Returns `None` if the range
+/// falls outside the line. Positions landing exactly at end-of-line are
+/// clamped to the line length.
+fn utf16_span_to_bytes(line: &str, start_u16: u32, len_u16: u32) -> Option<(usize, usize)> {
+    let end_u16 = start_u16.checked_add(len_u16)?;
+    let mut u16_count: u32 = 0;
+    let mut byte = 0usize;
+    let mut b_start: Option<usize> = None;
+    let mut b_end: Option<usize> = None;
+    for ch in line.chars() {
+        if u16_count == start_u16 {
+            b_start = Some(byte);
+        }
+        if u16_count == end_u16 {
+            b_end = Some(byte);
+            break;
+        }
+        u16_count += ch.len_utf16() as u32;
+        byte += ch.len_utf8();
+    }
+    if u16_count == start_u16 {
+        b_start.get_or_insert(byte);
+    }
+    if u16_count == end_u16 {
+        b_end.get_or_insert(byte);
+    }
+    Some((b_start?, b_end?))
+}
+
 /// Build a `line_starts` table from raw bytes.
 pub fn compute_line_starts(text: &[u8]) -> Vec<usize> {
     let mut out = vec![0usize];
@@ -564,6 +690,56 @@ mod tests {
     }
 
     #[test]
+    fn semantic_tokens_color_parameter_in_body() {
+        // The whole point of the LSP overlay: a parameter referenced in
+        // the function body (where tree-sitter sees only a plain
+        // identifier) must get the parameter color, matching VS Code.
+        let src = "def f(x):\n    return x\n";
+        let line_starts = compute_line_starts(src.as_bytes());
+        let legend = vec!["parameter".to_string(), "variable".to_string()];
+        // Two `parameter` tokens: `x` in the signature (line 0, col 6)
+        // and `x` in the body (line 1, col 11). Relative-encoded.
+        let data: Vec<u32> = vec![
+            0, 6, 1, 0, 0, // line 0, char 6, len 1, type 0 (parameter)
+            1, 11, 1, 0, 0, // +1 line, char 11, len 1, type 0 (parameter)
+        ];
+        let spans = decode_semantic_tokens(&data, &legend, src.as_bytes(), &line_starts);
+
+        let param_fg = Some(rgb(0xd0, 0x87, 0x70));
+        // Body line: byte col 11 is the `x` in "    return x".
+        let body = "    return x";
+        let col = body.rfind('x').unwrap();
+        let span = spans[1]
+            .iter()
+            .find(|s| s.start <= col && col < s.end)
+            .expect("a semantic span should cover the body parameter `x`");
+        assert_eq!(
+            span.style.fg, param_fg,
+            "parameter referenced in the body should carry the parameter color"
+        );
+    }
+
+    #[test]
+    fn semantic_tokens_skip_unmapped_and_handle_unicode() {
+        // Unknown token types are skipped (tree-sitter shows through),
+        // and UTF-16 columns past a multi-byte char convert correctly.
+        let src = "x = \"é\" + ab\n"; // 'é' is 2 bytes / 1 UTF-16 unit
+        let line_starts = compute_line_starts(src.as_bytes());
+        let legend = vec!["bogusType".to_string(), "variable".to_string()];
+        // `ab` starts after: x(1) space(1) =(1) space(1) "(1) é(1 u16) "(1) space(1) +(1) space(1) = col 10
+        let data: Vec<u32> = vec![
+            0, 0, 1, 0, 0, // type 0 = bogus -> skipped
+            0, 10, 2, 1, 0, // type 1 = variable, len 2 -> `ab`
+        ];
+        let spans = decode_semantic_tokens(&data, &legend, src.as_bytes(), &line_starts);
+        assert_eq!(spans[0].len(), 1, "only the mapped token survives");
+        let byte_col = src.find("ab").unwrap();
+        let s = &spans[0][0];
+        assert_eq!(s.start, byte_col, "UTF-16 col converted to the right byte");
+        assert_eq!(s.end, byte_col + 2);
+    }
+
+    #[test]
     fn highlight_python_colors_parameters() {
         // The bundled Python query emits no @variable.parameter; the
         // appended overlay should color def/lambda parameters with the
@@ -573,7 +749,7 @@ mod tests {
         let line_starts = compute_line_starts(src.as_bytes());
         let h = highlight_text(&mut reg, LangKind::Python, src.as_bytes(), &line_starts);
 
-        let param_fg = Some(rgb(0x96, 0xb5, 0xb4));
+        let param_fg = Some(rgb(0xd0, 0x87, 0x70));
         let default_fg = Some(rgb(0xc0, 0xc5, 0xce));
         let line0 = "def f(text, n=1, *args, **kw):";
 

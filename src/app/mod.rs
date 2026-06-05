@@ -2356,6 +2356,10 @@ impl App {
             } else {
                 lsp.change_doc(path.clone(), text);
             }
+            // Refresh semantic tokens whenever the document is opened or
+            // changed. Gated by the same `seq` diff as did_change above, so
+            // this fires once per edit-batch, not per keystroke.
+            lsp.request_semantic_tokens(path.clone());
             self.lsp_last_seen.insert(path, seq);
         }
         let closed: Vec<PathBuf> = self
@@ -2515,6 +2519,36 @@ impl App {
                 None => self.hover_popup = None,
             }
             changed = true;
+        }
+        changed
+    }
+
+    /// Drain semantic-token batches and hand each to whichever editor group
+    /// currently shows that file. Returns true when an overlay changed and
+    /// the next frame should redraw.
+    pub fn drain_lsp_semantic_tokens(&mut self) -> bool {
+        let Some(lsp) = self.lsp.as_ref() else {
+            return false;
+        };
+        // Collect first so the immutable borrow of `lsp` ends before the
+        // editors are mutated below.
+        let mut updates = Vec::new();
+        while let Some(u) = lsp.drain_semantic_tokens() {
+            updates.push(u);
+        }
+        let mut changed = false;
+        for u in updates {
+            if self.editor.path.as_deref() == Some(u.path.as_path()) {
+                self.editor
+                    .apply_semantic_tokens(u.path.clone(), u.data.clone(), u.legend.clone());
+                changed = true;
+            }
+            if let Some(split) = self.editor_split.as_mut()
+                && split.path.as_deref() == Some(u.path.as_path())
+            {
+                split.apply_semantic_tokens(u.path, u.data, u.legend);
+                changed = true;
+            }
         }
         changed
     }
@@ -13185,6 +13219,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let implementation_changed = app.drain_lsp_implementation();
         let references_changed = app.drain_lsp_references();
         let rename_changed = app.drain_lsp_rename();
+        let semantic_changed = app.drain_lsp_semantic_tokens();
         let sysmon_changed = app.drain_sysmon();
         // Surface the managed TypeScript-server install progress in the status
         // bar so the background work (which can take a few seconds) is visible.
@@ -13223,6 +13258,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             || implementation_changed
             || references_changed
             || rename_changed
+            || semantic_changed
             || install_status_changed
             || sysmon_changed;
         let pty_eligible = pty_pending

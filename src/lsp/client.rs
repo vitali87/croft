@@ -14,9 +14,10 @@ use lsp_types::{
     CompletionTriggerKind, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
     DidOpenTextDocumentParams, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverParams,
     InitializeParams, InitializedParams, Location, PartialResultParams, Position, ReferenceContext,
-    ReferenceParams, RenameParams, ServerCapabilities, TextDocumentContentChangeEvent,
-    TextDocumentIdentifier, TextDocumentItem, TextDocumentPositionParams, Url,
-    VersionedTextDocumentIdentifier, WorkDoneProgressParams, WorkspaceEdit, WorkspaceFolder,
+    ReferenceParams, RenameParams, SemanticTokensParams, SemanticTokensResult, ServerCapabilities,
+    TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem,
+    TextDocumentPositionParams, Url, VersionedTextDocumentIdentifier, WorkDoneProgressParams,
+    WorkspaceEdit, WorkspaceFolder,
 };
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
@@ -408,6 +409,17 @@ impl LspClient {
             })
             .await
             .context("rename")
+    }
+
+    pub async fn semantic_tokens_full(&mut self, uri: Url) -> Result<Option<SemanticTokensResult>> {
+        self.server
+            .semantic_tokens_full(SemanticTokensParams {
+                text_document: TextDocumentIdentifier { uri },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+            })
+            .await
+            .context("semantic_tokens_full")
     }
 
     pub async fn shutdown(mut self) -> Result<()> {

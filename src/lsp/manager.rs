@@ -10,8 +10,10 @@ use lsp_types::{
     CompletionItemKindCapability, CompletionResponse, DeclarationCapability,
     DocumentChangeOperation, DocumentChanges, GotoDefinitionResponse, HoverContents,
     HoverProviderCapability, ImplementationProviderCapability, Location, MarkedString, MarkupKind,
-    OneOf, Position, TextDocumentClientCapabilities, TextEdit, TypeDefinitionProviderCapability,
-    Url, WorkspaceEdit,
+    OneOf, Position, SemanticTokenModifier, SemanticTokenType, SemanticTokensClientCapabilities,
+    SemanticTokensClientCapabilitiesRequests, SemanticTokensFullOptions, SemanticTokensResult,
+    SemanticTokensServerCapabilities, ServerCapabilities, TextDocumentClientCapabilities, TextEdit,
+    TokenFormat, TypeDefinitionProviderCapability, Url, WorkspaceEdit,
 };
 use tokio::sync::{Mutex as TokioMutex, mpsc as tokio_mpsc};
 
@@ -109,10 +111,27 @@ pub struct RenameResult {
     pub edits: Option<Vec<(PathBuf, Vec<TextSpanEdit>)>>,
 }
 
+/// A fresh batch of semantic tokens for a document, pushed to the editor
+/// to overlay on the tree-sitter highlights. Unlike the navigation
+/// requests this carries no `request_id`: it is keyed by `path` and the
+/// latest batch always wins. `data` is the raw relative-encoded LSP
+/// array; the editor decodes it against its own buffer (where the text
+/// lives) so UTF-16 columns convert to byte offsets correctly. `legend`
+/// maps token-type indices to names.
+#[derive(Debug)]
+pub struct SemanticTokensUpdate {
+    pub path: PathBuf,
+    pub data: Vec<u32>,
+    pub legend: Arc<Vec<String>>,
+}
+
 enum Cmd {
     OpenDoc {
         path: PathBuf,
         text: String,
+    },
+    RequestSemanticTokens {
+        path: PathBuf,
     },
     ChangeDoc {
         path: PathBuf,
@@ -197,6 +216,7 @@ pub struct LspManager {
     impl_rx: std_mpsc::Receiver<ImplementationResult>,
     ref_rx: std_mpsc::Receiver<ReferencesResult>,
     rename_rx: std_mpsc::Receiver<RenameResult>,
+    semantic_rx: std_mpsc::Receiver<SemanticTokensUpdate>,
     capability_support: CapabilitySupport,
     next_request_id: u64,
     workspace_root: PathBuf,
@@ -215,6 +235,7 @@ impl LspManager {
         let (impl_tx, impl_rx) = std_mpsc::channel();
         let (ref_tx, ref_rx) = std_mpsc::channel();
         let (rename_tx, rename_rx) = std_mpsc::channel();
+        let (semantic_tx, semantic_rx) = std_mpsc::channel();
         let capability_support: CapabilitySupport =
             Arc::new(StdMutex::new(LangCapabilitySupport::default()));
         let root = workspace_root.clone();
@@ -231,6 +252,7 @@ impl LspManager {
                 implementation: impl_tx,
                 references: ref_tx,
                 rename: rename_tx,
+                semantic_tokens: semantic_tx,
             },
             capability_support.clone(),
         ));
@@ -244,6 +266,7 @@ impl LspManager {
             impl_rx,
             ref_rx,
             rename_rx,
+            semantic_rx,
             capability_support,
             next_request_id: 1,
             workspace_root,
@@ -297,6 +320,18 @@ impl LspManager {
 
     pub fn drain_hover(&self) -> Option<HoverResult> {
         self.hover_rx.try_recv().ok()
+    }
+
+    /// Ask the server for the whole document's semantic tokens. Fire this
+    /// on open and (debounced) after edits; the freshest batch wins. No
+    /// request id: results are keyed by path. A no-op for languages whose
+    /// server advertises no `semanticTokensProvider`.
+    pub fn request_semantic_tokens(&self, path: PathBuf) {
+        let _ = self.cmd_tx.send(Cmd::RequestSemanticTokens { path });
+    }
+
+    pub fn drain_semantic_tokens(&self) -> Option<SemanticTokensUpdate> {
+        self.semantic_rx.try_recv().ok()
     }
 
     pub fn request_definition(&mut self, path: PathBuf, line: u32, character: u32) -> u64 {
@@ -462,6 +497,17 @@ struct ManagedClient {
     supports_implementation: bool,
     supports_references: bool,
     supports_rename: bool,
+    /// The server's semantic-token legend (token-type names by index),
+    /// captured at spawn. `None` when the server advertises no
+    /// `semanticTokensProvider` with full-document support.
+    semantic_legend: Option<Arc<Vec<String>>>,
+    /// Whether the server's `semanticTokensProvider` also advertises range
+    /// support. Used to prefer a purpose-built, incremental highlighter (e.g.
+    /// ty, which answers in tens of ms even on a huge cold workspace and
+    /// supports range) over one that only does full-document tokens after a
+    /// slow whole-tree enumeration (e.g. basedpyright). See
+    /// `request_semantic_tokens`.
+    semantic_supports_range: bool,
 }
 
 /// Servers are keyed by language AND the file's project root, not language
@@ -497,6 +543,7 @@ struct ResultSenders {
     implementation: std_mpsc::Sender<ImplementationResult>,
     references: std_mpsc::Sender<ReferencesResult>,
     rename: std_mpsc::Sender<RenameResult>,
+    semantic_tokens: std_mpsc::Sender<SemanticTokensUpdate>,
 }
 
 async fn worker_loop(
@@ -516,6 +563,11 @@ async fn worker_loop(
     while let Some(cmd) = cmd_rx.recv().await {
         match cmd {
             Cmd::OpenDoc { path, text } => state.open_doc(path, text).await,
+            Cmd::RequestSemanticTokens { path } => {
+                state
+                    .request_semantic_tokens(path, &tx.semantic_tokens)
+                    .await
+            }
             Cmd::ChangeDoc { path, text } => state.change_doc(path, text).await,
             Cmd::CloseDoc { path } => state.close_doc(path).await,
             Cmd::RequestCompletion {
@@ -645,6 +697,8 @@ impl WorkerState {
                             implementation_supported(&caps.implementation_provider);
                         let supports_references = one_of_supported(&caps.references_provider);
                         let supports_rename = one_of_supported(&caps.rename_provider);
+                        let semantic_legend = semantic_legend_of(caps).map(Arc::new);
+                        let semantic_supports_range = semantic_tokens_range_supported(caps);
                         log_file::log(&format!(
                             "lsp[{}] spawned, root={} supports_completion={supports} supports_hover={supports_hover} supports_definition={supports_definition} supports_declaration={supports_declaration} supports_type_definition={supports_type_definition} supports_implementation={supports_implementation} supports_references={supports_references} supports_rename={supports_rename}",
                             config.name,
@@ -661,6 +715,8 @@ impl WorkerState {
                             supports_implementation,
                             supports_references,
                             supports_rename,
+                            semantic_legend,
+                            semantic_supports_range,
                         });
                     }
                     Err(e) => {
@@ -921,6 +977,70 @@ impl WorkerState {
                 request_id,
                 path: path_clone,
                 text,
+            });
+        });
+    }
+
+    async fn request_semantic_tokens(
+        &mut self,
+        path: PathBuf,
+        tx: &std_mpsc::Sender<SemanticTokensUpdate>,
+    ) {
+        let Some(doc) = self.docs.get(&path) else {
+            return;
+        };
+        let lang = doc.language;
+        let root = doc.project_root.clone();
+        self.ensure_clients(lang, &root).await;
+        let Some(clients) = self.clients.get(&(lang, root)) else {
+            return;
+        };
+        // Prefer a range-capable semantic-token provider (ty answers in tens
+        // of ms even on a huge cold workspace and is a purpose-built
+        // incremental highlighter) over a full-only one (basedpyright, which
+        // pays a slow whole-tree enumeration before its first response). Fall
+        // back to any server with a legend so single-server languages and
+        // setups without ty still get tokens.
+        let pick = |c: &ManagedClient| {
+            c.semantic_legend
+                .clone()
+                .map(|leg| (c.name.clone(), c.client.clone(), leg))
+        };
+        let picked = clients
+            .iter()
+            .filter(|c| c.semantic_supports_range)
+            .find_map(&pick)
+            .or_else(|| clients.iter().find_map(&pick));
+        let Some((server_name, client_arc, legend)) = picked else {
+            return;
+        };
+        let Ok(uri) = Url::from_file_path(&path) else {
+            return;
+        };
+        let tx = tx.clone();
+        let path_clone = path.clone();
+        tokio::spawn(async move {
+            let mut client = client_arc.lock().await;
+            let resp = client.semantic_tokens_full(uri).await;
+            drop(client);
+            let data: Vec<u32> = match resp {
+                Ok(Some(SemanticTokensResult::Tokens(t))) => flatten_semantic_tokens(&t.data),
+                Ok(Some(SemanticTokensResult::Partial(p))) => flatten_semantic_tokens(&p.data),
+                Ok(None) => Vec::new(),
+                Err(e) => {
+                    log_file::log(&format!("lsp[{server_name}] semantic_tokens error: {e}"));
+                    Vec::new()
+                }
+            };
+            log_file::log(&format!(
+                "semantic_tokens response server={server_name} path={} tokens={}",
+                path_clone.display(),
+                data.len() / 5
+            ));
+            let _ = tx.send(SemanticTokensUpdate {
+                path: path_clone,
+                data,
+                legend,
             });
         });
     }
@@ -1540,6 +1660,109 @@ fn reference_locations(locs: &[Location]) -> Vec<(PathBuf, u32, u32)> {
         .collect()
 }
 
+/// Extract a server's semantic-token legend (token-type names in index
+/// order) from its advertised capabilities, but only when it supports
+/// full-document requests, since that is the only variant croft issues.
+fn semantic_legend_of(caps: &ServerCapabilities) -> Option<Vec<String>> {
+    let opts = match caps.semantic_tokens_provider.as_ref()? {
+        SemanticTokensServerCapabilities::SemanticTokensOptions(o) => o,
+        SemanticTokensServerCapabilities::SemanticTokensRegistrationOptions(o) => {
+            &o.semantic_tokens_options
+        }
+    };
+    let full_ok = matches!(
+        opts.full,
+        Some(SemanticTokensFullOptions::Bool(true)) | Some(SemanticTokensFullOptions::Delta { .. })
+    );
+    if !full_ok {
+        return None;
+    }
+    Some(
+        opts.legend
+            .token_types
+            .iter()
+            .map(|t| t.as_str().to_string())
+            .collect(),
+    )
+}
+
+/// Whether the server's `semanticTokensProvider` advertises range support
+/// (`textDocument/semanticTokens/range`). A server that supports range is a
+/// purpose-built incremental highlighter (ty), which is preferred for
+/// semantic tokens over a full-only provider (basedpyright) that pays a slow
+/// whole-workspace enumeration before its first response.
+fn semantic_tokens_range_supported(caps: &ServerCapabilities) -> bool {
+    let opts = match caps.semantic_tokens_provider.as_ref() {
+        Some(SemanticTokensServerCapabilities::SemanticTokensOptions(o)) => o,
+        Some(SemanticTokensServerCapabilities::SemanticTokensRegistrationOptions(o)) => {
+            &o.semantic_tokens_options
+        }
+        None => return false,
+    };
+    matches!(opts.range, Some(true))
+}
+
+/// Flatten lsp-types `SemanticToken` structs back into the raw
+/// relative-encoded `[deltaLine, deltaStart, length, type, modifiers]`
+/// u32 array that `highlight::decode_semantic_tokens` consumes.
+fn flatten_semantic_tokens(tokens: &[lsp_types::SemanticToken]) -> Vec<u32> {
+    let mut out = Vec::with_capacity(tokens.len() * 5);
+    for t in tokens {
+        out.push(t.delta_line);
+        out.push(t.delta_start);
+        out.push(t.length);
+        out.push(t.token_type);
+        out.push(t.token_modifiers_bitset);
+    }
+    out
+}
+
+/// The standard LSP semantic token types croft can render. Declared so
+/// servers know which types we understand; they reply with a legend that
+/// is a subset of this set.
+fn standard_semantic_token_types() -> Vec<SemanticTokenType> {
+    vec![
+        SemanticTokenType::NAMESPACE,
+        SemanticTokenType::TYPE,
+        SemanticTokenType::CLASS,
+        SemanticTokenType::ENUM,
+        SemanticTokenType::INTERFACE,
+        SemanticTokenType::STRUCT,
+        SemanticTokenType::TYPE_PARAMETER,
+        SemanticTokenType::PARAMETER,
+        SemanticTokenType::VARIABLE,
+        SemanticTokenType::PROPERTY,
+        SemanticTokenType::ENUM_MEMBER,
+        SemanticTokenType::EVENT,
+        SemanticTokenType::FUNCTION,
+        SemanticTokenType::METHOD,
+        SemanticTokenType::MACRO,
+        SemanticTokenType::KEYWORD,
+        SemanticTokenType::MODIFIER,
+        SemanticTokenType::COMMENT,
+        SemanticTokenType::STRING,
+        SemanticTokenType::NUMBER,
+        SemanticTokenType::REGEXP,
+        SemanticTokenType::OPERATOR,
+        SemanticTokenType::DECORATOR,
+    ]
+}
+
+fn standard_semantic_token_modifiers() -> Vec<SemanticTokenModifier> {
+    vec![
+        SemanticTokenModifier::DECLARATION,
+        SemanticTokenModifier::DEFINITION,
+        SemanticTokenModifier::READONLY,
+        SemanticTokenModifier::STATIC,
+        SemanticTokenModifier::DEPRECATED,
+        SemanticTokenModifier::ABSTRACT,
+        SemanticTokenModifier::ASYNC,
+        SemanticTokenModifier::MODIFICATION,
+        SemanticTokenModifier::DOCUMENTATION,
+        SemanticTokenModifier::DEFAULT_LIBRARY,
+    ]
+}
+
 fn build_client_capabilities() -> ClientCapabilities {
     ClientCapabilities {
         text_document: Some(TextDocumentClientCapabilities {
@@ -1585,6 +1808,23 @@ fn build_client_capabilities() -> ClientCapabilities {
                         CompletionItemKind::TYPE_PARAMETER,
                     ]),
                 }),
+                ..Default::default()
+            }),
+            semantic_tokens: Some(SemanticTokensClientCapabilities {
+                dynamic_registration: Some(false),
+                requests: SemanticTokensClientCapabilitiesRequests {
+                    range: Some(false),
+                    full: Some(SemanticTokensFullOptions::Bool(true)),
+                },
+                token_types: standard_semantic_token_types(),
+                token_modifiers: standard_semantic_token_modifiers(),
+                formats: vec![TokenFormat::RELATIVE],
+                overlapping_token_support: Some(false),
+                multiline_token_support: Some(false),
+                // Tell the server its tokens layer over croft's tree-sitter
+                // highlighting (VS Code / Zed "combined" model), so it may
+                // omit tokens that already match syntax.
+                augments_syntax_tokens: Some(true),
                 ..Default::default()
             }),
             ..Default::default()
@@ -1719,7 +1959,10 @@ pub(crate) fn is_on_path(cmd: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lsp_types::{LanguageString, Location, LocationLink, MarkupContent};
+    use lsp_types::{
+        LanguageString, Location, LocationLink, MarkupContent, SemanticTokensLegend,
+        SemanticTokensOptions,
+    };
     use std::time::{Duration, Instant};
 
     fn def_range(line: u32, ch: u32) -> lsp_types::Range {
@@ -2229,5 +2472,168 @@ mod tests {
         let (target_path, target_line, _col) = result.target.expect("definition target found");
         assert_eq!(target_path, file, "greet is defined in the same file");
         assert_eq!(target_line, 0, "greet is defined on line 0");
+    }
+
+    fn semantic_caps(range: Option<bool>) -> ServerCapabilities {
+        ServerCapabilities {
+            semantic_tokens_provider: Some(
+                SemanticTokensServerCapabilities::SemanticTokensOptions(SemanticTokensOptions {
+                    legend: SemanticTokensLegend {
+                        token_types: vec![SemanticTokenType::PARAMETER],
+                        token_modifiers: vec![],
+                    },
+                    range,
+                    full: Some(SemanticTokensFullOptions::Bool(true)),
+                    work_done_progress_options: Default::default(),
+                }),
+            ),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn range_support_detected_only_when_advertised() {
+        // ty advertises range; basedpyright advertises full-only.
+        assert!(semantic_tokens_range_supported(&semantic_caps(Some(true))));
+        assert!(!semantic_tokens_range_supported(&semantic_caps(None)));
+        assert!(!semantic_tokens_range_supported(&semantic_caps(Some(
+            false
+        ))));
+        assert!(!semantic_tokens_range_supported(
+            &ServerCapabilities::default()
+        ));
+    }
+
+    fn drain_semantic_blocking(
+        manager: &LspManager,
+        timeout: Duration,
+    ) -> Option<SemanticTokensUpdate> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(r) = manager.drain_semantic_tokens() {
+                return Some(r);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn manager_semantic_tokens_against_python_lsp() {
+        if !any_python_completion_server_on_path() {
+            eprintln!("SKIPPED: no basedpyright/pyright/ty on PATH");
+            return;
+        }
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().canonicalize().expect("canonicalize");
+        let file = root.join("demo.py");
+        // `value` is a parameter referenced in the body; tree-sitter alone
+        // cannot know the body use is the parameter, the LSP can.
+        let text = String::from("def calc(value):\n    return value + 1\n");
+        std::fs::write(&file, &text).expect("write demo");
+
+        let manager = LspManager::new(root).expect("manager");
+        manager.open_doc(file.clone(), text.clone());
+        std::thread::sleep(Duration::from_millis(2500));
+        manager.request_semantic_tokens(file.clone());
+
+        let update = drain_semantic_blocking(&manager, Duration::from_secs(30))
+            .expect("semantic tokens arrived");
+        assert_eq!(update.path, file);
+        assert!(
+            update.legend.iter().any(|t| t == "parameter"),
+            "the server legend should include the `parameter` token type, got: {:?}",
+            update.legend
+        );
+        assert!(!update.data.is_empty(), "expected a non-empty token batch");
+
+        // Decode and confirm the `value` reference in the body (line 1)
+        // carries the parameter color, end-to-end through the real server.
+        let line_starts = crate::highlight::compute_line_starts(text.as_bytes());
+        let spans = crate::highlight::decode_semantic_tokens(
+            &update.data,
+            &update.legend,
+            text.as_bytes(),
+            &line_starts,
+        );
+        let body = "    return value + 1";
+        let col = body.find("value").expect("value in body");
+        let hit = spans[1]
+            .iter()
+            .find(|s| s.start <= col && col < s.end)
+            .expect("a semantic span should cover the body `value`");
+        assert_eq!(
+            hit.style.fg,
+            Some(ratatui::style::Color::Rgb(0xd0, 0x87, 0x70)),
+            "the parameter referenced in the body must carry the parameter color"
+        );
+    }
+
+    // Reproduces the FULL real-app path for a file with a stray lone `\r`
+    // (the n-gram.py bug): opened through `Editor::open`, synced the way
+    // `sync_lsp` does (`lines.join("\n")`), then the batch applied via
+    // `Editor::apply_semantic_tokens`. The lone `\r` is a line break for the
+    // LSP but not for Rust's `str::lines`, so before the fix every token
+    // below it landed one row off and the body parameter went uncolored.
+    #[test]
+    fn editor_overlay_aligns_with_lsp_across_a_lone_cr() {
+        if !any_python_completion_server_on_path() {
+            eprintln!("SKIPPED: no basedpyright/pyright/ty on PATH");
+            return;
+        }
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().canonicalize().expect("canonicalize");
+        let file = root.join("mixed.py");
+        // A lone `\r` (the `\n\r` after line 0) sits above the function, the
+        // same shape as the real n-gram.py. Buffer lines after the fix:
+        //   0:"x = 1"  1:""  2:"def calc(value):"  3:"    return value + 1"
+        let disk = "x = 1\n\rdef calc(value):\n    return value + 1\n";
+        std::fs::write(&file, disk).expect("write mixed");
+
+        let mut editor = crate::widgets::editor::Editor::new();
+        editor.open(&file).expect("open");
+        // The lone CR must split a line so our numbering matches the server's.
+        assert_eq!(
+            editor.lines_for_test().len(),
+            4,
+            "lone CR must split a line"
+        );
+        let sent = editor.lines_for_test().join("\n");
+
+        let manager = LspManager::new(root).expect("manager");
+        manager.open_doc(file.clone(), sent);
+        std::thread::sleep(Duration::from_millis(2500));
+        manager.request_semantic_tokens(file.clone());
+        let update = drain_semantic_blocking(&manager, Duration::from_secs(30))
+            .expect("semantic tokens arrived");
+
+        // When ty is installed, the range-capable preference must route the
+        // request to ty (instant on any workspace), not full-only basedpyright.
+        // ty's legend uniquely carries `selfParameter`; basedpyright's does not.
+        if is_on_path("ty") {
+            assert!(
+                update.legend.iter().any(|t| t == "selfParameter"),
+                "ty (range-capable) must be preferred for semantic tokens; legend={:?}",
+                update.legend
+            );
+        }
+
+        editor.apply_semantic_tokens(update.path, update.data, update.legend);
+        let overlay = editor.semantic_overlay_for_test();
+        // The `value` reference in the body is on buffer line 3. It must carry
+        // the parameter color there, and NOT bleed onto the wrong row.
+        let orange = ratatui::style::Color::Rgb(0xd0, 0x87, 0x70);
+        let colored_on = |line: usize| {
+            overlay
+                .get(line)
+                .map(|s| s.iter().any(|sp| sp.style.fg == Some(orange)))
+                .unwrap_or(false)
+        };
+        assert!(
+            colored_on(3),
+            "body parameter must be colored on its real row (line 3); overlay={overlay:?}"
+        );
     }
 }
