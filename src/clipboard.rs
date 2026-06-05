@@ -4,7 +4,7 @@
 /// from croft's already-threaded TUI process, which is both slower and more
 /// brittle under macOS's fork-safety rules.
 ///
-/// On Linux, try `wl-paste` (Wayland) then `xclip` then `xsel` (X11).
+/// On Linux, tries `wl-paste`, `xclip`, then `xsel` in that fixed order.
 pub fn read_string() -> Option<String> {
     #[cfg(test)]
     {
@@ -50,7 +50,7 @@ fn read_pbpaste() -> Option<String> {
 /// objc runtime resolves but `NSPasteboard` rejects the write for some
 /// sandboxing reason.
 ///
-/// On Linux, try `wl-copy` (Wayland) then `xclip` then `xsel` (X11).
+/// On Linux, tries `wl-copy`, `xclip`, then `xsel` in that fixed order.
 /// Returns `false` only when none of those tools are available, in which
 /// case the caller falls back to OSC 52 (useful for remote SSH sessions).
 pub fn write_string(text: &str) -> bool {
@@ -92,7 +92,7 @@ mod linux {
 
     /// Write `text` to the system clipboard on Linux.
     ///
-    /// Tries `wl-copy` (Wayland), then `xclip`, then `xsel`. Returns `true`
+    /// Tries `wl-copy`, then `xclip`, then `xsel`. Returns `true`
     /// when one of them succeeded. Returns `false` when none are installed,
     /// which happens in headless SSH sessions — the caller sends OSC 52 then.
     pub fn write_string(text: &str) -> bool {
@@ -125,7 +125,7 @@ mod linux {
 
     /// Read text from the system clipboard on Linux.
     ///
-    /// Tries `wl-paste` (Wayland), then `xclip`, then `xsel`.
+    /// Tries `wl-paste`, then `xclip`, then `xsel`.
     pub fn read_string() -> Option<String> {
         read_via(&["wl-paste"])
             .or_else(|| read_via(&["xclip", "-selection", "clipboard", "-o"]))
