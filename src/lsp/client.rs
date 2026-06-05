@@ -13,8 +13,9 @@ use lsp_types::{
     ClientCapabilities, CompletionContext, CompletionParams, CompletionResponse,
     CompletionTriggerKind, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
     DidOpenTextDocumentParams, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverParams,
-    InitializeParams, InitializedParams, Location, PartialResultParams, Position, ReferenceContext,
-    ReferenceParams, RenameParams, SemanticTokensParams, SemanticTokensResult, ServerCapabilities,
+    InitializeParams, InitializedParams, Location, PartialResultParams, Position, Range,
+    ReferenceContext, ReferenceParams, RenameParams, SemanticTokensParams,
+    SemanticTokensRangeParams, SemanticTokensRangeResult, SemanticTokensResult, ServerCapabilities,
     TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem,
     TextDocumentPositionParams, Url, VersionedTextDocumentIdentifier, WorkDoneProgressParams,
     WorkspaceEdit, WorkspaceFolder,
@@ -420,6 +421,37 @@ impl LspClient {
             })
             .await
             .context("semantic_tokens_full")
+    }
+
+    /// Semantic tokens for just the visible line range. ty answers a viewport
+    /// query in tens of milliseconds even on a cold workspace, so croft fires
+    /// this on open to paint on-screen code immediately while the whole-file
+    /// `semantic_tokens_full` request fills in the rest behind it (the VS Code
+    /// / Zed first-paint model). `start`/`end` are zero-based line numbers.
+    pub async fn semantic_tokens_range(
+        &mut self,
+        uri: Url,
+        start: u32,
+        end: u32,
+    ) -> Result<Option<SemanticTokensRangeResult>> {
+        self.server
+            .semantic_tokens_range(SemanticTokensRangeParams {
+                text_document: TextDocumentIdentifier { uri },
+                range: Range {
+                    start: Position {
+                        line: start,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: end,
+                        character: 0,
+                    },
+                },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+            })
+            .await
+            .context("semantic_tokens_range")
     }
 
     pub async fn shutdown(mut self) -> Result<()> {

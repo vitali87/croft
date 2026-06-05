@@ -1183,6 +1183,12 @@ pub struct Editor {
     semantic_data: Vec<u32>,
     semantic_legend: Option<std::sync::Arc<Vec<String>>>,
     semantic_path: Option<PathBuf>,
+    /// Whether the retained batch covers the WHOLE document (a
+    /// `semanticTokens/full` reply) rather than just the opening viewport (a
+    /// `semanticTokens/range` reply). Once a full batch lands for a file, a
+    /// late range reply for that same file is dropped so it cannot blank the
+    /// off-screen colour the full batch painted.
+    semantic_is_full: bool,
     registry: LangRegistry,
     /// When set, every occurrence of this string in the visible portion of
     /// the buffer is overpainted with the search-match style after the
@@ -1270,6 +1276,7 @@ impl Editor {
             semantic_data: Vec::new(),
             semantic_legend: None,
             semantic_path: None,
+            semantic_is_full: false,
             registry: LangRegistry::new(),
             search_highlight: None,
             search_highlight_opts: crate::widgets::search::SearchOpts::default(),
@@ -1710,10 +1717,21 @@ impl Editor {
         path: PathBuf,
         data: Vec<u32>,
         legend: std::sync::Arc<Vec<String>>,
+        is_full: bool,
     ) {
+        // A viewport-only (range) batch must never clobber a whole-document
+        // batch already in place for the same file: the full set colours the
+        // off-screen lines the range set omits, so letting a late range reply
+        // win would blank them. Full batches always win; a range batch only
+        // applies as the first paint, before the full reply arrives.
+        let same_file = self.semantic_path.as_deref() == Some(path.as_path());
+        if !is_full && same_file && self.semantic_is_full {
+            return;
+        }
         self.semantic_path = Some(path);
         self.semantic_data = data;
         self.semantic_legend = Some(legend);
+        self.semantic_is_full = is_full;
         self.recompute_semantic_overlay();
     }
 
@@ -4866,6 +4884,58 @@ mod tests {
         assert!(is_binary(b"hello\0world"));
         assert!(!is_binary(b"hello world"));
         assert!(!is_binary(b""));
+    }
+
+    #[test]
+    fn range_batch_does_not_overwrite_a_full_batch_for_the_same_file() {
+        // The viewport range request races the whole-document request on open.
+        // If a range reply lands AFTER the full reply, it must be dropped so it
+        // cannot blank the off-screen colour the full reply painted.
+        let mut e = editor_with("def f(x):\n    return x\n");
+        let p = std::path::PathBuf::from("/tmp/sem_guard.py");
+        e.path = Some(p.clone());
+        let legend = std::sync::Arc::new(vec!["parameter".to_string()]);
+        // Full batch: signature param (line 0) AND body reference (line 1).
+        let full = vec![0, 6, 1, 0, 0, 1, 11, 1, 0, 0];
+        e.apply_semantic_tokens(p.clone(), full, legend.clone(), true);
+        let body_spans = e.semantic_overlay_for_test()[1].len();
+        assert!(body_spans > 0, "full batch must colour the body reference");
+
+        // A late range batch covering only line 0 must be rejected.
+        let range_only_line0 = vec![0, 6, 1, 0, 0];
+        e.apply_semantic_tokens(p.clone(), range_only_line0, legend, false);
+        assert_eq!(
+            e.semantic_overlay_for_test()[1].len(),
+            body_spans,
+            "a range batch must not erase off-screen colour from the full batch"
+        );
+    }
+
+    #[test]
+    fn range_batch_paints_first_then_full_replaces() {
+        // The intended first-paint order: range colours the viewport, then the
+        // full reply arrives and extends colour to off-screen lines.
+        let mut e = editor_with("def f(x):\n    return x\n");
+        let p = std::path::PathBuf::from("/tmp/sem_first.py");
+        e.path = Some(p.clone());
+        let legend = std::sync::Arc::new(vec!["parameter".to_string()]);
+        // Range first: only line 0 (the viewport) is coloured.
+        e.apply_semantic_tokens(p.clone(), vec![0, 6, 1, 0, 0], legend.clone(), false);
+        let line1_before = e
+            .semantic_overlay_for_test()
+            .get(1)
+            .map(|s| s.len())
+            .unwrap_or(0);
+        assert_eq!(
+            line1_before, 0,
+            "range batch leaves the off-screen line bare"
+        );
+        // Full reply lands and colours the body reference on line 1.
+        e.apply_semantic_tokens(p.clone(), vec![0, 6, 1, 0, 0, 1, 11, 1, 0, 0], legend, true);
+        assert!(
+            !e.semantic_overlay_for_test()[1].is_empty(),
+            "full reply must colour the previously-bare off-screen line"
+        );
     }
 
     #[test]

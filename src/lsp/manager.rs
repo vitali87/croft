@@ -11,9 +11,11 @@ use lsp_types::{
     DocumentChangeOperation, DocumentChanges, GotoDefinitionResponse, HoverContents,
     HoverProviderCapability, ImplementationProviderCapability, Location, MarkedString, MarkupKind,
     OneOf, Position, SemanticTokenModifier, SemanticTokenType, SemanticTokensClientCapabilities,
-    SemanticTokensClientCapabilitiesRequests, SemanticTokensFullOptions, SemanticTokensResult,
-    SemanticTokensServerCapabilities, ServerCapabilities, TextDocumentClientCapabilities, TextEdit,
-    TokenFormat, TypeDefinitionProviderCapability, Url, WorkspaceEdit,
+    SemanticTokensClientCapabilitiesRequests, SemanticTokensFullOptions, SemanticTokensRangeResult,
+    SemanticTokensResult, SemanticTokensServerCapabilities,
+    SemanticTokensWorkspaceClientCapabilities, ServerCapabilities, TextDocumentClientCapabilities,
+    TextEdit, TokenFormat, TypeDefinitionProviderCapability, Url, WorkspaceClientCapabilities,
+    WorkspaceEdit,
 };
 use tokio::sync::{Mutex as TokioMutex, mpsc as tokio_mpsc};
 
@@ -123,6 +125,11 @@ pub struct SemanticTokensUpdate {
     pub path: PathBuf,
     pub data: Vec<u32>,
     pub legend: Arc<Vec<String>>,
+    /// `true` for a whole-document `semanticTokens/full` batch, `false` for a
+    /// viewport-only `semanticTokens/range` batch. The editor refuses to let a
+    /// range batch overwrite a full one for the same file, so a range reply
+    /// that arrives after the full document can never erase off-screen colour.
+    pub is_full: bool,
 }
 
 enum Cmd {
@@ -132,6 +139,11 @@ enum Cmd {
     },
     RequestSemanticTokens {
         path: PathBuf,
+    },
+    RequestSemanticTokensRange {
+        path: PathBuf,
+        start_line: u32,
+        end_line: u32,
     },
     ChangeDoc {
         path: PathBuf,
@@ -328,6 +340,17 @@ impl LspManager {
     /// server advertises no `semanticTokensProvider`.
     pub fn request_semantic_tokens(&self, path: PathBuf) {
         let _ = self.cmd_tx.send(Cmd::RequestSemanticTokens { path });
+    }
+
+    /// Ask the server for semantic tokens covering only `start_line..end_line`
+    /// (zero-based, half-open). Fire this on open with the editor's viewport so
+    /// the visible code colours immediately, ahead of the whole-file request.
+    pub fn request_semantic_tokens_range(&self, path: PathBuf, start_line: u32, end_line: u32) {
+        let _ = self.cmd_tx.send(Cmd::RequestSemanticTokensRange {
+            path,
+            start_line,
+            end_line,
+        });
     }
 
     pub fn drain_semantic_tokens(&self) -> Option<SemanticTokensUpdate> {
@@ -568,6 +591,15 @@ async fn worker_loop(
                     .request_semantic_tokens(path, &tx.semantic_tokens)
                     .await
             }
+            Cmd::RequestSemanticTokensRange {
+                path,
+                start_line,
+                end_line,
+            } => {
+                state
+                    .request_semantic_tokens_range(path, start_line, end_line, &tx.semantic_tokens)
+                    .await
+            }
             Cmd::ChangeDoc { path, text } => state.change_doc(path, text).await,
             Cmd::CloseDoc { path } => state.close_doc(path).await,
             Cmd::RequestCompletion {
@@ -670,14 +702,28 @@ impl WorkerState {
                 .is_some_and(|clients| clients.is_empty());
         if should_try {
             let configs: Vec<ServerConfig> = self.registry.for_language(lang).to_vec();
+            // Spawn every server for this root concurrently rather than awaiting
+            // each in turn. The worker loop processes commands one at a time, so
+            // a sequential spawn chain made the OpenDoc command (and the
+            // semantic-token request queued right behind it) block on the SUM of
+            // ty + basedpyright + ruff init handshakes. Concurrent spawn bounds
+            // the cold-root stall to the SLOWEST single handshake instead.
+            let resolved: Vec<(ServerConfig, Vec<PathBuf>)> = configs
+                .iter()
+                .filter_map(|config| resolve_config(config, first_attempt))
+                .collect();
+            let outcomes =
+                futures::future::join_all(resolved.into_iter().map(|(config, extra_path)| {
+                    let caps = build_client_capabilities();
+                    async move {
+                        let result = LspClient::spawn(&config, root, caps, &extra_path).await;
+                        (config, result)
+                    }
+                }))
+                .await;
             let mut spawned: Vec<ManagedClient> = Vec::new();
-            for config in configs.iter() {
-                let Some((config, extra_path)) = resolve_config(config, first_attempt) else {
-                    continue;
-                };
-                match LspClient::spawn(&config, root, build_client_capabilities(), &extra_path)
-                    .await
-                {
+            for (config, result) in outcomes {
+                match result {
                     Ok(client) => {
                         let caps = client.capabilities();
                         // A capability that can be sent as a bare `false` (the
@@ -1020,18 +1066,44 @@ impl WorkerState {
         let tx = tx.clone();
         let path_clone = path.clone();
         tokio::spawn(async move {
-            let mut client = client_arc.lock().await;
-            let resp = client.semantic_tokens_full(uri).await;
-            drop(client);
-            let data: Vec<u32> = match resp {
-                Ok(Some(SemanticTokensResult::Tokens(t))) => flatten_semantic_tokens(&t.data),
-                Ok(Some(SemanticTokensResult::Partial(p))) => flatten_semantic_tokens(&p.data),
-                Ok(None) => Vec::new(),
-                Err(e) => {
-                    log_file::log(&format!("lsp[{server_name}] semantic_tokens error: {e}"));
-                    Vec::new()
+            // A server freshly spawned for a cold root can answer the very
+            // first `semanticTokens/full` (fired microseconds after didOpen)
+            // with an empty set before its analysis is ready, then have the
+            // real tokens available a beat later. ty does NOT send
+            // `workspace/semanticTokens/refresh` to prompt a re-pull (verified
+            // empirically), and the doc-sync loop only re-requests on an edit,
+            // so without this retry an unedited file would stay uncoloured for
+            // seconds. Retry on empty with a short bounded backoff; stop at the
+            // first non-empty batch (or after the last attempt, emitting empty
+            // so a genuinely token-free file still resolves).
+            const BACKOFF_MS: [u64; 5] = [0, 80, 160, 320, 640];
+            let mut data: Vec<u32> = Vec::new();
+            for (attempt, delay) in BACKOFF_MS.iter().enumerate() {
+                if *delay > 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(*delay)).await;
                 }
-            };
+                let mut client = client_arc.lock().await;
+                let resp = client.semantic_tokens_full(uri.clone()).await;
+                drop(client);
+                data = match resp {
+                    Ok(Some(SemanticTokensResult::Tokens(t))) => flatten_semantic_tokens(&t.data),
+                    Ok(Some(SemanticTokensResult::Partial(p))) => flatten_semantic_tokens(&p.data),
+                    Ok(None) => Vec::new(),
+                    Err(e) => {
+                        log_file::log(&format!("lsp[{server_name}] semantic_tokens error: {e}"));
+                        Vec::new()
+                    }
+                };
+                if !data.is_empty() {
+                    if attempt > 0 {
+                        log_file::log(&format!(
+                            "semantic_tokens server={server_name} resolved on retry #{attempt} for {}",
+                            path_clone.display()
+                        ));
+                    }
+                    break;
+                }
+            }
             log_file::log(&format!(
                 "semantic_tokens response server={server_name} path={} tokens={}",
                 path_clone.display(),
@@ -1041,6 +1113,73 @@ impl WorkerState {
                 path: path_clone,
                 data,
                 legend,
+                is_full: true,
+            });
+        });
+    }
+
+    async fn request_semantic_tokens_range(
+        &mut self,
+        path: PathBuf,
+        start_line: u32,
+        end_line: u32,
+        tx: &std_mpsc::Sender<SemanticTokensUpdate>,
+    ) {
+        let Some(doc) = self.docs.get(&path) else {
+            return;
+        };
+        let lang = doc.language;
+        let root = doc.project_root.clone();
+        self.ensure_clients(lang, &root).await;
+        let Some(clients) = self.clients.get(&(lang, root)) else {
+            return;
+        };
+        // A range request only makes sense to a server that actually advertises
+        // `semanticTokens/range`; there is no full-only fallback here because
+        // the whole-document `request_semantic_tokens` covers those servers.
+        let picked = clients
+            .iter()
+            .filter(|c| c.semantic_supports_range)
+            .find_map(|c| {
+                c.semantic_legend
+                    .clone()
+                    .map(|leg| (c.name.clone(), c.client.clone(), leg))
+            });
+        let Some((server_name, client_arc, legend)) = picked else {
+            return;
+        };
+        let Ok(uri) = Url::from_file_path(&path) else {
+            return;
+        };
+        let tx = tx.clone();
+        let path_clone = path.clone();
+        tokio::spawn(async move {
+            let mut client = client_arc.lock().await;
+            let resp = client
+                .semantic_tokens_range(uri, start_line, end_line)
+                .await;
+            drop(client);
+            let data: Vec<u32> = match resp {
+                Ok(Some(SemanticTokensRangeResult::Tokens(t))) => flatten_semantic_tokens(&t.data),
+                Ok(Some(SemanticTokensRangeResult::Partial(p))) => flatten_semantic_tokens(&p.data),
+                Ok(None) => Vec::new(),
+                Err(e) => {
+                    log_file::log(&format!(
+                        "lsp[{server_name}] semantic_tokens_range error: {e}"
+                    ));
+                    Vec::new()
+                }
+            };
+            log_file::log(&format!(
+                "semantic_tokens range response server={server_name} path={} lines={start_line}..{end_line} tokens={}",
+                path_clone.display(),
+                data.len() / 5
+            ));
+            let _ = tx.send(SemanticTokensUpdate {
+                path: path_clone,
+                data,
+                legend,
+                is_full: false,
             });
         });
     }
@@ -1813,7 +1952,10 @@ fn build_client_capabilities() -> ClientCapabilities {
             semantic_tokens: Some(SemanticTokensClientCapabilities {
                 dynamic_registration: Some(false),
                 requests: SemanticTokensClientCapabilitiesRequests {
-                    range: Some(false),
+                    // ty answers a viewport `semanticTokens/range` query in tens
+                    // of ms even on a cold workspace, so croft fires one on open
+                    // for instant first paint of on-screen code.
+                    range: Some(true),
                     full: Some(SemanticTokensFullOptions::Bool(true)),
                 },
                 token_types: standard_semantic_token_types(),
@@ -1826,6 +1968,17 @@ fn build_client_capabilities() -> ClientCapabilities {
                 // omit tokens that already match syntax.
                 augments_syntax_tokens: Some(true),
                 ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        // Advertise that croft can re-pull tokens on a server's request. ty
+        // does not currently send `workspace/semanticTokens/refresh` (croft
+        // covers the cold-start gap with its own empty-response retry instead),
+        // but declaring support is correct and future-proofs the path for
+        // servers that do.
+        workspace: Some(WorkspaceClientCapabilities {
+            semantic_tokens: Some(SemanticTokensWorkspaceClientCapabilities {
+                refresh_support: Some(true),
             }),
             ..Default::default()
         }),
@@ -2571,6 +2724,41 @@ mod tests {
         );
     }
 
+    #[test]
+    fn manager_semantic_tokens_range_against_python_lsp() {
+        // The viewport-range first-paint path: a `semanticTokens/range` query
+        // over the opening rows must return tokens and arrive flagged
+        // `is_full == false`. Requires a range-capable server (ty); when only
+        // full-only basedpyright is present the request yields nothing, so the
+        // assertion is gated on ty being on PATH.
+        if !is_on_path("ty") {
+            eprintln!("SKIPPED: ty (range-capable) not on PATH");
+            return;
+        }
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().canonicalize().expect("canonicalize");
+        let file = root.join("range_demo.py");
+        let text = String::from("def calc(value):\n    return value + 1\n");
+        std::fs::write(&file, &text).expect("write range_demo");
+
+        let manager = LspManager::new(root).expect("manager");
+        manager.open_doc(file.clone(), text.clone());
+        std::thread::sleep(Duration::from_millis(2500));
+        manager.request_semantic_tokens_range(file.clone(), 0, 2);
+
+        let update = drain_semantic_blocking(&manager, Duration::from_secs(30))
+            .expect("range semantic tokens arrived");
+        assert_eq!(update.path, file);
+        assert!(
+            !update.is_full,
+            "a range reply must be flagged is_full=false so it cannot clobber the full batch"
+        );
+        assert!(
+            !update.data.is_empty(),
+            "the viewport range must carry tokens for the visible function"
+        );
+    }
+
     // Reproduces the FULL real-app path for a file with a stray lone `\r`
     // (the n-gram.py bug): opened through `Editor::open`, synced the way
     // `sync_lsp` does (`lines.join("\n")`), then the batch applied via
@@ -2620,7 +2808,7 @@ mod tests {
             );
         }
 
-        editor.apply_semantic_tokens(update.path, update.data, update.legend);
+        editor.apply_semantic_tokens(update.path, update.data, update.legend, update.is_full);
         let overlay = editor.semantic_overlay_for_test();
         // The `value` reference in the body is on buffer line 3. It must carry
         // the parameter color there, and NOT bleed onto the wrong row.

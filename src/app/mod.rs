@@ -2323,7 +2323,12 @@ impl App {
             return;
         }
         let mut current: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
-        let mut to_send: Vec<(bool, PathBuf, String, u64)> = Vec::new();
+        // `(is_open, path, text, seq, viewport)`. The viewport `(start, end)`
+        // lines are captured only for opens, so the first paint can fire a fast
+        // `semanticTokens/range` over what is on screen ahead of the
+        // whole-document request.
+        type DocSync = (bool, PathBuf, String, u64, Option<(u32, u32)>);
+        let mut to_send: Vec<DocSync> = Vec::new();
         for tab in self.editor.iter_tabs() {
             if tab.image.is_some() || tab.sheet.is_some() || tab.diff.is_some() {
                 continue;
@@ -2339,9 +2344,22 @@ impl App {
             let seq = tab.edit_seq;
             let prev = self.lsp_last_seen.get(path).copied();
             match prev {
-                None => to_send.push((true, path.clone(), tab.lines.join("\n"), seq)),
+                None => {
+                    // A small look-ahead past the visible rows keeps colour
+                    // stable through the first nudge of the scroll wheel
+                    // before the full-document reply lands.
+                    let start = tab.scroll as u32;
+                    let end = (tab.scroll + tab.page_size() + 16).min(tab.lines.len()) as u32;
+                    to_send.push((
+                        true,
+                        path.clone(),
+                        tab.lines.join("\n"),
+                        seq,
+                        Some((start, end)),
+                    ));
+                }
                 Some(p) if p != seq => {
-                    to_send.push((false, path.clone(), tab.lines.join("\n"), seq))
+                    to_send.push((false, path.clone(), tab.lines.join("\n"), seq, None))
                 }
                 _ => {}
             }
@@ -2350,15 +2368,23 @@ impl App {
             Some(l) => l,
             None => return,
         };
-        for (is_open, path, text, seq) in to_send {
+        for (is_open, path, text, seq, viewport) in to_send {
             if is_open {
                 lsp.open_doc(path.clone(), text);
+                // Paint the visible lines first: ty answers a viewport range
+                // query in tens of ms even on a cold workspace, so on-screen
+                // code colours immediately while the full request fills in the
+                // rest. The editor refuses to let this range batch overwrite
+                // the full one when it arrives.
+                if let Some((start, end)) = viewport {
+                    lsp.request_semantic_tokens_range(path.clone(), start, end);
+                }
             } else {
                 lsp.change_doc(path.clone(), text);
             }
-            // Refresh semantic tokens whenever the document is opened or
-            // changed. Gated by the same `seq` diff as did_change above, so
-            // this fires once per edit-batch, not per keystroke.
+            // Refresh the whole document's semantic tokens whenever it is
+            // opened or changed. Gated by the same `seq` diff as did_change
+            // above, so this fires once per edit-batch, not per keystroke.
             lsp.request_semantic_tokens(path.clone());
             self.lsp_last_seen.insert(path, seq);
         }
@@ -2539,14 +2565,18 @@ impl App {
         let mut changed = false;
         for u in updates {
             if self.editor.path.as_deref() == Some(u.path.as_path()) {
-                self.editor
-                    .apply_semantic_tokens(u.path.clone(), u.data.clone(), u.legend.clone());
+                self.editor.apply_semantic_tokens(
+                    u.path.clone(),
+                    u.data.clone(),
+                    u.legend.clone(),
+                    u.is_full,
+                );
                 changed = true;
             }
             if let Some(split) = self.editor_split.as_mut()
                 && split.path.as_deref() == Some(u.path.as_path())
             {
-                split.apply_semantic_tokens(u.path, u.data, u.legend);
+                split.apply_semantic_tokens(u.path, u.data, u.legend, u.is_full);
                 changed = true;
             }
         }
