@@ -6648,6 +6648,23 @@ impl App {
                 _ => self.editor.collapse_carets(),
             }
         }
+        // Close-tab (Cmd/Ctrl+W) applies to every tab type, so it sits above
+        // the read-only diff / sheet / image guards below. Those guards each
+        // short-circuit to a view-specific handler that has no close branch,
+        // so without this hoist Cmd+W is silently swallowed on a diff, sheet,
+        // or image tab and the tab can never be closed from the keyboard.
+        if is_close_tab_key(key) {
+            if self.editor.close_active() {
+                self.sync_open_file_poll_mtime();
+                self.status = String::from("Closed tab");
+                // Closing the focused group's last tab while split closes
+                // the group: collapse back to the surviving column.
+                self.collapse_split_if_empty();
+            } else {
+                self.status = String::from("Cannot close last tab");
+            }
+            return;
+        }
         if self.editor.diff.is_some() {
             self.handle_diff_key(key);
             return;
@@ -6774,18 +6791,6 @@ impl App {
                 self.status = String::from("Undo");
             } else {
                 self.status = String::from("Nothing to undo");
-            }
-            return;
-        }
-        if is_close_tab_key(key) {
-            if self.editor.close_active() {
-                self.sync_open_file_poll_mtime();
-                self.status = String::from("Closed tab");
-                // Closing the focused group's last tab while split closes
-                // the group: collapse back to the surviving column.
-                self.collapse_split_if_empty();
-            } else {
-                self.status = String::from("Cannot close last tab");
             }
             return;
         }

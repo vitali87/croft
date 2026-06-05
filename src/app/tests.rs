@@ -1729,6 +1729,72 @@ fn cmd_c_on_side_by_side_diff_selection_lands_text_on_macos_clipboard() {
 }
 
 #[test]
+fn cmd_w_closes_a_diff_tab() {
+    // Repro: Cmd+W did nothing on a diff view. handle_editor_key
+    // short-circuits to handle_diff_key when a diff is open and returns
+    // before the close-tab branch, so the close-tab key was swallowed.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let f1 = tmp.path().join("a.txt");
+    let f2 = tmp.path().join("b.txt");
+    std::fs::write(&f1, "alpha\nbravo\n").unwrap();
+    std::fs::write(&f2, "alpha\nBRAVO\n").unwrap();
+    app.editor.open_diff(&f1, &f2).unwrap();
+    app.focus = Pane::Editor;
+    assert!(app.editor.diff.is_some(), "setup: diff must be open");
+
+    app.handle_key(key(KeyCode::Char('w'), KeyModifiers::SUPER))
+        .unwrap();
+
+    assert!(
+        app.editor.diff.is_none(),
+        "Cmd+W on a diff view must close the tab (resetting the last tab to blank), not be swallowed by handle_diff_key"
+    );
+}
+
+#[test]
+fn cmd_w_closes_a_sheet_tab() {
+    // Same swallow bug, sheet branch: handle_sheet_key returned before
+    // the close-tab handler so Cmd+W never reached close_active.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let csv = tmp.path().join("data.csv");
+    std::fs::write(&csv, "name,age\nAlice,30\n").unwrap();
+    app.editor.open(&csv).unwrap();
+    app.focus = Pane::Editor;
+    assert!(app.editor.sheet.is_some(), "setup: sheet must be open");
+
+    app.handle_key(key(KeyCode::Char('w'), KeyModifiers::SUPER))
+        .unwrap();
+
+    assert!(
+        app.editor.sheet.is_none(),
+        "Cmd+W on a sheet view must close the tab, not be swallowed by handle_sheet_key"
+    );
+}
+
+#[test]
+fn cmd_w_closes_an_image_tab() {
+    // Same swallow bug, image branch: the read-only image guard returned
+    // before the close-tab handler so Cmd+W could never close a PNG tab.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let png = tmp.path().join("pic.png");
+    image::RgbaImage::new(2, 2).save(&png).unwrap();
+    app.editor.open(&png).unwrap();
+    app.focus = Pane::Editor;
+    assert!(app.editor.image.is_some(), "setup: image must be open");
+
+    app.handle_key(key(KeyCode::Char('w'), KeyModifiers::SUPER))
+        .unwrap();
+
+    assert!(
+        app.editor.image.is_none(),
+        "Cmd+W on an image view must close the tab, not be swallowed by the read-only image guard"
+    );
+}
+
+#[test]
 fn enter_in_diff_view_opens_the_file_under_the_caret_at_its_line() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
