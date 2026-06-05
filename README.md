@@ -194,6 +194,7 @@ croft setup-terminal --help
 | `Ctrl`+`F12` | Go to Type Definition: jumps to where the type of the expression under the cursor is defined, via the language server's `textDocument/typeDefinition`. Shown in the right-click menu only for languages whose server implements it (vtsls, basedpyright, rust-analyzer, gopls all do) |
 | `Cmd`+`F12` | Go to Implementations: jumps from a trait / interface / abstract method to its concrete implementors, via the language server's `textDocument/implementation` (often many; jumps to the first). Shown in the right-click menu only for languages whose server implements it (rust-analyzer, gopls, vtsls do). Requires `croft setup-iterm2` so iTerm2 forwards the Cmd chord |
 | Hover (300 ms dwell) | Show the LSP hover popup for the symbol under the pointer |
+| Hover a tab (300 ms dwell) | Show a tooltip with the tab's full file path, so two same-named files (e.g. two `app.ts`) can be told apart; diff tabs show both compared paths |
 | Right-click | Editor symbol menu: Go to Definition, Go to Declaration, Go to Type Definition, Go to Implementations, Go to References, Rename Symbol, Change All Occurrences |
 | `Cmd`+`E` | Toggle native modal (vim) editing for the editor pane (see below) |
 | `Ctrl`+`W` / `Cmd`+`W` | Close the active editor tab (no-op on the last tab). The `Cmd` chord reaches croft only after `croft setup-iterm2`: macOS otherwise binds it to iTerm2's File → Close, which closes the session and quits iTerm2 |

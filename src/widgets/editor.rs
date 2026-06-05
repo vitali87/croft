@@ -4350,6 +4350,26 @@ impl EditorTabs {
         None
     }
 
+    /// Full filesystem path for a tab, used as the hover tooltip that
+    /// disambiguates same-named files (the tab label only shows the bare
+    /// `file_name()`). Returns `None` for an unsaved "untitled" buffer
+    /// since there is nothing to disambiguate. Diff tabs report both
+    /// sides so the viewer can tell which revisions are being compared.
+    pub fn tab_full_path(&self, idx: usize) -> Option<String> {
+        let e = self.editors.get(idx)?;
+        if let Some(diff) = e.diff.as_ref() {
+            let l = diff.left_path.to_string_lossy().into_owned();
+            let r_is_real = diff.right_path != Path::new("/dev/null")
+                && !diff.right_path.as_os_str().is_empty();
+            if r_is_real {
+                let r = diff.right_path.to_string_lossy().into_owned();
+                return Some(format!("{l} \u{2194} {r}"));
+            }
+            return Some(l);
+        }
+        e.path.as_ref().map(|p| p.to_string_lossy().into_owned())
+    }
+
     pub fn tab_screen_x(&self, idx: usize) -> Option<(u16, u16)> {
         self.tab_screen_ranges.get(idx).copied()
     }
@@ -7128,6 +7148,48 @@ mod tests {
         assert_eq!(diff.left_lines, vec!["alpha", "bravo", "charlie"]);
         assert_eq!(diff.right_lines, vec!["alpha", "BRAVO", "charlie"]);
         assert_eq!(diff.rows.len(), 3);
+    }
+
+    #[test]
+    fn tab_full_path_reports_the_whole_path_for_disambiguation() {
+        // The tab label only shows `file_name()`, so two `app.ts` tabs look
+        // identical. The hover tooltip must expose the full path to tell
+        // them apart.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("app.ts");
+        std::fs::write(&p, "export const x = 1;\n").unwrap();
+        let mut t = EditorTabs::new();
+        t.open_pinned(&p).unwrap();
+        let idx = t.active_index();
+        assert_eq!(
+            t.tab_full_path(idx).as_deref(),
+            Some(p.to_string_lossy().as_ref()),
+            "tooltip must expose the full path, not just the file name"
+        );
+    }
+
+    #[test]
+    fn tab_full_path_is_none_for_an_unsaved_buffer() {
+        let t = EditorTabs::new();
+        assert_eq!(
+            t.tab_full_path(t.active_index()),
+            None,
+            "an untitled buffer has no path to disambiguate"
+        );
+    }
+
+    #[test]
+    fn tab_full_path_shows_both_sides_of_a_diff() {
+        let f1 = NamedTempFile::new().unwrap();
+        let f2 = NamedTempFile::new().unwrap();
+        std::fs::write(f1.path(), "a\n").unwrap();
+        std::fs::write(f2.path(), "b\n").unwrap();
+        let mut t = EditorTabs::new();
+        t.open_diff(f1.path(), f2.path()).unwrap();
+        let label = t.tab_full_path(t.active_index()).unwrap();
+        assert!(label.contains(&f1.path().to_string_lossy().into_owned()));
+        assert!(label.contains(&f2.path().to_string_lossy().into_owned()));
+        assert!(label.contains('\u{2194}'), "diff tooltip shows both sides");
     }
 
     #[test]

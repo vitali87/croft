@@ -905,6 +905,14 @@ pub struct App {
     hover_request_id: Option<u64>,
     hover_anchor: Option<(u16, u16)>,
     hover_word: Option<(usize, usize, usize)>,
+    /// Separate dwell timer for the editor tab strip. Hovering a tab for
+    /// `HOVER_DELAY` surfaces `tab_tooltip` with the tab's full path so
+    /// same-named files can be told apart. Kept distinct from `hover`
+    /// (which drives LSP word hover in the editor body) so the two never
+    /// fight over the same timer.
+    tab_hover: HoverDwell,
+    tab_tooltip: Option<crate::widgets::hover_popup::HoverPopup>,
+    tab_hover_idx: Option<usize>,
     definition_request_id: Option<u64>,
     declaration_request_id: Option<u64>,
     type_definition_request_id: Option<u64>,
@@ -1484,6 +1492,9 @@ impl App {
             hover_request_id: None,
             hover_anchor: None,
             hover_word: None,
+            tab_hover: HoverDwell::default(),
+            tab_tooltip: None,
+            tab_hover_idx: None,
             definition_request_id: None,
             declaration_request_id: None,
             type_definition_request_id: None,
@@ -2465,6 +2476,25 @@ impl App {
     }
 
     fn on_mouse_moved(&mut self, col: u16, row: u16, in_editor: bool) {
+        // Editor tab strip: dwell over a tab to surface its full path. The
+        // dwell only restarts when the pointer crosses into a *different*
+        // tab, so the tooltip keeps showing while the pointer drifts a few
+        // cells within the same tab (matches the LSP "same word" rule).
+        if let Some(idx) = self.editor.tab_at(col, row) {
+            self.hover.clear();
+            self.hover_popup = None;
+            self.hover_word = None;
+            self.hover_request_id = None;
+            if self.tab_hover_idx != Some(idx) {
+                self.tab_hover.on_move(std::time::Instant::now(), col, row);
+                self.tab_hover_idx = Some(idx);
+                self.tab_tooltip = None;
+            }
+            return;
+        }
+        self.tab_hover.clear();
+        self.tab_tooltip = None;
+        self.tab_hover_idx = None;
         if !in_editor {
             self.hover.clear();
             self.hover_popup = None;
@@ -2517,6 +2547,34 @@ impl App {
         self.hover_request_id = Some(id);
         self.hover_anchor = Some((col, row));
         self.hover_word = Some((line, start, end));
+    }
+
+    /// Fire the tab-strip tooltip once its dwell crosses `HOVER_DELAY`.
+    /// Returns `true` when a tooltip was created so the frame loop knows
+    /// to redraw. Suppressed while a tab context menu is open so the
+    /// right-click menu never collides with the tooltip.
+    fn poll_tab_hover(&mut self) -> bool {
+        if !self.tab_hover.due(std::time::Instant::now(), HOVER_DELAY) {
+            return false;
+        }
+        self.tab_hover.mark_fired();
+        if self.context_menu.is_some() {
+            return false;
+        }
+        let Some(idx) = self.tab_hover_idx else {
+            return false;
+        };
+        let Some((col, row)) = self.tab_hover.cell() else {
+            return false;
+        };
+        let Some(path) = self.editor.tab_full_path(idx) else {
+            return false;
+        };
+        self.tab_tooltip = Some(crate::widgets::hover_popup::HoverPopup::new(
+            path,
+            (col, row),
+        ));
+        true
     }
 
     pub fn drain_lsp_hover(&mut self) -> bool {
@@ -4346,6 +4404,12 @@ impl App {
                 }
             }
             if let Some(popup) = self.hover_popup.as_ref() {
+                let area = popup.area_for(focused_area);
+                if area.width > 0 && area.height > 0 {
+                    frame.render_widget(popup, area);
+                }
+            }
+            if let Some(popup) = self.tab_tooltip.as_ref() {
                 let area = popup.area_for(focused_area);
                 if area.width > 0 && area.height > 0 {
                     frame.render_widget(popup, area);
@@ -9150,6 +9214,11 @@ impl App {
             return;
         }
         self.hover_popup = None;
+        // Any click dismisses the tab tooltip (selecting/closing a tab,
+        // or clicking elsewhere) so it can't linger over the new state.
+        self.tab_tooltip = None;
+        self.tab_hover.clear();
+        self.tab_hover_idx = None;
 
         match m.kind {
             MouseEventKind::Down(MouseButton::Right) => {
@@ -13275,6 +13344,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let lsp_changed = app.drain_lsp_completion();
         app.poll_hover();
         let hover_changed = app.drain_lsp_hover();
+        let tab_hover_changed = app.poll_tab_hover();
         let definition_changed = app.drain_lsp_definition();
         let declaration_changed = app.drain_lsp_declaration();
         let type_definition_changed = app.drain_lsp_type_definition();
@@ -13314,6 +13384,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             || update_changed
             || lsp_changed
             || hover_changed
+            || tab_hover_changed
             || definition_changed
             || declaration_changed
             || type_definition_changed
