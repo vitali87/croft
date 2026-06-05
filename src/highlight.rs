@@ -184,6 +184,60 @@ const JS_PARAM_HIGHLIGHTS_OVERLAY_QUERY: &str = r#"
 (rest_pattern (identifier) @variable.parameter)
 "#;
 
+/// Broad identifier capture PREPENDED onto the bundled Rust highlights query.
+/// tree-sitter-rust's highlights query has no catch-all `(identifier)` rule
+/// (only specific ones: `@function` calls, `@constant`/`@constructor` by
+/// regex, `@variable.parameter` at declarations, ...), so a parameter's body
+/// reference matches no highlight capture at all. That breaks the locals
+/// machinery: `tree-sitter-highlight` resolves the reference to its
+/// definition's colour but only EMITS that colour when the reference node ALSO
+/// carries a highlights capture (otherwise it skips emission entirely). This
+/// catch-all gives every identifier a carrier capture. Prepended FIRST so the
+/// bundled specific rules follow and win under last-match-wins; only
+/// otherwise-unmatched identifiers take `@variable`, whose grey equals the
+/// previous default foreground, so non-parameter identifiers look unchanged.
+/// Mirrors `JS_PARAM_HIGHLIGHTS_OVERLAY_QUERY`.
+const RUST_IDENTIFIER_OVERLAY_QUERY: &str = r#"(identifier) @variable"#;
+
+/// Local-scope query for Rust, passed as the locals slot of
+/// `HighlightConfiguration::new`. tree-sitter-rust ships no locals query, so
+/// without this a parameter is coloured only at its declaration site (by the
+/// bundled `(parameter (identifier) @variable.parameter)` rule); its
+/// references in the body match no highlights capture (the Rust query has no
+/// broad `(identifier) @variable` rule) and fall through to default grey until
+/// rust-analyzer's semantic-token overlay lands, which on a cold crate is
+/// ~25s after open. The locals query lets tree-sitter link each body
+/// reference to its in-scope definition and inherit the definition's colour
+/// instantly, the same way Helix and Zed colour locals without waiting on the
+/// language server.
+///
+/// The Rust `tree-sitter-highlight` crate matches the BARE capture names
+/// `local.scope` / `local.definition` / `local.reference` exactly. Definition
+/// patterns are listed before the broad `(identifier) @local.reference` so a
+/// node that is both a definition and an identifier is recorded as a
+/// definition first and not re-resolved as a reference. A body reference only
+/// inherits a colour when its definition node carries a highlights-query
+/// capture: parameters do (`@variable.parameter`, orange), so their references
+/// turn orange; plain `let` locals do not, so they stay default grey exactly
+/// as before, matching rust-analyzer's own "parameters coloured, locals plain"
+/// scheme. `self` is a dedicated `(self)` node, not an `(identifier)`, so it is
+/// untouched and keeps its `@variable.builtin` colour.
+const RUST_LOCALS_QUERY: &str = r#"
+[
+  (source_file)
+  (function_item)
+  (closure_expression)
+  (block)
+] @local.scope
+
+(parameter (identifier) @local.definition)
+(closure_parameters (identifier) @local.definition)
+(let_declaration pattern: (identifier) @local.definition)
+(for_expression pattern: (identifier) @local.definition)
+
+(identifier) @local.reference
+"#;
+
 /// Base16-Ocean-Dark inspired palette, indexed by HIGHLIGHT_NAMES position.
 fn style_for(idx: usize) -> Style {
     style_for_name(HIGHLIGHT_NAMES.get(idx).copied().unwrap_or(""))
@@ -265,14 +319,26 @@ pub fn lang_for_extension(ext: &str) -> Option<LangKind> {
 
 fn build_config(kind: LangKind) -> Option<HighlightConfiguration> {
     let mut cfg = match kind {
-        LangKind::Rust => HighlightConfiguration::new(
-            tree_sitter_rust::LANGUAGE.into(),
-            "rust",
-            tree_sitter_rust::HIGHLIGHTS_QUERY,
-            tree_sitter_rust::INJECTIONS_QUERY,
-            "",
-        )
-        .ok()?,
+        LangKind::Rust => {
+            // Prepend a broad `(identifier) @variable` carrier so the locals
+            // query can emit a parameter reference's resolved colour (the
+            // tree-sitter-highlight crate only emits a resolved reference when
+            // its node also carries a highlights capture). Bundled specific
+            // rules follow and win under last-match-wins.
+            let highlights = format!(
+                "{}\n{}",
+                RUST_IDENTIFIER_OVERLAY_QUERY,
+                tree_sitter_rust::HIGHLIGHTS_QUERY,
+            );
+            HighlightConfiguration::new(
+                tree_sitter_rust::LANGUAGE.into(),
+                "rust",
+                &highlights,
+                tree_sitter_rust::INJECTIONS_QUERY,
+                RUST_LOCALS_QUERY,
+            )
+            .ok()?
+        }
         LangKind::Python => {
             // The bundled Python highlights.scm emits no
             // @variable.parameter, so parameters render as plain
@@ -1000,6 +1066,51 @@ mod tests {
             "function f(text) {\n    return text + text;\n}\n",
             "    return text + text;",
         );
+    }
+
+    #[test]
+    fn highlight_rust_colors_parameter_references_in_body_via_locals() {
+        // tree-sitter-rust colours `(parameter (identifier))` orange at the
+        // declaration but ships no locals query, so a parameter's body
+        // references match no highlights capture and fall through to default
+        // grey until rust-analyzer's semantic-token overlay lands, which on a
+        // cold crate is ~25s after open. The Rust locals query links each body
+        // reference to its in-scope parameter definition so the parameter
+        // colour appears instantly, the way Helix/Zed do it.
+        assert_body_param_ref_is_param_colored(
+            LangKind::Rust,
+            "fn f(text: i32) -> i32 {\n    text + text\n}\n",
+            "    text + text",
+        );
+    }
+
+    #[test]
+    fn highlight_rust_keeps_specific_captures_over_broad_identifier_overlay() {
+        // The prepended `(identifier) @variable` carrier (needed so the locals
+        // query can emit a resolved parameter reference) must not swallow the
+        // bundled specific captures under last-match-wins: a function call and
+        // a type name must keep their own colours, not turn @variable grey.
+        let mut reg = LangRegistry::new();
+        let src = "fn run() {\n    let v = compute(x);\n    let p: Parser = v;\n}\n";
+        let line_starts = compute_line_starts(src.as_bytes());
+        let h = highlight_text(&mut reg, LangKind::Rust, src.as_bytes(), &line_starts);
+
+        let function = Some(rgb(0x8f, 0xa1, 0xb3));
+        let type_c = Some(rgb(0xeb, 0xcb, 0x8b));
+        let default_fg = Some(rgb(0xc0, 0xc5, 0xce));
+
+        let line1 = "    let v = compute(x);";
+        let call = span_at(&h[1], line1, "compute").expect("call name span");
+        assert_eq!(
+            call.style.fg, function,
+            "call name must keep @function colour"
+        );
+        assert_ne!(call.style.fg, default_fg);
+
+        let line2 = "    let p: Parser = v;";
+        let ty = span_at(&h[2], line2, "Parser").expect("type name span");
+        assert_eq!(ty.style.fg, type_c, "type name must keep @type colour");
+        assert_ne!(ty.style.fg, default_fg);
     }
 
     #[test]
