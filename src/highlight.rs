@@ -71,6 +71,60 @@ const PYTHON_PARAM_OVERLAY_QUERY: &str = r#"
 (typed_parameter (dictionary_splat_pattern (identifier) @variable.parameter))
 "#;
 
+/// Local-scope query for Python, passed as the locals slot of
+/// `HighlightConfiguration::new`. tree-sitter-python ships none, so without
+/// this a parameter is coloured only at its `def` site (by
+/// `PYTHON_PARAM_OVERLAY_QUERY`); its references in the body fall through to
+/// `(identifier) @variable` (grey) and stay grey until ty's semantic-token
+/// overlay lands, which on a cold, heavy-import file is 1-2s after open. The
+/// locals query lets tree-sitter link each body reference to its in-scope
+/// definition and inherit the definition's colour instantly, the same way
+/// Helix and Zed colour locals without waiting on the language server.
+///
+/// The Rust `tree-sitter-highlight` crate matches the BARE capture names
+/// `local.scope` / `local.definition` / `local.reference` exactly (it does not
+/// understand nvim-treesitter's dotted `@local.definition.parameter`
+/// subtypes), so every capture below uses the bare form. Definition patterns
+/// are listed before the broad `(identifier) @local.reference` so a node that
+/// is both a definition and an identifier is recorded as a definition first
+/// and not re-resolved as a reference.
+const PYTHON_LOCALS_QUERY: &str = r#"
+[
+  (module)
+  (function_definition)
+  (lambda)
+  (class_definition)
+  (list_comprehension)
+  (set_comprehension)
+  (dictionary_comprehension)
+  (generator_expression)
+] @local.scope
+
+(parameters (identifier) @local.definition)
+(lambda_parameters (identifier) @local.definition)
+(typed_parameter (identifier) @local.definition)
+(default_parameter name: (identifier) @local.definition)
+(typed_default_parameter name: (identifier) @local.definition)
+(parameters (list_splat_pattern (identifier) @local.definition))
+(parameters (dictionary_splat_pattern (identifier) @local.definition))
+(lambda_parameters (list_splat_pattern (identifier) @local.definition))
+(lambda_parameters (dictionary_splat_pattern (identifier) @local.definition))
+
+(assignment left: (identifier) @local.definition)
+(assignment left: (pattern_list (identifier) @local.definition))
+(assignment left: (tuple_pattern (identifier) @local.definition))
+(for_statement left: (identifier) @local.definition)
+(for_statement left: (pattern_list (identifier) @local.definition))
+(for_statement left: (tuple_pattern (identifier) @local.definition))
+(for_in_clause left: (identifier) @local.definition)
+(for_in_clause left: (pattern_list (identifier) @local.definition))
+(for_in_clause left: (tuple_pattern (identifier) @local.definition))
+(named_expression (identifier) @local.definition)
+(as_pattern alias: (as_pattern_target) @local.definition)
+
+(identifier) @local.reference
+"#;
+
 /// Base16-Ocean-Dark inspired palette, indexed by HIGHLIGHT_NAMES position.
 fn style_for(idx: usize) -> Style {
     style_for_name(HIGHLIGHT_NAMES.get(idx).copied().unwrap_or(""))
@@ -176,7 +230,7 @@ fn build_config(kind: LangKind) -> Option<HighlightConfiguration> {
                 "python",
                 &combined,
                 "",
-                "",
+                PYTHON_LOCALS_QUERY,
             )
             .ok()?
         }
@@ -763,6 +817,42 @@ mod tests {
             assert_eq!(
                 span.style.fg, param_fg,
                 "parameter `{name}` should use the parameter color, not {:?}",
+                span.style.fg
+            );
+            assert_ne!(span.style.fg, default_fg);
+        }
+    }
+
+    #[test]
+    fn highlight_python_colors_parameter_references_in_body_via_locals() {
+        // Tree-sitter alone (no LSP) must colour a parameter's REFERENCES in
+        // the function body, not just at the `def` site. Without a locals
+        // query, body references fall through to `(identifier) @variable`
+        // (grey) and only ty's semantic-token overlay recolours them, seconds
+        // later on a cold file. The Python locals query links each body
+        // reference to its in-scope parameter definition so the parameter
+        // colour appears instantly, the way Helix/Zed do it.
+        let mut reg = LangRegistry::new();
+        let src = "def f(text):\n    return text + text\n";
+        let line_starts = compute_line_starts(src.as_bytes());
+        let h = highlight_text(&mut reg, LangKind::Python, src.as_bytes(), &line_starts);
+
+        let param_fg = Some(rgb(0xd0, 0x87, 0x70));
+        let default_fg = Some(rgb(0xc0, 0xc5, 0xce));
+        let line1 = "    return text + text";
+
+        // Both body references of `text` on line 1 must carry the parameter
+        // colour, not the default @variable grey.
+        let first = line1.find("text").expect("first body ref");
+        let second = line1[first + 4..].find("text").expect("second body ref") + first + 4;
+        for col in [first, second] {
+            let span = h[1]
+                .iter()
+                .find(|s| s.start <= col && col < s.end)
+                .unwrap_or_else(|| panic!("no span covers body reference at col {col}"));
+            assert_eq!(
+                span.style.fg, param_fg,
+                "body parameter reference at col {col} should use the parameter colour, not {:?}",
                 span.style.fg
             );
             assert_ne!(span.style.fg, default_fg);
