@@ -244,6 +244,11 @@ pub struct ActivityOverlay {
     images: Option<super::ActivityBarImages>,
     dirty: bool,
     last_emit: Option<std::time::Instant>,
+    /// Cell positions of the icons painted on the most recent emit. Compared
+    /// against the next frame's positions so the flush can detect a layout
+    /// shift (terminal resize, or any change that recenters the bar) and
+    /// evict iTerm2's stale OSC-1337 image layer before re-emitting.
+    last_positions: Vec<(u16, u16)>,
     clear: ClearLatch,
 }
 
@@ -288,6 +293,21 @@ impl ActivityOverlay {
 
     pub fn consume_clear(&mut self) -> bool {
         self.clear.consume()
+    }
+
+    /// True when the icons were emitted before at a *different* set of cells.
+    /// A first emit (or one after `forget_positions`) reports `false` so the
+    /// caller paints rather than looping on an eviction it doesn't need.
+    pub fn positions_moved(&self, positions: &[(u16, u16)]) -> bool {
+        !self.last_positions.is_empty() && self.last_positions != positions
+    }
+
+    pub fn store_positions(&mut self, positions: Vec<(u16, u16)>) {
+        self.last_positions = positions;
+    }
+
+    pub fn forget_positions(&mut self) {
+        self.last_positions.clear();
     }
 
     #[cfg(test)]

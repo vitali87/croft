@@ -4590,6 +4590,58 @@ fn resize_arms_a_one_shot_terminal_clear_to_evict_stale_activity_icons() {
 }
 
 #[test]
+fn activity_bar_icons_moving_within_the_flush_arms_a_one_shot_terminal_clear() {
+    // Same emit-time move-detection the run-debug headline icon uses, applied
+    // to the activity bar: when the icon cells shift since the last emit, the
+    // post-draw flush must arm one terminal.clear() to evict iTerm2's stale
+    // OSC-1337 image layer instead of stacking a fresh copy on top (the
+    // doubled-icon ghost). This is trigger-agnostic — it fires for any layout
+    // shift, not only the Event::Resize path that on_resize covers.
+    use ratatui::layout::Rect;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.overlays.activity.set_images(ActivityBarImages {
+        explorer_active: String::new(),
+        explorer_inactive: String::new(),
+        search_active: String::new(),
+        search_inactive: String::new(),
+        source_control_active: String::new(),
+        source_control_inactive: String::new(),
+        remote_active: String::new(),
+        remote_inactive: String::new(),
+        run_debug_active: String::new(),
+        run_debug_inactive: String::new(),
+    });
+    let place = |app: &mut App, base: u16| {
+        app.sidebar_areas.explorer_icon = Rect::new(0, base, 2, 1);
+        app.sidebar_areas.search_icon = Rect::new(0, base + 2, 2, 1);
+        app.sidebar_areas.source_control_icon = Rect::new(0, base + 4, 2, 1);
+        app.sidebar_areas.remote_icon = Rect::new(0, base + 6, 2, 1);
+        app.sidebar_areas.run_debug_icon = Rect::new(0, base + 8, 2, 1);
+    };
+    // First emit at one layout: records the positions, arms no clear.
+    place(&mut app, 2);
+    app.overlays.activity.mark_dirty();
+    app.flush_activity_image_overlays();
+    assert!(
+        !app.consume_activity_image_clear(),
+        "the first emit has no prior positions to compare, so it must not arm a clear",
+    );
+    // A resize recenters the bar — every icon row shifts by one.
+    place(&mut app, 3);
+    app.overlays.activity.mark_dirty();
+    app.flush_activity_image_overlays();
+    assert!(
+        app.consume_activity_image_clear(),
+        "icons that moved since the last emit must arm one terminal.clear() to evict the stale image layer",
+    );
+    assert!(
+        !app.consume_activity_image_clear(),
+        "the clear request must be one-shot",
+    );
+}
+
+#[test]
 fn leaving_run_debug_after_emitting_the_icon_arms_a_one_shot_terminal_clear() {
     // Regression for the bug+play headline icon ghosting on top of
     // whichever sidebar replaced Run-Debug. iTerm2's OSC-1337 image

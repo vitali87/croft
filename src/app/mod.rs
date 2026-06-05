@@ -1968,6 +1968,49 @@ impl App {
         .collect()
     }
 
+    /// Post-draw flush of the activity-bar icons. Re-emits the pre-encoded
+    /// OSC-1337 image bytes each frame (ratatui doesn't track image cells, so
+    /// neighbouring SGR traffic can evict them from iTerm2's cache) — but
+    /// first applies the same emit-time move-detection as the run-debug
+    /// headline icon: if the icon cells shifted since the last emit (a
+    /// terminal resize, or any future layout change that recenters the bar),
+    /// a plain re-emit stacks a fresh image on top of the one iTerm2 still
+    /// caches at the old cell, the doubled-icon ghost. On a move it arms one
+    /// `terminal.clear()` (the proven `\x1b[2J` eviction the main loop folds
+    /// into its OR chain), forgets the emit positions, and skips painting
+    /// this frame; the next frame clears, full-redraws, and re-emits a single
+    /// clean set at the new cells.
+    pub fn flush_activity_image_overlays(&mut self) {
+        use std::io::Write;
+        if !self.overlays.activity.should_refresh() {
+            return;
+        }
+        let overlays = self.pending_activity_image_overlays();
+        if overlays.is_empty() {
+            return;
+        }
+        let positions: Vec<(u16, u16)> = overlays.iter().map(|(cell, _)| *cell).collect();
+        if self.overlays.activity.positions_moved(&positions) {
+            self.overlays.activity.request_clear();
+            self.overlays.activity.forget_positions();
+            return;
+        }
+        let mut out = stdout();
+        let cursor_on = self.cursor_should_be_visible();
+        let _ = write!(out, "\x1b[?25l\x1b[s");
+        for ((x, y), seq) in &overlays {
+            let _ = write!(out, "\x1b[{};{}H", y + 1, x + 1); // 1-based
+            let _ = out.write_all(seq.as_bytes());
+        }
+        let _ = write!(out, "\x1b[u");
+        if cursor_on {
+            let _ = write!(out, "\x1b[?25h");
+        }
+        let _ = out.flush();
+        self.overlays.activity.mark_emitted();
+        self.overlays.activity.store_positions(positions);
+    }
+
     /// Paint the Codeberg badge OSC-1337 image at its current welcome-panel
     /// cell, after first wiping any previous emit position. iTerm2 keeps
     /// image cells in a layer that survives plain SGR redraws, so when
@@ -13261,27 +13304,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             // buffer in image-mode, ratatui's diff produces zero per-cell
             // writes here — re-emitting the pre-encoded OSC bytes every
             // frame is cheap and locks the images in.
-            let overlays = if app.overlays.activity.should_refresh() {
-                app.pending_activity_image_overlays()
-            } else {
-                Vec::new()
-            };
-            if !overlays.is_empty() {
-                use std::io::Write;
-                let mut out = stdout();
-                let cursor_on = app.cursor_should_be_visible();
-                let _ = write!(out, "\x1b[?25l\x1b[s");
-                for ((x, y), seq) in overlays {
-                    let _ = write!(out, "\x1b[{};{}H", y + 1, x + 1); // 1-based
-                    let _ = out.write_all(seq.as_bytes());
-                }
-                let _ = write!(out, "\x1b[u");
-                if cursor_on {
-                    let _ = write!(out, "\x1b[?25h");
-                }
-                let _ = out.flush();
-                app.overlays.activity.mark_emitted();
-            }
+            app.flush_activity_image_overlays();
             // Active editor image preview: bake-once-emit-each-frame
             // overlay, just like the welcome wordmark. Sent after ratatui
             // has finished its diff so the image bytes land on cells
