@@ -35,7 +35,7 @@ Built on [ratatui](https://ratatui.rs/) + [crossterm](https://github.com/crosste
 | Rust 1.85+ stable | To compile the binary (the crate uses edition 2024, stabilized in Rust 1.85). |
 | A Nerd Font as your terminal font | The file explorer icons are Private Use Area glyphs (Codicons, Devicons, Seti). Without a Nerd Font, icons render as `[?]` boxes. |
 | A 256 color or truecolor terminal | macOS Terminal.app, iTerm2, Alacritty, kitty, WezTerm, Ghostty all qualify. |
-| iTerm2, WezTerm, Ghostty, kitty, or Termux (optional) | Required for inline image / PDF / sheet preview rendering via OSC 1337. Termux's terminal implements the same OSC 1337 protocol, so icons and previews render there automatically (it sets no `TERM_PROGRAM`, so croft detects it via `TERMUX_VERSION` / the `com.termux` prefix). Other terminals fall back to a metadata header line so the feature is still informative. |
+| iTerm2, WezTerm, Ghostty, or kitty (optional) | Required for inline image / PDF / sheet preview rendering via OSC 1337. Other terminals (including Termux) fall back to a metadata header line so the feature is still informative. If you run a Termux build that supports the iTerm2 OSC 1337 protocol, opt in with `CROFT_FORCE_INLINE_IMAGES=1`. |
 | `pdftoppm` from poppler-utils (optional) | Multi-page PDF preview. Install with `brew install poppler` (macOS) or `apt install poppler-utils` (Linux). Without it, croft falls back to macOS `sips` for page 1 only. |
 | Node.js + npm (optional) | TypeScript / JavaScript LSP. croft auto-installs the `vtsls` server into `~/.croft/servers` the first time you open a `.ts`/`.tsx`/`.js` file. It finds `node` even when a version manager keeps it off croft's PATH: first by reading the on-disk layout directly (highest nvm `versions/node`, Volta, Homebrew, `/usr/local`), and as a universal fallback by asking your login shell where `node` resolves — run in a detached session (`setsid`) so it can never touch croft's terminal. That covers nvm / fnm / asdf / volta / custom setups, for both the install and running the server. Other language servers (`basedpyright`, `ruff`, `ty`, `rust-analyzer`, `gopls`) are used from your PATH if present. Each server is anchored at the file's own project root (the nearest ancestor with a `pyproject.toml` / `Cargo.toml` / `go.mod` / `package.json`, etc.), not croft's workspace root, so in a monorepo every sub-project's `.venv` and imports resolve correctly. croft runs one server instance per (language, project root), mirroring Zed. |
 
@@ -341,10 +341,11 @@ Other terminals (kitty, Ghostty, WezTerm, Alacritty) deliver Cmd over the kitty 
 
 ## Termux / Android
 
-croft installs and runs as a native Android binary inside [Termux](https://termux.dev) (`cargo install --git https://codeberg.org/vitali87/croft.git`). Two things work differently from the desktop, and both are automatic, no setup command:
+croft installs and runs as a native Android binary inside [Termux](https://termux.dev) (`cargo install --git https://codeberg.org/vitali87/croft.git`). One thing works differently from the desktop, and it is automatic, no setup command:
 
-- **Icons and inline previews.** Termux's terminal implements the iTerm2 OSC 1337 inline-image protocol, so the activity-bar icons, welcome wordmark, and image / PDF / spreadsheet previews all render. Termux sets no `TERM_PROGRAM`, so croft recognises it from the `TERMUX_VERSION` and `com.termux`-prefixed `PREFIX` it exports, and routes to the OSC 1337 path it already uses for iTerm2.
 - **The command key.** Android has no Cmd key, so on Termux **`Ctrl` is the command modifier** (VS Code's Linux convention). Every Cmd chord in the tables above is reachable as the same chord with `Ctrl`: `Ctrl+P` quick-open, `Ctrl+\` split editor, `Ctrl+T` new terminal, `Ctrl+]` / `Ctrl+[` cycle terminals, `Ctrl+Opt+←` / `Ctrl+Opt+→` move editor-group focus, and so on. One consequence of full `Ctrl` parity: `Ctrl+\` opens the editor split instead of sending `SIGQUIT` to the shell.
+
+Inline image / PDF / spreadsheet previews and the activity-bar icons do **not** render on mainline Termux: its terminal does not implement the iTerm2 OSC 1337 inline-image protocol (the [termux-app PR](https://github.com/termux/termux-app/pull/2973) adding it is still unmerged), so croft falls back to the metadata-header line instead of emitting OSC 1337, which mainline Termux would print as raw base64 text. If you run a Termux build that does support OSC 1337, set `CROFT_FORCE_INLINE_IMAGES=1` to enable previews.
 
 ## How the embedded terminal works
 

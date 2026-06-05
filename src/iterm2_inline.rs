@@ -124,32 +124,11 @@ pub fn inline_image_protocol_for(
     }
 }
 
-/// Resolve the inline-image protocol from the raw terminal signals, folding in
-/// Termux. Termux's terminal implements the iTerm2 OSC 1337 protocol (added in
-/// termux-app, alongside Sixel) but does **not** set `TERM_PROGRAM`, so it is
-/// detected separately and routed to the `ITerm2` emit path.
-#[allow(dead_code)]
-pub fn inline_image_protocol_for_env(
-    term_program: Option<&str>,
-    term: Option<&str>,
-    termux: bool,
-) -> InlineImageProtocol {
-    let base = inline_image_protocol_for(term_program, term);
-    if base != InlineImageProtocol::None {
-        return base;
-    }
-    if termux {
-        return InlineImageProtocol::ITerm2;
-    }
-    InlineImageProtocol::None
-}
-
 #[allow(dead_code)]
 pub fn detect_inline_image_protocol() -> InlineImageProtocol {
     let term_program = std::env::var("TERM_PROGRAM").ok();
     let term = std::env::var("TERM").ok();
-    let protocol =
-        inline_image_protocol_for_env(term_program.as_deref(), term.as_deref(), detect_termux());
+    let protocol = inline_image_protocol_for(term_program.as_deref(), term.as_deref());
     if protocol != InlineImageProtocol::None {
         return protocol;
     }
@@ -169,7 +148,9 @@ pub fn is_termux_env(termux_version: Option<&str>, prefix: Option<&str>) -> bool
 
 /// Cached `is_termux_env` over the live environment. Termux-ness is fixed for
 /// the lifetime of the process, so the env lookup runs once even on the
-/// per-render and per-keystroke hot paths that consult it.
+/// per-keystroke hot path that consults it. Used only by the keymap (Ctrl
+/// stands in for the absent Cmd key on Android); it does NOT enable inline
+/// images, since mainline Termux cannot render OSC 1337.
 pub fn detect_termux() -> bool {
     static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CACHE.get_or_init(|| {
@@ -197,11 +178,12 @@ pub fn detect_iterm2_inline_support() -> bool {
     if force_inline_images(std::env::var("CROFT_FORCE_INLINE_IMAGES").ok().as_deref()) {
         return true;
     }
-    // Termux's terminal renders OSC 1337 inline images but reports no
-    // TERM_PROGRAM, so gate it on the Termux env signals instead.
-    if detect_termux() {
-        return true;
-    }
+    // Termux is deliberately NOT auto-enabled here. Mainline Termux does not
+    // render the iTerm2 OSC 1337 inline-image protocol (the termux-app PR that
+    // adds it is still unmerged), so emitting it dumps the raw base64 payload
+    // to the screen. Termux falls back to the metadata-header line like any
+    // other unsupported terminal; users on an OSC 1337 build can opt in with
+    // `CROFT_FORCE_INLINE_IMAGES=1`.
     let term_program = std::env::var("TERM_PROGRAM").ok();
     is_iterm2_term_program(term_program.as_deref())
 }
@@ -400,13 +382,14 @@ mod tests {
     }
 
     #[test]
-    fn termux_selects_iterm2_inline_protocol() {
-        // Termux's terminal implements the iTerm2 OSC 1337 inline-image
-        // protocol (not Kitty graphics), so a Termux session must resolve to
-        // the ITerm2 emit path even though TERM_PROGRAM is unset there.
+    fn termux_does_not_auto_enable_inline_images() {
+        // Mainline Termux cannot render the iTerm2 OSC 1337 protocol (the
+        // termux-app PR adding it is unmerged), so emitting it would dump raw
+        // base64 to the screen. A Termux session with no other signals must
+        // resolve to None, falling back to the metadata-header line.
         assert_eq!(
-            inline_image_protocol_for_env(None, None, true),
-            InlineImageProtocol::ITerm2
+            inline_image_protocol_for(None, None),
+            InlineImageProtocol::None
         );
     }
 
