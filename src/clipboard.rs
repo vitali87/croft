@@ -19,9 +19,13 @@ pub fn read_string() -> Option<String> {
         }
         return read_pbpaste();
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     {
         linux::read_string()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        None
     }
 }
 
@@ -71,13 +75,17 @@ pub fn write_string(text: &str) -> bool {
         }
         return write_pbcopy(text);
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     {
         linux::write_string(text)
     }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        false
+    }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
 mod linux {
     use std::io::Write;
     use std::process::{Command, Stdio};
@@ -117,9 +125,9 @@ mod linux {
 
     /// Read text from the system clipboard on Linux.
     ///
-    /// Tries `wl-paste --no-newline` (Wayland), then `xclip`, then `xsel`.
+    /// Tries `wl-paste` (Wayland), then `xclip`, then `xsel`.
     pub fn read_string() -> Option<String> {
-        read_via(&["wl-paste", "--no-newline"])
+        read_via(&["wl-paste"])
             .or_else(|| read_via(&["xclip", "-selection", "clipboard", "-o"]))
             .or_else(|| read_via(&["xsel", "--clipboard", "--output"]))
     }
