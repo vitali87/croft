@@ -11353,6 +11353,20 @@ fn keyboard_enhancement_flags() -> KeyboardEnhancementFlags {
         | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
 }
 
+/// True when the "command" modifier is effectively held. That is `Super`
+/// (Cmd) everywhere; on Termux (Android, no Cmd key) `Ctrl` stands in for it
+/// too, mirroring VS Code's Linux keymap so the Super-only chords stay
+/// reachable. `termux` is threaded in explicitly to keep the decision pure
+/// and testable.
+fn cmd_active(mods: KeyModifiers, termux: bool) -> bool {
+    mods.contains(KeyModifiers::SUPER) || (termux && mods.contains(KeyModifiers::CONTROL))
+}
+
+/// `cmd_active` over the live environment (cached Termux detection).
+fn has_cmd(mods: KeyModifiers) -> bool {
+    cmd_active(mods, crate::iterm2_inline::detect_termux())
+}
+
 /// Build the OSC 0 escape sequence that sets the terminal's window/icon title.
 ///
 /// Format: `ESC ] 0 ; <title> BEL`.  Control bytes that would break the escape
@@ -11488,9 +11502,11 @@ fn is_file_finder_key(key: KeyEvent) -> bool {
 /// Explorer-pane shortcut: `Cmd+Z` — open the zoxide jump popup. `z` for
 /// **z**oxide; the user's shell still uses `j` for the same jump. Requires
 /// SUPER (iTerm2 already forwards Cmd+Z as `Char('z') + SUPER` for the
-/// editor's undo via the `CMD_Z` GlobalKeyMap entry), and explicitly
-/// rejects CONTROL so a terminal `Ctrl+Z` suspend never reaches it and so
-/// it stays distinct from the Ctrl-based terminal-toggle chords on `j`.
+/// editor's undo via the `CMD_Z` GlobalKeyMap entry). Off Termux it rejects
+/// CONTROL so a terminal `Ctrl+Z` suspend never reaches it and it stays
+/// distinct from the Ctrl-based terminal-toggle chords on `j`; on Termux,
+/// where Ctrl is the Cmd surrogate, `Ctrl+Z` opens the popup (this predicate
+/// only runs while the Explorer is focused, so there is no suspend to clash).
 /// SHIFT is rejected because `Cmd+Shift+Z` is the reserved redo chord.
 /// Editor-pane `Cmd+Z` is untouched: this predicate is only consulted from
 /// `handle_explorer_shortcut`, which runs solely when the Explorer is
@@ -11502,13 +11518,13 @@ fn is_tree_zoxide_jump_key(key: KeyEvent) -> bool {
     if !c.eq_ignore_ascii_case(&'z') {
         return false;
     }
-    if key.modifiers.contains(KeyModifiers::SHIFT)
-        || key.modifiers.contains(KeyModifiers::ALT)
-        || key.modifiers.contains(KeyModifiers::CONTROL)
-    {
+    if key.modifiers.contains(KeyModifiers::SHIFT) || key.modifiers.contains(KeyModifiers::ALT) {
         return false;
     }
-    key.modifiers.contains(KeyModifiers::SUPER)
+    // `has_cmd` is SUPER-only off Termux (so a terminal `Ctrl+Z` suspend is
+    // never swallowed); on Termux Ctrl is the command key, and this predicate
+    // only runs while the Explorer is focused, so there is no suspend to clash.
+    has_cmd(key.modifiers)
 }
 
 /// Explorer-pane shortcut: `Cmd+F` / `Ctrl+F` (no Shift, no Alt) - "New File".
@@ -11725,9 +11741,11 @@ fn is_terminal_split_key(key: KeyEvent) -> bool {
     if !c.eq_ignore_ascii_case(&'t') {
         return false;
     }
-    if key.modifiers.contains(KeyModifiers::SUPER) {
-        return !key.modifiers.contains(KeyModifiers::SHIFT)
-            && !key.modifiers.contains(KeyModifiers::ALT);
+    if has_cmd(key.modifiers)
+        && !key.modifiers.contains(KeyModifiers::SHIFT)
+        && !key.modifiers.contains(KeyModifiers::ALT)
+    {
+        return true;
     }
     key.modifiers.contains(KeyModifiers::CONTROL) && key.modifiers.contains(KeyModifiers::SHIFT)
 }
@@ -11741,10 +11759,11 @@ fn is_editor_split_key(key: KeyEvent) -> bool {
     let KeyCode::Char('\\') = key.code else {
         return false;
     };
-    key.modifiers.contains(KeyModifiers::SUPER)
+    // SUPER off Termux; on Termux `Ctrl+\` is the command surrogate (note this
+    // shadows the shell's SIGQUIT there, the accepted cost of Ctrl parity).
+    has_cmd(key.modifiers)
         && !key.modifiers.contains(KeyModifiers::SHIFT)
         && !key.modifiers.contains(KeyModifiers::ALT)
-        && !key.modifiers.contains(KeyModifiers::CONTROL)
 }
 
 /// `Cmd+Opt+Left`: move keyboard focus to the LEFT editor group while
@@ -11754,7 +11773,7 @@ fn is_focus_group_left_key(key: KeyEvent) -> bool {
     let KeyCode::Left = key.code else {
         return false;
     };
-    key.modifiers.contains(KeyModifiers::SUPER) && key.modifiers.contains(KeyModifiers::ALT)
+    has_cmd(key.modifiers) && key.modifiers.contains(KeyModifiers::ALT)
 }
 
 /// `Cmd+Opt+Right`: move keyboard focus to the RIGHT editor group while
@@ -11764,7 +11783,7 @@ fn is_focus_group_right_key(key: KeyEvent) -> bool {
     let KeyCode::Right = key.code else {
         return false;
     };
-    key.modifiers.contains(KeyModifiers::SUPER) && key.modifiers.contains(KeyModifiers::ALT)
+    has_cmd(key.modifiers) && key.modifiers.contains(KeyModifiers::ALT)
 }
 
 /// `Cmd+Shift+T` (Mac SUPER+SHIFT+T): focus the Terminal pane from any
@@ -11814,7 +11833,7 @@ fn is_terminal_cycle_key(key: KeyEvent) -> bool {
     let KeyCode::Char(c) = key.code else {
         return false;
     };
-    (c == ']' || c == '}') && key.modifiers.contains(KeyModifiers::SUPER)
+    (c == ']' || c == '}') && has_cmd(key.modifiers)
 }
 
 /// `Cmd+[`: cycle to the previous (left) terminal in the pane. Mirror of
@@ -11823,7 +11842,7 @@ fn is_terminal_cycle_back_key(key: KeyEvent) -> bool {
     let KeyCode::Char(c) = key.code else {
         return false;
     };
-    (c == '[' || c == '{') && key.modifiers.contains(KeyModifiers::SUPER)
+    (c == '[' || c == '{') && has_cmd(key.modifiers)
 }
 
 /// Returns true if the given key event should trash the currently-selected

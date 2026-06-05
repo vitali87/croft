@@ -10345,3 +10345,55 @@ fn focus_group_keys_are_cmd_opt_arrows_disjoint_from_word_motion() {
         KeyModifiers::ALT
     )));
 }
+
+#[test]
+fn cmd_active_treats_super_as_command_everywhere() {
+    // Super is the command modifier on every platform, Termux or not.
+    assert!(cmd_active(KeyModifiers::SUPER, false));
+    assert!(cmd_active(KeyModifiers::SUPER, true));
+}
+
+#[test]
+fn cmd_active_treats_ctrl_as_command_only_on_termux() {
+    // Termux (Android) has no Cmd key, so Ctrl stands in for it there
+    // (VS Code's Linux keymap). Off Termux, Ctrl is NOT the command key.
+    assert!(!cmd_active(KeyModifiers::CONTROL, false));
+    assert!(cmd_active(KeyModifiers::CONTROL, true));
+}
+
+#[test]
+fn cmd_active_rejects_bare_modifiers() {
+    assert!(!cmd_active(KeyModifiers::NONE, true));
+    assert!(!cmd_active(KeyModifiers::ALT, true));
+    assert!(!cmd_active(KeyModifiers::SHIFT, true));
+}
+
+#[test]
+fn editor_split_still_requires_super_off_termux() {
+    // Regression guard: with no Termux env present (the test process),
+    // Cmd+\ splits but Ctrl+\ does not — Ctrl+\ stays SIGQUIT for the shell.
+    assert!(is_editor_split_key(key(
+        KeyCode::Char('\\'),
+        KeyModifiers::SUPER
+    )));
+    assert!(!is_editor_split_key(key(
+        KeyCode::Char('\\'),
+        KeyModifiers::CONTROL
+    )));
+}
+
+#[test]
+fn terminal_cycle_still_requires_super_off_termux() {
+    assert!(is_terminal_cycle_key(key(
+        KeyCode::Char(']'),
+        KeyModifiers::SUPER
+    )));
+    assert!(!is_terminal_cycle_key(key(
+        KeyCode::Char(']'),
+        KeyModifiers::CONTROL
+    )));
+    assert!(is_terminal_cycle_back_key(key(
+        KeyCode::Char('['),
+        KeyModifiers::SUPER
+    )));
+}

@@ -124,11 +124,32 @@ pub fn inline_image_protocol_for(
     }
 }
 
+/// Resolve the inline-image protocol from the raw terminal signals, folding in
+/// Termux. Termux's terminal implements the iTerm2 OSC 1337 protocol (added in
+/// termux-app, alongside Sixel) but does **not** set `TERM_PROGRAM`, so it is
+/// detected separately and routed to the `ITerm2` emit path.
+#[allow(dead_code)]
+pub fn inline_image_protocol_for_env(
+    term_program: Option<&str>,
+    term: Option<&str>,
+    termux: bool,
+) -> InlineImageProtocol {
+    let base = inline_image_protocol_for(term_program, term);
+    if base != InlineImageProtocol::None {
+        return base;
+    }
+    if termux {
+        return InlineImageProtocol::ITerm2;
+    }
+    InlineImageProtocol::None
+}
+
 #[allow(dead_code)]
 pub fn detect_inline_image_protocol() -> InlineImageProtocol {
     let term_program = std::env::var("TERM_PROGRAM").ok();
     let term = std::env::var("TERM").ok();
-    let protocol = inline_image_protocol_for(term_program.as_deref(), term.as_deref());
+    let protocol =
+        inline_image_protocol_for_env(term_program.as_deref(), term.as_deref(), detect_termux());
     if protocol != InlineImageProtocol::None {
         return protocol;
     }
@@ -136,6 +157,27 @@ pub fn detect_inline_image_protocol() -> InlineImageProtocol {
         return InlineImageProtocol::ITerm2;
     }
     InlineImageProtocol::None
+}
+
+/// True when running inside Termux's terminal on Android. Termux does not set
+/// `TERM_PROGRAM`, so detection keys off `TERMUX_VERSION` (exported by the
+/// Termux app) and the `com.termux` install `PREFIX`.
+pub fn is_termux_env(termux_version: Option<&str>, prefix: Option<&str>) -> bool {
+    termux_version.is_some_and(|v| !v.is_empty())
+        || prefix.is_some_and(|p| p.contains("com.termux"))
+}
+
+/// Cached `is_termux_env` over the live environment. Termux-ness is fixed for
+/// the lifetime of the process, so the env lookup runs once even on the
+/// per-render and per-keystroke hot paths that consult it.
+pub fn detect_termux() -> bool {
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        is_termux_env(
+            std::env::var("TERMUX_VERSION").ok().as_deref(),
+            std::env::var("PREFIX").ok().as_deref(),
+        )
+    })
 }
 
 pub fn is_iterm2_term_program(value: Option<&str>) -> bool {
@@ -153,6 +195,11 @@ pub fn is_tmux_env(term: Option<&str>, tmux_var: Option<&str>) -> bool {
 
 pub fn detect_iterm2_inline_support() -> bool {
     if force_inline_images(std::env::var("CROFT_FORCE_INLINE_IMAGES").ok().as_deref()) {
+        return true;
+    }
+    // Termux's terminal renders OSC 1337 inline images but reports no
+    // TERM_PROGRAM, so gate it on the Termux env signals instead.
+    if detect_termux() {
         return true;
     }
     let term_program = std::env::var("TERM_PROGRAM").ok();
@@ -325,6 +372,42 @@ mod tests {
     #[test]
     fn xterm_is_not_tmux() {
         assert!(!is_tmux_env(Some("xterm-256color"), None));
+    }
+
+    #[test]
+    fn termux_version_var_detected() {
+        assert!(is_termux_env(Some("0.118.0"), None));
+    }
+
+    #[test]
+    fn termux_prefix_detected() {
+        assert!(is_termux_env(None, Some("/data/data/com.termux/files/usr")));
+    }
+
+    #[test]
+    fn empty_termux_version_is_not_termux() {
+        assert!(!is_termux_env(Some(""), None));
+    }
+
+    #[test]
+    fn non_termux_prefix_is_not_termux() {
+        assert!(!is_termux_env(None, Some("/usr")));
+    }
+
+    #[test]
+    fn missing_termux_signals_is_not_termux() {
+        assert!(!is_termux_env(None, None));
+    }
+
+    #[test]
+    fn termux_selects_iterm2_inline_protocol() {
+        // Termux's terminal implements the iTerm2 OSC 1337 inline-image
+        // protocol (not Kitty graphics), so a Termux session must resolve to
+        // the ITerm2 emit path even though TERM_PROGRAM is unset there.
+        assert_eq!(
+            inline_image_protocol_for_env(None, None, true),
+            InlineImageProtocol::ITerm2
+        );
     }
 
     #[test]
