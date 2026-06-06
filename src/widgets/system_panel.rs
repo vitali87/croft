@@ -29,6 +29,10 @@ pub const EXPANDED_HEIGHT: u16 = 7;
 
 const MIN_ACTIVITY_ROWS: u16 = 14;
 
+/// Left indent for panel content, matching the `Borders::ALL` inset of the
+/// activity widget rendered directly above so the two left edges align.
+const CONTENT_INDENT: u16 = 1;
+
 pub struct SystemPanel {
     user_override: Option<bool>,
     pub hidden: bool,
@@ -160,6 +164,17 @@ impl Widget for &mut SystemPanel {
         if inner.height == 0 || inner.width == 0 {
             return;
         }
+
+        // The activity widget directly above is drawn with `Borders::ALL`,
+        // so its content sits one column right of the shared column edge.
+        // This panel only has a bottom separator, so indent its content by
+        // the same column to keep the labels and sparklines aligned with the
+        // box above. The bottom border (rendered by `block`) keeps full width.
+        let inner = Rect {
+            x: inner.x + CONTENT_INDENT.min(inner.width),
+            width: inner.width.saturating_sub(CONTENT_INDENT),
+            ..inner
+        };
 
         let can_show_expanded = inner.height > 5;
         let effective_collapsed = self.user_override.unwrap_or(!can_show_expanded);
@@ -491,6 +506,31 @@ mod tests {
             border_text.chars().any(|c| c == '─'),
             "bottom border row was {border_text:?}"
         );
+    }
+
+    #[test]
+    fn content_is_indented_to_align_with_box_above() {
+        let mut p = SystemPanel::new();
+        p.apply_sample(SystemSample {
+            cpu_pct: 10,
+            mem_pct: 20,
+            net_bps: 0,
+            disk_pct: 30,
+            temp_c: Some(52),
+        });
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 30,
+            height: EXPANDED_HEIGHT,
+        };
+        let mut buf = Buffer::empty(area);
+        (&mut p).render(area, &mut buf);
+        // The leftmost column stays blank; content begins one column in,
+        // matching the bordered activity widget rendered above.
+        let header_row = area.y;
+        assert_eq!(buf[(0, header_row)].symbol(), " ");
+        assert_eq!(buf[(CONTENT_INDENT, header_row)].symbol(), "▾");
     }
 
     #[test]
