@@ -71,6 +71,35 @@ const PYTHON_PARAM_OVERLAY_QUERY: &str = r#"
 (typed_parameter (dictionary_splat_pattern (identifier) @variable.parameter))
 "#;
 
+/// Namespace + class heuristics appended LAST onto the bundled Python
+/// highlights query, so they win under tree-sitter-highlight's
+/// last-match-wins rule. This is how Helix/Zed/Neovim colour Python without
+/// the language server: the two biggest cold-open mismatches against ty are
+/// imported class references and module names, and both are recoverable from
+/// syntax alone.
+///
+/// 1. Module names in `import` / `from ... import` statements are coloured
+///    `@module` (yellow), matching ty's `namespace`. The bundled query leaves
+///    them as plain `@variable` (grey), which is the most visible part of the
+///    grey-to-yellow snap on an import-heavy file.
+/// 2. CamelCase identifiers (a capital followed somewhere by a lowercase) are
+///    coloured `@type` (yellow), matching ty's `class`. The bundled query
+///    already singles capitalised names out, but as `@constructor` (blue),
+///    which disagrees with ty's yellow. Restricting to names that contain a
+///    lowercase letter deliberately excludes ALL_CAPS names, which the bundled
+///    `@constant` rule keeps orange (ty calls those plain variables, but
+///    highlighting module-level constants is a deliberate choice and they are
+///    few). PEP 8 makes CamelCase an almost perfect proxy for "class".
+const PYTHON_NAMESPACE_TYPE_OVERLAY_QUERY: &str = r#"
+(import_statement name: (dotted_name (identifier) @module))
+(import_statement name: (aliased_import (dotted_name (identifier) @module)))
+(import_from_statement module_name: (dotted_name (identifier) @module))
+(import_from_statement module_name: (relative_import (dotted_name (identifier) @module)))
+
+((identifier) @type
+ (#match? @type "^[A-Z].*[a-z]"))
+"#;
+
 /// Local-scope query for Python, passed as the locals slot of
 /// `HighlightConfiguration::new`. tree-sitter-python ships none, so without
 /// this a parameter is coloured only at its `def` site (by
@@ -121,6 +150,14 @@ const PYTHON_LOCALS_QUERY: &str = r#"
 (for_in_clause left: (tuple_pattern (identifier) @local.definition))
 (named_expression (identifier) @local.definition)
 (as_pattern alias: (as_pattern_target) @local.definition)
+
+; Imported module names bind a name in scope, so body references to them
+; (`pydantic` in `pydantic.BaseModel`) resolve here and inherit the def's
+; `@module` colour instantly, the same way parameters do. The `.` anchor binds
+; only the first segment of a dotted import (`import a.b.c` binds `a`); an
+; aliased import binds its alias.
+(import_statement name: (dotted_name . (identifier) @local.definition))
+(import_statement name: (aliased_import alias: (identifier) @local.definition))
 
 (identifier) @local.reference
 "#;
@@ -374,9 +411,10 @@ fn build_config(kind: LangKind) -> Option<HighlightConfiguration> {
             // captures override the broad (identifier) @variable rule
             // under tree-sitter-highlight's last-match-wins rule.
             let combined = format!(
-                "{}\n{}",
+                "{}\n{}\n{}",
                 tree_sitter_python::HIGHLIGHTS_QUERY,
                 PYTHON_PARAM_OVERLAY_QUERY,
+                PYTHON_NAMESPACE_TYPE_OVERLAY_QUERY,
             );
             HighlightConfiguration::new(
                 tree_sitter_python::LANGUAGE.into(),
@@ -807,6 +845,89 @@ pub fn compute_line_starts(text: &[u8]) -> Vec<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Color of the first occurrence of `needle` on the line at `row`.
+    fn py_color(src: &str, row: usize, needle: &str) -> Option<Color> {
+        let mut reg = LangRegistry::new();
+        let ls = compute_line_starts(src.as_bytes());
+        let h = highlight_text(&mut reg, LangKind::Python, src.as_bytes(), &ls);
+        let line = src.split('\n').nth(row)?;
+        let col = line.find(needle)?;
+        h[row]
+            .iter()
+            .find(|s| s.start <= col && col < s.end)
+            .map(|s| s.style.fg)
+            .flatten()
+    }
+
+    #[test]
+    fn highlight_python_colors_imported_classes_and_modules_to_match_ty() {
+        // The cold-open snap on an import-heavy file was tree-sitter painting
+        // imported names grey/blue while ty paints them yellow. The namespace +
+        // CamelCase overlay must make the base agree with ty INSTANTLY: module
+        // names in imports and CamelCase class references are both `@module` /
+        // `@type` (yellow #ebcb8b), matching ty's `namespace` / `class`.
+        let yellow = rgb(0xeb, 0xcb, 0x8b);
+        let src = "import pydantic\n\
+from anterior.lib_tasks.schema import Config\n\
+\n\
+def f() -> Config:\n\
+    return pydantic.BaseModel()\n";
+
+        // Module name in `import pydantic`.
+        assert_eq!(
+            py_color(src, 0, "pydantic"),
+            Some(yellow),
+            "import module name"
+        );
+        // Dotted module path segments in a from-import.
+        assert_eq!(
+            py_color(src, 1, "anterior"),
+            Some(yellow),
+            "from-import module head"
+        );
+        assert_eq!(
+            py_color(src, 1, "schema"),
+            Some(yellow),
+            "from-import module tail"
+        );
+        // CamelCase imported class, both at import and as a return annotation.
+        assert_eq!(
+            py_color(src, 1, "Config"),
+            Some(yellow),
+            "imported class name"
+        );
+        assert_eq!(
+            py_color(src, 3, "Config"),
+            Some(yellow),
+            "class as annotation"
+        );
+        // Module reference in the BODY resolves through the locals query and
+        // inherits the namespace colour (this is the part syntax-position rules
+        // alone can't reach).
+        assert_eq!(
+            py_color(src, 4, "pydantic"),
+            Some(yellow),
+            "module base in body"
+        );
+        // The class accessed off the module is a CamelCase reference -> type.
+        assert_eq!(
+            py_color(src, 4, "BaseModel"),
+            Some(yellow),
+            "CamelCase attr ref"
+        );
+    }
+
+    #[test]
+    fn highlight_python_camelcase_overlay_excludes_all_caps_constants() {
+        // The CamelCase rule requires a lowercase letter, so an ALL_CAPS name
+        // is NOT recoloured to type-yellow; it stays on the bundled @constant
+        // rule (orange). This keeps module-level constants highlighted and
+        // avoids turning them yellow.
+        let orange = rgb(0xd0, 0x87, 0x70);
+        let src = "MAX_SIZE = 300\n";
+        assert_eq!(py_color(src, 0, "MAX_SIZE"), Some(orange));
+    }
 
     #[test]
     fn highlight_c_produces_spans() {
