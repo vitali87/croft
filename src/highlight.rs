@@ -199,6 +199,33 @@ const JS_PARAM_HIGHLIGHTS_OVERLAY_QUERY: &str = r#"
 /// Mirrors `JS_PARAM_HIGHLIGHTS_OVERLAY_QUERY`.
 const RUST_IDENTIFIER_OVERLAY_QUERY: &str = r#"(identifier) @variable"#;
 
+/// Appended AFTER the bundled Rust highlights so it wins under last-match-wins.
+/// Colours the two most pervasive tokens that otherwise recolour when
+/// rust-analyzer's semantic overlay lands 1-3s after open (RA cold crate-graph
+/// analysis, unfixable at the LSP layer):
+///   - module/namespace path segments (`std::collections::`) which RA paints
+///     `namespace` (yellow) but tree-sitter leaves grey @variable. Restricted
+///     to lowercase leading segments via `#match?` so capitalized type paths
+///     keep the bundled `@type` rule. Mirrors the bundled capitalized-`@type`
+///     scoped rules but for lowercase -> `@module`.
+///   - enum-variant DECLARATIONS (`enum E { A, B }`) which RA paints
+///     `enumMember` (orange) but tree-sitter colours @constructor (blue-grey).
+/// Variant USES (`E::A`) are deliberately NOT matched: syntactically they are
+/// indistinguishable from a type path or associated const, so colouring them
+/// would mis-paint real types. That residual recolour is inherent to the
+/// combined model (VS Code has it too) and only the LSP can resolve it.
+const RUST_MODULE_OVERLAY_QUERY: &str = r#"
+((scoped_identifier path: (identifier) @module)
+ (#match? @module "^[a-z]"))
+((scoped_identifier path: (scoped_identifier name: (identifier) @module))
+ (#match? @module "^[a-z]"))
+((scoped_type_identifier path: (identifier) @module)
+ (#match? @module "^[a-z]"))
+((scoped_type_identifier path: (scoped_identifier name: (identifier) @module))
+ (#match? @module "^[a-z]"))
+(enum_variant name: (identifier) @constant)
+"#;
+
 /// Local-scope query for Rust, passed as the locals slot of
 /// `HighlightConfiguration::new`. tree-sitter-rust ships no locals query, so
 /// without this a parameter is coloured only at its declaration site (by the
@@ -326,9 +353,10 @@ fn build_config(kind: LangKind) -> Option<HighlightConfiguration> {
             // its node also carries a highlights capture). Bundled specific
             // rules follow and win under last-match-wins.
             let highlights = format!(
-                "{}\n{}",
+                "{}\n{}\n{}",
                 RUST_IDENTIFIER_OVERLAY_QUERY,
                 tree_sitter_rust::HIGHLIGHTS_QUERY,
+                RUST_MODULE_OVERLAY_QUERY,
             );
             HighlightConfiguration::new(
                 tree_sitter_rust::LANGUAGE.into(),
@@ -1111,6 +1139,43 @@ mod tests {
         let ty = span_at(&h[2], line2, "Parser").expect("type name span");
         assert_eq!(ty.style.fg, type_c, "type name must keep @type colour");
         assert_ne!(ty.style.fg, default_fg);
+    }
+
+    #[test]
+    fn highlight_rust_colors_module_paths_and_enum_variant_defs_to_match_lsp() {
+        // rust-analyzer paints module path segments (`std`, `collections`) as
+        // `namespace` (yellow) and enum-variant declarations (`Light`, `Dark`)
+        // as `enumMember` (orange/constant). tree-sitter-rust leaves the path
+        // segments grey @variable and colours capitalized scoped names
+        // @constructor (blue-grey), so when RA's overlay lands ~1-3s after open
+        // those tokens visibly recolour. Colour them in the tree-sitter base so
+        // the overlay is a no-op for these (the most pervasive recolour, since
+        // every `use`/path has module segments).
+        let mut reg = LangRegistry::new();
+        let src = "use std::collections::HashMap;\nenum Shade { Light, Dark }\n";
+        let line_starts = compute_line_starts(src.as_bytes());
+        let h = highlight_text(&mut reg, LangKind::Rust, src.as_bytes(), &line_starts);
+
+        let module_c = Some(rgb(0xeb, 0xcb, 0x8b)); // @module / @type (yellow)
+        let constant_c = Some(rgb(0xd0, 0x87, 0x70)); // @constant (orange)
+
+        let l0 = "use std::collections::HashMap;";
+        let std_span = span_at(&h[0], l0, "std").expect("std path span");
+        assert_eq!(std_span.style.fg, module_c, "`std` must be module-coloured");
+        let coll_span = span_at(&h[0], l0, "collections").expect("collections span");
+        assert_eq!(
+            coll_span.style.fg, module_c,
+            "`collections` must be module-coloured"
+        );
+
+        let l1 = "enum Shade { Light, Dark }";
+        let light = span_at(&h[1], l1, "Light").expect("Light variant span");
+        assert_eq!(
+            light.style.fg, constant_c,
+            "enum variant declaration must be constant-coloured"
+        );
+        let dark = span_at(&h[1], l1, "Dark").expect("Dark variant span");
+        assert_eq!(dark.style.fg, constant_c);
     }
 
     #[test]
