@@ -1,5 +1,7 @@
 use ratatui::style::{Color, Modifier, Style};
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 use tree_sitter_highlight::{HighlightConfiguration, HighlightEvent, Highlighter};
 
 /// Order matters: the index assigned by `HighlightConfiguration::configure`
@@ -610,26 +612,64 @@ pub struct HiSpan {
     pub style: Style,
 }
 
+thread_local! {
+    // One built `HighlightConfiguration` per language, shared by every editor
+    // on the UI thread. Compiling the (overlay-augmented) tree-sitter queries
+    // costs tens of milliseconds; without sharing, each new tab rebuilt them on
+    // its first highlight, blocking the first paint. The config is immutable
+    // after `build_config` calls `configure`, so an `Rc` is safe to hand out.
+    static SHARED_CONFIGS: RefCell<HashMap<LangKind, Rc<HighlightConfiguration>>> =
+        RefCell::new(HashMap::new());
+}
+
+/// Build once per thread and return the shared highlight configuration for
+/// `kind`, or `None` if the language has no tree-sitter config.
+fn shared_config(kind: LangKind) -> Option<Rc<HighlightConfiguration>> {
+    SHARED_CONFIGS.with(|c| {
+        if let Some(cfg) = c.borrow().get(&kind) {
+            return Some(Rc::clone(cfg));
+        }
+        let built = Rc::new(build_config(kind)?);
+        c.borrow_mut().insert(kind, Rc::clone(&built));
+        Some(built)
+    })
+}
+
+/// Pre-build the tree-sitter highlight configurations on the calling thread so
+/// the first file open does not pay the query-compilation cost on the paint
+/// path. Call once at startup on the UI thread. Idempotent.
+pub fn prewarm_configs() {
+    for kind in [
+        LangKind::Rust,
+        LangKind::Python,
+        LangKind::TypeScript,
+        LangKind::Tsx,
+        LangKind::JavaScript,
+    ] {
+        let _ = shared_config(kind);
+    }
+}
+
 pub struct LangRegistry {
-    cache: HashMap<LangKind, HighlightConfiguration>,
+    _private: (),
+}
+
+impl Default for LangRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl LangRegistry {
     pub fn new() -> Self {
-        Self {
-            cache: HashMap::new(),
-        }
+        Self { _private: () }
     }
 
-    pub fn get(&mut self, kind: LangKind) -> Option<&HighlightConfiguration> {
-        if let std::collections::hash_map::Entry::Vacant(e) = self.cache.entry(kind) {
-            if let Some(cfg) = build_config(kind) {
-                e.insert(cfg);
-            } else {
-                return None;
-            }
-        }
-        self.cache.get(&kind)
+    /// Return the shared configuration for `kind`, building it once per thread.
+    /// Takes `&mut self` for call-site compatibility, but state lives in the
+    /// thread-local `SHARED_CONFIGS` so all editors reuse one build.
+    pub fn get(&mut self, kind: LangKind) -> Option<Rc<HighlightConfiguration>> {
+        shared_config(kind)
     }
 }
 
@@ -647,7 +687,7 @@ pub fn highlight_text(
         None => return per_line,
     };
     let mut hl = Highlighter::new();
-    let events = match hl.highlight(cfg, text, None, |_| None) {
+    let events = match hl.highlight(cfg.as_ref(), text, None, |_| None) {
         Ok(e) => e,
         Err(_) => return per_line,
     };
@@ -1021,6 +1061,22 @@ def f() -> Config:\n\
         assert!(reg.get(LangKind::Rust).is_some());
         // Second call should hit the cache and still succeed.
         assert!(reg.get(LangKind::Rust).is_some());
+    }
+
+    #[test]
+    fn highlight_configs_are_shared_across_editors() {
+        // The query-compilation cost must be paid once per process, not once
+        // per editor tab: a new tab's first paint should never rebuild the
+        // config. Two independent registries must hand out the same `Rc`.
+        prewarm_configs();
+        let mut a = LangRegistry::new();
+        let mut b = LangRegistry::new();
+        let ca = a.get(LangKind::Rust).expect("rust config");
+        let cb = b.get(LangKind::Rust).expect("rust config");
+        assert!(
+            Rc::ptr_eq(&ca, &cb),
+            "every editor must share one built highlight config"
+        );
     }
 
     #[test]

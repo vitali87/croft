@@ -13378,6 +13378,11 @@ pub fn run(root: PathBuf, restore_session: Option<PathBuf>) -> Result<()> {
     // on — the local Mac and the remote Linux box both reach `run` — so
     // the dependency is satisfied identically on both (GOLDEN RULE).
     crate::zoxide::ensure_installed_in_background();
+    // Build the tree-sitter highlight configurations on the UI thread now, so
+    // the first file open paints its syntax (keywords, strings, comments)
+    // instantly instead of paying the one-time query-compilation cost on the
+    // paint path. Shared across every editor tab via a thread-local cache.
+    crate::highlight::prewarm_configs();
     let title = build_title(&root);
     let mut app = App::new(root.clone())?;
     // Restore the tabs / layout carried across a self-update re-exec, then
