@@ -133,6 +133,45 @@ pub struct SemanticTokensUpdate {
     pub is_full: bool,
 }
 
+/// Severity of a diagnostic, normalised off the LSP `DiagnosticSeverity`
+/// wire enum. Drives the underline colour the editor paints (VS Code: red
+/// for errors, yellow for warnings, blue/teal for info & hints).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiagnosticSeverity {
+    Error,
+    Warning,
+    Information,
+    Hint,
+}
+
+/// One diagnostic from a language server, normalised off the LSP wire type.
+/// Positions are LSP UTF-16 (`line`, `character`), zero-based; the editor
+/// converts them to character columns against its own buffer, exactly as it
+/// does for semantic tokens. A diagnostic can span several lines
+/// (`start_line..=end_line`).
+#[derive(Debug, Clone)]
+pub struct Diagnostic {
+    pub start_line: u32,
+    pub start_char: u32,
+    pub end_line: u32,
+    pub end_char: u32,
+    pub severity: DiagnosticSeverity,
+    pub message: String,
+}
+
+/// A fresh, COMPLETE set of diagnostics for one document from one server,
+/// pushed via `textDocument/publishDiagnostics`. LSP always republishes the
+/// whole list (an empty `diagnostics` means "all clear"), so each update
+/// replaces the prior set for the same `(path, server)` pair. Keyed by
+/// `server` too, so two servers analysing one file (e.g. ty + ruff) layer
+/// their diagnostics instead of clobbering each other.
+#[derive(Debug, Clone)]
+pub struct DiagnosticsUpdate {
+    pub path: PathBuf,
+    pub server: String,
+    pub diagnostics: Vec<Diagnostic>,
+}
+
 enum Cmd {
     OpenDoc {
         path: PathBuf,
@@ -230,6 +269,7 @@ pub struct LspManager {
     ref_rx: std_mpsc::Receiver<ReferencesResult>,
     rename_rx: std_mpsc::Receiver<RenameResult>,
     semantic_rx: std_mpsc::Receiver<SemanticTokensUpdate>,
+    diagnostics_rx: std_mpsc::Receiver<DiagnosticsUpdate>,
     capability_support: CapabilitySupport,
     semantic_refresh: Arc<AtomicBool>,
     next_request_id: u64,
@@ -250,6 +290,7 @@ impl LspManager {
         let (ref_tx, ref_rx) = std_mpsc::channel();
         let (rename_tx, rename_rx) = std_mpsc::channel();
         let (semantic_tx, semantic_rx) = std_mpsc::channel();
+        let (diagnostics_tx, diagnostics_rx) = std_mpsc::channel();
         let capability_support: CapabilitySupport =
             Arc::new(StdMutex::new(LangCapabilitySupport::default()));
         let semantic_refresh = Arc::new(AtomicBool::new(false));
@@ -268,6 +309,7 @@ impl LspManager {
                 references: ref_tx,
                 rename: rename_tx,
                 semantic_tokens: semantic_tx,
+                diagnostics: diagnostics_tx,
             },
             capability_support.clone(),
             semantic_refresh.clone(),
@@ -283,6 +325,7 @@ impl LspManager {
             ref_rx,
             rename_rx,
             semantic_rx,
+            diagnostics_rx,
             capability_support,
             semantic_refresh,
             next_request_id: 1,
@@ -360,6 +403,13 @@ impl LspManager {
 
     pub fn drain_semantic_tokens(&self) -> Option<SemanticTokensUpdate> {
         self.semantic_rx.try_recv().ok()
+    }
+
+    /// Pop the next server-pushed diagnostics batch, if any. Each batch is the
+    /// complete set for one `(path, server)` pair; the app keeps a per-file,
+    /// per-server store so layering and "all clear" (empty batch) both work.
+    pub fn drain_diagnostics(&self) -> Option<DiagnosticsUpdate> {
+        self.diagnostics_rx.try_recv().ok()
     }
 
     /// Returns and clears the "a server asked us to re-pull semantic tokens"
@@ -563,6 +613,9 @@ struct WorkerState {
     // Shared with every spawned client's router; a client sets it on a
     // `workspace/semanticTokens/refresh` and the app polls + clears it.
     semantic_refresh: Arc<AtomicBool>,
+    // Cloned into every spawned client's router so the server-pushed
+    // `textDocument/publishDiagnostics` notifications reach the app.
+    diagnostics_tx: std_mpsc::Sender<DiagnosticsUpdate>,
 }
 
 struct DocState {
@@ -583,6 +636,7 @@ struct ResultSenders {
     references: std_mpsc::Sender<ReferencesResult>,
     rename: std_mpsc::Sender<RenameResult>,
     semantic_tokens: std_mpsc::Sender<SemanticTokensUpdate>,
+    diagnostics: std_mpsc::Sender<DiagnosticsUpdate>,
 }
 
 async fn worker_loop(
@@ -600,6 +654,7 @@ async fn worker_loop(
         docs: HashMap::new(),
         capability_support,
         semantic_refresh,
+        diagnostics_tx: tx.diagnostics.clone(),
     };
     while let Some(cmd) = cmd_rx.recv().await {
         match cmd {
@@ -734,9 +789,17 @@ impl WorkerState {
                 futures::future::join_all(resolved.into_iter().map(|(config, extra_path)| {
                     let caps = build_client_capabilities();
                     let refresh = self.semantic_refresh.clone();
+                    let diagnostics = self.diagnostics_tx.clone();
                     async move {
-                        let result =
-                            LspClient::spawn(&config, root, caps, &extra_path, refresh).await;
+                        let result = LspClient::spawn(
+                            &config,
+                            root,
+                            caps,
+                            &extra_path,
+                            refresh,
+                            diagnostics,
+                        )
+                        .await;
                         (config, result)
                     }
                 }))

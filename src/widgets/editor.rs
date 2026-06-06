@@ -1189,6 +1189,16 @@ pub struct Editor {
     /// late range reply for that same file is dropped so it cannot blank the
     /// off-screen colour the full batch painted.
     semantic_is_full: bool,
+    /// Diagnostics for the loaded file, retained with their raw LSP UTF-16
+    /// positions so `diagnostic_spans` can be re-decoded against the buffer.
+    /// `diagnostics_path` guards a stale batch from underlining the wrong file
+    /// after a tab switch, exactly as `semantic_path` does for tokens.
+    diagnostics: Vec<crate::lsp::manager::Diagnostic>,
+    diagnostics_path: Option<PathBuf>,
+    /// Decoded per-logical-line underline runs `(start_char, end_char,
+    /// severity)`, recomputed from `diagnostics` whenever they or the buffer
+    /// change. The render loop paints a coloured underline over each run.
+    diagnostic_spans: Vec<Vec<(usize, usize, crate::lsp::manager::DiagnosticSeverity)>>,
     registry: LangRegistry,
     /// When set, every occurrence of this string in the visible portion of
     /// the buffer is overpainted with the search-match style after the
@@ -1277,6 +1287,9 @@ impl Editor {
             semantic_legend: None,
             semantic_path: None,
             semantic_is_full: false,
+            diagnostics: Vec::new(),
+            diagnostics_path: None,
+            diagnostic_spans: Vec::new(),
             registry: LangRegistry::new(),
             search_highlight: None,
             search_highlight_opts: crate::widgets::search::SearchOpts::default(),
@@ -1707,6 +1720,7 @@ impl Editor {
             }
         }
         self.recompute_semantic_overlay();
+        self.recompute_diagnostic_spans();
     }
 
     /// Store a fresh semantic-token batch from the LSP and decode it into
@@ -1743,6 +1757,74 @@ impl Editor {
     #[cfg(test)]
     pub(crate) fn lines_for_test(&self) -> &[String] {
         &self.lines
+    }
+
+    /// Store a fresh diagnostics set for `path` and decode it into per-line
+    /// underline runs. Called by the app when `drain_diagnostics` yields a
+    /// batch for this editor's file (an empty `diagnostics` clears them, which
+    /// is how an "all clear" republish erases the squiggles).
+    pub fn apply_diagnostics(
+        &mut self,
+        path: PathBuf,
+        diagnostics: Vec<crate::lsp::manager::Diagnostic>,
+    ) {
+        self.diagnostics_path = Some(path);
+        self.diagnostics = diagnostics;
+        self.recompute_diagnostic_spans();
+    }
+
+    /// The file the editor's current diagnostics belong to, if any. The app
+    /// reads this to re-apply the stored set after a tab switch (diagnostics
+    /// are server-pushed, never re-requested on focus like semantic tokens).
+    pub fn diagnostics_path(&self) -> Option<&Path> {
+        self.diagnostics_path.as_deref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn diagnostic_spans_for_test(
+        &self,
+    ) -> &[Vec<(usize, usize, crate::lsp::manager::DiagnosticSeverity)>] {
+        &self.diagnostic_spans
+    }
+
+    /// Re-decode the retained diagnostics into per-logical-line character runs
+    /// against the current buffer. A no-op (clears the runs) unless the batch
+    /// belongs to the loaded file, so stale squiggles never bleed across a tab
+    /// switch. A zero-width diagnostic (e.g. a "missing token" pointing between
+    /// two characters) is widened to one cell so it is still visible, matching
+    /// VS Code drawing a squiggle under at least one character.
+    fn recompute_diagnostic_spans(&mut self) {
+        let same_file = self.diagnostics_path.as_deref() == self.path.as_deref();
+        if !same_file || self.diagnostics.is_empty() {
+            self.diagnostic_spans = Vec::new();
+            return;
+        }
+        let mut spans: Vec<Vec<(usize, usize, crate::lsp::manager::DiagnosticSeverity)>> =
+            vec![Vec::new(); self.lines.len()];
+        for d in &self.diagnostics {
+            let start_line = d.start_line as usize;
+            let end_line = d.end_line as usize;
+            for line in start_line..=end_line {
+                let Some(text) = self.lines.get(line) else {
+                    continue;
+                };
+                let line_chars = text.chars().count();
+                let from = if line == start_line {
+                    utf16_to_char_col(text, d.start_char)
+                } else {
+                    0
+                };
+                let to = if line == end_line {
+                    utf16_to_char_col(text, d.end_char)
+                } else {
+                    line_chars
+                };
+                // Widen an empty run to one cell so a point diagnostic is seen.
+                let to = to.max(from + 1);
+                spans[line].push((from, to, d.severity));
+            }
+        }
+        self.diagnostic_spans = spans;
     }
 
     /// Re-decode the retained semantic-token batch against the current
@@ -3357,6 +3439,21 @@ fn byte_index_of_char(line: &str, chars_in: usize) -> usize {
         .unwrap_or(line.len())
 }
 
+/// Character column for the LSP UTF-16 offset `u16_off` within `line`. LSP
+/// positions count UTF-16 code units; the editor lays out by character, so a
+/// line containing astral-plane characters (which take two UTF-16 units) needs
+/// this conversion. An offset past the line clamps to the line's char length.
+fn utf16_to_char_col(line: &str, u16_off: u32) -> usize {
+    let mut units: u32 = 0;
+    for (char_idx, ch) in line.chars().enumerate() {
+        if units >= u16_off {
+            return char_idx;
+        }
+        units += ch.len_utf16() as u32;
+    }
+    line.chars().count()
+}
+
 /// A character VS Code breaks a wrapped line *after* (a subset of its default
 /// `editor.wordWrapBreakAfterCharacters` that matters for Latin/Markdown
 /// prose): whitespace plus trailing punctuation, so the next word starts a
@@ -3747,6 +3844,22 @@ impl Widget for &mut Editor {
             let spans = build_line_spans(visible_raw, &shifted);
             buf.set_line(text_x, y, &Line::from(spans), row_width);
 
+            // LSP diagnostics: underline each problem span in its severity
+            // colour, clipped to the visible row window. VS Code draws a wavy
+            // underline; the crossterm backend exposes only a straight one, so
+            // a coloured straight underline carries the severity instead. The
+            // underline colour is independent of the glyph's foreground, so the
+            // syntax/semantic colour underneath is preserved.
+            let empty_diag: Vec<(usize, usize, crate::lsp::manager::DiagnosticSeverity)> =
+                Vec::new();
+            for &(sc, ec, severity) in self.diagnostic_spans.get(line_idx).unwrap_or(&empty_diag) {
+                let vs = sc.saturating_sub(row_start);
+                let ve = ec.saturating_sub(row_start);
+                if ve > vs {
+                    paint_diagnostic_underline(buf, text_x, y, row_width, vs, ve, severity);
+                }
+            }
+
             if let Some(term) = self.search_highlight.as_deref() {
                 let active_on_line = self
                     .active_search_match
@@ -4079,6 +4192,43 @@ fn paint_selection_band(
         let x = text_x + col as u16;
         let cell = &mut buf[(x, y)];
         cell.set_style(cell.style().bg(bg));
+    }
+}
+
+/// Paint a coloured underline across `[start_char, end_char)` of a rendered
+/// row to mark an LSP diagnostic. The colour encodes severity, matching VS
+/// Code's palette (red error, yellow warning, teal info/hint). Uses the
+/// terminal's separate underline colour so the glyph's foreground (its syntax
+/// or semantic colour) is left untouched, the way VS Code's squiggle sits
+/// under unchanged text.
+fn paint_diagnostic_underline(
+    buf: &mut Buffer,
+    text_x: u16,
+    y: u16,
+    text_width: u16,
+    start_char: usize,
+    end_char: usize,
+    severity: crate::lsp::manager::DiagnosticSeverity,
+) {
+    use crate::lsp::manager::DiagnosticSeverity;
+    let color = match severity {
+        DiagnosticSeverity::Error => Color::Rgb(0xf1, 0x4c, 0x4c),
+        DiagnosticSeverity::Warning => Color::Rgb(0xcc, 0xa7, 0x00),
+        DiagnosticSeverity::Information | DiagnosticSeverity::Hint => Color::Rgb(0x3b, 0x9e, 0xff),
+    };
+    let s = start_char.min(text_width as usize);
+    let e = end_char.min(text_width as usize);
+    if e <= s {
+        return;
+    }
+    for col in s..e {
+        let x = text_x + col as u16;
+        let cell = &mut buf[(x, y)];
+        cell.set_style(
+            cell.style()
+                .add_modifier(Modifier::UNDERLINED)
+                .underline_color(color),
+        );
     }
 }
 
@@ -4904,6 +5054,123 @@ mod tests {
         assert!(is_binary(b"hello\0world"));
         assert!(!is_binary(b"hello world"));
         assert!(!is_binary(b""));
+    }
+
+    fn diag(
+        start_line: u32,
+        start_char: u32,
+        end_line: u32,
+        end_char: u32,
+        severity: crate::lsp::manager::DiagnosticSeverity,
+    ) -> crate::lsp::manager::Diagnostic {
+        crate::lsp::manager::Diagnostic {
+            start_line,
+            start_char,
+            end_line,
+            end_char,
+            severity,
+            message: String::from("test diagnostic"),
+        }
+    }
+
+    #[test]
+    fn apply_diagnostics_decodes_into_per_line_char_spans() {
+        use crate::lsp::manager::DiagnosticSeverity;
+        let mut e = editor_with("const x = 1;");
+        let p = std::path::PathBuf::from("/tmp/diag.ts");
+        e.path = Some(p.clone());
+        // Underline the `x` (chars 6..7).
+        e.apply_diagnostics(p, vec![diag(0, 6, 0, 7, DiagnosticSeverity::Error)]);
+        let spans = e.diagnostic_spans_for_test();
+        assert_eq!(
+            spans[0],
+            vec![(6, 7, DiagnosticSeverity::Error)],
+            "the diagnostic must decode to a single-char run over `x`"
+        );
+    }
+
+    #[test]
+    fn zero_width_diagnostic_is_widened_to_one_cell() {
+        use crate::lsp::manager::DiagnosticSeverity;
+        let mut e = editor_with("const x = 1;");
+        let p = std::path::PathBuf::from("/tmp/diag.ts");
+        e.path = Some(p.clone());
+        // A point diagnostic (start == end) must still show one cell.
+        e.apply_diagnostics(p, vec![diag(0, 6, 0, 6, DiagnosticSeverity::Warning)]);
+        assert_eq!(
+            e.diagnostic_spans_for_test()[0],
+            vec![(6, 7, DiagnosticSeverity::Warning)],
+            "a zero-width diagnostic must widen to one cell so it stays visible"
+        );
+    }
+
+    #[test]
+    fn diagnostics_for_another_file_do_not_decode() {
+        use crate::lsp::manager::DiagnosticSeverity;
+        let mut e = editor_with("const x = 1;");
+        e.path = Some(std::path::PathBuf::from("/tmp/open.ts"));
+        // Batch is for a different file than the one loaded.
+        e.apply_diagnostics(
+            std::path::PathBuf::from("/tmp/other.ts"),
+            vec![diag(0, 0, 0, 5, DiagnosticSeverity::Error)],
+        );
+        assert!(
+            e.diagnostic_spans_for_test().iter().all(|l| l.is_empty()),
+            "a batch for a different file must not underline the loaded one"
+        );
+    }
+
+    #[test]
+    fn empty_diagnostics_batch_clears_the_underlines() {
+        use crate::lsp::manager::DiagnosticSeverity;
+        let mut e = editor_with("const x = 1;");
+        let p = std::path::PathBuf::from("/tmp/diag.ts");
+        e.path = Some(p.clone());
+        e.apply_diagnostics(p.clone(), vec![diag(0, 6, 0, 7, DiagnosticSeverity::Error)]);
+        assert!(!e.diagnostic_spans_for_test()[0].is_empty());
+        // An "all clear" republish carries an empty list.
+        e.apply_diagnostics(p, Vec::new());
+        assert!(
+            e.diagnostic_spans_for_test().iter().all(|l| l.is_empty()),
+            "an empty batch must erase the squiggles"
+        );
+    }
+
+    #[test]
+    fn render_paints_severity_coloured_underline_over_the_diagnostic_span() {
+        use crate::lsp::manager::DiagnosticSeverity;
+        let mut e = editor_with("const x = 1;");
+        let p = std::path::PathBuf::from("/tmp/diag.ts");
+        e.path = Some(p.clone());
+        e.apply_diagnostics(p, vec![diag(0, 6, 0, 7, DiagnosticSeverity::Error)]);
+        e.focused = true;
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 5,
+        };
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        (&mut e as &mut Editor).render(area, &mut buf);
+        let red = Color::Rgb(0xf1, 0x4c, 0x4c);
+        let mut underlined: Vec<(u16, u16, String)> = Vec::new();
+        for y in 0..area.height {
+            for x in 0..area.width {
+                let cell = &buf[(x, y)];
+                if cell.modifier.contains(Modifier::UNDERLINED) && cell.underline_color == red {
+                    underlined.push((x, y, cell.symbol().to_string()));
+                }
+            }
+        }
+        assert_eq!(
+            underlined.len(),
+            1,
+            "exactly one cell (the `x`) must carry a red error underline; got {underlined:?}"
+        );
+        assert_eq!(
+            underlined[0].2, "x",
+            "the underline must sit under the offending `x` glyph"
+        );
     }
 
     #[test]
