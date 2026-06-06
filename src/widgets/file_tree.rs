@@ -24,8 +24,10 @@ pub struct FileTree {
     pub selected: usize,
     pub scroll: usize,
     pub focused: bool,
-    /// When focused, draw the orange→green gradient border (Black theme)
-    /// instead of the solid blue one. Set by the app's focus/theme sync.
+    /// True under the Black theme. Draws the orange→green gradient border
+    /// (when focused) instead of the solid blue one, and fills the selected
+    /// row with the brand's dark-teal instead of the legacy blue. Set by the
+    /// app's focus/theme sync.
     pub focus_gradient: bool,
     pub last_inner: Rect,
     pub last_area: Rect,
@@ -1168,12 +1170,24 @@ impl Widget for &mut FileTree {
             }
 
             let line = Line::from(spans);
+            // Black theme: the selected/marked rows wear the brand's muted
+            // dark-teal fill (identical to the right-click menu's selection),
+            // replacing the legacy bright-blue accent. Croft Dark keeps the
+            // historical blue. The drop target stays green either way.
+            let (sel_bg, mark_bg) = if self.focus_gradient {
+                (
+                    crate::gradient::rgb_color(crate::gradient::POPUP_SEL_BG),
+                    Color::Rgb(0x18, 0x35, 0x32),
+                )
+            } else {
+                (Color::Rgb(0x09, 0x4d, 0x77), Color::Rgb(0x07, 0x33, 0x55))
+            };
             let line_style = if is_drop_target {
                 Style::default().bg(Color::Rgb(0x2c, 0x60, 0x2e))
             } else if is_selected {
-                Style::default().bg(Color::Rgb(0x09, 0x4d, 0x77))
+                Style::default().bg(sel_bg)
             } else if is_marked {
-                Style::default().bg(Color::Rgb(0x07, 0x33, 0x55))
+                Style::default().bg(mark_bg)
             } else {
                 Style::default()
             };

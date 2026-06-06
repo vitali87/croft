@@ -4382,6 +4382,10 @@ impl App {
         let gradient = self.theme == crate::theme::Theme::Black;
         self.editor.focus_gradient = gradient;
         self.tree.focus_gradient = gradient;
+        self.search.focus_gradient = gradient;
+        self.source_control.focus_gradient = gradient;
+        self.run_debug.focus_gradient = gradient;
+        self.remote.focus_gradient = gradient;
         for t in self.terminals.iter_mut() {
             t.focus_gradient = gradient;
         }

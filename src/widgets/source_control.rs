@@ -67,6 +67,10 @@ impl CommitMenuItem {
 
 pub struct SourceControlPanel {
     pub focused: bool,
+    /// True under the Black theme: overpaint the focused outer border with the
+    /// orange→green brand gradient instead of the legacy solid blue. Set by the
+    /// app's focus/theme sync.
+    pub focus_gradient: bool,
     pub message: String,
     pub message_cursor: usize,
     /// Leading characters scrolled out of view on the left of the
@@ -132,6 +136,7 @@ impl SourceControlPanel {
     pub fn new() -> Self {
         Self {
             focused: false,
+            focus_gradient: false,
             message: String::new(),
             message_cursor: 0,
             message_scroll: 0,
@@ -765,6 +770,13 @@ fn badge_color(kind: ChangeKind) -> Color {
 impl Widget for &mut SourceControlPanel {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let focus_blue = Color::Rgb(0x4e, 0x9a, 0xff);
+        // Black theme: the commit-input focus ring wears the muted brand teal
+        // instead of the legacy blue (the outer border becomes the gradient).
+        let accent = if self.focus_gradient {
+            crate::gradient::rgb_color(crate::gradient::INNER_ACCENT)
+        } else {
+            focus_blue
+        };
         let outer_style = if self.focused {
             Style::default().fg(focus_blue)
         } else {
@@ -775,6 +787,12 @@ impl Widget for &mut SourceControlPanel {
             .border_style(outer_style);
         let inner = outer.inner(area);
         outer.render(area, buf);
+        // Black theme: replace the solid focus border with the brand gradient.
+        // The SOURCE CONTROL header sits inside the border, so nothing on the
+        // border itself needs re-stamping.
+        if self.focused && self.focus_gradient {
+            crate::gradient::paint_gradient_box(buf, area);
+        }
         self.last_area = area;
         self.last_inner = inner;
         self.last_input_area = Rect::default();
@@ -867,7 +885,7 @@ impl Widget for &mut SourceControlPanel {
         };
         self.last_input_area = input_box;
         let input_border_style = if self.focused {
-            Style::default().fg(focus_blue)
+            Style::default().fg(accent)
         } else {
             Style::default().fg(Color::Rgb(0x60, 0x68, 0x78))
         };

@@ -13,6 +13,10 @@ pub struct RemotePanel {
     pub selected: usize,
     pub scroll: usize,
     pub focused: bool,
+    /// True under the Black theme: overpaint the focused outer border with the
+    /// orange→green brand gradient instead of the legacy solid blue. Set by the
+    /// app's focus/theme sync.
+    pub focus_gradient: bool,
     pub collapsed: bool,
     pub filter: String,
     pub last_area: Rect,
@@ -38,6 +42,7 @@ impl RemotePanel {
             selected: 0,
             scroll: 0,
             focused: false,
+            focus_gradient: false,
             collapsed: false,
             filter: String::new(),
             last_area: Rect::default(),
@@ -558,18 +563,25 @@ impl Widget for &mut RemotePanel {
         } else {
             Style::default().fg(Color::DarkGray)
         };
+        let title = Span::styled(
+            " REMOTE EXPLORER ",
+            Style::default()
+                .fg(Color::White)
+                .bg(Color::Rgb(0x1e, 0x3a, 0x6e))
+                .add_modifier(Modifier::BOLD),
+        );
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(block_style)
-            .title(Span::styled(
-                " REMOTE EXPLORER ",
-                Style::default()
-                    .fg(Color::White)
-                    .bg(Color::Rgb(0x1e, 0x3a, 0x6e))
-                    .add_modifier(Modifier::BOLD),
-            ));
+            .title(title.clone());
         let inner = block.inner(area);
         block.render(area, buf);
+        // Black theme: replace the solid focus border with the brand gradient,
+        // then re-stamp the title the gradient top edge just overwrote.
+        if self.focused && self.focus_gradient {
+            crate::gradient::paint_gradient_box(buf, area);
+            buf.set_span(area.x + 1, area.y, &title, title.width() as u16);
+        }
         self.last_area = area;
         self.last_inner = inner;
         self.last_scrollbar = Rect::default();

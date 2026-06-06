@@ -25,6 +25,10 @@ pub const RUN_DEBUG_ICON_CELLS_H: u16 = 3;
 
 pub struct RunDebugPanel {
     pub focused: bool,
+    /// True under the Black theme: overpaint the focused outer border with the
+    /// orange→green brand gradient instead of the legacy solid blue. Set by the
+    /// app's focus/theme sync.
+    pub focus_gradient: bool,
     pub active_file: Option<PathBuf>,
     pub last_area: Rect,
     pub last_button_area: Rect,
@@ -42,6 +46,7 @@ impl RunDebugPanel {
     pub fn new() -> Self {
         Self {
             focused: false,
+            focus_gradient: false,
             active_file: None,
             last_area: Rect::default(),
             last_button_area: Rect::default(),
@@ -95,6 +100,11 @@ impl Widget for &mut RunDebugPanel {
             .border_style(border_style);
         let inner = block.inner(area);
         block.render(area, buf);
+        // Black theme: replace the solid focus border with the brand gradient.
+        // This panel has no border title, so nothing needs re-stamping.
+        if self.focused && self.focus_gradient {
+            crate::gradient::paint_gradient_box(buf, area);
+        }
         self.last_area = area;
         self.last_button_area = Rect::default();
         self.last_icon_cell = None;

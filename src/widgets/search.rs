@@ -485,6 +485,10 @@ pub struct SearchPanel {
     pub selected: usize,
     pub scroll: usize,
     pub focused: bool,
+    /// True under the Black theme: overpaint the focused outer border with the
+    /// orange→green brand gradient instead of the legacy solid blue. Set by the
+    /// app's focus/theme sync.
+    pub focus_gradient: bool,
     pub last_inner: Rect,
     pub last_area: Rect,
     pub root: PathBuf,
@@ -514,6 +518,7 @@ impl SearchPanel {
             selected: 0,
             scroll: 0,
             focused: false,
+            focus_gradient: false,
             last_inner: Rect::default(),
             last_area: Rect::default(),
             root,
@@ -718,6 +723,13 @@ pub enum SearchToggle {
 impl Widget for &mut SearchPanel {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let focus_blue = Color::Rgb(0x4e, 0x9a, 0xff);
+        // Black theme: inner stroke accents (chevron, input ring, magnifier,
+        // cursor) wear the muted brand teal instead of the legacy blue.
+        let accent = if self.focus_gradient {
+            crate::gradient::rgb_color(crate::gradient::INNER_ACCENT)
+        } else {
+            focus_blue
+        };
         let outer_style = if self.focused {
             Style::default().fg(focus_blue)
         } else {
@@ -728,6 +740,12 @@ impl Widget for &mut SearchPanel {
             .border_style(outer_style);
         let inner = outer.inner(area);
         outer.render(area, buf);
+        // Black theme: replace the solid focus border with the brand gradient.
+        // No title sits on this border (the SEARCH header is inside), so there
+        // is nothing to re-stamp.
+        if self.focused && self.focus_gradient {
+            crate::gradient::paint_gradient_box(buf, area);
+        }
         self.last_area = area;
         self.last_inner = inner;
         if inner.height == 0 || inner.width == 0 {
@@ -789,7 +807,7 @@ impl Widget for &mut SearchPanel {
 
         // Chevron, vertically aligned with the input content row.
         let chevron_color = if self.focused {
-            focus_blue
+            accent
         } else {
             Color::DarkGray
         };
@@ -806,7 +824,7 @@ impl Widget for &mut SearchPanel {
         // panel border). Style switches to focus blue when the panel is
         // focused; otherwise dim grey, matching the rest of the panel.
         let input_border_style = if self.focused {
-            Style::default().fg(focus_blue)
+            Style::default().fg(accent)
         } else {
             Style::default().fg(Color::Rgb(0x60, 0x68, 0x78))
         };
@@ -821,7 +839,7 @@ impl Widget for &mut SearchPanel {
         // codicon `search` U+EA6D used in the activity bar.
         let magnifier_glyph = "\u{ea6d}";
         let magnifier_color = if self.focused {
-            focus_blue
+            accent
         } else {
             Color::Rgb(0x9d, 0xa5, 0xb4)
         };
@@ -839,7 +857,7 @@ impl Widget for &mut SearchPanel {
 
         // Query / placeholder / cursor inside the input box, on its
         // single content row.
-        let cursor_span = Span::styled("█", Style::default().fg(focus_blue));
+        let cursor_span = Span::styled("█", Style::default().fg(accent));
         let placeholder_span = Span::styled(
             "Search",
             Style::default()
@@ -993,11 +1011,20 @@ impl Widget for &mut SearchPanel {
                         .display()
                         .to_string()
                 });
+            // Black theme: selected result row matches the Explorer's
+            // white-on-dark-teal selection; Croft Dark keeps black-on-blue.
             let header_style = if hit_idx == self.selected {
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Rgb(0x4e, 0x9a, 0xff))
-                    .add_modifier(Modifier::BOLD)
+                if self.focus_gradient {
+                    Style::default()
+                        .fg(Color::White)
+                        .bg(crate::gradient::rgb_color(crate::gradient::POPUP_SEL_BG))
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Rgb(0x4e, 0x9a, 0xff))
+                        .add_modifier(Modifier::BOLD)
+                }
             } else {
                 Style::default().fg(Color::White)
             };
