@@ -234,6 +234,7 @@ impl LspClient {
             .initialize(InitializeParams {
                 process_id: Some(std::process::id()),
                 capabilities: client_capabilities,
+                initialization_options: config.initialization_options.clone(),
                 workspace_folders: Some(vec![WorkspaceFolder {
                     uri: workspace_uri,
                     name: workspace_name,

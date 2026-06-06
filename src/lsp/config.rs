@@ -57,12 +57,21 @@ impl Language {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+// `Eq` is intentionally not derived: `initialization_options` is a
+// `serde_json::Value`, which is only `PartialEq` (floats break total
+// equality). `ServerConfig` is never used as a map key, so `PartialEq` is all
+// the call sites and tests need.
+#[derive(Debug, Clone, PartialEq)]
 pub struct ServerConfig {
     pub name: &'static str,
     pub command: String,
     pub args: Vec<String>,
     pub language: Language,
+    /// Server-specific `initializationOptions` sent in the LSP `initialize`
+    /// request. `None` for servers that need none. For rust-analyzer this
+    /// carries `cargo.targetDir` so its `cargo check` uses an isolated target
+    /// directory.
+    pub initialization_options: Option<serde_json::Value>,
 }
 
 impl ServerConfig {
@@ -72,6 +81,7 @@ impl ServerConfig {
             command: "ty".into(),
             args: vec!["server".into()],
             language: Language::Python,
+            initialization_options: None,
         }
     }
 
@@ -81,6 +91,7 @@ impl ServerConfig {
             command: "basedpyright-langserver".into(),
             args: vec!["--stdio".into()],
             language: Language::Python,
+            initialization_options: None,
         }
     }
 
@@ -90,6 +101,7 @@ impl ServerConfig {
             command: "pyright-langserver".into(),
             args: vec!["--stdio".into()],
             language: Language::Python,
+            initialization_options: None,
         }
     }
 
@@ -99,6 +111,7 @@ impl ServerConfig {
             command: "ruff".into(),
             args: vec!["server".into()],
             language: Language::Python,
+            initialization_options: None,
         }
     }
 
@@ -108,6 +121,7 @@ impl ServerConfig {
             command: crate::lsp::install::VTSLS_SERVER_NAME.into(),
             args: vec!["--stdio".into()],
             language: Language::TypeScript,
+            initialization_options: None,
         }
     }
 
@@ -117,6 +131,7 @@ impl ServerConfig {
             command: "typescript-language-server".into(),
             args: vec!["--stdio".into()],
             language: Language::TypeScript,
+            initialization_options: None,
         }
     }
 
@@ -126,6 +141,14 @@ impl ServerConfig {
             command: "rust-analyzer".into(),
             args: vec![],
             language: Language::Rust,
+            // Give rust-analyzer its own `target/rust-analyzer/` so its
+            // `cargo check` no longer fights the user's `cargo build`/`cargo
+            // install` over the target-dir lock, and its build-script and
+            // proc-macro artifacts survive a rebuild instead of forcing a
+            // fresh ~14s cold crate-graph analysis on the next file open.
+            initialization_options: Some(serde_json::json!({
+                "cargo": { "targetDir": true }
+            })),
         }
     }
 
@@ -135,6 +158,7 @@ impl ServerConfig {
             command: "gopls".into(),
             args: vec!["serve".into()],
             language: Language::Go,
+            initialization_options: None,
         }
     }
 }
@@ -208,6 +232,25 @@ mod tests {
         assert_eq!(c.command, "rust-analyzer");
         assert!(c.args.is_empty());
         assert_eq!(c.language, Language::Rust);
+    }
+
+    #[test]
+    fn rust_analyzer_isolates_its_target_dir() {
+        // A dedicated `target/rust-analyzer/` keeps the user's
+        // `cargo install`/`cargo build` from invalidating rust-analyzer's
+        // build-script and proc-macro artifacts (and vice versa), so the cold
+        // crate-graph analysis is re-paid far less often.
+        let c = ServerConfig::rust_analyzer();
+        let opts = c
+            .initialization_options
+            .expect("rust-analyzer must send initializationOptions");
+        assert_eq!(opts["cargo"]["targetDir"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn most_servers_send_no_initialization_options() {
+        assert!(ServerConfig::ty().initialization_options.is_none());
+        assert!(ServerConfig::gopls().initialization_options.is_none());
     }
 
     #[test]

@@ -2224,6 +2224,7 @@ mod tests {
             command: "definitely-not-a-real-binary-zzzqqq".into(),
             args: vec![],
             language: Language::Go,
+            initialization_options: None,
         };
         assert!(
             resolve_config(&absent, false).is_none(),
@@ -2234,6 +2235,7 @@ mod tests {
             command: "sh".into(),
             args: vec![],
             language: Language::Bash,
+            initialization_options: None,
         };
         assert!(
             resolve_config(&present, false).is_some(),
