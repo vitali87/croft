@@ -660,7 +660,10 @@ mod tests {
         let glyph_opaque = decoded
             .pixels()
             .any(|p| p.0 != [bg[0], bg[1], bg[2], bg[3]]);
-        assert!(glyph_opaque, "the rasterised glyph must paint visible pixels");
+        assert!(
+            glyph_opaque,
+            "the rasterised glyph must paint visible pixels"
+        );
     }
 
     #[test]
