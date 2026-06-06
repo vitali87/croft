@@ -11,7 +11,8 @@ use lsp_types::{
     CompletionItemKindCapability, CompletionResponse, DeclarationCapability,
     DocumentChangeOperation, DocumentChanges, GotoDefinitionResponse, HoverContents,
     HoverProviderCapability, ImplementationProviderCapability, Location, MarkedString, MarkupKind,
-    OneOf, Position, SemanticTokenModifier, SemanticTokenType, SemanticTokensClientCapabilities,
+    OneOf, Position, PublishDiagnosticsClientCapabilities, SemanticTokenModifier, SemanticTokenType,
+    SemanticTokensClientCapabilities,
     SemanticTokensClientCapabilitiesRequests, SemanticTokensFullOptions, SemanticTokensRangeResult,
     SemanticTokensResult, SemanticTokensServerCapabilities,
     SemanticTokensWorkspaceClientCapabilities, ServerCapabilities, TextDocumentClientCapabilities,
@@ -2050,6 +2051,14 @@ fn build_client_capabilities() -> ClientCapabilities {
                 // highlighting (VS Code / Zed "combined" model), so it may
                 // omit tokens that already match syntax.
                 augments_syntax_tokens: Some(true),
+                ..Default::default()
+            }),
+            // Declare push-diagnostics support. Several servers gate
+            // `textDocument/publishDiagnostics` on the client advertising this
+            // (ty and ruff push regardless, but vtsls stays silent without it);
+            // declaring it is what every real LSP client (VS Code, Neovim) does.
+            publish_diagnostics: Some(PublishDiagnosticsClientCapabilities {
+                related_information: Some(true),
                 ..Default::default()
             }),
             ..Default::default()
