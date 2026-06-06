@@ -14,13 +14,14 @@
 
 use ratatui::style::Color;
 
-/// The active IDE color theme. `DarkBlue` is the historical default so a
-/// fresh install (and every test that hard-codes `1e222e`) keeps its look.
+/// The active IDE color theme. `Black` (`#000000`) is the default so a fresh
+/// install opens on the OLED-friendly background; `DarkBlue` (`#1e222e`) is the
+/// historical look, still selectable from the gear menu's theme picker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Theme {
     #[default]
-    DarkBlue,
     Black,
+    DarkBlue,
 }
 
 impl Theme {
@@ -57,8 +58,8 @@ impl Theme {
     /// anything unrecognized (forward/backward-compatible prefs).
     pub fn from_id(id: &str) -> Self {
         match id {
-            "black" => Theme::Black,
-            _ => Theme::DarkBlue,
+            "dark-blue" => Theme::DarkBlue,
+            _ => Theme::default(),
         }
     }
 
@@ -98,7 +99,7 @@ mod tests {
     }
 
     #[test]
-    fn default_is_dark_blue() {
-        assert_eq!(Theme::default(), Theme::DarkBlue);
+    fn default_is_black() {
+        assert_eq!(Theme::default(), Theme::Black);
     }
 }

@@ -6325,16 +6325,16 @@ fn clicking_the_gear_opens_the_color_theme_menu_then_the_picker() {
 }
 
 #[test]
-fn selecting_the_black_theme_switches_the_active_theme() {
+fn applying_a_theme_switches_the_active_theme_and_arms_a_repaint() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     assert_eq!(
         app.theme,
-        crate::theme::Theme::DarkBlue,
-        "default is dark blue"
+        crate::theme::Theme::Black,
+        "fresh install defaults to the black theme"
     );
-    app.apply_theme(crate::theme::Theme::Black);
-    assert_eq!(app.theme, crate::theme::Theme::Black);
+    app.apply_theme(crate::theme::Theme::DarkBlue);
+    assert_eq!(app.theme, crate::theme::Theme::DarkBlue);
     // A theme switch arms a one-shot clear so iTerm2 evicts the stale-bg
     // image layer and the whole screen repaints on the new background.
     assert!(app.consume_activity_image_clear());

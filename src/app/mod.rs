@@ -1448,7 +1448,15 @@ impl App {
             workspace_root: root.clone(),
             sidebar_view: SidebarView::Explorer,
             sidebar_areas: SidebarAreas::default(),
-            theme: crate::prefs::Prefs::load_or_default().theme(),
+            // Read the persisted theme from the real config only outside tests;
+            // under test fall back to the default so the suite stays hermetic
+            // and never depends on (nor mutates) the developer's ~/.config. This
+            // mirrors the cfg!(test) write-skip in `apply_theme`.
+            theme: if cfg!(test) {
+                crate::theme::Theme::default()
+            } else {
+                crate::prefs::Prefs::load_or_default().theme()
+            },
             focus: Pane::Tree,
             show_tree: true,
             show_terminal: true,
