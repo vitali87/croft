@@ -21,6 +21,7 @@ The non-negotiables that shape every decision in croft:
 ## Layout
 
 * **Left pane (sidebar):** Explorer with multi-select, cut / copy / paste, drag and drop file moves, and VS Code style icons (Codicons / Devicons / Seti). Two more sidebar views switch in via the activity bar: full-text Search and a Remote (SSH) explorer.
+* **Activity bar:** the icon strip down the far left. View icons (Explorer, Search, Source Control, Remote, Run and Debug) stack from the top; a settings gear sits at the bottom (VS Code's "Manage" button). Clicking the gear opens a menu with **Color Theme**, a picker that switches between the **Croft Dark (Blue)** (`#1e222e`) and **Croft Black** (`#000000`) themes. The choice persists across launches in `~/.config/croft/config.json`.
 * **Top right pane (editor):** code editor with `tree-sitter` syntax highlighting, enriched by an LSP semantic-token overlay (Zed's "combined" model: the language server repaints resolved symbols, so a function parameter keeps its color everywhere it is used, not just at the declaration, with tree-sitter as the instant base and fallback; on open the visible rows are coloured first via a fast `semanticTokens/range` request while the whole-document set fills in behind it, an empty first reply from a just-spawned server is retried so colour never stalls, and when a server upgrades its analysis and asks to re-pull via `workspace/semanticTokens/refresh` — as rust-analyzer does once its crate-graph analysis resolves the richer type-aware tokens — croft honours it and re-requests the visible editors), plus inline preview tabs for PNG / JPEG / GIF / BMP / WebP, PDFs (with page navigation), and CSV / TSV / XLSX / XLS / ODS spreadsheets. Splits into two side-by-side columns with `Cmd`+`\` to view files together, each column with its own tabs and cursor (images and PDFs render inline in both). An optional native modal (vim) editing mode toggles on with `Cmd`+`E`.
 * **Bottom right pane (terminal):** a real interactive shell, your `$SHELL` running on a real PTY.
 * All three panes resize by dragging the seams between them, including the seam between the two editor columns when the editor is split.
@@ -35,7 +36,7 @@ Built on [ratatui](https://ratatui.rs/) + [crossterm](https://github.com/crosste
 | Rust 1.85+ stable | To compile the binary (the crate uses edition 2024, stabilized in Rust 1.85). |
 | A Nerd Font as your terminal font | The file explorer icons are Private Use Area glyphs (Codicons, Devicons, Seti). Without a Nerd Font, icons render as `[?]` boxes. |
 | A 256 color or truecolor terminal | macOS Terminal.app, iTerm2, Alacritty, kitty, WezTerm, Ghostty all qualify. |
-| iTerm2, WezTerm, Ghostty, kitty, or Termux (optional) | Required for inline image / PDF / sheet preview rendering via OSC 1337. Termux's terminal implements the same OSC 1337 protocol, so icons and previews render there automatically (it sets no `TERM_PROGRAM`, so croft detects it via `TERMUX_VERSION` / the `com.termux` prefix). Other terminals fall back to a metadata header line so the feature is still informative. |
+| iTerm2, WezTerm, Ghostty, or kitty (optional) | Required for inline image / PDF / sheet preview rendering via OSC 1337. Other terminals (including Termux) fall back to a metadata header line so the feature is still informative. If you run a Termux build that supports the iTerm2 OSC 1337 protocol, opt in with `CROFT_FORCE_INLINE_IMAGES=1`. |
 | `pdftoppm` from poppler-utils (optional) | Multi-page PDF preview. Install with `brew install poppler` (macOS) or `apt install poppler-utils` (Linux). Without it, croft falls back to macOS `sips` for page 1 only. |
 | Node.js + npm (optional) | TypeScript / JavaScript LSP. croft auto-installs the `vtsls` server into `~/.croft/servers` the first time you open a `.ts`/`.tsx`/`.js` file. It finds `node` even when a version manager keeps it off croft's PATH: first by reading the on-disk layout directly (highest nvm `versions/node`, Volta, Homebrew, `/usr/local`), and as a universal fallback by asking your login shell where `node` resolves — run in a detached session (`setsid`) so it can never touch croft's terminal. That covers nvm / fnm / asdf / volta / custom setups, for both the install and running the server. Other language servers (`basedpyright`, `ruff`, `ty`, `rust-analyzer`, `gopls`) are used from your PATH if present. Each server is anchored at the file's own project root (the nearest ancestor with a `pyproject.toml` / `Cargo.toml` / `go.mod` / `package.json`, etc.), not croft's workspace root, so in a monorepo every sub-project's `.venv` and imports resolve correctly. croft runs one server instance per (language, project root), mirroring Zed. |
 
@@ -118,6 +119,7 @@ croft setup-terminal --help
 | `Ctrl+Shift+r` / `Cmd+Shift+r` | Jump to Remote (SSH) |
 | `Ctrl+Shift+l` / `Cmd+Shift+l` | While connected to a remote, disconnect and drop back into the local croft at the directory you connected from (`Ctrl+q` still fully exits) |
 | Click activity-bar icons (left edge) | Switch between Explorer, Search, Source Control, Run-Debug, and Remote sidebar views |
+| Click the settings gear (bottom of the activity bar) | Open the settings menu → **Color Theme** picker to switch between the Croft Dark (Blue) and Croft Black themes |
 | Drag the vertical seam between sidebar and editor | Resize the sidebar |
 | Drag the vertical seam between the two editor columns (when split) | Rebalance the side-by-side split |
 | Drag the horizontal seam between editor and terminal | Resize the terminal pane |
@@ -341,10 +343,11 @@ Other terminals (kitty, Ghostty, WezTerm, Alacritty) deliver Cmd over the kitty 
 
 ## Termux / Android
 
-croft installs and runs as a native Android binary inside [Termux](https://termux.dev) (`cargo install --git https://codeberg.org/vitali87/croft.git`). Two things work differently from the desktop, and both are automatic, no setup command:
+croft installs and runs as a native Android binary inside [Termux](https://termux.dev) (`cargo install --git https://codeberg.org/vitali87/croft.git`). One thing works differently from the desktop, and it is automatic, no setup command:
 
-- **Icons and inline previews.** Termux's terminal implements the iTerm2 OSC 1337 inline-image protocol, so the activity-bar icons, welcome wordmark, and image / PDF / spreadsheet previews all render. Termux sets no `TERM_PROGRAM`, so croft recognises it from the `TERMUX_VERSION` and `com.termux`-prefixed `PREFIX` it exports, and routes to the OSC 1337 path it already uses for iTerm2.
 - **The command key.** Android has no Cmd key, so on Termux **`Ctrl` is the command modifier** (VS Code's Linux convention). Every Cmd chord in the tables above is reachable as the same chord with `Ctrl`: `Ctrl+P` quick-open, `Ctrl+\` split editor, `Ctrl+T` new terminal, `Ctrl+]` / `Ctrl+[` cycle terminals, `Ctrl+Opt+←` / `Ctrl+Opt+→` move editor-group focus, and so on. One consequence of full `Ctrl` parity: `Ctrl+\` opens the editor split instead of sending `SIGQUIT` to the shell.
+
+Inline image / PDF / spreadsheet previews and the activity-bar icons do **not** render on mainline Termux: its terminal does not implement the iTerm2 OSC 1337 inline-image protocol (the [termux-app PR](https://github.com/termux/termux-app/pull/2973) adding it is still unmerged), so croft falls back to the metadata-header line instead of emitting OSC 1337, which mainline Termux would print as raw base64 text. If you run a Termux build that does support OSC 1337, set `CROFT_FORCE_INLINE_IMAGES=1` to enable previews.
 
 ## How the embedded terminal works
 
@@ -366,13 +369,15 @@ src/
 ├── icons.rs             Codicon / Devicon / Seti glyphs and per-language colors
 ├── install_session.rs   streams install-progress events while a remote host builds / installs the croft binary
 ├── iterm2.rs            iTerm2 plist mutation helpers for fonts and Croft key mappings
-├── iterm2_inline.rs     OSC 1337 inline-image baking pipeline (welcome wordmark, image / PDF preview, activity-bar icons, SSH empty-state hero)
+├── iterm2_inline.rs     OSC 1337 inline-image baking pipeline (welcome wordmark, image / PDF preview, activity-bar icons incl. the settings gear, SSH empty-state hero)
 ├── pdf.rs               PDF rasteriser: prefers pdftoppm (poppler), falls back to macOS sips
+├── prefs.rs             durable user preferences (color theme) persisted at ~/.config/croft/config.json
 ├── remote.rs            remote (SSH) target metadata and launch dispatch
 ├── remote_connect.rs    interactive SSH connect flow (host + password prompt phases) behind the connect dialog
 ├── session_state.rs     captures open tabs / layout so a self-update re-exec can restore them
 ├── sheet.rs             CSV / TSV / XLSX / XLS / XLSB / ODS parsing via the csv and calamine crates
 ├── sysmon.rs            system-metrics sampler loop (CPU / memory / network / disk / temp)
+├── theme.rs             IDE color theme (Croft Dark / Croft Black): the background palette driving SetColors + baked-image fills
 ├── update_watch.rs      remote self-update: watch for a newer binary installed under a running remote croft
 ├── vim.rs               native modal (vim-style) editing: a pure key state machine (modes, counts, operators, text objects, f/t, search, ex-commands) that emits editing intents the app applies; toggled with Cmd+E
 ├── zoxide.rs            zoxide integration: strict query + typo-tolerant fuzzy fallback (Damerau-Levenshtein) + cross-platform ensure-install backing the Cmd+Z jump popup

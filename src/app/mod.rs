@@ -66,12 +66,6 @@ pub enum SidebarView {
 
 const ACTIVITY_BAR_WIDTH: u16 = 4;
 
-/// Single source of truth for the editor pane background. Used both as
-/// ratatui's bg style and as the alpha-blend target behind the welcome
-/// half-block raster, so the wordmark seamlessly merges with the pane.
-/// When the IDE later supports themes, swap this for a lookup against the
-/// active theme and the welcome grid will re-bake on the next render.
-const EDITOR_BG_RGB: (u8, u8, u8) = (0x1e, 0x22, 0x2e);
 const ACTIVITY_ICON_HEIGHT: u16 = 2;
 const ACTIVITY_ICON_GAP: u16 = 0;
 const FALLBACK_CELL_PIXEL: (u32, u32) = (10, 20);
@@ -145,6 +139,25 @@ fn activity_run_debug_block(bar: Rect) -> Rect {
     }
 }
 
+/// The settings gear, anchored to the BOTTOM of the activity bar (VS Code's
+/// "Manage" gear), asymmetric to the view icons stacked from the top. Returns
+/// an empty rect when the bar is too short to fit the gear below the last view
+/// icon, so the caller skips rendering and hit-testing it rather than letting
+/// it collide with Run-and-Debug on a tiny terminal.
+fn activity_settings_block(bar: Rect) -> Rect {
+    let y = bar.y + bar.height.saturating_sub(ACTIVITY_ICON_HEIGHT);
+    let last_view_bottom = activity_remote_y(bar) + ACTIVITY_ICON_HEIGHT;
+    if y < last_view_bottom {
+        return Rect::default();
+    }
+    Rect {
+        x: bar.x,
+        y,
+        width: bar.width,
+        height: ACTIVITY_ICON_HEIGHT,
+    }
+}
+
 #[derive(Default, Clone, Copy)]
 struct SidebarAreas {
     /// Block occupied by the Explorer activity-bar icon, in absolute coords.
@@ -159,6 +172,10 @@ struct SidebarAreas {
     remote_icon: Rect,
     /// Block occupied by the Run and Debug activity-bar icon, in absolute coords.
     run_debug_icon: Rect,
+    /// Block occupied by the settings gear, bottom-anchored on the activity
+    /// bar (VS Code's "Manage" button). Asymmetric to the view icons up top;
+    /// clicking it opens the settings menu (Color Theme picker).
+    settings_icon: Rect,
 }
 
 /// Pre-encoded iTerm2 OSC-1337 inline-image escape sequences for each icon
@@ -176,6 +193,10 @@ pub struct ActivityBarImages {
     remote_inactive: String,
     run_debug_active: String,
     run_debug_inactive: String,
+    /// The settings gear. `active` is shown while its menu is open so the
+    /// button reads as pressed, mirroring the view icons' selected state.
+    settings_active: String,
+    settings_inactive: String,
 }
 
 /// Single source of truth for the application's user-facing name.
@@ -383,6 +404,12 @@ enum MenuAction {
         line: u32,
         col: u32,
     },
+    /// Settings gear → "Color Theme": replace the gear menu with the theme
+    /// picker (the list of themes with a check on the active one).
+    OpenThemePicker,
+    /// Theme picker entry: switch the IDE color theme to `theme`, persist it,
+    /// re-emit the session background, and re-bake the icon images.
+    SetTheme(crate::theme::Theme),
 }
 
 /// Return the macOS-style keyboard shortcut hint to display on the right
@@ -750,6 +777,11 @@ pub struct App {
     workspace_root: PathBuf,
     sidebar_view: SidebarView,
     sidebar_areas: SidebarAreas,
+    /// Active IDE color theme. Drives every explicit-background surface
+    /// (baked icon PNGs, editor image/sheet/diff canvases, the `SetColors`
+    /// session fill); `Color::Reset` surfaces follow the session bg for free.
+    /// Toggled from the activity-bar gear menu; persisted via `crate::prefs`.
+    theme: crate::theme::Theme,
     focus: Pane,
     show_tree: bool,
     show_terminal: bool,
@@ -1416,6 +1448,7 @@ impl App {
             workspace_root: root.clone(),
             sidebar_view: SidebarView::Explorer,
             sidebar_areas: SidebarAreas::default(),
+            theme: crate::prefs::Prefs::load_or_default().theme(),
             focus: Pane::Tree,
             show_tree: true,
             show_terminal: true,
@@ -1528,6 +1561,14 @@ impl App {
     /// SSH PTYs often report only rows/columns and leave pixel dimensions
     /// as zero, so fall back to a sane 10×20 cell estimate; OSC-1337 still
     /// scales the image to the requested cell rectangle.
+    /// The active theme's background as a fully-opaque image pixel. Used to
+    /// fill the OSC-1337 icon/hero canvases so the baked PNGs sit on the same
+    /// color as the surrounding (session-bg) panes, with no visible seam.
+    fn theme_bg_pixel(&self) -> image::Rgba<u8> {
+        let (r, g, b) = self.theme.editor_bg_rgb();
+        image::Rgba([r, g, b, 0xff])
+    }
+
     pub fn init_graphics(&mut self) {
         if !crate::iterm2_inline::detect_iterm2_inline_support() {
             return;
@@ -1556,7 +1597,7 @@ impl App {
         let is_tmux = crate::iterm2_inline::detect_tmux();
         let w_cells = ACTIVITY_BAR_WIDTH;
         let h_cells = ACTIVITY_ICON_HEIGHT;
-        let icon_bg = image::Rgba([EDITOR_BG_RGB.0, EDITOR_BG_RGB.1, EDITOR_BG_RGB.2, 0xff]);
+        let icon_bg = self.theme_bg_pixel();
         let encode = |src: &[u8], is_active: bool| -> Option<String> {
             let baked =
                 crate::iterm2_inline::compose_icon(src, canvas_w, canvas_h, is_active, icon_bg)
@@ -1582,6 +1623,8 @@ impl App {
         let remote_inactive = encode(crate::iterm2_inline::REMOTE_SRC_PNG, false);
         let run_debug_active = encode(crate::iterm2_inline::RUN_DEBUG_SRC_PNG, true);
         let run_debug_inactive = encode(crate::iterm2_inline::RUN_DEBUG_SRC_PNG, false);
+        let settings_active = encode(crate::iterm2_inline::SETTINGS_GEAR_SRC_PNG, true);
+        let settings_inactive = encode(crate::iterm2_inline::SETTINGS_GEAR_SRC_PNG, false);
         if let (
             Some(ea),
             Some(ei),
@@ -1593,6 +1636,8 @@ impl App {
             Some(ri),
             Some(rda),
             Some(rdi),
+            Some(gea),
+            Some(gei),
         ) = (
             explorer_active,
             explorer_inactive,
@@ -1604,6 +1649,8 @@ impl App {
             remote_inactive,
             run_debug_active,
             run_debug_inactive,
+            settings_active,
+            settings_inactive,
         ) {
             self.overlays.activity.set_images(ActivityBarImages {
                 explorer_active: ea,
@@ -1616,6 +1663,8 @@ impl App {
                 remote_inactive: ri,
                 run_debug_active: rda,
                 run_debug_inactive: rdi,
+                settings_active: gea,
+                settings_inactive: gei,
             });
         }
         // Codeberg badge for the welcome panel: 2 cells wide, 1 cell tall,
@@ -1800,7 +1849,7 @@ impl App {
         if !self.overlays.hero.layout_matches(&desired) || !self.overlays.hero.has_image() {
             let canvas_w = (hero.width as u32) * cw;
             let canvas_h = (hero.height as u32) * ch;
-            let bg = image::Rgba([EDITOR_BG_RGB.0, EDITOR_BG_RGB.1, EDITOR_BG_RGB.2, 0xff]);
+            let bg = self.theme_bg_pixel();
             if let Ok(baked) = crate::iterm2_inline::fit_image(
                 crate::iterm2_inline::NO_REPO_HERO_PNG,
                 canvas_w,
@@ -1967,6 +2016,14 @@ impl App {
         } else {
             &images.run_debug_inactive
         };
+        // The gear is bottom-anchored and may be absent on a short bar
+        // (empty block). It reads "active" while its menu/picker is open.
+        let set_block = self.sidebar_areas.settings_icon;
+        let set_state = if self.settings_menu_active() {
+            &images.settings_active
+        } else {
+            &images.settings_inactive
+        };
         // The shortcuts modal and file finder are centered over the editor
         // column, not the far-left activity bar, so the icons stay visible
         // beside them. Suppress an icon only when its block actually
@@ -1984,17 +2041,36 @@ impl App {
                 .flatten()
                 .all(|panel| !block.intersects(*panel))
         };
-        [
+        let mut blocks = vec![
             (exp_block, exp_state.as_str()),
             (sea_block, sea_state.as_str()),
             (scm_block, scm_state.as_str()),
             (rem_block, rem_state.as_str()),
             (rdb_block, rdb_state.as_str()),
-        ]
-        .into_iter()
-        .filter(|(block, _)| visible(*block))
-        .map(|(block, state)| ((block.x, block.y), state))
-        .collect()
+        ];
+        if set_block.width > 0 {
+            blocks.push((set_block, set_state.as_str()));
+        }
+        blocks
+            .into_iter()
+            .filter(|(block, _)| visible(*block))
+            .map(|(block, state)| ((block.x, block.y), state))
+            .collect()
+    }
+
+    /// True while the activity-bar gear's menu or theme picker is open, so the
+    /// gear renders in its pressed/active state. Derived from the live context
+    /// menu's actions rather than a separate flag that could drift out of sync
+    /// with the many places the menu is dismissed.
+    fn settings_menu_active(&self) -> bool {
+        self.context_menu.as_ref().is_some_and(|menu| {
+            menu.items.iter().any(|(_, action)| {
+                matches!(
+                    action,
+                    MenuAction::OpenThemePicker | MenuAction::SetTheme(_)
+                )
+            })
+        })
     }
 
     /// Post-draw flush of the activity-bar icons. Re-emits the pre-encoded
@@ -2990,6 +3066,91 @@ impl App {
         });
     }
 
+    /// Anchor a `ContextMenu` at the activity-bar gear. `menu_rect` clamps it
+    /// onto the screen, so a bottom-anchored gear pops the menu upward — the
+    /// same direction VS Code's "Manage" menu opens.
+    fn settings_menu_origin(&self) -> (u16, u16) {
+        let gear = self.sidebar_areas.settings_icon;
+        (gear.x + gear.width, gear.y)
+    }
+
+    /// Open the activity-bar gear's settings menu (VS Code's "Manage" menu).
+    /// Currently one entry — Color Theme — which opens the theme picker; more
+    /// settings entries slot in here later.
+    fn open_settings_menu(&mut self) {
+        let origin = self.settings_menu_origin();
+        self.context_menu = Some(ContextMenu {
+            origin,
+            items: vec![(String::from("Color Theme"), MenuAction::OpenThemePicker)],
+            selected: 0,
+            target_dir: self.workspace_root.clone(),
+        });
+        // The gear renders "active" while its menu is open; re-emit it so the
+        // pressed-state PNG replaces the idle one.
+        self.overlays.activity.mark_dirty();
+    }
+
+    /// Replace the gear menu with the Color Theme picker: one row per theme,
+    /// a check on the active one. Selecting a row switches + persists it.
+    fn open_theme_picker(&mut self) {
+        let origin = self.settings_menu_origin();
+        let active = self.theme;
+        let items: Vec<(String, MenuAction)> = crate::theme::Theme::ALL
+            .iter()
+            .map(|&t| {
+                let mark = if t == active { "✔ " } else { "  " };
+                (format!("{mark}{}", t.label()), MenuAction::SetTheme(t))
+            })
+            .collect();
+        let selected = crate::theme::Theme::ALL
+            .iter()
+            .position(|&t| t == active)
+            .unwrap_or(0);
+        self.context_menu = Some(ContextMenu {
+            origin,
+            items,
+            selected,
+            target_dir: self.workspace_root.clone(),
+        });
+        self.overlays.activity.mark_dirty();
+    }
+
+    /// Switch the IDE color theme: persist it, repaint the iTerm2 session
+    /// background (so every `Color::Reset` surface follows), re-bake the
+    /// OSC-1337 icon PNGs against the new background, and drop the lazily-baked
+    /// image overlays + arm a full clear so nothing ghosts the old background.
+    fn apply_theme(&mut self, theme: crate::theme::Theme) {
+        self.theme = theme;
+        // Persistence is best-effort: a write failure never blocks the
+        // in-session switch, which has already taken effect above. Skipped
+        // under test so the suite never clobbers the developer's real config.
+        if !cfg!(test) {
+            let _ = crate::prefs::save_theme(theme);
+        }
+        if !cfg!(test) && crate::iterm2_inline::detect_iterm2_inline_support() {
+            use std::io::Write;
+            let mut out = stdout();
+            let _ = out.write_all(set_session_bg_srgb_seq(theme.editor_bg_rgb()).as_bytes());
+            let _ = out.flush();
+        }
+        // Re-bake the fixed icon/badge/run-debug PNGs against the new bg.
+        self.init_graphics();
+        // The welcome wordmark, no-repo hero, SSH empty state, and editor
+        // image previews are baked lazily and keyed on layout, not theme —
+        // drop them so the next render re-bakes them on the new background.
+        self.overlays.welcome.disable();
+        self.overlays.hero.disable();
+        self.overlays.ssh.disable();
+        self.overlays.editor[0].disable();
+        self.overlays.editor[1].disable();
+        // Evict the stale activity-icon image layer and force a full repaint
+        // (the clear latch the main loop folds into `terminal.clear()`), so
+        // every cell — SGR and image alike — repaints on the new background.
+        self.overlays.activity.mark_dirty();
+        self.overlays.activity.request_clear();
+        self.status = format!("Color Theme: {}", theme.label());
+    }
+
     fn open_at(&mut self, path: &Path, row: usize, col: usize) -> Result<()> {
         self.hover_popup = None;
         self.hover_diagnostic = None;
@@ -3478,11 +3639,7 @@ impl App {
         let bg = if crate::iterm2_inline::detect_iterm2_inline_support() {
             Style::default().bg(Color::Reset)
         } else {
-            Style::default().bg(Color::Rgb(
-                EDITOR_BG_RGB.0,
-                EDITOR_BG_RGB.1,
-                EDITOR_BG_RGB.2,
-            ))
+            Style::default().bg(self.theme.editor_bg())
         };
         // Paint a full bordered box around the welcome area so the editor
         // pane has the same visible envelope as when a file is open
@@ -3573,7 +3730,7 @@ impl App {
             if let Some((cw, ch)) = self.cell_pixel {
                 let canvas_w = (logo_w_cells as u32) * cw;
                 let canvas_h = (logo_h_cells as u32) * ch;
-                let bg = image::Rgba([EDITOR_BG_RGB.0, EDITOR_BG_RGB.1, EDITOR_BG_RGB.2, 0xff]);
+                let bg = self.theme_bg_pixel();
                 if let Ok(baked) = crate::iterm2_inline::fit_image(
                     crate::iterm2_inline::WELCOME_LOGO_PNG,
                     canvas_w,
@@ -3827,11 +3984,7 @@ impl App {
         let bg = if self.overlays.activity.has_images() {
             Style::default().bg(Color::Reset)
         } else {
-            Style::default().bg(Color::Rgb(
-                EDITOR_BG_RGB.0,
-                EDITOR_BG_RGB.1,
-                EDITOR_BG_RGB.2,
-            ))
+            Style::default().bg(self.theme.editor_bg())
         };
         // In images mode the icon PNG owns the entire activity-bar block —
         // background, codicon, and active pill are baked in. Rendering a bg
@@ -3849,11 +4002,13 @@ impl App {
         let source_control_block = activity_source_control_block(area);
         let remote_block = activity_remote_block(area);
         let run_debug_block = activity_run_debug_block(area);
+        let settings_block = activity_settings_block(area);
         let explorer_active = self.sidebar_view == SidebarView::Explorer;
         let search_active = self.sidebar_view == SidebarView::Search;
         let source_control_active = self.sidebar_view == SidebarView::SourceControl;
         let remote_active = self.sidebar_view == SidebarView::Remote;
         let run_debug_active = self.sidebar_view == SidebarView::RunDebug;
+        let settings_active = self.settings_menu_active();
 
         let active_color = Color::White;
         let inactive_color = Color::Rgb(0x6c, 0x7d, 0x9c);
@@ -3931,6 +4086,14 @@ impl App {
                 crate::icons::ACTIVITY_RUN_DEBUG,
                 run_debug_active,
             );
+            if settings_block.width > 0 {
+                render_glyph(
+                    frame,
+                    settings_block,
+                    crate::icons::ACTIVITY_SETTINGS,
+                    settings_active,
+                );
+            }
         }
 
         self.sidebar_areas.explorer_icon = explorer_block;
@@ -3938,6 +4101,7 @@ impl App {
         self.sidebar_areas.source_control_icon = source_control_block;
         self.sidebar_areas.remote_icon = remote_block;
         self.sidebar_areas.run_debug_icon = run_debug_block;
+        self.sidebar_areas.settings_icon = settings_block;
     }
 
     fn set_sidebar_view(&mut self, view: SidebarView) {
@@ -9588,6 +9752,10 @@ impl App {
                     self.set_sidebar_view(SidebarView::RunDebug);
                     return;
                 }
+                if rect_contains(self.sidebar_areas.settings_icon, m.column, m.row) {
+                    self.open_settings_menu();
+                    return;
+                }
                 if in_editor_pane
                     && self.editor.is_blank_initial()
                     && self.activate_welcome_link(m.column, m.row)
@@ -10628,6 +10796,8 @@ impl App {
             MenuAction::GoToLocation { path, line, col } => {
                 self.go_to_definition(path, line, col);
             }
+            MenuAction::OpenThemePicker => self.open_theme_picker(),
+            MenuAction::SetTheme(theme) => self.apply_theme(theme),
         }
     }
 
@@ -10748,7 +10918,7 @@ impl App {
         self.overlays.editor[side].request_clear_if_displayed();
         let canvas_w = cell_w as u32 * cw_px;
         let canvas_h = cell_h as u32 * ch_px;
-        let bg = image::Rgba([EDITOR_BG_RGB.0, EDITOR_BG_RGB.1, EDITOR_BG_RGB.2, 0xff]);
+        let bg = self.theme_bg_pixel();
         // Borrow the image bytes from the group on this side directly (a
         // disjoint-field borrow from `self.overlays`); the borrow ends at
         // the last use inside the bake, before we store into the slot.
@@ -13202,7 +13372,8 @@ pub fn run(root: PathBuf, restore_session: Option<PathBuf>) -> Result<()> {
         // surrounding pane bg pixel-for-pixel
         // (https://gitlab.com/gnachman/iterm2/-/issues/12529).
         if crate::iterm2_inline::detect_iterm2_inline_support() {
-            out.write_all(set_session_bg_srgb_seq(EDITOR_BG_RGB).as_bytes())
+            let theme = crate::prefs::Prefs::load_or_default().theme();
+            out.write_all(set_session_bg_srgb_seq(theme.editor_bg_rgb()).as_bytes())
                 .ok();
         }
         out.flush().ok();
