@@ -1,6 +1,6 @@
 [package]
 name = "croft"
-version = "0.1.322"
+version = "0.1.323"
 edition = "2024"
 description = "VSCode-style TUI written in Rust"
 license = "MIT"
@@ -70,6 +70,13 @@ notify-debouncer-full = "0.7"
 base64 = "0.22"
 regex = "1.12"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp", "webp"] }
+# SVG rasteriser for the activity-bar codicons. Rendered once at startup at the
+# exact icon pixel size, so the glyphs stay crisp at any cell size and we never
+# ship (or decode) a heavyweight raster source for a 4×2-cell icon. resvg
+# re-exports `usvg` and `tiny_skia`, so it is the only direct dep needed.
+# default-features = false drops text/system-font/raster-image support: the
+# codicons are pure `<path>` glyphs, so this trims fontdb/rustybuzz entirely.
+resvg = { version = "0.47", default-features = false }
 ureq = { version = "2", default-features = false, features = ["tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

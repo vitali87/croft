@@ -1,26 +1,25 @@
 use base64::Engine;
 use image::{ImageBuffer, Rgba, RgbaImage};
 
-pub const EXPLORER_SRC_PNG: &[u8] = include_bytes!("../assets/icons/explorer_src.png");
-pub const SEARCH_SRC_PNG: &[u8] = include_bytes!("../assets/icons/search_src.png");
-pub const REMOTE_SRC_PNG: &[u8] = include_bytes!("../assets/icons/remote_src.png");
+// Activity-bar codicons, kept as their upstream `microsoft/vscode-codicons`
+// SVG sources and rasterised at the exact icon pixel size in `compose_icon_svg`
+// (see `App::init_graphics`). Shipping the vector source rather than a 192×192
+// raster keeps the glyphs crisp at any cell size and avoids decoding a
+// heavyweight PNG for a 4×2-cell icon (the Source Control icon previously
+// reused the 2.18 MB no-repo illustration, which dominated cold-start time).
+pub const EXPLORER_SRC_SVG: &[u8] = include_bytes!("../assets/icons/files.svg");
+pub const SEARCH_SRC_SVG: &[u8] = include_bytes!("../assets/icons/search.svg");
+pub const SOURCE_CONTROL_SRC_SVG: &[u8] = include_bytes!("../assets/icons/source-control.svg");
+pub const REMOTE_SRC_SVG: &[u8] = include_bytes!("../assets/icons/remote-explorer.svg");
+/// Codicon `debug-alt` (bug + play triangle), the Run and Debug activity icon.
+pub const RUN_DEBUG_SRC_SVG: &[u8] = include_bytes!("../assets/icons/debug-alt.svg");
+/// Codicon `gear`, the bottom-anchored "Manage" button (Color Theme picker).
+pub const SETTINGS_GEAR_SRC_SVG: &[u8] = include_bytes!("../assets/icons/settings_gear.svg");
 pub const CODEBERG_SRC_PNG: &[u8] = include_bytes!("../assets/icons/codeberg_src.png");
-/// 192x192 white-on-transparent rasterisation of `assets/icons/debug-alt.svg`,
-/// the upstream codicon `debug-alt` glyph (bug + play triangle). Rendered
-/// once with `rsvg-convert -w 192 -h 192 -b transparent`; the resulting PNG
-/// is committed alongside the SVG so cargo builds don't need rsvg-convert
-/// installed. Hand-drawing the same shape from primitives loses too much
-/// detail under the activity-bar's downsample (the bug stops reading as a
-/// bug at ~30px); the SVG render keeps the silhouette legible at every
-/// cell-size croft is likely to see.
+/// 192x192 white-on-transparent rasterisation of `assets/icons/debug-alt.svg`.
+/// Still drives the Run and Debug panel's headline illustration (composed via
+/// the PNG path); the activity-bar icon now rasterises the SVG directly.
 pub const RUN_DEBUG_SRC_PNG: &[u8] = include_bytes!("../assets/icons/run_debug_src.png");
-/// 192x192 white-on-transparent rasterisation of `assets/icons/settings_gear.svg`,
-/// the upstream codicon `gear` glyph. Drives the bottom-anchored "Manage"
-/// button on the activity bar (VS Code's gear), which opens the settings
-/// menu — currently just the Color Theme picker. Rendered once with
-/// `rsvg-convert -w 192 -h 192`; the PNG is committed beside the SVG so
-/// builds don't require rsvg-convert.
-pub const SETTINGS_GEAR_SRC_PNG: &[u8] = include_bytes!("../assets/icons/settings_gear_src.png");
 pub const WELCOME_LOGO_PNG: &[u8] = include_bytes!("../assets/logo-tight-removebg-preview.png");
 /// Hero illustration shown in the Source Control sidebar when the
 /// workspace isn't a git repo: a stylised file silhouette with the Git
@@ -63,19 +62,8 @@ pub fn compose_icon(
 ) -> Result<Vec<u8>, image::ImageError> {
     let codicon =
         image::load_from_memory_with_format(src_codicon_png, image::ImageFormat::Png)?.to_rgba8();
-    let target_max = (canvas_w.min(canvas_h).saturating_sub(4) * 9 / 10).max(8);
     let (src_w, src_h) = (codicon.width().max(1), codicon.height().max(1));
-    let (icon_w, icon_h) = if src_w <= src_h {
-        let scaled_h = ((target_max * src_h) / src_w).max(1);
-        let capped_h = scaled_h.min(canvas_h.saturating_sub(2).max(1));
-        let final_w = ((capped_h * src_w) / src_h).max(1);
-        (final_w, capped_h)
-    } else {
-        let scaled_w = ((target_max * src_w) / src_h).max(1);
-        let capped_w = scaled_w.min(canvas_w.saturating_sub(2).max(1));
-        let final_h = ((capped_w * src_h) / src_w).max(1);
-        (capped_w, final_h)
-    };
+    let (icon_w, icon_h) = fit_icon_dims(canvas_w, canvas_h, src_w, src_h);
     let scaled = image::imageops::resize(
         &codicon,
         icon_w,
@@ -88,6 +76,90 @@ pub fn compose_icon(
         INACTIVE_TINT
     };
     let tinted = tint_rgba(&scaled, tint);
+    Ok(finish_icon(
+        &tinted, canvas_w, canvas_h, is_active, bg, off_y_bias,
+    ))
+}
+
+/// Like [`compose_icon`], but rasterises an SVG codicon directly at the target
+/// icon pixel size instead of decoding-then-downscaling a raster source. The
+/// glyph is rendered crisp at the exact cell size, tinted, and composed onto
+/// the bar-bg canvas identically to the raster path. Returns `None` if the SVG
+/// fails to parse or a zero-sized pixmap is requested.
+pub fn compose_icon_svg(
+    src_svg: &[u8],
+    canvas_w: u32,
+    canvas_h: u32,
+    is_active: bool,
+    bg: Rgba<u8>,
+    off_y_bias: i64,
+) -> Option<Vec<u8>> {
+    let tree = resvg::usvg::Tree::from_data(src_svg, &resvg::usvg::Options::default()).ok()?;
+    let size = tree.size();
+    let (src_w, src_h) = (
+        size.width().ceil().max(1.0) as u32,
+        size.height().ceil().max(1.0) as u32,
+    );
+    let (icon_w, icon_h) = fit_icon_dims(canvas_w, canvas_h, src_w, src_h);
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(icon_w, icon_h)?;
+    // Independent x/y scale fills the icon rect exactly; because `fit_icon_dims`
+    // preserves the source aspect, the two factors are equal up to rounding, so
+    // there is no visible distortion.
+    let transform = resvg::tiny_skia::Transform::from_scale(
+        icon_w as f32 / size.width(),
+        icon_h as f32 / size.height(),
+    );
+    resvg::render(&tree, transform, &mut pixmap.as_mut());
+    // Keep only the coverage alpha from the rasterised glyph and stamp the tint
+    // colour on top, mirroring `tint_rgba` for the raster path. tiny-skia stores
+    // premultiplied RGBA but the alpha byte itself is straight, which is all the
+    // alpha-composited overlay below needs.
+    let tint = if is_active {
+        ACTIVE_TINT
+    } else {
+        INACTIVE_TINT
+    };
+    let data = pixmap.data();
+    let mut glyph: RgbaImage = ImageBuffer::new(icon_w, icon_h);
+    for (i, px) in glyph.pixels_mut().enumerate() {
+        *px = Rgba([tint.0[0], tint.0[1], tint.0[2], data[i * 4 + 3]]);
+    }
+    Some(finish_icon(
+        &glyph, canvas_w, canvas_h, is_active, bg, off_y_bias,
+    ))
+}
+
+/// Size the glyph to a square-ish area inside the canvas while preserving the
+/// source aspect ratio: at most 90% of the shorter canvas axis, never taller or
+/// wider than the canvas less a 2px margin.
+fn fit_icon_dims(canvas_w: u32, canvas_h: u32, src_w: u32, src_h: u32) -> (u32, u32) {
+    let target_max = (canvas_w.min(canvas_h).saturating_sub(4) * 9 / 10).max(8);
+    let (src_w, src_h) = (src_w.max(1), src_h.max(1));
+    if src_w <= src_h {
+        let scaled_h = ((target_max * src_h) / src_w).max(1);
+        let capped_h = scaled_h.min(canvas_h.saturating_sub(2).max(1));
+        let final_w = ((capped_h * src_w) / src_h).max(1);
+        (final_w, capped_h)
+    } else {
+        let scaled_w = ((target_max * src_w) / src_h).max(1);
+        let capped_w = scaled_w.min(canvas_w.saturating_sub(2).max(1));
+        let final_h = ((capped_w * src_h) / src_w).max(1);
+        (capped_w, final_h)
+    }
+}
+
+/// Centre an already-sized, already-tinted glyph on a bar-bg canvas, apply the
+/// optional active blue pill on the left edge, and PNG-encode the result.
+/// `off_y_bias` nudges the glyph vertically, clamped so it never clips.
+fn finish_icon(
+    tinted: &RgbaImage,
+    canvas_w: u32,
+    canvas_h: u32,
+    is_active: bool,
+    bg: Rgba<u8>,
+    off_y_bias: i64,
+) -> Vec<u8> {
+    let (icon_w, icon_h) = (tinted.width(), tinted.height());
     let mut canvas: RgbaImage = ImageBuffer::from_pixel(canvas_w, canvas_h, bg);
     let off_x = ((canvas_w.saturating_sub(icon_w)) / 2) as i64;
     let centered_off_y = (canvas_h.saturating_sub(icon_h)) / 2;
@@ -95,7 +167,7 @@ pub fn compose_icon(
     // at most as far as the centering padding in either direction.
     let max_off_y = canvas_h.saturating_sub(icon_h) as i64;
     let off_y = (centered_off_y as i64 + off_y_bias).clamp(0, max_off_y);
-    image::imageops::overlay(&mut canvas, &tinted, off_x, off_y);
+    image::imageops::overlay(&mut canvas, tinted, off_x, off_y);
     if is_active {
         let pill_w: u32 = if canvas_w >= 8 { 2 } else { 1 };
         let pill_y_start = off_y.max(0) as u32;
@@ -107,9 +179,11 @@ pub fn compose_icon(
         }
     }
     let mut out = Vec::with_capacity(2048);
-    image::DynamicImage::ImageRgba8(canvas)
-        .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)?;
-    Ok(out)
+    // Encoding a tiny RGBA canvas to PNG is ~0.01ms; the cost that used to
+    // dominate startup was decoding the multi-MB raster *source*, not this.
+    let _ = image::DynamicImage::ImageRgba8(canvas)
+        .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png);
+    out
 }
 
 fn tint_rgba(src: &RgbaImage, tint: Rgba<u8>) -> RgbaImage {
@@ -563,6 +637,48 @@ mod tests {
             [bg[0], bg[1], bg[2], bg[3]],
             "and on the right too"
         );
+    }
+
+    #[test]
+    fn compose_icon_svg_rasterises_codicon_to_canvas_size() {
+        // The activity-bar icons now come from SVG codicons rasterised at the
+        // exact icon size. The result must be a PNG of exactly the requested
+        // canvas dimensions, carry an opaque glyph, and keep the bar-bg fill in
+        // the corners (the codicon never bleeds to the canvas edge).
+        let bg = Rgba([0x1e, 0x22, 0x2e, 0xff]);
+        let baked = compose_icon_svg(EXPLORER_SRC_SVG, 40, 40, false, bg, 0)
+            .expect("the files codicon SVG must rasterise");
+        let decoded = image::load_from_memory_with_format(&baked, image::ImageFormat::Png)
+            .unwrap()
+            .to_rgba8();
+        assert_eq!((decoded.width(), decoded.height()), (40, 40));
+        assert_eq!(
+            decoded.get_pixel(0, 0).0,
+            [bg[0], bg[1], bg[2], bg[3]],
+            "corner must stay bar-bg; the glyph sits centred inside a margin"
+        );
+        let glyph_opaque = decoded
+            .pixels()
+            .any(|p| p.0 != [bg[0], bg[1], bg[2], bg[3]]);
+        assert!(glyph_opaque, "the rasterised glyph must paint visible pixels");
+    }
+
+    #[test]
+    fn compose_icon_svg_active_paints_the_blue_pill() {
+        let bg = Rgba([0x1e, 0x22, 0x2e, 0xff]);
+        let baked = compose_icon_svg(EXPLORER_SRC_SVG, 40, 40, true, bg, 0).unwrap();
+        let decoded = image::load_from_memory_with_format(&baked, image::ImageFormat::Png)
+            .unwrap()
+            .to_rgba8();
+        // The active variant draws the blue selection pill down the left edge.
+        let mut saw_pill = false;
+        for y in 0..40 {
+            if decoded.get_pixel(0, y).0 == [ACTIVE_PILL[0], ACTIVE_PILL[1], ACTIVE_PILL[2], 0xff] {
+                saw_pill = true;
+                break;
+            }
+        }
+        assert!(saw_pill, "active icon must carry the left-edge blue pill");
     }
 
     #[test]

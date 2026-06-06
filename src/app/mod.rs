@@ -1616,13 +1616,14 @@ impl App {
         let w_cells = ACTIVITY_BAR_WIDTH;
         let h_cells = ACTIVITY_ICON_HEIGHT;
         let icon_bg = self.theme_bg_pixel();
-        let encode = |src: &[u8], is_active: bool, off_y_bias: i64| -> Option<String> {
-            let baked = crate::iterm2_inline::compose_icon(
-                src, canvas_w, canvas_h, is_active, icon_bg, off_y_bias,
-            )
-            .ok()?;
+        // The activity-bar icons are codicon SVGs, rasterised at the exact icon
+        // pixel size (no multi-MB raster decode, crisp at any cell size).
+        let encode = |src_svg: &[u8], is_active: bool, off_y_bias: i64| -> Option<String> {
+            let baked = crate::iterm2_inline::compose_icon_svg(
+                src_svg, canvas_w, canvas_h, is_active, icon_bg, off_y_bias,
+            )?;
             // preserveAspectRatio=0: stretch to exactly fill 4×2 cells.
-            // Since the PNG was composed at exactly that pixel size,
+            // Since the canvas was composed at exactly that pixel size,
             // there's no actual scaling and the codicon's square area
             // remains a true square on screen.
             let raw = crate::iterm2_inline::build_inline_image_osc(&baked, w_cells, h_cells, false);
@@ -1635,26 +1636,27 @@ impl App {
         // View icons render dead-centered in their cell block; the gear gets a
         // downward bias so it bottom-aligns within its (bottom-inset) block,
         // shaving the canvas's bottom padding off the gap above the status bar.
-        // The value need only exceed the no-clip ceiling; `compose_icon` clamps
-        // it, so this stays correct at any cell size.
+        // The value need only exceed the no-clip ceiling; `compose_icon_svg`
+        // clamps it, so this stays correct at any cell size.
         let gear_off_y_bias = canvas_h as i64;
-        let explorer_active = encode(crate::iterm2_inline::EXPLORER_SRC_PNG, true, 0);
-        let explorer_inactive = encode(crate::iterm2_inline::EXPLORER_SRC_PNG, false, 0);
-        let search_active = encode(crate::iterm2_inline::SEARCH_SRC_PNG, true, 0);
-        let search_inactive = encode(crate::iterm2_inline::SEARCH_SRC_PNG, false, 0);
-        let source_control_active = encode(crate::iterm2_inline::NO_REPO_HERO_PNG, true, 0);
-        let source_control_inactive = encode(crate::iterm2_inline::NO_REPO_HERO_PNG, false, 0);
-        let remote_active = encode(crate::iterm2_inline::REMOTE_SRC_PNG, true, 0);
-        let remote_inactive = encode(crate::iterm2_inline::REMOTE_SRC_PNG, false, 0);
-        let run_debug_active = encode(crate::iterm2_inline::RUN_DEBUG_SRC_PNG, true, 0);
-        let run_debug_inactive = encode(crate::iterm2_inline::RUN_DEBUG_SRC_PNG, false, 0);
+        let explorer_active = encode(crate::iterm2_inline::EXPLORER_SRC_SVG, true, 0);
+        let explorer_inactive = encode(crate::iterm2_inline::EXPLORER_SRC_SVG, false, 0);
+        let search_active = encode(crate::iterm2_inline::SEARCH_SRC_SVG, true, 0);
+        let search_inactive = encode(crate::iterm2_inline::SEARCH_SRC_SVG, false, 0);
+        let source_control_active = encode(crate::iterm2_inline::SOURCE_CONTROL_SRC_SVG, true, 0);
+        let source_control_inactive =
+            encode(crate::iterm2_inline::SOURCE_CONTROL_SRC_SVG, false, 0);
+        let remote_active = encode(crate::iterm2_inline::REMOTE_SRC_SVG, true, 0);
+        let remote_inactive = encode(crate::iterm2_inline::REMOTE_SRC_SVG, false, 0);
+        let run_debug_active = encode(crate::iterm2_inline::RUN_DEBUG_SRC_SVG, true, 0);
+        let run_debug_inactive = encode(crate::iterm2_inline::RUN_DEBUG_SRC_SVG, false, 0);
         let settings_active = encode(
-            crate::iterm2_inline::SETTINGS_GEAR_SRC_PNG,
+            crate::iterm2_inline::SETTINGS_GEAR_SRC_SVG,
             true,
             gear_off_y_bias,
         );
         let settings_inactive = encode(
-            crate::iterm2_inline::SETTINGS_GEAR_SRC_PNG,
+            crate::iterm2_inline::SETTINGS_GEAR_SRC_SVG,
             false,
             gear_off_y_bias,
         );
