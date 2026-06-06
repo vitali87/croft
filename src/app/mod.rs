@@ -13404,11 +13404,14 @@ pub fn run(root: PathBuf, restore_session: Option<PathBuf>) -> Result<()> {
     // on — the local Mac and the remote Linux box both reach `run` — so
     // the dependency is satisfied identically on both (GOLDEN RULE).
     crate::zoxide::ensure_installed_in_background();
-    // Build the tree-sitter highlight configurations on the UI thread now, so
+    // Build the tree-sitter highlight configurations on a background thread so
     // the first file open paints its syntax (keywords, strings, comments)
-    // instantly instead of paying the one-time query-compilation cost on the
-    // paint path. Shared across every editor tab via a thread-local cache.
-    crate::highlight::prewarm_configs();
+    // instantly without the per-tab query-compilation snap, yet the ~80ms of
+    // query compilation never blocks the cold-start path before the first
+    // frame. The configs land in a process-wide cache, so the UI thread reads
+    // the finished build straight out of it on first open (or builds on demand
+    // if the user opens a file before the prewarm finishes).
+    std::thread::spawn(crate::highlight::prewarm_configs);
     let title = build_title(&root);
     let mut app = App::new(root.clone())?;
     // Restore the tabs / layout carried across a self-update re-exec, then
