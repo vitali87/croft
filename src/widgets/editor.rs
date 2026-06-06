@@ -1135,6 +1135,9 @@ pub struct Editor {
     pub cursor_row: usize,
     pub cursor_col: usize,
     pub focused: bool,
+    /// When focused, draw the orange→green gradient border (Black theme)
+    /// instead of the solid blue one. Set by the app's focus/theme sync.
+    pub focus_gradient: bool,
     pub dirty: bool,
     pub status: String,
     pub last_area: Rect,
@@ -1274,6 +1277,7 @@ impl Editor {
             cursor_row: 0,
             cursor_col: 0,
             focused: false,
+            focus_gradient: false,
             dirty: false,
             status: String::from("No file open"),
             last_area: Rect::default(),
@@ -3716,6 +3720,12 @@ impl Widget for &mut Editor {
             .border_style(block_style);
         let inner = block.inner(area);
         block.render(area, buf);
+        // Black theme: replace the solid focus border with the orange→green
+        // gradient that matches the welcome activity box. The editor has no
+        // title, so nothing needs re-stamping over the gradient top edge.
+        if self.focused && self.focus_gradient {
+            crate::gradient::paint_gradient_box(buf, area);
+        }
         self.last_area = area;
         self.last_inner = inner;
         self.last_scrollbar = Rect::default();
@@ -5360,6 +5370,33 @@ mod tests {
             underlined[0].2, "x",
             "the underline must sit under the offending `x` glyph"
         );
+    }
+
+    #[test]
+    fn focused_editor_gradient_border_is_gated_on_focus_gradient() {
+        use crate::gradient::{GRAD_TL, rgb_color};
+        let mut e = editor_with("hi");
+        e.focused = true;
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 5,
+        };
+
+        // Black theme: rounded gradient corner in the gradient's TL colour.
+        e.focus_gradient = true;
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        (&mut e as &mut Editor).render(area, &mut buf);
+        assert_eq!(buf[(0, 0)].symbol(), "\u{256d}");
+        assert_eq!(buf[(0, 0)].fg, rgb_color(GRAD_TL));
+
+        // Croft Dark: square corner, solid blue (the historical highlight).
+        e.focus_gradient = false;
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        (&mut e as &mut Editor).render(area, &mut buf);
+        assert_eq!(buf[(0, 0)].symbol(), "\u{250c}");
+        assert_eq!(buf[(0, 0)].fg, Color::Rgb(0x4e, 0x9a, 0xff));
     }
 
     #[test]

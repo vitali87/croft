@@ -1,4 +1,5 @@
 use super::*;
+use crate::gradient::lerp_rgb;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 fn key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {

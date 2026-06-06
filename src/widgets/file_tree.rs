@@ -24,6 +24,9 @@ pub struct FileTree {
     pub selected: usize,
     pub scroll: usize,
     pub focused: bool,
+    /// When focused, draw the orange→green gradient border (Black theme)
+    /// instead of the solid blue one. Set by the app's focus/theme sync.
+    pub focus_gradient: bool,
     pub last_inner: Rect,
     pub last_area: Rect,
     pub last_scrollbar: Rect,
@@ -50,6 +53,7 @@ impl FileTree {
             selected: 0,
             scroll: 0,
             focused: true,
+            focus_gradient: false,
             last_inner: Rect::default(),
             last_area: Rect::default(),
             last_scrollbar: Rect::default(),
@@ -1053,18 +1057,26 @@ impl Widget for &mut FileTree {
         } else {
             Style::default().fg(Color::DarkGray)
         };
+        let title = Span::styled(
+            " EXPLORER ",
+            Style::default()
+                .fg(Color::White)
+                .bg(Color::Rgb(0x1e, 0x3a, 0x6e))
+                .add_modifier(Modifier::BOLD),
+        );
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(block_style)
-            .title(Span::styled(
-                " EXPLORER ",
-                Style::default()
-                    .fg(Color::White)
-                    .bg(Color::Rgb(0x1e, 0x3a, 0x6e))
-                    .add_modifier(Modifier::BOLD),
-            ));
+            .title(title.clone());
         let inner = block.inner(area);
         block.render(area, buf);
+        // Black theme: replace the solid focus border with the orange→green
+        // gradient (matching the welcome activity box), then re-stamp the
+        // title the gradient top edge just overwrote.
+        if self.focused && self.focus_gradient {
+            crate::gradient::paint_gradient_box(buf, area);
+            buf.set_span(area.x + 1, area.y, &title, title.width() as u16);
+        }
         self.last_inner = inner;
         self.last_area = area;
         self.last_scrollbar = Rect::default();
@@ -1197,6 +1209,49 @@ mod tests {
         fs::write(root.join("src/lib.rs"), "pub fn x() {}\n").unwrap();
         let tree = FileTree::new(root.to_path_buf());
         (tmp, tree)
+    }
+
+    #[test]
+    fn focused_gradient_border_draws_rounded_corner_and_keeps_title() {
+        use crate::gradient::{GRAD_TL, rgb_color};
+        let (_tmp, mut tree) = fixture();
+        tree.focused = true;
+        tree.focus_gradient = true;
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 30,
+            height: 6,
+        };
+        let mut buf = Buffer::empty(area);
+        (&mut tree).render(area, &mut buf);
+        // Rounded top-left corner in the gradient's top-left colour.
+        assert_eq!(buf[(0, 0)].symbol(), "\u{256d}");
+        assert_eq!(buf[(0, 0)].fg, rgb_color(GRAD_TL));
+        // The EXPLORER title must survive the gradient repaint of the top edge.
+        let top: String = (0..area.width).map(|x| buf[(x, 0)].symbol()).collect();
+        assert!(
+            top.contains("EXPLORER"),
+            "title clobbered by gradient: {top:?}"
+        );
+    }
+
+    #[test]
+    fn croft_dark_keeps_solid_blue_focus_border() {
+        let (_tmp, mut tree) = fixture();
+        tree.focused = true;
+        tree.focus_gradient = false;
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 30,
+            height: 6,
+        };
+        let mut buf = Buffer::empty(area);
+        (&mut tree).render(area, &mut buf);
+        // Square corner, solid blue: the historical Croft Dark highlight.
+        assert_eq!(buf[(0, 0)].symbol(), "\u{250c}");
+        assert_eq!(buf[(0, 0)].fg, Color::Rgb(0x4e, 0x9a, 0xff));
     }
 
     #[test]

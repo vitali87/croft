@@ -139,6 +139,9 @@ pub struct PtyTerminal {
     /// listener instance through every `resize` call.
     size_shared: Arc<std::sync::Mutex<(u16, u16)>>,
     pub focused: bool,
+    /// When focused, draw the orange→green gradient border (Black theme)
+    /// instead of the solid blue one. Set by the app's focus/theme sync.
+    pub focus_gradient: bool,
     pub last_area: Rect,
     pub last_inner: Rect,
     selection: Option<Selection>,
@@ -317,6 +320,7 @@ impl PtyTerminal {
             rows,
             size_shared,
             focused: false,
+            focus_gradient: false,
             last_area: Rect::default(),
             last_inner: Rect::default(),
             selection: None,
@@ -723,18 +727,26 @@ impl Widget for &mut PtyTerminal {
         } else {
             Style::default().fg(Color::DarkGray)
         };
+        let title = Span::styled(
+            " TERMINAL ",
+            Style::default()
+                .fg(Color::White)
+                .bg(Color::Rgb(0x1e, 0x3a, 0x6e))
+                .add_modifier(Modifier::BOLD),
+        );
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(block_style)
-            .title(Span::styled(
-                " TERMINAL ",
-                Style::default()
-                    .fg(Color::White)
-                    .bg(Color::Rgb(0x1e, 0x3a, 0x6e))
-                    .add_modifier(Modifier::BOLD),
-            ));
+            .title(title.clone());
         let inner = block.inner(area);
         block.render(area, buf);
+        // Black theme: replace the solid focus border with the orange→green
+        // gradient (matching the welcome activity box), then re-stamp the
+        // title the gradient top edge just overwrote.
+        if self.focused && self.focus_gradient {
+            crate::gradient::paint_gradient_box(buf, area);
+            buf.set_span(area.x + 1, area.y, &title, title.width() as u16);
+        }
         self.last_area = area;
         self.last_inner = inner;
         let sel_norm = self.selection.map(|s| s.normalised());

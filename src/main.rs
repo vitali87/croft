@@ -2,6 +2,7 @@ mod app;
 mod cli;
 mod clipboard;
 mod git;
+mod gradient;
 mod highlight;
 mod icons;
 mod install_session;
