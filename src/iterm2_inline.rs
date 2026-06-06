@@ -47,12 +47,19 @@ const INACTIVE_TINT: Rgba<u8> = Rgba([0x9d, 0xa5, 0xb4, 0xff]);
 /// `min(w,h)` square sub-area; the canvas extra space along the longer
 /// axis is filled with bar bg, so the rendered cell area shows zero
 /// terminal-default-bg leftover.
+/// `off_y_bias` nudges the composed glyph vertically by a pixel count, on top
+/// of the default vertical centering, and is clamped so the glyph can never
+/// clip past the canvas edges. Positive shifts down, negative up. View icons
+/// pass `0`; the bottom-anchored settings gear passes a small positive bias so
+/// it sits a touch lower within its cell block (sub-cell precision the
+/// whole-cell block anchor can't express).
 pub fn compose_icon(
     src_codicon_png: &[u8],
     canvas_w: u32,
     canvas_h: u32,
     is_active: bool,
     bg: Rgba<u8>,
+    off_y_bias: i64,
 ) -> Result<Vec<u8>, image::ImageError> {
     let codicon =
         image::load_from_memory_with_format(src_codicon_png, image::ImageFormat::Png)?.to_rgba8();
@@ -83,7 +90,11 @@ pub fn compose_icon(
     let tinted = tint_rgba(&scaled, tint);
     let mut canvas: RgbaImage = ImageBuffer::from_pixel(canvas_w, canvas_h, bg);
     let off_x = ((canvas_w.saturating_sub(icon_w)) / 2) as i64;
-    let off_y = ((canvas_h.saturating_sub(icon_h)) / 2) as i64;
+    let centered_off_y = (canvas_h.saturating_sub(icon_h)) / 2;
+    // Clamp the bias so the glyph stays fully inside the canvas: it can travel
+    // at most as far as the centering padding in either direction.
+    let max_off_y = canvas_h.saturating_sub(icon_h) as i64;
+    let off_y = (centered_off_y as i64 + off_y_bias).clamp(0, max_off_y);
     image::imageops::overlay(&mut canvas, &tinted, off_x, off_y);
     if is_active {
         let pill_w: u32 = if canvas_w >= 8 { 2 } else { 1 };
@@ -432,6 +443,56 @@ mod tests {
     }
 
     #[test]
+    fn compose_icon_positive_off_y_bias_lowers_the_glyph_and_never_clips() {
+        // A small opaque square so the composed glyph is distinguishable from
+        // the background regardless of where it lands.
+        let src = {
+            let img: RgbaImage = ImageBuffer::from_pixel(4, 4, Rgba([0xff, 0xff, 0xff, 0xff]));
+            let mut buf = Vec::new();
+            image::DynamicImage::ImageRgba8(img)
+                .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+                .unwrap();
+            buf
+        };
+        let bg = Rgba([0x1e, 0x22, 0x2e, 0xff]);
+        // Rows that contain any non-bg (glyph) pixel, top-most and bottom-most.
+        let content_span = |png: &[u8]| -> (u32, u32) {
+            let img = image::load_from_memory_with_format(png, image::ImageFormat::Png)
+                .unwrap()
+                .to_rgba8();
+            let (mut top, mut bottom) = (None, None);
+            for y in 0..img.height() {
+                let has = (0..img.width()).any(|x| img.get_pixel(x, y).0 != bg.0);
+                if has {
+                    top.get_or_insert(y);
+                    bottom = Some(y);
+                }
+            }
+            (top.unwrap(), bottom.unwrap())
+        };
+        let (canvas_w, canvas_h) = (32u32, 48u32);
+        let centered = compose_icon(&src, canvas_w, canvas_h, false, bg, 0).unwrap();
+        // A bias far larger than the canvas: clamp must keep the glyph inside.
+        let lowered = compose_icon(&src, canvas_w, canvas_h, false, bg, 10_000).unwrap();
+        let (c_top, c_bottom) = content_span(&centered);
+        let (l_top, l_bottom) = content_span(&lowered);
+        assert!(
+            l_top > c_top && l_bottom > c_bottom,
+            "a positive bias must push the glyph downward (centered span {c_top}..={c_bottom}, lowered {l_top}..={l_bottom})"
+        );
+        assert!(
+            l_bottom <= canvas_h - 1,
+            "the glyph must stay inside the canvas: bottom row {l_bottom} exceeds {}",
+            canvas_h - 1
+        );
+        assert_eq!(
+            l_bottom - l_top,
+            c_bottom - c_top,
+            "clamping must preserve the glyph height (no clipping), only shift it"
+        );
+    }
+
+    #[test]
     fn compose_icon_canvas_corners_equal_caller_supplied_bg() {
         // 1x1 transparent PNG: avoids needing a real codicon asset and lets
         // us verify the canvas fill is exactly the caller-provided sRGB bg.
@@ -444,7 +505,7 @@ mod tests {
             buf
         };
         let bg = Rgba([0x1e, 0x22, 0x2e, 0xff]);
-        let baked = compose_icon(&src, 32, 16, false, bg).unwrap();
+        let baked = compose_icon(&src, 32, 16, false, bg, 0).unwrap();
         let decoded = image::load_from_memory_with_format(&baked, image::ImageFormat::Png)
             .unwrap()
             .to_rgba8();
@@ -480,7 +541,7 @@ mod tests {
     #[test]
     fn compose_icon_preserves_source_aspect_ratio_for_a_portrait_png() {
         let bg = Rgba([0x1e, 0x22, 0x2e, 0xff]);
-        let baked = compose_icon(NO_REPO_HERO_PNG, 32, 16, false, bg)
+        let baked = compose_icon(NO_REPO_HERO_PNG, 32, 16, false, bg, 0)
             .expect("compose_icon must accept the portrait source-control PNG");
         let decoded = image::load_from_memory_with_format(&baked, image::ImageFormat::Png)
             .unwrap()
@@ -539,7 +600,7 @@ mod tests {
     #[test]
     fn run_debug_icon_composes_through_icon_pipeline() {
         let bg = Rgba([0x1e, 0x22, 0x2e, 0xff]);
-        let baked = compose_icon(RUN_DEBUG_SRC_PNG, 32, 16, false, bg)
+        let baked = compose_icon(RUN_DEBUG_SRC_PNG, 32, 16, false, bg, 0)
             .expect("compose_icon must accept the SVG-rasterised run-debug PNG");
         let decoded = image::load_from_memory_with_format(&baked, image::ImageFormat::Png)
             .unwrap()
@@ -559,7 +620,7 @@ mod tests {
         let bg = Rgba([0x1e, 0x22, 0x2e, 0xff]);
         let canvas_w = 40u32;
         let canvas_h = 40u32;
-        let baked = compose_icon(NO_REPO_HERO_PNG, canvas_w, canvas_h, false, bg)
+        let baked = compose_icon(NO_REPO_HERO_PNG, canvas_w, canvas_h, false, bg, 0)
             .expect("portrait source must compose into the activity-bar cell");
         let decoded = image::load_from_memory_with_format(&baked, image::ImageFormat::Png)
             .unwrap()

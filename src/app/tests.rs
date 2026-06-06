@@ -6295,6 +6295,31 @@ fn settings_gear_is_bottom_anchored_below_the_view_icons() {
 }
 
 #[test]
+fn settings_gear_bottom_inset_matches_the_view_icon_top_inset() {
+    // The view icons start one cell below the bar's top edge
+    // (`activity_explorer_y` = `bar.y + 1`). The gear must leave the same
+    // one-cell gap above the status bar instead of hugging the bottom row,
+    // so the bar reads as vertically balanced rather than bottom-heavy.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.overlays.activity.set_images(dummy_activity_images());
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let explorer = app.sidebar_areas.explorer_icon;
+    let gear = app.sidebar_areas.settings_icon;
+    assert!(gear.width > 0, "gear must lay out on a tall bar");
+    // The activity bar spans every row except the single status-bar row.
+    let bar_bottom = app.last_frame_area.height - 1 - 1;
+    let top_inset = explorer.y - app.last_frame_area.y;
+    let bottom_inset = bar_bottom - (gear.y + gear.height - 1);
+    assert_eq!(
+        bottom_inset, top_inset,
+        "the gap below the gear must equal the gap above the first view icon"
+    );
+}
+
+#[test]
 fn clicking_the_gear_opens_the_color_theme_menu_then_the_picker() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
