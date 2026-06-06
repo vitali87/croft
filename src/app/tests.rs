@@ -3156,8 +3156,14 @@ fn welcome_image_bake_produces_osc1337_carrying_logo_pixels() {
 }
 
 #[test]
-fn brand_pill_uses_app_name_constant() {
-    assert_eq!(brand_pill_text(), " croft ");
+fn brand_spans_render_the_cr_ft_wordmark_with_orange_brackets() {
+    let spans = brand_spans();
+    let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+    assert_eq!(text, " cr<>ft ");
+    // The "<>" (the stylised "o") carries the logo orange; letters stay white.
+    let bracket = spans.iter().find(|s| s.content == "<>").unwrap();
+    assert_eq!(bracket.style.fg, Some(BRAND_ORANGE));
+    assert_eq!(spans[0].style.fg, Some(Color::White));
 }
 
 #[test]

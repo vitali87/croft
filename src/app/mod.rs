@@ -260,9 +260,27 @@ fn git_status_spans<'a>(status: &'a crate::git::GitStatus) -> Vec<Span<'a>> {
     spans
 }
 
-/// Text shown inside the colored "brand" pill at the left of the status bar.
-fn brand_pill_text() -> String {
-    format!(" {APP_NAME} ")
+/// Logo orange (#e97c41), sampled from `assets/logo.png`: the colour of the
+/// `<>` angle brackets in the "cr<>ft" wordmark.
+const BRAND_ORANGE: Color = Color::Rgb(0xe9, 0x7c, 0x41);
+
+/// Spans for the "cr<>ft" wordmark at the left of the status bar, styled to
+/// mirror the app logo: white letters with the `<>` (the stylised "o") in the
+/// brand orange, sitting on the bar's own background rather than a pill.
+fn brand_spans() -> Vec<Span<'static>> {
+    let letter = Style::default()
+        .fg(Color::White)
+        .add_modifier(Modifier::BOLD);
+    vec![
+        Span::styled(" cr", letter),
+        Span::styled(
+            "<>",
+            Style::default()
+                .fg(BRAND_ORANGE)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("ft ", letter),
+    ]
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -4799,13 +4817,7 @@ impl App {
         }
 
         let mut spans: Vec<Span> = Vec::with_capacity(20);
-        spans.push(Span::styled(
-            brand_pill_text(),
-            Style::default()
-                .bg(Color::Rgb(0x4e, 0x9a, 0xff))
-                .fg(Color::Black)
-                .add_modifier(Modifier::BOLD),
-        ));
+        spans.extend(brand_spans());
         if let Some(span) = self.perf.status_span() {
             spans.push(span);
         }
