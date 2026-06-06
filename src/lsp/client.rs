@@ -3,6 +3,7 @@ use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc as std_mpsc;
 
 use anyhow::{Context, Result, anyhow};
 use async_lsp::concurrency::ConcurrencyLayer;
@@ -10,6 +11,7 @@ use async_lsp::panic::CatchUnwindLayer;
 use async_lsp::router::Router;
 use async_lsp::tracing::TracingLayer;
 use async_lsp::{LanguageServer, MainLoop, ServerSocket};
+use lsp_types::DiagnosticSeverity as LspDiagnosticSeverity;
 use lsp_types::notification::{LogMessage, PublishDiagnostics, ShowMessage};
 use lsp_types::request::SemanticTokensRefresh;
 use lsp_types::{
@@ -30,6 +32,7 @@ use tower::ServiceBuilder;
 
 use crate::lsp::config::ServerConfig;
 use crate::lsp::log_file;
+use crate::lsp::manager::{Diagnostic, DiagnosticSeverity, DiagnosticsUpdate};
 
 struct ClientState {
     name: String,
@@ -39,13 +42,21 @@ struct ClientState {
     // syntax analysis, then sends refresh once the cargo/crate-graph analysis
     // resolves the richer type-aware tokens. (ty/basedpyright never send it.)
     semantic_refresh: Arc<AtomicBool>,
+    // Server-pushed `textDocument/publishDiagnostics` batches are normalised
+    // and forwarded here; the manager owns the receiver and the app drains it.
+    diagnostics_tx: std_mpsc::Sender<DiagnosticsUpdate>,
 }
 
 impl ClientState {
-    fn router(name: String, semantic_refresh: Arc<AtomicBool>) -> Router<Self> {
+    fn router(
+        name: String,
+        semantic_refresh: Arc<AtomicBool>,
+        diagnostics_tx: std_mpsc::Sender<DiagnosticsUpdate>,
+    ) -> Router<Self> {
         let mut router = Router::new(ClientState {
             name,
             semantic_refresh,
+            diagnostics_tx,
         });
         router
             .request::<SemanticTokensRefresh, _>(|this, _params| {
@@ -63,6 +74,16 @@ impl ClientState {
                     params.uri,
                     params.diagnostics.len()
                 ));
+                // Forward the normalised batch to the app. A non-file URI
+                // (e.g. an untitled buffer) has no editor to paint, so skip it.
+                if let Ok(path) = params.uri.to_file_path() {
+                    let diagnostics = params.diagnostics.iter().map(convert_diagnostic).collect();
+                    let _ = this.diagnostics_tx.send(DiagnosticsUpdate {
+                        path,
+                        server: this.name.clone(),
+                        diagnostics,
+                    });
+                }
                 ControlFlow::Continue(())
             })
             .notification::<ShowMessage>(|this, params| {
@@ -103,6 +124,26 @@ impl ClientState {
     }
 }
 
+/// Normalise one LSP wire diagnostic into croft's `Diagnostic`. Severity
+/// defaults to `Error` when the server omits it (the LSP spec says the client
+/// may pick, and an unclassified problem is most safely shown as an error).
+fn convert_diagnostic(d: &lsp_types::Diagnostic) -> Diagnostic {
+    let severity = match d.severity {
+        Some(LspDiagnosticSeverity::WARNING) => DiagnosticSeverity::Warning,
+        Some(LspDiagnosticSeverity::INFORMATION) => DiagnosticSeverity::Information,
+        Some(LspDiagnosticSeverity::HINT) => DiagnosticSeverity::Hint,
+        _ => DiagnosticSeverity::Error,
+    };
+    Diagnostic {
+        start_line: d.range.start.line,
+        start_char: d.range.start.character,
+        end_line: d.range.end.line,
+        end_char: d.range.end.character,
+        severity,
+        message: d.message.clone(),
+    }
+}
+
 pub struct LspClient {
     server: ServerSocket,
     capabilities: ServerCapabilities,
@@ -120,6 +161,7 @@ impl LspClient {
         client_capabilities: ClientCapabilities,
         extra_path: &[std::path::PathBuf],
         semantic_refresh: Arc<AtomicBool>,
+        diagnostics_tx: std_mpsc::Sender<DiagnosticsUpdate>,
     ) -> Result<Self> {
         let workspace_uri = Url::from_file_path(workspace_root).map_err(|_| {
             anyhow!(
@@ -166,7 +208,11 @@ impl LspClient {
                 .layer(TracingLayer::default())
                 .layer(CatchUnwindLayer::default())
                 .layer(ConcurrencyLayer::default())
-                .service(ClientState::router(router_name, semantic_refresh))
+                .service(ClientState::router(
+                    router_name,
+                    semantic_refresh,
+                    diagnostics_tx,
+                ))
         });
 
         let stderr_name = name.clone();
@@ -499,7 +545,8 @@ mod tests {
         // raise the shared flag so the app re-pulls (vs the old behaviour of
         // declining it with METHOD_NOT_FOUND and never updating).
         let flag = Arc::new(AtomicBool::new(false));
-        let mut router = ClientState::router("rust-analyzer".into(), flag.clone());
+        let (diag_tx, _diag_rx) = std_mpsc::channel();
+        let mut router = ClientState::router("rust-analyzer".into(), flag.clone(), diag_tx);
         let req: AnyRequest = serde_json::from_value(json!({
             "id": 1,
             "method": "workspace/semanticTokens/refresh",
@@ -514,9 +561,59 @@ mod tests {
     }
 
     #[test]
+    fn convert_diagnostic_maps_severity_and_utf16_range() {
+        use lsp_types::{Position, Range};
+        let wire = lsp_types::Diagnostic {
+            range: Range {
+                start: Position {
+                    line: 6,
+                    character: 25,
+                },
+                end: Position {
+                    line: 6,
+                    character: 32,
+                },
+            },
+            severity: Some(LspDiagnosticSeverity::WARNING),
+            message: "Property 'capitol' does not exist".into(),
+            ..Default::default()
+        };
+        let d = convert_diagnostic(&wire);
+        assert_eq!(d.start_line, 6);
+        assert_eq!(d.start_char, 25);
+        assert_eq!(d.end_line, 6);
+        assert_eq!(d.end_char, 32);
+        assert_eq!(d.severity, DiagnosticSeverity::Warning);
+        assert_eq!(d.message, "Property 'capitol' does not exist");
+    }
+
+    #[test]
+    fn convert_diagnostic_defaults_missing_severity_to_error() {
+        use lsp_types::{Position, Range};
+        let wire = lsp_types::Diagnostic {
+            range: Range {
+                start: Position::default(),
+                end: Position::default(),
+            },
+            severity: None,
+            message: "unclassified".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            convert_diagnostic(&wire).severity,
+            DiagnosticSeverity::Error,
+            "an unclassified problem is shown as an error, not silently dropped"
+        );
+    }
+
+    #[test]
     fn router_continues_past_unhandled_vendor_notification_like_pyright_begin_progress() {
-        let mut router =
-            ClientState::router("basedpyright".into(), Arc::new(AtomicBool::new(false)));
+        let (diag_tx, _diag_rx) = std_mpsc::channel();
+        let mut router = ClientState::router(
+            "basedpyright".into(),
+            Arc::new(AtomicBool::new(false)),
+            diag_tx,
+        );
         let notif: AnyNotification = serde_json::from_value(json!({
             "method": "pyright/beginProgress",
             "params": {}
@@ -534,7 +631,9 @@ mod tests {
 
     #[test]
     fn router_continues_past_arbitrary_unhandled_notification_methods() {
-        let mut router = ClientState::router("any".into(), Arc::new(AtomicBool::new(false)));
+        let (diag_tx, _diag_rx) = std_mpsc::channel();
+        let mut router =
+            ClientState::router("any".into(), Arc::new(AtomicBool::new(false)), diag_tx);
         for method in ["foo/bar", "experimental/dap", "rust-analyzer/serverStatus"] {
             let notif: AnyNotification = serde_json::from_value(json!({
                 "method": method,
@@ -592,12 +691,14 @@ mod tests {
         let display_name = config.name;
 
         let result: Result<()> = rt.handle().block_on(async move {
+            let (diag_tx, _diag_rx) = std_mpsc::channel();
             let client = LspClient::spawn(
                 &config,
                 &root,
                 ClientCapabilities::default(),
                 &[],
                 Arc::new(AtomicBool::new(false)),
+                diag_tx,
             )
             .await?;
             assert_eq!(client.name(), expected_name);

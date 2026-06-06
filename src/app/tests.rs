@@ -10479,3 +10479,71 @@ fn terminal_cycle_still_requires_super_off_termux() {
         KeyModifiers::SUPER
     )));
 }
+
+fn diag(
+    start_char: u32,
+    end_char: u32,
+    severity: crate::lsp::manager::DiagnosticSeverity,
+) -> crate::lsp::manager::Diagnostic {
+    crate::lsp::manager::Diagnostic {
+        start_line: 0,
+        start_char,
+        end_line: 0,
+        end_char,
+        severity,
+        message: String::from("test"),
+    }
+}
+
+#[test]
+fn diagnostics_store_applies_to_the_active_editor_on_drain() {
+    use crate::lsp::manager::DiagnosticSeverity;
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("a.ts");
+    std::fs::write(&file, "const x = 1;\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&file).unwrap();
+    // Seed the store as if vtsls had published a diagnostic for this file.
+    let mut by_server = std::collections::HashMap::new();
+    by_server.insert(
+        String::from("vtsls"),
+        vec![diag(6, 7, DiagnosticSeverity::Error)],
+    );
+    app.lsp_diagnostics.insert(file.clone(), by_server);
+    // Nothing arrives on the channel, but the active file's diagnostics are
+    // unapplied (a "tab switch"), so the drain must push the stored set in.
+    let changed = app.drain_lsp_diagnostics();
+    assert!(
+        changed,
+        "applying the stored diagnostics must mark a redraw"
+    );
+    assert_eq!(app.editor.diagnostics_path(), Some(file.as_path()));
+    assert_eq!(
+        app.editor.diagnostic_spans_for_test()[0],
+        vec![(6, 7, DiagnosticSeverity::Error)],
+    );
+}
+
+#[test]
+fn merged_diagnostics_layers_every_server_for_a_file() {
+    use crate::lsp::manager::DiagnosticSeverity;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let file = tmp.path().join("a.py");
+    let mut by_server = std::collections::HashMap::new();
+    by_server.insert(
+        String::from("ty"),
+        vec![diag(0, 1, DiagnosticSeverity::Error)],
+    );
+    by_server.insert(
+        String::from("ruff"),
+        vec![diag(2, 3, DiagnosticSeverity::Warning)],
+    );
+    app.lsp_diagnostics.insert(file.clone(), by_server);
+    let merged = app.merged_diagnostics(&file);
+    assert_eq!(
+        merged.len(),
+        2,
+        "both servers' diagnostics must survive the merge, not clobber each other"
+    );
+}

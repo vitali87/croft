@@ -924,6 +924,17 @@ pub struct App {
     /// manager. sync_lsp diffs every tick against the current tabs to
     /// emit did_open / did_change / did_close.
     lsp_last_seen: std::collections::HashMap<PathBuf, u64>,
+    /// Diagnostics store: per file, the latest set from each server. Servers
+    /// push complete sets via `textDocument/publishDiagnostics`, so the inner
+    /// map is keyed by server name (ty + ruff can both publish for one file)
+    /// and a server's entry is replaced wholesale on each batch (an empty
+    /// batch removes it). The merged value for the visible file is handed to
+    /// the editor; the store outlives tab switches so re-focusing a file shows
+    /// its squiggles again without waiting for the next server push.
+    lsp_diagnostics: std::collections::HashMap<
+        PathBuf,
+        std::collections::HashMap<String, Vec<crate::lsp::manager::Diagnostic>>,
+    >,
     /// Active completion popup, when a completion request has been issued
     /// and the user hasn't dismissed the result. Populated by drain_lsp_completion
     /// once the worker sends a CompletionResult back.
@@ -1491,6 +1502,7 @@ impl App {
                 }
             },
             lsp_last_seen: std::collections::HashMap::new(),
+            lsp_diagnostics: std::collections::HashMap::new(),
             completion_popup: None,
             editor_vim_chord: EditorVimChord::default(),
             vim: crate::vim::VimState::new(),
@@ -2484,6 +2496,9 @@ impl App {
         for p in closed {
             lsp.close_doc(p.clone());
             self.lsp_last_seen.remove(&p);
+            // Drop the closed file's diagnostics so the store doesn't grow
+            // unbounded across a long session of opening and closing files.
+            self.lsp_diagnostics.remove(&p);
         }
     }
 
@@ -2711,6 +2726,68 @@ impl App {
                 && split.path.as_deref() == Some(u.path.as_path())
             {
                 split.apply_semantic_tokens(u.path, u.data, u.legend, u.is_full);
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// Flatten the per-server diagnostics stored for `path` into one list for
+    /// the editor. Servers are layered, not merged across (each owns its own
+    /// findings), so this is a simple concatenation of every server's set.
+    fn merged_diagnostics(&self, path: &Path) -> Vec<crate::lsp::manager::Diagnostic> {
+        self.lsp_diagnostics
+            .get(path)
+            .map(|by_server| by_server.values().flatten().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Drain server-pushed diagnostics into the per-file store, then refresh
+    /// the underline overlay on whichever editor group shows an affected (or
+    /// just-switched-to) file. Returns true when an overlay changed and the
+    /// next frame should redraw.
+    pub fn drain_lsp_diagnostics(&mut self) -> bool {
+        // Collect first so the immutable borrow of `lsp` ends before the store
+        // and the editors are mutated below.
+        let mut updates = Vec::new();
+        if let Some(lsp) = self.lsp.as_ref() {
+            while let Some(u) = lsp.drain_diagnostics() {
+                updates.push(u);
+            }
+        }
+        let mut touched: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+        for u in updates {
+            touched.insert(u.path.clone());
+            let by_server = self.lsp_diagnostics.entry(u.path).or_default();
+            // An empty batch is the server saying "all clear" for its findings.
+            if u.diagnostics.is_empty() {
+                by_server.remove(&u.server);
+            } else {
+                by_server.insert(u.server, u.diagnostics);
+            }
+        }
+        let mut changed = false;
+        // The active editor re-decodes when its file was touched this tick OR
+        // when it now shows a file whose stored diagnostics it hasn't applied
+        // yet (a tab switch: diagnostics are pushed, never re-requested).
+        if let Some(path) = self.editor.path.clone() {
+            let stale = self.editor.diagnostics_path() != Some(path.as_path());
+            if stale || touched.contains(&path) {
+                let merged = self.merged_diagnostics(&path);
+                self.editor.apply_diagnostics(path, merged);
+                changed = true;
+            }
+        }
+        // Same for the split group, computed without overlapping borrows.
+        let split_target = self.editor_split.as_ref().and_then(|s| {
+            let p = s.path.clone()?;
+            let stale = s.diagnostics_path() != Some(p.as_path());
+            (stale || touched.contains(&p)).then_some(p)
+        });
+        if let Some(path) = split_target {
+            let merged = self.merged_diagnostics(&path);
+            if let Some(split) = self.editor_split.as_mut() {
+                split.apply_diagnostics(path, merged);
                 changed = true;
             }
         }
@@ -13547,6 +13624,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let references_changed = app.drain_lsp_references();
         let rename_changed = app.drain_lsp_rename();
         let semantic_changed = app.drain_lsp_semantic_tokens();
+        let diagnostics_changed = app.drain_lsp_diagnostics();
         let sysmon_changed = app.drain_sysmon();
         // Surface the managed TypeScript-server install progress in the status
         // bar so the background work (which can take a few seconds) is visible.
@@ -13587,6 +13665,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             || references_changed
             || rename_changed
             || semantic_changed
+            || diagnostics_changed
             || install_status_changed
             || sysmon_changed;
         let pty_eligible = pty_pending
