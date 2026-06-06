@@ -44,6 +44,11 @@ pub const ACTIVITY_SOURCE_CONTROL: char = '\u{ea68}';
 /// NOT use U+EAD8 (cod-debug, just the bug) or U+EB2C (cod-play, just
 /// the triangle): both lose half the silhouette.
 pub const ACTIVITY_RUN_DEBUG: char = '\u{eb91}';
+/// Codicon `gear` (a.k.a. `settings-gear`) — the cogwheel VS Code uses for
+/// its bottom-left "Manage" button. Verified against the Nerd Fonts CSS
+/// (`.nf-cod-gear`) which pins it to **U+EB51**. Glyph-fallback only; the
+/// image path bakes the rasterised `settings_gear_src.png` instead.
+pub const ACTIVITY_SETTINGS: char = '\u{eb51}';
 
 pub fn for_path(name: &str, suffix: &str) -> Icon {
     let n = name.to_ascii_lowercase();

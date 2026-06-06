@@ -18,6 +18,8 @@ fn dummy_activity_images() -> ActivityBarImages {
         remote_inactive: s(),
         run_debug_active: s(),
         run_debug_inactive: s(),
+        settings_active: s(),
+        settings_inactive: s(),
     }
 }
 
@@ -2985,7 +2987,7 @@ fn set_session_bg_srgb_seq_uses_iterm_osc1337_and_srgb_prefix() {
     // sRGB) matches pixel-for-pixel. Locking in the exact bytes catches
     // any future refactor that drops the `srgb:` prefix or the iTerm2
     // OSC introducer.
-    let seq = set_session_bg_srgb_seq(EDITOR_BG_RGB);
+    let seq = set_session_bg_srgb_seq(crate::theme::Theme::DarkBlue.editor_bg_rgb());
     assert_eq!(seq, "\x1b]1337;SetColors=bg=srgb:1e222e\x07");
 }
 
@@ -3022,7 +3024,8 @@ fn welcome_image_bake_produces_osc1337_carrying_logo_pixels() {
     // or fail the byte assertions.
     let canvas_w = 48u32 * 8; // approx welcome cell w * cell pixel w
     let canvas_h = 14u32 * 16;
-    let bg = image::Rgba([EDITOR_BG_RGB.0, EDITOR_BG_RGB.1, EDITOR_BG_RGB.2, 0xff]);
+    let bg_rgb = crate::theme::Theme::DarkBlue.editor_bg_rgb();
+    let bg = image::Rgba([bg_rgb.0, bg_rgb.1, bg_rgb.2, 0xff]);
     let baked = crate::iterm2_inline::fit_image(
         crate::iterm2_inline::WELCOME_LOGO_PNG,
         canvas_w,
@@ -3041,8 +3044,8 @@ fn welcome_image_bake_produces_osc1337_carrying_logo_pixels() {
     assert!(osc.contains("width=48"));
     assert!(osc.contains("height=14"));
 
-    // Verify the canvas corner pixels are exactly EDITOR_BG_RGB so the
-    // welcome image bg matches the sRGB-decoded session bg.
+    // Verify the canvas corner pixels are exactly the dark-blue theme bg so
+    // the welcome image bg matches the sRGB-decoded session bg.
     let img = image::load_from_memory_with_format(&baked, image::ImageFormat::Png)
         .unwrap()
         .to_rgba8();
@@ -3055,7 +3058,7 @@ fn welcome_image_bake_produces_osc1337_carrying_logo_pixels() {
         let p = img.get_pixel(x, y);
         assert_eq!(
             (p.0[0], p.0[1], p.0[2], p.0[3]),
-            (EDITOR_BG_RGB.0, EDITOR_BG_RGB.1, EDITOR_BG_RGB.2, 0xff),
+            (bg_rgb.0, bg_rgb.1, bg_rgb.2, 0xff),
             "canvas corner ({x}, {y}) must be opaque editor bg"
         );
     }
@@ -4639,6 +4642,8 @@ fn resize_arms_a_one_shot_terminal_clear_to_evict_stale_activity_icons() {
         remote_inactive: String::new(),
         run_debug_active: String::new(),
         run_debug_inactive: String::new(),
+        settings_active: String::new(),
+        settings_inactive: String::new(),
     });
     app.on_resize();
     assert!(
@@ -4677,6 +4682,8 @@ fn activity_bar_icons_moving_within_the_flush_arms_a_one_shot_terminal_clear() {
         remote_inactive: String::new(),
         run_debug_active: String::new(),
         run_debug_inactive: String::new(),
+        settings_active: String::new(),
+        settings_inactive: String::new(),
     });
     let place = |app: &mut App, base: u16| {
         app.sidebar_areas.explorer_icon = Rect::new(0, base, 2, 1);
@@ -6141,7 +6148,10 @@ fn activity_icons_stay_visible_beside_the_centered_shortcuts_modal() {
     let mut term = ratatui::Terminal::new(backend).unwrap();
     term.draw(|f| app.render(f)).unwrap();
     let before = app.pending_activity_image_overlays().len();
-    assert_eq!(before, 5, "precondition: all five activity-bar icons emit");
+    assert_eq!(
+        before, 6,
+        "precondition: all five view icons plus the bottom settings gear emit"
+    );
     app.handle_key(key(KeyCode::F(1), KeyModifiers::NONE))
         .unwrap();
     term.draw(|f| app.render(f)).unwrap();
@@ -6169,6 +6179,78 @@ fn activity_icons_behind_a_modal_that_reaches_the_left_edge_are_suppressed() {
         during < before || before == 0,
         "on a terminal narrow enough that the centered modal reaches column 0, icons whose blocks intersect the modal must be suppressed so they don't ghost over the modal text; saw {before} icons before, {during} during"
     );
+}
+
+#[test]
+fn settings_gear_is_bottom_anchored_below_the_view_icons() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.overlays.activity.set_images(dummy_activity_images());
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let gear = app.sidebar_areas.settings_icon;
+    let run_debug = app.sidebar_areas.run_debug_icon;
+    assert!(gear.width > 0, "gear must lay out on a tall bar");
+    assert!(
+        gear.y > run_debug.y,
+        "the gear is anchored at the bottom, below the Run-and-Debug view icon"
+    );
+    assert_eq!(
+        app.pending_activity_image_overlays().len(),
+        6,
+        "five view icons plus the bottom settings gear emit"
+    );
+}
+
+#[test]
+fn clicking_the_gear_opens_the_color_theme_menu_then_the_picker() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.overlays.activity.set_images(dummy_activity_images());
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let gear = app.sidebar_areas.settings_icon;
+    app.handle_mouse(crossterm::event::MouseEvent {
+        kind: crossterm::event::MouseEventKind::Down(MouseButton::Left),
+        column: gear.x,
+        row: gear.y,
+        modifiers: KeyModifiers::NONE,
+    });
+    let menu = app.context_menu.as_ref().expect("gear opens a menu");
+    assert!(
+        matches!(menu.items.as_slice(), [(_, MenuAction::OpenThemePicker)]),
+        "the gear menu holds a single Color Theme entry"
+    );
+    // Selecting Color Theme replaces the menu with the theme picker.
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    let picker = app.context_menu.as_ref().expect("picker opens");
+    assert_eq!(picker.items.len(), crate::theme::Theme::ALL.len());
+    assert!(
+        picker
+            .items
+            .iter()
+            .all(|(_, a)| matches!(a, MenuAction::SetTheme(_))),
+        "every picker row switches a theme"
+    );
+}
+
+#[test]
+fn selecting_the_black_theme_switches_the_active_theme() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    assert_eq!(
+        app.theme,
+        crate::theme::Theme::DarkBlue,
+        "default is dark blue"
+    );
+    app.apply_theme(crate::theme::Theme::Black);
+    assert_eq!(app.theme, crate::theme::Theme::Black);
+    // A theme switch arms a one-shot clear so iTerm2 evicts the stale-bg
+    // image layer and the whole screen repaints on the new background.
+    assert!(app.consume_activity_image_clear());
 }
 
 #[test]

@@ -14,6 +14,13 @@ pub const CODEBERG_SRC_PNG: &[u8] = include_bytes!("../assets/icons/codeberg_src
 /// bug at ~30px); the SVG render keeps the silhouette legible at every
 /// cell-size croft is likely to see.
 pub const RUN_DEBUG_SRC_PNG: &[u8] = include_bytes!("../assets/icons/run_debug_src.png");
+/// 192x192 white-on-transparent rasterisation of `assets/icons/settings_gear.svg`,
+/// the upstream codicon `gear` glyph. Drives the bottom-anchored "Manage"
+/// button on the activity bar (VS Code's gear), which opens the settings
+/// menu — currently just the Color Theme picker. Rendered once with
+/// `rsvg-convert -w 192 -h 192`; the PNG is committed beside the SVG so
+/// builds don't require rsvg-convert.
+pub const SETTINGS_GEAR_SRC_PNG: &[u8] = include_bytes!("../assets/icons/settings_gear_src.png");
 pub const WELCOME_LOGO_PNG: &[u8] = include_bytes!("../assets/logo-tight-removebg-preview.png");
 /// Hero illustration shown in the Source Control sidebar when the
 /// workspace isn't a git repo: a stylised file silhouette with the Git

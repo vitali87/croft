@@ -58,7 +58,10 @@ fn render_image_placeholder(image: &ImageView, path: Option<&Path>, inner: Rect,
     // Solid bg fill so the OSC-1337 inline image (emitted post-frame on
     // capable terminals) sits on a clean canvas; on non-capable terminals
     // the metadata header below is the only content the user sees.
-    let bg_style = Style::default().bg(Color::Rgb(0x1e, 0x22, 0x2e));
+    // Inherit the iTerm2 session bg (set per active theme via SetColors) so
+    // the canvas matches the surrounding panes on both the dark-blue and the
+    // pure-black theme without threading the palette through every widget.
+    let bg_style = Style::default().bg(Color::Reset);
     for y in inner.y..inner.y + inner.height {
         for x in inner.x..inner.x + inner.width {
             buf[(x, y)].set_style(bg_style);
@@ -111,7 +114,10 @@ fn render_sheet(
 ) {
     // Bg fill so the spreadsheet sits on a clean canvas regardless of
     // what the previous tab left behind.
-    let bg_style = Style::default().bg(Color::Rgb(0x1e, 0x22, 0x2e));
+    // Inherit the iTerm2 session bg (set per active theme via SetColors) so
+    // the canvas matches the surrounding panes on both the dark-blue and the
+    // pure-black theme without threading the palette through every widget.
+    let bg_style = Style::default().bg(Color::Reset);
     for y in inner.y..inner.y + inner.height {
         for x in inner.x..inner.x + inner.width {
             buf[(x, y)].set_style(bg_style);
@@ -203,9 +209,9 @@ fn render_sheet(
 
     // Data rows.
     let row_end = (sheet.scroll_row + data_rows).min(row_count);
-    let row_style = Style::default()
-        .fg(Color::White)
-        .bg(Color::Rgb(0x1e, 0x22, 0x2e));
+    // Base rows inherit the themed session bg (see the canvas fill above);
+    // alternating rows keep an explicit lift for the zebra stripe.
+    let row_style = Style::default().fg(Color::White).bg(Color::Reset);
     let alt_row_style = Style::default()
         .fg(Color::White)
         .bg(Color::Rgb(0x24, 0x29, 0x37));
@@ -268,7 +274,10 @@ fn render_diff(
 ) -> (Rect, Rect) {
     use crate::widgets::diff::DiffRow;
     // Background fill so the diff sits on a clean canvas.
-    let bg_style = Style::default().bg(Color::Rgb(0x1e, 0x22, 0x2e));
+    // Inherit the iTerm2 session bg (set per active theme via SetColors) so
+    // the canvas matches the surrounding panes on both the dark-blue and the
+    // pure-black theme without threading the palette through every widget.
+    let bg_style = Style::default().bg(Color::Reset);
     for y in inner.y..inner.y + inner.height {
         for x in inner.x..inner.x + inner.width {
             buf[(x, y)].set_style(bg_style);

@@ -21,6 +21,7 @@ The non-negotiables that shape every decision in croft:
 ## Layout
 
 * **Left pane (sidebar):** Explorer with multi-select, cut / copy / paste, drag and drop file moves, and VS Code style icons (Codicons / Devicons / Seti). Two more sidebar views switch in via the activity bar: full-text Search and a Remote (SSH) explorer.
+* **Activity bar:** the icon strip down the far left. View icons (Explorer, Search, Source Control, Remote, Run and Debug) stack from the top; a settings gear sits at the bottom (VS Code's "Manage" button). Clicking the gear opens a menu with **Color Theme**, a picker that switches between the **Croft Dark (Blue)** (`#1e222e`) and **Croft Black** (`#000000`) themes. The choice persists across launches in `~/.config/croft/config.json`.
 * **Top right pane (editor):** code editor with `tree-sitter` syntax highlighting, enriched by an LSP semantic-token overlay (Zed's "combined" model: the language server repaints resolved symbols, so a function parameter keeps its color everywhere it is used, not just at the declaration, with tree-sitter as the instant base and fallback; on open the visible rows are coloured first via a fast `semanticTokens/range` request while the whole-document set fills in behind it, an empty first reply from a just-spawned server is retried so colour never stalls, and when a server upgrades its analysis and asks to re-pull via `workspace/semanticTokens/refresh` — as rust-analyzer does once its crate-graph analysis resolves the richer type-aware tokens — croft honours it and re-requests the visible editors), plus inline preview tabs for PNG / JPEG / GIF / BMP / WebP, PDFs (with page navigation), and CSV / TSV / XLSX / XLS / ODS spreadsheets. Splits into two side-by-side columns with `Cmd`+`\` to view files together, each column with its own tabs and cursor (images and PDFs render inline in both). An optional native modal (vim) editing mode toggles on with `Cmd`+`E`.
 * **Bottom right pane (terminal):** a real interactive shell, your `$SHELL` running on a real PTY.
 * All three panes resize by dragging the seams between them, including the seam between the two editor columns when the editor is split.
@@ -118,6 +119,7 @@ croft setup-terminal --help
 | `Ctrl+Shift+r` / `Cmd+Shift+r` | Jump to Remote (SSH) |
 | `Ctrl+Shift+l` / `Cmd+Shift+l` | While connected to a remote, disconnect and drop back into the local croft at the directory you connected from (`Ctrl+q` still fully exits) |
 | Click activity-bar icons (left edge) | Switch between Explorer, Search, Source Control, Run-Debug, and Remote sidebar views |
+| Click the settings gear (bottom of the activity bar) | Open the settings menu → **Color Theme** picker to switch between the Croft Dark (Blue) and Croft Black themes |
 | Drag the vertical seam between sidebar and editor | Resize the sidebar |
 | Drag the vertical seam between the two editor columns (when split) | Rebalance the side-by-side split |
 | Drag the horizontal seam between editor and terminal | Resize the terminal pane |
@@ -367,13 +369,15 @@ src/
 ├── icons.rs             Codicon / Devicon / Seti glyphs and per-language colors
 ├── install_session.rs   streams install-progress events while a remote host builds / installs the croft binary
 ├── iterm2.rs            iTerm2 plist mutation helpers for fonts and Croft key mappings
-├── iterm2_inline.rs     OSC 1337 inline-image baking pipeline (welcome wordmark, image / PDF preview, activity-bar icons, SSH empty-state hero)
+├── iterm2_inline.rs     OSC 1337 inline-image baking pipeline (welcome wordmark, image / PDF preview, activity-bar icons incl. the settings gear, SSH empty-state hero)
 ├── pdf.rs               PDF rasteriser: prefers pdftoppm (poppler), falls back to macOS sips
+├── prefs.rs             durable user preferences (color theme) persisted at ~/.config/croft/config.json
 ├── remote.rs            remote (SSH) target metadata and launch dispatch
 ├── remote_connect.rs    interactive SSH connect flow (host + password prompt phases) behind the connect dialog
 ├── session_state.rs     captures open tabs / layout so a self-update re-exec can restore them
 ├── sheet.rs             CSV / TSV / XLSX / XLS / XLSB / ODS parsing via the csv and calamine crates
 ├── sysmon.rs            system-metrics sampler loop (CPU / memory / network / disk / temp)
+├── theme.rs             IDE color theme (Croft Dark / Croft Black): the background palette driving SetColors + baked-image fills
 ├── update_watch.rs      remote self-update: watch for a newer binary installed under a running remote croft
 ├── vim.rs               native modal (vim-style) editing: a pure key state machine (modes, counts, operators, text objects, f/t, search, ex-commands) that emits editing intents the app applies; toggled with Cmd+E
 ├── zoxide.rs            zoxide integration: strict query + typo-tolerant fuzzy fallback (Damerau-Levenshtein) + cross-platform ensure-install backing the Cmd+Z jump popup
