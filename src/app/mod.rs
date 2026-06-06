@@ -1275,7 +1275,7 @@ fn welcome_recents_height(
 
 const WELCOME_TAGLINE: &str = "LIGHTWEIGHT.  BLAZINGLY FAST.  BUILT FOR DEVELOPERS.";
 
-use crate::gradient::{GRAD_TL, GRAD_TR, paint_gradient_box, rgb_color};
+use crate::gradient::{GRAD_TL, GRAD_TR, POPUP_SEL_BG, paint_gradient_box, rgb_color};
 
 fn open_url(url: &str) -> Result<()> {
     #[cfg(target_os = "macos")]
@@ -1352,7 +1352,7 @@ impl App {
             let _ = file_finder_index_tx.send(entries);
         });
         let fs_watch = FsWatch::spawn(&root, &tree);
-        Ok(Self {
+        let mut app = Self {
             tree,
             search,
             remote,
@@ -1495,7 +1495,14 @@ impl App {
             implementation_request_id: None,
             references_request_id: None,
             nav: NavHistory::default(),
-        })
+        };
+        // Initialise the per-pane focus/gradient flags to match the starting
+        // pane (Tree) and persisted theme. Without this, the explorer boots
+        // focused-but-not-gradient: the Black-theme gradient border only
+        // arms on the first focus change because nothing ran the sync at
+        // construction time.
+        app.sync_focus_flags();
+        Ok(app)
     }
 
     /// Detect inline-image support via env vars only — no stdin queries, no
@@ -4380,6 +4387,14 @@ impl App {
         }
     }
 
+    /// Whether popups/menus/tooltips should wear the orange→green gradient
+    /// border and the muted dark-teal selection fill instead of the legacy
+    /// bright-blue accent. Gated on the Black theme to mirror the focused-pane
+    /// border, so Croft Dark keeps its coherent all-blue look.
+    fn popup_gradient(&self) -> bool {
+        self.theme == crate::theme::Theme::Black
+    }
+
     /// Split the editor into two side-by-side columns (`Cmd+\`). The new
     /// group duplicates the active file (re-opens its path, copies the
     /// cursor/scroll position) and takes focus, landing in the right
@@ -4680,12 +4695,14 @@ impl App {
                 self.disable_editor_image(1);
                 editor_area
             };
+            let grad = self.popup_gradient();
             if self.focus == Pane::Editor
                 && self.completion_popup.is_some()
                 && let Some((cx, cy)) = self.editor.cursor_screen_pos()
             {
                 if let Some(popup) = self.completion_popup.as_mut() {
                     popup.anchor = (cx, cy);
+                    popup.gradient = grad;
                 }
                 let popup_ref = self.completion_popup.as_ref().unwrap();
                 let area = popup_ref.area_for(focused_area);
@@ -4693,16 +4710,18 @@ impl App {
                     frame.render_widget(popup_ref, area);
                 }
             }
-            if let Some(popup) = self.hover_popup.as_ref() {
+            if let Some(popup) = self.hover_popup.as_mut() {
+                popup.gradient = grad;
                 let area = popup.area_for(focused_area);
                 if area.width > 0 && area.height > 0 {
-                    frame.render_widget(popup, area);
+                    frame.render_widget(&*popup, area);
                 }
             }
-            if let Some(popup) = self.tab_tooltip.as_ref() {
+            if let Some(popup) = self.tab_tooltip.as_mut() {
+                popup.gradient = grad;
                 let area = popup.area_for(focused_area);
                 if area.width > 0 && area.height > 0 {
-                    frame.render_widget(popup, area);
+                    frame.render_widget(&*popup, area);
                 }
             }
         }
@@ -4815,8 +4834,15 @@ impl App {
             width: hit_end - hit_x,
             height: 1,
         });
-        let status = Paragraph::new(Line::from(spans))
-            .style(Style::default().bg(Color::Rgb(0x1e, 0x3a, 0x6e)));
+        // Black theme: drop the navy status strip to a near-black seam (a hair
+        // lighter than the #000000 editor so the bar still reads as distinct),
+        // matching VS Code's OLED themes. Croft Dark keeps the navy band.
+        let status_bg = if self.popup_gradient() {
+            Color::Rgb(0x18, 0x18, 0x18)
+        } else {
+            Color::Rgb(0x1e, 0x3a, 0x6e)
+        };
+        let status = Paragraph::new(Line::from(spans)).style(Style::default().bg(status_bg));
         frame.render_widget(status, outer[1]);
 
         // Overlays render last so they sit on top of everything else.
@@ -4876,12 +4902,26 @@ impl App {
         let Some(clipped) = self.menu_rect() else {
             return;
         };
+        // Black theme: orange→green gradient border + muted dark-teal
+        // selection. Croft Dark keeps the legacy bright-blue accent so the
+        // menu stays coherent with that theme's blue focus border.
+        let grad = self.popup_gradient();
+        let border_blue = Color::Rgb(0x4e, 0x9a, 0xff);
         let block = ratatui::widgets::Block::default()
             .borders(ratatui::widgets::Borders::ALL)
-            .border_style(Style::default().fg(Color::Rgb(0x4e, 0x9a, 0xff)))
+            .border_style(Style::default().fg(border_blue))
             .style(Style::default().bg(Color::Rgb(0x1e, 0x1e, 0x1e)));
         frame.render_widget(ratatui::widgets::Clear, clipped);
         frame.render_widget(block, clipped);
+        if grad {
+            paint_gradient_box(frame.buffer_mut(), clipped);
+        }
+        let sel_bg = if grad {
+            rgb_color(POPUP_SEL_BG)
+        } else {
+            border_blue
+        };
+        let sel_fg = if grad { Color::White } else { Color::Black };
         let inner = Rect {
             x: clipped.x + 1,
             y: clipped.y + 1,
@@ -4900,9 +4940,7 @@ impl App {
             };
             let selected = i == menu.selected;
             let row_style = if selected {
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Rgb(0x4e, 0x9a, 0xff))
+                Style::default().fg(sel_fg).bg(sel_bg)
             } else {
                 Style::default().fg(Color::White)
             };
@@ -4916,9 +4954,7 @@ impl App {
                 if sc_w + 2 <= inner.width {
                     let sc_x = inner.x + inner.width - sc_w - 1;
                     let sc_style = if selected {
-                        Style::default()
-                            .fg(Color::Black)
-                            .bg(Color::Rgb(0x4e, 0x9a, 0xff))
+                        Style::default().fg(sel_fg).bg(sel_bg)
                     } else {
                         Style::default().fg(Color::Rgb(0x9d, 0xa5, 0xb4))
                     };
@@ -5156,19 +5192,39 @@ impl App {
             width,
             height,
         };
+        let grad = self.popup_gradient();
+        let cursor_fg = if grad {
+            rgb_color(GRAD_TL)
+        } else {
+            Color::Rgb(0x4e, 0x9a, 0xff)
+        };
+        let title_bg = if grad {
+            rgb_color(POPUP_SEL_BG)
+        } else {
+            Color::Rgb(0x1e, 0x3a, 0x6e)
+        };
+        let title = ratatui::text::Span::styled(
+            format!(" {} ", p.label),
+            Style::default()
+                .fg(Color::White)
+                .bg(title_bg)
+                .add_modifier(Modifier::BOLD),
+        );
         let block = ratatui::widgets::Block::default()
             .borders(ratatui::widgets::Borders::ALL)
             .border_style(Style::default().fg(Color::Rgb(0x4e, 0x9a, 0xff)))
             .style(Style::default().bg(Color::Rgb(0x1e, 0x1e, 0x1e)))
-            .title(ratatui::text::Span::styled(
-                format!(" {} ", p.label),
-                Style::default()
-                    .fg(Color::White)
-                    .bg(Color::Rgb(0x1e, 0x3a, 0x6e))
-                    .add_modifier(Modifier::BOLD),
-            ));
+            .title(title.clone());
         frame.render_widget(ratatui::widgets::Clear, rect);
         frame.render_widget(block, rect);
+        // Black theme: overpaint the solid border with the gradient, then
+        // re-stamp the title the gradient top edge just covered.
+        if grad {
+            paint_gradient_box(frame.buffer_mut(), rect);
+            frame
+                .buffer_mut()
+                .set_span(rect.x + 1, rect.y, &title, title.width() as u16);
+        }
         let inner = Rect {
             x: rect.x + 2,
             y: rect.y + 1,
@@ -5183,10 +5239,7 @@ impl App {
                         p.buffer.as_str(),
                         Style::default().fg(Color::White),
                     ),
-                    ratatui::text::Span::styled(
-                        "█",
-                        Style::default().fg(Color::Rgb(0x4e, 0x9a, 0xff)),
-                    ),
+                    ratatui::text::Span::styled("█", Style::default().fg(cursor_fg)),
                 ]),
                 "Enter to create, Esc to cancel",
             ),
@@ -5197,10 +5250,7 @@ impl App {
                         p.buffer.as_str(),
                         Style::default().fg(Color::White),
                     ),
-                    ratatui::text::Span::styled(
-                        "█",
-                        Style::default().fg(Color::Rgb(0x4e, 0x9a, 0xff)),
-                    ),
+                    ratatui::text::Span::styled("█", Style::default().fg(cursor_fg)),
                 ]),
                 "Enter to rename, Esc to cancel",
             ),
@@ -5211,10 +5261,7 @@ impl App {
                         p.buffer.as_str(),
                         Style::default().fg(Color::White),
                     ),
-                    ratatui::text::Span::styled(
-                        "█",
-                        Style::default().fg(Color::Rgb(0x4e, 0x9a, 0xff)),
-                    ),
+                    ratatui::text::Span::styled("█", Style::default().fg(cursor_fg)),
                 ]),
                 "Enter to rename symbol, Esc to cancel",
             ),
@@ -8822,11 +8869,12 @@ impl App {
     }
 
     fn render_file_finder(&mut self, frame: &mut ratatui::Frame) {
+        let gradient = self.popup_gradient();
         let Some(finder) = self.file_finder.as_mut() else {
             return;
         };
         let area = frame.area();
-        crate::widgets::file_finder::render_file_finder(finder, area, frame.buffer_mut());
+        crate::widgets::file_finder::render_file_finder(finder, area, frame.buffer_mut(), gradient);
     }
 
     pub fn consume_zoxide_jump_image_clear(&mut self) -> bool {
@@ -8976,6 +9024,7 @@ impl App {
     fn render_zoxide_jump(&mut self, frame: &mut ratatui::Frame) {
         let sidebar = self.last_sidebar_area;
         let full = frame.area();
+        let gradient = self.popup_gradient();
         let Some(jump) = self.zoxide_jump.as_mut() else {
             return;
         };
@@ -9008,7 +9057,7 @@ impl App {
                 }
             }
         };
-        crate::widgets::zoxide_jump::render_zoxide_jump(jump, rect, frame.buffer_mut());
+        crate::widgets::zoxide_jump::render_zoxide_jump(jump, rect, frame.buffer_mut(), gradient);
     }
 
     fn open_editor_find(&mut self) {
@@ -9335,6 +9384,7 @@ impl App {
     }
 
     fn render_editor_find(&mut self, frame: &mut ratatui::Frame) {
+        let gradient = self.popup_gradient();
         let Some(state) = self.editor_find.as_mut() else {
             return;
         };
@@ -9342,7 +9392,7 @@ impl App {
         if area.width == 0 || area.height == 0 {
             return;
         }
-        crate::widgets::editor_find::render_editor_find(state, area, frame.buffer_mut());
+        crate::widgets::editor_find::render_editor_find(state, area, frame.buffer_mut(), gradient);
     }
 
     fn handle_shortcuts_modal_key(&mut self, key: KeyEvent) {
@@ -9380,18 +9430,26 @@ impl App {
     }
 
     fn render_shortcuts_modal(&mut self, frame: &mut ratatui::Frame) {
+        let gradient = self.popup_gradient();
         let Some(modal) = self.shortcuts_modal.as_mut() else {
             return;
         };
         let area = frame.area();
-        crate::widgets::shortcuts::render_shortcuts_modal(modal, area, frame.buffer_mut());
+        crate::widgets::shortcuts::render_shortcuts_modal(
+            modal,
+            area,
+            frame.buffer_mut(),
+            gradient,
+        );
     }
 
     fn render_connect_dialog(&mut self, frame: &mut ratatui::Frame) {
         let visible = self.cursor_visible_phase();
+        let gradient = self.popup_gradient();
         let Some(dialog) = self.connect_dialog.as_mut() else {
             return;
         };
+        dialog.gradient = gradient;
         let area = frame.area();
         use ratatui::widgets::Widget as _;
         dialog.render(area, frame.buffer_mut());

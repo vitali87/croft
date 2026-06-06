@@ -13,6 +13,9 @@ const MAX_HEIGHT: u16 = 16;
 pub struct HoverPopup {
     pub lines: Vec<String>,
     pub anchor: (u16, u16),
+    /// Black theme: wear the orange→green gradient border instead of the
+    /// legacy bright-blue. Set by the app before render from `popup_gradient`.
+    pub gradient: bool,
 }
 
 impl HoverPopup {
@@ -20,6 +23,7 @@ impl HoverPopup {
         Self {
             lines: text.lines().map(|s| s.to_string()).collect(),
             anchor,
+            gradient: false,
         }
     }
 
@@ -90,6 +94,9 @@ impl Widget for &HoverPopup {
             .wrap(Wrap { trim: false });
         Widget::render(Clear, area, buf);
         para.render(area, buf);
+        if self.gradient {
+            crate::gradient::paint_gradient_box(buf, area);
+        }
     }
 }
 

@@ -572,7 +572,7 @@ pub fn build_file_index(root: &Path) -> Vec<FileEntry> {
     out
 }
 
-pub fn render_file_finder(finder: &mut FileFinder, area: Rect, buf: &mut Buffer) {
+pub fn render_file_finder(finder: &mut FileFinder, area: Rect, buf: &mut Buffer, gradient: bool) {
     let width = area.width.saturating_mul(7) / 10;
     let width = width.clamp(40, 100.min(area.width));
     let height = area.height.saturating_mul(6) / 10;
@@ -588,15 +588,16 @@ pub fn render_file_finder(finder: &mut FileFinder, area: Rect, buf: &mut Buffer)
     finder.last_rect = rect;
 
     Widget::render(Clear, rect, buf);
+    let title = Span::styled(
+        " Go to File — Esc to close, ↑/↓ to navigate, Enter to open ",
+        Style::default()
+            .fg(Color::Rgb(0xff, 0xff, 0xff))
+            .add_modifier(Modifier::BOLD),
+    );
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Rgb(0x4e, 0x9a, 0xff)))
-        .title(Span::styled(
-            " Go to File — Esc to close, ↑/↓ to navigate, Enter to open ",
-            Style::default()
-                .fg(Color::Rgb(0xff, 0xff, 0xff))
-                .add_modifier(Modifier::BOLD),
-        ))
+        .title(title.clone())
         .style(Style::default().bg(Color::Rgb(0x16, 0x18, 0x1f)));
     let inner = Rect {
         x: rect.x + 1,
@@ -605,6 +606,17 @@ pub fn render_file_finder(finder: &mut FileFinder, area: Rect, buf: &mut Buffer)
         height: rect.height.saturating_sub(2),
     };
     Widget::render(block, rect, buf);
+    // Black theme: gradient border over the solid one, then re-stamp the title.
+    if gradient {
+        crate::gradient::paint_gradient_box(buf, rect);
+        buf.set_span(rect.x + 1, rect.y, &title, title.width() as u16);
+    }
+    let sel_bg = if gradient {
+        let (r, g, b) = crate::gradient::POPUP_SEL_BG;
+        Color::Rgb(r, g, b)
+    } else {
+        Color::Rgb(0x1e, 0x3a, 0x6e)
+    };
 
     if inner.height == 0 || inner.width == 0 {
         return;
@@ -690,16 +702,12 @@ pub fn render_file_finder(finder: &mut FileFinder, area: Rect, buf: &mut Buffer)
         let row_idx = finder.scroll + offset;
         let is_selected = row_idx == finder.selected;
         let row_style = if is_selected {
-            Style::default()
-                .bg(Color::Rgb(0x1e, 0x3a, 0x6e))
-                .fg(Color::White)
+            Style::default().bg(sel_bg).fg(Color::White)
         } else {
             Style::default().fg(Color::Rgb(0xec, 0xef, 0xf4))
         };
         let dir_style = if is_selected {
-            Style::default()
-                .bg(Color::Rgb(0x1e, 0x3a, 0x6e))
-                .fg(Color::Rgb(0xa0, 0xb4, 0xd8))
+            Style::default().bg(sel_bg).fg(Color::Rgb(0xa0, 0xb4, 0xd8))
         } else {
             Style::default().fg(Color::Rgb(0x8e, 0x95, 0xa4))
         };

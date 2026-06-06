@@ -449,7 +449,12 @@ impl ShortcutsModal {
     }
 }
 
-pub fn render_shortcuts_modal(modal: &mut ShortcutsModal, area: Rect, buf: &mut Buffer) {
+pub fn render_shortcuts_modal(
+    modal: &mut ShortcutsModal,
+    area: Rect,
+    buf: &mut Buffer,
+    gradient: bool,
+) {
     let width = area.width.saturating_mul(8) / 10;
     let width = width.clamp(40, 110.min(area.width));
     let height = area.height.saturating_mul(8) / 10;
@@ -465,15 +470,16 @@ pub fn render_shortcuts_modal(modal: &mut ShortcutsModal, area: Rect, buf: &mut 
     modal.last_rect = rect;
 
     Widget::render(Clear, rect, buf);
+    let title = Span::styled(
+        " Shortcuts — Esc/q to close, ↑/↓ PgUp/PgDn Home/End to scroll ",
+        Style::default()
+            .fg(Color::Rgb(0xff, 0xff, 0xff))
+            .add_modifier(Modifier::BOLD),
+    );
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Rgb(0x4e, 0x9a, 0xff)))
-        .title(Span::styled(
-            " Shortcuts — Esc/q to close, ↑/↓ PgUp/PgDn Home/End to scroll ",
-            Style::default()
-                .fg(Color::Rgb(0xff, 0xff, 0xff))
-                .add_modifier(Modifier::BOLD),
-        ))
+        .title(title.clone())
         .style(Style::default().bg(Color::Rgb(0x16, 0x18, 0x1f)));
     let inner = Rect {
         x: rect.x + 1,
@@ -482,6 +488,11 @@ pub fn render_shortcuts_modal(modal: &mut ShortcutsModal, area: Rect, buf: &mut 
         height: rect.height.saturating_sub(2),
     };
     Widget::render(block, rect, buf);
+    // Black theme: gradient border over the solid one, then re-stamp the title.
+    if gradient {
+        crate::gradient::paint_gradient_box(buf, rect);
+        buf.set_span(rect.x + 1, rect.y, &title, title.width() as u16);
+    }
 
     let lines = modal.lines();
     modal.last_content_height = lines.len() as u16;

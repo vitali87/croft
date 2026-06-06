@@ -11,6 +11,12 @@ pub const GRAD_TR: (u8, u8, u8) = (0xec, 0x8c, 0x5a);
 pub const GRAD_BR: (u8, u8, u8) = (0x4f, 0xb1, 0xa6);
 pub const GRAD_BL: (u8, u8, u8) = (0x35, 0x80, 0x78);
 
+/// Muted dark-teal fill for the selected row of popups/menus under the Black
+/// theme, replacing the legacy bright-blue (`#4e9aff`) highlight inherited from
+/// the pre-brand VS Code accent. Quiet enough that the gradient border carries
+/// the brand identity; white text reads cleanly on top.
+pub const POPUP_SEL_BG: (u8, u8, u8) = (0x26, 0x4f, 0x4a);
+
 pub fn lerp_rgb(a: (u8, u8, u8), b: (u8, u8, u8), t: f32) -> (u8, u8, u8) {
     let t = t.clamp(0.0, 1.0);
     let mix = |x: u8, y: u8| ((1.0 - t) * x as f32 + t * y as f32).round() as u8;

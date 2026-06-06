@@ -155,7 +155,12 @@ pub fn match_index_at(
     None
 }
 
-pub fn render_editor_find(state: &mut EditorFind, editor_area: Rect, buf: &mut Buffer) {
+pub fn render_editor_find(
+    state: &mut EditorFind,
+    editor_area: Rect,
+    buf: &mut Buffer,
+    gradient: bool,
+) {
     if editor_area.width < 30 || editor_area.height < 3 {
         state.last_rect = Rect::default();
         return;
@@ -181,15 +186,16 @@ pub fn render_editor_find(state: &mut EditorFind, editor_area: Rect, buf: &mut B
         (total, Some(idx)) => format!(" Find — {idx} of {total} "),
         (total, None) => format!(" Find — {total} matches "),
     };
+    let title = Span::styled(
+        title,
+        Style::default()
+            .fg(Color::Rgb(0xff, 0xff, 0xff))
+            .add_modifier(Modifier::BOLD),
+    );
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Rgb(0x4e, 0x9a, 0xff)))
-        .title(Span::styled(
-            title,
-            Style::default()
-                .fg(Color::Rgb(0xff, 0xff, 0xff))
-                .add_modifier(Modifier::BOLD),
-        ))
+        .title(title.clone())
         .style(Style::default().bg(Color::Rgb(0x16, 0x18, 0x1f)));
     let inner = Rect {
         x: rect.x + 1,
@@ -198,6 +204,11 @@ pub fn render_editor_find(state: &mut EditorFind, editor_area: Rect, buf: &mut B
         height: rect.height.saturating_sub(2),
     };
     Widget::render(block, rect, buf);
+    // Black theme: gradient border over the solid one, then re-stamp the title.
+    if gradient {
+        crate::gradient::paint_gradient_box(buf, rect);
+        buf.set_span(rect.x + 1, rect.y, &title, title.width() as u16);
+    }
     if inner.width == 0 || inner.height == 0 {
         return;
     }

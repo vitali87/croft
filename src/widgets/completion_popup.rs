@@ -21,6 +21,9 @@ pub struct CompletionPopup {
     pub anchor: (u16, u16),
     pub path: PathBuf,
     pub request_id: u64,
+    /// Black theme: gradient border + muted dark-teal selection instead of the
+    /// legacy bright-blue. Set by the app before render from `popup_gradient`.
+    pub gradient: bool,
 }
 
 impl CompletionPopup {
@@ -38,6 +41,7 @@ impl CompletionPopup {
             anchor,
             path,
             request_id,
+            gradient: false,
         }
     }
 
@@ -177,9 +181,15 @@ impl Widget for &CompletionPopup {
             .border_style(Style::default().fg(Color::Rgb(0x4e, 0x9a, 0xff)))
             .style(Style::default().bg(Color::Rgb(0x1e, 0x21, 0x2a)));
 
+        let sel_bg = if self.gradient {
+            let (r, g, b) = crate::gradient::POPUP_SEL_BG;
+            Color::Rgb(r, g, b)
+        } else {
+            Color::Rgb(0x09, 0x67, 0xb8)
+        };
         let list = List::new(items).block(block).highlight_style(
             Style::default()
-                .bg(Color::Rgb(0x09, 0x67, 0xb8))
+                .bg(sel_bg)
                 .fg(Color::Rgb(0xff, 0xff, 0xff))
                 .add_modifier(Modifier::BOLD),
         );
@@ -188,6 +198,9 @@ impl Widget for &CompletionPopup {
         let mut state = ListState::default();
         state.select(Some(self.selected));
         StatefulWidget::render(list, area, buf, &mut state);
+        if self.gradient {
+            crate::gradient::paint_gradient_box(buf, area);
+        }
     }
 }
 

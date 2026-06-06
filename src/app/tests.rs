@@ -6,6 +6,88 @@ fn key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
     KeyEvent::new(code, mods)
 }
 
+#[test]
+fn explorer_boots_with_gradient_focus_under_black_theme() {
+    // Regression: the explorer auto-focuses at startup, but the Black-theme
+    // gradient border used to arm only on the first focus change because
+    // `sync_focus_flags` never ran during construction. `App::new` now syncs
+    // once before returning, so the initial focus already carries the gradient.
+    let tmp = tempfile::tempdir().unwrap();
+    let app = App::new(tmp.path().to_path_buf()).unwrap();
+    assert_eq!(app.theme, crate::theme::Theme::Black);
+    assert!(app.tree.focused, "explorer should boot focused");
+    assert!(
+        app.tree.focus_gradient,
+        "Black-theme gradient border must arm at startup, not just after a focus change"
+    );
+}
+
+#[test]
+fn popup_gradient_tracks_black_theme() {
+    // Popups/menus/tooltips wear the gradient + muted selection only under the
+    // Black theme; Croft Dark keeps the legacy bright-blue accent so it stays
+    // coherent with that theme's blue focus border.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.theme = crate::theme::Theme::Black;
+    assert!(app.popup_gradient());
+    app.theme = crate::theme::Theme::DarkBlue;
+    assert!(!app.popup_gradient());
+}
+
+#[test]
+fn black_theme_context_menu_uses_gradient_border_and_muted_selection() {
+    use crate::gradient::{GRAD_TL, POPUP_SEL_BG, rgb_color};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.theme = crate::theme::Theme::Black;
+    app.context_menu = Some(ContextMenu {
+        origin: (10, 10),
+        items: vec![
+            (
+                String::from("New File"),
+                MenuAction::Create(CreateKind::File),
+            ),
+            (
+                String::from("New Folder"),
+                MenuAction::Create(CreateKind::Folder),
+            ),
+        ],
+        selected: 0,
+        target_dir: tmp.path().to_path_buf(),
+    });
+    let backend = ratatui::backend::TestBackend::new(140, 50);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let buf = term.backend().buffer();
+    // The menu's top-left corner carries the gradient's TL colour, not blue.
+    assert_eq!(buf[(10, 10)].fg, rgb_color(GRAD_TL));
+    // The selected (first) row sits on the muted dark-teal fill.
+    assert_eq!(buf[(11, 11)].bg, rgb_color(POPUP_SEL_BG));
+}
+
+#[test]
+fn black_theme_status_bar_is_near_black_not_navy() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.theme = crate::theme::Theme::Black;
+    let backend = ratatui::backend::TestBackend::new(140, 50);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let buf = term.backend().buffer();
+    let last_y = buf.area.height - 1;
+    let near_black = Color::Rgb(0x18, 0x18, 0x18);
+    let navy = Color::Rgb(0x1e, 0x3a, 0x6e);
+    assert!(
+        (0..buf.area.width).any(|x| buf[(x, last_y)].bg == near_black),
+        "status bar should paint the near-black seam under the Black theme"
+    );
+    assert!(
+        !(0..buf.area.width).any(|x| buf[(x, last_y)].bg == navy),
+        "status bar must not keep the legacy navy under the Black theme"
+    );
+}
+
 fn dummy_activity_images() -> ActivityBarImages {
     let s = || String::from("\x1b]1337;File=inline=1:Zm9v\x07");
     ActivityBarImages {

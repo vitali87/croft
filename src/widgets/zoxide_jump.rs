@@ -198,19 +198,20 @@ fn display_path(path: &Path) -> String {
 /// the Explorer column vs. a centered fallback) is decided by the caller
 /// in `App::render_zoxide_jump`, which knows the pane layout; this widget
 /// just fills the box it is handed.
-pub fn render_zoxide_jump(jump: &mut ZoxideJump, rect: Rect, buf: &mut Buffer) {
+pub fn render_zoxide_jump(jump: &mut ZoxideJump, rect: Rect, buf: &mut Buffer, gradient: bool) {
     jump.last_rect = rect;
 
     Widget::render(Clear, rect, buf);
+    let title = Span::styled(
+        " Jump (zoxide) — Esc to close, ↑/↓ to navigate, Enter to jump ",
+        Style::default()
+            .fg(Color::Rgb(0xff, 0xff, 0xff))
+            .add_modifier(Modifier::BOLD),
+    );
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Rgb(0x4e, 0x9a, 0xff)))
-        .title(Span::styled(
-            " Jump (zoxide) — Esc to close, ↑/↓ to navigate, Enter to jump ",
-            Style::default()
-                .fg(Color::Rgb(0xff, 0xff, 0xff))
-                .add_modifier(Modifier::BOLD),
-        ))
+        .title(title.clone())
         .style(Style::default().bg(Color::Rgb(0x16, 0x18, 0x1f)));
     let inner = Rect {
         x: rect.x + 1,
@@ -219,6 +220,17 @@ pub fn render_zoxide_jump(jump: &mut ZoxideJump, rect: Rect, buf: &mut Buffer) {
         height: rect.height.saturating_sub(2),
     };
     Widget::render(block, rect, buf);
+    // Black theme: gradient border over the solid one, then re-stamp the title.
+    if gradient {
+        crate::gradient::paint_gradient_box(buf, rect);
+        buf.set_span(rect.x + 1, rect.y, &title, title.width() as u16);
+    }
+    let sel_bg = if gradient {
+        let (r, g, b) = crate::gradient::POPUP_SEL_BG;
+        Color::Rgb(r, g, b)
+    } else {
+        Color::Rgb(0x1e, 0x3a, 0x6e)
+    };
 
     if inner.height == 0 || inner.width == 0 {
         return;
@@ -322,9 +334,7 @@ pub fn render_zoxide_jump(jump: &mut ZoxideJump, rect: Rect, buf: &mut Buffer) {
         let row_idx = jump.scroll + offset;
         let is_selected = row_idx == jump.selected;
         let row_style = if is_selected {
-            Style::default()
-                .bg(Color::Rgb(0x1e, 0x3a, 0x6e))
-                .fg(Color::White)
+            Style::default().bg(sel_bg).fg(Color::White)
         } else {
             Style::default().fg(Color::Rgb(0xec, 0xef, 0xf4))
         };

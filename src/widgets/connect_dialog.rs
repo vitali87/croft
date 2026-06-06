@@ -58,6 +58,9 @@ pub struct ConnectDialog {
     pub caret_pos: Option<(u16, u16)>,
     pub submitted: bool,
     pub install_started_at: Option<Instant>,
+    /// Black theme: wear the orange→green gradient border instead of the legacy
+    /// bright-blue. Set by the app before render from `popup_gradient`.
+    pub gradient: bool,
 }
 
 const SPINNER_FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
@@ -89,6 +92,7 @@ impl ConnectDialog {
             caret_pos: None,
             submitted: false,
             install_started_at: None,
+            gradient: false,
         }
     }
 
@@ -291,15 +295,19 @@ impl Widget for &mut ConnectDialog {
             .fg(Color::White)
             .bg(PANEL_BG)
             .add_modifier(Modifier::BOLD);
+        let title = Span::styled(format!(" Connect — {} ", self.host), title_style);
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(ACCENT).bg(PANEL_BG))
-            .title(Span::styled(
-                format!(" Connect — {} ", self.host),
-                title_style,
-            ));
+            .title(title.clone());
         let inner = block.inner(rect);
         block.render(rect, buf);
+        // Black theme: overpaint the solid border with the gradient, then
+        // re-stamp the title the gradient top edge just covered.
+        if self.gradient {
+            crate::gradient::paint_gradient_box(buf, rect);
+            buf.set_span(rect.x + 1, rect.y, &title, title.width() as u16);
+        }
         self.last_area = rect;
         self.last_inner = inner;
 
