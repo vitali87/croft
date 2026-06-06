@@ -265,6 +265,44 @@ const RUST_MODULE_OVERLAY_QUERY: &str = r#"
 (enum_variant name: (identifier) @constant)
 "#;
 
+/// Appended AFTER `RUST_MODULE_OVERLAY_QUERY` so it wins under last-match-wins.
+/// Colours `use` declarations the way rust-analyzer resolves them, killing the
+/// most visible cold-open snap: the whole import block at the top of a file,
+/// which the bundled query paints blue/grey and RA repaints yellow ~1-3s later
+/// once crate-graph analysis lands.
+///
+/// This is the Rust counterpart of Python's `PYTHON_NAMESPACE_TYPE_OVERLAY_QUERY`,
+/// but restricted to `use` position rather than a blanket CamelCase rule. In
+/// Rust a blanket `(identifier) @type (#match? "^[A-Z]...")` would collide with
+/// enum variants: `Some` / `None` / `Ok` / `Err` and custom variants are
+/// CamelCase bare identifiers too, yet RA paints them `enumMember` (orange), not
+/// type-yellow, and syntax cannot tell a variant from a type in expression
+/// position. Inside a `use` path there is no such ambiguity: `Some`/`None`/etc.
+/// are prelude items never written in `use`, so every capitalized import name is
+/// a type/trait/struct (yellow) and every lowercase path segment is a module
+/// (yellow `@module`). Empirically (token diff against RA's cached tokens for
+/// the real src/remote.rs) imports are the single biggest type-coloured snap.
+///
+///   - Imported type/trait/struct names -> `@type`. `^[A-Z].*[a-z]` (a capital
+///     plus a lowercase) excludes ALL_CAPS const imports, which RA paints as
+///     `const` (orange) and the bundled `@constant` rule already handles.
+///   - Brace-list module heads (`anyhow` in `anyhow::{...}`, `thread` in
+///     `std::thread::{...}`) which the `scoped_identifier` module overlay does
+///     not reach because a `scoped_use_list` path is not a `scoped_identifier`.
+const RUST_USE_OVERLAY_QUERY: &str = r#"
+((use_declaration argument: (scoped_identifier name: (identifier) @type))
+ (#match? @type "^[A-Z].*[a-z]"))
+((use_list (identifier) @type)
+ (#match? @type "^[A-Z].*[a-z]"))
+((use_as_clause alias: (identifier) @type)
+ (#match? @type "^[A-Z].*[a-z]"))
+
+((scoped_use_list path: (identifier) @module)
+ (#match? @module "^[a-z]"))
+((scoped_use_list path: (scoped_identifier name: (identifier) @module))
+ (#match? @module "^[a-z]"))
+"#;
+
 /// Local-scope query for Rust, passed as the locals slot of
 /// `HighlightConfiguration::new`. tree-sitter-rust ships no locals query, so
 /// without this a parameter is coloured only at its declaration site (by the
@@ -392,10 +430,11 @@ fn build_config(kind: LangKind) -> Option<HighlightConfiguration> {
             // its node also carries a highlights capture). Bundled specific
             // rules follow and win under last-match-wins.
             let highlights = format!(
-                "{}\n{}\n{}",
+                "{}\n{}\n{}\n{}",
                 RUST_IDENTIFIER_OVERLAY_QUERY,
                 tree_sitter_rust::HIGHLIGHTS_QUERY,
                 RUST_MODULE_OVERLAY_QUERY,
+                RUST_USE_OVERLAY_QUERY,
             );
             HighlightConfiguration::new(
                 tree_sitter_rust::LANGUAGE.into(),
@@ -1353,6 +1392,97 @@ def f() -> Config:\n\
         );
         let dark = span_at(&h[1], l1, "Dark").expect("Dark variant span");
         assert_eq!(dark.style.fg, constant_c);
+    }
+
+    #[test]
+    fn highlight_rust_colors_use_imports_to_match_lsp() {
+        // rust-analyzer paints `use` paths by resolved kind: module segments
+        // (`std`, `collections`, `anyhow`) as `namespace` (yellow) and imported
+        // type/trait/struct names (`BTreeSet`, `Context`, `Result`) as
+        // `struct`/`interface`/`typeAlias` (yellow). The bundled
+        // tree-sitter-rust query colours capitalized use-list items
+        // `@constructor` (blue) and a brace-list module head plain @variable
+        // (grey), so the whole import block snaps blue/grey -> yellow ~1-3s
+        // after open when RA's semantic overlay lands. Colour them in the base
+        // so imports never snap. This is the UNAMBIGUOUS slice of
+        // "CamelCase == type": `Some`/`None`/`Ok`/`Err` never appear in `use`,
+        // so unlike a blanket CamelCase rule there is no enum-variant collision.
+        let mut reg = LangRegistry::new();
+        let src = "use std::collections::BTreeSet;\nuse anyhow::{Context, Result};\n";
+        let ls = compute_line_starts(src.as_bytes());
+        let h = highlight_text(&mut reg, LangKind::Rust, src.as_bytes(), &ls);
+        let yellow = Some(rgb(0xeb, 0xcb, 0x8b));
+
+        let l0 = "use std::collections::BTreeSet;";
+        for (needle, label) in [
+            ("std", "module head `std`"),
+            ("collections", "module segment `collections`"),
+            ("BTreeSet", "imported struct `BTreeSet`"),
+        ] {
+            let sp = span_at(&h[0], l0, needle).unwrap_or_else(|| panic!("no span: {label}"));
+            assert_eq!(sp.style.fg, yellow, "{label}");
+        }
+
+        let l1 = "use anyhow::{Context, Result};";
+        for (needle, label) in [
+            ("anyhow", "brace-list module head `anyhow`"),
+            ("Context", "imported trait `Context` in list"),
+            ("Result", "imported type alias `Result` in list"),
+        ] {
+            let sp = span_at(&h[1], l1, needle).unwrap_or_else(|| panic!("no span: {label}"));
+            assert_eq!(sp.style.fg, yellow, "{label}");
+        }
+    }
+
+    #[test]
+    fn highlight_rust_colors_capitalized_scoped_path_heads_as_types() {
+        // Regression guard for existing behaviour (the bundled
+        // `scoped_identifier path -> @type` rule, kept winning over the
+        // prepended `(identifier) @variable` carrier and the use overlay): the
+        // capitalized head of a `::` path is a type, and rust-analyzer paints it
+        // `struct`/`enum` (yellow). This already holds for real (non-macro)
+        // scoped calls like `String::from(..)`; the empirically-observed blue
+        // `String` tokens that still snap are inside macro token trees
+        // (`vec![..]`, `format!(..)`), where tree-sitter sees only unparsed
+        // identifier tokens and no syntactic rule can recover the type. Those
+        // are left to the LSP/disk cache, matching the 0.1.315 doctrine.
+        let mut reg = LangRegistry::new();
+        let src = "fn g() {\n    let _ = String::from(\"x\");\n    let _ = Command::new(\"y\");\n    let _ = Shade::Dark;\n}\n";
+        let ls = compute_line_starts(src.as_bytes());
+        let h = highlight_text(&mut reg, LangKind::Rust, src.as_bytes(), &ls);
+        let yellow = Some(rgb(0xeb, 0xcb, 0x8b));
+        for (row, line, head) in [
+            (1usize, "    let _ = String::from(\"x\");", "String"),
+            (2, "    let _ = Command::new(\"y\");", "Command"),
+            (3, "    let _ = Shade::Dark;", "Shade"),
+        ] {
+            let sp = span_at(&h[row], line, head).unwrap_or_else(|| panic!("no span: {head}"));
+            assert_eq!(
+                sp.style.fg, yellow,
+                "scoped path head `{head}` must be type-yellow"
+            );
+        }
+    }
+
+    #[test]
+    fn highlight_rust_use_overlay_does_not_yellow_enum_variants_in_body() {
+        // The use-import type rule must NOT leak to expression position: `Some`
+        // referenced in a body is an enum member, which RA paints orange, not
+        // type-yellow. The tree-sitter base cannot disambiguate variant-vs-type
+        // in expression position (the LSP/cache covers that residual), so it
+        // must keep the bundled colour here rather than be turned yellow.
+        // Guards against regressing to a blanket CamelCase->type rule.
+        let mut reg = LangRegistry::new();
+        let src = "fn f() {\n    let _ = Some(1);\n}\n";
+        let ls = compute_line_starts(src.as_bytes());
+        let h = highlight_text(&mut reg, LangKind::Rust, src.as_bytes(), &ls);
+        let yellow = Some(rgb(0xeb, 0xcb, 0x8b));
+        let l1 = "    let _ = Some(1);";
+        let some = span_at(&h[1], l1, "Some").expect("a span covers `Some`");
+        assert_ne!(
+            some.style.fg, yellow,
+            "an enum variant in expression position must not be coloured type-yellow"
+        );
     }
 
     #[test]
