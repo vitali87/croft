@@ -47,7 +47,7 @@ pub const ACTIVITY_RUN_DEBUG: char = '\u{eb91}';
 /// Codicon `gear` (a.k.a. `settings-gear`) — the cogwheel VS Code uses for
 /// its bottom-left "Manage" button. Verified against the Nerd Fonts CSS
 /// (`.nf-cod-gear`) which pins it to **U+EB51**. Glyph-fallback only; the
-/// image path bakes the rasterised `settings_gear_src.png` instead.
+/// image path rasterises `assets/icons/settings_gear.svg` instead.
 pub const ACTIVITY_SETTINGS: char = '\u{eb51}';
 
 pub fn for_path(name: &str, suffix: &str) -> Icon {
