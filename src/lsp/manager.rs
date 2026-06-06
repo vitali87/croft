@@ -11,13 +11,12 @@ use lsp_types::{
     CompletionItemKindCapability, CompletionResponse, DeclarationCapability,
     DocumentChangeOperation, DocumentChanges, GotoDefinitionResponse, HoverContents,
     HoverProviderCapability, ImplementationProviderCapability, Location, MarkedString, MarkupKind,
-    OneOf, Position, PublishDiagnosticsClientCapabilities, SemanticTokenModifier, SemanticTokenType,
-    SemanticTokensClientCapabilities,
-    SemanticTokensClientCapabilitiesRequests, SemanticTokensFullOptions, SemanticTokensRangeResult,
-    SemanticTokensResult, SemanticTokensServerCapabilities,
-    SemanticTokensWorkspaceClientCapabilities, ServerCapabilities, TextDocumentClientCapabilities,
-    TextEdit, TokenFormat, TypeDefinitionProviderCapability, Url, WorkspaceClientCapabilities,
-    WorkspaceEdit,
+    OneOf, Position, PublishDiagnosticsClientCapabilities, SemanticTokenModifier,
+    SemanticTokenType, SemanticTokensClientCapabilities, SemanticTokensClientCapabilitiesRequests,
+    SemanticTokensFullOptions, SemanticTokensRangeResult, SemanticTokensResult,
+    SemanticTokensServerCapabilities, SemanticTokensWorkspaceClientCapabilities,
+    ServerCapabilities, TextDocumentClientCapabilities, TextEdit, TokenFormat,
+    TypeDefinitionProviderCapability, Url, WorkspaceClientCapabilities, WorkspaceEdit,
 };
 use tokio::sync::{Mutex as TokioMutex, mpsc as tokio_mpsc};
 

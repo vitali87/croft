@@ -2726,8 +2726,9 @@ impl App {
             // Diagnostic on top, type info below (VS Code PR #166560). Either
             // side may be empty; an all-empty compose hides the popup.
             let anchor = self.hover_anchor.unwrap_or((0, 0));
-            self.hover_popup = compose_hover(self.hover_diagnostic.as_deref(), result.text.as_deref())
-                .map(|text| crate::widgets::hover_popup::HoverPopup::new(text, anchor));
+            self.hover_popup =
+                compose_hover(self.hover_diagnostic.as_deref(), result.text.as_deref())
+                    .map(|text| crate::widgets::hover_popup::HoverPopup::new(text, anchor));
             changed = true;
         }
         changed

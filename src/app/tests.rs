@@ -32,7 +32,9 @@ fn format_diagnostics_labels_each_message_and_sorts_errors_first() {
     ];
     assert_eq!(
         format_diagnostics(&diags),
-        Some(String::from("Error: type mismatch\n\nWarning: unused variable")),
+        Some(String::from(
+            "Error: type mismatch\n\nWarning: unused variable"
+        )),
         "errors must come before warnings and each line is labelled by severity"
     );
     assert_eq!(
@@ -47,7 +49,9 @@ fn compose_hover_puts_the_diagnostic_above_the_type_info() {
     // VS Code (PR microsoft/vscode#166560) renders marker hovers on top.
     assert_eq!(
         compose_hover(Some("Error: type mismatch"), Some("const x: number")),
-        Some(String::from("Error: type mismatch\n────────\nconst x: number")),
+        Some(String::from(
+            "Error: type mismatch\n────────\nconst x: number"
+        )),
         "the diagnostic block sits above the language hover, divided by a rule"
     );
     assert_eq!(

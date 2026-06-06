@@ -5278,7 +5278,10 @@ mod tests {
         );
         assert_eq!(
             e.diagnostics_at(0, 6),
-            vec![(DiagnosticSeverity::Warning, String::from("missing semicolon"))],
+            vec![(
+                DiagnosticSeverity::Warning,
+                String::from("missing semicolon")
+            )],
             "a zero-width diagnostic must still be hoverable over its one widened cell"
         );
     }
