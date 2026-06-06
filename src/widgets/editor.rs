@@ -1758,6 +1758,15 @@ impl Editor {
         self.recompute_semantic_overlay();
     }
 
+    /// The buffer text to key a semantic-token cache entry on, but only when
+    /// the buffer is clean: a dirty buffer no longer matches the on-disk
+    /// content the next open will read, so caching it would key the entry under
+    /// the wrong content. Returns the same normalised (`\n`-joined) text the
+    /// app sends to the server, so the key matches on both store and load.
+    pub fn clean_cache_text(&self) -> Option<String> {
+        (!self.dirty).then(|| self.lines.join("\n"))
+    }
+
     #[cfg(test)]
     pub(crate) fn semantic_overlay_for_test(&self) -> &[Vec<HiSpan>] {
         &self.semantic_overlay

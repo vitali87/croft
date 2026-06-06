@@ -2442,6 +2442,12 @@ impl App {
         // whole-document request.
         type DocSync = (bool, PathBuf, String, u64, Option<(u32, u32)>);
         let mut to_send: Vec<DocSync> = Vec::new();
+        // Semantic-token batches recovered from the on-disk cache for files
+        // being opened this tick. Applied after the tab loop (which borrows the
+        // editor immutably) so the correct colours paint on the first frame,
+        // before the server finishes its ~1.8s cold analysis. See
+        // `crate::lsp::semantic_cache`.
+        let mut cache_hits: Vec<(PathBuf, std::sync::Arc<Vec<String>>, Vec<u32>)> = Vec::new();
         for tab in self.editor.iter_tabs() {
             if tab.image.is_some() || tab.sheet.is_some() || tab.diff.is_some() {
                 continue;
@@ -2463,13 +2469,16 @@ impl App {
                     // before the full-document reply lands.
                     let start = tab.scroll as u32;
                     let end = (tab.scroll + tab.page_size() + 16).min(tab.lines.len()) as u32;
-                    to_send.push((
-                        true,
-                        path.clone(),
-                        tab.lines.join("\n"),
-                        seq,
-                        Some((start, end)),
-                    ));
+                    let text = tab.lines.join("\n");
+                    // Paint the last-known semantic colours instantly from the
+                    // disk cache, so an import-heavy file does not flash grey
+                    // then snap to the server's class/namespace colours seconds
+                    // later. A hit is identical to what the server will send, so
+                    // the live reply is a no-op repaint.
+                    if let Some((legend, data)) = crate::lsp::semantic_cache::load(path, &text) {
+                        cache_hits.push((path.clone(), legend, data));
+                    }
+                    to_send.push((true, path.clone(), text, seq, Some((start, end))));
                 }
                 Some(p) if p != seq => {
                     to_send.push((false, path.clone(), tab.lines.join("\n"), seq, None))
@@ -2513,6 +2522,21 @@ impl App {
             // Drop the closed file's diagnostics so the store doesn't grow
             // unbounded across a long session of opening and closing files.
             self.lsp_diagnostics.remove(&p);
+        }
+        // Paint cached semantic colours onto the visible editor(s) now that the
+        // immutable tab borrow above has ended. `is_full = true` so a later
+        // server `range` reply can't blank the off-screen colours, and the
+        // identical `full` reply repaints to the same pixels (no snap).
+        for (path, legend, data) in cache_hits {
+            if self.editor.path.as_deref() == Some(path.as_path()) {
+                self.editor
+                    .apply_semantic_tokens(path.clone(), data.clone(), legend.clone(), true);
+            }
+            if let Some(split) = self.editor_split.as_mut()
+                && split.path.as_deref() == Some(path.as_path())
+            {
+                split.apply_semantic_tokens(path, data, legend, true);
+            }
         }
     }
 
@@ -2761,8 +2785,32 @@ impl App {
             if let Some(split) = self.editor_split.as_mut()
                 && split.path.as_deref() == Some(u.path.as_path())
             {
-                split.apply_semantic_tokens(u.path, u.data, u.legend, u.is_full);
+                split.apply_semantic_tokens(
+                    u.path.clone(),
+                    u.data.clone(),
+                    u.legend.clone(),
+                    u.is_full,
+                );
                 changed = true;
+            }
+            // Persist whole-document batches so the next open of this exact
+            // content paints these colours instantly instead of waiting out the
+            // server's cold analysis. Only when a visible editor holds the file
+            // unchanged, so the cache key matches the bytes the next open reads.
+            if u.is_full {
+                let clean_text = (self.editor.path.as_deref() == Some(u.path.as_path()))
+                    .then(|| self.editor.clean_cache_text())
+                    .flatten()
+                    .or_else(|| {
+                        self.editor_split.as_ref().and_then(|s| {
+                            (s.path.as_deref() == Some(u.path.as_path()))
+                                .then(|| s.clean_cache_text())
+                                .flatten()
+                        })
+                    });
+                if let Some(text) = clean_text {
+                    crate::lsp::semantic_cache::store(&u.path, &text, &u.legend, &u.data);
+                }
             }
         }
         changed

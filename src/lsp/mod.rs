@@ -9,6 +9,7 @@ pub mod log_file;
 pub mod manager;
 pub mod registry;
 pub mod runtime;
+pub mod semantic_cache;
 
 pub use client::LspClient;
 pub use config::{Language, ServerConfig};
