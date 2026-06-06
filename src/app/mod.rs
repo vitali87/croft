@@ -916,6 +916,11 @@ pub struct App {
     hover_request_id: Option<u64>,
     hover_anchor: Option<(u16, u16)>,
     hover_word: Option<(usize, usize, usize)>,
+    /// Diagnostic block for the point a hover is anchored to, captured
+    /// synchronously when the dwell fires (server diagnostics already live in
+    /// the editor). Stacked above the async LSP hover reply by `compose_hover`
+    /// so a squiggle's message shows even when the server returns no type info.
+    hover_diagnostic: Option<String>,
     /// Separate dwell timer for the editor tab strip. Hovering a tab for
     /// `HOVER_DELAY` surfaces `tab_tooltip` with the tab's full path so
     /// same-named files can be told apart. Kept distinct from `hover`
@@ -1504,6 +1509,7 @@ impl App {
             hover_request_id: None,
             hover_anchor: None,
             hover_word: None,
+            hover_diagnostic: None,
             tab_hover: HoverDwell::default(),
             tab_tooltip: None,
             tab_hover_idx: None,
@@ -2499,6 +2505,7 @@ impl App {
             self.hover.clear();
             self.hover_popup = None;
             self.hover_word = None;
+            self.hover_diagnostic = None;
             self.hover_request_id = None;
             if self.tab_hover_idx != Some(idx) {
                 self.tab_hover.on_move(std::time::Instant::now(), col, row);
@@ -2514,6 +2521,7 @@ impl App {
             self.hover.clear();
             self.hover_popup = None;
             self.hover_word = None;
+            self.hover_diagnostic = None;
             self.hover_request_id = None;
             return;
         }
@@ -2522,10 +2530,11 @@ impl App {
             let current = self
                 .editor
                 .buffer_pos_at(col, row)
-                .and_then(|(line, c)| self.editor.word_at(line, c).map(|(s, e)| (line, s, e)));
+                .and_then(|(line, c)| self.editor.hover_region_at(line, c));
             if current != self.hover_word {
                 self.hover_popup = None;
                 self.hover_word = None;
+                self.hover_diagnostic = None;
                 self.hover_request_id = None;
             }
         }
@@ -2546,22 +2555,43 @@ impl App {
         let Some((col, row)) = self.hover.cell() else {
             return;
         };
+        self.hover_at_cell(col, row);
+    }
+
+    /// Resolve a hover at screen cell `(col, row)`: capture any diagnostic
+    /// under the point synchronously and, for a real identifier, fire the
+    /// async `textDocument/hover`. Split out of `poll_hover` so the dwell
+    /// timer doesn't have to be driven to test the resolution logic.
+    fn hover_at_cell(&mut self, col: u16, row: u16) {
         let Some((line, c)) = self.editor.buffer_pos_at(col, row) else {
             return;
         };
-        let Some((start, end)) = self.editor.word_at(line, c) else {
+        // The region (word, or else a diagnostic span over punctuation) the
+        // popup belongs to. Nothing of interest under the point → no hover.
+        let Some(region) = self.editor.hover_region_at(line, c) else {
             return;
         };
-        let Some(path) = self.editor.path.clone() else {
-            return;
-        };
-        let Some(lsp) = self.lsp.as_mut() else {
-            return;
-        };
-        let id = lsp.request_hover(path, line as u32, c as u32);
-        self.hover_request_id = Some(id);
         self.hover_anchor = Some((col, row));
-        self.hover_word = Some((line, start, end));
+        self.hover_word = Some(region);
+        // Server diagnostics are already in the editor, so capture the
+        // message synchronously; the squiggle's message must show even if the
+        // server has no type info (or no LSP is attached at all).
+        self.hover_diagnostic = format_diagnostics(&self.editor.diagnostics_at(line, c));
+        // Only a real word is worth a `textDocument/hover` round-trip; over
+        // punctuation there is no symbol to describe, so show the diagnostic
+        // alone right away.
+        let word = self.editor.word_at(line, c).is_some();
+        match (word, self.editor.path.clone(), self.lsp.as_mut()) {
+            (true, Some(path), Some(lsp)) => {
+                let id = lsp.request_hover(path, line as u32, c as u32);
+                self.hover_request_id = Some(id);
+            }
+            _ => {
+                self.hover_request_id = None;
+                self.hover_popup = compose_hover(self.hover_diagnostic.as_deref(), None)
+                    .map(|text| crate::widgets::hover_popup::HoverPopup::new(text, (col, row)));
+            }
+        }
     }
 
     /// Fire the tab-strip tooltip once its dwell crosses `HOVER_DELAY`.
@@ -2605,18 +2635,15 @@ impl App {
                 .hover
                 .cell()
                 .and_then(|(c, r)| self.editor.buffer_pos_at(c, r))
-                .and_then(|(line, ch)| self.editor.word_at(line, ch).map(|(s, e)| (line, s, e)));
+                .and_then(|(line, ch)| self.editor.hover_region_at(line, ch));
             if current != self.hover_word {
                 continue;
             }
-            match result.text {
-                Some(text) => {
-                    let anchor = self.hover_anchor.unwrap_or((0, 0));
-                    self.hover_popup =
-                        Some(crate::widgets::hover_popup::HoverPopup::new(text, anchor));
-                }
-                None => self.hover_popup = None,
-            }
+            // Diagnostic on top, type info below (VS Code PR #166560). Either
+            // side may be empty; an all-empty compose hides the popup.
+            let anchor = self.hover_anchor.unwrap_or((0, 0));
+            self.hover_popup = compose_hover(self.hover_diagnostic.as_deref(), result.text.as_deref())
+                .map(|text| crate::widgets::hover_popup::HoverPopup::new(text, anchor));
             changed = true;
         }
         changed
@@ -2965,6 +2992,7 @@ impl App {
 
     fn open_at(&mut self, path: &Path, row: usize, col: usize) -> Result<()> {
         self.hover_popup = None;
+        self.hover_diagnostic = None;
         self.editor.open_preview(path)?;
         self.sync_open_file_poll_mtime();
         let row = row.min(self.editor.lines.len().saturating_sub(1));
@@ -5054,6 +5082,7 @@ impl App {
             return Ok(());
         }
         self.hover_popup = None;
+        self.hover_diagnostic = None;
         self.hover_request_id = None;
         if self.connect_dialog.is_some() {
             self.handle_connect_dialog_key(key);
@@ -9296,6 +9325,7 @@ impl App {
             return;
         }
         self.hover_popup = None;
+        self.hover_diagnostic = None;
         // Any click dismisses the tab tooltip (selecting/closing a tab,
         // or clicking elsewhere) so it can't linger over the new state.
         self.tab_tooltip = None;
@@ -13034,6 +13064,57 @@ fn key_to_bytes(key: KeyEvent) -> Vec<u8> {
             }
         }
         _ => Vec::new(),
+    }
+}
+
+/// Divider drawn between the diagnostic block and the language hover content,
+/// mirroring the horizontal rule VS Code renders between hover sections.
+const HOVER_DIVIDER: &str = "────────";
+
+/// Render the diagnostics under the hovered point into a single labelled text
+/// block, errors first (so the most severe message leads), each line prefixed
+/// with its severity. `None` when there are no diagnostics. The severity word
+/// answers the user's "what type of error is it" directly, since a TUI can't
+/// show VS Code's coloured marker icon.
+fn format_diagnostics(
+    diags: &[(crate::lsp::manager::DiagnosticSeverity, String)],
+) -> Option<String> {
+    use crate::lsp::manager::DiagnosticSeverity;
+    if diags.is_empty() {
+        return None;
+    }
+    let rank = |s: &DiagnosticSeverity| match s {
+        DiagnosticSeverity::Error => 0,
+        DiagnosticSeverity::Warning => 1,
+        DiagnosticSeverity::Information => 2,
+        DiagnosticSeverity::Hint => 3,
+    };
+    let label = |s: &DiagnosticSeverity| match s {
+        DiagnosticSeverity::Error => "Error",
+        DiagnosticSeverity::Warning => "Warning",
+        DiagnosticSeverity::Information => "Info",
+        DiagnosticSeverity::Hint => "Hint",
+    };
+    let mut ordered: Vec<&(DiagnosticSeverity, String)> = diags.iter().collect();
+    ordered.sort_by_key(|(s, _)| rank(s));
+    Some(
+        ordered
+            .iter()
+            .map(|(s, m)| format!("{}: {}", label(s), m))
+            .collect::<Vec<_>>()
+            .join("\n\n"),
+    )
+}
+
+/// Stack the diagnostic block above the language hover content, divided by a
+/// rule, matching VS Code (PR microsoft/vscode#166560 put marker hovers on
+/// top). Either side may be absent; `None` when both are.
+fn compose_hover(diagnostic: Option<&str>, hover: Option<&str>) -> Option<String> {
+    match (diagnostic, hover) {
+        (Some(d), Some(h)) => Some(format!("{d}\n{HOVER_DIVIDER}\n{h}")),
+        (Some(d), None) => Some(d.to_string()),
+        (None, Some(h)) => Some(h.to_string()),
+        (None, None) => None,
     }
 }
 

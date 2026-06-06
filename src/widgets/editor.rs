@@ -3305,6 +3305,88 @@ impl Editor {
         }
         Some((start, end))
     }
+
+    /// Severities and messages of every diagnostic whose range covers the
+    /// character position `(line, ch)`. Decoded on demand from the retained
+    /// `diagnostics` (UTF-16 positions) rather than the per-line span cache so
+    /// the messages don't have to be duplicated into the render-time cache.
+    /// Only runs on a hover dwell, never per frame. A zero-width diagnostic is
+    /// widened to one cell to match the underline, so a point diagnostic is
+    /// still hoverable. Returns an empty vec when no squiggle is under the
+    /// point (and when the retained batch belongs to another file).
+    pub fn diagnostics_at(
+        &self,
+        line: usize,
+        ch: usize,
+    ) -> Vec<(crate::lsp::manager::DiagnosticSeverity, String)> {
+        if self.diagnostics_path.as_deref() != self.path.as_deref() {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        for d in &self.diagnostics {
+            let start_line = d.start_line as usize;
+            let end_line = d.end_line as usize;
+            if line < start_line || line > end_line {
+                continue;
+            }
+            let Some(text) = self.lines.get(line) else {
+                continue;
+            };
+            let from = if line == start_line {
+                utf16_to_char_col(text, d.start_char)
+            } else {
+                0
+            };
+            let to = if line == end_line {
+                utf16_to_char_col(text, d.end_char)
+            } else {
+                text.chars().count()
+            };
+            let to = to.max(from + 1);
+            if ch >= from && ch < to {
+                out.push((d.severity, d.message.clone()));
+            }
+        }
+        out
+    }
+
+    /// The region a hover popup should be keyed to at `(line, ch)`: the word
+    /// range when one is under the point, otherwise the span of the first
+    /// diagnostic covering it (so a squiggle on punctuation, e.g. a `..`
+    /// syntax error, still anchors and dismisses a hover). `None` when neither
+    /// is present. Shared by `poll_hover`, `drain_lsp_hover`, and the
+    /// mouse-move dismissal so all three agree on what the popup belongs to.
+    pub fn hover_region_at(&self, line: usize, ch: usize) -> Option<(usize, usize, usize)> {
+        if let Some((start, end)) = self.word_at(line, ch) {
+            return Some((line, start, end));
+        }
+        if self.diagnostics_path.as_deref() != self.path.as_deref() {
+            return None;
+        }
+        for d in &self.diagnostics {
+            let start_line = d.start_line as usize;
+            let end_line = d.end_line as usize;
+            if line < start_line || line > end_line {
+                continue;
+            }
+            let text = self.lines.get(line)?;
+            let from = if line == start_line {
+                utf16_to_char_col(text, d.start_char)
+            } else {
+                0
+            };
+            let to = if line == end_line {
+                utf16_to_char_col(text, d.end_char)
+            } else {
+                text.chars().count()
+            };
+            let to = to.max(from + 1);
+            if ch >= from && ch < to {
+                return Some((line, from, to));
+            }
+        }
+        None
+    }
 }
 
 /// Convert a char index within `s` to a byte index, saturating at `s.len()`.
@@ -5133,6 +5215,92 @@ mod tests {
         assert!(
             e.diagnostic_spans_for_test().iter().all(|l| l.is_empty()),
             "an empty batch must erase the squiggles"
+        );
+    }
+
+    #[test]
+    fn diagnostics_at_returns_messages_covering_the_point() {
+        use crate::lsp::manager::{Diagnostic, DiagnosticSeverity};
+        let mut e = editor_with("const x = 1;");
+        let p = std::path::PathBuf::from("/tmp/diag.ts");
+        e.path = Some(p.clone());
+        // Underline the `x` (chars 6..7) with a real message.
+        e.apply_diagnostics(
+            p,
+            vec![Diagnostic {
+                start_line: 0,
+                start_char: 6,
+                end_line: 0,
+                end_char: 7,
+                severity: DiagnosticSeverity::Error,
+                message: String::from("Type 'number' is not assignable to type 'string'."),
+            }],
+        );
+        assert_eq!(
+            e.diagnostics_at(0, 6),
+            vec![(
+                DiagnosticSeverity::Error,
+                String::from("Type 'number' is not assignable to type 'string'.")
+            )],
+            "a point inside the diagnostic range must surface its message"
+        );
+        assert!(
+            e.diagnostics_at(0, 0).is_empty(),
+            "a point outside every diagnostic range must surface nothing"
+        );
+    }
+
+    #[test]
+    fn diagnostics_at_widens_a_zero_width_diagnostic_to_one_cell() {
+        use crate::lsp::manager::{Diagnostic, DiagnosticSeverity};
+        let mut e = editor_with("const x = 1;");
+        let p = std::path::PathBuf::from("/tmp/diag.ts");
+        e.path = Some(p.clone());
+        e.apply_diagnostics(
+            p,
+            vec![Diagnostic {
+                start_line: 0,
+                start_char: 6,
+                end_line: 0,
+                end_char: 6,
+                severity: DiagnosticSeverity::Warning,
+                message: String::from("missing semicolon"),
+            }],
+        );
+        assert_eq!(
+            e.diagnostics_at(0, 6),
+            vec![(DiagnosticSeverity::Warning, String::from("missing semicolon"))],
+            "a zero-width diagnostic must still be hoverable over its one widened cell"
+        );
+    }
+
+    #[test]
+    fn hover_region_at_prefers_the_word_then_falls_back_to_the_diagnostic_span() {
+        use crate::lsp::manager::{Diagnostic, DiagnosticSeverity};
+        // `a.b` — the `.` at char 1 is not a word char, but a diagnostic covers it.
+        let mut e = editor_with("a.b");
+        let p = std::path::PathBuf::from("/tmp/dot.ts");
+        e.path = Some(p.clone());
+        e.apply_diagnostics(
+            p,
+            vec![Diagnostic {
+                start_line: 0,
+                start_char: 1,
+                end_line: 0,
+                end_char: 2,
+                severity: DiagnosticSeverity::Error,
+                message: String::from("unexpected token"),
+            }],
+        );
+        assert_eq!(
+            e.hover_region_at(0, 0),
+            Some((0, 0, 1)),
+            "over the `a` identifier the region is the word range"
+        );
+        assert_eq!(
+            e.hover_region_at(0, 1),
+            Some((0, 1, 2)),
+            "over the punctuation `.` the region falls back to the covering diagnostic span"
         );
     }
 

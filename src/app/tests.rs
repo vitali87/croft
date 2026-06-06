@@ -22,6 +22,93 @@ fn dummy_activity_images() -> ActivityBarImages {
 }
 
 #[test]
+fn format_diagnostics_labels_each_message_and_sorts_errors_first() {
+    use crate::lsp::manager::DiagnosticSeverity;
+    let diags = vec![
+        (DiagnosticSeverity::Warning, String::from("unused variable")),
+        (DiagnosticSeverity::Error, String::from("type mismatch")),
+    ];
+    assert_eq!(
+        format_diagnostics(&diags),
+        Some(String::from("Error: type mismatch\n\nWarning: unused variable")),
+        "errors must come before warnings and each line is labelled by severity"
+    );
+    assert_eq!(
+        format_diagnostics(&[]),
+        None,
+        "no diagnostics must produce no block"
+    );
+}
+
+#[test]
+fn compose_hover_puts_the_diagnostic_above_the_type_info() {
+    // VS Code (PR microsoft/vscode#166560) renders marker hovers on top.
+    assert_eq!(
+        compose_hover(Some("Error: type mismatch"), Some("const x: number")),
+        Some(String::from("Error: type mismatch\n────────\nconst x: number")),
+        "the diagnostic block sits above the language hover, divided by a rule"
+    );
+    assert_eq!(
+        compose_hover(Some("Error: type mismatch"), None),
+        Some(String::from("Error: type mismatch")),
+        "a diagnostic with no type info shows on its own"
+    );
+    assert_eq!(
+        compose_hover(None, Some("const x: number")),
+        Some(String::from("const x: number")),
+        "type info with no diagnostic shows on its own"
+    );
+    assert_eq!(
+        compose_hover(None, None),
+        None,
+        "nothing to show means no popup"
+    );
+}
+
+#[test]
+fn hovering_a_diagnostic_on_punctuation_shows_its_message_synchronously() {
+    use crate::lsp::manager::{Diagnostic, DiagnosticSeverity};
+    use ratatui::layout::Rect;
+    let tmp = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("dot.ts");
+    std::fs::write(&f, "a.b\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    // Stand the editor up directly: the `.` at char 1 is not a word, so this
+    // path never depends on a language server being attached.
+    app.editor.path = Some(f.clone());
+    app.editor.lines = vec![String::from("a.b")];
+    app.editor.last_inner = Rect {
+        x: 0,
+        y: 0,
+        width: 80,
+        height: 25,
+    };
+    app.editor.last_gutter_width = 2;
+    app.editor.apply_diagnostics(
+        f,
+        vec![Diagnostic {
+            start_line: 0,
+            start_char: 1,
+            end_line: 0,
+            end_char: 2,
+            severity: DiagnosticSeverity::Error,
+            message: String::from("unexpected token"),
+        }],
+    );
+    // text_x = x(0) + gutter(2) + 1 = 3, so cell col 4 is char 1 (the `.`).
+    app.hover_at_cell(4, 0);
+    let popup = app
+        .hover_popup
+        .as_ref()
+        .expect("hovering a squiggle must surface a popup even without an LSP reply");
+    assert_eq!(
+        popup.lines,
+        vec![String::from("Error: unexpected token")],
+        "the popup must carry the diagnostic's severity and message"
+    );
+}
+
+#[test]
 fn opening_a_search_hit_moves_focus_to_the_editor() {
     let tmp = tempfile::tempdir().unwrap();
     let f = tmp.path().join("hit.txt");
