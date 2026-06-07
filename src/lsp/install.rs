@@ -1,26 +1,62 @@
 //! croft-managed language-server provisioning.
 //!
-//! The TypeScript server (`vtsls`) is an internal dependency the user never
-//! invokes directly, so croft installs and owns its own copy under
-//! `~/.croft/servers/` rather than touching the user's global npm prefix. This
-//! sidesteps `npm -g` permission failures, keeps the binary off the user's
-//! PATH (croft invokes it by absolute path), and pins a known-good version so
-//! every install behaves identically (the local/remote parity rule).
+//! When a language server isn't already on the user's PATH, croft installs and
+//! owns its own copy under `~/.croft/servers/` rather than touching the user's
+//! global package managers. This sidesteps `npm -g` permission failures, pins a
+//! known-good version where it matters, and means "open a file → get LSP" works
+//! on a fresh remote box with nothing pre-installed (the local/remote parity
+//! rule).
 //!
-//! The install is lazy and best-effort: it fires the first time a TypeScript
-//! file is opened without a usable `vtsls`, runs on a detached thread so launch
-//! is never blocked, and a failure just leaves TS LSP unavailable.
+//! Provisioning is keyed by ecosystem backend, not special-cased per server:
+//!   - [`Provision::Npm`] — TypeScript's `vtsls`, installed with `npm install
+//!     --prefix` and run via a discovered `node`.
+//!   - [`Provision::Uv`] — Python's `ty` / `ruff`, installed with `uv tool
+//!     install` into a croft-owned tool dir. uv resolves the platform, Python
+//!     interpreter and version itself, so there is no tarball to unpack.
+//!
+//! Every install is lazy and best-effort: it fires the first time a file whose
+//! server is missing is opened, runs on a detached thread so launch is never
+//! blocked, and a failure just leaves that language's LSP unavailable (with a
+//! status-bar note pointing at the cause).
 
+use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
+use crate::lsp::config::{Language, ServerConfig};
 use crate::lsp::log_file;
 
-/// Latest one-line status of the managed install, polled by the app each tick
-/// and surfaced in the status bar so the background work isn't invisible.
+/// How croft obtains a server it manages itself. Each variant maps to one
+/// ecosystem installer. `version` pins an exact release for reproducibility;
+/// `None` tracks latest (what the fast-moving Astral servers want, since they
+/// are backward-compatible LSP daemons and a stale pin would just fail to
+/// install).
+#[derive(Debug, Clone, PartialEq)]
+pub enum Provision {
+    /// An npm package installed under `~/.croft/servers/<name>` and invoked via
+    /// the discovered `node`. `bin` is the executable npm drops in
+    /// `node_modules/.bin`.
+    Npm {
+        package: &'static str,
+        version: Option<&'static str>,
+        bin: &'static str,
+    },
+    /// A PyPI tool installed with `uv tool install` into croft's own uv tool
+    /// dir (`~/.croft/servers/uv`). `bin` is the entry-point uv writes into
+    /// `UV_TOOL_BIN_DIR`.
+    Uv {
+        package: &'static str,
+        version: Option<&'static str>,
+        bin: &'static str,
+    },
+}
+
+/// Latest one-line status of a managed install, polled by the app each tick and
+/// surfaced in the status bar so the background work isn't invisible. A single
+/// slot: when several servers install at once the most recent message wins,
+/// which is all the status bar can show anyway.
 static STATUS: Mutex<Option<String>> = Mutex::new(None);
 
 fn set_status(msg: impl Into<String>) {
@@ -35,16 +71,420 @@ pub fn take_status() -> Option<String> {
     STATUS.lock().ok().and_then(|mut g| g.take())
 }
 
-/// Set when a managed install finishes successfully. The app consumes this to
-/// re-open its TypeScript documents to the LSP, which makes the manager
-/// re-probe and spawn the freshly-installed server without waiting for the
-/// user's next action ("installed" should mean "now working").
-static JUST_INSTALLED: AtomicBool = AtomicBool::new(false);
+/// Languages whose managed server finished installing since the last call. The
+/// app re-opens that language's open documents so the manager re-probes and
+/// spawns the freshly-installed server — "installed" should mean "now working"
+/// without waiting for the user's next action.
+static JUST_INSTALLED: Mutex<Vec<Language>> = Mutex::new(Vec::new());
 
-/// One-shot: true exactly once after a successful managed install.
-pub fn take_just_installed() -> bool {
-    JUST_INSTALLED.swap(false, Ordering::SeqCst)
+fn mark_installed(language: Language) {
+    if let Ok(mut g) = JUST_INSTALLED.lock()
+        && !g.contains(&language)
+    {
+        g.push(language);
+    }
 }
+
+/// Drain the set of languages whose server just became available.
+pub fn take_just_installed() -> Vec<Language> {
+    JUST_INSTALLED
+        .lock()
+        .map(|mut g| std::mem::take(&mut *g))
+        .unwrap_or_default()
+}
+
+/// Ensures only one install thread is ever spawned per process per server, no
+/// matter how many times the manager re-probes a missing client.
+static INSTALL_STARTED: Mutex<BTreeSet<&'static str>> = Mutex::new(BTreeSet::new());
+
+/// The registry name for the TypeScript server, shared so config and the
+/// manager's resolver agree on which server croft provisions itself.
+pub const VTSLS_SERVER_NAME: &str = "vtsls";
+
+// ---------------------------------------------------------------------------
+// Resolution: turn a `Provision` into a spawnable command, kicking off a lazy
+// background install when the server isn't there yet.
+// ---------------------------------------------------------------------------
+
+/// Resolve a managed server to a spawnable `(config, extra_PATH)` pair, or
+/// `None` (after starting a background install) when it isn't installed yet.
+/// The manager calls this for any `ServerConfig` carrying a `provision`.
+pub fn resolve_managed(
+    config: &ServerConfig,
+    provision: &Provision,
+    log_skip: bool,
+) -> Option<(ServerConfig, Vec<PathBuf>)> {
+    match provision {
+        Provision::Npm { bin, .. } => {
+            if let Some(command) = npm_command(config.name, bin) {
+                let mut resolved = config.clone();
+                resolved.command = command;
+                // vtsls is a Node script; its `env node` shebang needs node on
+                // the spawned process's PATH, which (for version managers) means
+                // the discovered node dir, not croft's inherited PATH.
+                let extra: Vec<PathBuf> = node_path_prepend().into_iter().collect();
+                return Some((resolved, extra));
+            }
+        }
+        Provision::Uv { bin, .. } => {
+            if let Some(command) = uv_command(bin) {
+                let mut resolved = config.clone();
+                resolved.command = command;
+                // uv writes a self-contained launcher (absolute shebang to the
+                // tool's own venv python), so no extra PATH entry is needed.
+                return Some((resolved, Vec::new()));
+            }
+        }
+    }
+    // Not installed yet: start the one-shot managed install. This open skips the
+    // server; a later request re-probes once the install lands.
+    ensure_in_background(config, provision);
+    if log_skip {
+        log_file::log(&format!(
+            "lsp[{}] not installed; starting croft-managed install",
+            config.name
+        ));
+    }
+    None
+}
+
+/// Resolve an invocable command for an npm-provisioned server: prefer croft's
+/// managed copy (absolute path, no PATH dependency), then fall back to a binary
+/// already on PATH so a user who installed one globally still works. `None`
+/// when neither exists. Managed-first because vtsls is an internal dependency
+/// croft pins, not a tool the user drives directly.
+fn npm_command(name: &str, bin: &str) -> Option<String> {
+    if let Some(p) = managed_npm_binary(name, bin)
+        && p.is_file()
+    {
+        return Some(p.to_string_lossy().into_owned());
+    }
+    if crate::lsp::manager::is_on_path(bin) {
+        return Some(bin.to_string());
+    }
+    None
+}
+
+/// Resolve an invocable command for a uv-provisioned server. Unlike vtsls,
+/// `ty`/`ruff` are user-facing tools the user may want to control the version
+/// of, so a copy already on PATH wins over croft's managed one; the managed
+/// copy is the fallback for a box that has neither.
+fn uv_command(bin: &str) -> Option<String> {
+    if crate::lsp::manager::is_on_path(bin) {
+        return Some(bin.to_string());
+    }
+    if let Some(p) = managed_uv_binary(bin)
+        && p.is_file()
+    {
+        return Some(p.to_string_lossy().into_owned());
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
+// Managed install locations.
+// ---------------------------------------------------------------------------
+
+/// croft's managed server store: `~/.croft/servers`. `None` when `$HOME` is
+/// unset (the same guard the rest of croft uses for `~/.croft`).
+fn servers_dir() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    Some(PathBuf::from(home).join(".croft").join("servers"))
+}
+
+/// Directory `npm install --prefix` targets for a given server.
+fn npm_prefix(name: &str) -> Option<PathBuf> {
+    Some(servers_dir()?.join(name))
+}
+
+/// Path to an npm `bin` under a prefix. `npm install --prefix DIR PKG` drops
+/// executables in `DIR/node_modules/.bin`. Pure, so it's testable without
+/// touching `$HOME`.
+fn npm_bin_in(prefix: &Path, bin: &str) -> PathBuf {
+    prefix.join("node_modules").join(".bin").join(bin)
+}
+
+/// Absolute path to a managed npm-installed binary, whether or not it exists.
+fn managed_npm_binary(name: &str, bin: &str) -> Option<PathBuf> {
+    Some(npm_bin_in(&npm_prefix(name)?, bin))
+}
+
+/// croft's uv tool dir (`uv` installs each tool's venv here).
+fn uv_tool_dir() -> Option<PathBuf> {
+    Some(servers_dir()?.join("uv").join("tools"))
+}
+
+/// croft's uv bin dir (`uv` writes entry-point launchers here).
+fn uv_bin_dir() -> Option<PathBuf> {
+    Some(servers_dir()?.join("uv").join("bin"))
+}
+
+/// Absolute path to a managed uv-installed binary, whether or not it exists.
+fn managed_uv_binary(bin: &str) -> Option<PathBuf> {
+    Some(uv_bin_dir()?.join(bin))
+}
+
+/// Build the package spec npm installs, pinning the version when given.
+fn npm_spec(package: &str, version: Option<&str>) -> String {
+    match version {
+        Some(v) => format!("{package}@{v}"),
+        None => package.to_string(),
+    }
+}
+
+/// Build the package spec uv installs, pinning the version when given.
+fn uv_spec(package: &str, version: Option<&str>) -> String {
+    match version {
+        Some(v) => format!("{package}=={v}"),
+        None => package.to_string(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Background installers.
+// ---------------------------------------------------------------------------
+
+/// Install `config`'s server into the managed store on a detached thread, if no
+/// thread for it is already running this process. Idempotent per server,
+/// best-effort, and non-blocking.
+pub fn ensure_in_background(config: &ServerConfig, provision: &Provision) {
+    {
+        let mut started = match INSTALL_STARTED.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        if !started.insert(config.name) {
+            return; // an install thread for this server is already running
+        }
+    }
+    let name = config.name;
+    let language = config.language;
+    let provision = provision.clone();
+    std::thread::spawn(move || match &provision {
+        Provision::Npm {
+            package, version, ..
+        } => run_npm_install(name, language, package, *version),
+        Provision::Uv {
+            package, version, ..
+        } => run_uv_install(name, language, package, *version),
+    });
+}
+
+/// `npm install --prefix ~/.croft/servers/<name> <pkg>`. Requires `npm` on PATH
+/// (or a discovered version-manager dir); `node` must also be present for the
+/// installed server to actually run.
+fn run_npm_install(name: &'static str, language: Language, package: &str, version: Option<&str>) {
+    let Some(prefix) = npm_prefix(name) else {
+        return;
+    };
+    if !node_available() {
+        log_file::log(&format!(
+            "lsp[{name}] cannot auto-install: no `node`/`npm` found"
+        ));
+        set_status(format!(
+            "{name} unavailable: install Node.js (node/npm not found)"
+        ));
+        return;
+    }
+    if let Err(e) = std::fs::create_dir_all(&prefix) {
+        log_file::log(&format!("lsp[{name}] could not create {prefix:?}: {e}"));
+        set_status(format!("{name} install failed (could not create install dir)"));
+        return;
+    }
+    let extra = node_path_prepend();
+    let npm: PathBuf = match &extra {
+        Some(dir) => dir.join("npm"),
+        None => PathBuf::from("npm"),
+    };
+    let spec = npm_spec(package, version);
+    log_file::log(&format!("lsp[{name}] installing {spec} into {prefix:?}"));
+    set_status(format!("Installing {name}…"));
+    let output = Command::new(&npm)
+        .arg("install")
+        .arg("--prefix")
+        .arg(&prefix)
+        .arg(&spec)
+        .env("PATH", augmented_path(extra.as_deref()))
+        .output();
+    finish_install(name, language, output);
+}
+
+/// `uv tool install <pkg>` into croft's own uv tool dir. Requires `uv` on the
+/// system; uv pulls a suitable Python interpreter itself, so nothing else is
+/// needed on the box.
+fn run_uv_install(name: &'static str, language: Language, package: &str, version: Option<&str>) {
+    let Some(uv) = ensure_uv() else {
+        log_file::log(&format!(
+            "lsp[{name}] cannot auto-install: `uv` unavailable and could not be bootstrapped"
+        ));
+        set_status(format!(
+            "{name} unavailable: could not install uv automatically (see ~/.croft/lsp.log)"
+        ));
+        return;
+    };
+    let (Some(tool_dir), Some(bin_dir)) = (uv_tool_dir(), uv_bin_dir()) else {
+        return;
+    };
+    if let Err(e) = std::fs::create_dir_all(&bin_dir) {
+        log_file::log(&format!("lsp[{name}] could not create {bin_dir:?}: {e}"));
+        set_status(format!("{name} install failed (could not create install dir)"));
+        return;
+    }
+    let spec = uv_spec(package, version);
+    log_file::log(&format!("lsp[{name}] installing {spec} via uv into {tool_dir:?}"));
+    set_status(format!("Installing {name} (uv)…"));
+    // `--force` so a half-finished previous attempt is overwritten cleanly.
+    let output = Command::new(&uv)
+        .arg("tool")
+        .arg("install")
+        .arg("--force")
+        .arg(&spec)
+        .env("UV_TOOL_DIR", &tool_dir)
+        .env("UV_TOOL_BIN_DIR", &bin_dir)
+        .output();
+    finish_install(name, language, output);
+}
+
+/// Shared completion handling for both backends: log + status + mark the
+/// language installed on success, log + status the failure otherwise.
+fn finish_install(
+    name: &'static str,
+    language: Language,
+    output: std::io::Result<std::process::Output>,
+) {
+    match output {
+        Ok(out) if out.status.success() => {
+            log_file::log(&format!("lsp[{name}] managed install complete"));
+            mark_installed(language);
+            set_status(format!("{name} installed"));
+        }
+        Ok(out) => {
+            let err = String::from_utf8_lossy(&out.stderr);
+            log_file::log(&format!("lsp[{name}] install failed: {}", err.trim()));
+            set_status(format!("{name} install failed (see ~/.croft/lsp.log)"));
+        }
+        Err(e) => {
+            log_file::log(&format!("lsp[{name}] install error: {e}"));
+            set_status(format!("{name} install failed (see ~/.croft/lsp.log)"));
+        }
+    }
+}
+
+/// Where croft bootstraps its own `uv` when the box has none: the official
+/// installer is pointed here via `UV_INSTALL_DIR` so the binary is croft-owned
+/// and cleanly removable, rather than scattered in the user's `~/.local/bin`.
+fn uv_dist_dir() -> Option<PathBuf> {
+    Some(servers_dir()?.join("uv-dist"))
+}
+
+/// Locate the `uv` executable: PATH first, then croft's own bootstrapped copy,
+/// then the dirs uv's official installer drops it in (`~/.local/bin`,
+/// `~/.cargo/bin`) plus the common Homebrew/local prefixes — a non-login `exec`
+/// won't have those on PATH. `None` when uv isn't installed anywhere croft
+/// looks.
+fn uv_program() -> Option<PathBuf> {
+    if crate::lsp::manager::is_on_path("uv") {
+        return Some(PathBuf::from("uv"));
+    }
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(dist) = uv_dist_dir() {
+        candidates.push(dist.join("uv"));
+    }
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        candidates.push(home.join(".local").join("bin").join("uv"));
+        candidates.push(home.join(".cargo").join("bin").join("uv"));
+    }
+    candidates.push(PathBuf::from("/opt/homebrew/bin/uv"));
+    candidates.push(PathBuf::from("/usr/local/bin/uv"));
+    candidates.into_iter().find(|p| p.is_file())
+}
+
+/// Return a usable `uv`, bootstrapping it via the official installer if the box
+/// has none. Serialized by a process-global lock so `ty` and `ruff` opening at
+/// once don't both kick off a uv install — the second waits, then finds the uv
+/// the first just laid down.
+fn ensure_uv() -> Option<PathBuf> {
+    if let Some(uv) = uv_program() {
+        return Some(uv);
+    }
+    static UV_BOOTSTRAP: Mutex<()> = Mutex::new(());
+    let _guard = UV_BOOTSTRAP.lock().ok()?;
+    // Re-probe under the lock: another server's install thread may have just
+    // bootstrapped uv while we waited.
+    if let Some(uv) = uv_program() {
+        return Some(uv);
+    }
+    bootstrap_uv()
+}
+
+/// Pick the fetcher for the uv install script: `curl` preferred, `wget` as a
+/// fallback (the official one-liner ships both forms). `None` when neither is
+/// available — uv can't be fetched without an HTTP client on the box.
+fn uv_fetch_command(has_curl: bool, has_wget: bool) -> Option<&'static str> {
+    if has_curl {
+        Some("curl -LsSf https://astral.sh/uv/install.sh")
+    } else if has_wget {
+        Some("wget -qO- https://astral.sh/uv/install.sh")
+    } else {
+        None
+    }
+}
+
+/// Install uv with Astral's official script, pointed at croft's own dir and
+/// told not to touch the user's shell rc files. Best-effort; returns the uv
+/// path on success.
+fn bootstrap_uv() -> Option<PathBuf> {
+    let dir = uv_dist_dir()?;
+    let Some(fetch) = uv_fetch_command(
+        crate::lsp::manager::is_on_path("curl"),
+        crate::lsp::manager::is_on_path("wget"),
+    ) else {
+        log_file::log("lsp[uv] cannot bootstrap: neither `curl` nor `wget` found");
+        set_status("Python LSP needs uv: install uv or curl/wget (see ~/.croft/lsp.log)");
+        return None;
+    };
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        log_file::log(&format!("lsp[uv] could not create {dir:?}: {e}"));
+        set_status("uv install failed (could not create install dir)");
+        return None;
+    }
+    let script = format!("{fetch} | sh");
+    log_file::log(&format!(
+        "lsp[uv] bootstrapping uv via official installer into {dir:?}"
+    ));
+    set_status("Installing uv…");
+    // `UV_INSTALL_DIR` puts uv in croft's dir; `INSTALLER_NO_MODIFY_PATH` keeps
+    // the script from editing the user's shell profiles. If the env vars are
+    // ignored by some installer version, uv lands in `~/.local/bin`, which
+    // `uv_program` also searches, so discovery still succeeds.
+    match Command::new("sh")
+        .arg("-c")
+        .arg(&script)
+        .env("UV_INSTALL_DIR", &dir)
+        .env("INSTALLER_NO_MODIFY_PATH", "1")
+        .output()
+    {
+        Ok(out) if out.status.success() => {
+            log_file::log("lsp[uv] bootstrap complete");
+            uv_program()
+        }
+        Ok(out) => {
+            let err = String::from_utf8_lossy(&out.stderr);
+            log_file::log(&format!("lsp[uv] bootstrap failed: {}", err.trim()));
+            set_status("uv install failed (see ~/.croft/lsp.log)");
+            None
+        }
+        Err(e) => {
+            log_file::log(&format!("lsp[uv] bootstrap error: {e}"));
+            set_status("uv install failed (see ~/.croft/lsp.log)");
+            None
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// node discovery (needed by the npm backend and by spawning vtsls).
+// ---------------------------------------------------------------------------
 
 /// A directory to PREPEND to PATH so a non-shell `exec` can find `node`/`npm`,
 /// or `None` when `node` is already on croft's PATH (nothing to add) or none
@@ -243,146 +683,57 @@ pub(crate) fn prepend_paths(dirs: &[PathBuf]) -> OsString {
     std::env::join_paths(all).unwrap_or(current)
 }
 
-/// The registry name for the TypeScript server, shared so config and the
-/// manager's resolver agree on which server croft provisions itself.
-pub const VTSLS_SERVER_NAME: &str = "vtsls";
-
-/// Pinned vtsls release. Bump deliberately so behaviour is reproducible across
-/// machines rather than drifting with whatever a host happens to have.
-const VTSLS_VERSION: &str = "0.3.0";
-
-/// Ensures only one install thread is ever spawned per process, no matter how
-/// many times the manager re-probes an empty TypeScript client list.
-static INSTALL_STARTED: AtomicBool = AtomicBool::new(false);
-
-/// croft's managed server store: `~/.croft/servers`. `None` when `$HOME` is
-/// unset (the same guard the rest of croft uses for `~/.croft`).
-fn servers_dir() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join(".croft").join("servers"))
-}
-
-/// Directory `npm install --prefix` targets for vtsls.
-fn vtsls_prefix() -> Option<PathBuf> {
-    Some(servers_dir()?.join("vtsls"))
-}
-
-/// Path to the vtsls binary under a given prefix. `npm install --prefix DIR
-/// PKG` drops executables in `DIR/node_modules/.bin`. Pure, so it's testable
-/// without touching `$HOME` (mutating env is unsafe under the parallel suite).
-fn vtsls_binary_in(prefix: &std::path::Path) -> PathBuf {
-    prefix.join("node_modules").join(".bin").join("vtsls")
-}
-
-/// Absolute path to the managed vtsls binary, whether or not it exists yet.
-fn managed_vtsls_binary() -> Option<PathBuf> {
-    Some(vtsls_binary_in(&vtsls_prefix()?))
-}
-
-/// The npm package spec croft installs, pinned for reproducibility.
-fn install_spec() -> String {
-    format!("@vtsls/language-server@{VTSLS_VERSION}")
-}
-
-/// Resolve an invocable `vtsls` command: prefer croft's managed copy (absolute
-/// path, no PATH dependency), then fall back to a `vtsls` already on PATH so a
-/// user who installed one globally still works. `None` when neither exists.
-pub fn vtsls_command() -> Option<String> {
-    if let Some(bin) = managed_vtsls_binary()
-        && bin.is_file()
-    {
-        return Some(bin.to_string_lossy().into_owned());
-    }
-    if crate::lsp::manager::is_on_path("vtsls") {
-        return Some("vtsls".to_string());
-    }
-    None
-}
-
-/// Install vtsls into the managed dir on a detached thread if it isn't already
-/// usable. Idempotent per process (guarded by `INSTALL_STARTED`), best-effort,
-/// and non-blocking. Requires `npm` on PATH; `node` must also be present for
-/// the installed server to actually run.
-pub fn ensure_vtsls_in_background() {
-    if INSTALL_STARTED.swap(true, Ordering::SeqCst) {
-        return;
-    }
-    std::thread::spawn(|| {
-        if vtsls_command().is_some() {
-            return;
-        }
-        let Some(prefix) = vtsls_prefix() else {
-            return;
-        };
-        if !node_available() {
-            log_file::log("lsp[vtsls] cannot auto-install: no `node`/`npm` found");
-            set_status("TypeScript server unavailable: install Node.js (node/npm not found)");
-            return;
-        }
-        if let Err(e) = std::fs::create_dir_all(&prefix) {
-            log_file::log(&format!("lsp[vtsls] could not create {prefix:?}: {e}"));
-            set_status("TypeScript server install failed (could not create install dir)");
-            return;
-        }
-        let extra = node_path_prepend();
-        let npm: PathBuf = match &extra {
-            Some(dir) => dir.join("npm"),
-            None => PathBuf::from("npm"),
-        };
-        let spec = install_spec();
-        log_file::log(&format!("lsp[vtsls] installing {spec} into {prefix:?}"));
-        set_status("Installing TypeScript server (vtsls)…");
-        match Command::new(&npm)
-            .arg("install")
-            .arg("--prefix")
-            .arg(&prefix)
-            .arg(&spec)
-            .env("PATH", augmented_path(extra.as_deref()))
-            .output()
-        {
-            Ok(out) if out.status.success() => {
-                log_file::log("lsp[vtsls] managed install complete");
-                JUST_INSTALLED.store(true, Ordering::SeqCst);
-                set_status("TypeScript server installed");
-            }
-            Ok(out) => {
-                let err = String::from_utf8_lossy(&out.stderr);
-                log_file::log(&format!("lsp[vtsls] install failed: {}", err.trim()));
-                set_status("TypeScript server install failed (see ~/.croft/lsp.log)");
-            }
-            Err(e) => {
-                log_file::log(&format!("lsp[vtsls] install error: {e}"));
-                set_status("TypeScript server install failed (see ~/.croft/lsp.log)");
-            }
-        }
-    });
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::TempDir;
 
     #[test]
-    fn vtsls_binary_lands_in_npm_bin_dir() {
+    fn npm_binary_lands_in_npm_bin_dir() {
         let prefix = std::path::Path::new("/tmp/croft/servers/vtsls");
         assert_eq!(
-            vtsls_binary_in(prefix),
+            npm_bin_in(prefix, "vtsls"),
             std::path::Path::new("/tmp/croft/servers/vtsls/node_modules/.bin/vtsls"),
             "npm install --prefix drops executables under <prefix>/node_modules/.bin"
         );
     }
 
     #[test]
-    fn install_spec_pins_the_version() {
+    fn npm_spec_pins_the_version_when_given() {
         assert_eq!(
-            install_spec(),
-            format!("@vtsls/language-server@{VTSLS_VERSION}")
+            npm_spec("@vtsls/language-server", Some("0.3.0")),
+            "@vtsls/language-server@0.3.0"
         );
-        assert!(
-            install_spec().contains('@') && install_spec().ends_with(VTSLS_VERSION),
-            "the spec must pin an exact version for reproducible installs, got {}",
-            install_spec()
+        assert_eq!(
+            npm_spec("@vtsls/language-server", None),
+            "@vtsls/language-server",
+            "no pin installs latest"
+        );
+    }
+
+    #[test]
+    fn uv_spec_uses_double_equals_for_pinning() {
+        // PyPI version pinning is `pkg==X`, not npm's `pkg@X`.
+        assert_eq!(uv_spec("ruff", Some("0.9.0")), "ruff==0.9.0");
+        assert_eq!(uv_spec("ty", None), "ty", "no pin tracks latest");
+    }
+
+    #[test]
+    fn uv_fetch_command_prefers_curl_then_wget_then_gives_up() {
+        assert_eq!(
+            uv_fetch_command(true, true),
+            Some("curl -LsSf https://astral.sh/uv/install.sh"),
+            "curl wins when both are present"
+        );
+        assert_eq!(
+            uv_fetch_command(false, true),
+            Some("wget -qO- https://astral.sh/uv/install.sh"),
+            "wget is the fallback"
+        );
+        assert_eq!(
+            uv_fetch_command(false, false),
+            None,
+            "no fetcher → can't bootstrap uv"
         );
     }
 
@@ -454,12 +805,12 @@ mod tests {
     }
 
     #[test]
-    fn binary_is_detected_only_once_npm_has_populated_the_bin_dir() {
+    fn npm_binary_is_detected_only_once_the_bin_dir_is_populated() {
         // Before install, the bin path doesn't exist; after a file appears
-        // there, `is_file()` (what `vtsls_command` keys off) flips to true.
+        // there, `is_file()` (what `npm_command` keys off) flips to true.
         let tmp = TempDir::new().unwrap();
         let prefix = tmp.path().join("vtsls");
-        let bin = vtsls_binary_in(&prefix);
+        let bin = npm_bin_in(&prefix, "vtsls");
         assert!(!bin.is_file());
         std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
         std::fs::write(&bin, b"#!/usr/bin/env node\n").unwrap();

@@ -446,18 +446,65 @@ pub(crate) mod test_clip {
         MOCK.with(|b| b.borrow().clone())
     }
 
+    /// Read the host clipboard through the platform-native backend, bypassing
+    /// the opt-in routing. Used to snapshot the real clipboard before a
+    /// real-clipboard test runs so it can be restored afterwards.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn native_read() -> Option<String> {
+        #[cfg(target_os = "macos")]
+        {
+            super::macos::read_string_native()
+        }
+        #[cfg(target_os = "linux")]
+        {
+            super::linux::read_string()
+        }
+    }
+
+    /// Restore the host clipboard to `prev` (or wipe it if there was nothing),
+    /// through the platform-native backend.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn native_restore(prev: Option<String>) {
+        match prev {
+            Some(text) => {
+                #[cfg(target_os = "macos")]
+                {
+                    let _ = super::macos::write_string_native(&text);
+                }
+                #[cfg(target_os = "linux")]
+                {
+                    let _ = super::linux::write_string(&text);
+                }
+            }
+            None => {
+                #[cfg(target_os = "macos")]
+                {
+                    super::macos::clear_native();
+                }
+                #[cfg(target_os = "linux")]
+                {
+                    // Linux has no "clear"; overwriting with empty is the
+                    // closest equivalent and a no-op when no backend exists.
+                    let _ = super::linux::write_string("");
+                }
+            }
+        }
+    }
+
     /// Guard returned by `lock_clipboard_for_test`. While held, the
     /// current thread's `write_string` / `read_string` calls bypass the
-    /// per-thread mock and exercise the real macOS pasteboard, and no
+    /// per-thread mock and exercise the real OS clipboard, and no
     /// other thread can hold the lock concurrently.
     ///
-    /// On macOS the guard also snapshots the system clipboard at
+    /// On macOS and Linux the guard also snapshots the system clipboard at
     /// acquire-time and restores it on drop, so a `cargo test` run never
     /// leaves a test sentinel (e.g. `croft-terminal-cmdc-<pid>`) sitting
     /// on the developer's real clipboard for the next paste to surface.
+    /// (On a headless box with no clipboard backend the snapshot is `None`
+    /// and restore is a harmless no-op.)
     pub(crate) struct ClipboardTestGuard {
         _mutex: MutexGuard<'static, ()>,
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         snapshot: Option<String>,
     }
 
@@ -466,12 +513,12 @@ pub(crate) mod test_clip {
             let mutex = CLIP_LOCK
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner());
-            #[cfg(target_os = "macos")]
-            let snapshot = super::macos::read_string_native();
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            let snapshot = native_read();
             REAL_OPT_IN.with(|c| c.set(true));
             Self {
                 _mutex: mutex,
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
                 snapshot,
             }
         }
@@ -479,17 +526,8 @@ pub(crate) mod test_clip {
 
     impl Drop for ClipboardTestGuard {
         fn drop(&mut self) {
-            #[cfg(target_os = "macos")]
-            {
-                match self.snapshot.take() {
-                    Some(prev) => {
-                        let _ = super::macos::write_string_native(&prev);
-                    }
-                    None => {
-                        super::macos::clear_native();
-                    }
-                }
-            }
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            native_restore(self.snapshot.take());
             REAL_OPT_IN.with(|c| c.set(false));
         }
     }
@@ -599,5 +637,67 @@ mod tests {
             "the NSPasteboard FFI bridge itself must succeed on macOS - if this fails, pbcopy will be the production fallback and we'll know the bridge regressed"
         );
         assert_eq!(read_string().as_deref(), Some(sentinel.as_str()));
+    }
+}
+
+/// Linux-backend parity for the clipboard round-trip the macOS tests above
+/// cover via NSPasteboard. Exercises the real `wl-copy`/`xclip`/`xsel` path
+/// through `write_string`/`read_string` (the test guard snapshots and restores
+/// the developer's clipboard, so no sentinel leaks). On a headless box with
+/// none of those tools installed, `write_string` returns `false` and the test
+/// skips cleanly rather than failing — the same graceful degradation the
+/// production OSC-52 fallback relies on.
+#[cfg(all(test, target_os = "linux"))]
+mod linux_backend_tests {
+    use super::*;
+
+    #[test]
+    fn write_then_read_round_trips_when_a_clipboard_backend_is_available() {
+        let _g = lock_clipboard_for_test();
+        let sentinel = format!(
+            "croft-linux-clip-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        if !write_string(&sentinel) {
+            // No wl-copy/xclip/xsel on this box (headless CI/SSH): nothing to
+            // assert against. Treat as skipped, not failed.
+            eprintln!(
+                "linux_backend_tests: no clipboard backend (wl-copy/xclip/xsel) available — skipping"
+            );
+            return;
+        }
+        assert_eq!(
+            read_string().as_deref(),
+            Some(sentinel.as_str()),
+            "a Linux clipboard backend must return exactly what write_string just put on it"
+        );
+    }
+}
+
+/// Parity for platforms with no integrated clipboard backend (e.g. Android,
+/// where the freedesktop tools don't exist): `write_string`/`read_string` must
+/// fail soft — `false` / `None`, never a panic — so the caller's OSC-52
+/// fallback can take over. Mirrors the macOS and Linux coverage above for the
+/// "no native backend" arm of the cfg cascade.
+#[cfg(all(test, not(any(target_os = "macos", target_os = "linux"))))]
+mod other_os_backend_tests {
+    use super::*;
+
+    #[test]
+    fn clipboard_is_a_graceful_no_op_without_a_native_backend() {
+        let _g = lock_clipboard_for_test();
+        assert!(
+            !write_string("croft-no-backend-probe"),
+            "without a native backend, write_string must report false so the caller falls back to OSC 52"
+        );
+        assert_eq!(
+            read_string(),
+            None,
+            "without a native backend, read_string must yield None rather than panic"
+        );
     }
 }

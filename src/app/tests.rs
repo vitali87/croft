@@ -1840,9 +1840,12 @@ fn cmd_c_on_terminal_selection_lands_text_on_macos_clipboard() {
     );
 }
 
+// Cross-platform: asserts via `clipboard::read_string()`, so the per-thread
+// test mock covers the diff-selection → Cmd+C → clipboard wiring on every OS.
+// The macOS NSPasteboard FFI is verified separately by the cfg(macos) tests in
+// `clipboard.rs` and `cmd_c_on_terminal_selection_lands_text_on_macos_clipboard`.
 #[test]
-fn cmd_c_on_side_by_side_diff_selection_lands_text_on_macos_clipboard() {
-    let _g = crate::clipboard::lock_clipboard_for_test();
+fn cmd_c_on_side_by_side_diff_selection_copies_selected_text() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     let f1 = tmp.path().join("a.txt");
@@ -2153,7 +2156,9 @@ fn double_click_in_diff_selects_word_and_cmd_c_copies_it() {
     // the left column must snap a word-bounded selection (same UX
     // as VS Code / standard text editors), and the very next Cmd+C
     // keystroke must put exactly that word on the clipboard.
-    let _g = crate::clipboard::lock_clipboard_for_test();
+    // Cross-platform: asserts via `clipboard::read_string()`, so the
+    // per-thread test mock exercises this on every OS (no real-clipboard
+    // opt-in needed — the OS pasteboard path is covered elsewhere).
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     let f1 = tmp.path().join("a.txt");
@@ -2205,6 +2210,12 @@ fn double_click_in_diff_selects_word_and_cmd_c_copies_it() {
     );
 }
 
+// Exercises the macOS-native NSPasteboard backend (`clipboard::macos`), which
+// only exists on macOS — gate it like the sibling native tests in
+// `clipboard.rs` so the Linux/Android test binaries still compile and run
+// everything else (an ungated macOS-only test fails to *compile* off-macOS,
+// poisoning the whole test target rather than just skipping).
+#[cfg(target_os = "macos")]
 #[test]
 fn lock_clipboard_for_test_restores_prior_clipboard_text_on_drop() {
     // Tests that hit the real NSPasteboard must never leave their
@@ -2748,7 +2759,6 @@ fn terminal_copy_paste_into_other_panes_works_in_split_and_maximised_layout() {
     for &maximise in layouts {
         // ---- Destination: Search sidebar ----
         {
-            let _g = crate::clipboard::lock_clipboard_for_test();
             let tmp = tempfile::tempdir().unwrap();
             let mut app = App::new(tmp.path().to_path_buf()).unwrap();
             let backend = ratatui::backend::TestBackend::new(140, 50);
@@ -2784,7 +2794,6 @@ fn terminal_copy_paste_into_other_panes_works_in_split_and_maximised_layout() {
 
         // ---- Destination: editor-find ----
         {
-            let _g = crate::clipboard::lock_clipboard_for_test();
             let tmp = tempfile::tempdir().unwrap();
             let f = tmp.path().join("probe.txt");
             std::fs::write(&f, "alpha\nbeta\ngamma\n").unwrap();
@@ -2820,7 +2829,6 @@ fn terminal_copy_paste_into_other_panes_works_in_split_and_maximised_layout() {
 
         // ---- Destination: editor body ----
         {
-            let _g = crate::clipboard::lock_clipboard_for_test();
             let tmp = tempfile::tempdir().unwrap();
             let f = tmp.path().join("probe.txt");
             std::fs::write(&f, "alpha\nbeta\ngamma\n").unwrap();
@@ -2850,7 +2858,6 @@ fn terminal_copy_paste_into_other_panes_works_in_split_and_maximised_layout() {
 
         // ---- Destination: source-control commit box ----
         {
-            let _g = crate::clipboard::lock_clipboard_for_test();
             let tmp = tempfile::tempdir().unwrap();
             let mut app = App::new(tmp.path().to_path_buf()).unwrap();
             let backend = ratatui::backend::TestBackend::new(140, 50);
@@ -2885,7 +2892,8 @@ fn terminal_copy_paste_into_other_panes_works_in_split_and_maximised_layout() {
 /// view is showing.
 #[test]
 fn terminal_cmd_c_copies_even_when_search_sidebar_is_open() {
-    let _g = crate::clipboard::lock_clipboard_for_test();
+    // Cross-platform: the assertion reads back via `clipboard::read_string()`,
+    // so the per-thread mock validates the Cmd+C-routing logic on every OS.
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     let backend = ratatui::backend::TestBackend::new(140, 50);
