@@ -6930,8 +6930,21 @@ mod tests {
         let mut tabs = EditorTabs::new();
         tabs.open_pinned(&a).unwrap(); // tab for a
         tabs.open_pinned(&b).unwrap(); // tab for b is now active; a is in the background
-        // External edit to the BACKGROUND file.
+        // External edit to the BACKGROUND file. The new content is the same
+        // length as the old ("a old\n" / "a NEW\n" are both 6 bytes), so the
+        // change is detectable only by mtime — and two back-to-back writes can
+        // land in the same mtime tick on a coarse-granularity filesystem,
+        // making detection flaky. Force a distinctly-newer mtime so the test is
+        // deterministic across filesystems (the production path keys off this
+        // same (mtime, len) stamp).
         std::fs::write(&a, "a NEW\n").unwrap();
+        let bumped = std::time::SystemTime::now() + std::time::Duration::from_secs(2);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&a)
+            .unwrap()
+            .set_modified(bumped)
+            .unwrap();
         let report = tabs.reload_externally_changed_tabs();
         assert_eq!(report.reloaded, vec![a.clone()]);
         assert!(report.conflicts.is_empty());
