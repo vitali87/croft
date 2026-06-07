@@ -340,6 +340,9 @@ fn try_local_cross_install_streaming(
         .map(|n| (n.get() / 2).max(1))
         .unwrap_or(1)
         .to_string();
+    sync_workspace_lock(&source, |msg| {
+        let _ = log_tx.send(msg);
+    });
     let _ = log_tx.send(format!(
         "Cross-compiling croft locally for {triple} (niced, {jobs} jobs)…"
     ));
@@ -1201,6 +1204,41 @@ fn cross_compile_available() -> bool {
         .unwrap_or(false)
 }
 
+/// Re-pin the croft workspace member in `Cargo.lock` to whatever `Cargo.toml`
+/// now declares, immediately before a `--locked` cross-build.
+///
+/// Every behavioural change bumps the patch version in `Cargo.toml`, but
+/// `cargo install --path .` never rewrites the on-disk lockfile - so the lock
+/// drifts exactly one patch behind. `cargo zigbuild --locked` then refuses to
+/// build, and the installer silently falls back to a minutes-long
+/// from-scratch `cargo install` *on the remote host* (the thing the fast path
+/// exists to avoid). `cargo update -p croft --offline` rewrites only croft's
+/// own version line - it touches no dependency, needs no network, and so keeps
+/// `--locked`'s real guarantee (a reproducible dependency graph) fully intact.
+///
+/// Best-effort: if the sync itself fails we log and still attempt the locked
+/// build, preserving the old fall-back behaviour rather than blocking install.
+fn sync_workspace_lock(source: &Path, log: impl Fn(String)) {
+    match Command::new("cargo")
+        .args(["update", "-p", "croft", "--offline"])
+        .current_dir(source)
+        .output()
+    {
+        Ok(out) if out.status.success() => {
+            log(
+                "Synced Cargo.lock to the bumped croft version before the locked cross-build"
+                    .to_string(),
+            );
+        }
+        Ok(out) => log(format!(
+            "Cargo.lock sync skipped (cargo update exited {}): {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        )),
+        Err(e) => log(format!("Cargo.lock sync skipped ({e})")),
+    }
+}
+
 fn remote_target_triple(ssh: &SshControl) -> Result<Option<&'static str>> {
     let output = ssh
         .command()
@@ -1253,6 +1291,7 @@ fn try_local_cross_install(ssh: &SshControl, source_stamp: &str) -> Result<bool>
     }
 
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    sync_workspace_lock(&source, |msg| println!("{msg}"));
     println!("Cross-compiling croft locally for {triple}...");
     let status = Command::new("cargo")
         .args([
@@ -1960,5 +1999,40 @@ Host !blocked *.internal
         let socket = ssh_control_socket_path_for_test(&dir);
         assert!(socket.starts_with(&dir));
         assert_eq!(socket.file_name().and_then(|s| s.to_str()), Some("ctl"));
+    }
+
+    // Guards the exact bug class `sync_workspace_lock` exists to fix: a version
+    // bump in Cargo.toml that leaves Cargo.lock one patch behind makes the
+    // `--locked` remote cross-build fail and silently host-compile. A drifted
+    // lock should never reach a commit, so fail the suite if the two disagree.
+    #[test]
+    fn cargo_lock_croft_version_matches_cargo_toml_so_locked_cross_build_never_falls_back() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let toml = std::fs::read_to_string(root.join("Cargo.toml")).unwrap();
+        let toml_version = toml
+            .lines()
+            .find_map(|l| {
+                l.strip_prefix("version = \"")
+                    .and_then(|r| r.strip_suffix('"'))
+            })
+            .expect("Cargo.toml has a package version");
+
+        let lock = std::fs::read_to_string(root.join("Cargo.lock")).unwrap();
+        let lock_version = lock
+            .split("name = \"croft\"")
+            .nth(1)
+            .and_then(|after| {
+                after.lines().find_map(|l| {
+                    l.trim()
+                        .strip_prefix("version = \"")
+                        .and_then(|r| r.strip_suffix('"'))
+                })
+            })
+            .expect("Cargo.lock has a croft entry");
+
+        assert_eq!(
+            lock_version, toml_version,
+            "Cargo.lock croft version {lock_version} drifted from Cargo.toml {toml_version}; run `cargo update -p croft`"
+        );
     }
 }
