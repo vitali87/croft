@@ -17,8 +17,16 @@ preview*.svg
 
 /target
 
-# Per-machine cargo parallelism cap; local-only, never committed
+# Per-machine cargo parallelism cap; local-only, never committed.
+# Superseded by the Nix dev shell (flake.nix), whose shellHook caps
+# RUST_TEST_THREADS/CARGO_BUILD_JOBS adaptively on every machine — kept ignored
+# so a stray local override never gets committed.
 /.cargo/config.toml
+
+# Nix / direnv
+/.direnv/
+/result
+/result-*
 
 # macOS
 .DS_Store
