@@ -288,7 +288,9 @@ fn run_npm_install(name: &'static str, language: Language, package: &str, versio
     }
     if let Err(e) = std::fs::create_dir_all(&prefix) {
         log_file::log(&format!("lsp[{name}] could not create {prefix:?}: {e}"));
-        set_status(format!("{name} install failed (could not create install dir)"));
+        set_status(format!(
+            "{name} install failed (could not create install dir)"
+        ));
         return;
     }
     let extra = node_path_prepend();
@@ -327,11 +329,15 @@ fn run_uv_install(name: &'static str, language: Language, package: &str, version
     };
     if let Err(e) = std::fs::create_dir_all(&bin_dir) {
         log_file::log(&format!("lsp[{name}] could not create {bin_dir:?}: {e}"));
-        set_status(format!("{name} install failed (could not create install dir)"));
+        set_status(format!(
+            "{name} install failed (could not create install dir)"
+        ));
         return;
     }
     let spec = uv_spec(package, version);
-    log_file::log(&format!("lsp[{name}] installing {spec} via uv into {tool_dir:?}"));
+    log_file::log(&format!(
+        "lsp[{name}] installing {spec} via uv into {tool_dir:?}"
+    ));
     set_status(format!("Installing {name} (uv)…"));
     // `--force` so a half-finished previous attempt is overwritten cleanly.
     let output = Command::new(&uv)

@@ -17,15 +17,41 @@
 //! cross-platform installer (no root, installs to `~/.local/bin`). When
 //! the binary still cannot be found the popup degrades to an "unavailable"
 //! message instead of failing.
+//!
+//! The same background step also wires zoxide's shell hook into the host's
+//! shell rc (`~/.zshrc` / `~/.bashrc`) so the terminal pane's `j` command
+//! and the popup share one populated database — without it a fresh remote
+//! has the binary but an empty database that no `cd` ever feeds, the exact
+//! local/remote divergence the GOLDEN RULE forbids. The write is idempotent:
+//! it is skipped whenever the rc already contains a `zoxide init` line (the
+//! user's own, or one croft wrote on a previous launch).
 
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+
+use crate::lsp::log_file;
 
 /// Official zoxide installer. Cross-platform (macOS + Linux), needs only
 /// `curl` + `sh`, and installs a static binary to `~/.local/bin` without
 /// root — the same destination `binary()` probes below.
 const INSTALL_SCRIPT: &str =
     "curl -sSfL https://raw.githubusercontent.com/ajeetdsouza/zoxide/main/install.sh | sh";
+
+/// The `--cmd` name croft wires into the shell, matching the Cmd+Z popup it
+/// mirrors: the jump command is `j` (and the interactive `ji`), not the
+/// default `z`/`zi`. Kept in sync with the popup's intent in this module.
+const ZOXIDE_CMD: &str = "j";
+
+/// Sentinels bracketing the block croft appends to the shell rc, so a prior
+/// launch's block is recognisable and never duplicated.
+const INIT_MARKER_START: &str = "# >>> croft zoxide (managed) >>>";
+const INIT_MARKER_END: &str = "# <<< croft zoxide (managed) <<<";
+
+/// Substring whose presence in an rc file means zoxide is already wired —
+/// by the user themselves or by a previous croft run — so croft must not
+/// append again. Matches every `zoxide init <shell> …` form.
+const INIT_SENTINEL: &str = "zoxide init";
 
 /// Absolute fallbacks probed after `PATH`, covering the default install
 /// dir used by the official script (`~/.local/bin`) plus the common
@@ -185,17 +211,115 @@ pub fn fuzzy_rank(needle: &str, dirs: &[PathBuf]) -> Vec<PathBuf> {
     scored.into_iter().map(|(_, _, path)| path).collect()
 }
 
+/// Normalise a `$SHELL` path to the shell name croft knows how to wire,
+/// or `None` for anything else (we never guess an rc layout for an
+/// unfamiliar shell). Only `zsh` and `bash` are supported — the two shells
+/// croft actually launches (zsh on the Mac, bash on the Linux remote).
+fn supported_shell(shell_path: &str) -> Option<&'static str> {
+    let base = Path::new(shell_path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(shell_path);
+    match base {
+        "zsh" => Some("zsh"),
+        "bash" => Some("bash"),
+        _ => None,
+    }
+}
+
+/// The rc file croft appends the init block to for a (already validated)
+/// shell. bash targets `~/.bashrc` (zoxide's documented target; the login
+/// shell reaches it via `~/.profile` sourcing `~/.bashrc`), zsh targets
+/// `~/.zshrc` (sourced for every interactive zsh).
+fn rc_file_name(shell: &str) -> &'static str {
+    match shell {
+        "zsh" => ".zshrc",
+        _ => ".bashrc",
+    }
+}
+
+/// The managed block croft appends for `shell`: prepend `~/.local/bin` to
+/// `PATH` (so the binary croft drops there is reachable before the eval),
+/// then install zoxide's `cd` hook and the `j` command. Wrapped in marker
+/// comments and led by a blank line so it never fuses onto existing content.
+fn init_block(shell: &str) -> String {
+    format!(
+        "\n{INIT_MARKER_START}\nexport PATH=\"$HOME/.local/bin:$PATH\"\neval \"$(zoxide init {shell} --cmd {ZOXIDE_CMD})\"\n{INIT_MARKER_END}\n"
+    )
+}
+
+/// Decide what (if anything) to append to an rc file whose current contents
+/// are `existing`. `None` means already wired — the rc contains a
+/// `zoxide init` line, whether the user's own or a prior croft block — so
+/// croft leaves it untouched. This is the idempotency guard that keeps
+/// repeated launches from duplicating the block.
+fn pending_init_block(shell: &str, existing: &str) -> Option<String> {
+    if existing.contains(INIT_SENTINEL) {
+        return None;
+    }
+    Some(init_block(shell))
+}
+
+/// Wire zoxide's shell hook into the host's shell rc so the terminal `j`
+/// command and the Cmd+Z popup share one database. Best-effort and
+/// idempotent: resolves `$SHELL`/`$HOME`, skips unsupported shells, and
+/// appends only when no `zoxide init` line is already present.
+fn ensure_shell_init() {
+    let Ok(shell_path) = std::env::var("SHELL") else {
+        log_file::log("zoxide: $SHELL unset, skipping shell-init wiring");
+        return;
+    };
+    let Some(shell) = supported_shell(&shell_path) else {
+        log_file::log(&format!(
+            "zoxide: unsupported shell {shell_path:?}, skipping shell-init wiring"
+        ));
+        return;
+    };
+    let Some(home) = std::env::var_os("HOME") else {
+        log_file::log("zoxide: $HOME unset, skipping shell-init wiring");
+        return;
+    };
+    let rc = PathBuf::from(home).join(rc_file_name(shell));
+    let existing = std::fs::read_to_string(&rc).unwrap_or_default();
+    let Some(block) = pending_init_block(shell, &existing) else {
+        return;
+    };
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&rc)
+    {
+        Ok(mut f) => match f.write_all(block.as_bytes()) {
+            Ok(()) => log_file::log(&format!(
+                "zoxide: wired `{ZOXIDE_CMD}` shell init into {rc:?}"
+            )),
+            Err(e) => log_file::log(&format!("zoxide: failed to append init to {rc:?}: {e}")),
+        },
+        Err(e) => log_file::log(&format!(
+            "zoxide: could not open {rc:?} for init wiring: {e}"
+        )),
+    }
+}
+
 /// Probe for `zoxide` and, if it is missing, install it via the official
-/// script on a detached thread so launch is never blocked. Best-effort:
-/// any failure leaves the popup in its "unavailable" state. Invoked once
-/// from `app::run`, so it covers both the local Mac and the remote Linux
-/// box (both reach `run` through the normal launch path).
+/// script on a detached thread so launch is never blocked, then wire the
+/// shell hook. Best-effort: any failure leaves the popup in its
+/// "unavailable" state. Invoked once from `app::run`, so it covers both the
+/// local Mac and the remote Linux box (both reach `run` through the normal
+/// launch path).
 pub fn ensure_installed_in_background() {
     std::thread::spawn(|| {
-        if binary().is_some() {
-            return;
+        if binary().is_none() {
+            let _ = Command::new("sh").arg("-c").arg(INSTALL_SCRIPT).output();
         }
-        let _ = Command::new("sh").arg("-c").arg(INSTALL_SCRIPT).output();
+        // Wire the shell hook only once the binary is actually resolvable,
+        // otherwise the `eval "$(zoxide init …)"` line errors on every shell
+        // start. `binary()` finds the freshly-installed `~/.local/bin` copy
+        // even though it is not yet on the login shell's PATH — which is why
+        // the appended block prepends that dir before the eval.
+        if binary().is_some() {
+            ensure_shell_init();
+        }
     });
 }
 
@@ -321,5 +445,73 @@ mod tests {
         assert_eq!(fuzzy_threshold(5), 1);
         assert_eq!(fuzzy_threshold(9), 3);
         assert_eq!(fuzzy_threshold(30), 3, "capped at three edits");
+    }
+
+    #[test]
+    fn supported_shell_maps_only_bash_and_zsh_by_basename() {
+        assert_eq!(supported_shell("/bin/zsh"), Some("zsh"));
+        assert_eq!(supported_shell("/usr/bin/bash"), Some("bash"));
+        assert_eq!(supported_shell("/opt/homebrew/bin/zsh"), Some("zsh"));
+        assert_eq!(
+            supported_shell("/usr/bin/fish"),
+            None,
+            "an unfamiliar shell must be skipped, not guessed"
+        );
+        assert_eq!(supported_shell("/bin/sh"), None);
+    }
+
+    #[test]
+    fn rc_file_name_targets_the_conventional_rc_per_shell() {
+        assert_eq!(rc_file_name("zsh"), ".zshrc");
+        assert_eq!(rc_file_name("bash"), ".bashrc");
+    }
+
+    #[test]
+    fn init_block_installs_the_hook_and_j_command_for_the_shell() {
+        let bash = init_block("bash");
+        assert!(
+            bash.contains("zoxide init bash --cmd j"),
+            "must install the cd-hook and rename the command to `j`"
+        );
+        assert!(
+            bash.contains("export PATH=\"$HOME/.local/bin:$PATH\""),
+            "must put the croft-installed binary on PATH before the eval"
+        );
+        assert!(bash.contains(INIT_MARKER_START) && bash.contains(INIT_MARKER_END));
+        assert!(
+            bash.starts_with('\n'),
+            "a leading blank line keeps the block off the end of existing content"
+        );
+        assert!(init_block("zsh").contains("zoxide init zsh --cmd j"));
+    }
+
+    #[test]
+    fn pending_init_block_appends_when_rc_has_no_zoxide() {
+        let block = pending_init_block("bash", "# my bashrc\nalias ll='ls -la'\n");
+        assert!(block.is_some_and(|b| b.contains("zoxide init bash --cmd j")));
+    }
+
+    #[test]
+    fn pending_init_block_skips_when_user_already_wired_zoxide() {
+        // The Mac case: the user's own `~/.zshrc` line. croft must never
+        // append a duplicate on top of it.
+        let existing = "eval \"$(zoxide init zsh --cmd j)\"\n";
+        assert_eq!(
+            pending_init_block("zsh", existing),
+            None,
+            "an existing user `zoxide init` line must suppress croft's block"
+        );
+    }
+
+    #[test]
+    fn pending_init_block_is_idempotent_across_relaunches() {
+        // A second launch sees the block croft wrote on the first and must
+        // not append it again (the block itself contains `zoxide init`).
+        let once = init_block("bash");
+        assert_eq!(
+            pending_init_block("bash", &once),
+            None,
+            "croft's own block must suppress a second append"
+        );
     }
 }
