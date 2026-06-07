@@ -1,0 +1,9 @@
+# Single source of truth for the Rust toolchain across every machine.
+#
+# Both bare `cargo`/`rustup` and the Nix dev shell (flake.nix, via
+# rust-overlay's `fromRustupToolchainFile`) resolve to this exact version, so
+# the macOS and Linux boxes compile with byte-identical toolchains — the thing
+# whose absence let croft go un-built on Linux for a while. Bump deliberately.
+[toolchain]
+channel = "1.95.0"
+components = ["rustfmt", "clippy", "rust-src", "rust-analyzer"]
