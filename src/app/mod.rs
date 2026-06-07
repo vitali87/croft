@@ -8204,7 +8204,7 @@ impl App {
         let dropped = parse_dropped_paths(s);
         if !dropped.is_empty() {
             match self.sidebar_view {
-                SidebarView::Remote => {
+                SidebarView::Remote if self.focus == Pane::Tree => {
                     self.import_paths_into_remote(&dropped);
                     return;
                 }

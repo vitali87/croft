@@ -8497,7 +8497,7 @@ fn finder_drop_into_explorer_moves_file_into_workspace() {
 }
 
 #[test]
-fn finder_drop_on_remote_view_queues_scp_even_when_terminal_focused() {
+fn finder_drop_into_terminal_pastes_path_instead_of_scp_in_remote_view() {
     let workspace = tempfile::tempdir().unwrap();
     let outside = tempfile::tempdir().unwrap();
     let src = outside.path().join("dragged.txt");
@@ -8510,22 +8510,28 @@ fn finder_drop_on_remote_view_queues_scp_even_when_terminal_focused() {
     }];
     app.remote.selected = 0;
     app.set_sidebar_view(SidebarView::Remote);
-    // The user clicked into the embedded terminal and never returned
-    // focus to the sidebar before dragging from Finder. iTerm2's
-    // drag-drop arrives as a bracketed paste; mouse focus does not
-    // shift on drop.
+    // Focus sits in the embedded terminal (e.g. a Claude Code session)
+    // while the Remote sidebar happens to be the active view. A Finder
+    // drag-drop here must forward the path into the terminal so the
+    // running program receives it, NOT hijack it into an scp upload to
+    // the auto-selected host. Focus wins, mirroring the Explorer branch.
     app.show_terminal = true;
     app.focus_pane(Pane::Terminal);
+    let editor_before = app.editor.lines.clone();
     app.handle_paste(&format!("{}\n", src.display()));
-    let queued = app.take_pending_scp_uploads();
-    assert_eq!(queued.len(), 1, "one scp upload should be queued");
-    assert_eq!(queued[0].alias, "alpha");
-    assert_eq!(queued[0].src, src);
-    assert!(src.exists(), "scp must copy, not move");
+    assert!(
+        app.take_pending_scp_uploads().is_empty(),
+        "terminal-focused drop must not queue an scp upload",
+    );
+    assert_eq!(
+        app.editor.lines, editor_before,
+        "terminal-focused drop must not leak the path into the editor",
+    );
+    assert!(src.exists(), "the drop must not move or delete the source");
 }
 
 #[test]
-fn finder_drop_on_remote_view_queues_scp_even_when_editor_focused() {
+fn finder_drop_into_editor_inserts_path_instead_of_scp_in_remote_view() {
     let workspace = tempfile::tempdir().unwrap();
     let outside = tempfile::tempdir().unwrap();
     let src = outside.path().join("e.txt");
@@ -8539,14 +8545,41 @@ fn finder_drop_on_remote_view_queues_scp_even_when_editor_focused() {
     app.remote.selected = 0;
     app.set_sidebar_view(SidebarView::Remote);
     app.focus_pane(Pane::Editor);
-    let editor_before = app.editor.lines.clone();
     app.handle_paste(&format!("{}\n", src.display()));
-    assert_eq!(
-        app.editor.lines, editor_before,
-        "remote drop must not leak the path text into the editor",
+    assert!(
+        app.take_pending_scp_uploads().is_empty(),
+        "editor-focused drop must not queue an scp upload",
     );
+    assert!(
+        app.editor.lines.iter().any(|l| l.contains("e.txt")),
+        "editor-focused drop should insert the dropped path, was: {:?}",
+        app.editor.lines,
+    );
+}
+
+#[test]
+fn finder_drop_onto_remote_tree_still_queues_scp() {
+    let workspace = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let src = outside.path().join("dragged.txt");
+    std::fs::write(&src, "hello").unwrap();
+    let mut app = App::new(workspace.path().to_path_buf()).unwrap();
+    app.remote.targets = vec![crate::remote::RemoteTarget {
+        alias: String::from("alpha"),
+        host_name: Some(String::from("alpha.example.com")),
+        user: Some(String::from("vitali")),
+    }];
+    app.remote.selected = 0;
+    app.set_sidebar_view(SidebarView::Remote);
+    // Dropping ONTO the Remote sidebar (tree focused) is the deliberate
+    // upload gesture and must still queue an scp copy to the host.
+    app.focus_pane(Pane::Tree);
+    app.handle_paste(&format!("{}\n", src.display()));
     let queued = app.take_pending_scp_uploads();
-    assert_eq!(queued.len(), 1);
+    assert_eq!(queued.len(), 1, "one scp upload should be queued");
+    assert_eq!(queued[0].alias, "alpha");
+    assert_eq!(queued[0].src, src);
+    assert!(src.exists(), "scp must copy, not move");
 }
 
 #[test]
