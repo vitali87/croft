@@ -680,6 +680,11 @@ impl Widget for &mut RemotePanel {
             .width
             .saturating_sub(u16::from(scrollbar_metrics.is_some()));
 
+        let sel_bg = if self.focus_gradient {
+            crate::gradient::rgb_color(crate::gradient::POPUP_SEL_BG)
+        } else {
+            Color::Rgb(0x09, 0x4d, 0x77)
+        };
         let end = (self.scroll + viewport).min(self.visible.len());
         for (row, vis_idx) in (self.scroll..end).enumerate() {
             let idx = self.visible[vis_idx];
@@ -687,7 +692,7 @@ impl Widget for &mut RemotePanel {
             let y = self.last_list_area.y + row as u16;
             let selected = idx == self.selected;
             let style = if selected {
-                Style::default().bg(Color::Rgb(0x09, 0x4d, 0x77))
+                Style::default().bg(sel_bg)
             } else {
                 Style::default()
             };
@@ -787,6 +792,52 @@ mod tests {
         assert!(
             !header_row.contains('\u{2699}'),
             "header must not paint the gear U+2699 anywhere"
+        );
+    }
+
+    #[test]
+    fn black_theme_selected_host_uses_muted_brand_teal_not_legacy_blue() {
+        use crate::gradient::{POPUP_SEL_BG, rgb_color};
+        let mut p = populated_panel(&["a", "b"]);
+        p.focus_gradient = true;
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 10,
+        };
+        let mut buf = Buffer::empty(area);
+        (&mut p).render(area, &mut buf);
+        let sel_y = p.last_list_area.y; // selected defaults to row 0
+        assert_eq!(
+            buf[(p.last_list_area.x, sel_y)].bg,
+            rgb_color(POPUP_SEL_BG),
+            "under the Black theme the selected SSH host row must use the muted brand teal that Explorer/Search use, not the legacy bright-blue highlight"
+        );
+        assert_ne!(
+            buf[(p.last_list_area.x, sel_y)].bg,
+            Color::Rgb(0x09, 0x4d, 0x77),
+            "the old #094d77 blue is the regression the user reported on the Remote Explorer"
+        );
+    }
+
+    #[test]
+    fn croft_dark_selected_host_keeps_solid_blue_highlight() {
+        let mut p = populated_panel(&["a", "b"]);
+        p.focus_gradient = false;
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 10,
+        };
+        let mut buf = Buffer::empty(area);
+        (&mut p).render(area, &mut buf);
+        let sel_y = p.last_list_area.y;
+        assert_eq!(
+            buf[(p.last_list_area.x, sel_y)].bg,
+            Color::Rgb(0x09, 0x4d, 0x77),
+            "Croft Dark retains the historical solid-blue selection, matching the file tree's non-gradient branch"
         );
     }
 
