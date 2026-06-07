@@ -1509,14 +1509,75 @@ if [ -f "$HOME/.cargo/env" ]; then
   . "$HOME/.cargo/env"
 fi
 export PATH="$HOME/.cargo/bin:$PATH"
+
+# Package installs need root. Run them directly when already root, otherwise
+# via sudo if available. CROFT_SUDO is empty in both the root and the
+# no-sudo case so the install commands stay identical.
+if [ "$(id -u)" = "0" ]; then
+  CROFT_SUDO=""
+elif command -v sudo >/dev/null 2>&1; then
+  CROFT_SUDO="sudo"
+else
+  CROFT_SUDO=""
+fi
+
+# Install system packages with whatever package manager the box ships.
+croft_pkg_install() {{
+  if command -v apt-get >/dev/null 2>&1; then
+    export DEBIAN_FRONTEND=noninteractive
+    $CROFT_SUDO apt-get update
+    $CROFT_SUDO apt-get install -y "$@"
+  elif command -v dnf >/dev/null 2>&1; then
+    $CROFT_SUDO dnf install -y "$@"
+  elif command -v yum >/dev/null 2>&1; then
+    $CROFT_SUDO yum install -y "$@"
+  elif command -v apk >/dev/null 2>&1; then
+    $CROFT_SUDO apk add "$@"
+  elif command -v pacman >/dev/null 2>&1; then
+    $CROFT_SUDO pacman -Sy --noconfirm "$@"
+  elif command -v zypper >/dev/null 2>&1; then
+    $CROFT_SUDO zypper install -y "$@"
+  else
+    return 1
+  fi
+}}
+
+# croft compiles native crates from source, so the final link step needs a C
+# compiler/linker (`cc`) and pkg-config. Stock cloud images (Ubuntu Server,
+# minimal Fedora, Alpine, ...) ship without them, which is why a bare
+# `cargo install` dies with `linker `cc` not found`. The user opted into a
+# from-source install, so install the toolchain rather than fail. This runs
+# unconditionally, even when cargo already exists, because cargo can be
+# present on a box that still lacks cc. The per-manager package names differ:
+# Debian bundles the compiler in build-essential; others name it separately.
+croft_ensure_build_toolchain() {{
+  if command -v cc >/dev/null 2>&1 && command -v pkg-config >/dev/null 2>&1; then
+    return 0
+  fi
+  if command -v apt-get >/dev/null 2>&1; then
+    export DEBIAN_FRONTEND=noninteractive
+    $CROFT_SUDO apt-get update
+    $CROFT_SUDO apt-get install -y build-essential pkg-config
+  elif command -v dnf >/dev/null 2>&1; then
+    $CROFT_SUDO dnf install -y gcc make pkgconf-pkg-config
+  elif command -v yum >/dev/null 2>&1; then
+    $CROFT_SUDO yum install -y gcc make pkgconfig
+  elif command -v apk >/dev/null 2>&1; then
+    $CROFT_SUDO apk add build-base pkgconf
+  elif command -v pacman >/dev/null 2>&1; then
+    $CROFT_SUDO pacman -Sy --noconfirm base-devel pkgconf
+  elif command -v zypper >/dev/null 2>&1; then
+    $CROFT_SUDO zypper install -y gcc make pkg-config
+  else
+    echo 'croft: no supported package manager found to install a C toolchain (need cc + pkg-config)' >&2
+    return 1
+  fi
+}}
+
 if ! command -v cargo >/dev/null 2>&1; then
   if ! command -v curl >/dev/null 2>&1; then
-    if command -v apt-get >/dev/null 2>&1 && [ "$(id -u)" = "0" ]; then
-      export DEBIAN_FRONTEND=noninteractive
-      apt-get update
-      apt-get install -y curl ca-certificates build-essential pkg-config
-    else
-      echo 'cargo and curl are missing; install Rust/Cargo on the remote and retry' >&2
+    if ! croft_pkg_install curl ca-certificates; then
+      echo 'cargo and curl are missing and no supported package manager was found to bootstrap them' >&2
       exit 127
     fi
   fi
@@ -1524,6 +1585,9 @@ if ! command -v cargo >/dev/null 2>&1; then
   . "$HOME/.cargo/env"
 fi
 export PATH="$HOME/.cargo/bin:$PATH"
+# Ensure the C toolchain before compiling, regardless of whether cargo was
+# already installed: a box can have rustup/cargo but no cc.
+croft_ensure_build_toolchain
 # Cap the host build to ~half its cores and run it niced: this fallback
 # compiles on the shared remote (often while other workloads run and,
 # with launch-now, while a live croft session is using the box), so the
@@ -1800,6 +1864,27 @@ Host !blocked *.internal
         assert!(command.contains("cargo install --path \"$HOME/.cache/croft/source\""));
         assert!(command.contains("rustup.rs"));
         assert!(command.contains("printf %s 'abc123' > \"$HOME/.cache/croft/install-stamp\""));
+    }
+
+    #[test]
+    fn remote_install_command_ensures_c_toolchain_unconditionally() {
+        // Regression: cargo can be present on a box that still lacks `cc`, so a
+        // bare `cargo install` dies with `linker `cc` not found`. The toolchain
+        // ensure must run on its own, not only when cargo+curl are both absent,
+        // and it must precede the compile.
+        let command = remote_install_command("abc123");
+        assert!(command.contains("croft_ensure_build_toolchain"));
+        assert!(command.contains("build-essential"));
+        let ensure_call = command
+            .rfind("\ncroft_ensure_build_toolchain")
+            .expect("toolchain ensure must be invoked");
+        let cargo_install = command
+            .find("cargo install --path")
+            .expect("cargo install must be present");
+        assert!(
+            ensure_call < cargo_install,
+            "the C toolchain must be ensured before `cargo install` runs"
+        );
     }
 
     #[test]

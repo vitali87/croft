@@ -96,6 +96,8 @@ croft --help
 croft setup-terminal --help
 ```
 
+`croft remote <host>` installs itself on the box on first connect, with no manual prep. The fast path cross-compiles a static musl binary on your Mac and copies it over; the source fallback compiles on the host and provisions its own build dependencies (a C toolchain and `pkg-config`) across `apt`, `dnf`/`yum`, `apk`, `pacman`, and `zypper`, using `sudo` when not already root. A stock cloud image (Ubuntu Server, minimal Fedora, Alpine) works out of the box.
+
 ## Keybindings
 
 ### Global
