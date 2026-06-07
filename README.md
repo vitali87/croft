@@ -100,6 +100,9 @@ croft setup-terminal --help
 
 ## Keybindings
 
+<details>
+<summary>Click to expand the full keybinding tables.</summary>
+
 ### Global
 
 | Keys | Action |
@@ -262,6 +265,8 @@ Tabs are read-only. Every keystroke is swallowed so a stray key cannot corrupt a
 | `Cmd+T` / `Ctrl+Shift+t` | Open another terminal next to the current one (works from any pane). `Cmd+T` is the primary chord (reaches croft after `croft setup-iterm2`, which relocates iTerm2's New Tab to `Cmd+Ctrl+T`). Each terminal has its own PTY, scrollback, and selection. |
 | `Cmd+W` / `Ctrl+Shift+w` | Close the active terminal (no-op when only one is left; use `Ctrl+J` to hide the pane). `Cmd+W` is the primary chord (reaches croft after `croft setup-iterm2`); plain `Ctrl+W` is left alone so the shell's delete-word-backward keeps working. |
 | `Cmd+]` / `Cmd+[` | Cycle to the next / previous terminal in the pane (reaches croft after `croft setup-iterm2`, which relocates iTerm2's Next/Previous Pane to `Cmd+Opt+]` / `Cmd+Opt+[`). Click any terminal to switch focus directly. |
+
+</details>
 
 ## iTerm2 setup for macOS users
 
