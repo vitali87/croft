@@ -2136,31 +2136,14 @@ fn project_root_for(path: &Path, lang: Language, workspace_root: &Path) -> PathB
 /// langserver exits 1 on --help and crashes on --version, rustup shims
 /// pretend to exist even when their component isn't installed).
 /// Resolve a server config to a spawnable command, or `None` to skip it.
-/// `vtsls` is provisioned by croft's managed installer (absolute path; a lazy
-/// background install is kicked off when it's absent), so it is resolved
-/// against `~/.croft/servers` rather than PATH. Every other server is resolved
+/// A server carrying a `provision` is handled by croft's managed installer
+/// (resolved to an absolute path under `~/.croft/servers`; a lazy background
+/// install is kicked off when it's absent). Every other server is resolved
 /// against PATH unchanged. `log_skip` gates the "not available" log so empty
 /// re-probes don't spam the log on every request.
 fn resolve_config(config: &ServerConfig, log_skip: bool) -> Option<(ServerConfig, Vec<PathBuf>)> {
-    if config.name == crate::lsp::install::VTSLS_SERVER_NAME {
-        if let Some(command) = crate::lsp::install::vtsls_command() {
-            let mut resolved = config.clone();
-            resolved.command = command;
-            // vtsls is a Node script; its `env node` shebang needs node on the
-            // spawned process's PATH, which (for version managers) means the
-            // discovered node dir, not croft's inherited PATH.
-            let extra: Vec<PathBuf> = crate::lsp::install::node_path_prepend()
-                .into_iter()
-                .collect();
-            return Some((resolved, extra));
-        }
-        // Not installed yet: start the one-shot managed install. This open
-        // skips TS LSP; a later request re-probes once the install lands.
-        crate::lsp::install::ensure_vtsls_in_background();
-        if log_skip {
-            log_file::log("lsp[vtsls] not installed; starting croft-managed install");
-        }
-        return None;
+    if let Some(provision) = &config.provision {
+        return crate::lsp::install::resolve_managed(config, provision, log_skip);
     }
     if is_on_path(&config.command) {
         return Some((config.clone(), Vec::new()));
@@ -2225,6 +2208,7 @@ mod tests {
             args: vec![],
             language: Language::Go,
             initialization_options: None,
+            provision: None,
         };
         assert!(
             resolve_config(&absent, false).is_none(),
@@ -2236,6 +2220,7 @@ mod tests {
             args: vec![],
             language: Language::Bash,
             initialization_options: None,
+            provision: None,
         };
         assert!(
             resolve_config(&present, false).is_some(),

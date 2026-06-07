@@ -12391,17 +12391,28 @@ fn is_rename_symbol_key(key: KeyEvent) -> bool {
 
 /// True for `.ts`/`.tsx`/`.js`/`.jsx` paths — the languages served by the
 /// croft-managed vtsls, used to re-open just those docs after vtsls installs.
-fn is_typescript_family(path: &Path) -> bool {
+/// Collapse a language to the server "family" it shares a managed server with.
+/// vtsls serves the whole TypeScript/JS family but reports its config language
+/// as `TypeScript`, so all four map together; every other language is its own
+/// family. Used to decide which open docs to re-open after a managed install.
+fn lsp_server_family(lang: crate::lsp::Language) -> crate::lsp::Language {
+    use crate::lsp::Language;
+    match lang {
+        Language::Tsx | Language::JavaScript | Language::Jsx => Language::TypeScript,
+        other => other,
+    }
+}
+
+/// True when `path`'s language is served by one of the just-installed servers,
+/// so its LSP sync state should be dropped to force a re-open + re-probe.
+fn just_installed_covers_path(installed: &[crate::lsp::Language], path: &Path) -> bool {
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-    matches!(
-        crate::lsp::Language::from_extension(ext),
-        Some(
-            crate::lsp::Language::TypeScript
-                | crate::lsp::Language::Tsx
-                | crate::lsp::Language::JavaScript
-                | crate::lsp::Language::Jsx
-        )
-    )
+    let Some(lang) = crate::lsp::Language::from_extension(ext) else {
+        return false;
+    };
+    installed
+        .iter()
+        .any(|&i| lsp_server_family(i) == lsp_server_family(lang))
 }
 
 /// Editor-pane Change All Occurrences: `Cmd+F2` (macOS) or `Ctrl+F2` (Linux),
@@ -13792,8 +13803,8 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let semantic_changed = app.drain_lsp_semantic_tokens();
         let diagnostics_changed = app.drain_lsp_diagnostics();
         let sysmon_changed = app.drain_sysmon();
-        // Surface the managed TypeScript-server install progress in the status
-        // bar so the background work (which can take a few seconds) is visible.
+        // Surface managed language-server install progress in the status bar so
+        // the background work (which can take a few seconds) is visible.
         let install_status_changed = match crate::lsp::install::take_status() {
             Some(msg) => {
                 app.status = msg;
@@ -13801,13 +13812,14 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             }
             None => false,
         };
-        // When the managed install finishes, forget the LSP sync state for the
-        // TypeScript-family docs so the next `sync_lsp` re-opens them. That
+        // When a managed install finishes, forget the LSP sync state for the
+        // docs that language serves so the next `sync_lsp` re-opens them. That
         // re-open makes the manager re-probe and spawn the just-installed
         // server, so "installed" becomes "working" without a further action.
-        if crate::lsp::install::take_just_installed() {
+        let just_installed = crate::lsp::install::take_just_installed();
+        if !just_installed.is_empty() {
             app.lsp_last_seen
-                .retain(|path, _| !is_typescript_family(path));
+                .retain(|path, _| !just_installed_covers_path(&just_installed, path));
         }
 
         let non_pty_dirty = needs_redraw

@@ -72,6 +72,11 @@ pub struct ServerConfig {
     /// carries `cargo.targetDir` so its `cargo check` uses an isolated target
     /// directory.
     pub initialization_options: Option<serde_json::Value>,
+    /// How croft installs this server itself when it isn't already on the
+    /// user's PATH. `None` means PATH-only (croft never provisions it). When
+    /// `Some`, [`crate::lsp::manager`]'s resolver dispatches to the matching
+    /// backend and kicks off a lazy background install on first miss.
+    pub provision: Option<crate::lsp::install::Provision>,
 }
 
 impl ServerConfig {
@@ -82,6 +87,14 @@ impl ServerConfig {
             args: vec!["server".into()],
             language: Language::Python,
             initialization_options: None,
+            // Astral's type server is on PyPI; uv installs it (and pulls a
+            // Python interpreter) with no node dependency. Latest, not pinned:
+            // ty is fast-moving and a stale pin would just fail to install.
+            provision: Some(crate::lsp::install::Provision::Uv {
+                package: "ty",
+                version: None,
+                bin: "ty",
+            }),
         }
     }
 
@@ -92,6 +105,10 @@ impl ServerConfig {
             args: vec!["--stdio".into()],
             language: Language::Python,
             initialization_options: None,
+            // PATH-only: the registered fallback for the few capabilities `ty`
+            // doesn't advertise. croft provisions `ty`/`ruff` for Python; a user
+            // who wants basedpyright too can install it themselves.
+            provision: None,
         }
     }
 
@@ -102,6 +119,7 @@ impl ServerConfig {
             args: vec!["--stdio".into()],
             language: Language::Python,
             initialization_options: None,
+            provision: None,
         }
     }
 
@@ -112,6 +130,12 @@ impl ServerConfig {
             args: vec!["server".into()],
             language: Language::Python,
             initialization_options: None,
+            // Ruff's linter LSP, installed from PyPI via uv alongside `ty`.
+            provision: Some(crate::lsp::install::Provision::Uv {
+                package: "ruff",
+                version: None,
+                bin: "ruff",
+            }),
         }
     }
 
@@ -122,6 +146,13 @@ impl ServerConfig {
             args: vec!["--stdio".into()],
             language: Language::TypeScript,
             initialization_options: None,
+            // croft owns an npm-installed copy pinned for local/remote parity;
+            // a globally-installed `vtsls` is the fallback.
+            provision: Some(crate::lsp::install::Provision::Npm {
+                package: "@vtsls/language-server",
+                version: Some("0.3.0"),
+                bin: crate::lsp::install::VTSLS_SERVER_NAME,
+            }),
         }
     }
 
@@ -132,6 +163,7 @@ impl ServerConfig {
             args: vec!["--stdio".into()],
             language: Language::TypeScript,
             initialization_options: None,
+            provision: None,
         }
     }
 
@@ -149,6 +181,7 @@ impl ServerConfig {
             initialization_options: Some(serde_json::json!({
                 "cargo": { "targetDir": true }
             })),
+            provision: None,
         }
     }
 
@@ -159,6 +192,7 @@ impl ServerConfig {
             args: vec!["serve".into()],
             language: Language::Go,
             initialization_options: None,
+            provision: None,
         }
     }
 }
@@ -201,6 +235,16 @@ mod tests {
         assert_eq!(c.command, "ty");
         assert_eq!(c.args, vec!["server"]);
         assert_eq!(c.language, Language::Python);
+        // Python servers are provisioned via uv (PyPI), so a fresh box gets
+        // them with no manual install and no node dependency.
+        assert_eq!(
+            c.provision,
+            Some(crate::lsp::install::Provision::Uv {
+                package: "ty",
+                version: None,
+                bin: "ty",
+            })
+        );
     }
 
     #[test]
@@ -224,6 +268,24 @@ mod tests {
         assert_eq!(c.command, "vtsls");
         assert_eq!(c.args, vec!["--stdio"]);
         assert_eq!(c.language, Language::TypeScript);
+        // vtsls is npm-provisioned and version-pinned for local/remote parity.
+        assert_eq!(
+            c.provision,
+            Some(crate::lsp::install::Provision::Npm {
+                package: "@vtsls/language-server",
+                version: Some("0.3.0"),
+                bin: "vtsls",
+            })
+        );
+    }
+
+    #[test]
+    fn path_only_servers_have_no_provision() {
+        // rust-analyzer / gopls are expected on the user's toolchain PATH;
+        // croft doesn't install them.
+        assert!(ServerConfig::rust_analyzer().provision.is_none());
+        assert!(ServerConfig::gopls().provision.is_none());
+        assert!(ServerConfig::basedpyright().provision.is_none());
     }
 
     #[test]
