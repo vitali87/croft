@@ -259,7 +259,7 @@ Tabs are read-only. Every keystroke is swallowed so a stray key cannot corrupt a
 | Keys | Action |
 |------|--------|
 | Any key | Forwarded to the shell PTY (arrows, `Ctrl+letter`, `Alt+x`, function keys all translated to the proper VT escape sequences) |
-| Mouse drag | Select text; selection stays highlighted until you copy or click elsewhere |
+| Mouse drag | Select text; selection stays highlighted until you copy or click elsewhere. Selections are pinned to the scrollback content, not the screen, so they stay put when you scroll and can span more rows than the pane is tall. Drag past the top or bottom edge and the viewport auto-scrolls through history, growing the selection as it goes. |
 | Mouse wheel | Scroll through 5000 rows of scrollback. In alternate-screen mode (vim / less / htop) the wheel forwards arrow keys so the running app handles it. Any keystroke snaps back to the live bottom. |
 | `Cmd+C` / `Ctrl+Shift+c` | Explicit copy of the terminal's current selection (`Cmd+C` reaches croft after `croft setup-iterm2`; native NSPasteboard locally, OSC 52 over SSH) |
 | `Cmd+T` / `Ctrl+Shift+t` | Open another terminal next to the current one (works from any pane). `Cmd+T` is the primary chord (reaches croft after `croft setup-iterm2`, which relocates iTerm2's New Tab to `Cmd+Ctrl+T`). Each terminal has its own PTY, scrollback, and selection. |

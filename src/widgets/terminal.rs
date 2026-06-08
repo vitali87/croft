@@ -22,27 +22,32 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 const SCROLLBACK_LINES: usize = 5000;
 
+/// A terminal text selection, anchored to *absolute* alacritty grid lines
+/// rather than viewport rows. `line` is the grid `Line` index: `0..rows`
+/// is the live screen, negative values are scrollback history. Storing
+/// absolute lines (instead of `row - inner.y`) is what lets a selection
+/// be taller than the visible pane and survive scrolling — the highlight
+/// and the extracted text both track content, not screen position.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Selection {
-    pub anchor: (u16, u16),
-    pub head: (u16, u16),
+    pub anchor: (i32, u16),
+    pub head: (i32, u16),
 }
 
 impl Selection {
-    pub fn new(row: u16, col: u16) -> Self {
+    pub fn new(line: i32, col: u16) -> Self {
         Self {
-            anchor: (row, col),
-            head: (row, col),
+            anchor: (line, col),
+            head: (line, col),
         }
     }
-    pub fn normalised(&self) -> (u16, u16, u16, u16) {
-        let (a_r, a_c) = self.anchor;
-        let (b_r, b_c) = self.head;
-        let after = (a_r, a_c) <= (b_r, b_c);
-        if after {
-            (a_r, a_c, b_r, b_c)
+    pub fn normalised(&self) -> (i32, u16, i32, u16) {
+        let (a_l, a_c) = self.anchor;
+        let (b_l, b_c) = self.head;
+        if (a_l, a_c) <= (b_l, b_c) {
+            (a_l, a_c, b_l, b_c)
         } else {
-            (b_r, b_c, a_r, a_c)
+            (b_l, b_c, a_l, a_c)
         }
     }
     pub fn has_area(&self) -> bool {
@@ -207,8 +212,8 @@ impl PtyTerminal {
         if rows == 0 || cols == 0 {
             return String::new();
         }
-        let display_offset = term.grid().display_offset();
-        extract_selection_text(&term, display_offset, 0, 0, rows - 1, cols - 1)
+        let off = term.grid().display_offset() as i32;
+        extract_selection_text(&term, -off, 0, rows as i32 - 1 - off, cols - 1)
     }
 
     fn spawn_with(mut cmd: CommandBuilder, run_label: Option<String>) -> Result<Self> {
@@ -368,16 +373,85 @@ impl PtyTerminal {
         Some((row - inner.y, col - inner.x))
     }
 
+    /// Current scrollback offset: how many rows the viewport is scrolled
+    /// up from the live bottom. Viewport row `r` maps to absolute grid
+    /// line `r - display_offset`.
+    fn display_offset(&self) -> i32 {
+        self.term.lock().grid().display_offset() as i32
+    }
+
     pub fn start_selection_at(&mut self, col: u16, row: u16) {
         if let Some((r, c)) = self.cell_at(col, row) {
-            self.selection = Some(Selection::new(r, c));
+            let line = r as i32 - self.display_offset();
+            self.selection = Some(Selection::new(line, c));
         }
     }
 
     pub fn extend_selection_to(&mut self, col: u16, row: u16) {
         let cell = self.cell_at(col, row);
+        let off = self.display_offset();
         if let (Some(sel), Some((r, c))) = (self.selection.as_mut(), cell) {
-            sel.head = (r, c);
+            sel.head = (r as i32 - off, c);
+        }
+    }
+
+    /// Extend a drag-selection toward a pointer that may have left the
+    /// pane. Columns and rows are clamped to the inner content rect; the
+    /// returned value is the auto-scroll direction the caller should keep
+    /// applying while the pointer stays past an edge: `-1` (pointer above
+    /// the top, scroll into history), `+1` (below the bottom, scroll
+    /// toward live), or `0` (inside the pane, no auto-scroll). Mirrors
+    /// the click-drag-past-the-edge selection growth in iTerm2/VS Code.
+    pub fn drag_select_to(&mut self, col: u16, row: u16) -> i32 {
+        let inner = self.last_inner;
+        if inner.width == 0 || inner.height == 0 {
+            return 0;
+        }
+        let top = inner.y;
+        let bottom = inner.y + inner.height - 1;
+        let (vp_row, dir) = if row < top {
+            (0u16, -1)
+        } else if row > bottom {
+            (inner.height - 1, 1)
+        } else {
+            (row - inner.y, 0)
+        };
+        let max_x = inner.x + inner.width - 1;
+        let c = col.clamp(inner.x, max_x) - inner.x;
+        let off = self.display_offset();
+        if let Some(sel) = self.selection.as_mut() {
+            sel.head = (vp_row as i32 - off, c);
+        }
+        dir
+    }
+
+    /// One step of edge auto-scroll while a drag-selection is held past
+    /// the top (`dir < 0`) or bottom (`dir > 0`) edge. Scrolls the
+    /// viewport by one row and re-pins the selection head to the new edge
+    /// line at the last-known drag column. No-op in alternate-screen mode
+    /// (where the inner program owns scrolling).
+    pub fn autoscroll_select(&mut self, dir: i32, col: u16) {
+        if dir == 0 {
+            return;
+        }
+        let scrolled = if dir < 0 {
+            self.scroll_up(1)
+        } else {
+            self.scroll_down(1)
+        };
+        if !scrolled {
+            return;
+        }
+        let inner = self.last_inner;
+        if inner.width == 0 || inner.height == 0 {
+            return;
+        }
+        let max_x = inner.x + inner.width - 1;
+        let c = col.clamp(inner.x, max_x) - inner.x;
+        let vp_row = if dir < 0 { 0u16 } else { inner.height - 1 };
+        let off = self.display_offset();
+        if let Some(sel) = self.selection.as_mut() {
+            sel.head = (vp_row as i32 - off, c);
         }
     }
 
@@ -400,7 +474,14 @@ impl PtyTerminal {
             return;
         };
         drop(term);
-        self.selection = Some(Selection { anchor, head });
+        // `select_word_at_in_term` reports viewport rows; anchor them to
+        // absolute grid lines so the selection stays put when scrolled.
+        let off = display_offset as i32;
+        let to_abs = |(vr, vc): (u16, u16)| (vr as i32 - off, vc);
+        self.selection = Some(Selection {
+            anchor: to_abs(anchor),
+            head: to_abs(head),
+        });
     }
 
     pub fn selection(&self) -> Option<Selection> {
@@ -413,15 +494,7 @@ impl PtyTerminal {
         };
         let (sr, sc, er, ec) = sel.normalised();
         let term = self.term.lock();
-        let display_offset = term.grid().display_offset();
-        extract_selection_text(
-            &term,
-            display_offset,
-            sr as usize,
-            sc as usize,
-            er as usize,
-            ec as usize,
-        )
+        extract_selection_text(&term, sr, sc as usize, er, ec as usize)
     }
 
     pub fn write_input(&mut self, data: &[u8]) {
@@ -538,23 +611,28 @@ impl PtyTerminal {
 /// the user gets the wrong line on the clipboard.
 pub fn extract_selection_text(
     term: &Term<VoidListener>,
-    display_offset: usize,
-    sr: usize,
+    sr: i32,
     sc: usize,
-    er: usize,
+    er: i32,
     ec: usize,
 ) -> String {
     let cols = term.columns();
-    let rows = term.screen_lines();
+    // Clamp the range to the grid: the newest live line is
+    // `screen_lines - 1`; the oldest readable line is the grid's topmost
+    // (scrollback floor). Reading outside that panics alacritty's index.
+    let max_line = term.screen_lines() as i32 - 1;
+    let min_line = term.grid().topmost_line().0;
+    let sr = sr.max(min_line);
+    let er = er.min(max_line);
     let mut out = String::new();
-    for row in sr..=er.min(rows.saturating_sub(1)) {
-        let row_start = if row == sr { sc } else { 0 };
-        let row_end = if row == er {
+    let mut line_idx = sr;
+    while line_idx <= er {
+        let row_start = if line_idx == sr { sc } else { 0 };
+        let row_end = if line_idx == er {
             ec.min(cols.saturating_sub(1))
         } else {
             cols.saturating_sub(1)
         };
-        let line_idx = row as i32 - display_offset as i32;
         let mut line = String::new();
         for col in row_start..=row_end {
             let p = Point::new(Line(line_idx), Column(col));
@@ -568,9 +646,10 @@ pub fn extract_selection_text(
         }
         let trimmed = line.trim_end();
         out.push_str(trimmed);
-        if row != er {
+        if line_idx != er {
             out.push('\n');
         }
+        line_idx += 1;
     }
     out
 }
@@ -804,7 +883,7 @@ impl Widget for &mut PtyTerminal {
                     style = style.add_modifier(Modifier::REVERSED);
                 }
                 if let Some((sr, sc, er, ec)) = sel_norm
-                    && cell_in_selection(y, x, sr, sc, er, ec)
+                    && cell_in_selection(line_idx, x, sr, sc, er, ec)
                 {
                     style = style.bg(Color::Rgb(0x26, 0x4f, 0x78));
                 }
@@ -821,7 +900,7 @@ impl Widget for &mut PtyTerminal {
 
 /// True iff (row, col) is inside the inclusive row-major range
 /// [(sr,sc)..=(er,ec)]. Public for unit testing.
-pub fn cell_in_selection(row: u16, col: u16, sr: u16, sc: u16, er: u16, ec: u16) -> bool {
+pub fn cell_in_selection(row: i32, col: u16, sr: i32, sc: u16, er: i32, ec: u16) -> bool {
     if row < sr || row > er {
         return false;
     }
@@ -1337,7 +1416,7 @@ mod tests {
     fn extract_selection_text_single_line() {
         let mut t = fresh_term(20, 5);
         feed(&mut t, b"hello world");
-        let txt = extract_selection_text(&t, 0, 0, 6, 0, 10);
+        let txt = extract_selection_text(&t, 0, 6, 0, 10);
         assert_eq!(txt, "world");
     }
 
@@ -1345,74 +1424,62 @@ mod tests {
     fn extract_selection_text_multi_line_trims_trailing_spaces() {
         let mut t = fresh_term(20, 5);
         feed(&mut t, b"first line\r\nsecond line");
-        let txt = extract_selection_text(&t, 0, 0, 6, 1, 5);
+        let txt = extract_selection_text(&t, 0, 6, 1, 5);
         assert_eq!(txt, "line\nsecond");
     }
 
-    /// User-visible regression: when the terminal is scrolled back into
-    /// history and the user selects a row in the scrollback, the
-    /// clipboard must contain that scrollback row, not whatever happens
-    /// to be at the same viewport y on the live grid. This is the bug
-    /// the user hit in production where selecting "useUploadArtifact is"
-    /// pasted "▎ 3000 and 2000 are u" and selecting a row from a
-    /// scrolled-back file:line marker pasted a different file:line —
-    /// `extract_selection_text` was reading `Line(viewport_row)`
-    /// regardless of `display_offset`, so once the user scrolled the
-    /// painted highlight and the extracted text diverged.
-    /// User-visible regression test: feed enough rows to a 3-row
-    /// viewport that the first three lines spill into scrollback, then
-    /// scroll the viewport back and confirm that
-    /// `extract_selection_text` returns the scrollback row the user
-    /// sees, not the live-grid row at the same viewport y.
+    /// `extract_selection_text` now addresses absolute grid lines, so a
+    /// negative line index reads scrollback directly and a given line
+    /// returns the same content no matter how the viewport is scrolled.
+    /// This is the property that lets a selection survive scrolling: the
+    /// endpoints name content, not screen rows.
     #[test]
-    fn extract_selection_text_reads_scrollback_when_display_offset_is_nonzero() {
+    fn extract_selection_text_addresses_absolute_grid_lines() {
         let mut t = fresh_term(20, 3);
         // Six lines into a 3-row viewport. Each `\r\n` past the bottom
         // pushes the topmost row into scrollback. End-state:
-        //   scrollback (oldest → newest): scroll-A, scroll-B, scroll-C
-        //   live (top → bottom):          live-D,   live-E,   live-F
-        // Cursor parks at the end of live-F, display_offset = 0.
+        //   scrollback: scroll-A = Line(-3), scroll-B = Line(-2), scroll-C = Line(-1)
+        //   live:       live-D = Line(0), live-E = Line(1), live-F = Line(2)
         feed(
             &mut t,
             b"scroll-A row\r\nscroll-B row\r\nscroll-C row\r\nlive-D row\r\nlive-E row\r\nlive-F row",
         );
 
-        // Sanity-check the live screen before scrolling: viewport row 0
-        // is `live-D` because the three older rows already moved to
-        // scrollback.
-        let live_top_before = extract_selection_text(&t, 0, 0, 0, 0, 19);
         assert_eq!(
-            live_top_before, "live-D row",
-            "precondition: with no scroll, viewport row 0 must read 'live-D row' from the live grid - if this fails the scrollback never filled, so the scrolled-back assertion below would prove nothing"
+            extract_selection_text(&t, 0, 0, 0, 19),
+            "live-D row",
+            "Line(0) is the first live row"
+        );
+        assert_eq!(
+            extract_selection_text(&t, -2, 0, -2, 19),
+            "scroll-B row",
+            "Line(-2) reads the scrollback row directly, no display_offset needed"
         );
 
-        // Scroll the viewport up by 2 rows into history. The cells the
-        // user now sees at viewport y=0,1,2 correspond to scrollback
-        // lines −2, −1 and live line 0 respectively. (alacritty's
-        // `Scroll::Delta(n>0)` moves the viewport into history.)
+        // Scrolling the viewport must NOT change what an absolute line
+        // returns - that invariant is why a selection no longer drifts
+        // when the user scrolls mid-drag.
         t.scroll_display(alacritty_terminal::grid::Scroll::Delta(2));
-        let display_offset = t.grid().display_offset();
+        assert_eq!(t.grid().display_offset(), 2);
         assert_eq!(
-            display_offset, 2,
-            "precondition: Scroll::Delta(2) must produce display_offset=2 once scrollback has at least two lines in it"
+            extract_selection_text(&t, -2, 0, -2, 19),
+            "scroll-B row",
+            "Line(-2) still reads 'scroll-B row' after scrolling - absolute lines are scroll-invariant"
         );
+    }
 
-        // With the fix in place: viewport row 0 + display_offset=2
-        // reads grid `Line(-2)`, the OLDER of the two scrollback rows
-        // currently shown — that's `scroll-B row`.
-        let scrollback = extract_selection_text(&t, display_offset, 0, 0, 0, 19);
-        assert_eq!(
-            scrollback, "scroll-B row",
-            "viewport row 0 with display_offset=2 must surface the scrollback row the user actually sees highlighted, NOT the live grid row at the same y - this is the non-negotiable invariant the user lost when selection_text forgot to subtract display_offset, and the symptom was selecting one terminal row and pasting the contents of a completely different row"
-        );
-
-        // Without the offset (the pre-fix behaviour), the same call
-        // would still report 'live-D row' because Line(0) names the
-        // live first line. We assert that by passing 0 explicitly:
-        let still_live = extract_selection_text(&t, 0, 0, 0, 0, 19);
-        assert_eq!(
-            still_live, "live-D row",
-            "passing display_offset=0 must still read the live grid - the function must be honest in BOTH directions so future callers (snapshot helpers, tests) can opt into either semantic without ambiguity"
-        );
+    /// The whole point of the fix: a selection that spans from scrollback
+    /// history into the live screen extracts every line, even though it
+    /// is far taller than the 3-row viewport. Before the absolute-
+    /// coordinate model the selection was capped at the visible pane
+    /// height and the off-screen lines were simply unreachable.
+    #[test]
+    fn selection_spanning_scrollback_into_live_extracts_every_line() {
+        let mut t = fresh_term(20, 3);
+        feed(&mut t, b"AAAA\r\nBBBB\r\nCCCC\r\nDDDD\r\nEEEE\r\nFFFF");
+        // Select from the oldest scrollback line (AAAA = Line(-3)) all
+        // the way to the last live line (FFFF = Line(2)).
+        let all = extract_selection_text(&t, -3, 0, 2, 19);
+        assert_eq!(all, "AAAA\nBBBB\nCCCC\nDDDD\nEEEE\nFFFF");
     }
 }

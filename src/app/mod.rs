@@ -773,6 +773,19 @@ struct PendingDiscard {
     untracked: bool,
 }
 
+/// State for edge auto-scroll during a terminal drag-selection. `dir` is
+/// -1 (pointer above the top edge, scroll into history) or +1 (below the
+/// bottom edge, scroll toward live); `col` is the last drag column so the
+/// re-pinned selection head tracks the pointer horizontally; `last` rate-
+/// limits the scroll so it advances at a readable speed rather than once
+/// per main-loop wakeup.
+#[derive(Clone, Copy)]
+struct TerminalSelectAutoScroll {
+    dir: i32,
+    col: u16,
+    last: std::time::Instant,
+}
+
 pub struct App {
     pub tree: FileTree,
     pub search: SearchPanel,
@@ -831,6 +844,12 @@ pub struct App {
     editor_click: ClickTracker,
     tree_click: ClickTracker,
     terminal_click: ClickTracker,
+    /// Active edge auto-scroll while drag-selecting in the terminal: set
+    /// when the drag pointer is pinned past the top/bottom edge, serviced
+    /// each main-loop tick to keep growing the selection through
+    /// scrollback. `None` whenever the pointer is inside the pane or the
+    /// button is released.
+    terminal_select_autoscroll: Option<TerminalSelectAutoScroll>,
     /// Pane whose scrollbar is currently being dragged with the left mouse button.
     scrollbar_drag: Option<Pane>,
     /// True while the editor's horizontal scrollbar thumb is being dragged.
@@ -1409,6 +1428,7 @@ impl App {
             editor_click: ClickTracker::default(),
             tree_click: ClickTracker::default(),
             terminal_click: ClickTracker::default(),
+            terminal_select_autoscroll: None,
             scrollbar_drag: None,
             editor_hscrollbar_drag: false,
             welcome,
@@ -8347,6 +8367,26 @@ impl App {
         std::mem::take(&mut self.pending_scp_uploads)
     }
 
+    /// Service edge auto-scroll while a terminal drag-selection is held
+    /// past the top/bottom edge. Called every main-loop wakeup; advances
+    /// the viewport by one row at ~30 ms intervals (a readable ~33 rows/s)
+    /// and re-pins the selection head to the new edge. Returns true when a
+    /// scroll happened so the caller knows it owes a redraw.
+    pub fn tick_terminal_autoscroll(&mut self) -> bool {
+        let Some(state) = self.terminal_select_autoscroll else {
+            return false;
+        };
+        if state.last.elapsed() < std::time::Duration::from_millis(30) {
+            return false;
+        }
+        self.terminal_mut().autoscroll_select(state.dir, state.col);
+        self.terminal_select_autoscroll = Some(TerminalSelectAutoScroll {
+            last: std::time::Instant::now(),
+            ..state
+        });
+        true
+    }
+
     fn drop_relay_active(&self) -> bool {
         std::env::var_os("CROFT_DROP_RELAY_LOG").is_some()
             && std::env::var_os("CROFT_DROP_RELAY_INBOX").is_some()
@@ -10232,6 +10272,22 @@ impl App {
                 self.editor_click.clear_if_moved(m.column, m.row);
                 self.tree_click.clear_if_moved(m.column, m.row);
                 self.terminal_click.clear_if_moved(m.column, m.row);
+                // Terminal drag-selection is handled before the per-pane
+                // branches so it keeps extending even when the pointer
+                // leaves the pane: dragging past the bottom edge is how the
+                // user grows a selection down through scrollback. The
+                // returned direction arms edge auto-scroll (serviced each
+                // main-loop tick); a pointer back inside the pane disarms it.
+                if self.focus == Pane::Terminal && self.terminal().selection().is_some() {
+                    let dir = self.terminal_mut().drag_select_to(m.column, m.row);
+                    self.terminal_select_autoscroll =
+                        (dir != 0).then_some(TerminalSelectAutoScroll {
+                            dir,
+                            col: m.column,
+                            last: std::time::Instant::now(),
+                        });
+                    return;
+                }
                 if in_editor {
                     if self.editor.diff.is_some() {
                         let last_inner = self.editor.last_inner;
@@ -10295,6 +10351,8 @@ impl App {
                 }
             }
             MouseEventKind::Up(MouseButton::Left) => {
+                // Releasing the button ends any terminal edge auto-scroll.
+                self.terminal_select_autoscroll = None;
                 if self.splitter_drag.take().is_some() {
                     return;
                 }
@@ -14025,6 +14083,13 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             needs_redraw = true;
         }
         poll_max_us = poll_max_us.max(poll_start.elapsed().as_micros());
+        // Drive edge auto-scroll for an in-progress terminal drag-selection
+        // even when the pointer is held still (no fresh events): the poll
+        // above wakes us every 8 ms, and this advances the selection while
+        // the pointer stays pinned past the pane edge.
+        if app.tick_terminal_autoscroll() {
+            needs_redraw = true;
+        }
     }
     Ok(())
 }
