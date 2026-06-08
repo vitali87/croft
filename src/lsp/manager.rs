@@ -16,7 +16,8 @@ use lsp_types::{
     SemanticTokensFullOptions, SemanticTokensRangeResult, SemanticTokensResult,
     SemanticTokensServerCapabilities, SemanticTokensWorkspaceClientCapabilities,
     ServerCapabilities, TextDocumentClientCapabilities, TextEdit, TokenFormat,
-    TypeDefinitionProviderCapability, Url, WorkspaceClientCapabilities, WorkspaceEdit,
+    TypeDefinitionProviderCapability, Url, WindowClientCapabilities, WorkspaceClientCapabilities,
+    WorkspaceEdit,
 };
 use tokio::sync::{Mutex as TokioMutex, mpsc as tokio_mpsc};
 
@@ -172,6 +173,16 @@ pub struct DiagnosticsUpdate {
     pub diagnostics: Vec<Diagnostic>,
 }
 
+/// A server's work-done progress update, forwarded from a `$/progress`
+/// notification. `message` is `Some(text)` while a task is running (Begin /
+/// Report) and `None` when it ends (End), so the app can show or clear the
+/// per-server status (e.g. "rust-analyzer: Indexing 112/340 33%").
+#[derive(Debug, Clone)]
+pub struct ProgressUpdate {
+    pub server: String,
+    pub message: Option<String>,
+}
+
 enum Cmd {
     OpenDoc {
         path: PathBuf,
@@ -270,6 +281,7 @@ pub struct LspManager {
     rename_rx: std_mpsc::Receiver<RenameResult>,
     semantic_rx: std_mpsc::Receiver<SemanticTokensUpdate>,
     diagnostics_rx: std_mpsc::Receiver<DiagnosticsUpdate>,
+    progress_rx: std_mpsc::Receiver<ProgressUpdate>,
     capability_support: CapabilitySupport,
     semantic_refresh: Arc<AtomicBool>,
     next_request_id: u64,
@@ -291,6 +303,7 @@ impl LspManager {
         let (rename_tx, rename_rx) = std_mpsc::channel();
         let (semantic_tx, semantic_rx) = std_mpsc::channel();
         let (diagnostics_tx, diagnostics_rx) = std_mpsc::channel();
+        let (progress_tx, progress_rx) = std_mpsc::channel();
         let capability_support: CapabilitySupport =
             Arc::new(StdMutex::new(LangCapabilitySupport::default()));
         let semantic_refresh = Arc::new(AtomicBool::new(false));
@@ -310,6 +323,7 @@ impl LspManager {
                 rename: rename_tx,
                 semantic_tokens: semantic_tx,
                 diagnostics: diagnostics_tx,
+                progress: progress_tx,
             },
             capability_support.clone(),
             semantic_refresh.clone(),
@@ -326,6 +340,7 @@ impl LspManager {
             rename_rx,
             semantic_rx,
             diagnostics_rx,
+            progress_rx,
             capability_support,
             semantic_refresh,
             next_request_id: 1,
@@ -410,6 +425,13 @@ impl LspManager {
     /// per-server store so layering and "all clear" (empty batch) both work.
     pub fn drain_diagnostics(&self) -> Option<DiagnosticsUpdate> {
         self.diagnostics_rx.try_recv().ok()
+    }
+
+    /// Pop the next server work-done progress update, if any. `message` is
+    /// `Some` while a task runs and `None` when it ends; the app keeps a
+    /// per-server map so the status bar can show or clear "Indexing…".
+    pub fn drain_progress(&self) -> Option<ProgressUpdate> {
+        self.progress_rx.try_recv().ok()
     }
 
     /// Returns and clears the "a server asked us to re-pull semantic tokens"
@@ -616,6 +638,9 @@ struct WorkerState {
     // Cloned into every spawned client's router so the server-pushed
     // `textDocument/publishDiagnostics` notifications reach the app.
     diagnostics_tx: std_mpsc::Sender<DiagnosticsUpdate>,
+    // Cloned into every spawned client's router so server `$/progress`
+    // notifications (rust-analyzer indexing, etc.) reach the status bar.
+    progress_tx: std_mpsc::Sender<ProgressUpdate>,
 }
 
 struct DocState {
@@ -637,6 +662,7 @@ struct ResultSenders {
     rename: std_mpsc::Sender<RenameResult>,
     semantic_tokens: std_mpsc::Sender<SemanticTokensUpdate>,
     diagnostics: std_mpsc::Sender<DiagnosticsUpdate>,
+    progress: std_mpsc::Sender<ProgressUpdate>,
 }
 
 async fn worker_loop(
@@ -655,6 +681,7 @@ async fn worker_loop(
         capability_support,
         semantic_refresh,
         diagnostics_tx: tx.diagnostics.clone(),
+        progress_tx: tx.progress.clone(),
     };
     while let Some(cmd) = cmd_rx.recv().await {
         match cmd {
@@ -790,6 +817,7 @@ impl WorkerState {
                     let caps = build_client_capabilities();
                     let refresh = self.semantic_refresh.clone();
                     let diagnostics = self.diagnostics_tx.clone();
+                    let progress = self.progress_tx.clone();
                     async move {
                         let result = LspClient::spawn(
                             &config,
@@ -798,6 +826,7 @@ impl WorkerState {
                             &extra_path,
                             refresh,
                             diagnostics,
+                            progress,
                         )
                         .await;
                         (config, result)
@@ -2073,6 +2102,14 @@ fn build_client_capabilities() -> ClientCapabilities {
             }),
             ..Default::default()
         }),
+        // Declare `window.workDoneProgress` so servers stream `$/progress`
+        // (rust-analyzer's "Indexing…", "Building CrateGraph", "Roots
+        // Scanned"). The router forwards it to the status bar, so a server
+        // that is busy priming is never silently mistaken for a dead one.
+        window: Some(WindowClientCapabilities {
+            work_done_progress: Some(true),
+            ..Default::default()
+        }),
         ..Default::default()
     }
 }
@@ -2191,6 +2228,16 @@ mod tests {
         SemanticTokensOptions,
     };
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn client_capabilities_advertise_work_done_progress() {
+        // Servers only emit `$/progress` (rust-analyzer's "Indexing…") when the
+        // client declares `window.workDoneProgress`. Without this the status bar
+        // could never show indexing state.
+        let caps = build_client_capabilities();
+        let window = caps.window.expect("window capabilities must be set");
+        assert_eq!(window.work_done_progress, Some(true));
+    }
 
     fn def_range(line: u32, ch: u32) -> lsp_types::Range {
         let p = lsp_types::Position {

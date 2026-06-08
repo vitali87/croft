@@ -987,6 +987,11 @@ pub struct App {
         PathBuf,
         std::collections::HashMap<String, Vec<crate::lsp::manager::Diagnostic>>,
     >,
+    /// Live LSP work-done progress, keyed by server name (e.g. "rust-analyzer"
+    /// -> "Indexing 112/340 33%"). An entry exists only while that server has
+    /// an active task; the status bar surfaces it so a busy-priming server is
+    /// never mistaken for a dead one. Cleared on the server's `End`.
+    lsp_progress: std::collections::HashMap<String, String>,
     /// Active completion popup, when a completion request has been issued
     /// and the user hasn't dismissed the result. Populated by drain_lsp_completion
     /// once the worker sends a CompletionResult back.
@@ -1477,6 +1482,7 @@ impl App {
             },
             lsp_last_seen: std::collections::HashMap::new(),
             lsp_diagnostics: std::collections::HashMap::new(),
+            lsp_progress: std::collections::HashMap::new(),
             completion_popup: None,
             editor_vim_chord: EditorVimChord::default(),
             vim: crate::vim::VimState::new(),
@@ -2924,6 +2930,50 @@ impl App {
             }
         }
         changed
+    }
+
+    /// Drain server work-done progress updates into the per-server map the
+    /// status bar reads. Returns true when anything changed so the main loop
+    /// repaints the bar. A `Some(message)` upserts the server's status; a
+    /// `None` (the server's `End`) clears it.
+    pub fn drain_lsp_progress(&mut self) -> bool {
+        let mut updates = Vec::new();
+        if let Some(lsp) = self.lsp.as_ref() {
+            while let Some(u) = lsp.drain_progress() {
+                updates.push(u);
+            }
+        }
+        let mut changed = false;
+        for u in updates {
+            match u.message {
+                Some(message) => {
+                    self.lsp_progress.insert(u.server, message);
+                    changed = true;
+                }
+                None => {
+                    if self.lsp_progress.remove(&u.server).is_some() {
+                        changed = true;
+                    }
+                }
+            }
+        }
+        changed
+    }
+
+    /// The active LSP progress line for the status bar, if any server is busy
+    /// (e.g. `rust-analyzer: Indexing 112/340 33%`). Joins multiple busy
+    /// servers with `  ·  ` so a Rust + Python workspace shows both.
+    fn lsp_progress_status(&self) -> Option<String> {
+        if self.lsp_progress.is_empty() {
+            return None;
+        }
+        let mut entries: Vec<String> = self
+            .lsp_progress
+            .iter()
+            .map(|(server, msg)| format!("{server}: {msg}"))
+            .collect();
+        entries.sort();
+        Some(entries.join("  ·  "))
     }
 
     /// Re-pull semantic tokens when a server asked us to via
@@ -4871,6 +4921,18 @@ impl App {
                 ),
                 Style::default()
                     .fg(Color::Rgb(0xff, 0x45, 0x4d))
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        if let Some(progress) = self.lsp_progress_status() {
+            // A busy language server (rust-analyzer priming its crate graph,
+            // etc.) is otherwise invisible: hover/completion just return empty
+            // until it finishes. Surfacing "rust-analyzer: Indexing …" tells
+            // the user to wait rather than assume the server is dead.
+            spans.push(Span::styled(
+                format!(" ⟳ {progress} "),
+                Style::default()
+                    .fg(Color::Rgb(0x4e, 0x9a, 0xff))
                     .add_modifier(Modifier::BOLD),
             ));
         }
@@ -13938,6 +14000,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let rename_changed = app.drain_lsp_rename();
         let semantic_changed = app.drain_lsp_semantic_tokens();
         let diagnostics_changed = app.drain_lsp_diagnostics();
+        let progress_changed = app.drain_lsp_progress();
         let sysmon_changed = app.drain_sysmon();
         // Surface managed language-server install progress in the status bar so
         // the background work (which can take a few seconds) is visible.
@@ -13980,6 +14043,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             || rename_changed
             || semantic_changed
             || diagnostics_changed
+            || progress_changed
             || install_status_changed
             || sysmon_changed;
         let pty_eligible = pty_pending

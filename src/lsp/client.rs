@@ -12,18 +12,19 @@ use async_lsp::router::Router;
 use async_lsp::tracing::TracingLayer;
 use async_lsp::{LanguageServer, MainLoop, ServerSocket};
 use lsp_types::DiagnosticSeverity as LspDiagnosticSeverity;
-use lsp_types::notification::{LogMessage, PublishDiagnostics, ShowMessage};
-use lsp_types::request::SemanticTokensRefresh;
+use lsp_types::notification::{LogMessage, Progress, PublishDiagnostics, ShowMessage};
+use lsp_types::request::{SemanticTokensRefresh, WorkDoneProgressCreate};
 use lsp_types::{
     ClientCapabilities, CompletionContext, CompletionParams, CompletionResponse,
     CompletionTriggerKind, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
     DidOpenTextDocumentParams, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverParams,
-    InitializeParams, InitializedParams, Location, PartialResultParams, Position, Range,
-    ReferenceContext, ReferenceParams, RenameParams, SemanticTokensParams,
-    SemanticTokensRangeParams, SemanticTokensRangeResult, SemanticTokensResult, ServerCapabilities,
-    TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem,
-    TextDocumentPositionParams, Url, VersionedTextDocumentIdentifier, WorkDoneProgressParams,
-    WorkspaceEdit, WorkspaceFolder,
+    InitializeParams, InitializedParams, Location, PartialResultParams, Position,
+    ProgressParamsValue, Range, ReferenceContext, ReferenceParams, RenameParams,
+    SemanticTokensParams, SemanticTokensRangeParams, SemanticTokensRangeResult,
+    SemanticTokensResult, ServerCapabilities, TextDocumentContentChangeEvent,
+    TextDocumentIdentifier, TextDocumentItem, TextDocumentPositionParams, Url,
+    VersionedTextDocumentIdentifier, WorkDoneProgress, WorkDoneProgressParams, WorkspaceEdit,
+    WorkspaceFolder,
 };
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
@@ -32,7 +33,7 @@ use tower::ServiceBuilder;
 
 use crate::lsp::config::ServerConfig;
 use crate::lsp::log_file;
-use crate::lsp::manager::{Diagnostic, DiagnosticSeverity, DiagnosticsUpdate};
+use crate::lsp::manager::{Diagnostic, DiagnosticSeverity, DiagnosticsUpdate, ProgressUpdate};
 
 struct ClientState {
     name: String,
@@ -45,6 +46,37 @@ struct ClientState {
     // Server-pushed `textDocument/publishDiagnostics` batches are normalised
     // and forwarded here; the manager owns the receiver and the app drains it.
     diagnostics_tx: std_mpsc::Sender<DiagnosticsUpdate>,
+    // Server `$/progress` work-done updates (rust-analyzer indexing, etc.)
+    // forwarded here for the status bar.
+    progress_tx: std_mpsc::Sender<ProgressUpdate>,
+    // Begin carries the progress title; Report/End don't, so the title is
+    // remembered per progress token to keep the status line meaningful.
+    progress_titles: std::collections::HashMap<String, String>,
+}
+
+/// Join a work-done progress title with its optional message and percentage
+/// into one compact status string (e.g. `Indexing 112/340 33%`).
+pub(crate) fn compose_progress(
+    title: &str,
+    message: Option<&str>,
+    percentage: Option<u32>,
+) -> String {
+    let mut out = title.to_string();
+    if let Some(m) = message.filter(|m| !m.is_empty()) {
+        out.push(' ');
+        out.push_str(m);
+    }
+    if let Some(p) = percentage {
+        out.push_str(&format!(" {p}%"));
+    }
+    out
+}
+
+fn progress_token_key(token: &lsp_types::ProgressToken) -> String {
+    match token {
+        lsp_types::NumberOrString::Number(n) => n.to_string(),
+        lsp_types::NumberOrString::String(s) => s.clone(),
+    }
 }
 
 impl ClientState {
@@ -52,11 +84,14 @@ impl ClientState {
         name: String,
         semantic_refresh: Arc<AtomicBool>,
         diagnostics_tx: std_mpsc::Sender<DiagnosticsUpdate>,
+        progress_tx: std_mpsc::Sender<ProgressUpdate>,
     ) -> Router<Self> {
         let mut router = Router::new(ClientState {
             name,
             semantic_refresh,
             diagnostics_tx,
+            progress_tx,
+            progress_titles: std::collections::HashMap::new(),
         });
         router
             .request::<SemanticTokensRefresh, _>(|this, _params| {
@@ -66,6 +101,37 @@ impl ClientState {
                     this.name
                 ));
                 std::future::ready(Ok(()))
+            })
+            // Servers (rust-analyzer) ask us to create a progress token before
+            // streaming `$/progress`. Acknowledge it so the progress flows;
+            // declining with METHOD_NOT_FOUND would suppress the indexing UI.
+            .request::<WorkDoneProgressCreate, _>(|_this, _params| std::future::ready(Ok(())))
+            .notification::<Progress>(|this, params| {
+                let ProgressParamsValue::WorkDone(work) = params.value;
+                let key = progress_token_key(&params.token);
+                let message = match work {
+                    WorkDoneProgress::Begin(b) => {
+                        this.progress_titles.insert(key.clone(), b.title.clone());
+                        Some(compose_progress(
+                            &b.title,
+                            b.message.as_deref(),
+                            b.percentage,
+                        ))
+                    }
+                    WorkDoneProgress::Report(r) => {
+                        let title = this.progress_titles.get(&key).cloned().unwrap_or_default();
+                        Some(compose_progress(&title, r.message.as_deref(), r.percentage))
+                    }
+                    WorkDoneProgress::End(_) => {
+                        this.progress_titles.remove(&key);
+                        None
+                    }
+                };
+                let _ = this.progress_tx.send(ProgressUpdate {
+                    server: this.name.clone(),
+                    message,
+                });
+                ControlFlow::Continue(())
             })
             .notification::<PublishDiagnostics>(|this, params| {
                 log_file::log(&format!(
@@ -162,6 +228,7 @@ impl LspClient {
         extra_path: &[std::path::PathBuf],
         semantic_refresh: Arc<AtomicBool>,
         diagnostics_tx: std_mpsc::Sender<DiagnosticsUpdate>,
+        progress_tx: std_mpsc::Sender<ProgressUpdate>,
     ) -> Result<Self> {
         let workspace_uri = Url::from_file_path(workspace_root).map_err(|_| {
             anyhow!(
@@ -212,6 +279,7 @@ impl LspClient {
                     router_name,
                     semantic_refresh,
                     diagnostics_tx,
+                    progress_tx,
                 ))
         });
 
@@ -538,6 +606,26 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn compose_progress_joins_title_message_and_percentage() {
+        // rust-analyzer's $/progress: Begin carries the title ("Indexing"),
+        // Report carries an optional message ("112/340") and percentage. We
+        // surface them as one compact status string.
+        assert_eq!(compose_progress("Indexing", None, None), "Indexing");
+        assert_eq!(
+            compose_progress("Indexing", Some("112/340"), None),
+            "Indexing 112/340"
+        );
+        assert_eq!(
+            compose_progress("Indexing", Some("112/340"), Some(33)),
+            "Indexing 112/340 33%"
+        );
+        assert_eq!(
+            compose_progress("Roots Scanned", None, Some(100)),
+            "Roots Scanned 100%"
+        );
+    }
+
+    #[test]
     fn semantic_tokens_refresh_request_sets_the_repull_flag() {
         use async_lsp::AnyRequest;
         use tower::Service;
@@ -547,7 +635,9 @@ mod tests {
         // declining it with METHOD_NOT_FOUND and never updating).
         let flag = Arc::new(AtomicBool::new(false));
         let (diag_tx, _diag_rx) = std_mpsc::channel();
-        let mut router = ClientState::router("rust-analyzer".into(), flag.clone(), diag_tx);
+        let (prog_tx, _prog_rx) = std_mpsc::channel();
+        let mut router =
+            ClientState::router("rust-analyzer".into(), flag.clone(), diag_tx, prog_tx);
         let req: AnyRequest = serde_json::from_value(json!({
             "id": 1,
             "method": "workspace/semanticTokens/refresh",
@@ -610,10 +700,12 @@ mod tests {
     #[test]
     fn router_continues_past_unhandled_vendor_notification_like_pyright_begin_progress() {
         let (diag_tx, _diag_rx) = std_mpsc::channel();
+        let (prog_tx, _prog_rx) = std_mpsc::channel();
         let mut router = ClientState::router(
             "basedpyright".into(),
             Arc::new(AtomicBool::new(false)),
             diag_tx,
+            prog_tx,
         );
         let notif: AnyNotification = serde_json::from_value(json!({
             "method": "pyright/beginProgress",
@@ -633,8 +725,13 @@ mod tests {
     #[test]
     fn router_continues_past_arbitrary_unhandled_notification_methods() {
         let (diag_tx, _diag_rx) = std_mpsc::channel();
-        let mut router =
-            ClientState::router("any".into(), Arc::new(AtomicBool::new(false)), diag_tx);
+        let (prog_tx, _prog_rx) = std_mpsc::channel();
+        let mut router = ClientState::router(
+            "any".into(),
+            Arc::new(AtomicBool::new(false)),
+            diag_tx,
+            prog_tx,
+        );
         for method in ["foo/bar", "experimental/dap", "rust-analyzer/serverStatus"] {
             let notif: AnyNotification = serde_json::from_value(json!({
                 "method": method,
@@ -693,6 +790,7 @@ mod tests {
 
         let result: Result<()> = rt.handle().block_on(async move {
             let (diag_tx, _diag_rx) = std_mpsc::channel();
+            let (prog_tx, _prog_rx) = std_mpsc::channel();
             let client = LspClient::spawn(
                 &config,
                 &root,
@@ -700,6 +798,7 @@ mod tests {
                 &[],
                 Arc::new(AtomicBool::new(false)),
                 diag_tx,
+                prog_tx,
             )
             .await?;
             assert_eq!(client.name(), expected_name);
