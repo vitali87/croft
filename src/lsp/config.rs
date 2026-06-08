@@ -68,9 +68,7 @@ pub struct ServerConfig {
     pub args: Vec<String>,
     pub language: Language,
     /// Server-specific `initializationOptions` sent in the LSP `initialize`
-    /// request. `None` for servers that need none. For rust-analyzer this
-    /// carries `cargo.targetDir` so its `cargo check` uses an isolated target
-    /// directory.
+    /// request. `None` for servers that need none (the common case).
     pub initialization_options: Option<serde_json::Value>,
     /// How croft installs this server itself when it isn't already on the
     /// user's PATH. `None` means PATH-only (croft never provisions it). When
@@ -173,14 +171,14 @@ impl ServerConfig {
             command: "rust-analyzer".into(),
             args: vec![],
             language: Language::Rust,
-            // Give rust-analyzer its own `target/rust-analyzer/` so its
-            // `cargo check` no longer fights the user's `cargo build`/`cargo
-            // install` over the target-dir lock, and its build-script and
-            // proc-macro artifacts survive a rebuild instead of forcing a
-            // fresh ~14s cold crate-graph analysis on the next file open.
-            initialization_options: Some(serde_json::json!({
-                "cargo": { "targetDir": true }
-            })),
+            // No `cargo.targetDir` isolation: rust-analyzer shares the default
+            // `target/`, reusing the warm build-script / proc-macro / dep
+            // artifacts the user's own `cargo build` already produced, so the
+            // crate-graph prime takes seconds. An isolated `target/rust-analyzer/`
+            // (tried in 19df82c) is always cold on a large crate, so the prime
+            // never finishes and every hover / completion / semantic-token
+            // response comes back empty.
+            initialization_options: None,
             provision: None,
         }
     }
@@ -297,16 +295,18 @@ mod tests {
     }
 
     #[test]
-    fn rust_analyzer_isolates_its_target_dir() {
-        // A dedicated `target/rust-analyzer/` keeps the user's
-        // `cargo install`/`cargo build` from invalidating rust-analyzer's
-        // build-script and proc-macro artifacts (and vice versa), so the cold
-        // crate-graph analysis is re-paid far less often.
+    fn rust_analyzer_shares_the_default_target_dir() {
+        // rust-analyzer must NOT isolate its `cargo check` into
+        // `target/rust-analyzer/`. On a large crate that isolated dir is always
+        // cold, so the initial crate-graph prime effectively never finishes and
+        // hover / completion / semantic tokens come back empty. Sharing the
+        // default `target/` lets RA reuse the warm artifacts the user's
+        // `cargo build` already produced, so it primes in seconds.
         let c = ServerConfig::rust_analyzer();
-        let opts = c
-            .initialization_options
-            .expect("rust-analyzer must send initializationOptions");
-        assert_eq!(opts["cargo"]["targetDir"], serde_json::json!(true));
+        assert!(
+            c.initialization_options.is_none(),
+            "rust-analyzer must not send cargo.targetDir (the isolated dir never primes on a big crate)"
+        );
     }
 
     #[test]
