@@ -341,6 +341,56 @@ const HELP_MENU_EQUIV: &str = "@~?";
 // iTerm2 reports for Cmd+click. Re-running setup purges any stale copy.
 const STALE_GOTO_DEF_POINTER_KEY: &str = "Button,0,1,c,";
 
+/// CSI-u Send-Hex payloads exposed to the crate for the Ghostty keybind
+/// generator (`crate::ghostty`). The byte sequences are defined exactly once,
+/// in the const block above, as the single source of truth for what each croft
+/// chord puts on the wire. Ghostty emits the identical bytes through its `csi:`
+/// keybind action, so croft receives byte-for-byte the same input under Ghostty
+/// as it does under iTerm2's GlobalKeyMap forwarders. A descendant module may
+/// read its parent's private items, so these `pub(crate)` aliases copy the
+/// private payloads without widening any original const's visibility.
+pub(crate) mod payloads {
+    pub(crate) const CMD_A_HEX: &str = super::CMD_A_HEX;
+    pub(crate) const CMD_B_HEX: &str = super::CMD_B_HEX;
+    pub(crate) const CMD_BACKSLASH_HEX: &str = super::CMD_BACKSLASH_HEX;
+    pub(crate) const CMD_C_HEX: &str = super::CMD_C_HEX;
+    pub(crate) const CMD_D_HEX: &str = super::CMD_D_HEX;
+    pub(crate) const CMD_DIGIT_CHORDS: &[(&str, &str)] = super::CMD_DIGIT_CHORDS;
+    pub(crate) const CMD_E_HEX: &str = super::CMD_E_HEX;
+    pub(crate) const CMD_F12_HEX: &str = super::CMD_F12_HEX;
+    pub(crate) const CMD_F_HEX: &str = super::CMD_F_HEX;
+    pub(crate) const CMD_G_HEX: &str = super::CMD_G_HEX;
+    pub(crate) const CMD_LBRACKET_HEX: &str = super::CMD_LBRACKET_HEX;
+    pub(crate) const CMD_O_HEX: &str = super::CMD_O_HEX;
+    pub(crate) const CMD_OPT_LEFT_HEX: &str = super::CMD_OPT_LEFT_HEX;
+    pub(crate) const CMD_OPT_R_HEX: &str = super::CMD_OPT_R_HEX;
+    pub(crate) const CMD_OPT_RIGHT_HEX: &str = super::CMD_OPT_RIGHT_HEX;
+    pub(crate) const CMD_P_HEX: &str = super::CMD_P_HEX;
+    pub(crate) const CMD_R_HEX: &str = super::CMD_R_HEX;
+    pub(crate) const CMD_RBRACKET_HEX: &str = super::CMD_RBRACKET_HEX;
+    pub(crate) const CMD_S_HEX: &str = super::CMD_S_HEX;
+    pub(crate) const CMD_SHIFT_D_HEX: &str = super::CMD_SHIFT_D_HEX;
+    pub(crate) const CMD_SHIFT_E_HEX: &str = super::CMD_SHIFT_E_HEX;
+    pub(crate) const CMD_SHIFT_ENTER_HEX: &str = super::CMD_SHIFT_ENTER_HEX;
+    pub(crate) const CMD_SHIFT_F_HEX: &str = super::CMD_SHIFT_F_HEX;
+    pub(crate) const CMD_SHIFT_G_HEX: &str = super::CMD_SHIFT_G_HEX;
+    pub(crate) const CMD_SHIFT_L_HEX: &str = super::CMD_SHIFT_L_HEX;
+    pub(crate) const CMD_SHIFT_N_HEX: &str = super::CMD_SHIFT_N_HEX;
+    pub(crate) const CMD_SHIFT_O_HEX: &str = super::CMD_SHIFT_O_HEX;
+    pub(crate) const CMD_SHIFT_R_HEX: &str = super::CMD_SHIFT_R_HEX;
+    pub(crate) const CMD_SHIFT_S_HEX: &str = super::CMD_SHIFT_S_HEX;
+    pub(crate) const CMD_SHIFT_SLASH_HEX: &str = super::CMD_SHIFT_SLASH_HEX;
+    pub(crate) const CMD_SHIFT_T_HEX: &str = super::CMD_SHIFT_T_HEX;
+    pub(crate) const CMD_SLASH_HEX: &str = super::CMD_SLASH_HEX;
+    pub(crate) const CMD_T_HEX: &str = super::CMD_T_HEX;
+    pub(crate) const CMD_W_HEX: &str = super::CMD_W_HEX;
+    pub(crate) const CMD_X_HEX: &str = super::CMD_X_HEX;
+    pub(crate) const CMD_Y_HEX: &str = super::CMD_Y_HEX;
+    pub(crate) const CMD_Z_HEX: &str = super::CMD_Z_HEX;
+    pub(crate) const CTRL_SHIFT_F12_HEX: &str = super::CTRL_SHIFT_F12_HEX;
+    pub(crate) const CTRL_SHIFT_J_HEX: &str = super::CTRL_SHIFT_J_HEX;
+}
+
 /// PostScript name iTerm2 stores in `Normal Font` and `Non Ascii Font`.
 /// Format is "<PostScriptName> <size>".
 pub fn primary_font_value(font_ps: &str, size: u32) -> String {

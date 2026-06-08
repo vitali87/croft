@@ -79,6 +79,14 @@ pub enum CliCommand {
         #[arg(short, long, default_value_t = false)]
         yes: bool,
     },
+    /// Configure Ghostty for Croft: forward every croft chord (Cmd+T, Cmd+W,
+    /// Cmd+[ / Cmd+], Cmd+1..9, etc.) to croft as a CSI-u sequence instead of
+    /// letting Ghostty's own keybinds (new_tab, goto_tab, ...) swallow them.
+    SetupGhostty {
+        /// Skip confirmation prompt
+        #[arg(short, long, default_value_t = false)]
+        yes: bool,
+    },
 }
 
 impl Cli {
@@ -102,6 +110,7 @@ impl Cli {
                 }
             }
             Some(CliCommand::SetupCross { yes }) => setup_cross(yes),
+            Some(CliCommand::SetupGhostty { yes }) => setup_ghostty(yes),
             None => {
                 let path = self
                     .path
@@ -335,6 +344,48 @@ fn setup_iterm2(font: &str, nonascii: &str, size: u32, yes: bool) -> Result<()> 
     println!("Wrote Croft settings to {}.", plist_path.display());
     println!(
         "Quit iTerm2 entirely (cmd+Q) and reopen it. macOS caches plists; iTerm2 must be relaunched to pick up the change."
+    );
+    Ok(())
+}
+
+fn setup_ghostty(yes: bool) -> Result<()> {
+    let config_path = crate::ghostty::default_config_path();
+    println!(
+        "This will add a managed keybind block to your Ghostty config so Croft, not Ghostty, owns its chords:"
+    );
+    println!(
+        "  Cmd+T -> new terminal; Cmd+[ / Cmd+] -> cycle terminals; Cmd+W -> close editor tab"
+    );
+    println!(
+        "  Cmd+1..Cmd+9 / Cmd+0 -> Croft (Ghostty's goto_tab is overridden) so they work as vim counts"
+    );
+    println!(
+        "  Cmd+C / Cmd+X / Cmd+A / Cmd+Z / Cmd+S and the editor / Explorer / source-control chords"
+    );
+    println!(
+        "  Each chord is re-emitted as the same CSI-u sequence Croft already receives under iTerm2"
+    );
+    println!("  Cmd+V is left on Ghostty's native paste so it keeps working locally and over SSH");
+    println!("Config target: {}", config_path.display());
+    println!(
+        "Only Croft's marked block is rewritten; the rest of your Ghostty config is preserved."
+    );
+    if !yes {
+        print!("Apply this change? [y/N] ");
+        use std::io::Write;
+        std::io::stdout().flush()?;
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer)?;
+        if !matches!(answer.trim().to_lowercase().as_str(), "y" | "yes") {
+            println!("Aborted.");
+            return Ok(());
+        }
+    }
+    crate::ghostty::install_keybinds(&config_path)
+        .with_context(|| "applying Ghostty Croft keybindings")?;
+    println!("Wrote Croft keybindings to {}.", config_path.display());
+    println!(
+        "Reload Ghostty's config (Cmd+Shift+,) or restart Ghostty for the change to take effect."
     );
     Ok(())
 }

@@ -1,6 +1,7 @@
 mod app;
 mod cli;
 mod clipboard;
+mod ghostty;
 mod git;
 mod gradient;
 mod highlight;
