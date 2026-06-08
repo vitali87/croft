@@ -1366,21 +1366,44 @@ fn try_local_cross_install(ssh: &SshControl, source_stamp: &str) -> Result<bool>
 }
 
 pub fn remote_croft_command(path: Option<&str>, env: &[(String, String)]) -> String {
-    remote_croft_command_for_terminal(path, std::env::var("TERM_PROGRAM").ok().as_deref(), env)
+    remote_croft_command_for_terminal(
+        path,
+        std::env::var("TERM_PROGRAM").ok().as_deref(),
+        std::env::var("TERM").ok().as_deref(),
+        env,
+    )
 }
 
 fn remote_croft_command_for_terminal(
     path: Option<&str>,
     term_program: Option<&str>,
+    term: Option<&str>,
     env: &[(String, String)],
 ) -> String {
+    use crate::iterm2_inline::InlineImageProtocol;
     let mut prefix = String::from("export CROFT_REMOTE_AUTOUPDATE=1; ");
-    if let Some(term_program) =
-        term_program.filter(|value| crate::iterm2_inline::is_iterm2_term_program(Some(value)))
-    {
-        prefix.push_str("export CROFT_FORCE_INLINE_IMAGES=1 TERM_PROGRAM=");
-        prefix.push_str(&shell_quote(term_program));
-        prefix.push_str("; ");
+    // The remote croft renders into *this* terminal over the SSH PTY, so it has
+    // to use whichever inline-image protocol the local terminal speaks. SSH
+    // forwards `TERM` but not `TERM_PROGRAM` (absent an `AcceptEnv` opt-in), so
+    // export the hint the remote detector needs explicitly rather than relying
+    // on the environment surviving the hop.
+    match crate::iterm2_inline::inline_image_protocol_for(term_program, term) {
+        InlineImageProtocol::ITerm2 => {
+            // iTerm2/WezTerm implement OSC 1337 inline images + `SetColors`;
+            // force them on and carry `TERM_PROGRAM` so the remote paints the
+            // session background too.
+            let tp = term_program.unwrap_or("iTerm.app");
+            prefix.push_str("export CROFT_FORCE_INLINE_IMAGES=1 TERM_PROGRAM=");
+            prefix.push_str(&shell_quote(tp));
+            prefix.push_str("; ");
+        }
+        InlineImageProtocol::Kitty => {
+            // Ghostty/Kitty render via the Kitty graphics protocol and paint the
+            // background with explicit truecolor (no `SetColors`), so export
+            // `TERM_PROGRAM=ghostty` only; do NOT force the OSC-1337 path.
+            prefix.push_str("export TERM_PROGRAM=ghostty; ");
+        }
+        InlineImageProtocol::None => {}
     }
     for (k, v) in env {
         prefix.push_str("export ");
@@ -1795,7 +1818,7 @@ Host !blocked *.internal
     #[test]
     fn remote_croft_command_quotes_paths() {
         assert_eq!(
-            remote_croft_command_for_terminal(Some("/tmp/it's here"), None, &[]),
+            remote_croft_command_for_terminal(Some("/tmp/it's here"), None, None, &[]),
             "export CROFT_REMOTE_AUTOUPDATE=1; export PATH=\"$HOME/.cargo/bin:$PATH\"; command -v croft >/dev/null 2>&1 || { echo 'croft not found on remote PATH' >&2; exit 127; }; exec croft '/tmp/it'\"'\"'s here'"
         );
     }
@@ -1803,9 +1826,27 @@ Host !blocked *.internal
     #[test]
     fn remote_croft_command_forwards_supported_terminal_program() {
         assert_eq!(
-            remote_croft_command_for_terminal(None, Some("iTerm.app"), &[]),
+            remote_croft_command_for_terminal(None, Some("iTerm.app"), None, &[]),
             "export CROFT_REMOTE_AUTOUPDATE=1; export CROFT_FORCE_INLINE_IMAGES=1 TERM_PROGRAM='iTerm.app'; export PATH=\"$HOME/.cargo/bin:$PATH\"; command -v croft >/dev/null 2>&1 || { echo 'croft not found on remote PATH' >&2; exit 127; }; exec croft"
         );
+    }
+
+    #[test]
+    fn remote_croft_command_exports_kitty_hint_for_ghostty() {
+        // Ghostty: TERM_PROGRAM=ghostty locally, but SSH does not forward it, so
+        // croft must export the hint itself. It must NOT force the OSC-1337 path
+        // (Ghostty parses but ignores it); the remote resolves the Kitty
+        // protocol from the exported TERM_PROGRAM.
+        let command = remote_croft_command_for_terminal(None, Some("ghostty"), None, &[]);
+        assert!(command.contains("export TERM_PROGRAM=ghostty;"));
+        assert!(!command.contains("CROFT_FORCE_INLINE_IMAGES"));
+    }
+
+    #[test]
+    fn remote_croft_command_exports_kitty_hint_from_term_only() {
+        // A bare `kitty` terminal sets no TERM_PROGRAM; detection keys off TERM.
+        let command = remote_croft_command_for_terminal(None, None, Some("xterm-kitty"), &[]);
+        assert!(command.contains("export TERM_PROGRAM=ghostty;"));
     }
 
     #[test]
@@ -1820,7 +1861,7 @@ Host !blocked *.internal
                 String::from("/tmp/r/inbox"),
             ),
         ];
-        let command = remote_croft_command_for_terminal(None, None, &env);
+        let command = remote_croft_command_for_terminal(None, None, None, &env);
         assert!(command.contains("export CROFT_DROP_RELAY_LOG='/tmp/r/log'"));
         assert!(command.contains("export CROFT_DROP_RELAY_INBOX='/tmp/r/inbox'"));
     }

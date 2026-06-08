@@ -211,7 +211,13 @@ pub fn inline_image_protocol_for(
     match term_program {
         Some("iTerm.app") | Some("WezTerm") => InlineImageProtocol::ITerm2,
         Some("ghostty") => InlineImageProtocol::Kitty,
-        _ if term.is_some_and(|t| t.contains("kitty")) => InlineImageProtocol::Kitty,
+        // SSH forwards `TERM` (Ghostty advertises `xterm-ghostty`, Kitty
+        // `xterm-kitty`) but not `TERM_PROGRAM` unless the remote sshd opts in
+        // via `AcceptEnv`, so a remote croft must key Kitty detection off `TERM`
+        // too or it falls back to text glyphs over SSH.
+        _ if term.is_some_and(|t| t.contains("kitty") || t.contains("ghostty")) => {
+            InlineImageProtocol::Kitty
+        }
         _ => InlineImageProtocol::None,
     }
 }
@@ -954,6 +960,16 @@ mod tests {
     fn kitty_term_is_detected_via_term_env() {
         assert_eq!(
             inline_image_protocol_for(None, Some("xterm-kitty")),
+            InlineImageProtocol::Kitty
+        );
+    }
+
+    #[test]
+    fn ghostty_term_is_detected_via_term_env_over_ssh() {
+        // Over SSH, TERM_PROGRAM is dropped but TERM=xterm-ghostty survives;
+        // the remote croft must still resolve the Kitty protocol from it.
+        assert_eq!(
+            inline_image_protocol_for(None, Some("xterm-ghostty")),
             InlineImageProtocol::Kitty
         );
     }
