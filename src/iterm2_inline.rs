@@ -253,8 +253,13 @@ pub fn detect_termux() -> bool {
     })
 }
 
+/// True for terminals that implement iTerm2's proprietary OSC-1337 inline
+/// image + `SetColors` sequences. Ghostty is deliberately excluded: it parses
+/// those sequences but does not implement them, so it must take the Kitty
+/// graphics path and paint its welcome/editor bg with explicit truecolor
+/// rather than relying on the ignored `SetColors=bg=srgb:…`.
 pub fn is_iterm2_term_program(value: Option<&str>) -> bool {
-    matches!(value, Some("iTerm.app") | Some("WezTerm") | Some("ghostty"))
+    matches!(value, Some("iTerm.app") | Some("WezTerm"))
 }
 
 pub fn force_inline_images(value: Option<&str>) -> bool {
@@ -343,12 +348,22 @@ pub fn build_inline_image_osc(
     )
 }
 
-#[allow(dead_code)]
+/// Build a Kitty graphics-protocol transmit-and-display (`a=T`) sequence
+/// placing `png` at the cursor across `width_cells` × `height_cells` cells.
+/// `image_id` keys the transmitted image data; `placement_id` keys the on-
+/// screen placement. Re-sending the same `(image_id, placement_id)` pair
+/// REPLACES the existing placement in place (flicker-free per the Kitty spec)
+/// rather than stacking a duplicate, which is what lets croft re-emit the
+/// image every frame from the same per-overlay slot id. `C=1` keeps the
+/// cursor from advancing; `q=2` suppresses the terminal's OK/error reply so
+/// it never pollutes the crossterm stdin reader. Base64 is chunked at 4096
+/// bytes (a multiple of 4) with `m=1` on every chunk but the last.
 pub fn build_inline_image_kitty(
     png: &[u8],
     width_cells: u16,
     height_cells: u16,
     image_id: u32,
+    placement_id: u32,
 ) -> String {
     let b64 = base64::engine::general_purpose::STANDARD.encode(png);
     let len = b64.len();
@@ -360,7 +375,7 @@ pub fn build_inline_image_kitty(
         let more = u8::from(end < len);
         if first {
             out.push_str(&format!(
-                "\x1b_Gf=100,a=T,c={width_cells},r={height_cells},C=1,q=2,i={image_id},m={more};"
+                "\x1b_Gf=100,a=T,c={width_cells},r={height_cells},C=1,q=2,i={image_id},p={placement_id},m={more};"
             ));
             first = false;
         } else {
@@ -380,6 +395,66 @@ pub fn build_inline_image_kitty(
 pub fn delete_kitty_image(image_id: u32) -> String {
     format!("\x1b_Ga=d,d=i,i={image_id},q=2\x1b\\")
 }
+
+/// Delete every on-screen Kitty placement (`d=a`), quietly (`q=2`). A plain
+/// `\x1b[2J` clear evicts iTerm2's cached image cells but leaves Kitty
+/// graphics painted on their separate layer, so the Kitty eviction path emits
+/// this on the same frames the main loop clears the screen to repaint. The
+/// currently-visible overlays then re-emit themselves on the post-draw flush.
+pub fn delete_all_kitty_images() -> String {
+    "\x1b_Ga=d,d=a,q=2\x1b\\".to_string()
+}
+
+/// Single chokepoint that turns a baked PNG into the right inline-image escape
+/// for the host terminal's protocol. `id` is the stable per-overlay slot id
+/// used for both the Kitty image and placement ids (see `KITTY_ID_*`); it is
+/// ignored on the iTerm2 path. Returns `None` when no inline protocol is
+/// available, so callers fall back to their text/metadata rendering.
+pub fn build_inline_image(
+    protocol: InlineImageProtocol,
+    png: &[u8],
+    width_cells: u16,
+    height_cells: u16,
+    preserve_aspect: bool,
+    id: u32,
+) -> Option<String> {
+    match protocol {
+        InlineImageProtocol::ITerm2 => Some(build_inline_image_osc(
+            png,
+            width_cells,
+            height_cells,
+            preserve_aspect,
+        )),
+        InlineImageProtocol::Kitty => Some(build_inline_image_kitty(
+            png,
+            width_cells,
+            height_cells,
+            id,
+            id,
+        )),
+        InlineImageProtocol::None => None,
+    }
+}
+
+/// Stable Kitty image/placement ids, one per inline-image overlay slot. Re-
+/// transmitting an overlay with its fixed id replaces its placement in place
+/// instead of stacking duplicates. Namespaced well above the small ids other
+/// programs typically use; croft owns the alt-screen so collisions are
+/// unlikely regardless.
+pub const KITTY_ID_BASE: u32 = 0x00C0_F700; // "croft"
+pub const KITTY_ID_EXPLORER: u32 = KITTY_ID_BASE + 1;
+pub const KITTY_ID_SEARCH: u32 = KITTY_ID_BASE + 2;
+pub const KITTY_ID_SOURCE_CONTROL: u32 = KITTY_ID_BASE + 3;
+pub const KITTY_ID_REMOTE: u32 = KITTY_ID_BASE + 4;
+pub const KITTY_ID_RUN_DEBUG_BAR: u32 = KITTY_ID_BASE + 5;
+pub const KITTY_ID_SETTINGS: u32 = KITTY_ID_BASE + 6;
+pub const KITTY_ID_BADGE: u32 = KITTY_ID_BASE + 7;
+pub const KITTY_ID_RUN_DEBUG_PANEL: u32 = KITTY_ID_BASE + 8;
+pub const KITTY_ID_HERO: u32 = KITTY_ID_BASE + 9;
+pub const KITTY_ID_SSH: u32 = KITTY_ID_BASE + 10;
+pub const KITTY_ID_WELCOME: u32 = KITTY_ID_BASE + 11;
+/// Editor image slots, indexed by physical split side (`+0` left, `+1` right).
+pub const KITTY_ID_EDITOR_BASE: u32 = KITTY_ID_BASE + 12;
 
 pub fn tmux_passthrough_wrap(seq: &str) -> String {
     let mut out = String::with_capacity(seq.len() + 8);
@@ -779,19 +854,19 @@ mod tests {
 
     #[test]
     fn kitty_graphics_starts_with_apc_introducer() {
-        let seq = build_inline_image_kitty(b"PNGDATA", 4, 3, 7);
+        let seq = build_inline_image_kitty(b"PNGDATA", 4, 3, 7, 7);
         assert!(seq.starts_with("\x1b_G"), "wrong prefix: {seq:?}");
     }
 
     #[test]
     fn kitty_graphics_terminates_with_st() {
-        let seq = build_inline_image_kitty(b"PNGDATA", 4, 3, 7);
+        let seq = build_inline_image_kitty(b"PNGDATA", 4, 3, 7, 7);
         assert!(seq.ends_with("\x1b\\"), "must end with ST: {seq:?}");
     }
 
     #[test]
     fn kitty_first_chunk_carries_png_format_action_and_cells() {
-        let seq = build_inline_image_kitty(b"PNGDATA", 4, 3, 7);
+        let seq = build_inline_image_kitty(b"PNGDATA", 4, 3, 7, 7);
         assert!(seq.contains("f=100"), "PNG format: {seq:?}");
         assert!(seq.contains("a=T"), "transmit+display: {seq:?}");
         assert!(seq.contains("c=4"), "width in cells: {seq:?}");
@@ -800,15 +875,27 @@ mod tests {
     }
 
     #[test]
+    fn kitty_first_chunk_carries_a_stable_placement_id() {
+        // Re-transmitting the same image id with the same placement id replaces
+        // the placement in place (flicker-free) instead of stacking a duplicate,
+        // which is what lets croft's per-frame re-emit loop work on Kitty.
+        let seq = build_inline_image_kitty(b"PNGDATA", 4, 3, 7, 42);
+        assert!(
+            seq.contains("p=42"),
+            "placement id must be present: {seq:?}"
+        );
+    }
+
+    #[test]
     fn kitty_sets_cursor_and_response_suppression_flags() {
-        let seq = build_inline_image_kitty(b"PNGDATA", 4, 3, 7);
+        let seq = build_inline_image_kitty(b"PNGDATA", 4, 3, 7, 7);
         assert!(seq.contains("C=1"), "cursor must not advance: {seq:?}");
         assert!(seq.contains("q=2"), "responses must be suppressed: {seq:?}");
     }
 
     #[test]
     fn kitty_payload_is_base64_encoded_png() {
-        let seq = build_inline_image_kitty(b"PNGDATA", 4, 3, 7);
+        let seq = build_inline_image_kitty(b"PNGDATA", 4, 3, 7, 7);
         assert!(
             seq.contains(";UE5HREFUQQ=="),
             "expected base64 payload after the control-data semicolon: {seq:?}"
@@ -818,7 +905,7 @@ mod tests {
     #[test]
     fn kitty_chunks_payload_larger_than_4096_base64_bytes() {
         let png = vec![0xABu8; 4000];
-        let seq = build_inline_image_kitty(&png, 4, 3, 7);
+        let seq = build_inline_image_kitty(&png, 4, 3, 7, 7);
         let chunks: Vec<&str> = seq.split("\x1b\\").filter(|s| !s.is_empty()).collect();
         assert!(
             chunks.len() >= 2,
@@ -892,5 +979,52 @@ mod tests {
         assert!(seq.contains("d=i"), "delete by id selector: {seq:?}");
         assert!(seq.contains("i=7"), "target id: {seq:?}");
         assert!(seq.contains("q=2"), "delete must be quiet too: {seq:?}");
+    }
+
+    #[test]
+    fn delete_all_kitty_images_clears_every_placement_quietly() {
+        // `\x1b[2J` evicts iTerm2's image cells but leaves Kitty graphics on
+        // their layer, so the Kitty eviction path needs an explicit delete-all
+        // (d=a) on the frames croft clears to repaint.
+        let seq = delete_all_kitty_images();
+        assert!(seq.starts_with("\x1b_G"), "APC prefix: {seq:?}");
+        assert!(seq.ends_with("\x1b\\"), "ST terminator: {seq:?}");
+        assert!(seq.contains("a=d"), "delete action: {seq:?}");
+        assert!(seq.contains("d=a"), "delete-all selector: {seq:?}");
+        assert!(seq.contains("q=2"), "delete must be quiet too: {seq:?}");
+    }
+
+    #[test]
+    fn ghostty_is_not_classified_as_iterm2() {
+        // Ghostty parses but ignores the iTerm2 OSC-1337 / SetColors sequences;
+        // it must take the Kitty path and the explicit-truecolor welcome bg, so
+        // the iTerm2-specific predicate must reject it.
+        assert!(!is_iterm2_term_program(Some("ghostty")));
+    }
+
+    #[test]
+    fn build_inline_image_dispatches_on_protocol() {
+        let osc = build_inline_image(InlineImageProtocol::ITerm2, b"PNGDATA", 4, 3, false, 11)
+            .expect("iTerm2 must produce a sequence");
+        assert!(
+            osc.starts_with("\x1b]1337;File="),
+            "iTerm2 → OSC-1337: {osc:?}"
+        );
+
+        let kitty = build_inline_image(InlineImageProtocol::Kitty, b"PNGDATA", 4, 3, false, 11)
+            .expect("Kitty must produce a sequence");
+        assert!(
+            kitty.starts_with("\x1b_G"),
+            "Kitty → APC graphics: {kitty:?}"
+        );
+        assert!(
+            kitty.contains("i=11") && kitty.contains("p=11"),
+            "Kitty uses the id for both image and placement: {kitty:?}"
+        );
+
+        assert!(
+            build_inline_image(InlineImageProtocol::None, b"PNGDATA", 4, 3, false, 11).is_none(),
+            "no inline protocol → no sequence"
+        );
     }
 }

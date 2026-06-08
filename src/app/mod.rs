@@ -868,6 +868,11 @@ pub struct App {
     /// Required to bake OSC-1337 images at exact viewport pixel size so
     /// iTerm draws them with no stretching or letterboxing.
     cell_pixel: Option<(u32, u32)>,
+    /// Which inline-image protocol the host terminal speaks, resolved once at
+    /// startup (env-fixed). Drives the [`crate::iterm2_inline::build_inline_image`]
+    /// dispatch (iTerm2 OSC-1337 vs Kitty graphics) and the Kitty-only
+    /// delete-all eviction on the clear chain.
+    inline_protocol: crate::iterm2_inline::InlineImageProtocol,
     /// Clipboard read entrypoint. Production uses the host clipboard; tests
     /// can swap in a deterministic reader for Cmd+V routing assertions.
     clipboard_reader: fn() -> Option<String>,
@@ -1435,6 +1440,7 @@ impl App {
             search_query_tx,
             search_results_rx,
             cell_pixel: None,
+            inline_protocol: crate::iterm2_inline::detect_inline_image_protocol(),
             clipboard_reader: read_system_clipboard,
             remote_launch: None,
             pending_remote_launch_host: None,
@@ -1539,8 +1545,30 @@ impl App {
         image::Rgba([r, g, b, 0xff])
     }
 
+    /// True when the host terminal can render inline images via either
+    /// protocol. Gates the bake/emit path; the iTerm2-only `SetColors` /
+    /// `Color::Reset` tricks stay behind `detect_iterm2_inline_support`.
+    fn inline_images_enabled(&self) -> bool {
+        self.inline_protocol != crate::iterm2_inline::InlineImageProtocol::None
+    }
+
+    /// Kitty graphics live on a layer that survives the `\x1b[2J` the main
+    /// loop fires to evict iTerm2's image cells, so on the Kitty path that
+    /// same clear frame must also delete every placement; the visible
+    /// overlays re-emit themselves on the following post-draw flush. No-op on
+    /// the iTerm2 path, where the clear already evicted the cached cells.
+    pub fn evict_inline_images_on_clear(&self) {
+        use std::io::Write;
+        if self.inline_protocol == crate::iterm2_inline::InlineImageProtocol::Kitty {
+            let mut out = stdout();
+            let _ = out.write_all(crate::iterm2_inline::delete_all_kitty_images().as_bytes());
+            let _ = out.flush();
+        }
+    }
+
     pub fn init_graphics(&mut self) {
-        if !crate::iterm2_inline::detect_iterm2_inline_support() {
+        self.inline_protocol = crate::iterm2_inline::detect_inline_image_protocol();
+        if !self.inline_images_enabled() {
             return;
         }
         let Ok(ws) = crossterm::terminal::window_size() else {
@@ -1568,49 +1596,69 @@ impl App {
         let w_cells = ACTIVITY_BAR_WIDTH;
         let h_cells = ACTIVITY_ICON_HEIGHT;
         let icon_bg = self.theme_bg_pixel();
+        let protocol = self.inline_protocol;
         // The activity-bar icons are codicon SVGs, rasterised at the exact icon
-        // pixel size (no multi-MB raster decode, crisp at any cell size).
-        let encode = |src_svg: &[u8], is_active: bool, off_y_bias: i64| -> Option<String> {
-            let baked = crate::iterm2_inline::compose_icon_svg(
-                src_svg, canvas_w, canvas_h, is_active, icon_bg, off_y_bias,
-            )?;
-            // preserveAspectRatio=0: stretch to exactly fill 4×2 cells.
-            // Since the canvas was composed at exactly that pixel size,
-            // there's no actual scaling and the codicon's square area
-            // remains a true square on screen.
-            let raw = crate::iterm2_inline::build_inline_image_osc(&baked, w_cells, h_cells, false);
-            Some(if is_tmux {
-                crate::iterm2_inline::tmux_passthrough_wrap(&raw)
-            } else {
-                raw
-            })
-        };
+        // pixel size (no multi-MB raster decode, crisp at any cell size). `id`
+        // is the icon's stable per-slot Kitty image/placement id (shared by its
+        // active and inactive variants so swapping one for the other replaces
+        // the placement in place); ignored on the iTerm2 path.
+        let encode =
+            |src_svg: &[u8], is_active: bool, off_y_bias: i64, id: u32| -> Option<String> {
+                let baked = crate::iterm2_inline::compose_icon_svg(
+                    src_svg, canvas_w, canvas_h, is_active, icon_bg, off_y_bias,
+                )?;
+                // preserveAspectRatio=0: stretch to exactly fill 4×2 cells.
+                // Since the canvas was composed at exactly that pixel size,
+                // there's no actual scaling and the codicon's square area
+                // remains a true square on screen.
+                let raw = crate::iterm2_inline::build_inline_image(
+                    protocol, &baked, w_cells, h_cells, false, id,
+                )?;
+                Some(if is_tmux {
+                    crate::iterm2_inline::tmux_passthrough_wrap(&raw)
+                } else {
+                    raw
+                })
+            };
         // View icons render dead-centered in their cell block; the gear gets a
         // downward bias so it bottom-aligns within its (bottom-inset) block,
         // shaving the canvas's bottom padding off the gap above the status bar.
         // The value need only exceed the no-clip ceiling; `compose_icon_svg`
         // clamps it, so this stays correct at any cell size.
         let gear_off_y_bias = canvas_h as i64;
-        let explorer_active = encode(crate::iterm2_inline::EXPLORER_SRC_SVG, true, 0);
-        let explorer_inactive = encode(crate::iterm2_inline::EXPLORER_SRC_SVG, false, 0);
-        let search_active = encode(crate::iterm2_inline::SEARCH_SRC_SVG, true, 0);
-        let search_inactive = encode(crate::iterm2_inline::SEARCH_SRC_SVG, false, 0);
-        let source_control_active = encode(crate::iterm2_inline::SOURCE_CONTROL_SRC_SVG, true, 0);
-        let source_control_inactive =
-            encode(crate::iterm2_inline::SOURCE_CONTROL_SRC_SVG, false, 0);
-        let remote_active = encode(crate::iterm2_inline::REMOTE_SRC_SVG, true, 0);
-        let remote_inactive = encode(crate::iterm2_inline::REMOTE_SRC_SVG, false, 0);
-        let run_debug_active = encode(crate::iterm2_inline::RUN_DEBUG_SRC_SVG, true, 0);
-        let run_debug_inactive = encode(crate::iterm2_inline::RUN_DEBUG_SRC_SVG, false, 0);
+        use crate::iterm2_inline as ki;
+        let explorer_active = encode(ki::EXPLORER_SRC_SVG, true, 0, ki::KITTY_ID_EXPLORER);
+        let explorer_inactive = encode(ki::EXPLORER_SRC_SVG, false, 0, ki::KITTY_ID_EXPLORER);
+        let search_active = encode(ki::SEARCH_SRC_SVG, true, 0, ki::KITTY_ID_SEARCH);
+        let search_inactive = encode(ki::SEARCH_SRC_SVG, false, 0, ki::KITTY_ID_SEARCH);
+        let source_control_active = encode(
+            ki::SOURCE_CONTROL_SRC_SVG,
+            true,
+            0,
+            ki::KITTY_ID_SOURCE_CONTROL,
+        );
+        let source_control_inactive = encode(
+            ki::SOURCE_CONTROL_SRC_SVG,
+            false,
+            0,
+            ki::KITTY_ID_SOURCE_CONTROL,
+        );
+        let remote_active = encode(ki::REMOTE_SRC_SVG, true, 0, ki::KITTY_ID_REMOTE);
+        let remote_inactive = encode(ki::REMOTE_SRC_SVG, false, 0, ki::KITTY_ID_REMOTE);
+        let run_debug_active = encode(ki::RUN_DEBUG_SRC_SVG, true, 0, ki::KITTY_ID_RUN_DEBUG_BAR);
+        let run_debug_inactive =
+            encode(ki::RUN_DEBUG_SRC_SVG, false, 0, ki::KITTY_ID_RUN_DEBUG_BAR);
         let settings_active = encode(
-            crate::iterm2_inline::SETTINGS_GEAR_SRC_SVG,
+            ki::SETTINGS_GEAR_SRC_SVG,
             true,
             gear_off_y_bias,
+            ki::KITTY_ID_SETTINGS,
         );
         let settings_inactive = encode(
-            crate::iterm2_inline::SETTINGS_GEAR_SRC_SVG,
+            ki::SETTINGS_GEAR_SRC_SVG,
             false,
             gear_off_y_bias,
+            ki::KITTY_ID_SETTINGS,
         );
         if let (
             Some(ea),
@@ -1664,8 +1712,14 @@ impl App {
             badge_w_px,
             badge_h_px,
             icon_bg,
+        ) && let Some(raw) = crate::iterm2_inline::build_inline_image(
+            protocol,
+            &baked,
+            2,
+            1,
+            false,
+            crate::iterm2_inline::KITTY_ID_BADGE,
         ) {
-            let raw = crate::iterm2_inline::build_inline_image_osc(&baked, 2, 1, false);
             self.overlays.badge.set_image(if is_tmux {
                 crate::iterm2_inline::tmux_passthrough_wrap(&raw)
             } else {
@@ -1689,13 +1743,14 @@ impl App {
             false,
             icon_bg,
             0,
+        ) && let Some(raw) = crate::iterm2_inline::build_inline_image(
+            protocol,
+            &baked,
+            crate::widgets::run_debug::RUN_DEBUG_ICON_CELLS_W,
+            crate::widgets::run_debug::RUN_DEBUG_ICON_CELLS_H,
+            false,
+            crate::iterm2_inline::KITTY_ID_RUN_DEBUG_PANEL,
         ) {
-            let raw = crate::iterm2_inline::build_inline_image_osc(
-                &baked,
-                crate::widgets::run_debug::RUN_DEBUG_ICON_CELLS_W,
-                crate::widgets::run_debug::RUN_DEBUG_ICON_CELLS_H,
-                false,
-            );
             self.overlays.run_debug.set_image(if is_tmux {
                 crate::iterm2_inline::tmux_passthrough_wrap(&raw)
             } else {
@@ -1721,13 +1776,14 @@ impl App {
             ssh_w_px,
             ssh_h_px,
             card_bg,
+        ) && let Some(raw) = crate::iterm2_inline::build_inline_image(
+            protocol,
+            &baked,
+            ssh_cells_w,
+            ssh_cells_h,
+            false,
+            crate::iterm2_inline::KITTY_ID_SSH,
         ) {
-            let raw = crate::iterm2_inline::build_inline_image_osc(
-                &baked,
-                ssh_cells_w,
-                ssh_cells_h,
-                false,
-            );
             self.overlays.ssh.set_image(if is_tmux {
                 crate::iterm2_inline::tmux_passthrough_wrap(&raw)
             } else {
@@ -1838,18 +1894,20 @@ impl App {
             let canvas_w = (hero.width as u32) * cw;
             let canvas_h = (hero.height as u32) * ch;
             let bg = self.theme_bg_pixel();
+            let protocol = self.inline_protocol;
             if let Ok(baked) = crate::iterm2_inline::fit_image(
                 crate::iterm2_inline::NO_REPO_HERO_PNG,
                 canvas_w,
                 canvas_h,
                 bg,
+            ) && let Some(raw) = crate::iterm2_inline::build_inline_image(
+                protocol,
+                &baked,
+                hero.width,
+                hero.height,
+                false,
+                crate::iterm2_inline::KITTY_ID_HERO,
             ) {
-                let raw = crate::iterm2_inline::build_inline_image_osc(
-                    &baked,
-                    hero.width,
-                    hero.height,
-                    false,
-                );
                 let osc = if crate::iterm2_inline::detect_tmux() {
                     crate::iterm2_inline::tmux_passthrough_wrap(&raw)
                 } else {
@@ -2115,6 +2173,16 @@ impl App {
     fn stamp_blank_pair(&self, px: u16, py: u16) {
         use std::io::Write;
         let mut out = stdout();
+        // On Kitty the badge lives on the graphics layer, so stamping blank
+        // cells over it does nothing; delete the placement by id instead.
+        if self.inline_protocol == crate::iterm2_inline::InlineImageProtocol::Kitty {
+            let _ = out.write_all(
+                crate::iterm2_inline::delete_kitty_image(crate::iterm2_inline::KITTY_ID_BADGE)
+                    .as_bytes(),
+            );
+            let _ = out.flush();
+            return;
+        }
         let cursor_on = self.cursor_should_be_visible();
         let _ = write!(out, "\x1b[?25l\x1b[s");
         let _ = write!(out, "\x1b[{};{}H  ", py + 1, px + 1);
@@ -3771,18 +3839,20 @@ impl App {
                 let canvas_w = (logo_w_cells as u32) * cw;
                 let canvas_h = (logo_h_cells as u32) * ch;
                 let bg = self.theme_bg_pixel();
+                let protocol = self.inline_protocol;
                 if let Ok(baked) = crate::iterm2_inline::fit_image(
                     crate::iterm2_inline::WELCOME_LOGO_PNG,
                     canvas_w,
                     canvas_h,
                     bg,
+                ) && let Some(raw) = crate::iterm2_inline::build_inline_image(
+                    protocol,
+                    &baked,
+                    logo_w_cells,
+                    logo_h_cells,
+                    false,
+                    crate::iterm2_inline::KITTY_ID_WELCOME,
                 ) {
-                    let raw = crate::iterm2_inline::build_inline_image_osc(
-                        &baked,
-                        logo_w_cells,
-                        logo_h_cells,
-                        false,
-                    );
                     let osc = if crate::iterm2_inline::detect_tmux() {
                         crate::iterm2_inline::tmux_passthrough_wrap(&raw)
                     } else {
@@ -11012,7 +11082,7 @@ impl App {
             self.disable_editor_image(side);
             return;
         };
-        if !crate::iterm2_inline::detect_iterm2_inline_support() {
+        if !self.inline_images_enabled() {
             self.disable_editor_image(side);
             return;
         }
@@ -11072,8 +11142,16 @@ impl App {
             };
             crate::iterm2_inline::fit_image_auto(&image.bytes, canvas_w, canvas_h, bg)
         };
-        if let Ok(baked) = baked {
-            let raw = crate::iterm2_inline::build_inline_image_osc(&baked, cell_w, cell_h, false);
+        if let Ok(baked) = baked
+            && let Some(raw) = crate::iterm2_inline::build_inline_image(
+                self.inline_protocol,
+                &baked,
+                cell_w,
+                cell_h,
+                false,
+                crate::iterm2_inline::KITTY_ID_EDITOR_BASE + side as u32,
+            )
+        {
             let osc = if crate::iterm2_inline::detect_tmux() {
                 crate::iterm2_inline::tmux_passthrough_wrap(&raw)
             } else {
@@ -13937,6 +14015,10 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
                 || app.consume_activity_image_clear()
             {
                 terminal.clear()?;
+                // `\x1b[2J` evicts iTerm2's cached image cells but leaves
+                // Kitty graphics on their layer; on the Kitty path delete
+                // every placement here too so nothing ghosts. No-op on iTerm2.
+                app.evict_inline_images_on_clear();
                 // Activity-bar icons live outside ratatui too; re-emit
                 // them on the next post-draw flush. The welcome wordmark
                 // and the source-control hero also live in iTerm's image
@@ -13965,6 +14047,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
                 || app.consume_activity_image_clear()
             {
                 terminal.clear()?;
+                app.evict_inline_images_on_clear();
                 app.overlays.activity.mark_dirty();
                 app.overlays.welcome.mark_dirty();
                 app.overlays.hero.mark_dirty();
