@@ -1,7 +1,7 @@
 use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
 
-use sysinfo::{Components, Disks, MINIMUM_CPU_UPDATE_INTERVAL, Networks, System};
+use sysinfo::{Components, MINIMUM_CPU_UPDATE_INTERVAL, Networks, System};
 
 #[derive(Debug, Clone, Copy)]
 pub struct SystemSample {
@@ -17,7 +17,6 @@ const SAMPLE_INTERVAL: Duration = Duration::from_millis(1000);
 pub fn system_monitor_loop(tx: Sender<SystemSample>) {
     let mut sys = System::new();
     let mut nets = Networks::new_with_refreshed_list();
-    let mut disks = Disks::new_with_refreshed_list();
     let mut comps = Components::new_with_refreshed_list();
 
     sys.refresh_memory();
@@ -31,7 +30,6 @@ pub fn system_monitor_loop(tx: Sender<SystemSample>) {
         sys.refresh_cpu_usage();
         sys.refresh_memory();
         nets.refresh(true);
-        disks.refresh(true);
         comps.refresh(true);
 
         let now = Instant::now();
@@ -50,7 +48,7 @@ pub fn system_monitor_loop(tx: Sender<SystemSample>) {
         last_net_total = net_total;
         let net_bps = ((net_delta as f64) / elapsed).round() as u64;
 
-        let disk_pct = root_disk_pct(&disks).unwrap_or(0);
+        let disk_pct = home_disk_pct().unwrap_or(0);
 
         let temp_c = peak_temp(&comps);
 
@@ -77,18 +75,59 @@ fn sum_net_bytes(nets: &Networks) -> u64 {
         .sum()
 }
 
-fn root_disk_pct(disks: &Disks) -> Option<u8> {
-    let root = disks.iter().find(|d| d.mount_point().as_os_str() == "/")?;
-    let total = root.total_space();
+/// Usage of the filesystem holding the user's home directory - the storage
+/// the user can actually fill - via the same `statvfs` call `df $HOME`
+/// makes. Measuring the `/` mount instead is wrong on Android: there the
+/// rootfs is the sealed read-only system partition (permanently ~100%)
+/// while all writable storage lives on the /data partition, so the gauge
+/// pinned at 100% on Termux no matter how much space was free.
+fn home_disk_pct() -> Option<u8> {
+    let home = std::env::var_os("HOME").unwrap_or_else(|| std::ffi::OsString::from("/"));
+    let path = std::ffi::CString::new(home.as_encoded_bytes()).ok()?;
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(path.as_ptr(), &mut st) } != 0 {
+        return None;
+    }
+    disk_pct_from(st.f_blocks as u64, st.f_bfree as u64, st.f_bavail as u64)
+}
+
+/// df's percentage: used blocks over (used + available-to-user), rounded
+/// up like coreutils, so the gauge agrees with what `df` prints. The
+/// root-reserved slice (`bfree - bavail`) is excluded from the
+/// denominator, again matching df.
+fn disk_pct_from(blocks: u64, bfree: u64, bavail: u64) -> Option<u8> {
+    let used = blocks.saturating_sub(bfree);
+    let total = used.saturating_add(bavail);
     if total == 0 {
         return None;
     }
-    let used = total.saturating_sub(root.available_space());
     Some(
         ((used as f64 / total as f64) * 100.0)
-            .clamp(0.0, 100.0)
-            .round() as u8,
+            .ceil()
+            .clamp(0.0, 100.0) as u8,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn disk_pct_uses_dfs_used_over_used_plus_avail_formula() {
+        // 75 used, 25 available to the user: 75%.
+        assert_eq!(disk_pct_from(100, 25, 25), Some(75));
+        // Root-reserved blocks (bfree > bavail) shrink the denominator,
+        // exactly like df: used=499, avail=450 -> 499/949 -> ceil 53%.
+        assert_eq!(disk_pct_from(1000, 501, 450), Some(53));
+        // A degenerate filesystem reports nothing rather than a fake 0%.
+        assert_eq!(disk_pct_from(0, 0, 0), None);
+    }
+
+    #[test]
+    fn home_disk_pct_measures_a_real_filesystem() {
+        let pct = home_disk_pct().expect("home filesystem must be measurable");
+        assert!(pct <= 100);
+    }
 }
 
 fn peak_temp(comps: &Components) -> Option<u8> {

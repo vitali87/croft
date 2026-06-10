@@ -31,7 +31,7 @@ src/
 ├── remote_connect.rs    interactive SSH connect flow (host + password prompt phases) behind the connect dialog
 ├── session_state.rs     captures open tabs / layout so a self-update re-exec can restore them
 ├── sheet.rs             CSV / TSV / XLSX / XLS / XLSB / ODS parsing via the csv and calamine crates
-├── sysmon.rs            system-metrics sampler loop (CPU / memory / network / disk / temp)
+├── sysmon.rs            system-metrics sampler loop (CPU / memory / network / disk / temp); disk gauge statvfs's $HOME's filesystem with df's formula (the `/` mount is Android's sealed read-only system partition, permanently ~100%)
 ├── termux.rs            Termux font auto-install: downloads Meslo Nerd Font Mono into ~/.termux/font.ttf (background, no-clobber) so the activity-bar codicon glyphs render
 ├── theme.rs             IDE color theme (Croft Dark / Croft Black): the background palette driving SetColors + baked-image fills
 ├── update_watch.rs      remote self-update: watch for a newer binary installed under a running remote croft
