@@ -54,7 +54,7 @@ src/
 │   ├── mod.rs
 │   ├── client.rs        async-lsp client wrapper; router forwards diagnostics + work-done progress ($/progress, e.g. rust-analyzer "Indexing…") to the status bar
 │   ├── config.rs        per-language LSP config (basedpyright, ruff, ty, vtsls, rust-analyzer, gopls)
-│   ├── install.rs       croft-managed TypeScript server: lazy background install of vtsls into ~/.croft/servers
+│   ├── install.rs       croft-managed server provisioning: lazy background installs of vtsls (npm) and ty/ruff (uv, rerouted to Termux's pkg on Android) into ~/.croft/servers, incl. the uv bootstrap
 │   ├── log_file.rs      LSP stderr / debug log sink at ~/.croft/lsp.log
 │   ├── manager.rs       lifecycle: spawn / did_open / did_change / completion / shutdown
 │   ├── registry.rs      language detection from file extension and shebang

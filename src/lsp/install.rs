@@ -311,10 +311,44 @@ fn run_npm_install(name: &'static str, language: Language, package: &str, versio
     finish_install(name, language, output);
 }
 
+/// `pkg install` argument vector for a uv-provisioned server on Termux. The
+/// uv chain is structurally impossible there: stock Termux has no curl/wget
+/// to bootstrap uv, Astral ships no aarch64-linux-android uv build, and the
+/// ty/ruff PyPI wheels don't target Android. Termux's own repo packages both
+/// servers under their PyPI names, and `pkg` installs into the
+/// always-on-PATH `$PREFIX/bin`, which `uv_command`'s PATH-first probe then
+/// resolves with no further plumbing. The repo carries one rolling version,
+/// so any `Provision::Uv` pin is ignored on this path (ty/ruff track latest
+/// anyway).
+fn termux_pkg_args(package: &str) -> Vec<String> {
+    vec![
+        String::from("install"),
+        String::from("-y"),
+        String::from(package),
+    ]
+}
+
+/// Install a uv-provisioned server from the Termux repo. Same lifecycle as
+/// the other backends: logged, surfaced in the status bar, completion via
+/// `finish_install` so the language's open documents re-probe on success.
+fn run_termux_pkg_install(name: &'static str, language: Language, package: &str) {
+    log_file::log(&format!(
+        "lsp[{name}] installing {package} via pkg (Termux repo)"
+    ));
+    set_status(format!("Installing {name} (pkg)…"));
+    let output = Command::new("pkg").args(termux_pkg_args(package)).output();
+    finish_install(name, language, output);
+}
+
 /// `uv tool install <pkg>` into croft's own uv tool dir. Requires `uv` on the
 /// system; uv pulls a suitable Python interpreter itself, so nothing else is
-/// needed on the box.
+/// needed on the box. On Termux the install reroutes to the native `pkg`
+/// backend instead of the unreachable uv chain.
 fn run_uv_install(name: &'static str, language: Language, package: &str, version: Option<&str>) {
+    if crate::iterm2_inline::detect_termux() {
+        run_termux_pkg_install(name, language, package);
+        return;
+    }
     let Some(uv) = ensure_uv() else {
         log_file::log(&format!(
             "lsp[{name}] cannot auto-install: `uv` unavailable and could not be bootstrapped"
@@ -693,6 +727,33 @@ pub(crate) fn prepend_paths(dirs: &[PathBuf]) -> OsString {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn termux_pkg_args_install_the_package_noninteractively() {
+        assert_eq!(
+            termux_pkg_args("ty"),
+            ["install", "-y", "ty"],
+            "background installs can never answer an apt prompt, so -y is required"
+        );
+        assert_eq!(termux_pkg_args("ruff"), ["install", "-y", "ruff"]);
+    }
+
+    #[test]
+    fn uv_provisioned_python_servers_use_their_termux_repo_package_names() {
+        // The Termux pkg backend reuses `Provision::Uv`'s PyPI package name
+        // as the Termux package name. That only works because Termux packages
+        // ty and ruff under exactly those names (verified in termux-packages
+        // on 2026-06-10); this test pins the assumption on croft's side.
+        for (config, expected) in [
+            (crate::lsp::config::ServerConfig::ty(), "ty"),
+            (crate::lsp::config::ServerConfig::ruff(), "ruff"),
+        ] {
+            match config.provision {
+                Some(Provision::Uv { package, .. }) => assert_eq!(package, expected),
+                other => panic!("expected Uv provision for {expected}, got {other:?}"),
+            }
+        }
+    }
 
     #[test]
     fn npm_binary_lands_in_npm_bin_dir() {
