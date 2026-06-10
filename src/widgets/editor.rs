@@ -1826,10 +1826,16 @@ impl Editor {
         for d in &self.diagnostics {
             let start_line = d.start_line as usize;
             let end_line = d.end_line as usize;
-            for line in start_line..=end_line {
-                let Some(text) = self.lines.get(line) else {
-                    continue;
-                };
+            // Zip bounds the walk to the buffer, replacing the per-line
+            // `lines.get` check a stale diagnostic range would otherwise need.
+            for (line, (text, line_spans)) in self
+                .lines
+                .iter()
+                .zip(spans.iter_mut())
+                .enumerate()
+                .take(end_line + 1)
+                .skip(start_line)
+            {
                 let line_chars = text.chars().count();
                 let from = if line == start_line {
                     utf16_to_char_col(text, d.start_char)
@@ -1843,7 +1849,7 @@ impl Editor {
                 };
                 // Widen an empty run to one cell so a point diagnostic is seen.
                 let to = to.max(from + 1);
-                spans[line].push((from, to, d.severity));
+                line_spans.push((from, to, d.severity));
             }
         }
         self.diagnostic_spans = spans;

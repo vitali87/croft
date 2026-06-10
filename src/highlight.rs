@@ -248,10 +248,11 @@ const RUST_IDENTIFIER_OVERLAY_QUERY: &str = r#"(identifier) @variable"#;
 ///     scoped rules but for lowercase -> `@module`.
 ///   - enum-variant DECLARATIONS (`enum E { A, B }`) which RA paints
 ///     `enumMember` (orange) but tree-sitter colours @constructor (blue-grey).
-/// Variant USES (`E::A`) are deliberately NOT matched: syntactically they are
-/// indistinguishable from a type path or associated const, so colouring them
-/// would mis-paint real types. That residual recolour is inherent to the
-/// combined model (VS Code has it too) and only the LSP can resolve it.
+///     Variant USES (`E::A`) are deliberately NOT matched: syntactically they
+///     are indistinguishable from a type path or associated const, so
+///     colouring them would mis-paint real types. That residual recolour is
+///     inherent to the combined model (VS Code has it too) and only the LSP
+///     can resolve it.
 const RUST_MODULE_OVERLAY_QUERY: &str = r#"
 ((scoped_identifier path: (identifier) @module)
  (#match? @module "^[a-z]"))

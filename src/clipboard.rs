@@ -17,7 +17,7 @@ pub fn read_string() -> Option<String> {
         if let Some(s) = macos::read_string_native() {
             return Some(s);
         }
-        return read_pbpaste();
+        read_pbpaste()
     }
     #[cfg(target_os = "linux")]
     {
@@ -73,7 +73,7 @@ pub fn write_string(text: &str) -> bool {
         if macos::write_string_native(text) {
             return true;
         }
-        return write_pbcopy(text);
+        write_pbcopy(text)
     }
     #[cfg(target_os = "linux")]
     {

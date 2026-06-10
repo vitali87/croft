@@ -5811,10 +5811,10 @@ impl App {
                     self.open_search_hit(&hit);
                 }
             }
-            KeyCode::Backspace => {
-                if self.search.delete_selection() || self.search.query.pop().is_some() {
-                    self.submit_search_query();
-                }
+            KeyCode::Backspace
+                if (self.search.delete_selection() || self.search.query.pop().is_some()) =>
+            {
+                self.submit_search_query();
             }
             KeyCode::Up => self.search.move_up(),
             KeyCode::Down => self.search.move_down(),
@@ -5845,10 +5845,8 @@ impl App {
             KeyCode::Down => self.remote.move_down(),
             KeyCode::PageUp => self.remote.scroll_up(10),
             KeyCode::PageDown => self.remote.scroll_down(10),
-            KeyCode::Backspace => {
-                if !self.remote.filter.is_empty() {
-                    self.remote.pop_filter_char();
-                }
+            KeyCode::Backspace if !self.remote.filter.is_empty() => {
+                self.remote.pop_filter_char();
             }
             KeyCode::Char(' ') if has_mod => {}
             KeyCode::Char(c) if !has_mod => {
@@ -10765,13 +10763,11 @@ impl App {
                     }
                 }
             }
-            MouseEventKind::ScrollLeft => {
-                if in_editor {
-                    if let Some(diff) = self.editor.diff.as_mut() {
-                        diff.scroll_left_by(4);
-                    } else {
-                        self.editor.scroll_left_by(4);
-                    }
+            MouseEventKind::ScrollLeft if in_editor => {
+                if let Some(diff) = self.editor.diff.as_mut() {
+                    diff.scroll_left_by(4);
+                } else {
+                    self.editor.scroll_left_by(4);
                 }
             }
             MouseEventKind::ScrollRight if in_editor => {
@@ -11573,18 +11569,14 @@ impl App {
         let row_count = data.rows.len();
         let col_count = data.col_widths.len();
         match key.code {
-            KeyCode::Down => {
-                if data.scroll_row + 1 < row_count {
-                    data.scroll_row += 1;
-                }
+            KeyCode::Down if data.scroll_row + 1 < row_count => {
+                data.scroll_row += 1;
             }
             KeyCode::Up => {
                 data.scroll_row = data.scroll_row.saturating_sub(1);
             }
-            KeyCode::Right => {
-                if data.scroll_col + 1 < col_count {
-                    data.scroll_col += 1;
-                }
+            KeyCode::Right if data.scroll_col + 1 < col_count => {
+                data.scroll_col += 1;
             }
             KeyCode::Left => {
                 data.scroll_col = data.scroll_col.saturating_sub(1);
@@ -11602,10 +11594,8 @@ impl App {
             KeyCode::End => {
                 data.scroll_row = row_count.saturating_sub(visible.max(1));
             }
-            KeyCode::Tab => {
-                if total_sheets > 1 {
-                    sheet.current_sheet = (current + 1) % total_sheets;
-                }
+            KeyCode::Tab if total_sheets > 1 => {
+                sheet.current_sheet = (current + 1) % total_sheets;
             }
             KeyCode::BackTab if total_sheets > 1 => {
                 sheet.current_sheet = (current + total_sheets - 1) % total_sheets;
