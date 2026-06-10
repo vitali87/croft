@@ -873,6 +873,12 @@ pub struct App {
     /// dispatch (iTerm2 OSC-1337 vs Kitty graphics) and the Kitty-only
     /// delete-all eviction on the clear chain.
     inline_protocol: crate::iterm2_inline::InlineImageProtocol,
+    /// Set once by the runtime DA1 probe (`run`) when the host terminal lacks an
+    /// env-advertised protocol (iTerm2/Kitty) but answers DA1 with sixel
+    /// support. `init_graphics` promotes `inline_protocol` to `Sixel` when this
+    /// is true, and preserves it across the theme-switch re-detect that would
+    /// otherwise reset to `None` (sixel has no env signal to re-derive from).
+    sixel_supported: bool,
     /// Clipboard read entrypoint. Production uses the host clipboard; tests
     /// can swap in a deterministic reader for Cmd+V routing assertions.
     clipboard_reader: fn() -> Option<String>,
@@ -1459,6 +1465,7 @@ impl App {
             search_results_rx,
             cell_pixel: None,
             inline_protocol: crate::iterm2_inline::detect_inline_image_protocol(),
+            sixel_supported: false,
             clipboard_reader: read_system_clipboard,
             remote_launch: None,
             pending_remote_launch_host: None,
@@ -1588,7 +1595,16 @@ impl App {
     }
 
     pub fn init_graphics(&mut self) {
-        self.inline_protocol = crate::iterm2_inline::detect_inline_image_protocol();
+        // Env-advertised protocols (iTerm2/Kitty) win; otherwise fall back to a
+        // sixel host detected earlier by the DA1 probe. Re-derived here so the
+        // theme-switch re-bake keeps the right protocol, and `sixel_supported`
+        // carries the probe result across the env re-detect (sixel has none).
+        self.inline_protocol = match crate::iterm2_inline::detect_inline_image_protocol() {
+            crate::iterm2_inline::InlineImageProtocol::None if self.sixel_supported => {
+                crate::iterm2_inline::InlineImageProtocol::Sixel
+            }
+            other => other,
+        };
         if !self.inline_images_enabled() {
             return;
         }
@@ -1635,11 +1651,9 @@ impl App {
                 let raw = crate::iterm2_inline::build_inline_image(
                     protocol, &baked, w_cells, h_cells, false, id,
                 )?;
-                Some(if is_tmux {
-                    crate::iterm2_inline::tmux_passthrough_wrap(&raw)
-                } else {
-                    raw
-                })
+                Some(crate::iterm2_inline::maybe_tmux_wrap(
+                    protocol, is_tmux, raw,
+                ))
             };
         // View icons render dead-centered in their cell block; the gear gets a
         // downward bias so it bottom-aligns within its (bottom-inset) block,
@@ -1741,11 +1755,11 @@ impl App {
             false,
             crate::iterm2_inline::KITTY_ID_BADGE,
         ) {
-            self.overlays.badge.set_image(if is_tmux {
-                crate::iterm2_inline::tmux_passthrough_wrap(&raw)
-            } else {
-                raw
-            });
+            self.overlays
+                .badge
+                .set_image(crate::iterm2_inline::maybe_tmux_wrap(
+                    protocol, is_tmux, raw,
+                ));
         }
         // Run-and-Debug headline icon: the same debug-alt PNG used in the
         // activity bar, fitted to the panel's icon block (RUN_DEBUG_ICON_CELLS_W
@@ -1772,11 +1786,11 @@ impl App {
             false,
             crate::iterm2_inline::KITTY_ID_RUN_DEBUG_PANEL,
         ) {
-            self.overlays.run_debug.set_image(if is_tmux {
-                crate::iterm2_inline::tmux_passthrough_wrap(&raw)
-            } else {
-                raw
-            });
+            self.overlays
+                .run_debug
+                .set_image(crate::iterm2_inline::maybe_tmux_wrap(
+                    protocol, is_tmux, raw,
+                ));
         }
         // SSH empty-state illustration baked to a fixed cell box (18 × 8
         // cells). Letterboxed onto the card's dark bg so iTerm2 has no
@@ -1805,11 +1819,11 @@ impl App {
             false,
             crate::iterm2_inline::KITTY_ID_SSH,
         ) {
-            self.overlays.ssh.set_image(if is_tmux {
-                crate::iterm2_inline::tmux_passthrough_wrap(&raw)
-            } else {
-                raw
-            });
+            self.overlays
+                .ssh
+                .set_image(crate::iterm2_inline::maybe_tmux_wrap(
+                    protocol, is_tmux, raw,
+                ));
         }
     }
 
@@ -1929,11 +1943,11 @@ impl App {
                 false,
                 crate::iterm2_inline::KITTY_ID_HERO,
             ) {
-                let osc = if crate::iterm2_inline::detect_tmux() {
-                    crate::iterm2_inline::tmux_passthrough_wrap(&raw)
-                } else {
-                    raw
-                };
+                let osc = crate::iterm2_inline::maybe_tmux_wrap(
+                    protocol,
+                    crate::iterm2_inline::detect_tmux(),
+                    raw,
+                );
                 self.overlays.hero.set(osc, desired);
             }
         }
@@ -2154,7 +2168,11 @@ impl App {
     /// clean set at the new cells.
     pub fn flush_activity_image_overlays(&mut self) {
         use std::io::Write;
-        if !self.overlays.activity.should_refresh() {
+        // The keepalive re-emit fights iTerm2's image-cache eviction; the sixel
+        // cell buffer doesn't evict, so its icons re-emit only when dirty.
+        let allow_keepalive =
+            self.inline_protocol != crate::iterm2_inline::InlineImageProtocol::Sixel;
+        if !self.overlays.activity.should_refresh(allow_keepalive) {
             return;
         }
         let overlays = self.pending_activity_image_overlays();
@@ -3918,11 +3936,11 @@ impl App {
                     false,
                     crate::iterm2_inline::KITTY_ID_WELCOME,
                 ) {
-                    let osc = if crate::iterm2_inline::detect_tmux() {
-                        crate::iterm2_inline::tmux_passthrough_wrap(&raw)
-                    } else {
-                        raw
-                    };
+                    let osc = crate::iterm2_inline::maybe_tmux_wrap(
+                        protocol,
+                        crate::iterm2_inline::detect_tmux(),
+                        raw,
+                    );
                     self.overlays.welcome.set_image(osc);
                 }
             }
@@ -11372,11 +11390,11 @@ impl App {
                 crate::iterm2_inline::KITTY_ID_EDITOR_BASE + side as u32,
             )
         {
-            let osc = if crate::iterm2_inline::detect_tmux() {
-                crate::iterm2_inline::tmux_passthrough_wrap(&raw)
-            } else {
-                raw
-            };
+            let osc = crate::iterm2_inline::maybe_tmux_wrap(
+                self.inline_protocol,
+                crate::iterm2_inline::detect_tmux(),
+                raw,
+            );
             self.overlays.editor[side].set(osc, desired);
         }
     }
@@ -13791,6 +13809,17 @@ pub fn run(root: PathBuf, restore_session: Option<PathBuf>) -> Result<()> {
     app.start_update_watch_if_remote();
 
     enable_raw_mode().context("enable raw mode")?;
+    // Sixel has no env var, so when neither iTerm2 nor Kitty was detected from
+    // the environment, probe the host with a DA1 query. This runs in raw mode
+    // but before the alt-screen switch and long before the event loop's first
+    // poll, so crossterm's (lazily-started) event reader can't swallow the
+    // reply. A non-sixel terminal (e.g. Apple Terminal) answers DA1 without
+    // attribute 4 and the probe returns instantly; init_graphics then promotes
+    // the protocol to Sixel only when this is true.
+    #[cfg(unix)]
+    if app.inline_protocol == crate::iterm2_inline::InlineImageProtocol::None {
+        app.sixel_supported = crate::iterm2_inline::probe_sixel_support();
+    }
     let mut out = stdout();
     execute!(
         out,

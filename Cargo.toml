@@ -1,6 +1,6 @@
 [package]
 name = "croft"
-version = "0.1.345"
+version = "0.1.346"
 edition = "2024"
 description = "VSCode-style TUI written in Rust"
 license = "MIT"
@@ -70,6 +70,11 @@ notify-debouncer-full = "0.7"
 base64 = "0.22"
 regex = "1.12"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp", "webp"] }
+# NeuQuant colour quantiser, already in the tree via image's gif feature. Used
+# directly by the hand-rolled sixel encoder (src/iterm2_inline.rs) to fit an
+# overlay's pixels into sixel's <=256 palette registers; avoids pulling a whole
+# SIMD/proc-macro sixel crate for what are mostly two-colour codicons.
+color_quant = "1.1"
 # SVG rasteriser for the activity-bar codicons. Rendered once at startup at the
 # exact icon pixel size, so the glyphs stay crisp at any cell size and we never
 # ship (or decode) a heavyweight raster source for a 4×2-cell icon. resvg

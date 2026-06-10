@@ -200,6 +200,14 @@ fn tint_rgba(src: &RgbaImage, tint: Rgba<u8>) -> RgbaImage {
 pub enum InlineImageProtocol {
     ITerm2,
     Kitty,
+    /// DEC sixel graphics. Unlike iTerm2/Kitty there is no env var that
+    /// advertises it, so it is detected at runtime via a DA1 probe
+    /// (`probe_sixel_support`) rather than by `inline_image_protocol_for`.
+    /// Painted as explicit truecolor like Kitty (it is not iTerm2, so no
+    /// `SetColors`), but its cells live in the normal cell buffer like the
+    /// iTerm2 path: a `\x1b[2J` evicts them and writing spaces erases them, so
+    /// it needs neither the Kitty delete-all-on-clear nor delete-by-id.
+    Sixel,
     None,
 }
 
@@ -234,6 +242,78 @@ pub fn detect_inline_image_protocol() -> InlineImageProtocol {
         return InlineImageProtocol::ITerm2;
     }
     InlineImageProtocol::None
+}
+
+/// True when a Primary Device Attributes (DA1) reply advertises sixel support.
+/// A DA1 reply looks like `\x1b[?62;1;4;6c`; sixel is attribute `4`, declared as
+/// a standalone `;`-separated token (so it must not match the `4` inside `14`,
+/// `64`, etc.). Bytes outside the `\x1b[?` … `c` envelope are ignored, which
+/// tolerates stray input that arrived alongside the reply.
+pub fn da1_advertises_sixel(reply: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(reply);
+    let Some(start) = text.find("\x1b[?") else {
+        return false;
+    };
+    let tail = &text[start + 3..];
+    let Some(end) = tail.find('c') else {
+        return false;
+    };
+    tail[..end].split(';').any(|tok| tok.trim() == "4")
+}
+
+/// Probe the host terminal for sixel support by issuing Primary Device
+/// Attributes (`\x1b[c`) and parsing the reply for attribute `4`. Returns
+/// `false` on any timeout, read error, or absent attribute, so a terminal that
+/// stays silent (or replies without sixel, like Apple Terminal) falls back
+/// cleanly to the text glyphs.
+///
+/// MUST be called after raw mode is enabled and BEFORE the main loop starts
+/// reading stdin (crossterm's event source initialises lazily on first poll, so
+/// probing first keeps it from swallowing the reply). Virtually every terminal
+/// answers DA1 promptly, so the timeout is only a safety net for a
+/// non-responding host and does not slow normal startup.
+#[cfg(unix)]
+pub fn probe_sixel_support() -> bool {
+    use std::io::{Read, Write};
+    use std::os::fd::AsRawFd;
+
+    let mut out = std::io::stdout();
+    if out.write_all(b"\x1b[c").is_err() || out.flush().is_err() {
+        return false;
+    }
+    let stdin = std::io::stdin();
+    let fd = stdin.as_raw_fd();
+    let mut buf = Vec::with_capacity(32);
+    let mut byte = [0u8; 1];
+    // ~250ms total budget: comfortably covers an SSH round-trip while staying
+    // imperceptible. DA1 normally returns in a few ms regardless.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ms = remaining.as_millis().min(i32::MAX as u128) as libc::c_int;
+        let n = unsafe { libc::poll(&mut pfd, 1, ms) };
+        if n <= 0 {
+            break; // timeout or poll error
+        }
+        match stdin.lock().read(&mut byte) {
+            Ok(1) => {
+                buf.push(byte[0]);
+                if byte[0] == b'c' || buf.len() >= 64 {
+                    break; // DA1 terminator (or runaway guard)
+                }
+            }
+            _ => break,
+        }
+    }
+    da1_advertises_sixel(&buf)
 }
 
 /// True when running inside Termux's terminal on Android. Termux does not set
@@ -431,11 +511,135 @@ pub fn delete_all_kitty_images() -> String {
     "\x1b_Ga=d,d=a,q=2\x1b\\".to_string()
 }
 
+/// Encode a straight-RGBA pixel buffer (`width`×`height`, 4 bytes/pixel) as a
+/// DEC sixel DCS string. Colours are quantised to sixel's ≤256 palette
+/// registers with NeuQuant (`color_quant`, already in-tree for GIF); only the
+/// registers that actually appear are declared, which keeps the payload small
+/// for the near-two-colour codicons. The image is emitted opaque — callers bake
+/// the surrounding pane bg into the source exactly like the OSC/Kitty paths, so
+/// no transparency handling is needed. Sixel values are 0–100 *percentages*,
+/// not 0–255. Pixels are written in horizontal bands of six rows, one pass per
+/// colour, with run-length compression (`!count char`).
+pub fn encode_sixel_rgba(rgba: &[u8], width: u32, height: u32) -> String {
+    let (w, h) = (width as usize, height as usize);
+    if w == 0 || h == 0 || rgba.len() < w * h * 4 {
+        return String::new();
+    }
+    // NeuQuant wants `colors` >= 64 and treats the buffer as RGBA. samplefac=1
+    // is the highest quality; our overlays are tiny so the cost is negligible.
+    let nq = color_quant::NeuQuant::new(1, 256, &rgba[..w * h * 4]);
+    let palette = nq.color_map_rgb(); // 256 * 3 (R,G,B bytes)
+    // Pixels below this alpha are left unpainted so the host's existing cell
+    // content shows through (P2=1 below). The activity-bar icons bake an opaque
+    // bg, so every pixel is painted; only letterboxed overlays (SSH empty state)
+    // exercise the transparent path.
+    const ALPHA_CUTOFF: u8 = 128;
+    let mut indices = vec![0u8; w * h];
+    let mut opaque = vec![false; w * h];
+    for i in 0..w * h {
+        let px = &rgba[i * 4..i * 4 + 4];
+        if px[3] >= ALPHA_CUTOFF {
+            opaque[i] = true;
+            indices[i] = nq.index_of(px) as u8;
+        }
+    }
+
+    let mut out = String::with_capacity(w * h / 4 + 512);
+    // P2=1: positions left unset stay transparent (show prior cell content).
+    out.push_str("\x1bP0;1;0q");
+    out.push_str(&format!("\"1;1;{width};{height}")); // 1:1 aspect, raster size
+
+    // Declare only the palette registers that painted (opaque) pixels use.
+    let mut used = [false; 256];
+    for i in 0..w * h {
+        if opaque[i] {
+            used[indices[i] as usize] = true;
+        }
+    }
+    let scale = |v: u8| -> u32 { (v as u32 * 100 + 127) / 255 };
+    for (c, is_used) in used.iter().enumerate() {
+        if !is_used {
+            continue;
+        }
+        let (r, g, b) = (palette[c * 3], palette[c * 3 + 1], palette[c * 3 + 2]);
+        out.push_str(&format!("#{c};2;{};{};{}", scale(r), scale(g), scale(b)));
+    }
+
+    // One band per six rows; within a band, one left-to-right pass per colour.
+    let mut band = 0usize;
+    while band < h {
+        let rows = (h - band).min(6);
+        let mut first_color_in_band = true;
+        for (c, is_used) in used.iter().enumerate() {
+            if !is_used {
+                continue;
+            }
+            // Build this colour's sixel chars for the whole row width.
+            let mut row: Vec<u8> = Vec::with_capacity(w);
+            let mut any = false;
+            for x in 0..w {
+                let mut bits = 0u8;
+                for r in 0..rows {
+                    let p = (band + r) * w + x;
+                    if opaque[p] && indices[p] as usize == c {
+                        bits |= 1 << r;
+                    }
+                }
+                if bits != 0 {
+                    any = true;
+                }
+                row.push(0x3F + bits);
+            }
+            if !any {
+                continue; // this colour is absent from the band
+            }
+            if !first_color_in_band {
+                out.push('$'); // graphics carriage return: overlay next colour
+            }
+            first_color_in_band = false;
+            out.push_str(&format!("#{c}"));
+            // Run-length encode the row.
+            let mut x = 0usize;
+            while x < w {
+                let ch = row[x];
+                let mut run = 1usize;
+                while x + run < w && row[x + run] == ch {
+                    run += 1;
+                }
+                if run >= 4 {
+                    out.push_str(&format!("!{run}"));
+                    out.push(ch as char);
+                } else {
+                    for _ in 0..run {
+                        out.push(ch as char);
+                    }
+                }
+                x += run;
+            }
+        }
+        out.push('-'); // graphics new line: advance to the next band
+        band += 6;
+    }
+
+    out.push_str("\x1b\\"); // ST: terminate the DCS
+    out
+}
+
+/// Decode a baked PNG back to RGBA and encode it as sixel. The OSC/Kitty paths
+/// base64 the PNG as-is; sixel needs raw pixels, so we pay one decode here. The
+/// caller has already sized the PNG to an exact cell-pixel multiple, so the
+/// sixel lands on the same cells.
+pub fn build_inline_image_sixel(png: &[u8]) -> Option<String> {
+    let img = image::load_from_memory(png).ok()?.to_rgba8();
+    let (w, h) = (img.width(), img.height());
+    Some(encode_sixel_rgba(img.as_raw(), w, h))
+}
+
 /// Single chokepoint that turns a baked PNG into the right inline-image escape
 /// for the host terminal's protocol. `id` is the stable per-overlay slot id
 /// used for both the Kitty image and placement ids (see `KITTY_ID_*`); it is
-/// ignored on the iTerm2 path. Returns `None` when no inline protocol is
-/// available, so callers fall back to their text/metadata rendering.
+/// ignored on the iTerm2 and sixel paths. Returns `None` when no inline
+/// protocol is available, so callers fall back to their text/metadata rendering.
 pub fn build_inline_image(
     protocol: InlineImageProtocol,
     png: &[u8],
@@ -458,6 +662,7 @@ pub fn build_inline_image(
             id,
             id,
         )),
+        InlineImageProtocol::Sixel => build_inline_image_sixel(png),
         InlineImageProtocol::None => None,
     }
 }
@@ -481,6 +686,18 @@ pub const KITTY_ID_SSH: u32 = KITTY_ID_BASE + 10;
 pub const KITTY_ID_WELCOME: u32 = KITTY_ID_BASE + 11;
 /// Editor image slots, indexed by physical split side (`+0` left, `+1` right).
 pub const KITTY_ID_EDITOR_BASE: u32 = KITTY_ID_BASE + 12;
+
+/// Apply tmux DCS passthrough wrapping to an inline-image escape when needed.
+/// Sixel passes through tmux natively (tmux built with sixel support renders it
+/// directly), and the OSC/APC-oriented passthrough wrapper would corrupt it, so
+/// sixel is never wrapped. iTerm2/Kitty escapes are wrapped only under tmux.
+pub fn maybe_tmux_wrap(protocol: InlineImageProtocol, is_tmux: bool, raw: String) -> String {
+    if is_tmux && protocol != InlineImageProtocol::Sixel {
+        tmux_passthrough_wrap(&raw)
+    } else {
+        raw
+    }
+}
 
 pub fn tmux_passthrough_wrap(seq: &str) -> String {
     let mut out = String::with_capacity(seq.len() + 8);
@@ -1012,6 +1229,80 @@ mod tests {
         assert_eq!(
             inline_image_protocol_for(None, None),
             InlineImageProtocol::None
+        );
+    }
+
+    #[test]
+    fn da1_sixel_attribute_is_detected_as_standalone_token() {
+        // VT340-style reply with sixel (4) present.
+        assert!(da1_advertises_sixel(b"\x1b[?62;1;4;6;9;15c"));
+        // Konsole-style.
+        assert!(da1_advertises_sixel(b"\x1b[?62;4c"));
+        // Sixel as the first attribute.
+        assert!(da1_advertises_sixel(b"\x1b[?4;6c"));
+    }
+
+    #[test]
+    fn da1_without_sixel_is_rejected() {
+        // Apple Terminal: VT100 with AVO, no sixel.
+        assert!(!da1_advertises_sixel(b"\x1b[?1;2c"));
+        // The `4` must be a whole token, not a digit inside 14 / 64.
+        assert!(!da1_advertises_sixel(b"\x1b[?62;14;64c"));
+        // Garbage / no envelope.
+        assert!(!da1_advertises_sixel(b""));
+        assert!(!da1_advertises_sixel(b"hello"));
+    }
+
+    #[test]
+    fn encode_sixel_wraps_in_dcs_and_declares_palette() {
+        // 2x2 solid red, opaque.
+        let rgba = [255u8, 0, 0, 255].repeat(4);
+        let seq = encode_sixel_rgba(&rgba, 2, 2);
+        assert!(seq.starts_with("\x1bP0;1;0q"), "DCS sixel intro: {seq:?}");
+        assert!(seq.contains("\"1;1;2;2"), "raster attrs: {seq:?}");
+        assert!(seq.contains('#'), "declares a palette register: {seq:?}");
+        assert!(seq.ends_with("\x1b\\"), "ST terminator: {seq:?}");
+    }
+
+    #[test]
+    fn encode_sixel_rejects_degenerate_input() {
+        assert_eq!(encode_sixel_rgba(&[], 0, 0), "");
+        // buffer too small for the claimed dimensions
+        assert_eq!(encode_sixel_rgba(&[0, 0, 0, 0], 4, 4), "");
+    }
+
+    #[test]
+    fn build_inline_image_dispatches_sixel() {
+        // A 2x2 opaque PNG round-trips through the dispatch into a sixel DCS.
+        let mut png = Vec::new();
+        let img: RgbaImage = ImageBuffer::from_pixel(2, 2, Rgba([10, 200, 30, 255]));
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        let seq = build_inline_image(InlineImageProtocol::Sixel, &png, 2, 2, false, 0)
+            .expect("sixel dispatch");
+        assert!(seq.starts_with("\x1bP"), "is a sixel DCS: {seq:?}");
+        assert!(seq.ends_with("\x1b\\"));
+    }
+
+    #[test]
+    fn maybe_tmux_wrap_skips_sixel_but_wraps_others() {
+        let raw = "\x1bPq#0;2;0;0;0-\x1b\\".to_string();
+        // Sixel is never wrapped, even under tmux.
+        assert_eq!(
+            maybe_tmux_wrap(InlineImageProtocol::Sixel, true, raw.clone()),
+            raw
+        );
+        // iTerm2 under tmux IS wrapped.
+        let wrapped = maybe_tmux_wrap(InlineImageProtocol::ITerm2, true, raw.clone());
+        assert!(
+            wrapped.starts_with("\x1bPtmux;"),
+            "tmux-wrapped: {wrapped:?}"
+        );
+        // Not under tmux: unchanged.
+        assert_eq!(
+            maybe_tmux_wrap(InlineImageProtocol::ITerm2, false, raw.clone()),
+            raw
         );
     }
 

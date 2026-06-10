@@ -271,11 +271,18 @@ impl ActivityOverlay {
         self.dirty = true;
     }
 
-    pub fn should_refresh(&self) -> bool {
+    /// Whether the icons should be re-emitted this frame. Always true on a
+    /// dirty (view switch, resize). The 2-second keepalive re-emit only applies
+    /// when `allow_keepalive` is set: it exists to outlast iTerm2's image-cache
+    /// eviction under SGR traffic, but sixel cells live in the normal buffer and
+    /// are never overwritten in the untouched activity-bar column, so re-emitting
+    /// them just risks a repaint flicker — the sixel path passes `false`.
+    pub fn should_refresh(&self, allow_keepalive: bool) -> bool {
         self.dirty
-            || self
-                .last_emit
-                .is_none_or(|t| t.elapsed() >= Self::KEEPALIVE)
+            || (allow_keepalive
+                && self
+                    .last_emit
+                    .is_none_or(|t| t.elapsed() >= Self::KEEPALIVE))
     }
 
     pub fn mark_emitted(&mut self) {

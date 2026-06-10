@@ -459,7 +459,7 @@ dependencies = [
 
 [[package]]
 name = "croft"
-version = "0.1.345"
+version = "0.1.346"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -468,6 +468,7 @@ dependencies = [
  "base64",
  "calamine",
  "clap",
+ "color_quant",
  "crossterm",
  "csv",
  "futures",

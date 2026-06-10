@@ -1411,6 +1411,10 @@ fn remote_croft_command_for_terminal(
             // `TERM_PROGRAM=ghostty` only; do NOT force the OSC-1337 path.
             prefix.push_str("export TERM_PROGRAM=ghostty; ");
         }
+        // Sixel is never returned by `inline_image_protocol_for` (it has no env
+        // signal); the remote croft discovers it by running its own DA1 probe
+        // against this same terminal over the SSH PTY, so no hint is forwarded.
+        InlineImageProtocol::Sixel => {}
         InlineImageProtocol::None => {}
     }
     for (k, v) in env {
