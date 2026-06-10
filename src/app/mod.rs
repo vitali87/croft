@@ -13725,6 +13725,11 @@ pub fn run(root: PathBuf, restore_session: Option<PathBuf>) -> Result<()> {
     // on — the local Mac and the remote Linux box both reach `run` — so
     // the dependency is satisfied identically on both (GOLDEN RULE).
     crate::zoxide::ensure_installed_in_background();
+    // Termux ships no font with codicon glyphs, so the activity-bar glyph
+    // fallback renders blank cells out of the box. Install the Meslo Nerd
+    // Font Mono into ~/.termux/font.ttf in the background (no-op on every
+    // other host, and when the user already has a font.ttf).
+    crate::termux::ensure_codicon_font_in_background();
     // Build the tree-sitter highlight configurations on a background thread so
     // the first file open paints its syntax (keywords, strings, comments)
     // instantly without the per-tab query-compilation snap, yet the ~80ms of

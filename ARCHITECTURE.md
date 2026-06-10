@@ -17,6 +17,7 @@ src/
 ├── main.rs              entry point + module declarations
 ├── cli.rs               clap CLI: open path, setup-terminal / setup-iterm2 / setup-cross / remote / keys subcommands
 ├── clipboard.rs         native macOS clipboard read/write (NSPasteboard) with pbpaste fallback
+├── ghostty.rs           Ghostty config keybinds (setup-ghostty): re-emit every croft chord as its CSI-u sequence so Ghostty's own binds don't swallow them
 ├── git.rs               branch / dirty / ahead-behind status, plus anonymous git-protocol fetch for the welcome screen recents
 ├── gradient.rs          shared orange→green corner gradient: the welcome activity box border and the Black-theme focused-pane border
 ├── highlight.rs         tree-sitter highlight registry per language
@@ -31,6 +32,7 @@ src/
 ├── session_state.rs     captures open tabs / layout so a self-update re-exec can restore them
 ├── sheet.rs             CSV / TSV / XLSX / XLS / XLSB / ODS parsing via the csv and calamine crates
 ├── sysmon.rs            system-metrics sampler loop (CPU / memory / network / disk / temp)
+├── termux.rs            Termux font auto-install: downloads Meslo Nerd Font Mono into ~/.termux/font.ttf (background, no-clobber) so the activity-bar codicon glyphs render
 ├── theme.rs             IDE color theme (Croft Dark / Croft Black): the background palette driving SetColors + baked-image fills
 ├── update_watch.rs      remote self-update: watch for a newer binary installed under a running remote croft
 ├── vim.rs               native modal (vim-style) editing: a pure key state machine (modes, counts, operators, text objects, f/t, search, ex-commands) that emits editing intents the app applies; toggled with Cmd+E
