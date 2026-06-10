@@ -9747,6 +9747,10 @@ impl App {
         // hits the new layer, not the stale one.
         let band = osk.last_area;
         osk.layout(band);
+        // The split choice outlives the session (best-effort, like themes).
+        if key == crate::widgets::osk::OskKey::SplitToggle {
+            let _ = crate::prefs::save_osk_split(osk.split);
+        }
         if let Some(ev) = ev
             && let Err(e) = self.handle_key(ev)
         {
@@ -9915,7 +9919,10 @@ impl App {
             && matches!(m.kind, MouseEventKind::Down(MouseButton::Left))
             && (in_editor || in_terminal || (in_tree && self.sidebar_view == SidebarView::Search))
         {
-            self.osk = Some(crate::widgets::osk::Osk::new());
+            let mut osk = crate::widgets::osk::Osk::new();
+            // Restore the persisted split-layout choice (foldables).
+            osk.split = crate::prefs::Prefs::load_or_default().osk_split;
+            self.osk = Some(osk);
             // The raise reflows the whole frame, so a dwell armed at the
             // pre-raise coordinates would resolve the wrong buffer cell.
             self.hover.clear();

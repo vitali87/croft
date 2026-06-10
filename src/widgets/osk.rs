@@ -13,9 +13,20 @@
 //! hardware keystrokes.
 //!
 //! Layers mirror a phone keyboard: lowercase, Shift (one-shot uppercase,
-//! like a phone's shift), and a symbols page. Ctrl and Alt are one-shot
-//! latches that apply to the next key tap, so Ctrl+C / Ctrl+P chords work
-//! with two taps.
+//! like a phone's shift), and a symbols page. Caps Lock is a persistent
+//! uppercase lock that - like a real Mac caps lock - uppercases letters
+//! only, leaving digits and punctuation untouched. Ctrl and Alt are
+//! one-shot latches that apply to the next key tap, so Ctrl+C / Ctrl+P
+//! chords work with two taps.
+//!
+//! Geometry follows a physical keyboard rather than stretching every key
+//! proportionally: structural keys carry a max width in cells, so on wide
+//! frames (an unfolded foldable) they stay key-sized while the letters and
+//! the space bar absorb the slack. The left column staggers like a MacBook:
+//! esc < tab < caps < shift. A split mode (toggled by the `split` key,
+//! persisted in prefs) breaks the board into two thumb clusters separated
+//! by a center gap of about a sixth of the band width, mirroring Gboard's
+//! foldable split with no duplicated letter keys.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::buffer::Buffer;
@@ -24,6 +35,22 @@ use ratatui::style::{Color, Modifier, Style};
 
 /// Key rows on the keyboard (the band is `OSK_ROWS` x the per-key height).
 pub const OSK_ROWS: u16 = 5;
+
+/// Below this band width the split layout collapses back to merged: two
+/// 20-cell half-boards are unusable, and the fold's outer screen is narrow.
+const MIN_SPLIT_WIDTH: u16 = 60;
+
+/// Split-mode center gap as a divisor of the band width (about 3cm on an
+/// unfolded foldable's inner screen).
+const SPLIT_GAP_DIV: u16 = 6;
+
+/// Weight of an ordinary letter/digit key; structural weights are tuned
+/// against this so narrow frames keep MacBook-like proportions.
+const CHAR_WEIGHT: u16 = 4;
+
+/// "No cap": letters and the space bar absorb whatever the structural keys
+/// give up on wide frames.
+const UNCAPPED: u16 = u16::MAX;
 
 /// Band height for a given frame: keys grow to thumb size on tall (portrait
 /// phone) frames and shrink back to one row each on short ones. Roughly 40%
@@ -48,18 +75,30 @@ pub enum OskKey {
     Code(KeyCode),
     /// One-shot uppercase / layer flip back from Symbols.
     Shift,
+    /// Persistent uppercase lock (letters only, like a Mac caps lock).
+    Caps,
     /// One-shot Ctrl latch for the next key.
     Ctrl,
-    /// One-shot Alt latch for the next key.
+    /// One-shot Alt latch, same lifecycle as `ctrl`.
     Alt,
     /// Toggle the Symbols layer.
     Symbols,
+    /// Toggle the split (two thumb clusters) layout; persisted by the app.
+    SplitToggle,
+    /// The split-mode center gap: never tappable, never painted.
+    Gap,
     /// Dismiss the keyboard (handled by the app, never synthesized).
     Hide,
 }
 
 pub struct Osk {
     pub layer: OskLayer,
+    /// Persistent uppercase lock; orthogonal to `layer` so a Symbols trip
+    /// and back lands on uppercase again.
+    pub caps: bool,
+    /// User's split-layout choice (persisted in prefs). Only takes effect
+    /// on bands at least `MIN_SPLIT_WIDTH` wide; see `split_active`.
+    pub split: bool,
     /// One-shot Ctrl latch: armed by tapping `ctrl`, consumed by the next
     /// character/named key.
     pub ctrl: bool,
@@ -67,33 +106,65 @@ pub struct Osk {
     pub alt: bool,
     /// Band rect from the last layout; the mouse handler hit-tests this.
     pub last_area: Rect,
+    /// Whether the last layout actually split (wants split AND wide enough).
+    split_active: bool,
     /// Per-key hit rects from the last layout, in render order.
     keys: Vec<(Rect, OskKey)>,
 }
 
-/// One key slot in a row: display label, the key it fires, and its relative
-/// width. Every layer keeps identical key counts per row so the geometry is
-/// stable across layer flips that happen between two frames.
-type KeySlot = (String, OskKey, u16);
+/// One key slot in a row: display label (plus a short fallback for cramped
+/// keys), the key it fires, its relative width, and the max width in cells
+/// it may grow to on wide bands (`UNCAPPED` for letters and space).
+struct KeySlot {
+    label: String,
+    short: &'static str,
+    key: OskKey,
+    weight: u16,
+    max_w: u16,
+}
 
-fn slot(label: &str, key: OskKey, weight: u16) -> KeySlot {
-    (String::from(label), key, weight)
+fn slot(label: &str, short: &'static str, key: OskKey, weight: u16, max_w: u16) -> KeySlot {
+    KeySlot {
+        label: String::from(label),
+        short,
+        key,
+        weight,
+        max_w,
+    }
 }
 
 fn char_slots(chars: &str) -> Vec<KeySlot> {
     chars
         .chars()
-        .map(|c| (c.to_string(), OskKey::Char(c), 1))
+        .map(|c| KeySlot {
+            label: c.to_string(),
+            short: "",
+            key: OskKey::Char(c),
+            weight: CHAR_WEIGHT,
+            max_w: UNCAPPED,
+        })
         .collect()
 }
 
-fn rows_for(layer: OskLayer) -> Vec<Vec<KeySlot>> {
-    let esc = || slot("esc", OskKey::Code(KeyCode::Esc), 2);
-    let bksp = || slot("⌫", OskKey::Code(KeyCode::Backspace), 2);
-    let tab = || slot("⇥", OskKey::Code(KeyCode::Tab), 2);
-    let ctrl = || slot("ctrl", OskKey::Ctrl, 2);
-    let enter = || slot("⏎", OskKey::Code(KeyCode::Enter), 2);
-    let shift = || slot("⇧", OskKey::Shift, 2);
+fn gap_slot() -> KeySlot {
+    slot("", "", OskKey::Gap, 0, 0)
+}
+
+/// Insert the split gap after `at` slots (the left thumb cluster).
+fn split_at(mut row: Vec<KeySlot>, at: usize) -> Vec<KeySlot> {
+    row.insert(at.min(row.len()), gap_slot());
+    row
+}
+
+fn rows_for(layer: OskLayer, caps: bool, split: bool) -> Vec<Vec<KeySlot>> {
+    // MacBook left-column stagger: esc < tab < caps < shift (1 : 1.5 :
+    // 1.75 : 2.25 key units, quantised to cells).
+    let esc = || slot("esc", "", OskKey::Code(KeyCode::Esc), 5, 5);
+    let bksp = || slot("⌫", "", OskKey::Code(KeyCode::Backspace), 6, 6);
+    let tab = || slot("⇥ tab", "⇥", OskKey::Code(KeyCode::Tab), 6, 6);
+    let caps_k = || slot("⇪ caps", "⇪", OskKey::Caps, 7, 7);
+    let enter = || slot("⏎", "", OskKey::Code(KeyCode::Enter), 7, 8);
+    let shift = || slot("⇧ shift", "⇧", OskKey::Shift, 9, 9);
     let row = |left: KeySlot, mid: &str, right: Option<KeySlot>| {
         let mut r = vec![left];
         r.extend(char_slots(mid));
@@ -101,40 +172,105 @@ fn rows_for(layer: OskLayer) -> Vec<Vec<KeySlot>> {
         r
     };
     // Bottom row is shared by every layer; the layer key relabels itself.
+    // Ctrl lives here, next to Alt, like a physical keyboard's bottom row.
     let bottom = |symbols_label: &str| {
-        vec![
-            slot(symbols_label, OskKey::Symbols, 3),
-            slot("alt", OskKey::Alt, 2),
-            slot(" ", OskKey::Char(' '), 8),
-            slot("←", OskKey::Code(KeyCode::Left), 1),
-            slot("↓", OskKey::Code(KeyCode::Down), 1),
-            slot("↑", OskKey::Code(KeyCode::Up), 1),
-            slot("→", OskKey::Code(KeyCode::Right), 1),
-            slot("⌄", OskKey::Hide, 2),
-        ]
+        let mut left = vec![
+            slot(symbols_label, "", OskKey::Symbols, 6, 6),
+            slot("ctrl", "^", OskKey::Ctrl, 6, 6),
+            slot("alt", "", OskKey::Alt, 5, 5),
+            slot(" ", "", OskKey::Char(' '), 14, UNCAPPED),
+        ];
+        let right = vec![
+            slot("←", "", OskKey::Code(KeyCode::Left), 4, 6),
+            slot("↓", "", OskKey::Code(KeyCode::Down), 4, 6),
+            slot("↑", "", OskKey::Code(KeyCode::Up), 4, 6),
+            slot("→", "", OskKey::Code(KeyCode::Right), 4, 6),
+            slot("split", "][", OskKey::SplitToggle, 6, 7),
+            slot("⌄", "", OskKey::Hide, 4, 5),
+        ];
+        if split {
+            // Both thumbs get a space bar, Gboard-style.
+            left.push(gap_slot());
+            left.push(slot(" ", "", OskKey::Char(' '), 14, UNCAPPED));
+        }
+        left.extend(right);
+        left
     };
-    match layer {
-        OskLayer::Lower => vec![
-            row(esc(), "1234567890", Some(bksp())),
-            row(tab(), "qwertyuiop", None),
-            row(ctrl(), "asdfghjkl", Some(enter())),
-            row(shift(), "zxcvbnm,./", None),
-            bottom("&123"),
-        ],
-        OskLayer::Upper => vec![
-            row(esc(), "!@#$%^&*()", Some(bksp())),
-            row(tab(), "QWERTYUIOP", None),
-            row(ctrl(), "ASDFGHJKL", Some(enter())),
-            row(shift(), "ZXCVBNM<>?", None),
-            bottom("&123"),
-        ],
-        OskLayer::Symbols => vec![
-            row(esc(), "1234567890", Some(bksp())),
-            row(tab(), "`~[]{}()<>", None),
-            row(ctrl(), "-_=+;:'\"", Some(enter())),
-            row(shift(), "!@#$%\\|,.?", None),
-            bottom("abc"),
-        ],
+    // Caps Lock uppercases letters only: digits and punctuation rows stay
+    // as on the Lower layer, unlike the one-shot Shift layer.
+    let (digits, top, home, low) = match (layer, caps) {
+        (OskLayer::Lower, false) => ("1234567890", "qwertyuiop", "asdfghjkl", "zxcvbnm,./"),
+        (OskLayer::Lower, true) => ("1234567890", "QWERTYUIOP", "ASDFGHJKL", "ZXCVBNM,./"),
+        (OskLayer::Upper, _) => ("!@#$%^&*()", "QWERTYUIOP", "ASDFGHJKL", "ZXCVBNM<>?"),
+        (OskLayer::Symbols, _) => ("1234567890", "`~[]{}()<>", "-_=+;:'\"", "!@#$%\\|,.?"),
+    };
+    let layer_label = if layer == OskLayer::Symbols {
+        "abc"
+    } else {
+        "&123"
+    };
+    let mut rows = vec![
+        row(esc(), digits, Some(bksp())),
+        row(tab(), top, None),
+        row(caps_k(), home, Some(enter())),
+        row(shift(), low, None),
+    ];
+    if split {
+        // Left thumb cluster = structural key + first five characters
+        // (esc 12345 | tab qwert | caps asdfg | shift zxcvb).
+        rows = rows.into_iter().map(|r| split_at(r, 6)).collect();
+    }
+    rows.push(bottom(layer_label));
+    rows
+}
+
+/// Per-row key widths: proportional by weight, but any key whose share
+/// exceeds its `max_w` is pinned there and the freed cells flow back to the
+/// uncapped keys (water-filling). The final flex pass uses cumulative
+/// rounding so the row stays pinned to its region's full width with no
+/// drift.
+fn solve_widths(row: &[KeySlot], avail: u32) -> Vec<u16> {
+    let mut widths = vec![0u16; row.len()];
+    let mut fixed = vec![false; row.len()];
+    loop {
+        let used: u32 = widths
+            .iter()
+            .zip(&fixed)
+            .filter(|(_, f)| **f)
+            .map(|(w, _)| u32::from(*w))
+            .sum();
+        let rem = avail.saturating_sub(used);
+        let wsum: u32 = row
+            .iter()
+            .zip(&fixed)
+            .filter(|(_, f)| !**f)
+            .map(|(s, _)| u32::from(s.weight))
+            .sum();
+        if wsum == 0 {
+            return widths;
+        }
+        let mut changed = false;
+        for (i, s) in row.iter().enumerate() {
+            if !fixed[i] && rem * u32::from(s.weight) / wsum > u32::from(s.max_w) {
+                widths[i] = s.max_w;
+                fixed[i] = true;
+                changed = true;
+            }
+        }
+        if changed {
+            continue;
+        }
+        let (mut cum, mut consumed) = (0u32, 0u32);
+        for (i, s) in row.iter().enumerate() {
+            if fixed[i] {
+                continue;
+            }
+            cum += u32::from(s.weight);
+            let end = rem * cum / wsum;
+            widths[i] = ((end - consumed) as u16).max(1);
+            consumed = end;
+        }
+        return widths;
     }
 }
 
@@ -142,59 +278,91 @@ impl Osk {
     pub fn new() -> Self {
         Self {
             layer: OskLayer::Lower,
+            caps: false,
+            split: false,
             ctrl: false,
             alt: false,
             last_area: Rect::default(),
+            split_active: false,
             keys: Vec::new(),
         }
     }
 
+    /// Slot rows for the current layer/caps/split state, as last laid out.
+    fn rows(&self) -> Vec<Vec<KeySlot>> {
+        rows_for(self.layer, self.caps, self.split_active)
+    }
+
     /// Recompute per-key hit rects for the current layer inside `area`.
     /// Each key row gets an equal share of the band's height, so taller
-    /// bands directly mean taller (thumb-sized) keys.
+    /// bands directly mean taller (thumb-sized) keys. In split mode each
+    /// half is solved independently inside its own region, so the center
+    /// channel stays a straight column across every row regardless of how
+    /// unevenly the clusters are loaded.
     pub fn layout(&mut self, area: Rect) {
         self.last_area = area;
+        self.split_active = self.split && area.width >= MIN_SPLIT_WIDTH;
         self.keys.clear();
         let row_h = (area.height / OSK_ROWS).max(1);
-        for (i, row) in rows_for(self.layer).iter().enumerate() {
+        let gap_w = area.width / SPLIT_GAP_DIV;
+        let half_w = (area.width - gap_w) / 2;
+        for (i, row) in self.rows().iter().enumerate() {
             let y = area.y + i as u16 * row_h;
             if y >= area.y.saturating_add(area.height) {
                 break;
             }
-            let gaps = row.len().saturating_sub(1) as u16;
-            let avail = u32::from(area.width.saturating_sub(gaps));
-            let total: u32 = row.iter().map(|(_, _, w)| u32::from(*w)).sum();
-            if avail == 0 || total == 0 {
-                continue;
+            match row.iter().position(|s| s.key == OskKey::Gap) {
+                None => self.place_half(row, area.x, area.width, y, row_h),
+                Some(at) => {
+                    self.place_half(&row[..at], area.x, half_w, y, row_h);
+                    self.keys.push((
+                        Rect {
+                            x: area.x + half_w,
+                            y,
+                            width: gap_w,
+                            height: row_h,
+                        },
+                        OskKey::Gap,
+                    ));
+                    let right_x = area.x + half_w + gap_w;
+                    let right_w = area.width - half_w - gap_w;
+                    self.place_half(&row[at + 1..], right_x, right_w, y, row_h);
+                }
             }
-            // Proportional rounding over cumulative weights keeps the row
-            // pinned to the band's full width with no drift.
-            let (mut cum, mut consumed, mut x) = (0u32, 0u32, area.x);
-            for (_, key, w) in row {
-                cum += u32::from(*w);
-                let end = avail * cum / total;
-                let kw = ((end - consumed) as u16).max(1);
-                self.keys.push((
-                    Rect {
-                        x,
-                        y,
-                        width: kw,
-                        height: row_h,
-                    },
-                    *key,
-                ));
-                x = x.saturating_add(kw + 1);
-                consumed = end;
-            }
+        }
+    }
+
+    /// Lay one row (or one split half) into `[x, x + region_w)`.
+    fn place_half(&mut self, slots: &[KeySlot], x: u16, region_w: u16, y: u16, row_h: u16) {
+        let gaps = slots.len().saturating_sub(1) as u16;
+        let avail = u32::from(region_w.saturating_sub(gaps));
+        if avail == 0 {
+            return;
+        }
+        let widths = solve_widths(slots, avail);
+        let mut x = x;
+        for (s, kw) in slots.iter().zip(widths) {
+            self.keys.push((
+                Rect {
+                    x,
+                    y,
+                    width: kw,
+                    height: row_h,
+                },
+                s.key,
+            ));
+            x = x.saturating_add(kw + 1);
         }
     }
 
     /// The key under a screen cell, if any. The full key rect is the hit
     /// target - including the visual gap row under tall keys - so thumb
-    /// taps that graze a key's edge still land.
+    /// taps that graze a key's edge still land. The split-mode center gap
+    /// is dead space and never matches.
     pub fn key_at(&self, col: u16, row: u16) -> Option<OskKey> {
         self.keys
             .iter()
+            .filter(|(_, k)| *k != OskKey::Gap)
             .find(|(r, _)| {
                 row >= r.y
                     && row < r.y.saturating_add(r.height)
@@ -211,17 +379,38 @@ impl Osk {
         self.keys.iter().find(|(_, k)| *k == key).map(|(r, _)| *r)
     }
 
+    /// How many slots fire `key` in the current layout. Test-only.
+    #[cfg(test)]
+    pub fn count_of(&self, key: OskKey) -> usize {
+        self.keys.iter().filter(|(_, k)| *k == key).count()
+    }
+
     /// Apply a tapped key. Layer/modifier keys mutate state and return
     /// `None`; character/named keys return the synthesized `KeyEvent` with
     /// any one-shot latches consumed. `Hide` always returns `None` - the
-    /// app dismisses the keyboard before calling this.
+    /// app dismisses the keyboard before calling this. `SplitToggle`
+    /// returns `None` too; the app persists the new choice.
     pub fn tap(&mut self, key: OskKey) -> Option<KeyEvent> {
         match key {
             OskKey::Shift => {
-                self.layer = match self.layer {
-                    OskLayer::Upper => OskLayer::Lower,
-                    _ => OskLayer::Upper,
-                };
+                // Shift releases an armed caps lock; otherwise it is the
+                // usual one-shot uppercase toggle.
+                if self.caps {
+                    self.caps = false;
+                    self.layer = OskLayer::Lower;
+                } else {
+                    self.layer = match self.layer {
+                        OskLayer::Upper => OskLayer::Lower,
+                        _ => OskLayer::Upper,
+                    };
+                }
+                None
+            }
+            OskKey::Caps => {
+                self.caps = !self.caps;
+                if self.layer == OskLayer::Upper {
+                    self.layer = OskLayer::Lower;
+                }
                 None
             }
             OskKey::Symbols => {
@@ -239,11 +428,16 @@ impl Osk {
                 self.alt = !self.alt;
                 None
             }
-            OskKey::Hide => None,
+            OskKey::SplitToggle => {
+                self.split = !self.split;
+                None
+            }
+            OskKey::Gap | OskKey::Hide => None,
             OskKey::Char(c) => {
                 let ev = KeyEvent::new(KeyCode::Char(c), self.take_latches());
                 // One-shot shift, phone-style: typing a character drops the
-                // Upper layer back to Lower. Symbols stays until toggled.
+                // Upper layer back to Lower. Symbols stays until toggled,
+                // and caps lock holds until released.
                 if self.layer == OskLayer::Upper {
                     self.layer = OskLayer::Lower;
                 }
@@ -265,13 +459,15 @@ impl Osk {
     }
 
     /// True when `key` should render highlighted: an armed one-shot latch
-    /// or the key that owns the active layer.
+    /// or the key that owns the active layer/lock.
     fn is_armed(&self, key: OskKey) -> bool {
         match key {
             OskKey::Ctrl => self.ctrl,
             OskKey::Alt => self.alt,
             OskKey::Shift => self.layer == OskLayer::Upper,
+            OskKey::Caps => self.caps,
             OskKey::Symbols => self.layer == OskLayer::Symbols,
+            OskKey::SplitToggle => self.split,
             _ => false,
         }
     }
@@ -299,9 +495,12 @@ pub fn render_osk(osk: &mut Osk, area: Rect, buf: &mut Buffer, panel_bg: Color) 
     for y in area.y..area.y.saturating_add(area.height) {
         buf.set_stringn(area.x, y, &blank, area.width as usize, gap);
     }
-    let rows = rows_for(osk.layer);
-    let labels: Vec<&KeySlot> = rows.iter().flatten().collect();
-    for ((rect, key), (label, _, _)) in osk.keys.iter().zip(labels) {
+    let rows = osk.rows();
+    let slots: Vec<&KeySlot> = rows.iter().flatten().collect();
+    for ((rect, key), s) in osk.keys.iter().zip(slots) {
+        if *key == OskKey::Gap {
+            continue;
+        }
         let armed = osk.is_armed(*key);
         let special = !matches!(key, OskKey::Char(_));
         let style = if armed {
@@ -315,6 +514,13 @@ pub fn render_osk(osk: &mut Osk, area: Rect, buf: &mut Buffer, panel_bg: Color) 
                 .bg(if special { KEY_SPECIAL_BG } else { KEY_BG })
         };
         let w = rect.width as usize;
+        // Cramped keys fall back to their short glyph label instead of
+        // truncating the word ("shift" -> "⇧").
+        let label = if s.label.chars().count() > w && !s.short.is_empty() {
+            s.short
+        } else {
+            s.label.as_str()
+        };
         let chars = label.chars().count();
         let pad = w.saturating_sub(chars) / 2;
         let mut cell = " ".repeat(pad);
@@ -350,6 +556,15 @@ mod tests {
         }
     }
 
+    fn wide() -> Rect {
+        Rect {
+            x: 0,
+            y: 34,
+            width: 120,
+            height: OSK_ROWS,
+        }
+    }
+
     #[test]
     fn layout_fills_band_and_every_row_hit_tests() {
         let mut osk = Osk::new();
@@ -377,9 +592,11 @@ mod tests {
             OskKey::Code(KeyCode::Tab),
             OskKey::Char(' '),
             OskKey::Shift,
+            OskKey::Caps,
             OskKey::Ctrl,
             OskKey::Alt,
             OskKey::Symbols,
+            OskKey::SplitToggle,
             OskKey::Hide,
             OskKey::Code(KeyCode::Left),
             OskKey::Code(KeyCode::Right),
@@ -416,6 +633,152 @@ mod tests {
         osk.tap(OskKey::Shift);
         osk.tap(OskKey::Shift);
         assert_eq!(osk.layer, OskLayer::Lower);
+    }
+
+    #[test]
+    fn caps_lock_uppercases_letters_only_until_released() {
+        let mut osk = Osk::new();
+        assert!(osk.tap(OskKey::Caps).is_none());
+        assert!(osk.caps);
+        osk.layout(band());
+        // Letters are uppercase; digits and punctuation stay as on Lower
+        // (a real caps lock, not a locked Shift layer).
+        for c in ['A', 'Q', 'Z', '1', '0', ',', '.', '/'] {
+            assert!(
+                osk.rect_for(OskKey::Char(c)).is_some(),
+                "missing key {c:?} under caps lock"
+            );
+        }
+        assert!(
+            osk.rect_for(OskKey::Char('!')).is_none(),
+            "caps lock must not expose the Shift layer's symbol row"
+        );
+        // Typing does NOT release the lock (unlike one-shot Shift).
+        let ev = osk.tap(OskKey::Char('A')).unwrap();
+        assert_eq!(ev.code, KeyCode::Char('A'));
+        assert!(osk.caps, "caps lock persists across keystrokes");
+        // A Symbols round-trip lands back on uppercase.
+        osk.tap(OskKey::Symbols);
+        osk.tap(OskKey::Symbols);
+        assert!(osk.caps);
+        // Shift releases the lock.
+        assert!(osk.tap(OskKey::Shift).is_none());
+        assert!(!osk.caps);
+        assert_eq!(osk.layer, OskLayer::Lower);
+        // Tapping caps again toggles it off too.
+        osk.tap(OskKey::Caps);
+        osk.tap(OskKey::Caps);
+        assert!(!osk.caps);
+    }
+
+    #[test]
+    fn left_column_staggers_like_a_macbook() {
+        let mut osk = Osk::new();
+        osk.layout(wide());
+        let esc = osk.rect_for(OskKey::Code(KeyCode::Esc)).unwrap();
+        let tab = osk.rect_for(OskKey::Code(KeyCode::Tab)).unwrap();
+        let caps = osk.rect_for(OskKey::Caps).unwrap();
+        let shift = osk.rect_for(OskKey::Shift).unwrap();
+        assert!(
+            esc.width < tab.width && tab.width < caps.width && caps.width < shift.width,
+            "MacBook stagger esc<tab<caps<shift, got {} {} {} {}",
+            esc.width,
+            tab.width,
+            caps.width,
+            shift.width
+        );
+    }
+
+    #[test]
+    fn structural_keys_stop_stretching_on_wide_bands() {
+        let mut osk = Osk::new();
+        osk.layout(wide());
+        // Structural keys pin at their caps; letters absorb the slack and
+        // end up wider than tab, the widest top-left structural key.
+        assert_eq!(osk.rect_for(OskKey::Code(KeyCode::Esc)).unwrap().width, 5);
+        assert_eq!(osk.rect_for(OskKey::Code(KeyCode::Tab)).unwrap().width, 6);
+        assert_eq!(osk.rect_for(OskKey::Caps).unwrap().width, 7);
+        assert_eq!(osk.rect_for(OskKey::Shift).unwrap().width, 9);
+        assert_eq!(
+            osk.rect_for(OskKey::Code(KeyCode::Backspace))
+                .unwrap()
+                .width,
+            6
+        );
+        let q = osk.rect_for(OskKey::Char('q')).unwrap();
+        let tab = osk.rect_for(OskKey::Code(KeyCode::Tab)).unwrap();
+        assert!(
+            q.width > tab.width,
+            "letters ({}) must out-grow structural keys ({}) on wide bands",
+            q.width,
+            tab.width
+        );
+    }
+
+    #[test]
+    fn ctrl_sits_on_the_bottom_row_next_to_alt() {
+        let mut osk = Osk::new();
+        osk.layout(band());
+        let ctrl = osk.rect_for(OskKey::Ctrl).unwrap();
+        let alt = osk.rect_for(OskKey::Alt).unwrap();
+        let shift = osk.rect_for(OskKey::Shift).unwrap();
+        let space = osk.rect_for(OskKey::Char(' ')).unwrap();
+        assert_eq!(ctrl.y, alt.y, "ctrl and alt share the bottom row");
+        assert!(ctrl.y > shift.y, "ctrl lives below the shift row");
+        assert!(ctrl.x < alt.x && alt.x < space.x, "order: ctrl, alt, space");
+    }
+
+    #[test]
+    fn split_layout_breaks_into_two_thumb_clusters_with_a_center_gap() {
+        let mut osk = Osk::new();
+        osk.split = true;
+        osk.layout(wide());
+        let area = wide();
+        let center = area.x + area.width / 2;
+        let row_y = |i: u16| area.y + i;
+        // The center column is dead space on every row.
+        for i in 0..OSK_ROWS {
+            assert_eq!(
+                osk.key_at(center, row_y(i)),
+                None,
+                "row {i} must have a center gap"
+            );
+        }
+        // Gboard's 5|5 split with no duplicated keys: t/g/v/5 end the left
+        // half, y/h/b/6 start the right half.
+        for (l, r) in [('5', '6'), ('t', 'y'), ('g', 'h'), ('b', 'n')] {
+            let lr = osk.rect_for(OskKey::Char(l)).unwrap();
+            let rr = osk.rect_for(OskKey::Char(r)).unwrap();
+            assert!(
+                lr.x + lr.width <= center && rr.x >= center,
+                "{l} must sit left of the gap and {r} right of it"
+            );
+            assert!(
+                rr.x - (lr.x + lr.width) >= area.width / SPLIT_GAP_DIV,
+                "gap between {l} and {r} must be at least a sixth of the band"
+            );
+        }
+        // Both halves carry a space bar.
+        assert_eq!(osk.count_of(OskKey::Char(' ')), 2);
+    }
+
+    #[test]
+    fn split_toggle_taps_toggle_and_narrow_bands_stay_merged() {
+        let mut osk = Osk::new();
+        assert!(osk.tap(OskKey::SplitToggle).is_none());
+        assert!(osk.split);
+        // A narrow band (folded front screen) ignores the split choice.
+        let narrow = Rect {
+            x: 0,
+            y: 34,
+            width: 40,
+            height: OSK_ROWS,
+        };
+        osk.layout(narrow);
+        assert_eq!(osk.count_of(OskKey::Gap), 0, "narrow bands never split");
+        assert_eq!(osk.count_of(OskKey::Char(' ')), 1);
+        osk.tap(OskKey::SplitToggle);
+        assert!(!osk.split);
     }
 
     #[test]

@@ -20,6 +20,10 @@ pub struct Prefs {
     /// Active color theme, stored by its stable [`Theme::id`].
     #[serde(default)]
     pub theme: String,
+    /// On-screen keyboard split layout (two thumb clusters on foldables),
+    /// toggled by the OSK's `split` key.
+    #[serde(default)]
+    pub osk_split: bool,
 }
 
 impl Prefs {
@@ -63,6 +67,15 @@ pub fn save_theme(theme: Theme) -> Result<()> {
     prefs.save(&path)
 }
 
+/// Persist the on-screen keyboard split choice, preserving other settings.
+/// Best-effort: a write failure is swallowed by the caller.
+pub fn save_osk_split(split: bool) -> Result<()> {
+    let path = config_path();
+    let mut prefs = Prefs::load(&path).unwrap_or_default();
+    prefs.osk_split = split;
+    prefs.save(&path)
+}
+
 pub fn config_path() -> PathBuf {
     config_dir().join("config.json")
 }
@@ -90,6 +103,22 @@ mod tests {
         prefs.save(&path).expect("save");
         let loaded = Prefs::load(&path).expect("load");
         assert_eq!(loaded.theme(), Theme::Black);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn round_trips_osk_split_and_old_configs_default_to_merged() {
+        let dir = std::env::temp_dir().join(format!("croft-prefs-osk-test-{}", std::process::id()));
+        let path = dir.join("config.json");
+        let prefs = Prefs {
+            osk_split: true,
+            ..Prefs::default()
+        };
+        prefs.save(&path).expect("save");
+        assert!(Prefs::load(&path).expect("load").osk_split);
+        // A pre-split config (theme only) still parses, defaulting to merged.
+        std::fs::write(&path, r#"{"theme":"black"}"#).expect("write old config");
+        assert!(!Prefs::load(&path).expect("load old").osk_split);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
