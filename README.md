@@ -36,7 +36,7 @@ The editor speaks LSP for completion, hover, go-to-definition / references / imp
 | Rust 1.85+ stable | To compile the binary (edition 2024). |
 | A Nerd Font as your terminal font | Explorer icons are Private Use Area glyphs (Codicons, Devicons, Seti). Without one, icons render as `[?]` boxes. |
 | A 256 color or truecolor terminal | Terminal.app, iTerm2, Alacritty, kitty, WezTerm, Ghostty all qualify. |
-| iTerm2, WezTerm, Ghostty, or kitty (optional) | Inline image / PDF / spreadsheet previews via OSC 1337. Other terminals fall back to a metadata header line. |
+| iTerm2, WezTerm, Ghostty, or kitty (optional) | Inline image / PDF / spreadsheet previews via OSC 1337 or the Kitty graphics protocol. Sixel terminals (detected at startup via a DA1 probe) are also supported. Other terminals fall back to a metadata header line. |
 | `pdftoppm` from poppler-utils (optional) | Multi-page PDF preview (`brew install poppler` / `apt install poppler-utils`). Without it, croft falls back to macOS `sips` for page 1 only. |
 | Node.js + npm (optional) | TypeScript / JavaScript LSP. croft auto-installs the `vtsls` server on first use and finds `node` even under nvm / fnm / asdf / volta. |
 

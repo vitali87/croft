@@ -2,7 +2,7 @@
 
 Notes for maintainers and developers. For what croft does and how to use it, see the [README](README.md); for the keyboard surface see [KEYBINDINGS.md](KEYBINDINGS.md).
 
-croft is built on [ratatui](https://ratatui.rs/) + [crossterm](https://github.com/crossterm-rs/crossterm), with [portable-pty](https://docs.rs/portable-pty/) for the embedded shell, [alacritty_terminal](https://docs.rs/alacritty_terminal/) for terminal-state parsing, [tree-sitter](https://tree-sitter.github.io/tree-sitter/) for incremental syntax highlighting, [calamine](https://docs.rs/calamine/) for spreadsheet parsing, and an inline-image protocol (iTerm2 OSC 1337, or the Kitty graphics protocol on Ghostty / kitty) for image / PDF previews.
+croft is built on [ratatui](https://ratatui.rs/) + [crossterm](https://github.com/crossterm-rs/crossterm), with [portable-pty](https://docs.rs/portable-pty/) for the embedded shell, [alacritty_terminal](https://docs.rs/alacritty_terminal/) for terminal-state parsing, [tree-sitter](https://tree-sitter.github.io/tree-sitter/) for incremental syntax highlighting, [calamine](https://docs.rs/calamine/) for spreadsheet parsing, and an inline-image protocol (iTerm2 OSC 1337, the Kitty graphics protocol on Ghostty / kitty, or DEC sixel on terminals whose DA1 reply advertises it) for image / PDF previews.
 
 ## How the embedded terminal works
 
@@ -24,7 +24,7 @@ src/
 ├── icons.rs             Codicon / Devicon / Seti glyphs and per-language colors
 ├── install_session.rs   streams install-progress events while a remote host builds / installs the croft binary
 ├── iterm2.rs            iTerm2 plist mutation helpers for fonts and Croft key mappings
-├── iterm2_inline.rs     inline-image baking pipeline + protocol dispatch (iTerm2 OSC 1337 / Kitty graphics): welcome wordmark, image / PDF preview, activity-bar icons incl. the settings gear, SSH empty-state hero
+├── iterm2_inline.rs     inline-image baking pipeline + protocol dispatch (iTerm2 OSC 1337 / Kitty graphics / DEC sixel via DA1 probe): welcome wordmark, image / PDF preview, activity-bar icons incl. the settings gear, SSH empty-state hero
 ├── pdf.rs               PDF rasteriser: prefers pdftoppm (poppler), falls back to macOS sips
 ├── prefs.rs             durable user preferences (color theme) persisted at ~/.config/croft/config.json
 ├── remote.rs            remote (SSH) target metadata and launch dispatch
