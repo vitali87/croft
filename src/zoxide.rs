@@ -38,6 +38,52 @@ use crate::lsp::log_file;
 const INSTALL_SCRIPT: &str =
     "curl -sSfL https://raw.githubusercontent.com/ajeetdsouza/zoxide/main/install.sh | sh";
 
+/// Termux installer. The official curl script can never run on a stock
+/// Termux: `curl` is not in the Termux bootstrap. `pkg` always is, zoxide
+/// is in the official Termux repo, and a `pkg` install lands in
+/// `$PREFIX/bin` — on `PATH` and exec-permitted on every Termux build
+/// (Android blocks exec from `$HOME` on some of them).
+const TERMUX_INSTALL_SCRIPT: &str = "pkg install -y zoxide";
+
+/// Pick the installer for this host.
+fn install_script(termux: bool) -> &'static str {
+    if termux {
+        TERMUX_INSTALL_SCRIPT
+    } else {
+        INSTALL_SCRIPT
+    }
+}
+
+/// Lifecycle of the one background install attempt per croft process,
+/// surfaced to the Cmd+Z popup so its "unavailable" message can tell the
+/// truth: `Running` while the installer is working, `Failed` once the
+/// attempt is over and the binary still cannot be found, `Done` when the
+/// binary resolves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallState {
+    Idle = 0,
+    Running = 1,
+    Done = 2,
+    Failed = 3,
+}
+
+static INSTALL_STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+fn set_install_state(state: InstallState) {
+    INSTALL_STATE.store(state as u8, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Current install lifecycle, readable from the render path (one relaxed
+/// atomic load).
+pub fn install_state() -> InstallState {
+    match INSTALL_STATE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => InstallState::Running,
+        2 => InstallState::Done,
+        3 => InstallState::Failed,
+        _ => InstallState::Idle,
+    }
+}
+
 /// The `--cmd` name croft wires into the shell, matching the Cmd+Z popup it
 /// mirrors: the jump command is `j` (and the interactive `ji`), not the
 /// default `z`/`zi`. Kept in sync with the popup's intent in this module.
@@ -310,7 +356,25 @@ fn ensure_shell_init() {
 pub fn ensure_installed_in_background() {
     std::thread::spawn(|| {
         if binary().is_none() {
-            let _ = Command::new("sh").arg("-c").arg(INSTALL_SCRIPT).output();
+            set_install_state(InstallState::Running);
+            let script = install_script(crate::iterm2_inline::detect_termux());
+            // The outcome is logged, never discarded: a host where the
+            // installer can't run (e.g. it once piped curl on a stock
+            // Termux, which has no curl) used to fail in total silence
+            // while the popup claimed "installing".
+            match Command::new("sh").arg("-c").arg(script).output() {
+                Ok(out) if out.status.success() => {
+                    log_file::log(&format!("zoxide: installer `{script}` succeeded"))
+                }
+                Ok(out) => log_file::log(&format!(
+                    "zoxide: installer `{script}` exited {}: {}",
+                    out.status,
+                    String::from_utf8_lossy(&out.stderr).trim()
+                )),
+                Err(e) => log_file::log(&format!(
+                    "zoxide: installer `{script}` could not start: {e}"
+                )),
+            }
         }
         // Wire the shell hook only once the binary is actually resolvable,
         // otherwise the `eval "$(zoxide init …)"` line errors on every shell
@@ -318,7 +382,10 @@ pub fn ensure_installed_in_background() {
         // even though it is not yet on the login shell's PATH — which is why
         // the appended block prepends that dir before the eval.
         if binary().is_some() {
+            set_install_state(InstallState::Done);
             ensure_shell_init();
+        } else {
+            set_install_state(InstallState::Failed);
         }
     });
 }
@@ -326,6 +393,21 @@ pub fn ensure_installed_in_background() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn install_script_is_pkg_on_termux_and_curl_elsewhere() {
+        assert_eq!(
+            install_script(true),
+            TERMUX_INSTALL_SCRIPT,
+            "stock Termux has no curl, so the curl|sh installer can never run there; \
+             pkg is in every Termux bootstrap and installs to the always-executable $PREFIX/bin"
+        );
+        assert_eq!(
+            install_script(false),
+            INSTALL_SCRIPT,
+            "macOS/Linux keep the official cross-platform curl installer"
+        );
+    }
 
     #[test]
     fn query_args_splits_needle_into_keyword_tokens() {

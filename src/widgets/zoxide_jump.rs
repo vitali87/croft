@@ -15,9 +15,11 @@ use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph, Widget},
+    widgets::{Block, Borders, Clear, Paragraph, Widget, Wrap},
 };
 use std::path::{Path, PathBuf};
+
+use crate::zoxide::InstallState;
 
 pub struct ZoxideJump {
     pub query: String,
@@ -39,6 +41,14 @@ pub struct ZoxideJump {
     /// strict zoxide match; drives the "no exact match" hint so an
     /// approximate result is never mistaken for a real frecency hit.
     pub approximate: bool,
+    /// Lifecycle of the background zoxide install, injected by the app
+    /// layer (`crate::zoxide::install_state()`) whenever results are
+    /// refreshed, so the "unavailable" message reports what actually
+    /// happened instead of a perpetual "installing".
+    pub install_state: InstallState,
+    /// True on Termux, injected at popup open; selects the platform's
+    /// install hint (`pkg install zoxide` vs the manual route).
+    pub termux: bool,
 }
 
 impl Default for ZoxideJump {
@@ -54,7 +64,28 @@ impl Default for ZoxideJump {
             available: true,
             all_dirs: Vec::new(),
             approximate: false,
+            install_state: InstallState::Idle,
+            termux: false,
         }
+    }
+}
+
+/// The line shown when the zoxide binary cannot be found, honest about the
+/// background install: claim "installing" only while the installer is
+/// actually running, and once it has failed, say so and name the
+/// platform's install command instead.
+pub fn unavailable_message(state: InstallState, termux: bool) -> &'static str {
+    match (state, termux) {
+        (InstallState::Running, _) => {
+            "  zoxide is not installed on this host. Installing it in the background; try again shortly."
+        }
+        (InstallState::Failed, true) => {
+            "  zoxide auto-install failed. Run `pkg install zoxide` in the terminal pane, then try again."
+        }
+        (InstallState::Failed, false) => {
+            "  zoxide auto-install failed. Install it manually (e.g. `brew install zoxide`), then try again."
+        }
+        _ => "  zoxide is not installed on this host.",
     }
 }
 
@@ -296,10 +327,17 @@ pub fn render_zoxide_jump(jump: &mut ZoxideJump, rect: Rect, buf: &mut Buffer, g
 
     if !jump.available {
         let msg = Line::from(Span::styled(
-            "  zoxide is not installed on this host — installing in the background; try again shortly.",
+            unavailable_message(jump.install_state, jump.termux),
             Style::default().fg(Color::Rgb(0xe5, 0xc0, 0x7b)),
         ));
-        Widget::render(Paragraph::new(msg), list_rect, buf);
+        // Wrapped, not clipped: the popup is as narrow as the Explorer
+        // column (phone-width on Termux), and the install hint's tail is
+        // the actionable part.
+        Widget::render(
+            Paragraph::new(msg).wrap(Wrap { trim: false }),
+            list_rect,
+            buf,
+        );
         return;
     }
 
@@ -388,6 +426,71 @@ mod tests {
         assert!(
             !j.approximate,
             "a strict result must reset the approximate flag"
+        );
+    }
+
+    #[test]
+    fn unavailable_message_reflects_install_state_and_platform() {
+        assert!(
+            unavailable_message(InstallState::Running, true)
+                .to_lowercase()
+                .contains("installing"),
+            "while the installer runs, saying so is the truth"
+        );
+        assert!(
+            unavailable_message(InstallState::Failed, true).contains("pkg install zoxide"),
+            "a failed install on Termux must hand the user the pkg command"
+        );
+        let failed_elsewhere = unavailable_message(InstallState::Failed, false);
+        assert!(
+            !failed_elsewhere.contains("pkg install"),
+            "pkg is Termux-only; never suggest it on macOS/Linux"
+        );
+        assert!(
+            failed_elsewhere.contains("brew install zoxide"),
+            "the non-Termux failed message must name a manual install route"
+        );
+        for termux in [false, true] {
+            assert!(
+                !unavailable_message(InstallState::Idle, termux)
+                    .to_lowercase()
+                    .contains("installing"),
+                "must not claim an install is happening when none was started"
+            );
+            assert!(
+                !unavailable_message(InstallState::Done, termux)
+                    .to_lowercase()
+                    .contains("installing"),
+                "must not claim an install is happening after it finished"
+            );
+        }
+    }
+
+    #[test]
+    fn unavailable_message_tail_stays_visible_in_a_narrow_popup() {
+        let mut j = ZoxideJump::new();
+        j.set_results(None);
+        j.install_state = InstallState::Failed;
+        j.termux = true;
+        let rect = Rect::new(0, 0, 30, 12);
+        let mut buf = Buffer::empty(rect);
+        render_zoxide_jump(&mut j, rect, &mut buf, false);
+        let screen: String = (0..rect.height)
+            .map(|y| {
+                (0..rect.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            screen.contains("zoxide"),
+            "message must render at all: {screen}"
+        );
+        assert!(
+            screen.contains("again"),
+            "the end of the message must wrap into view instead of being \
+             truncated by the popup's right edge (phone-width Explorer): {screen}"
         );
     }
 

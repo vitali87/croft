@@ -9128,6 +9128,8 @@ impl App {
             return;
         }
         let mut jump = crate::widgets::zoxide_jump::ZoxideJump::new();
+        jump.install_state = crate::zoxide::install_state();
+        jump.termux = crate::iterm2_inline::detect_termux();
         jump.set_results(crate::zoxide::query(""));
         // Snapshot the full frecency list so the typo-tolerant fuzzy
         // fallback can rank against it without re-spawning zoxide on every
@@ -9139,8 +9141,11 @@ impl App {
                 jump.results.len()
             )
         } else {
-            String::from(
-                "Jump: zoxide not installed — installing in the background, try again shortly",
+            // Same honest copy as the popup body (single source of truth).
+            format!(
+                "Jump: {}",
+                crate::widgets::zoxide_jump::unavailable_message(jump.install_state, jump.termux)
+                    .trim_start()
             )
         };
         self.zoxide_jump = Some(jump);
@@ -9175,6 +9180,9 @@ impl App {
             return;
         };
         let needle = jump.query.clone();
+        // The background install may have advanced (Running -> Done/Failed)
+        // since the popup opened; keep the unavailable message current.
+        jump.install_state = crate::zoxide::install_state();
         match crate::zoxide::query(&needle) {
             Some(paths) if paths.is_empty() && !needle.trim().is_empty() => {
                 let ranked = crate::zoxide::fuzzy_rank(&needle, &jump.all_dirs);
