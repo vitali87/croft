@@ -6,6 +6,7 @@ pub mod editor_find;
 pub mod file_finder;
 pub mod file_tree;
 pub mod hover_popup;
+pub mod osk;
 pub mod remote;
 pub mod run_debug;
 pub mod scrollbar;

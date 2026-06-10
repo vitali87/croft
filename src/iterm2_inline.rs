@@ -259,6 +259,26 @@ pub fn detect_termux() -> bool {
     })
 }
 
+/// True when taps in editable areas should auto-raise croft's own on-screen
+/// keyboard. Termux's tap-to-show-keyboard path is dead while an app has
+/// mouse tracking active (croft always does, for click routing), so touch
+/// users there otherwise have no way to type; `CROFT_FORCE_OSK` opts desktop
+/// terminals in for testing. Same truthy values as the inline-image override.
+pub fn osk_env(termux: bool, force: Option<&str>) -> bool {
+    termux || force_inline_images(force)
+}
+
+/// Cached `osk_env` over the live environment, mirroring `detect_termux`.
+pub fn detect_osk_auto() -> bool {
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        osk_env(
+            detect_termux(),
+            std::env::var("CROFT_FORCE_OSK").ok().as_deref(),
+        )
+    })
+}
+
 /// True for terminals that implement iTerm2's proprietary OSC-1337 inline
 /// image + `SetColors` sequences. Ghostty is deliberately excluded: it parses
 /// those sequences but does not implement them, so it must take the Kitty
@@ -507,6 +527,15 @@ mod tests {
         assert!(force_inline_images(Some("yes")));
         assert!(!force_inline_images(Some("0")));
         assert!(!force_inline_images(None));
+    }
+
+    #[test]
+    fn osk_env_arms_on_termux_or_explicit_force() {
+        assert!(osk_env(true, None));
+        assert!(osk_env(false, Some("1")));
+        assert!(osk_env(false, Some("true")));
+        assert!(!osk_env(false, Some("0")));
+        assert!(!osk_env(false, None));
     }
 
     #[test]

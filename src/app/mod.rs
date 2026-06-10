@@ -964,6 +964,16 @@ pub struct App {
     /// is open (closing the last one would leave the pane empty, which we
     /// explicitly forbid) or the pane is hidden.
     terminal_close_buttons: Vec<Rect>,
+    /// On-screen keyboard for touch-only environments (Termux). `Some`
+    /// while the bottom keyboard band is visible; taps on its keys
+    /// synthesize `KeyEvent`s through `handle_key`, so they reach the
+    /// editor, terminal PTY, and modals exactly like hardware keystrokes.
+    osk: Option<crate::widgets::osk::Osk>,
+    /// True when taps in editable areas (editor text, terminal panes, the
+    /// Search input) auto-raise the on-screen keyboard. Armed on Termux,
+    /// where active mouse tracking permanently suppresses the native soft
+    /// keyboard; `CROFT_FORCE_OSK=1` arms it elsewhere for testing.
+    osk_auto: bool,
     /// Total width / height of the right-hand content area, captured on
     /// every render so a splitter drag can clamp to the live viewport.
     last_content_width: u16,
@@ -1126,6 +1136,9 @@ const SIDEBAR_WIDTH_DEFAULT: u16 = 32;
 const SIDEBAR_WIDTH_MIN: u16 = 12;
 const TERMINAL_HEIGHT_MIN: u16 = 3;
 const EDITOR_HEIGHT_MIN: u16 = 3;
+/// Shortest frame that still shows the on-screen keyboard band; below this
+/// the workspace would be unusably squeezed, so the band collapses instead.
+const OSK_MIN_FRAME_HEIGHT: u16 = 16;
 const RIGHT_PANE_MIN: u16 = 20;
 /// Minimum width of the zoxide jump popup. The Explorer column it anchors
 /// over is typically ~32 cells, too narrow to read frecency paths like
@@ -1471,6 +1484,8 @@ impl App {
             terminal_splitter_y: None,
             terminal_add_buttons: Vec::new(),
             terminal_close_buttons: Vec::new(),
+            osk: None,
+            osk_auto: crate::iterm2_inline::detect_osk_auto(),
             last_content_width: 0,
             last_content_height: 0,
             lsp: match crate::lsp::LspManager::new(root.clone()) {
@@ -4623,9 +4638,21 @@ impl App {
     fn render(&mut self, frame: &mut ratatui::Frame) {
         let size = frame.area();
         self.last_frame_area = size;
+        // The on-screen keyboard docks as a fixed band between the panes and
+        // the status bar; frames too short to host it keep it collapsed so
+        // the workspace can't be squeezed into nothing.
+        let osk_h = if self.osk.is_some() && size.height >= OSK_MIN_FRAME_HEIGHT {
+            crate::widgets::osk::OSK_HEIGHT
+        } else {
+            0
+        };
         let outer = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Min(1), Constraint::Length(1)])
+            .constraints([
+                Constraint::Min(1),
+                Constraint::Length(osk_h),
+                Constraint::Length(1),
+            ])
             .split(size);
 
         // Clamp sidebar width to leave at least RIGHT_PANE_MIN cells for
@@ -4979,7 +5006,18 @@ impl App {
         spans.push(Span::styled("F1", Style::default().fg(Color::Yellow)));
         spans.push(Span::raw(" Shortcuts"));
         let shortcuts_label_len: u16 = "F1 Shortcuts".chars().count() as u16;
-        let status_rect = outer[1];
+        if let Some(osk) = self.osk.as_mut() {
+            if osk_h > 0 {
+                let bg = self.theme.editor_bg();
+                crate::widgets::osk::render_osk(osk, outer[1], frame.buffer_mut(), bg);
+            } else {
+                // Collapsed (frame too short): zero the hit rect so the
+                // invisible band can't swallow clicks.
+                osk.last_area = Rect::default();
+            }
+        }
+
+        let status_rect = outer[2];
         let hit_x = status_rect.x.saturating_add(shortcuts_label_start_col);
         let hit_end = hit_x
             .saturating_add(shortcuts_label_len)
@@ -4999,7 +5037,7 @@ impl App {
             Color::Rgb(0x1e, 0x3a, 0x6e)
         };
         let status = Paragraph::new(Line::from(spans)).style(Style::default().bg(status_bg));
-        frame.render_widget(status, outer[1]);
+        frame.render_widget(status, outer[2]);
 
         // Overlays render last so they sit on top of everything else.
         self.render_context_menu(frame);
@@ -9634,7 +9672,50 @@ impl App {
         }
     }
 
+    /// A tap inside the on-screen keyboard band. Layer/modifier keys mutate
+    /// the keyboard; character/named keys synthesize a `KeyEvent` and feed
+    /// it through `handle_key`, so it reaches whatever currently owns the
+    /// keyboard focus (editor, terminal, search, or an open modal).
+    fn handle_osk_mouse(&mut self, m: MouseEvent) {
+        if !matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
+            return;
+        }
+        let Some(osk) = self.osk.as_mut() else {
+            return;
+        };
+        let Some(key) = osk.key_at(m.column, m.row) else {
+            return;
+        };
+        if key == crate::widgets::osk::OskKey::Hide {
+            self.osk = None;
+            return;
+        }
+        let ev = osk.tap(key);
+        // Layer/modifier taps reshape the band; refresh the hit rects
+        // immediately so a follow-up tap that lands before the next frame
+        // hits the new layer, not the stale one.
+        let band = osk.last_area;
+        osk.layout(band);
+        if let Some(ev) = ev
+            && let Err(e) = self.handle_key(ev)
+        {
+            self.status = format!("On-screen key failed: {e}");
+        }
+    }
+
     fn handle_mouse(&mut self, m: MouseEvent) {
+        // On-screen keyboard taps outrank every other gate - including the
+        // modal overlays - because the OSK is how Termux users type into
+        // those modals. Its band is laid out disjoint from all panes, so
+        // swallowing events inside it never steals a pane's click.
+        if self
+            .osk
+            .as_ref()
+            .is_some_and(|k| rect_contains(k.last_area, m.column, m.row))
+        {
+            self.handle_osk_mouse(m);
+            return;
+        }
         if self.connect_dialog.is_some() {
             if matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
                 self.handle_connect_dialog_click(m.column, m.row);
@@ -9744,6 +9825,18 @@ impl App {
         self.tab_tooltip = None;
         self.tab_hover.clear();
         self.tab_hover_idx = None;
+
+        // Termux: a tap in any editable area raises the on-screen keyboard,
+        // standing in for the native soft keyboard that active mouse
+        // tracking permanently suppresses. The tap still falls through to
+        // its normal focus / cursor handling below.
+        if self.osk_auto
+            && self.osk.is_none()
+            && matches!(m.kind, MouseEventKind::Down(MouseButton::Left))
+            && (in_editor || in_terminal || (in_tree && self.sidebar_view == SidebarView::Search))
+        {
+            self.osk = Some(crate::widgets::osk::Osk::new());
+        }
 
         match m.kind {
             MouseEventKind::Down(MouseButton::Right) => {

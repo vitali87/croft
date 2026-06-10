@@ -10793,3 +10793,149 @@ fn merged_diagnostics_layers_every_server_for_a_file() {
         "both servers' diagnostics must survive the merge, not clobber each other"
     );
 }
+
+// ---------------------------------------------------------------------------
+// On-screen keyboard (Termux touch typing)
+// ---------------------------------------------------------------------------
+
+fn left_click(app: &mut App, column: u16, row: u16) {
+    app.handle_mouse(crossterm::event::MouseEvent {
+        kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        column,
+        row,
+        modifiers: KeyModifiers::empty(),
+    });
+}
+
+fn draw(app: &mut App, w: u16, h: u16) {
+    let backend = ratatui::backend::TestBackend::new(w, h);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+}
+
+#[test]
+fn osk_auto_shows_on_terminal_tap_and_only_when_armed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.osk_auto = true;
+    draw(&mut app, 80, 40);
+    let t = app.terminals[0].last_area;
+    assert!(t.width > 0 && t.height > 0, "terminal pane must be visible");
+    left_click(&mut app, t.x + t.width / 2, t.y + t.height / 2);
+    assert!(
+        app.osk.is_some(),
+        "a tap in the terminal must raise the on-screen keyboard on Termux"
+    );
+
+    // Desktop terminals (auto flag off) keep the band hidden on the same tap.
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.osk_auto = false;
+    draw(&mut app, 80, 40);
+    let t = app.terminals[0].last_area;
+    left_click(&mut app, t.x + t.width / 2, t.y + t.height / 2);
+    assert!(app.osk.is_none());
+}
+
+#[test]
+fn osk_auto_shows_on_editor_tap() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("notes.txt");
+    std::fs::write(&path, "hello\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.osk_auto = true;
+    app.editor.open_preview(&path).unwrap();
+    app.focus_pane(Pane::Editor);
+    draw(&mut app, 80, 40);
+    let e = app.editor.last_area;
+    left_click(&mut app, e.x + e.width / 2, e.y + e.height / 2);
+    assert!(
+        app.osk.is_some(),
+        "a tap in the editor text area must raise the on-screen keyboard"
+    );
+}
+
+#[test]
+fn osk_reserves_bottom_band_above_status_bar() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.osk = Some(crate::widgets::osk::Osk::new());
+    draw(&mut app, 80, 40);
+    let band = app.osk.as_ref().unwrap().last_area;
+    assert_eq!(band.height, crate::widgets::osk::OSK_HEIGHT);
+    assert_eq!(
+        band.y,
+        40 - 1 - crate::widgets::osk::OSK_HEIGHT,
+        "keyboard docks directly above the status bar"
+    );
+    assert_eq!(band.width, 80, "keyboard spans the full frame width");
+    let t = app.terminals[0].last_area;
+    assert!(
+        t.y + t.height <= band.y,
+        "terminal pane must end above the keyboard band, not under it"
+    );
+}
+
+#[test]
+fn osk_tap_types_into_focused_editor() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("notes.txt");
+    std::fs::write(&path, "").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.osk_auto = true;
+    app.editor.open_preview(&path).unwrap();
+    app.focus_pane(Pane::Editor);
+    draw(&mut app, 80, 40);
+    let e = app.editor.last_area;
+    left_click(&mut app, e.x + 1, e.y + 1);
+    assert!(app.osk.is_some());
+    // Second frame lays the keyboard band out so its keys are tappable.
+    draw(&mut app, 80, 40);
+    let r = app
+        .osk
+        .as_ref()
+        .unwrap()
+        .rect_for(crate::widgets::osk::OskKey::Char('a'))
+        .expect("lower layer exposes the letter a");
+    left_click(&mut app, r.x + r.width / 2, r.y);
+    assert_eq!(
+        app.editor.lines[0], "a",
+        "an OSK letter tap must reach the editor buffer like a keystroke"
+    );
+}
+
+#[test]
+fn osk_hide_key_dismisses_the_band() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.osk = Some(crate::widgets::osk::Osk::new());
+    draw(&mut app, 80, 40);
+    let r = app
+        .osk
+        .as_ref()
+        .unwrap()
+        .rect_for(crate::widgets::osk::OskKey::Hide)
+        .expect("hide key is always present");
+    left_click(&mut app, r.x + r.width / 2, r.y);
+    assert!(app.osk.is_none(), "the hide key must dismiss the keyboard");
+}
+
+#[test]
+fn osk_tap_types_into_file_finder_query() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.osk = Some(crate::widgets::osk::Osk::new());
+    app.open_file_finder();
+    draw(&mut app, 80, 40);
+    let r = app
+        .osk
+        .as_ref()
+        .unwrap()
+        .rect_for(crate::widgets::osk::OskKey::Char('a'))
+        .unwrap();
+    left_click(&mut app, r.x + r.width / 2, r.y);
+    assert_eq!(
+        app.file_finder.as_ref().unwrap().query,
+        "a",
+        "OSK taps must route into open modals, not be swallowed by their mouse gates"
+    );
+}
