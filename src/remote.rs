@@ -1370,6 +1370,7 @@ pub fn remote_croft_command(path: Option<&str>, env: &[(String, String)]) -> Str
         path,
         std::env::var("TERM_PROGRAM").ok().as_deref(),
         std::env::var("TERM").ok().as_deref(),
+        crate::iterm2_inline::detect_osk_auto(),
         env,
     )
 }
@@ -1378,10 +1379,17 @@ fn remote_croft_command_for_terminal(
     path: Option<&str>,
     term_program: Option<&str>,
     term: Option<&str>,
+    osk: bool,
     env: &[(String, String)],
 ) -> String {
     use crate::iterm2_inline::InlineImageProtocol;
     let mut prefix = String::from("export CROFT_REMOTE_AUTOUPDATE=1; ");
+    // SSH from Termux does not forward TERMUX_VERSION, so the remote croft
+    // can't detect the touch environment itself; carry the local on-screen
+    // keyboard detection across the hop like the TERM_PROGRAM hint below.
+    if osk {
+        prefix.push_str("export CROFT_FORCE_OSK=1; ");
+    }
     // The remote croft renders into *this* terminal over the SSH PTY, so it has
     // to use whichever inline-image protocol the local terminal speaks. SSH
     // forwards `TERM` but not `TERM_PROGRAM` (absent an `AcceptEnv` opt-in), so
@@ -1818,7 +1826,7 @@ Host !blocked *.internal
     #[test]
     fn remote_croft_command_quotes_paths() {
         assert_eq!(
-            remote_croft_command_for_terminal(Some("/tmp/it's here"), None, None, &[]),
+            remote_croft_command_for_terminal(Some("/tmp/it's here"), None, None, false, &[]),
             "export CROFT_REMOTE_AUTOUPDATE=1; export PATH=\"$HOME/.cargo/bin:$PATH\"; command -v croft >/dev/null 2>&1 || { echo 'croft not found on remote PATH' >&2; exit 127; }; exec croft '/tmp/it'\"'\"'s here'"
         );
     }
@@ -1826,7 +1834,7 @@ Host !blocked *.internal
     #[test]
     fn remote_croft_command_forwards_supported_terminal_program() {
         assert_eq!(
-            remote_croft_command_for_terminal(None, Some("iTerm.app"), None, &[]),
+            remote_croft_command_for_terminal(None, Some("iTerm.app"), None, false, &[]),
             "export CROFT_REMOTE_AUTOUPDATE=1; export CROFT_FORCE_INLINE_IMAGES=1 TERM_PROGRAM='iTerm.app'; export PATH=\"$HOME/.cargo/bin:$PATH\"; command -v croft >/dev/null 2>&1 || { echo 'croft not found on remote PATH' >&2; exit 127; }; exec croft"
         );
     }
@@ -1837,7 +1845,7 @@ Host !blocked *.internal
         // croft must export the hint itself. It must NOT force the OSC-1337 path
         // (Ghostty parses but ignores it); the remote resolves the Kitty
         // protocol from the exported TERM_PROGRAM.
-        let command = remote_croft_command_for_terminal(None, Some("ghostty"), None, &[]);
+        let command = remote_croft_command_for_terminal(None, Some("ghostty"), None, false, &[]);
         assert!(command.contains("export TERM_PROGRAM=ghostty;"));
         assert!(!command.contains("CROFT_FORCE_INLINE_IMAGES"));
     }
@@ -1845,7 +1853,8 @@ Host !blocked *.internal
     #[test]
     fn remote_croft_command_exports_kitty_hint_from_term_only() {
         // A bare `kitty` terminal sets no TERM_PROGRAM; detection keys off TERM.
-        let command = remote_croft_command_for_terminal(None, None, Some("xterm-kitty"), &[]);
+        let command =
+            remote_croft_command_for_terminal(None, None, Some("xterm-kitty"), false, &[]);
         assert!(command.contains("export TERM_PROGRAM=ghostty;"));
     }
 
@@ -1861,9 +1870,20 @@ Host !blocked *.internal
                 String::from("/tmp/r/inbox"),
             ),
         ];
-        let command = remote_croft_command_for_terminal(None, None, None, &env);
+        let command = remote_croft_command_for_terminal(None, None, None, false, &env);
         assert!(command.contains("export CROFT_DROP_RELAY_LOG='/tmp/r/log'"));
         assert!(command.contains("export CROFT_DROP_RELAY_INBOX='/tmp/r/inbox'"));
+    }
+
+    #[test]
+    fn remote_croft_command_forwards_osk_flag_when_local_osk_is_armed() {
+        // SSH from Termux does not forward TERMUX_VERSION, so a remote croft
+        // would never auto-arm the on-screen keyboard; the launcher carries
+        // the local detection across the hop explicitly.
+        let command = remote_croft_command_for_terminal(None, None, None, true, &[]);
+        assert!(command.contains("export CROFT_FORCE_OSK=1;"));
+        let command = remote_croft_command_for_terminal(None, None, None, false, &[]);
+        assert!(!command.contains("CROFT_FORCE_OSK"));
     }
 
     #[test]

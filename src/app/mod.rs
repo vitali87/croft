@@ -4638,11 +4638,12 @@ impl App {
     fn render(&mut self, frame: &mut ratatui::Frame) {
         let size = frame.area();
         self.last_frame_area = size;
-        // The on-screen keyboard docks as a fixed band between the panes and
-        // the status bar; frames too short to host it keep it collapsed so
-        // the workspace can't be squeezed into nothing.
+        // The on-screen keyboard docks as a band between the panes and the
+        // status bar, scaling its keys to thumb size on tall frames; frames
+        // too short to host it keep it collapsed so the workspace can't be
+        // squeezed into nothing.
         let osk_h = if self.osk.is_some() && size.height >= OSK_MIN_FRAME_HEIGHT {
-            crate::widgets::osk::OSK_HEIGHT
+            crate::widgets::osk::band_height(size.height)
         } else {
             0
         };
@@ -4708,11 +4709,12 @@ impl App {
         self.last_content_width = right_area.width;
         self.last_content_height = right_area.height;
 
-        let (editor_area, terminal_area) = if self.show_terminal {
-            if self.terminal_maximized {
-                // Editor / welcome collapses; terminal fills the entire
-                // right column next to the Explorer. Splitter is hidden
-                // because there is nothing to drag against.
+        // While the on-screen keyboard is up, the screen is too small to
+        // host editor + terminal + keys, and the user is only typing into
+        // one pane anyway: the focused pane keeps the whole right column
+        // (riding directly above the keys) and the other folds away.
+        let (editor_area, terminal_area) =
+            if osk_h > 0 && self.focus == Pane::Terminal && self.show_terminal {
                 let zero_editor = Rect {
                     x: right_area.x,
                     y: right_area.y,
@@ -4721,38 +4723,54 @@ impl App {
                 };
                 self.terminal_splitter_y = None;
                 (zero_editor, Some(right_area))
-            } else {
-                let total_h = right_area.height;
-                let pinned = self.terminal_height.map(|h| {
-                    h.clamp(
-                        TERMINAL_HEIGHT_MIN,
-                        total_h
-                            .saturating_sub(EDITOR_HEIGHT_MIN)
-                            .max(TERMINAL_HEIGHT_MIN),
-                    )
-                });
-                let right = if let Some(term_h) = pinned {
-                    self.terminal_height = Some(term_h);
-                    Layout::default()
-                        .direction(Direction::Vertical)
-                        .constraints([
-                            Constraint::Min(EDITOR_HEIGHT_MIN),
-                            Constraint::Length(term_h),
-                        ])
-                        .split(right_area)
+            } else if osk_h > 0 {
+                self.terminal_splitter_y = None;
+                (right_area, None)
+            } else if self.show_terminal {
+                if self.terminal_maximized {
+                    // Editor / welcome collapses; terminal fills the entire
+                    // right column next to the Explorer. Splitter is hidden
+                    // because there is nothing to drag against.
+                    let zero_editor = Rect {
+                        x: right_area.x,
+                        y: right_area.y,
+                        width: right_area.width,
+                        height: 0,
+                    };
+                    self.terminal_splitter_y = None;
+                    (zero_editor, Some(right_area))
                 } else {
-                    Layout::default()
-                        .direction(Direction::Vertical)
-                        .constraints([Constraint::Percentage(65), Constraint::Percentage(35)])
-                        .split(right_area)
-                };
-                self.terminal_splitter_y = Some(right[1].y);
-                (right[0], Some(right[1]))
-            }
-        } else {
-            self.terminal_splitter_y = None;
-            (right_area, None)
-        };
+                    let total_h = right_area.height;
+                    let pinned = self.terminal_height.map(|h| {
+                        h.clamp(
+                            TERMINAL_HEIGHT_MIN,
+                            total_h
+                                .saturating_sub(EDITOR_HEIGHT_MIN)
+                                .max(TERMINAL_HEIGHT_MIN),
+                        )
+                    });
+                    let right = if let Some(term_h) = pinned {
+                        self.terminal_height = Some(term_h);
+                        Layout::default()
+                            .direction(Direction::Vertical)
+                            .constraints([
+                                Constraint::Min(EDITOR_HEIGHT_MIN),
+                                Constraint::Length(term_h),
+                            ])
+                            .split(right_area)
+                    } else {
+                        Layout::default()
+                            .direction(Direction::Vertical)
+                            .constraints([Constraint::Percentage(65), Constraint::Percentage(35)])
+                            .split(right_area)
+                    };
+                    self.terminal_splitter_y = Some(right[1].y);
+                    (right[0], Some(right[1]))
+                }
+            } else {
+                self.terminal_splitter_y = None;
+                (right_area, None)
+            };
 
         self.render_activity_bar(frame, activity_area);
 
@@ -4922,6 +4940,13 @@ impl App {
         } else {
             self.terminal_add_buttons.clear();
             self.terminal_close_buttons.clear();
+            // A hidden terminal must not keep stale hit rects alive, or
+            // `terminal_at_pos` would phantom-match clicks meant for
+            // whatever now occupies those cells (mirrors the SYSTEM
+            // panel's hidden-state reset).
+            for t in self.terminals.iter_mut() {
+                t.last_area = Rect::default();
+            }
         }
 
         let mut spans: Vec<Span> = Vec::with_capacity(20);

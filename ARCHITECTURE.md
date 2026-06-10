@@ -68,7 +68,7 @@ src/
     ├── file_finder.rs   VS Code-style Quick Open (Cmd+P) fuzzy file picker with tiered match ranking (exact filename > prefix > substring > path > subsequence)
     ├── file_tree.rs     ignore::WalkBuilder backed tree, lazy children, fs-watcher refresh, multi-select, drag-drop, bulk trash, reveal-path on Cmd+P open
     ├── hover_popup.rs   LSP hover popup (300 ms dwell, anchored at the cursor)
-    ├── osk.rs           on-screen keyboard for Termux (mouse tracking blocks the native soft keyboard): bottom-docked tappable band whose keys synthesize KeyEvents through handle_key; lower / shift / symbol layers, one-shot ctrl + alt latches
+    ├── osk.rs           on-screen keyboard for Termux (mouse tracking blocks the native soft keyboard): bottom-docked tappable band whose keys synthesize KeyEvents through handle_key; lower / shift / symbol layers, one-shot ctrl + alt latches; thumb-sized keys scale with frame height and the non-focused pane folds away while the band is up
     ├── remote.rs        Remote (SSH) sidebar widget with empty-state hero illustration
     ├── run_debug.rs     Run and Debug sidebar widget: empty state plus Run [filename] button that spawns the active file in a fresh terminal
     ├── scrollbar.rs     shared vertical- and horizontal-scrollbar geometry

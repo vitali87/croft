@@ -10861,17 +10861,78 @@ fn osk_reserves_bottom_band_above_status_bar() {
     app.osk = Some(crate::widgets::osk::Osk::new());
     draw(&mut app, 80, 40);
     let band = app.osk.as_ref().unwrap().last_area;
-    assert_eq!(band.height, crate::widgets::osk::OSK_HEIGHT);
     assert_eq!(
-        band.y,
-        40 - 1 - crate::widgets::osk::OSK_HEIGHT,
+        band.height,
+        crate::widgets::osk::band_height(40),
+        "band height scales with the frame for thumb-sized keys"
+    );
+    assert_eq!(
+        band.y + band.height,
+        40 - 1,
         "keyboard docks directly above the status bar"
     );
     assert_eq!(band.width, 80, "keyboard spans the full frame width");
+    // Default focus is the sidebar, not the terminal, so the terminal pane
+    // folds away entirely and its space goes to the keyboard.
+    assert_eq!(
+        app.terminals[0].last_area,
+        Rect::default(),
+        "non-focused terminal must fold away (and not phantom-hit-test) while the keyboard is up"
+    );
+}
+
+#[test]
+fn osk_with_editor_focus_hides_terminal_and_keeps_editor() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("notes.txt");
+    std::fs::write(&path, "hello\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_preview(&path).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.osk = Some(crate::widgets::osk::Osk::new());
+    draw(&mut app, 80, 40);
+    let band = app.osk.as_ref().unwrap().last_area;
+    assert!(band.height > 0);
+    assert_eq!(app.terminals[0].last_area, Rect::default());
+    let e = app.editor.last_full_area;
+    assert!(
+        e.height > 0,
+        "the editor must stay visible while typing into it"
+    );
+    assert!(
+        e.y + e.height <= band.y,
+        "editor must end above the keyboard band"
+    );
+}
+
+#[test]
+fn osk_with_terminal_focus_bumps_terminal_above_keyboard() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("notes.txt");
+    std::fs::write(&path, "hello\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_preview(&path).unwrap();
+    app.focus_pane(Pane::Terminal);
+    app.osk = Some(crate::widgets::osk::Osk::new());
+    draw(&mut app, 80, 40);
+    let band = app.osk.as_ref().unwrap().last_area;
     let t = app.terminals[0].last_area;
     assert!(
-        t.y + t.height <= band.y,
-        "terminal pane must end above the keyboard band, not under it"
+        t.height > 0,
+        "the terminal must stay visible while typing into it"
+    );
+    assert_eq!(
+        t.y + t.height,
+        band.y,
+        "terminal rides directly on top of the keyboard"
+    );
+    assert_eq!(
+        t.y, 0,
+        "terminal claims the editor's space from the very top"
+    );
+    assert_eq!(
+        app.editor.last_area.height, 0,
+        "the open editor folds away while typing into the terminal"
     );
 }
 

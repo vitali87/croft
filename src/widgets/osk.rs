@@ -22,8 +22,16 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 
-/// Rows the keyboard band occupies (one terminal row per key row).
-pub const OSK_HEIGHT: u16 = 5;
+/// Key rows on the keyboard (the band is `OSK_ROWS` x the per-key height).
+pub const OSK_ROWS: u16 = 5;
+
+/// Band height for a given frame: keys grow to thumb size on tall (portrait
+/// phone) frames and shrink back to one row each on short ones. Roughly 40%
+/// of the frame, quantised to whole key-row heights between 1 and 4.
+pub fn band_height(frame_height: u16) -> u16 {
+    let row_h = (u32::from(frame_height) * 2 / 5 / u32::from(OSK_ROWS)).clamp(1, 4) as u16;
+    OSK_ROWS * row_h
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum OskLayer {
@@ -142,11 +150,14 @@ impl Osk {
     }
 
     /// Recompute per-key hit rects for the current layer inside `area`.
+    /// Each key row gets an equal share of the band's height, so taller
+    /// bands directly mean taller (thumb-sized) keys.
     pub fn layout(&mut self, area: Rect) {
         self.last_area = area;
         self.keys.clear();
+        let row_h = (area.height / OSK_ROWS).max(1);
         for (i, row) in rows_for(self.layer).iter().enumerate() {
-            let y = area.y + i as u16;
+            let y = area.y + i as u16 * row_h;
             if y >= area.y.saturating_add(area.height) {
                 break;
             }
@@ -168,7 +179,7 @@ impl Osk {
                         x,
                         y,
                         width: kw,
-                        height: 1,
+                        height: row_h,
                     },
                     *key,
                 ));
@@ -178,11 +189,18 @@ impl Osk {
         }
     }
 
-    /// The key under a screen cell, if any.
+    /// The key under a screen cell, if any. The full key rect is the hit
+    /// target - including the visual gap row under tall keys - so thumb
+    /// taps that graze a key's edge still land.
     pub fn key_at(&self, col: u16, row: u16) -> Option<OskKey> {
         self.keys
             .iter()
-            .find(|(r, _)| row == r.y && col >= r.x && col < r.x.saturating_add(r.width))
+            .find(|(r, _)| {
+                row >= r.y
+                    && row < r.y.saturating_add(r.height)
+                    && col >= r.x
+                    && col < r.x.saturating_add(r.width)
+            })
             .map(|(_, k)| *k)
     }
 
@@ -302,7 +320,20 @@ pub fn render_osk(osk: &mut Osk, area: Rect, buf: &mut Buffer, panel_bg: Color) 
         let mut cell = " ".repeat(pad);
         cell.push_str(label);
         cell.push_str(&" ".repeat(w.saturating_sub(cell.chars().count())));
-        buf.set_stringn(rect.x, rect.y, &cell, w, style);
+        // Tall keys keep their last row as a panel-bg gap so adjacent key
+        // rows read as separate caps (the gap still hit-tests as the key);
+        // the label sits on the cap's vertical middle row.
+        let visual_h = if rect.height >= 2 {
+            rect.height - 1
+        } else {
+            rect.height
+        };
+        let label_y = rect.y + (visual_h.saturating_sub(1)) / 2;
+        let fill = " ".repeat(w);
+        for y in rect.y..rect.y + visual_h {
+            let text = if y == label_y { &cell } else { &fill };
+            buf.set_stringn(rect.x, y, text, w, style);
+        }
     }
 }
 
@@ -315,7 +346,7 @@ mod tests {
             x: 0,
             y: 34,
             width: 80,
-            height: OSK_HEIGHT,
+            height: OSK_ROWS,
         }
     }
 
@@ -325,7 +356,7 @@ mod tests {
         osk.layout(band());
         assert_eq!(osk.last_area, band());
         // Every row of the band carries at least one tappable key.
-        for row in band().y..band().y + OSK_HEIGHT {
+        for row in band().y..band().y + OSK_ROWS {
             assert!(
                 (0..80).any(|col| osk.key_at(col, row).is_some()),
                 "row {row} has no keys"
@@ -426,6 +457,38 @@ mod tests {
         assert_eq!(osk.layer, OskLayer::Symbols);
         assert!(osk.tap(OskKey::Symbols).is_none());
         assert_eq!(osk.layer, OskLayer::Lower);
+    }
+
+    #[test]
+    fn band_height_scales_with_frame_for_thumb_typing() {
+        assert_eq!(band_height(40), 15); // portrait phone: 3-row keys
+        assert_eq!(band_height(50), 20); // tall portrait: 4-row keys
+        assert_eq!(band_height(30), 10); // landscape: 2-row keys
+        assert_eq!(band_height(24), 5); // short frame: 1-row keys
+    }
+
+    #[test]
+    fn tall_band_lays_out_multi_row_keys_with_full_height_hit_targets() {
+        let mut osk = Osk::new();
+        let tall = Rect {
+            x: 0,
+            y: 20,
+            width: 80,
+            height: 15,
+        };
+        osk.layout(tall);
+        let r = osk.rect_for(OskKey::Char('a')).unwrap();
+        assert_eq!(r.height, 3, "15-row band gives every key 3 rows");
+        for dy in 0..3 {
+            assert_eq!(
+                osk.key_at(r.x + r.width / 2, r.y + dy),
+                Some(OskKey::Char('a')),
+                "row {dy} of a tall key must hit-test as the key"
+            );
+        }
+        // Key rows step by the full key height: q sits directly above a.
+        let q = osk.rect_for(OskKey::Char('q')).unwrap();
+        assert_eq!(q.y + 3, r.y);
     }
 
     #[test]
