@@ -9851,13 +9851,42 @@ impl App {
             self.on_mouse_moved(m.column, m.row, in_editor);
             return;
         }
-        self.hover_popup = None;
-        self.hover_diagnostic = None;
+        // The release of a press is not a new gesture, so it keeps the popup:
+        // that is what lets a press-and-hold (touch) read the hover after
+        // lifting the finger. Every other event dismisses it.
+        if !matches!(m.kind, MouseEventKind::Up(_)) {
+            self.hover_popup = None;
+            self.hover_diagnostic = None;
+        }
         // Any click dismisses the tab tooltip (selecting/closing a tab,
         // or clicking elsewhere) so it can't linger over the new state.
         self.tab_tooltip = None;
         self.tab_hover.clear();
         self.tab_hover_idx = None;
+
+        // A left press in the editor body arms the same dwell a resting
+        // pointer does: a touchscreen emits no Moved events (a finger cannot
+        // hover), so the tap itself is the "pointer arrived here" signal and
+        // the LSP hover fires HOVER_DELAY later. This matches VS Code on
+        // desktop too, where the hover re-shows when the pointer rests on a
+        // symbol after a click. Drags (selection) and scrolls cancel the
+        // pending dwell; the release does not, so a quick tap still fires.
+        match m.kind {
+            MouseEventKind::Down(MouseButton::Left)
+                if in_editor
+                    && !in_editor_scrollbar
+                    && !in_editor_hscrollbar
+                    && self.editor.tab_at(m.column, m.row).is_none() =>
+            {
+                // clear() before on_move(): a repeat tap on the same cell
+                // must restart the timer (on_move alone keys off cell change).
+                self.hover.clear();
+                self.hover
+                    .on_move(std::time::Instant::now(), m.column, m.row);
+            }
+            MouseEventKind::Up(_) => {}
+            _ => self.hover.clear(),
+        }
 
         // Termux: a tap in any editable area raises the on-screen keyboard,
         // standing in for the native soft keyboard that active mouse
@@ -9869,6 +9898,9 @@ impl App {
             && (in_editor || in_terminal || (in_tree && self.sidebar_view == SidebarView::Search))
         {
             self.osk = Some(crate::widgets::osk::Osk::new());
+            // The raise reflows the whole frame, so a dwell armed at the
+            // pre-raise coordinates would resolve the wrong buffer cell.
+            self.hover.clear();
         }
 
         match m.kind {

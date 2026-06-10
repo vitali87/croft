@@ -92,7 +92,7 @@ On macOS, the `Cmd` chords below only reach croft after you run a one-time setup
 | `Ctrl`+`Shift`+`F12` | Go to Declaration (where the server implements it; hidden for TypeScript) |
 | `Ctrl`+`F12` | Go to Type Definition |
 | `Cmd`+`F12` | Go to Implementations (concrete implementors of a trait / interface) |
-| Hover (300 ms dwell) | Hover popup: any diagnostic over the point first, then type / signature info |
+| Hover or click/tap (300 ms rest) | Hover popup: any diagnostic over the point first, then type / signature info. A click or tap arms the same dwell, so touch screens (Termux) get the popup by tapping an identifier and resting; releasing the press keeps it open |
 | Hover a tab (300 ms dwell) | Tooltip with the tab's full path (tells two same-named files apart) |
 | Right-click | Editor symbol menu: the Go to / Rename / Change All actions above |
 | `Cmd`+`E` | Toggle native modal (vim) editing (see below) |

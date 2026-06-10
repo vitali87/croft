@@ -197,6 +197,122 @@ fn hovering_a_diagnostic_on_punctuation_shows_its_message_synchronously() {
     );
 }
 
+/// Stand up an app with a real file open in the editor and one frame
+/// rendered (so every `last_*` rect is live), returning a cell inside the
+/// editor body for tap-hover tests.
+fn app_with_open_file_and_editor_cell() -> (App, tempfile::TempDir, u16, u16) {
+    let tmp = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("m.py");
+    std::fs::write(&f, "value = compute()\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&f).unwrap();
+    let backend = ratatui::backend::TestBackend::new(100, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|frame| app.render(frame)).unwrap();
+    let col = app.editor.last_inner.x + app.editor.last_gutter_width as u16 + 3;
+    let row = app.editor.last_inner.y + 1;
+    assert!(
+        rect_contains(app.editor.last_area, col, row),
+        "test cell must land inside the editor body"
+    );
+    (app, tmp, col, row)
+}
+
+fn mouse(
+    kind: crossterm::event::MouseEventKind,
+    col: u16,
+    row: u16,
+) -> crossterm::event::MouseEvent {
+    crossterm::event::MouseEvent {
+        kind,
+        column: col,
+        row,
+        modifiers: KeyModifiers::NONE,
+    }
+}
+
+#[test]
+fn tap_in_the_editor_arms_the_hover_dwell_and_release_keeps_it_armed() {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let (mut app, _tmp, col, row) = app_with_open_file_and_editor_cell();
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), col, row));
+    assert_eq!(
+        app.hover.cell(),
+        Some((col, row)),
+        "a tap is the touch equivalent of the pointer arriving: it must arm \
+         the dwell at the tapped cell (a touchscreen never emits Moved events)"
+    );
+    assert!(
+        app.hover
+            .due(std::time::Instant::now() + HOVER_DELAY, HOVER_DELAY),
+        "the tap-armed dwell must come due HOVER_DELAY after the press"
+    );
+    app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), col, row));
+    assert_eq!(
+        app.hover.cell(),
+        Some((col, row)),
+        "lifting the finger must not cancel the pending dwell, or a quick \
+         tap could never fire"
+    );
+}
+
+#[test]
+fn drag_and_scroll_cancel_a_tap_armed_hover_dwell() {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let (mut app, _tmp, col, row) = app_with_open_file_and_editor_cell();
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), col, row));
+    app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), col + 3, row));
+    assert_eq!(
+        app.hover.cell(),
+        None,
+        "a drag is a selection, not a rest: it must cancel the pending dwell"
+    );
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), col, row));
+    app.handle_mouse(mouse(MouseEventKind::ScrollDown, col, row));
+    assert_eq!(
+        app.hover.cell(),
+        None,
+        "scrolling moves the text under the tapped cell; the dwell must cancel"
+    );
+}
+
+#[test]
+fn press_and_hold_hover_popup_survives_the_finger_release() {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let (mut app, _tmp, col, row) = app_with_open_file_and_editor_cell();
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), col, row));
+    // The dwell fired while the finger was still down (press-and-hold).
+    app.hover_popup = Some(crate::widgets::hover_popup::HoverPopup::new(
+        String::from("int"),
+        (col, row),
+    ));
+    app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), col, row));
+    assert!(
+        app.hover_popup.is_some(),
+        "releasing the press must not dismiss the popup it just summoned"
+    );
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), col, row));
+    assert!(
+        app.hover_popup.is_none(),
+        "the next tap is a new gesture and dismisses the previous popup"
+    );
+}
+
+#[test]
+fn a_second_tap_on_the_same_cell_rearms_the_dwell() {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let (mut app, _tmp, col, row) = app_with_open_file_and_editor_cell();
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), col, row));
+    app.hover.mark_fired();
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), col, row));
+    assert!(
+        app.hover
+            .due(std::time::Instant::now() + HOVER_DELAY, HOVER_DELAY),
+        "a fresh tap must restart the dwell even on the same cell, else a \
+         dismissed popup could never be re-summoned by tapping again"
+    );
+}
+
 #[test]
 fn opening_a_search_hit_moves_focus_to_the_editor() {
     let tmp = tempfile::tempdir().unwrap();
