@@ -13,6 +13,7 @@ mod lsp;
 mod pdf;
 mod prefs;
 mod remote;
+mod remote_bulk;
 mod remote_connect;
 mod session_state;
 mod sheet;

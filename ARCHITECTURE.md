@@ -28,6 +28,7 @@ src/
 ├── pdf.rs               PDF rasteriser: prefers pdftoppm (poppler), falls back to macOS sips
 ├── prefs.rs             durable user preferences (color theme) persisted at ~/.config/croft/config.json
 ├── remote.rs            remote (SSH) target metadata and launch dispatch
+├── remote_bulk.rs       bulk lane for background installs: dedicated BatchMode SSH connection when key auth works (throttled shared mux otherwise) so update bytes never queue ahead of live-session keystrokes
 ├── remote_connect.rs    interactive SSH connect flow (host + password prompt phases) behind the connect dialog
 ├── session_state.rs     captures open tabs / layout so a self-update re-exec can restore them
 ├── sheet.rs             CSV / TSV / XLSX / XLS / XLSB / ODS parsing via the csv and calamine crates

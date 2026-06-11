@@ -185,8 +185,15 @@ pub fn install_only_streaming(
     // running croft shows "Updating…" for the whole build+ship, not just
     // the final remote activation.
     mark_remote_updating(&ssh);
+    // The user may already be inside the remote croft over the interactive
+    // master. Route every bulk byte of this install through a bulk lane so
+    // the transfer never queues ahead of their keystrokes in the shared
+    // TCP stream (SSH multiplexing is head-of-line blocking).
+    let bulk = crate::remote_bulk::establish(&ssh.host, &ssh.socket_path, |msg| {
+        let _ = log_tx.send(msg);
+    });
     let _ = log_tx.send(format!("Installing/updating Croft on {host_label}…"));
-    if let Err(e) = install_remote_croft_streaming(&ssh, &local_stamp, &log_tx) {
+    if let Err(e) = install_remote_croft_streaming(&ssh, &bulk.lane, &local_stamp, &log_tx) {
         clear_remote_updating(&ssh);
         std::mem::forget(ssh);
         return Err(e);
@@ -285,10 +292,11 @@ fn run_command_streaming(
 
 fn install_remote_croft_streaming(
     ssh: &SshControl,
+    lane: &crate::remote_bulk::BulkLane,
     source_stamp: &str,
     log_tx: &std::sync::mpsc::Sender<String>,
 ) -> Result<()> {
-    match try_local_cross_install_streaming(ssh, source_stamp, log_tx) {
+    match try_local_cross_install_streaming(ssh, lane, source_stamp, log_tx) {
         Ok(true) => return Ok(()),
         Ok(false) => {}
         Err(e) => {
@@ -298,10 +306,12 @@ fn install_remote_croft_streaming(
         }
     }
     let _ = log_tx.send("Syncing source tree to remote…".to_string());
-    sync_local_source_to_remote_streaming(ssh, log_tx)?;
+    sync_local_source_to_remote_streaming(ssh, lane, log_tx)?;
     let _ = log_tx
         .send("Running cargo install on remote (first time can take several minutes)…".to_string());
-    let mut cmd = ssh.command();
+    // The compile session is long-lived; keep it (and its streamed output)
+    // off the interactive master when a dedicated lane exists.
+    let mut cmd = lane.ssh_command(&ssh.socket_path);
     cmd.arg(&ssh.host).arg(remote_install_command(source_stamp));
     let status = run_command_streaming(cmd, log_tx).context("installing croft on remote")?;
     if !status.success() {
@@ -312,6 +322,7 @@ fn install_remote_croft_streaming(
 
 fn try_local_cross_install_streaming(
     ssh: &SshControl,
+    lane: &crate::remote_bulk::BulkLane,
     source_stamp: &str,
     log_tx: &std::sync::mpsc::Sender<String>,
 ) -> Result<bool> {
@@ -391,18 +402,12 @@ fn try_local_cross_install_streaming(
         anyhow::bail!("remote mkdir exited with {mkdir_status}");
     }
 
-    let ssh_e = format!(
-        "ssh -S {} -o ControlMaster=no",
-        shell_quote_for_e_arg(&ssh.socket_path),
-    );
     let dest = format!("{}:.cargo/bin/croft.new", ssh.host);
-    let _ = log_tx.send(format!("Rsyncing binary to {dest}…"));
-    let mut rsync = Command::new("rsync");
-    rsync
-        .args(["-az", "--checksum", "-e"])
-        .arg(&ssh_e)
-        .arg(&binary)
-        .arg(&dest);
+    let _ = log_tx.send(format!(
+        "Rsyncing binary to {dest} (bulk lane, {} KB/s cap)…",
+        lane.bwlimit_kbps()
+    ));
+    let rsync = ship_binary_rsync_command(lane, &ssh.socket_path, &binary, &dest);
     let rsync_status =
         run_command_streaming(rsync, log_tx).context("rsyncing croft binary to remote")?;
     if !rsync_status.success() {
@@ -422,6 +427,7 @@ fn try_local_cross_install_streaming(
 
 fn sync_local_source_to_remote_streaming(
     ssh: &SshControl,
+    lane: &crate::remote_bulk::BulkLane,
     log_tx: &std::sync::mpsc::Sender<String>,
 ) -> Result<()> {
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -434,28 +440,10 @@ fn sync_local_source_to_remote_streaming(
     if !mkdir_status.success() {
         anyhow::bail!("remote mkdir exited with {mkdir_status}");
     }
-    let ssh_e = format!(
-        "ssh -S {} -o ControlMaster=no",
-        shell_quote_for_e_arg(&ssh.socket_path),
-    );
     let mut source_arg: std::ffi::OsString = source.clone().into_os_string();
     source_arg.push("/");
     let dest = format!("{}:.cache/croft/source/", ssh.host);
-    let mut rsync = Command::new("rsync");
-    rsync
-        .args([
-            "-a",
-            "-z",
-            "--delete",
-            "--exclude=target",
-            "--exclude=.git",
-            "--exclude=.DS_Store",
-            "--exclude=assets/.DS_Store",
-            "-e",
-        ])
-        .arg(&ssh_e)
-        .arg(&source_arg)
-        .arg(&dest);
+    let rsync = source_sync_rsync_command(lane, &ssh.socket_path, &source_arg, &dest);
     let status = run_command_streaming(rsync, log_tx).context("running rsync to remote")?;
     if !status.success() {
         anyhow::bail!("rsync exited with {status}");
@@ -1239,6 +1227,46 @@ fn sync_workspace_lock(source: &Path, log: impl Fn(String)) {
     }
 }
 
+/// Build the rsync that ships the cross-built binary, routed and paced by
+/// the bulk lane so it never queues ahead of the live session's keystrokes.
+fn ship_binary_rsync_command(
+    lane: &crate::remote_bulk::BulkLane,
+    interactive_socket: &Path,
+    binary: &Path,
+    dest: &str,
+) -> Command {
+    let mut rsync = Command::new("rsync");
+    rsync.args(["-az", "--checksum"]);
+    rsync.args(lane.rsync_throttle_args());
+    rsync.arg("-e").arg(lane.rsync_ssh_arg(interactive_socket));
+    rsync.arg(binary).arg(dest);
+    rsync
+}
+
+/// Build the rsync that mirrors the source tree to the remote for the
+/// `cargo install` fallback, routed and paced by the bulk lane.
+fn source_sync_rsync_command(
+    lane: &crate::remote_bulk::BulkLane,
+    interactive_socket: &Path,
+    source_arg: &std::ffi::OsStr,
+    dest: &str,
+) -> Command {
+    let mut rsync = Command::new("rsync");
+    rsync.args([
+        "-a",
+        "-z",
+        "--delete",
+        "--exclude=target",
+        "--exclude=.git",
+        "--exclude=.DS_Store",
+        "--exclude=assets/.DS_Store",
+    ]);
+    rsync.args(lane.rsync_throttle_args());
+    rsync.arg("-e").arg(lane.rsync_ssh_arg(interactive_socket));
+    rsync.arg(source_arg).arg(dest);
+    rsync
+}
+
 fn remote_target_triple(ssh: &SshControl) -> Result<Option<&'static str>> {
     let output = ssh
         .command()
@@ -1565,7 +1593,7 @@ fn sync_via_tar(ssh: &SshControl) -> Result<()> {
 /// `std::env::temp_dir()` which is normally space-free, but the socket
 /// path is process-id + millisecond-stamped so quote defensively rather
 /// than trust the format.
-fn shell_quote_for_e_arg(p: &std::path::Path) -> String {
+pub(crate) fn shell_quote_for_e_arg(p: &std::path::Path) -> String {
     let s = p.to_string_lossy();
     if s.chars()
         .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-'))
@@ -2064,6 +2092,96 @@ Host !blocked *.internal
         let socket = ssh_control_socket_path_for_test(&dir);
         assert!(socket.starts_with(&dir));
         assert_eq!(socket.file_name().and_then(|s| s.to_str()), Some("ctl"));
+    }
+
+    fn args_of(cmd: &Command) -> Vec<String> {
+        cmd.get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    // The launch-now bug class: a background install shipping bytes through
+    // the SAME multiplexed TCP connection as the live remote session queues
+    // megabytes ahead of every keystroke (SSH head-of-line blocking) and
+    // makes the running croft unusable. Every bulk rsync must honor the
+    // bulk lane's routing and pacing.
+    #[test]
+    fn binary_ship_never_rides_the_interactive_master_when_lane_is_dedicated() {
+        let lane = crate::remote_bulk::BulkLane::new(
+            crate::remote_bulk::LaneMode::Dedicated {
+                socket_path: PathBuf::from("/tmp/bulk/ctl"),
+            },
+            512,
+        );
+        let cmd = ship_binary_rsync_command(
+            &lane,
+            Path::new("/tmp/interactive/ctl"),
+            Path::new("/tmp/target/croft"),
+            "host:.cargo/bin/croft.new",
+        );
+        let args = args_of(&cmd);
+        let e = args
+            .iter()
+            .position(|a| a == "-e")
+            .map(|i| args[i + 1].clone())
+            .expect("rsync must use an explicit -e remote shell");
+        assert!(e.contains("/tmp/bulk/ctl"));
+        assert!(!e.contains("/tmp/interactive/ctl"));
+        assert!(
+            args.iter().any(|a| a == "--bwlimit=512"),
+            "unpaced bulk saturates the uplink queue and lags the session even on its own connection"
+        );
+    }
+
+    #[test]
+    fn binary_ship_throttles_on_the_shared_mux_when_no_lane_is_available() {
+        let lane = crate::remote_bulk::BulkLane::new(crate::remote_bulk::LaneMode::SharedMux, 300);
+        let cmd = ship_binary_rsync_command(
+            &lane,
+            Path::new("/tmp/interactive/ctl"),
+            Path::new("/tmp/target/croft"),
+            "host:.cargo/bin/croft.new",
+        );
+        let args = args_of(&cmd);
+        let e = args
+            .iter()
+            .position(|a| a == "-e")
+            .map(|i| args[i + 1].clone())
+            .expect("rsync must use an explicit -e remote shell");
+        assert!(e.contains("/tmp/interactive/ctl"));
+        assert!(args.iter().any(|a| a == "--bwlimit=300"));
+        assert!(args.iter().any(|a| a == "--checksum"));
+    }
+
+    #[test]
+    fn source_sync_honors_the_bulk_lane_and_keeps_the_incremental_excludes() {
+        let lane = crate::remote_bulk::BulkLane::new(
+            crate::remote_bulk::LaneMode::Dedicated {
+                socket_path: PathBuf::from("/tmp/bulk/ctl"),
+            },
+            700,
+        );
+        let cmd = source_sync_rsync_command(
+            &lane,
+            Path::new("/tmp/interactive/ctl"),
+            std::ffi::OsStr::new("/Users/v/croft/"),
+            "host:.cache/croft/source/",
+        );
+        let args = args_of(&cmd);
+        let e = args
+            .iter()
+            .position(|a| a == "-e")
+            .map(|i| args[i + 1].clone())
+            .expect("rsync must use an explicit -e remote shell");
+        assert!(e.contains("/tmp/bulk/ctl"));
+        assert!(!e.contains("/tmp/interactive/ctl"));
+        assert!(args.iter().any(|a| a == "--bwlimit=700"));
+        assert!(
+            args.iter().any(|a| a == "--exclude=target"),
+            "shipping target/ would be gigabytes through the lane"
+        );
+        assert!(args.iter().any(|a| a == "--exclude=.git"));
+        assert!(args.iter().any(|a| a == "--delete"));
     }
 
     // Guards the exact bug class `sync_workspace_lock` exists to fix: a version
