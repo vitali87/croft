@@ -11220,3 +11220,155 @@ fn dark_blue_theme_terminal_keeps_navy_chips() {
     assert_eq!(buf[(tx, ty)].bg, navy);
     assert_eq!(buf[(add.x + 1, add.y)].bg, navy);
 }
+
+/// Render the app at 140x50 and clone the buffer for color probing.
+fn render_buf(app: &mut App) -> ratatui::buffer::Buffer {
+    let backend = ratatui::backend::TestBackend::new(140, 50);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    term.backend().buffer().clone()
+}
+
+fn count_bg(buf: &ratatui::buffer::Buffer, c: Color) -> usize {
+    let a = buf.area;
+    (a.y..a.y + a.height)
+        .flat_map(|y| (a.x..a.x + a.width).map(move |x| (x, y)))
+        .filter(|&(x, y)| buf[(x, y)].bg == c)
+        .count()
+}
+
+#[test]
+fn black_theme_paints_no_legacy_navy_or_button_blue_in_any_sidebar_view() {
+    // The Black theme replaced the old blue accent with the brand teal, so
+    // no frame may keep the legacy navy chips (#1e3a6e) or the VS Code
+    // button blue (#0967b8): sidebar titles, remote header buttons, the
+    // active editor tab, and the Initialize / Run and Debug buttons all
+    // restyle together.
+    let tmp = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("probe.txt");
+    std::fs::write(&f, "alpha\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&f).unwrap();
+    let navy = Color::Rgb(0x1e, 0x3a, 0x6e);
+    let button_blue = Color::Rgb(0x09, 0x67, 0xb8);
+    for view in [
+        SidebarView::Explorer,
+        SidebarView::Search,
+        SidebarView::SourceControl,
+        SidebarView::Remote,
+        SidebarView::RunDebug,
+    ] {
+        app.sidebar_view = view;
+        let buf = render_buf(&mut app);
+        assert_eq!(
+            count_bg(&buf, navy),
+            0,
+            "legacy navy chip leaked into {view:?} under the Black theme"
+        );
+        assert_eq!(
+            count_bg(&buf, button_blue),
+            0,
+            "legacy button blue leaked into {view:?} under the Black theme"
+        );
+    }
+}
+
+#[test]
+fn black_theme_sidebar_titles_are_chipless_brand_headers() {
+    use crate::gradient::{PANEL_TITLE_FG, rgb_color};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let buf = render_buf(&mut app);
+    let tree = app.tree.last_area;
+    assert_eq!(buf[(tree.x + 2, tree.y)].symbol(), "E");
+    assert_eq!(buf[(tree.x + 2, tree.y)].fg, rgb_color(PANEL_TITLE_FG));
+    app.sidebar_view = SidebarView::Remote;
+    let buf = render_buf(&mut app);
+    let remote = app.remote.last_area;
+    assert_eq!(buf[(remote.x + 2, remote.y)].symbol(), "R");
+    assert_eq!(buf[(remote.x + 2, remote.y)].fg, rgb_color(PANEL_TITLE_FG));
+}
+
+#[test]
+fn black_theme_remote_header_buttons_are_teal_icons() {
+    use crate::gradient::{INNER_ACCENT, rgb_color};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.sidebar_view = SidebarView::Remote;
+    let buf = render_buf(&mut app);
+    let add = app.remote.header_add_btn;
+    assert!(add.width > 0, "remote header add button must render");
+    assert_eq!(
+        buf[(add.x + add.width / 2, add.y)].fg,
+        rgb_color(INNER_ACCENT)
+    );
+}
+
+#[test]
+fn black_theme_active_editor_tab_wears_the_teal_selection_fill() {
+    use crate::gradient::{POPUP_SEL_BG, rgb_color};
+    let tmp = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("probe.txt");
+    std::fs::write(&f, "alpha\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&f).unwrap();
+    let buf = render_buf(&mut app);
+    assert!(
+        count_bg(&buf, rgb_color(POPUP_SEL_BG)) > 0,
+        "active tab must wear the muted teal fill under the Black theme"
+    );
+}
+
+#[test]
+fn black_theme_action_buttons_wear_the_brand_teal_fill() {
+    use crate::gradient::{PRIMARY_BTN_BG, rgb_color};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.sidebar_view = SidebarView::SourceControl;
+    let buf = render_buf(&mut app);
+    let init = app.source_control.last_init_repo_button_area;
+    assert!(
+        init.width > 0,
+        "Initialize button must render outside a repo"
+    );
+    assert_eq!(
+        buf[(init.x + init.width / 2, init.y + init.height / 2)].bg,
+        rgb_color(PRIMARY_BTN_BG)
+    );
+    app.sidebar_view = SidebarView::RunDebug;
+    let buf = render_buf(&mut app);
+    let run = app.run_debug.last_button_area;
+    assert!(run.width > 0, "Run and Debug button must render");
+    assert_eq!(
+        buf[(run.x + run.width / 2, run.y + run.height / 2)].bg,
+        rgb_color(PRIMARY_BTN_BG)
+    );
+}
+
+#[test]
+fn dark_blue_theme_keeps_the_legacy_blue_chrome() {
+    let tmp = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("probe.txt");
+    std::fs::write(&f, "alpha\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.theme = crate::theme::Theme::DarkBlue;
+    app.sync_focus_flags();
+    app.editor.open_pinned(&f).unwrap();
+    let buf = render_buf(&mut app);
+    let navy = Color::Rgb(0x1e, 0x3a, 0x6e);
+    let tree = app.tree.last_area;
+    assert_eq!(
+        buf[(tree.x + 2, tree.y)].bg,
+        navy,
+        "EXPLORER chip stays navy"
+    );
+    assert!(count_bg(&buf, navy) > 0, "active tab stays navy");
+    app.sidebar_view = SidebarView::RunDebug;
+    let buf = render_buf(&mut app);
+    let run = app.run_debug.last_button_area;
+    assert_eq!(
+        buf[(run.x + run.width / 2, run.y + run.height / 2)].bg,
+        Color::Rgb(0x09, 0x67, 0xb8),
+        "Run and Debug button stays VS Code blue under Croft Dark"
+    );
+}

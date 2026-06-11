@@ -17,6 +17,17 @@ pub const GRAD_BL: (u8, u8, u8) = (0x35, 0x80, 0x78);
 /// the brand identity; white text reads cleanly on top.
 pub const POPUP_SEL_BG: (u8, u8, u8) = (0x26, 0x4f, 0x4a);
 
+/// Bright teal/cyan card accent (borders, line-art illustrations, links) on
+/// the empty-state cards under the Black theme — the same value the Remote
+/// Explorer card has always used locally as `CARD_BORDER`/`LINK_FG`.
+pub const CARD_ACCENT: (u8, u8, u8) = (0x3e, 0xd8, 0xc4);
+
+/// Brand-teal fill for primary action buttons (`Initialize Repository`,
+/// `Run and Debug`, the Remote Explorer `Connect`) under the Black theme,
+/// replacing the legacy VS Code button blue (#0967b8). Same value the remote
+/// empty-state card has always used, promoted here as the single source.
+pub const PRIMARY_BTN_BG: (u8, u8, u8) = (0x0e, 0x7e, 0x76);
+
 /// VS Code's `panelTitle.activeForeground` (#E7E7E7): the chipless panel
 /// header text under the Black theme (e.g. the TERMINAL title), replacing the
 /// legacy white-on-navy chip so the gradient border alone carries the brand.

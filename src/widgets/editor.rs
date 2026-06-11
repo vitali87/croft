@@ -5064,6 +5064,23 @@ impl Widget for &mut EditorTabs {
         self.tab_close_x.clear();
         let mut cursor_x = strip.x;
         let active = self.active;
+        // Black theme (`focus_gradient` doubles as the theme flag): the
+        // active tab wears the muted teal selection fill instead of the
+        // legacy navy chip; Croft Dark keeps the navy. Sync pushes the flag
+        // to every editor, but one freshly opened since the last sync still
+        // defaults to false — propagate from its siblings so it can't flash
+        // the navy chip (or a blue body border) for a frame.
+        let brand = self.editors.iter().any(|e| e.focus_gradient);
+        if brand {
+            for ed in self.editors.iter_mut() {
+                ed.focus_gradient = true;
+            }
+        }
+        let active_tab_bg = if brand {
+            crate::gradient::rgb_color(crate::gradient::POPUP_SEL_BG)
+        } else {
+            TAB_ACTIVE_BG
+        };
         for (i, ed) in self.editors.iter().enumerate() {
             let label_text = tab_label(ed);
             let label_chars = label_text.chars().count() as u16;
@@ -5079,7 +5096,7 @@ impl Widget for &mut EditorTabs {
             }
             let is_active = i == active;
             let bg = if is_active {
-                TAB_ACTIVE_BG
+                active_tab_bg
             } else {
                 TAB_INACTIVE_BG
             };

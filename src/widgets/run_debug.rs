@@ -236,11 +236,17 @@ impl Widget for &mut RunDebugPanel {
             height: BUTTON_H,
         };
         self.last_button_area = button_area;
+        // Black theme: brand-teal button fill; Croft Dark keeps VS Code blue.
+        let button_bg = if self.focus_gradient {
+            crate::gradient::rgb_color(crate::gradient::PRIMARY_BTN_BG)
+        } else {
+            Color::Rgb(BUTTON_BG_RGB.0, BUTTON_BG_RGB.1, BUTTON_BG_RGB.2)
+        };
         crate::widgets::source_control::render_rounded_button(
             buf,
             button_area,
             label.as_str(),
-            Color::Rgb(BUTTON_BG_RGB.0, BUTTON_BG_RGB.1, BUTTON_BG_RGB.2),
+            button_bg,
             Color::Rgb(BUTTON_FG_RGB.0, BUTTON_FG_RGB.1, BUTTON_FG_RGB.2),
         );
 

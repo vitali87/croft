@@ -4558,7 +4558,17 @@ impl App {
         // Only the Black theme dresses the focused pane in the gradient
         // border; Croft Dark keeps the historical solid-blue highlight.
         let gradient = self.theme == crate::theme::Theme::Black;
-        self.editor.focus_gradient = gradient;
+        // Every editor in both groups, not just the active one (deref would
+        // only hit the active editor): a tab switch or the split group must
+        // not resurrect the legacy navy active-tab chip between syncs.
+        for ed in self.editor.editors.iter_mut() {
+            ed.focus_gradient = gradient;
+        }
+        if let Some(split) = self.editor_split.as_mut() {
+            for ed in split.editors.iter_mut() {
+                ed.focus_gradient = gradient;
+            }
+        }
         self.tree.focus_gradient = gradient;
         self.search.focus_gradient = gradient;
         self.source_control.focus_gradient = gradient;

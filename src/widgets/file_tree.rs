@@ -1059,13 +1059,24 @@ impl Widget for &mut FileTree {
         } else {
             Style::default().fg(Color::DarkGray)
         };
-        let title = Span::styled(
-            " EXPLORER ",
-            Style::default()
-                .fg(Color::White)
-                .bg(Color::Rgb(0x1e, 0x3a, 0x6e))
-                .add_modifier(Modifier::BOLD),
-        );
+        // Black theme: chipless brand header (panelTitle.activeForeground);
+        // Croft Dark keeps the historical white-on-navy chip.
+        let title = if self.focus_gradient {
+            Span::styled(
+                " EXPLORER ",
+                Style::default()
+                    .fg(crate::gradient::rgb_color(crate::gradient::PANEL_TITLE_FG))
+                    .add_modifier(Modifier::BOLD),
+            )
+        } else {
+            Span::styled(
+                " EXPLORER ",
+                Style::default()
+                    .fg(Color::White)
+                    .bg(Color::Rgb(0x1e, 0x3a, 0x6e))
+                    .add_modifier(Modifier::BOLD),
+            )
+        };
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(block_style)

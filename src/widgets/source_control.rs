@@ -455,11 +455,22 @@ impl SourceControlPanel {
             return;
         }
 
-        let blue = Color::Rgb(0x60, 0x9a, 0xfe);
+        // Black theme: the brand's teal card accent and button fill replace
+        // the legacy blue line art and VS Code button blue; Croft Dark keeps
+        // the historical blues.
+        let blue = if self.focus_gradient {
+            crate::gradient::rgb_color(crate::gradient::CARD_ACCENT)
+        } else {
+            Color::Rgb(0x60, 0x9a, 0xfe)
+        };
         let dim_blue = Color::Rgb(0x4b, 0x50, 0x5a);
         let text_white = Color::Rgb(0xff, 0xff, 0xff);
         let text_dim = Color::Rgb(0x9d, 0xa5, 0xb4);
-        let blue_bg = Color::Rgb(BUTTON_BG_RGB.0, BUTTON_BG_RGB.1, BUTTON_BG_RGB.2);
+        let blue_bg = if self.focus_gradient {
+            crate::gradient::rgb_color(crate::gradient::PRIMARY_BTN_BG)
+        } else {
+            Color::Rgb(BUTTON_BG_RGB.0, BUTTON_BG_RGB.1, BUTTON_BG_RGB.2)
+        };
 
         let mut y = card_inner.y + 2;
         let bottom = card_inner.y + card_inner.height;
@@ -959,7 +970,12 @@ impl Widget for &mut SourceControlPanel {
         if y + 3 > inner.y + inner.height {
             return;
         }
-        let blue = Color::Rgb(BUTTON_BG_RGB.0, BUTTON_BG_RGB.1, BUTTON_BG_RGB.2);
+        // Black theme: brand-teal Commit button; Croft Dark keeps VS Code blue.
+        let blue = if self.focus_gradient {
+            crate::gradient::rgb_color(crate::gradient::PRIMARY_BTN_BG)
+        } else {
+            Color::Rgb(BUTTON_BG_RGB.0, BUTTON_BG_RGB.1, BUTTON_BG_RGB.2)
+        };
         let white = Color::Rgb(BUTTON_FG_RGB.0, BUTTON_FG_RGB.1, BUTTON_FG_RGB.2);
         let split_caret_w: u16 = 3;
         let split_gap_w: u16 = 1;

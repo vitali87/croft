@@ -230,9 +230,17 @@ impl Default for RemotePanel {
 /// Teal/cyan accent color sampled from the `v0.1.122` version chip in the
 /// croft mockup. Used by the empty-state card, the secondary button outline,
 /// the illustration line art, and the learn-more link.
-const CARD_BORDER: Color = Color::Rgb(0x3e, 0xd8, 0xc4);
-const PRIMARY_BG: Color = Color::Rgb(0x0e, 0x7e, 0x76);
-const LINK_FG: Color = Color::Rgb(0x3e, 0xd8, 0xc4);
+const CARD_BORDER: Color = Color::Rgb(
+    crate::gradient::CARD_ACCENT.0,
+    crate::gradient::CARD_ACCENT.1,
+    crate::gradient::CARD_ACCENT.2,
+);
+const PRIMARY_BG: Color = Color::Rgb(
+    crate::gradient::PRIMARY_BTN_BG.0,
+    crate::gradient::PRIMARY_BTN_BG.1,
+    crate::gradient::PRIMARY_BTN_BG.2,
+);
+const LINK_FG: Color = CARD_BORDER;
 const BODY_FG: Color = Color::Rgb(0xb4, 0xbe, 0xc8);
 
 /// Background colour painted under the header `+` / refresh pill buttons so
@@ -277,7 +285,7 @@ fn render_section_header(panel: &mut RemotePanel, buf: &mut Buffer, inner: Rect)
     let refresh_x = right.saturating_sub(pill_w + 1);
     let add_x = refresh_x.saturating_sub(pill_w + 1);
     if add_x > inner.x + 5 {
-        render_header_pill(buf, add_x, inner.y, pill_w, ADD_GLYPH);
+        render_header_pill(buf, add_x, inner.y, pill_w, ADD_GLYPH, panel.focus_gradient);
         panel.header_add_btn = Rect {
             x: add_x,
             y: inner.y,
@@ -286,7 +294,14 @@ fn render_section_header(panel: &mut RemotePanel, buf: &mut Buffer, inner: Rect)
         };
     }
     if refresh_x > inner.x + 5 {
-        render_header_pill(buf, refresh_x, inner.y, pill_w, REFRESH_GLYPH);
+        render_header_pill(
+            buf,
+            refresh_x,
+            inner.y,
+            pill_w,
+            REFRESH_GLYPH,
+            panel.focus_gradient,
+        );
         panel.header_refresh_btn = Rect {
             x: refresh_x,
             y: inner.y,
@@ -296,18 +311,31 @@ fn render_section_header(panel: &mut RemotePanel, buf: &mut Buffer, inner: Rect)
     }
 }
 
-fn render_header_pill(buf: &mut Buffer, x: u16, y: u16, width: u16, glyph: char) {
-    let bg = Style::default().bg(HEADER_BTN_BG);
+fn render_header_pill(buf: &mut Buffer, x: u16, y: u16, width: u16, glyph: char, brand: bool) {
+    // Black theme (`brand`): chipless teal icon in the VS Code toolbar
+    // spirit, matching the terminal pane's -/+; Croft Dark keeps the navy
+    // pill behind the glyph.
+    let bg = if brand {
+        Style::default()
+    } else {
+        Style::default().bg(HEADER_BTN_BG)
+    };
     for dx in 0..width {
         let cell = &mut buf[(x + dx, y)];
         cell.set_char(' ');
         cell.set_style(bg);
     }
     let centre = x + width / 2;
-    let style = Style::default()
-        .bg(HEADER_BTN_BG)
-        .fg(HEADER_BTN_FG)
-        .add_modifier(Modifier::BOLD);
+    let style = if brand {
+        Style::default()
+            .fg(crate::gradient::rgb_color(crate::gradient::INNER_ACCENT))
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+            .bg(HEADER_BTN_BG)
+            .fg(HEADER_BTN_FG)
+            .add_modifier(Modifier::BOLD)
+    };
     buf.set_string(centre, y, glyph.to_string(), style);
 }
 
@@ -563,13 +591,24 @@ impl Widget for &mut RemotePanel {
         } else {
             Style::default().fg(Color::DarkGray)
         };
-        let title = Span::styled(
-            " REMOTE EXPLORER ",
-            Style::default()
-                .fg(Color::White)
-                .bg(Color::Rgb(0x1e, 0x3a, 0x6e))
-                .add_modifier(Modifier::BOLD),
-        );
+        // Black theme: chipless brand header (panelTitle.activeForeground);
+        // Croft Dark keeps the historical white-on-navy chip.
+        let title = if self.focus_gradient {
+            Span::styled(
+                " REMOTE EXPLORER ",
+                Style::default()
+                    .fg(crate::gradient::rgb_color(crate::gradient::PANEL_TITLE_FG))
+                    .add_modifier(Modifier::BOLD),
+            )
+        } else {
+            Span::styled(
+                " REMOTE EXPLORER ",
+                Style::default()
+                    .fg(Color::White)
+                    .bg(Color::Rgb(0x1e, 0x3a, 0x6e))
+                    .add_modifier(Modifier::BOLD),
+            )
+        };
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(block_style)
