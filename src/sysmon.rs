@@ -108,28 +108,6 @@ fn disk_pct_from(blocks: u64, bfree: u64, bavail: u64) -> Option<u8> {
     )
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn disk_pct_uses_dfs_used_over_used_plus_avail_formula() {
-        // 75 used, 25 available to the user: 75%.
-        assert_eq!(disk_pct_from(100, 25, 25), Some(75));
-        // Root-reserved blocks (bfree > bavail) shrink the denominator,
-        // exactly like df: used=499, avail=450 -> 499/949 -> ceil 53%.
-        assert_eq!(disk_pct_from(1000, 501, 450), Some(53));
-        // A degenerate filesystem reports nothing rather than a fake 0%.
-        assert_eq!(disk_pct_from(0, 0, 0), None);
-    }
-
-    #[test]
-    fn home_disk_pct_measures_a_real_filesystem() {
-        let pct = home_disk_pct().expect("home filesystem must be measurable");
-        assert!(pct <= 100);
-    }
-}
-
 fn peak_temp(comps: &Components) -> Option<u8> {
     let mut hottest: Option<f32> = None;
     for c in comps.iter() {
@@ -209,4 +187,26 @@ fn linux_peak_temp() -> Option<u8> {
         }
     }
     hottest.map(|t| t.clamp(0.0, 250.0).round() as u8)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn disk_pct_uses_dfs_used_over_used_plus_avail_formula() {
+        // 75 used, 25 available to the user: 75%.
+        assert_eq!(disk_pct_from(100, 25, 25), Some(75));
+        // Root-reserved blocks (bfree > bavail) shrink the denominator,
+        // exactly like df: used=499, avail=450 -> 499/949 -> ceil 53%.
+        assert_eq!(disk_pct_from(1000, 501, 450), Some(53));
+        // A degenerate filesystem reports nothing rather than a fake 0%.
+        assert_eq!(disk_pct_from(0, 0, 0), None);
+    }
+
+    #[test]
+    fn home_disk_pct_measures_a_real_filesystem() {
+        let pct = home_disk_pct().expect("home filesystem must be measurable");
+        assert!(pct <= 100);
+    }
 }
