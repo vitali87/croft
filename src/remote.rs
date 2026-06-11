@@ -160,6 +160,13 @@ pub fn install_only_streaming(
     can_launch_tx: std::sync::mpsc::Sender<()>,
 ) -> Result<AdoptedMaster> {
     let host_label = adopted.host.clone();
+    // Mirror every line into ~/.cache/croft/install.log so the install
+    // remains diagnosable after the connect dialog is gone.
+    let log_tx = spawn_log_tee(install_log_path(), log_tx);
+    let _ = log_tx.send(format!(
+        "Install session for {host_label} (croft {})",
+        env!("CARGO_PKG_VERSION")
+    ));
     let _ = log_tx.send(format!("Adopting control socket for {host_label}…"));
     let ssh = SshControl::adopt(adopted.clone());
     let _ = log_tx.send("Hashing local source tree…".to_string());
@@ -201,6 +208,45 @@ pub fn install_only_streaming(
     let _ = log_tx.send("Install complete.".to_string());
     std::mem::forget(ssh);
     Ok(adopted)
+}
+
+/// Tee every install log line into a persistent file so a backgrounded
+/// install stays diagnosable after its dialog is gone (the line saying WHY
+/// the fast cross-build was skipped used to vanish with the connect
+/// dialog). Lines flow through to `downstream` unchanged; file IO is
+/// best-effort and never blocks the install.
+pub(crate) fn spawn_log_tee(
+    path: PathBuf,
+    downstream: std::sync::mpsc::Sender<String>,
+) -> std::sync::mpsc::Sender<String> {
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let mut file = std::fs::File::create(&path).ok();
+        while let Ok(line) = rx.recv() {
+            if let Some(f) = file.as_mut() {
+                use std::io::Write as _;
+                let secs = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let _ = writeln!(f, "[{secs}] {line}");
+            }
+            // The dialog may be gone (user already inside the remote
+            // croft); keep writing the file regardless.
+            let _ = downstream.send(line);
+        }
+    });
+    tx
+}
+
+fn install_log_path() -> PathBuf {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    home.join(".cache").join("croft").join("install.log")
 }
 
 pub const DROP_TO_LOCAL_EXIT_CODE: i32 = 88;
@@ -1696,9 +1742,18 @@ croft_ensure_build_toolchain
 # default `cargo install -j <all cores>` would pin the machine. (nproc+1)/2
 # stays >=1 even on a single core; nice is best-effort if present.
 CROFT_JOBS=$(( ( $(nproc 2>/dev/null || echo 2) + 1 ) / 2 ))
+# A live croft session on this box outranks the build entirely: the user
+# is typing into a shell that shares these cores, RAM, and disk. Half the
+# cores still wrecks a small VPS, so drop to one compile job and put all
+# codegen IO in the idle class; the update simply takes longer.
+if pgrep -x croft >/dev/null 2>&1; then
+  CROFT_JOBS=1
+fi
 CROFT_NICE=""
 if command -v nice >/dev/null 2>&1; then CROFT_NICE="nice -n 19"; fi
-$CROFT_NICE cargo install --path "$HOME/.cache/croft/source" --jobs "$CROFT_JOBS" --force --locked
+CROFT_IONICE=""
+if command -v ionice >/dev/null 2>&1; then CROFT_IONICE="ionice -c3"; fi
+$CROFT_NICE $CROFT_IONICE cargo install --path "$HOME/.cache/croft/source" --jobs "$CROFT_JOBS" --force --locked
 mkdir -p "$HOME/.cache/croft"
 printf %s {stamp} > "$HOME/.cache/croft/install-stamp"
 rm -f "$HOME/.cache/croft/updating"
@@ -1996,6 +2051,74 @@ Host !blocked *.internal
         assert!(command.contains("cargo install --path \"$HOME/.cache/croft/source\""));
         assert!(command.contains("rustup.rs"));
         assert!(command.contains("printf %s 'abc123' > \"$HOME/.cache/croft/install-stamp\""));
+    }
+
+    // The 2026-06-12 "horrendous typing latency on various" report: the
+    // fast cross-build silently fell back to `cargo install` ON the remote
+    // box, and even niced, a rustc compile on a small VPS wrecks the live
+    // session sharing it. When a croft session is running on the box, the
+    // compile must yield everything: one job and idle-class IO.
+    #[test]
+    fn remote_install_compile_yields_to_a_live_croft_session() {
+        let command = remote_install_command("abc123");
+        assert!(
+            command.contains("pgrep -x croft"),
+            "must detect a live croft session on the box"
+        );
+        assert!(
+            command.contains("CROFT_JOBS=1"),
+            "a live session drops the compile to a single job"
+        );
+        assert!(
+            command.contains("ionice") && command.contains("-c3"),
+            "codegen writes must run in the idle IO class so the session's PTY never waits on them"
+        );
+        let gate = command.find("pgrep -x croft").unwrap();
+        let install = command.find("cargo install --path").unwrap();
+        assert!(gate < install, "the session check must precede the compile");
+    }
+
+    // A backgrounded install's log lines died with the connect dialog,
+    // which is why the various fallback went undiagnosed. Every line must
+    // also land in a persistent local file.
+    #[test]
+    fn install_log_tee_writes_lines_to_file_and_forwards_them_unchanged() {
+        let dir = std::env::temp_dir().join(format!("croft-log-tee-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("install.log");
+        let (down_tx, down_rx) = std::sync::mpsc::channel::<String>();
+        let tee = spawn_log_tee(path.clone(), down_tx);
+        tee.send(String::from("Cross-compiling croft locally…"))
+            .unwrap();
+        tee.send(String::from("Local cross-build skipped (zig missing)"))
+            .unwrap();
+        let timeout = std::time::Duration::from_secs(2);
+        assert_eq!(
+            down_rx.recv_timeout(timeout).unwrap(),
+            "Cross-compiling croft locally…",
+            "downstream consumers must still receive every line"
+        );
+        assert_eq!(
+            down_rx.recv_timeout(timeout).unwrap(),
+            "Local cross-build skipped (zig missing)"
+        );
+        drop(tee);
+        let deadline = std::time::Instant::now() + timeout;
+        let mut contents = String::new();
+        while std::time::Instant::now() < deadline {
+            contents = std::fs::read_to_string(&path).unwrap_or_default();
+            if contents.contains("zig missing") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(contents.contains("Cross-compiling croft locally…"));
+        assert!(
+            contents.contains("Local cross-build skipped (zig missing)"),
+            "the skip REASON is the whole point of the persistent log"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
