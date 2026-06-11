@@ -400,8 +400,12 @@ fn try_local_cross_install_streaming(
     sync_workspace_lock(&source, |msg| {
         let _ = log_tx.send(msg);
     });
+    // Belt and braces with the startup raise: the zig linker dies with
+    // ProcessFdQuotaExceeded under macOS's default 256-fd soft limit, and
+    // the resulting silent fallback compiles on the remote box instead.
+    let fd_limit = raise_fd_limit();
     let _ = log_tx.send(format!(
-        "Cross-compiling croft locally for {triple} (niced, {jobs} jobs)…"
+        "Cross-compiling croft locally for {triple} (niced, {jobs} jobs, fd limit {fd_limit})…"
     ));
     let mut zigbuild = Command::new("nice");
     zigbuild
@@ -1225,6 +1229,45 @@ fn install_remote_croft(ssh: &SshControl, source_stamp: &str) -> Result<()> {
     Ok(())
 }
 
+/// Raise this process's soft RLIMIT_NOFILE as far as the hard limit
+/// allows (capped at 1M). macOS launchd hands GUI/login processes a soft
+/// limit of 256; croft's cross-link opens ~250 rlibs at once, so the zig
+/// linker spawned under that default dies with ProcessFdQuotaExceeded and
+/// the installer silently falls back to compiling on the remote box —
+/// the 2026-06-12 "horrendous latency on various" root cause. Children
+/// inherit the raised limit. Returns the resulting soft limit.
+pub(crate) fn raise_fd_limit() -> u64 {
+    let mut lim = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } != 0 {
+        return 0;
+    }
+    let ceiling: libc::rlim_t = 1 << 20;
+    let target = if lim.rlim_max == libc::RLIM_INFINITY {
+        ceiling
+    } else {
+        lim.rlim_max.min(ceiling)
+    };
+    // macOS rejects soft limits above kern.maxfilesperproc even when the
+    // hard limit reads as unlimited, so step down through sane sizes
+    // until one sticks. Never lower an already-high limit.
+    for candidate in [target, 65536, 10240] {
+        if candidate <= lim.rlim_cur {
+            break;
+        }
+        let raised = libc::rlimit {
+            rlim_cur: candidate,
+            rlim_max: lim.rlim_max,
+        };
+        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raised) } == 0 {
+            return candidate;
+        }
+    }
+    lim.rlim_cur
+}
+
 fn cross_compile_available() -> bool {
     // Probe the cargo-zigbuild binary directly: `cargo zigbuild --version`
     // is rejected by cargo-zigbuild >=0.22 (the `zigbuild` subcommand has
@@ -1366,6 +1409,7 @@ fn try_local_cross_install(ssh: &SshControl, source_stamp: &str) -> Result<bool>
 
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     sync_workspace_lock(&source, |msg| println!("{msg}"));
+    raise_fd_limit();
     println!("Cross-compiling croft locally for {triple}...");
     let status = Command::new("cargo")
         .args([
@@ -2305,6 +2349,19 @@ Host !blocked *.internal
         );
         assert!(args.iter().any(|a| a == "--exclude=.git"));
         assert!(args.iter().any(|a| a == "--delete"));
+    }
+
+    // The 2026-06-12 root cause on various: croft inherited macOS's default
+    // 256-fd soft limit, the zig linker needed ~250 rlibs open at once and
+    // died with ProcessFdQuotaExceeded, and the installer silently fell
+    // back to compiling on the remote box under the live session.
+    #[test]
+    fn raise_fd_limit_lifts_the_soft_limit_beyond_the_linkers_needs() {
+        let soft = raise_fd_limit();
+        assert!(
+            soft >= 4096,
+            "croft's cross-link opens ~250 rlibs plus zig's own files; a {soft}-fd soft limit reproduces ProcessFdQuotaExceeded"
+        );
     }
 
     // Guards the exact bug class `sync_workspace_lock` exists to fix: a version

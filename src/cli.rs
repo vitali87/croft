@@ -91,6 +91,10 @@ pub enum CliCommand {
 
 impl Cli {
     pub fn run(self) -> Result<()> {
+        // macOS launchd starts croft with a 256-fd soft limit; the editor's
+        // PTYs/watchers/LSPs and especially the spawned cross-link (~250
+        // rlibs open at once) need far more. Children inherit the raise.
+        crate::remote::raise_fd_limit();
         match self.command {
             Some(CliCommand::SetupTerminal { font, size, yes }) => setup_terminal(&font, size, yes),
             Some(CliCommand::Keys { mouse }) => keys_diagnostic(mouse),
