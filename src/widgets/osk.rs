@@ -443,6 +443,16 @@ impl Osk {
                 }
                 Some(ev)
             }
+            // Shift+Tab on a one-shot Upper layer synthesizes BackTab, the
+            // only path by which the soft keyboard can emit the `ESC [ Z`
+            // backtab sequence (key_to_bytes). Consoles like Claude Code
+            // cycle modes on backtab, unreachable otherwise since the OSK's
+            // Shift is a layer toggle, not a modifier carried by take_latches.
+            // Caps lock (letters-only) deliberately does not trigger this.
+            OskKey::Code(KeyCode::Tab) if self.layer == OskLayer::Upper => {
+                self.layer = OskLayer::Lower;
+                Some(KeyEvent::new(KeyCode::BackTab, self.take_latches()))
+            }
             OskKey::Code(code) => Some(KeyEvent::new(code, self.take_latches())),
         }
     }
@@ -633,6 +643,29 @@ mod tests {
         osk.tap(OskKey::Shift);
         osk.tap(OskKey::Shift);
         assert_eq!(osk.layer, OskLayer::Lower);
+    }
+
+    #[test]
+    fn shift_tab_synthesizes_backtab() {
+        let mut osk = Osk::new();
+        // Plain Tab is forward-tab, no modifier.
+        let ev = osk.tap(OskKey::Code(KeyCode::Tab)).unwrap();
+        assert_eq!(ev.code, KeyCode::Tab);
+        assert_eq!(ev.modifiers, KeyModifiers::NONE);
+
+        // Shift then Tab emits BackTab (the `ESC [ Z` backtab sequence) so
+        // consoles like Claude Code can cycle modes from the soft keyboard.
+        assert!(osk.tap(OskKey::Shift).is_none());
+        assert_eq!(osk.layer, OskLayer::Upper);
+        let ev = osk.tap(OskKey::Code(KeyCode::Tab)).unwrap();
+        assert_eq!(ev.code, KeyCode::BackTab);
+        // The one-shot shift is consumed, mirroring character taps.
+        assert_eq!(osk.layer, OskLayer::Lower);
+
+        // Caps lock (letters-only) leaves Tab as a forward-tab.
+        assert!(osk.tap(OskKey::Caps).is_none());
+        let ev = osk.tap(OskKey::Code(KeyCode::Tab)).unwrap();
+        assert_eq!(ev.code, KeyCode::Tab);
     }
 
     #[test]
