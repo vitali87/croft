@@ -17,6 +17,11 @@ pub const GRAD_BL: (u8, u8, u8) = (0x35, 0x80, 0x78);
 /// the brand identity; white text reads cleanly on top.
 pub const POPUP_SEL_BG: (u8, u8, u8) = (0x26, 0x4f, 0x4a);
 
+/// VS Code's `panelTitle.activeForeground` (#E7E7E7): the chipless panel
+/// header text under the Black theme (e.g. the TERMINAL title), replacing the
+/// legacy white-on-navy chip so the gradient border alone carries the brand.
+pub const PANEL_TITLE_FG: (u8, u8, u8) = (0xe7, 0xe7, 0xe7);
+
 /// Muted brand teal (the gradient's bottom-right corner) used as the inner
 /// stroke accent under the Black theme — input-box focus rings, text cursors,
 /// chevrons, and magnifier glyphs — replacing the legacy bright-blue

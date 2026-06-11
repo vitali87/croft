@@ -970,6 +970,10 @@ pub struct App {
     /// is open (closing the last one would leave the pane empty, which we
     /// explicitly forbid) or the pane is hidden.
     terminal_close_buttons: Vec<Rect>,
+    /// Last pointer cell reported by a `Moved` event. Render-time hover
+    /// hit-testing (the Black theme's teal pill behind the terminal `-`/`+`
+    /// buttons) reads this instead of tracking enter/leave transitions.
+    pointer_cell: Option<(u16, u16)>,
     /// On-screen keyboard for touch-only environments (Termux). `Some`
     /// while the bottom keyboard band is visible; taps on its keys
     /// synthesize `KeyEvent`s through `handle_key`, so they reach the
@@ -1491,6 +1495,7 @@ impl App {
             terminal_splitter_y: None,
             terminal_add_buttons: Vec::new(),
             terminal_close_buttons: Vec::new(),
+            pointer_cell: None,
             osk: None,
             osk_auto: crate::iterm2_inline::detect_osk_auto(),
             last_content_width: 0,
@@ -4944,10 +4949,12 @@ impl App {
                 frame.render_widget(t, cols[i]);
             }
             let show_close = self.terminals.len() > 1;
+            let brand = self.theme == crate::theme::Theme::Black;
             self.terminal_add_buttons.clear();
             self.terminal_close_buttons.clear();
             for col in cols.iter().take(self.terminals.len()) {
-                let (add_rect, close_rect) = paint_terminal_pane_buttons(frame, *col, show_close);
+                let (add_rect, close_rect) =
+                    paint_terminal_pane_buttons(frame, *col, show_close, brand, self.pointer_cell);
                 if let Some(r) = add_rect {
                     self.terminal_add_buttons.push(r);
                 }
@@ -9868,6 +9875,7 @@ impl App {
         let in_editor_hscrollbar = rect_contains(self.editor.last_hscrollbar, m.column, m.row);
 
         if matches!(m.kind, MouseEventKind::Moved) {
+            self.pointer_cell = Some((m.column, m.row));
             self.on_mouse_moved(m.column, m.row, in_editor);
             return;
         }
@@ -13591,17 +13599,34 @@ fn paint_terminal_pane_buttons(
     frame: &mut ratatui::Frame,
     area: Rect,
     show_close_button: bool,
+    brand: bool,
+    pointer: Option<(u16, u16)>,
 ) -> (Option<Rect>, Option<Rect>) {
     let add_w = TERMINAL_ADD_LABEL.chars().count() as u16;
     let close_w = TERMINAL_CLOSE_LABEL.chars().count() as u16;
     if area.height == 0 {
         return (None, None);
     }
-    let style = Style::default()
-        .fg(Color::White)
-        .bg(Color::Rgb(0x1e, 0x3a, 0x6e))
-        .add_modifier(Modifier::BOLD);
     let y = area.y;
+    // Black theme (`brand`): quiet teal icons in the VS Code toolbar spirit
+    // (`icon.foreground`), with the muted dark-teal pill on hover standing in
+    // for `toolbar.hoverBackground`. Croft Dark keeps the navy chips.
+    let style_at = |x: u16, w: u16| -> Style {
+        if !brand {
+            return Style::default()
+                .fg(Color::White)
+                .bg(Color::Rgb(0x1e, 0x3a, 0x6e))
+                .add_modifier(Modifier::BOLD);
+        }
+        let hovered = pointer.is_some_and(|(px, py)| py == y && px >= x && px < x + w);
+        if hovered {
+            Style::default()
+                .fg(Color::White)
+                .bg(crate::gradient::rgb_color(crate::gradient::POPUP_SEL_BG))
+        } else {
+            Style::default().fg(crate::gradient::rgb_color(crate::gradient::INNER_ACCENT))
+        }
+    };
     let mut add_rect: Option<Rect> = None;
     let mut close_rect: Option<Rect> = None;
 
@@ -13609,7 +13634,7 @@ fn paint_terminal_pane_buttons(
         let x = area.x + area.width - add_w - 1;
         frame
             .buffer_mut()
-            .set_string(x, y, TERMINAL_ADD_LABEL, style);
+            .set_string(x, y, TERMINAL_ADD_LABEL, style_at(x, add_w));
         add_rect = Some(Rect {
             x,
             y,
@@ -13622,7 +13647,7 @@ fn paint_terminal_pane_buttons(
         let x = area.x + area.width - add_w - close_w - 1;
         frame
             .buffer_mut()
-            .set_string(x, y, TERMINAL_CLOSE_LABEL, style);
+            .set_string(x, y, TERMINAL_CLOSE_LABEL, style_at(x, close_w));
         close_rect = Some(Rect {
             x,
             y,

@@ -11116,3 +11116,107 @@ fn osk_tap_types_into_file_finder_query() {
         "OSK taps must route into open modals, not be swallowed by their mouse gates"
     );
 }
+
+/// Render once and return (title 'T' cell coords, add-button rect).
+fn terminal_header_probe(app: &mut App) -> ((u16, u16), Rect) {
+    let backend = ratatui::backend::TestBackend::new(140, 50);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let area = app.terminal().last_area;
+    assert!(
+        area.width > 20 && area.height > 2,
+        "terminal pane must render"
+    );
+    let buf = term.backend().buffer();
+    let tx = (area.x..area.x + area.width)
+        .find(|&x| buf[(x, area.y)].symbol() == "T")
+        .expect("TERMINAL title must sit on the top border");
+    let add = app.terminal_add_buttons[0];
+    ((tx, area.y), add)
+}
+
+#[test]
+fn black_theme_terminal_title_is_chipless_brand_header() {
+    // Under Croft Black the TERMINAL header drops the legacy navy chip and
+    // wears the VS Code panel-title foreground (#E7E7E7) straight on the
+    // border row, mirroring panelTitle.activeForeground.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    assert_eq!(app.theme, crate::theme::Theme::Black);
+    let backend = ratatui::backend::TestBackend::new(140, 50);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let ((tx, ty), _) = terminal_header_probe(&mut app);
+    term.draw(|f| app.render(f)).unwrap();
+    let buf = term.backend().buffer();
+    let navy = Color::Rgb(0x1e, 0x3a, 0x6e);
+    assert_eq!(buf[(tx, ty)].fg, Color::Rgb(0xe7, 0xe7, 0xe7));
+    assert_ne!(
+        buf[(tx, ty)].bg,
+        navy,
+        "Black theme must not paint the navy chip"
+    );
+}
+
+#[test]
+fn black_theme_terminal_buttons_are_teal_icons_not_navy_chips() {
+    use crate::gradient::{INNER_ACCENT, rgb_color};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let (_, add) = terminal_header_probe(&mut app);
+    let backend = ratatui::backend::TestBackend::new(140, 50);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let buf = term.backend().buffer();
+    let plus = (add.x + 1, add.y);
+    assert_eq!(buf[plus].symbol(), "+");
+    assert_eq!(buf[plus].fg, rgb_color(INNER_ACCENT));
+    assert_ne!(
+        buf[plus].bg,
+        Color::Rgb(0x1e, 0x3a, 0x6e),
+        "Black theme must not paint the navy chip behind the + button"
+    );
+}
+
+#[test]
+fn black_theme_terminal_button_hover_paints_teal_pill() {
+    use crate::gradient::{POPUP_SEL_BG, rgb_color};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let (_, add) = terminal_header_probe(&mut app);
+    app.handle_mouse(crossterm::event::MouseEvent {
+        kind: crossterm::event::MouseEventKind::Moved,
+        column: add.x + 1,
+        row: add.y,
+        modifiers: KeyModifiers::NONE,
+    });
+    let backend = ratatui::backend::TestBackend::new(140, 50);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let buf = term.backend().buffer();
+    let plus = (add.x + 1, add.y);
+    assert_eq!(
+        buf[plus].bg,
+        rgb_color(POPUP_SEL_BG),
+        "hovered button wears the teal pill"
+    );
+    assert_eq!(buf[plus].fg, Color::White);
+}
+
+#[test]
+fn dark_blue_theme_terminal_keeps_navy_chips() {
+    // Croft Dark keeps its coherent all-blue look: navy chip on the title
+    // and both buttons, exactly as before the Black-theme restyle.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.theme = crate::theme::Theme::DarkBlue;
+    app.sync_focus_flags();
+    let ((tx, ty), add) = terminal_header_probe(&mut app);
+    let backend = ratatui::backend::TestBackend::new(140, 50);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let buf = term.backend().buffer();
+    let navy = Color::Rgb(0x1e, 0x3a, 0x6e);
+    assert_eq!(buf[(tx, ty)].bg, navy);
+    assert_eq!(buf[(add.x + 1, add.y)].bg, navy);
+}
