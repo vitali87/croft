@@ -759,10 +759,10 @@ mod android_trash {
     }
 
     fn trash_dir() -> io::Result<PathBuf> {
-        if let Some(xdg) = std::env::var_os("XDG_DATA_HOME") {
-            if !xdg.is_empty() {
-                return Ok(PathBuf::from(xdg).join("Trash"));
-            }
+        if let Some(xdg) = std::env::var_os("XDG_DATA_HOME")
+            && !xdg.is_empty()
+        {
+            return Ok(PathBuf::from(xdg).join("Trash"));
         }
         let home = std::env::var_os("HOME").ok_or_else(|| io::Error::other("HOME is not set"))?;
         Ok(PathBuf::from(home).join(".local/share/Trash"))
