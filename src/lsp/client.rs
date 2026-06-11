@@ -218,6 +218,10 @@ pub struct LspClient {
     // dropped, not when spawn() returns. Without this the server is
     // SIGKILLed mid-handshake and the mainloop reader sees EOF.
     child: Child,
+    // The async-lsp MainLoop driving this client. Aborted on drop, before
+    // `server` (its ServerSocket sender) is dropped, so the loop never polls
+    // a closed event channel and panics with "Sender is alive" (lib.rs:553).
+    mainloop_task: tokio::task::JoinHandle<()>,
 }
 
 impl LspClient {
@@ -292,7 +296,7 @@ impl LspClient {
         });
 
         let mainloop_name = name.clone();
-        tokio::spawn(async move {
+        let mainloop_task = tokio::spawn(async move {
             if let Err(e) = mainloop.run_buffered(stdout, stdin).await {
                 log_file::log(&format!("lsp[{mainloop_name}] mainloop exited: {e}"));
             }
@@ -320,6 +324,7 @@ impl LspClient {
             capabilities: init.capabilities,
             name,
             child,
+            mainloop_task,
         })
     }
 
@@ -590,11 +595,21 @@ impl LspClient {
             .context("semantic_tokens_range")
     }
 
-    pub async fn shutdown(mut self) -> Result<()> {
+    pub async fn shutdown(&mut self) -> Result<()> {
         self.server.shutdown(()).await.context("lsp shutdown")?;
         self.server.exit(()).context("lsp exit")?;
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), self.child.wait()).await;
         Ok(())
+    }
+}
+
+impl Drop for LspClient {
+    fn drop(&mut self) {
+        // Abort the MainLoop before `server` (its ServerSocket) drops below.
+        // Otherwise the loop polls a closed event channel and panics with
+        // "Sender is alive" (async-lsp lib.rs:553). Graceful shutdown() leaves
+        // the task already finished, so this is a no-op in that case.
+        self.mainloop_task.abort();
     }
 }
 
@@ -802,6 +817,7 @@ mod tests {
             )
             .await?;
             assert_eq!(client.name(), expected_name);
+            let mut client = client;
             client.shutdown().await
         });
 
