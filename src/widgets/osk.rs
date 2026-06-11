@@ -29,7 +29,9 @@
 //! foldable split with no duplicated letter keys. The number/top rows split
 //! 5|5 (`esc 12345 | tab qwert`); the home and bottom rows split one column
 //! earlier (`caps asdf | g hjkl`, `shift zxcv | b nm`) so `g` and `b` land
-//! in the right thumb cluster rather than at the left cluster's far edge.
+//! in the right thumb cluster rather than at the left cluster's far edge. In
+//! split mode the top-right cluster also gains a `\` parked at the far edge
+//! (`y u i o p \`); the qwerty letters keep their natural order.
 
 use crate::gradient::{PRIMARY_BTN_BG, rgb_color};
 use crate::theme::Theme;
@@ -216,9 +218,21 @@ fn rows_for(layer: OskLayer, caps: bool, split: bool) -> Vec<Vec<KeySlot>> {
     } else {
         "&123"
     };
+    // In split mode the right thumb cluster's top row gains a `\` parked at
+    // the band's far edge; the qwerty letters keep their natural order and
+    // positions. Letters only — the symbols layer's top row carries no
+    // letters and already has its own `\`.
+    let alpha = matches!(layer, OskLayer::Lower | OskLayer::Upper);
+    let top_row = if split && alpha {
+        let mut s = String::from(top);
+        s.push('\\');
+        row(tab(), &s, None)
+    } else {
+        row(tab(), top, None)
+    };
     let mut rows = vec![
         row(esc(), digits, Some(bksp())),
-        row(tab(), top, None),
+        top_row,
         row(caps_k(), home, Some(enter())),
         row(shift(), low, None),
     ];
@@ -1014,6 +1028,30 @@ mod tests {
         }
         // Both halves carry a space bar.
         assert_eq!(osk.count_of(OskKey::Char(' ')), 2);
+    }
+
+    #[test]
+    fn split_top_right_parks_backslash_at_the_edge_keeping_letter_order() {
+        let mut osk = Osk::new();
+        osk.split = true;
+        osk.layout(wide());
+        // The right thumb cluster's top row reads `y u i o p \`: the qwerty
+        // letters keep their natural left-to-right order and a `\` is parked
+        // at the far edge.
+        let xs: Vec<u16> = ['y', 'u', 'i', 'o', 'p', '\\']
+            .iter()
+            .map(|&c| osk.rect_for(OskKey::Char(c)).unwrap().x)
+            .collect();
+        for w in xs.windows(2) {
+            assert!(w[0] < w[1], "split top-right keys must be left-to-right");
+        }
+        // Backslash appears only in the split alpha layout, not when merged.
+        osk.split = false;
+        osk.layout(band());
+        assert!(
+            osk.rect_for(OskKey::Char('\\')).is_none(),
+            "merged lower layer must not expose backslash"
+        );
     }
 
     #[test]
