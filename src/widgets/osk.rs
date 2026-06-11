@@ -185,8 +185,8 @@ fn rows_for(layer: OskLayer, caps: bool, split: bool) -> Vec<Vec<KeySlot>> {
             slot("↓", "", OskKey::Code(KeyCode::Down), 4, 6),
             slot("↑", "", OskKey::Code(KeyCode::Up), 4, 6),
             slot("→", "", OskKey::Code(KeyCode::Right), 4, 6),
-            slot("split", "][", OskKey::SplitToggle, 6, 7),
-            slot("⌄", "", OskKey::Hide, 4, 5),
+            slot("split", "][", OskKey::SplitToggle, 4, 5),
+            slot("⌄", "", OskKey::Hide, 8, 10),
         ];
         if split {
             // Both thumbs get a space bar, Gboard-style.
@@ -306,13 +306,47 @@ impl Osk {
         let row_h = (area.height / OSK_ROWS).max(1);
         let gap_w = area.width / SPLIT_GAP_DIV;
         let half_w = (area.width - gap_w) / 2;
-        for (i, row) in self.rows().iter().enumerate() {
+        let rows = self.rows();
+        // In merged mode the Enter key grows into a two-row L on the right,
+        // like a physical keyboard. The home row (the one carrying Enter) is
+        // solved at full width; the row directly below it (shift) reserves
+        // Enter's column so its letters stop just left of the cap - which is
+        // what nudges the trailing `/` in off the screen edge.
+        let tall_enter_row = if self.split_active {
+            None
+        } else {
+            rows.iter()
+                .position(|r| r.iter().any(|s| s.key == OskKey::Code(KeyCode::Enter)))
+        };
+        let mut enter_x: Option<u16> = None;
+        for (i, row) in rows.iter().enumerate() {
             let y = area.y + i as u16 * row_h;
             if y >= area.y.saturating_add(area.height) {
                 break;
             }
+            // The shift row keeps clear of the Enter column carried down from
+            // the home row above it.
+            let region_w = match (tall_enter_row, enter_x) {
+                (Some(hr), Some(ex)) if i == hr + 1 => ex.saturating_sub(area.x).saturating_sub(1),
+                _ => area.width,
+            };
             match row.iter().position(|s| s.key == OskKey::Gap) {
-                None => self.place_half(row, area.x, area.width, y, row_h),
+                None => {
+                    self.place_half(row, area.x, region_w, y, row_h);
+                    // Promote the just-placed Enter to a two-row-tall cap and
+                    // record its column for the row below to clear.
+                    if tall_enter_row == Some(i)
+                        && let Some((rect, _)) = self
+                            .keys
+                            .iter_mut()
+                            .rev()
+                            .find(|(_, k)| *k == OskKey::Code(KeyCode::Enter))
+                    {
+                        let max_h = area.height.saturating_sub(rect.y - area.y);
+                        rect.height = (row_h * 2).min(max_h);
+                        enter_x = Some(rect.x);
+                    }
+                }
                 Some(at) => {
                     self.place_half(&row[..at], area.x, half_w, y, row_h);
                     self.keys.push((
@@ -759,6 +793,67 @@ mod tests {
         assert_eq!(ctrl.y, alt.y, "ctrl and alt share the bottom row");
         assert!(ctrl.y > shift.y, "ctrl lives below the shift row");
         assert!(ctrl.x < alt.x && alt.x < space.x, "order: ctrl, alt, space");
+    }
+
+    #[test]
+    fn collapse_button_outgrows_split() {
+        let mut osk = Osk::new();
+        osk.layout(wide());
+        let hide = osk.rect_for(OskKey::Hide).unwrap();
+        let split = osk.rect_for(OskKey::SplitToggle).unwrap();
+        assert!(
+            hide.width >= split.width * 2,
+            "collapse ({}) must be about twice the split key ({})",
+            hide.width,
+            split.width
+        );
+    }
+
+    #[test]
+    fn merged_enter_is_a_two_row_l_and_pushes_slash_off_the_edge() {
+        let mut osk = Osk::new();
+        let tall = Rect {
+            x: 0,
+            y: 20,
+            width: 80,
+            height: 15,
+        };
+        osk.layout(tall);
+        let row_h = 15 / OSK_ROWS;
+        let enter = osk.rect_for(OskKey::Code(KeyCode::Enter)).unwrap();
+        assert_eq!(enter.height, row_h * 2, "Enter spans two key rows");
+        // It hit-tests across both rows it covers.
+        let cx = enter.x + enter.width / 2;
+        assert_eq!(osk.key_at(cx, enter.y), Some(OskKey::Code(KeyCode::Enter)));
+        assert_eq!(
+            osk.key_at(cx, enter.y + row_h),
+            Some(OskKey::Code(KeyCode::Enter)),
+            "the lower arm of the L hit-tests as Enter too"
+        );
+        // `/` is the last shift-row key and now sits just left of the Enter
+        // column rather than at the band's right edge.
+        let slash = osk.rect_for(OskKey::Char('/')).unwrap();
+        assert_eq!(slash.y, enter.y + row_h, "`/` is on the shift row");
+        assert!(
+            slash.x + slash.width <= enter.x,
+            "`/` ({}) must clear the Enter column ({})",
+            slash.x + slash.width,
+            enter.x
+        );
+        assert!(
+            enter.x + enter.width > slash.x + slash.width,
+            "Enter, not `/`, owns the right edge"
+        );
+    }
+
+    #[test]
+    fn split_keeps_enter_a_single_row() {
+        let mut osk = Osk::new();
+        osk.split = true;
+        osk.layout(wide());
+        let row_h = wide().height / OSK_ROWS;
+        let enter = osk.rect_for(OskKey::Code(KeyCode::Enter)).unwrap();
+        assert_eq!(enter.height, row_h, "split mode keeps a one-row Enter");
     }
 
     #[test]
