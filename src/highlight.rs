@@ -939,8 +939,7 @@ mod tests {
         h[row]
             .iter()
             .find(|s| s.start <= col && col < s.end)
-            .map(|s| s.style.fg)
-            .flatten()
+            .and_then(|s| s.style.fg)
     }
 
     #[test]

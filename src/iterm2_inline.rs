@@ -882,7 +882,7 @@ mod tests {
             "a positive bias must push the glyph downward (centered span {c_top}..={c_bottom}, lowered {l_top}..={l_bottom})"
         );
         assert!(
-            l_bottom <= canvas_h - 1,
+            l_bottom < canvas_h,
             "the glyph must stay inside the canvas: bottom row {l_bottom} exceeds {}",
             canvas_h - 1
         );
