@@ -7660,6 +7660,72 @@ fn left_click_on_paste_button_triggers_clipboard_paste_into_search() {
 }
 
 #[test]
+fn double_clicking_a_search_hit_pins_the_tab_so_the_next_hit_opens_beside_it() {
+    // Search results must mirror the Explorer's preview/pin gesture: a
+    // single click opens the hit in the replaceable preview slot, a
+    // double-click pins it so navigating to the next result opens a NEW
+    // preview tab beside it instead of replacing the file under review.
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("a.txt"), "needle a\n").unwrap();
+    std::fs::write(tmp.path().join("b.txt"), "needle b\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.set_sidebar_view(SidebarView::Search);
+    app.search.query = String::from("needle");
+    app.search.run_query();
+    assert_eq!(app.search.hits.len(), 2, "precondition: one hit per file");
+    app.search.last_area = Rect {
+        x: 0,
+        y: 0,
+        width: 60,
+        height: 20,
+    };
+    app.search.last_inner = Rect {
+        x: 1,
+        y: 1,
+        width: 58,
+        height: 18,
+    };
+    // Result rows start 7 rows below the inner top (header + input box +
+    // separator + caption), matching SearchPanel::hit_at_y.
+    let first_hit_row = app.search.last_inner.y + 7;
+    let click = |row: u16| crossterm::event::MouseEvent {
+        kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        column: 5,
+        row,
+        modifiers: KeyModifiers::NONE,
+    };
+    let first_path = app.search.hits[0].path.clone();
+    let second_path = app.search.hits[1].path.clone();
+
+    app.handle_mouse(click(first_hit_row));
+    assert!(
+        app.editor.editors[app.editor.active_index()].preview,
+        "a single click on a search hit opens it as a preview tab"
+    );
+    app.handle_mouse(click(first_hit_row));
+    assert!(
+        !app.editor.editors[app.editor.active_index()].preview,
+        "a second click on the same hit within the double-click window must pin the tab, exactly like double-clicking a file in the Explorer"
+    );
+
+    app.handle_mouse(click(first_hit_row + 1));
+    let paths: Vec<_> = app
+        .editor
+        .editors
+        .iter()
+        .filter_map(|e| e.path.clone())
+        .collect();
+    assert!(
+        paths.contains(&first_path) && paths.contains(&second_path),
+        "after pinning the first hit, opening the second must keep both files open (got {paths:?}); the pinned tab must not be replaced by the next preview"
+    );
+    assert!(
+        app.editor.editors[app.editor.active_index()].preview,
+        "the second hit lands in a fresh preview tab beside the pinned one"
+    );
+}
+
+#[test]
 fn cmd_p_index_is_built_in_the_background_so_open_does_not_walk_synchronously() {
     // Regression for the user's "Cmd+P is so slow" report. The old
     // open_file_finder ran build_file_index synchronously on the

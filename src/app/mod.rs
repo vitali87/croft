@@ -10269,11 +10269,25 @@ impl App {
                         self.submit_search_query();
                         return;
                     }
-                    // Click on a result row: open it.
+                    // Click on a result row: open it. Mirrors the Explorer's
+                    // preview/pin gesture — a single click opens the hit in
+                    // the replaceable preview slot, a double-click pins the
+                    // tab so moving on to the next result opens beside it
+                    // instead of replacing the file under review.
                     if let Some(idx) = self.search.hit_at_y(m.row) {
                         self.search.selected = idx;
+                        let now = std::time::Instant::now();
+                        let is_double = self.tree_click.is_double(now, m.column, m.row);
                         if let Some(hit) = self.search.selected_hit().cloned() {
                             self.open_search_hit(&hit);
+                            if is_double {
+                                self.editor.pin_active();
+                            }
+                        }
+                        if is_double {
+                            self.tree_click.clear();
+                        } else {
+                            self.tree_click.record(now, m.column, m.row);
                         }
                     } else {
                         // Click on the input/header area: just focus search.

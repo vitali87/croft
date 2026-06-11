@@ -35,6 +35,7 @@ On macOS, the `Cmd` chords below only reach croft after you run a one-time setup
 |------|--------|
 | `↑` / `↓` | Move selection |
 | `Enter` or `→` | Open a file; expand or collapse a folder |
+| Double-click a file | Pin its tab (a single click opens the file in the replaceable preview tab) |
 | `←` | Collapse a folder |
 | `Shift`+`↑` / `↓` / `PageUp` / `PageDown` / `Home` / `End` | Extend multi-selection from the anchor row |
 | `Shift`+click | Extend multi-selection across a range |
@@ -56,7 +57,8 @@ On macOS, the `Cmd` chords below only reach croft after you run a one-time setup
 |------|--------|
 | Type | Live `.gitignore`-aware workspace search, per keystroke (off the UI thread, capped at 200 hits). Unsaved buffers are searched in-memory, so unsaved edits are findable before you save |
 | Click `Aa` / `ab` / `.*` | Toggle case-sensitive / whole-word / regex; active toggles show a yellow background |
-| `↑` / `↓` + `Enter`, or click a result | Open the file at the matched line |
+| `↑` / `↓` + `Enter`, or click a result | Open the file at the matched line in the replaceable preview tab |
+| Double-click a result | Pin its tab, so moving to the next result opens beside it instead of replacing it |
 
 ## Editor: text
 
