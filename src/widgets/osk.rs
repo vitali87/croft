@@ -40,9 +40,11 @@ pub const OSK_ROWS: u16 = 5;
 /// 20-cell half-boards are unusable, and the fold's outer screen is narrow.
 const MIN_SPLIT_WIDTH: u16 = 60;
 
-/// Split-mode center gap as a divisor of the band width (about 3cm on an
-/// unfolded foldable's inner screen).
-const SPLIT_GAP_DIV: u16 = 6;
+/// Split-mode center gap as a fraction of the band width: `2/9`, about 4cm on
+/// an unfolded foldable's inner screen. Widened one centimetre past the
+/// original `1/6` (~3cm) so thumbs get more separation on mobile.
+const SPLIT_GAP_NUM: u16 = 2;
+const SPLIT_GAP_DEN: u16 = 9;
 
 /// Weight of an ordinary letter/digit key; structural weights are tuned
 /// against this so narrow frames keep MacBook-like proportions.
@@ -304,7 +306,7 @@ impl Osk {
         self.split_active = self.split && area.width >= MIN_SPLIT_WIDTH;
         self.keys.clear();
         let row_h = (area.height / OSK_ROWS).max(1);
-        let gap_w = area.width / SPLIT_GAP_DIV;
+        let gap_w = area.width * SPLIT_GAP_NUM / SPLIT_GAP_DEN;
         let half_w = (area.width - gap_w) / 2;
         let rows = self.rows();
         // The Enter key grows into a two-row L on the right, like a physical
@@ -956,8 +958,8 @@ mod tests {
                 "{l} must sit left of the gap and {r} right of it"
             );
             assert!(
-                rr.x - (lr.x + lr.width) >= area.width / SPLIT_GAP_DIV,
-                "gap between {l} and {r} must be at least a sixth of the band"
+                rr.x - (lr.x + lr.width) >= area.width * SPLIT_GAP_NUM / SPLIT_GAP_DEN,
+                "gap between {l} and {r} must be at least two-ninths of the band"
             );
         }
         // Both halves carry a space bar.
