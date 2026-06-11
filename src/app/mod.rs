@@ -5068,8 +5068,7 @@ impl App {
         let shortcuts_label_len: u16 = "F1 Shortcuts".chars().count() as u16;
         if let Some(osk) = self.osk.as_mut() {
             if osk_h > 0 {
-                let bg = self.theme.editor_bg();
-                crate::widgets::osk::render_osk(osk, outer[1], frame.buffer_mut(), bg);
+                crate::widgets::osk::render_osk(osk, outer[1], frame.buffer_mut(), self.theme);
             } else {
                 // Collapsed (frame too short): zero the hit rect so the
                 // invisible band can't swallow clicks.

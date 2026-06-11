@@ -328,15 +328,59 @@ fn termux_pkg_args(package: &str) -> Vec<String> {
     ]
 }
 
+/// apt/dpkg take a single process-global lock, so two `pkg install` calls can
+/// never run concurrently. Opening one Python file provisions both `ty` and
+/// `ruff` on separate install threads; without this gate they race for the
+/// lock and the loser dies with `Could not get lock …/apt/lists/lock`, leaving
+/// its server uninstalled (observed for `ty` in lsp.log 2026-06-11). Every
+/// Termux `pkg` invocation serializes through this mutex so croft never
+/// contends with itself.
+fn termux_pkg_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+/// How many extra times to retry a `pkg install` whose only problem was that
+/// the apt lock was held — by an *external* apt the mutex can't serialize.
+const PKG_LOCK_RETRIES: u32 = 5;
+
+/// True when `pkg`'s only failure was apt's lock being held elsewhere, i.e. the
+/// install should be retried rather than reported as a hard failure. A genuine
+/// error (missing package, network) is not contention and falls through.
+fn pkg_lock_contended(output: &std::io::Result<std::process::Output>) -> bool {
+    match output {
+        Ok(o) if !o.status.success() => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            stderr.contains("Could not get lock") || stderr.contains("Unable to lock")
+        }
+        _ => false,
+    }
+}
+
 /// Install a uv-provisioned server from the Termux repo. Same lifecycle as
 /// the other backends: logged, surfaced in the status bar, completion via
 /// `finish_install` so the language's open documents re-probe on success.
+/// Serialized against croft's other pkg installs and retried while the apt
+/// lock is held, so concurrent `ty`/`ruff` provisioning can't lose the race.
 fn run_termux_pkg_install(name: &'static str, language: Language, package: &str) {
     log_file::log(&format!(
         "lsp[{name}] installing {package} via pkg (Termux repo)"
     ));
     set_status(format!("Installing {name} (pkg)…"));
-    let output = Command::new("pkg").args(termux_pkg_args(package)).output();
+    // Recover the guard even if another install thread panicked mid-pkg: a
+    // poisoned lock still serializes correctly, the data is just `()`.
+    let _guard = termux_pkg_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let mut output = Command::new("pkg").args(termux_pkg_args(package)).output();
+    for attempt in 1..=PKG_LOCK_RETRIES {
+        if !pkg_lock_contended(&output) {
+            break;
+        }
+        log_file::log(&format!(
+            "lsp[{name}] apt lock held, retrying pkg install ({attempt}/{PKG_LOCK_RETRIES})"
+        ));
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        output = Command::new("pkg").args(termux_pkg_args(package)).output();
+    }
     finish_install(name, language, output);
 }
 
@@ -736,6 +780,41 @@ mod tests {
             "background installs can never answer an apt prompt, so -y is required"
         );
         assert_eq!(termux_pkg_args("ruff"), ["install", "-y", "ruff"]);
+    }
+
+    #[test]
+    fn apt_lock_contention_is_a_retryable_outcome_not_a_hard_failure() {
+        // Opening one Python file provisions ty AND ruff on separate threads;
+        // apt's single global lock means the loser sees this exact stderr.
+        // It must be treated as "retry", not "give up" — otherwise ty stays
+        // uninstalled forever (observed in lsp.log 2026-06-11).
+        let locked = fake_output(
+            false,
+            "E: Could not get lock /data/.../apt/lists/lock. It is held by process 10355 (apt)\n\
+             E: Unable to lock directory /data/.../apt/lists/\n",
+        );
+        assert!(
+            pkg_lock_contended(&Ok(locked)),
+            "apt lock-held stderr must be recognized as retryable contention"
+        );
+
+        // A clean success is not contention.
+        assert!(!pkg_lock_contended(&Ok(fake_output(true, ""))));
+        // A genuine failure (e.g. no such package) is not lock contention —
+        // retrying it would just waste time, so it must fall through to fail.
+        assert!(!pkg_lock_contended(&Ok(fake_output(
+            false,
+            "E: Unable to locate package nope\n"
+        ))));
+    }
+
+    fn fake_output(success: bool, stderr: &str) -> std::process::Output {
+        use std::os::unix::process::ExitStatusExt;
+        std::process::Output {
+            status: std::process::ExitStatus::from_raw(if success { 0 } else { 256 }),
+            stdout: Vec::new(),
+            stderr: stderr.as_bytes().to_vec(),
+        }
     }
 
     #[test]

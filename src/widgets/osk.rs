@@ -26,8 +26,15 @@
 //! esc < tab < caps < shift. A split mode (toggled by the `split` key,
 //! persisted in prefs) breaks the board into two thumb clusters separated
 //! by a center gap of about a sixth of the band width, mirroring Gboard's
-//! foldable split with no duplicated letter keys.
+//! foldable split with no duplicated letter keys. The number/top rows split
+//! 5|5 (`esc 12345 | tab qwert`); the home and bottom rows split one column
+//! earlier (`caps asdf | g hjkl`, `shift zxcv | b nm`) so `g` and `b` land
+//! in the right thumb cluster rather than at the left cluster's far edge. In
+//! split mode the top-right cluster also gains a `\` parked at the far edge
+//! (`y u i o p \`); the qwerty letters keep their natural order.
 
+use crate::gradient::{PRIMARY_BTN_BG, rgb_color};
+use crate::theme::Theme;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -40,9 +47,11 @@ pub const OSK_ROWS: u16 = 5;
 /// 20-cell half-boards are unusable, and the fold's outer screen is narrow.
 const MIN_SPLIT_WIDTH: u16 = 60;
 
-/// Split-mode center gap as a divisor of the band width (about 3cm on an
-/// unfolded foldable's inner screen).
-const SPLIT_GAP_DIV: u16 = 6;
+/// Split-mode center gap as a fraction of the band width: `2/9`, about 4cm on
+/// an unfolded foldable's inner screen. Widened one centimetre past the
+/// original `1/6` (~3cm) so thumbs get more separation on mobile.
+const SPLIT_GAP_NUM: u16 = 2;
+const SPLIT_GAP_DEN: u16 = 9;
 
 /// Weight of an ordinary letter/digit key; structural weights are tuned
 /// against this so narrow frames keep MacBook-like proportions.
@@ -209,16 +218,35 @@ fn rows_for(layer: OskLayer, caps: bool, split: bool) -> Vec<Vec<KeySlot>> {
     } else {
         "&123"
     };
+    // In split mode the right thumb cluster's top row gains a `\` parked at
+    // the band's far edge; the qwerty letters keep their natural order and
+    // positions. Letters only — the symbols layer's top row carries no
+    // letters and already has its own `\`.
+    let alpha = matches!(layer, OskLayer::Lower | OskLayer::Upper);
+    let top_row = if split && alpha {
+        let mut s = String::from(top);
+        s.push('\\');
+        row(tab(), &s, None)
+    } else {
+        row(tab(), top, None)
+    };
     let mut rows = vec![
         row(esc(), digits, Some(bksp())),
-        row(tab(), top, None),
+        top_row,
         row(caps_k(), home, Some(enter())),
         row(shift(), low, None),
     ];
     if split {
-        // Left thumb cluster = structural key + first five characters
-        // (esc 12345 | tab qwert | caps asdfg | shift zxcvb).
-        rows = rows.into_iter().map(|r| split_at(r, 6)).collect();
+        // Number and top rows give the left thumb the structural key plus
+        // five characters (esc 12345 | tab qwert). The home and bottom rows
+        // split one column earlier (caps asdf | g hjkl, shift zxcv | b nm)
+        // so `g` and `b` fall into the right thumb cluster instead of the
+        // left cluster's far edge.
+        rows = rows
+            .into_iter()
+            .enumerate()
+            .map(|(i, r)| split_at(r, if i <= 1 { 6 } else { 5 }))
+            .collect();
     }
     rows.push(bottom(layer_label));
     rows
@@ -304,7 +332,7 @@ impl Osk {
         self.split_active = self.split && area.width >= MIN_SPLIT_WIDTH;
         self.keys.clear();
         let row_h = (area.height / OSK_ROWS).max(1);
-        let gap_w = area.width / SPLIT_GAP_DIV;
+        let gap_w = area.width * SPLIT_GAP_NUM / SPLIT_GAP_DEN;
         let half_w = (area.width - gap_w) / 2;
         let rows = self.rows();
         // The Enter key grows into a two-row L on the right, like a physical
@@ -533,17 +561,50 @@ impl Default for Osk {
     }
 }
 
-/// VS Code dark-keyboard palette: char keys on a raised grey, structural
-/// keys a step darker, armed modifiers on the focus-accent blue.
-const KEY_FG: Color = Color::Rgb(0xd4, 0xd8, 0xe0);
-const KEY_BG: Color = Color::Rgb(0x3a, 0x40, 0x52);
-const KEY_SPECIAL_BG: Color = Color::Rgb(0x2c, 0x31, 0x40);
-const KEY_ARMED_BG: Color = Color::Rgb(0x00, 0x7a, 0xcc);
+/// Keyboard palette for one IDE theme: char-key caps raised a step above the
+/// editor background, structural keys a step below the caps, and an armed
+/// modifier on the theme's action accent.
+struct OskPalette {
+    fg: Color,
+    armed_fg: Color,
+    key_bg: Color,
+    special_bg: Color,
+    armed_bg: Color,
+}
 
-/// Paint the keyboard band and refresh its hit rects. `panel_bg` is the
-/// theme's editor background so the band reads as part of the chrome.
-pub fn render_osk(osk: &mut Osk, area: Rect, buf: &mut Buffer, panel_bg: Color) {
+/// Resolve the keyboard palette so the band rhymes with the active theme:
+/// neutral dark caps over a true-black band with the brand-teal armed accent
+/// on Croft Black, the historical navy caps with the VS Code focus blue on
+/// Croft Dark. Caps sit a step proud of the editor background either way, so
+/// the band reads as raised chrome rather than a flat overlay.
+fn palette(theme: Theme) -> OskPalette {
+    match theme {
+        Theme::Black => OskPalette {
+            fg: Color::Rgb(0xd4, 0xd8, 0xe0),
+            armed_fg: Color::White,
+            key_bg: Color::Rgb(0x20, 0x24, 0x2b),
+            special_bg: Color::Rgb(0x14, 0x16, 0x1b),
+            // Brand teal — the same primary-action fill the Black theme uses
+            // for buttons and active chrome elsewhere.
+            armed_bg: rgb_color(PRIMARY_BTN_BG),
+        },
+        Theme::DarkBlue => OskPalette {
+            fg: Color::Rgb(0xd4, 0xd8, 0xe0),
+            armed_fg: Color::White,
+            key_bg: Color::Rgb(0x3a, 0x40, 0x52),
+            special_bg: Color::Rgb(0x2c, 0x31, 0x40),
+            armed_bg: Color::Rgb(0x00, 0x7a, 0xcc),
+        },
+    }
+}
+
+/// Paint the keyboard band and refresh its hit rects. The band gap and key
+/// caps are drawn from `theme`'s palette so the keyboard reads as part of the
+/// active IDE theme's chrome.
+pub fn render_osk(osk: &mut Osk, area: Rect, buf: &mut Buffer, theme: Theme) {
     osk.layout(area);
+    let pal = palette(theme);
+    let panel_bg = theme.editor_bg();
     let gap = Style::default().bg(panel_bg);
     let blank = " ".repeat(area.width as usize);
     for y in area.y..area.y.saturating_add(area.height) {
@@ -571,13 +632,13 @@ pub fn render_osk(osk: &mut Osk, area: Rect, buf: &mut Buffer, panel_bg: Color) 
         let special = !matches!(key, OskKey::Char(_));
         let style = if armed {
             Style::default()
-                .fg(Color::White)
-                .bg(KEY_ARMED_BG)
+                .fg(pal.armed_fg)
+                .bg(pal.armed_bg)
                 .add_modifier(Modifier::BOLD)
         } else {
             Style::default()
-                .fg(KEY_FG)
-                .bg(if special { KEY_SPECIAL_BG } else { KEY_BG })
+                .fg(pal.fg)
+                .bg(if special { pal.special_bg } else { pal.key_bg })
         };
         let w = rect.width as usize;
         // Cramped keys fall back to their short glyph label instead of
@@ -914,11 +975,14 @@ mod tests {
             height: band_height(24), // row_h == 1
         };
         let mut buf = Buffer::empty(area);
-        render_osk(&mut osk, area, &mut buf, Color::Reset);
+        render_osk(&mut osk, area, &mut buf, Theme::Black);
+        // Key caps paint a raised bg; the band gap stays the editor bg, so a
+        // cell counts as "painted" only when it differs from the gap fill.
+        let gap_bg = Theme::Black.editor_bg();
         let enter = osk.rect_for(OskKey::Code(KeyCode::Enter)).unwrap();
         let painted = |rect: Rect| {
             (rect.y..rect.y + rect.height)
-                .filter(|&y| buf[(rect.x + rect.width / 2, y)].bg != Color::Reset)
+                .filter(|&y| buf[(rect.x + rect.width / 2, y)].bg != gap_bg)
                 .count()
         };
         let a = osk.rect_for(OskKey::Char('l')).unwrap();
@@ -946,9 +1010,11 @@ mod tests {
                 "row {i} must have a center gap"
             );
         }
-        // Gboard's 5|5 split with no duplicated keys: t/g/v/5 end the left
-        // half, y/h/b/6 start the right half.
-        for (l, r) in [('5', '6'), ('t', 'y'), ('g', 'h'), ('b', 'n')] {
+        // Split with no duplicated keys: 5/t end the number/top left halves,
+        // 6/y start their right halves; the home and bottom rows break one
+        // column earlier so f/v end the left half and g/b start the right
+        // half (g and b sit in the right thumb cluster, not the left edge).
+        for (l, r) in [('5', '6'), ('t', 'y'), ('f', 'g'), ('v', 'b')] {
             let lr = osk.rect_for(OskKey::Char(l)).unwrap();
             let rr = osk.rect_for(OskKey::Char(r)).unwrap();
             assert!(
@@ -956,12 +1022,36 @@ mod tests {
                 "{l} must sit left of the gap and {r} right of it"
             );
             assert!(
-                rr.x - (lr.x + lr.width) >= area.width / SPLIT_GAP_DIV,
-                "gap between {l} and {r} must be at least a sixth of the band"
+                rr.x - (lr.x + lr.width) >= area.width * SPLIT_GAP_NUM / SPLIT_GAP_DEN,
+                "gap between {l} and {r} must be at least two-ninths of the band"
             );
         }
         // Both halves carry a space bar.
         assert_eq!(osk.count_of(OskKey::Char(' ')), 2);
+    }
+
+    #[test]
+    fn split_top_right_parks_backslash_at_the_edge_keeping_letter_order() {
+        let mut osk = Osk::new();
+        osk.split = true;
+        osk.layout(wide());
+        // The right thumb cluster's top row reads `y u i o p \`: the qwerty
+        // letters keep their natural left-to-right order and a `\` is parked
+        // at the far edge.
+        let xs: Vec<u16> = ['y', 'u', 'i', 'o', 'p', '\\']
+            .iter()
+            .map(|&c| osk.rect_for(OskKey::Char(c)).unwrap().x)
+            .collect();
+        for w in xs.windows(2) {
+            assert!(w[0] < w[1], "split top-right keys must be left-to-right");
+        }
+        // Backslash appears only in the split alpha layout, not when merged.
+        osk.split = false;
+        osk.layout(band());
+        assert!(
+            osk.rect_for(OskKey::Char('\\')).is_none(),
+            "merged lower layer must not expose backslash"
+        );
     }
 
     #[test]

@@ -19,7 +19,7 @@ use lsp_types::{
     TypeDefinitionProviderCapability, Url, WindowClientCapabilities, WorkspaceClientCapabilities,
     WorkspaceEdit,
 };
-use tokio::sync::{Mutex as TokioMutex, mpsc as tokio_mpsc};
+use tokio::sync::{Mutex as TokioMutex, mpsc as tokio_mpsc, oneshot};
 
 use crate::lsp::client::LspClient;
 use crate::lsp::config::{Language, ServerConfig};
@@ -184,6 +184,12 @@ pub struct ProgressUpdate {
 }
 
 enum Cmd {
+    /// Gracefully shut every server down (LSP `shutdown`+`exit`, then await the
+    /// child) and acknowledge on `done`. Sent by `LspManager`'s Drop so servers
+    /// exit cleanly instead of being SIGKILLed by `kill_on_drop`.
+    Shutdown {
+        done: oneshot::Sender<()>,
+    },
     OpenDoc {
         path: PathBuf,
         text: String,
@@ -287,6 +293,22 @@ pub struct LspManager {
     next_request_id: u64,
     workspace_root: PathBuf,
     _runtime: LspRuntime,
+}
+
+impl Drop for LspManager {
+    fn drop(&mut self) {
+        // Ask the worker to gracefully shut every server down, and block until
+        // it acks. We run on the app's main thread (not inside the LSP runtime),
+        // so block_on the runtime handle is valid. An overall cap keeps an
+        // unresponsive server from hanging app exit; afterwards the fields drop
+        // — `cmd_tx` closes the worker loop and `_runtime` joins the thread.
+        let (done_tx, done_rx) = oneshot::channel();
+        if self.cmd_tx.send(Cmd::Shutdown { done: done_tx }).is_ok() {
+            let _ = self._runtime.handle().block_on(async {
+                tokio::time::timeout(std::time::Duration::from_secs(3), done_rx).await
+            });
+        }
+    }
 }
 
 impl LspManager {
@@ -685,6 +707,11 @@ async fn worker_loop(
     };
     while let Some(cmd) = cmd_rx.recv().await {
         match cmd {
+            Cmd::Shutdown { done } => {
+                state.shutdown_all().await;
+                let _ = done.send(());
+                return;
+            }
             Cmd::OpenDoc { path, text } => state.open_doc(path, text).await,
             Cmd::RequestSemanticTokens { path } => {
                 state
@@ -788,6 +815,28 @@ async fn worker_loop(
 }
 
 impl WorkerState {
+    /// Gracefully shut down every managed client concurrently. Each client's
+    /// `shutdown` self-bounds its child-wait, so a single unresponsive server
+    /// can't block the others. Clients are left in the map; their eventual Drop
+    /// aborts the (now-finished) MainLoop and reaps the (now-exited) child.
+    async fn shutdown_all(&mut self) {
+        let clients: Vec<Arc<TokioMutex<LspClient>>> = self
+            .clients
+            .values()
+            .flatten()
+            .map(|m| m.client.clone())
+            .collect();
+        let mut tasks = Vec::with_capacity(clients.len());
+        for client in clients {
+            tasks.push(tokio::spawn(async move {
+                let _ = client.lock().await.shutdown().await;
+            }));
+        }
+        for t in tasks {
+            let _ = t.await;
+        }
+    }
+
     async fn ensure_clients(&mut self, lang: Language, root: &Path) -> &[ManagedClient] {
         // Re-probe when the cached list is empty: a server (e.g. the managed
         // vtsls) may have finished its background install since the first
