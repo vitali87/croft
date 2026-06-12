@@ -30,6 +30,9 @@ pub struct RemotePanel {
     pub empty_secondary_btn: Rect,
     pub empty_learn_link: Rect,
     pub last_image_cell: Option<(u16, u16)>,
+    /// Render-time pointer cell, fed from `App::pointer_cell` each frame so a
+    /// hovered host row and the header action pills (+ / refresh) can lift.
+    pub hover_pointer: Option<(u16, u16)>,
     visible: Vec<usize>,
     ssh_config_state: SshConfigState,
 }
@@ -56,6 +59,7 @@ impl RemotePanel {
             empty_secondary_btn: Rect::default(),
             empty_learn_link: Rect::default(),
             last_image_cell: None,
+            hover_pointer: None,
             visible: Vec::new(),
             ssh_config_state,
         }
@@ -248,6 +252,10 @@ const BODY_FG: Color = Color::Rgb(0xb4, 0xbe, 0xc8);
 /// behind the `REMOTE EXPLORER` title.
 const HEADER_BTN_BG: Color = Color::Rgb(0x1e, 0x3a, 0x6e);
 const HEADER_BTN_FG: Color = Color::Rgb(0xe6, 0xed, 0xf5);
+/// Brightened navy the Croft Dark header pill takes while the pointer rests on
+/// it (VS Code `toolbar.hoverBackground`). The Black theme instead grows a
+/// faint teal pill from nothing, so it has no separate constant here.
+const HEADER_BTN_HOVER_BG: Color = Color::Rgb(0x2f, 0x5a, 0xa8);
 
 pub const SSH_EMPTY_STATE_CELLS_W: u16 = 18;
 pub const SSH_EMPTY_STATE_CELLS_H: u16 = 8;
@@ -284,16 +292,35 @@ fn render_section_header(panel: &mut RemotePanel, buf: &mut Buffer, inner: Rect)
     let right = inner.x + inner.width;
     let refresh_x = right.saturating_sub(pill_w + 1);
     let add_x = refresh_x.saturating_sub(pill_w + 1);
+    let pointer = panel.hover_pointer;
     if add_x > inner.x + 5 {
-        render_header_pill(buf, add_x, inner.y, pill_w, ADD_GLYPH, panel.focus_gradient);
-        panel.header_add_btn = Rect {
+        let rect = Rect {
             x: add_x,
             y: inner.y,
             width: pill_w,
             height: 1,
         };
+        panel.header_add_btn = rect;
+        let hovered = crate::widgets::hover::contains(rect, pointer);
+        render_header_pill(
+            buf,
+            add_x,
+            inner.y,
+            pill_w,
+            ADD_GLYPH,
+            panel.focus_gradient,
+            hovered,
+        );
     }
     if refresh_x > inner.x + 5 {
+        let rect = Rect {
+            x: refresh_x,
+            y: inner.y,
+            width: pill_w,
+            height: 1,
+        };
+        panel.header_refresh_btn = rect;
+        let hovered = crate::widgets::hover::contains(rect, pointer);
         render_header_pill(
             buf,
             refresh_x,
@@ -301,40 +328,46 @@ fn render_section_header(panel: &mut RemotePanel, buf: &mut Buffer, inner: Rect)
             pill_w,
             REFRESH_GLYPH,
             panel.focus_gradient,
+            hovered,
         );
-        panel.header_refresh_btn = Rect {
-            x: refresh_x,
-            y: inner.y,
-            width: pill_w,
-            height: 1,
-        };
     }
 }
 
-fn render_header_pill(buf: &mut Buffer, x: u16, y: u16, width: u16, glyph: char, brand: bool) {
-    // Black theme (`brand`): chipless teal icon in the VS Code toolbar
-    // spirit, matching the terminal pane's -/+; Croft Dark keeps the navy
-    // pill behind the glyph.
-    let bg = if brand {
-        Style::default()
+fn render_header_pill(
+    buf: &mut Buffer,
+    x: u16,
+    y: u16,
+    width: u16,
+    glyph: char,
+    brand: bool,
+    hovered: bool,
+) {
+    // Black theme (`brand`): chipless teal icon in the VS Code toolbar spirit,
+    // matching the terminal pane's -/+, that grows a faint teal pill only while
+    // hovered. Croft Dark keeps the navy pill and brightens it on hover
+    // (toolbar.hoverBackground).
+    let fill = if brand {
+        hovered.then(|| crate::gradient::rgb_color(crate::gradient::POPUP_SEL_BG))
+    } else if hovered {
+        Some(HEADER_BTN_HOVER_BG)
     } else {
-        Style::default().bg(HEADER_BTN_BG)
+        Some(HEADER_BTN_BG)
     };
+    let fill_style = fill.map(|c| Style::default().bg(c)).unwrap_or_default();
     for dx in 0..width {
         let cell = &mut buf[(x + dx, y)];
         cell.set_char(' ');
-        cell.set_style(bg);
+        cell.set_style(fill_style);
     }
     let centre = x + width / 2;
-    let style = if brand {
-        Style::default()
-            .fg(crate::gradient::rgb_color(crate::gradient::INNER_ACCENT))
-            .add_modifier(Modifier::BOLD)
+    let mut style = Style::default().add_modifier(Modifier::BOLD);
+    if let Some(c) = fill {
+        style = style.bg(c);
+    }
+    style = if brand {
+        style.fg(crate::gradient::rgb_color(crate::gradient::INNER_ACCENT))
     } else {
-        Style::default()
-            .bg(HEADER_BTN_BG)
-            .fg(HEADER_BTN_FG)
-            .add_modifier(Modifier::BOLD)
+        style.fg(HEADER_BTN_FG)
     };
     buf.set_string(centre, y, glyph.to_string(), style);
 }
@@ -724,26 +757,28 @@ impl Widget for &mut RemotePanel {
         } else {
             Color::Rgb(0x09, 0x4d, 0x77)
         };
+        let pointer = self.hover_pointer;
+        let brand = self.focus_gradient;
         let end = (self.scroll + viewport).min(self.visible.len());
         for (row, vis_idx) in (self.scroll..end).enumerate() {
             let idx = self.visible[vis_idx];
             let target = &self.targets[idx];
             let y = self.last_list_area.y + row as u16;
             let selected = idx == self.selected;
+            let row_rect = Rect {
+                x: self.last_list_area.x,
+                y,
+                width: row_width,
+                height: 1,
+            };
             let style = if selected {
                 Style::default().bg(sel_bg)
+            } else if let Some(bg) = crate::widgets::hover::row_hover_bg(row_rect, pointer, brand) {
+                Style::default().bg(bg)
             } else {
                 Style::default()
             };
-            buf.set_style(
-                Rect {
-                    x: self.last_list_area.x,
-                    y,
-                    width: row_width,
-                    height: 1,
-                },
-                style,
-            );
+            buf.set_style(row_rect, style);
             let detail = target.detail();
             let mut spans = vec![
                 Span::raw("  "),
@@ -831,6 +866,61 @@ mod tests {
         assert!(
             !header_row.contains('\u{2699}'),
             "header must not paint the gear U+2699 anywhere"
+        );
+    }
+
+    #[test]
+    fn header_add_pill_brightens_under_the_pointer() {
+        let mut p = populated_panel(&["a", "b"]);
+        p.focus_gradient = false; // Croft Dark navy pill
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 10,
+        };
+        let mut buf = Buffer::empty(area);
+        (&mut p).render(area, &mut buf);
+        let add = p.header_add_btn;
+        let refresh = p.header_refresh_btn;
+        assert!(add.width > 0, "the + pill must have rendered");
+        // Rest the pointer on the + pill and re-render.
+        p.hover_pointer = Some((add.x, add.y));
+        let mut buf = Buffer::empty(area);
+        (&mut p).render(area, &mut buf);
+        assert_eq!(
+            buf[(add.x, add.y)].bg,
+            HEADER_BTN_HOVER_BG,
+            "the + pill lifts to the hover navy under the pointer"
+        );
+        assert_eq!(
+            buf[(refresh.x, refresh.y)].bg,
+            HEADER_BTN_BG,
+            "the un-hovered refresh pill keeps the rest navy"
+        );
+    }
+
+    #[test]
+    fn hovering_an_unselected_host_row_lifts_it() {
+        let mut p = populated_panel(&["a", "b", "c"]);
+        p.focus_gradient = false; // Croft Dark
+        p.selected = 0; // row 0 is selected
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 10,
+        };
+        let mut buf = Buffer::empty(area);
+        (&mut p).render(area, &mut buf);
+        let row_y = p.last_list_area.y + 1; // second host, unselected
+        p.hover_pointer = Some((p.last_list_area.x, row_y));
+        let mut buf = Buffer::empty(area);
+        (&mut p).render(area, &mut buf);
+        assert_eq!(
+            buf[(p.last_list_area.x, row_y)].bg,
+            Color::Rgb(0x2b, 0x31, 0x42),
+            "the hovered unselected host row wears the Croft Dark hover lift"
         );
     }
 

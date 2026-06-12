@@ -508,6 +508,9 @@ pub struct SearchPanel {
     /// scrollbar. Empty when there's no overflow. Used by the mouse
     /// handler to route track clicks / drags to `scroll_to_bar_y`.
     pub last_scrollbar: Rect,
+    /// Render-time pointer cell, fed from `App::pointer_cell` each frame so a
+    /// hovered (but unselected) result row can lift to the hover background.
+    pub hover_pointer: Option<(u16, u16)>,
 }
 
 impl SearchPanel {
@@ -532,6 +535,7 @@ impl SearchPanel {
             paste_button_w: 0,
             selection: None,
             last_scrollbar: Rect::default(),
+            hover_pointer: None,
         }
     }
 
@@ -996,6 +1000,28 @@ impl Widget for &mut SearchPanel {
         for (row_idx, hit_idx) in (self.scroll..end).enumerate() {
             let y = results_start_y + row_idx as u16;
             let hit = &self.hits[hit_idx];
+            // Lift the row under the pointer (unless it is already the
+            // selected row, which carries its own highlight). Pre-filling the
+            // bg works because `set_line` only patches the cells it writes and
+            // leaves their bg untouched when a span sets no bg of its own.
+            let row_rect = Rect {
+                x: inner.x,
+                y,
+                width: row_width,
+                height: 1,
+            };
+            if hit_idx != self.selected
+                && let Some(bg) = crate::widgets::hover::row_hover_bg(
+                    row_rect,
+                    self.hover_pointer,
+                    self.focus_gradient,
+                )
+            {
+                let fill = Style::default().bg(bg);
+                for rx in 0..row_width {
+                    buf[(inner.x + rx, y)].set_symbol(" ").set_style(fill);
+                }
+            }
             // Show just the basename so the matched line itself has room
             // to render inside a narrow side panel — without this, deep
             // monorepo paths consumed the whole row and the highlight fell
@@ -1985,6 +2011,32 @@ mod tests {
             })
             .collect();
         panel
+    }
+
+    #[test]
+    fn hovering_an_unselected_result_row_lifts_it() {
+        let tmp = TempDir::new().unwrap();
+        let mut panel = make_panel_with_hits(&tmp, 20);
+        panel.focus_gradient = false; // Croft Dark
+        panel.selected = 0;
+        panel.scroll = 0;
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 30,
+        };
+        // Results start at inner.y + 7 (see the click-mapping in `result_at`);
+        // hover the second result row, which is not the selected one.
+        let row_y = area.y + 1 + 7 + 1;
+        panel.hover_pointer = Some((area.x + 1, row_y));
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        ratatui::widgets::Widget::render(&mut panel, area, &mut buf);
+        assert_eq!(
+            buf[(area.x + 1, row_y)].bg,
+            Color::Rgb(0x2b, 0x31, 0x42),
+            "the hovered unselected result row wears the Croft Dark hover lift"
+        );
     }
 
     #[test]

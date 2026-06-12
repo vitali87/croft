@@ -39,6 +39,10 @@ pub struct FileTree {
     /// a highlighted bg so the drop target is unambiguous. Cleared on drop
     /// or cancel.
     pub drag_target: Option<usize>,
+    /// Render-time pointer cell, fed from `App::pointer_cell` each frame so a
+    /// row under the cursor can lift to the hover background. `None` when the
+    /// pointer is outside the panel.
+    pub hover_pointer: Option<(u16, u16)>,
 }
 
 impl FileTree {
@@ -62,6 +66,7 @@ impl FileTree {
             anchor: 0,
             marked: BTreeSet::new(),
             drag_target: None,
+            hover_pointer: None,
         };
         tree.load_children(0);
         tree
@@ -1122,6 +1127,8 @@ impl Widget for &mut FileTree {
             .width
             .saturating_sub(u16::from(scrollbar_metrics.is_some()));
 
+        let pointer = self.hover_pointer;
+        let brand = self.focus_gradient;
         let end = (self.scroll + visible_height).min(self.nodes.len());
         for (row, idx) in (self.scroll..end).enumerate() {
             let node = &self.nodes[idx];
@@ -1193,24 +1200,24 @@ impl Widget for &mut FileTree {
             } else {
                 (Color::Rgb(0x09, 0x4d, 0x77), Color::Rgb(0x07, 0x33, 0x55))
             };
+            let row_rect = Rect {
+                x: inner.x,
+                y,
+                width: row_width,
+                height: 1,
+            };
             let line_style = if is_drop_target {
                 Style::default().bg(Color::Rgb(0x2c, 0x60, 0x2e))
             } else if is_selected {
                 Style::default().bg(sel_bg)
             } else if is_marked {
                 Style::default().bg(mark_bg)
+            } else if let Some(bg) = crate::widgets::hover::row_hover_bg(row_rect, pointer, brand) {
+                Style::default().bg(bg)
             } else {
                 Style::default()
             };
-            buf.set_style(
-                Rect {
-                    x: inner.x,
-                    y,
-                    width: row_width,
-                    height: 1,
-                },
-                line_style,
-            );
+            buf.set_style(row_rect, line_style);
             buf.set_line(inner.x, y, &line, row_width);
         }
         if let Some(metrics) = scrollbar_metrics {
@@ -1258,6 +1265,59 @@ mod tests {
         assert!(
             top.contains("EXPLORER"),
             "title clobbered by gradient: {top:?}"
+        );
+    }
+
+    #[test]
+    fn hovering_an_unselected_row_lifts_it_without_touching_the_selection() {
+        let (_tmp, mut tree) = fixture();
+        tree.focused = true;
+        tree.focus_gradient = false; // Croft Dark
+        tree.selected = 0; // the root row stays selected
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 30,
+            height: 8,
+        };
+        // Rest the pointer on the second visible row (a child of the root).
+        let inner_y = area.y + 1;
+        tree.hover_pointer = Some((area.x + 1, inner_y + 1));
+        let mut buf = Buffer::empty(area);
+        (&mut tree).render(area, &mut buf);
+        assert_eq!(
+            buf[(area.x + 1, inner_y + 1)].bg,
+            Color::Rgb(0x2b, 0x31, 0x42),
+            "the hovered child row wears the Croft Dark hover lift"
+        );
+        assert_eq!(
+            buf[(area.x + 1, inner_y)].bg,
+            Color::Rgb(0x09, 0x4d, 0x77),
+            "the selected row keeps its selection bg, not the hover lift"
+        );
+    }
+
+    #[test]
+    fn a_selected_row_is_not_overridden_by_hovering_it() {
+        let (_tmp, mut tree) = fixture();
+        tree.focused = true;
+        tree.focus_gradient = false;
+        tree.selected = 0;
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 30,
+            height: 8,
+        };
+        let inner_y = area.y + 1;
+        // Hover the selected row itself.
+        tree.hover_pointer = Some((area.x + 1, inner_y));
+        let mut buf = Buffer::empty(area);
+        (&mut tree).render(area, &mut buf);
+        assert_eq!(
+            buf[(area.x + 1, inner_y)].bg,
+            Color::Rgb(0x09, 0x4d, 0x77),
+            "selection outranks hover so the row never dims to the hover lift"
         );
     }
 

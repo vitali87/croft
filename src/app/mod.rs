@@ -4896,6 +4896,14 @@ impl App {
             } else {
                 (usable_area, None)
             };
+            // Feed the render-time pointer cell to every side panel so the row
+            // under the cursor (and the remote header pills) can light up,
+            // mirroring the editor tab strip and terminal pane buttons.
+            let panel_pointer = self.pointer_cell;
+            self.tree.hover_pointer = panel_pointer;
+            self.search.hover_pointer = panel_pointer;
+            self.source_control.hover_pointer = panel_pointer;
+            self.remote.hover_pointer = panel_pointer;
             match self.sidebar_view {
                 SidebarView::Explorer => frame.render_widget(&mut self.tree, activity_area),
                 SidebarView::Search => frame.render_widget(&mut self.search, activity_area),

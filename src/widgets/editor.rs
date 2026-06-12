@@ -5021,9 +5021,15 @@ const TAB_HOVER_BG: Color = Color::Rgb(0x34, 0x50, 0x7f);
 /// Black theme counterpart of `TAB_HOVER_BG`.
 const TAB_HOVER_BG_BRAND: Color = Color::Rgb(0x2f, 0x35, 0x50);
 /// Pill painted behind the close `\u{2715}` cell when the pointer is on it
-/// (VS Code `toolbar.hoverBackground`). Croft Dark uses a brightened navy;
-/// the Black theme reuses the terminal-button teal (`POPUP_SEL_BG`).
-const TAB_CLOSE_PILL_BG: Color = Color::Rgb(0x2f, 0x5a, 0xa8);
+/// (VS Code `toolbar.hoverBackground`). Croft Dark uses the bright focus-accent
+/// blue so the pill reads clearly even on the already-navy active tab; an
+/// earlier dim navy was invisible against `TAB_ACTIVE_BG`.
+const TAB_CLOSE_PILL_BG: Color = Color::Rgb(0x4e, 0x9a, 0xff);
+/// Black-theme counterpart. The active tab there is already `POPUP_SEL_BG`
+/// teal, so the pill must be a *brighter* teal to be visible; reusing
+/// `POPUP_SEL_BG` (as the code once did) painted the pill the same colour as
+/// the tab and showed nothing.
+const TAB_CLOSE_PILL_BG_BRAND: Color = Color::Rgb(0x3c, 0x8a, 0x7e);
 
 impl Widget for &mut EditorTabs {
     fn render(self, area: Rect, buf: &mut Buffer) {
@@ -5152,7 +5158,7 @@ impl Widget for &mut EditorTabs {
             // exactly which X their click will land on.
             if on_close {
                 let pill_bg = if brand {
-                    crate::gradient::rgb_color(crate::gradient::POPUP_SEL_BG)
+                    TAB_CLOSE_PILL_BG_BRAND
                 } else {
                     TAB_CLOSE_PILL_BG
                 };
@@ -8709,6 +8715,41 @@ mod tests {
             buf[(other, area.y)].bg,
             TAB_CLOSE_PILL_BG,
             "an un-hovered cross gets no pill"
+        );
+    }
+
+    #[test]
+    fn black_theme_close_pill_is_distinct_from_the_active_tab_bg() {
+        use ratatui::buffer::Buffer;
+        let mut t = EditorTabs::new();
+        t.editors[0].path = Some(std::path::PathBuf::from("/foo.rs"));
+        t.editors[0].focus_gradient = true; // turn on the Black theme
+        t.add_tab_with_path(std::path::PathBuf::from("/bar.rs"));
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 10,
+        };
+        let mut buf = Buffer::empty(area);
+        (&mut t).render(area, &mut buf);
+        let active = t.active;
+        let cx = t
+            .close_screen_x(active)
+            .expect("the active tab has a close cross");
+        t.hover_pointer = Some((cx, area.y));
+        let mut buf = Buffer::empty(area);
+        (&mut t).render(area, &mut buf);
+        let active_bg = crate::gradient::rgb_color(crate::gradient::POPUP_SEL_BG);
+        assert_eq!(
+            buf[(cx, area.y)].bg,
+            TAB_CLOSE_PILL_BG_BRAND,
+            "the Black-theme close pill uses the brighter teal"
+        );
+        assert_ne!(
+            buf[(cx, area.y)].bg,
+            active_bg,
+            "the pill must not equal the active tab bg, or the cross shows no hover at all"
         );
     }
 

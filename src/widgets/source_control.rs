@@ -130,6 +130,9 @@ pub struct SourceControlPanel {
     /// selected row is already staged. Cleared at the top of each render
     /// and re-populated for the visible selected row.
     pub last_row_actions: Option<RowActionAreas>,
+    /// Render-time pointer cell, fed from `App::pointer_cell` each frame so a
+    /// hovered (but unselected) change row can lift to the hover background.
+    pub hover_pointer: Option<(u16, u16)>,
 }
 
 impl SourceControlPanel {
@@ -159,6 +162,7 @@ impl SourceControlPanel {
             commit_feedback: None,
             commit_feedback_is_error: false,
             last_row_actions: None,
+            hover_pointer: None,
         }
     }
 
@@ -1168,7 +1172,11 @@ impl Widget for &mut SourceControlPanel {
                     } else if is_in_multi {
                         Some(Color::Rgb(0x1f, 0x3a, 0x5c))
                     } else {
-                        None
+                        crate::widgets::hover::row_hover_bg(
+                            row_rect,
+                            self.hover_pointer,
+                            self.focus_gradient,
+                        )
                     };
                     let is_selected = is_primary;
                     if let Some(bg) = row_bg {
@@ -1304,6 +1312,45 @@ mod tests {
         p.backspace();
         assert_eq!(p.message, "");
         assert_eq!(p.message_cursor, 0);
+    }
+
+    #[test]
+    fn hovering_an_unselected_change_row_lifts_it() {
+        use ratatui::buffer::Buffer;
+        let mut p = SourceControlPanel::new();
+        p.focus_gradient = false; // Croft Dark
+        p.status.in_repo = true;
+        p.selected_change = None; // nothing selected
+        p.entries = vec![
+            ChangeEntry {
+                path: "a.rs".into(),
+                kind: ChangeKind::Modified,
+                ..Default::default()
+            },
+            ChangeEntry {
+                path: "b.rs".into(),
+                kind: ChangeKind::Modified,
+                ..Default::default()
+            },
+        ];
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 24,
+        };
+        let mut buf = Buffer::empty(area);
+        (&mut p).render(area, &mut buf);
+        // list_layout = [Header(Changes), Entry(0), Entry(1)]; hover Entry(1).
+        let row_y = p.last_list_area.y + 2;
+        p.hover_pointer = Some((p.last_list_area.x, row_y));
+        let mut buf = Buffer::empty(area);
+        (&mut p).render(area, &mut buf);
+        assert_eq!(
+            buf[(p.last_list_area.x, row_y)].bg,
+            Color::Rgb(0x2b, 0x31, 0x42),
+            "the hovered unselected change row wears the Croft Dark hover lift"
+        );
     }
 
     #[test]
