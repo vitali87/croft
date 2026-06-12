@@ -93,16 +93,22 @@ fn dummy_activity_images() -> ActivityBarImages {
     ActivityBarImages {
         explorer_active: s(),
         explorer_inactive: s(),
+        explorer_hovered: s(),
         search_active: s(),
         search_inactive: s(),
+        search_hovered: s(),
         source_control_active: s(),
         source_control_inactive: s(),
+        source_control_hovered: s(),
         remote_active: s(),
         remote_inactive: s(),
+        remote_hovered: s(),
         run_debug_active: s(),
         run_debug_inactive: s(),
+        run_debug_hovered: s(),
         settings_active: s(),
         settings_inactive: s(),
+        settings_hovered: s(),
     }
 }
 
@@ -4938,16 +4944,22 @@ fn resize_arms_a_one_shot_terminal_clear_to_evict_stale_activity_icons() {
     app.overlays.activity.set_images(ActivityBarImages {
         explorer_active: String::new(),
         explorer_inactive: String::new(),
+        explorer_hovered: String::new(),
         search_active: String::new(),
         search_inactive: String::new(),
+        search_hovered: String::new(),
         source_control_active: String::new(),
         source_control_inactive: String::new(),
+        source_control_hovered: String::new(),
         remote_active: String::new(),
         remote_inactive: String::new(),
+        remote_hovered: String::new(),
         run_debug_active: String::new(),
         run_debug_inactive: String::new(),
+        run_debug_hovered: String::new(),
         settings_active: String::new(),
         settings_inactive: String::new(),
+        settings_hovered: String::new(),
     });
     app.on_resize();
     assert!(
@@ -4978,16 +4990,22 @@ fn activity_bar_icons_moving_within_the_flush_arms_a_one_shot_terminal_clear() {
     app.overlays.activity.set_images(ActivityBarImages {
         explorer_active: String::new(),
         explorer_inactive: String::new(),
+        explorer_hovered: String::new(),
         search_active: String::new(),
         search_inactive: String::new(),
+        search_hovered: String::new(),
         source_control_active: String::new(),
         source_control_inactive: String::new(),
+        source_control_hovered: String::new(),
         remote_active: String::new(),
         remote_inactive: String::new(),
+        remote_hovered: String::new(),
         run_debug_active: String::new(),
         run_debug_inactive: String::new(),
+        run_debug_hovered: String::new(),
         settings_active: String::new(),
         settings_inactive: String::new(),
+        settings_hovered: String::new(),
     });
     let place = |app: &mut App, base: u16| {
         app.sidebar_areas.explorer_icon = Rect::new(0, base, 2, 1);
@@ -11267,6 +11285,100 @@ fn black_theme_terminal_button_hover_paints_teal_pill() {
         "hovered button wears the teal pill"
     );
     assert_eq!(buf[plus].fg, Color::White);
+}
+
+#[test]
+fn hovering_a_non_selected_activity_icon_emits_its_hovered_variant() {
+    use ratatui::layout::Rect;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    // Distinguishable payloads so the emitted set reveals which variant won.
+    app.overlays.activity.set_images(ActivityBarImages {
+        explorer_active: "EA".into(),
+        explorer_inactive: "EI".into(),
+        explorer_hovered: "EH".into(),
+        search_active: "SA".into(),
+        search_inactive: "SI".into(),
+        search_hovered: "SH".into(),
+        source_control_active: "CA".into(),
+        source_control_inactive: "CI".into(),
+        source_control_hovered: "CH".into(),
+        remote_active: "RA".into(),
+        remote_inactive: "RI".into(),
+        remote_hovered: "RH".into(),
+        run_debug_active: "DA".into(),
+        run_debug_inactive: "DI".into(),
+        run_debug_hovered: "DH".into(),
+        settings_active: "GA".into(),
+        settings_inactive: "GI".into(),
+        settings_hovered: "GH".into(),
+    });
+    // Every view icon needs a non-empty block or the emit early-returns.
+    app.sidebar_areas.explorer_icon = Rect::new(0, 0, 2, 1);
+    app.sidebar_areas.search_icon = Rect::new(0, 2, 2, 1);
+    app.sidebar_areas.source_control_icon = Rect::new(0, 4, 2, 1);
+    app.sidebar_areas.remote_icon = Rect::new(0, 6, 2, 1);
+    app.sidebar_areas.run_debug_icon = Rect::new(0, 8, 2, 1);
+    app.sidebar_view = SidebarView::Explorer;
+    // Hover Search, a non-selected icon.
+    app.hovered_activity_icon = Some(ActivityIcon::Search);
+    let emitted: Vec<&str> = app
+        .pending_activity_image_overlays()
+        .into_iter()
+        .map(|(_, s)| s)
+        .collect();
+    assert!(
+        emitted.contains(&"SH"),
+        "the hovered search icon emits its hovered variant"
+    );
+    assert!(
+        !emitted.contains(&"SI"),
+        "search drops its resting variant while hovered"
+    );
+    assert!(
+        emitted.contains(&"EA"),
+        "the selected explorer view still wins with its active variant"
+    );
+}
+
+#[test]
+fn moving_over_an_activity_icon_marks_it_hovered_and_redirties_the_overlay() {
+    use ratatui::layout::Rect;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.sidebar_areas.search_icon = Rect::new(0, 4, 2, 2);
+    // Baseline: no hover, icons already emitted (clean).
+    app.hovered_activity_icon = None;
+    app.overlays.activity.mark_emitted();
+    assert!(!app.overlays.activity.is_dirty());
+    let moved = |col: u16, row: u16| crossterm::event::MouseEvent {
+        kind: crossterm::event::MouseEventKind::Moved,
+        column: col,
+        row,
+        modifiers: KeyModifiers::NONE,
+    };
+    // Pointer enters the search icon (rows 4..6).
+    app.handle_mouse(moved(0, 5));
+    assert_eq!(app.hovered_activity_icon, Some(ActivityIcon::Search));
+    assert!(
+        app.overlays.activity.is_dirty(),
+        "entering an icon re-emits the swapped image"
+    );
+    // Drifting within the same icon costs nothing: no re-dirty.
+    app.overlays.activity.mark_emitted();
+    app.handle_mouse(moved(1, 4));
+    assert_eq!(app.hovered_activity_icon, Some(ActivityIcon::Search));
+    assert!(
+        !app.overlays.activity.is_dirty(),
+        "drifting within one icon does not re-emit"
+    );
+    // Leaving the bar clears the hover and re-emits the resting icon.
+    app.handle_mouse(moved(40, 20));
+    assert_eq!(app.hovered_activity_icon, None);
+    assert!(
+        app.overlays.activity.is_dirty(),
+        "leaving the icon re-emits its resting variant"
+    );
 }
 
 #[test]

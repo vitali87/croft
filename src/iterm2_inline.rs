@@ -81,6 +81,32 @@ pub fn compose_icon(
     ))
 }
 
+/// Visual state of an activity-bar icon, mirroring VS Code's activity bar:
+/// `Inactive` is the muted grey resting glyph, `Hovered` brightens it to the
+/// active foreground while the pointer is over it (no selection bar), and
+/// `Active` is the selected view: bright glyph plus the blue left pill.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum IconState {
+    Inactive,
+    Hovered,
+    Active,
+}
+
+impl IconState {
+    /// Whether the glyph wears the bright (active-foreground) tint. Both the
+    /// hovered and active states do; only the resting state stays muted.
+    fn tinted(self) -> bool {
+        matches!(self, IconState::Hovered | IconState::Active)
+    }
+
+    /// Whether the blue left selection pill is painted. Only the active
+    /// (selected-view) state shows it, so a merely-hovered icon stays
+    /// distinguishable from the selected one.
+    fn pill(self) -> bool {
+        matches!(self, IconState::Active)
+    }
+}
+
 /// Like [`compose_icon`], but rasterises an SVG codicon directly at the target
 /// icon pixel size instead of decoding-then-downscaling a raster source. The
 /// glyph is rendered crisp at the exact cell size, tinted, and composed onto
@@ -90,7 +116,7 @@ pub fn compose_icon_svg(
     src_svg: &[u8],
     canvas_w: u32,
     canvas_h: u32,
-    is_active: bool,
+    state: IconState,
     bg: Rgba<u8>,
     off_y_bias: i64,
 ) -> Option<Vec<u8>> {
@@ -114,7 +140,7 @@ pub fn compose_icon_svg(
     // colour on top, mirroring `tint_rgba` for the raster path. tiny-skia stores
     // premultiplied RGBA but the alpha byte itself is straight, which is all the
     // alpha-composited overlay below needs.
-    let tint = if is_active {
+    let tint = if state.tinted() {
         ACTIVE_TINT
     } else {
         INACTIVE_TINT
@@ -125,7 +151,12 @@ pub fn compose_icon_svg(
         *px = Rgba([tint.0[0], tint.0[1], tint.0[2], data[i * 4 + 3]]);
     }
     Some(finish_icon(
-        &glyph, canvas_w, canvas_h, is_active, bg, off_y_bias,
+        &glyph,
+        canvas_w,
+        canvas_h,
+        state.pill(),
+        bg,
+        off_y_bias,
     ))
 }
 
@@ -973,7 +1004,7 @@ mod tests {
         // canvas dimensions, carry an opaque glyph, and keep the bar-bg fill in
         // the corners (the codicon never bleeds to the canvas edge).
         let bg = Rgba([0x1e, 0x22, 0x2e, 0xff]);
-        let baked = compose_icon_svg(EXPLORER_SRC_SVG, 40, 40, false, bg, 0)
+        let baked = compose_icon_svg(EXPLORER_SRC_SVG, 40, 40, IconState::Inactive, bg, 0)
             .expect("the files codicon SVG must rasterise");
         let decoded = image::load_from_memory_with_format(&baked, image::ImageFormat::Png)
             .unwrap()
@@ -996,7 +1027,7 @@ mod tests {
     #[test]
     fn compose_icon_svg_active_paints_the_blue_pill() {
         let bg = Rgba([0x1e, 0x22, 0x2e, 0xff]);
-        let baked = compose_icon_svg(EXPLORER_SRC_SVG, 40, 40, true, bg, 0).unwrap();
+        let baked = compose_icon_svg(EXPLORER_SRC_SVG, 40, 40, IconState::Active, bg, 0).unwrap();
         let decoded = image::load_from_memory_with_format(&baked, image::ImageFormat::Png)
             .unwrap()
             .to_rgba8();
@@ -1009,6 +1040,44 @@ mod tests {
             }
         }
         assert!(saw_pill, "active icon must carry the left-edge blue pill");
+    }
+
+    #[test]
+    fn compose_icon_svg_hovered_brightens_glyph_without_the_pill() {
+        // The hovered variant wears the active (bright) tint so the user sees
+        // the icon light up under the pointer, but it must NOT paint the blue
+        // selection pill — that bar is reserved for the actually-selected view.
+        let bg = Rgba([0x1e, 0x22, 0x2e, 0xff]);
+        let hovered =
+            compose_icon_svg(EXPLORER_SRC_SVG, 40, 40, IconState::Hovered, bg, 0).unwrap();
+        let active = compose_icon_svg(EXPLORER_SRC_SVG, 40, 40, IconState::Active, bg, 0).unwrap();
+        let inactive =
+            compose_icon_svg(EXPLORER_SRC_SVG, 40, 40, IconState::Inactive, bg, 0).unwrap();
+        let decode = |b: &[u8]| {
+            image::load_from_memory_with_format(b, image::ImageFormat::Png)
+                .unwrap()
+                .to_rgba8()
+        };
+        let (hov, inact) = (decode(&hovered), decode(&inactive));
+        // No blue pill anywhere down the left edge of the hovered glyph.
+        let pill = [ACTIVE_PILL[0], ACTIVE_PILL[1], ACTIVE_PILL[2], 0xff];
+        assert!(
+            (0..40).all(|y| hov.get_pixel(0, y).0 != pill),
+            "hovered icon must not carry the selection pill"
+        );
+        // The brighter tint makes the hovered render differ from the muted
+        // resting one, and the (pill-bearing) active render differs from both.
+        assert_ne!(
+            hovered, inactive,
+            "hover must visibly brighten the resting glyph"
+        );
+        assert_ne!(
+            hovered, active,
+            "hover (no pill) must stay distinct from the selected state"
+        );
+        // Sanity: both renders are still the requested canvas size.
+        assert_eq!((hov.width(), hov.height()), (40, 40));
+        assert_eq!((inact.width(), inact.height()), (40, 40));
     }
 
     #[test]

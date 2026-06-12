@@ -64,6 +64,20 @@ pub enum SidebarView {
     RunDebug,
 }
 
+/// The clickable icons on the activity bar, used to track which one the
+/// pointer is hovering. Mirrors `SidebarView` plus the bottom-anchored
+/// settings gear, which is not a sidebar view but is still a hoverable
+/// button.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ActivityIcon {
+    Explorer,
+    Search,
+    SourceControl,
+    Remote,
+    RunDebug,
+    Settings,
+}
+
 const ACTIVITY_BAR_WIDTH: u16 = 4;
 
 const ACTIVITY_ICON_HEIGHT: u16 = 2;
@@ -195,18 +209,25 @@ struct SidebarAreas {
 pub struct ActivityBarImages {
     explorer_active: String,
     explorer_inactive: String,
+    explorer_hovered: String,
     search_active: String,
     search_inactive: String,
+    search_hovered: String,
     source_control_active: String,
     source_control_inactive: String,
+    source_control_hovered: String,
     remote_active: String,
     remote_inactive: String,
+    remote_hovered: String,
     run_debug_active: String,
     run_debug_inactive: String,
+    run_debug_hovered: String,
     /// The settings gear. `active` is shown while its menu is open so the
-    /// button reads as pressed, mirroring the view icons' selected state.
+    /// button reads as pressed, mirroring the view icons' selected state;
+    /// `hovered` brightens it while the pointer rests on it.
     settings_active: String,
     settings_inactive: String,
+    settings_hovered: String,
 }
 
 /// Single source of truth for the application's user-facing name.
@@ -974,6 +995,11 @@ pub struct App {
     /// hit-testing (the Black theme's teal pill behind the terminal `-`/`+`
     /// buttons) reads this instead of tracking enter/leave transitions.
     pointer_cell: Option<(u16, u16)>,
+    /// Which activity-bar icon the pointer is currently over, if any. Drives
+    /// the hover variant of the icon (brightened glyph, no selection pill).
+    /// Changing it arms `overlays.activity.mark_dirty()` so the swapped
+    /// pre-baked image is re-emitted; it never triggers a re-bake.
+    hovered_activity_icon: Option<ActivityIcon>,
     /// On-screen keyboard for touch-only environments (Termux). `Some`
     /// while the bottom keyboard band is visible; taps on its keys
     /// synthesize `KeyEvent`s through `handle_key`, so they reach the
@@ -1496,6 +1522,7 @@ impl App {
             terminal_add_buttons: Vec::new(),
             terminal_close_buttons: Vec::new(),
             pointer_cell: None,
+            hovered_activity_icon: None,
             osk: None,
             osk_auto: crate::iterm2_inline::detect_osk_auto(),
             last_content_width: 0,
@@ -1644,22 +1671,25 @@ impl App {
         // is the icon's stable per-slot Kitty image/placement id (shared by its
         // active and inactive variants so swapping one for the other replaces
         // the placement in place); ignored on the iTerm2 path.
-        let encode =
-            |src_svg: &[u8], is_active: bool, off_y_bias: i64, id: u32| -> Option<String> {
-                let baked = crate::iterm2_inline::compose_icon_svg(
-                    src_svg, canvas_w, canvas_h, is_active, icon_bg, off_y_bias,
-                )?;
-                // preserveAspectRatio=0: stretch to exactly fill 4×2 cells.
-                // Since the canvas was composed at exactly that pixel size,
-                // there's no actual scaling and the codicon's square area
-                // remains a true square on screen.
-                let raw = crate::iterm2_inline::build_inline_image(
-                    protocol, &baked, w_cells, h_cells, false, id,
-                )?;
-                Some(crate::iterm2_inline::maybe_tmux_wrap(
-                    protocol, is_tmux, raw,
-                ))
-            };
+        let encode = |src_svg: &[u8],
+                      state: crate::iterm2_inline::IconState,
+                      off_y_bias: i64,
+                      id: u32|
+         -> Option<String> {
+            let baked = crate::iterm2_inline::compose_icon_svg(
+                src_svg, canvas_w, canvas_h, state, icon_bg, off_y_bias,
+            )?;
+            // preserveAspectRatio=0: stretch to exactly fill 4×2 cells.
+            // Since the canvas was composed at exactly that pixel size,
+            // there's no actual scaling and the codicon's square area
+            // remains a true square on screen.
+            let raw = crate::iterm2_inline::build_inline_image(
+                protocol, &baked, w_cells, h_cells, false, id,
+            )?;
+            Some(crate::iterm2_inline::maybe_tmux_wrap(
+                protocol, is_tmux, raw,
+            ))
+        };
         // View icons render dead-centered in their cell block; the gear gets a
         // downward bias so it bottom-aligns within its (bottom-inset) block,
         // shaving the canvas's bottom padding off the gap above the status bar.
@@ -1667,79 +1697,54 @@ impl App {
         // clamps it, so this stays correct at any cell size.
         let gear_off_y_bias = canvas_h as i64;
         use crate::iterm2_inline as ki;
-        let explorer_active = encode(ki::EXPLORER_SRC_SVG, true, 0, ki::KITTY_ID_EXPLORER);
-        let explorer_inactive = encode(ki::EXPLORER_SRC_SVG, false, 0, ki::KITTY_ID_EXPLORER);
-        let search_active = encode(ki::SEARCH_SRC_SVG, true, 0, ki::KITTY_ID_SEARCH);
-        let search_inactive = encode(ki::SEARCH_SRC_SVG, false, 0, ki::KITTY_ID_SEARCH);
-        let source_control_active = encode(
-            ki::SOURCE_CONTROL_SRC_SVG,
-            true,
-            0,
-            ki::KITTY_ID_SOURCE_CONTROL,
-        );
-        let source_control_inactive = encode(
-            ki::SOURCE_CONTROL_SRC_SVG,
-            false,
-            0,
-            ki::KITTY_ID_SOURCE_CONTROL,
-        );
-        let remote_active = encode(ki::REMOTE_SRC_SVG, true, 0, ki::KITTY_ID_REMOTE);
-        let remote_inactive = encode(ki::REMOTE_SRC_SVG, false, 0, ki::KITTY_ID_REMOTE);
-        let run_debug_active = encode(ki::RUN_DEBUG_SRC_SVG, true, 0, ki::KITTY_ID_RUN_DEBUG_BAR);
-        let run_debug_inactive =
-            encode(ki::RUN_DEBUG_SRC_SVG, false, 0, ki::KITTY_ID_RUN_DEBUG_BAR);
-        let settings_active = encode(
-            ki::SETTINGS_GEAR_SRC_SVG,
-            true,
-            gear_off_y_bias,
-            ki::KITTY_ID_SETTINGS,
-        );
-        let settings_inactive = encode(
-            ki::SETTINGS_GEAR_SRC_SVG,
-            false,
-            gear_off_y_bias,
-            ki::KITTY_ID_SETTINGS,
-        );
+        // Bake all three states per icon up front (selected / hovered / resting)
+        // so the render path only ever swaps which pre-encoded sequence it emits
+        // — a hover never triggers a re-bake, just a different cached string.
+        let bake = |src: &[u8], off_y_bias: i64, id: u32| -> Option<(String, String, String)> {
+            Some((
+                encode(src, ki::IconState::Active, off_y_bias, id)?,
+                encode(src, ki::IconState::Inactive, off_y_bias, id)?,
+                encode(src, ki::IconState::Hovered, off_y_bias, id)?,
+            ))
+        };
         if let (
-            Some(ea),
-            Some(ei),
-            Some(sa),
-            Some(si),
-            Some(sca),
-            Some(sci),
-            Some(ra),
-            Some(ri),
-            Some(rda),
-            Some(rdi),
-            Some(gea),
-            Some(gei),
+            Some((ea, ei, eh)),
+            Some((sa, si, sh)),
+            Some((sca, sci, sch)),
+            Some((ra, ri, rh)),
+            Some((rda, rdi, rdh)),
+            Some((gea, gei, geh)),
         ) = (
-            explorer_active,
-            explorer_inactive,
-            search_active,
-            search_inactive,
-            source_control_active,
-            source_control_inactive,
-            remote_active,
-            remote_inactive,
-            run_debug_active,
-            run_debug_inactive,
-            settings_active,
-            settings_inactive,
+            bake(ki::EXPLORER_SRC_SVG, 0, ki::KITTY_ID_EXPLORER),
+            bake(ki::SEARCH_SRC_SVG, 0, ki::KITTY_ID_SEARCH),
+            bake(ki::SOURCE_CONTROL_SRC_SVG, 0, ki::KITTY_ID_SOURCE_CONTROL),
+            bake(ki::REMOTE_SRC_SVG, 0, ki::KITTY_ID_REMOTE),
+            bake(ki::RUN_DEBUG_SRC_SVG, 0, ki::KITTY_ID_RUN_DEBUG_BAR),
+            bake(
+                ki::SETTINGS_GEAR_SRC_SVG,
+                gear_off_y_bias,
+                ki::KITTY_ID_SETTINGS,
+            ),
         ) {
             self.overlays.activity.set_images(ActivityBarImages {
                 explorer_active: ea,
                 explorer_inactive: ei,
+                explorer_hovered: eh,
                 search_active: sa,
                 search_inactive: si,
+                search_hovered: sh,
                 source_control_active: sca,
                 source_control_inactive: sci,
+                source_control_hovered: sch,
                 remote_active: ra,
                 remote_inactive: ri,
+                remote_hovered: rh,
                 run_debug_active: rda,
                 run_debug_inactive: rdi,
+                run_debug_hovered: rdh,
                 settings_active: gea,
                 settings_inactive: gei,
+                settings_hovered: geh,
             });
         }
         // Codeberg badge for the welcome panel: 2 cells wide, 1 cell tall,
@@ -2077,28 +2082,42 @@ impl App {
         {
             return Vec::new();
         }
+        // Three-way per icon: the selected view shows the active (pilled)
+        // variant; otherwise the pointer-hovered icon brightens (no pill); the
+        // rest stay muted. Selected always wins over hovered.
+        let hov = self.hovered_activity_icon;
         let exp_state = if self.sidebar_view == SidebarView::Explorer {
             &images.explorer_active
+        } else if hov == Some(ActivityIcon::Explorer) {
+            &images.explorer_hovered
         } else {
             &images.explorer_inactive
         };
         let sea_state = if self.sidebar_view == SidebarView::Search {
             &images.search_active
+        } else if hov == Some(ActivityIcon::Search) {
+            &images.search_hovered
         } else {
             &images.search_inactive
         };
         let scm_state = if self.sidebar_view == SidebarView::SourceControl {
             &images.source_control_active
+        } else if hov == Some(ActivityIcon::SourceControl) {
+            &images.source_control_hovered
         } else {
             &images.source_control_inactive
         };
         let rem_state = if self.sidebar_view == SidebarView::Remote {
             &images.remote_active
+        } else if hov == Some(ActivityIcon::Remote) {
+            &images.remote_hovered
         } else {
             &images.remote_inactive
         };
         let rdb_state = if self.sidebar_view == SidebarView::RunDebug {
             &images.run_debug_active
+        } else if hov == Some(ActivityIcon::RunDebug) {
+            &images.run_debug_hovered
         } else {
             &images.run_debug_inactive
         };
@@ -2107,6 +2126,8 @@ impl App {
         let set_block = self.sidebar_areas.settings_icon;
         let set_state = if self.settings_menu_active() {
             &images.settings_active
+        } else if hov == Some(ActivityIcon::Settings) {
+            &images.settings_hovered
         } else {
             &images.settings_inactive
         };
@@ -2696,7 +2717,39 @@ impl App {
         self.completion_request_id = Some(id);
     }
 
+    /// Map a pointer cell to the activity-bar icon under it, if any. Uses the
+    /// same per-icon rectangles the click handler hit-tests, so hover and
+    /// click target exactly the same cells.
+    fn activity_icon_at(&self, col: u16, row: u16) -> Option<ActivityIcon> {
+        let a = &self.sidebar_areas;
+        if rect_contains(a.explorer_icon, col, row) {
+            Some(ActivityIcon::Explorer)
+        } else if rect_contains(a.search_icon, col, row) {
+            Some(ActivityIcon::Search)
+        } else if rect_contains(a.source_control_icon, col, row) {
+            Some(ActivityIcon::SourceControl)
+        } else if rect_contains(a.remote_icon, col, row) {
+            Some(ActivityIcon::Remote)
+        } else if rect_contains(a.run_debug_icon, col, row) {
+            Some(ActivityIcon::RunDebug)
+        } else if rect_contains(a.settings_icon, col, row) {
+            Some(ActivityIcon::Settings)
+        } else {
+            None
+        }
+    }
+
     fn on_mouse_moved(&mut self, col: u16, row: u16, in_editor: bool) {
+        // Activity-bar hover: brighten the icon under the pointer. Re-emit the
+        // swapped pre-baked image only when the hovered icon actually changes,
+        // so a pointer drifting within one icon (or anywhere else) costs
+        // nothing. Computed before the tab/editor early-returns below so the
+        // hover clears the moment the pointer leaves the bar.
+        let new_hover = self.activity_icon_at(col, row);
+        if self.hovered_activity_icon != new_hover {
+            self.hovered_activity_icon = new_hover;
+            self.overlays.activity.mark_dirty();
+        }
         // Editor tab strip: dwell over a tab to surface its full path. The
         // dwell only restarts when the pointer crosses into a *different*
         // tab, so the tooltip keeps showing while the pointer drifts a few
@@ -4207,47 +4260,59 @@ impl App {
         let remote_active = self.sidebar_view == SidebarView::Remote;
         let run_debug_active = self.sidebar_view == SidebarView::RunDebug;
         let settings_active = self.settings_menu_active();
+        // Hover brightens the glyph (like active) but draws no selection pill,
+        // mirroring the image path's hovered variant. Selected wins over hover.
+        let hov = self.hovered_activity_icon;
+        let explorer_hovered = hov == Some(ActivityIcon::Explorer);
+        let search_hovered = hov == Some(ActivityIcon::Search);
+        let source_control_hovered = hov == Some(ActivityIcon::SourceControl);
+        let remote_hovered = hov == Some(ActivityIcon::Remote);
+        let run_debug_hovered = hov == Some(ActivityIcon::RunDebug);
+        let settings_hovered = hov == Some(ActivityIcon::Settings);
 
         let active_color = Color::White;
         let inactive_color = Color::Rgb(0x6c, 0x7d, 0x9c);
         let glyph_x = activity_icon_glyph_x(area);
-        let render_glyph =
-            |frame: &mut ratatui::Frame, block: Rect, glyph: char, is_active: bool| {
-                let mid = block.y + block.height.saturating_sub(1) / 2;
-                if is_active {
-                    let pill = Rect {
-                        x: block.x,
-                        y: mid,
-                        width: 1,
-                        height: 1,
-                    };
-                    frame.render_widget(
-                        ratatui::widgets::Paragraph::new("▎")
-                            .style(Style::default().fg(active_bar).bg(bg_color)),
-                        pill,
-                    );
-                }
-                let cell = Rect {
-                    x: glyph_x,
+        let render_glyph = |frame: &mut ratatui::Frame,
+                            block: Rect,
+                            glyph: char,
+                            is_active: bool,
+                            is_hovered: bool| {
+            let mid = block.y + block.height.saturating_sub(1) / 2;
+            if is_active {
+                let pill = Rect {
+                    x: block.x,
                     y: mid,
                     width: 1,
                     height: 1,
                 };
-                let color = if is_active {
-                    active_color
-                } else {
-                    inactive_color
-                };
                 frame.render_widget(
-                    ratatui::widgets::Paragraph::new(glyph.to_string()).style(
-                        Style::default()
-                            .fg(color)
-                            .bg(bg_color)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    cell,
+                    ratatui::widgets::Paragraph::new("▎")
+                        .style(Style::default().fg(active_bar).bg(bg_color)),
+                    pill,
                 );
+            }
+            let cell = Rect {
+                x: glyph_x,
+                y: mid,
+                width: 1,
+                height: 1,
             };
+            let color = if is_active || is_hovered {
+                active_color
+            } else {
+                inactive_color
+            };
+            frame.render_widget(
+                ratatui::widgets::Paragraph::new(glyph.to_string()).style(
+                    Style::default()
+                        .fg(color)
+                        .bg(bg_color)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                cell,
+            );
+        };
 
         if !self.overlays.activity.has_images() {
             // Glyph fallback path: render the codicon and a separate active
@@ -4259,30 +4324,35 @@ impl App {
                 explorer_block,
                 crate::icons::ACTIVITY_EXPLORER,
                 explorer_active,
+                explorer_hovered,
             );
             render_glyph(
                 frame,
                 search_block,
                 crate::icons::ACTIVITY_SEARCH,
                 search_active,
+                search_hovered,
             );
             render_glyph(
                 frame,
                 source_control_block,
                 crate::icons::ACTIVITY_SOURCE_CONTROL,
                 source_control_active,
+                source_control_hovered,
             );
             render_glyph(
                 frame,
                 remote_block,
                 crate::icons::ACTIVITY_REMOTE,
                 remote_active,
+                remote_hovered,
             );
             render_glyph(
                 frame,
                 run_debug_block,
                 crate::icons::ACTIVITY_RUN_DEBUG,
                 run_debug_active,
+                run_debug_hovered,
             );
             if settings_block.width > 0 {
                 render_glyph(
@@ -4290,6 +4360,7 @@ impl App {
                     settings_block,
                     crate::icons::ACTIVITY_SETTINGS,
                     settings_active,
+                    settings_hovered,
                 );
             }
         }
@@ -4867,6 +4938,14 @@ impl App {
             // to re-emit it.
             self.overlays.welcome.mark_dirty();
             self.overlays.badge.set_target(None);
+            // Feed the render-time pointer cell to every editor group so the
+            // tab strip can light the hovered tab body / close-cross pill,
+            // mirroring the terminal pane buttons' hover affordance.
+            let pointer = self.pointer_cell;
+            self.editor.hover_pointer = pointer;
+            if let Some(split) = self.editor_split.as_mut() {
+                split.hover_pointer = pointer;
+            }
             // Render either a single editor group or two side-by-side
             // columns, and report which column has focus so the
             // completion / hover popups anchor there.

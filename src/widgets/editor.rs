@@ -4378,6 +4378,11 @@ pub struct EditorTabs {
     /// Toggle state matching `search_highlight_term`. Same propagation
     /// strategy: every newly-created editor inherits these.
     search_highlight_opts: crate::widgets::search::SearchOpts,
+    /// Last pointer cell, fed in by `App` before each render so the tab
+    /// strip can paint a hover lift on the tab body under the pointer and a
+    /// pill behind the close `\u{2715}` cell when the pointer rests on it.
+    /// `None` when the pointer is off-screen or unknown.
+    pub hover_pointer: Option<(u16, u16)>,
 }
 
 impl EditorTabs {
@@ -4391,6 +4396,7 @@ impl EditorTabs {
             last_full_area: Rect::default(),
             search_highlight_term: None,
             search_highlight_opts: crate::widgets::search::SearchOpts::default(),
+            hover_pointer: None,
         }
     }
 
@@ -5008,6 +5014,16 @@ const TAB_INACTIVE_BG: Color = Color::Rgb(0x2a, 0x2f, 0x3e);
 const TAB_ACTIVE_BG: Color = Color::Rgb(0x1e, 0x3a, 0x6e);
 const TAB_INACTIVE_FG: Color = Color::Rgb(0x9d, 0xa5, 0xb4);
 const TAB_ACTIVE_FG: Color = Color::White;
+/// Lift applied to an inactive tab's body while the pointer rests anywhere
+/// over it (VS Code `tab.hoverBackground`). Croft Dark lifts the slate chip
+/// toward navy; the active tab is already prominent so it never lifts.
+const TAB_HOVER_BG: Color = Color::Rgb(0x34, 0x50, 0x7f);
+/// Black theme counterpart of `TAB_HOVER_BG`.
+const TAB_HOVER_BG_BRAND: Color = Color::Rgb(0x2f, 0x35, 0x50);
+/// Pill painted behind the close `\u{2715}` cell when the pointer is on it
+/// (VS Code `toolbar.hoverBackground`). Croft Dark uses a brightened navy;
+/// the Black theme reuses the terminal-button teal (`POPUP_SEL_BG`).
+const TAB_CLOSE_PILL_BG: Color = Color::Rgb(0x2f, 0x5a, 0xa8);
 
 impl Widget for &mut EditorTabs {
     fn render(self, area: Rect, buf: &mut Buffer) {
@@ -5081,6 +5097,7 @@ impl Widget for &mut EditorTabs {
         } else {
             TAB_ACTIVE_BG
         };
+        let pointer = self.hover_pointer;
         for (i, ed) in self.editors.iter().enumerate() {
             let label_text = tab_label(ed);
             let label_chars = label_text.chars().count() as u16;
@@ -5095,12 +5112,27 @@ impl Widget for &mut EditorTabs {
                 continue;
             }
             let is_active = i == active;
-            let bg = if is_active {
+            let close_x = cursor_x + 1 + label_chars + 1;
+            // Treatment C: the pointer resting anywhere on a tab lifts an
+            // inactive tab's body (the active tab is already prominent), and
+            // resting on the close cross gives that single cell a pill.
+            let tab_hovered = pointer.is_some_and(|(px, py)| {
+                py == strip.y && px >= cursor_x && px < cursor_x.saturating_add(width)
+            });
+            let on_close = pointer == Some((close_x, strip.y));
+            let hover_lift = tab_hovered && !is_active;
+            let bg = if hover_lift {
+                if brand {
+                    TAB_HOVER_BG_BRAND
+                } else {
+                    TAB_HOVER_BG
+                }
+            } else if is_active {
                 active_tab_bg
             } else {
                 TAB_INACTIVE_BG
             };
-            let fg = if is_active {
+            let fg = if is_active || hover_lift {
                 TAB_ACTIVE_FG
             } else {
                 TAB_INACTIVE_FG
@@ -5116,8 +5148,26 @@ impl Widget for &mut EditorTabs {
             // Layout: " " + label + " " + ✕ + " "
             let padded = format!(" {label_text} \u{2715} ");
             buf.set_string(cursor_x, strip.y, &padded, style);
+            // Overpaint the close cross with its hover pill so the user sees
+            // exactly which X their click will land on.
+            if on_close {
+                let pill_bg = if brand {
+                    crate::gradient::rgb_color(crate::gradient::POPUP_SEL_BG)
+                } else {
+                    TAB_CLOSE_PILL_BG
+                };
+                buf.set_string(
+                    close_x,
+                    strip.y,
+                    "\u{2715}",
+                    Style::default()
+                        .fg(Color::White)
+                        .bg(pill_bg)
+                        .add_modifier(Modifier::BOLD),
+                );
+            }
             self.tab_screen_ranges.push((cursor_x, width));
-            self.tab_close_x.push(cursor_x + 1 + label_chars + 1);
+            self.tab_close_x.push(close_x);
             cursor_x = cursor_x.saturating_add(width);
         }
 
@@ -8621,6 +8671,78 @@ mod tests {
         assert_eq!(t.close_at(tab0_x, area.y), None);
         // Clicks outside the strip row are not close clicks.
         assert_eq!(t.close_at(cx0, area.y + 2), None);
+    }
+
+    #[test]
+    fn hovering_the_close_cross_paints_a_pill_on_that_cell() {
+        use ratatui::buffer::Buffer;
+        let mut t = EditorTabs::new();
+        t.editors[0].path = Some(std::path::PathBuf::from("/foo.rs"));
+        t.add_tab_with_path(std::path::PathBuf::from("/bar.rs"));
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 10,
+        };
+        // First render to learn where the close crosses landed.
+        let mut buf = Buffer::empty(area);
+        (&mut t).render(area, &mut buf);
+        let cx = t.close_screen_x(0).expect("two tabs -> tab 0 has a cross");
+        let other = t.close_screen_x(1).expect("tab 1 has a cross");
+        // Hover the first tab's cross and re-render.
+        t.hover_pointer = Some((cx, area.y));
+        let mut buf = Buffer::empty(area);
+        (&mut t).render(area, &mut buf);
+        assert_eq!(
+            buf[(cx, area.y)].bg,
+            TAB_CLOSE_PILL_BG,
+            "the hovered cross cell wears the pill"
+        );
+        assert_eq!(buf[(cx, area.y)].fg, Color::White);
+        assert_eq!(
+            buf[(cx, area.y)].symbol(),
+            "\u{2715}",
+            "the pill sits behind the cross glyph, not a blank cell"
+        );
+        assert_ne!(
+            buf[(other, area.y)].bg,
+            TAB_CLOSE_PILL_BG,
+            "an un-hovered cross gets no pill"
+        );
+    }
+
+    #[test]
+    fn hovering_an_inactive_tab_lifts_its_body_not_the_active_one() {
+        use ratatui::buffer::Buffer;
+        let mut t = EditorTabs::new();
+        t.editors[0].path = Some(std::path::PathBuf::from("/foo.rs"));
+        // Adding a tab makes the new one (index 1) active; index 0 is inactive.
+        t.add_tab_with_path(std::path::PathBuf::from("/bar.rs"));
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 10,
+        };
+        let mut buf = Buffer::empty(area);
+        (&mut t).render(area, &mut buf);
+        let (x0, _) = t.tab_screen_x(0).unwrap();
+        let (x1, _) = t.tab_screen_x(1).unwrap();
+        // Hover the inactive tab's label area (one cell past its left pad).
+        t.hover_pointer = Some((x0 + 1, area.y));
+        let mut buf = Buffer::empty(area);
+        (&mut t).render(area, &mut buf);
+        assert_eq!(
+            buf[(x0 + 1, area.y)].bg,
+            TAB_HOVER_BG,
+            "an inactive tab body lifts under the pointer"
+        );
+        assert_ne!(
+            buf[(x1 + 1, area.y)].bg,
+            TAB_HOVER_BG,
+            "the active tab keeps its own bg when a sibling is hovered"
+        );
     }
 
     #[test]
