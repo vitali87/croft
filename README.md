@@ -26,7 +26,7 @@ The non-negotiables behind every decision in croft:
 * **Bottom right pane (terminal):** a real interactive shell, your `$SHELL` on a real PTY.
 * All three panes resize by dragging the seams between them, including the seam between the two editor columns when the editor is split.
 
-The editor speaks LSP for completion, hover, go-to-definition / references / implementations, rename, and diagnostics. croft auto-installs the TypeScript server on first use and uses `basedpyright`, `ruff`, `ty`, `rust-analyzer`, and `gopls` from your PATH if present, each anchored at the file's own project root so monorepo sub-projects resolve correctly.
+The editor speaks LSP for completion, hover, go-to-definition / references / implementations, rename, and diagnostics, each anchored at the file's own project root so monorepo sub-projects resolve correctly. For Python it runs Astral's `ty` as the primary server, with `basedpyright` as a fallback for the few capabilities `ty` does not yet advertise and `ruff` for lint; for TypeScript / JavaScript it runs `vtsls`. croft provisions `vtsls` (via npm) and `ty` / `ruff` (via uv, or `pkg` on Termux) for itself on first use, and picks up `basedpyright`, `rust-analyzer`, and `gopls` from your PATH if present.
 
 ## Requirements
 
