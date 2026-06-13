@@ -3036,8 +3036,7 @@ impl Editor {
     /// VS Code "Toggle Block Comment" (Shift+Alt+A): wrap the selection (or,
     /// with no selection, the current line) in the language's block-comment
     /// delimiters, or strip them when the selection already is a block
-    /// comment. Returns false for languages with no block comment (e.g.
-    /// Python).
+    /// comment. Returns false for languages with no block comment (e.g. YAML).
     pub fn toggle_block_comment(&mut self) -> bool {
         let Some((open, close)) = block_comment_tokens(self.lang) else {
             return false;
@@ -3830,8 +3829,9 @@ fn line_comment_token(lang: Option<LangKind>) -> Option<&'static str> {
 }
 
 /// The block-comment delimiters for a language (VS Code `blockComment`), or
-/// `None` for languages without one (e.g. Python), in which case Toggle Block
-/// Comment is a no-op.
+/// `None` for languages without one (e.g. YAML), in which case Toggle Block
+/// Comment is a no-op. Python has no real block comment, but VS Code maps the
+/// command onto a triple-quoted string, so it returns `""" """`.
 fn block_comment_tokens(lang: Option<LangKind>) -> Option<(&'static str, &'static str)> {
     match lang {
         Some(LangKind::Rust)
@@ -3843,6 +3843,9 @@ fn block_comment_tokens(lang: Option<LangKind>) -> Option<(&'static str, &'stati
         | Some(LangKind::Cpp)
         | Some(LangKind::Css) => Some(("/*", "*/")),
         Some(LangKind::Html) | Some(LangKind::Markdown) => Some(("<!--", "-->")),
+        // Python has no true block comment; VS Code's language config maps
+        // Toggle Block Comment onto a triple-quoted string (`""" """`).
+        Some(LangKind::Python) => Some(("\"\"\"", "\"\"\"")),
         _ => None,
     }
 }
@@ -9659,14 +9662,28 @@ mod tests {
     }
 
     #[test]
-    fn toggle_block_comment_python_falls_back_to_noop() {
+    fn toggle_block_comment_python_wraps_in_triple_quotes() {
+        // VS Code's Python language config defines blockComment as `""" """`,
+        // so Shift+Alt+A wraps the selection in a triple-quoted string.
         let mut e = editor_with("x = 1");
         e.lang = Some(LangKind::Python);
         e.selection = Some(EditorSelection {
             anchor: (0, 0),
             head: (0, 5),
         });
-        assert!(!e.toggle_block_comment());
+        assert!(e.toggle_block_comment());
+        assert_eq!(e.lines, vec!["\"\"\" x = 1 \"\"\""]);
+    }
+
+    #[test]
+    fn toggle_block_comment_python_unwraps_triple_quotes() {
+        let mut e = editor_with("\"\"\" x = 1 \"\"\"");
+        e.lang = Some(LangKind::Python);
+        e.selection = Some(EditorSelection {
+            anchor: (0, 0),
+            head: (0, 13),
+        });
+        assert!(e.toggle_block_comment());
         assert_eq!(e.lines, vec!["x = 1"]);
     }
 
