@@ -6,9 +6,9 @@ croft is built on [ratatui](https://ratatui.rs/) + [crossterm](https://github.co
 
 ## How the embedded terminal works
 
-`portable_pty::native_pty_system().openpty(...)` allocates a pseudoterminal and `spawn_command(...)` runs `$SHELL` on the slave side. A background thread drains the master fd into a `vt100::Parser`, which maintains the screen cell grid in memory. The render path walks `screen.cell(y, x)` for every cell in the pane and emits styled cells to the ratatui buffer with proper foreground / background / bold / italic / underline / reverse styles.
+`portable_pty::native_pty_system().openpty(...)` allocates a pseudoterminal and `spawn_command(...)` runs `$SHELL` on the slave side. A background thread reads the master fd and feeds the bytes to an `alacritty_terminal` `Processor::<StdSyncHandler>`, which applies them to an `alacritty_terminal` `Term` that maintains the screen cell grid in memory. The render path walks `term.grid()[point]` for every cell in the pane and emits styled cells to the ratatui buffer with proper foreground / background / bold / italic / underline / reverse styles.
 
-Resizes call `master.resize(...)` and `parser.set_size(...)` so programs like `htop`, `vim`, or your shell prompt redraw to fit the pane. Keystrokes from `crossterm`'s `Event::Key` are translated back to the byte sequences real terminals send (arrow keys to `\x1b[A`, `Ctrl+letter` to `0x01..0x1a`, `Alt+x` to `\x1b<x>`) and written to the master writer.
+Resizes call `master.resize(...)` and `term.resize(...)` so programs like `htop`, `vim`, or your shell prompt redraw to fit the pane. Keystrokes from `crossterm`'s `Event::Key` are translated back to the byte sequences real terminals send (arrow keys to `\x1b[A`, `Ctrl+letter` to `0x01..0x1a`, `Alt+x` to `\x1b<x>`) and written to the master writer.
 
 ## Project layout
 
@@ -18,7 +18,7 @@ src/
 ├── cli.rs               clap CLI: open path, setup-terminal / setup-iterm2 / setup-cross / remote / keys subcommands
 ├── clipboard.rs         native macOS clipboard read/write (NSPasteboard) with pbpaste fallback
 ├── ghostty.rs           Ghostty config keybinds (setup-ghostty): re-emit every croft chord as its CSI-u sequence so Ghostty's own binds don't swallow them
-├── git.rs               branch / dirty / ahead-behind status, plus anonymous git-protocol fetch for the welcome screen recents
+├── git.rs               branch / dirty / ahead-behind status, plus an anonymous shallow `git clone` (over the remote's HTTPS URL) fetching the welcome-screen recents
 ├── gradient.rs          shared orange→green corner gradient: the welcome activity box border and the Black-theme focused-pane border
 ├── highlight.rs         tree-sitter highlight registry per language
 ├── icons.rs             Codicon / Devicon / Seti glyphs and per-language colors

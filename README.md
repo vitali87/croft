@@ -21,7 +21,7 @@ The non-negotiables behind every decision in croft:
 ## Layout
 
 * **Left pane (sidebar):** Explorer with multi-select, cut / copy / paste, drag-and-drop moves, and VS Code style icons. Search and a Remote (SSH) explorer swap in via the activity bar.
-* **Activity bar:** the icon strip down the far left. View icons (Explorer, Search, Source Control, Remote, Run and Debug) at the top, a settings gear at the bottom whose Color Theme picker switches between Croft Black (`#000000`, default) and Croft Dark Blue (`#1e222e`), persisted in `~/.config/croft/config.json`.
+* **Activity bar:** the icon strip down the far left. View icons (Explorer, Search, Source Control, Remote, Run and Debug) at the top, a settings gear at the bottom whose Color Theme picker switches between Croft Black (`#000000`, default) and Croft Dark (Blue) (`#1e222e`), persisted in `~/.config/croft/config.json`.
 * **Top right pane (editor):** code editor with tree-sitter syntax highlighting, an LSP semantic-token overlay, and inline preview tabs for images, PDFs, and spreadsheets. Splits side by side with `Cmd`+`\`, with an optional native vim modal mode on `Cmd`+`E`.
 * **Bottom right pane (terminal):** a real interactive shell, your `$SHELL` on a real PTY.
 * All three panes resize by dragging the seams between them, including the seam between the two editor columns when the editor is split.

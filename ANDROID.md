@@ -52,7 +52,7 @@ Termux only raises the Android soft keyboard from its tap path, and that path is
 
 **Physical-keyboard geometry.** `ctrl` and `alt` sit on the bottom row beside the space bar, the left column staggers like a MacBook (`esc` < `tab` < `caps` < `shift`), and on wide frames the structural keys stay key-sized while the letters and space bar absorb the extra width, so nothing looks stretched on an unfolded foldable.
 
-**Split layout for foldables.** For thumb typing on foldables the `split` key switches to a Gboard-style split layout: two clusters (`qwert` | `yuiop` and friends, with a space bar on each side) separated by a center gap of about two-ninths of the screen. The choice is remembered across launches in `~/.config/croft/config.json` as `osk_split`. Narrow screens (the folded front display) automatically fall back to the merged layout.
+**Split layout for foldables.** For thumb typing on foldables the `split` key switches to a Gboard-style split layout: two clusters (`qwert` | `yuiop` and friends, with a space bar on each side) separated by a center gap of about two-ninths of the keyboard's width. The choice is remembered across launches in `~/.config/croft/config.json` as `osk_split`. Narrow screens (the folded front display) automatically fall back to the merged layout.
 
 ## Testing the keyboard on a desktop
 
