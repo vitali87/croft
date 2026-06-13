@@ -2881,6 +2881,7 @@ impl Editor {
             sel.head.0 += block_len;
         }
         self.mark_buffer_changed();
+        self.recompute_highlights();
         self.ensure_cursor_col_visible();
     }
 
@@ -2896,6 +2897,7 @@ impl Editor {
             self.lines.insert(start_row + i, line);
         }
         self.mark_buffer_changed();
+        self.recompute_highlights();
         self.ensure_cursor_col_visible();
     }
 
@@ -2956,6 +2958,7 @@ impl Editor {
             sel.head.0 += 1;
         }
         self.mark_buffer_changed();
+        self.recompute_highlights();
         self.ensure_cursor_col_visible();
     }
 
@@ -2974,6 +2977,7 @@ impl Editor {
             sel.head.0 -= 1;
         }
         self.mark_buffer_changed();
+        self.recompute_highlights();
         self.ensure_cursor_col_visible();
     }
 
@@ -3024,6 +3028,7 @@ impl Editor {
         }
         self.cursor_col = self.cursor_col.min(self.line_char_len(self.cursor_row));
         self.mark_buffer_changed();
+        self.recompute_highlights();
         self.ensure_cursor_col_visible();
         true
     }
@@ -3065,6 +3070,7 @@ impl Editor {
         self.cursor_row = start.0;
         self.cursor_col = self.line_char_len(start.0);
         self.mark_buffer_changed();
+        self.recompute_highlights();
         self.ensure_cursor_col_visible();
         true
     }
@@ -3094,6 +3100,7 @@ impl Editor {
         self.cursor_col = cursor_col;
         self.selection = None;
         self.mark_buffer_changed();
+        self.recompute_highlights();
         self.ensure_cursor_col_visible();
     }
 
@@ -3122,6 +3129,7 @@ impl Editor {
         };
         self.replace_char_range(start, end, &new);
         self.mark_buffer_changed();
+        self.recompute_highlights();
         self.ensure_cursor_col_visible();
     }
 
@@ -3147,6 +3155,7 @@ impl Editor {
         }
         self.lines.splice(start..=end, block);
         self.mark_buffer_changed();
+        self.recompute_highlights();
     }
 
     /// VS Code "Trim Trailing Whitespace": strip trailing spaces and tabs from
@@ -3167,6 +3176,7 @@ impl Editor {
         }
         self.cursor_col = self.cursor_col.min(self.line_char_len(self.cursor_row));
         self.mark_buffer_changed();
+        self.recompute_highlights();
         true
     }
 
@@ -9563,6 +9573,31 @@ mod tests {
         e.cursor_row = 0;
         assert!(e.toggle_line_comment());
         assert_eq!(e.lines, vec!["# x = 1"]);
+    }
+
+    #[test]
+    fn toggle_line_comment_refreshes_highlights() {
+        // Commenting a line must re-run tree-sitter so the line repaints as a
+        // comment, not keep the stale pre-comment code spans. Without the
+        // refresh the rendered comment shows code colours shifted by `# `.
+        let mut e = editor_with("x = 1");
+        e.lang = Some(LangKind::Python);
+        e.recompute_highlights();
+        e.cursor_row = 0;
+        assert!(e.toggle_line_comment());
+        let after: Vec<(usize, usize, Option<Color>)> = e.highlights[0]
+            .iter()
+            .map(|s| (s.start, s.end, s.style.fg))
+            .collect();
+        e.recompute_highlights();
+        let fresh: Vec<(usize, usize, Option<Color>)> = e.highlights[0]
+            .iter()
+            .map(|s| (s.start, s.end, s.style.fg))
+            .collect();
+        assert_eq!(
+            after, fresh,
+            "toggle_line_comment must refresh syntax highlights to match the new buffer"
+        );
     }
 
     #[test]
