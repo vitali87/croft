@@ -11476,10 +11476,9 @@ fn black_theme_remote_header_buttons_are_teal_icons() {
     let buf = render_buf(&mut app);
     let add = app.remote.header_add_btn;
     assert!(add.width > 0, "remote header add button must render");
-    assert_eq!(
-        buf[(add.x + add.width / 2, add.y)].fg,
-        rgb_color(INNER_ACCENT)
-    );
+    // The snug pill paints the glyph at the rect origin (the highlight wraps
+    // exactly that one cell), so probe there rather than the rect centre.
+    assert_eq!(buf[(add.x, add.y)].fg, rgb_color(INNER_ACCENT));
 }
 
 #[test]

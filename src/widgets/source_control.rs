@@ -863,7 +863,6 @@ impl Widget for &mut SourceControlPanel {
                 buf,
                 refresh_x,
                 inner.y,
-                pill_w,
                 crate::widgets::header_pill::REFRESH_GLYPH,
                 self.focus_gradient,
                 hovered,

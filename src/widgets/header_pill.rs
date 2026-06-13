@@ -22,19 +22,17 @@ pub const HEADER_BTN_HOVER_BG: Color = Color::Rgb(0x2f, 0x5a, 0xa8);
 pub const REFRESH_GLYPH: char = '\u{eb37}';
 pub const ADD_GLYPH: char = '\u{ea60}';
 
-/// Paint a header pill button. `brand` is true under the Black theme: a
-/// chipless teal icon in the VS Code toolbar spirit that grows a faint teal
-/// pill only while hovered. Croft Dark keeps the navy pill and brightens it on
-/// hover (`toolbar.hoverBackground`).
-pub fn render(
-    buf: &mut Buffer,
-    x: u16,
-    y: u16,
-    width: u16,
-    glyph: char,
-    brand: bool,
-    hovered: bool,
-) {
+/// Paint a header pill button at cell `(x, y)`. `brand` is true under the
+/// Black theme: a chipless teal icon in the VS Code toolbar spirit that grows
+/// a faint teal pill only while hovered. Croft Dark keeps the navy pill and
+/// brightens it on hover (`toolbar.hoverBackground`).
+///
+/// The painted footprint is exactly **one cell** — it wraps the single-width
+/// codicon so the chip and the glyph coincide perfectly. A wider chip around a
+/// 1-cell glyph always left a bare highlight cell beside the icon, which read
+/// as a misalignment. Callers keep a wider hit-test rect for a forgiving click
+/// target; only the visible highlight is snug.
+pub fn render(buf: &mut Buffer, x: u16, y: u16, glyph: char, brand: bool, hovered: bool) {
     let fill = if brand {
         hovered.then(|| crate::gradient::rgb_color(crate::gradient::POPUP_SEL_BG))
     } else if hovered {
@@ -42,13 +40,6 @@ pub fn render(
     } else {
         Some(HEADER_BTN_BG)
     };
-    let fill_style = fill.map(|c| Style::default().bg(c)).unwrap_or_default();
-    for dx in 0..width {
-        let cell = &mut buf[(x + dx, y)];
-        cell.set_char(' ');
-        cell.set_style(fill_style);
-    }
-    let centre = x + width / 2;
     let mut style = Style::default().add_modifier(Modifier::BOLD);
     if let Some(c) = fill {
         style = style.bg(c);
@@ -58,5 +49,60 @@ pub fn render(
     } else {
         style.fg(HEADER_BTN_FG)
     };
-    buf.set_string(centre, y, glyph.to_string(), style);
+    buf.set_string(x, y, glyph.to_string(), style);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::layout::Rect;
+
+    #[test]
+    fn croft_dark_highlight_wraps_exactly_the_glyph_cell() {
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 6,
+            height: 1,
+        };
+        let mut buf = Buffer::empty(area);
+        // Croft Dark (brand = false) always paints the navy chip. Render at x=2.
+        render(&mut buf, 2, 0, REFRESH_GLYPH, false, false);
+        assert_eq!(
+            buf[(2, 0)].bg,
+            HEADER_BTN_BG,
+            "the glyph cell wears the navy chip"
+        );
+        assert_eq!(buf[(2, 0)].symbol().chars().next(), Some(REFRESH_GLYPH));
+        // The whole point of the fix: no bare highlight cell beside the glyph,
+        // so the chip and the single-width glyph coincide perfectly.
+        assert_eq!(
+            buf[(1, 0)].bg,
+            Color::Reset,
+            "no bare highlight cell left of the glyph"
+        );
+        assert_eq!(
+            buf[(3, 0)].bg,
+            Color::Reset,
+            "no bare highlight cell right of the glyph"
+        );
+    }
+
+    #[test]
+    fn black_theme_idle_pill_is_chipless() {
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 6,
+            height: 1,
+        };
+        let mut buf = Buffer::empty(area);
+        // Black theme (brand = true), not hovered: a chipless teal glyph.
+        render(&mut buf, 2, 0, REFRESH_GLYPH, true, false);
+        assert_eq!(
+            buf[(2, 0)].bg,
+            Color::Reset,
+            "the idle Black-theme pill grows its teal fill only on hover"
+        );
+    }
 }
