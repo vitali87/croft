@@ -37,23 +37,16 @@ The editor speaks LSP for completion, hover, go-to-definition / references / imp
 | A Nerd Font as your terminal font | Explorer icons are Private Use Area glyphs (Codicons, Devicons, Seti). Without one, icons render as `[?]` boxes. |
 | A 256 color or truecolor terminal | Terminal.app, iTerm2, Alacritty, kitty, WezTerm, Ghostty all qualify. |
 | iTerm2, WezTerm, Ghostty, or kitty (optional) | Inline image / PDF / spreadsheet previews via OSC 1337 or the Kitty graphics protocol. Sixel terminals (detected at startup via a DA1 probe) are also supported. Other terminals fall back to a metadata header line. |
-| `pdftoppm` from poppler-utils (optional) | Multi-page PDF preview (`brew install poppler` / `apt install poppler-utils`). Without it, croft falls back to macOS `sips` for page 1 only. |
+| `pdftoppm` from poppler-utils (optional) | Multi-page PDF preview. Without it, croft falls back to macOS `sips` for page 1 only. |
 | Node.js + npm (optional) | TypeScript / JavaScript LSP. croft auto-installs the `vtsls` server on first use and finds `node` even under nvm / fnm / asdf / volta. |
+
+Per-platform setup (Nerd Font, terminal keybindings, optional dependencies) lives in the platform guides linked under [Platform setup](#platform-setup).
 
 ### Install Rust
 
 ```bash
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ```
-
-### Install a Nerd Font (macOS)
-
-```bash
-brew install --cask font-meslo-lg-nerd-font
-croft setup-terminal   # sets Terminal.app's default profile font to MesloLGS NF 13pt
-```
-
-Quit Terminal.app entirely (`Cmd`+`Q`) and reopen for the font to take effect. macOS Terminal.app does not fall back to a Nerd Font for Private Use Area glyphs the way iTerm2 does, so the *primary* font must be a Nerd Font. To set it by hand: Terminal.app → Settings → Profiles → Text → Font → MesloLGS Nerd Font Mono Regular 13pt.
 
 ## Install
 
@@ -78,29 +71,19 @@ croft remote <host>  # launch croft over SSH on a Linux server (host from ~/.ssh
 croft --help
 ```
 
-`croft remote <host>` installs itself on the box on first connect, with no manual prep: it cross-compiles a static musl binary on your Mac and copies it over, or falls back to compiling on the host (provisioning a C toolchain and `pkg-config` across `apt`, `dnf`/`yum`, `apk`, `pacman`, and `zypper`). A stock cloud image works out of the box.
+`croft remote <host>` installs itself on the box on first connect with no manual prep, and a stock cloud image works out of the box. See [LINUX.md](LINUX.md#remote-croft-remote-host) for how the cross-compile and host provisioning work.
+
+## Platform setup
+
+croft runs on macOS, Linux, and Android. Cross-platform basics are above; each platform has a short guide for its Nerd Font, terminal keybindings, and optional dependencies:
+
+* **[macOS](MACOS.md)** — Nerd Font for Terminal.app, and `croft setup-iterm2` / `croft setup-ghostty` to deliver the `Cmd` chords that macOS otherwise reserves for menus.
+* **[Linux](LINUX.md)** — `Ctrl` as the command modifier, Nerd Font and poppler-utils, language servers, and the `croft remote <host>` cross-compile / provisioning flow.
+* **[Android (Termux)](ANDROID.md)** — `Ctrl` as the command modifier, `pkg`-based dependencies, the auto-installed activity-bar font, and the built-in on-screen keyboard for touch.
 
 ## Keybindings
 
-Every action is reachable from the keyboard; press `F1` inside croft for the full reference. The complete tables (global, Explorer, Search, editor, vim mode, previews, terminal) live in **[KEYBINDINGS.md](KEYBINDINGS.md)**.
-
-### macOS (iTerm2) setup
-
-macOS reserves the `Cmd` modifier for application menus, so `Cmd` chords need one extra step. Run it once after installing:
-
-```bash
-croft setup-iterm2
-```
-
-This installs croft's `Cmd` chords as CSI-u key forwarders and relocates the conflicting iTerm2 / macOS menu shortcuts out of the way. Then enable right-click forwarding so croft's context menu works: iTerm2 → Settings (`⌘,`) → search **"right click"** → tick **"Right click reported to apps, does not open menu"**. Fully quit iTerm2 (`⌘Q`) and reopen. See [KEYBINDINGS.md](KEYBINDINGS.md#iterm2-key-mappings) for the full mapping and the zero-setup `Ctrl`-based alternatives. Other terminals (kitty, Ghostty, WezTerm, Alacritty) deliver `Cmd` over the kitty protocol natively, so nothing is needed there.
-
-## Termux / Android
-
-croft installs and runs as a native Android binary inside [Termux](https://termux.dev) via the same `cargo install` command. Android has no Cmd key, so **`Ctrl` is the command modifier** (VS Code's Linux convention): every `Cmd` chord works as the same chord with `Ctrl`. Inline image previews do not render on mainline Termux (no OSC 1337 support); croft falls back to a metadata-header line. A Termux build that supports OSC 1337 can opt in with `CROFT_FORCE_INLINE_IMAGES=1`. Dependencies croft installs for itself come from the Termux repo via `pkg install`, since the curl-based installers used on macOS and Linux cannot run on a stock Termux (no curl in the bootstrap): zoxide (backing the `Ctrl`+`Z` jump popup) and the Python language servers ty and ruff (which croft provisions through uv elsewhere; uv does not support Android). For the other languages, `pkg install nodejs` lets croft set up the TypeScript/JavaScript server itself, and `pkg install rust-analyzer gopls` covers Rust and Go (those two are picked up from PATH on every platform).
-
-**Activity-bar icons.** Without inline images the activity bar draws codicon glyphs, and Android's system fonts contain none of them, so out of the box the bar would render blank. On first launch inside Termux croft downloads MesloLGS Nerd Font Mono (the same Meslo family `setup-iterm2` configures on macOS) into `~/.termux/font.ttf` in the background and applies it with `termux-reload-settings`; the icons appear within a few seconds with no manual step. An existing `~/.termux/font.ttf` is never overwritten (delete it to re-arm the install), and a failed download is retried on the next launch.
-
-**On-screen keyboard.** Termux only raises the Android soft keyboard from its tap path, and that path is skipped entirely while an app has mouse tracking active, which croft always does for click routing, so a tap can never summon the native keyboard. Instead croft ships its own: tapping the editor, a terminal pane, or the Search input docks a five-row keyboard above the status bar. It has lowercase, Shift (one-shot uppercase), and symbol layers plus a real Caps Lock (uppercases letters only, digits and punctuation untouched) and one-shot `ctrl` / `alt` latches, so two taps produce chords like `Ctrl`+`C` or `Ctrl`+`P`; the `⌄` key dismisses it. The geometry follows a physical keyboard: `ctrl` and `alt` sit on the bottom row beside the space bar, the left column staggers like a MacBook (`esc` < `tab` < `caps` < `shift`), and on wide frames the structural keys stay key-sized while the letters and the space bar absorb the extra width, so nothing looks stretched on an unfolded foldable. For thumb typing on foldables the `split` key switches to a Gboard-style split layout — two clusters (`qwert` | `yuiop` and friends, a space bar on each side) separated by a center gap of about two-ninths of the screen — and the choice is remembered across launches in `~/.config/croft/config.json`; narrow screens (the folded front display) automatically fall back to the merged layout. Keys synthesize real keystrokes, so they reach the editor, terminal, and every modal identically to a hardware keyboard. The keyboard is thumb-sized: it scales to roughly 40% of the screen on portrait frames, and while it is up only the pane you are typing into stays visible — focusing the terminal folds the editor away so the terminal rides directly above the keys, and vice versa. Desktop terminals can try it with `CROFT_FORCE_OSK=1`, and croft's remote SSH launcher forwards that flag automatically, so a session opened from a phone gets the keyboard on the remote box too.
+Every action is reachable from the keyboard; press `F1` inside croft for the full reference. The complete tables (global, Explorer, Search, editor, vim mode, previews, terminal) live in **[KEYBINDINGS.md](KEYBINDINGS.md)**. The command modifier is `Cmd` on macOS and `Ctrl` on Linux / Android; getting `Cmd` chords through your terminal is covered in the [platform guides](#platform-setup).
 
 ## Goal
 
