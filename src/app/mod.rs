@@ -1107,6 +1107,10 @@ pub struct App {
     /// VS Code-style Cmd+Shift+P / Ctrl+Shift+P command palette. None when
     /// the modal is closed.
     pub command_palette: Option<crate::widgets::command_palette::CommandPalette>,
+    /// "Debug: Attach to Python Process" picker (PEP 768). None when closed.
+    /// Lists running CPython 3.14+ processes; selecting one spawns
+    /// `pdb -p <pid>` in a PTY.
+    pub process_picker: Option<crate::widgets::process_picker::ProcessPicker>,
     /// zoxide-backed Explorer jump popup (Cmd+Z). None when closed. Opens
     /// only from the Explorer pane, so it never collides with the editor's
     /// Cmd+Z undo.
@@ -1564,6 +1568,7 @@ impl App {
             editor_find: None,
             file_finder: None,
             command_palette: None,
+            process_picker: None,
             zoxide_jump: None,
             file_finder_index: None,
             file_finder_index_rx: Some(file_finder_index_rx),
@@ -1858,6 +1863,7 @@ impl App {
         if self.shortcuts_modal.is_some()
             || self.file_finder.is_some()
             || self.command_palette.is_some()
+            || self.process_picker.is_some()
             || self.zoxide_jump.is_some()
         {
             return;
@@ -1917,6 +1923,7 @@ impl App {
         if self.shortcuts_modal.is_some()
             || self.file_finder.is_some()
             || self.command_palette.is_some()
+            || self.process_picker.is_some()
             || self.zoxide_jump.is_some()
         {
             return;
@@ -2148,6 +2155,7 @@ impl App {
             self.shortcuts_modal.as_ref().map(|m| m.last_rect),
             self.file_finder.as_ref().map(|f| f.last_rect),
             self.command_palette.as_ref().map(|p| p.last_rect),
+            self.process_picker.as_ref().map(|p| p.last_rect),
         ];
         let visible = |block: Rect| {
             occluders
@@ -2270,6 +2278,7 @@ impl App {
         if self.shortcuts_modal.is_some()
             || self.file_finder.is_some()
             || self.command_palette.is_some()
+            || self.process_picker.is_some()
             || self.zoxide_jump.is_some()
             || self.connect_dialog.is_some()
         {
@@ -5205,6 +5214,7 @@ impl App {
         self.render_editor_find(frame);
         self.render_file_finder(frame);
         self.render_command_palette(frame);
+        self.render_process_picker(frame);
         self.render_zoxide_jump(frame);
         self.render_shortcuts_modal(frame);
         self.render_connect_dialog(frame);
@@ -5676,6 +5686,10 @@ impl App {
         }
         if self.command_palette.is_some() {
             self.handle_command_palette_key(key);
+            return Ok(());
+        }
+        if self.process_picker.is_some() {
+            self.handle_process_picker_key(key);
             return Ok(());
         }
         if self.zoxide_jump.is_some() {
@@ -9415,6 +9429,153 @@ impl App {
         );
     }
 
+    pub fn consume_process_picker_image_clear(&mut self) -> bool {
+        self.overlays.process_picker_clear.consume()
+    }
+
+    /// Open the "Debug: Attach to Python Process" picker. Enumerates running
+    /// CPython 3.14+ processes (those with PEP 768 `sys.remote_exec`); shows a
+    /// status message and opens nothing when there are none.
+    fn open_attach_python_picker(&mut self) {
+        if self.process_picker.is_some() {
+            return;
+        }
+        let targets = crate::dap::discovery::attachable_python_targets();
+        if targets.is_empty() {
+            self.run_debug.feedback = Some(String::from(
+                "No attachable Python 3.14+ processes found (PEP 768 needs CPython 3.14+)",
+            ));
+            self.run_debug.feedback_is_error = true;
+            self.status = String::from("Attach: no Python 3.14+ processes running");
+            return;
+        }
+        let count = targets.len();
+        self.process_picker = Some(crate::widgets::process_picker::ProcessPicker::new(targets));
+        self.overlays.process_picker_clear.request();
+        self.status = format!("Attach: {count} Python process(es) — Esc to close, Enter to attach");
+    }
+
+    fn close_process_picker(&mut self) {
+        if self.process_picker.take().is_some() {
+            self.overlays.process_picker_clear.request();
+            self.overlays.activity.mark_dirty();
+            self.overlays.welcome.mark_dirty();
+            self.overlays.hero.mark_dirty();
+            self.invalidate_editor_image_layouts();
+            self.status.clear();
+        }
+    }
+
+    fn handle_process_picker_key(&mut self, key: KeyEvent) {
+        let Some(picker) = self.process_picker.as_mut() else {
+            return;
+        };
+        match (key.code, key.modifiers) {
+            (KeyCode::Esc, _) => self.close_process_picker(),
+            (KeyCode::Enter, _) => {
+                let target = picker.selected_target().cloned();
+                self.close_process_picker();
+                if let Some(target) = target {
+                    self.attach_to_python_target(target);
+                }
+            }
+            (KeyCode::Up, _) => picker.select_prev(),
+            (KeyCode::Down, _) => picker.select_next(),
+            (KeyCode::PageUp, _) => {
+                for _ in 0..10 {
+                    picker.select_prev();
+                }
+            }
+            (KeyCode::PageDown, _) => {
+                for _ in 0..10 {
+                    picker.select_next();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_process_picker_mouse(&mut self, m: MouseEvent) {
+        let Some(picker) = self.process_picker.as_mut() else {
+            return;
+        };
+        let inside = rect_contains(picker.last_rect, m.column, m.row);
+        match m.kind {
+            MouseEventKind::ScrollDown => {
+                for _ in 0..3 {
+                    picker.select_next();
+                }
+            }
+            MouseEventKind::ScrollUp => {
+                for _ in 0..3 {
+                    picker.select_prev();
+                }
+            }
+            MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Down(MouseButton::Right)
+                if !inside =>
+            {
+                self.close_process_picker();
+            }
+            _ => {}
+        }
+    }
+
+    fn render_process_picker(&mut self, frame: &mut ratatui::Frame) {
+        let gradient = self.popup_gradient();
+        let Some(picker) = self.process_picker.as_mut() else {
+            return;
+        };
+        let area = frame.area();
+        crate::widgets::process_picker::render_process_picker(
+            picker,
+            area,
+            frame.buffer_mut(),
+            gradient,
+        );
+    }
+
+    /// Spawn `pdb -p <pid>` for the chosen target in a new PTY terminal,
+    /// wrapping in `sudo` when the platform requires elevation (always on
+    /// macOS; on Linux unless Yama `ptrace_scope` is relaxed). The PTY hosts
+    /// both the interactive pdb prompt and any `sudo` password prompt — the
+    /// edge a GUI debugger lacks.
+    fn attach_to_python_target(&mut self, target: crate::dap::discovery::PyTarget) {
+        use crate::dap::remote_attach::{Platform, plan_attach, read_yama_ptrace_scope};
+        let pid = target.pid;
+        let plan = match plan_attach(
+            target.version,
+            target.exe,
+            pid,
+            Platform::current(),
+            read_yama_ptrace_scope(),
+        ) {
+            Ok(plan) => plan,
+            Err(e) => {
+                self.run_debug.feedback = Some(format!("Cannot attach to PID {pid}: {e:?}"));
+                self.run_debug.feedback_is_error = true;
+                return;
+            }
+        };
+        let (program, args) = plan.command_line();
+        match PtyTerminal::new_running(&program, &args, &self.workspace_root) {
+            Ok(term) => {
+                let slot = self.active_terminal + 1;
+                self.terminals.insert(slot, term);
+                self.active_terminal = slot;
+                if !self.show_terminal {
+                    self.show_terminal = true;
+                }
+                self.focus_pane(Pane::Terminal);
+                self.run_debug.feedback = Some(format!("Attaching debugger to PID {pid}"));
+                self.run_debug.feedback_is_error = false;
+            }
+            Err(e) => {
+                self.run_debug.feedback = Some(format!("Failed to spawn terminal: {e}"));
+                self.run_debug.feedback_is_error = true;
+            }
+        }
+    }
+
     /// Execute a Command Palette entry. Editor text commands act on the active
     /// editor buffer; view / navigation commands defer to the same methods
     /// their dedicated chords use, so the palette can never drift from the
@@ -9483,6 +9644,7 @@ impl App {
                     self.status = format!("Split terminal failed: {e}");
                 }
             },
+            Cmd::AttachPythonProcess => self.open_attach_python_picker(),
             Cmd::ColorTheme => self.open_theme_picker(),
             Cmd::KeyboardShortcuts => self.open_shortcuts_modal(),
         }
@@ -10137,6 +10299,10 @@ impl App {
         }
         if self.file_finder.is_some() {
             self.handle_file_finder_mouse(m);
+            return;
+        }
+        if self.process_picker.is_some() {
+            self.handle_process_picker_mouse(m);
             return;
         }
         if self.command_palette.is_some() {
@@ -11801,6 +11967,7 @@ impl App {
         if self.shortcuts_modal.is_some()
             || self.file_finder.is_some()
             || self.command_palette.is_some()
+            || self.process_picker.is_some()
             || self.zoxide_jump.is_some()
         {
             return None;
@@ -11816,6 +11983,7 @@ impl App {
         if self.shortcuts_modal.is_some()
             || self.file_finder.is_some()
             || self.command_palette.is_some()
+            || self.process_picker.is_some()
             || self.zoxide_jump.is_some()
             || self.connect_dialog.is_some()
             || !self.editor.is_blank_initial()
@@ -14716,6 +14884,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
                 || app.consume_shortcuts_image_clear()
                 || app.consume_file_finder_image_clear()
                 || app.consume_command_palette_image_clear()
+                || app.consume_process_picker_image_clear()
                 || app.consume_zoxide_jump_image_clear()
                 || app.consume_ssh_empty_state_image_clear()
                 || app.consume_activity_image_clear()
@@ -14749,6 +14918,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
                 || app.consume_shortcuts_image_clear()
                 || app.consume_file_finder_image_clear()
                 || app.consume_command_palette_image_clear()
+                || app.consume_process_picker_image_clear()
                 || app.consume_zoxide_jump_image_clear()
                 || app.consume_ssh_empty_state_image_clear()
                 || app.consume_activity_image_clear()

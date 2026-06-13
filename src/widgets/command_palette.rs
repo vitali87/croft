@@ -49,6 +49,8 @@ pub enum Command {
     ToggleSideBar,
     ToggleTerminal,
     NewTerminal,
+    // --- Run / debug ---
+    AttachPythonProcess,
     ColorTheme,
     KeyboardShortcuts,
 }
@@ -83,6 +85,7 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::ToggleSideBar,
     Command::ToggleTerminal,
     Command::NewTerminal,
+    Command::AttachPythonProcess,
     Command::ColorTheme,
     Command::KeyboardShortcuts,
 ];
@@ -119,6 +122,7 @@ impl Command {
             Command::ToggleSideBar => "View: Toggle Primary Side Bar",
             Command::ToggleTerminal => "View: Toggle Terminal",
             Command::NewTerminal => "Terminal: Create New Terminal",
+            Command::AttachPythonProcess => "Debug: Attach to Python Process",
             Command::ColorTheme => "Preferences: Color Theme",
             Command::KeyboardShortcuts => "Help: Keyboard Shortcuts Reference",
         }

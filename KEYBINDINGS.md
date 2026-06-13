@@ -40,6 +40,7 @@ On macOS, the `Cmd` chords below only reach croft after you run a one-time setup
 | Transform to Uppercase / Lowercase / Title Case | Re-case the selection, or the word under the cursor when nothing is selected |
 | Sort Lines Ascending / Descending | Sort the selected lines (or the whole file when nothing is selected) lexicographically |
 | Trim Trailing Whitespace | Strip trailing spaces and tabs from every line |
+| Debug: Attach to Python Process | Pick a running CPython 3.14+ process and drop a `pdb` REPL into it (PEP 768 `sys.remote_exec`); the debugger runs in a croft terminal, elevating with `sudo` when the OS requires it |
 
 ## Explorer (file tree)
 

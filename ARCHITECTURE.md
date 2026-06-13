@@ -51,6 +51,10 @@ src/
 │   ├── sys_monitor.rs   background system-metrics poller driving the SYSTEM panel
 │   ├── welcome.rs       welcome-screen state + async recent-repos drain
 │   └── tests.rs         unit / integration tests
+├── dap/                 debugger stack: PEP 768 remote-attach to running Python processes
+│   ├── mod.rs
+│   ├── remote_attach.rs pure attach planning: parse / gate the CPython version (>=3.14 ships sys.remote_exec), the platform-aware sudo-elevation decision (macOS always, Linux unless Yama ptrace_scope is relaxed), and the `pdb -p` command builder
+│   └── discovery.rs     enumerate attachable CPython 3.14+ processes via sysinfo plus a per-candidate `--version` probe
 ├── lsp/                 LSP client stack
 │   ├── mod.rs
 │   ├── client.rs        async-lsp client wrapper; router forwards diagnostics + work-done progress ($/progress, e.g. rust-analyzer "Indexing…") to the status bar
@@ -75,6 +79,7 @@ src/
     ├── hover.rs         shared hover-feedback helpers (pointer hit-test + theme-aware row-hover background) used by the side panels and header pills
     ├── hover_popup.rs   LSP hover popup (300 ms dwell, anchored at the cursor)
     ├── osk.rs           on-screen keyboard for Termux (mouse tracking blocks the native soft keyboard): bottom-docked tappable band whose keys synthesize KeyEvents through handle_key; lower / shift / symbol layers plus caps lock (letters only), one-shot ctrl + alt latches on the bottom row next to space; physical-keyboard geometry (structural keys carry max cell widths, the left column staggers esc < tab < caps < shift like a MacBook, letters and space absorb wide-frame slack via water-filling, Enter grows into a two-row L on the right in both merged and split layouts (full-height even on one-row bands) and the collapse `⌄` key is about twice the `split` key); Gboard-style split layout for foldables (number/top rows split 5|5, the home and bottom rows one column earlier so `g` and `b` fall in the right thumb cluster, and the top-right cluster parks a `\` at the far edge (`y u i o p \`, qwerty letters keep their natural order); halves solved independently around a 2·width/9 center gap, space on both halves, merged again under 60 cols), toggled by the `split` key and persisted as `osk_split` in prefs; thumb-sized keys scale with frame height and the non-focused pane folds away while the band is up; key caps are drawn from the active theme's palette (brand-teal armed accent on Black, the historical navy on Dark)
+    ├── process_picker.rs centered selectable list of attachable Python 3.14+ processes for "Debug: Attach to Python Process"; selecting one has the App spawn `pdb -p <pid>` in a PTY
     ├── remote.rs        Remote (SSH) sidebar widget with empty-state hero illustration
     ├── run_debug.rs     Run and Debug sidebar widget: empty state plus Run [filename] button that spawns the active file in a fresh terminal
     ├── scrollbar.rs     shared vertical- and horizontal-scrollbar geometry
