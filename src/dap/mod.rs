@@ -18,4 +18,7 @@
 //! [`remote_attach::elevation_required`].
 
 pub mod discovery;
+pub mod install;
 pub mod remote_attach;
+pub mod session;
+pub mod transport;

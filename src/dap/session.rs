@@ -1,0 +1,467 @@
+//! A single debug session: the lifecycle state machine over a [`DapTransport`].
+//!
+//! DAP is event-driven, so the session is too. The app calls [`DapSession::poll`]
+//! once per frame; it drains every message the adapter has sent, advances the
+//! handshake (`initialize` → on the `initialized` event push breakpoints +
+//! `configurationDone` → run), and returns the user-facing [`DapEvent`]s the app
+//! reacts to (stop-line highlight, output, teardown).
+//!
+//! The wire bodies are built and read as `serde_json::Value` rather than a large
+//! vendored type set: the message surface croft drives is small, and the request
+//! builders + the event classifier — the parts worth locking down — are pure and
+//! unit-tested below.
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+
+use anyhow::Result;
+use serde_json::{Value, json};
+
+use super::transport::DapTransport;
+
+/// Where a session is in its lifecycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionPhase {
+    /// `initialize` sent, awaiting the `initialized` event.
+    Initializing,
+    /// Breakpoints pushed + `configurationDone` sent; debuggee running.
+    Running,
+    /// Stopped at a breakpoint / step / exception.
+    Stopped,
+    /// Adapter reported the debuggee exited or the session ended.
+    Terminated,
+}
+
+/// A user-facing event distilled from a raw DAP message, for the app to act on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DapEvent {
+    /// Adapter is ready for configuration (breakpoints). Handled internally,
+    /// surfaced for visibility/tests.
+    Initialized,
+    /// Execution stopped; `thread_id` is the stopped thread, `reason` e.g.
+    /// `breakpoint` / `step` / `exception`.
+    Stopped { thread_id: i64, reason: String },
+    /// Execution resumed.
+    Continued,
+    /// Program / debug console output.
+    Output { category: String, text: String },
+    /// The debuggee process exited.
+    Terminated,
+}
+
+/// Classify a raw incoming DAP message into a [`DapEvent`], or `None` for
+/// messages the app doesn't surface (responses, bookkeeping events). Pure.
+pub fn classify_event(msg: &Value) -> Option<DapEvent> {
+    if msg.get("type")?.as_str()? != "event" {
+        return None;
+    }
+    let body = msg.get("body");
+    match msg.get("event")?.as_str()? {
+        "initialized" => Some(DapEvent::Initialized),
+        "stopped" => Some(DapEvent::Stopped {
+            thread_id: body
+                .and_then(|b| b.get("threadId"))
+                .and_then(Value::as_i64)
+                .unwrap_or(0),
+            reason: body
+                .and_then(|b| b.get("reason"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+        }),
+        "continued" => Some(DapEvent::Continued),
+        "output" => Some(DapEvent::Output {
+            category: body
+                .and_then(|b| b.get("category"))
+                .and_then(Value::as_str)
+                .unwrap_or("console")
+                .to_string(),
+            text: body
+                .and_then(|b| b.get("output"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+        }),
+        "terminated" | "exited" => Some(DapEvent::Terminated),
+        _ => None,
+    }
+}
+
+/// Build the `initialize` request body (sans `seq`, which the transport stamps).
+pub fn initialize_request() -> Value {
+    json!({
+        "type": "request",
+        "command": "initialize",
+        "arguments": {
+            "adapterID": "debugpy",
+            "linesStartAt1": true,
+            "columnsStartAt1": true,
+            "pathFormat": "path",
+            "supportsRunInTerminalRequest": true
+        }
+    })
+}
+
+/// Build the `launch` request body for a Python program under `interpreter`.
+pub fn launch_request(program: &Path, interpreter: &Path, stop_on_entry: bool) -> Value {
+    json!({
+        "type": "request",
+        "command": "launch",
+        "arguments": {
+            "request": "launch",
+            "program": program.to_string_lossy(),
+            "python": [interpreter.to_string_lossy()],
+            "console": "internalConsole",
+            "stopOnEntry": stop_on_entry,
+            "justMyCode": false
+        }
+    })
+}
+
+/// Build a `setBreakpoints` request body for one source file.
+pub fn set_breakpoints_request(path: &Path, lines: &[u32]) -> Value {
+    let breakpoints: Vec<Value> = lines.iter().map(|l| json!({ "line": l })).collect();
+    json!({
+        "type": "request",
+        "command": "setBreakpoints",
+        "arguments": {
+            "source": { "path": path.to_string_lossy() },
+            "breakpoints": breakpoints,
+            "lines": lines
+        }
+    })
+}
+
+/// Build a `configurationDone` request body.
+pub fn configuration_done_request() -> Value {
+    json!({ "type": "request", "command": "configurationDone", "arguments": {} })
+}
+
+/// Build a thread-scoped execution request (`continue` / `next` / `stepIn` /
+/// `stepOut`).
+pub fn thread_request(command: &str, thread_id: i64) -> Value {
+    json!({
+        "type": "request",
+        "command": command,
+        "arguments": { "threadId": thread_id }
+    })
+}
+
+/// Build a `stackTrace` request for the top frame of `thread_id` — enough to
+/// learn the file + line the debugger is paused on.
+pub fn stack_trace_request(thread_id: i64) -> Value {
+    json!({
+        "type": "request",
+        "command": "stackTrace",
+        "arguments": { "threadId": thread_id, "startFrame": 0, "levels": 1 }
+    })
+}
+
+/// Extract `(path, 1-based line)` of the top frame from a `stackTrace` response
+/// body, or `None` if the shape isn't as expected. Pure.
+pub fn top_frame_location(stack_trace_response: &Value) -> Option<(PathBuf, usize)> {
+    let frame = stack_trace_response
+        .get("body")?
+        .get("stackFrames")?
+        .as_array()?
+        .first()?;
+    let path = frame.get("source")?.get("path")?.as_str()?;
+    let line = frame.get("line")?.as_i64()?;
+    Some((PathBuf::from(path), line as usize))
+}
+
+/// One running debug session.
+pub struct DapSession {
+    transport: DapTransport,
+    pub phase: SessionPhase,
+    /// Breakpoints to push once the adapter is `initialized`, keyed by absolute
+    /// file path.
+    breakpoints: BTreeMap<PathBuf, Vec<u32>>,
+    /// Thread id reported by the most recent `stopped` event.
+    pub stopped_thread: Option<i64>,
+    /// File + 1-based line the debugger is paused on, resolved from the
+    /// `stackTrace` response that follows each `stopped` event. Cleared on
+    /// resume/terminate.
+    pub current_location: Option<(PathBuf, usize)>,
+}
+
+impl DapSession {
+    /// Spawn the adapter, send `initialize`, and stash the breakpoints to push
+    /// when the `initialized` event arrives. `adapter_*` describe how to launch
+    /// the DAP adapter (e.g. the debug-venv python with `-m debugpy.adapter`);
+    /// `program`/`interpreter` describe the debuggee.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch(
+        adapter_program: &str,
+        adapter_args: &[String],
+        cwd: &Path,
+        program: &Path,
+        interpreter: &Path,
+        breakpoints: BTreeMap<PathBuf, Vec<u32>>,
+        stop_on_entry: bool,
+    ) -> Result<DapSession> {
+        let transport = DapTransport::spawn(adapter_program, adapter_args, cwd)?;
+        transport.send(initialize_request())?;
+        transport.send(launch_request(program, interpreter, stop_on_entry))?;
+        Ok(DapSession {
+            transport,
+            phase: SessionPhase::Initializing,
+            breakpoints,
+            stopped_thread: None,
+            current_location: None,
+        })
+    }
+
+    /// Drain everything the adapter has sent, advance the handshake, and return
+    /// the user-facing events. Non-blocking.
+    pub fn poll(&mut self) -> Vec<DapEvent> {
+        let mut out = Vec::new();
+        while let Ok(msg) = self.transport.incoming.try_recv() {
+            // Responses: the only one we act on is `stackTrace`, which tells us
+            // the file + line a `stopped` paused on.
+            if msg.get("type").and_then(Value::as_str) == Some("response") {
+                if msg.get("command").and_then(Value::as_str) == Some("stackTrace")
+                    && let Some(loc) = top_frame_location(&msg)
+                {
+                    self.current_location = Some(loc);
+                }
+                continue;
+            }
+            let Some(event) = classify_event(&msg) else {
+                continue;
+            };
+            match &event {
+                DapEvent::Initialized => {
+                    self.push_breakpoints();
+                    let _ = self.transport.send(configuration_done_request());
+                    self.phase = SessionPhase::Running;
+                }
+                DapEvent::Stopped { thread_id, .. } => {
+                    self.stopped_thread = Some(*thread_id);
+                    self.phase = SessionPhase::Stopped;
+                    // Resolve the paused location asynchronously; the response
+                    // arrives on a later poll and fills `current_location`.
+                    let _ = self.transport.send(stack_trace_request(*thread_id));
+                }
+                DapEvent::Continued => {
+                    self.phase = SessionPhase::Running;
+                    self.current_location = None;
+                }
+                DapEvent::Terminated => {
+                    self.phase = SessionPhase::Terminated;
+                    self.current_location = None;
+                }
+                DapEvent::Output { .. } => {}
+            }
+            out.push(event);
+        }
+        out
+    }
+
+    /// Push every stashed breakpoint set (called on `initialized`).
+    fn push_breakpoints(&mut self) {
+        for (path, lines) in &self.breakpoints {
+            let _ = self.transport.send(set_breakpoints_request(path, lines));
+        }
+    }
+
+    /// Resume execution of the stopped thread.
+    pub fn continue_execution(&mut self) {
+        if let Some(tid) = self.stopped_thread {
+            let _ = self.transport.send(thread_request("continue", tid));
+            self.phase = SessionPhase::Running;
+        }
+    }
+
+    /// Push an updated breakpoint set for one file mid-session (debugpy accepts
+    /// `setBreakpoints` at any time), so toggling a breakpoint while paused or
+    /// running takes effect without a restart.
+    pub fn update_breakpoints(&mut self, path: &Path, lines: &[u32]) {
+        let _ = self.transport.send(set_breakpoints_request(path, lines));
+    }
+
+    /// Step over (`next`), into (`stepIn`), or out (`stepOut`).
+    pub fn step(&mut self, command: &str) {
+        if let Some(tid) = self.stopped_thread {
+            let _ = self.transport.send(thread_request(command, tid));
+        }
+    }
+
+    /// Ask the adapter to disconnect and terminate the debuggee.
+    pub fn disconnect(&mut self) {
+        let _ = self.transport.send(json!({
+            "type": "request",
+            "command": "disconnect",
+            "arguments": { "terminateDebuggee": true }
+        }));
+        self.phase = SessionPhase::Terminated;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classifies_stopped_event_with_thread_and_reason() {
+        let msg = json!({
+            "type": "event", "event": "stopped",
+            "body": { "threadId": 1, "reason": "breakpoint" }
+        });
+        assert_eq!(
+            classify_event(&msg),
+            Some(DapEvent::Stopped {
+                thread_id: 1,
+                reason: "breakpoint".into()
+            })
+        );
+    }
+
+    #[test]
+    fn classifies_initialized_and_terminated() {
+        assert_eq!(
+            classify_event(&json!({"type": "event", "event": "initialized"})),
+            Some(DapEvent::Initialized)
+        );
+        assert_eq!(
+            classify_event(&json!({"type": "event", "event": "terminated"})),
+            Some(DapEvent::Terminated)
+        );
+        assert_eq!(
+            classify_event(&json!({"type": "event", "event": "exited"})),
+            Some(DapEvent::Terminated)
+        );
+    }
+
+    #[test]
+    fn classifies_output_event() {
+        let msg = json!({
+            "type": "event", "event": "output",
+            "body": { "category": "stdout", "output": "hello\n" }
+        });
+        assert_eq!(
+            classify_event(&msg),
+            Some(DapEvent::Output {
+                category: "stdout".into(),
+                text: "hello\n".into()
+            })
+        );
+    }
+
+    #[test]
+    fn ignores_responses_and_unknown_events() {
+        assert_eq!(
+            classify_event(&json!({"type": "response", "command": "initialize"})),
+            None
+        );
+        assert_eq!(
+            classify_event(&json!({"type": "event", "event": "module"})),
+            None
+        );
+    }
+
+    #[test]
+    fn set_breakpoints_request_maps_lines_to_objects() {
+        let req = set_breakpoints_request(Path::new("/a/b.py"), &[2, 7]);
+        assert_eq!(req["command"], "setBreakpoints");
+        assert_eq!(req["arguments"]["source"]["path"], "/a/b.py");
+        let bps = req["arguments"]["breakpoints"].as_array().unwrap();
+        assert_eq!(bps.len(), 2);
+        assert_eq!(bps[0]["line"], 2);
+        assert_eq!(bps[1]["line"], 7);
+    }
+
+    #[test]
+    fn launch_request_carries_program_and_interpreter() {
+        let req = launch_request(Path::new("/w/app.py"), Path::new("/v/bin/python"), false);
+        assert_eq!(req["command"], "launch");
+        assert_eq!(req["arguments"]["program"], "/w/app.py");
+        assert_eq!(req["arguments"]["python"][0], "/v/bin/python");
+        assert_eq!(req["arguments"]["request"], "launch");
+    }
+
+    #[test]
+    fn thread_request_carries_thread_id() {
+        let req = thread_request("continue", 3);
+        assert_eq!(req["command"], "continue");
+        assert_eq!(req["arguments"]["threadId"], 3);
+    }
+
+    #[test]
+    fn stack_trace_request_targets_top_frame() {
+        let req = stack_trace_request(5);
+        assert_eq!(req["command"], "stackTrace");
+        assert_eq!(req["arguments"]["threadId"], 5);
+        assert_eq!(req["arguments"]["levels"], 1);
+    }
+
+    #[test]
+    fn top_frame_location_reads_path_and_line() {
+        let resp = json!({
+            "type": "response", "command": "stackTrace",
+            "body": { "stackFrames": [
+                { "source": { "path": "/w/app.py" }, "line": 12 },
+                { "source": { "path": "/w/lib.py" }, "line": 1 }
+            ]}
+        });
+        assert_eq!(
+            top_frame_location(&resp),
+            Some((PathBuf::from("/w/app.py"), 12))
+        );
+    }
+
+    #[test]
+    fn top_frame_location_none_when_empty_or_malformed() {
+        let empty =
+            json!({"type": "response", "command": "stackTrace", "body": {"stackFrames": []}});
+        assert_eq!(top_frame_location(&empty), None);
+        assert_eq!(top_frame_location(&json!({"body": {}})), None);
+    }
+
+    /// End-to-end against a real debugpy adapter: launch a script with a
+    /// breakpoint and confirm the session reaches `Stopped` at that line.
+    /// Ignored by default — needs `~/.croft/debug-venv` (uv + debugpy on 3.14);
+    /// run with `cargo test --bin croft -- --ignored launches_debugpy`.
+    #[test]
+    #[ignore = "requires ~/.croft/debug-venv (uv + debugpy on CPython 3.14)"]
+    fn launches_debugpy_and_stops_at_breakpoint() {
+        use std::io::Write;
+        let py = crate::dap::install::ensure_debug_venv().expect("provision debug venv");
+        let mut f = tempfile::Builder::new().suffix(".py").tempfile().unwrap();
+        writeln!(f, "x = 1\ny = 2\nz = x + y\nprint(z)").unwrap();
+        // Canonicalize so our breakpoint path matches debugpy's (macOS resolves
+        // /var -> /private/var; an unresolved path would never bind).
+        let path = f.path().canonicalize().unwrap();
+
+        let mut bps = BTreeMap::new();
+        bps.insert(path.clone(), vec![3u32]); // break on `z = x + y`
+        let mut sess = DapSession::launch(
+            &py.to_string_lossy(),
+            &["-m".to_string(), "debugpy.adapter".to_string()],
+            path.parent().unwrap(),
+            &path,
+            &py,
+            bps,
+            false,
+        )
+        .unwrap();
+
+        let mut stopped = false;
+        for _ in 0..100 {
+            for ev in sess.poll() {
+                if matches!(ev, DapEvent::Stopped { .. }) {
+                    stopped = true;
+                }
+            }
+            if sess.current_location.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        sess.disconnect();
+
+        assert!(stopped, "expected a `stopped` event from debugpy");
+        let (_loc, line) = sess.current_location.clone().expect("a paused location");
+        assert_eq!(line, 3, "should pause on the breakpoint line");
+    }
+}

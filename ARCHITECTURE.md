@@ -51,8 +51,11 @@ src/
 │   ├── sys_monitor.rs   background system-metrics poller driving the SYSTEM panel
 │   ├── welcome.rs       welcome-screen state + async recent-repos drain
 │   └── tests.rs         unit / integration tests
-├── dap/                 debugger stack: PEP 768 remote-attach to running Python processes
+├── dap/                 debugger stack: Debug Adapter Protocol client for Python (debugpy), 3.14+ only, no fallback
 │   ├── mod.rs
+│   ├── transport.rs     DAP wire framing (Content-Length + seq envelope, not JSON-RPC, so async-lsp can't be reused); spawns the adapter, blocking reader thread frames stdout into an mpsc channel
+│   ├── session.rs       one launch session: the initialize -> setBreakpoints -> configurationDone -> stopped state machine, event classifier, stackTrace-on-stop to resolve the paused line, continue/step/disconnect; Value-based request builders (no vendored protocol types)
+│   ├── install.rs       provisions a private debugpy venv at ~/.croft/debug-venv via uv (PEP 668 forbids pip-ing into the uv-managed CPython; mirrors ~/.croft/servers)
 │   ├── remote_attach.rs pure attach planning: parse / gate the CPython version (>=3.14 ships sys.remote_exec), the platform-aware sudo-elevation decision (macOS always, Linux unless Yama ptrace_scope is relaxed), and the `pdb -p` command builder
 │   └── discovery.rs     enumerate attachable CPython 3.14+ processes via sysinfo plus a per-candidate `--version` probe
 ├── lsp/                 LSP client stack

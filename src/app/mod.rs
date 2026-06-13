@@ -1111,6 +1111,10 @@ pub struct App {
     /// Lists running CPython 3.14+ processes; selecting one spawns
     /// `pdb -p <pid>` in a PTY.
     pub process_picker: Option<crate::widgets::process_picker::ProcessPicker>,
+    /// Active debug session: a debugpy DAP launch. None when not debugging.
+    /// Polled each frame by [`App::poll_dap`], which mirrors the paused location
+    /// into `editor.stop_line`.
+    pub dap_session: Option<crate::dap::session::DapSession>,
     /// zoxide-backed Explorer jump popup (Cmd+Z). None when closed. Opens
     /// only from the Explorer pane, so it never collides with the editor's
     /// Cmd+Z undo.
@@ -1569,6 +1573,7 @@ impl App {
             file_finder: None,
             command_palette: None,
             process_picker: None,
+            dap_session: None,
             zoxide_jump: None,
             file_finder_index: None,
             file_finder_index_rx: Some(file_finder_index_rx),
@@ -5712,6 +5717,33 @@ impl App {
             self.quit = true;
             return Ok(());
         }
+        // Debugger chords (VS Code defaults). F5 start/continue, Shift+F5 stop,
+        // F9 toggle breakpoint, F10 step over, F11/Shift+F11 step in/out.
+        if matches!(key.code, KeyCode::F(5)) {
+            if key.modifiers.contains(KeyModifiers::SHIFT) {
+                self.debug_stop();
+            } else {
+                self.debug_start_or_continue();
+            }
+            return Ok(());
+        }
+        if matches!(key.code, KeyCode::F(9)) {
+            self.debug_toggle_breakpoint();
+            return Ok(());
+        }
+        if matches!(key.code, KeyCode::F(10)) {
+            self.debug_step("next");
+            return Ok(());
+        }
+        if matches!(key.code, KeyCode::F(11)) {
+            let cmd = if key.modifiers.contains(KeyModifiers::SHIFT) {
+                "stepOut"
+            } else {
+                "stepIn"
+            };
+            self.debug_step(cmd);
+            return Ok(());
+        }
         if is_file_finder_key(key) {
             self.open_file_finder();
             return Ok(());
@@ -6162,6 +6194,166 @@ impl App {
     /// Spawn a fresh PTY at the resolved working directory, seed it with the
     /// runner command for the active editor tab's file, and focus the
     /// terminal pane so the user sees output immediately.
+    /// Drain the debug session each frame. Returns true if anything changed
+    /// (so the frame loop redraws). Mirrors the paused location into the
+    /// editor's stop-line, surfaces program output + stop reasons, and tears
+    /// the session down when the debuggee exits.
+    pub fn poll_dap(&mut self) -> bool {
+        use crate::dap::session::{DapEvent, SessionPhase};
+        if self.dap_session.is_none() {
+            return false;
+        }
+        let events = self
+            .dap_session
+            .as_mut()
+            .map(|s| s.poll())
+            .unwrap_or_default();
+        let mut changed = !events.is_empty();
+        for ev in events {
+            match ev {
+                DapEvent::Output { text, .. } => {
+                    let line = text.trim_end();
+                    if !line.is_empty() {
+                        self.status = format!("debug: {line}");
+                    }
+                }
+                DapEvent::Stopped { reason, .. } => {
+                    self.run_debug.feedback = Some(format!("Paused ({reason})"));
+                    self.run_debug.feedback_is_error = false;
+                }
+                _ => {}
+            }
+        }
+        let phase = self.dap_session.as_ref().map(|s| s.phase);
+        match phase {
+            Some(SessionPhase::Stopped) => {
+                let loc = self
+                    .dap_session
+                    .as_ref()
+                    .and_then(|s| s.current_location.clone());
+                if let Some(loc) = loc
+                    && self.editor.stop_line.as_ref() != Some(&loc)
+                {
+                    self.editor.stop_line = Some(loc);
+                    changed = true;
+                }
+            }
+            Some(SessionPhase::Terminated) => {
+                self.editor.stop_line = None;
+                self.dap_session = None;
+                self.run_debug.feedback = Some(String::from("Debug session ended"));
+                self.run_debug.feedback_is_error = false;
+                changed = true;
+            }
+            _ => {
+                if self.editor.stop_line.take().is_some() {
+                    changed = true;
+                }
+            }
+        }
+        changed
+    }
+
+    /// F5: start debugging the active file, or resume if already paused.
+    pub fn debug_start_or_continue(&mut self) {
+        use crate::dap::session::SessionPhase;
+        if let Some(session) = self.dap_session.as_mut() {
+            if session.phase == SessionPhase::Stopped {
+                session.continue_execution();
+                self.editor.stop_line = None;
+            }
+            return;
+        }
+        self.start_debug_session();
+    }
+
+    /// Launch debugpy on the active file, pushing the editor's breakpoints.
+    fn start_debug_session(&mut self) {
+        use std::collections::BTreeMap;
+        let Some(path) = self.editor.path.clone() else {
+            self.run_debug.feedback = Some(String::from("Open a Python file to debug"));
+            self.run_debug.feedback_is_error = true;
+            return;
+        };
+        let py = match crate::dap::install::ensure_debug_venv() {
+            Ok(py) => py,
+            Err(e) => {
+                self.run_debug.feedback = Some(format!("Debugger setup failed: {e}"));
+                self.run_debug.feedback_is_error = true;
+                return;
+            }
+        };
+        let breakpoints: BTreeMap<PathBuf, Vec<u32>> = self
+            .editor
+            .breakpoints
+            .iter()
+            .map(|(p, lines)| (p.clone(), lines.iter().map(|&l| l as u32).collect()))
+            .collect();
+        let adapter_args = vec![String::from("-m"), String::from("debugpy.adapter")];
+        let py_str = py.to_string_lossy().into_owned();
+        match crate::dap::session::DapSession::launch(
+            &py_str,
+            &adapter_args,
+            &self.workspace_root,
+            &path,
+            &py,
+            breakpoints,
+            false,
+        ) {
+            Ok(session) => {
+                self.dap_session = Some(session);
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                self.run_debug.feedback = Some(format!("Debugging {name}"));
+                self.run_debug.feedback_is_error = false;
+                self.status =
+                    format!("Debugging {name} — F5 continue · F10 step over · Shift+F5 stop");
+            }
+            Err(e) => {
+                self.run_debug.feedback = Some(format!("Failed to start debugger: {e}"));
+                self.run_debug.feedback_is_error = true;
+            }
+        }
+    }
+
+    /// F9: toggle a breakpoint on the cursor line, pushing it live if a session
+    /// is running.
+    pub fn debug_toggle_breakpoint(&mut self) {
+        match self.editor.toggle_breakpoint() {
+            Some((_, line)) => self.status = format!("Breakpoint toggled at line {line}"),
+            None => {
+                self.status = String::from("Open a file to set a breakpoint");
+                return;
+            }
+        }
+        if let Some(path) = self.editor.path.clone() {
+            let lines = self.editor.breakpoint_lines(&path);
+            if let Some(session) = self.dap_session.as_mut() {
+                session.update_breakpoints(&path, &lines);
+            }
+        }
+    }
+
+    /// F10/F11/Shift+F11: step the paused thread (`next` / `stepIn` / `stepOut`).
+    pub fn debug_step(&mut self, command: &str) {
+        if let Some(session) = self.dap_session.as_mut() {
+            session.step(command);
+            self.editor.stop_line = None;
+        }
+    }
+
+    /// Shift+F5: stop debugging and tear the session down.
+    pub fn debug_stop(&mut self) {
+        if let Some(session) = self.dap_session.as_mut() {
+            session.disconnect();
+        }
+        self.dap_session = None;
+        self.editor.stop_line = None;
+        self.status = String::from("Debug session stopped");
+    }
+
     pub fn run_active_file(&mut self) {
         let Some(path) = self.editor.path.clone() else {
             self.run_debug.feedback = Some(String::from("Open a file first"));
@@ -9644,6 +9836,10 @@ impl App {
                     self.status = format!("Split terminal failed: {e}");
                 }
             },
+            Cmd::StartDebugging => self.debug_start_or_continue(),
+            Cmd::StopDebugging => self.debug_stop(),
+            Cmd::ToggleBreakpoint => self.debug_toggle_breakpoint(),
+            Cmd::StepOver => self.debug_step("next"),
             Cmd::AttachPythonProcess => self.open_attach_python_picker(),
             Cmd::ColorTheme => self.open_theme_picker(),
             Cmd::KeyboardShortcuts => self.open_shortcuts_modal(),
@@ -14811,6 +15007,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let diagnostics_changed = app.drain_lsp_diagnostics();
         let progress_changed = app.drain_lsp_progress();
         let sysmon_changed = app.drain_sysmon();
+        let dap_changed = app.poll_dap();
         // Surface managed language-server install progress in the status bar so
         // the background work (which can take a few seconds) is visible.
         let install_status_changed = match crate::lsp::install::take_status() {
@@ -14854,7 +15051,8 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             || diagnostics_changed
             || progress_changed
             || install_status_changed
-            || sysmon_changed;
+            || sysmon_changed
+            || dap_changed;
         let pty_eligible = pty_pending
             && (app.peek_terminals_pending_bytes() <= PTY_SMALL_UPDATE_BYTES
                 || last_pty_redraw.elapsed() >= pty_min_interval);

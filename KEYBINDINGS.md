@@ -166,6 +166,20 @@ Image tabs (`.png`, `.jpg`, `.jpeg`, `.gif`, `.bmp`, `.webp`) are read-only; eve
 | `End` | Jump to the last visible page |
 | `Tab` / `Shift+Tab` | Switch worksheet |
 
+## Run & Debug
+
+Real breakpoint debugging for Python via debugpy over the Debug Adapter Protocol. Requires CPython 3.14+ (croft provisions a private `~/.croft/debug-venv` with debugpy on first use); there is no fallback to older interpreters.
+
+| Keys | Action |
+|------|--------|
+| `F5` | Start debugging the active file (launches it under debugpy), or resume when paused at a breakpoint |
+| `Shift+F5` | Stop the debug session |
+| `F9` | Toggle a breakpoint on the cursor's line (a red dot in the gutter); pushed live when a session is running |
+| `F10` | Step over |
+| `F11` / `Shift+F11` | Step into / out |
+
+The paused line is marked with a yellow `▶` in the gutter. Breakpoints, start/stop, step over, and "Debug: Attach to Python Process" are also in the Command Palette.
+
 ## Terminal
 
 | Keys | Action |

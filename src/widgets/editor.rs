@@ -1129,6 +1129,14 @@ impl ExternalReloadReport {
 pub struct Editor {
     pub path: Option<PathBuf>,
     pub lines: Vec<String>,
+    /// Debugger breakpoints, keyed by file path, as 1-based line numbers.
+    /// Rendered as red dots in the gutter and pushed to the DAP adapter on
+    /// launch. Keyed by path (not just the active file) so switching the buffer
+    /// to another file and back keeps its breakpoints.
+    pub breakpoints: std::collections::HashMap<PathBuf, std::collections::BTreeSet<usize>>,
+    /// Where the debugger is currently paused (path, 1-based line), or None when
+    /// not stopped. Drawn as a highlighted row with a gutter arrow.
+    pub stop_line: Option<(PathBuf, usize)>,
     /// Monotonic counter that bumps on every buffer mutation. The App's
     /// per-tick sync_lsp diff reads this to know when to forward a
     /// did_change to the LSP server, so building lines.join("\n") only
@@ -1296,6 +1304,8 @@ impl Editor {
         Self {
             path: None,
             lines: Vec::new(),
+            breakpoints: std::collections::HashMap::new(),
+            stop_line: None,
             edit_seq: 0,
             scroll: 0,
             scroll_sub: 0,
@@ -1347,6 +1357,32 @@ impl Editor {
 
     pub fn set_search_highlight(&mut self, term: Option<String>) {
         self.search_highlight = term.filter(|s| !s.is_empty());
+    }
+
+    /// Toggle a debugger breakpoint on the cursor's current line for the active
+    /// file. Returns the now-active set's path + 1-based line on success, or
+    /// `None` when no file is open. Empty sets are dropped so the map stays
+    /// clean for the gutter renderer.
+    pub fn toggle_breakpoint(&mut self) -> Option<(PathBuf, usize)> {
+        let path = self.path.clone()?;
+        let line = self.cursor_row + 1; // gutter + DAP are 1-based
+        let set = self.breakpoints.entry(path.clone()).or_default();
+        if !set.remove(&line) {
+            set.insert(line);
+        }
+        if set.is_empty() {
+            self.breakpoints.remove(&path);
+        }
+        Some((path, line))
+    }
+
+    /// 1-based breakpoint lines for `path`, ascending, for a DAP
+    /// `setBreakpoints` request.
+    pub fn breakpoint_lines(&self, path: &Path) -> Vec<u32> {
+        self.breakpoints
+            .get(path)
+            .map(|s| s.iter().map(|&l| l as u32).collect())
+            .unwrap_or_default()
     }
 
     fn mark_buffer_changed(&mut self) {
@@ -4342,6 +4378,38 @@ impl Widget for &mut Editor {
                 );
             }
 
+            // Debugger gutter glyphs, on a logical line's first visual row only:
+            // a yellow stop arrow (▶) takes priority over a red breakpoint dot
+            // (●), painted over the blank leftmost gutter cell.
+            if (!wrap || row_start == 0)
+                && let Some(path) = self.path.as_deref()
+            {
+                let here = line_idx + 1; // gutter is 1-based
+                let is_stop = self
+                    .stop_line
+                    .as_ref()
+                    .is_some_and(|(p, l)| p == path && *l == here);
+                let is_bp = self
+                    .breakpoints
+                    .get(path)
+                    .is_some_and(|s| s.contains(&here));
+                if is_stop {
+                    buf.set_string(
+                        inner.x,
+                        y,
+                        "▶",
+                        Style::default().fg(Color::Rgb(0xff, 0xcc, 0x00)),
+                    );
+                } else if is_bp {
+                    buf.set_string(
+                        inner.x,
+                        y,
+                        "●",
+                        Style::default().fg(Color::Rgb(0xe5, 0x1c, 0x23)),
+                    );
+                }
+            }
+
             // Per-row window: the segment [row_start, row_end). For non-wrap
             // this is exactly the horizontally-scrolled view; for wrap it is
             // one folded segment. The overlay painters treat `row_start` as
@@ -5640,6 +5708,24 @@ mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::NamedTempFile;
+
+    #[test]
+    fn toggle_breakpoint_adds_then_removes_on_cursor_line() {
+        let mut e = Editor::new();
+        e.path = Some(PathBuf::from("/x/a.py"));
+        e.lines = vec!["a".into(), "b".into(), "c".into()];
+        e.cursor_row = 1; // 0-based row 1 => 1-based line 2
+        assert_eq!(e.toggle_breakpoint(), Some((PathBuf::from("/x/a.py"), 2)));
+        assert_eq!(e.breakpoint_lines(Path::new("/x/a.py")), vec![2u32]);
+        e.toggle_breakpoint(); // toggles the same line back off
+        assert!(e.breakpoint_lines(Path::new("/x/a.py")).is_empty());
+    }
+
+    #[test]
+    fn toggle_breakpoint_without_open_file_is_noop() {
+        let mut e = Editor::new();
+        assert_eq!(e.toggle_breakpoint(), None);
+    }
 
     fn editor_with(text: &str) -> Editor {
         let mut e = Editor::new();
