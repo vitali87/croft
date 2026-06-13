@@ -25,7 +25,7 @@
 //! the space bar absorb the slack. The left column staggers like a MacBook:
 //! esc < tab < caps < shift. A split mode (toggled by the `split` key,
 //! persisted in prefs) breaks the board into two thumb clusters separated
-//! by a center gap of about a sixth of the band width, mirroring Gboard's
+//! by a center gap of about two-ninths of the band width, mirroring Gboard's
 //! foldable split with no duplicated letter keys. The number/top rows split
 //! 5|5 (`esc 12345 | tab qwert`); the home and bottom rows split one column
 //! earlier (`caps asdf | g hjkl`, `shift zxcv | b nm`) so `g` and `b` land
