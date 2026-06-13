@@ -18,6 +18,7 @@ On macOS, the `Cmd` chords below only reach croft after you run a one-time setup
 | `Cmd+\` | Split the editor into two side-by-side columns; each keeps its own tabs, scroll, and cursor. Closing the last tab in a column collapses the split |
 | `Cmd+Opt+←` / `Cmd+Opt+→` | Move focus to the left / right editor group while split (or click a column) |
 | `Ctrl+p` / `Cmd+p` | Quick Open: fuzzy-search workspace files and jump to one (auto-reveals it in the Explorer) |
+| `Ctrl+Shift+p` / `Cmd+Shift+p` | Command Palette: fuzzy-search every named command and run it, with its keybinding shown alongside |
 | `Ctrl+Shift+e` / `Cmd+Shift+e` | Jump to the Explorer sidebar |
 | `Ctrl+Shift+f` / `Cmd+Shift+f` | Jump to the Search sidebar |
 | `Ctrl+Shift+s` / `Cmd+Shift+s` | Jump to Source Control |
@@ -28,6 +29,17 @@ On macOS, the `Cmd` chords below only reach croft after you run a one-time setup
 | Click the settings gear | Open settings → Color Theme picker (Croft Dark Blue / Croft Black) |
 | Drag a seam | Resize the sidebar, the split between editor columns, or the editor/terminal split |
 | Mouse wheel | Scroll the pane under the pointer |
+
+## Command Palette
+
+`Cmd`/`Ctrl`+`Shift`+`P` opens the Command Palette: type to fuzzy-search every named command, `↑`/`↓` to move, `Enter` to run, `Esc` to close. Commands that have a dedicated chord show it on the right. Beyond the chord-bound actions above, these editor commands are reachable only here:
+
+| Command | Action |
+|---------|--------|
+| Join Lines | Collapse the selected lines (or the current line with the next) into one, single-spaced |
+| Transform to Uppercase / Lowercase / Title Case | Re-case the selection, or the word under the cursor when nothing is selected |
+| Sort Lines Ascending / Descending | Sort the selected lines (or the whole file when nothing is selected) lexicographically |
+| Trim Trailing Whitespace | Strip trailing spaces and tabs from every line |
 
 ## Explorer (file tree)
 
@@ -72,6 +84,12 @@ On macOS, the `Cmd` chords below only reach croft after you run a one-time setup
 | Printable char, Enter, Backspace, Delete | Edit (typing or deleting with a selection replaces it) |
 | `Tab` | Indent: a multi-line selection indents every touched line one level; otherwise inserts to the next tab stop (4, or 2 in YAML) |
 | `Shift`+`Tab` | Outdent one level, tab-stop aligned, for the current line or every line a selection touches |
+| `Alt`+`↑` / `Alt`+`↓` | Move the current line (or selected block) up / down, carrying the cursor and selection |
+| `Shift`+`Alt`+`↑` / `↓` | Copy the current line (or selected block) up / down |
+| `Cmd`/`Ctrl`+`Opt`+`↑` / `↓` | Add a cursor above / below the current one (multi-cursor) |
+| `Cmd`+`/` / `Ctrl`+`/` | Toggle line comment for the current line or every line the selection touches (language-aware; comments at the block's common indent) |
+| `Shift`+`Alt`+`A` | Toggle block comment around the selection (languages with a block comment) |
+| `Alt`+`Z` | Toggle soft word wrap for this file (overrides the per-language default until the file is reopened) |
 | Mouse drag | Select text; every other occurrence of a single-line selection highlights in blue |
 | `Ctrl`+`C` / `Cmd`+`C` | Copy the selection to the system clipboard |
 | `Ctrl`+`X` / `Cmd`+`X` | Cut the selection |
@@ -166,7 +184,10 @@ Image tabs (`.png`, `.jpg`, `.jpeg`, `.gif`, `.bmp`, `.webp`) are read-only; eve
 | iTerm2 keystroke | What croft does |
 |------------------|-----------------|
 | `⌘P` | Quick Open |
+| `⌘⇧P` | Command Palette |
 | `⌘F` | In-editor Find |
+| `⌘/` | Toggle line comment |
+| `⌥⌘↑` / `⌥⌘↓` | Add a cursor above / below (multi-cursor) |
 | `⌘⇧E` / `⌘⇧F` / `⌘⇧S` / `⌘⇧D` / `⌘⇧R` | Jump to Explorer / Search / Source Control / Run and Debug / Remote |
 | `⌘⇧L` | Disconnect a remote session |
 | `⌘⇧N` | Explorer "New folder" prompt |

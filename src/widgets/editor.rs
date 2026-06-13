@@ -1040,6 +1040,27 @@ enum EditKind {
     /// A single keystroke applied simultaneously across every multi-cursor
     /// caret. Never coalesces, so each multi-edit is its own undo step.
     MultiEdit,
+    /// Move a line / block up or down (Alt+Up / Alt+Down). Its own step.
+    MoveLines,
+    /// Toggle line or block comment (Cmd+/ / Shift+Alt+A). Its own step.
+    ToggleComment,
+    /// Join selected lines into one. Its own step.
+    JoinLines,
+    /// Upper / lower / title-case a selection. Its own step.
+    TransformCase,
+    /// Sort the selected lines. Its own step.
+    SortLines,
+    /// Trim trailing whitespace across the buffer. Its own step.
+    TrimWhitespace,
+}
+
+/// The three case transforms VS Code exposes as
+/// `editor.action.transformTo{Upper,Lower,Title}case`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CaseTransform {
+    Upper,
+    Lower,
+    Title,
 }
 
 /// A single keystroke to fan out across every multi-cursor caret.
@@ -1181,6 +1202,12 @@ pub struct Editor {
     undo_stack: Vec<Snapshot>,
     last_edit_kind: Option<EditKind>,
     lang: Option<LangKind>,
+    /// Per-tab override for soft-wrap (VS Code "View: Toggle Word Wrap",
+    /// Alt+Z). `None` means follow the language default (`wrap_enabled`
+    /// wraps Markdown only); `Some(true)`/`Some(false)` force it on/off for
+    /// this buffer. Reset to `None` on every `open` so each file starts at
+    /// its language default.
+    wrap_override: Option<bool>,
     highlights: Vec<Vec<HiSpan>>,
     /// LSP semantic-token overlay decoded per line (byte offsets within
     /// the line), painted over `highlights` at render so a parameter (and
@@ -1294,6 +1321,7 @@ impl Editor {
             undo_stack: Vec::new(),
             last_edit_kind: None,
             lang: None,
+            wrap_override: None,
             highlights: Vec::new(),
             semantic_overlay: Vec::new(),
             semantic_data: Vec::new(),
@@ -1331,8 +1359,11 @@ impl Editor {
     /// Soft-wrap mode: long lines fold onto multiple visual rows instead of
     /// scrolling horizontally. Matches VS Code, which ships word-wrap on by
     /// default for Markdown only (`"[markdown]": { "editor.wordWrap": "on" }`).
+    /// `toggle_wrap` (Alt+Z) sets a per-buffer override that wins over the
+    /// language default.
     pub fn wrap_enabled(&self) -> bool {
-        matches!(self.lang, Some(LangKind::Markdown))
+        self.wrap_override
+            .unwrap_or(matches!(self.lang, Some(LangKind::Markdown)))
     }
 
     /// Longest line width in characters, cached until the buffer changes.
@@ -1559,6 +1590,7 @@ impl Editor {
             .extension()
             .and_then(|e| e.to_str())
             .and_then(lang_for_extension);
+        self.wrap_override = None;
         self.scroll = 0;
         self.cursor_row = 0;
         self.cursor_col = 0;
@@ -2877,6 +2909,317 @@ impl Editor {
         }
     }
 
+    /// Char-based slice of the buffer between two `(row, char_col)` points
+    /// (`start <= end`), joining spanned rows with `\n`.
+    fn char_range_text(&self, start: (usize, usize), end: (usize, usize)) -> String {
+        if start.0 == end.0 {
+            return self.lines[start.0]
+                .chars()
+                .skip(start.1)
+                .take(end.1.saturating_sub(start.1))
+                .collect();
+        }
+        let mut out: String = self.lines[start.0].chars().skip(start.1).collect();
+        for line in &self.lines[start.0 + 1..end.0] {
+            out.push('\n');
+            out.push_str(line);
+        }
+        out.push('\n');
+        let last: String = self.lines[end.0].chars().take(end.1).collect();
+        out.push_str(&last);
+        out
+    }
+
+    /// Replace the char-range `start..end` with `new`, re-splitting on `\n`
+    /// so a replacement that adds or removes newlines reshapes `lines`.
+    fn replace_char_range(&mut self, start: (usize, usize), end: (usize, usize), new: &str) {
+        let prefix: String = self.lines[start.0].chars().take(start.1).collect();
+        let suffix: String = self.lines[end.0].chars().skip(end.1).collect();
+        let combined = format!("{prefix}{new}{suffix}");
+        let replacement: Vec<String> = combined.split('\n').map(str::to_string).collect();
+        self.lines.splice(start.0..=end.0, replacement);
+    }
+
+    /// VS Code "Move Line Down" (Alt+Down): swap the current line / selected
+    /// block with the line below it, carrying the cursor and selection along.
+    /// No-op when the block already touches the last line.
+    pub fn move_lines_down(&mut self) {
+        let (start, end) = self.selected_or_cursor_row_range();
+        if end + 1 >= self.lines.len() {
+            return;
+        }
+        self.push_undo(EditKind::MoveLines);
+        self.lines[start..=end + 1].rotate_right(1);
+        self.cursor_row += 1;
+        if let Some(sel) = self.selection.as_mut() {
+            sel.anchor.0 += 1;
+            sel.head.0 += 1;
+        }
+        self.mark_buffer_changed();
+        self.ensure_cursor_col_visible();
+    }
+
+    /// VS Code "Move Line Up" (Alt+Up): mirror of `move_lines_down`. No-op
+    /// when the block already touches the first line.
+    pub fn move_lines_up(&mut self) {
+        let (start, end) = self.selected_or_cursor_row_range();
+        if start == 0 {
+            return;
+        }
+        self.push_undo(EditKind::MoveLines);
+        self.lines[start - 1..=end].rotate_left(1);
+        self.cursor_row -= 1;
+        if let Some(sel) = self.selection.as_mut() {
+            sel.anchor.0 -= 1;
+            sel.head.0 -= 1;
+        }
+        self.mark_buffer_changed();
+        self.ensure_cursor_col_visible();
+    }
+
+    /// VS Code "Toggle Line Comment" (Cmd+/): comment or uncomment every line
+    /// the cursor or selection touches using the language's line-comment
+    /// marker. Comments are inserted at the block's common (minimum)
+    /// indentation so the markers align; the whole block uncomments only when
+    /// every non-blank line is already commented. Returns false (a no-op) for
+    /// languages with no line comment.
+    pub fn toggle_line_comment(&mut self) -> bool {
+        let Some(token) = line_comment_token(self.lang) else {
+            return false;
+        };
+        let (start, end) = self.selected_or_cursor_row_range();
+        let non_blank: Vec<usize> = (start..=end)
+            .filter(|&r| !self.lines[r].trim().is_empty())
+            .collect();
+        if non_blank.is_empty() {
+            return false;
+        }
+        self.push_undo(EditKind::ToggleComment);
+        let all_commented = non_blank
+            .iter()
+            .all(|&r| self.lines[r].trim_start().starts_with(token));
+        if all_commented {
+            for &r in &non_blank {
+                let line = self.lines[r].clone();
+                let off = line.len() - line.trim_start().len();
+                let mut rest = line[off..].to_string();
+                rest.drain(..token.len());
+                if rest.starts_with(' ') {
+                    rest.drain(..1);
+                }
+                self.lines[r] = format!("{}{}", &line[..off], rest);
+            }
+        } else {
+            let min_indent = non_blank
+                .iter()
+                .map(|&r| {
+                    let l = &self.lines[r];
+                    l.len() - l.trim_start().len()
+                })
+                .min()
+                .unwrap_or(0);
+            for &r in &non_blank {
+                self.lines[r].insert_str(min_indent, &format!("{token} "));
+            }
+        }
+        self.cursor_col = self.cursor_col.min(self.line_char_len(self.cursor_row));
+        self.mark_buffer_changed();
+        self.ensure_cursor_col_visible();
+        true
+    }
+
+    /// VS Code "Toggle Block Comment" (Shift+Alt+A): wrap the selection (or,
+    /// with no selection, the current line) in the language's block-comment
+    /// delimiters, or strip them when the selection already is a block
+    /// comment. Returns false for languages with no block comment (e.g.
+    /// Python).
+    pub fn toggle_block_comment(&mut self) -> bool {
+        let Some((open, close)) = block_comment_tokens(self.lang) else {
+            return false;
+        };
+        let (start, end) = match &self.selection {
+            Some(sel) => sel.normalised(),
+            None => {
+                let len = self.line_char_len(self.cursor_row);
+                ((self.cursor_row, 0), (self.cursor_row, len))
+            }
+        };
+        let text = self.char_range_text(start, end);
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return false;
+        }
+        self.push_undo(EditKind::ToggleComment);
+        let wrapped = trimmed.starts_with(open)
+            && trimmed.ends_with(close)
+            && trimmed.len() >= open.len() + close.len();
+        let new = if wrapped {
+            trimmed[open.len()..trimmed.len() - close.len()]
+                .trim()
+                .to_string()
+        } else {
+            format!("{open} {trimmed} {close}")
+        };
+        self.replace_char_range(start, end, &new);
+        self.selection = None;
+        self.cursor_row = start.0;
+        self.cursor_col = self.line_char_len(start.0);
+        self.mark_buffer_changed();
+        self.ensure_cursor_col_visible();
+        true
+    }
+
+    /// VS Code "Join Lines": collapse the selected lines (or the current line
+    /// with the one below it) into one, trimming each joined line's leading
+    /// whitespace and separating with a single space. No-op when there is no
+    /// following line to join.
+    pub fn join_lines(&mut self) {
+        let (start, end) = self.selected_or_cursor_row_range();
+        let last = if start == end { start + 1 } else { end };
+        if last >= self.lines.len() {
+            return;
+        }
+        self.push_undo(EditKind::JoinLines);
+        let mut result = self.lines[start].trim_end().to_string();
+        let cursor_col = result.chars().count();
+        for line in &self.lines[start + 1..=last] {
+            let piece = line.trim_start();
+            if !result.is_empty() && !result.ends_with(char::is_whitespace) && !piece.is_empty() {
+                result.push(' ');
+            }
+            result.push_str(piece);
+        }
+        self.lines.splice(start..=last, std::iter::once(result));
+        self.cursor_row = start;
+        self.cursor_col = cursor_col;
+        self.selection = None;
+        self.mark_buffer_changed();
+        self.ensure_cursor_col_visible();
+    }
+
+    /// VS Code "Transform to Upper/Lower/Title Case": rewrite the selection
+    /// (or, with no selection, the word under the cursor) in the requested
+    /// case. No-op when there is nothing to transform.
+    pub fn transform_selection_case(&mut self, kind: CaseTransform) {
+        let range = match &self.selection {
+            Some(sel) => Some(sel.normalised()),
+            None => self
+                .word_at(self.cursor_row, self.cursor_col)
+                .map(|(s, e)| ((self.cursor_row, s), (self.cursor_row, e))),
+        };
+        let Some((start, end)) = range else {
+            return;
+        };
+        let text = self.char_range_text(start, end);
+        if text.is_empty() {
+            return;
+        }
+        self.push_undo(EditKind::TransformCase);
+        let new = match kind {
+            CaseTransform::Upper => text.to_uppercase(),
+            CaseTransform::Lower => text.to_lowercase(),
+            CaseTransform::Title => title_case(&text),
+        };
+        self.replace_char_range(start, end, &new);
+        self.mark_buffer_changed();
+        self.ensure_cursor_col_visible();
+    }
+
+    /// VS Code "Sort Lines Ascending/Descending": sort the selected lines
+    /// lexicographically, or the whole buffer when nothing is selected. No-op
+    /// on a single line.
+    pub fn sort_lines(&mut self, ascending: bool) {
+        let (start, end) = match &self.selection {
+            Some(sel) => {
+                let (s, e) = sel.normalised();
+                (s.0, e.0)
+            }
+            None => (0, self.lines.len().saturating_sub(1)),
+        };
+        if start >= end {
+            return;
+        }
+        self.push_undo(EditKind::SortLines);
+        let mut block: Vec<String> = self.lines[start..=end].to_vec();
+        block.sort();
+        if !ascending {
+            block.reverse();
+        }
+        self.lines.splice(start..=end, block);
+        self.mark_buffer_changed();
+    }
+
+    /// VS Code "Trim Trailing Whitespace": strip trailing spaces and tabs from
+    /// every line, clamping the cursor onto the new line end. Returns false
+    /// (a no-op) when the buffer is already clean.
+    pub fn trim_trailing_whitespace(&mut self) -> bool {
+        let any = self
+            .lines
+            .iter()
+            .any(|l| l.trim_end_matches([' ', '\t']).len() != l.len());
+        if !any {
+            return false;
+        }
+        self.push_undo(EditKind::TrimWhitespace);
+        for line in &mut self.lines {
+            let trimmed_len = line.trim_end_matches([' ', '\t']).len();
+            line.truncate(trimmed_len);
+        }
+        self.cursor_col = self.cursor_col.min(self.line_char_len(self.cursor_row));
+        self.mark_buffer_changed();
+        true
+    }
+
+    /// VS Code "Add Cursor Below" (Cmd+Alt+Down): drop a secondary caret on
+    /// the row below the lowest current caret, at the same column (clamped to
+    /// that line's length). No-op at the last row.
+    pub fn add_cursor_below(&mut self) {
+        let max_row = self
+            .carets
+            .iter()
+            .map(|c| c.head.0)
+            .chain(std::iter::once(self.cursor_row))
+            .max()
+            .unwrap_or(self.cursor_row);
+        let target = max_row + 1;
+        if target >= self.lines.len() {
+            return;
+        }
+        let col = self.cursor_col.min(self.line_char_len(target));
+        self.carets.push(EditorSelection {
+            anchor: (target, col),
+            head: (target, col),
+        });
+    }
+
+    /// VS Code "Add Cursor Above" (Cmd+Alt+Up): mirror of `add_cursor_below`.
+    /// No-op at the first row.
+    pub fn add_cursor_above(&mut self) {
+        let min_row = self
+            .carets
+            .iter()
+            .map(|c| c.head.0)
+            .chain(std::iter::once(self.cursor_row))
+            .min()
+            .unwrap_or(self.cursor_row);
+        if min_row == 0 {
+            return;
+        }
+        let target = min_row - 1;
+        let col = self.cursor_col.min(self.line_char_len(target));
+        self.carets.push(EditorSelection {
+            anchor: (target, col),
+            head: (target, col),
+        });
+    }
+
+    /// VS Code "View: Toggle Word Wrap" (Alt+Z): flip this buffer's soft-wrap
+    /// state, overriding the language default until the file is reopened.
+    pub fn toggle_wrap(&mut self) {
+        let now = self.wrap_enabled();
+        self.wrap_override = Some(!now);
+    }
+
     /// True when the active selection spans more than one row, so Tab should
     /// indent the whole block (VS Code) rather than replace the selection
     /// with a single indentation unit.
@@ -3452,6 +3795,66 @@ fn find_word_occurrences(chars: &[char], word: &[char]) -> Vec<usize> {
             }
         }
         i += 1;
+    }
+    out
+}
+
+/// The line-comment marker for a language (VS Code `lineComment`), or `None`
+/// for languages with no line comment, in which case Toggle Line Comment is a
+/// no-op.
+fn line_comment_token(lang: Option<LangKind>) -> Option<&'static str> {
+    match lang {
+        Some(LangKind::Rust)
+        | Some(LangKind::JavaScript)
+        | Some(LangKind::TypeScript)
+        | Some(LangKind::Tsx)
+        | Some(LangKind::Go)
+        | Some(LangKind::C)
+        | Some(LangKind::Cpp) => Some("//"),
+        Some(LangKind::Python)
+        | Some(LangKind::Yaml)
+        | Some(LangKind::Toml)
+        | Some(LangKind::Bash) => Some("#"),
+        _ => None,
+    }
+}
+
+/// The block-comment delimiters for a language (VS Code `blockComment`), or
+/// `None` for languages without one (e.g. Python), in which case Toggle Block
+/// Comment is a no-op.
+fn block_comment_tokens(lang: Option<LangKind>) -> Option<(&'static str, &'static str)> {
+    match lang {
+        Some(LangKind::Rust)
+        | Some(LangKind::JavaScript)
+        | Some(LangKind::TypeScript)
+        | Some(LangKind::Tsx)
+        | Some(LangKind::Go)
+        | Some(LangKind::C)
+        | Some(LangKind::Cpp)
+        | Some(LangKind::Css) => Some(("/*", "*/")),
+        Some(LangKind::Html) | Some(LangKind::Markdown) => Some(("<!--", "-->")),
+        _ => None,
+    }
+}
+
+/// Title-case a string: the first alphanumeric of each run is upper-cased,
+/// the rest lower-cased, separators preserved. Used by Transform to Title
+/// Case.
+fn title_case(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut prev_alnum = false;
+    for c in s.chars() {
+        if c.is_alphanumeric() {
+            if prev_alnum {
+                out.extend(c.to_lowercase());
+            } else {
+                out.extend(c.to_uppercase());
+            }
+            prev_alnum = true;
+        } else {
+            out.push(c);
+            prev_alnum = false;
+        }
     }
     out
 }
@@ -9078,5 +9481,350 @@ mod tests {
         let after: Vec<Option<std::path::PathBuf>> =
             tabs.iter_tabs().map(|e| e.path.clone()).collect();
         assert_eq!(before, after);
+    }
+
+    // ---- Move Line Up / Down (Alt+Up / Alt+Down) ----
+
+    #[test]
+    fn move_line_down_swaps_with_next_and_follows_cursor() {
+        let mut e = editor_with("a\nb\nc");
+        e.cursor_row = 0;
+        e.move_lines_down();
+        assert_eq!(e.lines, vec!["b", "a", "c"]);
+        assert_eq!(e.cursor_row, 1, "cursor follows the moved line");
+    }
+
+    #[test]
+    fn move_line_up_swaps_with_previous_and_follows_cursor() {
+        let mut e = editor_with("a\nb\nc");
+        e.cursor_row = 2;
+        e.move_lines_up();
+        assert_eq!(e.lines, vec!["a", "c", "b"]);
+        assert_eq!(e.cursor_row, 1);
+    }
+
+    #[test]
+    fn move_line_up_at_top_is_noop() {
+        let mut e = editor_with("a\nb");
+        e.cursor_row = 0;
+        e.move_lines_up();
+        assert_eq!(e.lines, vec!["a", "b"]);
+        assert_eq!(e.cursor_row, 0);
+    }
+
+    #[test]
+    fn move_line_down_at_bottom_is_noop() {
+        let mut e = editor_with("a\nb");
+        e.cursor_row = 1;
+        e.move_lines_down();
+        assert_eq!(e.lines, vec!["a", "b"]);
+        assert_eq!(e.cursor_row, 1);
+    }
+
+    #[test]
+    fn move_line_down_moves_whole_selected_block() {
+        let mut e = editor_with("a\nb\nc\nd");
+        e.selection = Some(EditorSelection {
+            anchor: (0, 0),
+            head: (1, 1),
+        });
+        e.cursor_row = 1;
+        e.move_lines_down();
+        assert_eq!(e.lines, vec!["c", "a", "b", "d"]);
+        assert_eq!(e.cursor_row, 2);
+        let sel = e.selection.unwrap();
+        assert_eq!((sel.anchor.0, sel.head.0), (1, 2), "selection rows shift");
+    }
+
+    // ---- Toggle Line Comment (Cmd+/) ----
+
+    #[test]
+    fn toggle_line_comment_adds_rust_token() {
+        let mut e = editor_with("    let x = 1;");
+        e.lang = Some(LangKind::Rust);
+        e.cursor_row = 0;
+        assert!(e.toggle_line_comment());
+        assert_eq!(e.lines, vec!["    // let x = 1;"]);
+    }
+
+    #[test]
+    fn toggle_line_comment_removes_existing_rust_token() {
+        let mut e = editor_with("    // let x = 1;");
+        e.lang = Some(LangKind::Rust);
+        e.cursor_row = 0;
+        assert!(e.toggle_line_comment());
+        assert_eq!(e.lines, vec!["    let x = 1;"]);
+    }
+
+    #[test]
+    fn toggle_line_comment_python_hash() {
+        let mut e = editor_with("x = 1");
+        e.lang = Some(LangKind::Python);
+        e.cursor_row = 0;
+        assert!(e.toggle_line_comment());
+        assert_eq!(e.lines, vec!["# x = 1"]);
+    }
+
+    #[test]
+    fn toggle_line_comment_block_comments_at_min_indent() {
+        let mut e = editor_with("  a\n    b");
+        e.lang = Some(LangKind::Python);
+        e.selection = Some(EditorSelection {
+            anchor: (0, 0),
+            head: (1, 5),
+        });
+        assert!(e.toggle_line_comment());
+        assert_eq!(e.lines, vec!["  # a", "  #   b"]);
+    }
+
+    #[test]
+    fn toggle_line_comment_block_uncomments_when_all_commented() {
+        let mut e = editor_with("  # a\n  #   b");
+        e.lang = Some(LangKind::Python);
+        e.selection = Some(EditorSelection {
+            anchor: (0, 0),
+            head: (1, 7),
+        });
+        assert!(e.toggle_line_comment());
+        assert_eq!(e.lines, vec!["  a", "    b"]);
+    }
+
+    #[test]
+    fn toggle_line_comment_unknown_lang_is_noop() {
+        let mut e = editor_with("x = 1");
+        e.lang = None;
+        assert!(!e.toggle_line_comment());
+        assert_eq!(e.lines, vec!["x = 1"]);
+    }
+
+    // ---- Toggle Block Comment (Shift+Alt+A) ----
+
+    #[test]
+    fn toggle_block_comment_wraps_selection() {
+        let mut e = editor_with("let x = 1;");
+        e.lang = Some(LangKind::Rust);
+        e.selection = Some(EditorSelection {
+            anchor: (0, 4),
+            head: (0, 5),
+        });
+        assert!(e.toggle_block_comment());
+        assert_eq!(e.lines, vec!["let /* x */ = 1;"]);
+    }
+
+    #[test]
+    fn toggle_block_comment_unwraps_when_already_wrapped() {
+        let mut e = editor_with("let /* x */ = 1;");
+        e.lang = Some(LangKind::Rust);
+        e.selection = Some(EditorSelection {
+            anchor: (0, 4),
+            head: (0, 11),
+        });
+        assert!(e.toggle_block_comment());
+        assert_eq!(e.lines, vec!["let x = 1;"]);
+    }
+
+    #[test]
+    fn toggle_block_comment_python_falls_back_to_noop() {
+        let mut e = editor_with("x = 1");
+        e.lang = Some(LangKind::Python);
+        e.selection = Some(EditorSelection {
+            anchor: (0, 0),
+            head: (0, 5),
+        });
+        assert!(!e.toggle_block_comment());
+        assert_eq!(e.lines, vec!["x = 1"]);
+    }
+
+    // ---- Join Lines ----
+
+    #[test]
+    fn join_lines_merges_current_with_next() {
+        let mut e = editor_with("hello\n    world");
+        e.cursor_row = 0;
+        e.join_lines();
+        assert_eq!(e.lines, vec!["hello world"]);
+    }
+
+    #[test]
+    fn join_lines_merges_whole_selection() {
+        let mut e = editor_with("a\n  b\n  c\nd");
+        e.selection = Some(EditorSelection {
+            anchor: (0, 0),
+            head: (2, 3),
+        });
+        e.cursor_row = 2;
+        e.join_lines();
+        assert_eq!(e.lines, vec!["a b c", "d"]);
+    }
+
+    #[test]
+    fn join_lines_on_last_line_is_noop() {
+        let mut e = editor_with("a\nb");
+        e.cursor_row = 1;
+        e.join_lines();
+        assert_eq!(e.lines, vec!["a", "b"]);
+    }
+
+    // ---- Transform Case ----
+
+    #[test]
+    fn transform_upper_on_selection() {
+        let mut e = editor_with("hello world");
+        e.selection = Some(EditorSelection {
+            anchor: (0, 0),
+            head: (0, 5),
+        });
+        e.transform_selection_case(CaseTransform::Upper);
+        assert_eq!(e.lines, vec!["HELLO world"]);
+    }
+
+    #[test]
+    fn transform_lower_on_selection() {
+        let mut e = editor_with("HELLO world");
+        e.selection = Some(EditorSelection {
+            anchor: (0, 0),
+            head: (0, 5),
+        });
+        e.transform_selection_case(CaseTransform::Lower);
+        assert_eq!(e.lines, vec!["hello world"]);
+    }
+
+    #[test]
+    fn transform_title_on_selection() {
+        let mut e = editor_with("hello there world");
+        e.selection = Some(EditorSelection {
+            anchor: (0, 0),
+            head: (0, 17),
+        });
+        e.transform_selection_case(CaseTransform::Title);
+        assert_eq!(e.lines, vec!["Hello There World"]);
+    }
+
+    #[test]
+    fn transform_upper_falls_back_to_word_at_cursor() {
+        let mut e = editor_with("alpha beta");
+        e.cursor_row = 0;
+        e.cursor_col = 7; // inside "beta"
+        e.transform_selection_case(CaseTransform::Upper);
+        assert_eq!(e.lines, vec!["alpha BETA"]);
+    }
+
+    // ---- Sort Lines ----
+
+    #[test]
+    fn sort_lines_ascending_over_selection() {
+        let mut e = editor_with("banana\napple\ncherry");
+        e.selection = Some(EditorSelection {
+            anchor: (0, 0),
+            head: (2, 6),
+        });
+        e.sort_lines(true);
+        assert_eq!(e.lines, vec!["apple", "banana", "cherry"]);
+    }
+
+    #[test]
+    fn sort_lines_descending_over_selection() {
+        let mut e = editor_with("apple\nbanana\ncherry");
+        e.selection = Some(EditorSelection {
+            anchor: (0, 0),
+            head: (2, 6),
+        });
+        e.sort_lines(false);
+        assert_eq!(e.lines, vec!["cherry", "banana", "apple"]);
+    }
+
+    #[test]
+    fn sort_lines_without_selection_sorts_whole_buffer() {
+        let mut e = editor_with("c\na\nb");
+        e.selection = None;
+        e.sort_lines(true);
+        assert_eq!(e.lines, vec!["a", "b", "c"]);
+    }
+
+    // ---- Trim Trailing Whitespace ----
+
+    #[test]
+    fn trim_trailing_whitespace_strips_every_line() {
+        let mut e = editor_with("a   \nb\t\n  c  ");
+        assert!(e.trim_trailing_whitespace());
+        assert_eq!(e.lines, vec!["a", "b", "  c"]);
+    }
+
+    #[test]
+    fn trim_trailing_whitespace_clamps_cursor() {
+        let mut e = editor_with("abc    ");
+        e.cursor_row = 0;
+        e.cursor_col = 7;
+        assert!(e.trim_trailing_whitespace());
+        assert_eq!(e.cursor_col, 3, "cursor clamps to trimmed end");
+    }
+
+    #[test]
+    fn trim_trailing_whitespace_noop_when_clean() {
+        let mut e = editor_with("a\nb");
+        assert!(!e.trim_trailing_whitespace());
+        assert_eq!(e.lines, vec!["a", "b"]);
+    }
+
+    // ---- Insert Cursor Above / Below ----
+
+    #[test]
+    fn add_cursor_below_pushes_caret_on_next_row() {
+        let mut e = editor_with("aaaa\nbbbb\ncccc");
+        e.cursor_row = 0;
+        e.cursor_col = 2;
+        e.add_cursor_below();
+        assert_eq!(e.carets.len(), 1);
+        let c = e.carets[0];
+        assert_eq!(c.head, (1, 2));
+        assert_eq!(c.anchor, (1, 2), "zero-width caret");
+    }
+
+    #[test]
+    fn add_cursor_above_pushes_caret_on_previous_row() {
+        let mut e = editor_with("aaaa\nbbbb\ncccc");
+        e.cursor_row = 2;
+        e.cursor_col = 3;
+        e.add_cursor_above();
+        assert_eq!(e.carets.len(), 1);
+        assert_eq!(e.carets[0].head, (1, 3));
+    }
+
+    #[test]
+    fn add_cursor_below_clamps_to_short_line() {
+        let mut e = editor_with("aaaa\nbb");
+        e.cursor_row = 0;
+        e.cursor_col = 4;
+        e.add_cursor_below();
+        assert_eq!(e.carets[0].head, (1, 2), "column clamps to line length");
+    }
+
+    #[test]
+    fn add_cursor_below_at_last_row_is_noop() {
+        let mut e = editor_with("aaaa\nbbbb");
+        e.cursor_row = 1;
+        e.cursor_col = 1;
+        e.add_cursor_below();
+        assert!(e.carets.is_empty());
+    }
+
+    // ---- Toggle Word Wrap (Alt+Z) ----
+
+    #[test]
+    fn toggle_wrap_turns_wrap_on_for_code_file() {
+        let mut e = editor_with("fn main() {}");
+        e.lang = Some(LangKind::Rust);
+        assert!(!e.wrap_enabled(), "code files default to no wrap");
+        e.toggle_wrap();
+        assert!(e.wrap_enabled());
+    }
+
+    #[test]
+    fn toggle_wrap_turns_wrap_off_for_markdown() {
+        let mut e = editor_with("# title");
+        e.lang = Some(LangKind::Markdown);
+        assert!(e.wrap_enabled(), "markdown defaults to wrap on");
+        e.toggle_wrap();
+        assert!(!e.wrap_enabled());
     }
 }

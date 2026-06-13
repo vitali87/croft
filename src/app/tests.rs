@@ -11549,3 +11549,115 @@ fn dark_blue_theme_keeps_the_legacy_blue_chrome() {
         "Run and Debug button stays VS Code blue under Croft Dark"
     );
 }
+
+// ---- New VS Code feature keybinding predicates ----
+
+#[test]
+fn command_palette_key_is_cmd_or_ctrl_shift_p() {
+    assert!(is_command_palette_key(key(
+        KeyCode::Char('p'),
+        KeyModifiers::SUPER | KeyModifiers::SHIFT
+    )));
+    assert!(is_command_palette_key(key(
+        KeyCode::Char('p'),
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT
+    )));
+    // Cmd+P (no Shift) is Quick Open, not the palette.
+    assert!(!is_command_palette_key(key(
+        KeyCode::Char('p'),
+        KeyModifiers::SUPER
+    )));
+    // Alt disqualifies it.
+    assert!(!is_command_palette_key(key(
+        KeyCode::Char('p'),
+        KeyModifiers::SUPER | KeyModifiers::SHIFT | KeyModifiers::ALT
+    )));
+}
+
+#[test]
+fn toggle_line_comment_key_is_cmd_or_ctrl_slash() {
+    assert!(is_toggle_line_comment_key(key(
+        KeyCode::Char('/'),
+        KeyModifiers::SUPER
+    )));
+    assert!(is_toggle_line_comment_key(key(
+        KeyCode::Char('/'),
+        KeyModifiers::CONTROL
+    )));
+    assert!(!is_toggle_line_comment_key(key(
+        KeyCode::Char('/'),
+        KeyModifiers::NONE
+    )));
+    assert!(!is_toggle_line_comment_key(key(
+        KeyCode::Char('/'),
+        KeyModifiers::SUPER | KeyModifiers::SHIFT
+    )));
+}
+
+#[test]
+fn toggle_block_comment_key_is_shift_alt_a() {
+    assert!(is_toggle_block_comment_key(key(
+        KeyCode::Char('a'),
+        KeyModifiers::SHIFT | KeyModifiers::ALT
+    )));
+    assert!(is_toggle_block_comment_key(key(
+        KeyCode::Char('A'),
+        KeyModifiers::SHIFT | KeyModifiers::ALT
+    )));
+    // Alt alone (no Shift) is not the chord.
+    assert!(!is_toggle_block_comment_key(key(
+        KeyCode::Char('a'),
+        KeyModifiers::ALT
+    )));
+    // The command modifier disqualifies it.
+    assert!(!is_toggle_block_comment_key(key(
+        KeyCode::Char('a'),
+        KeyModifiers::SHIFT | KeyModifiers::ALT | KeyModifiers::SUPER
+    )));
+}
+
+#[test]
+fn toggle_wrap_key_is_alt_z() {
+    assert!(is_toggle_wrap_key(key(
+        KeyCode::Char('z'),
+        KeyModifiers::ALT
+    )));
+    assert!(!is_toggle_wrap_key(key(
+        KeyCode::Char('z'),
+        KeyModifiers::ALT | KeyModifiers::SHIFT
+    )));
+    assert!(!is_toggle_wrap_key(key(
+        KeyCode::Char('z'),
+        KeyModifiers::NONE
+    )));
+}
+
+#[test]
+fn cmd_shift_p_opens_command_palette() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    assert!(app.command_palette.is_none());
+    app.handle_key(key(
+        KeyCode::Char('p'),
+        KeyModifiers::SUPER | KeyModifiers::SHIFT,
+    ))
+    .unwrap();
+    assert!(
+        app.command_palette.is_some(),
+        "Cmd+Shift+P must open the command palette"
+    );
+    // Esc closes it.
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.command_palette.is_none());
+}
+
+#[test]
+fn running_move_line_down_command_reorders_buffer() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.lines = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+    app.editor.cursor_row = 0;
+    app.run_command(crate::widgets::command_palette::Command::MoveLineDown);
+    assert_eq!(app.editor.lines, vec!["b", "a", "c"]);
+}

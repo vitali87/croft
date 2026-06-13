@@ -88,6 +88,11 @@ const CHORDS: &[(&str, &str)] = &[
     ("cmd+\\", pl::CMD_BACKSLASH_HEX),
     ("cmd+alt+arrow_left", pl::CMD_OPT_LEFT_HEX),
     ("cmd+alt+arrow_right", pl::CMD_OPT_RIGHT_HEX),
+    // Multi-cursor: add cursor above / below.
+    ("cmd+alt+arrow_up", pl::CMD_OPT_UP_HEX),
+    ("cmd+alt+arrow_down", pl::CMD_OPT_DOWN_HEX),
+    // Command Palette.
+    ("cmd+shift+p", pl::CMD_SHIFT_P_HEX),
     ("cmd+f12", pl::CMD_F12_HEX),
     ("ctrl+shift+f12", pl::CTRL_SHIFT_F12_HEX),
 ];

@@ -327,6 +327,7 @@ impl ActivityOverlay {
 pub struct OverlayManager {
     pub shortcuts_clear: ClearLatch,
     pub file_finder_clear: ClearLatch,
+    pub command_palette_clear: ClearLatch,
     pub zoxide_jump_clear: ClearLatch,
     /// Inline-image overlay state, one slot per editor split column
     /// (`[0]` = left pane, `[1]` = right pane). When the editor is not

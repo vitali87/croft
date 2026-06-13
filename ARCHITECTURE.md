@@ -63,6 +63,7 @@ src/
 │   └── semantic_cache.rs content-keyed disk cache of semantic-token batches at ~/.croft/sem-cache
 └── widgets/
     ├── mod.rs
+    ├── command_palette.rs   VS Code Command Palette (Cmd/Ctrl+Shift+P): a static command registry + fuzzy-filtered picker; the App's run_command dispatches each entry
     ├── completion_popup.rs  LSP completion popup (anchored at the cursor, filterable)
     ├── connect_dialog.rs    remote SSH connect modal (host + auth prompt phases)
     ├── diff.rs          side-by-side file diff renderer used by the explorer's Compare action

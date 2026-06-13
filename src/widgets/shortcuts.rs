@@ -51,6 +51,10 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 description: "Quick Open: fuzzy-search workspace files by name",
             },
             ShortcutEntry {
+                keys: "Cmd/Ctrl+Shift+P",
+                description: "Command Palette: fuzzy-search and run any named command",
+            },
+            ShortcutEntry {
                 keys: "Cmd/Ctrl+Shift+E",
                 description: "Jump to the Explorer sidebar",
             },
@@ -190,7 +194,27 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
             },
             ShortcutEntry {
                 keys: "Shift+Alt+Up / Down",
-                description: "Duplicate the current line or selection",
+                description: "Copy the current line or selection up / down",
+            },
+            ShortcutEntry {
+                keys: "Alt+Up / Down",
+                description: "Move the current line or selection up / down",
+            },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+Opt+Up / Down",
+                description: "Add a cursor above / below (multi-cursor)",
+            },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+/",
+                description: "Toggle line comment for the line or selection",
+            },
+            ShortcutEntry {
+                keys: "Shift+Alt+A",
+                description: "Toggle block comment around the selection",
+            },
+            ShortcutEntry {
+                keys: "Alt+Z",
+                description: "Toggle word wrap for this file",
             },
             ShortcutEntry {
                 keys: "Cmd/Ctrl+C",

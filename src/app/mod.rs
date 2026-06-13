@@ -1104,6 +1104,9 @@ pub struct App {
     /// VS Code-style Cmd+P / Ctrl+P quick-open file finder. None when
     /// the modal is closed.
     pub file_finder: Option<crate::widgets::file_finder::FileFinder>,
+    /// VS Code-style Cmd+Shift+P / Ctrl+Shift+P command palette. None when
+    /// the modal is closed.
+    pub command_palette: Option<crate::widgets::command_palette::CommandPalette>,
     /// zoxide-backed Explorer jump popup (Cmd+Z). None when closed. Opens
     /// only from the Explorer pane, so it never collides with the editor's
     /// Cmd+Z undo.
@@ -1560,6 +1563,7 @@ impl App {
             },
             editor_find: None,
             file_finder: None,
+            command_palette: None,
             zoxide_jump: None,
             file_finder_index: None,
             file_finder_index_rx: Some(file_finder_index_rx),
@@ -1853,6 +1857,7 @@ impl App {
         use std::io::Write;
         if self.shortcuts_modal.is_some()
             || self.file_finder.is_some()
+            || self.command_palette.is_some()
             || self.zoxide_jump.is_some()
         {
             return;
@@ -1911,6 +1916,7 @@ impl App {
         use std::io::Write;
         if self.shortcuts_modal.is_some()
             || self.file_finder.is_some()
+            || self.command_palette.is_some()
             || self.zoxide_jump.is_some()
         {
             return;
@@ -2141,6 +2147,7 @@ impl App {
         let occluders = [
             self.shortcuts_modal.as_ref().map(|m| m.last_rect),
             self.file_finder.as_ref().map(|f| f.last_rect),
+            self.command_palette.as_ref().map(|p| p.last_rect),
         ];
         let visible = |block: Rect| {
             occluders
@@ -2262,6 +2269,7 @@ impl App {
         use std::io::Write;
         if self.shortcuts_modal.is_some()
             || self.file_finder.is_some()
+            || self.command_palette.is_some()
             || self.zoxide_jump.is_some()
             || self.connect_dialog.is_some()
         {
@@ -5196,6 +5204,7 @@ impl App {
         self.render_discard_confirm(frame);
         self.render_editor_find(frame);
         self.render_file_finder(frame);
+        self.render_command_palette(frame);
         self.render_zoxide_jump(frame);
         self.render_shortcuts_modal(frame);
         self.render_connect_dialog(frame);
@@ -5665,6 +5674,10 @@ impl App {
             self.handle_file_finder_key(key);
             return Ok(());
         }
+        if self.command_palette.is_some() {
+            self.handle_command_palette_key(key);
+            return Ok(());
+        }
         if self.zoxide_jump.is_some() {
             self.handle_zoxide_jump_key(key);
             return Ok(());
@@ -5687,6 +5700,10 @@ impl App {
         }
         if is_file_finder_key(key) {
             self.open_file_finder();
+            return Ok(());
+        }
+        if is_command_palette_key(key) {
+            self.open_command_palette();
             return Ok(());
         }
         // Modal layer: prompt eats every key while it's open.
@@ -7210,6 +7227,13 @@ impl App {
         }
     }
 
+    /// True when the active editor tab holds an editable text buffer (not a
+    /// read-only diff / spreadsheet / image preview), so text-editing chords
+    /// know whether to act.
+    fn editor_is_text(&self) -> bool {
+        self.editor.diff.is_none() && self.editor.sheet.is_none() && self.editor.image.is_none()
+    }
+
     fn handle_editor_key(&mut self, key: KeyEvent) {
         // Inline find bar (Cmd+F / Ctrl+F) eats every key while open.
         if self.editor_find.is_some() {
@@ -7239,6 +7263,30 @@ impl App {
         }
         if is_change_all_occurrences_key(key) {
             self.start_change_all_occurrences();
+            return;
+        }
+        // VS Code "Toggle Line Comment" (Cmd+/ / Ctrl+/), "Toggle Block
+        // Comment" (Shift+Alt+A), and "View: Toggle Word Wrap" (Alt+Z). All
+        // act on a text buffer, so they no-op on read-only diff / sheet /
+        // image tabs (the keystroke is still swallowed). Each is also
+        // reachable from the Command Palette, which guarantees parity on
+        // terminals that don't deliver the Alt+letter chords.
+        if is_toggle_line_comment_key(key) {
+            if self.editor_is_text() {
+                self.editor.toggle_line_comment();
+            }
+            return;
+        }
+        if is_toggle_block_comment_key(key) {
+            if self.editor_is_text() {
+                self.editor.toggle_block_comment();
+            }
+            return;
+        }
+        if is_toggle_wrap_key(key) {
+            if self.editor_is_text() {
+                self.editor.toggle_wrap();
+            }
             return;
         }
         // Go to Definition (F12) / References (Shift+F12) / Type Definition
@@ -7493,10 +7541,33 @@ impl App {
                 | KeyCode::PageDown
         );
         let alt = key.modifiers.contains(KeyModifiers::ALT);
+        // The command modifier: Cmd (SUPER) on macOS, Ctrl on Linux / Termux.
+        let cmd = key.modifiers.contains(KeyModifiers::SUPER)
+            || key.modifiers.contains(KeyModifiers::CONTROL);
+        // VS Code "Add Cursor Above/Below" (Cmd+Opt+Up / Cmd+Opt+Down). Must
+        // come before the plain-Alt move-line check so the cmd+alt combo is
+        // routed here, not there.
+        if cmd && alt && matches!(key.code, KeyCode::Up | KeyCode::Down) {
+            match key.code {
+                KeyCode::Up => self.editor.add_cursor_above(),
+                KeyCode::Down => self.editor.add_cursor_below(),
+                _ => unreachable!(),
+            }
+            return;
+        }
         if shift && alt && matches!(key.code, KeyCode::Up | KeyCode::Down) {
             match key.code {
                 KeyCode::Up => self.editor.duplicate_lines_up(),
                 KeyCode::Down => self.editor.duplicate_lines_down(),
+                _ => unreachable!(),
+            }
+            return;
+        }
+        // VS Code "Move Line Up/Down" (Alt+Up / Alt+Down, no Shift, no Cmd).
+        if alt && !shift && !cmd && matches!(key.code, KeyCode::Up | KeyCode::Down) {
+            match key.code {
+                KeyCode::Up => self.editor.move_lines_up(),
+                KeyCode::Down => self.editor.move_lines_down(),
                 _ => unreachable!(),
             }
             return;
@@ -9238,6 +9309,185 @@ impl App {
         crate::widgets::file_finder::render_file_finder(finder, area, frame.buffer_mut(), gradient);
     }
 
+    pub fn consume_command_palette_image_clear(&mut self) -> bool {
+        self.overlays.command_palette_clear.consume()
+    }
+
+    /// Open the Command Palette (Cmd/Ctrl+Shift+P). The palette is built from
+    /// the static command registry, so there is nothing to index — it opens
+    /// instantly regardless of workspace size.
+    fn open_command_palette(&mut self) {
+        if self.command_palette.is_some() {
+            return;
+        }
+        let palette = crate::widgets::command_palette::CommandPalette::new();
+        let count = palette.results.len();
+        self.command_palette = Some(palette);
+        self.overlays.command_palette_clear.request();
+        self.status = format!("Command Palette: {count} commands — Esc to close");
+    }
+
+    fn close_command_palette(&mut self) {
+        if self.command_palette.take().is_some() {
+            self.overlays.command_palette_clear.request();
+            self.overlays.activity.mark_dirty();
+            self.overlays.welcome.mark_dirty();
+            self.overlays.hero.mark_dirty();
+            self.invalidate_editor_image_layouts();
+            self.status.clear();
+        }
+    }
+
+    fn handle_command_palette_key(&mut self, key: KeyEvent) {
+        let Some(palette) = self.command_palette.as_mut() else {
+            return;
+        };
+        match (key.code, key.modifiers) {
+            (KeyCode::Esc, _) => self.close_command_palette(),
+            (KeyCode::Enter, _) => {
+                let cmd = palette.selected_command();
+                self.close_command_palette();
+                if let Some(cmd) = cmd {
+                    self.run_command(cmd);
+                }
+            }
+            (KeyCode::Up, _) => palette.select_prev(),
+            (KeyCode::Down, _) => palette.select_next(),
+            (KeyCode::PageUp, _) => {
+                for _ in 0..10 {
+                    palette.select_prev();
+                }
+            }
+            (KeyCode::PageDown, _) => {
+                for _ in 0..10 {
+                    palette.select_next();
+                }
+            }
+            (KeyCode::Left, _) => palette.move_cursor_left(),
+            (KeyCode::Right, _) => palette.move_cursor_right(),
+            (KeyCode::Home, _) => palette.move_cursor_home(),
+            (KeyCode::End, _) => palette.move_cursor_end(),
+            (KeyCode::Backspace, _) => palette.pop_char(),
+            (KeyCode::Delete, _) => palette.delete_char(),
+            (KeyCode::Char(c), m) if !m.intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER) => {
+                palette.push_char(c);
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_command_palette_mouse(&mut self, m: MouseEvent) {
+        let Some(palette) = self.command_palette.as_mut() else {
+            return;
+        };
+        let inside = rect_contains(palette.last_rect, m.column, m.row);
+        match m.kind {
+            MouseEventKind::ScrollDown => {
+                for _ in 0..3 {
+                    palette.select_next();
+                }
+            }
+            MouseEventKind::ScrollUp => {
+                for _ in 0..3 {
+                    palette.select_prev();
+                }
+            }
+            MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Down(MouseButton::Right)
+                if !inside =>
+            {
+                self.close_command_palette();
+            }
+            _ => {}
+        }
+    }
+
+    fn render_command_palette(&mut self, frame: &mut ratatui::Frame) {
+        let gradient = self.popup_gradient();
+        let Some(palette) = self.command_palette.as_mut() else {
+            return;
+        };
+        let area = frame.area();
+        crate::widgets::command_palette::render_command_palette(
+            palette,
+            area,
+            frame.buffer_mut(),
+            gradient,
+        );
+    }
+
+    /// Execute a Command Palette entry. Editor text commands act on the active
+    /// editor buffer; view / navigation commands defer to the same methods
+    /// their dedicated chords use, so the palette can never drift from the
+    /// keyboard surface.
+    fn run_command(&mut self, cmd: crate::widgets::command_palette::Command) {
+        use crate::widgets::command_palette::Command as Cmd;
+        use crate::widgets::editor::CaseTransform;
+        match cmd {
+            Cmd::MoveLineUp => self.editor.move_lines_up(),
+            Cmd::MoveLineDown => self.editor.move_lines_down(),
+            Cmd::ToggleLineComment => {
+                if !self.editor.toggle_line_comment() {
+                    self.status = String::from("Toggle Line Comment: no comment for this language");
+                }
+            }
+            Cmd::ToggleBlockComment => {
+                if !self.editor.toggle_block_comment() {
+                    self.status =
+                        String::from("Toggle Block Comment: no block comment for this language");
+                }
+            }
+            Cmd::JoinLines => self.editor.join_lines(),
+            Cmd::TransformUpper => self.editor.transform_selection_case(CaseTransform::Upper),
+            Cmd::TransformLower => self.editor.transform_selection_case(CaseTransform::Lower),
+            Cmd::TransformTitle => self.editor.transform_selection_case(CaseTransform::Title),
+            Cmd::SortLinesAscending => self.editor.sort_lines(true),
+            Cmd::SortLinesDescending => self.editor.sort_lines(false),
+            Cmd::TrimTrailingWhitespace => {
+                if self.editor.trim_trailing_whitespace() {
+                    self.status = String::from("Trimmed trailing whitespace");
+                }
+            }
+            Cmd::ToggleWordWrap => {
+                self.editor.toggle_wrap();
+                self.status = if self.editor.wrap_enabled() {
+                    String::from("Word wrap: on")
+                } else {
+                    String::from("Word wrap: off")
+                };
+            }
+            Cmd::AddCursorAbove => self.editor.add_cursor_above(),
+            Cmd::AddCursorBelow => self.editor.add_cursor_below(),
+            Cmd::SaveFile => self.save(),
+            Cmd::CloseEditor => {
+                if self.editor.close_active() {
+                    self.sync_open_file_poll_mtime();
+                    self.collapse_split_if_empty();
+                    self.status = String::from("Closed tab");
+                }
+            }
+            Cmd::SplitEditor => self.split_editor(),
+            Cmd::QuickOpen => self.open_file_finder(),
+            Cmd::ToggleVimMode => self.toggle_vim_mode(),
+            Cmd::ShowExplorer => self.set_sidebar_view(SidebarView::Explorer),
+            Cmd::ShowSearch => self.set_sidebar_view(SidebarView::Search),
+            Cmd::ShowSourceControl => self.set_sidebar_view(SidebarView::SourceControl),
+            Cmd::ShowRunDebug => self.set_sidebar_view(SidebarView::RunDebug),
+            Cmd::ShowRemote => self.set_sidebar_view(SidebarView::Remote),
+            Cmd::ToggleSideBar => self.show_tree = !self.show_tree,
+            Cmd::ToggleTerminal => self.toggle_terminal(),
+            Cmd::NewTerminal => match self.split_terminal() {
+                Ok(()) => {
+                    self.status = format!("Split terminal: {} active", self.terminals.len());
+                }
+                Err(e) => {
+                    self.status = format!("Split terminal failed: {e}");
+                }
+            },
+            Cmd::ColorTheme => self.open_theme_picker(),
+            Cmd::KeyboardShortcuts => self.open_shortcuts_modal(),
+        }
+    }
+
     pub fn consume_zoxide_jump_image_clear(&mut self) -> bool {
         self.overlays.zoxide_jump_clear.consume()
     }
@@ -9887,6 +10137,10 @@ impl App {
         }
         if self.file_finder.is_some() {
             self.handle_file_finder_mouse(m);
+            return;
+        }
+        if self.command_palette.is_some() {
+            self.handle_command_palette_mouse(m);
             return;
         }
         if self.zoxide_jump.is_some() {
@@ -11546,6 +11800,7 @@ impl App {
     pub fn editor_image_payload(&self, side: usize) -> Option<(&str, &EditorImageLayout)> {
         if self.shortcuts_modal.is_some()
             || self.file_finder.is_some()
+            || self.command_palette.is_some()
             || self.zoxide_jump.is_some()
         {
             return None;
@@ -11560,6 +11815,7 @@ impl App {
     pub fn welcome_image_emit_payload(&self) -> Option<(&str, &WelcomeLayout)> {
         if self.shortcuts_modal.is_some()
             || self.file_finder.is_some()
+            || self.command_palette.is_some()
             || self.zoxide_jump.is_some()
             || self.connect_dialog.is_some()
             || !self.editor.is_blank_initial()
@@ -12348,6 +12604,59 @@ fn is_file_finder_key(key: KeyEvent) -> bool {
         return false;
     }
     key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::SUPER)
+}
+
+/// `Ctrl/Cmd+Shift+P`: open the Command Palette from any pane, mirroring VS
+/// Code. Shares the `is_cmd_shift_letter` helper with the sidebar-view jumps
+/// so the SHIFT / case handling is identical, and sits after
+/// `is_file_finder_key` in the dispatch (which rejects SHIFT, so `Cmd+P` and
+/// `Cmd+Shift+P` never collide).
+fn is_command_palette_key(key: KeyEvent) -> bool {
+    is_cmd_shift_letter(key, 'p')
+}
+
+/// `Cmd+/` (macOS) / `Ctrl+/` (Linux / Termux): Toggle Line Comment. Rejects
+/// Shift and Alt so it never collides with a future chord on `/`.
+fn is_toggle_line_comment_key(key: KeyEvent) -> bool {
+    if key.code != KeyCode::Char('/') {
+        return false;
+    }
+    if key.modifiers.contains(KeyModifiers::ALT) || key.modifiers.contains(KeyModifiers::SHIFT) {
+        return false;
+    }
+    key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::SUPER)
+}
+
+/// `Shift+Alt+A`: Toggle Block Comment (the VS Code default). Requires both
+/// Shift and Alt and rejects the command modifier. Also reachable from the
+/// Command Palette, which is the parity path on terminals that swallow the
+/// Alt+letter chord.
+fn is_toggle_block_comment_key(key: KeyEvent) -> bool {
+    let KeyCode::Char(c) = key.code else {
+        return false;
+    };
+    if !c.eq_ignore_ascii_case(&'a') {
+        return false;
+    }
+    key.modifiers.contains(KeyModifiers::SHIFT)
+        && key.modifiers.contains(KeyModifiers::ALT)
+        && !key.modifiers.contains(KeyModifiers::SUPER)
+        && !key.modifiers.contains(KeyModifiers::CONTROL)
+}
+
+/// `Alt+Z`: View: Toggle Word Wrap (the VS Code default). Rejects Shift and
+/// the command modifier. Also reachable from the Command Palette.
+fn is_toggle_wrap_key(key: KeyEvent) -> bool {
+    let KeyCode::Char(c) = key.code else {
+        return false;
+    };
+    if !c.eq_ignore_ascii_case(&'z') {
+        return false;
+    }
+    key.modifiers.contains(KeyModifiers::ALT)
+        && !key.modifiers.contains(KeyModifiers::SHIFT)
+        && !key.modifiers.contains(KeyModifiers::SUPER)
+        && !key.modifiers.contains(KeyModifiers::CONTROL)
 }
 
 /// Explorer-pane shortcut: `Cmd+Z` — open the zoxide jump popup. `z` for
@@ -14406,6 +14715,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
                 || app.consume_no_repo_hero_image_clear()
                 || app.consume_shortcuts_image_clear()
                 || app.consume_file_finder_image_clear()
+                || app.consume_command_palette_image_clear()
                 || app.consume_zoxide_jump_image_clear()
                 || app.consume_ssh_empty_state_image_clear()
                 || app.consume_activity_image_clear()
@@ -14438,6 +14748,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
                 || app.consume_no_repo_hero_image_clear()
                 || app.consume_shortcuts_image_clear()
                 || app.consume_file_finder_image_clear()
+                || app.consume_command_palette_image_clear()
                 || app.consume_zoxide_jump_image_clear()
                 || app.consume_ssh_empty_state_image_clear()
                 || app.consume_activity_image_clear()

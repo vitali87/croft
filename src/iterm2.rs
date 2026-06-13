@@ -179,6 +179,21 @@ const CMD_OPT_LEFT_KEY: &str = "0xf702-0x180000";
 const CMD_OPT_LEFT_HEX: &str = "0x1b 0x5b 0x31 0x3b 0x31 0x31 0x44";
 const CMD_OPT_RIGHT_KEY: &str = "0xf703-0x180000";
 const CMD_OPT_RIGHT_HEX: &str = "0x1b 0x5b 0x31 0x3b 0x31 0x31 0x43";
+/// `Cmd+Opt+Up` / `Cmd+Opt+Down` -> Add Cursor Above / Below (VS Code
+/// multi-cursor). Mirrors the Cmd+Opt+Left/Right forwarders above:
+/// `NSUpArrowFunctionKey` = 0xf700, `NSDownArrowFunctionKey` = 0xf701, Cmd+Opt
+/// mask 0x180000. Payload `ESC [ 1 ; 11 (A|B)` decodes to `KeyCode::Up/Down +
+/// ALT | SUPER`, which `handle_editor_key` routes to `add_cursor_above/below`.
+const CMD_OPT_UP_KEY: &str = "0xf700-0x180000";
+const CMD_OPT_UP_HEX: &str = "0x1b 0x5b 0x31 0x3b 0x31 0x31 0x41";
+const CMD_OPT_DOWN_KEY: &str = "0xf701-0x180000";
+const CMD_OPT_DOWN_HEX: &str = "0x1b 0x5b 0x31 0x3b 0x31 0x31 0x42";
+/// `Cmd+Shift+P` -> Command Palette. Mirrors the `Cmd+Shift+F` forwarder:
+/// `kVK_ANSI_P` = 0x23, char 'P' = 0x50, modifier mask 0x120000 (Cmd | Shift).
+/// CSI-u `ESC [ 80 ; 10 u` (codepoint 80 = 'P', modifier 10 = Super(8) +
+/// Shift(1) + 1), which crossterm decodes to `Char('p') + SUPER | SHIFT`.
+const CMD_SHIFT_P_KEY: &str = "0x50-0x120000-0x23";
+const CMD_SHIFT_P_HEX: &str = "0x1b 0x5b 0x38 0x30 0x3b 0x31 0x30 0x75";
 /// iTerm2 menu items that own bare `Cmd+[` / `Cmd+]`, relocated so the
 /// bracket forwarders above reach croft. Cmd+Opt+[ / Cmd+Opt+] keep pane
 /// navigation reachable.
@@ -365,6 +380,9 @@ pub(crate) mod payloads {
     pub(crate) const CMD_OPT_LEFT_HEX: &str = super::CMD_OPT_LEFT_HEX;
     pub(crate) const CMD_OPT_R_HEX: &str = super::CMD_OPT_R_HEX;
     pub(crate) const CMD_OPT_RIGHT_HEX: &str = super::CMD_OPT_RIGHT_HEX;
+    pub(crate) const CMD_OPT_UP_HEX: &str = super::CMD_OPT_UP_HEX;
+    pub(crate) const CMD_OPT_DOWN_HEX: &str = super::CMD_OPT_DOWN_HEX;
+    pub(crate) const CMD_SHIFT_P_HEX: &str = super::CMD_SHIFT_P_HEX;
     pub(crate) const CMD_P_HEX: &str = super::CMD_P_HEX;
     pub(crate) const CMD_R_HEX: &str = super::CMD_R_HEX;
     pub(crate) const CMD_RBRACKET_HEX: &str = super::CMD_RBRACKET_HEX;
@@ -618,6 +636,9 @@ pub fn apply_croft_key_settings(plist: &mut Value) -> Result<(), ITerm2Error> {
         (CMD_BACKSLASH_KEY, CMD_BACKSLASH_HEX),
         (CMD_OPT_LEFT_KEY, CMD_OPT_LEFT_HEX),
         (CMD_OPT_RIGHT_KEY, CMD_OPT_RIGHT_HEX),
+        (CMD_OPT_UP_KEY, CMD_OPT_UP_HEX),
+        (CMD_OPT_DOWN_KEY, CMD_OPT_DOWN_HEX),
+        (CMD_SHIFT_P_KEY, CMD_SHIFT_P_HEX),
     ] {
         global.insert(key.into(), send_hex_action(hex, 0));
     }
@@ -1263,6 +1284,37 @@ mod tests {
             action_text(global, CMD_OPT_RIGHT_KEY),
             CMD_OPT_RIGHT_HEX,
             "GlobalKeyMap must forward Cmd+Opt+Right as `ESC [ 1 ; 11 C` so croft's `is_focus_group_right_key` moves focus to the right editor group"
+        );
+    }
+
+    #[test]
+    fn apply_croft_key_settings_forwards_cmd_opt_up_down_for_multi_cursor() {
+        let mut plist = synth_plist("GUID-1", &["GUID-1"]);
+        apply_croft_key_settings(&mut plist).unwrap();
+        let top = plist.as_dictionary().unwrap();
+        let global = dict_in(top, "GlobalKeyMap");
+        assert_eq!(
+            action_text(global, CMD_OPT_UP_KEY),
+            CMD_OPT_UP_HEX,
+            "GlobalKeyMap must forward Cmd+Opt+Up as `ESC [ 1 ; 11 A` so croft adds a cursor above; modifier byte 11 decodes to Up + ALT | SUPER"
+        );
+        assert_eq!(
+            action_text(global, CMD_OPT_DOWN_KEY),
+            CMD_OPT_DOWN_HEX,
+            "GlobalKeyMap must forward Cmd+Opt+Down as `ESC [ 1 ; 11 B` so croft adds a cursor below"
+        );
+    }
+
+    #[test]
+    fn apply_croft_key_settings_forwards_cmd_shift_p_for_command_palette() {
+        let mut plist = synth_plist("GUID-1", &["GUID-1"]);
+        apply_croft_key_settings(&mut plist).unwrap();
+        let top = plist.as_dictionary().unwrap();
+        let global = dict_in(top, "GlobalKeyMap");
+        assert_eq!(
+            action_text(global, CMD_SHIFT_P_KEY),
+            CMD_SHIFT_P_HEX,
+            "GlobalKeyMap must forward Cmd+Shift+P as `ESC [ 80 ; 10 u` so croft's `is_command_palette_key` opens the Command Palette; modifier byte 10 = 1 base + Shift(1) + Super(8), decoded as Char('p') + SUPER | SHIFT"
         );
     }
 
