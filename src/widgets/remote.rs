@@ -247,23 +247,13 @@ const PRIMARY_BG: Color = Color::Rgb(
 const LINK_FG: Color = CARD_BORDER;
 const BODY_FG: Color = Color::Rgb(0xb4, 0xbe, 0xc8);
 
-/// Background colour painted under the header `+` / refresh pill buttons so
-/// they read as touch targets, not naked single glyphs. Matches the chip
-/// behind the `REMOTE EXPLORER` title.
-const HEADER_BTN_BG: Color = Color::Rgb(0x1e, 0x3a, 0x6e);
-const HEADER_BTN_FG: Color = Color::Rgb(0xe6, 0xed, 0xf5);
-/// Brightened navy the Croft Dark header pill takes while the pointer rests on
-/// it (VS Code `toolbar.hoverBackground`). The Black theme instead grows a
-/// faint teal pill from nothing, so it has no separate constant here.
-const HEADER_BTN_HOVER_BG: Color = Color::Rgb(0x2f, 0x5a, 0xa8);
-
 pub const SSH_EMPTY_STATE_CELLS_W: u16 = 18;
 pub const SSH_EMPTY_STATE_CELLS_H: u16 = 8;
 
-/// Codicon `cod-refresh` — the circular-arrow glyph VS Code paints on the
-/// Remote Explorer refresh affordance. Verified against the Nerd Font cmap.
-pub const REFRESH_GLYPH: char = '\u{eb37}';
-pub const ADD_GLYPH: char = '\u{ea60}';
+// The header pill renderer, chip colours and codicon glyphs are shared with the
+// Source Control header; re-export the glyph so existing call sites and tests
+// keep using `crate::widgets::remote::REFRESH_GLYPH`.
+pub use crate::widgets::header_pill::{ADD_GLYPH, REFRESH_GLYPH};
 
 fn render_section_header(panel: &mut RemotePanel, buf: &mut Buffer, inner: Rect) {
     let header_style = Style::default()
@@ -302,7 +292,7 @@ fn render_section_header(panel: &mut RemotePanel, buf: &mut Buffer, inner: Rect)
         };
         panel.header_add_btn = rect;
         let hovered = crate::widgets::hover::contains(rect, pointer);
-        render_header_pill(
+        crate::widgets::header_pill::render(
             buf,
             add_x,
             inner.y,
@@ -321,7 +311,7 @@ fn render_section_header(panel: &mut RemotePanel, buf: &mut Buffer, inner: Rect)
         };
         panel.header_refresh_btn = rect;
         let hovered = crate::widgets::hover::contains(rect, pointer);
-        render_header_pill(
+        crate::widgets::header_pill::render(
             buf,
             refresh_x,
             inner.y,
@@ -331,45 +321,6 @@ fn render_section_header(panel: &mut RemotePanel, buf: &mut Buffer, inner: Rect)
             hovered,
         );
     }
-}
-
-fn render_header_pill(
-    buf: &mut Buffer,
-    x: u16,
-    y: u16,
-    width: u16,
-    glyph: char,
-    brand: bool,
-    hovered: bool,
-) {
-    // Black theme (`brand`): chipless teal icon in the VS Code toolbar spirit,
-    // matching the terminal pane's -/+, that grows a faint teal pill only while
-    // hovered. Croft Dark keeps the navy pill and brightens it on hover
-    // (toolbar.hoverBackground).
-    let fill = if brand {
-        hovered.then(|| crate::gradient::rgb_color(crate::gradient::POPUP_SEL_BG))
-    } else if hovered {
-        Some(HEADER_BTN_HOVER_BG)
-    } else {
-        Some(HEADER_BTN_BG)
-    };
-    let fill_style = fill.map(|c| Style::default().bg(c)).unwrap_or_default();
-    for dx in 0..width {
-        let cell = &mut buf[(x + dx, y)];
-        cell.set_char(' ');
-        cell.set_style(fill_style);
-    }
-    let centre = x + width / 2;
-    let mut style = Style::default().add_modifier(Modifier::BOLD);
-    if let Some(c) = fill {
-        style = style.bg(c);
-    }
-    style = if brand {
-        style.fg(crate::gradient::rgb_color(crate::gradient::INNER_ACCENT))
-    } else {
-        style.fg(HEADER_BTN_FG)
-    };
-    buf.set_string(centre, y, glyph.to_string(), style);
 }
 
 fn render_filter_row(buf: &mut Buffer, area: Rect, filter: &str) {
@@ -890,12 +841,12 @@ mod tests {
         (&mut p).render(area, &mut buf);
         assert_eq!(
             buf[(add.x, add.y)].bg,
-            HEADER_BTN_HOVER_BG,
+            crate::widgets::header_pill::HEADER_BTN_HOVER_BG,
             "the + pill lifts to the hover navy under the pointer"
         );
         assert_eq!(
             buf[(refresh.x, refresh.y)].bg,
-            HEADER_BTN_BG,
+            crate::widgets::header_pill::HEADER_BTN_BG,
             "the un-hovered refresh pill keeps the rest navy"
         );
     }

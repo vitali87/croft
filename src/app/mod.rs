@@ -2447,6 +2447,9 @@ impl App {
     /// non-blocking try_recv. Called from `try_install_pending_init`,
     /// which already runs every tick.
     pub fn drain_git_responses(&mut self) -> bool {
+        // Ship any refresh the debounce window coalesced once the gap clears,
+        // so the trailing edge of an edit burst lands without another FS event.
+        self.git.flush_pending();
         let changed = self.git.drain(&mut self.source_control);
         if changed && self.git.status().in_repo && self.default_branch_label.is_none() {
             self.default_branch_label = crate::git::default_branch(&self.tree.root).ok();
@@ -10382,6 +10385,11 @@ impl App {
                 }
                 if in_tree && self.sidebar_view == SidebarView::SourceControl {
                     self.focus_pane(Pane::Tree);
+                    if self.source_control.click_header_refresh(m.column, m.row) {
+                        self.refresh_source_control();
+                        self.status = String::from("Refreshed Source Control");
+                        return;
+                    }
                     if self.commit_menu_open
                         && let Some(item) =
                             self.source_control.click_commit_menu_item(m.column, m.row)

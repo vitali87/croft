@@ -133,6 +133,11 @@ pub struct SourceControlPanel {
     /// Render-time pointer cell, fed from `App::pointer_cell` each frame so a
     /// hovered (but unselected) change row can lift to the hover background.
     pub hover_pointer: Option<(u16, u16)>,
+    /// Hit-test rect for the refresh pill at the right of the SOURCE CONTROL
+    /// header row, mirroring the Remote Explorer refresh affordance. Clicking
+    /// it forces an immediate, un-debounced git re-scan. Empty when the panel
+    /// is in the no-repo state or the header row was clipped.
+    pub header_refresh_btn: Rect,
 }
 
 impl SourceControlPanel {
@@ -163,6 +168,7 @@ impl SourceControlPanel {
             commit_feedback_is_error: false,
             last_row_actions: None,
             hover_pointer: None,
+            header_refresh_btn: Rect::default(),
         }
     }
 
@@ -180,6 +186,12 @@ impl SourceControlPanel {
     pub fn click_stage_action(&self, x: u16, y: u16) -> Option<usize> {
         let a = self.last_row_actions?;
         rect_hit(a.stage, x, y).then_some(a.entry_idx)
+    }
+
+    /// True when (x, y) lands on the header refresh pill, so the App can
+    /// force an immediate git re-scan.
+    pub fn click_header_refresh(&self, x: u16, y: u16) -> bool {
+        rect_hit(self.header_refresh_btn, x, y)
     }
 
     pub fn set_status(&mut self, status: GitStatus, entries: Vec<ChangeEntry>) {
@@ -817,6 +829,7 @@ impl Widget for &mut SourceControlPanel {
         self.last_list_area = Rect::default();
         self.last_scrollbar = Rect::default();
         self.last_row_actions = None;
+        self.header_refresh_btn = Rect::default();
 
         if inner.height == 0 || inner.width == 0 {
             return;
@@ -831,6 +844,31 @@ impl Widget for &mut SourceControlPanel {
                 .fg(Color::Rgb(0xb0, 0xb8, 0xc8))
                 .add_modifier(Modifier::BOLD),
         );
+        // Refresh pill at the right of the header row, mirroring the Remote
+        // Explorer affordance. Live FS-driven refresh already keeps the panel
+        // current; this is the manual override for the rare case the watcher
+        // misses an edit. Only painted in a repo with room past the title.
+        let pill_w: u16 = 2;
+        let refresh_x = (inner.x + inner.width).saturating_sub(pill_w + 1);
+        if self.status.in_repo && refresh_x > inner.x + 15 {
+            let rect = Rect {
+                x: refresh_x,
+                y: inner.y,
+                width: pill_w,
+                height: 1,
+            };
+            self.header_refresh_btn = rect;
+            let hovered = crate::widgets::hover::contains(rect, self.hover_pointer);
+            crate::widgets::header_pill::render(
+                buf,
+                refresh_x,
+                inner.y,
+                pill_w,
+                crate::widgets::header_pill::REFRESH_GLYPH,
+                self.focus_gradient,
+                hovered,
+            );
+        }
 
         // Non-repo workspace: render the "No repository detected" card -
         // bordered card with illustration, title, description, primary
@@ -1350,6 +1388,53 @@ mod tests {
             buf[(p.last_list_area.x, row_y)].bg,
             Color::Rgb(0x2b, 0x31, 0x42),
             "the hovered unselected change row wears the Croft Dark hover lift"
+        );
+    }
+
+    #[test]
+    fn header_refresh_pill_renders_in_repo_and_hit_tests() {
+        use ratatui::buffer::Buffer;
+        let mut p = SourceControlPanel::new();
+        p.status.in_repo = true;
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 24,
+        };
+        let mut buf = Buffer::empty(area);
+        (&mut p).render(area, &mut buf);
+        let btn = p.header_refresh_btn;
+        assert!(btn.width > 0, "the refresh pill must render inside a repo");
+        // The cod-refresh glyph lands in the header row.
+        let header_row: String = (0..area.width)
+            .map(|x| buf[(x, btn.y)].symbol().chars().next().unwrap_or(' '))
+            .collect();
+        assert!(
+            header_row.contains(crate::widgets::header_pill::REFRESH_GLYPH),
+            "header row must paint the cod-refresh glyph (got: {header_row:?})",
+        );
+        // Hit-test: a click on the pill registers, one column left of it does not.
+        assert!(p.click_header_refresh(btn.x, btn.y));
+        assert!(!p.click_header_refresh(btn.x.saturating_sub(2), btn.y));
+    }
+
+    #[test]
+    fn header_refresh_pill_absent_without_a_repo() {
+        use ratatui::buffer::Buffer;
+        let mut p = SourceControlPanel::new();
+        p.status.in_repo = false;
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 24,
+        };
+        let mut buf = Buffer::empty(area);
+        (&mut p).render(area, &mut buf);
+        assert_eq!(
+            p.header_refresh_btn.width, 0,
+            "no refresh pill in the no-repo empty state",
         );
     }
 
