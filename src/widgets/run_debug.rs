@@ -31,6 +31,8 @@ const DBG_LOC: Color = Color::Rgb(0x6b, 0x76, 0x89); // file:line / dim console
 const DBG_PILL_BG: Color = Color::Rgb(0x0e, 0x7e, 0x76); // status pill
 const DBG_PILL_FG: Color = Color::Rgb(0xdf, 0xfd, 0xf7);
 const DBG_FRAME_SEL_FG: Color = Color::Rgb(0xff, 0xff, 0xff);
+const DBG_FIELD_BG: Color = Color::Rgb(0x0d, 0x11, 0x17); // REPL input field fill
+const DBG_PLACEHOLDER: Color = Color::Rgb(0x4b, 0x55, 0x63); // ghost hint text
 
 /// Write `s` at `(x, y)` styled, clipped to the half-open column range
 /// `[x, right)`, and return the column just past what was drawn. Lets the
@@ -227,16 +229,17 @@ impl RunDebugPanel {
             return;
         }
 
-        // Reserve the bottom for the console + a REPL bar (1 prompt row + up to
-        // 6 console rows when there is output).
+        // Reserve the bottom for the console + the REPL input area. The input
+        // area is 2 rows: a "DEBUG CONSOLE" label and the filled input field.
+        // Plus up to 6 console rows when there is output.
         let bottom = inner.y + inner.height;
-        let prompt_h: u16 = 1;
+        let input_h: u16 = 2;
         let console_h: u16 = if self.console_tail.is_empty() {
             0
         } else {
-            6.min(bottom.saturating_sub(y).saturating_sub(prompt_h + 2))
+            6.min(bottom.saturating_sub(y).saturating_sub(input_h + 2))
         };
-        let rows_bottom = bottom.saturating_sub(prompt_h + console_h);
+        let rows_bottom = bottom.saturating_sub(input_h + console_h);
         let rows_area_h = rows_bottom.saturating_sub(y) as usize;
         self.last_debug_row_y0 = y;
 
@@ -347,10 +350,14 @@ impl RunDebugPanel {
         }
         self.last_debug_rows_shown = shown;
 
-        // Console: program output + REPL echoes, above the prompt.
-        let prompt_y = bottom - 1;
+        // Bottom-up: the input field is the last row, the "DEBUG CONSOLE" label
+        // the row above it, and any console output sits above that.
+        let field_y = bottom - 1;
+        let label_y = bottom - 2;
+
+        // Console: program output + REPL echoes, above the label.
         if console_h > 0 {
-            let console_y0 = prompt_y - console_h;
+            let console_y0 = label_y.saturating_sub(console_h);
             for (i, line) in self
                 .console_tail
                 .iter()
@@ -359,8 +366,6 @@ impl RunDebugPanel {
                 .rev()
                 .enumerate()
             {
-                // REPL echoes ("❯ …") in teal; everything else dim, stderr-ish
-                // red left to the caller's prefixing.
                 let style = if line.starts_with('❯') {
                     Style::default().fg(DBG_ACCENT)
                 } else {
@@ -370,32 +375,81 @@ impl RunDebugPanel {
             }
         }
 
-        // REPL bar pinned to the bottom: a teal caret, the input, a block cursor.
+        // "DEBUG CONSOLE" label above the field.
+        put(
+            buf,
+            inner.x + 1,
+            label_y,
+            right,
+            "DEBUG CONSOLE",
+            Style::default().fg(DBG_LOC).add_modifier(Modifier::BOLD),
+        );
+
+        // The input field: a subtle full-width fill makes it read as a text box.
+        // A teal caret, then the input (or a dim-italic placeholder when empty),
+        // with a teal block cursor marking the insertion point.
+        buf.set_style(
+            Rect {
+                x: inner.x,
+                y: field_y,
+                width: inner.width,
+                height: 1,
+            },
+            Style::default().bg(DBG_FIELD_BG),
+        );
+        let bg = Some(DBG_FIELD_BG);
         let caret_end = put(
             buf,
             inner.x + 1,
-            prompt_y,
+            field_y,
             right,
             "❯ ",
-            Style::default().fg(DBG_ACCENT).add_modifier(Modifier::BOLD),
+            with_bg(
+                Style::default().fg(DBG_ACCENT).add_modifier(Modifier::BOLD),
+                bg,
+            ),
         );
-        let input_end = put(
-            buf,
-            caret_end,
-            prompt_y,
-            right,
-            &self.repl_input,
-            Style::default().fg(DBG_NAME),
-        );
-        // Block cursor.
-        put(
-            buf,
-            input_end,
-            prompt_y,
-            right,
-            " ",
-            Style::default().bg(DBG_ACCENT),
-        );
+        if self.repl_input.is_empty() {
+            // Block cursor at the insertion point, then the ghost placeholder.
+            let after_cursor = put(
+                buf,
+                caret_end,
+                field_y,
+                right,
+                " ",
+                Style::default().bg(DBG_ACCENT),
+            );
+            put(
+                buf,
+                after_cursor,
+                field_y,
+                right,
+                "Evaluate expression…",
+                with_bg(
+                    Style::default()
+                        .fg(DBG_PLACEHOLDER)
+                        .add_modifier(Modifier::ITALIC),
+                    bg,
+                ),
+            );
+        } else {
+            let input_end = put(
+                buf,
+                caret_end,
+                field_y,
+                right,
+                &self.repl_input,
+                with_bg(Style::default().fg(DBG_NAME), bg),
+            );
+            put(
+                buf,
+                input_end,
+                field_y,
+                right,
+                " ",
+                Style::default().bg(DBG_ACCENT),
+            );
+        }
     }
 
     pub fn button_label(&self) -> String {
@@ -713,6 +767,37 @@ mod tests {
             "console output:\n{dump}"
         );
         assert!(dump.contains("❯ x + 1"), "repl prompt with input:\n{dump}");
+        assert!(
+            dump.contains("DEBUG CONSOLE"),
+            "input field must carry a label:\n{dump}"
+        );
+    }
+
+    #[test]
+    fn empty_repl_shows_a_ghost_placeholder() {
+        let mut panel = RunDebugPanel::new();
+        panel.debug_active = true;
+        panel.debug_status = String::from("Paused");
+        panel.debug_rows = vec![DebugRow {
+            indent: 0,
+            kind: DebugRowKind::Header {
+                title: "VARIABLES".into(),
+            },
+        }];
+        // repl_input left empty
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 24,
+        };
+        let mut buf = Buffer::empty(area);
+        Widget::render(&mut panel, area, &mut buf);
+        let dump = buffer_to_string(&buf);
+        assert!(
+            dump.contains("Evaluate expression"),
+            "empty REPL must show a placeholder hint:\n{dump}"
+        );
     }
 
     #[test]
