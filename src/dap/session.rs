@@ -51,6 +51,10 @@ pub enum DapEvent {
     /// `setBreakpoints` response or a `breakpoint` event). The app refreshes the
     /// gutter so unverified breakpoints render hollow.
     BreakpointsUpdated,
+    /// The call stack, scopes, or variables changed (a `stackTrace`/`scopes`/
+    /// `variables` response landed). The app refreshes the Call Stack / Variables
+    /// panels.
+    InspectionUpdated,
 }
 
 /// One breakpoint's binding status as reported by the adapter: the source file,
@@ -212,27 +216,145 @@ pub fn thread_request(command: &str, thread_id: i64) -> Value {
     })
 }
 
-/// Build a `stackTrace` request for the top frame of `thread_id` — enough to
-/// learn the file + line the debugger is paused on.
+/// Build a `stackTrace` request for the full call stack of `thread_id`. Omitting
+/// `levels` asks the adapter for every frame (debugpy returns the whole stack),
+/// which powers the Call Stack panel; the top frame still drives the stop-line.
 pub fn stack_trace_request(thread_id: i64) -> Value {
     json!({
         "type": "request",
         "command": "stackTrace",
-        "arguments": { "threadId": thread_id, "startFrame": 0, "levels": 1 }
+        "arguments": { "threadId": thread_id, "startFrame": 0 }
     })
 }
 
-/// Extract `(path, 1-based line)` of the top frame from a `stackTrace` response
-/// body, or `None` if the shape isn't as expected. Pure.
-pub fn top_frame_location(stack_trace_response: &Value) -> Option<(PathBuf, usize)> {
-    let frame = stack_trace_response
-        .get("body")?
-        .get("stackFrames")?
-        .as_array()?
-        .first()?;
-    let path = frame.get("source")?.get("path")?.as_str()?;
-    let line = frame.get("line")?.as_i64()?;
-    Some((PathBuf::from(path), line as usize))
+/// Build a `scopes` request for one stack frame (locals / globals containers).
+pub fn scopes_request(frame_id: i64) -> Value {
+    json!({
+        "type": "request",
+        "command": "scopes",
+        "arguments": { "frameId": frame_id }
+    })
+}
+
+/// Build a `variables` request for a `variablesReference` (a scope's container or
+/// an expandable variable's children).
+pub fn variables_request(variables_reference: i64) -> Value {
+    json!({
+        "type": "request",
+        "command": "variables",
+        "arguments": { "variablesReference": variables_reference }
+    })
+}
+
+/// One frame of the call stack: the adapter's frame `id` (used for `scopes`), the
+/// display `name`, and the source location (None for frames with no source, e.g.
+/// native frames).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StackFrame {
+    pub id: i64,
+    pub name: String,
+    pub path: Option<PathBuf>,
+    pub line: usize,
+}
+
+/// A variable container for a frame (e.g. "Locals", "Globals"). `variables_ref`
+/// is fed to a `variables` request to fetch its members.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Scope {
+    pub name: String,
+    pub variables_ref: i64,
+}
+
+/// A single variable. `variables_ref > 0` means it is expandable (its children
+/// are fetched with a further `variables` request on that reference).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Variable {
+    pub name: String,
+    pub value: String,
+    pub type_name: String,
+    pub variables_ref: i64,
+}
+
+/// Parse the full call stack from a `stackTrace` response. Pure.
+pub fn parse_stack_frames(stack_trace_response: &Value) -> Vec<StackFrame> {
+    stack_trace_response
+        .get("body")
+        .and_then(|b| b.get("stackFrames"))
+        .and_then(Value::as_array)
+        .map(|frames| {
+            frames
+                .iter()
+                .filter_map(|f| {
+                    Some(StackFrame {
+                        id: f.get("id")?.as_i64()?,
+                        name: f
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string(),
+                        path: f
+                            .get("source")
+                            .and_then(|s| s.get("path"))
+                            .and_then(Value::as_str)
+                            .map(PathBuf::from),
+                        line: f.get("line").and_then(Value::as_i64).unwrap_or(0) as usize,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Parse scopes from a `scopes` response. Pure.
+pub fn parse_scopes(scopes_response: &Value) -> Vec<Scope> {
+    scopes_response
+        .get("body")
+        .and_then(|b| b.get("scopes"))
+        .and_then(Value::as_array)
+        .map(|scopes| {
+            scopes
+                .iter()
+                .filter_map(|s| {
+                    Some(Scope {
+                        name: s.get("name")?.as_str()?.to_string(),
+                        variables_ref: s.get("variablesReference")?.as_i64()?,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Parse variables from a `variables` response. Pure.
+pub fn parse_variables(variables_response: &Value) -> Vec<Variable> {
+    variables_response
+        .get("body")
+        .and_then(|b| b.get("variables"))
+        .and_then(Value::as_array)
+        .map(|vars| {
+            vars.iter()
+                .filter_map(|v| {
+                    Some(Variable {
+                        name: v.get("name")?.as_str()?.to_string(),
+                        value: v
+                            .get("value")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string(),
+                        type_name: v
+                            .get("type")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string(),
+                        variables_ref: v
+                            .get("variablesReference")
+                            .and_then(Value::as_i64)
+                            .unwrap_or(0),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Fold breakpoint reports into a per-path unverified-line map, returning `true`
@@ -295,6 +417,20 @@ pub struct DapSession {
     /// (could not bind). Updated from `setBreakpoints` responses and `breakpoint`
     /// events; the editor renders these hollow so the user sees they are inert.
     pub unverified_breakpoints: BTreeMap<PathBuf, std::collections::BTreeSet<usize>>,
+    /// Full call stack at the current stop (top frame first), from the
+    /// `stackTrace` response. Empty while running.
+    pub stack_frames: Vec<StackFrame>,
+    /// Scopes (Locals / Globals) of the selected frame.
+    pub scopes: Vec<Scope>,
+    /// Variables keyed by `variablesReference`: the entry for a scope's ref holds
+    /// that scope's members; expanding a variable adds its ref's children here.
+    pub variables: BTreeMap<i64, Vec<Variable>>,
+    /// Frame whose scopes/variables are currently loaded (top frame by default).
+    pub selected_frame: Option<i64>,
+    /// In-flight `variables` requests: request `seq` -> the `variablesReference`
+    /// it asked for, so the response (which echoes only `request_seq`) can be
+    /// filed under the right reference.
+    pending_var_refs: std::collections::HashMap<i64, i64>,
 }
 
 impl DapSession {
@@ -322,7 +458,40 @@ impl DapSession {
             stopped_thread: None,
             current_location: None,
             unverified_breakpoints: BTreeMap::new(),
+            stack_frames: Vec::new(),
+            scopes: Vec::new(),
+            variables: BTreeMap::new(),
+            selected_frame: None,
+            pending_var_refs: std::collections::HashMap::new(),
         })
+    }
+
+    /// Clear all inspection state (call stack, scopes, variables). Done on every
+    /// resume/step/terminate since frame ids and variable references are only
+    /// valid for the current stop.
+    fn clear_inspection(&mut self) {
+        self.stack_frames.clear();
+        self.scopes.clear();
+        self.variables.clear();
+        self.selected_frame = None;
+        self.pending_var_refs.clear();
+    }
+
+    /// Load scopes for `frame_id` and fetch each scope's variables. Called when a
+    /// stop resolves its stack (top frame) or the user selects another frame.
+    pub fn load_frame(&mut self, frame_id: i64) {
+        self.selected_frame = Some(frame_id);
+        self.scopes.clear();
+        self.variables.clear();
+        self.pending_var_refs.clear();
+        let _ = self.transport.send(scopes_request(frame_id));
+    }
+
+    /// Send a `variables` request and remember which reference it was for.
+    fn request_variables(&mut self, variables_reference: i64) {
+        if let Ok(seq) = self.transport.send(variables_request(variables_reference)) {
+            self.pending_var_refs.insert(seq, variables_reference);
+        }
     }
 
     /// Fold a set of breakpoint reports into `unverified_breakpoints`, returning
@@ -356,8 +525,34 @@ impl DapSession {
             if msg.get("type").and_then(Value::as_str) == Some("response") {
                 match msg.get("command").and_then(Value::as_str) {
                     Some("stackTrace") => {
-                        if let Some(loc) = top_frame_location(&msg) {
-                            self.current_location = Some(loc);
+                        self.stack_frames = parse_stack_frames(&msg);
+                        if let Some(top) = self.stack_frames.first() {
+                            if let Some(path) = top.path.clone() {
+                                self.current_location = Some((path, top.line));
+                            }
+                            // Auto-load the top frame's locals/globals.
+                            let top_id = top.id;
+                            self.load_frame(top_id);
+                        }
+                        out.push(DapEvent::InspectionUpdated);
+                    }
+                    Some("scopes") => {
+                        self.scopes = parse_scopes(&msg);
+                        // Fetch each scope's variables.
+                        let refs: Vec<i64> =
+                            self.scopes.iter().map(|s| s.variables_ref).collect();
+                        for r in refs {
+                            self.request_variables(r);
+                        }
+                        out.push(DapEvent::InspectionUpdated);
+                    }
+                    Some("variables") => {
+                        let req_seq = msg.get("request_seq").and_then(Value::as_i64);
+                        if let Some(reference) =
+                            req_seq.and_then(|s| self.pending_var_refs.remove(&s))
+                        {
+                            self.variables.insert(reference, parse_variables(&msg));
+                            out.push(DapEvent::InspectionUpdated);
                         }
                     }
                     Some("setBreakpoints") => {
@@ -390,21 +585,25 @@ impl DapSession {
                 DapEvent::Stopped { thread_id, .. } => {
                     self.stopped_thread = Some(*thread_id);
                     self.phase = SessionPhase::Stopped;
-                    // Resolve the paused location asynchronously; the response
-                    // arrives on a later poll and fills `current_location`.
+                    // Frame ids / variable references from a prior stop are stale.
+                    self.clear_inspection();
+                    // Resolve the stack asynchronously; the response arrives on a
+                    // later poll and fills the location + call stack + variables.
                     let _ = self.transport.send(stack_trace_request(*thread_id));
                 }
                 DapEvent::Continued => {
                     self.phase = SessionPhase::Running;
                     self.current_location = None;
+                    self.clear_inspection();
                 }
                 DapEvent::Terminated => {
                     self.phase = SessionPhase::Terminated;
                     self.current_location = None;
+                    self.clear_inspection();
                 }
                 DapEvent::Output { .. } => {}
                 // Produced internally above, never via classify_event.
-                DapEvent::BreakpointsUpdated => {}
+                DapEvent::BreakpointsUpdated | DapEvent::InspectionUpdated => {}
             }
             out.push(event);
         }
@@ -618,34 +817,63 @@ mod tests {
     }
 
     #[test]
-    fn stack_trace_request_targets_top_frame() {
+    fn stack_trace_request_targets_full_stack() {
         let req = stack_trace_request(5);
         assert_eq!(req["command"], "stackTrace");
         assert_eq!(req["arguments"]["threadId"], 5);
-        assert_eq!(req["arguments"]["levels"], 1);
+        assert_eq!(req["arguments"]["startFrame"], 0);
+        // No `levels` cap: the adapter returns every frame.
+        assert!(req["arguments"].get("levels").is_none());
     }
 
     #[test]
-    fn top_frame_location_reads_path_and_line() {
+    fn parse_stack_frames_reads_all_frames_with_ids() {
         let resp = json!({
             "type": "response", "command": "stackTrace",
             "body": { "stackFrames": [
-                { "source": { "path": "/w/app.py" }, "line": 12 },
-                { "source": { "path": "/w/lib.py" }, "line": 1 }
+                { "id": 1000, "name": "isValid", "source": { "path": "/w/app.py" }, "line": 12 },
+                { "id": 1001, "name": "<module>", "source": { "path": "/w/app.py" }, "line": 24 }
             ]}
         });
-        assert_eq!(
-            top_frame_location(&resp),
-            Some((PathBuf::from("/w/app.py"), 12))
-        );
+        let frames = parse_stack_frames(&resp);
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].id, 1000);
+        assert_eq!(frames[0].name, "isValid");
+        assert_eq!(frames[0].path, Some(PathBuf::from("/w/app.py")));
+        assert_eq!(frames[0].line, 12);
+        assert_eq!(frames[1].id, 1001);
     }
 
     #[test]
-    fn top_frame_location_none_when_empty_or_malformed() {
-        let empty =
-            json!({"type": "response", "command": "stackTrace", "body": {"stackFrames": []}});
-        assert_eq!(top_frame_location(&empty), None);
-        assert_eq!(top_frame_location(&json!({"body": {}})), None);
+    fn parse_stack_frames_empty_when_malformed() {
+        assert!(parse_stack_frames(&json!({"body": {}})).is_empty());
+        assert!(parse_stack_frames(&json!({})).is_empty());
+    }
+
+    #[test]
+    fn parse_scopes_and_variables() {
+        let scopes = parse_scopes(&json!({
+            "body": { "scopes": [
+                { "name": "Locals", "variablesReference": 7 },
+                { "name": "Globals", "variablesReference": 8 }
+            ]}
+        }));
+        assert_eq!(scopes.len(), 2);
+        assert_eq!(scopes[0].name, "Locals");
+        assert_eq!(scopes[0].variables_ref, 7);
+
+        let vars = parse_variables(&json!({
+            "body": { "variables": [
+                { "name": "x", "value": "1", "type": "int", "variablesReference": 0 },
+                { "name": "obj", "value": "<Foo>", "type": "Foo", "variablesReference": 9 }
+            ]}
+        }));
+        assert_eq!(vars.len(), 2);
+        assert_eq!(vars[0].name, "x");
+        assert_eq!(vars[0].value, "1");
+        assert_eq!(vars[0].type_name, "int");
+        assert_eq!(vars[0].variables_ref, 0);
+        assert_eq!(vars[1].variables_ref, 9, "expandable variable keeps its ref");
     }
 
     /// End-to-end against a real debugpy adapter: launch a script with a
@@ -693,6 +921,63 @@ mod tests {
         assert!(stopped, "expected a `stopped` event from debugpy");
         let (_loc, line) = sess.current_location.clone().expect("a paused location");
         assert_eq!(line, 3, "should pause on the breakpoint line");
+    }
+
+    /// End-to-end: at a breakpoint, the inspection chain (stackTrace -> scopes ->
+    /// variables) populates the call stack and the locals. Break on line 3 of
+    /// `x=1; y=2; z=x+y; print(z)`, where `x` and `y` are already bound.
+    #[test]
+    #[ignore = "requires ~/.croft/debug-venv (uv + debugpy on CPython 3.14)"]
+    fn inspection_chain_populates_stack_and_locals() {
+        use std::io::Write;
+        let py = crate::dap::install::ensure_debug_venv().expect("provision debug venv");
+        let mut f = tempfile::Builder::new().suffix(".py").tempfile().unwrap();
+        writeln!(f, "x = 1\ny = 2\nz = x + y\nprint(z)").unwrap();
+        let path = f.path().canonicalize().unwrap();
+        let mut bps = BTreeMap::new();
+        bps.insert(path.clone(), vec![3u32]);
+        let mut sess = DapSession::launch(
+            &py.to_string_lossy(),
+            &["-m".to_string(), "debugpy.adapter".to_string()],
+            path.parent().unwrap(),
+            &path,
+            &py,
+            bps,
+            false,
+        )
+        .unwrap();
+
+        // Poll until the variables for some scope have arrived (the chain runs
+        // across several polls: stackTrace -> scopes -> variables).
+        let mut have_locals = false;
+        for _ in 0..200 {
+            sess.poll();
+            let names: Vec<&str> = sess
+                .variables
+                .values()
+                .flatten()
+                .map(|v| v.name.as_str())
+                .collect();
+            if names.contains(&"x") && names.contains(&"y") {
+                have_locals = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let frames = sess.stack_frames.clone();
+        let xy: Vec<(String, String)> = sess
+            .variables
+            .values()
+            .flatten()
+            .filter(|v| v.name == "x" || v.name == "y")
+            .map(|v| (v.name.clone(), v.value.clone()))
+            .collect();
+        sess.disconnect();
+
+        assert!(!frames.is_empty(), "call stack must be populated at the stop");
+        assert!(have_locals, "locals x and y must arrive via the chain");
+        assert!(xy.contains(&("x".to_string(), "1".to_string())));
+        assert!(xy.contains(&("y".to_string(), "2".to_string())));
     }
 
     /// Regression: a breakpoint set via a NON-canonical (symlinked) path must
