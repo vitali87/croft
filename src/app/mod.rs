@@ -6322,10 +6322,12 @@ impl App {
         let mut changed = !events.is_empty();
         for ev in events {
             match ev {
-                DapEvent::Output { text, .. } => {
-                    // Route program output to the debug console (each embedded
-                    // newline becomes its own line) rather than flashing it in
-                    // the status bar.
+                // Route program output to the debug console (each embedded
+                // newline becomes its own line), but drop debugpy's own
+                // `telemetry` banner (the `ptvsd` / `debugpy` noise).
+                DapEvent::Output { category, text }
+                    if crate::dap::session::output_is_user_visible(&category) =>
+                {
                     for line in text.split('\n') {
                         if !line.is_empty() {
                             self.debug_console_push(line.to_string());

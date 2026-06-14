@@ -145,6 +145,14 @@ pub fn classify_event(msg: &Value) -> Option<DapEvent> {
     }
 }
 
+/// Whether a DAP `output` event of this `category` is user-facing program
+/// output worth showing in the debug console. `telemetry` (debugpy's own
+/// `ptvsd` / `debugpy` banner lines) is adapter noise and is filtered out;
+/// `stdout` / `stderr` / `console` / `important` are kept.
+pub fn output_is_user_visible(category: &str) -> bool {
+    category != "telemetry"
+}
+
 /// Build the `initialize` request body (sans `seq`, which the transport stamps).
 pub fn initialize_request() -> Value {
     json!({
@@ -1037,6 +1045,15 @@ mod tests {
         assert!(!map.contains_key(&p));
         // No reports => no change.
         assert!(!fold_breakpoint_reports(&mut map, &[]));
+    }
+
+    #[test]
+    fn telemetry_output_is_filtered_but_program_output_is_kept() {
+        // debugpy's `ptvsd` / `debugpy` banner arrives as category `telemetry`.
+        assert!(!output_is_user_visible("telemetry"));
+        assert!(output_is_user_visible("stdout"));
+        assert!(output_is_user_visible("stderr"));
+        assert!(output_is_user_visible("console"));
     }
 
     #[test]
