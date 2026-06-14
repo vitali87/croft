@@ -1155,6 +1155,9 @@ pub struct App {
     /// Variable `variablesReference`s the user has expanded in the Variables
     /// panel. Persisted across polls so re-fetched variables stay open.
     pub debug_expanded: std::collections::HashSet<i64>,
+    /// Debug console log: program stdout/stderr (DAP output events) plus REPL
+    /// echoes and results. Capped; the tail is shown in the Run & Debug panel.
+    pub debug_console: Vec<String>,
     /// zoxide-backed Explorer jump popup (Cmd+Z). None when closed. Opens
     /// only from the Explorer pane, so it never collides with the editor's
     /// Cmd+Z undo.
@@ -1615,6 +1618,7 @@ impl App {
             process_picker: None,
             dap_session: None,
             debug_expanded: std::collections::HashSet::new(),
+            debug_console: Vec::new(),
             zoxide_jump: None,
             file_finder_index: None,
             file_finder_index_rx: Some(file_finder_index_rx),
@@ -6175,6 +6179,25 @@ impl App {
     }
 
     fn handle_run_debug_key(&mut self, key: KeyEvent) {
+        // While a session is live the panel is a REPL: text edits the prompt and
+        // Enter evaluates it. Esc always leaves the view.
+        if self.run_debug.debug_active {
+            match key.code {
+                KeyCode::Esc => self.set_sidebar_view(SidebarView::Explorer),
+                KeyCode::Enter => {
+                    self.debug_repl_submit();
+                    self.refresh_debug_panel();
+                }
+                KeyCode::Backspace => {
+                    self.run_debug.repl_input.pop();
+                }
+                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.run_debug.repl_input.push(c);
+                }
+                _ => {}
+            }
+            return;
+        }
         match key.code {
             KeyCode::Esc => self.set_sidebar_view(SidebarView::Explorer),
             KeyCode::Enter => self.run_active_file(),
@@ -6263,10 +6286,24 @@ impl App {
         for ev in events {
             match ev {
                 DapEvent::Output { text, .. } => {
-                    let line = text.trim_end();
-                    if !line.is_empty() {
-                        self.status = format!("debug: {line}");
+                    // Route program output to the debug console (each embedded
+                    // newline becomes its own line) rather than flashing it in
+                    // the status bar.
+                    for line in text.split('\n') {
+                        if !line.is_empty() {
+                            self.debug_console_push(line.to_string());
+                        }
                     }
+                }
+                // REPL submissions echo "❯ expr" then the result; watch/hover
+                // results are consumed elsewhere.
+                DapEvent::Evaluated {
+                    context,
+                    expression,
+                    result,
+                } if context == "repl" => {
+                    self.debug_console_push(format!("❯ {expression}"));
+                    self.debug_console_push(result);
                 }
                 DapEvent::Stopped { reason, .. } => {
                     self.run_debug.feedback = Some(format!("Paused ({reason})"));
@@ -6341,9 +6378,14 @@ impl App {
             if self.run_debug.debug_scroll > max_scroll {
                 self.run_debug.debug_scroll = max_scroll;
             }
+            // Show the console tail (most recent output / REPL lines).
+            let n = self.debug_console.len();
+            self.run_debug.console_tail = self.debug_console[n.saturating_sub(50)..].to_vec();
         } else {
             self.run_debug.debug_rows.clear();
             self.run_debug.debug_scroll = 0;
+            self.run_debug.console_tail.clear();
+            self.run_debug.repl_input.clear();
         }
     }
 
@@ -6356,8 +6398,18 @@ impl App {
         let Some(session) = self.dap_session.as_ref() else {
             return (false, String::new(), Vec::new());
         };
-        if session.phase != SessionPhase::Stopped {
+        // Active for any live session: while Running the tree is empty but the
+        // console still shows output; while Stopped the full tree is built.
+        if session.phase == SessionPhase::Terminated {
             return (false, String::new(), Vec::new());
+        }
+        if session.phase != SessionPhase::Stopped {
+            let status = self
+                .run_debug
+                .feedback
+                .clone()
+                .unwrap_or_else(|| String::from("Running"));
+            return (true, status, Vec::new());
         }
         let mut rows = Vec::new();
         rows.push(DebugRow {
@@ -6402,6 +6454,31 @@ impl App {
             .clone()
             .unwrap_or_else(|| String::from("Paused"));
         (true, status, rows)
+    }
+
+    /// Append a line to the debug console, capping the backlog so a chatty
+    /// program can't grow it without bound.
+    fn debug_console_push(&mut self, line: String) {
+        const CAP: usize = 1000;
+        self.debug_console.push(line);
+        if self.debug_console.len() > CAP {
+            let overflow = self.debug_console.len() - CAP;
+            self.debug_console.drain(..overflow);
+        }
+    }
+
+    /// Submit the Run & Debug panel's REPL input: echo + evaluate it at the
+    /// selected frame. No-op on empty input or with no session.
+    fn debug_repl_submit(&mut self) {
+        let expr = self.run_debug.repl_input.trim().to_string();
+        self.run_debug.repl_input.clear();
+        if expr.is_empty() {
+            return;
+        }
+        match self.dap_session.as_mut() {
+            Some(session) => session.evaluate(&expr, "repl"),
+            None => self.debug_console_push(String::from("(no debug session)")),
+        }
     }
 
     /// Hover-to-evaluate: while a debug session is paused, return a popup string

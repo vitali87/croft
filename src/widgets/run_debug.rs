@@ -66,6 +66,11 @@ pub struct RunDebugPanel {
     /// recorded each frame so a click can be mapped to a row index.
     pub last_debug_row_y0: u16,
     pub last_debug_rows_shown: usize,
+    /// Tail of the debug console (program output + REPL echoes/results), set by
+    /// the app each refresh; rendered below the variables tree.
+    pub console_tail: Vec<String>,
+    /// Current REPL input line, rendered as a `❯` prompt at the panel bottom.
+    pub repl_input: String,
     /// Top-left cell of the OSC-1337 icon overlay block. The post-draw
     /// flush in `App` reads this to emit the rasterised debug-alt PNG
     /// above the headline. `None` when the panel hasn't been laid out,
@@ -90,6 +95,8 @@ impl RunDebugPanel {
             debug_scroll: 0,
             last_debug_row_y0: 0,
             last_debug_rows_shown: 0,
+            console_tail: Vec::new(),
+            repl_input: String::new(),
             last_icon_cell: None,
             feedback: None,
             feedback_is_error: false,
@@ -150,7 +157,19 @@ impl RunDebugPanel {
         if y >= inner.y + inner.height {
             return;
         }
-        let rows_area_h = (inner.y + inner.height - y) as usize;
+        // Reserve the bottom of the panel for the debug console + REPL prompt:
+        // one prompt row, plus up to 6 console rows when there is output. The
+        // call-stack/variables tree gets whatever remains above.
+        let bottom = inner.y + inner.height;
+        let prompt_h: u16 = 1;
+        let console_h: u16 = if self.console_tail.is_empty() {
+            0
+        } else {
+            6.min(bottom.saturating_sub(y).saturating_sub(prompt_h + 2))
+        };
+        let reserved = prompt_h + console_h;
+        let rows_bottom = bottom.saturating_sub(reserved);
+        let rows_area_h = (rows_bottom.saturating_sub(y)) as usize;
         self.last_debug_row_y0 = y;
         let visible = self.debug_rows.iter().skip(self.debug_scroll).take(rows_area_h);
         let mut shown = 0usize;
@@ -201,6 +220,36 @@ impl RunDebugPanel {
             shown += 1;
         }
         self.last_debug_rows_shown = shown;
+
+        // Debug console (program output + REPL echoes) and the REPL prompt at the
+        // bottom of the panel.
+        let bottom = inner.y + inner.height;
+        let prompt_y = bottom - 1;
+        if console_h > 0 {
+            let console_y0 = prompt_y - console_h;
+            let tail = self
+                .console_tail
+                .iter()
+                .rev()
+                .take(console_h as usize)
+                .rev();
+            let style = Style::default().fg(Color::Rgb(BODY_FG_RGB.0, BODY_FG_RGB.1, BODY_FG_RGB.2));
+            for (i, line) in tail.enumerate() {
+                let truncated: String = line.chars().take(inner.width.saturating_sub(1) as usize).collect();
+                buf.set_string(inner.x + 1, console_y0 + i as u16, &truncated, style);
+            }
+        }
+        // REPL prompt: "❯ <input>".
+        let prompt = format!("❯ {}", self.repl_input);
+        let truncated: String = prompt.chars().take(inner.width.saturating_sub(1) as usize).collect();
+        buf.set_string(
+            inner.x + 1,
+            prompt_y,
+            &truncated,
+            Style::default()
+                .fg(Color::Rgb(0x9c, 0xdc, 0xfe))
+                .add_modifier(Modifier::BOLD),
+        );
     }
 
     pub fn button_label(&self) -> String {
@@ -452,6 +501,26 @@ mod tests {
         assert_eq!(panel.debug_row_at(y0), Some(0));
         assert_eq!(panel.debug_row_at(y0 + 1), Some(1));
         assert_eq!(panel.debug_row_at(y0.saturating_sub(1)), None);
+    }
+
+    #[test]
+    fn paused_state_renders_console_tail_and_repl_prompt() {
+        let mut panel = RunDebugPanel::new();
+        panel.debug_active = true;
+        panel.debug_status = String::from("Paused (breakpoint)");
+        panel.debug_rows = vec![DebugRow {
+            indent: 0,
+            text: "CALL STACK".into(),
+            kind: DebugRowKind::Header,
+        }];
+        panel.console_tail = vec!["hello from program".into(), "42".into()];
+        panel.repl_input = String::from("x + 1");
+        let area = Rect { x: 0, y: 0, width: 40, height: 24 };
+        let mut buf = Buffer::empty(area);
+        Widget::render(&mut panel, area, &mut buf);
+        let dump = buffer_to_string(&buf);
+        assert!(dump.contains("hello from program"), "console output:\n{dump}");
+        assert!(dump.contains("❯ x + 1"), "repl prompt with input:\n{dump}");
     }
 
     #[test]

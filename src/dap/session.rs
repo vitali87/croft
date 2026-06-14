@@ -55,6 +55,13 @@ pub enum DapEvent {
     /// `variables` response landed). The app refreshes the Call Stack / Variables
     /// panels.
     InspectionUpdated,
+    /// An `evaluate` request resolved. `context` is the request context
+    /// (`repl` / `watch` / `hover`), `expression` the input, `result` the value.
+    Evaluated {
+        context: String,
+        expression: String,
+        result: String,
+    },
 }
 
 /// One breakpoint's binding status as reported by the adapter: the source file,
@@ -225,6 +232,26 @@ pub fn stack_trace_request(thread_id: i64) -> Value {
         "command": "stackTrace",
         "arguments": { "threadId": thread_id, "startFrame": 0 }
     })
+}
+
+/// Build an `evaluate` request: run `expression` in the context of `frame_id`
+/// (None evaluates in the global/REPL context). `context` is `repl`, `watch`,
+/// or `hover` and tells the adapter how to format the result.
+pub fn evaluate_request(expression: &str, frame_id: Option<i64>, context: &str) -> Value {
+    let mut args = json!({ "expression": expression, "context": context });
+    if let Some(fid) = frame_id {
+        args["frameId"] = Value::from(fid);
+    }
+    json!({ "type": "request", "command": "evaluate", "arguments": args })
+}
+
+/// Extract an `evaluate` response's `result` string, or None. Pure.
+pub fn parse_evaluate_result(response: &Value) -> Option<String> {
+    response
+        .get("body")?
+        .get("result")?
+        .as_str()
+        .map(str::to_string)
 }
 
 /// Build a `scopes` request for one stack frame (locals / globals containers).
@@ -431,6 +458,9 @@ pub struct DapSession {
     /// it asked for, so the response (which echoes only `request_seq`) can be
     /// filed under the right reference.
     pending_var_refs: std::collections::HashMap<i64, i64>,
+    /// In-flight `evaluate` requests: request `seq` -> (context, expression), so
+    /// the response can be turned into an [`DapEvent::Evaluated`].
+    pending_evals: std::collections::HashMap<i64, (String, String)>,
 }
 
 impl DapSession {
@@ -463,7 +493,19 @@ impl DapSession {
             variables: BTreeMap::new(),
             selected_frame: None,
             pending_var_refs: std::collections::HashMap::new(),
+            pending_evals: std::collections::HashMap::new(),
         })
+    }
+
+    /// Evaluate `expression` in the selected frame (or globally if no frame is
+    /// selected). The result arrives on a later poll as [`DapEvent::Evaluated`].
+    /// `context` is typically `repl` or `watch`.
+    pub fn evaluate(&mut self, expression: &str, context: &str) {
+        let req = evaluate_request(expression, self.selected_frame, context);
+        if let Ok(seq) = self.transport.send(req) {
+            self.pending_evals
+                .insert(seq, (context.to_string(), expression.to_string()));
+        }
     }
 
     /// Clear all inspection state (call stack, scopes, variables). Done on every
@@ -574,6 +616,25 @@ impl DapSession {
                             out.push(DapEvent::InspectionUpdated);
                         }
                     }
+                    Some("evaluate") => {
+                        let req_seq = msg.get("request_seq").and_then(Value::as_i64);
+                        if let Some((context, expression)) =
+                            req_seq.and_then(|s| self.pending_evals.remove(&s))
+                        {
+                            let result = parse_evaluate_result(&msg).unwrap_or_else(|| {
+                                // Failed evaluate: surface the adapter's message.
+                                msg.get("message")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("")
+                                    .to_string()
+                            });
+                            out.push(DapEvent::Evaluated {
+                                context,
+                                expression,
+                                result,
+                            });
+                        }
+                    }
                     Some("setBreakpoints") => {
                         let reports = breakpoint_reports(&msg);
                         if self.apply_breakpoint_reports(&reports) {
@@ -622,7 +683,9 @@ impl DapSession {
                 }
                 DapEvent::Output { .. } => {}
                 // Produced internally above, never via classify_event.
-                DapEvent::BreakpointsUpdated | DapEvent::InspectionUpdated => {}
+                DapEvent::BreakpointsUpdated
+                | DapEvent::InspectionUpdated
+                | DapEvent::Evaluated { .. } => {}
             }
             out.push(event);
         }
@@ -702,6 +765,25 @@ mod tests {
             classify_event(&json!({"type": "event", "event": "exited"})),
             Some(DapEvent::Terminated)
         );
+    }
+
+    #[test]
+    fn evaluate_request_carries_expression_frame_and_context() {
+        let with_frame = evaluate_request("x + 1", Some(42), "repl");
+        assert_eq!(with_frame["command"], "evaluate");
+        assert_eq!(with_frame["arguments"]["expression"], "x + 1");
+        assert_eq!(with_frame["arguments"]["frameId"], 42);
+        assert_eq!(with_frame["arguments"]["context"], "repl");
+        // No frame selected => no frameId key (global evaluation).
+        let no_frame = evaluate_request("len(xs)", None, "watch");
+        assert!(no_frame["arguments"].get("frameId").is_none());
+    }
+
+    #[test]
+    fn parse_evaluate_result_reads_body_result() {
+        let resp = json!({ "body": { "result": "3", "type": "int" } });
+        assert_eq!(parse_evaluate_result(&resp).as_deref(), Some("3"));
+        assert_eq!(parse_evaluate_result(&json!({"body": {}})), None);
     }
 
     #[test]
