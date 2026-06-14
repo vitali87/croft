@@ -50,9 +50,10 @@
         nativeBuildInputs = [
           pkgs.pkg-config
           pkgs.git
+          pkgs.python3
         ];
 
-        buildInputs = lib.flatten [ 
+        buildInputs = lib.flatten [
           rustToolchain
           linuxClipboard
           darwinFrameworks
@@ -88,12 +89,21 @@
           pname = cfg.package.name;
           version = cfg.package.version;
           __structuredAttrs = true;
-        
+
           src = ./.;
           cargoLock.lockFile = ./Cargo.lock;
 
           inherit nativeBuildInputs buildInputs;
-          
+
+          # buildPhase = ''
+          #   export HOME=$(pwd)
+          # '';
+
+          # postPatch = ''
+          #   substituteInPlace src/widgets/terminal.rs \
+          #     --replace-fail /bin/echo ${pkgs.coreutils}/bin/echo
+          # '';
+
           checkFlags = [
             # Disabling while working through issues causing test failures.
             "--skip=app::tests::cmd_p_index_drops_a_file_deleted_off_disk"
@@ -101,14 +111,13 @@
             "--skip=app::tests::cmd_t_globally_splits_the_terminal_and_does_not_double_fire_as_focus"
             "--skip=app::tests::ctrl_shift_t_still_splits_the_terminal_and_does_not_double_fire_as_focus"
             "--skip=app::tests::open_cmd_p_finder_re_ranks_in_place_when_the_index_swaps"
-            "--skip=app::tests::run_active_file_with_python_file_spawns_a_new_terminal_and_focuses_it"
             "--skip=sysmon::tests::home_disk_pct_measures_a_real_filesystem"
             "--skip=widgets::terminal::tests::new_running_appends_exit_footer_when_child_finishes"
             "--skip=widgets::terminal::tests::new_running_renders_running_header_in_term_immediately"
             "--skip=widgets::terminal::tests::new_running_spawns_program_directly_and_produces_output"
             "--skip=widgets::terminal::tests::pending_bytes_counts_advanced_output_and_resets_on_take_dirty"
           ];
-          
+
           meta = {
             description = cfg.package.description;
             homepage = cfg.package.homepage;
