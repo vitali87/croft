@@ -5810,8 +5810,10 @@ impl App {
             }
             return Ok(());
         }
-        // F6 pause (mirrors VS Code's Pause key).
-        if matches!(key.code, KeyCode::F(6)) {
+        // F6 pauses a running program (VS Code's Pause key) ONLY while a debug
+        // session is live; with no session it falls through to its long-standing
+        // role as croft's cycle-focus key.
+        if matches!(key.code, KeyCode::F(6)) && self.dap_session.is_some() {
             self.debug_pause();
             return Ok(());
         }
