@@ -168,17 +168,20 @@ Image tabs (`.png`, `.jpg`, `.jpeg`, `.gif`, `.bmp`, `.webp`) are read-only; eve
 
 ## Run & Debug
 
-Real breakpoint debugging for Python via debugpy over the Debug Adapter Protocol. Requires CPython 3.14+ (croft provisions a private `~/.croft/debug-venv` with debugpy on first use); there is no fallback to older interpreters.
+Real breakpoint debugging over the Debug Adapter Protocol. Python is the verified adapter (debugpy, CPython 3.14+; croft provisions a private `~/.croft/debug-venv` with debugpy on first use, with no fallback to older interpreters). Rust / C / C++ route to `lldb-dap` (binary built on launch; breakpoint binding additionally needs a permitted macOS `debugserver`).
 
 | Keys | Action |
 |------|--------|
-| `F5` | Start debugging the active file (launches it under debugpy), or resume when paused at a breakpoint |
+| `F5` | Start debugging the active file, or resume when paused at a breakpoint |
 | `Shift+F5` | Stop the debug session |
+| `F6` | Pause (interrupt) a running program |
 | `F9` | Toggle a breakpoint on the cursor's line (a red dot in the gutter); pushed live when a session is running |
 | `F10` | Step over |
 | `F11` / `Shift+F11` | Step into / out |
 
-The paused line is marked with a yellow `▶` in the gutter. Breakpoints, start/stop, step over, and "Debug: Attach to Python Process" are also in the Command Palette.
+When paused, the Run and Debug panel shows the **call stack** (click a frame to inspect it) and an expandable **variables** tree, plus a **debug console** of program output with a `❯` **REPL prompt** that evaluates expressions in the selected frame. Hovering a variable in the editor shows its current value. The paused line is marked with a yellow `▶` in the gutter; a breakpoint is a red `●`, a conditional breakpoint a red `◆`, and a breakpoint the adapter could not bind a hollow `○`.
+
+Also in the Command Palette: Start / Stop / Pause / Restart Debugging, Toggle Breakpoint, Add Conditional Breakpoint, Step Over, Toggle Break on Raised Exceptions (uncaught always breaks), and Attach to Python Process.
 
 ## Terminal
 
