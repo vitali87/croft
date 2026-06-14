@@ -4417,7 +4417,10 @@ impl Widget for &mut Editor {
 
             // Debugger gutter glyphs, on a logical line's first visual row only:
             // a yellow stop arrow (▶) takes priority over a red breakpoint dot
-            // (●), painted over the blank leftmost gutter cell.
+            // (●). Painted in the sign column between the line number and the
+            // code (`inner.x + gutter_width`), VS Code-style, so it never
+            // overwrites a line-number digit.
+            let sign_x = inner.x + gutter_width;
             if (!wrap || row_start == 0)
                 && let Some(path) = self.path.as_deref()
             {
@@ -4440,7 +4443,7 @@ impl Widget for &mut Editor {
                     .is_some_and(|c| c.contains_key(&here));
                 if is_stop {
                     buf.set_string(
-                        inner.x,
+                        sign_x,
                         y,
                         "▶",
                         Style::default().fg(Color::Rgb(0xff, 0xcc, 0x00)),
@@ -4456,7 +4459,7 @@ impl Widget for &mut Editor {
                     } else {
                         ("●", Color::Rgb(0xe5, 0x1c, 0x23))
                     };
-                    buf.set_string(inner.x, y, glyph, Style::default().fg(color));
+                    buf.set_string(sign_x, y, glyph, Style::default().fg(color));
                 }
             }
 
@@ -5775,6 +5778,48 @@ mod tests {
     fn toggle_breakpoint_without_open_file_is_noop() {
         let mut e = Editor::new();
         assert_eq!(e.toggle_breakpoint(), None);
+    }
+
+    #[test]
+    fn breakpoint_glyph_sits_in_sign_column_not_over_the_line_number() {
+        let f = NamedTempFile::new().unwrap();
+        std::fs::write(f.path(), "aaa\nbbb\nccc\n").unwrap();
+        let mut ed = Editor::new();
+        ed.open(f.path()).unwrap();
+        ed.breakpoints
+            .entry(f.path().to_path_buf())
+            .or_default()
+            .insert(2); // breakpoint on line 2
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 30,
+            height: 10,
+        };
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        ratatui::widgets::Widget::render(&mut ed, area, &mut buf);
+        // The editor insets by a 1-col border, so inner.x == 1 and content rows
+        // start at y == 1; line 2 is therefore at y == 2.
+        let inner_x = ed.last_inner.x;
+        let gutter = ed.last_gutter_width;
+        let row = ed.last_inner.y + 1; // line 2 is the 2nd content row
+        let mut line = String::new();
+        for x in 0..area.width {
+            line.push_str(buf[(x, row)].symbol());
+        }
+        // The line number "2" must be intact (not clobbered by the glyph)...
+        assert_eq!(
+            buf[(inner_x, row)].symbol(),
+            "2",
+            "line number must survive: {line:?}"
+        );
+        // ...and the dot must be in the sign column between number and code.
+        assert_eq!(
+            buf[(inner_x + gutter, row)].symbol(),
+            "●",
+            "breakpoint dot must be in the sign column (x={}); row was {line:?}",
+            inner_x + gutter
+        );
     }
 
     #[test]
