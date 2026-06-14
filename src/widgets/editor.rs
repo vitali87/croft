@@ -4255,10 +4255,7 @@ impl Widget for &mut Editor {
         // the margin into `gutter_width` shifts the numbers and code right
         // together, so the number-to-code gap is unchanged and click/cursor
         // mapping (which derives from `gutter_width`) stays correct for free.
-        // A 3-cell glyph margin (space · glyph · space) so the breakpoint dot
-        // sits centred between the panel's left border and the line number, with
-        // one blank cell on each side, rather than hugging the border.
-        const SIGN_MARGIN: u16 = 3;
+        const SIGN_MARGIN: u16 = 2;
         let gutter_width = (self.lines.len() + 1).to_string().len() as u16 + 1 + SIGN_MARGIN;
         self.last_gutter_width = gutter_width;
         let wrap = self.wrap_enabled();
@@ -4427,10 +4424,10 @@ impl Widget for &mut Editor {
 
             // Debugger gutter glyphs, on a logical line's first visual row only:
             // a yellow stop arrow (▶) takes priority over a red breakpoint dot
-            // (●). Painted in the MIDDLE cell of the 3-wide glyph margin
-            // (`inner.x + 1`), so it's centred between the left border and the
-            // line number with a blank cell on each side.
-            let sign_x = inner.x + 1;
+            // (●). Painted in the dedicated glyph margin at the far left
+            // (`inner.x`), VS Code-style, so it never crowds the line number or
+            // the code and the number-to-code gap is untouched.
+            let sign_x = inner.x;
             if (!wrap || row_start == 0)
                 && let Some(path) = self.path.as_deref()
             {
@@ -5817,28 +5814,25 @@ mod tests {
         for x in 0..area.width {
             line.push_str(buf[(x, row)].symbol());
         }
-        // The dot is centred in the 3-cell glyph margin: a blank, the dot, a
-        // blank, then the line number.
+        // The dot lives in the far-left glyph margin...
         assert_eq!(
             buf[(inner_x, row)].symbol(),
-            " ",
-            "blank before the dot (border side); row was {line:?}"
-        );
-        assert_eq!(
-            buf[(inner_x + 1, row)].symbol(),
             "●",
-            "dot centred in the margin; row was {line:?}"
+            "breakpoint dot must be in the left glyph margin; row was {line:?}"
         );
-        assert_eq!(
-            buf[(inner_x + 2, row)].symbol(),
-            " ",
-            "blank after the dot (number side); row was {line:?}"
-        );
-        // The line number is right-aligned after the margin and intact.
+        // ...the line number is right-aligned after the margin (its last digit
+        // sits one cell before the gutter's trailing space) and is intact...
         assert_eq!(
             buf[(inner_x + gutter - 2, row)].symbol(),
             "2",
             "line number must survive after the margin; row was {line:?}"
+        );
+        // ...and the margin never overwrites a digit (the cell after the dot is
+        // a blank, not a number).
+        assert_eq!(
+            buf[(inner_x + 1, row)].symbol(),
+            " ",
+            "a space separates the dot from the line number; row was {line:?}"
         );
     }
 
