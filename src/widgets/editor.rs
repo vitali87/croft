@@ -1137,6 +1137,10 @@ pub struct Editor {
     /// Where the debugger is currently paused (path, 1-based line), or None when
     /// not stopped. Drawn as a highlighted row with a gutter arrow.
     pub stop_line: Option<(PathBuf, usize)>,
+    /// Breakpoint lines the adapter reported as NOT verified (could not bind,
+    /// e.g. a blank/comment line). Rendered as a hollow ○ instead of a solid ●
+    /// so the user sees the breakpoint is inert. Keyed by path.
+    pub unverified_breakpoints: std::collections::HashMap<PathBuf, std::collections::BTreeSet<usize>>,
     /// Monotonic counter that bumps on every buffer mutation. The App's
     /// per-tick sync_lsp diff reads this to know when to forward a
     /// did_change to the LSP server, so building lines.join("\n") only
@@ -1306,6 +1310,7 @@ impl Editor {
             lines: Vec::new(),
             breakpoints: std::collections::HashMap::new(),
             stop_line: None,
+            unverified_breakpoints: std::collections::HashMap::new(),
             edit_seq: 0,
             scroll: 0,
             scroll_sub: 0,
@@ -4393,6 +4398,10 @@ impl Widget for &mut Editor {
                     .breakpoints
                     .get(path)
                     .is_some_and(|s| s.contains(&here));
+                let is_unverified = self
+                    .unverified_breakpoints
+                    .get(path)
+                    .is_some_and(|s| s.contains(&here));
                 if is_stop {
                     buf.set_string(
                         inner.x,
@@ -4401,12 +4410,14 @@ impl Widget for &mut Editor {
                         Style::default().fg(Color::Rgb(0xff, 0xcc, 0x00)),
                     );
                 } else if is_bp {
-                    buf.set_string(
-                        inner.x,
-                        y,
-                        "●",
-                        Style::default().fg(Color::Rgb(0xe5, 0x1c, 0x23)),
-                    );
+                    // Hollow, dimmed ring when the adapter could not bind it
+                    // (inert breakpoint); solid red dot when it is live.
+                    let (glyph, color) = if is_unverified {
+                        ("○", Color::Rgb(0x99, 0x99, 0x99))
+                    } else {
+                        ("●", Color::Rgb(0xe5, 0x1c, 0x23))
+                    };
+                    buf.set_string(inner.x, y, glyph, Style::default().fg(color));
                 }
             }
 

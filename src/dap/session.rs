@@ -47,6 +47,56 @@ pub enum DapEvent {
     Output { category: String, text: String },
     /// The debuggee process exited.
     Terminated,
+    /// The adapter reported updated breakpoint verification (from a
+    /// `setBreakpoints` response or a `breakpoint` event). The app refreshes the
+    /// gutter so unverified breakpoints render hollow.
+    BreakpointsUpdated,
+}
+
+/// One breakpoint's binding status as reported by the adapter: the source file,
+/// the (possibly adjusted) 1-based line, and whether the adapter could actually
+/// place it. An unverified breakpoint never pauses execution, so surfacing it is
+/// what stops the "I set a breakpoint and it just ran" confusion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BreakpointReport {
+    pub path: PathBuf,
+    pub line: usize,
+    pub verified: bool,
+}
+
+/// Extract breakpoint statuses from either a `setBreakpoints` response
+/// (`body.breakpoints[]`) or a `breakpoint` event (`body.breakpoint`). Entries
+/// without a source path or line are skipped (debugpy occasionally reports
+/// `line: 0` for a not-yet-resolved breakpoint). Pure.
+pub fn breakpoint_reports(msg: &Value) -> Vec<BreakpointReport> {
+    let body = match msg.get("body") {
+        Some(b) => b,
+        None => return Vec::new(),
+    };
+    let mut raw: Vec<&Value> = Vec::new();
+    if let Some(arr) = body.get("breakpoints").and_then(Value::as_array) {
+        raw.extend(arr.iter());
+    }
+    if let Some(one) = body.get("breakpoint") {
+        raw.push(one);
+    }
+    raw.into_iter()
+        .filter_map(|bp| {
+            let path = bp.get("source")?.get("path")?.as_str()?;
+            let line = bp.get("line").and_then(Value::as_i64).unwrap_or(0);
+            if line <= 0 {
+                return None;
+            }
+            Some(BreakpointReport {
+                path: PathBuf::from(path),
+                line: line as usize,
+                verified: bp
+                    .get("verified")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            })
+        })
+        .collect()
 }
 
 /// Classify a raw incoming DAP message into a [`DapEvent`], or `None` for
@@ -170,6 +220,49 @@ pub fn top_frame_location(stack_trace_response: &Value) -> Option<(PathBuf, usiz
     Some((PathBuf::from(path), line as usize))
 }
 
+/// Fold breakpoint reports into a per-path unverified-line map, returning `true`
+/// if anything changed. Each reported path's unverified set is replaced
+/// wholesale (a `setBreakpoints` response describes that file's full set); a path
+/// whose breakpoints all verify is dropped from the map. Pure.
+pub fn fold_breakpoint_reports(
+    map: &mut BTreeMap<PathBuf, std::collections::BTreeSet<usize>>,
+    reports: &[BreakpointReport],
+) -> bool {
+    use std::collections::{BTreeSet, btree_map::Entry};
+    if reports.is_empty() {
+        return false;
+    }
+    let mut by_path: BTreeMap<PathBuf, BTreeSet<usize>> = BTreeMap::new();
+    for r in reports {
+        let set = by_path.entry(r.path.clone()).or_default();
+        if !r.verified {
+            set.insert(r.line);
+        }
+    }
+    let mut changed = false;
+    for (path, unverified) in by_path {
+        match map.entry(path) {
+            Entry::Occupied(mut e) => {
+                if *e.get() != unverified {
+                    if unverified.is_empty() {
+                        e.remove();
+                    } else {
+                        e.insert(unverified);
+                    }
+                    changed = true;
+                }
+            }
+            Entry::Vacant(e) => {
+                if !unverified.is_empty() {
+                    e.insert(unverified);
+                    changed = true;
+                }
+            }
+        }
+    }
+    changed
+}
+
 /// One running debug session.
 pub struct DapSession {
     transport: DapTransport,
@@ -183,6 +276,10 @@ pub struct DapSession {
     /// `stackTrace` response that follows each `stopped` event. Cleared on
     /// resume/terminate.
     pub current_location: Option<(PathBuf, usize)>,
+    /// Per-file set of breakpoint lines the adapter reported as NOT verified
+    /// (could not bind). Updated from `setBreakpoints` responses and `breakpoint`
+    /// events; the editor renders these hollow so the user sees they are inert.
+    pub unverified_breakpoints: BTreeMap<PathBuf, std::collections::BTreeSet<usize>>,
 }
 
 impl DapSession {
@@ -209,7 +306,14 @@ impl DapSession {
             breakpoints,
             stopped_thread: None,
             current_location: None,
+            unverified_breakpoints: BTreeMap::new(),
         })
+    }
+
+    /// Fold a set of breakpoint reports into `unverified_breakpoints`, returning
+    /// `true` if the set changed (so the caller can trigger a redraw).
+    fn apply_breakpoint_reports(&mut self, reports: &[BreakpointReport]) -> bool {
+        fold_breakpoint_reports(&mut self.unverified_breakpoints, reports)
     }
 
     /// Drain everything the adapter has sent, advance the handshake, and return
@@ -220,10 +324,27 @@ impl DapSession {
             // Responses: the only one we act on is `stackTrace`, which tells us
             // the file + line a `stopped` paused on.
             if msg.get("type").and_then(Value::as_str) == Some("response") {
-                if msg.get("command").and_then(Value::as_str) == Some("stackTrace")
-                    && let Some(loc) = top_frame_location(&msg)
-                {
-                    self.current_location = Some(loc);
+                match msg.get("command").and_then(Value::as_str) {
+                    Some("stackTrace") => {
+                        if let Some(loc) = top_frame_location(&msg) {
+                            self.current_location = Some(loc);
+                        }
+                    }
+                    Some("setBreakpoints") => {
+                        let reports = breakpoint_reports(&msg);
+                        if self.apply_breakpoint_reports(&reports) {
+                            out.push(DapEvent::BreakpointsUpdated);
+                        }
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+            // `breakpoint` events carry late-resolved verification updates.
+            if msg.get("event").and_then(Value::as_str) == Some("breakpoint") {
+                let reports = breakpoint_reports(&msg);
+                if self.apply_breakpoint_reports(&reports) {
+                    out.push(DapEvent::BreakpointsUpdated);
                 }
                 continue;
             }
@@ -252,6 +373,8 @@ impl DapSession {
                     self.current_location = None;
                 }
                 DapEvent::Output { .. } => {}
+                // Produced internally above, never via classify_event.
+                DapEvent::BreakpointsUpdated => {}
             }
             out.push(event);
         }
@@ -331,6 +454,69 @@ mod tests {
             classify_event(&json!({"type": "event", "event": "exited"})),
             Some(DapEvent::Terminated)
         );
+    }
+
+    #[test]
+    fn breakpoint_reports_parses_response_array() {
+        let msg = json!({
+            "type": "response", "command": "setBreakpoints",
+            "body": { "breakpoints": [
+                { "verified": true, "line": 3, "source": { "path": "/a.py" } },
+                { "verified": false, "line": 7, "source": { "path": "/a.py" } },
+            ]}
+        });
+        let reports = breakpoint_reports(&msg);
+        assert_eq!(reports.len(), 2);
+        assert_eq!(reports[1].line, 7);
+        assert!(!reports[1].verified);
+    }
+
+    #[test]
+    fn breakpoint_reports_parses_singular_event_and_skips_line_zero() {
+        let event = json!({
+            "type": "event", "event": "breakpoint",
+            "body": { "reason": "changed",
+                "breakpoint": { "verified": true, "line": 5, "source": { "path": "/b.py" } } }
+        });
+        let reports = breakpoint_reports(&event);
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].path, PathBuf::from("/b.py"));
+
+        // line: 0 (not yet resolved) is skipped, not reported as line 0.
+        let unresolved = json!({
+            "type": "response", "command": "setBreakpoints",
+            "body": { "breakpoints": [
+                { "verified": true, "line": 0, "source": { "path": "/c.py" } } ]}
+        });
+        assert!(breakpoint_reports(&unresolved).is_empty());
+    }
+
+    #[test]
+    fn fold_breakpoint_reports_tracks_only_unverified() {
+        let mut map = BTreeMap::new();
+        let p = PathBuf::from("/a.py");
+        // One verified, one not: only the unverified line is tracked.
+        let changed = fold_breakpoint_reports(
+            &mut map,
+            &[
+                BreakpointReport { path: p.clone(), line: 3, verified: true },
+                BreakpointReport { path: p.clone(), line: 7, verified: false },
+            ],
+        );
+        assert!(changed);
+        assert_eq!(
+            map.get(&p).unwrap().iter().copied().collect::<Vec<_>>(),
+            vec![7]
+        );
+        // A later report verifying line 7 clears it (and the now-empty entry).
+        let changed = fold_breakpoint_reports(
+            &mut map,
+            &[BreakpointReport { path: p.clone(), line: 7, verified: true }],
+        );
+        assert!(changed);
+        assert!(!map.contains_key(&p));
+        // No reports => no change.
+        assert!(!fold_breakpoint_reports(&mut map, &[]));
     }
 
     #[test]
@@ -463,5 +649,67 @@ mod tests {
         assert!(stopped, "expected a `stopped` event from debugpy");
         let (_loc, line) = sess.current_location.clone().expect("a paused location");
         assert_eq!(line, 3, "should pause on the breakpoint line");
+    }
+
+    /// Regression: a breakpoint set via a NON-canonical (symlinked) path must
+    /// still bind, and debugpy must echo back the SAME path we launched with
+    /// (not the canonical `realpath`). This is why croft does NOT canonicalize:
+    /// debugpy keys breakpoints and reports `stackTrace` source paths by the
+    /// path it was launched with, so `current_location` matches the editor's
+    /// open path and the gutter triangle renders. Canonicalizing the launch path
+    /// would make debugpy report the canonical path and break that match.
+    /// (macOS `/tmp` is itself a symlink to `/private/tmp`, exercising the
+    /// `/var`-style case too.)
+    #[test]
+    #[ignore = "requires ~/.croft/debug-venv (uv + debugpy on CPython 3.14)"]
+    fn binds_breakpoint_set_via_symlinked_path() {
+        use std::io::Write;
+        let py = crate::dap::install::ensure_debug_venv().expect("provision debug venv");
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let mut f = std::fs::File::create(real.join("m.py")).unwrap();
+        writeln!(f, "a = 1\nb = 2\nc = a + b\nprint(c)").unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        // Open the file through the symlinked directory: NOT canonical.
+        let via_link = link.join("m.py");
+        assert_ne!(
+            via_link,
+            via_link.canonicalize().unwrap(),
+            "test setup: path must be non-canonical"
+        );
+
+        let mut bps = BTreeMap::new();
+        bps.insert(via_link.clone(), vec![3u32]);
+        let mut sess = DapSession::launch(
+            &py.to_string_lossy(),
+            &["-m".to_string(), "debugpy.adapter".to_string()],
+            &link,
+            &via_link,
+            &py,
+            bps,
+            false,
+        )
+        .unwrap();
+
+        let mut stopped = false;
+        for _ in 0..100 {
+            for ev in sess.poll() {
+                if matches!(ev, DapEvent::Stopped { .. }) {
+                    stopped = true;
+                }
+            }
+            if sess.current_location.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        sess.disconnect();
+        assert!(stopped, "breakpoint via symlinked path must still bind+stop");
+        let (loc, line) = sess.current_location.clone().expect("a paused location");
+        assert_eq!(line, 3);
+        // debugpy echoes the launched (symlinked) path, NOT the canonical one.
+        assert_eq!(loc, via_link, "debugpy must report the path as launched");
     }
 }

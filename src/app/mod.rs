@@ -6221,6 +6221,27 @@ impl App {
                     self.run_debug.feedback = Some(format!("Paused ({reason})"));
                     self.run_debug.feedback_is_error = false;
                 }
+                DapEvent::BreakpointsUpdated => {
+                    // Mirror the adapter's unverified set into the editor so the
+                    // gutter can hollow out inert breakpoints, and warn once if
+                    // any failed to bind (the "I set a breakpoint and it just
+                    // ran" case).
+                    let unverified: std::collections::HashMap<
+                        PathBuf,
+                        std::collections::BTreeSet<usize>,
+                    > = self
+                        .dap_session
+                        .as_ref()
+                        .map(|s| s.unverified_breakpoints.clone().into_iter().collect())
+                        .unwrap_or_default();
+                    let total: usize = unverified.values().map(|s| s.len()).sum();
+                    self.editor.unverified_breakpoints = unverified;
+                    if total > 0 {
+                        self.status = format!(
+                            "{total} breakpoint(s) could not bind (no executable code on that line)"
+                        );
+                    }
+                }
                 _ => {}
             }
         }
@@ -6240,6 +6261,7 @@ impl App {
             }
             Some(SessionPhase::Terminated) => {
                 self.editor.stop_line = None;
+                self.editor.unverified_breakpoints.clear();
                 self.dap_session = None;
                 self.run_debug.feedback = Some(String::from("Debug session ended"));
                 self.run_debug.feedback_is_error = false;
@@ -6351,6 +6373,7 @@ impl App {
         }
         self.dap_session = None;
         self.editor.stop_line = None;
+        self.editor.unverified_breakpoints.clear();
         self.status = String::from("Debug session stopped");
     }
 
