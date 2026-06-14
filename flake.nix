@@ -95,15 +95,6 @@
 
           inherit nativeBuildInputs buildInputs;
 
-          # buildPhase = ''
-          #   export HOME=$(pwd)
-          # '';
-
-          # postPatch = ''
-          #   substituteInPlace src/widgets/terminal.rs \
-          #     --replace-fail /bin/echo ${pkgs.coreutils}/bin/echo
-          # '';
-
           checkFlags = [
             # Disabling while working through issues causing test failures.
             "--skip=app::tests::cmd_p_index_drops_a_file_deleted_off_disk"
