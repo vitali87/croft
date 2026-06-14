@@ -14786,6 +14786,10 @@ fn install_terminal_restore_panic_hook() {
         let original = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
             use std::io::Write;
+            // Persist the panic BEFORE touching the terminal: the TUI teardown
+            // can garble or scroll away the message printed to stderr, so a file
+            // is the only reliable record (read with `cat ~/.cache/croft/panic.log`).
+            log_panic_to_file(info);
             let _ = disable_raw_mode();
             let mut out = stdout();
             let _ = out.write_all(TERMINAL_RESTORE_SEQ);
@@ -14794,6 +14798,44 @@ fn install_terminal_restore_panic_hook() {
             original(info);
         }));
     });
+}
+
+/// Append a panic record (version, thread, location, message, backtrace) to
+/// `~/.cache/croft/panic.log`. Best-effort and silent on any I/O failure.
+fn log_panic_to_file(info: &std::panic::PanicHookInfo<'_>) {
+    use std::io::Write;
+    let Some(home) = std::env::var_os("HOME") else {
+        return;
+    };
+    let dir = std::path::PathBuf::from(home).join(".cache").join("croft");
+    let _ = std::fs::create_dir_all(&dir);
+    let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("panic.log"))
+    else {
+        return;
+    };
+    let payload = info.payload();
+    let message = payload
+        .downcast_ref::<&str>()
+        .map(|s| s.to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| String::from("<non-string panic payload>"));
+    let location = info
+        .location()
+        .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+        .unwrap_or_else(|| String::from("<unknown>"));
+    let thread = std::thread::current()
+        .name()
+        .unwrap_or("<unnamed>")
+        .to_string();
+    let backtrace = std::backtrace::Backtrace::force_capture();
+    let _ = writeln!(
+        f,
+        "=== croft {} panicked ===\nthread: {thread}\nlocation: {location}\nmessage: {message}\nbacktrace:\n{backtrace}\n",
+        env!("CARGO_PKG_VERSION"),
+    );
 }
 
 /// Suspend the alt-screen, run every queued scp upload with the host
