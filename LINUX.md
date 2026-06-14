@@ -10,7 +10,7 @@ croft mirrors VS Code's Linux convention, where the command modifier is `Ctrl`. 
 
 ## Nerd Font
 
-Explorer icons and the activity bar are Private Use Area glyphs (Codicons, Devicons, Seti). Without a Nerd Font they render as `[?]` boxes. Install one and set it as your terminal font:
+Explorer icons and the activity bar are Private Use Area Nerd Font glyphs (Codicons plus file-type icons). Without a Nerd Font they render as `[?]` boxes. Install one and set it as your terminal font:
 
 ```bash
 # Example: Meslo, the family croft uses elsewhere

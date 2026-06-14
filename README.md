@@ -20,7 +20,7 @@ The non-negotiables behind every decision in croft:
 
 ## Layout
 
-Three panes in the VS Code arrangement: an **Explorer sidebar** on the left, a **code editor** top right, and a **real terminal** bottom right. An activity bar down the far left switches the sidebar between Explorer, Search, Source Control, and a Remote (SSH) explorer, and holds the theme picker. Every seam drags to resize.
+Three panes in the VS Code arrangement: an **Explorer sidebar** on the left, a **code editor** top right, and a **real terminal** bottom right. An activity bar down the far left switches the sidebar between Explorer, Search, Source Control, a Remote (SSH) explorer, and Run and Debug, and holds the theme picker. Every seam drags to resize.
 
 The editor brings tree-sitter highlighting, inline previews for images / PDFs / spreadsheets, side-by-side splits, an optional vim mode, and full LSP (completion, hover, go-to-definition, rename, diagnostics). A Command Palette (`Cmd`/`Ctrl`+`Shift`+`P`) runs every command, and you can debug Python, Rust, C, and C++ with breakpoints over DAP or attach a `pdb` REPL to a live process.
 
@@ -30,9 +30,9 @@ See **[LAYOUT.md](LAYOUT.md)** for the full pane-by-pane reference, debugging wo
 
 | Requirement | Why |
 |-------------|-----|
-| macOS, Linux, or Android (Termux) | The PTY layer uses POSIX `forkpty`. Windows is not yet supported. |
+| macOS, Linux, or Android (Termux) | The PTY layer uses a POSIX pseudo-terminal. Windows is not yet supported. |
 | Rust 1.85+ stable | To compile the binary (edition 2024). |
-| A Nerd Font as your terminal font | Explorer icons are Private Use Area glyphs (Codicons, Devicons, Seti). Without one, icons render as `[?]` boxes. |
+| A Nerd Font as your terminal font | Explorer icons are Private Use Area Nerd Font glyphs (Codicons plus file-type icons). Without one, icons render as `[?]` boxes. |
 | A 256 color or truecolor terminal | Terminal.app, iTerm2, Alacritty, kitty, WezTerm, Ghostty all qualify. |
 | iTerm2, WezTerm, Ghostty, or kitty (optional) | Inline image / PDF / spreadsheet previews via OSC 1337 or the Kitty graphics protocol. Sixel terminals (detected at startup via a DA1 probe) are also supported. Other terminals fall back to a metadata header line. |
 | `pdftoppm` from poppler-utils (optional) | Multi-page PDF preview. Without it, croft falls back to macOS `sips` for page 1 only. |

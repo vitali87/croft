@@ -21,7 +21,7 @@ src/
 ├── git.rs               branch / dirty / ahead-behind status, plus an anonymous shallow `git clone` (over the remote's HTTPS URL) fetching the welcome-screen recents
 ├── gradient.rs          shared orange→green corner gradient: the welcome activity box border and the Black-theme focused-pane border
 ├── highlight.rs         tree-sitter highlight registry per language
-├── icons.rs             Codicon / Devicon / Seti glyphs and per-language colors
+├── icons.rs             Codicon and file-type Nerd Font glyphs and per-language colors
 ├── install_session.rs   streams install-progress events while a remote host builds / installs the croft binary
 ├── iterm2.rs            iTerm2 plist mutation helpers for fonts and Croft key mappings
 ├── iterm2_inline.rs     inline-image baking pipeline + protocol dispatch (iTerm2 OSC 1337 / Kitty graphics / DEC sixel via DA1 probe): welcome wordmark, image / PDF preview, activity-bar icons incl. the settings gear, SSH empty-state hero

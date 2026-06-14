@@ -6,7 +6,7 @@ macOS is croft's primary local platform: the clipboard, inline previews, and "Re
 
 ## Nerd Font
 
-Explorer icons and the activity bar are Private Use Area glyphs (Codicons, Devicons, Seti). Without a Nerd Font they render as `[?]` boxes.
+Explorer icons and the activity bar are Private Use Area Nerd Font glyphs (Codicons plus file-type icons). Without a Nerd Font they render as `[?]` boxes.
 
 ```bash
 brew install --cask font-meslo-lg-nerd-font
