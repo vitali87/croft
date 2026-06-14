@@ -23,6 +23,29 @@ const FOCUS_BORDER_RGB: (u8, u8, u8) = (0x4e, 0x9a, 0xff);
 pub const RUN_DEBUG_ICON_CELLS_W: u16 = 6;
 pub const RUN_DEBUG_ICON_CELLS_H: u16 = 3;
 
+/// What a [`DebugRow`] represents, so a click can act on it (navigate to a
+/// frame, expand a variable) and so the renderer can style it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DebugRowKind {
+    /// A section header ("CALL STACK", "VARIABLES").
+    Header,
+    /// A call-stack frame; carries the adapter frame id for selection.
+    Frame { id: i64, selected: bool },
+    /// A scope container row ("Locals", "Globals").
+    Scope,
+    /// A variable; `reference > 0` means expandable, `expanded` tracks state.
+    Variable { reference: i64, expandable: bool, expanded: bool },
+}
+
+/// One rendered line of the paused-state debug tree. The app builds these from
+/// the session; the panel renders them and maps clicks back to them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DebugRow {
+    pub indent: u8,
+    pub text: String,
+    pub kind: DebugRowKind,
+}
+
 pub struct RunDebugPanel {
     pub focused: bool,
     /// True under the Black theme: overpaint the focused outer border with the
@@ -32,6 +55,17 @@ pub struct RunDebugPanel {
     pub active_file: Option<PathBuf>,
     pub last_area: Rect,
     pub last_button_area: Rect,
+    /// When a debug session is paused, the app fills these rows (call stack +
+    /// variables) and sets `debug_active`; the panel then renders the tree
+    /// instead of the empty-state Run button.
+    pub debug_active: bool,
+    pub debug_status: String,
+    pub debug_rows: Vec<DebugRow>,
+    pub debug_scroll: usize,
+    /// Screen y of the first rendered debug row and how many rows were drawn,
+    /// recorded each frame so a click can be mapped to a row index.
+    pub last_debug_row_y0: u16,
+    pub last_debug_rows_shown: usize,
     /// Top-left cell of the OSC-1337 icon overlay block. The post-draw
     /// flush in `App` reads this to emit the rasterised debug-alt PNG
     /// above the headline. `None` when the panel hasn't been laid out,
@@ -50,9 +84,29 @@ impl RunDebugPanel {
             active_file: None,
             last_area: Rect::default(),
             last_button_area: Rect::default(),
+            debug_active: false,
+            debug_status: String::new(),
+            debug_rows: Vec::new(),
+            debug_scroll: 0,
+            last_debug_row_y0: 0,
+            last_debug_rows_shown: 0,
             last_icon_cell: None,
             feedback: None,
             feedback_is_error: false,
+        }
+    }
+
+    /// Map a click at screen row `y` to the index of the debug row drawn there,
+    /// or `None` if the click missed the rendered rows.
+    pub fn debug_row_at(&self, y: u16) -> Option<usize> {
+        if !self.debug_active || self.last_debug_rows_shown == 0 || y < self.last_debug_row_y0 {
+            return None;
+        }
+        let offset = (y - self.last_debug_row_y0) as usize;
+        if offset < self.last_debug_rows_shown {
+            Some(self.debug_scroll + offset)
+        } else {
+            None
         }
     }
 
@@ -68,6 +122,85 @@ impl RunDebugPanel {
             && x < r.x + r.width
             && y >= r.y
             && y < r.y + r.height
+    }
+
+    /// Render the paused-state tree: a status line, then the scrollable
+    /// call-stack + variables rows. Records `last_debug_row_y0` /
+    /// `last_debug_rows_shown` for click mapping.
+    fn render_debug_tree(&mut self, inner: Rect, buf: &mut Buffer) {
+        let mut y = inner.y;
+        // Status line (e.g. "Paused (breakpoint)").
+        if !self.debug_status.is_empty() {
+            let status = Paragraph::new(self.debug_status.as_str()).style(
+                Style::default()
+                    .fg(Color::Rgb(0xff, 0xcc, 0x00))
+                    .add_modifier(Modifier::BOLD),
+            );
+            status.render(
+                Rect {
+                    x: inner.x + 1,
+                    y,
+                    width: inner.width.saturating_sub(1),
+                    height: 1,
+                },
+                buf,
+            );
+            y += 2;
+        }
+        if y >= inner.y + inner.height {
+            return;
+        }
+        let rows_area_h = (inner.y + inner.height - y) as usize;
+        self.last_debug_row_y0 = y;
+        let visible = self.debug_rows.iter().skip(self.debug_scroll).take(rows_area_h);
+        let mut shown = 0usize;
+        for row in visible {
+            let row_y = y + shown as u16;
+            let indent = (row.indent as u16) * 2;
+            let x = inner.x + 1 + indent;
+            if x >= inner.x + inner.width {
+                shown += 1;
+                continue;
+            }
+            let avail = (inner.x + inner.width - x) as usize;
+            let (prefix, style) = match &row.kind {
+                DebugRowKind::Header => (
+                    String::new(),
+                    Style::default()
+                        .fg(Color::Rgb(TITLE_FG_RGB.0, TITLE_FG_RGB.1, TITLE_FG_RGB.2))
+                        .add_modifier(Modifier::BOLD),
+                ),
+                DebugRowKind::Frame { selected, .. } => {
+                    let s = if *selected {
+                        Style::default()
+                            .fg(Color::Rgb(0xff, 0xff, 0xff))
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::Rgb(BODY_FG_RGB.0, BODY_FG_RGB.1, BODY_FG_RGB.2))
+                    };
+                    (if *selected { "▸ ".to_string() } else { "  ".to_string() }, s)
+                }
+                DebugRowKind::Scope => (
+                    String::new(),
+                    Style::default()
+                        .fg(Color::Rgb(0x9c, 0xa8, 0xbe))
+                        .add_modifier(Modifier::BOLD),
+                ),
+                DebugRowKind::Variable { expandable, expanded, .. } => {
+                    let p = if *expandable {
+                        if *expanded { "▾ ".to_string() } else { "▸ ".to_string() }
+                    } else {
+                        "  ".to_string()
+                    };
+                    (p, Style::default().fg(Color::Rgb(BODY_FG_RGB.0, BODY_FG_RGB.1, BODY_FG_RGB.2)))
+                }
+            };
+            let text = format!("{prefix}{}", row.text);
+            let truncated: String = text.chars().take(avail).collect();
+            buf.set_string(x, row_y, &truncated, style);
+            shown += 1;
+        }
+        self.last_debug_rows_shown = shown;
     }
 
     pub fn button_label(&self) -> String {
@@ -108,7 +241,15 @@ impl Widget for &mut RunDebugPanel {
         self.last_area = area;
         self.last_button_area = Rect::default();
         self.last_icon_cell = None;
+        self.last_debug_rows_shown = 0;
         if inner.height == 0 || inner.width == 0 {
+            return;
+        }
+
+        // Paused at a breakpoint: render the call-stack + variables tree instead
+        // of the empty-state Run button.
+        if self.debug_active {
+            self.render_debug_tree(inner, buf);
             return;
         }
 
@@ -269,6 +410,49 @@ impl Widget for &mut RunDebugPanel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn paused_state_renders_call_stack_and_variables_and_maps_clicks() {
+        let mut panel = RunDebugPanel::new();
+        panel.debug_active = true;
+        panel.debug_status = String::from("Paused (breakpoint)");
+        panel.debug_rows = vec![
+            DebugRow { indent: 0, text: "CALL STACK".into(), kind: DebugRowKind::Header },
+            DebugRow {
+                indent: 1,
+                text: "isValid (app.py:12)".into(),
+                kind: DebugRowKind::Frame { id: 1000, selected: true },
+            },
+            DebugRow { indent: 0, text: "VARIABLES".into(), kind: DebugRowKind::Header },
+            DebugRow { indent: 1, text: "Locals".into(), kind: DebugRowKind::Scope },
+            DebugRow {
+                indent: 2,
+                text: "x = 1".into(),
+                kind: DebugRowKind::Variable { reference: 0, expandable: false, expanded: false },
+            },
+            DebugRow {
+                indent: 2,
+                text: "obj = <Foo>".into(),
+                kind: DebugRowKind::Variable { reference: 9, expandable: true, expanded: false },
+            },
+        ];
+        let area = Rect { x: 0, y: 0, width: 40, height: 24 };
+        let mut buf = Buffer::empty(area);
+        Widget::render(&mut panel, area, &mut buf);
+        let dump = buffer_to_string(&buf);
+        assert!(dump.contains("CALL STACK"), "call stack header:\n{dump}");
+        assert!(dump.contains("VARIABLES"), "variables header:\n{dump}");
+        assert!(dump.contains("isValid (app.py:12)"), "frame row:\n{dump}");
+        assert!(dump.contains("x = 1"), "variable row:\n{dump}");
+        assert!(dump.contains("▸ obj = <Foo>"), "expandable chevron:\n{dump}");
+        // The empty-state Run button must NOT be laid out while debugging.
+        assert_eq!(panel.last_button_area, Rect::default());
+        // Click mapping: first row sits at last_debug_row_y0.
+        let y0 = panel.last_debug_row_y0;
+        assert_eq!(panel.debug_row_at(y0), Some(0));
+        assert_eq!(panel.debug_row_at(y0 + 1), Some(1));
+        assert_eq!(panel.debug_row_at(y0.saturating_sub(1)), None);
+    }
 
     #[test]
     fn button_label_says_run_and_debug_when_no_file_is_active() {

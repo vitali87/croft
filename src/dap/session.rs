@@ -487,6 +487,14 @@ impl DapSession {
         let _ = self.transport.send(scopes_request(frame_id));
     }
 
+    /// Request the children of an expandable variable (its `variablesReference`)
+    /// unless already loaded; the response files them under that reference.
+    pub fn expand_variable(&mut self, variables_reference: i64) {
+        if variables_reference > 0 && !self.variables.contains_key(&variables_reference) {
+            self.request_variables(variables_reference);
+        }
+    }
+
     /// Send a `variables` request and remember which reference it was for.
     fn request_variables(&mut self, variables_reference: i64) {
         if let Ok(seq) = self.transport.send(variables_request(variables_reference)) {

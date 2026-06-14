@@ -88,6 +88,43 @@ fn activity_icon_glyph_x(bar: Rect) -> u16 {
     bar.x + bar.width / 2
 }
 
+/// Append variable rows to the debug tree, recursing into any expanded
+/// (`variablesReference` in `expanded`) container whose children are loaded.
+/// Pulled out as a free function so it can borrow the session immutably while
+/// the caller mutates the row vector.
+fn push_variable_rows(
+    rows: &mut Vec<crate::widgets::run_debug::DebugRow>,
+    session: &crate::dap::session::DapSession,
+    expanded: &std::collections::HashSet<i64>,
+    vars: &[crate::dap::session::Variable],
+    indent: u8,
+) {
+    use crate::widgets::run_debug::{DebugRow, DebugRowKind};
+    for v in vars {
+        let expandable = v.variables_ref > 0;
+        let is_open = expandable && expanded.contains(&v.variables_ref);
+        let text = if v.value.is_empty() {
+            v.name.clone()
+        } else {
+            format!("{} = {}", v.name, v.value)
+        };
+        rows.push(DebugRow {
+            indent,
+            text,
+            kind: DebugRowKind::Variable {
+                reference: v.variables_ref,
+                expandable,
+                expanded: is_open,
+            },
+        });
+        if is_open
+            && let Some(children) = session.variables.get(&v.variables_ref)
+        {
+            push_variable_rows(rows, session, expanded, children, indent.saturating_add(1));
+        }
+    }
+}
+
 fn activity_explorer_y(bar: Rect) -> u16 {
     bar.y + 1
 }
@@ -1115,6 +1152,9 @@ pub struct App {
     /// Polled each frame by [`App::poll_dap`], which mirrors the paused location
     /// into `editor.stop_line`.
     pub dap_session: Option<crate::dap::session::DapSession>,
+    /// Variable `variablesReference`s the user has expanded in the Variables
+    /// panel. Persisted across polls so re-fetched variables stay open.
+    pub debug_expanded: std::collections::HashSet<i64>,
     /// zoxide-backed Explorer jump popup (Cmd+Z). None when closed. Opens
     /// only from the Explorer pane, so it never collides with the editor's
     /// Cmd+Z undo.
@@ -1574,6 +1614,7 @@ impl App {
             command_palette: None,
             process_picker: None,
             dap_session: None,
+            debug_expanded: std::collections::HashSet::new(),
             zoxide_jump: None,
             file_finder_index: None,
             file_finder_index_rx: Some(file_finder_index_rx),
@@ -6273,7 +6314,118 @@ impl App {
                 }
             }
         }
+        // Rebuild the Call Stack / Variables panel from the (now-updated) session.
+        self.refresh_debug_panel();
         changed
+    }
+
+    /// Rebuild the Run & Debug panel's paused-state tree from the session, or
+    /// deactivate it when not paused. Cheap; called after each `poll_dap`.
+    fn refresh_debug_panel(&mut self) {
+        let (active, status, rows) = self.build_debug_view();
+        self.run_debug.debug_active = active;
+        if active {
+            self.run_debug.debug_status = status;
+            self.run_debug.debug_rows = rows;
+            let max_scroll = self.run_debug.debug_rows.len().saturating_sub(1);
+            if self.run_debug.debug_scroll > max_scroll {
+                self.run_debug.debug_scroll = max_scroll;
+            }
+        } else {
+            self.run_debug.debug_rows.clear();
+            self.run_debug.debug_scroll = 0;
+        }
+    }
+
+    /// Build the (active, status, rows) tuple for the debug panel from the
+    /// session. `&self` so it can borrow the session and expansion set without
+    /// conflicting with the `&mut self` assignment in `refresh_debug_panel`.
+    fn build_debug_view(&self) -> (bool, String, Vec<crate::widgets::run_debug::DebugRow>) {
+        use crate::dap::session::SessionPhase;
+        use crate::widgets::run_debug::{DebugRow, DebugRowKind};
+        let Some(session) = self.dap_session.as_ref() else {
+            return (false, String::new(), Vec::new());
+        };
+        if session.phase != SessionPhase::Stopped {
+            return (false, String::new(), Vec::new());
+        }
+        let mut rows = Vec::new();
+        rows.push(DebugRow {
+            indent: 0,
+            text: String::from("CALL STACK"),
+            kind: DebugRowKind::Header,
+        });
+        for f in &session.stack_frames {
+            let loc = f
+                .path
+                .as_ref()
+                .and_then(|p| p.file_name())
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            rows.push(DebugRow {
+                indent: 1,
+                text: format!("{} ({loc}:{})", f.name, f.line),
+                kind: DebugRowKind::Frame {
+                    id: f.id,
+                    selected: Some(f.id) == session.selected_frame,
+                },
+            });
+        }
+        rows.push(DebugRow {
+            indent: 0,
+            text: String::from("VARIABLES"),
+            kind: DebugRowKind::Header,
+        });
+        for scope in &session.scopes {
+            rows.push(DebugRow {
+                indent: 1,
+                text: scope.name.clone(),
+                kind: DebugRowKind::Scope,
+            });
+            if let Some(vars) = session.variables.get(&scope.variables_ref) {
+                push_variable_rows(&mut rows, session, &self.debug_expanded, vars, 2);
+            }
+        }
+        let status = self
+            .run_debug
+            .feedback
+            .clone()
+            .unwrap_or_else(|| String::from("Paused"));
+        (true, status, rows)
+    }
+
+    /// Act on a click of debug-panel row `idx`: select a call-stack frame (load
+    /// its scopes/variables) or toggle an expandable variable open/closed.
+    fn debug_panel_click(&mut self, idx: usize) {
+        use crate::widgets::run_debug::DebugRowKind;
+        let Some(row) = self.run_debug.debug_rows.get(idx) else {
+            return;
+        };
+        match row.kind.clone() {
+            DebugRowKind::Frame { id, .. } => {
+                if let Some(session) = self.dap_session.as_mut() {
+                    session.load_frame(id);
+                }
+                // Collapse expansions: variable refs are frame-scoped.
+                self.debug_expanded.clear();
+            }
+            DebugRowKind::Variable {
+                reference,
+                expandable: true,
+                ..
+            } => {
+                if self.debug_expanded.contains(&reference) {
+                    self.debug_expanded.remove(&reference);
+                } else {
+                    self.debug_expanded.insert(reference);
+                    if let Some(session) = self.dap_session.as_mut() {
+                        session.expand_variable(reference);
+                    }
+                }
+            }
+            _ => {}
+        }
+        self.refresh_debug_panel();
     }
 
     /// F5: start debugging the active file, or resume if already paused.
@@ -11075,7 +11227,11 @@ impl App {
                 }
                 if in_tree && self.sidebar_view == SidebarView::RunDebug {
                     self.focus_pane(Pane::Tree);
-                    if self.run_debug.click_button(m.column, m.row) {
+                    if self.run_debug.debug_active {
+                        if let Some(idx) = self.run_debug.debug_row_at(m.row) {
+                            self.debug_panel_click(idx);
+                        }
+                    } else if self.run_debug.click_button(m.column, m.row) {
                         self.run_active_file();
                     }
                     return;
