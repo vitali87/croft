@@ -3462,7 +3462,7 @@ impl Editor {
         let scrollbar_w = u16::from(self.last_scrollbar.width > 0);
         self.last_inner
             .width
-            .saturating_sub(self.last_gutter_width + 2 + scrollbar_w) as usize
+            .saturating_sub(self.last_gutter_width + 3 + scrollbar_w) as usize
     }
 
     /// Pull `scroll_col` so the cursor sits inside the current viewport.
@@ -3683,7 +3683,7 @@ impl Editor {
         }
         let row_idx = (row - self.last_inner.y) as usize;
         let target_line = (self.scroll + row_idx).min(self.lines.len().saturating_sub(1));
-        let text_x = self.last_inner.x + self.last_gutter_width + 1;
+        let text_x = self.last_inner.x + self.last_gutter_width + 2;
         let target_col = if col < text_x {
             0
         } else {
@@ -3700,7 +3700,7 @@ impl Editor {
         if self.last_inner.height == 0 || self.lines.is_empty() || row < self.last_inner.y {
             return None;
         }
-        let text_x = self.last_inner.x + self.last_gutter_width + 1;
+        let text_x = self.last_inner.x + self.last_gutter_width + 2;
         if self.wrap_enabled() {
             // Map the screen row through the last render's visual-row layout so
             // a click lands on the right logical line/column even when wrapped.
@@ -3727,7 +3727,7 @@ impl Editor {
         let text_width = self
             .last_inner
             .width
-            .saturating_sub(self.last_gutter_width + 2 + u16::from(self.last_scrollbar.width > 0));
+            .saturating_sub(self.last_gutter_width + 3 + u16::from(self.last_scrollbar.width > 0));
         let visible_col = (col - text_x) as usize;
         if visible_col >= text_width as usize {
             return None;
@@ -4257,7 +4257,7 @@ impl Widget for &mut Editor {
             // Wrapped text folds onto extra rows instead of scrolling sideways.
             self.scroll_col = 0;
         }
-        let text_x = inner.x + gutter_width + 1;
+        let text_x = inner.x + gutter_width + 2;
         let content_cols = self.content_cols();
 
         // Layout has a small cycle: the horizontal bar takes the bottom row
@@ -4272,7 +4272,7 @@ impl Widget for &mut Editor {
         // The horizontal bar never appears in wrap mode (lines fold instead).
         let provisional_text_width = inner
             .width
-            .saturating_sub(gutter_width + 2 + u16::from(self.lines.len() > height))
+            .saturating_sub(gutter_width + 3 + u16::from(self.lines.len() > height))
             as usize;
         let hbar_present =
             !wrap && provisional_text_width > 0 && content_cols > provisional_text_width;
@@ -4291,7 +4291,7 @@ impl Widget for &mut Editor {
         // and scroll position are measured in VISUAL rows (a logical line may
         // span several); otherwise in logical lines, one per row.
         let (text_width, scrollbar_metrics) = if wrap {
-            let wide = inner.width.saturating_sub(gutter_width + 2) as usize;
+            let wide = inner.width.saturating_sub(gutter_width + 3) as usize;
             // Overflow at the wide width forces the vbar, which narrows the
             // column and only ever adds rows, so the decision is stable.
             let vbar = self.total_visual_rows(wide) > text_height;
@@ -4333,7 +4333,7 @@ impl Widget for &mut Editor {
                 self.scroll,
             );
             let sw = u16::from(metrics.is_some());
-            let tw = inner.width.saturating_sub(gutter_width + 2 + sw);
+            let tw = inner.width.saturating_sub(gutter_width + 3 + sw);
             (tw, metrics)
         };
         if let Some(metrics) = scrollbar_metrics {
@@ -4399,20 +4399,25 @@ impl Widget for &mut Editor {
             // The line number shows once per logical line - on its first visual
             // row; wrapped continuation rows get a blank gutter, like VS Code.
             if !wrap || row_start == 0 {
+                // Fill the whole pre-text region (`gutter_width + 2` cells): the
+                // right-aligned number, then trailing spaces. The breakpoint
+                // glyph later overwrites the cell at `gutter_width`, leaving a
+                // blank on each side so it reads " ▶ " centred between the line
+                // number and the code instead of hugging the first word.
                 let line_no = format!(
-                    "{:>width$} ",
+                    "{:>width$}   ",
                     line_idx + 1,
                     width = gutter_width as usize - 1
                 );
                 let gutter =
                     Line::from(Span::styled(line_no, Style::default().fg(Color::DarkGray)));
-                buf.set_line(inner.x, y, &gutter, gutter_width);
+                buf.set_line(inner.x, y, &gutter, gutter_width + 2);
             } else {
                 buf.set_line(
                     inner.x,
                     y,
-                    &Line::from(" ".repeat(gutter_width as usize)),
-                    gutter_width,
+                    &Line::from(" ".repeat(gutter_width as usize + 2)),
+                    gutter_width + 2,
                 );
             }
 
@@ -4598,7 +4603,7 @@ impl Editor {
         if self.last_inner.height == 0 {
             return None;
         }
-        let text_x = self.last_inner.x + self.last_gutter_width + 1;
+        let text_x = self.last_inner.x + self.last_gutter_width + 2;
         if self.wrap_enabled() {
             // Find the visual row holding the cursor in the layout the last
             // render captured (a logical line spans several wrapped rows). A
@@ -4627,7 +4632,7 @@ impl Editor {
         let text_width = self
             .last_inner
             .width
-            .saturating_sub(self.last_gutter_width + 2 + u16::from(self.last_scrollbar.width > 0));
+            .saturating_sub(self.last_gutter_width + 3 + u16::from(self.last_scrollbar.width > 0));
         if text_width == 0 || self.cursor_col < self.scroll_col {
             return None;
         }
@@ -6713,17 +6718,17 @@ mod tests {
         };
         e.last_gutter_width = 2;
         assert_eq!(
-            e.buffer_pos_at(3, 0),
+            e.buffer_pos_at(4, 0),
             Some((0, 0)),
-            "first text cell (text_x = x + gutter + 1 = 3) is char 0 of line 0"
+            "first text cell (text_x = x + gutter + 2 = 4) is char 0 of line 0"
         );
         assert_eq!(
-            e.buffer_pos_at(6, 0),
+            e.buffer_pos_at(7, 0),
             Some((0, 3)),
             "three cells into the text is char 3"
         );
         assert_eq!(
-            e.buffer_pos_at(3, 1),
+            e.buffer_pos_at(4, 1),
             Some((1, 0)),
             "the second screen row is the second buffer line"
         );
@@ -6755,7 +6760,7 @@ mod tests {
         e.last_gutter_width = 2;
         e.scroll = 2;
         assert_eq!(
-            e.buffer_pos_at(3, 0),
+            e.buffer_pos_at(4, 0),
             Some((2, 0)),
             "the top visible row is buffer line scroll = 2"
         );
@@ -6773,12 +6778,12 @@ mod tests {
         e.last_gutter_width = 2;
         e.scroll_col = 5;
         assert_eq!(
-            e.buffer_pos_at(3, 0),
+            e.buffer_pos_at(4, 0),
             Some((0, 5)),
             "the leftmost text cell maps to char scroll_col, not char 0"
         );
         assert_eq!(
-            e.buffer_pos_at(5, 0),
+            e.buffer_pos_at(6, 0),
             Some((0, 7)),
             "two cells right of the left edge is char scroll_col + 2"
         );
@@ -6794,9 +6799,9 @@ mod tests {
             height: 10,
         };
         e.last_gutter_width = 3;
-        assert_eq!(e.buffer_pos_at(14, 4), Some((0, 0)), "text_x = 10 + 3 + 1");
-        assert_eq!(e.buffer_pos_at(16, 4), Some((0, 2)));
-        assert_eq!(e.buffer_pos_at(13, 4), None, "one cell left of text_x");
+        assert_eq!(e.buffer_pos_at(15, 4), Some((0, 0)), "text_x = 10 + 3 + 2");
+        assert_eq!(e.buffer_pos_at(17, 4), Some((0, 2)));
+        assert_eq!(e.buffer_pos_at(14, 4), None, "one cell left of text_x");
     }
 
     #[test]
@@ -8037,7 +8042,7 @@ mod tests {
         let mut buf = Buffer::empty(area);
         (&mut e).render(area, &mut buf);
 
-        let text_x = e.last_inner.x + e.last_gutter_width + 1;
+        let text_x = e.last_inner.x + e.last_gutter_width + 2;
         let cell = &buf[(text_x + 2, e.last_inner.y)];
         assert_eq!(
             cell.symbol(),
@@ -8058,9 +8063,9 @@ mod tests {
         e.last_gutter_width = 2;
         e.cursor_row = 1;
         e.cursor_col = 3;
-        // text_x = inner.x + gutter + 1 = 5 + 2 + 1 = 8
+        // text_x = inner.x + gutter + 2 = 5 + 2 + 2 = 9
         // cy = inner.y + (cursor_row - scroll) = 7 + 1 = 8
-        assert_eq!(e.cursor_screen_pos(), Some((8 + 3, 8)));
+        assert_eq!(e.cursor_screen_pos(), Some((9 + 3, 8)));
     }
 
     #[test]
@@ -8184,7 +8189,7 @@ mod tests {
         };
         let mut buf = Buffer::empty(area);
         (&mut e).render(area, &mut buf);
-        let text_x = e.last_inner.x + e.last_gutter_width + 1;
+        let text_x = e.last_inner.x + e.last_gutter_width + 2;
         let y = e.last_inner.y;
         let yellow = Color::Rgb(0xff, 0xd7, 0x4a);
         // First "needle" starts at char index 6 ("alpha "), 6 chars long.
@@ -8226,7 +8231,7 @@ mod tests {
         };
         let mut buf = Buffer::empty(area);
         (&mut e).render(area, &mut buf);
-        let text_x = e.last_inner.x + e.last_gutter_width + 1;
+        let text_x = e.last_inner.x + e.last_gutter_width + 2;
         let y = e.last_inner.y;
         let occurrence = Color::Rgb(0x37, 0x61, 0x8e);
         let selection = Color::Rgb(0x26, 0x4f, 0x78);
@@ -8270,7 +8275,7 @@ mod tests {
         };
         let mut buf = Buffer::empty(area);
         (&mut e).render(area, &mut buf);
-        let text_x = e.last_inner.x + e.last_gutter_width + 1;
+        let text_x = e.last_inner.x + e.last_gutter_width + 2;
         let y = e.last_inner.y;
         let occurrence = Color::Rgb(0x37, 0x61, 0x8e);
         for col in 0..10u16 {
@@ -8310,7 +8315,7 @@ mod tests {
         };
         let mut buf = Buffer::empty(area);
         (&mut e).render(area, &mut buf);
-        let text_x = e.last_inner.x + e.last_gutter_width + 1;
+        let text_x = e.last_inner.x + e.last_gutter_width + 2;
         let y = e.last_inner.y;
         let yellow = Color::Rgb(0xff, 0xd7, 0x4a);
         for col in 0..18u16 {
@@ -8336,7 +8341,7 @@ mod tests {
         };
         let mut buf = Buffer::empty(area);
         (&mut e).render(area, &mut buf);
-        let text_x = e.last_inner.x + e.last_gutter_width + 1;
+        let text_x = e.last_inner.x + e.last_gutter_width + 2;
         let y = e.last_inner.y;
         let yellow = Color::Rgb(0xff, 0xd7, 0x4a);
         for col in 0..3u16 {
@@ -8828,7 +8833,7 @@ mod tests {
         let text_width = e
             .last_inner
             .width
-            .saturating_sub(e.last_gutter_width + 2 + u16::from(e.last_scrollbar.width > 0))
+            .saturating_sub(e.last_gutter_width + 3 + u16::from(e.last_scrollbar.width > 0))
             as usize;
         assert!(text_width > 0 && text_width < 500);
         // Move cursor to the very first off-screen column.
@@ -8857,7 +8862,7 @@ mod tests {
         };
         let mut buf = ratatui::buffer::Buffer::empty(area);
         (&mut e).render(area, &mut buf);
-        let text_x = e.last_inner.x + e.last_gutter_width + 1;
+        let text_x = e.last_inner.x + e.last_gutter_width + 2;
         assert_eq!(
             buf[(text_x, e.last_inner.y)].symbol(),
             "D",
@@ -8884,7 +8889,7 @@ mod tests {
         let text_width = e
             .last_inner
             .width
-            .saturating_sub(e.last_gutter_width + 2 + u16::from(e.last_scrollbar.width > 0))
+            .saturating_sub(e.last_gutter_width + 3 + u16::from(e.last_scrollbar.width > 0))
             as usize;
         assert!(text_width > 0);
         assert_eq!(
@@ -9023,7 +9028,7 @@ mod tests {
         let mut e = md_editor(&"a".repeat(100));
         render_at(&mut e, 30, 10);
         let seg0_end = e.last_wrap_rows[0].2;
-        let text_x = e.last_inner.x + e.last_gutter_width + 1;
+        let text_x = e.last_inner.x + e.last_gutter_width + 2;
         let (line, col) = e
             .buffer_pos_at(text_x, e.last_inner.y + 1)
             .expect("a click on the second visual row is a text hit");
@@ -9085,7 +9090,7 @@ mod tests {
         (&mut e).render(area, &mut buf);
 
         // gutter for 1 line: "1 ".len() = 2 → text_x = 0+1+2+1 = 4
-        let text_x = e.last_inner.x + e.last_gutter_width + 1;
+        let text_x = e.last_inner.x + e.last_gutter_width + 2;
         let selected_bg = Color::Rgb(0x26, 0x4f, 0x78);
         // chars 0..5 should be highlighted
         for col in 0..5u16 {
@@ -9121,7 +9126,7 @@ mod tests {
         let mut buf = Buffer::empty(area);
         (&mut e).render(area, &mut buf);
 
-        let text_x = e.last_inner.x + e.last_gutter_width + 1;
+        let text_x = e.last_inner.x + e.last_gutter_width + 2;
         let selected_bg = Color::Rgb(0x26, 0x4f, 0x78);
 
         // Row 0: cols 2..end (all the way past the end of "first")
@@ -9194,7 +9199,7 @@ mod tests {
             height: 25,
         };
         e.last_gutter_width = 2;
-        let text_x: u16 = 3;
+        let text_x: u16 = 4;
         e.select_word_at(text_x + 5, 0);
         assert!(
             e.selection.map(|s| !s.has_area()).unwrap_or(true),
@@ -9212,7 +9217,7 @@ mod tests {
             height: 25,
         };
         e.last_gutter_width = 2;
-        let text_x: u16 = 3;
+        let text_x: u16 = 4;
         e.select_word_at(text_x + 12, 0);
         let sel = e.selection.unwrap();
         assert_eq!(sel.normalised(), ((0, 0), (0, 3)));
@@ -9668,7 +9673,7 @@ mod tests {
             height: 25,
         };
         e.last_gutter_width = 2;
-        let text_x: u16 = 3;
+        let text_x: u16 = 4;
         e.mouse_down(text_x, 0);
         e.mouse_drag(text_x + 5, 0);
         let sel = e.selection.unwrap();
