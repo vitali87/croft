@@ -5792,6 +5792,11 @@ impl App {
             }
             return Ok(());
         }
+        // F6 pause (mirrors VS Code's Pause key).
+        if matches!(key.code, KeyCode::F(6)) {
+            self.debug_pause();
+            return Ok(());
+        }
         if matches!(key.code, KeyCode::F(9)) {
             self.debug_toggle_breakpoint();
             return Ok(());
@@ -6732,6 +6737,26 @@ impl App {
         } else {
             String::from("Breaking on uncaught exceptions only")
         };
+    }
+
+    /// F6: interrupt a running program so it stops at the current line.
+    pub fn debug_pause(&mut self) {
+        match self.dap_session.as_mut() {
+            Some(session) => {
+                session.pause();
+                self.status = String::from("Pausing…");
+            }
+            None => self.status = String::from("No debug session to pause"),
+        }
+    }
+
+    /// Restart: tear down the current session and relaunch the active file with
+    /// the same breakpoints.
+    pub fn debug_restart(&mut self) {
+        if self.dap_session.is_some() {
+            self.debug_stop();
+        }
+        self.start_debug_session();
     }
 
     /// Shift+F5: stop debugging and tear the session down.
@@ -10229,6 +10254,8 @@ impl App {
             },
             Cmd::StartDebugging => self.debug_start_or_continue(),
             Cmd::StopDebugging => self.debug_stop(),
+            Cmd::PauseDebugging => self.debug_pause(),
+            Cmd::RestartDebugging => self.debug_restart(),
             Cmd::ToggleBreakpoint => self.debug_toggle_breakpoint(),
             Cmd::EditBreakpointCondition => self.debug_edit_condition(),
             Cmd::StepOver => self.debug_step("next"),

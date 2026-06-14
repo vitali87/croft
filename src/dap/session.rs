@@ -501,6 +501,9 @@ pub struct DapSession {
     /// Sent on `initialized` and whenever toggled. Defaults to `uncaught` so an
     /// unhandled exception pauses the debugger instead of silently exiting.
     pub exception_filters: Vec<String>,
+    /// Most recently seen thread id (from `thread`/`stopped` events). Used to
+    /// target `pause` while the program is running and `stopped_thread` is None.
+    known_thread: Option<i64>,
 }
 
 impl DapSession {
@@ -535,7 +538,16 @@ impl DapSession {
             pending_var_refs: std::collections::HashMap::new(),
             pending_evals: std::collections::HashMap::new(),
             exception_filters: vec![String::from("uncaught")],
+            known_thread: None,
         })
+    }
+
+    /// Interrupt a running program (`pause`), targeting the most recently known
+    /// thread. No-op if no thread is known yet.
+    pub fn pause(&mut self) {
+        if let Some(tid) = self.stopped_thread.or(self.known_thread) {
+            let _ = self.transport.send(thread_request("pause", tid));
+        }
     }
 
     /// Replace the active exception-breakpoint filters, resending immediately so
@@ -700,6 +712,18 @@ impl DapSession {
                 }
                 continue;
             }
+            // `thread` events announce thread ids; remember the latest so we can
+            // target `pause` while the program is running.
+            if msg.get("event").and_then(Value::as_str) == Some("thread") {
+                if let Some(tid) = msg
+                    .get("body")
+                    .and_then(|b| b.get("threadId"))
+                    .and_then(Value::as_i64)
+                {
+                    self.known_thread = Some(tid);
+                }
+                continue;
+            }
             // `breakpoint` events carry late-resolved verification updates.
             if msg.get("event").and_then(Value::as_str) == Some("breakpoint") {
                 let reports = breakpoint_reports(&msg);
@@ -722,6 +746,7 @@ impl DapSession {
                 }
                 DapEvent::Stopped { thread_id, .. } => {
                     self.stopped_thread = Some(*thread_id);
+                    self.known_thread = Some(*thread_id);
                     self.phase = SessionPhase::Stopped;
                     // Frame ids / variable references from a prior stop are stale.
                     self.clear_inspection();
