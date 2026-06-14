@@ -2552,6 +2552,11 @@ impl App {
     /// applied so the main loop knows to redraw. Cheap when the rx is
     /// empty: a single non-blocking try_recv.
     pub fn drain_sysmon(&mut self) -> bool {
+        // Only collect system metrics while the SYSTEM panel is actually showing
+        // them: collapsed (the default) or hidden means the sampler thread idles.
+        let collecting =
+            !self.system_panel.hidden && !self.system_panel.last_effective_collapsed;
+        self.sysmon.set_active(collecting);
         self.sysmon.drain(&mut self.system_panel)
     }
 

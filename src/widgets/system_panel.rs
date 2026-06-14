@@ -52,9 +52,12 @@ pub struct SystemPanel {
 impl SystemPanel {
     pub fn new() -> Self {
         Self {
-            user_override: None,
+            // Collapsed by default (VS Code parity): show only the SYSTEM header
+            // until the user expands it, so the live metrics never distract and
+            // sampling stays idle until asked for.
+            user_override: Some(true),
             hidden: false,
-            last_effective_collapsed: false,
+            last_effective_collapsed: true,
             latest: None,
             last_area: Rect::default(),
             last_header_row: 0,
@@ -416,8 +419,18 @@ mod tests {
     }
 
     #[test]
-    fn desired_height_auto_downgrades_when_sidebar_short() {
+    fn collapsed_by_default_even_with_ample_room() {
+        // Matches VS Code: the SYSTEM section starts collapsed (just its header)
+        // so the metrics don't distract; the user expands it from the header.
         let p = SystemPanel::new();
+        assert_eq!(p.desired_height(60), COLLAPSED_HEIGHT);
+    }
+
+    #[test]
+    fn desired_height_auto_downgrades_when_sidebar_short() {
+        let mut p = SystemPanel::new();
+        // Clear the collapsed-by-default override to exercise the auto sizing.
+        p.user_override = None;
         assert_eq!(p.desired_height(60), EXPANDED_HEIGHT);
         assert_eq!(p.desired_height(20), COLLAPSED_HEIGHT);
         assert_eq!(p.desired_height(10), 0);
@@ -475,6 +488,7 @@ mod tests {
     #[test]
     fn temp_row_sits_just_above_bottom_border() {
         let mut p = SystemPanel::new();
+        p.user_override = Some(false); // expand to exercise the full layout
         p.apply_sample(SystemSample {
             cpu_pct: 10,
             mem_pct: 20,
@@ -511,6 +525,7 @@ mod tests {
     #[test]
     fn content_is_indented_to_align_with_box_above() {
         let mut p = SystemPanel::new();
+        p.user_override = Some(false); // expand to exercise the full layout
         p.apply_sample(SystemSample {
             cpu_pct: 10,
             mem_pct: 20,

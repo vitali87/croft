@@ -1,3 +1,5 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
 
@@ -14,19 +16,35 @@ pub struct SystemSample {
 
 const SAMPLE_INTERVAL: Duration = Duration::from_millis(1000);
 
-pub fn system_monitor_loop(tx: Sender<SystemSample>) {
+pub fn system_monitor_loop(tx: Sender<SystemSample>, active: Arc<AtomicBool>) {
     let mut sys = System::new();
     let mut nets = Networks::new_with_refreshed_list();
     let mut comps = Components::new_with_refreshed_list();
 
-    sys.refresh_memory();
-    sys.refresh_cpu_usage();
-    std::thread::sleep(MINIMUM_CPU_UPDATE_INTERVAL);
-
     let mut last_net_total: u64 = sum_net_bytes(&nets);
     let mut last_tick = Instant::now();
+    // Collection is gated by `active`: while the SYSTEM panel is collapsed the
+    // loop does no work at all (no sysinfo refresh, no send). `primed` tracks
+    // whether baselines are fresh; on the collapsed -> expanded edge we re-prime
+    // so the first emitted sample is a clean ~1s window rather than an average
+    // over the whole idle gap.
+    let mut primed = false;
 
     loop {
+        if !active.load(Ordering::Relaxed) {
+            primed = false;
+            std::thread::sleep(SAMPLE_INTERVAL);
+            continue;
+        }
+        if !primed {
+            sys.refresh_memory();
+            sys.refresh_cpu_usage();
+            nets.refresh(true);
+            std::thread::sleep(MINIMUM_CPU_UPDATE_INTERVAL);
+            last_net_total = sum_net_bytes(&nets);
+            last_tick = Instant::now();
+            primed = true;
+        }
         sys.refresh_cpu_usage();
         sys.refresh_memory();
         nets.refresh(true);
