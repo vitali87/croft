@@ -1140,7 +1140,8 @@ pub struct Editor {
     /// Breakpoint lines the adapter reported as NOT verified (could not bind,
     /// e.g. a blank/comment line). Rendered as a hollow ○ instead of a solid ●
     /// so the user sees the breakpoint is inert. Keyed by path.
-    pub unverified_breakpoints: std::collections::HashMap<PathBuf, std::collections::BTreeSet<usize>>,
+    pub unverified_breakpoints:
+        std::collections::HashMap<PathBuf, std::collections::BTreeSet<usize>>,
     /// Optional condition expression per breakpoint line (path -> line ->
     /// condition). A conditional breakpoint only pauses when the expression is
     /// true. Rendered with a distinct gutter glyph.

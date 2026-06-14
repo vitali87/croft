@@ -34,7 +34,11 @@ pub enum DebugRowKind {
     /// A scope container row ("Locals", "Globals").
     Scope,
     /// A variable; `reference > 0` means expandable, `expanded` tracks state.
-    Variable { reference: i64, expandable: bool, expanded: bool },
+    Variable {
+        reference: i64,
+        expandable: bool,
+        expanded: bool,
+    },
 }
 
 /// One rendered line of the paused-state debug tree. The app builds these from
@@ -171,7 +175,11 @@ impl RunDebugPanel {
         let rows_bottom = bottom.saturating_sub(reserved);
         let rows_area_h = (rows_bottom.saturating_sub(y)) as usize;
         self.last_debug_row_y0 = y;
-        let visible = self.debug_rows.iter().skip(self.debug_scroll).take(rows_area_h);
+        let visible = self
+            .debug_rows
+            .iter()
+            .skip(self.debug_scroll)
+            .take(rows_area_h);
         let mut shown = 0usize;
         for row in visible {
             let row_y = y + shown as u16;
@@ -197,7 +205,14 @@ impl RunDebugPanel {
                     } else {
                         Style::default().fg(Color::Rgb(BODY_FG_RGB.0, BODY_FG_RGB.1, BODY_FG_RGB.2))
                     };
-                    (if *selected { "▸ ".to_string() } else { "  ".to_string() }, s)
+                    (
+                        if *selected {
+                            "▸ ".to_string()
+                        } else {
+                            "  ".to_string()
+                        },
+                        s,
+                    )
                 }
                 DebugRowKind::Scope => (
                     String::new(),
@@ -205,13 +220,28 @@ impl RunDebugPanel {
                         .fg(Color::Rgb(0x9c, 0xa8, 0xbe))
                         .add_modifier(Modifier::BOLD),
                 ),
-                DebugRowKind::Variable { expandable, expanded, .. } => {
+                DebugRowKind::Variable {
+                    expandable,
+                    expanded,
+                    ..
+                } => {
                     let p = if *expandable {
-                        if *expanded { "▾ ".to_string() } else { "▸ ".to_string() }
+                        if *expanded {
+                            "▾ ".to_string()
+                        } else {
+                            "▸ ".to_string()
+                        }
                     } else {
                         "  ".to_string()
                     };
-                    (p, Style::default().fg(Color::Rgb(BODY_FG_RGB.0, BODY_FG_RGB.1, BODY_FG_RGB.2)))
+                    (
+                        p,
+                        Style::default().fg(Color::Rgb(
+                            BODY_FG_RGB.0,
+                            BODY_FG_RGB.1,
+                            BODY_FG_RGB.2,
+                        )),
+                    )
                 }
             };
             let text = format!("{prefix}{}", row.text);
@@ -233,15 +263,22 @@ impl RunDebugPanel {
                 .rev()
                 .take(console_h as usize)
                 .rev();
-            let style = Style::default().fg(Color::Rgb(BODY_FG_RGB.0, BODY_FG_RGB.1, BODY_FG_RGB.2));
+            let style =
+                Style::default().fg(Color::Rgb(BODY_FG_RGB.0, BODY_FG_RGB.1, BODY_FG_RGB.2));
             for (i, line) in tail.enumerate() {
-                let truncated: String = line.chars().take(inner.width.saturating_sub(1) as usize).collect();
+                let truncated: String = line
+                    .chars()
+                    .take(inner.width.saturating_sub(1) as usize)
+                    .collect();
                 buf.set_string(inner.x + 1, console_y0 + i as u16, &truncated, style);
             }
         }
         // REPL prompt: "❯ <input>".
         let prompt = format!("❯ {}", self.repl_input);
-        let truncated: String = prompt.chars().take(inner.width.saturating_sub(1) as usize).collect();
+        let truncated: String = prompt
+            .chars()
+            .take(inner.width.saturating_sub(1) as usize)
+            .collect();
         buf.set_string(
             inner.x + 1,
             prompt_y,
@@ -466,26 +503,54 @@ mod tests {
         panel.debug_active = true;
         panel.debug_status = String::from("Paused (breakpoint)");
         panel.debug_rows = vec![
-            DebugRow { indent: 0, text: "CALL STACK".into(), kind: DebugRowKind::Header },
+            DebugRow {
+                indent: 0,
+                text: "CALL STACK".into(),
+                kind: DebugRowKind::Header,
+            },
             DebugRow {
                 indent: 1,
                 text: "isValid (app.py:12)".into(),
-                kind: DebugRowKind::Frame { id: 1000, selected: true },
+                kind: DebugRowKind::Frame {
+                    id: 1000,
+                    selected: true,
+                },
             },
-            DebugRow { indent: 0, text: "VARIABLES".into(), kind: DebugRowKind::Header },
-            DebugRow { indent: 1, text: "Locals".into(), kind: DebugRowKind::Scope },
+            DebugRow {
+                indent: 0,
+                text: "VARIABLES".into(),
+                kind: DebugRowKind::Header,
+            },
+            DebugRow {
+                indent: 1,
+                text: "Locals".into(),
+                kind: DebugRowKind::Scope,
+            },
             DebugRow {
                 indent: 2,
                 text: "x = 1".into(),
-                kind: DebugRowKind::Variable { reference: 0, expandable: false, expanded: false },
+                kind: DebugRowKind::Variable {
+                    reference: 0,
+                    expandable: false,
+                    expanded: false,
+                },
             },
             DebugRow {
                 indent: 2,
                 text: "obj = <Foo>".into(),
-                kind: DebugRowKind::Variable { reference: 9, expandable: true, expanded: false },
+                kind: DebugRowKind::Variable {
+                    reference: 9,
+                    expandable: true,
+                    expanded: false,
+                },
             },
         ];
-        let area = Rect { x: 0, y: 0, width: 40, height: 24 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 24,
+        };
         let mut buf = Buffer::empty(area);
         Widget::render(&mut panel, area, &mut buf);
         let dump = buffer_to_string(&buf);
@@ -493,7 +558,10 @@ mod tests {
         assert!(dump.contains("VARIABLES"), "variables header:\n{dump}");
         assert!(dump.contains("isValid (app.py:12)"), "frame row:\n{dump}");
         assert!(dump.contains("x = 1"), "variable row:\n{dump}");
-        assert!(dump.contains("▸ obj = <Foo>"), "expandable chevron:\n{dump}");
+        assert!(
+            dump.contains("▸ obj = <Foo>"),
+            "expandable chevron:\n{dump}"
+        );
         // The empty-state Run button must NOT be laid out while debugging.
         assert_eq!(panel.last_button_area, Rect::default());
         // Click mapping: first row sits at last_debug_row_y0.
@@ -515,11 +583,19 @@ mod tests {
         }];
         panel.console_tail = vec!["hello from program".into(), "42".into()];
         panel.repl_input = String::from("x + 1");
-        let area = Rect { x: 0, y: 0, width: 40, height: 24 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 24,
+        };
         let mut buf = Buffer::empty(area);
         Widget::render(&mut panel, area, &mut buf);
         let dump = buffer_to_string(&buf);
-        assert!(dump.contains("hello from program"), "console output:\n{dump}");
+        assert!(
+            dump.contains("hello from program"),
+            "console output:\n{dump}"
+        );
         assert!(dump.contains("❯ x + 1"), "repl prompt with input:\n{dump}");
     }
 

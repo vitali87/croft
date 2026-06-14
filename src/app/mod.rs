@@ -135,9 +135,7 @@ fn push_variable_rows(
                 expanded: is_open,
             },
         });
-        if is_open
-            && let Some(children) = session.variables.get(&v.variables_ref)
-        {
+        if is_open && let Some(children) = session.variables.get(&v.variables_ref) {
             push_variable_rows(rows, session, expanded, children, indent.saturating_add(1));
         }
     }
@@ -2554,8 +2552,7 @@ impl App {
     pub fn drain_sysmon(&mut self) -> bool {
         // Only collect system metrics while the SYSTEM panel is actually showing
         // them: collapsed (the default) or hidden means the sampler thread idles.
-        let collecting =
-            !self.system_panel.hidden && !self.system_panel.last_effective_collapsed;
+        let collecting = !self.system_panel.hidden && !self.system_panel.last_effective_collapsed;
         self.sysmon.set_active(collecting);
         self.sysmon.drain(&mut self.system_panel)
     }
@@ -2930,7 +2927,10 @@ impl App {
         if let Some(text) = self.debug_hover_value(line, c) {
             self.hover_request_id = None;
             self.hover_diagnostic = None;
-            self.hover_popup = Some(crate::widgets::hover_popup::HoverPopup::new(text, (col, row)));
+            self.hover_popup = Some(crate::widgets::hover_popup::HoverPopup::new(
+                text,
+                (col, row),
+            ));
             return;
         }
         // Server diagnostics are already in the editor, so capture the
@@ -6610,8 +6610,9 @@ impl App {
                 return;
             }
             None => {
-                self.run_debug.feedback =
-                    Some(format!("No debugger for .{ext} files (Python is supported)"));
+                self.run_debug.feedback = Some(format!(
+                    "No debugger for .{ext} files (Python is supported)"
+                ));
                 self.run_debug.feedback_is_error = true;
                 return;
             }
@@ -6707,7 +6708,8 @@ impl App {
                     .unwrap_or_default();
                 self.run_debug.feedback = Some(format!("Debugging {name} (lldb)"));
                 self.run_debug.feedback_is_error = false;
-                self.status = format!("Debugging {name} via lldb-dap — F5 continue · Shift+F5 stop");
+                self.status =
+                    format!("Debugging {name} via lldb-dap — F5 continue · Shift+F5 stop");
             }
             Err(e) => {
                 self.run_debug.feedback = Some(format!("Failed to start lldb-dap: {e}"));

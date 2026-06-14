@@ -101,10 +101,7 @@ pub fn breakpoint_reports(msg: &Value) -> Vec<BreakpointReport> {
             Some(BreakpointReport {
                 path: PathBuf::from(path),
                 line: line as usize,
-                verified: bp
-                    .get("verified")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false),
+                verified: bp.get("verified").and_then(Value::as_bool).unwrap_or(false),
             })
         })
         .collect()
@@ -722,8 +719,7 @@ impl DapSession {
                     Some("scopes") => {
                         self.scopes = parse_scopes(&msg);
                         // Fetch each scope's variables.
-                        let refs: Vec<i64> =
-                            self.scopes.iter().map(|s| s.variables_ref).collect();
+                        let refs: Vec<i64> = self.scopes.iter().map(|s| s.variables_ref).collect();
                         for r in refs {
                             self.request_variables(r);
                         }
@@ -928,10 +924,8 @@ mod tests {
 
     #[test]
     fn set_exception_breakpoints_request_lists_filters() {
-        let req = set_exception_breakpoints_request(&[
-            String::from("uncaught"),
-            String::from("raised"),
-        ]);
+        let req =
+            set_exception_breakpoints_request(&[String::from("uncaught"), String::from("raised")]);
         assert_eq!(req["command"], "setExceptionBreakpoints");
         assert_eq!(req["arguments"]["filters"][0], "uncaught");
         assert_eq!(req["arguments"]["filters"][1], "raised");
@@ -1013,8 +1007,16 @@ mod tests {
         let changed = fold_breakpoint_reports(
             &mut map,
             &[
-                BreakpointReport { path: p.clone(), line: 3, verified: true },
-                BreakpointReport { path: p.clone(), line: 7, verified: false },
+                BreakpointReport {
+                    path: p.clone(),
+                    line: 3,
+                    verified: true,
+                },
+                BreakpointReport {
+                    path: p.clone(),
+                    line: 7,
+                    verified: false,
+                },
             ],
         );
         assert!(changed);
@@ -1025,7 +1027,11 @@ mod tests {
         // A later report verifying line 7 clears it (and the now-empty entry).
         let changed = fold_breakpoint_reports(
             &mut map,
-            &[BreakpointReport { path: p.clone(), line: 7, verified: true }],
+            &[BreakpointReport {
+                path: p.clone(),
+                line: 7,
+                verified: true,
+            }],
         );
         assert!(changed);
         assert!(!map.contains_key(&p));
@@ -1155,7 +1161,10 @@ mod tests {
         assert_eq!(vars[0].value, "1");
         assert_eq!(vars[0].type_name, "int");
         assert_eq!(vars[0].variables_ref, 0);
-        assert_eq!(vars[1].variables_ref, 9, "expandable variable keeps its ref");
+        assert_eq!(
+            vars[1].variables_ref, 9,
+            "expandable variable keeps its ref"
+        );
     }
 
     /// End-to-end against a real debugpy adapter: launch a script with a
@@ -1256,7 +1265,10 @@ mod tests {
             .collect();
         sess.disconnect();
 
-        assert!(!frames.is_empty(), "call stack must be populated at the stop");
+        assert!(
+            !frames.is_empty(),
+            "call stack must be populated at the stop"
+        );
         assert!(have_locals, "locals x and y must arrive via the chain");
         assert!(xy.contains(&("x".to_string(), "1".to_string())));
         assert!(xy.contains(&("y".to_string(), "2".to_string())));
@@ -1380,7 +1392,10 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
         sess.disconnect();
-        assert!(stopped, "breakpoint via symlinked path must still bind+stop");
+        assert!(
+            stopped,
+            "breakpoint via symlinked path must still bind+stop"
+        );
         let (loc, line) = sess.current_location.clone().expect("a paused location");
         assert_eq!(line, 3);
         // debugpy echoes the launched (symlinked) path, NOT the canonical one.
