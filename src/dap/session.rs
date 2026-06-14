@@ -179,15 +179,40 @@ pub fn launch_request(program: &Path, interpreter: &Path, stop_on_entry: bool) -
     })
 }
 
-/// Build a `setBreakpoints` request body for one source file.
-pub fn set_breakpoints_request(path: &Path, lines: &[u32]) -> Value {
-    let breakpoints: Vec<Value> = lines.iter().map(|l| json!({ "line": l })).collect();
+/// A breakpoint to set on a source line, with an optional `condition` (a boolean
+/// expression the adapter evaluates; the breakpoint only pauses when it's true).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceBreakpoint {
+    pub line: u32,
+    pub condition: Option<String>,
+}
+
+impl SourceBreakpoint {
+    pub fn plain(line: u32) -> Self {
+        Self {
+            line,
+            condition: None,
+        }
+    }
+}
+
+/// Build a `setBreakpoints` request body for one source file, carrying any
+/// per-breakpoint `condition`.
+pub fn set_breakpoints_request(path: &Path, breakpoints: &[SourceBreakpoint]) -> Value {
+    let bps: Vec<Value> = breakpoints
+        .iter()
+        .map(|b| match &b.condition {
+            Some(c) => json!({ "line": b.line, "condition": c }),
+            None => json!({ "line": b.line }),
+        })
+        .collect();
+    let lines: Vec<u32> = breakpoints.iter().map(|b| b.line).collect();
     json!({
         "type": "request",
         "command": "setBreakpoints",
         "arguments": {
             "source": { "path": path.to_string_lossy() },
-            "breakpoints": breakpoints,
+            "breakpoints": bps,
             "lines": lines
         }
     })
@@ -443,8 +468,8 @@ pub struct DapSession {
     transport: DapTransport,
     pub phase: SessionPhase,
     /// Breakpoints to push once the adapter is `initialized`, keyed by absolute
-    /// file path.
-    breakpoints: BTreeMap<PathBuf, Vec<u32>>,
+    /// file path (with optional per-breakpoint conditions).
+    breakpoints: BTreeMap<PathBuf, Vec<SourceBreakpoint>>,
     /// Thread id reported by the most recent `stopped` event.
     pub stopped_thread: Option<i64>,
     /// File + 1-based line the debugger is paused on, resolved from the
@@ -490,7 +515,7 @@ impl DapSession {
         cwd: &Path,
         program: &Path,
         interpreter: &Path,
-        breakpoints: BTreeMap<PathBuf, Vec<u32>>,
+        breakpoints: BTreeMap<PathBuf, Vec<SourceBreakpoint>>,
         stop_on_entry: bool,
     ) -> Result<DapSession> {
         let transport = DapTransport::spawn(adapter_program, adapter_args, cwd)?;
@@ -743,8 +768,10 @@ impl DapSession {
     /// Push an updated breakpoint set for one file mid-session (debugpy accepts
     /// `setBreakpoints` at any time), so toggling a breakpoint while paused or
     /// running takes effect without a restart.
-    pub fn update_breakpoints(&mut self, path: &Path, lines: &[u32]) {
-        let _ = self.transport.send(set_breakpoints_request(path, lines));
+    pub fn update_breakpoints(&mut self, path: &Path, breakpoints: &[SourceBreakpoint]) {
+        let _ = self
+            .transport
+            .send(set_breakpoints_request(path, breakpoints));
     }
 
     /// Step over (`next`), into (`stepIn`), or out (`stepOut`).
@@ -936,13 +963,24 @@ mod tests {
 
     #[test]
     fn set_breakpoints_request_maps_lines_to_objects() {
-        let req = set_breakpoints_request(Path::new("/a/b.py"), &[2, 7]);
+        let req = set_breakpoints_request(
+            Path::new("/a/b.py"),
+            &[
+                SourceBreakpoint::plain(2),
+                SourceBreakpoint {
+                    line: 7,
+                    condition: Some(String::from("i > 3")),
+                },
+            ],
+        );
         assert_eq!(req["command"], "setBreakpoints");
         assert_eq!(req["arguments"]["source"]["path"], "/a/b.py");
         let bps = req["arguments"]["breakpoints"].as_array().unwrap();
         assert_eq!(bps.len(), 2);
         assert_eq!(bps[0]["line"], 2);
+        assert!(bps[0].get("condition").is_none());
         assert_eq!(bps[1]["line"], 7);
+        assert_eq!(bps[1]["condition"], "i > 3");
     }
 
     #[test]
@@ -1037,7 +1075,7 @@ mod tests {
         let path = f.path().canonicalize().unwrap();
 
         let mut bps = BTreeMap::new();
-        bps.insert(path.clone(), vec![3u32]); // break on `z = x + y`
+        bps.insert(path.clone(), vec![SourceBreakpoint::plain(3)]); // break on `z = x + y`
         let mut sess = DapSession::launch(
             &py.to_string_lossy(),
             &["-m".to_string(), "debugpy.adapter".to_string()],
@@ -1080,7 +1118,7 @@ mod tests {
         writeln!(f, "x = 1\ny = 2\nz = x + y\nprint(z)").unwrap();
         let path = f.path().canonicalize().unwrap();
         let mut bps = BTreeMap::new();
-        bps.insert(path.clone(), vec![3u32]);
+        bps.insert(path.clone(), vec![SourceBreakpoint::plain(3)]);
         let mut sess = DapSession::launch(
             &py.to_string_lossy(),
             &["-m".to_string(), "debugpy.adapter".to_string()],
@@ -1159,7 +1197,7 @@ mod tests {
         );
 
         let mut bps = BTreeMap::new();
-        bps.insert(via_link.clone(), vec![3u32]);
+        bps.insert(via_link.clone(), vec![SourceBreakpoint::plain(3)]);
         let mut sess = DapSession::launch(
             &py.to_string_lossy(),
             &["-m".to_string(), "debugpy.adapter".to_string()],

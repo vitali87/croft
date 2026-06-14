@@ -1141,6 +1141,11 @@ pub struct Editor {
     /// e.g. a blank/comment line). Rendered as a hollow ○ instead of a solid ●
     /// so the user sees the breakpoint is inert. Keyed by path.
     pub unverified_breakpoints: std::collections::HashMap<PathBuf, std::collections::BTreeSet<usize>>,
+    /// Optional condition expression per breakpoint line (path -> line ->
+    /// condition). A conditional breakpoint only pauses when the expression is
+    /// true. Rendered with a distinct gutter glyph.
+    pub breakpoint_conditions:
+        std::collections::HashMap<PathBuf, std::collections::HashMap<usize, String>>,
     /// Monotonic counter that bumps on every buffer mutation. The App's
     /// per-tick sync_lsp diff reads this to know when to forward a
     /// did_change to the LSP server, so building lines.join("\n") only
@@ -1311,6 +1316,7 @@ impl Editor {
             breakpoints: std::collections::HashMap::new(),
             stop_line: None,
             unverified_breakpoints: std::collections::HashMap::new(),
+            breakpoint_conditions: std::collections::HashMap::new(),
             edit_seq: 0,
             scroll: 0,
             scroll_sub: 0,
@@ -1388,6 +1394,24 @@ impl Editor {
             .get(path)
             .map(|s| s.iter().map(|&l| l as u32).collect())
             .unwrap_or_default()
+    }
+
+    /// Breakpoints for `path` as DAP `SourceBreakpoint`s, attaching any stored
+    /// per-line condition. `lines` is the path's breakpoint set (passed in to
+    /// avoid a second lookup at the call site).
+    pub fn source_breakpoints(
+        &self,
+        path: &Path,
+        lines: &std::collections::BTreeSet<usize>,
+    ) -> Vec<crate::dap::session::SourceBreakpoint> {
+        let conds = self.breakpoint_conditions.get(path);
+        lines
+            .iter()
+            .map(|&l| crate::dap::session::SourceBreakpoint {
+                line: l as u32,
+                condition: conds.and_then(|c| c.get(&l)).cloned(),
+            })
+            .collect()
     }
 
     fn mark_buffer_changed(&mut self) {
@@ -4410,6 +4434,10 @@ impl Widget for &mut Editor {
                     .unverified_breakpoints
                     .get(path)
                     .is_some_and(|s| s.contains(&here));
+                let is_conditional = self
+                    .breakpoint_conditions
+                    .get(path)
+                    .is_some_and(|c| c.contains_key(&here));
                 if is_stop {
                     buf.set_string(
                         inner.x,
@@ -4418,10 +4446,13 @@ impl Widget for &mut Editor {
                         Style::default().fg(Color::Rgb(0xff, 0xcc, 0x00)),
                     );
                 } else if is_bp {
-                    // Hollow, dimmed ring when the adapter could not bind it
-                    // (inert breakpoint); solid red dot when it is live.
+                    // Hollow dimmed ring when the adapter could not bind it; a
+                    // diamond for a conditional breakpoint; a solid red dot for a
+                    // plain, live one.
                     let (glyph, color) = if is_unverified {
                         ("○", Color::Rgb(0x99, 0x99, 0x99))
+                    } else if is_conditional {
+                        ("◆", Color::Rgb(0xe5, 0x1c, 0x23))
                     } else {
                         ("●", Color::Rgb(0xe5, 0x1c, 0x23))
                     };
@@ -5744,6 +5775,25 @@ mod tests {
     fn toggle_breakpoint_without_open_file_is_noop() {
         let mut e = Editor::new();
         assert_eq!(e.toggle_breakpoint(), None);
+    }
+
+    #[test]
+    fn source_breakpoints_attach_conditions() {
+        let mut e = Editor::new();
+        let p = PathBuf::from("/x/a.py");
+        let mut lines = std::collections::BTreeSet::new();
+        lines.insert(3usize);
+        lines.insert(5usize);
+        e.breakpoint_conditions
+            .entry(p.clone())
+            .or_default()
+            .insert(5, String::from("i == 10"));
+        let specs = e.source_breakpoints(&p, &lines);
+        assert_eq!(specs.len(), 2);
+        assert_eq!(specs[0].line, 3);
+        assert_eq!(specs[0].condition, None);
+        assert_eq!(specs[1].line, 5);
+        assert_eq!(specs[1].condition.as_deref(), Some("i == 10"));
     }
 
     #[test]

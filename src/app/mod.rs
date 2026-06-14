@@ -1158,6 +1158,9 @@ pub struct App {
     /// Debug console log: program stdout/stderr (DAP output events) plus REPL
     /// echoes and results. Capped; the tail is shown in the Run & Debug panel.
     pub debug_console: Vec<String>,
+    /// Active breakpoint-condition editor: (path, 1-based line, input buffer).
+    /// While Some, keystrokes edit the condition; Enter saves, Esc cancels.
+    pub debug_condition_input: Option<(PathBuf, usize, String)>,
     /// zoxide-backed Explorer jump popup (Cmd+Z). None when closed. Opens
     /// only from the Explorer pane, so it never collides with the editor's
     /// Cmd+Z undo.
@@ -1619,6 +1622,7 @@ impl App {
             dap_session: None,
             debug_expanded: std::collections::HashSet::new(),
             debug_console: Vec::new(),
+            debug_condition_input: None,
             zoxide_jump: None,
             file_finder_index: None,
             file_finder_index_rx: Some(file_finder_index_rx),
@@ -5732,6 +5736,12 @@ impl App {
         self.hover_popup = None;
         self.hover_diagnostic = None;
         self.hover_request_id = None;
+        // The breakpoint-condition editor is a modal text input: it captures
+        // every key until Enter/Esc.
+        if self.debug_condition_input.is_some() {
+            self.debug_condition_input_key(key);
+            return Ok(());
+        }
         if self.connect_dialog.is_some() {
             self.handle_connect_dialog_key(key);
             return Ok(());
@@ -6563,11 +6573,11 @@ impl App {
                 return;
             }
         };
-        let breakpoints: BTreeMap<PathBuf, Vec<u32>> = self
+        let breakpoints: BTreeMap<PathBuf, Vec<crate::dap::session::SourceBreakpoint>> = self
             .editor
             .breakpoints
             .iter()
-            .map(|(p, lines)| (p.clone(), lines.iter().map(|&l| l as u32).collect()))
+            .map(|(p, lines)| (p.clone(), self.editor.source_breakpoints(p, lines)))
             .collect();
         let adapter_args = vec![String::from("-m"), String::from("debugpy.adapter")];
         let py_str = py.to_string_lossy().into_owned();
@@ -6609,11 +6619,90 @@ impl App {
             }
         }
         if let Some(path) = self.editor.path.clone() {
-            let lines = self.editor.breakpoint_lines(&path);
+            let specs = self
+                .editor
+                .breakpoints
+                .get(&path)
+                .map(|lines| self.editor.source_breakpoints(&path, lines))
+                .unwrap_or_default();
             if let Some(session) = self.dap_session.as_mut() {
-                session.update_breakpoints(&path, &lines);
+                session.update_breakpoints(&path, &specs);
             }
         }
+    }
+
+    /// Open the breakpoint-condition editor for the cursor line, pre-filled with
+    /// any existing condition. Saved with Enter (see `debug_condition_input_key`).
+    pub fn debug_edit_condition(&mut self) {
+        let Some(path) = self.editor.path.clone() else {
+            self.status = String::from("Open a file to set a conditional breakpoint");
+            return;
+        };
+        let line = self.editor.cursor_row + 1;
+        let existing = self
+            .editor
+            .breakpoint_conditions
+            .get(&path)
+            .and_then(|c| c.get(&line))
+            .cloned()
+            .unwrap_or_default();
+        self.status = format!("Breakpoint condition (Enter saves, Esc cancels): {existing}");
+        self.debug_condition_input = Some((path, line, existing));
+    }
+
+    /// Feed a key to the active breakpoint-condition editor.
+    fn debug_condition_input_key(&mut self, key: KeyEvent) {
+        let Some((path, line, mut buf)) = self.debug_condition_input.take() else {
+            return;
+        };
+        match key.code {
+            KeyCode::Esc => {
+                self.status = String::from("Cancelled breakpoint condition");
+                return;
+            }
+            KeyCode::Enter => {
+                // Ensure a breakpoint exists on the line, then attach/clear the
+                // condition and push the file's breakpoints to a live session.
+                self.editor
+                    .breakpoints
+                    .entry(path.clone())
+                    .or_default()
+                    .insert(line);
+                let cond = buf.trim().to_string();
+                if cond.is_empty() {
+                    if let Some(c) = self.editor.breakpoint_conditions.get_mut(&path) {
+                        c.remove(&line);
+                    }
+                    self.status = format!("Plain breakpoint at line {line}");
+                } else {
+                    self.editor
+                        .breakpoint_conditions
+                        .entry(path.clone())
+                        .or_default()
+                        .insert(line, cond);
+                    self.status = format!("Conditional breakpoint at line {line}");
+                }
+                let specs = self
+                    .editor
+                    .breakpoints
+                    .get(&path)
+                    .map(|l| self.editor.source_breakpoints(&path, l))
+                    .unwrap_or_default();
+                if let Some(session) = self.dap_session.as_mut() {
+                    session.update_breakpoints(&path, &specs);
+                }
+                return;
+            }
+            KeyCode::Backspace => {
+                buf.pop();
+            }
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                buf.push(c);
+            }
+            _ => {}
+        }
+        self.status = format!("Breakpoint condition (Enter saves, Esc cancels): {buf}");
+        self.debug_condition_input = Some((path, line, buf));
     }
 
     /// F10/F11/Shift+F11: step the paused thread (`next` / `stepIn` / `stepOut`).
@@ -10141,6 +10230,7 @@ impl App {
             Cmd::StartDebugging => self.debug_start_or_continue(),
             Cmd::StopDebugging => self.debug_stop(),
             Cmd::ToggleBreakpoint => self.debug_toggle_breakpoint(),
+            Cmd::EditBreakpointCondition => self.debug_edit_condition(),
             Cmd::StepOver => self.debug_step("next"),
             Cmd::ToggleRaisedExceptions => self.debug_toggle_raised_exceptions(),
             Cmd::AttachPythonProcess => self.open_attach_python_picker(),
