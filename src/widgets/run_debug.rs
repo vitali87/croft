@@ -231,14 +231,13 @@ impl RunDebugPanel {
 
         // Reserve the bottom for the console + the REPL input area. The input
         // area is 2 rows: a "DEBUG CONSOLE" label and the filled input field.
-        // Plus up to 6 console rows when there is output.
+        // The console is sized to its actual line count (capped at 6) so the
+        // newest line sits directly above the label and output grows UPWARD,
+        // like a terminal — never floating at the top of a fixed-height box.
         let bottom = inner.y + inner.height;
         let input_h: u16 = 2;
-        let console_h: u16 = if self.console_tail.is_empty() {
-            0
-        } else {
-            6.min(bottom.saturating_sub(y).saturating_sub(input_h + 2))
-        };
+        let console_avail = bottom.saturating_sub(y).saturating_sub(input_h + 2);
+        let console_h: u16 = (self.console_tail.len() as u16).min(6).min(console_avail);
         let rows_bottom = bottom.saturating_sub(input_h + console_h);
         let rows_area_h = rows_bottom.saturating_sub(y) as usize;
         self.last_debug_row_y0 = y;
@@ -770,6 +769,21 @@ mod tests {
         assert!(
             dump.contains("DEBUG CONSOLE"),
             "input field must carry a label:\n{dump}"
+        );
+        // Bottom-anchored: the newest console line ("42") must sit on the row
+        // directly above the DEBUG CONSOLE label, with no gap floating it up.
+        let row_text = |y: u16| -> String {
+            (0..area.width)
+                .map(|x| buf[(x, y)].symbol())
+                .collect::<String>()
+        };
+        let label_y = (0..area.height)
+            .find(|&y| row_text(y).contains("DEBUG CONSOLE"))
+            .expect("label present");
+        assert!(
+            row_text(label_y - 1).contains("42"),
+            "newest console line must hug the label (row above it):\nlabel-1: {:?}",
+            row_text(label_y - 1)
         );
     }
 
