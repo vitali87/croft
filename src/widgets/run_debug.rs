@@ -13,6 +13,61 @@ const BODY_FG_RGB: (u8, u8, u8) = (0xb0, 0xb8, 0xc8);
 const TITLE_FG_RGB: (u8, u8, u8) = (0xff, 0xff, 0xff);
 const FOCUS_BORDER_RGB: (u8, u8, u8) = (0x4e, 0x9a, 0xff);
 
+// --- Debug-panel (Variant A "Darcula") palette. Fixed darks chosen to read
+// well on both the Black (#000) and Dark Blue (#1e222e) theme backgrounds. ---
+const DBG_BAR_BG: Color = Color::Rgb(0x1c, 0x27, 0x33); // section-header bar fill
+const DBG_BAR_FG: Color = Color::Rgb(0x8f, 0xd9, 0xcf); // section-header text
+const DBG_FRAME_BG: Color = Color::Rgb(0x20, 0x2a, 0x37); // selected-frame fill
+const DBG_ACCENT: Color = Color::Rgb(0x5c, 0xd6, 0xc8); // brand teal stripe / caret
+const DBG_SCOPE: Color = Color::Rgb(0xc8, 0xa0, 0x6a); // Locals / Globals (gold)
+const DBG_NAME: Color = Color::Rgb(0xbc, 0xbe, 0xc4); // identifiers / var names
+const DBG_EQ: Color = Color::Rgb(0x6b, 0x72, 0x80); // "="
+const DBG_TYPE: Color = Color::Rgb(0x78, 0x7c, 0x80); // ": type"
+const DBG_STR: Color = Color::Rgb(0x6a, 0xab, 0x73); // strings / collections
+const DBG_NUM: Color = Color::Rgb(0x2a, 0xac, 0xb8); // numbers
+const DBG_KW: Color = Color::Rgb(0xcf, 0x8e, 0x6d); // None / bool
+const DBG_CHEV: Color = Color::Rgb(0x5c, 0x66, 0x75); // expand chevrons
+const DBG_LOC: Color = Color::Rgb(0x6b, 0x76, 0x89); // file:line / dim console
+const DBG_PILL_BG: Color = Color::Rgb(0x0e, 0x7e, 0x76); // status pill
+const DBG_PILL_FG: Color = Color::Rgb(0xdf, 0xfd, 0xf7);
+const DBG_FRAME_SEL_FG: Color = Color::Rgb(0xff, 0xff, 0xff);
+
+/// Write `s` at `(x, y)` styled, clipped to the half-open column range
+/// `[x, right)`, and return the column just past what was drawn. Lets the
+/// renderer lay coloured segments left-to-right without overflowing the panel.
+fn put(buf: &mut Buffer, x: u16, y: u16, right: u16, s: &str, style: Style) -> u16 {
+    if x >= right {
+        return x;
+    }
+    let budget = (right - x) as usize;
+    let clipped: String = s.chars().take(budget).collect();
+    let drawn = clipped.chars().count() as u16;
+    buf.set_string(x, y, &clipped, style);
+    x + drawn
+}
+
+/// Add a background colour to `style` when `bg` is `Some` (so a selected frame's
+/// segments share its highlight fill).
+fn with_bg(style: Style, bg: Option<Color>) -> Style {
+    match bg {
+        Some(c) => style.bg(c),
+        None => style,
+    }
+}
+
+/// Colour a Python value by its `type_name` (PyCharm/Darcula-ish): strings and
+/// collections green, numbers cyan, None/bool orange, everything else (objects)
+/// the neutral name grey.
+fn value_color(type_name: &str) -> Color {
+    match type_name {
+        "str" => DBG_STR,
+        "int" | "float" | "complex" => DBG_NUM,
+        "bool" | "NoneType" => DBG_KW,
+        "list" | "tuple" | "dict" | "set" | "frozenset" | "bytes" | "bytearray" => DBG_STR,
+        _ => DBG_NAME,
+    }
+}
+
 /// Cells reserved above the headline for the OSC-1337 debug-alt icon
 /// overlay. Six cells wide × three cells tall lands a roughly 60×60-pixel
 /// codicon at typical iTerm2 cell sizes (10×20 px), matching the VS Code
@@ -24,20 +79,31 @@ pub const RUN_DEBUG_ICON_CELLS_W: u16 = 6;
 pub const RUN_DEBUG_ICON_CELLS_H: u16 = 3;
 
 /// What a [`DebugRow`] represents, so a click can act on it (navigate to a
-/// frame, expand a variable) and so the renderer can style it.
+/// frame, expand a variable) and so the renderer can colour each part. Each
+/// variant carries the structured pieces the renderer styles independently
+/// (name vs value vs type), PyCharm-style.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DebugRowKind {
-    /// A section header ("CALL STACK", "VARIABLES").
-    Header,
-    /// A call-stack frame; carries the adapter frame id for selection.
-    Frame { id: i64, selected: bool },
+    /// A section header ("CALL STACK", "VARIABLES") drawn as a filled bar.
+    Header { title: String },
+    /// A call-stack frame; `name` is the function, `location` is `file:line`.
+    Frame {
+        id: i64,
+        selected: bool,
+        name: String,
+        location: String,
+    },
     /// A scope container row ("Locals", "Globals").
-    Scope,
-    /// A variable; `reference > 0` means expandable, `expanded` tracks state.
+    Scope { name: String },
+    /// A variable. `reference > 0` means expandable; `value`/`type_name` are
+    /// coloured by type.
     Variable {
         reference: i64,
         expandable: bool,
         expanded: bool,
+        name: String,
+        value: String,
+        type_name: String,
     },
 }
 
@@ -46,7 +112,6 @@ pub enum DebugRowKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DebugRow {
     pub indent: u8,
-    pub text: String,
     pub kind: DebugRowKind,
 }
 
@@ -135,35 +200,35 @@ impl RunDebugPanel {
             && y < r.y + r.height
     }
 
-    /// Render the paused-state tree: a status line, then the scrollable
-    /// call-stack + variables rows. Records `last_debug_row_y0` /
+    /// Render the paused-state tree (Variant A / Darcula): a status pill, the
+    /// call-stack + variables tree with type-coloured values, then the console
+    /// and a REPL bar pinned to the bottom. Records `last_debug_row_y0` /
     /// `last_debug_rows_shown` for click mapping.
     fn render_debug_tree(&mut self, inner: Rect, buf: &mut Buffer) {
+        let right = inner.x + inner.width;
         let mut y = inner.y;
-        // Status line (e.g. "Paused (breakpoint)").
+
+        // Status pill, e.g. " ⏸ Paused (breakpoint) ".
         if !self.debug_status.is_empty() {
-            let status = Paragraph::new(self.debug_status.as_str()).style(
+            let pill = format!(" ⏸ {} ", self.debug_status);
+            let pill: String = pill.chars().take(inner.width as usize).collect();
+            buf.set_string(
+                inner.x + 1,
+                y,
+                &pill,
                 Style::default()
-                    .fg(Color::Rgb(0xff, 0xcc, 0x00))
+                    .fg(DBG_PILL_FG)
+                    .bg(DBG_PILL_BG)
                     .add_modifier(Modifier::BOLD),
-            );
-            status.render(
-                Rect {
-                    x: inner.x + 1,
-                    y,
-                    width: inner.width.saturating_sub(1),
-                    height: 1,
-                },
-                buf,
             );
             y += 2;
         }
         if y >= inner.y + inner.height {
             return;
         }
-        // Reserve the bottom of the panel for the debug console + REPL prompt:
-        // one prompt row, plus up to 6 console rows when there is output. The
-        // call-stack/variables tree gets whatever remains above.
+
+        // Reserve the bottom for the console + a REPL bar (1 prompt row + up to
+        // 6 console rows when there is output).
         let bottom = inner.y + inner.height;
         let prompt_h: u16 = 1;
         let console_h: u16 = if self.console_tail.is_empty() {
@@ -171,121 +236,165 @@ impl RunDebugPanel {
         } else {
             6.min(bottom.saturating_sub(y).saturating_sub(prompt_h + 2))
         };
-        let reserved = prompt_h + console_h;
-        let rows_bottom = bottom.saturating_sub(reserved);
-        let rows_area_h = (rows_bottom.saturating_sub(y)) as usize;
+        let rows_bottom = bottom.saturating_sub(prompt_h + console_h);
+        let rows_area_h = rows_bottom.saturating_sub(y) as usize;
         self.last_debug_row_y0 = y;
-        let visible = self
-            .debug_rows
-            .iter()
-            .skip(self.debug_scroll)
-            .take(rows_area_h);
+
         let mut shown = 0usize;
-        for row in visible {
+        for row in self.debug_rows.iter().skip(self.debug_scroll).take(rows_area_h) {
             let row_y = y + shown as u16;
-            let indent = (row.indent as u16) * 2;
-            let x = inner.x + 1 + indent;
-            if x >= inner.x + inner.width {
-                shown += 1;
-                continue;
-            }
-            let avail = (inner.x + inner.width - x) as usize;
-            let (prefix, style) = match &row.kind {
-                DebugRowKind::Header => (
-                    String::new(),
-                    Style::default()
-                        .fg(Color::Rgb(TITLE_FG_RGB.0, TITLE_FG_RGB.1, TITLE_FG_RGB.2))
-                        .add_modifier(Modifier::BOLD),
-                ),
-                DebugRowKind::Frame { selected, .. } => {
-                    let s = if *selected {
-                        Style::default()
-                            .fg(Color::Rgb(0xff, 0xff, 0xff))
-                            .add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default().fg(Color::Rgb(BODY_FG_RGB.0, BODY_FG_RGB.1, BODY_FG_RGB.2))
-                    };
-                    (
-                        if *selected {
-                            "▸ ".to_string()
-                        } else {
-                            "  ".to_string()
+            match &row.kind {
+                DebugRowKind::Header { title } => {
+                    // Filled bar across the full width, title in teal.
+                    buf.set_style(
+                        Rect {
+                            x: inner.x,
+                            y: row_y,
+                            width: inner.width,
+                            height: 1,
                         },
-                        s,
-                    )
+                        Style::default().bg(DBG_BAR_BG),
+                    );
+                    let t: String = title.chars().take(inner.width.saturating_sub(2) as usize).collect();
+                    buf.set_string(
+                        inner.x + 1,
+                        row_y,
+                        &t,
+                        Style::default()
+                            .fg(DBG_BAR_FG)
+                            .bg(DBG_BAR_BG)
+                            .add_modifier(Modifier::BOLD),
+                    );
                 }
-                DebugRowKind::Scope => (
-                    String::new(),
-                    Style::default()
-                        .fg(Color::Rgb(0x9c, 0xa8, 0xbe))
-                        .add_modifier(Modifier::BOLD),
-                ),
+                DebugRowKind::Frame {
+                    selected,
+                    name,
+                    location,
+                    ..
+                } => {
+                    if *selected {
+                        buf.set_style(
+                            Rect {
+                                x: inner.x,
+                                y: row_y,
+                                width: inner.width,
+                                height: 1,
+                            },
+                            Style::default().bg(DBG_FRAME_BG),
+                        );
+                        buf.set_string(inner.x, row_y, "▌", Style::default().fg(DBG_ACCENT).bg(DBG_FRAME_BG));
+                    }
+                    let bg = if *selected { Some(DBG_FRAME_BG) } else { None };
+                    let mut x = inner.x + 2;
+                    let name_style = if *selected {
+                        Style::default().fg(DBG_FRAME_SEL_FG).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(DBG_NAME)
+                    };
+                    x = put(buf, x, row_y, right, name, with_bg(name_style, bg));
+                    x = put(buf, x, row_y, right, " ", with_bg(Style::default(), bg));
+                    put(buf, x, row_y, right, location, with_bg(Style::default().fg(DBG_LOC), bg));
+                }
+                DebugRowKind::Scope { name } => {
+                    put(
+                        buf,
+                        inner.x + 1,
+                        row_y,
+                        right,
+                        name,
+                        Style::default().fg(DBG_SCOPE).add_modifier(Modifier::BOLD),
+                    );
+                }
                 DebugRowKind::Variable {
                     expandable,
                     expanded,
+                    name,
+                    value,
+                    type_name,
                     ..
                 } => {
-                    let p = if *expandable {
-                        if *expanded {
-                            "▾ ".to_string()
-                        } else {
-                            "▸ ".to_string()
-                        }
+                    let indent = (row.indent as u16) * 2;
+                    let mut x = inner.x + indent;
+                    let chev = if *expandable {
+                        if *expanded { "▾ " } else { "▸ " }
                     } else {
-                        "  ".to_string()
+                        "  "
                     };
-                    (
-                        p,
-                        Style::default().fg(Color::Rgb(
-                            BODY_FG_RGB.0,
-                            BODY_FG_RGB.1,
-                            BODY_FG_RGB.2,
-                        )),
-                    )
+                    x = put(buf, x, row_y, right, chev, Style::default().fg(DBG_CHEV));
+                    x = put(buf, x, row_y, right, name, Style::default().fg(DBG_NAME));
+                    x = put(buf, x, row_y, right, " = ", Style::default().fg(DBG_EQ));
+                    x = put(
+                        buf,
+                        x,
+                        row_y,
+                        right,
+                        value,
+                        Style::default().fg(value_color(type_name)),
+                    );
+                    if !type_name.is_empty() {
+                        put(
+                            buf,
+                            x,
+                            row_y,
+                            right,
+                            &format!(" : {type_name}"),
+                            Style::default().fg(DBG_TYPE).add_modifier(Modifier::ITALIC),
+                        );
+                    }
                 }
-            };
-            let text = format!("{prefix}{}", row.text);
-            let truncated: String = text.chars().take(avail).collect();
-            buf.set_string(x, row_y, &truncated, style);
+            }
             shown += 1;
         }
         self.last_debug_rows_shown = shown;
 
-        // Debug console (program output + REPL echoes) and the REPL prompt at the
-        // bottom of the panel.
-        let bottom = inner.y + inner.height;
+        // Console: program output + REPL echoes, above the prompt.
         let prompt_y = bottom - 1;
         if console_h > 0 {
             let console_y0 = prompt_y - console_h;
-            let tail = self
+            for (i, line) in self
                 .console_tail
                 .iter()
                 .rev()
                 .take(console_h as usize)
-                .rev();
-            let style =
-                Style::default().fg(Color::Rgb(BODY_FG_RGB.0, BODY_FG_RGB.1, BODY_FG_RGB.2));
-            for (i, line) in tail.enumerate() {
-                let truncated: String = line
-                    .chars()
-                    .take(inner.width.saturating_sub(1) as usize)
-                    .collect();
-                buf.set_string(inner.x + 1, console_y0 + i as u16, &truncated, style);
+                .rev()
+                .enumerate()
+            {
+                // REPL echoes ("❯ …") in teal; everything else dim, stderr-ish
+                // red left to the caller's prefixing.
+                let style = if line.starts_with('❯') {
+                    Style::default().fg(DBG_ACCENT)
+                } else {
+                    Style::default().fg(DBG_LOC)
+                };
+                put(buf, inner.x + 1, console_y0 + i as u16, right, line, style);
             }
         }
-        // REPL prompt: "❯ <input>".
-        let prompt = format!("❯ {}", self.repl_input);
-        let truncated: String = prompt
-            .chars()
-            .take(inner.width.saturating_sub(1) as usize)
-            .collect();
-        buf.set_string(
+
+        // REPL bar pinned to the bottom: a teal caret, the input, a block cursor.
+        let caret_end = put(
+            buf,
             inner.x + 1,
             prompt_y,
-            &truncated,
-            Style::default()
-                .fg(Color::Rgb(0x9c, 0xdc, 0xfe))
-                .add_modifier(Modifier::BOLD),
+            right,
+            "❯ ",
+            Style::default().fg(DBG_ACCENT).add_modifier(Modifier::BOLD),
+        );
+        let input_end = put(
+            buf,
+            caret_end,
+            prompt_y,
+            right,
+            &self.repl_input,
+            Style::default().fg(DBG_NAME),
+        );
+        // Block cursor.
+        put(
+            buf,
+            input_end,
+            prompt_y,
+            right,
+            " ",
+            Style::default().bg(DBG_ACCENT),
         );
     }
 
@@ -505,43 +614,51 @@ mod tests {
         panel.debug_rows = vec![
             DebugRow {
                 indent: 0,
-                text: "CALL STACK".into(),
-                kind: DebugRowKind::Header,
+                kind: DebugRowKind::Header {
+                    title: "CALL STACK".into(),
+                },
             },
             DebugRow {
                 indent: 1,
-                text: "isValid (app.py:12)".into(),
                 kind: DebugRowKind::Frame {
                     id: 1000,
                     selected: true,
+                    name: "isValid".into(),
+                    location: "app.py:12".into(),
                 },
             },
             DebugRow {
                 indent: 0,
-                text: "VARIABLES".into(),
-                kind: DebugRowKind::Header,
+                kind: DebugRowKind::Header {
+                    title: "VARIABLES".into(),
+                },
             },
             DebugRow {
                 indent: 1,
-                text: "Locals".into(),
-                kind: DebugRowKind::Scope,
-            },
-            DebugRow {
-                indent: 2,
-                text: "x = 1".into(),
-                kind: DebugRowKind::Variable {
-                    reference: 0,
-                    expandable: false,
-                    expanded: false,
+                kind: DebugRowKind::Scope {
+                    name: "Locals".into(),
                 },
             },
             DebugRow {
                 indent: 2,
-                text: "obj = <Foo>".into(),
+                kind: DebugRowKind::Variable {
+                    reference: 0,
+                    expandable: false,
+                    expanded: false,
+                    name: "x".into(),
+                    value: "1".into(),
+                    type_name: "int".into(),
+                },
+            },
+            DebugRow {
+                indent: 2,
                 kind: DebugRowKind::Variable {
                     reference: 9,
                     expandable: true,
                     expanded: false,
+                    name: "obj".into(),
+                    value: "<Foo>".into(),
+                    type_name: "Foo".into(),
                 },
             },
         ];
@@ -556,12 +673,10 @@ mod tests {
         let dump = buffer_to_string(&buf);
         assert!(dump.contains("CALL STACK"), "call stack header:\n{dump}");
         assert!(dump.contains("VARIABLES"), "variables header:\n{dump}");
-        assert!(dump.contains("isValid (app.py:12)"), "frame row:\n{dump}");
+        assert!(dump.contains("isValid"), "frame name:\n{dump}");
+        assert!(dump.contains("app.py:12"), "frame location:\n{dump}");
         assert!(dump.contains("x = 1"), "variable row:\n{dump}");
-        assert!(
-            dump.contains("▸ obj = <Foo>"),
-            "expandable chevron:\n{dump}"
-        );
+        assert!(dump.contains("▸ obj = <Foo>"), "expandable chevron:\n{dump}");
         // The empty-state Run button must NOT be laid out while debugging.
         assert_eq!(panel.last_button_area, Rect::default());
         // Click mapping: first row sits at last_debug_row_y0.
@@ -578,8 +693,9 @@ mod tests {
         panel.debug_status = String::from("Paused (breakpoint)");
         panel.debug_rows = vec![DebugRow {
             indent: 0,
-            text: "CALL STACK".into(),
-            kind: DebugRowKind::Header,
+            kind: DebugRowKind::Header {
+                title: "CALL STACK".into(),
+            },
         }];
         panel.console_tail = vec!["hello from program".into(), "42".into()];
         panel.repl_input = String::from("x + 1");

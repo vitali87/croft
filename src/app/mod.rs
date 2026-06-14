@@ -121,18 +121,15 @@ fn push_variable_rows(
     for v in vars {
         let expandable = v.variables_ref > 0;
         let is_open = expandable && expanded.contains(&v.variables_ref);
-        let text = if v.value.is_empty() {
-            v.name.clone()
-        } else {
-            format!("{} = {}", v.name, v.value)
-        };
         rows.push(DebugRow {
             indent,
-            text,
             kind: DebugRowKind::Variable {
                 reference: v.variables_ref,
                 expandable,
                 expanded: is_open,
+                name: v.name.clone(),
+                value: v.value.clone(),
+                type_name: v.type_name.clone(),
             },
         });
         if is_open && let Some(children) = session.variables.get(&v.variables_ref) {
@@ -6454,8 +6451,9 @@ impl App {
         let mut rows = Vec::new();
         rows.push(DebugRow {
             indent: 0,
-            text: String::from("CALL STACK"),
-            kind: DebugRowKind::Header,
+            kind: DebugRowKind::Header {
+                title: String::from("CALL STACK"),
+            },
         });
         for f in &session.stack_frames {
             let loc = f
@@ -6466,23 +6464,26 @@ impl App {
                 .unwrap_or_default();
             rows.push(DebugRow {
                 indent: 1,
-                text: format!("{} ({loc}:{})", f.name, f.line),
                 kind: DebugRowKind::Frame {
                     id: f.id,
                     selected: Some(f.id) == session.selected_frame,
+                    name: f.name.clone(),
+                    location: format!("{loc}:{}", f.line),
                 },
             });
         }
         rows.push(DebugRow {
             indent: 0,
-            text: String::from("VARIABLES"),
-            kind: DebugRowKind::Header,
+            kind: DebugRowKind::Header {
+                title: String::from("VARIABLES"),
+            },
         });
         for scope in &session.scopes {
             rows.push(DebugRow {
                 indent: 1,
-                text: scope.name.clone(),
-                kind: DebugRowKind::Scope,
+                kind: DebugRowKind::Scope {
+                    name: scope.name.clone(),
+                },
             });
             if let Some(vars) = session.variables.get(&scope.variables_ref) {
                 push_variable_rows(&mut rows, session, &self.debug_expanded, vars, 2);
