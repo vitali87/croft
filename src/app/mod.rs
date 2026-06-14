@@ -6574,6 +6574,15 @@ impl App {
         self.refresh_debug_panel();
     }
 
+    /// Open and focus the Run and Debug view so the call stack, variables,
+    /// console, and REPL are visible the instant a session starts (VS Code
+    /// reveals its debug view on launch the same way).
+    fn reveal_debug_view(&mut self) {
+        self.show_tree = true;
+        self.set_sidebar_view(SidebarView::RunDebug);
+        self.focus_pane(Pane::Tree);
+    }
+
     /// F5: start debugging the active file, or resume if already paused.
     pub fn debug_start_or_continue(&mut self) {
         use crate::dap::session::SessionPhase;
@@ -6652,6 +6661,7 @@ impl App {
                 self.run_debug.feedback_is_error = false;
                 self.status =
                     format!("Debugging {name} — F5 continue · F10 step over · Shift+F5 stop");
+                self.reveal_debug_view();
             }
             Err(e) => {
                 self.run_debug.feedback = Some(format!("Failed to start debugger: {e}"));
@@ -6710,6 +6720,7 @@ impl App {
                 self.run_debug.feedback_is_error = false;
                 self.status =
                     format!("Debugging {name} via lldb-dap — F5 continue · Shift+F5 stop");
+                self.reveal_debug_view();
             }
             Err(e) => {
                 self.run_debug.feedback = Some(format!("Failed to start lldb-dap: {e}"));
