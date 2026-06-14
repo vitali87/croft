@@ -88,6 +88,24 @@ fn activity_icon_glyph_x(bar: Rect) -> u16 {
     bar.x + bar.width / 2
 }
 
+/// Resolve the `lldb-dap` adapter binary: the Xcode Command Line Tools copy
+/// first (always present on a dev Mac), then `PATH`. None if unavailable.
+fn lldb_dap_path() -> Option<String> {
+    let xcode = "/Library/Developer/CommandLineTools/usr/bin/lldb-dap";
+    if std::path::Path::new(xcode).is_file() {
+        return Some(xcode.to_string());
+    }
+    let out = std::process::Command::new("which")
+        .arg("lldb-dap")
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!path.is_empty()).then_some(path)
+}
+
 /// Append variable rows to the debug tree, recursing into any expanded
 /// (`variablesReference` in `expanded`) container whose children are loaded.
 /// Pulled out as a free function so it can borrow the session immutably while
@@ -6562,14 +6580,35 @@ impl App {
         self.start_debug_session();
     }
 
-    /// Launch debugpy on the active file, pushing the editor's breakpoints.
+    /// Launch a debug session for the active file, choosing the adapter by file
+    /// type. Python (debugpy) is the verified path; other recognised compiled
+    /// languages route to lldb-dap.
     fn start_debug_session(&mut self) {
+        use crate::dap::session::AdapterKind;
         use std::collections::BTreeMap;
         let Some(path) = self.editor.path.clone() else {
-            self.run_debug.feedback = Some(String::from("Open a Python file to debug"));
+            self.run_debug.feedback = Some(String::from("Open a file to debug"));
             self.run_debug.feedback_is_error = true;
             return;
         };
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        match crate::dap::session::adapter_for_extension(&ext) {
+            Some(AdapterKind::Debugpy) => {}
+            Some(AdapterKind::LldbDap) => {
+                self.start_lldb_debug_session(&path);
+                return;
+            }
+            None => {
+                self.run_debug.feedback =
+                    Some(format!("No debugger for .{ext} files (Python is supported)"));
+                self.run_debug.feedback_is_error = true;
+                return;
+            }
+        }
         let py = match crate::dap::install::ensure_debug_venv() {
             Ok(py) => py,
             Err(e) => {
@@ -6611,6 +6650,114 @@ impl App {
                 self.run_debug.feedback_is_error = true;
             }
         }
+    }
+
+    /// Launch lldb-dap on a Rust / C / C++ source file: build a debuggable
+    /// binary, then drive the same DAP session machinery as Python. The binary
+    /// build is the only language-specific step; breakpoints, stepping, call
+    /// stack, variables, and the REPL all flow through the shared session.
+    ///
+    /// Note: lldb-dap requires a permitted `debugserver` (macOS gates this
+    /// behind code-signing / `DevToolsSecurity`); where that isn't granted the
+    /// process runs without binding breakpoints. croft surfaces the adapter's
+    /// own status rather than pretending otherwise.
+    fn start_lldb_debug_session(&mut self, path: &Path) {
+        use std::collections::BTreeMap;
+        let Some(adapter) = lldb_dap_path() else {
+            self.run_debug.feedback = Some(String::from(
+                "lldb-dap not found (install Xcode Command Line Tools)",
+            ));
+            self.run_debug.feedback_is_error = true;
+            return;
+        };
+        let binary = match self.build_debuggable_binary(path) {
+            Ok(b) => b,
+            Err(e) => {
+                self.run_debug.feedback = Some(format!("Build for debug failed: {e}"));
+                self.run_debug.feedback_is_error = true;
+                return;
+            }
+        };
+        let breakpoints: BTreeMap<PathBuf, Vec<crate::dap::session::SourceBreakpoint>> = self
+            .editor
+            .breakpoints
+            .iter()
+            .map(|(p, lines)| (p.clone(), self.editor.source_breakpoints(p, lines)))
+            .collect();
+        let cwd = path.parent().unwrap_or(&self.workspace_root).to_path_buf();
+        match crate::dap::session::DapSession::launch_with(
+            &adapter,
+            &[],
+            &cwd,
+            crate::dap::session::lldb_launch_request(&binary, false),
+            breakpoints,
+        ) {
+            Ok(session) => {
+                self.dap_session = Some(session);
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                self.run_debug.feedback = Some(format!("Debugging {name} (lldb)"));
+                self.run_debug.feedback_is_error = false;
+                self.status = format!("Debugging {name} via lldb-dap — F5 continue · Shift+F5 stop");
+            }
+            Err(e) => {
+                self.run_debug.feedback = Some(format!("Failed to start lldb-dap: {e}"));
+                self.run_debug.feedback_is_error = true;
+            }
+        }
+    }
+
+    /// Compile `path` to a debuggable binary (with debug info, no optimisation)
+    /// and return the binary path. C via `cc`, C++ via `c++`, Rust via `rustc`
+    /// for a single file. The binary lands next to the source as `<stem>.dbg`.
+    fn build_debuggable_binary(&self, path: &Path) -> std::io::Result<PathBuf> {
+        use std::process::Command;
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let out = path.with_extension("dbg");
+        let (program, args): (&str, Vec<String>) = match ext.as_str() {
+            "rs" => (
+                "rustc",
+                vec![
+                    String::from("-g"),
+                    String::from("-o"),
+                    out.to_string_lossy().into_owned(),
+                    path.to_string_lossy().into_owned(),
+                ],
+            ),
+            "c" | "h" | "m" => (
+                "cc",
+                vec![
+                    String::from("-g"),
+                    String::from("-O0"),
+                    path.to_string_lossy().into_owned(),
+                    String::from("-o"),
+                    out.to_string_lossy().into_owned(),
+                ],
+            ),
+            _ => (
+                "c++",
+                vec![
+                    String::from("-g"),
+                    String::from("-O0"),
+                    path.to_string_lossy().into_owned(),
+                    String::from("-o"),
+                    out.to_string_lossy().into_owned(),
+                ],
+            ),
+        };
+        let status = Command::new(program).args(&args).status()?;
+        if !status.success() {
+            return Err(std::io::Error::other(format!(
+                "{program} exited with {status}"
+            )));
+        }
+        Ok(out)
     }
 
     /// F9: toggle a breakpoint on the cursor line, pushing it live if a session

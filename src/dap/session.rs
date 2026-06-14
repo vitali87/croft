@@ -163,6 +163,41 @@ pub fn initialize_request() -> Value {
     })
 }
 
+/// The debug adapter family for a given source language. Selected from the
+/// file extension; drives which adapter is spawned and the `launch` shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdapterKind {
+    /// debugpy (CPython 3.14+), launches the `.py` source directly.
+    Debugpy,
+    /// lldb-dap, launches a compiled binary (Rust / C / C++).
+    LldbDap,
+}
+
+/// Pick the debug adapter for a file extension (lowercased, no dot), or None for
+/// languages croft can't debug yet.
+pub fn adapter_for_extension(ext: &str) -> Option<AdapterKind> {
+    match ext {
+        "py" | "pyw" => Some(AdapterKind::Debugpy),
+        "rs" | "c" | "h" | "cc" | "cpp" | "cxx" | "hpp" | "hxx" | "m" | "mm" => {
+            Some(AdapterKind::LldbDap)
+        }
+        _ => None,
+    }
+}
+
+/// Build the lldb-dap `launch` request for a compiled `program` binary. Unlike
+/// debugpy there is no interpreter; lldb-dap loads the binary and its DWARF.
+pub fn lldb_launch_request(program: &Path, stop_on_entry: bool) -> Value {
+    json!({
+        "type": "request",
+        "command": "launch",
+        "arguments": {
+            "program": program.to_string_lossy(),
+            "stopOnEntry": stop_on_entry,
+        }
+    })
+}
+
 /// Build the `launch` request body for a Python program under `interpreter`.
 pub fn launch_request(program: &Path, interpreter: &Path, stop_on_entry: bool) -> Value {
     json!({
@@ -521,9 +556,29 @@ impl DapSession {
         breakpoints: BTreeMap<PathBuf, Vec<SourceBreakpoint>>,
         stop_on_entry: bool,
     ) -> Result<DapSession> {
+        Self::launch_with(
+            adapter_program,
+            adapter_args,
+            cwd,
+            launch_request(program, interpreter, stop_on_entry),
+            breakpoints,
+        )
+    }
+
+    /// Generic launch: spawn `adapter_program args...`, send `initialize`, then
+    /// the caller-built `launch_request` (debugpy or lldb-dap shaped). The rest
+    /// of the protocol (breakpoints, configurationDone, stepping, inspection) is
+    /// adapter-agnostic, so every adapter shares this path.
+    pub fn launch_with(
+        adapter_program: &str,
+        adapter_args: &[String],
+        cwd: &Path,
+        launch_request: Value,
+        breakpoints: BTreeMap<PathBuf, Vec<SourceBreakpoint>>,
+    ) -> Result<DapSession> {
         let transport = DapTransport::spawn(adapter_program, adapter_args, cwd)?;
         transport.send(initialize_request())?;
-        transport.send(launch_request(program, interpreter, stop_on_entry))?;
+        transport.send(launch_request)?;
         Ok(DapSession {
             transport,
             phase: SessionPhase::Initializing,
@@ -850,6 +905,25 @@ mod tests {
             classify_event(&json!({"type": "event", "event": "exited"})),
             Some(DapEvent::Terminated)
         );
+    }
+
+    #[test]
+    fn adapter_selection_by_extension() {
+        assert_eq!(adapter_for_extension("py"), Some(AdapterKind::Debugpy));
+        assert_eq!(adapter_for_extension("rs"), Some(AdapterKind::LldbDap));
+        assert_eq!(adapter_for_extension("c"), Some(AdapterKind::LldbDap));
+        assert_eq!(adapter_for_extension("cpp"), Some(AdapterKind::LldbDap));
+        assert_eq!(adapter_for_extension("txt"), None);
+        assert_eq!(adapter_for_extension(""), None);
+    }
+
+    #[test]
+    fn lldb_launch_request_carries_binary_not_interpreter() {
+        let req = lldb_launch_request(Path::new("/build/app"), false);
+        assert_eq!(req["command"], "launch");
+        assert_eq!(req["arguments"]["program"], "/build/app");
+        // lldb-dap debugs a binary; there is no `python` interpreter field.
+        assert!(req["arguments"].get("python").is_none());
     }
 
     #[test]
@@ -1190,6 +1264,65 @@ mod tests {
         let x = sess.lookup_local("x").expect("lookup_local should find x");
         assert_eq!(x.value, "1");
         assert!(sess.lookup_local("nonexistent").is_none());
+    }
+
+    /// End-to-end through croft's shared session machinery with a SECOND adapter
+    /// (lldb-dap), proving `launch_with` is adapter-agnostic: compile a tiny C
+    /// program, launch it under lldb-dap, and confirm the session progresses to
+    /// termination. (Breakpoint binding needs a permitted macOS `debugserver`,
+    /// so this asserts the launch/run/teardown flow, not a stop.)
+    #[test]
+    #[ignore = "requires lldb-dap (Xcode Command Line Tools) + cc"]
+    fn lldb_dap_session_launches_via_shared_machinery() {
+        use std::io::Write;
+        let adapter = "/Library/Developer/CommandLineTools/usr/bin/lldb-dap";
+        if !std::path::Path::new(adapter).is_file() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("m.c");
+        let mut f = std::fs::File::create(&src).unwrap();
+        writeln!(f, "#include <stdio.h>\nint main(){{\n  int x=41;\n  x++;\n  printf(\"%d\\n\", x);\n  return 0;\n}}").unwrap();
+        let bin = dir.path().join("m.dbg");
+        let ok = std::process::Command::new("cc")
+            .args([
+                "-g",
+                "-O0",
+                src.to_str().unwrap(),
+                "-o",
+                bin.to_str().unwrap(),
+            ])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(ok, "cc must compile the test program");
+
+        let mut sess = DapSession::launch_with(
+            adapter,
+            &[],
+            dir.path(),
+            lldb_launch_request(&bin, false),
+            BTreeMap::new(),
+        )
+        .unwrap();
+
+        let mut terminated = false;
+        for _ in 0..200 {
+            for ev in sess.poll() {
+                if matches!(ev, DapEvent::Terminated) {
+                    terminated = true;
+                }
+            }
+            if terminated {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        sess.disconnect();
+        assert!(
+            terminated,
+            "lldb-dap session must launch and run to completion via launch_with"
+        );
     }
 
     /// Regression: a breakpoint set via a NON-canonical (symlinked) path must
