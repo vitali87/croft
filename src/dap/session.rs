@@ -182,6 +182,21 @@ pub fn set_breakpoints_request(path: &Path, lines: &[u32]) -> Value {
     })
 }
 
+/// Build a response to an adapter-initiated reverse request (e.g.
+/// `runInTerminal`, `startDebugging`). The DAP client MUST answer every reverse
+/// request or the adapter blocks waiting; `request_seq` references the adapter's
+/// request `seq`. croft doesn't yet honor these (it debugs in-process via
+/// `internalConsole`), so it declines with `success: false` rather than stall.
+pub fn reverse_request_response(request_seq: i64, command: &str, success: bool) -> Value {
+    json!({
+        "type": "response",
+        "request_seq": request_seq,
+        "success": success,
+        "command": command,
+        "message": if success { Value::Null } else { Value::from("unsupported by croft") },
+    })
+}
+
 /// Build a `configurationDone` request body.
 pub fn configuration_done_request() -> Value {
     json!({ "type": "request", "command": "configurationDone", "arguments": {} })
@@ -321,6 +336,21 @@ impl DapSession {
     pub fn poll(&mut self) -> Vec<DapEvent> {
         let mut out = Vec::new();
         while let Ok(msg) = self.transport.incoming.try_recv() {
+            // Reverse requests (adapter -> client, e.g. `runInTerminal`,
+            // `startDebugging`) MUST be answered or the adapter blocks. croft
+            // debugs in-process (`internalConsole`) and doesn't honor them yet,
+            // so it declines rather than stall.
+            if msg.get("type").and_then(Value::as_str) == Some("request") {
+                if let (Some(seq), Some(command)) = (
+                    msg.get("seq").and_then(Value::as_i64),
+                    msg.get("command").and_then(Value::as_str),
+                ) {
+                    let _ = self
+                        .transport
+                        .send(reverse_request_response(seq, command, false));
+                }
+                continue;
+            }
             // Responses: the only one we act on is `stackTrace`, which tells us
             // the file + line a `stopped` paused on.
             if msg.get("type").and_then(Value::as_str) == Some("response") {
@@ -454,6 +484,20 @@ mod tests {
             classify_event(&json!({"type": "event", "event": "exited"})),
             Some(DapEvent::Terminated)
         );
+    }
+
+    #[test]
+    fn reverse_request_response_references_request_seq() {
+        let r = reverse_request_response(42, "runInTerminal", false);
+        assert_eq!(r["type"], "response");
+        assert_eq!(r["request_seq"], 42);
+        assert_eq!(r["command"], "runInTerminal");
+        assert_eq!(r["success"], false);
+        assert_eq!(r["message"], "unsupported by croft");
+        // A success response carries no message.
+        let ok = reverse_request_response(1, "startDebugging", true);
+        assert_eq!(ok["success"], true);
+        assert!(ok["message"].is_null());
     }
 
     #[test]
