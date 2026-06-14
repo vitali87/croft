@@ -2892,6 +2892,16 @@ impl App {
         };
         self.hover_anchor = Some((col, row));
         self.hover_word = Some(region);
+        // Debug hover-to-evaluate: while paused, hovering a variable shows its
+        // current value (from the loaded locals/globals) instead of the LSP
+        // type hover. Takes priority because the live value is what the user
+        // wants mid-debug.
+        if let Some(text) = self.debug_hover_value(line, c) {
+            self.hover_request_id = None;
+            self.hover_diagnostic = None;
+            self.hover_popup = Some(crate::widgets::hover_popup::HoverPopup::new(text, (col, row)));
+            return;
+        }
         // Server diagnostics are already in the editor, so capture the
         // message synchronously; the squiggle's message must show even if the
         // server has no type info (or no LSP is attached at all).
@@ -6392,6 +6402,25 @@ impl App {
             .clone()
             .unwrap_or_else(|| String::from("Paused"));
         (true, status, rows)
+    }
+
+    /// Hover-to-evaluate: while a debug session is paused, return a popup string
+    /// for the identifier at `(line, c)` if it's a loaded local/global, else
+    /// None (so the normal LSP hover proceeds).
+    fn debug_hover_value(&self, line: usize, c: usize) -> Option<String> {
+        use crate::dap::session::SessionPhase;
+        let session = self.dap_session.as_ref()?;
+        if session.phase != SessionPhase::Stopped {
+            return None;
+        }
+        let word = self.editor.word_string_at(line, c)?;
+        let var = session.lookup_local(&word)?;
+        let ty = if var.type_name.is_empty() {
+            String::new()
+        } else {
+            format!(": {}", var.type_name)
+        };
+        Some(format!("{} = {}{ty}", var.name, var.value))
     }
 
     /// Act on a click of debug-panel row `idx`: select a call-stack frame (load

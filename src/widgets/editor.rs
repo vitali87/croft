@@ -3727,6 +3727,14 @@ impl Editor {
         Some((start, end))
     }
 
+    /// The identifier text under `(line, col)`, or None over non-word
+    /// characters. Used by debug hover-to-evaluate to name the variable.
+    pub fn word_string_at(&self, line: usize, col: usize) -> Option<String> {
+        let (start, end) = self.word_at(line, col)?;
+        let chars: Vec<char> = self.lines.get(line)?.chars().collect();
+        Some(chars[start..end].iter().collect())
+    }
+
     /// Severities and messages of every diagnostic whose range covers the
     /// character position `(line, ch)`. Decoded on demand from the retained
     /// `diagnostics` (UTF-16 positions) rather than the per-line span cache so
@@ -5736,6 +5744,18 @@ mod tests {
     fn toggle_breakpoint_without_open_file_is_noop() {
         let mut e = Editor::new();
         assert_eq!(e.toggle_breakpoint(), None);
+    }
+
+    #[test]
+    fn word_string_at_reads_identifier_under_cursor() {
+        let mut e = Editor::new();
+        e.lines = vec!["    total = count + 1".into()];
+        // cursor inside "total" (chars 4..9)
+        assert_eq!(e.word_string_at(0, 6).as_deref(), Some("total"));
+        // cursor inside "count"
+        assert_eq!(e.word_string_at(0, 13).as_deref(), Some("count"));
+        // over the '=' (non-word) => None
+        assert_eq!(e.word_string_at(0, 10), None);
     }
 
     fn editor_with(text: &str) -> Editor {

@@ -487,6 +487,17 @@ impl DapSession {
         let _ = self.transport.send(scopes_request(frame_id));
     }
 
+    /// Find a top-level variable by name across the selected frame's loaded
+    /// scopes (Locals first, then Globals), for hover-to-evaluate. Returns the
+    /// first match. None while running or before variables arrive.
+    pub fn lookup_local(&self, name: &str) -> Option<&Variable> {
+        self.scopes
+            .iter()
+            .filter_map(|s| self.variables.get(&s.variables_ref))
+            .flatten()
+            .find(|v| v.name == name)
+    }
+
     /// Request the children of an expandable variable (its `variablesReference`)
     /// unless already loaded; the response files them under that reference.
     pub fn expand_variable(&mut self, variables_reference: i64) {
@@ -986,6 +997,10 @@ mod tests {
         assert!(have_locals, "locals x and y must arrive via the chain");
         assert!(xy.contains(&("x".to_string(), "1".to_string())));
         assert!(xy.contains(&("y".to_string(), "2".to_string())));
+        // Hover-to-evaluate lookup resolves a loaded local by name.
+        let x = sess.lookup_local("x").expect("lookup_local should find x");
+        assert_eq!(x.value, "1");
+        assert!(sess.lookup_local("nonexistent").is_none());
     }
 
     /// Regression: a breakpoint set via a NON-canonical (symlinked) path must
