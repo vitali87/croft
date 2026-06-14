@@ -6624,6 +6624,27 @@ impl App {
         }
     }
 
+    /// Toggle "break on raised exceptions" for the active session. `uncaught` is
+    /// always kept on so unhandled exceptions still pause. No-op without a
+    /// session.
+    pub fn debug_toggle_raised_exceptions(&mut self) {
+        let Some(session) = self.dap_session.as_mut() else {
+            self.status = String::from("Start debugging first to set exception breakpoints");
+            return;
+        };
+        let raised = !session.has_exception_filter("raised");
+        let mut filters = vec![String::from("uncaught")];
+        if raised {
+            filters.push(String::from("raised"));
+        }
+        session.set_exception_filters(filters);
+        self.status = if raised {
+            String::from("Breaking on raised exceptions (and uncaught)")
+        } else {
+            String::from("Breaking on uncaught exceptions only")
+        };
+    }
+
     /// Shift+F5: stop debugging and tear the session down.
     pub fn debug_stop(&mut self) {
         if let Some(session) = self.dap_session.as_mut() {
@@ -10121,6 +10142,7 @@ impl App {
             Cmd::StopDebugging => self.debug_stop(),
             Cmd::ToggleBreakpoint => self.debug_toggle_breakpoint(),
             Cmd::StepOver => self.debug_step("next"),
+            Cmd::ToggleRaisedExceptions => self.debug_toggle_raised_exceptions(),
             Cmd::AttachPythonProcess => self.open_attach_python_picker(),
             Cmd::ColorTheme => self.open_theme_picker(),
             Cmd::KeyboardShortcuts => self.open_shortcuts_modal(),

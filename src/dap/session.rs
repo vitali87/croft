@@ -213,6 +213,17 @@ pub fn configuration_done_request() -> Value {
     json!({ "type": "request", "command": "configurationDone", "arguments": {} })
 }
 
+/// Build a `setExceptionBreakpoints` request. `filters` are adapter-defined ids;
+/// debugpy supports `raised`, `uncaught`, and `userUnhandled`. An empty slice
+/// disables exception breaking.
+pub fn set_exception_breakpoints_request(filters: &[String]) -> Value {
+    json!({
+        "type": "request",
+        "command": "setExceptionBreakpoints",
+        "arguments": { "filters": filters }
+    })
+}
+
 /// Build a thread-scoped execution request (`continue` / `next` / `stepIn` /
 /// `stepOut`).
 pub fn thread_request(command: &str, thread_id: i64) -> Value {
@@ -461,6 +472,10 @@ pub struct DapSession {
     /// In-flight `evaluate` requests: request `seq` -> (context, expression), so
     /// the response can be turned into an [`DapEvent::Evaluated`].
     pending_evals: std::collections::HashMap<i64, (String, String)>,
+    /// Active exception-breakpoint filter ids (debugpy: `raised`, `uncaught`).
+    /// Sent on `initialized` and whenever toggled. Defaults to `uncaught` so an
+    /// unhandled exception pauses the debugger instead of silently exiting.
+    pub exception_filters: Vec<String>,
 }
 
 impl DapSession {
@@ -494,7 +509,22 @@ impl DapSession {
             selected_frame: None,
             pending_var_refs: std::collections::HashMap::new(),
             pending_evals: std::collections::HashMap::new(),
+            exception_filters: vec![String::from("uncaught")],
         })
+    }
+
+    /// Replace the active exception-breakpoint filters, resending immediately so
+    /// the change takes effect mid-session (debugpy accepts it at any time).
+    pub fn set_exception_filters(&mut self, filters: Vec<String>) {
+        self.exception_filters = filters;
+        let _ = self
+            .transport
+            .send(set_exception_breakpoints_request(&self.exception_filters));
+    }
+
+    /// Whether an exception filter id is currently active.
+    pub fn has_exception_filter(&self, filter: &str) -> bool {
+        self.exception_filters.iter().any(|f| f == filter)
     }
 
     /// Evaluate `expression` in the selected frame (or globally if no frame is
@@ -659,6 +689,9 @@ impl DapSession {
             match &event {
                 DapEvent::Initialized => {
                     self.push_breakpoints();
+                    let _ = self
+                        .transport
+                        .send(set_exception_breakpoints_request(&self.exception_filters));
                     let _ = self.transport.send(configuration_done_request());
                     self.phase = SessionPhase::Running;
                 }
@@ -765,6 +798,17 @@ mod tests {
             classify_event(&json!({"type": "event", "event": "exited"})),
             Some(DapEvent::Terminated)
         );
+    }
+
+    #[test]
+    fn set_exception_breakpoints_request_lists_filters() {
+        let req = set_exception_breakpoints_request(&[
+            String::from("uncaught"),
+            String::from("raised"),
+        ]);
+        assert_eq!(req["command"], "setExceptionBreakpoints");
+        assert_eq!(req["arguments"]["filters"][0], "uncaught");
+        assert_eq!(req["arguments"]["filters"][1], "raised");
     }
 
     #[test]
