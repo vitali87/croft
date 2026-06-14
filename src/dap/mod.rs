@@ -19,6 +19,7 @@
 
 pub mod discovery;
 pub mod install;
+pub mod log;
 pub mod remote_attach;
 pub mod session;
 pub mod transport;

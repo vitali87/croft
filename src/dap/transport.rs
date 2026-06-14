@@ -104,12 +104,32 @@ impl DapTransport {
     /// `python -m debugpy.adapter`). A reader thread frames stdout into the
     /// `incoming` channel until the adapter exits.
     pub fn spawn(program: &str, args: &[String], cwd: &std::path::Path) -> Result<DapTransport> {
-        let mut child = Command::new(program)
-            .args(args)
+        use std::os::unix::process::CommandExt;
+        let mut cmd = Command::new(program);
+        cmd.args(args)
             .current_dir(cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::piped());
+        // Detach the adapter into its own session before exec. debugpy launches
+        // the debuggee and does terminal job control (`tcsetpgrp`) on whatever
+        // controlling tty it inherits; sharing croft's tty would background
+        // croft and suspend it with SIGTTIN the moment the main loop next reads
+        // input. `setsid` gives the adapter (and every process it spawns) a
+        // brand-new session with no controlling terminal, so it physically
+        // cannot touch croft's tty. DAP itself rides the piped stdio, never the
+        // tty, so nothing is lost. Mirrors `lsp::install`'s detached probe.
+        //
+        // SAFETY: `setsid` is async-signal-safe and the only call in the
+        // pre-exec hook; the forked child is never a process-group leader (its
+        // pid differs from croft's pgid), so the call always succeeds.
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+        let mut child = cmd
             .spawn()
             .with_context(|| format!("spawning debug adapter `{program}`"))?;
 
@@ -142,6 +162,13 @@ impl DapTransport {
             obj.insert("seq".into(), Value::from(seq));
         }
         let bytes = encode(&message);
+        super::log::log(&format!(
+            "send seq={seq} {}",
+            message
+                .get("command")
+                .and_then(Value::as_str)
+                .unwrap_or("?")
+        ));
         let mut stdin = self.stdin.lock().expect("dap stdin mutex poisoned");
         stdin
             .write_all(&bytes)
@@ -175,6 +202,14 @@ fn reader_loop(stdout: std::process::ChildStdout, tx: Sender<Value>) {
             Ok(n) => {
                 decoder.feed(&chunk[..n]);
                 while let Some(msg) = decoder.next_message() {
+                    super::log::log(&format!(
+                        "recv type={} key={}",
+                        msg.get("type").and_then(Value::as_str).unwrap_or("?"),
+                        msg.get("event")
+                            .or_else(|| msg.get("command"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("?")
+                    ));
                     if tx.send(msg).is_err() {
                         return;
                     }
@@ -241,5 +276,28 @@ mod tests {
         assert_eq!(content_length("content-length: 42"), Some(42));
         assert_eq!(content_length("Content-Length: 7\r\nX: y"), Some(7));
         assert_eq!(content_length("X-Other: 1"), None);
+    }
+
+    /// The adapter (and the debuggee it launches) must NOT share croft's
+    /// controlling terminal: debugpy's launcher does terminal job control
+    /// (`tcsetpgrp`), which would background croft and suspend it with SIGTTIN
+    /// the next time the main loop reads input. `spawn` therefore `setsid`s the
+    /// child into its own session. Assert the spawned child's session id differs
+    /// from ours. (Spawns `sleep` as a stand-in adapter; the reader thread just
+    /// hits EOF when it exits.)
+    #[test]
+    fn spawned_adapter_is_detached_into_its_own_session() {
+        let cwd = std::env::temp_dir();
+        let t =
+            DapTransport::spawn("sleep", &["3".to_string()], &cwd).expect("spawn stand-in adapter");
+        let child_pid = t.child.id() as libc::pid_t;
+        // SAFETY: getsid is a pure query with no side effects.
+        let child_sid = unsafe { libc::getsid(child_pid) };
+        let our_sid = unsafe { libc::getsid(0) };
+        assert!(child_sid > 0, "getsid(child) failed: {child_sid}");
+        assert_ne!(
+            child_sid, our_sid,
+            "adapter must be in its own session, detached from croft's tty"
+        );
     }
 }
