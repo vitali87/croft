@@ -561,6 +561,19 @@ enum MenuAction {
         line: u32,
         col: u32,
     },
+    /// Editor gutter: toggle a breakpoint on 1-based `line`. Built from a
+    /// glyph-margin right-click; the label reads "Add Breakpoint" or "Remove
+    /// Breakpoint" depending on whether one already sits on that line, but both
+    /// resolve to the same toggle. Mirrors VS Code's glyph-margin menu.
+    ToggleBreakpointAt {
+        line: usize,
+    },
+    /// Editor gutter: open the breakpoint-condition editor for 1-based `line`,
+    /// creating the breakpoint if absent. VS Code's "Add Conditional
+    /// Breakpoint…" / "Edit Condition…".
+    EditBreakpointConditionAt {
+        line: usize,
+    },
     /// Settings gear → "Color Theme": replace the gear menu with the theme
     /// picker (the list of themes with a check on the active one).
     OpenThemePicker,
@@ -597,6 +610,7 @@ fn shortcut_for(action: &MenuAction) -> Option<&'static str> {
         MenuAction::GoToDeclarationAt { .. } => Some("⌃⇧F12"),
         MenuAction::GoToTypeDefinitionAt { .. } => Some("⌃F12"),
         MenuAction::GoToImplementationAt { .. } => Some("⌘F12"),
+        MenuAction::ToggleBreakpointAt { .. } => Some("F9"),
         _ => None,
     }
 }
@@ -6931,7 +6945,14 @@ impl App {
     /// F9: toggle a breakpoint on the cursor line, pushing it live if a session
     /// is running.
     pub fn debug_toggle_breakpoint(&mut self) {
-        match self.editor.toggle_breakpoint() {
+        self.debug_toggle_breakpoint_line(self.editor.cursor_row + 1);
+    }
+
+    /// Toggle a breakpoint on an explicit 1-based `line`, then push the file's
+    /// breakpoints to a live session. Shared by F9 (cursor line) and the gutter
+    /// right-click menu (clicked line).
+    fn debug_toggle_breakpoint_line(&mut self, line: usize) {
+        match self.editor.toggle_breakpoint_line(line) {
             Some((_, line, now_set)) => {
                 self.status = if now_set {
                     format!("Breakpoint set at line {line}")
@@ -6960,11 +6981,17 @@ impl App {
     /// Open the breakpoint-condition editor for the cursor line, pre-filled with
     /// any existing condition. Saved with Enter (see `debug_condition_input_key`).
     pub fn debug_edit_condition(&mut self) {
+        self.debug_edit_condition_line(self.editor.cursor_row + 1);
+    }
+
+    /// Open the breakpoint-condition editor for an explicit 1-based `line`.
+    /// Shared by the command-palette entry (cursor line) and the gutter
+    /// right-click menu (clicked line).
+    fn debug_edit_condition_line(&mut self, line: usize) {
         let Some(path) = self.editor.path.clone() else {
             self.status = String::from("Open a file to set a conditional breakpoint");
             return;
         };
-        let line = self.editor.cursor_row + 1;
         let existing = self
             .editor
             .breakpoint_conditions
@@ -11458,6 +11485,60 @@ impl App {
                     });
                     return;
                 }
+                // Editor gutter: right-click in the glyph margin / line-number
+                // column opens the breakpoint menu (Add / Remove Breakpoint,
+                // Add Conditional / Edit Condition), mirroring VS Code's
+                // glyph-margin context menu. Routed before the body branch so a
+                // gutter click never falls through to the symbol menu. Diff /
+                // sheet / image tabs have no debuggable source lines.
+                if in_editor
+                    && self.editor.diff.is_none()
+                    && self.editor.sheet.is_none()
+                    && self.editor.image.is_none()
+                    && let Some(line0) = self.editor.gutter_line_at(m.column, m.row)
+                {
+                    self.focus_pane(Pane::Editor);
+                    let line = line0 + 1; // 1-based, as breakpoints are stored
+                    let (has_bp, has_cond) = self
+                        .editor
+                        .path
+                        .as_ref()
+                        .map(|p| {
+                            let has_bp = self
+                                .editor
+                                .breakpoints
+                                .get(p)
+                                .is_some_and(|s| s.contains(&line));
+                            let has_cond = self
+                                .editor
+                                .breakpoint_conditions
+                                .get(p)
+                                .is_some_and(|c| c.contains_key(&line));
+                            (has_bp, has_cond)
+                        })
+                        .unwrap_or((false, false));
+                    let toggle_label = if has_bp {
+                        String::from("Remove Breakpoint")
+                    } else {
+                        String::from("Add Breakpoint")
+                    };
+                    let cond_label = if has_cond {
+                        String::from("Edit Condition\u{2026}")
+                    } else {
+                        String::from("Add Conditional Breakpoint\u{2026}")
+                    };
+                    let items = vec![
+                        (toggle_label, MenuAction::ToggleBreakpointAt { line }),
+                        (cond_label, MenuAction::EditBreakpointConditionAt { line }),
+                    ];
+                    self.context_menu = Some(ContextMenu {
+                        origin: (m.column, m.row),
+                        items,
+                        selected: 0,
+                        target_dir: self.tree.root.clone(),
+                    });
+                    return;
+                }
                 // Editor body: right-click over a text buffer opens the symbol
                 // menu (Go to Definition / Rename Symbol / Change All
                 // Occurrences). Read-only diff / sheet / image tabs have no
@@ -12736,6 +12817,14 @@ impl App {
             }
             MenuAction::GoToLocation { path, line, col } => {
                 self.go_to_definition(path, line, col);
+            }
+            MenuAction::ToggleBreakpointAt { line } => {
+                self.focus_pane(Pane::Editor);
+                self.debug_toggle_breakpoint_line(line);
+            }
+            MenuAction::EditBreakpointConditionAt { line } => {
+                self.focus_pane(Pane::Editor);
+                self.debug_edit_condition_line(line);
             }
             MenuAction::OpenThemePicker => self.open_theme_picker(),
             MenuAction::SetTheme(theme) => self.apply_theme(theme),

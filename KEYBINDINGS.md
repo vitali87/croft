@@ -179,6 +179,8 @@ Real breakpoint debugging over the Debug Adapter Protocol. Python is the verifie
 | `F10` | Step over |
 | `F11` / `Shift+F11` | Step into / out |
 
+Right-clicking the editor **gutter** (the glyph margin / line-number column) opens a breakpoint menu on the clicked line, mirroring VS Code's glyph-margin menu: **Add Breakpoint** / **Remove Breakpoint** and **Add Conditional Breakpoint…** / **Edit Condition…** (the cursor does not move).
+
 When paused, the Run and Debug panel shows the **call stack** (click a frame to inspect it) and an expandable **variables** tree, plus a **debug console** of program output with a `❯` **REPL prompt** that evaluates expressions in the selected frame. Hovering a variable in the editor shows its current value. The paused line is marked with a yellow `▶` in the gutter; a breakpoint is a red `●`, a conditional breakpoint a red `◆`, and a breakpoint the adapter could not bind a hollow `○`.
 
 Also in the Command Palette: Start / Stop / Pause / Restart Debugging, Toggle Breakpoint, Add Conditional Breakpoint, Step Over, Toggle Break on Raised Exceptions (uncaught always breaks), and Attach to Python Process.

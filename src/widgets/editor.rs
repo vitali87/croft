@@ -1377,8 +1377,16 @@ impl Editor {
     /// when no file is open. Empty sets are dropped so the map stays clean for
     /// the gutter renderer.
     pub fn toggle_breakpoint(&mut self) -> Option<(PathBuf, usize, bool)> {
+        self.toggle_breakpoint_line(self.cursor_row + 1) // gutter + DAP are 1-based
+    }
+
+    /// Toggle a breakpoint on an explicit 1-based `line` (rather than the
+    /// cursor). Drives the gutter right-click "Add / Remove Breakpoint" menu,
+    /// where the target line is the row the user clicked, not where the caret
+    /// happens to sit. Returns `(path, line, now_set)`, or `None` with no open
+    /// file.
+    pub fn toggle_breakpoint_line(&mut self, line: usize) -> Option<(PathBuf, usize, bool)> {
         let path = self.path.clone()?;
-        let line = self.cursor_row + 1; // gutter + DAP are 1-based
         let set = self.breakpoints.entry(path.clone()).or_default();
         let now_set = if set.remove(&line) {
             false
@@ -1390,6 +1398,35 @@ impl Editor {
             self.breakpoints.remove(&path);
         }
         Some((path, line, now_set))
+    }
+
+    /// The 0-based buffer line under screen `(col, row)`, but ONLY when `col`
+    /// falls in the left gutter (glyph margin + line-number columns) rather
+    /// than the text body. Returns `None` over the body, past the last line,
+    /// or outside the viewport. Complements [`Editor::buffer_pos_at`] (which
+    /// resolves body clicks) and drives the gutter right-click breakpoint menu,
+    /// mirroring VS Code's glyph-margin context menu.
+    pub fn gutter_line_at(&self, col: u16, row: u16) -> Option<usize> {
+        if self.last_inner.height == 0 || self.lines.is_empty() {
+            return None;
+        }
+        if row < self.last_inner.y || row >= self.last_inner.y + self.last_inner.height {
+            return None;
+        }
+        // text_x mirrors `buffer_pos_at`: the gutter occupies every column to
+        // its left, so `col < text_x` is exactly "in the gutter".
+        let text_x = self.last_inner.x + self.last_gutter_width + 1;
+        if col < self.last_inner.x || col >= text_x {
+            return None;
+        }
+        let line = if self.wrap_enabled() {
+            self.last_wrap_rows
+                .get((row - self.last_inner.y) as usize)?
+                .0
+        } else {
+            self.scroll + (row - self.last_inner.y) as usize
+        };
+        (line < self.lines.len()).then_some(line)
     }
 
     /// 1-based breakpoint lines for `path`, ascending, for a DAP
@@ -5797,6 +5834,65 @@ mod tests {
     fn toggle_breakpoint_without_open_file_is_noop() {
         let mut e = Editor::new();
         assert_eq!(e.toggle_breakpoint(), None);
+    }
+
+    #[test]
+    fn toggle_breakpoint_line_targets_an_explicit_line_not_the_cursor() {
+        let mut e = Editor::new();
+        e.path = Some(PathBuf::from("/x/a.py"));
+        e.lines = vec!["a".into(), "b".into(), "c".into()];
+        e.cursor_row = 0; // cursor on line 1, but we target line 3
+        assert_eq!(
+            e.toggle_breakpoint_line(3),
+            Some((PathBuf::from("/x/a.py"), 3, true))
+        );
+        assert_eq!(e.breakpoint_lines(Path::new("/x/a.py")), vec![3u32]);
+        // Cursor never moved.
+        assert_eq!(e.cursor_row, 0);
+        // Toggling the same line removes it again.
+        assert_eq!(
+            e.toggle_breakpoint_line(3),
+            Some((PathBuf::from("/x/a.py"), 3, false))
+        );
+        assert!(e.breakpoint_lines(Path::new("/x/a.py")).is_empty());
+    }
+
+    #[test]
+    fn gutter_line_at_maps_gutter_clicks_and_ignores_the_body() {
+        let mut e = editor_with("a\nbb\nccc\ndddd\neeeee");
+        e.last_inner = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 25,
+        };
+        e.last_gutter_width = 2; // text_x = 0 + 2 + 1 = 3
+        // A click in the glyph margin / line-number columns maps to the line.
+        assert_eq!(e.gutter_line_at(0, 0), Some(0), "col 0 is the glyph margin");
+        assert_eq!(e.gutter_line_at(2, 2), Some(2), "col 2 is the line number");
+        // The body (col >= text_x) is NOT the gutter.
+        assert_eq!(e.gutter_line_at(3, 0), None, "col 3 is the text body");
+        assert_eq!(e.gutter_line_at(10, 1), None, "deep in the body");
+        // Past the last line there is no gutter target.
+        assert_eq!(e.gutter_line_at(0, 20), None, "row past content");
+    }
+
+    #[test]
+    fn gutter_line_at_follows_vertical_scroll() {
+        let mut e = editor_with("a\nbb\nccc\ndddd\neeeee");
+        e.last_inner = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 25,
+        };
+        e.last_gutter_width = 2;
+        e.scroll = 2;
+        assert_eq!(
+            e.gutter_line_at(1, 0),
+            Some(2),
+            "the top visible gutter row is buffer line scroll = 2"
+        );
     }
 
     #[test]

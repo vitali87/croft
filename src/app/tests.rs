@@ -480,6 +480,90 @@ fn a_second_tap_on_the_same_cell_rearms_the_dwell() {
     );
 }
 
+/// Right-clicking the editor gutter (glyph margin / line-number column)
+/// opens the breakpoint context menu and toggles the breakpoint on the
+/// CLICKED line, not the cursor line, mirroring VS Code's glyph-margin
+/// menu. The cursor must not move.
+#[test]
+fn right_click_on_the_gutter_opens_the_breakpoint_menu_and_toggles_the_clicked_line() {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let tmp = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("prog.py");
+    std::fs::write(&f, "l1\nl2\nl3\nl4\nl5\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&f).unwrap();
+    let backend = ratatui::backend::TestBackend::new(100, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|frame| app.render(frame)).unwrap();
+
+    // Glyph-margin column (left of text_x) on the 3rd content row => 1-based
+    // line 3. Cursor stays on line 1 throughout.
+    let gutter_col = app.editor.last_inner.x;
+    let row = app.editor.last_inner.y + 2;
+    assert_eq!(app.editor.cursor_row, 0, "precondition: cursor on line 1");
+
+    app.handle_mouse(mouse(
+        MouseEventKind::Down(MouseButton::Right),
+        gutter_col,
+        row,
+    ));
+    let menu = app
+        .context_menu
+        .as_ref()
+        .expect("a gutter right-click must open a context menu");
+    let labels: Vec<&str> = menu.items.iter().map(|(l, _)| l.as_str()).collect();
+    assert!(
+        labels.contains(&"Add Breakpoint"),
+        "menu must offer Add Breakpoint when none exists; got {labels:?}"
+    );
+    assert!(
+        labels.contains(&"Add Conditional Breakpoint\u{2026}"),
+        "menu must offer Add Conditional Breakpoint; got {labels:?}"
+    );
+
+    // Select "Add Breakpoint" and commit it through the real menu key path.
+    let idx = menu
+        .items
+        .iter()
+        .position(|(l, _)| l == "Add Breakpoint")
+        .unwrap();
+    app.context_menu.as_mut().unwrap().selected = idx;
+    app.handle_menu_key(key(KeyCode::Enter, KeyModifiers::NONE));
+
+    assert!(
+        app.context_menu.is_none(),
+        "committing a menu item must close the menu"
+    );
+    assert_eq!(
+        app.editor.breakpoint_lines(&f),
+        vec![3u32],
+        "the breakpoint must land on the clicked line (3), not the cursor line (1)"
+    );
+    assert_eq!(
+        app.editor.cursor_row, 0,
+        "the gutter click must not move the cursor"
+    );
+
+    // Right-clicking the same gutter line now offers Remove Breakpoint.
+    app.handle_mouse(mouse(
+        MouseEventKind::Down(MouseButton::Right),
+        gutter_col,
+        row,
+    ));
+    let labels: Vec<&str> = app
+        .context_menu
+        .as_ref()
+        .unwrap()
+        .items
+        .iter()
+        .map(|(l, _)| l.as_str())
+        .collect();
+    assert!(
+        labels.contains(&"Remove Breakpoint"),
+        "an existing breakpoint must offer Remove Breakpoint; got {labels:?}"
+    );
+}
+
 #[test]
 fn opening_a_search_hit_moves_focus_to_the_editor() {
     let tmp = tempfile::tempdir().unwrap();
