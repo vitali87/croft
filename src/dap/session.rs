@@ -988,11 +988,15 @@ impl DapSession {
                 self.clear_inspection();
             }
             DapEvent::Terminated => {
-                // For js-debug a child `terminated` ends the run; a parent
-                // `terminated` without a child also ends it. Either way tear down.
-                self.phase = SessionPhase::Terminated;
-                self.current_location = None;
-                self.clear_inspection();
+                // A js-debug parent ("bootstrap") can end its own connection
+                // while the child debuggee is still running; that must NOT tear
+                // the session down. Only the child's exit (or a stdio adapter /
+                // parent with no child) actually ends the run.
+                if from_child || self.child.is_none() {
+                    self.phase = SessionPhase::Terminated;
+                    self.current_location = None;
+                    self.clear_inspection();
+                }
             }
             DapEvent::Output { .. } => {}
             DapEvent::BreakpointsUpdated
