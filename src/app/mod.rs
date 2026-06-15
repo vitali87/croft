@@ -6244,6 +6244,19 @@ impl App {
 
     fn refresh_run_debug(&mut self) {
         let path = self.editor.path.clone();
+        // The Run button is only offered for files croft actually knows how to
+        // run (run_spec_for) or debug (an adapter for the extension). An
+        // extensionless file like `.git/config` is neither, so the button is
+        // hidden rather than offering an action that would just fail.
+        self.run_debug.runnable = path.as_deref().is_some_and(|p| {
+            let ext = p
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            Self::run_spec_for(p, &self.workspace_root).is_some()
+                || crate::dap::session::adapter_for_extension(&ext).is_some()
+        });
         self.run_debug.set_active_file(path);
         self.run_debug.feedback = None;
         self.run_debug.feedback_is_error = false;

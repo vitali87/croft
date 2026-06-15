@@ -124,6 +124,10 @@ pub struct RunDebugPanel {
     /// app's focus/theme sync.
     pub focus_gradient: bool,
     pub active_file: Option<PathBuf>,
+    /// Whether the active file is something croft can run or debug. When false
+    /// (e.g. an extensionless `.git/config`) the empty state shows a "can't run
+    /// this file" note instead of an actionable Run button. Set by the app.
+    pub runnable: bool,
     pub last_area: Rect,
     pub last_button_area: Rect,
     /// When a debug session is paused, the app fills these rows (call stack +
@@ -158,6 +162,7 @@ impl RunDebugPanel {
             focused: false,
             focus_gradient: false,
             active_file: None,
+            runnable: false,
             last_area: Rect::default(),
             last_button_area: Rect::default(),
             debug_active: false,
@@ -586,7 +591,10 @@ impl Widget for &mut RunDebugPanel {
             return;
         }
         let body_text = match self.active_file.as_ref() {
-            Some(_) => "Press the button below to run the active file in a new terminal.",
+            Some(_) if self.runnable => {
+                "Press the button below to run the active file in a new terminal."
+            }
+            Some(_) => "This file can't be run or debugged. Open a Python, Rust, C/C++, or script file.",
             None => "Open a file that can be run or debugged, then press the button below.",
         };
         let body_h = BODY_MAX_H.min(inner.y + inner.height - y);
@@ -604,6 +612,13 @@ impl Widget for &mut RunDebugPanel {
         body.render(body_area, buf);
         y += BODY_MAX_H + GAP_AFTER_BODY;
 
+        // A file is open but croft can't run/debug it: show only the note, no
+        // actionable button. (`last_button_area` stays default, so a click in
+        // the panel does nothing.) The no-file case still shows the generic
+        // "Run and Debug" button.
+        if self.active_file.is_some() && !self.runnable {
+            return;
+        }
         if y + BUTTON_H > inner.y + inner.height {
             return;
         }
@@ -846,6 +861,7 @@ mod tests {
     fn rendering_lays_out_button_area_inside_panel() {
         let mut panel = RunDebugPanel::new();
         panel.set_active_file(Some(PathBuf::from("/work/run_me.rs")));
+        panel.runnable = true;
         let area = Rect {
             x: 0,
             y: 0,
@@ -858,6 +874,40 @@ mod tests {
         assert!(b.width > 0 && b.height > 0, "button area must be laid out");
         assert!(b.x >= area.x && b.x + b.width <= area.x + area.width);
         assert!(b.y >= area.y && b.y < area.y + area.height);
+    }
+
+    #[test]
+    fn non_runnable_file_shows_a_note_and_no_button() {
+        // An open file croft can't run/debug (e.g. .git/config) must not offer a
+        // Run button that would just fail.
+        let mut panel = RunDebugPanel::new();
+        panel.set_active_file(Some(PathBuf::from("/repo/.git/config")));
+        panel.runnable = false;
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 24,
+        };
+        let mut buf = Buffer::empty(area);
+        Widget::render(&mut panel, area, &mut buf);
+        assert_eq!(
+            panel.last_button_area,
+            Rect::default(),
+            "no Run button for a non-runnable file"
+        );
+        let mut dump = String::new();
+        for y in 0..area.height {
+            for x in 0..area.width {
+                dump.push_str(buf[(x, y)].symbol());
+            }
+        }
+        // The note wraps across rows in the narrow panel, so assert an
+        // intra-line fragment rather than the whole phrase.
+        assert!(
+            dump.contains("can't be run") && dump.contains("debugged"),
+            "must explain why there's no button: {dump:?}"
+        );
     }
 
     fn buffer_to_string(buf: &Buffer) -> String {
