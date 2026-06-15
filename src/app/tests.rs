@@ -138,6 +138,65 @@ fn lldb_dap_missing_message_is_platform_appropriate() {
 }
 
 #[test]
+fn f5_failure_reaches_the_status_bar_when_run_debug_panel_is_hidden() {
+    // Repro (remote Linux with no lldb-dap installed): pressing F5 on a file
+    // croft can't debug wrote the reason ONLY into the Run/Debug panel's
+    // feedback line, which renders solely while that sidebar is the active
+    // view. With the Explorer focused the message landed nowhere, so F5 looked
+    // like it did nothing. Every debug-start failure must also reach the
+    // always-visible status bar. Exercised here via the platform-independent
+    // "no adapter for this file type" branch (the lldb-missing branch shares
+    // the same surfacing path but can't be reproduced on a dev Mac, where the
+    // Xcode lldb-dap is always present).
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let file = tmp.path().join("notes.txt");
+    std::fs::write(&file, b"hi\n").unwrap();
+    app.editor.path = Some(file);
+    app.set_sidebar_view(SidebarView::Explorer);
+
+    app.debug_start_or_continue();
+
+    assert!(
+        app.status.contains("No debugger"),
+        "F5 failure must explain itself in the status bar, not just the hidden panel: {}",
+        app.status
+    );
+}
+
+#[test]
+fn run_debug_icon_clears_when_a_paused_session_takes_over_the_panel() {
+    // Repro (Run/Debug panel already open when F5 starts a session, as seen on
+    // a remote): the empty-state debug icon is an OSC-1337 inline image. When
+    // the panel flips to the paused call-stack tree the widget stops re-emitting
+    // it (last_icon_cell = None), but text drawn over an inline image does NOT
+    // evict it, so the icon ghosted on top of the call stack. The flush must arm
+    // a one-shot terminal clear whenever a previously-emitted icon is no longer
+    // shown — the same eviction the welcome/hero overlays use.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.show_tree = true;
+    app.set_sidebar_view(SidebarView::RunDebug);
+    app.overlays
+        .run_debug
+        .set_image("\x1b]1337;File=inline=1:AAAA\x07".to_string());
+    app.overlays.run_debug.mark_emitted_at((5, 5));
+    // A paused session now owns the panel: render draws the tree, not the icon.
+    app.run_debug.last_icon_cell = None;
+
+    app.flush_run_debug_icon_overlay();
+
+    assert!(
+        app.consume_run_debug_image_clear(),
+        "a one-shot terminal clear must be armed to evict the ghosted debug icon"
+    );
+    assert!(
+        !app.overlays.run_debug.was_emitted(),
+        "emitted-position tracking must reset so the clear fires exactly once"
+    );
+}
+
+#[test]
 fn black_theme_context_menu_uses_gradient_border_and_muted_selection() {
     use crate::gradient::{GRAD_TL, POPUP_SEL_BG, rgb_color};
     let tmp = tempfile::tempdir().unwrap();

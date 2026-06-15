@@ -253,7 +253,12 @@ impl RunDebugPanel {
         self.last_debug_row_y0 = y;
 
         let mut shown = 0usize;
-        for row in self.debug_rows.iter().skip(self.debug_scroll).take(rows_area_h) {
+        for row in self
+            .debug_rows
+            .iter()
+            .skip(self.debug_scroll)
+            .take(rows_area_h)
+        {
             let row_y = y + shown as u16;
             match &row.kind {
                 DebugRowKind::Header { title } => {
@@ -267,7 +272,10 @@ impl RunDebugPanel {
                         },
                         Style::default().bg(DBG_BAR_BG),
                     );
-                    let t: String = title.chars().take(inner.width.saturating_sub(2) as usize).collect();
+                    let t: String = title
+                        .chars()
+                        .take(inner.width.saturating_sub(2) as usize)
+                        .collect();
                     buf.set_string(
                         inner.x + 1,
                         row_y,
@@ -294,18 +302,32 @@ impl RunDebugPanel {
                             },
                             Style::default().bg(DBG_FRAME_BG),
                         );
-                        buf.set_string(inner.x, row_y, "▌", Style::default().fg(DBG_ACCENT).bg(DBG_FRAME_BG));
+                        buf.set_string(
+                            inner.x,
+                            row_y,
+                            "▌",
+                            Style::default().fg(DBG_ACCENT).bg(DBG_FRAME_BG),
+                        );
                     }
                     let bg = if *selected { Some(DBG_FRAME_BG) } else { None };
                     let mut x = inner.x + 2;
                     let name_style = if *selected {
-                        Style::default().fg(DBG_FRAME_SEL_FG).add_modifier(Modifier::BOLD)
+                        Style::default()
+                            .fg(DBG_FRAME_SEL_FG)
+                            .add_modifier(Modifier::BOLD)
                     } else {
                         Style::default().fg(DBG_NAME)
                     };
                     x = put(buf, x, row_y, right, name, with_bg(name_style, bg));
                     x = put(buf, x, row_y, right, " ", with_bg(Style::default(), bg));
-                    put(buf, x, row_y, right, location, with_bg(Style::default().fg(DBG_LOC), bg));
+                    put(
+                        buf,
+                        x,
+                        row_y,
+                        right,
+                        location,
+                        with_bg(Style::default().fg(DBG_LOC), bg),
+                    );
                 }
                 DebugRowKind::Scope { name } => {
                     put(
@@ -604,7 +626,9 @@ impl Widget for &mut RunDebugPanel {
             Some(_) if self.runnable => {
                 "Press the button below to run the active file in a new terminal."
             }
-            Some(_) => "This file can't be run or debugged. Open a Python, Rust, C/C++, or script file.",
+            Some(_) => {
+                "This file can't be run or debugged. Open a Python, Rust, C/C++, or script file."
+            }
             None => "Open a file that can be run or debugged, then press the button below.",
         };
         let body_h = BODY_MAX_H.min(inner.y + inner.height - y);
@@ -754,7 +778,10 @@ mod tests {
         assert!(dump.contains("isValid"), "frame name:\n{dump}");
         assert!(dump.contains("app.py:12"), "frame location:\n{dump}");
         assert!(dump.contains("x = 1"), "variable row:\n{dump}");
-        assert!(dump.contains("▸ obj = <Foo>"), "expandable chevron:\n{dump}");
+        assert!(
+            dump.contains("▸ obj = <Foo>"),
+            "expandable chevron:\n{dump}"
+        );
         // The empty-state Run button must NOT be laid out while debugging.
         assert_eq!(panel.last_button_area, Rect::default());
         // Click mapping: first row sits at last_debug_row_y0.

@@ -1983,6 +1983,18 @@ impl App {
     /// exclusively by the `consume_run_debug_image_clear` →
     /// `terminal.clear()` gate in the main loop, the same pipeline the
     /// welcome wordmark and editor preview image use.
+    /// Stop showing the Run/Debug empty-state icon: if an OSC-1337 image was
+    /// emitted, arm the one-shot `terminal.clear()` latch so the cached image
+    /// cells are evicted (text painted over an inline image does not remove
+    /// it), then reset the emitted-position tracking so the clear fires exactly
+    /// once rather than every frame.
+    fn clear_run_debug_icon_if_emitted(&mut self) {
+        if self.overlays.run_debug.was_emitted() {
+            self.overlays.run_debug.request_clear();
+        }
+        self.overlays.run_debug.clear_emitted();
+    }
+
     pub fn flush_run_debug_icon_overlay(&mut self) {
         use std::io::Write;
         if self.shortcuts_modal.is_some()
@@ -1997,11 +2009,16 @@ impl App {
             && self.sidebar_view == SidebarView::RunDebug
             && self.overlays.run_debug.has_image();
         if !panel_visible {
-            self.overlays.run_debug.clear_emitted();
+            self.clear_run_debug_icon_if_emitted();
             return;
         }
+        // No icon cell this frame means the panel is showing the paused
+        // call-stack tree (debug_active) or is too short for the icon. The
+        // empty-state icon is an OSC-1337 image; drawing the tree over it does
+        // NOT evict it, so an emitted icon must be cleared with the one-shot
+        // `\x1b[2J` latch or it ghosts on top of the call stack.
         let Some((cx, cy)) = self.run_debug.last_icon_cell else {
-            self.overlays.run_debug.clear_emitted();
+            self.clear_run_debug_icon_if_emitted();
             return;
         };
         // The icon moved since the last emit (terminal resize OR an internal
@@ -6689,6 +6706,18 @@ impl App {
         self.focus_pane(Pane::Tree);
     }
 
+    /// Surface a debug-start failure on BOTH the styled Run/Debug panel
+    /// feedback line AND the always-visible status bar. The panel line only
+    /// renders while the Run/Debug sidebar is the active view (`reveal_debug_view`
+    /// is reached only on success), so without the status-bar mirror F5 fails
+    /// silently whenever the user is looking at any other sidebar — which read
+    /// as "F5 does nothing" on a remote with no debug adapter installed.
+    fn debug_error(&mut self, msg: String) {
+        self.run_debug.feedback = Some(msg.clone());
+        self.run_debug.feedback_is_error = true;
+        self.status = msg;
+    }
+
     /// F5: start debugging the active file, or resume if already paused.
     pub fn debug_start_or_continue(&mut self) {
         use crate::dap::session::SessionPhase;
@@ -6709,8 +6738,7 @@ impl App {
         use crate::dap::session::AdapterKind;
         use std::collections::BTreeMap;
         let Some(path) = self.editor.path.clone() else {
-            self.run_debug.feedback = Some(String::from("Open a file to debug"));
-            self.run_debug.feedback_is_error = true;
+            self.debug_error(String::from("Open a file to debug"));
             return;
         };
         let ext = path
@@ -6730,10 +6758,9 @@ impl App {
                 if is_executable_file(&path) {
                     self.launch_lldb(&path, &path);
                 } else {
-                    self.run_debug.feedback = Some(format!(
+                    self.debug_error(format!(
                         "No debugger for .{ext} files (Python is supported)"
                     ));
-                    self.run_debug.feedback_is_error = true;
                 }
                 return;
             }
@@ -6741,8 +6768,7 @@ impl App {
         let py = match crate::dap::install::ensure_debug_venv() {
             Ok(py) => py,
             Err(e) => {
-                self.run_debug.feedback = Some(format!("Debugger setup failed: {e}"));
-                self.run_debug.feedback_is_error = true;
+                self.debug_error(format!("Debugger setup failed: {e}"));
                 return;
             }
         };
@@ -6776,8 +6802,7 @@ impl App {
                 self.reveal_debug_view();
             }
             Err(e) => {
-                self.run_debug.feedback = Some(format!("Failed to start debugger: {e}"));
-                self.run_debug.feedback_is_error = true;
+                self.debug_error(format!("Failed to start debugger: {e}"));
             }
         }
     }
@@ -6793,16 +6818,14 @@ impl App {
     /// own status rather than pretending otherwise.
     fn start_lldb_debug_session(&mut self, path: &Path) {
         if lldb_dap_path().is_none() {
-            self.run_debug.feedback = Some(lldb_dap_missing_message());
-            self.run_debug.feedback_is_error = true;
+            self.debug_error(lldb_dap_missing_message());
             return;
         }
         // Compiled source: build a debuggable binary first, then debug it.
         let binary = match self.build_debuggable_binary(path) {
             Ok(b) => b,
             Err(e) => {
-                self.run_debug.feedback = Some(format!("Build for debug failed: {e}"));
-                self.run_debug.feedback_is_error = true;
+                self.debug_error(format!("Build for debug failed: {e}"));
                 return;
             }
         };
@@ -6816,8 +6839,7 @@ impl App {
     fn launch_lldb(&mut self, binary: &Path, label_path: &Path) {
         use std::collections::BTreeMap;
         let Some(adapter) = lldb_dap_path() else {
-            self.run_debug.feedback = Some(lldb_dap_missing_message());
-            self.run_debug.feedback_is_error = true;
+            self.debug_error(lldb_dap_missing_message());
             return;
         };
         let breakpoints: BTreeMap<PathBuf, Vec<crate::dap::session::SourceBreakpoint>> = self
@@ -6850,8 +6872,7 @@ impl App {
                 self.reveal_debug_view();
             }
             Err(e) => {
-                self.run_debug.feedback = Some(format!("Failed to start lldb-dap: {e}"));
-                self.run_debug.feedback_is_error = true;
+                self.debug_error(format!("Failed to start lldb-dap: {e}"));
             }
         }
     }
