@@ -900,6 +900,15 @@ enum PromptKind {
         row: usize,
         col: usize,
     },
+    /// Debugger "Add Conditional Breakpoint…" / "Edit Condition…": edit the
+    /// boolean condition for the breakpoint on 1-based `line` of `path`. The
+    /// buffer is pre-filled with any existing condition; on commit the
+    /// breakpoint is created (if absent) and the condition attached/cleared,
+    /// then pushed to a live session. A popup, never the status line.
+    BreakpointCondition {
+        path: PathBuf,
+        line: usize,
+    },
 }
 
 struct Prompt {
@@ -1243,9 +1252,6 @@ pub struct App {
     /// Debug console log: program stdout/stderr (DAP output events) plus REPL
     /// echoes and results. Capped; the tail is shown in the Run & Debug panel.
     pub debug_console: Vec<String>,
-    /// Active breakpoint-condition editor: (path, 1-based line, input buffer).
-    /// While Some, keystrokes edit the condition; Enter saves, Esc cancels.
-    pub debug_condition_input: Option<(PathBuf, usize, String)>,
     /// zoxide-backed Explorer jump popup (Cmd+Z). None when closed. Opens
     /// only from the Explorer pane, so it never collides with the editor's
     /// Cmd+Z undo.
@@ -1707,7 +1713,6 @@ impl App {
             dap_session: None,
             debug_expanded: std::collections::HashSet::new(),
             debug_console: Vec::new(),
-            debug_condition_input: None,
             zoxide_jump: None,
             file_finder_index: None,
             file_finder_index_rx: Some(file_finder_index_rx),
@@ -5800,6 +5805,17 @@ impl App {
                 ]),
                 "Enter to rename symbol, Esc to cancel",
             ),
+            PromptKind::BreakpointCondition { .. } => (
+                ratatui::text::Line::from(vec![
+                    ratatui::text::Span::raw("> "),
+                    ratatui::text::Span::styled(
+                        p.buffer.as_str(),
+                        Style::default().fg(Color::White),
+                    ),
+                    ratatui::text::Span::styled("█", Style::default().fg(cursor_fg)),
+                ]),
+                "Enter to set condition (blank for a plain breakpoint), Esc to cancel",
+            ),
         };
         frame.render_widget(
             ratatui::widgets::Paragraph::new(top_line),
@@ -5845,12 +5861,6 @@ impl App {
         self.hover_popup = None;
         self.hover_diagnostic = None;
         self.hover_request_id = None;
-        // The breakpoint-condition editor is a modal text input: it captures
-        // every key until Enter/Esc.
-        if self.debug_condition_input.is_some() {
-            self.debug_condition_input_key(key);
-            return Ok(());
-        }
         if self.connect_dialog.is_some() {
             self.handle_connect_dialog_key(key);
             return Ok(());
@@ -6979,14 +6989,16 @@ impl App {
     }
 
     /// Open the breakpoint-condition editor for the cursor line, pre-filled with
-    /// any existing condition. Saved with Enter (see `debug_condition_input_key`).
+    /// any existing condition.
     pub fn debug_edit_condition(&mut self) {
         self.debug_edit_condition_line(self.editor.cursor_row + 1);
     }
 
-    /// Open the breakpoint-condition editor for an explicit 1-based `line`.
-    /// Shared by the command-palette entry (cursor line) and the gutter
-    /// right-click menu (clicked line).
+    /// Open the breakpoint-condition editor for an explicit 1-based `line` as a
+    /// centered popup (`PromptKind::BreakpointCondition`), pre-filled with any
+    /// existing condition. Shared by the command-palette entry (cursor line)
+    /// and the gutter right-click menu (clicked line). The popup, not the
+    /// status line, captures the input; commit lives in [`App::commit_prompt`].
     fn debug_edit_condition_line(&mut self, line: usize) {
         let Some(path) = self.editor.path.clone() else {
             self.status = String::from("Open a file to set a conditional breakpoint");
@@ -6999,63 +7011,53 @@ impl App {
             .and_then(|c| c.get(&line))
             .cloned()
             .unwrap_or_default();
-        self.status = format!("Breakpoint condition (Enter saves, Esc cancels): {existing}");
-        self.debug_condition_input = Some((path, line, existing));
+        let label = if existing.is_empty() {
+            format!("Add Conditional Breakpoint · line {line}")
+        } else {
+            format!("Edit Condition · line {line}")
+        };
+        let target_dir = self.tree.root.clone();
+        self.prompt = Some(Prompt {
+            label,
+            buffer: existing,
+            kind: PromptKind::BreakpointCondition { path, line },
+            target_dir,
+            error: None,
+        });
     }
 
-    /// Feed a key to the active breakpoint-condition editor.
-    fn debug_condition_input_key(&mut self, key: KeyEvent) {
-        let Some((path, line, mut buf)) = self.debug_condition_input.take() else {
-            return;
-        };
-        match key.code {
-            KeyCode::Esc => {
-                self.status = String::from("Cancelled breakpoint condition");
-                return;
+    /// Commit the breakpoint-condition popup: ensure a breakpoint exists on the
+    /// line, attach the typed expression (or clear it when blank), and push the
+    /// file's breakpoints to a live session.
+    fn commit_breakpoint_condition(&mut self, path: PathBuf, line: usize, expr: &str) {
+        self.editor
+            .breakpoints
+            .entry(path.clone())
+            .or_default()
+            .insert(line);
+        let cond = expr.trim();
+        if cond.is_empty() {
+            if let Some(c) = self.editor.breakpoint_conditions.get_mut(&path) {
+                c.remove(&line);
             }
-            KeyCode::Enter => {
-                // Ensure a breakpoint exists on the line, then attach/clear the
-                // condition and push the file's breakpoints to a live session.
-                self.editor
-                    .breakpoints
-                    .entry(path.clone())
-                    .or_default()
-                    .insert(line);
-                let cond = buf.trim().to_string();
-                if cond.is_empty() {
-                    if let Some(c) = self.editor.breakpoint_conditions.get_mut(&path) {
-                        c.remove(&line);
-                    }
-                    self.status = format!("Plain breakpoint at line {line}");
-                } else {
-                    self.editor
-                        .breakpoint_conditions
-                        .entry(path.clone())
-                        .or_default()
-                        .insert(line, cond);
-                    self.status = format!("Conditional breakpoint at line {line}");
-                }
-                let specs = self
-                    .editor
-                    .breakpoints
-                    .get(&path)
-                    .map(|l| self.editor.source_breakpoints(&path, l))
-                    .unwrap_or_default();
-                if let Some(session) = self.dap_session.as_mut() {
-                    session.update_breakpoints(&path, &specs);
-                }
-                return;
-            }
-            KeyCode::Backspace => {
-                buf.pop();
-            }
-            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                buf.push(c);
-            }
-            _ => {}
+            self.status = format!("Plain breakpoint at line {line}");
+        } else {
+            self.editor
+                .breakpoint_conditions
+                .entry(path.clone())
+                .or_default()
+                .insert(line, cond.to_string());
+            self.status = format!("Conditional breakpoint at line {line}");
         }
-        self.status = format!("Breakpoint condition (Enter saves, Esc cancels): {buf}");
-        self.debug_condition_input = Some((path, line, buf));
+        let specs = self
+            .editor
+            .breakpoints
+            .get(&path)
+            .map(|l| self.editor.source_breakpoints(&path, l))
+            .unwrap_or_default();
+        if let Some(session) = self.dap_session.as_mut() {
+            session.update_breakpoints(&path, &specs);
+        }
     }
 
     /// F10/F11/Shift+F11: step the paused thread (`next` / `stepIn` / `stepOut`).
@@ -13649,6 +13651,11 @@ impl App {
                 self.rename_request_id = Some(id);
                 self.prompt = None;
                 self.status = String::from("Renaming symbol...");
+            }
+            PromptKind::BreakpointCondition { path, line } => {
+                let expr = prompt.buffer.clone();
+                self.prompt = None;
+                self.commit_breakpoint_condition(path, line, &expr);
             }
         }
     }

@@ -564,6 +564,74 @@ fn right_click_on_the_gutter_opens_the_breakpoint_menu_and_toggles_the_clicked_l
     );
 }
 
+/// "Add Conditional Breakpoint…" must open a visible popup (the centered
+/// `Prompt` overlay), NOT capture keystrokes on the bottom status line. The
+/// status line is reserved for read-only info.
+#[test]
+fn add_conditional_breakpoint_opens_a_popup_not_the_status_line() {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let tmp = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("prog.py");
+    std::fs::write(&f, "l1\nl2\nl3\nl4\nl5\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&f).unwrap();
+    let backend = ratatui::backend::TestBackend::new(100, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|frame| app.render(frame)).unwrap();
+
+    let gutter_col = app.editor.last_inner.x;
+    let row = app.editor.last_inner.y + 2; // 1-based line 3
+
+    app.handle_mouse(mouse(
+        MouseEventKind::Down(MouseButton::Right),
+        gutter_col,
+        row,
+    ));
+    let idx = app
+        .context_menu
+        .as_ref()
+        .unwrap()
+        .items
+        .iter()
+        .position(|(l, _)| l == "Add Conditional Breakpoint\u{2026}")
+        .expect("menu must offer Add Conditional Breakpoint");
+    app.context_menu.as_mut().unwrap().selected = idx;
+    app.handle_menu_key(key(KeyCode::Enter, KeyModifiers::NONE));
+
+    // A visible popup must open on the clicked line; nothing should be armed
+    // on the status line.
+    let prompt = app
+        .prompt
+        .as_ref()
+        .expect("conditional breakpoint must open a popup prompt, not a status-line input");
+    assert!(
+        matches!(prompt.kind, PromptKind::BreakpointCondition { line: 3, .. }),
+        "popup must target the clicked line (3)"
+    );
+
+    // Type a condition into the popup and commit it via the real key path.
+    for c in "x > 1".chars() {
+        app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
+            .unwrap();
+    }
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+
+    assert!(app.prompt.is_none(), "committing must close the popup");
+    assert_eq!(
+        app.editor.breakpoint_lines(&f),
+        vec![3u32],
+        "committing a condition must create the breakpoint on line 3"
+    );
+    let lines = app.editor.breakpoints.get(&f).unwrap();
+    let specs = app.editor.source_breakpoints(&f, lines);
+    assert_eq!(
+        specs[0].condition.as_deref(),
+        Some("x > 1"),
+        "the typed expression must be attached as the breakpoint condition"
+    );
+}
+
 #[test]
 fn opening_a_search_hit_moves_focus_to_the_editor() {
     let tmp = tempfile::tempdir().unwrap();
