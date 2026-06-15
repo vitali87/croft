@@ -1,6 +1,6 @@
 # Layout
 
-croft is a three pane workspace in the VS Code arrangement: an Explorer sidebar, a code editor, and a terminal, with an activity bar down the far left. This is the full pane-by-pane reference; the [README](README.md#layout) keeps the high-level summary.
+croft is a three pane workspace in the VS Code arrangement: an Explorer sidebar, a code editor, and a terminal, with an activity bar down the far left. This is the full pane-by-pane reference; the [README](../README.md#layout) keeps the high-level summary.
 
 ## Panes
 

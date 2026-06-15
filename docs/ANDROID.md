@@ -1,6 +1,6 @@
 # croft on Android (Termux)
 
-Setup notes for running croft as a native Android binary inside [Termux](https://termux.dev). For what croft does and the full keyboard surface see the [README](README.md) and [KEYBINDINGS.md](KEYBINDINGS.md).
+Setup notes for running croft as a native Android binary inside [Termux](https://termux.dev). For what croft does and the full keyboard surface see the [README](../README.md) and [KEYBINDINGS.md](KEYBINDINGS.md).
 
 croft compiles and runs natively on Android via the same `cargo install` command as every other platform. Two things differ on Android: there is no `Cmd` key, and mainline Termux supports no inline-image protocol. croft handles both, plus the lack of a usable soft keyboard, in-process.
 

@@ -1,6 +1,6 @@
 # croft architecture
 
-Notes for maintainers and developers. For what croft does and how to use it, see the [README](README.md); for the keyboard surface see [KEYBINDINGS.md](KEYBINDINGS.md).
+Notes for maintainers and developers. For what croft does and how to use it, see the [README](../README.md); for the keyboard surface see [KEYBINDINGS.md](KEYBINDINGS.md).
 
 croft is built on [ratatui](https://ratatui.rs/) + [crossterm](https://github.com/crossterm-rs/crossterm), with [portable-pty](https://docs.rs/portable-pty/) for the embedded shell, [alacritty_terminal](https://docs.rs/alacritty_terminal/) for terminal-state parsing, [tree-sitter](https://tree-sitter.github.io/tree-sitter/) for incremental syntax highlighting, [calamine](https://docs.rs/calamine/) for spreadsheet parsing, and an inline-image protocol (iTerm2 OSC 1337, the Kitty graphics protocol on Ghostty / kitty, or DEC sixel on terminals whose DA1 reply advertises it) for image / PDF previews.
 

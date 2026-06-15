@@ -1,6 +1,6 @@
 # croft on Linux
 
-Setup notes for running croft on Linux, both locally and as the remote target of `croft remote <host>`. For what croft does and the full keyboard surface see the [README](README.md) and [KEYBINDINGS.md](KEYBINDINGS.md).
+Setup notes for running croft on Linux, both locally and as the remote target of `croft remote <host>`. For what croft does and the full keyboard surface see the [README](../README.md) and [KEYBINDINGS.md](KEYBINDINGS.md).
 
 Linux is a first-class target: behaviour on a Linux box over SSH is identical to the local Mac, with no second-class remote mode. Most of croft's Linux-specific surface is about getting it onto the box (the remote launcher) and the keyboard modifier.
 

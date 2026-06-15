@@ -1,6 +1,6 @@
 # croft on macOS
 
-Setup notes for running croft on macOS. For what croft does and the full keyboard surface see the [README](README.md) and [KEYBINDINGS.md](KEYBINDINGS.md).
+Setup notes for running croft on macOS. For what croft does and the full keyboard surface see the [README](../README.md) and [KEYBINDINGS.md](KEYBINDINGS.md).
 
 macOS is croft's primary local platform: the clipboard, inline previews, and "Reveal in Finder" all use native AppKit paths here. The one thing macOS needs that other platforms don't is a small amount of terminal setup, because macOS reserves the `Cmd` modifier for application menus.
 

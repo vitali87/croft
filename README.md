@@ -24,7 +24,7 @@ Three panes in the VS Code arrangement: an **Explorer sidebar** on the left, a *
 
 The editor brings tree-sitter highlighting, inline previews for images / PDFs / spreadsheets, side-by-side splits, an optional vim mode, and full LSP (completion, hover, go-to-definition, rename, diagnostics). A Command Palette (`Cmd`/`Ctrl`+`Shift`+`P`) runs every command, and you can debug Python, Rust, C, and C++ with breakpoints over DAP or attach a `pdb` REPL to a live process.
 
-See **[LAYOUT.md](LAYOUT.md)** for the full pane-by-pane reference, debugging workflow, and language-server setup.
+See **[LAYOUT.md](docs/LAYOUT.md)** for the full pane-by-pane reference, debugging workflow, and language-server setup.
 
 ## Requirements
 
@@ -69,25 +69,25 @@ croft remote <host>  # launch croft over SSH on a Linux server (host from ~/.ssh
 croft --help
 ```
 
-`croft remote <host>` installs itself on the box on first connect with no manual prep, and a stock cloud image works out of the box. See [LINUX.md](LINUX.md#remote-croft-remote-host) for how the cross-compile and host provisioning work.
+`croft remote <host>` installs itself on the box on first connect with no manual prep, and a stock cloud image works out of the box. See [LINUX.md](docs/LINUX.md#remote-croft-remote-host) for how the cross-compile and host provisioning work.
 
 ## Platform setup
 
 croft runs on macOS, Linux, and Android. Cross-platform basics are above; each platform has a short guide for its Nerd Font, terminal keybindings, and optional dependencies:
 
-* **[macOS](MACOS.md)** — Nerd Font for Terminal.app, and `croft setup-iterm2` / `croft setup-ghostty` to deliver the `Cmd` chords that macOS otherwise reserves for menus.
-* **[Linux](LINUX.md)** — `Ctrl` as the command modifier, Nerd Font and poppler-utils, language servers, and the `croft remote <host>` cross-compile / provisioning flow.
-* **[Android (Termux)](ANDROID.md)** — `Ctrl` as the command modifier, `pkg`-based dependencies, the auto-installed activity-bar font, and the built-in on-screen keyboard for touch.
+* **[macOS](docs/MACOS.md)** — Nerd Font for Terminal.app, and `croft setup-iterm2` / `croft setup-ghostty` to deliver the `Cmd` chords that macOS otherwise reserves for menus.
+* **[Linux](docs/LINUX.md)** — `Ctrl` as the command modifier, Nerd Font and poppler-utils, language servers, and the `croft remote <host>` cross-compile / provisioning flow.
+* **[Android (Termux)](docs/ANDROID.md)** — `Ctrl` as the command modifier, `pkg`-based dependencies, the auto-installed activity-bar font, and the built-in on-screen keyboard for touch.
 
 ## Keybindings
 
-Every action is reachable from the keyboard; press `F1` inside croft for the full reference. The complete tables (global, Explorer, Search, editor, vim mode, previews, terminal) live in **[KEYBINDINGS.md](KEYBINDINGS.md)**. The command modifier is `Cmd` on macOS and `Ctrl` on Linux / Android; getting `Cmd` chords through your terminal is covered in the [platform guides](#platform-setup).
+Every action is reachable from the keyboard; press `F1` inside croft for the full reference. The complete tables (global, Explorer, Search, editor, vim mode, previews, terminal) live in **[KEYBINDINGS.md](docs/KEYBINDINGS.md)**. The command modifier is `Cmd` on macOS and `Ctrl` on Linux / Android; getting `Cmd` chords through your terminal is covered in the [platform guides](#platform-setup).
 
 ## Goal
 
 A complete VS Code replacement in the terminal: the full IDE experience as a single fast Rust binary. Everything VS Code does, croft will do, without leaving the TUI.
 
-Maintainers and developers: see [ARCHITECTURE.md](ARCHITECTURE.md) for the project layout and internals.
+Maintainers and developers: see [ARCHITECTURE.md](docs/ARCHITECTURE.md) for the project layout and internals.
 
 ## License
 
