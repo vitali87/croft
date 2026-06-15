@@ -615,6 +615,18 @@ fn shortcut_for(action: &MenuAction) -> Option<&'static str> {
     }
 }
 
+/// The end-of-session feedback line. When breakpoints were set but the program
+/// exited without ever stopping, say so explicitly — that is the common "I set a
+/// breakpoint and nothing happened" confusion (e.g. running a library module
+/// whose breakpointed code is never called). Otherwise a plain end message.
+fn debug_end_message(had_breakpoints: bool, ever_stopped: bool) -> &'static str {
+    if had_breakpoints && !ever_stopped {
+        "Program exited without hitting a breakpoint"
+    } else {
+        "Debug session ended"
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum ExplorerClipMode {
     Copy,
@@ -1252,6 +1264,10 @@ pub struct App {
     /// Debug console log: program stdout/stderr (DAP output events) plus REPL
     /// echoes and results. Capped; the tail is shown in the Run & Debug panel.
     pub debug_console: Vec<String>,
+    /// True once the current/just-ended debug session stopped at least once
+    /// (breakpoint / step / exception). Drives the "exited without hitting a
+    /// breakpoint" end message. Reset when a new session starts.
+    debug_ever_stopped: bool,
     /// zoxide-backed Explorer jump popup (Cmd+Z). None when closed. Opens
     /// only from the Explorer pane, so it never collides with the editor's
     /// Cmd+Z undo.
@@ -1713,6 +1729,7 @@ impl App {
             dap_session: None,
             debug_expanded: std::collections::HashSet::new(),
             debug_console: Vec::new(),
+            debug_ever_stopped: false,
             zoxide_jump: None,
             file_finder_index: None,
             file_finder_index_rx: Some(file_finder_index_rx),
@@ -6509,6 +6526,7 @@ impl App {
         let phase = self.dap_session.as_ref().map(|s| s.phase);
         match phase {
             Some(SessionPhase::Stopped) => {
+                self.debug_ever_stopped = true;
                 let loc = self
                     .dap_session
                     .as_ref()
@@ -6524,8 +6542,13 @@ impl App {
                 self.editor.stop_line = None;
                 self.editor.unverified_breakpoints.clear();
                 self.dap_session = None;
-                self.run_debug.feedback = Some(String::from("Debug session ended"));
+                let had_breakpoints = !self.editor.breakpoints.is_empty();
+                self.run_debug.feedback =
+                    Some(debug_end_message(had_breakpoints, self.debug_ever_stopped).to_string());
                 self.run_debug.feedback_is_error = false;
+                // Keep `debug_console` so its output stays visible after the run;
+                // the panel renders it until the next session starts.
+                self.run_debug.session_ended = true;
                 changed = true;
             }
             _ => {
@@ -6557,8 +6580,15 @@ impl App {
         } else {
             self.run_debug.debug_rows.clear();
             self.run_debug.debug_scroll = 0;
-            self.run_debug.console_tail.clear();
             self.run_debug.repl_input.clear();
+            // Retain the just-ended session's console output until the next run;
+            // otherwise the idle Run panel shows nothing.
+            if self.run_debug.session_ended && !self.debug_console.is_empty() {
+                let n = self.debug_console.len();
+                self.run_debug.console_tail = self.debug_console[n.saturating_sub(50)..].to_vec();
+            } else {
+                self.run_debug.console_tail.clear();
+            }
         }
     }
 
@@ -6725,6 +6755,12 @@ impl App {
     /// console, and REPL are visible the instant a session starts (VS Code
     /// reveals its debug view on launch the same way).
     fn reveal_debug_view(&mut self) {
+        // A fresh session: drop the previous run's retained console + stop
+        // tracking so the "exited without hitting a breakpoint" hint and the
+        // console reflect only this run.
+        self.debug_console.clear();
+        self.debug_ever_stopped = false;
+        self.run_debug.session_ended = false;
         self.show_tree = true;
         self.set_sidebar_view(SidebarView::RunDebug);
         self.focus_pane(Pane::Tree);

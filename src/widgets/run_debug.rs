@@ -158,6 +158,11 @@ pub struct RunDebugPanel {
     pub last_icon_cell: Option<(u16, u16)>,
     pub feedback: Option<String>,
     pub feedback_is_error: bool,
+    /// True from when a debug session ends until the next one starts. While set
+    /// (and `console_tail` is non-empty) the idle panel keeps the just-ended
+    /// session's console output on screen instead of wiping straight back to the
+    /// Run button, so a fast-exiting program's output/errors stay readable.
+    pub session_ended: bool,
 }
 
 impl RunDebugPanel {
@@ -181,6 +186,7 @@ impl RunDebugPanel {
             last_icon_cell: None,
             feedback: None,
             feedback_is_error: false,
+            session_ended: false,
         }
     }
 
@@ -569,7 +575,13 @@ impl Widget for &mut RunDebugPanel {
             )
         };
 
-        let top_pad = if inner.height > cluster {
+        // After a session ends with output, anchor the cluster to the top so the
+        // retained console (rendered below the button) gets the lower region;
+        // otherwise centre it like the resting state.
+        let show_ended_console = self.session_ended && !self.console_tail.is_empty();
+        let top_pad = if show_ended_console {
+            0
+        } else if inner.height > cluster {
             (inner.height - cluster) / 2
         } else {
             0
@@ -699,6 +711,33 @@ impl Widget for &mut RunDebugPanel {
             };
             buf.set_string(inner.x + 1, next_y, msg.as_str(), style);
             next_y = next_y.saturating_add(1);
+        }
+        // Retained console from the just-ended session: program output / errors
+        // stay readable after the run instead of being wiped to the Run button.
+        if show_ended_console && next_y + 1 < inner.y + inner.height {
+            next_y = next_y.saturating_add(1);
+            buf.set_string(
+                inner.x + 1,
+                next_y,
+                "DEBUG CONSOLE",
+                Style::default()
+                    .fg(Color::Rgb(TITLE_FG_RGB.0, TITLE_FG_RGB.1, TITLE_FG_RGB.2))
+                    .add_modifier(Modifier::BOLD),
+            );
+            next_y = next_y.saturating_add(1);
+            let bottom = inner.y + inner.height;
+            let avail = bottom.saturating_sub(next_y) as usize;
+            let start = self.console_tail.len().saturating_sub(avail);
+            let max_w = inner.width.saturating_sub(2) as usize;
+            let line_style = Style::default().fg(Color::Rgb(0x9d, 0xa5, 0xb4));
+            for line in &self.console_tail[start..] {
+                if next_y >= bottom {
+                    break;
+                }
+                let shown: String = line.chars().take(max_w).collect();
+                buf.set_string(inner.x + 1, next_y, &shown, line_style);
+                next_y = next_y.saturating_add(1);
+            }
         }
         let _ = next_y;
     }

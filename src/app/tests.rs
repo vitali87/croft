@@ -11974,3 +11974,42 @@ fn running_move_line_down_command_reorders_buffer() {
     app.run_command(crate::widgets::command_palette::Command::MoveLineDown);
     assert_eq!(app.editor.lines, vec!["b", "a", "c"]);
 }
+
+/// When a debug session ends after breakpoints were set but none was ever hit,
+/// the feedback says so explicitly rather than the opaque "Debug session ended".
+#[test]
+fn debug_end_message_flags_a_program_that_exited_without_hitting_a_breakpoint() {
+    assert_eq!(
+        debug_end_message(true, false),
+        "Program exited without hitting a breakpoint"
+    );
+    // A breakpoint was hit (ever_stopped), or none were set: plain end message.
+    assert_eq!(debug_end_message(true, true), "Debug session ended");
+    assert_eq!(debug_end_message(false, false), "Debug session ended");
+}
+
+/// The debug console (program output) stays visible after the session ends, so a
+/// fast-exiting program's output/errors aren't wiped before the user can read
+/// them. A fresh idle panel (no ended session) shows no console.
+#[test]
+fn debug_console_is_retained_after_the_session_ends() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.debug_console = vec![String::from("hello from program"), String::from("all done")];
+    app.run_debug.session_ended = true;
+    app.refresh_debug_panel();
+    assert!(
+        app.run_debug
+            .console_tail
+            .contains(&String::from("all done")),
+        "the ended session's console output must stay visible"
+    );
+
+    // A fresh idle panel (never ran, or a new run reset the flag) shows nothing.
+    app.run_debug.session_ended = false;
+    app.refresh_debug_panel();
+    assert!(
+        app.run_debug.console_tail.is_empty(),
+        "the idle Run panel must not show stale console output"
+    );
+}
