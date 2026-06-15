@@ -36,6 +36,24 @@ fn popup_gradient_tracks_black_theme() {
 }
 
 #[test]
+fn run_spec_for_runs_an_executable_binary_directly() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    // An extensionless file with the +x bit is runnable: run it directly.
+    let bin = tmp.path().join("myapp");
+    std::fs::write(&bin, b"#!/bin/sh\necho hi\n").unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let spec = App::run_spec_for(&bin, tmp.path()).expect("executable must be runnable");
+    assert_eq!(spec.program, bin.to_string_lossy());
+    assert!(spec.args.is_empty(), "the binary is run with no extra args");
+
+    // A non-executable, unknown file (like .git/config) is not runnable.
+    let cfg = tmp.path().join("config");
+    std::fs::write(&cfg, b"[core]\n").unwrap();
+    assert!(App::run_spec_for(&cfg, tmp.path()).is_none());
+}
+
+#[test]
 fn debug_stop_immediately_deactivates_the_run_debug_panel() {
     // Repro: Shift+F5 tore down the session but left the panel showing the
     // stale "Paused" tree, because poll_dap early-returns with no session and

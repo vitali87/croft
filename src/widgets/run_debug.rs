@@ -126,8 +126,12 @@ pub struct RunDebugPanel {
     pub active_file: Option<PathBuf>,
     /// Whether the active file is something croft can run or debug. When false
     /// (e.g. an extensionless `.git/config`) the empty state shows a "can't run
-    /// this file" note instead of an actionable Run button. Set by the app.
+    /// this file" note instead of an actionable button. Set by the app.
     pub runnable: bool,
+    /// Whether the button's action is debug (compiled source: build + lldb)
+    /// rather than run-in-terminal (scripts / executables). Drives both the
+    /// button verb ("Debug" vs "Run") and the click dispatch. Set by the app.
+    pub run_is_debug: bool,
     pub last_area: Rect,
     pub last_button_area: Rect,
     /// When a debug session is paused, the app fills these rows (call stack +
@@ -163,6 +167,7 @@ impl RunDebugPanel {
             focus_gradient: false,
             active_file: None,
             runnable: false,
+            run_is_debug: false,
             last_area: Rect::default(),
             last_button_area: Rect::default(),
             debug_active: false,
@@ -458,7 +463,12 @@ impl RunDebugPanel {
 
     pub fn button_label(&self) -> String {
         match self.active_file.as_ref().and_then(|p| p.file_name()) {
-            Some(name) => format!("Run {}", name.to_string_lossy()),
+            Some(name) => {
+                // Compiled source builds + launches the debugger; scripts and
+                // executables run in a terminal.
+                let verb = if self.run_is_debug { "Debug" } else { "Run" };
+                format!("{verb} {}", name.to_string_lossy())
+            }
             None => String::from("Run and Debug"),
         }
     }
@@ -840,6 +850,14 @@ mod tests {
         let mut panel = RunDebugPanel::new();
         panel.set_active_file(Some(PathBuf::from("/work/script.py")));
         assert_eq!(panel.button_label(), "Run script.py");
+    }
+
+    #[test]
+    fn button_label_says_debug_for_compiled_source() {
+        let mut panel = RunDebugPanel::new();
+        panel.set_active_file(Some(PathBuf::from("/work/main.rs")));
+        panel.run_is_debug = true;
+        assert_eq!(panel.button_label(), "Debug main.rs");
     }
 
     #[test]

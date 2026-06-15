@@ -106,6 +106,17 @@ fn lldb_dap_path() -> Option<String> {
     (!path.is_empty()).then_some(path)
 }
 
+/// Whether `path` is a regular file with the executable bit set — i.e. a
+/// compiled binary or script croft can run directly (`./file`) and debug via
+/// lldb-dap without a build step. The honest signal for "directly executable",
+/// since such files usually have no extension.
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
 /// Append variable rows to the debug tree, recursing into any expanded
 /// (`variablesReference` in `expanded`) container whose children are loaded.
 /// Pulled out as a free function so it can borrow the session immutably while
@@ -6237,26 +6248,37 @@ impl App {
         }
         match key.code {
             KeyCode::Esc => self.set_sidebar_view(SidebarView::Explorer),
-            KeyCode::Enter => self.run_active_file(),
+            KeyCode::Enter => self.run_debug_button_action(),
             _ => {}
         }
     }
 
     fn refresh_run_debug(&mut self) {
         let path = self.editor.path.clone();
-        // The Run button is only offered for files croft actually knows how to
-        // run (run_spec_for) or debug (an adapter for the extension). An
-        // extensionless file like `.git/config` is neither, so the button is
-        // hidden rather than offering an action that would just fail.
-        self.run_debug.runnable = path.as_deref().is_some_and(|p| {
-            let ext = p
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("")
-                .to_ascii_lowercase();
-            Self::run_spec_for(p, &self.workspace_root).is_some()
-                || crate::dap::session::adapter_for_extension(&ext).is_some()
-        });
+        // Decide the button: scripts and executables are "Run" (terminal);
+        // compiled source (no script runner, but a debug adapter) is "Debug"
+        // (build + lldb). Files that are neither (e.g. `.git/config`) get no
+        // button. run_spec_for already covers executables (the +x bit), so a
+        // compiled binary is "Run" — run it directly.
+        let (runnable, is_debug) = match path.as_deref() {
+            Some(p) => {
+                let ext = p
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                if Self::run_spec_for(p, &self.workspace_root).is_some() {
+                    (true, false)
+                } else if crate::dap::session::adapter_for_extension(&ext).is_some() {
+                    (true, true)
+                } else {
+                    (false, false)
+                }
+            }
+            None => (false, false),
+        };
+        self.run_debug.runnable = runnable;
+        self.run_debug.run_is_debug = is_debug;
         self.run_debug.set_active_file(path);
         self.run_debug.feedback = None;
         self.run_debug.feedback_is_error = false;
@@ -6306,7 +6328,18 @@ impl App {
             "sh" | "bash" => "bash",
             "zsh" => "zsh",
             "fish" => "fish",
-            _ => return None,
+            _ => {
+                // No known script runner. If the file is itself an executable
+                // (a compiled binary, usually extensionless), run it directly.
+                if is_executable_file(file) {
+                    return Some(RunSpec {
+                        program: file_str,
+                        args: vec![],
+                        cwd: file_dir,
+                    });
+                }
+                return None;
+            }
         };
         Some(RunSpec {
             program: String::from(runner),
@@ -6590,6 +6623,16 @@ impl App {
         self.refresh_debug_panel();
     }
 
+    /// The Run/Debug panel button action: debug compiled source (build + lldb),
+    /// or run scripts/executables in a terminal — matching the button's verb.
+    fn run_debug_button_action(&mut self) {
+        if self.run_debug.run_is_debug {
+            self.debug_start_or_continue();
+        } else {
+            self.run_active_file();
+        }
+    }
+
     /// Open and focus the Run and Debug view so the call stack, variables,
     /// console, and REPL are visible the instant a session starts (VS Code
     /// reveals its debug view on launch the same way).
@@ -6635,10 +6678,15 @@ impl App {
                 return;
             }
             None => {
-                self.run_debug.feedback = Some(format!(
-                    "No debugger for .{ext} files (Python is supported)"
-                ));
-                self.run_debug.feedback_is_error = true;
+                // An executable binary (e.g. a compiled `target/debug/app`) can
+                // be debugged directly by lldb-dap with no build step.
+                if is_executable_file(&path) {
+                    self.launch_lldb(&path, &path);
+                } else {
+                    self.run_debug.feedback =
+                        Some(format!("No debugger for .{ext} files (Python is supported)"));
+                    self.run_debug.feedback_is_error = true;
+                }
                 return;
             }
         }
@@ -6696,14 +6744,14 @@ impl App {
     /// process runs without binding breakpoints. croft surfaces the adapter's
     /// own status rather than pretending otherwise.
     fn start_lldb_debug_session(&mut self, path: &Path) {
-        use std::collections::BTreeMap;
-        let Some(adapter) = lldb_dap_path() else {
+        if lldb_dap_path().is_none() {
             self.run_debug.feedback = Some(String::from(
                 "lldb-dap not found (install Xcode Command Line Tools)",
             ));
             self.run_debug.feedback_is_error = true;
             return;
-        };
+        }
+        // Compiled source: build a debuggable binary first, then debug it.
         let binary = match self.build_debuggable_binary(path) {
             Ok(b) => b,
             Err(e) => {
@@ -6712,23 +6760,42 @@ impl App {
                 return;
             }
         };
+        self.launch_lldb(&binary, path);
+    }
+
+    /// Launch lldb-dap on an already-built `binary`, attributing status to
+    /// `label_path` (the source for a compiled language, or the binary itself
+    /// for a directly-debugged executable). Shared by the compiled-source path
+    /// and the executable-binary path so neither duplicates the launch plumbing.
+    fn launch_lldb(&mut self, binary: &Path, label_path: &Path) {
+        use std::collections::BTreeMap;
+        let Some(adapter) = lldb_dap_path() else {
+            self.run_debug.feedback = Some(String::from(
+                "lldb-dap not found (install Xcode Command Line Tools)",
+            ));
+            self.run_debug.feedback_is_error = true;
+            return;
+        };
         let breakpoints: BTreeMap<PathBuf, Vec<crate::dap::session::SourceBreakpoint>> = self
             .editor
             .breakpoints
             .iter()
             .map(|(p, lines)| (p.clone(), self.editor.source_breakpoints(p, lines)))
             .collect();
-        let cwd = path.parent().unwrap_or(&self.workspace_root).to_path_buf();
+        let cwd = label_path
+            .parent()
+            .unwrap_or(&self.workspace_root)
+            .to_path_buf();
         match crate::dap::session::DapSession::launch_with(
             &adapter,
             &[],
             &cwd,
-            crate::dap::session::lldb_launch_request(&binary, false),
+            crate::dap::session::lldb_launch_request(binary, false),
             breakpoints,
         ) {
             Ok(session) => {
                 self.dap_session = Some(session);
-                let name = path
+                let name = label_path
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_default();
@@ -11674,7 +11741,7 @@ impl App {
                             self.debug_panel_click(idx);
                         }
                     } else if self.run_debug.click_button(m.column, m.row) {
-                        self.run_active_file();
+                        self.run_debug_button_action();
                     }
                     return;
                 }
