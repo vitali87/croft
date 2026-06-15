@@ -166,13 +166,22 @@ impl DapTransport {
         cwd: &std::path::Path,
         host: &str,
         port: u16,
+        path_prepend: Option<&std::path::Path>,
     ) -> Result<DapTransport> {
-        let child = Command::new(program)
-            .args(args)
+        let mut cmd = Command::new(program);
+        cmd.args(args)
             .current_dir(cwd)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::null());
+        // js-debug spawns the debuggee with a bare `node`, so when croft resolved
+        // node outside PATH (nvm/fnm/etc.) its directory must be on the server's
+        // PATH or the child target can't launch.
+        if let Some(dir) = path_prepend {
+            let existing = std::env::var("PATH").unwrap_or_default();
+            cmd.env("PATH", format!("{}:{existing}", dir.display()));
+        }
+        let child = cmd
             .spawn()
             .with_context(|| format!("spawning debug server `{program}`"))?;
         let stream = connect_with_retry(host, port)?;

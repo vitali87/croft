@@ -8,7 +8,8 @@
 //! debugger supports (PEP 768), with no fallback to older interpreters.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 
@@ -81,14 +82,77 @@ fn js_debug_server_path(dir: &Path) -> PathBuf {
 }
 
 /// Resolve the `node` runtime croft launches the js-debug server (and the
-/// debuggee) with. Errors with an actionable hint when Node is not on PATH,
-/// since js/ts debugging cannot work without it.
+/// debuggee) with, returning an absolute path or the bare `node` command.
+///
+/// Version managers (nvm, fnm, asdf, volta) expose node only inside an
+/// interactive login shell, and nvm *lazy-loads* it, so node's directory is not
+/// on the inherited PATH and is not even on a captured login-shell PATH until
+/// node first runs. So when the plain PATH scan misses, croft asks the user's
+/// login+interactive shell to run node and print its own path — which triggers
+/// the lazy loader. This mirrors how Zed resolves the shell environment for
+/// GUI/launcher-started processes. Errors with an actionable hint when node
+/// genuinely cannot be found.
 pub fn node_program() -> Result<String> {
     if which("node") {
-        Ok(String::from("node"))
-    } else {
-        bail!("`node` not found on PATH; install Node.js to debug JavaScript/TypeScript")
+        return Ok(String::from("node"));
     }
+    if let Some(path) = resolve_node_via_login_shell() {
+        return Ok(path);
+    }
+    bail!("`node` not found on PATH; install Node.js to debug JavaScript/TypeScript")
+}
+
+/// The directory containing the resolved node binary, when it is an absolute
+/// path. Prepended to the js-debug server's PATH so the *debuggee* node process
+/// js-debug spawns (with a bare `node`) resolves to the same runtime.
+pub fn node_bin_dir(node: &str) -> Option<PathBuf> {
+    let p = Path::new(node);
+    p.is_absolute().then(|| p.parent().map(Path::to_path_buf))?
+}
+
+/// Ask the user's login+interactive shell to print node's absolute path by
+/// running it (`process.execPath`). `-i` is required because nvm defines its
+/// lazy `node` function in the interactive rc; the call is bounded so a
+/// misbehaving rc cannot hang croft.
+fn resolve_node_via_login_shell() -> Option<String> {
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| String::from("/bin/sh"));
+    let out = run_bounded(
+        &shell,
+        &["-lic", "node -e 'process.stdout.write(process.execPath)'"],
+        Duration::from_secs(8),
+    )?;
+    let path = out.trim();
+    (!path.is_empty() && Path::new(path).is_file()).then(|| path.to_string())
+}
+
+/// Run `program args...` capturing stdout, killing it if it outlives `timeout`
+/// (a login shell with a chatty/blocking rc must never wedge croft). Returns the
+/// captured stdout on a clean exit, else `None`.
+fn run_bounded(program: &str, args: &[&str], timeout: Duration) -> Option<String> {
+    use std::io::Read;
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+            Err(_) => return None,
+        }
+    }
+    let mut buf = String::new();
+    child.stdout.take()?.read_to_string(&mut buf).ok()?;
+    Some(buf)
 }
 
 /// Whether `bin` resolves on PATH (a `command -v` check via the shell-less
@@ -150,4 +214,23 @@ fn download_to_file(url: &str, dest: &Path) -> Result<()> {
         .context("reading js-debug release body")?;
     std::fs::write(dest, &bytes).context("writing js-debug release tarball")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn node_bin_dir_is_the_parent_of_an_absolute_node_path() {
+        assert_eq!(
+            node_bin_dir("/Users/x/.nvm/versions/node/v23.7.0/bin/node"),
+            Some(PathBuf::from("/Users/x/.nvm/versions/node/v23.7.0/bin"))
+        );
+    }
+
+    #[test]
+    fn node_bin_dir_is_none_for_a_bare_command() {
+        // A bare `node` (already on PATH) has no directory to inject.
+        assert_eq!(node_bin_dir("node"), None);
+    }
 }

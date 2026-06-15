@@ -687,7 +687,9 @@ impl DapSession {
             port.to_string(),
             host.to_string(),
         ];
-        let transport = DapTransport::connect_tcp_server(node, &args, cwd, host, port)?;
+        let node_dir = super::install::node_bin_dir(node);
+        let transport =
+            DapTransport::connect_tcp_server(node, &args, cwd, host, port, node_dir.as_deref())?;
         transport.send(initialize_request())?;
         transport.send(js_launch_request(program, cwd, stop_on_entry))?;
         Ok(Self::new_with_transport(
