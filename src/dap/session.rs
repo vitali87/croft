@@ -154,6 +154,11 @@ pub fn output_is_user_visible(category: &str) -> bool {
 }
 
 /// Build the `initialize` request body (sans `seq`, which the transport stamps).
+///
+/// `supportsStartDebuggingRequest` is advertised because vscode-js-debug only
+/// issues the `startDebugging` reverse request (the one that spawns the child
+/// session that actually binds breakpoints) to a client that claims support;
+/// debugpy and lldb-dap simply never send it, so it is harmless for them.
 pub fn initialize_request() -> Value {
     json!({
         "type": "request",
@@ -163,7 +168,8 @@ pub fn initialize_request() -> Value {
             "linesStartAt1": true,
             "columnsStartAt1": true,
             "pathFormat": "path",
-            "supportsRunInTerminalRequest": true
+            "supportsRunInTerminalRequest": true,
+            "supportsStartDebuggingRequest": true
         }
     })
 }
@@ -176,6 +182,10 @@ pub enum AdapterKind {
     Debugpy,
     /// lldb-dap, launches a compiled binary (Rust / C / C++).
     LldbDap,
+    /// vscode-js-debug (`dapDebugServer.js` over TCP), launches a `.js`/`.ts`
+    /// program under Node. Multi-session: a parent bootstraps and a child binds
+    /// breakpoints (see [`start_debugging_request`]).
+    JsDebug,
 }
 
 /// Pick the debug adapter for a file extension (lowercased, no dot), or None for
@@ -186,6 +196,9 @@ pub fn adapter_for_extension(ext: &str) -> Option<AdapterKind> {
         "rs" | "c" | "h" | "cc" | "cpp" | "cxx" | "hpp" | "hxx" | "m" | "mm" => {
             Some(AdapterKind::LldbDap)
         }
+        // Node-run JS/TS. TypeScript binds via source maps (Node strips types on
+        // recent versions; otherwise the adapter follows emitted `.js.map`).
+        "js" | "mjs" | "cjs" | "jsx" | "ts" | "tsx" | "mts" | "cts" => Some(AdapterKind::JsDebug),
         _ => None,
     }
 }
@@ -216,6 +229,64 @@ pub fn launch_request(program: &Path, interpreter: &Path, stop_on_entry: bool) -
             "stopOnEntry": stop_on_entry,
             "justMyCode": false
         }
+    })
+}
+
+/// Build the vscode-js-debug `launch` request for a Node program. The `pwa-node`
+/// type is the canonical Node launcher (Zed normalises `node`/`node-terminal`
+/// onto it too); `sourceMaps` lets TypeScript resolve to its `.ts` source. This
+/// is sent on BOTH the parent connection and, with the adapter-provided child
+/// configuration, the child connection that actually runs the program.
+pub fn js_launch_request(program: &Path, cwd: &Path, stop_on_entry: bool) -> Value {
+    json!({
+        "type": "request",
+        "command": "launch",
+        "arguments": {
+            "type": "pwa-node",
+            "request": "launch",
+            "program": program.to_string_lossy(),
+            "cwd": cwd.to_string_lossy(),
+            "console": "internalConsole",
+            "sourceMaps": true,
+            "stopOnEntry": stop_on_entry
+        }
+    })
+}
+
+/// Build the child `launch` request from the configuration vscode-js-debug hands
+/// back in its `startDebugging` reverse request. The configuration (carrying the
+/// `__pendingTargetId` that ties the child to the right target) is passed
+/// through verbatim as the launch arguments.
+pub fn js_child_launch_request(configuration: &Value) -> Value {
+    json!({
+        "type": "request",
+        "command": "launch",
+        "arguments": configuration,
+    })
+}
+
+/// A recognised `startDebugging` reverse request: vscode-js-debug asks the client
+/// to open a child session for `config` and the client must answer the request
+/// `request_seq`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartDebuggingRequest {
+    pub request_seq: i64,
+    pub config: Value,
+}
+
+/// Recognise a vscode-js-debug `startDebugging` reverse request and pull out the
+/// child session configuration + the seq to answer. Returns `None` for anything
+/// else (events, responses, other reverse requests like `runInTerminal`). Pure.
+pub fn start_debugging_request(msg: &Value) -> Option<StartDebuggingRequest> {
+    if msg.get("type")?.as_str()? != "request" {
+        return None;
+    }
+    if msg.get("command")?.as_str()? != "startDebugging" {
+        return None;
+    }
+    Some(StartDebuggingRequest {
+        request_seq: msg.get("seq")?.as_i64()?,
+        config: msg.get("arguments")?.get("configuration")?.clone(),
     })
 }
 
@@ -506,6 +577,15 @@ pub fn fold_breakpoint_reports(
 /// One running debug session.
 pub struct DapSession {
     transport: DapTransport,
+    /// vscode-js-debug child session. js-debug is multi-session: the `transport`
+    /// (parent) bootstraps and, via a `startDebugging` reverse request, asks us
+    /// to open this second connection to the same server; the child is where
+    /// breakpoints bind and execution stops. `None` for debugpy / lldb-dap and
+    /// until the parent requests it.
+    child: Option<DapTransport>,
+    /// For a js-debug session, the `host:port` of the debug server so the child
+    /// connection can be opened on demand. `None` for stdio adapters.
+    js_server: Option<(String, u16)>,
     pub phase: SessionPhase,
     /// Breakpoints to push once the adapter is `initialized`, keyed by absolute
     /// file path (with optional per-breakpoint conditions).
@@ -584,8 +664,51 @@ impl DapSession {
         let transport = DapTransport::spawn(adapter_program, adapter_args, cwd)?;
         transport.send(initialize_request())?;
         transport.send(launch_request)?;
-        Ok(DapSession {
+        Ok(Self::new_with_transport(transport, breakpoints, None))
+    }
+
+    /// Launch a vscode-js-debug session: spawn `node dapDebugServer.js <port>
+    /// <host>` as a TCP debug server, connect the parent socket, and drive the
+    /// `pwa-node` launch. The parent will later issue a `startDebugging` reverse
+    /// request (handled in [`DapSession::poll`]) that opens the child session
+    /// which actually runs `program` and binds breakpoints.
+    pub fn launch_js(
+        node: &str,
+        server_js: &Path,
+        cwd: &Path,
+        program: &Path,
+        breakpoints: BTreeMap<PathBuf, Vec<SourceBreakpoint>>,
+        stop_on_entry: bool,
+    ) -> Result<DapSession> {
+        let host = "127.0.0.1";
+        let port = super::transport::free_port()?;
+        let args = vec![
+            server_js.to_string_lossy().into_owned(),
+            port.to_string(),
+            host.to_string(),
+        ];
+        let transport = DapTransport::connect_tcp_server(node, &args, cwd, host, port)?;
+        transport.send(initialize_request())?;
+        transport.send(js_launch_request(program, cwd, stop_on_entry))?;
+        Ok(Self::new_with_transport(
             transport,
+            breakpoints,
+            Some((host.to_string(), port)),
+        ))
+    }
+
+    /// Assemble a fresh session around its (parent) `transport`. `js_server` is
+    /// set only for vscode-js-debug, marking the session multi-session and
+    /// carrying the address its child connection reuses.
+    fn new_with_transport(
+        transport: DapTransport,
+        breakpoints: BTreeMap<PathBuf, Vec<SourceBreakpoint>>,
+        js_server: Option<(String, u16)>,
+    ) -> DapSession {
+        DapSession {
+            transport,
+            child: None,
+            js_server,
             phase: SessionPhase::Initializing,
             breakpoints,
             stopped_thread: None,
@@ -599,14 +722,21 @@ impl DapSession {
             pending_evals: std::collections::HashMap::new(),
             exception_filters: vec![String::from("uncaught")],
             known_thread: None,
-        })
+        }
+    }
+
+    /// The transport that user-facing operations (breakpoints, stepping, stack,
+    /// variables, evaluate) target: the js-debug child once it exists, otherwise
+    /// the parent. For stdio adapters there is only the parent.
+    fn active(&self) -> &DapTransport {
+        self.child.as_ref().unwrap_or(&self.transport)
     }
 
     /// Interrupt a running program (`pause`), targeting the most recently known
     /// thread. No-op if no thread is known yet.
     pub fn pause(&mut self) {
         if let Some(tid) = self.stopped_thread.or(self.known_thread) {
-            let _ = self.transport.send(thread_request("pause", tid));
+            let _ = self.active().send(thread_request("pause", tid));
         }
     }
 
@@ -629,7 +759,7 @@ impl DapSession {
     /// `context` is typically `repl` or `watch`.
     pub fn evaluate(&mut self, expression: &str, context: &str) {
         let req = evaluate_request(expression, self.selected_frame, context);
-        if let Ok(seq) = self.transport.send(req) {
+        if let Ok(seq) = self.active().send(req) {
             self.pending_evals
                 .insert(seq, (context.to_string(), expression.to_string()));
         }
@@ -653,7 +783,7 @@ impl DapSession {
         self.scopes.clear();
         self.variables.clear();
         self.pending_var_refs.clear();
-        let _ = self.transport.send(scopes_request(frame_id));
+        let _ = self.active().send(scopes_request(frame_id));
     }
 
     /// Find a top-level variable by name across the selected frame's loaded
@@ -677,7 +807,7 @@ impl DapSession {
 
     /// Send a `variables` request and remember which reference it was for.
     fn request_variables(&mut self, variables_reference: i64) {
-        if let Ok(seq) = self.transport.send(variables_request(variables_reference)) {
+        if let Ok(seq) = self.active().send(variables_request(variables_reference)) {
             self.pending_var_refs.insert(seq, variables_reference);
         }
     }
@@ -688,163 +818,224 @@ impl DapSession {
         fold_breakpoint_reports(&mut self.unverified_breakpoints, reports)
     }
 
-    /// Drain everything the adapter has sent, advance the handshake, and return
-    /// the user-facing events. Non-blocking.
+    /// Drain everything the adapter(s) have sent, advance the handshake, and
+    /// return the user-facing events. Non-blocking. For js-debug both the parent
+    /// and the child connections are drained; `from_child` records which one a
+    /// message came from so reverse requests are answered on the right socket.
     pub fn poll(&mut self) -> Vec<DapEvent> {
         let mut out = Vec::new();
+        // Drain the parent first so a `startDebugging` request can open the child
+        // before we try to drain it this same poll.
         while let Ok(msg) = self.transport.incoming.try_recv() {
-            // Reverse requests (adapter -> client, e.g. `runInTerminal`,
-            // `startDebugging`) MUST be answered or the adapter blocks. croft
-            // debugs in-process (`internalConsole`) and doesn't honor them yet,
-            // so it declines rather than stall.
-            if msg.get("type").and_then(Value::as_str) == Some("request") {
-                if let (Some(seq), Some(command)) = (
-                    msg.get("seq").and_then(Value::as_i64),
-                    msg.get("command").and_then(Value::as_str),
-                ) {
-                    let _ = self
-                        .transport
-                        .send(reverse_request_response(seq, command, false));
-                }
-                continue;
+            self.handle_message(msg, false, &mut out);
+        }
+        // Drain the child into a buffer first (handling a message borrows `self`
+        // mutably, which can't coexist with holding the child's receiver).
+        let mut child_msgs = Vec::new();
+        if let Some(child) = self.child.as_ref() {
+            while let Ok(msg) = child.incoming.try_recv() {
+                child_msgs.push(msg);
             }
-            // Responses: the only one we act on is `stackTrace`, which tells us
-            // the file + line a `stopped` paused on.
-            if msg.get("type").and_then(Value::as_str) == Some("response") {
-                match msg.get("command").and_then(Value::as_str) {
-                    Some("stackTrace") => {
-                        self.stack_frames = parse_stack_frames(&msg);
-                        if let Some(top) = self.stack_frames.first() {
-                            if let Some(path) = top.path.clone() {
-                                self.current_location = Some((path, top.line));
-                            }
-                            // Auto-load the top frame's locals/globals.
-                            let top_id = top.id;
-                            self.load_frame(top_id);
-                        }
-                        out.push(DapEvent::InspectionUpdated);
-                    }
-                    Some("scopes") => {
-                        self.scopes = parse_scopes(&msg);
-                        // Fetch each scope's variables.
-                        let refs: Vec<i64> = self.scopes.iter().map(|s| s.variables_ref).collect();
-                        for r in refs {
-                            self.request_variables(r);
-                        }
-                        out.push(DapEvent::InspectionUpdated);
-                    }
-                    Some("variables") => {
-                        let req_seq = msg.get("request_seq").and_then(Value::as_i64);
-                        if let Some(reference) =
-                            req_seq.and_then(|s| self.pending_var_refs.remove(&s))
-                        {
-                            self.variables.insert(reference, parse_variables(&msg));
-                            out.push(DapEvent::InspectionUpdated);
-                        }
-                    }
-                    Some("evaluate") => {
-                        let req_seq = msg.get("request_seq").and_then(Value::as_i64);
-                        if let Some((context, expression)) =
-                            req_seq.and_then(|s| self.pending_evals.remove(&s))
-                        {
-                            let result = parse_evaluate_result(&msg).unwrap_or_else(|| {
-                                // Failed evaluate: surface the adapter's message.
-                                msg.get("message")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or("")
-                                    .to_string()
-                            });
-                            out.push(DapEvent::Evaluated {
-                                context,
-                                expression,
-                                result,
-                            });
-                        }
-                    }
-                    Some("setBreakpoints") => {
-                        let reports = breakpoint_reports(&msg);
-                        if self.apply_breakpoint_reports(&reports) {
-                            out.push(DapEvent::BreakpointsUpdated);
-                        }
-                    }
-                    _ => {}
-                }
-                continue;
-            }
-            // `thread` events announce thread ids; remember the latest so we can
-            // target `pause` while the program is running.
-            if msg.get("event").and_then(Value::as_str) == Some("thread") {
-                if let Some(tid) = msg
-                    .get("body")
-                    .and_then(|b| b.get("threadId"))
-                    .and_then(Value::as_i64)
-                {
-                    self.known_thread = Some(tid);
-                }
-                continue;
-            }
-            // `breakpoint` events carry late-resolved verification updates.
-            if msg.get("event").and_then(Value::as_str) == Some("breakpoint") {
-                let reports = breakpoint_reports(&msg);
-                if self.apply_breakpoint_reports(&reports) {
-                    out.push(DapEvent::BreakpointsUpdated);
-                }
-                continue;
-            }
-            let Some(event) = classify_event(&msg) else {
-                continue;
-            };
-            match &event {
-                DapEvent::Initialized => {
-                    self.push_breakpoints();
-                    let _ = self
-                        .transport
-                        .send(set_exception_breakpoints_request(&self.exception_filters));
-                    let _ = self.transport.send(configuration_done_request());
-                    self.phase = SessionPhase::Running;
-                }
-                DapEvent::Stopped { thread_id, .. } => {
-                    self.stopped_thread = Some(*thread_id);
-                    self.known_thread = Some(*thread_id);
-                    self.phase = SessionPhase::Stopped;
-                    // Frame ids / variable references from a prior stop are stale.
-                    self.clear_inspection();
-                    // Resolve the stack asynchronously; the response arrives on a
-                    // later poll and fills the location + call stack + variables.
-                    let _ = self.transport.send(stack_trace_request(*thread_id));
-                }
-                DapEvent::Continued => {
-                    self.phase = SessionPhase::Running;
-                    self.current_location = None;
-                    self.clear_inspection();
-                }
-                DapEvent::Terminated => {
-                    self.phase = SessionPhase::Terminated;
-                    self.current_location = None;
-                    self.clear_inspection();
-                }
-                DapEvent::Output { .. } => {}
-                // Produced internally above, never via classify_event.
-                DapEvent::BreakpointsUpdated
-                | DapEvent::InspectionUpdated
-                | DapEvent::Evaluated { .. } => {}
-            }
-            out.push(event);
+        }
+        for msg in child_msgs {
+            self.handle_message(msg, true, &mut out);
         }
         out
     }
 
-    /// Push every stashed breakpoint set (called on `initialized`).
+    /// Handle one decoded message from the parent (`from_child = false`) or the
+    /// js-debug child (`from_child = true`), pushing any user-facing events.
+    fn handle_message(&mut self, msg: Value, from_child: bool, out: &mut Vec<DapEvent>) {
+        // Reverse requests (adapter -> client) MUST be answered or the adapter
+        // blocks. vscode-js-debug's `startDebugging` asks us to open the child
+        // session; everything else croft declines (it debugs in-process).
+        if msg.get("type").and_then(Value::as_str) == Some("request") {
+            if let Some(req) = start_debugging_request(&msg) {
+                let _ = self.transport.send(reverse_request_response(
+                    req.request_seq,
+                    "startDebugging",
+                    true,
+                ));
+                self.open_child_session(&req.config);
+            } else if let (Some(seq), Some(command)) = (
+                msg.get("seq").and_then(Value::as_i64),
+                msg.get("command").and_then(Value::as_str),
+            ) {
+                let resp = reverse_request_response(seq, command, false);
+                if from_child {
+                    if let Some(c) = self.child.as_ref() {
+                        let _ = c.send(resp);
+                    }
+                } else {
+                    let _ = self.transport.send(resp);
+                }
+            }
+            return;
+        }
+        // Responses: the only one we act on is `stackTrace`, which tells us the
+        // file + line a `stopped` paused on.
+        if msg.get("type").and_then(Value::as_str) == Some("response") {
+            match msg.get("command").and_then(Value::as_str) {
+                Some("stackTrace") => {
+                    self.stack_frames = parse_stack_frames(&msg);
+                    if let Some(top) = self.stack_frames.first() {
+                        if let Some(path) = top.path.clone() {
+                            self.current_location = Some((path, top.line));
+                        }
+                        let top_id = top.id;
+                        self.load_frame(top_id);
+                    }
+                    out.push(DapEvent::InspectionUpdated);
+                }
+                Some("scopes") => {
+                    self.scopes = parse_scopes(&msg);
+                    let refs: Vec<i64> = self.scopes.iter().map(|s| s.variables_ref).collect();
+                    for r in refs {
+                        self.request_variables(r);
+                    }
+                    out.push(DapEvent::InspectionUpdated);
+                }
+                Some("variables") => {
+                    let req_seq = msg.get("request_seq").and_then(Value::as_i64);
+                    if let Some(reference) = req_seq.and_then(|s| self.pending_var_refs.remove(&s))
+                    {
+                        self.variables.insert(reference, parse_variables(&msg));
+                        out.push(DapEvent::InspectionUpdated);
+                    }
+                }
+                Some("evaluate") => {
+                    let req_seq = msg.get("request_seq").and_then(Value::as_i64);
+                    if let Some((context, expression)) =
+                        req_seq.and_then(|s| self.pending_evals.remove(&s))
+                    {
+                        let result = parse_evaluate_result(&msg).unwrap_or_else(|| {
+                            msg.get("message")
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .to_string()
+                        });
+                        out.push(DapEvent::Evaluated {
+                            context,
+                            expression,
+                            result,
+                        });
+                    }
+                }
+                // js-debug reports breakpoints `verified:false` ("provisional")
+                // before binding them on the fly, so treating its reports as
+                // unverified would wrongly render every js/ts breakpoint hollow.
+                // Only stdio adapters' reports drive the hollow rendering; for a
+                // js-debug session the guard fails and the arm falls through to
+                // the no-op `_` below.
+                Some("setBreakpoints") if self.js_server.is_none() => {
+                    let reports = breakpoint_reports(&msg);
+                    if self.apply_breakpoint_reports(&reports) {
+                        out.push(DapEvent::BreakpointsUpdated);
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+        // `thread` events announce thread ids; remember the latest so we can
+        // target `pause` while the program is running.
+        if msg.get("event").and_then(Value::as_str) == Some("thread") {
+            if let Some(tid) = msg
+                .get("body")
+                .and_then(|b| b.get("threadId"))
+                .and_then(Value::as_i64)
+            {
+                self.known_thread = Some(tid);
+            }
+            return;
+        }
+        // `breakpoint` events carry late-resolved verification updates.
+        if msg.get("event").and_then(Value::as_str) == Some("breakpoint") {
+            if self.js_server.is_none() {
+                let reports = breakpoint_reports(&msg);
+                if self.apply_breakpoint_reports(&reports) {
+                    out.push(DapEvent::BreakpointsUpdated);
+                }
+            }
+            return;
+        }
+        let Some(event) = classify_event(&msg) else {
+            return;
+        };
+        match &event {
+            DapEvent::Initialized => {
+                // Push breakpoints + configurationDone to the connection that
+                // just initialized (parent or child). `active()` already resolves
+                // to the child once it exists, and to the parent before that.
+                self.push_breakpoints();
+                let t = self.active();
+                let _ = t.send(set_exception_breakpoints_request(&self.exception_filters));
+                let _ = t.send(configuration_done_request());
+                self.phase = SessionPhase::Running;
+            }
+            DapEvent::Stopped { thread_id, .. } => {
+                self.stopped_thread = Some(*thread_id);
+                self.known_thread = Some(*thread_id);
+                self.phase = SessionPhase::Stopped;
+                self.clear_inspection();
+                let _ = self.active().send(stack_trace_request(*thread_id));
+            }
+            DapEvent::Continued => {
+                self.phase = SessionPhase::Running;
+                self.current_location = None;
+                self.clear_inspection();
+            }
+            DapEvent::Terminated => {
+                // For js-debug a child `terminated` ends the run; a parent
+                // `terminated` without a child also ends it. Either way tear down.
+                self.phase = SessionPhase::Terminated;
+                self.current_location = None;
+                self.clear_inspection();
+            }
+            DapEvent::Output { .. } => {}
+            DapEvent::BreakpointsUpdated
+            | DapEvent::InspectionUpdated
+            | DapEvent::Evaluated { .. } => {}
+        }
+        // Suppress the parent's own `terminated` for js-debug while a child is
+        // still live (the parent can wind down its bootstrap connection first).
+        if from_child || !matches!(event, DapEvent::Terminated) || self.child.is_none() {
+            out.push(event);
+        }
+    }
+
+    /// Open the vscode-js-debug child session: connect a second socket to the
+    /// same debug server and replay `initialize` + `launch` with the adapter-
+    /// provided child configuration (which carries the `__pendingTargetId`).
+    fn open_child_session(&mut self, config: &Value) {
+        let Some((host, port)) = self.js_server.clone() else {
+            return;
+        };
+        match DapTransport::connect_tcp(&host, port) {
+            Ok(child) => {
+                let _ = child.send(initialize_request());
+                let _ = child.send(js_child_launch_request(config));
+                self.child = Some(child);
+            }
+            Err(e) => {
+                super::log::log(&format!("js-debug child connect failed: {e}"));
+            }
+        }
+    }
+
+    /// Push every stashed breakpoint set to the active connection (called on
+    /// `initialized`).
     fn push_breakpoints(&mut self) {
+        let t = self.active();
         for (path, lines) in &self.breakpoints {
-            let _ = self.transport.send(set_breakpoints_request(path, lines));
+            let _ = t.send(set_breakpoints_request(path, lines));
         }
     }
 
     /// Resume execution of the stopped thread.
     pub fn continue_execution(&mut self) {
         if let Some(tid) = self.stopped_thread {
-            let _ = self.transport.send(thread_request("continue", tid));
+            let _ = self.active().send(thread_request("continue", tid));
             self.phase = SessionPhase::Running;
         }
     }
@@ -854,24 +1045,30 @@ impl DapSession {
     /// running takes effect without a restart.
     pub fn update_breakpoints(&mut self, path: &Path, breakpoints: &[SourceBreakpoint]) {
         let _ = self
-            .transport
+            .active()
             .send(set_breakpoints_request(path, breakpoints));
     }
 
     /// Step over (`next`), into (`stepIn`), or out (`stepOut`).
     pub fn step(&mut self, command: &str) {
         if let Some(tid) = self.stopped_thread {
-            let _ = self.transport.send(thread_request(command, tid));
+            let _ = self.active().send(thread_request(command, tid));
         }
     }
 
-    /// Ask the adapter to disconnect and terminate the debuggee.
+    /// Ask the adapter to disconnect and terminate the debuggee. Sent to both the
+    /// child (if any) and the parent so a js-debug server tears the whole tree
+    /// down, not just the target.
     pub fn disconnect(&mut self) {
-        let _ = self.transport.send(json!({
+        let req = json!({
             "type": "request",
             "command": "disconnect",
             "arguments": { "terminateDebuggee": true }
-        }));
+        });
+        if let Some(child) = self.child.as_ref() {
+            let _ = child.send(req.clone());
+        }
+        let _ = self.transport.send(req);
         self.phase = SessionPhase::Terminated;
     }
 }
@@ -919,6 +1116,73 @@ mod tests {
         assert_eq!(adapter_for_extension("cpp"), Some(AdapterKind::LldbDap));
         assert_eq!(adapter_for_extension("txt"), None);
         assert_eq!(adapter_for_extension(""), None);
+    }
+
+    #[test]
+    fn adapter_selection_routes_js_and_ts_to_js_debug() {
+        for ext in ["js", "mjs", "cjs", "jsx", "ts", "tsx", "mts", "cts"] {
+            assert_eq!(
+                adapter_for_extension(ext),
+                Some(AdapterKind::JsDebug),
+                "{ext} must route to js-debug"
+            );
+        }
+    }
+
+    #[test]
+    fn js_launch_request_is_pwa_node_with_source_maps() {
+        let req = js_launch_request(Path::new("/proj/app.ts"), Path::new("/proj"), false);
+        assert_eq!(req["command"], "launch");
+        assert_eq!(req["arguments"]["type"], "pwa-node");
+        assert_eq!(req["arguments"]["request"], "launch");
+        assert_eq!(req["arguments"]["program"], "/proj/app.ts");
+        assert_eq!(req["arguments"]["cwd"], "/proj");
+        // TypeScript debugging rides on source maps (matches Zed's defaults).
+        assert_eq!(req["arguments"]["sourceMaps"], true);
+        assert_eq!(req["arguments"]["console"], "internalConsole");
+    }
+
+    #[test]
+    fn initialize_advertises_start_debugging_support() {
+        // js-debug only sends the `startDebugging` reverse request to a client
+        // that advertises support for it; without this it never spawns the
+        // child session that actually binds breakpoints.
+        let req = initialize_request();
+        assert_eq!(req["arguments"]["supportsStartDebuggingRequest"], true);
+    }
+
+    #[test]
+    fn start_debugging_reverse_request_is_recognised_and_yields_child_config() {
+        // Shape captured from the live adapter (vscode-js-debug v1.117.0).
+        let msg = json!({
+            "type": "request", "seq": 8, "command": "startDebugging",
+            "arguments": {
+                "request": "launch",
+                "configuration": {
+                    "type": "pwa-node",
+                    "name": "target.js [60277]",
+                    "__pendingTargetId": "dd35f91abc4e878814ccfee3"
+                }
+            }
+        });
+        let parsed = start_debugging_request(&msg).expect("must recognise startDebugging");
+        assert_eq!(parsed.request_seq, 8);
+        assert_eq!(
+            parsed.config["__pendingTargetId"],
+            "dd35f91abc4e878814ccfee3"
+        );
+        assert_eq!(parsed.config["type"], "pwa-node");
+    }
+
+    #[test]
+    fn non_start_debugging_messages_are_not_mistaken_for_it() {
+        assert!(start_debugging_request(&json!({"type": "event", "event": "stopped"})).is_none());
+        assert!(
+            start_debugging_request(
+                &json!({"type": "request", "seq": 1, "command": "runInTerminal"})
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -1227,6 +1491,53 @@ mod tests {
         sess.disconnect();
 
         assert!(stopped, "expected a `stopped` event from debugpy");
+        let (_loc, line) = sess.current_location.clone().expect("a paused location");
+        assert_eq!(line, 3, "should pause on the breakpoint line");
+    }
+
+    /// End-to-end against the real vscode-js-debug server: launch a Node script
+    /// with a breakpoint and confirm the multi-session handshake (parent ->
+    /// `startDebugging` -> child) reaches `Stopped` at that line. Ignored by
+    /// default — needs `node` + `~/.croft/js-debug`; run with
+    /// `cargo test --bin croft -- --ignored launches_js_debug`.
+    #[test]
+    #[ignore = "requires node + ~/.croft/js-debug (vscode-js-debug server)"]
+    fn launches_js_debug_and_stops_at_breakpoint() {
+        use std::io::Write;
+        let node = crate::dap::install::node_program().expect("node on PATH");
+        let server = crate::dap::install::ensure_js_debug().expect("provision js-debug");
+        let mut f = tempfile::Builder::new().suffix(".js").tempfile().unwrap();
+        writeln!(
+            f,
+            "const a = 1;\nconst b = 2;\nconst c = a + b;\nconsole.log(c);"
+        )
+        .unwrap();
+        let path = f.path().canonicalize().unwrap();
+
+        let mut bps = BTreeMap::new();
+        bps.insert(path.clone(), vec![SourceBreakpoint::plain(3)]); // break on `const c = a + b`
+        let mut sess =
+            DapSession::launch_js(&node, &server, path.parent().unwrap(), &path, bps, false)
+                .unwrap();
+
+        let mut stopped = false;
+        for _ in 0..200 {
+            for ev in sess.poll() {
+                if matches!(ev, DapEvent::Stopped { .. }) {
+                    stopped = true;
+                }
+            }
+            if sess.current_location.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        sess.disconnect();
+
+        assert!(
+            stopped,
+            "expected a `stopped` event from js-debug's child session"
+        );
         let (_loc, line) = sess.current_location.clone().expect("a paused location");
         assert_eq!(line, 3, "should pause on the breakpoint line");
     }

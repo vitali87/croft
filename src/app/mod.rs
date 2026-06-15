@@ -6776,6 +6776,10 @@ impl App {
                 self.start_lldb_debug_session(&path);
                 return;
             }
+            Some(AdapterKind::JsDebug) => {
+                self.start_js_debug_session(&path);
+                return;
+            }
             None => {
                 // An executable binary (e.g. a compiled `target/debug/app`) can
                 // be debugged directly by lldb-dap with no build step.
@@ -6783,7 +6787,7 @@ impl App {
                     self.launch_lldb(&path, &path);
                 } else {
                     self.debug_error(format!(
-                        "No debugger for .{ext} files (Python is supported)"
+                        "No debugger for .{ext} files (Python, JS/TS, Rust, C/C++ are supported)"
                     ));
                 }
                 return;
@@ -6810,6 +6814,58 @@ impl App {
             &self.workspace_root,
             &path,
             &py,
+            breakpoints,
+            false,
+        ) {
+            Ok(session) => {
+                self.dap_session = Some(session);
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                self.run_debug.feedback = Some(format!("Debugging {name}"));
+                self.run_debug.feedback_is_error = false;
+                self.status =
+                    format!("Debugging {name} — F5 continue · F10 step over · Shift+F5 stop");
+                self.reveal_debug_view();
+            }
+            Err(e) => {
+                self.debug_error(format!("Failed to start debugger: {e}"));
+            }
+        }
+    }
+
+    /// Launch a vscode-js-debug session for a `.js`/`.ts` file run under Node.
+    /// Provisions the js-debug server on first use, then drives the shared DAP
+    /// session machinery (which transparently spawns the parent + child
+    /// connections js-debug requires). TypeScript binds via source maps.
+    fn start_js_debug_session(&mut self, path: &Path) {
+        use std::collections::BTreeMap;
+        let node = match crate::dap::install::node_program() {
+            Ok(n) => n,
+            Err(e) => {
+                self.debug_error(format!("{e}"));
+                return;
+            }
+        };
+        let server = match crate::dap::install::ensure_js_debug() {
+            Ok(s) => s,
+            Err(e) => {
+                self.debug_error(format!("Debugger setup failed: {e}"));
+                return;
+            }
+        };
+        let breakpoints: BTreeMap<PathBuf, Vec<crate::dap::session::SourceBreakpoint>> = self
+            .editor
+            .breakpoints
+            .iter()
+            .map(|(p, lines)| (p.clone(), self.editor.source_breakpoints(p, lines)))
+            .collect();
+        match crate::dap::session::DapSession::launch_js(
+            &node,
+            &server,
+            &self.workspace_root,
+            path,
             breakpoints,
             false,
         ) {

@@ -7,13 +7,22 @@
 //! is built from CPython 3.14+ (`uv venv -p 3.14`) — the only line croft's
 //! debugger supports (PEP 768), with no fallback to older interpreters.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 
 /// Minimum CPython line croft debugs. `uv` resolves the newest matching.
 const PYTHON_VERSION: &str = "3.14";
+
+/// Pinned vscode-js-debug release. The `js-debug-dap-vX.Y.Z.tar.gz` asset is the
+/// bundled standalone debug server (the same artifact Zed and nvim/Mason use);
+/// it extracts to `js-debug/src/dapDebugServer.js`. Bump deliberately.
+const JS_DEBUG_VERSION: &str = "v1.117.0";
+
+/// Cap on the js-debug tarball download (the v1.117 asset is ~10 MB; this is a
+/// generous ceiling that still refuses a runaway/redirected body).
+const MAX_JS_DEBUG_BYTES: u64 = 64 * 1024 * 1024;
 
 /// `~/.croft/debug-venv`, or `None` when `$HOME` is unset (the guard the rest of
 /// croft uses for `~/.croft`).
@@ -58,4 +67,87 @@ pub fn ensure_debug_venv() -> Result<PathBuf> {
         bail!("`uv pip install debugpy` failed");
     }
     Ok(py)
+}
+
+/// `~/.croft/js-debug`, the install root for the vscode-js-debug server.
+fn js_debug_dir() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    Some(PathBuf::from(home).join(".croft").join("js-debug"))
+}
+
+/// Path to the extracted `dapDebugServer.js` (the standalone DAP server).
+fn js_debug_server_path(dir: &Path) -> PathBuf {
+    dir.join("js-debug").join("src").join("dapDebugServer.js")
+}
+
+/// Resolve the `node` runtime croft launches the js-debug server (and the
+/// debuggee) with. Errors with an actionable hint when Node is not on PATH,
+/// since js/ts debugging cannot work without it.
+pub fn node_program() -> Result<String> {
+    if which("node") {
+        Ok(String::from("node"))
+    } else {
+        bail!("`node` not found on PATH; install Node.js to debug JavaScript/TypeScript")
+    }
+}
+
+/// Whether `bin` resolves on PATH (a `command -v` check via the shell-less
+/// `which`-style scan of PATH entries).
+fn which(bin: &str) -> bool {
+    std::env::var_os("PATH")
+        .map(|paths| std::env::split_paths(&paths).any(|p| p.join(bin).is_file()))
+        .unwrap_or(false)
+}
+
+/// Ensure the vscode-js-debug server is installed, downloading + extracting the
+/// pinned release tarball on first use. Returns the path to `dapDebugServer.js`.
+/// Blocking: the first call downloads ~10 MB and shells out to `tar`; later
+/// calls are a cheap existence check. Mirrors [`ensure_debug_venv`].
+pub fn ensure_js_debug() -> Result<PathBuf> {
+    let dir = js_debug_dir().context("$HOME unset; cannot locate ~/.croft/js-debug")?;
+    let server = js_debug_server_path(&dir);
+    if server.exists() {
+        return Ok(server);
+    }
+    std::fs::create_dir_all(&dir).context("creating ~/.croft/js-debug")?;
+
+    let url = format!(
+        "https://github.com/microsoft/vscode-js-debug/releases/download/{JS_DEBUG_VERSION}/js-debug-dap-{JS_DEBUG_VERSION}.tar.gz"
+    );
+    let tarball = dir.join("js-debug-dap.tar.gz");
+    download_to_file(&url, &tarball)?;
+
+    // The asset extracts a top-level `js-debug/` directory; -C lands it under
+    // ~/.croft/js-debug so the server is at js-debug/src/dapDebugServer.js.
+    let status = Command::new("tar")
+        .arg("-xzf")
+        .arg(&tarball)
+        .arg("-C")
+        .arg(&dir)
+        .status()
+        .context("running `tar -xzf` on the js-debug release")?;
+    let _ = std::fs::remove_file(&tarball);
+    if !status.success() {
+        bail!("extracting the js-debug release failed");
+    }
+    if !server.exists() {
+        bail!("js-debug release did not contain dapDebugServer.js (layout changed?)");
+    }
+    Ok(server)
+}
+
+/// Stream `url` to `dest`, capped at [`MAX_JS_DEBUG_BYTES`]. Follows redirects
+/// (the GitHub release URL 302s to a CDN).
+fn download_to_file(url: &str, dest: &Path) -> Result<()> {
+    use std::io::Read;
+    let resp = ureq::get(url)
+        .call()
+        .context("downloading js-debug release")?;
+    let mut bytes = Vec::new();
+    resp.into_reader()
+        .take(MAX_JS_DEBUG_BYTES)
+        .read_to_end(&mut bytes)
+        .context("reading js-debug release body")?;
+    std::fs::write(dest, &bytes).context("writing js-debug release tarball")?;
+    Ok(())
 }

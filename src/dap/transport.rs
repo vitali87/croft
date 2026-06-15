@@ -14,7 +14,7 @@
 //! `request_seq` and reacts to events.
 
 use std::io::{BufReader, Read, Write};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
@@ -89,10 +89,15 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     (0..=haystack.len() - needle.len()).find(|&i| &haystack[i..i + needle.len()] == needle)
 }
 
-/// A running debug adapter process plus its message plumbing.
+/// A running debug adapter connection plus its message plumbing. The adapter is
+/// reached either over a child process's stdio (debugpy, lldb-dap) or over a TCP
+/// socket to a debug server (vscode-js-debug). Both share one decode/encode path;
+/// only the byte source differs, abstracted behind the boxed writer + reader.
 pub struct DapTransport {
-    child: Child,
-    stdin: Mutex<ChildStdin>,
+    /// The adapter / debug-server process, when this transport owns one. A child
+    /// TCP session connecting to an already-running server holds `None`.
+    child: Option<Child>,
+    writer: Mutex<Box<dyn Write + Send>>,
     seq: AtomicI64,
     /// Drained by the session: every decoded incoming message (responses,
     /// events, reverse-requests).
@@ -143,8 +148,58 @@ impl DapTransport {
             .context("spawning dap-reader thread")?;
 
         Ok(DapTransport {
+            child: Some(child),
+            writer: Mutex::new(Box::new(stdin)),
+            seq: AtomicI64::new(0),
+            incoming: rx,
+        })
+    }
+
+    /// Spawn a DAP debug *server* (`node dapDebugServer.js <port> <host>`) and
+    /// connect to it over TCP. Used by vscode-js-debug, whose adapter is a
+    /// socket server rather than a stdio child. The server's own stdout/stderr
+    /// are discarded (DAP rides the socket); croft retries the connect for a
+    /// short window while the server binds its port.
+    pub fn connect_tcp_server(
+        program: &str,
+        args: &[String],
+        cwd: &std::path::Path,
+        host: &str,
+        port: u16,
+    ) -> Result<DapTransport> {
+        let child = Command::new(program)
+            .args(args)
+            .current_dir(cwd)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .with_context(|| format!("spawning debug server `{program}`"))?;
+        let stream = connect_with_retry(host, port)?;
+        Self::from_stream(stream, Some(child))
+    }
+
+    /// Connect to an already-running DAP debug server over TCP, owning no child
+    /// process. vscode-js-debug's child sessions reuse the parent's server, so
+    /// the child transport just opens a second socket to the same `host:port`.
+    pub fn connect_tcp(host: &str, port: u16) -> Result<DapTransport> {
+        let stream = connect_with_retry(host, port)?;
+        Self::from_stream(stream, None)
+    }
+
+    /// Wire a connected TCP stream into a transport: a reader thread frames the
+    /// read half into `incoming`, the write half is the boxed writer.
+    fn from_stream(stream: std::net::TcpStream, child: Option<Child>) -> Result<DapTransport> {
+        let reader = stream.try_clone().context("cloning DAP socket for reads")?;
+        let writer = stream;
+        let (tx, rx): (Sender<Value>, Receiver<Value>) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("dap-reader".into())
+            .spawn(move || reader_loop(reader, tx))
+            .context("spawning dap-reader thread")?;
+        Ok(DapTransport {
             child,
-            stdin: Mutex::new(stdin),
+            writer: Mutex::new(Box::new(writer)),
             seq: AtomicI64::new(0),
             incoming: rx,
         })
@@ -169,18 +224,60 @@ impl DapTransport {
                 .and_then(Value::as_str)
                 .unwrap_or("?")
         ));
-        let mut stdin = self.stdin.lock().expect("dap stdin mutex poisoned");
-        stdin
-            .write_all(&bytes)
-            .context("writing to adapter stdin")?;
-        stdin.flush().context("flushing adapter stdin")?;
+        let mut writer = self.writer.lock().expect("dap writer mutex poisoned");
+        writer.write_all(&bytes).context("writing to adapter")?;
+        writer.flush().context("flushing adapter")?;
         Ok(seq)
     }
 
-    /// Best-effort terminate the adapter process.
+    /// Best-effort terminate the adapter process, if this transport owns one.
     pub fn kill(&mut self) {
-        let _ = self.child.kill();
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.kill();
+        }
     }
+}
+
+/// Connect to `host:port`, retrying for a short window while the freshly-spawned
+/// debug server binds its listener. Fails after the window with the last error.
+fn connect_with_retry(host: &str, port: u16) -> Result<std::net::TcpStream> {
+    use std::net::{TcpStream, ToSocketAddrs};
+    let addr = (host, port)
+        .to_socket_addrs()
+        .with_context(|| format!("resolving {host}:{port}"))?
+        .next()
+        .with_context(|| format!("no address for {host}:{port}"))?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut last_err = None;
+    while std::time::Instant::now() < deadline {
+        match TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(500)) {
+            Ok(stream) => {
+                let _ = stream.set_nodelay(true);
+                return Ok(stream);
+            }
+            Err(e) => {
+                last_err = Some(e);
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
+    }
+    Err(anyhow::anyhow!(
+        "could not connect to debug server at {host}:{port}: {}",
+        last_err
+            .map(|e| e.to_string())
+            .unwrap_or_else(|| String::from("timed out"))
+    ))
+}
+
+/// Pick a currently-free TCP port on localhost by binding to port 0 and reading
+/// back the assigned port. There is a tiny race between releasing it here and
+/// the debug server binding it, but it is the standard way editors hand a port
+/// to a DAP server (Zed/nvim do the same).
+pub fn free_port() -> Result<u16> {
+    let listener =
+        std::net::TcpListener::bind("127.0.0.1:0").context("binding to find free port")?;
+    let port = listener.local_addr().context("reading bound port")?.port();
+    Ok(port)
 }
 
 impl Drop for DapTransport {
@@ -192,8 +289,8 @@ impl Drop for DapTransport {
 /// Read framed messages off the adapter's stdout until EOF, forwarding each to
 /// the session. Exits quietly when the channel receiver is dropped or stdout
 /// closes.
-fn reader_loop(stdout: std::process::ChildStdout, tx: Sender<Value>) {
-    let mut reader = BufReader::new(stdout);
+fn reader_loop<R: Read>(source: R, tx: Sender<Value>) {
+    let mut reader = BufReader::new(source);
     let mut decoder = FrameDecoder::new();
     let mut chunk = [0u8; 8192];
     loop {
@@ -290,7 +387,7 @@ mod tests {
         let cwd = std::env::temp_dir();
         let t =
             DapTransport::spawn("sleep", &["3".to_string()], &cwd).expect("spawn stand-in adapter");
-        let child_pid = t.child.id() as libc::pid_t;
+        let child_pid = t.child.as_ref().expect("stdio adapter owns a child").id() as libc::pid_t;
         // SAFETY: getsid is a pure query with no side effects.
         let child_sid = unsafe { libc::getsid(child_pid) };
         let our_sid = unsafe { libc::getsid(0) };
