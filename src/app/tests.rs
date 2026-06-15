@@ -44,6 +44,7 @@ fn debug_stop_immediately_deactivates_the_run_debug_panel() {
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     // Simulate a paused panel.
     app.run_debug.debug_active = true;
+    app.run_debug.feedback = Some("Paused (breakpoint)".into());
     app.run_debug.debug_rows = vec![crate::widgets::run_debug::DebugRow {
         indent: 0,
         kind: crate::widgets::run_debug::DebugRowKind::Header {
@@ -58,6 +59,10 @@ fn debug_stop_immediately_deactivates_the_run_debug_panel() {
     assert!(
         app.run_debug.debug_rows.is_empty(),
         "stale call-stack/variables rows must be cleared on stop"
+    );
+    assert!(
+        app.run_debug.feedback.is_none(),
+        "stale 'Paused' feedback must be cleared so the empty state is clean"
     );
 }
 

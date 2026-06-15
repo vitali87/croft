@@ -6938,6 +6938,10 @@ impl App {
         self.editor.stop_line = None;
         self.editor.unverified_breakpoints.clear();
         self.status = String::from("Debug session stopped");
+        // Clear the paused-state feedback ("Paused (breakpoint)") so the
+        // empty-state panel doesn't keep showing it under the Run button.
+        self.run_debug.feedback = None;
+        self.run_debug.feedback_is_error = false;
         // Refresh now: `poll_dap` early-returns once the session is gone, so it
         // would never deactivate the panel on its own — without this the Run &
         // Debug panel keeps showing the stale "Paused" tree until the next event.
