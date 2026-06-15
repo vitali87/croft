@@ -36,6 +36,32 @@ fn popup_gradient_tracks_black_theme() {
 }
 
 #[test]
+fn debug_stop_immediately_deactivates_the_run_debug_panel() {
+    // Repro: Shift+F5 tore down the session but left the panel showing the
+    // stale "Paused" tree, because poll_dap early-returns with no session and
+    // never refreshes. debug_stop must refresh the panel itself.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    // Simulate a paused panel.
+    app.run_debug.debug_active = true;
+    app.run_debug.debug_rows = vec![crate::widgets::run_debug::DebugRow {
+        indent: 0,
+        kind: crate::widgets::run_debug::DebugRowKind::Header {
+            title: "CALL STACK".into(),
+        },
+    }];
+    app.debug_stop();
+    assert!(
+        !app.run_debug.debug_active,
+        "panel must deactivate the instant the session stops"
+    );
+    assert!(
+        app.run_debug.debug_rows.is_empty(),
+        "stale call-stack/variables rows must be cleared on stop"
+    );
+}
+
+#[test]
 fn black_theme_context_menu_uses_gradient_border_and_muted_selection() {
     use crate::gradient::{GRAD_TL, POPUP_SEL_BG, rgb_color};
     let tmp = tempfile::tempdir().unwrap();
