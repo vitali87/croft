@@ -88,22 +88,69 @@ fn activity_icon_glyph_x(bar: Rect) -> u16 {
     bar.x + bar.width / 2
 }
 
+/// Rank an executable basename as an lldb-dap candidate, or `None` if it is not
+/// one. LLVM ships the adapter under several names: the bare `lldb-dap`, the
+/// versioned `lldb-dap-18` that Debian/Ubuntu install (often with no
+/// unversioned symlink), and the legacy `lldb-vscode[-NN]` name from older
+/// releases. Higher rank wins: an unversioned binary (tracks the system
+/// default) beats any versioned one, a newer LLVM release beats an older one,
+/// and at equal version the modern `lldb-dap` name beats legacy `lldb-vscode`.
+fn lldb_dap_rank(name: &str) -> Option<i64> {
+    if name == "lldb-dap" {
+        return Some(i64::MAX);
+    }
+    if name == "lldb-vscode" {
+        return Some(i64::MAX - 1);
+    }
+    // `family` breaks ties at equal version: lldb-dap (1) over lldb-vscode (0).
+    let (version, family) = name
+        .strip_prefix("lldb-dap-")
+        .map(|v| (v, 1))
+        .or_else(|| name.strip_prefix("lldb-vscode-").map(|v| (v, 0)))?;
+    let version: i64 = version.parse().ok()?;
+    Some(version * 2 + family)
+}
+
 /// Resolve the `lldb-dap` adapter binary: the Xcode Command Line Tools copy
-/// first (always present on a dev Mac), then `PATH`. None if unavailable.
+/// first (always present on a dev Mac), then the best-ranked match found by
+/// scanning `PATH` for `lldb-dap`/`lldb-dap-NN`/`lldb-vscode[-NN]`. `None` if
+/// none is installed.
 fn lldb_dap_path() -> Option<String> {
     let xcode = "/Library/Developer/CommandLineTools/usr/bin/lldb-dap";
     if std::path::Path::new(xcode).is_file() {
         return Some(xcode.to_string());
     }
-    let out = std::process::Command::new("which")
-        .arg("lldb-dap")
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
+    let path_var = std::env::var_os("PATH")?;
+    let mut best: Option<(i64, String)> = None;
+    for dir in std::env::split_paths(&path_var) {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            let Some(rank) = lldb_dap_rank(&name) else {
+                continue;
+            };
+            let full = entry.path();
+            if is_executable_file(&full) && best.as_ref().is_none_or(|(r, _)| rank > *r) {
+                best = Some((rank, full.to_string_lossy().into_owned()));
+            }
+        }
     }
-    let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    (!path.is_empty()).then_some(path)
+    best.map(|(_, p)| p)
+}
+
+/// The error shown when no lldb-dap adapter is installed, with a host-correct
+/// install hint: Xcode Command Line Tools on macOS, the LLVM package elsewhere.
+fn lldb_dap_missing_message() -> String {
+    let hint = if cfg!(target_os = "macos") {
+        "install Xcode Command Line Tools"
+    } else {
+        "install LLVM, e.g. apt install lldb"
+    };
+    format!("lldb-dap not found ({hint})")
 }
 
 /// Whether `path` is a regular file with the executable bit set — i.e. a
@@ -6683,8 +6730,9 @@ impl App {
                 if is_executable_file(&path) {
                     self.launch_lldb(&path, &path);
                 } else {
-                    self.run_debug.feedback =
-                        Some(format!("No debugger for .{ext} files (Python is supported)"));
+                    self.run_debug.feedback = Some(format!(
+                        "No debugger for .{ext} files (Python is supported)"
+                    ));
                     self.run_debug.feedback_is_error = true;
                 }
                 return;
@@ -6745,9 +6793,7 @@ impl App {
     /// own status rather than pretending otherwise.
     fn start_lldb_debug_session(&mut self, path: &Path) {
         if lldb_dap_path().is_none() {
-            self.run_debug.feedback = Some(String::from(
-                "lldb-dap not found (install Xcode Command Line Tools)",
-            ));
+            self.run_debug.feedback = Some(lldb_dap_missing_message());
             self.run_debug.feedback_is_error = true;
             return;
         }
@@ -6770,9 +6816,7 @@ impl App {
     fn launch_lldb(&mut self, binary: &Path, label_path: &Path) {
         use std::collections::BTreeMap;
         let Some(adapter) = lldb_dap_path() else {
-            self.run_debug.feedback = Some(String::from(
-                "lldb-dap not found (install Xcode Command Line Tools)",
-            ));
+            self.run_debug.feedback = Some(lldb_dap_missing_message());
             self.run_debug.feedback_is_error = true;
             return;
         };

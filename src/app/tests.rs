@@ -85,6 +85,59 @@ fn debug_stop_immediately_deactivates_the_run_debug_panel() {
 }
 
 #[test]
+fn lldb_dap_rank_prefers_unversioned_then_highest_version() {
+    // The Linux bug: lldb-dap ships under versioned names (`lldb-dap-18`) with
+    // no unversioned symlink, so resolution must rank candidates rather than
+    // only matching the bare `lldb-dap` name.
+    // Non-matches return None.
+    assert_eq!(lldb_dap_rank("lldb"), None);
+    assert_eq!(lldb_dap_rank("lldb-dap-"), None);
+    assert_eq!(lldb_dap_rank("lldb-dapper"), None);
+    assert_eq!(lldb_dap_rank("clangd"), None);
+
+    // Every real adapter name ranks.
+    let unversioned = lldb_dap_rank("lldb-dap").expect("bare name must rank");
+    let v18 = lldb_dap_rank("lldb-dap-18").expect("versioned name must rank");
+    let v17 = lldb_dap_rank("lldb-dap-17").expect("versioned name must rank");
+    let legacy_v18 = lldb_dap_rank("lldb-vscode-18").expect("legacy name must rank");
+
+    // The unversioned binary wins outright (it tracks the system default).
+    assert!(
+        unversioned > v18,
+        "unversioned lldb-dap outranks any versioned"
+    );
+    // Among versioned binaries, the newer LLVM release wins.
+    assert!(v18 > v17, "lldb-dap-18 outranks lldb-dap-17");
+    // At equal version, the modern `lldb-dap` name beats legacy `lldb-vscode`.
+    assert!(
+        v18 > legacy_v18,
+        "lldb-dap-18 is preferred over the legacy lldb-vscode-18 name"
+    );
+}
+
+#[test]
+fn lldb_dap_missing_message_is_platform_appropriate() {
+    // Regression: Linux users saw "install Xcode Command Line Tools", which is
+    // nonsense off macOS. The hint must match the host's package manager.
+    let msg = lldb_dap_missing_message();
+    assert!(
+        msg.contains("lldb-dap not found"),
+        "message must name the missing adapter: {msg}"
+    );
+    if cfg!(target_os = "macos") {
+        assert!(
+            msg.contains("Xcode"),
+            "macOS hint should mention Xcode: {msg}"
+        );
+    } else {
+        assert!(
+            !msg.contains("Xcode"),
+            "non-macOS hint must not mention Xcode: {msg}"
+        );
+    }
+}
+
+#[test]
 fn black_theme_context_menu_uses_gradient_border_and_muted_selection() {
     use crate::gradient::{GRAD_TL, POPUP_SEL_BG, rgb_color};
     let tmp = tempfile::tempdir().unwrap();
