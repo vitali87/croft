@@ -1372,20 +1372,24 @@ impl Editor {
     }
 
     /// Toggle a debugger breakpoint on the cursor's current line for the active
-    /// file. Returns the now-active set's path + 1-based line on success, or
-    /// `None` when no file is open. Empty sets are dropped so the map stays
-    /// clean for the gutter renderer.
-    pub fn toggle_breakpoint(&mut self) -> Option<(PathBuf, usize)> {
+    /// file. Returns `(path, 1-based line, now_set)` where `now_set` is `true`
+    /// if a breakpoint was just added and `false` if one was removed, or `None`
+    /// when no file is open. Empty sets are dropped so the map stays clean for
+    /// the gutter renderer.
+    pub fn toggle_breakpoint(&mut self) -> Option<(PathBuf, usize, bool)> {
         let path = self.path.clone()?;
         let line = self.cursor_row + 1; // gutter + DAP are 1-based
         let set = self.breakpoints.entry(path.clone()).or_default();
-        if !set.remove(&line) {
+        let now_set = if set.remove(&line) {
+            false
+        } else {
             set.insert(line);
-        }
+            true
+        };
         if set.is_empty() {
             self.breakpoints.remove(&path);
         }
-        Some((path, line))
+        Some((path, line, now_set))
     }
 
     /// 1-based breakpoint lines for `path`, ascending, for a DAP
@@ -5775,9 +5779,17 @@ mod tests {
         e.path = Some(PathBuf::from("/x/a.py"));
         e.lines = vec!["a".into(), "b".into(), "c".into()];
         e.cursor_row = 1; // 0-based row 1 => 1-based line 2
-        assert_eq!(e.toggle_breakpoint(), Some((PathBuf::from("/x/a.py"), 2)));
+        // First toggle adds it (now_set = true).
+        assert_eq!(
+            e.toggle_breakpoint(),
+            Some((PathBuf::from("/x/a.py"), 2, true))
+        );
         assert_eq!(e.breakpoint_lines(Path::new("/x/a.py")), vec![2u32]);
-        e.toggle_breakpoint(); // toggles the same line back off
+        // Second toggle removes it (now_set = false).
+        assert_eq!(
+            e.toggle_breakpoint(),
+            Some((PathBuf::from("/x/a.py"), 2, false))
+        );
         assert!(e.breakpoint_lines(Path::new("/x/a.py")).is_empty());
     }
 

@@ -6787,7 +6787,13 @@ impl App {
     /// is running.
     pub fn debug_toggle_breakpoint(&mut self) {
         match self.editor.toggle_breakpoint() {
-            Some((_, line)) => self.status = format!("Breakpoint toggled at line {line}"),
+            Some((_, line, now_set)) => {
+                self.status = if now_set {
+                    format!("Breakpoint set at line {line}")
+                } else {
+                    format!("Breakpoint removed from line {line}")
+                };
+            }
             None => {
                 self.status = String::from("Open a file to set a breakpoint");
                 return;
