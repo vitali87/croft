@@ -53,6 +53,20 @@ This adds a managed `keybind` block to your Ghostty config that re-emits every c
 
 Both deliver `Cmd` over the kitty keyboard protocol natively, so nothing is needed there.
 
+## One-click launcher (Croft.app)
+
+To open croft without typing anything, create a clickable launcher:
+
+```bash
+croft install-launcher                 # opens croft at your home folder
+croft install-launcher --path ~/Documents   # opens croft at a specific folder
+croft install-launcher --user          # install to ~/Applications (no admin rights)
+```
+
+This builds a `Croft.app` bundle (with croft's logo as its icon) in `/Applications`, reachable from Spotlight (`⌘Space`, type "Croft"), Launchpad, and the Dock. Clicking it opens a fresh Ghostty window with croft already running in the chosen folder.
+
+It works by launching `open -na Ghostty.app --args --initial-command="croft <dir>"`. `--initial-command` sets the command for only that launch's first window, so your normal Ghostty windows stay a plain shell and your Ghostty config is untouched. Unlike Ghostty's `-e` flag, it does not trigger the macOS "Allow Ghostty to Execute" prompt. Re-run the command any time to point the launcher at a different folder.
+
 ## Inline previews
 
 iTerm2 renders inline image, PDF, and spreadsheet previews via OSC 1337; kitty and Ghostty use the Kitty graphics protocol; sixel-capable terminals (detected at startup via a DA1 probe) use DEC sixel. Other terminals fall back to a metadata header line.

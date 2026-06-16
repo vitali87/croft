@@ -10,6 +10,7 @@ mod icons;
 mod install_session;
 mod iterm2;
 mod iterm2_inline;
+mod launcher;
 mod lsp;
 mod pdf;
 mod prefs;

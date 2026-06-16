@@ -21,6 +21,9 @@ pub const CODEBERG_SRC_PNG: &[u8] = include_bytes!("../assets/icons/codeberg_src
 /// the PNG path); the activity-bar icon now rasterises the SVG directly.
 pub const RUN_DEBUG_SRC_PNG: &[u8] = include_bytes!("../assets/icons/run_debug_src.png");
 pub const WELCOME_LOGO_PNG: &[u8] = include_bytes!("../assets/logo-tight-removebg-preview.png");
+/// Square (1254x1254) croft logo, used as the source for the macOS launcher
+/// app-bundle icon (`croft install-launcher` rasterises it into an `.icns`).
+pub const APP_ICON_PNG: &[u8] = include_bytes!("../assets/logo.png");
 /// Hero illustration shown in the Source Control sidebar when the
 /// workspace isn't a git repo: a stylised file silhouette with the Git
 /// Y-fork (three blue rings + curved branch) and a dashed circle, framed
