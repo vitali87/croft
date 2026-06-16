@@ -23,6 +23,16 @@ fn explorer_boots_with_gradient_focus_under_black_theme() {
 }
 
 #[test]
+fn persistence_advisory_only_for_nonpersistent_remote_sessions() {
+    // Remote session without dtach: warn on the status line. Remote-with-dtach
+    // and any local session: nothing.
+    assert!(super::remote_persistence_status(true, false).is_some());
+    assert!(super::remote_persistence_status(true, true).is_none());
+    assert!(super::remote_persistence_status(false, false).is_none());
+    assert!(super::remote_persistence_status(false, true).is_none());
+}
+
+#[test]
 fn terminal_warning_swallows_a_key_and_dismisses_for_the_session() {
     // While the unsupported-terminal nudge is up, any non-D key dismisses it
     // for this session and is swallowed so it never reaches the editor below.

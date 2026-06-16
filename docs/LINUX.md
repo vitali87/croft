@@ -52,3 +52,11 @@ This is the most common way Linux comes into play, even from a Mac. `croft remot
 A stock cloud image works out of the box. Behaviour, keybindings, latency, and the filesystem-sync invariants are all identical to the local session.
 
 Background self-updates use a dedicated throttled SSH lane so install bytes never queue ahead of live keystrokes, keeping input latency at zero even while a newer binary streams in.
+
+### Surviving sleep and network drops
+
+A remote session is launched under [`dtach`](https://github.com/crigler/dtach), so closing your laptop or changing networks no longer kills it. When the SSH transport dies (its keepalive gives up after ~30s of no response), the croft process keeps running on the host inside its dtach session; croft auto-reconnects (showing `Reconnecting to <host>…`, Ctrl+C to stop) and reattaches with your tabs, layout, and terminals intact.
+
+dtach is used rather than tmux because it is transparent to the byte stream: croft's inline images (iTerm2 OSC-1337 and the Kitty graphics protocol used by Ghostty/Kitty/WezTerm) pass through untouched, whereas tmux corrupts the Kitty protocol. The session is launched with `dtach -A -E -z -r winch`, so dtach never steals croft's `Ctrl` chords and fires a redraw on reattach.
+
+The session name is keyed to the workspace path, so reconnecting to the same directory resumes the same session. The from-source install path provisions dtach automatically; on a host that installed via the fast cross-build path, install it once (`sudo apt install dtach`, or your package manager's equivalent) to enable persistence. When a remote session is running without dtach, croft shows an orange `⚠ Persistence off: install dtach` badge on its bottom status line for the whole session, so you know a transport drop will end it as before.

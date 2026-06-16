@@ -282,29 +282,97 @@ fn outcome_or_bail(status: ExitStatus) -> Result<RemoteOutcome> {
     }
 }
 
+/// True when the remote host has `dtach`, which croft launches its session
+/// under for persistence across an SSH transport drop. Best-effort over the
+/// existing control master; any error (host unreachable, no dtach) reports
+/// `false` so croft simply runs without persistence.
+fn remote_has_session_supervisor(ssh: &SshControl) -> bool {
+    ssh.command()
+        .arg(&ssh.host)
+        .arg("command -v dtach >/dev/null 2>&1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Re-establish the SSH control master after a transport drop (laptop sleep,
+/// network change), printing progress. Each attempt is bounded by the master's
+/// `ConnectTimeout`, then backs off; the user presses Ctrl+C to stop and fall
+/// back to the local shell. Returns the fresh control once the host answers.
+fn reconnect_master(host: &str) -> Option<SshControl> {
+    const MAX_ATTEMPTS: u32 = 30;
+    for attempt in 1..=MAX_ATTEMPTS {
+        println!(
+            "Connection lost. Reconnecting to {host}\u{2026} (attempt {attempt}; Ctrl+C to stop)"
+        );
+        match SshControl::start(host) {
+            Ok(ssh) => {
+                println!("Reconnected to {host}; resuming session.");
+                return Some(ssh);
+            }
+            Err(_) => std::thread::sleep(std::time::Duration::from_secs(2)),
+        }
+    }
+    eprintln!("Could not reconnect to {host}; returning to the local shell.");
+    None
+}
+
+/// Drive the remote croft session to completion, auto-reconnecting when the
+/// SSH transport dies on a host that supports session persistence. Owns the
+/// control connection so a reconnect can swap in a fresh master and reattach
+/// the dtach session (which kept croft alive remotely) with its state intact.
+/// `local_stamp` is only consulted on the rare first-run bootstrap path.
+fn run_croft_session(
+    mut ssh: SshControl,
+    host: &str,
+    path: Option<&str>,
+    local_stamp: &str,
+    persistent: bool,
+) -> Result<RemoteOutcome> {
+    let mut bootstrapped = false;
+    loop {
+        let pump = match DropPump::start(&ssh) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                eprintln!("Drag-drop relay disabled: {e}");
+                None
+            }
+        };
+        let env = pump.as_ref().map(DropPump::remote_env).unwrap_or_default();
+        let status = run_remote_croft(&ssh, path, &env)?;
+        match classify_remote_status(status.code()) {
+            RemoteStatusClass::ReturnToLocal => return Ok(RemoteOutcome::ReturnToLocal),
+            RemoteStatusClass::Exited => return Ok(RemoteOutcome::Exited),
+            RemoteStatusClass::NotInstalled if !bootstrapped => {
+                println!("Croft is not installed on {host}; bootstrapping from local source...");
+                install_remote_croft(&ssh, local_stamp)?;
+                bootstrapped = true;
+            }
+            RemoteStatusClass::Failed if persistent && is_transport_failure(status.code()) => {
+                drop(pump);
+                match reconnect_master(host) {
+                    Some(new_ssh) => ssh = new_ssh,
+                    None => return Ok(RemoteOutcome::Exited),
+                }
+            }
+            _ => return outcome_or_bail(status),
+        }
+    }
+}
+
 /// Counterpart to `install_only_streaming`: skips the install check and
 /// runs the actual remote croft. Must be called only after the terminal
 /// has been returned to cooked mode and the alt-screen surrendered, since
 /// the spawned ssh shares stdin/stdout/stderr with the user's terminal.
 pub fn launch_only(adopted: AdoptedMaster, path: Option<&str>) -> Result<RemoteOutcome> {
     let ssh = SshControl::adopt(adopted);
-    let pump = match DropPump::start(&ssh) {
-        Ok(p) => Some(p),
-        Err(e) => {
-            eprintln!("Drag-drop relay disabled: {e}");
-            None
-        }
-    };
-    let env = pump.as_ref().map(DropPump::remote_env).unwrap_or_default();
-    let status = run_remote_croft(&ssh, path, &env)?;
-    if classify_remote_status(status.code()) == RemoteStatusClass::NotInstalled {
-        eprintln!("Croft is not installed on {}; bootstrapping...", ssh.host);
-        let stamp = local_source_stamp()?;
-        install_remote_croft(&ssh, &stamp)?;
-        let status = run_remote_croft(&ssh, path, &env)?;
-        return outcome_or_bail(status);
-    }
-    outcome_or_bail(status)
+    let host = ssh.host.clone();
+    let local_stamp = local_source_stamp()?;
+    let persistent = remote_has_session_supervisor(&ssh);
+    run_croft_session(ssh, &host, path, &local_stamp, persistent)
 }
 
 fn run_command_streaming(
@@ -520,23 +588,8 @@ pub fn launch_croft_with(
         println!("Installing/updating Croft on {host}...");
         install_remote_croft(&ssh, &local_stamp)?;
     }
-    let pump = match DropPump::start(&ssh) {
-        Ok(p) => Some(p),
-        Err(e) => {
-            eprintln!("Drag-drop relay disabled: {e}");
-            None
-        }
-    };
-    let env = pump.as_ref().map(DropPump::remote_env).unwrap_or_default();
-    let status = run_remote_croft(&ssh, path, &env)?;
-    if classify_remote_status(status.code()) == RemoteStatusClass::NotInstalled {
-        println!("Croft is not installed on {host}; bootstrapping from local source...");
-        install_remote_croft(&ssh, &local_stamp)?;
-        println!("Reconnecting to {host}...");
-        let status = run_remote_croft(&ssh, path, &env)?;
-        return outcome_or_bail(status);
-    }
-    outcome_or_bail(status)
+    let persistent = remote_has_session_supervisor(&ssh);
+    run_croft_session(ssh, host, path, &local_stamp, persistent)
 }
 
 pub struct SshControl {
@@ -576,6 +629,15 @@ impl SshControl {
             .arg("-f")
             .arg("-N")
             .arg("-T")
+            // Bound each connect attempt so a reconnect against a host that is
+            // still asleep/offline fails fast instead of hanging, and let the
+            // master tear itself down promptly once the link goes away.
+            .arg("-o")
+            .arg("ConnectTimeout=10")
+            .arg("-o")
+            .arg("ServerAliveInterval=10")
+            .arg("-o")
+            .arg("ServerAliveCountMax=3")
             .arg(host)
             .status()
             .context("starting SSH control connection")?;
@@ -1542,11 +1604,45 @@ fn remote_croft_command_for_terminal(
         prefix.push_str(&shell_quote(v));
         prefix.push_str("; ");
     }
-    prefix.push_str("export PATH=\"$HOME/.cargo/bin:$PATH\"; command -v croft >/dev/null 2>&1 || { echo 'croft not found on remote PATH' >&2; exit 127; }; exec croft");
-    match path.filter(|p| !p.is_empty()) {
-        Some(path) => format!("{prefix} {}", shell_quote(path)),
-        None => prefix,
-    }
+    prefix.push_str("export PATH=\"$HOME/.cargo/bin:$PATH\"; command -v croft >/dev/null 2>&1 || { echo 'croft not found on remote PATH' >&2; exit 127; }; ");
+    let croft_invocation = match path.filter(|p| !p.is_empty()) {
+        Some(p) => format!("croft {}", shell_quote(p)),
+        None => String::from("croft"),
+    };
+    // Run croft under dtach so the session survives an SSH transport drop
+    // (laptop sleep, network change): `-A` reattaches the persisted session or
+    // creates a fresh one, `-E`/`-z` stop dtach from intercepting croft's Ctrl
+    // chords (croft keeps Ctrl+Z etc.), and `-r winch` fires SIGWINCH on
+    // reattach so croft repaints (crossterm turns every SIGWINCH into a Resize,
+    // which re-emits the inline images). dtach is transparent to the byte
+    // stream, so croft's OSC-1337 / Kitty graphics pass through untouched —
+    // tmux corrupts the Kitty protocol, which is why a transparent supervisor
+    // is used instead. Hosts without dtach exec croft directly, no persistence.
+    // `CROFT_SESSION_PERSISTENT=1` is exported only on the dtach branch so the
+    // remote croft can tell whether its session will survive a transport drop
+    // and surface that on its status line (the else branch leaves it unset).
+    let socket = dtach_socket_path(path);
+    format!(
+        "{prefix}if command -v dtach >/dev/null 2>&1; then mkdir -p \"$(dirname \"{socket}\")\"; export CROFT_SESSION_PERSISTENT=1; exec dtach -A \"{socket}\" -E -z -r winch {croft_invocation}; else exec {croft_invocation}; fi"
+    )
+}
+
+/// Remote path of the dtach control socket for a workspace. Keyed on a stable
+/// hash of the workspace path so a reconnect reattaches the same session.
+/// `DefaultHasher` uses fixed SipHash keys, so the name is deterministic across
+/// croft processes (a randomized hasher would orphan the session on relaunch).
+fn dtach_socket_path(path: Option<&str>) -> String {
+    use std::hash::Hasher;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    hasher.write(path.unwrap_or("").as_bytes());
+    format!("$HOME/.cache/croft/sessions/{:016x}.sock", hasher.finish())
+}
+
+/// True for ssh's own connection-failure exit code (255), as opposed to any
+/// status the remote croft itself returned. Only this warrants an auto-
+/// reconnect; a real remote crash (e.g. 101) must surface to the user.
+fn is_transport_failure(code: Option<i32>) -> bool {
+    code == Some(255)
 }
 
 fn remote_install_needed(ssh: &SshControl, local_stamp: &str) -> Result<bool> {
@@ -1780,6 +1876,10 @@ export PATH="$HOME/.cargo/bin:$PATH"
 # Ensure the C toolchain before compiling, regardless of whether cargo was
 # already installed: a box can have rustup/cargo but no cc.
 croft_ensure_build_toolchain
+# dtach lets a remote croft session survive an SSH transport drop (laptop
+# sleep, network change): croft launches itself under it for reconnect. Best
+# effort and never fatal; a box without dtach just runs without persistence.
+command -v dtach >/dev/null 2>&1 || croft_pkg_install dtach || true
 # Cap the host build to ~half its cores and run it niced: this fallback
 # compiles on the shared remote (often while other workloads run and,
 # with launch-now, while a live croft session is using the box), so the
@@ -1956,18 +2056,19 @@ Host !blocked *.internal
 
     #[test]
     fn remote_croft_command_quotes_paths() {
-        assert_eq!(
-            remote_croft_command_for_terminal(Some("/tmp/it's here"), None, None, false, &[]),
-            "export CROFT_REMOTE_AUTOUPDATE=1; export PATH=\"$HOME/.cargo/bin:$PATH\"; command -v croft >/dev/null 2>&1 || { echo 'croft not found on remote PATH' >&2; exit 127; }; exec croft '/tmp/it'\"'\"'s here'"
-        );
+        // A workspace path with a single quote must be shell-quoted in the
+        // croft invocation (which now appears in both the dtach and the
+        // direct-exec branch).
+        let command =
+            remote_croft_command_for_terminal(Some("/tmp/it's here"), None, None, false, &[]);
+        assert!(command.contains("croft '/tmp/it'\"'\"'s here'"));
+        assert!(command.starts_with("export CROFT_REMOTE_AUTOUPDATE=1;"));
     }
 
     #[test]
     fn remote_croft_command_forwards_supported_terminal_program() {
-        assert_eq!(
-            remote_croft_command_for_terminal(None, Some("iTerm.app"), None, false, &[]),
-            "export CROFT_REMOTE_AUTOUPDATE=1; export CROFT_FORCE_INLINE_IMAGES=1 TERM_PROGRAM='iTerm.app'; export PATH=\"$HOME/.cargo/bin:$PATH\"; command -v croft >/dev/null 2>&1 || { echo 'croft not found on remote PATH' >&2; exit 127; }; exec croft"
-        );
+        let command = remote_croft_command_for_terminal(None, Some("iTerm.app"), None, false, &[]);
+        assert!(command.contains("export CROFT_FORCE_INLINE_IMAGES=1 TERM_PROGRAM='iTerm.app';"));
     }
 
     #[test]
@@ -2015,6 +2116,45 @@ Host !blocked *.internal
         assert!(command.contains("export CROFT_FORCE_OSK=1;"));
         let command = remote_croft_command_for_terminal(None, None, None, false, &[]);
         assert!(!command.contains("CROFT_FORCE_OSK"));
+    }
+
+    #[test]
+    fn remote_command_wraps_croft_in_dtach_for_session_persistence() {
+        let command = remote_croft_command_for_terminal(Some("/srv/app"), None, None, false, &[]);
+        // The persisted session runs croft under dtach with the exact flags
+        // croft needs: attach-or-create, no detach/suspend key theft, WINCH
+        // redraw on reattach.
+        assert!(command.contains("command -v dtach"));
+        assert!(command.contains("dtach -A"));
+        assert!(command.contains("-E"));
+        assert!(command.contains("-z"));
+        assert!(command.contains("-r winch"));
+        // The dtach branch flags the session as persistent for the remote
+        // croft's status line.
+        assert!(command.contains("export CROFT_SESSION_PERSISTENT=1;"));
+        // Hosts without dtach still launch croft directly (no persistence).
+        assert!(command.contains("else exec croft"));
+    }
+
+    #[test]
+    fn dtach_socket_is_stable_per_workspace_and_differs_across_paths() {
+        let a1 = dtach_socket_path(Some("/srv/app"));
+        let a2 = dtach_socket_path(Some("/srv/app"));
+        let b = dtach_socket_path(Some("/srv/other"));
+        assert_eq!(a1, a2, "same workspace must map to the same dtach session");
+        assert_ne!(a1, b, "different workspaces must not share a session");
+        assert!(a1.contains("/.cache/croft/sessions/"));
+    }
+
+    #[test]
+    fn transport_failure_is_exit_255_only() {
+        // 255 is ssh's own connection-died code; everything else is a real
+        // remote exit and must not trigger an auto-reconnect.
+        assert!(is_transport_failure(Some(255)));
+        assert!(!is_transport_failure(Some(0)));
+        assert!(!is_transport_failure(Some(1)));
+        assert!(!is_transport_failure(Some(101)));
+        assert!(!is_transport_failure(None));
     }
 
     #[test]

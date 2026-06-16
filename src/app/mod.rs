@@ -996,6 +996,11 @@ pub struct App {
     /// the terminal entirely with `Ctrl+J`, clears the flag.
     terminal_maximized: bool,
     status: String,
+    /// Orange status-bar badge shown for the whole session when this is a
+    /// remote (SSH) croft not running under dtach, so it can't survive a
+    /// transport drop. Set once at startup; rendered separately from `status`
+    /// so transient messages never clobber it. `None` otherwise.
+    persistence_warning: Option<&'static str>,
     quit: bool,
     drop_to_local: bool,
     is_remote: bool,
@@ -1644,6 +1649,10 @@ impl App {
             show_terminal: true,
             terminal_maximized: false,
             status: String::from("Ready"),
+            persistence_warning: remote_persistence_status(
+                is_remote_session(),
+                std::env::var_os("CROFT_SESSION_PERSISTENT").is_some(),
+            ),
             quit: false,
             drop_to_local: false,
             is_remote: is_remote_session(),
@@ -5357,6 +5366,19 @@ impl App {
         }
         spans.extend(git_status_spans(self.git.status()));
         spans.push(Span::raw("  "));
+        // Persistent orange badge for a remote session with no dtach: it can't
+        // survive a transport drop, so flag it for the whole session (rendered
+        // before the transient status so a status update never hides it).
+        if let Some(warning) = self.persistence_warning {
+            spans.push(Span::styled(
+                format!(" \u{26a0} {warning} "),
+                Style::default()
+                    .bg(Color::Rgb(0xff, 0x9d, 0x2f))
+                    .fg(Color::Rgb(0x10, 0x13, 0x1a))
+                    .add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::raw("  "));
+        }
         spans.push(Span::raw(&self.status));
         spans.push(Span::raw("  "));
         spans.push(Span::styled("^q", Style::default().fg(Color::Yellow)));
@@ -15303,6 +15325,20 @@ fn is_remote_session() -> bool {
     std::env::var_os("SSH_CONNECTION").is_some()
         || std::env::var_os("SSH_TTY").is_some()
         || std::env::var_os("SSH_CLIENT").is_some()
+}
+
+/// Status-line advisory for a remote croft session that will not survive an
+/// SSH transport drop. `croft remote` launches the remote croft under dtach
+/// and exports `CROFT_SESSION_PERSISTENT=1`; when that marker is absent on a
+/// remote (SSH) session the host has no dtach, so croft tells the user how to
+/// turn persistence on. Local sessions never see it. Returned as a status
+/// string only (the bottom line is info-only; no input).
+fn remote_persistence_status(is_remote: bool, persistent: bool) -> Option<&'static str> {
+    if is_remote && !persistent {
+        Some("Persistence off: install dtach")
+    } else {
+        None
+    }
 }
 
 fn croft_cache_dir() -> PathBuf {
