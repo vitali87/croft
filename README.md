@@ -30,7 +30,7 @@ See **[LAYOUT.md](docs/LAYOUT.md)** for the full pane-by-pane reference, debuggi
 
 | Requirement | Why |
 |-------------|-----|
-| macOS, Linux, or Android (Termux) | The PTY layer uses a POSIX pseudo-terminal. Windows is not yet supported. |
+| macOS, Linux, or Android (Termux) | The PTY layer is POSIX (pseudo-terminal + termios). On Windows, run croft inside WSL2 (it is the Linux build); native PowerShell / conhost is not supported. See [WINDOWS.md](docs/WINDOWS.md). |
 | Rust 1.85+ stable | To compile the binary (edition 2024). |
 | A Nerd Font as your terminal font | Explorer icons are Private Use Area Nerd Font glyphs (Codicons plus file-type icons). Without one, icons render as `[?]` boxes. |
 | A 256 color or truecolor terminal | Terminal.app, iTerm2, Alacritty, kitty, WezTerm, Ghostty all qualify. |
@@ -73,11 +73,12 @@ croft --help
 
 ## Platform setup
 
-croft runs on macOS, Linux, and Android. Cross-platform basics are above; each platform has a short guide for its Nerd Font, terminal keybindings, and optional dependencies:
+croft runs on macOS, Linux, Android, and Windows (via WSL2). Cross-platform basics are above; each platform has a short guide for its Nerd Font, terminal keybindings, and optional dependencies:
 
 * **[macOS](docs/MACOS.md)** — Nerd Font for Terminal.app, and `croft setup-iterm2` / `croft setup-ghostty` to deliver the `Cmd` chords that macOS otherwise reserves for menus.
 * **[Linux](docs/LINUX.md)** — `Ctrl` as the command modifier, Nerd Font and poppler-utils, language servers, and the `croft remote <host>` cross-compile / provisioning flow.
 * **[Android (Termux)](docs/ANDROID.md)** — `Ctrl` as the command modifier, `pkg`-based dependencies, the auto-installed activity-bar font, and the built-in on-screen keyboard for touch.
+* **[Windows (WSL2)](docs/WINDOWS.md)** — run the Linux build inside WSL2, hosted in WezTerm for the full icon/image UI; why native PowerShell / conhost is not supported.
 
 ## Keybindings
 
