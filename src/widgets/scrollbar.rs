@@ -1,8 +1,6 @@
-use ratatui::{
-    buffer::Buffer,
-    layout::Rect,
-    style::{Color, Style},
-};
+use ratatui::{buffer::Buffer, layout::Rect, style::Style};
+
+use crate::theme::Theme;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VerticalScrollbar {
@@ -59,12 +57,12 @@ pub fn scroll_for_y(metrics: VerticalScrollbar, y: u16) -> usize {
     (thumb_top as usize * metrics.max_scroll + travel as usize / 2) / travel as usize
 }
 
-pub fn render_vertical(buf: &mut Buffer, metrics: VerticalScrollbar, focused: bool) {
-    let track = Style::default().bg(Color::Rgb(0x2b, 0x33, 0x46));
+pub fn render_vertical(buf: &mut Buffer, metrics: VerticalScrollbar, focused: bool, theme: Theme) {
+    let track = Style::default().bg(theme.scrollbar_track());
     let thumb_color = if focused {
-        Color::Rgb(0x4e, 0x9a, 0xff)
+        theme.scrollbar_thumb_focused()
     } else {
-        Color::Rgb(0x6b, 0x73, 0x86)
+        theme.scrollbar_thumb()
     };
     let thumb = Style::default().bg(thumb_color);
     for row in 0..metrics.area.height {
@@ -136,16 +134,21 @@ pub fn scroll_for_x(metrics: HorizontalScrollbar, x: u16) -> usize {
     (thumb_left as usize * metrics.max_scroll + travel as usize / 2) / travel as usize
 }
 
-pub fn render_horizontal(buf: &mut Buffer, metrics: HorizontalScrollbar, focused: bool) {
+pub fn render_horizontal(
+    buf: &mut Buffer,
+    metrics: HorizontalScrollbar,
+    focused: bool,
+    theme: Theme,
+) {
     // Paint a lower-half block (`▄`) coloured via the foreground rather than a
     // full-cell background. Terminal cells are about twice as tall as they are
     // wide, so a full-row bar reads twice as thick as the 1-column vertical
     // bar; the half block matches its visual weight and hugs the bottom edge.
-    let track_color = Color::Rgb(0x2b, 0x33, 0x46);
+    let track_color = theme.scrollbar_track();
     let thumb_color = if focused {
-        Color::Rgb(0x4e, 0x9a, 0xff)
+        theme.scrollbar_thumb_focused()
     } else {
-        Color::Rgb(0x6b, 0x73, 0x86)
+        theme.scrollbar_thumb()
     };
     for col in 0..metrics.area.width {
         let is_thumb = col >= metrics.thumb_start
@@ -160,6 +163,7 @@ pub fn render_horizontal(buf: &mut Buffer, metrics: HorizontalScrollbar, focused
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::style::Color;
 
     #[test]
     fn vertical_metrics_hidden_without_overflow() {
@@ -201,10 +205,12 @@ mod tests {
             height: 5,
         });
         let metrics = vertical_metrics(area, 100, 20, 0).unwrap();
-        render_vertical(&mut buf, metrics, true);
+        render_vertical(&mut buf, metrics, true, Theme::Black);
         assert_eq!(buf[(2, 0)].symbol(), " ");
-        assert_eq!(buf[(2, 0)].bg, Color::Rgb(0x4e, 0x9a, 0xff));
-        assert_eq!(buf[(2, 4)].bg, Color::Rgb(0x2b, 0x33, 0x46));
+        // Focused thumb on Black = #646464 @ 70% over #000000.
+        assert_eq!(buf[(2, 0)].bg, Color::Rgb(0x46, 0x46, 0x46));
+        // Track matches the editor background, so the lane melts into it.
+        assert_eq!(buf[(2, 4)].bg, Theme::Black.editor_bg());
     }
 
     #[test]
@@ -247,10 +253,11 @@ mod tests {
             height: 3,
         });
         let metrics = horizontal_metrics(area, 100, 20, 0).unwrap();
-        render_horizontal(&mut buf, metrics, true);
+        render_horizontal(&mut buf, metrics, true, Theme::Black);
         // Half-height block coloured via the foreground keeps the bar thin.
         assert_eq!(buf[(0, 2)].symbol(), "\u{2584}");
-        assert_eq!(buf[(0, 2)].fg, Color::Rgb(0x4e, 0x9a, 0xff));
-        assert_eq!(buf[(4, 2)].fg, Color::Rgb(0x2b, 0x33, 0x46));
+        // Focused thumb on Black = #646464 @ 70% over #000000.
+        assert_eq!(buf[(0, 2)].fg, Color::Rgb(0x46, 0x46, 0x46));
+        assert_eq!(buf[(4, 2)].fg, Theme::Black.editor_bg());
     }
 }

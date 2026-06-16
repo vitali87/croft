@@ -29,6 +29,9 @@ pub struct FileTree {
     /// row with the brand's dark-teal instead of the legacy blue. Set by the
     /// app's focus/theme sync.
     pub focus_gradient: bool,
+    /// Active color theme. Drives the scrollbar track/thumb colors (which
+    /// pre-blend against the theme background). Set by the app's theme sync.
+    pub theme: crate::theme::Theme,
     pub last_inner: Rect,
     pub last_area: Rect,
     pub last_scrollbar: Rect,
@@ -60,6 +63,7 @@ impl FileTree {
             scroll: 0,
             focused: true,
             focus_gradient: false,
+            theme: crate::theme::Theme::default(),
             last_inner: Rect::default(),
             last_area: Rect::default(),
             last_scrollbar: Rect::default(),
@@ -1221,7 +1225,7 @@ impl Widget for &mut FileTree {
             buf.set_line(inner.x, y, &line, row_width);
         }
         if let Some(metrics) = scrollbar_metrics {
-            scrollbar::render_vertical(buf, metrics, self.focused);
+            scrollbar::render_vertical(buf, metrics, self.focused, self.theme);
         }
     }
 }

@@ -489,6 +489,9 @@ pub struct SearchPanel {
     /// orange→green brand gradient instead of the legacy solid blue. Set by the
     /// app's focus/theme sync.
     pub focus_gradient: bool,
+    /// Active color theme; drives the scrollbar track/thumb colors. Set by the
+    /// app's theme sync.
+    pub theme: crate::theme::Theme,
     pub last_inner: Rect,
     pub last_area: Rect,
     pub root: PathBuf,
@@ -522,6 +525,7 @@ impl SearchPanel {
             scroll: 0,
             focused: false,
             focus_gradient: false,
+            theme: crate::theme::Theme::default(),
             last_inner: Rect::default(),
             last_area: Rect::default(),
             root,
@@ -1085,7 +1089,7 @@ impl Widget for &mut SearchPanel {
             buf.set_line(inner.x, y, &line, row_width);
         }
         if let Some(metrics) = scrollbar_metrics {
-            crate::widgets::scrollbar::render_vertical(buf, metrics, self.focused);
+            crate::widgets::scrollbar::render_vertical(buf, metrics, self.focused, self.theme);
         }
     }
 }

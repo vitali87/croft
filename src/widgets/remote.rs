@@ -17,6 +17,9 @@ pub struct RemotePanel {
     /// orange→green brand gradient instead of the legacy solid blue. Set by the
     /// app's focus/theme sync.
     pub focus_gradient: bool,
+    /// Active color theme; drives the scrollbar track/thumb colors. Set by the
+    /// app's theme sync.
+    pub theme: crate::theme::Theme,
     pub collapsed: bool,
     pub filter: String,
     pub last_area: Rect,
@@ -46,6 +49,7 @@ impl RemotePanel {
             scroll: 0,
             focused: false,
             focus_gradient: false,
+            theme: crate::theme::Theme::default(),
             collapsed: false,
             filter: String::new(),
             last_area: Rect::default(),
@@ -749,7 +753,7 @@ impl Widget for &mut RemotePanel {
             buf.set_line(self.last_list_area.x, y, &Line::from(spans), row_width);
         }
         if let Some(metrics) = scrollbar_metrics {
-            scrollbar::render_vertical(buf, metrics, self.focused);
+            scrollbar::render_vertical(buf, metrics, self.focused, self.theme);
         }
     }
 }

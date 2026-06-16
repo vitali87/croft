@@ -1177,6 +1177,9 @@ pub struct Editor {
     /// When focused, draw the orange→green gradient border (Black theme)
     /// instead of the solid blue one. Set by the app's focus/theme sync.
     pub focus_gradient: bool,
+    /// Active color theme; drives the scrollbar track/thumb colors. Set by the
+    /// app's theme sync.
+    pub theme: crate::theme::Theme,
     pub dirty: bool,
     pub status: String,
     pub last_area: Rect,
@@ -1327,6 +1330,7 @@ impl Editor {
             cursor_col: 0,
             focused: false,
             focus_gradient: false,
+            theme: crate::theme::Theme::default(),
             dirty: false,
             status: String::from("No file open"),
             last_area: Rect::default(),
@@ -4629,10 +4633,10 @@ impl Widget for &mut Editor {
             // hides the underlying character.
         }
         if let Some(metrics) = scrollbar_metrics {
-            scrollbar::render_vertical(buf, metrics, self.focused);
+            scrollbar::render_vertical(buf, metrics, self.focused, self.theme);
         }
         if let Some(metrics) = hbar_metrics {
-            scrollbar::render_horizontal(buf, metrics, self.focused);
+            scrollbar::render_horizontal(buf, metrics, self.focused, self.theme);
         }
     }
 }

@@ -4864,17 +4864,23 @@ impl App {
         // not resurrect the legacy navy active-tab chip between syncs.
         for ed in self.editor.editors.iter_mut() {
             ed.focus_gradient = gradient;
+            ed.theme = self.theme;
         }
         if let Some(split) = self.editor_split.as_mut() {
             for ed in split.editors.iter_mut() {
                 ed.focus_gradient = gradient;
+                ed.theme = self.theme;
             }
         }
         self.tree.focus_gradient = gradient;
+        self.tree.theme = self.theme;
         self.search.focus_gradient = gradient;
+        self.search.theme = self.theme;
         self.source_control.focus_gradient = gradient;
+        self.source_control.theme = self.theme;
         self.run_debug.focus_gradient = gradient;
         self.remote.focus_gradient = gradient;
+        self.remote.theme = self.theme;
         for t in self.terminals.iter_mut() {
             t.focus_gradient = gradient;
         }

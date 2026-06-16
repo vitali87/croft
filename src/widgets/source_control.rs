@@ -71,6 +71,9 @@ pub struct SourceControlPanel {
     /// orange→green brand gradient instead of the legacy solid blue. Set by the
     /// app's focus/theme sync.
     pub focus_gradient: bool,
+    /// Active color theme; drives the scrollbar track/thumb colors. Set by the
+    /// app's theme sync.
+    pub theme: crate::theme::Theme,
     pub message: String,
     pub message_cursor: usize,
     /// Leading characters scrolled out of view on the left of the
@@ -145,6 +148,7 @@ impl SourceControlPanel {
         Self {
             focused: false,
             focus_gradient: false,
+            theme: crate::theme::Theme::default(),
             message: String::new(),
             message_cursor: 0,
             message_scroll: 0,
@@ -1316,7 +1320,7 @@ impl Widget for &mut SourceControlPanel {
             }
         }
         if let Some(metrics) = scrollbar_metrics {
-            scrollbar::render_vertical(buf, metrics, self.focused);
+            scrollbar::render_vertical(buf, metrics, self.focused, self.theme);
         }
     }
 }
