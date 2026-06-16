@@ -2231,8 +2231,12 @@ fn resolve_config(config: &ServerConfig, log_skip: bool) -> Option<(ServerConfig
     if let Some(provision) = &config.provision {
         return crate::lsp::install::resolve_managed(config, provision, log_skip);
     }
-    if is_on_path(&config.command) {
-        return Some((config.clone(), Vec::new()));
+    if let Some(resolved) = resolve_path_only(
+        config,
+        is_on_path(&config.command),
+        &toolchain_fallback_dirs(),
+    ) {
+        return Some(resolved);
     }
     if log_skip {
         log_file::log(&format!(
@@ -2247,26 +2251,74 @@ pub(crate) fn is_on_path(cmd: &str) -> bool {
     let Some(path) = std::env::var_os("PATH") else {
         return false;
     };
-    for entry in std::env::split_paths(&path) {
-        let candidate = entry.join(cmd);
-        if !candidate.is_file() {
-            continue;
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if let Ok(meta) = std::fs::metadata(&candidate)
-                && meta.permissions().mode() & 0o111 != 0
-            {
-                return true;
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            return true;
-        }
+    std::env::split_paths(&path).any(|entry| is_executable_file(&entry.join(cmd)))
+}
+
+/// True when `path` is a regular file with at least one execute bit set. On
+/// non-unix any existing file counts (no mode bits to inspect).
+fn is_executable_file(path: &Path) -> bool {
+    if !path.is_file() {
+        return false;
     }
-    false
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path)
+            .map(|m| m.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+/// Toolchain `bin` dirs that a macOS GUI launch (Finder / Dock / the Croft.app
+/// bundle, which `open`s Ghostty under the stripped launchd PATH) drops because
+/// the login-shell profile is never sourced. rust-analyzer and gopls live here
+/// but resolve by bare name, so a GUI-launched croft can't find them even
+/// though a terminal launch (full PATH) can. Probed only when the command is
+/// already absent from the inherited PATH, so a normal launch never reaches it,
+/// which keeps local and remote behaviour identical.
+fn toolchain_fallback_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = PathBuf::from(home);
+        dirs.push(home.join(".cargo").join("bin"));
+        dirs.push(home.join("go").join("bin"));
+        dirs.push(home.join(".local").join("bin"));
+    }
+    dirs.push(PathBuf::from("/opt/homebrew/bin"));
+    dirs.push(PathBuf::from("/usr/local/bin"));
+    dirs
+}
+
+/// Absolute path to `cmd` in the first `dirs` entry that holds an executable
+/// file of that name, or `None`.
+fn find_executable_in(cmd: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
+    dirs.iter()
+        .map(|dir| dir.join(cmd))
+        .find(|candidate| is_executable_file(candidate))
+}
+
+/// Resolve a PATH-only server (no managed provision) to a spawnable
+/// `(config, extra_path)` pair, or `None` to skip it. When `on_path` the
+/// bare command spawns as-is; otherwise the toolchain `fallback_dirs` are
+/// probed and a hit is pinned to its absolute path (with its dir prepended to
+/// the child's PATH) so a stripped GUI PATH can't hide it.
+fn resolve_path_only(
+    config: &ServerConfig,
+    on_path: bool,
+    fallback_dirs: &[PathBuf],
+) -> Option<(ServerConfig, Vec<PathBuf>)> {
+    if on_path {
+        return Some((config.clone(), Vec::new()));
+    }
+    let abs = find_executable_in(&config.command, fallback_dirs)?;
+    let extra = abs.parent().map(Path::to_path_buf).into_iter().collect();
+    let mut resolved = config.clone();
+    resolved.command = abs.to_string_lossy().into_owned();
+    Some((resolved, extra))
 }
 
 #[cfg(test)]
@@ -2321,6 +2373,45 @@ mod tests {
         assert!(
             resolve_config(&present, false).is_some(),
             "a server whose command is on PATH must resolve"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_path_only_pins_a_fallback_dir_binary_to_its_absolute_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let bin = dir.join("rust-analyzer");
+        std::fs::write(&bin, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let cfg = ServerConfig {
+            name: "rust-analyzer",
+            command: "rust-analyzer".into(),
+            args: vec![],
+            language: Language::Rust,
+            initialization_options: None,
+            provision: None,
+        };
+
+        // Not on PATH, but present in a fallback dir: must resolve to the
+        // ABSOLUTE binary path (so a GUI-launched croft with a stripped PATH
+        // still spawns it) and prepend that dir to the child's PATH.
+        let (resolved, extra) = resolve_path_only(&cfg, false, std::slice::from_ref(&dir))
+            .expect("a binary in a fallback dir must resolve");
+        assert_eq!(resolved.command, bin.to_string_lossy());
+        assert_eq!(extra, vec![dir.clone()]);
+
+        // Already on PATH: spawn the bare command, no extra PATH entries.
+        let (resolved, extra) = resolve_path_only(&cfg, true, std::slice::from_ref(&dir))
+            .expect("an on-PATH server must resolve");
+        assert_eq!(resolved.command, "rust-analyzer");
+        assert!(extra.is_empty());
+
+        // Neither on PATH nor in any fallback dir: skip.
+        assert!(
+            resolve_path_only(&cfg, false, &[]).is_none(),
+            "a server missing everywhere must be skipped"
         );
     }
 
