@@ -12762,6 +12762,38 @@ impl App {
             }
         }
         self.workspace_root = new_root.clone();
+        // Rebind the LSP servers to the new root. The manager captured its
+        // workspace folder once, at App::new, from croft's launch directory -
+        // and the Croft.app launcher hardcodes that to ~/Documents. Re-rooting
+        // into a child repo left rust-analyzer running `cargo metadata` against
+        // the parent, which has no Cargo.toml, so every opened .rs came back as
+        // an `unlinked-file` with no hover / completion / semantic tokens.
+        // Spawn a fresh manager rooted at new_root; assigning over the Option
+        // drops the old manager, whose Drop shuts its servers down. Clearing
+        // lsp_last_seen makes the next sync_lsp() re-open every live editor tab
+        // against the new servers; the stale diagnostics / progress from the
+        // old root are dropped with it.
+        self.lsp = match crate::lsp::LspManager::new(new_root.clone()) {
+            Ok(m) => Some(m),
+            Err(e) => {
+                eprintln!("lsp manager rebind failed: {e}");
+                None
+            }
+        };
+        self.lsp_last_seen.clear();
+        self.lsp_diagnostics.clear();
+        self.lsp_progress.clear();
+        // Refresh the window/icon title: it was emitted once at startup from
+        // the launch dir and never updated, so after a re-root it kept showing
+        // the parent (e.g. "Documents") instead of the repo. OSC 0 is
+        // grid-independent, so writing it straight to stdout between draws is
+        // safe - the same pattern startup uses.
+        {
+            use std::io::Write;
+            let mut out = std::io::stdout();
+            let _ = out.write_all(&set_title_seq(&build_title(&new_root)));
+            let _ = out.flush();
+        }
         self.tree.set_root(new_root.clone());
         self.tree_clipboard = None;
         self.compare_anchor = None;

@@ -4433,6 +4433,30 @@ fn changing_workspace_root_retargets_search_at_the_new_explorer_root() {
 }
 
 #[test]
+fn changing_workspace_root_rebinds_the_lsp_manager_to_the_new_root() {
+    let tmp = tempfile::tempdir().unwrap();
+    let inner = tmp.path().join("inner");
+    std::fs::create_dir_all(&inner).unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    // Pretend a file from the old root is already open with the LSP so we can
+    // prove the seen-map is reset (otherwise sync_lsp would never re-open it
+    // against the new server).
+    app.lsp_last_seen.insert(tmp.path().join("stale.rs"), 7);
+
+    app.change_workspace_root(inner.clone());
+
+    assert_eq!(
+        app.lsp.as_ref().unwrap().workspace_root(),
+        inner,
+        "rust-analyzer's workspace folder must follow the Explorer root; left at the launch dir (e.g. ~/Documents, which has no Cargo.toml) every opened .rs comes back as an unlinked-file with no IDE services"
+    );
+    assert!(
+        app.lsp_last_seen.is_empty(),
+        "the LSP seen-map must be cleared on re-root so the next sync_lsp re-opens every live editor tab against the freshly-rooted server"
+    );
+}
+
+#[test]
 fn cmd_shift_slash_on_a_folder_changes_workspace_root_to_that_folder_s_parent() {
     let tmp = tempfile::tempdir().unwrap();
     let mid = tmp.path().join("mid");
