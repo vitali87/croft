@@ -24,6 +24,11 @@ pub struct Prefs {
     /// toggled by the OSK's `split` key.
     #[serde(default)]
     pub osk_split: bool,
+    /// When true, the startup "switch to iTerm2/Ghostty" nudge shown in
+    /// terminals that can't render croft's inline images is silenced (the
+    /// user dismissed it with "don't show again").
+    #[serde(default)]
+    pub suppress_terminal_warning: bool,
 }
 
 impl Prefs {
@@ -76,6 +81,15 @@ pub fn save_osk_split(split: bool) -> Result<()> {
     prefs.save(&path)
 }
 
+/// Persist the "don't warn about this terminal again" choice, preserving
+/// other settings. Best-effort: a write failure is swallowed by the caller.
+pub fn save_suppress_terminal_warning(suppress: bool) -> Result<()> {
+    let path = config_path();
+    let mut prefs = Prefs::load(&path).unwrap_or_default();
+    prefs.suppress_terminal_warning = suppress;
+    prefs.save(&path)
+}
+
 pub fn config_path() -> PathBuf {
     config_dir().join("config.json")
 }
@@ -119,6 +133,28 @@ mod tests {
         // A pre-split config (theme only) still parses, defaulting to merged.
         std::fs::write(&path, r#"{"theme":"black"}"#).expect("write old config");
         assert!(!Prefs::load(&path).expect("load old").osk_split);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn round_trips_suppress_terminal_warning_and_old_configs_default_off() {
+        let dir =
+            std::env::temp_dir().join(format!("croft-prefs-warn-test-{}", std::process::id()));
+        let path = dir.join("config.json");
+        let prefs = Prefs {
+            suppress_terminal_warning: true,
+            ..Prefs::default()
+        };
+        prefs.save(&path).expect("save");
+        assert!(Prefs::load(&path).expect("load").suppress_terminal_warning);
+        // A config written before this field existed still parses, defaulting
+        // the nudge to enabled (false = not suppressed).
+        std::fs::write(&path, r#"{"theme":"dark"}"#).expect("write old config");
+        assert!(
+            !Prefs::load(&path)
+                .expect("load old")
+                .suppress_terminal_warning
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

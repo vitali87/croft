@@ -23,6 +23,22 @@ fn explorer_boots_with_gradient_focus_under_black_theme() {
 }
 
 #[test]
+fn terminal_warning_swallows_a_key_and_dismisses_for_the_session() {
+    // While the unsupported-terminal nudge is up, any non-D key dismisses it
+    // for this session and is swallowed so it never reaches the editor below.
+    // Uses a plain letter so nothing is persisted to the real prefs file.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.pending_terminal_warning = true;
+    app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(
+        !app.pending_terminal_warning,
+        "any key should dismiss the nudge for this session"
+    );
+}
+
+#[test]
 fn popup_gradient_tracks_black_theme() {
     // Popups/menus/tooltips wear the gradient + muted selection only under the
     // Black theme; Croft Dark keeps the legacy bright-blue accent so it stays

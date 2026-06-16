@@ -1092,6 +1092,11 @@ pub struct App {
     /// tracked discard runs `git checkout HEAD -- <path>`). Both paths
     /// destroy uncommitted work, so the modal must always run first.
     pending_discard: Option<PendingDiscard>,
+    /// Set on startup (after `init_graphics` resolves the inline-image
+    /// protocol) when the host terminal can't render croft's icons/images
+    /// and the user hasn't silenced the nudge. Drawn as a dismissible modal
+    /// recommending iTerm2 (macOS) / Ghostty (macOS/Linux).
+    pending_terminal_warning: bool,
     /// True while the Source Control commit dropdown (▾ caret) is open.
     /// The caret button toggles this; clicking a menu row, the commit
     /// button, or anywhere outside the menu closes it.
@@ -1674,6 +1679,7 @@ impl App {
             pending_remote_pulls: Vec::new(),
             pending_local_open: None,
             pending_discard: None,
+            pending_terminal_warning: false,
             commit_menu_open: false,
             default_branch_label: None,
             trust_local_browser: false,
@@ -5413,6 +5419,9 @@ impl App {
         self.render_zoxide_jump(frame);
         self.render_shortcuts_modal(frame);
         self.render_connect_dialog(frame);
+        // The startup unsupported-terminal nudge renders last so it sits above
+        // every other overlay until the user dismisses it.
+        self.render_terminal_warning(frame);
 
         // Show the host terminal's hardware caret only when the editor is
         // focused and has no modal overlay. The DECSCUSR style is set to
@@ -5666,6 +5675,101 @@ impl App {
         frame.render_widget(ratatui::widgets::Paragraph::new(body), inner);
     }
 
+    fn render_terminal_warning(&self, frame: &mut ratatui::Frame) {
+        if !self.pending_terminal_warning {
+            return;
+        }
+        let area = frame.area();
+        let width = area.width.saturating_sub(8).clamp(50, 96);
+        let height: u16 = 11;
+        let x = (area.width.saturating_sub(width)) / 2 + area.x;
+        let y = (area.height.saturating_sub(height)) / 2 + area.y;
+        let rect = Rect {
+            x,
+            y,
+            width,
+            height,
+        };
+        let warn = Color::Rgb(0xff, 0xa5, 0x00);
+        let accent = Color::Rgb(0x4e, 0x9a, 0xff);
+        let block = ratatui::widgets::Block::default()
+            .borders(ratatui::widgets::Borders::ALL)
+            .border_style(Style::default().fg(warn))
+            .style(Style::default().bg(Color::Rgb(0x1e, 0x1e, 0x1e)))
+            .title(ratatui::text::Span::styled(
+                " UNSUPPORTED TERMINAL ",
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(warn)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        frame.render_widget(ratatui::widgets::Clear, rect);
+        frame.render_widget(block, rect);
+        let inner = Rect {
+            x: rect.x + 2,
+            y: rect.y + 1,
+            width: rect.width.saturating_sub(4),
+            height: rect.height.saturating_sub(2),
+        };
+        let current = std::env::var("TERM_PROGRAM")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .or_else(|| std::env::var("TERM").ok().filter(|s| !s.is_empty()))
+            .unwrap_or_else(|| String::from("this terminal"));
+        let body = ratatui::text::Text::from(vec![
+            Line::from(Span::styled(
+                "Croft draws its icons and images with inline-image protocols",
+                Style::default().fg(Color::White),
+            )),
+            Line::from(Span::styled(
+                format!("that {current} does not support, so the activity bar and"),
+                Style::default().fg(Color::White),
+            )),
+            Line::from(Span::styled(
+                "file icons stay blank. Croft still runs; for the full UI use:",
+                Style::default().fg(Color::White),
+            )),
+            Line::from(""),
+            Line::from(vec![
+                Span::raw("  macOS:  "),
+                Span::styled(
+                    "iTerm2",
+                    Style::default().fg(accent).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("  or  "),
+                Span::styled(
+                    "Ghostty",
+                    Style::default().fg(accent).add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::from(vec![
+                Span::raw("  Linux:  "),
+                Span::styled(
+                    "Ghostty",
+                    Style::default().fg(accent).add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled(
+                    "[any key]",
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" dismiss    "),
+                Span::styled(
+                    "[D]",
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("on't show again"),
+            ]),
+        ]);
+        frame.render_widget(ratatui::widgets::Paragraph::new(body), inner);
+    }
+
     fn render_local_open_confirm(&self, frame: &mut ratatui::Frame) {
         let Some(url) = &self.pending_local_open else {
             return;
@@ -5878,6 +5982,17 @@ impl App {
         self.hover_popup = None;
         self.hover_diagnostic = None;
         self.hover_request_id = None;
+        // Modal layer: the unsupported-terminal nudge sits on top of everything
+        // at startup. Any key dismisses it for this session; D also persists the
+        // dismissal so it never shows again. All keys are swallowed so the user
+        // can't accidentally type through into the UI below.
+        if self.pending_terminal_warning {
+            match key.code {
+                KeyCode::Char('d') | KeyCode::Char('D') => self.dismiss_terminal_warning(true),
+                _ => self.dismiss_terminal_warning(false),
+            }
+            return Ok(());
+        }
         if self.connect_dialog.is_some() {
             self.handle_connect_dialog_key(key);
             return Ok(());
@@ -7626,6 +7741,29 @@ impl App {
 
     pub fn cancel_pending_discard(&mut self) {
         self.pending_discard = None;
+    }
+
+    /// Decide whether to show the unsupported-terminal nudge. Call AFTER
+    /// `init_graphics` has resolved `inline_protocol` (including the sixel
+    /// promotion), so a sixel host is correctly treated as supported. No-op
+    /// when the user has already silenced the nudge in their prefs.
+    fn arm_terminal_warning(&mut self) {
+        if crate::prefs::Prefs::load_or_default().suppress_terminal_warning {
+            return;
+        }
+        self.pending_terminal_warning = crate::iterm2_inline::terminal_warrants_switch_warning(
+            self.inline_protocol,
+            crate::iterm2_inline::detect_termux(),
+        );
+    }
+
+    /// Dismiss the unsupported-terminal nudge. `dont_show_again` persists the
+    /// dismissal so it never reappears; otherwise it returns next launch.
+    fn dismiss_terminal_warning(&mut self, dont_show_again: bool) {
+        self.pending_terminal_warning = false;
+        if dont_show_again {
+            let _ = crate::prefs::save_suppress_terminal_warning(true);
+        }
     }
 
     fn commit_source_control(&mut self) {
@@ -15621,6 +15759,13 @@ pub fn run(root: PathBuf, restore_session: Option<PathBuf>) -> Result<()> {
     // Env-var-only iTerm2 detection: no stdin queries, so this can't
     // contend with the crossterm event reader.
     app.init_graphics();
+    // With the inline-image protocol fully resolved (env detection + the sixel
+    // DA1 probe above), decide whether to nudge the user toward a terminal that
+    // can render croft's icons and images. Runs identically on the local Mac
+    // and the remote Linux box (GOLDEN RULE): both reach `run`, and `croft
+    // remote` forwards the local terminal's identity so an SSH session from
+    // iTerm2/Ghostty is never falsely warned.
+    app.arm_terminal_warning();
 
     // Wrap stdout so we can count exactly how many bytes ratatui's diff
     // ships per frame — over SSH that byte count, alongside the per-frame

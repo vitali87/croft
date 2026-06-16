@@ -261,6 +261,19 @@ pub fn inline_image_protocol_for(
     }
 }
 
+/// True when croft should nudge the user to switch to a richer terminal:
+/// the resolved inline-image `protocol` is `None` (no iTerm2/Kitty/sixel
+/// rendering, so the activity bar and file icons fall back to blank cells)
+/// AND this is not Termux. Termux renders no images either, but it is an
+/// intentional Android target where the recommended terminals (iTerm2 on
+/// macOS, Ghostty on macOS/Linux) don't exist, so it is never warned.
+///
+/// Must be evaluated AFTER the sixel DA1 probe has promoted `protocol`, so a
+/// sixel host (foot, contour, xterm) is correctly treated as supported.
+pub fn terminal_warrants_switch_warning(protocol: InlineImageProtocol, termux: bool) -> bool {
+    protocol == InlineImageProtocol::None && !termux
+}
+
 #[allow(dead_code)]
 pub fn detect_inline_image_protocol() -> InlineImageProtocol {
     let term_program = std::env::var("TERM_PROGRAM").ok();
@@ -1299,6 +1312,34 @@ mod tests {
             inline_image_protocol_for(None, None),
             InlineImageProtocol::None
         );
+    }
+
+    #[test]
+    fn switch_warning_fires_only_for_imageless_non_termux_terminals() {
+        // Apple Terminal and friends: no protocol, not Termux -> warn.
+        assert!(terminal_warrants_switch_warning(
+            InlineImageProtocol::None,
+            false
+        ));
+        // Every rendering protocol suppresses the warning.
+        assert!(!terminal_warrants_switch_warning(
+            InlineImageProtocol::ITerm2,
+            false
+        ));
+        assert!(!terminal_warrants_switch_warning(
+            InlineImageProtocol::Kitty,
+            false
+        ));
+        assert!(!terminal_warrants_switch_warning(
+            InlineImageProtocol::Sixel,
+            false
+        ));
+        // Termux renders no images but is an intentional Android target where
+        // the recommended terminals don't exist, so it is never warned.
+        assert!(!terminal_warrants_switch_warning(
+            InlineImageProtocol::None,
+            true
+        ));
     }
 
     #[test]
