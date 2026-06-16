@@ -266,35 +266,60 @@ impl FsWatch {
         // cargo/npm/git write storms the debouncer's FileIdMap memcmp loop
         // can't keep up with, and which on macOS also trip Sonoma's App
         // Management TCC class.
-        let is_skippable = |name: &std::ffi::OsStr| -> bool {
-            FS_WATCH_PROTECTED_NAMES.iter().any(|n| name == *n) || is_noise_dir(name)
-        };
         #[cfg(target_os = "macos")]
         {
-            let entries: Vec<std::fs::DirEntry> = std::fs::read_dir(root)
-                .map(|rd| rd.filter_map(Result::ok).collect())
-                .unwrap_or_default();
-            if entries.iter().any(|e| is_skippable(&e.file_name())) {
+            // Depth-aware pruning. The old code only checked the root's
+            // *immediate* children for noise, so opening a directory that is
+            // a PARENT of repos (e.g. ~/Documents) found no top-level
+            // node_modules/.git/target, fell through to a single recursive
+            // watch over the whole tree, and re-subscribed every repo's write
+            // storm one level down (confirmed by `sample`: five fsevents
+            // loops + a mutex-bound debouncer at ~45% CPU, UI frozen).
+            //
+            // Instead, walk the tree (descent stops at noise dirs, so their
+            // subtrees are never read) and install a recursive watch only at
+            // the root of each maximal noise-free subtree, plus a
+            // non-recursive watch on every "boundary" directory that contains
+            // noise so its own direct entries are still observed. A noise dir
+            // is therefore never covered by any FSEvents stream at any depth,
+            // and the stream count stays in the low hundreds instead of one
+            // pathological recursive watch — keeping FSEventStreamCreate well
+            // under the per-tree count that pins a core.
+            let mut targets: Vec<(PathBuf, RecursiveMode)> = Vec::new();
+            if collect_macos_watch_targets(root, &mut targets) {
+                // Whole tree is noise-free (e.g. a small repo with no
+                // node_modules): one recursive watch covers it in a single
+                // stream, exactly as before.
+                targets.push((root.to_path_buf(), RecursiveMode::Recursive));
+            }
+            // Safety net: if a pathological tree still produces a huge number
+            // of streams, keep the shallowest (broadest-coverage) ones and let
+            // the adaptive-backoff poll fallback cover the rest, rather than
+            // spending forever in FSEventStreamCreate.
+            const MAX_WATCHES: usize = 2_000;
+            if targets.len() > MAX_WATCHES {
+                targets.sort_by_key(|(p, _)| p.components().count());
+                targets.truncate(MAX_WATCHES);
+            }
+            // The root itself must always be watchable, or `spawn_watcher`
+            // would succeed having subscribed to nothing on a clean-but-empty
+            // root; mirror the previous contract of failing loudly if even
+            // the root cannot be watched.
+            if targets.is_empty() {
                 debouncer
                     .watch(root, RecursiveMode::NonRecursive)
                     .context("starting non-recursive watch on workspace root")?;
-                for entry in entries {
-                    if is_skippable(&entry.file_name()) {
-                        continue;
-                    }
-                    let path = entry.path();
-                    if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
-                        let _ = debouncer.watch(&path, RecursiveMode::Recursive);
-                    }
-                }
             } else {
-                debouncer
-                    .watch(root, RecursiveMode::Recursive)
-                    .context("starting watch on workspace root")?;
+                for (path, mode) in targets {
+                    let _ = debouncer.watch(&path, mode);
+                }
             }
         }
         #[cfg(not(target_os = "macos"))]
         {
+            let is_skippable = |name: &std::ffi::OsStr| -> bool {
+                FS_WATCH_PROTECTED_NAMES.iter().any(|n| name == *n) || is_noise_dir(name)
+            };
             // Hard ceiling so a pathological tree can't spend forever
             // issuing inotify_add_watch syscalls on the init thread;
             // anything beyond is covered by the adaptive-backoff poll
@@ -348,6 +373,65 @@ impl FsWatch {
     pub fn clear_dir_mtimes(&mut self) {
         self.poll_dir_mtimes.clear();
     }
+}
+
+/// True for a directory name croft must never watch: a protected macOS dir
+/// (`Library`/`.Trash`, which trip Sonoma's App Management TCC class) or a
+/// build/VCS noise dir (`node_modules`/`target`/`.git`/…) whose cargo/npm/git
+/// write storms the debouncer's FileIdMap loop cannot keep up with.
+#[cfg(target_os = "macos")]
+fn is_skippable_name(name: &std::ffi::OsStr) -> bool {
+    FS_WATCH_PROTECTED_NAMES.iter().any(|n| name == *n) || is_noise_dir(name)
+}
+
+/// Walk `dir` and append the FSEvents watch targets that cover every
+/// non-noise file beneath it without ever subscribing to a noise subtree at
+/// any depth (descent stops at noise dirs, so their subtrees are never even
+/// read). Returns `true` when `dir`'s entire subtree is noise-free, deferring
+/// to the caller to install one recursive watch at the subtree's highest
+/// point (a single stream); returns `false` when `dir` is a boundary, having
+/// already pushed a non-recursive watch on `dir` itself plus a recursive
+/// watch on each maximal noise-free child subtree.
+#[cfg(target_os = "macos")]
+fn collect_macos_watch_targets(
+    dir: &Path,
+    targets: &mut Vec<(PathBuf, notify::RecursiveMode)>,
+) -> bool {
+    use notify::RecursiveMode;
+    let mut has_noise = false;
+    let mut subdirs: Vec<PathBuf> = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for entry in rd.filter_map(Result::ok) {
+            if is_skippable_name(&entry.file_name()) {
+                has_noise = true;
+                continue;
+            }
+            // `file_type()` does not follow symlinks, so a symlinked dir
+            // reports `is_dir() == false` and we never descend — that also
+            // rules out symlink cycles (e.g. the ~/Library group-container
+            // loops that flooded the basedpyright crawl).
+            if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+                subdirs.push(entry.path());
+            }
+        }
+    }
+    let child_clean: Vec<(PathBuf, bool)> = subdirs
+        .into_iter()
+        .map(|sd| {
+            let clean = collect_macos_watch_targets(&sd, targets);
+            (sd, clean)
+        })
+        .collect();
+    if !has_noise && child_clean.iter().all(|(_, clean)| *clean) {
+        return true;
+    }
+    targets.push((dir.to_path_buf(), RecursiveMode::NonRecursive));
+    for (sd, clean) in child_clean {
+        if clean {
+            targets.push((sd, RecursiveMode::Recursive));
+        }
+    }
+    false
 }
 
 fn event_mutates_content(kind: &notify::EventKind) -> bool {

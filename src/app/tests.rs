@@ -992,6 +992,82 @@ fn fs_watcher_does_not_deliver_events_from_target_or_node_modules_subtrees() {
 }
 
 #[test]
+fn fs_watcher_prunes_noise_dirs_nested_below_the_workspace_root() {
+    // Regression for the freeze when the workspace root is a *parent of
+    // repos* (e.g. ~/Documents): there the noise dirs (node_modules/, .git/,
+    // target/) are NOT direct children of the root, so the old depth-1
+    // pruning missed them and installed one recursive FSEvents watch over
+    // the whole tree, re-subscribing every repo's node_modules write storm
+    // (confirmed by `sample`: five fsevents loops + a mutex-bound debouncer
+    // at ~45% CPU). Pruning must therefore be depth-aware: a noise dir
+    // nested under a normal subdir must still never deliver events.
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_raw = tmp.path().join("repo");
+    let src_raw = repo_raw.join("src");
+    let node_modules_raw = repo_raw.join("node_modules");
+    let git_raw = repo_raw.join(".git");
+    std::fs::create_dir_all(&src_raw).unwrap();
+    std::fs::create_dir_all(&node_modules_raw).unwrap();
+    std::fs::create_dir_all(&git_raw).unwrap();
+    let src = src_raw.canonicalize().unwrap();
+    let node_modules = node_modules_raw.canonicalize().unwrap();
+    let git = git_raw.canonicalize().unwrap();
+
+    let (_debouncer, rx) = super::fs_watch::FsWatch::spawn_watcher(tmp.path())
+        .expect("watcher must start cleanly with nested noise dirs present");
+
+    for _ in 0..30 {
+        while rx.try_recv().is_ok() {}
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    for i in 0..50 {
+        std::fs::write(node_modules.join(format!("pkg_{i}.js")), b"x").unwrap();
+        std::fs::write(git.join(format!("obj_{i}")), b"x").unwrap();
+    }
+    std::thread::sleep(std::time::Duration::from_millis(400));
+
+    let mut noise_events: Vec<std::path::PathBuf> = Vec::new();
+    while let Ok(batch) = rx.try_recv() {
+        for ev in batch.unwrap_or_default() {
+            for path in &ev.event.paths {
+                if path.starts_with(&node_modules) || path.starts_with(&git) {
+                    noise_events.push(path.clone());
+                }
+            }
+        }
+    }
+    assert!(
+        noise_events.is_empty(),
+        "writes under a repo's nested node_modules/ and .git/ must not produce \
+         debouncer events even when the repo is itself a subdir of the root; got {noise_events:?}"
+    );
+
+    std::fs::write(src.join("a.rs"), b"fn main() {}").unwrap();
+    let started = std::time::Instant::now();
+    let mut signal_events: Vec<std::path::PathBuf> = Vec::new();
+    while started.elapsed() < std::time::Duration::from_millis(1500) {
+        while let Ok(batch) = rx.try_recv() {
+            for ev in batch.unwrap_or_default() {
+                for path in &ev.event.paths {
+                    if path.starts_with(&src) {
+                        signal_events.push(path.clone());
+                    }
+                }
+            }
+        }
+        if !signal_events.is_empty() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(
+        !signal_events.is_empty(),
+        "writes under a nested repo/src/ must still produce events after the depth-aware split"
+    );
+}
+
+#[test]
 fn drain_fs_events_returns_false_when_nothing_pending() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
