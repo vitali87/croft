@@ -63,6 +63,25 @@ impl CommitMenuItem {
             }
         }
     }
+
+    /// Leading codicon glyph painted before the label, mirroring VS Code's
+    /// Source Control menu. Codepoints are Nerd Fonts `cod-*` PUA values
+    /// (verified against ryanoasis/nerd-fonts glyphnames.json on
+    /// 2026-06-18), matching the cod-source-control (U+EA68) glyph already
+    /// used by the branch row:
+    ///   - cloud-upload (U+EAC3): commit then push to the remote
+    ///   - arrow-up (U+EAA1): push to the remote
+    ///   - diff (U+EAE1): the staged diff against HEAD
+    ///   - git-compare (U+EAFD): a branch/commit comparison
+    pub fn icon(&self) -> char {
+        match self {
+            CommitMenuItem::CommitAndPush => '\u{eac3}',
+            CommitMenuItem::Push => '\u{eaa1}',
+            CommitMenuItem::ViewStagedDiff => '\u{eae1}',
+            CommitMenuItem::ViewPreviousCommitDiff => '\u{eafd}',
+            CommitMenuItem::ViewDefaultBranchDiff => '\u{eafd}',
+        }
+    }
 }
 
 pub struct SourceControlPanel {
@@ -2819,6 +2838,17 @@ mod tests {
             CommitMenuItem::ViewStagedDiff.label("anything"),
             "View Staged Changes"
         );
+    }
+
+    #[test]
+    fn commit_menu_items_carry_their_codicon_glyph() {
+        // Nerd Fonts cod-* PUA values, verified against glyphnames.json
+        // alongside cod-source-control (U+EA68) on the branch row.
+        assert_eq!(CommitMenuItem::CommitAndPush.icon(), '\u{eac3}'); // cloud-upload
+        assert_eq!(CommitMenuItem::Push.icon(), '\u{eaa1}'); // arrow-up
+        assert_eq!(CommitMenuItem::ViewStagedDiff.icon(), '\u{eae1}'); // diff
+        assert_eq!(CommitMenuItem::ViewPreviousCommitDiff.icon(), '\u{eafd}'); // git-compare
+        assert_eq!(CommitMenuItem::ViewDefaultBranchDiff.icon(), '\u{eafd}'); // git-compare
     }
 
     #[test]

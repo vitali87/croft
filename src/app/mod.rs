@@ -5578,11 +5578,14 @@ impl App {
             .unwrap_or_else(|| "default".to_string());
         let items: Vec<(CommitMenuItem, String)> = CommitMenuItem::ALL
             .iter()
-            .map(|item| (*item, format!(" {} ", item.label(&default_branch))))
+            .map(|item| (*item, item.label(&default_branch)))
             .collect();
+        // Row layout: [pad][icon][gap][label][pad]. The icon occupies one
+        // cell at item_x+1; the label starts two cells later at item_x+3.
+        const ICON_PAD: u16 = 3;
         let label_w = items
             .iter()
-            .map(|(_, l)| l.chars().count() as u16)
+            .map(|(_, l)| l.chars().count() as u16 + ICON_PAD + 1)
             .max()
             .unwrap_or(0);
         let item_w: u16 = label_w.max(caret.width);
@@ -5612,9 +5615,24 @@ impl App {
                     .set_symbol(" ")
                     .set_style(style);
             }
+            // Leading codicon, colored per action: push glyphs in blue,
+            // diff/compare glyphs in purple, mirroring VS Code's SCM accents.
+            let icon_color = match item {
+                CommitMenuItem::CommitAndPush => Color::Rgb(0x9a, 0xa4, 0xb2),
+                CommitMenuItem::Push => Color::Rgb(0x6c, 0xb6, 0xff),
+                CommitMenuItem::ViewStagedDiff
+                | CommitMenuItem::ViewPreviousCommitDiff
+                | CommitMenuItem::ViewDefaultBranchDiff => Color::Rgb(0xc0, 0xa4, 0xf5),
+            };
+            frame.buffer_mut().set_string(
+                row_rect.x + 1,
+                row_rect.y,
+                item.icon().to_string(),
+                Style::default().fg(icon_color).bg(bg),
+            );
             frame
                 .buffer_mut()
-                .set_string(row_rect.x, row_rect.y, &label, style);
+                .set_string(row_rect.x + 3, row_rect.y, &label, style);
             self.source_control
                 .commit_menu_item_areas
                 .push((row_rect, item));
