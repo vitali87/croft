@@ -32,6 +32,9 @@ pub const NEW_FOLDER_GLYPH: char = '\u{ea80}';
 /// Codicon `cod-collapse_all` — the stacked-rows-with-minus glyph for
 /// "Collapse Folders in Explorer". Nerd Fonts `cod-collapse_all` = U+EAC5.
 pub const COLLAPSE_ALL_GLYPH: char = '\u{eac5}';
+/// Codicon `cod-filter` — the funnel glyph VS Code paints on a list/tree's
+/// "Filter" action. Nerd Fonts `cod-filter` = U+EAF1.
+pub const FILTER_GLYPH: char = '\u{eaf1}';
 
 /// Paint a header pill button at cell `(x, y)`. `brand` is true under the
 /// Black theme: a chipless teal icon in the VS Code toolbar spirit that grows

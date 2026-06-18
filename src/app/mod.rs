@@ -8463,6 +8463,31 @@ impl App {
     }
 
     fn handle_tree_key(&mut self, key: KeyEvent) {
+        // Filter box open: it owns text entry. Plain characters extend the
+        // query, Backspace deletes, Esc closes it (mirroring VS Code's tree
+        // filter). Navigation keys (arrows/Enter/PageUp/...) fall through so the
+        // user can still move within and open from the filtered results.
+        if self.tree.filter_active() {
+            match key.code {
+                KeyCode::Esc => {
+                    self.tree.close_filter();
+                    return;
+                }
+                KeyCode::Backspace => {
+                    self.tree.filter_backspace();
+                    return;
+                }
+                KeyCode::Char(c)
+                    if !key.modifiers.intersects(
+                        KeyModifiers::CONTROL | KeyModifiers::SUPER | KeyModifiers::META,
+                    ) =>
+                {
+                    self.tree.filter_push(c);
+                    return;
+                }
+                _ => {}
+            }
+        }
         // Delete key (or Cmd+Backspace) trashes every selected node.
         if is_delete_node_key(key) {
             self.delete_selection();
@@ -12400,6 +12425,24 @@ impl App {
                     if rect_contains(self.tree.header_collapse_btn, m.column, m.row) {
                         self.tree.collapse_all();
                         self.status = String::from("Collapsed all folders");
+                        return;
+                    }
+                    // Funnel toggle: opens the inline filter box, or closes it
+                    // when already open (VS Code's toggled filter action).
+                    if rect_contains(self.tree.header_filter_btn, m.column, m.row) {
+                        if self.tree.filter_active() {
+                            self.tree.close_filter();
+                            self.status = String::from("Filter cleared");
+                        } else {
+                            self.tree.open_filter();
+                            self.status = String::from("Filter Explorer");
+                        }
+                        return;
+                    }
+                    // The filter box's "x" clears and closes the filter.
+                    if rect_contains(self.tree.filter_clear_btn, m.column, m.row) {
+                        self.tree.close_filter();
+                        self.status = String::from("Filter cleared");
                         return;
                     }
                     if let Some(idx) = self.tree.node_at_y(m.row) {

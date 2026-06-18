@@ -12506,3 +12506,34 @@ fn debug_console_is_retained_after_the_session_ends() {
         "the idle Run panel must not show stale console output"
     );
 }
+
+#[test]
+fn explorer_filter_keys_route_to_the_tree_filter_box() {
+    // With the Explorer focused (the default at boot) and the funnel filter
+    // open, plain characters extend the query, Backspace deletes, and Esc
+    // closes the box - never leaking into the status line or the editor.
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("main.rs"), "fn main() {}\n").unwrap();
+    std::fs::write(tmp.path().join("README.md"), "# hi\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    assert!(matches!(app.focus, Pane::Tree));
+    assert!(matches!(app.sidebar_view, SidebarView::Explorer));
+
+    app.tree.open_filter();
+    for c in "main".chars() {
+        app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
+            .unwrap();
+    }
+    assert_eq!(app.tree.filter_query(), "main");
+
+    app.handle_key(key(KeyCode::Backspace, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.tree.filter_query(), "mai");
+
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    assert!(
+        !app.tree.filter_active(),
+        "Esc must close the filter box and restore the full tree"
+    );
+}
