@@ -12073,8 +12073,8 @@ fn black_theme_sidebar_titles_are_chipless_brand_headers() {
 }
 
 #[test]
-fn black_theme_remote_header_buttons_are_teal_icons() {
-    use crate::gradient::{INNER_ACCENT, rgb_color};
+fn black_theme_remote_header_buttons_are_near_white_icons() {
+    use crate::gradient::{PANEL_TITLE_FG, rgb_color};
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.sidebar_view = SidebarView::Remote;
@@ -12083,7 +12083,9 @@ fn black_theme_remote_header_buttons_are_teal_icons() {
     assert!(add.width > 0, "remote header add button must render");
     // The snug pill paints the glyph at the rect origin (the highlight wraps
     // exactly that one cell), so probe there rather than the rect centre.
-    assert_eq!(buf[(add.x, add.y)].fg, rgb_color(INNER_ACCENT));
+    // 863cc5c moved header view-action icons off the brand teal to the
+    // near-white PANEL_TITLE_FG, matching VS Code's light `icon.foreground`.
+    assert_eq!(buf[(add.x, add.y)].fg, rgb_color(PANEL_TITLE_FG));
 }
 
 #[test]
