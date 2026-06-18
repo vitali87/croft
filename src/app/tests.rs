@@ -425,6 +425,59 @@ fn mouse(
 }
 
 #[test]
+fn outline_scrollbar_drag_is_not_hijacked_by_the_sidebar_splitter() {
+    use crate::lsp::manager::{OutlineKind, OutlineSymbol};
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let tmp = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("a.rs");
+    std::fs::write(&f, "fn main() {}\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&f).unwrap();
+    // Enough symbols to overflow the OUTLINE's capped half-height so a scrollbar
+    // is drawn; expand the panel so the body (and its bar) render.
+    let syms: Vec<_> = (0..200u32)
+        .map(|i| OutlineSymbol {
+            name: format!("f{i}"),
+            detail: None,
+            kind: OutlineKind::Function,
+            depth: 0,
+            line: i,
+            character: 0,
+            range_start_line: i,
+            range_end_line: i,
+        })
+        .collect();
+    app.outline.set_symbols(f.clone(), syms);
+    app.outline.collapsed = false;
+
+    let backend = ratatui::backend::TestBackend::new(100, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|frame| app.render(frame)).unwrap();
+
+    let bar = app.outline.last_scrollbar;
+    assert!(
+        bar.width > 0 && bar.height > 0,
+        "the overflowing outline must draw a scrollbar"
+    );
+    // The outline panel has no right border, so its scrollbar lands on the
+    // sidebar's rightmost column, inside the splitter's two-cell grab zone. A
+    // press there must drive the outline's bar, not start a sidebar resize.
+    app.handle_mouse(mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        bar.x,
+        bar.y + bar.height - 1,
+    ));
+    assert!(
+        app.splitter_drag.is_none(),
+        "pressing the outline scrollbar must not start a sidebar splitter drag"
+    );
+    assert!(
+        app.outline_scrollbar_drag,
+        "pressing the outline scrollbar must arm the outline scrollbar drag"
+    );
+}
+
+#[test]
 fn tap_in_the_editor_arms_the_hover_dwell_and_release_keeps_it_armed() {
     use crossterm::event::{MouseButton, MouseEventKind};
     let (mut app, _tmp, col, row) = app_with_open_file_and_editor_cell();

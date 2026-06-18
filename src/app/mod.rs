@@ -12055,7 +12055,15 @@ impl App {
                     // left edge) and one column to the left (the tree's right
                     // border). Either grab starts a sidebar drag — a 1-cell
                     // target is too easy to miss.
-                    if m.column == x || m.column == x.saturating_sub(1) {
+                    //
+                    // The OUTLINE panel draws no right border, so its scrollbar
+                    // sits on the sidebar's rightmost column (`x - 1`), inside
+                    // this zone. Exempt that column when it's the outline bar so
+                    // the press reaches the scrollbar handler below instead of
+                    // being swallowed as a resize.
+                    if (m.column == x || m.column == x.saturating_sub(1))
+                        && !rect_contains(self.outline.last_scrollbar, m.column, m.row)
+                    {
                         self.splitter_drag = Some(SplitterDrag::Sidebar);
                         return;
                     }
