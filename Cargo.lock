@@ -459,7 +459,7 @@ dependencies = [
 
 [[package]]
 name = "croft"
-version = "0.1.423"
+version = "0.1.428"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -472,6 +472,7 @@ dependencies = [
  "crossterm",
  "csv",
  "futures",
+ "globset",
  "grep-matcher",
  "grep-regex",
  "grep-searcher",

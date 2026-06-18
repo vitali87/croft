@@ -1,6 +1,6 @@
 [package]
 name = "croft"
-version = "0.1.427"
+version = "0.1.428"
 edition = "2024"
 description = "VSCode-style TUI written in Rust"
 license = "MIT"
@@ -97,6 +97,7 @@ rayon = "1.12"
 sysinfo = { version = "0.38", default-features = false, features = ["system", "disk", "network", "component"] }
 tree-sitter-cpp = "0.23.4"
 tree-sitter-c = "0.24.2"
+globset = "0.4.18"
 
 # `trash` has no android backend: its freedesktop backend is gated
 # `not(target_os = "android")`, so on android the crate fails to compile

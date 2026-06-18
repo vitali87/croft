@@ -89,7 +89,7 @@ src/
     ├── remote.rs        Remote (SSH) sidebar widget with empty-state hero illustration
     ├── run_debug.rs     Run and Debug sidebar widget: empty-state Run [filename] button, and when a session is live the paused-state tree (call stack + expandable variables), a debug console of program output, and a `❯` REPL prompt; the App builds the rows and maps clicks back to frames / variables
     ├── scrollbar.rs     shared vertical- and horizontal-scrollbar geometry
-    ├── search.rs        sidebar search panel + .gitignore-aware substring walker
+    ├── search.rs        sidebar search panel (query/replace/include/exclude inputs) + .gitignore-aware walker, glob filtering, and replace
     ├── shortcuts.rs     F1 shortcuts modal: every binding grouped by pane, scrollable
     ├── source_control.rs Source Control sidebar widget: branch summary, commit input, change list, commit button, header refresh pill, no-repo hero
     ├── system_panel.rs  collapsible SYSTEM metrics panel pinned to the sidebar bottom

@@ -71,8 +71,13 @@ On macOS, the `Cmd` chords below only reach croft after you run a one-time setup
 
 | Keys | Action |
 |------|--------|
-| Type | Live `.gitignore`-aware workspace search, per keystroke (off the UI thread, capped at 200 hits). Unsaved buffers are searched in-memory, so unsaved edits are findable before you save |
+| Type | Live `.gitignore`-aware workspace search, per keystroke (off the UI thread; every match is returned, no cap). Unsaved buffers are searched in-memory, so unsaved edits are findable before you save |
 | Click `Aa` / `ab` / `.*` | Toggle case-sensitive / whole-word / regex; active toggles show a yellow background |
+| Click the left chevron (`▸`/`▾`) | Expand / collapse the Replace row |
+| Type in Replace, then `Enter` or click the replace-all icon | Replace every match across all result files with the Replace text (regex mode honours `$1` capture references); the search re-runs afterward |
+| Click the `...` icon | Expand / collapse the "files to include" and "files to exclude" glob inputs |
+| Type globs into include / exclude | Restrict the search to / from matching files (comma-separated, VS Code style; a bare `*.rs` matches at any depth). Editing re-runs the search live |
+| `Tab` | Cycle focus through the visible inputs (search → replace → include → exclude) |
 | `↑` / `↓` + `Enter`, or click a result | Open the file at the matched line in the replaceable preview tab |
 | Double-click a result | Pin its tab, so moving to the next result opens beside it instead of replacing it |
 

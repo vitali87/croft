@@ -46,6 +46,18 @@ pub const ACTIVITY_SOURCE_CONTROL: char = '\u{ea68}';
 /// NOT use U+EAD8 (cod-debug, just the bug) or U+EB2C (cod-play, just
 /// the triangle): both lose half the silhouette.
 pub const ACTIVITY_RUN_DEBUG: char = '\u{eb91}';
+/// Codicon `replace-all` — the two-line "find & replace, all" glyph VS Code
+/// shows beside the Replace input in its Search sidebar. Verified on
+/// 2026-06-19 against the upstream codicon `mapping.json`: replace-all is
+/// **U+EB3C** (decimal 60220). Do NOT confuse with `replace` (U+EB3D), the
+/// single-replace glyph used on each result row.
+pub const SEARCH_REPLACE_ALL: char = '\u{eb3c}';
+/// Codicon `replace` — single find-&-replace glyph. U+EB3D (decimal 60221).
+pub const SEARCH_REPLACE: char = '\u{eb3d}';
+/// Codicon `ellipsis` — the "..." toggle VS Code uses to expand the
+/// "files to include" / "files to exclude" rows. U+EA7C (decimal 60028).
+pub const SEARCH_ELLIPSIS: char = '\u{ea7c}';
+
 /// Codicon `gear` (a.k.a. `settings-gear`) — the cogwheel VS Code uses for
 /// its bottom-left "Manage" button. Verified against the Nerd Fonts CSS
 /// (`.nf-cod-gear`) which pins it to **U+EB51**. Glyph-fallback only; the
@@ -302,6 +314,27 @@ mod tests {
     #[test]
     fn activity_bar_search_glyph_is_cod_search() {
         assert_eq!(ACTIVITY_SEARCH, '\u{ea6d}');
+    }
+
+    #[test]
+    fn search_replace_all_glyph_is_cod_replace_all_not_cod_replace() {
+        // VS Code's Search sidebar puts `replace-all` (U+EB3C) beside the
+        // Replace input, and `replace` (U+EB3D) on each result row. Verified
+        // against codicon mapping.json (replace-all=60220, replace=60221) on
+        // 2026-06-19. Guard against swapping the two.
+        assert_eq!(SEARCH_REPLACE_ALL, '\u{eb3c}');
+        assert_eq!(SEARCH_REPLACE, '\u{eb3d}');
+        assert_ne!(
+            SEARCH_REPLACE_ALL, SEARCH_REPLACE,
+            "replace-all and replace are distinct glyphs"
+        );
+    }
+
+    #[test]
+    fn search_ellipsis_glyph_is_cod_ellipsis() {
+        // The "..." toggle that expands files-to-include/exclude is codicon
+        // `ellipsis` U+EA7C (decimal 60028), verified 2026-06-19.
+        assert_eq!(SEARCH_ELLIPSIS, '\u{ea7c}');
     }
 
     #[test]

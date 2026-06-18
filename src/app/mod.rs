@@ -2719,6 +2719,12 @@ impl App {
         let _ = self
             .search_query_tx
             .send(SearchRequest::SetDirtyBuffers(dirty));
+        // Push the current files-to-include / files-to-exclude globs so the
+        // next scan honours them (VS Code's Search filter inputs).
+        let _ = self.search_query_tx.send(SearchRequest::SetFilter(
+            self.search.include.clone(),
+            self.search.exclude.clone(),
+        ));
         let _ = self.search_query_tx.send(SearchRequest::Query(
             self.search.query.clone(),
             self.search.opts,
@@ -6440,17 +6446,18 @@ impl App {
     }
 
     fn handle_search_key(&mut self, key: KeyEvent) {
+        use crate::widgets::search::SearchField;
         if is_search_paste_key(key) {
             let text = (self.clipboard_reader)();
             self.paste_clipboard_into_search(text.as_deref());
             return;
         }
         if is_editor_select_all_key(key) {
-            self.search.select_all_query();
+            self.search.select_all_active();
             return;
         }
         if is_editor_copy_key(key) {
-            let text = self.search.selection_text();
+            let text = self.search.active_selection_text();
             if !text.is_empty() {
                 copy_to_clipboard(&text);
                 self.status = format!("Copied {} chars to clipboard", text.chars().count());
@@ -6458,36 +6465,52 @@ impl App {
             return;
         }
         if is_editor_cut_key(key) {
-            let text = self.search.selection_text();
+            let text = self.search.active_selection_text();
             if !text.is_empty() {
                 copy_to_clipboard(&text);
                 let n = text.chars().count();
-                self.search.delete_selection();
-                self.submit_search_query();
+                self.search.backspace();
+                self.refresh_search_if_filtering();
                 self.status = format!("Cut {n} chars to clipboard");
             }
             return;
         }
+        // Tab cycles through the visible inputs (Query → Replace → include →
+        // exclude → Query), mirroring VS Code. Shift+Tab is left to fall
+        // through to default since BackTab arrives as its own key code.
+        if key.code == KeyCode::Tab && key.modifiers.is_empty() {
+            self.search.focus_next_field();
+            return;
+        }
         match key.code {
             KeyCode::Esc => {
-                if self.search.query.is_empty() {
-                    self.set_sidebar_view(SidebarView::Explorer);
+                if self.search.active_text().is_empty() {
+                    if self.search.field == SearchField::Query {
+                        self.set_sidebar_view(SidebarView::Explorer);
+                    } else {
+                        self.search.focus_field(SearchField::Query);
+                    }
                 } else {
-                    self.search.query.clear();
-                    self.search.clear_selection();
-                    self.search.hits.clear();
-                    self.submit_search_query();
+                    let was_query = self.search.field == SearchField::Query;
+                    self.search.active_text_mut_clear();
+                    self.search.clear_active_selection();
+                    if was_query {
+                        self.search.hits.clear();
+                    }
+                    self.refresh_search_if_filtering();
                 }
             }
             KeyCode::Enter => {
-                if let Some(hit) = self.search.selected_hit().cloned() {
+                // On the Replace field, Enter runs Replace All across the
+                // current results; elsewhere it opens the selected hit.
+                if self.search.field == SearchField::Replace {
+                    self.run_search_replace_all();
+                } else if let Some(hit) = self.search.selected_hit().cloned() {
                     self.open_search_hit(&hit);
                 }
             }
-            KeyCode::Backspace
-                if (self.search.delete_selection() || self.search.query.pop().is_some()) =>
-            {
-                self.submit_search_query();
+            KeyCode::Backspace if self.search.backspace() => {
+                self.refresh_search_if_filtering();
             }
             KeyCode::Up => self.search.move_up(),
             KeyCode::Down => self.search.move_down(),
@@ -6496,9 +6519,8 @@ impl App {
                     && !key.modifiers.contains(KeyModifiers::ALT)
                     && !key.modifiers.contains(KeyModifiers::SUPER)
                 {
-                    self.search.delete_selection();
-                    self.search.query.push(c);
-                    self.submit_search_query();
+                    self.search.type_char(c);
+                    self.refresh_search_if_filtering();
                 } else if key.modifiers.contains(KeyModifiers::SUPER) {
                     self.status = format!("Search: unhandled Cmd+{c}");
                 } else if key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -6507,6 +6529,31 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// Re-run the search after a field edit, but only when the edited field
+    /// actually affects the result set. Editing the Replace text changes
+    /// nothing about which files match, so it must not clear / re-scan.
+    fn refresh_search_if_filtering(&mut self) {
+        if self.search.field != crate::widgets::search::SearchField::Replace {
+            self.submit_search_query();
+        }
+    }
+
+    /// Replace every match in the current results with the Replace text, then
+    /// re-run the query so the (now stale) hit list refreshes.
+    fn run_search_replace_all(&mut self) {
+        if self.search.query.trim().is_empty() {
+            self.status = String::from("Replace All: enter a search term first");
+            return;
+        }
+        let n = self.search.replace_all_on_disk();
+        if n == 0 {
+            self.status = String::from("Replace All: nothing to replace");
+        } else {
+            self.status = format!("Replace All: replaced {n} occurrence(s)");
+        }
+        self.submit_search_query();
     }
 
     fn handle_remote_key(&mut self, key: KeyEvent) {
@@ -9931,19 +9978,16 @@ impl App {
             self.status = String::from("Cmd+V: clipboard is empty");
             return;
         }
-        let before = self.search.query.chars().count();
-        self.search.insert_str_into_query(s);
-        self.submit_search_query();
-        let after = self.search.query.chars().count();
-        let inserted = after.saturating_sub(before);
-        if inserted == 0 {
-            self.status = format!(
-                "Cmd+V: saw clipboard chars={}, inserted 0 after filtering",
-                s.chars().count()
-            );
-        } else {
-            self.status = format!("Cmd+V: inserted {inserted} chars; query len {after}");
+        self.search.insert_str(s);
+        // Replace text doesn't change which files match, so only re-run the
+        // scan when the paste landed in a search-affecting field.
+        if self.search.field != crate::widgets::search::SearchField::Replace {
+            self.submit_search_query();
         }
+        self.status = format!(
+            "Cmd+V: pasted into {} field",
+            search_field_name(self.search.field)
+        );
     }
 
     fn paste_clipboard_into_editor(&mut self, text: Option<&str>) {
@@ -12256,6 +12300,26 @@ impl App {
                     if self.search.paste_button_at(m.column, m.row) {
                         let text = (self.clipboard_reader)();
                         self.paste_clipboard_into_search(text.as_deref());
+                        return;
+                    }
+                    // Left chevron expands/collapses the Replace row.
+                    if self.search.chevron_at(m.column, m.row) {
+                        self.search.toggle_replace();
+                        return;
+                    }
+                    // "..." ellipsis expands/collapses files-to-include/exclude.
+                    if self.search.ellipsis_at(m.column, m.row) {
+                        self.search.toggle_details();
+                        return;
+                    }
+                    // Replace-all action icon runs Replace All across results.
+                    if self.search.replace_all_at(m.column, m.row) {
+                        self.run_search_replace_all();
+                        return;
+                    }
+                    // Click inside one of the input boxes focuses that field.
+                    if let Some(field) = self.search.field_at(m.column, m.row) {
+                        self.search.focus_field(field);
                         return;
                     }
                     if let Some(t) = self.search.toggle_at(m.column, m.row) {
@@ -14904,6 +14968,17 @@ fn is_editor_cut_key(key: KeyEvent) -> bool {
 /// the raw Ctrl+V byte is accepted as a fallback for older setups.
 fn is_search_paste_key(key: KeyEvent) -> bool {
     is_clipboard_paste_key(key)
+}
+
+/// Human-readable name of a Search input field, for status-line messages.
+fn search_field_name(field: crate::widgets::search::SearchField) -> &'static str {
+    use crate::widgets::search::SearchField;
+    match field {
+        SearchField::Query => "search",
+        SearchField::Replace => "replace",
+        SearchField::Include => "files-to-include",
+        SearchField::Exclude => "files-to-exclude",
+    }
 }
 
 fn is_editor_paste_key(key: KeyEvent) -> bool {

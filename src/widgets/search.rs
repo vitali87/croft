@@ -1,3 +1,4 @@
+use globset::{Glob, GlobSet, GlobSetBuilder};
 use grep_regex::{RegexMatcher, RegexMatcherBuilder};
 use grep_searcher::{BinaryDetection, MmapChoice, Searcher, SearcherBuilder, Sink, SinkMatch};
 use ignore::{WalkBuilder, WalkState};
@@ -55,6 +56,82 @@ fn build_searcher() -> Searcher {
         .binary_detection(BinaryDetection::quit(b'\x00'))
         .memory_map(MmapChoice::never())
         .build()
+}
+
+/// Compiled `files to include` / `files to exclude` globs, mirroring VS
+/// Code's two Search-sidebar glob inputs. Both inputs take a comma-separated
+/// list of globs. A bare pattern with no path separator (e.g. `*.rs`) is
+/// treated as match-at-any-depth (`**/*.rs`), exactly like VS Code, so users
+/// don't have to remember to prefix `**/`.
+#[derive(Clone, Debug, Default)]
+pub struct PathFilter {
+    include: Option<GlobSet>,
+    exclude: Option<GlobSet>,
+}
+
+/// Build a `GlobSet` from a comma-separated glob list, returning `None` when
+/// the trimmed input is empty (meaning "no filter"). Invalid individual globs
+/// are skipped silently so one typo doesn't disable the whole filter.
+fn build_glob_set(raw: &str) -> Option<GlobSet> {
+    let mut builder = GlobSetBuilder::new();
+    let mut any = false;
+    for part in raw.split(',') {
+        let pat = part.trim();
+        if pat.is_empty() {
+            continue;
+        }
+        // VS Code convention: a pattern without a path separator matches at
+        // any depth, so `*.rs` finds Rust files in every subdirectory.
+        let expanded = if pat.contains('/') {
+            pat.to_string()
+        } else {
+            format!("**/{pat}")
+        };
+        if let Ok(g) = Glob::new(&expanded) {
+            builder.add(g);
+            any = true;
+        }
+    }
+    if !any {
+        return None;
+    }
+    builder.build().ok()
+}
+
+impl PathFilter {
+    /// Compile a filter from the raw include/exclude input strings. An empty
+    /// (or all-whitespace) string disables that side of the filter.
+    pub fn new(include: &str, exclude: &str) -> Self {
+        Self {
+            include: build_glob_set(include),
+            exclude: build_glob_set(exclude),
+        }
+    }
+
+    /// True when no include and no exclude globs are active, so the walker can
+    /// skip the per-file relative-path work entirely.
+    pub fn is_empty(&self) -> bool {
+        self.include.is_none() && self.exclude.is_none()
+    }
+
+    /// Decide whether `path` (under `root`) should be searched. Matching is
+    /// done against the path relative to `root` (falling back to the full path
+    /// when it isn't under `root`). Include wins first: if an include set is
+    /// present, the path must match it; then any exclude match drops the path.
+    pub fn allows(&self, root: &Path, path: &Path) -> bool {
+        let rel = path.strip_prefix(root).unwrap_or(path);
+        if let Some(inc) = &self.include
+            && !inc.is_match(rel)
+        {
+            return false;
+        }
+        if let Some(exc) = &self.exclude
+            && exc.is_match(rel)
+        {
+            return false;
+        }
+        true
+    }
 }
 
 struct HitSink<'a> {
@@ -126,6 +203,31 @@ pub fn search_workspace_streaming_skipping<F>(
 ) where
     F: FnMut(Vec<SearchHit>) + Send + Clone,
 {
+    search_workspace_streaming_filtered(
+        root,
+        query,
+        opts,
+        cancel,
+        skip,
+        &PathFilter::default(),
+        on_batch,
+    );
+}
+
+/// Like `search_workspace_streaming_skipping` but also honours a `PathFilter`
+/// (VS Code's "files to include" / "files to exclude" glob inputs). A file is
+/// searched only when `filter.allows(root, path)` returns true.
+pub fn search_workspace_streaming_filtered<F>(
+    root: &Path,
+    query: &str,
+    opts: SearchOpts,
+    cancel: &Arc<AtomicBool>,
+    skip: &HashSet<PathBuf>,
+    filter: &PathFilter,
+    on_batch: F,
+) where
+    F: FnMut(Vec<SearchHit>) + Send + Clone,
+{
     let q = query.trim();
     if q.is_empty() {
         return;
@@ -137,10 +239,13 @@ pub fn search_workspace_streaming_skipping<F>(
         .git_ignore(true)
         .hidden(true)
         .build_parallel();
+    let root = root.to_path_buf();
     walker.run(|| {
         let matcher = matcher.clone();
         let cancel = cancel.clone();
         let skip = skip.clone();
+        let filter = filter.clone();
+        let root = root.clone();
         let mut on_batch = on_batch.clone();
         Box::new(move |entry| {
             if cancel.load(Ordering::Relaxed) {
@@ -154,6 +259,10 @@ pub fn search_workspace_streaming_skipping<F>(
                 return WalkState::Continue;
             }
             let path = entry.path();
+            // Apply the include/exclude glob filter before any IO on the file.
+            if !filter.is_empty() && !filter.allows(&root, path) {
+                return WalkState::Continue;
+            }
             // Dirty files are searched from their in-memory buffer elsewhere;
             // skip the stale disk copy. Only pay the canonicalize syscall when
             // there is actually something to skip.
@@ -314,6 +423,11 @@ pub enum SearchRequest {
     /// (e.g. a Rename Symbol) is findable immediately. Like `SetRoot`, this is
     /// state, not a query: it updates the snapshot used by the next scan.
     SetDirtyBuffers(Vec<(PathBuf, String)>),
+    /// VS Code's "files to include" / "files to exclude" glob inputs, as raw
+    /// comma-separated strings. Like `SetRoot`, this is state, not a query: it
+    /// updates the filter the next scan applies. Empty strings clear the
+    /// filter.
+    SetFilter(String, String),
 }
 
 /// How long the user has to pause typing before the search fires. Each
@@ -342,6 +456,8 @@ pub fn search_worker_loop(
     let mut current: Option<(std::thread::JoinHandle<()>, Arc<AtomicBool>)> = None;
     // Latest snapshot of unsaved editor buffers, refreshed by SetDirtyBuffers.
     let mut dirty: Vec<(PathBuf, String)> = Vec::new();
+    // Latest include/exclude glob filter, refreshed by SetFilter.
+    let mut filter = PathFilter::default();
     while let Ok(mut latest) = rx.recv() {
         // A new message landed: cancel the in-flight scan (if any) so its
         // worker thread bails out before the user pauses long enough to
@@ -361,6 +477,10 @@ pub fn search_worker_loop(
                 dirty = buffers;
                 continue;
             }
+            SearchRequest::SetFilter(ref include, ref exclude) => {
+                filter = PathFilter::new(include, exclude);
+                continue;
+            }
             SearchRequest::Query(..) => {}
         }
         // Trailing-edge debounce: each new keystroke resets the timer.
@@ -371,6 +491,9 @@ pub fn search_worker_loop(
             match rx.recv_timeout(SEARCH_DEBOUNCE) {
                 Ok(SearchRequest::SetRoot(new_root)) => root = new_root,
                 Ok(SearchRequest::SetDirtyBuffers(buffers)) => dirty = buffers,
+                Ok(SearchRequest::SetFilter(include, exclude)) => {
+                    filter = PathFilter::new(&include, &exclude)
+                }
                 Ok(newer) => latest = newer,
                 Err(RecvTimeoutError::Timeout) => break,
                 Err(RecvTimeoutError::Disconnected) => return,
@@ -391,28 +514,37 @@ pub fn search_worker_loop(
         let root_for_thread = root.clone();
         let query_for_thread = query.clone();
         let dirty_for_thread = dirty.clone();
+        let filter_for_thread = filter.clone();
         let handle = std::thread::spawn(move || {
             let q_for_emit = query_for_thread.clone();
             let tx_for_emit = tx_for_thread.clone();
             // First, search the unsaved buffers in-memory and collect the set
             // of their canonical paths so the disk walk skips the stale copies.
+            // Dirty buffers must respect the include/exclude filter too, so a
+            // glob that excludes a file hides its unsaved hits as well.
             let mut skip: HashSet<PathBuf> = HashSet::new();
             let mut buf_hits: Vec<SearchHit> = Vec::new();
             for (path, content) in &dirty_for_thread {
                 if let Ok(canon) = path.canonicalize() {
                     skip.insert(canon);
                 }
+                if !filter_for_thread.is_empty()
+                    && !filter_for_thread.allows(&root_for_thread, path)
+                {
+                    continue;
+                }
                 collect_matches_in_text(path, content, &query_for_thread, opts, &mut buf_hits);
             }
             if !buf_hits.is_empty() {
                 let _ = tx_for_emit.send(SearchEvent::Hits(q_for_emit.clone(), opts, buf_hits));
             }
-            search_workspace_streaming_skipping(
+            search_workspace_streaming_filtered(
                 &root_for_thread,
                 &query_for_thread,
                 opts,
                 &cancel_for_thread,
                 &skip,
+                &filter_for_thread,
                 move |batch| {
                     let _ = tx_for_emit.send(SearchEvent::Hits(q_for_emit.clone(), opts, batch));
                 },
@@ -456,6 +588,83 @@ pub fn collect_matches_in_text(
         .binary_detection(BinaryDetection::quit(b'\x00'))
         .build();
     let _ = searcher.search_slice(&matcher, content.as_bytes(), &mut sink);
+}
+
+/// Compile the search query + `SearchOpts` into a `regex::Regex`, mirroring
+/// the pattern construction used by `split_for_highlight_regex` so replace
+/// matches exactly what the highlighter shows. In literal (non-regex) mode the
+/// query is escaped so metacharacters are matched verbatim. Returns `None` for
+/// an empty query or an uncompilable pattern.
+fn build_replace_regex(query: &str, opts: SearchOpts) -> Option<regex::Regex> {
+    let q = query.trim();
+    if q.is_empty() {
+        return None;
+    }
+    let body = if opts.use_regex {
+        q.to_string()
+    } else {
+        regex::escape(q)
+    };
+    let mut pattern = String::new();
+    if !opts.case_sensitive {
+        pattern.push_str("(?i)");
+    }
+    if opts.whole_word {
+        pattern.push_str("\\b(?:");
+        pattern.push_str(&body);
+        pattern.push_str(")\\b");
+    } else {
+        pattern.push_str(&body);
+    }
+    regex::Regex::new(&pattern).ok()
+}
+
+/// Replace every match of `query` (honouring `opts`) in `content` with
+/// `replacement`, returning `(new_content, count)`. In regex mode the
+/// replacement honours `$1` / `${name}` capture references, like VS Code; in
+/// literal mode the replacement is inserted verbatim (a `$` in the replacement
+/// is escaped so it is not treated as a capture reference). Returns `None` when
+/// the query is empty or the pattern can't compile, so callers leave the file
+/// untouched.
+pub fn replace_in_text(
+    content: &str,
+    query: &str,
+    replacement: &str,
+    opts: SearchOpts,
+) -> Option<(String, usize)> {
+    let re = build_replace_regex(query, opts)?;
+    let count = re.find_iter(content).count();
+    if count == 0 {
+        return Some((content.to_string(), 0));
+    }
+    let out = if opts.use_regex {
+        re.replace_all(content, replacement).into_owned()
+    } else {
+        // Literal replacement: escape `$` so the substituted text is inserted
+        // verbatim rather than parsed as a capture reference.
+        let escaped = replacement.replace('$', "$$");
+        re.replace_all(content, escaped.as_str()).into_owned()
+    };
+    Some((out, count))
+}
+
+/// Replace every match in the file at `path` on disk, writing the result back
+/// only when at least one replacement was made. Returns the number of matches
+/// replaced, or `None` when the file can't be read, the pattern can't compile,
+/// or the write fails. Preserves files with no matches untouched (returns 0).
+pub fn replace_in_file(
+    path: &Path,
+    query: &str,
+    replacement: &str,
+    opts: SearchOpts,
+) -> Option<usize> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let (new_content, count) = replace_in_text(&content, query, replacement, opts)?;
+    if count == 0 {
+        return Some(0);
+    }
+    std::fs::write(path, new_content).ok()?;
+    Some(count)
 }
 
 fn is_whole_word_match(haystack: &str, start: usize, end: usize) -> bool {
@@ -514,6 +723,57 @@ pub struct SearchPanel {
     /// Render-time pointer cell, fed from `App::pointer_cell` each frame so a
     /// hovered (but unselected) result row can lift to the hover background.
     pub hover_pointer: Option<(u16, u16)>,
+
+    // --- Replace + files-to-include/exclude (VS Code Search sidebar) ---
+    /// Replacement text. Editable only while the Replace row is expanded.
+    pub replace: String,
+    /// "files to include" glob list (comma-separated), shown when the details
+    /// (`...`) row is expanded.
+    pub include: String,
+    /// "files to exclude" glob list (comma-separated), shown when details is
+    /// expanded.
+    pub exclude: String,
+    /// Whether the Replace row is expanded, toggled by the left chevron.
+    pub replace_open: bool,
+    /// Whether the include/exclude detail rows are expanded, toggled by `...`.
+    pub details_open: bool,
+    /// Which input field currently receives typed characters. Tab cycles
+    /// through the visible fields; clicking an input focuses it directly.
+    pub field: SearchField,
+    /// Selection range within the currently focused field's text.
+    pub field_selection: Option<(usize, usize)>,
+
+    // --- Hit-test geometry captured during render (absolute screen coords) ---
+    /// The left expand chevron (toggles the Replace row).
+    pub chevron_x: u16,
+    pub chevron_y: u16,
+    /// The replace-all action icon at the right of the Replace row.
+    pub replace_all_x: u16,
+    pub replace_all_y: u16,
+    /// The `...` details toggle (expands include/exclude).
+    pub ellipsis_x: u16,
+    pub ellipsis_y: u16,
+    /// Content rects of each input box's editable area, for click-to-focus.
+    pub query_input_rect: Rect,
+    pub replace_input_rect: Rect,
+    pub include_input_rect: Rect,
+    pub exclude_input_rect: Rect,
+    /// Row offset (from `inner.y`) where the results list starts. Recomputed
+    /// each render because expanding Replace / details rows pushes results
+    /// down. `results_viewport_height` and `hit_at_y` read this so scrolling
+    /// and click mapping stay aligned with the rendered layout.
+    pub results_start_offset: u16,
+}
+
+/// Which input field of the Search panel currently has the cursor. Drives
+/// where typed characters land and which box draws the focus accent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum SearchField {
+    #[default]
+    Query,
+    Replace,
+    Include,
+    Exclude,
 }
 
 impl SearchPanel {
@@ -540,6 +800,24 @@ impl SearchPanel {
             selection: None,
             last_scrollbar: Rect::default(),
             hover_pointer: None,
+            replace: String::new(),
+            include: String::new(),
+            exclude: String::new(),
+            replace_open: false,
+            details_open: false,
+            field: SearchField::Query,
+            field_selection: None,
+            chevron_x: 0,
+            chevron_y: 0,
+            replace_all_x: 0,
+            replace_all_y: 0,
+            ellipsis_x: 0,
+            ellipsis_y: 0,
+            query_input_rect: Rect::default(),
+            replace_input_rect: Rect::default(),
+            include_input_rect: Rect::default(),
+            exclude_input_rect: Rect::default(),
+            results_start_offset: 7,
         }
     }
 
@@ -597,6 +875,225 @@ impl SearchPanel {
                 self.query.push(c);
             }
         }
+    }
+
+    /// Mutable handle to the text of whichever field is focused. The Query
+    /// field keeps its own `selection`; the other fields share
+    /// `field_selection`, so selecting text in one input clears it elsewhere.
+    fn active_text_mut(&mut self) -> &mut String {
+        match self.field {
+            SearchField::Query => &mut self.query,
+            SearchField::Replace => &mut self.replace,
+            SearchField::Include => &mut self.include,
+            SearchField::Exclude => &mut self.exclude,
+        }
+    }
+
+    /// Read-only view of the focused field's text.
+    pub fn active_text(&self) -> &str {
+        match self.field {
+            SearchField::Query => &self.query,
+            SearchField::Replace => &self.replace,
+            SearchField::Include => &self.include,
+            SearchField::Exclude => &self.exclude,
+        }
+    }
+
+    /// Clear the focused field's text entirely (used by Esc).
+    pub fn active_text_mut_clear(&mut self) {
+        self.active_text_mut().clear();
+    }
+
+    /// Clear the selection of the focused field.
+    pub fn clear_active_selection(&mut self) {
+        self.set_active_selection(None);
+    }
+
+    fn active_selection(&self) -> Option<(usize, usize)> {
+        let sel = match self.field {
+            SearchField::Query => self.selection,
+            _ => self.field_selection,
+        };
+        sel.map(|(a, b)| if a <= b { (a, b) } else { (b, a) })
+    }
+
+    fn set_active_selection(&mut self, sel: Option<(usize, usize)>) {
+        match self.field {
+            SearchField::Query => self.selection = sel,
+            _ => self.field_selection = sel,
+        }
+    }
+
+    /// Append `c` to the focused field, replacing any selection first.
+    pub fn type_char(&mut self, c: char) {
+        if c == '\n' || c == '\r' {
+            return;
+        }
+        self.delete_active_selection();
+        self.active_text_mut().push(c);
+    }
+
+    /// Backspace one char (or the selection) from the focused field. Returns
+    /// true when the text changed.
+    pub fn backspace(&mut self) -> bool {
+        if self.delete_active_selection() {
+            return true;
+        }
+        self.active_text_mut().pop().is_some()
+    }
+
+    /// Insert `s` into the focused field, replacing the selection and stripping
+    /// newlines (all Search inputs are single-line).
+    pub fn insert_str(&mut self, s: &str) {
+        self.delete_active_selection();
+        let text = self.active_text_mut();
+        for c in s.chars() {
+            if c != '\n' && c != '\r' {
+                text.push(c);
+            }
+        }
+    }
+
+    /// Select the whole text of the focused field.
+    pub fn select_all_active(&mut self) {
+        let len = self.active_text().len();
+        if len == 0 {
+            self.set_active_selection(None);
+        } else {
+            self.set_active_selection(Some((0, len)));
+        }
+    }
+
+    fn delete_active_selection(&mut self) -> bool {
+        let Some((a, b)) = self.active_selection() else {
+            return false;
+        };
+        if a == b {
+            self.set_active_selection(None);
+            return false;
+        }
+        self.active_text_mut().replace_range(a..b, "");
+        self.set_active_selection(None);
+        true
+    }
+
+    /// Text currently selected in the focused field (empty when none).
+    pub fn active_selection_text(&self) -> String {
+        match self.active_selection() {
+            Some((a, b)) if a < b => self.active_text()[a..b].to_string(),
+            _ => String::new(),
+        }
+    }
+
+    /// Move keyboard focus to the next visible field, wrapping around. Only
+    /// fields whose row is currently expanded participate, mirroring VS Code
+    /// where Tab skips collapsed inputs.
+    pub fn focus_next_field(&mut self) {
+        let order = self.visible_fields();
+        let pos = order.iter().position(|f| *f == self.field).unwrap_or(0);
+        let next = order[(pos + 1) % order.len()];
+        self.focus_field(next);
+    }
+
+    /// Set the focused field, clearing selection in the field being left.
+    pub fn focus_field(&mut self, field: SearchField) {
+        if self.field != field {
+            self.set_active_selection(None);
+            self.field = field;
+        }
+    }
+
+    /// Visible (focusable) fields, in tab order, honouring which rows are
+    /// expanded. Query is always present.
+    fn visible_fields(&self) -> Vec<SearchField> {
+        let mut v = vec![SearchField::Query];
+        if self.replace_open {
+            v.push(SearchField::Replace);
+        }
+        if self.details_open {
+            v.push(SearchField::Include);
+            v.push(SearchField::Exclude);
+        }
+        v
+    }
+
+    /// Toggle the Replace row. When collapsing while it holds focus, focus
+    /// falls back to the Query field.
+    pub fn toggle_replace(&mut self) {
+        self.replace_open = !self.replace_open;
+        if !self.replace_open && self.field == SearchField::Replace {
+            self.focus_field(SearchField::Query);
+        }
+    }
+
+    /// Toggle the include/exclude detail rows. Collapsing while one holds
+    /// focus returns focus to the Query field.
+    pub fn toggle_details(&mut self) {
+        self.details_open = !self.details_open;
+        if !self.details_open && matches!(self.field, SearchField::Include | SearchField::Exclude) {
+            self.focus_field(SearchField::Query);
+        }
+    }
+
+    /// Compile the current include/exclude inputs into a `PathFilter`.
+    pub fn path_filter(&self) -> PathFilter {
+        PathFilter::new(&self.include, &self.exclude)
+    }
+
+    /// True when `(col, row)` lands on the expand chevron (toggle Replace row).
+    pub fn chevron_at(&self, col: u16, row: u16) -> bool {
+        row == self.chevron_y && col == self.chevron_x
+    }
+
+    /// True when `(col, row)` lands on the `...` ellipsis (toggle details).
+    pub fn ellipsis_at(&self, col: u16, row: u16) -> bool {
+        self.ellipsis_x != 0 && row == self.ellipsis_y && col == self.ellipsis_x
+    }
+
+    /// True when `(col, row)` lands on the replace-all action icon.
+    pub fn replace_all_at(&self, col: u16, row: u16) -> bool {
+        self.replace_all_x != 0 && row == self.replace_all_y && col == self.replace_all_x
+    }
+
+    /// Map a click to the input field whose editable row it lands on, for
+    /// click-to-focus. Returns `None` when the click is outside every input.
+    pub fn field_at(&self, col: u16, row: u16) -> Option<SearchField> {
+        let on = |r: Rect| r.width != 0 && row == r.y && col >= r.x && col < r.x + r.width;
+        if on(self.query_input_rect) {
+            return Some(SearchField::Query);
+        }
+        if on(self.replace_input_rect) {
+            return Some(SearchField::Replace);
+        }
+        if on(self.include_input_rect) {
+            return Some(SearchField::Include);
+        }
+        if on(self.exclude_input_rect) {
+            return Some(SearchField::Exclude);
+        }
+        None
+    }
+
+    /// Replace every match in every distinct file among the current hits with
+    /// `self.replace`, honouring the active `SearchOpts`. Returns the total
+    /// number of matches replaced across all files. The caller is responsible
+    /// for re-running the query afterwards so the (now stale) hit list updates.
+    pub fn replace_all_on_disk(&self) -> usize {
+        let needle = self.query.trim();
+        if needle.is_empty() {
+            return 0;
+        }
+        let mut seen: HashSet<PathBuf> = HashSet::new();
+        let mut total = 0usize;
+        for hit in &self.hits {
+            if !seen.insert(hit.path.clone()) {
+                continue;
+            }
+            if let Some(n) = replace_in_file(&hit.path, needle, &self.replace, self.opts) {
+                total += n;
+            }
+        }
+        total
     }
 
     /// Run the current query, store the results, and reset selection.
@@ -684,13 +1181,14 @@ impl SearchPanel {
     }
 
     fn results_viewport_height(&self) -> usize {
-        // Results occupy rows from `inner.y + 7` to `inner.y + inner.height - 1`
-        // (header + blank + 3-row input box + separator + caption = 7 rows).
+        // Results start at `results_start_offset` rows below `inner.y`. That
+        // offset is recomputed each render and grows when the Replace row or
+        // the include/exclude detail rows are expanded.
         let inner = self.last_inner;
         if inner.height == 0 {
             return 0;
         }
-        let results_top = 7u16;
+        let results_top = self.results_start_offset;
         if inner.height <= results_top {
             return 0;
         }
@@ -701,12 +1199,12 @@ impl SearchPanel {
         self.hits.get(self.selected)
     }
 
-    /// Map a click row to a hit index, if any. Hits sit below the cluster:
-    /// row 0 = "SEARCH" header, rows 2..=4 = bordered input box, row 5 =
-    /// thin separator, row 6 = match-count caption, rows 7+ = results.
+    /// Map a click row to a hit index, if any. Hits sit below the input
+    /// cluster; the exact first row depends on which optional rows (Replace,
+    /// include/exclude) are expanded, captured in `results_start_offset`.
     pub fn hit_at_y(&self, y: u16) -> Option<usize> {
         let inner = self.last_inner;
-        let results_start = inner.y + 7;
+        let results_start = inner.y + self.results_start_offset;
         if y < results_start || y >= inner.y + inner.height {
             return None;
         }
@@ -726,6 +1224,103 @@ pub enum SearchToggle {
     CaseSensitive,
     WholeWord,
     UseRegex,
+}
+
+/// Parameters for `render_input_box`, bundled so the long argument list stays
+/// readable at each call site.
+struct InputBoxArgs<'a> {
+    /// 3-row outer rect of the box.
+    rect: Rect,
+    /// Optional leading glyph (e.g. the magnifier) drawn at the content start.
+    lead_glyph: Option<&'a str>,
+    /// Current text of the field.
+    text: &'a str,
+    /// Placeholder shown italic-grey when `text` is empty.
+    placeholder: &'a str,
+    /// Selection range within `text`, already normalised (a <= b).
+    selection: Option<(usize, usize)>,
+    /// Whether THIS field is the focused one (drives the accent ring, and
+    /// whether the cursor renders here).
+    field_focused: bool,
+    /// Accent color for the border / cursor when active.
+    accent: Color,
+}
+
+/// Render a rounded 3-row input box and its contents, returning the editable
+/// content `Rect` (the single inner row to the right of any lead glyph) so the
+/// caller can store it for click-to-focus hit-testing. Shared by all four
+/// Search inputs (query, replace, include, exclude) so they look identical.
+fn render_input_box(buf: &mut Buffer, args: InputBoxArgs) -> Rect {
+    // The focused field wears the accent ring; every other box stays dim grey
+    // whether or not the panel itself has focus.
+    let border_style = if args.field_focused {
+        Style::default().fg(args.accent)
+    } else {
+        Style::default().fg(Color::Rgb(0x60, 0x68, 0x78))
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(border_style);
+    let box_inner = block.inner(args.rect);
+    block.render(args.rect, buf);
+    if box_inner.width == 0 || box_inner.height == 0 {
+        return box_inner;
+    }
+
+    let lead_w: u16 = if args.lead_glyph.is_some() { 2 } else { 0 };
+    if let Some(g) = args.lead_glyph
+        && box_inner.width > lead_w
+    {
+        let lead_color = if args.field_focused {
+            args.accent
+        } else {
+            Color::Rgb(0x9d, 0xa5, 0xb4)
+        };
+        buf.set_string(box_inner.x, box_inner.y, g, Style::default().fg(lead_color));
+    }
+    let content = Rect {
+        x: box_inner.x + lead_w,
+        y: box_inner.y,
+        width: box_inner.width.saturating_sub(lead_w),
+        height: 1,
+    };
+
+    let cursor_span = Span::styled("█", Style::default().fg(args.accent));
+    let mut spans: Vec<Span> = Vec::with_capacity(4);
+    if args.text.is_empty() {
+        if args.field_focused {
+            spans.push(cursor_span);
+        }
+        spans.push(Span::styled(
+            args.placeholder.to_string(),
+            Style::default()
+                .fg(Color::Rgb(0x6c, 0x7d, 0x9c))
+                .add_modifier(Modifier::ITALIC),
+        ));
+    } else {
+        let plain = Style::default().fg(Color::White);
+        let selected = Style::default()
+            .fg(Color::White)
+            .bg(Color::Rgb(0x26, 0x4f, 0x78));
+        match args.selection {
+            Some((a, b)) if a < b => {
+                if a > 0 {
+                    spans.push(Span::styled(args.text[..a].to_string(), plain));
+                }
+                spans.push(Span::styled(args.text[a..b].to_string(), selected));
+                if b < args.text.len() {
+                    spans.push(Span::styled(args.text[b..].to_string(), plain));
+                }
+            }
+            _ => spans.push(Span::styled(args.text.to_string(), plain)),
+        }
+        if args.field_focused {
+            spans.push(cursor_span);
+        }
+    }
+    buf.set_line(content.x, content.y, &Line::from(spans), content.width);
+    content
 }
 
 impl Widget for &mut SearchPanel {
@@ -776,139 +1371,80 @@ impl Widget for &mut SearchPanel {
             return;
         }
 
-        // Geometry for the input cluster sitting at rows 2..=4 of the
-        // inner area: a chevron `▾` on the left, a 3-row input box in the
-        // middle (thin rounded border, focus-aware), and `Aa │ ab │ .*`
-        // toggles to the right of the input. Cursor and content sit on
-        // the box's middle row.
+        // ---- Query row geometry ----
+        // A chevron on the left (▸ collapsed / ▾ expanded, toggles the Replace
+        // row), a 3-row query box, then to its right the `Aa │ ab │ .*` toggles
+        // and finally the `...` ellipsis that expands the include/exclude rows.
         let toggles_inner_w: u16 = 2 + 3 + 2 + 3 + 2; // "Aa" + " │ " + "ab" + " │ " + ".*"
-        let chevron_w: u16 = 2; // "▾ "
-        // Matching breathing room on both sides of the toggle cluster: one
-        // cell between the input box's right border and `Aa`, and the same
-        // one cell between `.*` and the panel's outer right border. Without
-        // this margin the asterisk reads as crowded into the corner.
+        let chevron_w: u16 = 2; // chevron + 1-cell gap
         const TOGGLE_GAP: u16 = 1;
+        let ellipsis_w: u16 = 1; // the "..." glyph
+        // Reserve room on the right for: gap + toggles + gap + ellipsis + gap.
+        let right_cluster_w = TOGGLE_GAP + toggles_inner_w + TOGGLE_GAP + ellipsis_w + TOGGLE_GAP;
         let input_top_y = inner.y + 2;
-        let input_bot_y = input_top_y + 2;
         let content_y = input_top_y + 1;
         let chevron_x = inner.x;
         let input_x = chevron_x + chevron_w;
         let toggles_x = inner.x.saturating_add(
             inner
                 .width
-                .saturating_sub(toggles_inner_w)
-                .saturating_sub(TOGGLE_GAP),
+                .saturating_sub(right_cluster_w)
+                .saturating_add(TOGGLE_GAP),
         );
-        // Input box width is whatever sits between the chevron column and
-        // the start of the toggles cluster, with the same TOGGLE_GAP cell
-        // separating the box border from `Aa`.
+        let ellipsis_x = inner.x + inner.width.saturating_sub(TOGGLE_GAP + ellipsis_w);
         let input_w = toggles_x
             .saturating_sub(input_x)
             .saturating_sub(TOGGLE_GAP)
             .max(8);
-        let input_box = Rect {
-            x: input_x,
-            y: input_top_y,
-            width: input_w,
-            height: 3,
-        };
 
-        // Chevron, vertically aligned with the input content row.
+        // Expand chevron (left of the query box). ▾ when the Replace row is
+        // open, ▸ when collapsed — VS Code's expand-to-replace affordance.
         let chevron_color = if self.focused {
             accent
         } else {
             Color::DarkGray
         };
+        let chevron_glyph = if self.replace_open {
+            crate::icons::CHEVRON_OPEN
+        } else {
+            crate::icons::CHEVRON_CLOSED
+        };
         buf.set_string(
             chevron_x,
             content_y,
-            "▾",
+            chevron_glyph.to_string(),
             Style::default()
                 .fg(chevron_color)
                 .add_modifier(Modifier::BOLD),
         );
+        self.chevron_x = chevron_x;
+        self.chevron_y = content_y;
 
-        // Input box border (rounded so it reads softer than the outer
-        // panel border). Style switches to focus blue when the panel is
-        // focused; otherwise dim grey, matching the rest of the panel.
-        let input_border_style = if self.focused {
-            Style::default().fg(accent)
-        } else {
-            Style::default().fg(Color::Rgb(0x60, 0x68, 0x78))
-        };
-        let input_block = Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(input_border_style);
-        let input_inner = input_block.inner(input_box);
-        input_block.render(input_box, buf);
-
-        // Magnifier glyph on the left of the input content, matching the
-        // codicon `search` U+EA6D used in the activity bar.
-        let magnifier_glyph = "\u{ea6d}";
-        let magnifier_color = if self.focused {
-            accent
-        } else {
-            Color::Rgb(0x9d, 0xa5, 0xb4)
-        };
-        let magnifier_w: u16 = 2; // glyph + 1-cell gap
-        if input_inner.width > magnifier_w {
-            buf.set_string(
-                input_inner.x,
-                input_inner.y,
-                magnifier_glyph,
-                Style::default().fg(magnifier_color),
-            );
-        }
-        let typed_x = input_inner.x + magnifier_w;
-        let typed_w = input_inner.width.saturating_sub(magnifier_w);
-
-        // Query / placeholder / cursor inside the input box, on its
-        // single content row.
-        let cursor_span = Span::styled("█", Style::default().fg(accent));
-        let placeholder_span = Span::styled(
-            "Search",
-            Style::default()
-                .fg(Color::Rgb(0x6c, 0x7d, 0x9c))
-                .add_modifier(Modifier::ITALIC),
+        // Query input box.
+        let query_focused = self.focused && self.field == SearchField::Query;
+        let query_content = render_input_box(
+            buf,
+            InputBoxArgs {
+                rect: Rect {
+                    x: input_x,
+                    y: input_top_y,
+                    width: input_w,
+                    height: 3,
+                },
+                lead_glyph: Some("\u{ea6d}"),
+                text: &self.query,
+                placeholder: "Search",
+                selection: self.selection_range(),
+                field_focused: query_focused,
+                accent,
+            },
         );
-        let mut spans: Vec<Span> = Vec::with_capacity(4);
-        if self.query.is_empty() {
-            if self.focused {
-                spans.push(cursor_span);
-            }
-            spans.push(placeholder_span);
-        } else {
-            let plain = Style::default().fg(Color::White);
-            let selected = Style::default()
-                .fg(Color::White)
-                .bg(Color::Rgb(0x26, 0x4f, 0x78));
-            match self.selection_range() {
-                Some((a, b)) if a < b => {
-                    if a > 0 {
-                        spans.push(Span::styled(self.query[..a].to_string(), plain));
-                    }
-                    spans.push(Span::styled(self.query[a..b].to_string(), selected));
-                    if b < self.query.len() {
-                        spans.push(Span::styled(self.query[b..].to_string(), plain));
-                    }
-                }
-                _ => {
-                    spans.push(Span::styled(self.query.as_str(), plain));
-                }
-            }
-            if self.focused {
-                spans.push(cursor_span);
-            }
-        }
-        buf.set_line(typed_x, input_inner.y, &Line::from(spans), typed_w);
+        self.query_input_rect = query_content;
 
-        // Toggles cluster: `Aa │ ab │ .*` aligned with the input content
-        // row, with vertical-bar separators between the three glyphs.
+        // Toggles cluster `Aa │ ab │ .*` on the query content row.
         self.paste_button_x = 0;
         self.paste_button_y = content_y;
         self.paste_button_w = 0;
-
         let active_style = Style::default()
             .fg(Color::Black)
             .bg(Color::Rgb(0xff, 0xd7, 0x4a))
@@ -933,21 +1469,144 @@ impl Widget for &mut SearchPanel {
         buf.set_string(case_x + 2 + 1, content_y, "│", pipe_style);
         buf.set_string(word_x + 2 + 1, content_y, "│", pipe_style);
 
-        // Thin separator below the input box: light grey horizontal rule
-        // running the full inner width.
-        let separator_y = input_bot_y + 1;
+        // `...` ellipsis toggle (expands include/exclude). Highlighted when the
+        // detail rows are open so the active state reads at a glance.
+        let ellipsis_style = if self.details_open {
+            Style::default().fg(accent).add_modifier(Modifier::BOLD)
+        } else {
+            inactive_style
+        };
+        buf.set_string(
+            ellipsis_x,
+            content_y,
+            crate::icons::SEARCH_ELLIPSIS.to_string(),
+            ellipsis_style,
+        );
+        self.ellipsis_x = ellipsis_x;
+        self.ellipsis_y = content_y;
+
+        // ---- Optional Replace row ----
+        // `next_y` tracks the top of the next 3-row box as optional rows stack.
+        let mut next_y = input_top_y + 3;
+        self.replace_input_rect = Rect::default();
+        self.replace_all_x = 0;
+        self.replace_all_y = 0;
+        if self.replace_open && next_y + 3 <= inner.y + inner.height {
+            // The replace box is indented under the query box (aligned with it)
+            // and leaves room on the right for the replace-all action icon.
+            let replace_box_w = input_w;
+            let replace_focused = self.focused && self.field == SearchField::Replace;
+            let replace_content = render_input_box(
+                buf,
+                InputBoxArgs {
+                    rect: Rect {
+                        x: input_x,
+                        y: next_y,
+                        width: replace_box_w,
+                        height: 3,
+                    },
+                    lead_glyph: Some(&crate::icons::SEARCH_REPLACE.to_string()),
+                    text: &self.replace,
+                    placeholder: "Replace",
+                    selection: if self.field == SearchField::Replace {
+                        self.active_selection()
+                    } else {
+                        None
+                    },
+                    field_focused: replace_focused,
+                    accent,
+                },
+            );
+            self.replace_input_rect = replace_content;
+            // Replace-all action icon to the right of the replace box, aligned
+            // with the toggles column on the query row.
+            let ra_y = next_y + 1;
+            buf.set_string(
+                toggles_x,
+                ra_y,
+                crate::icons::SEARCH_REPLACE_ALL.to_string(),
+                Style::default().fg(if self.focused {
+                    accent
+                } else {
+                    Color::Rgb(0x9d, 0xa5, 0xb4)
+                }),
+            );
+            self.replace_all_x = toggles_x;
+            self.replace_all_y = ra_y;
+            next_y += 3;
+        }
+
+        // ---- Optional files-to-include / files-to-exclude rows ----
+        self.include_input_rect = Rect::default();
+        self.exclude_input_rect = Rect::default();
+        if self.details_open {
+            let detail_w = ellipsis_x.saturating_sub(input_x).max(8);
+            if next_y + 3 <= inner.y + inner.height {
+                let inc_focused = self.focused && self.field == SearchField::Include;
+                let inc = render_input_box(
+                    buf,
+                    InputBoxArgs {
+                        rect: Rect {
+                            x: input_x,
+                            y: next_y,
+                            width: detail_w,
+                            height: 3,
+                        },
+                        lead_glyph: None,
+                        text: &self.include,
+                        placeholder: "files to include",
+                        selection: if self.field == SearchField::Include {
+                            self.active_selection()
+                        } else {
+                            None
+                        },
+                        field_focused: inc_focused,
+                        accent,
+                    },
+                );
+                self.include_input_rect = inc;
+                next_y += 3;
+            }
+            if next_y + 3 <= inner.y + inner.height {
+                let exc_focused = self.focused && self.field == SearchField::Exclude;
+                let exc = render_input_box(
+                    buf,
+                    InputBoxArgs {
+                        rect: Rect {
+                            x: input_x,
+                            y: next_y,
+                            width: detail_w,
+                            height: 3,
+                        },
+                        lead_glyph: None,
+                        text: &self.exclude,
+                        placeholder: "files to exclude",
+                        selection: if self.field == SearchField::Exclude {
+                            self.active_selection()
+                        } else {
+                            None
+                        },
+                        field_focused: exc_focused,
+                        accent,
+                    },
+                );
+                self.exclude_input_rect = exc;
+                next_y += 3;
+            }
+        }
+
+        // ---- Separator + match-count caption ----
+        let separator_y = next_y;
         if separator_y < inner.y + inner.height {
             let sep_style = Style::default().fg(Color::Rgb(0x40, 0x48, 0x58));
             for x in inner.x..inner.x + inner.width {
                 buf.set_string(x, separator_y, "─", sep_style);
             }
         }
-
-        // Match-count caption: live "N matches" line just below the
-        // separator. Left blank while waiting for the first result so the
-        // panel doesn't flash "0 matches" between keystrokes.
         let caption_y = separator_y + 1;
         let results_start_y = caption_y + 1;
+        // Record where results begin so scrolling / click mapping stay aligned.
+        self.results_start_offset = results_start_y.saturating_sub(inner.y);
         if caption_y < inner.y + inner.height && !self.query.trim().is_empty() {
             let count = self.hits.len();
             let header = format!("{count} match{}", if count == 1 { "" } else { "es" });
@@ -1399,11 +2058,21 @@ mod tests {
         let mut buf = Buffer::empty(area);
         ratatui::widgets::Widget::render(&mut panel, area, &mut buf);
         let dump = buffer_to_string(&buf);
-        // The expand chevron is the only down-arrow on the panel; absence
-        // of it means we regressed back to the right-pointing chevron.
+        // VS Code's expand-to-replace chevron points RIGHT (▸) while the
+        // Replace row is collapsed and flips DOWN (▾) once expanded. A fresh
+        // panel starts collapsed, so the right chevron must render.
         assert!(
-            dump.contains('▾') || dump.contains('⌄'),
-            "input row must have a down-chevron on the left, like VS Code's expand-to-replace toggle:\n{dump}"
+            dump.contains('▸'),
+            "collapsed panel must show a right-pointing expand chevron on the left:\n{dump}"
+        );
+        // Now expand the Replace row: the chevron flips to a down-arrow.
+        panel.toggle_replace();
+        let mut buf2 = Buffer::empty(area);
+        ratatui::widgets::Widget::render(&mut panel, area, &mut buf2);
+        let dump2 = buffer_to_string(&buf2);
+        assert!(
+            dump2.contains('▾'),
+            "expanded panel must flip the chevron to a down-arrow:\n{dump2}"
         );
         // Toggles separated by pipe '│' so the trio reads "Aa │ ab │ .*".
         assert!(
@@ -2156,5 +2825,375 @@ mod tests {
         panel.scroll_down(20);
         assert_eq!(panel.selected, 0, "wheel-scrolling must not move selection");
         assert_eq!(panel.scroll, 20);
+    }
+
+    // ---- files-to-include / files-to-exclude glob filtering ----
+
+    #[test]
+    fn path_filter_empty_allows_everything() {
+        let f = PathFilter::new("", "");
+        assert!(f.is_empty());
+        let root = Path::new("/proj");
+        assert!(f.allows(root, Path::new("/proj/src/main.rs")));
+        assert!(f.allows(root, Path::new("/proj/a/b/c.py")));
+    }
+
+    #[test]
+    fn path_filter_include_bare_glob_matches_at_any_depth() {
+        // VS Code: `*.rs` with no slash means `**/*.rs`.
+        let f = PathFilter::new("*.rs", "");
+        assert!(!f.is_empty());
+        let root = Path::new("/proj");
+        assert!(f.allows(root, Path::new("/proj/main.rs")));
+        assert!(f.allows(root, Path::new("/proj/src/deep/mod.rs")));
+        assert!(!f.allows(root, Path::new("/proj/src/app.py")));
+    }
+
+    #[test]
+    fn path_filter_include_with_multiple_comma_separated_globs() {
+        let f = PathFilter::new("*.rs, *.toml", "");
+        let root = Path::new("/proj");
+        assert!(f.allows(root, Path::new("/proj/main.rs")));
+        assert!(f.allows(root, Path::new("/proj/Cargo.toml")));
+        assert!(!f.allows(root, Path::new("/proj/notes.md")));
+    }
+
+    #[test]
+    fn path_filter_exclude_drops_matching_files() {
+        let f = PathFilter::new("", "*.lock");
+        let root = Path::new("/proj");
+        assert!(f.allows(root, Path::new("/proj/main.rs")));
+        assert!(!f.allows(root, Path::new("/proj/Cargo.lock")));
+    }
+
+    #[test]
+    fn path_filter_exclude_beats_include_for_overlapping_paths() {
+        // include *.rs, but exclude anything under target/. A target/*.rs file
+        // must be dropped because exclude wins.
+        let f = PathFilter::new("*.rs", "target/**");
+        let root = Path::new("/proj");
+        assert!(f.allows(root, Path::new("/proj/src/main.rs")));
+        assert!(!f.allows(root, Path::new("/proj/target/debug/build.rs")));
+    }
+
+    #[test]
+    fn path_filter_directory_glob_matches_relative_to_root() {
+        let f = PathFilter::new("src/**", "");
+        let root = Path::new("/proj");
+        assert!(f.allows(root, Path::new("/proj/src/a/b.rs")));
+        assert!(!f.allows(root, Path::new("/proj/tests/c.rs")));
+    }
+
+    #[test]
+    fn search_streaming_filtered_honours_include_glob() {
+        let tmp = TempDir::new().unwrap();
+        write(&tmp.path().join("keep.rs"), "needle here\n");
+        write(&tmp.path().join("drop.txt"), "needle here too\n");
+        let cancel = Arc::new(AtomicBool::new(false));
+        let filter = PathFilter::new("*.rs", "");
+        let collected = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let c2 = collected.clone();
+        search_workspace_streaming_filtered(
+            tmp.path(),
+            "needle",
+            SearchOpts::default(),
+            &cancel,
+            &HashSet::new(),
+            &filter,
+            move |batch| c2.lock().unwrap().extend(batch),
+        );
+        let hits = Arc::try_unwrap(collected).unwrap().into_inner().unwrap();
+        assert_eq!(
+            hits.len(),
+            1,
+            "only the .rs file should match the include glob"
+        );
+        assert!(hits[0].path.ends_with("keep.rs"));
+    }
+
+    #[test]
+    fn search_streaming_filtered_honours_exclude_glob() {
+        let tmp = TempDir::new().unwrap();
+        write(&tmp.path().join("a.rs"), "needle\n");
+        write(&tmp.path().join("b.rs"), "needle\n");
+        let cancel = Arc::new(AtomicBool::new(false));
+        let filter = PathFilter::new("", "b.rs");
+        let collected = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let c2 = collected.clone();
+        search_workspace_streaming_filtered(
+            tmp.path(),
+            "needle",
+            SearchOpts::default(),
+            &cancel,
+            &HashSet::new(),
+            &filter,
+            move |batch| c2.lock().unwrap().extend(batch),
+        );
+        let hits = Arc::try_unwrap(collected).unwrap().into_inner().unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].path.ends_with("a.rs"), "b.rs must be excluded");
+    }
+
+    #[test]
+    fn search_worker_loop_applies_set_filter_to_subsequent_query() {
+        let tmp = TempDir::new().unwrap();
+        write(&tmp.path().join("keep.rs"), "needle\n");
+        write(&tmp.path().join("skip.md"), "needle\n");
+        let (q_tx, q_rx) = std::sync::mpsc::channel::<SearchRequest>();
+        let (e_tx, e_rx) = std::sync::mpsc::channel::<SearchEvent>();
+        let root = tmp.path().to_path_buf();
+        let join = std::thread::spawn(move || search_worker_loop(root, q_rx, e_tx));
+        q_tx.send(SearchRequest::SetFilter("*.rs".into(), String::new()))
+            .unwrap();
+        q_tx.send(SearchRequest::Query("needle".into(), SearchOpts::default()))
+            .unwrap();
+        let (_, hits, done) = collect_until_done(&e_rx, std::time::Duration::from_secs(2));
+        assert!(done);
+        assert_eq!(hits.len(), 1, "filter must restrict the scan to *.rs");
+        assert!(hits[0].path.ends_with("keep.rs"));
+        drop(q_tx);
+        join.join().unwrap();
+    }
+
+    // ---- replace ----
+
+    #[test]
+    fn replace_in_text_literal_replaces_all_occurrences() {
+        let (out, n) =
+            replace_in_text("foo bar foo baz foo", "foo", "X", SearchOpts::default()).unwrap();
+        assert_eq!(n, 3);
+        assert_eq!(out, "X bar X baz X");
+    }
+
+    #[test]
+    fn replace_in_text_no_match_returns_zero_and_unchanged() {
+        let (out, n) = replace_in_text("hello world", "zzz", "X", SearchOpts::default()).unwrap();
+        assert_eq!(n, 0);
+        assert_eq!(out, "hello world");
+    }
+
+    #[test]
+    fn replace_in_text_literal_dollar_is_inserted_verbatim() {
+        // A literal replacement containing `$` must not be parsed as a capture
+        // reference; it should appear as-is.
+        let (out, n) = replace_in_text("price=AMT", "AMT", "$5", SearchOpts::default()).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(out, "price=$5");
+    }
+
+    #[test]
+    fn replace_in_text_case_insensitive_by_default() {
+        let (out, n) = replace_in_text("Foo foo FOO", "foo", "x", SearchOpts::default()).unwrap();
+        assert_eq!(n, 3);
+        assert_eq!(out, "x x x");
+    }
+
+    #[test]
+    fn replace_in_text_case_sensitive_only_exact_case() {
+        let opts = SearchOpts {
+            case_sensitive: true,
+            ..Default::default()
+        };
+        let (out, n) = replace_in_text("Foo foo FOO", "foo", "x", opts).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(out, "Foo x FOO");
+    }
+
+    #[test]
+    fn replace_in_text_whole_word_skips_substrings() {
+        let opts = SearchOpts {
+            whole_word: true,
+            ..Default::default()
+        };
+        let (out, n) = replace_in_text("cat category cat", "cat", "dog", opts).unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(out, "dog category dog");
+    }
+
+    #[test]
+    fn replace_in_text_regex_with_capture_reference() {
+        let opts = SearchOpts {
+            use_regex: true,
+            ..Default::default()
+        };
+        let (out, n) = replace_in_text("a1 b2 c3", r"([a-z])(\d)", "$2$1", opts).unwrap();
+        assert_eq!(n, 3);
+        assert_eq!(out, "1a 2b 3c");
+    }
+
+    #[test]
+    fn replace_in_text_invalid_regex_returns_none() {
+        let opts = SearchOpts {
+            use_regex: true,
+            ..Default::default()
+        };
+        assert!(replace_in_text("anything", "[unclosed", "x", opts).is_none());
+    }
+
+    #[test]
+    fn replace_in_file_writes_only_when_a_match_is_replaced() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path().join("a.txt");
+        write(&p, "old value old\n");
+        let n = replace_in_file(&p, "old", "new", SearchOpts::default()).unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(fs::read_to_string(&p).unwrap(), "new value new\n");
+    }
+
+    #[test]
+    fn replace_all_on_disk_replaces_across_distinct_hit_files() {
+        let tmp = TempDir::new().unwrap();
+        write(&tmp.path().join("a.txt"), "foo foo\n");
+        write(&tmp.path().join("b.txt"), "foo\n");
+        let mut panel = SearchPanel::new(tmp.path().to_path_buf());
+        panel.query = "foo".into();
+        panel.replace = "bar".into();
+        panel.run_query();
+        // a.txt contributes 2 hits, b.txt 1 hit (3 hit rows, 2 files).
+        let total = panel.replace_all_on_disk();
+        assert_eq!(total, 3, "all three matches across both files replaced");
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("a.txt")).unwrap(),
+            "bar bar\n"
+        );
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("b.txt")).unwrap(),
+            "bar\n"
+        );
+    }
+
+    // ---- panel field focus + control hit-testing ----
+
+    #[test]
+    fn toggle_replace_expands_and_collapses_the_replace_row() {
+        let tmp = TempDir::new().unwrap();
+        let mut panel = SearchPanel::new(tmp.path().to_path_buf());
+        assert!(!panel.replace_open);
+        panel.toggle_replace();
+        assert!(panel.replace_open);
+        // Focus the replace field, then collapse: focus falls back to Query.
+        panel.focus_field(SearchField::Replace);
+        panel.toggle_replace();
+        assert!(!panel.replace_open);
+        assert_eq!(panel.field, SearchField::Query);
+    }
+
+    #[test]
+    fn tab_cycles_only_through_visible_fields() {
+        let tmp = TempDir::new().unwrap();
+        let mut panel = SearchPanel::new(tmp.path().to_path_buf());
+        // Only Query visible: Tab stays on Query.
+        panel.focus_next_field();
+        assert_eq!(panel.field, SearchField::Query);
+        // Expand replace + details: Query -> Replace -> Include -> Exclude -> Query.
+        panel.replace_open = true;
+        panel.details_open = true;
+        panel.focus_next_field();
+        assert_eq!(panel.field, SearchField::Replace);
+        panel.focus_next_field();
+        assert_eq!(panel.field, SearchField::Include);
+        panel.focus_next_field();
+        assert_eq!(panel.field, SearchField::Exclude);
+        panel.focus_next_field();
+        assert_eq!(panel.field, SearchField::Query);
+    }
+
+    #[test]
+    fn type_char_lands_in_the_focused_field() {
+        let tmp = TempDir::new().unwrap();
+        let mut panel = SearchPanel::new(tmp.path().to_path_buf());
+        panel.replace_open = true;
+        panel.type_char('a');
+        assert_eq!(panel.query, "a");
+        assert_eq!(panel.replace, "");
+        panel.focus_field(SearchField::Replace);
+        panel.type_char('b');
+        assert_eq!(panel.query, "a");
+        assert_eq!(panel.replace, "b");
+    }
+
+    #[test]
+    fn backspace_removes_from_the_focused_field() {
+        let tmp = TempDir::new().unwrap();
+        let mut panel = SearchPanel::new(tmp.path().to_path_buf());
+        panel.details_open = true;
+        panel.focus_field(SearchField::Include);
+        panel.insert_str("*.rs");
+        assert_eq!(panel.include, "*.rs");
+        assert!(panel.backspace());
+        assert_eq!(panel.include, "*.r");
+        assert_eq!(panel.query, "");
+    }
+
+    #[test]
+    fn chevron_ellipsis_and_replace_all_hit_tests_after_render() {
+        use ratatui::buffer::Buffer;
+        let tmp = TempDir::new().unwrap();
+        let mut panel = SearchPanel::new(tmp.path().to_path_buf());
+        panel.focused = true;
+        panel.replace_open = true;
+        panel.details_open = true;
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 24,
+        };
+        let mut buf = Buffer::empty(area);
+        ratatui::widgets::Widget::render(&mut panel, area, &mut buf);
+        assert!(panel.chevron_at(panel.chevron_x, panel.chevron_y));
+        assert!(panel.ellipsis_at(panel.ellipsis_x, panel.ellipsis_y));
+        assert!(panel.replace_all_at(panel.replace_all_x, panel.replace_all_y));
+        // Clicking the query input row focuses the Query field.
+        let q = panel.query_input_rect;
+        assert_eq!(panel.field_at(q.x, q.y), Some(SearchField::Query));
+        let r = panel.replace_input_rect;
+        assert_eq!(panel.field_at(r.x, r.y), Some(SearchField::Replace));
+    }
+
+    #[test]
+    fn expanded_rows_push_results_start_down() {
+        use ratatui::buffer::Buffer;
+        let tmp = TempDir::new().unwrap();
+        let mut panel = SearchPanel::new(tmp.path().to_path_buf());
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 30,
+        };
+        let mut buf = Buffer::empty(area);
+        ratatui::widgets::Widget::render(&mut panel, area, &mut buf);
+        let collapsed_offset = panel.results_start_offset;
+        panel.replace_open = true;
+        panel.details_open = true;
+        let mut buf2 = Buffer::empty(area);
+        ratatui::widgets::Widget::render(&mut panel, area, &mut buf2);
+        assert!(
+            panel.results_start_offset > collapsed_offset,
+            "expanding replace + include/exclude must push results down (was {collapsed_offset}, now {})",
+            panel.results_start_offset
+        );
+        // 3 extra rows for replace + 3 + 3 for include/exclude = 9 rows.
+        assert_eq!(panel.results_start_offset, collapsed_offset + 9);
+    }
+
+    #[test]
+    fn collapsed_panel_keeps_legacy_results_offset_of_seven() {
+        use ratatui::buffer::Buffer;
+        let tmp = TempDir::new().unwrap();
+        let mut panel = SearchPanel::new(tmp.path().to_path_buf());
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 20,
+        };
+        let mut buf = Buffer::empty(area);
+        ratatui::widgets::Widget::render(&mut panel, area, &mut buf);
+        assert_eq!(
+            panel.results_start_offset, 7,
+            "with replace/details collapsed the layout matches the original 7-row offset"
+        );
     }
 }
