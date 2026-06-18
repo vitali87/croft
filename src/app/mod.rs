@@ -12213,6 +12213,29 @@ impl App {
                 }
                 if in_tree && self.sidebar_view == SidebarView::Explorer {
                     self.focus_pane(Pane::Tree);
+                    // Header toolbar (root folder row): New File / New Folder /
+                    // Refresh / Collapse Folders. Checked before row hit-testing
+                    // so a click on an icon never falls through to the node.
+                    if rect_contains(self.tree.header_new_file_btn, m.column, m.row) {
+                        let target = self.explorer_create_target_dir();
+                        self.open_create_prompt(CreateKind::File, target);
+                        return;
+                    }
+                    if rect_contains(self.tree.header_new_folder_btn, m.column, m.row) {
+                        let target = self.explorer_create_target_dir();
+                        self.open_create_prompt(CreateKind::Folder, target);
+                        return;
+                    }
+                    if rect_contains(self.tree.header_refresh_btn, m.column, m.row) {
+                        self.tree.refresh_children(0);
+                        self.status = String::from("Refreshed Explorer");
+                        return;
+                    }
+                    if rect_contains(self.tree.header_collapse_btn, m.column, m.row) {
+                        self.tree.collapse_all();
+                        self.status = String::from("Collapsed all folders");
+                        return;
+                    }
                     if let Some(idx) = self.tree.node_at_y(m.row) {
                         let now = std::time::Instant::now();
                         let is_double = self.tree_click.is_double(now, m.column, m.row);

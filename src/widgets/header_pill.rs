@@ -21,6 +21,17 @@ pub const HEADER_BTN_HOVER_BG: Color = Color::Rgb(0x2f, 0x5a, 0xa8);
 /// refresh affordance. Verified against the Nerd Font cmap.
 pub const REFRESH_GLYPH: char = '\u{eb37}';
 pub const ADD_GLYPH: char = '\u{ea60}';
+/// Codicon `cod-new_file` — the document-with-plus glyph VS Code paints on the
+/// Explorer title's "New File" action. Verified against Nerd Fonts
+/// `glyphnames.json` (`cod-new_file` = U+EA7F); do NOT use the upstream
+/// `vscode-codicons/mapping.json` value, which targets a different PUA range.
+pub const NEW_FILE_GLYPH: char = '\u{ea7f}';
+/// Codicon `cod-new_folder` — the folder-with-plus glyph for "New Folder".
+/// Nerd Fonts `cod-new_folder` = U+EA80.
+pub const NEW_FOLDER_GLYPH: char = '\u{ea80}';
+/// Codicon `cod-collapse_all` — the stacked-rows-with-minus glyph for
+/// "Collapse Folders in Explorer". Nerd Fonts `cod-collapse_all` = U+EAC5.
+pub const COLLAPSE_ALL_GLYPH: char = '\u{eac5}';
 
 /// Paint a header pill button at cell `(x, y)`. `brand` is true under the
 /// Black theme: a chipless teal icon in the VS Code toolbar spirit that grows
@@ -44,8 +55,12 @@ pub fn render(buf: &mut Buffer, x: u16, y: u16, glyph: char, brand: bool, hovere
     if let Some(c) = fill {
         style = style.bg(c);
     }
+    // VS Code paints view-action icons in a light `icon.foreground`, not an
+    // accent hue. The Black theme previously used the brand teal here, which
+    // read as an out-of-place dark green; use the same near-white the panel
+    // title wears so the icons sit quietly on the header.
     style = if brand {
-        style.fg(crate::gradient::rgb_color(crate::gradient::INNER_ACCENT))
+        style.fg(crate::gradient::rgb_color(crate::gradient::PANEL_TITLE_FG))
     } else {
         style.fg(HEADER_BTN_FG)
     };

@@ -63,6 +63,7 @@ On macOS, the `Cmd` chords below only reach croft after you run a one-time setup
 | `Delete` / `Backspace` / `Cmd`+`Backspace` | Move every selected path to the OS Trash |
 | `Cmd`+`Opt`+`R` (local macOS only) | Reveal the selected entry in Finder |
 | Right-click | Context menu: Cut, Copy, Paste, Rename, Delete, Reveal in Finder (local macOS), and New File / New Folder on empty space |
+| Click the Explorer root-folder icons | New File, New Folder, Refresh Explorer, and Collapse Folders, right-aligned on the root folder row and shown only while the Explorer is focused, mirroring VS Code's workspace-folder actions (New File / New Folder also on `Cmd+F` / `Cmd+Shift+N`) |
 
 ## Search sidebar
 

@@ -46,6 +46,14 @@ pub struct FileTree {
     /// row under the cursor can lift to the hover background. `None` when the
     /// pointer is outside the panel.
     pub hover_pointer: Option<(u16, u16)>,
+    /// Hit-test rects for the Explorer header toolbar buttons, captured each
+    /// render on the panel's top border row: VS Code's New File / New Folder /
+    /// Refresh / Collapse Folders affordances. `Rect::default()` (zero width)
+    /// when the panel is too narrow to paint them.
+    pub header_new_file_btn: Rect,
+    pub header_new_folder_btn: Rect,
+    pub header_refresh_btn: Rect,
+    pub header_collapse_btn: Rect,
 }
 
 impl FileTree {
@@ -71,6 +79,10 @@ impl FileTree {
             marked: BTreeSet::new(),
             drag_target: None,
             hover_pointer: None,
+            header_new_file_btn: Rect::default(),
+            header_new_folder_btn: Rect::default(),
+            header_refresh_btn: Rect::default(),
+            header_collapse_btn: Rect::default(),
         };
         tree.load_children(0);
         tree
@@ -441,6 +453,29 @@ impl FileTree {
             return;
         }
         self.collapse(idx);
+    }
+
+    /// Collapse every expanded directory except the workspace root, so the
+    /// tree shows just the root's immediate children (VS Code's "Collapse
+    /// Folders in Explorer" title action). Walking from the bottom up keeps
+    /// indices valid: `collapse` only drains nodes *after* the collapsed one,
+    /// which we have already passed, and never shifts the lower indices we are
+    /// still to visit. Resets the cursor and scroll to the root row.
+    pub fn collapse_all(&mut self) {
+        let mut idx = self.nodes.len();
+        while idx > 1 {
+            idx -= 1;
+            if idx >= self.nodes.len() {
+                continue;
+            }
+            if self.nodes[idx].is_dir && self.nodes[idx].expanded {
+                self.collapse(idx);
+            }
+        }
+        self.selected = 0;
+        self.anchor = 0;
+        self.scroll = 0;
+        self.marked.clear();
     }
 
     pub fn selected_path(&self) -> Option<&Path> {
@@ -1099,6 +1134,14 @@ impl Widget for &mut FileTree {
             crate::gradient::paint_gradient_box(buf, area);
             buf.set_span(area.x + 1, area.y, &title, title.width() as u16);
         }
+        // Explorer header toolbar (New File / New Folder / Refresh / Collapse
+        // Folders) is painted later, on the root folder row, not here on the
+        // title border. Reset the hit-test rects each frame so a hidden toolbar
+        // never registers stale clicks.
+        self.header_new_file_btn = Rect::default();
+        self.header_new_folder_btn = Rect::default();
+        self.header_refresh_btn = Rect::default();
+        self.header_collapse_btn = Rect::default();
         self.last_inner = inner;
         self.last_area = area;
         self.last_scrollbar = Rect::default();
@@ -1224,6 +1267,60 @@ impl Widget for &mut FileTree {
             buf.set_style(row_rect, line_style);
             buf.set_line(inner.x, y, &line, row_width);
         }
+        // Explorer header toolbar: New File / New Folder / Refresh / Collapse
+        // Folders, right-aligned on the root folder row (the "croft" header),
+        // mirroring VS Code's view actions, which live on the workspace-folder
+        // header rather than the EXPLORER title. Revealed only while the
+        // Explorer pane is focused and the root row sits at the top of the
+        // viewport; hidden otherwise (VS Code's hover/focus reveal). Painted
+        // after the rows so the pills win over the root row's text/fill.
+        if self.focused && self.scroll == 0 && !self.nodes.is_empty() {
+            use crate::widgets::header_pill;
+            const GLYPHS: [char; 4] = [
+                header_pill::NEW_FILE_GLYPH,
+                header_pill::NEW_FOLDER_GLYPH,
+                header_pill::REFRESH_GLYPH,
+                header_pill::COLLAPSE_ALL_GLYPH,
+            ];
+            // Each pill is a single-cell glyph; `step` adds a one-cell gap so
+            // the chips read as four distinct buttons. `right_pad` keeps the
+            // block clear of the scrollbar / right border.
+            let step: u16 = 2;
+            let count = GLYPHS.len() as u16;
+            let block_w = count * step - 1;
+            let right_pad: u16 = 1;
+            // Approximate the root label footprint (chevron + space + folder
+            // icon + space + name) so a narrow panel withholds the toolbar
+            // rather than overprinting the folder name.
+            let root_name = self.nodes[0]
+                .path
+                .file_name()
+                .map(|n| n.to_string_lossy().chars().count())
+                .unwrap_or(0) as u16;
+            let label_w = 4 + root_name;
+            if row_width > label_w + block_w + right_pad + 2 {
+                let start_x = inner.x + row_width - right_pad - block_w;
+                let y = inner.y;
+                let brand = self.focus_gradient;
+                for (i, &glyph) in GLYPHS.iter().enumerate() {
+                    let x = start_x + i as u16 * step;
+                    let rect = Rect {
+                        x,
+                        y,
+                        width: step,
+                        height: 1,
+                    };
+                    let hovered = crate::widgets::hover::contains(rect, self.hover_pointer);
+                    header_pill::render(buf, x, y, glyph, brand, hovered);
+                    match i {
+                        0 => self.header_new_file_btn = rect,
+                        1 => self.header_new_folder_btn = rect,
+                        2 => self.header_refresh_btn = rect,
+                        _ => self.header_collapse_btn = rect,
+                    }
+                }
+            }
+        }
         if let Some(metrics) = scrollbar_metrics {
             scrollbar::render_vertical(buf, metrics, self.focused, self.theme);
         }
@@ -1270,6 +1367,117 @@ mod tests {
             top.contains("EXPLORER"),
             "title clobbered by gradient: {top:?}"
         );
+    }
+
+    #[test]
+    fn collapse_all_closes_nested_folders_but_keeps_the_root_expanded() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("src/inner")).unwrap();
+        fs::write(root.join("src/inner/deep.rs"), "//\n").unwrap();
+        let mut tree = FileTree::new(root.to_path_buf());
+        // Expand every ancestor of the deep file so three depth levels show.
+        assert!(
+            tree.reveal_path(&root.join("src/inner/deep.rs")),
+            "precondition: reveal expands src and src/inner"
+        );
+        assert!(
+            tree.nodes.iter().any(|n| n.path.ends_with("deep.rs")),
+            "precondition: the deep file is visible before collapse"
+        );
+
+        tree.collapse_all();
+
+        assert!(tree.nodes[0].expanded, "the workspace root stays expanded");
+        assert_eq!(tree.nodes[0].depth, 0);
+        assert!(
+            tree.nodes.iter().skip(1).all(|n| !(n.is_dir && n.expanded)),
+            "no subfolder remains expanded"
+        );
+        assert!(
+            !tree.nodes.iter().any(|n| n.path.ends_with("deep.rs")),
+            "nested descendants are dropped from the flattened list"
+        );
+        assert_eq!(tree.selected, 0);
+        assert_eq!(tree.scroll, 0);
+    }
+
+    #[test]
+    fn explorer_header_toolbar_paints_four_pills_and_hit_tests() {
+        let (_tmp, mut tree) = fixture();
+        tree.focused = true;
+        tree.focus_gradient = false; // Croft Dark
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 8,
+        };
+        let mut buf = Buffer::empty(area);
+        (&mut tree).render(area, &mut buf);
+
+        // The toolbar lives on the root folder row (inner.y), not the title
+        // border, mirroring VS Code's workspace-folder header actions.
+        let root_y = tree.last_inner.y;
+        let root_row: String = (0..area.width).map(|x| buf[(x, root_y)].symbol()).collect();
+        for glyph in [
+            crate::widgets::header_pill::NEW_FILE_GLYPH,
+            crate::widgets::header_pill::NEW_FOLDER_GLYPH,
+            crate::widgets::header_pill::REFRESH_GLYPH,
+            crate::widgets::header_pill::COLLAPSE_ALL_GLYPH,
+        ] {
+            assert!(
+                root_row.contains(glyph),
+                "root row missing glyph {glyph:?}: {root_row:?}"
+            );
+        }
+
+        for btn in [
+            tree.header_new_file_btn,
+            tree.header_new_folder_btn,
+            tree.header_refresh_btn,
+            tree.header_collapse_btn,
+        ] {
+            assert!(btn.width > 0, "button rect was not captured");
+            assert_eq!(btn.y, root_y, "button sits on the root folder row");
+        }
+        // Painted left to right in VS Code's order, clear of the right border.
+        assert!(tree.header_new_file_btn.x < tree.header_new_folder_btn.x);
+        assert!(tree.header_new_folder_btn.x < tree.header_refresh_btn.x);
+        assert!(tree.header_refresh_btn.x < tree.header_collapse_btn.x);
+        assert!(tree.header_collapse_btn.x + tree.header_collapse_btn.width < area.x + area.width);
+    }
+
+    #[test]
+    fn explorer_header_toolbar_is_withheld_when_the_panel_is_too_narrow() {
+        let (_tmp, mut tree) = fixture();
+        tree.focused = true;
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 14,
+            height: 6,
+        };
+        let mut buf = Buffer::empty(area);
+        (&mut tree).render(area, &mut buf);
+        assert_eq!(tree.header_new_file_btn.width, 0);
+        assert_eq!(tree.header_collapse_btn.width, 0);
+    }
+
+    #[test]
+    fn explorer_header_toolbar_is_withheld_when_the_panel_is_unfocused() {
+        let (_tmp, mut tree) = fixture();
+        tree.focused = false;
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 8,
+        };
+        let mut buf = Buffer::empty(area);
+        (&mut tree).render(area, &mut buf);
+        assert_eq!(tree.header_new_file_btn.width, 0);
+        assert_eq!(tree.header_collapse_btn.width, 0);
     }
 
     #[test]
