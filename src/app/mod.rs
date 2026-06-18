@@ -12517,6 +12517,10 @@ impl App {
                     }
                 } else if in_editor {
                     self.focus_pane(Pane::Editor);
+                    // Mirror of the terminal branch: a selection lives in one
+                    // pane only, so anchoring one in the editor drops any
+                    // leftover terminal selection (issue #23).
+                    self.terminal_mut().clear_selection();
                     // Diff header arrows: take precedence over selection so a
                     // click on the ‹ / › glyph jumps to prev/next change
                     // instead of anchoring a selection at the header row.
@@ -12572,6 +12576,10 @@ impl App {
                         self.active_terminal = idx;
                     }
                     self.focus_pane(Pane::Terminal);
+                    // A selection belongs to exactly one pane: starting one in
+                    // the terminal drops any leftover editor selection so the
+                    // two panes never paint a highlight at once (issue #23).
+                    self.editor.clear_selection();
                     let now = std::time::Instant::now();
                     let is_double = self.terminal_click.is_double(now, m.column, m.row);
                     if is_double {

@@ -3064,6 +3064,107 @@ fn maximised_terminal_owns_mouse_drag_for_selection_not_the_collapsed_editor() {
     );
 }
 
+/// User-visible regression (issue #23): on mobile (Termux) a
+/// multiline drag-selection that begins inside the terminal pane and
+/// then travels *up* past the terminal's top edge into the editor
+/// region must stay local to the terminal. The terminal sits below the
+/// editor in the split layout, so a drag headed upward crosses into the
+/// editor's rectangle. Before the fix, the editor pane reacted to the
+/// out-of-bounds drag and started its own selection, so the user saw
+/// text highlighted in BOTH the terminal and the left editor pane. The
+/// drag must only ever extend the terminal's own selection (clamped to
+/// the terminal grid) and never seed an editor selection.
+#[test]
+fn multiline_terminal_drag_above_the_pane_does_not_bleed_into_the_editor() {
+    let tmp = tempfile::tempdir().unwrap();
+    // Seed and open a real file so the editor claims a non-empty rect
+    // directly above the terminal — the region the upward drag enters.
+    let f = tmp.path().join("probe.txt");
+    std::fs::write(&f, "alpha\nbeta\ngamma\ndelta\nepsilon\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&f).unwrap();
+
+    // Render once in the split layout (editor on top, terminal on the
+    // bottom, sharing the same column band).
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+
+    let term_inner = app.terminal().last_inner;
+    let editor_area = app.editor.last_area;
+    assert!(
+        term_inner.width > 4 && term_inner.height > 2,
+        "precondition: the split terminal must own a real rect"
+    );
+    assert!(
+        editor_area.height > 0 && editor_area.y < term_inner.y,
+        "precondition: the editor pane must sit above the terminal so the upward drag crosses into it"
+    );
+
+    // The user first has an active selection in the editor pane (e.g. left
+    // over from editing). Seed it so the editor owns a real selection band
+    // that would render alongside any new terminal selection.
+    app.focus_pane(Pane::Editor);
+    app.editor.start_selection_at_cursor();
+    app.editor.move_right();
+    app.editor.move_right();
+    app.editor.extend_selection_to_cursor();
+    assert!(
+        app.editor.selection.is_some_and(|s| s.has_area()),
+        "precondition: the editor must hold an active selection before the terminal gesture"
+    );
+
+    // Down inside the terminal, a couple of rows below its top edge so
+    // there is vertical room to drag upward out of the pane.
+    let click_col = term_inner.x + 3;
+    let click_row = term_inner.y + 2;
+    app.handle_mouse(crossterm::event::MouseEvent {
+        kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        column: click_col,
+        row: click_row,
+        modifiers: KeyModifiers::NONE,
+    });
+    // Drag UP into the editor region (row above the terminal's top edge)
+    // and toward the left — the gesture that used to overflow the pane.
+    let drag_col = term_inner.x + 1;
+    let drag_row = editor_area.y + 1; // well inside the editor's rectangle
+    assert!(
+        drag_row < term_inner.y,
+        "precondition: the drag end-point must land above the terminal pane"
+    );
+    app.handle_mouse(crossterm::event::MouseEvent {
+        kind: crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+        column: drag_col,
+        row: drag_row,
+        modifiers: KeyModifiers::NONE,
+    });
+
+    // The editor must NOT have started a selection of its own.
+    assert!(
+        app.editor.selection.is_none_or(|s| !s.has_area()),
+        "a terminal drag that overflowed upward must not seed an editor selection - that is the cross-pane bleed reported in issue #23"
+    );
+
+    // The terminal's selection head must be clamped to the terminal's
+    // own grid: with no scrollback the topmost reachable viewport line
+    // is 0 and the column stays within the inner width.
+    let sel = app
+        .terminal()
+        .selection()
+        .expect("the terminal Down must have seeded a selection");
+    let (head_line, head_col) = sel.head;
+    assert!(
+        head_line >= 0 && (head_line as u16) < term_inner.height,
+        "terminal selection head line {head_line} must clamp inside the terminal viewport (0..{})",
+        term_inner.height
+    );
+    assert!(
+        head_col < term_inner.width,
+        "terminal selection head col {head_col} must clamp inside the terminal inner width {}",
+        term_inner.width
+    );
+}
+
 /// Cross-pane paste matrix. In production, Cmd+V on macOS does NOT
 /// arrive as a key event — `setup-iterm2` deliberately leaves Cmd+V
 /// unbound (src/iterm2.rs:225-235) so iTerm2's native Paste action
