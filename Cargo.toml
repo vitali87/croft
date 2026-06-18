@@ -1,6 +1,6 @@
 [package]
 name = "croft"
-version = "0.1.417"
+version = "0.1.422"
 edition = "2024"
 description = "VSCode-style TUI written in Rust"
 license = "MIT"
@@ -28,6 +28,9 @@ alacritty_terminal = "0.26"
 # Tree-sitter core + per-language grammars.  Direct deps, no dynamic loading.
 tree-sitter = "0.26"
 tree-sitter-highlight = "0.26"
+# Trait for tree-sitter 0.26's `QueryMatches`, which is a streaming (not std)
+# iterator; needed to walk outline-query matches in `outline_syntax`.
+streaming-iterator = "0.1"
 tree-sitter-rust = "0.24"
 tree-sitter-python = "0.25"
 tree-sitter-javascript = "0.25"

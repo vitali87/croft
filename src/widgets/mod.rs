@@ -10,6 +10,7 @@ pub mod header_pill;
 pub mod hover;
 pub mod hover_popup;
 pub mod osk;
+pub mod outline;
 pub mod process_picker;
 pub mod remote;
 pub mod run_debug;

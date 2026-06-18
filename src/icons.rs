@@ -1,5 +1,7 @@
 use ratatui::style::Color;
 
+use crate::lsp::manager::OutlineKind;
+
 pub struct Icon {
     pub glyph: char,
     pub color: Color,
@@ -49,6 +51,45 @@ pub const ACTIVITY_RUN_DEBUG: char = '\u{eb91}';
 /// (`.nf-cod-gear`) which pins it to **U+EB51**. Glyph-fallback only; the
 /// image path rasterises `assets/icons/settings_gear.svg` instead.
 pub const ACTIVITY_SETTINGS: char = '\u{eb51}';
+
+/// Codicon + colour for an Outline symbol, mirroring VS Code's `symbol-*`
+/// glyphs and `symbolIcon.*Foreground` theme colours. Codepoints verified on
+/// 2026-06-18 against the upstream codicon `mapping.json`; the Nerd Font
+/// preserves the codicon PUA block, so the same codepoints render in iTerm2.
+/// Three colour families match VS Code dark: callables purple, types orange,
+/// data blue; everything structural falls back to the default text grey.
+pub fn for_outline_kind(kind: OutlineKind) -> Icon {
+    const PURPLE: Color = rgb(0xB1, 0x80, 0xD7); // methods / functions / events
+    const ORANGE: Color = rgb(0xEE, 0x9D, 0x28); // classes / enums
+    const BLUE: Color = rgb(0x75, 0xBE, 0xFF); // fields / variables / interfaces
+    const GREY: Color = rgb(0xCC, 0xCC, 0xCC); // modules / literals / fallback
+    let (glyph, color) = match kind {
+        OutlineKind::Method | OutlineKind::Function | OutlineKind::Constructor => {
+            ('\u{ea8c}', PURPLE)
+        }
+        OutlineKind::Event => ('\u{ea86}', PURPLE),
+        OutlineKind::Operator => ('\u{eb64}', PURPLE),
+        OutlineKind::Class => ('\u{eb5b}', ORANGE),
+        OutlineKind::Enum => ('\u{ea95}', ORANGE),
+        OutlineKind::Interface => ('\u{eb61}', BLUE),
+        OutlineKind::Field => ('\u{eb5f}', BLUE),
+        OutlineKind::Variable => ('\u{ea88}', BLUE),
+        OutlineKind::Constant => ('\u{eb5d}', BLUE),
+        OutlineKind::Property => ('\u{eb65}', BLUE),
+        OutlineKind::EnumMember => ('\u{eb5e}', BLUE),
+        OutlineKind::TypeParameter => ('\u{ea92}', BLUE),
+        OutlineKind::Struct => ('\u{ea91}', ORANGE),
+        OutlineKind::Module | OutlineKind::Namespace | OutlineKind::Package => ('\u{ea8b}', GREY),
+        OutlineKind::Object => ('\u{ea8b}', GREY),
+        OutlineKind::Key => ('\u{ea93}', GREY),
+        OutlineKind::String => ('\u{eb8d}', GREY),
+        OutlineKind::Number => ('\u{ea90}', GREY),
+        OutlineKind::Boolean | OutlineKind::Null => ('\u{ea8f}', GREY),
+        OutlineKind::Array => ('\u{ea8a}', GREY),
+        OutlineKind::File => ('\u{eb60}', GREY),
+    };
+    Icon { glyph, color }
+}
 
 pub fn for_path(name: &str, suffix: &str) -> Icon {
     let n = name.to_ascii_lowercase();

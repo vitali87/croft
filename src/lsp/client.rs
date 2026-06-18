@@ -17,10 +17,10 @@ use lsp_types::request::{SemanticTokensRefresh, WorkDoneProgressCreate};
 use lsp_types::{
     ClientCapabilities, CompletionContext, CompletionParams, CompletionResponse,
     CompletionTriggerKind, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
-    DidOpenTextDocumentParams, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverParams,
-    InitializeParams, InitializedParams, Location, PartialResultParams, Position,
-    ProgressParamsValue, Range, ReferenceContext, ReferenceParams, RenameParams,
-    SemanticTokensParams, SemanticTokensRangeParams, SemanticTokensRangeResult,
+    DidOpenTextDocumentParams, DocumentSymbolParams, DocumentSymbolResponse, GotoDefinitionParams,
+    GotoDefinitionResponse, Hover, HoverParams, InitializeParams, InitializedParams, Location,
+    PartialResultParams, Position, ProgressParamsValue, Range, ReferenceContext, ReferenceParams,
+    RenameParams, SemanticTokensParams, SemanticTokensRangeParams, SemanticTokensRangeResult,
     SemanticTokensResult, ServerCapabilities, TextDocumentContentChangeEvent,
     TextDocumentIdentifier, TextDocumentItem, TextDocumentPositionParams, Url,
     VersionedTextDocumentIdentifier, WorkDoneProgress, WorkDoneProgressParams, WorkspaceEdit,
@@ -433,6 +433,21 @@ impl LspClient {
             })
             .await
             .context("definition")
+    }
+
+    /// Ask the server for the document's symbol tree (`textDocument/
+    /// documentSymbol`), the data behind the Outline view. Servers answer with
+    /// either the modern `Nested` hierarchy or the legacy `Flat` list; the
+    /// worker normalises both. No position: the request covers the whole file.
+    pub async fn document_symbol(&mut self, uri: Url) -> Result<Option<DocumentSymbolResponse>> {
+        self.server
+            .document_symbol(DocumentSymbolParams {
+                text_document: TextDocumentIdentifier { uri },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+            })
+            .await
+            .context("document_symbol")
     }
 
     pub async fn declaration(

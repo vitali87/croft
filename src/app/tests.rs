@@ -11071,6 +11071,172 @@ fn app_with_open_file(tmp: &std::path::Path, name: &str, body: &str) -> App {
     app
 }
 
+fn outline_sym(
+    name: &str,
+    kind: crate::lsp::manager::OutlineKind,
+    start: u32,
+    end: u32,
+) -> crate::lsp::manager::OutlineSymbol {
+    crate::lsp::manager::OutlineSymbol {
+        name: name.to_string(),
+        detail: None,
+        kind,
+        depth: 0,
+        line: start,
+        character: 0,
+        range_start_line: start,
+        range_end_line: end,
+    }
+}
+
+#[test]
+fn outline_symbols_apply_only_for_the_active_file() {
+    use crate::lsp::manager::OutlineKind;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.rs", "fn a() {}\n");
+    let active = app.editor.path.clone().unwrap();
+    let syms = vec![outline_sym("a", OutlineKind::Function, 0, 0)];
+
+    // A reply for a file the user already navigated away from is dropped.
+    let other = tmp.path().join("b.rs");
+    assert!(
+        !app.apply_outline_symbols(other, syms.clone()),
+        "a reply whose path is not the active editor file must be ignored"
+    );
+    assert!(app.outline.path.is_none(), "stale reply must not populate");
+
+    // A reply for the active file populates the outline.
+    assert!(app.apply_outline_symbols(active.clone(), syms));
+    assert_eq!(app.outline.path.as_ref(), Some(&active));
+    assert!(!app.outline.is_empty());
+}
+
+#[test]
+fn sync_outline_settles_empty_for_a_file_without_a_language_server() {
+    // A plain text file has no language server, so no documentSymbol reply will
+    // ever arrive. sync_outline must settle the panel to a loaded, empty state
+    // (rendering "No symbols") rather than leaving it spinning on "Loading…".
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "notes.txt", "hello\nworld\n");
+    let active = app.editor.path.clone().unwrap();
+    app.sync_outline();
+    assert_eq!(app.outline.path.as_ref(), Some(&active));
+    assert!(app.outline.is_empty(), "no symbols for a non-served file");
+    assert!(
+        app.outline.loaded(),
+        "outline must be marked loaded so it shows 'No symbols', not 'Loading…'"
+    );
+}
+
+#[test]
+fn sync_outline_populates_from_tree_sitter_without_a_language_server() {
+    // Even with no LSP attached, opening a source file must fill the OUTLINE
+    // instantly from the buffer's own syntax tree (tree-sitter-first), so the
+    // panel never spins on "Loading…" waiting for a cold server.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(
+        tmp.path(),
+        "demo.rs",
+        "struct S;\n\nfn alpha() {}\n\nfn beta() {}\n",
+    );
+    app.sync_outline();
+    assert!(
+        app.outline.loaded(),
+        "syntactic outline settles immediately"
+    );
+    assert!(
+        !app.outline.is_empty(),
+        "tree-sitter must surface the struct and two functions"
+    );
+}
+
+#[test]
+fn empty_lsp_reply_keeps_the_tree_sitter_outline() {
+    // A server that lacks documentSymbol (or replies before indexing) sends an
+    // empty outline. That must not blank symbols tree-sitter already painted.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "demo.rs", "fn only() {}\n");
+    let active = app.editor.path.clone().unwrap();
+    app.sync_outline();
+    assert!(!app.outline.is_empty(), "tree-sitter painted the outline");
+    assert!(
+        !app.apply_outline_symbols(active, Vec::new()),
+        "an empty LSP reply is ignored when an outline already exists"
+    );
+    assert!(
+        !app.outline.is_empty(),
+        "the tree-sitter outline survives the empty reply"
+    );
+}
+
+#[test]
+fn clicking_the_outline_header_toggles_collapse() {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.rs", "fn a() {}\n");
+    let active = app.editor.path.clone().unwrap();
+    app.apply_outline_symbols(
+        active,
+        vec![outline_sym(
+            "a",
+            crate::lsp::manager::OutlineKind::Function,
+            0,
+            0,
+        )],
+    );
+    assert!(app.outline.collapsed, "starts collapsed");
+
+    let backend = ratatui::backend::TestBackend::new(140, 50);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let hdr = app.outline.last_area;
+    assert!(hdr.height > 0, "outline must have rendered");
+    app.handle_mouse(mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        hdr.x + 2,
+        hdr.y,
+    ));
+    assert!(
+        !app.outline.collapsed,
+        "clicking the header expands the section"
+    );
+}
+
+#[test]
+fn clicking_an_outline_row_jumps_the_editor_to_that_symbol() {
+    use crate::lsp::manager::OutlineKind;
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.rs", "fn a() {}\nfn b() {}\nfn c() {}\n");
+    let active = app.editor.path.clone().unwrap();
+    app.outline.toggle_collapse(); // expand so rows render
+    app.apply_outline_symbols(
+        active,
+        vec![
+            outline_sym("a", OutlineKind::Function, 0, 0),
+            outline_sym("b", OutlineKind::Function, 1, 1),
+            outline_sym("c", OutlineKind::Function, 2, 2),
+        ],
+    );
+    app.editor.cursor_row = 0;
+
+    let backend = ratatui::backend::TestBackend::new(140, 50);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let area = app.outline.last_area;
+    // Header occupies the first inner row; symbol rows follow. Click the
+    // second symbol ("b", line 1), which sits two rows below the header.
+    app.handle_mouse(mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        area.x + 2,
+        area.y + 2,
+    ));
+    assert_eq!(
+        app.editor.cursor_row, 1,
+        "clicking the second outline row must move the editor caret to line 1"
+    );
+}
+
 #[test]
 fn shift_tab_in_editor_dedents_the_current_python_line() {
     let tmp = tempfile::tempdir().unwrap();

@@ -459,7 +459,7 @@ dependencies = [
 
 [[package]]
 name = "croft"
-version = "0.1.417"
+version = "0.1.422"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -491,6 +491,7 @@ dependencies = [
  "serde",
  "serde_json",
  "similar",
+ "streaming-iterator",
  "sysinfo",
  "tempfile",
  "thiserror 2.0.18",

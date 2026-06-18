@@ -46,6 +46,7 @@ use welcome::WelcomeState;
 use crate::widgets::{
     editor::{Editor, EditorTabs},
     file_tree::FileTree,
+    outline::OutlinePanel,
     remote::RemotePanel,
     run_debug::RunDebugPanel,
     search::{SearchPanel, SearchRequest},
@@ -956,6 +957,9 @@ pub struct App {
     pub remote: RemotePanel,
     pub source_control: SourceControlPanel,
     pub run_debug: RunDebugPanel,
+    /// The Explorer's OUTLINE section, stacked below the file tree: the active
+    /// editor's `documentSymbol` tree. See [`OutlinePanel`].
+    pub outline: OutlinePanel,
     pub system_panel: SystemPanel,
     pub editor: EditorTabs,
     /// The secondary editor group, shown side by side with `editor` when
@@ -1024,6 +1028,10 @@ pub struct App {
     /// True while the editor's horizontal scrollbar thumb is being dragged.
     /// Only the editor has a horizontal bar, so a bool suffices.
     editor_hscrollbar_drag: bool,
+    /// A left-drag is moving the OUTLINE panel's scrollbar thumb. The outline
+    /// is not a focusable `Pane`, so it gets its own drag latch rather than
+    /// riding `scrollbar_drag`.
+    outline_scrollbar_drag: bool,
     welcome: WelcomeState,
     /// Channel to the background search worker. Each keystroke or toggle
     /// flip pushes a `(query, opts)` request here; the worker debounces
@@ -1220,6 +1228,10 @@ pub struct App {
     definition_request_id: Option<u64>,
     declaration_request_id: Option<u64>,
     type_definition_request_id: Option<u64>,
+    /// The `(active file, last-seen LSP edit seq)` the OUTLINE was last synced
+    /// to, so `sync_outline` re-requests symbols exactly once per tab switch or
+    /// edit batch. `None` seq means the file has no language server.
+    outline_synced: Option<(PathBuf, Option<u64>)>,
     implementation_request_id: Option<u64>,
     references_request_id: Option<u64>,
     rename_request_id: Option<u64>,
@@ -1565,6 +1577,7 @@ impl App {
         let remote = RemotePanel::new();
         let source_control = SourceControlPanel::new();
         let run_debug = RunDebugPanel::new();
+        let outline = OutlinePanel::new();
         let editor = EditorTabs::new();
         let term = PtyTerminal::new(&root).context("spawning terminal")?;
 
@@ -1610,6 +1623,7 @@ impl App {
             remote,
             source_control,
             run_debug,
+            outline,
             system_panel: {
                 let mut p = SystemPanel::new();
                 // Pre-existing app/SC tests assume the sidebar column
@@ -1668,6 +1682,7 @@ impl App {
             terminal_select_autoscroll: None,
             scrollbar_drag: None,
             editor_hscrollbar_drag: false,
+            outline_scrollbar_drag: false,
             welcome,
             search_query_tx,
             search_results_rx,
@@ -1761,6 +1776,7 @@ impl App {
             tab_tooltip: None,
             tab_hover_idx: None,
             definition_request_id: None,
+            outline_synced: None,
             declaration_request_id: None,
             type_definition_request_id: None,
             implementation_request_id: None,
@@ -3342,6 +3358,96 @@ impl App {
         }
     }
 
+    /// Keep the OUTLINE in sync with the active editor: request fresh symbols
+    /// when the file or its edit-seq changed (once per change), settle a
+    /// loaded-empty outline for files no language server tracks, and advance
+    /// follow-cursor. Returns whether the highlight moved (for redraw).
+    pub fn sync_outline(&mut self) -> bool {
+        let Some(path) = self.editor.path.clone() else {
+            // Back on the welcome screen: drop any stale outline.
+            if self.outline.path.is_some() {
+                self.outline.clear();
+            }
+            self.outline_synced = None;
+            return false;
+        };
+        // `lsp_last_seen` carries the edit seq the manager last saw for an open
+        // doc; absent means no language server tracks this file.
+        let seq = self.lsp_last_seen.get(&path).copied();
+        let key = (path.clone(), seq);
+        if self.outline_synced.as_ref() != Some(&key) {
+            self.outline_synced = Some(key);
+            // Tree-sitter paints the outline instantly from the buffer's own
+            // syntax tree, before any language server replies. The LSP request
+            // below refines it with richer kinds/detail when (and if) it lands.
+            let syntax = self.compute_syntax_outline(&path);
+            let lsp_pending = seq.is_some();
+            self.outline
+                .set_syntax_symbols(path.clone(), syntax, lsp_pending);
+            if lsp_pending && let Some(lsp) = self.lsp.as_ref() {
+                lsp.request_document_symbols(path);
+            }
+        }
+        // Follow-cursor every tick; cheap (O(symbols)) and only repaints when
+        // the enclosing symbol actually changes.
+        self.outline.follow_caret(self.editor.cursor_row as u32)
+    }
+
+    /// Apply a `documentSymbol` reply to the OUTLINE panel, but only when its
+    /// `path` is still the active editor file — a reply for a file the user
+    /// navigated away from is dropped. Refreshes follow-cursor on success.
+    /// Returns whether the outline changed (for redraw).
+    fn apply_outline_symbols(
+        &mut self,
+        path: std::path::PathBuf,
+        symbols: Vec<crate::lsp::manager::OutlineSymbol>,
+    ) -> bool {
+        if self.editor.path.as_ref() != Some(&path) {
+            return false;
+        }
+        // An empty reply (server lacks `documentSymbol`, or answered before it
+        // finished indexing) must not blank an outline tree-sitter already
+        // filled. Keep the syntactic symbols rather than flashing "No symbols".
+        if symbols.is_empty() && !self.outline.is_empty() {
+            return false;
+        }
+        self.outline.set_symbols(path, symbols);
+        self.outline.follow_caret(self.editor.cursor_row as u32);
+        true
+    }
+
+    /// Compute the active editor's outline directly from its syntax tree, so
+    /// the OUTLINE panel can paint before a (possibly cold) language server
+    /// answers `documentSymbol`. Empty for files whose language has no outline
+    /// query; those fall back to the LSP reply.
+    fn compute_syntax_outline(
+        &self,
+        path: &std::path::Path,
+    ) -> Vec<crate::lsp::manager::OutlineSymbol> {
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        let Some(kind) = crate::highlight::lang_for_extension(ext) else {
+            return Vec::new();
+        };
+        let text = self.editor.lines.join("\n");
+        crate::outline_syntax::symbols_for(kind, text.as_bytes())
+    }
+
+    /// Drain pending `documentSymbol` replies and apply the freshest to the
+    /// OUTLINE (guarded to the active file by `apply_outline_symbols`). Mirrors
+    /// the other `drain_lsp_*` pollers; the latest batch per file wins.
+    pub fn drain_lsp_document_symbols(&mut self) -> bool {
+        let mut latest: Option<(PathBuf, Vec<crate::lsp::manager::OutlineSymbol>)> = None;
+        if let Some(lsp) = self.lsp.as_ref() {
+            while let Some(r) = lsp.drain_document_symbols() {
+                latest = Some((r.path, r.symbols));
+            }
+        }
+        match latest {
+            Some((path, symbols)) => self.apply_outline_symbols(path, symbols),
+            None => false,
+        }
+    }
+
     pub fn drain_lsp_definition(&mut self) -> bool {
         let mut target = None;
         {
@@ -4879,6 +4985,10 @@ impl App {
         self.source_control.focus_gradient = gradient;
         self.source_control.theme = self.theme;
         self.run_debug.focus_gradient = gradient;
+        self.outline.focus_gradient = gradient;
+        self.outline.theme = self.theme;
+        self.outline.focused =
+            self.focus == Pane::Tree && self.sidebar_view == SidebarView::Explorer;
         self.remote.focus_gradient = gradient;
         self.remote.theme = self.theme;
         for t in self.terminals.iter_mut() {
@@ -5123,7 +5233,7 @@ impl App {
             // hides entirely when the column is too short to leave the
             // activity widget enough room to be usable.
             let panel_h = self.system_panel.desired_height(usable_area.height);
-            let (activity_area, panel_area) = if panel_h > 0 {
+            let (after_system, panel_area) = if panel_h > 0 {
                 let split = Layout::default()
                     .direction(Direction::Vertical)
                     .constraints([Constraint::Min(1), Constraint::Length(panel_h)])
@@ -5131,6 +5241,25 @@ impl App {
                 (split[0], Some(split[1]))
             } else {
                 (usable_area, None)
+            };
+            // Explorer-only: the OUTLINE section stacks just above the SYSTEM
+            // footer (VS Code's sub-views live under the file tree). It shrinks
+            // to a 1-row chevron strip when collapsed and is capped so the tree
+            // above always keeps its minimum rows. Other sidebar views give all
+            // of `after_system` to their activity widget.
+            let outline_h = if self.sidebar_view == SidebarView::Explorer {
+                self.outline.desired_height(after_system.height)
+            } else {
+                0
+            };
+            let (activity_area, outline_area) = if outline_h > 0 {
+                let split = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Min(1), Constraint::Length(outline_h)])
+                    .split(after_system);
+                (split[0], Some(split[1]))
+            } else {
+                (after_system, None)
             };
             // Feed the render-time pointer cell to every side panel so the row
             // under the cursor (and the remote header pills) can light up,
@@ -5140,6 +5269,7 @@ impl App {
             self.search.hover_pointer = panel_pointer;
             self.source_control.hover_pointer = panel_pointer;
             self.remote.hover_pointer = panel_pointer;
+            self.outline.hover_pointer = panel_pointer;
             match self.sidebar_view {
                 SidebarView::Explorer => frame.render_widget(&mut self.tree, activity_area),
                 SidebarView::Search => frame.render_widget(&mut self.search, activity_area),
@@ -5148,6 +5278,11 @@ impl App {
                 }
                 SidebarView::Remote => frame.render_widget(&mut self.remote, activity_area),
                 SidebarView::RunDebug => frame.render_widget(&mut self.run_debug, activity_area),
+            }
+            if let Some(oa) = outline_area {
+                frame.render_widget(&mut self.outline, oa);
+            } else {
+                self.outline.last_area = Rect::default();
             }
             if let Some(pa) = panel_area {
                 frame.render_widget(&mut self.system_panel, pa);
@@ -11630,6 +11765,11 @@ impl App {
             SidebarView::RunDebug => self.run_debug.last_area,
         };
         let in_tree = self.show_tree && rect_contains(active_sidebar_area, m.column, m.row);
+        // The OUTLINE section sits below the tree in the Explorer sidebar and
+        // scrolls independently, so wheel events over it must reach the panel
+        // rather than the tree above.
+        let in_outline = self.sidebar_view == SidebarView::Explorer
+            && rect_contains(self.outline.last_area, m.column, m.row);
         let in_editor_pane = rect_contains(self.editor.last_full_area, m.column, m.row);
         let in_editor = rect_contains(self.editor.last_area, m.column, m.row);
         let terminal_hit = self.terminal_at_pos(m.column, m.row);
@@ -11934,6 +12074,24 @@ impl App {
                 // through to the activity widget above (which would
                 // otherwise see the click as occurring on a row that's
                 // visually covered by the panel).
+                // The OUTLINE section stacks just above the SYSTEM panel. A
+                // click on its header toggles collapse; a click on a symbol row
+                // jumps the editor to that symbol (recording nav history, like
+                // go-to-definition); any other click inside its rect is
+                // swallowed so it doesn't fall through to the tree above.
+                if rect_contains(self.outline.last_area, m.column, m.row) {
+                    if rect_contains(self.outline.last_scrollbar, m.column, m.row) {
+                        self.outline.scroll_to_bar_y(m.row);
+                        self.outline_scrollbar_drag = true;
+                    } else if self.outline.hit_header(m.column, m.row) {
+                        self.outline.toggle_collapse();
+                    } else if let Some(idx) = self.outline.row_at(m.row)
+                        && let Some((path, line, col)) = self.outline.jump_target(idx)
+                    {
+                        self.go_to_definition(path, line, col);
+                    }
+                    return;
+                }
                 if rect_contains(self.system_panel.last_area, m.column, m.row) {
                     if self.system_panel.hit_header(m.column, m.row) {
                         self.system_panel.toggle_collapse();
@@ -12431,6 +12589,10 @@ impl App {
                     self.poke_cursor();
                     return;
                 }
+                if self.outline_scrollbar_drag {
+                    self.outline.scroll_to_bar_y(m.row);
+                    return;
+                }
                 if let Some(pane) = self.scrollbar_drag {
                     match pane {
                         Pane::Tree => match self.sidebar_view {
@@ -12552,6 +12714,9 @@ impl App {
                 if std::mem::take(&mut self.editor_hscrollbar_drag) {
                     return;
                 }
+                if std::mem::take(&mut self.outline_scrollbar_drag) {
+                    return;
+                }
                 if let Some(drag) = self.tree_drag.take() {
                     self.tree.drag_target = None;
                     if drag.armed {
@@ -12595,7 +12760,9 @@ impl App {
                 }
             }
             MouseEventKind::ScrollDown => {
-                if in_tree {
+                if in_outline {
+                    self.outline.scroll_down(3);
+                } else if in_tree {
                     match self.sidebar_view {
                         SidebarView::Explorer => self.tree.scroll_down(3),
                         SidebarView::Remote => self.remote.scroll_down(3),
@@ -12619,7 +12786,9 @@ impl App {
                 }
             }
             MouseEventKind::ScrollUp => {
-                if in_tree {
+                if in_outline {
+                    self.outline.scroll_up(3);
+                } else if in_tree {
                     match self.sidebar_view {
                         SidebarView::Explorer => self.tree.scroll_up(3),
                         SidebarView::Remote => self.remote.scroll_up(3),
@@ -16235,6 +16404,10 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let install_changed = app.poll_install_session();
         let update_changed = app.poll_update_watch();
         app.sync_lsp();
+        // Request/refresh the OUTLINE for the active file (after sync_lsp so the
+        // edit-seq it reads is current) and advance follow-cursor.
+        let outline_sync_changed = app.sync_outline();
+        let outline_changed = app.drain_lsp_document_symbols();
         app.refresh_semantic_tokens_if_requested();
         let lsp_changed = app.drain_lsp_completion();
         app.poll_hover();
@@ -16293,6 +16466,8 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             || semantic_changed
             || diagnostics_changed
             || progress_changed
+            || outline_sync_changed
+            || outline_changed
             || install_status_changed
             || sysmon_changed
             || dap_changed;

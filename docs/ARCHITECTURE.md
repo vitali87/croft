@@ -25,6 +25,7 @@ src/
 ├── install_session.rs   streams install-progress events while a remote host builds / installs the croft binary
 ├── iterm2.rs            iTerm2 plist mutation helpers for fonts and Croft key mappings
 ├── iterm2_inline.rs     inline-image baking pipeline + protocol dispatch (iTerm2 OSC 1337 / Kitty graphics / DEC sixel via DA1 probe): welcome wordmark, image / PDF preview, activity-bar icons incl. the settings gear, SSH empty-state hero
+├── outline_syntax.rs    tree-sitter outline provider: extracts the OUTLINE panel's symbol tree (functions, structs, methods, fields, etc.) directly from the buffer's syntax tree via hand-written per-language queries, so the panel paints instantly before a cold language server answers documentSymbol; the LSP reply later supersedes it (tree-sitter-first, like Zed and aerial.nvim). Rust / Python / JS / TS / TSX / Go covered; other languages fall back to the LSP outline
 ├── pdf.rs               PDF rasteriser: prefers pdftoppm (poppler), falls back to macOS sips
 ├── prefs.rs             durable user preferences (color theme) persisted at ~/.config/croft/config.json
 ├── remote.rs            remote (SSH) target metadata and launch dispatch
@@ -65,7 +66,7 @@ src/
 │   ├── config.rs        per-language LSP config (basedpyright, ruff, ty, vtsls, rust-analyzer, gopls)
 │   ├── install.rs       croft-managed server provisioning: lazy background installs of vtsls (npm) and ty/ruff (uv, rerouted to Termux's pkg on Android) into ~/.croft/servers, incl. the uv bootstrap
 │   ├── log_file.rs      LSP stderr / debug log sink at ~/.croft/lsp.log
-│   ├── manager.rs       lifecycle: spawn / did_open / did_change / completion / shutdown
+│   ├── manager.rs       lifecycle: spawn / did_open / did_change / completion / documentSymbol (Outline) / shutdown
 │   ├── registry.rs      language detection from file extension and shebang
 │   ├── runtime.rs       Tokio runtime owned by the LSP manager
 │   └── semantic_cache.rs content-keyed disk cache of semantic-token batches at ~/.croft/sem-cache
@@ -82,6 +83,7 @@ src/
     ├── header_pill.rs   shared section-header pill button (chip-backed codicon affordance + theme colours) used by both the Remote Explorer (+ / refresh) and Source Control (refresh) headers
     ├── hover.rs         shared hover-feedback helpers (pointer hit-test + theme-aware row-hover background) used by the side panels and header pills
     ├── hover_popup.rs   LSP hover popup (300 ms dwell, anchored at the cursor)
+    ├── outline.rs       collapsible OUTLINE section under the file tree: the active editor's symbol tree, indented + kind-iconed, with follow-cursor highlight and click-to-jump; painted instantly from tree-sitter (see outline_syntax.rs) and refined by the LSP documentSymbol reply when it arrives
     ├── osk.rs           on-screen keyboard for Termux (mouse tracking blocks the native soft keyboard): bottom-docked tappable band whose keys synthesize KeyEvents through handle_key; lower / shift / symbol layers plus caps lock (letters only), one-shot ctrl + alt latches on the bottom row next to space; physical-keyboard geometry (structural keys carry max cell widths, the left column staggers esc < tab < caps < shift like a MacBook, letters and space absorb wide-frame slack via water-filling, Enter grows into a two-row L on the right in both merged and split layouts (full-height even on one-row bands) and the collapse `⌄` key is about twice the `split` key); Gboard-style split layout for foldables (number/top rows split 5|5, the home and bottom rows one column earlier so `g` and `b` fall in the right thumb cluster, and the top-right cluster parks a `\` at the far edge (`y u i o p \`, qwerty letters keep their natural order); halves solved independently around a 2·width/9 center gap, space on both halves, merged again under 60 cols), toggled by the `split` key and persisted as `osk_split` in prefs; thumb-sized keys scale with frame height and the non-focused pane folds away while the band is up; key caps are drawn from the active theme's palette (brand-teal armed accent on Black, the historical navy on Dark)
     ├── process_picker.rs centered selectable list of attachable Python 3.14+ processes for "Debug: Attach to Python Process"; selecting one has the App spawn `pdb -p <pid>` in a PTY
     ├── remote.rs        Remote (SSH) sidebar widget with empty-state hero illustration

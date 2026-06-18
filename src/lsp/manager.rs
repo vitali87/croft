@@ -9,13 +9,14 @@ use anyhow::Result;
 use lsp_types::{
     ClientCapabilities, CompletionClientCapabilities, CompletionItemCapability, CompletionItemKind,
     CompletionItemKindCapability, CompletionResponse, DeclarationCapability,
-    DocumentChangeOperation, DocumentChanges, GotoDefinitionResponse, HoverContents,
-    HoverProviderCapability, ImplementationProviderCapability, Location, MarkedString, MarkupKind,
-    OneOf, Position, PublishDiagnosticsClientCapabilities, SemanticTokenModifier,
-    SemanticTokenType, SemanticTokensClientCapabilities, SemanticTokensClientCapabilitiesRequests,
+    DocumentChangeOperation, DocumentChanges, DocumentSymbol, DocumentSymbolClientCapabilities,
+    DocumentSymbolResponse, GotoDefinitionResponse, HoverContents, HoverProviderCapability,
+    ImplementationProviderCapability, Location, MarkedString, MarkupKind, OneOf, Position,
+    PublishDiagnosticsClientCapabilities, SemanticTokenModifier, SemanticTokenType,
+    SemanticTokensClientCapabilities, SemanticTokensClientCapabilitiesRequests,
     SemanticTokensFullOptions, SemanticTokensRangeResult, SemanticTokensResult,
     SemanticTokensServerCapabilities, SemanticTokensWorkspaceClientCapabilities,
-    ServerCapabilities, TextDocumentClientCapabilities, TextEdit, TokenFormat,
+    ServerCapabilities, SymbolKind, TextDocumentClientCapabilities, TextEdit, TokenFormat,
     TypeDefinitionProviderCapability, Url, WindowClientCapabilities, WorkspaceClientCapabilities,
     WorkspaceEdit,
 };
@@ -56,6 +57,100 @@ pub struct DefinitionResult {
     pub request_id: u64,
     pub path: PathBuf,
     pub target: Option<(PathBuf, u32, u32)>,
+}
+
+/// The kind of an outline symbol, normalised off the LSP `SymbolKind` wire
+/// enum so the Outline widget never depends on `lsp-types`. Mirrors VS Code's
+/// symbol categories one-to-one; the widget maps each to a codicon + colour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutlineKind {
+    File,
+    Module,
+    Namespace,
+    Package,
+    Class,
+    Method,
+    Property,
+    Field,
+    Constructor,
+    Enum,
+    Interface,
+    Function,
+    Variable,
+    Constant,
+    String,
+    Number,
+    Boolean,
+    Array,
+    Object,
+    Key,
+    Null,
+    EnumMember,
+    Struct,
+    Event,
+    Operator,
+    TypeParameter,
+}
+
+impl OutlineKind {
+    fn from_lsp(kind: SymbolKind) -> Self {
+        match kind {
+            SymbolKind::MODULE => Self::Module,
+            SymbolKind::NAMESPACE => Self::Namespace,
+            SymbolKind::PACKAGE => Self::Package,
+            SymbolKind::CLASS => Self::Class,
+            SymbolKind::METHOD => Self::Method,
+            SymbolKind::PROPERTY => Self::Property,
+            SymbolKind::FIELD => Self::Field,
+            SymbolKind::CONSTRUCTOR => Self::Constructor,
+            SymbolKind::ENUM => Self::Enum,
+            SymbolKind::INTERFACE => Self::Interface,
+            SymbolKind::FUNCTION => Self::Function,
+            SymbolKind::VARIABLE => Self::Variable,
+            SymbolKind::CONSTANT => Self::Constant,
+            SymbolKind::STRING => Self::String,
+            SymbolKind::NUMBER => Self::Number,
+            SymbolKind::BOOLEAN => Self::Boolean,
+            SymbolKind::ARRAY => Self::Array,
+            SymbolKind::OBJECT => Self::Object,
+            SymbolKind::KEY => Self::Key,
+            SymbolKind::NULL => Self::Null,
+            SymbolKind::ENUM_MEMBER => Self::EnumMember,
+            SymbolKind::STRUCT => Self::Struct,
+            SymbolKind::EVENT => Self::Event,
+            SymbolKind::OPERATOR => Self::Operator,
+            SymbolKind::TYPE_PARAMETER => Self::TypeParameter,
+            // SymbolKind::FILE and any future/unknown kind fall back to File.
+            _ => Self::File,
+        }
+    }
+}
+
+/// One row of the Outline, flattened from the server's symbol tree in document
+/// order with a `depth` for indentation. `line`/`character` are the
+/// `selectionRange` start (zero-based LSP UTF-16) — where the caret lands on
+/// click — while `range_start_line`/`range_end_line` bound the whole construct
+/// so the panel can highlight the symbol the editor caret currently sits in.
+#[derive(Debug, Clone)]
+pub struct OutlineSymbol {
+    pub name: String,
+    pub detail: Option<String>,
+    pub kind: OutlineKind,
+    pub depth: u16,
+    pub line: u32,
+    pub character: u32,
+    pub range_start_line: u32,
+    pub range_end_line: u32,
+}
+
+/// The Outline for one document. Keyed by `path` (the latest batch wins, like
+/// `SemanticTokensUpdate`); the app applies it only when `path` still matches
+/// the active editor, so a reply for a file the user navigated away from is
+/// dropped without needing a request id.
+#[derive(Debug)]
+pub struct DocumentSymbolsResult {
+    pub path: PathBuf,
+    pub symbols: Vec<OutlineSymbol>,
 }
 
 #[derive(Debug)]
@@ -227,6 +322,9 @@ enum Cmd {
         line: u32,
         character: u32,
     },
+    RequestDocumentSymbols {
+        path: PathBuf,
+    },
     RequestDeclaration {
         request_id: u64,
         path: PathBuf,
@@ -280,6 +378,7 @@ pub struct LspManager {
     completion_rx: std_mpsc::Receiver<CompletionResult>,
     hover_rx: std_mpsc::Receiver<HoverResult>,
     def_rx: std_mpsc::Receiver<DefinitionResult>,
+    doc_symbols_rx: std_mpsc::Receiver<DocumentSymbolsResult>,
     decl_rx: std_mpsc::Receiver<DeclarationResult>,
     type_def_rx: std_mpsc::Receiver<TypeDefinitionResult>,
     impl_rx: std_mpsc::Receiver<ImplementationResult>,
@@ -318,6 +417,7 @@ impl LspManager {
         let (completion_tx, completion_rx) = std_mpsc::channel();
         let (hover_tx, hover_rx) = std_mpsc::channel();
         let (def_tx, def_rx) = std_mpsc::channel();
+        let (doc_symbols_tx, doc_symbols_rx) = std_mpsc::channel();
         let (decl_tx, decl_rx) = std_mpsc::channel();
         let (type_def_tx, type_def_rx) = std_mpsc::channel();
         let (impl_tx, impl_rx) = std_mpsc::channel();
@@ -338,6 +438,7 @@ impl LspManager {
                 completion: completion_tx,
                 hover: hover_tx,
                 definition: def_tx,
+                document_symbols: doc_symbols_tx,
                 declaration: decl_tx,
                 type_definition: type_def_tx,
                 implementation: impl_tx,
@@ -355,6 +456,7 @@ impl LspManager {
             completion_rx,
             hover_rx,
             def_rx,
+            doc_symbols_rx,
             decl_rx,
             type_def_rx,
             impl_rx,
@@ -478,6 +580,18 @@ impl LspManager {
 
     pub fn drain_definition(&self) -> Option<DefinitionResult> {
         self.def_rx.try_recv().ok()
+    }
+
+    /// Ask the server for the document's symbol tree (the Outline). Fire on
+    /// open, on the active editor tab changing, and (debounced) after edits;
+    /// the freshest reply for the active file wins. No request id: replies are
+    /// keyed by path and the app drops any whose path is no longer active.
+    pub fn request_document_symbols(&self, path: PathBuf) {
+        let _ = self.cmd_tx.send(Cmd::RequestDocumentSymbols { path });
+    }
+
+    pub fn drain_document_symbols(&self) -> Option<DocumentSymbolsResult> {
+        self.doc_symbols_rx.try_recv().ok()
     }
 
     pub fn request_declaration(&mut self, path: PathBuf, line: u32, character: u32) -> u64 {
@@ -622,6 +736,7 @@ struct ManagedClient {
     supports_completion: bool,
     supports_hover: bool,
     supports_definition: bool,
+    supports_document_symbol: bool,
     supports_declaration: bool,
     supports_type_definition: bool,
     supports_implementation: bool,
@@ -677,6 +792,7 @@ struct ResultSenders {
     completion: std_mpsc::Sender<CompletionResult>,
     hover: std_mpsc::Sender<HoverResult>,
     definition: std_mpsc::Sender<DefinitionResult>,
+    document_symbols: std_mpsc::Sender<DocumentSymbolsResult>,
     declaration: std_mpsc::Sender<DeclarationResult>,
     type_definition: std_mpsc::Sender<TypeDefinitionResult>,
     implementation: std_mpsc::Sender<ImplementationResult>,
@@ -757,6 +873,11 @@ async fn worker_loop(
             } => {
                 state
                     .request_definition(request_id, path, line, character, &tx.definition)
+                    .await
+            }
+            Cmd::RequestDocumentSymbols { path } => {
+                state
+                    .request_document_symbols(path, &tx.document_symbols)
                     .await
             }
             Cmd::RequestDeclaration {
@@ -896,6 +1017,8 @@ impl WorkerState {
                         let supports = caps.completion_provider.is_some();
                         let supports_hover = hover_supported(&caps.hover_provider);
                         let supports_definition = one_of_supported(&caps.definition_provider);
+                        let supports_document_symbol =
+                            one_of_supported(&caps.document_symbol_provider);
                         let supports_declaration =
                             declaration_supported(&caps.declaration_provider);
                         let supports_type_definition =
@@ -917,6 +1040,7 @@ impl WorkerState {
                             supports_completion: supports,
                             supports_hover,
                             supports_definition,
+                            supports_document_symbol,
                             supports_declaration,
                             supports_type_definition,
                             supports_implementation,
@@ -1410,6 +1534,61 @@ impl WorkerState {
         });
     }
 
+    async fn request_document_symbols(
+        &mut self,
+        path: PathBuf,
+        tx: &std_mpsc::Sender<DocumentSymbolsResult>,
+    ) {
+        let Some(doc) = self.docs.get(&path) else {
+            return;
+        };
+        let lang = doc.language;
+        let root = doc.project_root.clone();
+        self.ensure_clients(lang, &root).await;
+        let Some(clients) = self.clients.get(&(lang, root)) else {
+            return;
+        };
+        let picked = clients
+            .iter()
+            .find(|c| c.supports_document_symbol)
+            .map(|c| (c.name.clone(), c.client.clone()));
+        let Some((server_name, client_arc)) = picked else {
+            // No symbol provider: send an empty outline so the panel shows
+            // "No symbols" rather than a stale tree from a previous file.
+            let _ = tx.send(DocumentSymbolsResult {
+                path,
+                symbols: Vec::new(),
+            });
+            return;
+        };
+        let Ok(uri) = Url::from_file_path(&path) else {
+            return;
+        };
+        let tx = tx.clone();
+        let path_clone = path.clone();
+        tokio::spawn(async move {
+            let mut client = client_arc.lock().await;
+            let resp = client.document_symbol(uri).await;
+            drop(client);
+            let symbols = match resp {
+                Ok(Some(r)) => flatten_symbols(r),
+                Ok(None) => Vec::new(),
+                Err(e) => {
+                    log_file::log(&format!("lsp[{server_name}] document_symbol error: {e:#}"));
+                    Vec::new()
+                }
+            };
+            log_file::log(&format!(
+                "document_symbol response server={server_name} count={}",
+                symbols.len()
+            ));
+            let _ = tx.send(DocumentSymbolsResult {
+                path: path_clone,
+                symbols,
+            });
+        });
+    }
+
     async fn request_declaration(
         &mut self,
         request_id: u64,
@@ -1873,6 +2052,58 @@ fn hover_supported(cap: &Option<HoverProviderCapability>) -> bool {
 /// Declaration capability (`boolean | DeclarationOptions | DeclarationRegistrationOptions`).
 /// vtsls sends `declarationProvider: false`, so the bare-`false` arm is what
 /// stops croft from calling the unhandled `textDocument/declaration`.
+/// Flatten the server's symbol response into a depth-tagged list in document
+/// order — the shape the Outline widget renders directly. The modern `Nested`
+/// hierarchy recurses (depth grows with nesting); the legacy `Flat` list has no
+/// hierarchy, so every symbol sits at depth 0, sorted by position.
+fn flatten_symbols(resp: DocumentSymbolResponse) -> Vec<OutlineSymbol> {
+    match resp {
+        DocumentSymbolResponse::Nested(syms) => {
+            let mut out = Vec::new();
+            push_nested(&syms, 0, &mut out);
+            out
+        }
+        DocumentSymbolResponse::Flat(infos) => {
+            let mut out: Vec<OutlineSymbol> = infos
+                .into_iter()
+                .map(|info| {
+                    let start = info.location.range.start;
+                    OutlineSymbol {
+                        name: info.name,
+                        detail: None,
+                        kind: OutlineKind::from_lsp(info.kind),
+                        depth: 0,
+                        line: start.line,
+                        character: start.character,
+                        range_start_line: info.location.range.start.line,
+                        range_end_line: info.location.range.end.line,
+                    }
+                })
+                .collect();
+            out.sort_by_key(|s| (s.line, s.character));
+            out
+        }
+    }
+}
+
+fn push_nested(syms: &[DocumentSymbol], depth: u16, out: &mut Vec<OutlineSymbol>) {
+    for sym in syms {
+        out.push(OutlineSymbol {
+            name: sym.name.clone(),
+            detail: sym.detail.clone(),
+            kind: OutlineKind::from_lsp(sym.kind),
+            depth,
+            line: sym.selection_range.start.line,
+            character: sym.selection_range.start.character,
+            range_start_line: sym.range.start.line,
+            range_end_line: sym.range.end.line,
+        });
+        if let Some(children) = &sym.children {
+            push_nested(children, depth + 1, out);
+        }
+    }
+}
+
 fn declaration_supported(cap: &Option<DeclarationCapability>) -> bool {
     match cap {
         Some(DeclarationCapability::Simple(b)) => *b,
@@ -2128,6 +2359,15 @@ fn build_client_capabilities() -> ClientCapabilities {
                 // highlighting (VS Code / Zed "combined" model), so it may
                 // omit tokens that already match syntax.
                 augments_syntax_tokens: Some(true),
+                ..Default::default()
+            }),
+            // Advertise hierarchical Outline support so servers return the
+            // nested `DocumentSymbol` tree (rust-analyzer falls back to the
+            // flat `SymbolInformation` list without this), exactly as VS Code
+            // does. `flatten_symbols` handles both shapes regardless.
+            document_symbol: Some(DocumentSymbolClientCapabilities {
+                dynamic_registration: Some(false),
+                hierarchical_document_symbol_support: Some(true),
                 ..Default::default()
             }),
             // Declare push-diagnostics support. Several servers gate
