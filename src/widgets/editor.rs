@@ -383,6 +383,10 @@ fn render_diff(
     let find_needle = diff.find.needle.clone();
     let find_opts = diff.find.opts;
     let find_active = diff.find.active;
+    // VS Code-style selection highlight: when a single word/run is selected,
+    // every OTHER occurrence on screen gets a muted-blue box, mirroring the
+    // plain editor. Painted per row below, under the brighter active band.
+    let occ_needle = diff.selection_occurrence_needle();
 
     let end = (diff.scroll + viewport).min(total);
     for (vis_row, row_idx) in (diff.scroll..end).enumerate() {
@@ -565,6 +569,35 @@ fn render_diff(
                     find_opts,
                     diff.scroll_x,
                     active,
+                );
+            }
+        }
+
+        // Selection-occurrence highlight: muted-blue box over every match of
+        // the selected word on both columns. Painted after the find pass so
+        // the two layers compose like the plain editor; the active selection
+        // band overpaints these in a brighter blue below the row loop.
+        if let Some(needle) = occ_needle.as_deref() {
+            if l_left_idx.is_some() && l_text_w > 0 {
+                paint_selection_occurrences(
+                    buf,
+                    l_text_x,
+                    y,
+                    l_text_w,
+                    &l_text,
+                    needle,
+                    diff.scroll_x,
+                );
+            }
+            if r_right_idx.is_some() && r_text_w > 0 {
+                paint_selection_occurrences(
+                    buf,
+                    r_text_x,
+                    y,
+                    r_text_w,
+                    &r_text,
+                    needle,
+                    diff.scroll_x,
                 );
             }
         }

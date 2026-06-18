@@ -3,6 +3,11 @@ use std::path::{Path, PathBuf};
 use crate::widgets::editor_find::line_matches;
 use crate::widgets::search::SearchOpts;
 
+/// Max selected-text length that still drives occurrence highlighting,
+/// matching VS Code's default `editor.selectionHighlightMaxLength`. Kept in
+/// sync with the plain editor's constant of the same purpose.
+const SELECTION_HIGHLIGHT_MAX_LEN: usize = 200;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DiffData {
     pub left_path: PathBuf,
@@ -548,6 +553,48 @@ impl DiffData {
             out.extend(chars[cs..ce].iter());
         }
         if out.is_empty() { None } else { Some(out) }
+    }
+
+    /// The literal substring an active single-row selection covers, used to
+    /// drive the "highlight every other occurrence" box (VS Code's
+    /// `editor.selectionHighlight`). Returns `None` for a zero-area click,
+    /// a multi-row selection (VS Code only highlights occurrences for
+    /// single-line selections), a whitespace-only selection, or one past the
+    /// `editor.selectionHighlightMaxLength` ceiling — mirroring the plain
+    /// editor's `selection_occurrence_needle` exactly.
+    pub fn selection_occurrence_needle(&self) -> Option<String> {
+        let sel = self.selection?;
+        if !sel.has_area() {
+            return None;
+        }
+        let (start, end) = sel.normalized();
+        if start.0 != end.0 {
+            return None;
+        }
+        let line_idx = match (sel.side, *self.rows.get(start.0)?) {
+            (DiffSide::Left, DiffRow::Equal { left, .. })
+            | (DiffSide::Left, DiffRow::Removed { left })
+            | (DiffSide::Left, DiffRow::Replaced { left, .. }) => left,
+            (DiffSide::Right, DiffRow::Equal { right, .. })
+            | (DiffSide::Right, DiffRow::Added { right })
+            | (DiffSide::Right, DiffRow::Replaced { right, .. }) => right,
+            _ => return None,
+        };
+        let lines = match sel.side {
+            DiffSide::Left => &self.left_lines,
+            DiffSide::Right => &self.right_lines,
+        };
+        let chars: Vec<char> = lines.get(line_idx)?.chars().collect();
+        let cs = start.1.min(chars.len());
+        let ce = end.1.min(chars.len());
+        if ce <= cs {
+            return None;
+        }
+        let text: String = chars[cs..ce].iter().collect();
+        if text.trim().is_empty() || text.chars().count() > SELECTION_HIGHLIGHT_MAX_LEN {
+            return None;
+        }
+        Some(text)
     }
 
     /// Length (in chars) of the longest line across both files. Used to
@@ -1541,6 +1588,65 @@ mod tests {
         assert!(
             d.selection.is_none(),
             "double-clicking on the (blank) left side of an Added row must NOT anchor a phantom selection"
+        );
+    }
+
+    #[test]
+    fn selection_occurrence_needle_returns_single_row_word() {
+        let mut d = DiffData::build(
+            PathBuf::from("x"),
+            PathBuf::from("y"),
+            lines(&["alpha beta", "alpha gamma"]),
+            lines(&["alpha beta", "alpha gamma"]),
+        );
+        d.select_word_at(DiffSide::Left, 0, 0);
+        assert_eq!(
+            d.selection_occurrence_needle().as_deref(),
+            Some("alpha"),
+            "a single-row word selection must expose its text as the occurrence needle"
+        );
+    }
+
+    #[test]
+    fn selection_occurrence_needle_is_none_for_zero_area_or_multi_row() {
+        let mut d = DiffData::build(
+            PathBuf::from("x"),
+            PathBuf::from("y"),
+            lines(&["alpha", "beta"]),
+            lines(&["alpha", "beta"]),
+        );
+        // Zero-area click: no occurrence highlight.
+        d.start_selection(DiffSide::Left, 0, 2);
+        assert_eq!(
+            d.selection_occurrence_needle(),
+            None,
+            "a click is not a word"
+        );
+        // Multi-row selection: VS Code only highlights single-line selections.
+        d.start_selection(DiffSide::Left, 0, 0);
+        d.extend_selection_to(1, 2);
+        assert_eq!(
+            d.selection_occurrence_needle(),
+            None,
+            "a multi-row selection must not drive occurrence highlighting"
+        );
+    }
+
+    #[test]
+    fn selection_occurrence_needle_skips_whitespace_only_selection() {
+        let mut d = DiffData::build(
+            PathBuf::from("x"),
+            PathBuf::from("y"),
+            lines(&["a   b"]),
+            lines(&["a   b"]),
+        );
+        // Select the run of spaces between the two words.
+        d.start_selection(DiffSide::Left, 0, 1);
+        d.extend_selection_to(0, 4);
+        assert_eq!(
+            d.selection_occurrence_needle(),
+            None,
+            "a whitespace-only selection must not highlight occurrences"
         );
     }
 

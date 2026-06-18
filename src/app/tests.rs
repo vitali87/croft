@@ -2741,6 +2741,51 @@ fn editor_find_in_diff_next_prev_cycle_through_both_columns() {
 }
 
 #[test]
+fn diff_word_selection_highlights_every_other_occurrence() {
+    // Highlight-all parity with the plain editor: selecting a word in the
+    // diff must paint a muted-blue box over EVERY other occurrence of that
+    // word on screen (VS Code's `editor.selectionHighlight`), exactly like
+    // the regular editor does. The diff renderer used to only paint the
+    // active selection band, leaving the other occurrences un-highlighted.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let f1 = tmp.path().join("a.txt");
+    let f2 = tmp.path().join("b.txt");
+    // "alpha" appears on every equal row's left AND right column, so a single
+    // word selection has many other occurrences visible at once.
+    std::fs::write(&f1, "alpha one\nalpha two\nalpha three\n").unwrap();
+    std::fs::write(&f2, "alpha one\nalpha two\nalpha three\nalpha four\n").unwrap();
+    app.editor.open_diff(&f1, &f2).unwrap();
+    app.focus = Pane::Editor;
+    let _ = render_buf(&mut app);
+
+    // Select the word "alpha" (cols 0..5) on the left column of the first row.
+    {
+        let diff = app.editor.diff.as_mut().unwrap();
+        diff.select_word_at(crate::widgets::diff::DiffSide::Left, 0, 0);
+        assert_eq!(
+            diff.selection_text().as_deref(),
+            Some("alpha"),
+            "fixture: word click must select exactly 'alpha'"
+        );
+    }
+
+    let buf = render_buf(&mut app);
+    let occurrence = Color::Rgb(0x37, 0x61, 0x8e);
+    let occ_cells = count_bg(&buf, occurrence);
+    // The selected word itself is overpainted by the brighter selection band,
+    // so every occurrence we count here is a *different* one. Two equal rows
+    // still on screen carry "alpha" on both columns -> at least four more
+    // 5-char spans = 20 cells, well over this floor.
+    assert!(
+        occ_cells >= 10,
+        "selecting 'alpha' in the diff must highlight all other occurrences in \
+         the muted-blue selection-highlight colour, mirroring the plain editor; \
+         got only {occ_cells} highlighted cells"
+    );
+}
+
+#[test]
 fn double_click_in_diff_selects_word_and_cmd_c_copies_it() {
     // End-to-end: two left-clicks in quick succession on a word in
     // the left column must snap a word-bounded selection (same UX
