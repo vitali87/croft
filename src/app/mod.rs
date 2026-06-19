@@ -12780,6 +12780,16 @@ impl App {
                         self.paste_clipboard_into_search(text.as_deref());
                         return;
                     }
+                    // Header "Refresh" re-runs the current query.
+                    if self.search.refresh_at(m.column, m.row) {
+                        self.submit_search_query();
+                        return;
+                    }
+                    // Header "Clear Search Results" wipes the query + results.
+                    if self.search.clear_at(m.column, m.row) {
+                        self.search.clear_all();
+                        return;
+                    }
                     // Left chevron expands/collapses the Replace row.
                     if self.search.chevron_at(m.column, m.row) {
                         self.search.toggle_replace();

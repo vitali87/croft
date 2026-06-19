@@ -7,7 +7,7 @@ use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Widget},
+    widgets::{Block, Borders, Widget},
 };
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -15,6 +15,29 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 const MAX_LINE_LEN: usize = 200;
+
+/// Per-channel lift applied to the theme background to fill an idle input row,
+/// mirroring VS Code's `input.background` sitting a touch lighter than the
+/// panel. On Black (#000) this lands a neutral #141414; on Croft Dark
+/// (#1e222e) a lighter navy. Single source of truth for both helpers below.
+const FIELD_FILL_LIFT_IDLE: u8 = 0x14;
+/// The focused input row lifts further still, standing in for VS Code's
+/// `focusBorder` ring — in a cell grid we cannot draw a 1px sub-cell edge, so
+/// the brighter fill plus the accent left-bar carry the focus signal.
+const FIELD_FILL_LIFT_FOCUS: u8 = 0x22;
+/// The dim left-edge bar an unfocused field wears, so every input reads as a
+/// touch target even before it gains the accent bar on focus.
+const FIELD_BAR_IDLE: Color = Color::Rgb(0x2b, 0x31, 0x3b);
+
+/// Lift each channel of `(r, g, b)` by `d`, saturating. Used to derive the
+/// input fill from the active theme background.
+fn lift_bg((r, g, b): (u8, u8, u8), d: u8) -> Color {
+    Color::Rgb(
+        r.saturating_add(d),
+        g.saturating_add(d),
+        b.saturating_add(d),
+    )
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SearchHit {
@@ -753,6 +776,12 @@ pub struct SearchPanel {
     /// The `...` details toggle (expands include/exclude).
     pub ellipsis_x: u16,
     pub ellipsis_y: u16,
+    /// The SEARCH header action icons (top-right): refresh re-runs the query,
+    /// clear wipes the query + results. Single-cell hit targets.
+    pub refresh_x: u16,
+    pub refresh_y: u16,
+    pub clear_x: u16,
+    pub clear_y: u16,
     /// Content rects of each input box's editable area, for click-to-focus.
     pub query_input_rect: Rect,
     pub replace_input_rect: Rect,
@@ -813,11 +842,15 @@ impl SearchPanel {
             replace_all_y: 0,
             ellipsis_x: 0,
             ellipsis_y: 0,
+            refresh_x: 0,
+            refresh_y: 0,
+            clear_x: 0,
+            clear_y: 0,
             query_input_rect: Rect::default(),
             replace_input_rect: Rect::default(),
             include_input_rect: Rect::default(),
             exclude_input_rect: Rect::default(),
-            results_start_offset: 7,
+            results_start_offset: 5,
         }
     }
 
@@ -1055,6 +1088,30 @@ impl SearchPanel {
         self.replace_all_x != 0 && row == self.replace_all_y && col == self.replace_all_x
     }
 
+    /// True when `(col, row)` lands on the header "Refresh" action icon.
+    pub fn refresh_at(&self, col: u16, row: u16) -> bool {
+        self.refresh_x != 0 && row == self.refresh_y && col == self.refresh_x
+    }
+
+    /// True when `(col, row)` lands on the header "Clear Search Results" icon.
+    pub fn clear_at(&self, col: u16, row: u16) -> bool {
+        self.clear_x != 0 && row == self.clear_y && col == self.clear_x
+    }
+
+    /// Clear the search like VS Code's "Clear Search Results": empty the query
+    /// (and the replace text typed against it) and drop every hit, resetting
+    /// selection and scroll. The include/exclude glob filters are intentionally
+    /// preserved — they are scoping settings, not search results.
+    pub fn clear_all(&mut self) {
+        self.query.clear();
+        self.replace.clear();
+        self.hits.clear();
+        self.selected = 0;
+        self.scroll = 0;
+        self.selection = None;
+        self.field_selection = None;
+    }
+
     /// Map a click to the input field whose editable row it lands on, for
     /// click-to-focus. Returns `None` when the click is outside every input.
     pub fn field_at(&self, col: u16, row: u16) -> Option<SearchField> {
@@ -1226,12 +1283,17 @@ pub enum SearchToggle {
     UseRegex,
 }
 
-/// Parameters for `render_input_box`, bundled so the long argument list stays
+/// Parameters for [`render_field`], bundled so the long argument list stays
 /// readable at each call site.
-struct InputBoxArgs<'a> {
-    /// 3-row outer rect of the box.
-    rect: Rect,
-    /// Optional leading glyph (e.g. the magnifier) drawn at the content start.
+struct FieldArgs<'a> {
+    /// Column of the accent/idle left-edge bar; the filled content begins one
+    /// cell to its right.
+    bar_x: u16,
+    /// The single content row this field occupies.
+    y: u16,
+    /// Last column of the fill (inclusive).
+    fill_right: u16,
+    /// Optional leading glyph (e.g. the magnifier) drawn at the fill start.
     lead_glyph: Option<&'a str>,
     /// Current text of the field.
     text: &'a str,
@@ -1239,54 +1301,74 @@ struct InputBoxArgs<'a> {
     placeholder: &'a str,
     /// Selection range within `text`, already normalised (a <= b).
     selection: Option<(usize, usize)>,
-    /// Whether THIS field is the focused one (drives the accent ring, and
-    /// whether the cursor renders here).
+    /// Whether THIS field is focused (drives the accent bar, brighter fill and
+    /// whether the inline cursor renders here).
     field_focused: bool,
-    /// Accent color for the border / cursor when active.
+    /// Accent color for the bar / lead glyph / cursor when focused.
     accent: Color,
+    /// The active theme background, lifted to derive the idle/focused fill so
+    /// the field reads as elevated on Black and on Croft Dark alike.
+    bg: (u8, u8, u8),
+    /// Cells kept clear at the right of the fill for inset controls (the query
+    /// row's toggles). The returned hit rect also stops short of them so a
+    /// toggle click is not swallowed as a click-to-focus.
+    reserve_right: u16,
 }
 
-/// Render a rounded 3-row input box and its contents, returning the editable
-/// content `Rect` (the single inner row to the right of any lead glyph) so the
-/// caller can store it for click-to-focus hit-testing. Shared by all four
-/// Search inputs (query, replace, include, exclude) so they look identical.
-fn render_input_box(buf: &mut Buffer, args: InputBoxArgs) -> Rect {
-    // The focused field wears the accent ring; every other box stays dim grey
-    // whether or not the panel itself has focus.
-    let border_style = if args.field_focused {
-        Style::default().fg(args.accent)
+/// Render a single filled input row (VS Code's `input.background` model) and
+/// return the click-to-focus hit `Rect` covering the bar + editable span (but
+/// not any reserved control cells on the right). Shared by all four Search
+/// inputs so they look identical: a one-cell accent/idle left bar, a subtly
+/// lifted fill, an optional lead glyph, then the text/placeholder with an
+/// inline cursor when focused. Replaces the old 3-row rounded box, which read
+/// as bulky next to VS Code / Zed's thin single-line fields.
+fn render_field(buf: &mut Buffer, args: FieldArgs) -> Rect {
+    if args.fill_right <= args.bar_x {
+        return Rect {
+            x: args.bar_x,
+            y: args.y,
+            width: 0,
+            height: 1,
+        };
+    }
+    // Left-edge bar: accent when focused (standing in for VS Code's focus
+    // border, which we cannot draw as a sub-cell stroke), dim otherwise so the
+    // field still reads as a target at rest.
+    let bar_color = if args.field_focused {
+        args.accent
     } else {
-        Style::default().fg(Color::Rgb(0x60, 0x68, 0x78))
+        FIELD_BAR_IDLE
     };
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(border_style);
-    let box_inner = block.inner(args.rect);
-    block.render(args.rect, buf);
-    if box_inner.width == 0 || box_inner.height == 0 {
-        return box_inner;
+    buf.set_string(args.bar_x, args.y, "▏", Style::default().fg(bar_color));
+
+    let fill_x = args.bar_x + 1;
+    let lift = if args.field_focused {
+        FIELD_FILL_LIFT_FOCUS
+    } else {
+        FIELD_FILL_LIFT_IDLE
+    };
+    let fill = lift_bg(args.bg, lift);
+    let fill_style = Style::default().bg(fill);
+    for x in fill_x..=args.fill_right {
+        buf[(x, args.y)].set_symbol(" ").set_style(fill_style);
     }
 
     let lead_w: u16 = if args.lead_glyph.is_some() { 2 } else { 0 };
-    if let Some(g) = args.lead_glyph
-        && box_inner.width > lead_w
-    {
+    if let Some(g) = args.lead_glyph {
         let lead_color = if args.field_focused {
             args.accent
         } else {
             Color::Rgb(0x9d, 0xa5, 0xb4)
         };
-        buf.set_string(box_inner.x, box_inner.y, g, Style::default().fg(lead_color));
+        buf.set_string(fill_x, args.y, g, Style::default().fg(lead_color).bg(fill));
     }
-    let content = Rect {
-        x: box_inner.x + lead_w,
-        y: box_inner.y,
-        width: box_inner.width.saturating_sub(lead_w),
-        height: 1,
-    };
 
-    let cursor_span = Span::styled("█", Style::default().fg(args.accent));
+    // Editable span: after the lead glyph, up to the reserved control cells.
+    let text_x = fill_x + lead_w;
+    let text_right = args.fill_right.saturating_sub(args.reserve_right);
+    let text_w = text_right.saturating_sub(text_x).saturating_add(1);
+
+    let cursor_span = Span::styled("█", Style::default().fg(args.accent).bg(fill));
     let mut spans: Vec<Span> = Vec::with_capacity(4);
     if args.text.is_empty() {
         if args.field_focused {
@@ -1296,10 +1378,11 @@ fn render_input_box(buf: &mut Buffer, args: InputBoxArgs) -> Rect {
             args.placeholder.to_string(),
             Style::default()
                 .fg(Color::Rgb(0x6c, 0x7d, 0x9c))
+                .bg(fill)
                 .add_modifier(Modifier::ITALIC),
         ));
     } else {
-        let plain = Style::default().fg(Color::White);
+        let plain = Style::default().fg(Color::White).bg(fill);
         let selected = Style::default()
             .fg(Color::White)
             .bg(Color::Rgb(0x26, 0x4f, 0x78));
@@ -1319,8 +1402,18 @@ fn render_input_box(buf: &mut Buffer, args: InputBoxArgs) -> Rect {
             spans.push(cursor_span);
         }
     }
-    buf.set_line(content.x, content.y, &Line::from(spans), content.width);
-    content
+    if text_w > 0 {
+        buf.set_line(text_x, args.y, &Line::from(spans), text_w);
+    }
+
+    // Hit rect: bar + editable span, excluding reserved control cells so the
+    // query toggles (checked after `field_at`) still receive their clicks.
+    Rect {
+        x: args.bar_x,
+        y: args.y,
+        width: text_right.saturating_sub(args.bar_x).saturating_add(1),
+        height: 1,
+    }
 }
 
 impl Widget for &mut SearchPanel {
@@ -1355,9 +1448,8 @@ impl Widget for &mut SearchPanel {
             return;
         }
 
-        // Row 0: "SEARCH" header, top-left, light grey. Replaces the old
-        // dark-blue title chip on the outer border, matching the VS Code
-        // mockup the user supplied.
+        // Row 0: "SEARCH" header (top-left) plus the VS Code SEARCH header
+        // actions (refresh / clear) at the top-right.
         buf.set_string(
             inner.x,
             inner.y,
@@ -1367,38 +1459,69 @@ impl Widget for &mut SearchPanel {
                 .add_modifier(Modifier::BOLD),
         );
 
-        if inner.height < 4 {
+        // Header action icons, laid out from the right edge: clear (rightmost)
+        // then refresh, each a single-cell click target that lifts to the accent
+        // on hover. Only drawn when the panel is wide enough to clear the label.
+        self.refresh_x = 0;
+        self.refresh_y = inner.y;
+        self.clear_x = 0;
+        self.clear_y = inner.y;
+        if inner.width > 16 {
+            let clear_x = inner.x + inner.width - 1;
+            let refresh_x = clear_x - 3;
+            for (x, glyph) in [
+                (refresh_x, crate::icons::SEARCH_REFRESH),
+                (clear_x, crate::icons::SEARCH_CLEAR_ALL),
+            ] {
+                let hot = self
+                    .hover_pointer
+                    .is_some_and(|(px, py)| py == inner.y && px == x);
+                let color = if hot {
+                    accent
+                } else {
+                    Color::Rgb(0x8b, 0x94, 0xa4)
+                };
+                buf.set_string(x, inner.y, glyph.to_string(), Style::default().fg(color));
+            }
+            self.refresh_x = refresh_x;
+            self.clear_x = clear_x;
+        }
+
+        // Below this the panel cannot host the header + a field row, or is too
+        // narrow for the chevron column + a field bar + lead glyph + content.
+        if inner.height < 4 || inner.width < 8 {
             return;
         }
 
-        // ---- Query row geometry ----
-        // A chevron on the left (▸ collapsed / ▾ expanded, toggles the Replace
-        // row), a 3-row query box, then to its right the `Aa │ ab │ .*` toggles
-        // and finally the `...` ellipsis that expands the include/exclude rows.
-        let toggles_inner_w: u16 = 2 + 3 + 2 + 3 + 2; // "Aa" + " │ " + "ab" + " │ " + ".*"
-        let chevron_w: u16 = 2; // chevron + 1-cell gap
-        const TOGGLE_GAP: u16 = 1;
-        let ellipsis_w: u16 = 1; // the "..." glyph
-        // Reserve room on the right for: gap + toggles + gap + ellipsis + gap.
-        let right_cluster_w = TOGGLE_GAP + toggles_inner_w + TOGGLE_GAP + ellipsis_w + TOGGLE_GAP;
-        let input_top_y = inner.y + 2;
-        let content_y = input_top_y + 1;
+        // ---- Field cluster geometry ----
+        // VS Code / Zed model: each input is a single filled row, never a 3-row
+        // box. A chevron sits at the far left (toggles the Replace row); every
+        // field is indented two cells past it so the chevron column stays clear.
+        // The query row's `Aa ab .*` toggles are inset INSIDE the field at its
+        // right edge (VS Code's `.controls`), and the `...` details expander
+        // sits in the rightmost cell, just past the field.
+        let bg = self.theme.editor_bg_rgb();
         let chevron_x = inner.x;
-        let input_x = chevron_x + chevron_w;
-        let toggles_x = inner.x.saturating_add(
-            inner
-                .width
-                .saturating_sub(right_cluster_w)
-                .saturating_add(TOGGLE_GAP),
-        );
-        let ellipsis_x = inner.x + inner.width.saturating_sub(TOGGLE_GAP + ellipsis_w);
-        let input_w = toggles_x
-            .saturating_sub(input_x)
-            .saturating_sub(TOGGLE_GAP)
-            .max(8);
+        let bar_x = inner.x + 2; // left edge of every field's fill bar
+        let inner_right = inner.x + inner.width - 1; // last usable column
+        let content_y = inner.y + 2; // one blank row below the header
 
-        // Expand chevron (left of the query box). ▾ when the Replace row is
-        // open, ▸ when collapsed — VS Code's expand-to-replace affordance.
+        // The `...` details expander occupies the rightmost cell of the query
+        // row; the query field's fill ends two cells short of it.
+        let ellipsis_x = inner_right;
+        let query_fill_right = ellipsis_x.saturating_sub(2);
+
+        // Inset toggles, right-aligned inside the query fill with a 1-cell pad.
+        // Each glyph is two cells; one-cell gaps separate them. `toggle_at` keys
+        // off these stored columns, so the layout must match cell-for-cell.
+        let regex_x = query_fill_right.saturating_sub(2); // 1-cell pad + 2-cell glyph
+        let word_x = regex_x.saturating_sub(3);
+        let case_x = word_x.saturating_sub(3);
+        // Cells the query field reserves on its right so its text never slides
+        // under the toggles: from the first toggle column to the fill edge.
+        let query_reserve = query_fill_right.saturating_sub(case_x).saturating_add(1);
+
+        // Expand chevron (far left). ▾ when Replace is open, ▸ when collapsed.
         let chevron_color = if self.focused {
             accent
         } else {
@@ -1420,40 +1543,47 @@ impl Widget for &mut SearchPanel {
         self.chevron_x = chevron_x;
         self.chevron_y = content_y;
 
-        // Query input box.
+        // Query field: filled single row, magnifier lead, inset toggles.
         let query_focused = self.focused && self.field == SearchField::Query;
-        let query_content = render_input_box(
+        self.query_input_rect = render_field(
             buf,
-            InputBoxArgs {
-                rect: Rect {
-                    x: input_x,
-                    y: input_top_y,
-                    width: input_w,
-                    height: 3,
-                },
+            FieldArgs {
+                bar_x,
+                y: content_y,
+                fill_right: query_fill_right,
                 lead_glyph: Some("\u{ea6d}"),
                 text: &self.query,
                 placeholder: "Search",
                 selection: self.selection_range(),
                 field_focused: query_focused,
                 accent,
+                bg,
+                reserve_right: query_reserve,
             },
         );
-        self.query_input_rect = query_content;
 
-        // Toggles cluster `Aa │ ab │ .*` on the query content row.
+        // Inset toggles `Aa ab .*`, painted on top of the query fill at its
+        // right edge. Active = a muted accent chip (standing in for VS Code's
+        // translucent `inputOption.activeBackground`); inactive = a dim glyph
+        // sitting on the same fill so the chips read as part of the field.
         self.paste_button_x = 0;
         self.paste_button_y = content_y;
         self.paste_button_w = 0;
+        let toggle_fill = lift_bg(
+            bg,
+            if query_focused {
+                FIELD_FILL_LIFT_FOCUS
+            } else {
+                FIELD_FILL_LIFT_IDLE
+            },
+        );
         let active_style = Style::default()
-            .fg(Color::Black)
-            .bg(Color::Rgb(0xff, 0xd7, 0x4a))
+            .fg(Color::White)
+            .bg(crate::gradient::rgb_color(crate::gradient::POPUP_SEL_BG))
             .add_modifier(Modifier::BOLD);
-        let inactive_style = Style::default().fg(Color::Rgb(0x9d, 0xa5, 0xb4));
-        let pipe_style = Style::default().fg(Color::Rgb(0x60, 0x68, 0x78));
-        let case_x = toggles_x;
-        let word_x = case_x + 2 + 3;
-        let regex_x = word_x + 2 + 3;
+        let inactive_style = Style::default()
+            .fg(Color::Rgb(0x79, 0x82, 0x8f))
+            .bg(toggle_fill);
         self.toggle_y = content_y;
         self.toggle_case_x = case_x;
         self.toggle_word_x = word_x;
@@ -1466,15 +1596,12 @@ impl Widget for &mut SearchPanel {
             let style = if active { active_style } else { inactive_style };
             buf.set_string(x, content_y, glyph, style);
         }
-        buf.set_string(case_x + 2 + 1, content_y, "│", pipe_style);
-        buf.set_string(word_x + 2 + 1, content_y, "│", pipe_style);
 
-        // `...` ellipsis toggle (expands include/exclude). Highlighted when the
-        // detail rows are open so the active state reads at a glance.
+        // `...` details expander, just past the query field. Accent when open.
         let ellipsis_style = if self.details_open {
             Style::default().fg(accent).add_modifier(Modifier::BOLD)
         } else {
-            inactive_style
+            Style::default().fg(Color::Rgb(0x79, 0x82, 0x8f))
         };
         buf.set_string(
             ellipsis_x,
@@ -1486,25 +1613,24 @@ impl Widget for &mut SearchPanel {
         self.ellipsis_y = content_y;
 
         // ---- Optional Replace row ----
-        // `next_y` tracks the top of the next 3-row box as optional rows stack.
-        let mut next_y = input_top_y + 3;
+        // `next_y` tracks the next content row as optional fields stack. Each is
+        // now a single row, so the cluster is far shorter than the old boxes.
+        let mut next_y = content_y + 1;
         self.replace_input_rect = Rect::default();
         self.replace_all_x = 0;
         self.replace_all_y = 0;
-        if self.replace_open && next_y + 3 <= inner.y + inner.height {
-            // The replace box is indented under the query box (aligned with it)
-            // and leaves room on the right for the replace-all action icon.
-            let replace_box_w = input_w;
+        if self.replace_open && next_y < inner.y + inner.height {
+            // The replace-all action icon sits at the far right (under the ...),
+            // and the replace fill ends two cells short of it.
+            let replace_all_x = inner_right;
+            let replace_fill_right = replace_all_x.saturating_sub(2).max(bar_x + 1);
             let replace_focused = self.focused && self.field == SearchField::Replace;
-            let replace_content = render_input_box(
+            self.replace_input_rect = render_field(
                 buf,
-                InputBoxArgs {
-                    rect: Rect {
-                        x: input_x,
-                        y: next_y,
-                        width: replace_box_w,
-                        height: 3,
-                    },
+                FieldArgs {
+                    bar_x,
+                    y: next_y,
+                    fill_right: replace_fill_right,
                     lead_glyph: Some(&crate::icons::SEARCH_REPLACE.to_string()),
                     text: &self.replace,
                     placeholder: "Replace",
@@ -1515,15 +1641,13 @@ impl Widget for &mut SearchPanel {
                     },
                     field_focused: replace_focused,
                     accent,
+                    bg,
+                    reserve_right: 0,
                 },
             );
-            self.replace_input_rect = replace_content;
-            // Replace-all action icon to the right of the replace box, aligned
-            // with the toggles column on the query row.
-            let ra_y = next_y + 1;
             buf.set_string(
-                toggles_x,
-                ra_y,
+                replace_all_x,
+                next_y,
                 crate::icons::SEARCH_REPLACE_ALL.to_string(),
                 Style::default().fg(if self.focused {
                     accent
@@ -1531,30 +1655,34 @@ impl Widget for &mut SearchPanel {
                     Color::Rgb(0x9d, 0xa5, 0xb4)
                 }),
             );
-            self.replace_all_x = toggles_x;
-            self.replace_all_y = ra_y;
-            next_y += 3;
+            self.replace_all_x = replace_all_x;
+            self.replace_all_y = next_y;
+            next_y += 1;
         }
 
         // ---- Optional files-to-include / files-to-exclude rows ----
+        // VS Code stacks an 11px caption above each thin field rather than using
+        // placeholder-as-label, so each detail field is a caption row over a
+        // single filled field.
         self.include_input_rect = Rect::default();
         self.exclude_input_rect = Rect::default();
         if self.details_open {
-            let detail_w = ellipsis_x.saturating_sub(input_x).max(8);
-            if next_y + 3 <= inner.y + inner.height {
+            let detail_fill_right = inner_right.saturating_sub(1).max(bar_x + 1);
+            let caption_style = Style::default().fg(Color::Rgb(0x9d, 0xa5, 0xb4));
+
+            if next_y + 1 < inner.y + inner.height {
+                buf.set_string(bar_x, next_y, "files to include", caption_style);
+                next_y += 1;
                 let inc_focused = self.focused && self.field == SearchField::Include;
-                let inc = render_input_box(
+                self.include_input_rect = render_field(
                     buf,
-                    InputBoxArgs {
-                        rect: Rect {
-                            x: input_x,
-                            y: next_y,
-                            width: detail_w,
-                            height: 3,
-                        },
+                    FieldArgs {
+                        bar_x,
+                        y: next_y,
+                        fill_right: detail_fill_right,
                         lead_glyph: None,
                         text: &self.include,
-                        placeholder: "files to include",
+                        placeholder: "e.g. src/**/*.rs",
                         selection: if self.field == SearchField::Include {
                             self.active_selection()
                         } else {
@@ -1562,25 +1690,25 @@ impl Widget for &mut SearchPanel {
                         },
                         field_focused: inc_focused,
                         accent,
+                        bg,
+                        reserve_right: 0,
                     },
                 );
-                self.include_input_rect = inc;
-                next_y += 3;
+                next_y += 1;
             }
-            if next_y + 3 <= inner.y + inner.height {
+            if next_y + 1 < inner.y + inner.height {
+                buf.set_string(bar_x, next_y, "files to exclude", caption_style);
+                next_y += 1;
                 let exc_focused = self.focused && self.field == SearchField::Exclude;
-                let exc = render_input_box(
+                self.exclude_input_rect = render_field(
                     buf,
-                    InputBoxArgs {
-                        rect: Rect {
-                            x: input_x,
-                            y: next_y,
-                            width: detail_w,
-                            height: 3,
-                        },
+                    FieldArgs {
+                        bar_x,
+                        y: next_y,
+                        fill_right: detail_fill_right,
                         lead_glyph: None,
                         text: &self.exclude,
-                        placeholder: "files to exclude",
+                        placeholder: "e.g. target, dist",
                         selection: if self.field == SearchField::Exclude {
                             self.active_selection()
                         } else {
@@ -1588,10 +1716,11 @@ impl Widget for &mut SearchPanel {
                         },
                         field_focused: exc_focused,
                         accent,
+                        bg,
+                        reserve_right: 0,
                     },
                 );
-                self.exclude_input_rect = exc;
-                next_y += 3;
+                next_y += 1;
             }
         }
 
@@ -1860,13 +1989,14 @@ mod tests {
         assert_eq!(panel.selected, 0);
     }
 
-    /// New layout x-offset for the typed-content cell, relative to
-    /// `inner.x`: 2-cell chevron column + 1 input-box left border +
-    /// 2-cell magnifier glyph (codicon + 1 cell gap) = 5.
+    /// Layout x-offset for the typed-content cell, relative to `inner.x`:
+    /// chevron (1) + gap (1) + field bar (1) + 2-cell magnifier glyph
+    /// (codicon + 1 cell gap) = 5.
     const INPUT_TYPED_COL: u16 = 5;
-    /// New layout y-offset for the input content row, relative to
-    /// `inner.y`: header + blank + top border + content = 3.
-    const INPUT_CONTENT_ROW: u16 = 3;
+    /// Layout y-offset for the input content row, relative to `inner.y`:
+    /// header + blank + content = 2. The single filled field has no top
+    /// border row, so the query sits one row higher than the old 3-row box.
+    const INPUT_CONTENT_ROW: u16 = 2;
 
     #[test]
     fn cursor_sits_at_input_start_when_query_empty_and_focused() {
@@ -2773,17 +2903,19 @@ mod tests {
     fn move_down_past_bottom_of_viewport_advances_scroll_to_keep_selection_visible() {
         let tmp = TempDir::new().unwrap();
         let mut panel = make_panel_with_hits(&tmp, 100);
-        // Pretend a 30-row panel was rendered: viewport = 30 - 7 = 23 rows.
+        // Pretend a 30-row panel was rendered: viewport = 30 - 5 = 25 rows
+        // (the single-row query field starts results two rows higher than the
+        // old 3-row box did).
         panel.last_inner = Rect {
             x: 0,
             y: 0,
             width: 60,
             height: 30,
         };
-        panel.selected = 22;
+        panel.selected = 24;
         panel.scroll = 0;
         panel.move_down();
-        assert_eq!(panel.selected, 23);
+        assert_eq!(panel.selected, 25);
         assert_eq!(
             panel.scroll, 1,
             "arrow-down past the bottom row must scroll to keep selection visible"
@@ -3174,12 +3306,13 @@ mod tests {
             "expanding replace + include/exclude must push results down (was {collapsed_offset}, now {})",
             panel.results_start_offset
         );
-        // 3 extra rows for replace + 3 + 3 for include/exclude = 9 rows.
-        assert_eq!(panel.results_start_offset, collapsed_offset + 9);
+        // Single-row fields: 1 extra row for replace, plus a caption+field (2)
+        // each for include and exclude = 5 rows.
+        assert_eq!(panel.results_start_offset, collapsed_offset + 5);
     }
 
     #[test]
-    fn collapsed_panel_keeps_legacy_results_offset_of_seven() {
+    fn collapsed_panel_results_offset_is_five() {
         use ratatui::buffer::Buffer;
         let tmp = TempDir::new().unwrap();
         let mut panel = SearchPanel::new(tmp.path().to_path_buf());
@@ -3191,9 +3324,12 @@ mod tests {
         };
         let mut buf = Buffer::empty(area);
         ratatui::widgets::Widget::render(&mut panel, area, &mut buf);
+        // header(0) + blank(1) + query(2) + separator(3) + caption(4) → results
+        // begin at row 5. The single-row query field saves two rows versus the
+        // old 3-row box (which started results at 7).
         assert_eq!(
-            panel.results_start_offset, 7,
-            "with replace/details collapsed the layout matches the original 7-row offset"
+            panel.results_start_offset, 5,
+            "collapsed layout starts results at the 5-row offset"
         );
     }
 }

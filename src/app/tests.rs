@@ -8341,9 +8341,9 @@ fn double_clicking_a_search_hit_pins_the_tab_so_the_next_hit_opens_beside_it() {
         width: 58,
         height: 18,
     };
-    // Result rows start 7 rows below the inner top (header + input box +
-    // separator + caption), matching SearchPanel::hit_at_y.
-    let first_hit_row = app.search.last_inner.y + 7;
+    // Result rows start 5 rows below the inner top (header + blank + single-row
+    // query field + separator + caption), matching SearchPanel::hit_at_y.
+    let first_hit_row = app.search.last_inner.y + 5;
     let click = |row: u16| crossterm::event::MouseEvent {
         kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
         column: 5,

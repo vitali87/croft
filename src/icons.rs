@@ -57,6 +57,17 @@ pub const SEARCH_REPLACE: char = '\u{eb3d}';
 /// Codicon `ellipsis` — the "..." toggle VS Code uses to expand the
 /// "files to include" / "files to exclude" rows. U+EA7C (decimal 60028).
 pub const SEARCH_ELLIPSIS: char = '\u{ea7c}';
+/// Codicon `refresh` — the circular-arrow glyph VS Code paints on the
+/// SEARCH header's "Refresh" action (re-run the current query). Verified on
+/// 2026-06-19 against the upstream codicon `mapping.json`: refresh = **U+EB37**
+/// (decimal 60215).
+pub const SEARCH_REFRESH: char = '\u{eb37}';
+/// Codicon `clear-all` — the stacked-lines-with-x glyph VS Code paints on the
+/// SEARCH header's "Clear Search Results" action. Verified on 2026-06-19
+/// against the upstream codicon `mapping.json`: clear-all = **U+EABF**
+/// (decimal 60095). Do NOT use U+EB80 (a popular but wrong value floated by
+/// secondary sources); that codepoint is not clear-all in the upstream map.
+pub const SEARCH_CLEAR_ALL: char = '\u{eabf}';
 
 /// Codicon `gear` (a.k.a. `settings-gear`) — the cogwheel VS Code uses for
 /// its bottom-left "Manage" button. Verified against the Nerd Fonts CSS
@@ -335,6 +346,20 @@ mod tests {
         // The "..." toggle that expands files-to-include/exclude is codicon
         // `ellipsis` U+EA7C (decimal 60028), verified 2026-06-19.
         assert_eq!(SEARCH_ELLIPSIS, '\u{ea7c}');
+    }
+
+    #[test]
+    fn search_header_action_glyphs_match_upstream_codicons() {
+        // Verified 2026-06-19 against microsoft/vscode-codicons mapping.json:
+        //   refresh   = 60215 = U+EB37
+        //   clear-all = 60095 = U+EABF  (NOT U+EB80, a wrong value from
+        //                                secondary sources)
+        assert_eq!(SEARCH_REFRESH, '\u{eb37}');
+        assert_eq!(SEARCH_CLEAR_ALL, '\u{eabf}');
+        assert_ne!(
+            SEARCH_CLEAR_ALL, '\u{eb80}',
+            "U+EB80 is not codicon clear-all"
+        );
     }
 
     #[test]
