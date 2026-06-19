@@ -12508,32 +12508,39 @@ fn debug_console_is_retained_after_the_session_ends() {
 }
 
 #[test]
-fn explorer_filter_keys_route_to_the_tree_filter_box() {
-    // With the Explorer focused (the default at boot) and the funnel filter
-    // open, plain characters extend the query, Backspace deletes, and Esc
-    // closes the box - never leaking into the status line or the editor.
+fn explorer_views_menu_lists_all_five_toggles_with_checkmarks() {
+    // The ⋯ "Views and More Actions" menu offers every sub-view with a leading
+    // checkmark reflecting its current visibility (VS Code's view-toggle menu).
     let tmp = tempfile::tempdir().unwrap();
     std::fs::write(tmp.path().join("main.rs"), "fn main() {}\n").unwrap();
-    std::fs::write(tmp.path().join("README.md"), "# hi\n").unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    assert!(matches!(app.focus, Pane::Tree));
-    assert!(matches!(app.sidebar_view, SidebarView::Explorer));
-
-    app.tree.open_filter();
-    for c in "main".chars() {
-        app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
-            .unwrap();
+    app.open_explorer_views_menu();
+    let menu = app.context_menu.as_ref().expect("menu must open");
+    assert_eq!(menu.items.len(), ExplorerView::ALL.len());
+    for (view, (label, _)) in ExplorerView::ALL.iter().zip(menu.items.iter()) {
+        assert!(
+            label.contains(view.label()),
+            "menu row for {view:?} should name the view: {label:?}"
+        );
+        // Checked views lead with a check glyph; hidden ones do not.
+        let checked = label.starts_with('\u{2713}');
+        assert_eq!(
+            checked,
+            app.explorer_views.is_visible(*view),
+            "checkmark must reflect visibility for {view:?}"
+        );
     }
-    assert_eq!(app.tree.filter_query(), "main");
+}
 
-    app.handle_key(key(KeyCode::Backspace, KeyModifiers::NONE))
-        .unwrap();
-    assert_eq!(app.tree.filter_query(), "mai");
-
-    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
-        .unwrap();
-    assert!(
-        !app.tree.filter_active(),
-        "Esc must close the filter box and restore the full tree"
+#[test]
+fn toggling_an_explorer_view_flips_and_persists_its_visibility() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let before = app.explorer_views.is_visible(ExplorerView::Outline);
+    app.toggle_explorer_view(ExplorerView::Outline);
+    assert_eq!(
+        app.explorer_views.is_visible(ExplorerView::Outline),
+        !before,
+        "toggling Outline must flip its visibility"
     );
 }

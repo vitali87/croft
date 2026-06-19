@@ -562,6 +562,77 @@ fn diff_text(root: &Path, args: &[&str]) -> Result<String, String> {
     }
 }
 
+/// One commit in a file's history, for the Explorer TIMELINE view.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileHistoryEntry {
+    pub short_hash: String,
+    pub summary: String,
+    pub author: String,
+    /// Seconds elapsed since the commit time, for [`humanize_age`].
+    pub age_secs: i64,
+}
+
+/// Recent commits touching `rel_path`, newest first, via `git log --follow`
+/// (so the history survives renames, like VS Code's Timeline). Returns an
+/// empty vec when the path is untracked, the repo has no history, or git is
+/// unavailable — the panel renders that as an empty state, never an error.
+pub fn file_history(root: &Path, rel_path: &str, limit: usize) -> Vec<FileHistoryEntry> {
+    let Some(path_str) = root.to_str() else {
+        return Vec::new();
+    };
+    let output = Command::new("git")
+        .args([
+            "-C",
+            path_str,
+            "log",
+            "--follow",
+            &format!("-n{limit}"),
+            "--format=%h\x1f%s\x1f%an\x1f%ct",
+            "--",
+            rel_path,
+        ])
+        .output();
+    let Ok(output) = output else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    parse_file_history(
+        &String::from_utf8_lossy(&output.stdout),
+        current_unix_seconds(),
+    )
+}
+
+/// Parse the `%h\x1f%s\x1f%an\x1f%ct` lines emitted by [`file_history`] into
+/// entries, computing each commit's age relative to `now` (unix seconds).
+pub fn parse_file_history(out: &str, now: i64) -> Vec<FileHistoryEntry> {
+    out.lines()
+        .filter_map(|line| {
+            let mut parts = line.split('\x1f');
+            let short_hash = parts.next()?.to_string();
+            let summary = parts.next()?.to_string();
+            let author = parts.next()?.to_string();
+            let ct: i64 = parts.next()?.trim().parse().ok()?;
+            if short_hash.is_empty() {
+                return None;
+            }
+            Some(FileHistoryEntry {
+                short_hash,
+                summary,
+                author,
+                age_secs: now - ct,
+            })
+        })
+        .collect()
+}
+
+/// Raw `git show <hash> -- <rel_path>` text: the file's diff in that commit,
+/// for opening a TIMELINE entry in the side-by-side diff viewer.
+pub fn show_commit_file_diff(root: &Path, hash: &str, rel_path: &str) -> Result<String, String> {
+    diff_text(root, &["show", hash, "--", rel_path])
+}
+
 /// Repo's default branch name. Tries `origin/HEAD` first (set by
 /// `git clone` / `git remote set-head -a origin`), then falls back to
 /// common local names (`main`, `master`, `develop`, `trunk`) by checking
@@ -1974,6 +2045,41 @@ mod tests {
         assert!(
             out.contains("+three"),
             "diff vs branch must include the new +three line: {out}"
+        );
+    }
+
+    #[test]
+    fn parse_file_history_splits_fields_and_computes_age() {
+        // Two commits, newest first, in the %h\x1f%s\x1f%an\x1f%ct format.
+        let now = 10_000i64;
+        let out = "abc123\x1ffix: thing\x1fvitali87\x1f9_996\n\
+                   def456\x1ffeat: thing\x1falice\x1f7600"
+            .replace('_', "");
+        let entries = parse_file_history(&out, now);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].short_hash, "abc123");
+        assert_eq!(entries[0].summary, "fix: thing");
+        assert_eq!(entries[0].author, "vitali87");
+        assert_eq!(
+            entries[0].age_secs, 4,
+            "now (10000) minus commit time (9996)"
+        );
+        assert_eq!(entries[1].age_secs, 2400);
+        // A summary containing the field separator is impossible (git emits the
+        // literal subject), but a malformed line missing fields is dropped.
+        assert!(parse_file_history("oops-no-fields", now).is_empty());
+    }
+
+    #[test]
+    fn file_history_returns_real_commits_for_a_tracked_file() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        init_repo_with_commit(p);
+        // init_repo_with_commit commits seed.txt; its history has >=1 entry.
+        let hist = file_history(p, "seed.txt", 10);
+        assert!(
+            !hist.is_empty(),
+            "a committed file must have at least one history entry"
         );
     }
 }

@@ -32,9 +32,11 @@ pub const NEW_FOLDER_GLYPH: char = '\u{ea80}';
 /// Codicon `cod-collapse_all` — the stacked-rows-with-minus glyph for
 /// "Collapse Folders in Explorer". Nerd Fonts `cod-collapse_all` = U+EAC5.
 pub const COLLAPSE_ALL_GLYPH: char = '\u{eac5}';
-/// Codicon `cod-filter` — the funnel glyph VS Code paints on a list/tree's
-/// "Filter" action. Nerd Fonts `cod-filter` = U+EAF1.
-pub const FILTER_GLYPH: char = '\u{eaf1}';
+/// The "Views and More Actions" (⋯) affordance VS Code paints at the right of
+/// a view-container header. A plain horizontal ellipsis (U+2026) rather than a
+/// codicon PUA glyph, so it renders on every terminal/font — the same
+/// no-codicon-dependency reasoning behind the U+2715 close glyph.
+pub const MORE_GLYPH: char = '\u{2026}';
 
 /// Paint a header pill button at cell `(x, y)`. `brand` is true under the
 /// Black theme: a chipless teal icon in the VS Code toolbar spirit that grows

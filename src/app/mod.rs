@@ -46,13 +46,16 @@ use welcome::WelcomeState;
 use crate::widgets::{
     editor::{Editor, EditorTabs},
     file_tree::FileTree,
+    open_editors::{OpenEditorItem, OpenEditorsPanel},
     outline::OutlinePanel,
     remote::RemotePanel,
     run_debug::RunDebugPanel,
+    rust_deps::{RustDep, RustDepsPanel},
     search::{SearchPanel, SearchRequest},
     source_control::SourceControlPanel,
     system_panel::SystemPanel,
     terminal::PtyTerminal,
+    timeline::TimelinePanel,
 };
 
 /// Which sidebar view is active in the left side panel.
@@ -63,6 +66,82 @@ pub enum SidebarView {
     SourceControl,
     Remote,
     RunDebug,
+}
+
+/// The toggleable sub-views stacked inside the Explorer side panel, mirroring
+/// VS Code's "Views and More Actions" (⋯) menu on the EXPLORER header. Ordered
+/// top-to-bottom exactly as they stack in the panel.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ExplorerView {
+    OpenEditors,
+    Folders,
+    Outline,
+    Timeline,
+    RustDependencies,
+}
+
+impl ExplorerView {
+    /// Every view, in stacking order — the order the ⋯ menu lists them.
+    pub const ALL: [ExplorerView; 5] = [
+        ExplorerView::OpenEditors,
+        ExplorerView::Folders,
+        ExplorerView::Outline,
+        ExplorerView::Timeline,
+        ExplorerView::RustDependencies,
+    ];
+
+    /// Menu / section-header label, matching VS Code's wording.
+    pub fn label(self) -> &'static str {
+        match self {
+            ExplorerView::OpenEditors => "Open Editors",
+            ExplorerView::Folders => "Folders",
+            ExplorerView::Outline => "Outline",
+            ExplorerView::Timeline => "Timeline",
+            ExplorerView::RustDependencies => "Rust Dependencies",
+        }
+    }
+}
+
+/// Which Explorer sub-views are shown, toggled from the ⋯ menu. Wraps the
+/// persisted [`crate::prefs::ExplorerViewsPrefs`] so the app can query/flip a
+/// view by its [`ExplorerView`] without touching the serde struct's fields
+/// directly.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct ExplorerViewVisibility {
+    flags: crate::prefs::ExplorerViewsPrefs,
+}
+
+impl ExplorerViewVisibility {
+    fn from_prefs(flags: crate::prefs::ExplorerViewsPrefs) -> Self {
+        Self { flags }
+    }
+
+    fn as_prefs(self) -> crate::prefs::ExplorerViewsPrefs {
+        self.flags
+    }
+
+    pub fn is_visible(&self, view: ExplorerView) -> bool {
+        match view {
+            ExplorerView::OpenEditors => self.flags.open_editors,
+            ExplorerView::Folders => self.flags.folders,
+            ExplorerView::Outline => self.flags.outline,
+            ExplorerView::Timeline => self.flags.timeline,
+            ExplorerView::RustDependencies => self.flags.rust_dependencies,
+        }
+    }
+
+    /// Flip one view's visibility, returning the new state.
+    pub fn toggle(&mut self, view: ExplorerView) -> bool {
+        let slot = match view {
+            ExplorerView::OpenEditors => &mut self.flags.open_editors,
+            ExplorerView::Folders => &mut self.flags.folders,
+            ExplorerView::Outline => &mut self.flags.outline,
+            ExplorerView::Timeline => &mut self.flags.timeline,
+            ExplorerView::RustDependencies => &mut self.flags.rust_dependencies,
+        };
+        *slot = !*slot;
+        *slot
+    }
 }
 
 /// The clickable icons on the activity bar, used to track which one the
@@ -581,6 +660,10 @@ enum MenuAction {
     /// Theme picker entry: switch the IDE color theme to `theme`, persist it,
     /// re-emit the session background, and re-bake the icon images.
     SetTheme(crate::theme::Theme),
+    /// Explorer "Views and More Actions" (⋯) entry: flip the visibility of one
+    /// stacked sub-view (Open Editors / Folders / Outline / Timeline / Rust
+    /// Dependencies) and persist the choice.
+    ToggleExplorerView(ExplorerView),
 }
 
 /// Return the macOS-style keyboard shortcut hint to display on the right
@@ -957,9 +1040,33 @@ pub struct App {
     pub remote: RemotePanel,
     pub source_control: SourceControlPanel,
     pub run_debug: RunDebugPanel,
+    /// The Explorer's OPEN EDITORS section: the open editor tabs, projected
+    /// from `editor`/`editor_split` each frame. See [`OpenEditorsPanel`].
+    pub open_editors: OpenEditorsPanel,
     /// The Explorer's OUTLINE section, stacked below the file tree: the active
     /// editor's `documentSymbol` tree. See [`OutlinePanel`].
     pub outline: OutlinePanel,
+    /// The Explorer's TIMELINE section: the active file's git history, fetched
+    /// off-thread via [`crate::git::file_history`]. See [`TimelinePanel`].
+    pub timeline: TimelinePanel,
+    /// The Explorer's RUST DEPENDENCIES section: the workspace's resolved crate
+    /// set, fetched off-thread via `cargo metadata`. See [`RustDepsPanel`].
+    pub rust_deps: RustDepsPanel,
+    /// Which Explorer sub-views are shown, toggled from the ⋯ menu. Persisted.
+    pub explorer_views: ExplorerViewVisibility,
+    /// Background `git log` results for the TIMELINE, keyed by the file they
+    /// describe so a stale reply for a since-closed file is ignored on drain.
+    timeline_rx: std::sync::mpsc::Receiver<(PathBuf, Vec<crate::git::FileHistoryEntry>)>,
+    timeline_tx: std::sync::mpsc::Sender<(PathBuf, Vec<crate::git::FileHistoryEntry>)>,
+    /// The file the TIMELINE has been fetched (or is being fetched) for, so the
+    /// fetch fires exactly once per active-file change.
+    timeline_fetched: Option<PathBuf>,
+    /// Background `cargo metadata` result for RUST DEPENDENCIES.
+    rust_deps_rx: std::sync::mpsc::Receiver<Vec<RustDep>>,
+    rust_deps_tx: std::sync::mpsc::Sender<Vec<RustDep>>,
+    /// The workspace root RUST DEPENDENCIES was fetched for, so the fetch fires
+    /// once per root (re-fired by Make Root / re-root).
+    rust_deps_fetched: Option<PathBuf>,
     pub system_panel: SystemPanel,
     pub editor: EditorTabs,
     /// The secondary editor group, shown side by side with `editor` when
@@ -1032,6 +1139,11 @@ pub struct App {
     /// is not a focusable `Pane`, so it gets its own drag latch rather than
     /// riding `scrollbar_drag`.
     outline_scrollbar_drag: bool,
+    /// Scrollbar-thumb drag latches for the other stacked Explorer sub-views,
+    /// matching `outline_scrollbar_drag` (none is a focusable `Pane`).
+    open_editors_scrollbar_drag: bool,
+    timeline_scrollbar_drag: bool,
+    rust_deps_scrollbar_drag: bool,
     welcome: WelcomeState,
     /// Channel to the background search worker. Each keystroke or toggle
     /// flip pushes a `(query, opts)` request here; the worker debounces
@@ -1578,6 +1690,14 @@ impl App {
         let source_control = SourceControlPanel::new();
         let run_debug = RunDebugPanel::new();
         let outline = OutlinePanel::new();
+        let open_editors = OpenEditorsPanel::new();
+        let timeline = TimelinePanel::new();
+        let rust_deps = RustDepsPanel::new();
+        let explorer_views = ExplorerViewVisibility::from_prefs(
+            crate::prefs::Prefs::load_or_default().explorer_views,
+        );
+        let (timeline_tx, timeline_rx) = std::sync::mpsc::channel();
+        let (rust_deps_tx, rust_deps_rx) = std::sync::mpsc::channel();
         let editor = EditorTabs::new();
         let term = PtyTerminal::new(&root).context("spawning terminal")?;
 
@@ -1624,6 +1744,16 @@ impl App {
             source_control,
             run_debug,
             outline,
+            open_editors,
+            timeline,
+            rust_deps,
+            explorer_views,
+            timeline_rx,
+            timeline_tx,
+            timeline_fetched: None,
+            rust_deps_rx,
+            rust_deps_tx,
+            rust_deps_fetched: None,
             system_panel: {
                 let mut p = SystemPanel::new();
                 // Pre-existing app/SC tests assume the sidebar column
@@ -1683,6 +1813,9 @@ impl App {
             scrollbar_drag: None,
             editor_hscrollbar_drag: false,
             outline_scrollbar_drag: false,
+            open_editors_scrollbar_drag: false,
+            timeline_scrollbar_drag: false,
+            rust_deps_scrollbar_drag: false,
             welcome,
             search_query_tx,
             search_results_rx,
@@ -3399,6 +3532,131 @@ impl App {
         self.outline.follow_caret(self.editor.cursor_row as u32)
     }
 
+    /// Keep the Explorer's non-OUTLINE stacked sub-views current: re-project the
+    /// OPEN EDITORS list from the tabs, kick off the TIMELINE / RUST DEPENDENCIES
+    /// background fetches when their input (active file / workspace root) changed,
+    /// and drain any worker replies. Returns whether anything changed, so the
+    /// main loop only repaints when it must. All the heavy work (`git log`,
+    /// `cargo metadata`) runs on spawned threads — never on this tick.
+    fn sync_explorer_panels(&mut self) -> bool {
+        let mut changed = false;
+
+        // --- OPEN EDITORS: a pure projection of the focused group's tabs. ---
+        let active = self.editor.active_index();
+        let items: Vec<OpenEditorItem> = self
+            .editor
+            .iter_tabs()
+            .enumerate()
+            .filter_map(|(i, ed)| {
+                ed.path.as_ref().map(|p| OpenEditorItem {
+                    path: p.clone(),
+                    name: p
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| p.display().to_string()),
+                    dirty: ed.dirty,
+                    active: i == active,
+                })
+            })
+            .collect();
+        changed |= self.open_editors.set_items(items);
+
+        // --- TIMELINE: git history of the active file, fetched off-thread. ---
+        if self.explorer_views.is_visible(ExplorerView::Timeline) {
+            match self.editor.path.clone() {
+                Some(path) => {
+                    if self.timeline_fetched.as_ref() != Some(&path) {
+                        self.timeline_fetched = Some(path.clone());
+                        self.timeline.begin_loading(path.clone());
+                        changed = true;
+                        if let Ok(rel) = path.strip_prefix(&self.tree.root) {
+                            let root = self.tree.root.clone();
+                            let rel = rel.to_string_lossy().into_owned();
+                            let tx = self.timeline_tx.clone();
+                            std::thread::spawn(move || {
+                                let entries = crate::git::file_history(&root, &rel, 50);
+                                let _ = tx.send((path, entries));
+                            });
+                        }
+                    }
+                }
+                None => {
+                    if self.timeline_fetched.is_some() {
+                        self.timeline_fetched = None;
+                        self.timeline.clear();
+                        changed = true;
+                    }
+                }
+            }
+        }
+        // Drain any TIMELINE replies; ignore one for a since-closed file.
+        while let Ok((path, entries)) = self.timeline_rx.try_recv() {
+            if self.editor.path.as_deref() == Some(path.as_path()) {
+                self.timeline.set_history(path, entries);
+                changed = true;
+            }
+        }
+
+        // --- RUST DEPENDENCIES: `cargo metadata`, fetched once per root. ---
+        if self
+            .explorer_views
+            .is_visible(ExplorerView::RustDependencies)
+        {
+            let root = self.tree.root.clone();
+            if self.rust_deps_fetched.as_ref() != Some(&root) {
+                self.rust_deps_fetched = Some(root.clone());
+                let tx = self.rust_deps_tx.clone();
+                std::thread::spawn(move || {
+                    let deps = crate::widgets::rust_deps::fetch_dependencies(&root);
+                    let _ = tx.send(deps);
+                });
+            }
+        }
+        while let Ok(deps) = self.rust_deps_rx.try_recv() {
+            self.rust_deps.set_deps(deps);
+            changed = true;
+        }
+
+        changed
+    }
+
+    /// Activate the editor tab for `path` (clicked in OPEN EDITORS). The path is
+    /// already open by definition, so this selects its tab; should it have been
+    /// closed between the projection and the click, it re-opens it.
+    fn activate_open_editor(&mut self, path: PathBuf) {
+        if let Some(idx) = self.editor.find_tab_with_path(&path) {
+            self.editor.select(idx);
+        } else if self.editor.open(&path).is_err() {
+            self.status = format!("Could not open {}", path.display());
+            return;
+        }
+        self.focus_pane(Pane::Editor);
+        self.sync_open_file_poll_mtime();
+    }
+
+    /// Open the diff a TIMELINE commit introduced for `path` (`git show <hash>
+    /// -- <path>`) in a read-only side-by-side editor tab.
+    fn open_timeline_diff(&mut self, path: PathBuf, hash: String) {
+        let rel = match path.strip_prefix(&self.tree.root) {
+            Ok(r) => r.to_string_lossy().into_owned(),
+            Err(_) => path.display().to_string(),
+        };
+        match crate::git::show_commit_file_diff(&self.tree.root, &hash, &rel) {
+            Ok(raw) => {
+                let label = std::path::PathBuf::from(format!("{rel} @ {hash}"));
+                if let Err(e) = self.editor.open_git_diff_side_by_side(&label, &raw) {
+                    self.status = format!("Could not open diff: {e}");
+                    return;
+                }
+                self.focus_pane(Pane::Editor);
+                self.status = format!("Showing {rel} at {hash}");
+            }
+            Err(e) => {
+                self.status = format!("git show failed: {e}");
+            }
+        }
+    }
+
     /// Apply a `documentSymbol` reply to the OUTLINE panel, but only when its
     /// `path` is still the active editor file — a reply for a file the user
     /// navigated away from is dropped. Refreshes follow-cursor on success.
@@ -3701,6 +3959,161 @@ impl App {
             target_dir: self.workspace_root.clone(),
         });
         self.overlays.activity.mark_dirty();
+    }
+
+    /// Open the Explorer's "Views and More Actions" (⋯) menu: one row per
+    /// stacked sub-view, each prefixed with a check when currently shown.
+    /// Selecting a row toggles that view (see [`Self::toggle_explorer_view`]).
+    /// Anchored just below the ⋯ button on the EXPLORER title line; the
+    /// menu-rect clamp pulls it left so it never spills off the right edge.
+    fn open_explorer_views_menu(&mut self) {
+        let btn = self.tree.header_views_btn;
+        let origin = if btn.width > 0 {
+            (btn.x, btn.y + 1)
+        } else {
+            (self.tree.last_area.x + 1, self.tree.last_area.y + 1)
+        };
+        let items: Vec<(String, MenuAction)> = ExplorerView::ALL
+            .iter()
+            .map(|&view| {
+                let mark = if self.explorer_views.is_visible(view) {
+                    "\u{2713} "
+                } else {
+                    "  "
+                };
+                (
+                    format!("{mark}{}", view.label()),
+                    MenuAction::ToggleExplorerView(view),
+                )
+            })
+            .collect();
+        self.context_menu = Some(ContextMenu {
+            origin,
+            items,
+            selected: 0,
+            target_dir: self.workspace_root.clone(),
+        });
+    }
+
+    /// Flip one Explorer sub-view's visibility, persist the new set, and (for a
+    /// data-backed view turned on) clear its fetch latch so the next frame
+    /// re-populates it. The layout reads `explorer_views` directly, so no other
+    /// wiring is needed for the section to appear or vanish.
+    fn toggle_explorer_view(&mut self, view: ExplorerView) {
+        let now_visible = self.explorer_views.toggle(view);
+        let _ = crate::prefs::save_explorer_views(self.explorer_views.as_prefs());
+        if now_visible {
+            match view {
+                ExplorerView::Timeline => self.timeline_fetched = None,
+                ExplorerView::RustDependencies => self.rust_deps_fetched = None,
+                _ => {}
+            }
+        }
+        self.status = format!(
+            "{} {}",
+            if now_visible { "Showing" } else { "Hiding" },
+            view.label()
+        );
+    }
+
+    /// Lay out and paint the Explorer's visible stacked sub-views top-to-bottom
+    /// inside `area` (the region above the SYSTEM footer). Folders (the file
+    /// tree) is the flexible region that absorbs leftover rows; every other
+    /// visible section takes its own collapsible height, clipped so the tree
+    /// always keeps a few rows. Sections hidden via the ⋯ menu are skipped, and
+    /// their hit-test rects are zeroed so a stale click can't reach them.
+    fn render_explorer_sections(&mut self, frame: &mut ratatui::Frame, area: Rect) {
+        self.open_editors.last_area = Rect::default();
+        self.outline.last_area = Rect::default();
+        self.timeline.last_area = Rect::default();
+        self.rust_deps.last_area = Rect::default();
+
+        let folders_visible = self.explorer_views.is_visible(ExplorerView::Folders);
+        if !folders_visible {
+            // The tree isn't painted, so zero its geometry too — otherwise a
+            // click on a since-hidden row would still resolve against it.
+            self.tree.last_inner = Rect::default();
+            self.tree.last_area = Rect::default();
+        }
+        if area.height == 0 || area.width == 0 {
+            if folders_visible {
+                frame.render_widget(&mut self.tree, area);
+            }
+            return;
+        }
+
+        // Requested rows per visible section, in stacking order. Folders is a
+        // placeholder (0) here; it claims the leftover after the others.
+        let mut heights: Vec<(ExplorerView, u16)> = Vec::new();
+        for &v in &ExplorerView::ALL {
+            if !self.explorer_views.is_visible(v) {
+                continue;
+            }
+            let h = match v {
+                ExplorerView::Folders => 0,
+                ExplorerView::OpenEditors => self.open_editors.desired_height(area.height),
+                ExplorerView::Outline => self.outline.desired_height(area.height),
+                ExplorerView::Timeline => self.timeline.desired_height(area.height),
+                ExplorerView::RustDependencies => self.rust_deps.desired_height(area.height),
+            };
+            heights.push((v, h));
+        }
+        if heights.is_empty() {
+            return;
+        }
+
+        // Reserve a floor for the tree, then hand the fixed (non-Folders)
+        // sections rows in order, clipping each to what's left.
+        let total = area.height;
+        let tree_floor = if folders_visible { 3u16.min(total) } else { 0 };
+        let mut budget = total.saturating_sub(tree_floor);
+        let mut fixed_sum = 0u16;
+        for (v, h) in heights.iter_mut() {
+            if *v == ExplorerView::Folders {
+                continue;
+            }
+            let assigned = (*h).min(budget);
+            *h = assigned;
+            budget -= assigned;
+            fixed_sum += assigned;
+        }
+        if folders_visible {
+            if let Some(slot) = heights
+                .iter_mut()
+                .find(|(v, _)| *v == ExplorerView::Folders)
+            {
+                slot.1 = total.saturating_sub(fixed_sum);
+            }
+        } else {
+            // No tree to absorb slack: grow the first section to fill the gap.
+            let used: u16 = heights.iter().map(|(_, h)| *h).sum();
+            if used < total
+                && let Some(first) = heights.first_mut()
+            {
+                first.1 += total - used;
+            }
+        }
+
+        let mut y = area.y;
+        for (v, h) in heights {
+            if h == 0 {
+                continue;
+            }
+            let rect = Rect {
+                x: area.x,
+                y,
+                width: area.width,
+                height: h,
+            };
+            y = y.saturating_add(h);
+            match v {
+                ExplorerView::Folders => frame.render_widget(&mut self.tree, rect),
+                ExplorerView::OpenEditors => frame.render_widget(&mut self.open_editors, rect),
+                ExplorerView::Outline => frame.render_widget(&mut self.outline, rect),
+                ExplorerView::Timeline => frame.render_widget(&mut self.timeline, rect),
+                ExplorerView::RustDependencies => frame.render_widget(&mut self.rust_deps, rect),
+            }
+        }
     }
 
     /// Switch the IDE color theme: persist it, repaint the iTerm2 session
@@ -4991,10 +5404,20 @@ impl App {
         self.source_control.focus_gradient = gradient;
         self.source_control.theme = self.theme;
         self.run_debug.focus_gradient = gradient;
+        let explorer_focused =
+            self.focus == Pane::Tree && self.sidebar_view == SidebarView::Explorer;
         self.outline.focus_gradient = gradient;
         self.outline.theme = self.theme;
-        self.outline.focused =
-            self.focus == Pane::Tree && self.sidebar_view == SidebarView::Explorer;
+        self.outline.focused = explorer_focused;
+        self.open_editors.focus_gradient = gradient;
+        self.open_editors.theme = self.theme;
+        self.open_editors.focused = explorer_focused;
+        self.timeline.focus_gradient = gradient;
+        self.timeline.theme = self.theme;
+        self.timeline.focused = explorer_focused;
+        self.rust_deps.focus_gradient = gradient;
+        self.rust_deps.theme = self.theme;
+        self.rust_deps.focused = explorer_focused;
         self.remote.focus_gradient = gradient;
         self.remote.theme = self.theme;
         for t in self.terminals.iter_mut() {
@@ -5248,25 +5671,6 @@ impl App {
             } else {
                 (usable_area, None)
             };
-            // Explorer-only: the OUTLINE section stacks just above the SYSTEM
-            // footer (VS Code's sub-views live under the file tree). It shrinks
-            // to a 1-row chevron strip when collapsed and is capped so the tree
-            // above always keeps its minimum rows. Other sidebar views give all
-            // of `after_system` to their activity widget.
-            let outline_h = if self.sidebar_view == SidebarView::Explorer {
-                self.outline.desired_height(after_system.height)
-            } else {
-                0
-            };
-            let (activity_area, outline_area) = if outline_h > 0 {
-                let split = Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([Constraint::Min(1), Constraint::Length(outline_h)])
-                    .split(after_system);
-                (split[0], Some(split[1]))
-            } else {
-                (after_system, None)
-            };
             // Feed the render-time pointer cell to every side panel so the row
             // under the cursor (and the remote header pills) can light up,
             // mirroring the editor tab strip and terminal pane buttons.
@@ -5276,19 +5680,20 @@ impl App {
             self.source_control.hover_pointer = panel_pointer;
             self.remote.hover_pointer = panel_pointer;
             self.outline.hover_pointer = panel_pointer;
+            self.open_editors.hover_pointer = panel_pointer;
+            self.timeline.hover_pointer = panel_pointer;
+            self.rust_deps.hover_pointer = panel_pointer;
+            // Explorer stacks its toggled sub-views (Open Editors / Folders /
+            // Outline / Timeline / Rust Dependencies) inside `after_system`.
+            // Every other sidebar view fills it with its single activity widget.
             match self.sidebar_view {
-                SidebarView::Explorer => frame.render_widget(&mut self.tree, activity_area),
-                SidebarView::Search => frame.render_widget(&mut self.search, activity_area),
+                SidebarView::Explorer => self.render_explorer_sections(frame, after_system),
+                SidebarView::Search => frame.render_widget(&mut self.search, after_system),
                 SidebarView::SourceControl => {
-                    frame.render_widget(&mut self.source_control, activity_area)
+                    frame.render_widget(&mut self.source_control, after_system)
                 }
-                SidebarView::Remote => frame.render_widget(&mut self.remote, activity_area),
-                SidebarView::RunDebug => frame.render_widget(&mut self.run_debug, activity_area),
-            }
-            if let Some(oa) = outline_area {
-                frame.render_widget(&mut self.outline, oa);
-            } else {
-                self.outline.last_area = Rect::default();
+                SidebarView::Remote => frame.render_widget(&mut self.remote, after_system),
+                SidebarView::RunDebug => frame.render_widget(&mut self.run_debug, after_system),
             }
             if let Some(pa) = panel_area {
                 frame.render_widget(&mut self.system_panel, pa);
@@ -8510,31 +8915,6 @@ impl App {
     }
 
     fn handle_tree_key(&mut self, key: KeyEvent) {
-        // Filter box open: it owns text entry. Plain characters extend the
-        // query, Backspace deletes, Esc closes it (mirroring VS Code's tree
-        // filter). Navigation keys (arrows/Enter/PageUp/...) fall through so the
-        // user can still move within and open from the filtered results.
-        if self.tree.filter_active() {
-            match key.code {
-                KeyCode::Esc => {
-                    self.tree.close_filter();
-                    return;
-                }
-                KeyCode::Backspace => {
-                    self.tree.filter_backspace();
-                    return;
-                }
-                KeyCode::Char(c)
-                    if !key.modifiers.intersects(
-                        KeyModifiers::CONTROL | KeyModifiers::SUPER | KeyModifiers::META,
-                    ) =>
-                {
-                    self.tree.filter_push(c);
-                    return;
-                }
-                _ => {}
-            }
-        }
         // Delete key (or Cmd+Backspace) trashes every selected node.
         if is_delete_node_key(key) {
             self.delete_selection();
@@ -11839,6 +12219,12 @@ impl App {
         // rather than the tree above.
         let in_outline = self.sidebar_view == SidebarView::Explorer
             && rect_contains(self.outline.last_area, m.column, m.row);
+        let in_open_editors = self.sidebar_view == SidebarView::Explorer
+            && rect_contains(self.open_editors.last_area, m.column, m.row);
+        let in_timeline = self.sidebar_view == SidebarView::Explorer
+            && rect_contains(self.timeline.last_area, m.column, m.row);
+        let in_rust_deps = self.sidebar_view == SidebarView::Explorer
+            && rect_contains(self.rust_deps.last_area, m.column, m.row);
         let in_editor_pane = rect_contains(self.editor.last_full_area, m.column, m.row);
         let in_editor = rect_contains(self.editor.last_area, m.column, m.row);
         let terminal_hit = self.terminal_at_pos(m.column, m.row);
@@ -12151,6 +12537,49 @@ impl App {
                 // through to the activity widget above (which would
                 // otherwise see the click as occurring on a row that's
                 // visually covered by the panel).
+                // OPEN EDITORS: header toggles collapse; a row activates that
+                // editor's tab; the scrollbar lane starts a thumb drag. Any
+                // other click is swallowed so it can't fall through to a panel
+                // visually beneath this one.
+                if rect_contains(self.open_editors.last_area, m.column, m.row) {
+                    if rect_contains(self.open_editors.last_scrollbar, m.column, m.row) {
+                        self.open_editors.scroll_to_bar_y(m.row);
+                        self.open_editors_scrollbar_drag = true;
+                    } else if self.open_editors.hit_header(m.column, m.row) {
+                        self.open_editors.toggle_collapse();
+                    } else if let Some(idx) = self.open_editors.row_at(m.row)
+                        && let Some(path) = self.open_editors.path_at(idx)
+                    {
+                        self.activate_open_editor(path);
+                    }
+                    return;
+                }
+                // TIMELINE: header toggles collapse; a row opens that commit's
+                // diff for the file in a read-only editor tab.
+                if rect_contains(self.timeline.last_area, m.column, m.row) {
+                    if rect_contains(self.timeline.last_scrollbar, m.column, m.row) {
+                        self.timeline.scroll_to_bar_y(m.row);
+                        self.timeline_scrollbar_drag = true;
+                    } else if self.timeline.hit_header(m.column, m.row) {
+                        self.timeline.toggle_collapse();
+                    } else if let Some(idx) = self.timeline.row_at(m.row)
+                        && let Some((path, hash)) = self.timeline.diff_target(idx)
+                    {
+                        self.open_timeline_diff(path, hash);
+                    }
+                    return;
+                }
+                // RUST DEPENDENCIES: display-only, so only the header (collapse)
+                // and the scrollbar lane are interactive.
+                if rect_contains(self.rust_deps.last_area, m.column, m.row) {
+                    if rect_contains(self.rust_deps.last_scrollbar, m.column, m.row) {
+                        self.rust_deps.scroll_to_bar_y(m.row);
+                        self.rust_deps_scrollbar_drag = true;
+                    } else if self.rust_deps.hit_header(m.column, m.row) {
+                        self.rust_deps.toggle_collapse();
+                    }
+                    return;
+                }
                 // The OUTLINE section stacks just above the SYSTEM panel. A
                 // click on its header toggles collapse; a click on a symbol row
                 // jumps the editor to that symbol (recording nav history, like
@@ -12491,22 +12920,12 @@ impl App {
                         self.status = String::from("Collapsed all folders");
                         return;
                     }
-                    // Funnel toggle: opens the inline filter box, or closes it
-                    // when already open (VS Code's toggled filter action).
-                    if rect_contains(self.tree.header_filter_btn, m.column, m.row) {
-                        if self.tree.filter_active() {
-                            self.tree.close_filter();
-                            self.status = String::from("Filter cleared");
-                        } else {
-                            self.tree.open_filter();
-                            self.status = String::from("Filter Explorer");
-                        }
-                        return;
-                    }
-                    // The filter box's "x" clears and closes the filter.
-                    if rect_contains(self.tree.filter_clear_btn, m.column, m.row) {
-                        self.tree.close_filter();
-                        self.status = String::from("Filter cleared");
+                    // The ⋯ "Views and More Actions" button on the EXPLORER
+                    // title line opens the menu that toggles which sub-views
+                    // (Open Editors / Folders / Outline / Timeline / Rust
+                    // Dependencies) are stacked in the panel.
+                    if rect_contains(self.tree.header_views_btn, m.column, m.row) {
+                        self.open_explorer_views_menu();
                         return;
                     }
                     if let Some(idx) = self.tree.node_at_y(m.row) {
@@ -12716,6 +13135,18 @@ impl App {
                     self.outline.scroll_to_bar_y(m.row);
                     return;
                 }
+                if self.open_editors_scrollbar_drag {
+                    self.open_editors.scroll_to_bar_y(m.row);
+                    return;
+                }
+                if self.timeline_scrollbar_drag {
+                    self.timeline.scroll_to_bar_y(m.row);
+                    return;
+                }
+                if self.rust_deps_scrollbar_drag {
+                    self.rust_deps.scroll_to_bar_y(m.row);
+                    return;
+                }
                 if let Some(pane) = self.scrollbar_drag {
                     match pane {
                         Pane::Tree => match self.sidebar_view {
@@ -12840,6 +13271,15 @@ impl App {
                 if std::mem::take(&mut self.outline_scrollbar_drag) {
                     return;
                 }
+                if std::mem::take(&mut self.open_editors_scrollbar_drag) {
+                    return;
+                }
+                if std::mem::take(&mut self.timeline_scrollbar_drag) {
+                    return;
+                }
+                if std::mem::take(&mut self.rust_deps_scrollbar_drag) {
+                    return;
+                }
                 if let Some(drag) = self.tree_drag.take() {
                     self.tree.drag_target = None;
                     if drag.armed {
@@ -12885,6 +13325,12 @@ impl App {
             MouseEventKind::ScrollDown => {
                 if in_outline {
                     self.outline.scroll_down(3);
+                } else if in_open_editors {
+                    self.open_editors.scroll_down(3);
+                } else if in_timeline {
+                    self.timeline.scroll_down(3);
+                } else if in_rust_deps {
+                    self.rust_deps.scroll_down(3);
                 } else if in_tree {
                     match self.sidebar_view {
                         SidebarView::Explorer => self.tree.scroll_down(3),
@@ -12911,6 +13357,12 @@ impl App {
             MouseEventKind::ScrollUp => {
                 if in_outline {
                     self.outline.scroll_up(3);
+                } else if in_open_editors {
+                    self.open_editors.scroll_up(3);
+                } else if in_timeline {
+                    self.timeline.scroll_up(3);
+                } else if in_rust_deps {
+                    self.rust_deps.scroll_up(3);
                 } else if in_tree {
                     match self.sidebar_view {
                         SidebarView::Explorer => self.tree.scroll_up(3),
@@ -13453,6 +13905,7 @@ impl App {
             }
             MenuAction::OpenThemePicker => self.open_theme_picker(),
             MenuAction::SetTheme(theme) => self.apply_theme(theme),
+            MenuAction::ToggleExplorerView(view) => self.toggle_explorer_view(view),
         }
     }
 
@@ -16542,6 +16995,9 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         // edit-seq it reads is current) and advance follow-cursor.
         let outline_sync_changed = app.sync_outline();
         let outline_changed = app.drain_lsp_document_symbols();
+        // Refresh the Explorer's other stacked sub-views (Open Editors list,
+        // Timeline git history, Rust Dependencies) and drain their workers.
+        let explorer_panels_changed = app.sync_explorer_panels();
         app.refresh_semantic_tokens_if_requested();
         let lsp_changed = app.drain_lsp_completion();
         app.poll_hover();
@@ -16602,6 +17058,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             || progress_changed
             || outline_sync_changed
             || outline_changed
+            || explorer_panels_changed
             || install_status_changed
             || sysmon_changed
             || dap_changed;

@@ -13,6 +13,41 @@ use serde::{Deserialize, Serialize};
 
 use crate::theme::Theme;
 
+/// Which of the Explorer's stacked sub-views are shown, toggled from the
+/// "Views and More Actions" (⋯) menu on the EXPLORER header. Mirrors VS Code's
+/// defaults: Open Editors hidden, every other view shown. Each field carries
+/// its own `#[serde(default)]` so a config written before this block existed
+/// still parses straight into these defaults.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExplorerViewsPrefs {
+    #[serde(default)]
+    pub open_editors: bool,
+    #[serde(default = "default_true")]
+    pub folders: bool,
+    #[serde(default = "default_true")]
+    pub outline: bool,
+    #[serde(default = "default_true")]
+    pub timeline: bool,
+    #[serde(default = "default_true")]
+    pub rust_dependencies: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for ExplorerViewsPrefs {
+    fn default() -> Self {
+        Self {
+            open_editors: false,
+            folders: true,
+            outline: true,
+            timeline: true,
+            rust_dependencies: true,
+        }
+    }
+}
+
 /// The on-disk preferences document. New fields must default so an older
 /// config still parses; `#[serde(default)]` covers that.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -29,6 +64,9 @@ pub struct Prefs {
     /// user dismissed it with "don't show again").
     #[serde(default)]
     pub suppress_terminal_warning: bool,
+    /// Visibility of the Explorer's stacked sub-views (⋯ menu toggles).
+    #[serde(default)]
+    pub explorer_views: ExplorerViewsPrefs,
 }
 
 impl Prefs {
@@ -87,6 +125,15 @@ pub fn save_suppress_terminal_warning(suppress: bool) -> Result<()> {
     let path = config_path();
     let mut prefs = Prefs::load(&path).unwrap_or_default();
     prefs.suppress_terminal_warning = suppress;
+    prefs.save(&path)
+}
+
+/// Persist the Explorer sub-view visibility set, preserving other settings.
+/// Best-effort: a write failure is swallowed by the caller.
+pub fn save_explorer_views(views: ExplorerViewsPrefs) -> Result<()> {
+    let path = config_path();
+    let mut prefs = Prefs::load(&path).unwrap_or_default();
+    prefs.explorer_views = views;
     prefs.save(&path)
 }
 
@@ -155,6 +202,34 @@ mod tests {
                 .expect("load old")
                 .suppress_terminal_warning
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn round_trips_explorer_views_and_old_configs_default_to_vscode_defaults() {
+        let dir =
+            std::env::temp_dir().join(format!("croft-prefs-views-test-{}", std::process::id()));
+        let path = dir.join("config.json");
+        let prefs = Prefs {
+            explorer_views: ExplorerViewsPrefs {
+                open_editors: true,
+                timeline: false,
+                ..ExplorerViewsPrefs::default()
+            },
+            ..Prefs::default()
+        };
+        prefs.save(&path).expect("save");
+        let loaded = Prefs::load(&path).expect("load").explorer_views;
+        assert!(loaded.open_editors);
+        assert!(!loaded.timeline);
+        assert!(loaded.folders);
+        // A config written before the field existed parses to the VS Code
+        // defaults: Open Editors hidden, every other view shown.
+        std::fs::write(&path, r#"{"theme":"dark"}"#).expect("write old config");
+        let old = Prefs::load(&path).expect("load old").explorer_views;
+        assert_eq!(old, ExplorerViewsPrefs::default());
+        assert!(!old.open_editors);
+        assert!(old.folders && old.outline && old.timeline && old.rust_dependencies);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

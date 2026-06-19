@@ -54,25 +54,12 @@ pub struct FileTree {
     pub header_new_folder_btn: Rect,
     pub header_refresh_btn: Rect,
     pub header_collapse_btn: Rect,
-    /// Hit-test rect for the funnel "Filter" toggle, the right-most header
-    /// action mirroring VS Code's Explorer filter affordance. `Rect::default()`
-    /// (zero width) when the panel is too narrow to paint the toolbar.
-    pub header_filter_btn: Rect,
-    /// Active filter state. `None` = no filter widget showing; `Some` = the
-    /// inline filter box is open (whether or not the user has typed anything).
-    /// While `Some`, the tree narrows to matching nodes plus their ancestor
-    /// directories, mirroring VS Code's default Explorer "filter" mode.
-    pub filter: Option<FilterState>,
-    /// Hit-test rect for the filter box's clear ("x") button, captured when the
-    /// inline filter widget is painted. Zero width when the box is hidden.
-    pub filter_clear_btn: Rect,
-}
-
-/// State for the inline Explorer filter widget (VS Code's funnel filter box).
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct FilterState {
-    /// The query the user has typed. Empty while the box is open but untouched.
-    pub query: String,
+    /// Hit-test rect for the "Views and More Actions" (⋯) button on the
+    /// EXPLORER title line, which opens the menu that toggles the Explorer's
+    /// stacked sub-views (Open Editors / Folders / Outline / Timeline / Rust
+    /// Dependencies). `Rect::default()` (zero width) when the panel is too
+    /// narrow to paint it.
+    pub header_views_btn: Rect,
 }
 
 impl FileTree {
@@ -102,9 +89,7 @@ impl FileTree {
             header_new_folder_btn: Rect::default(),
             header_refresh_btn: Rect::default(),
             header_collapse_btn: Rect::default(),
-            header_filter_btn: Rect::default(),
-            filter: None,
-            filter_clear_btn: Rect::default(),
+            header_views_btn: Rect::default(),
         };
         tree.load_children(0);
         tree
@@ -130,26 +115,15 @@ impl FileTree {
         self.load_children(0);
     }
 
-    /// Map a screen y coordinate to a node index, if any. Honors the active
-    /// filter: screen rows step through the filtered (visible) node list, not
-    /// the raw `self.nodes` list, so a click lands on the row the user sees.
+    /// Map a screen y coordinate to a node index, if any. Screen rows map
+    /// straight onto consecutive node indices from the scroll offset.
     pub fn node_at_y(&self, y: u16) -> Option<usize> {
         if y < self.last_inner.y || y >= self.last_inner.y + self.last_inner.height {
             return None;
         }
         let row = (y - self.last_inner.y) as usize;
-        // Fast path (and the overwhelmingly common one): no active query, so
-        // screen rows map straight onto consecutive node indices. This keeps
-        // the hover hot path allocation-free.
-        if self.filter_query().is_empty() {
-            let idx = self.scroll + row;
-            return (idx < self.nodes.len()).then_some(idx);
-        }
-        let visible = self.visible_indices();
-        // `self.scroll` is the node index pinned to the top of the viewport;
-        // find its position within the filtered list, then step `row` rows down.
-        let top = visible.iter().position(|&i| i >= self.scroll).unwrap_or(0);
-        visible.get(top + row).copied()
+        let idx = self.scroll + row;
+        (idx < self.nodes.len()).then_some(idx)
     }
 
     pub fn select(&mut self, idx: usize) {
@@ -508,209 +482,12 @@ impl FileTree {
         self.marked.clear();
     }
 
-    /// Open the inline filter widget (the funnel toggle / typing while the tree
-    /// is focused). Idempotent: re-opening keeps whatever the user already
-    /// typed, matching VS Code where the funnel toggle reveals the box without
-    /// clearing it.
-    pub fn open_filter(&mut self) {
-        if self.filter.is_none() {
-            self.filter = Some(FilterState::default());
-        }
-    }
-
-    /// Close the filter widget and drop the query, restoring the full tree.
-    /// VS Code's Escape-in-filter / "x" both land here.
-    pub fn close_filter(&mut self) {
-        self.filter = None;
-        self.clamp_selection_to_visible();
-    }
-
-    /// True while the inline filter box is open (with or without a query).
-    pub fn filter_active(&self) -> bool {
-        self.filter.is_some()
-    }
-
-    /// The current filter query, or `""` when no box is open.
-    pub fn filter_query(&self) -> &str {
-        self.filter.as_ref().map_or("", |f| f.query.as_str())
-    }
-
-    /// Append a typed character to the filter query.
-    pub fn filter_push(&mut self, c: char) {
-        if let Some(f) = self.filter.as_mut() {
-            f.query.push(c);
-        }
-        self.snap_selection_to_first_match();
-    }
-
-    /// Delete the last character of the filter query (Backspace).
-    pub fn filter_backspace(&mut self) {
-        if let Some(f) = self.filter.as_mut() {
-            f.query.pop();
-        }
-        self.snap_selection_to_first_match();
-    }
-
-    /// Indices into `self.nodes` that should be painted, honoring the filter.
-    /// With no active query the whole flattened tree shows. With a query, a node
-    /// is kept iff its own file name matches, OR it is an ancestor directory of
-    /// a kept descendant - so every match stays reachable in the tree, exactly
-    /// as VS Code's Explorer filter keeps parent folders of a hit.
+    /// Indices into `self.nodes` painted in tree order — every node, in order,
+    /// since the Explorer no longer filters its rows. Kept as a method so the
+    /// render's scroll machinery can keep mapping a node index to its on-screen
+    /// position uniformly.
     pub fn visible_indices(&self) -> Vec<usize> {
-        let query = self.filter_query();
-        if query.is_empty() {
-            return (0..self.nodes.len()).collect();
-        }
-        // First pass: which nodes match on their own name. The root row (index
-        // 0) is always kept so the workspace header and its toolbar remain.
-        let mut keep = vec![false; self.nodes.len()];
-        for (i, node) in self.nodes.iter().enumerate() {
-            if i == 0 {
-                keep[0] = true;
-                continue;
-            }
-            let name = node_file_name(&node.path);
-            if subsequence_match(&name, query).is_some() {
-                keep[i] = true;
-            }
-        }
-        // Second pass: pull in ancestor directories of every kept node. Walking
-        // bottom-up means a child is already marked before we reach its parent,
-        // and depth strictly decreases as we scan left from the child, so the
-        // nearest shallower node is the parent to keep.
-        for i in (1..self.nodes.len()).rev() {
-            if !keep[i] {
-                continue;
-            }
-            let mut depth = self.nodes[i].depth;
-            let mut j = i;
-            while j > 0 && depth > 0 {
-                j -= 1;
-                if self.nodes[j].depth < depth {
-                    keep[j] = true;
-                    depth = self.nodes[j].depth;
-                }
-            }
-        }
-        (0..self.nodes.len()).filter(|&i| keep[i]).collect()
-    }
-
-    /// Move the cursor onto the first filtered match (skipping the root header)
-    /// so arrow keys and Enter act on a visible, relevant row as the user types.
-    fn snap_selection_to_first_match(&mut self) {
-        let visible = self.visible_indices();
-        // Prefer the first real match (not the always-kept root) so typing
-        // immediately highlights a result; fall back to the root otherwise.
-        let target = visible
-            .iter()
-            .copied()
-            .find(|&i| i != 0)
-            .or(visible.first().copied());
-        if let Some(idx) = target {
-            self.selected = idx;
-            self.anchor = idx;
-            self.scroll = 0;
-        }
-    }
-
-    /// After closing the filter, make sure the selection still points at a real
-    /// node (the index is always valid here since closing only widens the set).
-    fn clamp_selection_to_visible(&mut self) {
-        if self.selected >= self.nodes.len() {
-            self.selected = self.nodes.len().saturating_sub(1);
-            self.anchor = self.selected;
-        }
-    }
-
-    /// Paint the inline filter widget on row `y`, spanning the panel's inner
-    /// width: a funnel glyph, the typed query (or a dim placeholder), and a
-    /// trailing "x" clear button. `area` is the full panel rect, used only for
-    /// the inner-width geometry. Captures `filter_clear_btn` for hit-testing.
-    fn render_filter_box(&mut self, buf: &mut Buffer, area: Rect, y: u16) {
-        let inner_x = area.x + 1;
-        let inner_w = area.width.saturating_sub(2);
-        if inner_w < 4 {
-            return;
-        }
-        let brand = self.focus_gradient;
-        // A subtle filled bar so the box reads as a focused input, not a row.
-        let box_bg = if brand {
-            crate::gradient::rgb_color(crate::gradient::POPUP_SEL_BG)
-        } else {
-            Color::Rgb(0x16, 0x2a, 0x4d)
-        };
-        let bar = Rect {
-            x: inner_x,
-            y,
-            width: inner_w,
-            height: 1,
-        };
-        buf.set_style(bar, Style::default().bg(box_bg));
-
-        let query = self.filter_query();
-        let fg = if brand {
-            crate::gradient::rgb_color(crate::gradient::PANEL_TITLE_FG)
-        } else {
-            Color::Rgb(0xe6, 0xed, 0xf5)
-        };
-        // Funnel + space prefix.
-        let prefix = format!("{} ", crate::widgets::header_pill::FILTER_GLYPH);
-        buf.set_string(inner_x, y, &prefix, Style::default().fg(fg).bg(box_bg));
-        let text_x = inner_x + prefix.chars().count() as u16;
-        // Reserve the right-most two cells for the "x" clear button.
-        let clear_w: u16 = 2;
-        let text_w = inner_w
-            .saturating_sub(prefix.chars().count() as u16)
-            .saturating_sub(clear_w);
-
-        if query.is_empty() {
-            let placeholder = "Filter";
-            let shown: String = placeholder.chars().take(text_w as usize).collect();
-            buf.set_string(
-                text_x,
-                y,
-                shown,
-                Style::default().fg(Color::Rgb(0x8a, 0x93, 0xa6)).bg(box_bg),
-            );
-        } else {
-            // Tail-truncate so the newest characters stay visible as the user
-            // types past the box width.
-            let chars: Vec<char> = query.chars().collect();
-            let start = chars.len().saturating_sub(text_w as usize);
-            let shown: String = chars[start..].iter().collect();
-            buf.set_string(text_x, y, shown, Style::default().fg(fg).bg(box_bg));
-        }
-
-        // Clear "x" button, right-aligned.
-        let clear_x = inner_x + inner_w - clear_w;
-        let clear_hovered = crate::widgets::hover::contains(
-            Rect {
-                x: clear_x,
-                y,
-                width: clear_w,
-                height: 1,
-            },
-            self.hover_pointer,
-        );
-        let x_fg = if clear_hovered {
-            Color::Rgb(0xff, 0xff, 0xff)
-        } else {
-            fg
-        };
-        // The same crisp multiplication-X (✕) the editor tabs use for close,
-        // which renders on every terminal (no codicon PUA dependency).
-        buf.set_string(
-            clear_x,
-            y,
-            " \u{2715}",
-            Style::default().fg(x_fg).bg(box_bg),
-        );
-        self.filter_clear_btn = Rect {
-            x: clear_x,
-            y,
-            width: clear_w,
-            height: 1,
-        };
+        (0..self.nodes.len()).collect()
     }
 
     pub fn selected_path(&self) -> Option<&Path> {
@@ -1318,14 +1095,6 @@ fn remove_recursive(path: &Path) -> std::io::Result<()> {
     }
 }
 
-/// The display name (final path component) for a node, falling back to the full
-/// path for the workspace root, which has no `file_name`.
-fn node_file_name(path: &Path) -> String {
-    path.file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| path.display().to_string())
-}
-
 /// Case-insensitive subsequence (fuzzy) match of `query` against `haystack`,
 /// mirroring the VS Code tree filter, which accepts a hit when the query's
 /// characters appear in order (not necessarily contiguously). Returns the byte
@@ -1435,44 +1204,57 @@ impl Widget for &mut FileTree {
             crate::gradient::paint_gradient_box(buf, area);
             buf.set_span(area.x + 1, area.y, &title, title.width() as u16);
         }
-        // Explorer header toolbar (New File / New Folder / Refresh / Collapse
-        // Folders) is painted later, on the root folder row, not here on the
-        // title border. Reset the hit-test rects each frame so a hidden toolbar
-        // never registers stale clicks.
+        // The New File / New Folder / Refresh / Collapse toolbar is painted
+        // later, on the root folder row. The "Views and More Actions" (⋯)
+        // button sits here on the EXPLORER title line, mirroring VS Code's
+        // view-container header. Reset the hit-test rects each frame so a
+        // hidden affordance never registers stale clicks.
         self.header_new_file_btn = Rect::default();
         self.header_new_folder_btn = Rect::default();
         self.header_refresh_btn = Rect::default();
         self.header_collapse_btn = Rect::default();
-        self.header_filter_btn = Rect::default();
-        self.filter_clear_btn = Rect::default();
+        self.header_views_btn = Rect::default();
         self.last_area = area;
         self.last_scrollbar = Rect::default();
 
-        // When the filter box is open it claims the top inner row (VS Code's
-        // floating filter widget), and the tree rows start one row lower. The
-        // box itself is painted after the rows so it overdraws cleanly.
-        let filter_open = self.filter.is_some();
-        let list_top = inner.y + u16::from(filter_open);
-        let list_height = inner.height.saturating_sub(u16::from(filter_open));
-        let inner = Rect {
-            x: inner.x,
-            y: list_top,
-            width: inner.width,
-            height: list_height,
-        };
+        // Paint the ⋯ button at the right end of the title border row. It is
+        // always available (not focus-gated) so the view-toggle menu is one
+        // click away even when the tree is unfocused, like VS Code.
+        if area.width > 12 {
+            let bx = area.x + area.width - 2;
+            let by = area.y;
+            let hovered = crate::widgets::hover::contains(
+                Rect {
+                    x: bx,
+                    y: by,
+                    width: 1,
+                    height: 1,
+                },
+                self.hover_pointer,
+            );
+            crate::widgets::header_pill::render(
+                buf,
+                bx,
+                by,
+                crate::widgets::header_pill::MORE_GLYPH,
+                self.focus_gradient,
+                hovered,
+            );
+            self.header_views_btn = Rect {
+                x: bx,
+                y: by,
+                width: 1,
+                height: 1,
+            };
+        }
+
         self.last_inner = inner;
 
         let visible_height = inner.height as usize;
         if visible_height == 0 {
-            // Nothing but the (optional) filter box fits; still paint it so the
-            // user can see/clear what they typed.
-            if filter_open {
-                self.render_filter_box(buf, area, list_top - 1);
-            }
             return;
         }
-        // The filtered row set: with no query this is every node, so the legacy
-        // behaviour is untouched. `visible` holds node indices in tree order.
+        // Every node, in tree order — `visible` holds node indices.
         let visible = self.visible_indices();
         // Position of the selected node within the filtered list, so scroll and
         // highlight track the cursor even when intermediate rows are hidden.
@@ -1509,7 +1291,8 @@ impl Widget for &mut FileTree {
 
         let pointer = self.hover_pointer;
         let brand = self.focus_gradient;
-        let query = self.filter_query().to_string();
+        // No Explorer filter any more, so no characters are ever highlighted.
+        let query = String::new();
         let end = (scroll_pos + visible_height).min(visible.len());
         for (row, &idx) in visible[scroll_pos..end].iter().enumerate() {
             let node = &self.nodes[idx];
@@ -1608,12 +1391,11 @@ impl Widget for &mut FileTree {
         // after the rows so the pills win over the root row's text/fill.
         if self.focused && self.scroll == 0 && !self.nodes.is_empty() {
             use crate::widgets::header_pill;
-            const GLYPHS: [char; 5] = [
+            const GLYPHS: [char; 4] = [
                 header_pill::NEW_FILE_GLYPH,
                 header_pill::NEW_FOLDER_GLYPH,
                 header_pill::REFRESH_GLYPH,
                 header_pill::COLLAPSE_ALL_GLYPH,
-                header_pill::FILTER_GLYPH,
             ];
             // Each pill is a single-cell glyph; `step` adds a one-cell gap so
             // the chips read as four distinct buttons. `right_pad` keeps the
@@ -1644,27 +1426,18 @@ impl Widget for &mut FileTree {
                         height: 1,
                     };
                     let hovered = crate::widgets::hover::contains(rect, self.hover_pointer);
-                    // The funnel lights up (as if hovered) while the filter box
-                    // is open, mirroring VS Code's toggled filter action.
-                    let lit = hovered || (i == 4 && self.filter.is_some());
-                    header_pill::render(buf, x, y, glyph, brand, lit);
+                    header_pill::render(buf, x, y, glyph, brand, hovered);
                     match i {
                         0 => self.header_new_file_btn = rect,
                         1 => self.header_new_folder_btn = rect,
                         2 => self.header_refresh_btn = rect,
-                        3 => self.header_collapse_btn = rect,
-                        _ => self.header_filter_btn = rect,
+                        _ => self.header_collapse_btn = rect,
                     }
                 }
             }
         }
         if let Some(metrics) = scrollbar_metrics {
             scrollbar::render_vertical(buf, metrics, self.focused, self.theme);
-        }
-        // Paint the inline filter widget last so it overdraws the top row,
-        // anchored on the inner row reserved above the list.
-        if filter_open {
-            self.render_filter_box(buf, area, list_top - 1);
         }
     }
 }
@@ -1767,7 +1540,6 @@ mod tests {
             crate::widgets::header_pill::NEW_FOLDER_GLYPH,
             crate::widgets::header_pill::REFRESH_GLYPH,
             crate::widgets::header_pill::COLLAPSE_ALL_GLYPH,
-            crate::widgets::header_pill::FILTER_GLYPH,
         ] {
             assert!(
                 root_row.contains(glyph),
@@ -1780,18 +1552,32 @@ mod tests {
             tree.header_new_folder_btn,
             tree.header_refresh_btn,
             tree.header_collapse_btn,
-            tree.header_filter_btn,
         ] {
             assert!(btn.width > 0, "button rect was not captured");
             assert_eq!(btn.y, root_y, "button sits on the root folder row");
         }
-        // Painted left to right in VS Code's order, the funnel right-most and
-        // clear of the right border.
+        // Painted left to right in VS Code's order, clear of the right border.
         assert!(tree.header_new_file_btn.x < tree.header_new_folder_btn.x);
         assert!(tree.header_new_folder_btn.x < tree.header_refresh_btn.x);
         assert!(tree.header_refresh_btn.x < tree.header_collapse_btn.x);
-        assert!(tree.header_collapse_btn.x < tree.header_filter_btn.x);
-        assert!(tree.header_filter_btn.x + tree.header_filter_btn.width < area.x + area.width);
+        assert!(tree.header_collapse_btn.x + tree.header_collapse_btn.width < area.x + area.width);
+
+        // The ⋯ "Views and More Actions" button sits on the EXPLORER title
+        // border row, not the toolbar row — that's the whole point of the
+        // rework (the view-toggle affordance lives on the Explorer line).
+        assert!(
+            tree.header_views_btn.width > 0,
+            "views (⋯) button rect was not captured"
+        );
+        assert_eq!(
+            tree.header_views_btn.y, area.y,
+            "the ⋯ button sits on the EXPLORER title line"
+        );
+        let title_row: String = (0..area.width).map(|x| buf[(x, area.y)].symbol()).collect();
+        assert!(
+            title_row.contains(crate::widgets::header_pill::MORE_GLYPH),
+            "title row missing the ⋯ glyph: {title_row:?}"
+        );
     }
 
     #[test]
@@ -2720,144 +2506,5 @@ mod tests {
         let all: Vec<usize> = (0..tree.nodes.len()).collect();
         // No filter open at all.
         assert_eq!(tree.visible_indices(), all);
-    }
-
-    #[test]
-    fn visible_indices_open_filter_empty_query_shows_all() {
-        let (_tmp, mut tree) = fixture();
-        tree.open_filter();
-        let all: Vec<usize> = (0..tree.nodes.len()).collect();
-        // Box open but nothing typed: the whole tree is still shown.
-        assert_eq!(tree.visible_indices(), all);
-    }
-
-    #[test]
-    fn filter_narrows_to_matches_and_keeps_ancestor_dirs() {
-        // Build a nested tree so an ancestor must be retained for a deep match.
-        let tmp = TempDir::new().unwrap();
-        let root = tmp.path();
-        fs::create_dir_all(root.join("src")).unwrap();
-        fs::write(root.join("src/widget.rs"), "//\n").unwrap();
-        fs::write(root.join("README.md"), "#\n").unwrap();
-        let mut tree = FileTree::new(root.to_path_buf());
-        assert!(tree.reveal_path(&root.join("src/widget.rs")));
-
-        tree.open_filter();
-        for c in "widget".chars() {
-            tree.filter_push(c);
-        }
-        let visible: Vec<PathBuf> = tree
-            .visible_indices()
-            .into_iter()
-            .map(|i| tree.nodes[i].path.clone())
-            .collect();
-
-        // The matching file is shown.
-        assert!(visible.iter().any(|p| p.ends_with("widget.rs")));
-        // Its ancestor dir "src" is kept so the match stays reachable.
-        assert!(visible.iter().any(|p| p.ends_with("src")));
-        // The non-matching sibling file is hidden.
-        assert!(
-            !visible.iter().any(|p| p.ends_with("README.md")),
-            "non-matching file should be filtered out: {visible:?}"
-        );
-        // The root header row is always retained.
-        assert_eq!(visible.first(), Some(&root.to_path_buf()));
-    }
-
-    #[test]
-    fn close_filter_restores_the_full_tree() {
-        let (_tmp, mut tree) = fixture();
-        tree.open_filter();
-        for c in "zzz-no-match".chars() {
-            tree.filter_push(c);
-        }
-        // Only the always-kept root survives an impossible query.
-        assert_eq!(tree.visible_indices().len(), 1);
-        tree.close_filter();
-        assert!(!tree.filter_active());
-        assert_eq!(tree.visible_indices().len(), tree.nodes.len());
-    }
-
-    #[test]
-    fn typing_snaps_selection_onto_the_first_match() {
-        // README.md and main.rs sit under the root in the fixture; filtering to
-        // "main" must move the cursor onto main.rs, not leave it on the root.
-        let (_tmp, mut tree) = fixture();
-        tree.open_filter();
-        for c in "main".chars() {
-            tree.filter_push(c);
-        }
-        let sel_path = tree.nodes[tree.selected].path.clone();
-        assert!(
-            sel_path.ends_with("main.rs"),
-            "selection should snap to the match, got {sel_path:?}"
-        );
-    }
-
-    #[test]
-    fn open_filter_paints_the_inline_box_with_funnel_and_clear() {
-        let (_tmp, mut tree) = fixture();
-        tree.focused = true;
-        tree.open_filter();
-        for c in "rs".chars() {
-            tree.filter_push(c);
-        }
-        let area = Rect {
-            x: 0,
-            y: 0,
-            width: 30,
-            height: 8,
-        };
-        let mut buf = Buffer::empty(area);
-        (&mut tree).render(area, &mut buf);
-        // The box occupies the first inner row (just below the title border).
-        let box_y = area.y + 1;
-        let box_row: String = (0..area.width).map(|x| buf[(x, box_y)].symbol()).collect();
-        assert!(
-            box_row.contains(crate::widgets::header_pill::FILTER_GLYPH),
-            "filter box should show the funnel glyph: {box_row:?}"
-        );
-        assert!(
-            box_row.contains('\u{2715}'),
-            "filter box should show the clear (x) button: {box_row:?}"
-        );
-        // The clear button rect was captured for hit-testing.
-        assert!(tree.filter_clear_btn.width > 0);
-        assert_eq!(tree.filter_clear_btn.y, box_y);
-    }
-
-    #[test]
-    fn filtered_match_chars_are_highlighted_in_the_amber_match_colour() {
-        let (_tmp, mut tree) = fixture();
-        tree.focused = true;
-        tree.focus_gradient = false;
-        tree.open_filter();
-        for c in "main".chars() {
-            tree.filter_push(c);
-        }
-        let area = Rect {
-            x: 0,
-            y: 0,
-            width: 30,
-            height: 8,
-        };
-        let mut buf = Buffer::empty(area);
-        (&mut tree).render(area, &mut buf);
-        // Somewhere in the tree rows, the matched "main" run wears the amber
-        // filter-match foreground.
-        let mut found_amber = false;
-        for y in area.y..area.y + area.height {
-            for x in area.x..area.x + area.width {
-                let cell = &buf[(x, y)];
-                if cell.fg == FILTER_MATCH_FG && cell.symbol() == "m" {
-                    found_amber = true;
-                }
-            }
-        }
-        assert!(
-            found_amber,
-            "the matched filename run should be painted in the amber match colour"
-        );
     }
 }
