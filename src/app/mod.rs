@@ -2187,13 +2187,14 @@ impl App {
             ssh_w_px,
             ssh_h_px,
             card_bg,
-        ) && let Some(raw) = crate::iterm2_inline::build_inline_image(
+        ) && let Some(raw) = crate::iterm2_inline::build_inline_image_z(
             protocol,
             &baked,
             ssh_cells_w,
             ssh_cells_h,
             false,
             crate::iterm2_inline::KITTY_ID_SSH,
+            crate::iterm2_inline::KITTY_Z_BELOW_TEXT_AND_BG,
         ) {
             self.overlays
                 .ssh
@@ -2332,13 +2333,14 @@ impl App {
                 canvas_w,
                 canvas_h,
                 bg,
-            ) && let Some(raw) = crate::iterm2_inline::build_inline_image(
+            ) && let Some(raw) = crate::iterm2_inline::build_inline_image_z(
                 protocol,
                 &baked,
                 hero.width,
                 hero.height,
                 false,
                 crate::iterm2_inline::KITTY_ID_HERO,
+                crate::iterm2_inline::KITTY_Z_BELOW_TEXT_AND_BG,
             ) {
                 let osc = crate::iterm2_inline::maybe_tmux_wrap(
                     protocol,
@@ -2475,6 +2477,15 @@ impl App {
     /// No-op unless a tooltip is showing and actually lands on an illustration.
     pub fn flush_tooltip_over_image(&mut self) {
         use std::io::Write;
+        // Only the cell-buffer protocols (iTerm2 OSC-1337, Sixel) need this: a
+        // later text write wins those cells. The Kitty path instead places the
+        // illustration at a deep-negative z so text already draws on top, and
+        // re-blitting would be wasted stdout traffic.
+        match self.inline_protocol {
+            crate::iterm2_inline::InlineImageProtocol::ITerm2
+            | crate::iterm2_inline::InlineImageProtocol::Sixel => {}
+            _ => return,
+        }
         let Some(area) = self.ui_tooltip_area else {
             return;
         };

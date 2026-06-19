@@ -517,18 +517,28 @@ pub fn build_inline_image_kitty(
     height_cells: u16,
     image_id: u32,
     placement_id: u32,
+    z: i32,
 ) -> String {
     let b64 = base64::engine::general_purpose::STANDARD.encode(png);
     let len = b64.len();
     let mut out = String::with_capacity(len + 64);
     let mut start = 0usize;
     let mut first = true;
+    // `z=` is only emitted when non-zero so the common above-text placements
+    // stay byte-for-byte identical. A deep-negative z (see
+    // `KITTY_Z_BELOW_TEXT_AND_BG`) drops the image beneath text AND non-default
+    // background cells, letting an opaque tooltip box paint fully on top.
+    let z_field = if z == 0 {
+        String::new()
+    } else {
+        format!(",z={z}")
+    };
     loop {
         let end = (start + 4096).min(len);
         let more = u8::from(end < len);
         if first {
             out.push_str(&format!(
-                "\x1b_Gf=100,a=T,c={width_cells},r={height_cells},C=1,q=2,i={image_id},p={placement_id},m={more};"
+                "\x1b_Gf=100,a=T,c={width_cells},r={height_cells},C=1,q=2,i={image_id},p={placement_id}{z_field},m={more};"
             ));
             first = false;
         } else {
@@ -695,6 +705,38 @@ pub fn build_inline_image(
     preserve_aspect: bool,
     id: u32,
 ) -> Option<String> {
+    build_inline_image_z(
+        protocol,
+        png,
+        width_cells,
+        height_cells,
+        preserve_aspect,
+        id,
+        0,
+    )
+}
+
+/// Kitty z-index that places an image below BOTH text glyphs and cells with a
+/// non-default background (the spec threshold is INT32_MIN/2 = -1,073,741,824).
+/// Used for sidebar illustrations so a tooltip's opaque box paints fully on top
+/// while the illustration still shows through the panel's transparent reserved
+/// cells. iTerm2's OSC-1337 has no z-index, so on that path the tooltip is
+/// re-painted after the image instead (`App::flush_tooltip_over_image`).
+pub const KITTY_Z_BELOW_TEXT_AND_BG: i32 = -2_000_000_000;
+// The spec threshold for "below non-default background cells" is INT32_MIN/2.
+const _: () = assert!(KITTY_Z_BELOW_TEXT_AND_BG < -1_073_741_824);
+
+/// `build_inline_image` plus a Kitty z-index (ignored on the iTerm2/Sixel/None
+/// paths, which have no layer ordering control).
+pub fn build_inline_image_z(
+    protocol: InlineImageProtocol,
+    png: &[u8],
+    width_cells: u16,
+    height_cells: u16,
+    preserve_aspect: bool,
+    id: u32,
+    z: i32,
+) -> Option<String> {
     match protocol {
         InlineImageProtocol::ITerm2 => Some(build_inline_image_osc(
             png,
@@ -708,6 +750,7 @@ pub fn build_inline_image(
             height_cells,
             id,
             id,
+            z,
         )),
         InlineImageProtocol::Sixel => build_inline_image_sixel(png),
         InlineImageProtocol::None => None,
@@ -1191,19 +1234,19 @@ mod tests {
 
     #[test]
     fn kitty_graphics_starts_with_apc_introducer() {
-        let seq = build_inline_image_kitty(b"PNGDATA", 4, 3, 7, 7);
+        let seq = build_inline_image_kitty(b"PNGDATA", 4, 3, 7, 7, 0);
         assert!(seq.starts_with("\x1b_G"), "wrong prefix: {seq:?}");
     }
 
     #[test]
     fn kitty_graphics_terminates_with_st() {
-        let seq = build_inline_image_kitty(b"PNGDATA", 4, 3, 7, 7);
+        let seq = build_inline_image_kitty(b"PNGDATA", 4, 3, 7, 7, 0);
         assert!(seq.ends_with("\x1b\\"), "must end with ST: {seq:?}");
     }
 
     #[test]
     fn kitty_first_chunk_carries_png_format_action_and_cells() {
-        let seq = build_inline_image_kitty(b"PNGDATA", 4, 3, 7, 7);
+        let seq = build_inline_image_kitty(b"PNGDATA", 4, 3, 7, 7, 0);
         assert!(seq.contains("f=100"), "PNG format: {seq:?}");
         assert!(seq.contains("a=T"), "transmit+display: {seq:?}");
         assert!(seq.contains("c=4"), "width in cells: {seq:?}");
@@ -1212,11 +1255,27 @@ mod tests {
     }
 
     #[test]
+    fn kitty_omits_z_when_zero_but_emits_deep_negative_for_below_text() {
+        // z=0 keeps the default above-text placement and emits no z field, so
+        // the common icon/logo sequences stay byte-identical.
+        let above = build_inline_image_kitty(b"PNGDATA", 4, 3, 7, 7, 0);
+        assert!(!above.contains("z="), "no z field when z=0: {above:?}");
+        // A sidebar illustration is placed below text AND non-default-bg cells
+        // (z below the INT32_MIN/2 spec threshold, guarded at compile time
+        // beside the constant) so an opaque tooltip box can paint fully on top.
+        let below = build_inline_image_kitty(b"PNGDATA", 4, 3, 7, 7, KITTY_Z_BELOW_TEXT_AND_BG);
+        assert!(
+            below.contains(&format!("z={KITTY_Z_BELOW_TEXT_AND_BG}")),
+            "deep-negative z must be present: {below:?}"
+        );
+    }
+
+    #[test]
     fn kitty_first_chunk_carries_a_stable_placement_id() {
         // Re-transmitting the same image id with the same placement id replaces
         // the placement in place (flicker-free) instead of stacking a duplicate,
         // which is what lets croft's per-frame re-emit loop work on Kitty.
-        let seq = build_inline_image_kitty(b"PNGDATA", 4, 3, 7, 42);
+        let seq = build_inline_image_kitty(b"PNGDATA", 4, 3, 7, 42, 0);
         assert!(
             seq.contains("p=42"),
             "placement id must be present: {seq:?}"
@@ -1225,14 +1284,14 @@ mod tests {
 
     #[test]
     fn kitty_sets_cursor_and_response_suppression_flags() {
-        let seq = build_inline_image_kitty(b"PNGDATA", 4, 3, 7, 7);
+        let seq = build_inline_image_kitty(b"PNGDATA", 4, 3, 7, 7, 0);
         assert!(seq.contains("C=1"), "cursor must not advance: {seq:?}");
         assert!(seq.contains("q=2"), "responses must be suppressed: {seq:?}");
     }
 
     #[test]
     fn kitty_payload_is_base64_encoded_png() {
-        let seq = build_inline_image_kitty(b"PNGDATA", 4, 3, 7, 7);
+        let seq = build_inline_image_kitty(b"PNGDATA", 4, 3, 7, 7, 0);
         assert!(
             seq.contains(";UE5HREFUQQ=="),
             "expected base64 payload after the control-data semicolon: {seq:?}"
@@ -1242,7 +1301,7 @@ mod tests {
     #[test]
     fn kitty_chunks_payload_larger_than_4096_base64_bytes() {
         let png = vec![0xABu8; 4000];
-        let seq = build_inline_image_kitty(&png, 4, 3, 7, 7);
+        let seq = build_inline_image_kitty(&png, 4, 3, 7, 7, 0);
         let chunks: Vec<&str> = seq.split("\x1b\\").filter(|s| !s.is_empty()).collect();
         assert!(
             chunks.len() >= 2,
