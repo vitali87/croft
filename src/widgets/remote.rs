@@ -33,6 +33,10 @@ pub struct RemotePanel {
     pub empty_secondary_btn: Rect,
     pub empty_learn_link: Rect,
     pub last_image_cell: Option<(u16, u16)>,
+    /// Full cell rect the SSH empty-state illustration occupied on the most
+    /// recent render. Lets the post-draw flush detect when a chrome tooltip
+    /// lands on the image (whose OSC-1337 layer would hide the tooltip text).
+    pub last_image_area: Rect,
     /// Render-time pointer cell, fed from `App::pointer_cell` each frame so a
     /// hovered host row and the header action pills (+ / refresh) can lift.
     pub hover_pointer: Option<(u16, u16)>,
@@ -63,6 +67,7 @@ impl RemotePanel {
             empty_secondary_btn: Rect::default(),
             empty_learn_link: Rect::default(),
             last_image_cell: None,
+            last_image_area: Rect::default(),
             hover_pointer: None,
             visible: Vec::new(),
             ssh_config_state,
@@ -354,6 +359,7 @@ fn render_filter_row(buf: &mut Buffer, area: Rect, filter: &str) {
 
 fn render_empty_state(panel: &mut RemotePanel, buf: &mut Buffer, area: Rect) {
     panel.last_image_cell = None;
+    panel.last_image_area = Rect::default();
     if area.height < 14 || area.width < 22 {
         return;
     }
@@ -391,6 +397,12 @@ fn render_empty_state(panel: &mut RemotePanel, buf: &mut Buffer, area: Rect) {
             }
         }
         panel.last_image_cell = Some((img_x, y));
+        panel.last_image_area = Rect {
+            x: img_x,
+            y,
+            width: img_w,
+            height: img_h,
+        };
         y += img_h;
     }
     y = y.saturating_add(1);

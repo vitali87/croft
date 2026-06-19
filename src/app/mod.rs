@@ -1353,6 +1353,12 @@ pub struct App {
     ui_hover: HoverDwell,
     ui_tooltip: Option<crate::widgets::hover_popup::HoverPopup>,
     ui_tooltip_label: Option<&'static str>,
+    /// The chrome tooltip's final on-screen rect from the most recent render
+    /// (after the activity-bar shift / viewport clamp), or `None` when no
+    /// tooltip is showing. Read by the post-draw inline-image flushers so a
+    /// sidebar illustration can yield (hide) wherever the tooltip lands on it,
+    /// since OSC-1337 images always composite above the tooltip's text cells.
+    ui_tooltip_area: Option<Rect>,
     definition_request_id: Option<u64>,
     declaration_request_id: Option<u64>,
     type_definition_request_id: Option<u64>,
@@ -1933,6 +1939,7 @@ impl App {
             ui_hover: HoverDwell::default(),
             ui_tooltip: None,
             ui_tooltip_label: None,
+            ui_tooltip_area: None,
             definition_request_id: None,
             outline_synced: None,
             declaration_request_id: None,
@@ -2306,6 +2313,18 @@ impl App {
         if hero.width == 0 || hero.height == 0 {
             return;
         }
+        // A chrome tooltip floating over the hero (e.g. the Run-and-Debug icon
+        // hint, whose box flips up onto the illustration) would be hidden by the
+        // image layer that composites above text. Yield the hero for the dwell:
+        // request a clear so iTerm2 evicts the cached cells and the next frame
+        // repaints the tooltip text. It re-emits once the tooltip clears.
+        if self
+            .ui_tooltip_area
+            .is_some_and(|t| rects_intersect(t, hero))
+        {
+            self.overlays.hero.hide_and_request_clear();
+            return;
+        }
         let Some((cw, ch)) = self.cell_pixel else {
             return;
         };
@@ -2373,6 +2392,16 @@ impl App {
             && self.sidebar_view == SidebarView::Remote
             && self.remote.targets.is_empty();
         if !should_show {
+            self.overlays.ssh.hide_and_request_clear();
+            return;
+        }
+        // Yield the illustration if a chrome tooltip floats over it, same as the
+        // Source Control hero: the OSC-1337 image layer would otherwise hide the
+        // tooltip's text. Restored once the tooltip clears.
+        if self
+            .ui_tooltip_area
+            .is_some_and(|t| rects_intersect(t, self.remote.last_image_area))
+        {
             self.overlays.ssh.hide_and_request_clear();
             return;
         }
@@ -6171,6 +6200,7 @@ impl App {
         // clamping it to the editor area would yank it away from the control or,
         // on the welcome screen, drop it entirely.
         let tooltip_grad = self.popup_gradient();
+        let mut tooltip_area = None;
         if let Some(popup) = self.ui_tooltip.as_mut() {
             popup.gradient = tooltip_grad;
             let full = frame.area();
@@ -6186,8 +6216,15 @@ impl App {
             }
             if area.width > 0 && area.height > 0 {
                 frame.render_widget(&*popup, area);
+                tooltip_area = Some(area);
             }
         }
+        // Record where the tooltip actually landed so the post-draw inline-image
+        // flushers can yield any sidebar illustration the box overlaps (the
+        // illustration's OSC-1337 layer would otherwise composite over and hide
+        // the tooltip text, as it does on the Run-and-Debug icon hover that lands
+        // on the no-repo Source Control hero).
+        self.ui_tooltip_area = tooltip_area;
 
         // Show the host terminal's hardware caret only when the editor is
         // focused and has no modal overlay. The DECSCUSR style is set to
@@ -16316,6 +16353,21 @@ fn sheet_visible_rows(inner: Rect) -> usize {
 
 fn rect_contains(r: Rect, x: u16, y: u16) -> bool {
     r.width > 0 && r.height > 0 && x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height
+}
+
+/// True when two cell rectangles share at least one cell. Used to decide
+/// whether a text overlay (the chrome tooltip) lands on top of an OSC-1337
+/// inline image; since terminal images composite ABOVE text cells, an
+/// overlapping image would hide the tooltip text and must yield.
+fn rects_intersect(a: Rect, b: Rect) -> bool {
+    a.width > 0
+        && a.height > 0
+        && b.width > 0
+        && b.height > 0
+        && a.x < b.x.saturating_add(b.width)
+        && b.x < a.x.saturating_add(a.width)
+        && a.y < b.y.saturating_add(b.height)
+        && b.y < a.y.saturating_add(a.height)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

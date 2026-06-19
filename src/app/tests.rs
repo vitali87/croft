@@ -328,6 +328,48 @@ fn chrome_tooltip_paints_in_the_sidebar_not_clamped_into_the_editor() {
 }
 
 #[test]
+fn no_repo_hero_yields_when_a_tooltip_overlaps_it() {
+    // The Run-and-Debug activity-icon hint flips up onto the centered no-repo
+    // hero illustration. Because OSC-1337 images composite above text, the hero
+    // would hide the tooltip's "Debug" text. The hero must yield (request a
+    // clear) for the dwell so the tooltip reads in full.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.sidebar_view = SidebarView::SourceControl;
+    app.cell_pixel = Some((8, 16));
+    let backend = ratatui::backend::TestBackend::new(63, 50);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    // Only meaningful when the workspace is not a repo (hero is shown).
+    assert!(!app.source_control.status.in_repo, "tempdir is not a repo");
+    let hero = app.source_control.last_hero_area;
+    assert!(hero.width > 0 && hero.height > 0, "hero must be laid out");
+    app.overlays.hero.set_displayed(true);
+
+    // A tooltip box overlapping the hero forces it to yield.
+    app.ui_tooltip_area = Some(hero);
+    app.flush_no_repo_hero_overlay();
+    assert!(
+        app.consume_no_repo_hero_image_clear(),
+        "hero must request a clear when a tooltip overlaps it"
+    );
+
+    // A tooltip clear of the hero leaves it painting normally.
+    app.overlays.hero.set_displayed(true);
+    app.ui_tooltip_area = Some(Rect {
+        x: hero.x,
+        y: hero.y.saturating_add(hero.height),
+        width: 4,
+        height: 1,
+    });
+    app.flush_no_repo_hero_overlay();
+    assert!(
+        !app.consume_no_repo_hero_image_clear(),
+        "a non-overlapping tooltip must not disturb the hero"
+    );
+}
+
+#[test]
 fn sidebar_header_actions_are_tooltipped_per_view() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
