@@ -318,6 +318,62 @@ fn chrome_tooltip_paints_in_the_sidebar_not_clamped_into_the_editor() {
         painted,
         "the chrome tooltip must paint near its sidebar anchor, not be clamped into the editor"
     );
+    // ...and it must NOT paint over the activity-bar columns, whose inline-image
+    // icons composite above text and would hide the tooltip's left edge.
+    let over_bar = (0..ACTIVITY_BAR_WIDTH).any(|x| (0..50).any(|y| buf[(x, y)].bg == popup_bg));
+    assert!(
+        !over_bar,
+        "the tooltip must be shifted clear of the activity-bar image column"
+    );
+}
+
+#[test]
+fn sidebar_header_actions_are_tooltipped_per_view() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let cell = |x| Rect {
+        x,
+        y: 1,
+        width: 2,
+        height: 1,
+    };
+
+    // Explorer toolbar (the icons in Image #1: new file / new folder / refresh /
+    // collapse, plus the ⋯ views menu).
+    app.sidebar_view = SidebarView::Explorer;
+    app.tree.header_new_file_btn = cell(20);
+    app.tree.header_new_folder_btn = cell(23);
+    app.tree.header_refresh_btn = cell(26);
+    app.tree.header_collapse_btn = cell(29);
+    app.tree.header_views_btn = cell(32);
+    assert_eq!(app.ui_tooltip_at(20, 1), Some("New File..."));
+    assert_eq!(app.ui_tooltip_at(23, 1), Some("New Folder..."));
+    assert_eq!(app.ui_tooltip_at(26, 1), Some("Refresh Explorer"));
+    assert_eq!(
+        app.ui_tooltip_at(29, 1),
+        Some("Collapse Folders in Explorer")
+    );
+    assert_eq!(app.ui_tooltip_at(32, 1), Some("Views and More Actions..."));
+
+    // Remote Explorer header (the + / refresh in Image #2/#3).
+    app.sidebar_view = SidebarView::Remote;
+    app.remote.header_add_btn = cell(20);
+    app.remote.header_refresh_btn = cell(23);
+    assert_eq!(
+        app.ui_tooltip_at(20, 1),
+        Some("Open SSH Configuration File...")
+    );
+    assert_eq!(app.ui_tooltip_at(23, 1), Some("Refresh"));
+
+    // Source Control header refresh.
+    app.sidebar_view = SidebarView::SourceControl;
+    app.source_control.header_refresh_btn = cell(20);
+    assert_eq!(app.ui_tooltip_at(20, 1), Some("Refresh"));
+
+    // A view's stored rects go inert once another view is showing, so the
+    // Remote add button at col 20 must not leak its hint into Explorer.
+    app.sidebar_view = SidebarView::Explorer;
+    assert_eq!(app.ui_tooltip_at(23, 1), Some("New Folder..."));
 }
 
 fn dummy_activity_images() -> ActivityBarImages {

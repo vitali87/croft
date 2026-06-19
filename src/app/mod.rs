@@ -3154,12 +3154,48 @@ impl App {
                 ActivityIcon::Settings => "Manage",
             });
         }
-        // Search panel actions/toggles, only while the SEARCH view is showing
-        // (its stored geometry is stale once another view replaces it).
-        if self.sidebar_view == SidebarView::Search
-            && let Some(label) = self.search.tooltip_at(col, row)
-        {
-            return Some(label);
+        // Sidebar header actions, dispatched by the view that owns them so a
+        // panel's stored geometry is never consulted once another view has
+        // replaced it on screen.
+        match self.sidebar_view {
+            SidebarView::Search => {
+                if let Some(label) = self.search.tooltip_at(col, row) {
+                    return Some(label);
+                }
+            }
+            SidebarView::Explorer => {
+                let t = &self.tree;
+                if rect_contains(t.header_new_file_btn, col, row) {
+                    return Some("New File...");
+                }
+                if rect_contains(t.header_new_folder_btn, col, row) {
+                    return Some("New Folder...");
+                }
+                if rect_contains(t.header_refresh_btn, col, row) {
+                    return Some("Refresh Explorer");
+                }
+                if rect_contains(t.header_collapse_btn, col, row) {
+                    return Some("Collapse Folders in Explorer");
+                }
+                if rect_contains(t.header_views_btn, col, row) {
+                    return Some("Views and More Actions...");
+                }
+            }
+            SidebarView::Remote => {
+                let r = &self.remote;
+                if rect_contains(r.header_add_btn, col, row) {
+                    return Some("Open SSH Configuration File...");
+                }
+                if rect_contains(r.header_refresh_btn, col, row) {
+                    return Some("Refresh");
+                }
+            }
+            SidebarView::SourceControl => {
+                if rect_contains(self.source_control.header_refresh_btn, col, row) {
+                    return Some("Refresh");
+                }
+            }
+            SidebarView::RunDebug => {}
         }
         None
     }
@@ -6137,7 +6173,17 @@ impl App {
         let tooltip_grad = self.popup_gradient();
         if let Some(popup) = self.ui_tooltip.as_mut() {
             popup.gradient = tooltip_grad;
-            let area = popup.area_for(frame.area());
+            let full = frame.area();
+            let mut area = popup.area_for(full);
+            // Keep the box clear of the activity bar's inline-image column. Those
+            // codicon glyphs are a terminal graphics layer that always composites
+            // ABOVE text cells, so any overlap would paint over (hide) the left of
+            // the tooltip. Shift it to the right of the bar instead, like VS Code
+            // floats an activity-icon hint beside the icon.
+            if area.x < ACTIVITY_BAR_WIDTH {
+                area.x = ACTIVITY_BAR_WIDTH;
+                area.width = area.width.min(full.width.saturating_sub(area.x));
+            }
             if area.width > 0 && area.height > 0 {
                 frame.render_widget(&*popup, area);
             }
