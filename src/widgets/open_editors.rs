@@ -62,7 +62,9 @@ pub struct OpenEditorsPanel {
 impl OpenEditorsPanel {
     pub fn new() -> Self {
         Self {
-            collapsed: false,
+            // Start collapsed (a 1-row chevron strip), like OUTLINE, so a fresh
+            // Explorer is compact; the user expands what they want.
+            collapsed: true,
             items: Vec::new(),
             scroll: 0,
             focus_gradient: false,
@@ -352,7 +354,8 @@ mod tests {
 
     #[test]
     fn empty_expanded_shows_one_message_row() {
-        let p = OpenEditorsPanel::new();
+        let mut p = OpenEditorsPanel::new();
+        p.collapsed = false;
         assert_eq!(
             p.desired_height(40),
             3,
@@ -363,6 +366,7 @@ mod tests {
     #[test]
     fn row_at_maps_clicks_to_items() {
         let mut p = OpenEditorsPanel::new();
+        p.collapsed = false;
         p.set_items(vec![item("a.rs", false, true), item("b.rs", true, false)]);
         let area = Rect {
             x: 0,
@@ -401,6 +405,7 @@ mod tests {
     #[test]
     fn dirty_tab_draws_a_dot() {
         let mut p = OpenEditorsPanel::new();
+        p.collapsed = false;
         p.set_items(vec![item("dirty.rs", true, false)]);
         let text = rendered_text(&mut p, 24, 4);
         assert!(text.contains('●'), "dirty editor must show a dot: {text:?}");

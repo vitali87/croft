@@ -5,7 +5,7 @@
 //! — it answers "what am I building against?" at a glance without leaving the
 //! editor. Non-Cargo workspaces settle to an empty state, never an error.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use ratatui::{
@@ -50,6 +50,37 @@ struct MetaPackage {
     version: String,
 }
 
+/// Absolute path to the `cargo` binary. Prefers one on `PATH`, then the usual
+/// rustup / Homebrew locations. A GUI-launched croft inherits the stripped
+/// launchd `PATH` that omits `~/.cargo/bin`, so a bare `Command::new("cargo")`
+/// silently fails to spawn there (the "No Cargo workspace" bug) even though
+/// `git` — which lives in `/usr/bin` — is found. Resolving by absolute path,
+/// like croft already does for language servers, makes it launch-agnostic.
+fn cargo_binary() -> PathBuf {
+    if let Some(path_var) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path_var) {
+            let candidate = dir.join("cargo");
+            if candidate.is_file() {
+                return candidate;
+            }
+        }
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        let candidate = PathBuf::from(home).join(".cargo").join("bin").join("cargo");
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+    for dir in ["/opt/homebrew/bin", "/usr/local/bin"] {
+        let candidate = PathBuf::from(dir).join("cargo");
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+    // Last resort: let the OS resolve it and fail honestly into the empty state.
+    PathBuf::from("cargo")
+}
+
 /// Resolve the workspace's full (transitive) dependency set off the render
 /// thread. Returns every non-workspace package as a `name version` row,
 /// sorted and de-duplicated. An empty vec means "not a Cargo workspace" or
@@ -58,11 +89,21 @@ pub fn fetch_dependencies(root: &Path) -> Vec<RustDep> {
     let Some(path_str) = root.to_str() else {
         return Vec::new();
     };
-    let output = Command::new("cargo")
-        .args(["metadata", "--format-version", "1"])
-        .current_dir(path_str)
-        .output();
-    let Ok(output) = output else {
+    let cargo = cargo_binary();
+    let mut cmd = Command::new(&cargo);
+    cmd.args(["metadata", "--format-version", "1"])
+        .current_dir(path_str);
+    // Prepend cargo's own dir to the child PATH so the rustup shim can find its
+    // sibling `rustc` even when croft launched with a stripped PATH.
+    if let Some(dir) = cargo.parent() {
+        let existing = std::env::var_os("PATH").unwrap_or_default();
+        let mut dirs = vec![dir.to_path_buf()];
+        dirs.extend(std::env::split_paths(&existing));
+        if let Ok(joined) = std::env::join_paths(dirs) {
+            cmd.env("PATH", joined);
+        }
+    }
+    let Ok(output) = cmd.output() else {
         return Vec::new();
     };
     if !output.status.success() {
@@ -118,7 +159,8 @@ pub struct RustDepsPanel {
 impl RustDepsPanel {
     pub fn new() -> Self {
         Self {
-            collapsed: false,
+            // Start collapsed (a 1-row chevron strip), like OUTLINE.
+            collapsed: true,
             deps: Vec::new(),
             loaded: false,
             scroll: 0,
@@ -410,6 +452,7 @@ mod tests {
     #[test]
     fn renders_name_and_version() {
         let mut p = RustDepsPanel::new();
+        p.collapsed = false;
         p.set_deps(vec![RustDep {
             name: "ratatui".into(),
             version: "0.30.0".into(),
@@ -422,6 +465,7 @@ mod tests {
     #[test]
     fn empty_after_load_says_no_cargo_workspace() {
         let mut p = RustDepsPanel::new();
+        p.collapsed = false;
         p.set_deps(vec![]);
         let text = rendered_text(&mut p, 36, 4);
         assert!(text.contains("No Cargo workspace"), "got:\n{text}");

@@ -54,7 +54,8 @@ pub struct TimelinePanel {
 impl TimelinePanel {
     pub fn new() -> Self {
         Self {
-            collapsed: false,
+            // Start collapsed (a 1-row chevron strip), like OUTLINE.
+            collapsed: true,
             path: None,
             entries: Vec::new(),
             loaded: false,
@@ -388,8 +389,8 @@ mod tests {
 
     #[test]
     fn loading_then_no_history_messages() {
-        // The panel is expanded by default, so no toggle is needed.
         let mut p = TimelinePanel::new();
+        p.collapsed = false;
         // path set but no fetch landed yet → Loading.
         p.begin_loading("a.rs".into());
         let text = rendered_text(&mut p, 30, 6);
@@ -403,6 +404,7 @@ mod tests {
     #[test]
     fn row_at_resolves_both_rows_of_a_commit_to_one_index() {
         let mut p = TimelinePanel::new();
+        p.collapsed = false;
         p.set_history(
             "a.rs".into(),
             vec![entry("aaa", "first"), entry("bbb", "second")],
@@ -449,6 +451,7 @@ mod tests {
     #[test]
     fn renders_summary_author_and_age() {
         let mut p = TimelinePanel::new();
+        p.collapsed = false;
         p.set_history("a.rs".into(), vec![entry("abc", "feat: add views menu")]);
         let text = rendered_text(&mut p, 40, 6);
         assert!(text.contains("feat: add views menu"), "got:\n{text}");
