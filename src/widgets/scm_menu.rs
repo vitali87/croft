@@ -315,6 +315,51 @@ const FG: Color = Color::Rgb(0xe6, 0xe9, 0xef);
 const SEP_FG: Color = Color::Rgb(0x3b, 0x42, 0x52);
 const SUB_ARROW_FG: Color = Color::Rgb(0x9a, 0xa4, 0xb2);
 
+// Per-action icon accents, matching the Commit split-button dropdown so
+// the two menus read as one design: network/sync ops blue, branch/remote
+// cyan, commit/stage green, stash/tags amber, merge/rebase purple,
+// destructive ops red, neutral grey.
+const ACCENT_BLUE: Color = Color::Rgb(0x6c, 0xb6, 0xff);
+const ACCENT_CYAN: Color = Color::Rgb(0x88, 0xc0, 0xd0);
+const ACCENT_GREEN: Color = Color::Rgb(0xa3, 0xbe, 0x8c);
+const ACCENT_AMBER: Color = Color::Rgb(0xeb, 0xcb, 0x8b);
+const ACCENT_PURPLE: Color = Color::Rgb(0xc0, 0xa4, 0xf5);
+const ACCENT_RED: Color = Color::Rgb(0xe7, 0x70, 0x70);
+const ACCENT_GREY: Color = Color::Rgb(0x9a, 0xa4, 0xb2);
+
+/// Accent colour for a leaf's icon.
+fn action_color(action: ScmAction) -> Color {
+    use ScmAction::*;
+    match action {
+        Pull | Push | Fetch | Clone | Sync | PullRebase | PushTo | PushForce | PublishBranch
+        | CommitAndPush | CommitAndSync => ACCENT_BLUE,
+        CheckoutTo | CreateBranch | CreateBranchFrom => ACCENT_CYAN,
+        Commit | CommitStaged | CommitAll | StageAll | AddRemote => ACCENT_GREEN,
+        CommitAmend | RenameBranch => ACCENT_AMBER,
+        Merge | Rebase => ACCENT_PURPLE,
+        DiscardAll | DeleteBranch | RemoveRemote | DropStash | DeleteTag => ACCENT_RED,
+        Stash
+        | StashIncludeUntracked
+        | StashStaged
+        | ApplyStash
+        | PopStashLatest
+        | PopStashPick
+        | CreateTag => ACCENT_AMBER,
+        UnstageAll | ShowGitOutput => ACCENT_GREY,
+    }
+}
+
+/// Accent colour for a submenu parent row, by category.
+fn submenu_color(label: &str) -> Color {
+    match label {
+        "Commit" | "Changes" => ACCENT_GREEN,
+        "Pull, Push" => ACCENT_BLUE,
+        "Branch" | "Remote" => ACCENT_CYAN,
+        "Stash" | "Tags" => ACCENT_AMBER,
+        _ => ACCENT_GREY,
+    }
+}
+
 /// Width a column needs to show the longest of `labels` as
 /// `[pad][icon][gap][label][gap][›][pad]`.
 fn column_width(labels: impl Iterator<Item = usize>, with_arrow: bool) -> u16 {
@@ -370,13 +415,13 @@ pub fn render(state: &mut ScmMenuState, anchor: Rect, screen: Rect, buf: &mut Bu
                 }
             }
             Node::Item(l) => {
-                paint_row(buf, row, l.icon, l.label, false, BG);
+                paint_row(buf, row, l.icon, action_color(l.action), l.label, false, BG);
                 state.top_hits.push((row, TopHit::Action(l.action)));
             }
             Node::Sub { label, icon, .. } => {
                 let is_open = state.expanded == Some(i);
                 let row_bg = if is_open { SUB_BG } else { BG };
-                paint_row(buf, row, *icon, label, true, row_bg);
+                paint_row(buf, row, *icon, submenu_color(label), label, true, row_bg);
                 state.top_hits.push((row, TopHit::Expand(i)));
             }
         }
@@ -416,7 +461,15 @@ pub fn render(state: &mut ScmMenuState, anchor: Rect, screen: Rect, buf: &mut Bu
                 width: sub_rect.width,
                 height: 1,
             };
-            paint_row(buf, row, l.icon, l.label, false, SUB_BG);
+            paint_row(
+                buf,
+                row,
+                l.icon,
+                action_color(l.action),
+                l.label,
+                false,
+                SUB_BG,
+            );
             state.sub_hits.push((row, l.action));
         }
     }
@@ -433,9 +486,22 @@ fn fill(buf: &mut Buffer, rect: Rect, bg: Color) {
     }
 }
 
-fn paint_row(buf: &mut Buffer, row: Rect, icon: char, label: &str, submenu: bool, bg: Color) {
+fn paint_row(
+    buf: &mut Buffer,
+    row: Rect,
+    icon: char,
+    icon_color: Color,
+    label: &str,
+    submenu: bool,
+    bg: Color,
+) {
     let fg = Style::default().fg(FG).bg(bg);
-    buf.set_string(row.x + 1, row.y, icon.to_string(), fg);
+    buf.set_string(
+        row.x + 1,
+        row.y,
+        icon.to_string(),
+        Style::default().fg(icon_color).bg(bg),
+    );
     let label_x = row.x + 3;
     let avail = row.width.saturating_sub(3 + if submenu { 2 } else { 1 }) as usize;
     let shown: String = label.chars().take(avail).collect();
@@ -503,6 +569,27 @@ mod tests {
         assert_eq!(
             st.click(rect.x, rect.y),
             ClickOutcome::Fire(ScmAction::Pull)
+        );
+    }
+
+    #[test]
+    fn leaf_icons_carry_their_per_action_accent_colour() {
+        let mut st = ScmMenuState::default();
+        let screen = Rect::new(0, 0, 120, 40);
+        let mut buf = Buffer::empty(screen);
+        st.open = true;
+        render(&mut st, Rect::new(10, 0, 2, 1), screen, &mut buf);
+        let (rect, _) = st
+            .top_hits
+            .iter()
+            .find(|(_, t)| *t == TopHit::Action(ScmAction::Pull))
+            .copied()
+            .unwrap();
+        // The icon sits one cell in from the row's left edge.
+        assert_eq!(
+            buf[(rect.x + 1, rect.y)].fg,
+            ACCENT_BLUE,
+            "the Pull icon must be painted in its blue accent, not the neutral foreground"
         );
     }
 
