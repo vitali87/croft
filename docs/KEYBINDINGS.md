@@ -64,7 +64,7 @@ On macOS, the `Cmd` chords below only reach croft after you run a one-time setup
 | `Cmd`+`Opt`+`R` (local macOS only) | Reveal the selected entry in Finder |
 | Right-click | Context menu: Cut, Copy, Paste, Rename, Delete, Reveal in Finder (local macOS), and New File / New Folder on empty space |
 | Click the Explorer root-folder icons | New File, New Folder, Refresh Explorer, and Collapse Folders, right-aligned on the root folder row and shown only while the Explorer is focused, mirroring VS Code's workspace-folder actions (New File / New Folder also on `Cmd+F` / `Cmd+Shift+N`) |
-| Click the `⋯` button on the EXPLORER title line | Open the "Views and More Actions" menu: toggle which sub-views stack in the Explorer (Open Editors, Folders, Outline, Timeline, Rust Dependencies), each with a checkmark when shown. Choices persist across launches |
+| Click the `⋯` button on the EXPLORER title line | Open the "Views and More Actions" menu: toggle which sub-views stack in the Explorer (Open Editors, Folders, Outline, Timeline, and a language-aware Dependencies view that only appears when the workspace root has a recognized manifest), each with a checkmark when shown. Choices persist across launches |
 | Click a row in OPEN EDITORS | Activate that editor's tab (dirty tabs show a dot, the active tab is highlighted) |
 | Click a commit in TIMELINE | Open that commit's diff for the active file in a read-only editor tab |
 

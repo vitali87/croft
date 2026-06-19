@@ -1,6 +1,7 @@
 pub mod command_palette;
 pub mod completion_popup;
 pub mod connect_dialog;
+pub mod dependencies;
 pub mod diff;
 pub mod editor;
 pub mod editor_find;
@@ -15,7 +16,6 @@ pub mod outline;
 pub mod process_picker;
 pub mod remote;
 pub mod run_debug;
-pub mod rust_deps;
 pub mod scrollbar;
 pub mod search;
 pub mod shortcuts;

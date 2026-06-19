@@ -28,8 +28,10 @@ pub struct ExplorerViewsPrefs {
     pub outline: bool,
     #[serde(default = "default_true")]
     pub timeline: bool,
-    #[serde(default = "default_true")]
-    pub rust_dependencies: bool,
+    /// The DEPENDENCIES view. `alias` keeps configs written under the old
+    /// Rust-only `rust_dependencies` key parsing into this generalized field.
+    #[serde(default = "default_true", alias = "rust_dependencies")]
+    pub dependencies: bool,
 }
 
 fn default_true() -> bool {
@@ -43,7 +45,7 @@ impl Default for ExplorerViewsPrefs {
             folders: true,
             outline: true,
             timeline: true,
-            rust_dependencies: true,
+            dependencies: true,
         }
     }
 }
@@ -229,7 +231,13 @@ mod tests {
         let old = Prefs::load(&path).expect("load old").explorer_views;
         assert_eq!(old, ExplorerViewsPrefs::default());
         assert!(!old.open_editors);
-        assert!(old.folders && old.outline && old.timeline && old.rust_dependencies);
+        assert!(old.folders && old.outline && old.timeline && old.dependencies);
+        // A config written under the pre-generalization `rust_dependencies` key
+        // still drives the renamed `dependencies` field via the serde alias.
+        std::fs::write(&path, r#"{"explorer_views":{"rust_dependencies":false}}"#)
+            .expect("write legacy config");
+        let legacy = Prefs::load(&path).expect("load legacy").explorer_views;
+        assert!(!legacy.dependencies, "old rust_dependencies key aliases in");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

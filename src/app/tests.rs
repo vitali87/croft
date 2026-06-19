@@ -12508,28 +12508,63 @@ fn debug_console_is_retained_after_the_session_ends() {
 }
 
 #[test]
-fn explorer_views_menu_lists_all_five_toggles_with_checkmarks() {
-    // The ⋯ "Views and More Actions" menu offers every sub-view with a leading
-    // checkmark reflecting its current visibility (VS Code's view-toggle menu).
+fn explorer_views_menu_omits_dependencies_in_a_folder_with_no_manifest() {
+    // A plain folder carries no package manifest, so the DEPENDENCIES view is
+    // not offered at all — mirroring how rust-analyzer's "Rust Dependencies"
+    // view simply does not exist outside a Rust project. The other four views
+    // are always available, each with a checkmark reflecting its visibility.
     let tmp = tempfile::tempdir().unwrap();
     std::fs::write(tmp.path().join("main.rs"), "fn main() {}\n").unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.open_explorer_views_menu();
     let menu = app.context_menu.as_ref().expect("menu must open");
-    assert_eq!(menu.items.len(), ExplorerView::ALL.len());
-    for (view, (label, _)) in ExplorerView::ALL.iter().zip(menu.items.iter()) {
-        assert!(
-            label.contains(view.label()),
-            "menu row for {view:?} should name the view: {label:?}"
-        );
-        // Checked views lead with a check glyph; hidden ones do not.
+    assert_eq!(
+        menu.items.len(),
+        ExplorerView::ALL.len() - 1,
+        "the Dependencies row is dropped when no manifest is present"
+    );
+    assert!(
+        !menu
+            .items
+            .iter()
+            .any(|(label, _)| label.contains("Dependencies")),
+        "no dependency toggle in a manifest-less folder: {:?}",
+        menu.items
+    );
+    for (label, _) in &menu.items {
         let checked = label.starts_with('\u{2713}');
-        assert_eq!(
-            checked,
-            app.explorer_views.is_visible(*view),
-            "checkmark must reflect visibility for {view:?}"
-        );
+        // Every listed row names an always-available view and its check glyph
+        // matches that view's current visibility.
+        let view = ExplorerView::ALL
+            .iter()
+            .find(|v| label.contains(v.label()))
+            .unwrap_or_else(|| panic!("unrecognized menu row {label:?}"));
+        assert_eq!(checked, app.explorer_views.is_visible(*view));
     }
+}
+
+#[test]
+fn explorer_views_menu_labels_dependencies_for_the_detected_ecosystem() {
+    // A Cargo workspace makes the DEPENDENCIES view appear, labeled for the
+    // detected ecosystem ("Rust Dependencies"), so the menu is language-aware
+    // rather than hardcoded.
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("Cargo.toml"),
+        "[package]\nname = \"x\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.open_explorer_views_menu();
+    let menu = app.context_menu.as_ref().expect("menu must open");
+    assert_eq!(menu.items.len(), ExplorerView::ALL.len());
+    assert!(
+        menu.items
+            .iter()
+            .any(|(label, _)| label.contains("Rust Dependencies")),
+        "a Cargo root labels the view 'Rust Dependencies': {:?}",
+        menu.items
+    );
 }
 
 #[test]
