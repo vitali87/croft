@@ -5,6 +5,7 @@
 
 use ratatui::{
     buffer::Buffer,
+    layout::Rect,
     style::{Color, Modifier, Style},
 };
 
@@ -32,11 +33,13 @@ pub const NEW_FOLDER_GLYPH: char = '\u{ea80}';
 /// Codicon `cod-collapse_all` — the stacked-rows-with-minus glyph for
 /// "Collapse Folders in Explorer". Nerd Fonts `cod-collapse_all` = U+EAC5.
 pub const COLLAPSE_ALL_GLYPH: char = '\u{eac5}';
-/// The "Views and More Actions" (⋯) affordance VS Code paints at the right of
-/// a view-container header. A plain horizontal ellipsis (U+2026) rather than a
-/// codicon PUA glyph, so it renders on every terminal/font — the same
+/// The "Views and More Actions" (⋯) affordance VS Code paints at the right of a
+/// view-container header, as a space-padded action label so it reads as a real
+/// pill inset from the rounded corner — the same `" + "` treatment the terminal
+/// pane buttons wear. A plain horizontal ellipsis (U+2026) rather than a codicon
+/// PUA glyph, so it renders on every terminal/font — the same
 /// no-codicon-dependency reasoning behind the U+2715 close glyph.
-pub const MORE_GLYPH: char = '\u{2026}';
+pub const MORE_LABEL: &str = " \u{2026} ";
 
 /// Paint a header pill button at cell `(x, y)`. `brand` is true under the
 /// Black theme: a chipless teal icon in the VS Code toolbar spirit that grows
@@ -72,10 +75,67 @@ pub fn render(buf: &mut Buffer, x: u16, y: u16, glyph: char, brand: bool, hovere
     buf.set_string(x, y, glyph.to_string(), style);
 }
 
+/// The shared style for a header *action* pill — the space-padded `" + "` /
+/// `" ⋯ "` affordances that sit on a pane's top border. This is the single
+/// source of truth the terminal pane buttons and the Explorer `⋯` button both
+/// draw from, so the two can never drift apart again:
+///
+/// * Croft Dark (`!brand`): white-on-navy chip, bold (the historical look).
+/// * Black idle (`brand`, not hovered): a chipless teal icon in the VS Code
+///   toolbar spirit (`icon.foreground`), no bold.
+/// * Black hover: white on the muted teal `POPUP_SEL_BG` pill standing in for
+///   `toolbar.hoverBackground`.
+pub fn action_style(brand: bool, hovered: bool) -> Style {
+    if !brand {
+        return Style::default()
+            .fg(Color::White)
+            .bg(HEADER_BTN_BG)
+            .add_modifier(Modifier::BOLD);
+    }
+    if hovered {
+        Style::default()
+            .fg(Color::White)
+            .bg(crate::gradient::rgb_color(crate::gradient::POPUP_SEL_BG))
+    } else {
+        Style::default().fg(crate::gradient::rgb_color(crate::gradient::INNER_ACCENT))
+    }
+}
+
+/// Paint a space-padded action label (e.g. `" ⋯ "`) as a header pill whose top
+/// edge sits inset one cell from the pane's rounded corner, and return its
+/// hit-test rect. This is the design the terminal `+` / `-` buttons use; the
+/// Explorer `⋯` shares it verbatim via [`action_style`]. `right_edge` is the
+/// pane's right border column (`area.x + area.width - 1`); the label is laid
+/// out ending one cell short of it so the rounded corner stays intact.
+///
+/// Returns `None` when the row is too narrow to seat the padded label without
+/// colliding with the corner.
+pub fn render_action(
+    buf: &mut Buffer,
+    right_edge: u16,
+    y: u16,
+    label: &str,
+    brand: bool,
+    pointer: Option<(u16, u16)>,
+) -> Option<Rect> {
+    let w = label.chars().count() as u16;
+    if right_edge < w + 1 {
+        return None;
+    }
+    let x = right_edge - w; // leave the corner cell (right_edge) for the border
+    let hovered = pointer.is_some_and(|(px, py)| py == y && px >= x && px < x + w);
+    buf.set_string(x, y, label, action_style(brand, hovered));
+    Some(Rect {
+        x,
+        y,
+        width: w,
+        height: 1,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::layout::Rect;
 
     #[test]
     fn croft_dark_highlight_wraps_exactly_the_glyph_cell() {

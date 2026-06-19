@@ -1219,33 +1219,21 @@ impl Widget for &mut FileTree {
 
         // Paint the ⋯ button at the right end of the title border row. It is
         // always available (not focus-gated) so the view-toggle menu is one
-        // click away even when the tree is unfocused, like VS Code.
-        if area.width > 12 {
-            let bx = area.x + area.width - 2;
-            let by = area.y;
-            let hovered = crate::widgets::hover::contains(
-                Rect {
-                    x: bx,
-                    y: by,
-                    width: 1,
-                    height: 1,
-                },
-                self.hover_pointer,
-            );
-            crate::widgets::header_pill::render(
+        // click away even when the tree is unfocused, like VS Code. It wears
+        // the shared header-action pill — a space-padded `" ⋯ "` inset one cell
+        // from the rounded corner — so it matches the terminal `+` button
+        // exactly instead of jamming a naked glyph against the corner.
+        if area.width > 12
+            && let Some(rect) = crate::widgets::header_pill::render_action(
                 buf,
-                bx,
-                by,
-                crate::widgets::header_pill::MORE_GLYPH,
+                area.x + area.width - 1,
+                area.y,
+                crate::widgets::header_pill::MORE_LABEL,
                 self.focus_gradient,
-                hovered,
-            );
-            self.header_views_btn = Rect {
-                x: bx,
-                y: by,
-                width: 1,
-                height: 1,
-            };
+                self.hover_pointer,
+            )
+        {
+            self.header_views_btn = rect;
         }
 
         self.last_inner = inner;
@@ -1575,7 +1563,7 @@ mod tests {
         );
         let title_row: String = (0..area.width).map(|x| buf[(x, area.y)].symbol()).collect();
         assert!(
-            title_row.contains(crate::widgets::header_pill::MORE_GLYPH),
+            title_row.contains(crate::widgets::header_pill::MORE_LABEL.trim()),
             "title row missing the ⋯ glyph: {title_row:?}"
         );
     }

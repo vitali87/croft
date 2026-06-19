@@ -12971,7 +12971,7 @@ impl App {
                     }
                     // The ⋯ "Views and More Actions" button on the EXPLORER
                     // title line opens the menu that toggles which sub-views
-                    // (Open Editors / Folders / Outline / Timeline / Rust
+                    // (Open Editors / Folders / Outline / Timeline /
                     // Dependencies) are stacked in the panel.
                     if rect_contains(self.tree.header_views_btn, m.column, m.row) {
                         self.open_explorer_views_menu();
@@ -16398,24 +16398,12 @@ fn paint_terminal_pane_buttons(
         return (None, None);
     }
     let y = area.y;
-    // Black theme (`brand`): quiet teal icons in the VS Code toolbar spirit
-    // (`icon.foreground`), with the muted dark-teal pill on hover standing in
-    // for `toolbar.hoverBackground`. Croft Dark keeps the navy chips.
+    // Styling is the shared header-action look (see `header_pill::action_style`):
+    // quiet teal icons under Black with a teal hover pill, navy chips under
+    // Croft Dark. The Explorer `⋯` button draws from the same source of truth.
     let style_at = |x: u16, w: u16| -> Style {
-        if !brand {
-            return Style::default()
-                .fg(Color::White)
-                .bg(Color::Rgb(0x1e, 0x3a, 0x6e))
-                .add_modifier(Modifier::BOLD);
-        }
         let hovered = pointer.is_some_and(|(px, py)| py == y && px >= x && px < x + w);
-        if hovered {
-            Style::default()
-                .fg(Color::White)
-                .bg(crate::gradient::rgb_color(crate::gradient::POPUP_SEL_BG))
-        } else {
-            Style::default().fg(crate::gradient::rgb_color(crate::gradient::INNER_ACCENT))
-        }
+        crate::widgets::header_pill::action_style(brand, hovered)
     };
     let mut add_rect: Option<Rect> = None;
     let mut close_rect: Option<Rect> = None;
