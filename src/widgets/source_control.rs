@@ -1123,7 +1123,11 @@ impl Widget for &mut SourceControlPanel {
             };
             self.last_button_area = main_area;
             self.last_commit_caret_area = caret_area;
-            render_rounded_button(buf, main_area, "✓ Commit", blue, white);
+            // Nerd Fonts `cod-check` (U+EAB2, verified against
+            // ryanoasis/nerd-fonts glyphnames.json v3.4.0) — the same crisp
+            // codicon VS Code paints on its Commit button, replacing the
+            // generic Unicode check that did not match the dropdown glyphs.
+            render_rounded_button(buf, main_area, "\u{eab2} Commit", blue, white);
             render_rounded_button(buf, caret_area, "▾", blue, white);
         } else {
             let button_area = Rect {
