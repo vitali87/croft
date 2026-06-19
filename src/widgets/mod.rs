@@ -1,3 +1,4 @@
+pub mod branch_picker;
 pub mod command_palette;
 pub mod completion_popup;
 pub mod connect_dialog;

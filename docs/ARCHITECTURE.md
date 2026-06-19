@@ -18,7 +18,7 @@ src/
 ├── cli.rs               clap CLI: open path, setup-terminal / setup-iterm2 / setup-cross / remote / keys subcommands
 ├── clipboard.rs         native macOS clipboard read/write (NSPasteboard) with pbpaste fallback
 ├── ghostty.rs           Ghostty config keybinds (setup-ghostty): re-emit every croft chord as its CSI-u sequence so Ghostty's own binds don't swallow them
-├── git.rs               branch / dirty / ahead-behind status, plus an anonymous shallow `git clone` (over the remote's HTTPS URL) fetching the welcome-screen recents
+├── git.rs               branch / dirty / ahead-behind status, the working-tree operations the Source Control panel drives (stage, unstage, commit, push, pull, branch list / checkout / create, stash push / pop, discard, diffs), plus an anonymous shallow `git clone` (over the remote's HTTPS URL) fetching the welcome-screen recents
 ├── gradient.rs          shared orange→green corner gradient: the welcome activity box border and the Black-theme focused-pane border
 ├── highlight.rs         tree-sitter highlight registry per language
 ├── icons.rs             Codicon and file-type Nerd Font glyphs and per-language colors
@@ -91,7 +91,8 @@ src/
     ├── scrollbar.rs     shared vertical- and horizontal-scrollbar geometry
     ├── search.rs        sidebar search panel (query/replace/include/exclude inputs) + .gitignore-aware walker, glob filtering, and replace
     ├── shortcuts.rs     F1 shortcuts modal: every binding grouped by pane, scrollable
-    ├── source_control.rs Source Control sidebar widget: branch summary, commit input, change list, commit button, header refresh pill, no-repo hero
+    ├── branch_picker.rs Checkout / Create Branch quick-pick overlay: type to filter the repo's branches, Enter to switch or create-and-switch; pure widget fed by `git::list_branches`
+    ├── source_control.rs Source Control sidebar widget: branch summary (click to open the branch picker), commit input, change list, inline stage/unstage/discard row actions, commit split-button + actions menu (push/pull/sync/branch/stash/diffs), header refresh pill, no-repo hero
     ├── terminal.rs      portable-pty + alacritty_terminal + ratatui integration with selection + scrollback
     ├── timeline.rs      collapsible TIMELINE section: the active file's git history (`git log --follow`) fetched off-thread, two rows per commit (summary + author/age), click-to-open the commit's diff; a ⋯-menu Explorer sub-view
     └── zoxide_jump.rs   Cmd+Z zoxide jump popup: fuzzy directory jumper that re-roots + cd's the terminal

@@ -1423,6 +1423,7 @@ pub struct App {
     /// only from the Explorer pane, so it never collides with the editor's
     /// Cmd+Z undo.
     pub zoxide_jump: Option<crate::widgets::zoxide_jump::ZoxideJump>,
+    pub branch_picker: Option<crate::widgets::branch_picker::BranchPicker>,
     /// Cached workspace file index. Built lazily on first Cmd+P and
     /// shared across reopens so repeated invocations are instant.
     file_finder_index: Option<std::sync::Arc<Vec<crate::widgets::file_finder::FileEntry>>>,
@@ -1900,6 +1901,7 @@ impl App {
             debug_console: Vec::new(),
             debug_ever_stopped: false,
             zoxide_jump: None,
+            branch_picker: None,
             file_finder_index: None,
             file_finder_index_rx: Some(file_finder_index_rx),
             file_finder_index_dirty: false,
@@ -2213,6 +2215,7 @@ impl App {
             || self.command_palette.is_some()
             || self.process_picker.is_some()
             || self.zoxide_jump.is_some()
+            || self.branch_picker.is_some()
         {
             return;
         }
@@ -2278,6 +2281,7 @@ impl App {
             || self.command_palette.is_some()
             || self.process_picker.is_some()
             || self.zoxide_jump.is_some()
+            || self.branch_picker.is_some()
         {
             return;
         }
@@ -2356,6 +2360,7 @@ impl App {
         let should_show = self.shortcuts_modal.is_none()
             && self.file_finder.is_none()
             && self.zoxide_jump.is_none()
+            && self.branch_picker.is_none()
             && self.show_tree
             && self.sidebar_view == SidebarView::Remote
             && self.remote.targets.is_empty();
@@ -2707,6 +2712,7 @@ impl App {
             || self.command_palette.is_some()
             || self.process_picker.is_some()
             || self.zoxide_jump.is_some()
+            || self.branch_picker.is_some()
             || self.connect_dialog.is_some()
         {
             if let Some((px, py)) = self.overlays.badge.take_last_emitted() {
@@ -6185,6 +6191,7 @@ impl App {
         self.render_command_palette(frame);
         self.render_process_picker(frame);
         self.render_zoxide_jump(frame);
+        self.render_branch_picker(frame);
         self.render_shortcuts_modal(frame);
         self.render_connect_dialog(frame);
         // The startup unsupported-terminal nudge renders last so it sits above
@@ -6390,7 +6397,11 @@ impl App {
             // diff/compare glyphs in purple, mirroring VS Code's SCM accents.
             let icon_color = match item {
                 CommitMenuItem::CommitAndPush => Color::Rgb(0x9a, 0xa4, 0xb2),
-                CommitMenuItem::Push => Color::Rgb(0x6c, 0xb6, 0xff),
+                CommitMenuItem::Push | CommitMenuItem::Pull | CommitMenuItem::Sync => {
+                    Color::Rgb(0x6c, 0xb6, 0xff)
+                }
+                CommitMenuItem::CheckoutBranch => Color::Rgb(0x88, 0xc0, 0xd0),
+                CommitMenuItem::Stash | CommitMenuItem::StashPop => Color::Rgb(0xeb, 0xcb, 0x8b),
                 CommitMenuItem::ViewStagedDiff
                 | CommitMenuItem::ViewPreviousCommitDiff
                 | CommitMenuItem::ViewDefaultBranchDiff => Color::Rgb(0xc0, 0xa4, 0xf5),
@@ -6415,6 +6426,11 @@ impl App {
         match item {
             CommitMenuItem::CommitAndPush => self.commit_and_push_source_control(),
             CommitMenuItem::Push => self.push_source_control(),
+            CommitMenuItem::Pull => self.pull_source_control(),
+            CommitMenuItem::Sync => self.sync_source_control(),
+            CommitMenuItem::CheckoutBranch => self.open_branch_picker(),
+            CommitMenuItem::Stash => self.stash_source_control(),
+            CommitMenuItem::StashPop => self.stash_pop_source_control(),
             CommitMenuItem::ViewStagedDiff => self.view_staged_diff_source_control(),
             CommitMenuItem::ViewPreviousCommitDiff => {
                 self.view_previous_commit_diff_source_control()
@@ -6832,6 +6848,10 @@ impl App {
         }
         if self.zoxide_jump.is_some() {
             self.handle_zoxide_jump_key(key);
+            return Ok(());
+        }
+        if self.branch_picker.is_some() {
+            self.handle_branch_picker_key(key);
             return Ok(());
         }
         if matches!(key.code, KeyCode::F(1)) {
@@ -8413,6 +8433,126 @@ impl App {
         }
         self.git.bypass_debounce();
         self.refresh_git_status_debounced();
+    }
+
+    /// Pull the current branch from its upstream. Sibling of
+    /// `push_source_control`, reached from the commit dropdown's "Pull".
+    pub fn pull_source_control(&mut self) {
+        match crate::git::pull_current_branch(&self.tree.root) {
+            Ok(summary) => {
+                self.source_control.commit_feedback = Some(if summary.is_empty() {
+                    "pulled".to_string()
+                } else {
+                    format!("pulled: {summary}")
+                });
+                self.source_control.commit_feedback_is_error = false;
+                self.status = format!("Pulled: {summary}");
+            }
+            Err(err) => {
+                self.source_control.commit_feedback = Some(format!("pull failed: {err}"));
+                self.source_control.commit_feedback_is_error = true;
+                self.status = format!("Pull failed: {err}");
+            }
+        }
+        self.git.bypass_debounce();
+        self.refresh_git_status_debounced();
+        self.refresh_source_control();
+    }
+
+    /// Sync = pull then push, mirroring VS Code's sync button. A failed
+    /// pull short-circuits (we never push on top of an unmerged tree); a
+    /// successful pull followed by a failed push reports both halves.
+    pub fn sync_source_control(&mut self) {
+        let pull_summary = match crate::git::pull_current_branch(&self.tree.root) {
+            Ok(s) => s,
+            Err(err) => {
+                self.source_control.commit_feedback = Some(format!("sync: pull failed: {err}"));
+                self.source_control.commit_feedback_is_error = true;
+                self.status = format!("Sync failed on pull: {err}");
+                self.git.bypass_debounce();
+                self.refresh_git_status_debounced();
+                self.refresh_source_control();
+                return;
+            }
+        };
+        match crate::git::push_current_branch(&self.tree.root) {
+            Ok(push_summary) => {
+                self.source_control.commit_feedback = Some(format!(
+                    "synced (pulled: {pull_summary} | pushed: {push_summary})"
+                ));
+                self.source_control.commit_feedback_is_error = false;
+                self.status = String::from("Synced");
+            }
+            Err(err) => {
+                self.source_control.commit_feedback = Some(format!("pull ok; push failed: {err}"));
+                self.source_control.commit_feedback_is_error = true;
+                self.status = format!("Sync: pull ok; push failed: {err}");
+            }
+        }
+        self.git.bypass_debounce();
+        self.refresh_git_status_debounced();
+        self.refresh_source_control();
+    }
+
+    /// Stash the working tree (`git stash push`). Reached from the commit
+    /// dropdown's "Stash" item.
+    pub fn stash_source_control(&mut self) {
+        match crate::git::stash_push(&self.tree.root) {
+            Ok(summary) => {
+                self.source_control.commit_feedback = Some(format!("stashed: {summary}"));
+                self.source_control.commit_feedback_is_error = false;
+                self.status = format!("Stashed: {summary}");
+            }
+            Err(err) => {
+                self.source_control.commit_feedback = Some(format!("stash failed: {err}"));
+                self.source_control.commit_feedback_is_error = true;
+                self.status = format!("Stash failed: {err}");
+            }
+        }
+        self.git.bypass_debounce();
+        self.refresh_git_status_debounced();
+        self.refresh_source_control();
+    }
+
+    /// Restore the most recent stash (`git stash pop`). A pop conflict is
+    /// surfaced verbatim so the user can resolve it.
+    pub fn stash_pop_source_control(&mut self) {
+        match crate::git::stash_pop(&self.tree.root) {
+            Ok(summary) => {
+                self.source_control.commit_feedback = Some(format!("popped: {summary}"));
+                self.source_control.commit_feedback_is_error = false;
+                self.status = format!("Stash popped: {summary}");
+            }
+            Err(err) => {
+                self.source_control.commit_feedback = Some(format!("stash pop failed: {err}"));
+                self.source_control.commit_feedback_is_error = true;
+                self.status = format!("Stash pop failed: {err}");
+            }
+        }
+        self.git.bypass_debounce();
+        self.refresh_git_status_debounced();
+        self.refresh_source_control();
+    }
+
+    /// Unstage a single entry by index (the inline "−" icon on a staged
+    /// row). Mirror of `stage_source_control_entry`.
+    pub fn unstage_source_control_entry(&mut self, entry_idx: usize) {
+        let Some(entry) = self.source_control.entries.get(entry_idx).cloned() else {
+            return;
+        };
+        match crate::git::unstage_path(&self.tree.root, &entry.path) {
+            Ok(()) => {
+                self.status = format!("Unstaged {}", entry.path);
+                self.git.bypass_debounce();
+                self.refresh_git_status_debounced();
+                self.refresh_source_control();
+            }
+            Err(err) => {
+                self.status = format!("Unstage failed: {err}");
+                self.source_control.commit_feedback = Some(err);
+                self.source_control.commit_feedback_is_error = true;
+            }
+        }
     }
 
     /// Open the staged-changes diff (`git diff --staged`) in a read-only
@@ -11900,6 +12040,186 @@ impl App {
         crate::widgets::zoxide_jump::render_zoxide_jump(jump, rect, frame.buffer_mut(), gradient);
     }
 
+    pub fn consume_branch_picker_image_clear(&mut self) -> bool {
+        self.overlays.branch_picker_clear.consume()
+    }
+
+    /// Open the Checkout / Create Branch picker, seeded with the repo's
+    /// branches (most-recently-committed first). A one-shot `git
+    /// for-each-ref` runs here, off the render path — same discipline as
+    /// the zoxide jumper. Outside a git repo there is nothing to pick, so
+    /// we report that instead of opening an empty box.
+    fn open_branch_picker(&mut self) {
+        if self.branch_picker.is_some() {
+            return;
+        }
+        self.commit_menu_open = false;
+        match crate::git::list_branches(&self.tree.root) {
+            Ok(branches) => {
+                let n = branches.len();
+                self.branch_picker =
+                    Some(crate::widgets::branch_picker::BranchPicker::new(branches));
+                self.overlays.branch_picker_clear.request();
+                self.status =
+                    format!("Branches: {n} — type to filter or name a new branch, Esc to close");
+            }
+            Err(err) => {
+                self.source_control.commit_feedback = Some(format!("branches: {err}"));
+                self.source_control.commit_feedback_is_error = true;
+                self.status = format!("Branch picker: {err}");
+            }
+        }
+    }
+
+    fn close_branch_picker(&mut self) {
+        if self.branch_picker.take().is_some() {
+            self.overlays.branch_picker_clear.request();
+            self.overlays.activity.mark_dirty();
+            self.overlays.welcome.mark_dirty();
+            self.overlays.hero.mark_dirty();
+            self.invalidate_editor_image_layouts();
+            self.status.clear();
+        }
+    }
+
+    /// Run the action the highlighted picker row resolves to: switch to an
+    /// existing branch, or create-and-switch a new one. The picker closes
+    /// on success; on failure it stays open with the error in the SC
+    /// feedback line so the user can amend the name.
+    fn apply_branch_action(&mut self, action: crate::widgets::branch_picker::BranchAction) {
+        use crate::widgets::branch_picker::BranchAction;
+        let (result, verb) = match &action {
+            BranchAction::Checkout(name) => (
+                crate::git::checkout_branch(&self.tree.root, name),
+                "Switched to",
+            ),
+            BranchAction::Create(name) => {
+                (crate::git::create_branch(&self.tree.root, name), "Created")
+            }
+        };
+        match result {
+            Ok(summary) => {
+                self.close_branch_picker();
+                self.source_control.commit_feedback = Some(summary.clone());
+                self.source_control.commit_feedback_is_error = false;
+                self.status = format!("{verb}: {summary}");
+                self.git.bypass_debounce();
+                self.refresh_git_status_debounced();
+                self.refresh_source_control();
+            }
+            Err(err) => {
+                self.source_control.commit_feedback = Some(format!("branch: {err}"));
+                self.source_control.commit_feedback_is_error = true;
+                self.status = format!("Branch: {err}");
+            }
+        }
+    }
+
+    fn handle_branch_picker_key(&mut self, key: KeyEvent) {
+        let Some(picker) = self.branch_picker.as_mut() else {
+            return;
+        };
+        match (key.code, key.modifiers) {
+            (KeyCode::Esc, _) => self.close_branch_picker(),
+            (KeyCode::Enter, _) => {
+                if let Some(action) = picker.selected_action() {
+                    self.apply_branch_action(action);
+                } else {
+                    self.close_branch_picker();
+                }
+            }
+            (KeyCode::Up, _) => picker.select_prev(),
+            (KeyCode::Down, _) => picker.select_next(),
+            (KeyCode::PageUp, _) => {
+                for _ in 0..10 {
+                    picker.select_prev();
+                }
+            }
+            (KeyCode::PageDown, _) => {
+                for _ in 0..10 {
+                    picker.select_next();
+                }
+            }
+            (KeyCode::Left, _) => picker.move_cursor_left(),
+            (KeyCode::Right, _) => picker.move_cursor_right(),
+            (KeyCode::Home, _) => picker.move_cursor_home(),
+            (KeyCode::End, _) => picker.move_cursor_end(),
+            (KeyCode::Backspace, _) => picker.pop_char(),
+            (KeyCode::Delete, _) => picker.delete_char(),
+            (KeyCode::Char(c), m) if !m.intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER) => {
+                picker.push_char(c);
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_branch_picker_mouse(&mut self, m: MouseEvent) {
+        let Some(picker) = self.branch_picker.as_mut() else {
+            return;
+        };
+        let inside = rect_contains(picker.last_rect, m.column, m.row);
+        match m.kind {
+            MouseEventKind::ScrollDown => {
+                for _ in 0..3 {
+                    picker.select_next();
+                }
+            }
+            MouseEventKind::ScrollUp => {
+                for _ in 0..3 {
+                    picker.select_prev();
+                }
+            }
+            MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Down(MouseButton::Right)
+                if !inside =>
+            {
+                self.close_branch_picker();
+            }
+            _ => {}
+        }
+    }
+
+    fn render_branch_picker(&mut self, frame: &mut ratatui::Frame) {
+        let sidebar = self.last_sidebar_area;
+        let full = frame.area();
+        let gradient = self.popup_gradient();
+        let Some(picker) = self.branch_picker.as_mut() else {
+            return;
+        };
+        // Anchor over the sidebar column like the jumper (it is a Source
+        // Control action), widening rightward for readable branch names;
+        // fall back to a centered box when the sidebar is collapsed.
+        let rect = match sidebar {
+            Some(side) if side.width >= 2 && side.height >= 4 => {
+                let width = side
+                    .width
+                    .max(ZOXIDE_JUMP_MIN_WIDTH)
+                    .min(full.width.saturating_sub(side.x));
+                Rect {
+                    x: side.x,
+                    y: side.y,
+                    width,
+                    height: side.height,
+                }
+            }
+            _ => {
+                let width = (full.width.saturating_mul(7) / 10).clamp(40, 100.min(full.width));
+                let height = (full.height.saturating_mul(6) / 10).clamp(10, full.height);
+                Rect {
+                    x: full.x + (full.width.saturating_sub(width)) / 2,
+                    y: full.y + (full.height.saturating_sub(height)) / 4,
+                    width,
+                    height,
+                }
+            }
+        };
+        crate::widgets::branch_picker::render_branch_picker(
+            picker,
+            rect,
+            frame.buffer_mut(),
+            gradient,
+        );
+    }
+
     fn open_editor_find(&mut self) {
         if self.editor_find.is_some() {
             return;
@@ -12370,6 +12690,10 @@ impl App {
         }
         if self.zoxide_jump.is_some() {
             self.handle_zoxide_jump_mouse(m);
+            return;
+        }
+        if self.branch_picker.is_some() {
+            self.handle_branch_picker_mouse(m);
             return;
         }
         if matches!(m.kind, MouseEventKind::Down(MouseButton::Left))
@@ -13057,12 +13381,20 @@ impl App {
                     if self.source_control.click_input(m.column, m.row) {
                         return;
                     }
+                    if self.source_control.click_branch(m.column, m.row) {
+                        self.open_branch_picker();
+                        return;
+                    }
                     if let Some(idx) = self.source_control.click_discard_action(m.column, m.row) {
                         self.request_discard_source_control_entry(idx);
                         return;
                     }
                     if let Some(idx) = self.source_control.click_stage_action(m.column, m.row) {
                         self.stage_source_control_entry(idx);
+                        return;
+                    }
+                    if let Some(idx) = self.source_control.click_unstage_action(m.column, m.row) {
+                        self.unstage_source_control_entry(idx);
                         return;
                     }
                     if let Some(idx) = self.source_control.entry_at_y(m.row) {
@@ -14313,6 +14645,7 @@ impl App {
             || self.command_palette.is_some()
             || self.process_picker.is_some()
             || self.zoxide_jump.is_some()
+            || self.branch_picker.is_some()
         {
             return None;
         }
@@ -14329,6 +14662,7 @@ impl App {
             || self.command_palette.is_some()
             || self.process_picker.is_some()
             || self.zoxide_jump.is_some()
+            || self.branch_picker.is_some()
             || self.connect_dialog.is_some()
             || !self.editor.is_blank_initial()
             || self.terminal_maximized
@@ -17339,6 +17673,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
                 || app.consume_command_palette_image_clear()
                 || app.consume_process_picker_image_clear()
                 || app.consume_zoxide_jump_image_clear()
+                || app.consume_branch_picker_image_clear()
                 || app.consume_ssh_empty_state_image_clear()
                 || app.consume_activity_image_clear()
             {
@@ -17373,6 +17708,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
                 || app.consume_command_palette_image_clear()
                 || app.consume_process_picker_image_clear()
                 || app.consume_zoxide_jump_image_clear()
+                || app.consume_branch_picker_image_clear()
                 || app.consume_ssh_empty_state_image_clear()
                 || app.consume_activity_image_clear()
             {

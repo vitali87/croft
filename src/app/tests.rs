@@ -6181,6 +6181,59 @@ fn stage_source_control_entry_runs_git_add_and_flips_kind_to_staged() {
 }
 
 #[test]
+fn unstage_source_control_entry_runs_git_reset_and_flips_kind_back_to_modified() {
+    let tmp = make_committed_repo();
+    std::fs::write(tmp.path().join("seed.txt"), b"changed\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let idx = {
+        assert!(
+            wait_for_changes(&mut app, |a| a
+                .source_control
+                .entries
+                .iter()
+                .any(
+                    |e| e.path == "seed.txt" && e.kind == crate::git::ChangeKind::Modified
+                )),
+            "preconditions: seed.txt must appear as Modified"
+        );
+        app.source_control
+            .entries
+            .iter()
+            .position(|e| e.path == "seed.txt")
+            .unwrap()
+    };
+    app.stage_source_control_entry(idx);
+    assert!(
+        wait_for_changes(&mut app, |a| a
+            .source_control
+            .entries
+            .iter()
+            .any(
+                |e| e.path == "seed.txt" && e.kind == crate::git::ChangeKind::StagedModified
+            )),
+        "preconditions: seed.txt must be staged before we can unstage it"
+    );
+    let staged_idx = app
+        .source_control
+        .entries
+        .iter()
+        .position(|e| e.path == "seed.txt" && e.kind == crate::git::ChangeKind::StagedModified)
+        .unwrap();
+    app.unstage_source_control_entry(staged_idx);
+    assert!(
+        wait_for_changes(&mut app, |a| a
+            .source_control
+            .entries
+            .iter()
+            .any(
+                |e| e.path == "seed.txt" && e.kind == crate::git::ChangeKind::Modified
+            )),
+        "after unstage the file must read as Modified again; saw {:?}",
+        app.source_control.entries,
+    );
+}
+
+#[test]
 fn request_discard_source_control_entry_only_opens_a_confirm_modal_without_touching_disk() {
     let tmp = make_committed_repo();
     std::fs::write(tmp.path().join("seed.txt"), b"changed\n").unwrap();

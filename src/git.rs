@@ -78,6 +78,40 @@ fn run_git(path: &Path, args: &[&str]) -> std::io::Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+/// Run a mutating git subcommand and return a human-readable summary.
+///
+/// Shared by every operation the Source Control panel invokes
+/// synchronously (unstage, pull, sync, branch switch/create, stash) so
+/// they don't each re-implement the spawn → check → pick-the-right-stream
+/// dance. On success git often reports the interesting line on *stderr*
+/// (push/pull print "Everything up-to-date" / ref updates there), so we
+/// surface stderr when stdout is empty and vice-versa. On failure we
+/// surface whichever stream carries the message verbatim, so the panel
+/// shows the host's exact reason (e.g. "fatal: 'x' is not a commit").
+fn run_mutation(root: &Path, args: &[&str]) -> Result<String, String> {
+    let path_str = root
+        .to_str()
+        .ok_or_else(|| "non-utf8 workspace path".to_string())?;
+    let mut cmd = Command::new("git");
+    cmd.args(["-C", path_str]).args(args);
+    let output = cmd
+        .output()
+        .map_err(|e| format!("failed to spawn git: {e}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if output.status.success() {
+        Ok(if !stdout.is_empty() { stdout } else { stderr })
+    } else {
+        let msg = if !stderr.is_empty() { stderr } else { stdout };
+        Err(if msg.is_empty() {
+            let verb = args.first().copied().unwrap_or("git");
+            format!("git {verb} failed with code {:?}", output.status.code())
+        } else {
+            msg
+        })
+    }
+}
+
 /// Trim whitespace and treat empty as "no branch".
 pub fn parse_branch(out: String) -> Option<String> {
     let trimmed = out.trim();
@@ -727,6 +761,27 @@ pub fn stage_paths(root: &Path, rel_paths: &[String]) -> Result<(), String> {
     }
 }
 
+/// Unstage a single path. Convenience wrapper over `unstage_paths` for
+/// the inline "−" icon click on a staged row.
+pub fn unstage_path(root: &Path, rel_path: &str) -> Result<(), String> {
+    unstage_paths(root, std::slice::from_ref(&rel_path.to_string()))
+}
+
+/// Move all listed paths out of the index and back into the working tree,
+/// in one `git reset -q HEAD -- p1 p2 …` invocation. The mirror of
+/// `stage_paths`: `git reset HEAD` is what VS Code's git extension runs to
+/// unstage, and unlike `git restore --staged` it also unstages files added
+/// in a repo's very first commit. Atomic w.r.t. the index lock, so the
+/// background status worker can't race us between paths.
+pub fn unstage_paths(root: &Path, rel_paths: &[String]) -> Result<(), String> {
+    if rel_paths.is_empty() {
+        return Ok(());
+    }
+    let mut args: Vec<&str> = vec!["reset", "-q", "HEAD", "--"];
+    args.extend(rel_paths.iter().map(String::as_str));
+    run_mutation(root, &args).map(|_| ())
+}
+
 /// Discard a single path. For tracked entries this restores the working
 /// tree to HEAD via `git checkout HEAD -- <path>`; for Untracked entries
 /// the file (or directory) is removed from disk. Destructive: callers
@@ -763,6 +818,119 @@ pub fn discard_path(root: &Path, rel_path: &str, untracked: bool) -> Result<(), 
             })
         }
     }
+}
+
+/// Pull the current branch from its upstream (`git pull`). Sibling of
+/// `push_current_branch`; surfaced by the commit dropdown's "Pull" item
+/// and used by `sync` below. Returns git's verbatim summary ("Already
+/// up to date." / the fast-forward range) so the panel can echo it.
+pub fn pull_current_branch(root: &Path) -> Result<String, String> {
+    run_mutation(root, &["pull"])
+}
+
+/// A single branch the Checkout/Create picker can offer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BranchInfo {
+    /// What the user sees: the local branch name, or `origin/foo` for a
+    /// remote-tracking branch.
+    pub display: String,
+    /// What to hand `git switch`: the local name, or the short name of a
+    /// remote branch (so `git switch foo` DWIMs the tracking branch).
+    pub checkout_name: String,
+    /// True for the branch currently checked out (marked in the picker,
+    /// never offered as a checkout target).
+    pub is_current: bool,
+    /// True for `origin/…` remote-tracking branches, listed below locals.
+    pub is_remote: bool,
+}
+
+/// List branches for the Checkout picker: local branches first (most
+/// recently committed on top, the current one flagged), then remote-only
+/// branches whose name has no local counterpart. Remote rows carry the
+/// short `checkout_name` so selecting `origin/foo` runs `git switch foo`
+/// and lets git create the tracking branch.
+pub fn list_branches(root: &Path) -> Result<Vec<BranchInfo>, String> {
+    let locals_raw = run_git(
+        root,
+        &[
+            "for-each-ref",
+            "--sort=-committerdate",
+            "--format=%(refname:short)%09%(HEAD)",
+            "refs/heads",
+        ],
+    )
+    .map_err(|e| e.to_string())?;
+    let mut branches: Vec<BranchInfo> = Vec::new();
+    let mut local_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for line in locals_raw.lines() {
+        let mut parts = line.split('\t');
+        let Some(name) = parts.next() else { continue };
+        if name.is_empty() {
+            continue;
+        }
+        let is_current = parts.next().map(|m| m.trim() == "*").unwrap_or(false);
+        local_names.insert(name.to_string());
+        branches.push(BranchInfo {
+            display: name.to_string(),
+            checkout_name: name.to_string(),
+            is_current,
+            is_remote: false,
+        });
+    }
+    let remotes_raw = run_git(
+        root,
+        &[
+            "for-each-ref",
+            "--sort=-committerdate",
+            "--format=%(refname:short)",
+            "refs/remotes",
+        ],
+    )
+    .unwrap_or_default();
+    for full in remotes_raw.lines() {
+        // `git symbolic-ref refs/remotes/origin/HEAD` shows up as e.g.
+        // "origin/HEAD" — skip those pointer refs, they aren't branches.
+        if full.is_empty() || full.ends_with("/HEAD") {
+            continue;
+        }
+        // Strip the leading "<remote>/" to get the short name git switch wants.
+        let short = full.split_once('/').map(|(_, s)| s).unwrap_or(full);
+        if local_names.contains(short) {
+            continue;
+        }
+        branches.push(BranchInfo {
+            display: full.to_string(),
+            checkout_name: short.to_string(),
+            is_current: false,
+            is_remote: true,
+        });
+    }
+    Ok(branches)
+}
+
+/// Switch to an existing branch (`git switch <name>`). For a remote-only
+/// branch pass its short name so git creates the local tracking branch.
+pub fn checkout_branch(root: &Path, name: &str) -> Result<String, String> {
+    run_mutation(root, &["switch", name])
+}
+
+/// Create a new branch off the current HEAD and switch to it
+/// (`git switch -c <name>`). Errors (e.g. name already exists) carry
+/// git's verbatim message.
+pub fn create_branch(root: &Path, name: &str) -> Result<String, String> {
+    run_mutation(root, &["switch", "-c", name])
+}
+
+/// Stash the working tree (`git stash push`). Tracked changes are saved
+/// and the working tree reverts to HEAD, exactly like VS Code's Stash.
+pub fn stash_push(root: &Path) -> Result<String, String> {
+    run_mutation(root, &["stash", "push"])
+}
+
+/// Restore and drop the most recent stash (`git stash pop`). A pop
+/// conflict surfaces git's verbatim message so the user can resolve it.
+pub fn stash_pop(root: &Path) -> Result<String, String> {
+    run_mutation(root, &["stash", "pop"])
 }
 
 /// One row in the welcome-screen recent-commits panel: the short hash, a
@@ -2080,6 +2248,119 @@ mod tests {
         assert!(
             !hist.is_empty(),
             "a committed file must have at least one history entry"
+        );
+    }
+
+    /// Stage a path so we can exercise `unstage_*` against a real index.
+    fn stage(p: &Path, rel: &str) {
+        let _ = Command::new("git")
+            .args(["-C"])
+            .arg(p)
+            .args(["add", rel])
+            .status();
+    }
+
+    /// True when `rel` shows up as a staged entry in `git status --porcelain`
+    /// (index column non-space, non-`?`).
+    fn is_staged(p: &Path, rel: &str) -> bool {
+        query_changes(p)
+            .iter()
+            .any(|e| e.path == rel && e.kind.section() == ChangeSection::Staged)
+    }
+
+    #[test]
+    fn unstage_path_moves_a_staged_file_back_to_changes() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        init_repo_with_commit(p);
+        std::fs::write(p.join("seed.txt"), "one\ntwo\nthree\n").unwrap();
+        stage(p, "seed.txt");
+        assert!(is_staged(p, "seed.txt"), "precondition: seed.txt is staged");
+        unstage_path(p, "seed.txt").expect("unstage must succeed");
+        assert!(
+            !is_staged(p, "seed.txt"),
+            "after unstage the modification is back in the working tree, not the index"
+        );
+    }
+
+    #[test]
+    fn unstage_paths_is_a_noop_on_an_empty_list() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        init_repo_with_commit(p);
+        assert!(unstage_paths(p, &[]).is_ok());
+    }
+
+    #[test]
+    fn create_branch_then_list_branches_marks_the_new_current_branch() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        init_repo_with_commit(p);
+        create_branch(p, "feature/x").expect("create_branch must succeed");
+        let branches = list_branches(p).expect("list_branches must succeed");
+        let current: Vec<&BranchInfo> = branches.iter().filter(|b| b.is_current).collect();
+        assert_eq!(current.len(), 1, "exactly one branch is current");
+        assert_eq!(current[0].display, "feature/x");
+        // The original branch is still listed, just not current.
+        assert!(
+            branches
+                .iter()
+                .any(|b| b.display == "main" && !b.is_current)
+        );
+    }
+
+    #[test]
+    fn checkout_branch_switches_back_to_an_existing_branch() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        init_repo_with_commit(p);
+        create_branch(p, "feature/x").unwrap();
+        checkout_branch(p, "main").expect("checkout_branch must succeed");
+        let branch = query(p).branch;
+        assert_eq!(branch.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn stash_push_then_pop_round_trips_a_working_tree_change() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        init_repo_with_commit(p);
+        std::fs::write(p.join("seed.txt"), "one\ntwo\nstashed\n").unwrap();
+        stash_push(p).expect("stash push must succeed");
+        // The dirty edit is gone from the working tree after stashing.
+        assert_eq!(
+            std::fs::read_to_string(p.join("seed.txt")).unwrap(),
+            "one\ntwo\n"
+        );
+        stash_pop(p).expect("stash pop must succeed");
+        assert_eq!(
+            std::fs::read_to_string(p.join("seed.txt")).unwrap(),
+            "one\ntwo\nstashed\n",
+            "pop restores the stashed edit"
+        );
+    }
+
+    #[test]
+    fn pull_on_an_up_to_date_clone_succeeds() {
+        let upstream = TempDir::new().unwrap();
+        let up = upstream.path();
+        init_repo_with_commit(up);
+        let clone = TempDir::new().unwrap();
+        let clone_path = clone.path().join("work");
+        let ok = Command::new("git")
+            .args(["clone", "-q"])
+            .arg(up)
+            .arg(&clone_path)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(ok, "clone of the local upstream must succeed");
+        // Nothing new upstream, so pull is a no-op but must return Ok with
+        // git's "up to date" summary rather than erroring.
+        let summary = pull_current_branch(&clone_path).expect("pull must succeed");
+        assert!(
+            summary.to_lowercase().contains("up to date") || summary.is_empty(),
+            "an up-to-date pull reports no new work (got: {summary:?})"
         );
     }
 }

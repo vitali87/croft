@@ -19,13 +19,21 @@ const DELETIONS_RGB: (u8, u8, u8) = (0xe7, 0x70, 0x70);
 
 pub const DISCARD_GLYPH: char = '\u{21b6}';
 pub const STAGE_GLYPH: char = '+';
+/// The minus sign (U+2212), used for the staged-row "unstage" affordance.
+/// Mirrors the plain `+` STAGE_GLYPH rather than a codicon so the two
+/// inline actions read as a matched pair.
+pub const UNSTAGE_GLYPH: char = '\u{2212}';
 const ROW_ACTIONS_WIDTH: u16 = 4;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RowActionAreas {
     pub entry_idx: usize,
+    /// Discard / stage are painted on a selected *unstaged* row; `unstage`
+    /// on a selected *staged* row. The irrelevant rects are left default
+    /// (zero-size, so they never hit-test) for the row's section.
     pub discard: Rect,
     pub stage: Rect,
+    pub unstage: Rect,
 }
 
 /// Items in the chevron-opened dropdown next to the Commit button.
@@ -35,15 +43,28 @@ pub struct RowActionAreas {
 pub enum CommitMenuItem {
     CommitAndPush,
     Push,
+    Pull,
+    Sync,
+    CheckoutBranch,
+    Stash,
+    StashPop,
     ViewStagedDiff,
     ViewPreviousCommitDiff,
     ViewDefaultBranchDiff,
 }
 
 impl CommitMenuItem {
-    pub const ALL: [CommitMenuItem; 5] = [
+    /// Ordered to mirror VS Code's Source Control "…" menu: the sync trio
+    /// (push / pull / sync), then branch, then the stash pair, then the
+    /// diff views.
+    pub const ALL: [CommitMenuItem; 10] = [
         CommitMenuItem::CommitAndPush,
         CommitMenuItem::Push,
+        CommitMenuItem::Pull,
+        CommitMenuItem::Sync,
+        CommitMenuItem::CheckoutBranch,
+        CommitMenuItem::Stash,
+        CommitMenuItem::StashPop,
         CommitMenuItem::ViewStagedDiff,
         CommitMenuItem::ViewPreviousCommitDiff,
         CommitMenuItem::ViewDefaultBranchDiff,
@@ -56,6 +77,11 @@ impl CommitMenuItem {
         match self {
             CommitMenuItem::CommitAndPush => "Commit & Push".to_string(),
             CommitMenuItem::Push => "Push".to_string(),
+            CommitMenuItem::Pull => "Pull".to_string(),
+            CommitMenuItem::Sync => "Sync (Pull, Push)".to_string(),
+            CommitMenuItem::CheckoutBranch => "Checkout / Create Branch…".to_string(),
+            CommitMenuItem::Stash => "Stash".to_string(),
+            CommitMenuItem::StashPop => "Pop Stash".to_string(),
             CommitMenuItem::ViewStagedDiff => "View Staged Changes".to_string(),
             CommitMenuItem::ViewPreviousCommitDiff => "View Changes vs previous".to_string(),
             CommitMenuItem::ViewDefaultBranchDiff => {
@@ -66,17 +92,26 @@ impl CommitMenuItem {
 
     /// Leading codicon glyph painted before the label, mirroring VS Code's
     /// Source Control menu. Codepoints are Nerd Fonts `cod-*` PUA values
-    /// (verified against ryanoasis/nerd-fonts glyphnames.json on
-    /// 2026-06-18), matching the cod-source-control (U+EA68) glyph already
+    /// (verified against ryanoasis/nerd-fonts glyphnames.json v3.4.0 on
+    /// 2026-06-19), matching the cod-source-control (U+EA68) glyph already
     /// used by the branch row:
     ///   - cloud-upload (U+EAC3): commit then push to the remote
     ///   - arrow-up (U+EAA1): push to the remote
+    ///   - cloud-download (U+EAC2): pull from the remote
+    ///   - sync (U+EA77): pull then push in one step
+    ///   - git-branch (U+EA96): checkout / create a branch
+    ///   - archive (U+EA98): stash / pop the working tree
     ///   - diff (U+EAE1): the staged diff against HEAD
     ///   - git-compare (U+EAFD): a branch/commit comparison
     pub fn icon(&self) -> char {
         match self {
             CommitMenuItem::CommitAndPush => '\u{eac3}',
             CommitMenuItem::Push => '\u{eaa1}',
+            CommitMenuItem::Pull => '\u{eac2}',
+            CommitMenuItem::Sync => '\u{ea77}',
+            CommitMenuItem::CheckoutBranch => '\u{ea96}',
+            CommitMenuItem::Stash => '\u{ea98}',
+            CommitMenuItem::StashPop => '\u{ea98}',
             CommitMenuItem::ViewStagedDiff => '\u{eae1}',
             CommitMenuItem::ViewPreviousCommitDiff => '\u{eafd}',
             CommitMenuItem::ViewDefaultBranchDiff => '\u{eafd}',
@@ -160,6 +195,10 @@ pub struct SourceControlPanel {
     /// it forces an immediate, un-debounced git re-scan. Empty when the panel
     /// is in the no-repo state or the header row was clipped.
     pub header_refresh_btn: Rect,
+    /// Hit-test rect for the branch name on the branch row. Clicking it
+    /// opens the Checkout / Create Branch picker, mirroring VS Code's
+    /// clickable status-bar branch indicator. Empty in the no-repo state.
+    pub last_branch_area: Rect,
 }
 
 impl SourceControlPanel {
@@ -192,6 +231,7 @@ impl SourceControlPanel {
             last_row_actions: None,
             hover_pointer: None,
             header_refresh_btn: Rect::default(),
+            last_branch_area: Rect::default(),
         }
     }
 
@@ -209,6 +249,20 @@ impl SourceControlPanel {
     pub fn click_stage_action(&self, x: u16, y: u16) -> Option<usize> {
         let a = self.last_row_actions?;
         rect_hit(a.stage, x, y).then_some(a.entry_idx)
+    }
+
+    /// Returns the entry index when (x, y) lands inside the Unstage icon
+    /// of the currently-selected *staged* row. The widget only paints this
+    /// icon on a selected staged row, so a hit implies that row.
+    pub fn click_unstage_action(&self, x: u16, y: u16) -> Option<usize> {
+        let a = self.last_row_actions?;
+        rect_hit(a.unstage, x, y).then_some(a.entry_idx)
+    }
+
+    /// True when (x, y) lands on the branch name, so the App can open the
+    /// Checkout / Create Branch picker.
+    pub fn click_branch(&self, x: u16, y: u16) -> bool {
+        rect_hit(self.last_branch_area, x, y)
     }
 
     /// True when (x, y) lands on the header refresh pill, so the App can
@@ -853,6 +907,7 @@ impl Widget for &mut SourceControlPanel {
         self.last_scrollbar = Rect::default();
         self.last_row_actions = None;
         self.header_refresh_btn = Rect::default();
+        self.last_branch_area = Rect::default();
 
         if inner.height == 0 || inner.width == 0 {
             return;
@@ -926,6 +981,15 @@ impl Widget for &mut SourceControlPanel {
             (Some(b), _) => b.clone(),
             (None, Some(h)) => h.clone(),
             (None, None) => "(no head)".to_string(),
+        };
+        // The glyph (2 cells) plus the name is the clickable target that
+        // opens the branch picker, clamped to the panel width.
+        let branch_w = (2 + label.chars().count() as u16).min(inner.width);
+        self.last_branch_area = Rect {
+            x: inner.x,
+            y,
+            width: branch_w,
+            height: 1,
         };
         spans.push(Span::styled(
             label,
@@ -1286,15 +1350,14 @@ impl Widget for &mut SourceControlPanel {
                     buf.set_string(icon_x, row_y, icon.glyph.to_string(), icon_style);
                     let text_x = icon_x + 2;
                     // Reserve a 4-cell strip before the badge for inline
-                    // action icons on the selected unstaged row:
-                    //   [discard][gap][stage][gap-before-badge]
-                    // Already-staged entries get no icons (stage would be a
-                    // no-op; we deliberately don't show unstage to keep the
-                    // surface to the two actions the user asked for).
+                    // action icons on the selected row. An unstaged row
+                    // gets [discard][gap][stage]; a staged row gets the
+                    // single [unstage] minus, mirroring VS Code (staged
+                    // changes only offer Unstage; the Changes section
+                    // offers Discard + Stage).
+                    let is_staged = entry.kind.section() == ChangeSection::Staged;
                     let text_w_unreserved = badge_x.saturating_sub(text_x).saturating_sub(1);
-                    let show_actions = is_selected
-                        && entry.kind.section() != ChangeSection::Staged
-                        && text_w_unreserved > ROW_ACTIONS_WIDTH;
+                    let show_actions = is_selected && text_w_unreserved > ROW_ACTIONS_WIDTH;
                     let text_w_reserved = if show_actions { ROW_ACTIONS_WIDTH } else { 0 };
                     let text_w = text_w_unreserved.saturating_sub(text_w_reserved);
                     if text_w > 0 {
@@ -1310,30 +1373,48 @@ impl Widget for &mut SourceControlPanel {
                         );
                     }
                     if show_actions {
-                        let discard_x = badge_x - 4;
-                        let stage_x = badge_x - 2;
                         let action_fg = Color::Rgb(0xd4, 0xd9, 0xe2);
                         let mut action_style = Style::default().fg(action_fg);
                         if let Some(bg) = row_bg {
                             action_style = action_style.bg(bg);
                         }
-                        buf.set_string(discard_x, row_y, DISCARD_GLYPH.to_string(), action_style);
-                        buf.set_string(stage_x, row_y, STAGE_GLYPH.to_string(), action_style);
-                        self.last_row_actions = Some(RowActionAreas {
-                            entry_idx: *entry_idx,
-                            discard: Rect {
-                                x: discard_x,
-                                y: row_y,
-                                width: 1,
-                                height: 1,
-                            },
-                            stage: Rect {
-                                x: stage_x,
-                                y: row_y,
-                                width: 1,
-                                height: 1,
-                            },
-                        });
+                        let cell = |x: u16| Rect {
+                            x,
+                            y: row_y,
+                            width: 1,
+                            height: 1,
+                        };
+                        if is_staged {
+                            let unstage_x = badge_x - 2;
+                            buf.set_string(
+                                unstage_x,
+                                row_y,
+                                UNSTAGE_GLYPH.to_string(),
+                                action_style,
+                            );
+                            self.last_row_actions = Some(RowActionAreas {
+                                entry_idx: *entry_idx,
+                                discard: Rect::default(),
+                                stage: Rect::default(),
+                                unstage: cell(unstage_x),
+                            });
+                        } else {
+                            let discard_x = badge_x - 4;
+                            let stage_x = badge_x - 2;
+                            buf.set_string(
+                                discard_x,
+                                row_y,
+                                DISCARD_GLYPH.to_string(),
+                                action_style,
+                            );
+                            buf.set_string(stage_x, row_y, STAGE_GLYPH.to_string(), action_style);
+                            self.last_row_actions = Some(RowActionAreas {
+                                entry_idx: *entry_idx,
+                                discard: cell(discard_x),
+                                stage: cell(stage_x),
+                                unstage: Rect::default(),
+                            });
+                        }
                     }
                 }
             }
@@ -2477,7 +2558,7 @@ mod tests {
     }
 
     #[test]
-    fn selected_staged_row_paints_no_action_icons() {
+    fn selected_staged_row_exposes_only_an_unstage_action() {
         let mut p = SourceControlPanel::new();
         p.set_status(
             dummy_status_with_branch("main"),
@@ -2507,9 +2588,24 @@ mod tests {
         p.select_change_at(row_y);
         let mut buf = Buffer::empty(area);
         ratatui::widgets::Widget::render(&mut p, area, &mut buf);
-        assert!(
-            p.last_row_actions.is_none(),
-            "Staged rows expose neither Discard nor Stage (no-op); the user asked for these two icons only"
+        let actions = p
+            .last_row_actions
+            .expect("a selected staged row exposes the unstage action");
+        assert!(actions.unstage.width > 0, "staged rows offer Unstage");
+        assert_eq!(
+            actions.stage,
+            Rect::default(),
+            "a staged row never offers Stage (it is already staged)"
+        );
+        assert_eq!(
+            actions.discard,
+            Rect::default(),
+            "Discard lives on the Changes section, not Staged"
+        );
+        // The minus glyph lands in the unstage cell.
+        assert_eq!(
+            buf[(actions.unstage.x, actions.unstage.y)].symbol(),
+            UNSTAGE_GLYPH.to_string(),
         );
     }
 
@@ -2530,6 +2626,7 @@ mod tests {
                 width: 1,
                 height: 1,
             },
+            unstage: Rect::default(),
         });
         assert_eq!(p.click_discard_action(10, 5), Some(7));
         assert_eq!(
@@ -2562,6 +2659,7 @@ mod tests {
                 width: 1,
                 height: 1,
             },
+            unstage: Rect::default(),
         });
         assert_eq!(p.click_stage_action(12, 5), Some(3));
         assert_eq!(
@@ -2570,6 +2668,29 @@ mod tests {
             "discard cell is not stage"
         );
         assert_eq!(p.click_stage_action(13, 5), None, "outside stage rect");
+    }
+
+    #[test]
+    fn click_unstage_action_returns_entry_idx_only_inside_the_rect() {
+        let mut p = SourceControlPanel::new();
+        p.last_row_actions = Some(RowActionAreas {
+            entry_idx: 4,
+            discard: Rect::default(),
+            stage: Rect::default(),
+            unstage: Rect {
+                x: 12,
+                y: 5,
+                width: 1,
+                height: 1,
+            },
+        });
+        assert_eq!(p.click_unstage_action(12, 5), Some(4));
+        assert_eq!(
+            p.click_unstage_action(11, 5),
+            None,
+            "gap cell is not unstage"
+        );
+        assert_eq!(p.click_unstage_action(12, 6), None, "wrong row");
     }
 
     #[test]

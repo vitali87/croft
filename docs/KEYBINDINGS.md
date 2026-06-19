@@ -84,6 +84,22 @@ On macOS, the `Cmd` chords below only reach croft after you run a one-time setup
 | `↑` / `↓` + `Enter`, or click a result | Open the file at the matched line in the replaceable preview tab |
 | Double-click a result | Pin its tab, so moving to the next result opens beside it instead of replacing it |
 
+## Source Control sidebar
+
+| Keys | Action |
+|------|--------|
+| Type in the message box | Edit the commit message (the box scrolls horizontally when the message outgrows it) |
+| `Enter` | Commit all tracked changes with the message |
+| Click ✓ Commit | Same as `Enter` |
+| Click a change row | Open that file's diff against HEAD in a read-only editor tab |
+| `Cmd`+`A` / `Ctrl`+`A`, then `Cmd`+`S` / `Ctrl`+`S` | Select every change, then stage the selection |
+| Click `+` on a selected unstaged row | Stage that file |
+| Click `↶` on a selected unstaged row | Discard that file (confirms first; deletes untracked files) |
+| Click `−` on a selected staged row | Unstage that file |
+| Click the branch name | Open the Checkout / Create Branch picker: type to filter branches, `↑`/`↓` to navigate, `Enter` to switch — or type a new name and `Enter` to create and switch to it |
+| Click the `▾` caret next to Commit | Open the actions menu: Commit & Push, Push, Pull, Sync (Pull, Push), Checkout / Create Branch…, Stash, Pop Stash, View Staged Changes, View Changes vs previous, View Changes vs `<default>` |
+| Click the header refresh icon | Force an immediate git re-scan |
+
 ## Editor: text
 
 | Keys | Action |
