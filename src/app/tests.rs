@@ -328,11 +328,11 @@ fn chrome_tooltip_paints_in_the_sidebar_not_clamped_into_the_editor() {
 }
 
 #[test]
-fn no_repo_hero_yields_when_a_tooltip_overlaps_it() {
+fn tooltip_repaints_over_the_hero_without_hiding_it() {
     // The Run-and-Debug activity-icon hint flips up onto the centered no-repo
-    // hero illustration. Because OSC-1337 images composite above text, the hero
-    // would hide the tooltip's "Debug" text. The hero must yield (request a
-    // clear) for the dwell so the tooltip reads in full.
+    // hero illustration. The illustration must STAY (it's an OSC-1337 image),
+    // and the tooltip is re-painted on top of it post-draw. The fix must never
+    // clear/hide the hero just because a tooltip overlaps it.
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.sidebar_view = SidebarView::SourceControl;
@@ -340,32 +340,35 @@ fn no_repo_hero_yields_when_a_tooltip_overlaps_it() {
     let backend = ratatui::backend::TestBackend::new(63, 50);
     let mut term = ratatui::Terminal::new(backend).unwrap();
     term.draw(|f| app.render(f)).unwrap();
-    // Only meaningful when the workspace is not a repo (hero is shown).
     assert!(!app.source_control.status.in_repo, "tempdir is not a repo");
     let hero = app.source_control.last_hero_area;
     assert!(hero.width > 0 && hero.height > 0, "hero must be laid out");
-    app.overlays.hero.set_displayed(true);
-
-    // A tooltip box overlapping the hero forces it to yield.
-    app.ui_tooltip_area = Some(hero);
-    app.flush_no_repo_hero_overlay();
-    assert!(
-        app.consume_no_repo_hero_image_clear(),
-        "hero must request a clear when a tooltip overlaps it"
+    assert_eq!(
+        app.active_sidebar_image_rect(),
+        Some(hero),
+        "the no-repo hero is the active sidebar illustration"
     );
 
-    // A tooltip clear of the hero leaves it painting normally.
-    app.overlays.hero.set_displayed(true);
-    app.ui_tooltip_area = Some(Rect {
-        x: hero.x,
-        y: hero.y.saturating_add(hero.height),
-        width: 4,
-        height: 1,
-    });
+    // A tooltip box squarely over the hero: the hero must keep painting (no
+    // clear requested), and the overlapping repaint path must engage.
+    app.ui_tooltip = Some(crate::widgets::hover_popup::HoverPopup::new_compact(
+        "Run and Debug".into(),
+        (hero.x, hero.y),
+    ));
+    app.ui_tooltip_area = Some(hero);
     app.flush_no_repo_hero_overlay();
+    app.flush_tooltip_over_image();
     assert!(
         !app.consume_no_repo_hero_image_clear(),
-        "a non-overlapping tooltip must not disturb the hero"
+        "the hero must NOT be hidden/cleared when a tooltip overlaps it"
+    );
+
+    // No active illustration in a repo, so nothing to repaint over.
+    app.source_control.status.in_repo = true;
+    assert_eq!(
+        app.active_sidebar_image_rect(),
+        None,
+        "a repo workspace shows no hero, so there is no image to overlay"
     );
 }
 

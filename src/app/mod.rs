@@ -1355,9 +1355,9 @@ pub struct App {
     ui_tooltip_label: Option<&'static str>,
     /// The chrome tooltip's final on-screen rect from the most recent render
     /// (after the activity-bar shift / viewport clamp), or `None` when no
-    /// tooltip is showing. Read by the post-draw inline-image flushers so a
-    /// sidebar illustration can yield (hide) wherever the tooltip lands on it,
-    /// since OSC-1337 images always composite above the tooltip's text cells.
+    /// tooltip is showing. Read by the post-draw flush so the box can be
+    /// re-painted on top of any sidebar illustration it overlaps, since
+    /// OSC-1337 images composite above ratatui's text layer.
     ui_tooltip_area: Option<Rect>,
     definition_request_id: Option<u64>,
     declaration_request_id: Option<u64>,
@@ -2313,18 +2313,6 @@ impl App {
         if hero.width == 0 || hero.height == 0 {
             return;
         }
-        // A chrome tooltip floating over the hero (e.g. the Run-and-Debug icon
-        // hint, whose box flips up onto the illustration) would be hidden by the
-        // image layer that composites above text. Yield the hero for the dwell:
-        // request a clear so iTerm2 evicts the cached cells and the next frame
-        // repaints the tooltip text. It re-emits once the tooltip clears.
-        if self
-            .ui_tooltip_area
-            .is_some_and(|t| rects_intersect(t, hero))
-        {
-            self.overlays.hero.hide_and_request_clear();
-            return;
-        }
         let Some((cw, ch)) = self.cell_pixel else {
             return;
         };
@@ -2395,16 +2383,6 @@ impl App {
             self.overlays.ssh.hide_and_request_clear();
             return;
         }
-        // Yield the illustration if a chrome tooltip floats over it, same as the
-        // Source Control hero: the OSC-1337 image layer would otherwise hide the
-        // tooltip's text. Restored once the tooltip clears.
-        if self
-            .ui_tooltip_area
-            .is_some_and(|t| rects_intersect(t, self.remote.last_image_area))
-        {
-            self.overlays.ssh.hide_and_request_clear();
-            return;
-        }
         let Some((cx, cy)) = self.remote.last_image_cell else {
             return;
         };
@@ -2468,6 +2446,70 @@ impl App {
     /// are evicted on view change.
     pub fn consume_no_repo_hero_image_clear(&mut self) -> bool {
         self.overlays.hero.consume_clear_latch()
+    }
+
+    /// The rect of the sidebar OSC-1337 illustration currently on screen (the
+    /// Source Control no-repo hero or the Remote SSH empty-state), or `None`
+    /// when neither is showing. Those images composite above ratatui's text
+    /// layer, so a tooltip overlapping one must be re-painted last.
+    fn active_sidebar_image_rect(&self) -> Option<Rect> {
+        if !self.show_tree {
+            return None;
+        }
+        let rect = match self.sidebar_view {
+            SidebarView::SourceControl if !self.source_control.status.in_repo => {
+                self.source_control.last_hero_area
+            }
+            SidebarView::Remote if self.remote.targets.is_empty() => self.remote.last_image_area,
+            _ => return None,
+        };
+        (rect.width > 0 && rect.height > 0).then_some(rect)
+    }
+
+    /// Re-paint the chrome tooltip directly to the terminal AFTER the inline
+    /// images have been flushed, so its box sits in the foreground over any
+    /// sidebar illustration it overlaps. The hero / SSH image is emitted
+    /// post-draw and would otherwise composite over the tooltip's text; since
+    /// the last writer wins each cell, re-emitting the box here puts it on top
+    /// while the illustration itself stays fully painted everywhere else.
+    /// No-op unless a tooltip is showing and actually lands on an illustration.
+    pub fn flush_tooltip_over_image(&mut self) {
+        use std::io::Write;
+        let Some(area) = self.ui_tooltip_area else {
+            return;
+        };
+        let Some(img) = self.active_sidebar_image_rect() else {
+            return;
+        };
+        if !rects_intersect(area, img) {
+            return;
+        }
+        let Some(popup) = self.ui_tooltip.as_ref() else {
+            return;
+        };
+        // Render the popup into a standalone buffer at its on-screen rect, then
+        // blit each cell as an absolutely-positioned SGR write. The box is fully
+        // opaque (its block fills the bg), so it cleanly occludes the slice of
+        // the illustration it covers, exactly like a floating tooltip.
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        ratatui::widgets::Widget::render(popup, area, &mut buf);
+        let mut out = stdout();
+        let cursor_on = self.cursor_should_be_visible();
+        let _ = write!(out, "\x1b[?25l\x1b[s");
+        for y in area.top()..area.bottom() {
+            let _ = write!(out, "\x1b[{};{}H", y + 1, area.left() + 1);
+            for x in area.left()..area.right() {
+                let cell = &buf[(x, y)];
+                let _ = out.write_all(sgr_for_cell(cell).as_bytes());
+                let _ = out.write_all(cell.symbol().as_bytes());
+            }
+            let _ = write!(out, "\x1b[0m");
+        }
+        let _ = write!(out, "\x1b[u");
+        if cursor_on {
+            let _ = write!(out, "\x1b[?25h");
+        }
+        let _ = out.flush();
     }
 
     /// Returns the post-frame OSC-1337 escapes to write under the activity
@@ -6219,11 +6261,10 @@ impl App {
                 tooltip_area = Some(area);
             }
         }
-        // Record where the tooltip actually landed so the post-draw inline-image
-        // flushers can yield any sidebar illustration the box overlaps (the
-        // illustration's OSC-1337 layer would otherwise composite over and hide
-        // the tooltip text, as it does on the Run-and-Debug icon hover that lands
-        // on the no-repo Source Control hero).
+        // Record the box so the post-draw flush can RE-PAINT it on top of any
+        // sidebar OSC-1337 illustration (the no-repo hero / SSH empty-state).
+        // Those images are emitted after ratatui's text and would otherwise
+        // composite over the tooltip; re-emitting the box last wins the cell.
         self.ui_tooltip_area = tooltip_area;
 
         // Show the host terminal's hardware caret only when the editor is
@@ -16355,10 +16396,25 @@ fn rect_contains(r: Rect, x: u16, y: u16) -> bool {
     r.width > 0 && r.height > 0 && x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height
 }
 
+/// The SGR prefix (reset + truecolor fg/bg) for one ratatui cell, used when
+/// blitting a buffer region straight to the terminal in
+/// `flush_tooltip_over_image`. The tooltip only uses RGB and reset colors, so
+/// other `Color` variants fall through to the terminal default.
+fn sgr_for_cell(cell: &ratatui::buffer::Cell) -> String {
+    let mut s = String::from("\x1b[0m");
+    if let Color::Rgb(r, g, b) = cell.fg {
+        s.push_str(&format!("\x1b[38;2;{r};{g};{b}m"));
+    }
+    if let Color::Rgb(r, g, b) = cell.bg {
+        s.push_str(&format!("\x1b[48;2;{r};{g};{b}m"));
+    }
+    s
+}
+
 /// True when two cell rectangles share at least one cell. Used to decide
 /// whether a text overlay (the chrome tooltip) lands on top of an OSC-1337
-/// inline image; since terminal images composite ABOVE text cells, an
-/// overlapping image would hide the tooltip text and must yield.
+/// inline image; since terminal images composite ABOVE text cells, the
+/// overlapping tooltip must be re-painted last to win those cells.
 fn rects_intersect(a: Rect, b: Rect) -> bool {
     a.width > 0
         && a.height > 0
@@ -17455,6 +17511,10 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
                 let _ = out.flush();
                 app.mark_welcome_image_emitted();
             }
+            // Last of all: re-paint the chrome tooltip on top of any sidebar
+            // illustration it overlaps. Must run after every inline-image flush
+            // above so the box wins those cells (last writer per cell wins).
+            app.flush_tooltip_over_image();
             needs_redraw = false;
             last_blink_visible = blink_visible;
             last_spinner_phase = spinner_phase;
