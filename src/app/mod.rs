@@ -1020,6 +1020,20 @@ struct PendingDiscard {
     untracked: bool,
 }
 
+/// Why the branch picker is open, deciding what its Enter does. `Checkout`
+/// is the default (click the branch name / "Checkout to…"); the others are
+/// reached from the Branch submenu and act on the highlighted *existing*
+/// branch (or, for `CreateFrom`, use it as the base for a new branch).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum BranchPurpose {
+    #[default]
+    Checkout,
+    CreateFrom,
+    Delete,
+    Merge,
+    Rebase,
+}
+
 /// State for edge auto-scroll during a terminal drag-selection. `dir` is
 /// -1 (pointer above the top edge, scroll into history) or +1 (below the
 /// bottom edge, scroll toward live); `col` is the last drag column so the
@@ -1424,6 +1438,22 @@ pub struct App {
     /// Cmd+Z undo.
     pub zoxide_jump: Option<crate::widgets::zoxide_jump::ZoxideJump>,
     pub branch_picker: Option<crate::widgets::branch_picker::BranchPicker>,
+    /// Why the branch picker is open, so its Enter dispatches the right
+    /// verb (checkout vs merge vs rebase vs delete vs create-from base).
+    pub branch_purpose: BranchPurpose,
+    /// The Source Control "⋯" title menu (open/expanded state + hit rects).
+    pub scm_menu: crate::widgets::scm_menu::ScmMenuState,
+    /// Single-line input modal for SCM ops that need a typed value
+    /// (clone URL, branch rename, remote name/URL, tag name).
+    pub input_prompt: Option<crate::widgets::input_prompt::InputPrompt>,
+    /// Single-choice picker for SCM ops that act on one of a git-owned list
+    /// (apply/pop/drop a stash, delete a tag, remove/push-to a remote).
+    pub list_picker: Option<crate::widgets::list_picker::ListPicker>,
+    /// Rolling log of git commands croft has run and their summaries, shown
+    /// read-only by the "Show Git Output" action (VS Code's Git channel).
+    pub git_output_log: Vec<String>,
+    /// True while the "Discard All Changes" confirmation modal is up.
+    pub pending_discard_all: bool,
     /// Cached workspace file index. Built lazily on first Cmd+P and
     /// shared across reopens so repeated invocations are instant.
     file_finder_index: Option<std::sync::Arc<Vec<crate::widgets::file_finder::FileEntry>>>,
@@ -1902,6 +1932,12 @@ impl App {
             debug_ever_stopped: false,
             zoxide_jump: None,
             branch_picker: None,
+            branch_purpose: BranchPurpose::Checkout,
+            scm_menu: crate::widgets::scm_menu::ScmMenuState::default(),
+            input_prompt: None,
+            list_picker: None,
+            git_output_log: Vec::new(),
+            pending_discard_all: false,
             file_finder_index: None,
             file_finder_index_rx: Some(file_finder_index_rx),
             file_finder_index_dirty: false,
@@ -2216,6 +2252,8 @@ impl App {
             || self.process_picker.is_some()
             || self.zoxide_jump.is_some()
             || self.branch_picker.is_some()
+            || self.input_prompt.is_some()
+            || self.list_picker.is_some()
         {
             return;
         }
@@ -2282,6 +2320,8 @@ impl App {
             || self.process_picker.is_some()
             || self.zoxide_jump.is_some()
             || self.branch_picker.is_some()
+            || self.input_prompt.is_some()
+            || self.list_picker.is_some()
         {
             return;
         }
@@ -2361,6 +2401,8 @@ impl App {
             && self.file_finder.is_none()
             && self.zoxide_jump.is_none()
             && self.branch_picker.is_none()
+            && self.input_prompt.is_none()
+            && self.list_picker.is_none()
             && self.show_tree
             && self.sidebar_view == SidebarView::Remote
             && self.remote.targets.is_empty();
@@ -2713,6 +2755,8 @@ impl App {
             || self.process_picker.is_some()
             || self.zoxide_jump.is_some()
             || self.branch_picker.is_some()
+            || self.input_prompt.is_some()
+            || self.list_picker.is_some()
             || self.connect_dialog.is_some()
         {
             if let Some((px, py)) = self.overlays.badge.take_last_emitted() {
@@ -6186,12 +6230,16 @@ impl App {
         self.render_prompt(frame);
         self.render_local_open_confirm(frame);
         self.render_discard_confirm(frame);
+        self.render_discard_all_confirm(frame);
         self.render_editor_find(frame);
         self.render_file_finder(frame);
         self.render_command_palette(frame);
         self.render_process_picker(frame);
         self.render_zoxide_jump(frame);
         self.render_branch_picker(frame);
+        self.render_scm_menu(frame);
+        self.render_input_prompt(frame);
+        self.render_list_picker(frame);
         self.render_shortcuts_modal(frame);
         self.render_connect_dialog(frame);
         // The startup unsupported-terminal nudge renders last so it sits above
@@ -6496,6 +6544,65 @@ impl App {
                     Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
                 ),
                 ratatui::text::Span::raw("es, discard   "),
+                ratatui::text::Span::styled(
+                    "[N]",
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                ratatui::text::Span::raw("o / Esc"),
+            ]),
+        ]);
+        frame.render_widget(ratatui::widgets::Paragraph::new(body), inner);
+    }
+
+    /// Confirmation modal for "Discard All Changes" — reverts every tracked
+    /// edit to HEAD, so it gets the same red Y/N gate as a single discard.
+    fn render_discard_all_confirm(&self, frame: &mut ratatui::Frame) {
+        if !self.pending_discard_all {
+            return;
+        }
+        let area = frame.area();
+        let width = area.width.saturating_sub(8).clamp(50, 96);
+        let height: u16 = 7;
+        let rect = Rect {
+            x: (area.width.saturating_sub(width)) / 2 + area.x,
+            y: (area.height.saturating_sub(height)) / 2 + area.y,
+            width,
+            height,
+        };
+        let warn = Color::Rgb(0xe7, 0x70, 0x70);
+        let block = ratatui::widgets::Block::default()
+            .borders(ratatui::widgets::Borders::ALL)
+            .border_style(Style::default().fg(warn))
+            .style(Style::default().bg(Color::Rgb(0x1e, 0x1e, 0x1e)))
+            .title(ratatui::text::Span::styled(
+                " DISCARD ALL CHANGES? ",
+                Style::default()
+                    .fg(Color::White)
+                    .bg(warn)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        frame.render_widget(ratatui::widgets::Clear, rect);
+        frame.render_widget(block, rect);
+        let inner = Rect {
+            x: rect.x + 2,
+            y: rect.y + 1,
+            width: rect.width.saturating_sub(4),
+            height: rect.height.saturating_sub(2),
+        };
+        let body = ratatui::text::Text::from(vec![
+            ratatui::text::Line::from(ratatui::text::Span::styled(
+                "This reverts every tracked file to HEAD. Untracked files are kept.",
+                Style::default().fg(Color::White),
+            )),
+            ratatui::text::Line::from(""),
+            ratatui::text::Line::from(vec![
+                ratatui::text::Span::styled(
+                    "[Y]",
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                ),
+                ratatui::text::Span::raw("es, discard all   "),
                 ratatui::text::Span::styled(
                     "[N]",
                     Style::default()
@@ -6852,6 +6959,30 @@ impl App {
         }
         if self.branch_picker.is_some() {
             self.handle_branch_picker_key(key);
+            return Ok(());
+        }
+        if self.input_prompt.is_some() {
+            self.handle_input_prompt_key(key);
+            return Ok(());
+        }
+        if self.list_picker.is_some() {
+            self.handle_list_picker_key(key);
+            return Ok(());
+        }
+        if self.pending_discard_all {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                    self.confirm_pending_discard_all();
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    self.cancel_pending_discard_all();
+                }
+                _ => {}
+            }
+            return Ok(());
+        }
+        if self.scm_menu.open && matches!(key.code, KeyCode::Esc) {
+            self.scm_menu.close();
             return Ok(());
         }
         if matches!(key.code, KeyCode::F(1)) {
@@ -8551,6 +8682,564 @@ impl App {
                 self.status = format!("Unstage failed: {err}");
                 self.source_control.commit_feedback = Some(err);
                 self.source_control.commit_feedback_is_error = true;
+            }
+        }
+    }
+
+    // --- Source Control "⋯" menu plumbing --------------------------------
+
+    /// Append a git command + its outcome to the rolling output log, which
+    /// the "Show Git Output" action surfaces read-only. Capped so a long
+    /// session can't grow it without bound.
+    fn log_git(&mut self, label: &str, outcome: &Result<String, String>) {
+        let body = match outcome {
+            Ok(s) if s.is_empty() => String::from("(ok)"),
+            Ok(s) => s.clone(),
+            Err(e) => format!("error: {e}"),
+        };
+        self.git_output_log.push(format!("$ git {label}\n{body}"));
+        const CAP: usize = 200;
+        if self.git_output_log.len() > CAP {
+            let excess = self.git_output_log.len() - CAP;
+            self.git_output_log.drain(0..excess);
+        }
+    }
+
+    /// Run an immediate git operation: log it, surface its summary or error
+    /// in the commit-feedback line, and refresh the panel. The single path
+    /// every "⋯"-menu leaf that acts now (vs. opening a modal) flows through.
+    fn run_scm_op(&mut self, label: &str, outcome: Result<String, String>, ok_prefix: &str) {
+        self.log_git(label, &outcome);
+        match outcome {
+            Ok(summary) => {
+                self.source_control.commit_feedback = Some(if summary.is_empty() {
+                    ok_prefix.to_string()
+                } else {
+                    format!("{ok_prefix}: {summary}")
+                });
+                self.source_control.commit_feedback_is_error = false;
+                self.status = format!("{ok_prefix}: {summary}");
+            }
+            Err(err) => {
+                self.source_control.commit_feedback = Some(format!("{ok_prefix} failed: {err}"));
+                self.source_control.commit_feedback_is_error = true;
+                self.status = format!("{ok_prefix} failed: {err}");
+            }
+        }
+        self.git.bypass_debounce();
+        self.refresh_git_status_debounced();
+        self.refresh_source_control();
+    }
+
+    pub fn stage_all_source_control(&mut self) {
+        let r = crate::git::stage_all(&self.tree.root);
+        self.run_scm_op("add -A", r, "Staged all");
+    }
+
+    pub fn unstage_all_source_control(&mut self) {
+        let r = crate::git::unstage_all(&self.tree.root);
+        self.run_scm_op("reset HEAD", r, "Unstaged all");
+    }
+
+    /// Arm the Discard All confirmation. Destructive (reverts every tracked
+    /// edit to HEAD), so it never acts until `confirm_pending_discard_all`.
+    pub fn request_discard_all_source_control(&mut self) {
+        self.pending_discard_all = true;
+    }
+
+    pub fn cancel_pending_discard_all(&mut self) {
+        self.pending_discard_all = false;
+    }
+
+    pub fn confirm_pending_discard_all(&mut self) {
+        if !self.pending_discard_all {
+            return;
+        }
+        self.pending_discard_all = false;
+        let r = crate::git::discard_all_tracked(&self.tree.root);
+        self.run_scm_op("checkout -- .", r, "Discarded all changes");
+    }
+
+    /// The commit message currently in the input box, trimmed, or an error
+    /// surfaced when it is empty (shared by the Commit submenu variants).
+    fn require_commit_message(&mut self) -> Option<String> {
+        let message = self.source_control.message.trim().to_string();
+        if message.is_empty() {
+            self.source_control.commit_feedback = Some(String::from("Empty commit message"));
+            self.source_control.commit_feedback_is_error = true;
+            return None;
+        }
+        Some(message)
+    }
+
+    fn commit_staged_source_control(&mut self) {
+        let Some(message) = self.require_commit_message() else {
+            return;
+        };
+        let r = crate::git::commit_staged(&self.tree.root, &message);
+        if r.is_ok() {
+            self.source_control.clear_message();
+        }
+        self.run_scm_op("commit -m", r, "Committed staged");
+    }
+
+    fn commit_all_source_control(&mut self) {
+        let Some(message) = self.require_commit_message() else {
+            return;
+        };
+        if let Err(err) = crate::git::stage_all(&self.tree.root) {
+            self.run_scm_op("add -A", Err(err), "Stage all");
+            return;
+        }
+        let r = crate::git::commit_staged(&self.tree.root, &message);
+        if r.is_ok() {
+            self.source_control.clear_message();
+        }
+        self.run_scm_op("commit (all)", r, "Committed all");
+    }
+
+    fn commit_amend_source_control(&mut self) {
+        // Amend keeps the prior message when the box is empty, otherwise
+        // rewrites it — matching VS Code's amend.
+        let message = self.source_control.message.trim().to_string();
+        let r = if message.is_empty() {
+            crate::git::commit_amend_no_edit(&self.tree.root)
+        } else {
+            crate::git::commit_amend(&self.tree.root, &message)
+        };
+        if r.is_ok() {
+            self.source_control.clear_message();
+        }
+        self.run_scm_op("commit --amend", r, "Amended commit");
+    }
+
+    fn commit_and_sync_source_control(&mut self) {
+        let Some(message) = self.require_commit_message() else {
+            return;
+        };
+        let commit = crate::git::commit_all_tracked(&self.tree.root, &message);
+        self.log_git("commit -am", &commit);
+        if let Err(err) = commit {
+            self.source_control.commit_feedback = Some(err.clone());
+            self.source_control.commit_feedback_is_error = true;
+            self.status = format!("Commit failed: {err}");
+            return;
+        }
+        self.source_control.clear_message();
+        self.sync_source_control();
+    }
+
+    fn publish_branch_source_control(&mut self) {
+        let Some(branch) = self.source_control.status.branch.clone() else {
+            self.source_control.commit_feedback =
+                Some(String::from("Detached HEAD has no branch to publish"));
+            self.source_control.commit_feedback_is_error = true;
+            return;
+        };
+        let r = crate::git::publish_branch(&self.tree.root, &branch);
+        self.run_scm_op("push -u origin", r, "Published");
+    }
+
+    /// Open the read-only "Git Output" log in an editor tab (VS Code's Git
+    /// output channel). Empty until croft has run an operation this session.
+    fn show_git_output(&mut self) {
+        let body = if self.git_output_log.is_empty() {
+            String::from("(no git operations run yet this session)")
+        } else {
+            self.git_output_log.join("\n\n")
+        };
+        let label = std::path::PathBuf::from("Git Output");
+        if let Err(err) = self.editor.open_text_buffer(&label, &body) {
+            self.status = format!("Could not open Git Output: {err}");
+            return;
+        }
+        self.focus_pane(Pane::Editor);
+    }
+
+    /// Open the branch picker with an explicit purpose (Checkout by default,
+    /// or one of the Branch-submenu verbs).
+    fn open_branch_picker_for(&mut self, purpose: BranchPurpose) {
+        self.branch_purpose = purpose;
+        self.open_branch_picker();
+    }
+
+    /// Open a single-line input modal for an SCM value (clone URL, branch
+    /// rename, …).
+    fn open_input_prompt(&mut self, prompt: crate::widgets::input_prompt::InputPrompt) {
+        self.scm_menu.close();
+        self.input_prompt = Some(prompt);
+        self.overlays.input_prompt_clear.request();
+    }
+
+    fn close_input_prompt(&mut self) {
+        if self.input_prompt.take().is_some() {
+            self.overlays.input_prompt_clear.request();
+            self.overlays.activity.mark_dirty();
+            self.overlays.welcome.mark_dirty();
+            self.overlays.hero.mark_dirty();
+            self.invalidate_editor_image_layouts();
+            self.status.clear();
+        }
+    }
+
+    /// Open a single-choice list picker (stashes, tags, remotes). Reports
+    /// the empty case instead of opening a useless box.
+    fn open_list_picker(
+        &mut self,
+        picker: crate::widgets::list_picker::ListPicker,
+        empty_msg: &str,
+    ) {
+        self.scm_menu.close();
+        if picker.rows.is_empty() {
+            self.status = empty_msg.to_string();
+            return;
+        }
+        self.list_picker = Some(picker);
+        self.overlays.list_picker_clear.request();
+    }
+
+    fn close_list_picker(&mut self) {
+        if self.list_picker.take().is_some() {
+            self.overlays.list_picker_clear.request();
+            self.overlays.activity.mark_dirty();
+            self.overlays.welcome.mark_dirty();
+            self.overlays.hero.mark_dirty();
+            self.invalidate_editor_image_layouts();
+            self.status.clear();
+        }
+    }
+
+    /// Route every "⋯"-menu leaf to its handler. Immediate ops run now;
+    /// ops needing a value or a choice open a modal/picker.
+    pub fn dispatch_scm_action(&mut self, action: crate::widgets::scm_menu::ScmAction) {
+        use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
+        use crate::widgets::list_picker::ListPurpose;
+        use crate::widgets::scm_menu::ScmAction;
+        self.scm_menu.close();
+        match action {
+            ScmAction::Pull => self.pull_source_control(),
+            ScmAction::Push => self.push_source_control(),
+            ScmAction::Clone => self.open_input_prompt(InputPrompt::new(
+                InputPurpose::CloneUrl,
+                "Clone Repository",
+                "Repository URL (https://… or git@…)",
+            )),
+            ScmAction::CheckoutTo => self.open_branch_picker_for(BranchPurpose::Checkout),
+            ScmAction::Fetch => {
+                let r = crate::git::fetch_all(&self.tree.root);
+                self.run_scm_op("fetch --all --prune", r, "Fetched");
+            }
+            ScmAction::ShowGitOutput => self.show_git_output(),
+            ScmAction::Commit => self.commit_source_control(),
+            ScmAction::CommitStaged => self.commit_staged_source_control(),
+            ScmAction::CommitAll => self.commit_all_source_control(),
+            ScmAction::CommitAmend => self.commit_amend_source_control(),
+            ScmAction::CommitAndPush => self.commit_and_push_source_control(),
+            ScmAction::CommitAndSync => self.commit_and_sync_source_control(),
+            ScmAction::StageAll => self.stage_all_source_control(),
+            ScmAction::UnstageAll => self.unstage_all_source_control(),
+            ScmAction::DiscardAll => self.request_discard_all_source_control(),
+            ScmAction::Sync => self.sync_source_control(),
+            ScmAction::PullRebase => {
+                let r = crate::git::pull_rebase(&self.tree.root);
+                self.run_scm_op("pull --rebase", r, "Pulled (rebase)");
+            }
+            ScmAction::PushTo => self.open_push_to_remote_picker(),
+            ScmAction::PushForce => {
+                let r = crate::git::push_force(&self.tree.root);
+                self.run_scm_op("push --force-with-lease", r, "Force-pushed");
+            }
+            ScmAction::PublishBranch => self.publish_branch_source_control(),
+            ScmAction::CreateBranch => self.open_branch_picker_for(BranchPurpose::Checkout),
+            ScmAction::CreateBranchFrom => self.open_branch_picker_for(BranchPurpose::CreateFrom),
+            ScmAction::RenameBranch => {
+                let seed = self
+                    .source_control
+                    .status
+                    .branch
+                    .clone()
+                    .unwrap_or_default();
+                self.open_input_prompt(
+                    InputPrompt::new(
+                        InputPurpose::RenameBranch,
+                        "Rename Branch",
+                        "New branch name",
+                    )
+                    .with_value(seed),
+                );
+            }
+            ScmAction::DeleteBranch => self.open_branch_picker_for(BranchPurpose::Delete),
+            ScmAction::Merge => self.open_branch_picker_for(BranchPurpose::Merge),
+            ScmAction::Rebase => self.open_branch_picker_for(BranchPurpose::Rebase),
+            ScmAction::AddRemote => self.open_input_prompt(InputPrompt::new(
+                InputPurpose::AddRemoteName,
+                "Add Remote",
+                "Remote name (e.g. origin)",
+            )),
+            ScmAction::RemoveRemote => self.open_remote_picker(ListPurpose::RemoveRemote),
+            ScmAction::Stash => self.stash_source_control(),
+            ScmAction::StashIncludeUntracked => {
+                let r = crate::git::stash_push_untracked(&self.tree.root);
+                self.run_scm_op("stash push -u", r, "Stashed (incl. untracked)");
+            }
+            ScmAction::StashStaged => {
+                let r = crate::git::stash_push_staged(&self.tree.root);
+                self.run_scm_op("stash push --staged", r, "Stashed staged");
+            }
+            ScmAction::ApplyStash => self.open_stash_picker(ListPurpose::StashApply),
+            ScmAction::PopStashLatest => self.stash_pop_source_control(),
+            ScmAction::PopStashPick => self.open_stash_picker(ListPurpose::StashPop),
+            ScmAction::DropStash => self.open_stash_picker(ListPurpose::StashDrop),
+            ScmAction::CreateTag => self.open_input_prompt(InputPrompt::new(
+                InputPurpose::CreateTag,
+                "Create Tag",
+                "Tag name (e.g. v1.0.0)",
+            )),
+            ScmAction::DeleteTag => self.open_tag_picker(),
+        }
+    }
+
+    fn open_stash_picker(&mut self, purpose: crate::widgets::list_picker::ListPurpose) {
+        use crate::widgets::list_picker::{ListPicker, ListRow};
+        let rows: Vec<ListRow> = match crate::git::list_stashes(&self.tree.root) {
+            Ok(stashes) => stashes
+                .into_iter()
+                .map(|s| ListRow {
+                    id: s.index.to_string(),
+                    label: format!("stash@{{{}}}: {}", s.index, s.message),
+                })
+                .collect(),
+            Err(err) => {
+                self.status = format!("Stashes: {err}");
+                return;
+            }
+        };
+        let title = match purpose {
+            crate::widgets::list_picker::ListPurpose::StashApply => "Apply Stash",
+            crate::widgets::list_picker::ListPurpose::StashDrop => "Drop Stash",
+            _ => "Pop Stash",
+        };
+        self.open_list_picker(
+            ListPicker::new(purpose, title, rows),
+            "No stashes to choose",
+        );
+    }
+
+    fn open_tag_picker(&mut self) {
+        use crate::widgets::list_picker::{ListPicker, ListPurpose, ListRow};
+        let rows: Vec<ListRow> = match crate::git::list_tags(&self.tree.root) {
+            Ok(tags) => tags
+                .into_iter()
+                .map(|t| ListRow {
+                    id: t.clone(),
+                    label: t,
+                })
+                .collect(),
+            Err(err) => {
+                self.status = format!("Tags: {err}");
+                return;
+            }
+        };
+        self.open_list_picker(
+            ListPicker::new(ListPurpose::DeleteTag, "Delete Tag", rows),
+            "No tags to delete",
+        );
+    }
+
+    fn open_remote_picker(&mut self, purpose: crate::widgets::list_picker::ListPurpose) {
+        use crate::widgets::list_picker::{ListPicker, ListRow};
+        let rows: Vec<ListRow> = match crate::git::list_remotes(&self.tree.root) {
+            Ok(remotes) => remotes
+                .into_iter()
+                .map(|r| ListRow {
+                    id: r.name.clone(),
+                    label: format!("{}  {}", r.name, r.url),
+                })
+                .collect(),
+            Err(err) => {
+                self.status = format!("Remotes: {err}");
+                return;
+            }
+        };
+        self.open_list_picker(
+            ListPicker::new(purpose, "Remove Remote", rows),
+            "No remotes configured",
+        );
+    }
+
+    fn open_push_to_remote_picker(&mut self) {
+        use crate::widgets::list_picker::{ListPicker, ListPurpose, ListRow};
+        let rows: Vec<ListRow> = match crate::git::list_remotes(&self.tree.root) {
+            Ok(remotes) => remotes
+                .into_iter()
+                .map(|r| ListRow {
+                    id: r.name.clone(),
+                    label: format!("{}  {}", r.name, r.url),
+                })
+                .collect(),
+            Err(err) => {
+                self.status = format!("Remotes: {err}");
+                return;
+            }
+        };
+        self.open_list_picker(
+            ListPicker::new(ListPurpose::PushToRemote, "Push to Remote", rows),
+            "No remotes configured",
+        );
+    }
+
+    /// Apply the value submitted by the input modal to its purpose's git op.
+    fn submit_input_prompt(&mut self) {
+        use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
+        let Some(prompt) = self.input_prompt.as_ref() else {
+            return;
+        };
+        let Some(value) = prompt.submit_value() else {
+            return; // blank: keep waiting
+        };
+        let purpose = prompt.purpose.clone();
+        match purpose {
+            InputPurpose::CloneUrl => {
+                self.close_input_prompt();
+                let parent = self
+                    .tree
+                    .root
+                    .parent()
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_else(|| self.tree.root.clone());
+                match crate::git::clone_into(&parent, &value) {
+                    Ok(dest) => {
+                        self.log_git("clone", &Ok(format!("into {}", dest.display())));
+                        self.status = format!("Cloned into {}", dest.display());
+                        self.change_workspace_root(dest);
+                    }
+                    Err(err) => {
+                        self.log_git("clone", &Err(err.clone()));
+                        self.source_control.commit_feedback = Some(format!("clone failed: {err}"));
+                        self.source_control.commit_feedback_is_error = true;
+                        self.status = format!("Clone failed: {err}");
+                    }
+                }
+            }
+            InputPurpose::RenameBranch => {
+                self.close_input_prompt();
+                let r = crate::git::rename_branch(&self.tree.root, &value);
+                self.run_scm_op("branch -m", r, "Renamed branch");
+            }
+            InputPurpose::CreateBranchFrom { base } => {
+                self.close_input_prompt();
+                let r = crate::git::create_branch_from(&self.tree.root, &value, &base);
+                self.run_scm_op("switch -c (from)", r, "Created branch");
+            }
+            InputPurpose::AddRemoteName => {
+                // First step: capture the name, then re-prompt for the URL.
+                self.close_input_prompt();
+                self.open_input_prompt(InputPrompt::new(
+                    InputPurpose::AddRemoteUrl { name: value },
+                    "Add Remote",
+                    "Remote URL",
+                ));
+            }
+            InputPurpose::AddRemoteUrl { name } => {
+                self.close_input_prompt();
+                let r = crate::git::add_remote(&self.tree.root, &name, &value);
+                self.run_scm_op("remote add", r, "Added remote");
+            }
+            InputPurpose::CreateTag => {
+                self.close_input_prompt();
+                let r = crate::git::create_tag(&self.tree.root, &value);
+                self.run_scm_op("tag", r, "Created tag");
+            }
+        }
+    }
+
+    /// Act on the row chosen in the list picker.
+    fn confirm_list_picker(&mut self) {
+        use crate::widgets::list_picker::ListPurpose;
+        let Some(picker) = self.list_picker.as_ref() else {
+            return;
+        };
+        let Some(row) = picker.selected_row().cloned() else {
+            return;
+        };
+        let purpose = picker.purpose;
+        self.close_list_picker();
+        let index = row.id.parse::<usize>().unwrap_or(0);
+        match purpose {
+            ListPurpose::StashApply => {
+                let r = crate::git::stash_apply(&self.tree.root, index);
+                self.run_scm_op("stash apply", r, "Applied stash");
+            }
+            ListPurpose::StashPop => {
+                let r = crate::git::stash_pop_at(&self.tree.root, index);
+                self.run_scm_op("stash pop", r, "Popped stash");
+            }
+            ListPurpose::StashDrop => {
+                let r = crate::git::stash_drop(&self.tree.root, index);
+                self.run_scm_op("stash drop", r, "Dropped stash");
+            }
+            ListPurpose::RemoveRemote => {
+                let r = crate::git::remove_remote(&self.tree.root, &row.id);
+                self.run_scm_op("remote remove", r, "Removed remote");
+            }
+            ListPurpose::DeleteTag => {
+                let r = crate::git::delete_tag(&self.tree.root, &row.id);
+                self.run_scm_op("tag -d", r, "Deleted tag");
+            }
+            ListPurpose::PushToRemote => {
+                let r = crate::git::push_to_remote(&self.tree.root, &row.id);
+                self.run_scm_op("push", r, "Pushed");
+            }
+        }
+    }
+
+    /// Resolve the branch-picker selection per its open purpose.
+    fn apply_branch_picker_selection(&mut self) {
+        let Some(picker) = self.branch_picker.as_ref() else {
+            return;
+        };
+        match self.branch_purpose {
+            BranchPurpose::Checkout => {
+                if let Some(action) = picker.selected_action() {
+                    self.apply_branch_action(action);
+                } else {
+                    self.close_branch_picker();
+                }
+            }
+            BranchPurpose::CreateFrom => {
+                let Some(base) = picker.selected_existing_branch() else {
+                    return;
+                };
+                self.close_branch_picker();
+                self.open_input_prompt(crate::widgets::input_prompt::InputPrompt::new(
+                    crate::widgets::input_prompt::InputPurpose::CreateBranchFrom { base },
+                    "Create Branch from",
+                    "New branch name",
+                ));
+            }
+            BranchPurpose::Delete => {
+                let Some(name) = picker.selected_existing_branch() else {
+                    return;
+                };
+                self.close_branch_picker();
+                let r = crate::git::delete_branch(&self.tree.root, &name);
+                self.run_scm_op("branch -d", r, "Deleted branch");
+            }
+            BranchPurpose::Merge => {
+                let Some(name) = picker.selected_existing_branch() else {
+                    return;
+                };
+                self.close_branch_picker();
+                let r = crate::git::merge_branch(&self.tree.root, &name);
+                self.run_scm_op("merge", r, "Merged");
+            }
+            BranchPurpose::Rebase => {
+                let Some(name) = picker.selected_existing_branch() else {
+                    return;
+                };
+                self.close_branch_picker();
+                let r = crate::git::rebase_branch(&self.tree.root, &name);
+                self.run_scm_op("rebase", r, "Rebased");
             }
         }
     }
@@ -12121,13 +12810,7 @@ impl App {
         };
         match (key.code, key.modifiers) {
             (KeyCode::Esc, _) => self.close_branch_picker(),
-            (KeyCode::Enter, _) => {
-                if let Some(action) = picker.selected_action() {
-                    self.apply_branch_action(action);
-                } else {
-                    self.close_branch_picker();
-                }
-            }
+            (KeyCode::Enter, _) => self.apply_branch_picker_selection(),
             (KeyCode::Up, _) => picker.select_prev(),
             (KeyCode::Down, _) => picker.select_next(),
             (KeyCode::PageUp, _) => {
@@ -12218,6 +12901,139 @@ impl App {
             frame.buffer_mut(),
             gradient,
         );
+    }
+
+    pub fn consume_input_prompt_image_clear(&mut self) -> bool {
+        self.overlays.input_prompt_clear.consume()
+    }
+
+    pub fn consume_list_picker_image_clear(&mut self) -> bool {
+        self.overlays.list_picker_clear.consume()
+    }
+
+    fn handle_input_prompt_key(&mut self, key: KeyEvent) {
+        let Some(prompt) = self.input_prompt.as_mut() else {
+            return;
+        };
+        match (key.code, key.modifiers) {
+            (KeyCode::Esc, _) => self.close_input_prompt(),
+            (KeyCode::Enter, _) => self.submit_input_prompt(),
+            (KeyCode::Left, _) => prompt.move_cursor_left(),
+            (KeyCode::Right, _) => prompt.move_cursor_right(),
+            (KeyCode::Home, _) => prompt.move_cursor_home(),
+            (KeyCode::End, _) => prompt.move_cursor_end(),
+            (KeyCode::Backspace, _) => prompt.pop_char(),
+            (KeyCode::Delete, _) => prompt.delete_char(),
+            (KeyCode::Char(c), m) if !m.intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER) => {
+                prompt.push_char(c);
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_input_prompt_mouse(&mut self, m: MouseEvent) {
+        let Some(prompt) = self.input_prompt.as_ref() else {
+            return;
+        };
+        let inside = rect_contains(prompt.last_rect, m.column, m.row);
+        if matches!(
+            m.kind,
+            MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Down(MouseButton::Right)
+        ) && !inside
+        {
+            self.close_input_prompt();
+        }
+    }
+
+    fn render_input_prompt(&mut self, frame: &mut ratatui::Frame) {
+        let full = frame.area();
+        let gradient = self.popup_gradient();
+        let Some(prompt) = self.input_prompt.as_mut() else {
+            return;
+        };
+        crate::widgets::input_prompt::render_input_prompt(
+            prompt,
+            full,
+            frame.buffer_mut(),
+            gradient,
+        );
+    }
+
+    fn handle_list_picker_key(&mut self, key: KeyEvent) {
+        let Some(picker) = self.list_picker.as_mut() else {
+            return;
+        };
+        match (key.code, key.modifiers) {
+            (KeyCode::Esc, _) => self.close_list_picker(),
+            (KeyCode::Enter, _) => self.confirm_list_picker(),
+            (KeyCode::Up, _) => picker.select_prev(),
+            (KeyCode::Down, _) => picker.select_next(),
+            (KeyCode::PageUp, _) => {
+                for _ in 0..10 {
+                    picker.select_prev();
+                }
+            }
+            (KeyCode::PageDown, _) => {
+                for _ in 0..10 {
+                    picker.select_next();
+                }
+            }
+            (KeyCode::Left, _) => picker.move_cursor_left(),
+            (KeyCode::Right, _) => picker.move_cursor_right(),
+            (KeyCode::Backspace, _) => picker.pop_char(),
+            (KeyCode::Char(c), m) if !m.intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER) => {
+                picker.push_char(c);
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_list_picker_mouse(&mut self, m: MouseEvent) {
+        let Some(picker) = self.list_picker.as_mut() else {
+            return;
+        };
+        let inside = rect_contains(picker.last_rect, m.column, m.row);
+        match m.kind {
+            MouseEventKind::ScrollDown => {
+                for _ in 0..3 {
+                    picker.select_next();
+                }
+            }
+            MouseEventKind::ScrollUp => {
+                for _ in 0..3 {
+                    picker.select_prev();
+                }
+            }
+            MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Down(MouseButton::Right)
+                if !inside =>
+            {
+                self.close_list_picker();
+            }
+            _ => {}
+        }
+    }
+
+    fn render_list_picker(&mut self, frame: &mut ratatui::Frame) {
+        let full = frame.area();
+        let gradient = self.popup_gradient();
+        let Some(picker) = self.list_picker.as_mut() else {
+            return;
+        };
+        crate::widgets::list_picker::render_list_picker(picker, full, frame.buffer_mut(), gradient);
+    }
+
+    /// Render the Source Control "⋯" actions menu under the header pill.
+    fn render_scm_menu(&mut self, frame: &mut ratatui::Frame) {
+        if !self.scm_menu.open || self.sidebar_view != SidebarView::SourceControl {
+            self.scm_menu.close();
+            return;
+        }
+        let anchor = self.source_control.header_more_btn;
+        if anchor.width == 0 {
+            return;
+        }
+        let screen = frame.area();
+        crate::widgets::scm_menu::render(&mut self.scm_menu, anchor, screen, frame.buffer_mut());
     }
 
     fn open_editor_find(&mut self) {
@@ -12694,6 +13510,23 @@ impl App {
         }
         if self.branch_picker.is_some() {
             self.handle_branch_picker_mouse(m);
+            return;
+        }
+        if self.input_prompt.is_some() {
+            self.handle_input_prompt_mouse(m);
+            return;
+        }
+        if self.list_picker.is_some() {
+            self.handle_list_picker_mouse(m);
+            return;
+        }
+        if self.scm_menu.open && matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
+            use crate::widgets::scm_menu::ClickOutcome;
+            match self.scm_menu.click(m.column, m.row) {
+                ClickOutcome::Fire(action) => self.dispatch_scm_action(action),
+                ClickOutcome::Toggled => {}
+                ClickOutcome::Missed => self.scm_menu.close(),
+            }
             return;
         }
         if matches!(m.kind, MouseEventKind::Down(MouseButton::Left))
@@ -13345,6 +14178,14 @@ impl App {
                 }
                 if in_tree && self.sidebar_view == SidebarView::SourceControl {
                     self.focus_pane(Pane::Tree);
+                    if self.source_control.click_more(m.column, m.row) {
+                        self.commit_menu_open = false;
+                        self.scm_menu.open = !self.scm_menu.open;
+                        if !self.scm_menu.open {
+                            self.scm_menu.close();
+                        }
+                        return;
+                    }
                     if self.source_control.click_header_refresh(m.column, m.row) {
                         self.refresh_source_control();
                         self.status = String::from("Refreshed Source Control");
@@ -14646,6 +15487,8 @@ impl App {
             || self.process_picker.is_some()
             || self.zoxide_jump.is_some()
             || self.branch_picker.is_some()
+            || self.input_prompt.is_some()
+            || self.list_picker.is_some()
         {
             return None;
         }
@@ -14663,6 +15506,8 @@ impl App {
             || self.process_picker.is_some()
             || self.zoxide_jump.is_some()
             || self.branch_picker.is_some()
+            || self.input_prompt.is_some()
+            || self.list_picker.is_some()
             || self.connect_dialog.is_some()
             || !self.editor.is_blank_initial()
             || self.terminal_maximized
@@ -17674,6 +18519,8 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
                 || app.consume_process_picker_image_clear()
                 || app.consume_zoxide_jump_image_clear()
                 || app.consume_branch_picker_image_clear()
+                || app.consume_input_prompt_image_clear()
+                || app.consume_list_picker_image_clear()
                 || app.consume_ssh_empty_state_image_clear()
                 || app.consume_activity_image_clear()
             {
@@ -17709,6 +18556,8 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
                 || app.consume_process_picker_image_clear()
                 || app.consume_zoxide_jump_image_clear()
                 || app.consume_branch_picker_image_clear()
+                || app.consume_input_prompt_image_clear()
+                || app.consume_list_picker_image_clear()
                 || app.consume_ssh_empty_state_image_clear()
                 || app.consume_activity_image_clear()
             {

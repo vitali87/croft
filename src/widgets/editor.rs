@@ -5541,6 +5541,35 @@ impl EditorTabs {
         Ok(())
     }
 
+    /// Open arbitrary text in a scratch tab labelled `label` (no file on
+    /// disk). Used by "Show Git Output" to surface the git command log. The
+    /// tab has no `disk_stamp`, so the FS-sync layer never tries to reload
+    /// or overwrite it.
+    pub fn open_text_buffer(&mut self, label: &Path, text: &str) -> Result<()> {
+        let mut e = Editor::new();
+        e.focused = self.editors[self.active].focused;
+        e.preview = false;
+        e.path = Some(label.to_path_buf());
+        e.lines = split_into_lines(text);
+        if e.lines.is_empty() {
+            e.lines.push(String::new());
+        }
+        if self.is_blank_initial() {
+            self.editors[self.active] = e;
+            return Ok(());
+        }
+        if let Some(idx) = self.find_tab_with_path(label) {
+            self.editors[idx] = e;
+            self.select(idx);
+            return Ok(());
+        }
+        let pos = self.active + 1;
+        self.editors.insert(pos, e);
+        self.editors[self.active].focused = false;
+        self.active = pos;
+        Ok(())
+    }
+
     /// Pinned-tab open: if the file is already in some tab, pin and switch
     /// to it. Otherwise create a fresh pinned tab next to the active one.
     /// Used by double-click in the explorer and Ctrl+Enter on a tree row.

@@ -6181,6 +6181,124 @@ fn stage_source_control_entry_runs_git_add_and_flips_kind_to_staged() {
 }
 
 #[test]
+fn stage_all_source_control_then_unstage_all_round_trips_every_entry() {
+    let tmp = make_committed_repo();
+    std::fs::write(tmp.path().join("seed.txt"), b"changed\n").unwrap();
+    std::fs::write(tmp.path().join("fresh.txt"), b"new\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    assert!(
+        wait_for_changes(&mut app, |a| a.source_control.entries.len() >= 2),
+        "preconditions: both files must show as changes"
+    );
+    app.stage_all_source_control();
+    assert!(
+        wait_for_changes(&mut app, |a| !a.source_control.entries.is_empty()
+            && a.source_control
+                .entries
+                .iter()
+                .all(|e| e.kind.section() == crate::git::ChangeSection::Staged)),
+        "after Stage All every entry must read as staged; saw {:?}",
+        app.source_control.entries,
+    );
+    app.unstage_all_source_control();
+    assert!(
+        wait_for_changes(&mut app, |a| !a.source_control.entries.is_empty()
+            && a.source_control
+                .entries
+                .iter()
+                .all(|e| e.kind.section() != crate::git::ChangeSection::Staged)),
+        "after Unstage All nothing must remain staged; saw {:?}",
+        app.source_control.entries,
+    );
+}
+
+#[test]
+fn discard_all_requires_confirmation_and_then_reverts_tracked_changes() {
+    let tmp = make_committed_repo();
+    std::fs::write(tmp.path().join("seed.txt"), b"dirty edit\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    wait_for_changes(&mut app, |a| {
+        a.source_control
+            .entries
+            .iter()
+            .any(|e| e.path == "seed.txt")
+    });
+    // Requesting discard-all only arms the confirm modal; the file is untouched.
+    app.request_discard_all_source_control();
+    assert!(
+        app.pending_discard_all,
+        "Discard All must arm a confirmation rather than act immediately"
+    );
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("seed.txt")).unwrap(),
+        "dirty edit\n",
+        "the working tree must be untouched until the user confirms"
+    );
+    app.confirm_pending_discard_all();
+    assert!(!app.pending_discard_all, "confirming clears the modal");
+    assert!(
+        wait_for_changes(&mut app, |_| std::fs::read_to_string(
+            tmp.path().join("seed.txt")
+        )
+        .map(|s| !s.contains("dirty edit"))
+        .unwrap_or(false)),
+        "after confirming, the tracked edit must be reverted to HEAD"
+    );
+}
+
+#[test]
+fn create_tag_via_the_menu_opens_an_input_then_creates_the_tag() {
+    use crate::widgets::input_prompt::InputPurpose;
+    use crate::widgets::scm_menu::ScmAction;
+    let tmp = make_committed_repo();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.dispatch_scm_action(ScmAction::CreateTag);
+    let prompt = app
+        .input_prompt
+        .as_ref()
+        .expect("Create Tag must open an input prompt");
+    assert_eq!(prompt.purpose, InputPurpose::CreateTag);
+    for c in "v9.9.9".chars() {
+        app.input_prompt.as_mut().unwrap().push_char(c);
+    }
+    app.submit_input_prompt();
+    assert!(app.input_prompt.is_none(), "submitting closes the prompt");
+    assert!(
+        crate::git::list_tags(tmp.path())
+            .unwrap()
+            .contains(&"v9.9.9".to_string()),
+        "the tag must exist after submitting the Create Tag input"
+    );
+}
+
+#[test]
+fn delete_branch_via_the_menu_opens_the_branch_picker_in_delete_mode() {
+    use crate::widgets::scm_menu::ScmAction;
+    let tmp = make_committed_repo();
+    crate::git::create_branch(tmp.path(), "doomed").unwrap();
+    crate::git::checkout_branch(tmp.path(), "main").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.dispatch_scm_action(ScmAction::DeleteBranch);
+    assert!(
+        app.branch_picker.is_some(),
+        "Delete Branch opens the branch picker"
+    );
+    assert_eq!(app.branch_purpose, crate::app::BranchPurpose::Delete);
+}
+
+#[test]
+fn dispatching_fetch_records_a_line_in_the_git_output_log() {
+    let tmp = make_committed_repo();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.dispatch_scm_action(crate::widgets::scm_menu::ScmAction::Fetch);
+    assert!(
+        app.git_output_log.iter().any(|l| l.contains("fetch")),
+        "every dispatched git op must append to the git output log; saw {:?}",
+        app.git_output_log,
+    );
+}
+
+#[test]
 fn unstage_source_control_entry_runs_git_reset_and_flips_kind_back_to_modified() {
     let tmp = make_committed_repo();
     std::fs::write(tmp.path().join("seed.txt"), b"changed\n").unwrap();

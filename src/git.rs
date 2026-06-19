@@ -933,6 +933,261 @@ pub fn stash_pop(root: &Path) -> Result<String, String> {
     run_mutation(root, &["stash", "pop"])
 }
 
+// --- Fetch / Clone -------------------------------------------------------
+
+/// Fetch from all remotes without merging (`git fetch --all --prune`).
+/// VS Code's "Fetch" updates remote-tracking refs so ahead/behind counts
+/// refresh; `--prune` drops refs deleted on the remote.
+pub fn fetch_all(root: &Path) -> Result<String, String> {
+    run_mutation(root, &["fetch", "--all", "--prune"])
+}
+
+/// Derive the directory name a clone of `url` would land in: the final
+/// path segment with any trailing `.git` and slash stripped. Returns
+/// `None` when the URL has no usable segment.
+pub fn clone_dir_name(url: &str) -> Option<String> {
+    let trimmed = url.trim().trim_end_matches('/');
+    let seg = trimmed.rsplit(['/', ':']).next()?.trim();
+    let name = seg.strip_suffix(".git").unwrap_or(seg).trim();
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+/// Clone `url` into `parent/<repo-name>` and return the new repo path.
+/// The Source Control "Clone" flow prompts for the URL, clones beside the
+/// current workspace, then re-roots croft into the clone.
+pub fn clone_into(parent: &Path, url: &str) -> Result<PathBuf, String> {
+    let name =
+        clone_dir_name(url).ok_or_else(|| format!("can't derive a folder name from {url}"))?;
+    let dest = parent.join(&name);
+    // run_mutation runs with `-C <parent>`, so the bare `<name>` clones into
+    // parent/<name>.
+    run_mutation(parent, &["clone", url, &name]).map(|_| dest)
+}
+
+// --- Commit variants -----------------------------------------------------
+
+/// Commit only what is already staged (`git commit -m`), leaving unstaged
+/// changes in the working tree. The mirror of `commit_all_tracked`, which
+/// auto-stages tracked edits with `-am`.
+pub fn commit_staged(root: &Path, message: &str) -> Result<String, String> {
+    if message.trim().is_empty() {
+        return Err("Commit message is empty".to_string());
+    }
+    run_mutation(root, &["commit", "-m", message])
+}
+
+/// Amend the previous commit with a new message (`git commit --amend -m`),
+/// folding any currently-staged changes into it. Rewrites history, so the
+/// caller confirms before invoking.
+pub fn commit_amend(root: &Path, message: &str) -> Result<String, String> {
+    if message.trim().is_empty() {
+        return Err("Commit message is empty".to_string());
+    }
+    run_mutation(root, &["commit", "--amend", "-m", message])
+}
+
+/// Amend the previous commit keeping its existing message
+/// (`git commit --amend --no-edit`); folds staged changes into HEAD.
+pub fn commit_amend_no_edit(root: &Path) -> Result<String, String> {
+    run_mutation(root, &["commit", "--amend", "--no-edit"])
+}
+
+// --- Bulk staging --------------------------------------------------------
+
+/// Stage every change, tracked and untracked (`git add -A`).
+pub fn stage_all(root: &Path) -> Result<String, String> {
+    run_mutation(root, &["add", "-A"])
+}
+
+/// Unstage everything (`git reset -q HEAD`), moving the whole index back
+/// into the working tree.
+pub fn unstage_all(root: &Path) -> Result<String, String> {
+    run_mutation(root, &["reset", "-q", "HEAD"])
+}
+
+/// Discard every tracked modification (`git checkout -- .`) — destructive,
+/// the caller MUST confirm. Untracked files are left untouched (matching
+/// the per-file discard, which deletes untracked only on explicit request).
+pub fn discard_all_tracked(root: &Path) -> Result<String, String> {
+    run_mutation(root, &["checkout", "--", "."])
+}
+
+// --- Pull / Push variants ------------------------------------------------
+
+/// Pull with rebase instead of merge (`git pull --rebase`).
+pub fn pull_rebase(root: &Path) -> Result<String, String> {
+    run_mutation(root, &["pull", "--rebase"])
+}
+
+/// Force-push the current branch, but only if the remote hasn't advanced
+/// past what we last saw (`git push --force-with-lease`). Safer than a
+/// bare `--force`; VS Code's "Push (Force)" uses the same lease guard.
+pub fn push_force(root: &Path) -> Result<String, String> {
+    run_mutation(root, &["push", "--force-with-lease"])
+}
+
+/// Push the current branch to a specific remote (`git push <remote>`).
+pub fn push_to_remote(root: &Path, remote: &str) -> Result<String, String> {
+    run_mutation(root, &["push", remote])
+}
+
+/// Publish the current branch: push it to `origin` and set upstream
+/// tracking (`git push -u origin <branch>`). Used when a local branch has
+/// no upstream yet.
+pub fn publish_branch(root: &Path, branch: &str) -> Result<String, String> {
+    run_mutation(root, &["push", "-u", "origin", branch])
+}
+
+// --- Branch management ---------------------------------------------------
+
+/// Create a new branch off an explicit base ref and switch to it
+/// (`git switch -c <name> <base>`). Powers "Create Branch from…".
+pub fn create_branch_from(root: &Path, name: &str, base: &str) -> Result<String, String> {
+    run_mutation(root, &["switch", "-c", name, base])
+}
+
+/// Rename the current branch (`git branch -m <new>`).
+pub fn rename_branch(root: &Path, new_name: &str) -> Result<String, String> {
+    run_mutation(root, &["branch", "-m", new_name])
+}
+
+/// Delete a branch (`git branch -d <name>`). Uses the safe `-d`, which
+/// refuses to drop unmerged work; the error is surfaced verbatim so the
+/// user can decide whether to force.
+pub fn delete_branch(root: &Path, name: &str) -> Result<String, String> {
+    run_mutation(root, &["branch", "-d", name])
+}
+
+/// Merge `branch` into the current branch (`git merge <branch>`).
+pub fn merge_branch(root: &Path, branch: &str) -> Result<String, String> {
+    run_mutation(root, &["merge", branch])
+}
+
+/// Rebase the current branch onto `branch` (`git rebase <branch>`).
+pub fn rebase_branch(root: &Path, branch: &str) -> Result<String, String> {
+    run_mutation(root, &["rebase", branch])
+}
+
+// --- Remotes -------------------------------------------------------------
+
+/// A configured remote: its name and fetch URL, for the Remote submenu's
+/// pickers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemoteInfo {
+    pub name: String,
+    pub url: String,
+}
+
+/// List configured remotes (`git remote -v`), de-duplicated to one row per
+/// remote (the fetch URL).
+pub fn list_remotes(root: &Path) -> Result<Vec<RemoteInfo>, String> {
+    let raw = run_git(root, &["remote", "-v"]).map_err(|e| e.to_string())?;
+    let mut out: Vec<RemoteInfo> = Vec::new();
+    for line in raw.lines() {
+        // Format: "<name>\t<url> (fetch|push)"
+        let mut parts = line.split_whitespace();
+        let (Some(name), Some(url)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        if out.iter().any(|r| r.name == name) {
+            continue;
+        }
+        out.push(RemoteInfo {
+            name: name.to_string(),
+            url: url.to_string(),
+        });
+    }
+    Ok(out)
+}
+
+/// Add a remote (`git remote add <name> <url>`).
+pub fn add_remote(root: &Path, name: &str, url: &str) -> Result<String, String> {
+    run_mutation(root, &["remote", "add", name, url])
+}
+
+/// Remove a remote (`git remote remove <name>`).
+pub fn remove_remote(root: &Path, name: &str) -> Result<String, String> {
+    run_mutation(root, &["remote", "remove", name])
+}
+
+// --- Stash (full set) ----------------------------------------------------
+
+/// Stash including untracked files (`git stash push -u`).
+pub fn stash_push_untracked(root: &Path) -> Result<String, String> {
+    run_mutation(root, &["stash", "push", "-u"])
+}
+
+/// Stash only the staged changes (`git stash push --staged`).
+pub fn stash_push_staged(root: &Path) -> Result<String, String> {
+    run_mutation(root, &["stash", "push", "--staged"])
+}
+
+/// One entry in the stash list, for the apply/pop/drop pickers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StashInfo {
+    /// Stash index (`stash@{N}` is built from this).
+    pub index: usize,
+    /// The human description git stores (`WIP on main: …`).
+    pub message: String,
+}
+
+/// List stashes newest-first (`git stash list`).
+pub fn list_stashes(root: &Path) -> Result<Vec<StashInfo>, String> {
+    let raw =
+        run_git(root, &["stash", "list", "--format=%gd\x1f%gs"]).map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    for line in raw.lines() {
+        let mut parts = line.split('\x1f');
+        let Some(reflog) = parts.next() else { continue };
+        let message = parts.next().unwrap_or("").to_string();
+        // reflog looks like "stash@{2}" — pull the integer out.
+        let index = reflog
+            .trim_start_matches("stash@{")
+            .trim_end_matches('}')
+            .parse::<usize>()
+            .unwrap_or(out.len());
+        out.push(StashInfo { index, message });
+    }
+    Ok(out)
+}
+
+/// Apply a stash without dropping it (`git stash apply stash@{N}`).
+pub fn stash_apply(root: &Path, index: usize) -> Result<String, String> {
+    run_mutation(root, &["stash", "apply", &format!("stash@{{{index}}}")])
+}
+
+/// Apply and drop a specific stash (`git stash pop stash@{N}`).
+pub fn stash_pop_at(root: &Path, index: usize) -> Result<String, String> {
+    run_mutation(root, &["stash", "pop", &format!("stash@{{{index}}}")])
+}
+
+/// Drop a stash without applying it (`git stash drop stash@{N}`).
+pub fn stash_drop(root: &Path, index: usize) -> Result<String, String> {
+    run_mutation(root, &["stash", "drop", &format!("stash@{{{index}}}")])
+}
+
+// --- Tags ----------------------------------------------------------------
+
+/// List tags newest-first (`git tag --sort=-creatordate`).
+pub fn list_tags(root: &Path) -> Result<Vec<String>, String> {
+    let raw = run_git(root, &["tag", "--sort=-creatordate"]).map_err(|e| e.to_string())?;
+    Ok(raw
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+/// Create a lightweight tag at HEAD (`git tag <name>`).
+pub fn create_tag(root: &Path, name: &str) -> Result<String, String> {
+    run_mutation(root, &["tag", name])
+}
+
+/// Delete a tag (`git tag -d <name>`).
+pub fn delete_tag(root: &Path, name: &str) -> Result<String, String> {
+    run_mutation(root, &["tag", "-d", name])
+}
+
 /// One row in the welcome-screen recent-commits panel: the short hash, a
 /// human-readable relative date (e.g. "2 hours ago"), and the commit
 /// subject.
@@ -2338,6 +2593,157 @@ mod tests {
             "one\ntwo\nstashed\n",
             "pop restores the stashed edit"
         );
+    }
+
+    #[test]
+    fn clone_dir_name_strips_dot_git_and_path() {
+        assert_eq!(
+            clone_dir_name("https://codeberg.org/vitali87/croft.git").as_deref(),
+            Some("croft")
+        );
+        assert_eq!(
+            clone_dir_name("git@github.com:owner/repo.git").as_deref(),
+            Some("repo")
+        );
+        assert_eq!(
+            clone_dir_name("https://host/path/thing/").as_deref(),
+            Some("thing")
+        );
+        assert_eq!(clone_dir_name("   ").as_deref(), None);
+    }
+
+    #[test]
+    fn stage_all_then_unstage_all_round_trips_the_index() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        init_repo_with_commit(p);
+        std::fs::write(p.join("seed.txt"), "one\ntwo\nthree\n").unwrap();
+        std::fs::write(p.join("new.txt"), "x").unwrap();
+        stage_all(p).expect("stage_all");
+        assert!(is_staged(p, "seed.txt"));
+        assert!(is_staged(p, "new.txt"), "untracked file is staged by -A");
+        unstage_all(p).expect("unstage_all");
+        assert!(!is_staged(p, "seed.txt"));
+        assert!(!is_staged(p, "new.txt"));
+    }
+
+    #[test]
+    fn discard_all_tracked_reverts_modifications_but_keeps_untracked() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        init_repo_with_commit(p);
+        std::fs::write(p.join("seed.txt"), "one\ntwo\nDIRTY\n").unwrap();
+        std::fs::write(p.join("scratch.txt"), "keep me").unwrap();
+        discard_all_tracked(p).expect("discard_all_tracked");
+        assert_eq!(
+            std::fs::read_to_string(p.join("seed.txt")).unwrap(),
+            "one\ntwo\n",
+            "tracked modification is reverted to HEAD"
+        );
+        assert!(
+            p.join("scratch.txt").exists(),
+            "untracked files survive a tracked-only discard"
+        );
+    }
+
+    #[test]
+    fn commit_staged_commits_only_the_index() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        init_repo_with_commit(p);
+        std::fs::write(p.join("seed.txt"), "one\ntwo\nstaged\n").unwrap();
+        std::fs::write(p.join("other.txt"), "unstaged").unwrap();
+        stage(p, "seed.txt");
+        commit_staged(p, "only staged").expect("commit_staged");
+        // other.txt is still untracked/uncommitted after the staged commit.
+        assert!(
+            query_changes(p).iter().any(|e| e.path == "other.txt"),
+            "an unstaged file must remain a pending change after commit_staged"
+        );
+    }
+
+    #[test]
+    fn rename_branch_changes_the_current_branch_name() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        init_repo_with_commit(p);
+        rename_branch(p, "renamed").expect("rename_branch");
+        assert_eq!(query(p).branch.as_deref(), Some("renamed"));
+    }
+
+    #[test]
+    fn delete_branch_removes_a_merged_branch() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        init_repo_with_commit(p);
+        create_branch(p, "throwaway").unwrap();
+        checkout_branch(p, "main").unwrap();
+        // throwaway points at the same commit as main, so -d is safe.
+        delete_branch(p, "throwaway").expect("delete_branch");
+        assert!(
+            !list_branches(p)
+                .unwrap()
+                .iter()
+                .any(|b| b.display == "throwaway"),
+            "the deleted branch must be gone"
+        );
+    }
+
+    #[test]
+    fn add_then_list_then_remove_remote_round_trips() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        init_repo_with_commit(p);
+        add_remote(p, "upstream", "https://example.com/x.git").expect("add_remote");
+        let remotes = list_remotes(p).unwrap();
+        assert!(
+            remotes
+                .iter()
+                .any(|r| r.name == "upstream" && r.url == "https://example.com/x.git")
+        );
+        remove_remote(p, "upstream").expect("remove_remote");
+        assert!(
+            !list_remotes(p)
+                .unwrap()
+                .iter()
+                .any(|r| r.name == "upstream")
+        );
+    }
+
+    #[test]
+    fn create_then_list_then_delete_tag_round_trips() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        init_repo_with_commit(p);
+        create_tag(p, "v1.0.0").expect("create_tag");
+        assert!(list_tags(p).unwrap().contains(&"v1.0.0".to_string()));
+        delete_tag(p, "v1.0.0").expect("delete_tag");
+        assert!(!list_tags(p).unwrap().contains(&"v1.0.0".to_string()));
+    }
+
+    #[test]
+    fn stash_list_indexes_newest_first_and_apply_drop_work() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        init_repo_with_commit(p);
+        std::fs::write(p.join("seed.txt"), "one\ntwo\nfirst\n").unwrap();
+        stash_push(p).expect("first stash");
+        std::fs::write(p.join("seed.txt"), "one\ntwo\nsecond\n").unwrap();
+        stash_push(p).expect("second stash");
+        let stashes = list_stashes(p).unwrap();
+        assert_eq!(stashes.len(), 2);
+        assert_eq!(stashes[0].index, 0, "newest stash is stash@{{0}}");
+        // Apply the older stash (index 1) without dropping it.
+        stash_apply(p, 1).expect("stash_apply");
+        assert_eq!(
+            std::fs::read_to_string(p.join("seed.txt")).unwrap(),
+            "one\ntwo\nfirst\n"
+        );
+        // Both stashes still present after apply.
+        assert_eq!(list_stashes(p).unwrap().len(), 2);
+        // Drop the newest; one remains.
+        stash_drop(p, 0).expect("stash_drop");
+        assert_eq!(list_stashes(p).unwrap().len(), 1);
     }
 
     #[test]

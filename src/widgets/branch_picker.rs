@@ -128,6 +128,18 @@ impl BranchPicker {
         }
     }
 
+    /// The currently-highlighted *existing* branch, by the name git
+    /// switch/merge/rebase/delete expects (`checkout_name`). `None` when the
+    /// highlight is on the synthetic "create" row. Used by the merge /
+    /// rebase / delete / create-from purposes, which only ever act on an
+    /// existing branch.
+    pub fn selected_existing_branch(&self) -> Option<String> {
+        match self.rows().get(self.selected)? {
+            Row::Existing(i) => self.branches.get(*i).map(|b| b.checkout_name.clone()),
+            Row::Create(_) => None,
+        }
+    }
+
     // --- query editing (mirrors ZoxideJump) -------------------------------
 
     pub fn push_char(&mut self, c: char) {

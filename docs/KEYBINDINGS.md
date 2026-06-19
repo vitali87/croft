@@ -97,7 +97,9 @@ On macOS, the `Cmd` chords below only reach croft after you run a one-time setup
 | Click `↶` on a selected unstaged row | Discard that file (confirms first; deletes untracked files) |
 | Click `−` on a selected staged row | Unstage that file |
 | Click the branch name | Open the Checkout / Create Branch picker: type to filter branches, `↑`/`↓` to navigate, `Enter` to switch — or type a new name and `Enter` to create and switch to it |
-| Click the `▾` caret next to Commit | Open the actions menu: Commit & Push, Push, Pull, Sync (Pull, Push), Checkout / Create Branch…, Stash, Pop Stash, View Staged Changes, View Changes vs previous, View Changes vs `<default>` |
+| Click the `▾` caret next to Commit | Open the quick actions menu: Commit & Push, Push, Pull, Sync (Pull, Push), Checkout / Create Branch…, Stash, Pop Stash, View Staged Changes, View Changes vs previous, View Changes vs `<default>` |
+| Click the `⋯` icon in the header | Open the full Source Control actions menu (VS Code's title menu) with fly-out submenus: Pull · Push · Clone… · Checkout to… · Fetch · **Commit ›** (Commit, Commit Staged, Commit All, Amend, Commit & Push, Commit & Sync) · **Changes ›** (Stage All, Unstage All, Discard All) · **Pull, Push ›** (Sync, Pull Rebase, Push to…, Push Force, Publish Branch) · **Branch ›** (Create, Create from…, Rename, Delete, Merge, Rebase) · **Remote ›** (Add, Remove) · **Stash ›** (Stash, Include Untracked, Stash Staged, Apply, Pop Latest, Pop…, Drop) · **Tags ›** (Create, Delete) · Show Git Output. Click a submenu row to fly it out; ops needing a value (clone URL, branch name, tag name, remote) open an input modal, ops choosing one of a list (apply/drop a stash, delete a tag, remove a remote) open a picker; `Esc` closes |
+| Discard All Changes | Reverts every tracked file to HEAD after a `Y`/`N` confirm modal (untracked files are kept) |
 | Click the header refresh icon | Force an immediate git re-scan |
 
 ## Editor: text

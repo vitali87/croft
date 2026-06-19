@@ -199,6 +199,10 @@ pub struct SourceControlPanel {
     /// opens the Checkout / Create Branch picker, mirroring VS Code's
     /// clickable status-bar branch indicator. Empty in the no-repo state.
     pub last_branch_area: Rect,
+    /// Hit-test rect for the "⋯" actions pill in the header (left of the
+    /// refresh pill). Opens the full Source Control actions menu. Empty in
+    /// the no-repo state or when the header row is too narrow.
+    pub header_more_btn: Rect,
 }
 
 impl SourceControlPanel {
@@ -232,7 +236,14 @@ impl SourceControlPanel {
             hover_pointer: None,
             header_refresh_btn: Rect::default(),
             last_branch_area: Rect::default(),
+            header_more_btn: Rect::default(),
         }
+    }
+
+    /// True when (x, y) lands on the "⋯" header pill, so the App can open
+    /// the Source Control actions menu.
+    pub fn click_more(&self, x: u16, y: u16) -> bool {
+        rect_hit(self.header_more_btn, x, y)
     }
 
     /// Returns the entry index when (x, y) lands inside the Discard icon
@@ -908,6 +919,7 @@ impl Widget for &mut SourceControlPanel {
         self.last_row_actions = None;
         self.header_refresh_btn = Rect::default();
         self.last_branch_area = Rect::default();
+        self.header_more_btn = Rect::default();
 
         if inner.height == 0 || inner.width == 0 {
             return;
@@ -945,6 +957,28 @@ impl Widget for &mut SourceControlPanel {
                 self.focus_gradient,
                 hovered,
             );
+            // "⋯" actions pill, one pill-plus-gap to the left of refresh,
+            // opening the full Source Control actions menu (VS Code's title
+            // "⋯" menu). cod-ellipsis (U+EA7C).
+            let more_x = refresh_x.saturating_sub(pill_w + 1);
+            if more_x > inner.x + 15 {
+                let more_rect = Rect {
+                    x: more_x,
+                    y: inner.y,
+                    width: pill_w,
+                    height: 1,
+                };
+                self.header_more_btn = more_rect;
+                let more_hovered = crate::widgets::hover::contains(more_rect, self.hover_pointer);
+                crate::widgets::header_pill::render(
+                    buf,
+                    more_x,
+                    inner.y,
+                    crate::widgets::scm_menu::ICON_ELLIPSIS,
+                    self.focus_gradient,
+                    more_hovered,
+                );
+            }
         }
 
         // Non-repo workspace: render the "No repository detected" card -
