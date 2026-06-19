@@ -275,6 +275,51 @@ fn black_theme_status_bar_is_near_black_not_navy() {
     );
 }
 
+#[test]
+fn resting_on_an_activity_icon_arms_its_button_hint() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    // Render once so the activity-bar icon rectangles are populated.
+    let backend = ratatui::backend::TestBackend::new(140, 50);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let icon = app.sidebar_areas.search_icon;
+    let (cx, cy) = (icon.x + icon.width / 2, icon.y);
+    app.on_mouse_moved(cx, cy, false);
+    assert_eq!(
+        app.ui_tooltip_label,
+        Some("Search"),
+        "hovering the Search activity-bar icon arms its hint label"
+    );
+    // Moving onto inert space clears the armed hint.
+    app.on_mouse_moved(cx, icon.y + 200, false);
+    assert_eq!(app.ui_tooltip_label, None);
+}
+
+#[test]
+fn chrome_tooltip_paints_in_the_sidebar_not_clamped_into_the_editor() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    // A compact hint anchored over an activity-bar cell (far-left column).
+    app.ui_tooltip = Some(crate::widgets::hover_popup::HoverPopup::new_compact(
+        "Search".into(),
+        (2, 6),
+    ));
+    let backend = ratatui::backend::TestBackend::new(140, 50);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let buf = term.backend().buffer();
+    // The popup's own background must appear in the far-left region near the
+    // anchor. The regression: it rendered against the editor's focused_area,
+    // which starts well to the right, so nothing painted over the sidebar.
+    let popup_bg = Color::Rgb(0x1e, 0x21, 0x2a);
+    let painted = (0..20).any(|x| (0..12).any(|y| buf[(x, y)].bg == popup_bg));
+    assert!(
+        painted,
+        "the chrome tooltip must paint near its sidebar anchor, not be clamped into the editor"
+    );
+}
+
 fn dummy_activity_images() -> ActivityBarImages {
     let s = || String::from("\x1b]1337;File=inline=1:Zm9v\x07");
     ActivityBarImages {

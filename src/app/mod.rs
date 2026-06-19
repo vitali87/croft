@@ -5947,13 +5947,6 @@ impl App {
                     frame.render_widget(&*popup, area);
                 }
             }
-            if let Some(popup) = self.ui_tooltip.as_mut() {
-                popup.gradient = grad;
-                let area = popup.area_for(focused_area);
-                if area.width > 0 && area.height > 0 {
-                    frame.render_widget(&*popup, area);
-                }
-            }
         }
         if let Some(area) = terminal_area {
             let n = self.terminals.len().max(1);
@@ -6135,6 +6128,20 @@ impl App {
         // The startup unsupported-terminal nudge renders last so it sits above
         // every other overlay until the user dismisses it.
         self.render_terminal_warning(frame);
+
+        // Chrome button-hint tooltip. Rendered at the top level against the
+        // whole frame (not the editor's `focused_area`) because the controls it
+        // labels live in the activity bar and sidebar, outside the editor pane;
+        // clamping it to the editor area would yank it away from the control or,
+        // on the welcome screen, drop it entirely.
+        let tooltip_grad = self.popup_gradient();
+        if let Some(popup) = self.ui_tooltip.as_mut() {
+            popup.gradient = tooltip_grad;
+            let area = popup.area_for(frame.area());
+            if area.width > 0 && area.height > 0 {
+                frame.render_widget(&*popup, area);
+            }
+        }
 
         // Show the host terminal's hardware caret only when the editor is
         // focused and has no modal overlay. The DECSCUSR style is set to
