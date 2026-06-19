@@ -20,7 +20,6 @@ mod remote_bulk;
 mod remote_connect;
 mod session_state;
 mod sheet;
-mod sysmon;
 mod termux;
 mod theme;
 mod update_watch;

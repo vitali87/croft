@@ -32,7 +32,6 @@ It is tempting to read "Windows is not supported" as "nobody ported the PTY yet,
 - `src/iterm2_inline.rs` — `libc::poll` / `pollfd` / `POLLIN` for the sixel DA1 capability probe (a timed raw read of stdin).
 - `src/remote.rs` — `getrlimit` / `setrlimit` on `RLIMIT_NOFILE` to raise the open-file limit before spawning PTYs, watchers, LSPs, and the cross-link.
 - `src/dap/transport.rs`, `src/lsp/install.rs` — `setsid` / `getsid` to detach spawned adapters and servers into their own process group.
-- `src/sysmon.rs` — `statvfs` for the disk-usage readout.
 - `src/widgets/file_tree.rs` — `localtime_r` for mtime formatting and the `EXDEV` cross-device-rename fallback.
 
 Porting these is busywork rather than research: each needs a Win32 equivalent (`WaitForMultipleObjects` / overlapped I/O, `SetHandleInformation` or job objects, `CreateProcess` flags, `GetDiskFreeSpaceEx`, `localtime_s`) behind a `cfg(windows)` arm. Doable, but it touches many modules.

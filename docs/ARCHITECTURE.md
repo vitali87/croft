@@ -33,7 +33,6 @@ src/
 ├── remote_connect.rs    interactive SSH connect flow (host + password prompt phases) behind the connect dialog
 ├── session_state.rs     captures open tabs / layout so a self-update re-exec can restore them
 ├── sheet.rs             CSV / TSV / XLSX / XLS / XLSB / ODS parsing via the csv and calamine crates
-├── sysmon.rs            system-metrics sampler loop (CPU / memory / network / disk / temp); disk gauge statvfs's $HOME's filesystem with df's formula (the `/` mount is Android's sealed read-only system partition, permanently ~100%)
 ├── termux.rs            Termux font auto-install: downloads Meslo Nerd Font Mono into ~/.termux/font.ttf (background, no-clobber) so the activity-bar codicon glyphs render
 ├── theme.rs             IDE color theme (Croft Dark / Croft Black): the background palette driving SetColors + baked-image fills
 ├── update_watch.rs      remote self-update: watch for a newer binary installed under a running remote croft
@@ -49,7 +48,6 @@ src/
 │   ├── nav.rs           editor back / forward navigation history
 │   ├── overlay.rs       inline-image overlay state + clear-on-hide latches (iTerm2 cell eviction; the Kitty path adds a delete-all on the same clear frames)
 │   ├── perf_hud.rs      F8 performance HUD
-│   ├── sys_monitor.rs   background system-metrics poller driving the SYSTEM panel
 │   ├── welcome.rs       welcome-screen state + async recent-repos drain
 │   └── tests.rs         unit / integration tests
 ├── dap/                 debugger stack: Debug Adapter Protocol client. Python (debugpy, 3.14+, no fallback) is the verified adapter; Rust/C/C++ route to lldb-dap
@@ -94,7 +92,6 @@ src/
     ├── search.rs        sidebar search panel (query/replace/include/exclude inputs) + .gitignore-aware walker, glob filtering, and replace
     ├── shortcuts.rs     F1 shortcuts modal: every binding grouped by pane, scrollable
     ├── source_control.rs Source Control sidebar widget: branch summary, commit input, change list, commit button, header refresh pill, no-repo hero
-    ├── system_panel.rs  collapsible SYSTEM metrics panel pinned to the sidebar bottom
     ├── terminal.rs      portable-pty + alacritty_terminal + ratatui integration with selection + scrollback
     ├── timeline.rs      collapsible TIMELINE section: the active file's git history (`git log --follow`) fetched off-thread, two rows per commit (summary + author/age), click-to-open the commit's diff; a ⋯-menu Explorer sub-view
     └── zoxide_jump.rs   Cmd+Z zoxide jump popup: fuzzy directory jumper that re-roots + cd's the terminal

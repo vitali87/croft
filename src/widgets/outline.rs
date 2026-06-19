@@ -235,7 +235,7 @@ impl OutlinePanel {
 
     /// Height the section wants given the rows available to it. The widget
     /// draws a `Borders::BOTTOM` separator, so every layout reserves one row
-    /// beyond the visible content for it (mirroring `SystemPanel`). Collapsed
+    /// beyond the visible content for it. Collapsed
     /// is the header plus that separator; expanded adds one row per symbol (or a
     /// single "no symbols" row), capped at **half** the shared region so a long
     /// outline can squeeze the file tree to a 50/50 split but never past it.

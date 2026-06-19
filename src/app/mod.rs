@@ -30,7 +30,6 @@ mod hover;
 mod nav;
 mod overlay;
 mod perf_hud;
-mod sys_monitor;
 mod welcome;
 use click::ClickTracker;
 use cursor_blink::CursorBlink;
@@ -40,7 +39,6 @@ use hover::{HOVER_DELAY, HoverDwell};
 use nav::{NavHistory, NavLoc};
 use overlay::OverlayManager;
 use perf_hud::PerfHud;
-use sys_monitor::SysMonitor;
 use welcome::WelcomeState;
 
 use crate::widgets::{
@@ -53,7 +51,6 @@ use crate::widgets::{
     run_debug::RunDebugPanel,
     search::{SearchPanel, SearchRequest},
     source_control::SourceControlPanel,
-    system_panel::SystemPanel,
     terminal::PtyTerminal,
     timeline::TimelinePanel,
 };
@@ -1075,7 +1072,6 @@ pub struct App {
     /// The workspace root DEPENDENCIES was detected/fetched for, so detection
     /// and the fetch fire once per root (re-fired by Make Root / re-root).
     deps_fetched: Option<PathBuf>,
-    pub system_panel: SystemPanel,
     pub editor: EditorTabs,
     /// The secondary editor group, shown side by side with `editor` when
     /// the user splits the pane (`Cmd+\`). `None` = not split. Invariant:
@@ -1127,7 +1123,6 @@ pub struct App {
     prompt: Option<Prompt>,
     fs_watch: FsWatch,
     git: GitWorker,
-    sysmon: SysMonitor,
     cursor_blink: CursorBlink,
     editor_click: ClickTracker,
     tree_click: ClickTracker,
@@ -1738,8 +1733,6 @@ impl App {
         // Control click.
         let git = GitWorker::spawn(root.clone());
 
-        let sysmon = SysMonitor::spawn();
-
         let welcome = WelcomeState::spawn();
 
         let (search_query_tx, search_query_rx) = std::sync::mpsc::channel();
@@ -1782,20 +1775,6 @@ impl App {
             deps_rx,
             deps_tx,
             deps_fetched: None,
-            system_panel: {
-                let mut p = SystemPanel::new();
-                // Pre-existing app/SC tests assume the sidebar column
-                // has the full main-pane height. The SYSTEM panel
-                // would otherwise eat ~3 rows from the activity
-                // widget and shrink the SCM list under its
-                // entry-rendering threshold. Hide it by default in
-                // test builds; tests that exercise the panel itself
-                // call `set_hidden(false)`.
-                if cfg!(test) {
-                    p.set_hidden(true);
-                }
-                p
-            },
             editor,
             editor_split: None,
             split_focus_left: true,
@@ -1832,7 +1811,6 @@ impl App {
             prompt: None,
             fs_watch,
             git,
-            sysmon,
             cursor_blink: CursorBlink::new(),
             editor_click: ClickTracker::default(),
             tree_click: ClickTracker::default(),
@@ -2921,19 +2899,6 @@ impl App {
             self.default_branch_label = crate::git::default_branch(&self.tree.root).ok();
         }
         changed
-    }
-
-    /// Drain every SystemSample the background sampler has produced
-    /// since the last tick and feed the freshest one into the SYSTEM
-    /// panel's history. Returns true iff at least one sample was
-    /// applied so the main loop knows to redraw. Cheap when the rx is
-    /// empty: a single non-blocking try_recv.
-    pub fn drain_sysmon(&mut self) -> bool {
-        // Only collect system metrics while the SYSTEM panel is actually showing
-        // them: collapsed (the default) or hidden means the sampler thread idles.
-        let collecting = !self.system_panel.hidden && !self.system_panel.last_effective_collapsed;
-        self.sysmon.set_active(collecting);
-        self.sysmon.drain(&mut self.system_panel)
     }
 
     /// Push the current search query string and toggle state onto the
@@ -5905,22 +5870,6 @@ impl App {
 
         if let Some(area) = side_area {
             let usable_area = area;
-            // Pin the SYSTEM panel to the bottom of the usable strip,
-            // beneath whichever activity is showing. The active widget
-            // gets the remaining space and scrolls within it; the panel
-            // shrinks to a 1-row chevron strip when collapsed, and
-            // hides entirely when the column is too short to leave the
-            // activity widget enough room to be usable.
-            let panel_h = self.system_panel.desired_height(usable_area.height);
-            let (after_system, panel_area) = if panel_h > 0 {
-                let split = Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([Constraint::Min(1), Constraint::Length(panel_h)])
-                    .split(usable_area);
-                (split[0], Some(split[1]))
-            } else {
-                (usable_area, None)
-            };
             // Feed the render-time pointer cell to every side panel so the row
             // under the cursor (and the remote header pills) can light up,
             // mirroring the editor tab strip and terminal pane buttons.
@@ -5934,21 +5883,16 @@ impl App {
             self.timeline.hover_pointer = panel_pointer;
             self.dependencies.hover_pointer = panel_pointer;
             // Explorer stacks its toggled sub-views (Open Editors / Folders /
-            // Outline / Timeline / Dependencies) inside `after_system`.
+            // Outline / Timeline / Dependencies) inside the usable strip.
             // Every other sidebar view fills it with its single activity widget.
             match self.sidebar_view {
-                SidebarView::Explorer => self.render_explorer_sections(frame, after_system),
-                SidebarView::Search => frame.render_widget(&mut self.search, after_system),
+                SidebarView::Explorer => self.render_explorer_sections(frame, usable_area),
+                SidebarView::Search => frame.render_widget(&mut self.search, usable_area),
                 SidebarView::SourceControl => {
-                    frame.render_widget(&mut self.source_control, after_system)
+                    frame.render_widget(&mut self.source_control, usable_area)
                 }
-                SidebarView::Remote => frame.render_widget(&mut self.remote, after_system),
-                SidebarView::RunDebug => frame.render_widget(&mut self.run_debug, after_system),
-            }
-            if let Some(pa) = panel_area {
-                frame.render_widget(&mut self.system_panel, pa);
-            } else {
-                self.system_panel.last_area = Rect::default();
+                SidebarView::Remote => frame.render_widget(&mut self.remote, usable_area),
+                SidebarView::RunDebug => frame.render_widget(&mut self.run_debug, usable_area),
             }
         }
         if self.editor_split.is_none() && self.editor.is_blank_initial() {
@@ -12817,12 +12761,6 @@ impl App {
                     self.splitter_drag = Some(SplitterDrag::EditorSplit);
                     return;
                 }
-                // SYSTEM panel sits at the bottom of the sidebar column.
-                // A click on its header row toggles collapse; any other
-                // click inside its rect is swallowed so it doesn't fall
-                // through to the activity widget above (which would
-                // otherwise see the click as occurring on a row that's
-                // visually covered by the panel).
                 // OPEN EDITORS: header toggles collapse; a row activates that
                 // editor's tab; the scrollbar lane starts a thumb drag. Any
                 // other click is swallowed so it can't fall through to a panel
@@ -12881,12 +12819,6 @@ impl App {
                         && let Some((path, line, col)) = self.outline.jump_target(idx)
                     {
                         self.go_to_definition(path, line, col);
-                    }
-                    return;
-                }
-                if rect_contains(self.system_panel.last_area, m.column, m.row) {
-                    if self.system_panel.hit_header(m.column, m.row) {
-                        self.system_panel.toggle_collapse();
                     }
                     return;
                 }
@@ -17327,7 +17259,6 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let semantic_changed = app.drain_lsp_semantic_tokens();
         let diagnostics_changed = app.drain_lsp_diagnostics();
         let progress_changed = app.drain_lsp_progress();
-        let sysmon_changed = app.drain_sysmon();
         let dap_changed = app.poll_dap();
         // Surface managed language-server install progress in the status bar so
         // the background work (which can take a few seconds) is visible.
@@ -17376,7 +17307,6 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             || outline_changed
             || explorer_panels_changed
             || install_status_changed
-            || sysmon_changed
             || dap_changed;
         let pty_eligible = pty_pending
             && (app.peek_terminals_pending_bytes() <= PTY_SMALL_UPDATE_BYTES
