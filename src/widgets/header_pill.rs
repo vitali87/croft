@@ -36,10 +36,13 @@ pub const COLLAPSE_ALL_GLYPH: char = '\u{eac5}';
 /// The "Views and More Actions" (⋯) affordance VS Code paints at the right of a
 /// view-container header, as a space-padded action label so it reads as a real
 /// pill inset from the rounded corner — the same `" + "` treatment the terminal
-/// pane buttons wear. A plain horizontal ellipsis (U+2026) rather than a codicon
-/// PUA glyph, so it renders on every terminal/font — the same
+/// pane buttons wear. The glyph is the *midline* horizontal ellipsis (U+22EF
+/// `⋯`), NOT the baseline U+2026 `…`: the midline variant centres its dots on
+/// the line so they sit level with the EXPLORER caps and the `+`, instead of
+/// dropping to the baseline. It is a standard Misc-Math-Symbols codepoint, not a
+/// codicon PUA glyph, so it still renders on every terminal/font — the same
 /// no-codicon-dependency reasoning behind the U+2715 close glyph.
-pub const MORE_LABEL: &str = " \u{2026} ";
+pub const MORE_LABEL: &str = " \u{22ef} ";
 
 /// Paint a header pill button at cell `(x, y)`. `brand` is true under the
 /// Black theme: a chipless teal icon in the VS Code toolbar spirit that grows
