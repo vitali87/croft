@@ -1345,6 +1345,14 @@ pub struct App {
     tab_hover: HoverDwell,
     tab_tooltip: Option<crate::widgets::hover_popup::HoverPopup>,
     tab_hover_idx: Option<usize>,
+    /// Shared dwell + popup for chrome button hints (search-panel actions and
+    /// toggles, activity-bar icons, …). One timer for all chrome controls,
+    /// keyed on the label so the dwell only restarts when the pointer crosses
+    /// to a different control; extending coverage to a new surface is one arm
+    /// in `ui_tooltip_at`.
+    ui_hover: HoverDwell,
+    ui_tooltip: Option<crate::widgets::hover_popup::HoverPopup>,
+    ui_tooltip_label: Option<&'static str>,
     definition_request_id: Option<u64>,
     declaration_request_id: Option<u64>,
     type_definition_request_id: Option<u64>,
@@ -1922,6 +1930,9 @@ impl App {
             tab_hover: HoverDwell::default(),
             tab_tooltip: None,
             tab_hover_idx: None,
+            ui_hover: HoverDwell::default(),
+            ui_tooltip: None,
+            ui_tooltip_label: None,
             definition_request_id: None,
             outline_synced: None,
             declaration_request_id: None,
@@ -3125,6 +3136,59 @@ impl App {
         }
     }
 
+    /// The hover-tooltip label for whatever chrome control sits under the
+    /// pointer, or `None` over inert space. The single dispatch point for
+    /// button hints: each surface contributes one branch that reuses that
+    /// surface's own hit-test, so adding a new tooltipped control is a
+    /// one-line change here plus a label in the widget.
+    fn ui_tooltip_at(&self, col: u16, row: u16) -> Option<&'static str> {
+        // Activity bar: always visible, so it is checked regardless of which
+        // sidebar view is open.
+        if let Some(icon) = self.activity_icon_at(col, row) {
+            return Some(match icon {
+                ActivityIcon::Explorer => "Explorer",
+                ActivityIcon::Search => "Search",
+                ActivityIcon::SourceControl => "Source Control",
+                ActivityIcon::Remote => "Remote",
+                ActivityIcon::RunDebug => "Run and Debug",
+                ActivityIcon::Settings => "Manage",
+            });
+        }
+        // Search panel actions/toggles, only while the SEARCH view is showing
+        // (its stored geometry is stale once another view replaces it).
+        if self.sidebar_view == SidebarView::Search
+            && let Some(label) = self.search.tooltip_at(col, row)
+        {
+            return Some(label);
+        }
+        None
+    }
+
+    /// Fire the chrome button-hint tooltip once its dwell crosses
+    /// `HOVER_DELAY`. Returns `true` when a tooltip was created so the frame
+    /// loop redraws. Suppressed while a context menu is open so the two never
+    /// overlap.
+    fn poll_ui_tooltip(&mut self) -> bool {
+        if !self.ui_hover.due(std::time::Instant::now(), HOVER_DELAY) {
+            return false;
+        }
+        self.ui_hover.mark_fired();
+        if self.context_menu.is_some() {
+            return false;
+        }
+        let Some(label) = self.ui_tooltip_label else {
+            return false;
+        };
+        let Some((col, row)) = self.ui_hover.cell() else {
+            return false;
+        };
+        self.ui_tooltip = Some(crate::widgets::hover_popup::HoverPopup::new_compact(
+            label.to_string(),
+            (col, row),
+        ));
+        true
+    }
+
     fn on_mouse_moved(&mut self, col: u16, row: u16, in_editor: bool) {
         // Activity-bar hover: brighten the icon under the pointer. Re-emit the
         // swapped pre-baked image only when the hovered icon actually changes,
@@ -3135,6 +3199,25 @@ impl App {
         if self.hovered_activity_icon != new_hover {
             self.hovered_activity_icon = new_hover;
             self.overlays.activity.mark_dirty();
+        }
+        // Chrome button hints: dwell over a labelled control (activity-bar
+        // icons, search-panel actions/toggles) to surface its name. Keyed on
+        // the label so the dwell only restarts when the pointer crosses to a
+        // different control, and is left running while it drifts within one.
+        // Computed before the tab/editor early-returns so it tracks the
+        // pointer everywhere, including over the sidebar.
+        match self.ui_tooltip_at(col, row) {
+            Some(label) if self.ui_tooltip_label == Some(label) => {}
+            Some(label) => {
+                self.ui_hover.on_move(std::time::Instant::now(), col, row);
+                self.ui_tooltip_label = Some(label);
+                self.ui_tooltip = None;
+            }
+            None => {
+                self.ui_hover.clear();
+                self.ui_tooltip = None;
+                self.ui_tooltip_label = None;
+            }
         }
         // Editor tab strip: dwell over a tab to surface its full path. The
         // dwell only restarts when the pointer crosses into a *different*
@@ -5858,6 +5941,13 @@ impl App {
                 }
             }
             if let Some(popup) = self.tab_tooltip.as_mut() {
+                popup.gradient = grad;
+                let area = popup.area_for(focused_area);
+                if area.width > 0 && area.height > 0 {
+                    frame.render_widget(&*popup, area);
+                }
+            }
+            if let Some(popup) = self.ui_tooltip.as_mut() {
                 popup.gradient = grad;
                 let area = popup.area_for(focused_area);
                 if area.width > 0 && area.height > 0 {
@@ -12304,6 +12394,11 @@ impl App {
         self.tab_tooltip = None;
         self.tab_hover.clear();
         self.tab_hover_idx = None;
+        // Same for the chrome button hint: a click acts on the control, so the
+        // hint has served its purpose and must not survive the state change.
+        self.ui_tooltip = None;
+        self.ui_hover.clear();
+        self.ui_tooltip_label = None;
 
         // A left press in the editor body arms the same dwell a resting
         // pointer does: a touchscreen emits no Moved events (a finger cannot
@@ -17050,6 +17145,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         app.poll_hover();
         let hover_changed = app.drain_lsp_hover();
         let tab_hover_changed = app.poll_tab_hover();
+        let ui_tooltip_changed = app.poll_ui_tooltip();
         let definition_changed = app.drain_lsp_definition();
         let declaration_changed = app.drain_lsp_declaration();
         let type_definition_changed = app.drain_lsp_type_definition();
@@ -17094,6 +17190,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             || lsp_changed
             || hover_changed
             || tab_hover_changed
+            || ui_tooltip_changed
             || definition_changed
             || declaration_changed
             || type_definition_changed

@@ -7,6 +7,10 @@ use ratatui::{
 };
 
 const MIN_WIDTH: u16 = 20;
+/// Compact tooltips (single-label button hints) shrink to fit their text
+/// instead of reserving the 20-cell minimum an LSP type signature wants, so a
+/// one-word hint like "Refresh" reads as a snug chip rather than a wide box.
+const COMPACT_MIN_WIDTH: u16 = 3;
 const MAX_WIDTH: u16 = 80;
 const MAX_HEIGHT: u16 = 16;
 
@@ -16,6 +20,9 @@ pub struct HoverPopup {
     /// Black theme: wear the orange→green gradient border instead of the
     /// legacy bright-blue. Set by the app before render from `popup_gradient`.
     pub gradient: bool,
+    /// Shrink-to-fit width for short button hints. Cleared (false) for the
+    /// LSP/diagnostic hover, which wants the wider minimum for readability.
+    pub compact: bool,
 }
 
 impl HoverPopup {
@@ -24,6 +31,15 @@ impl HoverPopup {
             lines: text.lines().map(|s| s.to_string()).collect(),
             anchor,
             gradient: false,
+            compact: false,
+        }
+    }
+
+    /// A button-hint tooltip: same bordered box, but width hugs the label.
+    pub fn new_compact(text: String, anchor: (u16, u16)) -> Self {
+        Self {
+            compact: true,
+            ..Self::new(text, anchor)
         }
     }
 
@@ -36,10 +52,15 @@ impl HoverPopup {
     }
 
     pub fn area_for(&self, viewport: Rect) -> Rect {
+        let min_width = if self.compact {
+            COMPACT_MIN_WIDTH
+        } else {
+            MIN_WIDTH
+        };
         let width = self
             .content_width()
             .saturating_add(2)
-            .clamp(MIN_WIDTH, MAX_WIDTH);
+            .clamp(min_width, MAX_WIDTH);
         let inner_w = width.saturating_sub(2).max(1);
         let body = self
             .lines
@@ -110,6 +131,31 @@ mod tests {
         assert_eq!(
             p.lines,
             vec!["line one".to_string(), "line two".to_string()]
+        );
+    }
+
+    #[test]
+    fn compact_popup_hugs_a_short_label_instead_of_the_wide_minimum() {
+        let vp = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 24,
+        };
+        let wide = HoverPopup::new("Refresh".into(), (10, 12)).area_for(vp);
+        let compact = HoverPopup::new_compact("Refresh".into(), (10, 12)).area_for(vp);
+        assert_eq!(
+            wide.width, MIN_WIDTH,
+            "default hover keeps the 20-cell floor"
+        );
+        assert_eq!(
+            compact.width,
+            "Refresh".len() as u16 + 2,
+            "compact hint hugs the label plus its two border cells"
+        );
+        assert!(
+            compact.width < wide.width,
+            "compact must be narrower than the LSP-sized minimum"
         );
     }
 

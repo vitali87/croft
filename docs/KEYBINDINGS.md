@@ -126,6 +126,7 @@ On macOS, the `Cmd` chords below only reach croft after you run a one-time setup
 | `Cmd`+`F12` | Go to Implementations (concrete implementors of a trait / interface) |
 | Hover or click/tap (300 ms rest) | Hover popup: any diagnostic over the point first, then type / signature info. A click or tap arms the same dwell, so touch screens (Termux) get the popup by tapping an identifier and resting; releasing the press keeps it open |
 | Hover a tab (300 ms dwell) | Tooltip with the tab's full path (tells two same-named files apart) |
+| Hover a chrome control (300 ms dwell) | Button hint naming the control under the pointer: activity-bar icons (Explorer, Search, …) and the SEARCH panel's actions and toggles (Refresh, Clear Search Results, Match Case, Use Regular Expression, …) |
 | Right-click | Editor symbol menu: the Go to / Rename / Change All actions above |
 | `Cmd`+`E` | Toggle native modal (vim) editing (see below) |
 | `Ctrl`+`W` / `Cmd`+`W` | Close the active editor tab (no-op on the last tab) |

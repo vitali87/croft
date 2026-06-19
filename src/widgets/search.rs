@@ -1111,6 +1111,41 @@ impl SearchPanel {
         self.clear_x != 0 && row == self.clear_y && col == self.clear_x
     }
 
+    /// The hover-tooltip label for whatever actionable control sits under
+    /// `(col, row)`, or `None` over plain text/fields/empty space. Reuses the
+    /// same hit-tests the click handler uses, so a hint targets exactly the
+    /// cells that act. Text inputs deliberately return `None`: their purpose is
+    /// shown by the inline placeholder, not a tooltip.
+    pub fn tooltip_at(&self, col: u16, row: u16) -> Option<&'static str> {
+        if self.refresh_at(col, row) {
+            return Some("Refresh");
+        }
+        if self.clear_at(col, row) {
+            return Some("Clear Search Results");
+        }
+        if self.chevron_at(col, row) {
+            return Some(if self.replace_open {
+                "Collapse Replace"
+            } else {
+                "Toggle Replace"
+            });
+        }
+        if self.ellipsis_at(col, row) {
+            return Some("Toggle Search Details");
+        }
+        if self.replace_all_at(col, row) {
+            return Some("Replace All");
+        }
+        if let Some(toggle) = self.toggle_at(col, row) {
+            return Some(match toggle {
+                SearchToggle::CaseSensitive => "Match Case",
+                SearchToggle::WholeWord => "Match Whole Word",
+                SearchToggle::UseRegex => "Use Regular Expression",
+            });
+        }
+        None
+    }
+
     /// Clear the search like VS Code's "Clear Search Results": empty the query
     /// (and the replace text typed against it) and drop every hit, resetting
     /// selection and scroll. The include/exclude glob filters are intentionally
@@ -2809,6 +2844,47 @@ mod tests {
         assert_eq!(panel.toggle_at(panel.toggle_case_x, y + 1), None);
         // Outside the toggle columns → None.
         assert_eq!(panel.toggle_at(0, y), None);
+    }
+
+    #[test]
+    fn tooltip_at_labels_each_actionable_control_and_skips_inert_cells() {
+        use ratatui::buffer::Buffer;
+        let tmp = TempDir::new().unwrap();
+        let mut panel = SearchPanel::new(tmp.path().to_path_buf());
+        panel.focused = true;
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 12,
+        };
+        let mut buf = Buffer::empty(area);
+        ratatui::widgets::Widget::render(&mut panel, area, &mut buf);
+        let y = panel.toggle_y;
+        assert_eq!(panel.tooltip_at(panel.toggle_case_x, y), Some("Match Case"));
+        assert_eq!(
+            panel.tooltip_at(panel.toggle_word_x, y),
+            Some("Match Whole Word")
+        );
+        assert_eq!(
+            panel.tooltip_at(panel.toggle_regex_x, y),
+            Some("Use Regular Expression")
+        );
+        assert_eq!(
+            panel.tooltip_at(panel.refresh_x, panel.refresh_y),
+            Some("Refresh")
+        );
+        assert_eq!(
+            panel.tooltip_at(panel.clear_x, panel.clear_y),
+            Some("Clear Search Results")
+        );
+        assert_eq!(
+            panel.tooltip_at(panel.chevron_x, panel.chevron_y),
+            Some("Toggle Replace"),
+            "the chevron reads as expand while the Replace row is collapsed"
+        );
+        // A plain text cell on the query row carries no tooltip.
+        assert_eq!(panel.tooltip_at(panel.toggle_case_x, y + 5), None);
     }
 
     #[test]
