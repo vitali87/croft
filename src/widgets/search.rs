@@ -39,6 +39,19 @@ fn lift_bg((r, g, b): (u8, u8, u8), d: u8) -> Color {
     )
 }
 
+/// Draw a faint hairline rule from column `x0` to `x1` (inclusive) on row `y`,
+/// used to separate the stacked Search inputs into distinct groups. A terminal
+/// cannot gap by less than one whole cell, so the divider turns the separator
+/// row into a deliberate rule instead of dead space. It is dimmer than, and
+/// spans less width than, the full results separator so the two never read as
+/// the same element.
+fn draw_field_divider(buf: &mut Buffer, x0: u16, x1: u16, y: u16) {
+    let style = Style::default().fg(FIELD_BAR_IDLE);
+    for x in x0..=x1 {
+        buf.set_string(x, y, "─", style);
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SearchHit {
     pub path: PathBuf,
@@ -1619,7 +1632,11 @@ impl Widget for &mut SearchPanel {
         self.replace_input_rect = Rect::default();
         self.replace_all_x = 0;
         self.replace_all_y = 0;
-        if self.replace_open && next_y < inner.y + inner.height {
+        if self.replace_open && next_y + 1 < inner.y + inner.height {
+            // A faint hairline between the query and replace fields so they read
+            // as two separate inputs instead of one continuous filled container.
+            draw_field_divider(buf, bar_x, query_fill_right, next_y);
+            next_y += 1;
             // The replace-all action icon sits at the far right (under the ...),
             // and the replace fill ends two cells short of it.
             let replace_all_x = inner_right;
@@ -1670,7 +1687,11 @@ impl Widget for &mut SearchPanel {
             let detail_fill_right = inner_right.saturating_sub(1).max(bar_x + 1);
             let caption_style = Style::default().fg(Color::Rgb(0x9d, 0xa5, 0xb4));
 
-            if next_y + 1 < inner.y + inner.height {
+            if next_y + 2 < inner.y + inner.height {
+                // Hairline before the include group, matching the query/replace
+                // separation so every input reads as its own row.
+                draw_field_divider(buf, bar_x, detail_fill_right, next_y);
+                next_y += 1;
                 buf.set_string(bar_x, next_y, "files to include", caption_style);
                 next_y += 1;
                 let inc_focused = self.focused && self.field == SearchField::Include;
@@ -1696,7 +1717,10 @@ impl Widget for &mut SearchPanel {
                 );
                 next_y += 1;
             }
-            if next_y + 1 < inner.y + inner.height {
+            if next_y + 2 < inner.y + inner.height {
+                // Hairline before the exclude group, same as above.
+                draw_field_divider(buf, bar_x, detail_fill_right, next_y);
+                next_y += 1;
                 buf.set_string(bar_x, next_y, "files to exclude", caption_style);
                 next_y += 1;
                 let exc_focused = self.focused && self.field == SearchField::Exclude;
@@ -3306,9 +3330,10 @@ mod tests {
             "expanding replace + include/exclude must push results down (was {collapsed_offset}, now {})",
             panel.results_start_offset
         );
-        // Single-row fields: 1 extra row for replace, plus a caption+field (2)
-        // each for include and exclude = 5 rows.
-        assert_eq!(panel.results_start_offset, collapsed_offset + 5);
+        // Single-row fields, each group separated by a hairline row: a divider
+        // + replace field (2 rows), plus a divider + caption + field (3) each
+        // for include and exclude = 8 rows.
+        assert_eq!(panel.results_start_offset, collapsed_offset + 8);
     }
 
     #[test]
