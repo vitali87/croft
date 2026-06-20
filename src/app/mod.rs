@@ -13629,7 +13629,7 @@ impl App {
     /// `termux-api` package kicks off a background install and asks the user to
     /// retry, and a non-Termux host just explains it is Termux-only.
     /// Tap the mic: cancel a live session, or start a new one. The success path
-    /// is not this tap but going quiet - Android finalizes recognition on
+    /// is not this tap but going quiet - the system speech dialog finalizes on
     /// silence and the transcript is injected then. A second tap is the escape
     /// hatch (cancel) because killing the recognizer preempts its result, so it
     /// can never be the way to "finish".
@@ -13649,7 +13649,7 @@ impl App {
             crate::voice::Availability::Ready => {
                 self.voice_handle = Some(crate::voice::start(self.voice_tx.clone()));
                 self.voice_canceling = false;
-                self.status = String::from("Listening… pause speaking to insert (tap to cancel)");
+                self.status = String::from("Listening… speak, then pause to insert");
             }
             crate::voice::Availability::NeedsApi => {
                 crate::voice::ensure_api_installed_in_background();

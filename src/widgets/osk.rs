@@ -119,8 +119,8 @@ pub enum OskKey {
     Symbols,
     /// Toggle the split (two thumb clusters) layout; persisted by the app.
     SplitToggle,
-    /// Microphone (Termux only, via `termux-speech-to-text`): a tap starts
-    /// speech recognition; the transcript is injected when you pause (Android
+    /// Microphone (Termux only, via `termux-dialog speech`): a tap opens the
+    /// system speech dialog; the transcript is injected when you pause (Android
     /// finalizes on silence), and a second tap cancels. A tap rather than
     /// push-to-talk because Termux turns any finger hold into its own text
     /// selection. Handled entirely by the app, never synthesized into a

@@ -1,24 +1,31 @@
-//! Push-to-talk voice input for the Termux on-screen keyboard.
+//! Voice input for the Termux on-screen keyboard.
 //!
 //! croft's OSK replaces Android's native soft keyboard (Termux mouse tracking
 //! suppresses it), which also removes the keyboard's mic button. This module
-//! restores voice dictation by delegating to `termux-speech-to-text` from the
-//! `termux-api` package, which drives Android's system `SpeechRecognizer` (the
-//! same engine Gboard's mic uses). croft never captures audio or ships a model
-//! itself, mirroring how it delegates directory ranking to the host `zoxide`.
+//! restores voice dictation by delegating to the `termux-api` package, which
+//! drives Android's system `SpeechRecognizer` (the same engine Gboard's mic
+//! uses). croft never captures audio or ships a model itself, mirroring how it
+//! delegates directory ranking to the host `zoxide`.
+//!
+//! It calls `termux-dialog speech`, NOT `termux-speech-to-text`, and the
+//! difference is the entire fix. Both wrap the same recognizer, but their
+//! `RecognitionListener`s diverge on one line: the `termux-speech-to-text`
+//! service closes its output stream on `onEndOfSpeech` (which fires the instant
+//! you pause), and that races *ahead* of `onResults` - so the final, best
+//! transcript is discarded and the caller sees at most buffered partials, or
+//! nothing when the recognizer emits no partials (the "No speech detected" /
+//! hang we hit). `termux-dialog speech`'s `onEndOfSpeech` is a no-op; it returns
+//! `onResults` - the final transcript - as JSON `{"code":..,"text":".."}` (with
+//! an `"error"` field on failure) and exits. It also requests `RECORD_AUDIO`
+//! itself, so a denied mic surfaces as a real error rather than silence.
 //!
 //! The mic is a tap, not push-to-talk: Termux turns any finger hold into its
 //! own text-selection gesture (hardcoded in TerminalView, unsuppressible from a
-//! TUI), so a sustained press can never reach croft. A tap starts a session;
-//! the transcript only exists once Android finalizes recognition at
-//! end-of-speech (silence, fired by `onResults` in its `SpeechRecognizer`), so
-//! croft must let the user pause rather than kill to "finish" - killing
-//! preempts the result. A second tap therefore cancels (kills the process
-//! group), it is never the path to the transcript. Final-only mode is used (no
-//! `-p`): the wrapper's `tail -1` yields exactly the final line at EOF, sparing
-//! croft the upstream progressive-output buffering bug (termux-api-package#137).
+//! TUI), so a sustained press can never reach croft. A tap opens the system
+//! speech dialog; speaking and then pausing commits the transcript, and the
+//! dialog owns cancellation (its own button, or a second mic tap kills it).
 
-use std::io::{BufRead, Read};
+use std::io::Read;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
@@ -30,8 +37,25 @@ use std::thread;
 
 use crate::lsp::log_file;
 
-/// The Termux:API CLI that fronts Android's `SpeechRecognizer`.
-const BINARY: &str = "termux-speech-to-text";
+/// The Termux:API CLI that fronts Android's `SpeechRecognizer`. The `speech`
+/// dialog widget (`termux-dialog speech`) returns the final `onResults`
+/// transcript as JSON; the `termux-speech-to-text` service discards it (see the
+/// module doc), so `termux-dialog` is the binary croft drives.
+const BINARY: &str = "termux-dialog";
+
+/// `termux-dialog` widget that opens the system speech recognizer.
+const SPEECH_WIDGET: &str = "speech";
+
+/// Shown as the dialog's title while it listens.
+const DIALOG_TITLE: &str = "croft voice input";
+
+/// JSON keys in `termux-dialog`'s result object.
+const JSON_TEXT: &str = "text";
+const JSON_ERROR: &str = "error";
+
+/// The recognizer error code Android raises when Termux:API lacks the mic
+/// permission; mapped to an actionable hint instead of a raw code.
+const ERR_NO_MIC_PERMISSION: &str = "ERROR_INSUFFICIENT_PERMISSIONS";
 
 /// Installed on Termux from the bootstrap's `pkg`; provides `BINARY` in
 /// `$PREFIX/bin` (always on PATH). The Termux:API *app* (APK) must also be
@@ -171,12 +195,14 @@ pub struct VoiceHandle {
 }
 
 impl VoiceHandle {
-    /// Stop recognition now (a second mic tap). `termux-speech-to-text` is a
-    /// wrapper script whose `termux-api` child inherits the stdout pipe, so
-    /// killing the script alone leaves that child holding the pipe open and the
-    /// reader never sees EOF. `start` put the tree in its own process group
-    /// (setsid), so signal the whole group: that takes down `termux-api` too,
-    /// the pipe closes, and the reader finalizes and reports the transcript.
+    /// Cancel the dialog now (a second mic tap). `termux-dialog` is a wrapper
+    /// script whose `termux-api` child inherits the stdout pipe, so killing the
+    /// script alone leaves that child holding the pipe open and the reader never
+    /// sees EOF. `start` put the tree in its own process group (setsid), so
+    /// signal the whole group: that takes down `termux-api` too, the pipe
+    /// closes, and the reader finalizes. The happy path does not need this - the
+    /// dialog returns on its own when you stop speaking - it is only the escape
+    /// hatch for an abandoned session.
     pub fn stop(&self) {
         if let Ok(mut guard) = self.child.lock()
             && let Some(child) = guard.as_mut()
@@ -190,22 +216,24 @@ impl VoiceHandle {
     }
 }
 
-/// Start a recognition session. Spawns `termux-speech-to-text -p`, reads its
-/// streamed hypotheses on a background thread, and on stream end sends the last
-/// non-empty line as the transcript over `tx`. Returns a handle the app keeps
-/// to stop the session on a second mic tap. On a spawn failure the session
-/// never opens and `VoiceMsg::Failed` is sent.
+/// Start a recognition session. Spawns `termux-dialog speech`, reads its single
+/// JSON result object on a background thread, and sends the recognized text as
+/// the transcript over `tx` (or `Failed`/`Empty` on a recognizer error or
+/// nothing heard). Returns a handle the app keeps to cancel on a second mic tap.
+/// On a spawn failure the session never opens and `VoiceMsg::Failed` is sent.
 pub fn start(tx: Sender<VoiceMsg>) -> VoiceHandle {
     set_listening(true);
-    // Final-only mode (no `-p`): the wrapper pipes the recognizer through
-    // `tail -1`, emitting exactly one line - the final transcript - when the
-    // recognizer finalizes on end-of-speech (silence). The transcript only
-    // exists after that finalize, so croft must NOT kill the session to "stop"
-    // it (that preempts the result); the user pauses and it commits. `-p` is
-    // avoided because its progressive output is buffered upstream (#137) and
-    // would yield partial or empty text. stderr is captured for diagnosis.
+    // `termux-dialog speech` opens the system speech dialog and prints one JSON
+    // object - `{"code":..,"text":".."[, "error":".."]}` - when the recognizer
+    // finalizes (`onResults`) or fails (`onError`), then exits. Unlike the
+    // `termux-speech-to-text` service it does NOT close on `onEndOfSpeech`, so
+    // the final transcript is actually delivered (see the module doc). stderr is
+    // captured for diagnosis.
     let mut cmd = Command::new(BINARY);
-    cmd.stdin(Stdio::null())
+    cmd.arg(SPEECH_WIDGET)
+        .arg("-t")
+        .arg(DIALOG_TITLE)
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     // Run the wrapper script in its own session/process group so `stop` can
@@ -229,28 +257,19 @@ pub fn start(tx: Sender<VoiceMsg>) -> VoiceHandle {
             };
         }
     };
-    let stdout = child.stdout.take();
+    let mut stdout = child.stdout.take();
     let mut stderr = child.stderr.take();
     let shared: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(Some(child)));
     let reader_shared = Arc::clone(&shared);
     thread::spawn(move || {
-        let mut latest = String::new();
-        if let Some(stdout) = stdout {
-            // Final-only mode emits a single line (the transcript) at EOF; keep
-            // the last non-empty line either way.
-            for line in std::io::BufReader::new(stdout)
-                .lines()
-                .map_while(Result::ok)
-            {
-                let trimmed = line.trim();
-                if !trimmed.is_empty() {
-                    latest = trimmed.to_string();
-                }
-            }
+        // The dialog prints a single small JSON object at end-of-speech; read it
+        // whole rather than line-by-line.
+        let mut json = String::new();
+        if let Some(stdout) = stdout.as_mut() {
+            let _ = stdout.read_to_string(&mut json);
         }
         // Drain stderr and reap, so a recognizer-side failure (no Termux:API
-        // app, denied mic permission, no speech-recognition service) leaves a
-        // real signal in the log instead of a silent "No speech detected".
+        // app, no speech-recognition service) leaves a real signal in the log.
         let mut err = String::new();
         if let Some(stderr) = stderr.as_mut() {
             let _ = stderr.read_to_string(&mut err);
@@ -263,15 +282,33 @@ pub fn start(tx: Sender<VoiceMsg>) -> VoiceHandle {
             None
         };
         set_listening(false);
+        let parsed = serde_json::from_str::<serde_json::Value>(json.trim()).ok();
+        let field = |key: &str| -> String {
+            parsed
+                .as_ref()
+                .and_then(|v| v.get(key))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string()
+        };
+        let text = field(JSON_TEXT);
+        let rec_err = field(JSON_ERROR);
         log_file::log(&format!(
-            "voice: session ended status={status:?} transcript_chars={} stderr={:?}",
-            latest.chars().count(),
+            "voice: dialog ended status={status:?} text_chars={} error={rec_err:?} stderr={:?}",
+            text.chars().count(),
             err.trim()
         ));
-        let msg = if latest.is_empty() {
-            VoiceMsg::Empty
+        let msg = if !text.is_empty() {
+            VoiceMsg::Transcript(text)
+        } else if rec_err == ERR_NO_MIC_PERMISSION {
+            VoiceMsg::Failed(String::from(
+                "Grant Termux:API microphone permission, then tap the mic again",
+            ))
+        } else if !rec_err.is_empty() {
+            VoiceMsg::Failed(format!("Voice input error: {rec_err}"))
         } else {
-            VoiceMsg::Transcript(latest)
+            VoiceMsg::Empty
         };
         let _ = tx.send(msg);
     });
