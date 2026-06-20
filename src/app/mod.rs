@@ -7547,15 +7547,27 @@ impl App {
     }
 
     fn handle_extensions_key(&mut self, key: KeyEvent) {
+        let has_mod = key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER);
         match key.code {
             KeyCode::Up => self.extensions.move_up(),
             KeyCode::Down => self.extensions.move_down(),
             KeyCode::PageUp => self.extensions.scroll_up(10),
             KeyCode::PageDown => self.extensions.scroll_down(10),
-            // Space / Enter flip the selected extension, like VS Code's
-            // Enable/Disable action on the focused row.
-            KeyCode::Char(' ') | KeyCode::Enter => self.toggle_selected_extension(),
-            KeyCode::Esc => self.set_sidebar_view(SidebarView::Explorer),
+            // Space / Enter flip the selected extension's toggle switch. Space is
+            // reserved for the toggle (per the panel's design), so the filter box
+            // takes every other printable character but never a space.
+            KeyCode::Char(' ') if !has_mod => self.toggle_selected_extension(),
+            KeyCode::Enter => self.toggle_selected_extension(),
+            KeyCode::Backspace if !self.extensions.filter_is_empty() => {
+                self.extensions.pop_filter_char()
+            }
+            KeyCode::Char(c) if !has_mod => self.extensions.push_filter_char(c),
+            // Esc clears an active filter first; a second Esc leaves the view.
+            KeyCode::Esc if !self.extensions.clear_filter() => {
+                self.set_sidebar_view(SidebarView::Explorer)
+            }
             _ => {}
         }
     }
@@ -14406,17 +14418,18 @@ impl App {
                 }
                 if in_tree && self.sidebar_view == SidebarView::Extensions {
                     self.focus_pane(Pane::Tree);
-                    // Clicking a row selects it; clicking the already-selected
-                    // row's Enable/Disable pill flips its state. The pill is only
-                    // laid out for the selected row, so a first click on a fresh
-                    // row just selects (arming the pill), VS Code-style.
+                    // The filter's clear (✕) button empties the search.
+                    if self.extensions.click_clear(m.column, m.row) {
+                        self.extensions.clear_filter();
+                        return;
+                    }
+                    // Clicking a row selects it; clicking its toggle switch (the
+                    // right-edge pill) also flips the extension in one click.
                     if let Some(idx) = self.extensions.row_at(m.row) {
-                        if self.extensions.is_selected(idx)
-                            && self.extensions.click_action(m.column, m.row)
-                        {
+                        let on_switch = self.extensions.click_action(m.column, m.row);
+                        self.extensions.select(idx);
+                        if on_switch {
                             self.toggle_selected_extension();
-                        } else {
-                            self.extensions.select(idx);
                         }
                     }
                     return;

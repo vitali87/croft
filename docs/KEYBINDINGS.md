@@ -218,14 +218,18 @@ Also in the Command Palette: Start / Stop / Pause / Restart Debugging, Toggle Br
 
 ## Extensions sidebar
 
-Jump here with `Cmd+Shift+X` (or the activity-bar icon, or the Command Palette's "View: Show Extensions"). The panel lists croft's bundled extensions — the PDF and CSV viewers, Vim mode, and the Python / TypeScript / Rust / Go language servers — each with a right-aligned **Enabled** / **Disabled** state. Any extensions you drop into `~/.config/croft/extensions/<id>/` appear here too.
+Jump here with `Cmd+Shift+X` (or the activity-bar icon, or the Command Palette's "View: Show Extensions"). The panel lists croft's bundled extensions — the PDF and CSV viewers, Vim mode, and the Python / TypeScript / Rust / Go language servers — each with a right-aligned **toggle switch** (blue = on, grey = off). Any extensions you drop into `~/.config/croft/extensions/<id>/` appear here too. A filter box at the top narrows the list as you type; it matches the installed list by name, blurb, or id (croft has no marketplace, so it is a local filter, not a remote search).
 
 | Keys | Action |
 |------|--------|
+| Type any character | Filter the list (matches name / description / id) |
+| `Backspace` | Delete the last filter character |
 | `Up` / `Down` | Move the selection |
-| `Space` / `Enter` | Enable or disable the selected extension |
-| Click a row | Select it (the selected row reveals its Enable/Disable action) |
-| Click the action pill | Toggle the selected extension |
+| `Space` / `Enter` | Flip the selected extension's toggle |
+| `Esc` | Clear the filter, or leave the view when it's already empty |
+| Click a row | Select it |
+| Click the toggle switch | Flip that extension on/off |
+| Click the `✕` in the filter box | Clear the filter |
 
 Disabling takes effect immediately for the viewers and Vim (a disabled PDF/CSV viewer opens that file type as plain text; a disabled Vim makes `Cmd+E` inert); a disabled language server stops spawning on the next launch. The choice persists in `~/.config/croft/config.json`.
 
