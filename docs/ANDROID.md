@@ -54,7 +54,23 @@ Termux only raises the Android soft keyboard from its tap path, and that path is
 
 **Split layout for foldables.** For thumb typing on foldables the `split` key switches to a Gboard-style split layout: two clusters (`qwert` | `yuiop` and friends, with a space bar on each side) separated by a center gap of about two-ninths of the keyboard's width. The choice is remembered across launches in `~/.config/croft/config.json` as `osk_split`. Narrow screens (the folded front display) automatically fall back to the merged layout.
 
-**Voice input.** A mic key sits immediately right of the left `alt`, taking its width from the space bar (the left space half in the split layout). Suppressing the native keyboard also removes its mic button, so this restores dictation: **tap the mic, speak, then pause** and the transcript is inserted automatically. A tap rather than press-and-hold because Termux turns any finger hold on the terminal into its own text-selection gesture, which a TUI cannot suppress. The system speech dialog appears while listening and the status line shows `Listening…`. The insert happens when you stop talking, not on a second tap: Android's speech recognizer only produces the final transcript at end-of-speech (silence), so killing it to "stop" would throw the result away. A second tap therefore **cancels** (the dialog also has its own Cancel button). Under the hood it calls `termux-dialog speech`, which drives Android's system recognizer (the same engine Gboard's mic uses) and returns the final transcript, so it lands wherever the cursor is, the editor, a terminal, or a modal. It deliberately does **not** use `termux-speech-to-text`: that service closes its output the moment you pause and so discards the final result, which is why dictation through it came back empty. The first tap installs the `termux-api` package automatically (background `pkg install`); you also need the **Termux:API app** from F-Droid and to grant it microphone permission, since the package alone cannot reach the recognizer.
+**Voice input.** A mic key sits immediately right of the left `alt`, taking its width from the space bar (the left space half in the split layout). Suppressing the native keyboard also removes its mic button, so this restores dictation: **tap the mic, speak, then pause** and the transcript is inserted automatically. A tap rather than press-and-hold because Termux turns any finger hold on the terminal into its own text-selection gesture, which a TUI cannot suppress. The system speech dialog appears while listening and the status line shows `Listening…`. The insert happens when you stop talking, not on a second tap: Android's speech recognizer only produces the final transcript at end-of-speech (silence), so killing it to "stop" would throw the result away. A second tap therefore **cancels** (the dialog also has its own Cancel button). Under the hood it calls `termux-dialog speech`, which drives Android's system recognizer (the same engine Gboard's mic uses) and returns the final transcript, so it lands wherever the cursor is, the editor, a terminal, or a modal. It deliberately does **not** use `termux-speech-to-text`: that service closes its output the moment you pause and so discards the final result, which is why dictation through it came back empty.
+
+**Required: the Termux:API app.** Voice input is the one croft feature with a setup step it cannot do for you. It depends on three separate pieces, and it is easy to think you have them all when you have only two:
+
+1. The **Termux app** itself (you are running it).
+2. The **`termux-api` package** (`pkg install termux-api`), a thin command-line client. croft installs this for you on the first mic tap.
+3. The **Termux:API app**, a *separate APK* that holds the Android permissions and actually talks to the speech recognizer. **You must install this yourself.**
+
+Install the Termux:API app **from the same source as Termux** (both from [F-Droid](https://f-droid.org/packages/com.termux.api/), or both from the same GitHub build). A mismatch (for example Termux from F-Droid and Termux:API from the Play Store) fails silently because the two apps are signed with different keys and cannot talk to each other. Then open Android **Settings → Apps → Termux:API → Permissions** and grant **Microphone**, and set its battery usage to **Unrestricted** so Android does not kill its background helper.
+
+Verify the bridge is alive before expecting voice to work:
+
+```bash
+termux-battery-status     # must print JSON (percentage, status, ...)
+```
+
+If that command (or any other `termux-*` command) **hangs**, the Termux:API app is missing, disabled, or signed by a different key than Termux: the package alone cannot reach the recognizer. Fix that first, and voice input then works with no further setup.
 
 ## Testing the keyboard on a desktop
 
