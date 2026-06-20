@@ -235,31 +235,29 @@ fn rows_for(layer: OskLayer, caps: bool, split: bool) -> Vec<Vec<KeySlot>> {
         r
     };
     // The bottom row mirrors a real keyboard: ctrl/alt flank a shortened
-    // space bar on both sides. On the letter page the comma/period live on
-    // the symbols page, so the letter bottom is `?123 ctrl alt space alt
-    // ctrl ⏎`; on the symbols page comma/period sit beside the space bar:
-    // `abc ctrl alt , space . ⏎`.
+    // space bar on both sides. Comma and period are permanent on every
+    // layer (not hidden behind `?123`) and live at opposite ends so each
+    // thumb has punctuation without crossing the keyboard: comma sits
+    // immediately right of the layer toggle, period immediately left of
+    // Enter. The bottom row is therefore `?123 , ctrl alt space alt ctrl . ⏎`
+    // (with `abc` replacing `?123` on the symbols page).
     let symbols = layer == OskLayer::Symbols;
     let bottom = |layer_label: &str| {
         let mut r = vec![
             slot(layer_label, "", OskKey::Symbols, 6, 8),
+            slot(",", "", OskKey::Char(','), 3, 5),
             slot("ctrl", "^", OskKey::Ctrl, 4, 6),
             slot("alt", "", OskKey::Alt, 4, 6),
         ];
-        if symbols {
-            r.push(slot(",", "", OskKey::Char(','), 3, 5));
-        }
         r.push(slot(" ", "", OskKey::Char(' '), 12, UNCAPPED));
         if split {
             // Both thumbs get a space bar, Gboard-style.
             r.push(gap_slot());
             r.push(slot(" ", "", OskKey::Char(' '), 12, UNCAPPED));
         }
-        if symbols {
-            r.push(slot(".", "", OskKey::Char('.'), 3, 5));
-        }
         r.push(slot("alt", "", OskKey::Alt, 4, 6));
         r.push(slot("ctrl", "^", OskKey::Ctrl, 4, 6));
+        r.push(slot(".", "", OskKey::Char('.'), 3, 5));
         r.push(enter());
         r
     };
@@ -807,11 +805,12 @@ mod tests {
             osk.rect_for(OskKey::Char('1')).is_none(),
             "digits live behind ?123, not on the lower layer"
         );
-        // Comma and period are NOT on the letter page (they live on ?123).
+        // Comma and period are permanent on the letter page (no longer
+        // hidden behind ?123), parked at opposite ends of the bottom row.
         for c in [',', '.'] {
             assert!(
-                osk.rect_for(OskKey::Char(c)).is_none(),
-                "{c:?} lives on the ?123 page, not the letter page"
+                osk.rect_for(OskKey::Char(c)).is_some(),
+                "{c:?} is a permanent bottom-row key on the letter page"
             );
         }
         // The space bar is always present.
@@ -1040,19 +1039,50 @@ mod tests {
     }
 
     #[test]
-    fn comma_and_period_live_on_the_symbols_page_by_the_space_bar() {
-        let mut osk = Osk::new();
-        osk.tap(OskKey::Symbols);
-        assert_eq!(osk.layer, OskLayer::Symbols);
-        osk.layout(band());
-        let comma = osk.rect_for(OskKey::Char(',')).unwrap();
-        let period = osk.rect_for(OskKey::Char('.')).unwrap();
-        let space = osk.rect_for(OskKey::Char(' ')).unwrap();
-        // The bottom row reads: abc ctrl alt , space . ⏎.
-        assert_eq!(comma.y, space.y, "comma shares the bottom row");
-        assert_eq!(period.y, space.y, "period shares the bottom row");
-        assert!(comma.x < space.x, "comma sits left of the space bar");
-        assert!(period.x > space.x, "period sits right of the space bar");
+    fn comma_sits_right_of_the_layer_toggle_and_period_left_of_enter() {
+        // The bottom row reads `?123 , ctrl alt space alt ctrl . ⏎` on every
+        // layer, so each thumb has punctuation without crossing the board:
+        // comma immediately right of the layer toggle, period immediately
+        // left of Enter. Verified on both the letter page and the ?123 page.
+        for layer_tap in [false, true] {
+            let mut osk = Osk::new();
+            if layer_tap {
+                osk.tap(OskKey::Symbols);
+                assert_eq!(osk.layer, OskLayer::Symbols);
+            }
+            osk.layout(band());
+            let toggle = osk.rect_for(OskKey::Symbols).unwrap();
+            let comma = osk.rect_for(OskKey::Char(',')).unwrap();
+            let period = osk.rect_for(OskKey::Char('.')).unwrap();
+            let enter = osk.rect_for(OskKey::Code(KeyCode::Enter)).unwrap();
+            let space = osk.rect_for(OskKey::Char(' ')).unwrap();
+            // All on the bottom row.
+            assert_eq!(comma.y, space.y, "comma shares the bottom row");
+            assert_eq!(period.y, space.y, "period shares the bottom row");
+            // Comma is wedged between the layer toggle and the space bar,
+            // right of the toggle; period between the space bar and Enter,
+            // left of Enter. No other key sits between toggle and comma.
+            assert!(comma.x > toggle.x, "comma sits right of the ?123/abc toggle");
+            assert!(comma.x < space.x, "comma stays left of the space bar");
+            assert!(period.x > space.x, "period stays right of the space bar");
+            assert!(period.x < enter.x, "period sits left of Enter");
+            let between_toggle_and_comma = osk
+                .keys
+                .iter()
+                .any(|(r, _)| r.y == comma.y && r.x > toggle.x && r.x < comma.x);
+            assert!(
+                !between_toggle_and_comma,
+                "comma is immediately right of the layer toggle"
+            );
+            let between_period_and_enter = osk
+                .keys
+                .iter()
+                .any(|(r, _)| r.y == period.y && r.x > period.x && r.x < enter.x);
+            assert!(
+                !between_period_and_enter,
+                "period is immediately left of Enter"
+            );
+        }
     }
 
     #[test]

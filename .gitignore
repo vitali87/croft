@@ -38,3 +38,7 @@ preview*.svg
 # Debugger build artifacts (build_debuggable_binary drops <stem>.dbg next to source)
 *.dbg
 *.dbg.dSYM/
+
+# Local secrets (Codeberg token, etc.) — never commit
+.env
+.env.*
