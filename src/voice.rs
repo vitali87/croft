@@ -19,6 +19,8 @@
 //! upstream, see termux-api-package#137 which buffers progressive output).
 
 use std::io::BufRead;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
@@ -169,12 +171,20 @@ pub struct VoiceHandle {
 }
 
 impl VoiceHandle {
-    /// Stop recognition now (a second mic tap). Killing the client closes its
-    /// stdout, so the reader thread finalizes and reports the best transcript.
+    /// Stop recognition now (a second mic tap). `termux-speech-to-text` is a
+    /// wrapper script whose `termux-api` child inherits the stdout pipe, so
+    /// killing the script alone leaves that child holding the pipe open and the
+    /// reader never sees EOF. `start` put the tree in its own process group
+    /// (setsid), so signal the whole group: that takes down `termux-api` too,
+    /// the pipe closes, and the reader finalizes and reports the transcript.
     pub fn stop(&self) {
         if let Ok(mut guard) = self.child.lock()
             && let Some(child) = guard.as_mut()
         {
+            #[cfg(unix)]
+            unsafe {
+                libc::kill(-(child.id() as i32), libc::SIGKILL);
+            }
             let _ = child.kill();
         }
     }
@@ -187,13 +197,22 @@ impl VoiceHandle {
 /// never opens and `VoiceMsg::Failed` is sent.
 pub fn start(tx: Sender<VoiceMsg>) -> VoiceHandle {
     set_listening(true);
-    let mut child = match Command::new(BINARY)
-        .arg("-p")
+    let mut cmd = Command::new(BINARY);
+    cmd.arg("-p")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-    {
+        .stderr(Stdio::null());
+    // Run the wrapper script in its own session/process group so `stop` can
+    // signal the whole tree (script + `termux-api`) as a unit; otherwise the
+    // `termux-api` child survives, holds the stdout pipe, and the reader hangs.
+    #[cfg(unix)]
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
             set_listening(false);
