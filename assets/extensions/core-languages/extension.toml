@@ -8,6 +8,7 @@ id = "core-languages"
 name = "Core language identities"
 description = "File-type identities for formats with no bundled language server."
 builtin = true
+hidden = true
 api_version = 1
 
 [[languages]]

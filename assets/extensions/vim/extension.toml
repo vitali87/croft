@@ -1,0 +1,8 @@
+# Bundled croft extension: Vim modal editing.
+# Built-in feature (src/vim.rs state machine). Disabling hides it from the
+# Cmd+E toggle so the editor stays in plain (non-modal) mode.
+id = "vim"
+name = "Vim"
+description = "Modal (vi-style) editing, toggled with Cmd+E."
+builtin = true
+api_version = 1

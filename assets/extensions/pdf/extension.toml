@@ -1,0 +1,9 @@
+# Bundled croft extension: PDF viewer.
+# A built-in feature surfaced in the Extensions panel so it can be disabled
+# (not removed). Rendering stays native (src/pdf.rs + OSC-1337); disabling
+# gates the .pdf open dispatch so the file opens as plain text instead.
+id = "pdf"
+name = "PDF Viewer"
+description = "Preview PDF files page-by-page (poppler / sips)."
+builtin = true
+api_version = 1

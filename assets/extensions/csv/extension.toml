@@ -1,0 +1,8 @@
+# Bundled croft extension: CSV / spreadsheet viewer.
+# Built-in feature; rendering stays native (src/sheet.rs). Disabling gates the
+# .csv/.tsv/.xlsx open dispatch so the file opens as plain text instead.
+id = "csv"
+name = "CSV Viewer"
+description = "Render CSV, TSV, and spreadsheet files as a grid."
+builtin = true
+api_version = 1

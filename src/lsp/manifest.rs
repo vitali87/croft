@@ -28,6 +28,9 @@ use crate::lsp::install::Provision;
 /// declares the file-type identities for formats with no bundled server.
 pub const BUNDLED_MANIFESTS: &[&str] = &[
     include_str!("../../assets/extensions/core-languages/extension.toml"),
+    include_str!("../../assets/extensions/pdf/extension.toml"),
+    include_str!("../../assets/extensions/csv/extension.toml"),
+    include_str!("../../assets/extensions/vim/extension.toml"),
     include_str!("../../assets/extensions/lsp-python/extension.toml"),
     include_str!("../../assets/extensions/lsp-typescript/extension.toml"),
     include_str!("../../assets/extensions/lsp-rust/extension.toml"),
@@ -44,6 +47,10 @@ pub struct ExtensionManifest {
     pub description: String,
     #[serde(default)]
     pub builtin: bool,
+    /// Infrastructure extensions (e.g. `core-languages`) set this so they don't
+    /// appear in the user-facing Extensions panel.
+    #[serde(default)]
+    pub hidden: bool,
     pub api_version: u32,
     #[serde(default)]
     pub languages: Vec<LanguageDecl>,
@@ -129,6 +136,33 @@ pub struct ServerEntry {
 /// Parse an `extension.toml` source.
 pub fn parse(src: &str) -> Result<ExtensionManifest, toml::de::Error> {
     toml::from_str(src)
+}
+
+/// A user-facing extension entry for the Extensions panel: identity and blurb,
+/// with no contribution detail. Enabled/disabled state is held separately (in
+/// prefs), so this stays a pure projection of the manifest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtensionSummary {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub builtin: bool,
+}
+
+/// Project a set of manifest sources to the panel's extension list, skipping
+/// unparseable and `hidden` (infrastructure) manifests.
+pub fn summaries(sources: &[&str]) -> Vec<ExtensionSummary> {
+    sources
+        .iter()
+        .filter_map(|s| parse(s).ok())
+        .filter(|m| !m.hidden)
+        .map(|m| ExtensionSummary {
+            id: m.id,
+            name: m.name,
+            description: m.description,
+            builtin: m.builtin,
+        })
+        .collect()
 }
 
 /// Leak a parsed string to `&'static`. Sound because the data it represents
@@ -248,6 +282,19 @@ mod tests {
         let names: Vec<&str> = entries.iter().map(|e| e.config.name).collect();
         assert_eq!(names, vec!["ty", "basedpyright", "ruff"]);
         assert!(entries.iter().all(|e| e.language == Language::PYTHON));
+    }
+
+    #[test]
+    fn bundled_summaries_list_user_facing_extensions_and_hide_infra() {
+        let s = summaries(BUNDLED_MANIFESTS);
+        let ids: Vec<&str> = s.iter().map(|e| e.id.as_str()).collect();
+        // The user-facing built-ins appear...
+        for id in ["pdf", "csv", "vim", "lsp-python", "lsp-rust"] {
+            assert!(ids.contains(&id), "missing {id} in {ids:?}");
+        }
+        // ...and the hidden infrastructure manifest does not.
+        assert!(!ids.contains(&"core-languages"));
+        assert!(s.iter().all(|e| e.builtin));
     }
 
     #[test]
