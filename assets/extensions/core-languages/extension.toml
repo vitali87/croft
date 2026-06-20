@@ -1,0 +1,39 @@
+# Bundled croft extension: core language identities with no language server.
+# These declare the file-extension -> language-id mapping for formats croft
+# recognises but ships no LSP for (highlighting comes from tree-sitter, a
+# separate path). Keeping them here preserves the exact `Language::from_extension`
+# surface now that it is data-driven, and models "a language is a contribution"
+# the same way a third-party language extension would.
+id = "core-languages"
+name = "Core language identities"
+description = "File-type identities for formats with no bundled language server."
+builtin = true
+api_version = 1
+
+[[languages]]
+id = "json"
+extensions = ["json"]
+
+[[languages]]
+id = "yaml"
+extensions = ["yaml", "yml"]
+
+[[languages]]
+id = "toml"
+extensions = ["toml"]
+
+[[languages]]
+id = "shellscript"
+extensions = ["sh", "bash"]
+
+[[languages]]
+id = "markdown"
+extensions = ["md", "markdown"]
+
+[[languages]]
+id = "html"
+extensions = ["html", "htm"]
+
+[[languages]]
+id = "css"
+extensions = ["css"]

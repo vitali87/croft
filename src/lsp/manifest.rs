@@ -18,6 +18,18 @@ use serde::Deserialize;
 use crate::lsp::config::{Language, ServerConfig};
 use crate::lsp::install::Provision;
 
+/// Bundled (first-party) extension manifests, embedded so they ship in the
+/// binary and load identically on every host. The same declarative
+/// `extension.toml` format a third-party extension uses. `core-languages`
+/// declares the file-type identities for formats with no bundled server.
+pub const BUNDLED_MANIFESTS: &[&str] = &[
+    include_str!("../../assets/extensions/core-languages/extension.toml"),
+    include_str!("../../assets/extensions/lsp-python/extension.toml"),
+    include_str!("../../assets/extensions/lsp-typescript/extension.toml"),
+    include_str!("../../assets/extensions/lsp-rust/extension.toml"),
+    include_str!("../../assets/extensions/lsp-go/extension.toml"),
+];
+
 /// A parsed `extension.toml`. Only the fields phase B1 consumes are modelled;
 /// unknown keys are ignored so the format can grow without breaking old builds.
 #[derive(Debug, Clone, Deserialize)]
@@ -30,7 +42,31 @@ pub struct ExtensionManifest {
     pub builtin: bool,
     pub api_version: u32,
     #[serde(default)]
+    pub languages: Vec<LanguageDecl>,
+    #[serde(default)]
     pub language_servers: Vec<LanguageServerDecl>,
+}
+
+/// One `[[languages]]` entry: a language identity contributed by an extension.
+/// Carries the data the closed `Language` enum used to hardcode — its LSP
+/// `languageId`, the file extensions that map to it, the project-root markers,
+/// and the server "family" it shares a managed server with.
+#[derive(Debug, Clone, Deserialize)]
+pub struct LanguageDecl {
+    /// LSP `languageId` (e.g. `"python"`, `"typescriptreact"`). The language's
+    /// stable identity.
+    pub id: String,
+    #[serde(default)]
+    pub extensions: Vec<String>,
+    /// Project-manifest filenames that mark a directory as this language's
+    /// project root (anchors the server at the right sub-project).
+    #[serde(default)]
+    pub root_markers: Vec<String>,
+    /// The canonical language id this one shares a managed server with (e.g.
+    /// `typescriptreact` -> `typescript`). Absent means the language is its own
+    /// family.
+    #[serde(default)]
+    pub family: Option<String>,
 }
 
 /// One `[[language_servers]]` entry: a server and the language id(s) it serves.
@@ -181,6 +217,6 @@ mod tests {
         let entries = entries(&m);
         let names: Vec<&str> = entries.iter().map(|e| e.config.name).collect();
         assert_eq!(names, vec!["ty", "basedpyright", "ruff"]);
-        assert!(entries.iter().all(|e| e.language == Language::Python));
+        assert!(entries.iter().all(|e| e.language == Language::PYTHON));
     }
 }

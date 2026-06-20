@@ -8,6 +8,32 @@ description = "TypeScript and JavaScript language support via vtsls."
 builtin = true
 api_version = 1
 
+# All four TS/JS languages share vtsls and the same project markers. The three
+# non-canonical ids declare `family = "typescript"` so a managed-install re-open
+# treats the whole family as one server (matches the old `lsp_server_family`).
+[[languages]]
+id = "typescript"
+extensions = ["ts"]
+root_markers = ["tsconfig.json", "jsconfig.json", "package.json"]
+
+[[languages]]
+id = "typescriptreact"
+extensions = ["tsx"]
+root_markers = ["tsconfig.json", "jsconfig.json", "package.json"]
+family = "typescript"
+
+[[languages]]
+id = "javascript"
+extensions = ["js", "mjs", "cjs"]
+root_markers = ["tsconfig.json", "jsconfig.json", "package.json"]
+family = "typescript"
+
+[[languages]]
+id = "javascriptreact"
+extensions = ["jsx"]
+root_markers = ["tsconfig.json", "jsconfig.json", "package.json"]
+family = "typescript"
+
 [[language_servers]]
 name = "vtsls"
 command = "vtsls"

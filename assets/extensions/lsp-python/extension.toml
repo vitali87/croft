@@ -9,6 +9,11 @@ description = "Python language support: ty (Astral type server), basedpyright fa
 builtin = true
 api_version = 1
 
+[[languages]]
+id = "python"
+extensions = ["py", "pyi"]
+root_markers = ["pyproject.toml", "setup.py", "setup.cfg", "pyrightconfig.json", ".venv"]
+
 [[language_servers]]
 name = "ty"
 command = "ty"

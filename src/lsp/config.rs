@@ -1,84 +1,57 @@
+/// A language identity, represented by its LSP `languageId` (interned to
+/// `&'static`). Formerly a closed enum; now an open newtype so a declarative
+/// extension can contribute a brand-new language (e.g. Zig) with no Rust
+/// change. The per-language data the enum used to hardcode — file extensions,
+/// project-root markers, the server family — lives in the language table built
+/// from extension manifests (see [`crate::lsp::languages`]); the constants
+/// below name the first-party languages for call sites and tests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Language {
-    Python,
-    TypeScript,
-    Tsx,
-    JavaScript,
-    Jsx,
-    Rust,
-    Go,
-    Json,
-    Yaml,
-    Toml,
-    Bash,
-    Markdown,
-    Html,
-    Css,
-}
+pub struct Language(pub(crate) &'static str);
 
 impl Language {
+    pub const PYTHON: Language = Language("python");
+    pub const TYPESCRIPT: Language = Language("typescript");
+    pub const TSX: Language = Language("typescriptreact");
+    pub const JAVASCRIPT: Language = Language("javascript");
+    pub const JSX: Language = Language("javascriptreact");
+    pub const RUST: Language = Language("rust");
+    pub const GO: Language = Language("go");
+    pub const JSON: Language = Language("json");
+    pub const YAML: Language = Language("yaml");
+    pub const TOML: Language = Language("toml");
+    pub const BASH: Language = Language("shellscript");
+    pub const MARKDOWN: Language = Language("markdown");
+    pub const HTML: Language = Language("html");
+    pub const CSS: Language = Language("css");
+
+    /// The language whose manifests map this file extension, or `None`.
+    /// Data-driven: the mapping comes from every loaded extension's
+    /// `[[languages]]` blocks.
     pub fn from_extension(ext: &str) -> Option<Self> {
-        match ext.to_ascii_lowercase().as_str() {
-            "py" | "pyi" => Some(Self::Python),
-            "ts" => Some(Self::TypeScript),
-            "tsx" => Some(Self::Tsx),
-            "js" | "mjs" | "cjs" => Some(Self::JavaScript),
-            "jsx" => Some(Self::Jsx),
-            "rs" => Some(Self::Rust),
-            "go" => Some(Self::Go),
-            "json" => Some(Self::Json),
-            "yaml" | "yml" => Some(Self::Yaml),
-            "toml" => Some(Self::Toml),
-            "sh" | "bash" => Some(Self::Bash),
-            "md" | "markdown" => Some(Self::Markdown),
-            "html" | "htm" => Some(Self::Html),
-            "css" => Some(Self::Css),
-            _ => None,
-        }
+        crate::lsp::languages::from_extension(ext)
     }
 
+    /// The LSP `languageId` sent in `initialize`/`didOpen`.
     pub fn lsp_id(&self) -> &'static str {
-        match self {
-            Self::Python => "python",
-            Self::TypeScript => "typescript",
-            Self::Tsx => "typescriptreact",
-            Self::JavaScript => "javascript",
-            Self::Jsx => "javascriptreact",
-            Self::Rust => "rust",
-            Self::Go => "go",
-            Self::Json => "json",
-            Self::Yaml => "yaml",
-            Self::Toml => "toml",
-            Self::Bash => "shellscript",
-            Self::Markdown => "markdown",
-            Self::Html => "html",
-            Self::Css => "css",
-        }
+        self.0
     }
 
-    /// Inverse of [`Self::lsp_id`]: resolve an LSP `languageId` string back to a
-    /// known language. Lets a declarative extension manifest name the languages
-    /// its servers target by their wire ids (`"python"`, `"typescriptreact"`,
-    /// …). `None` for ids this build's closed `Language` enum can't represent
-    /// yet (a third-party language that needs the enum opened — see phase B2).
+    /// Resolve an LSP `languageId` string to a known language, or `None` if no
+    /// loaded extension contributes it.
     pub fn from_lsp_id(id: &str) -> Option<Self> {
-        Some(match id {
-            "python" => Self::Python,
-            "typescript" => Self::TypeScript,
-            "typescriptreact" => Self::Tsx,
-            "javascript" => Self::JavaScript,
-            "javascriptreact" => Self::Jsx,
-            "rust" => Self::Rust,
-            "go" => Self::Go,
-            "json" => Self::Json,
-            "yaml" => Self::Yaml,
-            "toml" => Self::Toml,
-            "shellscript" => Self::Bash,
-            "markdown" => Self::Markdown,
-            "html" => Self::Html,
-            "css" => Self::Css,
-            _ => return None,
-        })
+        crate::lsp::languages::resolve(id)
+    }
+
+    /// Project-manifest filenames that anchor this language's server at the
+    /// right sub-project root. Empty slice means "use the workspace root".
+    pub fn root_markers(&self) -> &'static [&'static str] {
+        crate::lsp::languages::root_markers(*self)
+    }
+
+    /// The language this one shares a managed server with (e.g. `typescriptreact`
+    /// -> `typescript`); itself when it is its own family.
+    pub fn server_family(&self) -> Self {
+        crate::lsp::languages::server_family(*self)
     }
 }
 
@@ -108,7 +81,7 @@ impl ServerConfig {
             name: "ty",
             command: "ty".into(),
             args: vec!["server".into()],
-            language: Language::Python,
+            language: Language::PYTHON,
             initialization_options: None,
             // Astral's type server is on PyPI; uv installs it (and pulls a
             // Python interpreter) with no node dependency. Latest, not pinned:
@@ -126,7 +99,7 @@ impl ServerConfig {
             name: "basedpyright",
             command: "basedpyright-langserver".into(),
             args: vec!["--stdio".into()],
-            language: Language::Python,
+            language: Language::PYTHON,
             initialization_options: None,
             // PATH-only: the registered fallback for the few capabilities `ty`
             // doesn't advertise. croft provisions `ty`/`ruff` for Python; a user
@@ -140,7 +113,7 @@ impl ServerConfig {
             name: "pyright",
             command: "pyright-langserver".into(),
             args: vec!["--stdio".into()],
-            language: Language::Python,
+            language: Language::PYTHON,
             initialization_options: None,
             provision: None,
         }
@@ -151,7 +124,7 @@ impl ServerConfig {
             name: "ruff",
             command: "ruff".into(),
             args: vec!["server".into()],
-            language: Language::Python,
+            language: Language::PYTHON,
             initialization_options: None,
             // Ruff's linter LSP, installed from PyPI via uv alongside `ty`.
             provision: Some(crate::lsp::install::Provision::Uv {
@@ -167,7 +140,7 @@ impl ServerConfig {
             name: crate::lsp::install::VTSLS_SERVER_NAME,
             command: crate::lsp::install::VTSLS_SERVER_NAME.into(),
             args: vec!["--stdio".into()],
-            language: Language::TypeScript,
+            language: Language::TYPESCRIPT,
             initialization_options: None,
             // croft owns an npm-installed copy pinned for local/remote parity;
             // a globally-installed `vtsls` is the fallback.
@@ -184,7 +157,7 @@ impl ServerConfig {
             name: "typescript-language-server",
             command: "typescript-language-server".into(),
             args: vec!["--stdio".into()],
-            language: Language::TypeScript,
+            language: Language::TYPESCRIPT,
             initialization_options: None,
             provision: None,
         }
@@ -195,7 +168,7 @@ impl ServerConfig {
             name: "rust-analyzer",
             command: "rust-analyzer".into(),
             args: vec![],
-            language: Language::Rust,
+            language: Language::RUST,
             // No `cargo.targetDir` isolation: rust-analyzer shares the default
             // `target/`, reusing the warm build-script / proc-macro / dep
             // artifacts the user's own `cargo build` already produced, so the
@@ -213,7 +186,7 @@ impl ServerConfig {
             name: "gopls",
             command: "gopls".into(),
             args: vec!["serve".into()],
-            language: Language::Go,
+            language: Language::GO,
             initialization_options: None,
             provision: None,
         }
@@ -226,17 +199,17 @@ mod tests {
 
     #[test]
     fn from_extension_known() {
-        assert_eq!(Language::from_extension("py"), Some(Language::Python));
-        assert_eq!(Language::from_extension("PY"), Some(Language::Python));
-        assert_eq!(Language::from_extension("pyi"), Some(Language::Python));
-        assert_eq!(Language::from_extension("ts"), Some(Language::TypeScript));
-        assert_eq!(Language::from_extension("tsx"), Some(Language::Tsx));
-        assert_eq!(Language::from_extension("js"), Some(Language::JavaScript));
-        assert_eq!(Language::from_extension("mjs"), Some(Language::JavaScript));
-        assert_eq!(Language::from_extension("jsx"), Some(Language::Jsx));
-        assert_eq!(Language::from_extension("rs"), Some(Language::Rust));
-        assert_eq!(Language::from_extension("go"), Some(Language::Go));
-        assert_eq!(Language::from_extension("yml"), Some(Language::Yaml));
+        assert_eq!(Language::from_extension("py"), Some(Language::PYTHON));
+        assert_eq!(Language::from_extension("PY"), Some(Language::PYTHON));
+        assert_eq!(Language::from_extension("pyi"), Some(Language::PYTHON));
+        assert_eq!(Language::from_extension("ts"), Some(Language::TYPESCRIPT));
+        assert_eq!(Language::from_extension("tsx"), Some(Language::TSX));
+        assert_eq!(Language::from_extension("js"), Some(Language::JAVASCRIPT));
+        assert_eq!(Language::from_extension("mjs"), Some(Language::JAVASCRIPT));
+        assert_eq!(Language::from_extension("jsx"), Some(Language::JSX));
+        assert_eq!(Language::from_extension("rs"), Some(Language::RUST));
+        assert_eq!(Language::from_extension("go"), Some(Language::GO));
+        assert_eq!(Language::from_extension("yml"), Some(Language::YAML));
     }
 
     #[test]
@@ -247,8 +220,8 @@ mod tests {
 
     #[test]
     fn lsp_id_react_variants() {
-        assert_eq!(Language::Tsx.lsp_id(), "typescriptreact");
-        assert_eq!(Language::Jsx.lsp_id(), "javascriptreact");
+        assert_eq!(Language::TSX.lsp_id(), "typescriptreact");
+        assert_eq!(Language::JSX.lsp_id(), "javascriptreact");
     }
 
     #[test]
@@ -256,20 +229,20 @@ mod tests {
         // `from_lsp_id` is the inverse of `lsp_id`; an extension manifest names
         // languages by their wire id, so the two must never drift.
         for lang in [
-            Language::Python,
-            Language::TypeScript,
-            Language::Tsx,
-            Language::JavaScript,
-            Language::Jsx,
-            Language::Rust,
-            Language::Go,
-            Language::Json,
-            Language::Yaml,
-            Language::Toml,
-            Language::Bash,
-            Language::Markdown,
-            Language::Html,
-            Language::Css,
+            Language::PYTHON,
+            Language::TYPESCRIPT,
+            Language::TSX,
+            Language::JAVASCRIPT,
+            Language::JSX,
+            Language::RUST,
+            Language::GO,
+            Language::JSON,
+            Language::YAML,
+            Language::TOML,
+            Language::BASH,
+            Language::MARKDOWN,
+            Language::HTML,
+            Language::CSS,
         ] {
             assert_eq!(Language::from_lsp_id(lang.lsp_id()), Some(lang));
         }
@@ -282,7 +255,7 @@ mod tests {
         assert_eq!(c.name, "ty");
         assert_eq!(c.command, "ty");
         assert_eq!(c.args, vec!["server"]);
-        assert_eq!(c.language, Language::Python);
+        assert_eq!(c.language, Language::PYTHON);
         // Python servers are provisioned via uv (PyPI), so a fresh box gets
         // them with no manual install and no node dependency.
         assert_eq!(
@@ -307,7 +280,7 @@ mod tests {
         let c = ServerConfig::ruff();
         assert_eq!(c.command, "ruff");
         assert_eq!(c.args, vec!["server"]);
-        assert_eq!(c.language, Language::Python);
+        assert_eq!(c.language, Language::PYTHON);
     }
 
     #[test]
@@ -315,7 +288,7 @@ mod tests {
         let c = ServerConfig::vtsls();
         assert_eq!(c.command, "vtsls");
         assert_eq!(c.args, vec!["--stdio"]);
-        assert_eq!(c.language, Language::TypeScript);
+        assert_eq!(c.language, Language::TYPESCRIPT);
         // vtsls is npm-provisioned and version-pinned for local/remote parity.
         assert_eq!(
             c.provision,
@@ -341,7 +314,7 @@ mod tests {
         let c = ServerConfig::rust_analyzer();
         assert_eq!(c.command, "rust-analyzer");
         assert!(c.args.is_empty());
-        assert_eq!(c.language, Language::Rust);
+        assert_eq!(c.language, Language::RUST);
     }
 
     #[test]
@@ -370,6 +343,6 @@ mod tests {
         let c = ServerConfig::gopls();
         assert_eq!(c.command, "gopls");
         assert_eq!(c.args, vec!["serve"]);
-        assert_eq!(c.language, Language::Go);
+        assert_eq!(c.language, Language::GO);
     }
 }

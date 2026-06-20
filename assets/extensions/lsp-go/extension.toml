@@ -6,6 +6,11 @@ description = "Go language support via gopls (expected on PATH)."
 builtin = true
 api_version = 1
 
+[[languages]]
+id = "go"
+extensions = ["go"]
+root_markers = ["go.mod"]
+
 [[language_servers]]
 name = "gopls"
 command = "gopls"

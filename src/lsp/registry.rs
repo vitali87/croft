@@ -94,7 +94,7 @@ mod tests {
     fn empty_registry_returns_no_servers() {
         let r = ServerRegistry::new();
         assert!(r.for_extension("py").is_empty());
-        assert!(r.for_language(Language::Python).is_empty());
+        assert!(r.for_language(Language::PYTHON).is_empty());
     }
 
     #[test]
@@ -130,9 +130,9 @@ mod tests {
     #[test]
     fn register_appends_to_language() {
         let mut r = ServerRegistry::new();
-        r.register(Language::Python, ServerConfig::pyright());
-        r.register(Language::Python, ServerConfig::ruff());
-        assert_eq!(r.for_language(Language::Python).len(), 2);
+        r.register(Language::PYTHON, ServerConfig::pyright());
+        r.register(Language::PYTHON, ServerConfig::ruff());
+        assert_eq!(r.for_language(Language::PYTHON).len(), 2);
     }
 
     #[test]
@@ -143,7 +143,7 @@ mod tests {
         // manifest strings compare equal to the `&'static` literals by value.)
         let r = ServerRegistry::with_defaults();
         assert_eq!(
-            r.for_language(Language::Python),
+            r.for_language(Language::PYTHON),
             &[
                 ServerConfig::ty(),
                 ServerConfig::basedpyright(),
@@ -153,17 +153,17 @@ mod tests {
         // vtsls serves all four TS/JS languages; each key holds the identical
         // config (language field = TypeScript), as the old loop produced.
         for lang in [
-            Language::TypeScript,
-            Language::Tsx,
-            Language::JavaScript,
-            Language::Jsx,
+            Language::TYPESCRIPT,
+            Language::TSX,
+            Language::JAVASCRIPT,
+            Language::JSX,
         ] {
             assert_eq!(r.for_language(lang), &[ServerConfig::vtsls()]);
         }
         assert_eq!(
-            r.for_language(Language::Rust),
+            r.for_language(Language::RUST),
             &[ServerConfig::rust_analyzer()]
         );
-        assert_eq!(r.for_language(Language::Go), &[ServerConfig::gopls()]);
+        assert_eq!(r.for_language(Language::GO), &[ServerConfig::gopls()]);
     }
 }

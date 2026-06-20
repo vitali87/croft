@@ -5,6 +5,7 @@
 pub mod client;
 pub mod config;
 pub mod install;
+pub mod languages;
 pub mod log_file;
 pub mod manager;
 pub mod manifest;

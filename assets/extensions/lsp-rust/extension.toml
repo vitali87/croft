@@ -10,6 +10,11 @@ description = "Rust language support via rust-analyzer (expected on PATH)."
 builtin = true
 api_version = 1
 
+[[languages]]
+id = "rust"
+extensions = ["rs"]
+root_markers = ["Cargo.toml"]
+
 [[language_servers]]
 name = "rust-analyzer"
 command = "rust-analyzer"

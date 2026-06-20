@@ -16909,11 +16909,7 @@ fn is_rename_symbol_key(key: KeyEvent) -> bool {
 /// as `TypeScript`, so all four map together; every other language is its own
 /// family. Used to decide which open docs to re-open after a managed install.
 fn lsp_server_family(lang: crate::lsp::Language) -> crate::lsp::Language {
-    use crate::lsp::Language;
-    match lang {
-        Language::Tsx | Language::JavaScript | Language::Jsx => Language::TypeScript,
-        other => other,
-    }
+    lang.server_family()
 }
 
 /// True when `path`'s language is served by one of the just-installed servers,

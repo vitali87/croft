@@ -2414,21 +2414,7 @@ fn path_to_language(path: &Path) -> Option<Language> {
 /// (so basedpyright finds that project's `.venv`, rust-analyzer its `Cargo.toml`,
 /// etc.). An empty slice means "no per-project rooting" → use the workspace root.
 fn manifest_names(lang: Language) -> &'static [&'static str] {
-    match lang {
-        Language::Python => &[
-            "pyproject.toml",
-            "setup.py",
-            "setup.cfg",
-            "pyrightconfig.json",
-            ".venv",
-        ],
-        Language::Rust => &["Cargo.toml"],
-        Language::Go => &["go.mod"],
-        Language::TypeScript | Language::Tsx | Language::JavaScript | Language::Jsx => {
-            &["tsconfig.json", "jsconfig.json", "package.json"]
-        }
-        _ => &[],
-    }
+    lang.root_markers()
 }
 
 /// The project root a file's language server should be anchored at: the nearest
@@ -2594,7 +2580,7 @@ mod tests {
             name: "fake",
             command: "definitely-not-a-real-binary-zzzqqq".into(),
             args: vec![],
-            language: Language::Go,
+            language: Language::GO,
             initialization_options: None,
             provision: None,
         };
@@ -2606,7 +2592,7 @@ mod tests {
             name: "shell",
             command: "sh".into(),
             args: vec![],
-            language: Language::Bash,
+            language: Language::BASH,
             initialization_options: None,
             provision: None,
         };
@@ -2629,7 +2615,7 @@ mod tests {
             name: "rust-analyzer",
             command: "rust-analyzer".into(),
             args: vec![],
-            language: Language::Rust,
+            language: Language::RUST,
             initialization_options: None,
             provision: None,
         };
@@ -2688,7 +2674,7 @@ mod tests {
         std::fs::create_dir_all(svc.join("src/pkg")).unwrap();
         std::fs::write(svc.join("pyproject.toml"), b"[project]\n").unwrap();
         let file = svc.join("src/pkg/mod.py");
-        assert_eq!(project_root_for(&file, Language::Python, root), svc);
+        assert_eq!(project_root_for(&file, Language::PYTHON, root), svc);
     }
 
     #[test]
@@ -2698,7 +2684,7 @@ mod tests {
         let file = root.join("a/b/loose.py");
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
         // No pyproject anywhere up the tree → workspace root.
-        assert_eq!(project_root_for(&file, Language::Python, root), root);
+        assert_eq!(project_root_for(&file, Language::PYTHON, root), root);
     }
 
     #[test]
@@ -2710,11 +2696,11 @@ mod tests {
         // A Cargo.toml must not anchor a Python file; Python keeps walking to root.
         std::fs::write(sub.join("Cargo.toml"), b"[package]\n").unwrap();
         let file = sub.join("script.py");
-        assert_eq!(project_root_for(&file, Language::Python, root), root);
+        assert_eq!(project_root_for(&file, Language::PYTHON, root), root);
         // ...but it does anchor a Rust file.
         let rs = sub.join("src/main.rs");
         std::fs::create_dir_all(rs.parent().unwrap()).unwrap();
-        assert_eq!(project_root_for(&rs, Language::Rust, root), sub);
+        assert_eq!(project_root_for(&rs, Language::RUST, root), sub);
     }
 
     #[test]
