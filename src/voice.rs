@@ -1,0 +1,261 @@
+//! Push-to-talk voice input for the Termux on-screen keyboard.
+//!
+//! croft's OSK replaces Android's native soft keyboard (Termux mouse tracking
+//! suppresses it), which also removes the keyboard's mic button. This module
+//! restores voice dictation by delegating to `termux-speech-to-text` from the
+//! `termux-api` package, which drives Android's system `SpeechRecognizer` (the
+//! same engine Gboard's mic uses). croft never captures audio or ships a model
+//! itself, mirroring how it delegates directory ranking to the host `zoxide`.
+//!
+//! The recognition lifecycle is owned by Android: the recognizer stops on
+//! end-of-speech (silence) or a timeout, with no CLI "stop now". Push-to-talk
+//! is therefore approximated: the mic press starts a session, the release kills
+//! the client process, and whatever transcript has been recognized so far is
+//! injected once. `-p` is used so a partial hypothesis is available to grab on
+//! an early release; only the final line is ever injected, so it still reads as
+//! a single insert (true live partials are impossible upstream, see
+//! termux-api-package#137 which buffers progressive output).
+
+use std::io::BufRead;
+use std::path::PathBuf;
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::mpsc::Sender;
+use std::sync::{Arc, Mutex};
+use std::thread;
+
+use crate::lsp::log_file;
+
+/// The Termux:API CLI that fronts Android's `SpeechRecognizer`.
+const BINARY: &str = "termux-speech-to-text";
+
+/// Installed on Termux from the bootstrap's `pkg`; provides `BINARY` in
+/// `$PREFIX/bin` (always on PATH). The Termux:API *app* (APK) must also be
+/// present for the command to actually reach Android; a missing app surfaces as
+/// a runtime failure, not something `pkg` can fix.
+const TERMUX_INSTALL_PKG: &str = "pkg install -y termux-api";
+
+/// Whether the host can do voice input at all, and if not, why.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Availability {
+    /// Termux with `termux-speech-to-text` present: good to go.
+    Ready,
+    /// Not running under Termux; voice input is Termux-only.
+    NeedsTermux,
+    /// Termux, but the `termux-api` package is not installed yet.
+    NeedsApi,
+}
+
+/// Outcome of one push-to-talk session, delivered to the app's per-tick drain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VoiceMsg {
+    /// Recognized text to inject into the focused pane.
+    Transcript(String),
+    /// The session ended without recognizing anything.
+    Empty,
+    /// The session could not run (spawn error, recognizer missing, ...).
+    Failed(String),
+}
+
+/// True while a recognition session is live; drives the mic key's armed glow
+/// and the status-line "Listening…" hint. A process-global flag so the OSK
+/// render path can read it without app plumbing (one relaxed atomic load).
+static LISTENING: AtomicBool = AtomicBool::new(false);
+
+pub fn is_listening() -> bool {
+    LISTENING.load(Ordering::Relaxed)
+}
+
+fn set_listening(on: bool) {
+    LISTENING.store(on, Ordering::Relaxed);
+}
+
+/// Lifecycle of the one background `termux-api` install attempt per process,
+/// surfaced so the mic key can tell the user to wait / retry. Mirrors the
+/// zoxide installer's state machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallState {
+    Idle = 0,
+    Running = 1,
+    Done = 2,
+    Failed = 3,
+}
+
+static INSTALL_STATE: AtomicU8 = AtomicU8::new(0);
+
+fn set_install_state(state: InstallState) {
+    INSTALL_STATE.store(state as u8, Ordering::Relaxed);
+}
+
+pub fn install_state() -> InstallState {
+    match INSTALL_STATE.load(Ordering::Relaxed) {
+        1 => InstallState::Running,
+        2 => InstallState::Done,
+        3 => InstallState::Failed,
+        _ => InstallState::Idle,
+    }
+}
+
+/// `$PREFIX/bin/<BINARY>` existence (cheap, no subprocess), with a `command -v`
+/// fallback for non-standard layouts.
+fn binary_present() -> bool {
+    if let Some(prefix) = std::env::var_os("PREFIX")
+        && PathBuf::from(prefix).join("bin").join(BINARY).exists()
+    {
+        return true;
+    }
+    Command::new("sh")
+        .arg("-c")
+        .arg(format!("command -v {BINARY}"))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Whether voice input is usable here, and why not when it isn't.
+pub fn availability() -> Availability {
+    if !crate::iterm2_inline::detect_termux() {
+        Availability::NeedsTermux
+    } else if binary_present() {
+        Availability::Ready
+    } else {
+        Availability::NeedsApi
+    }
+}
+
+/// Install `termux-api` on a detached thread so the mic press never blocks the
+/// UI; the user retries the mic once it lands. Best-effort and idempotent: a
+/// second press while `Running` is a no-op at the call site.
+pub fn ensure_api_installed_in_background() {
+    if matches!(install_state(), InstallState::Running) {
+        return;
+    }
+    set_install_state(InstallState::Running);
+    thread::spawn(|| {
+        match Command::new("sh")
+            .arg("-c")
+            .arg(TERMUX_INSTALL_PKG)
+            .output()
+        {
+            Ok(out) if out.status.success() => {
+                log_file::log(&format!("voice: `{TERMUX_INSTALL_PKG}` succeeded"))
+            }
+            Ok(out) => log_file::log(&format!(
+                "voice: `{TERMUX_INSTALL_PKG}` exited {}: {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            )),
+            Err(e) => log_file::log(&format!(
+                "voice: `{TERMUX_INSTALL_PKG}` could not start: {e}"
+            )),
+        }
+        if binary_present() {
+            set_install_state(InstallState::Done);
+        } else {
+            set_install_state(InstallState::Failed);
+        }
+    });
+}
+
+/// Handle to a live recognition session: lets the app kill the client process
+/// when the user releases the mic. Dropping it without `stop()` leaves the
+/// session to finish on Android's own end-of-speech detection.
+pub struct VoiceHandle {
+    child: Arc<Mutex<Option<Child>>>,
+}
+
+impl VoiceHandle {
+    /// Stop recognition now (mic release). Killing the client closes its stdout,
+    /// so the reader thread finalizes and reports the best transcript it has.
+    pub fn stop(&self) {
+        if let Ok(mut guard) = self.child.lock()
+            && let Some(child) = guard.as_mut()
+        {
+            let _ = child.kill();
+        }
+    }
+}
+
+/// Start a push-to-talk session. Spawns `termux-speech-to-text -p`, reads its
+/// streamed hypotheses on a background thread, and on stream end sends the last
+/// non-empty line as the transcript over `tx`. Returns a handle the app keeps
+/// to stop the session on release. On a spawn failure the session never opens
+/// and `VoiceMsg::Failed` is sent.
+pub fn start(tx: Sender<VoiceMsg>) -> VoiceHandle {
+    set_listening(true);
+    let mut child = match Command::new(BINARY)
+        .arg("-p")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            set_listening(false);
+            log_file::log(&format!("voice: could not start `{BINARY}`: {e}"));
+            let _ = tx.send(VoiceMsg::Failed(format!("voice input unavailable: {e}")));
+            return VoiceHandle {
+                child: Arc::new(Mutex::new(None)),
+            };
+        }
+    };
+    let stdout = child.stdout.take();
+    let shared: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(Some(child)));
+    let reader_shared = Arc::clone(&shared);
+    thread::spawn(move || {
+        let mut latest = String::new();
+        if let Some(stdout) = stdout {
+            // Each line is Android's full best-guess-so-far; keep the last
+            // non-empty one as the transcript (the final result on a natural
+            // stop, or the latest partial on an early release-kill).
+            for line in std::io::BufReader::new(stdout)
+                .lines()
+                .map_while(Result::ok)
+            {
+                let trimmed = line.trim();
+                if !trimmed.is_empty() {
+                    latest = trimmed.to_string();
+                }
+            }
+        }
+        if let Ok(mut guard) = reader_shared.lock()
+            && let Some(child) = guard.as_mut()
+        {
+            let _ = child.wait();
+        }
+        set_listening(false);
+        let msg = if latest.is_empty() {
+            VoiceMsg::Empty
+        } else {
+            VoiceMsg::Transcript(latest)
+        };
+        let _ = tx.send(msg);
+    });
+    VoiceHandle { child: shared }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn install_state_round_trips_through_the_atomic() {
+        set_install_state(InstallState::Running);
+        assert_eq!(install_state(), InstallState::Running);
+        set_install_state(InstallState::Done);
+        assert_eq!(install_state(), InstallState::Done);
+        set_install_state(InstallState::Idle);
+        assert_eq!(install_state(), InstallState::Idle);
+    }
+
+    #[test]
+    fn listening_flag_round_trips() {
+        set_listening(true);
+        assert!(is_listening());
+        set_listening(false);
+        assert!(!is_listening());
+    }
+}

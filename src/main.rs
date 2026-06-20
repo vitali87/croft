@@ -24,6 +24,7 @@ mod termux;
 mod theme;
 mod update_watch;
 mod vim;
+mod voice;
 mod widgets;
 mod zoxide;
 

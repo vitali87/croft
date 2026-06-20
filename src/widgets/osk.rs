@@ -119,6 +119,11 @@ pub enum OskKey {
     Symbols,
     /// Toggle the split (two thumb clusters) layout; persisted by the app.
     SplitToggle,
+    /// Push-to-talk microphone: press starts speech recognition (Termux only,
+    /// via `termux-speech-to-text`), release stops it and injects the
+    /// transcript. Handled entirely by the app, never synthesized into a
+    /// `KeyEvent` here.
+    Voice,
     /// The split-mode center gap: never tappable, never painted.
     Gap,
     /// Dismiss the keyboard (handled by the app, never synthesized).
@@ -194,6 +199,11 @@ fn split_at(mut row: Vec<KeySlot>, at: usize) -> Vec<KeySlot> {
 /// ten F-keys render visibly narrower than the letters below.
 const FN_WEIGHT: u16 = 2;
 
+/// Nerd Font FontAwesome microphone glyph for the push-to-talk key. Termux
+/// ships Meslo Nerd Font (auto-installed on first launch), so the PUA glyph
+/// renders there; `short` falls back to "mic" on cramped bands.
+const MIC_LABEL: &str = "\u{f130}";
+
 /// Build the ten F1..F10 slots for the top strip. They carry a small weight
 /// so they stay narrow, and are uncapped so they soak up the strip's slack
 /// (every other strip key is capped, so without an uncapped key the row could
@@ -249,6 +259,11 @@ fn rows_for(layer: OskLayer, caps: bool, split: bool) -> Vec<Vec<KeySlot>> {
             slot("ctrl", "^", OskKey::Ctrl, 4, 6),
             slot("alt", "", OskKey::Alt, 4, 6),
         ];
+        // Push-to-talk mic, immediately right of the left alt. It carries a
+        // fixed weight like ctrl/alt, so the uncapped space bar water-fills
+        // around it: the mic takes its cells from the space bar (the left
+        // space half in split, where it sits in the left thumb cluster).
+        r.push(slot(MIC_LABEL, "mic", OskKey::Voice, 4, 6));
         r.push(slot(" ", "", OskKey::Char(' '), 12, UNCAPPED));
         if split {
             // Both thumbs get a space bar, Gboard-style.
@@ -559,7 +574,10 @@ impl Osk {
                 self.split = !self.split;
                 None
             }
-            OskKey::Gap | OskKey::Hide => None,
+            // Voice is press-and-hold: the app starts recognition on the
+            // mouse-down and stops it on the mouse-up, so the tap itself emits
+            // nothing.
+            OskKey::Gap | OskKey::Hide | OskKey::Voice => None,
             // The edge arrows flip with shift/caps: Left<->Right, Up<->Down.
             // A one-shot Upper layer is consumed by the tap (like a character),
             // so the next key returns to lowercase; caps lock holds.
@@ -640,6 +658,10 @@ impl Osk {
             OskKey::Shift => self.shifted(),
             OskKey::Symbols => self.layer == OskLayer::Symbols,
             OskKey::SplitToggle => self.split,
+            // The mic glows for the whole press-and-hold window. Listening
+            // state is a process-global flag (like the install-state atomics),
+            // so the band reads it directly without app plumbing.
+            OskKey::Voice => crate::voice::is_listening(),
             _ => false,
         }
     }
@@ -830,6 +852,7 @@ mod tests {
             OskKey::Hide,
             OskKey::ArrowLR,
             OskKey::ArrowUD,
+            OskKey::Voice,
         ] {
             assert!(osk.rect_for(k).is_some(), "missing key {k:?}");
         }
@@ -873,6 +896,71 @@ mod tests {
             shift.x < z.x && m.x < bksp.x,
             "shift left of z, backspace right of m"
         );
+    }
+
+    #[test]
+    fn mic_sits_immediately_right_of_the_left_alt_in_both_layouts() {
+        // Merged and split bottom rows both flow through `bottom()`, so the
+        // mic lands right after the left alt in each. (The left alt is the
+        // first `Alt`; the right alt flanks the space on the other side.)
+        for split in [false, true] {
+            let rows = rows_for(OskLayer::Lower, false, split);
+            let bottom = rows.last().expect("bottom row");
+            let alt_idx = bottom
+                .iter()
+                .position(|s| s.key == OskKey::Alt)
+                .expect("left alt");
+            assert_eq!(
+                bottom[alt_idx + 1].key,
+                OskKey::Voice,
+                "mic must sit immediately right of the left alt (split={split})"
+            );
+        }
+    }
+
+    #[test]
+    fn mic_is_in_the_left_thumb_cluster_when_split() {
+        // The split gap divides the two thumb clusters; the mic must fall in
+        // the left one (before the gap) so it eats into the left space half.
+        let rows = rows_for(OskLayer::Lower, false, true);
+        let bottom = rows.last().expect("bottom row");
+        let mic_idx = bottom
+            .iter()
+            .position(|s| s.key == OskKey::Voice)
+            .expect("mic");
+        let gap_idx = bottom
+            .iter()
+            .position(|s| s.key == OskKey::Gap)
+            .expect("split gap");
+        assert!(
+            mic_idx < gap_idx,
+            "mic must be in the left thumb cluster, before the split gap"
+        );
+    }
+
+    #[test]
+    fn mic_sits_between_the_left_alt_and_the_space_bar_on_screen() {
+        let mut osk = Osk::new();
+        osk.layout(band());
+        let alt = osk.rect_for(OskKey::Alt).expect("left alt"); // first match
+        let mic = osk.rect_for(OskKey::Voice).expect("mic");
+        let space = osk.rect_for(OskKey::Char(' ')).expect("space");
+        assert_eq!(
+            mic.y, space.y,
+            "mic rides the bottom row with the space bar"
+        );
+        assert!(
+            alt.x < mic.x && mic.x < space.x,
+            "mic renders between the left alt and the space bar"
+        );
+    }
+
+    #[test]
+    fn tapping_the_mic_emits_no_key_event() {
+        // Voice is push-to-talk, handled by the app on press/release; the tap
+        // itself must not synthesize a keystroke.
+        let mut osk = Osk::new();
+        assert_eq!(osk.tap(OskKey::Voice), None);
     }
 
     #[test]
@@ -1062,7 +1150,10 @@ mod tests {
             // Comma is wedged between the layer toggle and the space bar,
             // right of the toggle; period between the space bar and Enter,
             // left of Enter. No other key sits between toggle and comma.
-            assert!(comma.x > toggle.x, "comma sits right of the ?123/abc toggle");
+            assert!(
+                comma.x > toggle.x,
+                "comma sits right of the ?123/abc toggle"
+            );
             assert!(comma.x < space.x, "comma stays left of the space bar");
             assert!(period.x > space.x, "period stays right of the space bar");
             assert!(period.x < enter.x, "period sits left of Enter");

@@ -1113,6 +1113,12 @@ pub struct App {
     /// The workspace root DEPENDENCIES was detected/fetched for, so detection
     /// and the fetch fire once per root (re-fired by Make Root / re-root).
     deps_fetched: Option<PathBuf>,
+    /// Push-to-talk voice input (Termux OSK mic). The worker streams its
+    /// transcript over this channel; `voice_handle` lets the mic release kill
+    /// the in-flight recognizer.
+    voice_rx: std::sync::mpsc::Receiver<crate::voice::VoiceMsg>,
+    voice_tx: std::sync::mpsc::Sender<crate::voice::VoiceMsg>,
+    voice_handle: Option<crate::voice::VoiceHandle>,
     pub editor: EditorTabs,
     /// The secondary editor group, shown side by side with `editor` when
     /// the user splits the pane (`Cmd+\`). `None` = not split. Invariant:
@@ -1779,6 +1785,7 @@ impl App {
         let disabled_extensions = loaded_prefs.disabled_extensions.clone();
         let (timeline_tx, timeline_rx) = std::sync::mpsc::channel();
         let (deps_tx, deps_rx) = std::sync::mpsc::channel();
+        let (voice_tx, voice_rx) = std::sync::mpsc::channel();
         let editor = EditorTabs::new();
         let term = PtyTerminal::new(&root).context("spawning terminal")?;
 
@@ -1836,6 +1843,9 @@ impl App {
             deps_rx,
             deps_tx,
             deps_fetched: None,
+            voice_rx,
+            voice_tx,
+            voice_handle: None,
             editor,
             editor_split: None,
             split_focus_left: true,
@@ -13610,6 +13620,75 @@ impl App {
     /// the keyboard; character/named keys synthesize a `KeyEvent` and feed
     /// it through `handle_key`, so it reaches whatever currently owns the
     /// keyboard focus (editor, terminal, search, or an open modal).
+    /// Begin a push-to-talk session on a mic press. Gated on availability:
+    /// only Termux with `termux-speech-to-text` can listen; a missing
+    /// `termux-api` package kicks off a background install and asks the user to
+    /// retry, and a non-Termux host just explains it is Termux-only.
+    fn start_voice_input(&mut self) {
+        if self.voice_handle.is_some() {
+            return;
+        }
+        match crate::voice::availability() {
+            crate::voice::Availability::Ready => {
+                self.voice_handle = Some(crate::voice::start(self.voice_tx.clone()));
+                self.status = String::from("Listening… (release the mic to insert)");
+            }
+            crate::voice::Availability::NeedsApi => {
+                crate::voice::ensure_api_installed_in_background();
+                self.status = String::from(
+                    "Installing Termux:API for voice input… hold the mic again once it finishes",
+                );
+            }
+            crate::voice::Availability::NeedsTermux => {
+                self.status = String::from("Voice input is available only on Termux");
+            }
+        }
+    }
+
+    /// End the active session (mic release). The worker reports its transcript
+    /// when its stdout closes; `drain_voice` injects it and clears the handle,
+    /// so the handle is intentionally left in place until then.
+    fn stop_voice_input(&mut self) {
+        if let Some(handle) = self.voice_handle.as_ref() {
+            handle.stop();
+        }
+    }
+
+    /// Per-tick: deliver a finished voice session's result. Returns whether the
+    /// next frame should redraw (transcript injected or a status message set).
+    fn drain_voice(&mut self) -> bool {
+        let mut changed = false;
+        while let Ok(msg) = self.voice_rx.try_recv() {
+            changed = true;
+            self.voice_handle = None;
+            match msg {
+                crate::voice::VoiceMsg::Transcript(text) => self.inject_voice_text(&text),
+                crate::voice::VoiceMsg::Empty => self.status = String::from("No speech detected"),
+                crate::voice::VoiceMsg::Failed(e) => self.status = e,
+            }
+        }
+        changed
+    }
+
+    /// Type a recognized transcript into whatever owns keyboard focus by
+    /// replaying it as synthetic key events through `handle_key` - the same
+    /// path an OSK key tap takes - so it reaches the editor, terminal, or an
+    /// open modal without pane-specific wiring.
+    fn inject_voice_text(&mut self, text: &str) {
+        for ch in text.chars() {
+            let code = if ch == '\n' {
+                KeyCode::Enter
+            } else {
+                KeyCode::Char(ch)
+            };
+            if let Err(e) = self.handle_key(KeyEvent::new(code, KeyModifiers::NONE)) {
+                self.status = format!("Voice input failed: {e}");
+                return;
+            }
+        }
+        self.status = String::new();
+    }
+
     fn handle_osk_mouse(&mut self, m: MouseEvent) {
         if !matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
             return;
@@ -13634,14 +13713,29 @@ impl App {
         if key == crate::widgets::osk::OskKey::SplitToggle {
             let _ = crate::prefs::save_osk_split(osk.split);
         }
+        // Mic is push-to-talk: the press starts recognition (deferred until the
+        // `osk` borrow ends so `start_voice_input` can take `&mut self`); the
+        // release is caught in `handle_mouse` so lifting the finger anywhere
+        // stops it. `tap` returned None for it, so nothing reaches `handle_key`.
+        let is_voice = key == crate::widgets::osk::OskKey::Voice;
         if let Some(ev) = ev
             && let Err(e) = self.handle_key(ev)
         {
             self.status = format!("On-screen key failed: {e}");
         }
+        if is_voice {
+            self.start_voice_input();
+        }
     }
 
     fn handle_mouse(&mut self, m: MouseEvent) {
+        // Releasing the mouse ends a push-to-talk session no matter where the
+        // finger lifts (it may have slid off the mic key), so this outranks the
+        // OSK-band gate below. Only meaningful while a session is live.
+        if self.voice_handle.is_some() && matches!(m.kind, MouseEventKind::Up(MouseButton::Left)) {
+            self.stop_voice_input();
+            return;
+        }
         // On-screen keyboard taps outrank every other gate - including the
         // modal overlays - because the OSK is how Termux users type into
         // those modals. Its band is laid out disjoint from all panes, so
@@ -18660,6 +18754,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let diagnostics_changed = app.drain_lsp_diagnostics();
         let progress_changed = app.drain_lsp_progress();
         let dap_changed = app.poll_dap();
+        let voice_changed = app.drain_voice();
         // Surface managed language-server install progress in the status bar so
         // the background work (which can take a few seconds) is visible.
         let install_status_changed = match crate::lsp::install::take_status() {
@@ -18703,6 +18798,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             || semantic_changed
             || diagnostics_changed
             || progress_changed
+            || voice_changed
             || outline_sync_changed
             || outline_changed
             || explorer_panels_changed
