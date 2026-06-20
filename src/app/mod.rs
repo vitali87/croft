@@ -13624,6 +13624,17 @@ impl App {
     /// only Termux with `termux-speech-to-text` can listen; a missing
     /// `termux-api` package kicks off a background install and asks the user to
     /// retry, and a non-Termux host just explains it is Termux-only.
+    /// Tap the mic: stop a live session, or start a new one. Termux hijacks any
+    /// finger hold for text selection, so the gesture is a tap toggle rather
+    /// than push-to-talk.
+    fn toggle_voice_input(&mut self) {
+        if self.voice_handle.is_some() {
+            self.stop_voice_input();
+        } else {
+            self.start_voice_input();
+        }
+    }
+
     fn start_voice_input(&mut self) {
         if self.voice_handle.is_some() {
             return;
@@ -13631,12 +13642,12 @@ impl App {
         match crate::voice::availability() {
             crate::voice::Availability::Ready => {
                 self.voice_handle = Some(crate::voice::start(self.voice_tx.clone()));
-                self.status = String::from("Listening… (release the mic to insert)");
+                self.status = String::from("Listening… (tap the mic again to stop)");
             }
             crate::voice::Availability::NeedsApi => {
                 crate::voice::ensure_api_installed_in_background();
                 self.status = String::from(
-                    "Installing Termux:API for voice input… hold the mic again once it finishes",
+                    "Installing Termux:API for voice input… tap the mic again once it finishes",
                 );
             }
             crate::voice::Availability::NeedsTermux => {
@@ -13645,9 +13656,9 @@ impl App {
         }
     }
 
-    /// End the active session (mic release). The worker reports its transcript
-    /// when its stdout closes; `drain_voice` injects it and clears the handle,
-    /// so the handle is intentionally left in place until then.
+    /// Stop the active session (a second mic tap). The worker reports its
+    /// transcript when its stdout closes; `drain_voice` injects it and clears
+    /// the handle, so the handle is intentionally left in place until then.
     fn stop_voice_input(&mut self) {
         if let Some(handle) = self.voice_handle.as_ref() {
             handle.stop();
@@ -13713,10 +13724,13 @@ impl App {
         if key == crate::widgets::osk::OskKey::SplitToggle {
             let _ = crate::prefs::save_osk_split(osk.split);
         }
-        // Mic is push-to-talk: the press starts recognition (deferred until the
-        // `osk` borrow ends so `start_voice_input` can take `&mut self`); the
-        // release is caught in `handle_mouse` so lifting the finger anywhere
-        // stops it. `tap` returned None for it, so nothing reaches `handle_key`.
+        // Mic is tap-to-toggle, not push-to-talk: Termux turns any finger hold
+        // into its own text-selection gesture (hardcoded in TerminalView, not
+        // suppressible from a TUI), so a hold can never reach croft as a
+        // sustained press. A quick tap is the only touch Termux forwards as a
+        // click, so each tap toggles listening; recognition also auto-stops on
+        // silence. Deferred until the `osk` borrow ends so the toggle can take
+        // `&mut self`. `tap` returned None for it, so nothing reaches handle_key.
         let is_voice = key == crate::widgets::osk::OskKey::Voice;
         if let Some(ev) = ev
             && let Err(e) = self.handle_key(ev)
@@ -13724,18 +13738,11 @@ impl App {
             self.status = format!("On-screen key failed: {e}");
         }
         if is_voice {
-            self.start_voice_input();
+            self.toggle_voice_input();
         }
     }
 
     fn handle_mouse(&mut self, m: MouseEvent) {
-        // Releasing the mouse ends a push-to-talk session no matter where the
-        // finger lifts (it may have slid off the mic key), so this outranks the
-        // OSK-band gate below. Only meaningful while a session is live.
-        if self.voice_handle.is_some() && matches!(m.kind, MouseEventKind::Up(MouseButton::Left)) {
-            self.stop_voice_input();
-            return;
-        }
         // On-screen keyboard taps outrank every other gate - including the
         // modal overlays - because the OSK is how Termux users type into
         // those modals. Its band is laid out disjoint from all panes, so

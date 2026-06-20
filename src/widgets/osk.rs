@@ -119,10 +119,11 @@ pub enum OskKey {
     Symbols,
     /// Toggle the split (two thumb clusters) layout; persisted by the app.
     SplitToggle,
-    /// Push-to-talk microphone: press starts speech recognition (Termux only,
-    /// via `termux-speech-to-text`), release stops it and injects the
-    /// transcript. Handled entirely by the app, never synthesized into a
-    /// `KeyEvent` here.
+    /// Microphone (Termux only, via `termux-speech-to-text`): a tap toggles
+    /// speech recognition, and the transcript is injected when it stops. A tap
+    /// rather than push-to-talk because Termux turns any finger hold into its
+    /// own text selection. Handled entirely by the app, never synthesized into
+    /// a `KeyEvent` here.
     Voice,
     /// The split-mode center gap: never tappable, never painted.
     Gap,
@@ -574,9 +575,8 @@ impl Osk {
                 self.split = !self.split;
                 None
             }
-            // Voice is press-and-hold: the app starts recognition on the
-            // mouse-down and stops it on the mouse-up, so the tap itself emits
-            // nothing.
+            // Voice toggles recognition at the app level (tap on, tap off), so
+            // the tap itself emits no keystroke.
             OskKey::Gap | OskKey::Hide | OskKey::Voice => None,
             // The edge arrows flip with shift/caps: Left<->Right, Up<->Down.
             // A one-shot Upper layer is consumed by the tap (like a character),
@@ -658,9 +658,10 @@ impl Osk {
             OskKey::Shift => self.shifted(),
             OskKey::Symbols => self.layer == OskLayer::Symbols,
             OskKey::SplitToggle => self.split,
-            // The mic glows for the whole press-and-hold window. Listening
-            // state is a process-global flag (like the install-state atomics),
-            // so the band reads it directly without app plumbing.
+            // The mic glows while a recognition session is live (tap on, tap
+            // off). Listening state is a process-global flag (like the
+            // install-state atomics), so the band reads it directly without app
+            // plumbing.
             OskKey::Voice => crate::voice::is_listening(),
             _ => false,
         }

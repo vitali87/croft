@@ -7,14 +7,16 @@
 //! same engine Gboard's mic uses). croft never captures audio or ships a model
 //! itself, mirroring how it delegates directory ranking to the host `zoxide`.
 //!
-//! The recognition lifecycle is owned by Android: the recognizer stops on
-//! end-of-speech (silence) or a timeout, with no CLI "stop now". Push-to-talk
-//! is therefore approximated: the mic press starts a session, the release kills
-//! the client process, and whatever transcript has been recognized so far is
-//! injected once. `-p` is used so a partial hypothesis is available to grab on
-//! an early release; only the final line is ever injected, so it still reads as
-//! a single insert (true live partials are impossible upstream, see
-//! termux-api-package#137 which buffers progressive output).
+//! The mic is a tap toggle, not push-to-talk: Termux turns any finger hold into
+//! its own text-selection gesture (hardcoded in TerminalView, unsuppressible
+//! from a TUI), so a sustained press can never reach croft. A first tap starts
+//! a session; a second tap kills the client process. The recognizer also stops
+//! on its own at end-of-speech (silence) or a timeout, since Android owns the
+//! lifecycle and exposes no CLI "stop now". Either way the reader thread reports
+//! the last recognized line once. `-p` is used so a partial hypothesis is
+//! available to grab if the user stops early; only the final line is ever
+//! injected, so it reads as a single insert (true live partials are impossible
+//! upstream, see termux-api-package#137 which buffers progressive output).
 
 use std::io::BufRead;
 use std::path::PathBuf;
@@ -160,15 +162,15 @@ pub fn ensure_api_installed_in_background() {
 }
 
 /// Handle to a live recognition session: lets the app kill the client process
-/// when the user releases the mic. Dropping it without `stop()` leaves the
-/// session to finish on Android's own end-of-speech detection.
+/// on a second mic tap. Dropping it without `stop()` leaves the session to
+/// finish on Android's own end-of-speech detection.
 pub struct VoiceHandle {
     child: Arc<Mutex<Option<Child>>>,
 }
 
 impl VoiceHandle {
-    /// Stop recognition now (mic release). Killing the client closes its stdout,
-    /// so the reader thread finalizes and reports the best transcript it has.
+    /// Stop recognition now (a second mic tap). Killing the client closes its
+    /// stdout, so the reader thread finalizes and reports the best transcript.
     pub fn stop(&self) {
         if let Ok(mut guard) = self.child.lock()
             && let Some(child) = guard.as_mut()
@@ -178,11 +180,11 @@ impl VoiceHandle {
     }
 }
 
-/// Start a push-to-talk session. Spawns `termux-speech-to-text -p`, reads its
+/// Start a recognition session. Spawns `termux-speech-to-text -p`, reads its
 /// streamed hypotheses on a background thread, and on stream end sends the last
 /// non-empty line as the transcript over `tx`. Returns a handle the app keeps
-/// to stop the session on release. On a spawn failure the session never opens
-/// and `VoiceMsg::Failed` is sent.
+/// to stop the session on a second mic tap. On a spawn failure the session
+/// never opens and `VoiceMsg::Failed` is sent.
 pub fn start(tx: Sender<VoiceMsg>) -> VoiceHandle {
     set_listening(true);
     let mut child = match Command::new(BINARY)
