@@ -11680,7 +11680,21 @@ impl App {
         // is plumbed (set by the local-croft parent over the SSH
         // session) and the paste shape is path-like, request a reverse
         // pull through the relay.
-        if self.drop_relay_active() && self.sidebar_view == SidebarView::Explorer {
+        //
+        // Gate on `focus == Pane::Tree` exactly like the strict branch
+        // above. parse_foreign_dropped_paths can't require the path to
+        // exist (it lives on the user's local box, not here), so it
+        // matches *any* absolute-path-shaped token. Without the focus
+        // guard, an ordinary text paste into the terminal or editor that
+        // merely contains a `/...` token (a shell command, a code
+        // snippet, a bare path) gets hijacked into a relay pull that has
+        // no local file to fetch — surfacing as "Drop relay failed …"
+        // and swallowing the paste. Seen on remote sessions opened from
+        // Termux where pasting into the terminal kept failing.
+        if self.drop_relay_active()
+            && self.sidebar_view == SidebarView::Explorer
+            && self.focus == Pane::Tree
+        {
             let foreign = parse_foreign_dropped_paths(s);
             if !foreign.is_empty() {
                 self.request_remote_pulls(&foreign);
