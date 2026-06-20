@@ -1,6 +1,18 @@
 use std::collections::HashMap;
 
 use crate::lsp::config::{Language, ServerConfig};
+use crate::lsp::manifest;
+
+/// Bundled (first-party) extension manifests, embedded so they ship in the
+/// binary and load identically on every host. These are the same declarative
+/// `extension.toml` format a third-party extension uses; the language servers
+/// they declare reproduce the configs `with_defaults` used to hardcode.
+const BUNDLED_MANIFESTS: &[&str] = &[
+    include_str!("../../assets/extensions/lsp-python/extension.toml"),
+    include_str!("../../assets/extensions/lsp-typescript/extension.toml"),
+    include_str!("../../assets/extensions/lsp-rust/extension.toml"),
+    include_str!("../../assets/extensions/lsp-go/extension.toml"),
+];
 
 pub struct ServerRegistry {
     by_language: HashMap<Language, Vec<ServerConfig>>,
@@ -13,31 +25,35 @@ impl ServerRegistry {
         }
     }
 
+    /// Build the registry from the bundled extension manifests. The manifests
+    /// encode the same policy the hardcoded version did: ty (Astral) is
+    /// registered first (priority 0) so every per-capability selector picks it
+    /// for the features it advertises (completion, hover, definition,
+    /// declaration, type-definition, references, rename, semantic tokens,
+    /// diagnostics) — ty answers in tens of ms even on a huge cold workspace
+    /// where basedpyright pays a slow whole-tree enumeration. basedpyright
+    /// (priority 1) is the fallback for what ty doesn't advertise yet
+    /// (go-to-implementation, inlay hints); ruff (priority 2) lints. Servers are
+    /// registered in ascending priority so the registry's first-registered-wins
+    /// rule matches that policy.
     pub fn with_defaults() -> Self {
-        let mut r = Self::new();
-        // ty (Astral) first: every per-capability selector picks the first
-        // registered server that advertises the capability, so ty handles all
-        // the type-aware LSP features it supports (completion, hover,
-        // definition, declaration, type-definition, references, rename,
-        // semantic tokens, diagnostics). ty is a fast incremental Rust server
-        // that answers in tens of ms even on a huge cold workspace, where
-        // basedpyright pays a slow whole-tree enumeration first. basedpyright
-        // stays registered as the fallback for the capabilities ty does not
-        // yet advertise (go-to-implementation, inlay hints). ruff spawns for
-        // lint diagnostics.
-        r.register(Language::Python, ServerConfig::ty());
-        r.register(Language::Python, ServerConfig::basedpyright());
-        r.register(Language::Python, ServerConfig::ruff());
-        for lang in [
-            Language::TypeScript,
-            Language::Tsx,
-            Language::JavaScript,
-            Language::Jsx,
-        ] {
-            r.register(lang, ServerConfig::vtsls());
+        Self::from_manifest_sources(BUNDLED_MANIFESTS)
+    }
+
+    /// Build a registry from a set of `extension.toml` sources. Servers are
+    /// registered per language in ascending `priority` (stable within a
+    /// priority, so a manifest's declaration order breaks ties).
+    pub fn from_manifest_sources(sources: &[&str]) -> Self {
+        let mut entries: Vec<manifest::ServerEntry> = Vec::new();
+        for src in sources {
+            let parsed = manifest::parse(src).expect("bundled manifest must parse");
+            entries.extend(manifest::entries(&parsed));
         }
-        r.register(Language::Rust, ServerConfig::rust_analyzer());
-        r.register(Language::Go, ServerConfig::gopls());
+        entries.sort_by_key(|e| e.priority);
+        let mut r = Self::new();
+        for entry in entries {
+            r.register(entry.language, entry.config);
+        }
         r
     }
 
@@ -117,5 +133,37 @@ mod tests {
         r.register(Language::Python, ServerConfig::pyright());
         r.register(Language::Python, ServerConfig::ruff());
         assert_eq!(r.for_language(Language::Python).len(), 2);
+    }
+
+    #[test]
+    fn bundled_manifests_reproduce_the_hardcoded_configs_exactly() {
+        // The whole point of phase B1: loading the bundled manifests must yield
+        // byte-for-byte the same `ServerConfig`s the factory methods produce, so
+        // the move from Rust to TOML is provably behaviour-preserving. (Interned
+        // manifest strings compare equal to the `&'static` literals by value.)
+        let r = ServerRegistry::with_defaults();
+        assert_eq!(
+            r.for_language(Language::Python),
+            &[
+                ServerConfig::ty(),
+                ServerConfig::basedpyright(),
+                ServerConfig::ruff(),
+            ]
+        );
+        // vtsls serves all four TS/JS languages; each key holds the identical
+        // config (language field = TypeScript), as the old loop produced.
+        for lang in [
+            Language::TypeScript,
+            Language::Tsx,
+            Language::JavaScript,
+            Language::Jsx,
+        ] {
+            assert_eq!(r.for_language(lang), &[ServerConfig::vtsls()]);
+        }
+        assert_eq!(
+            r.for_language(Language::Rust),
+            &[ServerConfig::rust_analyzer()]
+        );
+        assert_eq!(r.for_language(Language::Go), &[ServerConfig::gopls()]);
     }
 }

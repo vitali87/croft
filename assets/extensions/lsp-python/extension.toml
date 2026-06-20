@@ -1,0 +1,33 @@
+# Bundled croft extension: Python language support.
+# Declarative (Tier 0) manifest — same format a third-party extension uses.
+# Reproduces the hardcoded `ServerConfig`s that `ServerRegistry::with_defaults`
+# used to build in Rust. `ty` is registered first (lowest priority) so it wins
+# every capability it advertises; basedpyright is the fallback; ruff lints.
+id = "lsp-python"
+name = "Python (ty + basedpyright + ruff)"
+description = "Python language support: ty (Astral type server), basedpyright fallback, ruff lint."
+builtin = true
+api_version = 1
+
+[[language_servers]]
+name = "ty"
+command = "ty"
+args = ["server"]
+language = "python"
+priority = 0
+provision = { kind = "uv", package = "ty", bin = "ty" }
+
+[[language_servers]]
+name = "basedpyright"
+command = "basedpyright-langserver"
+args = ["--stdio"]
+language = "python"
+priority = 1
+
+[[language_servers]]
+name = "ruff"
+command = "ruff"
+args = ["server"]
+language = "python"
+priority = 2
+provision = { kind = "uv", package = "ruff", bin = "ruff" }

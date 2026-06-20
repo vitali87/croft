@@ -1,0 +1,18 @@
+# Bundled croft extension: Rust language support.
+# rust-analyzer is expected on the user's toolchain PATH (croft does not
+# provision it). It must NOT receive a `cargo.targetDir` override: an isolated
+# target dir is always cold on a large crate, so the crate-graph prime never
+# finishes and every hover / completion / semantic-token response comes back
+# empty. Sharing the default target/ reuses the user's warm build artifacts.
+id = "lsp-rust"
+name = "Rust (rust-analyzer)"
+description = "Rust language support via rust-analyzer (expected on PATH)."
+builtin = true
+api_version = 1
+
+[[language_servers]]
+name = "rust-analyzer"
+command = "rust-analyzer"
+args = []
+language = "rust"
+priority = 0

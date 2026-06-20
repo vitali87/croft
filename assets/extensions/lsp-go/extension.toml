@@ -1,0 +1,14 @@
+# Bundled croft extension: Go language support.
+# gopls is expected on the user's toolchain PATH (croft does not provision it).
+id = "lsp-go"
+name = "Go (gopls)"
+description = "Go language support via gopls (expected on PATH)."
+builtin = true
+api_version = 1
+
+[[language_servers]]
+name = "gopls"
+command = "gopls"
+args = ["serve"]
+language = "go"
+priority = 0

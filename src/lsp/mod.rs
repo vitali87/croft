@@ -7,6 +7,7 @@ pub mod config;
 pub mod install;
 pub mod log_file;
 pub mod manager;
+pub mod manifest;
 pub mod registry;
 pub mod runtime;
 pub mod semantic_cache;

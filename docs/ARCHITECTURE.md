@@ -61,11 +61,12 @@ src/
 ├── lsp/                 LSP client stack
 │   ├── mod.rs
 │   ├── client.rs        async-lsp client wrapper; router forwards diagnostics + work-done progress ($/progress, e.g. rust-analyzer "Indexing…") to the status bar
-│   ├── config.rs        per-language LSP config (basedpyright, ruff, ty, vtsls, rust-analyzer, gopls)
+│   ├── config.rs        per-language LSP config (basedpyright, ruff, ty, vtsls, rust-analyzer, gopls); the ServerConfig factories are the executable spec the bundled manifests reproduce, plus Language <-> lsp_id mapping
 │   ├── install.rs       croft-managed server provisioning: lazy background installs of vtsls (npm) and ty/ruff (uv, rerouted to Termux's pkg on Android) into ~/.croft/servers, incl. the uv bootstrap
 │   ├── log_file.rs      LSP stderr / debug log sink at ~/.croft/lsp.log
 │   ├── manager.rs       lifecycle: spawn / did_open / did_change / completion / documentSymbol (Outline) / shutdown
-│   ├── registry.rs      language detection from file extension and shebang
+│   ├── manifest.rs      declarative extension.toml loader (extension system, Tier 0): parses a manifest's [[language_servers]] into ServerConfigs
+│   ├── registry.rs      ServerRegistry (language -> ordered servers); with_defaults loads the bundled extension manifests in assets/extensions/lsp-* instead of hardcoding configs
 │   ├── runtime.rs       Tokio runtime owned by the LSP manager
 │   └── semantic_cache.rs content-keyed disk cache of semantic-token batches at ~/.croft/sem-cache
 └── widgets/

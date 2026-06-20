@@ -1,0 +1,17 @@
+# Bundled croft extension: TypeScript / JavaScript language support.
+# One server (vtsls) serves all four TS/JS language ids. croft owns an
+# npm-installed copy pinned for local/remote parity; a global vtsls is the
+# fallback (see src/lsp/install.rs).
+id = "lsp-typescript"
+name = "TypeScript / JavaScript (vtsls)"
+description = "TypeScript and JavaScript language support via vtsls."
+builtin = true
+api_version = 1
+
+[[language_servers]]
+name = "vtsls"
+command = "vtsls"
+args = ["--stdio"]
+languages = ["typescript", "typescriptreact", "javascript", "javascriptreact"]
+priority = 0
+provision = { kind = "npm", package = "@vtsls/language-server", version = "0.3.0", bin = "vtsls" }

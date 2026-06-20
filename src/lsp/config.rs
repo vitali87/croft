@@ -55,6 +55,31 @@ impl Language {
             Self::Css => "css",
         }
     }
+
+    /// Inverse of [`Self::lsp_id`]: resolve an LSP `languageId` string back to a
+    /// known language. Lets a declarative extension manifest name the languages
+    /// its servers target by their wire ids (`"python"`, `"typescriptreact"`,
+    /// …). `None` for ids this build's closed `Language` enum can't represent
+    /// yet (a third-party language that needs the enum opened — see phase B2).
+    pub fn from_lsp_id(id: &str) -> Option<Self> {
+        Some(match id {
+            "python" => Self::Python,
+            "typescript" => Self::TypeScript,
+            "typescriptreact" => Self::Tsx,
+            "javascript" => Self::JavaScript,
+            "javascriptreact" => Self::Jsx,
+            "rust" => Self::Rust,
+            "go" => Self::Go,
+            "json" => Self::Json,
+            "yaml" => Self::Yaml,
+            "toml" => Self::Toml,
+            "shellscript" => Self::Bash,
+            "markdown" => Self::Markdown,
+            "html" => Self::Html,
+            "css" => Self::Css,
+            _ => return None,
+        })
+    }
 }
 
 // `Eq` is intentionally not derived: `initialization_options` is a
@@ -224,6 +249,31 @@ mod tests {
     fn lsp_id_react_variants() {
         assert_eq!(Language::Tsx.lsp_id(), "typescriptreact");
         assert_eq!(Language::Jsx.lsp_id(), "javascriptreact");
+    }
+
+    #[test]
+    fn from_lsp_id_round_trips_every_language() {
+        // `from_lsp_id` is the inverse of `lsp_id`; an extension manifest names
+        // languages by their wire id, so the two must never drift.
+        for lang in [
+            Language::Python,
+            Language::TypeScript,
+            Language::Tsx,
+            Language::JavaScript,
+            Language::Jsx,
+            Language::Rust,
+            Language::Go,
+            Language::Json,
+            Language::Yaml,
+            Language::Toml,
+            Language::Bash,
+            Language::Markdown,
+            Language::Html,
+            Language::Css,
+        ] {
+            assert_eq!(Language::from_lsp_id(lang.lsp_id()), Some(lang));
+        }
+        assert_eq!(Language::from_lsp_id("nonesuch"), None);
     }
 
     #[test]
