@@ -430,9 +430,19 @@ impl LspManager {
             Arc::new(StdMutex::new(LangCapabilitySupport::default()));
         let semantic_refresh = Arc::new(AtomicBool::new(false));
         let root = workspace_root.clone();
+        // Load user-installed extensions (`~/.config/croft/extensions`) and merge
+        // them with the bundled ones. The language table must be initialised
+        // before the first file open resolves a language, and the registry must
+        // see the same user servers, so both are built from one read here.
+        let user_sources = crate::lsp::manifest::read_extension_sources(
+            &crate::lsp::manifest::user_extensions_dir(),
+        );
+        let user_refs: Vec<&str> = user_sources.iter().map(String::as_str).collect();
+        crate::lsp::languages::init_with_user_sources(&user_refs);
+        let registry = ServerRegistry::with_user_extensions(&user_refs);
         runtime.handle().spawn(worker_loop(
             root,
-            ServerRegistry::with_defaults(),
+            registry,
             cmd_rx,
             ResultSenders {
                 completion: completion_tx,

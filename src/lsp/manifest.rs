@@ -1,17 +1,21 @@
 //! Declarative extension manifests (`extension.toml`).
 //!
-//! A croft extension is described by a TOML manifest. Phase B1 covers the
-//! Tier-0 (pure data) case that matters first: language-server registrations.
-//! The bundled Python/TypeScript/Rust/Go servers are expressed as manifests in
-//! exactly the format a third-party extension uses, and
-//! [`crate::lsp::ServerRegistry::with_defaults`] builds the registry by loading
-//! them instead of hardcoding `ServerConfig`s in Rust.
+//! A croft extension is described by a TOML manifest with two Tier-0 (pure
+//! data) blocks: `[[languages]]` (a language identity — its lsp id, file
+//! extensions, project-root markers, server family) and `[[language_servers]]`
+//! (a server and the languages it serves). The bundled Python/TypeScript/Rust/Go
+//! servers and the core language identities are expressed as manifests in
+//! exactly the format a third-party extension uses; the registry and language
+//! table are built by loading them plus any user extensions under
+//! `~/.config/croft/extensions/`, instead of hardcoding the data in Rust.
 //!
 //! Strings parsed from a manifest are interned to `&'static` (via [`intern`]):
 //! server/package names live for the whole process (the install path keys a
 //! `static` set on them and moves them into background threads), so a leak-once
 //! intern is the right representation and keeps `ServerConfig`/`Provision`
 //! `Copy`-friendly and the install path untouched.
+
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
@@ -158,10 +162,13 @@ impl ProvisionDecl {
 /// that lists N languages yields N entries sharing one config (matching the old
 /// `with_defaults`, which registered the same `ServerConfig` under each key).
 /// The config's own `language` field is the decl's first language id (the
-/// canonical one), again mirroring the old behaviour where `ServerConfig::vtsls`
+/// canonical one), mirroring the old behaviour where `ServerConfig::vtsls`
 /// carried `Language::TypeScript` even when registered under the React/JS keys.
-/// Language ids this build can't represent yet are skipped (phase B2 opens the
-/// `Language` enum).
+///
+/// The language is built straight from the decl's id, not looked up in the
+/// global language table — a manifest declaring a server for a brand-new
+/// language must register it even before (or without) a matching `[[languages]]`
+/// block, which is what lets a user add a language with zero Rust.
 pub fn entries(manifest: &ExtensionManifest) -> Vec<ServerEntry> {
     let mut out = Vec::new();
     for decl in &manifest.language_servers {
@@ -171,29 +178,52 @@ pub fn entries(manifest: &ExtensionManifest) -> Vec<ServerEntry> {
             .into_iter()
             .chain(decl.languages.iter().map(String::as_str))
             .collect();
-        let Some(canonical) = lang_ids.first().and_then(|id| Language::from_lsp_id(id)) else {
+        let Some(first) = lang_ids.first() else {
             continue;
         };
         let config = ServerConfig {
             name: intern(&decl.name),
             command: decl.command.clone(),
             args: decl.args.clone(),
-            language: canonical,
+            language: Language(intern(first)),
             initialization_options: decl.initialization_options.clone(),
             provision: decl.provision.as_ref().map(ProvisionDecl::to_provision),
         };
         for id in &lang_ids {
-            let Some(language) = Language::from_lsp_id(id) else {
-                continue;
-            };
             out.push(ServerEntry {
                 priority: decl.priority,
-                language,
+                language: Language(intern(id)),
                 config: config.clone(),
             });
         }
     }
     out
+}
+
+/// The directory user-installed extensions live in: `<config>/extensions`
+/// (e.g. `~/.config/croft/extensions`). Each extension is a subdirectory
+/// holding an `extension.toml`.
+pub fn user_extensions_dir() -> PathBuf {
+    crate::prefs::config_dir().join("extensions")
+}
+
+/// Read every `<dir>/<id>/extension.toml` into a source string, sorted by path
+/// for a deterministic load order. Best-effort: a missing directory or an
+/// unreadable entry yields no source rather than an error, so a fresh box with
+/// no user extensions simply gets the bundled set.
+pub fn read_extension_sources(dir: &Path) -> Vec<String> {
+    let Ok(read) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut subdirs: Vec<PathBuf> = read
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.is_dir())
+        .collect();
+    subdirs.sort();
+    subdirs
+        .iter()
+        .filter_map(|p| std::fs::read_to_string(p.join("extension.toml")).ok())
+        .collect()
 }
 
 #[cfg(test)]
@@ -218,5 +248,26 @@ mod tests {
         let names: Vec<&str> = entries.iter().map(|e| e.config.name).collect();
         assert_eq!(names, vec!["ty", "basedpyright", "ruff"]);
         assert!(entries.iter().all(|e| e.language == Language::PYTHON));
+    }
+
+    #[test]
+    fn reads_sorted_extension_manifests_skipping_subdirs_without_one() {
+        use std::fs;
+        let base = std::env::temp_dir().join(format!("croft-ext-read-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join("bbb")).unwrap();
+        fs::create_dir_all(base.join("aaa")).unwrap();
+        fs::create_dir_all(base.join("no-manifest")).unwrap();
+        fs::write(base.join("aaa/extension.toml"), "id='aaa'").unwrap();
+        fs::write(base.join("bbb/extension.toml"), "id='bbb'").unwrap();
+        let sources = read_extension_sources(&base);
+        let _ = fs::remove_dir_all(&base);
+        // Sorted by path, and the manifest-less subdir is skipped.
+        assert_eq!(
+            sources,
+            vec!["id='aaa'".to_string(), "id='bbb'".to_string()]
+        );
+        // A missing directory is not an error.
+        assert!(read_extension_sources(&base.join("gone")).is_empty());
     }
 }

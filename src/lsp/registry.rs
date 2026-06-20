@@ -40,6 +40,16 @@ impl ServerRegistry {
         Self::from_manifest_sources(BUNDLED_MANIFESTS)
     }
 
+    /// Build the registry from the bundled manifests plus user extension
+    /// sources (read from `~/.config/croft/extensions`). User servers register
+    /// after the bundled ones at equal priority, so a user extension extends
+    /// the language coverage without displacing a first-party server.
+    pub fn with_user_extensions(user_sources: &[&str]) -> Self {
+        let mut sources: Vec<&str> = manifest::BUNDLED_MANIFESTS.to_vec();
+        sources.extend_from_slice(user_sources);
+        Self::from_manifest_sources(&sources)
+    }
+
     /// Build a registry from a set of `extension.toml` sources. Servers are
     /// registered per language in ascending `priority` (stable within a
     /// priority, so a manifest's declaration order breaks ties).
@@ -165,5 +175,36 @@ mod tests {
             &[ServerConfig::rust_analyzer()]
         );
         assert_eq!(r.for_language(Language::GO), &[ServerConfig::gopls()]);
+    }
+
+    #[test]
+    fn a_user_manifest_registers_a_new_language_server_with_zero_rust() {
+        // The phase-B payoff: a Zig extension declared purely as data registers
+        // zls for .zig with no Rust change. (Hermetic: the manifest is passed
+        // as a source, not read from disk.)
+        const ZIG: &str = r#"
+id = "lsp-zig"
+name = "Zig"
+api_version = 1
+[[languages]]
+id = "zig"
+extensions = ["zig", "zon"]
+root_markers = ["build.zig", "build.zig.zon"]
+[[language_servers]]
+name = "zls"
+command = "zls"
+args = []
+language = "zig"
+priority = 0
+"#;
+        let r = ServerRegistry::from_manifest_sources(&[ZIG]);
+        let servers = r.for_language(Language("zig"));
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].name, "zls");
+        assert_eq!(servers[0].command, "zls");
+        // The bundled languages still resolve when a user manifest is mixed in.
+        let mixed = ServerRegistry::with_user_extensions(&[ZIG]);
+        assert_eq!(mixed.for_language(Language("zig"))[0].name, "zls");
+        assert_eq!(mixed.for_language(Language::RUST)[0].name, "rust-analyzer");
     }
 }

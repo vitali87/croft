@@ -12,7 +12,7 @@
 //! phase; until then resolution covers exactly the first-party languages.
 
 use std::collections::HashMap;
-use std::sync::LazyLock;
+use std::sync::OnceLock;
 
 use crate::lsp::config::Language;
 use crate::lsp::manifest;
@@ -63,22 +63,37 @@ impl LangTable {
     }
 }
 
-static TABLE: LazyLock<LangTable> =
-    LazyLock::new(|| LangTable::from_sources(manifest::BUNDLED_MANIFESTS));
+static TABLE: OnceLock<LangTable> = OnceLock::new();
+
+/// The active table. Lazily built from the bundled manifests only if
+/// [`init_with_user_sources`] was never called (the case in tests, which keeps
+/// resolution hermetic — no disk, no user state).
+fn table() -> &'static LangTable {
+    TABLE.get_or_init(|| LangTable::from_sources(manifest::BUNDLED_MANIFESTS))
+}
+
+/// Initialise the table from the bundled manifests plus user extension sources.
+/// Called once at LSP startup before any language is resolved; a no-op (and a
+/// dropped `user`) if the table was already built, so call it early.
+pub fn init_with_user_sources(user: &[&str]) {
+    let mut sources: Vec<&str> = manifest::BUNDLED_MANIFESTS.to_vec();
+    sources.extend_from_slice(user);
+    let _ = TABLE.set(LangTable::from_sources(&sources));
+}
 
 /// The language a file extension maps to, or `None` if no extension claims it.
 pub fn from_extension(ext: &str) -> Option<Language> {
-    TABLE.by_ext.get(&ext.to_ascii_lowercase()).copied()
+    table().by_ext.get(&ext.to_ascii_lowercase()).copied()
 }
 
 /// Resolve an LSP `languageId` to a known language, or `None`.
 pub fn resolve(id: &str) -> Option<Language> {
-    TABLE.records.get_key_value(id).map(|(k, _)| Language(k))
+    table().records.get_key_value(id).map(|(k, _)| Language(k))
 }
 
 /// Project-root markers for a language (empty slice when none / unknown).
 pub fn root_markers(lang: Language) -> &'static [&'static str] {
-    TABLE
+    table()
         .records
         .get(lang.lsp_id())
         .map(|r| r.root_markers)
@@ -87,7 +102,7 @@ pub fn root_markers(lang: Language) -> &'static [&'static str] {
 
 /// The server family a language belongs to; itself when it has no `family`.
 pub fn server_family(lang: Language) -> Language {
-    TABLE
+    table()
         .records
         .get(lang.lsp_id())
         .and_then(|r| r.family)
@@ -120,5 +135,28 @@ mod tests {
         assert_eq!(server_family(Language::JAVASCRIPT), Language::TYPESCRIPT);
         assert_eq!(server_family(Language::TYPESCRIPT), Language::TYPESCRIPT);
         assert_eq!(server_family(Language::RUST), Language::RUST);
+    }
+
+    const ZIG_MANIFEST: &str = r#"
+id = "lsp-zig"
+name = "Zig"
+api_version = 1
+[[languages]]
+id = "zig"
+extensions = ["zig", "zon"]
+root_markers = ["build.zig", "build.zig.zon"]
+"#;
+
+    #[test]
+    fn a_user_manifest_contributes_a_new_language_with_zero_rust() {
+        // Built locally (not the global table) so the test stays hermetic, but
+        // exercises the exact code path init_with_user_sources uses at startup.
+        let t = LangTable::from_sources(&[ZIG_MANIFEST]);
+        let zig = Language("zig");
+        assert_eq!(t.by_ext.get("zig"), Some(&zig));
+        assert_eq!(t.by_ext.get("zon"), Some(&zig));
+        let rec = t.records.get("zig").expect("zig language recorded");
+        assert_eq!(rec.root_markers, &["build.zig", "build.zig.zon"]);
+        assert!(rec.family.is_none());
     }
 }

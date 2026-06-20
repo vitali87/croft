@@ -143,7 +143,7 @@ pub fn config_path() -> PathBuf {
     config_dir().join("config.json")
 }
 
-fn config_dir() -> PathBuf {
+pub(crate) fn config_dir() -> PathBuf {
     if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
         return PathBuf::from(xdg).join("croft");
     }

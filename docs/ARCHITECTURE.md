@@ -66,8 +66,8 @@ src/
 │   ├── languages.rs     language table: file-extension -> language, root markers, and server family, all built from extension manifests' [[languages]] blocks (replaces the old hardcoded Language enum match arms)
 │   ├── log_file.rs      LSP stderr / debug log sink at ~/.croft/lsp.log
 │   ├── manager.rs       lifecycle: spawn / did_open / did_change / completion / documentSymbol (Outline) / shutdown
-│   ├── manifest.rs      declarative extension.toml loader (extension system, Tier 0): parses a manifest's [[language_servers]] into ServerConfigs
-│   ├── registry.rs      ServerRegistry (language -> ordered servers); with_defaults loads the bundled extension manifests in assets/extensions/lsp-* instead of hardcoding configs
+│   ├── manifest.rs      declarative extension.toml loader (extension system, Tier 0): parses a manifest's [[languages]] + [[language_servers]] blocks; also discovers user extensions under ~/.config/croft/extensions/<id>/
+│   ├── registry.rs      ServerRegistry (language -> ordered servers); built from the bundled manifests in assets/extensions/* plus user-installed extensions, instead of hardcoding configs
 │   ├── runtime.rs       Tokio runtime owned by the LSP manager
 │   └── semantic_cache.rs content-keyed disk cache of semantic-token batches at ~/.croft/sem-cache
 └── widgets/
