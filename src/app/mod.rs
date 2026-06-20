@@ -1119,6 +1119,9 @@ pub struct App {
     voice_rx: std::sync::mpsc::Receiver<crate::voice::VoiceMsg>,
     voice_tx: std::sync::mpsc::Sender<crate::voice::VoiceMsg>,
     voice_handle: Option<crate::voice::VoiceHandle>,
+    /// Set when a mic tap cancels a live session, so the resulting empty result
+    /// is reported as "canceled" rather than "no speech detected".
+    voice_canceling: bool,
     pub editor: EditorTabs,
     /// The secondary editor group, shown side by side with `editor` when
     /// the user splits the pane (`Cmd+\`). `None` = not split. Invariant:
@@ -1846,6 +1849,7 @@ impl App {
             voice_rx,
             voice_tx,
             voice_handle: None,
+            voice_canceling: false,
             editor,
             editor_split: None,
             split_focus_left: true,
@@ -13624,12 +13628,14 @@ impl App {
     /// only Termux with `termux-speech-to-text` can listen; a missing
     /// `termux-api` package kicks off a background install and asks the user to
     /// retry, and a non-Termux host just explains it is Termux-only.
-    /// Tap the mic: stop a live session, or start a new one. Termux hijacks any
-    /// finger hold for text selection, so the gesture is a tap toggle rather
-    /// than push-to-talk.
+    /// Tap the mic: cancel a live session, or start a new one. The success path
+    /// is not this tap but going quiet - Android finalizes recognition on
+    /// silence and the transcript is injected then. A second tap is the escape
+    /// hatch (cancel) because killing the recognizer preempts its result, so it
+    /// can never be the way to "finish".
     fn toggle_voice_input(&mut self) {
         if self.voice_handle.is_some() {
-            self.stop_voice_input();
+            self.cancel_voice_input();
         } else {
             self.start_voice_input();
         }
@@ -13642,7 +13648,8 @@ impl App {
         match crate::voice::availability() {
             crate::voice::Availability::Ready => {
                 self.voice_handle = Some(crate::voice::start(self.voice_tx.clone()));
-                self.status = String::from("Listening… (tap the mic again to stop)");
+                self.voice_canceling = false;
+                self.status = String::from("Listening… pause speaking to insert (tap to cancel)");
             }
             crate::voice::Availability::NeedsApi => {
                 crate::voice::ensure_api_installed_in_background();
@@ -13656,11 +13663,14 @@ impl App {
         }
     }
 
-    /// Stop the active session (a second mic tap). The worker reports its
-    /// transcript when its stdout closes; `drain_voice` injects it and clears
-    /// the handle, so the handle is intentionally left in place until then.
-    fn stop_voice_input(&mut self) {
+    /// Cancel the active session (a second mic tap): kill the recognizer and
+    /// discard. Recognition normally ends on its own when you stop talking;
+    /// this is only for abandoning a session that is stuck or unwanted. The
+    /// killed worker reports `Empty`, which `drain_voice` turns into a "canceled"
+    /// message via this flag.
+    fn cancel_voice_input(&mut self) {
         if let Some(handle) = self.voice_handle.as_ref() {
+            self.voice_canceling = true;
             handle.stop();
         }
     }
@@ -13673,9 +13683,21 @@ impl App {
             changed = true;
             self.voice_handle = None;
             match msg {
-                crate::voice::VoiceMsg::Transcript(text) => self.inject_voice_text(&text),
-                crate::voice::VoiceMsg::Empty => self.status = String::from("No speech detected"),
-                crate::voice::VoiceMsg::Failed(e) => self.status = e,
+                crate::voice::VoiceMsg::Transcript(text) => {
+                    self.voice_canceling = false;
+                    self.inject_voice_text(&text);
+                }
+                crate::voice::VoiceMsg::Empty => {
+                    self.status = if std::mem::take(&mut self.voice_canceling) {
+                        String::from("Voice input canceled")
+                    } else {
+                        String::from("No speech detected")
+                    };
+                }
+                crate::voice::VoiceMsg::Failed(e) => {
+                    self.voice_canceling = false;
+                    self.status = e;
+                }
             }
         }
         changed
@@ -13724,13 +13746,14 @@ impl App {
         if key == crate::widgets::osk::OskKey::SplitToggle {
             let _ = crate::prefs::save_osk_split(osk.split);
         }
-        // Mic is tap-to-toggle, not push-to-talk: Termux turns any finger hold
-        // into its own text-selection gesture (hardcoded in TerminalView, not
+        // Mic is a tap, not push-to-talk: Termux turns any finger hold into its
+        // own text-selection gesture (hardcoded in TerminalView, not
         // suppressible from a TUI), so a hold can never reach croft as a
         // sustained press. A quick tap is the only touch Termux forwards as a
-        // click, so each tap toggles listening; recognition also auto-stops on
-        // silence. Deferred until the `osk` borrow ends so the toggle can take
-        // `&mut self`. `tap` returned None for it, so nothing reaches handle_key.
+        // click. A tap starts recognition; the transcript lands when the user
+        // pauses (Android finalizes on silence), and a second tap cancels.
+        // Deferred until the `osk` borrow ends so the toggle can take `&mut
+        // self`. `tap` returned None for it, so nothing reaches handle_key.
         let is_voice = key == crate::widgets::osk::OskKey::Voice;
         if let Some(ev) = ev
             && let Err(e) = self.handle_key(ev)

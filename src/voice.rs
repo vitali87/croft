@@ -7,18 +7,18 @@
 //! same engine Gboard's mic uses). croft never captures audio or ships a model
 //! itself, mirroring how it delegates directory ranking to the host `zoxide`.
 //!
-//! The mic is a tap toggle, not push-to-talk: Termux turns any finger hold into
-//! its own text-selection gesture (hardcoded in TerminalView, unsuppressible
-//! from a TUI), so a sustained press can never reach croft. A first tap starts
-//! a session; a second tap kills the client process. The recognizer also stops
-//! on its own at end-of-speech (silence) or a timeout, since Android owns the
-//! lifecycle and exposes no CLI "stop now". Either way the reader thread reports
-//! the last recognized line once. `-p` is used so a partial hypothesis is
-//! available to grab if the user stops early; only the final line is ever
-//! injected, so it reads as a single insert (true live partials are impossible
-//! upstream, see termux-api-package#137 which buffers progressive output).
+//! The mic is a tap, not push-to-talk: Termux turns any finger hold into its
+//! own text-selection gesture (hardcoded in TerminalView, unsuppressible from a
+//! TUI), so a sustained press can never reach croft. A tap starts a session;
+//! the transcript only exists once Android finalizes recognition at
+//! end-of-speech (silence, fired by `onResults` in its `SpeechRecognizer`), so
+//! croft must let the user pause rather than kill to "finish" - killing
+//! preempts the result. A second tap therefore cancels (kills the process
+//! group), it is never the path to the transcript. Final-only mode is used (no
+//! `-p`): the wrapper's `tail -1` yields exactly the final line at EOF, sparing
+//! croft the upstream progressive-output buffering bug (termux-api-package#137).
 
-use std::io::BufRead;
+use std::io::{BufRead, Read};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
@@ -197,11 +197,17 @@ impl VoiceHandle {
 /// never opens and `VoiceMsg::Failed` is sent.
 pub fn start(tx: Sender<VoiceMsg>) -> VoiceHandle {
     set_listening(true);
+    // Final-only mode (no `-p`): the wrapper pipes the recognizer through
+    // `tail -1`, emitting exactly one line - the final transcript - when the
+    // recognizer finalizes on end-of-speech (silence). The transcript only
+    // exists after that finalize, so croft must NOT kill the session to "stop"
+    // it (that preempts the result); the user pauses and it commits. `-p` is
+    // avoided because its progressive output is buffered upstream (#137) and
+    // would yield partial or empty text. stderr is captured for diagnosis.
     let mut cmd = Command::new(BINARY);
-    cmd.arg("-p")
-        .stdin(Stdio::null())
+    cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+        .stderr(Stdio::piped());
     // Run the wrapper script in its own session/process group so `stop` can
     // signal the whole tree (script + `termux-api`) as a unit; otherwise the
     // `termux-api` child survives, holds the stdout pipe, and the reader hangs.
@@ -224,14 +230,14 @@ pub fn start(tx: Sender<VoiceMsg>) -> VoiceHandle {
         }
     };
     let stdout = child.stdout.take();
+    let mut stderr = child.stderr.take();
     let shared: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(Some(child)));
     let reader_shared = Arc::clone(&shared);
     thread::spawn(move || {
         let mut latest = String::new();
         if let Some(stdout) = stdout {
-            // Each line is Android's full best-guess-so-far; keep the last
-            // non-empty one as the transcript (the final result on a natural
-            // stop, or the latest partial on an early release-kill).
+            // Final-only mode emits a single line (the transcript) at EOF; keep
+            // the last non-empty line either way.
             for line in std::io::BufReader::new(stdout)
                 .lines()
                 .map_while(Result::ok)
@@ -242,12 +248,26 @@ pub fn start(tx: Sender<VoiceMsg>) -> VoiceHandle {
                 }
             }
         }
-        if let Ok(mut guard) = reader_shared.lock()
+        // Drain stderr and reap, so a recognizer-side failure (no Termux:API
+        // app, denied mic permission, no speech-recognition service) leaves a
+        // real signal in the log instead of a silent "No speech detected".
+        let mut err = String::new();
+        if let Some(stderr) = stderr.as_mut() {
+            let _ = stderr.read_to_string(&mut err);
+        }
+        let status = if let Ok(mut guard) = reader_shared.lock()
             && let Some(child) = guard.as_mut()
         {
-            let _ = child.wait();
-        }
+            child.wait().ok()
+        } else {
+            None
+        };
         set_listening(false);
+        log_file::log(&format!(
+            "voice: session ended status={status:?} transcript_chars={} stderr={:?}",
+            latest.chars().count(),
+            err.trim()
+        ));
         let msg = if latest.is_empty() {
             VoiceMsg::Empty
         } else {
