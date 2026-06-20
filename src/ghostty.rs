@@ -75,6 +75,7 @@ const CHORDS: &[(&str, &str)] = &[
     ("cmd+shift+s", pl::CMD_SHIFT_S_HEX),
     ("cmd+shift+d", pl::CMD_SHIFT_D_HEX),
     ("cmd+shift+r", pl::CMD_SHIFT_R_HEX),
+    ("cmd+shift+x", pl::CMD_SHIFT_X_HEX),
     ("cmd+shift+l", pl::CMD_SHIFT_L_HEX),
     ("cmd+shift+n", pl::CMD_SHIFT_N_HEX),
     ("cmd+shift+t", pl::CMD_SHIFT_T_HEX),

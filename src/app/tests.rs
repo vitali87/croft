@@ -439,6 +439,9 @@ fn dummy_activity_images() -> ActivityBarImages {
         run_debug_active: s(),
         run_debug_inactive: s(),
         run_debug_hovered: s(),
+        extensions_active: s(),
+        extensions_inactive: s(),
+        extensions_hovered: s(),
         settings_active: s(),
         settings_inactive: s(),
         settings_hovered: s(),
@@ -5741,6 +5744,9 @@ fn resize_arms_a_one_shot_terminal_clear_to_evict_stale_activity_icons() {
         run_debug_active: String::new(),
         run_debug_inactive: String::new(),
         run_debug_hovered: String::new(),
+        extensions_active: String::new(),
+        extensions_inactive: String::new(),
+        extensions_hovered: String::new(),
         settings_active: String::new(),
         settings_inactive: String::new(),
         settings_hovered: String::new(),
@@ -5787,6 +5793,9 @@ fn activity_bar_icons_moving_within_the_flush_arms_a_one_shot_terminal_clear() {
         run_debug_active: String::new(),
         run_debug_inactive: String::new(),
         run_debug_hovered: String::new(),
+        extensions_active: String::new(),
+        extensions_inactive: String::new(),
+        extensions_hovered: String::new(),
         settings_active: String::new(),
         settings_inactive: String::new(),
         settings_hovered: String::new(),
@@ -5797,6 +5806,7 @@ fn activity_bar_icons_moving_within_the_flush_arms_a_one_shot_terminal_clear() {
         app.sidebar_areas.source_control_icon = Rect::new(0, base + 4, 2, 1);
         app.sidebar_areas.remote_icon = Rect::new(0, base + 6, 2, 1);
         app.sidebar_areas.run_debug_icon = Rect::new(0, base + 8, 2, 1);
+        app.sidebar_areas.extensions_icon = Rect::new(0, base + 10, 2, 1);
     };
     // First emit at one layout: records the positions, arms no clear.
     place(&mut app, 2);
@@ -7426,8 +7436,8 @@ fn activity_icons_stay_visible_beside_the_centered_shortcuts_modal() {
     term.draw(|f| app.render(f)).unwrap();
     let before = app.pending_activity_image_overlays().len();
     assert_eq!(
-        before, 6,
-        "precondition: all five view icons plus the bottom settings gear emit"
+        before, 7,
+        "precondition: all six view icons plus the bottom settings gear emit"
     );
     app.handle_key(key(KeyCode::F(1), KeyModifiers::NONE))
         .unwrap();
@@ -7475,8 +7485,8 @@ fn settings_gear_is_bottom_anchored_below_the_view_icons() {
     );
     assert_eq!(
         app.pending_activity_image_overlays().len(),
-        6,
-        "five view icons plus the bottom settings gear emit"
+        7,
+        "six view icons plus the bottom settings gear emit"
     );
 }
 
@@ -12430,6 +12440,9 @@ fn hovering_a_non_selected_activity_icon_emits_its_hovered_variant() {
         run_debug_active: "DA".into(),
         run_debug_inactive: "DI".into(),
         run_debug_hovered: "DH".into(),
+        extensions_active: "XA".into(),
+        extensions_inactive: "XI".into(),
+        extensions_hovered: "XH".into(),
         settings_active: "GA".into(),
         settings_inactive: "GI".into(),
         settings_hovered: "GH".into(),
@@ -12440,6 +12453,7 @@ fn hovering_a_non_selected_activity_icon_emits_its_hovered_variant() {
     app.sidebar_areas.source_control_icon = Rect::new(0, 4, 2, 1);
     app.sidebar_areas.remote_icon = Rect::new(0, 6, 2, 1);
     app.sidebar_areas.run_debug_icon = Rect::new(0, 8, 2, 1);
+    app.sidebar_areas.extensions_icon = Rect::new(0, 10, 2, 1);
     app.sidebar_view = SidebarView::Explorer;
     // Hover Search, a non-selected icon.
     app.hovered_activity_icon = Some(ActivityIcon::Search);

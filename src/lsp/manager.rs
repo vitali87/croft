@@ -438,8 +438,14 @@ impl LspManager {
             &crate::lsp::manifest::user_extensions_dir(),
         );
         let user_refs: Vec<&str> = user_sources.iter().map(String::as_str).collect();
+        // The language table keeps every language identity (so file detection and
+        // highlighting stay intact); only server registration honors the disable
+        // set, so a disabled LSP extension stops spawning without losing its
+        // language. The set is read from prefs at construction; a live toggle
+        // takes effect on the next manager rebuild (re-root / relaunch).
         crate::lsp::languages::init_with_user_sources(&user_refs);
-        let registry = ServerRegistry::with_user_extensions(&user_refs);
+        let disabled = crate::prefs::Prefs::load_or_default().disabled_extensions;
+        let registry = ServerRegistry::with_user_extensions_filtered(&user_refs, &disabled);
         runtime.handle().spawn(worker_loop(
             root,
             registry,

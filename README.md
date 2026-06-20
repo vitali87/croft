@@ -20,7 +20,7 @@ The non-negotiables behind every decision in croft:
 
 ## Layout
 
-Three panes in the VS Code arrangement: an **Explorer sidebar** on the left, a **code editor** top right, and a **real terminal** bottom right. An activity bar down the far left switches the sidebar between Explorer, Search, Source Control, a Remote (SSH) explorer, and Run and Debug, and holds the theme picker. Every seam drags to resize.
+Three panes in the VS Code arrangement: an **Explorer sidebar** on the left, a **code editor** top right, and a **real terminal** bottom right. An activity bar down the far left switches the sidebar between Explorer, Search, Source Control, a Remote (SSH) explorer, Run and Debug, and Extensions, and holds the theme picker. Every seam drags to resize.
 
 The editor brings tree-sitter highlighting, inline previews for images / PDFs / spreadsheets, side-by-side splits, an optional vim mode, and full LSP (completion, hover, go-to-definition, rename, diagnostics). A Command Palette (`Cmd`/`Ctrl`+`Shift`+`P`) runs every command, and you can debug Python, JavaScript/TypeScript, Rust, C, and C++ with breakpoints over DAP or attach a `pdb` REPL to a live process.
 

@@ -6,6 +6,7 @@ pub mod dependencies;
 pub mod diff;
 pub mod editor;
 pub mod editor_find;
+pub mod extensions;
 pub mod file_finder;
 pub mod file_tree;
 pub mod header_pill;

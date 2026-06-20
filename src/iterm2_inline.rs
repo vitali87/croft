@@ -13,6 +13,8 @@ pub const SOURCE_CONTROL_SRC_SVG: &[u8] = include_bytes!("../assets/icons/source
 pub const REMOTE_SRC_SVG: &[u8] = include_bytes!("../assets/icons/remote-explorer.svg");
 /// Codicon `debug-alt` (bug + play triangle), the Run and Debug activity icon.
 pub const RUN_DEBUG_SRC_SVG: &[u8] = include_bytes!("../assets/icons/debug-alt.svg");
+/// Codicon `extensions` (four squares, one detached), the Extensions activity icon.
+pub const EXTENSIONS_SRC_SVG: &[u8] = include_bytes!("../assets/icons/extensions.svg");
 /// Codicon `gear`, the bottom-anchored "Manage" button (Color Theme picker).
 pub const SETTINGS_GEAR_SRC_SVG: &[u8] = include_bytes!("../assets/icons/settings_gear.svg");
 pub const CODEBERG_SRC_PNG: &[u8] = include_bytes!("../assets/icons/codeberg_src.png");
@@ -774,8 +776,11 @@ pub const KITTY_ID_RUN_DEBUG_PANEL: u32 = KITTY_ID_BASE + 8;
 pub const KITTY_ID_HERO: u32 = KITTY_ID_BASE + 9;
 pub const KITTY_ID_SSH: u32 = KITTY_ID_BASE + 10;
 pub const KITTY_ID_WELCOME: u32 = KITTY_ID_BASE + 11;
-/// Editor image slots, indexed by physical split side (`+0` left, `+1` right).
+/// Editor image slots, indexed by physical split side (`+0` left, `+1` right),
+/// so they occupy `+12` and `+13`.
 pub const KITTY_ID_EDITOR_BASE: u32 = KITTY_ID_BASE + 12;
+/// Extensions activity-bar icon, past the editor pair to avoid collision.
+pub const KITTY_ID_EXTENSIONS: u32 = KITTY_ID_BASE + 14;
 
 /// Apply tmux DCS passthrough wrapping to an inline-image escape when needed.
 /// Sixel passes through tmux natively (tmux built with sixel support renders it

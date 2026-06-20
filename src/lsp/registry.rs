@@ -50,6 +50,29 @@ impl ServerRegistry {
         Self::from_manifest_sources(&sources)
     }
 
+    /// Like [`with_user_extensions`], but skip the servers contributed by any
+    /// extension whose id is in `disabled` (the Extensions panel's disable set).
+    /// Only server *registration* is gated: the language table is built
+    /// separately and keeps every language identity, so a disabled `lsp-rust`
+    /// still recognises `.rs` (and its highlighting) while no rust-analyzer
+    /// spawns. An unparseable source is kept rather than silently dropped.
+    pub fn with_user_extensions_filtered(
+        user_sources: &[&str],
+        disabled: &std::collections::BTreeSet<String>,
+    ) -> Self {
+        let mut sources: Vec<&str> = manifest::BUNDLED_MANIFESTS.to_vec();
+        sources.extend_from_slice(user_sources);
+        let enabled: Vec<&str> = sources
+            .into_iter()
+            .filter(|s| {
+                manifest::parse(s)
+                    .map(|m| !disabled.contains(&m.id))
+                    .unwrap_or(true)
+            })
+            .collect();
+        Self::from_manifest_sources(&enabled)
+    }
+
     /// Build a registry from a set of `extension.toml` sources. Servers are
     /// registered per language in ascending `priority` (stable within a
     /// priority, so a manifest's declaration order breaks ties).
@@ -206,5 +229,22 @@ priority = 0
         let mixed = ServerRegistry::with_user_extensions(&[ZIG]);
         assert_eq!(mixed.for_language(Language("zig"))[0].name, "zls");
         assert_eq!(mixed.for_language(Language::RUST)[0].name, "rust-analyzer");
+    }
+
+    #[test]
+    fn a_disabled_lsp_extension_registers_no_server_for_its_language() {
+        let mut disabled = std::collections::BTreeSet::new();
+        disabled.insert("lsp-python".to_string());
+        let r = ServerRegistry::with_user_extensions_filtered(&[], &disabled);
+        assert!(
+            r.for_language(Language::PYTHON).is_empty(),
+            "a disabled lsp-python must register no server for Python"
+        );
+        // A language whose extension is still enabled is unaffected.
+        assert_eq!(
+            r.for_language(Language::RUST)[0].name,
+            "rust-analyzer",
+            "disabling one LSP extension must not gate the others"
+        );
     }
 }

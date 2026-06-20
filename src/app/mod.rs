@@ -63,6 +63,7 @@ pub enum SidebarView {
     SourceControl,
     Remote,
     RunDebug,
+    Extensions,
 }
 
 /// The toggleable sub-views stacked inside the Explorer side panel, mirroring
@@ -154,6 +155,7 @@ pub enum ActivityIcon {
     SourceControl,
     Remote,
     RunDebug,
+    Extensions,
     Settings,
 }
 
@@ -295,6 +297,10 @@ fn activity_remote_y(bar: Rect) -> u16 {
     activity_run_debug_y(bar) + ACTIVITY_ICON_HEIGHT + ACTIVITY_ICON_GAP
 }
 
+fn activity_extensions_y(bar: Rect) -> u16 {
+    activity_remote_y(bar) + ACTIVITY_ICON_HEIGHT + ACTIVITY_ICON_GAP
+}
+
 fn activity_explorer_block(bar: Rect) -> Rect {
     Rect {
         x: bar.x,
@@ -340,6 +346,15 @@ fn activity_run_debug_block(bar: Rect) -> Rect {
     }
 }
 
+fn activity_extensions_block(bar: Rect) -> Rect {
+    Rect {
+        x: bar.x,
+        y: activity_extensions_y(bar),
+        width: bar.width,
+        height: ACTIVITY_ICON_HEIGHT,
+    }
+}
+
 /// The settings gear, anchored to the BOTTOM of the activity bar (VS Code's
 /// "Manage" gear), asymmetric to the view icons stacked from the top. Returns
 /// an empty rect when the bar is too short to fit the gear below the last view
@@ -357,7 +372,7 @@ fn activity_settings_block(bar: Rect) -> Rect {
         .y
         .saturating_add(bar.height)
         .saturating_sub(ACTIVITY_ICON_HEIGHT + ACTIVITY_BOTTOM_INSET);
-    let last_view_bottom = activity_remote_y(bar) + ACTIVITY_ICON_HEIGHT;
+    let last_view_bottom = activity_extensions_y(bar) + ACTIVITY_ICON_HEIGHT;
     if y < last_view_bottom {
         return Rect::default();
     }
@@ -383,6 +398,8 @@ struct SidebarAreas {
     remote_icon: Rect,
     /// Block occupied by the Run and Debug activity-bar icon, in absolute coords.
     run_debug_icon: Rect,
+    /// Block occupied by the Extensions activity-bar icon, in absolute coords.
+    extensions_icon: Rect,
     /// Block occupied by the settings gear, bottom-anchored on the activity
     /// bar (VS Code's "Manage" button). Asymmetric to the view icons up top;
     /// clicking it opens the settings menu (Color Theme picker).
@@ -409,6 +426,9 @@ pub struct ActivityBarImages {
     run_debug_active: String,
     run_debug_inactive: String,
     run_debug_hovered: String,
+    extensions_active: String,
+    extensions_inactive: String,
+    extensions_hovered: String,
     /// The settings gear. `active` is shown while its menu is open so the
     /// button reads as pressed, mirroring the view icons' selected state;
     /// `hovered` brightens it while the pointer rests on it.
@@ -1053,6 +1073,8 @@ pub struct App {
     pub remote: RemotePanel,
     pub source_control: SourceControlPanel,
     pub run_debug: RunDebugPanel,
+    /// The Extensions side panel: bundled + installed extensions with toggles.
+    pub extensions: crate::widgets::extensions::ExtensionsPanel,
     /// The Explorer's OPEN EDITORS section: the open editor tabs, projected
     /// from `editor`/`editor_split` each frame. See [`OpenEditorsPanel`].
     pub open_editors: OpenEditorsPanel,
@@ -1073,6 +1095,11 @@ pub struct App {
     dep_ecosystems: Vec<Ecosystem>,
     /// Which Explorer sub-views are shown, toggled from the ⋯ menu. Persisted.
     pub explorer_views: ExplorerViewVisibility,
+    /// Extension ids the user has disabled in the Extensions panel. Loaded once
+    /// from prefs at startup and persisted on every toggle, mirroring how
+    /// `explorer_views` is held in memory rather than re-read each access. The
+    /// gates for the bundled features (PDF/CSV/Vim/LSPs) consult this set.
+    disabled_extensions: std::collections::BTreeSet<String>,
     /// Background `git log` results for the TIMELINE, keyed by the file they
     /// describe so a stale reply for a since-closed file is ignored on drain.
     timeline_rx: std::sync::mpsc::Receiver<(PathBuf, Vec<crate::git::FileHistoryEntry>)>,
@@ -1737,6 +1764,7 @@ impl App {
         let remote = RemotePanel::new();
         let source_control = SourceControlPanel::new();
         let run_debug = RunDebugPanel::new();
+        let extensions = crate::widgets::extensions::ExtensionsPanel::new();
         let outline = OutlinePanel::new();
         let open_editors = OpenEditorsPanel::new();
         let timeline = TimelinePanel::new();
@@ -1746,9 +1774,9 @@ impl App {
         // first sync tick. Re-detected on every re-root (see sync_explorer_panels).
         let dep_ecosystems = crate::widgets::dependencies::detect_ecosystems(&root);
         dependencies.set_header(crate::widgets::dependencies::header_label(&dep_ecosystems));
-        let explorer_views = ExplorerViewVisibility::from_prefs(
-            crate::prefs::Prefs::load_or_default().explorer_views,
-        );
+        let loaded_prefs = crate::prefs::Prefs::load_or_default();
+        let explorer_views = ExplorerViewVisibility::from_prefs(loaded_prefs.explorer_views);
+        let disabled_extensions = loaded_prefs.disabled_extensions.clone();
         let (timeline_tx, timeline_rx) = std::sync::mpsc::channel();
         let (deps_tx, deps_rx) = std::sync::mpsc::channel();
         let editor = EditorTabs::new();
@@ -1794,6 +1822,8 @@ impl App {
             remote,
             source_control,
             run_debug,
+            extensions,
+            disabled_extensions,
             outline,
             open_editors,
             timeline,
@@ -2095,6 +2125,7 @@ impl App {
             Some((sca, sci, sch)),
             Some((ra, ri, rh)),
             Some((rda, rdi, rdh)),
+            Some((exta, exti, exth)),
             Some((gea, gei, geh)),
         ) = (
             bake(ki::EXPLORER_SRC_SVG, 0, ki::KITTY_ID_EXPLORER),
@@ -2102,6 +2133,7 @@ impl App {
             bake(ki::SOURCE_CONTROL_SRC_SVG, 0, ki::KITTY_ID_SOURCE_CONTROL),
             bake(ki::REMOTE_SRC_SVG, 0, ki::KITTY_ID_REMOTE),
             bake(ki::RUN_DEBUG_SRC_SVG, 0, ki::KITTY_ID_RUN_DEBUG_BAR),
+            bake(ki::EXTENSIONS_SRC_SVG, 0, ki::KITTY_ID_EXTENSIONS),
             bake(
                 ki::SETTINGS_GEAR_SRC_SVG,
                 gear_off_y_bias,
@@ -2124,6 +2156,9 @@ impl App {
                 run_debug_active: rda,
                 run_debug_inactive: rdi,
                 run_debug_hovered: rdh,
+                extensions_active: exta,
+                extensions_inactive: exti,
+                extensions_hovered: exth,
                 settings_active: gea,
                 settings_inactive: gei,
                 settings_hovered: geh,
@@ -2561,11 +2596,13 @@ impl App {
         let scm_block = self.sidebar_areas.source_control_icon;
         let rem_block = self.sidebar_areas.remote_icon;
         let rdb_block = self.sidebar_areas.run_debug_icon;
+        let ext_block = self.sidebar_areas.extensions_icon;
         if exp_block.width == 0
             || sea_block.width == 0
             || scm_block.width == 0
             || rem_block.width == 0
             || rdb_block.width == 0
+            || ext_block.width == 0
         {
             return Vec::new();
         }
@@ -2608,6 +2645,13 @@ impl App {
         } else {
             &images.run_debug_inactive
         };
+        let ext_state = if self.sidebar_view == SidebarView::Extensions {
+            &images.extensions_active
+        } else if hov == Some(ActivityIcon::Extensions) {
+            &images.extensions_hovered
+        } else {
+            &images.extensions_inactive
+        };
         // The gear is bottom-anchored and may be absent on a short bar
         // (empty block). It reads "active" while its menu/picker is open.
         let set_block = self.sidebar_areas.settings_icon;
@@ -2643,6 +2687,7 @@ impl App {
             (scm_block, scm_state.as_str()),
             (rem_block, rem_state.as_str()),
             (rdb_block, rdb_state.as_str()),
+            (ext_block, ext_state.as_str()),
         ];
         if set_block.width > 0 {
             blocks.push((set_block, set_state.as_str()));
@@ -3226,6 +3271,8 @@ impl App {
             Some(ActivityIcon::Remote)
         } else if rect_contains(a.run_debug_icon, col, row) {
             Some(ActivityIcon::RunDebug)
+        } else if rect_contains(a.extensions_icon, col, row) {
+            Some(ActivityIcon::Extensions)
         } else if rect_contains(a.settings_icon, col, row) {
             Some(ActivityIcon::Settings)
         } else {
@@ -3248,6 +3295,7 @@ impl App {
                 ActivityIcon::SourceControl => "Source Control",
                 ActivityIcon::Remote => "Remote",
                 ActivityIcon::RunDebug => "Run and Debug",
+                ActivityIcon::Extensions => "Extensions",
                 ActivityIcon::Settings => "Manage",
             });
         }
@@ -3293,6 +3341,7 @@ impl App {
                 }
             }
             SidebarView::RunDebug => {}
+            SidebarView::Extensions => {}
         }
         None
     }
@@ -5273,12 +5322,14 @@ impl App {
         let source_control_block = activity_source_control_block(area);
         let remote_block = activity_remote_block(area);
         let run_debug_block = activity_run_debug_block(area);
+        let extensions_block = activity_extensions_block(area);
         let settings_block = activity_settings_block(area);
         let explorer_active = self.sidebar_view == SidebarView::Explorer;
         let search_active = self.sidebar_view == SidebarView::Search;
         let source_control_active = self.sidebar_view == SidebarView::SourceControl;
         let remote_active = self.sidebar_view == SidebarView::Remote;
         let run_debug_active = self.sidebar_view == SidebarView::RunDebug;
+        let extensions_active = self.sidebar_view == SidebarView::Extensions;
         let settings_active = self.settings_menu_active();
         // Hover brightens the glyph (like active) but draws no selection pill,
         // mirroring the image path's hovered variant. Selected wins over hover.
@@ -5288,6 +5339,7 @@ impl App {
         let source_control_hovered = hov == Some(ActivityIcon::SourceControl);
         let remote_hovered = hov == Some(ActivityIcon::Remote);
         let run_debug_hovered = hov == Some(ActivityIcon::RunDebug);
+        let extensions_hovered = hov == Some(ActivityIcon::Extensions);
         let settings_hovered = hov == Some(ActivityIcon::Settings);
 
         let active_color = Color::White;
@@ -5374,6 +5426,13 @@ impl App {
                 run_debug_active,
                 run_debug_hovered,
             );
+            render_glyph(
+                frame,
+                extensions_block,
+                crate::icons::ACTIVITY_EXTENSIONS,
+                extensions_active,
+                extensions_hovered,
+            );
             if settings_block.width > 0 {
                 render_glyph(
                     frame,
@@ -5390,6 +5449,7 @@ impl App {
         self.sidebar_areas.source_control_icon = source_control_block;
         self.sidebar_areas.remote_icon = remote_block;
         self.sidebar_areas.run_debug_icon = run_debug_block;
+        self.sidebar_areas.extensions_icon = extensions_block;
         self.sidebar_areas.settings_icon = settings_block;
     }
 
@@ -5455,7 +5515,20 @@ impl App {
                 self.refresh_run_debug();
                 self.focus_pane(Pane::Tree);
             }
+            SidebarView::Extensions => {
+                self.refresh_extensions();
+                self.focus_pane(Pane::Tree);
+            }
         }
+    }
+
+    /// Rebuild the Extensions panel's row list from the bundled + user manifests,
+    /// stamping each with its live enabled state from prefs. Called whenever the
+    /// view is shown or a toggle flips, so the list always reflects the manifests
+    /// on disk and the current disable set.
+    fn refresh_extensions(&mut self) {
+        let items = build_extension_items(&self.disabled_extensions);
+        self.extensions.set_items(items);
     }
 
     fn pane_visible(&self, p: Pane) -> bool {
@@ -5634,6 +5707,8 @@ impl App {
         self.remote.focused = self.focus == Pane::Tree && self.sidebar_view == SidebarView::Remote;
         self.run_debug.focused =
             self.focus == Pane::Tree && self.sidebar_view == SidebarView::RunDebug;
+        self.extensions.focused =
+            self.focus == Pane::Tree && self.sidebar_view == SidebarView::Extensions;
         self.editor.focused = self.focus == Pane::Editor;
         // The split group is by definition the NON-focused editor group,
         // so its border never lights up even while the editor pane holds
@@ -5652,14 +5727,22 @@ impl App {
         // Every editor in both groups, not just the active one (deref would
         // only hit the active editor): a tab switch or the split group must
         // not resurrect the legacy navy active-tab chip between syncs.
+        // The bundled PDF / CSV viewers are gated by the Extensions panel:
+        // when disabled, the editor opens those file types as plain text.
+        let pdf_on = self.is_extension_enabled("pdf");
+        let csv_on = self.is_extension_enabled("csv");
         for ed in self.editor.editors.iter_mut() {
             ed.focus_gradient = gradient;
             ed.theme = self.theme;
+            ed.pdf_viewer_enabled = pdf_on;
+            ed.csv_viewer_enabled = csv_on;
         }
         if let Some(split) = self.editor_split.as_mut() {
             for ed in split.editors.iter_mut() {
                 ed.focus_gradient = gradient;
                 ed.theme = self.theme;
+                ed.pdf_viewer_enabled = pdf_on;
+                ed.csv_viewer_enabled = csv_on;
             }
         }
         self.tree.focus_gradient = gradient;
@@ -5932,6 +6015,7 @@ impl App {
             self.open_editors.hover_pointer = panel_pointer;
             self.timeline.hover_pointer = panel_pointer;
             self.dependencies.hover_pointer = panel_pointer;
+            self.extensions.hover_pointer = panel_pointer;
             // Explorer stacks its toggled sub-views (Open Editors / Folders /
             // Outline / Timeline / Dependencies) inside the usable strip.
             // Every other sidebar view fills it with its single activity widget.
@@ -5943,6 +6027,7 @@ impl App {
                 }
                 SidebarView::Remote => frame.render_widget(&mut self.remote, usable_area),
                 SidebarView::RunDebug => frame.render_widget(&mut self.run_debug, usable_area),
+                SidebarView::Extensions => frame.render_widget(&mut self.extensions, usable_area),
             }
         }
         if self.editor_split.is_none() && self.editor.is_blank_initial() {
@@ -7168,6 +7253,11 @@ impl App {
             self.set_sidebar_view(SidebarView::Remote);
             return Ok(());
         }
+        if is_extensions_jump_key(key) {
+            self.show_tree = true;
+            self.set_sidebar_view(SidebarView::Extensions);
+            return Ok(());
+        }
         if self.is_remote && is_drop_to_local_key(key) {
             self.drop_to_local = true;
             self.quit = true;
@@ -7216,6 +7306,7 @@ impl App {
                 SidebarView::SourceControl => self.handle_source_control_key(key),
                 SidebarView::Remote => self.handle_remote_key(key),
                 SidebarView::RunDebug => self.handle_run_debug_key(key),
+                SidebarView::Extensions => self.handle_extensions_key(key),
             },
             Pane::Editor => {
                 self.handle_editor_key(key);
@@ -7453,6 +7544,49 @@ impl App {
         // `git status --porcelain` shell-out that used to stall the UI
         // thread on every Source Control click.
         self.git.request_changes();
+    }
+
+    fn handle_extensions_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Up => self.extensions.move_up(),
+            KeyCode::Down => self.extensions.move_down(),
+            KeyCode::PageUp => self.extensions.scroll_up(10),
+            KeyCode::PageDown => self.extensions.scroll_down(10),
+            // Space / Enter flip the selected extension, like VS Code's
+            // Enable/Disable action on the focused row.
+            KeyCode::Char(' ') | KeyCode::Enter => self.toggle_selected_extension(),
+            KeyCode::Esc => self.set_sidebar_view(SidebarView::Explorer),
+            _ => {}
+        }
+    }
+
+    /// Flip the enabled state of the Extensions panel's selected row: update the
+    /// in-memory disabled set, persist it, rebuild the list (so the row's state
+    /// label and dim styling refresh), and apply any immediate feature gating
+    /// (e.g. closing a now-disabled viewer). LSP extensions only re-evaluate on
+    /// the next launch; the others gate live.
+    fn toggle_selected_extension(&mut self) {
+        let Some(id) = self.extensions.selected_id().map(str::to_string) else {
+            return;
+        };
+        let now_enabled = self.disabled_extensions.contains(&id);
+        if now_enabled {
+            self.disabled_extensions.remove(&id);
+        } else {
+            self.disabled_extensions.insert(id.clone());
+        }
+        let _ = crate::prefs::save_disabled_extensions(&self.disabled_extensions);
+        self.refresh_extensions();
+        self.status = format!(
+            "{} extension '{id}'",
+            if now_enabled { "Enabled" } else { "Disabled" }
+        );
+    }
+
+    /// Whether the extension `id` is currently enabled (not in the disabled set).
+    /// The single gate the bundled features consult before activating.
+    fn is_extension_enabled(&self, id: &str) -> bool {
+        !self.disabled_extensions.contains(id)
     }
 
     fn handle_run_debug_key(&mut self, key: KeyEvent) {
@@ -10114,6 +10248,16 @@ impl App {
     /// any lingering `/` `?` search-match highlights, since the modal layer is
     /// the only place that clears them.
     fn toggle_vim_mode(&mut self) {
+        // The Vim modal layer is a bundled, toggleable extension: when disabled
+        // in the Extensions panel, Cmd+E is inert (and any active session is
+        // force-ended so a disable can't strand the editor in modal mode).
+        if !self.is_extension_enabled("vim") {
+            if self.vim.enabled {
+                self.vim.toggle();
+            }
+            self.status = String::from("Vim extension is disabled");
+            return;
+        }
         self.vim.toggle();
         if self.vim.enabled {
             self.status = String::from("vim mode on");
@@ -12514,6 +12658,7 @@ impl App {
             Cmd::ShowSourceControl => self.set_sidebar_view(SidebarView::SourceControl),
             Cmd::ShowRunDebug => self.set_sidebar_view(SidebarView::RunDebug),
             Cmd::ShowRemote => self.set_sidebar_view(SidebarView::Remote),
+            Cmd::ShowExtensions => self.set_sidebar_view(SidebarView::Extensions),
             Cmd::ToggleSideBar => self.show_tree = !self.show_tree,
             Cmd::ToggleTerminal => self.toggle_terminal(),
             Cmd::NewTerminal => match self.split_terminal() {
@@ -13594,6 +13739,7 @@ impl App {
             SidebarView::SourceControl => self.source_control.last_area,
             SidebarView::Remote => self.remote.last_area,
             SidebarView::RunDebug => self.run_debug.last_area,
+            SidebarView::Extensions => self.extensions.last_area,
         };
         let in_tree = self.show_tree && rect_contains(active_sidebar_area, m.column, m.row);
         // The OUTLINE section sits below the tree in the Explorer sidebar and
@@ -14052,6 +14198,10 @@ impl App {
                     self.set_sidebar_view(SidebarView::RunDebug);
                     return;
                 }
+                if rect_contains(self.sidebar_areas.extensions_icon, m.column, m.row) {
+                    self.set_sidebar_view(SidebarView::Extensions);
+                    return;
+                }
                 if rect_contains(self.sidebar_areas.settings_icon, m.column, m.row) {
                     self.open_settings_menu();
                     return;
@@ -14251,6 +14401,23 @@ impl App {
                         }
                     } else if self.run_debug.click_button(m.column, m.row) {
                         self.run_debug_button_action();
+                    }
+                    return;
+                }
+                if in_tree && self.sidebar_view == SidebarView::Extensions {
+                    self.focus_pane(Pane::Tree);
+                    // Clicking a row selects it; clicking the already-selected
+                    // row's Enable/Disable pill flips its state. The pill is only
+                    // laid out for the selected row, so a first click on a fresh
+                    // row just selects (arming the pill), VS Code-style.
+                    if let Some(idx) = self.extensions.row_at(m.row) {
+                        if self.extensions.is_selected(idx)
+                            && self.extensions.click_action(m.column, m.row)
+                        {
+                            self.toggle_selected_extension();
+                        } else {
+                            self.extensions.select(idx);
+                        }
                     }
                     return;
                 }
@@ -14564,6 +14731,7 @@ impl App {
                                 self.search.scroll_to_bar_y(m.row);
                             }
                             SidebarView::RunDebug => {}
+                            SidebarView::Extensions => {}
                         },
                         Pane::Editor => {
                             self.editor.scroll_to_bar_y(m.row);
@@ -14643,7 +14811,8 @@ impl App {
                         }
                         SidebarView::Search
                         | SidebarView::SourceControl
-                        | SidebarView::RunDebug => {}
+                        | SidebarView::RunDebug
+                        | SidebarView::Extensions => {}
                     }
                 } else if in_terminal {
                     self.terminal_mut().extend_selection_to(m.column, m.row);
@@ -14739,6 +14908,7 @@ impl App {
                         SidebarView::SourceControl => self.source_control.scroll_down(3),
                         SidebarView::Search => self.search.scroll_down(3),
                         SidebarView::RunDebug => {}
+                        SidebarView::Extensions => self.extensions.scroll_down(3),
                     }
                 } else if in_editor {
                     if let Some(diff) = self.editor.diff.as_mut() {
@@ -14771,6 +14941,7 @@ impl App {
                         SidebarView::SourceControl => self.source_control.scroll_up(3),
                         SidebarView::Search => self.search.scroll_up(3),
                         SidebarView::RunDebug => {}
+                        SidebarView::Extensions => self.extensions.scroll_up(3),
                     }
                 } else if in_editor {
                     if let Some(diff) = self.editor.diff.as_mut() {
@@ -16512,6 +16683,14 @@ fn is_remote_jump_key(key: KeyEvent) -> bool {
     is_cmd_shift_letter(key, 'r')
 }
 
+/// `Ctrl/Cmd+Shift+X`: jump to the Extensions sidebar view from any pane.
+/// Matches VS Code's "View: Show Extensions". Cmd+Shift+X is unbound by any
+/// default macOS / iTerm2 menu item, so `setup-iterm2` only needs the
+/// GlobalKeyMap forwarder (no menu relocation) to deliver it here.
+fn is_extensions_jump_key(key: KeyEvent) -> bool {
+    is_cmd_shift_letter(key, 'x')
+}
+
 fn is_drop_to_local_key(key: KeyEvent) -> bool {
     is_cmd_shift_letter(key, 'l')
 }
@@ -17637,6 +17816,7 @@ fn sidebar_view_label(view: SidebarView) -> &'static str {
         SidebarView::SourceControl => "SourceControl",
         SidebarView::Remote => "Remote",
         SidebarView::RunDebug => "RunDebug",
+        SidebarView::Extensions => "Extensions",
     }
 }
 
@@ -17647,8 +17827,25 @@ fn sidebar_view_from_label(label: &str) -> Option<SidebarView> {
         "SourceControl" => Some(SidebarView::SourceControl),
         "Remote" => Some(SidebarView::Remote),
         "RunDebug" => Some(SidebarView::RunDebug),
+        "Extensions" => Some(SidebarView::Extensions),
         _ => None,
     }
+}
+
+/// Collect the bundled and user-installed extension manifests, project them to
+/// the panel's row list, and stamp each with its enabled state from `disabled`.
+/// The bundled set ships in the binary; user extensions are read fresh from
+/// `~/.config/croft/extensions/` each call so a newly dropped-in extension shows
+/// up without a relaunch.
+fn build_extension_items(
+    disabled: &std::collections::BTreeSet<String>,
+) -> Vec<crate::widgets::extensions::ExtensionItem> {
+    use crate::lsp::manifest;
+    let user = manifest::read_extension_sources(&manifest::user_extensions_dir());
+    let mut sources: Vec<&str> = manifest::BUNDLED_MANIFESTS.to_vec();
+    sources.extend(user.iter().map(String::as_str));
+    let summaries = manifest::summaries(&sources);
+    crate::widgets::extensions::items_from_summaries(summaries, disabled)
 }
 
 /// Live cwd of a running process by PID, or None when the platform doesn't

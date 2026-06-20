@@ -1213,6 +1213,12 @@ pub struct Editor {
     /// Active color theme; drives the scrollbar track/thumb colors. Set by the
     /// app's theme sync.
     pub theme: crate::theme::Theme,
+    /// Whether the bundled PDF and CSV viewer extensions are enabled. Set by the
+    /// app from its disabled-extensions set; when off, `open` skips the inline
+    /// viewer and falls through to opening the file as plain text. Default true
+    /// so a freshly constructed editor (and every test) keeps the viewers on.
+    pub pdf_viewer_enabled: bool,
+    pub csv_viewer_enabled: bool,
     pub dirty: bool,
     pub status: String,
     pub last_area: Rect,
@@ -1364,6 +1370,8 @@ impl Editor {
             focused: false,
             focus_gradient: false,
             theme: crate::theme::Theme::default(),
+            pdf_viewer_enabled: true,
+            csv_viewer_enabled: true,
             dirty: false,
             status: String::from("No file open"),
             last_area: Rect::default(),
@@ -1705,10 +1713,10 @@ impl Editor {
         if extension_is_image(ext) {
             return self.open_image(path);
         }
-        if extension_is_pdf(ext) {
+        if extension_is_pdf(ext) && self.pdf_viewer_enabled {
             return self.open_pdf(path);
         }
-        if crate::sheet::extension_is_sheet(ext) {
+        if crate::sheet::extension_is_sheet(ext) && self.csv_viewer_enabled {
             return self.open_sheet(path);
         }
         let meta = std::fs::metadata(path)?;
@@ -5875,6 +5883,35 @@ mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::NamedTempFile;
+
+    #[test]
+    fn disabling_the_csv_viewer_opens_the_file_as_plain_text() {
+        // A .csv opens in the inline sheet viewer by default, but when the CSV
+        // extension is disabled in the Extensions panel the same file must fall
+        // through to a normal text buffer (no sheet, raw rows as lines).
+        let f = tempfile::Builder::new()
+            .suffix(".csv")
+            .tempfile()
+            .expect("temp csv");
+        std::fs::write(f.path(), "a,b\n1,2\n").expect("write csv");
+
+        let mut on = Editor::new();
+        on.open(f.path()).expect("open with viewer enabled");
+        assert!(on.sheet.is_some(), "enabled CSV viewer renders the sheet");
+
+        let mut off = Editor::new();
+        off.csv_viewer_enabled = false;
+        off.open(f.path()).expect("open with viewer disabled");
+        assert!(
+            off.sheet.is_none(),
+            "disabled CSV viewer must not build a sheet"
+        );
+        assert_eq!(
+            off.lines,
+            vec!["a,b".to_string(), "1,2".to_string()],
+            "disabled CSV viewer opens the raw rows as text lines"
+        );
+    }
 
     #[test]
     fn toggle_breakpoint_adds_then_removes_on_cursor_line() {

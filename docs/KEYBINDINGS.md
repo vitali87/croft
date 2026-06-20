@@ -24,8 +24,9 @@ On macOS, the `Cmd` chords below only reach croft after you run a one-time setup
 | `Ctrl+Shift+s` / `Cmd+Shift+s` | Jump to Source Control |
 | `Ctrl+Shift+d` / `Cmd+Shift+d` | Jump to Run and Debug |
 | `Ctrl+Shift+r` / `Cmd+Shift+r` | Jump to Remote (SSH) |
+| `Ctrl+Shift+x` / `Cmd+Shift+x` | Jump to Extensions |
 | `Ctrl+Shift+l` / `Cmd+Shift+l` | While on a remote, disconnect and return to the local croft at the directory you connected from |
-| Click activity-bar icons | Switch between Explorer, Search, Source Control, Run and Debug, and Remote |
+| Click activity-bar icons | Switch between Explorer, Search, Source Control, Run and Debug, Remote, and Extensions |
 | Click the settings gear | Open settings → Color Theme picker (Croft Dark Blue / Croft Black) |
 | Drag a seam | Resize the sidebar, the split between editor columns, or the editor/terminal split |
 | Mouse wheel | Scroll the pane under the pointer |
@@ -215,6 +216,19 @@ When paused, the Run and Debug panel shows the **call stack** (click a frame to 
 
 Also in the Command Palette: Start / Stop / Pause / Restart Debugging, Toggle Breakpoint, Add Conditional Breakpoint, Step Over, Toggle Break on Raised Exceptions (uncaught always breaks), and Attach to Python Process.
 
+## Extensions sidebar
+
+Jump here with `Cmd+Shift+X` (or the activity-bar icon, or the Command Palette's "View: Show Extensions"). The panel lists croft's bundled extensions — the PDF and CSV viewers, Vim mode, and the Python / TypeScript / Rust / Go language servers — each with a right-aligned **Enabled** / **Disabled** state. Any extensions you drop into `~/.config/croft/extensions/<id>/` appear here too.
+
+| Keys | Action |
+|------|--------|
+| `Up` / `Down` | Move the selection |
+| `Space` / `Enter` | Enable or disable the selected extension |
+| Click a row | Select it (the selected row reveals its Enable/Disable action) |
+| Click the action pill | Toggle the selected extension |
+
+Disabling takes effect immediately for the viewers and Vim (a disabled PDF/CSV viewer opens that file type as plain text; a disabled Vim makes `Cmd+E` inert); a disabled language server stops spawning on the next launch. The choice persists in `~/.config/croft/config.json`.
+
 ## Terminal
 
 | Keys | Action |
@@ -238,7 +252,7 @@ Also in the Command Palette: Start / Stop / Pause / Restart Debugging, Toggle Br
 | `⌘F` | In-editor Find |
 | `⌘/` | Toggle line comment |
 | `⌥⌘↑` / `⌥⌘↓` | Add a cursor above / below (multi-cursor) |
-| `⌘⇧E` / `⌘⇧F` / `⌘⇧S` / `⌘⇧D` / `⌘⇧R` | Jump to Explorer / Search / Source Control / Run and Debug / Remote |
+| `⌘⇧E` / `⌘⇧F` / `⌘⇧S` / `⌘⇧D` / `⌘⇧R` / `⌘⇧X` | Jump to Explorer / Search / Source Control / Run and Debug / Remote / Extensions |
 | `⌘⇧L` | Disconnect a remote session |
 | `⌘⇧N` | Explorer "New folder" prompt |
 | `⌃⇧J` | Maximize the terminal pane |

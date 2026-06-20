@@ -105,6 +105,17 @@ const CMD_SHIFT_D_HEX: &str = "0x1b 0x5b 0x36 0x38 0x3b 0x31 0x30 0x75";
 /// virtualKeyCode `kVK_ANSI_R` = 0x0f. CSI-u `ESC [ 82 ; 10 u`.
 const CMD_SHIFT_R_KEY: &str = "0x52-0x120000-0xf";
 const CMD_SHIFT_R_HEX: &str = "0x1b 0x5b 0x38 0x32 0x3b 0x31 0x30 0x75";
+/// `Cmd+Shift+X` — jump to the Extensions sidebar view. Matches VS Code's
+/// "View: Show Extensions". Cmd+Shift+X is unbound by any default macOS / iTerm2
+/// menu item (verified 2026-06-20), so like Cmd+Shift+S no NSUserKeyEquivalents
+/// relocation is needed; the GlobalKeyMap forwarder simply claims the chord.
+/// Codepoint 'X' (0x58 = 88), virtualKeyCode `kVK_ANSI_X` = 0x07, modifier mask
+/// 0x120000 (Cmd+Shift). CSI-u `ESC [ 88 ; 10 u` (modifier byte 10 = 1 base +
+/// Shift(1) + Super(8)), which crossterm decodes back to
+/// `KeyEvent { code: Char('X'), modifiers: SHIFT | SUPER }`, accepted
+/// case-insensitively by `is_extensions_jump_key`.
+const CMD_SHIFT_X_KEY: &str = "0x58-0x120000-0x7";
+const CMD_SHIFT_X_HEX: &str = "0x1b 0x5b 0x38 0x38 0x3b 0x31 0x30 0x75";
 /// `Cmd+Shift+L` — disconnect a remote session and drop back into the local
 /// croft. Codepoint 'L' (0x4c = 76), virtualKeyCode `kVK_ANSI_L` = 0x25.
 /// CSI-u `ESC [ 76 ; 10 u`. Forwarded defensively so AppKit / iTerm2 cannot
@@ -399,6 +410,7 @@ pub(crate) mod payloads {
     pub(crate) const CMD_SHIFT_S_HEX: &str = super::CMD_SHIFT_S_HEX;
     pub(crate) const CMD_SHIFT_SLASH_HEX: &str = super::CMD_SHIFT_SLASH_HEX;
     pub(crate) const CMD_SHIFT_T_HEX: &str = super::CMD_SHIFT_T_HEX;
+    pub(crate) const CMD_SHIFT_X_HEX: &str = super::CMD_SHIFT_X_HEX;
     pub(crate) const CMD_SLASH_HEX: &str = super::CMD_SLASH_HEX;
     pub(crate) const CMD_T_HEX: &str = super::CMD_T_HEX;
     pub(crate) const CMD_W_HEX: &str = super::CMD_W_HEX;
@@ -622,6 +634,7 @@ pub fn apply_croft_key_settings(plist: &mut Value) -> Result<(), ITerm2Error> {
         (CMD_SHIFT_S_KEY, CMD_SHIFT_S_HEX),
         (CMD_SHIFT_D_KEY, CMD_SHIFT_D_HEX),
         (CMD_SHIFT_R_KEY, CMD_SHIFT_R_HEX),
+        (CMD_SHIFT_X_KEY, CMD_SHIFT_X_HEX),
         (CMD_SHIFT_L_KEY, CMD_SHIFT_L_HEX),
         (CMD_SHIFT_N_KEY, CMD_SHIFT_N_HEX),
         (CMD_SHIFT_T_KEY, CMD_SHIFT_T_HEX),

@@ -46,6 +46,13 @@ pub const ACTIVITY_SOURCE_CONTROL: char = '\u{ea68}';
 /// NOT use U+EAD8 (cod-debug, just the bug) or U+EB2C (cod-play, just
 /// the triangle): both lose half the silhouette.
 pub const ACTIVITY_RUN_DEBUG: char = '\u{eb91}';
+/// Codicon `extensions` — the four-squares-with-one-detached glyph VS Code
+/// uses for its Extensions activity-bar entry. Verified on 2026-06-20 against
+/// the upstream codicon `mapping.json`: `extensions` is decimal **60134**
+/// (U+EAE6). Cross-checked against three siblings already in this file that
+/// match the same source (`source-control`=60008=U+EA68, `files`=60144=U+EAF0,
+/// `debug-alt`=60305=U+EB91), confirming Nerd Fonts preserve codicon codepoints.
+pub const ACTIVITY_EXTENSIONS: char = '\u{eae6}';
 /// Codicon `replace-all` — the two-line "find & replace, all" glyph VS Code
 /// shows beside the Replace input in its Search sidebar. Verified on
 /// 2026-06-19 against the upstream codicon `mapping.json`: replace-all is

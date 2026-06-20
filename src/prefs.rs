@@ -107,24 +107,6 @@ impl Prefs {
     pub fn set_theme(&mut self, theme: Theme) {
         self.theme = theme.id().to_string();
     }
-
-    /// Whether an extension is active. Everything is enabled unless its id was
-    /// explicitly disabled.
-    // Consumed by the Extensions panel (Phase A-2), staged ahead of its wiring.
-    #[allow(dead_code)]
-    pub fn is_extension_enabled(&self, id: &str) -> bool {
-        !self.disabled_extensions.contains(id)
-    }
-
-    /// Enable or disable an extension by id.
-    #[allow(dead_code)]
-    pub fn set_extension_enabled(&mut self, id: &str, enabled: bool) {
-        if enabled {
-            self.disabled_extensions.remove(id);
-        } else {
-            self.disabled_extensions.insert(id.to_string());
-        }
-    }
 }
 
 /// Persist `theme` to the config file, preserving any other settings already
@@ -165,8 +147,6 @@ pub fn save_explorer_views(views: ExplorerViewsPrefs) -> Result<()> {
 
 /// Persist the set of disabled extension ids, preserving other settings.
 /// Best-effort: a write failure is swallowed by the caller.
-// Consumed by the Extensions panel toggle handler (Phase A-2).
-#[allow(dead_code)]
 pub fn save_disabled_extensions(disabled: &BTreeSet<String>) -> Result<()> {
     let path = config_path();
     let mut prefs = Prefs::load(&path).unwrap_or_default();
