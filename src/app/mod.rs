@@ -5768,6 +5768,7 @@ impl App {
         self.dependencies.focused = explorer_focused;
         self.remote.focus_gradient = gradient;
         self.remote.theme = self.theme;
+        self.extensions.theme = self.theme;
         for t in self.terminals.iter_mut() {
             t.focus_gradient = gradient;
         }
