@@ -13,7 +13,12 @@
 //! hardware keystrokes.
 //!
 //! Layers mirror a phone keyboard: lowercase, Shift (one-shot uppercase,
-//! like a phone's shift), and a symbols page. Caps Lock is a persistent
+//! like a phone's shift), and two symbol pages. The `?123` page carries
+//! digits and the common programming punctuation; its row-3 lead key (where
+//! Shift sits on the letter pages) is Gboard's `=\<` switch to a second
+//! "more symbols" page of tilde, backtick, pipe, the bracket family, and the
+//! math / typographic / currency glyphs, with `?123` switching back. Caps
+//! Lock is a persistent
 //! uppercase lock that - like a real Mac caps lock - uppercases letters
 //! only, leaving digits and punctuation untouched. Ctrl and Alt are
 //! one-shot latches that apply to the next key tap, so Ctrl+C / Ctrl+P
@@ -90,7 +95,12 @@ pub fn band_height(frame_height: u16) -> u16 {
 pub enum OskLayer {
     Lower,
     Upper,
+    /// Gboard's `?123` page: digits and common programming punctuation.
     Symbols,
+    /// Gboard's `=\<` "more symbols" page: tilde, backtick, pipe, the
+    /// bracket family, math/typographic glyphs and currency. Reached from
+    /// `Symbols` via the row-3 page-switch key (where Shift sits on letters).
+    Symbols2,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -115,8 +125,13 @@ pub enum OskKey {
     Ctrl,
     /// One-shot Alt latch, same lifecycle as `ctrl`.
     Alt,
-    /// Toggle the Symbols layer.
+    /// Toggle the Symbols (`?123`) layer from the bottom row; from either
+    /// symbol page it returns to letters.
     Symbols,
+    /// Switch between the two symbol pages (Gboard's `=\<` ⇄ `?123`). Sits in
+    /// the row-3 lead slot on the symbol pages only, where Shift lives on the
+    /// letter pages. Like the other layer toggles it emits no keystroke.
+    MoreSymbols,
     /// Toggle the split (two thumb clusters) layout; persisted by the app.
     SplitToggle,
     /// Microphone (Termux only, via `termux-dialog speech`): a tap opens the
@@ -253,7 +268,19 @@ fn rows_for(layer: OskLayer, caps: bool, split: bool) -> Vec<Vec<KeySlot>> {
     // immediately right of the layer toggle, period immediately left of
     // Enter. The bottom row is therefore `?123 , ctrl alt space alt ctrl . ⏎`
     // (with `abc` replacing `?123` on the symbols page).
-    let symbols = layer == OskLayer::Symbols;
+    let on_symbols = matches!(layer, OskLayer::Symbols | OskLayer::Symbols2);
+    // On the symbol pages the row-3 lead key is Gboard's symbol-page switch
+    // (`=\<` on `?123`, `?123` on `=\<`) rather than Shift, which has no role
+    // among symbols; it toggles between the two symbol pages. On the letter
+    // pages it stays Shift. Same wide cap as Shift either way.
+    let more_symbols = layer == OskLayer::Symbols2;
+    let row3_lead = || {
+        if !on_symbols {
+            return shift();
+        }
+        let label = if more_symbols { "?123" } else { "=\\<" };
+        slot(label, "=\\<", OskKey::MoreSymbols, 9, 9)
+    };
     let bottom = |layer_label: &str| {
         let mut r = vec![
             slot(layer_label, "", OskKey::Symbols, 6, 8),
@@ -287,8 +314,13 @@ fn rows_for(layer: OskLayer, caps: bool, split: bool) -> Vec<Vec<KeySlot>> {
         (OskLayer::Lower, true) => ("QWERTYUIOP", "ASDFGHJKL", "ZXCVBNM"),
         (OskLayer::Upper, _) => ("QWERTYUIOP", "ASDFGHJKL", "ZXCVBNM"),
         (OskLayer::Symbols, _) => ("1234567890", "@#$_&-+()/", "*\"':;!?\\"),
+        // Gboard's `=\<` page: AOSP's symbols-shift glyphs (tilde, backtick,
+        // pipe, bullet/√/π/÷/×/¶/∆, currency, ^ ° =, the brace/bracket pairs)
+        // with `< > %` seated on the bottom row so a coding TUI gets every
+        // bracket and operator one page-switch away.
+        (OskLayer::Symbols2, _) => ("~`|•√π÷×¶∆", "£¢€¥^°={}", "<>%©®™[]"),
     };
-    let layer_label = if symbols { "abc" } else { "?123" };
+    let layer_label = if on_symbols { "abc" } else { "?123" };
     // The five-letter seam: the home row's left half ends with `home[..5]`'s
     // last letter (`g` on the letter page) and its right half starts with that
     // same letter again; likewise the shift row duplicates `low[..4]`'s last
@@ -313,8 +345,9 @@ fn rows_for(layer: OskLayer, caps: bool, split: bool) -> Vec<Vec<KeySlot>> {
         // shift letters split 4|3 with the 4th letter duplicated:
         //   left:  ⇧ low[0..4]               (… ends in `v`)
         //   right: low[3..] ⌫                (starts in `v` again)
+        // On the symbol pages `row3_lead` is the `=\<`/`?123` page-switch.
         let shift_full = {
-            let mut r = vec![shift()];
+            let mut r = vec![row3_lead()];
             r.extend(char_slots(&char_prefix(low, 4)));
             r.push(gap_slot());
             r.extend(char_slots(&char_suffix(low, 3)));
@@ -333,7 +366,8 @@ fn rows_for(layer: OskLayer, caps: bool, split: bool) -> Vec<Vec<KeySlot>> {
         return rows;
     }
     // Merged: the home row carries the two small edge arrows flanking all its
-    // letters; the shift row is shift + letters + backspace.
+    // letters; the shift row is the row-3 lead (Shift on letters, the symbol
+    // page-switch on the symbol pages) + characters + backspace.
     let home_row = {
         let mut r = vec![arrow_lr()];
         r.extend(char_slots(home));
@@ -345,7 +379,7 @@ fn rows_for(layer: OskLayer, caps: bool, split: bool) -> Vec<Vec<KeySlot>> {
         char_slots(top),
         home_row,
         {
-            let mut r = vec![shift()];
+            let mut r = vec![row3_lead()];
             r.extend(char_slots(low));
             r.push(bksp());
             r
@@ -558,9 +592,19 @@ impl Osk {
                 None
             }
             OskKey::Symbols => {
+                // The bottom-row toggle returns to letters from either symbol
+                // page, and enters page 1 from the letters.
                 self.layer = match self.layer {
-                    OskLayer::Symbols => OskLayer::Lower,
+                    OskLayer::Symbols | OskLayer::Symbols2 => OskLayer::Lower,
                     _ => OskLayer::Symbols,
+                };
+                None
+            }
+            OskKey::MoreSymbols => {
+                // The row-3 page-switch flips between the two symbol pages.
+                self.layer = match self.layer {
+                    OskLayer::Symbols2 => OskLayer::Symbols,
+                    _ => OskLayer::Symbols2,
                 };
                 None
             }
@@ -657,7 +701,10 @@ impl Osk {
             // Shift lights up for one-shot uppercase and stays lit while caps
             // lock is engaged (it is also the caps indicator, Gboard-style).
             OskKey::Shift => self.shifted(),
-            OskKey::Symbols => self.layer == OskLayer::Symbols,
+            // The bottom-row `?123`/`abc` toggle stays lit on either symbol
+            // page (it is the "you are in symbols" indicator); the in-page
+            // `=\<`/`?123` switch is plain navigation chrome and never lit.
+            OskKey::Symbols => matches!(self.layer, OskLayer::Symbols | OskLayer::Symbols2),
             OskKey::SplitToggle => self.split,
             // The mic glows while a recognition session is live (tap on, tap
             // off). Listening state is a process-global flag (like the
@@ -1494,6 +1541,107 @@ mod tests {
         assert_eq!(osk.layer, OskLayer::Symbols);
         assert!(osk.tap(OskKey::Symbols).is_none());
         assert_eq!(osk.layer, OskLayer::Lower);
+    }
+
+    #[test]
+    fn symbol_pages_lead_row_three_with_the_page_switch_not_shift() {
+        // On the letter pages the row-3 lead key is Shift; on both symbol
+        // pages it is the `=\<`/`?123` page-switch instead (Gboard-style),
+        // since Shift has no role among symbols.
+        let lead_key = |layer: OskLayer| {
+            rows_for(layer, false, false)
+                .into_iter()
+                .find_map(|row| {
+                    let lead = &row[0];
+                    matches!(lead.key, OskKey::Shift | OskKey::MoreSymbols).then_some(lead.key)
+                })
+                .expect("a row led by Shift or the page-switch")
+        };
+        assert_eq!(lead_key(OskLayer::Lower), OskKey::Shift);
+        assert_eq!(lead_key(OskLayer::Symbols), OskKey::MoreSymbols);
+        assert_eq!(lead_key(OskLayer::Symbols2), OskKey::MoreSymbols);
+        // Shift is therefore absent from the symbol pages.
+        let mut osk = Osk::new();
+        osk.tap(OskKey::Symbols);
+        osk.layout(band());
+        assert!(
+            osk.rect_for(OskKey::Shift).is_none(),
+            "Shift is replaced by the page-switch on the symbols page"
+        );
+        assert!(osk.rect_for(OskKey::MoreSymbols).is_some());
+    }
+
+    #[test]
+    fn more_symbols_page_carries_tilde_and_the_bracket_family() {
+        // The second symbol page is one page-switch from the first: ?123 then
+        // =\< lands on Gboard's "more symbols", which must carry the tilde the
+        // issue called out plus every bracket/operator a coding TUI needs.
+        let mut osk = Osk::new();
+        osk.tap(OskKey::Symbols);
+        assert_eq!(osk.layer, OskLayer::Symbols);
+        assert!(osk.tap(OskKey::MoreSymbols).is_none());
+        assert_eq!(osk.layer, OskLayer::Symbols2);
+        osk.layout(band());
+        for c in ['~', '`', '|', '^', '=', '%', '{', '}', '[', ']', '<', '>'] {
+            assert!(
+                osk.rect_for(OskKey::Char(c)).is_some(),
+                "missing key {c:?} on the more-symbols page"
+            );
+        }
+        // The page-1-only glyphs are not duplicated here, and digits stay on
+        // page 1, so the two pages do not overlap.
+        for c in ['1', '@', '/'] {
+            assert!(
+                osk.rect_for(OskKey::Char(c)).is_none(),
+                "{c:?} belongs to the ?123 page, not the more-symbols page"
+            );
+        }
+        // Typing a symbol holds the page (like the ?123 page, unlike Shift).
+        osk.tap(OskKey::Char('~'));
+        assert_eq!(osk.layer, OskLayer::Symbols2);
+    }
+
+    #[test]
+    fn page_switch_round_trips_and_abc_returns_to_letters_from_either_page() {
+        let mut osk = Osk::new();
+        // Letters -> ?123 -> =\< -> ?123 (round trip via the in-page switch).
+        osk.tap(OskKey::Symbols);
+        assert_eq!(osk.layer, OskLayer::Symbols);
+        osk.tap(OskKey::MoreSymbols);
+        assert_eq!(osk.layer, OskLayer::Symbols2);
+        osk.tap(OskKey::MoreSymbols);
+        assert_eq!(osk.layer, OskLayer::Symbols);
+        // The bottom-row `abc` toggle returns to letters from page 1.
+        osk.tap(OskKey::Symbols);
+        assert_eq!(osk.layer, OskLayer::Lower);
+        // ...and from page 2 directly (not just back through page 1).
+        osk.tap(OskKey::Symbols);
+        osk.tap(OskKey::MoreSymbols);
+        assert_eq!(osk.layer, OskLayer::Symbols2);
+        osk.tap(OskKey::Symbols);
+        assert_eq!(osk.layer, OskLayer::Lower);
+    }
+
+    #[test]
+    fn more_symbols_page_splits_into_two_thumb_clusters() {
+        // The =\< page reuses the 10/9/8 symbol geometry, so the split layout
+        // must open a center channel here exactly as it does on the letters.
+        let mut osk = Osk::new();
+        osk.split = true;
+        osk.tap(OskKey::Symbols);
+        osk.tap(OskKey::MoreSymbols);
+        assert_eq!(osk.layer, OskLayer::Symbols2);
+        osk.layout(wide());
+        let center = wide().x + wide().width / 2;
+        for i in 0..OSK_ROWS {
+            assert_eq!(
+                osk.key_at(center, wide().y + i),
+                None,
+                "row {i} of the more-symbols page must have a center gap"
+            );
+        }
+        // Both thumb clusters keep a space bar, like every other layer.
+        assert_eq!(osk.count_of(OskKey::Char(' ')), 2);
     }
 
     #[test]
