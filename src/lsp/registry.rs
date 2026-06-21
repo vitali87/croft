@@ -12,6 +12,7 @@ const BUNDLED_MANIFESTS: &[&str] = &[
     include_str!("../../assets/extensions/lsp-typescript/extension.toml"),
     include_str!("../../assets/extensions/lsp-rust/extension.toml"),
     include_str!("../../assets/extensions/lsp-go/extension.toml"),
+    include_str!("../../assets/extensions/lsp-yaml/extension.toml"),
 ];
 
 pub struct ServerRegistry {
@@ -198,6 +199,33 @@ mod tests {
             &[ServerConfig::rust_analyzer()]
         );
         assert_eq!(r.for_language(Language::GO), &[ServerConfig::gopls()]);
+    }
+
+    #[test]
+    fn bundled_manifests_register_yaml_language_server() {
+        // YAML is the first npm-provisioned language added after the founding
+        // four. The bundled set must register yaml-language-server for .yaml/.yml
+        // (provisioned from npm), proving a new language ships as data alone.
+        let r = ServerRegistry::with_defaults();
+        let servers = r.for_language(Language::YAML);
+        assert_eq!(servers.len(), 1, "exactly one server for YAML");
+        let yls = &servers[0];
+        assert_eq!(yls.name, "yaml-language-server");
+        assert_eq!(yls.command, "yaml-language-server");
+        assert_eq!(yls.args, vec!["--stdio".to_string()]);
+        assert!(
+            matches!(
+                yls.provision,
+                Some(crate::lsp::install::Provision::Npm {
+                    bin: "yaml-language-server",
+                    ..
+                })
+            ),
+            "yaml-language-server is npm-provisioned"
+        );
+        // Resolves by both file extensions.
+        assert_eq!(r.for_extension("yaml")[0].name, "yaml-language-server");
+        assert_eq!(r.for_extension("yml")[0].name, "yaml-language-server");
     }
 
     #[test]

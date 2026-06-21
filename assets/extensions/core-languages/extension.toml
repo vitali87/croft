@@ -16,10 +16,6 @@ id = "json"
 extensions = ["json"]
 
 [[languages]]
-id = "yaml"
-extensions = ["yaml", "yml"]
-
-[[languages]]
 id = "toml"
 extensions = ["toml"]
 

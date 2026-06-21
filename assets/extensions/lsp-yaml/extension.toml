@@ -1,0 +1,23 @@
+# Bundled croft extension: YAML language support.
+# yaml-language-server (Red Hat) speaks LSP over --stdio and needs no
+# initializationOptions for the common case (schema store autodetection works
+# out of the box). croft owns an npm-installed copy pinned for local/remote
+# parity; a global yaml-language-server on PATH is the fallback (see
+# src/lsp/install.rs).
+id = "lsp-yaml"
+name = "YAML (yaml-language-server)"
+description = "YAML language support via yaml-language-server."
+builtin = true
+api_version = 1
+
+[[languages]]
+id = "yaml"
+extensions = ["yaml", "yml"]
+
+[[language_servers]]
+name = "yaml-language-server"
+command = "yaml-language-server"
+args = ["--stdio"]
+language = "yaml"
+priority = 0
+provision = { kind = "npm", package = "yaml-language-server", version = "1.23.0", bin = "yaml-language-server" }
