@@ -12,6 +12,7 @@ mod iterm2;
 mod iterm2_inline;
 mod launcher;
 mod lsp;
+mod mcp;
 mod outline_syntax;
 mod pdf;
 mod prefs;
