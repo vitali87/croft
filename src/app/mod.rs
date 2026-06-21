@@ -11642,6 +11642,22 @@ impl App {
         // into whatever pane was last focused instead of into the finder
         // query, which makes the "open + paste a filename" path that the
         // VS Code Quick Open is meant to support unusable.
+        if let Some(prompt) = self.input_prompt.as_mut() {
+            for c in s.chars() {
+                if !c.is_control() {
+                    prompt.push_char(c);
+                }
+            }
+            return;
+        }
+        if let Some(palette) = self.command_palette.as_mut() {
+            for c in s.chars() {
+                if !c.is_control() {
+                    palette.push_char(c);
+                }
+            }
+            return;
+        }
         if let Some(finder) = self.file_finder.as_mut() {
             for c in s.chars() {
                 if !c.is_control() {

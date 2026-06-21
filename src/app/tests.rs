@@ -1052,6 +1052,29 @@ fn paste_while_terminal_focused_does_not_leak_into_search_box() {
 }
 
 #[test]
+fn paste_into_input_prompt_fills_it_not_the_focused_pane() {
+    // Regression: opening an MCP command's URL prompt then pasting leaked the
+    // URL into the focused terminal pane (the popup stayed empty). A bracketed
+    // paste while a modal input prompt is open must fill the prompt.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus_pane(Pane::Terminal);
+    app.input_prompt = Some(crate::widgets::input_prompt::InputPrompt::new(
+        crate::widgets::input_prompt::InputPurpose::McpArg {
+            command_id: String::from("fetch.url"),
+        },
+        "Web: Fetch URL as Markdown",
+        "URL to fetch",
+    ));
+    app.handle_paste("https://example.com/x");
+    assert_eq!(
+        app.input_prompt.as_ref().unwrap().value,
+        "https://example.com/x",
+        "a paste while the input prompt is open must fill the prompt, not leak to the focused pane"
+    );
+}
+
+#[test]
 fn paste_while_terminal_focused_does_not_leak_into_editor_find_bar() {
     // Sibling of paste_while_terminal_focused_does_not_leak_into_search_box,
     // but for the in-file Find bar (Cmd+F). The find bar is pane-scoped, not a
