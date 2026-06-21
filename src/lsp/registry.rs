@@ -13,6 +13,9 @@ const BUNDLED_MANIFESTS: &[&str] = &[
     include_str!("../../assets/extensions/lsp-rust/extension.toml"),
     include_str!("../../assets/extensions/lsp-go/extension.toml"),
     include_str!("../../assets/extensions/lsp-yaml/extension.toml"),
+    include_str!("../../assets/extensions/lsp-json/extension.toml"),
+    include_str!("../../assets/extensions/lsp-html/extension.toml"),
+    include_str!("../../assets/extensions/lsp-css/extension.toml"),
 ];
 
 pub struct ServerRegistry {
@@ -226,6 +229,38 @@ mod tests {
         // Resolves by both file extensions.
         assert_eq!(r.for_extension("yaml")[0].name, "yaml-language-server");
         assert_eq!(r.for_extension("yml")[0].name, "yaml-language-server");
+    }
+
+    #[test]
+    fn bundled_manifests_register_json_html_css_language_servers() {
+        // JSON, HTML and CSS each get their own extension/server, all three
+        // provisioned from the single maintained `@t1ckbase/vscode-langservers-extracted`
+        // npm package (one bin per language). Distinct server names keep their
+        // managed installs and re-probe signals independent.
+        let r = ServerRegistry::with_defaults();
+        for (lang, ext, server_bin) in [
+            (Language::JSON, "json", "vscode-json-language-server"),
+            (Language::HTML, "html", "vscode-html-language-server"),
+            (Language::CSS, "css", "vscode-css-language-server"),
+        ] {
+            let servers = r.for_language(lang);
+            assert_eq!(servers.len(), 1, "exactly one server for {ext}");
+            let s = &servers[0];
+            assert_eq!(s.name, server_bin);
+            assert_eq!(s.command, server_bin);
+            assert_eq!(s.args, vec!["--stdio".to_string()]);
+            assert!(
+                matches!(
+                    s.provision,
+                    Some(crate::lsp::install::Provision::Npm {
+                        package: "@t1ckbase/vscode-langservers-extracted",
+                        ..
+                    })
+                ),
+                "{ext} server installs from @t1ckbase/vscode-langservers-extracted"
+            );
+            assert_eq!(r.for_extension(ext)[0].name, server_bin);
+        }
     }
 
     #[test]

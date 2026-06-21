@@ -12,10 +12,6 @@ hidden = true
 api_version = 1
 
 [[languages]]
-id = "json"
-extensions = ["json"]
-
-[[languages]]
 id = "toml"
 extensions = ["toml"]
 
@@ -26,11 +22,3 @@ extensions = ["sh", "bash"]
 [[languages]]
 id = "markdown"
 extensions = ["md", "markdown"]
-
-[[languages]]
-id = "html"
-extensions = ["html", "htm"]
-
-[[languages]]
-id = "css"
-extensions = ["css"]

@@ -36,6 +36,9 @@ pub const BUNDLED_MANIFESTS: &[&str] = &[
     include_str!("../../assets/extensions/lsp-rust/extension.toml"),
     include_str!("../../assets/extensions/lsp-go/extension.toml"),
     include_str!("../../assets/extensions/lsp-yaml/extension.toml"),
+    include_str!("../../assets/extensions/lsp-json/extension.toml"),
+    include_str!("../../assets/extensions/lsp-html/extension.toml"),
+    include_str!("../../assets/extensions/lsp-css/extension.toml"),
 ];
 
 /// A parsed `extension.toml`. Only the fields phase B1 consumes are modelled;

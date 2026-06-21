@@ -136,6 +136,9 @@ fn chip_for(id: &str) -> Option<(char, Color)> {
         "lsp-rust" => ('\u{e7a8}', (0xce, 0x6a, 0x3a)), // dev-rust, orange
         "lsp-go" => ('\u{e724}', (0x00, 0xad, 0xd8)), // dev-go, cyan
         "lsp-yaml" => ('\u{e8eb}', (0xcb, 0x17, 0x1e)), // dev-yaml, red
+        "lsp-json" => ('\u{e80b}', (0xcb, 0xcb, 0x41)), // dev-json, gold
+        "lsp-html" => ('\u{e736}', (0xe3, 0x4f, 0x26)), // dev-html5, orange
+        "lsp-css" => ('\u{e749}', (0x15, 0x72, 0xb6)), // dev-css3, blue
         _ => return None,
     };
     Some((glyph, Color::Rgb(c.0, c.1, c.2)))

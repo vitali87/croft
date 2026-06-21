@@ -1,0 +1,25 @@
+# Bundled croft extension: CSS language support.
+# The JSON/HTML/CSS servers all ship in one npm package, one bin per language.
+# croft uses the actively-maintained @t1ckbase fork (the original
+# hrsh7th/vscode-langservers-extracted has been stale since 2024-05); it tracks
+# the upstream VS Code servers weekly, so a pinned version is required (it
+# auto-publishes after smoke tests only). croft owns an npm-installed copy
+# pinned for local/remote parity; a global vscode-css-language-server on PATH
+# is the fallback (see src/lsp/install.rs).
+id = "lsp-css"
+name = "CSS (vscode-css-language-server)"
+description = "CSS language support via vscode-css-language-server."
+builtin = true
+api_version = 1
+
+[[languages]]
+id = "css"
+extensions = ["css"]
+
+[[language_servers]]
+name = "vscode-css-language-server"
+command = "vscode-css-language-server"
+args = ["--stdio"]
+language = "css"
+priority = 0
+provision = { kind = "npm", package = "@t1ckbase/vscode-langservers-extracted", version = "2.0.1", bin = "vscode-css-language-server" }
