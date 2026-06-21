@@ -16,6 +16,7 @@ const BUNDLED_MANIFESTS: &[&str] = &[
     include_str!("../../assets/extensions/lsp-json/extension.toml"),
     include_str!("../../assets/extensions/lsp-html/extension.toml"),
     include_str!("../../assets/extensions/lsp-css/extension.toml"),
+    include_str!("../../assets/extensions/lsp-bash/extension.toml"),
 ];
 
 pub struct ServerRegistry {
@@ -261,6 +262,32 @@ mod tests {
             );
             assert_eq!(r.for_extension(ext)[0].name, server_bin);
         }
+    }
+
+    #[test]
+    fn bundled_manifests_register_bash_language_server() {
+        // Bash (the `shellscript` language id, .sh/.bash) gets bash-language-server,
+        // npm-provisioned. Note its invocation is the `start` subcommand, not the
+        // `--stdio` flag the other servers use.
+        let r = ServerRegistry::with_defaults();
+        let servers = r.for_language(Language::BASH);
+        assert_eq!(servers.len(), 1, "exactly one server for bash");
+        let s = &servers[0];
+        assert_eq!(s.name, "bash-language-server");
+        assert_eq!(s.command, "bash-language-server");
+        assert_eq!(s.args, vec!["start".to_string()]);
+        assert!(
+            matches!(
+                s.provision,
+                Some(crate::lsp::install::Provision::Npm {
+                    package: "bash-language-server",
+                    ..
+                })
+            ),
+            "bash-language-server is npm-provisioned"
+        );
+        assert_eq!(r.for_extension("sh")[0].name, "bash-language-server");
+        assert_eq!(r.for_extension("bash")[0].name, "bash-language-server");
     }
 
     #[test]

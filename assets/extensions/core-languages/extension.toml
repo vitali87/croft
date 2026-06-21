@@ -16,9 +16,5 @@ id = "toml"
 extensions = ["toml"]
 
 [[languages]]
-id = "shellscript"
-extensions = ["sh", "bash"]
-
-[[languages]]
 id = "markdown"
 extensions = ["md", "markdown"]

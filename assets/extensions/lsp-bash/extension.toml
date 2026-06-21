@@ -1,0 +1,24 @@
+# Bundled croft extension: Bash / shell language support.
+# bash-language-server is invoked via its `start` subcommand (not a --stdio
+# flag). It optionally shells out to `shellcheck` for linting when shellcheck is
+# on PATH; croft does not provision shellcheck (a system binary), so linting is
+# a no-op until the user installs it. croft owns an npm-installed copy pinned
+# for local/remote parity; a global bash-language-server on PATH is the fallback
+# (see src/lsp/install.rs).
+id = "lsp-bash"
+name = "Bash (bash-language-server)"
+description = "Bash and shell script language support via bash-language-server."
+builtin = true
+api_version = 1
+
+[[languages]]
+id = "shellscript"
+extensions = ["sh", "bash"]
+
+[[language_servers]]
+name = "bash-language-server"
+command = "bash-language-server"
+args = ["start"]
+language = "shellscript"
+priority = 0
+provision = { kind = "npm", package = "bash-language-server", version = "5.6.0", bin = "bash-language-server" }
