@@ -95,18 +95,22 @@
 
           inherit nativeBuildInputs buildInputs;
 
+          preConfigure = ''
+            export HOME=$(pwd)
+            export PATH=$PWD/bin:$PATH
+            
+            substituteInPlace src/widgets/terminal.rs \
+              --replace-fail /bin/echo ${pkgs.coreutils}/bin/echo
+          '';
+
+          # Prevent specified tests from causing nix build failures if they fail.
           checkFlags = [
-            # Disabling while working through issues causing test failures.
+            # Unknown Cause(s)
             "--skip=app::tests::cmd_p_index_drops_a_file_deleted_off_disk"
             "--skip=app::tests::cmd_p_index_refreshes_after_a_new_file_lands_on_disk"
-            "--skip=app::tests::cmd_t_globally_splits_the_terminal_and_does_not_double_fire_as_focus"
-            "--skip=app::tests::ctrl_shift_t_still_splits_the_terminal_and_does_not_double_fire_as_focus"
             "--skip=app::tests::open_cmd_p_finder_re_ranks_in_place_when_the_index_swaps"
-            "--skip=sysmon::tests::home_disk_pct_measures_a_real_filesystem"
-            "--skip=widgets::terminal::tests::new_running_appends_exit_footer_when_child_finishes"
+            # Failing due test not expecting "/nix/store/" path being prepended to "/bin/echo/"
             "--skip=widgets::terminal::tests::new_running_renders_running_header_in_term_immediately"
-            "--skip=widgets::terminal::tests::new_running_spawns_program_directly_and_produces_output"
-            "--skip=widgets::terminal::tests::pending_bytes_counts_advanced_output_and_resets_on_take_dirty"
           ];
 
           meta = {
