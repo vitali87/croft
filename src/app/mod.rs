@@ -12798,7 +12798,8 @@ impl App {
                 let label = PathBuf::from(format!("{}.md", outcome.title));
                 if self.editor.open_text_buffer(&label, &text).is_ok() {
                     self.focus_pane(Pane::Editor);
-                    self.status = format!("{} — done", outcome.title);
+                    self.status =
+                        format!("{}: opened in a new editor tab (unsaved)", outcome.title);
                 }
             }
             Err(e) => {

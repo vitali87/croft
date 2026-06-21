@@ -1052,6 +1052,38 @@ fn paste_while_terminal_focused_does_not_leak_into_search_box() {
 }
 
 #[test]
+fn mcp_success_opens_a_scratch_tab_and_tells_the_user_where() {
+    // Regression: a successful MCP command rendered its output into a scratch
+    // tab but the only feedback was a terse "— done", so the user couldn't find
+    // the output. poll_mcp must open the tab AND name where it went.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    tx.send(crate::mcp::McpOutcome {
+        title: String::from("Web: Fetch URL as Markdown"),
+        body: Ok(String::from("# Example Domain\n\nbody text")),
+    })
+    .unwrap();
+    app.mcp_rx = Some(rx);
+    assert!(app.poll_mcp(), "a delivered outcome must request a redraw");
+    let active_path = app
+        .editor
+        .path
+        .as_ref()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    assert!(
+        active_path.contains("Web: Fetch URL as Markdown"),
+        "the fetched markdown must be the active editor tab; active path was {active_path:?}"
+    );
+    assert!(
+        app.status.to_lowercase().contains("tab"),
+        "the status must tell the user the output opened in a tab; got: {}",
+        app.status
+    );
+}
+
+#[test]
 fn paste_into_input_prompt_fills_it_not_the_focused_pane() {
     // Regression: opening an MCP command's URL prompt then pasting leaked the
     // URL into the focused terminal pane (the popup stayed empty). A bracketed
