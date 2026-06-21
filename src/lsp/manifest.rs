@@ -46,6 +46,7 @@ pub const BUNDLED_MANIFESTS: &[&str] = &[
     include_str!("../../assets/extensions/dap-python/extension.toml"),
     include_str!("../../assets/extensions/dap-lldb/extension.toml"),
     include_str!("../../assets/extensions/dap-js/extension.toml"),
+    include_str!("../../assets/extensions/mcp-fetch/extension.toml"),
     include_str!("../../assets/extensions/themes/extension.toml"),
 ];
 
@@ -122,8 +123,13 @@ pub struct CommandDecl {
     pub server: String,
     /// The MCP tool name to call.
     pub tool: String,
-    /// When set, the label of the single string argument to collect from the
-    /// user before calling the tool. Absent for a no-argument tool.
+    /// When set, the tool's argument NAME that the collected input fills (e.g.
+    /// `url`). Paired with `prompt`. Absent for a no-argument tool.
+    #[serde(default)]
+    pub arg: Option<String>,
+    /// When set, the human label of the single string argument to collect from
+    /// the user before calling the tool (e.g. `URL`). Absent for a no-argument
+    /// tool.
     #[serde(default)]
     pub prompt: Option<String>,
 }

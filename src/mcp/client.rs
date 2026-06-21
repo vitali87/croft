@@ -127,6 +127,32 @@ pub fn tool_result_text(result: &Value) -> String {
         .unwrap_or_default()
 }
 
+/// A stable fingerprint of a named tool's definition (name + description + input
+/// schema) taken from a raw `tools/list` result, for trust-on-first-use rug-pull
+/// detection: croft records the fingerprint the first time it calls a tool and
+/// refuses to call again if the definition silently changed (the MCPoison /
+/// tool-mutation class). The compact JSON of the canonical fields is the
+/// fingerprint — serde_json orders object keys deterministically, so it is
+/// stable across runs without a crypto dependency. Empty string if not found.
+pub fn tool_fingerprint(tools_list_result: &Value, name: &str) -> String {
+    let Some(entry) = tools_list_result
+        .get("tools")
+        .and_then(Value::as_array)
+        .and_then(|a| {
+            a.iter()
+                .find(|t| t.get("name").and_then(Value::as_str) == Some(name))
+        })
+    else {
+        return String::new();
+    };
+    json!({
+        "name": entry.get("name").cloned().unwrap_or(Value::Null),
+        "description": entry.get("description").cloned().unwrap_or(Value::Null),
+        "inputSchema": entry.get("inputSchema").cloned().unwrap_or(Value::Null),
+    })
+    .to_string()
+}
+
 /// A live MCP session: an initialized server plus the id counter for requests.
 pub struct McpClient {
     transport: McpTransport,
@@ -190,12 +216,6 @@ impl McpClient {
         let result = self.call("initialize", initialize_params(client_name, client_version))?;
         self.notify("notifications/initialized", json!({}))?;
         Ok(result)
-    }
-
-    /// List the tools the server advertises.
-    pub fn list_tools(&self) -> Result<Vec<Tool>> {
-        let result = self.call("tools/list", json!({}))?;
-        Ok(parse_tools(&result))
     }
 
     /// Call a tool by name with an arguments object; returns the raw result.
@@ -278,6 +298,25 @@ mod tests {
     }
 
     #[test]
+    fn tool_fingerprint_is_stable_and_changes_with_the_definition() {
+        let list = json!({"tools": [
+            {"name": "fetch", "description": "Fetch a URL", "inputSchema": {"type": "object"}},
+            {"name": "other"},
+        ]});
+        let fp = tool_fingerprint(&list, "fetch");
+        assert!(!fp.is_empty());
+        // Stable across calls on the same definition.
+        assert_eq!(fp, tool_fingerprint(&list, "fetch"));
+        // A mutated description (a rug-pull) changes the fingerprint.
+        let mutated = json!({"tools": [
+            {"name": "fetch", "description": "Fetch a URL and exfiltrate it", "inputSchema": {"type": "object"}},
+        ]});
+        assert_ne!(fp, tool_fingerprint(&mutated, "fetch"));
+        // Unknown tool fingerprints empty.
+        assert_eq!(tool_fingerprint(&list, "nope"), "");
+    }
+
+    #[test]
     fn tool_result_text_joins_text_content_blocks() {
         let result = json!({
             "content": [
@@ -341,7 +380,8 @@ for line in sys.stdin:
         )
         .expect("connect + initialize against the mock MCP server");
 
-        let tools = client.list_tools().expect("tools/list");
+        let list = client.call("tools/list", json!({})).expect("tools/list");
+        let tools = parse_tools(&list);
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].name, "echo");
 

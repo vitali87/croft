@@ -23,10 +23,24 @@ use ratatui::{
 pub enum InputPurpose {
     CloneUrl,
     RenameBranch,
-    CreateBranchFrom { base: String },
+    CreateBranchFrom {
+        base: String,
+    },
     AddRemoteName,
-    AddRemoteUrl { name: String },
+    AddRemoteUrl {
+        name: String,
+    },
     CreateTag,
+    /// First-run consent to spawn an MCP sidecar: submitting confirms, then the
+    /// command (`command_id`) proceeds to its argument prompt or runs.
+    McpConsent {
+        command_id: String,
+    },
+    /// Collect the single string argument for an MCP command before calling its
+    /// tool. The submitted value fills the tool's declared argument.
+    McpArg {
+        command_id: String,
+    },
 }
 
 pub struct InputPrompt {

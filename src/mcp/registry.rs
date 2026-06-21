@@ -46,6 +46,8 @@ pub struct ResolvedCommand {
     pub command_id: String,
     pub title: String,
     pub tool: String,
+    /// The tool argument name the collected input fills (paired with `prompt`).
+    pub arg: Option<String>,
     pub prompt: Option<String>,
     pub server: ServerSpawn,
 }
@@ -120,6 +122,7 @@ fn resolved(ext_id: &str, cmd: &CommandDecl, server: &McpServerDecl) -> Resolved
         command_id: cmd.id.clone(),
         title: cmd.title.clone(),
         tool: cmd.tool.clone(),
+        arg: cmd.arg.clone(),
         prompt: cmd.prompt.clone(),
         server: server_spawn(server),
     }

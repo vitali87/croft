@@ -1,0 +1,28 @@
+# Bundled croft extension: Web Fetch (the Tier-1 MCP sidecar pilot).
+# Contributes a palette command that calls the `fetch` tool on the official
+# mcp-server-fetch (https://github.com/modelcontextprotocol/servers), which
+# fetches a URL and returns it as Markdown. croft renders that into a scratch
+# buffer. Keyless (no API key), so it verifies the sidecar path end-to-end.
+#
+# Provisioned pinned via uv into croft's managed server dir (never npx/uvx
+# fetch-at-launch); spawned over stdio; gated by first-run consent; the tool
+# definition is fingerprinted on first use and re-verified on every spawn.
+# Bump the version deliberately after reviewing the release.
+id = "mcp-fetch"
+name = "Web Fetch"
+description = "Fetch a URL and open it as Markdown (MCP sidecar)."
+builtin = true
+api_version = 1
+
+[[mcp_servers]]
+id = "fetch"
+command = "mcp-server-fetch"
+provision = { kind = "uv", package = "mcp-server-fetch", version = "2026.6.4", bin = "mcp-server-fetch" }
+
+[[commands]]
+id = "fetch.url"
+title = "Web: Fetch URL as Markdown"
+server = "fetch"
+tool = "fetch"
+arg = "url"
+prompt = "URL to fetch"

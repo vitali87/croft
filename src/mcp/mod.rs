@@ -18,14 +18,15 @@
 //! transports, and is simpler than the DAP `Content-Length` framer (no header).
 //! Speaking real MCP keeps croft interoperable with the existing MCP server
 //! ecosystem rather than inventing a private protocol.
-//!
-//! Staged build: this slice ships the transport + client core, exercised by
-//! tests but not yet reachable from the app (the manifest contributions,
-//! registry, and command-palette wiring land in the following slices). The
-//! module-level `allow(dead_code)` is removed once that wiring makes every item
-//! reachable.
-#![allow(dead_code)]
 
 pub mod client;
 pub mod registry;
 pub mod transport;
+
+/// The result of a backgrounded MCP command invocation, delivered to the app's
+/// poll loop. `title` labels the scratch buffer the rendered output opens in;
+/// `body` is the tool's text on success or a human-readable error on failure.
+pub struct McpOutcome {
+    pub title: String,
+    pub body: Result<String, String>,
+}

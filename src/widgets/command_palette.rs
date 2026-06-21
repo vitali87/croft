@@ -192,13 +192,57 @@ impl Command {
     }
 }
 
+/// A palette command contributed by an MCP sidecar extension. Carries its own
+/// runtime `title` (so the built-in [`Command`] enum stays a closed, `Copy`,
+/// `&'static`-titled set) plus the ids needed to dispatch and gate it. The app
+/// injects these via [`CommandPalette::set_extension_commands`]; the widget
+/// never reads manifests itself (it stays a pure projection, like the Extensions
+/// panel).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtensionCommand {
+    pub ext_id: String,
+    pub id: String,
+    pub title: String,
+}
+
+/// One row in the palette: a built-in command or an extension-contributed one.
+/// Built-ins keep their compile-time identity; extension rows carry owned data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PaletteItem {
+    Builtin(Command),
+    Extension(ExtensionCommand),
+}
+
+impl PaletteItem {
+    /// The label shown in the palette and matched against the query.
+    pub fn title(&self) -> &str {
+        match self {
+            PaletteItem::Builtin(c) => c.title(),
+            PaletteItem::Extension(e) => &e.title,
+        }
+    }
+
+    /// The right-aligned keybinding hint. Extension commands have none (they are
+    /// palette-only), so they show a blank hint.
+    pub fn keybinding_hint(&self) -> &str {
+        match self {
+            PaletteItem::Builtin(c) => c.keybinding_hint(),
+            PaletteItem::Extension(_) => "",
+        }
+    }
+}
+
 /// The palette's owned state: the query being typed and which filtered row is
 /// selected. Mirrors `FileFinder` so the App can drive both the same way.
 #[derive(Default)]
 pub struct CommandPalette {
     pub query: String,
     pub cursor: usize,
-    pub results: Vec<Command>,
+    pub results: Vec<PaletteItem>,
+    /// Extension-contributed commands injected by the app (empty until set), kept
+    /// separate from the built-in registry and merged into `results` on each
+    /// re-rank.
+    pub extensions: Vec<ExtensionCommand>,
     pub selected: usize,
     pub scroll: usize,
     pub last_rect: Rect,
@@ -211,6 +255,7 @@ impl CommandPalette {
             query: String::new(),
             cursor: 0,
             results: Vec::new(),
+            extensions: Vec::new(),
             selected: 0,
             scroll: 0,
             last_rect: Rect::default(),
@@ -218,6 +263,15 @@ impl CommandPalette {
         };
         me.refresh_results();
         me
+    }
+
+    /// Inject the extension-contributed commands to interleave into the list,
+    /// then re-rank. Called by the app when opening the palette.
+    pub fn set_extension_commands(&mut self, extensions: Vec<ExtensionCommand>) {
+        self.extensions = extensions;
+        self.refresh_results();
+        self.selected = 0;
+        self.scroll = 0;
     }
 
     fn char_count(&self) -> usize {
@@ -304,31 +358,38 @@ impl CommandPalette {
         }
     }
 
-    pub fn selected_command(&self) -> Option<Command> {
-        self.results.get(self.selected).copied()
+    pub fn selected_item(&self) -> Option<PaletteItem> {
+        self.results.get(self.selected).cloned()
     }
 
-    /// Re-rank the command list against the current query. An empty query
-    /// shows every command in declaration order; otherwise commands are kept
-    /// only when their lower-cased title fuzzy-matches the needle, ranked by
-    /// score (best first), ties broken by declaration order for stability.
+    /// Re-rank the command list against the current query, over built-ins AND
+    /// injected extension commands. An empty query shows every command in
+    /// declaration order (built-ins first, then extensions); otherwise rows are
+    /// kept only when their lower-cased title fuzzy-matches the needle, ranked
+    /// by score (best first), ties broken by declaration order for stability.
+    /// Built-ins occupy the low index range so they win ties against extensions.
     fn refresh_results(&mut self) {
+        let all: Vec<PaletteItem> = ALL_COMMANDS
+            .iter()
+            .map(|&c| PaletteItem::Builtin(c))
+            .chain(self.extensions.iter().cloned().map(PaletteItem::Extension))
+            .collect();
         let needle = self.query.trim().to_lowercase();
         if needle.is_empty() {
-            self.results = ALL_COMMANDS.to_vec();
+            self.results = all;
             return;
         }
-        let mut scored: Vec<(i32, usize, Command)> = ALL_COMMANDS
-            .iter()
+        let mut scored: Vec<(i32, usize, PaletteItem)> = all
+            .into_iter()
             .enumerate()
-            .filter_map(|(idx, &cmd)| {
-                let title_lower = cmd.title().to_lowercase();
-                fuzzy_score(&needle, &title_lower, 0).map(|score| (score, idx, cmd))
+            .filter_map(|(idx, item)| {
+                let title_lower = item.title().to_lowercase();
+                fuzzy_score(&needle, &title_lower, 0).map(|score| (score, idx, item))
             })
             .collect();
         // Higher score first; equal scores keep declaration order.
         scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
-        self.results = scored.into_iter().map(|(_, _, cmd)| cmd).collect();
+        self.results = scored.into_iter().map(|(_, _, item)| item).collect();
     }
 }
 
@@ -490,27 +551,42 @@ pub fn render_command_palette(
 mod tests {
     use super::*;
 
+    fn builtin(c: Command) -> PaletteItem {
+        PaletteItem::Builtin(c)
+    }
+
     #[test]
     fn empty_query_lists_every_command() {
         let palette = CommandPalette::new();
         assert_eq!(palette.results.len(), ALL_COMMANDS.len());
-        assert_eq!(palette.results.first(), Some(&Command::MoveLineUp));
+        assert_eq!(palette.results.first(), Some(&builtin(Command::MoveLineUp)));
     }
 
     #[test]
     fn query_filters_by_fuzzy_title() {
         let mut palette = CommandPalette::new();
         palette.set_query("comment");
-        assert!(palette.results.contains(&Command::ToggleLineComment));
-        assert!(palette.results.contains(&Command::ToggleBlockComment));
-        assert!(!palette.results.contains(&Command::SaveFile));
+        assert!(
+            palette
+                .results
+                .contains(&builtin(Command::ToggleLineComment))
+        );
+        assert!(
+            palette
+                .results
+                .contains(&builtin(Command::ToggleBlockComment))
+        );
+        assert!(!palette.results.contains(&builtin(Command::SaveFile)));
     }
 
     #[test]
     fn query_matches_subsequence() {
         let mut palette = CommandPalette::new();
         palette.set_query("sortasc");
-        assert_eq!(palette.results.first(), Some(&Command::SortLinesAscending));
+        assert_eq!(
+            palette.results.first(),
+            Some(&builtin(Command::SortLinesAscending))
+        );
     }
 
     #[test]
@@ -518,7 +594,25 @@ mod tests {
         let mut palette = CommandPalette::new();
         palette.set_query("zzzznotacommand");
         assert!(palette.results.is_empty());
-        assert_eq!(palette.selected_command(), None);
+        assert_eq!(palette.selected_item(), None);
+    }
+
+    #[test]
+    fn injected_extension_commands_appear_and_fuzzy_match() {
+        let mut palette = CommandPalette::new();
+        palette.set_extension_commands(vec![ExtensionCommand {
+            ext_id: "mcp-fetch".into(),
+            id: "fetch.url".into(),
+            title: "Fetch: URL to Markdown".into(),
+        }]);
+        // Listed after the built-ins on an empty query.
+        assert_eq!(palette.results.len(), ALL_COMMANDS.len() + 1);
+        // Fuzzy-matches its title and dispatches as an extension item.
+        palette.set_query("fetch url");
+        match palette.results.first() {
+            Some(PaletteItem::Extension(e)) => assert_eq!(e.id, "fetch.url"),
+            other => panic!("expected the extension command first, got {other:?}"),
+        }
     }
 
     #[test]
@@ -530,7 +624,10 @@ mod tests {
         assert_eq!(palette.selected, 0, "clamps at top");
         palette.select_next();
         assert_eq!(palette.selected, 1);
-        assert_eq!(palette.selected_command(), Some(Command::MoveLineDown));
+        assert_eq!(
+            palette.selected_item(),
+            Some(builtin(Command::MoveLineDown))
+        );
     }
 
     #[test]

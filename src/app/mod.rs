@@ -1451,6 +1451,10 @@ pub struct App {
     /// VS Code-style Cmd+Shift+P / Ctrl+Shift+P command palette. None when
     /// the modal is closed.
     pub command_palette: Option<crate::widgets::command_palette::CommandPalette>,
+    /// Receiver for an in-flight MCP sidecar command's result (the off-thread
+    /// worker delivers one [`crate::mcp::McpOutcome`] then disconnects). `None`
+    /// when no extension command is running; polled each frame by `poll_mcp`.
+    mcp_rx: Option<std::sync::mpsc::Receiver<crate::mcp::McpOutcome>>,
     /// "Debug: Attach to Python Process" picker (PEP 768). None when closed.
     /// Lists running CPython 3.14+ processes; selecting one spawns
     /// `pdb -p <pid>` in a PTY.
@@ -1969,6 +1973,7 @@ impl App {
             editor_find: None,
             file_finder: None,
             command_palette: None,
+            mcp_rx: None,
             process_picker: None,
             dap_session: None,
             debug_expanded: std::collections::HashSet::new(),
@@ -9317,6 +9322,22 @@ impl App {
                 let r = crate::git::create_tag(&self.tree.root, &value);
                 self.run_scm_op("tag", r, "Created tag");
             }
+            InputPurpose::McpConsent { command_id } => {
+                // The user confirmed; record consent for this command's
+                // extension and resume the command (which now passes the gate
+                // and proceeds to its argument prompt or runs).
+                self.close_input_prompt();
+                if let Some(resolved) = crate::mcp::registry::resolve_command(&command_id) {
+                    let _ = crate::prefs::save_mcp_consent(&resolved.ext_id);
+                }
+                self.run_extension_command(&command_id);
+            }
+            InputPurpose::McpArg { command_id } => {
+                self.close_input_prompt();
+                if let Some(resolved) = crate::mcp::registry::resolve_command(&command_id) {
+                    self.spawn_mcp_command(resolved, Some(value));
+                }
+            }
         }
     }
 
@@ -12405,7 +12426,20 @@ impl App {
         if self.command_palette.is_some() {
             return;
         }
-        let palette = crate::widgets::command_palette::CommandPalette::new();
+        let mut palette = crate::widgets::command_palette::CommandPalette::new();
+        // Inject the commands contributed by enabled MCP sidecar extensions so
+        // they're discoverable alongside the built-ins (eager registration; the
+        // server is only spawned when one is actually invoked).
+        let ext_commands: Vec<crate::widgets::command_palette::ExtensionCommand> =
+            crate::mcp::registry::contributed_commands()
+                .into_iter()
+                .map(|c| crate::widgets::command_palette::ExtensionCommand {
+                    ext_id: c.ext_id,
+                    id: c.id,
+                    title: c.title,
+                })
+                .collect();
+        palette.set_extension_commands(ext_commands);
         let count = palette.results.len();
         self.command_palette = Some(palette);
         self.overlays.command_palette_clear.request();
@@ -12430,10 +12464,10 @@ impl App {
         match (key.code, key.modifiers) {
             (KeyCode::Esc, _) => self.close_command_palette(),
             (KeyCode::Enter, _) => {
-                let cmd = palette.selected_command();
+                let item = palette.selected_item();
                 self.close_command_palette();
-                if let Some(cmd) = cmd {
-                    self.run_command(cmd);
+                if let Some(item) = item {
+                    self.run_palette_item(item);
                 }
             }
             (KeyCode::Up, _) => palette.select_prev(),
@@ -12645,6 +12679,117 @@ impl App {
                 self.run_debug.feedback_is_error = true;
             }
         }
+    }
+
+    /// Dispatch a chosen palette row: a built-in command runs inline; an
+    /// extension-contributed command routes through the MCP sidecar path.
+    fn run_palette_item(&mut self, item: crate::widgets::command_palette::PaletteItem) {
+        use crate::widgets::command_palette::PaletteItem;
+        match item {
+            PaletteItem::Builtin(cmd) => self.run_command(cmd),
+            PaletteItem::Extension(ec) => self.run_extension_command(&ec.id),
+        }
+    }
+
+    /// Invoke an MCP sidecar command by id. Gated by first-run consent (a popup
+    /// showing the exact spawn command); once consented, collects the declared
+    /// argument (if any) via an input popup, then spawns the server off-thread.
+    fn run_extension_command(&mut self, command_id: &str) {
+        use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
+        let Some(resolved) = crate::mcp::registry::resolve_command(command_id) else {
+            self.status = format!("Extension command '{command_id}' is unavailable");
+            return;
+        };
+        // First-run consent gate: never spawn a sidecar until the user has
+        // approved this extension, shown the exact command line croft will run.
+        let consented = crate::prefs::Prefs::load_or_default()
+            .mcp_consented
+            .contains(&resolved.ext_id);
+        if !consented {
+            let spawn_line = std::iter::once(resolved.server.command.clone())
+                .chain(resolved.server.args.iter().cloned())
+                .collect::<Vec<_>>()
+                .join(" ");
+            self.open_input_prompt(
+                InputPrompt::new(
+                    InputPurpose::McpConsent {
+                        command_id: command_id.to_string(),
+                    },
+                    format!("Allow {} to run:  {}", resolved.ext_id, spawn_line),
+                    "Enter to allow · Esc to cancel",
+                )
+                .with_value("allow"),
+            );
+            return;
+        }
+        // Collect the declared argument, if any, then run.
+        if let (Some(_), Some(label)) = (resolved.arg.as_ref(), resolved.prompt.as_ref()) {
+            self.open_input_prompt(InputPrompt::new(
+                InputPurpose::McpArg {
+                    command_id: command_id.to_string(),
+                },
+                resolved.title.clone(),
+                label.clone(),
+            ));
+            return;
+        }
+        self.spawn_mcp_command(resolved, None);
+    }
+
+    /// Spawn the MCP server off the UI thread and run the command's tool; the
+    /// result is delivered to [`poll_mcp`](Self::poll_mcp) over a channel and
+    /// rendered into a markdown scratch buffer. Refuses to start a second
+    /// command while one is in flight.
+    fn spawn_mcp_command(
+        &mut self,
+        resolved: crate::mcp::registry::ResolvedCommand,
+        arg: Option<String>,
+    ) {
+        if self.mcp_rx.is_some() {
+            self.status = String::from("An extension command is already running");
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.mcp_rx = Some(rx);
+        self.status = format!("Running {}…", resolved.title);
+        let cwd = self.workspace_root.clone();
+        let version = env!("CARGO_PKG_VERSION").to_string();
+        let _ = std::thread::Builder::new()
+            .name("mcp-cmd".into())
+            .spawn(move || {
+                let _ = tx.send(run_mcp_command_blocking(&resolved, arg, &cwd, &version));
+            });
+    }
+
+    /// Drain a completed MCP command: render its text into a scratch buffer on
+    /// success, or surface the error in the status line. Returns whether a
+    /// redraw is needed. Called each frame from the main loop.
+    pub fn poll_mcp(&mut self) -> bool {
+        let Some(rx) = self.mcp_rx.as_ref() else {
+            return false;
+        };
+        let outcome = match rx.try_recv() {
+            Ok(o) => o,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.mcp_rx = None;
+                return false;
+            }
+        };
+        self.mcp_rx = None;
+        match outcome.body {
+            Ok(text) => {
+                let label = PathBuf::from(format!("{}.md", outcome.title));
+                if self.editor.open_text_buffer(&label, &text).is_ok() {
+                    self.focus_pane(Pane::Editor);
+                    self.status = format!("{} — done", outcome.title);
+                }
+            }
+            Err(e) => {
+                self.status = format!("{}: {e}", outcome.title);
+            }
+        }
+        true
     }
 
     /// Execute a Command Palette entry. Editor text commands act on the active
@@ -18006,6 +18151,119 @@ fn build_extension_items(
     crate::widgets::extensions::items_from_summaries(summaries, disabled)
 }
 
+/// Resolve the program to spawn for a sidecar server: PATH-first / pinned
+/// managed install (reusing the LSP provisioning), or `None`+kick the install
+/// when not yet present. Returns the command plus extra PATH dirs it needs.
+fn resolve_mcp_program(
+    server: &crate::mcp::registry::ServerSpawn,
+) -> Result<(String, Vec<PathBuf>), String> {
+    let Some(provision) = &server.provision else {
+        // PATH-only server (no croft-managed provisioning declared).
+        return Ok((server.command.clone(), Vec::new()));
+    };
+    if let Some(found) = crate::lsp::install::provisioned_command(&server.id, provision) {
+        return Ok(found);
+    }
+    // Not installed: kick the one-shot managed install (leaking the id to
+    // 'static once, only on this first-install path — `resolve_managed` keys its
+    // install-started gate on it), and ask the user to retry once it lands.
+    let name: &'static str = Box::leak(server.id.clone().into_boxed_str());
+    let config = crate::lsp::config::ServerConfig {
+        name,
+        command: server.command.clone(),
+        args: server.args.clone(),
+        language: crate::lsp::config::Language("mcp"),
+        initialization_options: None,
+        provision: Some(provision.clone()),
+    };
+    crate::lsp::install::resolve_managed(&config, provision, true);
+    Err(format!(
+        "Installing {} — run the command again once it finishes",
+        server.id
+    ))
+}
+
+/// Run a resolved MCP command to completion on a worker thread: provision +
+/// spawn the server, verify the tool definition (trust-on-first-use rug-pull
+/// guard), call the tool, and return its text. Pure blocking; the caller sends
+/// the [`crate::mcp::McpOutcome`] back over a channel.
+fn run_mcp_command_blocking(
+    resolved: &crate::mcp::registry::ResolvedCommand,
+    arg: Option<String>,
+    cwd: &Path,
+    version: &str,
+) -> crate::mcp::McpOutcome {
+    use serde_json::json;
+    let title = resolved.title.clone();
+    let body = (|| -> Result<String, String> {
+        let (program, extra_paths) = resolve_mcp_program(&resolved.server)?;
+        // Least-privilege env: the declared vars plus a PATH (extra dirs first,
+        // then the inherited PATH) so the launcher resolves its interpreter.
+        let mut env = resolved.server.env.clone();
+        let mut path_parts: Vec<String> = extra_paths
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect();
+        if let Ok(sys) = std::env::var("PATH") {
+            path_parts.push(sys);
+        }
+        env.insert("PATH".to_string(), path_parts.join(":"));
+
+        let client = crate::mcp::client::McpClient::connect(
+            &program,
+            &resolved.server.args,
+            cwd,
+            &env,
+            "croft",
+            version,
+        )
+        .map_err(|e| e.to_string())?;
+
+        // Trust-on-first-use: fingerprint the tool definition and refuse if it
+        // changed since the user first ran this command (rug-pull / MCPoison).
+        let list = client
+            .call("tools/list", json!({}))
+            .map_err(|e| e.to_string())?;
+        // Validate the declared tool is actually advertised before calling it.
+        let tools = crate::mcp::client::parse_tools(&list);
+        if !tools.iter().any(|t| t.name == resolved.tool) {
+            return Err(format!(
+                "the server does not advertise a '{}' tool",
+                resolved.tool
+            ));
+        }
+        let fingerprint = crate::mcp::client::tool_fingerprint(&list, &resolved.tool);
+        let prefs = crate::prefs::Prefs::load_or_default();
+        match prefs.mcp_tool_fingerprints.get(&resolved.command_id) {
+            Some(prev) if prev != &fingerprint => {
+                return Err(format!(
+                    "refusing to run: the '{}' tool definition changed since you approved it (possible rug-pull); toggle the extension off and on to re-approve",
+                    resolved.tool
+                ));
+            }
+            Some(_) => {}
+            None => {
+                let _ = crate::prefs::save_mcp_tool_fingerprint(&resolved.command_id, &fingerprint);
+            }
+        }
+
+        let arguments = match (resolved.arg.as_ref(), arg) {
+            (Some(name), Some(value)) => json!({ name.as_str(): value }),
+            _ => json!({}),
+        };
+        let result = client
+            .call_tool(&resolved.tool, arguments)
+            .map_err(|e| e.to_string())?;
+        let text = crate::mcp::client::tool_result_text(&result);
+        Ok(if text.trim().is_empty() {
+            String::from("(the tool returned no text content)")
+        } else {
+            text
+        })
+    })();
+    crate::mcp::McpOutcome { title, body }
+}
+
 /// Live cwd of a running process by PID, or None when the platform doesn't
 /// expose one. Used by `split_terminal` so a new pane lands wherever the
 /// user has `cd`'d the active shell.
@@ -18790,6 +19048,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let diagnostics_changed = app.drain_lsp_diagnostics();
         let progress_changed = app.drain_lsp_progress();
         let dap_changed = app.poll_dap();
+        let mcp_changed = app.poll_mcp();
         let voice_changed = app.drain_voice();
         // Surface managed language-server install progress in the status bar so
         // the background work (which can take a few seconds) is visible.
@@ -18812,6 +19071,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
 
         let non_pty_dirty = needs_redraw
             || fs_changed
+            || mcp_changed
             || blink_changed
             || spinner_changed
             || commits_changed

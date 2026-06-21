@@ -6,7 +6,7 @@
 //! the same on macOS and Linux so the local and remote builds stay in lockstep
 //! (the golden rule: identical behavior on both targets).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -75,6 +75,17 @@ pub struct Prefs {
     /// default), so disabling is opt-in and an older config still parses.
     #[serde(default)]
     pub disabled_extensions: BTreeSet<String>,
+    /// MCP sidecar extension ids the user has consented to spawn (the first-run
+    /// consent gate). croft never launches a sidecar process until its extension
+    /// id is in this set.
+    #[serde(default)]
+    pub mcp_consented: BTreeSet<String>,
+    /// Trust-on-first-use tool fingerprints, keyed by command id. Recorded the
+    /// first time a command's tool is called; a later mismatch (a silent tool
+    /// rug-pull) makes croft refuse the call. See
+    /// [`crate::mcp::client::tool_fingerprint`].
+    #[serde(default)]
+    pub mcp_tool_fingerprints: BTreeMap<String, String>,
 }
 
 impl Prefs {
@@ -151,6 +162,26 @@ pub fn save_disabled_extensions(disabled: &BTreeSet<String>) -> Result<()> {
     let path = config_path();
     let mut prefs = Prefs::load(&path).unwrap_or_default();
     prefs.disabled_extensions = disabled.clone();
+    prefs.save(&path)
+}
+
+/// Record first-run consent to spawn an MCP sidecar extension, preserving other
+/// settings. Best-effort: a write failure is swallowed by the caller.
+pub fn save_mcp_consent(ext_id: &str) -> Result<()> {
+    let path = config_path();
+    let mut prefs = Prefs::load(&path).unwrap_or_default();
+    prefs.mcp_consented.insert(ext_id.to_string());
+    prefs.save(&path)
+}
+
+/// Record (trust-on-first-use) the fingerprint of the tool a command calls,
+/// preserving other settings. Best-effort: a write failure is swallowed.
+pub fn save_mcp_tool_fingerprint(command_id: &str, fingerprint: &str) -> Result<()> {
+    let path = config_path();
+    let mut prefs = Prefs::load(&path).unwrap_or_default();
+    prefs
+        .mcp_tool_fingerprints
+        .insert(command_id.to_string(), fingerprint.to_string());
     prefs.save(&path)
 }
 

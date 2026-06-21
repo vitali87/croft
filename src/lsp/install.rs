@@ -194,6 +194,23 @@ pub fn resolve_managed(
     None
 }
 
+/// Resolve the invocable command for a provisioned tool by `name` + `provision`,
+/// without the [`ServerConfig`] wrapper — the same managed-first / PATH-fallback
+/// resolution `resolve_managed` does, but usable by non-LSP callers (the MCP
+/// sidecar host). Returns the command plus any extra PATH dirs the launched
+/// process needs (the node dir for npm tools), or `None` when not yet installed.
+pub fn provisioned_command(name: &str, provision: &Provision) -> Option<(String, Vec<PathBuf>)> {
+    match provision {
+        Provision::Npm { bin, .. } => {
+            npm_command(name, bin).map(|c| (c, node_path_prepend().into_iter().collect()))
+        }
+        Provision::Uv { bin, .. } => uv_command(bin).map(|c| (c, Vec::new())),
+        Provision::Binary { bin, bin_path, .. } => {
+            binary_command(name, bin, *bin_path).map(|c| (c, Vec::new()))
+        }
+    }
+}
+
 /// Resolve an invocable command for an npm-provisioned server: prefer croft's
 /// managed copy (absolute path, no PATH dependency), then fall back to a binary
 /// already on PATH so a user who installed one globally still works. `None`

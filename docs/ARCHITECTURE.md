@@ -60,6 +60,11 @@ src/
 │   ├── install.rs       provisions a private debugpy venv at ~/.croft/debug-venv via uv (PEP 668 forbids pip-ing into the uv-managed CPython; mirrors ~/.croft/servers)
 │   ├── remote_attach.rs pure attach planning: parse / gate the CPython version (>=3.14 ships sys.remote_exec), the platform-aware sudo-elevation decision (macOS always, Linux unless Yama ptrace_scope is relaxed), and the `pdb -p` command builder
 │   └── discovery.rs     enumerate attachable CPython 3.14+ processes via sysinfo plus a per-candidate `--version` probe
+├── mcp/                 MCP sidecar host (Tier-1 extensions): croft is a DETERMINISTIC MCP host — a human invokes a contributed palette command and croft calls one pre-known tool on one vetted local server (no LLM picks tools), which removes MCP's whole prompt-injection/tool-poisoning attack family
+│   ├── mod.rs           module overview + McpOutcome (the off-thread worker's result)
+│   ├── transport.rs     JSON-RPC 2.0 over newline-delimited JSON on the server's stdio (the MCP stdio framing; simpler than DAP's Content-Length); setsid-detached child, reader thread -> mpsc, least-privilege env_clear()+envs()
+│   ├── client.rs        the MCP lifecycle: initialize -> notifications/initialized -> tools/list -> tools/call, synchronous id-correlated calls; tool_fingerprint for trust-on-first-use rug-pull detection
+│   └── registry.rs      data-driven: contributed_commands() (eager palette registration, skips disabled) + resolve_command() (lazy: tool + spawnable server with pinned Provision) from [[commands]]/[[mcp_servers]] manifests
 ├── lsp/                 LSP client stack
 │   ├── mod.rs
 │   ├── client.rs        async-lsp client wrapper; router forwards diagnostics + work-done progress ($/progress, e.g. rust-analyzer "Indexing…") to the status bar
@@ -68,7 +73,7 @@ src/
 │   ├── languages.rs     language table: file-extension -> language, root markers, and server family, all built from extension manifests' [[languages]] blocks (replaces the old hardcoded Language enum match arms)
 │   ├── log_file.rs      LSP stderr / debug log sink at ~/.croft/lsp.log
 │   ├── manager.rs       lifecycle: spawn / did_open / did_change / completion / documentSymbol (Outline) / shutdown
-│   ├── manifest.rs      declarative extension.toml loader (extension system, Tier 0): parses a manifest's [[languages]], [[language_servers]], [[themes]], and [[debug_adapters]] blocks; also discovers user extensions under ~/.config/croft/extensions/<id>/
+│   ├── manifest.rs      declarative extension.toml loader (extension system): parses a manifest's [[languages]], [[language_servers]], [[themes]], [[debug_adapters]], [[mcp_servers]], and [[commands]] blocks; also discovers user extensions under ~/.config/croft/extensions/<id>/
 │   ├── registry.rs      ServerRegistry (language -> ordered servers); built from the bundled manifests in assets/extensions/* plus user-installed extensions, instead of hardcoding configs
 │   ├── runtime.rs       Tokio runtime owned by the LSP manager
 │   └── semantic_cache.rs content-keyed disk cache of semantic-token batches at ~/.croft/sem-cache
