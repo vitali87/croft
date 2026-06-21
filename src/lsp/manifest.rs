@@ -77,6 +77,55 @@ pub struct ExtensionManifest {
     /// Disabling the extension stops F5 from offering that debugger.
     #[serde(default)]
     pub debug_adapters: Vec<DebugAdapterDecl>,
+    /// MCP sidecar servers this extension contributes (Tier-1 extensions). Each
+    /// is a local process croft spawns lazily and drives over JSON-RPC/NDJSON
+    /// stdio. Paired with [`commands`](Self::commands) that invoke their tools.
+    #[serde(default)]
+    pub mcp_servers: Vec<McpServerDecl>,
+    /// Palette commands this extension contributes. Each invokes one tool on one
+    /// of this extension's [`mcp_servers`](Self::mcp_servers); registered eagerly
+    /// in the command palette, the server is spawned lazily on first invocation.
+    #[serde(default)]
+    pub commands: Vec<CommandDecl>,
+}
+
+/// One `[[mcp_servers]]` entry: a sidecar server croft spawns and drives over
+/// MCP. `command`/`args` are the spawn line; `provision` (reused from the LSP
+/// backends) installs it pinned into a host-managed dir when absent from PATH,
+/// never fetching-at-launch; `env` is the explicit least-privilege environment
+/// handed to the process (croft does not leak its own environment).
+#[derive(Debug, Clone, Deserialize)]
+pub struct McpServerDecl {
+    /// Stable id referenced by a [`CommandDecl::server`].
+    pub id: String,
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub provision: Option<ProvisionDecl>,
+    /// Explicit environment variables the server is launched with (e.g. an API
+    /// key sourced by the host). Empty by default.
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+}
+
+/// One `[[commands]]` entry: a palette command that calls `tool` on `server`.
+/// `prompt`, when set, is the label of a single string argument croft collects
+/// from the user (e.g. a URL or search query) and passes to the tool.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CommandDecl {
+    /// Stable command id (e.g. `fetch.url`).
+    pub id: String,
+    /// Human-facing palette label.
+    pub title: String,
+    /// The [`McpServerDecl::id`] this command's tool lives on.
+    pub server: String,
+    /// The MCP tool name to call.
+    pub tool: String,
+    /// When set, the label of the single string argument to collect from the
+    /// user before calling the tool. Absent for a no-argument tool.
+    #[serde(default)]
+    pub prompt: Option<String>,
 }
 
 /// One `[[debug_adapters]]` entry: a debugger contributed by an extension. The
@@ -294,7 +343,7 @@ fn intern_pairs(m: &BTreeMap<String, String>) -> &'static [(&'static str, &'stat
 }
 
 impl ProvisionDecl {
-    fn to_provision(&self) -> Provision {
+    pub(crate) fn to_provision(&self) -> Provision {
         let version = self.version.as_deref().map(intern);
         let bin = intern(&self.bin);
         let package = || intern(self.package.as_deref().unwrap_or_default());
@@ -425,6 +474,40 @@ mod tests {
         // ...and the hidden infrastructure manifest does not.
         assert!(!ids.contains(&"core-languages"));
         assert!(s.iter().all(|e| e.builtin));
+    }
+
+    #[test]
+    fn parses_an_mcp_sidecar_manifest() {
+        let src = r#"
+id = "mcp-fetch"
+name = "Fetch"
+api_version = 1
+
+[[mcp_servers]]
+id = "fetch"
+command = "mcp-server-fetch"
+args = ["--quiet"]
+env = { USER_AGENT = "croft" }
+
+[[commands]]
+id = "fetch.url"
+title = "Fetch: URL to Markdown"
+server = "fetch"
+tool = "fetch"
+prompt = "URL"
+"#;
+        let m = parse(src).expect("sidecar manifest parses");
+        assert_eq!(m.mcp_servers.len(), 1);
+        assert_eq!(m.mcp_servers[0].id, "fetch");
+        assert_eq!(m.mcp_servers[0].command, "mcp-server-fetch");
+        assert_eq!(m.mcp_servers[0].env.get("USER_AGENT").unwrap(), "croft");
+        assert_eq!(m.commands.len(), 1);
+        let c = &m.commands[0];
+        assert_eq!(
+            (c.id.as_str(), c.server.as_str(), c.tool.as_str()),
+            ("fetch.url", "fetch", "fetch")
+        );
+        assert_eq!(c.prompt.as_deref(), Some("URL"));
     }
 
     #[test]
