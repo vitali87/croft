@@ -43,6 +43,9 @@ pub const BUNDLED_MANIFESTS: &[&str] = &[
     include_str!("../../assets/extensions/lsp-bash/extension.toml"),
     include_str!("../../assets/extensions/lsp-toml/extension.toml"),
     include_str!("../../assets/extensions/lsp-cpp/extension.toml"),
+    include_str!("../../assets/extensions/dap-python/extension.toml"),
+    include_str!("../../assets/extensions/dap-lldb/extension.toml"),
+    include_str!("../../assets/extensions/dap-js/extension.toml"),
     include_str!("../../assets/extensions/themes/extension.toml"),
 ];
 
@@ -69,6 +72,44 @@ pub struct ExtensionManifest {
     /// servers, AND/OR themes; a pure theme extension declares only these.
     #[serde(default)]
     pub themes: Vec<ThemeDecl>,
+    /// Debug adapters this extension contributes. Each maps a set of file
+    /// extensions to one of croft's built-in launch mechanisms (its `kind`).
+    /// Disabling the extension stops F5 from offering that debugger.
+    #[serde(default)]
+    pub debug_adapters: Vec<DebugAdapterDecl>,
+}
+
+/// One `[[debug_adapters]]` entry: a debugger contributed by an extension. The
+/// `kind` selects which built-in launch mechanism croft drives (debugpy /
+/// lldb-dap / vscode-js-debug — the launch flows are heterogeneous and stay
+/// native, like the PDF/CSV viewers); the `extensions` list is the data that
+/// used to live in the hardcoded `adapter_for_extension` match.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DebugAdapterDecl {
+    /// Stable id (matches the contributing extension's id for the toggle, e.g.
+    /// the `debugpy` adapter id; the panel toggle keys on the manifest `id`).
+    pub id: String,
+    /// Human-facing adapter name (shown in docs / future debugger UI).
+    pub label: String,
+    /// Which built-in launch mechanism croft drives for this adapter.
+    pub kind: AdapterKindDecl,
+    /// Lowercased, dot-less file extensions this adapter debugs.
+    #[serde(default)]
+    pub extensions: Vec<String>,
+}
+
+/// The built-in debug-adapter launch mechanisms croft knows. Mirrors (and maps
+/// onto) `crate::dap::session::AdapterKind`; kept here as pure manifest data so
+/// the manifest layer carries no dependency on the dap module.
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum AdapterKindDecl {
+    /// debugpy (CPython 3.14+), launches `.py` source under an interpreter.
+    Debugpy,
+    /// lldb-dap, builds then launches a compiled binary (Rust / C / C++).
+    Lldb,
+    /// vscode-js-debug, launches a Node program over its TCP multi-session.
+    JsDebug,
 }
 
 /// One `[[themes]]` entry: a complete IDE color palette. All colors are

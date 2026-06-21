@@ -218,7 +218,7 @@ Also in the Command Palette: Start / Stop / Pause / Restart Debugging, Toggle Br
 
 ## Extensions sidebar
 
-Jump here with `Cmd+Shift+X` (or the activity-bar icon, or the Command Palette's "View: Show Extensions"). The panel lists croft's bundled extensions — the PDF and CSV viewers, Vim mode, the Color Themes, and the Python / TypeScript / Rust / Go / YAML / JSON / HTML / CSS / Bash / TOML / C / C++ language servers — each with a right-aligned **toggle switch** (blue = on, grey = off). Any extensions you drop into `~/.config/croft/extensions/<id>/` appear here too. A filter box at the top narrows the list as you type; it matches the installed list by name, blurb, or id (croft has no marketplace, so it is a local filter, not a remote search).
+Jump here with `Cmd+Shift+X` (or the activity-bar icon, or the Command Palette's "View: Show Extensions"). The panel lists croft's bundled extensions — the PDF and CSV viewers, Vim mode, the Color Themes, the Python / TypeScript / Rust / Go / YAML / JSON / HTML / CSS / Bash / TOML / C / C++ language servers, and the Python (debugpy), LLDB (Rust/C/C++), and JavaScript (vscode-js-debug) debuggers — each with a right-aligned **toggle switch** (blue = on, grey = off). Disabling a debugger removes it as an F5 launch option for its file types. Any extensions you drop into `~/.config/croft/extensions/<id>/` appear here too. A filter box at the top narrows the list as you type; it matches the installed list by name, blurb, or id (croft has no marketplace, so it is a local filter, not a remote search).
 
 | Keys | Action |
 |------|--------|

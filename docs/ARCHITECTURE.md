@@ -51,10 +51,11 @@ src/
 │   ├── perf_hud.rs      F8 performance HUD
 │   ├── welcome.rs       welcome-screen state + async recent-repos drain
 │   └── tests.rs         unit / integration tests
-├── dap/                 debugger stack: Debug Adapter Protocol client. Python (debugpy, 3.14+, no fallback) is the verified adapter; Rust/C/C++ route to lldb-dap
+├── dap/                 debugger stack: Debug Adapter Protocol client. debugpy (Python, 3.14+, no fallback) is the verified mechanism; Rust/C/C++ route to lldb-dap; JS/TS route to vscode-js-debug. Which file types each handles is a data-driven extension axis (see registry.rs)
 │   ├── mod.rs
 │   ├── transport.rs     DAP wire framing (Content-Length + seq envelope, not JSON-RPC, so async-lsp can't be reused); spawns the adapter detached via setsid (so the debuggee can't tcsetpgrp-background and SIGTTIN-suspend croft), blocking reader thread frames stdout into an mpsc channel
-│   ├── session.rs       one launch session: the initialize -> setBreakpoints -> configurationDone -> stopped state machine, event classifier, the stackTrace -> scopes -> variables inspection chain, evaluate (REPL / hover / watch), conditional + exception breakpoints, breakpoint-verification tracking, pause, reverse-request replies, and a language-keyed adapter registry (debugpy / lldb-dap) over one adapter-agnostic launch_with; Value-based request builders (no vendored protocol types)
+│   ├── session.rs       one launch session: the initialize -> setBreakpoints -> configurationDone -> stopped state machine, event classifier, the stackTrace -> scopes -> variables inspection chain, evaluate (REPL / hover / watch), conditional + exception breakpoints, breakpoint-verification tracking, pause, reverse-request replies, over one adapter-agnostic launch_with; Value-based request builders (no vendored protocol types). AdapterKind names the launch mechanisms
+│   ├── registry.rs      data-driven debug-adapter registry: maps a file extension -> AdapterKind from the [[debug_adapters]] blocks in bundled + user manifests, skipping adapters whose extension is disabled in the Extensions panel (replaces the old hardcoded adapter_for_extension match; the launch mechanisms themselves stay native, like the PDF/CSV viewers)
 │   ├── log.rs           optional DAP wire log at ~/.croft/dap.log (gated by CROFT_DAP_LOG), mirroring lsp/log_file.rs
 │   ├── install.rs       provisions a private debugpy venv at ~/.croft/debug-venv via uv (PEP 668 forbids pip-ing into the uv-managed CPython; mirrors ~/.croft/servers)
 │   ├── remote_attach.rs pure attach planning: parse / gate the CPython version (>=3.14 ships sys.remote_exec), the platform-aware sudo-elevation decision (macOS always, Linux unless Yama ptrace_scope is relaxed), and the `pdb -p` command builder
@@ -67,7 +68,7 @@ src/
 │   ├── languages.rs     language table: file-extension -> language, root markers, and server family, all built from extension manifests' [[languages]] blocks (replaces the old hardcoded Language enum match arms)
 │   ├── log_file.rs      LSP stderr / debug log sink at ~/.croft/lsp.log
 │   ├── manager.rs       lifecycle: spawn / did_open / did_change / completion / documentSymbol (Outline) / shutdown
-│   ├── manifest.rs      declarative extension.toml loader (extension system, Tier 0): parses a manifest's [[languages]] + [[language_servers]] blocks; also discovers user extensions under ~/.config/croft/extensions/<id>/
+│   ├── manifest.rs      declarative extension.toml loader (extension system, Tier 0): parses a manifest's [[languages]], [[language_servers]], [[themes]], and [[debug_adapters]] blocks; also discovers user extensions under ~/.config/croft/extensions/<id>/
 │   ├── registry.rs      ServerRegistry (language -> ordered servers); built from the bundled manifests in assets/extensions/* plus user-installed extensions, instead of hardcoding configs
 │   ├── runtime.rs       Tokio runtime owned by the LSP manager
 │   └── semantic_cache.rs content-keyed disk cache of semantic-token batches at ~/.croft/sem-cache

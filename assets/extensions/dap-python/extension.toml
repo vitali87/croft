@@ -1,0 +1,16 @@
+# Bundled croft extension: Python debugger.
+# Launches `.py` source under debugpy (CPython 3.14+) via the shared DAP session
+# machinery (src/dap/session.rs). The launch flow stays native; this manifest
+# only declares which file types route to the debugpy mechanism. Disabling this
+# extension stops F5 from offering the Python debugger (it opens/runs normally).
+id = "dap-python"
+name = "Python Debugger"
+description = "Debug Python with debugpy (breakpoints, stepping, variables)."
+builtin = true
+api_version = 1
+
+[[debug_adapters]]
+id = "dap-python"
+label = "debugpy"
+kind = "debugpy"
+extensions = ["py", "pyw"]

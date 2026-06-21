@@ -7659,7 +7659,7 @@ impl App {
                     .to_ascii_lowercase();
                 if Self::run_spec_for(p, &self.workspace_root).is_some() {
                     (true, false)
-                } else if crate::dap::session::adapter_for_extension(&ext).is_some() {
+                } else if crate::dap::registry::adapter_for_extension(&ext).is_some() {
                     (true, true)
                 } else {
                     (false, false)
@@ -8091,7 +8091,7 @@ impl App {
             .and_then(|e| e.to_str())
             .unwrap_or("")
             .to_ascii_lowercase();
-        match crate::dap::session::adapter_for_extension(&ext) {
+        match crate::dap::registry::adapter_for_extension(&ext) {
             Some(AdapterKind::Debugpy) => {}
             Some(AdapterKind::LldbDap) => {
                 self.start_lldb_debug_session(&path);
@@ -8106,6 +8106,12 @@ impl App {
                 // be debugged directly by lldb-dap with no build step.
                 if is_executable_file(&path) {
                     self.launch_lldb(&path, &path);
+                } else if let Some(ext_id) = crate::dap::registry::disabled_extension_for(&ext) {
+                    // A debugger exists for this file type but its extension is
+                    // turned off — say so rather than claim none exists.
+                    self.debug_error(format!(
+                        "The {ext_id} debugger extension is disabled — enable it in Extensions"
+                    ));
                 } else {
                     self.debug_error(format!(
                         "No debugger for .{ext} files (Python, JS/TS, Rust, C/C++ are supported)"

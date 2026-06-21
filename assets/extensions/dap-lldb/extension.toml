@@ -1,0 +1,17 @@
+# Bundled croft extension: LLDB debugger.
+# Builds a debuggable binary (rustc / cc / c++ -g) then launches it under
+# lldb-dap via the shared DAP session machinery. The build + launch flow stays
+# native; this manifest declares which compiled-language file types route to
+# the lldb-dap mechanism. Breakpoint binding additionally requires a permitted
+# debugserver (macOS gates this behind code-signing / DevToolsSecurity).
+id = "dap-lldb"
+name = "LLDB Debugger"
+description = "Debug Rust, C, C++, and Objective-C with lldb-dap."
+builtin = true
+api_version = 1
+
+[[debug_adapters]]
+id = "dap-lldb"
+label = "lldb-dap"
+kind = "lldb"
+extensions = ["rs", "c", "h", "cc", "cpp", "cxx", "hpp", "hxx", "m", "mm"]

@@ -175,7 +175,9 @@ pub fn initialize_request() -> Value {
 }
 
 /// The debug adapter family for a given source language. Selected from the
-/// file extension; drives which adapter is spawned and the `launch` shape.
+/// file extension by [`crate::dap::registry::adapter_for_extension`] (a
+/// data-driven lookup over the `[[debug_adapters]]` manifests); drives which
+/// adapter is spawned and the `launch` shape.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdapterKind {
     /// debugpy (CPython 3.14+), launches the `.py` source directly.
@@ -186,21 +188,6 @@ pub enum AdapterKind {
     /// program under Node. Multi-session: a parent bootstraps and a child binds
     /// breakpoints (see [`start_debugging_request`]).
     JsDebug,
-}
-
-/// Pick the debug adapter for a file extension (lowercased, no dot), or None for
-/// languages croft can't debug yet.
-pub fn adapter_for_extension(ext: &str) -> Option<AdapterKind> {
-    match ext {
-        "py" | "pyw" => Some(AdapterKind::Debugpy),
-        "rs" | "c" | "h" | "cc" | "cpp" | "cxx" | "hpp" | "hxx" | "m" | "mm" => {
-            Some(AdapterKind::LldbDap)
-        }
-        // Node-run JS/TS. TypeScript binds via source maps (Node strips types on
-        // recent versions; otherwise the adapter follows emitted `.js.map`).
-        "js" | "mjs" | "cjs" | "jsx" | "ts" | "tsx" | "mts" | "cts" => Some(AdapterKind::JsDebug),
-        _ => None,
-    }
 }
 
 /// Build the lldb-dap `launch` request for a compiled `program` binary. Unlike
@@ -1112,27 +1099,6 @@ mod tests {
             classify_event(&json!({"type": "event", "event": "exited"})),
             Some(DapEvent::Terminated)
         );
-    }
-
-    #[test]
-    fn adapter_selection_by_extension() {
-        assert_eq!(adapter_for_extension("py"), Some(AdapterKind::Debugpy));
-        assert_eq!(adapter_for_extension("rs"), Some(AdapterKind::LldbDap));
-        assert_eq!(adapter_for_extension("c"), Some(AdapterKind::LldbDap));
-        assert_eq!(adapter_for_extension("cpp"), Some(AdapterKind::LldbDap));
-        assert_eq!(adapter_for_extension("txt"), None);
-        assert_eq!(adapter_for_extension(""), None);
-    }
-
-    #[test]
-    fn adapter_selection_routes_js_and_ts_to_js_debug() {
-        for ext in ["js", "mjs", "cjs", "jsx", "ts", "tsx", "mts", "cts"] {
-            assert_eq!(
-                adapter_for_extension(ext),
-                Some(AdapterKind::JsDebug),
-                "{ext} must route to js-debug"
-            );
-        }
     }
 
     #[test]

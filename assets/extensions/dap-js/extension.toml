@@ -1,0 +1,17 @@
+# Bundled croft extension: JavaScript / TypeScript debugger.
+# Launches a Node program under vscode-js-debug (the standalone dapDebugServer,
+# provisioned on first use) via the shared DAP session machinery, which drives
+# the parent + child TCP sessions js-debug requires. TypeScript binds via source
+# maps. The launch flow stays native; this manifest declares the file types that
+# route to the js-debug mechanism.
+id = "dap-js"
+name = "JavaScript Debugger"
+description = "Debug JavaScript and TypeScript with vscode-js-debug (Node)."
+builtin = true
+api_version = 1
+
+[[debug_adapters]]
+id = "dap-js"
+label = "vscode-js-debug"
+kind = "js-debug"
+extensions = ["js", "mjs", "cjs", "jsx", "ts", "tsx", "mts", "cts"]
