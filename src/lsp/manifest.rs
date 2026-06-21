@@ -43,6 +43,7 @@ pub const BUNDLED_MANIFESTS: &[&str] = &[
     include_str!("../../assets/extensions/lsp-bash/extension.toml"),
     include_str!("../../assets/extensions/lsp-toml/extension.toml"),
     include_str!("../../assets/extensions/lsp-cpp/extension.toml"),
+    include_str!("../../assets/extensions/themes/extension.toml"),
 ];
 
 /// A parsed `extension.toml`. Only the fields phase B1 consumes are modelled;
@@ -64,6 +65,42 @@ pub struct ExtensionManifest {
     pub languages: Vec<LanguageDecl>,
     #[serde(default)]
     pub language_servers: Vec<LanguageServerDecl>,
+    /// Color themes this extension contributes. An extension can ship languages,
+    /// servers, AND/OR themes; a pure theme extension declares only these.
+    #[serde(default)]
+    pub themes: Vec<ThemeDecl>,
+}
+
+/// One `[[themes]]` entry: a complete IDE color palette. All colors are
+/// `#rrggbb` strings; `gradient` selects the teal brand/gradient chrome scheme
+/// (vs the flat-accent scheme). croft's first-party Black/Dark-Blue ship as two
+/// of these; a third party adds a theme by dropping a manifest with another.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ThemeDecl {
+    /// Stable id persisted in prefs (e.g. `"black"`).
+    pub id: String,
+    /// Human-facing name shown in the theme picker.
+    pub label: String,
+    /// Editor/panel background (the `SetColors` session fill).
+    pub background: String,
+    /// Primary accent (selected-row text, active chrome).
+    pub accent: String,
+    /// Selected-row fill in lists/popups.
+    pub selection: String,
+    /// Filter/search input fill.
+    pub search: String,
+    /// Primary-button / lit-toggle fill.
+    pub button: String,
+    /// Whether this theme uses the gradient brand chrome (focused-pane gradient
+    /// border, popup gradient, brand accents) vs the flat-accent look.
+    #[serde(default)]
+    pub gradient: bool,
+    /// On-screen-keyboard normal key cap fill (Termux).
+    pub osk_key: String,
+    /// On-screen-keyboard special key cap fill (Termux).
+    pub osk_special: String,
+    /// On-screen-keyboard armed (held) key fill (Termux).
+    pub osk_armed: String,
 }
 
 /// One `[[languages]]` entry: a language identity contributed by an extension.
@@ -340,8 +377,8 @@ mod tests {
     fn bundled_summaries_list_user_facing_extensions_and_hide_infra() {
         let s = summaries(BUNDLED_MANIFESTS);
         let ids: Vec<&str> = s.iter().map(|e| e.id.as_str()).collect();
-        // The user-facing built-ins appear...
-        for id in ["pdf", "csv", "vim", "lsp-python", "lsp-rust"] {
+        // The user-facing built-ins appear (incl. the color-themes extension)...
+        for id in ["pdf", "csv", "vim", "lsp-python", "lsp-rust", "themes"] {
             assert!(ids.contains(&id), "missing {id} in {ids:?}");
         }
         // ...and the hidden infrastructure manifest does not.

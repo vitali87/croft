@@ -1,0 +1,39 @@
+# Bundled croft extension: the first-party color themes.
+# Each [[themes]] entry is a complete IDE palette. These two are croft's
+# historical built-ins, now expressed as data so a third party can add a theme
+# by dropping a manifest with another [[themes]] block into
+# ~/.config/croft/extensions/<id>/ (no rebuild). Croft Black is the baked-in
+# default; src/theme.rs also keeps a const fallback so croft is never themeless.
+# Values are byte-for-byte the historical palette (gradient brand consts inlined
+# from src/gradient.rs: accent #4fb1a6, selection #264f4a, button #0e7e76).
+id = "themes"
+name = "Color Themes"
+description = "The Croft Black and Croft Dark (Blue) color themes."
+builtin = true
+api_version = 1
+
+[[themes]]
+id = "black"
+label = "Croft Black"
+background = "#000000"
+accent = "#4fb1a6"
+selection = "#264f4a"
+search = "#141414"
+button = "#0e7e76"
+gradient = true
+osk_key = "#20242b"
+osk_special = "#14161b"
+osk_armed = "#0e7e76"
+
+[[themes]]
+id = "dark-blue"
+label = "Croft Dark (Blue)"
+background = "#1e222e"
+accent = "#4e9aff"
+selection = "#094d77"
+search = "#23272f"
+button = "#0967b8"
+gradient = false
+osk_key = "#3a4052"
+osk_special = "#2c3140"
+osk_armed = "#007acc"

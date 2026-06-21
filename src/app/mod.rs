@@ -4244,14 +4244,14 @@ impl App {
     fn open_theme_picker(&mut self) {
         let origin = self.settings_menu_origin();
         let active = self.theme;
-        let items: Vec<(String, MenuAction)> = crate::theme::Theme::ALL
+        let items: Vec<(String, MenuAction)> = crate::theme::Theme::all()
             .iter()
             .map(|&t| {
                 let mark = if t == active { "✔ " } else { "  " };
                 (format!("{mark}{}", t.label()), MenuAction::SetTheme(t))
             })
             .collect();
-        let selected = crate::theme::Theme::ALL
+        let selected = crate::theme::Theme::all()
             .iter()
             .position(|&t| t == active)
             .unwrap_or(0);
@@ -5737,7 +5737,7 @@ impl App {
         }
         // Only the Black theme dresses the focused pane in the gradient
         // border; Croft Dark keeps the historical solid-blue highlight.
-        let gradient = self.theme == crate::theme::Theme::Black;
+        let gradient = self.theme.gradient();
         // Every editor in both groups, not just the active one (deref would
         // only hit the active editor): a tab switch or the split group must
         // not resurrect the legacy navy active-tab chip between syncs.
@@ -5793,7 +5793,7 @@ impl App {
     /// bright-blue accent. Gated on the Black theme to mirror the focused-pane
     /// border, so Croft Dark keeps its coherent all-blue look.
     fn popup_gradient(&self) -> bool {
-        self.theme == crate::theme::Theme::Black
+        self.theme.gradient()
     }
 
     /// Split the editor into two side-by-side columns (`Cmd+\`). The new
@@ -6172,7 +6172,7 @@ impl App {
                 frame.render_widget(t, cols[i]);
             }
             let show_close = self.terminals.len() > 1;
-            let brand = self.theme == crate::theme::Theme::Black;
+            let brand = self.theme.gradient();
             self.terminal_add_buttons.clear();
             self.terminal_close_buttons.clear();
             for col in cols.iter().take(self.terminals.len()) {

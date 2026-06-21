@@ -14,7 +14,7 @@ fn explorer_boots_with_gradient_focus_under_black_theme() {
     // once before returning, so the initial focus already carries the gradient.
     let tmp = tempfile::tempdir().unwrap();
     let app = App::new(tmp.path().to_path_buf()).unwrap();
-    assert_eq!(app.theme, crate::theme::Theme::Black);
+    assert_eq!(app.theme, crate::theme::Theme::BLACK);
     assert!(app.tree.focused, "explorer should boot focused");
     assert!(
         app.tree.focus_gradient,
@@ -55,9 +55,9 @@ fn popup_gradient_tracks_black_theme() {
     // coherent with that theme's blue focus border.
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app.theme = crate::theme::Theme::Black;
+    app.theme = crate::theme::Theme::BLACK;
     assert!(app.popup_gradient());
-    app.theme = crate::theme::Theme::DarkBlue;
+    app.theme = crate::theme::Theme::DARK_BLUE;
     assert!(!app.popup_gradient());
 }
 
@@ -227,7 +227,7 @@ fn black_theme_context_menu_uses_gradient_border_and_muted_selection() {
     use crate::gradient::{GRAD_TL, POPUP_SEL_BG, rgb_color};
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app.theme = crate::theme::Theme::Black;
+    app.theme = crate::theme::Theme::BLACK;
     app.context_menu = Some(ContextMenu {
         origin: (10, 10),
         items: vec![
@@ -257,7 +257,7 @@ fn black_theme_context_menu_uses_gradient_border_and_muted_selection() {
 fn black_theme_status_bar_is_near_black_not_navy() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app.theme = crate::theme::Theme::Black;
+    app.theme = crate::theme::Theme::BLACK;
     let backend = ratatui::backend::TestBackend::new(140, 50);
     let mut term = ratatui::Terminal::new(backend).unwrap();
     term.draw(|f| app.render(f)).unwrap();
@@ -581,6 +581,9 @@ fn outline_scrollbar_drag_is_not_hijacked_by_the_sidebar_splitter() {
     let f = tmp.path().join("a.rs");
     std::fs::write(&f, "fn main() {}\n").unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    // Hermetic: App::new reads the user's real config; force the documented
+    // default views so this test never depends on a personal Outline-off pref.
+    app.explorer_views = Default::default();
     app.editor.open_pinned(&f).unwrap();
     // Enough symbols to overflow the OUTLINE's capped half-height so a scrollbar
     // is drawn; expand the panel so the body (and its bar) render.
@@ -4054,7 +4057,7 @@ fn set_session_bg_srgb_seq_uses_iterm_osc1337_and_srgb_prefix() {
     // sRGB) matches pixel-for-pixel. Locking in the exact bytes catches
     // any future refactor that drops the `srgb:` prefix or the iTerm2
     // OSC introducer.
-    let seq = set_session_bg_srgb_seq(crate::theme::Theme::DarkBlue.editor_bg_rgb());
+    let seq = set_session_bg_srgb_seq(crate::theme::Theme::DARK_BLUE.editor_bg_rgb());
     assert_eq!(seq, "\x1b]1337;SetColors=bg=srgb:1e222e\x07");
 }
 
@@ -4091,7 +4094,7 @@ fn welcome_image_bake_produces_osc1337_carrying_logo_pixels() {
     // or fail the byte assertions.
     let canvas_w = 48u32 * 8; // approx welcome cell w * cell pixel w
     let canvas_h = 14u32 * 16;
-    let bg_rgb = crate::theme::Theme::DarkBlue.editor_bg_rgb();
+    let bg_rgb = crate::theme::Theme::DARK_BLUE.editor_bg_rgb();
     let bg = image::Rgba([bg_rgb.0, bg_rgb.1, bg_rgb.2, 0xff]);
     let baked = crate::iterm2_inline::fit_image(
         crate::iterm2_inline::WELCOME_LOGO_PNG,
@@ -7539,7 +7542,7 @@ fn clicking_the_gear_opens_the_color_theme_menu_then_the_picker() {
     app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
         .unwrap();
     let picker = app.context_menu.as_ref().expect("picker opens");
-    assert_eq!(picker.items.len(), crate::theme::Theme::ALL.len());
+    assert_eq!(picker.items.len(), crate::theme::Theme::all().len());
     assert!(
         picker
             .items
@@ -7555,11 +7558,11 @@ fn applying_a_theme_switches_the_active_theme_and_arms_a_repaint() {
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     assert_eq!(
         app.theme,
-        crate::theme::Theme::Black,
+        crate::theme::Theme::BLACK,
         "fresh install defaults to the black theme"
     );
-    app.apply_theme(crate::theme::Theme::DarkBlue);
-    assert_eq!(app.theme, crate::theme::Theme::DarkBlue);
+    app.apply_theme(crate::theme::Theme::DARK_BLUE);
+    assert_eq!(app.theme, crate::theme::Theme::DARK_BLUE);
     // A theme switch arms a one-shot clear so iTerm2 evicts the stale-bg
     // image layer and the whole screen repaints on the new background.
     assert!(app.consume_activity_image_clear());
@@ -11700,6 +11703,8 @@ fn clicking_the_outline_header_toggles_collapse() {
     use crossterm::event::{MouseButton, MouseEventKind};
     let tmp = tempfile::tempdir().unwrap();
     let mut app = app_with_open_file(tmp.path(), "a.rs", "fn a() {}\n");
+    // Hermetic: ignore the user's real Outline-view pref (see scrollbar test).
+    app.explorer_views = Default::default();
     let active = app.editor.path.clone().unwrap();
     app.apply_outline_symbols(
         active,
@@ -11734,6 +11739,8 @@ fn clicking_an_outline_row_jumps_the_editor_to_that_symbol() {
     use crossterm::event::{MouseButton, MouseEventKind};
     let tmp = tempfile::tempdir().unwrap();
     let mut app = app_with_open_file(tmp.path(), "a.rs", "fn a() {}\nfn b() {}\nfn c() {}\n");
+    // Hermetic: ignore the user's real Outline-view pref (see scrollbar test).
+    app.explorer_views = Default::default();
     let active = app.editor.path.clone().unwrap();
     app.outline.toggle_collapse(); // expand so rows render
     app.apply_outline_symbols(
@@ -12357,7 +12364,7 @@ fn black_theme_terminal_title_is_chipless_brand_header() {
     // border row, mirroring panelTitle.activeForeground.
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    assert_eq!(app.theme, crate::theme::Theme::Black);
+    assert_eq!(app.theme, crate::theme::Theme::BLACK);
     let backend = ratatui::backend::TestBackend::new(140, 50);
     let mut term = ratatui::Terminal::new(backend).unwrap();
     term.draw(|f| app.render(f)).unwrap();
@@ -12522,7 +12529,7 @@ fn dark_blue_theme_terminal_keeps_navy_chips() {
     // and both buttons, exactly as before the Black-theme restyle.
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app.theme = crate::theme::Theme::DarkBlue;
+    app.theme = crate::theme::Theme::DARK_BLUE;
     app.sync_focus_flags();
     let ((tx, ty), add) = terminal_header_probe(&mut app);
     let backend = ratatui::backend::TestBackend::new(140, 50);
@@ -12665,7 +12672,7 @@ fn dark_blue_theme_keeps_the_legacy_blue_chrome() {
     let f = tmp.path().join("probe.txt");
     std::fs::write(&f, "alpha\n").unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app.theme = crate::theme::Theme::DarkBlue;
+    app.theme = crate::theme::Theme::DARK_BLUE;
     app.sync_focus_flags();
     app.editor.open_pinned(&f).unwrap();
     let buf = render_buf(&mut app);

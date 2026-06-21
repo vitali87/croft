@@ -177,10 +177,10 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("croft-prefs-test-{}", std::process::id()));
         let path = dir.join("config.json");
         let mut prefs = Prefs::default();
-        prefs.set_theme(Theme::Black);
+        prefs.set_theme(Theme::BLACK);
         prefs.save(&path).expect("save");
         let loaded = Prefs::load(&path).expect("load");
-        assert_eq!(loaded.theme(), Theme::Black);
+        assert_eq!(loaded.theme(), Theme::BLACK);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

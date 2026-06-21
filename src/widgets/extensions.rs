@@ -64,22 +64,15 @@ struct Palette {
 
 impl Palette {
     fn for_theme(theme: Theme) -> Self {
-        if theme == Theme::Black {
-            Palette {
-                brand: true,
-                accent: rgb(crate::gradient::INNER_ACCENT),
-                selection: rgb(crate::gradient::POPUP_SEL_BG),
-                search_bg: Color::Rgb(0x14, 0x14, 0x14),
-                switch_on: rgb(crate::gradient::PRIMARY_BTN_BG),
-            }
-        } else {
-            Palette {
-                brand: false,
-                accent: Color::Rgb(0x4e, 0x9a, 0xff),
-                selection: Color::Rgb(0x09, 0x4d, 0x77),
-                search_bg: Color::Rgb(0x23, 0x27, 0x2f),
-                switch_on: Color::Rgb(0x09, 0x67, 0xb8),
-            }
+        // Each theme declares its own palette; the gradient flag selects the
+        // brand chrome (was `theme == Black`). Byte-identical to the old
+        // hardcoded values for the two first-party themes.
+        Palette {
+            brand: theme.gradient(),
+            accent: theme.accent(),
+            selection: theme.selection(),
+            search_bg: theme.search_bg(),
+            switch_on: theme.button(),
         }
     }
 }
@@ -119,6 +112,7 @@ fn draw_switch(
     buf.set_string(sw_x + 3, y, SWITCH_CAP_R.to_string(), cap_style);
 }
 
+#[cfg(test)]
 fn rgb(c: (u8, u8, u8)) -> Color {
     Color::Rgb(c.0, c.1, c.2)
 }
@@ -142,6 +136,7 @@ fn chip_for(id: &str) -> Option<(char, Color)> {
         "lsp-bash" => ('\u{e760}', (0x4e, 0xaa, 0x25)), // dev-bash, green
         "lsp-toml" => ('\u{e615}', (0x9c, 0x42, 0x21)), // seti-config, toml brown
         "lsp-cpp" => ('\u{e7a3}', (0x00, 0x59, 0x9c)), // dev-cplusplus, C++ blue
+        "themes" => ('\u{eb5c}', (0xc5, 0x86, 0xc0)), // cod-symbol_color, theme purple
         _ => return None,
     };
     Some((glyph, Color::Rgb(c.0, c.1, c.2)))
@@ -630,7 +625,7 @@ mod tests {
     fn enabled_state_renders_as_a_pill_switch_not_a_word_label() {
         let mut panel = ExtensionsPanel::new();
         panel.set_items(items());
-        panel.theme = Theme::Black;
+        panel.theme = Theme::BLACK;
         let (buf, dump) = render(&mut panel, 44, 16);
         assert!(
             !dump.contains("Enabled"),
@@ -668,7 +663,7 @@ mod tests {
         panel.set_items(items());
         panel.select(0);
         // Black theme: selected row wears the brand teal fill.
-        panel.theme = Theme::Black;
+        panel.theme = Theme::BLACK;
         let (buf, _) = render(&mut panel, 44, 16);
         let y0 = panel.row_hits[0].0;
         assert_eq!(
@@ -677,7 +672,7 @@ mod tests {
             "Black theme selection is the brand teal"
         );
         // Dark-Blue theme: selected row wears the historical blue fill.
-        panel.theme = Theme::DarkBlue;
+        panel.theme = Theme::DARK_BLUE;
         let (buf, _) = render(&mut panel, 44, 16);
         let y0 = panel.row_hits[0].0;
         assert_eq!(

@@ -55,7 +55,6 @@
 //! T/G/V on the left and Y/G/V on the right. Tapping either copy of `g`/`v`
 //! types that letter. Both thumbs get a space bar in split mode.
 
-use crate::gradient::{PRIMARY_BTN_BG, rgb_color};
 use crate::theme::Theme;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::buffer::Buffer;
@@ -739,23 +738,15 @@ struct OskPalette {
 /// Croft Dark. Caps sit a step proud of the editor background either way, so
 /// the band reads as raised chrome rather than a flat overlay.
 fn palette(theme: Theme) -> OskPalette {
-    match theme {
-        Theme::Black => OskPalette {
-            fg: Color::Rgb(0xd4, 0xd8, 0xe0),
-            armed_fg: Color::White,
-            key_bg: Color::Rgb(0x20, 0x24, 0x2b),
-            special_bg: Color::Rgb(0x14, 0x16, 0x1b),
-            // Brand teal — the same primary-action fill the Black theme uses
-            // for buttons and active chrome elsewhere.
-            armed_bg: rgb_color(PRIMARY_BTN_BG),
-        },
-        Theme::DarkBlue => OskPalette {
-            fg: Color::Rgb(0xd4, 0xd8, 0xe0),
-            armed_fg: Color::White,
-            key_bg: Color::Rgb(0x3a, 0x40, 0x52),
-            special_bg: Color::Rgb(0x2c, 0x31, 0x40),
-            armed_bg: Color::Rgb(0x00, 0x7a, 0xcc),
-        },
+    // Key-cap colors come from the active theme's declared palette (the armed
+    // fill is the theme's primary-action color). Byte-identical to the old
+    // per-theme match for the two first-party themes; any theme works now.
+    OskPalette {
+        fg: Color::Rgb(0xd4, 0xd8, 0xe0),
+        armed_fg: Color::White,
+        key_bg: theme.osk_key_bg(),
+        special_bg: theme.osk_special_bg(),
+        armed_bg: theme.osk_armed_bg(),
     }
 }
 

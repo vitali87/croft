@@ -205,12 +205,12 @@ mod tests {
             height: 5,
         });
         let metrics = vertical_metrics(area, 100, 20, 0).unwrap();
-        render_vertical(&mut buf, metrics, true, Theme::Black);
+        render_vertical(&mut buf, metrics, true, Theme::BLACK);
         assert_eq!(buf[(2, 0)].symbol(), " ");
         // Focused thumb on Black = #646464 @ 70% over #000000.
         assert_eq!(buf[(2, 0)].bg, Color::Rgb(0x46, 0x46, 0x46));
         // Track matches the editor background, so the lane melts into it.
-        assert_eq!(buf[(2, 4)].bg, Theme::Black.editor_bg());
+        assert_eq!(buf[(2, 4)].bg, Theme::BLACK.editor_bg());
     }
 
     #[test]
@@ -253,11 +253,11 @@ mod tests {
             height: 3,
         });
         let metrics = horizontal_metrics(area, 100, 20, 0).unwrap();
-        render_horizontal(&mut buf, metrics, true, Theme::Black);
+        render_horizontal(&mut buf, metrics, true, Theme::BLACK);
         // Half-height block coloured via the foreground keeps the bar thin.
         assert_eq!(buf[(0, 2)].symbol(), "\u{2584}");
         // Focused thumb on Black = #646464 @ 70% over #000000.
         assert_eq!(buf[(0, 2)].fg, Color::Rgb(0x46, 0x46, 0x46));
-        assert_eq!(buf[(4, 2)].fg, Theme::Black.editor_bg());
+        assert_eq!(buf[(4, 2)].fg, Theme::BLACK.editor_bg());
     }
 }
