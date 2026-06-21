@@ -64,7 +64,8 @@ src/
 │   ├── mod.rs           module overview + McpOutcome (the off-thread worker's result)
 │   ├── transport.rs     JSON-RPC 2.0 over newline-delimited JSON on the server's stdio (the MCP stdio framing; simpler than DAP's Content-Length); setsid-detached child, reader thread -> mpsc, least-privilege env_clear()+envs()
 │   ├── client.rs        the MCP lifecycle: initialize -> notifications/initialized -> tools/list -> tools/call, synchronous id-correlated calls; tool_fingerprint for trust-on-first-use rug-pull detection
-│   └── registry.rs      data-driven: contributed_commands() (eager palette registration, skips disabled) + resolve_command() (lazy: tool + spawnable server with pinned Provision) from [[commands]]/[[mcp_servers]] manifests
+│   ├── registry.rs      data-driven: contributed_commands() (eager palette registration, skips disabled) + resolve_command() (lazy: tool + spawnable server with pinned Provision) from [[commands]]/[[mcp_servers]] manifests
+│   └── catalog.rs       the curated MCP catalog (AVAILABLE tier of the Extensions panel): CATALOG_MANIFESTS (vetted sidecars: Web Fetch / Time / MarkItDown) + install() which writes a catalog entry's manifest into the user extensions dir (Available → Add → Installed). Add via the panel's +Add
 ├── lsp/                 LSP client stack
 │   ├── mod.rs
 │   ├── client.rs        async-lsp client wrapper; router forwards diagnostics + work-done progress ($/progress, e.g. rust-analyzer "Indexing…") to the status bar

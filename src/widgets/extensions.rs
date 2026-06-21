@@ -156,6 +156,23 @@ pub struct ExtensionItem {
     pub description: String,
     pub builtin: bool,
     pub enabled: bool,
+    /// A catalog entry not yet installed: shown under AVAILABLE with an "Add"
+    /// affordance instead of an enable/disable toggle. `enabled` is meaningless
+    /// for these (they aren't installed yet).
+    pub available: bool,
+}
+
+impl ExtensionItem {
+    /// Section rank: BUILT-IN (0) before INSTALLED (1) before AVAILABLE (2).
+    fn group_rank(&self) -> u8 {
+        if self.available {
+            2
+        } else if self.builtin {
+            0
+        } else {
+            1
+        }
+    }
 }
 
 /// Project the manifest summaries (bundled + user, already hidden-filtered by
@@ -175,6 +192,23 @@ pub fn items_from_summaries(
             name: s.name,
             description: s.description,
             builtin: s.builtin,
+            available: false,
+        })
+        .collect()
+}
+
+/// Project catalog summaries onto AVAILABLE rows (not installed; the toggle
+/// action adds them). Appended after the installed items by the app.
+pub fn items_from_available(summaries: Vec<ExtensionSummary>) -> Vec<ExtensionItem> {
+    summaries
+        .into_iter()
+        .map(|s| ExtensionItem {
+            enabled: false,
+            id: s.id,
+            name: s.name,
+            description: s.description,
+            builtin: false,
+            available: true,
         })
         .collect()
 }
@@ -256,7 +290,7 @@ impl ExtensionsPanel {
         let mut v: Vec<usize> = (0..self.items.len())
             .filter(|&i| self.matches(&self.items[i]))
             .collect();
-        v.sort_by_key(|&i| !self.items[i].builtin); // builtin (true) first
+        v.sort_by_key(|&i| self.items[i].group_rank()); // BUILT-IN, INSTALLED, AVAILABLE
         v
     }
 
@@ -280,6 +314,15 @@ impl ExtensionsPanel {
         self.visible_indices()
             .get(self.selected)
             .map(|&i| self.items[i].id.as_str())
+    }
+
+    /// Whether the selected row is an AVAILABLE catalog entry — so the app
+    /// treats its toggle as "add" (install) rather than enable/disable.
+    pub fn selected_available(&self) -> bool {
+        self.visible_indices()
+            .get(self.selected)
+            .map(|&i| self.items[i].available)
+            .unwrap_or(false)
     }
 
     /// `idx` is a position in the *visible* list.
@@ -467,20 +510,20 @@ impl Widget for &mut ExtensionsPanel {
         self.last_switch_left = sw_x;
 
         let visible = self.visible_indices();
-        let mut prev_builtin: Option<bool> = None;
+        let mut prev_group: Option<u8> = None;
         for (vis_idx, &item_idx) in visible.iter().enumerate().skip(self.scroll) {
             let item = &self.items[item_idx];
 
             // Section header whenever the group changes (or on the first shown
             // row). One row tall, dim small-caps, like VS Code's BUILT-IN list.
-            if prev_builtin != Some(item.builtin) {
+            if prev_group != Some(item.group_rank()) {
                 if y + 1 >= bottom {
                     break;
                 }
-                let label = if item.builtin {
-                    "BUILT-IN"
-                } else {
-                    "INSTALLED"
+                let label = match item.group_rank() {
+                    0 => "BUILT-IN",
+                    1 => "INSTALLED",
+                    _ => "AVAILABLE",
                 };
                 put(
                     buf,
@@ -490,7 +533,7 @@ impl Widget for &mut ExtensionsPanel {
                     label,
                     Style::default().fg(DESC_FG).add_modifier(Modifier::BOLD),
                 );
-                prev_builtin = Some(item.builtin);
+                prev_group = Some(item.group_rank());
                 y += 1;
             }
             if y + ROW_H > bottom {
@@ -539,7 +582,18 @@ impl Widget for &mut ExtensionsPanel {
             );
             put(buf, x, y, name_right, &item.name, name_style);
 
-            draw_switch(buf, sw_x, y, item.enabled, row_bg, &pal);
+            // Installed rows get an enable/disable switch; AVAILABLE catalog
+            // rows get a "+ Add" affordance in the same hit zone (toggling it
+            // installs the entry rather than enabling it).
+            if item.available {
+                let add_style = Style::default()
+                    .fg(pal.accent)
+                    .bg(row_bg.unwrap_or(Color::Reset))
+                    .add_modifier(Modifier::BOLD);
+                put(buf, sw_x, y, right, "+Add", add_style);
+            } else {
+                draw_switch(buf, sw_x, y, item.enabled, row_bg, &pal);
+            }
 
             // Line 2: the blurb.
             let line2_y = y + 1;
@@ -565,6 +619,32 @@ const ICON_CHIP_FALLBACK: Color = Color::Rgb(0x6c, 0x7d, 0x9c);
 mod tests {
     use super::*;
 
+    #[test]
+    fn available_catalog_entries_sort_last_and_toggle_means_add() {
+        let mut panel = ExtensionsPanel::new();
+        let mut items = items(); // three BUILT-IN rows
+        items.extend(items_from_available(vec![ExtensionSummary {
+            id: "mcp-time".into(),
+            name: "Time".into(),
+            description: "Current time".into(),
+            builtin: false,
+        }]));
+        panel.set_items(items);
+        // The available entry sorts after every installed/built-in row.
+        let order = panel.visible_indices();
+        let last = *order.last().unwrap();
+        assert!(panel.items[last].available, "AVAILABLE row must sort last");
+        // Selecting it reports `available`, so the app treats its toggle as Add.
+        for _ in 0..10 {
+            panel.move_down();
+        }
+        assert_eq!(panel.selected_id(), Some("mcp-time"));
+        assert!(
+            panel.selected_available(),
+            "the catalog row must report as available so its toggle installs"
+        );
+    }
+
     fn items() -> Vec<ExtensionItem> {
         vec![
             ExtensionItem {
@@ -573,6 +653,7 @@ mod tests {
                 description: "Render PDF files inline".into(),
                 builtin: true,
                 enabled: true,
+                available: false,
             },
             ExtensionItem {
                 id: "csv".into(),
@@ -580,6 +661,7 @@ mod tests {
                 description: "Tabular view of delimited files".into(),
                 builtin: true,
                 enabled: false,
+                available: false,
             },
             ExtensionItem {
                 id: "vim".into(),
@@ -587,6 +669,7 @@ mod tests {
                 description: "Modal editing".into(),
                 builtin: true,
                 enabled: true,
+                available: false,
             },
         ]
     }

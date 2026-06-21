@@ -46,8 +46,19 @@ pub const BUNDLED_MANIFESTS: &[&str] = &[
     include_str!("../../assets/extensions/dap-python/extension.toml"),
     include_str!("../../assets/extensions/dap-lldb/extension.toml"),
     include_str!("../../assets/extensions/dap-js/extension.toml"),
-    include_str!("../../assets/extensions/mcp-fetch/extension.toml"),
     include_str!("../../assets/extensions/themes/extension.toml"),
+];
+
+/// The curated MCP-server catalog: vetted sidecars a user can *add* from the
+/// Extensions panel (Available → Add → Installed). Unlike [`BUNDLED_MANIFESTS`]
+/// these are NOT loaded as active extensions; adding one writes its manifest
+/// into the user extensions dir, after which it loads like any installed
+/// extension. Same `extension.toml` format. Each is a keyless (or opt-in)
+/// server croft can drive through its single-argument command model.
+pub const CATALOG_MANIFESTS: &[&str] = &[
+    include_str!("../../assets/catalog/mcp-fetch/extension.toml"),
+    include_str!("../../assets/catalog/mcp-time/extension.toml"),
+    include_str!("../../assets/catalog/mcp-markitdown/extension.toml"),
 ];
 
 /// A parsed `extension.toml`. Only the fields phase B1 consumes are modelled;

@@ -1,0 +1,21 @@
+# Catalog entry (MCP sidecar): MarkItDown (Microsoft). Keyless; converts a
+# file or URL (PDF, DOCX, PPTX, HTML, …) to Markdown. NOTE: the markitdown-mcp
+# package is alpha (0.0.1a4) — offered as an opt-in catalog entry, not a default.
+id = "mcp-markitdown"
+name = "MarkItDown"
+description = "Convert a file or URL (PDF, DOCX, …) to Markdown (alpha)."
+builtin = false
+api_version = 1
+
+[[mcp_servers]]
+id = "markitdown"
+command = "markitdown-mcp"
+provision = { kind = "uv", package = "markitdown-mcp", version = "0.0.1a4", bin = "markitdown-mcp" }
+
+[[commands]]
+id = "markitdown.convert"
+title = "MarkItDown: Convert URI to Markdown"
+server = "markitdown"
+tool = "convert_to_markdown"
+arg = "uri"
+prompt = "URI (http/https/file/data)"

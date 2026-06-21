@@ -19,6 +19,7 @@
 //! Speaking real MCP keeps croft interoperable with the existing MCP server
 //! ecosystem rather than inventing a private protocol.
 
+pub mod catalog;
 pub mod client;
 pub mod registry;
 pub mod transport;

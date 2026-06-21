@@ -1,0 +1,22 @@
+# Catalog entry (MCP sidecar): Web Fetch. Available to add from the Extensions
+# panel; not installed until the user adds it. On add, this manifest is written
+# into ~/.config/croft/extensions/mcp-fetch/ and loaded like any installed
+# extension. Keyless. Official Anthropic reference server.
+id = "mcp-fetch"
+name = "Web Fetch"
+description = "Fetch a URL and open it as Markdown."
+builtin = false
+api_version = 1
+
+[[mcp_servers]]
+id = "fetch"
+command = "mcp-server-fetch"
+provision = { kind = "uv", package = "mcp-server-fetch", version = "2026.6.4", bin = "mcp-server-fetch" }
+
+[[commands]]
+id = "fetch.url"
+title = "Web: Fetch URL as Markdown"
+server = "fetch"
+tool = "fetch"
+arg = "url"
+prompt = "URL to fetch"

@@ -1,0 +1,20 @@
+# Catalog entry (MCP sidecar): Time. Keyless. Official Anthropic reference
+# server (mcp-server-time). Available to add from the Extensions panel.
+id = "mcp-time"
+name = "Time"
+description = "Current time in any timezone (MCP sidecar)."
+builtin = false
+api_version = 1
+
+[[mcp_servers]]
+id = "time"
+command = "mcp-server-time"
+provision = { kind = "uv", package = "mcp-server-time", version = "2026.6.4", bin = "mcp-server-time" }
+
+[[commands]]
+id = "time.now"
+title = "Time: Current Time in Timezone"
+server = "time"
+tool = "get_current_time"
+arg = "timezone"
+prompt = "IANA timezone (e.g. Europe/London)"

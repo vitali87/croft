@@ -7601,6 +7601,21 @@ impl App {
         let Some(id) = self.extensions.selected_id().map(str::to_string) else {
             return;
         };
+        // AVAILABLE catalog rows: the toggle "adds" (installs) rather than
+        // enables. Materialize the manifest into the user extensions dir, then
+        // refresh so it moves into INSTALLED (enabled by default).
+        if self.extensions.selected_available() {
+            match crate::mcp::catalog::install(&id) {
+                Ok(_) => {
+                    self.refresh_extensions();
+                    self.status = format!(
+                        "Added '{id}' — invoke it from the Command Palette (its server installs on first use)"
+                    );
+                }
+                Err(e) => self.status = format!("Could not add '{id}': {e}"),
+            }
+            return;
+        }
         let now_enabled = self.disabled_extensions.contains(&id);
         if now_enabled {
             self.disabled_extensions.remove(&id);
@@ -18165,7 +18180,12 @@ fn build_extension_items(
     let mut sources: Vec<&str> = manifest::BUNDLED_MANIFESTS.to_vec();
     sources.extend(user.iter().map(String::as_str));
     let summaries = manifest::summaries(&sources);
-    crate::widgets::extensions::items_from_summaries(summaries, disabled)
+    let mut items = crate::widgets::extensions::items_from_summaries(summaries, disabled);
+    // Append the curated MCP catalog's not-yet-installed entries under AVAILABLE.
+    items.extend(crate::widgets::extensions::items_from_available(
+        crate::mcp::catalog::available(),
+    ));
+    items
 }
 
 /// Resolve the program to spawn for a sidecar server: PATH-first / pinned
