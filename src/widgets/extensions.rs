@@ -140,6 +140,8 @@ fn chip_for(id: &str) -> Option<(char, Color)> {
         "lsp-html" => ('\u{e736}', (0xe3, 0x4f, 0x26)), // dev-html5, orange
         "lsp-css" => ('\u{e749}', (0x15, 0x72, 0xb6)), // dev-css3, blue
         "lsp-bash" => ('\u{e760}', (0x4e, 0xaa, 0x25)), // dev-bash, green
+        "lsp-toml" => ('\u{e615}', (0x9c, 0x42, 0x21)), // seti-config, toml brown
+        "lsp-cpp" => ('\u{e7a3}', (0x00, 0x59, 0x9c)), // dev-cplusplus, C++ blue
         _ => return None,
     };
     Some((glyph, Color::Rgb(c.0, c.1, c.2)))

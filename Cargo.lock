@@ -459,7 +459,7 @@ dependencies = [
 
 [[package]]
 name = "croft"
-version = "0.1.463"
+version = "0.1.464"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -471,6 +471,7 @@ dependencies = [
  "color_quant",
  "crossterm",
  "csv",
+ "flate2",
  "futures",
  "globset",
  "grep-matcher",
@@ -519,6 +520,7 @@ dependencies = [
  "tree-sitter-yaml",
  "tui-input",
  "ureq",
+ "zip",
 ]
 
 [[package]]

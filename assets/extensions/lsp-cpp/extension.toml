@@ -1,0 +1,33 @@
+# Bundled croft extension: C / C++ language support.
+# One clangd serves both C and C++ (like vtsls serves the TS/JS family). clangd
+# ships as a per-platform zip carrying the binary plus a `lib/` it needs, so the
+# whole archive is extracted and the binary invoked at clangd_<ver>/bin/clangd.
+# The mac build is universal (serves any arch via the bare `macos` key); the
+# linux build is x86_64-only and there is no linux-aarch64 build, so that
+# platform falls back to a clangd already on PATH (apt/pkg). PATH-first overall,
+# so a toolchain clangd matching the user's compiler wins. Bump by editing the
+# target URLs and bin_path together.
+id = "lsp-cpp"
+name = "C / C++ (clangd)"
+description = "C and C++ language support via clangd."
+builtin = true
+api_version = 1
+
+[[languages]]
+id = "c"
+extensions = ["c", "h"]
+root_markers = ["compile_commands.json", "compile_flags.txt", ".clangd"]
+
+[[languages]]
+id = "cpp"
+extensions = ["cpp", "cc", "cxx", "hpp", "hh", "hxx"]
+root_markers = ["compile_commands.json", "compile_flags.txt", ".clangd"]
+family = "c"
+
+[[language_servers]]
+name = "clangd"
+command = "clangd"
+args = []
+languages = ["c", "cpp"]
+priority = 0
+provision = { kind = "binary", bin = "clangd", archive = "zip", bin_path = "clangd_22.1.0/bin/clangd", targets = { "macos" = "https://github.com/clangd/clangd/releases/download/22.1.0/clangd-mac-22.1.0.zip", "linux-x86_64" = "https://github.com/clangd/clangd/releases/download/22.1.0/clangd-linux-22.1.0.zip" } }

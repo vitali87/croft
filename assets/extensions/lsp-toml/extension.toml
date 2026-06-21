@@ -1,0 +1,23 @@
+# Bundled croft extension: TOML language support.
+# taplo ships as a single gzipped binary per platform (no npm LSP exists: the
+# `taplo-lsp` npm package is years stale and `@taplo/cli` omits the server). The
+# binary backend downloads the right asset into ~/.croft/servers/taplo on first
+# use; a `taplo` already on PATH (e.g. `cargo install taplo-cli`) wins. Bump the
+# version by editing each target URL.
+id = "lsp-toml"
+name = "TOML (taplo)"
+description = "TOML language support via taplo."
+builtin = true
+api_version = 1
+
+[[languages]]
+id = "toml"
+extensions = ["toml"]
+
+[[language_servers]]
+name = "taplo"
+command = "taplo"
+args = ["lsp", "stdio"]
+language = "toml"
+priority = 0
+provision = { kind = "binary", bin = "taplo", archive = "gz", targets = { "macos-aarch64" = "https://github.com/tamasfe/taplo/releases/download/0.10.0/taplo-darwin-aarch64.gz", "macos-x86_64" = "https://github.com/tamasfe/taplo/releases/download/0.10.0/taplo-darwin-x86_64.gz", "linux-x86_64" = "https://github.com/tamasfe/taplo/releases/download/0.10.0/taplo-linux-x86_64.gz", "linux-aarch64" = "https://github.com/tamasfe/taplo/releases/download/0.10.0/taplo-linux-aarch64.gz" } }

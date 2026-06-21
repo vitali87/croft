@@ -12,9 +12,5 @@ hidden = true
 api_version = 1
 
 [[languages]]
-id = "toml"
-extensions = ["toml"]
-
-[[languages]]
 id = "markdown"
 extensions = ["md", "markdown"]

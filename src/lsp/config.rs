@@ -23,6 +23,8 @@ impl Language {
     pub const MARKDOWN: Language = Language("markdown");
     pub const HTML: Language = Language("html");
     pub const CSS: Language = Language("css");
+    pub const C: Language = Language("c");
+    pub const CPP: Language = Language("cpp");
 
     /// The language whose manifests map this file extension, or `None`.
     /// Data-driven: the mapping comes from every loaded extension's

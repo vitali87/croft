@@ -17,6 +17,8 @@ const BUNDLED_MANIFESTS: &[&str] = &[
     include_str!("../../assets/extensions/lsp-html/extension.toml"),
     include_str!("../../assets/extensions/lsp-css/extension.toml"),
     include_str!("../../assets/extensions/lsp-bash/extension.toml"),
+    include_str!("../../assets/extensions/lsp-toml/extension.toml"),
+    include_str!("../../assets/extensions/lsp-cpp/extension.toml"),
 ];
 
 pub struct ServerRegistry {
@@ -288,6 +290,51 @@ mod tests {
         );
         assert_eq!(r.for_extension("sh")[0].name, "bash-language-server");
         assert_eq!(r.for_extension("bash")[0].name, "bash-language-server");
+    }
+
+    #[test]
+    fn bundled_manifests_register_toml_and_cpp_binary_servers() {
+        use crate::lsp::install::{ArchiveKind, Provision};
+        let r = ServerRegistry::with_defaults();
+
+        // TOML -> taplo, provisioned as a single gzipped binary.
+        let toml = r.for_language(Language::TOML);
+        assert_eq!(toml.len(), 1, "one server for toml");
+        assert_eq!(toml[0].name, "taplo");
+        assert_eq!(toml[0].command, "taplo");
+        assert_eq!(toml[0].args, vec!["lsp".to_string(), "stdio".to_string()]);
+        assert!(
+            matches!(
+                toml[0].provision,
+                Some(Provision::Binary {
+                    bin: "taplo",
+                    archive: ArchiveKind::Gz,
+                    ..
+                })
+            ),
+            "taplo is a gz binary download"
+        );
+        assert_eq!(r.for_extension("toml")[0].name, "taplo");
+
+        // C and C++ -> clangd (one server serves both), provisioned as a zip.
+        for (lang, ext) in [(Language::C, "c"), (Language::CPP, "cpp")] {
+            let s = r.for_language(lang);
+            assert_eq!(s.len(), 1, "one server for {ext}");
+            assert_eq!(s[0].name, "clangd");
+            assert!(
+                matches!(
+                    s[0].provision,
+                    Some(Provision::Binary {
+                        bin: "clangd",
+                        archive: ArchiveKind::Zip,
+                        ..
+                    })
+                ),
+                "clangd is a zip binary download"
+            );
+        }
+        assert_eq!(r.for_extension("c")[0].name, "clangd");
+        assert_eq!(r.for_extension("cpp")[0].name, "clangd");
     }
 
     #[test]

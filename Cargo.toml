@@ -1,6 +1,6 @@
 [package]
 name = "croft"
-version = "0.1.463"
+version = "0.1.464"
 edition = "2024"
 description = "VSCode-style TUI written in Rust"
 license = "MIT"
@@ -90,6 +90,14 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 csv = "1.4"
 calamine = "0.34"
+# Decompression for the `Provision::Binary` LSP backend (src/lsp/install.rs):
+# release binaries ship as a single gzipped executable (taplo) or a zip with
+# sibling files (clangd). Both crates are already in the tree transitively
+# (flate2 via the png/gzip paths, zip via calamine), so promoting them to
+# direct deps adds no new version to the lock. zip needs only `deflate` (the
+# standard GitHub-release compression); its heavier default codecs are dropped.
+flate2 = "1"
+zip = { version = "7", default-features = false, features = ["deflate"] }
 # Read-only TOML parser for the Explorer DEPENDENCIES view: extracts the
 # dependency list from `pyproject.toml` (PEP 621 `[project].dependencies` or
 # `[tool.poetry.dependencies]`). `parse` + `serde` give `toml::Table`/`Value`

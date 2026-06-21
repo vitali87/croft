@@ -51,6 +51,43 @@ pub enum Provision {
         version: Option<&'static str>,
         bin: &'static str,
     },
+    /// A prebuilt binary downloaded from a release URL and unpacked under
+    /// `~/.croft/servers/<name>/`. Host-agnostic: each `targets` entry is a full
+    /// literal URL (GitHub, Codeberg, GitLab, or any host), so neither the host
+    /// nor the project's asset-naming scheme is baked into croft. This is how
+    /// VS Code, Zed and Mason provision servers that ship as native binaries
+    /// (clangd, taplo) rather than npm/PyPI packages.
+    Binary {
+        /// Supported platforms mapped to their literal download URL. Keys are
+        /// `"<os>-<arch>"` (e.g. `linux-x86_64`) or a bare `"<os>"` (e.g.
+        /// `macos` for a universal build that serves every arch), using Rust's
+        /// `target_os`/`target_arch` tokens. Resolution tries the specific
+        /// `os-arch` key first, then the bare `os`. A platform absent from the
+        /// map is unsupported for managed install and falls back to PATH — this
+        /// is how an irregular matrix (clangd: universal mac, x86_64-only linux,
+        /// no linux-aarch64) is expressed exactly.
+        targets: &'static [(&'static str, &'static str)],
+        /// Executable name croft invokes after unpacking (also the PATH-probe
+        /// name for a user-installed copy).
+        bin: &'static str,
+        /// Archive format of the downloaded asset.
+        archive: ArchiveKind,
+        /// Literal path to the executable inside the unpacked archive, relative
+        /// to `~/.croft/servers/<name>/`. `None` for a single-file `.gz` whose
+        /// decompressed bytes ARE the binary (placed at `<name>/<bin>`). Set for
+        /// `.zip` payloads that carry sibling files the binary needs at a fixed
+        /// relative path (e.g. clangd's `clangd_<ver>/bin/clangd` beside `lib/`).
+        bin_path: Option<&'static str>,
+    },
+}
+
+/// Archive format of a [`Provision::Binary`] download.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ArchiveKind {
+    /// A single gzip-compressed executable; decompressed bytes are the binary.
+    Gz,
+    /// A zip holding the binary plus any sibling files it needs; extracted whole.
+    Zip,
 }
 
 /// Latest one-line status of a managed install, polled by the app each tick and
@@ -132,6 +169,15 @@ pub fn resolve_managed(
                 resolved.command = command;
                 // uv writes a self-contained launcher (absolute shebang to the
                 // tool's own venv python), so no extra PATH entry is needed.
+                return Some((resolved, Vec::new()));
+            }
+        }
+        Provision::Binary { bin, bin_path, .. } => {
+            if let Some(command) = binary_command(config.name, bin, *bin_path) {
+                let mut resolved = config.clone();
+                resolved.command = command;
+                // A self-contained native binary launched by absolute path; the
+                // archive carries any sibling files it needs, so no extra PATH.
                 return Some((resolved, Vec::new()));
             }
         }
@@ -224,6 +270,168 @@ fn managed_uv_binary(bin: &str) -> Option<PathBuf> {
     Some(uv_bin_dir()?.join(bin))
 }
 
+// ---------------------------------------------------------------------------
+// Binary backend: prebuilt release binaries (clangd, taplo). Host-agnostic —
+// the manifest carries a full URL template plus per-project OS/arch tokens, so
+// a server hosted on GitHub, Codeberg, GitLab or anywhere else is just data.
+// ---------------------------------------------------------------------------
+
+/// Generous ceiling on a release-binary download (clangd's zip is ~50 MB); a
+/// runaway or redirected body is refused past this.
+const MAX_BINARY_BYTES: u64 = 256 * 1024 * 1024;
+
+/// The download URL for the running platform, or `None` if unsupported. Tries
+/// the specific `"<os>-<arch>"` key first (e.g. `linux-x86_64`), then a bare
+/// `"<os>"` key (e.g. `macos` for a universal build). Pure and testable.
+fn target_url<'a>(targets: &'a [(&'a str, &'a str)], os: &str, arch: &str) -> Option<&'a str> {
+    let specific = format!("{os}-{arch}");
+    targets
+        .iter()
+        .find(|(k, _)| *k == specific)
+        .or_else(|| targets.iter().find(|(k, _)| *k == os))
+        .map(|(_, url)| *url)
+}
+
+/// The executable inside a managed binary install. `bin_path` locates a binary
+/// nested in an extracted archive; absent, the binary sits directly at
+/// `<name>/<bin>`.
+fn managed_binary_path(name: &str, bin: &str, bin_path: Option<&str>) -> Option<PathBuf> {
+    Some(servers_dir()?.join(name).join(bin_path.unwrap_or(bin)))
+}
+
+/// Resolve an invocable command for a binary-provisioned server. PATH-first
+/// (mirrors Zed: a user's own clangd/taplo, matching their toolchain, wins),
+/// then croft's managed copy. `None` when neither exists yet.
+fn binary_command(name: &str, bin: &str, bin_path: Option<&str>) -> Option<String> {
+    if crate::lsp::manager::is_on_path(bin) {
+        return Some(bin.to_string());
+    }
+    if let Some(p) = managed_binary_path(name, bin, bin_path)
+        && p.is_file()
+    {
+        return Some(p.to_string_lossy().into_owned());
+    }
+    None
+}
+
+/// Mark a downloaded file executable (no-op on non-unix; croft's targets are
+/// macOS/Linux/Android, all unix).
+#[cfg(unix)]
+fn set_executable(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = std::fs::metadata(path)?.permissions();
+    perms.set_mode(perms.mode() | 0o755);
+    std::fs::set_permissions(path, perms)
+}
+#[cfg(not(unix))]
+fn set_executable(_path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// Stream `url` into memory, capped at `max`. Follows redirects (release URLs
+/// 302 to a CDN). `None` on any transport error.
+fn download_capped(url: &str, max: u64) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let resp = ureq::get(url).call().ok()?;
+    let mut bytes = Vec::new();
+    resp.into_reader().take(max).read_to_end(&mut bytes).ok()?;
+    Some(bytes)
+}
+
+/// Gunzip a single-file `.gz` payload (the decompressed bytes ARE the binary)
+/// to `target` and mark it executable.
+fn extract_gz(bytes: &[u8], target: &Path) -> std::io::Result<()> {
+    use std::io::Read;
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut decoder = flate2::read::GzDecoder::new(bytes);
+    let mut out = Vec::new();
+    decoder.read_to_end(&mut out)?;
+    std::fs::write(target, &out)?;
+    set_executable(target)
+}
+
+/// Extract a `.zip` payload whole into `dir` (so the binary keeps its sibling
+/// files, e.g. clangd's `lib/`), then mark the resolved binary executable.
+fn extract_zip(bytes: &[u8], dir: &Path, target: &Path) -> std::io::Result<()> {
+    let reader = std::io::Cursor::new(bytes);
+    let mut archive = zip::ZipArchive::new(reader)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    archive.extract(dir).map_err(std::io::Error::other)?;
+    if target.is_file() {
+        set_executable(target)?;
+    }
+    Ok(())
+}
+
+/// Download + unpack a prebuilt release binary into `~/.croft/servers/<name>/`.
+/// Resolves the platform tokens, builds the URL, fetches, extracts per archive
+/// kind, and marks the language installed on success. A platform the project
+/// ships no asset for is logged + surfaced and left to PATH (e.g. clangd has no
+/// linux-aarch64 build).
+fn run_binary_install(
+    name: &'static str,
+    language: Language,
+    targets: &[(&str, &str)],
+    bin: &str,
+    archive: ArchiveKind,
+    bin_path: Option<&str>,
+) {
+    let (os, arch) = (std::env::consts::OS, std::env::consts::ARCH);
+    let Some(url) = target_url(targets, os, arch) else {
+        log_file::log(&format!("lsp[{name}] no prebuilt binary for {os}-{arch}"));
+        set_status(format!(
+            "{name} unavailable: no prebuilt binary for this platform (install {bin} manually)"
+        ));
+        return;
+    };
+
+    let Some(dir) = servers_dir().map(|d| d.join(name)) else {
+        return;
+    };
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        log_file::log(&format!("lsp[{name}] could not create {dir:?}: {e}"));
+        set_status(format!(
+            "{name} install failed (could not create install dir)"
+        ));
+        return;
+    }
+
+    log_file::log(&format!("lsp[{name}] downloading {url}"));
+    set_status(format!("Installing {name}…"));
+    let Some(bytes) = download_capped(url, MAX_BINARY_BYTES) else {
+        log_file::log(&format!("lsp[{name}] download failed: {url}"));
+        set_status(format!(
+            "{name} install failed (download error, see ~/.croft/lsp.log)"
+        ));
+        return;
+    };
+
+    let target = dir.join(bin_path.unwrap_or(bin));
+    let extracted = match archive {
+        ArchiveKind::Gz => extract_gz(&bytes, &target),
+        ArchiveKind::Zip => extract_zip(&bytes, &dir, &target),
+    };
+    if let Err(e) = extracted {
+        log_file::log(&format!("lsp[{name}] extract failed: {e}"));
+        set_status(format!(
+            "{name} install failed (extract error, see ~/.croft/lsp.log)"
+        ));
+        return;
+    }
+    if !target.is_file() {
+        log_file::log(&format!(
+            "lsp[{name}] expected binary missing after extract: {target:?}"
+        ));
+        set_status(format!("{name} install failed (unexpected archive layout)"));
+        return;
+    }
+    log_file::log(&format!("lsp[{name}] managed binary install complete"));
+    mark_installed(language);
+    set_status(format!("{name} installed"));
+}
+
 /// Build the package spec npm installs, pinning the version when given.
 fn npm_spec(package: &str, version: Option<&str>) -> String {
     match version {
@@ -267,6 +475,12 @@ pub fn ensure_in_background(config: &ServerConfig, provision: &Provision) {
         Provision::Uv {
             package, version, ..
         } => run_uv_install(name, language, package, *version),
+        Provision::Binary {
+            targets,
+            bin,
+            archive,
+            bin_path,
+        } => run_binary_install(name, language, targets, bin, *archive, *bin_path),
     });
 }
 
@@ -841,6 +1055,99 @@ mod tests {
             npm_bin_in(prefix, "vtsls"),
             std::path::Path::new("/tmp/croft/servers/vtsls/node_modules/.bin/vtsls"),
             "npm install --prefix drops executables under <prefix>/node_modules/.bin"
+        );
+    }
+
+    #[test]
+    fn target_url_prefers_os_arch_then_falls_back_to_bare_os() {
+        // clangd's matrix: universal mac (a bare `macos` key serves any arch),
+        // x86_64-only linux, and no linux-aarch64 build at all.
+        let targets = [("macos", "MAC"), ("linux-x86_64", "LINUX64")];
+        assert_eq!(target_url(&targets, "macos", "aarch64"), Some("MAC"));
+        assert_eq!(target_url(&targets, "macos", "x86_64"), Some("MAC"));
+        assert_eq!(target_url(&targets, "linux", "x86_64"), Some("LINUX64"));
+        // Unsupported platform -> None, so the caller falls back to PATH.
+        assert_eq!(target_url(&targets, "linux", "aarch64"), None);
+        assert_eq!(target_url(&targets, "android", "aarch64"), None);
+    }
+
+    #[test]
+    fn target_url_specific_os_arch_key_wins_over_bare_os() {
+        let targets = [("macos", "GENERIC"), ("macos-aarch64", "ARM")];
+        assert_eq!(target_url(&targets, "macos", "aarch64"), Some("ARM"));
+        assert_eq!(target_url(&targets, "macos", "x86_64"), Some("GENERIC"));
+    }
+
+    /// End-to-end exercise of the real download + gunzip path against taplo's
+    /// release. `#[ignore]`d because it hits the network and is platform-gated;
+    /// run explicitly with `cargo test --bin croft -- --ignored taplo_gz`.
+    /// Proves `download_capped` + `extract_gz` produce a runnable binary.
+    #[test]
+    #[ignore = "network: downloads a real taplo release"]
+    fn taplo_gz_binary_downloads_extracts_and_runs() {
+        let url = match (std::env::consts::OS, std::env::consts::ARCH) {
+            ("macos", "aarch64") => {
+                "https://github.com/tamasfe/taplo/releases/download/0.10.0/taplo-darwin-aarch64.gz"
+            }
+            ("macos", "x86_64") => {
+                "https://github.com/tamasfe/taplo/releases/download/0.10.0/taplo-darwin-x86_64.gz"
+            }
+            ("linux", "x86_64") => {
+                "https://github.com/tamasfe/taplo/releases/download/0.10.0/taplo-linux-x86_64.gz"
+            }
+            other => panic!("no taplo asset wired for {other:?}"),
+        };
+        let bytes = download_capped(url, MAX_BINARY_BYTES).expect("download taplo");
+        let dir = std::env::temp_dir().join(format!("croft-taplo-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("taplo");
+        extract_gz(&bytes, &target).expect("gunzip taplo");
+        assert!(target.is_file(), "extracted taplo binary exists");
+        let out = Command::new(&target)
+            .arg("--version")
+            .output()
+            .expect("run taplo --version");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(out.status.success(), "taplo --version exits 0");
+        let v = String::from_utf8_lossy(&out.stdout);
+        assert!(v.contains("0.10.0"), "taplo reports its version: {v}");
+    }
+
+    /// End-to-end exercise of the real download + zip-extract path against
+    /// clangd (the riskier archive format: whole-archive extract, nested
+    /// `bin_path`, chmod). `#[ignore]`d: ~50 MB network download, platform-gated.
+    /// Run with `cargo test --bin croft -- --ignored clangd_zip`.
+    #[test]
+    #[ignore = "network: downloads a real ~50MB clangd release"]
+    fn clangd_zip_binary_downloads_extracts_and_runs() {
+        let url = match std::env::consts::OS {
+            "macos" => {
+                "https://github.com/clangd/clangd/releases/download/22.1.0/clangd-mac-22.1.0.zip"
+            }
+            "linux" => {
+                "https://github.com/clangd/clangd/releases/download/22.1.0/clangd-linux-22.1.0.zip"
+            }
+            other => panic!("no clangd asset wired for {other}"),
+        };
+        let bytes = download_capped(url, MAX_BINARY_BYTES).expect("download clangd");
+        let dir = std::env::temp_dir().join(format!("croft-clangd-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("clangd_22.1.0/bin/clangd");
+        extract_zip(&bytes, &dir, &target).expect("unzip clangd");
+        assert!(
+            target.is_file(),
+            "clangd binary exists at the nested bin_path"
+        );
+        let out = Command::new(&target)
+            .arg("--version")
+            .output()
+            .expect("run clangd --version");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(out.status.success(), "clangd --version exits 0");
+        let v = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            v.to_lowercase().contains("clangd"),
+            "clangd reports itself: {v}"
         );
     }
 

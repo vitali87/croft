@@ -15,12 +15,13 @@
 //! intern is the right representation and keeps `ServerConfig`/`Provision`
 //! `Copy`-friendly and the install path untouched.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
 use crate::lsp::config::{Language, ServerConfig};
-use crate::lsp::install::Provision;
+use crate::lsp::install::{ArchiveKind, Provision};
 
 /// Bundled (first-party) extension manifests, embedded so they ship in the
 /// binary and load identically on every host. The same declarative
@@ -40,6 +41,8 @@ pub const BUNDLED_MANIFESTS: &[&str] = &[
     include_str!("../../assets/extensions/lsp-html/extension.toml"),
     include_str!("../../assets/extensions/lsp-css/extension.toml"),
     include_str!("../../assets/extensions/lsp-bash/extension.toml"),
+    include_str!("../../assets/extensions/lsp-toml/extension.toml"),
+    include_str!("../../assets/extensions/lsp-cpp/extension.toml"),
 ];
 
 /// A parsed `extension.toml`. Only the fields phase B1 consumes are modelled;
@@ -113,13 +116,30 @@ pub struct LanguageServerDecl {
 }
 
 /// How croft provisions the server when it isn't on PATH (maps to [`Provision`]).
+/// `npm`/`uv` use `package`; `binary` uses `url` + `archive` + the OS/arch token
+/// maps. Unused fields for a given kind are simply absent.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProvisionDecl {
     pub kind: ProvisionKind,
-    pub package: String,
+    /// npm/uv package name (unused by `binary`).
+    #[serde(default)]
+    pub package: Option<String>,
     #[serde(default)]
     pub version: Option<String>,
     pub bin: String,
+    /// `binary`: supported platform -> literal download URL. Keys are
+    /// `"<os>-<arch>"` (e.g. `linux-x86_64`) or a bare `"<os>"` (e.g. `macos`
+    /// for a universal build), using Rust's `target_os`/`target_arch` tokens.
+    /// Host-agnostic: each URL is a full literal (GitHub, Codeberg, anywhere).
+    #[serde(default)]
+    pub targets: BTreeMap<String, String>,
+    /// `binary`: archive format of the downloaded asset.
+    #[serde(default)]
+    pub archive: Option<ArchiveKindDecl>,
+    /// `binary`: literal path to the executable inside the unpacked archive.
+    /// Absent for a single-file `.gz`.
+    #[serde(default)]
+    pub bin_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -127,6 +147,14 @@ pub struct ProvisionDecl {
 pub enum ProvisionKind {
     Npm,
     Uv,
+    Binary,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ArchiveKindDecl {
+    Gz,
+    Zip,
 }
 
 /// A server registration extracted from a manifest: its priority, the language
@@ -177,21 +205,40 @@ fn intern(s: &str) -> &'static str {
     Box::leak(s.to_string().into_boxed_str())
 }
 
+/// Leak a parsed string map to `&'static [(&'static str, &'static str)]` (the
+/// OS/arch token form `Provision::Binary` carries). Same soundness as
+/// [`intern`]: the data lives for the whole process and is bounded by the
+/// installed extension count.
+fn intern_pairs(m: &BTreeMap<String, String>) -> &'static [(&'static str, &'static str)] {
+    let v: Vec<(&'static str, &'static str)> =
+        m.iter().map(|(k, val)| (intern(k), intern(val))).collect();
+    Box::leak(v.into_boxed_slice())
+}
+
 impl ProvisionDecl {
     fn to_provision(&self) -> Provision {
-        let package = intern(&self.package);
         let version = self.version.as_deref().map(intern);
         let bin = intern(&self.bin);
+        let package = || intern(self.package.as_deref().unwrap_or_default());
         match self.kind {
             ProvisionKind::Npm => Provision::Npm {
-                package,
+                package: package(),
                 version,
                 bin,
             },
             ProvisionKind::Uv => Provision::Uv {
-                package,
+                package: package(),
                 version,
                 bin,
+            },
+            ProvisionKind::Binary => Provision::Binary {
+                targets: intern_pairs(&self.targets),
+                bin,
+                archive: match self.archive.unwrap_or(ArchiveKindDecl::Gz) {
+                    ArchiveKindDecl::Gz => ArchiveKind::Gz,
+                    ArchiveKindDecl::Zip => ArchiveKind::Zip,
+                },
+                bin_path: self.bin_path.as_deref().map(intern),
             },
         }
     }
