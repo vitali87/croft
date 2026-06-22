@@ -65,14 +65,14 @@ impl FsWatch {
     }
 
     pub fn rebind(&mut self, root: &Path, tree: &FileTree) {
-        self._watcher = None;
+        offload_drop(self._watcher.take());
         self.rx = None;
         self.init_rx = Some(Self::start_watcher_thread(root));
         self.poll_dir_mtimes = Self::snapshot_expanded_dir_mtimes(tree);
     }
 
     pub fn disable(&mut self) {
-        self._watcher = None;
+        offload_drop(self._watcher.take());
         self.rx = None;
         self.init_rx = None;
     }
@@ -432,6 +432,18 @@ fn collect_macos_watch_targets(
         }
     }
     false
+}
+
+// VA 2026-06-23: Drop `value` on a detached background thread instead of
+// inline. Dropping a notify FSEvents watcher runs FsEventWatcher::stop(),
+// which busy-spins `while CFRunLoopIsWaiting(runloop) == 0 { thread::yield_now() }`
+// (notify 8.2.0, src/fsevent.rs) until the watcher's CFRunLoop thread parks.
+// When that thread is mid MustScanSubDirs rescan the spin never ends, so doing
+// it on the UI thread (change_workspace_root -> rebind, or disable) freezes the
+// whole app and pins a core. Offloading keeps the spin on a throwaway thread the
+// UI never joins; `T: Send + 'static` lets the watcher move across the boundary.
+pub(super) fn offload_drop<T: Send + 'static>(value: T) {
+    std::thread::spawn(move || drop(value));
 }
 
 fn event_mutates_content(kind: &notify::EventKind) -> bool {

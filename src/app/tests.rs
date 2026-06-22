@@ -1139,6 +1139,36 @@ fn paste_while_terminal_focused_does_not_leak_into_editor_find_bar() {
 }
 
 #[test]
+fn offload_drop_runs_the_destructor_off_the_calling_thread() {
+    // Regression for the UI freeze: dropping a notify FSEvents watcher runs
+    // FsEventWatcher::stop(), which busy-spins on thread::yield_now() until
+    // its CFRunLoop thread parks. On a MustScanSubDirs rescan that spin never
+    // ends, so dropping on the UI thread (change_workspace_root -> rebind,
+    // or disable) freezes the app and pins a core. offload_drop must run the
+    // destructor on another thread so the caller never blocks on stop().
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    struct DropSignal(mpsc::Sender<std::thread::ThreadId>);
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            let _ = self.0.send(std::thread::current().id());
+        }
+    }
+
+    let (tx, rx) = mpsc::channel();
+    let caller = std::thread::current().id();
+    super::fs_watch::offload_drop(DropSignal(tx));
+    let dropped_on = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("destructor must run within the timeout");
+    assert_ne!(
+        dropped_on, caller,
+        "watcher destructor must run off the calling (UI) thread, not block it"
+    );
+}
+
+#[test]
 fn fs_watcher_does_not_descend_into_protected_top_level_dirs() {
     // Regression for the macOS App Management TCC prompt: when the
     // workspace contains a `Library` subdir at the top level (as $HOME
