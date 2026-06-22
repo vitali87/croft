@@ -60,6 +60,8 @@ cd croft
 cargo build --release && cargo install --path .
 ```
 
+**macOS:** the build directory churns the Spotlight index and can spike your CPU and fans. Before building, point Cargo at a `.noindex` directory Spotlight ignores; see [MACOS.md](docs/MACOS.md#spotlight-indexing-and-the-build-directory).
+
 ## Run
 
 ```bash

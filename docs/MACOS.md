@@ -83,3 +83,33 @@ Without it, croft falls back to macOS `sips`, which renders page 1 only.
 
 - **Clipboard.** Copy and paste route through the native macOS pasteboard (`NSPasteboard`), with OSC 52 used only as a remote-host fallback, so copy/paste behaves identically local and over SSH.
 - **Reveal in Finder.** In the Explorer, `Cmd`+`Opt`+`R` (or the right-click menu) reveals the selected entry in Finder. This is macOS-only.
+
+## Spotlight indexing and the build directory
+
+On macOS, building any Rust project gives Spotlight (`mds_stores`) a lot of work. Cargo writes thousands of small files into the build directory on every build, mostly under `target/debug/.fingerprint/` and `target/debug/incremental/`. Spotlight treats each write as a filesystem event and re-indexes continuously, which pins a CPU core and spins your fans up. This is a general Rust on macOS issue (see [rust-lang/cargo#8684](https://github.com/rust-lang/cargo/issues/8684)) rather than something specific to croft, but you will meet it whenever you build croft from source.
+
+The reliable fix is to send Cargo's output to a directory whose name ends in `.noindex`. Spotlight skips any folder with that suffix, along with everything inside it, so the build churn is never indexed. Add this to your shell profile (`~/.zshrc`):
+
+```bash
+export CARGO_TARGET_DIR=target.noindex
+```
+
+The value is relative, so Cargo resolves it per project: each project builds into its own `target.noindex/` beside its `Cargo.toml`, and projects stay isolated from each other. Keep that directory out of Git with your global ignore file:
+
+```bash
+echo 'target.noindex/' >> ~/.config/git/ignore
+```
+
+Open a new terminal (or run the `export` in your current one) and rebuild. The installed binary still lands in `~/.cargo/bin/croft` exactly as before; only the intermediate build artifacts move, so `croft` stays a global command.
+
+If you have already built into a plain `target/`, its files are still in the Spotlight index. Clear them in one pass by rebuilding the index once:
+
+```bash
+sudo mdutil -E /
+```
+
+Approaches that do **not** work on current macOS, so you can skip them:
+
+* A `.metadata_never_index` file placed inside the build directory. That marker only takes effect at a volume root, not in a subdirectory, so it is ignored for `target/`.
+* `mdutil -i off <dir>`. `mdutil` acts per volume, not per directory, so this turns Spotlight off for your whole disk.
+* The System Settings Spotlight Privacy list does work, but it has no clean command line interface (the backing file is protected by SIP), so the `.noindex` directory above is the simplest dependable option.

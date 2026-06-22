@@ -112,3 +112,13 @@ Or, if you prefer systemd, a user `cargo-sweep.timer` paired with a
 Setting `incremental = false` would stop the cache from growing, but it slows
 the edit, build, run loop that you rely on while developing croft. Keep
 incremental on and let `cargo-sweep` reclaim the stale parts instead.
+
+### macOS: keep the build directory out of Spotlight
+
+Disk is not the only cost of the build directory on macOS. Spotlight indexes the
+constant `.fingerprint/` and `incremental/` churn, which pins a CPU core and
+spins your fans up while you build. The fix is to build into a directory whose
+name ends in `.noindex`, which Spotlight ignores. See
+[docs/MACOS.md](docs/MACOS.md#spotlight-indexing-and-the-build-directory) for the
+one line setup. With it applied your build directory is `target.noindex/` rather
+than `target/`.
