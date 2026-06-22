@@ -325,6 +325,17 @@ impl ExtensionsPanel {
             .unwrap_or(false)
     }
 
+    /// Whether the selected row is an INSTALLED extension (not built-in, not an
+    /// AVAILABLE catalog row) — the only rows eligible for uninstall. The app
+    /// further restricts removal to catalog-sourced ids so it never deletes a
+    /// hand-dropped user manifest.
+    pub fn selected_removable(&self) -> bool {
+        self.visible_indices()
+            .get(self.selected)
+            .map(|&i| !self.items[i].builtin && !self.items[i].available)
+            .unwrap_or(false)
+    }
+
     /// `idx` is a position in the *visible* list.
     pub fn select(&mut self, idx: usize) {
         if idx < self.visible_len() {
@@ -392,6 +403,14 @@ impl ExtensionsPanel {
     /// as opposed to elsewhere on the row, which just selects it.
     pub fn click_action(&self, x: u16, y: u16) -> bool {
         self.row_at(y).is_some() && x >= self.last_switch_left
+    }
+
+    /// The item drawn at visible-list index `vis_idx` (as returned by
+    /// [`Self::row_at`]), for hover-tooltip resolution. The app reads its flags
+    /// to pick the right tooltip text without the panel needing catalog
+    /// knowledge.
+    pub fn item_at(&self, vis_idx: usize) -> Option<&ExtensionItem> {
+        self.visible_indices().get(vis_idx).map(|&i| &self.items[i])
     }
 
     /// Whether the click landed on the filter's clear (✕) button.

@@ -224,7 +224,7 @@ Jump here with `Cmd+Shift+X` (or the activity-bar icon, or the Command Palette's
 - **INSTALLED** — extensions you added (from the catalog below or by hand-dropping a manifest into `~/.config/croft/extensions/<id>/`), also with enable/disable toggles.
 - **AVAILABLE** — the curated **MCP server catalog**: vetted sidecars you can add. Each shows a **+Add** affordance instead of a toggle; adding one writes its manifest into your extensions dir, so it moves up into INSTALLED (enabled). Seeded with **Web Fetch**, **Time**, and **MarkItDown** (convert a PDF/DOCX/URL to Markdown).
 
-So the lifecycle is **Available → Add → Installed → Enable → (provision on first use)**, each a distinct visible state.
+So the lifecycle is **Available → Add → Installed → Enable → (provision on first use)**, each a distinct visible state, and it is reversible: with an INSTALLED catalog extension selected, press **`Delete`** to uninstall it (its manifest is removed and it drops back to AVAILABLE to re-add). croft only uninstalls what it added from the catalog; a manifest you hand-dropped is your own file, so `Delete` won't remove it (disable it instead). Hover any row to get a tooltip explaining the toggle's state, the `+Add` affordance, or how to uninstall.
 
 **MCP sidecar extensions** contribute commands to the Command Palette (`Cmd+Shift+P`). Adding **Web Fetch** gives *"Web: Fetch URL as Markdown"*: it prompts for a URL, fetches it via the `mcp-server-fetch` sidecar (a separate vetted process croft speaks the Model Context Protocol to over stdio), and opens the result in a Markdown scratch buffer (a new editor tab). The first time you invoke a sidecar command, croft shows a one-time consent popup with the exact command it will run; the server is then provisioned pinned (via `uv`/`npm`, into croft's managed dir — never fetched-at-launch) and spawned lazily. The tool definition is fingerprinted on first use and re-verified on every spawn, so a silently-changed tool (a rug-pull) is refused. Disabling the extension removes its commands from the palette. A filter box at the top narrows all three sections by name, blurb, or id (a local filter — croft queries no remote marketplace; the catalog is curated and vetted).
 
@@ -233,11 +233,13 @@ So the lifecycle is **Available → Add → Installed → Enable → (provision 
 | Type any character | Filter the list (matches name / description / id) |
 | `Backspace` | Delete the last filter character |
 | `Up` / `Down` | Move the selection |
-| `Space` / `Enter` | Flip the selected extension's toggle |
+| `Space` / `Enter` | Flip the selected extension's toggle (on AVAILABLE rows, add it) |
+| `Delete` | Uninstall the selected INSTALLED catalog extension (back to AVAILABLE) |
 | `Esc` | Clear the filter, or leave the view when it's already empty |
 | Click a row | Select it |
 | Click the toggle switch | Flip that extension on/off |
 | Click the `✕` in the filter box | Clear the filter |
+| Hover any row | Tooltip explaining the toggle / `+Add` / how to uninstall |
 
 Disabling takes effect immediately for the viewers and Vim (a disabled PDF/CSV viewer opens that file type as plain text; a disabled Vim makes `Cmd+E` inert); a disabled language server stops spawning on the next launch. The choice persists in `~/.config/croft/config.json`.
 

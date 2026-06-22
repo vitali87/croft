@@ -72,6 +72,35 @@ pub fn install(id: &str) -> Result<PathBuf> {
     write_into(&manifest::user_extensions_dir(), id)
 }
 
+/// Whether `id` names a catalog entry. Only catalog-sourced extensions are
+/// croft-removable: croft wrote their manifest and can re-create it from the
+/// catalog with one keystroke, so uninstalling is reversible. A user-dropped
+/// manifest (not in the catalog) is the user's own file and is never deleted
+/// by croft — see the "never delete user files unilaterally" rule.
+pub fn is_catalog_entry(id: &str) -> bool {
+    find_source(id).is_some()
+}
+
+/// Remove a catalog entry's manifest dir under `dir` — pure over the target
+/// dir, for hermetic testing. Errors if `id` is not a catalog entry (croft
+/// only removes what it installed).
+fn remove_from(dir: &Path, id: &str) -> Result<()> {
+    if find_source(id).is_none() {
+        anyhow::bail!("'{id}' is not a catalog entry; croft only uninstalls what it added");
+    }
+    let ext_dir = dir.join(id);
+    if ext_dir.exists() {
+        std::fs::remove_dir_all(&ext_dir).with_context(|| format!("removing {ext_dir:?}"))?;
+    }
+    Ok(())
+}
+
+/// Uninstall a catalog entry: delete its manifest from the user extensions dir
+/// so it drops back to AVAILABLE on the next refresh. Reversible via [`install`].
+pub fn uninstall(id: &str) -> Result<()> {
+    remove_from(&manifest::user_extensions_dir(), id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -116,6 +145,28 @@ mod tests {
         assert_eq!(m.mcp_servers.len(), 1);
         assert_eq!(m.commands.len(), 1);
         assert!(write_into(&tmp, "no-such-entry").is_err());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn uninstall_removes_a_catalog_entry_and_refuses_non_catalog_ids() {
+        let tmp = std::env::temp_dir().join(format!("croft-catalog-rm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        // Install then uninstall round-trips the manifest dir off disk.
+        let path = write_into(&tmp, "mcp-time").expect("writes the manifest");
+        assert!(path.is_file());
+        remove_from(&tmp, "mcp-time").expect("uninstalls the catalog entry");
+        assert!(!tmp.join("mcp-time").exists(), "manifest dir must be gone");
+        // A user-dropped (non-catalog) extension is the user's file: refuse it,
+        // and leave any such dir untouched.
+        let user_dir = tmp.join("my-own-ext");
+        std::fs::create_dir_all(&user_dir).unwrap();
+        assert!(remove_from(&tmp, "my-own-ext").is_err());
+        assert!(user_dir.exists(), "a non-catalog dir is never deleted");
+        // Uninstalling an absent catalog entry is a no-op success (idempotent).
+        remove_from(&tmp, "mcp-fetch").expect("absent catalog entry is a no-op");
+        assert!(is_catalog_entry("mcp-fetch"));
+        assert!(!is_catalog_entry("my-own-ext"));
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

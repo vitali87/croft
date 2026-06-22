@@ -3360,9 +3360,44 @@ impl App {
                 }
             }
             SidebarView::RunDebug => {}
-            SidebarView::Extensions => {}
+            SidebarView::Extensions => {
+                if let Some(label) = self.extensions_tooltip_at(col, row) {
+                    return Some(label);
+                }
+            }
         }
         None
+    }
+
+    /// Resolve the hover tooltip for whatever the pointer is over in the
+    /// Extensions panel: the toggle switch (state-aware enable/disable), the
+    /// `+Add` affordance on AVAILABLE rows, or a row body (which conveys the
+    /// extension's class and how to remove it). Catalog-aware so an installed
+    /// catalog entry advertises Delete-to-uninstall while a hand-dropped user
+    /// manifest is correctly described as disable-only.
+    fn extensions_tooltip_at(&self, col: u16, row: u16) -> Option<&'static str> {
+        let idx = self.extensions.row_at(row)?;
+        let item = self.extensions.item_at(idx)?;
+        let on_switch = self.extensions.click_action(col, row);
+        Some(if item.available {
+            if on_switch {
+                "Add to your installed extensions"
+            } else {
+                "Available extension \u{2014} click +Add to install it"
+            }
+        } else if on_switch {
+            if item.enabled {
+                "Enabled \u{2014} click to disable"
+            } else {
+                "Disabled \u{2014} click to enable"
+            }
+        } else if item.builtin {
+            "Built-in extension \u{2014} can be disabled, not uninstalled"
+        } else if crate::mcp::catalog::is_catalog_entry(&item.id) {
+            "Installed \u{2014} press Delete to uninstall (returns to Available)"
+        } else {
+            "Installed (your own manifest) \u{2014} disable only; croft won't delete it"
+        })
     }
 
     /// Fire the chrome button-hint tooltip once its dwell crosses
@@ -7580,6 +7615,10 @@ impl App {
             // takes every other printable character but never a space.
             KeyCode::Char(' ') if !has_mod => self.toggle_selected_extension(),
             KeyCode::Enter => self.toggle_selected_extension(),
+            // Delete uninstalls the selected installed extension (distinct from
+            // Backspace, which edits the filter). Reaches the app on both iTerm2
+            // and Ghostty as a plain key, so no chord forwarder is needed.
+            KeyCode::Delete => self.uninstall_selected_extension(),
             KeyCode::Backspace if !self.extensions.filter_is_empty() => {
                 self.extensions.pop_filter_char()
             }
@@ -7628,6 +7667,37 @@ impl App {
             "{} extension '{id}'",
             if now_enabled { "Enabled" } else { "Disabled" }
         );
+    }
+
+    /// Uninstall the selected INSTALLED extension: delete its manifest from the
+    /// user extensions dir so it drops back to AVAILABLE on refresh. Restricted
+    /// to catalog-sourced ids — croft only removes what it added, never a
+    /// hand-dropped user manifest (which it can only disable). Reversible by
+    /// re-adding from the catalog with one keystroke, so no confirmation modal.
+    fn uninstall_selected_extension(&mut self) {
+        if !self.extensions.selected_removable() {
+            return;
+        }
+        let Some(id) = self.extensions.selected_id().map(str::to_string) else {
+            return;
+        };
+        if !crate::mcp::catalog::is_catalog_entry(&id) {
+            self.status =
+                format!("'{id}' is your own extension — croft won't delete it; disable it instead");
+            return;
+        }
+        match crate::mcp::catalog::uninstall(&id) {
+            Ok(()) => {
+                // Drop any stale disabled-state for the removed id so a later
+                // re-add starts enabled, matching a fresh install.
+                if self.disabled_extensions.remove(&id) {
+                    let _ = crate::prefs::save_disabled_extensions(&self.disabled_extensions);
+                }
+                self.refresh_extensions();
+                self.status = format!("Uninstalled '{id}' — it's back under AVAILABLE to re-add");
+            }
+            Err(e) => self.status = format!("Could not uninstall '{id}': {e}"),
+        }
     }
 
     /// Whether the extension `id` is currently enabled (not in the disabled set).
