@@ -9238,7 +9238,7 @@ impl App {
         } else {
             self.git_output_log.join("\n\n")
         };
-        let label = std::path::PathBuf::from("Git Output");
+        let label = self.scratch_buffer_path("Git Output");
         if let Err(err) = self.editor.open_text_buffer(&label, &body) {
             self.status = format!("Could not open Git Output: {err}");
             return;
@@ -13037,6 +13037,15 @@ impl App {
             });
     }
 
+    /// On-disk path for a scratch buffer (MCP output, Git Output): anchored under
+    /// the workspace root with a filesystem-safe name, so Cmd+S saves it
+    /// predictably into the open project (and the Explorer tree shows it) instead
+    /// of writing a bare filename to croft's working directory.
+    fn scratch_buffer_path(&self, name: &str) -> PathBuf {
+        let safe = name.replace(['/', '\\'], "-");
+        self.workspace_root.join(safe)
+    }
+
     /// Drain a completed MCP command: render its text into a scratch buffer on
     /// success, or surface the error in the status line. Returns whether a
     /// redraw is needed. Called each frame from the main loop.
@@ -13059,11 +13068,13 @@ impl App {
         self.mcp_busy_label = None;
         match outcome.body {
             Ok(text) => {
-                let label = PathBuf::from(format!("{}.md", outcome.title));
+                let label = self.scratch_buffer_path(&format!("{}.md", outcome.title));
                 if self.editor.open_text_buffer(&label, &text).is_ok() {
                     self.focus_pane(Pane::Editor);
-                    self.status =
-                        format!("{}: opened in a new editor tab (unsaved)", outcome.title);
+                    self.status = format!(
+                        "{}: opened in a new tab — Cmd+S saves it into the project",
+                        outcome.title
+                    );
                 }
             }
             Err(e) => {
