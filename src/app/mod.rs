@@ -3376,27 +3376,24 @@ impl App {
     /// catalog entry advertises Delete-to-uninstall while a hand-dropped user
     /// manifest is correctly described as disable-only.
     fn extensions_tooltip_at(&self, col: u16, row: u16) -> Option<&'static str> {
+        // A tooltip fires ONLY over an actual control, never over the row's
+        // name/blurb — so hovering the body shows nothing, and each control
+        // describes just itself. The trash button takes precedence over the
+        // switch since it sits left of it (and is checked first regardless).
+        if self.extensions.click_uninstall(col, row) {
+            return Some("Uninstall this extension (returns to Available)");
+        }
+        if !self.extensions.click_action(col, row) {
+            return None;
+        }
         let idx = self.extensions.row_at(row)?;
         let item = self.extensions.item_at(idx)?;
-        let on_switch = self.extensions.click_action(col, row);
         Some(if item.available {
-            if on_switch {
-                "Add to your installed extensions"
-            } else {
-                "Available extension \u{2014} click +Add to install it"
-            }
-        } else if on_switch {
-            if item.enabled {
-                "Enabled \u{2014} click to disable"
-            } else {
-                "Disabled \u{2014} click to enable"
-            }
-        } else if item.builtin {
-            "Built-in extension \u{2014} can be disabled, not uninstalled"
-        } else if crate::mcp::catalog::is_catalog_entry(&item.id) {
-            "Installed \u{2014} press Delete to uninstall (returns to Available)"
+            "Add to your installed extensions"
+        } else if item.enabled {
+            "Enabled \u{2014} click to disable"
         } else {
-            "Installed (your own manifest) \u{2014} disable only; croft won't delete it"
+            "Disabled \u{2014} click to enable"
         })
     }
 
@@ -3443,7 +3440,16 @@ impl App {
         // Computed before the tab/editor early-returns so it tracks the
         // pointer everywhere, including over the sidebar.
         match self.ui_tooltip_at(col, row) {
-            Some(label) if self.ui_tooltip_label == Some(label) => {}
+            // Same label AND still on the same row: keep the dwell running so the
+            // tooltip persists while the pointer drifts within one control. The
+            // row check matters because adjacent controls can share a label (e.g.
+            // every enabled extension toggle reads "Enabled — click to disable");
+            // without it the anchor would freeze on the first such control and
+            // the box would appear detached from the one actually under the
+            // pointer.
+            Some(label)
+                if self.ui_tooltip_label == Some(label)
+                    && self.ui_hover.cell().map(|(_, r)| r) == Some(row) => {}
             Some(label) => {
                 self.ui_hover.on_move(std::time::Instant::now(), col, row);
                 self.ui_tooltip_label = Some(label);
@@ -14815,12 +14821,17 @@ impl App {
                         self.extensions.clear_filter();
                         return;
                     }
-                    // Clicking a row selects it; clicking its toggle switch (the
-                    // right-edge pill) also flips the extension in one click.
+                    // Clicking a row selects it; clicking its trash button
+                    // uninstalls it; clicking its toggle switch (the right-edge
+                    // pill) flips the extension. The trash zone sits left of the
+                    // switch, so the two never overlap.
                     if let Some(idx) = self.extensions.row_at(m.row) {
+                        let on_trash = self.extensions.click_uninstall(m.column, m.row);
                         let on_switch = self.extensions.click_action(m.column, m.row);
                         self.extensions.select(idx);
-                        if on_switch {
+                        if on_trash {
+                            self.uninstall_selected_extension();
+                        } else if on_switch {
                             self.toggle_selected_extension();
                         }
                     }
@@ -18251,6 +18262,13 @@ fn build_extension_items(
     sources.extend(user.iter().map(String::as_str));
     let summaries = manifest::summaries(&sources);
     let mut items = crate::widgets::extensions::items_from_summaries(summaries, disabled);
+    // Flag installed catalog entries as removable: croft wrote their manifest
+    // (so uninstall is reversible), while a hand-dropped user manifest is the
+    // user's own file and is never deleted. Drives the per-row trash button.
+    for it in &mut items {
+        it.removable =
+            !it.builtin && !it.available && crate::mcp::catalog::is_catalog_entry(&it.id);
+    }
     // Append the curated MCP catalog's not-yet-installed entries under AVAILABLE.
     items.extend(crate::widgets::extensions::items_from_available(
         crate::mcp::catalog::available(),

@@ -50,6 +50,14 @@ const ROW_H: u16 = 2;
 /// (2 caps + track + knob) plus a 1-cell margin. The click zone is everything
 /// from `last_switch_left` to the panel edge.
 const SWITCH_ZONE: u16 = 5;
+/// Cells reserved just left of the switch for a row's uninstall (trash) button,
+/// drawn only on removable INSTALLED rows: the glyph plus a 1-cell gap. The
+/// click zone is `[last_uninstall_left, last_switch_left)`.
+const UNINSTALL_ZONE: u16 = 2;
+/// Codicon `trash` (matches the SCM menu's delete icon) — the per-row uninstall
+/// affordance so a mouse user has a visible control, not just the Delete key
+/// (which on a Mac keyboard is Fn+Delete and easy to miss).
+const TRASH_GLYPH: char = '\u{ea81}';
 
 /// The theme-driven colours the panel paints. Resolved once per render from the
 /// active [`Theme`] so the Black theme wears the brand teal where the Dark-Blue
@@ -160,6 +168,10 @@ pub struct ExtensionItem {
     /// affordance instead of an enable/disable toggle. `enabled` is meaningless
     /// for these (they aren't installed yet).
     pub available: bool,
+    /// An INSTALLED extension croft may uninstall (a catalog entry it wrote, not
+    /// a hand-dropped user manifest). Set by the app, which owns catalog
+    /// knowledge; drives the per-row trash button and the Delete handler.
+    pub removable: bool,
 }
 
 impl ExtensionItem {
@@ -193,6 +205,7 @@ pub fn items_from_summaries(
             description: s.description,
             builtin: s.builtin,
             available: false,
+            removable: false,
         })
         .collect()
 }
@@ -209,6 +222,7 @@ pub fn items_from_available(summaries: Vec<ExtensionSummary>) -> Vec<ExtensionIt
             description: s.description,
             builtin: false,
             available: true,
+            removable: false,
         })
         .collect()
 }
@@ -235,6 +249,10 @@ pub struct ExtensionsPanel {
     /// Left column of the toggle-switch zone, recorded each frame so a click can
     /// be told apart from a plain row select.
     last_switch_left: u16,
+    /// Left column of the per-row uninstall (trash) button zone, just left of
+    /// the switch. A click in `[last_uninstall_left, last_switch_left)` on a
+    /// removable row uninstalls it.
+    last_uninstall_left: u16,
     /// The filter input row and its trailing clear (✕) cell, for click routing.
     last_search_area: Rect,
     last_clear_area: Rect,
@@ -253,6 +271,7 @@ impl ExtensionsPanel {
             scroll: 0,
             row_hits: Vec::new(),
             last_switch_left: u16::MAX,
+            last_uninstall_left: u16::MAX,
             last_search_area: Rect::default(),
             last_clear_area: Rect::default(),
         }
@@ -413,6 +432,17 @@ impl ExtensionsPanel {
         self.visible_indices().get(vis_idx).map(|&i| &self.items[i])
     }
 
+    /// Whether the click landed on a removable row's trash button (the small
+    /// zone just left of the switch). Only true for rows flagged `removable`,
+    /// so a click on a built-in or AVAILABLE row never reads as uninstall.
+    pub fn click_uninstall(&self, x: u16, y: u16) -> bool {
+        let Some(idx) = self.row_at(y) else {
+            return false;
+        };
+        let removable = self.item_at(idx).map(|it| it.removable).unwrap_or(false);
+        removable && x >= self.last_uninstall_left && x < self.last_switch_left
+    }
+
     /// Whether the click landed on the filter's clear (✕) button.
     pub fn click_clear(&self, x: u16, y: u16) -> bool {
         let r = self.last_clear_area;
@@ -527,6 +557,11 @@ impl Widget for &mut ExtensionsPanel {
         }
         let sw_x = right.saturating_sub(SWITCH_ZONE);
         self.last_switch_left = sw_x;
+        // The trash button sits just left of the switch; same column on every
+        // removable row, so record it once. The click zone is bounded by the
+        // switch on its right.
+        let uninstall_x = sw_x.saturating_sub(UNINSTALL_ZONE);
+        self.last_uninstall_left = uninstall_x;
 
         let visible = self.visible_indices();
         let mut prev_group: Option<u8> = None;
@@ -584,8 +619,13 @@ impl Widget for &mut ExtensionsPanel {
             }
 
             // Line 1: coloured language/file mark + name, clipped before the
-            // toggle, then the toggle switch right-aligned.
-            let name_right = sw_x.saturating_sub(1);
+            // toggle (or before the trash button on a removable row), then the
+            // right-aligned controls.
+            let name_right = if item.removable {
+                uninstall_x.saturating_sub(1)
+            } else {
+                sw_x.saturating_sub(1)
+            };
             let (chip, chip_color) = chip_for(&item.id).unwrap_or(('\u{25c6}', ICON_CHIP_FALLBACK));
             let mut chip_style = Style::default().fg(chip_color);
             if let Some(bg) = row_bg {
@@ -612,6 +652,16 @@ impl Widget for &mut ExtensionsPanel {
                 put(buf, sw_x, y, right, "+Add", add_style);
             } else {
                 draw_switch(buf, sw_x, y, item.enabled, row_bg, &pal);
+            }
+
+            // Removable (catalog) rows get a visible trash button just left of
+            // the switch, so a mouse user has an uninstall control without the
+            // Delete key (Fn+Delete on a Mac, easy to miss).
+            if item.removable {
+                let trash_style = Style::default()
+                    .fg(DESC_FG)
+                    .bg(row_bg.unwrap_or(Color::Reset));
+                buf.set_string(uninstall_x, y, TRASH_GLYPH.to_string(), trash_style);
             }
 
             // Line 2: the blurb.
@@ -664,6 +714,54 @@ mod tests {
         );
     }
 
+    #[test]
+    fn removable_row_shows_a_trash_button_and_only_its_zone_uninstalls() {
+        let mut panel = ExtensionsPanel::new();
+        let mut its = items();
+        its.push(ExtensionItem {
+            id: "mcp-fetch".into(),
+            name: "Web Fetch".into(),
+            description: "Fetch a URL".into(),
+            builtin: false,
+            enabled: true,
+            available: false,
+            removable: true,
+        });
+        panel.set_items(its);
+        let (_buf, text) = render(&mut panel, 40, 24);
+        assert!(
+            text.contains(TRASH_GLYPH),
+            "a removable row must paint a trash button"
+        );
+
+        let row_y = |id: &str| {
+            (0..24u16).find(|&y| {
+                panel
+                    .row_at(y)
+                    .and_then(|idx| panel.item_at(idx))
+                    .map(|it| it.id == id)
+                    .unwrap_or(false)
+            })
+        };
+        let y = row_y("mcp-fetch").expect("removable row rendered");
+        let trash_x = panel.last_uninstall_left;
+        let switch_x = panel.last_switch_left;
+        assert!(
+            panel.click_uninstall(trash_x, y),
+            "the trash zone uninstalls the removable row"
+        );
+        assert!(
+            !panel.click_uninstall(switch_x, y),
+            "the switch is not the trash zone"
+        );
+        // The same column on a built-in row never reads as uninstall.
+        let by = row_y("pdf").expect("built-in row rendered");
+        assert!(
+            !panel.click_uninstall(trash_x, by),
+            "built-in rows are not removable"
+        );
+    }
+
     fn items() -> Vec<ExtensionItem> {
         vec![
             ExtensionItem {
@@ -673,6 +771,7 @@ mod tests {
                 builtin: true,
                 enabled: true,
                 available: false,
+                removable: false,
             },
             ExtensionItem {
                 id: "csv".into(),
@@ -681,6 +780,7 @@ mod tests {
                 builtin: true,
                 enabled: false,
                 available: false,
+                removable: false,
             },
             ExtensionItem {
                 id: "vim".into(),
@@ -689,6 +789,7 @@ mod tests {
                 builtin: true,
                 enabled: true,
                 available: false,
+                removable: false,
             },
         ]
     }
