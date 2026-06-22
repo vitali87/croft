@@ -49,10 +49,19 @@ fn available_from(installed: &BTreeSet<String>) -> Vec<ExtensionSummary> {
         .collect()
 }
 
-/// The catalog entries available to add (not yet installed). Reads the real
-/// user extensions dir.
+/// The entries available to add (not yet installed): the bundled catalog plus
+/// the signed remote index, deduped (bundled wins) and minus what's installed.
+/// Reads the real user extensions dir and the verified index cache.
 pub fn available() -> Vec<ExtensionSummary> {
-    available_from(&installed_ids(&manifest::user_extensions_dir()))
+    let installed = installed_ids(&manifest::user_extensions_dir());
+    let mut out = available_from(&installed);
+    let bundled_catalog_ids: BTreeSet<String> =
+        catalog_summaries().into_iter().map(|s| s.id).collect();
+    out.extend(crate::mcp::registry_index::available_summaries(
+        &bundled_catalog_ids,
+        &installed,
+    ));
+    out
 }
 
 /// Write a catalog entry's manifest into `dir/<id>/extension.toml` — pure over
@@ -66,10 +75,16 @@ fn write_into(dir: &Path, id: &str) -> Result<PathBuf> {
     Ok(path)
 }
 
-/// Add (install) a catalog entry: materialize its manifest into the user
-/// extensions dir so it loads like any installed extension on the next refresh.
+/// Add (install) an entry. A bundled catalog entry materializes from its
+/// embedded manifest; a remote (signed-index) entry is fetched and its sha256
+/// verified against the index before it is written. Either way it lands in the
+/// user extensions dir and loads like any installed extension on next refresh.
 pub fn install(id: &str) -> Result<PathBuf> {
-    write_into(&manifest::user_extensions_dir(), id)
+    if find_source(id).is_some() {
+        write_into(&manifest::user_extensions_dir(), id)
+    } else {
+        crate::mcp::registry_index::install_remote(id)
+    }
 }
 
 /// Whether `id` names a catalog entry. Only catalog-sourced extensions are
@@ -79,6 +94,15 @@ pub fn install(id: &str) -> Result<PathBuf> {
 /// by croft — see the "never delete user files unilaterally" rule.
 pub fn is_catalog_entry(id: &str) -> bool {
     find_source(id).is_some()
+}
+
+/// Whether croft may uninstall `id`: it came from a curated source — the
+/// bundled catalog or the signed remote index — so croft wrote its manifest and
+/// can recreate it, making the uninstall reversible. A hand-dropped manifest
+/// matches neither and is the user's own file (never deleted; see the "never
+/// delete user files unilaterally" rule).
+pub fn is_removable(id: &str) -> bool {
+    is_catalog_entry(id) || crate::mcp::registry_index::is_index_entry(id)
 }
 
 /// Remove a catalog entry's manifest dir under `dir` — pure over the target

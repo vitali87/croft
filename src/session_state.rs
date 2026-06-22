@@ -57,7 +57,7 @@ pub fn handoff_path() -> PathBuf {
     base.join(format!("session-{}.json", std::process::id()))
 }
 
-fn dirs_cache_croft() -> PathBuf {
+pub(crate) fn dirs_cache_croft() -> PathBuf {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));

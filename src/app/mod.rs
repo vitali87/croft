@@ -1203,6 +1203,10 @@ pub struct App {
     timeline_scrollbar_drag: bool,
     deps_scrollbar_drag: bool,
     welcome: WelcomeState,
+    /// One-shot background refresh of the remote extension index. Polled in the
+    /// main loop; rebuilds the Extensions panel once if the verified cache
+    /// changed. `None` once consumed (or on a disarmed build, immediately).
+    ext_index_refresh: Option<std::sync::mpsc::Receiver<bool>>,
     /// Channel to the background search worker. Each keystroke or toggle
     /// flip pushes a `(query, opts)` request here; the worker debounces
     /// and runs `search_workspace` off the UI thread.
@@ -1819,6 +1823,7 @@ impl App {
         let git = GitWorker::spawn(root.clone());
 
         let welcome = WelcomeState::spawn();
+        let ext_index_refresh = Some(crate::mcp::registry_index::spawn_refresh());
 
         let (search_query_tx, search_query_rx) = std::sync::mpsc::channel();
         let (search_results_tx, search_results_rx) = std::sync::mpsc::channel();
@@ -1914,6 +1919,7 @@ impl App {
             timeline_scrollbar_drag: false,
             deps_scrollbar_drag: false,
             welcome,
+            ext_index_refresh,
             search_query_tx,
             search_results_rx,
             cell_pixel: None,
@@ -3107,6 +3113,29 @@ impl App {
             self.status = msg;
         }
         true
+    }
+
+    /// Pull the one-shot remote-extension-index refresh if it has finished.
+    /// Rebuilds the Extensions panel exactly once, when the verified cache
+    /// actually changed, then drops the receiver so later calls are no-ops.
+    pub fn drain_ext_index_refresh(&mut self) -> bool {
+        let Some(rx) = self.ext_index_refresh.as_ref() else {
+            return false;
+        };
+        match rx.try_recv() {
+            Ok(updated) => {
+                self.ext_index_refresh = None;
+                if updated {
+                    self.refresh_extensions();
+                }
+                updated
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.ext_index_refresh = None;
+                false
+            }
+        }
     }
 
     /// Per-tick LSP doc sync. Diffs every text-buffer tab's edit_seq
@@ -7699,7 +7728,7 @@ impl App {
         let Some(id) = self.extensions.selected_id().map(str::to_string) else {
             return;
         };
-        if !crate::mcp::catalog::is_catalog_entry(&id) {
+        if !crate::mcp::catalog::is_removable(&id) {
             self.status =
                 format!("'{id}' is your own extension — croft won't delete it; disable it instead");
             return;
@@ -18298,8 +18327,7 @@ fn build_extension_items(
     // (so uninstall is reversible), while a hand-dropped user manifest is the
     // user's own file and is never deleted. Drives the per-row trash button.
     for it in &mut items {
-        it.removable =
-            !it.builtin && !it.available && crate::mcp::catalog::is_catalog_entry(&it.id);
+        it.removable = !it.builtin && !it.available && crate::mcp::catalog::is_removable(&it.id);
     }
     // Append the curated MCP catalog's not-yet-installed entries under AVAILABLE.
     items.extend(crate::widgets::extensions::items_from_available(
@@ -19175,6 +19203,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let spinner_phase = app.update_spinner_phase();
         let spinner_changed = spinner_phase != last_spinner_phase;
         let commits_changed = app.drain_recent_commits();
+        let ext_index_changed = app.drain_ext_index_refresh();
         let search_changed = app.drain_search_results();
         let remote_changed = app.refresh_remote_if_config_changed();
         let pulls_changed = app.drain_remote_pulls();
@@ -19232,6 +19261,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             || blink_changed
             || spinner_changed
             || commits_changed
+            || ext_index_changed
             || search_changed
             || remote_changed
             || pulls_changed

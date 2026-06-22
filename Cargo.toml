@@ -71,6 +71,15 @@ plist = "1.9"
 notify = "8.2"
 notify-debouncer-full = "0.7"
 base64 = "0.22"
+# Integrity for the remote extension index (src/mcp/registry_index.rs): `ring`
+# verifies the ed25519 signature over `index.json` against a baked public key,
+# and `sha2` checks each fetched manifest against the sha256 recorded in the
+# signed index. Both are already in the tree transitively (ring via ureq's TLS
+# backend, sha2 via several deps), so promoting them to direct deps adds no new
+# version to the lock and no new build surface — ring already compiles on every
+# croft target, Termux included.
+ring = "0.17"
+sha2 = "0.10"
 regex = "1.12"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp", "webp"] }
 # NeuQuant colour quantiser, already in the tree via image's gif feature. Used

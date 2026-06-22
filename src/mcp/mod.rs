@@ -22,6 +22,7 @@
 pub mod catalog;
 pub mod client;
 pub mod registry;
+pub mod registry_index;
 pub mod transport;
 
 /// The result of a backgrounded MCP command invocation, delivered to the app's
