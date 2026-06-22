@@ -41,6 +41,11 @@ pub enum InputPurpose {
     McpArg {
         command_id: String,
     },
+    /// Confirm uninstalling an installed extension. Submitting (Enter) performs
+    /// the removal; Esc keeps it. The submitted value is a sentinel, ignored.
+    ExtensionUninstall {
+        id: String,
+    },
 }
 
 pub struct InputPrompt {

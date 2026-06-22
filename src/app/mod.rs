@@ -7781,11 +7781,29 @@ impl App {
                 format!("'{id}' is your own extension — croft won't delete it; disable it instead");
             return;
         }
-        match crate::mcp::catalog::uninstall(&id) {
+        // Confirm before removing: uninstall is destructive and must never fire
+        // from a single Delete keypress (or trash click) without asking. Enter in
+        // the popup performs it; Esc keeps the extension. (Seed a sentinel value
+        // so Enter on the empty field still submits — submit_value() ignores blanks.)
+        use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
+        self.open_input_prompt(
+            InputPrompt::new(
+                InputPurpose::ExtensionUninstall { id: id.clone() },
+                format!("Uninstall '{id}'?  It returns to Available."),
+                "Enter to uninstall · Esc to keep",
+            )
+            .with_value("uninstall"),
+        );
+    }
+
+    /// Perform the confirmed uninstall (the popup's Enter path). Removes the
+    /// catalog/index-installed manifest and refreshes the panel.
+    fn perform_extension_uninstall(&mut self, id: &str) {
+        match crate::mcp::catalog::uninstall(id) {
             Ok(()) => {
                 // Drop any stale disabled-state for the removed id so a later
                 // re-add starts enabled, matching a fresh install.
-                if self.disabled_extensions.remove(&id) {
+                if self.disabled_extensions.remove(id) {
                     let _ = crate::prefs::save_disabled_extensions(&self.disabled_extensions);
                 }
                 self.refresh_extensions();
@@ -9537,6 +9555,10 @@ impl App {
                 if let Some(resolved) = crate::mcp::registry::resolve_command(&command_id) {
                     self.spawn_mcp_command(resolved, Some(value));
                 }
+            }
+            InputPurpose::ExtensionUninstall { id } => {
+                self.close_input_prompt();
+                self.perform_extension_uninstall(&id);
             }
         }
     }
