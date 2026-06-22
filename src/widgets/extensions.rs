@@ -42,6 +42,9 @@ const SWITCH_KNOB_OFF: Color = Color::Rgb(0xcd, 0xd3, 0xdc); // dim knob (off)
 /// Search icon), and the `close` glyph for the clear (✕) affordance.
 const SEARCH_GLYPH: char = '\u{ea6d}';
 const CLEAR_GLYPH: char = '\u{ea76}';
+/// Codicon `refresh`. A click re-pulls the signed remote index mid-session
+/// (the index also refreshes on every launch via stale-while-revalidate).
+const REFRESH_GLYPH: char = '\u{eb37}';
 
 /// Each list item is two cells tall: mark + name + toggle on the first line,
 /// blurb on the second, like VS Code's two-line extension rows.
@@ -256,6 +259,8 @@ pub struct ExtensionsPanel {
     /// The filter input row and its trailing clear (✕) cell, for click routing.
     last_search_area: Rect,
     last_clear_area: Rect,
+    /// The refresh (⟳) cell at the right of the filter row, for click routing.
+    last_refresh_area: Rect,
 }
 
 impl ExtensionsPanel {
@@ -274,6 +279,7 @@ impl ExtensionsPanel {
             last_uninstall_left: u16::MAX,
             last_search_area: Rect::default(),
             last_clear_area: Rect::default(),
+            last_refresh_area: Rect::default(),
         }
     }
 
@@ -448,6 +454,12 @@ impl ExtensionsPanel {
         let r = self.last_clear_area;
         r.width > 0 && x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height
     }
+
+    /// Whether the click landed on the refresh (⟳) button.
+    pub fn click_refresh(&self, x: u16, y: u16) -> bool {
+        let r = self.last_refresh_area;
+        r.width > 0 && x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height
+    }
 }
 
 impl Default for ExtensionsPanel {
@@ -476,6 +488,7 @@ impl Widget for &mut ExtensionsPanel {
         self.last_switch_left = u16::MAX;
         self.last_search_area = Rect::default();
         self.last_clear_area = Rect::default();
+        self.last_refresh_area = Rect::default();
         if area.width == 0 || area.height == 0 {
             return;
         }
@@ -515,18 +528,35 @@ impl Widget for &mut ExtensionsPanel {
                 &format!("{SEARCH_GLYPH} "),
                 Style::default().fg(pal.accent).bg(pal.search_bg),
             );
-            let text_right = box_rect.x + box_rect.width;
+            let box_right = box_rect.x + box_rect.width;
+            // Refresh (⟳) icon at the far right of the row, always shown: a click
+            // re-pulls the signed remote index without restarting croft.
+            let refresh_x = box_right.saturating_sub(2);
+            buf.set_string(
+                refresh_x,
+                search_y,
+                REFRESH_GLYPH.to_string(),
+                Style::default().fg(pal.accent).bg(pal.search_bg),
+            );
+            self.last_refresh_area = Rect {
+                x: refresh_x,
+                y: search_y,
+                width: 1,
+                height: 1,
+            };
+            // The query/clear area ends just before the refresh icon.
+            let text_right = refresh_x.saturating_sub(1);
             if self.filter.is_empty() {
                 put(
                     buf,
                     x,
                     search_y,
                     text_right,
-                    "Search built-in & installed\u{2026}",
+                    "Filter extensions\u{2026}",
                     Style::default().fg(DESC_FG).bg(pal.search_bg),
                 );
             } else {
-                let clear_x = text_right.saturating_sub(2);
+                let clear_x = text_right.saturating_sub(1);
                 put(
                     buf,
                     x,
@@ -820,7 +850,7 @@ mod tests {
         let (_buf, dump) = render(&mut panel, 44, 16);
         assert!(dump.contains("EXTENSIONS"), "title:\n{dump}");
         assert!(
-            dump.contains("Search built-in"),
+            dump.contains("Filter extensions"),
             "filter placeholder:\n{dump}"
         );
         assert!(dump.contains("BUILT-IN"), "section header:\n{dump}");
@@ -952,6 +982,27 @@ mod tests {
         assert!(
             !panel.click_action(1, y0),
             "a click at the row's left edge selects, it is not the toggle"
+        );
+    }
+
+    #[test]
+    fn refresh_button_renders_and_only_its_own_cell_triggers_a_refresh() {
+        let mut panel = ExtensionsPanel::new();
+        panel.set_items(items());
+        let _ = render(&mut panel, 44, 16);
+        let r = panel.last_refresh_area;
+        assert!(r.width > 0, "the refresh icon must render");
+        assert!(
+            panel.click_refresh(r.x, r.y),
+            "a click on the refresh cell triggers a refresh"
+        );
+        assert!(
+            !panel.click_refresh(r.x.saturating_sub(3), r.y),
+            "a click left of the icon does not"
+        );
+        assert!(
+            !panel.click_refresh(r.x, r.y + 2),
+            "a click on a different row does not"
         );
     }
 

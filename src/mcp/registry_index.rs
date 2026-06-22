@@ -56,9 +56,6 @@ const SUPPORTED_SCHEMA: u32 = 1;
 /// Cache file under `~/.cache/croft`: the last *verified* `index.json` bytes.
 const CACHE_FILE: &str = "extensions-index.json";
 
-/// How long a cached index is served before a background refresh refetches it.
-const CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
-
 /// Network timeout for the index / a manifest fetch.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -146,18 +143,6 @@ fn read_cache_bytes() -> Option<Vec<u8>> {
     std::fs::read(cache_path()).ok()
 }
 
-/// Whether the cache exists and is younger than [`CACHE_TTL`].
-fn cache_fresh() -> bool {
-    let Ok(meta) = std::fs::metadata(cache_path()) else {
-        return false;
-    };
-    meta.modified()
-        .ok()
-        .and_then(|m| m.elapsed().ok())
-        .map(|age| age < CACHE_TTL)
-        .unwrap_or(false)
-}
-
 /// Atomically replace the cache with `bytes` (write-temp-then-rename).
 fn write_cache(bytes: &[u8]) -> std::io::Result<()> {
     let dir = crate::session_state::dirs_cache_croft();
@@ -189,16 +174,23 @@ fn fetch_verified_index() -> Result<Vec<u8>> {
     Ok(index)
 }
 
-/// Refresh the cache if armed and stale. Returns whether the cache was updated.
-/// Best-effort: any network/verify failure leaves the existing cache in place.
+/// Stale-while-revalidate refresh: always refetch when armed (the cached copy is
+/// served synchronously meanwhile, so the panel shows stale-then-fresh), and
+/// report a change only when the verified index actually differs from the cache
+/// — so a new extension shows on the next launch with no TTL wait, but an
+/// unchanged index triggers no panel rebuild. Best-effort: any network/verify
+/// failure leaves the existing cache in place.
 fn refresh_blocking() -> bool {
-    if !index_armed() || cache_fresh() {
+    if !index_armed() {
         return false;
     }
-    match fetch_verified_index() {
-        Ok(bytes) => write_cache(&bytes).is_ok(),
-        Err(_) => false,
+    let Ok(fresh) = fetch_verified_index() else {
+        return false;
+    };
+    if read_cache_bytes().as_deref() == Some(fresh.as_slice()) {
+        return false;
     }
+    write_cache(&fresh).is_ok()
 }
 
 /// Kick a background index refresh. The boolean sent on completion is whether

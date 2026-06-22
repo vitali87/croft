@@ -1207,6 +1207,10 @@ pub struct App {
     /// main loop; rebuilds the Extensions panel once if the verified cache
     /// changed. `None` once consumed (or on a disarmed build, immediately).
     ext_index_refresh: Option<std::sync::mpsc::Receiver<bool>>,
+    /// True when the in-flight refresh was triggered by the user (the ⟳ button),
+    /// so its completion reports a status line; the silent startup refresh
+    /// doesn't, to avoid clobbering more useful startup messages.
+    ext_index_manual_refresh: bool,
     /// Channel to the background search worker. Each keystroke or toggle
     /// flip pushes a `(query, opts)` request here; the worker debounces
     /// and runs `search_workspace` off the UI thread.
@@ -1920,6 +1924,7 @@ impl App {
             deps_scrollbar_drag: false,
             welcome,
             ext_index_refresh,
+            ext_index_manual_refresh: false,
             search_query_tx,
             search_results_rx,
             cell_pixel: None,
@@ -3128,6 +3133,15 @@ impl App {
                 if updated {
                     self.refresh_extensions();
                 }
+                // A user-triggered refresh reports its outcome; the silent
+                // startup refresh does not (it must not clobber other status).
+                if std::mem::take(&mut self.ext_index_manual_refresh) {
+                    self.status = String::from(if updated {
+                        "Extensions index refreshed"
+                    } else {
+                        "Extensions index already up to date"
+                    });
+                }
                 updated
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => false,
@@ -3136,6 +3150,16 @@ impl App {
                 false
             }
         }
+    }
+
+    /// Manually re-pull the signed remote extension index (the panel's ⟳
+    /// button). Re-arms the background refresh; the cached entries keep showing
+    /// meanwhile, and [`Self::drain_ext_index_refresh`] rebuilds the panel and
+    /// reports the outcome when it lands.
+    fn refresh_extension_index(&mut self) {
+        self.ext_index_manual_refresh = true;
+        self.ext_index_refresh = Some(crate::mcp::registry_index::spawn_refresh());
+        self.status = String::from("Refreshing extensions index\u{2026}");
     }
 
     /// Per-tick LSP doc sync. Diffs every text-buffer tab's edit_seq
@@ -3421,6 +3445,12 @@ impl App {
         // name/blurb — so hovering the body shows nothing, and each control
         // describes just itself. The trash button takes precedence over the
         // switch since it sits left of it (and is checked first regardless).
+        if self.extensions.click_refresh(col, row) {
+            return Some("Refresh the extension index");
+        }
+        if self.extensions.click_clear(col, row) {
+            return Some("Clear the filter");
+        }
         if self.extensions.click_uninstall(col, row) {
             return Some("Uninstall this extension (returns to Available)");
         }
@@ -14880,6 +14910,11 @@ impl App {
                     // The filter's clear (✕) button empties the search.
                     if self.extensions.click_clear(m.column, m.row) {
                         self.extensions.clear_filter();
+                        return;
+                    }
+                    // The refresh (⟳) button re-pulls the signed remote index.
+                    if self.extensions.click_refresh(m.column, m.row) {
+                        self.refresh_extension_index();
                         return;
                     }
                     // Clicking a row selects it; clicking its trash button
