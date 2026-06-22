@@ -12949,7 +12949,20 @@ impl App {
         }
         let (tx, rx) = std::sync::mpsc::channel();
         self.mcp_rx = Some(rx);
-        self.status = format!("Running {}…", resolved.title);
+        // On first use the server isn't provisioned yet; the worker installs it
+        // (block-and-wait) before running, which can take a moment. Say so, so
+        // the user sees install progress rather than a silent "Running…".
+        let installing = resolved.server.provision.as_ref().is_some_and(|p| {
+            crate::lsp::install::provisioned_command(&resolved.server.id, p).is_none()
+        });
+        self.status = if installing {
+            format!(
+                "Installing {} (first run, this can take a moment)…",
+                resolved.title
+            )
+        } else {
+            format!("Running {}…", resolved.title)
+        };
         let cwd = self.workspace_root.clone();
         let version = env!("CARGO_PKG_VERSION").to_string();
         let _ = std::thread::Builder::new()
@@ -18397,10 +18410,24 @@ fn resolve_mcp_program(
         provision: Some(provision.clone()),
     };
     crate::lsp::install::resolve_managed(&config, provision, true);
-    Err(format!(
-        "Installing {} — run the command again once it finishes",
-        server.id
-    ))
+    // First run: the managed install runs in the background. Block here (on the
+    // worker thread — the UI stays responsive) until it lands, then resolve, so a
+    // single invocation installs AND runs the command instead of erroring with
+    // "run again" and dropping the user's argument. spawn_mcp_command shows a
+    // first-run status meanwhile.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        if let Some(found) = crate::lsp::install::provisioned_command(&server.id, provision) {
+            return Ok(found);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "Installing {} timed out — check your network and try again",
+                server.id
+            ));
+        }
+    }
 }
 
 /// Run a resolved MCP command to completion on a worker thread: provision +
