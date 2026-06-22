@@ -2930,6 +2930,18 @@ impl App {
         {
             return true;
         }
+        if self.focus == Pane::Tree
+            && self.sidebar_view == SidebarView::Search
+            && self.search.cursor_screen_pos().is_some()
+        {
+            return true;
+        }
+        if self.focus == Pane::Tree
+            && self.sidebar_view == SidebarView::Extensions
+            && self.extensions.cursor_screen_pos().is_some()
+        {
+            return true;
+        }
         false
     }
 
@@ -6544,6 +6556,29 @@ impl App {
         {
             frame.set_cursor_position((cx, cy));
         }
+
+        // Search-panel field caret and Extensions filter caret. Same software
+        // blink as the commit box so all three side-panel inputs share one
+        // blinking hardware caret instead of a static block (Search) or no
+        // caret at all (Extensions).
+        if self.focus == Pane::Tree
+            && self.sidebar_view == SidebarView::Search
+            && self.context_menu.is_none()
+            && self.prompt.is_none()
+            && self.cursor_visible_phase()
+            && let Some((cx, cy)) = self.search.cursor_screen_pos()
+        {
+            frame.set_cursor_position((cx, cy));
+        }
+        if self.focus == Pane::Tree
+            && self.sidebar_view == SidebarView::Extensions
+            && self.context_menu.is_none()
+            && self.prompt.is_none()
+            && self.cursor_visible_phase()
+            && let Some((cx, cy)) = self.extensions.cursor_screen_pos()
+        {
+            frame.set_cursor_position((cx, cy));
+        }
     }
 
     fn render_context_menu(&self, frame: &mut ratatui::Frame) {
@@ -7469,6 +7504,9 @@ impl App {
 
     fn handle_search_key(&mut self, key: KeyEvent) {
         use crate::widgets::search::SearchField;
+        // Reset the blink so the caret is solidly visible right after any key,
+        // matching the commit box; the panel is focused whenever this fires.
+        self.poke_cursor();
         if is_search_paste_key(key) {
             let text = (self.clipboard_reader)();
             self.paste_clipboard_into_search(text.as_deref());
@@ -7700,6 +7738,8 @@ impl App {
         let has_mod = key
             .modifiers
             .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER);
+        // Keep the filter caret solid right after a key, like the commit box.
+        self.poke_cursor();
         match key.code {
             KeyCode::Up => self.extensions.move_up(),
             KeyCode::Down => self.extensions.move_down(),

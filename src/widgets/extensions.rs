@@ -261,6 +261,10 @@ pub struct ExtensionsPanel {
     last_clear_area: Rect,
     /// The refresh (⟳) cell at the right of the filter row, for click routing.
     last_refresh_area: Rect,
+    /// Screen cell of the filter caret, captured each render so the app can
+    /// drive the host's blinking hardware caret there (matching the Source
+    /// Control commit box). `None` when the panel isn't focused.
+    caret_cell: Option<(u16, u16)>,
 }
 
 impl ExtensionsPanel {
@@ -280,7 +284,19 @@ impl ExtensionsPanel {
             last_search_area: Rect::default(),
             last_clear_area: Rect::default(),
             last_refresh_area: Rect::default(),
+            caret_cell: None,
         }
+    }
+
+    /// Screen position of the filter caret, in absolute terminal coordinates,
+    /// for the app to drive the host's blinking hardware caret (mirroring
+    /// `SourceControlPanel::cursor_screen_pos`). `None` when the panel isn't
+    /// focused or hasn't been laid out yet.
+    pub fn cursor_screen_pos(&self) -> Option<(u16, u16)> {
+        if !self.focused {
+            return None;
+        }
+        self.caret_cell
     }
 
     /// Replace the displayed list, preserving the selection by id where possible
@@ -489,6 +505,7 @@ impl Widget for &mut ExtensionsPanel {
         self.last_search_area = Rect::default();
         self.last_clear_area = Rect::default();
         self.last_refresh_area = Rect::default();
+        self.caret_cell = None;
         if area.width == 0 || area.height == 0 {
             return;
         }
@@ -555,9 +572,14 @@ impl Widget for &mut ExtensionsPanel {
                     "Filter extensions\u{2026}",
                     Style::default().fg(DESC_FG).bg(pal.search_bg),
                 );
+                // Caret sits at the text start so the user sees where typing
+                // lands even before the first character, like the commit box.
+                if self.focused {
+                    self.caret_cell = Some((x.min(text_right), search_y));
+                }
             } else {
                 let clear_x = text_right.saturating_sub(1);
-                put(
+                let after = put(
                     buf,
                     x,
                     search_y,
@@ -565,6 +587,12 @@ impl Widget for &mut ExtensionsPanel {
                     &self.filter,
                     Style::default().fg(NAME_FG).bg(pal.search_bg),
                 );
+                // Caret rides just past the filter text (clamped before the
+                // clear glyph) so the app can blink the host's hardware caret
+                // there instead of leaving the field cursor-less.
+                if self.focused {
+                    self.caret_cell = Some((after.min(clear_x), search_y));
+                }
                 buf.set_string(
                     clear_x,
                     search_y,
@@ -1050,6 +1078,39 @@ mod tests {
         let c = panel.last_clear_area;
         assert!(c.width > 0, "a non-empty filter lays out a clear button");
         assert!(panel.click_clear(c.x, c.y), "the clear button hit-tests");
+    }
+
+    #[test]
+    fn a_focused_filter_exposes_a_caret_for_the_blinking_hardware_cursor() {
+        let mut panel = ExtensionsPanel::new();
+        panel.set_items(items());
+        panel.focused = true;
+        // Empty filter: caret sits at the text start, just past the magnifier.
+        let _ = render(&mut panel, 44, 16);
+        let (cx0, cy0) = panel
+            .cursor_screen_pos()
+            .expect("a focused, empty filter still shows where typing will land");
+        assert_eq!(cy0, panel.last_search_area.y, "caret rides the filter row");
+        // Typing advances the caret to the right of the entered text so the
+        // user sees where the next character goes, like the commit box.
+        panel.push_filter_char('p');
+        panel.push_filter_char('d');
+        let _ = render(&mut panel, 44, 16);
+        let (cx1, _) = panel.cursor_screen_pos().expect("caret after typing");
+        assert!(cx1 > cx0, "caret advances past the typed characters");
+    }
+
+    #[test]
+    fn an_unfocused_filter_exposes_no_caret() {
+        let mut panel = ExtensionsPanel::new();
+        panel.set_items(items());
+        panel.focused = false;
+        panel.push_filter_char('p');
+        let _ = render(&mut panel, 44, 16);
+        assert!(
+            panel.cursor_screen_pos().is_none(),
+            "an unfocused panel must not claim the hardware caret"
+        );
     }
 
     #[test]

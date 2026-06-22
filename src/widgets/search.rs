@@ -805,6 +805,11 @@ pub struct SearchPanel {
     /// down. `results_viewport_height` and `hit_at_y` read this so scrolling
     /// and click mapping stay aligned with the rendered layout.
     pub results_start_offset: u16,
+    /// Screen cell of the focused field's text caret, captured each render so
+    /// the app can drive the host's blinking hardware caret there (matching
+    /// the Source Control commit box). `None` when no field is focused or the
+    /// panel has not laid out yet.
+    caret_cell: Option<(u16, u16)>,
 }
 
 /// Which input field of the Search panel currently has the cursor. Drives
@@ -864,7 +869,19 @@ impl SearchPanel {
             include_input_rect: Rect::default(),
             exclude_input_rect: Rect::default(),
             results_start_offset: 5,
+            caret_cell: None,
         }
+    }
+
+    /// Screen position of the focused field's text caret, in absolute terminal
+    /// coordinates, for the app to drive the host's blinking hardware caret
+    /// (mirroring `SourceControlPanel::cursor_screen_pos`). `None` when the
+    /// panel isn't focused or hasn't been laid out yet.
+    pub fn cursor_screen_pos(&self) -> Option<(u16, u16)> {
+        if !self.focused {
+            return None;
+        }
+        self.caret_cell
     }
 
     pub fn paste_button_at(&self, col: u16, row: u16) -> bool {
@@ -1367,10 +1384,16 @@ struct FieldArgs<'a> {
 /// return the click-to-focus hit `Rect` covering the bar + editable span (but
 /// not any reserved control cells on the right). Shared by all four Search
 /// inputs so they look identical: a one-cell accent/idle left bar, a subtly
-/// lifted fill, an optional lead glyph, then the text/placeholder with an
-/// inline cursor when focused. Replaces the old 3-row rounded box, which read
-/// as bulky next to VS Code / Zed's thin single-line fields.
-fn render_field(buf: &mut Buffer, args: FieldArgs) -> Rect {
+/// lifted fill, an optional lead glyph, then the text/placeholder. Replaces the
+/// old 3-row rounded box, which read as bulky next to VS Code / Zed's thin
+/// single-line fields.
+///
+/// When the field is focused, `caret_out` is set to the screen cell where the
+/// caret belongs (just past the text, at the field's left edge when empty) so
+/// the app can drive the host's blinking hardware caret there, matching the
+/// Source Control commit box. We no longer paint a static full block, which
+/// never blinked and so read differently from the commit input.
+fn render_field(buf: &mut Buffer, args: FieldArgs, caret_out: &mut Option<(u16, u16)>) -> Rect {
     if args.fill_right <= args.bar_x {
         return Rect {
             x: args.bar_x,
@@ -1416,12 +1439,8 @@ fn render_field(buf: &mut Buffer, args: FieldArgs) -> Rect {
     let text_right = args.fill_right.saturating_sub(args.reserve_right);
     let text_w = text_right.saturating_sub(text_x).saturating_add(1);
 
-    let cursor_span = Span::styled("█", Style::default().fg(args.accent).bg(fill));
     let mut spans: Vec<Span> = Vec::with_capacity(4);
     if args.text.is_empty() {
-        if args.field_focused {
-            spans.push(cursor_span);
-        }
         spans.push(Span::styled(
             args.placeholder.to_string(),
             Style::default()
@@ -1446,12 +1465,19 @@ fn render_field(buf: &mut Buffer, args: FieldArgs) -> Rect {
             }
             _ => spans.push(Span::styled(args.text.to_string(), plain)),
         }
-        if args.field_focused {
-            spans.push(cursor_span);
-        }
     }
     if text_w > 0 {
         buf.set_line(text_x, args.y, &Line::from(spans), text_w);
+    }
+
+    // The caret rides just past the text (at the field's left edge when empty),
+    // clamped inside the editable span. The app shows the host's blinking
+    // hardware caret here only while this field is focused, so we record the
+    // cell for the focused field alone. Char count matches the commit box's
+    // caret model (`message_cursor`); Search has no mid-text caret.
+    if args.field_focused && text_w > 0 {
+        let off = (args.text.chars().count() as u16).min(text_w.saturating_sub(1));
+        *caret_out = Some((text_x + off, args.y));
     }
 
     // Hit rect: bar + editable span, excluding reserved control cells so the
@@ -1492,6 +1518,9 @@ impl Widget for &mut SearchPanel {
         }
         self.last_area = area;
         self.last_inner = inner;
+        // Clear last frame's caret up front so an early return (too small to
+        // lay out a field) never leaves a stale hardware-caret position.
+        self.caret_cell = None;
         if inner.height == 0 || inner.width == 0 {
             return;
         }
@@ -1591,6 +1620,12 @@ impl Widget for &mut SearchPanel {
         self.chevron_x = chevron_x;
         self.chevron_y = content_y;
 
+        // Caret cell of whichever field is focused. `render_field` writes it
+        // only for the focused field (and never clears it for the others), so
+        // it accumulates the single focused field's caret across the calls
+        // below; committed to `self.caret_cell` once the cluster is laid out.
+        let mut caret: Option<(u16, u16)> = None;
+
         // Query field: filled single row, magnifier lead, inset toggles.
         let query_focused = self.focused && self.field == SearchField::Query;
         self.query_input_rect = render_field(
@@ -1608,6 +1643,7 @@ impl Widget for &mut SearchPanel {
                 bg,
                 reserve_right: query_reserve,
             },
+            &mut caret,
         );
 
         // Inset toggles `Aa ab .*`, painted on top of the query fill at its
@@ -1696,6 +1732,7 @@ impl Widget for &mut SearchPanel {
                     bg,
                     reserve_right: 0,
                 },
+                &mut caret,
             );
             buf.set_string(
                 replace_all_x,
@@ -1749,6 +1786,7 @@ impl Widget for &mut SearchPanel {
                         bg,
                         reserve_right: 0,
                     },
+                    &mut caret,
                 );
                 next_y += 1;
             }
@@ -1778,10 +1816,15 @@ impl Widget for &mut SearchPanel {
                         bg,
                         reserve_right: 0,
                     },
+                    &mut caret,
                 );
                 next_y += 1;
             }
         }
+        // Commit the focused field's caret now that the whole input cluster is
+        // laid out. Always runs (the optional rows above only skip their own
+        // render), so the app sees `None` whenever no field carried a caret.
+        self.caret_cell = caret;
 
         // ---- Separator + match-count caption ----
         let separator_y = next_y;
@@ -2073,10 +2116,12 @@ mod tests {
         ratatui::widgets::Widget::render(&mut panel, area, &mut buf);
         let inner_x = panel.last_inner.x;
         let inner_y = panel.last_inner.y;
+        // The caret (driven as the host's blinking hardware caret, like the
+        // commit box) sits at the start of the input content when empty.
         assert_eq!(
-            buf[(inner_x + INPUT_TYPED_COL, inner_y + INPUT_CONTENT_ROW)].symbol(),
-            "█",
-            "cursor must sit at the start of the input content area when the query is empty"
+            panel.cursor_screen_pos(),
+            Some((inner_x + INPUT_TYPED_COL, inner_y + INPUT_CONTENT_ROW)),
+            "caret must sit at the start of the input content area when the query is empty"
         );
     }
 
@@ -2097,12 +2142,12 @@ mod tests {
         ratatui::widgets::Widget::render(&mut panel, area, &mut buf);
         let inner_x = panel.last_inner.x;
         let inner_y = panel.last_inner.y;
-        // INPUT_TYPED_COL + "foo" (3 cells) → cursor sits 3 cells past
-        // the start of typed content.
+        // INPUT_TYPED_COL + "foo" (3 cells) → caret sits 3 cells past the start
+        // of typed content.
         assert_eq!(
-            buf[(inner_x + INPUT_TYPED_COL + 3, inner_y + INPUT_CONTENT_ROW)].symbol(),
-            "█",
-            "cursor must sit immediately after the typed query"
+            panel.cursor_screen_pos(),
+            Some((inner_x + INPUT_TYPED_COL + 3, inner_y + INPUT_CONTENT_ROW)),
+            "caret must sit immediately after the typed query"
         );
     }
 
@@ -3342,6 +3387,61 @@ mod tests {
         panel.type_char('b');
         assert_eq!(panel.query, "a");
         assert_eq!(panel.replace, "b");
+    }
+
+    #[test]
+    fn focused_query_field_exposes_a_caret_and_paints_no_static_block() {
+        use ratatui::buffer::Buffer;
+        let tmp = TempDir::new().unwrap();
+        let mut panel = SearchPanel::new(tmp.path().to_path_buf());
+        panel.focused = true;
+        panel.type_char('a');
+        panel.type_char('b');
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 20,
+        };
+        let mut buf = Buffer::empty(area);
+        Widget::render(&mut panel, area, &mut buf);
+        // The caret sits on the query row so the app can drive the host's
+        // blinking hardware caret there, matching the Source Control commit
+        // box, instead of painting a static block that never blinks.
+        let (cx, cy) = panel
+            .cursor_screen_pos()
+            .expect("a focused query field must expose a caret position");
+        let r = panel.query_input_rect;
+        assert_eq!(cy, r.y, "caret rides the query row");
+        assert!(cx > r.x, "caret sits past the magnifier-led text start");
+        let row: String = (r.x..r.right())
+            .map(|x| buf[(x, r.y)].symbol().to_string())
+            .collect();
+        assert!(
+            !row.contains('\u{2588}'),
+            "the static full-block cursor must be gone now that the hardware caret blinks; row was {row:?}"
+        );
+    }
+
+    #[test]
+    fn an_unfocused_search_panel_exposes_no_caret() {
+        use ratatui::buffer::Buffer;
+        let tmp = TempDir::new().unwrap();
+        let mut panel = SearchPanel::new(tmp.path().to_path_buf());
+        panel.focused = false;
+        panel.type_char('x');
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 20,
+        };
+        let mut buf = Buffer::empty(area);
+        Widget::render(&mut panel, area, &mut buf);
+        assert!(
+            panel.cursor_screen_pos().is_none(),
+            "an unfocused panel must not claim the hardware caret"
+        );
     }
 
     #[test]
