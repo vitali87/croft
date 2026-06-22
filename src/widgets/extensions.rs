@@ -421,7 +421,7 @@ impl ExtensionsPanel {
     /// Whether the click landed on a row's toggle switch (the right-edge zone),
     /// as opposed to elsewhere on the row, which just selects it.
     pub fn click_action(&self, x: u16, y: u16) -> bool {
-        self.row_at(y).is_some() && x >= self.last_switch_left
+        self.row_at(y).is_some() && x >= self.last_switch_left && x < self.last_area.right()
     }
 
     /// The item drawn at visible-list index `vis_idx` (as returned by
@@ -952,6 +952,33 @@ mod tests {
         assert!(
             !panel.click_action(1, y0),
             "a click at the row's left edge selects, it is not the toggle"
+        );
+    }
+
+    #[test]
+    fn the_switch_zone_stops_at_the_panel_edge_not_across_the_terminal() {
+        // Regression: the toggle hit-test bounded x only on the left
+        // (`x >= last_switch_left`), so every column to the right of the switch
+        // - the entire terminal pane beside the sidebar - reported as "on the
+        // toggle". A hover one row's height into the terminal then surfaced the
+        // enable/disable tooltip far from any switch, and a click there flipped
+        // the extension. The zone must end at the panel's right edge.
+        let mut panel = ExtensionsPanel::new();
+        panel.set_items(items());
+        let _ = render(&mut panel, 44, 16);
+        let y0 = panel.row_hits[0].0;
+        let panel_right = panel.last_area.right();
+        assert!(
+            panel.click_action(panel_right.saturating_sub(1), y0),
+            "the last column inside the panel is still the switch"
+        );
+        assert!(
+            !panel.click_action(panel_right, y0),
+            "the column at the panel's right edge is outside the switch"
+        );
+        assert!(
+            !panel.click_action(panel_right + 30, y0),
+            "deep in the terminal pane is never the switch"
         );
     }
 
