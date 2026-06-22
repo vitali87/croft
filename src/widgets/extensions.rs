@@ -688,8 +688,10 @@ impl Widget for &mut ExtensionsPanel {
             // the switch, so a mouse user has an uninstall control without the
             // Delete key (Fn+Delete on a Mac, easy to miss).
             if item.removable {
+                // The logo orange — the warm complement to the teal brand
+                // gradient — marks the destructive uninstall control.
                 let trash_style = Style::default()
-                    .fg(DESC_FG)
+                    .fg(crate::app::BRAND_ORANGE)
                     .bg(row_bg.unwrap_or(Color::Reset));
                 buf.set_string(uninstall_x, y, TRASH_GLYPH.to_string(), trash_style);
             }

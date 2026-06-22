@@ -489,8 +489,9 @@ fn git_status_spans<'a>(status: &'a crate::git::GitStatus) -> Vec<Span<'a>> {
 }
 
 /// Logo orange (#e97c41), sampled from `assets/logo.png`: the colour of the
-/// `<>` angle brackets in the "cr<>ft" wordmark.
-const BRAND_ORANGE: Color = Color::Rgb(0xe9, 0x7c, 0x41);
+/// `<>` angle brackets in the "cr<>ft" wordmark. Also the Extensions panel's
+/// trash button — the warm complement to the teal brand gradient.
+pub(crate) const BRAND_ORANGE: Color = Color::Rgb(0xe9, 0x7c, 0x41);
 
 /// Spans for the "cr<>ft" wordmark at the left of the status bar, styled to
 /// mirror the app logo: white letters with the `<>` (the stylised "o") in the
