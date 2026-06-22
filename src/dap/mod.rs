@@ -20,6 +20,7 @@
 pub mod discovery;
 pub mod install;
 pub mod log;
+pub mod reaper;
 pub mod registry;
 pub mod remote_attach;
 pub mod session;

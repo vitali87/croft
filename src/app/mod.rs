@@ -543,6 +543,11 @@ const UPDATE_SPINNER_FRAMES: [&str; 6] = [
 /// motion while keeping the status-bar-only redraws light over SSH.
 const UPDATE_SPINNER_FRAME_MS: u128 = 100;
 
+/// Grace before the post-teardown js-debug orphan sweep runs, letting a
+/// just-killed server's detached watchdog reparent to init so the sweep can
+/// recognise it as an orphan. See [`crate::dap::reaper`].
+const REAPER_TEARDOWN_GRACE_MS: u64 = 250;
+
 /// Pick the spinner frame for a given elapsed time. Pure so the wrap-around
 /// is unit-testable without a clock.
 fn update_spinner_frame(elapsed_ms: u128) -> &'static str {
@@ -1772,6 +1777,13 @@ fn open_url(url: &str) -> Result<()> {
 
 impl App {
     pub fn new(root: PathBuf) -> Result<Self> {
+        // Reap any js-debug adapter tree a previous croft left orphaned (a
+        // crash or force-quit skips `DapTransport`'s `Drop`, so the server +
+        // its detached watchdog get reparented to init and linger). Runs on a
+        // detached thread to stay off the time-to-first-frame critical path,
+        // and is safe even while another croft session is live: only processes
+        // reparented to init are touched. See `crate::dap::reaper`.
+        crate::dap::reaper::reap_orphaned_js_debug_async(std::time::Duration::ZERO);
         let tree = FileTree::new(root.clone());
         let search = SearchPanel::new(root.clone());
         let remote = RemotePanel::new();
@@ -7922,7 +7934,21 @@ impl App {
             Some(SessionPhase::Terminated) => {
                 self.editor.stop_line = None;
                 self.editor.unverified_breakpoints.clear();
+                // Reply to the adapter's own `terminated`/`exited` with the
+                // graceful `disconnect` handshake before dropping it. js-debug
+                // only retires its detached watchdog on this handshake, never on
+                // a SIGKILL of the server, so the natural-exit path used to leak
+                // the watchdog by dropping straight to a kill.
+                if let Some(session) = self.dap_session.as_mut() {
+                    session.disconnect();
+                }
                 self.dap_session = None;
+                // The watchdog reparents to init the moment the server dies;
+                // sweep it (and any tree a crashed prior croft left behind)
+                // after a short grace so it has settled into the orphan state.
+                crate::dap::reaper::reap_orphaned_js_debug_async(std::time::Duration::from_millis(
+                    REAPER_TEARDOWN_GRACE_MS,
+                ));
                 let had_breakpoints = !self.editor.breakpoints.is_empty();
                 self.run_debug.feedback =
                     Some(debug_end_message(had_breakpoints, self.debug_ever_stopped).to_string());
@@ -8594,6 +8620,12 @@ impl App {
             session.disconnect();
         }
         self.dap_session = None;
+        // Sweep js-debug's detached watchdog (and any leftover tree) once it has
+        // reparented to init after the server dies. See the Terminated arm in
+        // `poll_dap` and `crate::dap::reaper`.
+        crate::dap::reaper::reap_orphaned_js_debug_async(std::time::Duration::from_millis(
+            REAPER_TEARDOWN_GRACE_MS,
+        ));
         self.editor.stop_line = None;
         self.editor.unverified_breakpoints.clear();
         self.status = String::from("Debug session stopped");

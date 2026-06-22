@@ -168,6 +168,7 @@ impl DapTransport {
         port: u16,
         path_prepend: Option<&std::path::Path>,
     ) -> Result<DapTransport> {
+        use std::os::unix::process::CommandExt;
         let mut cmd = Command::new(program);
         cmd.args(args)
             .current_dir(cwd)
@@ -180,6 +181,21 @@ impl DapTransport {
         if let Some(dir) = path_prepend {
             let existing = std::env::var("PATH").unwrap_or_default();
             cmd.env("PATH", format!("{}:{existing}", dir.display()));
+        }
+        // Detach the server into its own session/process group, exactly as the
+        // stdio `spawn` path does. This is what lets `kill` later signal the
+        // whole group (server + the debuggee node it forks) in one shot rather
+        // than leaking the debuggee. The server's pid becomes its own pgid, so a
+        // group kill targets only this tree, never croft's.
+        //
+        // SAFETY: `setsid` is async-signal-safe and the only call in the
+        // pre-exec hook; the forked child is never a process-group leader (its
+        // pid differs from croft's pgid), so the call always succeeds.
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
         }
         let child = cmd
             .spawn()
@@ -239,10 +255,27 @@ impl DapTransport {
         Ok(seq)
     }
 
-    /// Best-effort terminate the adapter process, if this transport owns one.
+    /// Best-effort terminate the adapter process tree, if this transport owns
+    /// one. The adapter was `setsid`'d at spawn, so its pid is its own
+    /// process-group id; signalling the whole group (`killpg`) reaps the
+    /// debuggee it forked too, not just the direct child. `child.kill()` then
+    /// covers the direct child belt-and-suspenders, and `wait()` reaps the
+    /// zombie so a long-lived croft never accumulates defunct adapters.
+    ///
+    /// vscode-js-debug's `watchdog` `setsid`s into a *separate* session, so it
+    /// is deliberately outside this group; the graceful `disconnect` handshake
+    /// and the startup orphan sweep ([`crate::dap::reaper`]) are what retire it.
     pub fn kill(&mut self) {
         if let Some(child) = self.child.as_mut() {
+            let pid = child.id() as i32;
+            // SAFETY: `killpg` is a plain libc call; `pid` is this child's pgid
+            // (it `setsid`'d), distinct from croft's, so only the adapter tree
+            // is signalled.
+            unsafe {
+                libc::killpg(pid, libc::SIGKILL);
+            }
             let _ = child.kill();
+            let _ = child.wait();
         }
     }
 }

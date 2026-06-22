@@ -71,7 +71,7 @@ pub fn ensure_debug_venv() -> Result<PathBuf> {
 }
 
 /// `~/.croft/js-debug`, the install root for the vscode-js-debug server.
-fn js_debug_dir() -> Option<PathBuf> {
+pub(crate) fn js_debug_dir() -> Option<PathBuf> {
     let home = std::env::var_os("HOME")?;
     Some(PathBuf::from(home).join(".croft").join("js-debug"))
 }
