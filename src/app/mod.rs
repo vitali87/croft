@@ -9560,6 +9560,10 @@ impl App {
                 self.close_input_prompt();
                 self.perform_extension_uninstall(&id);
             }
+            InputPurpose::TreeDelete { paths } => {
+                self.close_input_prompt();
+                self.perform_delete_paths(paths);
+            }
         }
     }
 
@@ -16520,6 +16524,35 @@ impl App {
     }
 
     fn delete_paths(&mut self, paths: Vec<PathBuf>) {
+        let total = paths.len();
+        if total == 0 {
+            return;
+        }
+        // Confirm before trashing — Delete (or the context menu's Delete) must
+        // not remove files from a single action. Enter performs it; Esc keeps
+        // them. Files go to the OS Trash (recoverable), so the wording reflects that.
+        use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
+        let title = if total == 1 {
+            let name = paths[0]
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| paths[0].display().to_string());
+            format!("Move '{name}' to Trash?")
+        } else {
+            format!("Move {total} items to Trash?")
+        };
+        self.open_input_prompt(
+            InputPrompt::new(
+                InputPurpose::TreeDelete { paths },
+                title,
+                "Enter to trash · Esc to keep",
+            )
+            .with_value("trash"),
+        );
+    }
+
+    /// Perform the confirmed trash of `paths` (the popup's Enter path).
+    fn perform_delete_paths(&mut self, paths: Vec<PathBuf>) {
         let total = paths.len();
         if total == 0 {
             return;

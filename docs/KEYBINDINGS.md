@@ -61,7 +61,7 @@ On macOS, the `Cmd` chords below only reach croft after you run a one-time setup
 | `Ctrl`+`V` / `Cmd`+`V` | Paste into the focused folder (move on Cut, copy on Copy) |
 | `Cmd`+`Z` | Jump to a directory via zoxide: a fuzzy popup over your frecency-ranked dirs, then re-roots the workspace and `cd`s the terminal. Shares one database with the shell's `j` command; croft installs zoxide and wires the shell hook on first launch if needed |
 | Drag a row onto a folder | Move the selection into it (`Alt`-drag to copy instead) |
-| `Delete` / `Backspace` / `Cmd`+`Backspace` | Move every selected path to the OS Trash |
+| `Delete` / `Backspace` / `Cmd`+`Backspace` | Move every selected path to the OS Trash (after a confirmation popup — `Enter` to trash, `Esc` to keep) |
 | `Cmd`+`Opt`+`R` (local macOS only) | Reveal the selected entry in Finder |
 | Right-click | Context menu: Cut, Copy, Paste, Rename, Delete, Reveal in Finder (local macOS), and New File / New Folder on empty space |
 | Click the Explorer root-folder icons | New File, New Folder, Refresh Explorer, and Collapse Folders, right-aligned on the root folder row and shown only while the Explorer is focused, mirroring VS Code's workspace-folder actions (New File / New Folder also on `Cmd+F` / `Cmd+Shift+N`) |

@@ -9267,7 +9267,18 @@ fn delete_key_trashes_every_marked_path() {
         .unwrap();
     app.tree.select_replace(a_idx);
     app.tree.toggle_mark(b_idx);
+    // Delete now asks first: it opens a confirmation popup, nothing is trashed yet.
     app.handle_tree_key(key(KeyCode::Delete, KeyModifiers::NONE));
+    assert!(
+        app.input_prompt.is_some(),
+        "Delete must open a confirm popup"
+    );
+    assert!(
+        tmp.path().join("a.txt").exists(),
+        "not trashed until confirmed"
+    );
+    // Enter confirms; now both selected entries move to Trash.
+    app.submit_input_prompt();
     assert!(!tmp.path().join("a.txt").exists());
     assert!(!tmp.path().join("b.txt").exists());
 }

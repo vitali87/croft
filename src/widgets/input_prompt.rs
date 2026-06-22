@@ -8,6 +8,8 @@
 //! tag so a single key/mouse/render path serves every prompt, and decides
 //! what to do with the submitted string.
 
+use std::path::PathBuf;
+
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
@@ -45,6 +47,11 @@ pub enum InputPurpose {
     /// the removal; Esc keeps it. The submitted value is a sentinel, ignored.
     ExtensionUninstall {
         id: String,
+    },
+    /// Confirm moving Explorer file-tree entries to the OS Trash. Submitting
+    /// (Enter) trashes `paths`; Esc keeps them. The value is a sentinel.
+    TreeDelete {
+        paths: Vec<PathBuf>,
     },
 }
 
