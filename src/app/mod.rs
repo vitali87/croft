@@ -1468,6 +1468,11 @@ pub struct App {
     /// worker delivers one [`crate::mcp::McpOutcome`] then disconnects). `None`
     /// when no extension command is running; polled each frame by `poll_mcp`.
     mcp_rx: Option<std::sync::mpsc::Receiver<crate::mcp::McpOutcome>>,
+    /// While an extension command runs: when it started (drives the status-bar
+    /// spinner frame) and its human label (the animated badge text). Both `None`
+    /// when idle; set in `spawn_mcp_command`, cleared in `poll_mcp`.
+    mcp_started: Option<std::time::Instant>,
+    mcp_busy_label: Option<String>,
     /// "Debug: Attach to Python Process" picker (PEP 768). None when closed.
     /// Lists running CPython 3.14+ processes; selecting one spawns
     /// `pdb -p <pid>` in a PTY.
@@ -1997,6 +2002,8 @@ impl App {
             file_finder: None,
             command_palette: None,
             mcp_rx: None,
+            mcp_started: None,
+            mcp_busy_label: None,
             process_picker: None,
             dap_session: None,
             debug_expanded: std::collections::HashSet::new(),
@@ -6353,6 +6360,16 @@ impl App {
                     .add_modifier(Modifier::BOLD),
             ));
         }
+        if let Some(label) = &self.mcp_busy_label {
+            // An in-flight extension command (install + tool call on a worker
+            // thread) is otherwise invisible; an animated badge says it's working.
+            spans.push(Span::styled(
+                format!(" {} {label}… ", self.mcp_spinner_glyph()),
+                Style::default()
+                    .fg(Color::Rgb(0x2d, 0xd4, 0xbf))
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
         if self.vim.enabled {
             let (text, bg) = match self.vim.command_line() {
                 Some(cmd) => (format!(" {cmd} "), Color::Rgb(0x33, 0x33, 0x33)),
@@ -10066,6 +10083,23 @@ impl App {
         }
     }
 
+    /// Spinner glyph for an in-flight extension command (frame 0 when idle).
+    fn mcp_spinner_glyph(&self) -> &'static str {
+        match self.mcp_started {
+            Some(t) => update_spinner_frame(t.elapsed().as_millis()),
+            None => UPDATE_SPINNER_FRAMES[0],
+        }
+    }
+
+    /// Monotonic phase so the loop redraws each frame while an extension command
+    /// runs (`0` when idle, so it never wakes the renderer otherwise).
+    fn mcp_spinner_phase(&self) -> u128 {
+        match self.mcp_started {
+            Some(t) => t.elapsed().as_millis() / UPDATE_SPINNER_FRAME_MS,
+            None => 0,
+        }
+    }
+
     pub fn capture_session_state(&self) -> crate::session_state::SessionState {
         let mut tabs = Vec::new();
         let mut active_tab = 0;
@@ -12955,14 +12989,18 @@ impl App {
         let installing = resolved.server.provision.as_ref().is_some_and(|p| {
             crate::lsp::install::provisioned_command(&resolved.server.id, p).is_none()
         });
-        self.status = if installing {
+        let label = if installing {
             format!(
-                "Installing {} (first run, this can take a moment)…",
+                "Installing {} (first run, this can take a moment)",
                 resolved.title
             )
         } else {
-            format!("Running {}…", resolved.title)
+            format!("Running {}", resolved.title)
         };
+        // Drive the status-bar spinner badge while the worker runs.
+        self.mcp_started = Some(std::time::Instant::now());
+        self.mcp_busy_label = Some(label.clone());
+        self.status = format!("{label}…");
         let cwd = self.workspace_root.clone();
         let version = env!("CARGO_PKG_VERSION").to_string();
         let _ = std::thread::Builder::new()
@@ -12984,10 +13022,14 @@ impl App {
             Err(std::sync::mpsc::TryRecvError::Empty) => return false,
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 self.mcp_rx = None;
+                self.mcp_started = None;
+                self.mcp_busy_label = None;
                 return false;
             }
         };
         self.mcp_rx = None;
+        self.mcp_started = None;
+        self.mcp_busy_label = None;
         match outcome.body {
             Ok(text) => {
                 let label = PathBuf::from(format!("{}.md", outcome.title));
@@ -19262,7 +19304,8 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let pty_pending = app.peek_terminals_dirty();
         let blink_visible = app.cursor_visible_phase();
         let blink_changed = blink_visible != last_blink_visible;
-        let spinner_phase = app.update_spinner_phase();
+        // Either spinner advancing must wake a redraw; both stay 0 when idle.
+        let spinner_phase = app.update_spinner_phase() + app.mcp_spinner_phase();
         let spinner_changed = spinner_phase != last_spinner_phase;
         let commits_changed = app.drain_recent_commits();
         let ext_index_changed = app.drain_ext_index_refresh();
