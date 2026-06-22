@@ -1085,6 +1085,12 @@ enum EditKind {
     SortLines,
     /// Trim trailing whitespace across the buffer. Its own step.
     TrimWhitespace,
+    /// Transpose the two characters around the cursor (Ctrl+T). Its own step.
+    Transpose,
+    /// Convert leading indentation between tabs and spaces. Its own step.
+    IndentConvert,
+    /// Remove trailing blank lines at end of file. Its own step.
+    TrimFinalNewlines,
 }
 
 /// The three case transforms VS Code exposes as
@@ -3331,6 +3337,316 @@ impl Editor {
         true
     }
 
+    /// The character at `(row, char_col)`, or None when out of range. Used by
+    /// the bracket-matching helpers, which work in char indices.
+    fn char_at(&self, row: usize, col: usize) -> Option<char> {
+        self.lines.get(row)?.chars().nth(col)
+    }
+
+    /// Forward-scan from the opening bracket at `open` to its matching close,
+    /// counting nesting of the SAME pair type. Returns the `(row, col)` of the
+    /// closing bracket, or None when unbalanced.
+    fn match_bracket_forward(&self, open: BPos) -> Option<BPos> {
+        let oc = self.char_at(open.0, open.1)?;
+        let cc = matching_close(oc)?;
+        let mut depth = 0i32;
+        let (mut row, mut col) = open;
+        loop {
+            match self.char_at(row, col) {
+                Some(ch) => {
+                    if ch == oc {
+                        depth += 1;
+                    } else if ch == cc {
+                        depth -= 1;
+                        if depth == 0 {
+                            return Some((row, col));
+                        }
+                    }
+                    col += 1;
+                }
+                None => {
+                    row += 1;
+                    col = 0;
+                    if row >= self.lines.len() {
+                        return None;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Backward-scan from the closing bracket at `close` to its matching open.
+    fn match_bracket_backward(&self, close: BPos) -> Option<BPos> {
+        let cc = self.char_at(close.0, close.1)?;
+        let oc = matching_open(cc)?;
+        let mut depth = 0i32;
+        let mut row = close.0;
+        let mut col = close.1 as isize;
+        loop {
+            if col < 0 {
+                if row == 0 {
+                    return None;
+                }
+                row -= 1;
+                col = self.line_char_len(row) as isize - 1;
+                continue;
+            }
+            let ch = self.char_at(row, col as usize)?;
+            if ch == cc {
+                depth += 1;
+            } else if ch == oc {
+                depth -= 1;
+                if depth == 0 {
+                    return Some((row, col as usize));
+                }
+            }
+            col -= 1;
+        }
+    }
+
+    /// The innermost bracket pair enclosing the cursor, found by walking
+    /// backwards for the first unmatched opening bracket and matching it
+    /// forwards. Mirrors VS Code's `findEnclosingBrackets`.
+    fn enclosing_brackets(&self) -> Option<(BPos, BPos)> {
+        let mut row = self.cursor_row;
+        let mut col = self.cursor_col as isize - 1;
+        let mut expected: Vec<char> = Vec::new();
+        loop {
+            if col < 0 {
+                if row == 0 {
+                    return None;
+                }
+                row -= 1;
+                col = self.line_char_len(row) as isize - 1;
+                continue;
+            }
+            let ch = self.char_at(row, col as usize)?;
+            if is_close_bracket(ch) {
+                expected.push(matching_open(ch)?);
+            } else if is_open_bracket(ch) {
+                match expected.last() {
+                    Some(&want) if want == ch => {
+                        expected.pop();
+                    }
+                    _ => {
+                        let open = (row, col as usize);
+                        let close = self.match_bracket_forward(open)?;
+                        return Some((open, close));
+                    }
+                }
+            }
+            col -= 1;
+        }
+    }
+
+    /// The first bracket pair at or after the cursor (`findNextBracket`).
+    fn next_bracket_pair(&self) -> Option<(BPos, BPos)> {
+        let mut row = self.cursor_row;
+        let mut col = self.cursor_col;
+        loop {
+            match self.char_at(row, col) {
+                Some(ch) if is_open_bracket(ch) => {
+                    let open = (row, col);
+                    return self.match_bracket_forward(open).map(|c| (open, c));
+                }
+                Some(ch) if is_close_bracket(ch) => {
+                    let close = (row, col);
+                    return self.match_bracket_backward(close).map(|o| (o, close));
+                }
+                Some(_) => col += 1,
+                None => {
+                    row += 1;
+                    col = 0;
+                    if row >= self.lines.len() {
+                        return None;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Resolve the bracket pair relevant to the cursor, returning
+    /// `(open, close, anchored_on_close)`. `anchored_on_close` is true when the
+    /// cursor sits on the closing bracket, so a jump should target the open
+    /// bracket instead. Adjacency priority mirrors VS Code's `matchBracket`:
+    /// a close to the left wins, then an open to the right, then an open to the
+    /// left, then a close to the right; failing all four it falls back to the
+    /// enclosing pair, then the next bracket forward.
+    fn find_bracket_pair(&self) -> Option<(BPos, BPos, bool)> {
+        let row = self.cursor_row;
+        let col = self.cursor_col;
+        let left = col.checked_sub(1).and_then(|c| self.char_at(row, c));
+        let right = self.char_at(row, col);
+        if left.is_some_and(is_close_bracket) {
+            let close = (row, col - 1);
+            return self.match_bracket_backward(close).map(|o| (o, close, true));
+        }
+        if right.is_some_and(is_open_bracket) {
+            let open = (row, col);
+            return self.match_bracket_forward(open).map(|c| (open, c, false));
+        }
+        if left.is_some_and(is_open_bracket) {
+            let open = (row, col - 1);
+            return self.match_bracket_forward(open).map(|c| (open, c, false));
+        }
+        if right.is_some_and(is_close_bracket) {
+            let close = (row, col);
+            return self.match_bracket_backward(close).map(|o| (o, close, true));
+        }
+        if let Some((open, close)) = self.enclosing_brackets() {
+            return Some((open, close, false));
+        }
+        self.next_bracket_pair().map(|(o, c)| (o, c, false))
+    }
+
+    /// VS Code "Go to Bracket" (`editor.action.jumpToBracket`, Cmd+Shift+\):
+    /// move the cursor to the matching bracket. From an opening bracket it
+    /// lands on the closing one and vice versa; from inside a pair it lands on
+    /// the enclosing closing bracket. Returns false (a no-op) when no bracket
+    /// is in play.
+    pub fn jump_to_matching_bracket(&mut self) -> bool {
+        let Some((open, close, anchored_on_close)) = self.find_bracket_pair() else {
+            return false;
+        };
+        let target = if anchored_on_close { open } else { close };
+        self.clear_selection();
+        self.cursor_row = target.0;
+        self.cursor_col = target.1;
+        self.last_edit_kind = None;
+        self.ensure_cursor_col_visible();
+        true
+    }
+
+    /// VS Code "Select to Bracket" (`editor.action.selectToBracket`): select
+    /// the region between the matching brackets, including the brackets
+    /// themselves (from the opening bracket's start to the closing bracket's
+    /// end). Returns false (a no-op) when no bracket pair is in play.
+    pub fn select_to_matching_bracket(&mut self) -> bool {
+        let Some((open, close, _)) = self.find_bracket_pair() else {
+            return false;
+        };
+        let head = (close.0, close.1 + 1);
+        self.selection = Some(EditorSelection { anchor: open, head });
+        self.cursor_row = head.0;
+        self.cursor_col = head.1;
+        self.last_edit_kind = None;
+        self.ensure_cursor_col_visible();
+        true
+    }
+
+    /// VS Code "Transpose Characters around the Cursor"
+    /// (`editor.action.transpose`): swap the character before the cursor with
+    /// the one after it and advance the cursor (emacs `transpose-chars`). At
+    /// the end of a non-final line the last character moves across the line
+    /// break to the start of the next line. At the end of the final line it is
+    /// a no-op.
+    pub fn transpose_chars(&mut self) {
+        let row = self.cursor_row;
+        let col = self.cursor_col;
+        let len = self.line_char_len(row);
+        if col >= len {
+            if row + 1 >= self.lines.len() {
+                return;
+            }
+            self.push_undo(EditKind::Transpose);
+            if len > 0 {
+                let mut chars: Vec<char> = self.lines[row].chars().collect();
+                let moved = chars.pop().unwrap();
+                self.lines[row] = chars.into_iter().collect();
+                self.lines[row + 1].insert(0, moved);
+                self.cursor_col = 1;
+            } else {
+                self.cursor_col = 0;
+            }
+            self.cursor_row = row + 1;
+            self.mark_buffer_changed();
+            self.recompute_highlights();
+            self.ensure_cursor_col_visible();
+            return;
+        }
+        if col == 0 {
+            // VS Code's single-character range at column 1: no swap, just step
+            // the cursor right.
+            self.cursor_col = 1;
+            self.ensure_cursor_col_visible();
+            return;
+        }
+        self.push_undo(EditKind::Transpose);
+        let mut chars: Vec<char> = self.lines[row].chars().collect();
+        chars.swap(col - 1, col);
+        self.lines[row] = chars.into_iter().collect();
+        self.cursor_col = col + 1;
+        self.mark_buffer_changed();
+        self.recompute_highlights();
+        self.ensure_cursor_col_visible();
+    }
+
+    /// VS Code "Convert Indentation to Spaces" (`editor.action.indentationToSpaces`):
+    /// replace every tab in each line's leading indentation with `tabSize`
+    /// spaces. Only leading whitespace is touched.
+    pub fn indentation_to_spaces(&mut self) {
+        self.convert_indentation(true);
+    }
+
+    /// VS Code "Convert Indentation to Tabs" (`editor.action.indentationToTabs`):
+    /// replace each run of `tabSize` spaces in the leading indentation with a
+    /// tab, leaving any remainder. Only leading whitespace is touched.
+    pub fn indentation_to_tabs(&mut self) {
+        self.convert_indentation(false);
+    }
+
+    fn convert_indentation(&mut self, to_spaces: bool) {
+        let tab_w = indent_unit_for(self.lang).chars().count().max(1);
+        let spaces = " ".repeat(tab_w);
+        let mut new_lines = self.lines.clone();
+        let mut changed = false;
+        for line in new_lines.iter_mut() {
+            let indent_len = line.chars().take_while(|c| *c == ' ' || *c == '\t').count();
+            let indent: String = line.chars().take(indent_len).collect();
+            let converted = if to_spaces {
+                indent.replace('\t', &spaces)
+            } else {
+                indent.replace(&spaces, "\t")
+            };
+            if converted != indent {
+                let rest: String = line.chars().skip(indent_len).collect();
+                *line = format!("{converted}{rest}");
+                changed = true;
+            }
+        }
+        if !changed {
+            return;
+        }
+        self.push_undo(EditKind::IndentConvert);
+        self.lines = new_lines;
+        self.cursor_col = self.cursor_col.min(self.line_char_len(self.cursor_row));
+        self.mark_buffer_changed();
+        self.recompute_highlights();
+        self.ensure_cursor_col_visible();
+    }
+
+    /// VS Code's `files.trimFinalNewlines`, surfaced as a command: drop trailing
+    /// empty lines at the end of the buffer, always keeping at least one line.
+    /// Returns false (a no-op) when there are no trailing blank lines.
+    pub fn trim_final_newlines(&mut self) -> bool {
+        let mut end = self.lines.len();
+        while end > 1 && self.lines[end - 1].is_empty() {
+            end -= 1;
+        }
+        if end == self.lines.len() {
+            return false;
+        }
+        self.push_undo(EditKind::TrimFinalNewlines);
+        self.lines.truncate(end);
+        if self.cursor_row >= self.lines.len() {
+            self.cursor_row = self.lines.len() - 1;
+        }
+        self.cursor_col = self.cursor_col.min(self.line_char_len(self.cursor_row));
+        self.mark_buffer_changed();
+        self.recompute_highlights();
+        true
+    }
+
     /// VS Code "Add Cursor Below" (Cmd+Alt+Down): drop a secondary caret on
     /// the row below the lowest current caret, at the same column (clamped to
     /// that line's length). No-op at the last row.
@@ -3939,6 +4255,36 @@ fn char_byte(s: &str, char_idx: usize) -> usize {
 
 fn is_word_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
+}
+
+/// A `(row, char_col)` position of a bracket character, used by the bracket
+/// matching helpers.
+type BPos = (usize, usize);
+
+/// The bracket pairs croft matches, mirroring VS Code's default language
+/// brackets `()`, `[]`, `{}`.
+const BRACKET_PAIRS: [(char, char); 3] = [('(', ')'), ('[', ']'), ('{', '}')];
+
+fn is_open_bracket(c: char) -> bool {
+    BRACKET_PAIRS.iter().any(|&(o, _)| o == c)
+}
+
+fn is_close_bracket(c: char) -> bool {
+    BRACKET_PAIRS.iter().any(|&(_, cl)| cl == c)
+}
+
+fn matching_close(c: char) -> Option<char> {
+    BRACKET_PAIRS
+        .iter()
+        .find(|&&(o, _)| o == c)
+        .map(|&(_, cl)| cl)
+}
+
+fn matching_open(c: char) -> Option<char> {
+    BRACKET_PAIRS
+        .iter()
+        .find(|&&(_, cl)| cl == c)
+        .map(|&(o, _)| o)
 }
 
 /// Start char-indices of every whole-word, case-sensitive occurrence of
@@ -10315,5 +10661,181 @@ mod tests {
         assert!(e.wrap_enabled(), "markdown defaults to wrap on");
         e.toggle_wrap();
         assert!(!e.wrap_enabled());
+    }
+
+    // ---- Go to Bracket (editor.action.jumpToBracket) ----
+
+    #[test]
+    fn jump_to_bracket_from_open_moves_to_matching_close() {
+        let mut e = editor_with("foo(bar)baz");
+        e.cursor_row = 0;
+        e.cursor_col = 3; // immediately before the '('
+        assert!(e.jump_to_matching_bracket());
+        assert_eq!((e.cursor_row, e.cursor_col), (0, 7)); // start of ')'
+    }
+
+    #[test]
+    fn jump_to_bracket_from_close_moves_to_matching_open() {
+        let mut e = editor_with("foo(bar)baz");
+        e.cursor_row = 0;
+        e.cursor_col = 8; // immediately after the ')'
+        assert!(e.jump_to_matching_bracket());
+        assert_eq!((e.cursor_row, e.cursor_col), (0, 3)); // start of '('
+    }
+
+    #[test]
+    fn jump_to_bracket_from_inside_goes_to_enclosing_close() {
+        let mut e = editor_with("foo(bar)baz");
+        e.cursor_row = 0;
+        e.cursor_col = 5; // inside, between 'a' and 'r'
+        assert!(e.jump_to_matching_bracket());
+        assert_eq!((e.cursor_row, e.cursor_col), (0, 7)); // start of ')'
+    }
+
+    #[test]
+    fn jump_to_bracket_respects_nesting() {
+        let mut e = editor_with("(a(b)c)");
+        e.cursor_row = 0;
+        e.cursor_col = 0; // before the outer '('
+        assert!(e.jump_to_matching_bracket());
+        assert_eq!((e.cursor_row, e.cursor_col), (0, 6)); // outer ')'
+    }
+
+    #[test]
+    fn jump_to_bracket_works_across_lines() {
+        let mut e = editor_with("fn f() {\n    x\n}");
+        e.cursor_row = 0;
+        e.cursor_col = 7; // before the '{'
+        assert!(e.jump_to_matching_bracket());
+        assert_eq!((e.cursor_row, e.cursor_col), (2, 0)); // the '}'
+    }
+
+    #[test]
+    fn jump_to_bracket_noop_without_a_bracket() {
+        let mut e = editor_with("hello world");
+        e.cursor_row = 0;
+        e.cursor_col = 2;
+        assert!(!e.jump_to_matching_bracket());
+        assert_eq!((e.cursor_row, e.cursor_col), (0, 2));
+    }
+
+    // ---- Select to Bracket (editor.action.selectToBracket) ----
+
+    #[test]
+    fn select_to_bracket_includes_both_brackets() {
+        let mut e = editor_with("foo(bar)baz");
+        e.cursor_row = 0;
+        e.cursor_col = 3; // on the '('
+        assert!(e.select_to_matching_bracket());
+        assert_eq!(e.selection_text(), "(bar)");
+    }
+
+    #[test]
+    fn select_to_bracket_from_inside_selects_enclosing_pair() {
+        let mut e = editor_with("foo(bar)baz");
+        e.cursor_row = 0;
+        e.cursor_col = 5; // inside the parentheses
+        assert!(e.select_to_matching_bracket());
+        assert_eq!(e.selection_text(), "(bar)");
+    }
+
+    #[test]
+    fn select_to_bracket_spans_multiple_lines() {
+        let mut e = editor_with("fn f() {\n    x\n}");
+        e.cursor_row = 0;
+        e.cursor_col = 7; // on the '{'
+        assert!(e.select_to_matching_bracket());
+        assert_eq!(e.selection_text(), "{\n    x\n}");
+    }
+
+    // ---- Transpose Characters (editor.action.transpose) ----
+
+    #[test]
+    fn transpose_swaps_chars_around_cursor_and_advances() {
+        let mut e = editor_with("abcd");
+        e.cursor_row = 0;
+        e.cursor_col = 2; // between 'b' and 'c'
+        e.transpose_chars();
+        assert_eq!(e.lines, vec!["acbd"]);
+        assert_eq!((e.cursor_row, e.cursor_col), (0, 3));
+    }
+
+    #[test]
+    fn transpose_at_line_start_only_advances() {
+        let mut e = editor_with("abcd");
+        e.cursor_row = 0;
+        e.cursor_col = 0;
+        e.transpose_chars();
+        assert_eq!(e.lines, vec!["abcd"]);
+        assert_eq!((e.cursor_row, e.cursor_col), (0, 1));
+    }
+
+    #[test]
+    fn transpose_at_end_of_line_moves_char_across_break() {
+        let mut e = editor_with("ab\ncd");
+        e.cursor_row = 0;
+        e.cursor_col = 2; // end of "ab", not the last line
+        e.transpose_chars();
+        assert_eq!(e.lines, vec!["a", "bcd"]);
+        assert_eq!((e.cursor_row, e.cursor_col), (1, 1));
+    }
+
+    #[test]
+    fn transpose_at_end_of_final_line_is_noop() {
+        let mut e = editor_with("abc");
+        e.cursor_row = 0;
+        e.cursor_col = 3; // end of the only line
+        e.transpose_chars();
+        assert_eq!(e.lines, vec!["abc"]);
+        assert_eq!((e.cursor_row, e.cursor_col), (0, 3));
+    }
+
+    // ---- Convert Indentation to Spaces / Tabs ----
+
+    #[test]
+    fn indentation_to_spaces_converts_only_leading_tabs() {
+        let mut e = editor_with("\tfoo\n\t\tbar\nbaz\ta");
+        e.indentation_to_spaces();
+        assert_eq!(e.lines, vec!["    foo", "        bar", "baz\ta"]);
+    }
+
+    #[test]
+    fn indentation_to_tabs_converts_leading_space_groups() {
+        let mut e = editor_with("    foo\n      bar\nb  c");
+        e.indentation_to_tabs();
+        // 4 spaces -> 1 tab; 6 spaces -> 1 tab + 2 leftover; interior spaces stay.
+        assert_eq!(e.lines, vec!["\tfoo", "\t  bar", "b  c"]);
+    }
+
+    // ---- Trim Final Newlines (files.trimFinalNewlines) ----
+
+    #[test]
+    fn trim_final_newlines_removes_trailing_blank_lines() {
+        let mut e = editor_with("a\nb\n\n\n");
+        // editor_with drops the empty trailing element from `lines()`, so build
+        // the buffer explicitly with trailing blanks.
+        e.lines = vec![
+            String::from("a"),
+            String::from("b"),
+            String::new(),
+            String::new(),
+        ];
+        assert!(e.trim_final_newlines());
+        assert_eq!(e.lines, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn trim_final_newlines_keeps_at_least_one_line() {
+        let mut e = editor_with("");
+        e.lines = vec![String::new(), String::new(), String::new()];
+        assert!(e.trim_final_newlines());
+        assert_eq!(e.lines, vec![""]);
+    }
+
+    #[test]
+    fn trim_final_newlines_noop_when_no_trailing_blanks() {
+        let mut e = editor_with("a\nb");
+        assert!(!e.trim_final_newlines());
+        assert_eq!(e.lines, vec!["a", "b"]);
     }
 }

@@ -176,6 +176,14 @@ const CMD_RBRACKET_HEX: &str = "0x1b 0x5b 0x39 0x33 0x3b 0x39 0x75";
 /// macOS / iTerm2 menu item, so no NSUserKeyEquivalents relocation is needed.
 const CMD_BACKSLASH_KEY: &str = "0x5c-0x100000-0x2a";
 const CMD_BACKSLASH_HEX: &str = "0x1b 0x5b 0x39 0x32 0x3b 0x39 0x75";
+/// `Cmd+Shift+\` -> Go to Bracket (VS Code's `editor.action.jumpToBracket`,
+/// croft's `is_goto_bracket_key`). Same `\` key as Cmd+\ above but with Shift
+/// added to the modifier mask (Super 0x100000 | Shift 0x20000 = 0x120000).
+/// CSI-u `ESC [ 92 ; 10 u` (modifier byte 10 = 1 base + Shift(1) + Super(8)),
+/// which crossterm decodes to `Char('\\') + SHIFT | SUPER`. Not bound to any
+/// default macOS / iTerm2 menu item, so no NSUserKeyEquivalents relocation.
+const CMD_SHIFT_BACKSLASH_KEY: &str = "0x5c-0x120000-0x2a";
+const CMD_SHIFT_BACKSLASH_HEX: &str = "0x1b 0x5b 0x39 0x32 0x3b 0x31 0x30 0x75";
 /// `Cmd+Opt+Left` / `Cmd+Opt+Right` -> move focus to the left / right
 /// editor group while split (croft's `is_focus_group_left_key` /
 /// `is_focus_group_right_key`). Arrows use the 2-part function-key form
@@ -379,6 +387,7 @@ pub(crate) mod payloads {
     pub(crate) const CMD_A_HEX: &str = super::CMD_A_HEX;
     pub(crate) const CMD_B_HEX: &str = super::CMD_B_HEX;
     pub(crate) const CMD_BACKSLASH_HEX: &str = super::CMD_BACKSLASH_HEX;
+    pub(crate) const CMD_SHIFT_BACKSLASH_HEX: &str = super::CMD_SHIFT_BACKSLASH_HEX;
     pub(crate) const CMD_C_HEX: &str = super::CMD_C_HEX;
     pub(crate) const CMD_D_HEX: &str = super::CMD_D_HEX;
     pub(crate) const CMD_DIGIT_CHORDS: &[(&str, &str)] = super::CMD_DIGIT_CHORDS;
@@ -647,6 +656,7 @@ pub fn apply_croft_key_settings(plist: &mut Value) -> Result<(), ITerm2Error> {
         (CTRL_SHIFT_F12_KEY, CTRL_SHIFT_F12_HEX),
         (CMD_B_KEY, CMD_B_HEX),
         (CMD_BACKSLASH_KEY, CMD_BACKSLASH_HEX),
+        (CMD_SHIFT_BACKSLASH_KEY, CMD_SHIFT_BACKSLASH_HEX),
         (CMD_OPT_LEFT_KEY, CMD_OPT_LEFT_HEX),
         (CMD_OPT_RIGHT_KEY, CMD_OPT_RIGHT_HEX),
         (CMD_OPT_UP_KEY, CMD_OPT_UP_HEX),
@@ -1022,6 +1032,19 @@ mod tests {
                 .and_then(|v| v.as_string()),
             Some(USE_SELECTION_FOR_FIND_MENU_EQUIV),
             "iTerm2's Use Selection for Find must be relocated off bare Cmd+E so croft's vim-mode toggle can claim the chord; @~e = Cmd+Opt+E keeps the find-from-selection action reachable on a chord croft does not use"
+        );
+    }
+
+    #[test]
+    fn apply_croft_key_settings_forwards_cmd_shift_backslash_for_go_to_bracket() {
+        let mut plist = synth_plist("GUID-1", &["GUID-1"]);
+        apply_croft_key_settings(&mut plist).unwrap();
+        let top = plist.as_dictionary().unwrap();
+        let global = dict_in(top, "GlobalKeyMap");
+        assert_eq!(
+            action_text(global, CMD_SHIFT_BACKSLASH_KEY),
+            CMD_SHIFT_BACKSLASH_HEX,
+            "GlobalKeyMap must forward Cmd+Shift+\\ as a CSI-u sequence so croft's `is_goto_bracket_key` fires and jumps to the matching bracket (VS Code editor.action.jumpToBracket). Without it the chord never reaches croft and Go to Bracket is only reachable from the Command Palette"
         );
     }
 

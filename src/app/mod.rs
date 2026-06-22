@@ -10667,6 +10667,14 @@ impl App {
             }
             return;
         }
+        // VS Code "Go to Bracket" (Cmd+Shift+\): jump the cursor to the
+        // matching bracket. Also reachable from the Command Palette.
+        if is_goto_bracket_key(key) {
+            if self.editor_is_text() {
+                self.editor.jump_to_matching_bracket();
+            }
+            return;
+        }
         // Go to Definition (F12) / References (Shift+F12) / Type Definition
         // (Ctrl+F12) / Implementations (Cmd+F12) / Declaration (Ctrl+Shift+F12),
         // the VS Code F12-family bindings, also need a real text buffer. All are
@@ -13166,6 +13174,30 @@ impl App {
             }
             Cmd::AddCursorAbove => self.editor.add_cursor_above(),
             Cmd::AddCursorBelow => self.editor.add_cursor_below(),
+            Cmd::JumpToBracket => {
+                if !self.editor.jump_to_matching_bracket() {
+                    self.status = String::from("Go to Bracket: no matching bracket");
+                }
+            }
+            Cmd::SelectToBracket => {
+                if !self.editor.select_to_matching_bracket() {
+                    self.status = String::from("Select to Bracket: no matching bracket");
+                }
+            }
+            Cmd::TransposeCharacters => self.editor.transpose_chars(),
+            Cmd::IndentationToSpaces => {
+                self.editor.indentation_to_spaces();
+                self.status = String::from("Converted indentation to spaces");
+            }
+            Cmd::IndentationToTabs => {
+                self.editor.indentation_to_tabs();
+                self.status = String::from("Converted indentation to tabs");
+            }
+            Cmd::TrimFinalNewlines => {
+                if self.editor.trim_final_newlines() {
+                    self.status = String::from("Trimmed final newlines");
+                }
+            }
             Cmd::SaveFile => self.save(),
             Cmd::CloseEditor => {
                 if self.editor.close_active() {
@@ -17472,6 +17504,17 @@ fn is_editor_split_key(key: KeyEvent) -> bool {
     // shadows the shell's SIGQUIT there, the accepted cost of Ctrl parity).
     has_cmd(key.modifiers)
         && !key.modifiers.contains(KeyModifiers::SHIFT)
+        && !key.modifiers.contains(KeyModifiers::ALT)
+}
+
+/// `Cmd+Shift+\`: Go to Bracket (VS Code's `editor.action.jumpToBracket`). The
+/// same `\` key as the split chord but with Shift, so the two are disjoint.
+fn is_goto_bracket_key(key: KeyEvent) -> bool {
+    let KeyCode::Char('\\') = key.code else {
+        return false;
+    };
+    has_cmd(key.modifiers)
+        && key.modifiers.contains(KeyModifiers::SHIFT)
         && !key.modifiers.contains(KeyModifiers::ALT)
 }
 

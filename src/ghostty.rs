@@ -87,6 +87,8 @@ const CHORDS: &[(&str, &str)] = &[
     ("ctrl+shift+j", pl::CTRL_SHIFT_J_HEX),
     // Editor: split, focus group, LSP navigation.
     ("cmd+\\", pl::CMD_BACKSLASH_HEX),
+    // Go to Bracket (VS Code editor.action.jumpToBracket).
+    ("cmd+shift+\\", pl::CMD_SHIFT_BACKSLASH_HEX),
     ("cmd+alt+arrow_left", pl::CMD_OPT_LEFT_HEX),
     ("cmd+alt+arrow_right", pl::CMD_OPT_RIGHT_HEX),
     // Multi-cursor: add cursor above / below.
@@ -234,6 +236,8 @@ mod tests {
         assert!(block.contains("keybind = cmd+5=csi:53;9u"));
         // The backslash trigger survives literally.
         assert!(block.contains("keybind = cmd+\\=csi:92;9u"));
+        // Go to Bracket: same '\' key with Shift (modifier byte 10).
+        assert!(block.contains("keybind = cmd+shift+\\=csi:92;10u"));
     }
 
     #[test]
