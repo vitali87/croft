@@ -1246,8 +1246,6 @@ pub enum RecentCommitsError {
     NoEndpoint,
 }
 
-const RECENT_COMMITS_FETCH_ATTEMPTS: u32 = 3;
-
 pub fn fetch_croft_recent_commits_full(
     timeout: std::time::Duration,
 ) -> (RecentCommits, RecentCommitsError) {
@@ -1262,27 +1260,31 @@ pub fn fetch_croft_recent_commits_full(
         );
     };
     let now = current_unix_seconds();
-    for _ in 0..RECENT_COMMITS_FETCH_ATTEMPTS {
-        if let Ok(commits) = fetch_recent_commits_via_clone(&https_url, 5, timeout) {
-            return (
-                RecentCommits {
-                    remote,
-                    commits: commits
-                        .into_iter()
-                        .map(|c| commit_info_from_log(c, now))
-                        .collect(),
-                },
-                RecentCommitsError::None,
-            );
-        }
+    // EXACTLY ONE clone attempt: never retry a Codeberg request. A retry loop
+    // here turns a single rate-limit (HTTP 429) into a self-amplifying storm,
+    // each retry spending another request against the same limit and spawning
+    // another `git clone` process. On failure the welcome panel just shows
+    // "recent commits unavailable"; recency is best-effort, not worth hammering
+    // the host for.
+    match fetch_recent_commits_via_clone(&https_url, 5, timeout) {
+        Ok(commits) => (
+            RecentCommits {
+                remote,
+                commits: commits
+                    .into_iter()
+                    .map(|c| commit_info_from_log(c, now))
+                    .collect(),
+            },
+            RecentCommitsError::None,
+        ),
+        Err(_) => (
+            RecentCommits {
+                remote,
+                commits: Vec::new(),
+            },
+            RecentCommitsError::Network,
+        ),
     }
-    (
-        RecentCommits {
-            remote,
-            commits: Vec::new(),
-        },
-        RecentCommitsError::Network,
-    )
 }
 
 /// One row from `git log --pretty=...`. `committer_unix` is seconds since
