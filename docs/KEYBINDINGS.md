@@ -41,13 +41,9 @@ On macOS, the `Cmd` chords below only reach croft after you run a one-time setup
 | Transform to Uppercase / Lowercase / Title Case | Re-case the selection, or the word under the cursor when nothing is selected |
 | Sort Lines Ascending / Descending | Sort the selected lines (or the whole file when nothing is selected) lexicographically |
 | Trim Trailing Whitespace | Strip trailing spaces and tabs from every line |
-| Go to Bracket | Jump the cursor to the matching bracket (also `Cmd+Shift+\`) |
-| Select to Bracket | Select the region between the matching brackets, including the brackets themselves |
-| Transpose Characters around the Cursor | Swap the character before the cursor with the one after it and step right; at the end of a line the last character moves across the line break |
-| Convert Indentation to Spaces | Replace each tab in every line's leading indentation with one tab width of spaces (4, or 2 in YAML) |
-| Convert Indentation to Tabs | Replace each leading run of one tab width of spaces with a tab, leaving any remainder |
-| Trim Final Newlines | Drop trailing blank lines at the end of the file (always keeping at least one line) |
 | Debug: Attach to Python Process | Pick a running CPython 3.14+ process and drop a `pdb` REPL into it (PEP 768 `sys.remote_exec`); the debugger runs in a croft terminal, elevating with `sudo` when the OS requires it |
+
+The bracket / character / indentation commands (Go to Bracket, Select to Bracket, Transpose Characters, Convert Indentation to Spaces / Tabs, Trim Final Newlines) all carry their own chords, listed under [Editor: text](#editor-text).
 
 ## Explorer (file tree)
 
@@ -128,6 +124,11 @@ On macOS, the `Cmd` chords below only reach croft after you run a one-time setup
 | `Shift`+`Alt`+`A` | Toggle block comment around the selection (languages with a block comment) |
 | `Alt`+`Z` | Toggle soft word wrap for this file (overrides the per-language default until the file is reopened) |
 | `Cmd`+`Shift`+`\` | Go to Bracket: jump the cursor to the matching bracket. From an opening bracket it lands on its close (and vice versa); from inside a pair it lands on the enclosing close |
+| `Cmd`+`Opt`+`\` | Select to Bracket: select the region between the matching brackets, including the brackets themselves |
+| `Ctrl`+`T` | Transpose Characters: swap the character before the cursor with the one after it and step right; at the end of a line the last character moves across the line break |
+| `Cmd`+`Opt`+`Shift`+`S` | Convert Indentation to Spaces: replace each tab in every line's leading indentation with one tab width of spaces (4, or 2 in YAML) |
+| `Cmd`+`Opt`+`Shift`+`T` | Convert Indentation to Tabs: replace each leading run of one tab width of spaces with a tab, leaving any remainder |
+| `Cmd`+`Opt`+`Shift`+`N` | Trim Final Newlines: drop trailing blank lines at the end of the file (always keeping at least one line) |
 | Mouse drag | Select text; every other occurrence of a single-line selection highlights in blue |
 | `Ctrl`+`C` / `Cmd`+`C` | Copy the selection to the system clipboard |
 | `Ctrl`+`X` / `Cmd`+`X` | Cut the selection |
@@ -281,6 +282,9 @@ Disabling takes effect immediately for the viewers and Vim (a disabled PDF/CSV v
 | `⌘B` | Toggle the primary side bar |
 | `⌘\` | Split the editor |
 | `⌘⇧\` | Go to Bracket (jump to the matching bracket) |
+| `⌘⌥\` | Select to Bracket |
+| `⌘⌥⇧S` / `⌘⌥⇧T` | Convert Indentation to Spaces / Tabs |
+| `⌘⌥⇧N` | Trim Final Newlines |
 | `⌥⌘←` / `⌥⌘→` | Focus the left / right editor group |
 | `⌘F12` | Go to Implementations |
 | `⌃⇧F12` | Go to Declaration |

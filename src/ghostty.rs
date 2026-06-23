@@ -89,6 +89,12 @@ const CHORDS: &[(&str, &str)] = &[
     ("cmd+\\", pl::CMD_BACKSLASH_HEX),
     // Go to Bracket (VS Code editor.action.jumpToBracket).
     ("cmd+shift+\\", pl::CMD_SHIFT_BACKSLASH_HEX),
+    // Select to Bracket (editor.action.selectToBracket).
+    ("cmd+alt+\\", pl::CMD_OPT_BACKSLASH_HEX),
+    // Convert Indentation to Spaces / Tabs, Trim Final Newlines.
+    ("cmd+alt+shift+s", pl::CMD_OPT_SHIFT_S_HEX),
+    ("cmd+alt+shift+t", pl::CMD_OPT_SHIFT_T_HEX),
+    ("cmd+alt+shift+n", pl::CMD_OPT_SHIFT_N_HEX),
     ("cmd+alt+arrow_left", pl::CMD_OPT_LEFT_HEX),
     ("cmd+alt+arrow_right", pl::CMD_OPT_RIGHT_HEX),
     // Multi-cursor: add cursor above / below.

@@ -184,6 +184,24 @@ const CMD_BACKSLASH_HEX: &str = "0x1b 0x5b 0x39 0x32 0x3b 0x39 0x75";
 /// default macOS / iTerm2 menu item, so no NSUserKeyEquivalents relocation.
 const CMD_SHIFT_BACKSLASH_KEY: &str = "0x5c-0x120000-0x2a";
 const CMD_SHIFT_BACKSLASH_HEX: &str = "0x1b 0x5b 0x39 0x32 0x3b 0x31 0x30 0x75";
+/// `Cmd+Opt+\` -> Select to Bracket (VS Code's `editor.action.selectToBracket`,
+/// croft's `is_select_to_bracket_key`). The `\` key with Cmd+Opt (Super
+/// 0x100000 | Alt 0x80000 = 0x180000). CSI-u `ESC [ 92 ; 11 u` (modifier byte
+/// 11 = 1 base + Alt(2) + Super(8)) -> `Char('\\') + ALT | SUPER`.
+const CMD_OPT_BACKSLASH_KEY: &str = "0x5c-0x180000-0x2a";
+const CMD_OPT_BACKSLASH_HEX: &str = "0x1b 0x5b 0x39 0x32 0x3b 0x31 0x31 0x75";
+/// `Cmd+Opt+Shift+<letter>` for editor commands VS Code leaves unbound, so
+/// croft binds them (tenet: everything has a shortcut). Modifier mask Super
+/// 0x100000 | Alt 0x80000 | Shift 0x20000 = 0x1a0000; CSI-u modifier byte 12 =
+/// 1 base + Shift(1) + Alt(2) + Super(8), which crossterm decodes to
+/// `Char + SHIFT | ALT | SUPER`. `S` = Convert Indentation to Spaces, `T` =
+/// Convert Indentation to Tabs, `N` = Trim Final Newlines.
+const CMD_OPT_SHIFT_S_KEY: &str = "0x53-0x1a0000-0x1";
+const CMD_OPT_SHIFT_S_HEX: &str = "0x1b 0x5b 0x38 0x33 0x3b 0x31 0x32 0x75";
+const CMD_OPT_SHIFT_T_KEY: &str = "0x54-0x1a0000-0x11";
+const CMD_OPT_SHIFT_T_HEX: &str = "0x1b 0x5b 0x38 0x34 0x3b 0x31 0x32 0x75";
+const CMD_OPT_SHIFT_N_KEY: &str = "0x4e-0x1a0000-0x2d";
+const CMD_OPT_SHIFT_N_HEX: &str = "0x1b 0x5b 0x37 0x38 0x3b 0x31 0x32 0x75";
 /// `Cmd+Opt+Left` / `Cmd+Opt+Right` -> move focus to the left / right
 /// editor group while split (croft's `is_focus_group_left_key` /
 /// `is_focus_group_right_key`). Arrows use the 2-part function-key form
@@ -388,6 +406,10 @@ pub(crate) mod payloads {
     pub(crate) const CMD_B_HEX: &str = super::CMD_B_HEX;
     pub(crate) const CMD_BACKSLASH_HEX: &str = super::CMD_BACKSLASH_HEX;
     pub(crate) const CMD_SHIFT_BACKSLASH_HEX: &str = super::CMD_SHIFT_BACKSLASH_HEX;
+    pub(crate) const CMD_OPT_BACKSLASH_HEX: &str = super::CMD_OPT_BACKSLASH_HEX;
+    pub(crate) const CMD_OPT_SHIFT_S_HEX: &str = super::CMD_OPT_SHIFT_S_HEX;
+    pub(crate) const CMD_OPT_SHIFT_T_HEX: &str = super::CMD_OPT_SHIFT_T_HEX;
+    pub(crate) const CMD_OPT_SHIFT_N_HEX: &str = super::CMD_OPT_SHIFT_N_HEX;
     pub(crate) const CMD_C_HEX: &str = super::CMD_C_HEX;
     pub(crate) const CMD_D_HEX: &str = super::CMD_D_HEX;
     pub(crate) const CMD_DIGIT_CHORDS: &[(&str, &str)] = super::CMD_DIGIT_CHORDS;
@@ -657,6 +679,10 @@ pub fn apply_croft_key_settings(plist: &mut Value) -> Result<(), ITerm2Error> {
         (CMD_B_KEY, CMD_B_HEX),
         (CMD_BACKSLASH_KEY, CMD_BACKSLASH_HEX),
         (CMD_SHIFT_BACKSLASH_KEY, CMD_SHIFT_BACKSLASH_HEX),
+        (CMD_OPT_BACKSLASH_KEY, CMD_OPT_BACKSLASH_HEX),
+        (CMD_OPT_SHIFT_S_KEY, CMD_OPT_SHIFT_S_HEX),
+        (CMD_OPT_SHIFT_T_KEY, CMD_OPT_SHIFT_T_HEX),
+        (CMD_OPT_SHIFT_N_KEY, CMD_OPT_SHIFT_N_HEX),
         (CMD_OPT_LEFT_KEY, CMD_OPT_LEFT_HEX),
         (CMD_OPT_RIGHT_KEY, CMD_OPT_RIGHT_HEX),
         (CMD_OPT_UP_KEY, CMD_OPT_UP_HEX),
@@ -1046,6 +1072,42 @@ mod tests {
             CMD_SHIFT_BACKSLASH_HEX,
             "GlobalKeyMap must forward Cmd+Shift+\\ as a CSI-u sequence so croft's `is_goto_bracket_key` fires and jumps to the matching bracket (VS Code editor.action.jumpToBracket). Without it the chord never reaches croft and Go to Bracket is only reachable from the Command Palette"
         );
+    }
+
+    #[test]
+    fn apply_croft_key_settings_forwards_the_new_editor_command_chords() {
+        let mut plist = synth_plist("GUID-1", &["GUID-1"]);
+        apply_croft_key_settings(&mut plist).unwrap();
+        let top = plist.as_dictionary().unwrap();
+        let global = dict_in(top, "GlobalKeyMap");
+        for (key, hex, label) in [
+            (
+                CMD_OPT_BACKSLASH_KEY,
+                CMD_OPT_BACKSLASH_HEX,
+                "Cmd+Opt+\\ Select to Bracket",
+            ),
+            (
+                CMD_OPT_SHIFT_S_KEY,
+                CMD_OPT_SHIFT_S_HEX,
+                "Cmd+Opt+Shift+S Convert Indentation to Spaces",
+            ),
+            (
+                CMD_OPT_SHIFT_T_KEY,
+                CMD_OPT_SHIFT_T_HEX,
+                "Cmd+Opt+Shift+T Convert Indentation to Tabs",
+            ),
+            (
+                CMD_OPT_SHIFT_N_KEY,
+                CMD_OPT_SHIFT_N_HEX,
+                "Cmd+Opt+Shift+N Trim Final Newlines",
+            ),
+        ] {
+            assert_eq!(
+                action_text(global, key),
+                hex,
+                "GlobalKeyMap must forward {label} as a CSI-u sequence so the palette command also has a working chord, honoring croft's tenet that every action has a shortcut. Without it the chord never reaches croft and the command is palette-only"
+            );
+        }
     }
 
     #[test]

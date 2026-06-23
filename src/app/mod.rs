@@ -10675,6 +10675,44 @@ impl App {
             }
             return;
         }
+        // VS Code "Select to Bracket" (Cmd+Opt+\): select the region between
+        // the matching brackets, including the brackets.
+        if is_select_to_bracket_key(key) {
+            if self.editor_is_text() {
+                self.editor.select_to_matching_bracket();
+            }
+            return;
+        }
+        // VS Code "Transpose Characters around the Cursor" (Ctrl+T).
+        if is_transpose_key(key) {
+            if self.editor_is_text() {
+                self.editor.transpose_chars();
+            }
+            return;
+        }
+        // VS Code "Convert Indentation to Spaces" (Cmd+Opt+Shift+S).
+        if is_indentation_to_spaces_key(key) {
+            if self.editor_is_text() {
+                self.editor.indentation_to_spaces();
+                self.status = String::from("Converted indentation to spaces");
+            }
+            return;
+        }
+        // VS Code "Convert Indentation to Tabs" (Cmd+Opt+Shift+T).
+        if is_indentation_to_tabs_key(key) {
+            if self.editor_is_text() {
+                self.editor.indentation_to_tabs();
+                self.status = String::from("Converted indentation to tabs");
+            }
+            return;
+        }
+        // VS Code's `files.trimFinalNewlines`, as a command (Cmd+Opt+Shift+N).
+        if is_trim_final_newlines_key(key) {
+            if self.editor_is_text() && self.editor.trim_final_newlines() {
+                self.status = String::from("Trimmed final newlines");
+            }
+            return;
+        }
         // Go to Definition (F12) / References (Shift+F12) / Type Definition
         // (Ctrl+F12) / Implementations (Cmd+F12) / Declaration (Ctrl+Shift+F12),
         // the VS Code F12-family bindings, also need a real text buffer. All are
@@ -17516,6 +17554,71 @@ fn is_goto_bracket_key(key: KeyEvent) -> bool {
     has_cmd(key.modifiers)
         && key.modifiers.contains(KeyModifiers::SHIFT)
         && !key.modifiers.contains(KeyModifiers::ALT)
+}
+
+/// `Cmd+Opt+\`: Select to Bracket (VS Code's `editor.action.selectToBracket`).
+/// The `\` bracket-family key with Opt (not Shift), disjoint from the split
+/// chord (`Cmd+\`) and Go to Bracket (`Cmd+Shift+\`).
+fn is_select_to_bracket_key(key: KeyEvent) -> bool {
+    let KeyCode::Char('\\') = key.code else {
+        return false;
+    };
+    has_cmd(key.modifiers)
+        && key.modifiers.contains(KeyModifiers::ALT)
+        && !key.modifiers.contains(KeyModifiers::SHIFT)
+}
+
+/// `Ctrl+T`: Transpose Characters around the Cursor (VS Code's
+/// `editor.action.transpose`). A raw control byte, so it needs no iTerm2 /
+/// Ghostty forwarder; the editor intercepts it only when focused, leaving the
+/// shell's own `Ctrl+T` intact when the terminal is focused.
+fn is_transpose_key(key: KeyEvent) -> bool {
+    let KeyCode::Char(c) = key.code else {
+        return false;
+    };
+    if !c.eq_ignore_ascii_case(&'t') {
+        return false;
+    }
+    key.modifiers.contains(KeyModifiers::CONTROL)
+        && !key.modifiers.contains(KeyModifiers::SUPER)
+        && !key.modifiers.contains(KeyModifiers::ALT)
+        && !key.modifiers.contains(KeyModifiers::SHIFT)
+}
+
+/// `Cmd+Opt+Shift+S`: Convert Indentation to Spaces
+/// (`editor.action.indentationToSpaces`).
+fn is_indentation_to_spaces_key(key: KeyEvent) -> bool {
+    is_cmd_alt_shift_letter(key, 's')
+}
+
+/// `Cmd+Opt+Shift+T`: Convert Indentation to Tabs
+/// (`editor.action.indentationToTabs`).
+fn is_indentation_to_tabs_key(key: KeyEvent) -> bool {
+    is_cmd_alt_shift_letter(key, 't')
+}
+
+/// `Cmd+Opt+Shift+N`: Trim Final Newlines (VS Code's `files.trimFinalNewlines`
+/// surfaced as a command).
+fn is_trim_final_newlines_key(key: KeyEvent) -> bool {
+    is_cmd_alt_shift_letter(key, 'n')
+}
+
+/// True for `Cmd+Opt+Shift+<letter>` (or `Ctrl+Opt+Shift+<letter>` on Termux):
+/// the three-modifier sibling of [`is_cmd_shift_letter`], used for editor
+/// commands VS Code leaves unbound so croft can still honor "everything has a
+/// shortcut" without colliding with the two-modifier `Cmd+Shift+<letter>` set.
+fn is_cmd_alt_shift_letter(key: KeyEvent, letter: char) -> bool {
+    let KeyCode::Char(c) = key.code else {
+        return false;
+    };
+    if !c.eq_ignore_ascii_case(&letter) {
+        return false;
+    }
+    let has_shift = key.modifiers.contains(KeyModifiers::SHIFT);
+    let has_alt = key.modifiers.contains(KeyModifiers::ALT);
+    let has_cmd_or_ctrl = key.modifiers.contains(KeyModifiers::CONTROL)
+        || key.modifiers.contains(KeyModifiers::SUPER);
+    has_shift && has_alt && has_cmd_or_ctrl
 }
 
 /// `Cmd+Opt+Left`: move keyboard focus to the LEFT editor group while
