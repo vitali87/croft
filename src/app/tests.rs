@@ -9886,25 +9886,32 @@ fn relay_test_lock() -> &'static std::sync::Mutex<()> {
     LOCK.get_or_init(|| std::sync::Mutex::new(()))
 }
 
-/// Point `$HOME` (hence `croft_cache_dir`, hence the relay dir) at a temp dir
-/// for the duration of `body`, restoring the prior value afterwards. The relay
-/// dir is now derived from `$HOME/.cache/croft` + a hash of the workspace, so a
-/// relay test controls the rendezvous by controlling `$HOME` rather than by
-/// injecting the old `CROFT_DROP_RELAY_*` env. Serialized by `relay_test_lock`.
+/// Point `$HOME` (hence `croft_cache_dir`) at a temp dir and set a fixed
+/// `CROFT_RELAY_KEY` for the duration of `body`, restoring prior values after.
+/// The relay dir is `$HOME/.cache/croft/relay-<CROFT_RELAY_KEY>`, so a relay
+/// test controls the rendezvous by controlling those two env vars rather than
+/// injecting the old per-connection `CROFT_DROP_RELAY_*` paths. Serialized by
+/// `relay_test_lock`.
+const TEST_RELAY_KEY: &str = "0123456789abcdef";
+
 fn with_relay_home<T>(home: &std::path::Path, body: impl FnOnce() -> T) -> T {
-    let prev = std::env::var_os("HOME");
+    let prev_home = std::env::var_os("HOME");
+    let prev_key = std::env::var_os("CROFT_RELAY_KEY");
     // SAFETY: relay tests hold relay_test_lock, serializing env mutation.
     unsafe {
         std::env::set_var("HOME", home);
-        std::env::set_var("CROFT_REMOTE_AUTOUPDATE", "1");
+        std::env::set_var("CROFT_RELAY_KEY", TEST_RELAY_KEY);
     }
     let out = body();
     unsafe {
-        match prev {
+        match prev_home {
             Some(h) => std::env::set_var("HOME", h),
             None => std::env::remove_var("HOME"),
         }
-        std::env::remove_var("CROFT_REMOTE_AUTOUPDATE");
+        match prev_key {
+            Some(k) => std::env::set_var("CROFT_RELAY_KEY", k),
+            None => std::env::remove_var("CROFT_RELAY_KEY"),
+        }
     }
     out
 }

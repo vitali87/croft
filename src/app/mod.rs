@@ -12335,24 +12335,28 @@ impl App {
     }
 
     /// True when this croft is a remote-launched session whose local parent is
-    /// running a drop pump. Gated on the constant `CROFT_REMOTE_AUTOUPDATE`
-    /// marker (exported only by a `croft remote` parent, never a manual
-    /// `ssh host; croft`) plus a derivable relay dir. The marker is a
-    /// freeze-safe boolean: unlike the old `CROFT_DROP_RELAY_*` path env, it
-    /// never goes stale across a dtach reattach or a self-re-exec, because the
-    /// relay dir itself is recomputed from `workspace_root` every time.
+    /// running a drop pump. Gated on `CROFT_RELAY_KEY`, set only by a `croft
+    /// remote` launch command. The key is the deterministic `hash(launch arg)`
+    /// shared with the local pump; because it's deterministic, dtach freezing it
+    /// at first launch is harmless — every reconnect recomputes the same value,
+    /// so the running croft and a fresh pump always agree on one relay dir. A
+    /// session predating this var (an old long-lived dtach session) simply has
+    /// no key and reports the relay unavailable rather than timing out.
     fn drop_relay_active(&self) -> bool {
-        std::env::var_os("CROFT_REMOTE_AUTOUPDATE").is_some() && self.relay_dir().is_some()
+        self.relay_dir().is_some()
     }
 
-    /// `$HOME/.cache/croft/relay-<hash(canonical workspace)>/` on this remote
-    /// box. Both this remote croft and the local drop-pump derive the id from
-    /// the same canonical workspace path, so the rendezvous is stable across
-    /// local restarts, dtach reattaches, and the F9 self-re-exec. `None` only
-    /// if HOME or the workspace path isn't representable as UTF-8.
+    /// `$HOME/.cache/croft/relay-<CROFT_RELAY_KEY>/` on this remote box. The key
+    /// is `hash(launch arg)` — the same id the dtach socket uses — computed by
+    /// the local launcher and the local pump and carried here in env. Keying on
+    /// the launch identity (not `workspace_root`) keeps the rendezvous stable
+    /// across an in-session workspace change and the F9 self-re-exec, both of
+    /// which move `workspace_root` away from where the pump's `pwd` lands.
+    /// `None` when no `CROFT_RELAY_KEY` is set (not a relay-capable session).
     fn relay_dir(&self) -> Option<PathBuf> {
-        let ws = self.workspace_root.to_str()?;
-        let id = crate::remote::relay_session_id(ws);
+        let id = std::env::var("CROFT_RELAY_KEY")
+            .ok()
+            .filter(|s| !s.is_empty())?;
         Some(croft_cache_dir().join(format!("relay-{id}")))
     }
 

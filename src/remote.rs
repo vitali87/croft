@@ -334,18 +334,28 @@ fn run_croft_session(
     persistent: bool,
 ) -> Result<RemoteOutcome> {
     let mut bootstrapped = false;
+    // The relay rendezvous is keyed on the launch identity — the very same
+    // `hash(launch arg)` the dtach socket uses — NOT the remote croft's
+    // `workspace_root`. The workspace diverges from the launch identity (a
+    // no-path launch opens the login dir, but the user may then open a
+    // subfolder, and that opened root is also preserved across the F9 re-exec),
+    // so a workspace-keyed relay desynced the moment the opened folder differed
+    // from where the pump's `pwd` lands. The key is deterministic, so carrying
+    // it in env is freeze-safe: dtach freezes it at first launch, but every
+    // reconnect recomputes the identical value, so the running croft and a fresh
+    // pump always agree on one log. (The original bug was the id being *random*,
+    // not its being in env.)
+    let relay_id = relay_session_id(path.unwrap_or(""));
     loop {
-        let pump = match DropPump::start(&ssh, path) {
+        let pump = match DropPump::start(&ssh, &relay_id) {
             Ok(p) => Some(p),
             Err(e) => {
                 eprintln!("Drag-drop relay disabled: {e}");
                 None
             }
         };
-        // No relay env is carried into the remote croft: it derives the relay
-        // dir from its own workspace identity (see `App::relay_dir`), so a dtach
-        // reattach can never hand it a stale path.
-        let status = run_remote_croft(&ssh, path, &[])?;
+        let env = vec![(String::from("CROFT_RELAY_KEY"), relay_id.clone())];
+        let status = run_remote_croft(&ssh, path, &env)?;
         match classify_remote_status(status.code()) {
             RemoteStatusClass::ReturnToLocal => return Ok(RemoteOutcome::ReturnToLocal),
             RemoteStatusClass::Exited => return Ok(RemoteOutcome::Exited),
@@ -693,19 +703,14 @@ struct DropPump {
 }
 
 impl DropPump {
-    fn start(ssh: &SshControl, path: Option<&str>) -> Result<Self> {
-        // Key the relay dir on the canonical remote workspace path, the same
-        // value the remote croft hashes from its own `workspace_root` (see
-        // `App::relay_dir`). Nothing relay-related is carried in launch env:
-        // dtach freezes the remote croft's env at first launch, so an env-borne
-        // path went stale on every reconnect/upgrade. Both sides instead
-        // recompute the one dir from a stable identity and always agree.
-        let canonical = remote_canonical_workspace(ssh, path)?;
-        let id = relay_session_id(&canonical);
-        // Resolve $HOME on the remote and capture the literal absolute relay
-        // paths so the tail and the .ok/.err sentinels all agree on one
-        // location. The remote croft creates this dir lazily too, so `tail -F`
-        // tolerates it not existing yet.
+    fn start(ssh: &SshControl, relay_id: &str) -> Result<Self> {
+        // `relay_id` is the deterministic `hash(launch arg)` shared with the
+        // remote croft via `CROFT_RELAY_KEY` (see `run_croft_session` and
+        // `App::relay_dir`). Resolve $HOME on the remote and capture the literal
+        // absolute relay paths so the tail and the .ok/.err sentinels all agree
+        // on one location. The remote croft creates this dir lazily too, so
+        // `tail -F` tolerates it not existing yet.
+        let id = relay_id;
         let resolve = format!(
             "set -e; \
              RELAY=\"$HOME/.cache/croft/relay-{id}\"; \
@@ -1208,54 +1213,27 @@ fn write_relay_err(host: &str, socket: &Path, inbox_dir: &str, request_id: &str,
         .status();
 }
 
-/// Stable name for the drop-relay directory, keyed on the CANONICAL workspace
-/// path, exactly like [`dtach_socket_path`] keys the session socket. Both the
-/// local drop-pump and the remote croft compute this from the same canonical
-/// path, so the two sides always agree on one `requests.log` no matter how many
-/// times the connection drops and reattaches.
+/// Stable id for the drop-relay directory, keyed on the launch arg — the exact
+/// same `hash(launch arg)` that [`dtach_socket_path`] uses for the session
+/// socket (so `relay-<id>` and `sessions/<id>.sock` share one id). The local
+/// pump and the local launcher both compute it from the connection's launch
+/// arg, and the launcher carries it to the long-lived remote croft as the
+/// deterministic `CROFT_RELAY_KEY` env var (see `App::relay_dir`).
 ///
-/// The earlier scheme minted a fresh `pid-nanos` id per connection. Because
-/// `dtach -A` reattaches the *already-running* remote croft (whose relay
-/// location was fixed at first launch), a new id on reconnect made the local
-/// pump tail a different log than the one the reattached croft writes to, and
-/// every drop silently vanished — plus it littered `~/.cache/croft` with one
-/// orphan `relay-*` dir per connection. Keying on the canonical workspace path
-/// is also stable across the F9 self-re-exec: the re-exec relaunches with the
-/// canonical path as argv, and `canonicalize` of an already-canonical path is a
-/// fixed point, so the id never moves. `DefaultHasher` has fixed SipHash keys,
-/// so the value is deterministic across croft processes.
-pub(crate) fn relay_session_id(canonical_workspace: &str) -> String {
+/// Two earlier schemes were wrong. A `pid-nanos` random id desynced on every
+/// reconnect, because `dtach -A` reattaches the *already-running* croft whose
+/// relay env froze at first launch while the pump minted a fresh id. Keying on
+/// the croft's `workspace_root` desynced whenever the opened folder differed
+/// from the launch identity — a no-path launch opens the login dir, the user
+/// then opens a subfolder, and the pump (which only knows the launch arg) can't
+/// see that divergence. The launch arg is the one identity both sides share and
+/// that is invariant across an in-session workspace change and the F9 re-exec.
+/// `DefaultHasher` has fixed SipHash keys, so the value is deterministic across
+/// croft processes.
+pub(crate) fn relay_session_id(launch_arg: &str) -> String {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    hasher.write(canonical_workspace.as_bytes());
+    hasher.write(launch_arg.as_bytes());
     format!("{:016x}", hasher.finish())
-}
-
-/// Resolve the canonical physical workspace path ON THE REMOTE, so the relay id
-/// hashed by the local pump matches the one the remote croft hashes from its own
-/// `canonicalize`d `workspace_root`. `cd <path> && pwd -P` performs the same
-/// symlink-resolving physical canonicalisation as Rust's `Path::canonicalize`.
-/// For `path = None` the remote croft opens its login `current_dir`, so resolve
-/// that the same way with a bare `pwd -P`.
-fn remote_canonical_workspace(ssh: &SshControl, path: Option<&str>) -> Result<String> {
-    let cmd = match path.filter(|p| !p.is_empty()) {
-        Some(p) => format!("cd -- {} && pwd -P", shell_quote(p)),
-        None => String::from("pwd -P"),
-    };
-    let output = ssh
-        .command()
-        .arg(&ssh.host)
-        .arg(&cmd)
-        .stderr(Stdio::null())
-        .output()
-        .context("resolving remote workspace path for drop relay")?;
-    if !output.status.success() {
-        anyhow::bail!("remote workspace path could not be resolved");
-    }
-    let canonical = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if canonical.is_empty() {
-        anyhow::bail!("remote workspace path resolved empty");
-    }
-    Ok(canonical)
 }
 
 pub fn ssh_control_dir() -> Result<PathBuf> {
@@ -2234,38 +2212,37 @@ Host !blocked *.internal
     }
 
     #[test]
-    fn remote_croft_command_freezes_no_drop_relay_env_into_launch() {
-        // The relay rendezvous must NOT ride in the remote croft's launch env.
-        // dtach freezes that env for the life of the long-running remote croft,
-        // so any relay path baked in here went stale after a reconnect or a
-        // local upgrade, desyncing the pump from the running croft. The remote
-        // croft now derives its relay dir from its own workspace identity, so
-        // the launch command must carry nothing relay-related.
-        let command = remote_croft_command_for_terminal(None, None, None, false, &[]);
+    fn remote_launch_carries_only_a_deterministic_relay_key() {
+        // The relay rendezvous reaches the long-lived remote croft as the
+        // deterministic `CROFT_RELAY_KEY` env var, NOT the old per-connection
+        // `CROFT_DROP_RELAY_*` paths. Because the key is `hash(launch arg)` it is
+        // identical on every reconnect, so dtach freezing it at first launch can
+        // never desync the running croft from a fresh pump.
+        let id = relay_session_id("");
+        let env = vec![(String::from("CROFT_RELAY_KEY"), id.clone())];
+        let command = remote_croft_command_for_terminal(None, None, None, false, &env);
+        assert!(
+            command.contains(&format!("export CROFT_RELAY_KEY='{id}'")),
+            "launch must export the deterministic relay key, got: {command}",
+        );
         assert!(
             !command.contains("CROFT_DROP_RELAY"),
-            "launch command must not freeze drop-relay env, got: {command}",
+            "launch must not use the old per-connection relay env, got: {command}",
         );
     }
 
     #[test]
-    fn relay_session_id_is_stable_per_workspace_and_differs_across_paths() {
-        // The relay dir name must be deterministic per workspace, not minted
-        // fresh per connection. A dtach session outlives the SSH transport, so
-        // on reconnect `dtach -A` reattaches the *same* remote croft whose relay
-        // location was fixed at first launch; a fresh random id would tail a
-        // different log than the running croft writes to and every drop would
-        // silently vanish. Keying on the canonical workspace path (like the
-        // dtach socket) makes the reattached croft and a fresh local pump agree
-        // on one log forever, and is a fixed point under the F9 re-exec.
-        let a1 = relay_session_id("/srv/app");
-        let a2 = relay_session_id("/srv/app");
-        let b = relay_session_id("/srv/other");
-        assert_eq!(
-            a1, a2,
-            "same workspace must map to one relay across reconnects"
-        );
-        assert_ne!(a1, b, "different workspaces must not share a relay");
+    fn relay_session_id_matches_dtach_socket_and_is_deterministic() {
+        // The relay id is keyed on the launch arg, exactly like the dtach socket,
+        // so `relay-<id>` and `sessions/<id>.sock` share one id and the two sides
+        // always agree across reconnects. It must be deterministic (same arg ->
+        // same id) and arg-sensitive; the random per-connection id it replaced
+        // silently broke every drop after the first reconnect.
+        assert_eq!(relay_session_id(""), relay_session_id(""));
+        assert_ne!(relay_session_id("/srv/app"), relay_session_id("/srv/other"));
+        // Same hash the dtach socket path embeds for the same launch arg.
+        assert!(dtach_socket_path(None).contains(&relay_session_id("")));
+        assert!(dtach_socket_path(Some("/srv/app")).contains(&relay_session_id("/srv/app")));
     }
 
     #[test]
