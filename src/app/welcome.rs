@@ -1,35 +1,23 @@
-use std::sync::mpsc::Receiver;
-
-use crate::git::{CommitInfo, RecentCommits, RecentCommitsError};
+use crate::git::{CommitInfo, RecentCommits};
 
 use super::WelcomeLink;
-
-#[derive(Default)]
-pub struct RecentDrain {
-    pub installed: bool,
-    pub status: Option<String>,
-}
 
 pub struct WelcomeState {
     remote: Option<String>,
     commits: Vec<CommitInfo>,
-    rx: Option<Receiver<(RecentCommits, RecentCommitsError)>>,
     links: Vec<WelcomeLink>,
 }
 
 impl WelcomeState {
-    pub fn spawn() -> Self {
-        let (commits_tx, commits_rx) = std::sync::mpsc::channel();
-        let remote = crate::git::croft_repository_remote();
-        std::thread::spawn(move || {
-            let timeout = std::time::Duration::from_secs(5);
-            let result = crate::git::fetch_croft_recent_commits_full(timeout);
-            let _ = commits_tx.send(result);
-        });
+    /// Read the commits baked into this binary at build time. No network and
+    /// no background thread: the list is a property of the build, so every
+    /// launch is free and the panel reflects exactly what this version ships
+    /// (see [`crate::git::release_commits`]).
+    pub fn new() -> Self {
+        let RecentCommits { remote, commits } = crate::git::release_commits();
         Self {
             remote,
-            commits: Vec::new(),
-            rx: Some(commits_rx),
+            commits,
             links: Vec::new(),
         }
     }
@@ -56,37 +44,6 @@ impl WelcomeState {
 
     pub fn links(&self) -> &[WelcomeLink] {
         &self.links
-    }
-
-    pub fn drain(&mut self) -> RecentDrain {
-        let Some(rx) = self.rx.as_ref() else {
-            return RecentDrain::default();
-        };
-        match rx.try_recv() {
-            Ok((commits, err)) => {
-                self.remote = commits.remote;
-                self.commits = commits.commits;
-                self.rx = None;
-                let status = match err {
-                    RecentCommitsError::None => None,
-                    RecentCommitsError::Network => {
-                        Some(String::from("Recent commits unavailable: git fetch failed"))
-                    }
-                    RecentCommitsError::NoEndpoint => Some(String::from(
-                        "Recent commits unavailable: no remote configured",
-                    )),
-                };
-                RecentDrain {
-                    installed: true,
-                    status,
-                }
-            }
-            Err(std::sync::mpsc::TryRecvError::Empty) => RecentDrain::default(),
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                self.rx = None;
-                RecentDrain::default()
-            }
-        }
     }
 
     #[cfg(test)]

@@ -633,10 +633,7 @@ mod tests {
             palette.results.first(),
             Some(&builtin(Command::FormatDocument))
         );
-        assert_eq!(
-            Command::FormatDocument.keybinding_hint(),
-            "Cmd+Opt+Shift+F"
-        );
+        assert_eq!(Command::FormatDocument.keybinding_hint(), "Cmd+Opt+Shift+F");
     }
 
     #[test]

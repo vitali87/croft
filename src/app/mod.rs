@@ -1833,7 +1833,7 @@ impl App {
         // Control click.
         let git = GitWorker::spawn(root.clone());
 
-        let welcome = WelcomeState::spawn();
+        let welcome = WelcomeState::new();
         let ext_index_refresh = Some(crate::mcp::registry_index::spawn_refresh());
 
         let (search_query_tx, search_query_rx) = std::sync::mpsc::channel();
@@ -3121,25 +3121,6 @@ impl App {
             }
         }
         applied
-    }
-
-    /// Pull a single batch of croft commits from the background HTTP fetch,
-    /// if it has finished. Returns true exactly once when commits are
-    /// installed (so the welcome panel repaints), false otherwise. Drops
-    /// the receiver after consuming so subsequent calls are cheap no-ops.
-    pub fn drain_recent_commits(&mut self) -> bool {
-        let drain = self.welcome.drain();
-        if !drain.installed {
-            return false;
-        }
-        if self.editor.is_blank_initial() {
-            self.overlays.welcome.request_clear_if_displayed();
-        }
-        self.overlays.welcome.mark_dirty();
-        if let Some(msg) = drain.status {
-            self.status = msg;
-        }
-        true
     }
 
     /// Pull the one-shot remote-extension-index refresh if it has finished.
@@ -5405,7 +5386,9 @@ impl App {
                 .fg(Color::Rgb(0x4e, 0x9a, 0xff))
                 .add_modifier(Modifier::BOLD);
 
-            // Header row: "▎ RECENT ACTIVITY".
+            // Header row: "▎ IN THIS RELEASE (vX.Y.Z)". The commits below are
+            // baked into this build, so the heading names the version rather
+            // than implying a live "recent" feed.
             let header_y = inner_y;
             frame.buffer_mut().set_string(
                 inner_x,
@@ -5418,7 +5401,7 @@ impl App {
             frame.buffer_mut().set_string(
                 inner_x + 2,
                 header_y,
-                "RECENT ACTIVITY",
+                format!("IN THIS RELEASE (v{})", env!("CARGO_PKG_VERSION")),
                 Style::default()
                     .fg(Color::White)
                     .add_modifier(Modifier::BOLD),
@@ -19726,7 +19709,6 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         // Either spinner advancing must wake a redraw; both stay 0 when idle.
         let spinner_phase = app.update_spinner_phase() + app.mcp_spinner_phase();
         let spinner_changed = spinner_phase != last_spinner_phase;
-        let commits_changed = app.drain_recent_commits();
         let ext_index_changed = app.drain_ext_index_refresh();
         let search_changed = app.drain_search_results();
         let remote_changed = app.refresh_remote_if_config_changed();
@@ -19785,7 +19767,6 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             || mcp_changed
             || blink_changed
             || spinner_changed
-            || commits_changed
             || ext_index_changed
             || search_changed
             || remote_changed

@@ -1230,61 +1230,37 @@ pub struct CommitApiEndpoint {
 
 const DEFAULT_CROFT_REPOSITORY_REMOTE: &str = "ssh://git@codeberg.org/vitali87/croft.git";
 
-/// Why the welcome panel's commit list is empty. Used by the UI to phrase
-/// the status bar honestly — the panel itself only ever shows commits from
-/// a *successful, current* fetch. Stale or cached commits are deliberately
-/// not an option: this is a high-velocity project and an out-of-date
-/// "Recent" list is misinformation, strictly worse than an empty one.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum RecentCommitsError {
-    #[default]
-    None,
-    /// `git clone` / `git log` exited non-zero (transport failure, host
-    /// down, repo moved, malformed git output).
-    Network,
-    /// The repository remote is unset or doesn't resolve to an HTTPS URL.
-    NoEndpoint,
-}
-
-pub fn fetch_croft_recent_commits_full(
-    timeout: std::time::Duration,
-) -> (RecentCommits, RecentCommitsError) {
-    let remote = croft_repository_remote();
-    let Some(https_url) = remote.as_deref().and_then(https_clone_url_for_remote) else {
-        return (
-            RecentCommits {
-                remote,
-                commits: Vec::new(),
-            },
-            RecentCommitsError::NoEndpoint,
-        );
-    };
-    let now = current_unix_seconds();
-    // EXACTLY ONE clone attempt: never retry a Codeberg request. A retry loop
-    // here turns a single rate-limit (HTTP 429) into a self-amplifying storm,
-    // each retry spending another request against the same limit and spawning
-    // another `git clone` process. On failure the welcome panel just shows
-    // "recent commits unavailable"; recency is best-effort, not worth hammering
-    // the host for.
-    match fetch_recent_commits_via_clone(&https_url, 5, timeout) {
-        Ok(commits) => (
-            RecentCommits {
-                remote,
-                commits: commits
-                    .into_iter()
-                    .map(|c| commit_info_from_log(c, now))
-                    .collect(),
-            },
-            RecentCommitsError::None,
-        ),
-        Err(_) => (
-            RecentCommits {
-                remote,
-                commits: Vec::new(),
-            },
-            RecentCommitsError::Network,
+/// The commits baked into this binary at build time (`build.rs` runs
+/// `git log` and emits `CROFT_RELEASE_COMMITS`). These are exactly the
+/// commits that ARE in the running version, never live ones from the remote:
+/// showing the remote's `HEAD` would advertise features the installed binary
+/// does not have, and fetching on every launch hammered the host (HTTP 429).
+/// No network, no thread, no per-launch cost — the list is a property of the
+/// build. Links are derived from the (also baked) repository remote.
+pub fn release_commits() -> RecentCommits {
+    RecentCommits {
+        remote: croft_repository_remote(),
+        commits: parse_baked_commits(
+            option_env!("CROFT_RELEASE_COMMITS").unwrap_or_default(),
+            current_unix_seconds(),
         ),
     }
+}
+
+/// Decode the baked `CROFT_RELEASE_COMMITS` value. `build.rs` swaps each
+/// inter-record newline of `git log`'s output for a record separator (`\x1e`)
+/// so the whole list fits one `cargo:rustc-env` line; here we swap it back and
+/// reuse [`parse_git_log_lines`], then humanize each age against `now`.
+fn parse_baked_commits(baked: &str, now: i64) -> Vec<CommitInfo> {
+    if baked.trim().is_empty() {
+        return Vec::new();
+    }
+    let restored = baked.replace('\u{1e}', "\n");
+    parse_git_log_lines(&restored)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|row| commit_info_from_log(row, now))
+        .collect()
 }
 
 /// One row from `git log --pretty=...`. `committer_unix` is seconds since
@@ -1310,67 +1286,9 @@ fn commit_info_from_log(row: GitLogRow, now: i64) -> CommitInfo {
 /// Convert SSH or HTTPS remote refs to a clone-able HTTPS URL. Bitbucket
 /// and GitHub both accept the `https://<host>/<owner>/<repo>.git` form
 /// for anonymous public clones.
-pub fn https_clone_url_for_remote(remote: &str) -> Option<String> {
-    let normalized = normalize_remote_reference(remote)?;
-    Some(format!("{normalized}.git"))
-}
-
-fn fetch_recent_commits_via_clone(
-    https_url: &str,
-    depth: u32,
-    timeout: std::time::Duration,
-) -> std::io::Result<Vec<GitLogRow>> {
-    let staging = unique_staging_dir()?;
-    let _guard = TempDirGuard(staging.clone());
-    // --bare: no working tree
-    // --depth: shallow, only the most recent commits
-    // --filter=blob:none: skip file contents (we only need commit metadata)
-    // --no-tags: skip tag refs
-    // --quiet: silence progress output
-    let timeout_secs = timeout.as_secs().max(1).to_string();
-    let clone = Command::new("git")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_HTTP_LOW_SPEED_LIMIT", "1")
-        .env("GIT_HTTP_LOW_SPEED_TIME", &timeout_secs)
-        .args([
-            "clone",
-            "--bare",
-            "--no-tags",
-            "--filter=blob:none",
-            "--quiet",
-            "--depth",
-        ])
-        .arg(depth.to_string())
-        .arg(https_url)
-        .arg(&staging)
-        .output()?;
-    if !clone.status.success() {
-        return Err(std::io::Error::other(format!(
-            "git clone failed: {}",
-            String::from_utf8_lossy(&clone.stderr).trim()
-        )));
-    }
-    let log = Command::new("git")
-        .arg("-C")
-        .arg(&staging)
-        .args([
-            "log",
-            "--no-merges",
-            "--pretty=format:%h%x09%H%x09%ct%x09%s",
-            "-n",
-        ])
-        .arg(depth.to_string())
-        .output()?;
-    if !log.status.success() {
-        return Err(std::io::Error::other(format!(
-            "git log failed: {}",
-            String::from_utf8_lossy(&log.stderr).trim()
-        )));
-    }
-    parse_git_log_lines(&String::from_utf8_lossy(&log.stdout))
-        .ok_or_else(|| std::io::Error::other("git log produced unparseable output"))
-}
-
+/// Parse `git log --pretty=format:%h%x09%H%x09%ct%x09%s` output (tab-separated
+/// fields, one commit per line). Reused both by `build.rs`'s baked output (via
+/// [`parse_baked_commits`]) and directly in tests.
 pub fn parse_git_log_lines(out: &str) -> Option<Vec<GitLogRow>> {
     let mut rows = Vec::new();
     for line in out.lines() {
@@ -1390,27 +1308,6 @@ pub fn parse_git_log_lines(out: &str) -> Option<Vec<GitLogRow>> {
         });
     }
     Some(rows)
-}
-
-fn unique_staging_dir() -> std::io::Result<std::path::PathBuf> {
-    let pid = std::process::id();
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(0);
-    let path = std::env::temp_dir().join(format!("croft-recent-{pid}-{nanos}"));
-    if path.exists() {
-        std::fs::remove_dir_all(&path)?;
-    }
-    Ok(path)
-}
-
-struct TempDirGuard(std::path::PathBuf);
-
-impl Drop for TempDirGuard {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
 }
 
 pub fn croft_repository_remote() -> Option<String> {
@@ -1952,72 +1849,25 @@ mod tests {
     }
 
     #[test]
-    fn https_clone_url_for_bitbucket_ssh_remote() {
-        let url = https_clone_url_for_remote("git@bitbucket.org:vitali_avagyan/croft.git").unwrap();
-        assert_eq!(url, "https://bitbucket.org/vitali_avagyan/croft.git");
+    fn parse_baked_commits_decodes_record_separated_git_log() {
+        // build.rs bakes `git log --pretty=%h\t%H\t%ct\t%s`, swapping each
+        // inter-record newline for \x1e so the whole list fits one
+        // `cargo:rustc-env` line. parse_baked_commits swaps it back and reuses
+        // the proven parse_git_log_lines pipeline, then humanizes the age.
+        let baked = "abc123\tabc123def\t1700000000\tsecond commit\x1edef456\tdef456abc\t1699999000\tfirst commit";
+        let now = 1_700_003_600; // one hour after the newest commit
+        let commits = parse_baked_commits(baked, now);
+        assert_eq!(commits.len(), 2);
+        assert_eq!(commits[0].hash, "abc123");
+        assert_eq!(commits[0].full_hash, "abc123def");
+        assert_eq!(commits[0].subject, "second commit");
+        assert_eq!(commits[0].when, "1 hour ago");
+        assert_eq!(commits[1].subject, "first commit");
     }
 
     #[test]
-    fn https_clone_url_for_https_remote_already_normalized() {
-        let url = https_clone_url_for_remote("https://github.com/owner/repo").unwrap();
-        assert_eq!(url, "https://github.com/owner/repo.git");
-    }
-
-    #[test]
-    fn fetch_recent_commits_via_clone_returns_real_commits_for_local_repo() {
-        // Clone-from-local works through the same code path; a tempdir
-        // upstream avoids hitting the network in tests but exercises the
-        // git + parse pipeline end-to-end.
-        let upstream = tempfile::TempDir::new().unwrap();
-        Command::new("git")
-            .args(["init", "--quiet", "--initial-branch=main"])
-            .arg(upstream.path())
-            .status()
-            .unwrap();
-        Command::new("git")
-            .args(["-C"])
-            .arg(upstream.path())
-            .args(["config", "user.email", "test@example.com"])
-            .status()
-            .unwrap();
-        Command::new("git")
-            .args(["-C"])
-            .arg(upstream.path())
-            .args(["config", "user.name", "test"])
-            .status()
-            .unwrap();
-        std::fs::write(upstream.path().join("a.txt"), "1").unwrap();
-        Command::new("git")
-            .args(["-C"])
-            .arg(upstream.path())
-            .args(["add", "."])
-            .status()
-            .unwrap();
-        Command::new("git")
-            .args(["-C"])
-            .arg(upstream.path())
-            .args(["commit", "-m", "first commit", "--quiet"])
-            .status()
-            .unwrap();
-        std::fs::write(upstream.path().join("a.txt"), "2").unwrap();
-        Command::new("git")
-            .args(["-C"])
-            .arg(upstream.path())
-            .args(["add", "."])
-            .status()
-            .unwrap();
-        Command::new("git")
-            .args(["-C"])
-            .arg(upstream.path())
-            .args(["commit", "-m", "second commit", "--quiet"])
-            .status()
-            .unwrap();
-        let url = format!("file://{}", upstream.path().display());
-        let rows = fetch_recent_commits_via_clone(&url, 5, std::time::Duration::from_secs(10))
-            .expect("local clone must succeed");
-        assert!(rows.len() >= 2);
-        assert_eq!(rows[0].subject, "second commit");
-        assert_eq!(rows[1].subject, "first commit");
+    fn parse_baked_commits_is_empty_when_unset() {
+        assert!(parse_baked_commits("", 0).is_empty());
     }
 
     #[test]
