@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use std::collections::BTreeSet;
+use std::ffi::{OsStr, OsString};
 use std::hash::Hasher;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -334,15 +335,17 @@ fn run_croft_session(
 ) -> Result<RemoteOutcome> {
     let mut bootstrapped = false;
     loop {
-        let pump = match DropPump::start(&ssh) {
+        let pump = match DropPump::start(&ssh, path) {
             Ok(p) => Some(p),
             Err(e) => {
                 eprintln!("Drag-drop relay disabled: {e}");
                 None
             }
         };
-        let env = pump.as_ref().map(DropPump::remote_env).unwrap_or_default();
-        let status = run_remote_croft(&ssh, path, &env)?;
+        // No relay env is carried into the remote croft: it derives the relay
+        // dir from its own workspace identity (see `App::relay_dir`), so a dtach
+        // reattach can never hand it a stale path.
+        let status = run_remote_croft(&ssh, path, &[])?;
         match classify_remote_status(status.code()) {
             RemoteStatusClass::ReturnToLocal => return Ok(RemoteOutcome::ReturnToLocal),
             RemoteStatusClass::Exited => return Ok(RemoteOutcome::Exited),
@@ -440,7 +443,8 @@ fn try_local_cross_install_streaming(
     source_stamp: &str,
     log_tx: &std::sync::mpsc::Sender<String>,
 ) -> Result<bool> {
-    if !cross_compile_available() {
+    if let Some(reason) = cross_compile_unavailable_reason() {
+        let _ = log_tx.send(format!("Local cross-build skipped: {reason}"));
         return Ok(false);
     }
     let Some(triple) = remote_target_triple(ssh)? else {
@@ -475,24 +479,7 @@ fn try_local_cross_install_streaming(
     let _ = log_tx.send(format!(
         "Cross-compiling croft locally for {triple} (niced, {jobs} jobs, fd limit {fd_limit})…"
     ));
-    let mut zigbuild = Command::new("nice");
-    zigbuild
-        .args([
-            "-n",
-            "19",
-            "cargo",
-            "zigbuild",
-            "--profile",
-            "remote-fast",
-            "--locked",
-            "--jobs",
-            &jobs,
-            "--bin",
-            "croft",
-            "--target",
-            triple,
-        ])
-        .current_dir(&source);
+    let zigbuild = cargo_zigbuild_command(&source, triple, &jobs);
     let status = run_command_streaming(zigbuild, log_tx).context("running cargo zigbuild")?;
     if !status.success() {
         anyhow::bail!("cargo zigbuild exited with {status}");
@@ -700,21 +687,25 @@ impl Drop for SshControl {
 ///   `~/.cache/croft/relay-<id>/inbox/<request-id>/.err`
 ///       Sentinel local croft writes with the failure message.
 struct DropPump {
-    inbox_dir: String,
-    requests_log: String,
     stop: Arc<AtomicBool>,
     tail: Option<Child>,
     handle: Option<JoinHandle<()>>,
 }
 
 impl DropPump {
-    fn start(ssh: &SshControl) -> Result<Self> {
-        let id = relay_session_id();
-        // The child croft process will see CROFT_DROP_RELAY_LOG /
-        // CROFT_DROP_RELAY_INBOX as plain string env vars and call
-        // open() on them directly, so the path must be absolute and
-        // already-expanded by the remote shell. Resolve $HOME once on
-        // the remote and capture the literal absolute path.
+    fn start(ssh: &SshControl, path: Option<&str>) -> Result<Self> {
+        // Key the relay dir on the canonical remote workspace path, the same
+        // value the remote croft hashes from its own `workspace_root` (see
+        // `App::relay_dir`). Nothing relay-related is carried in launch env:
+        // dtach freezes the remote croft's env at first launch, so an env-borne
+        // path went stale on every reconnect/upgrade. Both sides instead
+        // recompute the one dir from a stable identity and always agree.
+        let canonical = remote_canonical_workspace(ssh, path)?;
+        let id = relay_session_id(&canonical);
+        // Resolve $HOME on the remote and capture the literal absolute relay
+        // paths so the tail and the .ok/.err sentinels all agree on one
+        // location. The remote croft creates this dir lazily too, so `tail -F`
+        // tolerates it not existing yet.
         let resolve = format!(
             "set -e; \
              RELAY=\"$HOME/.cache/croft/relay-{id}\"; \
@@ -777,25 +768,10 @@ impl DropPump {
             run_pump(pump_ssh_host, pump_socket, pump_inbox, stdout, pump_stop);
         });
         Ok(Self {
-            inbox_dir,
-            requests_log,
             stop,
             tail: Some(tail),
             handle: Some(handle),
         })
-    }
-
-    fn remote_env(&self) -> Vec<(String, String)> {
-        vec![
-            (
-                String::from("CROFT_DROP_RELAY_LOG"),
-                self.requests_log.clone(),
-            ),
-            (
-                String::from("CROFT_DROP_RELAY_INBOX"),
-                self.inbox_dir.clone(),
-            ),
-        ]
     }
 }
 
@@ -1232,12 +1208,54 @@ fn write_relay_err(host: &str, socket: &Path, inbox_dir: &str, request_id: &str,
         .status();
 }
 
-fn relay_session_id() -> String {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    format!("{}-{now}", std::process::id())
+/// Stable name for the drop-relay directory, keyed on the CANONICAL workspace
+/// path, exactly like [`dtach_socket_path`] keys the session socket. Both the
+/// local drop-pump and the remote croft compute this from the same canonical
+/// path, so the two sides always agree on one `requests.log` no matter how many
+/// times the connection drops and reattaches.
+///
+/// The earlier scheme minted a fresh `pid-nanos` id per connection. Because
+/// `dtach -A` reattaches the *already-running* remote croft (whose relay
+/// location was fixed at first launch), a new id on reconnect made the local
+/// pump tail a different log than the one the reattached croft writes to, and
+/// every drop silently vanished — plus it littered `~/.cache/croft` with one
+/// orphan `relay-*` dir per connection. Keying on the canonical workspace path
+/// is also stable across the F9 self-re-exec: the re-exec relaunches with the
+/// canonical path as argv, and `canonicalize` of an already-canonical path is a
+/// fixed point, so the id never moves. `DefaultHasher` has fixed SipHash keys,
+/// so the value is deterministic across croft processes.
+pub(crate) fn relay_session_id(canonical_workspace: &str) -> String {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    hasher.write(canonical_workspace.as_bytes());
+    format!("{:016x}", hasher.finish())
+}
+
+/// Resolve the canonical physical workspace path ON THE REMOTE, so the relay id
+/// hashed by the local pump matches the one the remote croft hashes from its own
+/// `canonicalize`d `workspace_root`. `cd <path> && pwd -P` performs the same
+/// symlink-resolving physical canonicalisation as Rust's `Path::canonicalize`.
+/// For `path = None` the remote croft opens its login `current_dir`, so resolve
+/// that the same way with a bare `pwd -P`.
+fn remote_canonical_workspace(ssh: &SshControl, path: Option<&str>) -> Result<String> {
+    let cmd = match path.filter(|p| !p.is_empty()) {
+        Some(p) => format!("cd -- {} && pwd -P", shell_quote(p)),
+        None => String::from("pwd -P"),
+    };
+    let output = ssh
+        .command()
+        .arg(&ssh.host)
+        .arg(&cmd)
+        .stderr(Stdio::null())
+        .output()
+        .context("resolving remote workspace path for drop relay")?;
+    if !output.status.success() {
+        anyhow::bail!("remote workspace path could not be resolved");
+    }
+    let canonical = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if canonical.is_empty() {
+        anyhow::bail!("remote workspace path resolved empty");
+    }
+    Ok(canonical)
 }
 
 pub fn ssh_control_dir() -> Result<PathBuf> {
@@ -1330,17 +1348,148 @@ pub(crate) fn raise_fd_limit() -> u64 {
     lim.rlim_cur
 }
 
-fn cross_compile_available() -> bool {
-    // Probe the cargo-zigbuild binary directly: `cargo zigbuild --version`
-    // is rejected by cargo-zigbuild >=0.22 (the `zigbuild` subcommand has
-    // no `--version`, exit 2), which silently disabled the fast path and
-    // forced every remote install onto the slow from-scratch `cargo
-    // install`. `cargo-zigbuild --version` exits 0 when installed.
-    Command::new("cargo-zigbuild")
-        .arg("--version")
+/// Reason the local cross-build fast path can't run, or `None` if it can. Each
+/// tool is located via [`cross_tool_program`] (PATH plus standard toolchain
+/// dirs) and then probed, so a GUI launch with a stripped launchd PATH still
+/// finds `~/.cargo/bin` and Homebrew. Returning a reason (instead of a bare
+/// bool) lets the caller log *why* it fell back to the slow from-scratch build.
+fn cross_compile_unavailable_reason() -> Option<String> {
+    // `cargo zigbuild --version` is rejected by cargo-zigbuild >=0.22 (the
+    // `zigbuild` subcommand has no `--version`, exit 2); probe each binary
+    // directly with the arg it accepts.
+    for (tool, version_arg, install_hint) in [
+        ("cargo", "--version", "install Rust via https://rustup.rs"),
+        ("cargo-zigbuild", "--version", "run `croft setup-cross`"),
+        ("zig", "version", "run `croft setup-cross`"),
+    ] {
+        if cross_tool_program(tool).is_none() {
+            return Some(format!(
+                "`{tool}` not found on PATH or standard toolchain locations ({install_hint})"
+            ));
+        }
+        if !probe_cross_tool(tool, version_arg) {
+            return Some(format!("`{tool} {version_arg}` failed ({install_hint})"));
+        }
+    }
+    None
+}
+
+fn probe_cross_tool(tool: &str, version_arg: &str) -> bool {
+    cross_tool_command(tool)
+        .arg(version_arg)
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
+}
+
+/// Directories searched for the cross-build toolchain. A Croft.app / Ghostty
+/// launch on macOS inherits launchd's stripped PATH, so `~/.cargo/bin` and
+/// Homebrew are absent even though the same tools resolve in an interactive
+/// shell. PATH entries come first (an explicit override wins), then the
+/// standard rustup/Homebrew locations.
+fn cross_tool_search_dirs_from(path: Option<&OsStr>, home: Option<&OsStr>) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(path) = path {
+        for dir in std::env::split_paths(path) {
+            push_unique_path(&mut dirs, dir);
+        }
+    }
+    if let Some(home) = home {
+        let home = PathBuf::from(home);
+        push_unique_path(&mut dirs, home.join(".cargo").join("bin"));
+        push_unique_path(&mut dirs, home.join(".local").join("bin"));
+    }
+    push_unique_path(&mut dirs, PathBuf::from("/opt/homebrew/bin"));
+    push_unique_path(&mut dirs, PathBuf::from("/usr/local/bin"));
+    dirs
+}
+
+fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
+    if !paths.iter().any(|existing| existing == &path) {
+        paths.push(path);
+    }
+}
+
+fn cross_tool_search_dirs() -> Vec<PathBuf> {
+    let path = std::env::var_os("PATH");
+    let home = std::env::var_os("HOME");
+    cross_tool_search_dirs_from(path.as_deref(), home.as_deref())
+}
+
+/// A PATH that includes the standard toolchain dirs, handed to every spawned
+/// cross-build tool so child processes (e.g. `cargo` invoking `cargo-zigbuild`
+/// invoking `zig`) resolve each other even under a stripped launchd PATH.
+fn cross_tool_path() -> OsString {
+    let path = std::env::var_os("PATH");
+    let home = std::env::var_os("HOME");
+    cross_tool_path_from(path.as_deref(), home.as_deref())
+}
+
+fn cross_tool_path_from(path: Option<&OsStr>, home: Option<&OsStr>) -> OsString {
+    std::env::join_paths(cross_tool_search_dirs_from(path, home))
+        .unwrap_or_else(|_| path.map(OsString::from).unwrap_or_default())
+}
+
+fn cross_tool_program(tool: &str) -> Option<PathBuf> {
+    find_executable_in_dirs(tool, &cross_tool_search_dirs())
+}
+
+fn find_executable_in_dirs(tool: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
+    dirs.iter()
+        .map(|dir| dir.join(tool))
+        .find(|candidate| is_executable_file(candidate))
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path)
+            .map(|m| m.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+/// A `Command` for a cross-build tool, resolved to its absolute path and run
+/// with the augmented PATH so its own child processes resolve too.
+fn cross_tool_command(tool: &str) -> Command {
+    let program = cross_tool_program(tool).unwrap_or_else(|| PathBuf::from(tool));
+    let mut command = Command::new(program);
+    command.env("PATH", cross_tool_path());
+    command
+}
+
+/// The niced, job-capped `cargo zigbuild` invocation, with `cargo` resolved to
+/// an absolute path and the augmented PATH exported so it finds cargo-zigbuild
+/// and zig.
+fn cargo_zigbuild_command(source: &Path, triple: &str, jobs: &str) -> Command {
+    let cargo = cross_tool_program("cargo").unwrap_or_else(|| PathBuf::from("cargo"));
+    let mut zigbuild = Command::new("nice");
+    zigbuild
+        .args(["-n", "19"])
+        .arg(cargo)
+        .args([
+            "zigbuild",
+            "--profile",
+            "remote-fast",
+            "--locked",
+            "--jobs",
+            jobs,
+            "--bin",
+            "croft",
+            "--target",
+            triple,
+        ])
+        .env("PATH", cross_tool_path())
+        .current_dir(source);
+    zigbuild
 }
 
 /// Re-pin the croft workspace member in `Cargo.lock` to whatever `Cargo.toml`
@@ -1358,7 +1507,7 @@ fn cross_compile_available() -> bool {
 /// Best-effort: if the sync itself fails we log and still attempt the locked
 /// build, preserving the old fall-back behaviour rather than blocking install.
 fn sync_workspace_lock(source: &Path, log: impl Fn(String)) {
-    match Command::new("cargo")
+    match cross_tool_command("cargo")
         .args(["update", "-p", "croft", "--offline"])
         .current_dir(source)
         .output()
@@ -1441,7 +1590,7 @@ pub fn arch_to_musl_triple(arch: &str) -> Option<&'static str> {
 }
 
 fn rust_target_installed(triple: &str) -> bool {
-    let Ok(output) = Command::new("rustup")
+    let Ok(output) = cross_tool_command("rustup")
         .args(["target", "list", "--installed"])
         .output()
     else {
@@ -1456,7 +1605,8 @@ fn rust_target_installed(triple: &str) -> bool {
 }
 
 fn try_local_cross_install(ssh: &SshControl, source_stamp: &str) -> Result<bool> {
-    if !cross_compile_available() {
+    if let Some(reason) = cross_compile_unavailable_reason() {
+        eprintln!("Local cross-build skipped: {reason}");
         return Ok(false);
     }
     let Some(triple) = remote_target_triple(ssh)? else {
@@ -1472,19 +1622,12 @@ fn try_local_cross_install(ssh: &SshControl, source_stamp: &str) -> Result<bool>
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     sync_workspace_lock(&source, |msg| println!("{msg}"));
     raise_fd_limit();
-    println!("Cross-compiling croft locally for {triple}...");
-    let status = Command::new("cargo")
-        .args([
-            "zigbuild",
-            "--profile",
-            "remote-fast",
-            "--locked",
-            "--bin",
-            "croft",
-            "--target",
-            triple,
-        ])
-        .current_dir(&source)
+    let jobs = std::thread::available_parallelism()
+        .map(|n| (n.get() / 2).max(1))
+        .unwrap_or(1)
+        .to_string();
+    println!("Cross-compiling croft locally for {triple} (niced, {jobs} jobs)...");
+    let status = cargo_zigbuild_command(&source, triple, &jobs)
         .status()
         .context("running cargo zigbuild")?;
     if !status.success() {
@@ -2091,20 +2234,83 @@ Host !blocked *.internal
     }
 
     #[test]
-    fn remote_croft_command_exports_drop_relay_env() {
-        let env = vec![
-            (
-                String::from("CROFT_DROP_RELAY_LOG"),
-                String::from("/tmp/r/log"),
-            ),
-            (
-                String::from("CROFT_DROP_RELAY_INBOX"),
-                String::from("/tmp/r/inbox"),
-            ),
-        ];
-        let command = remote_croft_command_for_terminal(None, None, None, false, &env);
-        assert!(command.contains("export CROFT_DROP_RELAY_LOG='/tmp/r/log'"));
-        assert!(command.contains("export CROFT_DROP_RELAY_INBOX='/tmp/r/inbox'"));
+    fn remote_croft_command_freezes_no_drop_relay_env_into_launch() {
+        // The relay rendezvous must NOT ride in the remote croft's launch env.
+        // dtach freezes that env for the life of the long-running remote croft,
+        // so any relay path baked in here went stale after a reconnect or a
+        // local upgrade, desyncing the pump from the running croft. The remote
+        // croft now derives its relay dir from its own workspace identity, so
+        // the launch command must carry nothing relay-related.
+        let command = remote_croft_command_for_terminal(None, None, None, false, &[]);
+        assert!(
+            !command.contains("CROFT_DROP_RELAY"),
+            "launch command must not freeze drop-relay env, got: {command}",
+        );
+    }
+
+    #[test]
+    fn relay_session_id_is_stable_per_workspace_and_differs_across_paths() {
+        // The relay dir name must be deterministic per workspace, not minted
+        // fresh per connection. A dtach session outlives the SSH transport, so
+        // on reconnect `dtach -A` reattaches the *same* remote croft whose relay
+        // location was fixed at first launch; a fresh random id would tail a
+        // different log than the running croft writes to and every drop would
+        // silently vanish. Keying on the canonical workspace path (like the
+        // dtach socket) makes the reattached croft and a fresh local pump agree
+        // on one log forever, and is a fixed point under the F9 re-exec.
+        let a1 = relay_session_id("/srv/app");
+        let a2 = relay_session_id("/srv/app");
+        let b = relay_session_id("/srv/other");
+        assert_eq!(
+            a1, a2,
+            "same workspace must map to one relay across reconnects"
+        );
+        assert_ne!(a1, b, "different workspaces must not share a relay");
+    }
+
+    #[test]
+    fn cross_tool_search_dirs_cover_gui_launch_tool_locations() {
+        // launchd hands a Croft.app / Ghostty launch a stripped PATH; the
+        // toolchain lives in dirs that PATH omits, so the search must add them.
+        let launchd_path = OsString::from("/usr/bin:/bin:/usr/sbin:/sbin");
+        let home = PathBuf::from("/Users/example");
+        let dirs =
+            cross_tool_search_dirs_from(Some(launchd_path.as_os_str()), Some(home.as_os_str()));
+
+        assert_eq!(dirs.first(), Some(&PathBuf::from("/usr/bin")));
+        assert!(
+            dirs.contains(&home.join(".cargo").join("bin")),
+            "cargo, rustup, and cargo-zigbuild installed by rustup live here, but launchd omits it"
+        );
+        assert!(
+            dirs.contains(&PathBuf::from("/opt/homebrew/bin")),
+            "Apple Silicon Homebrew's zig lives here, but launchd omits it"
+        );
+        assert!(dirs.contains(&PathBuf::from("/usr/local/bin")));
+    }
+
+    #[test]
+    fn cross_tool_lookup_finds_home_cargo_bin_outside_inherited_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_dir = tmp.path().join(".cargo").join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let tool = bin_dir.join("cargo-zigbuild");
+        std::fs::write(&tool, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let launchd_path = OsString::from("/usr/bin:/bin:/usr/sbin:/sbin");
+        let dirs = cross_tool_search_dirs_from(
+            Some(launchd_path.as_os_str()),
+            Some(tmp.path().as_os_str()),
+        );
+
+        assert_eq!(
+            find_executable_in_dirs("cargo-zigbuild", &dirs),
+            Some(tool),
+            "the remote fast path must work when Croft.app starts with launchd's stripped PATH"
+        );
     }
 
     #[test]

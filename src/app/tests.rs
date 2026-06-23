@@ -9886,32 +9886,47 @@ fn relay_test_lock() -> &'static std::sync::Mutex<()> {
     LOCK.get_or_init(|| std::sync::Mutex::new(()))
 }
 
+/// Point `$HOME` (hence `croft_cache_dir`, hence the relay dir) at a temp dir
+/// for the duration of `body`, restoring the prior value afterwards. The relay
+/// dir is now derived from `$HOME/.cache/croft` + a hash of the workspace, so a
+/// relay test controls the rendezvous by controlling `$HOME` rather than by
+/// injecting the old `CROFT_DROP_RELAY_*` env. Serialized by `relay_test_lock`.
+fn with_relay_home<T>(home: &std::path::Path, body: impl FnOnce() -> T) -> T {
+    let prev = std::env::var_os("HOME");
+    // SAFETY: relay tests hold relay_test_lock, serializing env mutation.
+    unsafe {
+        std::env::set_var("HOME", home);
+        std::env::set_var("CROFT_REMOTE_AUTOUPDATE", "1");
+    }
+    let out = body();
+    unsafe {
+        match prev {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+        std::env::remove_var("CROFT_REMOTE_AUTOUPDATE");
+    }
+    out
+}
+
 #[test]
 fn remote_launched_drop_queues_pull_request_via_relay_log() {
     let _guard = relay_test_lock().lock().unwrap();
-    // Simulates the case where the user dragged a Finder file onto a
-    // remote-launched croft. The Mac path doesn't exist on the remote
-    // box, but the parent local-croft has plumbed the relay env, so
-    // the drop is recorded in the request log instead of being
-    // pasted into the editor.
+    // The user dragged a Finder file onto a remote-launched croft. The Mac path
+    // doesn't exist on the remote box, but the session is a `croft remote` child
+    // (CROFT_REMOTE_AUTOUPDATE set) whose local parent runs a drop pump, so the
+    // drop is recorded in the identity-derived relay log (no env path needed)
+    // instead of being pasted into the editor.
     let workspace = tempfile::tempdir().unwrap();
-    let relay = tempfile::tempdir().unwrap();
-    let log = relay.path().join("requests.log");
-    let inbox = relay.path().join("inbox");
-    std::fs::create_dir_all(&inbox).unwrap();
-    // SAFETY: tests are single-threaded for env var manipulation.
-    unsafe {
-        std::env::set_var("CROFT_DROP_RELAY_LOG", &log);
-        std::env::set_var("CROFT_DROP_RELAY_INBOX", &inbox);
-    }
+    let home = tempfile::tempdir().unwrap();
     let mut app = App::new(workspace.path().to_path_buf()).unwrap();
     app.set_sidebar_view(SidebarView::Explorer);
     app.focus_pane(Pane::Tree);
-    app.handle_paste("/Users/vitali/Documents/foo.txt\n");
-    unsafe {
-        std::env::remove_var("CROFT_DROP_RELAY_LOG");
-        std::env::remove_var("CROFT_DROP_RELAY_INBOX");
-    }
+    let (log, _) = with_relay_home(home.path(), || {
+        let log = app.relay_log_path().expect("relay log path derivable");
+        app.handle_paste("/Users/vitali/Documents/foo.txt\n");
+        (log, ())
+    });
     let written = std::fs::read_to_string(&log).expect("relay log was written");
     assert!(
         written.starts_with("pull\t"),
@@ -9925,37 +9940,69 @@ fn remote_launched_drop_queues_pull_request_via_relay_log() {
 }
 
 #[test]
+fn pure_path_payload_distinguishes_finder_drag_from_text_paste() {
+    // A genuine Finder drag carries only absolute path tokens.
+    assert!(super::is_pure_path_payload("/Users/v/Documents/foo.txt"));
+    assert!(super::is_pure_path_payload("/Users/v/a.txt /Users/v/b.txt"));
+    assert!(super::is_pure_path_payload("'/Users/v/with space.txt'"));
+    // Text pastes that merely contain a path always carry a non-path token, so
+    // they must NOT be hijacked into a relay pull.
+    assert!(!super::is_pure_path_payload("cat /etc/hosts"));
+    assert!(!super::is_pure_path_payload("see /Users/v/foo.txt please"));
+    assert!(!super::is_pure_path_payload("relative/path.txt"));
+    assert!(!super::is_pure_path_payload(""));
+}
+
+#[test]
+fn remote_finder_drag_queues_pull_without_tree_focus() {
+    let _guard = relay_test_lock().lock().unwrap();
+    // A drop does not move keyboard focus to the Explorer tree, so a focus-only
+    // gate dropped drags whenever the user had last clicked the terminal or
+    // editor. A pure-path payload must be recognised regardless of focus.
+    let workspace = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let mut app = App::new(workspace.path().to_path_buf()).unwrap();
+    app.set_sidebar_view(SidebarView::Explorer);
+    app.focus_pane(Pane::Editor); // focus is NOT on the tree
+    let log = with_relay_home(home.path(), || {
+        let log = app.relay_log_path().expect("relay log path derivable");
+        app.handle_paste("/Users/vitali/Documents/dragged.txt\n");
+        log
+    });
+    let written = std::fs::read_to_string(&log).expect("relay log was written");
+    assert!(
+        written.starts_with("pull\t") && written.contains("/Users/vitali/Documents/dragged.txt"),
+        "a pure-path drag must queue a pull even without tree focus, got: {written:?}",
+    );
+    assert_eq!(app.pending_remote_pulls.len(), 1);
+}
+
+#[test]
 fn drain_remote_pulls_imports_file_when_relay_signals_ok() {
     let _guard = relay_test_lock().lock().unwrap();
     let workspace = tempfile::tempdir().unwrap();
-    let relay = tempfile::tempdir().unwrap();
-    let inbox = relay.path().join("inbox");
-    std::fs::create_dir_all(&inbox).unwrap();
-    unsafe {
-        std::env::set_var("CROFT_DROP_RELAY_INBOX", &inbox);
-    }
+    let home = tempfile::tempdir().unwrap();
     let mut app = App::new(workspace.path().to_path_buf()).unwrap();
     app.set_sidebar_view(SidebarView::Explorer);
     app.focus_pane(Pane::Tree);
-    let request_id = String::from("test-req-1");
-    let request_dir = inbox.join(&request_id);
-    std::fs::create_dir_all(&request_dir).unwrap();
-    let staged = request_dir.join("foo.txt");
-    std::fs::write(&staged, "payload").unwrap();
-    std::fs::write(request_dir.join(".ok"), b"").unwrap();
-    app.pending_remote_pulls.push(PendingRemotePull {
-        request_id: request_id.clone(),
-        src_display: String::from("/Users/v/Docs/foo.txt"),
-        basename: String::from("foo.txt"),
-        dest_dir: workspace.path().to_path_buf(),
-        started_at: std::time::Instant::now(),
-        kind: RemotePullKind::File,
+    let request_dir = with_relay_home(home.path(), || {
+        let inbox = app.relay_inbox_path().expect("relay inbox derivable");
+        let request_dir = inbox.join("test-req-1");
+        std::fs::create_dir_all(&request_dir).unwrap();
+        std::fs::write(request_dir.join("foo.txt"), "payload").unwrap();
+        std::fs::write(request_dir.join(".ok"), b"").unwrap();
+        app.pending_remote_pulls.push(PendingRemotePull {
+            request_id: String::from("test-req-1"),
+            src_display: String::from("/Users/v/Docs/foo.txt"),
+            basename: String::from("foo.txt"),
+            dest_dir: workspace.path().to_path_buf(),
+            started_at: std::time::Instant::now(),
+            kind: RemotePullKind::File,
+        });
+        let changed = app.drain_remote_pulls();
+        assert!(changed);
+        request_dir
     });
-    let changed = app.drain_remote_pulls();
-    unsafe {
-        std::env::remove_var("CROFT_DROP_RELAY_INBOX");
-    }
-    assert!(changed);
     assert!(app.pending_remote_pulls.is_empty());
     let landed = workspace.path().join("foo.txt");
     assert!(landed.exists(), "file should land in workspace");
@@ -9971,29 +10018,24 @@ fn drain_remote_pulls_imports_file_when_relay_signals_ok() {
 fn drain_remote_pulls_surfaces_relay_error_message() {
     let _guard = relay_test_lock().lock().unwrap();
     let workspace = tempfile::tempdir().unwrap();
-    let relay = tempfile::tempdir().unwrap();
-    let inbox = relay.path().join("inbox");
-    std::fs::create_dir_all(&inbox).unwrap();
-    unsafe {
-        std::env::set_var("CROFT_DROP_RELAY_INBOX", &inbox);
-    }
+    let home = tempfile::tempdir().unwrap();
     let mut app = App::new(workspace.path().to_path_buf()).unwrap();
-    let request_dir = inbox.join("req-2");
-    std::fs::create_dir_all(&request_dir).unwrap();
-    std::fs::write(request_dir.join(".err"), b"scp exited with 1").unwrap();
-    app.pending_remote_pulls.push(PendingRemotePull {
-        request_id: String::from("req-2"),
-        src_display: String::from("/Users/v/missing.txt"),
-        basename: String::from("missing.txt"),
-        dest_dir: workspace.path().to_path_buf(),
-        started_at: std::time::Instant::now(),
-        kind: RemotePullKind::File,
+    with_relay_home(home.path(), || {
+        let inbox = app.relay_inbox_path().expect("relay inbox derivable");
+        let request_dir = inbox.join("req-2");
+        std::fs::create_dir_all(&request_dir).unwrap();
+        std::fs::write(request_dir.join(".err"), b"scp exited with 1").unwrap();
+        app.pending_remote_pulls.push(PendingRemotePull {
+            request_id: String::from("req-2"),
+            src_display: String::from("/Users/v/missing.txt"),
+            basename: String::from("missing.txt"),
+            dest_dir: workspace.path().to_path_buf(),
+            started_at: std::time::Instant::now(),
+            kind: RemotePullKind::File,
+        });
+        let changed = app.drain_remote_pulls();
+        assert!(changed);
     });
-    let changed = app.drain_remote_pulls();
-    unsafe {
-        std::env::remove_var("CROFT_DROP_RELAY_INBOX");
-    }
-    assert!(changed);
     assert!(app.status.contains("scp exited with 1"));
 }
 

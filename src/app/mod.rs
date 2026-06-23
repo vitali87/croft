@@ -12174,19 +12174,20 @@ impl App {
         // session) and the paste shape is path-like, request a reverse
         // pull through the relay.
         //
-        // Gate on `focus == Pane::Tree` exactly like the strict branch
-        // above. parse_foreign_dropped_paths can't require the path to
-        // exist (it lives on the user's local box, not here), so it
-        // matches *any* absolute-path-shaped token. Without the focus
-        // guard, an ordinary text paste into the terminal or editor that
-        // merely contains a `/...` token (a shell command, a code
-        // snippet, a bare path) gets hijacked into a relay pull that has
-        // no local file to fetch — surfacing as "Drop relay failed …"
-        // and swallowing the paste. Seen on remote sessions opened from
-        // Termux where pasting into the terminal kept failing.
+        // Two triggers gate the relay pull. Tree focus is the explicit one,
+        // matching the strict branch above. The second, `is_pure_path_payload`,
+        // recovers a genuine Finder drag: a drop arrives as a bracketed paste
+        // and does NOT move keyboard focus to the tree, so a focus-only gate
+        // silently dropped every drag where the user had last clicked the
+        // terminal or editor. A real drop is nothing but absolute-path tokens,
+        // whereas the text pastes the focus guard protects — a shell command or
+        // code snippet that merely contains a `/...` token — always carry a
+        // non-path token, so they still fall through to a normal paste rather
+        // than being hijacked into a relay pull with no local file to fetch
+        // (the regression seen on remote sessions opened from Termux).
         if self.drop_relay_active()
             && self.sidebar_view == SidebarView::Explorer
-            && self.focus == Pane::Tree
+            && (self.focus == Pane::Tree || is_pure_path_payload(s))
         {
             let foreign = parse_foreign_dropped_paths(s);
             if !foreign.is_empty() {
@@ -12333,17 +12334,53 @@ impl App {
         true
     }
 
+    /// True when this croft is a remote-launched session whose local parent is
+    /// running a drop pump. Gated on the constant `CROFT_REMOTE_AUTOUPDATE`
+    /// marker (exported only by a `croft remote` parent, never a manual
+    /// `ssh host; croft`) plus a derivable relay dir. The marker is a
+    /// freeze-safe boolean: unlike the old `CROFT_DROP_RELAY_*` path env, it
+    /// never goes stale across a dtach reattach or a self-re-exec, because the
+    /// relay dir itself is recomputed from `workspace_root` every time.
     fn drop_relay_active(&self) -> bool {
-        std::env::var_os("CROFT_DROP_RELAY_LOG").is_some()
-            && std::env::var_os("CROFT_DROP_RELAY_INBOX").is_some()
+        std::env::var_os("CROFT_REMOTE_AUTOUPDATE").is_some() && self.relay_dir().is_some()
+    }
+
+    /// `$HOME/.cache/croft/relay-<hash(canonical workspace)>/` on this remote
+    /// box. Both this remote croft and the local drop-pump derive the id from
+    /// the same canonical workspace path, so the rendezvous is stable across
+    /// local restarts, dtach reattaches, and the F9 self-re-exec. `None` only
+    /// if HOME or the workspace path isn't representable as UTF-8.
+    fn relay_dir(&self) -> Option<PathBuf> {
+        let ws = self.workspace_root.to_str()?;
+        let id = crate::remote::relay_session_id(ws);
+        Some(croft_cache_dir().join(format!("relay-{id}")))
+    }
+
+    fn relay_log_path(&self) -> Option<PathBuf> {
+        self.relay_dir().map(|d| d.join("requests.log"))
+    }
+
+    fn relay_inbox_path(&self) -> Option<PathBuf> {
+        self.relay_dir().map(|d| d.join("inbox"))
+    }
+
+    /// Ensure the relay dir + inbox exist before writing a request. On the first
+    /// drop after a dtach reattach (or on a fresh box) the local pump's
+    /// `tail -F` may have started against a path this croft hadn't created yet;
+    /// `tail -F` retries, so a lazy mkdir here is enough. Idempotent and cheap.
+    fn ensure_relay_dir(&self) {
+        if let Some(inbox) = self.relay_inbox_path() {
+            let _ = std::fs::create_dir_all(inbox);
+        }
     }
 
     fn request_remote_pulls(&mut self, paths: &[PathBuf]) {
         let dest_dir = self.paste_target_dir();
-        let Some(log_path) = std::env::var_os("CROFT_DROP_RELAY_LOG").map(PathBuf::from) else {
+        let Some(log_path) = self.relay_log_path() else {
             self.status = String::from("Drop relay not available on this remote session");
             return;
         };
+        self.ensure_relay_dir();
         let mut lines = String::new();
         let mut staged: Vec<PendingRemotePull> = Vec::new();
         let now = std::time::Instant::now();
@@ -12389,10 +12426,11 @@ impl App {
     /// and stage it on this remote box. The drained pull resolves to a
     /// `paste_input` call on the embedded terminal — see `drain_remote_pulls`.
     fn request_remote_clipboard(&mut self) {
-        let Some(log_path) = std::env::var_os("CROFT_DROP_RELAY_LOG").map(PathBuf::from) else {
+        let Some(log_path) = self.relay_log_path() else {
             self.status = String::from("Cmd+V: drop relay vanished");
             return;
         };
+        self.ensure_relay_dir();
         let request_id = format!(
             "clip-{}-{}",
             std::process::id(),
@@ -12426,7 +12464,7 @@ impl App {
         if self.pending_remote_pulls.is_empty() {
             return false;
         }
-        let Some(inbox) = std::env::var_os("CROFT_DROP_RELAY_INBOX").map(PathBuf::from) else {
+        let Some(inbox) = self.relay_inbox_path() else {
             self.pending_remote_pulls.clear();
             self.status = String::from("Drop relay vanished mid-pull");
             return true;
@@ -12583,10 +12621,11 @@ impl App {
     }
 
     fn request_remote_url_open(&mut self, url: String) {
-        let Some(log_path) = std::env::var_os("CROFT_DROP_RELAY_LOG").map(PathBuf::from) else {
+        let Some(log_path) = self.relay_log_path() else {
             self.status = String::from("Open link: drop relay vanished");
             return;
         };
+        self.ensure_relay_dir();
         let request_id = format!(
             "open-{}-{}",
             std::process::id(),
@@ -18470,6 +18509,31 @@ pub fn parse_foreign_dropped_paths(s: &str) -> Vec<PathBuf> {
         .filter(|p| p.is_absolute())
         .filter(|p| !is_iterm2_inline_image_drop(p))
         .collect()
+}
+
+/// True when every token in a bracketed-paste payload normalises to an absolute
+/// path (and there is at least one). This is the signature of a genuine Finder
+/// drag, which carries only the dragged file path(s). A real drag does NOT move
+/// keyboard focus to the Explorer tree, so a focus-only gate silently dropped
+/// every drag where the user had last clicked the terminal or editor. A text
+/// paste that merely *contains* a path — a shell command like `cat /etc/hosts`,
+/// a pasted code snippet — always has at least one non-path token, so it returns
+/// false and is left to land as ordinary text rather than being hijacked into a
+/// relay pull that has no local file to fetch.
+fn is_pure_path_payload(s: &str) -> bool {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let tokens = shell_split_drop_payload(trimmed);
+    if tokens.is_empty() {
+        return false;
+    }
+    tokens.iter().all(|t| {
+        normalise_dropped_token(t)
+            .map(|p| p.is_absolute())
+            .unwrap_or(false)
+    })
 }
 
 /// True when the dropped path is iTerm2's temp file for an inline-image
