@@ -95,6 +95,14 @@ const CHORDS: &[(&str, &str)] = &[
     ("cmd+alt+shift+s", pl::CMD_OPT_SHIFT_S_HEX),
     ("cmd+alt+shift+t", pl::CMD_OPT_SHIFT_T_HEX),
     ("cmd+alt+shift+n", pl::CMD_OPT_SHIFT_N_HEX),
+    // Join Lines, Transform Upper/Lower/Title, Sort Asc/Desc, Trim Trailing.
+    ("cmd+alt+shift+j", pl::CMD_OPT_SHIFT_J_HEX),
+    ("cmd+alt+shift+u", pl::CMD_OPT_SHIFT_U_HEX),
+    ("cmd+alt+shift+l", pl::CMD_OPT_SHIFT_L_HEX),
+    ("cmd+alt+shift+c", pl::CMD_OPT_SHIFT_C_HEX),
+    ("cmd+alt+shift+a", pl::CMD_OPT_SHIFT_A_HEX),
+    ("cmd+alt+shift+d", pl::CMD_OPT_SHIFT_D_HEX),
+    ("cmd+alt+shift+w", pl::CMD_OPT_SHIFT_W_HEX),
     ("cmd+alt+arrow_left", pl::CMD_OPT_LEFT_HEX),
     ("cmd+alt+arrow_right", pl::CMD_OPT_RIGHT_HEX),
     // Multi-cursor: add cursor above / below.

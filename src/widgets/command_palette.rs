@@ -181,6 +181,13 @@ impl Command {
         match self {
             Command::MoveLineUp => "Alt+↑",
             Command::MoveLineDown => "Alt+↓",
+            Command::JoinLines => "Cmd+Opt+Shift+J",
+            Command::TransformUpper => "Cmd+Opt+Shift+U",
+            Command::TransformLower => "Cmd+Opt+Shift+L",
+            Command::TransformTitle => "Cmd+Opt+Shift+C",
+            Command::SortLinesAscending => "Cmd+Opt+Shift+A",
+            Command::SortLinesDescending => "Cmd+Opt+Shift+D",
+            Command::TrimTrailingWhitespace => "Cmd+Opt+Shift+W",
             Command::ToggleLineComment => "Cmd+/",
             Command::ToggleBlockComment => "Shift+Alt+A",
             Command::ToggleWordWrap => "Alt+Z",

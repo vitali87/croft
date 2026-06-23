@@ -33,17 +33,13 @@ On macOS, the `Cmd` chords below only reach croft after you run a one-time setup
 
 ## Command Palette
 
-`Cmd`/`Ctrl`+`Shift`+`P` opens the Command Palette: type to fuzzy-search every named command, `↑`/`↓` to move, `Enter` to run, `Esc` to close. Commands that have a dedicated chord show it on the right. Beyond the chord-bound actions above, these editor commands are reachable only here:
+`Cmd`/`Ctrl`+`Shift`+`P` opens the Command Palette: type to fuzzy-search every named command, `↑`/`↓` to move, `Enter` to run, `Esc` to close. Every command shows its chord on the right. All editor text commands now carry a chord (see [Editor: text](#editor-text)) — the palette is a second way to reach them and a discovery surface for their accelerators. A few feature commands are reachable from the palette without a dedicated chord:
 
 | Command | Action |
 |---------|--------|
-| Join Lines | Collapse the selected lines (or the current line with the next) into one, single-spaced |
-| Transform to Uppercase / Lowercase / Title Case | Re-case the selection, or the word under the cursor when nothing is selected |
-| Sort Lines Ascending / Descending | Sort the selected lines (or the whole file when nothing is selected) lexicographically |
-| Trim Trailing Whitespace | Strip trailing spaces and tabs from every line |
+| Debug: Restart / Add Conditional Breakpoint / Toggle Break on Raised Exceptions | Run/debug actions reachable from the Run and Debug panel and the palette |
 | Debug: Attach to Python Process | Pick a running CPython 3.14+ process and drop a `pdb` REPL into it (PEP 768 `sys.remote_exec`); the debugger runs in a croft terminal, elevating with `sudo` when the OS requires it |
-
-The bracket / character / indentation commands (Go to Bracket, Select to Bracket, Transpose Characters, Convert Indentation to Spaces / Tabs, Trim Final Newlines) all carry their own chords, listed under [Editor: text](#editor-text).
+| Preferences: Color Theme | Pick the active color theme (also via the settings gear) |
 
 ## Explorer (file tree)
 
@@ -129,6 +125,10 @@ The bracket / character / indentation commands (Go to Bracket, Select to Bracket
 | `Cmd`+`Opt`+`Shift`+`S` | Convert Indentation to Spaces: replace each tab in every line's leading indentation with one tab width of spaces (4, or 2 in YAML) |
 | `Cmd`+`Opt`+`Shift`+`T` | Convert Indentation to Tabs: replace each leading run of one tab width of spaces with a tab, leaving any remainder |
 | `Cmd`+`Opt`+`Shift`+`N` | Trim Final Newlines: drop trailing blank lines at the end of the file (always keeping at least one line) |
+| `Cmd`+`Opt`+`Shift`+`J` | Join Lines: collapse the selected lines (or the current line with the next) into one, single-spaced |
+| `Cmd`+`Opt`+`Shift`+`U` / `L` / `C` | Transform the selection (or the word under the cursor) to Uppercase / Lowercase / Title Case |
+| `Cmd`+`Opt`+`Shift`+`A` / `D` | Sort the selected lines (or the whole file) Ascending / Descending |
+| `Cmd`+`Opt`+`Shift`+`W` | Trim Trailing Whitespace: strip trailing spaces and tabs from every line |
 | Mouse drag | Select text; every other occurrence of a single-line selection highlights in blue |
 | `Ctrl`+`C` / `Cmd`+`C` | Copy the selection to the system clipboard |
 | `Ctrl`+`X` / `Cmd`+`X` | Cut the selection |
@@ -285,6 +285,10 @@ Disabling takes effect immediately for the viewers and Vim (a disabled PDF/CSV v
 | `⌘⌥\` | Select to Bracket |
 | `⌘⌥⇧S` / `⌘⌥⇧T` | Convert Indentation to Spaces / Tabs |
 | `⌘⌥⇧N` | Trim Final Newlines |
+| `⌘⌥⇧J` | Join Lines |
+| `⌘⌥⇧U` / `⌘⌥⇧L` / `⌘⌥⇧C` | Transform to Uppercase / Lowercase / Title Case |
+| `⌘⌥⇧A` / `⌘⌥⇧D` | Sort Lines Ascending / Descending |
+| `⌘⌥⇧W` | Trim Trailing Whitespace |
 | `⌥⌘←` / `⌥⌘→` | Focus the left / right editor group |
 | `⌘F12` | Go to Implementations |
 | `⌃⇧F12` | Go to Declaration |

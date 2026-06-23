@@ -10713,6 +10713,53 @@ impl App {
             }
             return;
         }
+        // Formerly palette-only editor commands, now each on a chord so none
+        // ships without an accelerator (croft tenet: everything has a shortcut).
+        if is_join_lines_key(key) {
+            if self.editor_is_text() {
+                self.editor.join_lines();
+            }
+            return;
+        }
+        if is_transform_upper_key(key) {
+            if self.editor_is_text() {
+                self.editor
+                    .transform_selection_case(crate::widgets::editor::CaseTransform::Upper);
+            }
+            return;
+        }
+        if is_transform_lower_key(key) {
+            if self.editor_is_text() {
+                self.editor
+                    .transform_selection_case(crate::widgets::editor::CaseTransform::Lower);
+            }
+            return;
+        }
+        if is_transform_title_key(key) {
+            if self.editor_is_text() {
+                self.editor
+                    .transform_selection_case(crate::widgets::editor::CaseTransform::Title);
+            }
+            return;
+        }
+        if is_sort_lines_asc_key(key) {
+            if self.editor_is_text() {
+                self.editor.sort_lines(true);
+            }
+            return;
+        }
+        if is_sort_lines_desc_key(key) {
+            if self.editor_is_text() {
+                self.editor.sort_lines(false);
+            }
+            return;
+        }
+        if is_trim_trailing_whitespace_key(key) {
+            if self.editor_is_text() && self.editor.trim_trailing_whitespace() {
+                self.status = String::from("Trimmed trailing whitespace");
+            }
+            return;
+        }
         // Go to Definition (F12) / References (Shift+F12) / Type Definition
         // (Ctrl+F12) / Implementations (Cmd+F12) / Declaration (Ctrl+Shift+F12),
         // the VS Code F12-family bindings, also need a real text buffer. All are
@@ -17601,6 +17648,41 @@ fn is_indentation_to_tabs_key(key: KeyEvent) -> bool {
 /// surfaced as a command).
 fn is_trim_final_newlines_key(key: KeyEvent) -> bool {
     is_cmd_alt_shift_letter(key, 'n')
+}
+
+/// `Cmd+Opt+Shift+J`: Join Lines (`editor.action.joinLines`).
+fn is_join_lines_key(key: KeyEvent) -> bool {
+    is_cmd_alt_shift_letter(key, 'j')
+}
+
+/// `Cmd+Opt+Shift+U`: Transform to Uppercase (`editor.action.transformToUppercase`).
+fn is_transform_upper_key(key: KeyEvent) -> bool {
+    is_cmd_alt_shift_letter(key, 'u')
+}
+
+/// `Cmd+Opt+Shift+L`: Transform to Lowercase (`editor.action.transformToLowercase`).
+fn is_transform_lower_key(key: KeyEvent) -> bool {
+    is_cmd_alt_shift_letter(key, 'l')
+}
+
+/// `Cmd+Opt+Shift+C`: Transform to Title Case (`editor.action.transformToTitlecase`).
+fn is_transform_title_key(key: KeyEvent) -> bool {
+    is_cmd_alt_shift_letter(key, 'c')
+}
+
+/// `Cmd+Opt+Shift+A`: Sort Lines Ascending (`editor.action.sortLinesAscending`).
+fn is_sort_lines_asc_key(key: KeyEvent) -> bool {
+    is_cmd_alt_shift_letter(key, 'a')
+}
+
+/// `Cmd+Opt+Shift+D`: Sort Lines Descending (`editor.action.sortLinesDescending`).
+fn is_sort_lines_desc_key(key: KeyEvent) -> bool {
+    is_cmd_alt_shift_letter(key, 'd')
+}
+
+/// `Cmd+Opt+Shift+W`: Trim Trailing Whitespace (`editor.action.trimTrailingWhitespace`).
+fn is_trim_trailing_whitespace_key(key: KeyEvent) -> bool {
+    is_cmd_alt_shift_letter(key, 'w')
 }
 
 /// True for `Cmd+Opt+Shift+<letter>` (or `Ctrl+Opt+Shift+<letter>` on Termux):
