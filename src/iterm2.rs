@@ -220,6 +220,9 @@ const CMD_OPT_SHIFT_D_KEY: &str = "0x44-0x1a0000-0x2";
 const CMD_OPT_SHIFT_D_HEX: &str = "0x1b 0x5b 0x36 0x38 0x3b 0x31 0x32 0x75";
 const CMD_OPT_SHIFT_W_KEY: &str = "0x57-0x1a0000-0xd";
 const CMD_OPT_SHIFT_W_HEX: &str = "0x1b 0x5b 0x38 0x37 0x3b 0x31 0x32 0x75";
+// `F` = Format Document (VS Code's `Shift+Alt+F`), CSI-u `ESC [ 70 ; 12 u`.
+const CMD_OPT_SHIFT_F_KEY: &str = "0x46-0x1a0000-0x3";
+const CMD_OPT_SHIFT_F_HEX: &str = "0x1b 0x5b 0x37 0x30 0x3b 0x31 0x32 0x75";
 /// `Cmd+Opt+Left` / `Cmd+Opt+Right` -> move focus to the left / right
 /// editor group while split (croft's `is_focus_group_left_key` /
 /// `is_focus_group_right_key`). Arrows use the 2-part function-key form
@@ -435,6 +438,7 @@ pub(crate) mod payloads {
     pub(crate) const CMD_OPT_SHIFT_A_HEX: &str = super::CMD_OPT_SHIFT_A_HEX;
     pub(crate) const CMD_OPT_SHIFT_D_HEX: &str = super::CMD_OPT_SHIFT_D_HEX;
     pub(crate) const CMD_OPT_SHIFT_W_HEX: &str = super::CMD_OPT_SHIFT_W_HEX;
+    pub(crate) const CMD_OPT_SHIFT_F_HEX: &str = super::CMD_OPT_SHIFT_F_HEX;
     pub(crate) const CMD_C_HEX: &str = super::CMD_C_HEX;
     pub(crate) const CMD_D_HEX: &str = super::CMD_D_HEX;
     pub(crate) const CMD_DIGIT_CHORDS: &[(&str, &str)] = super::CMD_DIGIT_CHORDS;
@@ -715,6 +719,7 @@ pub fn apply_croft_key_settings(plist: &mut Value) -> Result<(), ITerm2Error> {
         (CMD_OPT_SHIFT_A_KEY, CMD_OPT_SHIFT_A_HEX),
         (CMD_OPT_SHIFT_D_KEY, CMD_OPT_SHIFT_D_HEX),
         (CMD_OPT_SHIFT_W_KEY, CMD_OPT_SHIFT_W_HEX),
+        (CMD_OPT_SHIFT_F_KEY, CMD_OPT_SHIFT_F_HEX),
         (CMD_OPT_LEFT_KEY, CMD_OPT_LEFT_HEX),
         (CMD_OPT_RIGHT_KEY, CMD_OPT_RIGHT_HEX),
         (CMD_OPT_UP_KEY, CMD_OPT_UP_HEX),
@@ -1183,6 +1188,11 @@ mod tests {
                 CMD_OPT_SHIFT_W_KEY,
                 CMD_OPT_SHIFT_W_HEX,
                 "Cmd+Opt+Shift+W Trim Trailing Whitespace",
+            ),
+            (
+                CMD_OPT_SHIFT_F_KEY,
+                CMD_OPT_SHIFT_F_HEX,
+                "Cmd+Opt+Shift+F Format Document",
             ),
         ] {
             assert_eq!(

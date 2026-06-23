@@ -1428,6 +1428,7 @@ pub struct App {
     implementation_request_id: Option<u64>,
     references_request_id: Option<u64>,
     rename_request_id: Option<u64>,
+    format_request_id: Option<u64>,
     nav: NavHistory,
     editor_vim_chord: EditorVimChord,
     /// Native modal (vim-style) editing for the editor pane. When enabled it
@@ -2023,6 +2024,7 @@ impl App {
             file_finder_index_dirty: false,
             completion_request_id: None,
             rename_request_id: None,
+            format_request_id: None,
             hover: HoverDwell::default(),
             hover_popup: None,
             hover_request_id: None,
@@ -4954,6 +4956,73 @@ impl App {
             file_count += 1;
         }
         Ok((file_count, occ_count))
+    }
+
+    /// VS Code "Format Document" (Cmd+Opt+Shift+F): ask the language server to
+    /// reformat the active buffer. No-op on read-only diff / sheet / image
+    /// tabs. The reply is applied in [`drain_lsp_format`].
+    fn start_format_document(&mut self) {
+        if self.editor.diff.is_some() || self.editor.sheet.is_some() || self.editor.image.is_some()
+        {
+            return;
+        }
+        let Some(path) = self.editor.path.clone() else {
+            self.status = String::from("No file open");
+            return;
+        };
+        let Some(lsp) = self.lsp.as_mut() else {
+            self.status = String::from("No language server for this file");
+            return;
+        };
+        // Mirror the editor's indentation preference; servers that carry their
+        // own config (rustfmt, ruff, prettier) ignore these but the fields are
+        // required by the LSP request.
+        let (tab_size, insert_spaces) = self.editor.indent_preference();
+        let id = lsp.request_formatting(path, tab_size, insert_spaces);
+        self.format_request_id = Some(id);
+        self.status = String::from("Formatting document...");
+    }
+
+    pub fn drain_lsp_format(&mut self) -> bool {
+        let mut arrived = false;
+        let mut edits: Option<Vec<crate::widgets::editor::TextSpanEdit>> = None;
+        let mut unsupported = false;
+        let mut path: Option<PathBuf> = None;
+        {
+            let Some(lsp) = self.lsp.as_ref() else {
+                return false;
+            };
+            while let Some(result) = lsp.drain_formatting() {
+                if Some(result.request_id) != self.format_request_id {
+                    continue;
+                }
+                arrived = true;
+                edits = result.edits;
+                unsupported = result.unsupported;
+                path = Some(result.path);
+            }
+        }
+        if !arrived {
+            return false;
+        }
+        self.format_request_id = None;
+        if unsupported {
+            self.status = String::from("No formatter available for this file");
+            return true;
+        }
+        match (edits, path) {
+            (Some(edits), Some(path)) if !edits.is_empty() => {
+                match self.editor.apply_rename_to_open_tab(&path, &edits) {
+                    Some(_) => {
+                        self.editor.clamp_cursor();
+                        self.status = String::from("Formatted document");
+                    }
+                    None => self.status = String::from("Format failed: document not open"),
+                }
+            }
+            _ => self.status = String::from("Document already formatted"),
+        }
+        true
     }
 
     /// Route the key through the completion popup when one is open.
@@ -10760,6 +10829,14 @@ impl App {
             }
             return;
         }
+        // VS Code "Format Document" (Cmd+Opt+Shift+F): reformat the whole buffer
+        // through the language server. No-op on read-only diff / sheet / image.
+        if is_format_document_key(key) {
+            if self.editor_is_text() {
+                self.start_format_document();
+            }
+            return;
+        }
         // Go to Definition (F12) / References (Shift+F12) / Type Definition
         // (Ctrl+F12) / Implementations (Cmd+F12) / Declaration (Ctrl+Shift+F12),
         // the VS Code F12-family bindings, also need a real text buffer. All are
@@ -13278,6 +13355,7 @@ impl App {
                 self.editor.indentation_to_tabs();
                 self.status = String::from("Converted indentation to tabs");
             }
+            Cmd::FormatDocument => self.start_format_document(),
             Cmd::TrimFinalNewlines => {
                 if self.editor.trim_final_newlines() {
                     self.status = String::from("Trimmed final newlines");
@@ -17685,6 +17763,12 @@ fn is_trim_trailing_whitespace_key(key: KeyEvent) -> bool {
     is_cmd_alt_shift_letter(key, 'w')
 }
 
+/// `Cmd+Opt+Shift+F`: Format Document (`editor.action.formatDocument`, VS Code's
+/// `Shift+Alt+F`). Reformats the whole buffer through the language server.
+fn is_format_document_key(key: KeyEvent) -> bool {
+    is_cmd_alt_shift_letter(key, 'f')
+}
+
 /// True for `Cmd+Opt+Shift+<letter>` (or `Ctrl+Opt+Shift+<letter>` on Termux):
 /// the three-modifier sibling of [`is_cmd_shift_letter`], used for editor
 /// commands VS Code leaves unbound so croft can still honor "everything has a
@@ -19670,6 +19754,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let implementation_changed = app.drain_lsp_implementation();
         let references_changed = app.drain_lsp_references();
         let rename_changed = app.drain_lsp_rename();
+        let format_changed = app.drain_lsp_format();
         let semantic_changed = app.drain_lsp_semantic_tokens();
         let diagnostics_changed = app.drain_lsp_diagnostics();
         let progress_changed = app.drain_lsp_progress();
@@ -19718,6 +19803,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             || implementation_changed
             || references_changed
             || rename_changed
+            || format_changed
             || semantic_changed
             || diagnostics_changed
             || progress_changed

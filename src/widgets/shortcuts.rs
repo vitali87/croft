@@ -217,6 +217,10 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 description: "Toggle word wrap for this file",
             },
             ShortcutEntry {
+                keys: "Cmd/Ctrl+Opt+Shift+F",
+                description: "Format Document (reformat the whole buffer via the language server)",
+            },
+            ShortcutEntry {
                 keys: "Cmd/Ctrl+C",
                 description: "Copy the selection (native system clipboard; OSC 52 fallback on remote)",
             },

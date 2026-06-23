@@ -41,6 +41,7 @@ pub enum Command {
     IndentationToSpaces,
     IndentationToTabs,
     TrimFinalNewlines,
+    FormatDocument,
     // --- File / editor management ---
     SaveFile,
     CloseEditor,
@@ -94,6 +95,7 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::IndentationToSpaces,
     Command::IndentationToTabs,
     Command::TrimFinalNewlines,
+    Command::FormatDocument,
     Command::SaveFile,
     Command::CloseEditor,
     Command::SplitEditor,
@@ -146,6 +148,7 @@ impl Command {
             Command::IndentationToSpaces => "Convert Indentation to Spaces",
             Command::IndentationToTabs => "Convert Indentation to Tabs",
             Command::TrimFinalNewlines => "Trim Final Newlines",
+            Command::FormatDocument => "Format Document",
             Command::SaveFile => "File: Save",
             Command::CloseEditor => "View: Close Editor",
             Command::SplitEditor => "View: Split Editor",
@@ -199,6 +202,7 @@ impl Command {
             Command::IndentationToSpaces => "Cmd+Opt+Shift+S",
             Command::IndentationToTabs => "Cmd+Opt+Shift+T",
             Command::TrimFinalNewlines => "Cmd+Opt+Shift+N",
+            Command::FormatDocument => "Cmd+Opt+Shift+F",
             Command::SaveFile => "Cmd+S",
             Command::CloseEditor => "Cmd+W",
             Command::SplitEditor => "Cmd+\\",
@@ -618,6 +622,20 @@ mod tests {
         assert_eq!(
             palette.results.first(),
             Some(&builtin(Command::SortLinesAscending))
+        );
+    }
+
+    #[test]
+    fn format_document_is_reachable_and_shows_its_chord() {
+        let mut palette = CommandPalette::new();
+        palette.set_query("format document");
+        assert_eq!(
+            palette.results.first(),
+            Some(&builtin(Command::FormatDocument))
+        );
+        assert_eq!(
+            Command::FormatDocument.keybinding_hint(),
+            "Cmd+Opt+Shift+F"
         );
     }
 

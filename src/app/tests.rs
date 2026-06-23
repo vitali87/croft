@@ -11440,6 +11440,31 @@ fn rename_symbol_key_is_plain_f2_only() {
 }
 
 #[test]
+fn format_document_key_is_cmd_opt_shift_f() {
+    // VS Code "Format Document" is Shift+Alt+F; croft forwards it as the
+    // Cmd+Opt+Shift+F chord (modifier byte 12) so it reaches the editor over
+    // iTerm2's GlobalKeyMap and Ghostty's csi: keybind alike.
+    assert!(is_format_document_key(key(
+        KeyCode::Char('F'),
+        KeyModifiers::SUPER | KeyModifiers::ALT | KeyModifiers::SHIFT
+    )));
+    // Linux / Termux fold the command modifier onto Ctrl.
+    assert!(is_format_document_key(key(
+        KeyCode::Char('f'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT
+    )));
+    // Any missing modifier, or a different letter, is not the chord.
+    assert!(!is_format_document_key(key(
+        KeyCode::Char('F'),
+        KeyModifiers::SUPER | KeyModifiers::SHIFT
+    )));
+    assert!(!is_format_document_key(key(
+        KeyCode::Char('g'),
+        KeyModifiers::SUPER | KeyModifiers::ALT | KeyModifiers::SHIFT
+    )));
+}
+
+#[test]
 fn change_all_occurrences_key_accepts_cmd_ctrl_or_alt_f2() {
     // macOS Cmd, Linux Ctrl, and iTerm2's Cmd-folded-to-Meta (ALT) all fire.
     assert!(is_change_all_occurrences_key(key(

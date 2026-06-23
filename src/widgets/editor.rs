@@ -2127,6 +2127,30 @@ impl Editor {
         n
     }
 
+    /// The editor's indentation preference as the LSP `FormattingOptions`
+    /// fields (`tab_size`, `insert_spaces`). croft always indents with spaces,
+    /// so `insert_spaces` is always true and `tab_size` is the width of the
+    /// language's indent unit (2 for YAML, 4 otherwise).
+    pub fn indent_preference(&self) -> (u32, bool) {
+        let width = indent_unit_for(self.lang).chars().count() as u32;
+        (width, true)
+    }
+
+    /// Clamp the cursor back inside the buffer after an edit that may have
+    /// removed rows or shortened the cursor's line (e.g. a whole-document
+    /// reformat). Without this a stale `cursor_row`/`cursor_col` can index past
+    /// the end of `lines` on the next keystroke.
+    pub fn clamp_cursor(&mut self) {
+        if self.lines.is_empty() {
+            self.cursor_row = 0;
+            self.cursor_col = 0;
+            return;
+        }
+        self.cursor_row = self.cursor_row.min(self.lines.len() - 1);
+        let max_col = self.lines[self.cursor_row].chars().count();
+        self.cursor_col = self.cursor_col.min(max_col);
+    }
+
     pub fn insert_str(&mut self, s: &str) {
         self.pin_on_edit();
         self.push_undo(EditKind::Paste);

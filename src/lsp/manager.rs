@@ -210,6 +210,21 @@ pub struct RenameResult {
     pub edits: Option<Vec<(PathBuf, Vec<TextSpanEdit>)>>,
 }
 
+#[derive(Debug)]
+pub struct FormatResult {
+    pub request_id: u64,
+    pub path: PathBuf,
+    /// `None` when no server advertises `documentFormattingProvider`, the
+    /// server declined, or it returned no edits. Otherwise the char-indexed
+    /// spans to apply to the single formatted document. Unlike rename,
+    /// `textDocument/formatting` only ever touches the requested file.
+    pub edits: Option<Vec<TextSpanEdit>>,
+    /// True when no spawned server advertises a usable
+    /// `documentFormattingProvider`, so the app can tell "nothing to format"
+    /// apart from "no formatter for this language".
+    pub unsupported: bool,
+}
+
 /// A fresh batch of semantic tokens for a document, pushed to the editor
 /// to overlay on the tree-sitter highlights. Unlike the navigation
 /// requests this carries no `request_id`: it is keyed by `path` and the
@@ -356,6 +371,12 @@ enum Cmd {
         character: u32,
         new_name: String,
     },
+    RequestFormatting {
+        request_id: u64,
+        path: PathBuf,
+        tab_size: u32,
+        insert_spaces: bool,
+    },
 }
 
 /// Per-language support for the optional, capability-gated navigation methods,
@@ -370,6 +391,7 @@ struct LangCapabilitySupport {
     type_definition: HashMap<Language, bool>,
     implementation: HashMap<Language, bool>,
     references: HashMap<Language, bool>,
+    formatting: HashMap<Language, bool>,
 }
 type CapabilitySupport = Arc<StdMutex<LangCapabilitySupport>>;
 
@@ -384,6 +406,7 @@ pub struct LspManager {
     impl_rx: std_mpsc::Receiver<ImplementationResult>,
     ref_rx: std_mpsc::Receiver<ReferencesResult>,
     rename_rx: std_mpsc::Receiver<RenameResult>,
+    format_rx: std_mpsc::Receiver<FormatResult>,
     semantic_rx: std_mpsc::Receiver<SemanticTokensUpdate>,
     diagnostics_rx: std_mpsc::Receiver<DiagnosticsUpdate>,
     progress_rx: std_mpsc::Receiver<ProgressUpdate>,
@@ -423,6 +446,7 @@ impl LspManager {
         let (impl_tx, impl_rx) = std_mpsc::channel();
         let (ref_tx, ref_rx) = std_mpsc::channel();
         let (rename_tx, rename_rx) = std_mpsc::channel();
+        let (format_tx, format_rx) = std_mpsc::channel();
         let (semantic_tx, semantic_rx) = std_mpsc::channel();
         let (diagnostics_tx, diagnostics_rx) = std_mpsc::channel();
         let (progress_tx, progress_rx) = std_mpsc::channel();
@@ -460,6 +484,7 @@ impl LspManager {
                 implementation: impl_tx,
                 references: ref_tx,
                 rename: rename_tx,
+                formatting: format_tx,
                 semantic_tokens: semantic_tx,
                 diagnostics: diagnostics_tx,
                 progress: progress_tx,
@@ -478,6 +503,7 @@ impl LspManager {
             impl_rx,
             ref_rx,
             rename_rx,
+            format_rx,
             semantic_rx,
             diagnostics_rx,
             progress_rx,
@@ -744,6 +770,34 @@ impl LspManager {
     pub fn drain_rename(&self) -> Option<RenameResult> {
         self.rename_rx.try_recv().ok()
     }
+
+    pub fn request_formatting(&mut self, path: PathBuf, tab_size: u32, insert_spaces: bool) -> u64 {
+        let id = self.next_request_id;
+        self.next_request_id += 1;
+        let _ = self.cmd_tx.send(Cmd::RequestFormatting {
+            request_id: id,
+            path,
+            tab_size,
+            insert_spaces,
+        });
+        id
+    }
+
+    pub fn drain_formatting(&self) -> Option<FormatResult> {
+        self.format_rx.try_recv().ok()
+    }
+
+    /// Whether the server for `lang` implements `textDocument/formatting`.
+    /// `None` means no server has reported yet. Read synchronously by the app
+    /// to decide whether to offer "Format Document".
+    pub fn language_supports_formatting(&self, lang: Language) -> Option<bool> {
+        self.capability_support
+            .lock()
+            .ok()?
+            .formatting
+            .get(&lang)
+            .copied()
+    }
 }
 
 struct ManagedClient {
@@ -758,6 +812,7 @@ struct ManagedClient {
     supports_implementation: bool,
     supports_references: bool,
     supports_rename: bool,
+    supports_formatting: bool,
     /// The server's semantic-token legend (token-type names by index),
     /// captured at spawn. `None` when the server advertises no
     /// `semanticTokensProvider` with full-document support.
@@ -814,6 +869,7 @@ struct ResultSenders {
     implementation: std_mpsc::Sender<ImplementationResult>,
     references: std_mpsc::Sender<ReferencesResult>,
     rename: std_mpsc::Sender<RenameResult>,
+    formatting: std_mpsc::Sender<FormatResult>,
     semantic_tokens: std_mpsc::Sender<SemanticTokensUpdate>,
     diagnostics: std_mpsc::Sender<DiagnosticsUpdate>,
     progress: std_mpsc::Sender<ProgressUpdate>,
@@ -947,6 +1003,16 @@ async fn worker_loop(
                     .request_rename(request_id, path, line, character, new_name, &tx.rename)
                     .await
             }
+            Cmd::RequestFormatting {
+                request_id,
+                path,
+                tab_size,
+                insert_spaces,
+            } => {
+                state
+                    .request_formatting(request_id, path, tab_size, insert_spaces, &tx.formatting)
+                    .await
+            }
         }
     }
 }
@@ -1043,6 +1109,8 @@ impl WorkerState {
                             implementation_supported(&caps.implementation_provider);
                         let supports_references = one_of_supported(&caps.references_provider);
                         let supports_rename = one_of_supported(&caps.rename_provider);
+                        let supports_formatting =
+                            one_of_supported(&caps.document_formatting_provider);
                         let semantic_legend = semantic_legend_of(caps).map(Arc::new);
                         let semantic_supports_range = semantic_tokens_range_supported(caps);
                         log_file::log(&format!(
@@ -1062,6 +1130,7 @@ impl WorkerState {
                             supports_implementation,
                             supports_references,
                             supports_rename,
+                            supports_formatting,
                             semantic_legend,
                             semantic_supports_range,
                         });
@@ -1079,6 +1148,7 @@ impl WorkerState {
             let supports_type_definition = spawned.iter().any(|c| c.supports_type_definition);
             let supports_implementation = spawned.iter().any(|c| c.supports_implementation);
             let supports_references = spawned.iter().any(|c| c.supports_references);
+            let supports_formatting = spawned.iter().any(|c| c.supports_formatting);
             if let Ok(mut support) = self.capability_support.lock() {
                 support.declaration.insert(lang, supports_declaration);
                 support
@@ -1086,6 +1156,7 @@ impl WorkerState {
                     .insert(lang, supports_type_definition);
                 support.implementation.insert(lang, supports_implementation);
                 support.references.insert(lang, supports_references);
+                support.formatting.insert(lang, supports_formatting);
             }
             self.clients.insert(key.clone(), spawned);
         }
@@ -1943,6 +2014,72 @@ impl WorkerState {
                 request_id,
                 path: path_clone,
                 edits,
+            });
+        });
+    }
+
+    async fn request_formatting(
+        &mut self,
+        request_id: u64,
+        path: PathBuf,
+        tab_size: u32,
+        insert_spaces: bool,
+        tx: &std_mpsc::Sender<FormatResult>,
+    ) {
+        let Some(doc) = self.docs.get(&path) else {
+            return;
+        };
+        let lang = doc.language;
+        let root = doc.project_root.clone();
+        // Re-probe so a formatter installed since the file opened is picked up
+        // without reopening (mirrors `request_rename`).
+        self.ensure_clients(lang, &root).await;
+        let Some(clients) = self.clients.get(&(lang, root)) else {
+            return;
+        };
+        let picked = clients
+            .iter()
+            .find(|c| c.supports_formatting)
+            .map(|c| (c.name.clone(), c.client.clone()));
+        let Some((server_name, client_arc)) = picked else {
+            let _ = tx.send(FormatResult {
+                request_id,
+                path,
+                edits: None,
+                unsupported: true,
+            });
+            return;
+        };
+        let Ok(uri) = Url::from_file_path(&path) else {
+            return;
+        };
+        let tx = tx.clone();
+        let path_clone = path.clone();
+        log_file::log(&format!(
+            "formatting request id={request_id} server={server_name} path={} tab_size={tab_size} insert_spaces={insert_spaces}",
+            path.display()
+        ));
+        tokio::spawn(async move {
+            let mut client = client_arc.lock().await;
+            let resp = client.formatting(uri, tab_size, insert_spaces).await;
+            drop(client);
+            let edits = match resp {
+                Ok(Some(tes)) => Some(tes.iter().map(text_edit_to_span).collect()),
+                Ok(None) => None,
+                Err(e) => {
+                    log_file::log(&format!("lsp[{server_name}] formatting error: {e}"));
+                    None
+                }
+            };
+            log_file::log(&format!(
+                "formatting response id={request_id} server={server_name} edits={}",
+                edits.as_ref().map(Vec::len).unwrap_or(0)
+            ));
+            let _ = tx.send(FormatResult {
+                request_id,
+                path: path_clone,
+                edits,
+                unsupported: false,
             });
         });
     }

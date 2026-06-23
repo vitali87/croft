@@ -103,6 +103,8 @@ const CHORDS: &[(&str, &str)] = &[
     ("cmd+alt+shift+a", pl::CMD_OPT_SHIFT_A_HEX),
     ("cmd+alt+shift+d", pl::CMD_OPT_SHIFT_D_HEX),
     ("cmd+alt+shift+w", pl::CMD_OPT_SHIFT_W_HEX),
+    // Format Document (editor.action.formatDocument).
+    ("cmd+alt+shift+f", pl::CMD_OPT_SHIFT_F_HEX),
     ("cmd+alt+arrow_left", pl::CMD_OPT_LEFT_HEX),
     ("cmd+alt+arrow_right", pl::CMD_OPT_RIGHT_HEX),
     // Multi-cursor: add cursor above / below.

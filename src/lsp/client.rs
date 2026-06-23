@@ -17,12 +17,13 @@ use lsp_types::request::{SemanticTokensRefresh, WorkDoneProgressCreate};
 use lsp_types::{
     ClientCapabilities, CompletionContext, CompletionParams, CompletionResponse,
     CompletionTriggerKind, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
-    DidOpenTextDocumentParams, DocumentSymbolParams, DocumentSymbolResponse, GotoDefinitionParams,
-    GotoDefinitionResponse, Hover, HoverParams, InitializeParams, InitializedParams, Location,
-    PartialResultParams, Position, ProgressParamsValue, Range, ReferenceContext, ReferenceParams,
-    RenameParams, SemanticTokensParams, SemanticTokensRangeParams, SemanticTokensRangeResult,
+    DidOpenTextDocumentParams, DocumentFormattingParams, DocumentSymbolParams,
+    DocumentSymbolResponse, FormattingOptions, GotoDefinitionParams, GotoDefinitionResponse, Hover,
+    HoverParams, InitializeParams, InitializedParams, Location, PartialResultParams, Position,
+    ProgressParamsValue, Range, ReferenceContext, ReferenceParams, RenameParams,
+    SemanticTokensParams, SemanticTokensRangeParams, SemanticTokensRangeResult,
     SemanticTokensResult, ServerCapabilities, TextDocumentContentChangeEvent,
-    TextDocumentIdentifier, TextDocumentItem, TextDocumentPositionParams, Url,
+    TextDocumentIdentifier, TextDocumentItem, TextDocumentPositionParams, TextEdit, Url,
     VersionedTextDocumentIdentifier, WorkDoneProgress, WorkDoneProgressParams, WorkspaceEdit,
     WorkspaceFolder,
 };
@@ -566,6 +567,32 @@ impl LspClient {
             })
             .await
             .context("rename")
+    }
+
+    /// `textDocument/formatting`: ask the server to reformat the whole
+    /// document. Returns the edits to apply (servers usually answer with a
+    /// single full-document replacement, but the spec allows many disjoint
+    /// edits). `tab_size`/`insert_spaces` carry the editor's indentation
+    /// preference; most formatters (rustfmt, ruff, prettier) honour their own
+    /// project config and ignore these, but the LSP fields are required.
+    pub async fn formatting(
+        &mut self,
+        uri: Url,
+        tab_size: u32,
+        insert_spaces: bool,
+    ) -> Result<Option<Vec<TextEdit>>> {
+        self.server
+            .formatting(DocumentFormattingParams {
+                text_document: TextDocumentIdentifier { uri },
+                options: FormattingOptions {
+                    tab_size,
+                    insert_spaces,
+                    ..FormattingOptions::default()
+                },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+            })
+            .await
+            .context("formatting")
     }
 
     pub async fn semantic_tokens_full(&mut self, uri: Url) -> Result<Option<SemanticTokensResult>> {

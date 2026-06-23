@@ -129,6 +129,7 @@ On macOS, the `Cmd` chords below only reach croft after you run a one-time setup
 | `Cmd`+`Opt`+`Shift`+`U` / `L` / `C` | Transform the selection (or the word under the cursor) to Uppercase / Lowercase / Title Case |
 | `Cmd`+`Opt`+`Shift`+`A` / `D` | Sort the selected lines (or the whole file) Ascending / Descending |
 | `Cmd`+`Opt`+`Shift`+`W` | Trim Trailing Whitespace: strip trailing spaces and tabs from every line |
+| `Cmd`+`Opt`+`Shift`+`F` | Format Document: reformat the whole buffer through the language server (rustfmt, ruff, prettier, …); the edit lands as one undo step and leaves the tab dirty |
 | Mouse drag | Select text; every other occurrence of a single-line selection highlights in blue |
 | `Ctrl`+`C` / `Cmd`+`C` | Copy the selection to the system clipboard |
 | `Ctrl`+`X` / `Cmd`+`X` | Cut the selection |
@@ -289,6 +290,7 @@ Disabling takes effect immediately for the viewers and Vim (a disabled PDF/CSV v
 | `⌘⌥⇧U` / `⌘⌥⇧L` / `⌘⌥⇧C` | Transform to Uppercase / Lowercase / Title Case |
 | `⌘⌥⇧A` / `⌘⌥⇧D` | Sort Lines Ascending / Descending |
 | `⌘⌥⇧W` | Trim Trailing Whitespace |
+| `⌘⌥⇧F` | Format Document (reformat the whole buffer via the language server) |
 | `⌥⌘←` / `⌥⌘→` | Focus the left / right editor group |
 | `⌘F12` | Go to Implementations |
 | `⌃⇧F12` | Go to Declaration |
