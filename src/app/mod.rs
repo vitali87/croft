@@ -720,6 +720,11 @@ fn shortcut_for(action: &MenuAction) -> Option<&'static str> {
         MenuAction::GoToTypeDefinitionAt { .. } => Some("⌃F12"),
         MenuAction::GoToImplementationAt { .. } => Some("⌘F12"),
         MenuAction::ToggleBreakpointAt { .. } => Some("F9"),
+        MenuAction::EditBreakpointConditionAt { .. } => Some("⇧F9"),
+        MenuAction::OpenThemePicker => Some("⌘K ⌘T"),
+        MenuAction::CloseTabsToRight(_) => Some("⌘K →"),
+        MenuAction::SelectForCompare(_) => Some("⌘K S"),
+        MenuAction::CompareWithSelected { .. } => Some("⌘K C"),
         _ => None,
     }
 }
@@ -1431,6 +1436,11 @@ pub struct App {
     format_request_id: Option<u64>,
     nav: NavHistory,
     editor_vim_chord: EditorVimChord,
+    /// `Cmd+K` leader: armed when the user presses the prefix, holding the
+    /// instant it started so the next key within `CMD_K_LEADER_TIMEOUT`
+    /// completes a `Cmd+K`-prefixed chord (VS Code's two-key model). `None`
+    /// when no chord is in flight.
+    cmd_k_leader: Option<std::time::Instant>,
     /// Native modal (vim-style) editing for the editor pane. When enabled it
     /// supersedes the always-on `editor_vim_chord` convenience layer.
     vim: crate::vim::VimState,
@@ -1981,6 +1991,7 @@ impl App {
             lsp_progress: std::collections::HashMap::new(),
             completion_popup: None,
             editor_vim_chord: EditorVimChord::default(),
+            cmd_k_leader: None,
             vim: crate::vim::VimState::new(),
             vim_last_find: None,
             vim_visual_line: false,
@@ -7237,6 +7248,94 @@ impl App {
         }
     }
 
+    /// Dispatch the second key of a `Cmd+K`-prefixed chord (VS Code's two-key
+    /// model). Returns `true` if the key completed a chord and was consumed,
+    /// `false` if it matched nothing (the caller then processes it normally).
+    /// The second key reaches us as ordinary input, so `Cmd` on the trailing
+    /// key (e.g. `Cmd+K Cmd+T`) is accepted but not required.
+    fn handle_cmd_k_chord(&mut self, key: KeyEvent) -> bool {
+        let plain = !key.modifiers.contains(KeyModifiers::ALT);
+        match key.code {
+            // Cmd+K Cmd+T / Cmd+K T: open the Color Theme picker.
+            KeyCode::Char(c) if plain && c.eq_ignore_ascii_case(&'t') => {
+                self.open_theme_picker();
+                true
+            }
+            // Cmd+K →: close the editors to the right of the active tab.
+            KeyCode::Right if plain => {
+                let from = self.editor.active_index();
+                let removed = self.editor.close_to_right(from);
+                if removed > 0 {
+                    self.sync_open_file_poll_mtime();
+                    self.status = if removed == 1 {
+                        String::from("Closed 1 tab to the right")
+                    } else {
+                        format!("Closed {removed} tabs to the right")
+                    };
+                    self.poke_cursor();
+                }
+                true
+            }
+            // Cmd+K S: mark the active file as the compare anchor.
+            KeyCode::Char(c) if plain && c.eq_ignore_ascii_case(&'s') => {
+                if let Some(path) = self.editor.path.clone() {
+                    let label = path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| path.display().to_string());
+                    self.compare_anchor = Some(path);
+                    self.status = format!("Selected {label} for compare");
+                } else {
+                    self.status = String::from("Select for Compare: no active file");
+                }
+                true
+            }
+            // Cmd+K C: diff the active file against the compare anchor.
+            KeyCode::Char(c) if plain && c.eq_ignore_ascii_case(&'c') => {
+                match (self.compare_anchor.clone(), self.editor.path.clone()) {
+                    (Some(anchor), Some(other)) => match self.editor.open_diff(&anchor, &other) {
+                        Ok(()) => {
+                            self.focus_pane(Pane::Editor);
+                            self.compare_anchor = None;
+                            self.sync_open_file_poll_mtime();
+                            let l = anchor
+                                .file_name()
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| anchor.display().to_string());
+                            let r = other
+                                .file_name()
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| other.display().to_string());
+                            self.status = format!("Diff: {l} \u{2194} {r}");
+                        }
+                        Err(e) => self.status = format!("Diff failed: {e}"),
+                    },
+                    (None, _) => {
+                        self.status = String::from("Compare with Selected: nothing selected yet")
+                    }
+                    (_, None) => {
+                        self.status = String::from("Compare with Selected: no active file")
+                    }
+                }
+                true
+            }
+            // Cmd+K W: close all editor tabs.
+            KeyCode::Char(c) if plain && c.eq_ignore_ascii_case(&'w') => {
+                let removed = self.editor.close_all();
+                self.sync_open_file_poll_mtime();
+                self.status = if removed == 1 {
+                    String::from("Closed 1 tab")
+                } else {
+                    format!("Closed {removed} tabs")
+                };
+                self.poke_cursor();
+                self.collapse_split_if_empty();
+                true
+            }
+            _ => false,
+        }
+    }
+
     fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
         if key.kind != KeyEventKind::Press && key.kind != KeyEventKind::Repeat {
             return Ok(());
@@ -7244,6 +7343,17 @@ impl App {
         self.hover_popup = None;
         self.hover_diagnostic = None;
         self.hover_request_id = None;
+        // `Cmd+K` leader: if armed, this keystroke is the second half of a
+        // `Cmd+K`-prefixed chord. Consume the leader regardless; dispatch the
+        // chord if it matches and the window has not lapsed, otherwise fall
+        // through so the key keeps its normal meaning (e.g. Esc cancels).
+        if let Some(started) = self.cmd_k_leader.take() {
+            const CMD_K_LEADER_TIMEOUT: std::time::Duration =
+                std::time::Duration::from_millis(1500);
+            if started.elapsed() <= CMD_K_LEADER_TIMEOUT && self.handle_cmd_k_chord(key) {
+                return Ok(());
+            }
+        }
         // Modal layer: the unsupported-terminal nudge sits on top of everything
         // at startup. Any key dismisses it for this session; D also persists the
         // dismissal so it never shows again. All keys are swallowed so the user
@@ -7315,18 +7425,23 @@ impl App {
             self.perf.toggle();
             return Ok(());
         }
-        // A background update has landed and is waiting: F9 triggers the
-        // re-exec into the new binary. Gated on Ready so F9 passes through
-        // untouched the rest of the time.
-        if matches!(key.code, KeyCode::F(9)) && self.update_status == UpdateStatus::Ready {
-            self.pending_reexec = true;
-            self.quit = true;
-            return Ok(());
-        }
         // Debugger chords (VS Code defaults). F5 start/continue, Shift+F5 stop,
-        // F9 toggle breakpoint, F10 step over, F11/Shift+F11 step in/out.
+        // Shift+Cmd+F5 restart, Ctrl+F5 attach to a Python process, F9 toggle
+        // breakpoint, F10 step over, F11/Shift+F11 step in/out. Cmd is SUPER on
+        // macOS, Ctrl on Linux/Termux.
         if matches!(key.code, KeyCode::F(5)) {
-            if key.modifiers.contains(KeyModifiers::SHIFT) {
+            let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+            let cmd = key.modifiers.contains(KeyModifiers::SUPER)
+                || key.modifiers.contains(KeyModifiers::CONTROL);
+            if shift && cmd {
+                self.debug_restart();
+            } else if key.modifiers.contains(KeyModifiers::CONTROL)
+                && !shift
+                && !key.modifiers.contains(KeyModifiers::SUPER)
+                && !key.modifiers.contains(KeyModifiers::ALT)
+            {
+                self.open_attach_python_picker();
+            } else if shift {
                 self.debug_stop();
             } else {
                 self.debug_start_or_continue();
@@ -7341,7 +7456,19 @@ impl App {
             return Ok(());
         }
         if matches!(key.code, KeyCode::F(9)) {
-            self.debug_toggle_breakpoint();
+            if key.modifiers.contains(KeyModifiers::SHIFT) {
+                // Shift+F9: add or edit a conditional breakpoint at the cursor.
+                self.debug_edit_condition();
+            } else if key.modifiers.contains(KeyModifiers::ALT) {
+                // Alt+F9: toggle break-on-raised-exceptions.
+                self.debug_toggle_raised_exceptions();
+            } else if self.update_status == UpdateStatus::Ready {
+                // A background update has landed: bare F9 re-execs into it.
+                self.pending_reexec = true;
+                self.quit = true;
+            } else {
+                self.debug_toggle_breakpoint();
+            }
             return Ok(());
         }
         if matches!(key.code, KeyCode::F(10)) {
@@ -7355,6 +7482,13 @@ impl App {
                 "stepIn"
             };
             self.debug_step(cmd);
+            return Ok(());
+        }
+        // Arm the `Cmd+K` leader (VS Code's two-key chord prefix). The next
+        // keystroke is interpreted by `handle_cmd_k_chord`, checked at the top
+        // of this fn. Cmd is SUPER on macOS, Ctrl on Linux/Termux.
+        if is_cmd_k_leader_key(key) {
+            self.cmd_k_leader = Some(std::time::Instant::now());
             return Ok(());
         }
         if is_file_finder_key(key) {
@@ -17375,6 +17509,23 @@ fn is_file_finder_key(key: KeyEvent) -> bool {
 /// `Cmd+Shift+P` never collide).
 fn is_command_palette_key(key: KeyEvent) -> bool {
     is_cmd_shift_letter(key, 'p')
+}
+
+/// `Cmd+K` (macOS) / `Ctrl+K` (Linux / Termux): the leader for croft's
+/// `Cmd+K`-prefixed chords (Color Theme, Close to the Right, Select for /
+/// Compare with Selected, Close All). Rejects Shift and Alt so it never
+/// shadows a future `Cmd+K`+modifier chord.
+fn is_cmd_k_leader_key(key: KeyEvent) -> bool {
+    let KeyCode::Char(c) = key.code else {
+        return false;
+    };
+    if !c.eq_ignore_ascii_case(&'k') {
+        return false;
+    }
+    if key.modifiers.contains(KeyModifiers::SHIFT) || key.modifiers.contains(KeyModifiers::ALT) {
+        return false;
+    }
+    key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::SUPER)
 }
 
 /// `Cmd+/` (macOS) / `Ctrl+/` (Linux / Termux): Toggle Line Comment. Rejects

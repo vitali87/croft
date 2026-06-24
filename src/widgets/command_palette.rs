@@ -223,8 +223,14 @@ impl Command {
             Command::PauseDebugging => "F6",
             Command::ToggleBreakpoint => "F9",
             Command::StepOver => "F10",
-            _ => "",
+            Command::RestartDebugging => "Shift+Cmd+F5",
+            Command::EditBreakpointCondition => "Shift+F9",
+            Command::ToggleRaisedExceptions => "Alt+F9",
+            Command::AttachPythonProcess => "Ctrl+F5",
+            Command::ColorTheme => "Cmd+K Cmd+T",
         }
+        // No catch-all: every Command must carry an accelerator (croft tenet),
+        // so adding a variant fails to compile until its hint is supplied.
     }
 }
 

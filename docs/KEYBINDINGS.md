@@ -29,17 +29,31 @@ On macOS, the `Cmd` chords below only reach croft after you run a one-time setup
 | Click activity-bar icons | Switch between Explorer, Search, Source Control, Run and Debug, Remote, and Extensions |
 | Click the settings gear | Open settings → Color Theme picker (Croft Dark Blue / Croft Black) |
 | Drag a seam | Resize the sidebar, the split between editor columns, or the editor/terminal split |
+
+### `Cmd+K` chords
+
+`Cmd`/`Ctrl`+`K` is a leader (VS Code's two-key model): press it, then a second key within 1.5s. Pressing anything that completes no chord cancels the leader and keeps its normal meaning.
+
+| Keys | Action |
+|------|--------|
+| `Cmd+K` `Cmd+T` | Open the Color Theme picker |
+| `Cmd+K` `→` | Close the editor tabs to the right of the active one |
+| `Cmd+K` `S` | Select the active file as the compare anchor |
+| `Cmd+K` `C` | Diff the active file against the compare anchor |
+| `Cmd+K` `W` | Close all editor tabs |
 | Mouse wheel | Scroll the pane under the pointer |
 
 ## Command Palette
 
-`Cmd`/`Ctrl`+`Shift`+`P` opens the Command Palette: type to fuzzy-search every named command, `↑`/`↓` to move, `Enter` to run, `Esc` to close. Every command shows its chord on the right. All editor text commands now carry a chord (see [Editor: text](#editor-text)) — the palette is a second way to reach them and a discovery surface for their accelerators. A few feature commands are reachable from the palette without a dedicated chord:
+`Cmd`/`Ctrl`+`Shift`+`P` opens the Command Palette: type to fuzzy-search every named command, `↑`/`↓` to move, `Enter` to run, `Esc` to close. Every command shows its chord on the right, and every command now carries one — the palette is a second way to reach them and a discovery surface for their accelerators. The feature commands that previously had none:
 
-| Command | Action |
-|---------|--------|
-| Debug: Restart / Add Conditional Breakpoint / Toggle Break on Raised Exceptions | Run/debug actions reachable from the Run and Debug panel and the palette |
-| Debug: Attach to Python Process | Pick a running CPython 3.14+ process and drop a `pdb` REPL into it (PEP 768 `sys.remote_exec`); the debugger runs in a croft terminal, elevating with `sudo` when the OS requires it |
-| Preferences: Color Theme | Pick the active color theme (also via the settings gear) |
+| Command | Chord | Action |
+|---------|-------|--------|
+| Debug: Restart | `Shift`+`Cmd`+`F5` | Restart the active debug session |
+| Debug: Add Conditional Breakpoint | `Shift`+`F9` | Add or edit a conditional breakpoint at the cursor |
+| Debug: Toggle Break on Raised Exceptions | `Alt`+`F9` | Break on raised (not just uncaught) exceptions |
+| Debug: Attach to Python Process | `Ctrl`+`F5` | Pick a running CPython 3.14+ process and drop a `pdb` REPL into it (PEP 768 `sys.remote_exec`); the debugger runs in a croft terminal, elevating with `sudo` when the OS requires it |
+| Preferences: Color Theme | `Cmd`+`K` `Cmd`+`T` | Pick the active color theme (also via the settings gear) |
 
 ## Explorer (file tree)
 
@@ -214,8 +228,12 @@ Real breakpoint debugging over the Debug Adapter Protocol. Python is the verifie
 |------|--------|
 | `F5` | Start debugging the active file, or resume when paused at a breakpoint |
 | `Shift+F5` | Stop the debug session |
+| `Shift+Cmd+F5` | Restart the debug session |
+| `Ctrl+F5` | Attach to a running Python process |
 | `F6` | Pause (interrupt) a running program |
 | `F9` | Toggle a breakpoint on the cursor's line (a red dot in the gutter); pushed live when a session is running |
+| `Shift+F9` | Add or edit a conditional breakpoint on the cursor's line |
+| `Alt+F9` | Toggle break on raised (not just uncaught) exceptions |
 | `F10` | Step over |
 | `F11` / `Shift+F11` | Step into / out |
 
@@ -281,6 +299,7 @@ Disabling takes effect immediately for the viewers and Vim (a disabled PDF/CSV v
 | `⌃⇧J` | Maximize the terminal pane |
 | `⌥⌘R` | Reveal in Finder (local macOS only) |
 | `⌘B` | Toggle the primary side bar |
+| `⌘K` | Leader for the `Cmd+K` chords (Color Theme, Close to the Right, compare, Close All); iTerm2's Edit ▸ Clear Buffer is relocated to `⌥⌘K` |
 | `⌘\` | Split the editor |
 | `⌘⇧\` | Go to Bracket (jump to the matching bracket) |
 | `⌘⌥\` | Select to Bracket |

@@ -4748,8 +4748,25 @@ fn shortcut_for_returns_expected_shortcuts_for_each_explorer_action() {
         }),
         Some("⌫")
     );
-    // Compare actions have no keybinding (no shortcut shown).
-    assert_eq!(shortcut_for(&MenuAction::SelectForCompare(p)), None);
+    // Every menu row carries an accelerator (croft tenet: no blank column).
+    // Color Theme, Close to the Right, and the compare actions are Cmd+K chords.
+    assert_eq!(shortcut_for(&MenuAction::OpenThemePicker), Some("⌘K ⌘T"));
+    assert_eq!(shortcut_for(&MenuAction::CloseTabsToRight(0)), Some("⌘K →"));
+    assert_eq!(
+        shortcut_for(&MenuAction::SelectForCompare(p.clone())),
+        Some("⌘K S")
+    );
+    assert_eq!(
+        shortcut_for(&MenuAction::CompareWithSelected {
+            anchor: p.clone(),
+            other: p.clone()
+        }),
+        Some("⌘K C")
+    );
+    assert_eq!(
+        shortcut_for(&MenuAction::EditBreakpointConditionAt { line: 0 }),
+        Some("⇧F9")
+    );
 }
 
 #[test]
@@ -5179,6 +5196,41 @@ fn ctrl_d_with_no_anchor_stashes_selected_file() {
     app.tree.selected = idx;
     app.handle_key(key(KeyCode::Char('d'), KeyModifiers::CONTROL))
         .unwrap();
+    assert_eq!(app.compare_anchor.as_deref(), Some(f.as_path()));
+}
+
+#[test]
+fn cmd_k_arms_leader_then_unmatched_second_key_clears_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.handle_key(key(KeyCode::Char('k'), KeyModifiers::SUPER))
+        .unwrap();
+    assert!(app.cmd_k_leader.is_some(), "Cmd+K arms the chord leader");
+    // A key that completes no Cmd+K chord clears the leader and falls through
+    // to its normal meaning.
+    app.handle_key(key(KeyCode::Char('q'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(
+        app.cmd_k_leader.is_none(),
+        "an unmatched second key clears the leader"
+    );
+}
+
+#[test]
+fn cmd_k_then_s_selects_active_file_for_compare() {
+    let tmp = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("a.txt");
+    std::fs::write(&f, "v1").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.path = Some(f.clone());
+    app.handle_key(key(KeyCode::Char('k'), KeyModifiers::SUPER))
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('s'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(
+        app.cmd_k_leader.is_none(),
+        "the chord consumes the armed leader"
+    );
     assert_eq!(app.compare_anchor.as_deref(), Some(f.as_path()));
 }
 

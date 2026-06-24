@@ -61,6 +61,19 @@ const CMD_D_KEY: &str = "0x64-0x100000-0x2";
 const CMD_D_HEX: &str = "0x1b 0x5b 0x31 0x30 0x30 0x3b 0x39 0x75";
 const CMD_G_KEY: &str = "0x67-0x100000-0x5";
 const CMD_G_HEX: &str = "0x1b 0x5b 0x31 0x30 0x33 0x3b 0x39 0x75";
+/// `Cmd+K` — leader for croft's `Cmd+K`-prefixed chords (Color Theme, Close to
+/// the Right, Select for / Compare with Selected, Close All). iTerm2 binds
+/// `Cmd+K` to Edit > Clear Buffer by default, so the NSUserKeyEquivalents
+/// relocation below moves Clear Buffer to `Cmd+Opt+K` for this forwarder to
+/// win. `kVK_ANSI_K` = 0x28, CSI-u `ESC [ 107 ; 9 u` (107 = 'k', modifier
+/// byte 9 = 1 base + Super(8)).
+const CMD_K_KEY: &str = "0x6b-0x100000-0x28";
+const CMD_K_HEX: &str = "0x1b 0x5b 0x31 0x30 0x37 0x3b 0x39 0x75";
+/// iTerm2's Edit > "Clear Buffer" menu item (bound to Cmd+K by default) and the
+/// chord it is relocated to so croft can claim the bare Cmd+K leader. `@~k` =
+/// Cmd+Opt+K (`@` Cmd, `~` Opt).
+const CLEAR_BUFFER_MENU_KEY: &str = "Clear Buffer";
+const CLEAR_BUFFER_MENU_EQUIV: &str = "@~k";
 const CMD_Y_KEY: &str = "0x79-0x100000-0x10";
 const CMD_Y_HEX: &str = "0x1b 0x5b 0x31 0x32 0x31 0x3b 0x39 0x75";
 const CMD_O_KEY: &str = "0x6f-0x100000-0x1f";
@@ -446,6 +459,7 @@ pub(crate) mod payloads {
     pub(crate) const CMD_F12_HEX: &str = super::CMD_F12_HEX;
     pub(crate) const CMD_F_HEX: &str = super::CMD_F_HEX;
     pub(crate) const CMD_G_HEX: &str = super::CMD_G_HEX;
+    pub(crate) const CMD_K_HEX: &str = super::CMD_K_HEX;
     pub(crate) const CMD_LBRACKET_HEX: &str = super::CMD_LBRACKET_HEX;
     pub(crate) const CMD_O_HEX: &str = super::CMD_O_HEX;
     pub(crate) const CMD_OPT_LEFT_HEX: &str = super::CMD_OPT_LEFT_HEX;
@@ -619,6 +633,15 @@ pub fn apply_croft_key_settings(plist: &mut Value) -> Result<(), ITerm2Error> {
         USE_SELECTION_FOR_FIND_MENU_KEY,
         USE_SELECTION_FOR_FIND_MENU_EQUIV.to_string(),
     );
+    // Relocate iTerm2's Edit > "Clear Buffer" off bare Cmd+K so croft's Cmd+K
+    // chord leader reaches the app. The menu key-equivalent layer is consulted
+    // before GlobalKeyMap, so the forwarder alone is not enough; the item must
+    // move. Cmd+Opt+K keeps Clear Buffer reachable on a chord croft does not use.
+    set_string(
+        menu,
+        CLEAR_BUFFER_MENU_KEY,
+        CLEAR_BUFFER_MENU_EQUIV.to_string(),
+    );
     // Relocate iTerm2's "Restore Closed Session" off Cmd+Shift+T so
     // croft's terminal-focus chord can claim it. Cmd+Opt+Shift+T keeps
     // the iTerm2 action reachable on a chord croft does not use.
@@ -683,6 +706,7 @@ pub fn apply_croft_key_settings(plist: &mut Value) -> Result<(), ITerm2Error> {
         (CMD_Z_KEY, CMD_Z_HEX),
         (CMD_D_KEY, CMD_D_HEX),
         (CMD_G_KEY, CMD_G_HEX),
+        (CMD_K_KEY, CMD_K_HEX),
         (CMD_Y_KEY, CMD_Y_HEX),
         (CMD_O_KEY, CMD_O_HEX),
         (CMD_E_KEY, CMD_E_HEX),
