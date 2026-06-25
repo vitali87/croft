@@ -42,6 +42,7 @@ pub enum Command {
     IndentationToTabs,
     TrimFinalNewlines,
     FormatDocument,
+    QuickFix,
     // --- File / editor management ---
     SaveFile,
     CloseEditor,
@@ -96,6 +97,7 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::IndentationToTabs,
     Command::TrimFinalNewlines,
     Command::FormatDocument,
+    Command::QuickFix,
     Command::SaveFile,
     Command::CloseEditor,
     Command::SplitEditor,
@@ -149,6 +151,7 @@ impl Command {
             Command::IndentationToTabs => "Convert Indentation to Tabs",
             Command::TrimFinalNewlines => "Trim Final Newlines",
             Command::FormatDocument => "Format Document",
+            Command::QuickFix => "Quick Fix...",
             Command::SaveFile => "File: Save",
             Command::CloseEditor => "View: Close Editor",
             Command::SplitEditor => "View: Split Editor",
@@ -203,6 +206,7 @@ impl Command {
             Command::IndentationToTabs => "Cmd+Opt+Shift+T",
             Command::TrimFinalNewlines => "Cmd+Opt+Shift+N",
             Command::FormatDocument => "Cmd+Opt+Shift+F",
+            Command::QuickFix => "Cmd+.",
             Command::SaveFile => "Cmd+S",
             Command::CloseEditor => "Cmd+W",
             Command::SplitEditor => "Cmd+\\",
@@ -640,6 +644,14 @@ mod tests {
             Some(&builtin(Command::FormatDocument))
         );
         assert_eq!(Command::FormatDocument.keybinding_hint(), "Cmd+Opt+Shift+F");
+    }
+
+    #[test]
+    fn quick_fix_is_reachable_and_shows_its_chord() {
+        let mut palette = CommandPalette::new();
+        palette.set_query("quick fix");
+        assert_eq!(palette.results.first(), Some(&builtin(Command::QuickFix)));
+        assert_eq!(Command::QuickFix.keybinding_hint(), "Cmd+.");
     }
 
     #[test]

@@ -657,6 +657,11 @@ enum MenuAction {
         row: usize,
         col: usize,
     },
+    /// Editor body: LSP "Quick Fix" of the position at buffer `(row, col)`.
+    QuickFixAt {
+        row: usize,
+        col: usize,
+    },
     /// Jump straight to an already-resolved location (LSP line/character). Used
     /// for the entries of the multi-result "Go to Implementations" / "Go to
     /// References" pickers, where each row is one location; selecting it records
@@ -716,6 +721,7 @@ fn shortcut_for(action: &MenuAction) -> Option<&'static str> {
         MenuAction::ChangeAllOccurrencesAt { .. } => Some("⌘F2"),
         MenuAction::GoToDefinitionAt { .. } => Some("F12"),
         MenuAction::GoToReferencesAt { .. } => Some("⇧F12"),
+        MenuAction::QuickFixAt { .. } => Some("⌘."),
         MenuAction::GoToDeclarationAt { .. } => Some("⌃⇧F12"),
         MenuAction::GoToTypeDefinitionAt { .. } => Some("⌃F12"),
         MenuAction::GoToImplementationAt { .. } => Some("⌘F12"),
@@ -1434,6 +1440,14 @@ pub struct App {
     references_request_id: Option<u64>,
     rename_request_id: Option<u64>,
     format_request_id: Option<u64>,
+    code_action_request_id: Option<u64>,
+    /// True when the in-flight code-action request is a `codeAction/resolve`
+    /// (the reply is one resolved action to apply directly) rather than the
+    /// initial `textDocument/codeAction` (whose reply opens the picker).
+    code_action_pending_resolve: bool,
+    /// The actions from the in-flight `textDocument/codeAction` reply, indexed
+    /// by the row `id` the Quick Fix [`ListPicker`] presents.
+    pending_code_actions: Vec<crate::lsp::manager::CodeActionItem>,
     nav: NavHistory,
     editor_vim_chord: EditorVimChord,
     /// `Cmd+K` leader: armed when the user presses the prefix, holding the
@@ -2036,6 +2050,9 @@ impl App {
             completion_request_id: None,
             rename_request_id: None,
             format_request_id: None,
+            code_action_request_id: None,
+            code_action_pending_resolve: false,
+            pending_code_actions: Vec::new(),
             hover: HoverDwell::default(),
             hover_popup: None,
             hover_request_id: None,
@@ -4840,6 +4857,23 @@ impl App {
             .unwrap_or(false)
     }
 
+    fn editor_language_supports_code_action(&self) -> bool {
+        let Some(lang) = self
+            .editor
+            .path
+            .as_deref()
+            .and_then(|p| p.extension())
+            .and_then(|e| e.to_str())
+            .and_then(crate::lsp::Language::from_extension)
+        else {
+            return false;
+        };
+        self.lsp
+            .as_ref()
+            .and_then(|lsp| lsp.language_supports_code_action(lang))
+            .unwrap_or(false)
+    }
+
     /// VS Code "Change All Occurrences" (Cmd/Ctrl+F2): select every textual
     /// match of the word under the cursor in the current file as multi-cursor
     /// carets so the next keystrokes edit them all at once.
@@ -5015,6 +5049,164 @@ impl App {
             _ => self.status = String::from("Document already formatted"),
         }
         true
+    }
+
+    /// VS Code "Quick Fix" (`Cmd+.`): ask the language server for the code
+    /// actions available at the cursor (with the diagnostics on that line as
+    /// context) and present them in a picker. No-op on read-only preview tabs.
+    /// The reply is handled in [`Self::drain_lsp_code_actions`].
+    fn start_code_action(&mut self) {
+        if self.editor.diff.is_some() || self.editor.sheet.is_some() || self.editor.image.is_some()
+        {
+            return;
+        }
+        let Some(path) = self.editor.path.clone() else {
+            self.status = String::from("No file open");
+            return;
+        };
+        let row = self.editor.cursor_row as u32;
+        let col = self.editor.cursor_col as u32;
+        let diagnostics = self.editor.diagnostics_in_line_range(row, row);
+        let Some(lsp) = self.lsp.as_mut() else {
+            self.status = String::from("No language server for this file");
+            return;
+        };
+        let id = lsp.request_code_action(path, row, col, row, col, diagnostics);
+        self.code_action_request_id = Some(id);
+        self.code_action_pending_resolve = false;
+        self.status = String::from("Finding quick fixes...");
+    }
+
+    pub fn drain_lsp_code_actions(&mut self) -> bool {
+        let mut arrived = false;
+        let mut items: Option<Vec<crate::lsp::manager::CodeActionItem>> = None;
+        let mut unsupported = false;
+        {
+            let Some(lsp) = self.lsp.as_ref() else {
+                return false;
+            };
+            while let Some(result) = lsp.drain_code_action() {
+                if Some(result.request_id) != self.code_action_request_id {
+                    continue;
+                }
+                arrived = true;
+                items = result.items;
+                unsupported = result.unsupported;
+            }
+        }
+        if !arrived {
+            return false;
+        }
+        self.code_action_request_id = None;
+        let was_resolve = std::mem::take(&mut self.code_action_pending_resolve);
+        if unsupported {
+            self.status = String::from("No quick fixes: no code-action server for this file");
+            return true;
+        }
+        // A resolve reply carries the one action the user already chose, now with
+        // its edit filled in: apply it directly instead of re-opening a menu.
+        if was_resolve {
+            match items.and_then(|mut v| v.pop()) {
+                Some(item) => self.apply_resolved_code_action(item),
+                None => self.status = String::from("Quick fix could not be resolved"),
+            }
+            return true;
+        }
+        match items {
+            Some(items) if items.len() == 1 && items[0].needs_resolve => {
+                // A single resolve-only action (e.g. a deferred auto-import):
+                // resolve it straight away rather than popping a one-row menu.
+                self.resolve_and_apply_code_action(items.into_iter().next().unwrap());
+            }
+            Some(items) if !items.is_empty() => self.open_code_action_picker(items),
+            _ => self.status = String::from("No quick fixes available here"),
+        }
+        true
+    }
+
+    /// Present the available code actions in the shared list picker, tagging
+    /// each row with its index into `pending_code_actions`.
+    fn open_code_action_picker(&mut self, items: Vec<crate::lsp::manager::CodeActionItem>) {
+        use crate::widgets::list_picker::{ListPicker, ListPurpose, ListRow};
+        let rows = items
+            .iter()
+            .enumerate()
+            .map(|(i, item)| ListRow {
+                id: i.to_string(),
+                label: if item.is_preferred {
+                    format!("{} (preferred)", item.title)
+                } else {
+                    item.title.clone()
+                },
+            })
+            .collect();
+        self.pending_code_actions = items;
+        self.open_list_picker(
+            ListPicker::new(ListPurpose::CodeAction, "Quick Fix", rows),
+            "No quick fixes available here",
+        );
+    }
+
+    /// Apply the chosen code action: edits first (as one undo step, like rename),
+    /// then any command. A resolve-only action is sent for resolution first; its
+    /// resolved edit/command arrives back through [`Self::drain_lsp_code_actions`].
+    fn apply_code_action(&mut self, item: crate::lsp::manager::CodeActionItem) {
+        if item.needs_resolve {
+            self.resolve_and_apply_code_action(item);
+            return;
+        }
+        self.apply_resolved_code_action(item);
+    }
+
+    /// Apply an action that already carries its edit / command (the leaf of both
+    /// the direct and the post-resolve paths). Never re-resolves, so a server
+    /// that returns a still-edit-less action after resolve can't loop.
+    fn apply_resolved_code_action(&mut self, item: crate::lsp::manager::CodeActionItem) {
+        let mut applied = false;
+        if !item.edits.is_empty() {
+            match self.apply_rename_edits(&item.edits) {
+                Ok((files, occ)) => {
+                    applied = true;
+                    self.status = format!(
+                        "{}: changed {occ} edit(s) across {files} file(s)",
+                        item.title
+                    );
+                }
+                Err(e) => {
+                    self.status = format!("Quick fix failed: {e}");
+                    return;
+                }
+            }
+        }
+        if let Some(cmd) = item.command
+            && let (Some(path), Some(lsp)) = (self.editor.path.clone(), self.lsp.as_mut())
+        {
+            lsp.execute_command(path, cmd.command, cmd.arguments);
+            applied = true;
+            self.status = format!("Applied quick fix: {}", item.title);
+        }
+        if !applied {
+            self.status = format!("Quick fix had no effect: {}", item.title);
+        }
+    }
+
+    /// Send a resolve-only action for `codeAction/resolve`; the resolved item
+    /// comes back as a single-item reply that the drain applies.
+    fn resolve_and_apply_code_action(&mut self, item: crate::lsp::manager::CodeActionItem) {
+        let Some(action) = item.resolve_action else {
+            self.status = format!("Quick fix cannot be resolved: {}", item.title);
+            return;
+        };
+        let Some(path) = self.editor.path.clone() else {
+            return;
+        };
+        let Some(lsp) = self.lsp.as_mut() else {
+            return;
+        };
+        let id = lsp.request_code_action_resolve(path, item.server, action);
+        self.code_action_request_id = Some(id);
+        self.code_action_pending_resolve = true;
+        self.status = String::from("Resolving quick fix...");
     }
 
     /// Route the key through the completion popup when one is open.
@@ -9830,6 +10022,12 @@ impl App {
                 let r = crate::git::push_to_remote(&self.tree.root, &row.id);
                 self.run_scm_op("push", r, "Pushed");
             }
+            ListPurpose::CodeAction => {
+                if let Some(item) = self.pending_code_actions.get(index).cloned() {
+                    self.apply_code_action(item);
+                }
+                self.pending_code_actions.clear();
+            }
         }
     }
 
@@ -10951,6 +11149,13 @@ impl App {
         if is_format_document_key(key) {
             if self.editor_is_text() {
                 self.start_format_document();
+            }
+            return;
+        }
+        // VS Code "Quick Fix" (Cmd+. / Ctrl+.): code actions at the cursor.
+        if is_quick_fix_key(key) {
+            if self.editor_is_text() {
+                self.start_code_action();
             }
             return;
         }
@@ -13516,6 +13721,7 @@ impl App {
                 self.status = String::from("Converted indentation to tabs");
             }
             Cmd::FormatDocument => self.start_format_document(),
+            Cmd::QuickFix => self.start_code_action(),
             Cmd::TrimFinalNewlines => {
                 if self.editor.trim_final_newlines() {
                     self.status = String::from("Trimmed final newlines");
@@ -14032,6 +14238,13 @@ impl App {
                 if !inside =>
             {
                 self.close_list_picker();
+            }
+            // Click a row to select and run it, the way VS Code menus behave.
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(idx) = picker.row_index_at(m.row) {
+                    picker.selected = idx;
+                    self.confirm_list_picker();
+                }
             }
             _ => {}
         }
@@ -14997,6 +15210,12 @@ impl App {
                         String::from("Change All Occurrences"),
                         MenuAction::ChangeAllOccurrencesAt { row, col },
                     ));
+                    if self.editor_language_supports_code_action() {
+                        items.push((
+                            String::from("Quick Fix..."),
+                            MenuAction::QuickFixAt { row, col },
+                        ));
+                    }
                     self.context_menu = Some(ContextMenu {
                         origin: (m.column, m.row),
                         items,
@@ -16457,6 +16676,13 @@ impl App {
                 self.editor.cursor_col = col;
                 self.focus_pane(Pane::Editor);
                 self.request_implementation_at_cursor();
+            }
+            MenuAction::QuickFixAt { row, col } => {
+                self.editor.collapse_carets();
+                self.editor.cursor_row = row;
+                self.editor.cursor_col = col;
+                self.focus_pane(Pane::Editor);
+                self.start_code_action();
             }
             MenuAction::GoToReferencesAt { row, col } => {
                 self.editor.cursor_row = row;
@@ -17944,6 +18170,17 @@ fn is_trim_trailing_whitespace_key(key: KeyEvent) -> bool {
 /// `Shift+Alt+F`). Reformats the whole buffer through the language server.
 fn is_format_document_key(key: KeyEvent) -> bool {
     is_cmd_alt_shift_letter(key, 'f')
+}
+
+/// VS Code "Quick Fix": `Cmd+.` on macOS (delivered as `Char('.')` + SUPER by
+/// the iTerm2 / Ghostty CSI-u forwarder) and `Ctrl+.` on Linux / Termux. Plain
+/// `.`, `Shift+.` ('>'), and `Alt+.` (the shell's last-argument) are excluded.
+fn is_quick_fix_key(key: KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char('.'))
+        && (key.modifiers.contains(KeyModifiers::SUPER)
+            || key.modifiers.contains(KeyModifiers::CONTROL))
+        && !key.modifiers.contains(KeyModifiers::ALT)
+        && !key.modifiers.contains(KeyModifiers::SHIFT)
 }
 
 /// True for `Cmd+Opt+Shift+<letter>` (or `Ctrl+Opt+Shift+<letter>` on Termux):
@@ -19956,6 +20193,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let references_changed = app.drain_lsp_references();
         let rename_changed = app.drain_lsp_rename();
         let format_changed = app.drain_lsp_format();
+        let code_action_changed = app.drain_lsp_code_actions();
         let semantic_changed = app.drain_lsp_semantic_tokens();
         let diagnostics_changed = app.drain_lsp_diagnostics();
         let progress_changed = app.drain_lsp_progress();
@@ -20004,6 +20242,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             || references_changed
             || rename_changed
             || format_changed
+            || code_action_changed
             || semantic_changed
             || diagnostics_changed
             || progress_changed

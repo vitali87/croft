@@ -25,6 +25,9 @@ pub enum ListPurpose {
     RemoveRemote,
     DeleteTag,
     PushToRemote,
+    /// LSP Quick Fix: the rows are the code actions at the cursor; the App
+    /// reads back the chosen row's `id` as an index into its pending actions.
+    CodeAction,
 }
 
 /// One selectable row: a stable `id` the App acts on (a stash index, a
@@ -129,6 +132,19 @@ impl ListPicker {
 
     pub fn select_prev(&mut self) {
         self.selected = self.selected.saturating_sub(1);
+    }
+
+    /// The matched-row index at screen row `y`, if `y` lands on a visible row.
+    /// The list body starts two rows below `last_rect.y` (the top border, then
+    /// the prompt row), so the renderer and this stay in lock-step. Used to map
+    /// a mouse click to a selectable row.
+    pub fn row_index_at(&self, y: u16) -> Option<usize> {
+        let list_top = self.last_rect.y.saturating_add(2);
+        if y < list_top {
+            return None;
+        }
+        let idx = self.scroll + (y - list_top) as usize;
+        (idx < self.visible_count()).then_some(idx)
     }
 }
 
@@ -289,6 +305,23 @@ mod tests {
         assert_eq!(p.visible_count(), 1);
         assert_eq!(p.selected, 0, "a filter edit resets the highlight");
         assert_eq!(p.selected_row().map(|r| r.id.as_str()), Some("1"));
+    }
+
+    #[test]
+    fn row_index_at_maps_click_y_to_the_row_under_the_pointer() {
+        let mut p = ListPicker::new(ListPurpose::CodeAction, "Quick Fix", rows());
+        // Simulate the render geometry: a box whose top border is at y=10, so the
+        // prompt row is y=11 and the first list row is y=12.
+        p.last_rect = Rect {
+            x: 0,
+            y: 10,
+            width: 40,
+            height: 8,
+        };
+        assert_eq!(p.row_index_at(12), Some(0), "first list row");
+        assert_eq!(p.row_index_at(13), Some(1), "second list row");
+        assert_eq!(p.row_index_at(11), None, "the prompt row is not selectable");
+        assert_eq!(p.row_index_at(14), None, "below the last row is nothing");
     }
 
     #[test]

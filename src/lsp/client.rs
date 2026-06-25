@@ -15,13 +15,14 @@ use lsp_types::DiagnosticSeverity as LspDiagnosticSeverity;
 use lsp_types::notification::{LogMessage, Progress, PublishDiagnostics, ShowMessage};
 use lsp_types::request::{SemanticTokensRefresh, WorkDoneProgressCreate};
 use lsp_types::{
-    ClientCapabilities, CompletionContext, CompletionParams, CompletionResponse,
-    CompletionTriggerKind, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
+    ClientCapabilities, CodeAction, CodeActionContext, CodeActionParams, CodeActionResponse,
+    CompletionContext, CompletionParams, CompletionResponse, CompletionTriggerKind,
+    Diagnostic as LspDiagnostic, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
     DidOpenTextDocumentParams, DocumentFormattingParams, DocumentSymbolParams,
-    DocumentSymbolResponse, FormattingOptions, GotoDefinitionParams, GotoDefinitionResponse, Hover,
-    HoverParams, InitializeParams, InitializedParams, Location, PartialResultParams, Position,
-    ProgressParamsValue, Range, ReferenceContext, ReferenceParams, RenameParams,
-    SemanticTokensParams, SemanticTokensRangeParams, SemanticTokensRangeResult,
+    DocumentSymbolResponse, ExecuteCommandParams, FormattingOptions, GotoDefinitionParams,
+    GotoDefinitionResponse, Hover, HoverParams, InitializeParams, InitializedParams, Location,
+    PartialResultParams, Position, ProgressParamsValue, Range, ReferenceContext, ReferenceParams,
+    RenameParams, SemanticTokensParams, SemanticTokensRangeParams, SemanticTokensRangeResult,
     SemanticTokensResult, ServerCapabilities, TextDocumentContentChangeEvent,
     TextDocumentIdentifier, TextDocumentItem, TextDocumentPositionParams, TextEdit, Url,
     VersionedTextDocumentIdentifier, WorkDoneProgress, WorkDoneProgressParams, WorkspaceEdit,
@@ -567,6 +568,59 @@ impl LspClient {
             })
             .await
             .context("rename")
+    }
+
+    /// `textDocument/codeAction`: ask the server for the quick fixes and
+    /// refactors available over `range` (a point selection at the cursor, or a
+    /// real selection). `diagnostics` are the diagnostics overlapping the range,
+    /// passed as context so the server can offer fixes for them.
+    pub async fn code_action(
+        &mut self,
+        uri: Url,
+        range: Range,
+        diagnostics: Vec<LspDiagnostic>,
+    ) -> Result<Option<CodeActionResponse>> {
+        self.server
+            .code_action(CodeActionParams {
+                text_document: TextDocumentIdentifier { uri },
+                range,
+                context: CodeActionContext {
+                    diagnostics,
+                    only: None,
+                    trigger_kind: None,
+                },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+            })
+            .await
+            .context("code_action")
+    }
+
+    /// `codeAction/resolve`: fill in the `edit` for an action the server
+    /// returned without one (it carried only `data`). vtsls and rust-analyzer
+    /// defer the expensive edit computation to this second round trip.
+    pub async fn code_action_resolve(&mut self, action: CodeAction) -> Result<CodeAction> {
+        self.server
+            .code_action_resolve(action)
+            .await
+            .context("code_action_resolve")
+    }
+
+    /// `workspace/executeCommand`: run a command a code action asked for (some
+    /// actions perform their effect through a command rather than an edit).
+    pub async fn execute_command(
+        &mut self,
+        command: String,
+        arguments: Vec<serde_json::Value>,
+    ) -> Result<Option<serde_json::Value>> {
+        self.server
+            .execute_command(ExecuteCommandParams {
+                command,
+                arguments,
+                work_done_progress_params: WorkDoneProgressParams::default(),
+            })
+            .await
+            .context("execute_command")
     }
 
     /// `textDocument/formatting`: ask the server to reformat the whole

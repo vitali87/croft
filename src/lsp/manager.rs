@@ -7,7 +7,10 @@ use std::sync::mpsc as std_mpsc;
 
 use anyhow::Result;
 use lsp_types::{
-    ClientCapabilities, CompletionClientCapabilities, CompletionItemCapability, CompletionItemKind,
+    ClientCapabilities, CodeActionClientCapabilities, CodeActionKindLiteralSupport,
+    CodeActionLiteralSupport, CodeActionCapabilityResolveSupport, CodeActionOrCommand,
+    CodeActionProviderCapability, CodeActionResponse,
+    CompletionClientCapabilities, CompletionItemCapability, CompletionItemKind,
     CompletionItemKindCapability, CompletionResponse, DeclarationCapability,
     DocumentChangeOperation, DocumentChanges, DocumentSymbol, DocumentSymbolClientCapabilities,
     DocumentSymbolResponse, GotoDefinitionResponse, HoverContents, HoverProviderCapability,
@@ -210,6 +213,55 @@ pub struct RenameResult {
     pub edits: Option<Vec<(PathBuf, Vec<TextSpanEdit>)>>,
 }
 
+/// A command to run after a code action's edits, via `workspace/executeCommand`
+/// (LSP's `Command`). Carries the opaque command id and its arguments verbatim.
+#[derive(Debug, Clone)]
+pub struct CodeActionCommand {
+    pub command: String,
+    pub arguments: Vec<serde_json::Value>,
+}
+
+/// One selectable entry in the Quick Fix menu, normalised from an LSP
+/// `CodeActionOrCommand` into croft's own char-indexed edit representation so
+/// the app layer never touches `lsp_types`. Mirrors how [`RenameResult`] carries
+/// already-normalised edits.
+#[derive(Debug, Clone)]
+pub struct CodeActionItem {
+    pub title: String,
+    /// The language server that produced this action. A `codeAction/resolve`
+    /// for the action must go back to the same server, and the title is shown
+    /// as-is (servers already prefix, e.g. "Ruff: Organize imports").
+    pub server: String,
+    /// Per-file, char-indexed spans to apply (empty when the action has no
+    /// inline edit; it then runs `command` and/or must be resolved first).
+    pub edits: Vec<(PathBuf, Vec<TextSpanEdit>)>,
+    /// A command to run after the edits (or instead of them), if any.
+    pub command: Option<CodeActionCommand>,
+    /// True when the action carries `data` but neither an inline edit nor a
+    /// command, so its edit must be fetched via `codeAction/resolve` first.
+    pub needs_resolve: bool,
+    /// The full original `CodeAction` serialized to JSON, kept only when
+    /// `needs_resolve`. `codeAction/resolve` must round-trip the WHOLE action
+    /// (ruff rejects a resolve missing `kind` with "No kind was given"), so we
+    /// send this back verbatim rather than reconstructing from `title`+`data`.
+    pub resolve_action: Option<serde_json::Value>,
+    /// The server's "preferred" hint (VS Code's auto-fix target).
+    pub is_preferred: bool,
+}
+
+#[derive(Debug)]
+pub struct CodeActionResult {
+    pub request_id: u64,
+    pub path: PathBuf,
+    /// The available actions. `None` means the request errored; `Some(vec![])`
+    /// means the server ran but offered nothing here. The same shape is reused
+    /// for a `codeAction/resolve` reply (a single, now-resolved item).
+    pub items: Option<Vec<CodeActionItem>>,
+    /// True when no spawned server advertises a usable `codeActionProvider`, so
+    /// the app can say "no quick fixes available" distinctly from an empty list.
+    pub unsupported: bool,
+}
+
 #[derive(Debug)]
 pub struct FormatResult {
     pub request_id: u64,
@@ -377,6 +429,27 @@ enum Cmd {
         tab_size: u32,
         insert_spaces: bool,
     },
+    RequestCodeAction {
+        request_id: u64,
+        path: PathBuf,
+        start_line: u32,
+        start_char: u32,
+        end_line: u32,
+        end_char: u32,
+        diagnostics: Vec<Diagnostic>,
+    },
+    ResolveCodeAction {
+        request_id: u64,
+        path: PathBuf,
+        server: String,
+        /// The full original `CodeAction` as JSON, sent back to the server intact.
+        action: serde_json::Value,
+    },
+    ExecuteCommand {
+        path: PathBuf,
+        command: String,
+        arguments: Vec<serde_json::Value>,
+    },
 }
 
 /// Per-language support for the optional, capability-gated navigation methods,
@@ -392,6 +465,7 @@ struct LangCapabilitySupport {
     implementation: HashMap<Language, bool>,
     references: HashMap<Language, bool>,
     formatting: HashMap<Language, bool>,
+    code_action: HashMap<Language, bool>,
 }
 type CapabilitySupport = Arc<StdMutex<LangCapabilitySupport>>;
 
@@ -407,6 +481,7 @@ pub struct LspManager {
     ref_rx: std_mpsc::Receiver<ReferencesResult>,
     rename_rx: std_mpsc::Receiver<RenameResult>,
     format_rx: std_mpsc::Receiver<FormatResult>,
+    code_action_rx: std_mpsc::Receiver<CodeActionResult>,
     semantic_rx: std_mpsc::Receiver<SemanticTokensUpdate>,
     diagnostics_rx: std_mpsc::Receiver<DiagnosticsUpdate>,
     progress_rx: std_mpsc::Receiver<ProgressUpdate>,
@@ -447,6 +522,7 @@ impl LspManager {
         let (ref_tx, ref_rx) = std_mpsc::channel();
         let (rename_tx, rename_rx) = std_mpsc::channel();
         let (format_tx, format_rx) = std_mpsc::channel();
+        let (code_action_tx, code_action_rx) = std_mpsc::channel();
         let (semantic_tx, semantic_rx) = std_mpsc::channel();
         let (diagnostics_tx, diagnostics_rx) = std_mpsc::channel();
         let (progress_tx, progress_rx) = std_mpsc::channel();
@@ -485,6 +561,7 @@ impl LspManager {
                 references: ref_tx,
                 rename: rename_tx,
                 formatting: format_tx,
+                code_action: code_action_tx,
                 semantic_tokens: semantic_tx,
                 diagnostics: diagnostics_tx,
                 progress: progress_tx,
@@ -504,6 +581,7 @@ impl LspManager {
             ref_rx,
             rename_rx,
             format_rx,
+            code_action_rx,
             semantic_rx,
             diagnostics_rx,
             progress_rx,
@@ -798,6 +876,83 @@ impl LspManager {
             .get(&lang)
             .copied()
     }
+
+    /// Request the quick fixes / refactors available over a range (use the same
+    /// position for start and end for a caret request). `diagnostics` are the
+    /// app's diagnostics overlapping the range, forwarded as context so the
+    /// server can attach fixes to them. Reply arrives via [`Self::drain_code_action`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn request_code_action(
+        &mut self,
+        path: PathBuf,
+        start_line: u32,
+        start_char: u32,
+        end_line: u32,
+        end_char: u32,
+        diagnostics: Vec<Diagnostic>,
+    ) -> u64 {
+        let id = self.next_request_id;
+        self.next_request_id += 1;
+        let _ = self.cmd_tx.send(Cmd::RequestCodeAction {
+            request_id: id,
+            path,
+            start_line,
+            start_char,
+            end_line,
+            end_char,
+            diagnostics,
+        });
+        id
+    }
+
+    /// Resolve an action that arrived without its edit (it carried only `data`).
+    /// The reply reuses [`CodeActionResult`] with a single, now-resolved item.
+    pub fn request_code_action_resolve(
+        &mut self,
+        path: PathBuf,
+        server: String,
+        action: serde_json::Value,
+    ) -> u64 {
+        let id = self.next_request_id;
+        self.next_request_id += 1;
+        let _ = self.cmd_tx.send(Cmd::ResolveCodeAction {
+            request_id: id,
+            path,
+            server,
+            action,
+        });
+        id
+    }
+
+    /// Fire a `workspace/executeCommand` for a command-style code action. The
+    /// server performs the effect; croft does not await a reply.
+    pub fn execute_command(
+        &mut self,
+        path: PathBuf,
+        command: String,
+        arguments: Vec<serde_json::Value>,
+    ) {
+        let _ = self.cmd_tx.send(Cmd::ExecuteCommand {
+            path,
+            command,
+            arguments,
+        });
+    }
+
+    pub fn drain_code_action(&self) -> Option<CodeActionResult> {
+        self.code_action_rx.try_recv().ok()
+    }
+
+    /// Whether the server for `lang` implements `textDocument/codeAction`.
+    /// `None` means no server has reported yet.
+    pub fn language_supports_code_action(&self, lang: Language) -> Option<bool> {
+        self.capability_support
+            .lock()
+            .ok()?
+            .code_action
+            .get(&lang)
+            .copied()
+    }
 }
 
 struct ManagedClient {
@@ -813,6 +968,7 @@ struct ManagedClient {
     supports_references: bool,
     supports_rename: bool,
     supports_formatting: bool,
+    supports_code_action: bool,
     /// The server's semantic-token legend (token-type names by index),
     /// captured at spawn. `None` when the server advertises no
     /// `semanticTokensProvider` with full-document support.
@@ -870,6 +1026,7 @@ struct ResultSenders {
     references: std_mpsc::Sender<ReferencesResult>,
     rename: std_mpsc::Sender<RenameResult>,
     formatting: std_mpsc::Sender<FormatResult>,
+    code_action: std_mpsc::Sender<CodeActionResult>,
     semantic_tokens: std_mpsc::Sender<SemanticTokensUpdate>,
     diagnostics: std_mpsc::Sender<DiagnosticsUpdate>,
     progress: std_mpsc::Sender<ProgressUpdate>,
@@ -1013,6 +1170,43 @@ async fn worker_loop(
                     .request_formatting(request_id, path, tab_size, insert_spaces, &tx.formatting)
                     .await
             }
+            Cmd::RequestCodeAction {
+                request_id,
+                path,
+                start_line,
+                start_char,
+                end_line,
+                end_char,
+                diagnostics,
+            } => {
+                state
+                    .request_code_action(
+                        request_id,
+                        path,
+                        start_line,
+                        start_char,
+                        end_line,
+                        end_char,
+                        diagnostics,
+                        &tx.code_action,
+                    )
+                    .await
+            }
+            Cmd::ResolveCodeAction {
+                request_id,
+                path,
+                server,
+                action,
+            } => {
+                state
+                    .resolve_code_action(request_id, path, server, action, &tx.code_action)
+                    .await
+            }
+            Cmd::ExecuteCommand {
+                path,
+                command,
+                arguments,
+            } => state.execute_command(path, command, arguments).await,
         }
     }
 }
@@ -1111,6 +1305,8 @@ impl WorkerState {
                         let supports_rename = one_of_supported(&caps.rename_provider);
                         let supports_formatting =
                             one_of_supported(&caps.document_formatting_provider);
+                        let supports_code_action =
+                            code_action_supported(&caps.code_action_provider);
                         let semantic_legend = semantic_legend_of(caps).map(Arc::new);
                         let semantic_supports_range = semantic_tokens_range_supported(caps);
                         log_file::log(&format!(
@@ -1131,6 +1327,7 @@ impl WorkerState {
                             supports_references,
                             supports_rename,
                             supports_formatting,
+                            supports_code_action,
                             semantic_legend,
                             semantic_supports_range,
                         });
@@ -1149,6 +1346,7 @@ impl WorkerState {
             let supports_implementation = spawned.iter().any(|c| c.supports_implementation);
             let supports_references = spawned.iter().any(|c| c.supports_references);
             let supports_formatting = spawned.iter().any(|c| c.supports_formatting);
+            let supports_code_action = spawned.iter().any(|c| c.supports_code_action);
             if let Ok(mut support) = self.capability_support.lock() {
                 support.declaration.insert(lang, supports_declaration);
                 support
@@ -1157,6 +1355,7 @@ impl WorkerState {
                 support.implementation.insert(lang, supports_implementation);
                 support.references.insert(lang, supports_references);
                 support.formatting.insert(lang, supports_formatting);
+                support.code_action.insert(lang, supports_code_action);
             }
             self.clients.insert(key.clone(), spawned);
         }
@@ -1952,6 +2151,203 @@ impl WorkerState {
         });
     }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn request_code_action(
+        &mut self,
+        request_id: u64,
+        path: PathBuf,
+        start_line: u32,
+        start_char: u32,
+        end_line: u32,
+        end_char: u32,
+        diagnostics: Vec<Diagnostic>,
+        tx: &std_mpsc::Sender<CodeActionResult>,
+    ) {
+        let Some(doc) = self.docs.get(&path) else {
+            return;
+        };
+        let lang = doc.language;
+        let root = doc.project_root.clone();
+        self.ensure_clients(lang, &root).await;
+        let Some(clients) = self.clients.get(&(lang, root)) else {
+            return;
+        };
+        // Aggregate across EVERY server that supports code actions, like VS Code:
+        // for Python that is ty (type fixes), basedpyright (import fixes), and
+        // ruff (lint quick-fixes + "Organize Imports" / "Fix all"). Picking only
+        // the first server would silently drop ruff's source actions.
+        let servers: Vec<(String, Arc<TokioMutex<LspClient>>)> = clients
+            .iter()
+            .filter(|c| c.supports_code_action)
+            .map(|c| (c.name.clone(), c.client.clone()))
+            .collect();
+        if servers.is_empty() {
+            let _ = tx.send(CodeActionResult {
+                request_id,
+                path,
+                items: None,
+                unsupported: true,
+            });
+            return;
+        }
+        let Ok(uri) = Url::from_file_path(&path) else {
+            return;
+        };
+        let range = lsp_types::Range {
+            start: lsp_types::Position {
+                line: start_line,
+                character: start_char,
+            },
+            end: lsp_types::Position {
+                line: end_line,
+                character: end_char,
+            },
+        };
+        let diags: Vec<lsp_types::Diagnostic> = diagnostics.iter().map(to_lsp_diagnostic).collect();
+        let tx = tx.clone();
+        let path_clone = path.clone();
+        log_file::log(&format!(
+            "code_action request id={request_id} servers={} path={} line={start_line}",
+            servers.len(),
+            path.display()
+        ));
+        tokio::spawn(async move {
+            let mut combined: Vec<CodeActionItem> = Vec::new();
+            let mut any_ran = false;
+            for (server_name, client_arc) in servers {
+                let mut client = client_arc.lock().await;
+                let resp = client.code_action(uri.clone(), range, diags.clone()).await;
+                drop(client);
+                match resp {
+                    Ok(Some(r)) => {
+                        any_ran = true;
+                        combined.extend(code_action_items(&r, &server_name));
+                    }
+                    Ok(None) => any_ran = true,
+                    Err(e) => {
+                        log_file::log(&format!("lsp[{server_name}] code_action error: {e:#}"));
+                    }
+                }
+            }
+            // Preferred actions (e.g. the server's chosen auto-fix) float to the
+            // top of the menu, matching VS Code's ordering.
+            combined.sort_by_key(|i| !i.is_preferred);
+            log_file::log(&format!(
+                "code_action response id={request_id} count={} any_ran={any_ran}",
+                combined.len()
+            ));
+            let _ = tx.send(CodeActionResult {
+                request_id,
+                path: path_clone,
+                // `None` only when every server errored; an empty Vec means a
+                // server answered with nothing.
+                items: if any_ran { Some(combined) } else { None },
+                unsupported: false,
+            });
+        });
+    }
+
+    async fn resolve_code_action(
+        &mut self,
+        request_id: u64,
+        path: PathBuf,
+        server: String,
+        action: serde_json::Value,
+        tx: &std_mpsc::Sender<CodeActionResult>,
+    ) {
+        // Deserialize the original action back intact (kind/data/diagnostics all
+        // preserved); a malformed payload simply yields no resolution.
+        let Ok(action) = serde_json::from_value::<lsp_types::CodeAction>(action) else {
+            let _ = tx.send(CodeActionResult {
+                request_id,
+                path,
+                items: None,
+                unsupported: false,
+            });
+            return;
+        };
+        let Some(doc) = self.docs.get(&path) else {
+            return;
+        };
+        let lang = doc.language;
+        let root = doc.project_root.clone();
+        self.ensure_clients(lang, &root).await;
+        let Some(clients) = self.clients.get(&(lang, root)) else {
+            return;
+        };
+        // Resolve against the SAME server that produced the action; fall back to
+        // any code-action server only if that one is gone.
+        let picked = clients
+            .iter()
+            .find(|c| c.supports_code_action && c.name == server)
+            .or_else(|| clients.iter().find(|c| c.supports_code_action))
+            .map(|c| (c.name.clone(), c.client.clone()));
+        let Some((server_name, client_arc)) = picked else {
+            let _ = tx.send(CodeActionResult {
+                request_id,
+                path,
+                items: None,
+                unsupported: true,
+            });
+            return;
+        };
+        let tx = tx.clone();
+        let path_clone = path.clone();
+        tokio::spawn(async move {
+            let mut client = client_arc.lock().await;
+            let resolved = client.code_action_resolve(action).await;
+            drop(client);
+            let items = match resolved {
+                Ok(a) => {
+                    let one = vec![CodeActionOrCommand::CodeAction(a)];
+                    Some(code_action_items(&one, &server_name))
+                }
+                Err(e) => {
+                    log_file::log(&format!(
+                        "lsp[{server_name}] code_action_resolve error: {e:#}"
+                    ));
+                    None
+                }
+            };
+            let _ = tx.send(CodeActionResult {
+                request_id,
+                path: path_clone,
+                items,
+                unsupported: false,
+            });
+        });
+    }
+
+    async fn execute_command(
+        &mut self,
+        path: PathBuf,
+        command: String,
+        arguments: Vec<serde_json::Value>,
+    ) {
+        let Some(doc) = self.docs.get(&path) else {
+            return;
+        };
+        let lang = doc.language;
+        let root = doc.project_root.clone();
+        self.ensure_clients(lang, &root).await;
+        let Some(clients) = self.clients.get(&(lang, root)) else {
+            return;
+        };
+        let picked = clients
+            .iter()
+            .find(|c| c.supports_code_action)
+            .map(|c| (c.name.clone(), c.client.clone()));
+        let Some((server_name, client_arc)) = picked else {
+            return;
+        };
+        tokio::spawn(async move {
+            let mut client = client_arc.lock().await;
+            if let Err(e) = client.execute_command(command, arguments).await {
+                log_file::log(&format!("lsp[{server_name}] execute_command error: {e:#}"));
+            }
+        });
+    }
+
     async fn request_rename(
         &mut self,
         request_id: u64,
@@ -2138,6 +2534,86 @@ fn workspace_edits(edit: &WorkspaceEdit) -> Vec<(PathBuf, Vec<TextSpanEdit>)> {
     out
 }
 
+/// Normalise an LSP `textDocument/codeAction` response into croft's selectable
+/// [`CodeActionItem`]s. Disabled actions are dropped (VS Code hides them from
+/// the lightbulb menu); inline `WorkspaceEdit`s are flattened with the same
+/// [`workspace_edits`] path rename uses; an action with neither an edit nor a
+/// command but with `data` is flagged for a `codeAction/resolve` round trip.
+fn code_action_items(resp: &CodeActionResponse, server: &str) -> Vec<CodeActionItem> {
+    let to_command = |c: &lsp_types::Command| CodeActionCommand {
+        command: c.command.clone(),
+        arguments: c.arguments.clone().unwrap_or_default(),
+    };
+    resp.iter()
+        .filter_map(|entry| match entry {
+            CodeActionOrCommand::Command(cmd) => Some(CodeActionItem {
+                title: cmd.title.clone(),
+                server: server.to_string(),
+                edits: Vec::new(),
+                command: Some(to_command(cmd)),
+                needs_resolve: false,
+                resolve_action: None,
+                is_preferred: false,
+            }),
+            CodeActionOrCommand::CodeAction(action) => {
+                if action.disabled.is_some() {
+                    return None;
+                }
+                let edits = action
+                    .edit
+                    .as_ref()
+                    .map(workspace_edits)
+                    .unwrap_or_default();
+                let command = action.command.as_ref().map(to_command);
+                let needs_resolve =
+                    action.edit.is_none() && command.is_none() && action.data.is_some();
+                // Keep the whole action so resolve can send it back intact.
+                let resolve_action = if needs_resolve {
+                    serde_json::to_value(action).ok()
+                } else {
+                    None
+                };
+                Some(CodeActionItem {
+                    title: action.title.clone(),
+                    server: server.to_string(),
+                    edits,
+                    command,
+                    needs_resolve,
+                    resolve_action,
+                    is_preferred: action.is_preferred.unwrap_or(false),
+                })
+            }
+        })
+        .collect()
+}
+
+/// Re-materialise one of croft's normalised diagnostics into the LSP wire type
+/// so it can ride along as `codeAction` context. We carry range, severity, and
+/// message (the fields croft keeps); the server matches its fixes by range.
+fn to_lsp_diagnostic(d: &Diagnostic) -> lsp_types::Diagnostic {
+    let severity = match d.severity {
+        DiagnosticSeverity::Error => lsp_types::DiagnosticSeverity::ERROR,
+        DiagnosticSeverity::Warning => lsp_types::DiagnosticSeverity::WARNING,
+        DiagnosticSeverity::Information => lsp_types::DiagnosticSeverity::INFORMATION,
+        DiagnosticSeverity::Hint => lsp_types::DiagnosticSeverity::HINT,
+    };
+    lsp_types::Diagnostic {
+        range: lsp_types::Range {
+            start: lsp_types::Position {
+                line: d.start_line,
+                character: d.start_char,
+            },
+            end: lsp_types::Position {
+                line: d.end_line,
+                character: d.end_char,
+            },
+        },
+        severity: Some(severity),
+        message: d.message.clone(),
+        ..Default::default()
+    }
+}
+
 fn text_edit_to_span(te: &TextEdit) -> TextSpanEdit {
     TextSpanEdit {
         start: (
@@ -2185,6 +2661,17 @@ fn hover_text(contents: &HoverContents) -> Option<String> {
 /// is actually supported. `None` is unsupported; a bare `false` is unsupported;
 /// `true` or an options object is supported. The bare-`false` case is the one
 /// `Option::is_some` got wrong.
+/// Whether the server advertises a usable `textDocument/codeAction` provider.
+/// `Simple(false)` and `None` are unsupported; `Simple(true)` or an options
+/// object (which may also declare `resolveProvider`) is supported.
+fn code_action_supported(cap: &Option<CodeActionProviderCapability>) -> bool {
+    match cap {
+        Some(CodeActionProviderCapability::Simple(b)) => *b,
+        Some(CodeActionProviderCapability::Options(_)) => true,
+        None => false,
+    }
+}
+
 fn one_of_supported<B>(cap: &Option<OneOf<bool, B>>) -> bool {
     match cap {
         Some(OneOf::Left(b)) => *b,
@@ -2531,6 +3018,37 @@ fn build_client_capabilities() -> ClientCapabilities {
                 related_information: Some(true),
                 ..Default::default()
             }),
+            // Advertise rich code-action support. Without codeActionLiteralSupport
+            // a server (ruff, vtsls) must answer `textDocument/codeAction` with
+            // plain `Command[]` and withholds kinded source actions, so "Organize
+            // Imports" / "Fix all" never surface. dataSupport + resolveSupport for
+            // `edit` let servers defer the (expensive) edit to `codeAction/resolve`
+            // — vtsls auto-imports and ruff fixes rely on it. This is exactly what
+            // VS Code and Neovim declare.
+            code_action: Some(CodeActionClientCapabilities {
+                dynamic_registration: Some(false),
+                code_action_literal_support: Some(CodeActionLiteralSupport {
+                    code_action_kind: CodeActionKindLiteralSupport {
+                        value_set: vec![
+                            String::new(),
+                            "quickfix".to_string(),
+                            "refactor".to_string(),
+                            "refactor.extract".to_string(),
+                            "refactor.inline".to_string(),
+                            "refactor.rewrite".to_string(),
+                            "source".to_string(),
+                            "source.organizeImports".to_string(),
+                            "source.fixAll".to_string(),
+                        ],
+                    },
+                }),
+                is_preferred_support: Some(true),
+                data_support: Some(true),
+                resolve_support: Some(CodeActionCapabilityResolveSupport {
+                    properties: vec!["edit".to_string()],
+                }),
+                ..Default::default()
+            }),
             ..Default::default()
         }),
         // Advertise that croft can re-pull tokens on a server's request. ty
@@ -2816,6 +3334,137 @@ mod tests {
         assert_eq!(out[0].1.len(), 1);
         assert_eq!(out[0].1[0].new_text, "renamed");
         assert_eq!(out[0].1[0].start, (2, 4));
+    }
+
+    #[test]
+    fn code_action_items_skips_disabled_and_normalises_edits() {
+        use lsp_types::{CodeAction, CodeActionDisabled, CodeActionOrCommand, Command};
+        let uri = Url::from_file_path("/tmp/foo.rs").unwrap();
+        let mut changes = HashMap::new();
+        changes.insert(
+            uri,
+            vec![TextEdit {
+                range: def_range(0, 0),
+                new_text: "import os\n".to_string(),
+            }],
+        );
+        let edit = WorkspaceEdit {
+            changes: Some(changes),
+            document_changes: None,
+            change_annotations: None,
+        };
+        let resp: CodeActionResponse = vec![
+            // A bare command action (no inline edit; runs via executeCommand).
+            CodeActionOrCommand::Command(Command {
+                title: "Run fix".to_string(),
+                command: "fix.run".to_string(),
+                arguments: Some(vec![serde_json::json!(1)]),
+            }),
+            // A CodeAction carrying an inline workspace edit, marked preferred.
+            CodeActionOrCommand::CodeAction(CodeAction {
+                title: "Add import 'os'".to_string(),
+                edit: Some(edit),
+                is_preferred: Some(true),
+                ..Default::default()
+            }),
+            // A disabled action: must be filtered out, mirroring VS Code's
+            // lightbulb menu which hides disabled actions.
+            CodeActionOrCommand::CodeAction(CodeAction {
+                title: "Disabled thing".to_string(),
+                disabled: Some(CodeActionDisabled {
+                    reason: "nope".to_string(),
+                }),
+                ..Default::default()
+            }),
+        ];
+        let items = code_action_items(&resp, "ruff");
+        assert_eq!(items.len(), 2, "the disabled action must be filtered out");
+        assert_eq!(items[0].title, "Run fix");
+        assert_eq!(items[0].server, "ruff", "each item is tagged with its server");
+        assert!(items[0].edits.is_empty());
+        assert_eq!(items[0].command.as_ref().unwrap().command, "fix.run");
+        assert!(!items[0].needs_resolve);
+        assert_eq!(items[1].title, "Add import 'os'");
+        assert!(items[1].is_preferred);
+        assert_eq!(items[1].edits.len(), 1);
+        assert_eq!(items[1].edits[0].1[0].new_text, "import os\n");
+        assert!(!items[1].needs_resolve);
+    }
+
+    #[test]
+    fn code_action_items_flags_resolve_when_edit_absent() {
+        use lsp_types::{CodeAction, CodeActionOrCommand};
+        // ty / rust-analyzer style: the action arrives with `data` and no edit;
+        // the edit is filled in by a later codeAction/resolve round trip.
+        let resp: CodeActionResponse = vec![CodeActionOrCommand::CodeAction(CodeAction {
+            title: "Import symbol".to_string(),
+            data: Some(serde_json::json!({"id": 7})),
+            ..Default::default()
+        })];
+        let items = code_action_items(&resp, "basedpyright");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].server, "basedpyright");
+        assert!(items[0].edits.is_empty());
+        assert!(items[0].command.is_none());
+        assert!(
+            items[0].needs_resolve,
+            "an action with data but no edit/command must be marked for resolve"
+        );
+    }
+
+    #[test]
+    fn client_advertises_code_action_literal_and_resolve_support() {
+        // Servers like ruff only return rich CodeAction objects (kinds such as
+        // source.organizeImports / source.fixAll, plus resolvable edits) when the
+        // client advertises codeActionLiteralSupport + resolveSupport. Without it
+        // ty/ruff answer codeAction with nothing useful, so "Organize Imports"
+        // never appears.
+        let caps = build_client_capabilities();
+        let ca = caps
+            .text_document
+            .and_then(|td| td.code_action)
+            .expect("code action client capability must be declared");
+        let kinds = ca
+            .code_action_literal_support
+            .expect("codeActionLiteralSupport must be declared")
+            .code_action_kind
+            .value_set;
+        assert!(
+            kinds.iter().any(|k| k == "source.organizeImports"),
+            "the advertised kinds must include source.organizeImports"
+        );
+        assert!(
+            kinds.iter().any(|k| k == "quickfix"),
+            "the advertised kinds must include quickfix"
+        );
+        let resolves = ca
+            .resolve_support
+            .expect("resolveSupport must be declared so deferred edits resolve")
+            .properties;
+        assert!(resolves.iter().any(|p| p == "edit"));
+        assert_eq!(ca.data_support, Some(true));
+    }
+
+    #[test]
+    fn code_action_capability_detection() {
+        use lsp_types::{CodeActionOptions, CodeActionProviderCapability};
+        assert!(
+            !code_action_supported(&None),
+            "absent provider is unsupported"
+        );
+        assert!(
+            !code_action_supported(&Some(CodeActionProviderCapability::Simple(false))),
+            "a bare false is unsupported"
+        );
+        assert!(code_action_supported(&Some(
+            CodeActionProviderCapability::Simple(true)
+        )));
+        assert!(
+            code_action_supported(&Some(CodeActionProviderCapability::Options(
+                CodeActionOptions::default()
+            ))),
+            "an options object means supported"
+        );
     }
 
     #[test]

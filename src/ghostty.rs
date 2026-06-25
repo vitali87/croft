@@ -52,6 +52,7 @@ const CHORDS: &[(&str, &str)] = &[
     ("cmd+r", pl::CMD_R_HEX),
     ("cmd+alt+r", pl::CMD_OPT_R_HEX),
     ("cmd+/", pl::CMD_SLASH_HEX),
+    ("cmd+.", pl::CMD_DOT_HEX),
     ("cmd+shift+/", pl::CMD_SHIFT_SLASH_HEX),
     ("cmd+shift+enter", pl::CMD_SHIFT_ENTER_HEX),
     // Mac-style Cmd+letter editor / terminal / source-control chords.

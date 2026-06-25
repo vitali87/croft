@@ -19,6 +19,13 @@ const CMD_OPT_R_KEY: &str = "0x72-0x180000-0xf";
 const CMD_OPT_R_HEX: &str = "0x1b 0x5b 0x31 0x31 0x34 0x3b 0x31 0x31 0x75";
 const CMD_SLASH_KEY: &str = "0x2f-0x100000-0x2c";
 const CMD_SLASH_HEX: &str = "0x1b 0x5b 0x34 0x37 0x3b 0x39 0x75";
+/// `Cmd+.` (period) for Quick Fix (VS Code's `editor.action.quickFix`).
+/// character = 0x2e ('.'), modifiers = 0x100000 (Cmd), virtualKeyCode = 0x2f
+/// (kVK_ANSI_Period). HEX is the CSI-u sequence `ESC [ 46 ; 9 u` (codepoint 46
+/// = '.', modbyte 9 = 1 + Cmd(8)). iTerm2 does not bind Cmd+. to a menu item,
+/// so no NSUserKeyEquivalents relocation is needed; the forwarder claims it.
+const CMD_DOT_KEY: &str = "0x2e-0x100000-0x2f";
+const CMD_DOT_HEX: &str = "0x1b 0x5b 0x34 0x36 0x3b 0x39 0x75";
 /// `Cmd+Shift+Return`. Serialized identifier follows iTerm2's
 /// iTermKeystroke format `0x<char>-0x<modifiers>-0x<virtualKeyCode>`:
 /// character = 0xd (CR, the same unmodified value Return reports under
@@ -454,6 +461,7 @@ pub(crate) mod payloads {
     pub(crate) const CMD_OPT_SHIFT_F_HEX: &str = super::CMD_OPT_SHIFT_F_HEX;
     pub(crate) const CMD_C_HEX: &str = super::CMD_C_HEX;
     pub(crate) const CMD_D_HEX: &str = super::CMD_D_HEX;
+    pub(crate) const CMD_DOT_HEX: &str = super::CMD_DOT_HEX;
     pub(crate) const CMD_DIGIT_CHORDS: &[(&str, &str)] = super::CMD_DIGIT_CHORDS;
     pub(crate) const CMD_E_HEX: &str = super::CMD_E_HEX;
     pub(crate) const CMD_F12_HEX: &str = super::CMD_F12_HEX;
@@ -749,6 +757,7 @@ pub fn apply_croft_key_settings(plist: &mut Value) -> Result<(), ITerm2Error> {
         (CMD_OPT_UP_KEY, CMD_OPT_UP_HEX),
         (CMD_OPT_DOWN_KEY, CMD_OPT_DOWN_HEX),
         (CMD_SHIFT_P_KEY, CMD_SHIFT_P_HEX),
+        (CMD_DOT_KEY, CMD_DOT_HEX),
     ] {
         global.insert(key.into(), send_hex_action(hex, 0));
     }
@@ -1093,6 +1102,19 @@ mod tests {
                 "GlobalKeyMap is missing the CSI-u forwarder for {label}; without it, AppKit's NSResponder default key bindings catch the chord (Cmd+C -> copy: on PTYTextView) before croft's terminal handler sees a Char-with-Super key event, which is why Cmd+C silently fails to copy the croft selection even with the NSUserKeyEquivalents Edit-menu relocations in place"
             );
         }
+    }
+
+    #[test]
+    fn apply_croft_key_settings_forwards_cmd_dot_for_quick_fix() {
+        let mut plist = synth_plist("GUID-1", &["GUID-1"]);
+        apply_croft_key_settings(&mut plist).unwrap();
+        let top = plist.as_dictionary().unwrap();
+        let global = dict_in(top, "GlobalKeyMap");
+        assert_eq!(
+            action_text(global, CMD_DOT_KEY),
+            CMD_DOT_HEX,
+            "GlobalKeyMap must forward Cmd+. as a CSI-u sequence so croft's `is_quick_fix_key` fires and opens the Quick Fix menu. Without it the chord never reaches croft and the lightbulb is unreachable by keyboard"
+        );
     }
 
     #[test]

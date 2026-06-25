@@ -1031,23 +1031,17 @@ fn replace_span(lines: &mut Vec<String>, e: &TextSpanEdit) -> bool {
     if sr >= lines.len() || er >= lines.len() || (er, ec) < (sr, sc) {
         return false;
     }
-    if sr == er {
-        let line = &mut lines[sr];
-        let from = char_byte(line, sc);
-        let to = char_byte(line, ec);
-        line.replace_range(from..to, &e.new_text);
-        return true;
-    }
     let from = char_byte(&lines[sr], sc);
     let to = char_byte(&lines[er], ec);
+    let head = lines[sr][..from].to_string();
     let tail = lines[er][to..].to_string();
-    lines[sr].truncate(from);
-    lines[sr].push_str(&e.new_text);
-    lines[sr].push_str(&tail);
-    // Drop the now-merged intermediate and end rows.
-    for _ in sr + 1..=er {
-        lines.remove(sr + 1);
-    }
+    // Build the replacement text in full, then split it back on '\n' so a
+    // multi-line `new_text` (e.g. ruff's "Organize Imports", a whole-document
+    // reformat) becomes separate rows instead of one row with embedded newline
+    // bytes. A single-line edit (rename) yields exactly one row, unchanged.
+    let combined = format!("{head}{}{tail}", e.new_text);
+    let new_lines: Vec<String> = combined.split('\n').map(str::to_string).collect();
+    let _ = lines.splice(sr..=er, new_lines);
     true
 }
 
@@ -1990,6 +1984,21 @@ impl Editor {
     /// are server-pushed, never re-requested on focus like semantic tokens).
     pub fn diagnostics_path(&self) -> Option<&Path> {
         self.diagnostics_path.as_deref()
+    }
+
+    /// Clones of the diagnostics whose range intersects the inclusive logical
+    /// line span `[start_line, end_line]`. Passed as `codeAction` context so the
+    /// language server can attach quick fixes to the errors under the cursor.
+    pub fn diagnostics_in_line_range(
+        &self,
+        start_line: u32,
+        end_line: u32,
+    ) -> Vec<crate::lsp::manager::Diagnostic> {
+        self.diagnostics
+            .iter()
+            .filter(|d| d.start_line <= end_line && d.end_line >= start_line)
+            .cloned()
+            .collect()
     }
 
     #[cfg(test)]
@@ -6828,6 +6837,49 @@ mod tests {
         ];
         assert_eq!(apply_span_edits_to_lines(&mut lines, &edits), 2);
         assert_eq!(lines, vec!["baz bar baz".to_string()]);
+    }
+
+    #[test]
+    fn apply_span_edits_splits_multiline_new_text_into_separate_lines() {
+        // Ruff's "Organize Imports" returns ONE edit whose new_text spans several
+        // lines. The result must become several Vec entries, not one line with
+        // embedded '\n' (the bug that mashed the imports onto a single line).
+        let mut lines = vec![
+            "import typing".to_string(),
+            "import pandas".to_string(),
+            "import logging".to_string(),
+            "import re".to_string(),
+        ];
+        let edits = vec![TextSpanEdit {
+            start: (0, 0),
+            end: (3, 9),
+            new_text: "import logging\nimport re\nimport typing\n\nimport pandas".to_string(),
+        }];
+        assert_eq!(apply_span_edits_to_lines(&mut lines, &edits), 1);
+        assert_eq!(
+            lines,
+            vec![
+                "import logging".to_string(),
+                "import re".to_string(),
+                "import typing".to_string(),
+                String::new(),
+                "import pandas".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn apply_span_edits_single_line_range_with_multiline_new_text() {
+        // A same-line range whose new_text introduces a newline must split the
+        // line in two, keeping the untouched prefix and suffix.
+        let mut lines = vec!["abXYef".to_string()];
+        let edits = vec![TextSpanEdit {
+            start: (0, 2),
+            end: (0, 4),
+            new_text: "C\nD".to_string(),
+        }];
+        assert_eq!(apply_span_edits_to_lines(&mut lines, &edits), 1);
+        assert_eq!(lines, vec!["abC".to_string(), "Def".to_string()]);
     }
 
     #[test]

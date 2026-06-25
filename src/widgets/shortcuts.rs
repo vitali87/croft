@@ -297,6 +297,11 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 handler: "is_format_document_key",
             },
             ShortcutEntry {
+                keys: "Cmd/Ctrl+.",
+                description: "Quick Fix: code actions at the cursor (auto-import, fixes, refactors)",
+                handler: "is_quick_fix_key",
+            },
+            ShortcutEntry {
                 keys: "Cmd/Ctrl+C",
                 description: "Copy the selection (native system clipboard; OSC 52 fallback on remote)",
                 handler: "is_editor_copy_key",

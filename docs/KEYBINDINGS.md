@@ -159,6 +159,7 @@ On macOS, the `Cmd` chords below only reach croft after you run a one-time setup
 | `Cmd`+`d` `d` | Delete the current line (`Cmd`+`N` `Cmd`+`d` `d` for N lines; yanks to clipboard) |
 | `Cmd`+`y` `y` | Yank the current line (`Cmd`+`N` `Cmd`+`y` `y` for N lines) |
 | `Esc` | Clear the selection, or collapse multi-cursors back to one |
+| `Cmd`+`.` / `Ctrl`+`.` | Quick Fix: ask the language server for the code actions at the cursor (auto-import, fix-all, organize imports, refactors) and pick one from a menu; the diagnostics on the line ride along as context. One action with a deferred edit resolves and applies on pick (`codeAction/resolve`); also on the editor right-click menu and as Command Palette "Quick Fix..." |
 | `F2` | Rename Symbol across every file it touches (open tabs edit in-memory and stay dirty) |
 | `Cmd`+`F2` / `Ctrl`+`F2` | Change All Occurrences in the current file; type to replace, `Esc` to finish |
 | `F12` / `Cmd`/`Option`+click | Go to Definition (`Cmd`+`Shift`+click navigates back) |
@@ -292,6 +293,7 @@ Disabling takes effect immediately for the viewers and Vim (a disabled PDF/CSV v
 | `⌘⇧P` | Command Palette |
 | `⌘F` | In-editor Find |
 | `⌘/` | Toggle line comment |
+| `⌘.` | Quick Fix (code actions at the cursor) |
 | `⌥⌘↑` / `⌥⌘↓` | Add a cursor above / below (multi-cursor) |
 | `⌘⇧E` / `⌘⇧F` / `⌘⇧S` / `⌘⇧D` / `⌘⇧R` / `⌘⇧X` | Jump to Explorer / Search / Source Control / Run and Debug / Remote / Extensions |
 | `⌘⇧L` | Disconnect a remote session |

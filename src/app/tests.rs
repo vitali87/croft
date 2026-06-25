@@ -2325,6 +2325,38 @@ fn cmd_w_and_ctrl_shift_w_close_terminal_but_plain_ctrl_w_does_not() {
 }
 
 #[test]
+fn cmd_dot_and_ctrl_dot_are_quick_fix_key() {
+    // VS Code binds Quick Fix to Cmd+. on macOS (arrives as Char('.')+SUPER via
+    // the iTerm2/Ghostty CSI-u forwarder) and Ctrl+. on Linux/Termux.
+    assert!(is_quick_fix_key(key(
+        KeyCode::Char('.'),
+        KeyModifiers::SUPER
+    )));
+    assert!(is_quick_fix_key(key(
+        KeyCode::Char('.'),
+        KeyModifiers::CONTROL
+    )));
+}
+
+#[test]
+fn plain_dot_and_modified_dot_are_not_quick_fix_key() {
+    assert!(!is_quick_fix_key(key(
+        KeyCode::Char('.'),
+        KeyModifiers::NONE
+    )));
+    // Shift+. is '>' territory and Alt+. is the shell's last-arg; neither is
+    // Quick Fix.
+    assert!(!is_quick_fix_key(key(
+        KeyCode::Char('.'),
+        KeyModifiers::SUPER | KeyModifiers::SHIFT
+    )));
+    assert!(!is_quick_fix_key(key(
+        KeyCode::Char('.'),
+        KeyModifiers::ALT
+    )));
+}
+
+#[test]
 fn shift_ctrl_s_is_save_key() {
     // Some terminals report capital S with Ctrl pressed.
     let mods = KeyModifiers::CONTROL | KeyModifiers::SHIFT;
