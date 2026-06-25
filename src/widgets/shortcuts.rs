@@ -522,17 +522,17 @@ pub fn render_shortcuts_modal(
         buf.set_span(rect.x + 1, rect.y, &title, title.width() as u16);
     }
 
-    let lines = modal.lines();
-    modal.last_content_height = lines.len() as u16;
+    let paragraph = Paragraph::new(modal.lines()).wrap(Wrap { trim: false });
+    // Count the rows AFTER wrapping, not the logical-line count: a description
+    // that wraps onto a second visual row adds a row the scroll ceiling must
+    // account for, otherwise the bottom of the list is unreachable.
+    modal.last_content_height = paragraph.line_count(inner.width) as u16;
     modal.last_inner_height = inner.height;
     let max_scroll = modal.last_content_height.saturating_sub(inner.height);
     if modal.scroll > max_scroll {
         modal.scroll = max_scroll;
     }
-    let paragraph = Paragraph::new(lines)
-        .wrap(Wrap { trim: false })
-        .scroll((modal.scroll, 0));
-    Widget::render(paragraph, inner, buf);
+    Widget::render(paragraph.scroll((modal.scroll, 0)), inner, buf);
 }
 
 #[cfg(test)]
@@ -644,5 +644,40 @@ mod tests {
         };
         modal.scroll_to_bottom();
         assert_eq!(modal.scroll, 22);
+    }
+
+    fn buffer_text(buf: &Buffer) -> String {
+        let mut out = String::new();
+        for y in buf.area.top()..buf.area.bottom() {
+            for x in buf.area.left()..buf.area.right() {
+                out.push_str(buf[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    #[test]
+    fn scrolling_to_the_bottom_reveals_the_last_entry_even_when_lines_wrap() {
+        // A width where the long descriptions (zoxide jump, re-root, etc.) wrap to
+        // a second visual row but the short final entry still fits on one line.
+        let area = Rect::new(0, 0, 90, 24);
+        let mut buf = Buffer::empty(area);
+        let mut modal = ShortcutsModal::default();
+        // First render populates last_content_height / last_inner_height.
+        render_shortcuts_modal(&mut modal, area, &mut buf, false);
+        modal.scroll_to_bottom();
+        let mut buf = Buffer::empty(area);
+        render_shortcuts_modal(&mut modal, area, &mut buf, false);
+        let last_entry = SHORTCUT_GROUPS
+            .last()
+            .and_then(|g| g.entries.last())
+            .expect("there must be a final shortcut entry");
+        let text = buffer_text(&buf);
+        assert!(
+            text.contains(last_entry.description),
+            "after scroll_to_bottom the final entry '{}' must be visible; wrapped rows are not counted in the scroll ceiling so the bottom of the list is unreachable\n--- rendered ---\n{text}",
+            last_entry.description
+        );
     }
 }

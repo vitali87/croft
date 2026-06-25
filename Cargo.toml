@@ -1,6 +1,6 @@
 [package]
 name = "croft"
-version = "0.1.494"
+version = "0.1.495"
 edition = "2024"
 description = "VSCode-style TUI written in Rust"
 license = "MIT"
@@ -16,7 +16,7 @@ path = "src/main.rs"
 # Unix process control: `setsid` to detach a probe subprocess from croft's
 # controlling terminal so it can never hijack the tty (see lsp/install.rs).
 libc = "0.2"
-ratatui = "0.30"
+ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 crossterm = { version = "0.29", features = ["event-stream"] }
 portable-pty = "0.9"
 # Embedded-shell terminal emulator. Production-grade engine from
