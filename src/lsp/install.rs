@@ -78,6 +78,14 @@ pub enum Provision {
         /// `.zip` payloads that carry sibling files the binary needs at a fixed
         /// relative path (e.g. clangd's `clangd_<ver>/bin/clangd` beside `lib/`).
         bin_path: Option<&'static str>,
+        /// Termux/Android package name for `pkg install`. Set for a native
+        /// binary whose cross-distro release can't run on Android's bionic libc
+        /// (and whose `android` arch is therefore absent from `targets`): on
+        /// Termux the install reroutes to `pkg install <termux_pkg>`, which
+        /// lands the server in the always-on-PATH `$PREFIX/bin`. `None` leaves
+        /// an unsupported platform to fall back to PATH (clangd's linux-aarch64,
+        /// which has no Termux package either).
+        termux_pkg: Option<&'static str>,
     },
 }
 
@@ -394,7 +402,19 @@ fn run_binary_install(
     bin: &str,
     archive: ArchiveKind,
     bin_path: Option<&str>,
+    termux_pkg: Option<&str>,
 ) {
+    // Termux/Android: the cross-distro release (linux-gnu) won't run on bionic
+    // libc and `android` is absent from `targets`, so reroute to the native
+    // package manager exactly as the uv backend does for ty/ruff. `pkg` lands
+    // the server in the always-on-PATH `$PREFIX/bin`, which the next resolve
+    // picks up with no further plumbing.
+    if crate::iterm2_inline::detect_termux()
+        && let Some(pkg) = termux_pkg
+    {
+        run_termux_pkg_install(name, language, pkg);
+        return;
+    }
     let (os, arch) = (std::env::consts::OS, std::env::consts::ARCH);
     let Some(url) = target_url(targets, os, arch) else {
         log_file::log(&format!("lsp[{name}] no prebuilt binary for {os}-{arch}"));
@@ -497,7 +517,16 @@ pub fn ensure_in_background(config: &ServerConfig, provision: &Provision) {
             bin,
             archive,
             bin_path,
-        } => run_binary_install(name, language, targets, bin, *archive, *bin_path),
+            termux_pkg,
+        } => run_binary_install(
+            name,
+            language,
+            targets,
+            bin,
+            *archive,
+            *bin_path,
+            *termux_pkg,
+        ),
     });
 }
 

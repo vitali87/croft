@@ -1,12 +1,18 @@
 # Bundled croft extension: Rust language support.
-# rust-analyzer is expected on the user's toolchain PATH (croft does not
-# provision it). It must NOT receive a `cargo.targetDir` override: an isolated
-# target dir is always cold on a large crate, so the crate-graph prime never
-# finishes and every hover / completion / semantic-token response comes back
-# empty. Sharing the default target/ reuses the user's warm build artifacts.
+# PATH-first: a toolchain rust-analyzer (rustup component, ~/.cargo/bin) wins so
+# it matches the user's rustc and cargo stays reachable. When none exists, croft
+# downloads the single gzipped release binary (the asset VS Code's extension
+# uses) into ~/.croft/servers so "open a .rs -> get LSP" holds on a fresh box.
+# On Termux the linux-gnu binary can't run on Android's bionic libc, so the
+# install reroutes to `pkg install rust-analyzer` (termux_pkg below). It must
+# NOT receive a `cargo.targetDir` override either way: an isolated target dir is
+# always cold on a large crate, so the crate-graph prime never finishes and
+# every hover / completion / semantic-token response comes back empty. Sharing
+# the default target/ reuses the user's warm build artifacts. Keep the release
+# tag in the target URLs in sync with RUST_ANALYZER_TARGETS in src/lsp/config.rs.
 id = "lsp-rust"
 name = "Rust (rust-analyzer)"
-description = "Rust language support via rust-analyzer (expected on PATH)."
+description = "Rust language support via rust-analyzer (auto-provisioned if absent)."
 builtin = true
 api_version = 1
 
@@ -21,3 +27,4 @@ command = "rust-analyzer"
 args = []
 language = "rust"
 priority = 0
+provision = { kind = "binary", bin = "rust-analyzer", archive = "gz", termux_pkg = "rust-analyzer", targets = { "macos-aarch64" = "https://github.com/rust-lang/rust-analyzer/releases/download/2026-06-22/rust-analyzer-aarch64-apple-darwin.gz", "macos-x86_64" = "https://github.com/rust-lang/rust-analyzer/releases/download/2026-06-22/rust-analyzer-x86_64-apple-darwin.gz", "linux-x86_64" = "https://github.com/rust-lang/rust-analyzer/releases/download/2026-06-22/rust-analyzer-x86_64-unknown-linux-gnu.gz", "linux-aarch64" = "https://github.com/rust-lang/rust-analyzer/releases/download/2026-06-22/rust-analyzer-aarch64-unknown-linux-gnu.gz" } }

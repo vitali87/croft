@@ -284,6 +284,10 @@ pub struct ProvisionDecl {
     /// Absent for a single-file `.gz`.
     #[serde(default)]
     pub bin_path: Option<String>,
+    /// `binary`: Termux/Android package name for `pkg install`, used when the
+    /// cross-distro release can't run on Android (absent → PATH fallback).
+    #[serde(default)]
+    pub termux_pkg: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -383,6 +387,7 @@ impl ProvisionDecl {
                     ArchiveKindDecl::Zip => ArchiveKind::Zip,
                 },
                 bin_path: self.bin_path.as_deref().map(intern),
+                termux_pkg: self.termux_pkg.as_deref().map(intern),
             },
         }
     }

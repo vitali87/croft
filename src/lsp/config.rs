@@ -77,6 +77,32 @@ pub struct ServerConfig {
     pub provision: Option<crate::lsp::install::Provision>,
 }
 
+/// rust-analyzer release `.gz` assets (tag `2026-06-22`) keyed by Rust's
+/// `target_os`-`target_arch`. Listed in `BTreeMap` key order so this slice
+/// compares equal, by value, to the one the bundled `lsp-rust` manifest interns
+/// — the `reproduce_the_hardcoded_configs_exactly` invariant. Android is absent
+/// on purpose: the linux-gnu build can't run on bionic, so Termux installs via
+/// `pkg` instead (the `termux_pkg` field on the provision). Bump the tag in
+/// both this const and `assets/extensions/lsp-rust/extension.toml` together.
+const RUST_ANALYZER_TARGETS: &[(&str, &str)] = &[
+    (
+        "linux-aarch64",
+        "https://github.com/rust-lang/rust-analyzer/releases/download/2026-06-22/rust-analyzer-aarch64-unknown-linux-gnu.gz",
+    ),
+    (
+        "linux-x86_64",
+        "https://github.com/rust-lang/rust-analyzer/releases/download/2026-06-22/rust-analyzer-x86_64-unknown-linux-gnu.gz",
+    ),
+    (
+        "macos-aarch64",
+        "https://github.com/rust-lang/rust-analyzer/releases/download/2026-06-22/rust-analyzer-aarch64-apple-darwin.gz",
+    ),
+    (
+        "macos-x86_64",
+        "https://github.com/rust-lang/rust-analyzer/releases/download/2026-06-22/rust-analyzer-x86_64-apple-darwin.gz",
+    ),
+];
+
 impl ServerConfig {
     pub fn ty() -> Self {
         Self {
@@ -179,7 +205,21 @@ impl ServerConfig {
             // never finishes and every hover / completion / semantic-token
             // response comes back empty.
             initialization_options: None,
-            provision: None,
+            // rust-analyzer ships as a single gzipped native binary per platform
+            // (the same asset VS Code's extension downloads). resolve_config
+            // probes PATH + ~/.cargo/bin BEFORE this, so a toolchain
+            // rust-analyzer matching the user's rustc always wins and cargo
+            // stays reachable; croft downloads its own copy only when none
+            // exists anywhere — which is what makes "open a .rs → get LSP" hold
+            // on a fresh box. On Termux the linux-gnu build can't run on bionic
+            // libc, so the install reroutes to `pkg install rust-analyzer`.
+            provision: Some(crate::lsp::install::Provision::Binary {
+                targets: RUST_ANALYZER_TARGETS,
+                bin: "rust-analyzer",
+                archive: crate::lsp::install::ArchiveKind::Gz,
+                bin_path: None,
+                termux_pkg: Some("rust-analyzer"),
+            }),
         }
     }
 
@@ -304,11 +344,37 @@ mod tests {
 
     #[test]
     fn path_only_servers_have_no_provision() {
-        // rust-analyzer / gopls are expected on the user's toolchain PATH;
-        // croft doesn't install them.
-        assert!(ServerConfig::rust_analyzer().provision.is_none());
+        // gopls / basedpyright are expected on the user's toolchain PATH; croft
+        // doesn't install them. (rust-analyzer USED to be here too, but now
+        // carries a Binary provision — see `rust_analyzer_provisions_as_binary`.)
         assert!(ServerConfig::gopls().provision.is_none());
         assert!(ServerConfig::basedpyright().provision.is_none());
+    }
+
+    #[test]
+    fn rust_analyzer_provisions_as_binary_with_termux_fallback() {
+        // rust-analyzer is PATH-first (resolve_config probes PATH + ~/.cargo/bin
+        // before downloading), but no longer PATH-ONLY: when absent croft
+        // downloads the official release `.gz`, and on Termux reroutes to
+        // `pkg install rust-analyzer` since the glibc build can't run on bionic.
+        use crate::lsp::install::{ArchiveKind, Provision};
+        let Some(Provision::Binary {
+            bin,
+            archive,
+            bin_path,
+            termux_pkg,
+            targets,
+        }) = ServerConfig::rust_analyzer().provision
+        else {
+            panic!("rust-analyzer must carry a Binary provision");
+        };
+        assert_eq!(bin, "rust-analyzer");
+        assert_eq!(archive, ArchiveKind::Gz);
+        assert_eq!(bin_path, None);
+        assert_eq!(termux_pkg, Some("rust-analyzer"));
+        // No `android` key: Android is served by the Termux pkg fallback.
+        assert!(!targets.iter().any(|(k, _)| k.starts_with("android")));
+        assert!(targets.iter().any(|(k, _)| *k == "linux-x86_64"));
     }
 
     #[test]

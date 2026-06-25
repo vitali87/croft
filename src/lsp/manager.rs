@@ -7,21 +7,20 @@ use std::sync::mpsc as std_mpsc;
 
 use anyhow::Result;
 use lsp_types::{
-    ClientCapabilities, CodeActionClientCapabilities, CodeActionKindLiteralSupport,
-    CodeActionLiteralSupport, CodeActionCapabilityResolveSupport, CodeActionOrCommand,
-    CodeActionProviderCapability, CodeActionResponse,
-    CompletionClientCapabilities, CompletionItemCapability, CompletionItemKind,
-    CompletionItemKindCapability, CompletionResponse, DeclarationCapability,
-    DocumentChangeOperation, DocumentChanges, DocumentSymbol, DocumentSymbolClientCapabilities,
-    DocumentSymbolResponse, GotoDefinitionResponse, HoverContents, HoverProviderCapability,
-    ImplementationProviderCapability, Location, MarkedString, MarkupKind, OneOf, Position,
-    PublishDiagnosticsClientCapabilities, SemanticTokenModifier, SemanticTokenType,
-    SemanticTokensClientCapabilities, SemanticTokensClientCapabilitiesRequests,
-    SemanticTokensFullOptions, SemanticTokensRangeResult, SemanticTokensResult,
-    SemanticTokensServerCapabilities, SemanticTokensWorkspaceClientCapabilities,
-    ServerCapabilities, SymbolKind, TextDocumentClientCapabilities, TextEdit, TokenFormat,
-    TypeDefinitionProviderCapability, Url, WindowClientCapabilities, WorkspaceClientCapabilities,
-    WorkspaceEdit,
+    ClientCapabilities, CodeActionCapabilityResolveSupport, CodeActionClientCapabilities,
+    CodeActionKindLiteralSupport, CodeActionLiteralSupport, CodeActionOrCommand,
+    CodeActionProviderCapability, CodeActionResponse, CompletionClientCapabilities,
+    CompletionItemCapability, CompletionItemKind, CompletionItemKindCapability, CompletionResponse,
+    DeclarationCapability, DocumentChangeOperation, DocumentChanges, DocumentSymbol,
+    DocumentSymbolClientCapabilities, DocumentSymbolResponse, GotoDefinitionResponse,
+    HoverContents, HoverProviderCapability, ImplementationProviderCapability, Location,
+    MarkedString, MarkupKind, OneOf, Position, PublishDiagnosticsClientCapabilities,
+    SemanticTokenModifier, SemanticTokenType, SemanticTokensClientCapabilities,
+    SemanticTokensClientCapabilitiesRequests, SemanticTokensFullOptions, SemanticTokensRangeResult,
+    SemanticTokensResult, SemanticTokensServerCapabilities,
+    SemanticTokensWorkspaceClientCapabilities, ServerCapabilities, SymbolKind,
+    TextDocumentClientCapabilities, TextEdit, TokenFormat, TypeDefinitionProviderCapability, Url,
+    WindowClientCapabilities, WorkspaceClientCapabilities, WorkspaceEdit,
 };
 use tokio::sync::{Mutex as TokioMutex, mpsc as tokio_mpsc, oneshot};
 
@@ -3126,6 +3125,24 @@ fn project_root_for(path: &Path, lang: Language, workspace_root: &Path) -> PathB
 /// re-probes don't spam the log on every request.
 fn resolve_config(config: &ServerConfig, log_skip: bool) -> Option<(ServerConfig, Vec<PathBuf>)> {
     if let Some(provision) = &config.provision {
+        // Native-binary servers (rust-analyzer, clangd, taplo) are toolchain
+        // tools: a real copy on PATH or in a toolchain dir (~/.cargo/bin) must
+        // win over a croft-downloaded one so it matches the user's compiler, and
+        // for rust-analyzer `resolve_path_only` prepends that dir to the child
+        // PATH so the server can find cargo/rustc under a stripped GUI launch.
+        // Only when no real binary exists anywhere do we fall back to a managed
+        // download / Termux `pkg` install. npm/uv servers keep their own
+        // managed-first (vtsls) or PATH-first (ty/ruff) ordering inside
+        // `resolve_managed`, so this preference is scoped to the Binary backend.
+        if matches!(provision, crate::lsp::install::Provision::Binary { .. })
+            && let Some(resolved) = resolve_path_only(
+                config,
+                is_on_path(&config.command),
+                &toolchain_fallback_dirs(),
+            )
+        {
+            return Some(resolved);
+        }
         return crate::lsp::install::resolve_managed(config, provision, log_skip);
     }
     if let Some(resolved) = resolve_path_only(
@@ -3380,7 +3397,10 @@ mod tests {
         let items = code_action_items(&resp, "ruff");
         assert_eq!(items.len(), 2, "the disabled action must be filtered out");
         assert_eq!(items[0].title, "Run fix");
-        assert_eq!(items[0].server, "ruff", "each item is tagged with its server");
+        assert_eq!(
+            items[0].server, "ruff",
+            "each item is tagged with its server"
+        );
         assert!(items[0].edits.is_empty());
         assert_eq!(items[0].command.as_ref().unwrap().command, "fix.run");
         assert!(!items[0].needs_resolve);

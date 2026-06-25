@@ -338,6 +338,51 @@ mod tests {
     }
 
     #[test]
+    fn bundled_manifest_provisions_rust_analyzer_as_gz_binary_with_termux_fallback() {
+        // rust-analyzer used to be PATH-only (provision: None), so on a box
+        // without it on PATH — most of all Termux, where there is no rustup —
+        // Rust LSP silently never started. It now carries a gz-binary provision
+        // (the asset VS Code downloads) plus a Termux `pkg` fallback for Android,
+        // where the linux-gnu build can't run on bionic libc. Guard both.
+        use crate::lsp::install::{ArchiveKind, Provision};
+        let r = ServerRegistry::with_defaults();
+        let rust = r.for_language(Language::RUST);
+        assert_eq!(rust.len(), 1, "one server for rust");
+        assert_eq!(rust[0].name, "rust-analyzer");
+        assert_eq!(rust[0].command, "rust-analyzer");
+        let Some(Provision::Binary {
+            bin,
+            archive,
+            bin_path,
+            termux_pkg,
+            targets,
+        }) = &rust[0].provision
+        else {
+            panic!("rust-analyzer must carry a Binary provision");
+        };
+        assert_eq!(*bin, "rust-analyzer");
+        assert_eq!(*archive, ArchiveKind::Gz, "single gzipped binary");
+        assert_eq!(*bin_path, None, "gz decompresses straight to the binary");
+        assert_eq!(
+            *termux_pkg,
+            Some("rust-analyzer"),
+            "Termux reroutes to `pkg install rust-analyzer`"
+        );
+        // Desktop platforms croft can download for; Android is intentionally
+        // absent (handled by the Termux pkg fallback above).
+        for key in ["macos-aarch64", "macos-x86_64", "linux-x86_64", "linux-aarch64"] {
+            assert!(
+                targets.iter().any(|(k, url)| *k == key && url.ends_with(".gz")),
+                "rust-analyzer must have a .gz target for {key}"
+            );
+        }
+        assert!(
+            !targets.iter().any(|(k, _)| k.starts_with("android")),
+            "android must not be a download target (uses pkg instead)"
+        );
+    }
+
+    #[test]
     fn a_user_manifest_registers_a_new_language_server_with_zero_rust() {
         // The phase-B payoff: a Zig extension declared purely as data registers
         // zls for .zig with no Rust change. (Hermetic: the manifest is passed
