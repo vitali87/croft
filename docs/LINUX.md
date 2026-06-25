@@ -36,10 +36,10 @@ sudo pacman -S poppler              # Arch
 
 ## Language servers
 
-croft picks up `rust-analyzer` and `gopls` from your `PATH`. For the TypeScript / JavaScript server it auto-installs `vtsls` on first use as long as `node` + `npm` are present, and it provisions the Python servers (`ty`, `ruff`) itself via `uv`. Install whatever your distro provides for the languages you use:
+croft auto-provisions `rust-analyzer` on first use (it downloads the official release binary into `~/.croft/servers`), but a copy already on your `PATH` or in `~/.cargo/bin` wins so it matches your toolchain. It picks up `gopls` from your `PATH`. For the TypeScript / JavaScript server it auto-installs `vtsls` on first use as long as `node` + `npm` are present, and it provisions the Python servers (`ty`, `ruff`) itself via `uv`. You can still install distro packages for the languages you use (a PATH copy takes precedence):
 
 ```bash
-sudo apt install rust-analyzer gopls nodejs npm   # adjust per distro
+sudo apt install rust-analyzer gopls nodejs npm   # adjust per distro; rust-analyzer optional
 ```
 
 ## Remote: `croft remote <host>`
@@ -50,6 +50,8 @@ This is the most common way Linux comes into play, even from a Mac. `croft remot
 2. Failing that, it falls back to compiling on the host, provisioning a C toolchain and `pkg-config` across whichever package manager the box has: `apt`, `dnf`/`yum`, `apk`, `pacman`, or `zypper`.
 
 A stock cloud image works out of the box. Behaviour, keybindings, latency, and the filesystem-sync invariants are all identical to the local session.
+
+The **launching** machine needs `rsync` on its `PATH` — croft uses it to sync the source tree to the host. macOS and most Linux installs ship it already; a stock Termux does not (`pkg install rsync`). Without it the connect fails with `running rsync to remote: spawning streaming subprocess: No such file or directory`.
 
 Background self-updates use a dedicated throttled SSH lane so install bytes never queue ahead of live keystrokes, keeping input latency at zero even while a newer binary streams in.
 

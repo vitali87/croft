@@ -4,7 +4,7 @@ Setup notes for running croft as a native Android binary inside [Termux](https:/
 
 croft compiles and runs natively on Android via the same `cargo install` command as every other platform. Two things differ on Android: there is no `Cmd` key, and mainline Termux supports no inline-image protocol. croft handles both, plus the lack of a usable soft keyboard, in-process.
 
-There is **no required setup command** on Android. After `cargo install`, croft works on launch: the activity-bar font, the `Ctrl` modifier, and the on-screen keyboard all come up on their own. The only manual steps are optional `pkg install`s for the language servers croft cannot provision itself (Node for TypeScript, `rust-analyzer` / `gopls` for Rust / Go), and only if you want LSP for those languages.
+There is **no required setup command** on Android. After `cargo install`, croft works on launch: the activity-bar font, the `Ctrl` modifier, and the on-screen keyboard all come up on their own. The only manual step is an optional `pkg install nodejs` if you want the TypeScript / JavaScript server, plus `pkg install gopls` for Go — croft provisions the rest (Python's `ty`/`ruff` and Rust's `rust-analyzer`) itself on first use via `pkg`.
 
 ## Install
 
@@ -24,12 +24,19 @@ The curl-based installers croft uses on macOS and Linux cannot run on a stock Te
 
 - **zoxide** (backs the `Ctrl`+`Z` directory-jump popup) is installed via `pkg`.
 - **ty** and **ruff** (the Python language servers) are installed via `pkg`, because `uv` (croft's provisioning chain elsewhere) does not support Android.
+- **rust-analyzer** is installed via `pkg` too: its cross-distro release binary is built against glibc and won't run on Android's bionic libc, so croft reroutes to the Termux package (`rust-analyzer`) the same way it does for `ty`/`ruff`.
 
-For the other languages, install the servers yourself:
+For the remaining languages, install the servers yourself:
 
 ```bash
-pkg install nodejs                  # lets croft set up the TypeScript / JavaScript server
-pkg install rust-analyzer gopls     # Rust and Go (picked up from PATH on every platform)
+pkg install nodejs     # lets croft set up the TypeScript / JavaScript server
+pkg install gopls      # Go (picked up from PATH)
+```
+
+To launch croft on a server with `croft remote <host>`, you also need **`rsync`** on the phone — croft shells out to it to sync the source tree to the box, and a stock Termux has no `rsync`, so the connect fails with `running rsync to remote: spawning streaming subprocess: No such file or directory`:
+
+```bash
+pkg install rsync                   # required by `croft remote <host>`
 ```
 
 ## Inline previews
