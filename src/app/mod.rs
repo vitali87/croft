@@ -1412,17 +1412,11 @@ pub struct App {
     /// without recomputing layout outside of `render`.
     sidebar_splitter_x: Option<u16>,
     terminal_splitter_y: Option<u16>,
-    /// Last-rendered x of the seam between the two editor columns while
-    /// split side by side. `None` when not split horizontally. Used to
-    /// hit-test the editor-split drag, mirroring `sidebar_splitter_x`.
-    editor_splitter_x: Option<u16>,
-    /// Last-rendered y of the seam between two stacked editor groups while
-    /// split top/bottom. `None` unless the root is a vertical 2-group split.
-    /// The vertical analogue of `editor_splitter_x`.
-    editor_splitter_y: Option<u16>,
-    /// Last-rendered rect of the whole editor pane (all groups + seams), so a
-    /// vertical-seam drag can map a pointer row onto the top group's height.
-    editor_pane_area: Rect,
+    /// Every draggable seam between editor groups, as laid out by the most
+    /// recent render. Empty when unsplit. Drives both the focus-on-click guard
+    /// (a press on a seam must not steal focus) and the seam-drag hit-test, for
+    /// a grid of any depth.
+    editor_seams: Vec<editor_layout::Seam>,
     /// Hit-test rectangles of the "[+]" buttons - one per terminal pane,
     /// indexed in lock-step with `terminals`. Empty when the pane is hidden
     /// or every pane is too narrow for the label.
@@ -1675,16 +1669,14 @@ pub struct EditorImageLayout {
     pub path: PathBuf,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum SplitterDrag {
     Sidebar,
     Terminal,
-    /// Dragging the vertical seam between the two editor columns while
-    /// the editor is split side by side.
-    EditorSplit,
-    /// Dragging the horizontal seam between two stacked editor groups while
-    /// the editor is split top/bottom.
-    EditorSplitVertical,
+    /// Dragging a seam between two editor groups in the grid. Carries the seam
+    /// snapshot taken at mouse-down (stable for the drag's duration), so the
+    /// drag adjusts exactly that boundary in a grid of any depth.
+    EditorSeam(editor_layout::Seam),
 }
 
 /// Minimum width in cells of either editor column while split, so a drag
@@ -2035,9 +2027,7 @@ impl App {
             sidebar_width: SIDEBAR_WIDTH_DEFAULT,
             terminal_height: None,
             splitter_drag: None,
-            editor_splitter_x: None,
-            editor_splitter_y: None,
-            editor_pane_area: Rect::default(),
+            editor_seams: Vec::new(),
             sidebar_splitter_x: None,
             terminal_splitter_y: None,
             terminal_add_buttons: Vec::new(),
@@ -6099,9 +6089,6 @@ impl App {
     /// Right = (H, after), Left = (H, before), Down = (V, after), Up = (V,
     /// before). Splitting is offered only from an unsplit editor for now.
     fn split_editor_dir(&mut self, dir: editor_layout::SplitDir, new_after: bool) {
-        if self.editor_layout.is_split() {
-            return;
-        }
         let Some(path) = self.editor.path.clone() else {
             self.status = String::from("Cannot split: save the file first");
             return;
@@ -6158,6 +6145,27 @@ impl App {
         self.focus_pane(Pane::Editor);
     }
 
+    /// The seam (if any) the cell `(col, row)` lands on, using the same
+    /// two-cell hit-zone as the sidebar/terminal seams. Returns a clone so an
+    /// in-flight drag can hold the boundary across frames.
+    fn seam_at(&self, col: u16, row: u16) -> Option<editor_layout::Seam> {
+        self.editor_seams
+            .iter()
+            .find(|s| match s.dir {
+                editor_layout::SplitDir::Horizontal => {
+                    (col == s.pos || col == s.pos.saturating_sub(1))
+                        && row >= s.cross_start
+                        && row < s.cross_end
+                }
+                editor_layout::SplitDir::Vertical => {
+                    (row == s.pos || row == s.pos.saturating_sub(1))
+                        && col >= s.cross_start
+                        && col < s.cross_end
+                }
+            })
+            .cloned()
+    }
+
     /// After a tab close, collapse the split if the focused group ran out
     /// of real tabs. The surviving (other) group becomes the sole editor.
     fn collapse_split_if_empty(&mut self) {
@@ -6168,8 +6176,7 @@ impl App {
         // become the new active editor. Evict the right slot's image so it
         // can't ghost after the column disappears.
         self.editor = self.editor_layout.collapse_active();
-        self.editor_splitter_x = None;
-        self.editor_splitter_y = None;
+        self.editor_seams.clear();
         self.disable_editor_image(1);
         // Focus stays on the editor pane; just re-light the promoted
         // group's border. (No `focus_pane` so this is safe to call from
@@ -6355,8 +6362,7 @@ impl App {
             // case a split was just collapsed back to the welcome screen.
             self.disable_editor_image(0);
             self.disable_editor_image(1);
-            self.editor_splitter_x = None;
-            self.editor_splitter_y = None;
+            self.editor_seams.clear();
             // Keep the editor's hit-test rectangles fresh so the activity-bar
             // / tree click logic still works even though we skipped the
             // EditorTabs widget this frame.
@@ -6381,7 +6387,6 @@ impl App {
             // into `self.editor`; every other group lives in `editor_layout`.
             // Lay the leaves out and paint each at its rect (depth-first order),
             // reporting the active group's rect so popups anchor there.
-            self.editor_pane_area = editor_area;
             let rects = self.editor_layout.leaf_rects(editor_area, EDITOR_SPLIT_MIN);
             let active_idx = self.editor_layout.active_dfs_index();
             let focused_area = if self.editor_layout.is_split() {
@@ -6402,19 +6407,9 @@ impl App {
                     group.hover_pointer = pointer;
                     frame.render_widget(group, rect);
                 }
-                // The seam between the two groups is the drag target. A
-                // horizontal split has a vertical seam at the second column's
-                // left edge; a vertical split has a horizontal seam at the
-                // second row's top edge. Exactly one is set (or neither, for a
-                // shape this stage doesn't build).
-                let root_dir = self.editor_layout.root_split_dir();
-                let two = rects.len() == 2;
-                self.editor_splitter_x = (two
-                    && root_dir == Some(editor_layout::SplitDir::Horizontal))
-                .then(|| rects[1].x);
-                self.editor_splitter_y = (two
-                    && root_dir == Some(editor_layout::SplitDir::Vertical))
-                .then(|| rects[1].y);
+                // Every boundary in the grid is a draggable seam (one per
+                // internal child edge of every split node, any depth).
+                self.editor_seams = self.editor_layout.seams(editor_area, EDITOR_SPLIT_MIN);
                 // Image overlays stay keyed by physical column (0 = left).
                 if rects.len() == 2 {
                     self.update_editor_image_overlay(0, rects[0]);
@@ -6426,8 +6421,7 @@ impl App {
                 active_area
             } else {
                 frame.render_widget(&mut self.editor, editor_area);
-                self.editor_splitter_x = None;
-                self.editor_splitter_y = None;
+                self.editor_seams.clear();
                 self.update_editor_image_overlay(0, editor_area);
                 // No right pane: make sure its slot can't ghost an image.
                 self.disable_editor_image(1);
@@ -14853,8 +14847,7 @@ impl App {
         // columns fixed.
         if matches!(m.kind, MouseEventKind::Down(_))
             && self.editor_layout.is_split()
-            && self.editor_splitter_x != Some(m.column)
-            && self.editor_splitter_y != Some(m.row)
+            && self.seam_at(m.column, m.row).is_none()
             && let Some(target) = self.editor_layout.inactive_dfs_index_at(m.column, m.row)
         {
             let current = std::mem::take(&mut self.editor);
@@ -15203,20 +15196,10 @@ impl App {
                         return;
                     }
                 }
-                // Seam between the two editor columns while split side by side.
-                // Same two-column hit-zone as the sidebar seam.
-                if let Some(x) = self.editor_splitter_x
-                    && (m.column == x || m.column == x.saturating_sub(1))
-                {
-                    self.splitter_drag = Some(SplitterDrag::EditorSplit);
-                    return;
-                }
-                // Seam between two stacked editor groups while split top/bottom.
-                // Same two-row hit-zone as the terminal seam.
-                if let Some(y) = self.editor_splitter_y
-                    && (m.row == y || m.row == y.saturating_sub(1))
-                {
-                    self.splitter_drag = Some(SplitterDrag::EditorSplitVertical);
+                // Any seam between editor groups in the grid (any depth). Same
+                // two-cell hit-zone as the other seams.
+                if let Some(seam) = self.seam_at(m.column, m.row) {
+                    self.splitter_drag = Some(SplitterDrag::EditorSeam(seam));
                     return;
                 }
                 // OPEN EDITORS: header toggles collapse; a row activates that
@@ -15857,7 +15840,7 @@ impl App {
                 }
             }
             MouseEventKind::Drag(MouseButton::Left) => {
-                if let Some(kind) = self.splitter_drag {
+                if let Some(kind) = self.splitter_drag.clone() {
                     self.handle_splitter_drag(kind, m.column, m.row);
                     return;
                 }
@@ -17148,46 +17131,20 @@ impl App {
                     .max(TERMINAL_HEIGHT_MIN);
                 self.terminal_height = Some(new_h.clamp(TERMINAL_HEIGHT_MIN, max_h));
             }
-            SplitterDrag::EditorSplit => {
+            SplitterDrag::EditorSeam(seam) => {
                 if !self.editor_layout.is_split() {
                     return;
                 }
-                // The editor area starts after the activity bar and (when
-                // shown) the sidebar. The pointer column minus that left
-                // edge is the new left-column width; the seam carries no
-                // dedicated cell so left + right == total editor width. Pin the
-                // split's child weights to those cell counts so the layout
-                // reproduces the dragged split at the current width.
-                let editor_left = ACTIVITY_BAR_WIDTH
-                    + if self.show_tree {
-                        self.sidebar_width
-                    } else {
-                        0
-                    };
-                let total = self.last_content_width;
-                let max_left = total.saturating_sub(EDITOR_SPLIT_MIN).max(EDITOR_SPLIT_MIN);
-                let new_left = column
-                    .saturating_sub(editor_left)
-                    .clamp(EDITOR_SPLIT_MIN, max_left);
-                let new_right = total.saturating_sub(new_left).max(1);
+                // Map the pointer onto the seam's axis (column for a vertical
+                // seam line, row for a horizontal one) and repartition only the
+                // two groups it separates. The seam carries no dedicated cell,
+                // so the two groups tile the boundary exactly.
+                let pointer = match seam.dir {
+                    editor_layout::SplitDir::Horizontal => column,
+                    editor_layout::SplitDir::Vertical => row,
+                };
                 self.editor_layout
-                    .set_root_split_weights(new_left, new_right);
-            }
-            SplitterDrag::EditorSplitVertical => {
-                if !self.editor_layout.is_split() {
-                    return;
-                }
-                // The pointer row minus the editor pane's top edge is the new
-                // top-group height; the seam carries no dedicated row so top +
-                // bottom == the pane height. Pin the split's child weights to
-                // those cell counts (weights apportion along the split's axis).
-                let pane = self.editor_pane_area;
-                let total = pane.height;
-                let max_top = total.saturating_sub(EDITOR_SPLIT_MIN).max(EDITOR_SPLIT_MIN);
-                let new_top = row.saturating_sub(pane.y).clamp(EDITOR_SPLIT_MIN, max_top);
-                let new_bottom = total.saturating_sub(new_top).max(1);
-                self.editor_layout
-                    .set_root_split_weights(new_top, new_bottom);
+                    .drag_seam(&seam, pointer, EDITOR_SPLIT_MIN);
             }
         }
     }

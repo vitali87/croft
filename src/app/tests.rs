@@ -12262,6 +12262,29 @@ fn split_down_makes_a_vertical_split_with_the_new_group_active_below() {
 }
 
 #[test]
+fn split_right_then_split_down_yields_three_tiled_groups() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.txt", "hello");
+    app.split_editor_dir(editor_layout::SplitDir::Horizontal, true); // Split Right
+    app.split_editor_dir(editor_layout::SplitDir::Vertical, true); // Split Down on the right group
+    assert_eq!(
+        app.editor_layout.leaf_count(),
+        3,
+        "repeated splitting builds a real grid, not a no-op"
+    );
+    // Left column full height; the right column is split top/bottom.
+    let rects = app
+        .editor_layout
+        .leaf_rects(ratatui::layout::Rect::new(0, 0, 100, 40), 10);
+    assert_eq!(rects.len(), 3);
+    assert_eq!(rects[0], ratatui::layout::Rect::new(0, 0, 50, 40));
+    assert_eq!(rects[1], ratatui::layout::Rect::new(50, 0, 50, 20));
+    assert_eq!(rects[2], ratatui::layout::Rect::new(50, 20, 50, 20));
+    // The newest (focused) group is the lower-right leaf.
+    assert_eq!(app.editor_layout.active_dfs_index(), 2);
+}
+
+#[test]
 fn split_up_makes_a_vertical_split_with_the_new_group_active_above() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = app_with_open_file(tmp.path(), "a.txt", "hi");
@@ -12435,7 +12458,7 @@ fn closing_last_tab_in_focused_group_collapses_the_split() {
         0,
         "the collapsed state resets to the single-column default"
     );
-    assert_eq!(app.editor_splitter_x, None);
+    assert!(app.editor_seams.is_empty());
 }
 
 #[test]

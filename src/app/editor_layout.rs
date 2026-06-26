@@ -44,6 +44,33 @@ pub struct LayoutChild {
     pub weight: u16,
 }
 
+/// A draggable boundary between two adjacent groups in the rendered grid. One
+/// per internal child boundary of every split node, so a grid of any depth has
+/// every seam independently hit-testable and draggable.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Seam {
+    /// The owning split's orientation. `Horizontal` → a VERTICAL seam line the
+    /// user drags left/right; `Vertical` → a HORIZONTAL seam dragged up/down.
+    pub dir: SplitDir,
+    /// Screen coordinate of the seam line: `x` for a horizontal split, `y` for
+    /// a vertical split.
+    pub pos: u16,
+    /// Perpendicular extent `[cross_start, cross_end)` the seam spans (rows for
+    /// a vertical line, columns for a horizontal line) — so seams in different
+    /// regions of a grid don't claim each other's cells.
+    pub cross_start: u16,
+    pub cross_end: u16,
+    /// Along-axis start of the owning split node and its total length, plus the
+    /// child boundary index — enough to repartition the two adjacent groups on
+    /// a drag without disturbing the rest of the grid.
+    pub node_axis_start: u16,
+    pub node_axis_len: u16,
+    /// Path of child indices from the root to the owning split node.
+    pub path: Vec<usize>,
+    /// The seam sits between child `boundary` and `boundary + 1`.
+    pub boundary: usize,
+}
+
 /// Lay every leaf out within `area`, returning one [`Rect`] per leaf in
 /// depth-first (left-to-right / top-to-bottom) order — the same order
 /// [`LayoutNode`] iteration visits leaves. Splits apportion the available
@@ -167,6 +194,48 @@ impl EditorLayout {
         leaf_rects(&self.root, area, min)
     }
 
+    /// Every draggable seam in the grid laid out within `area`, one per internal
+    /// child boundary of every split node (depth-first).
+    pub fn seams(&self, area: Rect, min: u16) -> Vec<Seam> {
+        let mut out = Vec::new();
+        let mut path = Vec::new();
+        collect_seams(&self.root, area, min, &mut path, &mut out);
+        out
+    }
+
+    /// Apply a seam drag: move the boundary to `pointer` (a screen `x` for a
+    /// horizontal split, `y` for a vertical split) by repartitioning ONLY the
+    /// two groups the seam separates, leaving the rest of the grid fixed. The
+    /// owning split's child weights are first normalised to their current cell
+    /// lengths so adjusting two never disturbs the others.
+    pub fn drag_seam(&mut self, seam: &Seam, pointer: u16, min: u16) {
+        let Some(node) = node_at_path(&mut self.root, &seam.path) else {
+            return;
+        };
+        let LayoutNode::Split { children, .. } = node else {
+            return;
+        };
+        if seam.boundary + 1 >= children.len() {
+            return;
+        }
+        // Normalise to current cell lengths so only the dragged pair moves.
+        let weights: Vec<u16> = children.iter().map(|c| c.weight).collect();
+        let lengths = apportion(seam.node_axis_len, &weights, min);
+        for (c, len) in children.iter_mut().zip(&lengths) {
+            c.weight = (*len).max(1);
+        }
+        let b = seam.boundary;
+        let combined = lengths[b].saturating_add(lengths[b + 1]);
+        let first_start =
+            seam.node_axis_start + lengths[..b].iter().copied().map(u32::from).sum::<u32>() as u16;
+        let max_first = combined.saturating_sub(min).max(min);
+        let new_first = pointer
+            .saturating_sub(first_start)
+            .clamp(min.min(combined), max_first);
+        children[b].weight = new_first.max(1);
+        children[b + 1].weight = combined.saturating_sub(new_first).max(1);
+    }
+
     /// Depth-first index of the active leaf (the hoisted group), i.e. how many
     /// leaves precede it left-to-right / top-to-bottom. `0` when unsplit.
     pub fn active_dfs_index(&self) -> usize {
@@ -244,23 +313,13 @@ impl EditorLayout {
     }
 
     /// Orientation of the root split, or `None` when unsplit (a single leaf).
-    /// Drives the seam's drag axis and tells the tab menu which split exists.
+    /// A test-only accessor for asserting which split a directional op built;
+    /// production code reads the full grid via [`Self::seams`]/[`Self::leaf_rects`].
+    #[cfg(test)]
     pub fn root_split_dir(&self) -> Option<SplitDir> {
         match &self.root {
             LayoutNode::Split { dir, .. } => Some(*dir),
             LayoutNode::Leaf(_) => None,
-        }
-    }
-
-    /// Set the two child weights of the sole root split, so a seam drag pins
-    /// the columns to `(first, second)` cells at the current width. A no-op
-    /// unless the root is a two-child split (the only shape this stage drags).
-    pub fn set_root_split_weights(&mut self, first: u16, second: u16) {
-        if let LayoutNode::Split { children, .. } = &mut self.root
-            && children.len() == 2
-        {
-            children[0].weight = first.max(1);
-            children[1].weight = second.max(1);
         }
     }
 }
@@ -281,6 +340,69 @@ fn group_ref_at<'a>(node: &'a LayoutNode, dfs: usize, idx: &mut usize) -> Option
             None
         }
     }
+}
+
+/// Emit one [`Seam`] per internal child boundary of every split under `node`,
+/// laid out within `area` (mirroring [`leaf_rects`]'s tiling), depth-first.
+fn collect_seams(
+    node: &LayoutNode,
+    area: Rect,
+    min: u16,
+    path: &mut Vec<usize>,
+    out: &mut Vec<Seam>,
+) {
+    let LayoutNode::Split { dir, children } = node else {
+        return;
+    };
+    let weights: Vec<u16> = children.iter().map(|c| c.weight).collect();
+    let horizontal = *dir == SplitDir::Horizontal;
+    let total = if horizontal { area.width } else { area.height };
+    let lengths = apportion(total, &weights, min);
+    let node_axis_start = if horizontal { area.x } else { area.y };
+    let (cross_start, cross_end) = if horizontal {
+        (area.y, area.y.saturating_add(area.height))
+    } else {
+        (area.x, area.x.saturating_add(area.width))
+    };
+    let mut offset = node_axis_start;
+    let mut child_rects = Vec::with_capacity(children.len());
+    for (i, len) in lengths.iter().enumerate() {
+        let sub = if horizontal {
+            Rect::new(offset, area.y, *len, area.height)
+        } else {
+            Rect::new(area.x, offset, area.width, *len)
+        };
+        child_rects.push(sub);
+        offset = offset.saturating_add(*len);
+        if i + 1 < children.len() {
+            out.push(Seam {
+                dir: *dir,
+                pos: offset, // start of child i+1 == the seam line
+                cross_start,
+                cross_end,
+                node_axis_start,
+                node_axis_len: total,
+                path: path.clone(),
+                boundary: i,
+            });
+        }
+    }
+    for (i, child) in children.iter().enumerate() {
+        path.push(i);
+        collect_seams(&child.node, child_rects[i], min, path, out);
+        path.pop();
+    }
+}
+
+/// Descend `path` (child indices from the root) to a node for mutation.
+fn node_at_path<'a>(mut node: &'a mut LayoutNode, path: &[usize]) -> Option<&'a mut LayoutNode> {
+    for &i in path {
+        let LayoutNode::Split { children, .. } = node else {
+            return None;
+        };
+        node = &mut children.get_mut(i)?.node;
+    }
+    Some(node)
 }
 
 fn rect_contains(r: Rect, col: u16, row: u16) -> bool {
@@ -333,6 +455,32 @@ fn visit_leaves(node: &LayoutNode, f: &mut impl FnMut(bool)) {
     }
 }
 
+/// Replace an active (`Leaf(None)`) `node` with a fresh split of `dir`,
+/// seating the `existing` tabs in the sibling leaf and keeping the active
+/// placeholder. `new_after` puts the active placeholder after the existing
+/// group (Split Right / Down) or before it (Split Left / Up).
+fn wrap_active_leaf(
+    node: &mut LayoutNode,
+    existing: &mut Option<EditorTabs>,
+    dir: SplitDir,
+    new_after: bool,
+) {
+    let existing_leaf = LayoutChild {
+        node: LayoutNode::Leaf(Some(existing.take().expect("existing tabs"))),
+        weight: 1,
+    };
+    let active_leaf = LayoutChild {
+        node: LayoutNode::Leaf(None),
+        weight: 1,
+    };
+    let children = if new_after {
+        vec![existing_leaf, active_leaf]
+    } else {
+        vec![active_leaf, existing_leaf]
+    };
+    *node = LayoutNode::Split { dir, children };
+}
+
 fn split_active_rec(
     node: &mut LayoutNode,
     existing: &mut Option<EditorTabs>,
@@ -340,27 +488,43 @@ fn split_active_rec(
     new_after: bool,
 ) -> bool {
     match node {
+        // A bare active leaf (only the root reaches here): wrap it in a split.
         LayoutNode::Leaf(None) => {
-            let existing_leaf = LayoutChild {
-                node: LayoutNode::Leaf(Some(existing.take().expect("existing tabs"))),
-                weight: 1,
-            };
-            let active_leaf = LayoutChild {
-                node: LayoutNode::Leaf(None),
-                weight: 1,
-            };
-            let children = if new_after {
-                vec![existing_leaf, active_leaf]
-            } else {
-                vec![active_leaf, existing_leaf]
-            };
-            *node = LayoutNode::Split { dir, children };
+            wrap_active_leaf(node, existing, dir, new_after);
             true
         }
         LayoutNode::Leaf(Some(_)) => false,
-        LayoutNode::Split { children, .. } => children
-            .iter_mut()
-            .any(|c| split_active_rec(&mut c.node, existing, dir, new_after)),
+        LayoutNode::Split {
+            dir: node_dir,
+            children,
+        } => {
+            // Is the active placeholder a DIRECT child of this split?
+            if let Some(p) = children
+                .iter()
+                .position(|c| matches!(c.node, LayoutNode::Leaf(None)))
+            {
+                if *node_dir == dir {
+                    // Same axis as VS Code: insert the existing group as a flat
+                    // sibling next to the active placeholder rather than nesting.
+                    let existing_child = LayoutChild {
+                        node: LayoutNode::Leaf(Some(existing.take().expect("existing tabs"))),
+                        weight: 1,
+                    };
+                    // new_after keeps the active placeholder to the right/below
+                    // the existing group, so the existing group lands before it.
+                    let insert_at = if new_after { p } else { p + 1 };
+                    children.insert(insert_at, existing_child);
+                } else {
+                    // Cross axis: wrap just the active child in a nested split.
+                    wrap_active_leaf(&mut children[p].node, existing, dir, new_after);
+                }
+                true
+            } else {
+                children
+                    .iter_mut()
+                    .any(|c| split_active_rec(&mut c.node, existing, dir, new_after))
+            }
+        }
     }
 }
 
@@ -629,6 +793,186 @@ mod tests {
         assert!(!layout.is_split());
         assert_eq!(layout.active_dfs_index(), 0);
         assert!(matches!(&layout.root, LayoutNode::Leaf(None)));
+    }
+
+    #[test]
+    fn same_axis_split_inserts_a_flat_sibling_not_a_nested_split() {
+        let mut layout = EditorLayout::single();
+        layout.split_active(EditorTabs::default(), SplitDir::Horizontal, true);
+        // Split the active (right) leaf along the SAME axis again.
+        layout.split_active(EditorTabs::default(), SplitDir::Horizontal, true);
+        match &layout.root {
+            LayoutNode::Split { dir, children } => {
+                assert_eq!(*dir, SplitDir::Horizontal);
+                assert_eq!(children.len(), 3, "VS Code flattens same-axis splits");
+                assert!(
+                    children
+                        .iter()
+                        .all(|c| matches!(c.node, LayoutNode::Leaf(_))),
+                    "all three children are leaves, no nesting"
+                );
+            }
+            _ => panic!("expected one flat 3-way split"),
+        }
+        assert_eq!(layout.leaf_count(), 3);
+        assert_eq!(layout.active_dfs_index(), 2, "newest group is rightmost");
+    }
+
+    #[test]
+    fn cross_axis_split_wraps_the_active_leaf_in_a_nested_split() {
+        let mut layout = EditorLayout::single();
+        layout.split_active(EditorTabs::default(), SplitDir::Horizontal, true);
+        // Split the active (right) leaf along the CROSS axis.
+        layout.split_active(EditorTabs::default(), SplitDir::Vertical, true);
+        match &layout.root {
+            LayoutNode::Split { dir, children } => {
+                assert_eq!(*dir, SplitDir::Horizontal);
+                assert_eq!(children.len(), 2);
+                assert!(matches!(children[0].node, LayoutNode::Leaf(Some(_))));
+                assert!(matches!(
+                    children[1].node,
+                    LayoutNode::Split {
+                        dir: SplitDir::Vertical,
+                        ..
+                    }
+                ));
+            }
+            _ => panic!("expected the root to stay a 2-way horizontal split"),
+        }
+        assert_eq!(layout.leaf_count(), 3);
+        assert_eq!(layout.active_dfs_index(), 2, "newest group is lower-right");
+    }
+
+    #[test]
+    fn seams_lists_one_draggable_boundary_per_internal_split_edge() {
+        let mut layout = EditorLayout::single();
+        layout.root = LayoutNode::Split {
+            dir: SplitDir::Horizontal,
+            children: vec![
+                LayoutChild {
+                    node: leaf(),
+                    weight: 1,
+                },
+                LayoutChild {
+                    node: leaf(),
+                    weight: 1,
+                },
+                LayoutChild {
+                    node: leaf(),
+                    weight: 1,
+                },
+            ],
+        };
+        let seams = layout.seams(area(99, 40), 10);
+        assert_eq!(seams.len(), 2, "two internal boundaries → two seams");
+        assert!(seams.iter().all(|s| s.dir == SplitDir::Horizontal));
+        assert_eq!(seams[0].pos, 33); // 1/3 column
+        assert_eq!(seams[1].pos, 66); // 2/3 column
+        assert_eq!((seams[0].cross_start, seams[0].cross_end), (0, 40));
+        assert_eq!(seams[0].boundary, 0);
+        assert_eq!(seams[1].boundary, 1);
+    }
+
+    #[test]
+    fn seams_includes_nested_split_boundaries_scoped_to_their_region() {
+        // H[ leaf | V[leaf, leaf] ]: one outer vertical seam (full height) and
+        // one inner horizontal seam confined to the right column.
+        let mut layout = EditorLayout::single();
+        layout.root = LayoutNode::Split {
+            dir: SplitDir::Horizontal,
+            children: vec![
+                LayoutChild {
+                    node: leaf(),
+                    weight: 1,
+                },
+                LayoutChild {
+                    node: LayoutNode::Split {
+                        dir: SplitDir::Vertical,
+                        children: vec![
+                            LayoutChild {
+                                node: leaf(),
+                                weight: 1,
+                            },
+                            LayoutChild {
+                                node: leaf(),
+                                weight: 1,
+                            },
+                        ],
+                    },
+                    weight: 1,
+                },
+            ],
+        };
+        let seams = layout.seams(area(100, 40), 10);
+        assert_eq!(seams.len(), 2);
+        let outer = seams
+            .iter()
+            .find(|s| s.dir == SplitDir::Horizontal)
+            .unwrap();
+        assert_eq!(outer.pos, 50);
+        assert_eq!((outer.cross_start, outer.cross_end), (0, 40));
+        assert_eq!(outer.path, Vec::<usize>::new());
+        let inner = seams.iter().find(|s| s.dir == SplitDir::Vertical).unwrap();
+        assert_eq!(inner.pos, 20);
+        assert_eq!(
+            (inner.cross_start, inner.cross_end),
+            (50, 100),
+            "the inner seam spans only the right column"
+        );
+        assert_eq!(inner.path, vec![1]);
+    }
+
+    #[test]
+    fn dragging_a_seam_repartitions_only_its_two_groups() {
+        let mut layout = EditorLayout::single();
+        layout.root = LayoutNode::Split {
+            dir: SplitDir::Horizontal,
+            children: vec![
+                LayoutChild {
+                    node: leaf(),
+                    weight: 1,
+                },
+                LayoutChild {
+                    node: leaf(),
+                    weight: 1,
+                },
+                LayoutChild {
+                    node: leaf(),
+                    weight: 1,
+                },
+            ],
+        };
+        let seams = layout.seams(area(99, 40), 10);
+        // Drag the SECOND seam (between columns 1 and 2) to x = 50.
+        layout.drag_seam(&seams[1], 50, 10);
+        let rects = layout.leaf_rects(area(99, 40), 10);
+        assert_eq!(rects[0].x, 0);
+        assert_eq!(rects[0].width, 33, "the first boundary did not move");
+        assert_eq!(rects[2].x, 50, "only the dragged second boundary moved");
+    }
+
+    #[test]
+    fn collapse_active_in_a_nested_grid_unwraps_the_emptied_split() {
+        let mut layout = EditorLayout::single();
+        layout.split_active(EditorTabs::default(), SplitDir::Horizontal, true); // H[A, active]
+        layout.split_active(EditorTabs::default(), SplitDir::Vertical, true); // H[A, V[B, active]]
+        assert_eq!(layout.leaf_count(), 3);
+        let _ = layout.collapse_active(); // close the lower-right group
+        assert_eq!(layout.leaf_count(), 2);
+        match &layout.root {
+            LayoutNode::Split { dir, children } => {
+                assert_eq!(*dir, SplitDir::Horizontal, "the outer split survives");
+                assert_eq!(children.len(), 2);
+                assert!(
+                    children
+                        .iter()
+                        .all(|c| matches!(c.node, LayoutNode::Leaf(_))),
+                    "the emptied inner V-split unwrapped to its surviving leaf"
+                );
+            }
+            _ => panic!("expected the root H-split to remain"),
+        }
+        assert!(layout.is_split());
     }
 
     #[test]
