@@ -646,6 +646,13 @@ enum MenuAction {
     FocusGroupLeft,
     /// Move keyboard focus to the right editor group (while split).
     FocusGroupRight,
+    /// VS Code "Move into New Window": detach the tab at `idx` into a
+    /// full-screen, chrome-free editor window (Esc returns it). The tab leaves
+    /// its group, which collapses if it was the group's last tab.
+    MoveIntoNewWindow(usize),
+    /// VS Code "Copy into New Window" (⌘K O): open a duplicate view of the tab
+    /// at `idx` in a full-screen editor window, leaving the original in place.
+    CopyIntoNewWindow(usize),
     /// Editor body: LSP "Rename Symbol" of the identifier at buffer `(row,
     /// col)`. Captured at right-click so the later dispatch targets the same
     /// symbol the user clicked.
@@ -764,6 +771,8 @@ fn shortcut_for(action: &MenuAction) -> Option<&'static str> {
         MenuAction::SplitInGroup => Some("⌘K ⇧⌘\\"),
         MenuAction::FocusGroupLeft => Some("⌥⌘←"),
         MenuAction::FocusGroupRight => Some("⌥⌘→"),
+        MenuAction::CopyIntoNewWindow(_) => Some("⌘K O"),
+        MenuAction::MoveIntoNewWindow(_) => Some("⌘K ⇧O"),
         MenuAction::RenameSymbolAt { .. } => Some("F2"),
         MenuAction::ChangeAllOccurrencesAt { .. } => Some("⌘F2"),
         MenuAction::GoToDefinitionAt { .. } => Some("F12"),
@@ -953,6 +962,20 @@ fn build_tab_context_menu_items(
             MenuEntry::item("Split in Group", MenuAction::SplitInGroup),
         ],
     });
+    // VS Code's "Move into New Window" / "Copy into New Window". croft has no
+    // OS windows, so a "window" is a full-screen, chrome-free editor surface
+    // (Esc returns). Move works on any buffer (it carries the editor itself);
+    // Copy reopens the file, so it needs a real on-disk path.
+    items.push(MenuEntry::item(
+        "Move into New Window",
+        MenuAction::MoveIntoNewWindow(idx),
+    ));
+    if clicked.is_some() {
+        items.push(MenuEntry::item(
+            "Copy into New Window",
+            MenuAction::CopyIntoNewWindow(idx),
+        ));
+    }
     // Focus-group navigation appears once a second group exists.
     if is_split {
         items.push(MenuEntry::item(
@@ -1435,6 +1458,14 @@ pub struct App {
     /// structure; a single unsplit leaf is the just-launched state. Splitting,
     /// moving focus, and collapsing all go through [`editor_layout`].
     pub editor_layout: editor_layout::EditorLayout,
+    /// VS Code "Move/Copy into New Window". croft has no OS windows, so a
+    /// "window" is a full-screen, chrome-free editor surface laid over the
+    /// whole frame. While windowed, the window's tabs are hoisted into
+    /// `editor`(so every editing / LSP / save path Just Works) and the real
+    /// focused grid group is parked here; closing the window (Esc) swaps the
+    /// group back and reintegrates the window's tabs so nothing is ever lost.
+    /// `Some` is the "windowed" flag. See [`App::move_into_new_window`].
+    editor_window_parked: Option<EditorTabs>,
     /// One-shot latch armed when a save is refused because the file changed
     /// on disk. The next `save()` overwrites anyway, giving the user a
     /// "press Cmd+S again to overwrite" escape hatch without a modal.
@@ -2153,6 +2184,7 @@ impl App {
             voice_canceling: false,
             editor,
             editor_layout: editor_layout::EditorLayout::single(),
+            editor_window_parked: None,
             force_save_armed: false,
             terminals: vec![term],
             active_terminal: 0,
@@ -6282,6 +6314,11 @@ impl App {
     /// Right = (H, after), Left = (H, before), Down = (V, after), Up = (V,
     /// before). Splitting is offered only from an unsplit editor for now.
     fn split_editor_dir(&mut self, dir: editor_layout::SplitDir, new_after: bool) {
+        // Splitting is a grid operation; the parked grid isn't visible while a
+        // full-screen window is open. Return to the grid first.
+        if self.editor_windowed() {
+            self.close_editor_window();
+        }
         let Some(path) = self.editor.path.clone() else {
             self.status = String::from("Cannot split: save the file first");
             return;
@@ -6315,6 +6352,9 @@ impl App {
     /// is created in that direction holding the moved tab. Moving the only tab
     /// of a single group with no neighbour is a no-op (nowhere to move to).
     fn move_active_editor(&mut self, dir: editor_layout::Dir) {
+        if self.editor_windowed() {
+            self.close_editor_window();
+        }
         // A nominal area: seam adjacency is scale-invariant, so the exact pane
         // size doesn't matter for finding the directional neighbour.
         let synth = ratatui::layout::Rect::new(0, 0, 10_000, 10_000);
@@ -6361,6 +6401,9 @@ impl App {
     /// the physical columns fixed. No-op when not split or already focused
     /// there.
     fn focus_editor_group(&mut self, want_left: bool) {
+        if self.editor_windowed() {
+            self.close_editor_window();
+        }
         if !self.editor_layout.is_split() {
             return;
         }
@@ -6408,6 +6451,13 @@ impl App {
     /// After a tab close, collapse the split if the focused group ran out
     /// of real tabs. The surviving (other) group becomes the sole editor.
     fn collapse_split_if_empty(&mut self) {
+        // While a full-screen window is open, `editor` is the window and the
+        // grid is parked out of the tree — collapsing here would fold the
+        // parked grid into the window. The window's own emptiness is handled by
+        // `close_editor_window` on Esc.
+        if self.editor_windowed() {
+            return;
+        }
         if !self.editor_layout.is_split() || !self.editor.is_blank_initial() {
             return;
         }
@@ -6421,6 +6471,90 @@ impl App {
         // group's border. (No `focus_pane` so this is safe to call from
         // any close path without re-poking the cursor mid-frame.)
         self.sync_focus_flags();
+    }
+
+    /// True while a "New Window" (full-screen editor surface) is open. The
+    /// parked grid group held aside is the windowed flag.
+    fn editor_windowed(&self) -> bool {
+        self.editor_window_parked.is_some()
+    }
+
+    /// VS Code "Move into New Window". croft has no OS windows: a "window" is a
+    /// full-screen, chrome-free editor surface laid over the whole frame. The
+    /// tab at `idx` is detached from its group into a fresh single-tab
+    /// `EditorTabs`, which is hoisted into `self.editor` (so editing, LSP, find
+    /// and save all keep targeting it) while the real focused group is parked
+    /// aside. Esc reintegrates everything — see [`App::close_editor_window`].
+    fn move_into_new_window(&mut self, idx: usize) {
+        // A window-within-a-window would orphan the first parked group. Re-home
+        // the existing window first so the move acts on the visible grid.
+        if self.editor_windowed() {
+            self.close_editor_window();
+        }
+        self.editor.select(idx);
+        let label = self.editor.tab_display_label(self.editor.active_index());
+        let moved = self.editor.take_active_editor();
+        // Taking the group's last tab leaves it blank-initial; collapse it back
+        // into a sibling if the grid was split, exactly like closing a tab.
+        self.collapse_split_if_empty();
+        let mut window = EditorTabs::default();
+        window.push_editor(moved);
+        self.editor_window_parked = Some(std::mem::replace(&mut self.editor, window));
+        self.focus_pane(Pane::Editor);
+        self.status = format!("{label}: moved into a new window — Esc returns it");
+    }
+
+    /// VS Code "Copy into New Window" (⌘K O). Like [`App::move_into_new_window`]
+    /// but opens a *duplicate* view of the tab's file, leaving the original in
+    /// its group. Needs a real on-disk path to reopen, mirroring Split.
+    fn copy_into_new_window(&mut self, idx: usize) {
+        if self.editor_windowed() {
+            self.close_editor_window();
+        }
+        self.editor.select(idx);
+        let Some(path) = self.editor.path.clone() else {
+            self.status = String::from("Copy into New Window: save the file first");
+            return;
+        };
+        let mut window = EditorTabs::default();
+        if window.open_preview(&path).is_err() {
+            self.status = String::from("Copy into New Window: failed to open file");
+            return;
+        }
+        // Open the duplicate where the source was scrolled, like Split.
+        window.copy_view_position_from(&self.editor);
+        let label = self.editor.tab_display_label(self.editor.active_index());
+        self.editor_window_parked = Some(std::mem::replace(&mut self.editor, window));
+        self.focus_pane(Pane::Editor);
+        self.status = format!("{label}: copied into a new window — Esc returns it");
+    }
+
+    /// Close the full-screen editor window: swap the parked grid group back into
+    /// `self.editor` and reintegrate the window's tabs so nothing is lost. A
+    /// moved tab returns to its group; a copied duplicate joins it as a tab.
+    /// No-op when no window is open. Returns true when it closed one.
+    fn close_editor_window(&mut self) -> bool {
+        let Some(parked) = self.editor_window_parked.take() else {
+            return false;
+        };
+        let window = std::mem::replace(&mut self.editor, parked);
+        // Reintegrate the window's tabs into the restored grid group so nothing
+        // is lost: a moved tab returns, a copied duplicate joins as a tab. If
+        // the user closed everything inside the window it is blank-initial —
+        // drop it rather than pushing a stray blank tab back onto the grid.
+        if !window.is_blank_initial() {
+            for ed in window.editors {
+                self.editor.push_editor(ed);
+            }
+        }
+        // The window painted over the whole frame; force a clean repaint of the
+        // grid and drop any image overlay the window left in either slot.
+        self.disable_editor_image(0);
+        self.disable_editor_image(1);
+        self.editor_seams.clear();
+        self.focus_pane(Pane::Editor);
+        self.status = String::from("Closed editor window");
+        true
     }
 
     fn render(&mut self, frame: &mut ratatui::Frame) {
@@ -6560,9 +6694,33 @@ impl App {
                 (right_area, None)
             };
 
-        self.render_activity_bar(frame, activity_area);
+        // A "New Window" (Move/Copy into New Window) lays a chrome-free,
+        // full-screen editor over the whole frame: skip the activity bar,
+        // sidebar and terminal, and give the editor the entire region above the
+        // status bar / on-screen keyboard. `editor` already holds the window's
+        // tabs (the real grid is parked), so the normal editor render path below
+        // paints it; `render_grid` keeps it on the single-group branch even when
+        // the parked grid was split.
+        let windowed = self.editor_window_parked.is_some();
+        let (editor_area, terminal_area) = if windowed {
+            // The chrome isn't painted this frame, so its hit-test rectangles
+            // would go stale over cells the window now owns. Zero them so a
+            // click on the window can't fall through to the activity bar or a
+            // splitter hidden beneath it (the rest of the chrome rects are
+            // neutralised in `handle_mouse` while windowed).
+            self.sidebar_areas = SidebarAreas::default();
+            self.sidebar_splitter_x = None;
+            self.terminal_splitter_y = None;
+            (outer[0], None)
+        } else {
+            (editor_area, terminal_area)
+        };
 
-        if let Some(area) = side_area {
+        if !windowed {
+            self.render_activity_bar(frame, activity_area);
+        }
+
+        if let Some(area) = side_area.filter(|_| !windowed) {
             let usable_area = area;
             // Feed the render-time pointer cell to every side panel so the row
             // under the cursor (and the remote header pills) can light up,
@@ -6591,7 +6749,7 @@ impl App {
                 SidebarView::Extensions => frame.render_widget(&mut self.extensions, usable_area),
             }
         }
-        if !self.editor_layout.is_split() && self.editor.is_blank_initial() {
+        if !windowed && !self.editor_layout.is_split() && self.editor.is_blank_initial() {
             self.render_welcome(frame, editor_area);
             // The previous frame may have rendered an image-preview tab
             // whose OSC-1337 pixels are still cached in iTerm's image
@@ -6628,7 +6786,7 @@ impl App {
             // reporting the active group's rect so popups anchor there.
             let rects = self.editor_layout.leaf_rects(editor_area, EDITOR_SPLIT_MIN);
             let active_idx = self.editor_layout.active_dfs_index();
-            let focused_area = if self.editor_layout.is_split() {
+            let focused_area = if self.editor_layout.is_split() && !windowed {
                 let active_area = rects[active_idx];
                 frame.render_widget(&mut self.editor, active_area);
                 let inactive_rects: Vec<Rect> = rects
@@ -7755,6 +7913,19 @@ impl App {
                 }
                 true
             }
+            // Cmd+K Shift+O: move the active tab into a new window. Must precede
+            // the plain Cmd+K O (Copy) arm, which ignores Shift.
+            KeyCode::Char(c)
+                if c.eq_ignore_ascii_case(&'o') && key.modifiers.contains(KeyModifiers::SHIFT) =>
+            {
+                self.move_into_new_window(self.editor.active_index());
+                true
+            }
+            // Cmd+K O: copy the active tab into a new window (VS Code's binding).
+            KeyCode::Char(c) if plain && c.eq_ignore_ascii_case(&'o') => {
+                self.copy_into_new_window(self.editor.active_index());
+                true
+            }
             _ => false,
         }
     }
@@ -7950,6 +8121,18 @@ impl App {
         // Modal layer: open context menu eats keyboard navigation.
         if self.context_menu.is_some() {
             self.handle_menu_key(key);
+            return Ok(());
+        }
+        // A full-screen editor window (Move/Copy into New Window) closes on Esc,
+        // swapping the grid back and reintegrating its tabs. Let an open
+        // completion popup or the editor Find bar consume Esc first — there it
+        // cancels (closes the popup / find bar) rather than the whole window.
+        if self.editor_windowed()
+            && matches!(key.code, KeyCode::Esc)
+            && self.completion_popup.is_none()
+            && self.editor_find.is_none()
+        {
+            self.close_editor_window();
             return Ok(());
         }
         // Cmd+E toggles native modal (vim) editing. Global (above the focus
@@ -15173,6 +15356,7 @@ impl App {
         // operates on the clicked group. The swap keeps the physical
         // columns fixed.
         if matches!(m.kind, MouseEventKind::Down(_))
+            && !self.editor_windowed()
             && self.editor_layout.is_split()
             && self.seam_at(m.column, m.row).is_none()
             && let Some(target) = self.editor_layout.inactive_dfs_index_at(m.column, m.row)
@@ -15221,6 +15405,39 @@ impl App {
             && rect_contains(self.search.last_scrollbar, m.column, m.row);
         let in_editor_scrollbar = rect_contains(self.editor.last_scrollbar, m.column, m.row);
         let in_editor_hscrollbar = rect_contains(self.editor.last_hscrollbar, m.column, m.row);
+
+        // A full-screen editor window owns the whole frame: the sidebar and
+        // terminal aren't painted, so their (stale) hit rects must not capture
+        // clicks the window should get. Force every non-editor surface to miss.
+        let (
+            in_tree,
+            in_terminal,
+            terminal_hit,
+            in_outline,
+            in_open_editors,
+            in_timeline,
+            in_deps,
+            in_tree_scrollbar,
+            in_remote_scrollbar,
+            in_search_scrollbar,
+        ) = if self.editor_windowed() {
+            (
+                false, false, None, false, false, false, false, false, false, false,
+            )
+        } else {
+            (
+                in_tree,
+                in_terminal,
+                terminal_hit,
+                in_outline,
+                in_open_editors,
+                in_timeline,
+                in_deps,
+                in_tree_scrollbar,
+                in_remote_scrollbar,
+                in_search_scrollbar,
+            )
+        };
 
         if matches!(m.kind, MouseEventKind::Moved) {
             self.pointer_cell = Some((m.column, m.row));
@@ -16959,6 +17176,8 @@ impl App {
             MenuAction::SplitInGroup => self.split_in_group(),
             MenuAction::FocusGroupLeft => self.focus_editor_group(true),
             MenuAction::FocusGroupRight => self.focus_editor_group(false),
+            MenuAction::MoveIntoNewWindow(idx) => self.move_into_new_window(idx),
+            MenuAction::CopyIntoNewWindow(idx) => self.copy_into_new_window(idx),
             MenuAction::CompareWithSelected { anchor, other } => {
                 match self.editor.open_diff(&anchor, &other) {
                     Ok(()) => {

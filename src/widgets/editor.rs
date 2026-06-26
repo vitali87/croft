@@ -5447,6 +5447,12 @@ impl EditorTabs {
         self.active
     }
 
+    /// The tab strip label for the tab at `idx` (file name, diff pair, or
+    /// "untitled"), for status messages. Empty string for an out-of-range idx.
+    pub fn tab_display_label(&self, idx: usize) -> String {
+        self.editors.get(idx).map(tab_label).unwrap_or_default()
+    }
+
     /// The on-disk path backing the tab at `idx`, if any. `None` for an
     /// out-of-range index or a blank/untitled buffer. Used to seed the tab
     /// context-menu's path-bearing actions (Reveal in Finder, Copy Path).

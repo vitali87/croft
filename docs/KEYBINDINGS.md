@@ -43,6 +43,8 @@ On macOS, the `Cmd` chords below only reach croft after you run a one-time setup
 | `Cmd+K` `W` | Close all editor tabs |
 | `Cmd+K` `U` | Close all saved (non-dirty) editor tabs, keeping unsaved ones |
 | `Cmd+K` `E` | Reveal the active file in the Explorer tree (expand parents, select, focus) |
+| `Cmd+K` `O` | Copy into New Window: open a duplicate of the active file as a full-screen, chrome-free editor (`Esc` returns) |
+| `Cmd+K` `Shift+O` | Move into New Window: detach the active file into a full-screen, chrome-free editor (`Esc` returns) |
 | Mouse wheel | Scroll the pane under the pointer |
 
 ## Command Palette
@@ -304,7 +306,7 @@ Disabling takes effect immediately for the viewers and Vim (a disabled PDF/CSV v
 | `⌃⇧J` | Maximize the terminal pane |
 | `⌥⌘R` | Reveal in Finder: the selected Explorer entry, or the active editor file when the editor is focused (local macOS only) |
 | `⌘B` | Toggle the primary side bar |
-| `⌘K` | Leader for the `Cmd+K` chords (Color Theme, Close to the Right, compare, Close All, Close Saved, Reveal in Explorer View); iTerm2's Edit ▸ Clear Buffer is relocated to `⌥⌘K` |
+| `⌘K` | Leader for the `Cmd+K` chords (Color Theme, Close to the Right, compare, Close All, Close Saved, Reveal in Explorer View, Move/Copy into New Window); iTerm2's Edit ▸ Clear Buffer is relocated to `⌥⌘K` |
 | `⌘\` | Split the editor |
 | `⌘⇧\` | Go to Bracket (jump to the matching bracket) |
 | `⌘⌥\` | Select to Bracket |

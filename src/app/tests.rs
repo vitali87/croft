@@ -11045,6 +11045,7 @@ fn build_tab_context_menu_items_includes_all_four_close_actions_in_the_middle_of
             "Pin",
             "Split Right",
             "Split & Move",
+            "Move into New Window",
         ],
         "all close actions must appear and in this order — mirrors VS Code's tab strip"
     );
@@ -11085,6 +11086,7 @@ fn build_tab_context_menu_items_hides_close_to_the_right_on_the_last_tab() {
             "Pin",
             "Split Right",
             "Split & Move",
+            "Move into New Window",
         ],
         "Close to the Right must be suppressed on the rightmost tab"
     );
@@ -11095,7 +11097,14 @@ fn build_tab_context_menu_items_hides_close_others_when_only_one_tab_is_open() {
     let items = build_tab_context_menu_items(0, 1, false, None, false, false, false);
     assert_eq!(
         menu_labels(&items),
-        ["Close", "Close All", "Pin", "Split Right", "Split & Move"],
+        [
+            "Close",
+            "Close All",
+            "Pin",
+            "Split Right",
+            "Split & Move",
+            "Move into New Window",
+        ],
         "with a single tab, Close Others / Close to the Right / Close Saved are all no-ops and must be suppressed"
     );
 }
@@ -11118,6 +11127,8 @@ fn build_tab_context_menu_items_includes_reveal_in_finder_only_with_a_path_and_e
             "Pin",
             "Split Right",
             "Split & Move",
+            "Move into New Window",
+            "Copy into New Window",
         ],
     );
     assert!(matches!(
@@ -11149,6 +11160,8 @@ fn build_tab_context_menu_items_offers_reveal_in_explorer_for_any_path() {
             "Pin",
             "Split Right",
             "Split & Move",
+            "Move into New Window",
+            "Copy into New Window",
         ]
     );
     assert!(matches!(
@@ -11177,6 +11190,8 @@ fn build_tab_context_menu_items_offers_copy_path_for_any_path_local_or_remote() 
             "Pin",
             "Split Right",
             "Split & Move",
+            "Move into New Window",
+            "Copy into New Window",
         ]
     );
     assert!(matches!(
@@ -12406,6 +12421,132 @@ fn split_down_makes_a_vertical_split_with_the_new_group_active_below() {
     assert_eq!(app.editor.path.as_deref(), Some(path.as_path()));
     let groups = app.editor_layout.inactive_groups();
     assert_eq!(groups[0].path.as_deref(), Some(path.as_path()));
+}
+
+#[test]
+fn move_into_new_window_detaches_the_active_tab_into_a_full_screen_window() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.txt", "hello\nworld");
+    let path = app.editor.path.clone().unwrap();
+
+    app.move_into_new_window(app.editor.active_index());
+
+    assert!(app.editor_windowed(), "a window must be open");
+    assert_eq!(
+        app.editor.path.as_deref(),
+        Some(path.as_path()),
+        "the window holds the moved file (editor is hoisted to the window)"
+    );
+    // The single-file source group emptied, so the parked grid is blank.
+    assert!(
+        app.editor_window_parked
+            .as_ref()
+            .unwrap()
+            .is_blank_initial(),
+        "the source group held only this tab, so the parked grid is blank"
+    );
+}
+
+#[test]
+fn closing_the_window_returns_the_moved_tab_to_the_grid() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.txt", "hello");
+    let path = app.editor.path.clone().unwrap();
+
+    app.move_into_new_window(app.editor.active_index());
+    assert!(
+        app.close_editor_window(),
+        "close reports it closed a window"
+    );
+
+    assert!(!app.editor_windowed(), "the window is gone");
+    assert_eq!(
+        app.editor.path.as_deref(),
+        Some(path.as_path()),
+        "the moved tab returned to the grid — nothing is lost"
+    );
+    assert_eq!(app.editor.tab_count(), 1);
+}
+
+#[test]
+fn copy_into_new_window_duplicates_the_file_leaving_the_original_in_the_grid() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.txt", "hello");
+    let path = app.editor.path.clone().unwrap();
+
+    app.copy_into_new_window(app.editor.active_index());
+
+    assert!(app.editor_windowed());
+    assert_eq!(app.editor.path.as_deref(), Some(path.as_path()));
+    // Copy leaves the original behind in the parked grid (a duplicate, not a move).
+    assert_eq!(
+        app.editor_window_parked.as_ref().unwrap().path.as_deref(),
+        Some(path.as_path()),
+        "the original stays in the grid for Copy into New Window"
+    );
+}
+
+#[test]
+fn copy_into_new_window_is_refused_for_an_unsaved_buffer() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    // A fresh app has a single blank, path-less buffer.
+    app.copy_into_new_window(0);
+    assert!(
+        !app.editor_windowed(),
+        "no window opens without a real path"
+    );
+    assert!(
+        app.status.contains("save the file first"),
+        "the refusal is explained: {}",
+        app.status
+    );
+}
+
+#[test]
+fn esc_closes_the_editor_window() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.txt", "hello");
+    app.move_into_new_window(app.editor.active_index());
+    assert!(app.editor_windowed());
+
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+
+    assert!(!app.editor_windowed(), "Esc closes the full-screen window");
+}
+
+#[test]
+fn cmd_k_o_chords_drive_copy_and_move_into_new_window() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.txt", "hello");
+
+    // Cmd+K O copies into a window (original stays).
+    assert!(app.handle_cmd_k_chord(key(KeyCode::Char('o'), KeyModifiers::NONE)));
+    assert!(app.editor_windowed());
+    app.close_editor_window();
+
+    // Cmd+K Shift+O moves into a window.
+    assert!(app.handle_cmd_k_chord(key(KeyCode::Char('o'), KeyModifiers::SHIFT)));
+    assert!(app.editor_windowed());
+}
+
+#[test]
+fn tab_menu_window_actions_carry_the_clicked_tab_index() {
+    let p = std::path::Path::new("/tmp/demo.rs");
+    let items = build_tab_context_menu_items(2, 3, false, Some(p), false, false, false);
+    assert!(matches!(
+        menu_action_of(&items, "Move into New Window"),
+        Some(MenuAction::MoveIntoNewWindow(2))
+    ));
+    assert!(matches!(
+        menu_action_of(&items, "Copy into New Window"),
+        Some(MenuAction::CopyIntoNewWindow(2))
+    ));
+    // Copy needs a real path; a blank buffer omits it but still offers Move.
+    let blank = build_tab_context_menu_items(0, 1, false, None, false, false, false);
+    assert!(menu_labels(&blank).contains(&"Move into New Window"));
+    assert!(!menu_labels(&blank).contains(&"Copy into New Window"));
 }
 
 #[test]
