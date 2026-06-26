@@ -6,6 +6,28 @@ fn key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
     KeyEvent::new(code, mods)
 }
 
+/// Display label of a menu entry ("---" for a divider) — test helper for the
+/// `MenuEntry`-based context menus.
+fn menu_label(e: &MenuEntry) -> &str {
+    match e {
+        MenuEntry::Item { label, .. } | MenuEntry::Submenu { label, .. } => label,
+        MenuEntry::Separator => "---",
+    }
+}
+
+/// Top-level labels of a menu, in order.
+fn menu_labels(items: &[MenuEntry]) -> Vec<&str> {
+    items.iter().map(menu_label).collect()
+}
+
+/// The action carried by the first `Item` with `label`, if any.
+fn menu_action_of<'a>(items: &'a [MenuEntry], label: &str) -> Option<&'a MenuAction> {
+    items.iter().find_map(|e| match e {
+        MenuEntry::Item { label: l, action } if l == label => Some(action),
+        _ => None,
+    })
+}
+
 #[test]
 fn explorer_boots_with_gradient_focus_under_black_theme() {
     // Regression: the explorer auto-focuses at startup, but the Black-theme
@@ -228,9 +250,9 @@ fn black_theme_context_menu_uses_gradient_border_and_muted_selection() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.theme = crate::theme::Theme::BLACK;
-    app.context_menu = Some(ContextMenu {
-        origin: (10, 10),
-        items: vec![
+    app.context_menu = Some(ContextMenu::flat(
+        (10, 10),
+        vec![
             (
                 String::from("New File"),
                 MenuAction::Create(CreateKind::File),
@@ -240,9 +262,8 @@ fn black_theme_context_menu_uses_gradient_border_and_muted_selection() {
                 MenuAction::Create(CreateKind::Folder),
             ),
         ],
-        selected: 0,
-        target_dir: tmp.path().to_path_buf(),
-    });
+        tmp.path().to_path_buf(),
+    ));
     let backend = ratatui::backend::TestBackend::new(140, 50);
     let mut term = ratatui::Terminal::new(backend).unwrap();
     term.draw(|f| app.render(f)).unwrap();
@@ -742,7 +763,7 @@ fn right_click_on_the_gutter_opens_the_breakpoint_menu_and_toggles_the_clicked_l
         .context_menu
         .as_ref()
         .expect("a gutter right-click must open a context menu");
-    let labels: Vec<&str> = menu.items.iter().map(|(l, _)| l.as_str()).collect();
+    let labels = menu_labels(&menu.items);
     assert!(
         labels.contains(&"Add Breakpoint"),
         "menu must offer Add Breakpoint when none exists; got {labels:?}"
@@ -756,7 +777,7 @@ fn right_click_on_the_gutter_opens_the_breakpoint_menu_and_toggles_the_clicked_l
     let idx = menu
         .items
         .iter()
-        .position(|(l, _)| l == "Add Breakpoint")
+        .position(|e| menu_label(e) == "Add Breakpoint")
         .unwrap();
     app.context_menu.as_mut().unwrap().selected = idx;
     app.handle_menu_key(key(KeyCode::Enter, KeyModifiers::NONE));
@@ -781,14 +802,7 @@ fn right_click_on_the_gutter_opens_the_breakpoint_menu_and_toggles_the_clicked_l
         gutter_col,
         row,
     ));
-    let labels: Vec<&str> = app
-        .context_menu
-        .as_ref()
-        .unwrap()
-        .items
-        .iter()
-        .map(|(l, _)| l.as_str())
-        .collect();
+    let labels = menu_labels(&app.context_menu.as_ref().unwrap().items);
     assert!(
         labels.contains(&"Remove Breakpoint"),
         "an existing breakpoint must offer Remove Breakpoint; got {labels:?}"
@@ -824,7 +838,7 @@ fn add_conditional_breakpoint_opens_a_popup_not_the_status_line() {
         .unwrap()
         .items
         .iter()
-        .position(|(l, _)| l == "Add Conditional Breakpoint\u{2026}")
+        .position(|e| menu_label(e) == "Add Conditional Breakpoint\u{2026}")
         .expect("menu must offer Add Conditional Breakpoint");
     app.context_menu.as_mut().unwrap().selected = idx;
     app.handle_menu_key(key(KeyCode::Enter, KeyModifiers::NONE));
@@ -5476,12 +5490,7 @@ fn menu_item_at_handles_clipped_menu_so_clicks_dispatch_the_visible_row() {
     // Sanity: items[5] is "Select for Compare" after the New
     // File… / New Folder… prefix lifted everything down by two.
     assert!(matches!(&items[5].1, MenuAction::SelectForCompare(_)));
-    app.context_menu = Some(ContextMenu {
-        origin: (10, 6),
-        items,
-        selected: 0,
-        target_dir: target,
-    });
+    app.context_menu = Some(ContextMenu::flat((10, 6), items, target));
     // The visible "Select for Compare" row sits at clipped.y + 1
     // (top border) + 5 (item index) = 3 + 1 + 5 = 9.
     let idx = app
@@ -7589,7 +7598,13 @@ fn clicking_the_gear_opens_the_color_theme_menu_then_the_picker() {
     });
     let menu = app.context_menu.as_ref().expect("gear opens a menu");
     assert!(
-        matches!(menu.items.as_slice(), [(_, MenuAction::OpenThemePicker)]),
+        matches!(
+            menu.items.as_slice(),
+            [MenuEntry::Item {
+                action: MenuAction::OpenThemePicker,
+                ..
+            }]
+        ),
         "the gear menu holds a single Color Theme entry"
     );
     // Selecting Color Theme replaces the menu with the theme picker.
@@ -7601,7 +7616,7 @@ fn clicking_the_gear_opens_the_color_theme_menu_then_the_picker() {
         picker
             .items
             .iter()
-            .all(|(_, a)| matches!(a, MenuAction::SetTheme(_))),
+            .all(|e| matches!(e.action(), Some(MenuAction::SetTheme(_)))),
         "every picker row switches a theme"
     );
 }
@@ -11019,9 +11034,8 @@ fn build_tab_context_menu_items_includes_all_four_close_actions_in_the_middle_of
     // Right-click on tab 1 of 3 (i.e. a middle tab) should surface
     // every close action — there's at least one tab on each side.
     let items = build_tab_context_menu_items(1, 3, false, None, false, false, false);
-    let labels: Vec<&str> = items.iter().map(|(s, _)| s.as_str()).collect();
     assert_eq!(
-        labels,
+        menu_labels(&items),
         [
             "Close",
             "Close Others",
@@ -11029,23 +11043,31 @@ fn build_tab_context_menu_items_includes_all_four_close_actions_in_the_middle_of
             "Close Saved",
             "Close All",
             "Pin",
-            "Split Up",
-            "Split Down",
-            "Split Left",
             "Split Right",
-            "Move Up",
-            "Move Down",
-            "Move Left",
-            "Move Right",
-            "Split in Group"
+            "Split & Move",
         ],
         "all close actions must appear and in this order — mirrors VS Code's tab strip"
     );
-    assert!(matches!(&items[0].1, MenuAction::CloseTab(1)));
-    assert!(matches!(&items[1].1, MenuAction::CloseOtherTabs(1)));
-    assert!(matches!(&items[2].1, MenuAction::CloseTabsToRight(1)));
-    assert!(matches!(&items[3].1, MenuAction::CloseSavedTabs));
-    assert!(matches!(&items[4].1, MenuAction::CloseAllTabs));
+    assert!(matches!(
+        menu_action_of(&items, "Close"),
+        Some(MenuAction::CloseTab(1))
+    ));
+    assert!(matches!(
+        menu_action_of(&items, "Close Others"),
+        Some(MenuAction::CloseOtherTabs(1))
+    ));
+    assert!(matches!(
+        menu_action_of(&items, "Close to the Right"),
+        Some(MenuAction::CloseTabsToRight(1))
+    ));
+    assert!(matches!(
+        menu_action_of(&items, "Close Saved"),
+        Some(MenuAction::CloseSavedTabs)
+    ));
+    assert!(matches!(
+        menu_action_of(&items, "Close All"),
+        Some(MenuAction::CloseAllTabs)
+    ));
 }
 
 #[test]
@@ -11053,24 +11075,16 @@ fn build_tab_context_menu_items_hides_close_to_the_right_on_the_last_tab() {
     // Last tab → "Close to the Right" would close zero tabs, so it
     // must be suppressed (matches VS Code).
     let items = build_tab_context_menu_items(2, 3, false, None, false, false, false);
-    let labels: Vec<&str> = items.iter().map(|(s, _)| s.as_str()).collect();
     assert_eq!(
-        labels,
+        menu_labels(&items),
         [
             "Close",
             "Close Others",
             "Close Saved",
             "Close All",
             "Pin",
-            "Split Up",
-            "Split Down",
-            "Split Left",
             "Split Right",
-            "Move Up",
-            "Move Down",
-            "Move Left",
-            "Move Right",
-            "Split in Group"
+            "Split & Move",
         ],
         "Close to the Right must be suppressed on the rightmost tab"
     );
@@ -11079,23 +11093,9 @@ fn build_tab_context_menu_items_hides_close_to_the_right_on_the_last_tab() {
 #[test]
 fn build_tab_context_menu_items_hides_close_others_when_only_one_tab_is_open() {
     let items = build_tab_context_menu_items(0, 1, false, None, false, false, false);
-    let labels: Vec<&str> = items.iter().map(|(s, _)| s.as_str()).collect();
     assert_eq!(
-        labels,
-        [
-            "Close",
-            "Close All",
-            "Pin",
-            "Split Up",
-            "Split Down",
-            "Split Left",
-            "Split Right",
-            "Move Up",
-            "Move Down",
-            "Move Left",
-            "Move Right",
-            "Split in Group"
-        ],
+        menu_labels(&items),
+        ["Close", "Close All", "Pin", "Split Right", "Split & Move"],
         "with a single tab, Close Others / Close to the Right / Close Saved are all no-ops and must be suppressed"
     );
 }
@@ -11104,11 +11104,10 @@ fn build_tab_context_menu_items_hides_close_others_when_only_one_tab_is_open() {
 fn build_tab_context_menu_items_includes_reveal_in_finder_only_with_a_path_and_enabled() {
     let p = std::path::Path::new("/tmp/demo.rs");
     // Local macOS with a real path: Reveal in Finder sits after Close All,
-    // before the split/focus group — mirroring VS Code's lower-middle slot.
+    // before the split group — mirroring VS Code's lower-middle slot.
     let items = build_tab_context_menu_items(0, 1, false, Some(p), true, false, false);
-    let labels: Vec<&str> = items.iter().map(|(s, _)| s.as_str()).collect();
     assert_eq!(
-        labels,
+        menu_labels(&items),
         [
             "Close",
             "Close All",
@@ -11117,24 +11116,20 @@ fn build_tab_context_menu_items_includes_reveal_in_finder_only_with_a_path_and_e
             "Reveal in Finder",
             "Reveal in Explorer View",
             "Pin",
-            "Split Up",
-            "Split Down",
-            "Split Left",
             "Split Right",
-            "Move Up",
-            "Move Down",
-            "Move Left",
-            "Move Right",
-            "Split in Group"
+            "Split & Move",
         ],
     );
-    assert!(matches!(&items[4].1, MenuAction::RevealInFinder(rp) if rp == p));
+    assert!(matches!(
+        menu_action_of(&items, "Reveal in Finder"),
+        Some(MenuAction::RevealInFinder(rp)) if rp == p
+    ));
     // Remote (or non-macOS) session: entry withheld even with a path.
     let remote = build_tab_context_menu_items(0, 1, false, Some(p), false, false, false);
-    assert!(remote.iter().all(|(s, _)| s != "Reveal in Finder"));
+    assert!(!menu_labels(&remote).contains(&"Reveal in Finder"));
     // A blank/untitled buffer (no path) never offers it, even when enabled.
     let blank = build_tab_context_menu_items(0, 1, false, None, true, false, false);
-    assert!(blank.iter().all(|(s, _)| s != "Reveal in Finder"));
+    assert!(!menu_labels(&blank).contains(&"Reveal in Finder"));
 }
 
 #[test]
@@ -11143,9 +11138,8 @@ fn build_tab_context_menu_items_offers_reveal_in_explorer_for_any_path() {
     // Reveal in Explorer View targets croft's own tree, present local and
     // remote, so it shows for any path-bearing tab even when Finder is withheld.
     let remote = build_tab_context_menu_items(0, 1, false, Some(p), false, false, false);
-    let labels: Vec<&str> = remote.iter().map(|(s, _)| s.as_str()).collect();
     assert_eq!(
-        labels,
+        menu_labels(&remote),
         [
             "Close",
             "Close All",
@@ -11153,21 +11147,17 @@ fn build_tab_context_menu_items_offers_reveal_in_explorer_for_any_path() {
             "Copy Relative Path",
             "Reveal in Explorer View",
             "Pin",
-            "Split Up",
-            "Split Down",
-            "Split Left",
             "Split Right",
-            "Move Up",
-            "Move Down",
-            "Move Left",
-            "Move Right",
-            "Split in Group"
+            "Split & Move",
         ]
     );
-    assert!(matches!(&remote[4].1, MenuAction::RevealInExplorer(rp) if rp == p));
+    assert!(matches!(
+        menu_action_of(&remote, "Reveal in Explorer View"),
+        Some(MenuAction::RevealInExplorer(rp)) if rp == p
+    ));
     // A blank/untitled buffer (no path) has nothing to reveal.
     let blank = build_tab_context_menu_items(0, 1, false, None, true, false, false);
-    assert!(blank.iter().all(|(s, _)| s != "Reveal in Explorer View"));
+    assert!(!menu_labels(&blank).contains(&"Reveal in Explorer View"));
 }
 
 #[test]
@@ -11176,9 +11166,8 @@ fn build_tab_context_menu_items_offers_copy_path_for_any_path_local_or_remote() 
     // Copy Path is a clipboard write, so it shows for a path-bearing tab even
     // on a remote session where Reveal in Finder is withheld.
     let remote = build_tab_context_menu_items(0, 1, false, Some(p), false, false, false);
-    let labels: Vec<&str> = remote.iter().map(|(s, _)| s.as_str()).collect();
     assert_eq!(
-        labels,
+        menu_labels(&remote),
         [
             "Close",
             "Close All",
@@ -11186,40 +11175,41 @@ fn build_tab_context_menu_items_offers_copy_path_for_any_path_local_or_remote() 
             "Copy Relative Path",
             "Reveal in Explorer View",
             "Pin",
-            "Split Up",
-            "Split Down",
-            "Split Left",
             "Split Right",
-            "Move Up",
-            "Move Down",
-            "Move Left",
-            "Move Right",
-            "Split in Group"
+            "Split & Move",
         ]
     );
-    assert!(matches!(&remote[2].1, MenuAction::CopyTabPath(cp) if cp == p));
-    assert!(matches!(&remote[3].1, MenuAction::CopyTabRelativePath(cp) if cp == p));
+    assert!(matches!(
+        menu_action_of(&remote, "Copy Path"),
+        Some(MenuAction::CopyTabPath(cp)) if cp == p
+    ));
+    assert!(matches!(
+        menu_action_of(&remote, "Copy Relative Path"),
+        Some(MenuAction::CopyTabRelativePath(cp)) if cp == p
+    ));
     // A blank/untitled buffer (no path) has nothing to copy.
     let blank = build_tab_context_menu_items(0, 1, false, None, true, false, false);
-    assert!(blank.iter().all(|(s, _)| s != "Copy Path"));
-    assert!(blank.iter().all(|(s, _)| s != "Copy Relative Path"));
+    assert!(!menu_labels(&blank).contains(&"Copy Path"));
+    assert!(!menu_labels(&blank).contains(&"Copy Relative Path"));
 }
 
 #[test]
 fn build_tab_context_menu_items_offers_keep_open_only_for_a_preview_tab() {
     let p = std::path::Path::new("/tmp/demo.rs");
     // Preview tab (italic): "Keep Open" appears, carrying this tab's index, and
-    // sits just before the split group.
+    // sits just before the Pin / split group.
     let preview = build_tab_context_menu_items(0, 1, false, Some(p), false, true, false);
-    let keep = preview.iter().find(|(s, _)| s == "Keep Open");
-    assert!(matches!(keep, Some((_, MenuAction::KeepTabOpen(0)))));
+    assert!(matches!(
+        menu_action_of(&preview, "Keep Open"),
+        Some(MenuAction::KeepTabOpen(0))
+    ));
+    let labels = menu_labels(&preview);
     assert!(
-        preview.iter().position(|(s, _)| s == "Keep Open")
-            < preview.iter().position(|(s, _)| s == "Split Up")
+        labels.iter().position(|&s| s == "Keep Open") < labels.iter().position(|&s| s == "Pin")
     );
     // A permanent (non-preview) tab never offers it.
     let permanent = build_tab_context_menu_items(0, 1, false, Some(p), false, false, false);
-    assert!(permanent.iter().all(|(s, _)| s != "Keep Open"));
+    assert!(!menu_labels(&permanent).contains(&"Keep Open"));
 }
 
 #[test]
@@ -11228,20 +11218,155 @@ fn build_tab_context_menu_items_offers_pin_or_unpin_carrying_the_tab_index() {
     // Unpinned tab reads "Pin"; pinned tab reads "Unpin". Either way the entry
     // carries this tab's index and sits between Keep Open and the split group.
     let unpinned = build_tab_context_menu_items(0, 1, false, Some(p), true, false, false);
-    let pin = unpinned.iter().find(|(s, _)| s == "Pin");
-    assert!(matches!(pin, Some((_, MenuAction::ToggleTabPin(0)))));
-    assert!(unpinned.iter().all(|(s, _)| s != "Unpin"));
-    let keep = unpinned.iter().position(|(s, _)| s == "Keep Open");
-    let pin_pos = unpinned.iter().position(|(s, _)| s == "Pin");
-    let split = unpinned.iter().position(|(s, _)| s == "Split Up");
+    assert!(matches!(
+        menu_action_of(&unpinned, "Pin"),
+        Some(MenuAction::ToggleTabPin(0))
+    ));
+    let labels = menu_labels(&unpinned);
+    assert!(!labels.contains(&"Unpin"));
+    let keep = labels.iter().position(|&s| s == "Keep Open");
+    let pin_pos = labels.iter().position(|&s| s == "Pin");
+    let split = labels.iter().position(|&s| s == "Split Right");
     assert!(keep < pin_pos && pin_pos < split);
 
     let pinned = build_tab_context_menu_items(0, 1, false, Some(p), false, false, true);
     assert!(matches!(
-        pinned.iter().find(|(s, _)| s == "Unpin"),
-        Some((_, MenuAction::ToggleTabPin(0)))
+        menu_action_of(&pinned, "Unpin"),
+        Some(MenuAction::ToggleTabPin(0))
     ));
-    assert!(pinned.iter().all(|(s, _)| s != "Pin"));
+    assert!(!menu_labels(&pinned).contains(&"Pin"));
+}
+
+#[test]
+fn tab_menu_groups_split_and_move_into_a_submenu() {
+    let items = build_tab_context_menu_items(0, 1, false, None, false, false, false);
+    // A flat top-level "Split Right" plus a "Split & Move" submenu.
+    assert!(items.iter().any(|e| matches!(
+        e,
+        MenuEntry::Item { label, action: MenuAction::SplitEditor } if label == "Split Right"
+    )));
+    let sub = items
+        .iter()
+        .find_map(|e| match e {
+            MenuEntry::Submenu { label, items } if label == "Split & Move" => Some(items),
+            _ => None,
+        })
+        .expect("a Split & Move submenu");
+    let labels: Vec<&str> = sub
+        .iter()
+        .map(|e| match e {
+            MenuEntry::Item { label, .. } => label.as_str(),
+            MenuEntry::Submenu { label, .. } => label.as_str(),
+            MenuEntry::Separator => "---",
+        })
+        .collect();
+    assert_eq!(
+        labels,
+        [
+            "Split Up",
+            "Split Down",
+            "Split Left",
+            "Split Right",
+            "---",
+            "Move Above",
+            "Move Below",
+            "Move Left",
+            "Move Right",
+            "---",
+            "Split in Group",
+        ]
+    );
+    // VS Code's vertical labels: Above = Up, Below = Down.
+    assert!(matches!(
+        &sub[5],
+        MenuEntry::Item {
+            action: MenuAction::MoveEditorUp,
+            ..
+        }
+    ));
+    assert!(matches!(
+        &sub[6],
+        MenuEntry::Item {
+            action: MenuAction::MoveEditorDown,
+            ..
+        }
+    ));
+}
+
+/// Open the editor tab menu into `app.context_menu` with the cursor on the
+/// "Split & Move" submenu parent.
+fn open_tab_menu_on_split_and_move(app: &mut App) {
+    let items = build_tab_context_menu_items(0, 1, false, None, false, false, false);
+    let sub_idx = items
+        .iter()
+        .position(|e| menu_label(e) == "Split & Move")
+        .unwrap();
+    app.context_menu = Some(ContextMenu {
+        origin: (0, 0),
+        items,
+        selected: sub_idx,
+        open_submenu: None,
+        submenu_selected: 0,
+        target_dir: std::path::PathBuf::from("/"),
+    });
+}
+
+#[test]
+fn split_and_move_submenu_opens_and_down_skips_the_divider() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    open_tab_menu_on_split_and_move(&mut app);
+    // Right opens the submenu, selecting its first child (Split Up).
+    app.handle_menu_key(key(KeyCode::Right, KeyModifiers::NONE));
+    {
+        let m = app.context_menu.as_ref().unwrap();
+        assert!(m.open_submenu.is_some(), "Right opened the submenu");
+        assert_eq!(menu_label(m.cursor_entry().unwrap()), "Split Up");
+    }
+    // Down three times reaches "Split Right" (the last split before the
+    // divider); one more Down SKIPS the divider onto "Move Above".
+    for _ in 0..3 {
+        app.handle_menu_key(key(KeyCode::Down, KeyModifiers::NONE));
+    }
+    assert_eq!(
+        menu_label(app.context_menu.as_ref().unwrap().cursor_entry().unwrap()),
+        "Split Right"
+    );
+    app.handle_menu_key(key(KeyCode::Down, KeyModifiers::NONE));
+    assert_eq!(
+        menu_label(app.context_menu.as_ref().unwrap().cursor_entry().unwrap()),
+        "Move Above",
+        "Down must step over the divider, never land on it"
+    );
+    // Enter on a child dispatches its action and closes the whole menu.
+    app.handle_menu_key(key(KeyCode::Enter, KeyModifiers::NONE));
+    assert!(
+        app.context_menu.is_none(),
+        "Enter on a child closes the menu"
+    );
+}
+
+#[test]
+fn split_and_move_submenu_left_and_esc_back_out_before_dismissing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    open_tab_menu_on_split_and_move(&mut app);
+    app.handle_menu_key(key(KeyCode::Right, KeyModifiers::NONE));
+    // Left closes the submenu but keeps the menu open at the top level.
+    app.handle_menu_key(key(KeyCode::Left, KeyModifiers::NONE));
+    assert!(app.context_menu.as_ref().unwrap().open_submenu.is_none());
+    assert!(app.context_menu.is_some());
+    // Re-open; Esc backs out of the submenu first...
+    app.handle_menu_key(key(KeyCode::Right, KeyModifiers::NONE));
+    app.handle_menu_key(key(KeyCode::Esc, KeyModifiers::NONE));
+    assert!(app.context_menu.as_ref().unwrap().open_submenu.is_none());
+    assert!(
+        app.context_menu.is_some(),
+        "first Esc only closes the submenu"
+    );
+    // ...and a second Esc dismisses the whole menu.
+    app.handle_menu_key(key(KeyCode::Esc, KeyModifiers::NONE));
+    assert!(app.context_menu.is_none(), "second Esc dismisses the menu");
 }
 
 #[test]
@@ -11946,27 +12071,19 @@ fn implementation_picker_lists_every_target_as_a_jump_item() {
     );
     // Labels are workspace-relative path + 1-based line; actions jump straight
     // to the resolved location.
-    assert_eq!(menu.items[0].0, "foo.rs:5");
+    assert_eq!(menu_label(&menu.items[0]), "foo.rs:5");
+    assert!(matches!(
+        menu.items[0].action(),
+        Some(MenuAction::GoToLocation { path, line: 4, col: 2 }) if path == &a
+    ));
     assert_eq!(
-        menu.items[0].1,
-        MenuAction::GoToLocation {
-            path: a,
-            line: 4,
-            col: 2
-        }
-    );
-    assert_eq!(
-        menu.items[1].0,
+        menu_label(&menu.items[1]),
         format!("sub{}bar.rs:1", std::path::MAIN_SEPARATOR)
     );
-    assert_eq!(
-        menu.items[1].1,
-        MenuAction::GoToLocation {
-            path: b,
-            line: 0,
-            col: 0
-        }
-    );
+    assert!(matches!(
+        menu.items[1].action(),
+        Some(MenuAction::GoToLocation { path, line: 0, col: 0 }) if path == &b
+    ));
 }
 
 #[test]
@@ -13509,11 +13626,12 @@ fn explorer_views_menu_omits_dependencies_in_a_folder_with_no_manifest() {
         !menu
             .items
             .iter()
-            .any(|(label, _)| label.contains("Dependencies")),
+            .any(|e| menu_label(e).contains("Dependencies")),
         "no dependency toggle in a manifest-less folder: {:?}",
         menu.items
     );
-    for (label, _) in &menu.items {
+    for entry in &menu.items {
+        let label = menu_label(entry);
         let checked = label.starts_with('\u{2713}');
         // Every listed row names an always-available view and its check glyph
         // matches that view's current visibility.
@@ -13543,7 +13661,7 @@ fn explorer_views_menu_labels_dependencies_for_the_detected_ecosystem() {
     assert!(
         menu.items
             .iter()
-            .any(|(label, _)| label.contains("Rust Dependencies")),
+            .any(|e| menu_label(e).contains("Rust Dependencies")),
         "a Cargo root labels the view 'Rust Dependencies': {:?}",
         menu.items
     );

@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Feature,
-    summary: "Move the active editor to an adjacent group (Move Up/Down/Left/Right) and Split in Group, from the tab menu.",
+    summary: "Editor tab menu now has a Split & Move submenu: Split Up/Down/Left/Right, Move Above/Below/Left/Right, and Split in Group, grouped like VS Code.",
 }];

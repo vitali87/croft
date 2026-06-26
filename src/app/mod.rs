@@ -782,6 +782,21 @@ fn shortcut_for(action: &MenuAction) -> Option<&'static str> {
     }
 }
 
+/// Display width (in cells) a menu entry needs: its label plus the right-aligned
+/// shortcut hint (items) or the `▸` submenu indicator. Dividers need none.
+fn menu_entry_width(entry: &MenuEntry) -> usize {
+    match entry {
+        MenuEntry::Item { label, action } => {
+            let shortcut = shortcut_for(action)
+                .map(|s| s.chars().count() + 2)
+                .unwrap_or(0);
+            label.chars().count() + shortcut
+        }
+        MenuEntry::Submenu { label, .. } => label.chars().count() + 2,
+        MenuEntry::Separator => 0,
+    }
+}
+
 /// The end-of-session feedback line. When breakpoints were set but the program
 /// exited without ever stopping, say so explicitly — that is the common "I set a
 /// breakpoint and nothing happened" confusion (e.g. running a library module
@@ -856,35 +871,35 @@ fn build_tab_context_menu_items(
     reveal_enabled: bool,
     clicked_is_preview: bool,
     clicked_is_pinned: bool,
-) -> Vec<(String, MenuAction)> {
-    let mut items: Vec<(String, MenuAction)> = Vec::new();
-    items.push((String::from("Close"), MenuAction::CloseTab(idx)));
+) -> Vec<MenuEntry> {
+    let mut items: Vec<MenuEntry> = Vec::new();
+    items.push(MenuEntry::item("Close", MenuAction::CloseTab(idx)));
     if tab_count > 1 {
-        items.push((
-            String::from("Close Others"),
+        items.push(MenuEntry::item(
+            "Close Others",
             MenuAction::CloseOtherTabs(idx),
         ));
     }
     if idx + 1 < tab_count {
-        items.push((
-            String::from("Close to the Right"),
+        items.push(MenuEntry::item(
+            "Close to the Right",
             MenuAction::CloseTabsToRight(idx),
         ));
     }
     if tab_count > 1 {
-        items.push((String::from("Close Saved"), MenuAction::CloseSavedTabs));
+        items.push(MenuEntry::item("Close Saved", MenuAction::CloseSavedTabs));
     }
-    items.push((String::from("Close All"), MenuAction::CloseAllTabs));
+    items.push(MenuEntry::item("Close All", MenuAction::CloseAllTabs));
     // Copy Path: any tab backed by a real on-disk path, local or remote (it's
     // a clipboard write, not a host bridge). Sits between the close group and
     // Reveal in Finder, mirroring VS Code's tab-menu order.
     if let Some(path) = clicked {
-        items.push((
-            String::from("Copy Path"),
+        items.push(MenuEntry::item(
+            "Copy Path",
             MenuAction::CopyTabPath(path.to_path_buf()),
         ));
-        items.push((
-            String::from("Copy Relative Path"),
+        items.push(MenuEntry::item(
+            "Copy Relative Path",
             MenuAction::CopyTabRelativePath(path.to_path_buf()),
         ));
     }
@@ -892,16 +907,16 @@ fn build_tab_context_menu_items(
     // real on-disk path (a blank/untitled buffer has nothing to reveal). On a
     // remote SSH session the entry is withheld, matching the explorer menu.
     if let Some(path) = clicked.filter(|_| reveal_enabled) {
-        items.push((
-            String::from("Reveal in Finder"),
+        items.push(MenuEntry::item(
+            "Reveal in Finder",
             MenuAction::RevealInFinder(path.to_path_buf()),
         ));
     }
     // Reveal in Explorer View: select the file in croft's own tree. The tree
     // exists local and remote, so this is gated only on a real path.
     if let Some(path) = clicked {
-        items.push((
-            String::from("Reveal in Explorer View"),
+        items.push(MenuEntry::item(
+            "Reveal in Explorer View",
             MenuAction::RevealInExplorer(path.to_path_buf()),
         ));
     }
@@ -909,32 +924,43 @@ fn build_tab_context_menu_items(
     // Promotes it so a subsequent single-click open won't replace it. VS Code
     // omits the entry on an already-permanent tab, so we do too.
     if clicked_is_preview {
-        items.push((String::from("Keep Open"), MenuAction::KeepTabOpen(idx)));
+        items.push(MenuEntry::item("Keep Open", MenuAction::KeepTabOpen(idx)));
     }
     // Pin / Unpin: always offered. A pinned tab reads "Unpin"; pinning keeps it
     // leftmost and shields it from Close Others / Close to the Right.
-    items.push((
-        String::from(if clicked_is_pinned { "Unpin" } else { "Pin" }),
+    items.push(MenuEntry::item(
+        if clicked_is_pinned { "Unpin" } else { "Pin" },
         MenuAction::ToggleTabPin(idx),
     ));
-    // Split & Move: the four directional splits, the four directional moves, and
-    // Split in Group. Splits nest, so they are always offered (not only when
-    // unsplit). Focus-group navigation appears once a second group exists.
-    // (These flat entries move into a nested "Split & Move" submenu in a later
-    // increment.)
-    items.push((String::from("Split Up"), MenuAction::SplitEditorUp));
-    items.push((String::from("Split Down"), MenuAction::SplitEditorDown));
-    items.push((String::from("Split Left"), MenuAction::SplitEditorLeft));
-    items.push((String::from("Split Right"), MenuAction::SplitEditor));
-    items.push((String::from("Move Up"), MenuAction::MoveEditorUp));
-    items.push((String::from("Move Down"), MenuAction::MoveEditorDown));
-    items.push((String::from("Move Left"), MenuAction::MoveEditorLeft));
-    items.push((String::from("Move Right"), MenuAction::MoveEditorRight));
-    items.push((String::from("Split in Group"), MenuAction::SplitInGroup));
+    // A top-level "Split Right" (the common case), then a "Split & Move"
+    // submenu holding every directional split, the four directional moves, and
+    // Split in Group — mirroring VS Code's tab menu.
+    items.push(MenuEntry::item("Split Right", MenuAction::SplitEditor));
+    items.push(MenuEntry::Submenu {
+        label: String::from("Split & Move"),
+        items: vec![
+            MenuEntry::item("Split Up", MenuAction::SplitEditorUp),
+            MenuEntry::item("Split Down", MenuAction::SplitEditorDown),
+            MenuEntry::item("Split Left", MenuAction::SplitEditorLeft),
+            MenuEntry::item("Split Right", MenuAction::SplitEditor),
+            MenuEntry::Separator,
+            // VS Code's vertical labels: Above = Up, Below = Down.
+            MenuEntry::item("Move Above", MenuAction::MoveEditorUp),
+            MenuEntry::item("Move Below", MenuAction::MoveEditorDown),
+            MenuEntry::item("Move Left", MenuAction::MoveEditorLeft),
+            MenuEntry::item("Move Right", MenuAction::MoveEditorRight),
+            MenuEntry::Separator,
+            MenuEntry::item("Split in Group", MenuAction::SplitInGroup),
+        ],
+    });
+    // Focus-group navigation appears once a second group exists.
     if is_split {
-        items.push((String::from("Focus Left Group"), MenuAction::FocusGroupLeft));
-        items.push((
-            String::from("Focus Right Group"),
+        items.push(MenuEntry::item(
+            "Focus Left Group",
+            MenuAction::FocusGroupLeft,
+        ));
+        items.push(MenuEntry::item(
+            "Focus Right Group",
             MenuAction::FocusGroupRight,
         ));
     }
@@ -1113,15 +1139,171 @@ fn maybe_add_reveal_in_finder(
     );
 }
 
+/// One row of a context menu: a clickable action, a parent that opens a nested
+/// submenu, or a divider. Most menus are a flat list of `Item`s; the editor tab
+/// menu uses a `Submenu` ("Split & Move") whose children include `Separator`s.
+#[derive(Clone, Debug)]
+enum MenuEntry {
+    Item {
+        label: String,
+        action: MenuAction,
+    },
+    Submenu {
+        label: String,
+        items: Vec<MenuEntry>,
+    },
+    Separator,
+}
+
+impl MenuEntry {
+    fn item(label: impl Into<String>, action: MenuAction) -> Self {
+        Self::Item {
+            label: label.into(),
+            action,
+        }
+    }
+
+    /// The action a click on this entry dispatches, if it is a plain item.
+    fn action(&self) -> Option<&MenuAction> {
+        match self {
+            Self::Item { action, .. } => Some(action),
+            _ => None,
+        }
+    }
+
+    /// True for a row the cursor may land on (items and submenu parents, not
+    /// dividers).
+    fn is_selectable(&self) -> bool {
+        !matches!(self, Self::Separator)
+    }
+}
+
+impl From<(String, MenuAction)> for MenuEntry {
+    fn from((label, action): (String, MenuAction)) -> Self {
+        Self::Item { label, action }
+    }
+}
+
 struct ContextMenu {
     /// Top-left of the menu in absolute terminal coordinates.
     origin: (u16, u16),
-    /// Items, in display order. Each is the label + the action.
-    items: Vec<(String, MenuAction)>,
-    /// Highlighted row.
+    /// Items, in display order.
+    items: Vec<MenuEntry>,
+    /// Highlighted top-level row.
     selected: usize,
+    /// Index into `items` of the currently open submenu (a `Submenu` entry), or
+    /// `None` when no submenu is open.
+    open_submenu: Option<usize>,
+    /// Highlighted row WITHIN the open submenu (only meaningful when
+    /// `open_submenu` is `Some`).
+    submenu_selected: usize,
     /// Where any New File / New Folder should be created.
     target_dir: PathBuf,
+}
+
+impl ContextMenu {
+    /// A flat menu from `(label, action)` tuples (the common case).
+    fn flat(origin: (u16, u16), items: Vec<(String, MenuAction)>, target_dir: PathBuf) -> Self {
+        Self {
+            origin,
+            items: items.into_iter().map(MenuEntry::from).collect(),
+            selected: 0,
+            open_submenu: None,
+            submenu_selected: 0,
+            target_dir,
+        }
+    }
+
+    /// The entries at the active level: the open submenu's children, or the
+    /// top-level items.
+    fn level_entries(&self) -> &[MenuEntry] {
+        match self.open_submenu {
+            Some(i) => match &self.items[i] {
+                MenuEntry::Submenu { items, .. } => items,
+                _ => &self.items,
+            },
+            None => &self.items,
+        }
+    }
+
+    fn level_selected(&self) -> usize {
+        if self.open_submenu.is_some() {
+            self.submenu_selected
+        } else {
+            self.selected
+        }
+    }
+
+    fn set_level_selected(&mut self, idx: usize) {
+        if self.open_submenu.is_some() {
+            self.submenu_selected = idx;
+        } else {
+            self.selected = idx;
+        }
+    }
+
+    /// Move the cursor up/down within the active level, skipping dividers and
+    /// stopping at the ends.
+    fn move_cursor(&mut self, down: bool) {
+        let entries = self.level_entries();
+        let n = entries.len();
+        let mut i = self.level_selected();
+        loop {
+            i = if down {
+                if i + 1 >= n {
+                    return;
+                }
+                i + 1
+            } else {
+                if i == 0 {
+                    return;
+                }
+                i - 1
+            };
+            if entries[i].is_selectable() {
+                self.set_level_selected(i);
+                return;
+            }
+        }
+    }
+
+    /// The entry currently under the cursor at the active level.
+    fn cursor_entry(&self) -> Option<&MenuEntry> {
+        self.level_entries().get(self.level_selected())
+    }
+
+    /// The action a cursor-on-item Enter/click dispatches (None on a submenu
+    /// parent or divider).
+    fn cursor_action(&self) -> Option<MenuAction> {
+        match self.cursor_entry() {
+            Some(MenuEntry::Item { action, .. }) => Some(action.clone()),
+            _ => None,
+        }
+    }
+
+    /// If the top-level cursor is on a submenu parent (and none is open yet),
+    /// open it, selecting its first selectable child. Returns true when opened.
+    fn open_cursor_submenu(&mut self) -> bool {
+        if self.open_submenu.is_some() {
+            return false;
+        }
+        if let Some(MenuEntry::Submenu { items, .. }) = self.items.get(self.selected) {
+            self.submenu_selected = items.iter().position(MenuEntry::is_selectable).unwrap_or(0);
+            self.open_submenu = Some(self.selected);
+            return true;
+        }
+        false
+    }
+
+    /// Close any open submenu, returning to the top level. Returns true when a
+    /// submenu was actually open.
+    fn close_submenu(&mut self) -> bool {
+        if self.open_submenu.take().is_some() {
+            self.submenu_selected = 0;
+            return true;
+        }
+        false
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -2822,10 +3004,10 @@ impl App {
     /// with the many places the menu is dismissed.
     fn settings_menu_active(&self) -> bool {
         self.context_menu.as_ref().is_some_and(|menu| {
-            menu.items.iter().any(|(_, action)| {
+            menu.items.iter().any(|entry| {
                 matches!(
-                    action,
-                    MenuAction::OpenThemePicker | MenuAction::SetTheme(_)
+                    entry.action(),
+                    Some(MenuAction::OpenThemePicker | MenuAction::SetTheme(_))
                 )
             })
         })
@@ -4312,12 +4494,7 @@ impl App {
             self.editor.last_full_area.y + 1,
         ));
         self.focus_pane(Pane::Editor);
-        self.context_menu = Some(ContextMenu {
-            origin,
-            items,
-            selected: 0,
-            target_dir: root,
-        });
+        self.context_menu = Some(ContextMenu::flat(origin, items, root));
     }
 
     /// Anchor a `ContextMenu` at the activity-bar gear. `menu_rect` clamps it
@@ -4333,12 +4510,11 @@ impl App {
     /// settings entries slot in here later.
     fn open_settings_menu(&mut self) {
         let origin = self.settings_menu_origin();
-        self.context_menu = Some(ContextMenu {
+        self.context_menu = Some(ContextMenu::flat(
             origin,
-            items: vec![(String::from("Color Theme"), MenuAction::OpenThemePicker)],
-            selected: 0,
-            target_dir: self.workspace_root.clone(),
-        });
+            vec![(String::from("Color Theme"), MenuAction::OpenThemePicker)],
+            self.workspace_root.clone(),
+        ));
         // The gear renders "active" while its menu is open; re-emit it so the
         // pressed-state PNG replaces the idle one.
         self.overlays.activity.mark_dirty();
@@ -4362,8 +4538,10 @@ impl App {
             .unwrap_or(0);
         self.context_menu = Some(ContextMenu {
             origin,
-            items,
+            items: items.into_iter().map(MenuEntry::from).collect(),
             selected,
+            open_submenu: None,
+            submenu_selected: 0,
             target_dir: self.workspace_root.clone(),
         });
         self.overlays.activity.mark_dirty();
@@ -4420,12 +4598,11 @@ impl App {
                 )
             })
             .collect();
-        self.context_menu = Some(ContextMenu {
+        self.context_menu = Some(ContextMenu::flat(
             origin,
             items,
-            selected: 0,
-            target_dir: self.workspace_root.clone(),
-        });
+            self.workspace_root.clone(),
+        ));
     }
 
     /// Flip one Explorer sub-view's visibility, persist the new set, and (for a
@@ -6814,19 +6991,42 @@ impl App {
         let Some(clipped) = self.menu_rect() else {
             return;
         };
+        let grad = self.popup_gradient();
+        // The top-level panel; the open submenu's parent row stays highlighted.
+        self.render_menu_panel(frame, clipped, &menu.items, menu.selected, grad);
+        // Float the open submenu's panel beside its parent.
+        if let Some(sub_rect) = self.submenu_rect()
+            && let Some(MenuEntry::Submenu { items, .. }) =
+                menu.open_submenu.and_then(|p| menu.items.get(p))
+        {
+            self.render_menu_panel(frame, sub_rect, items, menu.submenu_selected, grad);
+        }
+    }
+
+    /// Paint one bordered menu panel of `entries` into `rect`, highlighting row
+    /// `selected`. Items show a right-aligned shortcut hint, submenu parents a
+    /// `▸`, and separators a divider rule. Shared by the main menu and the
+    /// floating submenu.
+    fn render_menu_panel(
+        &self,
+        frame: &mut ratatui::Frame,
+        rect: Rect,
+        entries: &[MenuEntry],
+        selected: usize,
+        grad: bool,
+    ) {
         // Black theme: orange→green gradient border + muted dark-teal
         // selection. Croft Dark keeps the legacy bright-blue accent so the
         // menu stays coherent with that theme's blue focus border.
-        let grad = self.popup_gradient();
         let border_blue = Color::Rgb(0x4e, 0x9a, 0xff);
         let block = ratatui::widgets::Block::default()
             .borders(ratatui::widgets::Borders::ALL)
             .border_style(Style::default().fg(border_blue))
             .style(Style::default().bg(Color::Rgb(0x1e, 0x1e, 0x1e)));
-        frame.render_widget(ratatui::widgets::Clear, clipped);
-        frame.render_widget(block, clipped);
+        frame.render_widget(ratatui::widgets::Clear, rect);
+        frame.render_widget(block, rect);
         if grad {
-            paint_gradient_box(frame.buffer_mut(), clipped);
+            paint_gradient_box(frame.buffer_mut(), rect);
         }
         let sel_bg = if grad {
             rgb_color(POPUP_SEL_BG)
@@ -6835,12 +7035,12 @@ impl App {
         };
         let sel_fg = if grad { Color::White } else { Color::Black };
         let inner = Rect {
-            x: clipped.x + 1,
-            y: clipped.y + 1,
-            width: clipped.width.saturating_sub(2),
-            height: clipped.height.saturating_sub(2),
+            x: rect.x + 1,
+            y: rect.y + 1,
+            width: rect.width.saturating_sub(2),
+            height: rect.height.saturating_sub(2),
         };
-        for (i, (label, action)) in menu.items.iter().enumerate() {
+        for (i, entry) in entries.iter().enumerate() {
             if i as u16 >= inner.height {
                 break;
             }
@@ -6850,27 +7050,46 @@ impl App {
                 width: inner.width,
                 height: 1,
             };
-            let selected = i == menu.selected;
-            let row_style = if selected {
+            if let MenuEntry::Separator = entry {
+                let rule = "\u{2500}".repeat(inner.width as usize);
+                frame.buffer_mut().set_string(
+                    inner.x,
+                    row.y,
+                    &rule,
+                    Style::default().fg(Color::Rgb(0x45, 0x45, 0x45)),
+                );
+                continue;
+            }
+            let is_sel = i == selected;
+            let row_style = if is_sel {
                 Style::default().fg(sel_fg).bg(sel_bg)
             } else {
                 Style::default().fg(Color::White)
             };
-            // Paint the label, then right-align the shortcut hint on the
-            // same row so the menu reads like VS Code's: action on the
-            // left, accelerator on the right.
+            let (label, right_hint) = match entry {
+                MenuEntry::Item { label, action } => {
+                    (label.as_str(), shortcut_for(action).map(str::to_string))
+                }
+                // A submenu parent shows the ▸ where a shortcut would sit.
+                MenuEntry::Submenu { label, .. } => {
+                    (label.as_str(), Some(String::from("\u{25b8}")))
+                }
+                MenuEntry::Separator => unreachable!("handled above"),
+            };
             let line = ratatui::text::Line::from(format!(" {label}"));
             frame.render_widget(ratatui::widgets::Paragraph::new(line).style(row_style), row);
-            if let Some(sc) = shortcut_for(action) {
-                let sc_w = sc.chars().count() as u16;
-                if sc_w + 2 <= inner.width {
-                    let sc_x = inner.x + inner.width - sc_w - 1;
-                    let sc_style = if selected {
+            if let Some(hint) = right_hint {
+                let hint_w = hint.chars().count() as u16;
+                if hint_w + 2 <= inner.width {
+                    let hint_x = inner.x + inner.width - hint_w - 1;
+                    let hint_style = if is_sel {
                         Style::default().fg(sel_fg).bg(sel_bg)
                     } else {
                         Style::default().fg(Color::Rgb(0x9d, 0xa5, 0xb4))
                     };
-                    frame.buffer_mut().set_string(sc_x, row.y, sc, sc_style);
+                    frame
+                        .buffer_mut()
+                        .set_string(hint_x, row.y, &hint, hint_style);
                 }
             }
         }
@@ -14887,18 +15106,57 @@ impl App {
         }
 
         // While a context menu is open, route clicks to it.
-        if let Some(menu) = &self.context_menu {
+        if self.context_menu.is_some() {
             match m.kind {
                 MouseEventKind::Down(MouseButton::Left) => {
-                    if let Some(idx) = self.menu_item_at(m.column, m.row) {
-                        let action = menu.items[idx].1.clone();
-                        let dir = menu.target_dir.clone();
-                        self.context_menu = None;
-                        self.dispatch_menu_action(action, dir);
-                    } else {
-                        // click outside the menu: dismiss
-                        self.context_menu = None;
+                    // 1. A click inside the open submenu panel dispatches that child.
+                    if let Some(child) = self.submenu_item_at(m.column, m.row) {
+                        let dispatch = self.context_menu.as_ref().and_then(|menu| {
+                            let parent = menu.open_submenu?;
+                            let MenuEntry::Submenu { items, .. } = menu.items.get(parent)? else {
+                                return None;
+                            };
+                            match items.get(child) {
+                                Some(MenuEntry::Item { action, .. }) => {
+                                    Some((action.clone(), menu.target_dir.clone()))
+                                }
+                                _ => None,
+                            }
+                        });
+                        if let Some((action, dir)) = dispatch {
+                            self.context_menu = None;
+                            self.dispatch_menu_action(action, dir);
+                        }
+                        return;
                     }
+                    // 2. A click on a top-level row: dispatch an item, or open a submenu.
+                    if let Some(idx) = self.menu_item_at(m.column, m.row) {
+                        let action =
+                            self.context_menu
+                                .as_ref()
+                                .and_then(|menu| match menu.items.get(idx) {
+                                    Some(MenuEntry::Item { action, .. }) => {
+                                        Some((action.clone(), menu.target_dir.clone()))
+                                    }
+                                    _ => None,
+                                });
+                        match action {
+                            Some((action, dir)) => {
+                                self.context_menu = None;
+                                self.dispatch_menu_action(action, dir);
+                            }
+                            None => {
+                                // A submenu parent (or a divider): open the submenu.
+                                if let Some(menu) = self.context_menu.as_mut() {
+                                    menu.selected = idx;
+                                    menu.open_cursor_submenu();
+                                }
+                            }
+                        }
+                        return;
+                    }
+                    // 3. Click outside every panel: dismiss.
+                    self.context_menu = None;
                     return;
                 }
                 MouseEventKind::Down(MouseButton::Right) => {
@@ -15052,6 +15310,8 @@ impl App {
                         origin: (m.column, m.row),
                         items,
                         selected: 0,
+                        open_submenu: None,
+                        submenu_selected: 0,
                         target_dir: self.tree.root.clone(),
                     });
                     return;
@@ -15086,12 +15346,8 @@ impl App {
                         clicked.as_deref(),
                         !self.is_remote && cfg!(target_os = "macos"),
                     );
-                    self.context_menu = Some(ContextMenu {
-                        origin: (m.column, m.row),
-                        items,
-                        selected: 0,
-                        target_dir,
-                    });
+                    self.context_menu =
+                        Some(ContextMenu::flat((m.column, m.row), items, target_dir));
                     return;
                 }
                 // Editor gutter: right-click in the glyph margin / line-number
@@ -15140,12 +15396,11 @@ impl App {
                         (toggle_label, MenuAction::ToggleBreakpointAt { line }),
                         (cond_label, MenuAction::EditBreakpointConditionAt { line }),
                     ];
-                    self.context_menu = Some(ContextMenu {
-                        origin: (m.column, m.row),
+                    self.context_menu = Some(ContextMenu::flat(
+                        (m.column, m.row),
                         items,
-                        selected: 0,
-                        target_dir: self.tree.root.clone(),
-                    });
+                        self.tree.root.clone(),
+                    ));
                     return;
                 }
                 // Editor body: right-click over a text buffer opens the symbol
@@ -15217,12 +15472,11 @@ impl App {
                             MenuAction::QuickFixAt { row, col },
                         ));
                     }
-                    self.context_menu = Some(ContextMenu {
-                        origin: (m.column, m.row),
+                    self.context_menu = Some(ContextMenu::flat(
+                        (m.column, m.row),
                         items,
-                        selected: 0,
-                        target_dir: self.tree.root.clone(),
-                    });
+                        self.tree.root.clone(),
+                    ));
                 }
             }
             MouseEventKind::Down(MouseButton::Left) => {
@@ -16231,18 +16485,7 @@ impl App {
         // Selected") don't inflate the menu width past what's needed.
         // Width must also fit the shortcut hint on the right side, with
         // at least 2 cells of gap between label and shortcut.
-        let widest = menu
-            .items
-            .iter()
-            .map(|(label, action)| {
-                let label_w = label.chars().count();
-                let shortcut_w = shortcut_for(action)
-                    .map(|s| s.chars().count() + 2)
-                    .unwrap_or(0);
-                label_w + shortcut_w
-            })
-            .max()
-            .unwrap_or(0);
+        let widest = menu.items.iter().map(menu_entry_width).max().unwrap_or(0);
         let width = (widest + 4).max(18) as u16;
         let height = (menu.items.len() + 2) as u16;
         let area = self.last_frame_area;
@@ -16268,7 +16511,41 @@ impl App {
         })
     }
 
-    /// If (x, y) hits a menu item row, return its index.
+    /// Rect of the open submenu's panel: floated to the RIGHT of its parent
+    /// row, flipped to the left when it would overflow the screen, with its
+    /// first row aligned to the parent row. `None` when no submenu is open.
+    fn submenu_rect(&self) -> Option<Rect> {
+        let menu = self.context_menu.as_ref()?;
+        let parent = menu.open_submenu?;
+        let MenuEntry::Submenu { items, .. } = menu.items.get(parent)? else {
+            return None;
+        };
+        let main = self.menu_rect()?;
+        let widest = items.iter().map(menu_entry_width).max().unwrap_or(0);
+        let width = (widest + 4).max(18) as u16;
+        let height = (items.len() + 2) as u16;
+        let area = self.last_frame_area;
+        // Float right of the main panel; flip left if it would overflow.
+        let mut x = main.x + main.width;
+        if area.width > 0 && x + width > area.width {
+            x = main.x.saturating_sub(width);
+        }
+        // Align the submenu's top border so its first row sits on the parent row.
+        let y = (main.y + 1 + parent as u16).saturating_sub(1);
+        let y = if area.height > 0 {
+            y.min(area.height.saturating_sub(height))
+        } else {
+            y
+        };
+        Some(Rect {
+            x,
+            y,
+            width,
+            height,
+        })
+    }
+
+    /// If (x, y) hits a top-level menu row, return its index.
     fn menu_item_at(&self, x: u16, y: u16) -> Option<usize> {
         let r = self.menu_rect()?;
         if !rect_contains(r, x, y) {
@@ -16278,35 +16555,70 @@ impl App {
         let inner_y = y.checked_sub(r.y + 1)?;
         let menu = self.context_menu.as_ref()?;
         let idx = inner_y as usize;
-        if idx < menu.items.len() {
-            Some(idx)
-        } else {
-            None
+        (idx < menu.items.len()).then_some(idx)
+    }
+
+    /// If (x, y) hits a row of the open submenu panel, return that child index.
+    fn submenu_item_at(&self, x: u16, y: u16) -> Option<usize> {
+        let r = self.submenu_rect()?;
+        if !rect_contains(r, x, y) {
+            return None;
         }
+        let inner_y = y.checked_sub(r.y + 1)?;
+        let menu = self.context_menu.as_ref()?;
+        let parent = menu.open_submenu?;
+        let MenuEntry::Submenu { items, .. } = menu.items.get(parent)? else {
+            return None;
+        };
+        let idx = inner_y as usize;
+        (idx < items.len()).then_some(idx)
     }
 
     fn handle_menu_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Esc => {
-                self.context_menu = None;
+                // Esc backs out of an open submenu first; at the top level it
+                // dismisses the whole menu.
+                let closed = self
+                    .context_menu
+                    .as_mut()
+                    .is_some_and(|menu| menu.close_submenu());
+                if !closed {
+                    self.context_menu = None;
+                }
             }
             KeyCode::Up => {
-                if let Some(menu) = self.context_menu.as_mut()
-                    && menu.selected > 0
-                {
-                    menu.selected -= 1;
+                if let Some(menu) = self.context_menu.as_mut() {
+                    menu.move_cursor(false);
                 }
             }
             KeyCode::Down => {
-                if let Some(menu) = self.context_menu.as_mut()
-                    && menu.selected + 1 < menu.items.len()
-                {
-                    menu.selected += 1;
+                if let Some(menu) = self.context_menu.as_mut() {
+                    menu.move_cursor(true);
+                }
+            }
+            KeyCode::Left => {
+                if let Some(menu) = self.context_menu.as_mut() {
+                    menu.close_submenu();
+                }
+            }
+            KeyCode::Right => {
+                if let Some(menu) = self.context_menu.as_mut() {
+                    menu.open_cursor_submenu();
                 }
             }
             KeyCode::Enter => {
-                if let Some(menu) = self.context_menu.as_ref() {
-                    let action = menu.items[menu.selected].1.clone();
+                // On a submenu parent, Enter opens it; on an item it dispatches.
+                let opened = self
+                    .context_menu
+                    .as_mut()
+                    .is_some_and(|menu| menu.open_cursor_submenu());
+                if opened {
+                    return;
+                }
+                if let Some(menu) = self.context_menu.as_ref()
+                    && let Some(action) = menu.cursor_action()
+                {
                     let dir = menu.target_dir.clone();
                     self.context_menu = None;
                     self.dispatch_menu_action(action, dir);
