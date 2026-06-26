@@ -370,9 +370,16 @@ mod tests {
         );
         // Desktop platforms croft can download for; Android is intentionally
         // absent (handled by the Termux pkg fallback above).
-        for key in ["macos-aarch64", "macos-x86_64", "linux-x86_64", "linux-aarch64"] {
+        for key in [
+            "macos-aarch64",
+            "macos-x86_64",
+            "linux-x86_64",
+            "linux-aarch64",
+        ] {
             assert!(
-                targets.iter().any(|(k, url)| *k == key && url.ends_with(".gz")),
+                targets
+                    .iter()
+                    .any(|(k, url)| *k == key && url.ends_with(".gz")),
                 "rust-analyzer must have a .gz target for {key}"
             );
         }

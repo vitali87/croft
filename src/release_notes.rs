@@ -51,6 +51,10 @@ pub struct ReleaseNote {
 pub const RELEASE_NOTES: &[ReleaseNote] = &[
     ReleaseNote {
         kind: NoteKind::Feature,
+        summary: "Editor tab right-click parity: Close Saved (Cmd+K U) closes every saved tab and keeps the unsaved ones open.",
+    },
+    ReleaseNote {
+        kind: NoteKind::Feature,
         summary: "Code Actions and Quick Fix: press Cmd+. to apply fixes and refactors from every running language server.",
     },
     ReleaseNote {

@@ -5616,6 +5616,33 @@ impl EditorTabs {
         n
     }
 
+    /// Close every saved (non-dirty) tab, keeping any with unsaved changes.
+    /// When no dirty tab remains the pane resets to a single blank buffer,
+    /// mirroring `close_all`; otherwise the surviving dirty tabs are kept in
+    /// order and the first becomes active. Returns how many tabs were removed
+    /// (0 when every open tab is dirty). Matches VS Code's "Close Saved"
+    /// (`workbench.action.closeUnmodifiedEditors`).
+    pub fn close_saved(&mut self) -> usize {
+        let before = self.editors.len();
+        let was_focused = self.editors[self.active].focused;
+        let mut kept: Vec<Editor> = std::mem::take(&mut self.editors)
+            .into_iter()
+            .filter(|e| e.dirty)
+            .collect();
+        let removed = before - kept.len();
+        if kept.is_empty() {
+            let mut fresh = Editor::new();
+            fresh.focused = was_focused;
+            kept.push(fresh);
+        }
+        self.editors = kept;
+        self.active = 0;
+        for (i, ed) in self.editors.iter_mut().enumerate() {
+            ed.focused = i == 0;
+        }
+        removed
+    }
+
     /// Map a mouse cell `(col, row)` to a tab index, or `None` if the click
     /// missed every tab. Uses the on-screen ranges captured during the most
     /// recent render.
@@ -10146,6 +10173,49 @@ mod tests {
         assert_eq!(removed, 3, "report how many tabs were collapsed");
         assert_eq!(t.tab_count(), 1, "always at least one tab survives");
         assert!(t.path.is_none(), "the surviving tab is a fresh blank slot");
+    }
+
+    #[test]
+    fn close_saved_drops_clean_tabs_and_keeps_dirty_ones() {
+        let mut t = EditorTabs::new();
+        t.editors[0].path = Some(std::path::PathBuf::from("/a"));
+        t.add_tab_with_path(std::path::PathBuf::from("/b"));
+        t.add_tab_with_path(std::path::PathBuf::from("/c"));
+        // Mark "b" (index 1) as having unsaved changes; a and c are saved.
+        t.editors[1].dirty = true;
+        let removed = t.close_saved();
+        assert_eq!(removed, 2, "the two saved tabs (a, c) are closed");
+        assert_eq!(t.tab_count(), 1, "only the dirty tab survives");
+        assert_eq!(
+            t.editors[0].path.as_deref(),
+            Some(std::path::Path::new("/b")),
+            "the kept tab is the dirty one"
+        );
+        assert_eq!(t.active_index(), 0, "the kept tab becomes active");
+        assert!(t.editors[0].focused, "the kept tab is focused");
+    }
+
+    #[test]
+    fn close_saved_collapses_to_blank_when_no_tab_is_dirty() {
+        let mut t = EditorTabs::new();
+        t.editors[0].path = Some(std::path::PathBuf::from("/a"));
+        t.add_tab_with_path(std::path::PathBuf::from("/b"));
+        let removed = t.close_saved();
+        assert_eq!(removed, 2, "both saved tabs are closed");
+        assert_eq!(t.tab_count(), 1, "always at least one tab survives");
+        assert!(t.path.is_none(), "the survivor is a fresh blank slot");
+    }
+
+    #[test]
+    fn close_saved_is_a_noop_when_every_tab_is_dirty() {
+        let mut t = EditorTabs::new();
+        t.editors[0].path = Some(std::path::PathBuf::from("/a"));
+        t.editors[0].dirty = true;
+        t.add_tab_with_path(std::path::PathBuf::from("/b"));
+        t.editors[1].dirty = true;
+        let removed = t.close_saved();
+        assert_eq!(removed, 0, "nothing saved means nothing to close");
+        assert_eq!(t.tab_count(), 2, "both dirty tabs stay open");
     }
 
     #[test]

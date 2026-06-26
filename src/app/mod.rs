@@ -600,6 +600,9 @@ enum MenuAction {
     CloseTabsToRight(usize),
     /// Close every editor tab and reset the pane to a blank state.
     CloseAllTabs,
+    /// Close every saved (non-dirty) editor tab, keeping any with unsaved
+    /// changes. Mirrors VS Code's "Close Saved".
+    CloseSavedTabs,
     /// Split the editor into two side-by-side columns, duplicating the
     /// active file into the new (right) group.
     SplitEditor,
@@ -714,6 +717,7 @@ fn shortcut_for(action: &MenuAction) -> Option<&'static str> {
         MenuAction::CloseTab(_) => Some("⌘W"),
         MenuAction::CloseOtherTabs(_) => Some("⌥⌘T"),
         MenuAction::CloseAllTabs => Some("⌘K W"),
+        MenuAction::CloseSavedTabs => Some("⌘K U"),
         MenuAction::SplitEditor => Some("⌘\\"),
         MenuAction::FocusGroupLeft => Some("⌥⌘←"),
         MenuAction::FocusGroupRight => Some("⌥⌘→"),
@@ -819,6 +823,9 @@ fn build_tab_context_menu_items(
             String::from("Close to the Right"),
             MenuAction::CloseTabsToRight(idx),
         ));
+    }
+    if tab_count > 1 {
+        items.push((String::from("Close Saved"), MenuAction::CloseSavedTabs));
     }
     items.push((String::from("Close All"), MenuAction::CloseAllTabs));
     // Editor-group actions: split is offered when not already split;
@@ -7311,6 +7318,11 @@ impl App {
                 };
                 self.poke_cursor();
                 self.collapse_split_if_empty();
+                true
+            }
+            // Cmd+K U: close all saved (non-dirty) editor tabs.
+            KeyCode::Char(c) if plain && c.eq_ignore_ascii_case(&'u') => {
+                self.close_saved_tabs();
                 true
             }
             _ => false,
@@ -16362,6 +16374,7 @@ impl App {
                 self.poke_cursor();
                 self.collapse_split_if_empty();
             }
+            MenuAction::CloseSavedTabs => self.close_saved_tabs(),
             MenuAction::SplitEditor => self.split_editor(),
             MenuAction::FocusGroupLeft => self.focus_editor_group(true),
             MenuAction::FocusGroupRight => self.focus_editor_group(false),
@@ -16452,6 +16465,25 @@ impl App {
             MenuAction::SetTheme(theme) => self.apply_theme(theme),
             MenuAction::ToggleExplorerView(view) => self.toggle_explorer_view(view),
         }
+    }
+
+    /// Close every saved (non-dirty) editor tab, keeping any with unsaved
+    /// changes. Shared by the tab context menu and the `Cmd+K U` chord so both
+    /// surfaces produce the same status line and split-collapse behavior.
+    fn close_saved_tabs(&mut self) {
+        let removed = self.editor.close_saved();
+        if removed == 0 {
+            self.status = String::from("No saved tabs to close");
+            return;
+        }
+        self.sync_open_file_poll_mtime();
+        self.status = if removed == 1 {
+            String::from("Closed 1 saved tab")
+        } else {
+            format!("Closed {removed} saved tabs")
+        };
+        self.poke_cursor();
+        self.collapse_split_if_empty();
     }
 
     /// Reveal `path` in macOS Finder by spawning `open -R`, which selects the
