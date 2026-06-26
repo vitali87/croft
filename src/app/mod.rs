@@ -589,6 +589,10 @@ enum MenuAction {
     /// clipboard (VS Code's "Copy Path"). Available wherever the tab is backed
     /// by a real on-disk path, local or remote.
     CopyTabPath(PathBuf),
+    /// Reveal the right-clicked editor tab's file in the Explorer tree:
+    /// expand its parent folders, select its row, and focus the Explorer.
+    /// Mirrors VS Code's "Reveal in Explorer View". Works local and remote.
+    RevealInExplorer(PathBuf),
     /// Reveal the path in macOS Finder via `open -R`. Local-macOS only:
     /// on a remote SSH session croft runs on the headless host where no
     /// Finder exists, so the menu omits this entry entirely rather than
@@ -718,6 +722,7 @@ fn shortcut_for(action: &MenuAction) -> Option<&'static str> {
         MenuAction::MakeRoot(_) => Some("⌘/"),
         MenuAction::RevealInFinder(_) => Some("⌥⌘R"),
         MenuAction::CopyTabPath(_) => Some("⌥⌘C"),
+        MenuAction::RevealInExplorer(_) => Some("⌘K E"),
         MenuAction::Delete { .. } => Some("⌫"),
         MenuAction::CloseTab(_) => Some("⌘W"),
         MenuAction::CloseOtherTabs(_) => Some("⌥⌘T"),
@@ -851,6 +856,14 @@ fn build_tab_context_menu_items(
         items.push((
             String::from("Reveal in Finder"),
             MenuAction::RevealInFinder(path.to_path_buf()),
+        ));
+    }
+    // Reveal in Explorer View: select the file in croft's own tree. The tree
+    // exists local and remote, so this is gated only on a real path.
+    if let Some(path) = clicked {
+        items.push((
+            String::from("Reveal in Explorer View"),
+            MenuAction::RevealInExplorer(path.to_path_buf()),
         ));
     }
     // Editor-group actions: split is offered when not already split;
@@ -7348,6 +7361,15 @@ impl App {
             // Cmd+K U: close all saved (non-dirty) editor tabs.
             KeyCode::Char(c) if plain && c.eq_ignore_ascii_case(&'u') => {
                 self.close_saved_tabs();
+                true
+            }
+            // Cmd+K E: reveal the active file in the Explorer tree.
+            KeyCode::Char(c) if plain && c.eq_ignore_ascii_case(&'e') => {
+                if let Some(path) = self.editor.path.clone() {
+                    self.reveal_in_explorer(path);
+                } else {
+                    self.status = String::from("Reveal in Explorer View: no active file");
+                }
                 true
             }
             _ => false,
@@ -16379,6 +16401,7 @@ impl App {
             }
             MenuAction::RevealInFinder(path) => self.reveal_in_finder(path),
             MenuAction::CopyTabPath(path) => self.copy_path_to_clipboard(path),
+            MenuAction::RevealInExplorer(path) => self.reveal_in_explorer(path),
             MenuAction::CloseTab(idx) => {
                 if self.editor.close_tab(idx) {
                     self.sync_open_file_poll_mtime();
@@ -16544,6 +16567,25 @@ impl App {
             format!("Copied path: {text}")
         } else {
             String::from("Could not copy path to clipboard")
+        };
+    }
+
+    /// Reveal `path` (an editor tab's file) in the Explorer tree: switch the
+    /// side bar to the Explorer, expand the file's parent folders, select its
+    /// row, and focus the tree. Shared by the tab context menu and the
+    /// `Cmd+K E` chord. Matches VS Code's "Reveal in Explorer View".
+    fn reveal_in_explorer(&mut self, path: PathBuf) {
+        self.set_sidebar_view(SidebarView::Explorer);
+        let found = self.tree.reveal_path(&path);
+        self.focus_pane(Pane::Tree);
+        self.status = if found {
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.display().to_string());
+            format!("Revealed {name} in Explorer")
+        } else {
+            String::from("File is outside the workspace")
         };
     }
 

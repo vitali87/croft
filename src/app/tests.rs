@@ -4657,6 +4657,14 @@ fn shortcut_for_returns_expected_shortcuts_for_each_explorer_action() {
         shortcut_for(&MenuAction::EditBreakpointConditionAt { line: 0 }),
         Some("⇧F9")
     );
+    // Editor tab-menu actions: Close Saved and Reveal in Explorer View are
+    // Cmd+K chords; Copy Path is a standalone Cmd+Opt chord.
+    assert_eq!(shortcut_for(&MenuAction::CloseSavedTabs), Some("⌘K U"));
+    assert_eq!(shortcut_for(&MenuAction::CopyTabPath(p.clone())), Some("⌥⌘C"));
+    assert_eq!(
+        shortcut_for(&MenuAction::RevealInExplorer(p.clone())),
+        Some("⌘K E")
+    );
 }
 
 #[test]
@@ -11056,6 +11064,7 @@ fn build_tab_context_menu_items_includes_reveal_in_finder_only_with_a_path_and_e
             "Close All",
             "Copy Path",
             "Reveal in Finder",
+            "Reveal in Explorer View",
             "Split Editor Right"
         ],
     );
@@ -11069,6 +11078,29 @@ fn build_tab_context_menu_items_includes_reveal_in_finder_only_with_a_path_and_e
 }
 
 #[test]
+fn build_tab_context_menu_items_offers_reveal_in_explorer_for_any_path() {
+    let p = std::path::Path::new("/tmp/demo.rs");
+    // Reveal in Explorer View targets croft's own tree, present local and
+    // remote, so it shows for any path-bearing tab even when Finder is withheld.
+    let remote = build_tab_context_menu_items(0, 1, false, Some(p), false);
+    let labels: Vec<&str> = remote.iter().map(|(s, _)| s.as_str()).collect();
+    assert_eq!(
+        labels,
+        [
+            "Close",
+            "Close All",
+            "Copy Path",
+            "Reveal in Explorer View",
+            "Split Editor Right"
+        ]
+    );
+    assert!(matches!(&remote[3].1, MenuAction::RevealInExplorer(rp) if rp == p));
+    // A blank/untitled buffer (no path) has nothing to reveal.
+    let blank = build_tab_context_menu_items(0, 1, false, None, true);
+    assert!(blank.iter().all(|(s, _)| s != "Reveal in Explorer View"));
+}
+
+#[test]
 fn build_tab_context_menu_items_offers_copy_path_for_any_path_local_or_remote() {
     let p = std::path::Path::new("/tmp/demo.rs");
     // Copy Path is a clipboard write, so it shows for a path-bearing tab even
@@ -11077,7 +11109,13 @@ fn build_tab_context_menu_items_offers_copy_path_for_any_path_local_or_remote() 
     let labels: Vec<&str> = remote.iter().map(|(s, _)| s.as_str()).collect();
     assert_eq!(
         labels,
-        ["Close", "Close All", "Copy Path", "Split Editor Right"]
+        [
+            "Close",
+            "Close All",
+            "Copy Path",
+            "Reveal in Explorer View",
+            "Split Editor Right"
+        ]
     );
     assert!(matches!(&remote[2].1, MenuAction::CopyTabPath(cp) if cp == p));
     // A blank/untitled buffer (no path) has nothing to copy.
