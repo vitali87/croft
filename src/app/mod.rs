@@ -24,6 +24,7 @@ use std::time::Duration;
 
 mod click;
 mod cursor_blink;
+mod editor_layout;
 mod fs_watch;
 mod git_worker;
 mod hover;
@@ -1170,7 +1171,7 @@ pub struct App {
     /// The Extensions side panel: bundled + installed extensions with toggles.
     pub extensions: crate::widgets::extensions::ExtensionsPanel,
     /// The Explorer's OPEN EDITORS section: the open editor tabs, projected
-    /// from `editor`/`editor_split` each frame. See [`OpenEditorsPanel`].
+    /// from the active `editor` group each frame. See [`OpenEditorsPanel`].
     pub open_editors: OpenEditorsPanel,
     /// The Explorer's OUTLINE section, stacked below the file tree: the active
     /// editor's `documentSymbol` tree. See [`OutlinePanel`].
@@ -1217,20 +1218,13 @@ pub struct App {
     /// is reported as "canceled" rather than "no speech detected".
     voice_canceling: bool,
     pub editor: EditorTabs,
-    /// The secondary editor group, shown side by side with `editor` when
-    /// the user splits the pane (`Cmd+\`). `None` = not split. Invariant:
-    /// `editor` is ALWAYS the focused group, so the 430-odd `self.editor`
-    /// call sites keep operating on whichever pane has focus. Moving focus
-    /// to the other group `mem::swap`s the two so the invariant holds.
-    pub editor_split: Option<EditorTabs>,
-    /// While split, `true` when the focused group (`editor`) occupies the
-    /// LEFT column and `editor_split` the right. A focus swap flips this so
-    /// the physical columns stay put. Meaningless when not split.
-    split_focus_left: bool,
-    /// Pinned width in cells of the LEFT editor column while split. `None`
-    /// = even 50/50 split. Set by dragging the seam between the two panes;
-    /// mirrors `sidebar_width` / `terminal_height`.
-    editor_split_left_width: Option<u16>,
+    /// The editor group layout tree. `editor` (above) is ALWAYS the active
+    /// (focused) group, hoisted out of the tree's single active leaf, so the
+    /// 430-odd `self.editor` call sites keep operating on whichever group has
+    /// focus. The tree holds every OTHER group plus the spatial split
+    /// structure; a single unsplit leaf is the just-launched state. Splitting,
+    /// moving focus, and collapsing all go through [`editor_layout`].
+    pub editor_layout: editor_layout::EditorLayout,
     /// One-shot latch armed when a save is refused because the file changed
     /// on disk. The next `save()` overwrites anyway, giving the user a
     /// "press Cmd+S again to overwrite" escape hatch without a modal.
@@ -1946,9 +1940,7 @@ impl App {
             voice_handle: None,
             voice_canceling: false,
             editor,
-            editor_split: None,
-            split_focus_left: true,
-            editor_split_left_width: None,
+            editor_layout: editor_layout::EditorLayout::single(),
             force_save_armed: false,
             terminals: vec![term],
             active_terminal: 0,
@@ -3225,10 +3217,10 @@ impl App {
                 self.editor
                     .apply_semantic_tokens(path.clone(), data.clone(), legend.clone(), true);
             }
-            if let Some(split) = self.editor_split.as_mut()
-                && split.path.as_deref() == Some(path.as_path())
-            {
-                split.apply_semantic_tokens(path, data, legend, true);
+            for group in self.editor_layout.inactive_groups_mut() {
+                if group.path.as_deref() == Some(path.as_path()) {
+                    group.apply_semantic_tokens(path.clone(), data.clone(), legend.clone(), true);
+                }
             }
         }
     }
@@ -3679,32 +3671,33 @@ impl App {
                 );
                 changed = true;
             }
-            if let Some(split) = self.editor_split.as_mut()
-                && split.path.as_deref() == Some(u.path.as_path())
-            {
-                split.apply_semantic_tokens(
-                    u.path.clone(),
-                    u.data.clone(),
-                    u.legend.clone(),
-                    u.is_full,
-                );
-                changed = true;
+            for group in self.editor_layout.inactive_groups_mut() {
+                if group.path.as_deref() == Some(u.path.as_path()) {
+                    group.apply_semantic_tokens(
+                        u.path.clone(),
+                        u.data.clone(),
+                        u.legend.clone(),
+                        u.is_full,
+                    );
+                    changed = true;
+                }
             }
             // Persist whole-document batches so the next open of this exact
             // content paints these colours instantly instead of waiting out the
             // server's cold analysis. Only when a visible editor holds the file
             // unchanged, so the cache key matches the bytes the next open reads.
             if u.is_full {
-                let clean_text = (self.editor.path.as_deref() == Some(u.path.as_path()))
+                let mut clean_text = (self.editor.path.as_deref() == Some(u.path.as_path()))
                     .then(|| self.editor.clean_cache_text())
-                    .flatten()
-                    .or_else(|| {
-                        self.editor_split.as_ref().and_then(|s| {
-                            (s.path.as_deref() == Some(u.path.as_path()))
-                                .then(|| s.clean_cache_text())
-                                .flatten()
-                        })
-                    });
+                    .flatten();
+                if clean_text.is_none() {
+                    clean_text = self
+                        .editor_layout
+                        .inactive_groups_mut()
+                        .into_iter()
+                        .find(|g| g.path.as_deref() == Some(u.path.as_path()))
+                        .and_then(|g| g.clean_cache_text());
+                }
                 if let Some(text) = clean_text {
                     crate::lsp::semantic_cache::store(&u.path, &text, &u.legend, &u.data);
                 }
@@ -3759,17 +3752,25 @@ impl App {
                 changed = true;
             }
         }
-        // Same for the split group, computed without overlapping borrows.
-        let split_target = self.editor_split.as_ref().and_then(|s| {
-            let p = s.path.clone()?;
-            let stale = s.diagnostics_path() != Some(p.as_path());
-            (stale || touched.contains(&p)).then_some(p)
-        });
-        if let Some(path) = split_target {
+        // Same for every inactive group, computed without overlapping borrows.
+        let mut split_targets: Vec<PathBuf> = self
+            .editor_layout
+            .inactive_groups_mut()
+            .into_iter()
+            .filter_map(|s| {
+                let p = s.path.clone()?;
+                let stale = s.diagnostics_path() != Some(p.as_path());
+                (stale || touched.contains(&p)).then_some(p)
+            })
+            .collect();
+        split_targets.dedup();
+        for path in split_targets {
             let merged = self.merged_diagnostics(&path);
-            if let Some(split) = self.editor_split.as_mut() {
-                split.apply_diagnostics(path, merged);
-                changed = true;
+            for group in self.editor_layout.inactive_groups_mut() {
+                if group.path.as_deref() == Some(path.as_path()) {
+                    group.apply_diagnostics(path.clone(), merged.clone());
+                    changed = true;
+                }
             }
         }
         changed
@@ -3838,10 +3839,10 @@ impl App {
         if let Some(p) = self.editor.path.clone() {
             paths.push(p);
         }
-        if let Some(split) = self.editor_split.as_ref()
-            && let Some(p) = split.path.clone()
-        {
-            paths.push(p);
+        for group in self.editor_layout.inactive_groups() {
+            if let Some(p) = group.path.clone() {
+                paths.push(p);
+            }
         }
         for p in paths {
             if self.lsp_last_seen.contains_key(&p) {
@@ -5983,11 +5984,11 @@ impl App {
         self.extensions.focused =
             self.focus == Pane::Tree && self.sidebar_view == SidebarView::Extensions;
         self.editor.focused = self.focus == Pane::Editor;
-        // The split group is by definition the NON-focused editor group,
-        // so its border never lights up even while the editor pane holds
-        // focus. `editor` (the focused group) carries the highlight.
-        if let Some(split) = self.editor_split.as_mut() {
-            split.focused = false;
+        // Inactive groups are by definition NOT the focused editor group, so
+        // their borders never light up even while the editor pane holds focus.
+        // `editor` (the active group) carries the highlight.
+        for group in self.editor_layout.inactive_groups_mut() {
+            group.focused = false;
         }
         let focused_pane = self.focus == Pane::Terminal;
         let active = self.active_terminal;
@@ -6010,8 +6011,8 @@ impl App {
             ed.pdf_viewer_enabled = pdf_on;
             ed.csv_viewer_enabled = csv_on;
         }
-        if let Some(split) = self.editor_split.as_mut() {
-            for ed in split.editors.iter_mut() {
+        for group in self.editor_layout.inactive_groups_mut() {
+            for ed in group.editors.iter_mut() {
                 ed.focus_gradient = gradient;
                 ed.theme = self.theme;
                 ed.pdf_viewer_enabled = pdf_on;
@@ -6061,7 +6062,7 @@ impl App {
     /// column. No-op if already split or the active tab has no path on
     /// disk (a blank/unsaved buffer has nothing to mirror).
     fn split_editor(&mut self) {
-        if self.editor_split.is_some() {
+        if self.editor_layout.is_split() {
             return;
         }
         let Some(path) = self.editor.path.clone() else {
@@ -6084,50 +6085,54 @@ impl App {
         // sub-line offset) so the duplicate opens exactly where the
         // source was rather than at the top of the file.
         group.copy_view_position_from(&self.editor);
-        // The existing group stays in the LEFT column; the new focused
-        // group renders on the RIGHT, so `editor` (always the focused
-        // group) is the right column → `split_focus_left = false`.
-        self.editor_split = Some(std::mem::replace(&mut self.editor, group));
-        self.split_focus_left = false;
-        self.editor_split_left_width = None;
+        // The existing group settles into the LEFT leaf; the new focused group
+        // (now in `self.editor`, always the active leaf) renders on the RIGHT.
+        // `new_after = true` puts the new active group after the existing one.
+        let existing = std::mem::replace(&mut self.editor, group);
+        self.editor_layout
+            .split_active(existing, editor_layout::SplitDir::Horizontal, true);
         self.focus_pane(Pane::Editor);
     }
 
     /// Move keyboard focus to the editor group in the given physical
-    /// column (`true` = left, `false` = right). Swaps `editor` and
-    /// `editor_split` so the focused group is always `editor`, keeping the
-    /// physical columns fixed. No-op when not split or already focused
+    /// column (`true` = left, `false` = right). Hoists the active group
+    /// through `editor_layout` so the focused group is always `editor`, keeping
+    /// the physical columns fixed. No-op when not split or already focused
     /// there.
     fn focus_editor_group(&mut self, want_left: bool) {
-        if self.editor_split.is_none() || self.split_focus_left == want_left {
-            // Still ensure the editor pane has focus even if the side is
-            // already correct, so the chord doubles as "focus editor".
-            if self.editor_split.is_some() && self.focus != Pane::Editor {
+        if !self.editor_layout.is_split() {
+            return;
+        }
+        // Physical columns map to depth-first leaf order: leftmost = 0,
+        // rightmost = last. Hoist the active group out and pull the target
+        // leaf's group into `self.editor` so the invariant holds.
+        let target = if want_left {
+            0
+        } else {
+            self.editor_layout.leaf_count() - 1
+        };
+        if self.editor_layout.active_dfs_index() == target {
+            // Already focused there; the chord still doubles as "focus editor".
+            if self.focus != Pane::Editor {
                 self.focus_pane(Pane::Editor);
             }
             return;
         }
-        if let Some(split) = self.editor_split.as_mut() {
-            std::mem::swap(&mut self.editor, split);
-        }
-        self.split_focus_left = want_left;
+        let current = std::mem::take(&mut self.editor);
+        self.editor = self.editor_layout.refocus_to_dfs(current, target);
         self.focus_pane(Pane::Editor);
     }
 
     /// After a tab close, collapse the split if the focused group ran out
     /// of real tabs. The surviving (other) group becomes the sole editor.
     fn collapse_split_if_empty(&mut self) {
-        if self.editor_split.is_none() || !self.editor.is_blank_initial() {
+        if !self.editor_layout.is_split() || !self.editor.is_blank_initial() {
             return;
         }
-        // The focused group is empty; promote the other group to be the
-        // single editor and tear the split down. Evict the right slot's
-        // image so it can't ghost after the column disappears.
-        if let Some(other) = self.editor_split.take() {
-            self.editor = other;
-        }
-        self.split_focus_left = true;
-        self.editor_split_left_width = None;
+        // The focused group is empty; drop it and promote a surviving group to
+        // become the new active editor. Evict the right slot's image so it
+        // can't ghost after the column disappears.
+        self.editor = self.editor_layout.collapse_active();
         self.editor_splitter_x = None;
         self.disable_editor_image(1);
         // Focus stays on the editor pane; just re-light the promoted
@@ -6304,7 +6309,7 @@ impl App {
                 SidebarView::Extensions => frame.render_widget(&mut self.extensions, usable_area),
             }
         }
-        if self.editor_split.is_none() && self.editor.is_blank_initial() {
+        if !self.editor_layout.is_split() && self.editor.is_blank_initial() {
             self.render_welcome(frame, editor_area);
             // The previous frame may have rendered an image-preview tab
             // whose OSC-1337 pixels are still cached in iTerm's image
@@ -6335,51 +6340,53 @@ impl App {
             // mirroring the terminal pane buttons' hover affordance.
             let pointer = self.pointer_cell;
             self.editor.hover_pointer = pointer;
-            if let Some(split) = self.editor_split.as_mut() {
-                split.hover_pointer = pointer;
-            }
-            // Render either a single editor group or two side-by-side
-            // columns, and report which column has focus so the
-            // completion / hover popups anchor there.
-            let focused_area = if self.editor_split.is_some() {
-                let total = editor_area.width;
-                let max_left = total.saturating_sub(EDITOR_SPLIT_MIN).max(EDITOR_SPLIT_MIN);
-                let left_w = self
-                    .editor_split_left_width
-                    .unwrap_or(total / 2)
-                    .clamp(EDITOR_SPLIT_MIN, max_left);
-                let cols = Layout::default()
-                    .direction(Direction::Horizontal)
-                    .constraints([
-                        Constraint::Length(left_w),
-                        Constraint::Min(EDITOR_SPLIT_MIN),
-                    ])
-                    .split(editor_area);
-                let (left_area, right_area) = (cols[0], cols[1]);
-                // The seam sits on the right column's left border; that
-                // single column is the drag hit target.
-                self.editor_splitter_x = Some(right_area.x);
-                // `editor` is always the focused group; `split_focus_left`
-                // says which physical column it occupies.
-                if self.split_focus_left {
-                    frame.render_widget(&mut self.editor, left_area);
-                    if let Some(split) = self.editor_split.as_mut() {
-                        frame.render_widget(split, right_area);
-                    }
-                } else {
-                    if let Some(split) = self.editor_split.as_mut() {
-                        frame.render_widget(split, left_area);
-                    }
-                    frame.render_widget(&mut self.editor, right_area);
+            // Render the editor group layout tree. The active group is hoisted
+            // into `self.editor`; every other group lives in `editor_layout`.
+            // Lay the leaves out and paint each at its rect (depth-first order),
+            // reporting the active group's rect so popups anchor there.
+            let rects = self.editor_layout.leaf_rects(editor_area, EDITOR_SPLIT_MIN);
+            let active_idx = self.editor_layout.active_dfs_index();
+            let focused_area = if self.editor_layout.is_split() {
+                let active_area = rects[active_idx];
+                frame.render_widget(&mut self.editor, active_area);
+                let inactive_rects: Vec<Rect> = rects
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| *i != active_idx)
+                    .map(|(_, r)| *r)
+                    .collect();
+                for (group, rect) in self
+                    .editor_layout
+                    .inactive_groups_mut()
+                    .into_iter()
+                    .zip(inactive_rects)
+                {
+                    group.hover_pointer = pointer;
+                    frame.render_widget(group, rect);
                 }
-                // Image overlays are keyed by physical column.
-                self.update_editor_image_overlay(0, left_area);
-                self.update_editor_image_overlay(1, right_area);
-                if self.split_focus_left {
-                    left_area
+                // A single vertical seam is the drag target — the only split
+                // shape this stage builds. Its X is the right column's left edge.
+                self.editor_splitter_x = if rects.len() == 2
+                    && matches!(
+                        self.editor_layout.root(),
+                        editor_layout::LayoutNode::Split {
+                            dir: editor_layout::SplitDir::Horizontal,
+                            ..
+                        }
+                    ) {
+                    Some(rects[1].x)
                 } else {
-                    right_area
+                    None
+                };
+                // Image overlays stay keyed by physical column (0 = left).
+                if rects.len() == 2 {
+                    self.update_editor_image_overlay(0, rects[0]);
+                    self.update_editor_image_overlay(1, rects[1]);
+                } else {
+                    self.update_editor_image_overlay(0, active_area);
+                    self.disable_editor_image(1);
                 }
+                active_area
             } else {
                 frame.render_widget(&mut self.editor, editor_area);
                 self.editor_splitter_x = None;
@@ -14800,15 +14807,14 @@ impl App {
         // the rest of this handler - which all reads `self.editor` - then
         // operates on the clicked group. The swap keeps the physical
         // columns fixed.
-        if self.editor_split.is_some()
-            && matches!(m.kind, MouseEventKind::Down(_))
+        if matches!(m.kind, MouseEventKind::Down(_))
+            && self.editor_layout.is_split()
             && self.editor_splitter_x != Some(m.column)
-            && self
-                .editor_split
-                .as_ref()
-                .is_some_and(|s| rect_contains(s.last_full_area, m.column, m.row))
+            && let Some(target) = self.editor_layout.inactive_dfs_index_at(m.column, m.row)
         {
-            self.focus_editor_group(!self.split_focus_left);
+            let current = std::mem::take(&mut self.editor);
+            self.editor = self.editor_layout.refocus_to_dfs(current, target);
+            self.focus_pane(Pane::Editor);
         }
 
         // Hit-test the side panel against the ACTIVE widget's last_area
@@ -14929,7 +14935,7 @@ impl App {
                     let items = build_tab_context_menu_items(
                         tab_idx,
                         self.editor.tab_count(),
-                        self.editor_split.is_some(),
+                        self.editor_layout.is_split(),
                         tab_path.as_deref(),
                         !self.is_remote && cfg!(target_os = "macos"),
                         self.editor.is_preview(tab_idx),
@@ -16704,24 +16710,26 @@ impl App {
 
     /// The editor group occupying physical column `side` (0 = left,
     /// 1 = right). When not split only side 0 exists. `editor` is always
-    /// the focused group, so which physical column it sits in depends on
-    /// `split_focus_left`.
+    /// the active group, so which physical column it sits in depends on the
+    /// active leaf's depth-first index in `editor_layout`.
     fn group_on_side(&self, side: usize) -> Option<&EditorTabs> {
-        match &self.editor_split {
-            None => (side == 0).then_some(&self.editor),
-            Some(split) => Some(if (side == 0) == self.split_focus_left {
-                &self.editor
-            } else {
-                split
-            }),
+        if !self.editor_layout.is_split() {
+            return (side == 0).then_some(&self.editor);
+        }
+        // Physical column maps directly to depth-first leaf index in the
+        // two-column layout. The active group is hoisted into `self.editor`.
+        if side == self.editor_layout.active_dfs_index() {
+            Some(&self.editor)
+        } else {
+            self.editor_layout.group_ref_at_dfs(side)
         }
     }
 
-    /// Physical overlay-slot index of the focused group: 0 when unsplit or
-    /// focused-left, 1 when focused-right.
+    /// Physical overlay-slot index of the focused group: its depth-first leaf
+    /// index (0 when unsplit or focused-left, 1 when focused-right).
     fn focused_image_side(&self) -> usize {
-        if self.editor_split.is_some() && !self.split_focus_left {
-            1
+        if self.editor_layout.is_split() {
+            self.editor_layout.active_dfs_index()
         } else {
             0
         }
@@ -16798,15 +16806,12 @@ impl App {
         // disjoint-field borrow from `self.overlays`); the borrow ends at
         // the last use inside the bake, before we store into the slot.
         let baked = {
-            let Some(image) = (match &self.editor_split {
-                None => self.editor.image.as_ref(),
-                Some(split) => {
-                    if (side == 0) == self.split_focus_left {
-                        self.editor.image.as_ref()
-                    } else {
-                        split.image.as_ref()
-                    }
-                }
+            let Some(image) = (if side == self.focused_image_side() {
+                self.editor.image.as_ref()
+            } else {
+                self.editor_layout
+                    .group_ref_at_dfs(side)
+                    .and_then(|g| g.image.as_ref())
             }) else {
                 return;
             };
@@ -17083,13 +17088,15 @@ impl App {
                 self.terminal_height = Some(new_h.clamp(TERMINAL_HEIGHT_MIN, max_h));
             }
             SplitterDrag::EditorSplit => {
-                if self.editor_split.is_none() {
+                if !self.editor_layout.is_split() {
                     return;
                 }
                 // The editor area starts after the activity bar and (when
                 // shown) the sidebar. The pointer column minus that left
                 // edge is the new left-column width; the seam carries no
-                // dedicated cell so left + right == total editor width.
+                // dedicated cell so left + right == total editor width. Pin the
+                // split's child weights to those cell counts so the layout
+                // reproduces the dragged split at the current width.
                 let editor_left = ACTIVITY_BAR_WIDTH
                     + if self.show_tree {
                         self.sidebar_width
@@ -17097,9 +17104,13 @@ impl App {
                         0
                     };
                 let total = self.last_content_width;
-                let new_left = column.saturating_sub(editor_left);
                 let max_left = total.saturating_sub(EDITOR_SPLIT_MIN).max(EDITOR_SPLIT_MIN);
-                self.editor_split_left_width = Some(new_left.clamp(EDITOR_SPLIT_MIN, max_left));
+                let new_left = column
+                    .saturating_sub(editor_left)
+                    .clamp(EDITOR_SPLIT_MIN, max_left);
+                let new_right = total.saturating_sub(new_left).max(1);
+                self.editor_layout
+                    .set_root_split_weights(new_left, new_right);
             }
         }
     }

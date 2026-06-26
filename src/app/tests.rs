@@ -12121,11 +12121,12 @@ fn split_editor_duplicates_active_file_into_a_focused_right_group() {
     app.split_editor();
 
     assert!(
-        app.editor_split.is_some(),
+        app.editor_layout.is_split(),
         "split must create a second group"
     );
-    assert!(
-        !app.split_focus_left,
+    assert_eq!(
+        app.editor_layout.active_dfs_index(),
+        1,
         "the new (focused) group lands in the RIGHT column, mirroring VS Code"
     );
     // `editor` is always the focused group: it is the new right duplicate.
@@ -12144,10 +12145,8 @@ fn split_editor_duplicates_active_file_into_a_focused_right_group() {
         "the new group holds exactly the file, with no stray blank tab"
     );
     // The original group survives in the left column.
-    assert_eq!(
-        app.editor_split.as_ref().unwrap().path.as_deref(),
-        Some(path.as_path())
-    );
+    let groups = app.editor_layout.inactive_groups();
+    assert_eq!(groups[0].path.as_deref(), Some(path.as_path()));
 }
 
 #[test]
@@ -12157,7 +12156,7 @@ fn split_editor_refuses_a_blank_unsaved_buffer() {
     app.focus_pane(Pane::Editor);
     app.split_editor();
     assert!(
-        app.editor_split.is_none(),
+        !app.editor_layout.is_split(),
         "a blank buffer has no path to mirror, so split is refused"
     );
 }
@@ -12182,7 +12181,8 @@ fn opening_a_file_in_the_split_replaces_the_duplicate_instead_of_stacking() {
     );
     assert_eq!(app.editor.path.as_deref(), Some(b.as_path()));
     // The left column is untouched, giving a true side-by-side of two files.
-    let left = app.editor_split.as_ref().unwrap();
+    let groups = app.editor_layout.inactive_groups();
+    let left = groups[0];
     assert_eq!(left.tab_count(), 1);
     assert_eq!(
         left.path.as_deref(),
@@ -12196,12 +12196,13 @@ fn focus_editor_group_swaps_focus_but_keeps_physical_columns_fixed() {
     let mut app = app_with_open_file(tmp.path(), "a.txt", "left-original");
     let original = app.editor.path.clone().unwrap();
     app.split_editor(); // focus now on the right duplicate
-    assert!(!app.split_focus_left);
+    assert_eq!(app.editor_layout.active_dfs_index(), 1);
 
     // Move focus to the LEFT group (the original).
     app.focus_editor_group(true);
-    assert!(
-        app.split_focus_left,
+    assert_eq!(
+        app.editor_layout.active_dfs_index(),
+        0,
         "focusing left makes the focused group the left column"
     );
     assert_eq!(
@@ -12210,13 +12211,13 @@ fn focus_editor_group_swaps_focus_but_keeps_physical_columns_fixed() {
         "after the swap `editor` is the original left group"
     );
     assert!(
-        app.editor.focused && !app.editor_split.as_ref().unwrap().focused,
+        app.editor.focused && !app.editor_layout.inactive_groups()[0].focused,
         "only the focused group's border lights up"
     );
 
     // Move focus back to the RIGHT group.
     app.focus_editor_group(false);
-    assert!(!app.split_focus_left);
+    assert_eq!(app.editor_layout.active_dfs_index(), 1);
     assert_eq!(
         app.editor.path.as_deref(),
         Some(original.as_path()),
@@ -12230,7 +12231,7 @@ fn closing_last_tab_in_focused_group_collapses_the_split() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = app_with_open_file(tmp.path(), "a.txt", "body");
     app.split_editor();
-    assert!(app.editor_split.is_some());
+    assert!(app.editor_layout.is_split());
 
     // Cmd+W closes the focused group's only tab -> the group empties and
     // the split collapses back to the surviving column.
@@ -12238,11 +12239,12 @@ fn closing_last_tab_in_focused_group_collapses_the_split() {
         .unwrap();
 
     assert!(
-        app.editor_split.is_none(),
+        !app.editor_layout.is_split(),
         "emptying the focused group collapses the split"
     );
-    assert!(
-        app.split_focus_left,
+    assert_eq!(
+        app.editor_layout.active_dfs_index(),
+        0,
         "the collapsed state resets to the single-column default"
     );
     assert_eq!(app.editor_splitter_x, None);
