@@ -11223,6 +11223,71 @@ fn copy_path_key_is_opt_cmd_c_and_disjoint_from_copy_and_relative_path() {
 }
 
 #[test]
+fn cmd_k_enter_keeps_the_active_preview_tab_open() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let f = tmp.path().join("a.rs");
+    std::fs::write(&f, "x").unwrap();
+    app.editor.open_preview(&f).unwrap();
+    let idx = app.editor.active_index();
+    assert!(app.editor.is_preview(idx), "opened as a preview tab");
+    app.handle_key(key(KeyCode::Char('k'), KeyModifiers::SUPER))
+        .unwrap();
+    assert!(app.cmd_k_leader.is_some(), "Cmd+K arms the chord leader");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert!(
+        !app.editor.is_preview(app.editor.active_index()),
+        "Cmd+K Enter (Keep Open) promoted the preview tab"
+    );
+}
+
+#[test]
+fn cmd_k_shift_enter_pins_then_unpins_the_active_tab() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let f = tmp.path().join("a.rs");
+    std::fs::write(&f, "x").unwrap();
+    app.editor.open_pinned(&f).unwrap();
+    app.handle_key(key(KeyCode::Char('k'), KeyModifiers::SUPER))
+        .unwrap();
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::SHIFT))
+        .unwrap();
+    assert!(
+        app.editor.is_pinned(app.editor.active_index()),
+        "Cmd+K Shift+Enter pins the active tab"
+    );
+    app.handle_key(key(KeyCode::Char('k'), KeyModifiers::SUPER))
+        .unwrap();
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::SHIFT))
+        .unwrap();
+    assert!(
+        !app.editor.is_pinned(app.editor.active_index()),
+        "a second Cmd+K Shift+Enter unpins it"
+    );
+}
+
+#[test]
+fn relative_clipboard_text_is_relative_inside_root_and_absolute_outside() {
+    use std::path::Path;
+    // Inside the workspace root: drop the root prefix.
+    assert_eq!(
+        relative_clipboard_text(Path::new("/ws/src/a.rs"), Path::new("/ws")),
+        "src/a.rs"
+    );
+    // Outside the root: fall back to the absolute path, never a `../` walk.
+    assert_eq!(
+        relative_clipboard_text(Path::new("/other/a.rs"), Path::new("/ws")),
+        "/other/a.rs"
+    );
+    // The root itself relativizes to empty.
+    assert_eq!(
+        relative_clipboard_text(Path::new("/ws"), Path::new("/ws")),
+        ""
+    );
+}
+
+#[test]
 fn zoxide_jump_key_is_cmd_z_only_and_never_ctrl_z_or_redo() {
     // Cmd+Z (SUPER) opens the Explorer jump popup. Ctrl+Z must NOT — it
     // is the shell suspend in the terminal, and the editor's undo lives on

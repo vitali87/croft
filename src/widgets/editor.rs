@@ -10282,6 +10282,137 @@ mod tests {
     }
 
     #[test]
+    fn keep_open_promotes_a_preview_tab_and_returns_true() {
+        let mut t = EditorTabs::new();
+        t.editors[0].path = Some(std::path::PathBuf::from("/a"));
+        t.editors[0].preview = true;
+        assert!(t.is_preview(0));
+        assert!(t.keep_open(0), "promoting a preview tab returns true");
+        assert!(!t.is_preview(0), "the tab is no longer the preview slot");
+    }
+
+    #[test]
+    fn keep_open_is_a_noop_on_an_already_permanent_tab() {
+        let mut t = EditorTabs::new();
+        t.editors[0].path = Some(std::path::PathBuf::from("/a"));
+        t.editors[0].preview = false;
+        assert!(
+            !t.keep_open(0),
+            "a permanent tab returns false (nothing to promote)"
+        );
+    }
+
+    #[test]
+    fn keep_open_out_of_range_is_false() {
+        let mut t = EditorTabs::new();
+        assert!(!t.keep_open(99));
+    }
+
+    #[test]
+    fn keep_open_only_affects_the_target_tab() {
+        let mut t = EditorTabs::new();
+        t.editors[0].path = Some(std::path::PathBuf::from("/a"));
+        t.editors[0].preview = true;
+        t.add_tab_with_path(std::path::PathBuf::from("/b"));
+        t.editors[1].preview = true;
+        t.keep_open(0);
+        assert!(!t.is_preview(0));
+        assert!(t.is_preview(1), "the sibling's preview flag is untouched");
+    }
+
+    #[test]
+    fn is_preview_and_is_pinned_are_false_out_of_range() {
+        let t = EditorTabs::new();
+        assert!(!t.is_preview(99));
+        assert!(!t.is_pinned(99));
+    }
+
+    #[test]
+    fn toggle_pin_clears_the_preview_flag_when_pinning() {
+        let mut t = EditorTabs::new();
+        t.editors[0].path = Some(std::path::PathBuf::from("/a"));
+        t.editors[0].preview = true;
+        assert!(t.toggle_pin(0), "pinning returns the new state = true");
+        assert!(t.is_pinned(0));
+        assert!(!t.is_preview(0), "a pinned tab is never the preview slot");
+    }
+
+    #[test]
+    fn toggle_pin_returns_new_state_and_round_trips() {
+        let mut t = EditorTabs::new();
+        t.editors[0].path = Some(std::path::PathBuf::from("/a"));
+        assert!(t.toggle_pin(0), "first toggle pins");
+        assert!(!t.toggle_pin(0), "second toggle unpins");
+        assert!(!t.is_pinned(0));
+    }
+
+    #[test]
+    fn toggle_pin_out_of_range_is_a_noop_and_false() {
+        let mut t = EditorTabs::new();
+        let before = t.tab_count();
+        assert!(!t.toggle_pin(99));
+        assert_eq!(t.tab_count(), before, "no panic, no mutation");
+    }
+
+    #[test]
+    fn close_all_closes_pinned_tabs_too() {
+        // VS Code parity: Close All does not spare pinned tabs.
+        let mut t = EditorTabs::new();
+        t.editors[0].path = Some(std::path::PathBuf::from("/a"));
+        t.add_tab_with_path(std::path::PathBuf::from("/b"));
+        t.toggle_pin(0);
+        let removed = t.close_all();
+        assert_eq!(removed, 2);
+        assert_eq!(t.tab_count(), 1, "collapses to a single blank tab");
+        assert!(!t.is_pinned(0));
+    }
+
+    #[test]
+    fn close_saved_closes_clean_pinned_tabs() {
+        // VS Code parity: Close Saved closes a clean tab even when pinned;
+        // only the dirty tab survives.
+        let mut t = EditorTabs::new();
+        t.editors[0].path = Some(std::path::PathBuf::from("/a"));
+        t.add_tab_with_path(std::path::PathBuf::from("/b"));
+        t.editors[1].dirty = true;
+        t.toggle_pin(0); // pin the clean /a
+        let removed = t.close_saved();
+        assert_eq!(removed, 1, "the clean pinned tab is still closed");
+        assert_eq!(t.tab_path(0).as_deref(), Some(std::path::Path::new("/b")));
+    }
+
+    #[test]
+    fn pinned_tab_paints_the_thumb_tack_instead_of_the_close_cross() {
+        let f1 = NamedTempFile::new().unwrap();
+        let f2 = NamedTempFile::new().unwrap();
+        std::fs::write(f1.path(), "1\n").unwrap();
+        std::fs::write(f2.path(), "2\n").unwrap();
+        let mut t = EditorTabs::new();
+        t.open_pinned(f1.path()).unwrap();
+        t.open_pinned(f2.path()).unwrap();
+        t.toggle_pin(0); // pin the first tab (stays leftmost)
+        let active_idx = t.active_index();
+        t.editors[active_idx].focused = true;
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 10,
+        };
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        (&mut t).render(area, &mut buf);
+        let strip: String = (0..area.width).map(|x| buf[(x, 0)].symbol()).collect();
+        assert!(
+            strip.contains('\u{f08d}'),
+            "the pinned tab shows the thumb-tack glyph in its close cell; strip was {strip:?}"
+        );
+        assert!(
+            strip.contains('\u{2715}'),
+            "the unpinned tab still shows the close cross; strip was {strip:?}"
+        );
+    }
+
+    #[test]
     fn close_others_is_a_noop_when_only_one_tab_is_open() {
         let mut t = EditorTabs::new();
         t.editors[0].path = Some(std::path::PathBuf::from("/only"));

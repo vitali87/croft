@@ -16654,8 +16654,7 @@ impl App {
     /// the workspace) fall back to the absolute path so the clipboard never
     /// holds a misleading `../../` walk or an empty string.
     fn copy_relative_path_to_clipboard(&mut self, path: PathBuf) {
-        let rel = path.strip_prefix(&self.workspace_root).unwrap_or(&path);
-        let text = rel.display().to_string();
+        let text = relative_clipboard_text(&path, &self.workspace_root);
         self.status = if copy_to_clipboard(&text) {
             format!("Copied relative path: {text}")
         } else {
@@ -18372,6 +18371,16 @@ fn read_system_clipboard() -> Option<String> {
 /// site can downgrade the status message if it ever needs to. Today all
 /// call sites discard the boolean; the return value is here so future
 /// code can branch on it.
+/// VS Code "Copy Relative Path" text: `path` relative to the workspace `root`,
+/// or the absolute `path` when it lives outside the root (never a `../` walk).
+/// Pure so the relativization is unit-tested without touching the clipboard.
+fn relative_clipboard_text(path: &Path, root: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .display()
+        .to_string()
+}
+
 fn copy_to_clipboard(text: &str) -> bool {
     if crate::clipboard::write_string(text) {
         return true;
