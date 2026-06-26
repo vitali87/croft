@@ -67,6 +67,10 @@ pub const RELEASE_NOTES: &[ReleaseNote] = &[
     },
     ReleaseNote {
         kind: NoteKind::Fix,
+        summary: "Ctrl+K in the editor kills to end of line again; it no longer gets swallowed by the Cmd+K chord leader.",
+    },
+    ReleaseNote {
+        kind: NoteKind::Fix,
         summary: "rust-analyzer now installs itself automatically the first time you open a Rust project.",
     },
     ReleaseNote {

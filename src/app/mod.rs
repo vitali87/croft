@@ -17633,7 +17633,11 @@ fn is_cmd_k_leader_key(key: KeyEvent) -> bool {
     if key.modifiers.contains(KeyModifiers::SHIFT) || key.modifiers.contains(KeyModifiers::ALT) {
         return false;
     }
-    key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::SUPER)
+    // SUPER everywhere; CONTROL only on Termux (where Ctrl is the cmd
+    // surrogate). Off Termux a bare Ctrl+K must fall through to the editor's
+    // kill-to-end-of-line rather than arming the leader — using `has_cmd`
+    // keeps this consistent with every other croft chord (e.g. Cmd+\ split).
+    has_cmd(key.modifiers)
 }
 
 /// `Cmd+/` (macOS) / `Ctrl+/` (Linux / Termux): Toggle Line Comment. Rejects

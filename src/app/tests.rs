@@ -4660,7 +4660,10 @@ fn shortcut_for_returns_expected_shortcuts_for_each_explorer_action() {
     // Editor tab-menu actions: Close Saved and Reveal in Explorer View are
     // Cmd+K chords; Copy Path is a standalone Cmd+Opt chord.
     assert_eq!(shortcut_for(&MenuAction::CloseSavedTabs), Some("⌘K U"));
-    assert_eq!(shortcut_for(&MenuAction::CopyTabPath(p.clone())), Some("⌥⌘C"));
+    assert_eq!(
+        shortcut_for(&MenuAction::CopyTabPath(p.clone())),
+        Some("⌥⌘C")
+    );
     assert_eq!(
         shortcut_for(&MenuAction::RevealInExplorer(p.clone())),
         Some("⌘K E")
@@ -5111,6 +5114,22 @@ fn cmd_k_arms_leader_then_unmatched_second_key_clears_it() {
     assert!(
         app.cmd_k_leader.is_none(),
         "an unmatched second key clears the leader"
+    );
+}
+
+#[test]
+fn cmd_k_leader_is_super_only_off_termux_so_ctrl_k_stays_kill_to_eol() {
+    // The Cmd+K chord leader must arm on SUPER (macOS / forwarded), but NOT on
+    // a bare Ctrl+K off Termux — Ctrl+K is the editor's kill-to-end-of-line and
+    // must not be shadowed by the leader. (On Termux, Ctrl is the documented
+    // cmd surrogate, so the leader does claim Ctrl+K there.)
+    assert!(is_cmd_k_leader_key(key(
+        KeyCode::Char('k'),
+        KeyModifiers::SUPER
+    )));
+    assert!(
+        !is_cmd_k_leader_key(key(KeyCode::Char('k'), KeyModifiers::CONTROL)),
+        "bare Ctrl+K off Termux must fall through to kill-to-end-of-line, not arm the leader"
     );
 }
 
