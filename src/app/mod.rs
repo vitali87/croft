@@ -589,6 +589,10 @@ enum MenuAction {
     /// clipboard (VS Code's "Copy Path"). Available wherever the tab is backed
     /// by a real on-disk path, local or remote.
     CopyTabPath(PathBuf),
+    /// Copy the right-clicked editor tab's path relative to the workspace root
+    /// (VS Code's "Copy Relative Path"). Falls back to the absolute path when
+    /// the file lives outside the workspace root. Local or remote.
+    CopyTabRelativePath(PathBuf),
     /// Reveal the right-clicked editor tab's file in the Explorer tree:
     /// expand its parent folders, select its row, and focus the Explorer.
     /// Mirrors VS Code's "Reveal in Explorer View". Works local and remote.
@@ -611,6 +615,10 @@ enum MenuAction {
     /// Close every saved (non-dirty) editor tab, keeping any with unsaved
     /// changes. Mirrors VS Code's "Close Saved".
     CloseSavedTabs,
+    /// Promote the preview tab at `idx` to a permanent tab so a later
+    /// single-click open won't replace it (VS Code's "Keep Open"). Only
+    /// surfaced for a tab that is currently the replaceable preview slot.
+    KeepTabOpen(usize),
     /// Split the editor into two side-by-side columns, duplicating the
     /// active file into the new (right) group.
     SplitEditor,
@@ -722,12 +730,14 @@ fn shortcut_for(action: &MenuAction) -> Option<&'static str> {
         MenuAction::MakeRoot(_) => Some("⌘/"),
         MenuAction::RevealInFinder(_) => Some("⌥⌘R"),
         MenuAction::CopyTabPath(_) => Some("⌥⌘C"),
+        MenuAction::CopyTabRelativePath(_) => Some("⌥⇧⌘C"),
         MenuAction::RevealInExplorer(_) => Some("⌘K E"),
         MenuAction::Delete { .. } => Some("⌫"),
         MenuAction::CloseTab(_) => Some("⌘W"),
         MenuAction::CloseOtherTabs(_) => Some("⌥⌘T"),
         MenuAction::CloseAllTabs => Some("⌘K W"),
         MenuAction::CloseSavedTabs => Some("⌘K U"),
+        MenuAction::KeepTabOpen(_) => Some("⌘K ⏎"),
         MenuAction::SplitEditor => Some("⌘\\"),
         MenuAction::FocusGroupLeft => Some("⌥⌘←"),
         MenuAction::FocusGroupRight => Some("⌥⌘→"),
@@ -821,6 +831,7 @@ fn build_tab_context_menu_items(
     is_split: bool,
     clicked: Option<&Path>,
     reveal_enabled: bool,
+    clicked_is_preview: bool,
 ) -> Vec<(String, MenuAction)> {
     let mut items: Vec<(String, MenuAction)> = Vec::new();
     items.push((String::from("Close"), MenuAction::CloseTab(idx)));
@@ -848,6 +859,10 @@ fn build_tab_context_menu_items(
             String::from("Copy Path"),
             MenuAction::CopyTabPath(path.to_path_buf()),
         ));
+        items.push((
+            String::from("Copy Relative Path"),
+            MenuAction::CopyTabRelativePath(path.to_path_buf()),
+        ));
     }
     // Reveal in Finder: local-macOS only, and only when the tab is backed by a
     // real on-disk path (a blank/untitled buffer has nothing to reveal). On a
@@ -865,6 +880,12 @@ fn build_tab_context_menu_items(
             String::from("Reveal in Explorer View"),
             MenuAction::RevealInExplorer(path.to_path_buf()),
         ));
+    }
+    // Keep Open: only meaningful for the replaceable preview tab (italic).
+    // Promotes it so a subsequent single-click open won't replace it. VS Code
+    // omits the entry on an already-permanent tab, so we do too.
+    if clicked_is_preview {
+        items.push((String::from("Keep Open"), MenuAction::KeepTabOpen(idx)));
     }
     // Editor-group actions: split is offered when not already split;
     // focus-group navigation only once a second column exists.
@@ -7372,6 +7393,16 @@ impl App {
                 }
                 true
             }
+            // Cmd+K Enter: keep the active preview tab open (VS Code's
+            // "Keep Open"); a no-op status when the tab is already permanent.
+            KeyCode::Enter if !key.modifiers.contains(KeyModifiers::SHIFT) => {
+                let idx = self.editor.active_index();
+                if self.editor.keep_open(idx) {
+                    self.status = String::from("Kept tab open");
+                    self.poke_cursor();
+                }
+                true
+            }
             _ => false,
         }
     }
@@ -10894,6 +10925,15 @@ impl App {
             }
             return;
         }
+        // VS Code "Copy Relative Path" (Cmd+Opt+Shift+C): copy the active file's
+        // path relative to the workspace root. Same path-or-no-op rule as Copy
+        // Path; the keystroke is swallowed even on a blank/untitled buffer.
+        if is_copy_relative_path_key(key) {
+            if let Some(path) = self.editor.path.clone() {
+                self.copy_relative_path_to_clipboard(path);
+            }
+            return;
+        }
         // VS Code "Toggle Line Comment" (Cmd+/ / Ctrl+/), "Toggle Block
         // Comment" (Shift+Alt+A), and "View: Toggle Word Wrap" (Alt+Z). All
         // act on a text buffer, so they no-op on read-only diff / sheet /
@@ -10983,13 +11023,6 @@ impl App {
             if self.editor_is_text() {
                 self.editor
                     .transform_selection_case(crate::widgets::editor::CaseTransform::Lower);
-            }
-            return;
-        }
-        if is_transform_title_key(key) {
-            if self.editor_is_text() {
-                self.editor
-                    .transform_selection_case(crate::widgets::editor::CaseTransform::Title);
             }
             return;
         }
@@ -14880,6 +14913,7 @@ impl App {
                         self.editor_split.is_some(),
                         tab_path.as_deref(),
                         !self.is_remote && cfg!(target_os = "macos"),
+                        self.editor.is_preview(tab_idx),
                     );
                     self.context_menu = Some(ContextMenu {
                         origin: (m.column, m.row),
@@ -16401,6 +16435,7 @@ impl App {
             }
             MenuAction::RevealInFinder(path) => self.reveal_in_finder(path),
             MenuAction::CopyTabPath(path) => self.copy_path_to_clipboard(path),
+            MenuAction::CopyTabRelativePath(path) => self.copy_relative_path_to_clipboard(path),
             MenuAction::RevealInExplorer(path) => self.reveal_in_explorer(path),
             MenuAction::CloseTab(idx) => {
                 if self.editor.close_tab(idx) {
@@ -16446,6 +16481,12 @@ impl App {
                 self.collapse_split_if_empty();
             }
             MenuAction::CloseSavedTabs => self.close_saved_tabs(),
+            MenuAction::KeepTabOpen(idx) => {
+                if self.editor.keep_open(idx) {
+                    self.status = String::from("Kept tab open");
+                    self.poke_cursor();
+                }
+            }
             MenuAction::SplitEditor => self.split_editor(),
             MenuAction::FocusGroupLeft => self.focus_editor_group(true),
             MenuAction::FocusGroupRight => self.focus_editor_group(false),
@@ -16565,6 +16606,20 @@ impl App {
         let text = path.display().to_string();
         self.status = if copy_to_clipboard(&text) {
             format!("Copied path: {text}")
+        } else {
+            String::from("Could not copy path to clipboard")
+        };
+    }
+
+    /// VS Code "Copy Relative Path": copy `path` relative to the workspace
+    /// root. Files outside the root (rare: a tab opened by absolute path above
+    /// the workspace) fall back to the absolute path so the clipboard never
+    /// holds a misleading `../../` walk or an empty string.
+    fn copy_relative_path_to_clipboard(&mut self, path: PathBuf) {
+        let rel = path.strip_prefix(&self.workspace_root).unwrap_or(&path);
+        let text = rel.display().to_string();
+        self.status = if copy_to_clipboard(&text) {
+            format!("Copied relative path: {text}")
         } else {
             String::from("Could not copy path to clipboard")
         };
@@ -17783,7 +17838,7 @@ fn is_reveal_in_finder_key(key: KeyEvent) -> bool {
 /// `Cmd+Opt+C` / `Ctrl+Opt+C` - "Copy Path": put the active file's absolute
 /// path on the system clipboard. The Alt requirement keeps it disjoint from
 /// plain `Cmd+C` (Copy selection), and rejecting Shift keeps it disjoint from
-/// `Cmd+Opt+Shift+C` (Transform to Title Case). Mirrors VS Code's binding.
+/// `Cmd+Opt+Shift+C` (Copy Relative Path). Mirrors VS Code's binding.
 fn is_copy_path_key(key: KeyEvent) -> bool {
     let KeyCode::Char(c) = key.code else {
         return false;
@@ -18050,8 +18105,12 @@ fn is_transform_lower_key(key: KeyEvent) -> bool {
     is_cmd_alt_shift_letter(key, 'l')
 }
 
-/// `Cmd+Opt+Shift+C`: Transform to Title Case (`editor.action.transformToTitlecase`).
-fn is_transform_title_key(key: KeyEvent) -> bool {
+/// `Cmd+Opt+Shift+C` / `Ctrl+Opt+Shift+C` - "Copy Relative Path": put the
+/// active file's path, relative to the workspace root, on the clipboard. The
+/// Shift distinguishes it from plain `Cmd+Opt+C` (Copy Path, absolute). Mirrors
+/// VS Code's binding; Transform to Title Case keeps its Command Palette entry
+/// but gives up this chord (VS Code assigns Title Case no default key).
+fn is_copy_relative_path_key(key: KeyEvent) -> bool {
     is_cmd_alt_shift_letter(key, 'c')
 }
 

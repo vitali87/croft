@@ -20,8 +20,8 @@ const CMD_OPT_R_HEX: &str = "0x1b 0x5b 0x31 0x31 0x34 0x3b 0x31 0x31 0x75";
 /// `Cmd+Opt+C` -> "Copy Path" (editor tab). Modifier mask 0x180000
 /// (Cmd 0x100000 | Opt 0x80000), `kVK_ANSI_C` = 0x8. CSI-u `ESC [ 99 ; 11 u`
 /// (99 = 'c'; modbyte 11 = 1 + Alt(2) + Super(8)) so crossterm decodes it as
-/// ALT|SUPER, disjoint from plain Cmd+C (Copy) and `Cmd+Opt+Shift+C` (Transform
-/// to Title Case, which carries Shift). macOS does not bind this chord to a
+/// ALT|SUPER, disjoint from plain Cmd+C (Copy) and `Cmd+Opt+Shift+C` (Copy
+/// Relative Path, which carries Shift). macOS does not bind this chord to a
 /// default menu item, so no NSUserKeyEquivalents relocation is needed.
 const CMD_OPT_C_KEY: &str = "0x63-0x180000-0x8";
 const CMD_OPT_C_HEX: &str = "0x1b 0x5b 0x39 0x39 0x3b 0x31 0x31 0x75";
@@ -232,8 +232,9 @@ const CMD_OPT_SHIFT_N_KEY: &str = "0x4e-0x1a0000-0x2d";
 const CMD_OPT_SHIFT_N_HEX: &str = "0x1b 0x5b 0x37 0x38 0x3b 0x31 0x32 0x75";
 // Same `Cmd+Opt+Shift+<letter>` tier (modifier byte 12) for the formerly
 // palette-only editor commands, so none ships without an accelerator:
-// `J` = Join Lines, `U`/`L`/`C` = Transform to Upper/Lower/Title case,
-// `A`/`D` = Sort Lines Ascending/Descending, `W` = Trim Trailing Whitespace.
+// `J` = Join Lines, `U`/`L` = Transform to Upper/Lower case, `C` = Copy
+// Relative Path (Title Case keeps its palette entry but no chord, matching VS
+// Code), `A`/`D` = Sort Lines Ascending/Descending, `W` = Trim Trailing Whitespace.
 const CMD_OPT_SHIFT_J_KEY: &str = "0x4a-0x1a0000-0x26";
 const CMD_OPT_SHIFT_J_HEX: &str = "0x1b 0x5b 0x37 0x34 0x3b 0x31 0x32 0x75";
 const CMD_OPT_SHIFT_U_KEY: &str = "0x55-0x1a0000-0x20";
@@ -1228,7 +1229,7 @@ mod tests {
             (
                 CMD_OPT_SHIFT_C_KEY,
                 CMD_OPT_SHIFT_C_HEX,
-                "Cmd+Opt+Shift+C Transform to Title Case",
+                "Cmd+Opt+Shift+C Copy Relative Path",
             ),
             (
                 CMD_OPT_SHIFT_A_KEY,

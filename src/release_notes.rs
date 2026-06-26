@@ -22,10 +22,12 @@ use ratatui::style::Color;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NoteKind {
     // Which variants RELEASE_NOTES constructs depends on what this version
-    // shipped; a fix-only release builds no `Feature`, so allow it to go
-    // unconstructed without tripping dead-code. `icon()`/`color()` still use it.
+    // shipped; a fix-only release builds no `Feature` (and vice versa), so
+    // either variant may go unconstructed in a given build. `icon()`/`color()`
+    // reference both regardless; allow the unused one without tripping dead-code.
     #[allow(dead_code)]
     Feature,
+    #[allow(dead_code)]
     Fix,
 }
 
@@ -57,7 +59,13 @@ pub struct ReleaseNote {
 }
 
 /// What shipped in the current release. Replace on every version bump.
-pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
-    kind: NoteKind::Fix,
-    summary: "The welcome panel now lists only this version's changes, not highlights carried over from previous releases.",
-}];
+pub const RELEASE_NOTES: &[ReleaseNote] = &[
+    ReleaseNote {
+        kind: NoteKind::Feature,
+        summary: "Copy Relative Path (Cmd+Opt+Shift+C): copy an editor tab's path relative to the workspace root, from the tab menu or the keyboard.",
+    },
+    ReleaseNote {
+        kind: NoteKind::Feature,
+        summary: "Keep Open (Cmd+K Enter): promote a preview tab from the tab menu so the next single-click open won't replace it.",
+    },
+];

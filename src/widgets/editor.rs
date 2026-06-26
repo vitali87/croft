@@ -5754,6 +5754,26 @@ impl EditorTabs {
         self.editors[self.active].preview = false;
     }
 
+    /// True when the tab at `idx` is the replaceable preview slot. Drives the
+    /// tab menu's "Keep Open" entry, which only makes sense for a preview tab.
+    pub fn is_preview(&self, idx: usize) -> bool {
+        self.editors.get(idx).is_some_and(|e| e.preview)
+    }
+
+    /// VS Code "Keep Open": promote the tab at `idx` out of the preview slot
+    /// so a subsequent single-click open no longer replaces it. Returns true
+    /// when a preview tab was actually promoted (false if it was already
+    /// permanent or the index is out of range).
+    pub fn keep_open(&mut self, idx: usize) -> bool {
+        match self.editors.get_mut(idx) {
+            Some(e) if e.preview => {
+                e.preview = false;
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// VS Code "preview tab" semantics: open `path` in the single
     /// replaceable preview slot. If the file is already in some tab, just
     /// switch to it. Otherwise reuse the existing preview slot, or create a

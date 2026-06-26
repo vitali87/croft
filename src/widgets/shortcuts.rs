@@ -312,6 +312,11 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 handler: "is_copy_path_key",
             },
             ShortcutEntry {
+                keys: "Cmd/Ctrl+Opt+Shift+C",
+                description: "Copy Relative Path: copy the active file's path relative to the workspace root",
+                handler: "is_copy_relative_path_key",
+            },
+            ShortcutEntry {
                 keys: "Cmd/Ctrl+X",
                 description: "Cut the selection",
                 handler: "is_editor_cut_key",
@@ -380,11 +385,6 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 keys: "Cmd/Ctrl+Opt+Shift+L",
                 description: "Transform the selection to lowercase",
                 handler: "is_transform_lower_key",
-            },
-            ShortcutEntry {
-                keys: "Cmd/Ctrl+Opt+Shift+C",
-                description: "Transform the selection to Title Case",
-                handler: "is_transform_title_key",
             },
             ShortcutEntry {
                 keys: "Cmd/Ctrl+Opt+Shift+A",
