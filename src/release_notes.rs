@@ -51,7 +51,7 @@ pub struct ReleaseNote {
 pub const RELEASE_NOTES: &[ReleaseNote] = &[
     ReleaseNote {
         kind: NoteKind::Feature,
-        summary: "Editor tab right-click parity: Close Saved (Cmd+K U) and Reveal in Finder (Cmd+Opt+R) now act on the tab you click.",
+        summary: "Editor tab right-click parity: Copy Path (Cmd+Opt+C), Reveal in Finder (Cmd+Opt+R), and Close Saved (Cmd+K U).",
     },
     ReleaseNote {
         kind: NoteKind::Feature,

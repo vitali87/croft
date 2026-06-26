@@ -307,6 +307,11 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 handler: "is_editor_copy_key",
             },
             ShortcutEntry {
+                keys: "Cmd/Ctrl+Opt+C",
+                description: "Copy Path: copy the active file's absolute path to the clipboard",
+                handler: "is_copy_path_key",
+            },
+            ShortcutEntry {
                 keys: "Cmd/Ctrl+X",
                 description: "Cut the selection",
                 handler: "is_editor_cut_key",

@@ -11054,17 +11054,59 @@ fn build_tab_context_menu_items_includes_reveal_in_finder_only_with_a_path_and_e
         [
             "Close",
             "Close All",
+            "Copy Path",
             "Reveal in Finder",
             "Split Editor Right"
         ],
     );
-    assert!(matches!(&items[2].1, MenuAction::RevealInFinder(rp) if rp == p));
+    assert!(matches!(&items[3].1, MenuAction::RevealInFinder(rp) if rp == p));
     // Remote (or non-macOS) session: entry withheld even with a path.
     let remote = build_tab_context_menu_items(0, 1, false, Some(p), false);
     assert!(remote.iter().all(|(s, _)| s != "Reveal in Finder"));
     // A blank/untitled buffer (no path) never offers it, even when enabled.
     let blank = build_tab_context_menu_items(0, 1, false, None, true);
     assert!(blank.iter().all(|(s, _)| s != "Reveal in Finder"));
+}
+
+#[test]
+fn build_tab_context_menu_items_offers_copy_path_for_any_path_local_or_remote() {
+    let p = std::path::Path::new("/tmp/demo.rs");
+    // Copy Path is a clipboard write, so it shows for a path-bearing tab even
+    // on a remote session where Reveal in Finder is withheld.
+    let remote = build_tab_context_menu_items(0, 1, false, Some(p), false);
+    let labels: Vec<&str> = remote.iter().map(|(s, _)| s.as_str()).collect();
+    assert_eq!(
+        labels,
+        ["Close", "Close All", "Copy Path", "Split Editor Right"]
+    );
+    assert!(matches!(&remote[2].1, MenuAction::CopyTabPath(cp) if cp == p));
+    // A blank/untitled buffer (no path) has nothing to copy.
+    let blank = build_tab_context_menu_items(0, 1, false, None, true);
+    assert!(blank.iter().all(|(s, _)| s != "Copy Path"));
+}
+
+#[test]
+fn copy_path_key_is_opt_cmd_c_and_disjoint_from_copy_and_title_case() {
+    // Cmd+Opt+C (and Ctrl+Opt+C) copy the path.
+    assert!(is_copy_path_key(key(
+        KeyCode::Char('c'),
+        KeyModifiers::SUPER | KeyModifiers::ALT
+    )));
+    assert!(is_copy_path_key(key(
+        KeyCode::Char('c'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT
+    )));
+    // Plain Cmd+C is Copy-selection, not Copy Path.
+    assert!(!is_copy_path_key(key(
+        KeyCode::Char('c'),
+        KeyModifiers::SUPER
+    )));
+    // Cmd+Opt+Shift+C is Transform to Title Case, so the Shift variant must not
+    // collide with Copy Path.
+    assert!(!is_copy_path_key(key(
+        KeyCode::Char('c'),
+        KeyModifiers::SUPER | KeyModifiers::ALT | KeyModifiers::SHIFT
+    )));
 }
 
 #[test]

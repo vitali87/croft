@@ -17,6 +17,14 @@ const CMD_R_HEX: &str = "0x1b 0x5b 0x31 0x31 0x34 0x3b 0x39 0x75";
 /// needed for the forwarder to win.
 const CMD_OPT_R_KEY: &str = "0x72-0x180000-0xf";
 const CMD_OPT_R_HEX: &str = "0x1b 0x5b 0x31 0x31 0x34 0x3b 0x31 0x31 0x75";
+/// `Cmd+Opt+C` -> "Copy Path" (editor tab). Modifier mask 0x180000
+/// (Cmd 0x100000 | Opt 0x80000), `kVK_ANSI_C` = 0x8. CSI-u `ESC [ 99 ; 11 u`
+/// (99 = 'c'; modbyte 11 = 1 + Alt(2) + Super(8)) so crossterm decodes it as
+/// ALT|SUPER, disjoint from plain Cmd+C (Copy) and `Cmd+Opt+Shift+C` (Transform
+/// to Title Case, which carries Shift). macOS does not bind this chord to a
+/// default menu item, so no NSUserKeyEquivalents relocation is needed.
+const CMD_OPT_C_KEY: &str = "0x63-0x180000-0x8";
+const CMD_OPT_C_HEX: &str = "0x1b 0x5b 0x39 0x39 0x3b 0x31 0x31 0x75";
 const CMD_SLASH_KEY: &str = "0x2f-0x100000-0x2c";
 const CMD_SLASH_HEX: &str = "0x1b 0x5b 0x34 0x37 0x3b 0x39 0x75";
 /// `Cmd+.` (period) for Quick Fix (VS Code's `editor.action.quickFix`).
@@ -472,6 +480,7 @@ pub(crate) mod payloads {
     pub(crate) const CMD_O_HEX: &str = super::CMD_O_HEX;
     pub(crate) const CMD_OPT_LEFT_HEX: &str = super::CMD_OPT_LEFT_HEX;
     pub(crate) const CMD_OPT_R_HEX: &str = super::CMD_OPT_R_HEX;
+    pub(crate) const CMD_OPT_C_HEX: &str = super::CMD_OPT_C_HEX;
     pub(crate) const CMD_OPT_RIGHT_HEX: &str = super::CMD_OPT_RIGHT_HEX;
     pub(crate) const CMD_OPT_UP_HEX: &str = super::CMD_OPT_UP_HEX;
     pub(crate) const CMD_OPT_DOWN_HEX: &str = super::CMD_OPT_DOWN_HEX;
@@ -734,6 +743,7 @@ pub fn apply_croft_key_settings(plist: &mut Value) -> Result<(), ITerm2Error> {
         (CMD_LBRACKET_KEY, CMD_LBRACKET_HEX),
         (CMD_RBRACKET_KEY, CMD_RBRACKET_HEX),
         (CMD_OPT_R_KEY, CMD_OPT_R_HEX),
+        (CMD_OPT_C_KEY, CMD_OPT_C_HEX),
         (CTRL_SHIFT_J_KEY, CTRL_SHIFT_J_HEX),
         (CMD_F12_KEY, CMD_F12_HEX),
         (CTRL_SHIFT_F12_KEY, CTRL_SHIFT_F12_HEX),
@@ -1490,6 +1500,19 @@ mod tests {
             action_text(global, CMD_OPT_R_KEY),
             CMD_OPT_R_HEX,
             "GlobalKeyMap must forward Cmd+Opt+R as a CSI-u sequence so croft's `is_reveal_in_finder_key` fires and reveals the selected entry (or active editor file) in Finder. Encoding: 'r' (codepoint 0x72 = 114) with kitty modifier byte 11 = 1 base + Alt(2) + Super(8), giving `ESC [ 114 ; 11 u` (decoded as ALT|SUPER, disjoint from plain Cmd+R = Rename)"
+        );
+    }
+
+    #[test]
+    fn apply_croft_key_settings_forwards_cmd_opt_c_for_copy_path() {
+        let mut plist = synth_plist("GUID-1", &["GUID-1"]);
+        apply_croft_key_settings(&mut plist).unwrap();
+        let top = plist.as_dictionary().unwrap();
+        let global = dict_in(top, "GlobalKeyMap");
+        assert_eq!(
+            action_text(global, CMD_OPT_C_KEY),
+            CMD_OPT_C_HEX,
+            "GlobalKeyMap must forward Cmd+Opt+C as a CSI-u sequence so croft's `is_copy_path_key` fires and copies the active file's path. Encoding: 'c' (codepoint 0x63 = 99) with kitty modifier byte 11 = 1 base + Alt(2) + Super(8), giving `ESC [ 99 ; 11 u` (decoded as ALT|SUPER, disjoint from plain Cmd+C = Copy)"
         );
     }
 

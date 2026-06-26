@@ -147,6 +147,7 @@ On macOS, the `Cmd` chords below only reach croft after you run a one-time setup
 | `Cmd`+`Opt`+`Shift`+`F` | Format Document: reformat the whole buffer through the language server (rustfmt, ruff, prettier, …); the edit lands as one undo step and leaves the tab dirty |
 | Mouse drag | Select text; every other occurrence of a single-line selection highlights in blue |
 | `Ctrl`+`C` / `Cmd`+`C` | Copy the selection to the system clipboard |
+| `Cmd`+`Opt`+`C` / `Ctrl`+`Opt`+`C` | Copy Path: put the active file's absolute path on the system clipboard (also on the editor tab right-click menu) |
 | `Ctrl`+`X` / `Cmd`+`X` | Cut the selection |
 | `Ctrl`+`V` / `Cmd`+`V` | Paste at the cursor (replaces any selection) |
 | `Ctrl`+`Z` / `Cmd`+`Z` | Undo (typing bursts coalesce; backspace, paste, cut, replace are each one step) |

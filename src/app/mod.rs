@@ -585,6 +585,10 @@ enum MenuAction {
     /// files can't be roots. Used to dive into a nested git repo without
     /// relaunching croft.
     MakeRoot(PathBuf),
+    /// Copy the absolute path of the right-clicked editor tab to the system
+    /// clipboard (VS Code's "Copy Path"). Available wherever the tab is backed
+    /// by a real on-disk path, local or remote.
+    CopyTabPath(PathBuf),
     /// Reveal the path in macOS Finder via `open -R`. Local-macOS only:
     /// on a remote SSH session croft runs on the headless host where no
     /// Finder exists, so the menu omits this entry entirely rather than
@@ -713,6 +717,7 @@ fn shortcut_for(action: &MenuAction) -> Option<&'static str> {
         MenuAction::Rename(_) => Some("⌘R"),
         MenuAction::MakeRoot(_) => Some("⌘/"),
         MenuAction::RevealInFinder(_) => Some("⌥⌘R"),
+        MenuAction::CopyTabPath(_) => Some("⌥⌘C"),
         MenuAction::Delete { .. } => Some("⌫"),
         MenuAction::CloseTab(_) => Some("⌘W"),
         MenuAction::CloseOtherTabs(_) => Some("⌥⌘T"),
@@ -830,6 +835,15 @@ fn build_tab_context_menu_items(
         items.push((String::from("Close Saved"), MenuAction::CloseSavedTabs));
     }
     items.push((String::from("Close All"), MenuAction::CloseAllTabs));
+    // Copy Path: any tab backed by a real on-disk path, local or remote (it's
+    // a clipboard write, not a host bridge). Sits between the close group and
+    // Reveal in Finder, mirroring VS Code's tab-menu order.
+    if let Some(path) = clicked {
+        items.push((
+            String::from("Copy Path"),
+            MenuAction::CopyTabPath(path.to_path_buf()),
+        ));
+    }
     // Reveal in Finder: local-macOS only, and only when the tab is backed by a
     // real on-disk path (a blank/untitled buffer has nothing to reveal). On a
     // remote SSH session the entry is withheld, matching the explorer menu.
@@ -10849,6 +10863,15 @@ impl App {
             }
             return;
         }
+        // VS Code "Copy Path" (Cmd+Opt+C): copy the active file's absolute path
+        // to the clipboard. Works on any tab with a real path, local or remote;
+        // a blank/untitled buffer is a no-op (the keystroke is still swallowed).
+        if is_copy_path_key(key) {
+            if let Some(path) = self.editor.path.clone() {
+                self.copy_path_to_clipboard(path);
+            }
+            return;
+        }
         // VS Code "Toggle Line Comment" (Cmd+/ / Ctrl+/), "Toggle Block
         // Comment" (Shift+Alt+A), and "View: Toggle Word Wrap" (Alt+Z). All
         // act on a text buffer, so they no-op on read-only diff / sheet /
@@ -16355,6 +16378,7 @@ impl App {
                 self.change_workspace_root(folder);
             }
             MenuAction::RevealInFinder(path) => self.reveal_in_finder(path),
+            MenuAction::CopyTabPath(path) => self.copy_path_to_clipboard(path),
             MenuAction::CloseTab(idx) => {
                 if self.editor.close_tab(idx) {
                     self.sync_open_file_poll_mtime();
@@ -16508,6 +16532,19 @@ impl App {
         };
         self.poke_cursor();
         self.collapse_split_if_empty();
+    }
+
+    /// Copy `path` (an editor tab's absolute path) to the system clipboard via
+    /// the NSPasteboard-first wrapper (OSC 52 fallback on a remote host). Shared
+    /// by the tab context menu and the `Cmd+Opt+C` chord. Matches VS Code's
+    /// "Copy Path".
+    fn copy_path_to_clipboard(&mut self, path: PathBuf) {
+        let text = path.display().to_string();
+        self.status = if copy_to_clipboard(&text) {
+            format!("Copied path: {text}")
+        } else {
+            String::from("Could not copy path to clipboard")
+        };
     }
 
     /// Reveal `path` in macOS Finder by spawning `open -R`, which selects the
@@ -17689,6 +17726,23 @@ fn is_reveal_in_finder_key(key: KeyEvent) -> bool {
         return false;
     };
     if !c.eq_ignore_ascii_case(&'r') {
+        return false;
+    }
+    if !key.modifiers.contains(KeyModifiers::ALT) || key.modifiers.contains(KeyModifiers::SHIFT) {
+        return false;
+    }
+    key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::SUPER)
+}
+
+/// `Cmd+Opt+C` / `Ctrl+Opt+C` - "Copy Path": put the active file's absolute
+/// path on the system clipboard. The Alt requirement keeps it disjoint from
+/// plain `Cmd+C` (Copy selection), and rejecting Shift keeps it disjoint from
+/// `Cmd+Opt+Shift+C` (Transform to Title Case). Mirrors VS Code's binding.
+fn is_copy_path_key(key: KeyEvent) -> bool {
+    let KeyCode::Char(c) = key.code else {
+        return false;
+    };
+    if !c.eq_ignore_ascii_case(&'c') {
         return false;
     }
     if !key.modifiers.contains(KeyModifiers::ALT) || key.modifiers.contains(KeyModifiers::SHIFT) {
