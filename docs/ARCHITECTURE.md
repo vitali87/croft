@@ -18,7 +18,7 @@ src/
 ├── cli.rs               clap CLI: open path, setup-terminal / setup-iterm2 / setup-cross / remote / keys subcommands
 ├── clipboard.rs         native macOS clipboard read/write (NSPasteboard) with pbpaste fallback
 ├── ghostty.rs           Ghostty config keybinds (setup-ghostty): re-emit every croft chord as its CSI-u sequence so Ghostty's own binds don't swallow them
-├── git.rs               branch / dirty / ahead-behind status and the full set of working-tree operations the Source Control panel drives: stage(/all), unstage(/all), commit (staged / all / amend), push (/force/to-remote/publish), pull (/rebase), fetch, sync, clone, branch list / checkout / create (/from) / rename / delete / merge / rebase, remote list / add / remove, stash push (/untracked/staged) / list / apply / pop / drop, tag list / create / delete, discard (/all), and diffs; plus `release_commits()`, which decodes the commits baked into the binary by `build.rs` (`CROFT_RELEASE_COMMITS`) for the welcome-screen "IN THIS RELEASE" panel (no network: it shows exactly what this build ships, never live `HEAD`)
+├── git.rs               branch / dirty / ahead-behind status and the full set of working-tree operations the Source Control panel drives: stage(/all), unstage(/all), commit (staged / all / amend), push (/force/to-remote/publish), pull (/rebase), fetch, sync, clone, branch list / checkout / create (/from) / rename / delete / merge / rebase, remote list / add / remove, stash push (/untracked/staged) / list / apply / pop / drop, tag list / create / delete, discard (/all), and diffs
 ├── gradient.rs          shared orange→green corner gradient: the welcome activity box border and the Black-theme focused-pane border
 ├── highlight.rs         tree-sitter highlight registry per language
 ├── icons.rs             Codicon and file-type Nerd Font glyphs and per-language colors
@@ -28,6 +28,7 @@ src/
 ├── outline_syntax.rs    tree-sitter outline provider: extracts the OUTLINE panel's symbol tree (functions, structs, methods, fields, etc.) directly from the buffer's syntax tree via hand-written per-language queries, so the panel paints instantly before a cold language server answers documentSymbol; the LSP reply later supersedes it (tree-sitter-first, like Zed and aerial.nvim). Rust / Python / JS / TS / TSX / Go covered; other languages fall back to the LSP outline
 ├── pdf.rs               PDF rasteriser: prefers pdftoppm (poppler), falls back to macOS sips
 ├── prefs.rs             durable user preferences (color theme) persisted at ~/.config/croft/config.json
+├── release_notes.rs     hand-curated "IN THIS RELEASE" highlights (feature / fix, glyph + summary) shown on the welcome panel; baked-in data, updated on every version bump (no git log, no network)
 ├── remote.rs            remote (SSH) target metadata and launch dispatch
 ├── remote_bulk.rs       bulk lane for background installs: dedicated BatchMode SSH connection when key auth works (throttled shared mux otherwise) so update bytes never queue ahead of live-session keystrokes
 ├── remote_connect.rs    interactive SSH connect flow (host + password prompt phases) behind the connect dialog
@@ -49,7 +50,7 @@ src/
 │   ├── nav.rs           editor back / forward navigation history
 │   ├── overlay.rs       inline-image overlay state + clear-on-hide latches (iTerm2 cell eviction; the Kitty path adds a delete-all on the same clear frames)
 │   ├── perf_hud.rs      F8 performance HUD
-│   ├── welcome.rs       welcome-screen state, read synchronously from the binary's baked release commits (no thread, no network)
+│   ├── welcome.rs       welcome-screen state: the "IN THIS RELEASE" highlights, read synchronously from `release_notes::RELEASE_NOTES` (no thread, no network)
 │   └── tests.rs         unit / integration tests
 ├── dap/                 debugger stack: Debug Adapter Protocol client. debugpy (Python, 3.14+, no fallback) is the verified mechanism; Rust/C/C++ route to lldb-dap; JS/TS route to vscode-js-debug. Which file types each handles is a data-driven extension axis (see registry.rs)
 │   ├── mod.rs

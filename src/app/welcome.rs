@@ -1,58 +1,31 @@
-use crate::git::{CommitInfo, RecentCommits};
+use crate::release_notes::{RELEASE_NOTES, ReleaseNote};
 
-use super::WelcomeLink;
-
+/// Backing state for the welcome screen's "IN THIS RELEASE" panel. The
+/// highlights are hand-curated data baked into the binary
+/// ([`crate::release_notes::RELEASE_NOTES`]) — no network, no git log, no
+/// background thread. The list is an accurate property of the build, so every
+/// launch is free and the panel reflects exactly what this version ships.
 pub struct WelcomeState {
-    remote: Option<String>,
-    commits: Vec<CommitInfo>,
-    links: Vec<WelcomeLink>,
+    notes: Vec<ReleaseNote>,
 }
 
 impl WelcomeState {
-    /// Read the commits baked into this binary at build time. No network and
-    /// no background thread: the list is a property of the build, so every
-    /// launch is free and the panel reflects exactly what this version ships
-    /// (see [`crate::git::release_commits`]).
     pub fn new() -> Self {
-        let RecentCommits { remote, commits } = crate::git::release_commits();
         Self {
-            remote,
-            commits,
-            links: Vec::new(),
+            notes: RELEASE_NOTES.to_vec(),
         }
     }
 
-    pub fn remote(&self) -> Option<&str> {
-        self.remote.as_deref()
-    }
-
-    pub fn commits(&self) -> &[CommitInfo] {
-        &self.commits
+    pub fn notes(&self) -> &[ReleaseNote] {
+        &self.notes
     }
 
     pub fn has_recent_panel(&self) -> bool {
-        self.remote.is_some() || !self.commits.is_empty()
-    }
-
-    pub fn clear_links(&mut self) {
-        self.links.clear();
-    }
-
-    pub fn push_link(&mut self, link: WelcomeLink) {
-        self.links.push(link);
-    }
-
-    pub fn links(&self) -> &[WelcomeLink] {
-        &self.links
+        !self.notes.is_empty()
     }
 
     #[cfg(test)]
-    pub fn set_test_remote(&mut self, remote: Option<String>) {
-        self.remote = remote;
-    }
-
-    #[cfg(test)]
-    pub fn set_test_commits(&mut self, commits: Vec<CommitInfo>) {
-        self.commits = commits;
+    pub fn set_test_notes(&mut self, notes: Vec<ReleaseNote>) {
+        self.notes = notes;
     }
 }

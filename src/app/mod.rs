@@ -1658,35 +1658,6 @@ struct RemoteLaunch {
     adopted: Option<crate::remote::AdoptedMaster>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct WelcomeLink {
-    rect: Rect,
-    url: String,
-    label: String,
-}
-
-fn welcome_provider_label(remote: &str) -> &'static str {
-    crate::git::commit_api_provider_for_remote(remote)
-        .map(crate::git::CommitApiProvider::label)
-        .unwrap_or("Repo")
-}
-
-fn welcome_provider_badge(remote: &str) -> String {
-    match crate::git::commit_api_provider_for_remote(remote) {
-        Some(crate::git::CommitApiProvider::Bitbucket) => "\u{f171} Bitbucket".to_string(),
-        Some(crate::git::CommitApiProvider::GitHub) => "\u{f09b} GitHub".to_string(),
-        // Codeberg has no reliable Nerd Font codepoint (many fonts ship
-        // without one), and the previous `\u{ea60}` placeholder rendered
-        // as the wrong symbol. Three leading spaces reserve the layout:
-        // two cells for the OSC-1337 image overlay that paints the actual
-        // Codeberg logo on iTerm2, plus one cell of visual gap so the
-        // logo doesn't butt against the "C". On non-image terminals the
-        // badge reads as plain "   Codeberg".
-        Some(crate::git::CommitApiProvider::Codeberg) => "   Codeberg".to_string(),
-        None => "Repo".to_string(),
-    }
-}
-
 fn split_at_char_count(s: &str, count: usize) -> (String, String) {
     let left: String = s.chars().take(count).collect();
     let right: String = s.chars().skip(count).collect();
@@ -1740,45 +1711,36 @@ fn wrap_cells_variable_width(text: &str, first_width: u16, rest_width: u16) -> V
     }
 }
 
-fn welcome_commit_widths(commit: &crate::git::CommitInfo, block_w: u16) -> (u16, u16) {
-    let hash_w = commit.hash.chars().count() as u16;
-    let when_w = commit.when.chars().count() as u16;
-    let prefix_w = hash_w.saturating_add(1);
-    let first = block_w
-        .saturating_sub(prefix_w)
-        .saturating_sub(when_w.saturating_add(2))
-        .max(1);
-    let rest = block_w.saturating_sub(prefix_w).max(1);
-    (first, rest)
+/// Cells reserved at the left of each highlight row for the kind glyph plus
+/// a one-cell gap before the summary text.
+const WELCOME_NOTE_GUTTER: u16 = 2;
+
+fn welcome_note_summary_width(block_w: u16) -> u16 {
+    block_w.saturating_sub(WELCOME_NOTE_GUTTER).max(1)
 }
 
-fn wrapped_welcome_commit_subject(commit: &crate::git::CommitInfo, block_w: u16) -> Vec<String> {
-    let (first, rest) = welcome_commit_widths(commit, block_w);
-    wrap_cells_variable_width(&commit.subject, first, rest)
-}
-
-fn welcome_commit_row_height(commit: &crate::git::CommitInfo, block_w: u16) -> u16 {
-    wrapped_welcome_commit_subject(commit, block_w).len().max(1) as u16
-}
-
-fn welcome_recents_height(
-    remote: Option<&str>,
-    commits: &[crate::git::CommitInfo],
+fn wrapped_welcome_note_summary(
+    note: &crate::release_notes::ReleaseNote,
     block_w: u16,
-) -> u16 {
-    if remote.is_none() && commits.is_empty() {
+) -> Vec<String> {
+    let w = welcome_note_summary_width(block_w);
+    wrap_cells_variable_width(note.summary, w, w)
+}
+
+fn welcome_note_row_height(note: &crate::release_notes::ReleaseNote, block_w: u16) -> u16 {
+    wrapped_welcome_note_summary(note, block_w).len().max(1) as u16
+}
+
+fn welcome_recents_height(notes: &[crate::release_notes::ReleaseNote], block_w: u16) -> u16 {
+    if notes.is_empty() {
         return 0;
     }
-    let remote_h = u16::from(remote.is_some());
-    let commit_h = if commits.is_empty() {
-        0
-    } else {
-        1 + commits
-            .iter()
-            .map(|c| welcome_commit_row_height(c, block_w))
-            .sum::<u16>()
-    };
-    1 + remote_h + commit_h
+    // Header row + one blank row + each highlight (which may wrap).
+    let notes_h: u16 = notes
+        .iter()
+        .map(|n| welcome_note_row_height(n, block_w))
+        .sum();
+    1 + 1 + notes_h
 }
 
 const WELCOME_TAGLINE: &str = "LIGHTWEIGHT.  BLAZINGLY FAST.  BUILT FOR DEVELOPERS.";
@@ -2243,30 +2205,6 @@ impl App {
                 settings_inactive: gei,
                 settings_hovered: geh,
             });
-        }
-        // Codeberg badge for the welcome panel: 2 cells wide, 1 cell tall,
-        // rendered as an OSC-1337 image overlay at the badge's anchor cell
-        // because Nerd Fonts have no reliable Codeberg codepoint.
-        let badge_w_px = cell_w * 2;
-        let badge_h_px = cell_h;
-        if let Ok(baked) = crate::iterm2_inline::fit_image_auto(
-            crate::iterm2_inline::CODEBERG_SRC_PNG,
-            badge_w_px,
-            badge_h_px,
-            icon_bg,
-        ) && let Some(raw) = crate::iterm2_inline::build_inline_image(
-            protocol,
-            &baked,
-            2,
-            1,
-            false,
-            crate::iterm2_inline::KITTY_ID_BADGE,
-        ) {
-            self.overlays
-                .badge
-                .set_image(crate::iterm2_inline::maybe_tmux_wrap(
-                    protocol, is_tmux, raw,
-                ));
         }
         // Run-and-Debug headline icon: the same debug-alt PNG used in the
         // activity bar, fitted to the panel's icon block (RUN_DEBUG_ICON_CELLS_W
@@ -2839,95 +2777,6 @@ impl App {
         let _ = out.flush();
         self.overlays.activity.mark_emitted();
         self.overlays.activity.store_positions(positions);
-    }
-
-    /// Paint the Codeberg badge OSC-1337 image at its current welcome-panel
-    /// cell, after first wiping any previous emit position. iTerm2 keeps
-    /// image cells in a layer that survives plain SGR redraws, so when
-    /// `welcome_codeberg_badge_cell` changes (window resize, sidebar
-    /// toggle, terminal-pane open/close) the *old* image stays on screen
-    /// unless we explicitly stamp blanks over it. Idempotent: when the
-    /// badge cell hasn't moved we just re-emit at the same position to
-    /// outlast iTerm2's image-cache eviction under heavy SGR traffic.
-    fn stamp_blank_pair(&self, px: u16, py: u16) {
-        use std::io::Write;
-        let mut out = stdout();
-        // On Kitty the badge lives on the graphics layer, so stamping blank
-        // cells over it does nothing; delete the placement by id instead.
-        if self.inline_protocol == crate::iterm2_inline::InlineImageProtocol::Kitty {
-            let _ = out.write_all(
-                crate::iterm2_inline::delete_kitty_image(crate::iterm2_inline::KITTY_ID_BADGE)
-                    .as_bytes(),
-            );
-            let _ = out.flush();
-            return;
-        }
-        let cursor_on = self.cursor_should_be_visible();
-        let _ = write!(out, "\x1b[?25l\x1b[s");
-        let _ = write!(out, "\x1b[{};{}H  ", py + 1, px + 1);
-        let _ = write!(out, "\x1b[u");
-        if cursor_on {
-            let _ = write!(out, "\x1b[?25h");
-        }
-        let _ = out.flush();
-    }
-
-    pub fn flush_welcome_codeberg_badge_overlay(&mut self) {
-        use std::io::Write;
-        if self.shortcuts_modal.is_some()
-            || self.file_finder.is_some()
-            || self.command_palette.is_some()
-            || self.process_picker.is_some()
-            || self.zoxide_jump.is_some()
-            || self.branch_picker.is_some()
-            || self.input_prompt.is_some()
-            || self.list_picker.is_some()
-            || self.connect_dialog.is_some()
-        {
-            if let Some((px, py)) = self.overlays.badge.take_last_emitted() {
-                self.stamp_blank_pair(px, py);
-            }
-            return;
-        }
-        if !self.editor.is_blank_initial() {
-            // Welcome panel hidden: clear any previous emit and stop
-            // re-emitting until we're back on the welcome screen.
-            if let Some((px, py)) = self.overlays.badge.take_last_emitted() {
-                self.stamp_blank_pair(px, py);
-            }
-            return;
-        }
-        let Some(osc) = self.overlays.badge.image() else {
-            return;
-        };
-        let Some((cx, cy)) = self.overlays.badge.target() else {
-            // Welcome visible but provider isn't Codeberg: still need to
-            // wipe a stale prior emit (e.g. user just changed providers
-            // without restart, or layout collapsed the badge row).
-            if let Some((px, py)) = self.overlays.badge.take_last_emitted() {
-                self.stamp_blank_pair(px, py);
-            }
-            return;
-        };
-        let mut out = stdout();
-        let cursor_on = self.cursor_should_be_visible();
-        let _ = write!(out, "\x1b[?25l\x1b[s");
-        // If the cell moved since the last emit, stamp blanks over the
-        // previous position first so the old logo doesn't ghost-overlay
-        // the freshly-drawn welcome layout.
-        if let Some((px, py)) = self.overlays.badge.last_emitted()
-            && (px, py) != (cx, cy)
-        {
-            let _ = write!(out, "\x1b[{};{}H  ", py + 1, px + 1);
-        }
-        let _ = write!(out, "\x1b[{};{}H", cy + 1, cx + 1);
-        let _ = out.write_all(osc.as_bytes());
-        let _ = write!(out, "\x1b[u");
-        if cursor_on {
-            let _ = write!(out, "\x1b[?25h");
-        }
-        let _ = out.flush();
-        self.overlays.badge.mark_emitted_at((cx, cy));
     }
 
     /// Reset the blink phase so the caret is solidly visible for the next
@@ -5346,8 +5195,6 @@ impl App {
     }
 
     fn render_welcome(&mut self, frame: &mut ratatui::Frame, outer_area: Rect) {
-        self.welcome.clear_links();
-        self.overlays.badge.set_target(None);
         if outer_area.width == 0 || outer_area.height == 0 {
             return;
         }
@@ -5385,7 +5232,7 @@ impl App {
         // Layout regions, top-to-bottom:
         //   [logo + version badge]
         //   [tagline]
-        //   [gradient box: header, provider, commits]
+        //   [gradient box: header + release highlights]
         //   [footer chevron line]
         let block_left = area.x + area.width / 8;
         let block_right = area.x + area.width - area.width / 8;
@@ -5394,8 +5241,7 @@ impl App {
         // border itself).
         let inner_w = block_w.saturating_sub(2);
         let has_recent_panel = self.welcome.has_recent_panel();
-        let recents_inner_h =
-            welcome_recents_height(self.welcome.remote(), self.welcome.commits(), inner_w);
+        let recents_inner_h = welcome_recents_height(self.welcome.notes(), inner_w);
         let tagline_h = 1u16;
         let footer_h = 1u16;
         // Gaps: blank row after logo, after tagline, after box.
@@ -5584,14 +5430,10 @@ impl App {
             let inner_w_actual = box_rect.width.saturating_sub(4);
 
             let row_style = Style::default().fg(Color::Rgb(0xc5, 0xcd, 0xd9));
-            let dim = Style::default().fg(Color::Rgb(0x6c, 0x7d, 0x9c));
-            let link_style = Style::default()
-                .fg(Color::Rgb(0x4e, 0x9a, 0xff))
-                .add_modifier(Modifier::BOLD);
 
-            // Header row: "▎ IN THIS RELEASE (vX.Y.Z)". The commits below are
-            // baked into this build, so the heading names the version rather
-            // than implying a live "recent" feed.
+            // Header row: "▎ IN THIS RELEASE (vX.Y.Z)". The highlights below
+            // are hand-curated data baked into this build (see
+            // `crate::release_notes`), so the heading names the exact version.
             let header_y = inner_y;
             frame.buffer_mut().set_string(
                 inner_x,
@@ -5610,91 +5452,38 @@ impl App {
                     .add_modifier(Modifier::BOLD),
             );
 
-            let recent_remote = self.welcome.remote().map(String::from);
-            let recent_commits = self.welcome.commits().to_vec();
+            // Each highlight: a kind glyph in the gutter (rocket = new feature,
+            // bug = fix) tinted by kind, then the wrapped one-line summary.
+            // Continuation lines align under the summary, leaving the gutter
+            // clear so the glyph reads as a single bullet.
+            let summary_x = inner_x + WELCOME_NOTE_GUTTER;
+            let summary_w = inner_w_actual.saturating_sub(WELCOME_NOTE_GUTTER);
+            let last_row = box_rect.y + box_rect.height - 1;
             let mut row_y = header_y + 2;
-            if let Some(remote) = recent_remote.as_ref() {
-                let provider = welcome_provider_label(remote);
-                let badge = welcome_provider_badge(remote);
-                frame
-                    .buffer_mut()
-                    .set_string(inner_x, row_y, &badge, link_style);
-                let is_codeberg = matches!(
-                    crate::git::commit_api_provider_for_remote(remote),
-                    Some(crate::git::CommitApiProvider::Codeberg)
-                );
-                let badge_target = if is_codeberg && self.overlays.badge.has_image() {
-                    Some((inner_x, row_y))
-                } else {
-                    None
-                };
-                self.overlays.badge.set_target(badge_target);
-                let badge_w = badge.chars().count() as u16;
-                let remote_x = inner_x + badge_w + 2;
-                let room = (inner_x + inner_w_actual).saturating_sub(remote_x) as usize;
-                let clipped: String = remote.chars().take(room).collect();
-                frame.buffer_mut().set_string(remote_x, row_y, clipped, dim);
-                let link_w = badge_w
-                    .saturating_add(2)
-                    .saturating_add(room.min(remote.chars().count()) as u16)
-                    .min(inner_w_actual);
-                self.welcome.push_link(WelcomeLink {
-                    rect: Rect {
-                        x: inner_x,
-                        y: row_y,
-                        width: link_w,
-                        height: 1,
-                    },
-                    url: remote.clone(),
-                    label: format!("Open {provider} repository"),
-                });
-                row_y += 2;
-            }
-            for c in &recent_commits {
-                let y = row_y;
-                if y >= box_rect.y + box_rect.height - 1 {
+            for note in self.welcome.notes() {
+                if row_y >= last_row {
                     break;
                 }
-                frame
-                    .buffer_mut()
-                    .set_string(inner_x, y, &c.hash, link_style);
-                let subject_x = inner_x + c.hash.chars().count() as u16 + 2;
-                let when_w = c.when.chars().count() as u16;
-                let row_end = inner_x + inner_w_actual;
-                let when_x = row_end.saturating_sub(when_w);
-                let subject_lines = wrapped_welcome_commit_subject(c, inner_w_actual);
-                for (line_idx, line) in subject_lines.iter().enumerate() {
-                    let line_y = y + line_idx as u16;
-                    if line_y >= box_rect.y + box_rect.height - 1 {
+                frame.buffer_mut().set_string(
+                    inner_x,
+                    row_y,
+                    note.kind.icon(),
+                    Style::default()
+                        .fg(note.kind.color())
+                        .add_modifier(Modifier::BOLD),
+                );
+                let lines = wrapped_welcome_note_summary(note, inner_w_actual);
+                for (line_idx, line) in lines.iter().enumerate() {
+                    let line_y = row_y + line_idx as u16;
+                    if line_y >= last_row {
                         break;
                     }
-                    let room = if line_idx == 0 {
-                        when_x.saturating_sub(subject_x).saturating_sub(2)
-                    } else {
-                        row_end.saturating_sub(subject_x)
-                    };
-                    let clipped: String = line.chars().take(room as usize).collect();
+                    let clipped: String = line.chars().take(summary_w as usize).collect();
                     frame
                         .buffer_mut()
-                        .set_string(subject_x, line_y, clipped, row_style);
+                        .set_string(summary_x, line_y, clipped, row_style);
                 }
-                frame.buffer_mut().set_string(when_x, y, &c.when, dim);
-                if let Some(remote) = recent_remote.as_ref()
-                    && let Some(url) = crate::git::commit_url_for_remote(remote, &c.full_hash)
-                {
-                    let height = subject_lines.len().max(1) as u16;
-                    self.welcome.push_link(WelcomeLink {
-                        rect: Rect {
-                            x: inner_x,
-                            y,
-                            width: inner_w_actual,
-                            height,
-                        },
-                        url,
-                        label: format!("Open commit {}", c.hash),
-                    });
-                }
-                row_y = row_y.saturating_add(subject_lines.len().max(1) as u16);
+                row_y = row_y.saturating_add(lines.len().max(1) as u16);
             }
         }
     }
@@ -6463,7 +6252,6 @@ impl App {
             // occupied; if the user reopens the welcome screen we'll need
             // to re-emit it.
             self.overlays.welcome.mark_dirty();
-            self.overlays.badge.set_target(None);
             // Feed the render-time pointer cell to every editor group so the
             // tab strip can light the hovered tab body / close-cross pill,
             // mirroring the terminal pane buttons' hover affordance.
@@ -12927,42 +12715,6 @@ impl App {
         };
     }
 
-    fn welcome_link_at(&self, col: u16, row: u16) -> Option<&WelcomeLink> {
-        self.welcome
-            .links()
-            .iter()
-            .find(|link| rect_contains(link.rect, col, row))
-    }
-
-    fn activate_welcome_link(&mut self, col: u16, row: u16) -> bool {
-        let Some(link) = self.welcome_link_at(col, row).cloned() else {
-            return false;
-        };
-        // Remote-launched croft has no working `xdg-open`, and even if it
-        // did, the user wants the URL on their *local* Mac browser. Route
-        // it through the drop-relay back to local croft. First click in
-        // a session pops a confirmation; subsequent clicks go silently
-        // once the user has chosen "Always".
-        if self.drop_relay_active() {
-            if self.trust_local_browser {
-                self.request_remote_url_open(link.url.clone());
-                self.status = format!("Opening {} on your local Mac…", link.label);
-            } else {
-                self.pending_local_open = Some(link.url.clone());
-            }
-            return true;
-        }
-        match open_url(&link.url) {
-            Ok(()) => {
-                self.status = link.label;
-            }
-            Err(e) => {
-                self.status = format!("Open link failed: {e}");
-            }
-        }
-        true
-    }
-
     fn request_remote_url_open(&mut self, url: String) {
         let Some(log_path) = self.relay_log_path() else {
             self.status = String::from("Open link: drop relay vanished");
@@ -15412,12 +15164,6 @@ impl App {
                 }
                 if rect_contains(self.sidebar_areas.settings_icon, m.column, m.row) {
                     self.open_settings_menu();
-                    return;
-                }
-                if in_editor_pane
-                    && self.editor.is_blank_initial()
-                    && self.activate_welcome_link(m.column, m.row)
-                {
                     return;
                 }
                 if in_tree_scrollbar {
@@ -20369,13 +20115,6 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
                     app.mark_editor_image_displayed(side);
                 }
             }
-            // Codeberg badge image overlay on the welcome panel. Same
-            // re-emit-every-frame strategy as the activity bar: ratatui
-            // doesn't track OSC-1337 image cells, so any neighbouring SGR
-            // burst can evict them in iTerm2's cache. Only fires when the
-            // welcome panel is visible, the open repo is on Codeberg, and
-            // we successfully baked the icon at init time.
-            app.flush_welcome_codeberg_badge_overlay();
             // Run-and-Debug headline icon: same re-emit-every-frame trick.
             // Only fires while the sidebar is on the Run-Debug view and the
             // panel reserved a cell for the icon on its last render. On

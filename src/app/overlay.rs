@@ -184,7 +184,6 @@ impl<L: PartialEq> ImageOverlay<L> {
 #[derive(Default)]
 pub struct CellOverlay {
     image: Option<String>,
-    target: Option<(u16, u16)>,
     last_emitted: Option<(u16, u16)>,
     clear: ClearLatch,
 }
@@ -202,20 +201,8 @@ impl CellOverlay {
         self.image.is_some()
     }
 
-    pub fn set_target(&mut self, target: Option<(u16, u16)>) {
-        self.target = target;
-    }
-
-    pub fn target(&self) -> Option<(u16, u16)> {
-        self.target
-    }
-
     pub fn last_emitted(&self) -> Option<(u16, u16)> {
         self.last_emitted
-    }
-
-    pub fn take_last_emitted(&mut self) -> Option<(u16, u16)> {
-        self.last_emitted.take()
     }
 
     pub fn mark_emitted_at(&mut self, cell: (u16, u16)) {
@@ -342,7 +329,6 @@ pub struct OverlayManager {
     pub welcome: ImageOverlay<super::WelcomeLayout>,
     pub hero: ImageOverlay<super::WelcomeLayout>,
     pub ssh: ImageOverlay<()>,
-    pub badge: CellOverlay,
     pub run_debug: CellOverlay,
     pub activity: ActivityOverlay,
 }

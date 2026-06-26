@@ -16,6 +16,7 @@ mod mcp;
 mod outline_syntax;
 mod pdf;
 mod prefs;
+mod release_notes;
 mod remote;
 mod remote_bulk;
 mod remote_connect;

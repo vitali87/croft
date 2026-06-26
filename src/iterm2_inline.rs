@@ -17,7 +17,6 @@ pub const RUN_DEBUG_SRC_SVG: &[u8] = include_bytes!("../assets/icons/debug-alt.s
 pub const EXTENSIONS_SRC_SVG: &[u8] = include_bytes!("../assets/icons/extensions.svg");
 /// Codicon `gear`, the bottom-anchored "Manage" button (Color Theme picker).
 pub const SETTINGS_GEAR_SRC_SVG: &[u8] = include_bytes!("../assets/icons/settings_gear.svg");
-pub const CODEBERG_SRC_PNG: &[u8] = include_bytes!("../assets/icons/codeberg_src.png");
 /// 192x192 white-on-transparent rasterisation of `assets/icons/debug-alt.svg`.
 /// Still drives the Run and Debug panel's headline illustration (composed via
 /// the PNG path); the activity-bar icon now rasterises the SVG directly.
@@ -771,7 +770,8 @@ pub const KITTY_ID_SOURCE_CONTROL: u32 = KITTY_ID_BASE + 3;
 pub const KITTY_ID_REMOTE: u32 = KITTY_ID_BASE + 4;
 pub const KITTY_ID_RUN_DEBUG_BAR: u32 = KITTY_ID_BASE + 5;
 pub const KITTY_ID_SETTINGS: u32 = KITTY_ID_BASE + 6;
-pub const KITTY_ID_BADGE: u32 = KITTY_ID_BASE + 7;
+// (KITTY_ID_BASE + 7 was the welcome-panel Codeberg badge, removed with the
+// repo-link row; the slot is left unused rather than renumbering the rest.)
 pub const KITTY_ID_RUN_DEBUG_PANEL: u32 = KITTY_ID_BASE + 8;
 pub const KITTY_ID_HERO: u32 = KITTY_ID_BASE + 9;
 pub const KITTY_ID_SSH: u32 = KITTY_ID_BASE + 10;

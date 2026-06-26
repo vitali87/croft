@@ -1655,79 +1655,37 @@ fn rect_contains_zero_sized_is_empty() {
     assert!(!rect_contains(r, 0, 0));
 }
 
-fn commit_fixture(subject: &str, when: &str) -> crate::git::CommitInfo {
-    crate::git::CommitInfo {
-        hash: "abc1234".to_string(),
-        full_hash: "abc1234deadbeef".to_string(),
-        when: when.to_string(),
-        subject: subject.to_string(),
+fn note_fixture(
+    kind: crate::release_notes::NoteKind,
+    summary: &'static str,
+) -> crate::release_notes::ReleaseNote {
+    crate::release_notes::ReleaseNote { kind, summary }
+}
+
+#[test]
+fn welcome_note_summary_wraps_long_lines() {
+    let n = note_fixture(
+        crate::release_notes::NoteKind::Feature,
+        "Code Actions and Quick Fix on Cmd+., aggregated across every running language server in the workspace",
+    );
+    let lines = wrapped_welcome_note_summary(&n, 42);
+    assert!(lines.len() > 1, "long highlight summaries should wrap");
+    for line in &lines {
+        assert!(line.chars().count() <= welcome_note_summary_width(42) as usize);
     }
 }
 
 #[test]
-fn welcome_commit_wrapping_reserves_timestamp_column() {
-    let c = commit_fixture(
-        "feat(search): clickable paste button in input row reads pbpaste and keeps going",
-        "3 hours ago",
+fn welcome_recents_height_accounts_for_wrapped_note_rows() {
+    let n = note_fixture(
+        crate::release_notes::NoteKind::Fix,
+        "A reasonably long highlight summary that will certainly wrap to more than a single line in a narrow column",
     );
-    let (first, rest) = welcome_commit_widths(&c, 42);
+    let h = welcome_recents_height(&[n], 42);
+    // header + blank + at least two wrapped rows.
     assert!(
-        first < rest,
-        "first line should reserve room for the timestamp"
-    );
-    let lines = wrapped_welcome_commit_subject(&c, 42);
-    assert!(lines.len() > 1, "long commit subjects should wrap");
-    assert!(lines[0].chars().count() <= first as usize);
-    assert!(lines[1].chars().count() <= rest as usize);
-}
-
-#[test]
-fn welcome_recents_height_accounts_for_wrapped_commit_rows() {
-    let c = commit_fixture(
-        "feat(search): clickable paste button in input row reads pbpaste and keeps going",
-        "3 hours ago",
-    );
-    let compact = welcome_recents_height(Some("https://bitbucket.org/a/b"), &[c], 42);
-    assert!(
-        compact > 1 + 1 + 1,
-        "height must include wrapped commit continuation rows"
-    );
-}
-
-#[test]
-fn welcome_provider_badge_uses_repo_provider() {
-    assert!(welcome_provider_badge("https://bitbucket.org/a/b").contains("Bitbucket"));
-    assert!(welcome_provider_badge("https://github.com/a/b").contains("GitHub"));
-}
-
-/// Codeberg's badge must show the literal name without a Nerd Font glyph
-/// in front of it: most installed Nerd Fonts (including the one croft
-/// ships with via `setup-iterm2`) do not have a Codeberg codepoint, so
-/// the previous `\u{ea60}` placeholder rendered as a stray symbol or
-/// tofu box. The actual Codeberg logo is composited as an OSC-1337
-/// image overlay at the badge cell when iTerm2 is detected (handled
-/// elsewhere); the text path stays glyph-free so non-iTerm2 terminals
-/// also display correctly.
-#[test]
-fn welcome_provider_badge_for_codeberg_has_no_unicode_glyph() {
-    let badge = welcome_provider_badge("ssh://git@codeberg.org/vitali87/croft.git");
-    assert!(badge.contains("Codeberg"), "badge: {badge:?}");
-    assert!(
-        badge.chars().all(|c| c.is_ascii() || c == ' '),
-        "badge must be glyph-free for Codeberg until/unless we render the icon as an image overlay; current badge: {badge:?}"
-    );
-}
-
-/// The Codeberg icon is overlaid as a 2-cell-wide OSC-1337 image at the
-/// badge's anchor; the text after it must start at least one cell later
-/// so the logo doesn't visually butt against the "C". That means three
-/// leading spaces total: two reserved for the icon, one for the gap.
-#[test]
-fn welcome_provider_badge_for_codeberg_leaves_a_gap_between_icon_and_text() {
-    let badge = welcome_provider_badge("https://codeberg.org/vitali87/croft");
-    assert!(
-        badge.starts_with("   Codeberg"),
-        "badge must start with three spaces (2 for the icon overlay + 1 visual gap) followed by 'Codeberg'; got: {badge:?}"
+        h > 1 + 1 + 1,
+        "height must include wrapped continuation rows; got {h}"
     );
 }
 
@@ -1957,115 +1915,17 @@ fn click_on_a_modified_source_control_entry_opens_a_diff_view_against_head() {
     );
 }
 
-#[test]
-fn flush_welcome_codeberg_badge_overlay_tracks_last_emitted_cell_across_resizes() {
-    let tmp = tempfile::tempdir().unwrap();
-    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    // Stub a baked OSC so the flush has something to "emit". The
-    // bytes never reach a real terminal in tests — we're checking
-    // the bookkeeping, not the wire format.
-    app.overlays
-        .badge
-        .set_image("\x1b]1337;File=...\x07".to_string());
-
-    // Initial render of welcome panel: badge anchored at (10, 5).
-    app.overlays.badge.set_target(Some((10, 5)));
-    app.flush_welcome_codeberg_badge_overlay();
-    assert_eq!(
-        app.overlays.badge.last_emitted(),
-        Some((10, 5)),
-        "after the first flush the last-emitted cell must match the target cell"
-    );
-
-    // Simulate a window resize that shifts the welcome panel right.
-    app.overlays.badge.set_target(Some((20, 8)));
-    app.flush_welcome_codeberg_badge_overlay();
-    assert_eq!(
-        app.overlays.badge.last_emitted(),
-        Some((20, 8)),
-        "after a resize the last-emitted cell must update to the new target so the next resize knows where to wipe"
-    );
-
-    // Repeated flush at the same cell is a no-op for tracking.
-    app.flush_welcome_codeberg_badge_overlay();
-    assert_eq!(
-        app.overlays.badge.last_emitted(),
-        Some((20, 8)),
-        "re-emitting at the same cell must not change tracking"
-    );
-
-    // User opens a file: welcome panel hides, badge cell cleared,
-    // and the next flush must drop the last-emitted record so the
-    // image cells are wiped and not re-emitted.
-    let file = tmp.path().join("README.md");
-    std::fs::write(&file, "hi").unwrap();
-    app.editor.open_pinned(&file).unwrap();
-    app.overlays.badge.set_target(None);
-    app.flush_welcome_codeberg_badge_overlay();
-    assert_eq!(
-        app.overlays.badge.last_emitted(),
-        None,
-        "leaving the welcome panel must clear the last-emitted record so a future welcome render starts fresh"
-    );
-}
-
-#[test]
-fn render_welcome_clears_codeberg_badge_cell_when_recents_box_collapses() {
-    let tmp = tempfile::tempdir().unwrap();
-    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app.welcome
-        .set_test_remote(Some("https://codeberg.org/vitali87/croft".to_string()));
-    app.overlays
-        .badge
-        .set_image("\x1b]1337;File=...\x07".to_string());
-
-    let tall = Rect {
-        x: 0,
-        y: 0,
-        width: 120,
-        height: 30,
-    };
-    let backend = ratatui::backend::TestBackend::new(tall.width, tall.height);
-    let mut term = ratatui::Terminal::new(backend).unwrap();
-    term.draw(|f| app.render_welcome(f, tall)).unwrap();
-    assert!(
-        app.overlays.badge.target().is_some(),
-        "with a tall welcome area the recents box must fit and the badge cell must be set so the flush emits the OSC-1337 image"
-    );
-
-    let tight = Rect {
-        x: 0,
-        y: 0,
-        width: 120,
-        height: 10,
-    };
-    let backend = ratatui::backend::TestBackend::new(tight.width, tight.height);
-    let mut term = ratatui::Terminal::new(backend).unwrap();
-    term.draw(|f| app.render_welcome(f, tight)).unwrap();
-    assert_eq!(
-        app.overlays.badge.target(),
-        None,
-        "when the recents box can't fit, the badge cell must reset to None so the post-draw flush wipes the stale image instead of re-emitting at the prior anchor"
-    );
-}
-
-/// The user dislikes underlined links in the welcome panel; the blue
-/// foreground colour already signals "clickable", and the underline
-/// adds visual noise (especially under the Codeberg logo overlay).
-/// Assert the rendered buffer contains zero cells with the UNDERLINED
+/// The user dislikes underlined text in the welcome panel: it adds visual
+/// noise. Assert the rendered buffer contains zero cells with the UNDERLINED
 /// modifier so this preference is enforced by the test suite.
 #[test]
 fn welcome_panel_renders_without_any_underlined_cells() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app.welcome
-        .set_test_remote(Some("https://codeberg.org/vitali87/croft".to_string()));
-    app.welcome.set_test_commits(vec![crate::git::CommitInfo {
-        hash: "abc1234".to_string(),
-        full_hash: "abc1234fffffffffffffffffffffffffffffffffff".to_string(),
-        when: "1 hour ago".to_string(),
-        subject: "feat: do thing".to_string(),
-    }]);
+    app.welcome.set_test_notes(vec![
+        note_fixture(crate::release_notes::NoteKind::Feature, "Did a new thing"),
+        note_fixture(crate::release_notes::NoteKind::Fix, "Fixed an old thing"),
+    ]);
     let area = Rect {
         x: 0,
         y: 0,
@@ -2125,25 +1985,23 @@ fn welcome_panel_does_not_paint_the_blazingly_fast_slogan_footer() {
 }
 
 #[test]
-fn render_welcome_does_not_panic_in_default_80x25_with_many_commits() {
+fn render_welcome_does_not_panic_in_default_80x25_with_many_notes() {
     // Repro for the index-(41,70) panic at startup: ratatui's initial
     // backend size is 80x25 before the alt-screen reflow. With a long
-    // recents list the previous code computed a box taller than 25,
-    // ran past the buffer, and panicked inside set_string.
+    // highlights list the box could compute taller than 25, run past the
+    // buffer, and panic inside set_string — so clamp to the area.
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app.welcome
-        .set_test_remote(Some("https://bitbucket.org/u/repo".to_string()));
-    app.welcome.set_test_commits((0..40)
-            .map(|i| crate::git::CommitInfo {
-                hash: format!("hash{i:04}"),
-                full_hash: format!("fullhash{i:040}"),
-                when: "1 hour ago".to_string(),
-                subject:
-                    "this is a long subject line that will wrap to multiple lines on a narrow recents column"
-                        .to_string(),
+    app.welcome.set_test_notes(
+        (0..40)
+            .map(|_| {
+                note_fixture(
+                    crate::release_notes::NoteKind::Feature,
+                    "this is a long highlight summary that will wrap to multiple lines on a narrow column",
+                )
             })
-            .collect());
+            .collect(),
+    );
     let area = Rect {
         x: 0,
         y: 0,
