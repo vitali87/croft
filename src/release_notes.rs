@@ -9,6 +9,11 @@
 //! the truth about what the running binary ships (see the project memory
 //! "always populate release narratives after every build"). Newest / most
 //! notable highlight first; keep each summary to one short sentence.
+//!
+//! REPLACE this list on every bump; do not append. The panel describes the
+//! single version it is baked into (`v{CARGO_PKG_VERSION}`), not a running
+//! changelog. Each patch bump is one change, so the list is usually one entry:
+//! what this bump fixed or added, and nothing carried over from prior versions.
 
 use ratatui::style::Color;
 
@@ -16,6 +21,10 @@ use ratatui::style::Color;
 /// the gutter glyph and tint the welcome panel paints beside the summary.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NoteKind {
+    // Which variants RELEASE_NOTES constructs depends on what this version
+    // shipped; a fix-only release builds no `Feature`, so allow it to go
+    // unconstructed without tripping dead-code. `icon()`/`color()` still use it.
+    #[allow(dead_code)]
     Feature,
     Fix,
 }
@@ -47,34 +56,8 @@ pub struct ReleaseNote {
     pub summary: &'static str,
 }
 
-/// What shipped in the current release. Edit on every version bump.
-pub const RELEASE_NOTES: &[ReleaseNote] = &[
-    ReleaseNote {
-        kind: NoteKind::Feature,
-        summary: "Editor tab right-click parity: Copy Path, Reveal in Finder, Reveal in Explorer View, and Close Saved, each with a key.",
-    },
-    ReleaseNote {
-        kind: NoteKind::Feature,
-        summary: "Code Actions and Quick Fix: press Cmd+. to apply fixes and refactors from every running language server.",
-    },
-    ReleaseNote {
-        kind: NoteKind::Feature,
-        summary: "Cmd+K chord leader and modified-F debug shortcuts, so every menu and palette action has a key.",
-    },
-    ReleaseNote {
-        kind: NoteKind::Feature,
-        summary: "Press F1 for a complete, searchable list of every keyboard shortcut.",
-    },
-    ReleaseNote {
-        kind: NoteKind::Fix,
-        summary: "Ctrl+K in the editor kills to end of line again; it no longer gets swallowed by the Cmd+K chord leader.",
-    },
-    ReleaseNote {
-        kind: NoteKind::Fix,
-        summary: "rust-analyzer now installs itself automatically the first time you open a Rust project.",
-    },
-    ReleaseNote {
-        kind: NoteKind::Fix,
-        summary: "Remote sessions no longer lose drag-and-drop after a reconnect or a no-path launch.",
-    },
-];
+/// What shipped in the current release. Replace on every version bump.
+pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
+    kind: NoteKind::Fix,
+    summary: "The welcome panel now lists only this version's changes, not highlights carried over from previous releases.",
+}];
