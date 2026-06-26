@@ -5441,6 +5441,13 @@ impl EditorTabs {
         self.active
     }
 
+    /// The on-disk path backing the tab at `idx`, if any. `None` for an
+    /// out-of-range index or a blank/untitled buffer. Used to seed the tab
+    /// context-menu's path-bearing actions (Reveal in Finder, Copy Path).
+    pub fn tab_path(&self, idx: usize) -> Option<PathBuf> {
+        self.editors.get(idx).and_then(|e| e.path.clone())
+    }
+
     pub fn iter_tabs(&self) -> impl Iterator<Item = &Editor> {
         self.editors.iter()
     }

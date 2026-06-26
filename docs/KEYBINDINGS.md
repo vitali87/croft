@@ -300,7 +300,7 @@ Disabling takes effect immediately for the viewers and Vim (a disabled PDF/CSV v
 | `⌘⇧L` | Disconnect a remote session |
 | `⌘⇧N` | Explorer "New folder" prompt |
 | `⌃⇧J` | Maximize the terminal pane |
-| `⌥⌘R` | Reveal in Finder (local macOS only) |
+| `⌥⌘R` | Reveal in Finder: the selected Explorer entry, or the active editor file when the editor is focused (local macOS only) |
 | `⌘B` | Toggle the primary side bar |
 | `⌘K` | Leader for the `Cmd+K` chords (Color Theme, Close to the Right, compare, Close All, Close Saved); iTerm2's Edit ▸ Clear Buffer is relocated to `⌥⌘K` |
 | `⌘\` | Split the editor |

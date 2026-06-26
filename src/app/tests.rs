@@ -4302,16 +4302,16 @@ fn reveal_in_finder_shortcut_hint_is_opt_cmd_r() {
 #[test]
 fn reveal_in_finder_key_is_opt_cmd_r_and_disjoint_from_rename() {
     // Cmd+Opt+R (and Ctrl+Opt+R) reveal in Finder.
-    assert!(is_tree_reveal_in_finder_key(key(
+    assert!(is_reveal_in_finder_key(key(
         KeyCode::Char('r'),
         KeyModifiers::SUPER | KeyModifiers::ALT
     )));
-    assert!(is_tree_reveal_in_finder_key(key(
+    assert!(is_reveal_in_finder_key(key(
         KeyCode::Char('r'),
         KeyModifiers::CONTROL | KeyModifiers::ALT
     )));
     // Plain Cmd+R must NOT trigger reveal - that chord is Rename.
-    assert!(!is_tree_reveal_in_finder_key(key(
+    assert!(!is_reveal_in_finder_key(key(
         KeyCode::Char('r'),
         KeyModifiers::SUPER
     )));
@@ -10991,7 +10991,7 @@ fn session_state_preserves_unsaved_buffer_contents() {
 fn build_tab_context_menu_items_includes_all_four_close_actions_in_the_middle_of_a_strip() {
     // Right-click on tab 1 of 3 (i.e. a middle tab) should surface
     // every close action — there's at least one tab on each side.
-    let items = build_tab_context_menu_items(1, 3, false);
+    let items = build_tab_context_menu_items(1, 3, false, None, false);
     let labels: Vec<&str> = items.iter().map(|(s, _)| s.as_str()).collect();
     assert_eq!(
         labels,
@@ -10999,39 +10999,72 @@ fn build_tab_context_menu_items_includes_all_four_close_actions_in_the_middle_of
             "Close",
             "Close Others",
             "Close to the Right",
+            "Close Saved",
             "Close All",
             "Split Editor Right"
         ],
-        "all four close actions must appear and in this order — mirrors VS Code's tab strip"
+        "all close actions must appear and in this order — mirrors VS Code's tab strip"
     );
     assert!(matches!(&items[0].1, MenuAction::CloseTab(1)));
     assert!(matches!(&items[1].1, MenuAction::CloseOtherTabs(1)));
     assert!(matches!(&items[2].1, MenuAction::CloseTabsToRight(1)));
-    assert!(matches!(&items[3].1, MenuAction::CloseAllTabs));
+    assert!(matches!(&items[3].1, MenuAction::CloseSavedTabs));
+    assert!(matches!(&items[4].1, MenuAction::CloseAllTabs));
 }
 
 #[test]
 fn build_tab_context_menu_items_hides_close_to_the_right_on_the_last_tab() {
     // Last tab → "Close to the Right" would close zero tabs, so it
     // must be suppressed (matches VS Code).
-    let items = build_tab_context_menu_items(2, 3, false);
+    let items = build_tab_context_menu_items(2, 3, false, None, false);
     let labels: Vec<&str> = items.iter().map(|(s, _)| s.as_str()).collect();
     assert_eq!(
         labels,
-        ["Close", "Close Others", "Close All", "Split Editor Right"],
+        [
+            "Close",
+            "Close Others",
+            "Close Saved",
+            "Close All",
+            "Split Editor Right"
+        ],
         "Close to the Right must be suppressed on the rightmost tab"
     );
 }
 
 #[test]
 fn build_tab_context_menu_items_hides_close_others_when_only_one_tab_is_open() {
-    let items = build_tab_context_menu_items(0, 1, false);
+    let items = build_tab_context_menu_items(0, 1, false, None, false);
     let labels: Vec<&str> = items.iter().map(|(s, _)| s.as_str()).collect();
     assert_eq!(
         labels,
         ["Close", "Close All", "Split Editor Right"],
-        "with a single tab, Close Others and Close to the Right are both no-ops and must be suppressed"
+        "with a single tab, Close Others / Close to the Right / Close Saved are all no-ops and must be suppressed"
     );
+}
+
+#[test]
+fn build_tab_context_menu_items_includes_reveal_in_finder_only_with_a_path_and_enabled() {
+    let p = std::path::Path::new("/tmp/demo.rs");
+    // Local macOS with a real path: Reveal in Finder sits after Close All,
+    // before the split/focus group — mirroring VS Code's lower-middle slot.
+    let items = build_tab_context_menu_items(0, 1, false, Some(p), true);
+    let labels: Vec<&str> = items.iter().map(|(s, _)| s.as_str()).collect();
+    assert_eq!(
+        labels,
+        [
+            "Close",
+            "Close All",
+            "Reveal in Finder",
+            "Split Editor Right"
+        ],
+    );
+    assert!(matches!(&items[2].1, MenuAction::RevealInFinder(rp) if rp == p));
+    // Remote (or non-macOS) session: entry withheld even with a path.
+    let remote = build_tab_context_menu_items(0, 1, false, Some(p), false);
+    assert!(remote.iter().all(|(s, _)| s != "Reveal in Finder"));
+    // A blank/untitled buffer (no path) never offers it, even when enabled.
+    let blank = build_tab_context_menu_items(0, 1, false, None, true);
+    assert!(blank.iter().all(|(s, _)| s != "Reveal in Finder"));
 }
 
 #[test]

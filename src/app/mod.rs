@@ -809,6 +809,8 @@ fn build_tab_context_menu_items(
     idx: usize,
     tab_count: usize,
     is_split: bool,
+    clicked: Option<&Path>,
+    reveal_enabled: bool,
 ) -> Vec<(String, MenuAction)> {
     let mut items: Vec<(String, MenuAction)> = Vec::new();
     items.push((String::from("Close"), MenuAction::CloseTab(idx)));
@@ -828,6 +830,15 @@ fn build_tab_context_menu_items(
         items.push((String::from("Close Saved"), MenuAction::CloseSavedTabs));
     }
     items.push((String::from("Close All"), MenuAction::CloseAllTabs));
+    // Reveal in Finder: local-macOS only, and only when the tab is backed by a
+    // real on-disk path (a blank/untitled buffer has nothing to reveal). On a
+    // remote SSH session the entry is withheld, matching the explorer menu.
+    if let Some(path) = clicked.filter(|_| reveal_enabled) {
+        items.push((
+            String::from("Reveal in Finder"),
+            MenuAction::RevealInFinder(path.to_path_buf()),
+        ));
+    }
     // Editor-group actions: split is offered when not already split;
     // focus-group navigation only once a second column exists.
     if is_split {
@@ -10828,6 +10839,16 @@ impl App {
             self.start_change_all_occurrences();
             return;
         }
+        // VS Code "Reveal in Finder" (Cmd+Opt+R) for the active file. Works on
+        // any tab backed by a real path (text, diff, sheet, image), so it sits
+        // above the text-only guards. Local-macOS only, matching the Explorer
+        // chord and the tab-menu entry; withheld on remote/headless sessions.
+        if !self.is_remote && cfg!(target_os = "macos") && is_reveal_in_finder_key(key) {
+            if let Some(path) = self.editor.path.clone() {
+                self.reveal_in_finder(path);
+            }
+            return;
+        }
         // VS Code "Toggle Line Comment" (Cmd+/ / Ctrl+/), "Toggle Block
         // Comment" (Shift+Alt+A), and "View: Toggle Word Wrap" (Alt+Z). All
         // act on a text buffer, so they no-op on read-only diff / sheet /
@@ -14807,10 +14828,13 @@ impl App {
                 // column with the sidebar.
                 if let Some(tab_idx) = self.editor.tab_at(m.column, m.row) {
                     self.focus_pane(Pane::Editor);
+                    let tab_path = self.editor.tab_path(tab_idx);
                     let items = build_tab_context_menu_items(
                         tab_idx,
                         self.editor.tab_count(),
                         self.editor_split.is_some(),
+                        tab_path.as_deref(),
+                        !self.is_remote && cfg!(target_os = "macos"),
                     );
                     self.context_menu = Some(ContextMenu {
                         origin: (m.column, m.row),
@@ -16200,7 +16224,7 @@ impl App {
         // Reveal in Finder is a local-macOS-only host bridge: on a remote SSH
         // session croft runs on a headless host with no Finder, so the chord
         // falls through there exactly as the menu entry is withheld.
-        if !self.is_remote && cfg!(target_os = "macos") && is_tree_reveal_in_finder_key(key) {
+        if !self.is_remote && cfg!(target_os = "macos") && is_reveal_in_finder_key(key) {
             if let Some(path) = self.explorer_selected_path() {
                 self.reveal_in_finder(path);
             }
@@ -17655,11 +17679,12 @@ fn is_tree_rename_key(key: KeyEvent) -> bool {
     key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::SUPER)
 }
 
-/// Explorer-pane shortcut: `Cmd+Opt+R` / `Ctrl+Opt+R` - "Reveal in Finder".
-/// The Alt requirement keeps this disjoint from `Cmd+R` (Rename), which
-/// rejects Alt, so the two R chords never collide. The caller additionally
-/// gates this to a local macOS session, matching the context-menu entry.
-fn is_tree_reveal_in_finder_key(key: KeyEvent) -> bool {
+/// `Cmd+Opt+R` / `Ctrl+Opt+R` - "Reveal in Finder". Used by both the Explorer
+/// (reveals the selected entry) and the editor (reveals the active file's path).
+/// The Alt requirement keeps this disjoint from `Cmd+R` (Rename), which rejects
+/// Alt, so the two R chords never collide. The caller additionally gates this to
+/// a local macOS session, matching the context-menu entry.
+fn is_reveal_in_finder_key(key: KeyEvent) -> bool {
     let KeyCode::Char(c) = key.code else {
         return false;
     };

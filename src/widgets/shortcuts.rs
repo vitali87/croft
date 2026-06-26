@@ -218,8 +218,8 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
             },
             ShortcutEntry {
                 keys: "Cmd/Ctrl+Opt+R",
-                description: "Reveal the selected entry in Finder (macOS)",
-                handler: "is_tree_reveal_in_finder_key",
+                description: "Reveal the selected entry or active file in Finder (macOS)",
+                handler: "is_reveal_in_finder_key",
             },
             ShortcutEntry {
                 keys: "Delete / Backspace",

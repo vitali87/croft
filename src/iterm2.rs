@@ -1489,7 +1489,7 @@ mod tests {
         assert_eq!(
             action_text(global, CMD_OPT_R_KEY),
             CMD_OPT_R_HEX,
-            "GlobalKeyMap must forward Cmd+Opt+R as a CSI-u sequence so croft's `is_tree_reveal_in_finder_key` fires and reveals the selected entry in Finder. Encoding: 'r' (codepoint 0x72 = 114) with kitty modifier byte 11 = 1 base + Alt(2) + Super(8), giving `ESC [ 114 ; 11 u` (decoded as ALT|SUPER, disjoint from plain Cmd+R = Rename)"
+            "GlobalKeyMap must forward Cmd+Opt+R as a CSI-u sequence so croft's `is_reveal_in_finder_key` fires and reveals the selected entry (or active editor file) in Finder. Encoding: 'r' (codepoint 0x72 = 114) with kitty modifier byte 11 = 1 base + Alt(2) + Super(8), giving `ESC [ 114 ; 11 u` (decoded as ALT|SUPER, disjoint from plain Cmd+R = Rename)"
         );
     }
 
