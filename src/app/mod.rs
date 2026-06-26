@@ -5431,14 +5431,15 @@ impl App {
 
             let row_style = Style::default().fg(Color::Rgb(0xc5, 0xcd, 0xd9));
 
-            // Header row: "▎ IN THIS RELEASE (vX.Y.Z)". The highlights below
-            // are hand-curated data baked into this build (see
+            // Header row: "> IN THIS RELEASE (vX.Y.Z)". The leading chevron
+            // echoes the cr<>ft wordmark's bracket. The highlights below are
+            // hand-curated data baked into this build (see
             // `crate::release_notes`), so the heading names the exact version.
             let header_y = inner_y;
             frame.buffer_mut().set_string(
                 inner_x,
                 header_y,
-                "\u{258e} ",
+                "> ",
                 Style::default()
                     .fg(rgb_color(GRAD_TR))
                     .add_modifier(Modifier::BOLD),
