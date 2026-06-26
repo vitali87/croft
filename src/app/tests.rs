@@ -11029,7 +11029,10 @@ fn build_tab_context_menu_items_includes_all_four_close_actions_in_the_middle_of
             "Close Saved",
             "Close All",
             "Pin",
-            "Split Editor Right"
+            "Split Up",
+            "Split Down",
+            "Split Left",
+            "Split Right"
         ],
         "all close actions must appear and in this order — mirrors VS Code's tab strip"
     );
@@ -11054,7 +11057,10 @@ fn build_tab_context_menu_items_hides_close_to_the_right_on_the_last_tab() {
             "Close Saved",
             "Close All",
             "Pin",
-            "Split Editor Right"
+            "Split Up",
+            "Split Down",
+            "Split Left",
+            "Split Right"
         ],
         "Close to the Right must be suppressed on the rightmost tab"
     );
@@ -11066,7 +11072,15 @@ fn build_tab_context_menu_items_hides_close_others_when_only_one_tab_is_open() {
     let labels: Vec<&str> = items.iter().map(|(s, _)| s.as_str()).collect();
     assert_eq!(
         labels,
-        ["Close", "Close All", "Pin", "Split Editor Right"],
+        [
+            "Close",
+            "Close All",
+            "Pin",
+            "Split Up",
+            "Split Down",
+            "Split Left",
+            "Split Right"
+        ],
         "with a single tab, Close Others / Close to the Right / Close Saved are all no-ops and must be suppressed"
     );
 }
@@ -11088,7 +11102,10 @@ fn build_tab_context_menu_items_includes_reveal_in_finder_only_with_a_path_and_e
             "Reveal in Finder",
             "Reveal in Explorer View",
             "Pin",
-            "Split Editor Right"
+            "Split Up",
+            "Split Down",
+            "Split Left",
+            "Split Right"
         ],
     );
     assert!(matches!(&items[4].1, MenuAction::RevealInFinder(rp) if rp == p));
@@ -11116,7 +11133,10 @@ fn build_tab_context_menu_items_offers_reveal_in_explorer_for_any_path() {
             "Copy Relative Path",
             "Reveal in Explorer View",
             "Pin",
-            "Split Editor Right"
+            "Split Up",
+            "Split Down",
+            "Split Left",
+            "Split Right"
         ]
     );
     assert!(matches!(&remote[4].1, MenuAction::RevealInExplorer(rp) if rp == p));
@@ -11141,7 +11161,10 @@ fn build_tab_context_menu_items_offers_copy_path_for_any_path_local_or_remote() 
             "Copy Relative Path",
             "Reveal in Explorer View",
             "Pin",
-            "Split Editor Right"
+            "Split Up",
+            "Split Down",
+            "Split Left",
+            "Split Right"
         ]
     );
     assert!(matches!(&remote[2].1, MenuAction::CopyTabPath(cp) if cp == p));
@@ -11162,7 +11185,7 @@ fn build_tab_context_menu_items_offers_keep_open_only_for_a_preview_tab() {
     assert!(matches!(keep, Some((_, MenuAction::KeepTabOpen(0)))));
     assert!(
         preview.iter().position(|(s, _)| s == "Keep Open")
-            < preview.iter().position(|(s, _)| s == "Split Editor Right")
+            < preview.iter().position(|(s, _)| s == "Split Up")
     );
     // A permanent (non-preview) tab never offers it.
     let permanent = build_tab_context_menu_items(0, 1, false, Some(p), false, false, false);
@@ -11180,7 +11203,7 @@ fn build_tab_context_menu_items_offers_pin_or_unpin_carrying_the_tab_index() {
     assert!(unpinned.iter().all(|(s, _)| s != "Unpin"));
     let keep = unpinned.iter().position(|(s, _)| s == "Keep Open");
     let pin_pos = unpinned.iter().position(|(s, _)| s == "Pin");
-    let split = unpinned.iter().position(|(s, _)| s == "Split Editor Right");
+    let split = unpinned.iter().position(|(s, _)| s == "Split Up");
     assert!(keep < pin_pos && pin_pos < split);
 
     let pinned = build_tab_context_menu_items(0, 1, false, Some(p), false, false, true);
@@ -12212,6 +12235,106 @@ fn split_editor_duplicates_active_file_into_a_focused_right_group() {
     // The original group survives in the left column.
     let groups = app.editor_layout.inactive_groups();
     assert_eq!(groups[0].path.as_deref(), Some(path.as_path()));
+}
+
+#[test]
+fn split_down_makes_a_vertical_split_with_the_new_group_active_below() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.txt", "hello\nworld");
+    let path = app.editor.path.clone().unwrap();
+
+    app.split_editor_dir(editor_layout::SplitDir::Vertical, true);
+
+    assert!(app.editor_layout.is_split());
+    assert_eq!(
+        app.editor_layout.root_split_dir(),
+        Some(editor_layout::SplitDir::Vertical),
+        "Split Down stacks the groups vertically"
+    );
+    assert_eq!(
+        app.editor_layout.active_dfs_index(),
+        1,
+        "the new (focused) group is the LOWER leaf"
+    );
+    assert_eq!(app.editor.path.as_deref(), Some(path.as_path()));
+    let groups = app.editor_layout.inactive_groups();
+    assert_eq!(groups[0].path.as_deref(), Some(path.as_path()));
+}
+
+#[test]
+fn split_up_makes_a_vertical_split_with_the_new_group_active_above() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.txt", "hi");
+    app.split_editor_dir(editor_layout::SplitDir::Vertical, false);
+    assert_eq!(
+        app.editor_layout.root_split_dir(),
+        Some(editor_layout::SplitDir::Vertical)
+    );
+    assert_eq!(
+        app.editor_layout.active_dfs_index(),
+        0,
+        "Split Up puts the new focused group in the UPPER leaf"
+    );
+}
+
+#[test]
+fn split_left_makes_a_horizontal_split_with_the_new_group_active_left() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.txt", "hi");
+    app.split_editor_dir(editor_layout::SplitDir::Horizontal, false);
+    assert_eq!(
+        app.editor_layout.root_split_dir(),
+        Some(editor_layout::SplitDir::Horizontal)
+    );
+    assert_eq!(
+        app.editor_layout.active_dfs_index(),
+        0,
+        "Split Left puts the new focused group in the LEFT leaf"
+    );
+}
+
+#[test]
+fn cmd_k_backslash_chord_splits_the_editor_up() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.txt", "hi");
+    app.handle_key(key(KeyCode::Char('k'), KeyModifiers::SUPER))
+        .unwrap();
+    assert!(app.cmd_k_leader.is_some(), "Cmd+K arms the chord leader");
+    app.handle_key(key(KeyCode::Char('\\'), KeyModifiers::SUPER))
+        .unwrap();
+    assert_eq!(
+        app.editor_layout.root_split_dir(),
+        Some(editor_layout::SplitDir::Vertical),
+        "Cmd+K Cmd+\\ splits the editor vertically"
+    );
+    assert_eq!(
+        app.editor_layout.active_dfs_index(),
+        0,
+        "Cmd+K Cmd+\\ = Split Up (new group above); plain Cmd+\\ stays Split Right"
+    );
+}
+
+#[test]
+fn split_down_lays_the_groups_out_stacked_with_a_horizontal_seam() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.txt", "hi");
+    app.split_editor_dir(editor_layout::SplitDir::Vertical, true);
+    let area = ratatui::layout::Rect::new(0, 0, 80, 24);
+    let rects = app.editor_layout.leaf_rects(area, 10);
+    assert_eq!(rects.len(), 2);
+    assert_eq!(
+        rects[0].x, rects[1].x,
+        "stacked groups share the same column"
+    );
+    assert!(
+        rects[0].y < rects[1].y,
+        "the two groups stack top over bottom"
+    );
+    assert_eq!(
+        rects[0].height + rects[1].height,
+        area.height,
+        "they tile the full height with the seam carrying no dedicated row"
+    );
 }
 
 #[test]

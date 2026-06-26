@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Feature,
-    summary: "Pin (Cmd+K Shift+Enter): pin an editor tab from the tab menu so it stays leftmost and survives Close Others and Close to the Right.",
+    summary: "Split the editor Up, Down, Left, or Right from the tab menu (Split Up = Cmd+K Cmd+\\); vertical splits stack the groups with a draggable horizontal seam.",
 }];

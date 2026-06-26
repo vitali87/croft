@@ -19,11 +19,7 @@ use crate::widgets::editor::EditorTabs;
 pub enum SplitDir {
     /// Children laid out left-to-right (VS Code "Split Left/Right").
     Horizontal,
-    /// Children laid out top-to-bottom (VS Code "Split Up/Down"). The layout
-    /// maths and tests already handle it; the operations that build a vertical
-    /// split (Split Up/Down) arrive in the next stage, so it is unconstructed
-    /// outside tests for now.
-    #[allow(dead_code)]
+    /// Children laid out top-to-bottom (VS Code "Split Up/Down").
     Vertical,
 }
 
@@ -155,11 +151,6 @@ impl EditorLayout {
         }
     }
 
-    /// The tree root, for rendering and hit-testing.
-    pub fn root(&self) -> &LayoutNode {
-        &self.root
-    }
-
     /// True when more than one group exists (the editor pane is split).
     pub fn is_split(&self) -> bool {
         self.leaf_count() > 1
@@ -250,6 +241,15 @@ impl EditorLayout {
     pub fn inactive_dfs_index_at(&self, col: u16, row: u16) -> Option<usize> {
         let mut idx = 0;
         inactive_index_at(&self.root, col, row, &mut idx)
+    }
+
+    /// Orientation of the root split, or `None` when unsplit (a single leaf).
+    /// Drives the seam's drag axis and tells the tab menu which split exists.
+    pub fn root_split_dir(&self) -> Option<SplitDir> {
+        match &self.root {
+            LayoutNode::Split { dir, .. } => Some(*dir),
+            LayoutNode::Leaf(_) => None,
+        }
     }
 
     /// Set the two child weights of the sole root split, so a seam drag pins
@@ -586,7 +586,7 @@ mod tests {
         assert!(layout.is_split());
         // New focused group is the right (after) leaf → depth-first index 1.
         assert_eq!(layout.active_dfs_index(), 1);
-        match layout.root() {
+        match &layout.root {
             LayoutNode::Split { dir, children } => {
                 assert_eq!(*dir, SplitDir::Horizontal);
                 assert_eq!(children.len(), 2);
@@ -608,7 +608,7 @@ mod tests {
 
         assert_eq!(layout.leaf_count(), 2);
         assert_eq!(layout.active_dfs_index(), 0); // active is now the left leaf
-        match layout.root() {
+        match &layout.root {
             LayoutNode::Split { children, .. } => {
                 assert!(matches!(children[0].node, LayoutNode::Leaf(None)));
                 assert!(matches!(children[1].node, LayoutNode::Leaf(Some(_))));
@@ -628,7 +628,7 @@ mod tests {
         assert_eq!(layout.leaf_count(), 1);
         assert!(!layout.is_split());
         assert_eq!(layout.active_dfs_index(), 0);
-        assert!(matches!(layout.root(), LayoutNode::Leaf(None)));
+        assert!(matches!(&layout.root, LayoutNode::Leaf(None)));
     }
 
     #[test]

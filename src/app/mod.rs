@@ -623,9 +623,15 @@ enum MenuAction {
     /// Toggle the pinned state of the tab at `idx` (VS Code's "Pin" / "Unpin").
     /// Pinned tabs stay leftmost and survive Close Others / Close to the Right.
     ToggleTabPin(usize),
-    /// Split the editor into two side-by-side columns, duplicating the
-    /// active file into the new (right) group.
+    /// Split the editor side by side, the new (focused) duplicate to the RIGHT
+    /// (VS Code "Split Right"). The default split.
     SplitEditor,
+    /// Split side by side, the new focused duplicate to the LEFT ("Split Left").
+    SplitEditorLeft,
+    /// Split stacked, the new focused duplicate ABOVE ("Split Up").
+    SplitEditorUp,
+    /// Split stacked, the new focused duplicate BELOW ("Split Down").
+    SplitEditorDown,
     /// Move keyboard focus to the left editor group (while split).
     FocusGroupLeft,
     /// Move keyboard focus to the right editor group (while split).
@@ -744,6 +750,7 @@ fn shortcut_for(action: &MenuAction) -> Option<&'static str> {
         MenuAction::KeepTabOpen(_) => Some("⌘K ⏎"),
         MenuAction::ToggleTabPin(_) => Some("⌘K ⇧⏎"),
         MenuAction::SplitEditor => Some("⌘\\"),
+        MenuAction::SplitEditorUp => Some("⌘K ⌘\\"),
         MenuAction::FocusGroupLeft => Some("⌥⌘←"),
         MenuAction::FocusGroupRight => Some("⌥⌘→"),
         MenuAction::RenameSymbolAt { .. } => Some("F2"),
@@ -899,8 +906,10 @@ fn build_tab_context_menu_items(
         String::from(if clicked_is_pinned { "Unpin" } else { "Pin" }),
         MenuAction::ToggleTabPin(idx),
     ));
-    // Editor-group actions: split is offered when not already split;
-    // focus-group navigation only once a second column exists.
+    // Editor-group actions: the four directional splits are offered when not
+    // already split; focus-group navigation only once a second group exists.
+    // (The flat Split Up/Down/Left/Right entries move into a nested "Split &
+    // Move" submenu in a later increment.)
     if is_split {
         items.push((String::from("Focus Left Group"), MenuAction::FocusGroupLeft));
         items.push((
@@ -908,7 +917,10 @@ fn build_tab_context_menu_items(
             MenuAction::FocusGroupRight,
         ));
     } else {
-        items.push((String::from("Split Editor Right"), MenuAction::SplitEditor));
+        items.push((String::from("Split Up"), MenuAction::SplitEditorUp));
+        items.push((String::from("Split Down"), MenuAction::SplitEditorDown));
+        items.push((String::from("Split Left"), MenuAction::SplitEditorLeft));
+        items.push((String::from("Split Right"), MenuAction::SplitEditor));
     }
     items
 }
@@ -1401,9 +1413,16 @@ pub struct App {
     sidebar_splitter_x: Option<u16>,
     terminal_splitter_y: Option<u16>,
     /// Last-rendered x of the seam between the two editor columns while
-    /// split. `None` when not split. Used to hit-test the editor-split
-    /// drag, mirroring `sidebar_splitter_x`.
+    /// split side by side. `None` when not split horizontally. Used to
+    /// hit-test the editor-split drag, mirroring `sidebar_splitter_x`.
     editor_splitter_x: Option<u16>,
+    /// Last-rendered y of the seam between two stacked editor groups while
+    /// split top/bottom. `None` unless the root is a vertical 2-group split.
+    /// The vertical analogue of `editor_splitter_x`.
+    editor_splitter_y: Option<u16>,
+    /// Last-rendered rect of the whole editor pane (all groups + seams), so a
+    /// vertical-seam drag can map a pointer row onto the top group's height.
+    editor_pane_area: Rect,
     /// Hit-test rectangles of the "[+]" buttons - one per terminal pane,
     /// indexed in lock-step with `terminals`. Empty when the pane is hidden
     /// or every pane is too narrow for the label.
@@ -1663,6 +1682,9 @@ enum SplitterDrag {
     /// Dragging the vertical seam between the two editor columns while
     /// the editor is split side by side.
     EditorSplit,
+    /// Dragging the horizontal seam between two stacked editor groups while
+    /// the editor is split top/bottom.
+    EditorSplitVertical,
 }
 
 /// Minimum width in cells of either editor column while split, so a drag
@@ -2014,6 +2036,8 @@ impl App {
             terminal_height: None,
             splitter_drag: None,
             editor_splitter_x: None,
+            editor_splitter_y: None,
+            editor_pane_area: Rect::default(),
             sidebar_splitter_x: None,
             terminal_splitter_y: None,
             terminal_add_buttons: Vec::new(),
@@ -6061,7 +6085,20 @@ impl App {
     /// cursor/scroll position) and takes focus, landing in the right
     /// column. No-op if already split or the active tab has no path on
     /// disk (a blank/unsaved buffer has nothing to mirror).
+    /// "Split Editor Right": split the active group side by side, the new
+    /// focused duplicate to the right. The default split, on `Cmd+\`.
     fn split_editor(&mut self) {
+        self.split_editor_dir(editor_layout::SplitDir::Horizontal, true);
+    }
+
+    /// Split the active group, duplicating its file into a new focused group
+    /// placed in the direction the caller asks for. `dir` chooses the seam's
+    /// orientation (Horizontal = side by side, Vertical = stacked) and
+    /// `new_after` whether the NEW group sits after the existing one (right /
+    /// below) or before it (left / above) — the four VS Code Split commands:
+    /// Right = (H, after), Left = (H, before), Down = (V, after), Up = (V,
+    /// before). Splitting is offered only from an unsplit editor for now.
+    fn split_editor_dir(&mut self, dir: editor_layout::SplitDir, new_after: bool) {
         if self.editor_layout.is_split() {
             return;
         }
@@ -6085,12 +6122,10 @@ impl App {
         // sub-line offset) so the duplicate opens exactly where the
         // source was rather than at the top of the file.
         group.copy_view_position_from(&self.editor);
-        // The existing group settles into the LEFT leaf; the new focused group
-        // (now in `self.editor`, always the active leaf) renders on the RIGHT.
-        // `new_after = true` puts the new active group after the existing one.
+        // The new focused group (now in `self.editor`, always the active leaf)
+        // takes the active slot; the existing group settles into the sibling.
         let existing = std::mem::replace(&mut self.editor, group);
-        self.editor_layout
-            .split_active(existing, editor_layout::SplitDir::Horizontal, true);
+        self.editor_layout.split_active(existing, dir, new_after);
         self.focus_pane(Pane::Editor);
     }
 
@@ -6134,6 +6169,7 @@ impl App {
         // can't ghost after the column disappears.
         self.editor = self.editor_layout.collapse_active();
         self.editor_splitter_x = None;
+        self.editor_splitter_y = None;
         self.disable_editor_image(1);
         // Focus stays on the editor pane; just re-light the promoted
         // group's border. (No `focus_pane` so this is safe to call from
@@ -6320,6 +6356,7 @@ impl App {
             self.disable_editor_image(0);
             self.disable_editor_image(1);
             self.editor_splitter_x = None;
+            self.editor_splitter_y = None;
             // Keep the editor's hit-test rectangles fresh so the activity-bar
             // / tree click logic still works even though we skipped the
             // EditorTabs widget this frame.
@@ -6344,6 +6381,7 @@ impl App {
             // into `self.editor`; every other group lives in `editor_layout`.
             // Lay the leaves out and paint each at its rect (depth-first order),
             // reporting the active group's rect so popups anchor there.
+            self.editor_pane_area = editor_area;
             let rects = self.editor_layout.leaf_rects(editor_area, EDITOR_SPLIT_MIN);
             let active_idx = self.editor_layout.active_dfs_index();
             let focused_area = if self.editor_layout.is_split() {
@@ -6364,20 +6402,19 @@ impl App {
                     group.hover_pointer = pointer;
                     frame.render_widget(group, rect);
                 }
-                // A single vertical seam is the drag target — the only split
-                // shape this stage builds. Its X is the right column's left edge.
-                self.editor_splitter_x = if rects.len() == 2
-                    && matches!(
-                        self.editor_layout.root(),
-                        editor_layout::LayoutNode::Split {
-                            dir: editor_layout::SplitDir::Horizontal,
-                            ..
-                        }
-                    ) {
-                    Some(rects[1].x)
-                } else {
-                    None
-                };
+                // The seam between the two groups is the drag target. A
+                // horizontal split has a vertical seam at the second column's
+                // left edge; a vertical split has a horizontal seam at the
+                // second row's top edge. Exactly one is set (or neither, for a
+                // shape this stage doesn't build).
+                let root_dir = self.editor_layout.root_split_dir();
+                let two = rects.len() == 2;
+                self.editor_splitter_x = (two
+                    && root_dir == Some(editor_layout::SplitDir::Horizontal))
+                .then(|| rects[1].x);
+                self.editor_splitter_y = (two
+                    && root_dir == Some(editor_layout::SplitDir::Vertical))
+                .then(|| rects[1].y);
                 // Image overlays stay keyed by physical column (0 = left).
                 if rects.len() == 2 {
                     self.update_editor_image_overlay(0, rects[0]);
@@ -6390,6 +6427,7 @@ impl App {
             } else {
                 frame.render_widget(&mut self.editor, editor_area);
                 self.editor_splitter_x = None;
+                self.editor_splitter_y = None;
                 self.update_editor_image_overlay(0, editor_area);
                 // No right pane: make sure its slot can't ghost an image.
                 self.disable_editor_image(1);
@@ -7324,6 +7362,12 @@ impl App {
             // Cmd+K Cmd+T / Cmd+K T: open the Color Theme picker.
             KeyCode::Char(c) if plain && c.eq_ignore_ascii_case(&'t') => {
                 self.open_theme_picker();
+                true
+            }
+            // Cmd+K Cmd+\ (or Cmd+K \): split the active group UP (stacked, the
+            // new group above). Plain Cmd+\ already splits Right.
+            KeyCode::Char('\\') if plain => {
+                self.split_editor_dir(editor_layout::SplitDir::Vertical, false);
                 true
             }
             // Cmd+K →: close the editors to the right of the active tab.
@@ -14810,6 +14854,7 @@ impl App {
         if matches!(m.kind, MouseEventKind::Down(_))
             && self.editor_layout.is_split()
             && self.editor_splitter_x != Some(m.column)
+            && self.editor_splitter_y != Some(m.row)
             && let Some(target) = self.editor_layout.inactive_dfs_index_at(m.column, m.row)
         {
             let current = std::mem::take(&mut self.editor);
@@ -15158,12 +15203,20 @@ impl App {
                         return;
                     }
                 }
-                // Seam between the two editor columns while split. Same
-                // two-column hit-zone as the sidebar seam.
+                // Seam between the two editor columns while split side by side.
+                // Same two-column hit-zone as the sidebar seam.
                 if let Some(x) = self.editor_splitter_x
                     && (m.column == x || m.column == x.saturating_sub(1))
                 {
                     self.splitter_drag = Some(SplitterDrag::EditorSplit);
+                    return;
+                }
+                // Seam between two stacked editor groups while split top/bottom.
+                // Same two-row hit-zone as the terminal seam.
+                if let Some(y) = self.editor_splitter_y
+                    && (m.row == y || m.row == y.saturating_sub(1))
+                {
+                    self.splitter_drag = Some(SplitterDrag::EditorSplitVertical);
                     return;
                 }
                 // OPEN EDITORS: header toggles collapse; a row activates that
@@ -16526,6 +16579,15 @@ impl App {
                 self.poke_cursor();
             }
             MenuAction::SplitEditor => self.split_editor(),
+            MenuAction::SplitEditorLeft => {
+                self.split_editor_dir(editor_layout::SplitDir::Horizontal, false)
+            }
+            MenuAction::SplitEditorUp => {
+                self.split_editor_dir(editor_layout::SplitDir::Vertical, false)
+            }
+            MenuAction::SplitEditorDown => {
+                self.split_editor_dir(editor_layout::SplitDir::Vertical, true)
+            }
             MenuAction::FocusGroupLeft => self.focus_editor_group(true),
             MenuAction::FocusGroupRight => self.focus_editor_group(false),
             MenuAction::CompareWithSelected { anchor, other } => {
@@ -17110,6 +17172,22 @@ impl App {
                 let new_right = total.saturating_sub(new_left).max(1);
                 self.editor_layout
                     .set_root_split_weights(new_left, new_right);
+            }
+            SplitterDrag::EditorSplitVertical => {
+                if !self.editor_layout.is_split() {
+                    return;
+                }
+                // The pointer row minus the editor pane's top edge is the new
+                // top-group height; the seam carries no dedicated row so top +
+                // bottom == the pane height. Pin the split's child weights to
+                // those cell counts (weights apportion along the split's axis).
+                let pane = self.editor_pane_area;
+                let total = pane.height;
+                let max_top = total.saturating_sub(EDITOR_SPLIT_MIN).max(EDITOR_SPLIT_MIN);
+                let new_top = row.saturating_sub(pane.y).clamp(EDITOR_SPLIT_MIN, max_top);
+                let new_bottom = total.saturating_sub(new_top).max(1);
+                self.editor_layout
+                    .set_root_split_weights(new_top, new_bottom);
             }
         }
     }
