@@ -632,6 +632,16 @@ enum MenuAction {
     SplitEditorUp,
     /// Split stacked, the new focused duplicate BELOW ("Split Down").
     SplitEditorDown,
+    /// Move the active editor into the group above ("Move Above").
+    MoveEditorUp,
+    /// Move the active editor into the group below ("Move Below").
+    MoveEditorDown,
+    /// Move the active editor into the group to the left ("Move Left").
+    MoveEditorLeft,
+    /// Move the active editor into the group to the right ("Move Right").
+    MoveEditorRight,
+    /// Open a second view of the active file beside it ("Split in Group").
+    SplitInGroup,
     /// Move keyboard focus to the left editor group (while split).
     FocusGroupLeft,
     /// Move keyboard focus to the right editor group (while split).
@@ -751,6 +761,7 @@ fn shortcut_for(action: &MenuAction) -> Option<&'static str> {
         MenuAction::ToggleTabPin(_) => Some("⌘K ⇧⏎"),
         MenuAction::SplitEditor => Some("⌘\\"),
         MenuAction::SplitEditorUp => Some("⌘K ⌘\\"),
+        MenuAction::SplitInGroup => Some("⌘K ⇧⌘\\"),
         MenuAction::FocusGroupLeft => Some("⌥⌘←"),
         MenuAction::FocusGroupRight => Some("⌥⌘→"),
         MenuAction::RenameSymbolAt { .. } => Some("F2"),
@@ -906,21 +917,26 @@ fn build_tab_context_menu_items(
         String::from(if clicked_is_pinned { "Unpin" } else { "Pin" }),
         MenuAction::ToggleTabPin(idx),
     ));
-    // Editor-group actions: the four directional splits are offered when not
-    // already split; focus-group navigation only once a second group exists.
-    // (The flat Split Up/Down/Left/Right entries move into a nested "Split &
-    // Move" submenu in a later increment.)
+    // Split & Move: the four directional splits, the four directional moves, and
+    // Split in Group. Splits nest, so they are always offered (not only when
+    // unsplit). Focus-group navigation appears once a second group exists.
+    // (These flat entries move into a nested "Split & Move" submenu in a later
+    // increment.)
+    items.push((String::from("Split Up"), MenuAction::SplitEditorUp));
+    items.push((String::from("Split Down"), MenuAction::SplitEditorDown));
+    items.push((String::from("Split Left"), MenuAction::SplitEditorLeft));
+    items.push((String::from("Split Right"), MenuAction::SplitEditor));
+    items.push((String::from("Move Up"), MenuAction::MoveEditorUp));
+    items.push((String::from("Move Down"), MenuAction::MoveEditorDown));
+    items.push((String::from("Move Left"), MenuAction::MoveEditorLeft));
+    items.push((String::from("Move Right"), MenuAction::MoveEditorRight));
+    items.push((String::from("Split in Group"), MenuAction::SplitInGroup));
     if is_split {
         items.push((String::from("Focus Left Group"), MenuAction::FocusGroupLeft));
         items.push((
             String::from("Focus Right Group"),
             MenuAction::FocusGroupRight,
         ));
-    } else {
-        items.push((String::from("Split Up"), MenuAction::SplitEditorUp));
-        items.push((String::from("Split Down"), MenuAction::SplitEditorDown));
-        items.push((String::from("Split Left"), MenuAction::SplitEditorLeft));
-        items.push((String::from("Split Right"), MenuAction::SplitEditor));
     }
     items
 }
@@ -6116,6 +6132,52 @@ impl App {
         self.focus_pane(Pane::Editor);
     }
 
+    /// VS Code "Move Editor into <dir> Group": relocate the active tab to the
+    /// group adjacent in `dir`. If a neighbour exists there the tab moves into
+    /// it (the source collapses when its last tab leaves); otherwise a new group
+    /// is created in that direction holding the moved tab. Moving the only tab
+    /// of a single group with no neighbour is a no-op (nowhere to move to).
+    fn move_active_editor(&mut self, dir: editor_layout::Dir) {
+        // A nominal area: seam adjacency is scale-invariant, so the exact pane
+        // size doesn't matter for finding the directional neighbour.
+        let synth = ratatui::layout::Rect::new(0, 0, 10_000, 10_000);
+        match self.editor_layout.neighbor_leaf_in_dir(synth, 1, dir) {
+            Some(target) => {
+                let moved = self.editor.take_active_editor();
+                let source_emptied = self.editor.is_blank_initial();
+                let reduced = std::mem::take(&mut self.editor);
+                self.editor = self.editor_layout.refocus_to_dfs(reduced, target);
+                self.editor.push_editor(moved);
+                if source_emptied {
+                    self.editor_layout
+                        .prune_blank_inactive(|t| t.is_blank_initial());
+                }
+                self.focus_pane(Pane::Editor);
+            }
+            None => {
+                if self.editor.tab_count() <= 1 {
+                    self.status = String::from("Move: the editor is already a single group");
+                    return;
+                }
+                let moved = self.editor.take_active_editor();
+                let mut group = EditorTabs::default();
+                group.push_editor(moved);
+                let existing = std::mem::replace(&mut self.editor, group);
+                self.editor_layout
+                    .split_active(existing, dir.split_dir(), dir.places_new_after());
+                self.focus_pane(Pane::Editor);
+            }
+        }
+    }
+
+    /// VS Code "Split in Group": open a second view of the active file beside
+    /// it. A TUI has no true in-group sub-view, so the observable equivalent is
+    /// a side-by-side split duplicating the active file — the same result as
+    /// Split Right.
+    fn split_in_group(&mut self) {
+        self.split_editor_dir(editor_layout::SplitDir::Horizontal, true);
+    }
+
     /// Move keyboard focus to the editor group in the given physical
     /// column (`true` = left, `false` = right). Hoists the active group
     /// through `editor_layout` so the focused group is always `editor`, keeping
@@ -7356,6 +7418,13 @@ impl App {
             // Cmd+K Cmd+T / Cmd+K T: open the Color Theme picker.
             KeyCode::Char(c) if plain && c.eq_ignore_ascii_case(&'t') => {
                 self.open_theme_picker();
+                true
+            }
+            // Cmd+K Shift+Cmd+\: open a second view of the active file beside it
+            // ("Split in Group"). Must precede the plain Cmd+\ (Split Up) arm,
+            // which ignores Shift. Shift+\ may arrive as '|' on some layouts.
+            KeyCode::Char('\\' | '|') if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                self.split_in_group();
                 true
             }
             // Cmd+K Cmd+\ (or Cmd+K \): split the active group UP (stacked, the
@@ -16571,6 +16640,11 @@ impl App {
             MenuAction::SplitEditorDown => {
                 self.split_editor_dir(editor_layout::SplitDir::Vertical, true)
             }
+            MenuAction::MoveEditorUp => self.move_active_editor(editor_layout::Dir::Up),
+            MenuAction::MoveEditorDown => self.move_active_editor(editor_layout::Dir::Down),
+            MenuAction::MoveEditorLeft => self.move_active_editor(editor_layout::Dir::Left),
+            MenuAction::MoveEditorRight => self.move_active_editor(editor_layout::Dir::Right),
+            MenuAction::SplitInGroup => self.split_in_group(),
             MenuAction::FocusGroupLeft => self.focus_editor_group(true),
             MenuAction::FocusGroupRight => self.focus_editor_group(false),
             MenuAction::CompareWithSelected { anchor, other } => {

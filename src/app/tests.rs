@@ -11032,7 +11032,12 @@ fn build_tab_context_menu_items_includes_all_four_close_actions_in_the_middle_of
             "Split Up",
             "Split Down",
             "Split Left",
-            "Split Right"
+            "Split Right",
+            "Move Up",
+            "Move Down",
+            "Move Left",
+            "Move Right",
+            "Split in Group"
         ],
         "all close actions must appear and in this order — mirrors VS Code's tab strip"
     );
@@ -11060,7 +11065,12 @@ fn build_tab_context_menu_items_hides_close_to_the_right_on_the_last_tab() {
             "Split Up",
             "Split Down",
             "Split Left",
-            "Split Right"
+            "Split Right",
+            "Move Up",
+            "Move Down",
+            "Move Left",
+            "Move Right",
+            "Split in Group"
         ],
         "Close to the Right must be suppressed on the rightmost tab"
     );
@@ -11079,7 +11089,12 @@ fn build_tab_context_menu_items_hides_close_others_when_only_one_tab_is_open() {
             "Split Up",
             "Split Down",
             "Split Left",
-            "Split Right"
+            "Split Right",
+            "Move Up",
+            "Move Down",
+            "Move Left",
+            "Move Right",
+            "Split in Group"
         ],
         "with a single tab, Close Others / Close to the Right / Close Saved are all no-ops and must be suppressed"
     );
@@ -11105,7 +11120,12 @@ fn build_tab_context_menu_items_includes_reveal_in_finder_only_with_a_path_and_e
             "Split Up",
             "Split Down",
             "Split Left",
-            "Split Right"
+            "Split Right",
+            "Move Up",
+            "Move Down",
+            "Move Left",
+            "Move Right",
+            "Split in Group"
         ],
     );
     assert!(matches!(&items[4].1, MenuAction::RevealInFinder(rp) if rp == p));
@@ -11136,7 +11156,12 @@ fn build_tab_context_menu_items_offers_reveal_in_explorer_for_any_path() {
             "Split Up",
             "Split Down",
             "Split Left",
-            "Split Right"
+            "Split Right",
+            "Move Up",
+            "Move Down",
+            "Move Left",
+            "Move Right",
+            "Split in Group"
         ]
     );
     assert!(matches!(&remote[4].1, MenuAction::RevealInExplorer(rp) if rp == p));
@@ -11164,7 +11189,12 @@ fn build_tab_context_menu_items_offers_copy_path_for_any_path_local_or_remote() 
             "Split Up",
             "Split Down",
             "Split Left",
-            "Split Right"
+            "Split Right",
+            "Move Up",
+            "Move Down",
+            "Move Left",
+            "Move Right",
+            "Split in Group"
         ]
     );
     assert!(matches!(&remote[2].1, MenuAction::CopyTabPath(cp) if cp == p));
@@ -12285,6 +12315,78 @@ fn split_right_then_split_down_yields_three_tiled_groups() {
 }
 
 #[test]
+fn move_right_with_no_neighbor_creates_a_new_group_with_the_moved_tab() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.txt", "A");
+    let b = tmp.path().join("b.txt");
+    std::fs::write(&b, "B").unwrap();
+    app.editor.open_pinned(&b).unwrap(); // active group: a.txt + b.txt, active = b
+    assert_eq!(app.editor.tab_count(), 2);
+    app.move_active_editor(editor_layout::Dir::Right);
+    assert_eq!(
+        app.editor_layout.leaf_count(),
+        2,
+        "no neighbour to the right → a new group is created for the moved tab"
+    );
+    assert_eq!(
+        app.editor.path.as_deref(),
+        Some(b.as_path()),
+        "the moved tab is active in the new group"
+    );
+    let groups = app.editor_layout.inactive_groups();
+    assert_eq!(groups.len(), 1);
+    assert!(
+        groups[0]
+            .iter_tabs()
+            .all(|e| e.path.as_deref() != Some(b.as_path())),
+        "the source group no longer holds the moved tab"
+    );
+}
+
+#[test]
+fn move_left_into_an_existing_neighbor_relocates_and_collapses_the_emptied_source() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.txt", "A");
+    let a = tmp.path().join("a.txt");
+    app.split_editor_dir(editor_layout::SplitDir::Horizontal, true); // right group active, dup of a
+    let b = tmp.path().join("b.txt");
+    std::fs::write(&b, "B").unwrap();
+    app.editor.open_preview(&b).unwrap(); // right group now shows b (single tab)
+    assert_eq!(app.editor_layout.leaf_count(), 2);
+    app.move_active_editor(editor_layout::Dir::Left); // move b into the left (a) group
+    assert_eq!(
+        app.editor_layout.leaf_count(),
+        1,
+        "the emptied right group collapses away"
+    );
+    let paths: Vec<_> = app
+        .editor
+        .iter_tabs()
+        .filter_map(|e| e.path.clone())
+        .collect();
+    assert!(
+        paths.iter().any(|p| p == &a) && paths.iter().any(|p| p == &b),
+        "both a.txt and the moved b.txt now live in the surviving group: {paths:?}"
+    );
+}
+
+#[test]
+fn split_in_group_opens_a_second_view_of_the_active_file_beside_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.txt", "A");
+    let a = tmp.path().join("a.txt");
+    app.split_in_group();
+    assert_eq!(app.editor_layout.leaf_count(), 2, "a second group appears");
+    assert_eq!(app.editor.path.as_deref(), Some(a.as_path()));
+    let groups = app.editor_layout.inactive_groups();
+    assert_eq!(
+        groups[0].path.as_deref(),
+        Some(a.as_path()),
+        "both groups show the same file"
+    );
+}
+
+#[test]
 fn split_up_makes_a_vertical_split_with_the_new_group_active_above() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = app_with_open_file(tmp.path(), "a.txt", "hi");
@@ -12334,6 +12436,24 @@ fn cmd_k_backslash_chord_splits_the_editor_up() {
         app.editor_layout.active_dfs_index(),
         0,
         "Cmd+K Cmd+\\ = Split Up (new group above); plain Cmd+\\ stays Split Right"
+    );
+}
+
+#[test]
+fn cmd_k_shift_backslash_chord_splits_in_group() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.txt", "hi");
+    app.handle_key(key(KeyCode::Char('k'), KeyModifiers::SUPER))
+        .unwrap();
+    app.handle_key(key(
+        KeyCode::Char('\\'),
+        KeyModifiers::SUPER | KeyModifiers::SHIFT,
+    ))
+    .unwrap();
+    assert_eq!(
+        app.editor_layout.leaf_count(),
+        2,
+        "Cmd+K Shift+Cmd+\\ (Split in Group) opens a second view beside the file"
     );
 }
 

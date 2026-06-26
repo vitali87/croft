@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Feature,
-    summary: "Split the editor repeatedly into a grid: splits now nest in any direction, with a draggable seam between each pair of groups.",
+    summary: "Move the active editor to an adjacent group (Move Up/Down/Left/Right) and Split in Group, from the tab menu.",
 }];

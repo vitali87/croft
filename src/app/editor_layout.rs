@@ -23,6 +23,33 @@ pub enum SplitDir {
     Vertical,
 }
 
+/// One of the four screen directions a Split or Move targets (VS Code's
+/// Split/Move Up/Down/Left/Right).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Dir {
+    Up,
+    Down,
+    Left,
+    Right,
+}
+
+impl Dir {
+    /// The split axis this direction lives on: Left/Right tile horizontally,
+    /// Up/Down vertically.
+    pub fn split_dir(self) -> SplitDir {
+        match self {
+            Self::Left | Self::Right => SplitDir::Horizontal,
+            Self::Up | Self::Down => SplitDir::Vertical,
+        }
+    }
+
+    /// Whether a new group created in this direction goes AFTER the existing one
+    /// (Right / Down) rather than before it (Left / Up).
+    pub fn places_new_after(self) -> bool {
+        matches!(self, Self::Right | Self::Down)
+    }
+}
+
 /// A node in the layout tree: either a single group (leaf) or a split of
 /// child nodes along one direction.
 pub enum LayoutNode {
@@ -320,6 +347,66 @@ impl EditorLayout {
         match &self.root {
             LayoutNode::Split { dir, .. } => Some(*dir),
             LayoutNode::Leaf(_) => None,
+        }
+    }
+
+    /// Depth-first index of the inactive group spatially adjacent to the active
+    /// group across its `dir` edge, if any. Adjacency = a shared edge with a
+    /// nonzero perpendicular overlap; the neighbour with the largest overlap
+    /// wins. Used by Move <dir> to find the destination group.
+    pub fn neighbor_leaf_in_dir(&self, area: Rect, min: u16, dir: Dir) -> Option<usize> {
+        let rects = self.leaf_rects(area, min);
+        let active = self.active_dfs_index();
+        let a = *rects.get(active)?;
+        let mut best: Option<(usize, u16)> = None;
+        for (i, r) in rects.iter().enumerate() {
+            if i == active {
+                continue;
+            }
+            let (adjacent, overlap) = match dir {
+                Dir::Left => (r.x + r.width == a.x, vertical_overlap(*r, a)),
+                Dir::Right => (a.x + a.width == r.x, vertical_overlap(*r, a)),
+                Dir::Up => (r.y + r.height == a.y, horizontal_overlap(*r, a)),
+                Dir::Down => (a.y + a.height == r.y, horizontal_overlap(*r, a)),
+            };
+            if adjacent && overlap > 0 && best.is_none_or(|(_, o)| overlap > o) {
+                best = Some((i, overlap));
+            }
+        }
+        best.map(|(i, _)| i)
+    }
+
+    /// Drop every inactive group for which `is_blank` holds (an emptied source
+    /// after a Move), collapsing any split left with a single child. The active
+    /// (hoisted) leaf is never touched.
+    pub fn prune_blank_inactive(&mut self, is_blank: impl Fn(&EditorTabs) -> bool) {
+        prune_blank_rec(&mut self.root, &is_blank);
+    }
+}
+
+/// Cells of vertical overlap between two rects (0 when they don't share rows).
+fn vertical_overlap(p: Rect, q: Rect) -> u16 {
+    let top = p.y.max(q.y);
+    let bottom = (p.y + p.height).min(q.y + q.height);
+    bottom.saturating_sub(top)
+}
+
+/// Cells of horizontal overlap between two rects (0 when they share no columns).
+fn horizontal_overlap(p: Rect, q: Rect) -> u16 {
+    let left = p.x.max(q.x);
+    let right = (p.x + p.width).min(q.x + q.width);
+    right.saturating_sub(left)
+}
+
+fn prune_blank_rec<F: Fn(&EditorTabs) -> bool>(node: &mut LayoutNode, is_blank: &F) {
+    if let LayoutNode::Split { children, .. } = node {
+        for c in children.iter_mut() {
+            prune_blank_rec(&mut c.node, is_blank);
+        }
+        children.retain(|c| !matches!(&c.node, LayoutNode::Leaf(Some(t)) if is_blank(t)));
+        if children.len() == 1 {
+            let only = children.remove(0);
+            *node = only.node;
         }
     }
 }
@@ -1008,5 +1095,53 @@ mod tests {
         assert_eq!(rects[0], Rect::new(0, 0, 50, 40)); // left column
         assert_eq!(rects[1], Rect::new(50, 0, 50, 20)); // right-top
         assert_eq!(rects[2], Rect::new(50, 20, 50, 20)); // right-bottom
+    }
+
+    #[test]
+    fn neighbor_leaf_in_dir_finds_the_group_across_each_edge() {
+        // Two side-by-side columns; the active group is the right one (dfs 1).
+        let mut layout = EditorLayout::single();
+        layout.split_active(EditorTabs::default(), SplitDir::Horizontal, true);
+        assert_eq!(layout.active_dfs_index(), 1);
+        // Its only spatial neighbour is the left column, reached by going Left.
+        assert_eq!(
+            layout.neighbor_leaf_in_dir(area(100, 40), 10, Dir::Left),
+            Some(0)
+        );
+        assert_eq!(
+            layout.neighbor_leaf_in_dir(area(100, 40), 10, Dir::Right),
+            None
+        );
+        assert_eq!(
+            layout.neighbor_leaf_in_dir(area(100, 40), 10, Dir::Up),
+            None
+        );
+        assert_eq!(
+            layout.neighbor_leaf_in_dir(area(100, 40), 10, Dir::Down),
+            None
+        );
+    }
+
+    #[test]
+    fn dir_maps_to_split_axis_and_placement() {
+        assert_eq!(Dir::Right.split_dir(), SplitDir::Horizontal);
+        assert_eq!(Dir::Left.split_dir(), SplitDir::Horizontal);
+        assert_eq!(Dir::Down.split_dir(), SplitDir::Vertical);
+        assert_eq!(Dir::Up.split_dir(), SplitDir::Vertical);
+        assert!(Dir::Right.places_new_after() && Dir::Down.places_new_after());
+        assert!(!Dir::Left.places_new_after() && !Dir::Up.places_new_after());
+    }
+
+    #[test]
+    fn prune_blank_inactive_drops_an_emptied_group_and_collapses_the_split() {
+        let mut layout = EditorLayout::single();
+        layout.split_active(EditorTabs::default(), SplitDir::Horizontal, true);
+        // Mark the inactive (left) group blank so prune should drop it, leaving
+        // a single active leaf.
+        assert_eq!(layout.leaf_count(), 2);
+        layout.prune_blank_inactive(|_t| true);
+        assert_eq!(layout.leaf_count(), 1);
+        assert!(!layout.is_split());
+        assert_eq!(layout.active_dfs_index(), 0);
     }
 }

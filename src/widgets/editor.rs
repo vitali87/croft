@@ -5844,6 +5844,41 @@ impl EditorTabs {
         now_pinned
     }
 
+    /// Remove and return the active editor (for a Move to another group). When
+    /// it was the only tab the group falls back to a single blank tab (like
+    /// closing the last tab), so the group stays renderable; the caller can
+    /// detect that empty state via [`Self::is_blank_initial`] and prune it.
+    pub fn take_active_editor(&mut self) -> Editor {
+        let ed = self.editors.remove(self.active);
+        if self.editors.is_empty() {
+            self.editors.push(Editor::new());
+            self.active = 0;
+        } else if self.active >= self.editors.len() {
+            self.active = self.editors.len() - 1;
+        }
+        for (i, e) in self.editors.iter_mut().enumerate() {
+            e.focused = i == self.active;
+        }
+        ed
+    }
+
+    /// Add `ed` (moved from another group) and make it active. A blank-initial
+    /// group is replaced in place so a Move never leaves a stray blank tab
+    /// beside the moved editor.
+    pub fn push_editor(&mut self, mut ed: Editor) {
+        if self.is_blank_initial() {
+            ed.focused = true;
+            self.editors[0] = ed;
+            self.active = 0;
+            return;
+        }
+        self.editors.push(ed);
+        self.active = self.editors.len() - 1;
+        for (i, e) in self.editors.iter_mut().enumerate() {
+            e.focused = i == self.active;
+        }
+    }
+
     /// VS Code "preview tab" semantics: open `path` in the single
     /// replaceable preview slot. If the file is already in some tab, just
     /// switch to it. Otherwise reuse the existing preview slot, or create a
@@ -10410,6 +10445,46 @@ mod tests {
             strip.contains('\u{2715}'),
             "the unpinned tab still shows the close cross; strip was {strip:?}"
         );
+    }
+
+    #[test]
+    fn take_active_editor_removes_and_returns_the_active_tab() {
+        let mut t = EditorTabs::new();
+        t.editors[0].path = Some(std::path::PathBuf::from("/a"));
+        t.add_tab_with_path(std::path::PathBuf::from("/b")); // active = /b
+        let ed = t.take_active_editor();
+        assert_eq!(ed.path.as_deref(), Some(std::path::Path::new("/b")));
+        assert_eq!(t.tab_count(), 1);
+        assert_eq!(t.tab_path(0).as_deref(), Some(std::path::Path::new("/a")));
+    }
+
+    #[test]
+    fn take_active_editor_on_the_last_tab_leaves_a_blank_group() {
+        let mut t = EditorTabs::new();
+        t.editors[0].path = Some(std::path::PathBuf::from("/a"));
+        let ed = t.take_active_editor();
+        assert_eq!(ed.path.as_deref(), Some(std::path::Path::new("/a")));
+        assert_eq!(t.tab_count(), 1);
+        assert!(t.is_blank_initial(), "the group falls back to a blank tab");
+    }
+
+    #[test]
+    fn push_editor_replaces_a_blank_group_then_appends() {
+        let mut src = EditorTabs::new();
+        src.editors[0].path = Some(std::path::PathBuf::from("/a"));
+        let ed = src.take_active_editor();
+        let mut dst = EditorTabs::new(); // blank-initial
+        dst.push_editor(ed);
+        assert_eq!(dst.tab_count(), 1, "pushing into a blank group replaces it");
+        assert_eq!(dst.tab_path(0).as_deref(), Some(std::path::Path::new("/a")));
+        assert_eq!(dst.active_index(), 0);
+        let mut src2 = EditorTabs::new();
+        src2.editors[0].path = Some(std::path::PathBuf::from("/b"));
+        let ed2 = src2.take_active_editor();
+        dst.push_editor(ed2);
+        assert_eq!(dst.tab_count(), 2, "a second push appends and activates it");
+        assert_eq!(dst.active_index(), 1);
+        assert_eq!(dst.tab_path(1).as_deref(), Some(std::path::Path::new("/b")));
     }
 
     #[test]
