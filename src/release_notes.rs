@@ -59,13 +59,7 @@ pub struct ReleaseNote {
 }
 
 /// What shipped in the current release. Replace on every version bump.
-pub const RELEASE_NOTES: &[ReleaseNote] = &[
-    ReleaseNote {
-        kind: NoteKind::Feature,
-        summary: "Copy Relative Path (Cmd+Opt+Shift+C): copy an editor tab's path relative to the workspace root, from the tab menu or the keyboard.",
-    },
-    ReleaseNote {
-        kind: NoteKind::Feature,
-        summary: "Keep Open (Cmd+K Enter): promote a preview tab from the tab menu so the next single-click open won't replace it.",
-    },
-];
+pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
+    kind: NoteKind::Feature,
+    summary: "Pin (Cmd+K Shift+Enter): pin an editor tab from the tab menu so it stays leftmost and survives Close Others and Close to the Right.",
+}];

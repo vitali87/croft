@@ -1259,6 +1259,11 @@ pub struct Editor {
     /// double-click / Ctrl+Enter / typing into the buffer pin the tab
     /// (preview = false) so subsequent previews don't overwrite it.
     pub preview: bool,
+    /// True when the user has pinned this tab (VS Code "Pin"). Pinned tabs are
+    /// kept leftmost in the strip, survive Close Others / Close to the Right,
+    /// and show a thumb-tack glyph in place of the close `\u{2715}`. A pinned
+    /// tab is never the replaceable preview slot (pinning clears `preview`).
+    pub pinned: bool,
     undo_stack: Vec<Snapshot>,
     last_edit_kind: Option<EditKind>,
     lang: Option<LangKind>,
@@ -1385,6 +1390,7 @@ impl Editor {
             selection: None,
             carets: Vec::new(),
             preview: false,
+            pinned: false,
             undo_stack: Vec::new(),
             last_edit_kind: None,
             lang: None,
@@ -5570,39 +5576,65 @@ impl EditorTabs {
         true
     }
 
-    /// Close every tab whose index ≠ `keep_idx`. The kept tab stays
-    /// active. Returns how many tabs were actually removed (0 when
-    /// `keep_idx` is out of range or only one tab is open). Mirrors VS
-    /// Code's "Close Others" context-menu action.
+    /// Close every tab whose index ≠ `keep_idx`, except pinned tabs, which
+    /// always survive (VS Code "Close Others" never closes a pinned tab). The
+    /// kept tab stays active. Returns how many tabs were actually removed (0
+    /// when `keep_idx` is out of range or nothing else is closeable). Mirrors
+    /// VS Code's "Close Others" context-menu action.
     pub fn close_others(&mut self, keep_idx: usize) -> usize {
         if keep_idx >= self.editors.len() || self.editors.len() <= 1 {
             return 0;
         }
-        let kept = self.editors.remove(keep_idx);
-        let removed = self.editors.len();
-        self.editors.clear();
-        self.editors.push(kept);
-        self.active = 0;
-        self.editors[0].focused = true;
+        let before = self.editors.len();
+        let mut new_active = 0;
+        let mut kept: Vec<Editor> = Vec::with_capacity(before);
+        for (i, ed) in std::mem::take(&mut self.editors).into_iter().enumerate() {
+            if i == keep_idx {
+                new_active = kept.len();
+                kept.push(ed);
+            } else if ed.pinned {
+                kept.push(ed);
+            }
+        }
+        let removed = before - kept.len();
+        self.editors = kept;
+        self.active = new_active;
+        for (i, ed) in self.editors.iter_mut().enumerate() {
+            ed.focused = i == self.active;
+        }
         removed
     }
 
-    /// Close every tab whose index > `from_idx`. The tab at `from_idx`
-    /// stays active; tabs to the left are untouched. Returns the number
-    /// of tabs removed. Matches VS Code's "Close to the Right".
+    /// Close every tab whose index > `from_idx`, except pinned tabs, which
+    /// always survive (VS Code "Close to the Right" never closes a pinned
+    /// tab). The tab at `from_idx` stays active; tabs to the left are
+    /// untouched. Returns the number of tabs removed. Matches VS Code's
+    /// "Close to the Right".
     pub fn close_to_right(&mut self, from_idx: usize) -> usize {
         if from_idx >= self.editors.len() {
             return 0;
         }
-        let target_len = from_idx + 1;
-        if self.editors.len() <= target_len {
-            return 0;
+        let before = self.editors.len();
+        let old_active = self.active;
+        let mut new_active: Option<usize> = None;
+        let mut pivot_pos = 0;
+        let mut kept: Vec<Editor> = Vec::with_capacity(before);
+        for (i, ed) in std::mem::take(&mut self.editors).into_iter().enumerate() {
+            if i <= from_idx || ed.pinned {
+                if i == from_idx {
+                    pivot_pos = kept.len();
+                }
+                if i == old_active {
+                    new_active = Some(kept.len());
+                }
+                kept.push(ed);
+            }
         }
-        let removed = self.editors.len() - target_len;
-        self.editors.truncate(target_len);
-        if self.active >= self.editors.len() {
-            self.active = self.editors.len() - 1;
-        }
+        let removed = before - kept.len();
+        self.editors = kept;
+        // Keep the previously-active tab active when it survived; otherwise
+        // fall back to the pivot tab's new position.
+        self.active = new_active.unwrap_or(pivot_pos);
         for (i, ed) in self.editors.iter_mut().enumerate() {
             ed.focused = i == self.active;
         }
@@ -5772,6 +5804,44 @@ impl EditorTabs {
             }
             _ => false,
         }
+    }
+
+    /// True when the tab at `idx` is pinned. Drives the tab menu's
+    /// "Pin"/"Unpin" label and the close-cell glyph (pin vs `\u{2715}`).
+    pub fn is_pinned(&self, idx: usize) -> bool {
+        self.editors.get(idx).is_some_and(|e| e.pinned)
+    }
+
+    /// VS Code "Pin"/"Unpin" the tab at `idx`. Returns the tab's new pinned
+    /// state. Pinning clears the preview flag (a pinned tab is never the
+    /// replaceable preview slot) and reorders the strip so pinned tabs stay
+    /// leftmost: a stable partition lands a newly-pinned tab at the end of the
+    /// pinned block and a newly-unpinned tab at the front of the unpinned
+    /// block, matching VS Code. The active tab follows its editor across the
+    /// reorder.
+    pub fn toggle_pin(&mut self, idx: usize) -> bool {
+        if idx >= self.editors.len() {
+            return false;
+        }
+        let now_pinned = !self.editors[idx].pinned;
+        self.editors[idx].pinned = now_pinned;
+        if now_pinned {
+            self.editors[idx].preview = false;
+        }
+        // Stable partition: pinned first (keeping their relative order), then
+        // unpinned (keeping theirs). `sort_by_key` is stable, so the two blocks
+        // preserve order and only the toggled tab crosses the boundary.
+        let n = self.editors.len();
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_by_key(|&i| !self.editors[i].pinned);
+        let new_active = order.iter().position(|&i| i == self.active).unwrap_or(0);
+        let mut slots: Vec<Option<Editor>> = self.editors.drain(..).map(Some).collect();
+        self.editors = order.iter().map(|&i| slots[i].take().unwrap()).collect();
+        self.active = new_active;
+        for (i, ed) in self.editors.iter_mut().enumerate() {
+            ed.focused = i == self.active;
+        }
+        now_pinned
     }
 
     /// VS Code "preview tab" semantics: open `path` in the single
@@ -6243,11 +6313,14 @@ impl Widget for &mut EditorTabs {
                 modifiers |= Modifier::ITALIC;
             }
             let style = Style::default().fg(fg).bg(bg).add_modifier(modifiers);
-            // Layout: " " + label + " " + ✕ + " "
-            let padded = format!(" {label_text} \u{2715} ");
+            // The close cell shows a thumb-tack on a pinned tab (clicking it
+            // unpins) and the close cross otherwise (clicking it closes).
+            let close_glyph = if ed.pinned { "\u{f08d}" } else { "\u{2715}" };
+            // Layout: " " + label + " " + ✕/pin + " "
+            let padded = format!(" {label_text} {close_glyph} ");
             buf.set_string(cursor_x, strip.y, &padded, style);
-            // Overpaint the close cross with its hover pill so the user sees
-            // exactly which X their click will land on.
+            // Overpaint the close/pin cell with its hover pill so the user sees
+            // exactly which glyph their click will land on.
             if on_close {
                 let pill_bg = if brand {
                     TAB_CLOSE_PILL_BG_BRAND
@@ -6257,7 +6330,7 @@ impl Widget for &mut EditorTabs {
                 buf.set_string(
                     close_x,
                     strip.y,
-                    "\u{2715}",
+                    close_glyph,
                     Style::default()
                         .fg(Color::White)
                         .bg(pill_bg)
@@ -10141,6 +10214,71 @@ mod tests {
         assert_eq!(t.active_index(), 0);
         assert_eq!(t.path.as_deref(), Some(std::path::Path::new("/b")));
         assert!(t.focused, "the surviving tab takes focus");
+    }
+
+    #[test]
+    fn toggle_pin_keeps_pinned_tabs_leftmost_and_follows_the_active_tab() {
+        let mut t = EditorTabs::new();
+        t.editors[0].path = Some(std::path::PathBuf::from("/a"));
+        t.add_tab_with_path(std::path::PathBuf::from("/b"));
+        t.add_tab_with_path(std::path::PathBuf::from("/c")); // active = /c (idx 2)
+        // Pin /c: it joins the (empty) pinned block at the front and stays
+        // active even though its index changed from 2 to 0.
+        assert!(t.toggle_pin(2));
+        assert!(t.is_pinned(0));
+        assert_eq!(t.tab_path(0).as_deref(), Some(std::path::Path::new("/c")));
+        assert_eq!(t.active_index(), 0, "the active tab follows its editor");
+        assert_eq!(t.tab_path(1).as_deref(), Some(std::path::Path::new("/a")));
+        assert_eq!(t.tab_path(2).as_deref(), Some(std::path::Path::new("/b")));
+        // Pinning /b too lands it at the END of the pinned block (after /c).
+        let b_idx = 2;
+        assert!(t.toggle_pin(b_idx));
+        assert_eq!(t.tab_path(0).as_deref(), Some(std::path::Path::new("/c")));
+        assert_eq!(t.tab_path(1).as_deref(), Some(std::path::Path::new("/b")));
+        assert!(t.is_pinned(0) && t.is_pinned(1) && !t.is_pinned(2));
+        // Unpinning /c returns it to the front of the unpinned block.
+        assert!(!t.toggle_pin(0));
+        assert!(t.is_pinned(0), "/b is still pinned and stays leftmost");
+        assert_eq!(t.tab_path(0).as_deref(), Some(std::path::Path::new("/b")));
+        assert_eq!(t.tab_path(1).as_deref(), Some(std::path::Path::new("/c")));
+    }
+
+    #[test]
+    fn close_others_keeps_pinned_tabs_alongside_the_kept_tab() {
+        let mut t = EditorTabs::new();
+        t.editors[0].path = Some(std::path::PathBuf::from("/a"));
+        t.add_tab_with_path(std::path::PathBuf::from("/b"));
+        t.add_tab_with_path(std::path::PathBuf::from("/c"));
+        t.add_tab_with_path(std::path::PathBuf::from("/d"));
+        t.toggle_pin(0); // pin /a (stays leftmost); order [/a*, /b, /c, /d]
+        let removed = t.close_others(2); // keep /c
+        assert_eq!(removed, 2, "only the unpinned non-kept tabs (/b, /d) close");
+        assert_eq!(t.tab_count(), 2);
+        assert!(t.is_pinned(0));
+        assert_eq!(t.tab_path(0).as_deref(), Some(std::path::Path::new("/a")));
+        assert_eq!(t.tab_path(1).as_deref(), Some(std::path::Path::new("/c")));
+        assert_eq!(t.active_index(), 1, "the kept tab is active");
+    }
+
+    #[test]
+    fn close_to_right_keeps_pinned_tabs_to_the_right_of_the_pivot() {
+        let mut t = EditorTabs::new();
+        t.editors[0].path = Some(std::path::PathBuf::from("/a"));
+        t.add_tab_with_path(std::path::PathBuf::from("/b"));
+        t.add_tab_with_path(std::path::PathBuf::from("/c"));
+        t.add_tab_with_path(std::path::PathBuf::from("/d"));
+        t.toggle_pin(0); // pin /a
+        t.toggle_pin(1); // pin /b -> end of pinned block; order [/a*, /b*, /c, /d]
+        let removed = t.close_to_right(0); // close to the right of /a
+        assert_eq!(
+            removed, 2,
+            "/c and /d close; the pinned /b to the right survives"
+        );
+        assert_eq!(t.tab_count(), 2);
+        assert!(t.is_pinned(0) && t.is_pinned(1));
+        assert_eq!(t.tab_path(0).as_deref(), Some(std::path::Path::new("/a")));
+        assert_eq!(t.tab_path(1).as_deref(), Some(std::path::Path::new("/b")));
+        assert_eq!(t.active_index(), 0, "the pivot tab is active");
     }
 
     #[test]

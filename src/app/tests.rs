@@ -11018,7 +11018,7 @@ fn session_state_preserves_unsaved_buffer_contents() {
 fn build_tab_context_menu_items_includes_all_four_close_actions_in_the_middle_of_a_strip() {
     // Right-click on tab 1 of 3 (i.e. a middle tab) should surface
     // every close action — there's at least one tab on each side.
-    let items = build_tab_context_menu_items(1, 3, false, None, false, false);
+    let items = build_tab_context_menu_items(1, 3, false, None, false, false, false);
     let labels: Vec<&str> = items.iter().map(|(s, _)| s.as_str()).collect();
     assert_eq!(
         labels,
@@ -11028,6 +11028,7 @@ fn build_tab_context_menu_items_includes_all_four_close_actions_in_the_middle_of
             "Close to the Right",
             "Close Saved",
             "Close All",
+            "Pin",
             "Split Editor Right"
         ],
         "all close actions must appear and in this order — mirrors VS Code's tab strip"
@@ -11043,7 +11044,7 @@ fn build_tab_context_menu_items_includes_all_four_close_actions_in_the_middle_of
 fn build_tab_context_menu_items_hides_close_to_the_right_on_the_last_tab() {
     // Last tab → "Close to the Right" would close zero tabs, so it
     // must be suppressed (matches VS Code).
-    let items = build_tab_context_menu_items(2, 3, false, None, false, false);
+    let items = build_tab_context_menu_items(2, 3, false, None, false, false, false);
     let labels: Vec<&str> = items.iter().map(|(s, _)| s.as_str()).collect();
     assert_eq!(
         labels,
@@ -11052,6 +11053,7 @@ fn build_tab_context_menu_items_hides_close_to_the_right_on_the_last_tab() {
             "Close Others",
             "Close Saved",
             "Close All",
+            "Pin",
             "Split Editor Right"
         ],
         "Close to the Right must be suppressed on the rightmost tab"
@@ -11060,11 +11062,11 @@ fn build_tab_context_menu_items_hides_close_to_the_right_on_the_last_tab() {
 
 #[test]
 fn build_tab_context_menu_items_hides_close_others_when_only_one_tab_is_open() {
-    let items = build_tab_context_menu_items(0, 1, false, None, false, false);
+    let items = build_tab_context_menu_items(0, 1, false, None, false, false, false);
     let labels: Vec<&str> = items.iter().map(|(s, _)| s.as_str()).collect();
     assert_eq!(
         labels,
-        ["Close", "Close All", "Split Editor Right"],
+        ["Close", "Close All", "Pin", "Split Editor Right"],
         "with a single tab, Close Others / Close to the Right / Close Saved are all no-ops and must be suppressed"
     );
 }
@@ -11074,7 +11076,7 @@ fn build_tab_context_menu_items_includes_reveal_in_finder_only_with_a_path_and_e
     let p = std::path::Path::new("/tmp/demo.rs");
     // Local macOS with a real path: Reveal in Finder sits after Close All,
     // before the split/focus group — mirroring VS Code's lower-middle slot.
-    let items = build_tab_context_menu_items(0, 1, false, Some(p), true, false);
+    let items = build_tab_context_menu_items(0, 1, false, Some(p), true, false, false);
     let labels: Vec<&str> = items.iter().map(|(s, _)| s.as_str()).collect();
     assert_eq!(
         labels,
@@ -11085,15 +11087,16 @@ fn build_tab_context_menu_items_includes_reveal_in_finder_only_with_a_path_and_e
             "Copy Relative Path",
             "Reveal in Finder",
             "Reveal in Explorer View",
+            "Pin",
             "Split Editor Right"
         ],
     );
     assert!(matches!(&items[4].1, MenuAction::RevealInFinder(rp) if rp == p));
     // Remote (or non-macOS) session: entry withheld even with a path.
-    let remote = build_tab_context_menu_items(0, 1, false, Some(p), false, false);
+    let remote = build_tab_context_menu_items(0, 1, false, Some(p), false, false, false);
     assert!(remote.iter().all(|(s, _)| s != "Reveal in Finder"));
     // A blank/untitled buffer (no path) never offers it, even when enabled.
-    let blank = build_tab_context_menu_items(0, 1, false, None, true, false);
+    let blank = build_tab_context_menu_items(0, 1, false, None, true, false, false);
     assert!(blank.iter().all(|(s, _)| s != "Reveal in Finder"));
 }
 
@@ -11102,7 +11105,7 @@ fn build_tab_context_menu_items_offers_reveal_in_explorer_for_any_path() {
     let p = std::path::Path::new("/tmp/demo.rs");
     // Reveal in Explorer View targets croft's own tree, present local and
     // remote, so it shows for any path-bearing tab even when Finder is withheld.
-    let remote = build_tab_context_menu_items(0, 1, false, Some(p), false, false);
+    let remote = build_tab_context_menu_items(0, 1, false, Some(p), false, false, false);
     let labels: Vec<&str> = remote.iter().map(|(s, _)| s.as_str()).collect();
     assert_eq!(
         labels,
@@ -11112,12 +11115,13 @@ fn build_tab_context_menu_items_offers_reveal_in_explorer_for_any_path() {
             "Copy Path",
             "Copy Relative Path",
             "Reveal in Explorer View",
+            "Pin",
             "Split Editor Right"
         ]
     );
     assert!(matches!(&remote[4].1, MenuAction::RevealInExplorer(rp) if rp == p));
     // A blank/untitled buffer (no path) has nothing to reveal.
-    let blank = build_tab_context_menu_items(0, 1, false, None, true, false);
+    let blank = build_tab_context_menu_items(0, 1, false, None, true, false, false);
     assert!(blank.iter().all(|(s, _)| s != "Reveal in Explorer View"));
 }
 
@@ -11126,7 +11130,7 @@ fn build_tab_context_menu_items_offers_copy_path_for_any_path_local_or_remote() 
     let p = std::path::Path::new("/tmp/demo.rs");
     // Copy Path is a clipboard write, so it shows for a path-bearing tab even
     // on a remote session where Reveal in Finder is withheld.
-    let remote = build_tab_context_menu_items(0, 1, false, Some(p), false, false);
+    let remote = build_tab_context_menu_items(0, 1, false, Some(p), false, false, false);
     let labels: Vec<&str> = remote.iter().map(|(s, _)| s.as_str()).collect();
     assert_eq!(
         labels,
@@ -11136,13 +11140,14 @@ fn build_tab_context_menu_items_offers_copy_path_for_any_path_local_or_remote() 
             "Copy Path",
             "Copy Relative Path",
             "Reveal in Explorer View",
+            "Pin",
             "Split Editor Right"
         ]
     );
     assert!(matches!(&remote[2].1, MenuAction::CopyTabPath(cp) if cp == p));
     assert!(matches!(&remote[3].1, MenuAction::CopyTabRelativePath(cp) if cp == p));
     // A blank/untitled buffer (no path) has nothing to copy.
-    let blank = build_tab_context_menu_items(0, 1, false, None, true, false);
+    let blank = build_tab_context_menu_items(0, 1, false, None, true, false, false);
     assert!(blank.iter().all(|(s, _)| s != "Copy Path"));
     assert!(blank.iter().all(|(s, _)| s != "Copy Relative Path"));
 }
@@ -11152,7 +11157,7 @@ fn build_tab_context_menu_items_offers_keep_open_only_for_a_preview_tab() {
     let p = std::path::Path::new("/tmp/demo.rs");
     // Preview tab (italic): "Keep Open" appears, carrying this tab's index, and
     // sits just before the split group.
-    let preview = build_tab_context_menu_items(0, 1, false, Some(p), false, true);
+    let preview = build_tab_context_menu_items(0, 1, false, Some(p), false, true, false);
     let keep = preview.iter().find(|(s, _)| s == "Keep Open");
     assert!(matches!(keep, Some((_, MenuAction::KeepTabOpen(0)))));
     assert!(
@@ -11160,8 +11165,30 @@ fn build_tab_context_menu_items_offers_keep_open_only_for_a_preview_tab() {
             < preview.iter().position(|(s, _)| s == "Split Editor Right")
     );
     // A permanent (non-preview) tab never offers it.
-    let permanent = build_tab_context_menu_items(0, 1, false, Some(p), false, false);
+    let permanent = build_tab_context_menu_items(0, 1, false, Some(p), false, false, false);
     assert!(permanent.iter().all(|(s, _)| s != "Keep Open"));
+}
+
+#[test]
+fn build_tab_context_menu_items_offers_pin_or_unpin_carrying_the_tab_index() {
+    let p = std::path::Path::new("/tmp/demo.rs");
+    // Unpinned tab reads "Pin"; pinned tab reads "Unpin". Either way the entry
+    // carries this tab's index and sits between Keep Open and the split group.
+    let unpinned = build_tab_context_menu_items(0, 1, false, Some(p), true, false, false);
+    let pin = unpinned.iter().find(|(s, _)| s == "Pin");
+    assert!(matches!(pin, Some((_, MenuAction::ToggleTabPin(0)))));
+    assert!(unpinned.iter().all(|(s, _)| s != "Unpin"));
+    let keep = unpinned.iter().position(|(s, _)| s == "Keep Open");
+    let pin_pos = unpinned.iter().position(|(s, _)| s == "Pin");
+    let split = unpinned.iter().position(|(s, _)| s == "Split Editor Right");
+    assert!(keep < pin_pos && pin_pos < split);
+
+    let pinned = build_tab_context_menu_items(0, 1, false, Some(p), false, false, true);
+    assert!(matches!(
+        pinned.iter().find(|(s, _)| s == "Unpin"),
+        Some((_, MenuAction::ToggleTabPin(0)))
+    ));
+    assert!(pinned.iter().all(|(s, _)| s != "Pin"));
 }
 
 #[test]

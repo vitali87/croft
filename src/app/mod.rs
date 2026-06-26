@@ -619,6 +619,9 @@ enum MenuAction {
     /// single-click open won't replace it (VS Code's "Keep Open"). Only
     /// surfaced for a tab that is currently the replaceable preview slot.
     KeepTabOpen(usize),
+    /// Toggle the pinned state of the tab at `idx` (VS Code's "Pin" / "Unpin").
+    /// Pinned tabs stay leftmost and survive Close Others / Close to the Right.
+    ToggleTabPin(usize),
     /// Split the editor into two side-by-side columns, duplicating the
     /// active file into the new (right) group.
     SplitEditor,
@@ -738,6 +741,7 @@ fn shortcut_for(action: &MenuAction) -> Option<&'static str> {
         MenuAction::CloseAllTabs => Some("⌘K W"),
         MenuAction::CloseSavedTabs => Some("⌘K U"),
         MenuAction::KeepTabOpen(_) => Some("⌘K ⏎"),
+        MenuAction::ToggleTabPin(_) => Some("⌘K ⇧⏎"),
         MenuAction::SplitEditor => Some("⌘\\"),
         MenuAction::FocusGroupLeft => Some("⌥⌘←"),
         MenuAction::FocusGroupRight => Some("⌥⌘→"),
@@ -832,6 +836,7 @@ fn build_tab_context_menu_items(
     clicked: Option<&Path>,
     reveal_enabled: bool,
     clicked_is_preview: bool,
+    clicked_is_pinned: bool,
 ) -> Vec<(String, MenuAction)> {
     let mut items: Vec<(String, MenuAction)> = Vec::new();
     items.push((String::from("Close"), MenuAction::CloseTab(idx)));
@@ -887,6 +892,12 @@ fn build_tab_context_menu_items(
     if clicked_is_preview {
         items.push((String::from("Keep Open"), MenuAction::KeepTabOpen(idx)));
     }
+    // Pin / Unpin: always offered. A pinned tab reads "Unpin"; pinning keeps it
+    // leftmost and shields it from Close Others / Close to the Right.
+    items.push((
+        String::from(if clicked_is_pinned { "Unpin" } else { "Pin" }),
+        MenuAction::ToggleTabPin(idx),
+    ));
     // Editor-group actions: split is offered when not already split;
     // focus-group navigation only once a second column exists.
     if is_split {
@@ -7391,6 +7402,14 @@ impl App {
                 } else {
                     self.status = String::from("Reveal in Explorer View: no active file");
                 }
+                true
+            }
+            // Cmd+K Shift+Enter: pin / unpin the active tab (VS Code's "Pin").
+            KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                let idx = self.editor.active_index();
+                let pinned = self.editor.toggle_pin(idx);
+                self.status = String::from(if pinned { "Pinned tab" } else { "Unpinned tab" });
+                self.poke_cursor();
                 true
             }
             // Cmd+K Enter: keep the active preview tab open (VS Code's
@@ -14914,6 +14933,7 @@ impl App {
                         tab_path.as_deref(),
                         !self.is_remote && cfg!(target_os = "macos"),
                         self.editor.is_preview(tab_idx),
+                        self.editor.is_pinned(tab_idx),
                     );
                     self.context_menu = Some(ContextMenu {
                         origin: (m.column, m.row),
@@ -15676,7 +15696,14 @@ impl App {
                     }
                 } else if in_editor_pane && !in_editor {
                     if let Some(idx) = self.editor.close_at(m.column, m.row) {
-                        if self.editor.close_tab(idx) {
+                        // The close cell of a pinned tab is an unpin button (it
+                        // shows a thumb-tack, not the close cross), matching VS
+                        // Code: a pinned tab is never closed by that click.
+                        if self.editor.is_pinned(idx) {
+                            self.editor.toggle_pin(idx);
+                            self.status = String::from("Unpinned tab");
+                            self.poke_cursor();
+                        } else if self.editor.close_tab(idx) {
                             self.sync_open_file_poll_mtime();
                             self.status = String::from("Closed tab");
                             self.poke_cursor();
@@ -16486,6 +16513,11 @@ impl App {
                     self.status = String::from("Kept tab open");
                     self.poke_cursor();
                 }
+            }
+            MenuAction::ToggleTabPin(idx) => {
+                let pinned = self.editor.toggle_pin(idx);
+                self.status = String::from(if pinned { "Pinned tab" } else { "Unpinned tab" });
+                self.poke_cursor();
             }
             MenuAction::SplitEditor => self.split_editor(),
             MenuAction::FocusGroupLeft => self.focus_editor_group(true),
