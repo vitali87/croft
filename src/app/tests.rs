@@ -12467,12 +12467,12 @@ fn new_window_is_refused_over_ssh_and_leaves_the_tab_in_place() {
 
 #[cfg(target_os = "macos")]
 #[test]
-fn new_window_argv_builds_the_open_ghostty_command() {
+fn ghostty_new_window_argv_builds_the_open_command() {
     use std::ffi::OsStr;
     let exe = std::path::Path::new("/usr/local/bin/croft");
     let root = std::path::Path::new("/home/me/project");
     let file = std::path::Path::new("/home/me/project/src/main.rs");
-    let argv = new_window_argv(exe, root, file);
+    let argv = ghostty_new_window_argv(exe, root, file);
     let argv: Vec<&OsStr> = argv.iter().map(|s| s.as_os_str()).collect();
     assert_eq!(
         argv,
@@ -12488,6 +12488,62 @@ fn new_window_argv_builds_the_open_ghostty_command() {
             OsStr::new("/home/me/project/src/main.rs"),
         ],
         "a new Ghostty window runs `croft <root> --open-file <file>` via `open -na`"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn new_window_targets_the_host_terminal() {
+    // The new window matches whatever terminal croft runs in, not always Ghostty.
+    assert_eq!(
+        detect_host_terminal(Some("iTerm.app"), None),
+        HostTerminal::ITerm2
+    );
+    assert_eq!(
+        detect_host_terminal(Some("ghostty"), None),
+        HostTerminal::Ghostty
+    );
+    assert_eq!(
+        detect_host_terminal(Some("Apple_Terminal"), None),
+        HostTerminal::AppleTerminal
+    );
+    // Ghostty sometimes only exports TERM=xterm-ghostty.
+    assert_eq!(
+        detect_host_terminal(None, Some("xterm-ghostty")),
+        HostTerminal::Ghostty
+    );
+    // An unrecognised terminal is reported by name, not silently mishandled.
+    assert_eq!(
+        detect_host_terminal(Some("WezTerm"), None),
+        HostTerminal::Unknown("WezTerm".to_string())
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn iterm2_and_terminal_scripts_shell_quote_paths_with_spaces() {
+    let exe = std::path::Path::new("/usr/local/bin/croft");
+    let root = std::path::Path::new("/home/me/My Project");
+    let file = std::path::Path::new("/home/me/My Project/a b.rs");
+
+    let iterm = iterm2_new_window_script(exe, root, file);
+    assert!(
+        iterm
+            .contains(r#"tell application "iTerm" to create window with default profile command "#),
+        "{iterm}"
+    );
+    // Each path single-quoted so the space survives the shell.
+    assert!(iterm.contains("'/home/me/My Project'"), "{iterm}");
+    assert!(iterm.contains("'/home/me/My Project/a b.rs'"), "{iterm}");
+
+    let term = apple_terminal_new_window_script(exe, root, file);
+    assert!(
+        term.contains(r#"tell application "Terminal" to do script "#),
+        "{term}"
+    );
+    assert!(
+        term.contains("--open-file '/home/me/My Project/a b.rs'"),
+        "{term}"
     );
 }
 

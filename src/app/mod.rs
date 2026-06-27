@@ -6449,8 +6449,8 @@ impl App {
         self.sync_focus_flags();
     }
 
-    /// VS Code "Move into New Window": open the tab at `idx` in a brand-new OS
-    /// terminal window (a real, separate Ghostty window running croft on the
+    /// VS Code "Move into New Window": open the tab at `idx` in a brand-new
+    /// window of the host terminal (a real, separate window running croft on the
     /// same workspace with the file open), then close the tab here — the file
     /// has moved to the new window. The current window is otherwise untouched.
     fn move_into_new_window(&mut self, idx: usize) {
@@ -18143,32 +18143,87 @@ fn reset_session_bg_seq() -> String {
     String::from("\x1b]1337;SetColors=bg=default\x07")
 }
 
-/// Spawn a brand-new OS terminal window running croft on `root` with `file`
-/// opened — VS Code's "Move/Copy into New Window", realised as a genuine
-/// separate window so the originating croft is never disturbed (a TUI owns one
-/// screen, so an in-process "window" could only ever hide the existing app).
-///
-/// macOS: open a fresh Ghostty window. `open -na` forces a new instance, the
-/// only reliable way to get a new window with a command — `open -a` would just
-/// re-focus the running Ghostty without passing args. `--quit-after-last-window-closed`
-/// keeps the spawned instance from lingering once the user closes that window.
-/// The croft binary is launched by its resolved absolute path: a GUI-launched
-/// croft inherits a stripped launchd PATH, so the bare name would not resolve
-/// in the new window's shell (see the project memory on PATH stripping).
+/// The host terminal croft is running inside, for spawning a new window of the
+/// SAME terminal (Move/Copy into New Window). Detected from `$TERM_PROGRAM` /
+/// `$TERM`, the same signals croft's inline-image detection keys off.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum HostTerminal {
+    Ghostty,
+    ITerm2,
+    AppleTerminal,
+    /// A terminal we don't know how to drive; carries its reported name so the
+    /// status line can say which one rather than failing silently.
+    Unknown(String),
+}
+
+#[cfg(target_os = "macos")]
+fn detect_host_terminal(term_program: Option<&str>, term: Option<&str>) -> HostTerminal {
+    match term_program {
+        Some("ghostty") => HostTerminal::Ghostty,
+        Some("iTerm.app") => HostTerminal::ITerm2,
+        Some("Apple_Terminal") => HostTerminal::AppleTerminal,
+        Some(other) if !other.is_empty() => HostTerminal::Unknown(other.to_string()),
+        // Some setups only export TERM (e.g. `xterm-ghostty`).
+        _ if term.is_some_and(|t| t.contains("ghostty")) => HostTerminal::Ghostty,
+        _ => HostTerminal::Unknown(term.unwrap_or("unknown").to_string()),
+    }
+}
+
+/// Spawn a brand-new OS window of the terminal croft is running in, opening
+/// `croft <root> --open-file <file>` — VS Code's "Move/Copy into New Window",
+/// realised as a genuine separate window so the originating croft is never
+/// disturbed. The croft binary is launched by its resolved ABSOLUTE path: a
+/// GUI-launched croft inherits a stripped launchd PATH, so the bare name would
+/// not resolve in the new window's shell (see the project memory on PATH
+/// stripping). macOS only; other platforms surface an Unsupported error.
 #[cfg(target_os = "macos")]
 fn spawn_new_window(root: &std::path::Path, file: &std::path::Path) -> std::io::Result<()> {
     let exe = std::env::current_exe()?;
-    std::process::Command::new("open")
-        .args(new_window_argv(&exe, root, file))
-        .spawn()?;
-    Ok(())
+    let host = detect_host_terminal(
+        std::env::var("TERM_PROGRAM").ok().as_deref(),
+        std::env::var("TERM").ok().as_deref(),
+    );
+    match host {
+        // Ghostty parses `-e <argv>` directly, so no shell quoting is needed.
+        // `open -na` forces a new instance — the only reliable way to get a new
+        // window with a command, since `open -a` re-focuses the running Ghostty
+        // and drops `--args`. `--quit-after-last-window-closed` keeps the spawned
+        // instance from lingering once the user closes that window.
+        HostTerminal::Ghostty => {
+            std::process::Command::new("open")
+                .args(ghostty_new_window_argv(&exe, root, file))
+                .spawn()?;
+            Ok(())
+        }
+        // iTerm2 and Terminal have no `open --args` command path; both are driven
+        // by AppleScript, and both run the `command` / `do script` string through
+        // a shell, so the croft invocation is shell-quoted.
+        HostTerminal::ITerm2 => {
+            std::process::Command::new("osascript")
+                .arg("-e")
+                .arg(iterm2_new_window_script(&exe, root, file))
+                .spawn()?;
+            Ok(())
+        }
+        HostTerminal::AppleTerminal => {
+            std::process::Command::new("osascript")
+                .arg("-e")
+                .arg(apple_terminal_new_window_script(&exe, root, file))
+                .spawn()?;
+            Ok(())
+        }
+        HostTerminal::Unknown(name) => Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            format!("unsupported terminal '{name}'"),
+        )),
+    }
 }
 
-/// The `open` argument vector for spawning a new Ghostty window running
-/// `croft <root> --open-file <file>`. Split out so the exact shape is unit-
-/// testable without actually launching a window.
+/// The `open` argv to launch a new Ghostty window running croft. Split out so the
+/// the exact shape is unit-testable without launching a window.
 #[cfg(target_os = "macos")]
-fn new_window_argv(
+fn ghostty_new_window_argv(
     exe: &std::path::Path,
     root: &std::path::Path,
     file: &std::path::Path,
@@ -18187,8 +18242,54 @@ fn new_window_argv(
     ]
 }
 
-/// Non-macOS builds have no supported window-spawn path yet (Ghostty's CLI
-/// differs per platform); the caller surfaces the error as a status line.
+/// `croft <root> --open-file <file>` as a single shell command line, with every
+/// path single-quoted so spaces and shell metacharacters survive (iTerm2 and
+/// Terminal both run the AppleScript command string through a shell).
+#[cfg(target_os = "macos")]
+fn new_window_shell_command(
+    exe: &std::path::Path,
+    root: &std::path::Path,
+    file: &std::path::Path,
+) -> String {
+    fn shq(p: &std::path::Path) -> String {
+        format!("'{}'", p.to_string_lossy().replace('\'', r"'\''"))
+    }
+    format!("{} {} --open-file {}", shq(exe), shq(root), shq(file))
+}
+
+/// Escape a Rust string for embedding inside an AppleScript double-quoted
+/// string literal (backslash and double-quote are the only specials).
+#[cfg(target_os = "macos")]
+fn applescript_escape(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// AppleScript to open a new iTerm2 window running croft. iTerm2's `command`
+/// argument overrides the profile's default `login`, running our shell command.
+#[cfg(target_os = "macos")]
+fn iterm2_new_window_script(
+    exe: &std::path::Path,
+    root: &std::path::Path,
+    file: &std::path::Path,
+) -> String {
+    let cmd = applescript_escape(&new_window_shell_command(exe, root, file));
+    format!(r#"tell application "iTerm" to create window with default profile command "{cmd}""#)
+}
+
+/// AppleScript to open a new Terminal.app window running croft. `do script`
+/// with no target opens a fresh window and runs the command there.
+#[cfg(target_os = "macos")]
+fn apple_terminal_new_window_script(
+    exe: &std::path::Path,
+    root: &std::path::Path,
+    file: &std::path::Path,
+) -> String {
+    let cmd = applescript_escape(&new_window_shell_command(exe, root, file));
+    format!(r#"tell application "Terminal" to do script "{cmd}""#)
+}
+
+/// Non-macOS builds have no supported window-spawn path yet (each terminal's
+/// CLI differs per platform); the caller surfaces the error as a status line.
 #[cfg(not(target_os = "macos"))]
 fn spawn_new_window(_root: &std::path::Path, _file: &std::path::Path) -> std::io::Result<()> {
     Err(std::io::Error::new(
