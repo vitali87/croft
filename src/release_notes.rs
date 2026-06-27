@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Feature,
-    summary: "Move/Copy into New Window (Cmd+K O) on an editor tab opens the file as a full-screen, chrome-free editor; Esc returns it to the grid.",
+    summary: "Move/Copy into New Window (Cmd+K O) on an editor tab opens the file in a real new Ghostty window, leaving your current window untouched; `croft --open-file` opens a file on launch.",
 }];

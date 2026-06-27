@@ -12423,112 +12423,117 @@ fn split_down_makes_a_vertical_split_with_the_new_group_active_below() {
     assert_eq!(groups[0].path.as_deref(), Some(path.as_path()));
 }
 
-#[test]
-fn move_into_new_window_detaches_the_active_tab_into_a_full_screen_window() {
-    let tmp = tempfile::tempdir().unwrap();
-    let mut app = app_with_open_file(tmp.path(), "a.txt", "hello\nworld");
-    let path = app.editor.path.clone().unwrap();
-
-    app.move_into_new_window(app.editor.active_index());
-
-    assert!(app.editor_windowed(), "a window must be open");
-    assert_eq!(
-        app.editor.path.as_deref(),
-        Some(path.as_path()),
-        "the window holds the moved file (editor is hoisted to the window)"
-    );
-    // The single-file source group emptied, so the parked grid is blank.
-    assert!(
-        app.editor_window_parked
-            .as_ref()
-            .unwrap()
-            .is_blank_initial(),
-        "the source group held only this tab, so the parked grid is blank"
-    );
-}
+// Move/Copy into New Window spawn a REAL Ghostty window via `open`, so the
+// happy path can't be exercised in a test without popping windows on the dev
+// machine. These tests cover everything up to (and the shape of) the spawn:
+// the refusal gates, the argv builder, and the `--open-file` launch open.
 
 #[test]
-fn closing_the_window_returns_the_moved_tab_to_the_grid() {
-    let tmp = tempfile::tempdir().unwrap();
-    let mut app = app_with_open_file(tmp.path(), "a.txt", "hello");
-    let path = app.editor.path.clone().unwrap();
-
-    app.move_into_new_window(app.editor.active_index());
-    assert!(
-        app.close_editor_window(),
-        "close reports it closed a window"
-    );
-
-    assert!(!app.editor_windowed(), "the window is gone");
-    assert_eq!(
-        app.editor.path.as_deref(),
-        Some(path.as_path()),
-        "the moved tab returned to the grid — nothing is lost"
-    );
-    assert_eq!(app.editor.tab_count(), 1);
-}
-
-#[test]
-fn copy_into_new_window_duplicates_the_file_leaving_the_original_in_the_grid() {
-    let tmp = tempfile::tempdir().unwrap();
-    let mut app = app_with_open_file(tmp.path(), "a.txt", "hello");
-    let path = app.editor.path.clone().unwrap();
-
-    app.copy_into_new_window(app.editor.active_index());
-
-    assert!(app.editor_windowed());
-    assert_eq!(app.editor.path.as_deref(), Some(path.as_path()));
-    // Copy leaves the original behind in the parked grid (a duplicate, not a move).
-    assert_eq!(
-        app.editor_window_parked.as_ref().unwrap().path.as_deref(),
-        Some(path.as_path()),
-        "the original stays in the grid for Copy into New Window"
-    );
-}
-
-#[test]
-fn copy_into_new_window_is_refused_for_an_unsaved_buffer() {
+fn new_window_is_refused_for_an_unsaved_buffer() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    // A fresh app has a single blank, path-less buffer.
+    // A fresh app has a single blank, path-less buffer — nothing to hand off.
     app.copy_into_new_window(0);
-    assert!(
-        !app.editor_windowed(),
-        "no window opens without a real path"
-    );
     assert!(
         app.status.contains("save the file first"),
         "the refusal is explained: {}",
         app.status
     );
+    assert_eq!(app.editor.tab_count(), 1, "nothing was spawned or removed");
 }
 
 #[test]
-fn esc_closes_the_editor_window() {
+fn new_window_is_refused_over_ssh_and_leaves_the_tab_in_place() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = app_with_open_file(tmp.path(), "a.txt", "hello");
+    // Over SSH croft runs on the headless host: there is no local window server.
+    app.is_remote = true;
+    let before = app.editor.tab_count();
+
     app.move_into_new_window(app.editor.active_index());
-    assert!(app.editor_windowed());
 
-    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
-        .unwrap();
+    assert!(
+        app.status.contains("not available over SSH"),
+        "the refusal is explained: {}",
+        app.status
+    );
+    assert_eq!(
+        app.editor.tab_count(),
+        before,
+        "Move is a no-op when it can't spawn — the file stays here"
+    );
+    assert!(app.editor.path.is_some());
+}
 
-    assert!(!app.editor_windowed(), "Esc closes the full-screen window");
+#[cfg(target_os = "macos")]
+#[test]
+fn new_window_argv_builds_the_open_ghostty_command() {
+    use std::ffi::OsStr;
+    let exe = std::path::Path::new("/usr/local/bin/croft");
+    let root = std::path::Path::new("/home/me/project");
+    let file = std::path::Path::new("/home/me/project/src/main.rs");
+    let argv = new_window_argv(exe, root, file);
+    let argv: Vec<&OsStr> = argv.iter().map(|s| s.as_os_str()).collect();
+    assert_eq!(
+        argv,
+        [
+            OsStr::new("-na"),
+            OsStr::new("Ghostty"),
+            OsStr::new("--args"),
+            OsStr::new("--quit-after-last-window-closed=true"),
+            OsStr::new("-e"),
+            OsStr::new("/usr/local/bin/croft"),
+            OsStr::new("/home/me/project"),
+            OsStr::new("--open-file"),
+            OsStr::new("/home/me/project/src/main.rs"),
+        ],
+        "a new Ghostty window runs `croft <root> --open-file <file>` via `open -na`"
+    );
 }
 
 #[test]
-fn cmd_k_o_chords_drive_copy_and_move_into_new_window() {
+fn open_file_at_launch_opens_the_file_and_focuses_the_editor() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut app = app_with_open_file(tmp.path(), "a.txt", "hello");
+    let file = tmp.path().join("hi.rs");
+    std::fs::write(&file, "fn main() {}").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
 
-    // Cmd+K O copies into a window (original stays).
+    app.open_file_at_launch(&file);
+
+    assert_eq!(
+        app.editor.path.as_deref(),
+        Some(file.as_path()),
+        "`croft --open-file <path>` opens that file on launch"
+    );
+    assert!(
+        app.focus == Pane::Editor,
+        "the editor takes focus on launch open"
+    );
+}
+
+#[test]
+fn cmd_k_o_chords_route_to_the_new_window_actions() {
+    let tmp = tempfile::tempdir().unwrap();
+    // Blank/unsaved buffer: the chord is still handled, but the action refuses
+    // (no path), so no real window is spawned during the test.
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+
+    // Cmd+K O -> Copy into New Window.
     assert!(app.handle_cmd_k_chord(key(KeyCode::Char('o'), KeyModifiers::NONE)));
-    assert!(app.editor_windowed());
-    app.close_editor_window();
+    assert!(
+        app.status.contains("save the file first"),
+        "Cmd+K O routes to Copy into New Window: {}",
+        app.status
+    );
 
-    // Cmd+K Shift+O moves into a window.
+    // Cmd+K Shift+O -> Move into New Window.
+    app.status.clear();
     assert!(app.handle_cmd_k_chord(key(KeyCode::Char('o'), KeyModifiers::SHIFT)));
-    assert!(app.editor_windowed());
+    assert!(
+        app.status.contains("save the file first"),
+        "Cmd+K Shift+O routes to Move into New Window: {}",
+        app.status
+    );
 }
 
 #[test]

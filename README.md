@@ -65,9 +65,10 @@ cargo build --release && cargo install --path .
 ## Run
 
 ```bash
-croft                # opens the current directory
-croft ~/projects     # opens a specific folder
-croft remote <host>  # launch croft over SSH on a Linux server (host from ~/.ssh/config)
+croft                            # opens the current directory
+croft ~/projects                 # opens a specific folder
+croft ~/proj --open-file a.rs    # opens a folder with a file already open
+croft remote <host>              # launch croft over SSH on a Linux server (host from ~/.ssh/config)
 croft --help
 ```
 

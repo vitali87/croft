@@ -1458,14 +1458,6 @@ pub struct App {
     /// structure; a single unsplit leaf is the just-launched state. Splitting,
     /// moving focus, and collapsing all go through [`editor_layout`].
     pub editor_layout: editor_layout::EditorLayout,
-    /// VS Code "Move/Copy into New Window". croft has no OS windows, so a
-    /// "window" is a full-screen, chrome-free editor surface laid over the
-    /// whole frame. While windowed, the window's tabs are hoisted into
-    /// `editor`(so every editing / LSP / save path Just Works) and the real
-    /// focused grid group is parked here; closing the window (Esc) swaps the
-    /// group back and reintegrates the window's tabs so nothing is ever lost.
-    /// `Some` is the "windowed" flag. See [`App::move_into_new_window`].
-    editor_window_parked: Option<EditorTabs>,
     /// One-shot latch armed when a save is refused because the file changed
     /// on disk. The next `save()` overwrites anyway, giving the user a
     /// "press Cmd+S again to overwrite" escape hatch without a modal.
@@ -2184,7 +2176,6 @@ impl App {
             voice_canceling: false,
             editor,
             editor_layout: editor_layout::EditorLayout::single(),
-            editor_window_parked: None,
             force_save_armed: false,
             terminals: vec![term],
             active_terminal: 0,
@@ -6314,11 +6305,6 @@ impl App {
     /// Right = (H, after), Left = (H, before), Down = (V, after), Up = (V,
     /// before). Splitting is offered only from an unsplit editor for now.
     fn split_editor_dir(&mut self, dir: editor_layout::SplitDir, new_after: bool) {
-        // Splitting is a grid operation; the parked grid isn't visible while a
-        // full-screen window is open. Return to the grid first.
-        if self.editor_windowed() {
-            self.close_editor_window();
-        }
         let Some(path) = self.editor.path.clone() else {
             self.status = String::from("Cannot split: save the file first");
             return;
@@ -6352,9 +6338,6 @@ impl App {
     /// is created in that direction holding the moved tab. Moving the only tab
     /// of a single group with no neighbour is a no-op (nowhere to move to).
     fn move_active_editor(&mut self, dir: editor_layout::Dir) {
-        if self.editor_windowed() {
-            self.close_editor_window();
-        }
         // A nominal area: seam adjacency is scale-invariant, so the exact pane
         // size doesn't matter for finding the directional neighbour.
         let synth = ratatui::layout::Rect::new(0, 0, 10_000, 10_000);
@@ -6401,9 +6384,6 @@ impl App {
     /// the physical columns fixed. No-op when not split or already focused
     /// there.
     fn focus_editor_group(&mut self, want_left: bool) {
-        if self.editor_windowed() {
-            self.close_editor_window();
-        }
         if !self.editor_layout.is_split() {
             return;
         }
@@ -6454,10 +6434,6 @@ impl App {
         // While a full-screen window is open, `editor` is the window and the
         // grid is parked out of the tree — collapsing here would fold the
         // parked grid into the window. The window's own emptiness is handled by
-        // `close_editor_window` on Esc.
-        if self.editor_windowed() {
-            return;
-        }
         if !self.editor_layout.is_split() || !self.editor.is_blank_initial() {
             return;
         }
@@ -6473,88 +6449,62 @@ impl App {
         self.sync_focus_flags();
     }
 
-    /// True while a "New Window" (full-screen editor surface) is open. The
-    /// parked grid group held aside is the windowed flag.
-    fn editor_windowed(&self) -> bool {
-        self.editor_window_parked.is_some()
-    }
-
-    /// VS Code "Move into New Window". croft has no OS windows: a "window" is a
-    /// full-screen, chrome-free editor surface laid over the whole frame. The
-    /// tab at `idx` is detached from its group into a fresh single-tab
-    /// `EditorTabs`, which is hoisted into `self.editor` (so editing, LSP, find
-    /// and save all keep targeting it) while the real focused group is parked
-    /// aside. Esc reintegrates everything — see [`App::close_editor_window`].
+    /// VS Code "Move into New Window": open the tab at `idx` in a brand-new OS
+    /// terminal window (a real, separate Ghostty window running croft on the
+    /// same workspace with the file open), then close the tab here — the file
+    /// has moved to the new window. The current window is otherwise untouched.
     fn move_into_new_window(&mut self, idx: usize) {
-        // A window-within-a-window would orphan the first parked group. Re-home
-        // the existing window first so the move acts on the visible grid.
-        if self.editor_windowed() {
-            self.close_editor_window();
+        if !self.open_tab_in_new_window(idx) {
+            return;
         }
-        self.editor.select(idx);
-        let label = self.editor.tab_display_label(self.editor.active_index());
-        let moved = self.editor.take_active_editor();
-        // Taking the group's last tab leaves it blank-initial; collapse it back
-        // into a sibling if the grid was split, exactly like closing a tab.
-        self.collapse_split_if_empty();
-        let mut window = EditorTabs::default();
-        window.push_editor(moved);
-        self.editor_window_parked = Some(std::mem::replace(&mut self.editor, window));
-        self.focus_pane(Pane::Editor);
-        self.status = format!("{label}: moved into a new window — Esc returns it");
+        // The file now lives in the new window; drop it from this one. Mirrors
+        // MenuAction::CloseTab so the split collapses if this was its last tab.
+        let label = self.editor.tab_display_label(idx);
+        if self.editor.close_tab(idx) {
+            self.sync_open_file_poll_mtime();
+            self.poke_cursor();
+            self.collapse_split_if_empty();
+        }
+        self.status = format!("{label}: moved into a new window");
     }
 
-    /// VS Code "Copy into New Window" (⌘K O). Like [`App::move_into_new_window`]
-    /// but opens a *duplicate* view of the tab's file, leaving the original in
-    /// its group. Needs a real on-disk path to reopen, mirroring Split.
+    /// VS Code "Copy into New Window" (⌘K O): open the tab at `idx` in a
+    /// brand-new OS terminal window, leaving the original tab exactly where it
+    /// is. The current window is not touched at all.
     fn copy_into_new_window(&mut self, idx: usize) {
-        if self.editor_windowed() {
-            self.close_editor_window();
-        }
-        self.editor.select(idx);
-        let Some(path) = self.editor.path.clone() else {
-            self.status = String::from("Copy into New Window: save the file first");
-            return;
-        };
-        let mut window = EditorTabs::default();
-        if window.open_preview(&path).is_err() {
-            self.status = String::from("Copy into New Window: failed to open file");
+        if !self.open_tab_in_new_window(idx) {
             return;
         }
-        // Open the duplicate where the source was scrolled, like Split.
-        window.copy_view_position_from(&self.editor);
-        let label = self.editor.tab_display_label(self.editor.active_index());
-        self.editor_window_parked = Some(std::mem::replace(&mut self.editor, window));
-        self.focus_pane(Pane::Editor);
-        self.status = format!("{label}: copied into a new window — Esc returns it");
+        let label = self.editor.tab_display_label(idx);
+        self.status = format!("{label}: copied into a new window");
     }
 
-    /// Close the full-screen editor window: swap the parked grid group back into
-    /// `self.editor` and reintegrate the window's tabs so nothing is lost. A
-    /// moved tab returns to its group; a copied duplicate joins it as a tab.
-    /// No-op when no window is open. Returns true when it closed one.
-    fn close_editor_window(&mut self) -> bool {
-        let Some(parked) = self.editor_window_parked.take() else {
+    /// Spawn a new OS terminal window running croft on the current workspace
+    /// with the tab at `idx` opened. Returns false (and sets a status) when the
+    /// action can't run: an unsaved/path-less buffer, a remote session (no
+    /// local window server on the headless host), or a spawn failure. Shared by
+    /// Move and Copy into New Window — the only difference is what the caller
+    /// does to the source tab afterwards.
+    fn open_tab_in_new_window(&mut self, idx: usize) -> bool {
+        // A new croft process opens a file by path, so an untitled buffer has
+        // nothing to hand off.
+        let Some(path) = self.editor.tab_path(idx) else {
+            self.status = String::from("New Window: save the file first");
             return false;
         };
-        let window = std::mem::replace(&mut self.editor, parked);
-        // Reintegrate the window's tabs into the restored grid group so nothing
-        // is lost: a moved tab returns, a copied duplicate joins as a tab. If
-        // the user closed everything inside the window it is blank-initial —
-        // drop it rather than pushing a stray blank tab back onto the grid.
-        if !window.is_blank_initial() {
-            for ed in window.editors {
-                self.editor.push_editor(ed);
+        // A new OS window only exists where croft can talk to a window server:
+        // the local machine. Over SSH croft runs on the headless host.
+        if self.is_remote {
+            self.status = String::from("New Window: not available over SSH");
+            return false;
+        }
+        match spawn_new_window(&self.tree.root, &path) {
+            Ok(()) => true,
+            Err(e) => {
+                self.status = format!("New Window failed: {e}");
+                false
             }
         }
-        // The window painted over the whole frame; force a clean repaint of the
-        // grid and drop any image overlay the window left in either slot.
-        self.disable_editor_image(0);
-        self.disable_editor_image(1);
-        self.editor_seams.clear();
-        self.focus_pane(Pane::Editor);
-        self.status = String::from("Closed editor window");
-        true
     }
 
     fn render(&mut self, frame: &mut ratatui::Frame) {
@@ -6694,33 +6644,9 @@ impl App {
                 (right_area, None)
             };
 
-        // A "New Window" (Move/Copy into New Window) lays a chrome-free,
-        // full-screen editor over the whole frame: skip the activity bar,
-        // sidebar and terminal, and give the editor the entire region above the
-        // status bar / on-screen keyboard. `editor` already holds the window's
-        // tabs (the real grid is parked), so the normal editor render path below
-        // paints it; `render_grid` keeps it on the single-group branch even when
-        // the parked grid was split.
-        let windowed = self.editor_window_parked.is_some();
-        let (editor_area, terminal_area) = if windowed {
-            // The chrome isn't painted this frame, so its hit-test rectangles
-            // would go stale over cells the window now owns. Zero them so a
-            // click on the window can't fall through to the activity bar or a
-            // splitter hidden beneath it (the rest of the chrome rects are
-            // neutralised in `handle_mouse` while windowed).
-            self.sidebar_areas = SidebarAreas::default();
-            self.sidebar_splitter_x = None;
-            self.terminal_splitter_y = None;
-            (outer[0], None)
-        } else {
-            (editor_area, terminal_area)
-        };
+        self.render_activity_bar(frame, activity_area);
 
-        if !windowed {
-            self.render_activity_bar(frame, activity_area);
-        }
-
-        if let Some(area) = side_area.filter(|_| !windowed) {
+        if let Some(area) = side_area {
             let usable_area = area;
             // Feed the render-time pointer cell to every side panel so the row
             // under the cursor (and the remote header pills) can light up,
@@ -6749,7 +6675,7 @@ impl App {
                 SidebarView::Extensions => frame.render_widget(&mut self.extensions, usable_area),
             }
         }
-        if !windowed && !self.editor_layout.is_split() && self.editor.is_blank_initial() {
+        if !self.editor_layout.is_split() && self.editor.is_blank_initial() {
             self.render_welcome(frame, editor_area);
             // The previous frame may have rendered an image-preview tab
             // whose OSC-1337 pixels are still cached in iTerm's image
@@ -6786,7 +6712,7 @@ impl App {
             // reporting the active group's rect so popups anchor there.
             let rects = self.editor_layout.leaf_rects(editor_area, EDITOR_SPLIT_MIN);
             let active_idx = self.editor_layout.active_dfs_index();
-            let focused_area = if self.editor_layout.is_split() && !windowed {
+            let focused_area = if self.editor_layout.is_split() {
                 let active_area = rects[active_idx];
                 frame.render_widget(&mut self.editor, active_area);
                 let inactive_rects: Vec<Rect> = rects
@@ -8121,18 +8047,6 @@ impl App {
         // Modal layer: open context menu eats keyboard navigation.
         if self.context_menu.is_some() {
             self.handle_menu_key(key);
-            return Ok(());
-        }
-        // A full-screen editor window (Move/Copy into New Window) closes on Esc,
-        // swapping the grid back and reintegrating its tabs. Let an open
-        // completion popup or the editor Find bar consume Esc first — there it
-        // cancels (closes the popup / find bar) rather than the whole window.
-        if self.editor_windowed()
-            && matches!(key.code, KeyCode::Esc)
-            && self.completion_popup.is_none()
-            && self.editor_find.is_none()
-        {
-            self.close_editor_window();
             return Ok(());
         }
         // Cmd+E toggles native modal (vim) editing. Global (above the focus
@@ -9685,6 +9599,17 @@ impl App {
             }
         };
         if opened {
+            self.focus_pane(Pane::Editor);
+            self.sync_open_file_poll_mtime();
+        }
+    }
+
+    /// Open `path` as a pinned editor tab and focus the editor. Used at launch
+    /// for `croft <root> --open-file <path>` (the new window spawned by Move /
+    /// Copy into New Window opens the handed-off file this way). Best-effort: a
+    /// missing / unreadable file just leaves the editor on the welcome screen.
+    pub fn open_file_at_launch(&mut self, path: &Path) {
+        if self.editor.open_pinned(path).is_ok() {
             self.focus_pane(Pane::Editor);
             self.sync_open_file_poll_mtime();
         }
@@ -15356,7 +15281,6 @@ impl App {
         // operates on the clicked group. The swap keeps the physical
         // columns fixed.
         if matches!(m.kind, MouseEventKind::Down(_))
-            && !self.editor_windowed()
             && self.editor_layout.is_split()
             && self.seam_at(m.column, m.row).is_none()
             && let Some(target) = self.editor_layout.inactive_dfs_index_at(m.column, m.row)
@@ -15405,39 +15329,6 @@ impl App {
             && rect_contains(self.search.last_scrollbar, m.column, m.row);
         let in_editor_scrollbar = rect_contains(self.editor.last_scrollbar, m.column, m.row);
         let in_editor_hscrollbar = rect_contains(self.editor.last_hscrollbar, m.column, m.row);
-
-        // A full-screen editor window owns the whole frame: the sidebar and
-        // terminal aren't painted, so their (stale) hit rects must not capture
-        // clicks the window should get. Force every non-editor surface to miss.
-        let (
-            in_tree,
-            in_terminal,
-            terminal_hit,
-            in_outline,
-            in_open_editors,
-            in_timeline,
-            in_deps,
-            in_tree_scrollbar,
-            in_remote_scrollbar,
-            in_search_scrollbar,
-        ) = if self.editor_windowed() {
-            (
-                false, false, None, false, false, false, false, false, false, false,
-            )
-        } else {
-            (
-                in_tree,
-                in_terminal,
-                terminal_hit,
-                in_outline,
-                in_open_editors,
-                in_timeline,
-                in_deps,
-                in_tree_scrollbar,
-                in_remote_scrollbar,
-                in_search_scrollbar,
-            )
-        };
 
         if matches!(m.kind, MouseEventKind::Moved) {
             self.pointer_cell = Some((m.column, m.row));
@@ -18252,6 +18143,60 @@ fn reset_session_bg_seq() -> String {
     String::from("\x1b]1337;SetColors=bg=default\x07")
 }
 
+/// Spawn a brand-new OS terminal window running croft on `root` with `file`
+/// opened — VS Code's "Move/Copy into New Window", realised as a genuine
+/// separate window so the originating croft is never disturbed (a TUI owns one
+/// screen, so an in-process "window" could only ever hide the existing app).
+///
+/// macOS: open a fresh Ghostty window. `open -na` forces a new instance, the
+/// only reliable way to get a new window with a command — `open -a` would just
+/// re-focus the running Ghostty without passing args. `--quit-after-last-window-closed`
+/// keeps the spawned instance from lingering once the user closes that window.
+/// The croft binary is launched by its resolved absolute path: a GUI-launched
+/// croft inherits a stripped launchd PATH, so the bare name would not resolve
+/// in the new window's shell (see the project memory on PATH stripping).
+#[cfg(target_os = "macos")]
+fn spawn_new_window(root: &std::path::Path, file: &std::path::Path) -> std::io::Result<()> {
+    let exe = std::env::current_exe()?;
+    std::process::Command::new("open")
+        .args(new_window_argv(&exe, root, file))
+        .spawn()?;
+    Ok(())
+}
+
+/// The `open` argument vector for spawning a new Ghostty window running
+/// `croft <root> --open-file <file>`. Split out so the exact shape is unit-
+/// testable without actually launching a window.
+#[cfg(target_os = "macos")]
+fn new_window_argv(
+    exe: &std::path::Path,
+    root: &std::path::Path,
+    file: &std::path::Path,
+) -> Vec<std::ffi::OsString> {
+    use std::ffi::OsString;
+    vec![
+        OsString::from("-na"),
+        OsString::from("Ghostty"),
+        OsString::from("--args"),
+        OsString::from("--quit-after-last-window-closed=true"),
+        OsString::from("-e"),
+        exe.as_os_str().to_os_string(),
+        root.as_os_str().to_os_string(),
+        OsString::from("--open-file"),
+        file.as_os_str().to_os_string(),
+    ]
+}
+
+/// Non-macOS builds have no supported window-spawn path yet (Ghostty's CLI
+/// differs per platform); the caller surfaces the error as a status line.
+#[cfg(not(target_os = "macos"))]
+fn spawn_new_window(_root: &std::path::Path, _file: &std::path::Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "opening a new window is only supported on macOS",
+    ))
+}
+
 fn build_title(workspace: &std::path::Path) -> String {
     let name = workspace
         .file_name()
@@ -20375,7 +20320,11 @@ impl std::io::Write for CountingWriter {
 
 type CroftTerminal = Terminal<CrosstermBackend<CountingWriter>>;
 
-pub fn run(root: PathBuf, restore_session: Option<PathBuf>) -> Result<()> {
+pub fn run(
+    root: PathBuf,
+    restore_session: Option<PathBuf>,
+    open_file: Option<PathBuf>,
+) -> Result<()> {
     // zoxide is a hard dependency of the Cmd+Z jump popup. Probe for it
     // and install it in the background if missing, off the launch path so
     // the first frame is never blocked. Runs on every host croft starts
@@ -20404,6 +20353,11 @@ pub fn run(root: PathBuf, restore_session: Option<PathBuf>) -> Result<()> {
             app.apply_session_state(&state);
         }
         let _ = std::fs::remove_file(session_path);
+    }
+    // `croft <root> --open-file <path>`: open the handed-off file (used by the
+    // new window that Move / Copy into New Window spawns).
+    if let Some(file) = open_file.as_ref() {
+        app.open_file_at_launch(file);
     }
     app.start_update_watch_if_remote();
 
@@ -20544,7 +20498,7 @@ pub fn run(root: PathBuf, restore_session: Option<PathBuf>) -> Result<()> {
         };
         restore_host_terminal_state();
         match launch_result? {
-            crate::remote::RemoteOutcome::ReturnToLocal => return run(root, None),
+            crate::remote::RemoteOutcome::ReturnToLocal => return run(root, None, None),
             crate::remote::RemoteOutcome::Exited => return Ok(()),
         }
     }

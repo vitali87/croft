@@ -43,8 +43,8 @@ On macOS, the `Cmd` chords below only reach croft after you run a one-time setup
 | `Cmd+K` `W` | Close all editor tabs |
 | `Cmd+K` `U` | Close all saved (non-dirty) editor tabs, keeping unsaved ones |
 | `Cmd+K` `E` | Reveal the active file in the Explorer tree (expand parents, select, focus) |
-| `Cmd+K` `O` | Copy into New Window: open a duplicate of the active file as a full-screen, chrome-free editor (`Esc` returns) |
-| `Cmd+K` `Shift+O` | Move into New Window: detach the active file into a full-screen, chrome-free editor (`Esc` returns) |
+| `Cmd+K` `O` | Copy into New Window: open the active file in a new Ghostty window (the current window is untouched; macOS only) |
+| `Cmd+K` `Shift+O` | Move into New Window: open the active file in a new Ghostty window and close its tab here (macOS only) |
 | Mouse wheel | Scroll the pane under the pointer |
 
 ## Command Palette

@@ -17,6 +17,12 @@ pub struct Cli {
     #[arg(value_name = "PATH")]
     pub path: Option<PathBuf>,
 
+    /// Open this file in the editor on launch (the workspace stays rooted at
+    /// PATH). Used by "Move/Copy into New Window", and handy on its own:
+    /// `croft ~/project --open-file ~/project/src/main.rs`.
+    #[arg(long, value_name = "FILE")]
+    pub open_file: Option<PathBuf>,
+
     /// Internal: restore tabs/layout from a session file written just
     /// before a self-update re-exec. Not intended for manual use.
     #[arg(long, hide = true)]
@@ -121,7 +127,7 @@ impl Cli {
                 match crate::remote::launch_croft(&host, path.as_deref())? {
                     crate::remote::RemoteOutcome::ReturnToLocal => {
                         let cwd = std::env::current_dir().context("resolving workspace path")?;
-                        crate::app::run(cwd, None)
+                        crate::app::run(cwd, None, None)
                     }
                     crate::remote::RemoteOutcome::Exited => Ok(()),
                 }
@@ -140,7 +146,7 @@ impl Cli {
                 if !path.is_dir() {
                     anyhow::bail!("{} is not a directory", path.display());
                 }
-                crate::app::run(path, self.restore_session)
+                crate::app::run(path, self.restore_session, self.open_file)
             }
         }
     }
