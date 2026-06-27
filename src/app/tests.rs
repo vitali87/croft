@@ -10,7 +10,9 @@ fn key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
 /// `MenuEntry`-based context menus.
 fn menu_label(e: &MenuEntry) -> &str {
     match e {
-        MenuEntry::Item { label, .. } | MenuEntry::Submenu { label, .. } => label,
+        MenuEntry::Item { label, .. }
+        | MenuEntry::Submenu { label, .. }
+        | MenuEntry::Header(label) => label,
         MenuEntry::Separator => "---",
     }
 }
@@ -7600,12 +7602,18 @@ fn clicking_the_gear_opens_the_color_theme_menu_then_the_picker() {
     assert!(
         matches!(
             menu.items.as_slice(),
-            [MenuEntry::Item {
-                action: MenuAction::OpenThemePicker,
-                ..
-            }]
+            [
+                MenuEntry::Item {
+                    action: MenuAction::OpenThemePicker,
+                    ..
+                },
+                MenuEntry::Item {
+                    action: MenuAction::OpenCustomizeLayout,
+                    ..
+                }
+            ]
         ),
-        "the gear menu holds a single Color Theme entry"
+        "the gear menu holds Color Theme then Customize Layout"
     );
     // Selecting Color Theme replaces the menu with the theme picker.
     app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
@@ -11272,6 +11280,7 @@ fn tab_menu_groups_split_and_move_into_a_submenu() {
         .map(|e| match e {
             MenuEntry::Item { label, .. } => label.as_str(),
             MenuEntry::Submenu { label, .. } => label.as_str(),
+            MenuEntry::Header(label) => label.as_str(),
             MenuEntry::Separator => "---",
         })
         .collect();
@@ -13908,4 +13917,330 @@ fn toggling_an_explorer_view_flips_and_persists_its_visibility() {
         !before,
         "toggling Outline must flip its visibility"
     );
+}
+
+// --- Customize Layout: pure chrome geometry -------------------------------
+
+fn main_band() -> Rect {
+    Rect {
+        x: 0,
+        y: 0,
+        width: 100,
+        height: 30,
+    }
+}
+
+#[test]
+fn chrome_left_position_orders_activity_primary_editor_secondary() {
+    let l = compute_chrome_layout(main_band(), true, true, true, SideBarPosition::Left, 20, 30);
+    let a = l.activity.expect("activity shown");
+    let p = l.primary_side.expect("primary shown");
+    let s = l.secondary_side.expect("secondary shown");
+    assert_eq!(a.x, 0, "activity bar hugs the left edge");
+    assert_eq!(a.width, ACTIVITY_BAR_WIDTH);
+    assert_eq!(
+        p.x,
+        a.x + a.width,
+        "primary side bar follows the activity bar"
+    );
+    assert_eq!(p.width, 20);
+    assert_eq!(
+        l.right.x,
+        p.x + p.width,
+        "editor follows the primary side bar"
+    );
+    assert_eq!(
+        s.x,
+        l.right.x + l.right.width,
+        "secondary is on the far right"
+    );
+    assert_eq!(
+        l.sidebar_splitter_x,
+        Some(l.right.x),
+        "seam is the editor's left edge"
+    );
+    // Every column tiles the band exactly, no gaps or overlaps.
+    assert_eq!(a.width + p.width + l.right.width + s.width, 100);
+}
+
+#[test]
+fn chrome_right_position_mirrors_to_secondary_editor_primary_activity() {
+    let l = compute_chrome_layout(
+        main_band(),
+        true,
+        true,
+        true,
+        SideBarPosition::Right,
+        20,
+        30,
+    );
+    let s = l.secondary_side.expect("secondary shown");
+    let p = l.primary_side.expect("primary shown");
+    let a = l.activity.expect("activity shown");
+    assert_eq!(
+        s.x, 0,
+        "secondary hugs the left when the primary is on the right"
+    );
+    assert_eq!(l.right.x, s.x + s.width, "editor follows the secondary");
+    assert_eq!(
+        p.x,
+        l.right.x + l.right.width,
+        "primary side bar follows the editor"
+    );
+    assert_eq!(a.x, p.x + p.width, "activity bar is on the far right");
+    assert_eq!(
+        l.sidebar_splitter_x,
+        Some(p.x),
+        "seam is the editor's right edge"
+    );
+    assert_eq!(s.width + l.right.width + p.width + a.width, 100);
+}
+
+#[test]
+fn chrome_hidden_regions_consume_no_width() {
+    let l = compute_chrome_layout(
+        main_band(),
+        false,
+        false,
+        false,
+        SideBarPosition::Left,
+        20,
+        30,
+    );
+    assert!(l.activity.is_none());
+    assert!(l.primary_side.is_none());
+    assert!(l.secondary_side.is_none());
+    assert_eq!(l.sidebar_splitter_x, None, "no seam without a side bar");
+    assert_eq!(l.right.x, 0, "editor reclaims the whole band");
+    assert_eq!(l.right.width, 100);
+}
+
+#[test]
+fn chrome_narrow_frame_shrinks_primary_to_keep_editor_min() {
+    // activity(4) + primary wants 90 + editor needs RIGHT_PANE_MIN, in 100 wide.
+    let l = compute_chrome_layout(main_band(), true, true, false, SideBarPosition::Left, 90, 0);
+    assert_eq!(l.right.width, RIGHT_PANE_MIN, "editor keeps its minimum");
+    let p = l.primary_side.expect("primary still shown, just narrower");
+    assert_eq!(p.width, 100 - ACTIVITY_BAR_WIDTH - RIGHT_PANE_MIN);
+}
+
+#[test]
+fn panel_band_center_and_justify_fill_the_band() {
+    let band = Rect {
+        x: 10,
+        y: 5,
+        width: 40,
+        height: 8,
+    };
+    assert_eq!(panel_band_rect(band, PanelAlignment::Center), band);
+    assert_eq!(panel_band_rect(band, PanelAlignment::Justify), band);
+}
+
+#[test]
+fn panel_band_left_hugs_left_right_hugs_right() {
+    let band = Rect {
+        x: 10,
+        y: 5,
+        width: 60,
+        height: 8,
+    };
+    let left = panel_band_rect(band, PanelAlignment::Left);
+    assert_eq!(left.x, 10);
+    assert_eq!(left.width, 30);
+    let right = panel_band_rect(band, PanelAlignment::Right);
+    assert_eq!(
+        right.x,
+        10 + 60 - 30,
+        "right-aligned panel ends at the band's right edge"
+    );
+    assert_eq!(right.width, 30);
+}
+
+// --- Zen Mode snapshot / restore ------------------------------------------
+
+#[test]
+fn zen_mode_hides_all_chrome_then_restores_the_snapshot() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    // A non-default starting layout so restore is meaningful.
+    app.show_tree = true;
+    app.show_terminal = false;
+    app.secondary_side_bar_visible = true;
+    app.activity_bar_visible = true;
+    app.status_bar_visible = true;
+
+    app.toggle_zen_mode();
+    assert!(app.zen_mode, "zen on");
+    assert!(!app.activity_bar_visible);
+    assert!(!app.status_bar_visible);
+    assert!(!app.show_tree);
+    assert!(!app.secondary_side_bar_visible);
+    assert!(!app.show_terminal);
+
+    app.toggle_zen_mode();
+    assert!(!app.zen_mode, "zen off");
+    assert!(app.show_tree, "restored prior side bar");
+    assert!(!app.show_terminal, "restored prior (hidden) panel");
+    assert!(
+        app.secondary_side_bar_visible,
+        "restored prior secondary bar"
+    );
+    assert!(app.activity_bar_visible);
+    assert!(app.status_bar_visible);
+}
+
+#[test]
+fn secondary_side_bar_toggle_flips_visibility() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let before = app.secondary_side_bar_visible;
+    app.toggle_secondary_side_bar();
+    assert_eq!(app.secondary_side_bar_visible, !before);
+}
+
+#[test]
+fn customize_layout_items_reflect_current_state_with_checks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.activity_bar_visible = true;
+    app.status_bar_visible = false;
+    app.side_bar_position = SideBarPosition::Right;
+    app.panel_alignment = PanelAlignment::Justify;
+    let items = app.customize_layout_items();
+    // Activity Bar (on) gets a check; Status Bar (off) does not.
+    let activity = menu_label(&items[0]);
+    assert!(
+        activity.starts_with('\u{2713}'),
+        "Activity Bar checked: {activity}"
+    );
+    let status = menu_label(&items[4]);
+    assert!(
+        !status.starts_with('\u{2713}'),
+        "Status Bar unchecked: {status}"
+    );
+    // The active radio option carries the check.
+    let labels = menu_labels(&items);
+    assert!(
+        labels
+            .iter()
+            .any(|l| l.starts_with('\u{2713}') && l.contains("Right")),
+        "side-bar Right is checked"
+    );
+    assert!(
+        labels
+            .iter()
+            .any(|l| l.starts_with('\u{2713}') && l.contains("Justify")),
+        "panel Justify is checked"
+    );
+}
+
+#[test]
+fn render_survives_every_customize_layout_combination() {
+    // Exercises the real render() path (not just the pure geometry) across the
+    // layout permutations so an out-of-bounds buffer write in any branch
+    // (side bar right, secondary bar, hidden chrome, every panel alignment)
+    // panics here rather than in front of the user.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let aligns = [
+        PanelAlignment::Left,
+        PanelAlignment::Center,
+        PanelAlignment::Right,
+        PanelAlignment::Justify,
+    ];
+    for &pos in &[SideBarPosition::Left, SideBarPosition::Right] {
+        for &activity in &[true, false] {
+            for &secondary in &[true, false] {
+                for &status in &[true, false] {
+                    for &align in &aligns {
+                        app.side_bar_position = pos;
+                        app.activity_bar_visible = activity;
+                        app.secondary_side_bar_visible = secondary;
+                        app.status_bar_visible = status;
+                        app.panel_alignment = align;
+                        for size in [(120u16, 40u16), (40, 12)] {
+                            let backend = ratatui::backend::TestBackend::new(size.0, size.1);
+                            let mut term = ratatui::Terminal::new(backend).unwrap();
+                            term.draw(|f| app.render(f)).expect("render must not panic");
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // And in Zen Mode (all chrome hidden) at a tiny size.
+    app.toggle_zen_mode();
+    let backend = ratatui::backend::TestBackend::new(30, 8);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f))
+        .expect("zen render must not panic");
+}
+
+#[test]
+fn clicking_the_customize_icon_opens_the_customize_layout_popup() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let cust = app.layout_icon_areas.customize;
+    assert!(cust.width > 0, "the customize icon must be laid out");
+    app.handle_mouse(crossterm::event::MouseEvent {
+        kind: crossterm::event::MouseEventKind::Down(MouseButton::Left),
+        column: cust.x,
+        row: cust.y,
+        modifiers: KeyModifiers::NONE,
+    });
+    let menu = app.context_menu.as_ref().expect("customize popup opens");
+    assert!(
+        matches!(
+            menu.items.first(),
+            Some(MenuEntry::Item {
+                action: MenuAction::ToggleActivityBar,
+                ..
+            })
+        ),
+        "the popup is the Customize Layout menu"
+    );
+    // And the icon advertises itself on hover.
+    assert_eq!(
+        app.ui_tooltip_at(cust.x, cust.y),
+        Some("Customize Layout...")
+    );
+}
+
+#[test]
+fn clicking_the_side_bar_icon_toggles_the_primary_side_bar() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let side = app.layout_icon_areas.toggle_side_bar;
+    assert!(side.width > 0);
+    let before = app.show_tree;
+    app.handle_mouse(crossterm::event::MouseEvent {
+        kind: crossterm::event::MouseEventKind::Down(MouseButton::Left),
+        column: side.x,
+        row: side.y,
+        modifiers: KeyModifiers::NONE,
+    });
+    assert_eq!(app.show_tree, !before, "the side-bar icon flips show_tree");
+}
+
+#[test]
+fn secondary_sidebar_chord_is_alt_cmd_b_not_plain_cmd_b() {
+    assert!(is_secondary_sidebar_toggle_key(key(
+        KeyCode::Char('b'),
+        KeyModifiers::SUPER | KeyModifiers::ALT
+    )));
+    assert!(!is_secondary_sidebar_toggle_key(key(
+        KeyCode::Char('b'),
+        KeyModifiers::SUPER
+    )));
+    // Plain Cmd+B stays the PRIMARY side-bar toggle, never the secondary.
+    assert!(!is_sidebar_toggle_key(key(
+        KeyCode::Char('b'),
+        KeyModifiers::SUPER | KeyModifiers::ALT
+    )));
 }

@@ -82,6 +82,16 @@ pub const SEARCH_CLEAR_ALL: char = '\u{eabf}';
 /// image path rasterises `assets/icons/settings_gear.svg` instead.
 pub const ACTIVITY_SETTINGS: char = '\u{eb51}';
 
+/// The Customize Layout toolbar (top-right of the editor tab strip and the
+/// welcome screen) — croft's analog of VS Code's title-bar layout controls.
+/// Plain geometric glyphs (NOT half-block / quadrant art), chosen so they
+/// render in any terminal font without the codicon Nerd Font: a square for the
+/// side bar, a wide rectangle for the bottom panel, and the four-corners mark
+/// for "Customize Layout". These are the glyphs the layout-options mockup used.
+pub const LAYOUT_TOGGLE_SIDEBAR: char = '\u{25a2}';
+pub const LAYOUT_TOGGLE_PANEL: char = '\u{25ad}';
+pub const LAYOUT_CUSTOMIZE: char = '\u{26f6}';
+
 /// Codicon + colour for an Outline symbol, mirroring VS Code's `symbol-*`
 /// glyphs and `symbolIcon.*Foreground` theme colours. Codepoints verified on
 /// 2026-06-18 against the upstream codicon `mapping.json`; the Nerd Font

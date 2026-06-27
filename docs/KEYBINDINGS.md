@@ -13,6 +13,7 @@ On macOS, the `Cmd` chords below only reach croft after you run a one-time setup
 | `F1` | Open the shortcuts modal |
 | `F6` | Cycle focus across panes (tree → editor → terminal → tree) |
 | `Ctrl+b` / `Cmd+b` | Toggle the primary side bar (left pane) |
+| `Opt+Ctrl+b` / `Opt+Cmd+b` | Toggle the secondary side bar (the active file's Outline, on the edge opposite the primary side bar) |
 | `Ctrl+j` | Toggle the terminal pane |
 | `Ctrl+Shift+j` | Maximize the terminal pane (press again to restore the split) |
 | `Cmd+\` | Split the editor into two side-by-side columns; each keeps its own tabs, scroll, and cursor. Closing the last tab in a column collapses the split |
@@ -27,7 +28,8 @@ On macOS, the `Cmd` chords below only reach croft after you run a one-time setup
 | `Ctrl+Shift+x` / `Cmd+Shift+x` | Jump to Extensions |
 | `Ctrl+Shift+l` / `Cmd+Shift+l` | While on a remote, disconnect and return to the local croft at the directory you connected from |
 | Click activity-bar icons | Switch between Explorer, Search, Source Control, Run and Debug, Remote, and Extensions |
-| Click the settings gear | Open settings → Color Theme picker (Croft Dark Blue / Croft Black) |
+| Click the settings gear | Open settings → Color Theme picker (Croft Dark Blue / Croft Black) or Customize Layout |
+| Click the layout icons (top-right of the editor / welcome) | Toggle the primary side bar, toggle the panel, or open the **Customize Layout** popup |
 | Drag a seam | Resize the sidebar, the split between editor columns, or the editor/terminal split |
 
 ### `Cmd+K` chords
@@ -45,7 +47,22 @@ On macOS, the `Cmd` chords below only reach croft after you run a one-time setup
 | `Cmd+K` `E` | Reveal the active file in the Explorer tree (expand parents, select, focus) |
 | `Cmd+K` `O` | Copy into New Window: open the active file in a new window of your terminal, focused on just the file (Explorer + terminal hidden; the current window is untouched; Ghostty / iTerm2 / Terminal; macOS only) |
 | `Cmd+K` `Shift+O` | Move into New Window: same, and close the file's tab here (macOS only) |
+| `Cmd+K` `Z` | Toggle Zen Mode: hide the activity bar, both side bars, the panel, and the status bar; press again to restore exactly what was shown before |
 | Mouse wheel | Scroll the pane under the pointer |
+
+### Customize Layout
+
+Click the **⛶** icon at the top-right of the editor (or the welcome screen), or the settings gear → **Customize Layout**. The popup mirrors VS Code's title-bar layout controls and stays open while you flip several toggles:
+
+| Group | Options |
+|-------|---------|
+| Visibility | Activity Bar, Primary Side Bar (`Cmd`/`Ctrl`+`B`), Secondary Side Bar (`Opt`+`Cmd`/`Ctrl`+`B`), Panel (`Ctrl`+`J`), Status Bar |
+| Primary Side Bar Position | Left / Right (moves the activity bar with it) |
+| Panel Alignment | Left / Center / Right / Justify (Justify spans the full width under the side bar) |
+| Quick Input Position | Top / Center (where Command Palette / Go to File appears) |
+| Zen Mode | `Cmd`/`Ctrl`+`K` `Z` |
+
+Every choice except the side-bar / panel visibility persists across launches in `~/.config/croft/config.json`.
 
 ## Command Palette
 

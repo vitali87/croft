@@ -59,7 +59,13 @@ pub struct ReleaseNote {
 }
 
 /// What shipped in the current release. Replace on every version bump.
-pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
-    kind: NoteKind::Feature,
-    summary: "Move/Copy into New Window (Cmd+K O) now opens exactly ONE new terminal window focused on just the file (Explorer + terminal hidden); the Ghostty stray-second-window is suppressed. New `croft --open-file` and `--zen` flags.",
-}];
+pub const RELEASE_NOTES: &[ReleaseNote] = &[
+    ReleaseNote {
+        kind: NoteKind::Feature,
+        summary: "Customize Layout: the ⛶ icon (top-right of the editor / welcome) and the gear menu open VS Code's layout controls — show/hide the activity bar, both side bars, panel, and status bar; dock the side bar left or right; align the panel; move the quick input.",
+    },
+    ReleaseNote {
+        kind: NoteKind::Feature,
+        summary: "New secondary side bar (Opt+Cmd/Ctrl+B) hosting the active file's Outline, plus Zen Mode (Cmd+K Z) that hides all chrome and restores it on the next press.",
+    },
+];

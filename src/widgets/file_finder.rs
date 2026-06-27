@@ -572,13 +572,25 @@ pub fn build_file_index(root: &Path) -> Vec<FileEntry> {
     out
 }
 
-pub fn render_file_finder(finder: &mut FileFinder, area: Rect, buf: &mut Buffer, gradient: bool) {
+pub fn render_file_finder(
+    finder: &mut FileFinder,
+    area: Rect,
+    buf: &mut Buffer,
+    gradient: bool,
+    center: bool,
+) {
     let width = area.width.saturating_mul(7) / 10;
     let width = width.clamp(40, 100.min(area.width));
     let height = area.height.saturating_mul(6) / 10;
     let height = height.clamp(10, area.height);
     let x = area.x + (area.width.saturating_sub(width)) / 2;
-    let y = area.y + (area.height.saturating_sub(height)) / 4;
+    // Quick Input Position: Top anchors in the upper third (VS Code's
+    // default); Center pins it to the vertical middle.
+    let y = if center {
+        area.y + (area.height.saturating_sub(height)) / 2
+    } else {
+        area.y + (area.height.saturating_sub(height)) / 4
+    };
     let rect = Rect {
         x,
         y,

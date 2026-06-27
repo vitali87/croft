@@ -57,6 +57,8 @@ pub enum Command {
     ShowRemote,
     ShowExtensions,
     ToggleSideBar,
+    ToggleSecondarySideBar,
+    ToggleZenMode,
     ToggleTerminal,
     NewTerminal,
     // --- Run / debug ---
@@ -110,6 +112,8 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::ShowRemote,
     Command::ShowExtensions,
     Command::ToggleSideBar,
+    Command::ToggleSecondarySideBar,
+    Command::ToggleZenMode,
     Command::ToggleTerminal,
     Command::NewTerminal,
     Command::StartDebugging,
@@ -164,6 +168,8 @@ impl Command {
             Command::ShowRemote => "View: Show Remote",
             Command::ShowExtensions => "View: Show Extensions",
             Command::ToggleSideBar => "View: Toggle Primary Side Bar",
+            Command::ToggleSecondarySideBar => "View: Toggle Secondary Side Bar",
+            Command::ToggleZenMode => "View: Toggle Zen Mode",
             Command::ToggleTerminal => "View: Toggle Terminal",
             Command::NewTerminal => "Terminal: Create New Terminal",
             Command::StartDebugging => "Debug: Start Debugging",
@@ -219,6 +225,8 @@ impl Command {
             Command::ShowRemote => "Cmd+Shift+R",
             Command::ShowExtensions => "Cmd+Shift+X",
             Command::ToggleSideBar => "Cmd+B",
+            Command::ToggleSecondarySideBar => "Cmd+Opt+B",
+            Command::ToggleZenMode => "Cmd+K Z",
             Command::ToggleTerminal => "Ctrl+J",
             Command::NewTerminal => "Cmd+T",
             Command::KeyboardShortcuts => "F1",
@@ -444,13 +452,20 @@ pub fn render_command_palette(
     area: Rect,
     buf: &mut Buffer,
     gradient: bool,
+    center: bool,
 ) {
     let width = area.width.saturating_mul(7) / 10;
     let width = width.clamp(40, 100.min(area.width));
     let height = area.height.saturating_mul(6) / 10;
     let height = height.clamp(10, area.height);
     let x = area.x + (area.width.saturating_sub(width)) / 2;
-    let y = area.y + (area.height.saturating_sub(height)) / 4;
+    // Quick Input Position: Top anchors in the upper third (VS Code's
+    // default); Center pins it to the vertical middle.
+    let y = if center {
+        area.y + (area.height.saturating_sub(height)) / 2
+    } else {
+        area.y + (area.height.saturating_sub(height)) / 4
+    };
     let rect = Rect {
         x,
         y,

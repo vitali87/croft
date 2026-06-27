@@ -12,7 +12,42 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::app::{PanelAlignment, QuickInputPosition, SideBarPosition};
 use crate::theme::Theme;
+
+/// The layout chrome chosen in the "Customize Layout" popup (croft's analog of
+/// VS Code's title-bar layout controls). Every field carries its own
+/// `#[serde(default)]` so a config written before this block existed still
+/// parses straight into these defaults. The primary side bar (⌘B) and panel
+/// (⌃J) visibility stay ephemeral per launch and so are NOT stored here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LayoutPrefs {
+    #[serde(default = "default_true")]
+    pub activity_bar: bool,
+    #[serde(default = "default_true")]
+    pub status_bar: bool,
+    #[serde(default)]
+    pub side_bar_position: SideBarPosition,
+    #[serde(default)]
+    pub secondary_side_bar: bool,
+    #[serde(default)]
+    pub panel_alignment: PanelAlignment,
+    #[serde(default)]
+    pub quick_input_position: QuickInputPosition,
+}
+
+impl Default for LayoutPrefs {
+    fn default() -> Self {
+        Self {
+            activity_bar: true,
+            status_bar: true,
+            side_bar_position: SideBarPosition::default(),
+            secondary_side_bar: false,
+            panel_alignment: PanelAlignment::default(),
+            quick_input_position: QuickInputPosition::default(),
+        }
+    }
+}
 
 /// Which of the Explorer's stacked sub-views are shown, toggled from the
 /// "Views and More Actions" (⋯) menu on the EXPLORER header. Mirrors VS Code's
@@ -86,6 +121,9 @@ pub struct Prefs {
     /// [`crate::mcp::client::tool_fingerprint`].
     #[serde(default)]
     pub mcp_tool_fingerprints: BTreeMap<String, String>,
+    /// Layout chrome chosen in the "Customize Layout" popup.
+    #[serde(default)]
+    pub layout: LayoutPrefs,
 }
 
 impl Prefs {
@@ -182,6 +220,15 @@ pub fn save_mcp_tool_fingerprint(command_id: &str, fingerprint: &str) -> Result<
     prefs
         .mcp_tool_fingerprints
         .insert(command_id.to_string(), fingerprint.to_string());
+    prefs.save(&path)
+}
+
+/// Persist the Customize Layout chrome choices, preserving other settings.
+/// Best-effort: a write failure is swallowed by the caller.
+pub fn save_layout(layout: LayoutPrefs) -> Result<()> {
+    let path = config_path();
+    let mut prefs = Prefs::load(&path).unwrap_or_default();
+    prefs.layout = layout;
     prefs.save(&path)
 }
 
@@ -284,6 +331,39 @@ mod tests {
             .expect("write legacy config");
         let legacy = Prefs::load(&path).expect("load legacy").explorer_views;
         assert!(!legacy.dependencies, "old rust_dependencies key aliases in");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn round_trips_layout_and_old_configs_default_to_full_chrome() {
+        let dir =
+            std::env::temp_dir().join(format!("croft-prefs-layout-test-{}", std::process::id()));
+        let path = dir.join("config.json");
+        let prefs = Prefs {
+            layout: LayoutPrefs {
+                activity_bar: false,
+                status_bar: false,
+                side_bar_position: SideBarPosition::Right,
+                secondary_side_bar: true,
+                panel_alignment: PanelAlignment::Justify,
+                quick_input_position: QuickInputPosition::Center,
+            },
+            ..Prefs::default()
+        };
+        prefs.save(&path).expect("save");
+        let loaded = Prefs::load(&path).expect("load").layout;
+        assert_eq!(loaded, prefs.layout);
+        // A config written before this block existed parses to full chrome:
+        // activity bar + status bar shown, side bar left, no secondary bar,
+        // panel centered, quick input on top.
+        std::fs::write(&path, r#"{"theme":"dark"}"#).expect("write old config");
+        let old = Prefs::load(&path).expect("load old").layout;
+        assert_eq!(old, LayoutPrefs::default());
+        assert!(old.activity_bar && old.status_bar);
+        assert_eq!(old.side_bar_position, SideBarPosition::Left);
+        assert!(!old.secondary_side_bar);
+        assert_eq!(old.panel_alignment, PanelAlignment::Center);
+        assert_eq!(old.quick_input_position, QuickInputPosition::Top);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

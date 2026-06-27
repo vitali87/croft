@@ -27,7 +27,7 @@ src/
 ├── iterm2_inline.rs     inline-image baking pipeline + protocol dispatch (iTerm2 OSC 1337 / Kitty graphics / DEC sixel via DA1 probe): welcome wordmark, image / PDF preview, activity-bar icons incl. the settings gear, SSH empty-state hero
 ├── outline_syntax.rs    tree-sitter outline provider: extracts the OUTLINE panel's symbol tree (functions, structs, methods, fields, etc.) directly from the buffer's syntax tree via hand-written per-language queries, so the panel paints instantly before a cold language server answers documentSymbol; the LSP reply later supersedes it (tree-sitter-first, like Zed and aerial.nvim). Rust / Python / JS / TS / TSX / Go covered; other languages fall back to the LSP outline
 ├── pdf.rs               PDF rasteriser: prefers pdftoppm (poppler), falls back to macOS sips
-├── prefs.rs             durable user preferences (color theme) persisted at ~/.config/croft/config.json
+├── prefs.rs             durable user preferences (color theme, Customize Layout chrome) persisted at ~/.config/croft/config.json
 ├── release_notes.rs     hand-curated "IN THIS RELEASE" highlights (feature / fix, glyph + summary) shown on the welcome panel; baked-in data, updated on every version bump (no git log, no network)
 ├── remote.rs            remote (SSH) target metadata and launch dispatch
 ├── remote_bulk.rs       bulk lane for background installs: dedicated BatchMode SSH connection when key auth works (throttled shared mux otherwise) so update bytes never queue ahead of live-session keystrokes
@@ -40,7 +40,7 @@ src/
 ├── vim.rs               native modal (vim-style) editing: a pure key state machine (modes, counts, operators, text objects, f/t, search, ex-commands) that emits editing intents the app applies; toggled with Cmd+E
 ├── voice.rs             voice input for the Termux OSK mic key: delegates to `termux-dialog speech` (Android's SpeechRecognizer, the same engine Gboard's mic uses), auto-installs the `termux-api` package (InstallState), and sends the transcript over a channel the app injects via handle_key; a tap opens the system speech dialog, the result is injected when Android finalizes on silence (a second tap cancels, since killing preempts the result); uses `termux-dialog speech`, NOT the `termux-speech-to-text` service, because the service closes its output on onEndOfSpeech and so discards the final onResults transcript; runs in its own process group so cancel kills the whole tree; a tap rather than hold because Termux steals finger-holds for text selection
 ├── zoxide.rs            zoxide integration: strict query + typo-tolerant fuzzy fallback (Damerau-Levenshtein) + ensure-install (pkg on Termux, curl script elsewhere) with a logged outcome + InstallState surfaced to the Cmd+Z jump popup
-├── app/                 event loop, three-pane layout + activity bar, key dispatch, status bar, mouse, clipboard, splitters, preview overlays
+├── app/                 event loop, three-pane layout + activity bar, key dispatch, status bar, mouse, clipboard, splitters, preview overlays, Customize Layout (compute_chrome_layout / panel_band_rect pure geometry, secondary side bar, Zen Mode)
 │   ├── mod.rs           the main App: render, key / mouse dispatch, status bar, splitters
 │   ├── click.rs         double / triple click detection
 │   ├── cursor_blink.rs  caret blink timing

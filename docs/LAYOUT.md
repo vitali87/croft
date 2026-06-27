@@ -8,7 +8,12 @@ croft is a three pane workspace in the VS Code arrangement: an Explorer sidebar,
 * **Activity bar:** the icon strip down the far left. View icons (Explorer, Search, Source Control, Remote, Run and Debug) at the top, a settings gear at the bottom whose Color Theme picker switches between Croft Black (`#000000`, default) and Croft Dark (Blue) (`#1e222e`), persisted in `~/.config/croft/config.json`. Themes are data: the two built-ins ship as a baked-in `[[themes]]` manifest (listed in the Extensions panel as "Color Themes"), and dropping another theme manifest into `~/.config/croft/extensions/` adds it to the picker with no rebuild.
 * **Top right pane (editor):** code editor with tree-sitter syntax highlighting, an LSP semantic-token overlay, and inline preview tabs for images, PDFs, and spreadsheets. Splits side by side with `Cmd`+`\`, with an optional native vim modal mode on `Cmd`+`E`. The usual VS Code editing commands are built in: move / copy lines, multi-cursor, toggle line and block comments, join lines, sort lines, transform case, trim trailing whitespace, and toggle word wrap.
 * **Bottom right pane (terminal):** a real interactive shell, your `$SHELL` on a real PTY.
+* **Secondary side bar:** an optional auxiliary column on the edge *opposite* the primary side bar, hosting the active file's **Outline**. Toggle it with `Opt`+`Cmd`/`Ctrl`+`B` or from the Customize Layout popup.
 * All three panes resize by dragging the seams between them, including the seam between the two editor columns when the editor is split.
+
+## Customize Layout
+
+The `⛶` icon at the top-right of the editor (and the welcome screen), or the settings gear → **Customize Layout**, opens a popup that mirrors VS Code's title-bar layout controls. Two icons beside it toggle the primary side bar (`▢`) and the panel (`▭`) directly. The popup groups: visibility toggles (Activity Bar, Primary Side Bar, Secondary Side Bar, Panel, Status Bar), **Primary Side Bar Position** (Left/Right — the activity bar moves with it), **Panel Alignment** (Left/Center/Right/Justify, where Justify spans the panel across the full content width under the side bar), **Quick Input Position** (Top/Center, for the Command Palette / Go to File), and **Zen Mode** (`Cmd`/`Ctrl`+`K` `Z`, which hides all chrome and restores it on the next toggle). Every choice except the frequently-toggled side-bar / panel visibility persists in `~/.config/croft/config.json`.
 
 ## Command Palette
 

@@ -52,6 +52,16 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 handler: "is_sidebar_toggle_key",
             },
             ShortcutEntry {
+                keys: "Opt+Cmd/Ctrl+B",
+                description: "Toggle the secondary side bar (Outline)",
+                handler: "is_secondary_sidebar_toggle_key",
+            },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+K Z",
+                description: "Toggle Zen Mode (hide all chrome; press again to restore)",
+                handler: "",
+            },
+            ShortcutEntry {
                 keys: "Ctrl+J",
                 description: "Toggle the terminal pane",
                 handler: "is_terminal_toggle_key",

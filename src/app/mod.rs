@@ -166,6 +166,180 @@ const ACTIVITY_ICON_HEIGHT: u16 = 2;
 const ACTIVITY_ICON_GAP: u16 = 0;
 const FALLBACK_CELL_PIXEL: (u32, u32) = (10, 20);
 
+/// Fixed width of the secondary side bar (hosts the active file's Outline),
+/// on the edge opposite the primary side bar. VS Code's auxiliary bar.
+const SECONDARY_SIDEBAR_WIDTH: u16 = 30;
+
+/// Which edge the primary side bar (and the activity bar that flanks it) dock
+/// to. VS Code's "Primary Side Bar Position". Persisted via `crate::prefs`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum SideBarPosition {
+    #[default]
+    Left,
+    Right,
+}
+
+/// Horizontal span of the bottom panel (the terminal stack). Mirrors VS
+/// Code's "Panel Alignment": `Center` (default) spans the editor column;
+/// `Left`/`Right` hug that half of the editor column; `Justify` stretches the
+/// panel across the full content width, under the side bar. Persisted.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum PanelAlignment {
+    Left,
+    #[default]
+    Center,
+    Right,
+    Justify,
+}
+
+/// Where the quick input (command palette / Go to File) anchors vertically.
+/// VS Code's "Quick Input Position". Persisted.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum QuickInputPosition {
+    #[default]
+    Top,
+    Center,
+}
+
+/// Pre-Zen visibility snapshot, restored verbatim when Zen Mode is toggled
+/// off so the workspace returns to exactly the chrome it had before.
+#[derive(Clone, Copy, Debug)]
+struct PreZenLayout {
+    activity_bar: bool,
+    status_bar: bool,
+    side_bar: bool,
+    secondary_side_bar: bool,
+    panel: bool,
+}
+
+/// Hit-test rects for the three layout-control icons (Toggle Primary Side
+/// Bar, Toggle Panel, Customize Layout) rendered at the top-right of the
+/// editor tab strip and the welcome screen — croft's analog of VS Code's
+/// title-bar layout controls.
+#[derive(Clone, Copy, Default)]
+struct LayoutIconAreas {
+    toggle_side_bar: Rect,
+    toggle_panel: Rect,
+    customize: Rect,
+}
+
+/// Result of [`compute_chrome_layout`]: the rectangles for each workspace
+/// region within the horizontal `main` band. Hidden regions are `None` and
+/// consume no width.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+struct ChromeLayout {
+    activity: Option<Rect>,
+    primary_side: Option<Rect>,
+    secondary_side: Option<Rect>,
+    /// The editor + terminal column (always present).
+    right: Rect,
+    /// Column of the seam between the editor and the primary side bar, where a
+    /// resize drag starts. `None` when the primary side bar is hidden.
+    sidebar_splitter_x: Option<u16>,
+}
+
+/// Pure horizontal layout of the workspace chrome within `main`. Column order
+/// follows the primary side bar's position (the activity bar always flanks the
+/// primary side bar on its outer edge, like VS Code):
+///   `Left`:  `[activity][primary][right......][secondary]`
+///   `Right`: `[secondary][right......][primary][activity]`
+/// The `right` column is guaranteed at least `RIGHT_PANE_MIN` cells; the
+/// primary side bar is shrunk to make room when the frame is narrow.
+fn compute_chrome_layout(
+    main: Rect,
+    activity_visible: bool,
+    primary_visible: bool,
+    secondary_visible: bool,
+    side_bar_position: SideBarPosition,
+    sidebar_w: u16,
+    secondary_w: u16,
+) -> ChromeLayout {
+    let activity_w = if activity_visible {
+        ACTIVITY_BAR_WIDTH
+    } else {
+        0
+    };
+    let secondary_w = if secondary_visible { secondary_w } else { 0 };
+    // Reserve activity + secondary first, then fit the primary side bar in
+    // what's left while keeping RIGHT_PANE_MIN for the editor column.
+    let reserved = activity_w.saturating_add(secondary_w);
+    let after_reserved = main.width.saturating_sub(reserved);
+    let max_primary = after_reserved.saturating_sub(RIGHT_PANE_MIN);
+    let primary_w = if primary_visible {
+        sidebar_w.min(max_primary)
+    } else {
+        0
+    };
+    let right_w = after_reserved.saturating_sub(primary_w);
+
+    let row = |x: u16, w: u16| Rect {
+        x,
+        y: main.y,
+        width: w,
+        height: main.height,
+    };
+    let mut x = main.x;
+    let (activity, primary_side, right, secondary_side, splitter);
+    match side_bar_position {
+        SideBarPosition::Left => {
+            activity = (activity_w > 0).then(|| row(x, activity_w));
+            x += activity_w;
+            primary_side = (primary_w > 0).then(|| row(x, primary_w));
+            x += primary_w;
+            let right_rect = row(x, right_w);
+            // Seam = editor's left edge.
+            splitter = (primary_w > 0).then_some(right_rect.x);
+            right = right_rect;
+            x += right_w;
+            secondary_side = (secondary_w > 0).then(|| row(x, secondary_w));
+        }
+        SideBarPosition::Right => {
+            secondary_side = (secondary_w > 0).then(|| row(x, secondary_w));
+            x += secondary_w;
+            let right_rect = row(x, right_w);
+            right = right_rect;
+            x += right_w;
+            // Seam = sidebar's left edge (= editor's right edge).
+            splitter = (primary_w > 0).then_some(x);
+            primary_side = (primary_w > 0).then(|| row(x, primary_w));
+            x += primary_w;
+            activity = (activity_w > 0).then(|| row(x, activity_w));
+        }
+    }
+    ChromeLayout {
+        activity,
+        primary_side,
+        secondary_side,
+        right,
+        sidebar_splitter_x: splitter,
+    }
+}
+
+/// Pure horizontal placement of the bottom panel within its `band`. `Center`
+/// and `Justify` fill the band; `Left`/`Right` hug that half (clamped to a
+/// usable minimum). The leftover strip is painted with the editor background
+/// by the caller so it never ghosts.
+fn panel_band_rect(band: Rect, alignment: PanelAlignment) -> Rect {
+    match alignment {
+        PanelAlignment::Center | PanelAlignment::Justify => band,
+        PanelAlignment::Left => Rect {
+            width: (band.width / 2).max(RIGHT_PANE_MIN).min(band.width),
+            ..band
+        },
+        PanelAlignment::Right => {
+            let w = (band.width / 2).max(RIGHT_PANE_MIN).min(band.width);
+            Rect {
+                x: band.x + band.width - w,
+                width: w,
+                ..band
+            }
+        }
+    }
+}
+
 fn activity_icon_glyph_x(bar: Rect) -> u16 {
     bar.x + bar.width / 2
 }
@@ -740,6 +914,27 @@ enum MenuAction {
     /// stacked sub-view (Open Editors / Folders / Outline / Timeline / Rust
     /// Dependencies) and persist the choice.
     ToggleExplorerView(ExplorerView),
+    /// Customize Layout: re-open the Customize Layout popup (so a toggle the
+    /// user just flipped stays visible for the next one, like VS Code).
+    OpenCustomizeLayout,
+    /// Customize Layout: show/hide the left activity bar.
+    ToggleActivityBar,
+    /// Customize Layout: show/hide the primary side bar (same as ⌘B).
+    ToggleSideBar,
+    /// Customize Layout: show/hide the secondary side bar (the Outline).
+    ToggleSecondarySideBar,
+    /// Customize Layout: show/hide the bottom panel (the terminal, same as ⌃J).
+    TogglePanel,
+    /// Customize Layout: show/hide the bottom status bar.
+    ToggleStatusBar,
+    /// Customize Layout: dock the primary side bar to `position`.
+    SetSideBarPosition(SideBarPosition),
+    /// Customize Layout: set the bottom panel's horizontal alignment.
+    SetPanelAlignment(PanelAlignment),
+    /// Customize Layout: anchor the quick input at `position`.
+    SetQuickInputPosition(QuickInputPosition),
+    /// Customize Layout: toggle Zen Mode (hide all chrome / restore).
+    ToggleZenMode,
 }
 
 /// Return the macOS-style keyboard shortcut hint to display on the right
@@ -784,6 +979,10 @@ fn shortcut_for(action: &MenuAction) -> Option<&'static str> {
         MenuAction::ToggleBreakpointAt { .. } => Some("F9"),
         MenuAction::EditBreakpointConditionAt { .. } => Some("⇧F9"),
         MenuAction::OpenThemePicker => Some("⌘K ⌘T"),
+        MenuAction::ToggleSideBar => Some("⌘B"),
+        MenuAction::ToggleSecondarySideBar => Some("⌥⌘B"),
+        MenuAction::TogglePanel => Some("⌃J"),
+        MenuAction::ToggleZenMode => Some("⌘K Z"),
         MenuAction::CloseTabsToRight(_) => Some("⌘K →"),
         MenuAction::SelectForCompare(_) => Some("⌘K S"),
         MenuAction::CompareWithSelected { .. } => Some("⌘K C"),
@@ -802,6 +1001,7 @@ fn menu_entry_width(entry: &MenuEntry) -> usize {
             label.chars().count() + shortcut
         }
         MenuEntry::Submenu { label, .. } => label.chars().count() + 2,
+        MenuEntry::Header(label) => label.chars().count(),
         MenuEntry::Separator => 0,
     }
 }
@@ -1176,6 +1376,9 @@ enum MenuEntry {
         items: Vec<MenuEntry>,
     },
     Separator,
+    /// A dimmed, non-selectable section label (e.g. "Side Bar Position" in the
+    /// Customize Layout popup). The cursor skips it like a `Separator`.
+    Header(String),
 }
 
 impl MenuEntry {
@@ -1184,6 +1387,10 @@ impl MenuEntry {
             label: label.into(),
             action,
         }
+    }
+
+    fn header(label: impl Into<String>) -> Self {
+        Self::Header(label.into())
     }
 
     /// The action a click on this entry dispatches, if it is a plain item.
@@ -1195,9 +1402,9 @@ impl MenuEntry {
     }
 
     /// True for a row the cursor may land on (items and submenu parents, not
-    /// dividers).
+    /// dividers or section headers).
     fn is_selectable(&self) -> bool {
-        !matches!(self, Self::Separator)
+        !matches!(self, Self::Separator | Self::Header(_))
     }
 }
 
@@ -1481,6 +1688,29 @@ pub struct App {
     /// column next to the Explorer. Pressing the chord again, or hiding
     /// the terminal entirely with `Ctrl+J`, clears the flag.
     terminal_maximized: bool,
+    /// Layout (Customize Layout popup): whether the left activity bar is
+    /// shown. Persisted via `crate::prefs`.
+    activity_bar_visible: bool,
+    /// Layout: whether the bottom status bar is shown. Persisted.
+    status_bar_visible: bool,
+    /// Layout: which edge the primary side bar (+ activity bar) docks to.
+    /// Persisted.
+    side_bar_position: SideBarPosition,
+    /// Layout: whether the secondary side bar (the active file's Outline) is
+    /// shown, on the edge opposite the primary side bar (⌥⌘B). Persisted.
+    secondary_side_bar_visible: bool,
+    /// Layout: horizontal span/alignment of the bottom panel. Persisted.
+    panel_alignment: PanelAlignment,
+    /// Layout: where the quick input (command palette / Go to File) anchors.
+    /// Persisted.
+    quick_input_position: QuickInputPosition,
+    /// Layout: Zen Mode hides the activity bar, both side bars, the panel,
+    /// and the status bar; toggling off restores `pre_zen`.
+    zen_mode: bool,
+    /// Pre-Zen visibility snapshot; `None` whenever not in Zen Mode.
+    pre_zen: Option<PreZenLayout>,
+    /// Hit-test rects for the top-right layout-control icons.
+    layout_icon_areas: LayoutIconAreas,
     status: String,
     /// Orange status-bar badge shown for the whole session when this is a
     /// remote (SSH) croft not running under dtach, so it can't survive a
@@ -2150,6 +2380,14 @@ impl App {
             let _ = file_finder_index_tx.send(entries);
         });
         let fs_watch = FsWatch::spawn(&root, &tree);
+        // Persisted layout preferences (Customize Layout popup). Skipped under
+        // test so the suite never reads/writes the developer's ~/.config,
+        // mirroring the theme load above.
+        let layout_prefs = if cfg!(test) {
+            crate::prefs::LayoutPrefs::default()
+        } else {
+            crate::prefs::Prefs::load_or_default().layout
+        };
         let mut app = Self {
             tree,
             search,
@@ -2196,6 +2434,15 @@ impl App {
             show_tree: true,
             show_terminal: true,
             terminal_maximized: false,
+            activity_bar_visible: layout_prefs.activity_bar,
+            status_bar_visible: layout_prefs.status_bar,
+            side_bar_position: layout_prefs.side_bar_position,
+            secondary_side_bar_visible: layout_prefs.secondary_side_bar,
+            panel_alignment: layout_prefs.panel_alignment,
+            quick_input_position: layout_prefs.quick_input_position,
+            zen_mode: false,
+            pre_zen: None,
+            layout_icon_areas: LayoutIconAreas::default(),
             status: String::from("Ready"),
             persistence_warning: remote_persistence_status(
                 is_remote_session(),
@@ -3016,7 +3263,9 @@ impl App {
         }
         blocks
             .into_iter()
-            .filter(|(block, _)| visible(*block))
+            // A zero-width block means the activity bar is hidden (Customize
+            // Layout / Zen): emit nothing so the icons can't ghost.
+            .filter(|(block, _)| block.width > 0 && visible(*block))
             .map(|(block, state)| ((block.x, block.y), state))
             .collect()
     }
@@ -3554,6 +3803,17 @@ impl App {
     /// surface's own hit-test, so adding a new tooltipped control is a
     /// one-line change here plus a label in the widget.
     fn ui_tooltip_at(&self, col: u16, row: u16) -> Option<&'static str> {
+        // Layout-control icons at the top-right of the editor strip / welcome.
+        let icons = self.layout_icon_areas;
+        if rect_contains(icons.toggle_side_bar, col, row) {
+            return Some("Toggle Primary Side Bar");
+        }
+        if rect_contains(icons.toggle_panel, col, row) {
+            return Some("Toggle Panel");
+        }
+        if rect_contains(icons.customize, col, row) {
+            return Some("Customize Layout...");
+        }
         // Activity bar: always visible, so it is checked regardless of which
         // sidebar view is open.
         if let Some(icon) = self.activity_icon_at(col, row) {
@@ -4535,12 +4795,224 @@ impl App {
         let origin = self.settings_menu_origin();
         self.context_menu = Some(ContextMenu::flat(
             origin,
-            vec![(String::from("Color Theme"), MenuAction::OpenThemePicker)],
+            vec![
+                (String::from("Color Theme"), MenuAction::OpenThemePicker),
+                (
+                    String::from("Customize Layout\u{2026}"),
+                    MenuAction::OpenCustomizeLayout,
+                ),
+            ],
             self.workspace_root.clone(),
         ));
         // The gear renders "active" while its menu is open; re-emit it so the
         // pressed-state PNG replaces the idle one.
         self.overlays.activity.mark_dirty();
+    }
+
+    /// Anchor for the Customize Layout popup: just under the Customize Layout
+    /// (⛶) title-bar icon when it has been laid out, else the activity-bar gear
+    /// (the gear-menu entry path).
+    fn customize_layout_origin(&self) -> (u16, u16) {
+        let icon = self.layout_icon_areas.customize;
+        if icon.width > 0 {
+            // Pull left so the wider popup doesn't spill off the right edge;
+            // `menu_rect` clamps anything that still would.
+            (icon.x.saturating_sub(18), icon.y + 1)
+        } else {
+            self.settings_menu_origin()
+        }
+    }
+
+    /// Build the Customize Layout popup rows (VS Code's title-bar layout
+    /// controls): visibility checkboxes, then radio groups for Side Bar
+    /// Position, Panel Alignment, and Quick Input Position, then Zen Mode.
+    /// A leading `✔` marks an enabled toggle / the active radio option.
+    fn customize_layout_items(&self) -> Vec<MenuEntry> {
+        let check = |on: bool| if on { "\u{2713} " } else { "  " };
+        vec![
+            MenuEntry::item(
+                format!("{}Activity Bar", check(self.activity_bar_visible)),
+                MenuAction::ToggleActivityBar,
+            ),
+            MenuEntry::item(
+                format!("{}Primary Side Bar", check(self.show_tree)),
+                MenuAction::ToggleSideBar,
+            ),
+            MenuEntry::item(
+                format!(
+                    "{}Secondary Side Bar",
+                    check(self.secondary_side_bar_visible)
+                ),
+                MenuAction::ToggleSecondarySideBar,
+            ),
+            MenuEntry::item(
+                format!("{}Panel", check(self.show_terminal)),
+                MenuAction::TogglePanel,
+            ),
+            MenuEntry::item(
+                format!("{}Status Bar", check(self.status_bar_visible)),
+                MenuAction::ToggleStatusBar,
+            ),
+            MenuEntry::Separator,
+            MenuEntry::header("Primary Side Bar Position"),
+            MenuEntry::item(
+                format!(
+                    "{}Left",
+                    check(self.side_bar_position == SideBarPosition::Left)
+                ),
+                MenuAction::SetSideBarPosition(SideBarPosition::Left),
+            ),
+            MenuEntry::item(
+                format!(
+                    "{}Right",
+                    check(self.side_bar_position == SideBarPosition::Right)
+                ),
+                MenuAction::SetSideBarPosition(SideBarPosition::Right),
+            ),
+            MenuEntry::Separator,
+            MenuEntry::header("Panel Alignment"),
+            MenuEntry::item(
+                format!(
+                    "{}Left",
+                    check(self.panel_alignment == PanelAlignment::Left)
+                ),
+                MenuAction::SetPanelAlignment(PanelAlignment::Left),
+            ),
+            MenuEntry::item(
+                format!(
+                    "{}Center",
+                    check(self.panel_alignment == PanelAlignment::Center)
+                ),
+                MenuAction::SetPanelAlignment(PanelAlignment::Center),
+            ),
+            MenuEntry::item(
+                format!(
+                    "{}Right",
+                    check(self.panel_alignment == PanelAlignment::Right)
+                ),
+                MenuAction::SetPanelAlignment(PanelAlignment::Right),
+            ),
+            MenuEntry::item(
+                format!(
+                    "{}Justify",
+                    check(self.panel_alignment == PanelAlignment::Justify)
+                ),
+                MenuAction::SetPanelAlignment(PanelAlignment::Justify),
+            ),
+            MenuEntry::Separator,
+            MenuEntry::header("Quick Input Position"),
+            MenuEntry::item(
+                format!(
+                    "{}Top",
+                    check(self.quick_input_position == QuickInputPosition::Top)
+                ),
+                MenuAction::SetQuickInputPosition(QuickInputPosition::Top),
+            ),
+            MenuEntry::item(
+                format!(
+                    "{}Center",
+                    check(self.quick_input_position == QuickInputPosition::Center)
+                ),
+                MenuAction::SetQuickInputPosition(QuickInputPosition::Center),
+            ),
+            MenuEntry::Separator,
+            MenuEntry::item(
+                format!("{}Zen Mode", check(self.zen_mode)),
+                MenuAction::ToggleZenMode,
+            ),
+        ]
+    }
+
+    /// Open (or re-open) the Customize Layout popup with the cursor on row
+    /// `selected`. Each toggle re-opens it so the popup stays put while the
+    /// user flips several controls, exactly like VS Code's dropdown.
+    fn open_customize_layout_menu_at(&mut self, selected: usize) {
+        let origin = self.customize_layout_origin();
+        self.context_menu = Some(ContextMenu {
+            origin,
+            items: self.customize_layout_items(),
+            selected,
+            open_submenu: None,
+            submenu_selected: 0,
+            target_dir: self.workspace_root.clone(),
+        });
+        self.overlays.activity.mark_dirty();
+    }
+
+    /// Open the Customize Layout popup fresh (cursor on the first row).
+    fn open_customize_layout_menu(&mut self) {
+        self.open_customize_layout_menu_at(0);
+    }
+
+    /// Persist the current Customize Layout chrome to `~/.config/croft`.
+    /// Best-effort and skipped under test (hermetic suite, like `apply_theme`).
+    fn persist_layout(&self) {
+        if cfg!(test) {
+            return;
+        }
+        let _ = crate::prefs::save_layout(crate::prefs::LayoutPrefs {
+            activity_bar: self.activity_bar_visible,
+            status_bar: self.status_bar_visible,
+            side_bar_position: self.side_bar_position,
+            secondary_side_bar: self.secondary_side_bar_visible,
+            panel_alignment: self.panel_alignment,
+            quick_input_position: self.quick_input_position,
+        });
+    }
+
+    /// Hide the activity bar's inline images when the bar is collapsed so the
+    /// OSC-1337 icons don't ghost over the editor; arm a re-emit when shown.
+    fn after_chrome_visibility_change(&mut self) {
+        self.overlays.activity.mark_dirty();
+        if self.overlays.activity.has_images() {
+            self.overlays.activity.request_clear();
+        }
+        // The welcome logo re-bakes against the new editor rect on next render.
+        self.overlays.welcome.mark_dirty();
+    }
+
+    /// Toggle the secondary side bar (the Outline of the active file), on the
+    /// edge opposite the primary side bar. Mirrors ⌥⌘B.
+    fn toggle_secondary_side_bar(&mut self) {
+        self.secondary_side_bar_visible = !self.secondary_side_bar_visible;
+        self.persist_layout();
+        self.after_chrome_visibility_change();
+        self.status = String::from(if self.secondary_side_bar_visible {
+            "Secondary side bar shown"
+        } else {
+            "Secondary side bar hidden"
+        });
+    }
+
+    /// Toggle Zen Mode: hide the activity bar, both side bars, the panel, and
+    /// the status bar; toggling off restores the pre-Zen snapshot. Mirrors VS
+    /// Code's ⌘K Z.
+    fn toggle_zen_mode(&mut self) {
+        if let Some(prev) = self.pre_zen.take() {
+            self.activity_bar_visible = prev.activity_bar;
+            self.status_bar_visible = prev.status_bar;
+            self.show_tree = prev.side_bar;
+            self.secondary_side_bar_visible = prev.secondary_side_bar;
+            self.show_terminal = prev.panel;
+            self.zen_mode = false;
+            self.status = String::from("Zen Mode off");
+        } else {
+            self.pre_zen = Some(PreZenLayout {
+                activity_bar: self.activity_bar_visible,
+                status_bar: self.status_bar_visible,
+                side_bar: self.show_tree,
+                secondary_side_bar: self.secondary_side_bar_visible,
+                panel: self.show_terminal,
+            });
+            self.activity_bar_visible = false;
+            self.status_bar_visible = false;
+            self.show_tree = false;
+            self.secondary_side_bar_visible = false;
+            self.show_terminal = false;
+            self.zen_mode = true;
+            self.status = String::from("Zen Mode on");
+        }
+        self.after_chrome_visibility_change();
     }
 
     /// Replace the gear menu with the Color Theme picker: one row per theme,
@@ -5536,6 +6008,15 @@ impl App {
         if area.width == 0 || area.height == 0 {
             return;
         }
+        // Layout-control icons at the welcome screen's top-right, inside the
+        // border row — same controls as the editor tab strip (placement A).
+        let icon_row = Rect {
+            x: outer_area.x + 1,
+            y: outer_area.y,
+            width: outer_area.width.saturating_sub(2),
+            height: 1,
+        };
+        self.paint_layout_icons(frame, icon_row);
 
         // Layout regions, top-to-bottom:
         //   [logo + version badge]
@@ -5795,6 +6276,90 @@ impl App {
                 row_y = row_y.saturating_add(lines.len().max(1) as u16);
             }
         }
+    }
+
+    /// Render the secondary side bar (VS Code's auxiliary bar): the active
+    /// file's Outline, on the edge opposite the primary side bar. Reuses the
+    /// single `OutlinePanel`, forced expanded for this dedicated panel; its
+    /// collapse state is saved/restored so the Explorer's own OUTLINE section
+    /// (which may render the same widget afterward) keeps its toggle.
+    fn render_secondary_side_bar(&mut self, frame: &mut ratatui::Frame, area: Option<Rect>) {
+        let Some(area) = area else {
+            return;
+        };
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+        // A left border + bg fill so the panel reads as a distinct column,
+        // like the primary side bar's seam against the editor.
+        let block = ratatui::widgets::Block::default()
+            .borders(ratatui::widgets::Borders::LEFT)
+            .border_style(Style::default().fg(Color::Rgb(0x2b, 0x2b, 0x2b)))
+            .style(Style::default().bg(self.theme.editor_bg()));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        let saved_collapsed = self.outline.collapsed;
+        self.outline.collapsed = false;
+        self.outline.theme = self.theme;
+        self.outline.focus_gradient = self.theme.gradient();
+        self.outline.focused = false;
+        self.outline.hover_pointer = self.pointer_cell;
+        frame.render_widget(&mut self.outline, inner);
+        self.outline.collapsed = saved_collapsed;
+    }
+
+    /// Paint the three layout-control icons (Toggle Primary Side Bar, Toggle
+    /// Panel, Customize Layout) right-aligned on the single-row `row` — the top
+    /// of the editor tab strip, or the welcome screen's top edge. croft's
+    /// analog of VS Code's title-bar layout controls (placement A). Records the
+    /// hit rects in `self.layout_icon_areas`.
+    fn paint_layout_icons(&mut self, frame: &mut ratatui::Frame, row: Rect) {
+        self.layout_icon_areas = LayoutIconAreas::default();
+        if row.height == 0 || row.width < 8 {
+            return;
+        }
+        let y = row.y;
+        let right = row.x + row.width;
+        let cust_x = right.saturating_sub(2);
+        let panel_x = cust_x.saturating_sub(2);
+        let side_x = panel_x.saturating_sub(2);
+        if side_x <= row.x {
+            return;
+        }
+        let pointer = self.pointer_cell;
+        let dim = Color::Rgb(0x6c, 0x7d, 0x9c);
+        let active = Color::White;
+        let accent = Color::Rgb(0x4e, 0x9a, 0xff);
+        let mut paint = |x: u16, glyph: char, is_active: bool| -> Rect {
+            let color = if pointer == Some((x, y)) {
+                accent
+            } else if is_active {
+                active
+            } else {
+                dim
+            };
+            frame
+                .buffer_mut()
+                .set_string(x, y, glyph.to_string(), Style::default().fg(color));
+            Rect {
+                x,
+                y,
+                width: 1,
+                height: 1,
+            }
+        };
+        let side = paint(side_x, crate::icons::LAYOUT_TOGGLE_SIDEBAR, self.show_tree);
+        let panel = paint(
+            panel_x,
+            crate::icons::LAYOUT_TOGGLE_PANEL,
+            self.show_terminal,
+        );
+        let cust = paint(cust_x, crate::icons::LAYOUT_CUSTOMIZE, false);
+        self.layout_icon_areas = LayoutIconAreas {
+            toggle_side_bar: side,
+            toggle_panel: panel,
+            customize: cust,
+        };
     }
 
     fn render_activity_bar(&mut self, frame: &mut ratatui::Frame, area: Rect) {
@@ -6519,21 +7084,35 @@ impl App {
         } else {
             0
         };
+        // The bottom status bar can be hidden (Customize Layout / Zen Mode),
+        // reclaiming its row for the workspace.
+        let status_h: u16 = if self.status_bar_visible { 1 } else { 0 };
         let outer = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Min(1),
                 Constraint::Length(osk_h),
-                Constraint::Length(1),
+                Constraint::Length(status_h),
             ])
             .split(size);
+        let main_area = outer[0];
 
-        // Clamp sidebar width to leave at least RIGHT_PANE_MIN cells for
-        // the editor + terminal. Window resizes shrink the sidebar to fit
-        // rather than refusing to render the right pane.
-        let total_w = outer[0].width;
-        let max_sidebar = total_w
-            .saturating_sub(ACTIVITY_BAR_WIDTH)
+        // Reserve the activity bar (when shown) and the secondary side bar,
+        // then clamp the primary side bar so the editor keeps RIGHT_PANE_MIN.
+        let activity_w = if self.activity_bar_visible {
+            ACTIVITY_BAR_WIDTH
+        } else {
+            0
+        };
+        let secondary_w = if self.secondary_side_bar_visible {
+            SECONDARY_SIDEBAR_WIDTH
+        } else {
+            0
+        };
+        let max_sidebar = main_area
+            .width
+            .saturating_sub(activity_w)
+            .saturating_sub(secondary_w)
             .saturating_sub(RIGHT_PANE_MIN);
         let sidebar_w = self
             .sidebar_width
@@ -6542,51 +7121,82 @@ impl App {
         // the user can actually see the splitter.
         self.sidebar_width = sidebar_w;
 
-        let main = if self.show_tree {
-            Layout::default()
-                .direction(Direction::Horizontal)
+        // Panel Alignment = Justify spans the panel across the full content
+        // width (under the side bar): carve it off the bottom of `main` BEFORE
+        // the horizontal chrome split, so the side bars sit above it.
+        let justify_panel = self.show_terminal
+            && !self.terminal_maximized
+            && osk_h == 0
+            && self.panel_alignment == PanelAlignment::Justify;
+        let (chrome_area, justify_terminal) = if justify_panel {
+            let total_h = main_area.height;
+            let max_h = total_h
+                .saturating_sub(EDITOR_HEIGHT_MIN)
+                .max(TERMINAL_HEIGHT_MIN);
+            let term_h = self
+                .terminal_height
+                .unwrap_or(total_h / 3)
+                .clamp(TERMINAL_HEIGHT_MIN, max_h);
+            self.terminal_height = Some(term_h);
+            let rows = Layout::default()
+                .direction(Direction::Vertical)
                 .constraints([
-                    Constraint::Length(ACTIVITY_BAR_WIDTH),
-                    Constraint::Length(sidebar_w),
-                    Constraint::Min(RIGHT_PANE_MIN),
+                    Constraint::Min(EDITOR_HEIGHT_MIN),
+                    Constraint::Length(term_h),
                 ])
-                .split(outer[0])
+                .split(main_area);
+            (rows[0], Some(rows[1]))
         } else {
-            Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([
-                    Constraint::Length(ACTIVITY_BAR_WIDTH),
-                    Constraint::Min(RIGHT_PANE_MIN),
-                ])
-                .split(outer[0])
+            (main_area, None)
         };
 
-        let (activity_area, side_area, right_area) = if self.show_tree {
-            (main[0], Some(main[1]), main[2])
-        } else {
-            (main[0], None, main[1])
-        };
+        // Pure horizontal split of the workspace chrome (honors activity-bar
+        // visibility, side bar position, and the secondary side bar).
+        let chrome = compute_chrome_layout(
+            chrome_area,
+            self.activity_bar_visible,
+            self.show_tree,
+            self.secondary_side_bar_visible,
+            self.side_bar_position,
+            sidebar_w,
+            SECONDARY_SIDEBAR_WIDTH,
+        );
+        let activity_area = chrome.activity;
+        let side_area = chrome.primary_side;
+        let secondary_area = chrome.secondary_side;
+        let right_area = chrome.right;
         // Remember the Explorer column so the zoxide jump popup can anchor
         // over it instead of centering on the whole frame.
         self.last_sidebar_area = side_area;
-
-        // Splitter column is the leftmost cell of the right (editor) pane —
-        // i.e. the seam where the sidebar's border meets the editor's
-        // border. Mouse-down on that column starts a horizontal drag.
-        self.sidebar_splitter_x = if self.show_tree {
-            Some(right_area.x)
-        } else {
-            None
-        };
+        self.sidebar_splitter_x = chrome.sidebar_splitter_x;
         self.last_content_width = right_area.width;
         self.last_content_height = right_area.height;
 
-        // While the on-screen keyboard is up, the screen is too small to
-        // host editor + terminal + keys, and the user is only typing into
-        // one pane anyway: the focused pane keeps the whole right column
-        // (riding directly above the keys) and the other folds away.
-        let (editor_area, terminal_area) =
-            if osk_h > 0 && self.focus == Pane::Terminal && self.show_terminal {
+        // Editor ↔ terminal split within the editor column. `terminal_band` is
+        // the full bottom strip; `terminal_area` is where the terminals draw
+        // (narrower than the band under Left/Right alignment).
+        let (editor_area, terminal_area, terminal_band) = if let Some(jt) = justify_terminal {
+            // The panel was already carved full-width from `main`; the editor
+            // fills the rest of its column and the splitter sits at the seam.
+            self.terminal_splitter_y = Some(jt.y);
+            (right_area, Some(jt), Some(jt))
+        } else if osk_h > 0 && self.focus == Pane::Terminal && self.show_terminal {
+            let zero_editor = Rect {
+                x: right_area.x,
+                y: right_area.y,
+                width: right_area.width,
+                height: 0,
+            };
+            self.terminal_splitter_y = None;
+            (zero_editor, Some(right_area), Some(right_area))
+        } else if osk_h > 0 {
+            self.terminal_splitter_y = None;
+            (right_area, None, None)
+        } else if self.show_terminal {
+            if self.terminal_maximized {
+                // Editor / welcome collapses; terminal fills the entire
+                // right column next to the Explorer. Splitter is hidden
+                // because there is nothing to drag against.
                 let zero_editor = Rect {
                     x: right_area.x,
                     y: right_area.y,
@@ -6594,57 +7204,54 @@ impl App {
                     height: 0,
                 };
                 self.terminal_splitter_y = None;
-                (zero_editor, Some(right_area))
-            } else if osk_h > 0 {
-                self.terminal_splitter_y = None;
-                (right_area, None)
-            } else if self.show_terminal {
-                if self.terminal_maximized {
-                    // Editor / welcome collapses; terminal fills the entire
-                    // right column next to the Explorer. Splitter is hidden
-                    // because there is nothing to drag against.
-                    let zero_editor = Rect {
-                        x: right_area.x,
-                        y: right_area.y,
-                        width: right_area.width,
-                        height: 0,
-                    };
-                    self.terminal_splitter_y = None;
-                    (zero_editor, Some(right_area))
-                } else {
-                    let total_h = right_area.height;
-                    let pinned = self.terminal_height.map(|h| {
-                        h.clamp(
-                            TERMINAL_HEIGHT_MIN,
-                            total_h
-                                .saturating_sub(EDITOR_HEIGHT_MIN)
-                                .max(TERMINAL_HEIGHT_MIN),
-                        )
-                    });
-                    let right = if let Some(term_h) = pinned {
-                        self.terminal_height = Some(term_h);
-                        Layout::default()
-                            .direction(Direction::Vertical)
-                            .constraints([
-                                Constraint::Min(EDITOR_HEIGHT_MIN),
-                                Constraint::Length(term_h),
-                            ])
-                            .split(right_area)
-                    } else {
-                        Layout::default()
-                            .direction(Direction::Vertical)
-                            .constraints([Constraint::Percentage(65), Constraint::Percentage(35)])
-                            .split(right_area)
-                    };
-                    self.terminal_splitter_y = Some(right[1].y);
-                    (right[0], Some(right[1]))
-                }
+                (zero_editor, Some(right_area), Some(right_area))
             } else {
-                self.terminal_splitter_y = None;
-                (right_area, None)
-            };
+                let total_h = right_area.height;
+                let pinned = self.terminal_height.map(|h| {
+                    h.clamp(
+                        TERMINAL_HEIGHT_MIN,
+                        total_h
+                            .saturating_sub(EDITOR_HEIGHT_MIN)
+                            .max(TERMINAL_HEIGHT_MIN),
+                    )
+                });
+                let rows = if let Some(term_h) = pinned {
+                    self.terminal_height = Some(term_h);
+                    Layout::default()
+                        .direction(Direction::Vertical)
+                        .constraints([
+                            Constraint::Min(EDITOR_HEIGHT_MIN),
+                            Constraint::Length(term_h),
+                        ])
+                        .split(right_area)
+                } else {
+                    Layout::default()
+                        .direction(Direction::Vertical)
+                        .constraints([Constraint::Percentage(65), Constraint::Percentage(35)])
+                        .split(right_area)
+                };
+                self.terminal_splitter_y = Some(rows[1].y);
+                let band = rows[1];
+                // Left/Right alignment hugs the panel to that half of the band.
+                let term = panel_band_rect(band, self.panel_alignment);
+                (rows[0], Some(term), Some(band))
+            }
+        } else {
+            self.terminal_splitter_y = None;
+            (right_area, None, None)
+        };
 
-        self.render_activity_bar(frame, activity_area);
+        if let Some(activity_area) = activity_area {
+            self.render_activity_bar(frame, activity_area);
+        } else {
+            // Hidden activity bar: zero the icon hit-rects so clicks and the
+            // post-draw OSC image flush both treat it as absent (no ghosting).
+            self.sidebar_areas = SidebarAreas::default();
+        }
+
+        // Secondary side bar: the active file's Outline, on the edge opposite
+        // the primary side bar.
+        self.render_secondary_side_bar(frame, secondary_area);
 
         if let Some(area) = side_area {
             let usable_area = area;
@@ -6779,8 +7386,28 @@ impl App {
                     frame.render_widget(&*popup, area);
                 }
             }
+            // Layout-control icons at the top-right of the editor tab strip.
+            let strip_row = Rect {
+                x: editor_area.x,
+                y: editor_area.y,
+                width: editor_area.width,
+                height: 1,
+            };
+            self.paint_layout_icons(frame, strip_row);
         }
         if let Some(area) = terminal_area {
+            // Left/Right panel alignment narrows the terminal to one half of
+            // its band; paint the leftover strip with the editor background so
+            // the vacated cells don't ghost the previous frame.
+            if let Some(band) = terminal_band
+                && (band.width != area.width || band.x != area.x)
+            {
+                frame.render_widget(
+                    ratatui::widgets::Block::default()
+                        .style(Style::default().bg(self.theme.editor_bg())),
+                    band,
+                );
+            }
             let n = self.terminals.len().max(1);
             let constraints: Vec<Constraint> =
                 (0..n).map(|_| Constraint::Ratio(1, n as u32)).collect();
@@ -6937,7 +7564,9 @@ impl App {
         let hit_end = hit_x
             .saturating_add(shortcuts_label_len)
             .min(status_rect.right());
-        self.shortcuts_hit_rect = (hit_end > hit_x).then(|| Rect {
+        // A hidden status bar (Customize Layout / Zen) has zero height: no
+        // clickable "F1 Shortcuts" target.
+        self.shortcuts_hit_rect = (status_h > 0 && hit_end > hit_x).then(|| Rect {
             x: hit_x,
             y: status_rect.y,
             width: hit_end - hit_x,
@@ -7144,6 +7773,19 @@ impl App {
                 );
                 continue;
             }
+            if let MenuEntry::Header(label) = entry {
+                // Dimmed, non-selectable section label (VS Code's group titles
+                // like "Side Bar Position").
+                frame.buffer_mut().set_string(
+                    inner.x,
+                    row.y,
+                    format!(" {label}"),
+                    Style::default()
+                        .fg(Color::Rgb(0x7a, 0x82, 0x90))
+                        .add_modifier(Modifier::BOLD),
+                );
+                continue;
+            }
             let is_sel = i == selected;
             let row_style = if is_sel {
                 Style::default().fg(sel_fg).bg(sel_bg)
@@ -7158,7 +7800,9 @@ impl App {
                 MenuEntry::Submenu { label, .. } => {
                     (label.as_str(), Some(String::from("\u{25b8}")))
                 }
-                MenuEntry::Separator => unreachable!("handled above"),
+                MenuEntry::Separator | MenuEntry::Header(_) => {
+                    unreachable!("handled above")
+                }
             };
             let line = ratatui::text::Line::from(format!(" {label}"));
             frame.render_widget(ratatui::widgets::Paragraph::new(line).style(row_style), row);
@@ -7852,6 +8496,11 @@ impl App {
                 self.copy_into_new_window(self.editor.active_index());
                 true
             }
+            // Cmd+K Z: toggle Zen Mode (VS Code's binding).
+            KeyCode::Char(c) if plain && c.eq_ignore_ascii_case(&'z') => {
+                self.toggle_zen_mode();
+                true
+            }
             _ => false,
         }
     }
@@ -8159,6 +8808,10 @@ impl App {
             && is_search_editing_shortcut(key)
         {
             self.handle_search_key(key);
+            return Ok(());
+        }
+        if is_secondary_sidebar_toggle_key(key) {
+            self.toggle_secondary_side_bar();
             return Ok(());
         }
         if is_sidebar_toggle_key(key) {
@@ -13566,11 +14219,18 @@ impl App {
 
     fn render_file_finder(&mut self, frame: &mut ratatui::Frame) {
         let gradient = self.popup_gradient();
+        let center = self.quick_input_position == QuickInputPosition::Center;
         let Some(finder) = self.file_finder.as_mut() else {
             return;
         };
         let area = frame.area();
-        crate::widgets::file_finder::render_file_finder(finder, area, frame.buffer_mut(), gradient);
+        crate::widgets::file_finder::render_file_finder(
+            finder,
+            area,
+            frame.buffer_mut(),
+            gradient,
+            center,
+        );
     }
 
     pub fn consume_command_palette_image_clear(&mut self) -> bool {
@@ -13680,6 +14340,7 @@ impl App {
 
     fn render_command_palette(&mut self, frame: &mut ratatui::Frame) {
         let gradient = self.popup_gradient();
+        let center = self.quick_input_position == QuickInputPosition::Center;
         let Some(palette) = self.command_palette.as_mut() else {
             return;
         };
@@ -13689,6 +14350,7 @@ impl App {
             area,
             frame.buffer_mut(),
             gradient,
+            center,
         );
     }
 
@@ -14069,6 +14731,8 @@ impl App {
             Cmd::ShowRemote => self.set_sidebar_view(SidebarView::Remote),
             Cmd::ShowExtensions => self.set_sidebar_view(SidebarView::Extensions),
             Cmd::ToggleSideBar => self.show_tree = !self.show_tree,
+            Cmd::ToggleSecondarySideBar => self.toggle_secondary_side_bar(),
+            Cmd::ToggleZenMode => self.toggle_zen_mode(),
             Cmd::ToggleTerminal => self.toggle_terminal(),
             Cmd::NewTerminal => match self.split_terminal() {
                 Ok(()) => {
@@ -15208,6 +15872,28 @@ impl App {
             self.open_shortcuts_modal();
             return;
         }
+        // Layout-control icons (Toggle Side Bar / Panel / Customize Layout) at
+        // the top-right of the editor tab strip / welcome screen. Checked
+        // before the panes so a click on an icon never falls through to the
+        // editor below it. Skipped while a menu is open (that block wins).
+        if self.context_menu.is_none() && matches!(m.kind, MouseEventKind::Down(MouseButton::Left))
+        {
+            let icons = self.layout_icon_areas;
+            if rect_contains(icons.toggle_side_bar, m.column, m.row) {
+                self.show_tree = !self.show_tree;
+                self.after_chrome_visibility_change();
+                return;
+            }
+            if rect_contains(icons.toggle_panel, m.column, m.row) {
+                self.toggle_terminal();
+                return;
+            }
+            if rect_contains(icons.customize, m.column, m.row) {
+                self.open_customize_layout_menu();
+                return;
+            }
+        }
+
         // While a prompt is open, mouse events are ignored.
         if self.prompt.is_some() {
             return;
@@ -17155,6 +17841,63 @@ impl App {
             MenuAction::OpenThemePicker => self.open_theme_picker(),
             MenuAction::SetTheme(theme) => self.apply_theme(theme),
             MenuAction::ToggleExplorerView(view) => self.toggle_explorer_view(view),
+            MenuAction::OpenCustomizeLayout => self.open_customize_layout_menu(),
+            MenuAction::ToggleActivityBar => {
+                self.activity_bar_visible = !self.activity_bar_visible;
+                self.persist_layout();
+                self.after_chrome_visibility_change();
+                self.open_customize_layout_menu_at(0);
+            }
+            MenuAction::ToggleSideBar => {
+                self.show_tree = !self.show_tree;
+                self.after_chrome_visibility_change();
+                self.open_customize_layout_menu_at(1);
+            }
+            MenuAction::ToggleSecondarySideBar => {
+                self.toggle_secondary_side_bar();
+                self.open_customize_layout_menu_at(2);
+            }
+            MenuAction::TogglePanel => {
+                self.toggle_terminal();
+                self.open_customize_layout_menu_at(3);
+            }
+            MenuAction::ToggleStatusBar => {
+                self.status_bar_visible = !self.status_bar_visible;
+                self.persist_layout();
+                self.after_chrome_visibility_change();
+                self.open_customize_layout_menu_at(4);
+            }
+            MenuAction::SetSideBarPosition(pos) => {
+                self.side_bar_position = pos;
+                self.persist_layout();
+                self.after_chrome_visibility_change();
+                self.open_customize_layout_menu_at(if pos == SideBarPosition::Left {
+                    7
+                } else {
+                    8
+                });
+            }
+            MenuAction::SetPanelAlignment(al) => {
+                self.panel_alignment = al;
+                self.persist_layout();
+                let row = match al {
+                    PanelAlignment::Left => 11,
+                    PanelAlignment::Center => 12,
+                    PanelAlignment::Right => 13,
+                    PanelAlignment::Justify => 14,
+                };
+                self.open_customize_layout_menu_at(row);
+            }
+            MenuAction::SetQuickInputPosition(pos) => {
+                self.quick_input_position = pos;
+                self.persist_layout();
+                self.open_customize_layout_menu_at(if pos == QuickInputPosition::Top {
+                    17
+                } else {
+                    18
+                });
+            }
+            MenuAction::ToggleZenMode => self.toggle_zen_mode(),
         }
     }
 
@@ -17596,11 +18339,36 @@ impl App {
     fn handle_splitter_drag(&mut self, kind: SplitterDrag, column: u16, row: u16) {
         match kind {
             SplitterDrag::Sidebar => {
-                let activity_w = ACTIVITY_BAR_WIDTH;
-                let new_w = column.saturating_sub(activity_w);
-                let total = activity_w + self.sidebar_width + self.last_content_width;
+                let activity_w = if self.activity_bar_visible {
+                    ACTIVITY_BAR_WIDTH
+                } else {
+                    0
+                };
+                let secondary_w = if self.secondary_side_bar_visible {
+                    SECONDARY_SIDEBAR_WIDTH
+                } else {
+                    0
+                };
+                // Reconstruct the content width from the live regions rather
+                // than the frame, so the drag is correct even before a real
+                // render has stamped `last_frame_area`.
+                let frame_x = self.last_frame_area.x;
+                let total = activity_w + secondary_w + self.sidebar_width + self.last_content_width;
+                let new_w = match self.side_bar_position {
+                    // Left: sidebar starts after the activity bar; the seam is
+                    // its right edge, so width = column - activity offset.
+                    SideBarPosition::Left => {
+                        column.saturating_sub(frame_x).saturating_sub(activity_w)
+                    }
+                    // Right: sidebar ends at the content's right edge (minus the
+                    // activity bar); dragging the seam left grows it.
+                    SideBarPosition::Right => (frame_x + total)
+                        .saturating_sub(activity_w)
+                        .saturating_sub(column),
+                };
                 let max_sidebar = total
                     .saturating_sub(activity_w)
+                    .saturating_sub(secondary_w)
                     .saturating_sub(RIGHT_PANE_MIN);
                 self.sidebar_width =
                     new_w.clamp(SIDEBAR_WIDTH_MIN, max_sidebar.max(SIDEBAR_WIDTH_MIN));
@@ -18694,6 +19462,22 @@ fn is_sidebar_toggle_key(key: KeyEvent) -> bool {
         return false;
     }
     if key.modifiers.contains(KeyModifiers::ALT) || key.modifiers.contains(KeyModifiers::SHIFT) {
+        return false;
+    }
+    key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::SUPER)
+}
+
+/// `⌥⌘B` (macOS) / `Ctrl+Alt+B` (Linux): toggle the secondary side bar (the
+/// Outline), the edge opposite the primary side bar. ALT distinguishes it from
+/// the plain ⌘B/Ctrl+B primary-side-bar toggle.
+fn is_secondary_sidebar_toggle_key(key: KeyEvent) -> bool {
+    let KeyCode::Char(c) = key.code else {
+        return false;
+    };
+    if !c.eq_ignore_ascii_case(&'b') {
+        return false;
+    }
+    if !key.modifiers.contains(KeyModifiers::ALT) || key.modifiers.contains(KeyModifiers::SHIFT) {
         return false;
     }
     key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::SUPER)
