@@ -18171,12 +18171,13 @@ fn detect_host_terminal(term_program: Option<&str>, term: Option<&str>) -> HostT
 }
 
 /// Spawn a brand-new OS window of the terminal croft is running in, opening
-/// `croft <root> --open-file <file>` — VS Code's "Move/Copy into New Window",
-/// realised as a genuine separate window so the originating croft is never
-/// disturbed. The croft binary is launched by its resolved ABSOLUTE path: a
-/// GUI-launched croft inherits a stripped launchd PATH, so the bare name would
-/// not resolve in the new window's shell (see the project memory on PATH
-/// stripping). macOS only; other platforms surface an Unsupported error.
+/// `croft <root> --open-file <file> --zen` — VS Code's "Move/Copy into New
+/// Window", realised as a genuine separate window so the originating croft is
+/// never disturbed. The new window opens in `--zen` (Explorer + terminal hidden)
+/// so it focuses on just the file. The croft binary is referenced by its
+/// resolved ABSOLUTE path: a GUI-launched croft inherits a stripped launchd
+/// PATH, so the bare name would not resolve in the new window's shell (see the
+/// project memory on PATH stripping). macOS only.
 #[cfg(target_os = "macos")]
 fn spawn_new_window(root: &std::path::Path, file: &std::path::Path) -> std::io::Result<()> {
     let exe = std::env::current_exe()?;
@@ -18185,14 +18186,15 @@ fn spawn_new_window(root: &std::path::Path, file: &std::path::Path) -> std::io::
         std::env::var("TERM").ok().as_deref(),
     );
     match host {
-        // Ghostty parses `-e <argv>` directly, so no shell quoting is needed.
-        // `open -na` forces a new instance — the only reliable way to get a new
-        // window with a command, since `open -a` re-focuses the running Ghostty
-        // and drops `--args`. `--quit-after-last-window-closed` keeps the spawned
-        // instance from lingering once the user closes that window.
+        // Ghostty: open the window in the ALREADY-RUNNING instance via the
+        // `+new-window` IPC. `open -na` was wrong here — it forces a fresh
+        // instance, and a fresh Ghostty opens its default window PLUS the
+        // command window (two tabs, ghostty-org/ghostty#8669) and a duplicate
+        // dock icon. IPC reuses our instance: exactly one new window. `--command`
+        // is shell-wrapped by Ghostty, so it takes the shell-quoted invocation.
         HostTerminal::Ghostty => {
-            std::process::Command::new("open")
-                .args(ghostty_new_window_argv(&exe, root, file))
+            std::process::Command::new(ghostty_bin())
+                .args(ghostty_ipc_argv(&exe, root, file))
                 .spawn()?;
             Ok(())
         }
@@ -18220,31 +18222,47 @@ fn spawn_new_window(root: &std::path::Path, file: &std::path::Path) -> std::io::
     }
 }
 
-/// The `open` argv to launch a new Ghostty window running croft. Split out so the
-/// the exact shape is unit-testable without launching a window.
+/// The Ghostty CLI binary used for the `+new-window` IPC. macOS ships it inside
+/// the app bundle (and a GUI-launched croft can't rely on `ghostty` being on a
+/// stripped PATH), so prefer the bundle path, then a user-local install, then
+/// fall back to the bare name for a PATH lookup.
 #[cfg(target_os = "macos")]
-fn ghostty_new_window_argv(
+fn ghostty_bin() -> std::path::PathBuf {
+    const SYSTEM: &str = "/Applications/Ghostty.app/Contents/MacOS/ghostty";
+    if std::path::Path::new(SYSTEM).exists() {
+        return std::path::PathBuf::from(SYSTEM);
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        let user =
+            std::path::Path::new(&home).join("Applications/Ghostty.app/Contents/MacOS/ghostty");
+        if user.exists() {
+            return user;
+        }
+    }
+    std::path::PathBuf::from("ghostty")
+}
+
+/// Args for `ghostty +new-window`: open one window in the running instance,
+/// rooted at `root`, running the croft invocation. Split out so the shape is
+/// unit-testable without launching a window.
+#[cfg(target_os = "macos")]
+fn ghostty_ipc_argv(
     exe: &std::path::Path,
     root: &std::path::Path,
     file: &std::path::Path,
 ) -> Vec<std::ffi::OsString> {
     use std::ffi::OsString;
-    vec![
-        OsString::from("-na"),
-        OsString::from("Ghostty"),
-        OsString::from("--args"),
-        OsString::from("--quit-after-last-window-closed=true"),
-        OsString::from("-e"),
-        exe.as_os_str().to_os_string(),
-        root.as_os_str().to_os_string(),
-        OsString::from("--open-file"),
-        file.as_os_str().to_os_string(),
-    ]
+    let mut wd = OsString::from("--working-directory=");
+    wd.push(root.as_os_str());
+    let mut command = OsString::from("--command=");
+    command.push(new_window_shell_command(exe, root, file));
+    vec![OsString::from("+new-window"), wd, command]
 }
 
-/// `croft <root> --open-file <file>` as a single shell command line, with every
-/// path single-quoted so spaces and shell metacharacters survive (iTerm2 and
-/// Terminal both run the AppleScript command string through a shell).
+/// `croft <root> --open-file <file> --zen` as a single shell command line, with
+/// every path single-quoted so spaces and shell metacharacters survive (Ghostty
+/// `--command`, iTerm2 `command`, and Terminal `do script` all run it via a
+/// shell). `--zen` opens the new window focused on the file (no sidebar/terminal).
 #[cfg(target_os = "macos")]
 fn new_window_shell_command(
     exe: &std::path::Path,
@@ -18254,7 +18272,7 @@ fn new_window_shell_command(
     fn shq(p: &std::path::Path) -> String {
         format!("'{}'", p.to_string_lossy().replace('\'', r"'\''"))
     }
-    format!("{} {} --open-file {}", shq(exe), shq(root), shq(file))
+    format!("{} {} --open-file {} --zen", shq(exe), shq(root), shq(file))
 }
 
 /// Escape a Rust string for embedding inside an AppleScript double-quoted
@@ -20425,6 +20443,7 @@ pub fn run(
     root: PathBuf,
     restore_session: Option<PathBuf>,
     open_file: Option<PathBuf>,
+    zen: bool,
 ) -> Result<()> {
     // zoxide is a hard dependency of the Cmd+Z jump popup. Probe for it
     // and install it in the background if missing, off the launch path so
@@ -20454,6 +20473,13 @@ pub fn run(
             app.apply_session_state(&state);
         }
         let _ = std::fs::remove_file(session_path);
+    }
+    // `--zen`: hide the Explorer sidebar and terminal so the editor fills the
+    // window. "Move/Copy into New Window" launches the new window this way so it
+    // opens focused on just the handed-off file. Toggle back with Cmd+B / Cmd+J.
+    if zen {
+        app.show_tree = false;
+        app.show_terminal = false;
     }
     // `croft <root> --open-file <path>`: open the handed-off file (used by the
     // new window that Move / Copy into New Window spawns).
@@ -20599,7 +20625,7 @@ pub fn run(
         };
         restore_host_terminal_state();
         match launch_result? {
-            crate::remote::RemoteOutcome::ReturnToLocal => return run(root, None, None),
+            crate::remote::RemoteOutcome::ReturnToLocal => return run(root, None, None, false),
             crate::remote::RemoteOutcome::Exited => return Ok(()),
         }
     }

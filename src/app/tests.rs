@@ -12467,27 +12467,25 @@ fn new_window_is_refused_over_ssh_and_leaves_the_tab_in_place() {
 
 #[cfg(target_os = "macos")]
 #[test]
-fn ghostty_new_window_argv_builds_the_open_command() {
+fn ghostty_ipc_argv_uses_new_window_into_the_running_instance() {
     use std::ffi::OsStr;
     let exe = std::path::Path::new("/usr/local/bin/croft");
     let root = std::path::Path::new("/home/me/project");
     let file = std::path::Path::new("/home/me/project/src/main.rs");
-    let argv = ghostty_new_window_argv(exe, root, file);
+    let argv = ghostty_ipc_argv(exe, root, file);
     let argv: Vec<&OsStr> = argv.iter().map(|s| s.as_os_str()).collect();
     assert_eq!(
         argv,
         [
-            OsStr::new("-na"),
-            OsStr::new("Ghostty"),
-            OsStr::new("--args"),
-            OsStr::new("--quit-after-last-window-closed=true"),
-            OsStr::new("-e"),
-            OsStr::new("/usr/local/bin/croft"),
-            OsStr::new("/home/me/project"),
-            OsStr::new("--open-file"),
-            OsStr::new("/home/me/project/src/main.rs"),
+            // `+new-window` IPC opens ONE window in the running instance — no
+            // `-na` (which would spawn a second instance + a stray default tab).
+            OsStr::new("+new-window"),
+            OsStr::new("--working-directory=/home/me/project"),
+            OsStr::new(
+                "--command='/usr/local/bin/croft' '/home/me/project' --open-file '/home/me/project/src/main.rs' --zen"
+            ),
         ],
-        "a new Ghostty window runs `croft <root> --open-file <file>` via `open -na`"
+        "a new Ghostty window runs croft via the +new-window IPC, in --zen"
     );
 }
 
@@ -12536,13 +12534,16 @@ fn iterm2_and_terminal_scripts_shell_quote_paths_with_spaces() {
     assert!(iterm.contains("'/home/me/My Project'"), "{iterm}");
     assert!(iterm.contains("'/home/me/My Project/a b.rs'"), "{iterm}");
 
+    // The window opens focused on the file: --zen is part of the invocation.
+    assert!(iterm.contains("--zen"), "{iterm}");
+
     let term = apple_terminal_new_window_script(exe, root, file);
     assert!(
         term.contains(r#"tell application "Terminal" to do script "#),
         "{term}"
     );
     assert!(
-        term.contains("--open-file '/home/me/My Project/a b.rs'"),
+        term.contains("--open-file '/home/me/My Project/a b.rs' --zen"),
         "{term}"
     );
 }

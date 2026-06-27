@@ -23,6 +23,12 @@ pub struct Cli {
     #[arg(long, value_name = "FILE")]
     pub open_file: Option<PathBuf>,
 
+    /// Start focused on the editor: hide the Explorer sidebar and the terminal
+    /// so just the file fills the window (toggle them back with Cmd/Ctrl+B and
+    /// Cmd/Ctrl+J). "Move/Copy into New Window" launches the new window this way.
+    #[arg(long, default_value_t = false)]
+    pub zen: bool,
+
     /// Internal: restore tabs/layout from a session file written just
     /// before a self-update re-exec. Not intended for manual use.
     #[arg(long, hide = true)]
@@ -127,7 +133,7 @@ impl Cli {
                 match crate::remote::launch_croft(&host, path.as_deref())? {
                     crate::remote::RemoteOutcome::ReturnToLocal => {
                         let cwd = std::env::current_dir().context("resolving workspace path")?;
-                        crate::app::run(cwd, None, None)
+                        crate::app::run(cwd, None, None, false)
                     }
                     crate::remote::RemoteOutcome::Exited => Ok(()),
                 }
@@ -146,7 +152,7 @@ impl Cli {
                 if !path.is_dir() {
                     anyhow::bail!("{} is not a directory", path.display());
                 }
-                crate::app::run(path, self.restore_session, self.open_file)
+                crate::app::run(path, self.restore_session, self.open_file, self.zen)
             }
         }
     }

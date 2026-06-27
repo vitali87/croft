@@ -68,6 +68,7 @@ cargo build --release && cargo install --path .
 croft                            # opens the current directory
 croft ~/projects                 # opens a specific folder
 croft ~/proj --open-file a.rs    # opens a folder with a file already open
+croft ~/proj --open-file a.rs --zen  # ...focused on just the file (no sidebar/terminal)
 croft remote <host>              # launch croft over SSH on a Linux server (host from ~/.ssh/config)
 croft --help
 ```

@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Feature,
-    summary: "Move/Copy into New Window (Cmd+K O) opens the file in a real new window of your terminal (Ghostty, iTerm2, or Terminal), leaving your current window untouched; `croft --open-file` opens a file on launch.",
+    summary: "Move/Copy into New Window (Cmd+K O) now opens ONE new window of your terminal focused on just the file (Explorer + terminal hidden); Ghostty uses the +new-window IPC so there's no stray second tab. New `croft --open-file` and `--zen` flags.",
 }];
