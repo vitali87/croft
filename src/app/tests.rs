@@ -12467,25 +12467,31 @@ fn new_window_is_refused_over_ssh_and_leaves_the_tab_in_place() {
 
 #[cfg(target_os = "macos")]
 #[test]
-fn ghostty_ipc_argv_uses_new_window_into_the_running_instance() {
+fn ghostty_open_argv_suppresses_the_stray_default_window() {
     use std::ffi::OsStr;
     let exe = std::path::Path::new("/usr/local/bin/croft");
     let root = std::path::Path::new("/home/me/project");
     let file = std::path::Path::new("/home/me/project/src/main.rs");
-    let argv = ghostty_ipc_argv(exe, root, file);
+    let argv = ghostty_open_argv(exe, root, file);
     let argv: Vec<&OsStr> = argv.iter().map(|s| s.as_os_str()).collect();
     assert_eq!(
         argv,
         [
-            // `+new-window` IPC opens ONE window in the running instance — no
-            // `-na` (which would spawn a second instance + a stray default tab).
-            OsStr::new("+new-window"),
-            OsStr::new("--working-directory=/home/me/project"),
-            OsStr::new(
-                "--command='/usr/local/bin/croft' '/home/me/project' --open-file '/home/me/project/src/main.rs' --zen"
-            ),
+            OsStr::new("-na"),
+            OsStr::new("Ghostty"),
+            OsStr::new("--args"),
+            // Empirically: without this a fresh instance opens a 2nd window.
+            OsStr::new("--initial-window=false"),
+            OsStr::new("--quit-after-last-window-closed=true"),
+            OsStr::new("-e"),
+            OsStr::new("/usr/local/bin/croft"),
+            OsStr::new("/home/me/project"),
+            OsStr::new("--open-file"),
+            OsStr::new("/home/me/project/src/main.rs"),
+            // Opens focused on the file.
+            OsStr::new("--zen"),
         ],
-        "a new Ghostty window runs croft via the +new-window IPC, in --zen"
+        "one Ghostty window, focused on the file, no stray default window"
     );
 }
 
@@ -12546,6 +12552,27 @@ fn iterm2_and_terminal_scripts_shell_quote_paths_with_spaces() {
         term.contains("--open-file '/home/me/My Project/a b.rs' --zen"),
         "{term}"
     );
+}
+
+#[test]
+fn zen_layout_collapses_explorer_and_terminal_and_survives_opening_a_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("hi.rs");
+    std::fs::write(&file, "fn main() {}").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    // Baseline: a normal launch shows both panes.
+    assert!(app.show_tree, "explorer visible by default");
+    assert!(app.show_terminal, "terminal visible by default");
+
+    // This is exactly what `run(.., zen = true)` does.
+    app.show_tree = false;
+    app.show_terminal = false;
+    app.open_file_at_launch(&file);
+
+    // Opening the file (which focuses the editor) must NOT re-show the chrome.
+    assert!(!app.show_tree, "--zen keeps the explorer collapsed");
+    assert!(!app.show_terminal, "--zen keeps the terminal collapsed");
+    assert_eq!(app.editor.path.as_deref(), Some(file.as_path()));
 }
 
 #[test]

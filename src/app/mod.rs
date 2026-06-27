@@ -18186,15 +18186,17 @@ fn spawn_new_window(root: &std::path::Path, file: &std::path::Path) -> std::io::
         std::env::var("TERM").ok().as_deref(),
     );
     match host {
-        // Ghostty: open the window in the ALREADY-RUNNING instance via the
-        // `+new-window` IPC. `open -na` was wrong here — it forces a fresh
-        // instance, and a fresh Ghostty opens its default window PLUS the
-        // command window (two tabs, ghostty-org/ghostty#8669) and a duplicate
-        // dock icon. IPC reuses our instance: exactly one new window. `--command`
-        // is shell-wrapped by Ghostty, so it takes the shell-quoted invocation.
+        // Ghostty on macOS has no IPC (`+new-window` is Linux/GTK-only), so a
+        // new window must come from `open -na` (a fresh instance). A fresh
+        // instance would ALSO open its default window → two windows
+        // (ghostty-org/ghostty#8669; verified empirically). `--initial-window=false`
+        // suppresses that default (verified: it adds zero windows), so `-e`'s
+        // command window is the only one. `--quit-after-last-window-closed` makes
+        // the spawned instance exit once that window closes. `-e` is exec'd
+        // directly (no shell), so the croft argv is passed token-by-token.
         HostTerminal::Ghostty => {
-            std::process::Command::new(ghostty_bin())
-                .args(ghostty_ipc_argv(&exe, root, file))
+            std::process::Command::new("open")
+                .args(ghostty_open_argv(&exe, root, file))
                 .spawn()?;
             Ok(())
         }
@@ -18222,47 +18224,36 @@ fn spawn_new_window(root: &std::path::Path, file: &std::path::Path) -> std::io::
     }
 }
 
-/// The Ghostty CLI binary used for the `+new-window` IPC. macOS ships it inside
-/// the app bundle (and a GUI-launched croft can't rely on `ghostty` being on a
-/// stripped PATH), so prefer the bundle path, then a user-local install, then
-/// fall back to the bare name for a PATH lookup.
+/// `open` argv for a new Ghostty window running croft, focused on the file
+/// (`--zen`). `--initial-window=false` stops the fresh instance opening a stray
+/// default window beside the `-e` one. Split out so the shape is unit-testable
+/// without launching a window.
 #[cfg(target_os = "macos")]
-fn ghostty_bin() -> std::path::PathBuf {
-    const SYSTEM: &str = "/Applications/Ghostty.app/Contents/MacOS/ghostty";
-    if std::path::Path::new(SYSTEM).exists() {
-        return std::path::PathBuf::from(SYSTEM);
-    }
-    if let Ok(home) = std::env::var("HOME") {
-        let user =
-            std::path::Path::new(&home).join("Applications/Ghostty.app/Contents/MacOS/ghostty");
-        if user.exists() {
-            return user;
-        }
-    }
-    std::path::PathBuf::from("ghostty")
-}
-
-/// Args for `ghostty +new-window`: open one window in the running instance,
-/// rooted at `root`, running the croft invocation. Split out so the shape is
-/// unit-testable without launching a window.
-#[cfg(target_os = "macos")]
-fn ghostty_ipc_argv(
+fn ghostty_open_argv(
     exe: &std::path::Path,
     root: &std::path::Path,
     file: &std::path::Path,
 ) -> Vec<std::ffi::OsString> {
     use std::ffi::OsString;
-    let mut wd = OsString::from("--working-directory=");
-    wd.push(root.as_os_str());
-    let mut command = OsString::from("--command=");
-    command.push(new_window_shell_command(exe, root, file));
-    vec![OsString::from("+new-window"), wd, command]
+    vec![
+        OsString::from("-na"),
+        OsString::from("Ghostty"),
+        OsString::from("--args"),
+        OsString::from("--initial-window=false"),
+        OsString::from("--quit-after-last-window-closed=true"),
+        OsString::from("-e"),
+        exe.as_os_str().to_os_string(),
+        root.as_os_str().to_os_string(),
+        OsString::from("--open-file"),
+        file.as_os_str().to_os_string(),
+        OsString::from("--zen"),
+    ]
 }
 
 /// `croft <root> --open-file <file> --zen` as a single shell command line, with
-/// every path single-quoted so spaces and shell metacharacters survive (Ghostty
-/// `--command`, iTerm2 `command`, and Terminal `do script` all run it via a
-/// shell). `--zen` opens the new window focused on the file (no sidebar/terminal).
+/// every path single-quoted so spaces and shell metacharacters survive (iTerm2
+/// `command` and Terminal `do script` both run it via a shell). `--zen` opens
+/// the new window focused on the file (no sidebar/terminal).
 #[cfg(target_os = "macos")]
 fn new_window_shell_command(
     exe: &std::path::Path,
