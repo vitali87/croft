@@ -13291,12 +13291,28 @@ fn the_active_panel_tab_is_underlined() {
     let backend = ratatui::backend::TestBackend::new(140, 50);
     let mut term = ratatui::Terminal::new(backend).unwrap();
     term.draw(|f| app.render(f)).unwrap();
-    // TERMINAL is active by default: its label underlines like a VS Code tab.
+    // TERMINAL is active by default: its label underlines like a VS Code tab,
+    // but the underline hugs the word, not the padded hit rect.
     let t = app.terminal_tab_rect;
     let buf = term.backend().buffer();
-    let underlined =
-        (t.x..t.x + t.width).any(|x| buf[(x, t.y)].modifier.contains(Modifier::UNDERLINED));
-    assert!(underlined, "the active tab label is underlined");
+    let underlined = (t.x..t.x + t.width)
+        .filter(|&x| buf[(x, t.y)].modifier.contains(Modifier::UNDERLINED))
+        .count();
+    assert_eq!(
+        underlined,
+        "TERMINAL".len(),
+        "underline spans only the word"
+    );
+    assert!(
+        !buf[(t.x, t.y)].modifier.contains(Modifier::UNDERLINED),
+        "the leading pad space is not underlined",
+    );
+    assert!(
+        !buf[(t.x + t.width - 1, t.y)]
+            .modifier
+            .contains(Modifier::UNDERLINED),
+        "the trailing pad space is not underlined",
+    );
 }
 
 // ---------------------------------------------------------------------------

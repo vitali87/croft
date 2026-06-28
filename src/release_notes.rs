@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Fix,
-    summary: "Polished the bottom panel tab strip: the PROBLEMS count now sits in a rounded orange brand pill, the active tab is underlined like a VS Code tab, and each terminal pane drops its redundant TERMINAL title since the strip already labels the group.",
+    summary: "The active panel tab's underline now hugs the label text instead of running the full width of the padded tab, matching VS Code's tab indicator.",
 }];

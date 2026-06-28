@@ -7153,7 +7153,7 @@ impl App {
                 Style::default()
                     .fg(active_fg)
                     .bg(strip_bg)
-                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+                    .add_modifier(Modifier::BOLD)
             } else if crate::widgets::hover::row_hover_bg(rect, pointer, brand).is_some() {
                 Style::default().fg(active_fg).bg(strip_bg)
             } else {
@@ -7209,6 +7209,24 @@ impl App {
                 right.saturating_sub(t_rect.x) as usize,
                 t_style,
             );
+        }
+
+        // The active-tab underline (VS Code's tab indicator) must hug the word,
+        // not the padded hit rect, so it spans only the trimmed label text and
+        // stops before the leading/trailing spaces (and the count pill).
+        let y = strip.y;
+        let mut underline_word = |x0: u16, label: &str| {
+            let leading = label.chars().take_while(|c| *c == ' ').count() as u16;
+            let word_len = label.trim().chars().count() as u16;
+            let start = x0 + leading;
+            for x in start..(start + word_len).min(right) {
+                buf[(x, y)].modifier.insert(Modifier::UNDERLINED);
+            }
+        };
+        if self.bottom_panel_tab == BottomPanelTab::Problems {
+            underline_word(p_rect.x, problems_label);
+        } else {
+            underline_word(t_rect.x, terminal_label);
         }
     }
 
