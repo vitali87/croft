@@ -13218,6 +13218,53 @@ fn clicking_the_problems_tab_switches_the_panel_view() {
 }
 
 #[test]
+fn clicking_the_output_tab_switches_the_panel_view() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let backend = ratatui::backend::TestBackend::new(140, 50);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let r = app.output_tab_rect;
+    assert!(r.width > 0, "the OUTPUT tab must have a hit rect");
+    left_click(&mut app, r.x, r.y);
+    assert_eq!(
+        app.bottom_panel_tab,
+        BottomPanelTab::Output,
+        "a click on the OUTPUT tab activates that view",
+    );
+}
+
+#[test]
+fn the_output_view_renders_a_pushed_channel_line() {
+    use crate::output::OutputLevel;
+    let ch = "app-output-render-test";
+    crate::output::push(ch, OutputLevel::Error, "boom-from-server");
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.bottom_panel_tab = BottomPanelTab::Output;
+    // Select our channel so the assertion is independent of other channels.
+    app.output.sync();
+    assert!(
+        app.output.select_by_name(ch),
+        "the pushed channel is present in the bus",
+    );
+    let backend = ratatui::backend::TestBackend::new(140, 50);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let buf = term.backend().buffer();
+    let mut text = String::new();
+    for y in 0..50 {
+        for x in 0..140 {
+            text.push_str(buf[(x, y)].symbol());
+        }
+    }
+    assert!(
+        text.contains("boom-from-server"),
+        "the OUTPUT view renders the channel's line",
+    );
+}
+
+#[test]
 fn clicking_a_problem_row_opens_that_file_at_the_line() {
     use crate::lsp::manager::DiagnosticSeverity;
     let tmp = tempfile::tempdir().unwrap();

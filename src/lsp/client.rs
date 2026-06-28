@@ -36,6 +36,22 @@ use tower::ServiceBuilder;
 use crate::lsp::config::ServerConfig;
 use crate::lsp::log_file;
 use crate::lsp::manager::{Diagnostic, DiagnosticSeverity, DiagnosticsUpdate, ProgressUpdate};
+use crate::output::{self, OutputLevel};
+
+/// Map an LSP `window/{show,log}Message` severity to an OUTPUT channel level so
+/// the panel colours a server's own messages the way it classified them.
+fn msg_level(typ: lsp_types::MessageType) -> OutputLevel {
+    use lsp_types::MessageType as MT;
+    if typ == MT::ERROR {
+        OutputLevel::Error
+    } else if typ == MT::WARNING {
+        OutputLevel::Warn
+    } else if typ == MT::INFO {
+        OutputLevel::Info
+    } else {
+        OutputLevel::Debug
+    }
+}
 
 struct ClientState {
     name: String,
@@ -159,6 +175,7 @@ impl ClientState {
                     "lsp[{}] {:?}: {}",
                     this.name, params.typ, params.message
                 ));
+                output::push(&this.name, msg_level(params.typ), &params.message);
                 ControlFlow::Continue(())
             })
             .notification::<LogMessage>(|this, params| {
@@ -166,6 +183,7 @@ impl ClientState {
                     "lsp[{}] log {:?}: {}",
                     this.name, params.typ, params.message
                 ));
+                output::push(&this.name, msg_level(params.typ), &params.message);
                 ControlFlow::Continue(())
             });
         router.unhandled_notification(|this, notif| {
@@ -294,13 +312,25 @@ impl LspClient {
             let mut lines = BufReader::new(stderr).lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 log_file::log(&format!("lsp[{stderr_name}] stderr: {line}"));
+                output::push(&stderr_name, OutputLevel::Info, &line);
             }
         });
+
+        // Tee both directions of the JSON-RPC stream into the server's
+        // "<name> (trace)" OUTPUT channel. The tee is inert (one atomic load per
+        // chunk) until the OUTPUT panel's RPC toggle turns tracing on.
+        let stdout = crate::lsp::trace::TraceRead::new(stdout, name.clone());
+        let stdin = crate::lsp::trace::TraceWrite::new(stdin, name.clone());
 
         let mainloop_name = name.clone();
         let mainloop_task = tokio::spawn(async move {
             if let Err(e) = mainloop.run_buffered(stdout, stdin).await {
                 log_file::log(&format!("lsp[{mainloop_name}] mainloop exited: {e}"));
+                output::push(
+                    &mainloop_name,
+                    OutputLevel::Error,
+                    &format!("language server exited: {e}"),
+                );
             }
         });
 

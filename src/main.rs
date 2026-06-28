@@ -14,6 +14,7 @@ mod launcher;
 mod lsp;
 mod mcp;
 mod outline_syntax;
+mod output;
 mod pdf;
 mod prefs;
 mod release_notes;

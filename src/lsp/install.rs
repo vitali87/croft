@@ -436,9 +436,19 @@ fn run_binary_install(
     }
 
     log_file::log(&format!("lsp[{name}] downloading {url}"));
+    crate::output::push(
+        crate::output::CHANNEL_PROVISION,
+        crate::output::OutputLevel::Info,
+        &format!("{name}: downloading {url}"),
+    );
     set_status(format!("Installing {name}"));
     let Some(bytes) = download_capped(url, MAX_BINARY_BYTES) else {
         log_file::log(&format!("lsp[{name}] download failed: {url}"));
+        crate::output::push(
+            crate::output::CHANNEL_PROVISION,
+            crate::output::OutputLevel::Error,
+            &format!("{name}: download failed: {url}"),
+        );
         set_status(format!(
             "{name} install failed (download error, see ~/.croft/lsp.log)"
         ));
@@ -452,6 +462,11 @@ fn run_binary_install(
     };
     if let Err(e) = extracted {
         log_file::log(&format!("lsp[{name}] extract failed: {e}"));
+        crate::output::push(
+            crate::output::CHANNEL_PROVISION,
+            crate::output::OutputLevel::Error,
+            &format!("{name}: extract failed: {e}"),
+        );
         set_status(format!(
             "{name} install failed (extract error, see ~/.croft/lsp.log)"
         ));
@@ -465,6 +480,11 @@ fn run_binary_install(
         return;
     }
     log_file::log(&format!("lsp[{name}] managed binary install complete"));
+    crate::output::push(
+        crate::output::CHANNEL_PROVISION,
+        crate::output::OutputLevel::Info,
+        &format!("{name}: install complete"),
+    );
     mark_installed(language);
     set_status(format!("{name} installed"));
 }

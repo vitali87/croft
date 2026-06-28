@@ -92,6 +92,14 @@ fn run_mutation(root: &Path, args: &[&str]) -> Result<String, String> {
     let path_str = root
         .to_str()
         .ok_or_else(|| "non-utf8 workspace path".to_string())?;
+    // Echo the command and its result into the OUTPUT panel's "Git" channel, so
+    // the user can see exactly what the Source Control panel ran (VS Code's Git
+    // output channel). Only mutations are logged here; status polls stay quiet.
+    crate::output::push(
+        crate::output::CHANNEL_GIT,
+        crate::output::OutputLevel::Info,
+        &format!("> git {}", args.join(" ")),
+    );
     let mut cmd = Command::new("git");
     cmd.args(["-C", path_str]).args(args);
     let output = cmd
@@ -100,15 +108,29 @@ fn run_mutation(root: &Path, args: &[&str]) -> Result<String, String> {
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
     if output.status.success() {
-        Ok(if !stdout.is_empty() { stdout } else { stderr })
+        let msg = if !stdout.is_empty() { stdout } else { stderr };
+        if !msg.is_empty() {
+            crate::output::push(
+                crate::output::CHANNEL_GIT,
+                crate::output::OutputLevel::Info,
+                &msg,
+            );
+        }
+        Ok(msg)
     } else {
         let msg = if !stderr.is_empty() { stderr } else { stdout };
-        Err(if msg.is_empty() {
+        let err = if msg.is_empty() {
             let verb = args.first().copied().unwrap_or("git");
             format!("git {verb} failed with code {:?}", output.status.code())
         } else {
             msg
-        })
+        };
+        crate::output::push(
+            crate::output::CHANNEL_GIT,
+            crate::output::OutputLevel::Error,
+            &err,
+        );
+        Err(err)
     }
 }
 

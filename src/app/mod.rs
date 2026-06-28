@@ -722,11 +722,13 @@ enum Pane {
 
 /// Which tab the bottom panel group shows. The panel is the "terminal group"
 /// VS Code-style: a tab strip over a shared region. `Terminal` shows the live
-/// shell(s); `Problems` shows aggregated workspace diagnostics.
+/// shell(s); `Problems` shows aggregated workspace diagnostics; `Output` is the
+/// read-only per-channel log viewer.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum BottomPanelTab {
     Terminal,
     Problems,
+    Output,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1917,9 +1919,15 @@ pub struct App {
     /// The PROBLEMS view: aggregated workspace diagnostics, projected from
     /// `lsp_diagnostics`. Rendered into the panel content when its tab is active.
     problems: crate::widgets::problems::ProblemsPanel,
+    /// The OUTPUT view: a read-only per-channel log viewer over the in-process
+    /// `crate::output` bus. Rendered into the panel content when its tab active.
+    output: crate::widgets::output::OutputPanel,
     /// Hit-test rect of the "PROBLEMS" tab in the panel tab strip. Empty when
     /// the panel is hidden.
     problems_tab_rect: Rect,
+    /// Hit-test rect of the "OUTPUT" tab in the panel tab strip. Empty when the
+    /// panel is hidden.
+    output_tab_rect: Rect,
     /// Hit-test rect of the "TERMINAL" tab in the panel tab strip. Empty when
     /// the panel is hidden.
     terminal_tab_rect: Rect,
@@ -2552,7 +2560,9 @@ impl App {
             terminal_close_buttons: Vec::new(),
             bottom_panel_tab: BottomPanelTab::Terminal,
             problems: crate::widgets::problems::ProblemsPanel::new(),
+            output: crate::widgets::output::OutputPanel::new(),
             problems_tab_rect: Rect::default(),
+            output_tab_rect: Rect::default(),
             terminal_tab_rect: Rect::default(),
             pointer_cell: None,
             hovered_activity_icon: None,
@@ -7081,6 +7091,11 @@ impl App {
         self.problems.theme = self.theme;
         self.problems.focused = self.focus == Pane::Terminal;
         self.problems.hover_pointer = self.pointer_cell;
+        self.output.focus_gradient = gradient;
+        self.output.theme = self.theme;
+        self.output.focused = self.focus == Pane::Terminal;
+        self.output.hover_pointer = self.pointer_cell;
+        self.output.sync();
         for t in self.terminals.iter_mut() {
             t.focus_gradient = gradient;
         }
@@ -7111,122 +7126,112 @@ impl App {
         let inactive_fg = Color::Rgb(0x80, 0x88, 0x98);
         let right = strip.x + strip.width;
         let count = self.problems.total_count();
-
-        // The PROBLEMS tab carries an orange count "pill" (the brand gradient's
-        // orange corner, rounded-cap badge) right after its label, mirroring VS
-        // Code's tab count badge; its hit rect spans label and pill together.
-        let problems_label = " PROBLEMS ";
-        let badge_text = if count > 0 {
-            format!(" {count} ")
-        } else {
-            String::new()
-        };
-        let badge_w = if count > 0 {
-            badge_text.chars().count() as u16 + 2
-        } else {
-            0
-        };
-        let problems_w = problems_label.chars().count() as u16 + badge_w;
-        let p_rect = Rect {
-            x: strip.x + 1,
-            y: strip.y,
-            width: problems_w.min(right.saturating_sub(strip.x + 1)),
-            height: 1,
-        };
-        let terminal_label = " TERMINAL ";
-        let t_x = p_rect.x + problems_w + 1;
-        let t_rect = Rect {
-            x: t_x,
-            y: strip.y,
-            width: (terminal_label.chars().count() as u16).min(right.saturating_sub(t_x)),
-            height: 1,
-        };
-        self.problems_tab_rect = p_rect;
-        self.terminal_tab_rect = t_rect;
-
-        // Active tab: brand foreground, bold, and underlined — the VS Code
-        // active-tab indicator. Hover brightens an inactive tab; the rest stay
-        // dim.
         let pointer = self.pointer_cell;
-        let label_style = |active: bool, rect: Rect| -> Style {
-            if active {
+        let orange = crate::gradient::rgb_color(crate::gradient::GRAD_TR);
+        let badge_fg = Color::Rgb(0x1a, 0x12, 0x0a);
+        let active = self.bottom_panel_tab;
+
+        self.problems_tab_rect = Rect::default();
+        self.output_tab_rect = Rect::default();
+        self.terminal_tab_rect = Rect::default();
+
+        // VS Code panel-group order: PROBLEMS, OUTPUT, TERMINAL. PROBLEMS alone
+        // carries the orange count pill after its label.
+        let tabs = [
+            (BottomPanelTab::Problems, " PROBLEMS "),
+            (BottomPanelTab::Output, " OUTPUT "),
+            (BottomPanelTab::Terminal, " TERMINAL "),
+        ];
+
+        // Lay each tab out left to right, recording its hit rect (which, for
+        // PROBLEMS, spans the label and the pill together).
+        let mut placed: Vec<(BottomPanelTab, &str, Rect, u16)> = Vec::with_capacity(tabs.len());
+        let mut x = strip.x + 1;
+        for (tab, label) in tabs {
+            if x >= right {
+                break;
+            }
+            let badge_w = if tab == BottomPanelTab::Problems && count > 0 {
+                format!(" {count} ").chars().count() as u16 + 2
+            } else {
+                0
+            };
+            let w = label.chars().count() as u16 + badge_w;
+            let rect = Rect {
+                x,
+                y: strip.y,
+                width: w.min(right.saturating_sub(x)),
+                height: 1,
+            };
+            match tab {
+                BottomPanelTab::Problems => self.problems_tab_rect = rect,
+                BottomPanelTab::Output => self.output_tab_rect = rect,
+                BottomPanelTab::Terminal => self.terminal_tab_rect = rect,
+            }
+            placed.push((tab, label, rect, badge_w));
+            x = x.saturating_add(w + 1);
+        }
+
+        let buf = frame.buffer_mut();
+        for (tab, label, rect, badge_w) in &placed {
+            let is_active = *tab == active;
+            // Active tab: brand fg + bold (and underlined below). Hover brightens
+            // an inactive tab; the rest stay dim.
+            let style = if is_active {
                 Style::default()
                     .fg(active_fg)
                     .bg(strip_bg)
                     .add_modifier(Modifier::BOLD)
-            } else if crate::widgets::hover::row_hover_bg(rect, pointer, brand).is_some() {
+            } else if crate::widgets::hover::row_hover_bg(*rect, pointer, brand).is_some() {
                 Style::default().fg(active_fg).bg(strip_bg)
             } else {
                 Style::default().fg(inactive_fg).bg(strip_bg)
-            }
-        };
-        let p_style = label_style(self.bottom_panel_tab == BottomPanelTab::Problems, p_rect);
-        let t_style = label_style(self.bottom_panel_tab == BottomPanelTab::Terminal, t_rect);
-
-        let orange = crate::gradient::rgb_color(crate::gradient::GRAD_TR);
-        let badge_fg = Color::Rgb(0x1a, 0x12, 0x0a);
-        let buf = frame.buffer_mut();
-
-        if p_rect.x < right {
-            buf.set_stringn(
-                p_rect.x,
-                p_rect.y,
-                problems_label,
-                right.saturating_sub(p_rect.x) as usize,
-                p_style,
-            );
-        }
-        if count > 0 {
-            let bx = p_rect.x + problems_label.chars().count() as u16;
-            let cap_style = Style::default().fg(orange).bg(strip_bg);
-            if bx < right {
-                buf.set_string(bx, p_rect.y, "\u{e0b6}", cap_style);
-            }
-            let inner_start = bx + 1;
-            if inner_start < right {
+            };
+            if rect.x < right {
                 buf.set_stringn(
-                    inner_start,
-                    p_rect.y,
-                    &badge_text,
-                    right.saturating_sub(inner_start) as usize,
-                    Style::default()
-                        .fg(badge_fg)
-                        .bg(orange)
-                        .add_modifier(Modifier::BOLD),
+                    rect.x,
+                    rect.y,
+                    label,
+                    right.saturating_sub(rect.x) as usize,
+                    style,
                 );
             }
-            let cap_r = inner_start + badge_text.chars().count() as u16;
-            if cap_r < right {
-                buf.set_string(cap_r, p_rect.y, "\u{e0b4}", cap_style);
+            // Orange count pill (rounded caps over the strip bg) after PROBLEMS.
+            if *badge_w > 0 {
+                let badge_text = format!(" {count} ");
+                let bx = rect.x + label.chars().count() as u16;
+                let cap_style = Style::default().fg(orange).bg(strip_bg);
+                if bx < right {
+                    buf.set_string(bx, rect.y, "\u{e0b6}", cap_style);
+                }
+                let inner_start = bx + 1;
+                if inner_start < right {
+                    buf.set_stringn(
+                        inner_start,
+                        rect.y,
+                        &badge_text,
+                        right.saturating_sub(inner_start) as usize,
+                        Style::default()
+                            .fg(badge_fg)
+                            .bg(orange)
+                            .add_modifier(Modifier::BOLD),
+                    );
+                }
+                let cap_r = inner_start + badge_text.chars().count() as u16;
+                if cap_r < right {
+                    buf.set_string(cap_r, rect.y, "\u{e0b4}", cap_style);
+                }
             }
-        }
-
-        if t_rect.x < right {
-            buf.set_stringn(
-                t_rect.x,
-                t_rect.y,
-                terminal_label,
-                right.saturating_sub(t_rect.x) as usize,
-                t_style,
-            );
-        }
-
-        // The active-tab underline (VS Code's tab indicator) must hug the word,
-        // not the padded hit rect, so it spans only the trimmed label text and
-        // stops before the leading/trailing spaces (and the count pill).
-        let y = strip.y;
-        let mut underline_word = |x0: u16, label: &str| {
-            let leading = label.chars().take_while(|c| *c == ' ').count() as u16;
-            let word_len = label.trim().chars().count() as u16;
-            let start = x0 + leading;
-            for x in start..(start + word_len).min(right) {
-                buf[(x, y)].modifier.insert(Modifier::UNDERLINED);
+            // The active-tab underline (VS Code's indicator) hugs the word only,
+            // stopping before the padding spaces and the pill.
+            if is_active {
+                let leading = label.chars().take_while(|c| *c == ' ').count() as u16;
+                let word_len = label.trim().chars().count() as u16;
+                let start = rect.x + leading;
+                for ux in start..(start + word_len).min(right) {
+                    buf[(ux, rect.y)].modifier.insert(Modifier::UNDERLINED);
+                }
             }
-        };
-        if self.bottom_panel_tab == BottomPanelTab::Problems {
-            underline_word(p_rect.x, problems_label);
-        } else {
-            underline_word(t_rect.x, terminal_label);
         }
     }
 
@@ -7860,11 +7865,22 @@ impl App {
                     }
                     frame.render_widget(&mut self.problems, content);
                 }
+                BottomPanelTab::Output => {
+                    // Same hidden-terminal reset as PROBLEMS: the OUTPUT view
+                    // covers the panes, so their hit rects must not linger.
+                    self.terminal_add_buttons.clear();
+                    self.terminal_close_buttons.clear();
+                    for t in self.terminals.iter_mut() {
+                        t.last_area = Rect::default();
+                    }
+                    frame.render_widget(&mut self.output, content);
+                }
             }
         } else {
             self.terminal_add_buttons.clear();
             self.terminal_close_buttons.clear();
             self.problems_tab_rect = Rect::default();
+            self.output_tab_rect = Rect::default();
             self.terminal_tab_rect = Rect::default();
             // A hidden terminal must not keep stale hit rects alive, or
             // `terminal_at_pos` would phantom-match clicks meant for
@@ -9288,10 +9304,11 @@ impl App {
                 self.poke_cursor();
             }
             Pane::Terminal => match self.bottom_panel_tab {
-                // The PROBLEMS view owns the panel pane while its tab is active,
-                // so keystrokes scroll the list instead of leaking into the
-                // hidden shell.
+                // The PROBLEMS / OUTPUT views own the panel pane while their tab
+                // is active, so keystrokes scroll the list instead of leaking
+                // into the hidden shell.
                 BottomPanelTab::Problems => self.handle_problems_key(key),
+                BottomPanelTab::Output => self.handle_output_key(key),
                 BottomPanelTab::Terminal => self.handle_terminal_key(key),
             },
         }
@@ -13709,6 +13726,17 @@ impl App {
         }
     }
 
+    fn handle_output_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Up => self.output.scroll_up(1),
+            KeyCode::Down => self.output.scroll_down(1),
+            KeyCode::PageUp => self.output.scroll_up(10),
+            KeyCode::PageDown => self.output.scroll_down(10),
+            KeyCode::Esc => self.focus_pane(Pane::Editor),
+            _ => {}
+        }
+    }
+
     fn handle_terminal_key(&mut self, key: KeyEvent) {
         // Ctrl+Shift+T: open another terminal next to the active one.
         if is_terminal_split_key(key) {
@@ -16459,6 +16487,8 @@ impl App {
         let in_terminal = terminal_hit.is_some();
         let in_problems = self.bottom_panel_tab == BottomPanelTab::Problems
             && rect_contains(self.problems.last_area, m.column, m.row);
+        let in_output = self.bottom_panel_tab == BottomPanelTab::Output
+            && rect_contains(self.output.last_area, m.column, m.row);
         let in_tree_scrollbar = self.sidebar_view == SidebarView::Explorer
             && rect_contains(self.tree.last_scrollbar, m.column, m.row);
         let in_remote_scrollbar = self.sidebar_view == SidebarView::Remote
@@ -16839,8 +16869,23 @@ impl App {
                     self.set_bottom_panel_tab(BottomPanelTab::Problems);
                     return;
                 }
+                if rect_contains(self.output_tab_rect, m.column, m.row) {
+                    self.set_bottom_panel_tab(BottomPanelTab::Output);
+                    return;
+                }
                 if rect_contains(self.terminal_tab_rect, m.column, m.row) {
                     self.set_bottom_panel_tab(BottomPanelTab::Terminal);
+                    return;
+                }
+                // A click in the OUTPUT view hits its toolbar (dropdown / clear /
+                // rpc / level) or dropdown list; if it lands in the log body the
+                // widget doesn't consume it, so we just focus the panel pane.
+                if self.bottom_panel_tab == BottomPanelTab::Output
+                    && rect_contains(self.output.last_area, m.column, m.row)
+                {
+                    if !self.output.click(m.column, m.row) {
+                        self.focus_pane(Pane::Terminal);
+                    }
                     return;
                 }
                 // A click in the PROBLEMS list jumps the editor to that
@@ -17652,6 +17697,8 @@ impl App {
                     self.dependencies.scroll_down(3);
                 } else if in_problems {
                     self.problems.scroll_down(3);
+                } else if in_output {
+                    self.output.scroll_down(3);
                 } else if in_tree {
                     match self.sidebar_view {
                         SidebarView::Explorer => self.tree.scroll_down(3),
@@ -17687,6 +17734,8 @@ impl App {
                     self.dependencies.scroll_up(3);
                 } else if in_problems {
                     self.problems.scroll_up(3);
+                } else if in_output {
+                    self.output.scroll_up(3);
                 } else if in_tree {
                     match self.sidebar_view {
                         SidebarView::Explorer => self.tree.scroll_up(3),

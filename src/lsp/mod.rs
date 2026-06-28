@@ -12,6 +12,7 @@ pub mod manifest;
 pub mod registry;
 pub mod runtime;
 pub mod semantic_cache;
+pub mod trace;
 
 pub use client::LspClient;
 pub use config::{Language, ServerConfig};

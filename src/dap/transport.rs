@@ -141,6 +141,28 @@ impl DapTransport {
         let stdin = child.stdin.take().context("adapter stdin missing")?;
         let stdout = child.stdout.take().context("adapter stdout missing")?;
 
+        // The adapter's stderr (its own diagnostics, e.g. debugpy tracebacks)
+        // rode nowhere before; tee it line-by-line into the OUTPUT panel's
+        // "Debug Adapter" channel so a failing adapter is visible in-app.
+        if let Some(stderr) = child.stderr.take() {
+            std::thread::Builder::new()
+                .name("dap-stderr".into())
+                .spawn(move || {
+                    use std::io::BufRead;
+                    for line in std::io::BufReader::new(stderr)
+                        .lines()
+                        .map_while(Result::ok)
+                    {
+                        crate::output::push(
+                            crate::output::CHANNEL_DAP,
+                            crate::output::OutputLevel::Info,
+                            &line,
+                        );
+                    }
+                })
+                .ok();
+        }
+
         let (tx, rx): (Sender<Value>, Receiver<Value>) = std::sync::mpsc::channel();
         std::thread::Builder::new()
             .name("dap-reader".into())

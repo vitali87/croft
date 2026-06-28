@@ -60,6 +60,6 @@ pub struct ReleaseNote {
 
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
-    kind: NoteKind::Fix,
-    summary: "The active panel tab's underline now hugs the label text instead of running the full width of the padded tab, matching VS Code's tab indicator.",
+    kind: NoteKind::Feature,
+    summary: "New OUTPUT tab in the bottom panel group: a read-only log viewer with a channel dropdown (one per language server, plus Debug Adapter, Git, and Server Provisioning), level colouring with a minimum-level filter, and an RPC toggle that traces raw JSON-RPC per server. Click the dropdown to switch channels, or clear to empty one.",
 }];
