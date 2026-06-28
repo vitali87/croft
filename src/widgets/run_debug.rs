@@ -461,7 +461,7 @@ impl RunDebugPanel {
                 after_cursor,
                 field_y,
                 right,
-                "Evaluate expression…",
+                "Evaluate expression",
                 with_bg(
                     Style::default()
                         .fg(DBG_PLACEHOLDER)

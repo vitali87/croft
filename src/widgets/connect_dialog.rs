@@ -77,7 +77,7 @@ impl ConnectDialog {
         Self {
             host,
             phase: DialogPhase::Connecting,
-            prompt_text: String::from("Establishing SSH connection…"),
+            prompt_text: String::from("Establishing SSH connection"),
             input: String::new(),
             status_line: String::from("Negotiating with the remote host"),
             error: None,
@@ -161,7 +161,7 @@ impl ConnectDialog {
 
     pub fn set_installing(&mut self) {
         self.phase = DialogPhase::Installing;
-        self.status_line = format!("Preparing remote croft on {}…", self.host);
+        self.status_line = format!("Preparing remote croft on {}", self.host);
         self.input.clear();
         self.show_logs = true;
         self.submitted = false;
@@ -594,10 +594,8 @@ fn truncate(s: &str, max: usize) -> String {
     if count <= max {
         return s.to_string();
     }
-    let take = max.saturating_sub(1);
-    let mut out: String = s.chars().take(take).collect();
-    out.push('…');
-    out
+    // Cut plainly, no trailing ellipsis marker (no ellipsis anywhere in croft).
+    s.chars().take(max).collect()
 }
 
 #[cfg(test)]

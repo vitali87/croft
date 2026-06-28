@@ -193,9 +193,8 @@ impl<'a> Sink for HitSink<'a> {
         let stripped = line_str.trim_end_matches(['\r', '\n']);
         let trimmed = stripped.trim_start();
         let cut = if trimmed.chars().count() > MAX_LINE_LEN {
-            let mut s: String = trimmed.chars().take(MAX_LINE_LEN).collect();
-            s.push('…');
-            s
+            // Cut plainly, no trailing ellipsis marker (no ellipsis anywhere).
+            trimmed.chars().take(MAX_LINE_LEN).collect()
         } else {
             trimmed.to_string()
         };
@@ -2024,8 +2023,9 @@ mod tests {
             &mut out,
         );
         assert_eq!(out.len(), 1);
-        assert!(out[0].line_text.ends_with('…'));
-        assert!(out[0].line_text.chars().count() <= MAX_LINE_LEN + 1);
+        // Overlong lines are cut to MAX_LINE_LEN with no trailing ellipsis.
+        assert!(!out[0].line_text.contains('…'));
+        assert_eq!(out[0].line_text.chars().count(), MAX_LINE_LEN);
     }
 
     #[test]

@@ -436,7 +436,7 @@ fn run_binary_install(
     }
 
     log_file::log(&format!("lsp[{name}] downloading {url}"));
-    set_status(format!("Installing {name}…"));
+    set_status(format!("Installing {name}"));
     let Some(bytes) = download_capped(url, MAX_BINARY_BYTES) else {
         log_file::log(&format!("lsp[{name}] download failed: {url}"));
         set_status(format!(
@@ -560,7 +560,7 @@ fn run_npm_install(name: &'static str, language: Language, package: &str, versio
     };
     let spec = npm_spec(package, version);
     log_file::log(&format!("lsp[{name}] installing {spec} into {prefix:?}"));
-    set_status(format!("Installing {name}…"));
+    set_status(format!("Installing {name}"));
     let output = Command::new(&npm)
         .arg("install")
         .arg("--prefix")
@@ -626,7 +626,7 @@ fn run_termux_pkg_install(name: &'static str, language: Language, package: &str)
     log_file::log(&format!(
         "lsp[{name}] installing {package} via pkg (Termux repo)"
     ));
-    set_status(format!("Installing {name} (pkg)…"));
+    set_status(format!("Installing {name} (pkg)"));
     // Recover the guard even if another install thread panicked mid-pkg: a
     // poisoned lock still serializes correctly, the data is just `()`.
     let _guard = termux_pkg_lock().lock().unwrap_or_else(|e| e.into_inner());
@@ -676,7 +676,7 @@ fn run_uv_install(name: &'static str, language: Language, package: &str, version
     log_file::log(&format!(
         "lsp[{name}] installing {spec} via uv into {tool_dir:?}"
     ));
-    set_status(format!("Installing {name} (uv)…"));
+    set_status(format!("Installing {name} (uv)"));
     // `--force` so a half-finished previous attempt is overwritten cleanly.
     let output = Command::new(&uv)
         .arg("tool")
@@ -796,7 +796,7 @@ fn bootstrap_uv() -> Option<PathBuf> {
     log_file::log(&format!(
         "lsp[uv] bootstrapping uv via official installer into {dir:?}"
     ));
-    set_status("Installing uv…");
+    set_status("Installing uv");
     // `UV_INSTALL_DIR` puts uv in croft's dir; `INSTALLER_NO_MODIFY_PATH` keeps
     // the script from editing the user's shell profiles. If the env vars are
     // ignored by some installer version, uv lands in `~/.local/bin`, which

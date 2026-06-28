@@ -1,9 +1,9 @@
-//! The Source Control branch picker: a VS Code-style "Checkout to…" quick
+//! The Source Control branch picker: a VS Code-style "Checkout to" quick
 //! pick. The user types to filter the repo's branches, arrow-keys to move,
 //! and Enter checks out the highlighted branch — or, when the typed name
 //! matches no existing branch, creates it. Opened by clicking the branch
 //! name in the SOURCE CONTROL header or the commit dropdown's
-//! "Checkout / Create Branch…" item.
+//! "Checkout / Create Branch" item.
 //!
 //! Like [`crate::widgets::zoxide_jump`], this widget is deliberately pure:
 //! it owns the query text and selection but never shells out to git. The

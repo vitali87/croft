@@ -431,7 +431,7 @@ pub struct DependenciesPanel {
     /// Section header, set from the detected ecosystems via [`Self::set_header`].
     header: String,
     /// `true` once a fetch (even an empty one) has landed, so the panel shows
-    /// the empty state instead of spinning on "Loading…".
+    /// the empty state instead of spinning on "Loading".
     loaded: bool,
     scroll: usize,
     pub focus_gradient: bool,
@@ -474,7 +474,7 @@ impl DependenciesPanel {
     }
 
     /// Set the section header for the current root's detected ecosystem(s).
-    /// A change clears the loaded flag so the panel shows "Loading…" until the
+    /// A change clears the loaded flag so the panel shows "Loading" until the
     /// new root's fetch lands instead of flashing the old root's dependencies.
     pub fn set_header(&mut self, header: String) {
         if header != self.header {

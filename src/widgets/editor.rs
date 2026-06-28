@@ -928,13 +928,9 @@ fn render_unified_deletion(
 
 fn write_cell(buf: &mut Buffer, x: u16, y: u16, w: u16, text: &str, style: Style) {
     let max_chars = w as usize;
-    let mut content: String = text.chars().take(max_chars).collect();
-    if text.chars().count() > max_chars && max_chars >= 1 {
-        // Replace the last visible char with an ellipsis to make
-        // truncation visually obvious.
-        content.pop();
-        content.push('…');
-    }
+    // Overflow is cut plainly with no trailing ellipsis marker (the user wants
+    // no ellipsis anywhere in croft).
+    let content: String = text.chars().take(max_chars).collect();
     let mut padded = content;
     let pad_count = max_chars.saturating_sub(padded.chars().count());
     for _ in 0..pad_count {

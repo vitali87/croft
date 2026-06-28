@@ -72,4 +72,8 @@ pub const RELEASE_NOTES: &[ReleaseNote] = &[
         kind: NoteKind::Fix,
         summary: "The layout toolbar icons (VS Code's layout-sidebar-left / layout-panel / layout codicons) render as crisp inline images sized to half an activity-bar icon, painted in front of the container's top line, with a hover highlight; the side-bar / panel icons swap filled/hollow with their visibility.",
     },
+    ReleaseNote {
+        kind: NoteKind::Fix,
+        summary: "Removed every trailing ellipsis across the UI: menu entries, tooltips, progress / status messages, and text truncation no longer append \"...\" anywhere.",
+    },
 ];

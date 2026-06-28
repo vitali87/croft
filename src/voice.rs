@@ -86,7 +86,7 @@ pub enum VoiceMsg {
 }
 
 /// True while a recognition session is live; drives the mic key's armed glow
-/// and the status-line "Listening…" hint. A process-global flag so the OSK
+/// and the status-line "Listening" hint. A process-global flag so the OSK
 /// render path can read it without app plumbing (one relaxed atomic load).
 static LISTENING: AtomicBool = AtomicBool::new(false);
 

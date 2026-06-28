@@ -520,7 +520,7 @@ fn install_zig_if_missing() -> Result<()> {
         .map(|o| o.status.success())
         .unwrap_or(false)
     {
-        println!("Installing zig via Homebrew...");
+        println!("Installing zig via Homebrew");
         let status = std::process::Command::new("brew")
             .args(["install", "zig"])
             .status()
@@ -546,7 +546,7 @@ fn install_cargo_zigbuild_if_missing() -> Result<()> {
         println!("cargo-zigbuild is already installed.");
         return Ok(());
     }
-    println!("Installing cargo-zigbuild via cargo...");
+    println!("Installing cargo-zigbuild via cargo");
     let status = std::process::Command::new("cargo")
         .args(["install", "cargo-zigbuild", "--locked"])
         .status()
@@ -572,7 +572,7 @@ fn install_rust_target_if_missing(triple: &str) -> Result<()> {
         println!("rustup target {triple} is already installed.");
         return Ok(());
     }
-    println!("Adding rustup target {triple}...");
+    println!("Adding rustup target {triple}");
     let status = std::process::Command::new("rustup")
         .args(["target", "add", triple])
         .status()

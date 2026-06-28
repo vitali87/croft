@@ -168,12 +168,12 @@ pub fn install_only_streaming(
         "Install session for {host_label} (croft {})",
         env!("CARGO_PKG_VERSION")
     ));
-    let _ = log_tx.send(format!("Adopting control socket for {host_label}…"));
+    let _ = log_tx.send(format!("Adopting control socket for {host_label}"));
     let ssh = SshControl::adopt(adopted.clone());
-    let _ = log_tx.send("Hashing local source tree…".to_string());
+    let _ = log_tx.send("Hashing local source tree".to_string());
     let local_stamp = local_source_stamp()?;
     let _ = log_tx.send(format!("Local source stamp: {local_stamp}"));
-    let _ = log_tx.send(format!("Checking installed croft version on {host_label}…"));
+    let _ = log_tx.send(format!("Checking installed croft version on {host_label}"));
     // If a croft is already on the remote, the user gets dropped into it
     // immediately and the (re)install proceeds in the background. The
     // running croft re-execs into the new binary once the stamp advances.
@@ -190,7 +190,7 @@ pub fn install_only_streaming(
         return Ok(adopted);
     }
     // Mark the remote as updating before the local cross-compile so the
-    // running croft shows "Updating…" for the whole build+ship, not just
+    // running croft shows "Updating" for the whole build+ship, not just
     // the final remote activation.
     mark_remote_updating(&ssh);
     // The user may already be inside the remote croft over the interactive
@@ -200,7 +200,7 @@ pub fn install_only_streaming(
     let bulk = crate::remote_bulk::establish(&ssh.host, &ssh.socket_path, |msg| {
         let _ = log_tx.send(msg);
     });
-    let _ = log_tx.send(format!("Installing/updating Croft on {host_label}…"));
+    let _ = log_tx.send(format!("Installing/updating Croft on {host_label}"));
     if let Err(e) = install_remote_croft_streaming(&ssh, &bulk.lane, &local_stamp, &log_tx) {
         clear_remote_updating(&ssh);
         std::mem::forget(ssh);
@@ -360,7 +360,7 @@ fn run_croft_session(
             RemoteStatusClass::ReturnToLocal => return Ok(RemoteOutcome::ReturnToLocal),
             RemoteStatusClass::Exited => return Ok(RemoteOutcome::Exited),
             RemoteStatusClass::NotInstalled if !bootstrapped => {
-                println!("Croft is not installed on {host}; bootstrapping from local source...");
+                println!("Croft is not installed on {host}; bootstrapping from local source");
                 install_remote_croft(&ssh, local_stamp)?;
                 bootstrapped = true;
             }
@@ -432,10 +432,10 @@ fn install_remote_croft_streaming(
             ));
         }
     }
-    let _ = log_tx.send("Syncing source tree to remote…".to_string());
+    let _ = log_tx.send("Syncing source tree to remote".to_string());
     sync_local_source_to_remote_streaming(ssh, lane, log_tx)?;
     let _ = log_tx
-        .send("Running cargo install on remote (first time can take several minutes)…".to_string());
+        .send("Running cargo install on remote (first time can take several minutes)".to_string());
     // The compile session is long-lived; keep it (and its streamed output)
     // off the interactive master when a dedicated lane exists.
     let mut cmd = lane.ssh_command(&ssh.socket_path);
@@ -487,7 +487,7 @@ fn try_local_cross_install_streaming(
     // the resulting silent fallback compiles on the remote box instead.
     let fd_limit = raise_fd_limit();
     let _ = log_tx.send(format!(
-        "Cross-compiling croft locally for {triple} (niced, {jobs} jobs, fd limit {fd_limit})…"
+        "Cross-compiling croft locally for {triple} (niced, {jobs} jobs, fd limit {fd_limit})"
     ));
     let zigbuild = cargo_zigbuild_command(&source, triple, &jobs);
     let status = run_command_streaming(zigbuild, log_tx).context("running cargo zigbuild")?;
@@ -519,7 +519,7 @@ fn try_local_cross_install_streaming(
 
     let dest = format!("{}:.cargo/bin/croft.new", ssh.host);
     let _ = log_tx.send(format!(
-        "Rsyncing binary to {dest} (bulk lane, {} KB/s cap)…",
+        "Rsyncing binary to {dest} (bulk lane, {} KB/s cap)",
         lane.bwlimit_kbps()
     ));
     let rsync = ship_binary_rsync_command(lane, &ssh.socket_path, &binary, &dest);
@@ -575,14 +575,14 @@ pub fn launch_croft_with(
     path: Option<&str>,
     adopted: Option<AdoptedMaster>,
 ) -> Result<RemoteOutcome> {
-    println!("Connecting to {host}...");
+    println!("Connecting to {host}");
     let ssh = match adopted {
         Some(a) => SshControl::adopt(a),
         None => SshControl::start(host)?,
     };
     let local_stamp = local_source_stamp()?;
     if remote_install_needed(&ssh, &local_stamp)? {
-        println!("Installing/updating Croft on {host}...");
+        println!("Installing/updating Croft on {host}");
         install_remote_croft(&ssh, &local_stamp)?;
     }
     let persistent = remote_has_session_supervisor(&ssh);
@@ -1604,7 +1604,7 @@ fn try_local_cross_install(ssh: &SshControl, source_stamp: &str) -> Result<bool>
         .map(|n| (n.get() / 2).max(1))
         .unwrap_or(1)
         .to_string();
-    println!("Cross-compiling croft locally for {triple} (niced, {jobs} jobs)...");
+    println!("Cross-compiling croft locally for {triple} (niced, {jobs} jobs)");
     let status = cargo_zigbuild_command(&source, triple, &jobs)
         .status()
         .context("running cargo zigbuild")?;
@@ -1893,7 +1893,7 @@ fn sync_via_tar(ssh: &SshControl) -> Result<()> {
     Ok(())
 }
 
-/// Quote a path for embedding inside rsync's `-e "ssh -S <path> ..."`
+/// Quote a path for embedding inside rsync's `-e "ssh -S <path> "`
 /// argument. rsync executes the remote-shell string through `/bin/sh -c`,
 /// so any spaces or shell metacharacters in the control-socket path would
 /// break the invocation. The control socket lives under
@@ -2040,7 +2040,7 @@ fn activate_command(source_stamp: &str) -> String {
 }
 
 /// Drop the `updating` marker so a remote-launched croft shows its
-/// "Updating…" indicator for the whole build+ship, not just the final
+/// "Updating" indicator for the whole build+ship, not just the final
 /// remote-side activation. Written before the (long) local cross-compile.
 fn mark_remote_updating(ssh: &SshControl) {
     let _ = ssh
@@ -2051,7 +2051,7 @@ fn mark_remote_updating(ssh: &SshControl) {
 }
 
 /// Clear the marker after a failed install so the indicator resolves to a
-/// brief "update failed" rather than hanging on "Updating…" forever.
+/// brief "update failed" rather than hanging on "Updating" forever.
 fn clear_remote_updating(ssh: &SshControl) {
     let _ = ssh
         .command()
@@ -2456,14 +2456,14 @@ Host !blocked *.internal
         let path = dir.join("install.log");
         let (down_tx, down_rx) = std::sync::mpsc::channel::<String>();
         let tee = spawn_log_tee(path.clone(), down_tx);
-        tee.send(String::from("Cross-compiling croft locally…"))
+        tee.send(String::from("Cross-compiling croft locally"))
             .unwrap();
         tee.send(String::from("Local cross-build skipped (zig missing)"))
             .unwrap();
         let timeout = std::time::Duration::from_secs(2);
         assert_eq!(
             down_rx.recv_timeout(timeout).unwrap(),
-            "Cross-compiling croft locally…",
+            "Cross-compiling croft locally",
             "downstream consumers must still receive every line"
         );
         assert_eq!(
@@ -2480,7 +2480,7 @@ Host !blocked *.internal
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
-        assert!(contents.contains("Cross-compiling croft locally…"));
+        assert!(contents.contains("Cross-compiling croft locally"));
         assert!(
             contents.contains("Local cross-build skipped (zig missing)"),
             "the skip REASON is the whole point of the persistent log"

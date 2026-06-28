@@ -54,7 +54,7 @@ pub enum CommitMenuItem {
 }
 
 impl CommitMenuItem {
-    /// Ordered to mirror VS Code's Source Control "…" menu: the sync trio
+    /// Ordered to mirror VS Code's Source Control "" menu: the sync trio
     /// (push / pull / sync), then branch, then the stash pair, then the
     /// diff views.
     pub const ALL: [CommitMenuItem; 10] = [
@@ -79,7 +79,7 @@ impl CommitMenuItem {
             CommitMenuItem::Push => "Push".to_string(),
             CommitMenuItem::Pull => "Pull".to_string(),
             CommitMenuItem::Sync => "Sync (Pull, Push)".to_string(),
-            CommitMenuItem::CheckoutBranch => "Checkout / Create Branch…".to_string(),
+            CommitMenuItem::CheckoutBranch => "Checkout / Create Branch".to_string(),
             CommitMenuItem::Stash => "Stash".to_string(),
             CommitMenuItem::StashPop => "Pop Stash".to_string(),
             CommitMenuItem::ViewStagedDiff => "View Staged Changes".to_string(),

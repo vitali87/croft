@@ -33,7 +33,7 @@ pub struct TimelinePanel {
     pub path: Option<PathBuf>,
     entries: Vec<FileHistoryEntry>,
     /// `true` once a fetch (even an empty one) has landed for `path`, so the
-    /// panel can show "No history" instead of spinning on "Loading…".
+    /// panel can show "No history" instead of spinning on "Loading".
     loaded: bool,
     scroll: usize,
     pub focus_gradient: bool,
@@ -88,7 +88,7 @@ impl TimelinePanel {
     }
 
     /// Mark the panel as loading history for `path` (the active file just
-    /// changed). Shows "Loading…" until the background fetch lands. No-op when
+    /// changed). Shows "Loading" until the background fetch lands. No-op when
     /// already tracking `path`, so it never resets a fetched view.
     pub fn begin_loading(&mut self, path: PathBuf) {
         if self.path.as_ref() != Some(&path) {
@@ -261,7 +261,7 @@ impl Widget for &mut TimelinePanel {
 
         if self.entries.is_empty() {
             let msg = if self.path.is_some() && !self.loaded {
-                "Loading…"
+                "Loading"
             } else if self.path.is_some() {
                 "No history"
             } else {

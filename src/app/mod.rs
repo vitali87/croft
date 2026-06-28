@@ -727,7 +727,7 @@ enum CreateKind {
 }
 
 /// State of a background self-update observed by a remote-launched croft.
-/// `Idle` is the steady state; `InProgress` paints an "Updating…" hint in
+/// `Idle` is the steady state; `InProgress` paints an "Updating" hint in
 /// the status bar; `Ready` arms the re-exec into the freshly-shipped binary.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum UpdateStatus {
@@ -926,7 +926,7 @@ enum MenuAction {
     },
     /// Editor gutter: open the breakpoint-condition editor for 1-based `line`,
     /// creating the breakpoint if absent. VS Code's "Add Conditional
-    /// Breakpoint…" / "Edit Condition…".
+    /// Breakpoint" / "Edit Condition".
     EditBreakpointConditionAt {
         line: usize,
     },
@@ -1576,7 +1576,7 @@ enum PromptKind {
         row: usize,
         col: usize,
     },
-    /// Debugger "Add Conditional Breakpoint…" / "Edit Condition…": edit the
+    /// Debugger "Add Conditional Breakpoint" / "Edit Condition": edit the
     /// boolean condition for the breakpoint on 1-based `line` of `path`. The
     /// buffer is pre-filled with any existing condition; on commit the
     /// breakpoint is created (if absent) and the condition attached/cleared,
@@ -1602,7 +1602,7 @@ struct PendingDiscard {
 }
 
 /// Why the branch picker is open, deciding what its Enter does. `Checkout`
-/// is the default (click the branch name / "Checkout to…"); the others are
+/// is the default (click the branch name / "Checkout to"); the others are
 /// reached from the Branch submenu and act on the highlighted *existing*
 /// branch (or, for `CreateFrom`, use it as the base for a new branch).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -3964,10 +3964,10 @@ impl App {
             SidebarView::Explorer => {
                 let t = &self.tree;
                 if rect_contains(t.header_new_file_btn, col, row) {
-                    return Some("New File...");
+                    return Some("New File");
                 }
                 if rect_contains(t.header_new_folder_btn, col, row) {
-                    return Some("New Folder...");
+                    return Some("New Folder");
                 }
                 if rect_contains(t.header_refresh_btn, col, row) {
                     return Some("Refresh Explorer");
@@ -3976,13 +3976,13 @@ impl App {
                     return Some("Collapse Folders in Explorer");
                 }
                 if rect_contains(t.header_views_btn, col, row) {
-                    return Some("Views and More Actions...");
+                    return Some("Views and More Actions");
                 }
             }
             SidebarView::Remote => {
                 let r = &self.remote;
                 if rect_contains(r.header_add_btn, col, row) {
-                    return Some("Open SSH Configuration File...");
+                    return Some("Open SSH Configuration File");
                 }
                 if rect_contains(r.header_refresh_btn, col, row) {
                     return Some("Refresh");
@@ -5776,7 +5776,7 @@ impl App {
         let (tab_size, insert_spaces) = self.editor.indent_preference();
         let id = lsp.request_formatting(path, tab_size, insert_spaces);
         self.format_request_id = Some(id);
-        self.status = String::from("Formatting document...");
+        self.status = String::from("Formatting document");
     }
 
     pub fn drain_lsp_format(&mut self) -> bool {
@@ -5844,7 +5844,7 @@ impl App {
         let id = lsp.request_code_action(path, row, col, row, col, diagnostics);
         self.code_action_request_id = Some(id);
         self.code_action_pending_resolve = false;
-        self.status = String::from("Finding quick fixes...");
+        self.status = String::from("Finding quick fixes");
     }
 
     pub fn drain_lsp_code_actions(&mut self) -> bool {
@@ -5976,7 +5976,7 @@ impl App {
         let id = lsp.request_code_action_resolve(path, item.server, action);
         self.code_action_request_id = Some(id);
         self.code_action_pending_resolve = true;
-        self.status = String::from("Resolving quick fix...");
+        self.status = String::from("Resolving quick fix");
     }
 
     /// Route the key through the completion popup when one is open.
@@ -7631,7 +7631,7 @@ impl App {
         if let Some(progress) = self.lsp_progress_status() {
             // A busy language server (rust-analyzer priming its crate graph,
             // etc.) is otherwise invisible: hover/completion just return empty
-            // until it finishes. Surfacing "rust-analyzer: Indexing …" tells
+            // until it finishes. Surfacing "rust-analyzer: Indexing " tells
             // the user to wait rather than assume the server is dead.
             spans.push(Span::styled(
                 format!(" ⟳ {progress} "),
@@ -7644,7 +7644,7 @@ impl App {
             // An in-flight extension command (install + tool call on a worker
             // thread) is otherwise invisible; an animated badge says it's working.
             spans.push(Span::styled(
-                format!(" {} {label}… ", self.mcp_spinner_glyph()),
+                format!(" {} {label} ", self.mcp_spinner_glyph()),
                 Style::default()
                     .fg(Color::Rgb(0x2d, 0xd4, 0xbf))
                     .add_modifier(Modifier::BOLD),
@@ -10250,7 +10250,7 @@ impl App {
         match self.dap_session.as_mut() {
             Some(session) => {
                 session.pause();
-                self.status = String::from("Pausing…");
+                self.status = String::from("Pausing");
             }
             None => self.status = String::from("No debug session to pause"),
         }
@@ -11530,7 +11530,7 @@ impl App {
                 host.clone(),
                 path,
             ));
-            self.status = format!("Preparing remote croft on {host}…");
+            self.status = format!("Preparing remote croft on {host}");
         }
         true
     }
@@ -11578,7 +11578,7 @@ impl App {
                     path,
                     adopted: Some(adopted),
                 });
-                self.status = format!("Launching croft on {host}…");
+                self.status = format!("Launching croft on {host}");
                 self.connect_dialog = None;
                 self.quit = true;
             }
@@ -11602,7 +11602,7 @@ impl App {
                     path,
                     adopted: Some(adopted),
                 });
-                self.status = format!("Launching croft on {host}…");
+                self.status = format!("Launching croft on {host}");
                 self.connect_dialog = None;
                 self.quit = true;
             }
@@ -11820,7 +11820,7 @@ impl App {
                 }
                 let payload = dialog.input_for_submit();
                 dialog.submitted = true;
-                dialog.status_line = format!("Verifying credentials with {}…", dialog.host);
+                dialog.status_line = format!("Verifying credentials with {}", dialog.host);
                 dialog.clear_input();
                 if let Some(auth) = self.connect_auth.as_mut() {
                     auth.respond_password(&payload);
@@ -11853,7 +11853,7 @@ impl App {
             let payload = dialog.input_for_submit();
             dialog.submitted = true;
             dialog.status_line = format!(
-                "Sending {} chars to {}…",
+                "Sending {} chars to {}",
                 payload.chars().count(),
                 dialog.host
             );
@@ -11896,7 +11896,7 @@ impl App {
         if self.drop_relay_active() {
             if self.trust_local_browser {
                 self.request_remote_url_open(url.to_string());
-                self.status = String::from("Opening ssh_config(5) on your local Mac…");
+                self.status = String::from("Opening ssh_config(5) on your local Mac");
             } else {
                 self.pending_local_open = Some(url.to_string());
             }
@@ -13813,7 +13813,7 @@ impl App {
             });
         }
         self.status = format!(
-            "Queued {} item(s) for scp copy to {} (you'll see scp's prompts next)…",
+            "Queued {} item(s) for scp copy to {} (you'll see scp's prompts next)",
             paths.len(),
             target.alias,
         );
@@ -13924,7 +13924,7 @@ impl App {
         match append_to_relay_log(&log_path, &lines) {
             Ok(()) => {
                 self.status = format!(
-                    "Fetching {} item(s) from your local Mac via croft relay…",
+                    "Fetching {} item(s) from your local Mac via croft relay",
                     staged.len(),
                 );
                 self.pending_remote_pulls.extend(staged);
@@ -13962,7 +13962,7 @@ impl App {
                     started_at: std::time::Instant::now(),
                     kind: RemotePullKind::Clipboard,
                 });
-                self.status = String::from("Cmd+V: fetching local Mac clipboard via croft relay…");
+                self.status = String::from("Cmd+V: fetching local Mac clipboard via croft relay");
             }
             Err(e) => {
                 self.status = format!("Cmd+V: relay write failed: {e}");
@@ -14141,13 +14141,13 @@ impl App {
             KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
                 self.pending_local_open = None;
                 self.request_remote_url_open(url.clone());
-                self.status = format!("Opening {url} on your local Mac…");
+                self.status = format!("Opening {url} on your local Mac");
             }
             KeyCode::Char('a') | KeyCode::Char('A') => {
                 self.pending_local_open = None;
                 self.trust_local_browser = true;
                 self.request_remote_url_open(url.clone());
-                self.status = format!("Trusted local browser for this session. Opening {url}…");
+                self.status = format!("Trusted local browser for this session. Opening {url}");
             }
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                 self.pending_local_open = None;
@@ -14730,7 +14730,7 @@ impl App {
         self.mcp_rx = Some(rx);
         // On first use the server isn't provisioned yet; the worker installs it
         // (block-and-wait) before running, which can take a moment. Say so, so
-        // the user sees install progress rather than a silent "Running…".
+        // the user sees install progress rather than a silent "Running".
         let installing = resolved.server.provision.as_ref().is_some_and(|p| {
             crate::lsp::install::provisioned_command(&resolved.server.id, p).is_none()
         });
@@ -14745,7 +14745,7 @@ impl App {
         // Drive the status-bar spinner badge while the worker runs.
         self.mcp_started = Some(std::time::Instant::now());
         self.mcp_busy_label = Some(label.clone());
-        self.status = format!("{label}…");
+        self.status = label.clone();
         let cwd = self.workspace_root.clone();
         let version = env!("CARGO_PKG_VERSION").to_string();
         let _ = std::thread::Builder::new()
@@ -15845,12 +15845,12 @@ impl App {
             crate::voice::Availability::Ready => {
                 self.voice_handle = Some(crate::voice::start(self.voice_tx.clone()));
                 self.voice_canceling = false;
-                self.status = String::from("Listening… speak, then pause to insert");
+                self.status = String::from("Listening, speak then pause to insert");
             }
             crate::voice::Availability::NeedsApi => {
                 crate::voice::ensure_api_installed_in_background();
                 self.status = String::from(
-                    "Installing Termux:API for voice input… tap the mic again once it finishes",
+                    "Installing Termux:API for voice input, tap the mic again once it finishes",
                 );
             }
             crate::voice::Availability::NeedsTermux => {
@@ -16419,7 +16419,7 @@ impl App {
                     ));
                     if self.editor_language_supports_code_action() {
                         items.push((
-                            String::from("Quick Fix..."),
+                            String::from("Quick Fix"),
                             MenuAction::QuickFixAt { row, col },
                         ));
                     }
@@ -16677,7 +16677,7 @@ impl App {
                         self.search.toggle_replace();
                         return;
                     }
-                    // "..." ellipsis expands/collapses files-to-include/exclude.
+                    // "" ellipsis expands/collapses files-to-include/exclude.
                     if self.search.ellipsis_at(m.column, m.row) {
                         self.search.toggle_details();
                         return;
@@ -17432,7 +17432,7 @@ impl App {
     fn menu_rect(&self) -> Option<Rect> {
         let menu = self.context_menu.as_ref()?;
         // Use char count (not byte len) so multi-byte glyphs in menu
-        // labels (e.g. the "…" in "Rename", the arrow in "Compare with
+        // labels (e.g. the "" in "Rename", the arrow in "Compare with
         // Selected") don't inflate the menu width past what's needed.
         // Width must also fit the shortcut hint on the right side, with
         // at least 2 cells of gap between label and shortcut.
@@ -18994,7 +18994,7 @@ impl App {
                 let id = lsp.request_rename(path, row as u32, col as u32, new_name);
                 self.rename_request_id = Some(id);
                 self.prompt = None;
-                self.status = String::from("Renaming symbol...");
+                self.status = String::from("Renaming symbol");
             }
             PromptKind::BreakpointCondition { path, line } => {
                 let expr = prompt.buffer.clone();
@@ -20722,21 +20722,14 @@ fn normalise_dropped_token(raw: &str) -> Option<PathBuf> {
 }
 
 /// Cap a string at `max` characters by inserting an ellipsis in the
-/// middle so the start (scheme/host) and end (path tail) both stay
-/// visible. `max <= 8` returns the original; below that the ellipsis
-/// alone wouldn't help.
+/// end so the start (scheme/host) stays visible. No ellipsis marker anywhere in
+/// croft, so overflow is cut plainly from the right rather than elided in the
+/// middle. `max <= 8` returns the original.
 fn truncate_for_display(s: &str, max: usize) -> String {
     if s.chars().count() <= max || max <= 8 {
         return s.to_string();
     }
-    let head = max / 2 - 1;
-    let tail = max - head - 1;
-    let mut out = String::new();
-    let chars: Vec<char> = s.chars().collect();
-    out.extend(chars.iter().take(head));
-    out.push('…');
-    out.extend(chars.iter().skip(chars.len() - tail));
-    out
+    s.chars().take(max).collect()
 }
 
 fn append_to_relay_log(log_path: &Path, payload: &str) -> std::io::Result<()> {
@@ -21731,7 +21724,7 @@ fn run_pending_scp_uploads(app: &mut App, terminal: &mut CroftTerminal) -> Resul
             out,
             "── done: {moved}/{total} uploaded, {error_count} error(s) ──"
         );
-        let _ = write!(out, "Press Enter to return to croft… ");
+        let _ = write!(out, "Press Enter to return to croft ");
         let _ = out.flush();
     }
     let mut line = String::new();

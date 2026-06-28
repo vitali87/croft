@@ -91,11 +91,8 @@ fn summarize_cmd(cmd: &[OsString]) -> String {
         .collect::<Vec<_>>()
         .join(" ");
     if joined.chars().count() > CMD_SUMMARY_MAX {
-        let kept: String = joined
-            .chars()
-            .take(CMD_SUMMARY_MAX.saturating_sub(1))
-            .collect();
-        format!("{kept}…")
+        // Cut to the cap with no trailing ellipsis marker.
+        joined.chars().take(CMD_SUMMARY_MAX).collect()
     } else {
         joined
     }
@@ -140,12 +137,14 @@ mod tests {
     }
 
     #[test]
-    fn summarize_truncates_overlong_argv_with_ellipsis() {
+    fn summarize_truncates_overlong_argv_plainly() {
         let long = "x".repeat(200);
         let cmd = vec![OsString::from(long)];
         let out = summarize_cmd(&cmd);
+        // Cut to the cap with no trailing ellipsis marker.
         assert!(out.chars().count() <= CMD_SUMMARY_MAX);
-        assert!(out.ends_with('…'));
+        assert!(!out.contains('…'));
+        assert!(out.chars().all(|c| c == 'x'));
     }
 
     #[test]

@@ -113,7 +113,7 @@ impl OutlinePanel {
     /// tree, before any language-server reply (tree-sitter-first, the way Zed
     /// and aerial.nvim source their outlines). `lsp_pending` is `true` when a
     /// server tracks this file and will refine the outline shortly; if so and
-    /// the syntax pass found nothing, the panel keeps showing "Loading…"
+    /// the syntax pass found nothing, the panel keeps showing "Loading"
     /// instead of a premature "No symbols". When no server will reply, an empty
     /// pass settles to "No symbols" exactly as before.
     pub fn set_syntax_symbols(
@@ -159,7 +159,7 @@ impl OutlinePanel {
     }
 
     /// Whether a reply (even an empty one) has been applied for the current
-    /// file, so the panel can show "No symbols" instead of "Loading…".
+    /// file, so the panel can show "No symbols" instead of "Loading".
     pub fn loaded(&self) -> bool {
         self.loaded
     }
@@ -350,13 +350,13 @@ impl Widget for &mut OutlinePanel {
         self.first_row_y = body_y;
         self.viewport_rows = body_h;
 
-        // Empty / loading message in place of rows. "Loading…" is only honest
+        // Empty / loading message in place of rows. "Loading" is only honest
         // while an active file is still awaiting its first symbols; with no
         // file open (welcome screen) there is nothing to load, so show
         // "No symbols" instead of spinning forever.
         if self.symbols.is_empty() {
             let msg = if self.path.is_some() && !self.loaded {
-                "Loading…"
+                "Loading"
             } else {
                 "No symbols"
             };
@@ -631,7 +631,7 @@ mod tests {
     #[test]
     fn no_open_file_shows_no_symbols_not_loading() {
         // On the welcome screen (no active editor) there is nothing to load, so
-        // the expanded panel must read "No symbols", never spin on "Loading…".
+        // the expanded panel must read "No symbols", never spin on "Loading".
         let mut p = OutlinePanel::new();
         p.toggle_collapse();
         let text = rendered_text(&mut p, 24, 6);
@@ -642,7 +642,7 @@ mod tests {
     #[test]
     fn loading_shows_only_while_an_active_file_awaits_symbols() {
         // A served file whose symbols have not arrived yet is the one case that
-        // legitimately reads "Loading…".
+        // legitimately reads "Loading".
         let mut p = OutlinePanel::new();
         p.set_syntax_symbols("a.rs".into(), vec![], true);
         p.toggle_collapse();

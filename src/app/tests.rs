@@ -414,14 +414,14 @@ fn sidebar_header_actions_are_tooltipped_per_view() {
     app.tree.header_refresh_btn = cell(26);
     app.tree.header_collapse_btn = cell(29);
     app.tree.header_views_btn = cell(32);
-    assert_eq!(app.ui_tooltip_at(20, 1), Some("New File..."));
-    assert_eq!(app.ui_tooltip_at(23, 1), Some("New Folder..."));
+    assert_eq!(app.ui_tooltip_at(20, 1), Some("New File"));
+    assert_eq!(app.ui_tooltip_at(23, 1), Some("New Folder"));
     assert_eq!(app.ui_tooltip_at(26, 1), Some("Refresh Explorer"));
     assert_eq!(
         app.ui_tooltip_at(29, 1),
         Some("Collapse Folders in Explorer")
     );
-    assert_eq!(app.ui_tooltip_at(32, 1), Some("Views and More Actions..."));
+    assert_eq!(app.ui_tooltip_at(32, 1), Some("Views and More Actions"));
 
     // Remote Explorer header (the + / refresh in Image #2/#3).
     app.sidebar_view = SidebarView::Remote;
@@ -429,7 +429,7 @@ fn sidebar_header_actions_are_tooltipped_per_view() {
     app.remote.header_refresh_btn = cell(23);
     assert_eq!(
         app.ui_tooltip_at(20, 1),
-        Some("Open SSH Configuration File...")
+        Some("Open SSH Configuration File")
     );
     assert_eq!(app.ui_tooltip_at(23, 1), Some("Refresh"));
 
@@ -441,7 +441,7 @@ fn sidebar_header_actions_are_tooltipped_per_view() {
     // A view's stored rects go inert once another view is showing, so the
     // Remote add button at col 20 must not leak its hint into Explorer.
     app.sidebar_view = SidebarView::Explorer;
-    assert_eq!(app.ui_tooltip_at(23, 1), Some("New Folder..."));
+    assert_eq!(app.ui_tooltip_at(23, 1), Some("New Folder"));
 }
 
 fn dummy_activity_images() -> ActivityBarImages {
@@ -821,7 +821,7 @@ fn right_click_on_the_gutter_opens_the_breakpoint_menu_and_toggles_the_clicked_l
     );
 }
 
-/// "Add Conditional Breakpoint…" must open a visible popup (the centered
+/// "Add Conditional Breakpoint" must open a visible popup (the centered
 /// `Prompt` overlay), NOT capture keystrokes on the bottom status line. The
 /// status line is reserved for read-only info.
 #[test]
@@ -5029,7 +5029,7 @@ fn tree_context_menu_on_a_deeply_nested_folder_creates_inside_that_folder() {
     // Regression for the user-reported "right-click on nested
     // folders only shows Cut/Copy/Rename/Delete; I cannot create a
     // new file or folder inside the folder I clicked". The menu
-    // must surface New File… / New Folder…, and the resolved
+    // must surface New File / New Folder, and the resolved
     // target_dir must be the right-clicked folder itself so the
     // create lands inside it (not at the workspace root).
     let tmp = tempfile::tempdir().unwrap();
@@ -5052,11 +5052,11 @@ fn tree_context_menu_on_a_deeply_nested_folder_creates_inside_that_folder() {
     let labels: Vec<&str> = items.iter().map(|(s, _)| s.as_str()).collect();
     assert!(
         labels.contains(&"New File"),
-        "nested-folder right-click must offer New File…; labels = {labels:?}",
+        "nested-folder right-click must offer New File; labels = {labels:?}",
     );
     assert!(
         labels.contains(&"New Folder"),
-        "nested-folder right-click must offer New Folder…; labels = {labels:?}",
+        "nested-folder right-click must offer New Folder; labels = {labels:?}",
     );
 }
 
@@ -5500,7 +5500,7 @@ fn menu_item_at_handles_clipped_menu_so_clicks_dispatch_the_visible_row() {
         None,
     );
     // Sanity: items[5] is "Select for Compare" after the New
-    // File… / New Folder… prefix lifted everything down by two.
+    // File… / New Folder prefix lifted everything down by two.
     assert!(matches!(&items[5].1, MenuAction::SelectForCompare(_)));
     app.context_menu = Some(ContextMenu::flat((10, 6), items, target));
     // The visible "Select for Compare" row sits at clipped.y + 1
@@ -12244,7 +12244,7 @@ fn outline_symbols_apply_only_for_the_active_file() {
 fn sync_outline_settles_empty_for_a_file_without_a_language_server() {
     // A plain text file has no language server, so no documentSymbol reply will
     // ever arrive. sync_outline must settle the panel to a loaded, empty state
-    // (rendering "No symbols") rather than leaving it spinning on "Loading…".
+    // (rendering "No symbols") rather than leaving it spinning on "Loading".
     let tmp = tempfile::tempdir().unwrap();
     let mut app = app_with_open_file(tmp.path(), "notes.txt", "hello\nworld\n");
     let active = app.editor.path.clone().unwrap();
@@ -12253,7 +12253,7 @@ fn sync_outline_settles_empty_for_a_file_without_a_language_server() {
     assert!(app.outline.is_empty(), "no symbols for a non-served file");
     assert!(
         app.outline.loaded(),
-        "outline must be marked loaded so it shows 'No symbols', not 'Loading…'"
+        "outline must be marked loaded so it shows 'No symbols', not 'Loading'"
     );
 }
 
@@ -12261,7 +12261,7 @@ fn sync_outline_settles_empty_for_a_file_without_a_language_server() {
 fn sync_outline_populates_from_tree_sitter_without_a_language_server() {
     // Even with no LSP attached, opening a source file must fill the OUTLINE
     // instantly from the buffer's own syntax tree (tree-sitter-first), so the
-    // panel never spins on "Loading…" waiting for a cold server.
+    // panel never spins on "Loading" waiting for a cold server.
     let tmp = tempfile::tempdir().unwrap();
     let mut app = app_with_open_file(
         tmp.path(),

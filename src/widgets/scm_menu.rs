@@ -138,7 +138,7 @@ const CHANGES_ITEMS: &[Leaf] = &[
 const PULL_PUSH_ITEMS: &[Leaf] = &[
     leaf(ScmAction::Sync, "Sync", ICON_SYNC),
     leaf(ScmAction::PullRebase, "Pull (Rebase)", ICON_CLOUD_DOWNLOAD),
-    leaf(ScmAction::PushTo, "Push to…", ICON_ARROW_UP),
+    leaf(ScmAction::PushTo, "Push to", ICON_ARROW_UP),
     leaf(ScmAction::PushForce, "Push (Force)", ICON_ARROW_UP),
     leaf(
         ScmAction::PublishBranch,
@@ -148,21 +148,21 @@ const PULL_PUSH_ITEMS: &[Leaf] = &[
 ];
 
 const BRANCH_ITEMS: &[Leaf] = &[
-    leaf(ScmAction::CreateBranch, "Create Branch…", ICON_GIT_BRANCH),
+    leaf(ScmAction::CreateBranch, "Create Branch", ICON_GIT_BRANCH),
     leaf(
         ScmAction::CreateBranchFrom,
-        "Create Branch from…",
+        "Create Branch from",
         ICON_NEW_FOLDER,
     ),
-    leaf(ScmAction::RenameBranch, "Rename Branch…", ICON_EDIT),
-    leaf(ScmAction::DeleteBranch, "Delete Branch…", ICON_TRASH),
-    leaf(ScmAction::Merge, "Merge…", ICON_GIT_MERGE),
-    leaf(ScmAction::Rebase, "Rebase…", ICON_GIT_PR),
+    leaf(ScmAction::RenameBranch, "Rename Branch", ICON_EDIT),
+    leaf(ScmAction::DeleteBranch, "Delete Branch", ICON_TRASH),
+    leaf(ScmAction::Merge, "Merge", ICON_GIT_MERGE),
+    leaf(ScmAction::Rebase, "Rebase", ICON_GIT_PR),
 ];
 
 const REMOTE_ITEMS: &[Leaf] = &[
-    leaf(ScmAction::AddRemote, "Add Remote…", ICON_ADD),
-    leaf(ScmAction::RemoveRemote, "Remove Remote…", ICON_TRASH),
+    leaf(ScmAction::AddRemote, "Add Remote", ICON_ADD),
+    leaf(ScmAction::RemoveRemote, "Remove Remote", ICON_TRASH),
 ];
 
 const STASH_ITEMS: &[Leaf] = &[
@@ -173,15 +173,15 @@ const STASH_ITEMS: &[Leaf] = &[
         ICON_ARCHIVE,
     ),
     leaf(ScmAction::StashStaged, "Stash Staged", ICON_ARCHIVE),
-    leaf(ScmAction::ApplyStash, "Apply Stash…", ICON_ARCHIVE),
+    leaf(ScmAction::ApplyStash, "Apply Stash", ICON_ARCHIVE),
     leaf(ScmAction::PopStashLatest, "Pop Latest Stash", ICON_ARCHIVE),
-    leaf(ScmAction::PopStashPick, "Pop Stash…", ICON_ARCHIVE),
-    leaf(ScmAction::DropStash, "Drop Stash…", ICON_TRASH),
+    leaf(ScmAction::PopStashPick, "Pop Stash", ICON_ARCHIVE),
+    leaf(ScmAction::DropStash, "Drop Stash", ICON_TRASH),
 ];
 
 const TAGS_ITEMS: &[Leaf] = &[
-    leaf(ScmAction::CreateTag, "Create Tag…", ICON_TAG),
-    leaf(ScmAction::DeleteTag, "Delete Tag…", ICON_TRASH),
+    leaf(ScmAction::CreateTag, "Create Tag", ICON_TAG),
+    leaf(ScmAction::DeleteTag, "Delete Tag", ICON_TRASH),
 ];
 
 /// The full top-level menu, mirroring VS Code's SCM "⋯" menu order.
@@ -189,8 +189,8 @@ pub fn menu() -> Vec<Node> {
     vec![
         Node::Item(leaf(ScmAction::Pull, "Pull", ICON_CLOUD_DOWNLOAD)),
         Node::Item(leaf(ScmAction::Push, "Push", ICON_CLOUD_UPLOAD)),
-        Node::Item(leaf(ScmAction::Clone, "Clone…", ICON_REPO_CLONE)),
-        Node::Item(leaf(ScmAction::CheckoutTo, "Checkout to…", ICON_GIT_BRANCH)),
+        Node::Item(leaf(ScmAction::Clone, "Clone", ICON_REPO_CLONE)),
+        Node::Item(leaf(ScmAction::CheckoutTo, "Checkout to", ICON_GIT_BRANCH)),
         Node::Item(leaf(ScmAction::Fetch, "Fetch", ICON_GIT_FETCH)),
         Node::Sep,
         Node::Sub {
