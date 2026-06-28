@@ -17,6 +17,18 @@ pub const RUN_DEBUG_SRC_SVG: &[u8] = include_bytes!("../assets/icons/debug-alt.s
 pub const EXTENSIONS_SRC_SVG: &[u8] = include_bytes!("../assets/icons/extensions.svg");
 /// Codicon `gear`, the bottom-anchored "Manage" button (Color Theme picker).
 pub const SETTINGS_GEAR_SRC_SVG: &[u8] = include_bytes!("../assets/icons/settings_gear.svg");
+/// VS Code's title-bar layout codicons for the Customize Layout toolbar.
+/// `layout-sidebar-left` / `-off` toggle the primary side bar (filled vs.
+/// hollow left pane), `layout-panel` / `-off` toggle the bottom panel, and
+/// `layout` is the Customize Layout grid. Rasterised at the toolbar cell box so
+/// they render twice the size of a font glyph and match the activity bar.
+pub const LAYOUT_SIDEBAR_ON_SRC_SVG: &[u8] =
+    include_bytes!("../assets/icons/layout-sidebar-left.svg");
+pub const LAYOUT_SIDEBAR_OFF_SRC_SVG: &[u8] =
+    include_bytes!("../assets/icons/layout-sidebar-left-off.svg");
+pub const LAYOUT_PANEL_ON_SRC_SVG: &[u8] = include_bytes!("../assets/icons/layout-panel.svg");
+pub const LAYOUT_PANEL_OFF_SRC_SVG: &[u8] = include_bytes!("../assets/icons/layout-panel-off.svg");
+pub const LAYOUT_CUSTOMIZE_SRC_SVG: &[u8] = include_bytes!("../assets/icons/layout.svg");
 /// 192x192 white-on-transparent rasterisation of `assets/icons/debug-alt.svg`.
 /// Still drives the Run and Debug panel's headline illustration (composed via
 /// the PNG path); the activity-bar icon now rasterises the SVG directly.
@@ -781,6 +793,12 @@ pub const KITTY_ID_WELCOME: u32 = KITTY_ID_BASE + 11;
 pub const KITTY_ID_EDITOR_BASE: u32 = KITTY_ID_BASE + 12;
 /// Extensions activity-bar icon, past the editor pair to avoid collision.
 pub const KITTY_ID_EXTENSIONS: u32 = KITTY_ID_BASE + 14;
+/// Customize Layout toolbar icons (top-right of the editor / welcome). One
+/// stable placement id each; the side-bar / panel ids swap their on/off image
+/// in place, exactly like an activity icon swaps active/inactive.
+pub const KITTY_ID_LAYOUT_SIDEBAR: u32 = KITTY_ID_BASE + 15;
+pub const KITTY_ID_LAYOUT_PANEL: u32 = KITTY_ID_BASE + 16;
+pub const KITTY_ID_LAYOUT_CUSTOMIZE: u32 = KITTY_ID_BASE + 17;
 
 /// Apply tmux DCS passthrough wrapping to an inline-image escape when needed.
 /// Sixel passes through tmux natively (tmux built with sixel support renders it

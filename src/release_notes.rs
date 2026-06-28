@@ -70,6 +70,6 @@ pub const RELEASE_NOTES: &[ReleaseNote] = &[
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "The layout toolbar now uses VS Code's actual codicons (layout-sidebar-left / layout-panel / layout) instead of plain geometric glyphs, so the icons match VS Code and reflect on/off state.",
+        summary: "The layout toolbar icons now render as crisp 2x inline images (VS Code's layout-sidebar-left / layout-panel / layout codicons), twice the size of the old font glyphs and matching the activity bar; the side-bar / panel icons swap filled/hollow with their visibility.",
     },
 ];

@@ -170,6 +170,14 @@ const FALLBACK_CELL_PIXEL: (u32, u32) = (10, 20);
 /// on the edge opposite the primary side bar. VS Code's auxiliary bar.
 const SECONDARY_SIDEBAR_WIDTH: u16 = 30;
 
+/// Cell box for each Customize Layout toolbar icon. 2 cells wide × 1 tall —
+/// with the usual ~1:2 cell aspect this is a ~square ≈20×20px image, roughly
+/// twice the size of a 1-cell font glyph, while staying within the single tab-
+/// strip row (no overlap with editor content). Icons are spaced one column
+/// apart, so the trio is `LAYOUT_ICON_CELLS_W*3 + 2` cells wide.
+const LAYOUT_ICON_CELLS_W: u16 = 2;
+const LAYOUT_ICON_CELLS_H: u16 = 1;
+
 /// Which edge the primary side bar (and the activity bar that flanks it) dock
 /// to. VS Code's "Primary Side Bar Position". Persisted via `crate::prefs`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, serde::Serialize, serde::Deserialize)]
@@ -610,6 +618,15 @@ pub struct ActivityBarImages {
     settings_active: String,
     settings_inactive: String,
     settings_hovered: String,
+    /// Customize Layout toolbar icons (top-right of the editor / welcome),
+    /// baked at the 2×1-cell toolbar box on a transparent canvas so they
+    /// composite over the tab strip. The side-bar / panel icons carry an
+    /// on/off pair (filled vs. hollow), matching their current visibility.
+    layout_sidebar_on: String,
+    layout_sidebar_off: String,
+    layout_panel_on: String,
+    layout_panel_off: String,
+    layout_customize: String,
 }
 
 /// Single source of truth for the application's user-facing name.
@@ -2712,6 +2729,45 @@ impl App {
                 encode(src, ki::IconState::Hovered, off_y_bias, id)?,
             ))
         };
+        // Customize Layout toolbar icons: baked at the 2×1-cell box on a
+        // TRANSPARENT canvas (alpha 0) so the codicon floats over the tab-strip
+        // cells without painting a background rectangle, and tinted the muted
+        // grey resting colour like VS Code's title-bar icons (Inactive state =
+        // no selection pill). One image per icon; the side-bar / panel ids swap
+        // their on/off image in place.
+        let layout_canvas_w = cell_w * LAYOUT_ICON_CELLS_W as u32;
+        let layout_canvas_h = cell_h * LAYOUT_ICON_CELLS_H as u32;
+        let transparent = image::Rgba([0, 0, 0, 0]);
+        let bake_layout = |src_svg: &[u8], id: u32| -> Option<String> {
+            let baked = crate::iterm2_inline::compose_icon_svg(
+                src_svg,
+                layout_canvas_w,
+                layout_canvas_h,
+                ki::IconState::Inactive,
+                transparent,
+                0,
+            )?;
+            let raw = crate::iterm2_inline::build_inline_image(
+                protocol,
+                &baked,
+                LAYOUT_ICON_CELLS_W,
+                LAYOUT_ICON_CELLS_H,
+                false,
+                id,
+            )?;
+            Some(crate::iterm2_inline::maybe_tmux_wrap(
+                protocol, is_tmux, raw,
+            ))
+        };
+        let layout_imgs = (|| {
+            Some((
+                bake_layout(ki::LAYOUT_SIDEBAR_ON_SRC_SVG, ki::KITTY_ID_LAYOUT_SIDEBAR)?,
+                bake_layout(ki::LAYOUT_SIDEBAR_OFF_SRC_SVG, ki::KITTY_ID_LAYOUT_SIDEBAR)?,
+                bake_layout(ki::LAYOUT_PANEL_ON_SRC_SVG, ki::KITTY_ID_LAYOUT_PANEL)?,
+                bake_layout(ki::LAYOUT_PANEL_OFF_SRC_SVG, ki::KITTY_ID_LAYOUT_PANEL)?,
+                bake_layout(ki::LAYOUT_CUSTOMIZE_SRC_SVG, ki::KITTY_ID_LAYOUT_CUSTOMIZE)?,
+            ))
+        })();
         if let (
             Some((ea, ei, eh)),
             Some((sa, si, sh)),
@@ -2720,6 +2776,7 @@ impl App {
             Some((rda, rdi, rdh)),
             Some((exta, exti, exth)),
             Some((gea, gei, geh)),
+            Some((lso, lsf, lpo, lpf, lcu)),
         ) = (
             bake(ki::EXPLORER_SRC_SVG, 0, ki::KITTY_ID_EXPLORER),
             bake(ki::SEARCH_SRC_SVG, 0, ki::KITTY_ID_SEARCH),
@@ -2732,6 +2789,7 @@ impl App {
                 gear_off_y_bias,
                 ki::KITTY_ID_SETTINGS,
             ),
+            layout_imgs,
         ) {
             self.overlays.activity.set_images(ActivityBarImages {
                 explorer_active: ea,
@@ -2755,6 +2813,11 @@ impl App {
                 settings_active: gea,
                 settings_inactive: gei,
                 settings_hovered: geh,
+                layout_sidebar_on: lso,
+                layout_sidebar_off: lsf,
+                layout_panel_on: lpo,
+                layout_panel_off: lpf,
+                layout_customize: lcu,
             });
         }
         // Run-and-Debug headline icon: the same debug-alt PNG used in the
@@ -3166,15 +3229,16 @@ impl App {
         let rem_block = self.sidebar_areas.remote_icon;
         let rdb_block = self.sidebar_areas.run_debug_icon;
         let ext_block = self.sidebar_areas.extensions_icon;
-        if exp_block.width == 0
-            || sea_block.width == 0
-            || scm_block.width == 0
-            || rem_block.width == 0
-            || rdb_block.width == 0
-            || ext_block.width == 0
-        {
-            return Vec::new();
-        }
+        // The activity bar is all-or-nothing: emit its icons only when every
+        // block is laid out (a partial bar would look broken). When it's hidden
+        // (Customize Layout / Zen) the blocks are zero-width and skipped, but
+        // the layout toolbar icons below still emit independently.
+        let activity_ready = exp_block.width > 0
+            && sea_block.width > 0
+            && scm_block.width > 0
+            && rem_block.width > 0
+            && rdb_block.width > 0
+            && ext_block.width > 0;
         // Three-way per icon: the selected view shows the active (pilled)
         // variant; otherwise the pointer-hovered icon brightens (no pill); the
         // rest stay muted. Selected always wins over hovered.
@@ -3250,21 +3314,43 @@ impl App {
                 .flatten()
                 .all(|panel| !block.intersects(*panel))
         };
-        let mut blocks = vec![
-            (exp_block, exp_state.as_str()),
-            (sea_block, sea_state.as_str()),
-            (scm_block, scm_state.as_str()),
-            (rem_block, rem_state.as_str()),
-            (rdb_block, rdb_state.as_str()),
-            (ext_block, ext_state.as_str()),
-        ];
-        if set_block.width > 0 {
-            blocks.push((set_block, set_state.as_str()));
+        let mut blocks: Vec<(Rect, &str)> = Vec::new();
+        if activity_ready {
+            blocks.extend_from_slice(&[
+                (exp_block, exp_state.as_str()),
+                (sea_block, sea_state.as_str()),
+                (scm_block, scm_state.as_str()),
+                (rem_block, rem_state.as_str()),
+                (rdb_block, rdb_state.as_str()),
+                (ext_block, ext_state.as_str()),
+            ]);
+            if set_block.width > 0 {
+                blocks.push((set_block, set_state.as_str()));
+            }
         }
+        // Customize Layout toolbar icons (top-right of the editor / welcome).
+        // Their image swaps with the side-bar / panel visibility, exactly like
+        // an activity icon swaps active/inactive. Independent of the activity
+        // bar, so they still emit when it's hidden.
+        let li = self.layout_icon_areas;
+        let side_img = if self.show_tree {
+            &images.layout_sidebar_on
+        } else {
+            &images.layout_sidebar_off
+        };
+        let panel_img = if self.show_terminal {
+            &images.layout_panel_on
+        } else {
+            &images.layout_panel_off
+        };
+        blocks.push((li.toggle_side_bar, side_img.as_str()));
+        blocks.push((li.toggle_panel, panel_img.as_str()));
+        blocks.push((li.customize, images.layout_customize.as_str()));
         blocks
             .into_iter()
-            // A zero-width block means the activity bar is hidden (Customize
-            // Layout / Zen): emit nothing so the icons can't ghost.
+            // A zero-width block means the icon is hidden (the activity bar is
+            // off in Customize Layout / Zen, or the toolbar isn't laid out):
+            // emit nothing so the image can't ghost.
             .filter(|(block, _)| block.width > 0 && visible(*block))
             .map(|(block, state)| ((block.x, block.y), state))
             .collect()
@@ -3812,7 +3898,7 @@ impl App {
             return Some("Toggle Panel");
         }
         if rect_contains(icons.customize, col, row) {
-            return Some("Customize Layout...");
+            return Some("Customize Layout");
         }
         // Activity bar: always visible, so it is checked regardless of which
         // sidebar view is open.
@@ -4798,7 +4884,7 @@ impl App {
             vec![
                 (String::from("Color Theme"), MenuAction::OpenThemePicker),
                 (
-                    String::from("Customize Layout\u{2026}"),
+                    String::from("Customize Layout"),
                     MenuAction::OpenCustomizeLayout,
                 ),
             ],
@@ -6315,38 +6401,49 @@ impl App {
     /// hit rects in `self.layout_icon_areas`.
     fn paint_layout_icons(&mut self, frame: &mut ratatui::Frame, row: Rect) {
         self.layout_icon_areas = LayoutIconAreas::default();
-        if row.height == 0 || row.width < 8 {
+        let w = LAYOUT_ICON_CELLS_W;
+        let stride = w + 1; // one-column gap between icons
+        // Three icons + a one-column right pad.
+        let needed = stride * 3;
+        if row.height == 0 || row.width < needed {
             return;
         }
         let y = row.y;
         let right = row.x + row.width;
-        let cust_x = right.saturating_sub(2);
-        let panel_x = cust_x.saturating_sub(2);
-        let side_x = panel_x.saturating_sub(2);
-        if side_x <= row.x {
+        let cust_x = right.saturating_sub(w + 1); // 1-col right pad
+        let panel_x = cust_x.saturating_sub(stride);
+        let side_x = panel_x.saturating_sub(stride);
+        if side_x < row.x {
+            return;
+        }
+        let rect = |x: u16| Rect {
+            x,
+            y,
+            width: w,
+            height: LAYOUT_ICON_CELLS_H,
+        };
+        self.layout_icon_areas = LayoutIconAreas {
+            toggle_side_bar: rect(side_x),
+            toggle_panel: rect(panel_x),
+            customize: rect(cust_x),
+        };
+        // On an image-capable terminal the post-draw flush paints crisp 2× PNG
+        // icons at these cells (see `pending_activity_image_overlays`); the text
+        // path below is only the fallback for terminals without inline images.
+        if self.overlays.activity.has_images() {
             return;
         }
         let pointer = self.pointer_cell;
         // The codicon shape carries the on/off state (filled vs. hollow), like
-        // VS Code; colour only brightens on hover. White (not dim) so the icons
-        // read clearly against the tab-strip background.
+        // VS Code; colour only brightens to the accent on hover.
         let base = Color::Rgb(0xcc, 0xcc, 0xcc);
         let accent = Color::Rgb(0x4e, 0x9a, 0xff);
-        let mut paint = |x: u16, glyph: char| -> Rect {
-            let color = if pointer == Some((x, y)) {
-                accent
-            } else {
-                base
-            };
+        let mut paint = |x: u16, glyph: char| {
+            let hovered = pointer.is_some_and(|(px, py)| py == y && px >= x && px < x + w);
+            let color = if hovered { accent } else { base };
             frame
                 .buffer_mut()
                 .set_string(x, y, glyph.to_string(), Style::default().fg(color));
-            Rect {
-                x,
-                y,
-                width: 1,
-                height: 1,
-            }
         };
         let side_glyph = if self.show_tree {
             crate::icons::LAYOUT_SIDEBAR_ON
@@ -6358,14 +6455,9 @@ impl App {
         } else {
             crate::icons::LAYOUT_PANEL_OFF
         };
-        let side = paint(side_x, side_glyph);
-        let panel = paint(panel_x, panel_glyph);
-        let cust = paint(cust_x, crate::icons::LAYOUT_CUSTOMIZE);
-        self.layout_icon_areas = LayoutIconAreas {
-            toggle_side_bar: side,
-            toggle_panel: panel,
-            customize: cust,
-        };
+        paint(side_x, side_glyph);
+        paint(panel_x, panel_glyph);
+        paint(cust_x, crate::icons::LAYOUT_CUSTOMIZE);
     }
 
     fn render_activity_bar(&mut self, frame: &mut ratatui::Frame, area: Rect) {

@@ -468,6 +468,11 @@ fn dummy_activity_images() -> ActivityBarImages {
         settings_active: s(),
         settings_inactive: s(),
         settings_hovered: s(),
+        layout_sidebar_on: s(),
+        layout_sidebar_off: s(),
+        layout_panel_on: s(),
+        layout_panel_off: s(),
+        layout_customize: s(),
     }
 }
 
@@ -5818,6 +5823,11 @@ fn resize_arms_a_one_shot_terminal_clear_to_evict_stale_activity_icons() {
         settings_active: String::new(),
         settings_inactive: String::new(),
         settings_hovered: String::new(),
+        layout_sidebar_on: String::new(),
+        layout_sidebar_off: String::new(),
+        layout_panel_on: String::new(),
+        layout_panel_off: String::new(),
+        layout_customize: String::new(),
     });
     app.on_resize();
     assert!(
@@ -5867,6 +5877,11 @@ fn activity_bar_icons_moving_within_the_flush_arms_a_one_shot_terminal_clear() {
         settings_active: String::new(),
         settings_inactive: String::new(),
         settings_hovered: String::new(),
+        layout_sidebar_on: String::new(),
+        layout_sidebar_off: String::new(),
+        layout_panel_on: String::new(),
+        layout_panel_off: String::new(),
+        layout_customize: String::new(),
     });
     let place = |app: &mut App, base: u16| {
         app.sidebar_areas.explorer_icon = Rect::new(0, base, 2, 1);
@@ -7504,8 +7519,8 @@ fn activity_icons_stay_visible_beside_the_centered_shortcuts_modal() {
     term.draw(|f| app.render(f)).unwrap();
     let before = app.pending_activity_image_overlays().len();
     assert_eq!(
-        before, 7,
-        "precondition: all six view icons plus the bottom settings gear emit"
+        before, 10,
+        "precondition: six view icons + the settings gear + the three layout toolbar icons emit"
     );
     app.handle_key(key(KeyCode::F(1), KeyModifiers::NONE))
         .unwrap();
@@ -7553,8 +7568,8 @@ fn settings_gear_is_bottom_anchored_below_the_view_icons() {
     );
     assert_eq!(
         app.pending_activity_image_overlays().len(),
-        7,
-        "six view icons plus the bottom settings gear emit"
+        10,
+        "six view icons + the settings gear + the three layout toolbar icons emit"
     );
 }
 
@@ -13453,6 +13468,11 @@ fn hovering_a_non_selected_activity_icon_emits_its_hovered_variant() {
         settings_active: "GA".into(),
         settings_inactive: "GI".into(),
         settings_hovered: "GH".into(),
+        layout_sidebar_on: "LS".into(),
+        layout_sidebar_off: "LF".into(),
+        layout_panel_on: "LP".into(),
+        layout_panel_off: "LQ".into(),
+        layout_customize: "LC".into(),
     });
     // Every view icon needs a non-empty block or the emit early-returns.
     app.sidebar_areas.explorer_icon = Rect::new(0, 0, 2, 1);
@@ -14177,6 +14197,63 @@ fn render_survives_every_customize_layout_combination() {
 }
 
 #[test]
+fn layout_toolbar_emits_2x_inline_images_reflecting_on_off_state() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let mut imgs = dummy_activity_images();
+    imgs.layout_sidebar_on = "SIDE_ON".into();
+    imgs.layout_sidebar_off = "SIDE_OFF".into();
+    imgs.layout_panel_on = "PANEL_ON".into();
+    imgs.layout_panel_off = "PANEL_OFF".into();
+    imgs.layout_customize = "CUSTOMIZE".into();
+    app.overlays.activity.set_images(imgs);
+    // Place the toolbar (2 cells wide each), zero the activity bar so only the
+    // layout icons survive the width filter.
+    app.sidebar_areas = SidebarAreas::default();
+    app.layout_icon_areas = LayoutIconAreas {
+        toggle_side_bar: Rect::new(50, 0, LAYOUT_ICON_CELLS_W, LAYOUT_ICON_CELLS_H),
+        toggle_panel: Rect::new(53, 0, LAYOUT_ICON_CELLS_W, LAYOUT_ICON_CELLS_H),
+        customize: Rect::new(56, 0, LAYOUT_ICON_CELLS_W, LAYOUT_ICON_CELLS_H),
+    };
+    app.show_tree = true;
+    app.show_terminal = false;
+    let overlays = app.pending_activity_image_overlays();
+    // Side bar shown -> the filled (ON) image; panel hidden -> the hollow (OFF).
+    assert!(
+        overlays
+            .iter()
+            .any(|(pos, s)| *pos == (50, 0) && *s == "SIDE_ON"),
+        "side-bar icon emits the ON image when shown"
+    );
+    assert!(
+        overlays
+            .iter()
+            .any(|(pos, s)| *pos == (53, 0) && *s == "PANEL_OFF"),
+        "panel icon emits the OFF image when hidden"
+    );
+    assert!(
+        overlays
+            .iter()
+            .any(|(pos, s)| *pos == (56, 0) && *s == "CUSTOMIZE"),
+        "customize icon always emits its image"
+    );
+    // Flip both: the images swap to match.
+    app.show_tree = false;
+    app.show_terminal = true;
+    let overlays = app.pending_activity_image_overlays();
+    assert!(
+        overlays
+            .iter()
+            .any(|(p, s)| *p == (50, 0) && *s == "SIDE_OFF")
+    );
+    assert!(
+        overlays
+            .iter()
+            .any(|(p, s)| *p == (53, 0) && *s == "PANEL_ON")
+    );
+}
+
+#[test]
 fn clicking_the_customize_icon_opens_the_customize_layout_popup() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
@@ -14203,10 +14280,7 @@ fn clicking_the_customize_icon_opens_the_customize_layout_popup() {
         "the popup is the Customize Layout menu"
     );
     // And the icon advertises itself on hover.
-    assert_eq!(
-        app.ui_tooltip_at(cust.x, cust.y),
-        Some("Customize Layout...")
-    );
+    assert_eq!(app.ui_tooltip_at(cust.x, cust.y), Some("Customize Layout"));
 }
 
 #[test]
