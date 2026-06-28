@@ -20,7 +20,7 @@ The non-negotiables behind every decision in croft:
 
 ## Layout
 
-Three panes in the VS Code arrangement: an **Explorer sidebar** on the left, a **code editor** top right, and a **real terminal** bottom right. An activity bar down the far left switches the sidebar between Explorer, Search, Source Control, a Remote (SSH) explorer, Run and Debug, and Extensions, and holds the theme picker. Every seam drags to resize.
+Three panes in the VS Code arrangement: an **Explorer sidebar** on the left, a **code editor** top right, and a **bottom panel group** bottom right. The panel carries a tab strip: **TERMINAL** (a real shell, splittable into panes) and **PROBLEMS** (aggregated workspace diagnostics grouped by file, with a count badge; click a diagnostic to jump the editor to it). An activity bar down the far left switches the sidebar between Explorer, Search, Source Control, a Remote (SSH) explorer, Run and Debug, and Extensions, and holds the theme picker. Every seam drags to resize.
 
 A **Customize Layout** popup (the `⛶` icon at the top-right of the editor, or the settings gear) mirrors VS Code's title-bar layout controls: show/hide the activity bar, primary and secondary side bars, panel, and status bar; dock the side bar left or right; align the panel; move the quick input; or enter Zen Mode (`Cmd`/`Ctrl`+`K` `Z`).
 

@@ -13162,6 +13162,98 @@ fn merged_diagnostics_layers_every_server_for_a_file() {
     );
 }
 
+#[test]
+fn problems_panel_aggregates_the_store_across_files() {
+    use crate::lsp::manager::DiagnosticSeverity;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let a = tmp.path().join("a.rs");
+    let mut s1 = std::collections::HashMap::new();
+    s1.insert(
+        String::from("rustc"),
+        vec![
+            diag(0, 1, DiagnosticSeverity::Error),
+            diag(2, 3, DiagnosticSeverity::Warning),
+        ],
+    );
+    app.lsp_diagnostics.insert(a, s1);
+    let b = tmp.path().join("b.rs");
+    let mut s2 = std::collections::HashMap::new();
+    s2.insert(
+        String::from("rustc"),
+        vec![diag(0, 1, DiagnosticSeverity::Error)],
+    );
+    app.lsp_diagnostics.insert(b, s2);
+
+    app.rebuild_problems();
+    assert_eq!(
+        app.problems.total_count(),
+        3,
+        "two files, three diagnostics"
+    );
+    assert_eq!(app.problems.error_count(), 2);
+    assert_eq!(app.problems.warning_count(), 1);
+}
+
+#[test]
+fn clicking_the_problems_tab_switches_the_panel_view() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let backend = ratatui::backend::TestBackend::new(140, 50);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    assert_eq!(app.bottom_panel_tab, BottomPanelTab::Terminal);
+    let r = app.problems_tab_rect;
+    assert!(r.width > 0, "the PROBLEMS tab must have a hit rect");
+    left_click(&mut app, r.x, r.y);
+    assert_eq!(
+        app.bottom_panel_tab,
+        BottomPanelTab::Problems,
+        "a click on the PROBLEMS tab activates that view",
+    );
+    // And the TERMINAL tab switches back.
+    let t = app.terminal_tab_rect;
+    left_click(&mut app, t.x, t.y);
+    assert_eq!(app.bottom_panel_tab, BottomPanelTab::Terminal);
+}
+
+#[test]
+fn clicking_a_problem_row_opens_that_file_at_the_line() {
+    use crate::lsp::manager::DiagnosticSeverity;
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("hello.rs");
+    std::fs::write(&file, "fn a() {}\nfn b() {}\nfn run() {}\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let mut by_server = std::collections::HashMap::new();
+    by_server.insert(
+        String::from("rustc"),
+        vec![crate::lsp::manager::Diagnostic {
+            start_line: 2,
+            start_char: 3,
+            end_line: 2,
+            end_char: 6,
+            severity: DiagnosticSeverity::Warning,
+            message: String::from("function `run` is never used"),
+        }],
+    );
+    app.lsp_diagnostics.insert(file.clone(), by_server);
+    app.rebuild_problems();
+    app.bottom_panel_tab = BottomPanelTab::Problems;
+
+    let backend = ratatui::backend::TestBackend::new(140, 50);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    // Row 0 of the list is the file header; row 1 is the diagnostic.
+    let list = app.problems.last_area;
+    left_click(&mut app, list.x + 4, list.y + 1);
+    assert_eq!(
+        app.editor.path.as_deref(),
+        Some(file.as_path()),
+        "clicking the row opens the file",
+    );
+    assert_eq!(app.editor.cursor_row, 2, "and jumps to the diagnostic line");
+}
+
 // ---------------------------------------------------------------------------
 // On-screen keyboard (Termux touch typing)
 // ---------------------------------------------------------------------------
@@ -13295,8 +13387,9 @@ fn osk_with_terminal_focus_bumps_terminal_above_keyboard() {
         "terminal rides directly on top of the keyboard"
     );
     assert_eq!(
-        t.y, 0,
-        "terminal claims the editor's space from the very top"
+        t.y, 1,
+        "the panel group claims the editor's space from the top; the terminal \
+         body sits one row down, under the panel tab strip (PROBLEMS / TERMINAL)",
     );
     assert_eq!(
         app.editor.last_area.height, 0,

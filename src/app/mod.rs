@@ -720,6 +720,15 @@ enum Pane {
     Terminal,
 }
 
+/// Which tab the bottom panel group shows. The panel is the "terminal group"
+/// VS Code-style: a tab strip over a shared region. `Terminal` shows the live
+/// shell(s); `Problems` shows aggregated workspace diagnostics.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum BottomPanelTab {
+    Terminal,
+    Problems,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum CreateKind {
     File,
@@ -1903,6 +1912,17 @@ pub struct App {
     /// is open (closing the last one would leave the pane empty, which we
     /// explicitly forbid) or the pane is hidden.
     terminal_close_buttons: Vec<Rect>,
+    /// Which tab the bottom panel group is showing (TERMINAL or PROBLEMS).
+    bottom_panel_tab: BottomPanelTab,
+    /// The PROBLEMS view: aggregated workspace diagnostics, projected from
+    /// `lsp_diagnostics`. Rendered into the panel content when its tab is active.
+    problems: crate::widgets::problems::ProblemsPanel,
+    /// Hit-test rect of the "PROBLEMS" tab in the panel tab strip. Empty when
+    /// the panel is hidden.
+    problems_tab_rect: Rect,
+    /// Hit-test rect of the "TERMINAL" tab in the panel tab strip. Empty when
+    /// the panel is hidden.
+    terminal_tab_rect: Rect,
     /// Last pointer cell reported by a `Moved` event. Render-time hover
     /// hit-testing (the Black theme's teal pill behind the terminal `-`/`+`
     /// buttons) reads this instead of tracking enter/leave transitions.
@@ -2530,6 +2550,10 @@ impl App {
             terminal_splitter_y: None,
             terminal_add_buttons: Vec::new(),
             terminal_close_buttons: Vec::new(),
+            bottom_panel_tab: BottomPanelTab::Terminal,
+            problems: crate::widgets::problems::ProblemsPanel::new(),
+            problems_tab_rect: Rect::default(),
+            terminal_tab_rect: Rect::default(),
             pointer_cell: None,
             hovered_activity_icon: None,
             hovered_layout_icon: None,
@@ -3810,12 +3834,17 @@ impl App {
             .filter(|p| !current.contains(*p))
             .cloned()
             .collect();
+        let mut dropped_any = false;
         for p in closed {
             lsp.close_doc(p.clone());
             self.lsp_last_seen.remove(&p);
             // Drop the closed file's diagnostics so the store doesn't grow
             // unbounded across a long session of opening and closing files.
-            self.lsp_diagnostics.remove(&p);
+            dropped_any |= self.lsp_diagnostics.remove(&p).is_some();
+        }
+        // A closed file's problems must leave the PROBLEMS panel too.
+        if dropped_any {
+            self.rebuild_problems();
         }
         // Paint cached semantic colours onto the visible editor(s) now that the
         // immutable tab borrow above has ended. `is_full = true` so a later
@@ -4352,6 +4381,53 @@ impl App {
             .unwrap_or_default()
     }
 
+    /// Rebuild the PROBLEMS panel's grouped projection from the per-file
+    /// diagnostics store. Returns whether the projection changed (so the caller
+    /// can fold it into its redraw decision). Files are grouped, ordered by
+    /// path; each group's diagnostics are ordered by position.
+    fn rebuild_problems(&mut self) -> bool {
+        use crate::widgets::problems::{ProblemGroup, ProblemItem};
+        let mut paths: Vec<&PathBuf> = self.lsp_diagnostics.keys().collect();
+        paths.sort();
+        let mut groups = Vec::new();
+        for path in paths {
+            let by_server = &self.lsp_diagnostics[path];
+            let mut items: Vec<ProblemItem> = Vec::new();
+            for (server, diags) in by_server {
+                for d in diags {
+                    items.push(ProblemItem {
+                        line: d.start_line,
+                        col: d.start_char,
+                        severity: d.severity,
+                        message: d.message.clone(),
+                        source: server.clone(),
+                    });
+                }
+            }
+            if items.is_empty() {
+                continue;
+            }
+            items.sort_by_key(|i| (i.line, i.col));
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let rel_dir = path
+                .strip_prefix(&self.workspace_root)
+                .unwrap_or(path)
+                .parent()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            groups.push(ProblemGroup {
+                path: path.clone(),
+                name,
+                rel_dir,
+                items,
+            });
+        }
+        self.problems.set_groups(groups)
+    }
+
     /// Drain server-pushed diagnostics into the per-file store, then refresh
     /// the underline overlay on whichever editor group shows an affected (or
     /// just-switched-to) file. Returns true when an overlay changed and the
@@ -4408,6 +4484,12 @@ impl App {
                     changed = true;
                 }
             }
+        }
+        // The PROBLEMS panel aggregates every file's diagnostics, including
+        // files no editor group has open, so rebuild it whenever any server
+        // republished this tick (not only when an editor overlay changed).
+        if !touched.is_empty() {
+            changed |= self.rebuild_problems();
         }
         changed
     }
@@ -6995,6 +7077,10 @@ impl App {
         self.remote.focus_gradient = gradient;
         self.remote.theme = self.theme;
         self.extensions.theme = self.theme;
+        self.problems.focus_gradient = gradient;
+        self.problems.theme = self.theme;
+        self.problems.focused = self.focus == Pane::Terminal;
+        self.problems.hover_pointer = self.pointer_cell;
         for t in self.terminals.iter_mut() {
             t.focus_gradient = gradient;
         }
@@ -7006,6 +7092,79 @@ impl App {
     /// border, so Croft Dark keeps its coherent all-blue look.
     fn popup_gradient(&self) -> bool {
         self.theme.gradient()
+    }
+
+    /// Paint the bottom panel group's tab strip (PROBLEMS / TERMINAL) across
+    /// `strip` (its top row) and record each tab's hit rect. The active tab is
+    /// bright/bold; the inactive one is dim, mirroring VS Code's panel tabs. A
+    /// non-zero problem count rides the PROBLEMS label as a badge.
+    fn paint_panel_tabs(&mut self, frame: &mut ratatui::Frame, strip: Rect) {
+        use ratatui::widgets::{Block, Paragraph};
+        frame.render_widget(
+            Block::default().style(Style::default().bg(self.theme.editor_bg())),
+            strip,
+        );
+        let brand = self.theme.gradient();
+        let active_fg = if brand {
+            crate::gradient::rgb_color(crate::gradient::PANEL_TITLE_FG)
+        } else {
+            Color::White
+        };
+        let inactive_fg = Color::Rgb(0x80, 0x88, 0x98);
+
+        let count = self.problems.total_count();
+        let problems_label = if count > 0 {
+            format!(" PROBLEMS {count} ")
+        } else {
+            " PROBLEMS ".to_string()
+        };
+        let labels = [
+            (BottomPanelTab::Problems, problems_label),
+            (BottomPanelTab::Terminal, " TERMINAL ".to_string()),
+        ];
+        let mut x = strip.x + 1;
+        self.problems_tab_rect = Rect::default();
+        self.terminal_tab_rect = Rect::default();
+        for (tab, label) in labels {
+            let w = label.chars().count() as u16;
+            let remaining = strip.width.saturating_sub(x.saturating_sub(strip.x));
+            if remaining == 0 {
+                break;
+            }
+            let rect = Rect {
+                x,
+                y: strip.y,
+                width: w.min(remaining),
+                height: 1,
+            };
+            let active = self.bottom_panel_tab == tab;
+            let style = if active {
+                Style::default().fg(active_fg).add_modifier(Modifier::BOLD)
+            } else if crate::widgets::hover::row_hover_bg(rect, self.pointer_cell, brand).is_some()
+            {
+                Style::default()
+                    .fg(active_fg)
+                    .add_modifier(Modifier::UNDERLINED)
+            } else {
+                Style::default().fg(inactive_fg)
+            };
+            frame.render_widget(Paragraph::new(Span::styled(label, style)), rect);
+            match tab {
+                BottomPanelTab::Problems => self.problems_tab_rect = rect,
+                BottomPanelTab::Terminal => self.terminal_tab_rect = rect,
+            }
+            x = x.saturating_add(w + 1);
+        }
+    }
+
+    /// Switch the bottom panel group's active tab, ensuring the panel is
+    /// visible and the panel pane is focused so the new view is usable at once.
+    fn set_bottom_panel_tab(&mut self, tab: BottomPanelTab) {
+        self.bottom_panel_tab = tab;
+        if !self.show_terminal {
+            self.show_terminal = true;
+        }
+        self.focus_pane(Pane::Terminal);
     }
 
     /// Split the editor into two side-by-side columns (`Cmd+\`). The new
@@ -7565,33 +7724,75 @@ impl App {
                     band,
                 );
             }
-            let n = self.terminals.len().max(1);
-            let constraints: Vec<Constraint> =
-                (0..n).map(|_| Constraint::Ratio(1, n as u32)).collect();
-            let cols = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints(constraints)
-                .split(area);
-            for (i, t) in self.terminals.iter_mut().enumerate() {
-                frame.render_widget(t, cols[i]);
-            }
-            let show_close = self.terminals.len() > 1;
-            let brand = self.theme.gradient();
-            self.terminal_add_buttons.clear();
-            self.terminal_close_buttons.clear();
-            for col in cols.iter().take(self.terminals.len()) {
-                let (add_rect, close_rect) =
-                    paint_terminal_pane_buttons(frame, *col, show_close, brand, self.pointer_cell);
-                if let Some(r) = add_rect {
-                    self.terminal_add_buttons.push(r);
+            // The panel group's tab strip (PROBLEMS / TERMINAL) takes the top
+            // row; the active tab's view fills the rest. Mirrors VS Code's
+            // bottom-panel tab bar.
+            let strip = Rect {
+                x: area.x,
+                y: area.y,
+                width: area.width,
+                height: 1,
+            };
+            let content = if area.height > 1 {
+                Rect {
+                    x: area.x,
+                    y: area.y + 1,
+                    width: area.width,
+                    height: area.height - 1,
                 }
-                if let Some(r) = close_rect {
-                    self.terminal_close_buttons.push(r);
+            } else {
+                area
+            };
+            self.paint_panel_tabs(frame, strip);
+            match self.bottom_panel_tab {
+                BottomPanelTab::Terminal => {
+                    let n = self.terminals.len().max(1);
+                    let constraints: Vec<Constraint> =
+                        (0..n).map(|_| Constraint::Ratio(1, n as u32)).collect();
+                    let cols = Layout::default()
+                        .direction(Direction::Horizontal)
+                        .constraints(constraints)
+                        .split(content);
+                    for (i, t) in self.terminals.iter_mut().enumerate() {
+                        frame.render_widget(t, cols[i]);
+                    }
+                    let show_close = self.terminals.len() > 1;
+                    let brand = self.theme.gradient();
+                    self.terminal_add_buttons.clear();
+                    self.terminal_close_buttons.clear();
+                    for col in cols.iter().take(self.terminals.len()) {
+                        let (add_rect, close_rect) = paint_terminal_pane_buttons(
+                            frame,
+                            *col,
+                            show_close,
+                            brand,
+                            self.pointer_cell,
+                        );
+                        if let Some(r) = add_rect {
+                            self.terminal_add_buttons.push(r);
+                        }
+                        if let Some(r) = close_rect {
+                            self.terminal_close_buttons.push(r);
+                        }
+                    }
+                }
+                BottomPanelTab::Problems => {
+                    // The terminals are hidden behind the PROBLEMS view; drop
+                    // their hit rects so a click never phantom-matches a pane
+                    // that isn't painted (mirrors the hidden-panel reset).
+                    self.terminal_add_buttons.clear();
+                    self.terminal_close_buttons.clear();
+                    for t in self.terminals.iter_mut() {
+                        t.last_area = Rect::default();
+                    }
+                    frame.render_widget(&mut self.problems, content);
                 }
             }
         } else {
             self.terminal_add_buttons.clear();
             self.terminal_close_buttons.clear();
+            self.problems_tab_rect = Rect::default();
+            self.terminal_tab_rect = Rect::default();
             // A hidden terminal must not keep stale hit rects alive, or
             // `terminal_at_pos` would phantom-match clicks meant for
             // whatever now occupies those cells (mirrors the SYSTEM
@@ -9013,7 +9214,13 @@ impl App {
                 self.handle_editor_key(key);
                 self.poke_cursor();
             }
-            Pane::Terminal => self.handle_terminal_key(key),
+            Pane::Terminal => match self.bottom_panel_tab {
+                // The PROBLEMS view owns the panel pane while its tab is active,
+                // so keystrokes scroll the list instead of leaking into the
+                // hidden shell.
+                BottomPanelTab::Problems => self.handle_problems_key(key),
+                BottomPanelTab::Terminal => self.handle_terminal_key(key),
+            },
         }
         Ok(())
     }
@@ -13416,6 +13623,19 @@ impl App {
         }
     }
 
+    /// Keyboard handling for the PROBLEMS view while it owns the panel pane:
+    /// arrow / page keys scroll the list, Escape hands focus back to the editor.
+    fn handle_problems_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Up => self.problems.scroll_up(1),
+            KeyCode::Down => self.problems.scroll_down(1),
+            KeyCode::PageUp => self.problems.scroll_up(10),
+            KeyCode::PageDown => self.problems.scroll_down(10),
+            KeyCode::Esc => self.focus_pane(Pane::Editor),
+            _ => {}
+        }
+    }
+
     fn handle_terminal_key(&mut self, key: KeyEvent) {
         // Ctrl+Shift+T: open another terminal next to the active one.
         if is_terminal_split_key(key) {
@@ -16164,6 +16384,8 @@ impl App {
         let in_editor = rect_contains(self.editor.last_area, m.column, m.row);
         let terminal_hit = self.terminal_at_pos(m.column, m.row);
         let in_terminal = terminal_hit.is_some();
+        let in_problems = self.bottom_panel_tab == BottomPanelTab::Problems
+            && rect_contains(self.problems.last_area, m.column, m.row);
         let in_tree_scrollbar = self.sidebar_view == SidebarView::Explorer
             && rect_contains(self.tree.last_scrollbar, m.column, m.row);
         let in_remote_scrollbar = self.sidebar_view == SidebarView::Remote
@@ -16534,6 +16756,36 @@ impl App {
                         && let Some((path, line, col)) = self.outline.jump_target(idx)
                     {
                         self.go_to_definition(path, line, col);
+                    }
+                    return;
+                }
+                // The panel group's tabs sit on the splitter row, so they must
+                // win the hit-test before the splitter-drag handler claims the
+                // click (same precedence as the "[+]" / "[-]" buttons below).
+                if rect_contains(self.problems_tab_rect, m.column, m.row) {
+                    self.set_bottom_panel_tab(BottomPanelTab::Problems);
+                    return;
+                }
+                if rect_contains(self.terminal_tab_rect, m.column, m.row) {
+                    self.set_bottom_panel_tab(BottomPanelTab::Terminal);
+                    return;
+                }
+                // A click in the PROBLEMS list jumps the editor to that
+                // diagnostic, or toggles a file group. Checked before the
+                // terminal/splitter logic because the terminals are not
+                // painted while this tab is active.
+                if self.bottom_panel_tab == BottomPanelTab::Problems
+                    && rect_contains(self.problems.last_area, m.column, m.row)
+                {
+                    use crate::widgets::problems::ProblemHit;
+                    match self.problems.hit_at(m.row) {
+                        Some(ProblemHit::Header(path)) => self.problems.toggle_collapse(&path),
+                        Some(ProblemHit::Diagnostic { path, line, col }) => {
+                            if let Err(e) = self.open_at(&path, line as usize, col as usize) {
+                                self.status = format!("Open failed: {e}");
+                            }
+                        }
+                        None => self.focus_pane(Pane::Terminal),
                     }
                     return;
                 }
@@ -17325,6 +17577,8 @@ impl App {
                     self.timeline.scroll_down(3);
                 } else if in_deps {
                     self.dependencies.scroll_down(3);
+                } else if in_problems {
+                    self.problems.scroll_down(3);
                 } else if in_tree {
                     match self.sidebar_view {
                         SidebarView::Explorer => self.tree.scroll_down(3),
@@ -17358,6 +17612,8 @@ impl App {
                     self.timeline.scroll_up(3);
                 } else if in_deps {
                     self.dependencies.scroll_up(3);
+                } else if in_problems {
+                    self.problems.scroll_up(3);
                 } else if in_tree {
                     match self.sidebar_view {
                         SidebarView::Explorer => self.tree.scroll_up(3),

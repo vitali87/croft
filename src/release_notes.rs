@@ -59,21 +59,7 @@ pub struct ReleaseNote {
 }
 
 /// What shipped in the current release. Replace on every version bump.
-pub const RELEASE_NOTES: &[ReleaseNote] = &[
-    ReleaseNote {
-        kind: NoteKind::Feature,
-        summary: "Customize Layout: the layout icon (top-right of the editor / welcome) and the gear menu open VS Code's layout controls — show/hide the activity bar, both side bars, panel, and status bar; dock the side bar left or right; align the panel; move the quick input.",
-    },
-    ReleaseNote {
-        kind: NoteKind::Feature,
-        summary: "New secondary side bar (Opt+Cmd/Ctrl+B) hosting the active file's Outline, plus Zen Mode (Cmd+K Z) that hides all chrome and restores it on the next press.",
-    },
-    ReleaseNote {
-        kind: NoteKind::Fix,
-        summary: "The layout toolbar icons (VS Code's layout-sidebar-left / layout-panel / layout codicons) render as crisp inline images sized to half an activity-bar icon, painted in front of the container's top line, with a hover highlight; the side-bar / panel icons swap filled/hollow with their visibility.",
-    },
-    ReleaseNote {
-        kind: NoteKind::Fix,
-        summary: "Removed every trailing ellipsis across the UI: menu entries, tooltips, progress / status messages, and text truncation no longer append \"...\" anywhere.",
-    },
-];
+pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
+    kind: NoteKind::Feature,
+    summary: "New PROBLEMS tab in the bottom panel group, beside TERMINAL: aggregated workspace diagnostics grouped by file with a count badge, severity glyphs, and the source server. Click a file header to collapse it; click a diagnostic to jump the editor to that line.",
+}];
