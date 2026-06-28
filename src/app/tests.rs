@@ -13254,6 +13254,51 @@ fn clicking_a_problem_row_opens_that_file_at_the_line() {
     assert_eq!(app.editor.cursor_row, 2, "and jumps to the diagnostic line");
 }
 
+#[test]
+fn the_problems_count_paints_an_orange_pill_in_the_tab_strip() {
+    use crate::lsp::manager::DiagnosticSeverity;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let a = tmp.path().join("a.rs");
+    let mut s1 = std::collections::HashMap::new();
+    s1.insert(
+        String::from("rustc"),
+        vec![diag(0, 1, DiagnosticSeverity::Error)],
+    );
+    app.lsp_diagnostics.insert(a, s1);
+    app.rebuild_problems();
+    let backend = ratatui::backend::TestBackend::new(140, 50);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let buf = term.backend().buffer();
+    // Somewhere along the PROBLEMS tab the count badge fills with the brand
+    // gradient's orange corner, the "circle" the user asked for.
+    let strip = app.problems_tab_rect;
+    let orange = crate::gradient::rgb_color(crate::gradient::GRAD_TR);
+    let painted = (strip.x..strip.x + strip.width).any(|x| buf[(x, strip.y)].bg == orange);
+    assert!(painted, "the problem count wears an orange pill");
+    // And the rounded right cap of the pill sits in brand orange foreground.
+    let cap_r = (strip.x..strip.x + strip.width)
+        .any(|x| buf[(x, strip.y)].symbol() == "\u{e0b4}" && buf[(x, strip.y)].fg == orange);
+    assert!(cap_r, "the pill has a rounded orange right cap");
+}
+
+#[test]
+fn the_active_panel_tab_is_underlined() {
+    use ratatui::style::Modifier;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let backend = ratatui::backend::TestBackend::new(140, 50);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    // TERMINAL is active by default: its label underlines like a VS Code tab.
+    let t = app.terminal_tab_rect;
+    let buf = term.backend().buffer();
+    let underlined =
+        (t.x..t.x + t.width).any(|x| buf[(x, t.y)].modifier.contains(Modifier::UNDERLINED));
+    assert!(underlined, "the active tab label is underlined");
+}
+
 // ---------------------------------------------------------------------------
 // On-screen keyboard (Termux touch typing)
 // ---------------------------------------------------------------------------
@@ -13463,7 +13508,7 @@ fn osk_tap_types_into_file_finder_query() {
 }
 
 /// Render once and return (title 'T' cell coords, add-button rect).
-fn terminal_header_probe(app: &mut App) -> ((u16, u16), Rect) {
+fn terminal_header_probe(app: &mut App) -> Rect {
     let backend = ratatui::backend::TestBackend::new(140, 50);
     let mut term = ratatui::Terminal::new(backend).unwrap();
     term.draw(|f| app.render(f)).unwrap();
@@ -13472,35 +13517,7 @@ fn terminal_header_probe(app: &mut App) -> ((u16, u16), Rect) {
         area.width > 20 && area.height > 2,
         "terminal pane must render"
     );
-    let buf = term.backend().buffer();
-    let tx = (area.x..area.x + area.width)
-        .find(|&x| buf[(x, area.y)].symbol() == "T")
-        .expect("TERMINAL title must sit on the top border");
-    let add = app.terminal_add_buttons[0];
-    ((tx, area.y), add)
-}
-
-#[test]
-fn black_theme_terminal_title_is_chipless_brand_header() {
-    // Under Croft Black the TERMINAL header drops the legacy navy chip and
-    // wears the VS Code panel-title foreground (#E7E7E7) straight on the
-    // border row, mirroring panelTitle.activeForeground.
-    let tmp = tempfile::tempdir().unwrap();
-    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    assert_eq!(app.theme, crate::theme::Theme::BLACK);
-    let backend = ratatui::backend::TestBackend::new(140, 50);
-    let mut term = ratatui::Terminal::new(backend).unwrap();
-    term.draw(|f| app.render(f)).unwrap();
-    let ((tx, ty), _) = terminal_header_probe(&mut app);
-    term.draw(|f| app.render(f)).unwrap();
-    let buf = term.backend().buffer();
-    let navy = Color::Rgb(0x1e, 0x3a, 0x6e);
-    assert_eq!(buf[(tx, ty)].fg, Color::Rgb(0xe7, 0xe7, 0xe7));
-    assert_ne!(
-        buf[(tx, ty)].bg,
-        navy,
-        "Black theme must not paint the navy chip"
-    );
+    app.terminal_add_buttons[0]
 }
 
 #[test]
@@ -13508,7 +13525,7 @@ fn black_theme_terminal_buttons_are_teal_icons_not_navy_chips() {
     use crate::gradient::{INNER_ACCENT, rgb_color};
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    let (_, add) = terminal_header_probe(&mut app);
+    let add = terminal_header_probe(&mut app);
     let backend = ratatui::backend::TestBackend::new(140, 50);
     let mut term = ratatui::Terminal::new(backend).unwrap();
     term.draw(|f| app.render(f)).unwrap();
@@ -13528,7 +13545,7 @@ fn black_theme_terminal_button_hover_paints_teal_pill() {
     use crate::gradient::{POPUP_SEL_BG, rgb_color};
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    let (_, add) = terminal_header_probe(&mut app);
+    let add = terminal_header_probe(&mut app);
     app.handle_mouse(crossterm::event::MouseEvent {
         kind: crossterm::event::MouseEventKind::Moved,
         column: add.x + 1,
@@ -13657,20 +13674,20 @@ fn moving_over_an_activity_icon_marks_it_hovered_and_redirties_the_overlay() {
 }
 
 #[test]
-fn dark_blue_theme_terminal_keeps_navy_chips() {
-    // Croft Dark keeps its coherent all-blue look: navy chip on the title
-    // and both buttons, exactly as before the Black-theme restyle.
+fn dark_blue_theme_terminal_button_keeps_navy_chip() {
+    // Croft Dark keeps its coherent all-blue look: navy chip on the pane's
+    // add/close buttons, exactly as before the Black-theme restyle. (The pane
+    // no longer carries a TERMINAL title — the panel tab strip labels it.)
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.theme = crate::theme::Theme::DARK_BLUE;
     app.sync_focus_flags();
-    let ((tx, ty), add) = terminal_header_probe(&mut app);
+    let add = terminal_header_probe(&mut app);
     let backend = ratatui::backend::TestBackend::new(140, 50);
     let mut term = ratatui::Terminal::new(backend).unwrap();
     term.draw(|f| app.render(f)).unwrap();
     let buf = term.backend().buffer();
     let navy = Color::Rgb(0x1e, 0x3a, 0x6e);
-    assert_eq!(buf[(tx, ty)].bg, navy);
     assert_eq!(buf[(add.x + 1, add.y)].bg, navy);
 }
 

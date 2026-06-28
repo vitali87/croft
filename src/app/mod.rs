@@ -7099,11 +7099,9 @@ impl App {
     /// bright/bold; the inactive one is dim, mirroring VS Code's panel tabs. A
     /// non-zero problem count rides the PROBLEMS label as a badge.
     fn paint_panel_tabs(&mut self, frame: &mut ratatui::Frame, strip: Rect) {
-        use ratatui::widgets::{Block, Paragraph};
-        frame.render_widget(
-            Block::default().style(Style::default().bg(self.theme.editor_bg())),
-            strip,
-        );
+        use ratatui::widgets::Block;
+        let strip_bg = self.theme.editor_bg();
+        frame.render_widget(Block::default().style(Style::default().bg(strip_bg)), strip);
         let brand = self.theme.gradient();
         let active_fg = if brand {
             crate::gradient::rgb_color(crate::gradient::PANEL_TITLE_FG)
@@ -7111,49 +7109,106 @@ impl App {
             Color::White
         };
         let inactive_fg = Color::Rgb(0x80, 0x88, 0x98);
-
+        let right = strip.x + strip.width;
         let count = self.problems.total_count();
-        let problems_label = if count > 0 {
-            format!(" PROBLEMS {count} ")
+
+        // The PROBLEMS tab carries an orange count "pill" (the brand gradient's
+        // orange corner, rounded-cap badge) right after its label, mirroring VS
+        // Code's tab count badge; its hit rect spans label and pill together.
+        let problems_label = " PROBLEMS ";
+        let badge_text = if count > 0 {
+            format!(" {count} ")
         } else {
-            " PROBLEMS ".to_string()
+            String::new()
         };
-        let labels = [
-            (BottomPanelTab::Problems, problems_label),
-            (BottomPanelTab::Terminal, " TERMINAL ".to_string()),
-        ];
-        let mut x = strip.x + 1;
-        self.problems_tab_rect = Rect::default();
-        self.terminal_tab_rect = Rect::default();
-        for (tab, label) in labels {
-            let w = label.chars().count() as u16;
-            let remaining = strip.width.saturating_sub(x.saturating_sub(strip.x));
-            if remaining == 0 {
-                break;
-            }
-            let rect = Rect {
-                x,
-                y: strip.y,
-                width: w.min(remaining),
-                height: 1,
-            };
-            let active = self.bottom_panel_tab == tab;
-            let style = if active {
-                Style::default().fg(active_fg).add_modifier(Modifier::BOLD)
-            } else if crate::widgets::hover::row_hover_bg(rect, self.pointer_cell, brand).is_some()
-            {
+        let badge_w = if count > 0 {
+            badge_text.chars().count() as u16 + 2
+        } else {
+            0
+        };
+        let problems_w = problems_label.chars().count() as u16 + badge_w;
+        let p_rect = Rect {
+            x: strip.x + 1,
+            y: strip.y,
+            width: problems_w.min(right.saturating_sub(strip.x + 1)),
+            height: 1,
+        };
+        let terminal_label = " TERMINAL ";
+        let t_x = p_rect.x + problems_w + 1;
+        let t_rect = Rect {
+            x: t_x,
+            y: strip.y,
+            width: (terminal_label.chars().count() as u16).min(right.saturating_sub(t_x)),
+            height: 1,
+        };
+        self.problems_tab_rect = p_rect;
+        self.terminal_tab_rect = t_rect;
+
+        // Active tab: brand foreground, bold, and underlined — the VS Code
+        // active-tab indicator. Hover brightens an inactive tab; the rest stay
+        // dim.
+        let pointer = self.pointer_cell;
+        let label_style = |active: bool, rect: Rect| -> Style {
+            if active {
                 Style::default()
                     .fg(active_fg)
-                    .add_modifier(Modifier::UNDERLINED)
+                    .bg(strip_bg)
+                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+            } else if crate::widgets::hover::row_hover_bg(rect, pointer, brand).is_some() {
+                Style::default().fg(active_fg).bg(strip_bg)
             } else {
-                Style::default().fg(inactive_fg)
-            };
-            frame.render_widget(Paragraph::new(Span::styled(label, style)), rect);
-            match tab {
-                BottomPanelTab::Problems => self.problems_tab_rect = rect,
-                BottomPanelTab::Terminal => self.terminal_tab_rect = rect,
+                Style::default().fg(inactive_fg).bg(strip_bg)
             }
-            x = x.saturating_add(w + 1);
+        };
+        let p_style = label_style(self.bottom_panel_tab == BottomPanelTab::Problems, p_rect);
+        let t_style = label_style(self.bottom_panel_tab == BottomPanelTab::Terminal, t_rect);
+
+        let orange = crate::gradient::rgb_color(crate::gradient::GRAD_TR);
+        let badge_fg = Color::Rgb(0x1a, 0x12, 0x0a);
+        let buf = frame.buffer_mut();
+
+        if p_rect.x < right {
+            buf.set_stringn(
+                p_rect.x,
+                p_rect.y,
+                problems_label,
+                right.saturating_sub(p_rect.x) as usize,
+                p_style,
+            );
+        }
+        if count > 0 {
+            let bx = p_rect.x + problems_label.chars().count() as u16;
+            let cap_style = Style::default().fg(orange).bg(strip_bg);
+            if bx < right {
+                buf.set_string(bx, p_rect.y, "\u{e0b6}", cap_style);
+            }
+            let inner_start = bx + 1;
+            if inner_start < right {
+                buf.set_stringn(
+                    inner_start,
+                    p_rect.y,
+                    &badge_text,
+                    right.saturating_sub(inner_start) as usize,
+                    Style::default()
+                        .fg(badge_fg)
+                        .bg(orange)
+                        .add_modifier(Modifier::BOLD),
+                );
+            }
+            let cap_r = inner_start + badge_text.chars().count() as u16;
+            if cap_r < right {
+                buf.set_string(cap_r, p_rect.y, "\u{e0b4}", cap_style);
+            }
+        }
+
+        if t_rect.x < right {
+            buf.set_stringn(
+                t_rect.x,
+                t_rect.y,
+                terminal_label,
+                right.saturating_sub(t_rect.x) as usize,
+                t_style,
+            );
         }
     }
 

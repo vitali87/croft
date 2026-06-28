@@ -60,6 +60,6 @@ pub struct ReleaseNote {
 
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
-    kind: NoteKind::Feature,
-    summary: "New PROBLEMS tab in the bottom panel group, beside TERMINAL: aggregated workspace diagnostics grouped by file with a count badge, severity glyphs, and the source server. Click a file header to collapse it; click a diagnostic to jump the editor to that line.",
+    kind: NoteKind::Fix,
+    summary: "Polished the bottom panel tab strip: the PROBLEMS count now sits in a rounded orange brand pill, the active tab is underlined like a VS Code tab, and each terminal pane drops its redundant TERMINAL title since the strip already labels the group.",
 }];

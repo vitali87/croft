@@ -13,7 +13,6 @@ use ratatui::{
     buffer::Buffer,
     layout::Rect,
     style::{Color, Modifier, Style},
-    text::Span,
     widgets::{Block, Borders, Widget},
 };
 use std::io::{Read, Write};
@@ -806,38 +805,18 @@ impl Widget for &mut PtyTerminal {
         } else {
             Style::default().fg(Color::DarkGray)
         };
-        // Black theme (`focus_gradient` doubles as the theme flag pushed to
-        // every pane): chipless VS Code-style panel header — the gradient
-        // border carries the brand, so the title drops the legacy navy chip.
-        // Croft Dark keeps the historical white-on-navy chip.
-        let title = if self.focus_gradient {
-            Span::styled(
-                " TERMINAL ",
-                Style::default()
-                    .fg(crate::gradient::rgb_color(crate::gradient::PANEL_TITLE_FG))
-                    .add_modifier(Modifier::BOLD),
-            )
-        } else {
-            Span::styled(
-                " TERMINAL ",
-                Style::default()
-                    .fg(Color::White)
-                    .bg(Color::Rgb(0x1e, 0x3a, 0x6e))
-                    .add_modifier(Modifier::BOLD),
-            )
-        };
+        // The panel group's tab strip already labels this region "TERMINAL", so
+        // each pane stays titleless — a bare bordered box, matching VS Code's
+        // unlabelled split terminal panes. The border alone frames the pane.
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(block_style)
-            .title(title.clone());
+            .border_style(block_style);
         let inner = block.inner(area);
         block.render(area, buf);
         // Black theme: replace the solid focus border with the orange→green
-        // gradient (matching the welcome activity box), then re-stamp the
-        // title the gradient top edge just overwrote.
+        // gradient (matching the welcome activity box).
         if self.focused && self.focus_gradient {
             crate::gradient::paint_gradient_box(buf, area);
-            buf.set_span(area.x + 1, area.y, &title, title.width() as u16);
         }
         self.last_area = area;
         self.last_inner = inner;
