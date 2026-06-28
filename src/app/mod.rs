@@ -6327,16 +6327,16 @@ impl App {
             return;
         }
         let pointer = self.pointer_cell;
-        let dim = Color::Rgb(0x6c, 0x7d, 0x9c);
-        let active = Color::White;
+        // The codicon shape carries the on/off state (filled vs. hollow), like
+        // VS Code; colour only brightens on hover. White (not dim) so the icons
+        // read clearly against the tab-strip background.
+        let base = Color::Rgb(0xcc, 0xcc, 0xcc);
         let accent = Color::Rgb(0x4e, 0x9a, 0xff);
-        let mut paint = |x: u16, glyph: char, is_active: bool| -> Rect {
+        let mut paint = |x: u16, glyph: char| -> Rect {
             let color = if pointer == Some((x, y)) {
                 accent
-            } else if is_active {
-                active
             } else {
-                dim
+                base
             };
             frame
                 .buffer_mut()
@@ -6348,13 +6348,19 @@ impl App {
                 height: 1,
             }
         };
-        let side = paint(side_x, crate::icons::LAYOUT_TOGGLE_SIDEBAR, self.show_tree);
-        let panel = paint(
-            panel_x,
-            crate::icons::LAYOUT_TOGGLE_PANEL,
-            self.show_terminal,
-        );
-        let cust = paint(cust_x, crate::icons::LAYOUT_CUSTOMIZE, false);
+        let side_glyph = if self.show_tree {
+            crate::icons::LAYOUT_SIDEBAR_ON
+        } else {
+            crate::icons::LAYOUT_SIDEBAR_OFF
+        };
+        let panel_glyph = if self.show_terminal {
+            crate::icons::LAYOUT_PANEL_ON
+        } else {
+            crate::icons::LAYOUT_PANEL_OFF
+        };
+        let side = paint(side_x, side_glyph);
+        let panel = paint(panel_x, panel_glyph);
+        let cust = paint(cust_x, crate::icons::LAYOUT_CUSTOMIZE);
         self.layout_icon_areas = LayoutIconAreas {
             toggle_side_bar: side,
             toggle_panel: panel,

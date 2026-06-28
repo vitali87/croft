@@ -62,10 +62,14 @@ pub struct ReleaseNote {
 pub const RELEASE_NOTES: &[ReleaseNote] = &[
     ReleaseNote {
         kind: NoteKind::Feature,
-        summary: "Customize Layout: the ⛶ icon (top-right of the editor / welcome) and the gear menu open VS Code's layout controls — show/hide the activity bar, both side bars, panel, and status bar; dock the side bar left or right; align the panel; move the quick input.",
+        summary: "Customize Layout: the layout icon (top-right of the editor / welcome) and the gear menu open VS Code's layout controls — show/hide the activity bar, both side bars, panel, and status bar; dock the side bar left or right; align the panel; move the quick input.",
     },
     ReleaseNote {
         kind: NoteKind::Feature,
         summary: "New secondary side bar (Opt+Cmd/Ctrl+B) hosting the active file's Outline, plus Zen Mode (Cmd+K Z) that hides all chrome and restores it on the next press.",
+    },
+    ReleaseNote {
+        kind: NoteKind::Fix,
+        summary: "The layout toolbar now uses VS Code's actual codicons (layout-sidebar-left / layout-panel / layout) instead of plain geometric glyphs, so the icons match VS Code and reflect on/off state.",
     },
 ];

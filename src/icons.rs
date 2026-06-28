@@ -84,13 +84,19 @@ pub const ACTIVITY_SETTINGS: char = '\u{eb51}';
 
 /// The Customize Layout toolbar (top-right of the editor tab strip and the
 /// welcome screen) — croft's analog of VS Code's title-bar layout controls.
-/// Plain geometric glyphs (NOT half-block / quadrant art), chosen so they
-/// render in any terminal font without the codicon Nerd Font: a square for the
-/// side bar, a wide rectangle for the bottom panel, and the four-corners mark
-/// for "Customize Layout". These are the glyphs the layout-options mockup used.
-pub const LAYOUT_TOGGLE_SIDEBAR: char = '\u{25a2}';
-pub const LAYOUT_TOGGLE_PANEL: char = '\u{25ad}';
-pub const LAYOUT_CUSTOMIZE: char = '\u{26f6}';
+/// These are the *actual* VS Code codicons (VS Code's own title-bar icons), so
+/// the toolbar is visually identical to VS Code's. Codepoints verified on
+/// 2026-06-28 against the upstream codicon `mapping.json`
+/// (`layout-sidebar-left` 60403, `layout-sidebar-left-off` 60418,
+/// `layout-panel` 60402, `layout-panel-off` 60417, `layout` 60395); the Nerd
+/// Font preserves the codicon PUA block, so the same codepoints render in the
+/// terminal exactly like the activity-bar glyph fallback and Outline symbols.
+/// The glyph shape itself shows the on/off state, matching VS Code.
+pub const LAYOUT_SIDEBAR_ON: char = '\u{ebf3}';
+pub const LAYOUT_SIDEBAR_OFF: char = '\u{ec02}';
+pub const LAYOUT_PANEL_ON: char = '\u{ebf2}';
+pub const LAYOUT_PANEL_OFF: char = '\u{ec01}';
+pub const LAYOUT_CUSTOMIZE: char = '\u{ebeb}';
 
 /// Codicon + colour for an Outline symbol, mirroring VS Code's `symbol-*`
 /// glyphs and `symbolIcon.*Foreground` theme colours. Codepoints verified on
