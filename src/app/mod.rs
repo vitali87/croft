@@ -170,13 +170,15 @@ const FALLBACK_CELL_PIXEL: (u32, u32) = (10, 20);
 /// on the edge opposite the primary side bar. VS Code's auxiliary bar.
 const SECONDARY_SIDEBAR_WIDTH: u16 = 30;
 
-/// Cell box for each Customize Layout toolbar icon. 2 cells wide × 1 tall —
-/// with the usual ~1:2 cell aspect this is a ~square ≈20×20px image, roughly
-/// twice the size of a 1-cell font glyph, while staying within the single tab-
-/// strip row (no overlap with editor content). Icons are spaced one column
-/// apart, so the trio is `LAYOUT_ICON_CELLS_W*3 + 2` cells wide.
-const LAYOUT_ICON_CELLS_W: u16 = 2;
-const LAYOUT_ICON_CELLS_H: u16 = 1;
+/// Cell box for each Customize Layout toolbar icon: 4 cells wide × 2 tall —
+/// the same box as an activity-bar icon, so with the usual ~1:2 cell aspect it
+/// is a crisp ≈40×40px square, twice the size of the earlier 2×1 box. The
+/// icons are baked OPAQUE on the editor background so they paint in FRONT of
+/// the tab-strip / welcome top line (the line sits behind them). The two-row
+/// height intentionally overlaps the container's top edge, matching VS Code's
+/// title-bar toolbar floating above the content.
+const LAYOUT_ICON_CELLS_W: u16 = 4;
+const LAYOUT_ICON_CELLS_H: u16 = 2;
 
 /// Which edge the primary side bar (and the activity bar that flanks it) dock
 /// to. VS Code's "Primary Side Bar Position". Persisted via `crate::prefs`.
@@ -619,14 +621,21 @@ pub struct ActivityBarImages {
     settings_inactive: String,
     settings_hovered: String,
     /// Customize Layout toolbar icons (top-right of the editor / welcome),
-    /// baked at the 2×1-cell toolbar box on a transparent canvas so they
-    /// composite over the tab strip. The side-bar / panel icons carry an
-    /// on/off pair (filled vs. hollow), matching their current visibility.
+    /// baked OPAQUE at the 4×2-cell toolbar box so they paint in front of the
+    /// container's top line. The side-bar / panel icons carry an on/off pair
+    /// (filled vs. hollow) matching their visibility; every icon also has a
+    /// brighter `_hover` variant emitted while the pointer rests on it, exactly
+    /// like the activity-bar icons.
     layout_sidebar_on: String,
+    layout_sidebar_on_hover: String,
     layout_sidebar_off: String,
+    layout_sidebar_off_hover: String,
     layout_panel_on: String,
+    layout_panel_on_hover: String,
     layout_panel_off: String,
+    layout_panel_off_hover: String,
     layout_customize: String,
+    layout_customize_hover: String,
 }
 
 /// Single source of truth for the application's user-facing name.
@@ -1903,6 +1912,10 @@ pub struct App {
     /// Changing it arms `overlays.activity.mark_dirty()` so the swapped
     /// pre-baked image is re-emitted; it never triggers a re-bake.
     hovered_activity_icon: Option<ActivityIcon>,
+    /// Which layout toolbar icon the pointer is over (0 = side bar, 1 = panel,
+    /// 2 = customize), so a hover change can re-emit the brighter image variant
+    /// like [`Self::hovered_activity_icon`] does for the activity bar.
+    hovered_layout_icon: Option<usize>,
     /// On-screen keyboard for touch-only environments (Termux). `Some`
     /// while the bottom keyboard band is visible; taps on its keys
     /// synthesize `KeyEvent`s through `handle_key`, so they reach the
@@ -2519,6 +2532,7 @@ impl App {
             terminal_close_buttons: Vec::new(),
             pointer_cell: None,
             hovered_activity_icon: None,
+            hovered_layout_icon: None,
             osk: None,
             osk_auto: crate::iterm2_inline::detect_osk_auto(),
             last_content_width: 0,
@@ -2729,22 +2743,21 @@ impl App {
                 encode(src, ki::IconState::Hovered, off_y_bias, id)?,
             ))
         };
-        // Customize Layout toolbar icons: baked at the 2×1-cell box on a
-        // TRANSPARENT canvas (alpha 0) so the codicon floats over the tab-strip
-        // cells without painting a background rectangle, and tinted the muted
-        // grey resting colour like VS Code's title-bar icons (Inactive state =
-        // no selection pill). One image per icon; the side-bar / panel ids swap
-        // their on/off image in place.
+        // Customize Layout toolbar icons: baked OPAQUE on the editor bg at the
+        // 4×2-cell box so they paint IN FRONT of the container's top line
+        // (the line sits behind the icon's solid background). `Inactive` is the
+        // muted resting grey; `Hovered` is the bright variant emitted while the
+        // pointer rests on the icon. The side-bar / panel ids swap their on/off
+        // image in place.
         let layout_canvas_w = cell_w * LAYOUT_ICON_CELLS_W as u32;
         let layout_canvas_h = cell_h * LAYOUT_ICON_CELLS_H as u32;
-        let transparent = image::Rgba([0, 0, 0, 0]);
-        let bake_layout = |src_svg: &[u8], id: u32| -> Option<String> {
+        let bake_layout = |src_svg: &[u8], state: ki::IconState, id: u32| -> Option<String> {
             let baked = crate::iterm2_inline::compose_icon_svg(
                 src_svg,
                 layout_canvas_w,
                 layout_canvas_h,
-                ki::IconState::Inactive,
-                transparent,
+                state,
+                icon_bg,
                 0,
             )?;
             let raw = crate::iterm2_inline::build_inline_image(
@@ -2759,14 +2772,24 @@ impl App {
                 protocol, is_tmux, raw,
             ))
         };
-        let layout_imgs = (|| {
+        let bake_layout_pair = |src: &[u8], id: u32| -> Option<(String, String)> {
             Some((
-                bake_layout(ki::LAYOUT_SIDEBAR_ON_SRC_SVG, ki::KITTY_ID_LAYOUT_SIDEBAR)?,
-                bake_layout(ki::LAYOUT_SIDEBAR_OFF_SRC_SVG, ki::KITTY_ID_LAYOUT_SIDEBAR)?,
-                bake_layout(ki::LAYOUT_PANEL_ON_SRC_SVG, ki::KITTY_ID_LAYOUT_PANEL)?,
-                bake_layout(ki::LAYOUT_PANEL_OFF_SRC_SVG, ki::KITTY_ID_LAYOUT_PANEL)?,
-                bake_layout(ki::LAYOUT_CUSTOMIZE_SRC_SVG, ki::KITTY_ID_LAYOUT_CUSTOMIZE)?,
+                bake_layout(src, ki::IconState::Inactive, id)?,
+                bake_layout(src, ki::IconState::Hovered, id)?,
             ))
+        };
+        let layout_imgs = (|| {
+            let (so, soh) =
+                bake_layout_pair(ki::LAYOUT_SIDEBAR_ON_SRC_SVG, ki::KITTY_ID_LAYOUT_SIDEBAR)?;
+            let (sf, sfh) =
+                bake_layout_pair(ki::LAYOUT_SIDEBAR_OFF_SRC_SVG, ki::KITTY_ID_LAYOUT_SIDEBAR)?;
+            let (po, poh) =
+                bake_layout_pair(ki::LAYOUT_PANEL_ON_SRC_SVG, ki::KITTY_ID_LAYOUT_PANEL)?;
+            let (pf, pfh) =
+                bake_layout_pair(ki::LAYOUT_PANEL_OFF_SRC_SVG, ki::KITTY_ID_LAYOUT_PANEL)?;
+            let (cu, cuh) =
+                bake_layout_pair(ki::LAYOUT_CUSTOMIZE_SRC_SVG, ki::KITTY_ID_LAYOUT_CUSTOMIZE)?;
+            Some((so, soh, sf, sfh, po, poh, pf, pfh, cu, cuh))
         })();
         if let (
             Some((ea, ei, eh)),
@@ -2776,7 +2799,7 @@ impl App {
             Some((rda, rdi, rdh)),
             Some((exta, exti, exth)),
             Some((gea, gei, geh)),
-            Some((lso, lsf, lpo, lpf, lcu)),
+            Some((lso, lsoh, lsf, lsfh, lpo, lpoh, lpf, lpfh, lcu, lcuh)),
         ) = (
             bake(ki::EXPLORER_SRC_SVG, 0, ki::KITTY_ID_EXPLORER),
             bake(ki::SEARCH_SRC_SVG, 0, ki::KITTY_ID_SEARCH),
@@ -2814,10 +2837,15 @@ impl App {
                 settings_inactive: gei,
                 settings_hovered: geh,
                 layout_sidebar_on: lso,
+                layout_sidebar_on_hover: lsoh,
                 layout_sidebar_off: lsf,
+                layout_sidebar_off_hover: lsfh,
                 layout_panel_on: lpo,
+                layout_panel_on_hover: lpoh,
                 layout_panel_off: lpf,
+                layout_panel_off_hover: lpfh,
                 layout_customize: lcu,
+                layout_customize_hover: lcuh,
             });
         }
         // Run-and-Debug headline icon: the same debug-alt PNG used in the
@@ -3333,19 +3361,30 @@ impl App {
         // an activity icon swaps active/inactive. Independent of the activity
         // bar, so they still emit when it's hidden.
         let li = self.layout_icon_areas;
-        let side_img = if self.show_tree {
-            &images.layout_sidebar_on
-        } else {
-            &images.layout_sidebar_off
+        let hovered = |r: Rect| {
+            self.pointer_cell
+                .is_some_and(|(px, py)| rect_contains(r, px, py))
         };
-        let panel_img = if self.show_terminal {
-            &images.layout_panel_on
+        let side_img = match (self.show_tree, hovered(li.toggle_side_bar)) {
+            (true, false) => &images.layout_sidebar_on,
+            (true, true) => &images.layout_sidebar_on_hover,
+            (false, false) => &images.layout_sidebar_off,
+            (false, true) => &images.layout_sidebar_off_hover,
+        };
+        let panel_img = match (self.show_terminal, hovered(li.toggle_panel)) {
+            (true, false) => &images.layout_panel_on,
+            (true, true) => &images.layout_panel_on_hover,
+            (false, false) => &images.layout_panel_off,
+            (false, true) => &images.layout_panel_off_hover,
+        };
+        let cust_img = if hovered(li.customize) {
+            &images.layout_customize_hover
         } else {
-            &images.layout_panel_off
+            &images.layout_customize
         };
         blocks.push((li.toggle_side_bar, side_img.as_str()));
         blocks.push((li.toggle_panel, panel_img.as_str()));
-        blocks.push((li.customize, images.layout_customize.as_str()));
+        blocks.push((li.customize, cust_img.as_str()));
         blocks
             .into_iter()
             // A zero-width block means the icon is hidden (the activity bar is
@@ -4032,6 +4071,22 @@ impl App {
         let new_hover = self.activity_icon_at(col, row);
         if self.hovered_activity_icon != new_hover {
             self.hovered_activity_icon = new_hover;
+            self.overlays.activity.mark_dirty();
+        }
+        // Layout toolbar hover: same affordance, re-emit the brighter image
+        // variant only when the hovered icon changes.
+        let li = self.layout_icon_areas;
+        let new_layout_hover = if rect_contains(li.toggle_side_bar, col, row) {
+            Some(0)
+        } else if rect_contains(li.toggle_panel, col, row) {
+            Some(1)
+        } else if rect_contains(li.customize, col, row) {
+            Some(2)
+        } else {
+            None
+        };
+        if self.hovered_layout_icon != new_layout_hover {
+            self.hovered_layout_icon = new_layout_hover;
             self.overlays.activity.mark_dirty();
         }
         // Chrome button hints: dwell over a labelled control (activity-bar
@@ -6435,15 +6490,19 @@ impl App {
         }
         let pointer = self.pointer_cell;
         // The codicon shape carries the on/off state (filled vs. hollow), like
-        // VS Code; colour only brightens to the accent on hover.
+        // VS Code; colour brightens to the accent on hover. Glyphs sit centred
+        // in the 4-wide slot.
         let base = Color::Rgb(0xcc, 0xcc, 0xcc);
         let accent = Color::Rgb(0x4e, 0x9a, 0xff);
         let mut paint = |x: u16, glyph: char| {
             let hovered = pointer.is_some_and(|(px, py)| py == y && px >= x && px < x + w);
             let color = if hovered { accent } else { base };
-            frame
-                .buffer_mut()
-                .set_string(x, y, glyph.to_string(), Style::default().fg(color));
+            frame.buffer_mut().set_string(
+                x + w / 2,
+                y,
+                glyph.to_string(),
+                Style::default().fg(color),
+            );
         };
         let side_glyph = if self.show_tree {
             crate::icons::LAYOUT_SIDEBAR_ON

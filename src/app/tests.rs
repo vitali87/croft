@@ -469,10 +469,15 @@ fn dummy_activity_images() -> ActivityBarImages {
         settings_inactive: s(),
         settings_hovered: s(),
         layout_sidebar_on: s(),
+        layout_sidebar_on_hover: s(),
         layout_sidebar_off: s(),
+        layout_sidebar_off_hover: s(),
         layout_panel_on: s(),
+        layout_panel_on_hover: s(),
         layout_panel_off: s(),
+        layout_panel_off_hover: s(),
         layout_customize: s(),
+        layout_customize_hover: s(),
     }
 }
 
@@ -5824,10 +5829,15 @@ fn resize_arms_a_one_shot_terminal_clear_to_evict_stale_activity_icons() {
         settings_inactive: String::new(),
         settings_hovered: String::new(),
         layout_sidebar_on: String::new(),
+        layout_sidebar_on_hover: String::new(),
         layout_sidebar_off: String::new(),
+        layout_sidebar_off_hover: String::new(),
         layout_panel_on: String::new(),
+        layout_panel_on_hover: String::new(),
         layout_panel_off: String::new(),
+        layout_panel_off_hover: String::new(),
         layout_customize: String::new(),
+        layout_customize_hover: String::new(),
     });
     app.on_resize();
     assert!(
@@ -5878,10 +5888,15 @@ fn activity_bar_icons_moving_within_the_flush_arms_a_one_shot_terminal_clear() {
         settings_inactive: String::new(),
         settings_hovered: String::new(),
         layout_sidebar_on: String::new(),
+        layout_sidebar_on_hover: String::new(),
         layout_sidebar_off: String::new(),
+        layout_sidebar_off_hover: String::new(),
         layout_panel_on: String::new(),
+        layout_panel_on_hover: String::new(),
         layout_panel_off: String::new(),
+        layout_panel_off_hover: String::new(),
         layout_customize: String::new(),
+        layout_customize_hover: String::new(),
     });
     let place = |app: &mut App, base: u16| {
         app.sidebar_areas.explorer_icon = Rect::new(0, base, 2, 1);
@@ -13469,10 +13484,15 @@ fn hovering_a_non_selected_activity_icon_emits_its_hovered_variant() {
         settings_inactive: "GI".into(),
         settings_hovered: "GH".into(),
         layout_sidebar_on: "LS".into(),
+        layout_sidebar_on_hover: "LSh".into(),
         layout_sidebar_off: "LF".into(),
+        layout_sidebar_off_hover: "LFh".into(),
         layout_panel_on: "LP".into(),
+        layout_panel_on_hover: "LPh".into(),
         layout_panel_off: "LQ".into(),
+        layout_panel_off_hover: "LQh".into(),
         layout_customize: "LC".into(),
+        layout_customize_hover: "LCh".into(),
     });
     // Every view icon needs a non-empty block or the emit early-returns.
     app.sidebar_areas.explorer_icon = Rect::new(0, 0, 2, 1);
@@ -14202,21 +14222,24 @@ fn layout_toolbar_emits_2x_inline_images_reflecting_on_off_state() {
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     let mut imgs = dummy_activity_images();
     imgs.layout_sidebar_on = "SIDE_ON".into();
+    imgs.layout_sidebar_on_hover = "SIDE_ON_H".into();
     imgs.layout_sidebar_off = "SIDE_OFF".into();
     imgs.layout_panel_on = "PANEL_ON".into();
     imgs.layout_panel_off = "PANEL_OFF".into();
     imgs.layout_customize = "CUSTOMIZE".into();
+    imgs.layout_customize_hover = "CUSTOMIZE_H".into();
     app.overlays.activity.set_images(imgs);
-    // Place the toolbar (2 cells wide each), zero the activity bar so only the
+    // Place the toolbar (4 cells wide each), zero the activity bar so only the
     // layout icons survive the width filter.
     app.sidebar_areas = SidebarAreas::default();
     app.layout_icon_areas = LayoutIconAreas {
         toggle_side_bar: Rect::new(50, 0, LAYOUT_ICON_CELLS_W, LAYOUT_ICON_CELLS_H),
-        toggle_panel: Rect::new(53, 0, LAYOUT_ICON_CELLS_W, LAYOUT_ICON_CELLS_H),
-        customize: Rect::new(56, 0, LAYOUT_ICON_CELLS_W, LAYOUT_ICON_CELLS_H),
+        toggle_panel: Rect::new(55, 0, LAYOUT_ICON_CELLS_W, LAYOUT_ICON_CELLS_H),
+        customize: Rect::new(60, 0, LAYOUT_ICON_CELLS_W, LAYOUT_ICON_CELLS_H),
     };
     app.show_tree = true;
     app.show_terminal = false;
+    app.pointer_cell = None;
     let overlays = app.pending_activity_image_overlays();
     // Side bar shown -> the filled (ON) image; panel hidden -> the hollow (OFF).
     assert!(
@@ -14228,16 +14251,41 @@ fn layout_toolbar_emits_2x_inline_images_reflecting_on_off_state() {
     assert!(
         overlays
             .iter()
-            .any(|(pos, s)| *pos == (53, 0) && *s == "PANEL_OFF"),
+            .any(|(pos, s)| *pos == (55, 0) && *s == "PANEL_OFF"),
         "panel icon emits the OFF image when hidden"
     );
     assert!(
         overlays
             .iter()
-            .any(|(pos, s)| *pos == (56, 0) && *s == "CUSTOMIZE"),
+            .any(|(pos, s)| *pos == (60, 0) && *s == "CUSTOMIZE"),
         "customize icon always emits its image"
     );
-    // Flip both: the images swap to match.
+    // Pointer over the customize icon -> the brighter hover variant.
+    app.pointer_cell = Some((61, 1));
+    let overlays = app.pending_activity_image_overlays();
+    assert!(
+        overlays
+            .iter()
+            .any(|(pos, s)| *pos == (60, 0) && *s == "CUSTOMIZE_H"),
+        "customize icon emits the hover image under the pointer"
+    );
+    assert!(
+        overlays
+            .iter()
+            .any(|(pos, s)| *pos == (50, 0) && *s == "SIDE_ON"),
+        "a non-hovered icon keeps its resting image"
+    );
+    // Pointer over the side-bar icon, side bar shown -> the ON hover variant.
+    app.pointer_cell = Some((51, 0));
+    let overlays = app.pending_activity_image_overlays();
+    assert!(
+        overlays
+            .iter()
+            .any(|(pos, s)| *pos == (50, 0) && *s == "SIDE_ON_H"),
+        "side-bar icon emits the ON hover image under the pointer"
+    );
+    // Flip both visibilities: the images swap to match.
+    app.pointer_cell = None;
     app.show_tree = false;
     app.show_terminal = true;
     let overlays = app.pending_activity_image_overlays();
@@ -14249,7 +14297,7 @@ fn layout_toolbar_emits_2x_inline_images_reflecting_on_off_state() {
     assert!(
         overlays
             .iter()
-            .any(|(p, s)| *p == (53, 0) && *s == "PANEL_ON")
+            .any(|(p, s)| *p == (55, 0) && *s == "PANEL_ON")
     );
 }
 
