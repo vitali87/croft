@@ -170,15 +170,15 @@ const FALLBACK_CELL_PIXEL: (u32, u32) = (10, 20);
 /// on the edge opposite the primary side bar. VS Code's auxiliary bar.
 const SECONDARY_SIDEBAR_WIDTH: u16 = 30;
 
-/// Cell box for each Customize Layout toolbar icon: 4 cells wide × 2 tall —
-/// the same box as an activity-bar icon, so with the usual ~1:2 cell aspect it
-/// is a crisp ≈40×40px square, twice the size of the earlier 2×1 box. The
-/// icons are baked OPAQUE on the editor background so they paint in FRONT of
-/// the tab-strip / welcome top line (the line sits behind them). The two-row
-/// height intentionally overlaps the container's top edge, matching VS Code's
-/// title-bar toolbar floating above the content.
-const LAYOUT_ICON_CELLS_W: u16 = 4;
-const LAYOUT_ICON_CELLS_H: u16 = 2;
+/// Cell box for each Customize Layout toolbar icon: 2 cells wide × 1 tall —
+/// exactly HALF an activity-bar icon's `ACTIVITY_BAR_WIDTH`×`ACTIVITY_ICON_HEIGHT`
+/// (4×2) box, so the toolbar reads as a smaller chrome control than the far-left
+/// Explorer / Search icons, as intended. With the usual ~1:2 cell aspect this is
+/// a crisp ~square ≈20×20px image. Baked OPAQUE on the editor background so it
+/// paints in FRONT of the tab-strip / welcome top line (the line sits behind
+/// it), and stays within the single top row (no overlap with editor content).
+const LAYOUT_ICON_CELLS_W: u16 = 2;
+const LAYOUT_ICON_CELLS_H: u16 = 1;
 
 /// Which edge the primary side bar (and the activity bar that flanks it) dock
 /// to. VS Code's "Primary Side Bar Position". Persisted via `crate::prefs`.

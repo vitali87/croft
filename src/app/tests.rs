@@ -14261,7 +14261,7 @@ fn layout_toolbar_emits_2x_inline_images_reflecting_on_off_state() {
         "customize icon always emits its image"
     );
     // Pointer over the customize icon -> the brighter hover variant.
-    app.pointer_cell = Some((61, 1));
+    app.pointer_cell = Some((61, 0));
     let overlays = app.pending_activity_image_overlays();
     assert!(
         overlays

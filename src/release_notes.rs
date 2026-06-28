@@ -70,6 +70,6 @@ pub const RELEASE_NOTES: &[ReleaseNote] = &[
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "The layout toolbar icons now render as crisp 4x2-cell inline images (VS Code's layout-sidebar-left / layout-panel / layout codicons) the size of the activity-bar icons, painted in front of the container's top line, with a hover highlight; the side-bar / panel icons swap filled/hollow with their visibility.",
+        summary: "The layout toolbar icons (VS Code's layout-sidebar-left / layout-panel / layout codicons) render as crisp inline images sized to half an activity-bar icon, painted in front of the container's top line, with a hover highlight; the side-bar / panel icons swap filled/hollow with their visibility.",
     },
 ];
