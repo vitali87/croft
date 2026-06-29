@@ -1051,6 +1051,7 @@ fn shortcut_for(action: &MenuAction) -> Option<&'static str> {
         MenuAction::ToggleSideBar => Some("⌘B"),
         MenuAction::ToggleSecondarySideBar => Some("⌥⌘B"),
         MenuAction::TogglePanel => Some("⌃J"),
+        MenuAction::ToggleMinimap => Some("⌥⌘M"),
         MenuAction::ToggleZenMode => Some("⌘K Z"),
         MenuAction::CloseTabsToRight(_) => Some("⌘K →"),
         MenuAction::SelectForCompare(_) => Some("⌘K S"),
@@ -5395,6 +5396,10 @@ impl App {
             MenuEntry::item(
                 format!("{}Status Bar", check(self.status_bar_visible)),
                 MenuAction::ToggleStatusBar,
+            ),
+            MenuEntry::item(
+                format!("{}Minimap", check(self.minimap_visible)),
+                MenuAction::ToggleMinimap,
             ),
             MenuEntry::Separator,
             MenuEntry::header("Primary Side Bar Position"),
@@ -9875,6 +9880,10 @@ impl App {
         }
         if is_secondary_sidebar_toggle_key(key) {
             self.toggle_secondary_side_bar();
+            return Ok(());
+        }
+        if is_minimap_toggle_key(key) {
+            self.toggle_minimap();
             return Ok(());
         }
         if is_sidebar_toggle_key(key) {
@@ -16218,6 +16227,7 @@ impl App {
             Cmd::ToggleSecondarySideBar => self.toggle_secondary_side_bar(),
             Cmd::ToggleZenMode => self.toggle_zen_mode(),
             Cmd::ToggleTerminal => self.toggle_terminal(),
+            Cmd::ToggleMinimap => self.toggle_minimap(),
             Cmd::NewTerminal => match self.split_terminal() {
                 Ok(()) => {
                     self.status = format!("Split terminal: {} active", self.terminals.len());
@@ -19553,17 +19563,7 @@ impl App {
                     Err(e) => self.status = format!("New terminal failed: {e}"),
                 }
             }
-            MenuAction::ToggleMinimap => {
-                self.minimap_visible = !self.minimap_visible;
-                if !self.minimap_visible {
-                    self.disable_minimap_image();
-                }
-                self.status = if self.minimap_visible {
-                    String::from("Minimap on")
-                } else {
-                    String::from("Minimap off")
-                };
-            }
+            MenuAction::ToggleMinimap => self.toggle_minimap(),
             MenuAction::SetMinimapSide(side) => {
                 self.minimap_side = side;
                 // The strip jumps columns: evict the old placement so it
@@ -19939,6 +19939,21 @@ impl App {
     fn disable_minimap_image(&mut self) {
         self.overlays.minimap.disable();
         self.minimap_img_rect = Rect::default();
+    }
+
+    /// Show/hide the editor minimap (⌥⌘M, the minimap right-click menu, the
+    /// Customize Layout menu, and the "View: Toggle Minimap" palette command
+    /// all route here). Hiding evicts the cached strip image so it can't ghost.
+    fn toggle_minimap(&mut self) {
+        self.minimap_visible = !self.minimap_visible;
+        if !self.minimap_visible {
+            self.disable_minimap_image();
+        }
+        self.status = if self.minimap_visible {
+            String::from("Minimap on")
+        } else {
+            String::from("Minimap off")
+        };
     }
 
     /// Carve the minimap strip off `editor_area` when the minimap is on (v1:
@@ -21398,6 +21413,21 @@ fn is_secondary_sidebar_toggle_key(key: KeyEvent) -> bool {
         return false;
     };
     if !c.eq_ignore_ascii_case(&'b') {
+        return false;
+    }
+    if !key.modifiers.contains(KeyModifiers::ALT) || key.modifiers.contains(KeyModifiers::SHIFT) {
+        return false;
+    }
+    key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::SUPER)
+}
+
+/// Returns true for `Cmd+Opt+M` (the CSI-u forwarders decode it as ALT|SUPER):
+/// VS Code's "View: Toggle Minimap". SHIFT must not be held.
+fn is_minimap_toggle_key(key: KeyEvent) -> bool {
+    let KeyCode::Char(c) = key.code else {
+        return false;
+    };
+    if !c.eq_ignore_ascii_case(&'m') {
         return false;
     }
     if !key.modifiers.contains(KeyModifiers::ALT) || key.modifiers.contains(KeyModifiers::SHIFT) {

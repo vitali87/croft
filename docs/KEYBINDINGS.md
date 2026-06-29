@@ -56,7 +56,7 @@ Click the **⛶** icon at the top-right of the editor (or the welcome screen), o
 
 | Group | Options |
 |-------|---------|
-| Visibility | Activity Bar, Primary Side Bar (`Cmd`/`Ctrl`+`B`), Secondary Side Bar (`Opt`+`Cmd`/`Ctrl`+`B`), Panel (`Ctrl`+`J`), Status Bar |
+| Visibility | Activity Bar, Primary Side Bar (`Cmd`/`Ctrl`+`B`), Secondary Side Bar (`Opt`+`Cmd`/`Ctrl`+`B`), Panel (`Ctrl`+`J`), Status Bar, Minimap (`Opt`+`Cmd`/`Ctrl`+`M`) |
 | Primary Side Bar Position | Left / Right (moves the activity bar with it) |
 | Panel Alignment | Left / Center / Right / Justify (Justify spans the full width under the side bar) |
 | Quick Input Position | Top / Center (where Command Palette / Go to File appears) |

@@ -25,6 +25,13 @@ const CMD_OPT_R_HEX: &str = "0x1b 0x5b 0x31 0x31 0x34 0x3b 0x31 0x31 0x75";
 /// default menu item, so no NSUserKeyEquivalents relocation is needed.
 const CMD_OPT_C_KEY: &str = "0x63-0x180000-0x8";
 const CMD_OPT_C_HEX: &str = "0x1b 0x5b 0x39 0x39 0x3b 0x31 0x31 0x75";
+/// `Cmd+Opt+M` -> "View: Toggle Minimap". Modifier mask 0x180000
+/// (Cmd 0x100000 | Opt 0x80000), `kVK_ANSI_M` = 0x2e. CSI-u `ESC [ 109 ; 11 u`
+/// (109 = 'm'; modbyte 11 = 1 + Alt(2) + Super(8)) so crossterm decodes it as
+/// ALT|SUPER. macOS does not bind this chord to a default menu item, so no
+/// NSUserKeyEquivalents relocation is needed; the forwarder claims it.
+const CMD_OPT_M_KEY: &str = "0x6d-0x180000-0x2e";
+const CMD_OPT_M_HEX: &str = "0x1b 0x5b 0x31 0x30 0x39 0x3b 0x31 0x31 0x75";
 const CMD_SLASH_KEY: &str = "0x2f-0x100000-0x2c";
 const CMD_SLASH_HEX: &str = "0x1b 0x5b 0x34 0x37 0x3b 0x39 0x75";
 /// `Cmd+.` (period) for Quick Fix (VS Code's `editor.action.quickFix`).
@@ -482,6 +489,7 @@ pub(crate) mod payloads {
     pub(crate) const CMD_OPT_LEFT_HEX: &str = super::CMD_OPT_LEFT_HEX;
     pub(crate) const CMD_OPT_R_HEX: &str = super::CMD_OPT_R_HEX;
     pub(crate) const CMD_OPT_C_HEX: &str = super::CMD_OPT_C_HEX;
+    pub(crate) const CMD_OPT_M_HEX: &str = super::CMD_OPT_M_HEX;
     pub(crate) const CMD_OPT_RIGHT_HEX: &str = super::CMD_OPT_RIGHT_HEX;
     pub(crate) const CMD_OPT_UP_HEX: &str = super::CMD_OPT_UP_HEX;
     pub(crate) const CMD_OPT_DOWN_HEX: &str = super::CMD_OPT_DOWN_HEX;
@@ -745,6 +753,7 @@ pub fn apply_croft_key_settings(plist: &mut Value) -> Result<(), ITerm2Error> {
         (CMD_RBRACKET_KEY, CMD_RBRACKET_HEX),
         (CMD_OPT_R_KEY, CMD_OPT_R_HEX),
         (CMD_OPT_C_KEY, CMD_OPT_C_HEX),
+        (CMD_OPT_M_KEY, CMD_OPT_M_HEX),
         (CTRL_SHIFT_J_KEY, CTRL_SHIFT_J_HEX),
         (CMD_F12_KEY, CMD_F12_HEX),
         (CTRL_SHIFT_F12_KEY, CTRL_SHIFT_F12_HEX),
