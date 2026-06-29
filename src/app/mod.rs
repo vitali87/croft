@@ -7137,9 +7137,11 @@ impl App {
             .first()
             .map(|c| (c.x, c.y.saturating_add(1)))
             .unwrap_or((self.last_frame_area.width.saturating_sub(20), 1));
-        // The dropdown can overlap the welcome logo (an OSC-1337 / Kitty image);
-        // arm its one-shot clear so the cached image is evicted, not ghosted.
-        self.overlays.welcome.request_clear_if_displayed();
+        // The dropdown is anchored under the `⌄` caret in the terminal
+        // toolbar and grows downward into the terminal panel — it never
+        // overlaps the editor's welcome logo, so the cached OSC-1337 image
+        // is left intact rather than evicted (evicting it left the logo
+        // blank, since the welcome emit is gated off while a menu is open).
         self.context_menu = Some(ContextMenu {
             origin,
             items,

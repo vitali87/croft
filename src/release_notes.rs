@@ -61,15 +61,7 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[
     ReleaseNote {
-        kind: NoteKind::Feature,
-        summary: "Terminal profiles: the ⌄ caret beside + drops a menu to launch a new pane with a chosen shell.",
-    },
-    ReleaseNote {
-        kind: NoteKind::Feature,
-        summary: "Split terminal panes are labeled with their live foreground process (zsh, vim, node…).",
-    },
-    ReleaseNote {
-        kind: NoteKind::Feature,
-        summary: "Rename a pane (⌘K R) or clear it (⌘K K), also on a pane right-click menu.",
+        kind: NoteKind::Fix,
+        summary: "Opening the terminal profile (⌄) menu no longer blanks the welcome logo.",
     },
 ];
