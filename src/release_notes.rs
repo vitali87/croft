@@ -60,6 +60,6 @@ pub struct ReleaseNote {
 
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
-    kind: NoteKind::Feature,
-    summary: "New OUTPUT tab in the bottom panel group: a read-only log viewer with a channel dropdown (one per language server, plus Debug Adapter, Git, and Server Provisioning), level colouring with a minimum-level filter, and an RPC toggle that traces raw JSON-RPC per server. Click the dropdown to switch channels, or clear to empty one.",
+    kind: NoteKind::Fix,
+    summary: "The PROBLEMS count badge is now a tight circle that hugs the number, instead of a wide rounded rectangle.",
 }];

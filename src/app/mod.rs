@@ -7152,7 +7152,7 @@ impl App {
                 break;
             }
             let badge_w = if tab == BottomPanelTab::Problems && count > 0 {
-                format!(" {count} ").chars().count() as u16 + 2
+                format!("{count}").chars().count() as u16 + 2
             } else {
                 0
             };
@@ -7198,7 +7198,7 @@ impl App {
             }
             // Orange count pill (rounded caps over the strip bg) after PROBLEMS.
             if *badge_w > 0 {
-                let badge_text = format!(" {count} ");
+                let badge_text = format!("{count}");
                 let bx = rect.x + label.chars().count() as u16;
                 let cap_style = Style::default().fg(orange).bg(strip_bg);
                 if bx < right {
