@@ -4050,6 +4050,106 @@ impl Editor {
         }
     }
 
+    /// Number of text rows currently visible (the minimap viewport box height).
+    pub fn visible_rows(&self) -> usize {
+        self.text_rows()
+    }
+
+    /// Inclusive `(start_row, end_row)` of the active selection, or `None` when
+    /// there's no selection with area. Drives the minimap selection band.
+    pub fn selection_rows(&self) -> Option<(usize, usize)> {
+        let sel = self.selection?;
+        if !sel.has_area() {
+            return None;
+        }
+        let (start, end) = sel.normalised();
+        Some((start.0, end.0))
+    }
+
+    /// Move the cursor to `line` and center the viewport on it (minimap click /
+    /// drag navigation). The cursor moves too because the render's scroll-follow
+    /// snaps the viewport back to keep the caret visible; centering the caret
+    /// here means that follow logic leaves the chosen scroll position alone.
+    pub fn goto_line_centered(&mut self, line: usize) {
+        if self.lines.is_empty() {
+            return;
+        }
+        let line = line.min(self.lines.len() - 1);
+        self.cursor_row = line;
+        self.cursor_col = self.cursor_col.min(self.line_char_len(line));
+        let viewport = self.text_rows();
+        self.scroll = line
+            .saturating_sub(viewport / 2)
+            .min(self.lines.len().saturating_sub(viewport));
+        self.last_edit_kind = None;
+    }
+
+    /// Rasterize the whole document into a `w`x`h` RGBA buffer for the minimap:
+    /// one column per character (clipped to `w`), each non-whitespace char
+    /// painted in its syntax color. Whitespace stays `bg`, so indentation reads
+    /// as the file's shape, like VS Code's minimap. The lines are mapped into
+    /// `content_h` rows (top-aligned) rather than the full `h`: a short file
+    /// uses a fixed small per-line height and leaves the rest of the strip
+    /// blank, instead of stretching six lines down the whole column. For a file
+    /// long enough to fill the strip, `content_h == h` and the mapping is the
+    /// plain whole-file fit.
+    /// ponytail: 1px per char, clipped at strip width; sub-pixel char scaling
+    /// only if a wider strip ever needs to show more columns.
+    pub fn minimap_rgba(
+        &self,
+        w: u32,
+        h: u32,
+        content_h: u32,
+        bg: (u8, u8, u8),
+        fg: (u8, u8, u8),
+    ) -> Vec<u8> {
+        let mut buf = vec![0u8; (w * h * 4) as usize];
+        for px in buf.chunks_exact_mut(4) {
+            px[0] = bg.0;
+            px[1] = bg.1;
+            px[2] = bg.2;
+            px[3] = 0xff;
+        }
+        let total = self.lines.len().max(1) as u64;
+        for (i, line) in self.lines.iter().enumerate() {
+            let y0 = (i as u64 * content_h as u64 / total) as u32;
+            if y0 >= h {
+                break;
+            }
+            let y1 = (((i as u64 + 1) * content_h as u64 / total) as u32).clamp(y0 + 1, h);
+            let merged = merge_overlay(
+                self.highlights.get(i).map(Vec::as_slice).unwrap_or(&[]),
+                self.semantic_overlay
+                    .get(i)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]),
+            );
+            let mut si = 0usize;
+            for (col, (byte, ch)) in (0_u32..).zip(line.char_indices()) {
+                if col >= w {
+                    break;
+                }
+                while si < merged.len() && merged[si].end <= byte {
+                    si += 1;
+                }
+                if !ch.is_whitespace() {
+                    let (r, g, b) = if si < merged.len() && merged[si].start <= byte {
+                        span_rgb(merged[si].style, fg)
+                    } else {
+                        fg
+                    };
+                    for y in y0..y1 {
+                        let idx = ((y * w + col) * 4) as usize;
+                        buf[idx] = r;
+                        buf[idx + 1] = g;
+                        buf[idx + 2] = b;
+                    }
+                }
+            }
+        }
+        buf
+    }
+
     fn scroll_view_to(&mut self, top: usize) {
         let viewport = self.last_inner.height as usize;
         if viewport == 0 || self.lines.is_empty() {
@@ -4611,6 +4711,15 @@ fn shift_spans_for_view(spans: &[HiSpan], byte_start: usize) -> Vec<HiSpan> {
 /// gaps. This is the per-line realization of the VS Code / Zed "combined"
 /// rule: semantic tokens repaint the bytes they resolve, tree-sitter
 /// syntax fills the rest.
+/// Resolve a span's foreground to RGB for the minimap; non-RGB colors
+/// (named/indexed/reset) fall back to the editor's default text color.
+fn span_rgb(style: ratatui::style::Style, default: (u8, u8, u8)) -> (u8, u8, u8) {
+    match style.fg {
+        Some(ratatui::style::Color::Rgb(r, g, b)) => (r, g, b),
+        _ => default,
+    }
+}
+
 fn merge_overlay(base: &[HiSpan], over: &[HiSpan]) -> Vec<HiSpan> {
     if over.is_empty() {
         return base.to_vec();

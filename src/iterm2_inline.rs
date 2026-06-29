@@ -799,6 +799,7 @@ pub const KITTY_ID_EXTENSIONS: u32 = KITTY_ID_BASE + 14;
 pub const KITTY_ID_LAYOUT_SIDEBAR: u32 = KITTY_ID_BASE + 15;
 pub const KITTY_ID_LAYOUT_PANEL: u32 = KITTY_ID_BASE + 16;
 pub const KITTY_ID_LAYOUT_CUSTOMIZE: u32 = KITTY_ID_BASE + 17;
+pub const KITTY_ID_MINIMAP: u32 = KITTY_ID_BASE + 18;
 
 /// Apply tmux DCS passthrough wrapping to an inline-image escape when needed.
 /// Sixel passes through tmux natively (tmux built with sixel support renders it

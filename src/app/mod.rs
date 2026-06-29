@@ -1000,6 +1000,10 @@ enum MenuAction {
     ClearTerminal(usize),
     /// Terminal profile dropdown (`⌄`): open a new pane running this shell path.
     NewTerminalWithProfile(String),
+    /// Minimap right-click menu: show/hide the editor minimap.
+    ToggleMinimap,
+    /// Minimap right-click menu: move the strip to the given editor edge.
+    SetMinimapSide(MinimapSide),
 }
 
 /// Return the macOS-style keyboard shortcut hint to display on the right
@@ -1853,6 +1857,22 @@ pub struct App {
     /// is true, and preserves it across the theme-switch re-detect that would
     /// otherwise reset to `None` (sixel has no env signal to re-derive from).
     sixel_supported: bool,
+    /// VS Code-style editor minimap (rasterized document preview in a right/left
+    /// strip). On by default; toggled and re-sided from the strip's right-click
+    /// menu.
+    minimap_visible: bool,
+    minimap_side: MinimapSide,
+    /// Cached whole-file raster; recomposited (not rebaked) on scroll.
+    minimap_base: Option<MinimapBase>,
+    /// Hit-test rect of the on-screen minimap image (text-aligned rows), for
+    /// click-to-scroll and the right-click menu. Empty when the minimap is off.
+    minimap_img_rect: Rect,
+    /// Pixel height the lines are mapped into within the image (top-aligned;
+    /// `<=` the image's pixel height for short files). Click mapping divides by
+    /// this, not the full strip height, so clicks land on the right line.
+    minimap_content_h: u32,
+    /// A left-drag is panning the view via the minimap strip.
+    minimap_drag: bool,
     /// Clipboard read entrypoint. Production uses the host clipboard; tests
     /// can swap in a deterministic reader for Cmd+V routing assertions.
     clipboard_reader: fn() -> Option<String>,
@@ -2243,6 +2263,150 @@ pub struct EditorImageLayout {
     pub cell_w: u16,
     pub cell_h: u16,
     pub path: PathBuf,
+}
+
+/// Which edge of the editor pane the minimap strip sits on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MinimapSide {
+    Left,
+    Right,
+}
+
+/// Width of the minimap strip in cells (the user picked the ~6-cell option).
+const MINIMAP_WIDTH_CELLS: u16 = 6;
+/// Minimum editor-text width that must remain after carving the strip; below
+/// this the minimap is suppressed so the code never gets squeezed to nothing.
+const MINIMAP_MIN_EDITOR_WIDTH: u16 = 44;
+/// Maximum pixel height per source line in the minimap. Only kicks in for very
+/// short files: it caps a six-line file to a compact sliver instead of
+/// stretching those lines down the whole strip. Any file long enough that its
+/// natural fit is already <= this (roughly > a screenful) fills the strip
+/// exactly as a plain whole-file fit would, so normal files are unaffected.
+const MINIMAP_MAX_LINE_PX: u32 = 6;
+
+/// Cached full-document raster for the minimap. The expensive part (walking
+/// every line's syntax spans) runs only when `sig` changes; scrolling reuses
+/// `rgba` and just re-composites the viewport box on top.
+struct MinimapBase {
+    rgba: Vec<u8>,
+    w: u32,
+    h: u32,
+    /// (path, edit_seq, canvas_w_px, canvas_h_px, bg) — a change rebakes.
+    sig: (Option<PathBuf>, u64, u32, u32, (u8, u8, u8)),
+}
+
+/// Re-emit key for the minimap overlay. Differs from the base sig: the
+/// viewport fields move on scroll (recomposite, no rebake), the cell fields
+/// move on resize/layout.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MinimapLayout {
+    cell_x: u16,
+    cell_y: u16,
+    cell_w: u16,
+    cell_h: u16,
+    top: usize,
+    rows: usize,
+    total: usize,
+    edit_seq: u64,
+    side: MinimapSide,
+    /// Theme editor bg; a change here (theme switch) forces a rebake.
+    bg: (u8, u8, u8),
+    /// Active selection `(start_row, end_row)`; a change recomposites the band.
+    selection: Option<(usize, usize)>,
+}
+
+/// The per-frame minimap overlays (everything not baked into the raster).
+struct MinimapOverlay {
+    /// First visible line, and number of visible lines (the viewport box).
+    top: usize,
+    rows: usize,
+    total: usize,
+    light: bool,
+    /// Active selection `(start_row, end_row)`, marked by a thin left accent.
+    selection: Option<(usize, usize)>,
+    sel_rgb: (u8, u8, u8),
+    /// Pixel height the lines are mapped into (top-aligned); `<= h` for short
+    /// files so the viewport box and selection accent track the raster.
+    content_h: u32,
+}
+
+/// Composite the per-frame overlays onto the cached raster: the translucent
+/// viewport box (style A) blending the visible-line rows toward white (dark
+/// theme) or black (light), plus a thin left-edge accent in the selection color
+/// marking the selected rows. The accent is deliberately tiny so the minimap's
+/// look and feel is unchanged. Returns a fresh buffer.
+fn composite_minimap_viewport(base: &[u8], w: u32, h: u32, ov: MinimapOverlay) -> Vec<u8> {
+    let MinimapOverlay {
+        top,
+        rows,
+        total,
+        light,
+        selection,
+        sel_rgb,
+        content_h,
+    } = ov;
+    let mut buf = base.to_vec();
+    if total == 0 || w == 0 || h == 0 {
+        return buf;
+    }
+    // Map a 0-based line index to a pixel row, matching `minimap_rgba`'s
+    // top-aligned `content_h` scale.
+    let row_y = |line: usize| (line as u64 * content_h as u64 / total as u64) as u32;
+    // Blend cols `x0..x1` of rows `r0..r1` toward `tint` by alpha `a` (0..=255).
+    let band = |buf: &mut [u8], r0: u32, r1: u32, x0: u32, x1: u32, tint: [u16; 3], a: u16| {
+        for y in r0..r1.min(h) {
+            for x in x0..x1.min(w) {
+                let idx = ((y * w + x) * 4) as usize;
+                for k in 0..3 {
+                    let c = buf[idx + k] as u16;
+                    buf[idx + k] = ((c * (255 - a) + tint[k] * a) / 255) as u8;
+                }
+            }
+        }
+    };
+    // Viewport box: a translucent fill plus a crisp bright border so "where am
+    // I" is unmistakable. Clamp the visible range to the line count so an
+    // all-visible short file's box covers only its content, not the empty
+    // strip below it.
+    let y0 = row_y(top);
+    let y1 = row_y((top + rows).min(total)).clamp(y0 + 1, h);
+    // Fill (toward white on dark, black on light), then the four edges at a
+    // much higher alpha so the rectangle outline reads against both the dark
+    // strip and the colored code.
+    let fill: [u16; 3] = if light { [0, 0, 0] } else { [255, 255, 255] };
+    let edge: [u16; 3] = if light { [20, 20, 20] } else { [235, 240, 250] };
+    band(&mut buf, y0, y1, 0, w, fill, 46);
+    band(&mut buf, y0, y0 + 1, 0, w, edge, 200); // top
+    band(&mut buf, y1.saturating_sub(1), y1, 0, w, edge, 200); // bottom
+    band(&mut buf, y0, y1, 0, 1, edge, 200); // left
+    band(&mut buf, y0, y1, w.saturating_sub(1), w, edge, 200); // right
+    // Selection: a thin (~2-3px) accent stripe down the left edge of the
+    // selected rows, in the selection color. Tiny on purpose.
+    if let Some((s, e)) = selection {
+        let r0 = row_y(s);
+        let r1 = row_y(e + 1).clamp(r0 + 1, h);
+        let aw = (w / 12).clamp(1, 3);
+        band(
+            &mut buf,
+            r0,
+            r1,
+            0,
+            aw,
+            [sel_rgb.0 as u16, sel_rgb.1 as u16, sel_rgb.2 as u16],
+            210,
+        );
+    }
+    buf
+}
+
+/// Encode an RGBA pixel buffer to PNG (the format `build_inline_image` wants).
+fn rgba_to_png(rgba: Vec<u8>, w: u32, h: u32) -> Option<Vec<u8>> {
+    let img: image::RgbaImage = image::ImageBuffer::from_raw(w, h, rgba)?;
+    let mut out = Vec::new();
+    image::DynamicImage::ImageRgba8(img)
+        .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
+        .ok()?;
+    Some(out)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2660,6 +2824,12 @@ impl App {
             cell_pixel: None,
             inline_protocol: crate::iterm2_inline::detect_inline_image_protocol(),
             sixel_supported: false,
+            minimap_visible: true,
+            minimap_side: MinimapSide::Right,
+            minimap_base: None,
+            minimap_img_rect: Rect::default(),
+            minimap_content_h: 0,
+            minimap_drag: false,
             clipboard_reader: read_system_clipboard,
             remote_launch: None,
             pending_remote_launch_host: None,
@@ -7939,6 +8109,8 @@ impl App {
             // case a split was just collapsed back to the welcome screen.
             self.disable_editor_image(0);
             self.disable_editor_image(1);
+            // The welcome screen has no minimap (no document to preview).
+            self.disable_minimap_image();
             self.editor_seams.clear();
             // Keep the editor's hit-test rectangles fresh so the activity-bar
             // / tree click logic still works even though we skipped the
@@ -7995,13 +8167,32 @@ impl App {
                     self.update_editor_image_overlay(0, active_area);
                     self.disable_editor_image(1);
                 }
+                // ponytail: no minimap while the editor is split; per-group
+                // minimaps when someone asks for them.
+                self.disable_minimap_image();
                 active_area
+            } else if let Some((ed_rect, full_strip, img_rect)) = self.carve_minimap(editor_area) {
+                // Bg-fill the whole strip column so no stale cells show
+                // through, then paint the editor into the narrowed rect and
+                // bake the minimap raster into the text-aligned sub-rect.
+                frame.render_widget(
+                    ratatui::widgets::Block::default()
+                        .style(Style::default().bg(self.theme.editor_bg())),
+                    full_strip,
+                );
+                frame.render_widget(&mut self.editor, ed_rect);
+                self.editor_seams.clear();
+                self.update_editor_image_overlay(0, ed_rect);
+                self.disable_editor_image(1);
+                self.update_minimap_overlay(img_rect);
+                ed_rect
             } else {
                 frame.render_widget(&mut self.editor, editor_area);
                 self.editor_seams.clear();
                 self.update_editor_image_overlay(0, editor_area);
                 // No right pane: make sure its slot can't ghost an image.
                 self.disable_editor_image(1);
+                self.disable_minimap_image();
                 editor_area
             };
             let grad = self.popup_gradient();
@@ -17388,6 +17579,13 @@ impl App {
 
         match m.kind {
             MouseEventKind::Down(MouseButton::Right) => {
+                // Minimap strip right-click: the VS Code-style options menu
+                // (Minimap toggle + Side submenu). Checked first so the strip
+                // wins over the editor pane it sits beside.
+                if rect_contains(self.minimap_img_rect, m.column, m.row) {
+                    self.open_minimap_menu(m.column, m.row);
+                    return;
+                }
                 // Editor tab strip: right-click on a tab opens the
                 // Close / Close Others / Close to the Right / Close All
                 // menu. Routed here BEFORE the explorer branch so the
@@ -17894,6 +18092,13 @@ impl App {
                     self.tree_click.clear();
                     return;
                 }
+                if rect_contains(self.minimap_img_rect, m.column, m.row) {
+                    self.focus_pane(Pane::Editor);
+                    self.minimap_scroll_to_row(m.row);
+                    self.minimap_drag = true;
+                    self.editor_click.clear();
+                    return;
+                }
                 if in_editor_scrollbar {
                     self.focus_pane(Pane::Editor);
                     self.editor.scroll_to_bar_y(m.row);
@@ -18383,6 +18588,10 @@ impl App {
                     self.handle_splitter_drag(kind, m.column, m.row);
                     return;
                 }
+                if self.minimap_drag {
+                    self.minimap_scroll_to_row(m.row);
+                    return;
+                }
                 if self.editor_hscrollbar_drag {
                     self.editor.scroll_to_bar_x(m.column);
                     self.poke_cursor();
@@ -18519,6 +18728,9 @@ impl App {
                 // Releasing the button ends any terminal edge auto-scroll.
                 self.terminal_select_autoscroll = None;
                 if self.splitter_drag.take().is_some() {
+                    return;
+                }
+                if std::mem::take(&mut self.minimap_drag) {
                     return;
                 }
                 if self.scrollbar_drag.take().is_some() {
@@ -19341,6 +19553,23 @@ impl App {
                     Err(e) => self.status = format!("New terminal failed: {e}"),
                 }
             }
+            MenuAction::ToggleMinimap => {
+                self.minimap_visible = !self.minimap_visible;
+                if !self.minimap_visible {
+                    self.disable_minimap_image();
+                }
+                self.status = if self.minimap_visible {
+                    String::from("Minimap on")
+                } else {
+                    String::from("Minimap off")
+                };
+            }
+            MenuAction::SetMinimapSide(side) => {
+                self.minimap_side = side;
+                // The strip jumps columns: evict the old placement so it
+                // doesn't ghost, and force a rebake at the new position.
+                self.disable_minimap_image();
+            }
         }
     }
 
@@ -19594,6 +19823,243 @@ impl App {
 
     pub fn mark_editor_image_displayed(&mut self, side: usize) {
         self.overlays.editor[side].mark_displayed();
+    }
+
+    /// Bake/recomposite the editor minimap for `strip` (the text-aligned image
+    /// rect on the chosen edge). Mirrors `update_editor_image_overlay`: the
+    /// expensive whole-file raster is cached in `minimap_base` and only rebuilt
+    /// when its signature (content / size / theme) changes; scrolling reuses the
+    /// raster and just recomposites the viewport box. The per-frame hot path
+    /// early-returns at `layout_matches` before any allocation.
+    fn update_minimap_overlay(&mut self, strip: Rect) {
+        if !self.minimap_visible || !self.inline_images_enabled() {
+            self.disable_minimap_image();
+            return;
+        }
+        let Some((cw_px, ch_px)) = self.cell_pixel else {
+            self.disable_minimap_image();
+            return;
+        };
+        if strip.width == 0 || strip.height == 0 {
+            self.disable_minimap_image();
+            return;
+        }
+        self.minimap_img_rect = strip;
+        let cell_w = strip.width;
+        let cell_h = strip.height;
+        let bg = self.theme.editor_bg_rgb();
+        let top = self.editor.scroll;
+        let rows = self.editor.visible_rows();
+        let total = self.editor.lines.len();
+        let edit_seq = self.editor.edit_seq;
+        let selection = self.editor.selection_rows();
+        let desired = MinimapLayout {
+            cell_x: strip.x,
+            cell_y: strip.y,
+            cell_w,
+            cell_h,
+            top,
+            rows,
+            total,
+            edit_seq,
+            side: self.minimap_side,
+            bg,
+            selection,
+        };
+        if self.overlays.minimap.layout_matches(&desired) {
+            return;
+        }
+        self.overlays.minimap.request_clear_if_displayed();
+        // Cold path only: clone the path into the rebake signature.
+        let canvas_w = cell_w as u32 * cw_px;
+        let canvas_h = cell_h as u32 * ch_px;
+        // Cap each line's height so a short file stays a compact sliver at the
+        // top rather than stretching down the whole strip; a file long enough
+        // to fill the strip naturally reaches `canvas_h` and is unaffected.
+        let content_h = (total as u32 * MINIMAP_MAX_LINE_PX).min(canvas_h).max(1);
+        self.minimap_content_h = content_h;
+        // Luminance picks the default text color and the viewport tint so the
+        // box reads on either theme.
+        let light = 0.299 * bg.0 as f32 + 0.587 * bg.1 as f32 + 0.114 * bg.2 as f32 > 140.0;
+        let sig = (self.editor.path.clone(), edit_seq, canvas_w, canvas_h, bg);
+        if self.minimap_base.as_ref().map(|b| &b.sig) != Some(&sig) {
+            let fg = if light {
+                (0x38, 0x3a, 0x41)
+            } else {
+                (0xc5, 0xcd, 0xd9)
+            };
+            let rgba = self
+                .editor
+                .minimap_rgba(canvas_w, canvas_h, content_h, bg, fg);
+            self.minimap_base = Some(MinimapBase {
+                rgba,
+                w: canvas_w,
+                h: canvas_h,
+                sig,
+            });
+        }
+        let Some(base) = self.minimap_base.as_ref() else {
+            return;
+        };
+        let composited = composite_minimap_viewport(
+            &base.rgba,
+            base.w,
+            base.h,
+            MinimapOverlay {
+                top,
+                rows,
+                total,
+                light,
+                selection,
+                sel_rgb: self.theme.selection_rgb(),
+                content_h,
+            },
+        );
+        let (bw, bh) = (base.w, base.h);
+        let Some(png) = rgba_to_png(composited, bw, bh) else {
+            return;
+        };
+        if let Some(raw) = crate::iterm2_inline::build_inline_image(
+            self.inline_protocol,
+            &png,
+            cell_w,
+            cell_h,
+            false,
+            crate::iterm2_inline::KITTY_ID_MINIMAP,
+        ) {
+            let osc = crate::iterm2_inline::maybe_tmux_wrap(
+                self.inline_protocol,
+                crate::iterm2_inline::detect_tmux(),
+                raw,
+            );
+            self.overlays.minimap.set(osc, desired);
+        }
+    }
+
+    fn disable_minimap_image(&mut self) {
+        self.overlays.minimap.disable();
+        self.minimap_img_rect = Rect::default();
+    }
+
+    /// Carve the minimap strip off `editor_area` when the minimap is on (v1:
+    /// unsplit, image-capable terminals, enough width). Returns
+    /// `(editor_rect, full_strip, image_rect)`: the editor renders into
+    /// `editor_rect`, the whole `full_strip` column is bg-filled, and the
+    /// raster image occupies `image_rect` (aligned to the editor's text rows).
+    fn carve_minimap(&self, editor_area: Rect) -> Option<(Rect, Rect, Rect)> {
+        if !self.minimap_visible
+            || self.editor_layout.is_split()
+            || !self.inline_images_enabled()
+            || self.cell_pixel.is_none()
+            || editor_area.width < MINIMAP_WIDTH_CELLS + MINIMAP_MIN_EDITOR_WIDTH
+        {
+            return None;
+        }
+        let w = MINIMAP_WIDTH_CELLS;
+        let (ed_x, strip_x) = match self.minimap_side {
+            MinimapSide::Right => (editor_area.x, editor_area.x + editor_area.width - w),
+            MinimapSide::Left => (editor_area.x + w, editor_area.x),
+        };
+        let ed_rect = Rect {
+            x: ed_x,
+            y: editor_area.y,
+            width: editor_area.width - w,
+            height: editor_area.height,
+        };
+        let full_strip = Rect {
+            x: strip_x,
+            y: editor_area.y,
+            width: w,
+            height: editor_area.height,
+        };
+        // Align the image to the editor's text rows (tab strip + border +
+        // header above, border below) so it tracks the text vertically.
+        let (tab, border, header) = (1u16, 1u16, 1u16);
+        let img = if editor_area.height > tab + 2 * border + header {
+            Rect {
+                x: strip_x,
+                y: editor_area.y + tab + border + header,
+                width: w,
+                height: editor_area.height - (tab + 2 * border + header),
+            }
+        } else {
+            full_strip
+        };
+        Some((ed_rect, full_strip, img))
+    }
+
+    pub fn minimap_image_payload(&self) -> Option<(&str, &MinimapLayout)> {
+        if self.shortcuts_modal.is_some()
+            || self.file_finder.is_some()
+            || self.command_palette.is_some()
+            || self.process_picker.is_some()
+            || self.zoxide_jump.is_some()
+            || self.branch_picker.is_some()
+            || self.input_prompt.is_some()
+            || self.list_picker.is_some()
+        {
+            return None;
+        }
+        self.overlays.minimap.payload()
+    }
+
+    pub fn consume_minimap_image_clear(&mut self) -> bool {
+        self.overlays.minimap.consume_clear()
+    }
+
+    pub fn mark_minimap_image_displayed(&mut self) {
+        self.overlays.minimap.mark_displayed();
+    }
+
+    /// Map a click row inside the minimap strip to a document line and jump
+    /// there, centered. The vertical mapping uses the raster's `content_h`
+    /// (the lines occupy only the top `content_h` px for a short file), so a
+    /// click lands on the line actually under the cursor.
+    fn minimap_scroll_to_row(&mut self, row: u16) {
+        let r = self.minimap_img_rect;
+        let total = self.editor.lines.len();
+        if r.height == 0 || total == 0 {
+            return;
+        }
+        let ch_px = self.cell_pixel.map(|(_, h)| h).unwrap_or(1).max(1);
+        let dy_px = (row.saturating_sub(r.y)) as u32 * ch_px;
+        let content_h = self.minimap_content_h.max(1);
+        let line = (dy_px as usize * total / content_h as usize).min(total - 1);
+        self.editor.goto_line_centered(line);
+        self.poke_cursor();
+    }
+
+    /// Right-click on the minimap strip: a compact menu mirroring VS Code's
+    /// (Minimap toggle + Side submenu).
+    fn open_minimap_menu(&mut self, col: u16, row: u16) {
+        let check = |on: bool| if on { "\u{2713} " } else { "  " };
+        let items = vec![
+            MenuEntry::Item {
+                label: format!("{}Minimap", check(self.minimap_visible)),
+                action: MenuAction::ToggleMinimap,
+            },
+            MenuEntry::Submenu {
+                label: String::from("Side"),
+                items: vec![
+                    MenuEntry::Item {
+                        label: format!("{}Left", check(self.minimap_side == MinimapSide::Left)),
+                        action: MenuAction::SetMinimapSide(MinimapSide::Left),
+                    },
+                    MenuEntry::Item {
+                        label: format!("{}Right", check(self.minimap_side == MinimapSide::Right)),
+                        action: MenuAction::SetMinimapSide(MinimapSide::Right),
+                    },
+                ],
+            },
+        ];
+        self.context_menu = Some(ContextMenu {
+            origin: (col, row),
+            items,
+            selected: 0,
+            open_submenu: None,
+            submenu_selected: 0,
+            target_dir: self.tree.root.clone(),
+        });
     }
 
     pub fn welcome_image_emit_payload(&self) -> Option<(&str, &WelcomeLayout)> {
@@ -23276,6 +23742,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
                 || app.consume_input_prompt_image_clear()
                 || app.consume_list_picker_image_clear()
                 || app.consume_ssh_empty_state_image_clear()
+                || app.consume_minimap_image_clear()
                 || app.consume_activity_image_clear()
             {
                 terminal.clear()?;
@@ -23313,6 +23780,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
                 || app.consume_input_prompt_image_clear()
                 || app.consume_list_picker_image_clear()
                 || app.consume_ssh_empty_state_image_clear()
+                || app.consume_minimap_image_clear()
                 || app.consume_activity_image_clear()
             {
                 terminal.clear()?;
@@ -23357,6 +23825,22 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
                     let _ = out.flush();
                     app.mark_editor_image_displayed(side);
                 }
+            }
+            // Editor minimap: same bake-once / emit-each-frame overlay, painted
+            // after ratatui's diff so the raster lands on the strip cells.
+            if let Some((osc, layout)) = app.minimap_image_payload() {
+                use std::io::Write;
+                let mut out = stdout();
+                let cursor_on = app.cursor_should_be_visible();
+                let _ = write!(out, "\x1b[?25l\x1b[s");
+                let _ = write!(out, "\x1b[{};{}H", layout.cell_y + 1, layout.cell_x + 1);
+                let _ = out.write_all(osc.as_bytes());
+                let _ = write!(out, "\x1b[u");
+                if cursor_on {
+                    let _ = write!(out, "\x1b[?25h");
+                }
+                let _ = out.flush();
+                app.mark_minimap_image_displayed();
             }
             // Run-and-Debug headline icon: same re-emit-every-frame trick.
             // Only fires while the sidebar is on the Run-Debug view and the

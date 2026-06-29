@@ -327,6 +327,7 @@ pub struct OverlayManager {
     /// focus swap (a focus swap never moves a group's column).
     pub editor: [ImageOverlay<super::EditorImageLayout>; 2],
     pub welcome: ImageOverlay<super::WelcomeLayout>,
+    pub minimap: ImageOverlay<super::MinimapLayout>,
     pub hero: ImageOverlay<super::WelcomeLayout>,
     pub ssh: ImageOverlay<()>,
     pub run_debug: CellOverlay,

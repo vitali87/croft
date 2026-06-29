@@ -61,7 +61,11 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[
     ReleaseNote {
-        kind: NoteKind::Fix,
-        summary: "Opening the terminal profile (⌄) menu no longer blanks the welcome logo.",
+        kind: NoteKind::Feature,
+        summary: "Editor minimap: a rasterized file preview in a right-edge strip; click or drag it to jump.",
+    },
+    ReleaseNote {
+        kind: NoteKind::Feature,
+        summary: "Right-click the minimap to toggle it or move it to the left or right edge.",
     },
 ];

@@ -209,6 +209,12 @@ impl Theme {
         rgb(self.bg)
     }
 
+    /// The selection-highlight background as raw sRGB bytes (minimap selection
+    /// band).
+    pub fn selection_rgb(self) -> (u8, u8, u8) {
+        self.selection
+    }
+
     /// Alpha-composite `fg` over this theme's background at `alpha` (0.0..=1.0),
     /// returning an opaque color. Terminal cells can't render real
     /// transparency, so we pre-blend against the known per-theme background —

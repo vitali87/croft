@@ -6,6 +6,117 @@ fn key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
     KeyEvent::new(code, mods)
 }
 
+#[test]
+fn minimap_rgba_paints_chars_skips_whitespace() {
+    let mut e = crate::widgets::editor::Editor::new();
+    // Two leading spaces then a glyph: indentation must read as bg, the glyph
+    // in fg. Second (blank) line keeps the file at 2 rows so each maps to one
+    // pixel row in a height-2 canvas.
+    e.lines = vec![String::from("  x"), String::new()];
+    let bg = (0u8, 0, 0);
+    let fg = (200u8, 200, 200);
+    let buf = e.minimap_rgba(4, 2, 2, bg, fg);
+    let px = |x: u32, y: u32| {
+        let i = ((y * 4 + x) * 4) as usize;
+        (buf[i], buf[i + 1], buf[i + 2])
+    };
+    assert_eq!(px(0, 0), bg, "indentation stays background");
+    assert_eq!(px(1, 0), bg, "indentation stays background");
+    assert_eq!(px(2, 0), fg, "the glyph is painted in the default fg");
+}
+
+#[test]
+fn minimap_goto_moves_the_cursor() {
+    // The editor force-follows the cursor on render, so minimap navigation must
+    // move the caret to the target line or the scroll would snap straight back
+    // (the bug behind "clicking the minimap does nothing").
+    let mut e = crate::widgets::editor::Editor::new();
+    e.lines = (0..200).map(|i| format!("line {i}")).collect();
+    e.goto_line_centered(100);
+    assert_eq!(e.cursor_row, 100, "caret jumps to the clicked line");
+    assert!(e.scroll <= 100, "viewport scrolls toward the target");
+}
+
+#[test]
+fn minimap_short_file_does_not_stretch() {
+    // Two lines into a tall (h=10) canvas with content_h=4: the lines occupy
+    // the top 4 rows; the rest of the strip stays background (no stretching a
+    // short file down the whole column).
+    let mut e = crate::widgets::editor::Editor::new();
+    e.lines = vec![String::from("x"), String::from("y")];
+    let bg = (0u8, 0, 0);
+    let fg = (200u8, 200, 200);
+    let buf = e.minimap_rgba(1, 10, 4, bg, fg);
+    let px = |y: u32| {
+        let i = (y * 4) as usize;
+        (buf[i], buf[i + 1], buf[i + 2])
+    };
+    assert_eq!(px(0), fg, "first line sits at the top");
+    assert_eq!(
+        px(8),
+        bg,
+        "rows past the content stay background, not stretched"
+    );
+}
+
+#[test]
+fn minimap_viewport_box_lightens_visible_rows_only() {
+    // 1px-wide, 4px-tall black raster; viewport = top 2 of 4 lines.
+    let base = vec![0u8; 4 * 4];
+    let out = composite_minimap_viewport(
+        &base,
+        1,
+        4,
+        MinimapOverlay {
+            top: 0,
+            rows: 2,
+            total: 4,
+            light: false,
+            selection: None,
+            sel_rgb: (0, 0, 0),
+            content_h: 4,
+        },
+    );
+    let row = |y: usize| out[y * 4]; // R channel
+    assert!(row(0) > 0, "a visible row is lightened toward white");
+    assert!(row(1) > 0, "a visible row is lightened toward white");
+    assert_eq!(row(3), 0, "an off-screen row is untouched");
+}
+
+#[test]
+fn minimap_selection_band_tints_selected_rows() {
+    // 1px-wide, 4px-tall black raster; rows 2..=3 selected in red, viewport is
+    // the top row only, so the selection band shows on its own.
+    let base = vec![0u8; 4 * 4];
+    let out = composite_minimap_viewport(
+        &base,
+        1,
+        4,
+        MinimapOverlay {
+            top: 0,
+            rows: 1,
+            total: 4,
+            light: false,
+            selection: Some((2, 3)),
+            sel_rgb: (255, 0, 0),
+            content_h: 4,
+        },
+    );
+    let r = |y: usize| out[y * 4];
+    assert!(r(2) > 0, "selected row picks up the selection color");
+    assert!(r(3) > 0, "selected row picks up the selection color");
+}
+
+#[test]
+fn minimap_rgba_to_png_roundtrips() {
+    let png = rgba_to_png(vec![1u8; 2 * 2 * 4], 2, 2).expect("encode");
+    assert_eq!(
+        &png[1..4],
+        b"PNG",
+        "emits a PNG the inline-image path can use"
+    );
+}
+
 /// Display label of a menu entry ("---" for a divider) — test helper for the
 /// `MenuEntry`-based context menus.
 fn menu_label(e: &MenuEntry) -> &str {
