@@ -994,6 +994,12 @@ enum MenuAction {
     SetQuickInputPosition(QuickInputPosition),
     /// Customize Layout: toggle Zen Mode (hide all chrome / restore).
     ToggleZenMode,
+    /// Terminal pane right-click: rename the pane at `idx`.
+    RenameTerminal(usize),
+    /// Terminal pane right-click: clear the pane at `idx`'s screen + scrollback.
+    ClearTerminal(usize),
+    /// Terminal profile dropdown (`⌄`): open a new pane running this shell path.
+    NewTerminalWithProfile(String),
 }
 
 /// Return the macOS-style keyboard shortcut hint to display on the right
@@ -1045,6 +1051,8 @@ fn shortcut_for(action: &MenuAction) -> Option<&'static str> {
         MenuAction::CloseTabsToRight(_) => Some("⌘K →"),
         MenuAction::SelectForCompare(_) => Some("⌘K S"),
         MenuAction::CompareWithSelected { .. } => Some("⌘K C"),
+        MenuAction::RenameTerminal(_) => Some("⌘K R"),
+        MenuAction::ClearTerminal(_) => Some("⌘K K"),
         _ => None,
     }
 }
@@ -1618,6 +1626,9 @@ enum PromptKind {
         path: PathBuf,
         line: usize,
     },
+    /// Rename the terminal pane at `idx`. The buffer is pre-filled with its
+    /// current label; on commit the name overrides the auto label.
+    RenameTerminal(usize),
 }
 
 struct Prompt {
@@ -1934,6 +1945,9 @@ pub struct App {
     /// indexed in lock-step with `terminals`. Empty when the pane is hidden
     /// or every pane is too narrow for the label.
     terminal_add_buttons: Vec<Rect>,
+    /// Hit-test rectangles of the profile-caret (`⌄`) buttons - one per pane,
+    /// in lock-step with `terminals`. Clicking one opens the profile picker.
+    terminal_profile_buttons: Vec<Rect>,
     /// Hit-test rectangles of the "[-]" buttons - one per terminal pane,
     /// indexed in lock-step with `terminals`. Empty when only one terminal
     /// is open (closing the last one would leave the pane empty, which we
@@ -1966,6 +1980,12 @@ pub struct App {
     /// True while a poll thread is in flight, so cadence ticks don't pile up
     /// overlapping `lsof` invocations.
     port_poll_inflight: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Auto-label refresh for terminal panes: `(shell_pid, process_name)` pairs
+    /// resolved off the event loop, applied to the pane with that shell pid.
+    last_label_refresh: std::time::Instant,
+    label_rx: std::sync::mpsc::Receiver<Vec<(i32, String)>>,
+    label_tx: std::sync::mpsc::Sender<Vec<(i32, String)>>,
+    label_inflight: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Hit-test rect of the "PROBLEMS" tab in the panel tab strip. Empty when
     /// the panel is hidden.
     problems_tab_rect: Rect,
@@ -2302,6 +2322,8 @@ const PORT_TOAST_TTL: Duration = Duration::from_secs(12);
 /// How often the socket-table poll runs (the output scrape is continuous;
 /// this is the backstop for servers that announce nothing).
 const PORT_POLL_INTERVAL: Duration = Duration::from_secs(3);
+/// How often terminal pane labels are refreshed from their foreground process.
+const TERMINAL_LABEL_INTERVAL: Duration = Duration::from_millis(1500);
 
 struct RemoteLaunch {
     host: String,
@@ -2522,6 +2544,7 @@ impl App {
         let (search_query_tx, search_query_rx) = std::sync::mpsc::channel();
         let (search_results_tx, search_results_rx) = std::sync::mpsc::channel();
         let (port_poll_tx, port_poll_rx) = std::sync::mpsc::channel();
+        let (label_tx, label_rx) = std::sync::mpsc::channel();
         let search_root = root.clone();
         std::thread::spawn(move || {
             crate::widgets::search::search_worker_loop(
@@ -2662,6 +2685,7 @@ impl App {
             sidebar_splitter_x: None,
             terminal_splitter_y: None,
             terminal_add_buttons: Vec::new(),
+            terminal_profile_buttons: Vec::new(),
             terminal_close_buttons: Vec::new(),
             bottom_panel_tab: BottomPanelTab::Terminal,
             problems: crate::widgets::problems::ProblemsPanel::new(),
@@ -2672,6 +2696,10 @@ impl App {
             port_poll_rx,
             port_poll_tx,
             port_poll_inflight: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            last_label_refresh: std::time::Instant::now(),
+            label_rx,
+            label_tx,
+            label_inflight: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             problems_tab_rect: Rect::default(),
             output_tab_rect: Rect::default(),
             ports_tab_rect: Rect::default(),
@@ -7025,13 +7053,35 @@ impl App {
     /// see. Inserting at the end would scatter related splits across the
     /// row whenever the active terminal wasn't already on the right edge.
     pub fn split_terminal(&mut self) -> Result<()> {
-        let cwd = self
-            .terminal()
+        self.insert_terminal(
+            PtyTerminal::new(&self.next_terminal_cwd()).context("spawning terminal")?,
+        );
+        Ok(())
+    }
+
+    /// Open a new pane running a specific shell (a terminal profile) instead of
+    /// `$SHELL`. Same placement and focus behaviour as [`split_terminal`].
+    pub fn split_terminal_with_shell(&mut self, shell_path: &str) -> Result<()> {
+        let cwd = self.next_terminal_cwd();
+        self.insert_terminal(
+            PtyTerminal::new_shell(shell_path, &cwd).context("spawning terminal")?,
+        );
+        Ok(())
+    }
+
+    /// The cwd a new terminal should inherit: the active terminal's live
+    /// directory if it has one, else the workspace root.
+    fn next_terminal_cwd(&self) -> PathBuf {
+        self.terminal()
             .pid()
             .and_then(cwd_of_pid)
             .filter(|p| p.is_dir())
-            .unwrap_or_else(|| self.workspace_root.clone());
-        let term = PtyTerminal::new(&cwd).context("spawning terminal")?;
+            .unwrap_or_else(|| self.workspace_root.clone())
+    }
+
+    /// Insert `term` just after the active pane, make it active, and reveal the
+    /// terminal pane.
+    fn insert_terminal(&mut self, term: PtyTerminal) {
         let target = self.active_terminal + 1;
         self.terminals.insert(target, term);
         self.active_terminal = target;
@@ -7039,7 +7089,89 @@ impl App {
             self.show_terminal = true;
         }
         self.focus_pane(Pane::Terminal);
-        Ok(())
+    }
+
+    /// Available terminal profiles as `(shell_path, label)`: the shells in
+    /// `/etc/shells`, with the user's current `$SHELL` ensured present
+    /// (prepended) so the default is always an option even on a box with no
+    /// `/etc/shells`.
+    fn terminal_profiles(&self) -> Vec<(String, String)> {
+        let contents = std::fs::read_to_string("/etc/shells").unwrap_or_default();
+        let mut shells = crate::widgets::terminal::parse_shells(&contents);
+        if let Ok(current) = std::env::var("SHELL")
+            && !current.is_empty()
+        {
+            let base = std::path::Path::new(&current)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or(&current)
+                .to_string();
+            if !shells.iter().any(|(_, b)| *b == base) {
+                shells.insert(0, (current, base));
+            }
+        }
+        shells
+    }
+
+    /// Open the terminal-profile dropdown (VS Code's `⌄` next to `+`): a compact
+    /// context menu anchored under the caret, one row per shell. Picking a row
+    /// opens a new pane running that shell.
+    fn open_terminal_profile_picker(&mut self) {
+        let items: Vec<MenuEntry> = self
+            .terminal_profiles()
+            .into_iter()
+            .map(|(path, label)| MenuEntry::Item {
+                label,
+                action: MenuAction::NewTerminalWithProfile(path),
+            })
+            .collect();
+        if items.is_empty() {
+            self.status = String::from("No terminal profiles found");
+            return;
+        }
+        // Anchor under the `⌄` caret; the menu auto-clamps up/left to stay on
+        // screen. Fall back to the toolbar's top-right corner if the caret rect
+        // hasn't been painted yet.
+        let origin = self
+            .terminal_profile_buttons
+            .first()
+            .map(|c| (c.x, c.y.saturating_add(1)))
+            .unwrap_or((self.last_frame_area.width.saturating_sub(20), 1));
+        // The dropdown can overlap the welcome logo (an OSC-1337 / Kitty image);
+        // arm its one-shot clear so the cached image is evicted, not ghosted.
+        self.overlays.welcome.request_clear_if_displayed();
+        self.context_menu = Some(ContextMenu {
+            origin,
+            items,
+            selected: 0,
+            open_submenu: None,
+            submenu_selected: 0,
+            target_dir: self.tree.root.clone(),
+        });
+    }
+
+    /// Clear the terminal at `idx`'s screen and scrollback (Cmd+K K / menu).
+    fn clear_terminal_at(&mut self, idx: usize) {
+        if let Some(t) = self.terminals.get_mut(idx) {
+            t.clear_screen_and_scrollback();
+            self.status = String::from("Cleared terminal");
+        }
+    }
+
+    /// Open a prompt to rename the terminal pane at `idx` (Cmd+K R / menu),
+    /// pre-filled with its current label.
+    fn begin_rename_terminal(&mut self, idx: usize) {
+        let Some(t) = self.terminals.get(idx) else {
+            return;
+        };
+        let current = t.label().to_string();
+        self.prompt = Some(Prompt {
+            label: String::from("Rename Terminal"),
+            buffer: current,
+            kind: PromptKind::RenameTerminal(idx),
+            target_dir: PathBuf::new(),
+            error: None,
+        });
     }
 
     /// Drop the terminal at `idx`. Returns false (and does nothing) when
@@ -7956,20 +8088,40 @@ impl App {
                     let show_close = self.terminals.len() > 1;
                     let brand = self.theme.gradient();
                     self.terminal_add_buttons.clear();
+                    self.terminal_profile_buttons.clear();
                     self.terminal_close_buttons.clear();
-                    for col in cols.iter().take(self.terminals.len()) {
-                        let (add_rect, close_rect) = paint_terminal_pane_buttons(
+                    let multi = self.terminals.len() > 1;
+                    for (i, col) in cols.iter().enumerate().take(self.terminals.len()) {
+                        let buttons = paint_terminal_pane_buttons(
                             frame,
                             *col,
                             show_close,
                             brand,
                             self.pointer_cell,
                         );
-                        if let Some(r) = add_rect {
+                        if let Some(r) = buttons.add {
                             self.terminal_add_buttons.push(r);
                         }
-                        if let Some(r) = close_rect {
+                        if let Some(r) = buttons.profile {
+                            self.terminal_profile_buttons.push(r);
+                        }
+                        if let Some(r) = buttons.close {
                             self.terminal_close_buttons.push(r);
+                        }
+                        // Auto/manual pane label at top-left, only with 2+ panes
+                        // (a lone pane needs no name). Kept clear of the buttons.
+                        if multi {
+                            let label = self.terminals[i].label().to_string();
+                            let room = col.width.saturating_sub(14) as usize;
+                            if !label.is_empty() && room >= 3 {
+                                let shown: String = label.chars().take(room).collect();
+                                frame.buffer_mut().set_string(
+                                    col.x,
+                                    col.y,
+                                    format!(" {shown} "),
+                                    crate::widgets::header_pill::action_style(brand, false),
+                                );
+                            }
                         }
                     }
                 }
@@ -7978,6 +8130,7 @@ impl App {
                     // their hit rects so a click never phantom-matches a pane
                     // that isn't painted (mirrors the hidden-panel reset).
                     self.terminal_add_buttons.clear();
+                    self.terminal_profile_buttons.clear();
                     self.terminal_close_buttons.clear();
                     for t in self.terminals.iter_mut() {
                         t.last_area = Rect::default();
@@ -7988,6 +8141,7 @@ impl App {
                     // Same hidden-terminal reset as PROBLEMS: the OUTPUT view
                     // covers the panes, so their hit rects must not linger.
                     self.terminal_add_buttons.clear();
+                    self.terminal_profile_buttons.clear();
                     self.terminal_close_buttons.clear();
                     for t in self.terminals.iter_mut() {
                         t.last_area = Rect::default();
@@ -7998,6 +8152,7 @@ impl App {
                     // Same hidden-terminal reset: the PORTS view covers the
                     // panes, so their hit rects must not linger.
                     self.terminal_add_buttons.clear();
+                    self.terminal_profile_buttons.clear();
                     self.terminal_close_buttons.clear();
                     for t in self.terminals.iter_mut() {
                         t.last_area = Rect::default();
@@ -8007,6 +8162,7 @@ impl App {
             }
         } else {
             self.terminal_add_buttons.clear();
+            self.terminal_profile_buttons.clear();
             self.terminal_close_buttons.clear();
             self.problems_tab_rect = Rect::default();
             self.output_tab_rect = Rect::default();
@@ -8992,6 +9148,17 @@ impl App {
                 ]),
                 "Enter to rename symbol, Esc to cancel",
             ),
+            PromptKind::RenameTerminal(_) => (
+                ratatui::text::Line::from(vec![
+                    ratatui::text::Span::raw("> "),
+                    ratatui::text::Span::styled(
+                        p.buffer.as_str(),
+                        Style::default().fg(Color::White),
+                    ),
+                    ratatui::text::Span::styled("█", Style::default().fg(cursor_fg)),
+                ]),
+                "Enter to rename, Esc to cancel (blank clears the name)",
+            ),
             PromptKind::BreakpointCondition { .. } => (
                 ratatui::text::Line::from(vec![
                     ratatui::text::Span::raw("> "),
@@ -9186,6 +9353,22 @@ impl App {
             // Cmd+K Z: toggle Zen Mode (VS Code's binding).
             KeyCode::Char(c) if plain && c.eq_ignore_ascii_case(&'z') => {
                 self.toggle_zen_mode();
+                true
+            }
+            // Cmd+K K: clear the active terminal (VS Code clears with Cmd+K).
+            KeyCode::Char(c) if plain && c.eq_ignore_ascii_case(&'k') => {
+                if !self.show_terminal {
+                    self.show_terminal = true;
+                }
+                self.clear_terminal_at(self.active_terminal);
+                true
+            }
+            // Cmd+K R: rename the active terminal pane.
+            KeyCode::Char(c) if plain && c.eq_ignore_ascii_case(&'r') => {
+                if !self.show_terminal {
+                    self.show_terminal = true;
+                }
+                self.begin_rename_terminal(self.active_terminal);
                 true
             }
             _ => false,
@@ -14813,6 +14996,61 @@ impl App {
         });
     }
 
+    /// Refresh each pane's auto-label from its live foreground process. The
+    /// `tcgetpgrp` reads are cheap and stay on the loop; the `sysinfo` name
+    /// lookups (the slow part) run on a one-shot background thread, keyed by
+    /// shell pid so results land on the right pane even if panes moved. Returns
+    /// whether any label changed (for redraw).
+    fn refresh_terminal_labels(&mut self) -> bool {
+        let mut changed = false;
+        // Apply whatever the last background lookup resolved.
+        if let Some(labels) = self.label_rx.try_iter().last() {
+            for (shell_pid, name) in labels {
+                if let Some(t) = self
+                    .terminals
+                    .iter_mut()
+                    .find(|t| t.shell_pid() == Some(shell_pid))
+                    && t.label() != name
+                {
+                    t.set_auto_label(name);
+                    changed = true;
+                }
+            }
+        }
+        if self.last_label_refresh.elapsed() >= TERMINAL_LABEL_INTERVAL
+            && !self
+                .label_inflight
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            self.last_label_refresh = std::time::Instant::now();
+            // (shell_pid, foreground_pid) gathered cheaply on the loop.
+            let targets: Vec<(i32, i32)> = self
+                .terminals
+                .iter()
+                .filter_map(|t| match (t.shell_pid(), t.foreground_pid()) {
+                    (Some(sp), Some(fg)) => Some((sp, fg)),
+                    _ => None,
+                })
+                .collect();
+            if !targets.is_empty() {
+                let tx = self.label_tx.clone();
+                let inflight = self.label_inflight.clone();
+                inflight.store(true, std::sync::atomic::Ordering::Relaxed);
+                std::thread::spawn(move || {
+                    let resolved: Vec<(i32, String)> = targets
+                        .into_iter()
+                        .filter_map(|(sp, fg)| {
+                            crate::widgets::terminal::process_name(fg).map(|n| (sp, n))
+                        })
+                        .collect();
+                    let _ = tx.send(resolved);
+                    inflight.store(false, std::sync::atomic::Ordering::Relaxed);
+                });
+            }
+        }
+        changed
+    }
+
     /// `⏎` on a port: open it. A local (or already-forwarded) port opens
     /// straight away; a remote port that isn't forwarded yet is forwarded first,
     /// then opened.
@@ -17175,6 +17413,34 @@ impl App {
                     });
                     return;
                 }
+                // Terminal pane right-click: the `…`-overflow equivalent. Rename
+                // and Clear (the gaps vs VS Code's toolbar); split/close already
+                // have buttons and chords.
+                if self.bottom_panel_tab == BottomPanelTab::Terminal
+                    && let Some(idx) = terminal_hit
+                {
+                    self.active_terminal = idx;
+                    self.focus_pane(Pane::Terminal);
+                    let items = vec![
+                        MenuEntry::Item {
+                            label: String::from("Rename Terminal"),
+                            action: MenuAction::RenameTerminal(idx),
+                        },
+                        MenuEntry::Item {
+                            label: String::from("Clear"),
+                            action: MenuAction::ClearTerminal(idx),
+                        },
+                    ];
+                    self.context_menu = Some(ContextMenu {
+                        origin: (m.column, m.row),
+                        items,
+                        selected: 0,
+                        open_submenu: None,
+                        submenu_selected: 0,
+                        target_dir: self.tree.root.clone(),
+                    });
+                    return;
+                }
                 if in_tree && self.sidebar_view == SidebarView::Explorer {
                     self.focus_pane(Pane::Tree);
                     let node_idx = self.tree.node_at_y(m.row);
@@ -17530,6 +17796,14 @@ impl App {
                         self.status =
                             format!("Closed terminal: {} remaining", self.terminals.len());
                     }
+                    return;
+                }
+                if self
+                    .terminal_profile_buttons
+                    .iter()
+                    .any(|r| rect_contains(*r, m.column, m.row))
+                {
+                    self.open_terminal_profile_picker();
                     return;
                 }
                 if self
@@ -19052,6 +19326,19 @@ impl App {
                 });
             }
             MenuAction::ToggleZenMode => self.toggle_zen_mode(),
+            MenuAction::RenameTerminal(idx) => self.begin_rename_terminal(idx),
+            MenuAction::ClearTerminal(idx) => self.clear_terminal_at(idx),
+            MenuAction::NewTerminalWithProfile(shell) => {
+                let label = std::path::Path::new(&shell)
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or(&shell)
+                    .to_string();
+                match self.split_terminal_with_shell(&shell) {
+                    Ok(()) => self.status = format!("Opened {label} terminal"),
+                    Err(e) => self.status = format!("New terminal failed: {e}"),
+                }
+            }
         }
     }
 
@@ -19316,6 +19603,7 @@ impl App {
             || self.branch_picker.is_some()
             || self.input_prompt.is_some()
             || self.list_picker.is_some()
+            || self.context_menu.is_some()
             || self.connect_dialog.is_some()
             || !self.editor.is_blank_initial()
             || self.terminal_maximized
@@ -19997,6 +20285,19 @@ impl App {
                 let expr = prompt.buffer.clone();
                 self.prompt = None;
                 self.commit_breakpoint_condition(path, line, &expr);
+            }
+            PromptKind::RenameTerminal(idx) => {
+                let name = prompt.buffer.trim().to_string();
+                self.prompt = None;
+                if let Some(t) = self.terminals.get_mut(idx) {
+                    let cleared = name.is_empty();
+                    t.set_manual_name(if cleared { None } else { Some(name.clone()) });
+                    self.status = if cleared {
+                        String::from("Cleared terminal name")
+                    } else {
+                        format!("Renamed terminal to {name}")
+                    };
+                }
             }
         }
     }
@@ -21830,6 +22131,9 @@ fn find_python_venv(start: &Path, workspace_root: &Path) -> Option<(PathBuf, Pat
 
 const TERMINAL_ADD_LABEL: &str = " + ";
 const TERMINAL_CLOSE_LABEL: &str = " - ";
+/// Codicon chevron-down, matching the OUTPUT dropdown caret. Opens the terminal
+/// profile picker (VS Code's `∨` beside `+`).
+const TERMINAL_PROFILE_LABEL: &str = " \u{eab4} ";
 
 /// True when croft was invoked over an SSH login (or otherwise inside a
 /// remote shell). Used to throttle PTY-driven redraws further so the SSH
@@ -22176,11 +22480,13 @@ fn paint_terminal_pane_buttons(
     show_close_button: bool,
     brand: bool,
     pointer: Option<(u16, u16)>,
-) -> (Option<Rect>, Option<Rect>) {
+) -> TerminalPaneButtons {
     let add_w = TERMINAL_ADD_LABEL.chars().count() as u16;
+    let caret_w = TERMINAL_PROFILE_LABEL.chars().count() as u16;
     let close_w = TERMINAL_CLOSE_LABEL.chars().count() as u16;
+    let mut out = TerminalPaneButtons::default();
     if area.height == 0 {
-        return (None, None);
+        return out;
     }
     let y = area.y;
     // Styling is the shared header-action look (see `header_pill::action_style`):
@@ -22190,35 +22496,54 @@ fn paint_terminal_pane_buttons(
         let hovered = pointer.is_some_and(|(px, py)| py == y && px >= x && px < x + w);
         crate::widgets::header_pill::action_style(brand, hovered)
     };
-    let mut add_rect: Option<Rect> = None;
-    let mut close_rect: Option<Rect> = None;
-
+    // Right to left: [+] at the edge, the profile caret just left of it, then
+    // [-]. The caret mirrors VS Code's `∨` next to `+`.
     if area.width >= add_w + 2 {
         let x = area.x + area.width - add_w - 1;
         frame
             .buffer_mut()
             .set_string(x, y, TERMINAL_ADD_LABEL, style_at(x, add_w));
-        add_rect = Some(Rect {
+        out.add = Some(Rect {
             x,
             y,
             width: add_w,
             height: 1,
         });
     }
-    if show_close_button && area.width >= add_w + close_w + 2 {
-        // Sit just to the left of the add button.
-        let x = area.x + area.width - add_w - close_w - 1;
+    if area.width >= add_w + caret_w + 2 {
+        let x = area.x + area.width - add_w - caret_w - 1;
+        frame
+            .buffer_mut()
+            .set_string(x, y, TERMINAL_PROFILE_LABEL, style_at(x, caret_w));
+        out.profile = Some(Rect {
+            x,
+            y,
+            width: caret_w,
+            height: 1,
+        });
+    }
+    if show_close_button && area.width >= add_w + caret_w + close_w + 2 {
+        let x = area.x + area.width - add_w - caret_w - close_w - 1;
         frame
             .buffer_mut()
             .set_string(x, y, TERMINAL_CLOSE_LABEL, style_at(x, close_w));
-        close_rect = Some(Rect {
+        out.close = Some(Rect {
             x,
             y,
             width: close_w,
             height: 1,
         });
     }
-    (add_rect, close_rect)
+    out
+}
+
+/// Hit rects for one terminal pane's header buttons, as laid out by the most
+/// recent render. Any may be `None` when the pane is too narrow.
+#[derive(Default)]
+struct TerminalPaneButtons {
+    add: Option<Rect>,
+    profile: Option<Rect>,
+    close: Option<Rect>,
 }
 
 fn key_to_bytes(key: KeyEvent) -> Vec<u8> {
@@ -22828,6 +23153,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let remote_changed = app.refresh_remote_if_config_changed();
         let pulls_changed = app.drain_remote_pulls();
         let ports_changed = app.drain_ports_and_poll();
+        let labels_changed = app.refresh_terminal_labels();
         let connect_changed = app.poll_connect_dialog();
         let install_changed = app.poll_install_session();
         let update_changed = app.poll_update_watch();
@@ -22888,6 +23214,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             || remote_changed
             || pulls_changed
             || ports_changed
+            || labels_changed
             || connect_changed
             || install_changed
             || update_changed

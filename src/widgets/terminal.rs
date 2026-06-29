@@ -153,6 +153,12 @@ pub struct PtyTerminal {
     pub last_area: Rect,
     pub last_inner: Rect,
     selection: Option<Selection>,
+    /// User-given pane name (via rename), overriding the auto label. `None`
+    /// until the user renames the pane.
+    manual_name: Option<String>,
+    /// Live foreground-process label (`zsh`, `vim`, `node`…), refreshed off the
+    /// event loop on a cadence. Empty until the first refresh resolves.
+    auto_label: String,
 }
 
 /// Pick the program + args to spawn the user's interactive shell so it
@@ -182,10 +188,61 @@ pub fn interactive_shell_invocation(shell_path: &str) -> (String, Vec<String>) {
     (shell_path.to_string(), args)
 }
 
+/// Parse `/etc/shells` into `(path, basename)` terminal profiles: skip comments
+/// and blanks, keep absolute paths only, and dedupe by basename (first wins, so
+/// `/bin/bash` shadows `/usr/local/bin/bash`). The basename is the label shown.
+pub fn parse_shells(contents: &str) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() || !line.starts_with('/') {
+            continue;
+        }
+        let base = std::path::Path::new(line)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(line)
+            .to_string();
+        if out.iter().any(|(_, b)| *b == base) {
+            continue;
+        }
+        out.push((line.to_string(), base));
+    }
+    out
+}
+
+/// Resolve a pid to its command name (basename), cross-platform, via `sysinfo`
+/// (no subprocess). Used to label a terminal pane with its foreground process.
+/// Refreshes only the one pid, so it's cheap, but still runs off the event loop.
+pub fn process_name(pid: i32) -> Option<String> {
+    use sysinfo::{Pid, ProcessesToUpdate, System};
+    if pid <= 0 {
+        return None;
+    }
+    let p = Pid::from(pid as usize);
+    let mut sys = System::new();
+    sys.refresh_processes(ProcessesToUpdate::Some(&[p]), true);
+    sys.process(p)
+        .map(|pr| pr.name().to_string_lossy().to_string())
+        .filter(|n| !n.is_empty())
+}
+
+/// The label to show for a pane: a manual name wins, else the live foreground
+/// process name.
+pub fn pick_pane_label<'a>(manual: Option<&'a str>, auto: &'a str) -> &'a str {
+    manual.unwrap_or(auto)
+}
+
 impl PtyTerminal {
     pub fn new(cwd: &std::path::Path) -> Result<Self> {
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
-        let (program, args) = interactive_shell_invocation(&shell);
+        Self::new_shell(&shell, cwd)
+    }
+
+    /// Spawn an interactive login session for a specific shell (a terminal
+    /// profile), rather than `$SHELL`. The same login-flag handling as [`new`].
+    pub fn new_shell(shell_path: &str, cwd: &std::path::Path) -> Result<Self> {
+        let (program, args) = interactive_shell_invocation(shell_path);
         let mut cmd = CommandBuilder::new(&program);
         for a in &args {
             cmd.arg(a);
@@ -336,7 +393,37 @@ impl PtyTerminal {
             last_area: Rect::default(),
             last_inner: Rect::default(),
             selection: None,
+            manual_name: None,
+            auto_label: String::new(),
         })
+    }
+
+    /// The pane's foreground process group leader pid (what owns the tty now):
+    /// the shell at a prompt, or a running command. `None` if unavailable.
+    pub fn foreground_pid(&self) -> Option<i32> {
+        self.master.process_group_leader()
+    }
+
+    /// The shell's own pid, stable for this pane's lifetime (the key the app
+    /// uses to match async label lookups back to the right pane).
+    pub fn shell_pid(&self) -> Option<i32> {
+        self.shell_pid
+    }
+
+    /// The label to show for this pane: manual name if set, else the live
+    /// foreground-process label.
+    pub fn label(&self) -> &str {
+        pick_pane_label(self.manual_name.as_deref(), &self.auto_label)
+    }
+
+    /// Set the foreground-process label (from the off-loop refresh).
+    pub fn set_auto_label(&mut self, label: String) {
+        self.auto_label = label;
+    }
+
+    /// Set or clear the user's manual pane name (a blank name clears it).
+    pub fn set_manual_name(&mut self, name: Option<String>) {
+        self.manual_name = name.filter(|n| !n.trim().is_empty());
     }
 
     pub fn take_dirty(&self) -> bool {
@@ -599,6 +686,20 @@ impl PtyTerminal {
     pub fn reset_scrollback(&mut self) {
         let mut term = self.term.lock();
         term.scroll_display(Scroll::Bottom);
+        self.pty_dirty.store(true, Ordering::Release);
+    }
+
+    /// Clear the visible screen and scrollback history (VS Code's terminal
+    /// "Clear"), homing the cursor. Feeds the standard erase sequences into the
+    /// grid (`ED 3` wipes scrollback, `ED 2` the screen); the shell redraws its
+    /// prompt on the next keystroke. Does not touch the running program.
+    pub fn clear_screen_and_scrollback(&mut self) {
+        let mut processor = Processor::<StdSyncHandler>::new();
+        {
+            let mut term = self.term.lock();
+            processor.advance(&mut *term, b"\x1b[3J\x1b[2J\x1b[H");
+            term.scroll_display(Scroll::Bottom);
+        }
         self.pty_dirty.store(true, Ordering::Release);
     }
 
@@ -1153,6 +1254,35 @@ mod tests {
     }
 
     #[test]
+    fn clear_screen_and_scrollback_wipes_the_grid() {
+        fn dump(term: &PtyTerminal) -> String {
+            let t = term.term.lock();
+            let rows = t.screen_lines();
+            let cols = t.columns();
+            let off = t.grid().display_offset() as i32;
+            extract_selection_text(&t, -off, 0, rows as i32 - 1 - off, cols.saturating_sub(1))
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let mut term =
+            PtyTerminal::new_running("/bin/echo", &[String::from("CLEAR-PROBE-XYZ")], tmp.path())
+                .unwrap();
+        let mut waited = 0u32;
+        while waited < 4000 && !dump(&term).contains("CLEAR-PROBE-XYZ") {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            waited += 20;
+        }
+        assert!(
+            dump(&term).contains("CLEAR-PROBE-XYZ"),
+            "probe present before clear"
+        );
+        term.clear_screen_and_scrollback();
+        assert!(
+            !dump(&term).contains("CLEAR-PROBE-XYZ"),
+            "clear wipes the screen and scrollback"
+        );
+    }
+
+    #[test]
     fn change_cwd_writes_cd_command_to_pty() {
         let tmp = tempfile::tempdir().unwrap();
         let mut term = PtyTerminal::new(tmp.path()).unwrap();
@@ -1500,5 +1630,35 @@ mod tests {
         // the way to the last live line (FFFF = Line(2)).
         let all = extract_selection_text(&t, -3, 0, 2, 19);
         assert_eq!(all, "AAAA\nBBBB\nCCCC\nDDDD\nEEEE\nFFFF");
+    }
+
+    #[test]
+    fn process_name_resolves_a_live_pid() {
+        let me = std::process::id() as i32;
+        let name = process_name(me);
+        assert!(
+            name.as_deref().is_some_and(|n| !n.is_empty()),
+            "the test process resolves to a non-empty name: {name:?}"
+        );
+    }
+
+    #[test]
+    fn pick_pane_label_prefers_a_manual_name() {
+        assert_eq!(pick_pane_label(Some("server"), "zsh"), "server");
+        assert_eq!(pick_pane_label(None, "vim"), "vim");
+        assert_eq!(pick_pane_label(None, ""), "");
+    }
+
+    #[test]
+    fn parse_shells_skips_comments_and_dedupes_by_basename() {
+        let s = "# /etc/shells\n/bin/zsh\n/bin/bash\n/usr/local/bin/bash\n\nnot-a-path\n/usr/bin/fish\n";
+        let p = parse_shells(s);
+        let bases: Vec<&str> = p.iter().map(|(_, b)| b.as_str()).collect();
+        assert_eq!(
+            bases,
+            vec!["zsh", "bash", "fish"],
+            "comments/blanks/non-paths skipped, basenames deduped"
+        );
+        assert_eq!(p[0].0, "/bin/zsh", "full path retained");
     }
 }

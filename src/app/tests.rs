@@ -13196,6 +13196,116 @@ fn problems_panel_aggregates_the_store_across_files() {
 }
 
 #[test]
+fn renaming_a_terminal_pane_sets_and_clears_its_label() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.begin_rename_terminal(0);
+    match app.prompt.as_mut() {
+        Some(p) => {
+            assert!(matches!(p.kind, super::PromptKind::RenameTerminal(0)));
+            p.buffer = "logs".into();
+        }
+        None => panic!("rename prompt did not open"),
+    }
+    app.commit_prompt();
+    assert_eq!(
+        app.terminals[0].label(),
+        "logs",
+        "rename sets the manual name"
+    );
+    // A blank rename clears the manual name (falls back to the auto label).
+    app.begin_rename_terminal(0);
+    app.prompt.as_mut().unwrap().buffer = "   ".into();
+    app.commit_prompt();
+    assert_ne!(
+        app.terminals[0].label(),
+        "logs",
+        "blank rename clears the name"
+    );
+}
+
+#[test]
+fn a_second_pane_shows_its_label() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.bottom_panel_tab = BottomPanelTab::Terminal;
+    app.show_terminal = true;
+    // One pane => no label clutter; split to two, name the first.
+    app.split_terminal().unwrap();
+    app.terminals[0].set_manual_name(Some("server".into()));
+    draw(&mut app, 160, 50);
+    let buf_text: String = {
+        let backend = ratatui::backend::TestBackend::new(160, 50);
+        let mut term = ratatui::Terminal::new(backend).unwrap();
+        term.draw(|f| app.render(f)).unwrap();
+        term.backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect()
+    };
+    assert!(
+        buf_text.contains("server"),
+        "the named pane shows its label"
+    );
+}
+
+#[test]
+fn clicking_the_profile_caret_opens_an_anchored_shell_menu() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.bottom_panel_tab = BottomPanelTab::Terminal;
+    app.show_terminal = true;
+    draw(&mut app, 140, 50);
+    let caret = *app
+        .terminal_profile_buttons
+        .first()
+        .expect("the profile caret is rendered on the pane header");
+    assert!(app.context_menu.is_none());
+    left_click(&mut app, caret.x, caret.y);
+    let menu = app
+        .context_menu
+        .as_ref()
+        .expect("a context menu opens on caret click");
+    // Anchored at the caret (drops one row below it), not a centered modal.
+    assert_eq!(
+        menu.origin,
+        (caret.x, caret.y + 1),
+        "the menu anchors under the caret",
+    );
+    // Every row launches a shell profile.
+    assert!(!menu.items.is_empty(), "the menu lists shells");
+    assert!(
+        menu.items.iter().all(|e| matches!(
+            e,
+            MenuEntry::Item {
+                action: MenuAction::NewTerminalWithProfile(_),
+                ..
+            }
+        )),
+        "every row opens a new terminal with a shell profile",
+    );
+}
+
+#[test]
+fn opening_the_profile_menu_arms_the_welcome_image_clear() {
+    // The dropdown draws over the welcome screen, whose croft logo is an
+    // OSC-1337 / Kitty image cached by the terminal. Without arming the clear
+    // the logo ghosts on top of the menu. Opening it must request the welcome
+    // clear so the main loop evicts the cached image.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.overlays.welcome.mark_displayed();
+    app.open_terminal_profile_picker();
+    assert!(app.context_menu.is_some(), "the menu opens");
+    assert!(
+        app.consume_welcome_image_clear(),
+        "opening the profile menu must arm the welcome image clear so the logo is evicted",
+    );
+}
+
+#[test]
 fn clicking_the_ports_tab_switches_the_panel_view() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();

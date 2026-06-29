@@ -304,6 +304,12 @@ Disabling takes effect immediately for the viewers and Vim (a disabled PDF/CSV v
 | `Cmd+T` / `Ctrl+Shift+t` | Open another terminal beside the current one (each has its own PTY, scrollback, selection) |
 | `Cmd+W` / `Ctrl+Shift+w` | Close the active terminal (no-op when one is left; `Ctrl+J` hides the pane) |
 | `Cmd+]` / `Cmd+[` | Cycle to the next / previous terminal (or click one to focus it) |
+| Click the `⌄` caret (beside `+`) | Drop the terminal profile menu anchored under the caret: pick a shell (from `/etc/shells` + `$SHELL`) to launch a new pane |
+| `Cmd+K` `R` | Rename the active terminal pane (a blank name clears it, restoring the auto label) |
+| `Cmd+K` `K` | Clear the active terminal's screen and scrollback (VS Code clears with `Cmd+K`) |
+| Right-click a terminal pane | Open the pane menu: **Rename Terminal**, **Clear** |
+
+With two or more panes open, each pane's header shows its live foreground process (`zsh`, `vim`, `node`…); a manual rename overrides that label.
 | `Cmd`/`Ctrl` + click a printed URL | Open it. A loopback dev-server URL on a remote session (`http://localhost:3000`) is forwarded home over the live SSH connection first, then opened in your local browser; any other link opens directly |
 
 ## Ports
