@@ -816,6 +816,12 @@ fn run_pump(
             Some(RelayRequest::Open { id, url }) => {
                 handle_open_request(&host, &socket, &inbox_dir, &id, &url);
             }
+            Some(RelayRequest::Forward { id, port, open }) => {
+                handle_forward_request(&host, &socket, &inbox_dir, &id, &port, open);
+            }
+            Some(RelayRequest::Unforward { local, remote }) => {
+                handle_unforward_request(&host, &socket, &local, &remote);
+            }
             None => {}
         }
     }
@@ -920,9 +926,31 @@ fn handle_clipboard_request(host: &str, socket: &Path, inbox_dir: &str, request_
 }
 
 enum RelayRequest {
-    Pull { id: String, src: String },
-    Clipboard { id: String },
-    Open { id: String, url: String },
+    Pull {
+        id: String,
+        src: String,
+    },
+    Clipboard {
+        id: String,
+    },
+    Open {
+        id: String,
+        url: String,
+    },
+    /// Forward a remote loopback port back to the local machine over the live
+    /// SSH master. `open` also launches the local browser once the tunnel is up.
+    Forward {
+        id: String,
+        port: String,
+        open: bool,
+    },
+    /// Tear down a forward previously added by [`RelayRequest::Forward`]. Fire
+    /// and forget — no inbox sentinels, since croft just drops the entry (the
+    /// parsed request id is validated but unused).
+    Unforward {
+        local: String,
+        remote: String,
+    },
 }
 
 fn parse_relay_request(line: &str) -> Option<RelayRequest> {
@@ -948,6 +976,23 @@ fn parse_relay_request(line: &str) -> Option<RelayRequest> {
                 return None;
             }
             Some(RelayRequest::Open { id, url })
+        }
+        "forward" => {
+            let port = parts.next()?.to_string();
+            if port.is_empty() {
+                return None;
+            }
+            let open = parts.next() == Some("1");
+            Some(RelayRequest::Forward { id, port, open })
+        }
+        "unforward" => {
+            let _ = id;
+            let local = parts.next()?.to_string();
+            let remote = parts.next()?.to_string();
+            if local.is_empty() || remote.is_empty() {
+                return None;
+            }
+            Some(RelayRequest::Unforward { local, remote })
         }
         _ => None,
     }
@@ -1107,6 +1152,41 @@ fn handle_pull_request(host: &str, socket: &Path, inbox_dir: &str, request_id: &
     }
 }
 
+/// Run `cmd` on the remote over the existing master socket (no second auth, no
+/// nested master). Used for the relay inbox bookkeeping (`mkdir`, sentinel
+/// writes). Returns whether it exited zero.
+fn ssh_exec(host: &str, socket: &Path, cmd: &str) -> bool {
+    Command::new("ssh")
+        .arg("-S")
+        .arg(socket)
+        .arg("-o")
+        .arg("ControlMaster=no")
+        .arg(host)
+        .arg(cmd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Hand `url` to the local platform opener (`open` on macOS, `xdg-open` on
+/// Linux). The caller has already validated the URL.
+fn open_local_url(url: &str) -> std::io::Result<std::process::ExitStatus> {
+    let program = if cfg!(target_os = "linux") {
+        "xdg-open"
+    } else {
+        "open"
+    };
+    Command::new(program)
+        .arg(url)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+}
+
 fn handle_open_request(host: &str, socket: &Path, inbox_dir: &str, request_id: &str, url: &str) {
     if !url_is_safe_to_open(url) {
         write_relay_err(
@@ -1119,60 +1199,21 @@ fn handle_open_request(host: &str, socket: &Path, inbox_dir: &str, request_id: &
         return;
     }
     let dest_dir = format!("{inbox_dir}/{request_id}");
-    let mkdir = format!("mkdir -p {}", shell_quote(&dest_dir));
-    let mkdir_ok = Command::new("ssh")
-        .arg("-S")
-        .arg(socket)
-        .arg("-o")
-        .arg("ControlMaster=no")
-        .arg(host)
-        .arg(&mkdir)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    if !mkdir_ok {
+    if !ssh_exec(
+        host,
+        socket,
+        &format!("mkdir -p {}", shell_quote(&dest_dir)),
+    ) {
         write_relay_err(host, socket, inbox_dir, request_id, "remote mkdir failed");
         return;
     }
-    let result = if cfg!(target_os = "macos") {
-        Command::new("open")
-            .arg(url)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-    } else if cfg!(target_os = "linux") {
-        Command::new("xdg-open")
-            .arg(url)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-    } else {
-        Command::new("open")
-            .arg(url)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-    };
-    match result {
+    match open_local_url(url) {
         Ok(s) if s.success() => {
-            let touch = format!("touch {}/.ok", shell_quote(&dest_dir));
-            let _ = Command::new("ssh")
-                .arg("-S")
-                .arg(socket)
-                .arg("-o")
-                .arg("ControlMaster=no")
-                .arg(host)
-                .arg(&touch)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
+            let _ = ssh_exec(
+                host,
+                socket,
+                &format!("touch {}/.ok", shell_quote(&dest_dir)),
+            );
         }
         Ok(s) => write_relay_err(
             host,
@@ -1189,6 +1230,106 @@ fn handle_open_request(host: &str, socket: &Path, inbox_dir: &str, request_id: &
             &format!("local open(1) spawn failed: {e}"),
         ),
     }
+}
+
+/// Mirror the remote port locally when it's free, else take an ephemeral port
+/// from the OS. The tiny bind race (port taken between probe and `ssh -L`) just
+/// surfaces as a forward failure the user can retry.
+fn pick_local_port(remote: u16) -> u16 {
+    use std::net::TcpListener;
+    if TcpListener::bind(("127.0.0.1", remote)).is_ok() {
+        return remote;
+    }
+    TcpListener::bind(("127.0.0.1", 0))
+        .ok()
+        .and_then(|l| l.local_addr().ok())
+        .map(|a| a.port())
+        .unwrap_or(remote)
+}
+
+/// Forward remote loopback `port` to the local machine by adding an `-L`
+/// channel to the live SSH master (`ssh -O forward` — no second auth), then,
+/// when `open`, launch the local browser at the forwarded address. The chosen
+/// local port is written as the `.ok` payload so remote croft can label the
+/// forward and re-open it; only digits ever reach the `-L` spec, so there's no
+/// metacharacter to smuggle.
+fn handle_forward_request(
+    host: &str,
+    socket: &Path,
+    inbox_dir: &str,
+    request_id: &str,
+    port: &str,
+    open: bool,
+) {
+    let Some(remote_port) = port.parse::<u16>().ok().filter(|p| *p >= 1) else {
+        write_relay_err(
+            host,
+            socket,
+            inbox_dir,
+            request_id,
+            "rejected: port must be 1..=65535",
+        );
+        return;
+    };
+    let dest_dir = format!("{inbox_dir}/{request_id}");
+    if !ssh_exec(
+        host,
+        socket,
+        &format!("mkdir -p {}", shell_quote(&dest_dir)),
+    ) {
+        write_relay_err(host, socket, inbox_dir, request_id, "remote mkdir failed");
+        return;
+    }
+    let local_port = pick_local_port(remote_port);
+    let spec = format!("127.0.0.1:{local_port}:127.0.0.1:{remote_port}");
+    let forwarded = Command::new("ssh")
+        .arg("-S")
+        .arg(socket)
+        .arg("-O")
+        .arg("forward")
+        .arg("-L")
+        .arg(&spec)
+        .arg(host)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !forwarded {
+        write_relay_err(host, socket, inbox_dir, request_id, "ssh -O forward failed");
+        return;
+    }
+    if open {
+        let _ = open_local_url(&format!("http://127.0.0.1:{local_port}/"));
+    }
+    let _ = ssh_exec(
+        host,
+        socket,
+        &format!("printf %s {local_port} > {}/.ok", shell_quote(&dest_dir)),
+    );
+}
+
+/// Tear down a forward added by [`handle_forward_request`] via `ssh -O cancel`
+/// against the live master. Best-effort and silent: only digits reach the `-L`
+/// spec, and a stale cancel (the forward already gone) is harmless.
+fn handle_unforward_request(host: &str, socket: &Path, local: &str, remote: &str) {
+    let (Ok(local), Ok(remote)) = (local.parse::<u16>(), remote.parse::<u16>()) else {
+        return;
+    };
+    let spec = format!("127.0.0.1:{local}:127.0.0.1:{remote}");
+    let _ = Command::new("ssh")
+        .arg("-S")
+        .arg(socket)
+        .arg("-O")
+        .arg("cancel")
+        .arg("-L")
+        .arg(&spec)
+        .arg(host)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
 }
 
 fn write_relay_err(host: &str, socket: &Path, inbox_dir: &str, request_id: &str, message: &str) {
@@ -2410,6 +2551,35 @@ Host !blocked *.internal
         assert!(super::parse_relay_request("pull\t\t/x").is_none());
         assert!(super::parse_relay_request("pull\tabc\t").is_none());
         assert!(super::parse_relay_request("clipboard\t").is_none());
+    }
+
+    #[test]
+    fn parse_relay_request_forward_extracts_port_and_open_flag() {
+        match super::parse_relay_request("forward\tfwd-1\t3000\t1") {
+            Some(super::RelayRequest::Forward { id, port, open }) => {
+                assert_eq!(id, "fwd-1");
+                assert_eq!(port, "3000");
+                assert!(open);
+            }
+            _ => panic!("expected Forward variant"),
+        }
+    }
+
+    #[test]
+    fn parse_relay_request_forward_defaults_open_to_false() {
+        match super::parse_relay_request("forward\tfwd-2\t8080") {
+            Some(super::RelayRequest::Forward { open, .. }) => assert!(!open),
+            _ => panic!("expected Forward variant"),
+        }
+        assert!(super::parse_relay_request("forward\tfwd-3\t").is_none());
+    }
+
+    #[test]
+    fn pick_local_port_mirrors_a_free_port() {
+        // Port 0 can never be mirrored (it's the "any" sentinel), but a high
+        // port is almost certainly free in the test environment.
+        let p = super::pick_local_port(54321);
+        assert!(p == 54321 || p >= 1024, "got {p}");
     }
 
     #[test]

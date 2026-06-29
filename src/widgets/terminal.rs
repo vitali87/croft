@@ -123,6 +123,10 @@ pub struct PtyTerminal {
     /// Tracks whether the inner program has enabled DECSET 2004 (bracketed
     /// paste). Sniffed off the byte stream; not all parsers expose it.
     bracketed_paste_enabled: Arc<AtomicBool>,
+    /// Listening loopback ports the reader thread scraped out of the output
+    /// stream (`http://localhost:PORT` banners, `listening on :PORT` lines).
+    /// The app drains this each tick to feed the PORTS panel and the toast.
+    port_rx: std::sync::mpsc::Receiver<crate::port_detect::PortHit>,
     master: Box<dyn MasterPty + Send>,
     /// Shared between this struct's user-input path (`write_input`,
     /// `paste_*`, `cd_into`) and the background responder thread that
@@ -275,6 +279,7 @@ impl PtyTerminal {
         let pty_pending_bytes_for_thread = pty_pending_bytes.clone();
         let bracketed_paste_enabled = Arc::new(AtomicBool::new(false));
         let bracketed_paste_for_thread = bracketed_paste_enabled.clone();
+        let (port_tx, port_rx) = std::sync::mpsc::channel::<crate::port_detect::PortHit>();
 
         if let Some(label) = run_label.as_deref() {
             let header = format!("\x1b[2m▶ {label}\x1b[22m\r\n");
@@ -287,12 +292,14 @@ impl PtyTerminal {
 
         std::thread::spawn(move || {
             let mut processor = Processor::<StdSyncHandler>::new();
+            let mut port_sniffer = crate::port_detect::PortSniffer::new();
             let mut buf = [0u8; 65536];
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) => break,
                     Ok(n) => {
                         sniff_bracketed_paste_mode(&buf[..n], &bracketed_paste_for_thread);
+                        port_sniffer.sniff(&buf[..n], &port_tx);
                         let mut t = term_for_thread.lock();
                         processor.advance(&mut *t, &buf[..n]);
                         drop(t);
@@ -316,6 +323,7 @@ impl PtyTerminal {
             pty_dirty,
             pty_pending_bytes,
             bracketed_paste_enabled,
+            port_rx,
             master: pair.master,
             writer,
             _child: child,
@@ -334,6 +342,13 @@ impl PtyTerminal {
     pub fn take_dirty(&self) -> bool {
         self.pty_pending_bytes.store(0, Ordering::Relaxed);
         self.pty_dirty.swap(false, Ordering::AcqRel)
+    }
+
+    /// Drain the loopback ports the reader thread scraped since the last call.
+    /// Each port is reported at most once over the terminal's lifetime, so this
+    /// is empty on most ticks.
+    pub fn drain_ports(&self) -> Vec<crate::port_detect::PortHit> {
+        self.port_rx.try_iter().collect()
     }
 
     /// Bytes advanced into the grid since the last redraw, without
@@ -377,6 +392,18 @@ impl PtyTerminal {
     /// line `r - display_offset`.
     fn display_offset(&self) -> i32 {
         self.term.lock().grid().display_offset() as i32
+    }
+
+    /// Text of the grid row under screen cell `(col, row)`, plus the 0-based
+    /// column within that text the click landed on. Drives Cmd/Ctrl+click URL
+    /// detection. `None` when the cell is outside the content area.
+    pub fn line_text_at(&self, col: u16, row: u16) -> Option<(String, usize)> {
+        let (r, c) = self.cell_at(col, row)?;
+        let term = self.term.lock();
+        let cols = term.columns();
+        let line = r as i32 - term.grid().display_offset() as i32;
+        let text = extract_selection_text(&term, line, 0, line, cols.saturating_sub(1));
+        Some((text, c as usize))
     }
 
     pub fn start_selection_at(&mut self, col: u16, row: u16) {

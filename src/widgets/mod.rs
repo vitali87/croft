@@ -18,6 +18,7 @@ pub mod open_editors;
 pub mod osk;
 pub mod outline;
 pub mod output;
+pub mod ports;
 pub mod problems;
 pub mod process_picker;
 pub mod remote;

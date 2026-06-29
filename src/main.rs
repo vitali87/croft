@@ -16,6 +16,7 @@ mod mcp;
 mod outline_syntax;
 mod output;
 mod pdf;
+mod port_detect;
 mod prefs;
 mod release_notes;
 mod remote;

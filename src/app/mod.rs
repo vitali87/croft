@@ -729,6 +729,28 @@ enum BottomPanelTab {
     Terminal,
     Problems,
     Output,
+    Ports,
+}
+
+/// A transient, click-only notification that a browsable port just appeared in
+/// the terminal. It never captures keystrokes — the terminal owns those — so
+/// the user clicks an action or lets it auto-dismiss. The forward actions only
+/// apply on a remote session (a local port is already reachable).
+struct PortToast {
+    port: u16,
+    process: Option<String>,
+    origin_remote: bool,
+    shown_at: std::time::Instant,
+    /// Action button hit rects, recomputed each render.
+    buttons: Vec<(Rect, PortToastAction)>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PortToastAction {
+    ForwardAndOpen,
+    ForwardOnly,
+    Open,
+    Dismiss,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1765,6 +1787,9 @@ pub struct App {
     editor_click: ClickTracker,
     tree_click: ClickTracker,
     terminal_click: ClickTracker,
+    /// Double-click tracking for PORTS rows: a second click on the same row
+    /// opens that port, the same as pressing Enter on it.
+    ports_click: ClickTracker,
     /// Active edge auto-scroll while drag-selecting in the terminal: set
     /// when the drag pointer is pinned past the top/bottom edge, serviced
     /// each main-loop tick to keep growing the selection through
@@ -1922,12 +1947,34 @@ pub struct App {
     /// The OUTPUT view: a read-only per-channel log viewer over the in-process
     /// `crate::output` bus. Rendered into the panel content when its tab active.
     output: crate::widgets::output::OutputPanel,
+    /// The PORTS view: the registry of detected loopback ports, fed by the
+    /// terminal output scrape and the periodic socket poll. Rendered into the
+    /// panel content when its tab is active.
+    ports: crate::widgets::ports::PortsPanel,
+    /// Transient click-only notification for a freshly detected browsable port,
+    /// offering forward / open. `None` when nothing is pending.
+    port_toast: Option<PortToast>,
+    /// Last time the socket poll was kicked off, so it fires on a low cadence
+    /// rather than every tick.
+    last_port_poll: std::time::Instant,
+    /// Socket-poll snapshots arrive here from a one-shot background thread (one
+    /// complete listener set per cycle), so the blocking `lsof`/`ps` never runs
+    /// on the event loop (keeps input at 0ms). A full set, not individual hits,
+    /// so the app can reconcile ports that stopped listening.
+    port_poll_rx: std::sync::mpsc::Receiver<Vec<crate::port_detect::PortHit>>,
+    port_poll_tx: std::sync::mpsc::Sender<Vec<crate::port_detect::PortHit>>,
+    /// True while a poll thread is in flight, so cadence ticks don't pile up
+    /// overlapping `lsof` invocations.
+    port_poll_inflight: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Hit-test rect of the "PROBLEMS" tab in the panel tab strip. Empty when
     /// the panel is hidden.
     problems_tab_rect: Rect,
     /// Hit-test rect of the "OUTPUT" tab in the panel tab strip. Empty when the
     /// panel is hidden.
     output_tab_rect: Rect,
+    /// Hit-test rect of the "PORTS" tab in the panel tab strip. Empty when the
+    /// panel is hidden.
+    ports_tab_rect: Rect,
     /// Hit-test rect of the "TERMINAL" tab in the panel tab strip. Empty when
     /// the panel is hidden.
     terminal_tab_rect: Rect,
@@ -2242,9 +2289,19 @@ pub enum RemotePullKind {
     /// URL handed to the user's local Mac `open(1)`; on completion croft
     /// just surfaces a status confirmation. No payload is shipped back.
     Open,
+    /// Remote loopback port forwarded home over the SSH master; the `.ok`
+    /// payload carries the chosen local port, which croft records so the PORTS
+    /// panel can label and open it. `remote_port` is the port being forwarded.
+    Forward { remote_port: u16 },
 }
 
 const REMOTE_PULL_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// How long the port-detection toast lingers before auto-dismissing.
+const PORT_TOAST_TTL: Duration = Duration::from_secs(12);
+/// How often the socket-table poll runs (the output scrape is continuous;
+/// this is the backstop for servers that announce nothing).
+const PORT_POLL_INTERVAL: Duration = Duration::from_secs(3);
 
 struct RemoteLaunch {
     host: String,
@@ -2370,6 +2427,23 @@ fn open_url(url: &str) -> Result<()> {
     Ok(())
 }
 
+/// Short label for this machine, shown as the origin of a remote port in the
+/// PORTS panel (`⇄ build-box`). Resolved once via `hostname`, falling back to a
+/// generic word so the column is never blank.
+fn remote_host_label() -> String {
+    static HOST: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    HOST.get_or_init(|| {
+        std::process::Command::new("hostname")
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().split('.').next().unwrap_or("remote").to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| String::from("remote"))
+    })
+    .clone()
+}
+
 impl App {
     pub fn new(root: PathBuf) -> Result<Self> {
         // Reap any js-debug adapter tree a previous croft left orphaned (a
@@ -2418,6 +2492,7 @@ impl App {
 
         let (search_query_tx, search_query_rx) = std::sync::mpsc::channel();
         let (search_results_tx, search_results_rx) = std::sync::mpsc::channel();
+        let (port_poll_tx, port_poll_rx) = std::sync::mpsc::channel();
         let search_root = root.clone();
         std::thread::spawn(move || {
             crate::widgets::search::search_worker_loop(
@@ -2517,6 +2592,7 @@ impl App {
             editor_click: ClickTracker::default(),
             tree_click: ClickTracker::default(),
             terminal_click: ClickTracker::default(),
+            ports_click: ClickTracker::default(),
             terminal_select_autoscroll: None,
             scrollbar_drag: None,
             editor_hscrollbar_drag: false,
@@ -2561,8 +2637,15 @@ impl App {
             bottom_panel_tab: BottomPanelTab::Terminal,
             problems: crate::widgets::problems::ProblemsPanel::new(),
             output: crate::widgets::output::OutputPanel::new(),
+            ports: crate::widgets::ports::PortsPanel::new(),
+            port_toast: None,
+            last_port_poll: std::time::Instant::now(),
+            port_poll_rx,
+            port_poll_tx,
+            port_poll_inflight: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             problems_tab_rect: Rect::default(),
             output_tab_rect: Rect::default(),
+            ports_tab_rect: Rect::default(),
             terminal_tab_rect: Rect::default(),
             pointer_cell: None,
             hovered_activity_icon: None,
@@ -7096,6 +7179,10 @@ impl App {
         self.output.focused = self.focus == Pane::Terminal;
         self.output.hover_pointer = self.pointer_cell;
         self.output.sync();
+        self.ports.focus_gradient = gradient;
+        self.ports.theme = self.theme;
+        self.ports.focused = self.focus == Pane::Terminal;
+        self.ports.hover_pointer = self.pointer_cell;
         for t in self.terminals.iter_mut() {
             t.focus_gradient = gradient;
         }
@@ -7133,14 +7220,16 @@ impl App {
 
         self.problems_tab_rect = Rect::default();
         self.output_tab_rect = Rect::default();
+        self.ports_tab_rect = Rect::default();
         self.terminal_tab_rect = Rect::default();
 
-        // VS Code panel-group order: PROBLEMS, OUTPUT, TERMINAL. PROBLEMS alone
-        // carries the orange count pill after its label.
+        // VS Code panel-group order: PROBLEMS, OUTPUT, TERMINAL, PORTS. PROBLEMS
+        // alone carries the orange count pill after its label.
         let tabs = [
             (BottomPanelTab::Problems, " PROBLEMS "),
             (BottomPanelTab::Output, " OUTPUT "),
             (BottomPanelTab::Terminal, " TERMINAL "),
+            (BottomPanelTab::Ports, " PORTS "),
         ];
 
         // Lay each tab out left to right, recording its hit rect (which, for
@@ -7166,6 +7255,7 @@ impl App {
             match tab {
                 BottomPanelTab::Problems => self.problems_tab_rect = rect,
                 BottomPanelTab::Output => self.output_tab_rect = rect,
+                BottomPanelTab::Ports => self.ports_tab_rect = rect,
                 BottomPanelTab::Terminal => self.terminal_tab_rect = rect,
             }
             placed.push((tab, label, rect, badge_w));
@@ -7875,12 +7965,23 @@ impl App {
                     }
                     frame.render_widget(&mut self.output, content);
                 }
+                BottomPanelTab::Ports => {
+                    // Same hidden-terminal reset: the PORTS view covers the
+                    // panes, so their hit rects must not linger.
+                    self.terminal_add_buttons.clear();
+                    self.terminal_close_buttons.clear();
+                    for t in self.terminals.iter_mut() {
+                        t.last_area = Rect::default();
+                    }
+                    frame.render_widget(&mut self.ports, content);
+                }
             }
         } else {
             self.terminal_add_buttons.clear();
             self.terminal_close_buttons.clear();
             self.problems_tab_rect = Rect::default();
             self.output_tab_rect = Rect::default();
+            self.ports_tab_rect = Rect::default();
             self.terminal_tab_rect = Rect::default();
             // A hidden terminal must not keep stale hit rects alive, or
             // `terminal_at_pos` would phantom-match clicks meant for
@@ -8030,7 +8131,9 @@ impl App {
         let status = Paragraph::new(Line::from(spans)).style(Style::default().bg(status_bg));
         frame.render_widget(status, outer[2]);
 
-        // Overlays render last so they sit on top of everything else.
+        // Overlays render last so they sit on top of everything else. The port
+        // toast goes first so modals/menus paint above it.
+        self.render_port_toast(frame);
         self.render_context_menu(frame);
         self.render_commit_dropdown(frame);
         self.render_prompt(frame);
@@ -8664,6 +8767,114 @@ impl App {
             ]),
         ]);
         frame.render_widget(ratatui::widgets::Paragraph::new(body), inner);
+    }
+
+    /// Paint the transient port-detection toast in the bottom-right corner and
+    /// record its clickable action-button rects. Click-only: it never captures
+    /// keystrokes, so it can't interfere with terminal typing.
+    fn render_port_toast(&mut self, frame: &mut ratatui::Frame) {
+        let Some(toast) = self.port_toast.as_ref() else {
+            return;
+        };
+        let port = toast.port;
+        let origin_remote = toast.origin_remote;
+        let proc = toast.process.clone().unwrap_or_default();
+
+        let accent = self.theme.accent();
+        let btn_bg = self.theme.button();
+        let actions: Vec<(String, PortToastAction)> = if origin_remote {
+            vec![
+                (
+                    " Forward & Open ".to_string(),
+                    PortToastAction::ForwardAndOpen,
+                ),
+                (" Forward ".to_string(), PortToastAction::ForwardOnly),
+                (" \u{2715} ".to_string(), PortToastAction::Dismiss),
+            ]
+        } else {
+            vec![
+                (" Open ".to_string(), PortToastAction::Open),
+                (" \u{2715} ".to_string(), PortToastAction::Dismiss),
+            ]
+        };
+        let buttons_w: u16 = actions
+            .iter()
+            .map(|(l, _)| l.chars().count() as u16 + 1)
+            .sum::<u16>()
+            + 1;
+        let title_line = format!("\u{25cf} port {port}  {proc}");
+        let inner_w = buttons_w.max(title_line.chars().count() as u16);
+
+        let area = frame.area();
+        let width = (inner_w + 4).min(area.width.saturating_sub(2));
+        let height: u16 = 4;
+        let status_h: u16 = if self.status_bar_visible { 1 } else { 0 };
+        if area.width < width + 2 || area.height < height + status_h + 1 {
+            return;
+        }
+        let rect = Rect {
+            x: area.x + area.width - width - 2,
+            y: area.y + area.height - height - status_h - 1,
+            width,
+            height,
+        };
+        let block = ratatui::widgets::Block::default()
+            .borders(ratatui::widgets::Borders::ALL)
+            .border_style(Style::default().fg(accent))
+            .style(Style::default().bg(self.theme.editor_bg()))
+            .title(ratatui::text::Span::styled(
+                " PORT DETECTED ",
+                Style::default().fg(accent).add_modifier(Modifier::BOLD),
+            ));
+        frame.render_widget(ratatui::widgets::Clear, rect);
+        frame.render_widget(block, rect);
+        let inner = Rect {
+            x: rect.x + 2,
+            y: rect.y + 1,
+            width: rect.width.saturating_sub(4),
+            height: rect.height.saturating_sub(2),
+        };
+
+        let buf = frame.buffer_mut();
+        buf.set_stringn(
+            inner.x,
+            inner.y,
+            &title_line,
+            inner.width as usize,
+            Style::default().fg(Color::Rgb(0xCC, 0xCC, 0xCC)),
+        );
+        let mut bx = inner.x;
+        let by = inner.y + 1;
+        let mut rects: Vec<(Rect, PortToastAction)> = Vec::new();
+        for (label, action) in &actions {
+            let w = label.chars().count() as u16;
+            if bx + w > inner.x + inner.width {
+                break;
+            }
+            buf.set_stringn(
+                bx,
+                by,
+                label,
+                w as usize,
+                Style::default()
+                    .fg(Color::White)
+                    .bg(btn_bg)
+                    .add_modifier(Modifier::BOLD),
+            );
+            rects.push((
+                Rect {
+                    x: bx,
+                    y: by,
+                    width: w,
+                    height: 1,
+                },
+                *action,
+            ));
+            bx += w + 1;
+        }
+        if let Some(t) = self.port_toast.as_mut() {
+            t.buttons = rects;
+        }
     }
 
     fn render_prompt(&self, frame: &mut ratatui::Frame) {
@@ -9309,6 +9520,7 @@ impl App {
                 // into the hidden shell.
                 BottomPanelTab::Problems => self.handle_problems_key(key),
                 BottomPanelTab::Output => self.handle_output_key(key),
+                BottomPanelTab::Ports => self.handle_ports_key(key),
                 BottomPanelTab::Terminal => self.handle_terminal_key(key),
             },
         }
@@ -13737,6 +13949,22 @@ impl App {
         }
     }
 
+    /// Keys while the PORTS tab owns the panel pane. `⏎` opens (forwarding first
+    /// on a remote port), `f` forwards without opening, `c` copies the address,
+    /// `x` stops watching (and tears the tunnel down).
+    fn handle_ports_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Up => self.ports.move_selection(-1),
+            KeyCode::Down => self.ports.move_selection(1),
+            KeyCode::Esc => self.focus_pane(Pane::Editor),
+            KeyCode::Enter => self.ports_open_selected(),
+            KeyCode::Char('f') => self.ports_forward_selected(),
+            KeyCode::Char('c') => self.ports_copy_selected(),
+            KeyCode::Char('x') => self.ports_stop_selected(),
+            _ => {}
+        }
+    }
+
     fn handle_terminal_key(&mut self, key: KeyEvent) {
         // Ctrl+Shift+T: open another terminal next to the active one.
         if is_terminal_split_key(key) {
@@ -14306,6 +14534,7 @@ impl App {
         let mut still_pending: Vec<PendingRemotePull> = Vec::new();
         let mut placed: Vec<PathBuf> = Vec::new();
         let mut opened_urls: Vec<String> = Vec::new();
+        let mut forwarded: Vec<(u16, u16)> = Vec::new();
         let mut errors: Vec<String> = Vec::new();
         let mut affected: BTreeSet<PathBuf> = BTreeSet::new();
         let pulls = std::mem::take(&mut self.pending_remote_pulls);
@@ -14334,6 +14563,13 @@ impl App {
                     RemotePullKind::Open => {
                         opened_urls.push(pull.src_display.clone());
                     }
+                    RemotePullKind::Forward { remote_port } => {
+                        let local_port = std::fs::read_to_string(&ok)
+                            .ok()
+                            .and_then(|s| s.trim().parse::<u16>().ok())
+                            .unwrap_or(remote_port);
+                        forwarded.push((remote_port, local_port));
+                    }
                 }
                 let _ = std::fs::remove_dir_all(&request_dir);
             } else if err.exists() {
@@ -14353,7 +14589,13 @@ impl App {
         {
             self.terminal_mut().paste_input(&bytes);
         }
-        let resolved_any = !placed.is_empty() || !opened_urls.is_empty() || !errors.is_empty();
+        let resolved_any = !placed.is_empty()
+            || !opened_urls.is_empty()
+            || !forwarded.is_empty()
+            || !errors.is_empty();
+        for (remote_port, local_port) in &forwarded {
+            self.ports.mark_forwarded(*remote_port, *local_port);
+        }
         self.pending_remote_pulls = still_pending;
         for dir in &affected {
             if let Some(idx) = self.tree.index_of_dir(dir) {
@@ -14374,7 +14616,14 @@ impl App {
         }
         if resolved_any {
             self.status = if errors.is_empty() {
-                if !opened_urls.is_empty() && placed.is_empty() {
+                if !forwarded.is_empty() && placed.is_empty() && opened_urls.is_empty() {
+                    let (remote, local) = forwarded[0];
+                    if local == remote {
+                        format!("Forwarded port {remote} to your machine")
+                    } else {
+                        format!("Forwarded remote port {remote} to local {local}")
+                    }
+                } else if !opened_urls.is_empty() && placed.is_empty() {
                     if opened_urls.len() == 1 {
                         format!("Opened {} in your local browser", opened_urls[0])
                     } else {
@@ -14416,6 +14665,286 @@ impl App {
         } else {
             format!("Uploaded {moved}/{total} via scp; {errors} error(s)")
         };
+    }
+
+    /// Origin to stamp on a newly detected port: a remote session's ports are
+    /// forwardable (and carry the host label), a local session's are already
+    /// reachable.
+    fn port_origin(&self) -> crate::widgets::ports::PortOrigin {
+        use crate::widgets::ports::PortOrigin;
+        if self.is_remote {
+            PortOrigin::Remote(remote_host_label())
+        } else {
+            PortOrigin::Local
+        }
+    }
+
+    /// Drain freshly scraped ports from every terminal and, on a low cadence,
+    /// poll the socket table. Output-scrape hits are browser-facing
+    /// announcements, so a new one raises the toast; socket-poll hits populate
+    /// the PORTS tab silently. Returns whether anything changed (for redraw).
+    fn drain_ports_and_poll(&mut self) -> bool {
+        let mut changed = false;
+        if self
+            .port_toast
+            .as_ref()
+            .is_some_and(|t| t.shown_at.elapsed() > PORT_TOAST_TTL)
+        {
+            self.port_toast = None;
+            changed = true;
+        }
+        let origin = self.port_origin();
+        let scraped: Vec<crate::port_detect::PortHit> = self
+            .terminals
+            .iter()
+            .flat_map(|t| t.drain_ports())
+            .collect();
+        for hit in scraped {
+            if self
+                .ports
+                .upsert(hit.port, hit.url, hit.process.clone(), origin.clone())
+            {
+                changed = true;
+                self.show_port_toast(hit.port, hit.process);
+            }
+        }
+        // Latest background-poll snapshot (a complete listener set): add new
+        // ports, then reconcile so ports that stopped listening go not-live and
+        // eventually drop. Only the newest queued snapshot matters.
+        if let Some(snapshot) = self.port_poll_rx.try_iter().last() {
+            let live: std::collections::HashSet<u16> = snapshot.iter().map(|h| h.port).collect();
+            for hit in snapshot {
+                if self
+                    .ports
+                    .upsert(hit.port, hit.url, hit.process, origin.clone())
+                {
+                    changed = true;
+                }
+            }
+            if self.ports.reconcile_live(&live) {
+                changed = true;
+            }
+        }
+        // On cadence, kick off a fresh poll off-thread — `lsof`/`ps` block for
+        // tens of ms and must never run on the event loop. One in flight max.
+        if self.last_port_poll.elapsed() >= PORT_POLL_INTERVAL
+            && !self
+                .port_poll_inflight
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            self.last_port_poll = std::time::Instant::now();
+            let pids: Vec<i32> = self
+                .terminals
+                .iter()
+                .filter_map(|t| t.pid().map(|p| p as i32))
+                .collect();
+            if !pids.is_empty() {
+                let tx = self.port_poll_tx.clone();
+                let inflight = self.port_poll_inflight.clone();
+                inflight.store(true, std::sync::atomic::Ordering::Relaxed);
+                std::thread::spawn(move || {
+                    // One complete snapshot across all terminals' subtrees, so
+                    // the app can tell a still-listening port from a gone one.
+                    let mut snapshot: Vec<crate::port_detect::PortHit> = Vec::new();
+                    for pid in pids {
+                        for hit in crate::port_detect::poll_listeners(pid) {
+                            if !snapshot.iter().any(|h| h.port == hit.port) {
+                                snapshot.push(hit);
+                            }
+                        }
+                    }
+                    let _ = tx.send(snapshot);
+                    inflight.store(false, std::sync::atomic::Ordering::Relaxed);
+                });
+            }
+        }
+        changed
+    }
+
+    fn show_port_toast(&mut self, port: u16, process: Option<String>) {
+        self.port_toast = Some(PortToast {
+            port,
+            process,
+            origin_remote: self.is_remote,
+            shown_at: std::time::Instant::now(),
+            buttons: Vec::new(),
+        });
+    }
+
+    /// `⏎` on a port: open it. A local (or already-forwarded) port opens
+    /// straight away; a remote port that isn't forwarded yet is forwarded first,
+    /// then opened.
+    fn ports_open_selected(&mut self) {
+        let Some(entry) = self.ports.selected() else {
+            return;
+        };
+        let port = entry.port;
+        match entry.open_url() {
+            Some(url) => match open_url(&url) {
+                Ok(()) => self.status = format!("Opened {url}"),
+                Err(e) => self.status = format!("Open failed: {e}"),
+            },
+            None => self.request_remote_forward(port, true),
+        }
+    }
+
+    fn ports_forward_selected(&mut self) {
+        use crate::widgets::ports::PortOrigin;
+        let Some(entry) = self.ports.selected() else {
+            return;
+        };
+        if !matches!(entry.origin, PortOrigin::Remote(_)) || entry.forwarded {
+            self.status = String::from("Port is already reachable locally");
+            return;
+        }
+        let port = entry.port;
+        self.request_remote_forward(port, false);
+    }
+
+    fn ports_copy_selected(&mut self) {
+        let Some(entry) = self.ports.selected() else {
+            return;
+        };
+        let addr = entry
+            .open_url()
+            .unwrap_or_else(|| format!("localhost:{}", entry.port));
+        if copy_to_clipboard(&addr) {
+            self.status = format!("Copied {addr}");
+        } else {
+            self.status = String::from("Copy failed");
+        }
+    }
+
+    fn ports_stop_selected(&mut self) {
+        use crate::widgets::ports::PortOrigin;
+        let Some(entry) = self.ports.selected() else {
+            return;
+        };
+        let port = entry.port;
+        let teardown = match (&entry.origin, entry.forwarded, entry.local_port) {
+            (PortOrigin::Remote(_), true, Some(local)) => Some((local, port)),
+            _ => None,
+        };
+        self.ports.remove(port);
+        if let Some((local, remote)) = teardown {
+            self.request_remote_unforward(local, remote);
+            self.status = format!("Stopped forwarding port {port} (the server keeps running)");
+        } else {
+            self.status = format!("Dismissed port {port} from the list (the server keeps running)");
+        }
+    }
+
+    /// Cmd/Ctrl+click in the active terminal: if a printed http(s) URL sits
+    /// under the cursor, act on it (forward a remote dev-server port and open,
+    /// or open the link) and return true so the click doesn't start a
+    /// selection. Returns false when there's no URL there.
+    fn terminal_url_click(&mut self, col: u16, row: u16) -> bool {
+        let Some((text, c)) = self.terminal().line_text_at(col, row) else {
+            return false;
+        };
+        let Some(url) = crate::port_detect::url_at(&text, c) else {
+            return false;
+        };
+        self.open_detected_url(&url);
+        true
+    }
+
+    /// Open a URL discovered in the terminal. On a remote session a loopback
+    /// dev-server URL is forwarded home and opened; any other link opens on the
+    /// local Mac through the drop relay (with the usual confirm gate). On a
+    /// local session everything opens directly.
+    fn open_detected_url(&mut self, url: &str) {
+        let loopback = crate::port_detect::loopback_url_port(url);
+        if self.drop_relay_active() {
+            if let Some(port) = loopback {
+                self.request_remote_forward(port, true);
+            } else if self.trust_local_browser {
+                self.request_remote_url_open(url.to_string());
+                self.status = format!("Opening {url} on your local Mac");
+            } else {
+                self.pending_local_open = Some(url.to_string());
+            }
+            return;
+        }
+        match open_url(url) {
+            Ok(()) => self.status = format!("Opened {url}"),
+            Err(e) => self.status = format!("Open link failed: {e}"),
+        }
+    }
+
+    /// Click on a port-detection toast button. Returns whether a button was hit
+    /// (and the action taken); a click elsewhere returns false so it falls
+    /// through to normal handling.
+    fn handle_port_toast_click(&mut self, x: u16, y: u16) -> bool {
+        let Some(toast) = self.port_toast.as_ref() else {
+            return false;
+        };
+        let Some(action) = toast
+            .buttons
+            .iter()
+            .find(|(r, _)| rect_contains(*r, x, y))
+            .map(|(_, a)| *a)
+        else {
+            return false;
+        };
+        let port = toast.port;
+        self.port_toast = None;
+        match action {
+            PortToastAction::ForwardAndOpen => self.request_remote_forward(port, true),
+            PortToastAction::ForwardOnly => self.request_remote_forward(port, false),
+            PortToastAction::Open => match open_url(&format!("http://127.0.0.1:{port}/")) {
+                Ok(()) => self.status = format!("Opened http://localhost:{port}/"),
+                Err(e) => self.status = format!("Open failed: {e}"),
+            },
+            PortToastAction::Dismiss => {}
+        }
+        true
+    }
+
+    /// Ask the local launcher (via the drop relay) to forward `port` home over
+    /// the live SSH master, optionally opening the local browser once it's up.
+    fn request_remote_forward(&mut self, port: u16, open: bool) {
+        let Some(log_path) = self.relay_log_path() else {
+            self.status = String::from("Forward port: drop relay vanished");
+            return;
+        };
+        self.ensure_relay_dir();
+        let request_id = format!(
+            "forward-{}-{}",
+            std::process::id(),
+            std::time::Instant::now().elapsed().as_nanos(),
+        );
+        let line = format!("forward\t{request_id}\t{port}\t{}\n", u8::from(open));
+        match append_to_relay_log(&log_path, &line) {
+            Ok(()) => {
+                self.pending_remote_pulls.push(PendingRemotePull {
+                    request_id,
+                    src_display: format!("port {port}"),
+                    basename: String::new(),
+                    dest_dir: PathBuf::new(),
+                    started_at: std::time::Instant::now(),
+                    kind: RemotePullKind::Forward { remote_port: port },
+                });
+                self.status = format!("Forwarding port {port}…");
+            }
+            Err(e) => self.status = format!("Forward port: relay write failed: {e}"),
+        }
+    }
+
+    /// Tear down a previously established forward. Fire and forget — the entry
+    /// is already gone from the panel, so there's no completion to await.
+    fn request_remote_unforward(&mut self, local: u16, remote: u16) {
+        let Some(log_path) = self.relay_log_path() else {
+            return;
+        };
+        self.ensure_relay_dir();
+        let request_id = format!(
+            "unforward-{}-{}",
+            std::process::id(),
+            std::time::Instant::now().elapsed().as_nanos(),
+        );
+        let line = format!("unforward\t{request_id}\t{local}\t{remote}\n");
+        let _ = append_to_relay_log(&log_path, &line);
     }
 
     fn request_remote_url_open(&mut self, url: String) {
@@ -16295,6 +16824,14 @@ impl App {
             self.handle_osk_mouse(m);
             return;
         }
+        // A click on the port-detection toast's action buttons is consumed
+        // before anything else; clicks elsewhere fall through to normal
+        // handling, so the toast never blocks the rest of the UI.
+        if matches!(m.kind, MouseEventKind::Down(MouseButton::Left))
+            && self.handle_port_toast_click(m.column, m.row)
+        {
+            return;
+        }
         if self.connect_dialog.is_some() {
             if matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
                 self.handle_connect_dialog_click(m.column, m.row);
@@ -16877,6 +17414,10 @@ impl App {
                     self.set_bottom_panel_tab(BottomPanelTab::Terminal);
                     return;
                 }
+                if rect_contains(self.ports_tab_rect, m.column, m.row) {
+                    self.set_bottom_panel_tab(BottomPanelTab::Ports);
+                    return;
+                }
                 // A click in the OUTPUT view hits its toolbar (dropdown / clear /
                 // rpc / level) or dropdown list; if it lands in the log body the
                 // widget doesn't consume it, so we just focus the panel pane.
@@ -16901,6 +17442,28 @@ impl App {
                         Some(ProblemHit::Diagnostic { path, line, col }) => {
                             if let Err(e) = self.open_at(&path, line as usize, col as usize) {
                                 self.status = format!("Open failed: {e}");
+                            }
+                        }
+                        None => self.focus_pane(Pane::Terminal),
+                    }
+                    return;
+                }
+                // A click in the PORTS list selects that row (so the keyboard
+                // actions act on it) or focuses the pane.
+                if self.bottom_panel_tab == BottomPanelTab::Ports
+                    && rect_contains(self.ports.last_area, m.column, m.row)
+                {
+                    match self.ports.row_at(m.column, m.row) {
+                        Some(idx) => {
+                            self.ports.select_index(idx);
+                            // A second click on the same row opens that port,
+                            // the same as pressing Enter on it.
+                            let now = std::time::Instant::now();
+                            if self.ports_click.is_double(now, m.column, m.row) {
+                                self.ports_open_selected();
+                                self.ports_click.clear();
+                            } else {
+                                self.ports_click.record(now, m.column, m.row);
                             }
                         }
                         None => self.focus_pane(Pane::Terminal),
@@ -17464,6 +18027,16 @@ impl App {
                         self.active_terminal = idx;
                     }
                     self.focus_pane(Pane::Terminal);
+                    // Cmd/Ctrl+click on a printed URL opens it (forwarding a
+                    // remote dev-server port first), mirroring the editor's
+                    // go-to-definition modifier. Consumes the click so it
+                    // doesn't also start a text selection.
+                    if (m.modifiers.contains(KeyModifiers::SUPER)
+                        || m.modifiers.contains(KeyModifiers::CONTROL))
+                        && self.terminal_url_click(m.column, m.row)
+                    {
+                        return;
+                    }
                     // A selection belongs to exactly one pane: starting one in
                     // the terminal drops any leftover editor selection so the
                     // two panes never paint a highlight at once (issue #23).
@@ -22208,6 +22781,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let search_changed = app.drain_search_results();
         let remote_changed = app.refresh_remote_if_config_changed();
         let pulls_changed = app.drain_remote_pulls();
+        let ports_changed = app.drain_ports_and_poll();
         let connect_changed = app.poll_connect_dialog();
         let install_changed = app.poll_install_session();
         let update_changed = app.poll_update_watch();
@@ -22267,6 +22841,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             || search_changed
             || remote_changed
             || pulls_changed
+            || ports_changed
             || connect_changed
             || install_changed
             || update_changed

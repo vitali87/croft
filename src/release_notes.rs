@@ -59,7 +59,13 @@ pub struct ReleaseNote {
 }
 
 /// What shipped in the current release. Replace on every version bump.
-pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
-    kind: NoteKind::Fix,
-    summary: "The PROBLEMS count badge is now a tight circle that hugs the number, instead of a wide rounded rectangle.",
-}];
+pub const RELEASE_NOTES: &[ReleaseNote] = &[
+    ReleaseNote {
+        kind: NoteKind::Feature,
+        summary: "New PORTS tab: croft detects loopback ports from terminal output and a socket poll, and on a remote session forwards them home over the live SSH connection.",
+    },
+    ReleaseNote {
+        kind: NoteKind::Feature,
+        summary: "Cmd/Ctrl+click a printed http://localhost URL to forward its port home and open it in your local browser.",
+    },
+];

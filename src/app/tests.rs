@@ -13196,6 +13196,94 @@ fn problems_panel_aggregates_the_store_across_files() {
 }
 
 #[test]
+fn clicking_the_ports_tab_switches_the_panel_view() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let backend = ratatui::backend::TestBackend::new(140, 50);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let r = app.ports_tab_rect;
+    assert!(r.width > 0, "the PORTS tab must have a hit rect");
+    left_click(&mut app, r.x, r.y);
+    assert_eq!(
+        app.bottom_panel_tab,
+        BottomPanelTab::Ports,
+        "a click on the PORTS tab activates that view",
+    );
+}
+
+#[test]
+fn a_detected_port_renders_in_the_ports_panel() {
+    use crate::widgets::ports::PortOrigin;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.bottom_panel_tab = BottomPanelTab::Ports;
+    app.ports
+        .upsert(3000, None, Some("node".into()), PortOrigin::Local);
+    let backend = ratatui::backend::TestBackend::new(140, 50);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let buf = term.backend().buffer().clone();
+    let text: String = buf.content().iter().map(|c| c.symbol()).collect();
+    assert!(text.contains("3000"), "the detected port is listed");
+    assert!(text.contains("node"), "its process is listed");
+}
+
+#[test]
+fn double_clicking_a_port_row_opens_it() {
+    use crate::widgets::ports::PortOrigin;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.bottom_panel_tab = BottomPanelTab::Ports;
+    // A remote, not-yet-forwarded port: opening it routes through the forward
+    // path, which sets an observable status without spawning a real browser.
+    app.ports
+        .upsert(3000, None, None, PortOrigin::Remote("box".into()));
+    draw(&mut app, 140, 50);
+    let x = app.ports.last_area.x + 2;
+    let y = app.ports.last_area.y + 1; // first data row
+    // A single click selects the row but takes no open action.
+    left_click(&mut app, x, y);
+    assert!(
+        !app.status.contains("orward"),
+        "a single click must not open the port: {}",
+        app.status
+    );
+    // A second click on the same row within the double-click window opens it.
+    left_click(&mut app, x, y);
+    assert!(
+        app.status.contains("orward"),
+        "a double click opens (forwards) the port: {}",
+        app.status
+    );
+}
+
+#[test]
+fn clicking_the_port_toast_dismiss_button_clears_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.show_port_toast(3000, Some("node".into()));
+    let backend = ratatui::backend::TestBackend::new(140, 50);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    // The render records the toast's clickable button rects; find Dismiss.
+    let dismiss = app
+        .port_toast
+        .as_ref()
+        .expect("toast is showing")
+        .buttons
+        .iter()
+        .find(|(_, a)| matches!(a, super::PortToastAction::Dismiss))
+        .map(|(r, _)| *r)
+        .expect("the toast has a dismiss button");
+    left_click(&mut app, dismiss.x, dismiss.y);
+    assert!(
+        app.port_toast.is_none(),
+        "clicking dismiss clears the toast"
+    );
+}
+
+#[test]
 fn clicking_the_problems_tab_switches_the_panel_view() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
