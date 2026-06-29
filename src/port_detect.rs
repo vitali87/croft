@@ -6,8 +6,9 @@
 //!   terminal reader thread (right beside `sniff_bracketed_paste_mode`),
 //!   matching the `http://localhost:PORT` banners and `listening on :PORT`
 //!   lines that dev servers print. Cheap: two precompiled regexes over a small
-//!   carry buffer, emitting each port at most once per terminal lifetime so a
-//!   chatty server can't flood the channel.
+//!   carry buffer. Emission is position-based — only a match in the freshly
+//!   read bytes fires, so the carried tail is never re-emitted, yet a banner
+//!   reprinted by a restarted server is. Deduping live ports is the app's job.
 //! * **Socket poll** — [`poll_listeners`] shells out to `lsof`/`ss` on a low
 //!   cadence to catch servers that bind a port without announcing it. Scoped to
 //!   the shell's own process subtree so system daemons don't leak in. On a
@@ -108,44 +109,50 @@ fn parse_port(s: &str) -> Option<u16> {
         .map(|p| p as u16)
 }
 
-/// Stateful scraper owned by a terminal's reader thread. Holds a short carry of
-/// the previous chunk's tail (so a banner split across two `read()`s still
-/// matches) and the set of ports already emitted (so a port fires once).
+/// Stateful scraper owned by a terminal's reader thread. Carries a short tail of
+/// already-scanned text so a banner split across two `read()`s still matches.
+/// Emission is position-based: only a match reaching into the *new* chunk fires,
+/// so the carried tail is never re-emitted, yet a banner printed afresh (a
+/// restarted server) is. Dedup against the live set is the app's job, not the
+/// sniffer's — which is what lets a restart re-toast.
 pub struct PortSniffer {
-    seen: HashSet<u16>,
-    carry: Vec<u8>,
+    carry: String,
 }
 
-/// How many trailing bytes of a chunk to prepend to the next scan, covering a
-/// URL straddling a read boundary without rescanning whole chunks.
+/// How many trailing chars of the combined text to keep for the next scan,
+/// covering a URL straddling a read boundary without rescanning whole chunks.
 const CARRY_BYTES: usize = 256;
 
 impl PortSniffer {
     pub fn new() -> Self {
         Self {
-            seen: HashSet::new(),
-            carry: Vec::new(),
+            carry: String::new(),
         }
     }
 
-    /// Scan one PTY chunk, pushing a [`PortHit`] for each newly seen port. The
-    /// channel send is best-effort: a dropped hit just means the app learns of
-    /// the port from the next banner line or the socket poll.
+    /// Scan one PTY chunk, pushing a [`PortHit`] for each port whose match
+    /// extends past the carried prefix (i.e. lives in the new bytes). The send
+    /// is best-effort: a dropped hit just means the app learns of the port from
+    /// the next line or the socket poll.
     pub fn sniff(&mut self, chunk: &[u8], tx: &std::sync::mpsc::Sender<PortHit>) {
-        // Lossy-decode carry+chunk together. ANSI colour codes around a URL are
-        // outside the match, and a colour reset mid-URL is vanishingly rare, so
-        // a string scan is enough without a full terminal parse.
-        let mut buf = std::mem::take(&mut self.carry);
-        buf.extend_from_slice(chunk);
-        let text = String::from_utf8_lossy(&buf);
-        for hit in scan(&text) {
-            if self.seen.insert(hit.port) {
+        // ANSI colour codes around a URL are outside the match, and a colour
+        // reset mid-URL is vanishingly rare, so a string scan is enough without
+        // a full terminal parse.
+        let carry_len = self.carry.len();
+        let text = format!("{}{}", self.carry, String::from_utf8_lossy(chunk));
+        for (end, hit) in scan_with_pos(&text) {
+            // A match ending within the carried prefix was already scanned last
+            // call; only emit one that reaches into the freshly read bytes.
+            if end > carry_len {
                 let _ = tx.send(hit);
             }
         }
-        // Retain the tail for the next call's boundary coverage.
-        let keep = buf.len().min(CARRY_BYTES);
-        self.carry = buf.split_off(buf.len() - keep);
+        // Keep the tail (on a char boundary) for the next call's split coverage.
+        let mut keep_from = text.len().saturating_sub(CARRY_BYTES);
+        while keep_from < text.len() && !text.is_char_boundary(keep_from) {
+            keep_from += 1;
+        }
+        self.carry = text[keep_from..].to_string();
     }
 }
 
@@ -155,35 +162,44 @@ impl Default for PortSniffer {
     }
 }
 
-/// Pure text scan shared by [`PortSniffer::sniff`] and the tests. URL hits win
-/// over bare hits for the same port (the URL carries scheme and path).
+/// Position-free view of [`scan_with_pos`] for the tests. URL hits win over bare
+/// hits for the same port (the URL carries scheme and path).
+#[cfg(test)]
 fn scan(text: &str) -> Vec<PortHit> {
-    let mut out: Vec<PortHit> = Vec::new();
+    scan_with_pos(text).into_iter().map(|(_, h)| h).collect()
+}
+
+/// Like [`scan`] but pairs each hit with the byte offset where its match ends,
+/// so [`PortSniffer::sniff`] can tell a hit in the freshly read bytes from one
+/// that only lives in the carried-over prefix.
+fn scan_with_pos(text: &str) -> Vec<(usize, PortHit)> {
+    let mut out: Vec<(usize, PortHit)> = Vec::new();
     for cap in URL_RE.captures_iter(text) {
-        let whole = cap.get(0).map(|m| m.as_str().to_string());
+        let m = cap.get(0).expect("group 0 always present");
+        let whole = m.as_str().to_string();
         // Explicit port, or the scheme's default (http=80, https=443).
-        let port = cap.get(1).and_then(|m| parse_port(m.as_str())).or_else(|| {
-            whole.as_deref().map(|u| {
-                if u.to_ascii_lowercase().starts_with("https") {
-                    443
-                } else {
-                    80
-                }
-            })
-        });
-        if let Some(port) = port {
-            out.push(PortHit {
+        let port = cap.get(1).and_then(|g| parse_port(g.as_str())).unwrap_or(
+            if whole.to_ascii_lowercase().starts_with("https") {
+                443
+            } else {
+                80
+            },
+        );
+        out.push((
+            m.end(),
+            PortHit {
                 port,
-                url: whole,
+                url: Some(whole),
                 process: None,
-            });
-        }
+            },
+        ));
     }
     for cap in BARE_RE.captures_iter(text) {
-        if let Some(port) = cap.get(1).and_then(|m| parse_port(m.as_str()))
-            && !out.iter().any(|h| h.port == port)
+        if let Some(g) = cap.get(1)
+            && let Some(port) = parse_port(g.as_str())
+            && !out.iter().any(|(_, h)| h.port == port)
         {
-            out.push(PortHit::bare(port));
+            out.push((g.end(), PortHit::bare(port)));
         }
     }
     out
@@ -385,14 +401,30 @@ mod tests {
     }
 
     #[test]
-    fn sniffer_emits_each_port_once() {
+    fn sniffer_does_not_double_emit_a_banner_via_the_carry() {
         let (tx, rx) = std::sync::mpsc::channel();
         let mut s = PortSniffer::new();
         s.sniff(b"up at http://localhost:3000/\n", &tx);
-        s.sniff(b"GET http://localhost:3000/ 200\n", &tx);
+        // The banner now lives only in the carried tail; a follow-up chunk that
+        // doesn't reprint it must not re-emit the port.
+        s.sniff(b"$ \n", &tx);
         let got: Vec<_> = rx.try_iter().collect();
-        assert_eq!(got.len(), 1, "second mention of 3000 is suppressed");
+        assert_eq!(got.len(), 1, "carried banner is not re-emitted: {got:?}");
         assert_eq!(got[0].port, 3000);
+    }
+
+    #[test]
+    fn sniffer_re_emits_a_port_after_the_server_stops_and_restarts() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut s = PortSniffer::new();
+        s.sniff(b"Serving on http://localhost:8000/\n", &tx);
+        // Server killed: a chunk with no port clears the suppression.
+        s.sniff(b"^C\nKeyboard interrupt received, exiting.\n", &tx);
+        // Restarted: the same port must be reported again so the toast fires.
+        s.sniff(b"Serving on http://localhost:8000/\n", &tx);
+        let got: Vec<_> = rx.try_iter().collect();
+        assert_eq!(got.len(), 2, "restart re-emits the port: {got:?}");
+        assert!(got.iter().all(|h| h.port == 8000));
     }
 
     #[test]

@@ -26,6 +26,15 @@ const COLOR_HEAD: Color = Color::Rgb(0x8b, 0x93, 0xa1);
 const COLOR_MSG: Color = Color::Rgb(0xCC, 0xCC, 0xCC);
 const COLOR_LIVE: Color = Color::Rgb(0x4f, 0xb1, 0xa6);
 
+/// Outcome of [`PortsPanel::reconcile_live`]: whether the view changed (for
+/// redraw) and any forwarded tunnels to tear down because their server stopped.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ReconcileOutcome {
+    pub changed: bool,
+    /// `(local_port, remote_port)` for each dropped forward.
+    pub torn_down: Vec<(u16, u16)>,
+}
+
 /// Where a detected port lives, and therefore what we can do with it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PortOrigin {
@@ -57,6 +66,10 @@ pub struct PortEntry {
     /// Consecutive poll cycles this port has been absent. A non-forwarded port
     /// is dropped once this passes the grace threshold.
     misses: u8,
+    /// Whether the detection toast has already fired for this entry. Tied to the
+    /// entry's lifetime, so a port re-added after its server restarts toasts
+    /// again, but the toast never double-fires for one running server.
+    toasted: bool,
 }
 
 impl PortEntry {
@@ -159,17 +172,31 @@ impl PortsPanel {
             local_port,
             live: true,
             misses: 0,
+            toasted: false,
         });
         true
     }
 
+    /// Mark that the output scrape has confirmed `port` is browser-facing, and
+    /// report whether the detection toast should fire now (true the first time
+    /// per entry). Lets the toast fire even when the silent socket poll added
+    /// the port first, and re-fire after a restart re-creates the entry.
+    pub fn note_scrape_toast(&mut self, port: u16) -> bool {
+        match self.entries.iter_mut().find(|e| e.port == port) {
+            Some(e) if !e.toasted => {
+                e.toasted = true;
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Reconcile the registry against the latest socket-poll snapshot (`live` =
     /// the ports currently listening). A port still present is live; one that's
-    /// gone is marked not-live, and a non-forwarded port that stays gone past a
-    /// short grace is dropped. Forwarded ports are never auto-removed — the user
-    /// set those up explicitly and clears them with `x`. Returns whether the
-    /// registry changed.
-    pub fn reconcile_live(&mut self, live: &HashSet<u16>) -> bool {
+    /// gone is marked not-live, and stays gone past a short grace is dropped —
+    /// the row follows the server, forwarded or not. A dropped forward's
+    /// `(local, remote)` pair is reported so the app can tear the tunnel down.
+    pub fn reconcile_live(&mut self, live: &HashSet<u16>) -> ReconcileOutcome {
         const GRACE_CYCLES: u8 = 2;
         let before = self.entries.len();
         let mut changed = false;
@@ -185,17 +212,24 @@ impl PortsPanel {
                     changed = true;
                 }
                 e.live = false;
-                if !e.forwarded {
-                    e.misses = e.misses.saturating_add(1);
-                }
+                e.misses = e.misses.saturating_add(1);
             }
         }
-        self.entries
-            .retain(|e| e.forwarded || e.misses < GRACE_CYCLES);
+        // Forwards about to be dropped: hand back their tunnels for teardown.
+        let torn_down: Vec<(u16, u16)> = self
+            .entries
+            .iter()
+            .filter(|e| e.misses >= GRACE_CYCLES && e.forwarded)
+            .filter_map(|e| e.local_port.map(|lp| (lp, e.port)))
+            .collect();
+        self.entries.retain(|e| e.misses < GRACE_CYCLES);
         if self.selected >= self.entries.len() {
             self.selected = self.entries.len().saturating_sub(1);
         }
-        changed || self.entries.len() != before
+        ReconcileOutcome {
+            changed: changed || self.entries.len() != before,
+            torn_down,
+        }
     }
 
     /// Drop a port from the registry and suppress re-detection, so a still
@@ -472,6 +506,33 @@ mod tests {
     }
 
     #[test]
+    fn a_polled_port_still_toasts_when_the_scrape_confirms_it() {
+        let mut p = PortsPanel::new();
+        // The socket poll adds it first (silent, no toast).
+        p.upsert(8000, None, Some("python3".into()), PortOrigin::Local);
+        // The output scrape then confirms it's browser-facing: toast once.
+        assert!(
+            p.note_scrape_toast(8000),
+            "scrape toasts even though the poll added the port first"
+        );
+        assert!(!p.note_scrape_toast(8000), "but only once per detection");
+    }
+
+    #[test]
+    fn a_restarted_port_toasts_again_after_reconcile_drops_it() {
+        let mut p = PortsPanel::new();
+        p.upsert(8000, None, None, PortOrigin::Local);
+        assert!(p.note_scrape_toast(8000));
+        // Server dies → reconciled out of the list.
+        p.reconcile_live(&HashSet::new());
+        p.reconcile_live(&HashSet::new());
+        assert_eq!(p.len(), 0);
+        // Restart: re-detected as a fresh entry, so it toasts again.
+        p.upsert(8000, None, None, PortOrigin::Local);
+        assert!(p.note_scrape_toast(8000), "a restart toasts again");
+    }
+
+    #[test]
     fn a_dismissed_port_does_not_come_back_on_the_next_poll() {
         let mut p = PortsPanel::new();
         p.upsert(8000, None, None, PortOrigin::Local);
@@ -504,16 +565,20 @@ mod tests {
     }
 
     #[test]
-    fn reconcile_keeps_a_forwarded_port_but_marks_it_not_live() {
+    fn a_stopped_forwarded_port_is_dropped_and_its_tunnel_torn_down() {
         let mut p = PortsPanel::new();
         p.upsert(3000, None, None, PortOrigin::Remote("box".into()));
-        p.mark_forwarded(3000, 3000);
-        // The remote process is gone, but the user's explicit forward stays in
-        // the list (greyed); only `x` removes a forwarded port.
-        p.reconcile_live(&HashSet::new());
-        p.reconcile_live(&HashSet::new());
-        assert_eq!(p.len(), 1, "a forwarded port is never auto-removed");
-        assert!(!p.selected().unwrap().live, "but it is marked not live");
+        p.mark_forwarded(3000, 3001);
+        // First poll without it: greyed but kept for the grace cycle.
+        let r1 = p.reconcile_live(&HashSet::new());
+        assert_eq!(p.len(), 1);
+        assert!(!p.selected().unwrap().live);
+        assert!(r1.torn_down.is_empty(), "not torn down during grace");
+        // Still gone: dropped, and its (local, remote) tunnel reported so the
+        // app can `ssh -O cancel` it.
+        let r2 = p.reconcile_live(&HashSet::new());
+        assert_eq!(p.len(), 0, "the row follows the server, forward or not");
+        assert_eq!(r2.torn_down, vec![(3001, 3000)]);
     }
 
     #[test]

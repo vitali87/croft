@@ -13230,6 +13230,45 @@ fn a_detected_port_renders_in_the_ports_panel() {
 }
 
 #[test]
+fn opening_a_forwarded_remote_port_routes_to_the_local_browser_via_relay() {
+    use crate::widgets::ports::{PortOrigin, PortsPanel};
+    // On a remote session the local opener would run on the headless remote, so
+    // a forwarded port must re-open through the relay (lands on the local Mac).
+    let mut p = PortsPanel::new();
+    p.upsert(3000, None, None, PortOrigin::Remote("box".into()));
+    p.mark_forwarded(3000, 3001);
+    let entry = p.selected().unwrap();
+    match super::plan_port_open(entry, true) {
+        super::PortOpenAction::OpenViaRelay(url) => assert_eq!(url, "http://127.0.0.1:3001/"),
+        other => panic!("expected relay open, got {other:?}"),
+    }
+}
+
+#[test]
+fn opening_an_unforwarded_remote_port_forwards_first() {
+    use crate::widgets::ports::{PortOrigin, PortsPanel};
+    let mut p = PortsPanel::new();
+    p.upsert(3000, None, None, PortOrigin::Remote("box".into()));
+    let entry = p.selected().unwrap();
+    assert!(matches!(
+        super::plan_port_open(entry, true),
+        super::PortOpenAction::Forward(3000)
+    ));
+}
+
+#[test]
+fn opening_a_local_port_opens_directly_not_via_relay() {
+    use crate::widgets::ports::{PortOrigin, PortsPanel};
+    let mut p = PortsPanel::new();
+    p.upsert(8000, None, None, PortOrigin::Local);
+    let entry = p.selected().unwrap();
+    match super::plan_port_open(entry, false) {
+        super::PortOpenAction::OpenDirect(url) => assert!(url.contains("8000"), "{url}"),
+        other => panic!("expected direct open, got {other:?}"),
+    }
+}
+
+#[test]
 fn double_clicking_a_port_row_opens_it() {
     use crate::widgets::ports::PortOrigin;
     let tmp = tempfile::tempdir().unwrap();

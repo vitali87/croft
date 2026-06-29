@@ -2444,6 +2444,35 @@ fn remote_host_label() -> String {
     .clone()
 }
 
+/// What activating a PORTS row (Enter / double-click) should do, computed from
+/// the entry and whether this is a remote (relay-active) session. Pure so it's
+/// testable without spawning a browser or standing up a relay.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PortOpenAction {
+    /// Remote port not yet forwarded: forward it home, then open.
+    Forward(u16),
+    /// A locally reachable address to open in the user's browser via the relay
+    /// — a remote session, so the opener must run on the local Mac, not the
+    /// headless remote.
+    OpenViaRelay(String),
+    /// A locally reachable address to open directly (local session).
+    OpenDirect(String),
+    /// Nothing actionable.
+    Nothing,
+}
+
+fn plan_port_open(entry: &crate::widgets::ports::PortEntry, relay_active: bool) -> PortOpenAction {
+    use crate::widgets::ports::PortOrigin;
+    if matches!(entry.origin, PortOrigin::Remote(_)) && !entry.forwarded {
+        return PortOpenAction::Forward(entry.port);
+    }
+    match entry.open_url() {
+        Some(url) if relay_active => PortOpenAction::OpenViaRelay(url),
+        Some(url) => PortOpenAction::OpenDirect(url),
+        None => PortOpenAction::Nothing,
+    }
+}
+
 impl App {
     pub fn new(root: PathBuf) -> Result<Self> {
         // Reap any js-debug adapter tree a previous croft left orphaned (a
@@ -14700,12 +14729,20 @@ impl App {
             .flat_map(|t| t.drain_ports())
             .collect();
         for hit in scraped {
+            let port = hit.port;
+            let process = hit.process.clone();
             if self
                 .ports
-                .upsert(hit.port, hit.url, hit.process.clone(), origin.clone())
+                .upsert(port, hit.url, hit.process, origin.clone())
             {
                 changed = true;
-                self.show_port_toast(hit.port, hit.process);
+            }
+            // Toast on the scrape confirmation, not on first insert: the silent
+            // socket poll may have added the port first (common on a remote
+            // session), which must not swallow the toast.
+            if self.ports.note_scrape_toast(port) {
+                self.show_port_toast(port, process);
+                changed = true;
             }
         }
         // Latest background-poll snapshot (a complete listener set): add new
@@ -14721,8 +14758,13 @@ impl App {
                     changed = true;
                 }
             }
-            if self.ports.reconcile_live(&live) {
+            let outcome = self.ports.reconcile_live(&live);
+            if outcome.changed {
                 changed = true;
+            }
+            // A dropped forward's tunnel is no longer needed — cancel it.
+            for (local, remote) in outcome.torn_down {
+                self.request_remote_unforward(local, remote);
             }
         }
         // On cadence, kick off a fresh poll off-thread — `lsof`/`ps` block for
@@ -14778,13 +14820,17 @@ impl App {
         let Some(entry) = self.ports.selected() else {
             return;
         };
-        let port = entry.port;
-        match entry.open_url() {
-            Some(url) => match open_url(&url) {
+        match plan_port_open(entry, self.drop_relay_active()) {
+            PortOpenAction::Forward(port) => self.request_remote_forward(port, true),
+            PortOpenAction::OpenViaRelay(url) => {
+                self.request_remote_url_open(url.clone());
+                self.status = format!("Opening {url} in your local browser");
+            }
+            PortOpenAction::OpenDirect(url) => match open_url(&url) {
                 Ok(()) => self.status = format!("Opened {url}"),
                 Err(e) => self.status = format!("Open failed: {e}"),
             },
-            None => self.request_remote_forward(port, true),
+            PortOpenAction::Nothing => {}
         }
     }
 
