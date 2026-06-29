@@ -1937,6 +1937,10 @@ pub struct App {
     /// "View Changes vs <name>" label so users know which branch the
     /// diff compares against. `None` until the resolver succeeds.
     default_branch_label: Option<String>,
+    /// Last HEAD oid the git-gutter baselines were synced against. When the
+    /// git worker reports a different oid (commit, checkout, pull), the cached
+    /// per-tab HEAD snapshots are invalidated so the gutter refetches.
+    git_gutter_head_oid: Option<String>,
     /// True after the user has chosen "Always for this session" on the
     /// local-browser confirmation. Subsequent link clicks dispatch to
     /// the relay silently.
@@ -2078,6 +2082,14 @@ pub struct App {
     /// id are dropped so a slow earlier response cannot clobber a fresh
     /// one (e.g. user already moved past the original trigger).
     completion_request_id: Option<u64>,
+    /// Signature Help (parameter hints) popup, anchored to the caret while the
+    /// user is inside a call. Populated by `drain_lsp_signature_help`.
+    pub signature_help_popup: Option<crate::widgets::signature_help_popup::SignatureHelpPopup>,
+    signature_help_request_id: Option<u64>,
+    /// (cursor_row, cursor_col, edit_seq) at the last signatureHelp request, so
+    /// the tick can re-query when the caret moves or the buffer changes while
+    /// the popup is open and close it once the caret leaves the call.
+    signature_help_anchor: Option<(usize, usize, u64)>,
     hover: HoverDwell,
     hover_popup: Option<crate::widgets::hover_popup::HoverPopup>,
     hover_request_id: Option<u64>,
@@ -2171,6 +2183,9 @@ pub struct App {
     /// VS Code-style Cmd+Shift+P / Ctrl+Shift+P command palette. None when
     /// the modal is closed.
     pub command_palette: Option<crate::widgets::command_palette::CommandPalette>,
+    /// VS Code-style Cmd+Shift+O / Ctrl+Shift+O "Go to Symbol in Editor"
+    /// picker (also Go to Line via a `:` prefix). None when the modal is closed.
+    pub go_to_symbol: Option<crate::widgets::symbol_picker::SymbolPicker>,
     /// Receiver for an in-flight MCP sidecar command's result (the off-thread
     /// worker delivers one [`crate::mcp::McpOutcome`] then disconnects). `None`
     /// when no extension command is running; polled each frame by `poll_mcp`.
@@ -2848,6 +2863,7 @@ impl App {
             pending_terminal_warning: false,
             commit_menu_open: false,
             default_branch_label: None,
+            git_gutter_head_oid: None,
             trust_local_browser: false,
             sidebar_width: SIDEBAR_WIDTH_DEFAULT,
             terminal_height: None,
@@ -2917,6 +2933,7 @@ impl App {
             editor_find: None,
             file_finder: None,
             command_palette: None,
+            go_to_symbol: None,
             mcp_rx: None,
             mcp_started: None,
             mcp_busy_label: None,
@@ -2937,6 +2954,9 @@ impl App {
             file_finder_index_rx: Some(file_finder_index_rx),
             file_finder_index_dirty: false,
             completion_request_id: None,
+            signature_help_popup: None,
+            signature_help_request_id: None,
+            signature_help_anchor: None,
             rename_request_id: None,
             format_request_id: None,
             code_action_request_id: None,
@@ -3289,6 +3309,7 @@ impl App {
         if self.shortcuts_modal.is_some()
             || self.file_finder.is_some()
             || self.command_palette.is_some()
+            || self.go_to_symbol.is_some()
             || self.process_picker.is_some()
             || self.zoxide_jump.is_some()
             || self.branch_picker.is_some()
@@ -3357,6 +3378,7 @@ impl App {
         if self.shortcuts_modal.is_some()
             || self.file_finder.is_some()
             || self.command_palette.is_some()
+            || self.go_to_symbol.is_some()
             || self.process_picker.is_some()
             || self.zoxide_jump.is_some()
             || self.branch_picker.is_some()
@@ -3679,6 +3701,7 @@ impl App {
             self.shortcuts_modal.as_ref().map(|m| m.last_rect),
             self.file_finder.as_ref().map(|f| f.last_rect),
             self.command_palette.as_ref().map(|p| p.last_rect),
+            self.go_to_symbol.as_ref().map(|p| p.last_rect),
             self.process_picker.as_ref().map(|p| p.last_rect),
         ];
         let visible = |block: Rect| {
@@ -3957,6 +3980,18 @@ impl App {
         if changed && self.git.status().in_repo && self.default_branch_label.is_none() {
             self.default_branch_label = crate::git::default_branch(&self.tree.root).ok();
         }
+        // HEAD moved (commit, checkout, pull): every cached git-gutter baseline
+        // is now stale. Clear the per-tab marker so `sync_git_gutters` refetches
+        // the committed snapshot and the bars reflect the new HEAD.
+        if changed {
+            let oid = self.git.status().head_oid.clone();
+            if oid != self.git_gutter_head_oid {
+                self.git_gutter_head_oid = oid;
+                for ed in &mut self.editor.editors {
+                    ed.git_baseline_for = None;
+                }
+            }
+        }
         changed
     }
 
@@ -4184,6 +4219,39 @@ impl App {
         }
     }
 
+    /// Keep each text tab's git-gutter baseline current. The first time a tab
+    /// is seen (or after it switches files, or after HEAD moves), shell out
+    /// once for the committed version of the file and hand it to the editor;
+    /// the per-line diff is then recomputed in-buffer on every edit with no
+    /// further subprocess. Cheap no-op once every open tab has a baseline:
+    /// just a path compare per tab.
+    ///
+    /// `read_file_at_head` is a `git show` (~tens of ms) but runs at most once
+    /// per (file, HEAD) pair, never on the keystroke path.
+    /// ponytail: synchronous fetch on the tick. Move to the git worker thread
+    /// if opening a file in a huge repo ever visibly hitches.
+    fn sync_git_gutters(&mut self) {
+        let root = self.tree.root.clone();
+        for ed in &mut self.editor.editors {
+            let Some(path) = ed.path.clone() else {
+                continue;
+            };
+            if ed.git_baseline_for.as_deref() == Some(path.as_path()) {
+                continue;
+            }
+            // Untracked files / non-repo dirs yield Err here, so the gutter
+            // simply shows nothing; the baseline-for marker still updates so we
+            // don't re-shell every tick.
+            let head = path
+                .strip_prefix(&root)
+                .ok()
+                .and_then(|rel| rel.to_str())
+                .and_then(|rel| crate::git::read_file_at_head(&root, rel).ok())
+                .map(|text| text.lines().map(str::to_string).collect());
+            ed.set_git_head_lines(path, head);
+        }
+    }
+
     /// Drain LSP completion responses. Drops responses with stale request
     /// ids so a slow earlier reply cannot clobber a fresher popup. Returns
     /// true when the popup state changed and the next frame should redraw.
@@ -4246,6 +4314,89 @@ impl App {
         };
         let id = lsp.request_completion(path, line, character);
         self.completion_request_id = Some(id);
+    }
+
+    /// Ask the server for parameter hints at the caret (typing `(` or `,`).
+    pub fn trigger_signature_help(&mut self) {
+        if self.editor.diff.is_some() || self.editor.sheet.is_some() || self.editor.image.is_some()
+        {
+            return;
+        }
+        let Some(path) = self.editor.path.clone() else {
+            return;
+        };
+        let line = self.editor.cursor_row as u32;
+        let character = self.editor.cursor_col as u32;
+        let Some(lsp) = self.lsp.as_mut() else {
+            return;
+        };
+        let id = lsp.request_signature_help(path, line, character);
+        self.signature_help_request_id = Some(id);
+        self.signature_help_anchor =
+            Some((self.editor.cursor_row, self.editor.cursor_col, self.editor.edit_seq));
+    }
+
+    /// Dismiss the parameter-hints popup (typing `)`, Esc, or moving away).
+    fn dismiss_signature_help(&mut self) {
+        self.signature_help_popup = None;
+        self.signature_help_request_id = None;
+        self.signature_help_anchor = None;
+    }
+
+    /// While the parameter-hints popup is open, re-query when the caret moves
+    /// or the buffer changes (typing an argument, backspacing, arrowing, a
+    /// click). The empty-response path closes the popup once the caret is no
+    /// longer inside a call; a non-empty reply keeps it open with the active
+    /// parameter following the caret. Cheap: only runs while a popup is up.
+    fn refresh_signature_help_if_moved(&mut self) {
+        if self.signature_help_popup.is_none() {
+            return;
+        }
+        let now = (self.editor.cursor_row, self.editor.cursor_col, self.editor.edit_seq);
+        if self.signature_help_anchor == Some(now) {
+            return;
+        }
+        // The caret left the editor entirely (focus moved to tree/terminal):
+        // drop the hint rather than re-query against a stale position.
+        if self.focus != Pane::Editor {
+            self.dismiss_signature_help();
+            return;
+        }
+        self.trigger_signature_help();
+    }
+
+    /// Drain LSP signatureHelp responses, dropping stale ids. An empty reply
+    /// closes any open popup; otherwise the popup is re-anchored to the caret.
+    pub fn drain_lsp_signature_help(&mut self) -> bool {
+        let Some(lsp) = self.lsp.as_ref() else {
+            return false;
+        };
+        let mut changed = false;
+        while let Some(result) = lsp.drain_signature_help() {
+            if Some(result.request_id) != self.signature_help_request_id {
+                continue;
+            }
+            if result.signatures.is_empty() {
+                if self.signature_help_popup.is_some() {
+                    self.signature_help_popup = None;
+                    changed = true;
+                }
+                continue;
+            }
+            let Some((cx, cy)) = self.editor.cursor_screen_pos() else {
+                continue;
+            };
+            self.signature_help_popup =
+                Some(crate::widgets::signature_help_popup::SignatureHelpPopup::new(
+                    result.signatures,
+                    result.active_signature,
+                    (cx, cy),
+                    result.path,
+                    result.request_id,
+                ));
+            changed = true;
+        }
+        changed
     }
 
     /// Map a pointer cell to the activity-bar icon under it, if any. Uses the
@@ -6454,6 +6605,9 @@ impl App {
                     self.completion_popup = None;
                     self.completion_request_id = None;
                 }
+                if is_signature_help_trigger(c) {
+                    self.trigger_signature_help();
+                }
                 true
             }
             _ => {
@@ -8215,6 +8369,22 @@ impl App {
                     frame.render_widget(popup_ref, area);
                 }
             }
+            // Parameter hints sit ABOVE the caret, so they coexist with the
+            // completion popup below it.
+            if self.focus == Pane::Editor
+                && self.signature_help_popup.is_some()
+                && let Some((cx, cy)) = self.editor.cursor_screen_pos()
+            {
+                if let Some(popup) = self.signature_help_popup.as_mut() {
+                    popup.anchor = (cx, cy);
+                    popup.gradient = grad;
+                }
+                let popup_ref = self.signature_help_popup.as_ref().unwrap();
+                let area = popup_ref.area_for(focused_area);
+                if area.width > 0 && area.height > 0 {
+                    frame.render_widget(popup_ref, area);
+                }
+            }
             if let Some(popup) = self.hover_popup.as_mut() {
                 popup.gradient = grad;
                 let area = popup.area_for(focused_area);
@@ -8526,6 +8696,7 @@ impl App {
         self.render_editor_find(frame);
         self.render_file_finder(frame);
         self.render_command_palette(frame);
+        self.render_go_to_symbol(frame);
         self.render_process_picker(frame);
         self.render_zoxide_jump(frame);
         self.render_branch_picker(frame);
@@ -9618,6 +9789,10 @@ impl App {
             self.handle_command_palette_key(key);
             return Ok(());
         }
+        if self.go_to_symbol.is_some() {
+            self.handle_go_to_symbol_key(key);
+            return Ok(());
+        }
         if self.process_picker.is_some() {
             self.handle_process_picker_key(key);
             return Ok(());
@@ -9734,6 +9909,10 @@ impl App {
         }
         if is_command_palette_key(key) {
             self.open_command_palette();
+            return Ok(());
+        }
+        if is_go_to_symbol_key(key) {
+            self.open_go_to_symbol();
             return Ok(());
         }
         // Modal layer: prompt eats every key while it's open.
@@ -13084,6 +13263,12 @@ impl App {
         if self.handle_completion_popup_key(key) {
             return;
         }
+        // Esc closes the parameter-hints popup first (VS Code parity); a second
+        // Esc then falls through to clear the selection / collapse cursors.
+        if self.signature_help_popup.is_some() && matches!(key.code, KeyCode::Esc) {
+            self.dismiss_signature_help();
+            return;
+        }
         if is_completion_trigger_key(key) {
             self.trigger_completion();
             return;
@@ -13598,6 +13783,12 @@ impl App {
                 // populates a fresh popup when the response lands.
                 if c == '.' {
                     self.trigger_completion();
+                }
+                // Parameter hints: `(` / `,` open or advance a call. Closing
+                // (typing `)`, moving away, deleting) is handled by the tick's
+                // re-query, which also covers nested calls.
+                if is_signature_help_trigger(c) {
+                    self.trigger_signature_help();
                 }
             }
             _ => {}
@@ -14562,6 +14753,14 @@ impl App {
             for c in s.chars() {
                 if !c.is_control() {
                     palette.push_char(c);
+                }
+            }
+            return;
+        }
+        if let Some(picker) = self.go_to_symbol.as_mut() {
+            for c in s.chars() {
+                if !c.is_control() {
+                    picker.push_char(c);
                 }
             }
             return;
@@ -15847,6 +16046,123 @@ impl App {
         );
     }
 
+    /// Open "Go to Symbol in Editor" (Cmd/Ctrl+Shift+O). Snapshots the active
+    /// file's symbols from the outline (tree-sitter is populated synchronously
+    /// each tick; LSP refines it). A leading `:` in the query switches to Go to
+    /// Line. ponytail: snapshot at open — symbols are present for any synced
+    /// file; if a slow LSP reply ever needs to land into an open picker, feed
+    /// it live from `drain_lsp_document_symbols`.
+    fn open_go_to_symbol(&mut self) {
+        if self.go_to_symbol.is_some() {
+            return;
+        }
+        let Some(path) = self.editor.path.clone() else {
+            self.status = String::from("Go to Symbol: no file open");
+            return;
+        };
+        let symbols = self.outline.symbols().to_vec();
+        let count = symbols.len();
+        self.go_to_symbol = Some(crate::widgets::symbol_picker::SymbolPicker::new(path, symbols));
+        self.overlays.command_palette_clear.request();
+        self.status = format!("Go to Symbol: {count} symbols — Esc to close");
+    }
+
+    fn close_go_to_symbol(&mut self) {
+        if self.go_to_symbol.take().is_some() {
+            self.overlays.command_palette_clear.request();
+            self.overlays.activity.mark_dirty();
+            self.overlays.welcome.mark_dirty();
+            self.overlays.hero.mark_dirty();
+            self.invalidate_editor_image_layouts();
+            self.status.clear();
+        }
+    }
+
+    fn handle_go_to_symbol_key(&mut self, key: KeyEvent) {
+        let Some(picker) = self.go_to_symbol.as_mut() else {
+            return;
+        };
+        match (key.code, key.modifiers) {
+            (KeyCode::Esc, _) => self.close_go_to_symbol(),
+            (KeyCode::Enter, _) => {
+                // Resolve the target before closing (close drops the picker).
+                let target = if picker.is_line_mode() {
+                    picker.line_target().map(|n| (n as u32 - 1, 0))
+                } else {
+                    picker.selected_target()
+                };
+                let path = picker.path.clone();
+                self.close_go_to_symbol();
+                if let Some((line, col)) = target {
+                    self.go_to_definition(path, line, col);
+                }
+            }
+            (KeyCode::Up, _) => picker.select_prev(),
+            (KeyCode::Down, _) => picker.select_next(),
+            (KeyCode::PageUp, _) => {
+                for _ in 0..10 {
+                    picker.select_prev();
+                }
+            }
+            (KeyCode::PageDown, _) => {
+                for _ in 0..10 {
+                    picker.select_next();
+                }
+            }
+            (KeyCode::Left, _) => picker.move_cursor_left(),
+            (KeyCode::Right, _) => picker.move_cursor_right(),
+            (KeyCode::Home, _) => picker.move_cursor_home(),
+            (KeyCode::End, _) => picker.move_cursor_end(),
+            (KeyCode::Backspace, _) => picker.pop_char(),
+            (KeyCode::Delete, _) => picker.delete_char(),
+            (KeyCode::Char(c), m) if !m.intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER) => {
+                picker.push_char(c);
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_go_to_symbol_mouse(&mut self, m: MouseEvent) {
+        let Some(picker) = self.go_to_symbol.as_mut() else {
+            return;
+        };
+        let inside = rect_contains(picker.last_rect, m.column, m.row);
+        match m.kind {
+            MouseEventKind::ScrollDown => {
+                for _ in 0..3 {
+                    picker.select_next();
+                }
+            }
+            MouseEventKind::ScrollUp => {
+                for _ in 0..3 {
+                    picker.select_prev();
+                }
+            }
+            MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Down(MouseButton::Right)
+                if !inside =>
+            {
+                self.close_go_to_symbol();
+            }
+            _ => {}
+        }
+    }
+
+    fn render_go_to_symbol(&mut self, frame: &mut ratatui::Frame) {
+        let gradient = self.popup_gradient();
+        let center = self.quick_input_position == QuickInputPosition::Center;
+        let Some(picker) = self.go_to_symbol.as_mut() else {
+            return;
+        };
+        let area = frame.area();
+        crate::widgets::symbol_picker::render_symbol_picker(
+            picker,
+            area,
+            frame.buffer_mut(),
+            gradient,
+            center,
+        );
+    }
+
     pub fn consume_process_picker_image_clear(&mut self) -> bool {
         self.overlays.process_picker_clear.consume()
     }
@@ -16216,6 +16532,7 @@ impl App {
             }
             Cmd::SplitEditor => self.split_editor(),
             Cmd::QuickOpen => self.open_file_finder(),
+            Cmd::GoToSymbol => self.open_go_to_symbol(),
             Cmd::ToggleVimMode => self.toggle_vim_mode(),
             Cmd::ShowExplorer => self.set_sidebar_view(SidebarView::Explorer),
             Cmd::ShowSearch => self.set_sidebar_view(SidebarView::Search),
@@ -17339,6 +17656,10 @@ impl App {
         }
         if self.command_palette.is_some() {
             self.handle_command_palette_mouse(m);
+            return;
+        }
+        if self.go_to_symbol.is_some() {
+            self.handle_go_to_symbol_mouse(m);
             return;
         }
         if self.zoxide_jump.is_some() {
@@ -19810,6 +20131,7 @@ impl App {
         if self.shortcuts_modal.is_some()
             || self.file_finder.is_some()
             || self.command_palette.is_some()
+            || self.go_to_symbol.is_some()
             || self.process_picker.is_some()
             || self.zoxide_jump.is_some()
             || self.branch_picker.is_some()
@@ -20007,6 +20329,7 @@ impl App {
         if self.shortcuts_modal.is_some()
             || self.file_finder.is_some()
             || self.command_palette.is_some()
+            || self.go_to_symbol.is_some()
             || self.process_picker.is_some()
             || self.zoxide_jump.is_some()
             || self.branch_picker.is_some()
@@ -20081,6 +20404,7 @@ impl App {
         if self.shortcuts_modal.is_some()
             || self.file_finder.is_some()
             || self.command_palette.is_some()
+            || self.go_to_symbol.is_some()
             || self.process_picker.is_some()
             || self.zoxide_jump.is_some()
             || self.branch_picker.is_some()
@@ -21117,6 +21441,12 @@ fn is_command_palette_key(key: KeyEvent) -> bool {
     is_cmd_shift_letter(key, 'p')
 }
 
+/// `Cmd+Shift+O` (macOS) / `Ctrl+Shift+O` (Linux): VS Code's "Go to Symbol in
+/// Editor". Opens the symbol picker (also Go to Line via a `:` prefix).
+fn is_go_to_symbol_key(key: KeyEvent) -> bool {
+    is_cmd_shift_letter(key, 'o')
+}
+
 /// `Cmd+K` (macOS) / `Ctrl+K` (Linux / Termux): the leader for croft's
 /// `Cmd+K`-prefixed chords (Color Theme, Close to the Right, Select for /
 /// Compare with Selected, Close All). Rejects Shift and Alt so it never
@@ -21741,6 +22071,11 @@ fn is_word_continuation(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
 
+/// Characters that open or advance a call, triggering parameter hints.
+fn is_signature_help_trigger(c: char) -> bool {
+    c == '(' || c == ','
+}
+
 fn is_completion_trigger_key(key: KeyEvent) -> bool {
     let KeyCode::Char(c) = key.code else {
         return false;
@@ -22231,11 +22566,12 @@ fn is_editor_open_line_below_key(key: KeyEvent) -> bool {
     key.modifiers.contains(KeyModifiers::SUPER) || key.modifiers.contains(KeyModifiers::CONTROL)
 }
 
+/// Insert line above: `Cmd+Shift+Enter` (macOS) / `Ctrl+Shift+Enter` (Linux),
+/// matching VS Code's `editor.action.insertLineBefore`. (Previously bound to
+/// `Cmd+Shift+O`, which VS Code reserves for Go to Symbol; relocated to its
+/// real chord so `Cmd+Shift+O` can open the symbol picker.)
 fn is_editor_open_line_above_key(key: KeyEvent) -> bool {
-    let KeyCode::Char(c) = key.code else {
-        return false;
-    };
-    if !c.eq_ignore_ascii_case(&'o') {
+    if !matches!(key.code, KeyCode::Enter) {
         return false;
     }
     if !key.modifiers.contains(KeyModifiers::SHIFT) {
@@ -23656,6 +23992,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let install_changed = app.poll_install_session();
         let update_changed = app.poll_update_watch();
         app.sync_lsp();
+        app.sync_git_gutters();
         // Request/refresh the OUTLINE for the active file (after sync_lsp so the
         // edit-seq it reads is current) and advance follow-cursor.
         let outline_sync_changed = app.sync_outline();
@@ -23665,6 +24002,8 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let explorer_panels_changed = app.sync_explorer_panels();
         app.refresh_semantic_tokens_if_requested();
         let lsp_changed = app.drain_lsp_completion();
+        app.refresh_signature_help_if_moved();
+        let sig_help_changed = app.drain_lsp_signature_help();
         app.poll_hover();
         let hover_changed = app.drain_lsp_hover();
         let tab_hover_changed = app.poll_tab_hover();
@@ -23717,6 +24056,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             || install_changed
             || update_changed
             || lsp_changed
+            || sig_help_changed
             || hover_changed
             || tab_hover_changed
             || ui_tooltip_changed

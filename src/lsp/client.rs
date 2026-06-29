@@ -435,6 +435,25 @@ impl LspClient {
             .context("completion")
     }
 
+    pub async fn signature_help(
+        &mut self,
+        uri: Url,
+        line: u32,
+        character: u32,
+    ) -> Result<Option<lsp_types::SignatureHelp>> {
+        self.server
+            .signature_help(lsp_types::SignatureHelpParams {
+                context: None,
+                text_document_position_params: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri },
+                    position: Position { line, character },
+                },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+            })
+            .await
+            .context("signature_help")
+    }
+
     pub async fn hover(&mut self, uri: Url, line: u32, character: u32) -> Result<Option<Hover>> {
         self.server
             .hover(HoverParams {

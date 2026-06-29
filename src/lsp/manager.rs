@@ -54,6 +54,24 @@ pub struct HoverResult {
     pub text: Option<String>,
 }
 
+/// One callable signature for the Signature Help popup, normalised off the LSP
+/// `SignatureInformation` so the widget never touches lsp-types. `active_param`
+/// is the (start, end) char range within `label` to bold (the parameter the
+/// caret currently sits in), already resolved against the active signature.
+#[derive(Clone, Debug)]
+pub struct SignatureInfo {
+    pub label: String,
+    pub active_param: Option<(usize, usize)>,
+}
+
+#[derive(Debug)]
+pub struct SignatureHelpResult {
+    pub request_id: u64,
+    pub path: PathBuf,
+    pub signatures: Vec<SignatureInfo>,
+    pub active_signature: usize,
+}
+
 #[derive(Debug)]
 pub struct DefinitionResult {
     pub request_id: u64,
@@ -376,6 +394,12 @@ enum Cmd {
         line: u32,
         character: u32,
     },
+    RequestSignatureHelp {
+        request_id: u64,
+        path: PathBuf,
+        line: u32,
+        character: u32,
+    },
     RequestHover {
         request_id: u64,
         path: PathBuf,
@@ -471,6 +495,7 @@ type CapabilitySupport = Arc<StdMutex<LangCapabilitySupport>>;
 pub struct LspManager {
     cmd_tx: tokio_mpsc::UnboundedSender<Cmd>,
     completion_rx: std_mpsc::Receiver<CompletionResult>,
+    signature_help_rx: std_mpsc::Receiver<SignatureHelpResult>,
     hover_rx: std_mpsc::Receiver<HoverResult>,
     def_rx: std_mpsc::Receiver<DefinitionResult>,
     doc_symbols_rx: std_mpsc::Receiver<DocumentSymbolsResult>,
@@ -512,6 +537,7 @@ impl LspManager {
         let runtime = LspRuntime::new()?;
         let (cmd_tx, cmd_rx) = tokio_mpsc::unbounded_channel();
         let (completion_tx, completion_rx) = std_mpsc::channel();
+        let (signature_help_tx, signature_help_rx) = std_mpsc::channel();
         let (hover_tx, hover_rx) = std_mpsc::channel();
         let (def_tx, def_rx) = std_mpsc::channel();
         let (doc_symbols_tx, doc_symbols_rx) = std_mpsc::channel();
@@ -551,6 +577,7 @@ impl LspManager {
             cmd_rx,
             ResultSenders {
                 completion: completion_tx,
+                signature_help: signature_help_tx,
                 hover: hover_tx,
                 definition: def_tx,
                 document_symbols: doc_symbols_tx,
@@ -571,6 +598,7 @@ impl LspManager {
         Ok(Self {
             cmd_tx,
             completion_rx,
+            signature_help_rx,
             hover_rx,
             def_rx,
             doc_symbols_rx,
@@ -622,6 +650,22 @@ impl LspManager {
 
     pub fn drain_completion(&self) -> Option<CompletionResult> {
         self.completion_rx.try_recv().ok()
+    }
+
+    pub fn request_signature_help(&mut self, path: PathBuf, line: u32, character: u32) -> u64 {
+        let id = self.next_request_id;
+        self.next_request_id += 1;
+        let _ = self.cmd_tx.send(Cmd::RequestSignatureHelp {
+            request_id: id,
+            path,
+            line,
+            character,
+        });
+        id
+    }
+
+    pub fn drain_signature_help(&self) -> Option<SignatureHelpResult> {
+        self.signature_help_rx.try_recv().ok()
     }
 
     pub fn request_hover(&mut self, path: PathBuf, line: u32, character: u32) -> u64 {
@@ -958,6 +1002,7 @@ struct ManagedClient {
     name: String,
     client: Arc<TokioMutex<LspClient>>,
     supports_completion: bool,
+    supports_signature_help: bool,
     supports_hover: bool,
     supports_definition: bool,
     supports_document_symbol: bool,
@@ -1016,6 +1061,7 @@ struct DocState {
 /// `worker_loop` keeps a small argument list as request kinds grow.
 struct ResultSenders {
     completion: std_mpsc::Sender<CompletionResult>,
+    signature_help: std_mpsc::Sender<SignatureHelpResult>,
     hover: std_mpsc::Sender<HoverResult>,
     definition: std_mpsc::Sender<DefinitionResult>,
     document_symbols: std_mpsc::Sender<DocumentSymbolsResult>,
@@ -1081,6 +1127,16 @@ async fn worker_loop(
             } => {
                 state
                     .request_completion(request_id, path, line, character, &tx.completion)
+                    .await
+            }
+            Cmd::RequestSignatureHelp {
+                request_id,
+                path,
+                line,
+                character,
+            } => {
+                state
+                    .request_signature_help(request_id, path, line, character, &tx.signature_help)
                     .await
             }
             Cmd::RequestHover {
@@ -1290,6 +1346,8 @@ impl WorkerState {
                         // vtsls (which advertises `declarationProvider: false`)
                         // and get a -32601 "Unhandled method" back.
                         let supports = caps.completion_provider.is_some();
+                        let supports_signature_help =
+                            signature_help_supported(&caps.signature_help_provider);
                         let supports_hover = hover_supported(&caps.hover_provider);
                         let supports_definition = one_of_supported(&caps.definition_provider);
                         let supports_document_symbol =
@@ -1309,7 +1367,7 @@ impl WorkerState {
                         let semantic_legend = semantic_legend_of(caps).map(Arc::new);
                         let semantic_supports_range = semantic_tokens_range_supported(caps);
                         log_file::log(&format!(
-                            "lsp[{}] spawned, root={} supports_completion={supports} supports_hover={supports_hover} supports_definition={supports_definition} supports_declaration={supports_declaration} supports_type_definition={supports_type_definition} supports_implementation={supports_implementation} supports_references={supports_references} supports_rename={supports_rename}",
+                            "lsp[{}] spawned, root={} supports_completion={supports} supports_signature_help={supports_signature_help} supports_hover={supports_hover} supports_definition={supports_definition} supports_declaration={supports_declaration} supports_type_definition={supports_type_definition} supports_implementation={supports_implementation} supports_references={supports_references} supports_rename={supports_rename}",
                             config.name,
                             root.display()
                         ));
@@ -1317,6 +1375,7 @@ impl WorkerState {
                             name: config.name.to_string(),
                             client: Arc::new(TokioMutex::new(client)),
                             supports_completion: supports,
+                            supports_signature_help,
                             supports_hover,
                             supports_definition,
                             supports_document_symbol,
@@ -1528,6 +1587,87 @@ impl WorkerState {
                 request_id,
                 path: path_clone,
                 items,
+            });
+        });
+    }
+
+    async fn request_signature_help(
+        &mut self,
+        request_id: u64,
+        path: PathBuf,
+        line: u32,
+        character: u32,
+        tx: &std_mpsc::Sender<SignatureHelpResult>,
+    ) {
+        let Some(doc) = self.docs.get(&path) else {
+            return;
+        };
+        let lang = doc.language;
+        let root = doc.project_root.clone();
+        self.ensure_clients(lang, &root).await;
+        let Some(clients) = self.clients.get(&(lang, root)) else {
+            return;
+        };
+        // Every server that advertises the capability, in registration order.
+        // Some servers (e.g. Astral's `ty`) advertise `signatureHelpProvider`
+        // but return nothing, so we try each in turn and take the FIRST that
+        // actually answers, rather than stopping at an empty stub.
+        let candidates: Vec<(String, Arc<TokioMutex<LspClient>>)> = clients
+            .iter()
+            .filter(|c| c.supports_signature_help)
+            .map(|c| (c.name.clone(), c.client.clone()))
+            .collect();
+        if candidates.is_empty() {
+            log_file::log(&format!(
+                "signatureHelp request id={request_id} dropped: no client advertises signature_help_provider for {lang:?}"
+            ));
+            let _ = tx.send(SignatureHelpResult {
+                request_id,
+                path,
+                signatures: Vec::new(),
+                active_signature: 0,
+            });
+            return;
+        }
+        let Ok(uri) = Url::from_file_path(&path) else {
+            return;
+        };
+        let tx = tx.clone();
+        let path_clone = path.clone();
+        log_file::log(&format!(
+            "signatureHelp request id={request_id} servers={:?} line={line} char={character}",
+            candidates.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>()
+        ));
+        tokio::spawn(async move {
+            let mut signatures = Vec::new();
+            let mut active_signature = 0;
+            for (name, client_arc) in &candidates {
+                let mut client = client_arc.lock().await;
+                let resp = client.signature_help(uri.clone(), line, character).await;
+                drop(client);
+                let (sigs, active) = match resp {
+                    Ok(Some(help)) => normalise_signature_help(help),
+                    Ok(None) => (Vec::new(), 0),
+                    Err(e) => {
+                        log_file::log(&format!("lsp[{name}] signatureHelp error: {e}"));
+                        (Vec::new(), 0)
+                    }
+                };
+                log_file::log(&format!(
+                    "signatureHelp response id={request_id} server={name} count={}",
+                    sigs.len()
+                ));
+                if !sigs.is_empty() {
+                    signatures = sigs;
+                    active_signature = active;
+                    break;
+                }
+            }
+            let _ = tx.send(SignatureHelpResult {
+                request_id,
+                path: path_clone,
+                signatures,
+                active_signature,
             });
         });
     }
@@ -2688,6 +2828,49 @@ fn hover_supported(cap: &Option<HoverProviderCapability>) -> bool {
     }
 }
 
+/// Whether the server advertises `signatureHelpProvider`.
+fn signature_help_supported(cap: &Option<lsp_types::SignatureHelpOptions>) -> bool {
+    cap.is_some()
+}
+
+/// Flatten an LSP `SignatureHelp` into the widget-facing [`SignatureInfo`]
+/// list, resolving each parameter label to a (start, end) char range within
+/// the signature label so the popup can bold the active parameter. The active
+/// parameter is taken per-signature when set, else from the help-level field.
+/// ponytail: parameter label offsets are UTF-16 per the spec; treated as char
+/// offsets here, which is exact for ASCII/BMP signatures (the overwhelming
+/// common case) and only off for astral-plane identifiers.
+fn normalise_signature_help(help: lsp_types::SignatureHelp) -> (Vec<SignatureInfo>, usize) {
+    use lsp_types::ParameterLabel;
+    let help_active_param = help.active_parameter;
+    let signatures: Vec<SignatureInfo> = help
+        .signatures
+        .into_iter()
+        .map(|sig| {
+            let active_idx = sig.active_parameter.or(help_active_param).unwrap_or(0) as usize;
+            let active_param = sig.parameters.as_ref().and_then(|params| {
+                params.get(active_idx).and_then(|p| match &p.label {
+                    ParameterLabel::LabelOffsets([s, e]) => Some((*s as usize, *e as usize)),
+                    ParameterLabel::Simple(text) => sig
+                        .label
+                        .find(text.as_str())
+                        .map(|byte| {
+                            let start = sig.label[..byte].chars().count();
+                            (start, start + text.chars().count())
+                        }),
+                })
+            });
+            SignatureInfo {
+                label: sig.label,
+                active_param,
+            }
+        })
+        .collect();
+    let active_signature = (help.active_signature.unwrap_or(0) as usize)
+        .min(signatures.len().saturating_sub(1));
+    (signatures, active_signature)
+}
+
 /// Declaration capability (`boolean | DeclarationOptions | DeclarationRegistrationOptions`).
 /// vtsls sends `declarationProvider: false`, so the bare-`false` arm is what
 /// stops croft from calling the unhandled `textDocument/declaration`.
@@ -2980,6 +3163,17 @@ fn build_client_capabilities() -> ClientCapabilities {
                 }),
                 ..Default::default()
             }),
+            signature_help: Some(lsp_types::SignatureHelpClientCapabilities {
+                dynamic_registration: Some(false),
+                signature_information: Some(lsp_types::SignatureInformationSettings {
+                    documentation_format: Some(vec![MarkupKind::PlainText, MarkupKind::Markdown]),
+                    parameter_information: Some(lsp_types::ParameterInformationSettings {
+                        label_offset_support: Some(true),
+                    }),
+                    active_parameter_support: Some(true),
+                }),
+                context_support: Some(true),
+            }),
             semantic_tokens: Some(SemanticTokensClientCapabilities {
                 dynamic_registration: Some(false),
                 requests: SemanticTokensClientCapabilitiesRequests {
@@ -3243,6 +3437,60 @@ mod tests {
         SemanticTokensOptions,
     };
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn normalise_signature_help_resolves_active_param_range() {
+        use lsp_types::{
+            ParameterInformation, ParameterLabel, SignatureHelp, SignatureInformation,
+        };
+        // Two params; help-level active_parameter = 1 (the second, "b: i32").
+        let help = SignatureHelp {
+            signatures: vec![SignatureInformation {
+                label: "foo(a: i32, b: i32)".to_string(),
+                documentation: None,
+                parameters: Some(vec![
+                    ParameterInformation {
+                        label: ParameterLabel::LabelOffsets([4, 10]),
+                        documentation: None,
+                    },
+                    ParameterInformation {
+                        label: ParameterLabel::LabelOffsets([12, 18]),
+                        documentation: None,
+                    },
+                ]),
+                active_parameter: None,
+            }],
+            active_signature: Some(0),
+            active_parameter: Some(1),
+        };
+        let (sigs, active) = normalise_signature_help(help);
+        assert_eq!(active, 0);
+        assert_eq!(sigs.len(), 1);
+        assert_eq!(sigs[0].active_param, Some((12, 18)));
+    }
+
+    #[test]
+    fn normalise_signature_help_resolves_simple_label_to_range() {
+        use lsp_types::{
+            ParameterInformation, ParameterLabel, SignatureHelp, SignatureInformation,
+        };
+        let help = SignatureHelp {
+            signatures: vec![SignatureInformation {
+                label: "foo(a, b)".to_string(),
+                documentation: None,
+                parameters: Some(vec![ParameterInformation {
+                    label: ParameterLabel::Simple("a".to_string()),
+                    documentation: None,
+                }]),
+                active_parameter: None,
+            }],
+            active_signature: None,
+            active_parameter: Some(0),
+        };
+        let (sigs, _) = normalise_signature_help(help);
+        // "a" sits at char index 4 in "foo(a, b)".
+        assert_eq!(sigs[0].active_param, Some((4, 5)));
+    }
 
     #[test]
     fn client_capabilities_advertise_work_done_progress() {

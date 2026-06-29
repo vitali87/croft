@@ -60,6 +60,6 @@ pub struct ReleaseNote {
 
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
-    kind: NoteKind::Feature,
-    summary: "Toggle the minimap with ⌥⌘M, from the Customize Layout menu, or the Command Palette.",
+    kind: NoteKind::Fix,
+    summary: "Signature help now follows the caret and closes when you leave the call (and handles nested calls).",
 }];

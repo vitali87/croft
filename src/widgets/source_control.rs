@@ -1635,6 +1635,7 @@ mod tests {
             detached_hash: None,
             ahead: 0,
             behind: 0,
+            head_oid: None,
             dirty: false,
         }
     }

@@ -2390,6 +2390,7 @@ fn git_status_spans_clean_branch_is_green() {
         dirty: false,
         ahead: 0,
         behind: 0,
+        head_oid: None,
     };
     let spans = git_status_spans(&st);
     let main_span = spans
@@ -2410,6 +2411,7 @@ fn git_status_spans_dirty_branch_is_yellow_not_red() {
         dirty: true,
         ahead: 0,
         behind: 0,
+        head_oid: None,
     };
     let spans = git_status_spans(&st);
     let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
@@ -2433,6 +2435,7 @@ fn git_status_spans_renders_detached_hash_when_no_branch() {
         dirty: false,
         ahead: 0,
         behind: 0,
+        head_oid: None,
     };
     let spans = git_status_spans(&st);
     let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
@@ -2448,6 +2451,7 @@ fn git_status_spans_renders_ahead_behind_counts() {
         dirty: false,
         ahead: 2,
         behind: 1,
+        head_oid: None,
     };
     let spans = git_status_spans(&st);
     let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
@@ -14276,6 +14280,41 @@ fn command_palette_key_is_cmd_or_ctrl_shift_p() {
     assert!(!is_command_palette_key(key(
         KeyCode::Char('p'),
         KeyModifiers::SUPER | KeyModifiers::SHIFT | KeyModifiers::ALT
+    )));
+}
+
+#[test]
+fn go_to_symbol_key_is_cmd_or_ctrl_shift_o() {
+    assert!(is_go_to_symbol_key(key(
+        KeyCode::Char('o'),
+        KeyModifiers::SUPER | KeyModifiers::SHIFT
+    )));
+    assert!(is_go_to_symbol_key(key(
+        KeyCode::Char('o'),
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT
+    )));
+    // Cmd+O (no Shift) is open-line-below, not Go to Symbol.
+    assert!(!is_go_to_symbol_key(key(
+        KeyCode::Char('o'),
+        KeyModifiers::SUPER
+    )));
+}
+
+#[test]
+fn open_line_above_relocated_from_cmd_shift_o_to_cmd_shift_enter() {
+    // The VS Code-correct chord: Cmd/Ctrl+Shift+Enter inserts a line above.
+    assert!(is_editor_open_line_above_key(key(
+        KeyCode::Enter,
+        KeyModifiers::SUPER | KeyModifiers::SHIFT
+    )));
+    assert!(is_editor_open_line_above_key(key(
+        KeyCode::Enter,
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT
+    )));
+    // Cmd+Shift+O no longer triggers it (it now opens Go to Symbol).
+    assert!(!is_editor_open_line_above_key(key(
+        KeyCode::Char('o'),
+        KeyModifiers::SUPER | KeyModifiers::SHIFT
     )));
 }
 

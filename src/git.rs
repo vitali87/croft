@@ -14,6 +14,10 @@ pub struct GitStatus {
     pub dirty: bool,
     pub ahead: usize,
     pub behind: usize,
+    /// The HEAD commit's full oid, or `None` outside a repo. Drives git-gutter
+    /// baseline invalidation: when this moves (commit, checkout, pull) the
+    /// cached HEAD file snapshots are stale and must be refetched.
+    pub head_oid: Option<String>,
 }
 
 pub fn query(root: &Path) -> GitStatus {
@@ -39,6 +43,10 @@ pub fn query(root: &Path) -> GitStatus {
         Ok(s) => parse_ahead_behind(&s),
         Err(_) => (0, 0),
     };
+    let head_oid = run_git(root, &["rev-parse", "HEAD"])
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
     GitStatus {
         in_repo: true,
         branch,
@@ -46,6 +54,7 @@ pub fn query(root: &Path) -> GitStatus {
         dirty,
         ahead,
         behind,
+        head_oid,
     }
 }
 

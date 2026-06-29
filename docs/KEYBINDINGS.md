@@ -175,7 +175,8 @@ Every choice except the side-bar / panel visibility persists across launches in 
 | `Ctrl`+`f` / `Cmd`+`f` | Inline Find bar: pre-filled from the selection or word under the cursor; active match in orange, the rest in yellow; `Enter`/`F3` forward, `Shift+Enter`/`Shift+F3` back, `Esc` closes |
 | `Ctrl`+`A` / `Ctrl`+`E` | Move to start / end of line |
 | `Ctrl`+`K` / `Ctrl`+`U` | Kill to end / start of line (yanks to clipboard) |
-| `Cmd`+`o` / `Cmd`+`Shift`+`O` | Open a new line below / above, inheriting indent |
+| `Cmd`+`o` / `Cmd`+`Shift`+`Enter` | Open a new line below / above, inheriting indent |
+| `Ctrl`+`Shift`+`o` / `Cmd`+`Shift`+`O` | Go to Symbol in Editor: fuzzy-search the file's symbols and jump (type `:` then a number to go to a line) |
 | `Cmd`+`g` `g` | Go to the top of the file (`Cmd`+`N` `Cmd`+`g` `g` for line N) |
 | `Cmd`+`Shift`+`G` | Go to the bottom of the file (with a leading count, that line) |
 | `Cmd`+`d` `d` | Delete the current line (`Cmd`+`N` `Cmd`+`d` `d` for N lines; yanks to clipboard) |

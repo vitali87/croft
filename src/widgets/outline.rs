@@ -104,6 +104,17 @@ impl OutlinePanel {
     /// `path` (always marks the panel loaded). Resets scroll/current when the
     /// file changed; preserves them when it is the same file being re-analysed
     /// after an edit so the view does not jump.
+    /// The active file's symbols (tree-sitter or LSP), for the Go to Symbol
+    /// picker. May be empty before the first sync or for an unsupported file.
+    pub fn symbols(&self) -> &[OutlineSymbol] {
+        &self.symbols
+    }
+
+    /// The path the current `symbols` belong to, if any.
+    pub fn path(&self) -> Option<&std::path::Path> {
+        self.path.as_deref()
+    }
+
     pub fn set_symbols(&mut self, path: PathBuf, symbols: Vec<OutlineSymbol>) {
         self.adopt(path, symbols);
         self.loaded = true;

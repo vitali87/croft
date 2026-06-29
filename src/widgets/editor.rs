@@ -1155,6 +1155,19 @@ impl ExternalReloadReport {
     }
 }
 
+/// How a buffer line differs from its committed (HEAD) version, for the git
+/// gutter. The colour carries the meaning, exactly like VS Code's gutter:
+/// green added, blue modified, red where lines were deleted.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GitMark {
+    Added,
+    Modified,
+    /// One or more lines were removed just above this surviving line (or at
+    /// end of file, on the last line). VS Code paints a triangle here; the
+    /// gutter shows a red bar on the boundary line.
+    Deleted,
+}
+
 pub struct Editor {
     pub path: Option<PathBuf>,
     pub lines: Vec<String>,
@@ -1181,6 +1194,21 @@ pub struct Editor {
     /// did_change to the LSP server, so building lines.join("\n") only
     /// happens on actual changes, not every frame.
     pub edit_seq: u64,
+    /// HEAD baseline for the git gutter: the committed version's lines. Set by
+    /// the app (read off the workspace git root once per file / HEAD change).
+    /// `None` when the file is untracked, outside a repo, or not yet fetched.
+    pub git_head_lines: Option<Vec<String>>,
+    /// The path `git_head_lines` was fetched for. The app refetches when this
+    /// stops matching `path` (the tab switched files) so the gutter can never
+    /// show another file's diff.
+    pub git_baseline_for: Option<PathBuf>,
+    /// Per 0-based buffer line, how it differs from HEAD. Recomputed from
+    /// `git_head_lines` vs `lines` whenever `edit_seq` moves (the diff is a
+    /// whole-file Myers pass, so it runs once per edit-batch, not per frame).
+    git_marks: std::collections::HashMap<usize, GitMark>,
+    /// The `edit_seq` `git_marks` was computed at; `u64::MAX` forces a first
+    /// recompute once a baseline arrives.
+    git_marks_seq: u64,
     pub scroll: usize,
     /// In soft-wrap mode, the index of the first visible visual segment within
     /// the top logical line (`self.scroll`). Lets the viewport start partway
@@ -1362,6 +1390,10 @@ impl Editor {
             unverified_breakpoints: std::collections::HashMap::new(),
             breakpoint_conditions: std::collections::HashMap::new(),
             edit_seq: 0,
+            git_head_lines: None,
+            git_baseline_for: None,
+            git_marks: std::collections::HashMap::new(),
+            git_marks_seq: u64::MAX,
             scroll: 0,
             scroll_sub: 0,
             wrap_total_cache: Vec::new(),
@@ -1508,6 +1540,68 @@ impl Editor {
         self.edit_seq = self.edit_seq.wrapping_add(1);
         self.hscroll_content_cols = None;
         self.wrap_total_cache.clear();
+    }
+
+    /// Install (or clear) the git-gutter HEAD baseline for `path`. The app
+    /// calls this once per file (and again after HEAD moves) with the
+    /// committed version's lines; `None` means untracked / not a repo. Forces
+    /// the per-line marks to recompute on the next render.
+    pub fn set_git_head_lines(&mut self, path: PathBuf, head: Option<Vec<String>>) {
+        self.git_baseline_for = Some(path);
+        self.git_head_lines = head;
+        self.git_marks_seq = u64::MAX;
+    }
+
+    /// Recompute the per-line git marks from the cached HEAD baseline if the
+    /// buffer has changed since they were last built. Cheap no-op when the
+    /// `edit_seq` is unchanged, so the render loop can call it every frame.
+    fn refresh_git_marks(&mut self) {
+        use crate::widgets::diff::DiffRow;
+        if self.git_marks_seq == self.edit_seq {
+            return;
+        }
+        self.git_marks_seq = self.edit_seq;
+        self.git_marks.clear();
+        let Some(head) = self.git_head_lines.as_ref() else {
+            return;
+        };
+        // `build_diff_rows` pairs consecutive delete+insert into `Replaced`, so
+        // a bare `Removed` run is a real deletion: attach a `Deleted` marker to
+        // the next surviving line (the gutter's deletion boundary, VS Code-style).
+        let rows = crate::widgets::diff::build_diff_rows(head, &self.lines);
+        let mut pending_delete = false;
+        for row in &rows {
+            match *row {
+                DiffRow::Added { right } => {
+                    self.git_marks.insert(right, GitMark::Added);
+                    pending_delete = false;
+                }
+                DiffRow::Replaced { right, .. } => {
+                    self.git_marks.insert(right, GitMark::Modified);
+                    pending_delete = false;
+                }
+                DiffRow::Removed { .. } => pending_delete = true,
+                DiffRow::Equal { right, .. } => {
+                    if pending_delete {
+                        self.git_marks.insert(right, GitMark::Deleted);
+                        pending_delete = false;
+                    }
+                }
+            }
+        }
+        // A deletion at end of file has no surviving line after it: mark the
+        // last line so a trailing removal still shows.
+        if pending_delete && !self.lines.is_empty() {
+            self.git_marks
+                .entry(self.lines.len() - 1)
+                .or_insert(GitMark::Deleted);
+        }
+    }
+
+    /// The git-gutter mark for 0-based buffer line `line`, if any. Reads the
+    /// last computed marks (call after a render, or after `refresh_git_marks`).
+    pub fn git_mark_at(&self, line: usize) -> Option<GitMark> {
+        self.git_marks.get(&line).copied()
     }
 
     /// Soft-wrap mode: long lines fold onto multiple visual rows instead of
@@ -4834,6 +4928,9 @@ impl Widget for &mut Editor {
         const SIGN_MARGIN: u16 = 2;
         let gutter_width = (self.lines.len() + 1).to_string().len() as u16 + 1 + SIGN_MARGIN;
         self.last_gutter_width = gutter_width;
+        // Rebuild the git-gutter marks if the buffer moved since last frame
+        // (cheap no-op otherwise), so the bars below diff against HEAD.
+        self.refresh_git_marks();
         let wrap = self.wrap_enabled();
         if wrap {
             // Wrapped text folds onto extra rows instead of scrolling sideways.
@@ -5044,6 +5141,28 @@ impl Widget for &mut Editor {
                     };
                     buf.set_string(sign_x, y, glyph, Style::default().fg(color));
                 }
+            }
+
+            // Git gutter: a thin coloured bar in the spacer cell between the
+            // line number and the code (VS Code's dirty-diff lane), on a
+            // logical line's first visual row only. Colour carries add/mod/del.
+            // ponytail: one heavy bar in three colours; the bar's column also
+            // shows deletions, which VS Code renders as a small triangle — fine
+            // as a first cut, the colour already disambiguates.
+            if (!wrap || row_start == 0)
+                && let Some(mark) = self.git_marks.get(&line_idx)
+            {
+                let color = match mark {
+                    GitMark::Added => self.theme.git_added(),
+                    GitMark::Modified => self.theme.git_modified(),
+                    GitMark::Deleted => self.theme.git_deleted(),
+                };
+                buf.set_string(
+                    inner.x + gutter_width,
+                    y,
+                    "\u{2503}", // ┃ heavy vertical
+                    Style::default().fg(color),
+                );
             }
 
             // Per-row window: the segment [row_start, row_end). For non-wrap
@@ -6741,6 +6860,66 @@ mod tests {
             e.lines.push(String::new());
         }
         e
+    }
+
+    fn head(lines: &[&str]) -> Option<Vec<String>> {
+        Some(lines.iter().map(|s| s.to_string()).collect())
+    }
+
+    #[test]
+    fn git_gutter_marks_added_modified_and_deleted_lines() {
+        let mut e = editor_with("a\nB2\nINSERTED\nc");
+        // HEAD: a / b / c / d  → b became B2 (modified), INSERTED is new (added),
+        // and d was removed before EOF.
+        e.set_git_head_lines(PathBuf::from("f.rs"), head(&["a", "b", "c", "d"]));
+        e.refresh_git_marks();
+        assert_eq!(e.git_mark_at(0), None, "unchanged line carries no mark");
+        assert_eq!(e.git_mark_at(1), Some(GitMark::Modified));
+        assert_eq!(e.git_mark_at(2), Some(GitMark::Added));
+        // `c` survives at line 3 with the deletion of `d` just below it.
+        assert_eq!(e.git_mark_at(3), Some(GitMark::Deleted));
+    }
+
+    #[test]
+    fn git_gutter_no_baseline_means_no_marks() {
+        let mut e = editor_with("a\nb\nc");
+        e.refresh_git_marks();
+        assert_eq!(e.git_mark_at(0), None);
+        assert_eq!(e.git_mark_at(1), None);
+    }
+
+    #[test]
+    fn git_gutter_recomputes_after_an_edit() {
+        let mut e = editor_with("a\nb");
+        e.set_git_head_lines(PathBuf::from("f.rs"), head(&["a", "b"]));
+        e.refresh_git_marks();
+        assert_eq!(e.git_mark_at(1), None, "buffer matches HEAD: clean");
+        // Edit line 1, then a fresh render-time refresh must light it up.
+        e.cursor_row = 1;
+        e.cursor_col = 1;
+        e.insert_char('X');
+        e.refresh_git_marks();
+        assert_eq!(e.git_mark_at(1), Some(GitMark::Modified));
+    }
+
+    #[test]
+    fn git_gutter_render_paints_bar_in_the_spacer_cell() {
+        use ratatui::buffer::Buffer;
+        let mut e = editor_with("a\nb");
+        e.set_git_head_lines(PathBuf::from("f.rs"), head(&["a", "DIFFERENT"]));
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 30,
+            height: 5,
+        };
+        let mut buf = Buffer::empty(area);
+        (&mut e).render(area, &mut buf);
+        // Line 1 (`b` vs `DIFFERENT`) is modified; the bar sits in the spacer
+        // cell at `inner.x + gutter_width`, one cell left of the text.
+        let bar_x = e.last_inner.x + e.last_gutter_width;
+        let cell = &buf[(bar_x, e.last_inner.y + 1)];
+        assert_eq!(cell.symbol(), "\u{2503}", "modified line shows a gutter bar");
     }
 
     #[test]

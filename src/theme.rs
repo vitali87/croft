@@ -225,6 +225,24 @@ impl Theme {
         Color::Rgb(mix(fg.0, br), mix(fg.1, bgc), mix(fg.2, bb))
     }
 
+    /// Git gutter bar for an added line (VS Code `editorGutter.addedBackground`,
+    /// a vivid green). The add/modify/delete decorations are semantic status
+    /// colours, identical across both dark themes and legible on either
+    /// background, so they are fixed here rather than carried per-theme.
+    pub fn git_added(self) -> Color {
+        Color::Rgb(0x2e, 0xa0, 0x43)
+    }
+
+    /// Git gutter bar for a modified line (VS Code `editorGutter.modifiedBackground`).
+    pub fn git_modified(self) -> Color {
+        Color::Rgb(0x0c, 0x7d, 0xc4)
+    }
+
+    /// Git gutter bar marking a deletion (VS Code `editorGutter.deletedBackground`).
+    pub fn git_deleted(self) -> Color {
+        Color::Rgb(0xf8, 0x51, 0x49)
+    }
+
     /// The scrollbar track. VS Code paints no track, so we match the editor
     /// background and the lane melts away on every theme.
     pub fn scrollbar_track(self) -> Color {
