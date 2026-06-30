@@ -14958,3 +14958,19 @@ fn secondary_sidebar_chord_is_alt_cmd_b_not_plain_cmd_b() {
         KeyModifiers::SUPER | KeyModifiers::ALT
     )));
 }
+
+#[test]
+fn unsaved_count_tracks_dirty_editors() {
+    // The Explorer activity badge mirrors VS Code: the count of open editors
+    // with unsaved edits. A freshly-opened blank buffer is clean; one edit
+    // makes it count as a single unsaved file.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    assert_eq!(app.unsaved_count(), 0, "a fresh blank buffer is clean");
+    app.editor.insert_char('x');
+    assert_eq!(
+        app.unsaved_count(),
+        1,
+        "an edited buffer counts as one unsaved file"
+    );
+}

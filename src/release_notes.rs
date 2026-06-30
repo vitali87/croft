@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Feature,
-    summary: "Source Control activity icon now shows a VS Code-style count badge over its corner whenever the working tree has changes.",
+    summary: "The Explorer activity icon now shows a count badge for unsaved open files, matching the Source Control change badge.",
 }];

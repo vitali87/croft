@@ -904,6 +904,8 @@ pub const KITTY_ID_LAYOUT_CUSTOMIZE: u32 = KITTY_ID_BASE + 17;
 pub const KITTY_ID_MINIMAP: u32 = KITTY_ID_BASE + 18;
 /// Source-control change-count badge, emitted at z=1 over the SCM icon.
 pub const KITTY_ID_SCM_BADGE: u32 = KITTY_ID_BASE + 19;
+/// Explorer unsaved-file count badge, emitted at z=1 over the Explorer icon.
+pub const KITTY_ID_EXPLORER_BADGE: u32 = KITTY_ID_BASE + 20;
 
 /// Apply tmux DCS passthrough wrapping to an inline-image escape when needed.
 /// Sixel passes through tmux natively (tmux built with sixel support renders it

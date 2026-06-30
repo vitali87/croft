@@ -1863,6 +1863,14 @@ pub struct App {
     /// Change count the cached `scm_change_badge` was built for; drives the
     /// dirty check and the badge's on-screen cell width.
     scm_change_badge_count: usize,
+    /// Pre-encoded inline-image for the Explorer change badge: the count of
+    /// open editors with unsaved edits (VS Code's Explorer activity badge),
+    /// emitted at z=1 over the Explorer icon's bottom-right. `None` when nothing
+    /// is unsaved or image rendering is off. Mirrors the SCM badge plumbing;
+    /// rebuilt by `refresh_explorer_unsaved_badge`.
+    explorer_unsaved_badge: Option<String>,
+    /// Unsaved-file count the cached `explorer_unsaved_badge` was built for.
+    explorer_unsaved_count: usize,
     /// Which inline-image protocol the host terminal speaks, resolved once at
     /// startup (env-fixed). Drives the [`crate::iterm2_inline::build_inline_image`]
     /// dispatch (iTerm2 OSC-1337 vs Kitty graphics) and the Kitty-only
@@ -2863,6 +2871,8 @@ impl App {
             cell_pixel: None,
             scm_change_badge: None,
             scm_change_badge_count: 0,
+            explorer_unsaved_badge: None,
+            explorer_unsaved_count: 0,
             inline_protocol: crate::iterm2_inline::detect_inline_image_protocol(),
             sixel_supported: false,
             minimap_visible: true,
@@ -3242,9 +3252,13 @@ impl App {
                 layout_customize_hover: lcuh,
             });
         }
-        // The change-count badge rides the same overlay machinery; rebuild it
-        // against the freshly-baked icons / new background or cell size.
+        // The activity-bar count badges ride the same overlay machinery; rebuild
+        // them against the freshly-baked icons / new background or cell size. The
+        // Explorer badge's per-frame refresh is count-gated, so force a rebuild
+        // here by invalidating its cached count first.
         self.refresh_scm_change_badge();
+        self.explorer_unsaved_count = usize::MAX;
+        self.refresh_explorer_unsaved_badge();
         // Run-and-Debug headline icon: the same debug-alt PNG used in the
         // activity bar, fitted to the panel's icon block (RUN_DEBUG_ICON_CELLS_W
         // cells wide × RUN_DEBUG_ICON_CELLS_H cells tall) and tinted at icon-
@@ -3774,6 +3788,21 @@ impl App {
                     badge,
                 ));
             }
+            // Same badge over the Explorer icon for the unsaved-file count.
+            if let Some(badge) = self.explorer_unsaved_badge.as_deref() {
+                let bw = crate::iterm2_inline::count_badge_cells_w(self.explorer_unsaved_count);
+                let bx = exp_block.x + exp_block.width.saturating_sub(bw);
+                let by = exp_block.y + exp_block.height.saturating_sub(1);
+                blocks.push((
+                    Rect {
+                        x: bx,
+                        y: by,
+                        width: bw,
+                        height: 1,
+                    },
+                    badge,
+                ));
+            }
         }
         // Customize Layout toolbar icons (top-right of the editor / welcome).
         // Their image swaps with the side-bar / panel visibility, exactly like
@@ -4099,6 +4128,78 @@ impl App {
         })
         .map(|raw| crate::iterm2_inline::maybe_tmux_wrap(self.inline_protocol, is_tmux, raw));
         self.scm_change_badge_count = count;
+        self.overlays.activity.mark_dirty();
+    }
+
+    /// Count of open editors with unsaved edits, across the active group and any
+    /// split groups, deduped by path (a file open in two splits is one unsaved
+    /// file; each dirty path-less buffer counts once). Drives the Explorer
+    /// activity badge, mirroring VS Code.
+    fn unsaved_count(&self) -> usize {
+        let mut paths: std::collections::HashSet<&std::path::Path> =
+            std::collections::HashSet::new();
+        let mut pathless = 0usize;
+        let groups = std::iter::once(&self.editor).chain(self.editor_layout.inactive_groups());
+        for ed in groups.flat_map(|g| g.editors.iter()).filter(|e| e.dirty) {
+            match ed.path.as_deref() {
+                Some(p) => {
+                    paths.insert(p);
+                }
+                None => pathless += 1,
+            }
+        }
+        paths.len() + pathless
+    }
+
+    /// Rebuild the cached Explorer unsaved-file badge when the count, theme, or
+    /// cell size shifts, and mark the activity overlay dirty so the next flush
+    /// re-emits. Cheap to call every frame: it recomputes the count and bails
+    /// unless it changed. The glyph-fallback path draws a text badge in
+    /// `render_activity_bar` instead.
+    pub fn refresh_explorer_unsaved_badge(&mut self) {
+        let count = self.unsaved_count();
+        if !self.overlays.activity.has_images() {
+            self.explorer_unsaved_badge = None;
+            if count != self.explorer_unsaved_count {
+                self.explorer_unsaved_count = count;
+                self.overlays.activity.mark_dirty();
+            }
+            return;
+        }
+        if count == self.explorer_unsaved_count {
+            return;
+        }
+        if count == 0 {
+            self.explorer_unsaved_badge = None;
+            self.explorer_unsaved_count = 0;
+            self.overlays.activity.mark_dirty();
+            return;
+        }
+        let Some((cw, ch)) = self.cell_pixel else {
+            return;
+        };
+        let cells_w = crate::iterm2_inline::count_badge_cells_w(count);
+        let is_tmux = crate::iterm2_inline::detect_tmux();
+        self.explorer_unsaved_badge = crate::iterm2_inline::compose_count_badge(
+            count,
+            cw,
+            ch,
+            self.theme.accent_rgb(),
+            self.theme_bg_pixel(),
+        )
+        .and_then(|png| {
+            crate::iterm2_inline::build_inline_image_z(
+                self.inline_protocol,
+                &png,
+                cells_w,
+                1,
+                false,
+                crate::iterm2_inline::KITTY_ID_EXPLORER_BADGE,
+                1,
+            )
+        })
+        .map(|raw| crate::iterm2_inline::maybe_tmux_wrap(self.inline_protocol, is_tmux, raw));
+        self.explorer_unsaved_count = count;
         self.overlays.activity.mark_dirty();
     }
 
@@ -7191,6 +7292,10 @@ impl App {
         if area.width == 0 || area.height == 0 {
             return;
         }
+        // Keep the Explorer unsaved-file badge current before the post-draw
+        // flush emits it. Count-gated, so a frame with no save/edit churn is a
+        // cheap no-op. (The SCM badge refreshes off the git worker instead.)
+        self.refresh_explorer_unsaved_badge();
         // In images mode the activity bar inherits the iTerm session bg
         // (forced to sRGB(EDITOR_BG_RGB) via SetColors), matching the rest
         // of the panes. The glyph-fallback path keeps a solid bg for
@@ -7279,6 +7384,34 @@ impl App {
                 cell,
             );
         };
+        // Text analogue of the baked count badge for image-less terminals: an
+        // accent cell with the count at the icon's bottom-right corner.
+        let badge_bg = self.theme.accent();
+        let render_count_badge = |frame: &mut ratatui::Frame, block: Rect, count: usize| {
+            if count == 0 {
+                return;
+            }
+            let label = if count > 9 {
+                String::from("9+")
+            } else {
+                count.to_string()
+            };
+            let w = label.chars().count() as u16;
+            frame.render_widget(
+                ratatui::widgets::Paragraph::new(label).style(
+                    Style::default()
+                        .fg(Color::White)
+                        .bg(badge_bg)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Rect {
+                    x: block.x + block.width.saturating_sub(w),
+                    y: block.y + block.height.saturating_sub(1),
+                    width: w,
+                    height: 1,
+                },
+            );
+        };
 
         if !self.overlays.activity.has_images() {
             // Glyph fallback path: render the codicon and a separate active
@@ -7292,6 +7425,7 @@ impl App {
                 explorer_active,
                 explorer_hovered,
             );
+            render_count_badge(frame, explorer_block, self.unsaved_count());
             render_glyph(
                 frame,
                 search_block,
@@ -7306,36 +7440,12 @@ impl App {
                 source_control_active,
                 source_control_hovered,
             );
-            // Change-count badge for image-less terminals: an accent cell with
-            // the count at the icon's bottom-right, the text analogue of the
-            // baked pill the image path emits.
             let scm_count = if self.git.status().in_repo {
                 self.source_control.changes_count()
             } else {
                 0
             };
-            if scm_count > 0 {
-                let label = if scm_count > 9 {
-                    String::from("9+")
-                } else {
-                    scm_count.to_string()
-                };
-                let w = label.chars().count() as u16;
-                frame.render_widget(
-                    ratatui::widgets::Paragraph::new(label).style(
-                        Style::default()
-                            .fg(Color::White)
-                            .bg(self.theme.accent())
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Rect {
-                        x: source_control_block.x + source_control_block.width.saturating_sub(w),
-                        y: source_control_block.y + source_control_block.height.saturating_sub(1),
-                        width: w,
-                        height: 1,
-                    },
-                );
-            }
+            render_count_badge(frame, source_control_block, scm_count);
             render_glyph(
                 frame,
                 remote_block,
