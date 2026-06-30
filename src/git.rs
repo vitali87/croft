@@ -1271,15 +1271,13 @@ pub fn parse_ahead_behind(out: &str) -> (usize, usize) {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GitRequest {
     Status,
-    Changes,
     StatusAndChanges,
     SetRoot(PathBuf),
 }
 
 impl GitRequest {
     /// Merge two pending *query* requests into the strongest one.
-    /// `StatusAndChanges` dominates everything; mixing `Status` and
-    /// `Changes` collapses to `StatusAndChanges`; same+same is the same.
+    /// `StatusAndChanges` dominates a bare `Status`; same+same is the same.
     /// `SetRoot` is never a query and the worker drains it inline before
     /// merging, so it must not appear here.
     pub fn merge(self, other: Self) -> Self {
@@ -1291,9 +1289,7 @@ impl GitRequest {
                 )
             }
             (StatusAndChanges, _) | (_, StatusAndChanges) => StatusAndChanges,
-            (Status, Changes) | (Changes, Status) => StatusAndChanges,
             (Status, Status) => Status,
-            (Changes, Changes) => Changes,
         }
     }
 }
@@ -1304,7 +1300,6 @@ impl GitRequest {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GitResponse {
     Status(GitStatus),
-    Changes(Vec<ChangeEntry>),
     StatusAndChanges(GitStatus, Vec<ChangeEntry>),
 }
 
@@ -1350,7 +1345,6 @@ pub fn git_worker_loop(
         };
         let resp = match req {
             GitRequest::Status => GitResponse::Status(query(&root)),
-            GitRequest::Changes => GitResponse::Changes(query_changes(&root)),
             GitRequest::StatusAndChanges => {
                 let s = query(&root);
                 let c = query_changes(&root);
@@ -1724,29 +1718,21 @@ mod tests {
     #[test]
     fn git_request_merge_collapses_status_and_changes_into_status_and_changes() {
         assert_eq!(
-            GitRequest::Status.merge(GitRequest::Changes),
-            GitRequest::StatusAndChanges,
-        );
-        assert_eq!(
-            GitRequest::Changes.merge(GitRequest::Status),
-            GitRequest::StatusAndChanges,
-        );
-        assert_eq!(
             GitRequest::Status.merge(GitRequest::Status),
             GitRequest::Status,
         );
         assert_eq!(
-            GitRequest::Changes.merge(GitRequest::Changes),
-            GitRequest::Changes,
+            GitRequest::Status.merge(GitRequest::StatusAndChanges),
+            GitRequest::StatusAndChanges,
         );
         assert_eq!(
-            GitRequest::StatusAndChanges.merge(GitRequest::Changes),
+            GitRequest::StatusAndChanges.merge(GitRequest::Status),
             GitRequest::StatusAndChanges,
         );
     }
 
     #[test]
-    fn git_worker_loop_processes_a_changes_request_and_returns_entries() {
+    fn git_worker_loop_processes_a_status_and_changes_request_and_returns_entries() {
         let tmp = TempDir::new().unwrap();
         let p = tmp.path();
         let _ = Command::new("git")
@@ -1769,12 +1755,12 @@ mod tests {
         let (resp_tx, resp_rx) = std::sync::mpsc::channel::<GitResponse>();
         let root = p.to_path_buf();
         let join = std::thread::spawn(move || git_worker_loop(root, req_rx, resp_tx));
-        req_tx.send(GitRequest::Changes).unwrap();
+        req_tx.send(GitRequest::StatusAndChanges).unwrap();
         let resp = resp_rx
             .recv_timeout(std::time::Duration::from_secs(10))
             .expect("worker must reply within 10s");
         match resp {
-            GitResponse::Changes(entries) => {
+            GitResponse::StatusAndChanges(_, entries) => {
                 assert_eq!(
                     entries.len(),
                     1,
@@ -1782,7 +1768,7 @@ mod tests {
                 );
                 assert_eq!(entries[0].kind, ChangeKind::Untracked);
             }
-            other => panic!("expected Changes, got {other:?}"),
+            other => panic!("expected StatusAndChanges, got {other:?}"),
         }
         drop(req_tx);
         join.join().unwrap();
@@ -1864,7 +1850,7 @@ mod tests {
         // Queue two requests BEFORE the worker starts so the first
         // recv() succeeds and the try_recv coalesce sees the second one.
         req_tx.send(GitRequest::Status).unwrap();
-        req_tx.send(GitRequest::Changes).unwrap();
+        req_tx.send(GitRequest::StatusAndChanges).unwrap();
         let join = std::thread::spawn(move || git_worker_loop(root, req_rx, resp_tx));
         let first = resp_rx
             .recv_timeout(std::time::Duration::from_secs(10))

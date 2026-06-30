@@ -10427,14 +10427,15 @@ impl App {
     }
 
     fn refresh_source_control(&mut self) {
-        // Non-blocking: post a Changes request and let the worker reply
-        // via `git_response_rx`. The panel paints immediately from
+        // Non-blocking: post a StatusAndChanges request and let the worker
+        // reply via `git_response_rx`. The panel paints immediately from
         // whatever entries the last drain installed (typically <400 ms
-        // old via the FS-watcher tick); the fresh entries land within
-        // one or two frames after the click. Removes the synchronous
-        // `git status --porcelain` shell-out that used to stall the UI
-        // thread on every Source Control click.
-        self.git.request_changes();
+        // old via the FS-watcher tick); the fresh state lands within one or
+        // two frames after the click. StatusAndChanges (not just Changes) so
+        // the branch sync counts (`↑1` / `↓N`) and dirty flag refresh too —
+        // a commit changes those without changing the file list. Still off
+        // the UI thread, so no synchronous `git status` stall.
+        self.git.request_status_and_changes();
     }
 
     fn handle_extensions_key(&mut self, key: KeyEvent) {

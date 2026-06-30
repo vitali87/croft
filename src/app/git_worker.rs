@@ -75,8 +75,12 @@ impl GitWorker {
         }
     }
 
-    pub fn request_changes(&mut self) {
-        let _ = self.request_tx.send(GitRequest::Changes);
+    /// Refresh the full source-control state in one shot: branch, ahead/behind,
+    /// dirty flag, AND the change list. Used by the explicit refresh action and
+    /// after a commit, where the branch sync counts (e.g. `↑1`) must update,
+    /// not just the file list. Still off-thread — the worker replies async.
+    pub fn request_status_and_changes(&mut self) {
+        let _ = self.request_tx.send(GitRequest::StatusAndChanges);
     }
 
     pub fn set_root(&mut self, root: PathBuf) {
@@ -99,10 +103,6 @@ impl GitWorker {
                         source_control.status = s;
                         changed = true;
                     }
-                }
-                Ok(GitResponse::Changes(entries)) => {
-                    source_control.set_status(self.status.clone(), entries);
-                    changed = true;
                 }
                 Ok(GitResponse::StatusAndChanges(s, entries)) => {
                     self.status = s.clone();
