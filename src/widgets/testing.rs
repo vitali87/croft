@@ -229,8 +229,8 @@ impl Widget for &mut TestingPanel {
         let summary_y = inner.y + 1;
         if self.activity != Activity::Idle {
             let label = match self.activity {
-                Activity::Discovering => "Discovering tests…",
-                _ => "Running tests…",
+                Activity::Discovering => "Discovering tests",
+                _ => "Running tests",
             };
             buf.set_string(
                 inner.x + 1,
