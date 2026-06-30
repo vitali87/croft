@@ -53,6 +53,10 @@ pub const ACTIVITY_RUN_DEBUG: char = '\u{eb91}';
 /// match the same source (`source-control`=60008=U+EA68, `files`=60144=U+EAF0,
 /// `debug-alt`=60305=U+EB91), confirming Nerd Fonts preserve codicon codepoints.
 pub const ACTIVITY_EXTENSIONS: char = '\u{eae6}';
+/// Codicon `beaker` — the flask glyph VS Code uses for its Testing activity-bar
+/// entry. Verified 2026-06-30 against the upstream codicon `mapping.json`:
+/// `beaker` is decimal 60025 (U+EA79).
+pub const ACTIVITY_TESTING: char = '\u{ea79}';
 /// Codicon `replace-all` — the two-line "find & replace, all" glyph VS Code
 /// shows beside the Replace input in its Search sidebar. Verified on
 /// 2026-06-19 against the upstream codicon `mapping.json`: replace-all is

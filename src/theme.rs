@@ -249,6 +249,12 @@ impl Theme {
         Color::Rgb(0xf8, 0x51, 0x49)
     }
 
+    /// The deletion/failure red as raw sRGB bytes, baked into the Testing
+    /// failing-count badge canvas. Same value as [`Theme::git_deleted`].
+    pub fn git_deleted_rgb(self) -> (u8, u8, u8) {
+        (0xf8, 0x51, 0x49)
+    }
+
     /// The scrollbar track. VS Code paints no track, so we match the editor
     /// background and the lane melts away on every theme.
     pub fn scrollbar_track(self) -> Color {

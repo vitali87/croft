@@ -46,6 +46,7 @@ impl OutputLevel {
 pub const CHANNEL_DAP: &str = "Debug Adapter";
 pub const CHANNEL_GIT: &str = "Git";
 pub const CHANNEL_PROVISION: &str = "Server Provisioning";
+pub const CHANNEL_TESTS: &str = "Test Runner";
 
 /// One line in a channel: when it arrived, how severe, and the text.
 #[derive(Clone, Debug, PartialEq)]

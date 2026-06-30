@@ -15,6 +15,8 @@ pub const REMOTE_SRC_SVG: &[u8] = include_bytes!("../assets/icons/remote-explore
 pub const RUN_DEBUG_SRC_SVG: &[u8] = include_bytes!("../assets/icons/debug-alt.svg");
 /// Codicon `extensions` (four squares, one detached), the Extensions activity icon.
 pub const EXTENSIONS_SRC_SVG: &[u8] = include_bytes!("../assets/icons/extensions.svg");
+/// Codicon `beaker`, the Testing activity icon.
+pub const TESTING_SRC_SVG: &[u8] = include_bytes!("../assets/icons/beaker.svg");
 /// Codicon `gear`, the bottom-anchored "Manage" button (Color Theme picker).
 pub const SETTINGS_GEAR_SRC_SVG: &[u8] = include_bytes!("../assets/icons/settings_gear.svg");
 /// VS Code's title-bar layout codicons for the Customize Layout toolbar.
@@ -908,6 +910,9 @@ pub const KITTY_ID_SCM_BADGE: u32 = KITTY_ID_BASE + 19;
 pub const KITTY_ID_EXPLORER_BADGE: u32 = KITTY_ID_BASE + 20;
 /// Remote forwarded-ports count badge, emitted at z=1 over the Remote icon.
 pub const KITTY_ID_REMOTE_BADGE: u32 = KITTY_ID_BASE + 21;
+/// Testing activity icon (beaker), and its failing-test count badge at z=1.
+pub const KITTY_ID_TESTING: u32 = KITTY_ID_BASE + 22;
+pub const KITTY_ID_TESTING_BADGE: u32 = KITTY_ID_BASE + 23;
 
 /// Apply tmux DCS passthrough wrapping to an inline-image escape when needed.
 /// Sixel passes through tmux natively (tmux built with sixel support renders it

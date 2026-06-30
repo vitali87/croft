@@ -172,7 +172,7 @@ struct MetaPackage {
 /// silently fails to spawn there (the "No dependencies" bug) even though `git`
 /// — which lives in `/usr/bin` — is found. Resolving by absolute path, like
 /// croft already does for language servers, makes it launch-agnostic.
-fn cargo_binary() -> PathBuf {
+pub(crate) fn cargo_binary() -> PathBuf {
     if let Some(path_var) = std::env::var_os("PATH") {
         for dir in std::env::split_paths(&path_var) {
             let candidate = dir.join("cargo");

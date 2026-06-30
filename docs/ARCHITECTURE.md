@@ -64,6 +64,11 @@ src/
 │   ├── remote_attach.rs pure attach planning: parse / gate the CPython version (>=3.14 ships sys.remote_exec), the platform-aware sudo-elevation decision (macOS always, Linux unless Yama ptrace_scope is relaxed), and the `pdb -p` command builder
 │   ├── discovery.rs     enumerate attachable CPython 3.14+ processes via sysinfo plus a per-candidate `--version` probe
 │   └── reaper.rs        sweeps orphaned vscode-js-debug processes (server + its detached watchdog, which setsids into its own session and survives a group-kill) left behind when croft crashes/force-quits without running Drop; kills only ~/.croft/js-debug scripts reparented to init (pid 1), so a live session is never touched; run async at startup and after each session teardown
+├── testing/             Test Runner: a background worker runs `cargo test` off the render loop and streams parsed cases into the Testing panel (mirrors app/git_worker + dap drain-per-tick)
+│   ├── mod.rs
+│   ├── model.rs         TestStatus (NotRun/Running/Passed/Failed/Skipped) + TestCase; suite_and_leaf splits a `module::name` path for the tree
+│   ├── parse.rs         libtest human-output parser: `test <path> ... ok|FAILED|ignored` -> TestCase, skipping compile chrome and the summary line
+│   └── worker.rs        spawns `cargo test --no-fail-fast` (cargo resolved by absolute path for the GUI-stripped PATH), tees output to the Test Runner OUTPUT channel, streams Started/Case/Finished over an mpsc channel the app drains each tick
 ├── mcp/                 MCP sidecar host (Tier-1 extensions): croft is a DETERMINISTIC MCP host — a human invokes a contributed palette command and croft calls one pre-known tool on one vetted local server (no LLM picks tools), which removes MCP's whole prompt-injection/tool-poisoning attack family
 │   ├── mod.rs           module overview + McpOutcome (the off-thread worker's result)
 │   ├── transport.rs     JSON-RPC 2.0 over newline-delimited JSON on the server's stdio (the MCP stdio framing; simpler than DAP's Content-Length); setsid-detached child, reader thread -> mpsc, least-privilege env_clear()+envs()
@@ -108,6 +113,7 @@ src/
     ├── process_picker.rs centered selectable list of attachable Python 3.14+ processes for "Debug: Attach to Python Process"; selecting one has the App spawn `pdb -p <pid>` in a PTY
     ├── remote.rs        Remote (SSH) sidebar widget with empty-state hero illustration
     ├── run_debug.rs     Run and Debug sidebar widget: empty-state Run [filename] button, and when a session is live the paused-state tree (call stack + expandable variables), a debug console of program output, and a `❯` REPL prompt; the App builds the rows and maps clicks back to frames / variables
+    ├── testing.rs       Testing sidebar widget: the test suite tree (grouped by module) with live pass/fail/skip status glyphs, a summary line, and the failing-test count that feeds the beaker activity badge; Enter runs all tests
     ├── scrollbar.rs     shared vertical- and horizontal-scrollbar geometry
     ├── search.rs        sidebar search panel (query/replace/include/exclude inputs) + .gitignore-aware walker, glob filtering, and replace
     ├── shortcuts.rs     F1 shortcuts modal: every binding grouped by pane, scrollable

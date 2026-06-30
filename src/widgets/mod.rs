@@ -31,5 +31,6 @@ pub mod signature_help_popup;
 pub mod source_control;
 pub mod symbol_picker;
 pub mod terminal;
+pub mod testing;
 pub mod timeline;
 pub mod zoxide_jump;

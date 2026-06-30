@@ -65,6 +65,7 @@ pub enum SidebarView {
     Remote,
     RunDebug,
     Extensions,
+    Testing,
 }
 
 /// The toggleable sub-views stacked inside the Explorer side panel, mirroring
@@ -157,6 +158,7 @@ pub enum ActivityIcon {
     Remote,
     RunDebug,
     Extensions,
+    Testing,
     Settings,
 }
 
@@ -486,6 +488,10 @@ fn activity_extensions_y(bar: Rect) -> u16 {
     activity_remote_y(bar) + ACTIVITY_ICON_HEIGHT + ACTIVITY_ICON_GAP
 }
 
+fn activity_testing_y(bar: Rect) -> u16 {
+    activity_extensions_y(bar) + ACTIVITY_ICON_HEIGHT + ACTIVITY_ICON_GAP
+}
+
 fn activity_explorer_block(bar: Rect) -> Rect {
     Rect {
         x: bar.x,
@@ -540,6 +546,15 @@ fn activity_extensions_block(bar: Rect) -> Rect {
     }
 }
 
+fn activity_testing_block(bar: Rect) -> Rect {
+    Rect {
+        x: bar.x,
+        y: activity_testing_y(bar),
+        width: bar.width,
+        height: ACTIVITY_ICON_HEIGHT,
+    }
+}
+
 /// The settings gear, anchored to the BOTTOM of the activity bar (VS Code's
 /// "Manage" gear), asymmetric to the view icons stacked from the top. Returns
 /// an empty rect when the bar is too short to fit the gear below the last view
@@ -557,7 +572,7 @@ fn activity_settings_block(bar: Rect) -> Rect {
         .y
         .saturating_add(bar.height)
         .saturating_sub(ACTIVITY_ICON_HEIGHT + ACTIVITY_BOTTOM_INSET);
-    let last_view_bottom = activity_extensions_y(bar) + ACTIVITY_ICON_HEIGHT;
+    let last_view_bottom = activity_testing_y(bar) + ACTIVITY_ICON_HEIGHT;
     if y < last_view_bottom {
         return Rect::default();
     }
@@ -585,6 +600,8 @@ struct SidebarAreas {
     run_debug_icon: Rect,
     /// Block occupied by the Extensions activity-bar icon, in absolute coords.
     extensions_icon: Rect,
+    /// Block occupied by the Testing (beaker) activity-bar icon, in absolute coords.
+    testing_icon: Rect,
     /// Block occupied by the settings gear, bottom-anchored on the activity
     /// bar (VS Code's "Manage" button). Asymmetric to the view icons up top;
     /// clicking it opens the settings menu (Color Theme picker).
@@ -614,6 +631,9 @@ pub struct ActivityBarImages {
     extensions_active: String,
     extensions_inactive: String,
     extensions_hovered: String,
+    testing_active: String,
+    testing_inactive: String,
+    testing_hovered: String,
     /// The settings gear. `active` is shown while its menu is open so the
     /// button reads as pressed, mirroring the view icons' selected state;
     /// `hovered` brightens it while the pointer rests on it.
@@ -1689,6 +1709,10 @@ pub struct App {
     pub remote: RemotePanel,
     pub source_control: SourceControlPanel,
     pub run_debug: RunDebugPanel,
+    /// The Testing side panel: the suite tree with live pass/fail status.
+    pub testing: crate::widgets::testing::TestingPanel,
+    /// Background `cargo test` worker feeding the Testing panel.
+    test_worker: crate::testing::worker::TestWorker,
     /// The Extensions side panel: bundled + installed extensions with toggles.
     pub extensions: crate::widgets::extensions::ExtensionsPanel,
     /// The Explorer's OPEN EDITORS section: the open editor tabs, projected
@@ -1878,6 +1902,13 @@ pub struct App {
     remote_ports_badge: Option<String>,
     /// Forwarded-port count the cached `remote_ports_badge` was built for.
     remote_ports_count: usize,
+    /// Pre-encoded inline-image for the Testing icon's failing-test count badge
+    /// (red pill, VS Code's Testing badge), emitted at z=1 over the beaker icon.
+    /// `None` when nothing is failing or image rendering is off. Same plumbing as
+    /// the other count badges; rebuilt by `refresh_testing_badge`.
+    testing_badge: Option<String>,
+    /// Failing-test count the cached `testing_badge` was built for.
+    testing_badge_count: usize,
     /// Which inline-image protocol the host terminal speaks, resolved once at
     /// startup (env-fixed). Drives the [`crate::iterm2_inline::build_inline_image`]
     /// dispatch (iTerm2 OSC-1337 vs Kitty graphics) and the Kitty-only
@@ -2797,6 +2828,8 @@ impl App {
             remote,
             source_control,
             run_debug,
+            testing: crate::widgets::testing::TestingPanel::new(),
+            test_worker: crate::testing::worker::TestWorker::spawn(root.clone()),
             extensions,
             disabled_extensions,
             outline,
@@ -2882,6 +2915,8 @@ impl App {
             explorer_unsaved_count: 0,
             remote_ports_badge: None,
             remote_ports_count: 0,
+            testing_badge: None,
+            testing_badge_count: 0,
             inline_protocol: crate::iterm2_inline::detect_inline_image_protocol(),
             sixel_supported: false,
             minimap_visible: true,
@@ -3211,6 +3246,7 @@ impl App {
             Some((ra, ri, rh)),
             Some((rda, rdi, rdh)),
             Some((exta, exti, exth)),
+            Some((tsta, tsti, tsth)),
             Some((gea, gei, geh)),
             Some((lso, lsoh, lsf, lsfh, lpo, lpoh, lpf, lpfh, lcu, lcuh)),
         ) = (
@@ -3220,6 +3256,7 @@ impl App {
             bake(ki::REMOTE_SRC_SVG, 0, ki::KITTY_ID_REMOTE),
             bake(ki::RUN_DEBUG_SRC_SVG, 0, ki::KITTY_ID_RUN_DEBUG_BAR),
             bake(ki::EXTENSIONS_SRC_SVG, 0, ki::KITTY_ID_EXTENSIONS),
+            bake(ki::TESTING_SRC_SVG, 0, ki::KITTY_ID_TESTING),
             bake(
                 ki::SETTINGS_GEAR_SRC_SVG,
                 gear_off_y_bias,
@@ -3246,6 +3283,9 @@ impl App {
                 extensions_active: exta,
                 extensions_inactive: exti,
                 extensions_hovered: exth,
+                testing_active: tsta,
+                testing_inactive: tsti,
+                testing_hovered: tsth,
                 settings_active: gea,
                 settings_inactive: gei,
                 settings_hovered: geh,
@@ -3270,6 +3310,8 @@ impl App {
         self.refresh_explorer_unsaved_badge();
         self.remote_ports_count = usize::MAX;
         self.refresh_remote_ports_badge();
+        self.testing_badge_count = usize::MAX;
+        self.refresh_testing_badge();
         // Run-and-Debug headline icon: the same debug-alt PNG used in the
         // activity bar, fitted to the panel's icon block (RUN_DEBUG_ICON_CELLS_W
         // cells wide × RUN_DEBUG_ICON_CELLS_H cells tall) and tinted at icon-
@@ -3681,6 +3723,7 @@ impl App {
         let rem_block = self.sidebar_areas.remote_icon;
         let rdb_block = self.sidebar_areas.run_debug_icon;
         let ext_block = self.sidebar_areas.extensions_icon;
+        let tst_block = self.sidebar_areas.testing_icon;
         // The activity bar is all-or-nothing: emit its icons only when every
         // block is laid out (a partial bar would look broken). When it's hidden
         // (Customize Layout / Zen) the blocks are zero-width and skipped, but
@@ -3690,7 +3733,8 @@ impl App {
             && scm_block.width > 0
             && rem_block.width > 0
             && rdb_block.width > 0
-            && ext_block.width > 0;
+            && ext_block.width > 0
+            && tst_block.width > 0;
         // Three-way per icon: the selected view shows the active (pilled)
         // variant; otherwise the pointer-hovered icon brightens (no pill); the
         // rest stay muted. Selected always wins over hovered.
@@ -3737,6 +3781,13 @@ impl App {
         } else {
             &images.extensions_inactive
         };
+        let tst_state = if self.sidebar_view == SidebarView::Testing {
+            &images.testing_active
+        } else if hov == Some(ActivityIcon::Testing) {
+            &images.testing_hovered
+        } else {
+            &images.testing_inactive
+        };
         // The gear is bottom-anchored and may be absent on a short bar
         // (empty block). It reads "active" while its menu/picker is open.
         let set_block = self.sidebar_areas.settings_icon;
@@ -3776,6 +3827,7 @@ impl App {
                 (rem_block, rem_state.as_str()),
                 (rdb_block, rdb_state.as_str()),
                 (ext_block, ext_state.as_str()),
+                (tst_block, tst_state.as_str()),
             ]);
             if set_block.width > 0 {
                 blocks.push((set_block, set_state.as_str()));
@@ -3819,6 +3871,21 @@ impl App {
                 let bw = crate::iterm2_inline::count_badge_cells_w(self.remote_ports_count);
                 let bx = rem_block.x + rem_block.width.saturating_sub(bw);
                 let by = rem_block.y + rem_block.height.saturating_sub(1);
+                blocks.push((
+                    Rect {
+                        x: bx,
+                        y: by,
+                        width: bw,
+                        height: 1,
+                    },
+                    badge,
+                ));
+            }
+            // And the failing-test count over the Testing (beaker) icon.
+            if let Some(badge) = self.testing_badge.as_deref() {
+                let bw = crate::iterm2_inline::count_badge_cells_w(self.testing_badge_count);
+                let bx = tst_block.x + tst_block.width.saturating_sub(bw);
+                let by = tst_block.y + tst_block.height.saturating_sub(1);
                 blocks.push((
                     Rect {
                         x: bx,
@@ -4130,7 +4197,11 @@ impl App {
             return;
         }
         self.scm_change_badge =
-            self.build_count_badge_image(count, crate::iterm2_inline::KITTY_ID_SCM_BADGE);
+            self.build_count_badge_image(
+                count,
+                crate::iterm2_inline::KITTY_ID_SCM_BADGE,
+                self.theme.accent_rgb(),
+            );
         self.scm_change_badge_count = count;
         self.overlays.activity.mark_dirty();
     }
@@ -4139,13 +4210,18 @@ impl App {
     /// count) at the given Kitty image id. `None` when image rendering is off or
     /// the cell size isn't known yet. Shared by the SCM, Explorer, and Remote
     /// badges so the compose/encode/tmux-wrap chain lives in one place.
-    fn build_count_badge_image(&self, count: usize, kitty_id: u32) -> Option<String> {
+    fn build_count_badge_image(
+        &self,
+        count: usize,
+        kitty_id: u32,
+        color: (u8, u8, u8),
+    ) -> Option<String> {
         let (cw, ch) = self.cell_pixel?;
         let png = crate::iterm2_inline::compose_count_badge(
             count,
             cw,
             ch,
-            self.theme.accent_rgb(),
+            color,
             self.theme_bg_pixel(),
         )?;
         let raw = crate::iterm2_inline::build_inline_image_z(
@@ -4209,7 +4285,11 @@ impl App {
             return;
         }
         self.explorer_unsaved_badge =
-            self.build_count_badge_image(count, crate::iterm2_inline::KITTY_ID_EXPLORER_BADGE);
+            self.build_count_badge_image(
+                count,
+                crate::iterm2_inline::KITTY_ID_EXPLORER_BADGE,
+                self.theme.accent_rgb(),
+            );
         self.explorer_unsaved_count = count;
         self.overlays.activity.mark_dirty();
     }
@@ -4237,8 +4317,43 @@ impl App {
             return;
         }
         self.remote_ports_badge =
-            self.build_count_badge_image(count, crate::iterm2_inline::KITTY_ID_REMOTE_BADGE);
+            self.build_count_badge_image(
+                count,
+                crate::iterm2_inline::KITTY_ID_REMOTE_BADGE,
+                self.theme.accent_rgb(),
+            );
         self.remote_ports_count = count;
+        self.overlays.activity.mark_dirty();
+    }
+
+    /// Rebuild the cached Testing failing-count badge (red pill) when the count,
+    /// theme, or cell size shifts. Count-gated per-frame no-op; the glyph path
+    /// draws a text badge instead.
+    pub fn refresh_testing_badge(&mut self) {
+        let count = self.testing.failed_count();
+        if !self.overlays.activity.has_images() {
+            self.testing_badge = None;
+            if count != self.testing_badge_count {
+                self.testing_badge_count = count;
+                self.overlays.activity.mark_dirty();
+            }
+            return;
+        }
+        if count == self.testing_badge_count {
+            return;
+        }
+        if count == 0 {
+            self.testing_badge = None;
+            self.testing_badge_count = 0;
+            self.overlays.activity.mark_dirty();
+            return;
+        }
+        self.testing_badge = self.build_count_badge_image(
+            count,
+            crate::iterm2_inline::KITTY_ID_TESTING_BADGE,
+            self.theme.git_deleted_rgb(),
+        );
+        self.testing_badge_count = count;
         self.overlays.activity.mark_dirty();
     }
 
@@ -4663,6 +4778,8 @@ impl App {
             Some(ActivityIcon::RunDebug)
         } else if rect_contains(a.extensions_icon, col, row) {
             Some(ActivityIcon::Extensions)
+        } else if rect_contains(a.testing_icon, col, row) {
+            Some(ActivityIcon::Testing)
         } else if rect_contains(a.settings_icon, col, row) {
             Some(ActivityIcon::Settings)
         } else {
@@ -4697,6 +4814,7 @@ impl App {
                 ActivityIcon::Remote => "Remote",
                 ActivityIcon::RunDebug => "Run and Debug",
                 ActivityIcon::Extensions => "Extensions",
+                ActivityIcon::Testing => "Testing",
                 ActivityIcon::Settings => "Manage",
             });
         }
@@ -4747,6 +4865,7 @@ impl App {
                     return Some(label);
                 }
             }
+            SidebarView::Testing => {}
         }
         None
     }
@@ -7336,6 +7455,7 @@ impl App {
         // no-op. (The SCM badge refreshes off the git worker instead.)
         self.refresh_explorer_unsaved_badge();
         self.refresh_remote_ports_badge();
+        self.refresh_testing_badge();
         // In images mode the activity bar inherits the iTerm session bg
         // (forced to sRGB(EDITOR_BG_RGB) via SetColors), matching the rest
         // of the panes. The glyph-fallback path keeps a solid bg for
@@ -7362,6 +7482,7 @@ impl App {
         let remote_block = activity_remote_block(area);
         let run_debug_block = activity_run_debug_block(area);
         let extensions_block = activity_extensions_block(area);
+        let testing_block = activity_testing_block(area);
         let settings_block = activity_settings_block(area);
         let explorer_active = self.sidebar_view == SidebarView::Explorer;
         let search_active = self.sidebar_view == SidebarView::Search;
@@ -7369,6 +7490,7 @@ impl App {
         let remote_active = self.sidebar_view == SidebarView::Remote;
         let run_debug_active = self.sidebar_view == SidebarView::RunDebug;
         let extensions_active = self.sidebar_view == SidebarView::Extensions;
+        let testing_active = self.sidebar_view == SidebarView::Testing;
         let settings_active = self.settings_menu_active();
         // Hover brightens the glyph (like active) but draws no selection pill,
         // mirroring the image path's hovered variant. Selected wins over hover.
@@ -7379,6 +7501,7 @@ impl App {
         let remote_hovered = hov == Some(ActivityIcon::Remote);
         let run_debug_hovered = hov == Some(ActivityIcon::RunDebug);
         let extensions_hovered = hov == Some(ActivityIcon::Extensions);
+        let testing_hovered = hov == Some(ActivityIcon::Testing);
         let settings_hovered = hov == Some(ActivityIcon::Settings);
 
         let active_color = Color::White;
@@ -7508,6 +7631,14 @@ impl App {
                 extensions_active,
                 extensions_hovered,
             );
+            render_glyph(
+                frame,
+                testing_block,
+                crate::icons::ACTIVITY_TESTING,
+                testing_active,
+                testing_hovered,
+            );
+            render_count_badge(frame, testing_block, self.testing.failed_count());
             if settings_block.width > 0 {
                 render_glyph(
                     frame,
@@ -7525,6 +7656,7 @@ impl App {
         self.sidebar_areas.remote_icon = remote_block;
         self.sidebar_areas.run_debug_icon = run_debug_block;
         self.sidebar_areas.extensions_icon = extensions_block;
+        self.sidebar_areas.testing_icon = testing_block;
         self.sidebar_areas.settings_icon = settings_block;
     }
 
@@ -7594,6 +7726,7 @@ impl App {
                 self.refresh_extensions();
                 self.focus_pane(Pane::Tree);
             }
+            SidebarView::Testing => self.focus_pane(Pane::Tree),
         }
     }
 
@@ -8544,6 +8677,7 @@ impl App {
                 SidebarView::Remote => frame.render_widget(&mut self.remote, usable_area),
                 SidebarView::RunDebug => frame.render_widget(&mut self.run_debug, usable_area),
                 SidebarView::Extensions => frame.render_widget(&mut self.extensions, usable_area),
+                SidebarView::Testing => frame.render_widget(&mut self.testing, usable_area),
             }
         }
         if !self.editor_layout.is_split() && self.editor.is_blank_initial() {
@@ -10096,6 +10230,14 @@ impl App {
                 self.begin_rename_terminal(self.active_terminal);
                 true
             }
+            // Cmd+K B: show the Testing view (B for the beaker icon). Cmd+Shift+T
+            // — VS Code's Testing-ish chord — is already croft's focus-Terminal
+            // chord, so the Cmd+K leader hosts this the way it hosts Zen (Cmd+K Z).
+            KeyCode::Char(c) if plain && c.eq_ignore_ascii_case(&'b') => {
+                self.show_tree = true;
+                self.set_sidebar_view(SidebarView::Testing);
+                true
+            }
             _ => false,
         }
     }
@@ -10458,6 +10600,7 @@ impl App {
                 SidebarView::Remote => self.handle_remote_key(key),
                 SidebarView::RunDebug => self.handle_run_debug_key(key),
                 SidebarView::Extensions => self.handle_extensions_key(key),
+                SidebarView::Testing => self.handle_testing_key(key),
             },
             Pane::Editor => {
                 self.handle_editor_key(key);
@@ -10859,6 +11002,28 @@ impl App {
             KeyCode::Enter => self.run_debug_button_action(),
             _ => {}
         }
+    }
+
+    /// Testing view keys: Enter kicks off a full run, arrows scroll the tree,
+    /// Esc returns to the Explorer (mirrors the Run-and-Debug view).
+    fn handle_testing_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => self.set_sidebar_view(SidebarView::Explorer),
+            KeyCode::Enter => self.run_all_tests(),
+            KeyCode::Up => self.testing.scroll_up(1),
+            KeyCode::Down => self.testing.scroll_down(1),
+            _ => {}
+        }
+    }
+
+    /// Kick off a full test run on the worker (no-op if one is already in
+    /// flight) and reveal the Testing view so the streaming results are visible.
+    fn run_all_tests(&mut self) {
+        if self.testing.is_running() {
+            return;
+        }
+        self.test_worker.run_all();
+        self.set_sidebar_view(SidebarView::Testing);
     }
 
     fn refresh_run_debug(&mut self) {
@@ -16897,6 +17062,7 @@ impl App {
             Cmd::ShowRunDebug => self.set_sidebar_view(SidebarView::RunDebug),
             Cmd::ShowRemote => self.set_sidebar_view(SidebarView::Remote),
             Cmd::ShowExtensions => self.set_sidebar_view(SidebarView::Extensions),
+            Cmd::ShowTesting => self.set_sidebar_view(SidebarView::Testing),
             Cmd::ToggleSideBar => self.show_tree = !self.show_tree,
             Cmd::ToggleSecondarySideBar => self.toggle_secondary_side_bar(),
             Cmd::ToggleZenMode => self.toggle_zen_mode(),
@@ -18196,6 +18362,7 @@ impl App {
             SidebarView::Remote => self.remote.last_area,
             SidebarView::RunDebug => self.run_debug.last_area,
             SidebarView::Extensions => self.extensions.last_area,
+            SidebarView::Testing => self.testing.last_area,
         };
         let in_tree = self.show_tree && rect_contains(active_sidebar_area, m.column, m.row);
         // The OUTLINE section sits below the tree in the Explorer sidebar and
@@ -18781,6 +18948,10 @@ impl App {
                     self.set_sidebar_view(SidebarView::Extensions);
                     return;
                 }
+                if rect_contains(self.sidebar_areas.testing_icon, m.column, m.row) {
+                    self.set_sidebar_view(SidebarView::Testing);
+                    return;
+                }
                 if rect_contains(self.sidebar_areas.settings_icon, m.column, m.row) {
                     self.open_settings_menu();
                     return;
@@ -19344,6 +19515,7 @@ impl App {
                             }
                             SidebarView::RunDebug => {}
                             SidebarView::Extensions => {}
+                            SidebarView::Testing => {}
                         },
                         Pane::Editor => {
                             self.editor.scroll_to_bar_y(m.row);
@@ -19424,7 +19596,8 @@ impl App {
                         SidebarView::Search
                         | SidebarView::SourceControl
                         | SidebarView::RunDebug
-                        | SidebarView::Extensions => {}
+                        | SidebarView::Extensions
+                        | SidebarView::Testing => {}
                     }
                 } else if in_terminal {
                     self.terminal_mut().extend_selection_to(m.column, m.row);
@@ -19528,6 +19701,7 @@ impl App {
                         SidebarView::Search => self.search.scroll_down(3),
                         SidebarView::RunDebug => {}
                         SidebarView::Extensions => self.extensions.scroll_down(3),
+                        SidebarView::Testing => self.testing.scroll_down(3),
                     }
                 } else if in_editor {
                     if let Some(diff) = self.editor.diff.as_mut() {
@@ -19565,6 +19739,7 @@ impl App {
                         SidebarView::Search => self.search.scroll_up(3),
                         SidebarView::RunDebug => {}
                         SidebarView::Extensions => self.extensions.scroll_up(3),
+                        SidebarView::Testing => self.testing.scroll_up(3),
                     }
                 } else if in_editor {
                     if let Some(diff) = self.editor.diff.as_mut() {
@@ -23507,6 +23682,7 @@ fn sidebar_view_label(view: SidebarView) -> &'static str {
         SidebarView::Remote => "Remote",
         SidebarView::RunDebug => "RunDebug",
         SidebarView::Extensions => "Extensions",
+        SidebarView::Testing => "Testing",
     }
 }
 
@@ -23518,6 +23694,7 @@ fn sidebar_view_from_label(label: &str) -> Option<SidebarView> {
         "Remote" => Some(SidebarView::Remote),
         "RunDebug" => Some(SidebarView::RunDebug),
         "Extensions" => Some(SidebarView::Extensions),
+        "Testing" => Some(SidebarView::Testing),
         _ => None,
     }
 }
@@ -24506,6 +24683,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let diagnostics_changed = app.drain_lsp_diagnostics();
         let progress_changed = app.drain_lsp_progress();
         let dap_changed = app.poll_dap();
+        let tests_changed = app.test_worker.drain(&mut app.testing);
         let mcp_changed = app.poll_mcp();
         let voice_changed = app.drain_voice();
         // Surface managed language-server install progress in the status bar so
@@ -24530,6 +24708,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let non_pty_dirty = needs_redraw
             || fs_changed
             || mcp_changed
+            || tests_changed
             || blink_changed
             || spinner_changed
             || ext_index_changed

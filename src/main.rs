@@ -25,6 +25,7 @@ mod remote_connect;
 mod session_state;
 mod sheet;
 mod termux;
+mod testing;
 mod theme;
 mod update_watch;
 mod vim;
