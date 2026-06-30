@@ -1853,6 +1853,16 @@ pub struct App {
     /// Required to bake OSC-1337 images at exact viewport pixel size so
     /// iTerm draws them with no stretching or letterboxing.
     cell_pixel: Option<(u32, u32)>,
+    /// Pre-encoded inline-image for the source-control change-count badge (an
+    /// accent pill + count, VS Code's `activityBarBadge`), emitted at z=1 over
+    /// the SCM activity icon's bottom-right. `None` when there are no changes,
+    /// not in a repo, or image rendering is off (the glyph path draws a text
+    /// badge instead). Rebuilt by `refresh_scm_change_badge` when the change
+    /// set, theme, or cell size shifts.
+    scm_change_badge: Option<String>,
+    /// Change count the cached `scm_change_badge` was built for; drives the
+    /// dirty check and the badge's on-screen cell width.
+    scm_change_badge_count: usize,
     /// Which inline-image protocol the host terminal speaks, resolved once at
     /// startup (env-fixed). Drives the [`crate::iterm2_inline::build_inline_image`]
     /// dispatch (iTerm2 OSC-1337 vs Kitty graphics) and the Kitty-only
@@ -2851,6 +2861,8 @@ impl App {
             search_query_tx,
             search_results_rx,
             cell_pixel: None,
+            scm_change_badge: None,
+            scm_change_badge_count: 0,
             inline_protocol: crate::iterm2_inline::detect_inline_image_protocol(),
             sixel_supported: false,
             minimap_visible: true,
@@ -3230,6 +3242,9 @@ impl App {
                 layout_customize_hover: lcuh,
             });
         }
+        // The change-count badge rides the same overlay machinery; rebuild it
+        // against the freshly-baked icons / new background or cell size.
+        self.refresh_scm_change_badge();
         // Run-and-Debug headline icon: the same debug-alt PNG used in the
         // activity bar, fitted to the panel's icon block (RUN_DEBUG_ICON_CELLS_W
         // cells wide × RUN_DEBUG_ICON_CELLS_H cells tall) and tinted at icon-
@@ -3740,6 +3755,25 @@ impl App {
             if set_block.width > 0 {
                 blocks.push((set_block, set_state.as_str()));
             }
+            // Change-count badge over the SCM icon's bottom-right corner. Pushed
+            // after the SCM icon so the iTerm2 path (last writer wins each cell)
+            // paints it on top; the Kitty path baked it at z=1 for the same
+            // effect. Dropping it from the list when the count hits zero shifts
+            // the emit positions, which arms the overlay's move-detection clear.
+            if let Some(badge) = self.scm_change_badge.as_deref() {
+                let bw = crate::iterm2_inline::count_badge_cells_w(self.scm_change_badge_count);
+                let bx = scm_block.x + scm_block.width.saturating_sub(bw);
+                let by = scm_block.y + scm_block.height.saturating_sub(1);
+                blocks.push((
+                    Rect {
+                        x: bx,
+                        y: by,
+                        width: bw,
+                        height: 1,
+                    },
+                    badge,
+                ));
+            }
         }
         // Customize Layout toolbar icons (top-right of the editor / welcome).
         // Their image swaps with the side-bar / panel visibility, exactly like
@@ -4008,8 +4042,64 @@ impl App {
                     ed.git_baseline_for = None;
                 }
             }
+            self.refresh_scm_change_badge();
         }
         changed
+    }
+
+    /// Rebuild the cached source-control change-count badge after the change
+    /// set, theme, or cell size shifts, and mark the activity overlay dirty so
+    /// the next post-draw flush re-emits. On the glyph-fallback path (no inline
+    /// images) it only tracks the count for the dirty check; that path draws a
+    /// text badge directly in `render_activity_bar`.
+    fn refresh_scm_change_badge(&mut self) {
+        let count = if self.git.status().in_repo {
+            self.source_control.changes_count()
+        } else {
+            0
+        };
+        if !self.overlays.activity.has_images() {
+            self.scm_change_badge = None;
+            if count != self.scm_change_badge_count {
+                self.scm_change_badge_count = count;
+                self.overlays.activity.mark_dirty();
+            }
+            return;
+        }
+        if count == 0 {
+            if self.scm_change_badge.is_some() {
+                self.scm_change_badge = None;
+                self.overlays.activity.mark_dirty();
+            }
+            self.scm_change_badge_count = 0;
+            return;
+        }
+        let Some((cw, ch)) = self.cell_pixel else {
+            return;
+        };
+        let cells_w = crate::iterm2_inline::count_badge_cells_w(count);
+        let is_tmux = crate::iterm2_inline::detect_tmux();
+        self.scm_change_badge = crate::iterm2_inline::compose_count_badge(
+            count,
+            cw,
+            ch,
+            self.theme.accent_rgb(),
+            self.theme_bg_pixel(),
+        )
+        .and_then(|png| {
+            crate::iterm2_inline::build_inline_image_z(
+                self.inline_protocol,
+                &png,
+                cells_w,
+                1,
+                false,
+                crate::iterm2_inline::KITTY_ID_SCM_BADGE,
+                1,
+            )
+        })
+        .map(|raw| crate::iterm2_inline::maybe_tmux_wrap(self.inline_protocol, is_tmux, raw));
+        self.scm_change_badge_count = count;
+        self.overlays.activity.mark_dirty();
     }
 
     /// Push the current search query string and toggle state onto the
@@ -7216,6 +7306,36 @@ impl App {
                 source_control_active,
                 source_control_hovered,
             );
+            // Change-count badge for image-less terminals: an accent cell with
+            // the count at the icon's bottom-right, the text analogue of the
+            // baked pill the image path emits.
+            let scm_count = if self.git.status().in_repo {
+                self.source_control.changes_count()
+            } else {
+                0
+            };
+            if scm_count > 0 {
+                let label = if scm_count > 9 {
+                    String::from("9+")
+                } else {
+                    scm_count.to_string()
+                };
+                let w = label.chars().count() as u16;
+                frame.render_widget(
+                    ratatui::widgets::Paragraph::new(label).style(
+                        Style::default()
+                            .fg(Color::White)
+                            .bg(self.theme.accent())
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Rect {
+                        x: source_control_block.x + source_control_block.width.saturating_sub(w),
+                        y: source_control_block.y + source_control_block.height.saturating_sub(1),
+                        width: w,
+                        height: 1,
+                    },
+                );
+            }
             render_glyph(
                 frame,
                 remote_block,

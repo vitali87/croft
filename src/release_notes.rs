@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Feature,
-    summary: "Redesigned status bar: Ln/Col, indentation, encoding, EOL, language, and diagnostics — click encoding/EOL/language to change them.",
+    summary: "Source Control activity icon now shows a VS Code-style count badge over its corner whenever the working tree has changes.",
 }];

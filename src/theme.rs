@@ -167,6 +167,12 @@ impl Theme {
         rgb(self.accent)
     }
 
+    /// Primary accent as raw sRGB bytes, baked into the activity-bar change
+    /// badge's inline-image canvas (VS Code `activityBarBadge.background`).
+    pub fn accent_rgb(self) -> (u8, u8, u8) {
+        self.accent
+    }
+
     /// Selected-row fill in lists/popups.
     pub fn selection(self) -> Color {
         rgb(self.selection)

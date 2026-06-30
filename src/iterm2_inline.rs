@@ -233,6 +233,108 @@ fn finish_icon(
     out
 }
 
+/// Activity-bar cells wide the source-control change badge occupies for a given
+/// change count. One- and two-digit counts use a square-ish 2-cell pill (a
+/// circle on the typical ~1:2 cell); the "99+" overflow needs three.
+pub fn count_badge_cells_w(count: usize) -> u16 {
+    if count > 99 {
+        3
+    } else {
+        2
+    }
+}
+
+/// 3×5 pixel-font rows for the digits and '+', one byte per row with bit 2 = the
+/// left column. Drawn white over the accent pill so the badge needs no font
+/// database (resvg's text support is compiled out, see `Cargo.toml`).
+const BADGE_GLYPHS: [(char, [u8; 5]); 11] = [
+    ('0', [0b111, 0b101, 0b101, 0b101, 0b111]),
+    ('1', [0b010, 0b110, 0b010, 0b010, 0b111]),
+    ('2', [0b111, 0b001, 0b111, 0b100, 0b111]),
+    ('3', [0b111, 0b001, 0b111, 0b001, 0b111]),
+    ('4', [0b101, 0b101, 0b111, 0b001, 0b001]),
+    ('5', [0b111, 0b100, 0b111, 0b001, 0b111]),
+    ('6', [0b111, 0b100, 0b111, 0b101, 0b111]),
+    ('7', [0b111, 0b001, 0b010, 0b010, 0b010]),
+    ('8', [0b111, 0b101, 0b111, 0b101, 0b111]),
+    ('9', [0b111, 0b101, 0b111, 0b001, 0b111]),
+    ('+', [0b000, 0b010, 0b111, 0b010, 0b000]),
+];
+
+/// Rasterise the source-control change-count badge: a rounded accent pill with
+/// the count in white, sized to `count_badge_cells_w(count)`×1 activity-bar
+/// cells. Composited onto `bg` (the bar background) so the iTerm2 path, which
+/// can't render alpha, has no transparent edge to ghost. Mirrors VS Code's
+/// `activityBarBadge`. Returns PNG bytes, or `None` on a zero-sized request.
+pub fn compose_count_badge(
+    count: usize,
+    cell_w: u32,
+    cell_h: u32,
+    accent: (u8, u8, u8),
+    bg: Rgba<u8>,
+) -> Option<Vec<u8>> {
+    let label = if count > 99 {
+        String::from("99+")
+    } else {
+        count.to_string()
+    };
+    let (w, h) = (cell_w * count_badge_cells_w(count) as u32, cell_h);
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let mut canvas: RgbaImage = ImageBuffer::from_pixel(w, h, bg);
+    // Stadium pill: full height, corner radius = half height (a circle when the
+    // pill is roughly square, which the 2-cell width gives on a ~1:2 cell).
+    let accent_px = Rgba([accent.0, accent.1, accent.2, 0xff]);
+    let r = h as f32 / 2.0;
+    for y in 0..h {
+        for x in 0..w {
+            let (fx, fy) = (x as f32 + 0.5, y as f32 + 0.5);
+            let cx = fx.clamp(r, (w as f32 - r).max(r));
+            let cy = fy.clamp(r, (h as f32 - r).max(r));
+            if (fx - cx).hypot(fy - cy) <= r {
+                canvas.put_pixel(x, y, accent_px);
+            }
+        }
+    }
+    // Count digits, white, nearest-neighbour scaled and centred over the pill.
+    let glyphs: Vec<&[u8; 5]> = label
+        .chars()
+        .filter_map(|c| BADGE_GLYPHS.iter().find(|(g, _)| *g == c).map(|(_, rows)| rows))
+        .collect();
+    let n = glyphs.len() as u32;
+    if n > 0 {
+        let grid_w = n * 3 + (n - 1); // 3 cols per glyph + a 1-col gap between
+        let scale = ((h * 6 / 10) / 5).min((w * 8 / 10) / grid_w).max(1);
+        let off_x = w.saturating_sub(grid_w * scale) / 2;
+        let off_y = h.saturating_sub(5 * scale) / 2;
+        let white = Rgba([0xff, 0xff, 0xff, 0xff]);
+        for (gi, rows) in glyphs.iter().enumerate() {
+            let gx = off_x + gi as u32 * 4 * scale;
+            for (ry, row) in rows.iter().enumerate() {
+                for col in 0..3u32 {
+                    if row & (0b100 >> col) == 0 {
+                        continue;
+                    }
+                    let (px0, py0) = (gx + col * scale, off_y + ry as u32 * scale);
+                    for dy in 0..scale {
+                        for dx in 0..scale {
+                            let (px, py) = (px0 + dx, py0 + dy);
+                            if px < w && py < h {
+                                canvas.put_pixel(px, py, white);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut out = Vec::with_capacity(1024);
+    let _ = image::DynamicImage::ImageRgba8(canvas)
+        .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png);
+    Some(out)
+}
+
 fn tint_rgba(src: &RgbaImage, tint: Rgba<u8>) -> RgbaImage {
     let mut out = src.clone();
     for px in out.pixels_mut() {
@@ -800,6 +902,8 @@ pub const KITTY_ID_LAYOUT_SIDEBAR: u32 = KITTY_ID_BASE + 15;
 pub const KITTY_ID_LAYOUT_PANEL: u32 = KITTY_ID_BASE + 16;
 pub const KITTY_ID_LAYOUT_CUSTOMIZE: u32 = KITTY_ID_BASE + 17;
 pub const KITTY_ID_MINIMAP: u32 = KITTY_ID_BASE + 18;
+/// Source-control change-count badge, emitted at z=1 over the SCM icon.
+pub const KITTY_ID_SCM_BADGE: u32 = KITTY_ID_BASE + 19;
 
 /// Apply tmux DCS passthrough wrapping to an inline-image escape when needed.
 /// Sixel passes through tmux natively (tmux built with sixel support renders it
@@ -834,6 +938,26 @@ mod tests {
     #[test]
     fn iterm_app_is_iterm2() {
         assert!(is_iterm2_term_program(Some("iTerm.app")));
+    }
+
+    #[test]
+    fn count_badge_widens_only_past_two_digits() {
+        assert_eq!(count_badge_cells_w(1), 2);
+        assert_eq!(count_badge_cells_w(99), 2);
+        assert_eq!(count_badge_cells_w(100), 3);
+    }
+
+    #[test]
+    fn count_badge_renders_pill_and_digits() {
+        let bg = Rgba([0x20, 0x20, 0x20, 0xff]);
+        let accent = (0x4e, 0x9a, 0xff);
+        let png = compose_count_badge(3, 9, 18, accent, bg).expect("badge png");
+        let img = image::load_from_memory(&png).expect("decode").to_rgba8();
+        // 1 digit -> 2 cells wide, 1 cell tall.
+        assert_eq!((img.width(), img.height()), (18, 18));
+        let has = |p: Rgba<u8>| img.pixels().any(|q| *q == p);
+        assert!(has(Rgba([accent.0, accent.1, accent.2, 0xff])), "accent pill");
+        assert!(has(Rgba([0xff, 0xff, 0xff, 0xff])), "white digit");
     }
 
     #[test]
