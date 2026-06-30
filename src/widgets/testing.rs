@@ -12,7 +12,7 @@ use ratatui::{
     widgets::{Block, Borders, Widget},
 };
 
-use crate::testing::model::{TestCase, TestStatus};
+use crate::testing::model::{Activity, TestCase, TestStatus};
 use crate::theme::Theme;
 use crate::widgets::scrollbar;
 
@@ -41,7 +41,7 @@ pub struct TestingPanel {
     /// All known cases, kept sorted by name; status is updated in place as
     /// result lines stream in.
     cases: Vec<TestCase>,
-    running: bool,
+    activity: Activity,
     /// `Some(ok)` after a run completes (`ok` = the runner exited 0). Drives the
     /// summary line; `None` before the first run.
     last_run_ok: Option<bool>,
@@ -62,7 +62,7 @@ impl TestingPanel {
     pub fn new() -> Self {
         Self {
             cases: Vec::new(),
-            running: false,
+            activity: Activity::Idle,
             last_run_ok: None,
             scroll: 0,
             focus_gradient: false,
@@ -76,11 +76,12 @@ impl TestingPanel {
         }
     }
 
-    /// A run is starting: clear stale results (cargo recompiles and re-emits the
-    /// full set) and show the running state until the first case lands.
-    pub fn on_run_started(&mut self) {
+    /// A run or discovery is starting: clear stale results (the test binary
+    /// recompiles and re-emits the full set) and show the busy state until the
+    /// first case lands.
+    pub fn on_busy_started(&mut self, activity: Activity) {
         self.cases.clear();
-        self.running = true;
+        self.activity = activity;
         self.last_run_ok = None;
         self.scroll = 0;
     }
@@ -94,13 +95,29 @@ impl TestingPanel {
         }
     }
 
-    pub fn on_run_finished(&mut self, ok: bool) {
-        self.running = false;
-        self.last_run_ok = Some(ok);
+    /// A run or discovery finished. `ok` is the runner's exit success for a run,
+    /// or `None` for discovery (which reports no pass/fail).
+    pub fn on_finished(&mut self, ok: Option<bool>) {
+        self.activity = Activity::Idle;
+        if ok.is_some() {
+            self.last_run_ok = ok;
+        }
     }
 
     pub fn is_running(&self) -> bool {
-        self.running
+        self.activity == Activity::Running
+    }
+
+    /// Whether a run or discovery is in flight (used to suppress overlapping
+    /// kicks — the test binary compile is expensive, so never double-spawn).
+    pub fn is_busy(&self) -> bool {
+        self.activity != Activity::Idle
+    }
+
+    /// No tests known yet (never discovered or run). Drives the one-shot
+    /// discover-on-open so re-opening a populated view doesn't recompile.
+    pub fn is_empty(&self) -> bool {
+        self.cases.is_empty()
     }
 
     /// Count of failing tests — the number the beaker badge shows.
@@ -206,15 +223,19 @@ impl Widget for &mut TestingPanel {
                 .add_modifier(Modifier::BOLD),
         );
 
-        // Summary line: running, the pass/fail/skip tally, or a kickoff hint.
+        // Summary line: busy state, the pass/fail/skip tally, or a kickoff hint.
         let (passed, failed, skipped) = self.counts();
         let right = inner.x + inner.width;
         let summary_y = inner.y + 1;
-        if self.running {
+        if self.activity != Activity::Idle {
+            let label = match self.activity {
+                Activity::Discovering => "Discovering tests…",
+                _ => "Running tests…",
+            };
             buf.set_string(
                 inner.x + 1,
                 summary_y,
-                "Running tests…",
+                label,
                 Style::default().fg(self.theme.accent()),
             );
         } else if self.cases.is_empty() {
@@ -306,7 +327,7 @@ mod tests {
     #[test]
     fn failed_count_reflects_applied_cases() {
         let mut p = TestingPanel::new();
-        p.on_run_started();
+        p.on_busy_started(Activity::Running);
         p.apply_case(TestCase {
             name: "m::a".into(),
             status: TestStatus::Passed,

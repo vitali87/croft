@@ -48,7 +48,7 @@ On macOS, the `Cmd` chords below only reach croft after you run a one-time setup
 | `Cmd+K` `O` | Copy into New Window: open the active file in a new window of your terminal, focused on just the file (Explorer + terminal hidden; the current window is untouched; Ghostty / iTerm2 / Terminal; macOS only) |
 | `Cmd+K` `Shift+O` | Move into New Window: same, and close the file's tab here (macOS only) |
 | `Cmd+K` `Z` | Toggle Zen Mode: hide the activity bar, both side bars, the panel, and the status bar; press again to restore exactly what was shown before |
-| `Cmd+K` `B` | Show the Testing view (beaker icon); press Enter there to run all tests |
+| `Cmd+K` `B` | Show the Testing view (beaker icon); it discovers tests on first open. In the view: Enter runs all tests, `r` re-discovers, ↑/↓ scroll |
 | Mouse wheel | Scroll the pane under the pointer |
 
 ### Customize Layout

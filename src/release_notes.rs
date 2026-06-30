@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Feature,
-    summary: "New Testing view (beaker icon): runs cargo test, shows a live pass/fail suite tree, and badges the icon red with the failing count.",
+    summary: "Testing view now discovers tests on open (cargo test --list) so the suite tree populates before you run; press r to refresh.",
 }];

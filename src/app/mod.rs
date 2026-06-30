@@ -10234,8 +10234,7 @@ impl App {
             // — VS Code's Testing-ish chord — is already croft's focus-Terminal
             // chord, so the Cmd+K leader hosts this the way it hosts Zen (Cmd+K Z).
             KeyCode::Char(c) if plain && c.eq_ignore_ascii_case(&'b') => {
-                self.show_tree = true;
-                self.set_sidebar_view(SidebarView::Testing);
+                self.open_testing_view();
                 true
             }
             _ => false,
@@ -11004,26 +11003,49 @@ impl App {
         }
     }
 
-    /// Testing view keys: Enter kicks off a full run, arrows scroll the tree,
-    /// Esc returns to the Explorer (mirrors the Run-and-Debug view).
+    /// Testing view keys: Enter runs all tests, `r` re-discovers, arrows scroll
+    /// the tree, Esc returns to the Explorer (mirrors the Run-and-Debug view).
     fn handle_testing_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Esc => self.set_sidebar_view(SidebarView::Explorer),
             KeyCode::Enter => self.run_all_tests(),
+            KeyCode::Char('r' | 'R') => self.discover_tests(),
             KeyCode::Up => self.testing.scroll_up(1),
             KeyCode::Down => self.testing.scroll_down(1),
             _ => {}
         }
     }
 
-    /// Kick off a full test run on the worker (no-op if one is already in
-    /// flight) and reveal the Testing view so the streaming results are visible.
+    /// Kick off a full test run on the worker (no-op if a run/discovery is
+    /// already in flight) and reveal the Testing view so results stream in.
     fn run_all_tests(&mut self) {
-        if self.testing.is_running() {
+        if self.testing.is_busy() {
             return;
         }
         self.test_worker.run_all();
         self.set_sidebar_view(SidebarView::Testing);
+    }
+
+    /// List tests without running them (populate the tree). No-op while busy or
+    /// outside a Cargo project — `cargo test -- --list` would error with no
+    /// manifest, and it compiles the test binary so we never auto-fire it
+    /// per-keystroke (M1/M2 is Rust-only; gate on Cargo.toml).
+    fn discover_tests(&mut self) {
+        if self.testing.is_busy() || !self.tree.root.join("Cargo.toml").is_file() {
+            return;
+        }
+        self.test_worker.discover();
+    }
+
+    /// Reveal the Testing view (the user-open gesture: activity icon, Cmd+K B,
+    /// palette). Auto-discovers once when the tree is still empty so it
+    /// populates like VS Code, without recompiling on every subsequent open.
+    fn open_testing_view(&mut self) {
+        self.show_tree = true;
+        self.set_sidebar_view(SidebarView::Testing);
+        if self.testing.is_empty() {
+            self.discover_tests();
+        }
     }
 
     fn refresh_run_debug(&mut self) {
@@ -17062,7 +17084,7 @@ impl App {
             Cmd::ShowRunDebug => self.set_sidebar_view(SidebarView::RunDebug),
             Cmd::ShowRemote => self.set_sidebar_view(SidebarView::Remote),
             Cmd::ShowExtensions => self.set_sidebar_view(SidebarView::Extensions),
-            Cmd::ShowTesting => self.set_sidebar_view(SidebarView::Testing),
+            Cmd::ShowTesting => self.open_testing_view(),
             Cmd::ToggleSideBar => self.show_tree = !self.show_tree,
             Cmd::ToggleSecondarySideBar => self.toggle_secondary_side_bar(),
             Cmd::ToggleZenMode => self.toggle_zen_mode(),
@@ -18949,7 +18971,7 @@ impl App {
                     return;
                 }
                 if rect_contains(self.sidebar_areas.testing_icon, m.column, m.row) {
-                    self.set_sidebar_view(SidebarView::Testing);
+                    self.open_testing_view();
                     return;
                 }
                 if rect_contains(self.sidebar_areas.settings_icon, m.column, m.row) {

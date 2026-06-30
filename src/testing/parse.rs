@@ -25,6 +25,14 @@ pub fn parse_test_line(line: &str) -> Option<TestCase> {
     })
 }
 
+/// Parse a single line of `cargo test -- --list` output into a discovered test
+/// name, or `None` for non-test lines. libtest `--list` prints `<path>: test`
+/// for each test and `<path>: benchmark` for benches (skipped), plus a trailing
+/// `N tests, M benchmarks` tally (no `: test` suffix, so excluded).
+pub fn parse_list_line(line: &str) -> Option<String> {
+    line.strip_suffix(": test").map(str::to_string)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -60,5 +68,17 @@ mod tests {
         assert!(parse_test_line("   Compiling croft v0.1.0").is_none());
         assert!(parse_test_line("").is_none());
         assert!(parse_test_line("test benchy ... bench: 12 ns/iter").is_none());
+    }
+
+    #[test]
+    fn list_parser_takes_test_lines_and_skips_benches_and_tally() {
+        assert_eq!(
+            parse_list_line("mymod::works: test").as_deref(),
+            Some("mymod::works")
+        );
+        assert_eq!(parse_list_line("a::b::c: test").as_deref(), Some("a::b::c"));
+        assert!(parse_list_line("benchy: benchmark").is_none());
+        assert!(parse_list_line("2 tests, 1 benchmark").is_none());
+        assert!(parse_list_line("").is_none());
     }
 }
