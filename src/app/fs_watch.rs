@@ -268,23 +268,30 @@ impl FsWatch {
         // Management TCC class.
         #[cfg(target_os = "macos")]
         {
-            // Depth-aware pruning. The old code only checked the root's
-            // *immediate* children for noise, so opening a directory that is
-            // a PARENT of repos (e.g. ~/Documents) found no top-level
-            // node_modules/.git/target, fell through to a single recursive
-            // watch over the whole tree, and re-subscribed every repo's write
-            // storm one level down (confirmed by `sample`: five fsevents
-            // loops + a mutex-bound debouncer at ~45% CPU, UI frozen).
+            // Depth-aware pruning. We install a recursive watch only at the
+            // root of each maximal noise-free subtree, and NEVER root a stream
+            // at or above a noise dir (target/, node_modules/, .git/).
             //
-            // Instead, walk the tree (descent stops at noise dirs, so their
-            // subtrees are never read) and install a recursive watch only at
-            // the root of each maximal noise-free subtree, plus a
-            // non-recursive watch on every "boundary" directory that contains
-            // noise so its own direct entries are still observed. A noise dir
-            // is therefore never covered by any FSEvents stream at any depth,
-            // and the stream count stays in the low hundreds instead of one
-            // pathological recursive watch — keeping FSEventStreamCreate well
-            // under the per-tree count that pins a core.
+            // Why "never above" and not "non-recursive on the boundary": on
+            // macOS there is no such thing as a non-recursive FSEvents watch.
+            // notify implements RecursiveMode::NonRecursive as a fully
+            // recursive FSEventStream rooted at the path, then DISCARDS events
+            // whose parent isn't the path — after the kernel has already
+            // delivered them and the callback has paid to filter them
+            // (notify 8.2.0 src/fsevent.rs: the `recursive_info`
+            // `path.starts_with` loop runs for every event in the subtree).
+            // So a non-recursive watch on a boundary dir like ~/Documents or
+            // a repo root still streams every target/ and node_modules/ write
+            // beneath it into the fsevents-loop thread, pinning a core during
+            // any cargo/npm build even though zero of those events reach the
+            // debouncer. The old code's boundary watches did exactly this; the
+            // regression hid because the tests only asserted zero *debouncer*
+            // events, never the callback CPU.
+            //
+            // The boundary dirs' own direct entries (a new top-level file, a
+            // Cargo.toml edit) are instead covered by the adaptive-backoff
+            // poll, which stats only the expanded/visible dirs — cheap, and
+            // already the fallback for everything not under a watch.
             let mut targets: Vec<(PathBuf, RecursiveMode)> = Vec::new();
             if collect_macos_watch_targets(root, &mut targets) {
                 // Whole tree is noise-free (e.g. a small repo with no
@@ -301,18 +308,17 @@ impl FsWatch {
                 targets.sort_by_key(|(p, _)| p.components().count());
                 targets.truncate(MAX_WATCHES);
             }
-            // The root itself must always be watchable, or `spawn_watcher`
-            // would succeed having subscribed to nothing on a clean-but-empty
-            // root; mirror the previous contract of failing loudly if even
-            // the root cannot be watched.
-            if targets.is_empty() {
-                debouncer
-                    .watch(root, RecursiveMode::NonRecursive)
-                    .context("starting non-recursive watch on workspace root")?;
-            } else {
-                for (path, mode) in targets {
-                    let _ = debouncer.watch(&path, mode);
-                }
+            // An empty target list here means `collect` returned `false`: the
+            // root is a boundary that contains noise but has no noise-free
+            // subtree to anchor a stream on (e.g. a repo that is only .git +
+            // node_modules + loose files). The OLD code fell back to a
+            // non-recursive watch on the root — which on macOS is a recursive
+            // stream over exactly that noise, the storm we're killing. So in
+            // that case we install NOTHING and let the adaptive poll cover the
+            // root's (few, visible) entries. Watching nothing is correct, not a
+            // failure: the poll is the floor for everything outside a watch.
+            for (path, mode) in targets {
+                let _ = debouncer.watch(&path, mode);
             }
         }
         #[cfg(not(target_os = "macos"))]
@@ -385,15 +391,18 @@ fn is_skippable_name(name: &std::ffi::OsStr) -> bool {
 }
 
 /// Walk `dir` and append the FSEvents watch targets that cover every
-/// non-noise file beneath it without ever subscribing to a noise subtree at
-/// any depth (descent stops at noise dirs, so their subtrees are never even
-/// read). Returns `true` when `dir`'s entire subtree is noise-free, deferring
-/// to the caller to install one recursive watch at the subtree's highest
-/// point (a single stream); returns `false` when `dir` is a boundary, having
-/// already pushed a non-recursive watch on `dir` itself plus a recursive
-/// watch on each maximal noise-free child subtree.
+/// non-noise file beneath it without ever rooting a stream at or above a noise
+/// subtree at any depth (descent stops at noise dirs, so their subtrees are
+/// never even read). Returns `true` when `dir`'s entire subtree is noise-free,
+/// deferring to the caller to install one recursive watch at the subtree's
+/// highest point (a single stream); returns `false` when `dir` is a boundary
+/// (it contains noise somewhere beneath it), having pushed a recursive watch
+/// on each maximal noise-free child subtree. A boundary dir is deliberately
+/// NOT watched itself: on macOS a non-recursive watch is still a recursive
+/// FSEventStream (see `spawn_watcher`), so watching a boundary would re-stream
+/// the very noise we descended past. Its direct entries fall to the poll.
 #[cfg(target_os = "macos")]
-fn collect_macos_watch_targets(
+pub(super) fn collect_macos_watch_targets(
     dir: &Path,
     targets: &mut Vec<(PathBuf, notify::RecursiveMode)>,
 ) -> bool {
@@ -425,7 +434,6 @@ fn collect_macos_watch_targets(
     if !has_noise && child_clean.iter().all(|(_, clean)| *clean) {
         return true;
     }
-    targets.push((dir.to_path_buf(), RecursiveMode::NonRecursive));
     for (sd, clean) in child_clean {
         if clean {
             targets.push((sd, RecursiveMode::Recursive));

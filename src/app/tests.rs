@@ -1497,6 +1497,75 @@ fn fs_watcher_prunes_noise_dirs_nested_below_the_workspace_root() {
     );
 }
 
+// Regression for the two-cores-pegged fan storm: on macOS a "non-recursive"
+// FSEvents watch is still a fully recursive stream rooted at the path, so any
+// watch target that is an ancestor of a noise dir (target/, node_modules/,
+// .git/) re-streams that dir's entire build churn into the fsevents callback
+// even though notify discards it before the debouncer. The earlier
+// boundary-watch fix left exactly such ancestor watches (on the workspace root
+// and on each repo dir) and its tests only checked debouncer events, never the
+// callback cost — so the burn shipped. The invariant the watcher MUST hold:
+// no installed watch target is an ancestor of any noise dir.
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_watch_targets_never_root_a_stream_above_a_noise_dir() {
+    use crate::widgets::file_finder::is_noise_dir;
+    // A parent-of-repos layout (~/Documents-shaped): root has no top-level
+    // noise, but each repo nested under it carries target/, node_modules/, .git.
+    let tmp = tempfile::tempdir().unwrap();
+    for repo in ["alpha", "beta"] {
+        let r = tmp.path().join(repo);
+        std::fs::create_dir_all(r.join("src/inner")).unwrap();
+        std::fs::create_dir_all(r.join("target/debug/incremental")).unwrap();
+        std::fs::create_dir_all(r.join("node_modules/pkg")).unwrap();
+        std::fs::create_dir_all(r.join(".git/objects")).unwrap();
+    }
+
+    let mut targets: Vec<(std::path::PathBuf, notify::RecursiveMode)> = Vec::new();
+    super::fs_watch::collect_macos_watch_targets(tmp.path(), &mut targets);
+
+    // No target may contain a noise dir anywhere beneath it (which on macOS
+    // would put that noise dir inside the target's recursive FSEvents stream).
+    for (path, _mode) in &targets {
+        for entry in walkdir_noise(path) {
+            if let Some(name) = entry.file_name() {
+                assert!(
+                    !is_noise_dir(name),
+                    "watch target {path:?} roots an FSEvents stream over noise dir {entry:?}; \
+                     cargo/npm build churn there would peg the fsevents callback"
+                );
+            }
+        }
+    }
+    // And the clean leaves must still be covered, or external edits go unseen.
+    assert!(
+        targets.iter().any(|(p, _)| p.ends_with("alpha/src")
+            || p.canonicalize()
+                .map(|c| c.ends_with("alpha/src"))
+                .unwrap_or(false)),
+        "the clean repo subtree (alpha/src) must still be watched; got {targets:?}"
+    );
+}
+
+#[cfg(target_os = "macos")]
+fn walkdir_noise(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in rd.filter_map(Result::ok) {
+            let p = entry.path();
+            if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+                out.push(p.clone());
+                stack.push(p);
+            }
+        }
+    }
+    out
+}
+
 #[test]
 fn drain_fs_events_returns_false_when_nothing_pending() {
     let tmp = tempfile::tempdir().unwrap();
@@ -4291,7 +4360,8 @@ fn status_bar_shows_document_facts_not_a_keyboard_cheat_sheet() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.editor.path = Some(std::path::PathBuf::from("x.rs"));
-    app.editor.set_language(Some(crate::highlight::LangKind::Rust));
+    app.editor
+        .set_language(Some(crate::highlight::LangKind::Rust));
     let backend = ratatui::backend::TestBackend::new(140, 50);
     let mut term = ratatui::Terminal::new(backend).unwrap();
     term.draw(|f| app.render(f)).unwrap();
@@ -4304,7 +4374,10 @@ fn status_bar_shows_document_facts_not_a_keyboard_cheat_sheet() {
         row.contains("Ln 1, Col 1"),
         "status bar shows cursor position: {row:?}"
     );
-    assert!(row.contains("Rust"), "status bar shows language mode: {row:?}");
+    assert!(
+        row.contains("Rust"),
+        "status bar shows language mode: {row:?}"
+    );
     assert!(
         !row.contains("Cycle pane") && !row.contains("Quit"),
         "the keyboard cheat-sheet must be gone: {row:?}"

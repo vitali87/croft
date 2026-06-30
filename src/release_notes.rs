@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Fix,
-    summary: "The PROBLEMS tab count is back to a round orange circle, the same raster badge as the activity-bar counts, instead of a rectangular pill.",
+    summary: "Killed the FSEvents fan storm for good: opening a parent-of-repos folder (e.g. ~/Documents) no longer pegs cores during builds; the watcher never roots a stream above target/, node_modules/, or .git/.",
 }];
