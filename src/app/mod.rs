@@ -1871,6 +1871,13 @@ pub struct App {
     explorer_unsaved_badge: Option<String>,
     /// Unsaved-file count the cached `explorer_unsaved_badge` was built for.
     explorer_unsaved_count: usize,
+    /// Pre-encoded inline-image for the Remote icon's forwarded-ports badge
+    /// (VS Code's Ports view count), emitted at z=1 over the Remote icon. `None`
+    /// when no port is forwarded or image rendering is off. Same plumbing as the
+    /// other count badges; rebuilt by `refresh_remote_ports_badge`.
+    remote_ports_badge: Option<String>,
+    /// Forwarded-port count the cached `remote_ports_badge` was built for.
+    remote_ports_count: usize,
     /// Which inline-image protocol the host terminal speaks, resolved once at
     /// startup (env-fixed). Drives the [`crate::iterm2_inline::build_inline_image`]
     /// dispatch (iTerm2 OSC-1337 vs Kitty graphics) and the Kitty-only
@@ -2873,6 +2880,8 @@ impl App {
             scm_change_badge_count: 0,
             explorer_unsaved_badge: None,
             explorer_unsaved_count: 0,
+            remote_ports_badge: None,
+            remote_ports_count: 0,
             inline_protocol: crate::iterm2_inline::detect_inline_image_protocol(),
             sixel_supported: false,
             minimap_visible: true,
@@ -3259,6 +3268,8 @@ impl App {
         self.refresh_scm_change_badge();
         self.explorer_unsaved_count = usize::MAX;
         self.refresh_explorer_unsaved_badge();
+        self.remote_ports_count = usize::MAX;
+        self.refresh_remote_ports_badge();
         // Run-and-Debug headline icon: the same debug-alt PNG used in the
         // activity bar, fitted to the panel's icon block (RUN_DEBUG_ICON_CELLS_W
         // cells wide × RUN_DEBUG_ICON_CELLS_H cells tall) and tinted at icon-
@@ -3803,6 +3814,21 @@ impl App {
                     badge,
                 ));
             }
+            // And over the Remote icon for the forwarded-ports count.
+            if let Some(badge) = self.remote_ports_badge.as_deref() {
+                let bw = crate::iterm2_inline::count_badge_cells_w(self.remote_ports_count);
+                let bx = rem_block.x + rem_block.width.saturating_sub(bw);
+                let by = rem_block.y + rem_block.height.saturating_sub(1);
+                blocks.push((
+                    Rect {
+                        x: bx,
+                        y: by,
+                        width: bw,
+                        height: 1,
+                    },
+                    badge,
+                ));
+            }
         }
         // Customize Layout toolbar icons (top-right of the editor / welcome).
         // Their image swaps with the side-bar / panel visibility, exactly like
@@ -4103,32 +4129,39 @@ impl App {
             self.scm_change_badge_count = 0;
             return;
         }
-        let Some((cw, ch)) = self.cell_pixel else {
-            return;
-        };
-        let cells_w = crate::iterm2_inline::count_badge_cells_w(count);
-        let is_tmux = crate::iterm2_inline::detect_tmux();
-        self.scm_change_badge = crate::iterm2_inline::compose_count_badge(
+        self.scm_change_badge =
+            self.build_count_badge_image(count, crate::iterm2_inline::KITTY_ID_SCM_BADGE);
+        self.scm_change_badge_count = count;
+        self.overlays.activity.mark_dirty();
+    }
+
+    /// Build the inline-image for an activity-bar count badge (accent pill +
+    /// count) at the given Kitty image id. `None` when image rendering is off or
+    /// the cell size isn't known yet. Shared by the SCM, Explorer, and Remote
+    /// badges so the compose/encode/tmux-wrap chain lives in one place.
+    fn build_count_badge_image(&self, count: usize, kitty_id: u32) -> Option<String> {
+        let (cw, ch) = self.cell_pixel?;
+        let png = crate::iterm2_inline::compose_count_badge(
             count,
             cw,
             ch,
             self.theme.accent_rgb(),
             self.theme_bg_pixel(),
-        )
-        .and_then(|png| {
-            crate::iterm2_inline::build_inline_image_z(
-                self.inline_protocol,
-                &png,
-                cells_w,
-                1,
-                false,
-                crate::iterm2_inline::KITTY_ID_SCM_BADGE,
-                1,
-            )
-        })
-        .map(|raw| crate::iterm2_inline::maybe_tmux_wrap(self.inline_protocol, is_tmux, raw));
-        self.scm_change_badge_count = count;
-        self.overlays.activity.mark_dirty();
+        )?;
+        let raw = crate::iterm2_inline::build_inline_image_z(
+            self.inline_protocol,
+            &png,
+            crate::iterm2_inline::count_badge_cells_w(count),
+            1,
+            false,
+            kitty_id,
+            1,
+        )?;
+        Some(crate::iterm2_inline::maybe_tmux_wrap(
+            self.inline_protocol,
+            crate::iterm2_inline::detect_tmux(),
+            raw,
+        ))
     }
 
     /// Count of open editors with unsaved edits, across the active group and any
@@ -4175,31 +4208,37 @@ impl App {
             self.overlays.activity.mark_dirty();
             return;
         }
-        let Some((cw, ch)) = self.cell_pixel else {
-            return;
-        };
-        let cells_w = crate::iterm2_inline::count_badge_cells_w(count);
-        let is_tmux = crate::iterm2_inline::detect_tmux();
-        self.explorer_unsaved_badge = crate::iterm2_inline::compose_count_badge(
-            count,
-            cw,
-            ch,
-            self.theme.accent_rgb(),
-            self.theme_bg_pixel(),
-        )
-        .and_then(|png| {
-            crate::iterm2_inline::build_inline_image_z(
-                self.inline_protocol,
-                &png,
-                cells_w,
-                1,
-                false,
-                crate::iterm2_inline::KITTY_ID_EXPLORER_BADGE,
-                1,
-            )
-        })
-        .map(|raw| crate::iterm2_inline::maybe_tmux_wrap(self.inline_protocol, is_tmux, raw));
+        self.explorer_unsaved_badge =
+            self.build_count_badge_image(count, crate::iterm2_inline::KITTY_ID_EXPLORER_BADGE);
         self.explorer_unsaved_count = count;
+        self.overlays.activity.mark_dirty();
+    }
+
+    /// Rebuild the cached Remote forwarded-ports badge when the count, theme, or
+    /// cell size shifts. Count-gated like the Explorer badge so it's a cheap
+    /// per-frame no-op; the glyph-fallback path draws a text badge instead.
+    pub fn refresh_remote_ports_badge(&mut self) {
+        let count = self.ports.forwarded_count();
+        if !self.overlays.activity.has_images() {
+            self.remote_ports_badge = None;
+            if count != self.remote_ports_count {
+                self.remote_ports_count = count;
+                self.overlays.activity.mark_dirty();
+            }
+            return;
+        }
+        if count == self.remote_ports_count {
+            return;
+        }
+        if count == 0 {
+            self.remote_ports_badge = None;
+            self.remote_ports_count = 0;
+            self.overlays.activity.mark_dirty();
+            return;
+        }
+        self.remote_ports_badge =
+            self.build_count_badge_image(count, crate::iterm2_inline::KITTY_ID_REMOTE_BADGE);
+        self.remote_ports_count = count;
         self.overlays.activity.mark_dirty();
     }
 
@@ -7292,10 +7331,11 @@ impl App {
         if area.width == 0 || area.height == 0 {
             return;
         }
-        // Keep the Explorer unsaved-file badge current before the post-draw
-        // flush emits it. Count-gated, so a frame with no save/edit churn is a
-        // cheap no-op. (The SCM badge refreshes off the git worker instead.)
+        // Keep the per-frame activity badges current before the post-draw flush
+        // emits them. Both are count-gated, so a frame with no churn is a cheap
+        // no-op. (The SCM badge refreshes off the git worker instead.)
         self.refresh_explorer_unsaved_badge();
+        self.refresh_remote_ports_badge();
         // In images mode the activity bar inherits the iTerm session bg
         // (forced to sRGB(EDITOR_BG_RGB) via SetColors), matching the rest
         // of the panes. The glyph-fallback path keeps a solid bg for
@@ -7453,6 +7493,7 @@ impl App {
                 remote_active,
                 remote_hovered,
             );
+            render_count_badge(frame, remote_block, self.ports.forwarded_count());
             render_glyph(
                 frame,
                 run_debug_block,

@@ -131,6 +131,12 @@ impl PortsPanel {
         self.entries.len()
     }
 
+    /// Count of ports currently forwarded home over the SSH master. Drives the
+    /// Remote activity-icon badge, mirroring VS Code's Ports view count.
+    pub fn forwarded_count(&self) -> usize {
+        self.entries.iter().filter(|e| e.forwarded).count()
+    }
+
     pub fn selected(&self) -> Option<&PortEntry> {
         self.entries.get(self.selected)
     }
@@ -442,6 +448,18 @@ mod tests {
     fn empty_shows_a_hint() {
         let mut p = PortsPanel::new();
         assert!(render(&mut p, 80, 5).contains("No ports detected yet"));
+    }
+
+    #[test]
+    fn forwarded_count_counts_only_tunneled_ports() {
+        // The Remote activity badge mirrors VS Code's Ports view: it counts
+        // ports actually forwarded home, not every detected port.
+        let mut p = PortsPanel::new();
+        p.upsert(3000, None, None, PortOrigin::Remote("box".into()));
+        p.upsert(8080, None, None, PortOrigin::Remote("box".into()));
+        assert_eq!(p.forwarded_count(), 0, "detected but not yet forwarded");
+        p.mark_forwarded(3000, 53000);
+        assert_eq!(p.forwarded_count(), 1, "one tunnel up");
     }
 
     #[test]
