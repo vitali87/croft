@@ -4282,15 +4282,29 @@ fn keyboard_enhancement_flags_do_not_force_all_keys_as_escapes() {
 }
 
 #[test]
-fn status_bar_advertises_terminal_toggle_shortcut() {
-    let src = include_str!("mod.rs");
+fn status_bar_shows_document_facts_not_a_keyboard_cheat_sheet() {
+    // The redesigned bar drops the `^q Quit / ^j Term / …` cheat-sheet for a
+    // VS Code-style right cluster of document facts.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.path = Some(std::path::PathBuf::from("x.rs"));
+    app.editor.set_language(Some(crate::highlight::LangKind::Rust));
+    let backend = ratatui::backend::TestBackend::new(140, 50);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let buf = term.backend().buffer();
+    let last_y = buf.area.height - 1;
+    let row: String = (0..buf.area.width)
+        .map(|x| buf[(x, last_y)].symbol())
+        .collect();
     assert!(
-        src.contains("\"^j\""),
-        "status bar should advertise ^j as the terminal-toggle shortcut"
+        row.contains("Ln 1, Col 1"),
+        "status bar shows cursor position: {row:?}"
     );
+    assert!(row.contains("Rust"), "status bar shows language mode: {row:?}");
     assert!(
-        src.contains("Span::raw(\" Term"),
-        "status bar should label the ^j shortcut 'Term' (matched a `Span::raw(\" Term` prefix so cosmetic trailing-whitespace tweaks do not break the assertion)"
+        !row.contains("Cycle pane") && !row.contains("Quit"),
+        "the keyboard cheat-sheet must be gone: {row:?}"
     );
 }
 
@@ -7517,17 +7531,35 @@ fn editor_cmd_o_opens_line_below_with_indent() {
 }
 
 #[test]
-fn editor_cmd_shift_o_opens_line_above_with_indent() {
+fn editor_cmd_shift_enter_opens_line_above_with_indent() {
+    // Open-line-above moved off Cmd+Shift+O (now Go to Symbol) onto its real
+    // VS Code chord, Cmd+Shift+Enter.
     let mut app = editor_app_with_lines(&["foo", "    bar"]);
     app.editor.cursor_row = 1;
     app.editor.cursor_col = 6;
     app.handle_key(key(
-        KeyCode::Char('O'),
+        KeyCode::Enter,
         KeyModifiers::SUPER | KeyModifiers::SHIFT,
     ))
     .unwrap();
     assert_eq!(app.editor.lines, vec!["foo", "    ", "    bar"]);
     assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (1, 4));
+}
+
+#[test]
+fn editor_cmd_shift_o_opens_go_to_symbol() {
+    let mut app = editor_app_with_lines(&["fn foo() {}", "fn bar() {}"]);
+    app.editor.path = Some(std::path::PathBuf::from("lib.rs"));
+    app.focus_pane(Pane::Editor);
+    app.handle_key(key(
+        KeyCode::Char('O'),
+        KeyModifiers::SUPER | KeyModifiers::SHIFT,
+    ))
+    .unwrap();
+    assert!(
+        app.go_to_symbol.is_some(),
+        "Cmd+Shift+O must open the Go to Symbol picker"
+    );
 }
 
 #[test]
@@ -13404,19 +13436,19 @@ fn clicking_the_profile_caret_opens_an_anchored_shell_menu() {
 }
 
 #[test]
-fn opening_the_profile_menu_arms_the_welcome_image_clear() {
-    // The dropdown draws over the welcome screen, whose croft logo is an
-    // OSC-1337 / Kitty image cached by the terminal. Without arming the clear
-    // the logo ghosts on top of the menu. Opening it must request the welcome
-    // clear so the main loop evicts the cached image.
+fn opening_the_profile_menu_keeps_the_welcome_logo() {
+    // Regression guard for the welcome-logo bug: opening the terminal profile
+    // dropdown must NOT arm the welcome image clear — clearing it blanked the
+    // logo (the reported bug). The menu's own Clear paints over its cells, so
+    // the cached logo stays intact behind/around the dropdown.
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.overlays.welcome.mark_displayed();
     app.open_terminal_profile_picker();
     assert!(app.context_menu.is_some(), "the menu opens");
     assert!(
-        app.consume_welcome_image_clear(),
-        "opening the profile menu must arm the welcome image clear so the logo is evicted",
+        !app.consume_welcome_image_clear(),
+        "opening the profile menu must NOT evict the welcome logo",
     );
 }
 

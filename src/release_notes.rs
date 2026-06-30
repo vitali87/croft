@@ -60,6 +60,6 @@ pub struct ReleaseNote {
 
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
-    kind: NoteKind::Fix,
-    summary: "Signature help now follows the caret and closes when you leave the call (and handles nested calls).",
+    kind: NoteKind::Feature,
+    summary: "Redesigned status bar: Ln/Col, indentation, encoding, EOL, language, and diagnostics — click encoding/EOL/language to change them.",
 }];

@@ -1155,6 +1155,32 @@ impl ExternalReloadReport {
     }
 }
 
+/// The line-ending style of the open buffer, shown in the status bar and
+/// applied when saving. Detected on open (CRLF if any `\r\n` is present);
+/// the user can switch it from the status bar, converting on the next save.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum LineEnding {
+    #[default]
+    Lf,
+    Crlf,
+}
+
+impl LineEnding {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Lf => "LF",
+            Self::Crlf => "CRLF",
+        }
+    }
+
+    pub fn sequence(self) -> &'static str {
+        match self {
+            Self::Lf => "\n",
+            Self::Crlf => "\r\n",
+        }
+    }
+}
+
 /// How a buffer line differs from its committed (HEAD) version, for the git
 /// gutter. The colour carries the meaning, exactly like VS Code's gutter:
 /// green added, blue modified, red where lines were deleted.
@@ -1291,6 +1317,12 @@ pub struct Editor {
     undo_stack: Vec<Snapshot>,
     last_edit_kind: Option<EditKind>,
     lang: Option<LangKind>,
+    /// Line-ending style, detected on open and applied on save. Surfaced in the
+    /// status bar; the user can switch it there.
+    pub eol: LineEnding,
+    /// Text encoding the buffer was decoded from and is re-encoded to on save.
+    /// Defaults to UTF-8; the status bar's "Reopen with Encoding" switches it.
+    pub encoding: &'static encoding_rs::Encoding,
     /// Per-tab override for soft-wrap (VS Code "View: Toggle Word Wrap",
     /// Alt+Z). `None` means follow the language default (`wrap_enabled`
     /// wraps Markdown only); `Some(true)`/`Some(false)` force it on/off for
@@ -1422,6 +1454,8 @@ impl Editor {
             undo_stack: Vec::new(),
             last_edit_kind: None,
             lang: None,
+            eol: LineEnding::Lf,
+            encoding: encoding_rs::UTF_8,
             wrap_override: None,
             highlights: Vec::new(),
             semantic_overlay: Vec::new(),
@@ -1823,7 +1857,21 @@ impl Editor {
         if is_binary(&bytes) {
             anyhow::bail!("Binary file");
         }
-        let text = String::from_utf8_lossy(&bytes).into_owned();
+        // Decode with the file's BOM-declared encoding if it has one, else
+        // UTF-8. A later "Reopen with Encoding" overrides this.
+        let enc = encoding_rs::Encoding::for_bom(&bytes)
+            .map(|(e, _)| e)
+            .unwrap_or(encoding_rs::UTF_8);
+        self.encoding = enc;
+        let text = enc.decode(&bytes).0.into_owned();
+        // Detect the file's line-ending style before normalisation so a save
+        // preserves it (and the status bar reports it). A single `\r\n` marks
+        // the file CRLF, matching VS Code's "files.eol auto" heuristic.
+        self.eol = if text.contains("\r\n") {
+            LineEnding::Crlf
+        } else {
+            LineEnding::Lf
+        };
         self.lines = split_into_lines(&text);
         if self.lines.is_empty() {
             self.lines.push(String::new());
@@ -2239,6 +2287,60 @@ impl Editor {
     pub fn indent_preference(&self) -> (u32, bool) {
         let width = indent_unit_for(self.lang).chars().count() as u32;
         (width, true)
+    }
+
+    /// Human label for the buffer's language mode, for the status bar.
+    pub fn language_label(&self) -> &'static str {
+        language_label(self.lang)
+    }
+
+    /// The active language, for the status-bar "Change Language Mode" picker
+    /// to pre-select the current entry.
+    pub fn language(&self) -> Option<LangKind> {
+        self.lang
+    }
+
+    /// Override the buffer's language mode (status-bar "Change Language Mode").
+    /// Re-runs tree-sitter highlighting under the new grammar; the app re-syncs
+    /// the LSP separately off the changed language.
+    pub fn set_language(&mut self, lang: Option<LangKind>) {
+        self.lang = lang;
+        self.recompute_highlights();
+    }
+
+    /// Re-read the open file and decode it with `enc` (status-bar "Reopen with
+    /// Encoding"). Replaces the buffer, resets the cursor, and re-highlights;
+    /// subsequent saves re-encode with `enc`. No-op without a backing file.
+    pub fn reopen_with_encoding(&mut self, enc: &'static encoding_rs::Encoding) -> Result<()> {
+        let path = self
+            .path
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("No file open"))?;
+        let bytes = std::fs::read(&path)?;
+        let text = enc.decode(&bytes).0.into_owned();
+        self.encoding = enc;
+        self.eol = if text.contains("\r\n") {
+            LineEnding::Crlf
+        } else {
+            LineEnding::Lf
+        };
+        self.lines = split_into_lines(&text);
+        if self.lines.is_empty() {
+            self.lines.push(String::new());
+        }
+        self.hscroll_content_cols = None;
+        self.wrap_total_cache.clear();
+        self.scroll = 0;
+        self.scroll_sub = 0;
+        self.cursor_row = 0;
+        self.cursor_col = 0;
+        self.selection = None;
+        // The buffer now matches disk decoded as `enc`, so it is clean; bump the
+        // edit seq so the LSP/outline/highlight resync sees the new content.
+        self.dirty = false;
+        self.edit_seq = self.edit_seq.wrapping_add(1);
+        self.recompute_highlights();
+        Ok(())
     }
 
     /// Clamp the cursor back inside the buffer after an edit that may have
@@ -2899,8 +3001,11 @@ impl Editor {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("No file open"))?
             .clone();
-        let content = self.lines.join("\n");
-        std::fs::write(&path, content)?;
+        let content = self.lines.join(self.eol.sequence());
+        // Re-encode to the buffer's encoding (UTF-8 is identity). Unmappable
+        // characters are replaced per encoding_rs, matching VS Code.
+        let (encoded, _, _) = self.encoding.encode(&content);
+        std::fs::write(&path, encoded)?;
         self.dirty = false;
         self.status = format!("Saved {}", path.display());
         // The buffer now matches disk, so this is the new sync point and any
@@ -4613,6 +4718,49 @@ fn indent_unit_for(lang: Option<LangKind>) -> &'static str {
         _ => "    ",
     }
 }
+
+/// Display name for a language mode, matching VS Code's status-bar labels.
+/// `None` is a buffer with no recognised grammar.
+pub fn language_label(lang: Option<LangKind>) -> &'static str {
+    match lang {
+        None => "Plain Text",
+        Some(LangKind::Rust) => "Rust",
+        Some(LangKind::Python) => "Python",
+        Some(LangKind::JavaScript) => "JavaScript",
+        Some(LangKind::TypeScript) => "TypeScript",
+        Some(LangKind::Tsx) => "TypeScript JSX",
+        Some(LangKind::Json) => "JSON",
+        Some(LangKind::Toml) => "TOML",
+        Some(LangKind::Yaml) => "YAML",
+        Some(LangKind::Markdown) => "Markdown",
+        Some(LangKind::Go) => "Go",
+        Some(LangKind::Html) => "HTML",
+        Some(LangKind::Css) => "CSS",
+        Some(LangKind::Bash) => "Shell Script",
+        Some(LangKind::C) => "C",
+        Some(LangKind::Cpp) => "C++",
+    }
+}
+
+/// Every selectable language mode, in the order the status-bar picker lists
+/// them. `None` (Plain Text) is offered separately by the picker.
+pub const SELECTABLE_LANGUAGES: &[LangKind] = &[
+    LangKind::Rust,
+    LangKind::Python,
+    LangKind::JavaScript,
+    LangKind::TypeScript,
+    LangKind::Tsx,
+    LangKind::Json,
+    LangKind::Toml,
+    LangKind::Yaml,
+    LangKind::Markdown,
+    LangKind::Go,
+    LangKind::Html,
+    LangKind::Css,
+    LangKind::Bash,
+    LangKind::C,
+    LangKind::Cpp,
+];
 
 /// Number of leading whitespace bytes to strip for one outdent step, matching
 /// VS Code's tab-stop-aligned `unshiftIndent`. A leading tab counts as one
@@ -8502,6 +8650,58 @@ mod tests {
         assert_eq!(e.cursor_row, 0);
         assert_eq!(e.cursor_col, 0);
         assert!(!e.dirty);
+    }
+
+    #[test]
+    fn open_detects_crlf_and_save_preserves_it() {
+        use std::io::Read;
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(b"alpha\r\nbeta\r\n").unwrap();
+        let mut e = Editor::new();
+        e.open(tmp.path()).unwrap();
+        assert_eq!(e.eol, LineEnding::Crlf, "CRLF file detected");
+        assert_eq!(e.lines, vec!["alpha".to_string(), "beta".to_string()]);
+        e.save_to_disk().unwrap();
+        let mut raw = Vec::new();
+        std::fs::File::open(tmp.path())
+            .unwrap()
+            .read_to_end(&mut raw)
+            .unwrap();
+        assert_eq!(raw, b"alpha\r\nbeta", "save re-applies CRLF, no trailing EOL");
+    }
+
+    #[test]
+    fn open_defaults_to_lf_for_unix_files() {
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(b"a\nb\n").unwrap();
+        let mut e = Editor::new();
+        e.open(tmp.path()).unwrap();
+        assert_eq!(e.eol, LineEnding::Lf);
+    }
+
+    #[test]
+    fn reopen_with_encoding_decodes_windows_1252() {
+        use std::io::Write as _;
+        // 0xE9 is 'é' in Windows-1252 but invalid UTF-8 (renders as the
+        // replacement char when first opened as UTF-8).
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(&[b'c', b'a', b'f', 0xE9]).unwrap();
+        tmp.flush().unwrap();
+        let mut e = Editor::new();
+        e.open(tmp.path()).unwrap();
+        assert_ne!(e.lines[0], "café", "UTF-8 decode mangles the 0xE9 byte");
+        e.reopen_with_encoding(encoding_rs::WINDOWS_1252).unwrap();
+        assert_eq!(e.lines[0], "café", "Windows-1252 decodes 0xE9 as é");
+        assert_eq!(e.encoding, encoding_rs::WINDOWS_1252);
+    }
+
+    #[test]
+    fn set_language_updates_the_label() {
+        let mut e = editor_with("x = 1");
+        e.set_language(Some(crate::highlight::LangKind::Python));
+        assert_eq!(e.language_label(), "Python");
+        e.set_language(None);
+        assert_eq!(e.language_label(), "Plain Text");
     }
 
     #[test]

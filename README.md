@@ -26,6 +26,8 @@ A **Customize Layout** popup (the `⛶` icon at the top-right of the editor, or 
 
 The editor brings tree-sitter highlighting, inline previews for images / PDFs / spreadsheets, side-by-side splits, a minimap (a rasterized file preview in a right-edge strip; click or drag to jump, right-click to toggle or re-side it), a git gutter (thin coloured bars marking lines added, modified, or deleted against HEAD), an optional vim mode, and full LSP (completion, signature help / parameter hints, hover, go-to-definition, rename, formatting, quick fixes / code actions, diagnostics). A Command Palette (`Cmd`/`Ctrl`+`Shift`+`P`) runs every command, Go to Symbol (`Cmd`/`Ctrl`+`Shift`+`O`) fuzzy-jumps within a file (or to a line with a `:` prefix), and you can debug Python, JavaScript/TypeScript, Rust, C, and C++ with breakpoints over DAP or attach a `pdb` REPL to a live process.
 
+The status bar mirrors VS Code's: branch and ahead/behind, error/warning counts (click to open Problems) and the active language server on the left; cursor position, indentation, encoding, line ending, and language mode on the right. Click the encoding, line ending, or language segment to change it (reopen with a different encoding, switch LF/CRLF, or override the language mode).
+
 See **[LAYOUT.md](docs/LAYOUT.md)** for the full pane-by-pane reference, debugging workflow, and language-server setup.
 
 ## Requirements

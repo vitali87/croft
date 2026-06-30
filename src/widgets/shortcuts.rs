@@ -82,6 +82,16 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 handler: "is_command_palette_key",
             },
             ShortcutEntry {
+                keys: "Cmd/Ctrl+Shift+O",
+                description: "Go to Symbol in Editor: fuzzy-jump to a symbol (or `:` then a line number)",
+                handler: "is_go_to_symbol_key",
+            },
+            ShortcutEntry {
+                keys: "Opt+Cmd/Ctrl+M",
+                description: "Toggle the editor minimap",
+                handler: "is_minimap_toggle_key",
+            },
+            ShortcutEntry {
                 keys: "Cmd/Ctrl+K",
                 description: "Chord leader: press, then a follow-up key for extra accelerators",
                 handler: "is_cmd_k_leader_key",

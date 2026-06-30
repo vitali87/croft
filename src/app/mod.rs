@@ -1004,6 +1004,12 @@ enum MenuAction {
     ToggleMinimap,
     /// Minimap right-click menu: move the strip to the given editor edge.
     SetMinimapSide(MinimapSide),
+    /// Status-bar language picker: set the active buffer's language mode.
+    SetLanguage(Option<crate::highlight::LangKind>),
+    /// Status-bar EOL picker: switch the buffer's line-ending style.
+    SetLineEnding(crate::widgets::editor::LineEnding),
+    /// Status-bar encoding picker: reopen the file decoded with this encoding.
+    SetEncoding(&'static encoding_rs::Encoding),
 }
 
 /// Return the macOS-style keyboard shortcut hint to display on the right
@@ -2158,6 +2164,13 @@ pub struct App {
     vim_visual_line: bool,
     shortcuts_modal: Option<crate::widgets::shortcuts::ShortcutsModal>,
     shortcuts_hit_rect: Option<Rect>,
+    /// Status-bar clickable-segment hit rects, recorded each render. Empty when
+    /// the bar is hidden or the segment doesn't fit. Diagnostics → PROBLEMS;
+    /// encoding / EOL / language → their respective "change" pickers.
+    status_diag_rect: Rect,
+    status_encoding_rect: Rect,
+    status_eol_rect: Rect,
+    status_language_rect: Rect,
     connect_dialog: Option<crate::widgets::connect_dialog::ConnectDialog>,
     connect_auth: Option<crate::remote_connect::SshAuth>,
     install_session: Option<crate::install_session::InstallSession>,
@@ -2916,6 +2929,10 @@ impl App {
             vim_visual_line: false,
             shortcuts_modal: None,
             shortcuts_hit_rect: None,
+            status_diag_rect: Rect::default(),
+            status_encoding_rect: Rect::default(),
+            status_eol_rect: Rect::default(),
+            status_language_rect: Rect::default(),
             connect_dialog: None,
             connect_auth: None,
             install_session: None,
@@ -8633,23 +8650,28 @@ impl App {
             ));
             spans.push(Span::raw("  "));
         }
-        spans.push(Span::raw(&self.status));
-        spans.push(Span::raw("  "));
-        spans.push(Span::styled("^q", Style::default().fg(Color::Yellow)));
-        spans.push(Span::raw(" Quit  "));
-        spans.push(Span::styled("^s", Style::default().fg(Color::Yellow)));
-        spans.push(Span::raw(" Save  "));
-        spans.push(Span::styled("F6", Style::default().fg(Color::Yellow)));
-        spans.push(Span::raw(" Cycle pane  "));
-        spans.push(Span::styled("^b", Style::default().fg(Color::Yellow)));
-        spans.push(Span::raw(" Tree  "));
-        spans.push(Span::styled("^j", Style::default().fg(Color::Yellow)));
-        spans.push(Span::raw(" Term  "));
-        let shortcuts_label_start_col: u16 =
-            spans.iter().map(|s| s.content.chars().count() as u16).sum();
-        spans.push(Span::styled("F1", Style::default().fg(Color::Yellow)));
-        spans.push(Span::raw(" Shortcuts"));
-        let shortcuts_label_len: u16 = "F1 Shortcuts".chars().count() as u16;
+        // Diagnostics counts (click → PROBLEMS), VS Code-style, after git.
+        // Always shown so the bar reads as a health indicator at a glance.
+        let err_count = self.problems.error_count();
+        let warn_count = self.problems.warning_count();
+        let diag_start_col: u16 = spans.iter().map(|s| s.content.chars().count() as u16).sum();
+        let diag_text = format!(" \u{ea87} {err_count}  \u{ea6c} {warn_count} ");
+        let diag_len = diag_text.chars().count() as u16;
+        spans.push(Span::styled(
+            format!(" \u{ea87} {err_count} "),
+            Style::default().fg(Color::Rgb(0xf1, 0x4c, 0x4c)),
+        ));
+        spans.push(Span::styled(
+            format!(" \u{ea6c} {warn_count} "),
+            Style::default().fg(Color::Rgb(0xcc, 0xa7, 0x00)),
+        ));
+        // Transient status message (e.g. "Saved editor.rs"), no keybinding
+        // cheat-sheet — those live in F1 / the Command Palette now.
+        if !self.status.is_empty() {
+            spans.push(Span::raw("  "));
+            spans.push(Span::raw(self.status.clone()));
+        }
+
         if let Some(osk) = self.osk.as_mut() {
             if osk_h > 0 {
                 crate::widgets::osk::render_osk(osk, outer[1], frame.buffer_mut(), self.theme);
@@ -8661,18 +8683,44 @@ impl App {
         }
 
         let status_rect = outer[2];
-        let hit_x = status_rect.x.saturating_add(shortcuts_label_start_col);
-        let hit_end = hit_x
-            .saturating_add(shortcuts_label_len)
-            .min(status_rect.right());
-        // A hidden status bar (Customize Layout / Zen) has zero height: no
-        // clickable "F1 Shortcuts" target.
-        self.shortcuts_hit_rect = (status_h > 0 && hit_end > hit_x).then(|| Rect {
-            x: hit_x,
-            y: status_rect.y,
-            width: hit_end - hit_x,
-            height: 1,
-        });
+        // The F1 cheat-sheet is gone; F1 / the palette still open Shortcuts.
+        self.shortcuts_hit_rect = None;
+        // Diagnostics hit rect (left group), for click-to-PROBLEMS.
+        self.status_diag_rect = if status_h > 0 {
+            Rect {
+                x: status_rect.x.saturating_add(diag_start_col),
+                y: status_rect.y,
+                width: diag_len.min(status_rect.width.saturating_sub(diag_start_col)),
+                height: 1,
+            }
+        } else {
+            Rect::default()
+        };
+
+        // ---- Right cluster: document facts, right-justified. Encoding / EOL /
+        // language are clickable to change (hit rects recorded below). ----
+        let (tab_w, _spaces) = self.editor.indent_preference();
+        let dim = Style::default().fg(Color::Rgb(0x9a, 0xa4, 0xb8));
+        let right: Vec<Span> = vec![
+            Span::styled(
+                format!(
+                    " Ln {}, Col {} ",
+                    self.editor.cursor_row + 1,
+                    self.editor.cursor_col + 1
+                ),
+                dim,
+            ),
+            Span::styled(format!(" Spaces: {tab_w} "), dim),
+            Span::styled(format!(" {} ", self.editor.encoding.name()), dim),
+            Span::styled(format!(" {} ", self.editor.eol.label()), dim),
+            Span::styled(format!(" {} ", self.editor.language_label()), dim),
+        ];
+        let widths: Vec<u16> = right
+            .iter()
+            .map(|s| s.content.chars().count() as u16)
+            .collect();
+        let right_total: u16 = widths.iter().sum();
+
         // Black theme: drop the navy status strip to a near-black seam (a hair
         // lighter than the #000000 editor so the bar still reads as distinct),
         // matching VS Code's OLED themes. Croft Dark keeps the navy band.
@@ -8681,8 +8729,45 @@ impl App {
         } else {
             Color::Rgb(0x1e, 0x3a, 0x6e)
         };
-        let status = Paragraph::new(Line::from(spans)).style(Style::default().bg(status_bg));
-        frame.render_widget(status, outer[2]);
+        // Left fills the whole bar (background + left text); the right cluster
+        // overwrites the right portion.
+        frame.render_widget(
+            Paragraph::new(Line::from(spans)).style(Style::default().bg(status_bg)),
+            status_rect,
+        );
+        // Reset clickable rects; re-record only when the right cluster fits.
+        self.status_encoding_rect = Rect::default();
+        self.status_eol_rect = Rect::default();
+        self.status_language_rect = Rect::default();
+        if status_h > 0 && right_total > 0 && right_total <= status_rect.width {
+            let rx = status_rect.right() - right_total;
+            frame.render_widget(
+                Paragraph::new(Line::from(right)).style(Style::default().bg(status_bg)),
+                Rect {
+                    x: rx,
+                    y: status_rect.y,
+                    width: right_total,
+                    height: status_rect.height,
+                },
+            );
+            // Record hit rects: indices 2=encoding, 3=EOL, 4=language.
+            let mut cx = rx;
+            for (i, w) in widths.iter().enumerate() {
+                let r = Rect {
+                    x: cx,
+                    y: status_rect.y,
+                    width: *w,
+                    height: 1,
+                };
+                match i {
+                    2 => self.status_encoding_rect = r,
+                    3 => self.status_eol_rect = r,
+                    4 => self.status_language_rect = r,
+                    _ => {}
+                }
+                cx = cx.saturating_add(*w);
+            }
+        }
 
         // Overlays render last so they sit on top of everything else. The port
         // toast goes first so modals/menus paint above it.
@@ -17695,6 +17780,32 @@ impl App {
             self.open_shortcuts_modal();
             return;
         }
+        // Clickable status-bar segments: encoding / EOL / language open a
+        // "change" picker; the diagnostics counts jump to the PROBLEMS panel.
+        if matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
+            if rect_contains(self.status_language_rect, m.column, m.row) {
+                self.open_status_language_menu(
+                    self.status_language_rect.x,
+                    self.status_language_rect.y,
+                );
+                return;
+            }
+            if rect_contains(self.status_eol_rect, m.column, m.row) {
+                self.open_status_eol_menu(self.status_eol_rect.x, self.status_eol_rect.y);
+                return;
+            }
+            if rect_contains(self.status_encoding_rect, m.column, m.row) {
+                self.open_status_encoding_menu(
+                    self.status_encoding_rect.x,
+                    self.status_encoding_rect.y,
+                );
+                return;
+            }
+            if rect_contains(self.status_diag_rect, m.column, m.row) {
+                self.set_bottom_panel_tab(BottomPanelTab::Problems);
+                return;
+            }
+        }
         // Layout-control icons (Toggle Side Bar / Panel / Customize Layout) at
         // the top-right of the editor tab strip / welcome screen. Checked
         // before the panes so a click on an icon never falls through to the
@@ -19891,6 +20002,23 @@ impl App {
                 // doesn't ghost, and force a rebake at the new position.
                 self.disable_minimap_image();
             }
+            MenuAction::SetLanguage(lang) => {
+                self.editor.set_language(lang);
+                self.status = format!("Language Mode: {}", self.editor.language_label());
+            }
+            MenuAction::SetLineEnding(eol) => {
+                if self.editor.eol != eol {
+                    self.editor.eol = eol;
+                    // The content is unchanged but the on-disk bytes will differ:
+                    // mark dirty so the user saves to apply the new EOL.
+                    self.editor.dirty = true;
+                }
+                self.status = format!("End of Line: {}", eol.label());
+            }
+            MenuAction::SetEncoding(enc) => match self.editor.reopen_with_encoding(enc) {
+                Ok(()) => self.status = format!("Reopened with {}", enc.name()),
+                Err(e) => self.status = format!("Reopen failed: {e}"),
+            },
         }
     }
 
@@ -20369,6 +20497,92 @@ impl App {
 
     /// Right-click on the minimap strip: a compact menu mirroring VS Code's
     /// (Minimap toggle + Side submenu).
+    /// Build a status-bar popup menu at `(col, row)`. `menu_rect` clamps it up
+    /// to fit, so opening at the bottom status row renders above the bar.
+    fn open_status_menu(&mut self, col: u16, row: u16, items: Vec<MenuEntry>) {
+        self.context_menu = Some(ContextMenu {
+            origin: (col, row),
+            items,
+            selected: 0,
+            open_submenu: None,
+            submenu_selected: 0,
+            target_dir: self.tree.root.clone(),
+        });
+    }
+
+    /// Status-bar "Change Language Mode" picker. Editor-level only: it re-runs
+    /// tree-sitter highlighting / indentation / comment rules under the chosen
+    /// grammar. The LSP stays routed by file extension.
+    fn open_status_language_menu(&mut self, col: u16, row: u16) {
+        let check = |on: bool| if on { "\u{2713} " } else { "  " };
+        let current = self.editor.language();
+        let mut items = vec![MenuEntry::Item {
+            label: format!("{}Plain Text", check(current.is_none())),
+            action: MenuAction::SetLanguage(None),
+        }];
+        for &lang in crate::widgets::editor::SELECTABLE_LANGUAGES {
+            items.push(MenuEntry::Item {
+                label: format!(
+                    "{}{}",
+                    check(current == Some(lang)),
+                    crate::widgets::editor::language_label(Some(lang))
+                ),
+                action: MenuAction::SetLanguage(Some(lang)),
+            });
+        }
+        self.open_status_menu(col, row, items);
+    }
+
+    /// Status-bar EOL picker (LF / CRLF). Converts on the next save.
+    fn open_status_eol_menu(&mut self, col: u16, row: u16) {
+        use crate::widgets::editor::LineEnding;
+        let check = |on: bool| if on { "\u{2713} " } else { "  " };
+        let cur = self.editor.eol;
+        let items = vec![
+            MenuEntry::Item {
+                label: format!("{}LF", check(cur == LineEnding::Lf)),
+                action: MenuAction::SetLineEnding(LineEnding::Lf),
+            },
+            MenuEntry::Item {
+                label: format!("{}CRLF", check(cur == LineEnding::Crlf)),
+                action: MenuAction::SetLineEnding(LineEnding::Crlf),
+            },
+        ];
+        self.open_status_menu(col, row, items);
+    }
+
+    /// Status-bar "Reopen with Encoding" picker over a common set; selecting one
+    /// re-decodes the file (and re-encodes it on the next save).
+    fn open_status_encoding_menu(&mut self, col: u16, row: u16) {
+        use encoding_rs::{
+            BIG5, EUC_JP, EUC_KR, GBK, KOI8_R, SHIFT_JIS, UTF_8, UTF_16BE, UTF_16LE, WINDOWS_1251,
+            WINDOWS_1252,
+        };
+        let check = |on: bool| if on { "\u{2713} " } else { "  " };
+        let cur = self.editor.encoding;
+        let encs: [&'static encoding_rs::Encoding; 11] = [
+            UTF_8,
+            UTF_16LE,
+            UTF_16BE,
+            WINDOWS_1252,
+            WINDOWS_1251,
+            SHIFT_JIS,
+            EUC_JP,
+            GBK,
+            BIG5,
+            EUC_KR,
+            KOI8_R,
+        ];
+        let items = encs
+            .iter()
+            .map(|&enc| MenuEntry::Item {
+                label: format!("{}{}", check(std::ptr::eq(enc, cur)), enc.name()),
+                action: MenuAction::SetEncoding(enc),
+            })
+            .collect();
+        self.open_status_menu(col, row, items);
+    }
+
     fn open_minimap_menu(&mut self, col: u16, row: u16) {
         let check = |on: bool| if on { "\u{2713} " } else { "  " };
         let items = vec![
