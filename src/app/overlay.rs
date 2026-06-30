@@ -193,6 +193,10 @@ impl CellOverlay {
         self.image = Some(image);
     }
 
+    pub fn clear_image(&mut self) {
+        self.image = None;
+    }
+
     pub fn image(&self) -> Option<&str> {
         self.image.as_deref()
     }
@@ -331,5 +335,6 @@ pub struct OverlayManager {
     pub hero: ImageOverlay<super::WelcomeLayout>,
     pub ssh: ImageOverlay<()>,
     pub run_debug: CellOverlay,
+    pub problems_badge: CellOverlay,
     pub activity: ActivityOverlay,
 }

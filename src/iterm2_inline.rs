@@ -239,11 +239,7 @@ fn finish_icon(
 /// change count. One- and two-digit counts use a square-ish 2-cell pill (a
 /// circle on the typical ~1:2 cell); the "99+" overflow needs three.
 pub fn count_badge_cells_w(count: usize) -> u16 {
-    if count > 99 {
-        3
-    } else {
-        2
-    }
+    if count > 99 { 3 } else { 2 }
 }
 
 /// 3×5 pixel-font rows for the digits and '+', one byte per row with bit 2 = the
@@ -302,7 +298,12 @@ pub fn compose_count_badge(
     // Count digits, white, nearest-neighbour scaled and centred over the pill.
     let glyphs: Vec<&[u8; 5]> = label
         .chars()
-        .filter_map(|c| BADGE_GLYPHS.iter().find(|(g, _)| *g == c).map(|(_, rows)| rows))
+        .filter_map(|c| {
+            BADGE_GLYPHS
+                .iter()
+                .find(|(g, _)| *g == c)
+                .map(|(_, rows)| rows)
+        })
         .collect();
     let n = glyphs.len() as u32;
     if n > 0 {
@@ -913,6 +914,8 @@ pub const KITTY_ID_REMOTE_BADGE: u32 = KITTY_ID_BASE + 21;
 /// Testing activity icon (beaker), and its failing-test count badge at z=1.
 pub const KITTY_ID_TESTING: u32 = KITTY_ID_BASE + 22;
 pub const KITTY_ID_TESTING_BADGE: u32 = KITTY_ID_BASE + 23;
+/// PROBLEMS panel-tab count badge: an orange circle emitted after the label.
+pub const KITTY_ID_PROBLEMS_BADGE: u32 = KITTY_ID_BASE + 24;
 
 /// Apply tmux DCS passthrough wrapping to an inline-image escape when needed.
 /// Sixel passes through tmux natively (tmux built with sixel support renders it
@@ -965,7 +968,10 @@ mod tests {
         // 1 digit -> 2 cells wide, 1 cell tall.
         assert_eq!((img.width(), img.height()), (18, 18));
         let has = |p: Rgba<u8>| img.pixels().any(|q| *q == p);
-        assert!(has(Rgba([accent.0, accent.1, accent.2, 0xff])), "accent pill");
+        assert!(
+            has(Rgba([accent.0, accent.1, accent.2, 0xff])),
+            "accent pill"
+        );
         assert!(has(Rgba([0xff, 0xff, 0xff, 0xff])), "white digit");
     }
 

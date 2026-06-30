@@ -60,6 +60,6 @@ pub struct ReleaseNote {
 
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
-    kind: NoteKind::Feature,
-    summary: "Testing view now discovers tests on open (cargo test --list) so the suite tree populates before you run; press r to refresh.",
+    kind: NoteKind::Fix,
+    summary: "The PROBLEMS tab count is back to a round orange circle, the same raster badge as the activity-bar counts, instead of a rectangular pill.",
 }];

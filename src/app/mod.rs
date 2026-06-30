@@ -1909,6 +1909,14 @@ pub struct App {
     testing_badge: Option<String>,
     /// Failing-test count the cached `testing_badge` was built for.
     testing_badge_count: usize,
+    /// Problem count the cached `overlays.problems_badge` circle was built for;
+    /// gates the per-frame rebuild in `refresh_problems_badge`.
+    problems_badge_count: usize,
+    /// Anchor cell (top-left) where the PROBLEMS-tab circle badge should be
+    /// emitted this frame, recorded by `paint_panel_tabs` in images mode. `None`
+    /// when the panel strip isn't drawn or the count is zero; the post-frame
+    /// `flush_problems_badge_overlay` clears the image when it's `None`.
+    problems_badge_cell: Option<(u16, u16)>,
     /// Which inline-image protocol the host terminal speaks, resolved once at
     /// startup (env-fixed). Drives the [`crate::iterm2_inline::build_inline_image`]
     /// dispatch (iTerm2 OSC-1337 vs Kitty graphics) and the Kitty-only
@@ -2917,6 +2925,8 @@ impl App {
             remote_ports_count: 0,
             testing_badge: None,
             testing_badge_count: 0,
+            problems_badge_count: 0,
+            problems_badge_cell: None,
             inline_protocol: crate::iterm2_inline::detect_inline_image_protocol(),
             sixel_supported: false,
             minimap_visible: true,
@@ -3312,6 +3322,8 @@ impl App {
         self.refresh_remote_ports_badge();
         self.testing_badge_count = usize::MAX;
         self.refresh_testing_badge();
+        self.problems_badge_count = usize::MAX;
+        self.refresh_problems_badge();
         // Run-and-Debug headline icon: the same debug-alt PNG used in the
         // activity bar, fitted to the panel's icon block (RUN_DEBUG_ICON_CELLS_W
         // cells wide × RUN_DEBUG_ICON_CELLS_H cells tall) and tinted at icon-
@@ -3466,6 +3478,67 @@ impl App {
         self.overlays.run_debug.mark_emitted_at((cx, cy));
     }
 
+    /// Arm the one-shot `terminal.clear()` latch if the PROBLEMS circle was
+    /// emitted, so its cached image cells are evicted when the badge goes away
+    /// (text painted over an inline image does not remove it), then reset the
+    /// emit position so the clear fires exactly once.
+    fn clear_problems_badge_if_emitted(&mut self) {
+        if self.overlays.problems_badge.was_emitted() {
+            self.overlays.problems_badge.request_clear();
+        }
+        self.overlays.problems_badge.clear_emitted();
+    }
+
+    /// Emit the PROBLEMS-tab orange circle as an OSC-1337/Kitty inline image at
+    /// the cell `paint_panel_tabs` recorded this frame, re-emitted every frame
+    /// (like the activity-bar badges) so heavy SGR traffic can't evict it.
+    /// Clears when the panel strip is hidden, the count is zero, or a modal owns
+    /// the screen; arms a one-shot clear when the anchor moves so no ghost stacks.
+    pub fn flush_problems_badge_overlay(&mut self) {
+        use std::io::Write;
+        if self.shortcuts_modal.is_some()
+            || self.file_finder.is_some()
+            || self.command_palette.is_some()
+            || self.go_to_symbol.is_some()
+            || self.process_picker.is_some()
+            || self.zoxide_jump.is_some()
+            || self.branch_picker.is_some()
+            || self.input_prompt.is_some()
+            || self.list_picker.is_some()
+        {
+            return;
+        }
+        let Some((cx, cy)) = self.problems_badge_cell.filter(|_| self.show_terminal) else {
+            self.clear_problems_badge_if_emitted();
+            return;
+        };
+        if !self.overlays.problems_badge.has_image() {
+            self.clear_problems_badge_if_emitted();
+            return;
+        }
+        if let Some(prev) = self.overlays.problems_badge.last_emitted()
+            && prev != (cx, cy)
+        {
+            self.overlays.problems_badge.request_clear();
+            self.overlays.problems_badge.clear_emitted();
+            return;
+        }
+        let Some(osc) = self.overlays.problems_badge.image() else {
+            return;
+        };
+        let mut out = stdout();
+        let cursor_on = self.cursor_should_be_visible();
+        let _ = write!(out, "\x1b[?25l\x1b[s");
+        let _ = write!(out, "\x1b[{};{}H", cy + 1, cx + 1);
+        let _ = out.write_all(osc.as_bytes());
+        let _ = write!(out, "\x1b[u");
+        if cursor_on {
+            let _ = write!(out, "\x1b[?25h");
+        }
+        let _ = out.flush();
+        self.overlays.problems_badge.mark_emitted_at((cx, cy));
+    }
+
     /// Re-bake (when needed) and re-emit the OSC-1337 inline image for
     /// the no-repo source-control hero. Pure no-op when the sidebar isn't
     /// on Source Control, the workspace IS a git repo, or the host
@@ -3603,6 +3676,13 @@ impl App {
     /// editor preview image.
     pub fn consume_run_debug_image_clear(&mut self) -> bool {
         self.overlays.run_debug.consume_clear()
+    }
+
+    /// One-shot consumer for the "the PROBLEMS circle went away / moved after it
+    /// was emitted" flag. Folded into the main loop's `terminal.clear()` OR chain
+    /// so iTerm2 evicts the cached badge bitmap.
+    pub fn consume_problems_badge_image_clear(&mut self) -> bool {
+        self.overlays.problems_badge.consume_clear()
     }
 
     /// One-shot consumer for the "a resize may have left stale activity-bar
@@ -4196,12 +4276,11 @@ impl App {
             self.scm_change_badge_count = 0;
             return;
         }
-        self.scm_change_badge =
-            self.build_count_badge_image(
-                count,
-                crate::iterm2_inline::KITTY_ID_SCM_BADGE,
-                self.theme.accent_rgb(),
-            );
+        self.scm_change_badge = self.build_count_badge_image(
+            count,
+            crate::iterm2_inline::KITTY_ID_SCM_BADGE,
+            self.theme.accent_rgb(),
+        );
         self.scm_change_badge_count = count;
         self.overlays.activity.mark_dirty();
     }
@@ -4217,13 +4296,8 @@ impl App {
         color: (u8, u8, u8),
     ) -> Option<String> {
         let (cw, ch) = self.cell_pixel?;
-        let png = crate::iterm2_inline::compose_count_badge(
-            count,
-            cw,
-            ch,
-            color,
-            self.theme_bg_pixel(),
-        )?;
+        let png =
+            crate::iterm2_inline::compose_count_badge(count, cw, ch, color, self.theme_bg_pixel())?;
         let raw = crate::iterm2_inline::build_inline_image_z(
             self.inline_protocol,
             &png,
@@ -4284,12 +4358,11 @@ impl App {
             self.overlays.activity.mark_dirty();
             return;
         }
-        self.explorer_unsaved_badge =
-            self.build_count_badge_image(
-                count,
-                crate::iterm2_inline::KITTY_ID_EXPLORER_BADGE,
-                self.theme.accent_rgb(),
-            );
+        self.explorer_unsaved_badge = self.build_count_badge_image(
+            count,
+            crate::iterm2_inline::KITTY_ID_EXPLORER_BADGE,
+            self.theme.accent_rgb(),
+        );
         self.explorer_unsaved_count = count;
         self.overlays.activity.mark_dirty();
     }
@@ -4316,12 +4389,11 @@ impl App {
             self.overlays.activity.mark_dirty();
             return;
         }
-        self.remote_ports_badge =
-            self.build_count_badge_image(
-                count,
-                crate::iterm2_inline::KITTY_ID_REMOTE_BADGE,
-                self.theme.accent_rgb(),
-            );
+        self.remote_ports_badge = self.build_count_badge_image(
+            count,
+            crate::iterm2_inline::KITTY_ID_REMOTE_BADGE,
+            self.theme.accent_rgb(),
+        );
         self.remote_ports_count = count;
         self.overlays.activity.mark_dirty();
     }
@@ -4355,6 +4427,35 @@ impl App {
         );
         self.testing_badge_count = count;
         self.overlays.activity.mark_dirty();
+    }
+
+    /// Rebuild the cached PROBLEMS-tab circle badge (orange, like the activity
+    /// bar badges) when the count, theme, or cell size shifts. The badge is an
+    /// inline-image circle emitted post-frame by `flush_problems_badge_overlay`;
+    /// glyph-fallback terminals keep the powerline-cap pill in `paint_panel_tabs`.
+    /// Count-gated, so a frame with no churn is a cheap no-op.
+    pub fn refresh_problems_badge(&mut self) {
+        let count = self.problems.total_count();
+        if !self.overlays.activity.has_images() {
+            self.problems_badge_count = count;
+            return;
+        }
+        if count == self.problems_badge_count {
+            return;
+        }
+        self.problems_badge_count = count;
+        if count == 0 {
+            self.overlays.problems_badge.clear_image();
+            self.overlays.problems_badge.request_clear();
+            return;
+        }
+        if let Some(img) = self.build_count_badge_image(
+            count,
+            crate::iterm2_inline::KITTY_ID_PROBLEMS_BADGE,
+            crate::gradient::GRAD_TR,
+        ) {
+            self.overlays.problems_badge.set_image(img);
+        }
     }
 
     /// Push the current search query string and toggle state onto the
@@ -4694,8 +4795,11 @@ impl App {
         };
         let id = lsp.request_signature_help(path, line, character);
         self.signature_help_request_id = Some(id);
-        self.signature_help_anchor =
-            Some((self.editor.cursor_row, self.editor.cursor_col, self.editor.edit_seq));
+        self.signature_help_anchor = Some((
+            self.editor.cursor_row,
+            self.editor.cursor_col,
+            self.editor.edit_seq,
+        ));
     }
 
     /// Dismiss the parameter-hints popup (typing `)`, Esc, or moving away).
@@ -4714,7 +4818,11 @@ impl App {
         if self.signature_help_popup.is_none() {
             return;
         }
-        let now = (self.editor.cursor_row, self.editor.cursor_col, self.editor.edit_seq);
+        let now = (
+            self.editor.cursor_row,
+            self.editor.cursor_col,
+            self.editor.edit_seq,
+        );
         if self.signature_help_anchor == Some(now) {
             return;
         }
@@ -4748,14 +4856,15 @@ impl App {
             let Some((cx, cy)) = self.editor.cursor_screen_pos() else {
                 continue;
             };
-            self.signature_help_popup =
-                Some(crate::widgets::signature_help_popup::SignatureHelpPopup::new(
+            self.signature_help_popup = Some(
+                crate::widgets::signature_help_popup::SignatureHelpPopup::new(
                     result.signatures,
                     result.active_signature,
                     (cx, cy),
                     result.path,
                     result.request_id,
-                ));
+                ),
+            );
             changed = true;
         }
         changed
@@ -7456,6 +7565,7 @@ impl App {
         self.refresh_explorer_unsaved_badge();
         self.refresh_remote_ports_badge();
         self.refresh_testing_badge();
+        self.refresh_problems_badge();
         // In images mode the activity bar inherits the iTerm session bg
         // (forced to sRGB(EDITOR_BG_RGB) via SetColors), matching the rest
         // of the panes. The glyph-fallback path keeps a solid bg for
@@ -8135,9 +8245,14 @@ impl App {
         self.output_tab_rect = Rect::default();
         self.ports_tab_rect = Rect::default();
         self.terminal_tab_rect = Rect::default();
+        // In images mode the count rides as an orange circle (the same raster
+        // badge as the activity bar), emitted post-frame; recompute its anchor
+        // each paint. Glyph-fallback terminals keep the powerline-cap pill.
+        let images = self.overlays.activity.has_images();
+        self.problems_badge_cell = None;
 
         // VS Code panel-group order: PROBLEMS, OUTPUT, TERMINAL, PORTS. PROBLEMS
-        // alone carries the orange count pill after its label.
+        // alone carries the orange count badge after its label.
         let tabs = [
             (BottomPanelTab::Problems, " PROBLEMS "),
             (BottomPanelTab::Output, " OUTPUT "),
@@ -8154,7 +8269,11 @@ impl App {
                 break;
             }
             let badge_w = if tab == BottomPanelTab::Problems && count > 0 {
-                format!("{count}").chars().count() as u16 + 2
+                if images {
+                    crate::iterm2_inline::count_badge_cells_w(count)
+                } else {
+                    format!("{count}").chars().count() as u16 + 2
+                }
             } else {
                 0
             };
@@ -8199,30 +8318,39 @@ impl App {
                     style,
                 );
             }
-            // Orange count pill (rounded caps over the strip bg) after PROBLEMS.
+            // Orange count badge after PROBLEMS. In images mode it's a raster
+            // circle (matching the activity-bar badges) emitted post-frame, so
+            // the cells stay blank strip_bg and we just record the anchor.
+            // Otherwise the powerline-cap pill is drawn as text.
             if *badge_w > 0 {
-                let badge_text = format!("{count}");
                 let bx = rect.x + label.chars().count() as u16;
-                let cap_style = Style::default().fg(orange).bg(strip_bg);
-                if bx < right {
-                    buf.set_string(bx, rect.y, "\u{e0b6}", cap_style);
-                }
-                let inner_start = bx + 1;
-                if inner_start < right {
-                    buf.set_stringn(
-                        inner_start,
-                        rect.y,
-                        &badge_text,
-                        right.saturating_sub(inner_start) as usize,
-                        Style::default()
-                            .fg(badge_fg)
-                            .bg(orange)
-                            .add_modifier(Modifier::BOLD),
-                    );
-                }
-                let cap_r = inner_start + badge_text.chars().count() as u16;
-                if cap_r < right {
-                    buf.set_string(cap_r, rect.y, "\u{e0b4}", cap_style);
+                if images {
+                    if bx < right {
+                        self.problems_badge_cell = Some((bx, rect.y));
+                    }
+                } else {
+                    let badge_text = format!("{count}");
+                    let cap_style = Style::default().fg(orange).bg(strip_bg);
+                    if bx < right {
+                        buf.set_string(bx, rect.y, "\u{e0b6}", cap_style);
+                    }
+                    let inner_start = bx + 1;
+                    if inner_start < right {
+                        buf.set_stringn(
+                            inner_start,
+                            rect.y,
+                            &badge_text,
+                            right.saturating_sub(inner_start) as usize,
+                            Style::default()
+                                .fg(badge_fg)
+                                .bg(orange)
+                                .add_modifier(Modifier::BOLD),
+                        );
+                    }
+                    let cap_r = inner_start + badge_text.chars().count() as u16;
+                    if cap_r < right {
+                        buf.set_string(cap_r, rect.y, "\u{e0b4}", cap_style);
+                    }
                 }
             }
             // The active-tab underline (VS Code's indicator) hugs the word only,
@@ -16606,7 +16734,9 @@ impl App {
         };
         let symbols = self.outline.symbols().to_vec();
         let count = symbols.len();
-        self.go_to_symbol = Some(crate::widgets::symbol_picker::SymbolPicker::new(path, symbols));
+        self.go_to_symbol = Some(crate::widgets::symbol_picker::SymbolPicker::new(
+            path, symbols,
+        ));
         self.overlays.command_palette_clear.request();
         self.status = format!("Go to Symbol: {count} symbols — Esc to close");
     }
@@ -24789,6 +24919,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             if app.consume_welcome_image_clear()
                 || app.consume_editor_image_clear()
                 || app.consume_run_debug_image_clear()
+                || app.consume_problems_badge_image_clear()
                 || app.consume_no_repo_hero_image_clear()
                 || app.consume_shortcuts_image_clear()
                 || app.consume_file_finder_image_clear()
@@ -24827,6 +24958,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             if app.consume_welcome_image_clear()
                 || app.consume_editor_image_clear()
                 || app.consume_run_debug_image_clear()
+                || app.consume_problems_badge_image_clear()
                 || app.consume_no_repo_hero_image_clear()
                 || app.consume_shortcuts_image_clear()
                 || app.consume_file_finder_image_clear()
@@ -24906,6 +25038,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             // already armed `terminal.clear()`, evicting the cached
             // image cells before the next sidebar paints.
             app.flush_run_debug_icon_overlay();
+            app.flush_problems_badge_overlay();
             app.flush_no_repo_hero_overlay();
             app.flush_ssh_empty_state_overlay();
             // Welcome-screen logo: same OSC-1337 trick, gated by its own
