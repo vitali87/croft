@@ -1636,7 +1636,10 @@ impl WorkerState {
         let path_clone = path.clone();
         log_file::log(&format!(
             "signatureHelp request id={request_id} servers={:?} line={line} char={character}",
-            candidates.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>()
+            candidates
+                .iter()
+                .map(|(n, _)| n.as_str())
+                .collect::<Vec<_>>()
         ));
         tokio::spawn(async move {
             let mut signatures = Vec::new();
@@ -2851,13 +2854,10 @@ fn normalise_signature_help(help: lsp_types::SignatureHelp) -> (Vec<SignatureInf
             let active_param = sig.parameters.as_ref().and_then(|params| {
                 params.get(active_idx).and_then(|p| match &p.label {
                     ParameterLabel::LabelOffsets([s, e]) => Some((*s as usize, *e as usize)),
-                    ParameterLabel::Simple(text) => sig
-                        .label
-                        .find(text.as_str())
-                        .map(|byte| {
-                            let start = sig.label[..byte].chars().count();
-                            (start, start + text.chars().count())
-                        }),
+                    ParameterLabel::Simple(text) => sig.label.find(text.as_str()).map(|byte| {
+                        let start = sig.label[..byte].chars().count();
+                        (start, start + text.chars().count())
+                    }),
                 })
             });
             SignatureInfo {
@@ -2866,8 +2866,8 @@ fn normalise_signature_help(help: lsp_types::SignatureHelp) -> (Vec<SignatureInf
             }
         })
         .collect();
-    let active_signature = (help.active_signature.unwrap_or(0) as usize)
-        .min(signatures.len().saturating_sub(1));
+    let active_signature =
+        (help.active_signature.unwrap_or(0) as usize).min(signatures.len().saturating_sub(1));
     (signatures, active_signature)
 }
 
