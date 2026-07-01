@@ -60,6 +60,6 @@ pub struct ReleaseNote {
 
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
-    kind: NoteKind::Fix,
-    summary: "Killed the FSEvents fan storm for good: opening a parent-of-repos folder (e.g. ~/Documents) no longer pegs cores during builds; the watcher never roots a stream above target/, node_modules/, or .git/.",
+    kind: NoteKind::Feature,
+    summary: "Code folding: collapse any indented block to its header line. Click the ▾/▸ chevron in the gutter, or use Cmd+K Cmd+L (toggle at cursor), Cmd+K Cmd+0 (fold all), Cmd+K Cmd+J (unfold all).",
 }];

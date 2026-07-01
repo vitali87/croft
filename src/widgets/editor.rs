@@ -1304,6 +1304,17 @@ pub struct Editor {
     /// Each entry is a full selection (anchor and head); head is that caret's
     /// cursor. Edits apply to the primary and all of these as one undo step.
     pub carets: Vec<EditorSelection>,
+    /// Currently-collapsed fold headers, as 0-based logical line indexes. A
+    /// header's body (the more-indented lines below it, up to `fold_range`'s
+    /// end) is hidden from the render while its index is in this set. Purely a
+    /// view: the buffer is untouched, so every edit/undo path ignores it.
+    folded: std::collections::BTreeSet<usize>,
+    /// `self.lines.len()` at the moment `folded` was last set. Fold headers are
+    /// line indexes, so an insert/delete anywhere shifts them; when the count
+    /// no longer matches, the render drops every fold rather than hide the
+    /// wrong lines. ponytail: whole-buffer invalidation, not per-fold anchor
+    /// tracking; upgrade to sticky anchors if folds-survive-edits is wanted.
+    fold_epoch_lines: usize,
     /// True when this tab is the single replaceable "preview" slot. Single-
     /// click / plain-Enter opens replace the preview tab's contents in place;
     /// double-click / Ctrl+Enter / typing into the buffer pin the tab
@@ -1449,6 +1460,8 @@ impl Editor {
             last_gutter_width: 0,
             selection: None,
             carets: Vec::new(),
+            folded: std::collections::BTreeSet::new(),
+            fold_epoch_lines: 0,
             preview: false,
             pinned: false,
             undo_stack: Vec::new(),
@@ -1532,14 +1545,39 @@ impl Editor {
         if col < self.last_inner.x || col >= text_x {
             return None;
         }
-        let line = if self.wrap_enabled() {
-            self.last_wrap_rows
-                .get((row - self.last_inner.y) as usize)?
-                .0
+        // `last_wrap_rows` is the row->line map the render built, which already
+        // skips folded-away lines, so it is correct for both wrap and fold.
+        // Before the first paint it is empty; fall back to the linear map, which
+        // is exact then since nothing can be wrapped or folded yet.
+        let vis_row = (row - self.last_inner.y) as usize;
+        let line = if self.last_wrap_rows.is_empty() {
+            self.scroll + vis_row
         } else {
-            self.scroll + (row - self.last_inner.y) as usize
+            self.last_wrap_rows.get(vis_row)?.0
         };
         (line < self.lines.len()).then_some(line)
+    }
+
+    /// If `(col, row)` lands on a fold chevron in the gutter, toggle that fold
+    /// and return `true`. The chevron sits at `inner.x + 1` on a foldable
+    /// header's first visual row (see the render's fold-chevron block).
+    pub fn fold_chevron_at(&mut self, col: u16, row: u16) -> bool {
+        if col != self.last_inner.x + 1 || row < self.last_inner.y {
+            return false;
+        }
+        let Some(&(line, start, _)) = self.last_wrap_rows.get((row - self.last_inner.y) as usize)
+        else {
+            return false;
+        };
+        // The chevron draws only on a header's first visual row.
+        if self.wrap_enabled() && start != 0 {
+            return false;
+        }
+        if self.is_foldable(line) {
+            self.toggle_fold(line);
+            return true;
+        }
+        false
     }
 
     /// 1-based breakpoint lines for `path`, ascending, for a DAP
@@ -2800,6 +2838,102 @@ impl Editor {
         self.selection = None;
         self.mark_buffer_changed();
         true
+    }
+
+    /// Leading-whitespace width of `line`, or `None` for a blank line (a blank
+    /// line belongs to whatever block surrounds it, so it carries no indent of
+    /// its own). Tabs and spaces each count as one column, which is all the
+    /// fold heuristic needs: it only ever compares indents with `>`.
+    fn indent_width(&self, line: usize) -> Option<usize> {
+        let s = self.lines.get(line)?;
+        (!s.trim().is_empty()).then(|| s.chars().take_while(|c| *c == ' ' || *c == '\t').count())
+    }
+
+    /// The foldable region headed by `line`, as `(line, last_line_inclusive)`,
+    /// or `None` when nothing below `line` is more indented. Interior blank
+    /// lines are absorbed; trailing blanks and the first line back at (or
+    /// below) the header's indent are not. This is VS Code's default
+    /// indentation-based folding: a pure function of the text, no LSP or
+    /// tree-sitter round-trip.
+    pub fn fold_range(&self, line: usize) -> Option<(usize, usize)> {
+        let base = self.indent_width(line)?;
+        let mut end = line;
+        let mut i = line + 1;
+        while i < self.lines.len() {
+            match self.indent_width(i) {
+                None => {} // blank: possibly interior, keep scanning
+                Some(w) if w > base => end = i,
+                Some(_) => break, // back to base indent or shallower
+            }
+            i += 1;
+        }
+        (end > line).then_some((line, end))
+    }
+
+    /// Whether `line` heads a collapsible region.
+    pub fn is_foldable(&self, line: usize) -> bool {
+        self.fold_range(line).is_some()
+    }
+
+    /// The nearest foldable header at or above `line` whose region contains
+    /// `line`, so "fold at cursor" collapses the enclosing block when the
+    /// cursor sits in a body line rather than on the header itself.
+    fn enclosing_fold_header(&self, line: usize) -> Option<usize> {
+        if self.is_foldable(line) {
+            return Some(line);
+        }
+        (0..line)
+            .rev()
+            .find(|&h| matches!(self.fold_range(h), Some((_, end)) if line <= end))
+    }
+
+    /// Whether `line` is hidden inside a collapsed region. Testing every folded
+    /// header is enough even with nesting: an outer fold's range covers any
+    /// inner fold's range, so a line hidden by the inner is also covered by the
+    /// outer. ponytail: O(folds) per query, fine for realistic fold counts.
+    pub fn is_line_hidden(&self, line: usize) -> bool {
+        self.folded
+            .iter()
+            .any(|&h| matches!(self.fold_range(h), Some((_, end)) if h < line && line <= end))
+    }
+
+    /// Toggle the fold owning `line` (VS Code `editor.toggleFold`). Collapsing a
+    /// block that contains the cursor snaps the cursor up to the header so it
+    /// never strands on a hidden line.
+    pub fn toggle_fold(&mut self, line: usize) {
+        let Some(header) = self.enclosing_fold_header(line) else {
+            return;
+        };
+        if !self.folded.remove(&header) {
+            self.folded.insert(header);
+            if self.is_line_hidden(self.cursor_row) {
+                let len = self
+                    .lines
+                    .get(header)
+                    .map(|s| s.chars().count())
+                    .unwrap_or(0);
+                self.cursor_row = header;
+                self.cursor_col = self.cursor_col.min(len);
+            }
+        }
+        self.fold_epoch_lines = self.lines.len();
+    }
+
+    /// Collapse every foldable region (VS Code "Fold All", Cmd+K Cmd+0),
+    /// snapping the cursor up to the nearest visible line.
+    pub fn fold_all(&mut self) {
+        self.folded = (0..self.lines.len())
+            .filter(|&l| self.is_foldable(l))
+            .collect();
+        self.fold_epoch_lines = self.lines.len();
+        while self.cursor_row > 0 && self.is_line_hidden(self.cursor_row) {
+            self.cursor_row -= 1;
+        }
+    }
+
+    /// Expand every fold (VS Code "Unfold All", Cmd+K Cmd+J).
+    pub fn unfold_all(&mut self) {
+        self.folded.clear();
     }
 
     fn snapshot(&self) -> Snapshot {
@@ -5079,6 +5213,12 @@ impl Widget for &mut Editor {
         // Rebuild the git-gutter marks if the buffer moved since last frame
         // (cheap no-op otherwise), so the bars below diff against HEAD.
         self.refresh_git_marks();
+        // Fold headers are line indexes; an insert/delete anywhere shifts them.
+        // If the line count changed since folds were set, drop them wholesale
+        // rather than hide the wrong lines (see `fold_epoch_lines`).
+        if !self.folded.is_empty() && self.lines.len() != self.fold_epoch_lines {
+            self.folded.clear();
+        }
         let wrap = self.wrap_enabled();
         if wrap {
             // Wrapped text folds onto extra rows instead of scrolling sideways.
@@ -5195,6 +5335,10 @@ impl Widget for &mut Editor {
             let mut line = self.scroll;
             let mut skip = self.scroll_sub;
             while line < self.lines.len() && visual_rows.len() < text_height {
+                if self.is_line_hidden(line) {
+                    line += 1;
+                    continue;
+                }
                 for (i, &(s, e)) in self.line_segments(line, tw).iter().enumerate() {
                     if i < skip {
                         continue;
@@ -5208,9 +5352,18 @@ impl Widget for &mut Editor {
                 line += 1;
             }
         } else {
-            let end = (self.scroll + text_height).min(self.lines.len());
-            for line in self.scroll..end {
-                visual_rows.push((line, self.scroll_col, self.scroll_col + text_width as usize));
+            // Collect up to `text_height` VISIBLE logical lines from `scroll`,
+            // skipping any hidden inside a collapsed fold.
+            let mut line = self.scroll;
+            while line < self.lines.len() && visual_rows.len() < text_height {
+                if !self.is_line_hidden(line) {
+                    visual_rows.push((
+                        line,
+                        self.scroll_col,
+                        self.scroll_col + text_width as usize,
+                    ));
+                }
+                line += 1;
             }
         }
         self.last_wrap_rows = visual_rows.clone();
@@ -5289,6 +5442,21 @@ impl Widget for &mut Editor {
                     };
                     buf.set_string(sign_x, y, glyph, Style::default().fg(color));
                 }
+            }
+
+            // Fold chevron: on a foldable header's first visual row, in the
+            // second sign-margin column (`sign_x + 1`) so it never collides with
+            // a breakpoint dot at `sign_x`. ▾ = expanded, ▸ = collapsed; the
+            // collapsed one is brighter so hidden content is noticeable. Matches
+            // the gutter's own DarkGray line numbers (which are theme-agnostic).
+            if (!wrap || row_start == 0) && self.is_foldable(line_idx) {
+                let collapsed = self.folded.contains(&line_idx);
+                let (glyph, color) = if collapsed {
+                    ("▸", Color::Gray)
+                } else {
+                    ("▾", Color::DarkGray)
+                };
+                buf.set_string(sign_x + 1, y, glyph, Style::default().fg(color));
             }
 
             // Git gutter: a thin coloured bar in the spacer cell between the
@@ -7067,7 +7235,11 @@ mod tests {
         // cell at `inner.x + gutter_width`, one cell left of the text.
         let bar_x = e.last_inner.x + e.last_gutter_width;
         let cell = &buf[(bar_x, e.last_inner.y + 1)];
-        assert_eq!(cell.symbol(), "\u{2503}", "modified line shows a gutter bar");
+        assert_eq!(
+            cell.symbol(),
+            "\u{2503}",
+            "modified line shows a gutter bar"
+        );
     }
 
     #[test]
@@ -8667,7 +8839,10 @@ mod tests {
             .unwrap()
             .read_to_end(&mut raw)
             .unwrap();
-        assert_eq!(raw, b"alpha\r\nbeta", "save re-applies CRLF, no trailing EOL");
+        assert_eq!(
+            raw, b"alpha\r\nbeta",
+            "save re-applies CRLF, no trailing EOL"
+        );
     }
 
     #[test]
@@ -11844,5 +12019,121 @@ mod tests {
         let mut e = editor_with("a\nb");
         assert!(!e.trim_final_newlines());
         assert_eq!(e.lines, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn fold_range_covers_an_indented_block() {
+        let e = editor_with("fn a() {\n    let x = 1;\n    let y = 2;\n}\nfn b() {}");
+        // Header line 0; body lines 1-2 are more indented; the closing brace on
+        // line 3 returns to base indent and is not part of the region.
+        assert_eq!(e.fold_range(0), Some((0, 2)));
+        // A leaf line with no deeper line below it is not foldable.
+        assert_eq!(e.fold_range(1), None);
+        assert_eq!(e.fold_range(4), None);
+    }
+
+    #[test]
+    fn fold_range_absorbs_interior_blank_lines_but_not_trailing_ones() {
+        let e = editor_with("fn a() {\n    x\n\n    y\n}\n");
+        // The interior blank (line 2) sits between two deeper lines, so it is
+        // inside the region; the region ends at the last deeper line (3).
+        assert_eq!(e.fold_range(0), Some((0, 3)));
+    }
+
+    #[test]
+    fn folding_a_header_hides_its_body_only() {
+        let mut e = editor_with("fn a() {\n    let x = 1;\n    let y = 2;\n}\nfn b() {}");
+        e.toggle_fold(0);
+        assert!(!e.is_line_hidden(0), "the header line stays visible");
+        assert!(e.is_line_hidden(1));
+        assert!(e.is_line_hidden(2));
+        assert!(
+            !e.is_line_hidden(3),
+            "the closing brace at base indent stays"
+        );
+        assert!(!e.is_line_hidden(4));
+    }
+
+    #[test]
+    fn toggling_a_fold_twice_restores_visibility() {
+        let mut e = editor_with("fn a() {\n    body\n}");
+        e.toggle_fold(0);
+        assert!(e.is_line_hidden(1));
+        e.toggle_fold(0);
+        assert!(!e.is_line_hidden(1), "a second toggle unfolds the block");
+    }
+
+    #[test]
+    fn folding_from_inside_the_body_folds_the_enclosing_block() {
+        let mut e = editor_with("fn a() {\n    body\n}");
+        e.cursor_row = 1;
+        e.toggle_fold(e.cursor_row);
+        assert!(
+            e.is_line_hidden(1),
+            "folding at a body line folds its owner"
+        );
+        assert_eq!(
+            e.cursor_row, 0,
+            "cursor on a hidden line snaps up to the header"
+        );
+    }
+
+    #[test]
+    fn render_omits_folded_body_lines() {
+        let mut e = editor_with("fn a() {\n    x\n    y\n}\nfn b() {}");
+        e.toggle_fold(0);
+        render_at(&mut e, 40, 10);
+        let shown: Vec<usize> = e.last_wrap_rows.iter().map(|&(l, _, _)| l).collect();
+        assert!(shown.contains(&0), "the header row is drawn");
+        assert!(!shown.contains(&1), "a folded body line is not drawn");
+        assert!(!shown.contains(&2), "a folded body line is not drawn");
+        assert!(
+            shown.contains(&3) && shown.contains(&4),
+            "lines after the fold are still drawn"
+        );
+    }
+
+    #[test]
+    fn fold_all_collapses_every_block_and_unfold_all_restores() {
+        let mut e = editor_with("fn a() {\n    x\n}\nfn b() {\n    y\n}");
+        e.fold_all();
+        assert!(
+            e.is_line_hidden(1) && e.is_line_hidden(4),
+            "every body is hidden"
+        );
+        e.unfold_all();
+        assert!(
+            !e.is_line_hidden(1) && !e.is_line_hidden(4),
+            "unfold restores all"
+        );
+    }
+
+    #[test]
+    fn clicking_the_gutter_chevron_toggles_the_fold() {
+        let mut e = editor_with("fn a() {\n    x\n}\nfn b() {}");
+        render_at(&mut e, 40, 10);
+        // The chevron is the second sign-margin cell; the header sits on the
+        // first visual row at the top of the inner rect.
+        let cx = e.last_inner.x + 1;
+        let cy = e.last_inner.y;
+        assert!(
+            e.fold_chevron_at(cx, cy),
+            "a click on the header chevron hits"
+        );
+        assert!(e.is_line_hidden(1), "the body is now folded");
+        assert!(e.fold_chevron_at(cx, cy), "a second click unfolds");
+        assert!(!e.is_line_hidden(1));
+    }
+
+    #[test]
+    fn clicking_off_the_chevron_column_is_not_a_fold_toggle() {
+        let mut e = editor_with("fn a() {\n    x\n}");
+        render_at(&mut e, 40, 10);
+        let text_x = e.last_inner.x + e.last_gutter_width + 1;
+        assert!(
+            !e.fold_chevron_at(text_x, e.last_inner.y),
+            "the text area is not the chevron"
+        );
+        assert!(!e.is_line_hidden(1));
     }
 }

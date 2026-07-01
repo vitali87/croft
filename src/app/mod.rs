@@ -10365,6 +10365,26 @@ impl App {
                 self.open_testing_view();
                 true
             }
+            // Cmd+K Cmd+0 / Cmd+K 0: collapse every fold (VS Code "Fold All").
+            KeyCode::Char('0') if plain => {
+                self.editor.fold_all();
+                self.poke_cursor();
+                true
+            }
+            // Cmd+K Cmd+J / Cmd+K J: expand every fold (VS Code "Unfold All").
+            KeyCode::Char(c) if plain && c.eq_ignore_ascii_case(&'j') => {
+                self.editor.unfold_all();
+                self.poke_cursor();
+                true
+            }
+            // Cmd+K Cmd+L / Cmd+K L: toggle the fold at the cursor line
+            // (VS Code "Toggle Fold").
+            KeyCode::Char(c) if plain && c.eq_ignore_ascii_case(&'l') => {
+                let row = self.editor.cursor_row;
+                self.editor.toggle_fold(row);
+                self.poke_cursor();
+                true
+            }
             _ => false,
         }
     }
@@ -17191,6 +17211,12 @@ impl App {
             }
             Cmd::FormatDocument => self.start_format_document(),
             Cmd::QuickFix => self.start_code_action(),
+            Cmd::ToggleFold => {
+                let row = self.editor.cursor_row;
+                self.editor.toggle_fold(row);
+            }
+            Cmd::FoldAll => self.editor.fold_all(),
+            Cmd::UnfoldAll => self.editor.unfold_all(),
             Cmd::TrimFinalNewlines => {
                 if self.editor.trim_final_newlines() {
                     self.status = String::from("Trimmed final newlines");
@@ -19571,6 +19597,13 @@ impl App {
                         } else {
                             self.editor_click.record(now, m.column, m.row);
                         }
+                        self.poke_cursor();
+                        return;
+                    }
+                    // Fold chevron in the gutter: toggle the fold, don't anchor
+                    // a selection or move the cursor into the (possibly hidden)
+                    // body.
+                    if self.editor.fold_chevron_at(m.column, m.row) {
                         self.poke_cursor();
                         return;
                     }

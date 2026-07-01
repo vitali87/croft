@@ -49,6 +49,9 @@ On macOS, the `Cmd` chords below only reach croft after you run a one-time setup
 | `Cmd+K` `Shift+O` | Move into New Window: same, and close the file's tab here (macOS only) |
 | `Cmd+K` `Z` | Toggle Zen Mode: hide the activity bar, both side bars, the panel, and the status bar; press again to restore exactly what was shown before |
 | `Cmd+K` `B` | Show the Testing view (beaker icon); it discovers tests on first open. In the view: Enter runs all tests, `r` re-discovers, ↑/↓ scroll |
+| `Cmd+K` `Cmd+L` | Toggle the code fold at the cursor: collapse the enclosing indented block (function, loop, struct) to its header line, or re-expand it |
+| `Cmd+K` `Cmd+0` | Fold All: collapse every foldable block in the buffer |
+| `Cmd+K` `Cmd+J` | Unfold All: expand every collapsed block |
 | Mouse wheel | Scroll the pane under the pointer |
 
 ### Customize Layout
@@ -166,6 +169,7 @@ Every choice except the side-bar / panel visibility persists across launches in 
 | `Cmd`+`Opt`+`Shift`+`A` / `D` | Sort the selected lines (or the whole file) Ascending / Descending |
 | `Cmd`+`Opt`+`Shift`+`W` | Trim Trailing Whitespace: strip trailing spaces and tabs from every line |
 | `Cmd`+`Opt`+`Shift`+`F` | Format Document: reformat the whole buffer through the language server (rustfmt, ruff, prettier, …); the edit lands as one undo step and leaves the tab dirty |
+| Click the gutter fold chevron | Toggle the fold on that line: a `▾` marks an expanded foldable block (a function, loop, struct — any line whose body is more indented), a `▸` marks a collapsed one. Also on `Cmd+K` `Cmd+L` at the cursor, and Command Palette "Toggle Fold" / "Fold All" / "Unfold All" |
 | Mouse drag | Select text; every other occurrence of a single-line selection highlights in blue |
 | `Ctrl`+`C` / `Cmd`+`C` | Copy the selection to the system clipboard |
 | `Cmd`+`Opt`+`C` / `Ctrl`+`Opt`+`C` | Copy Path: put the active file's absolute path on the system clipboard (also on the editor tab right-click menu) |
