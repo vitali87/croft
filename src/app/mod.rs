@@ -1740,6 +1740,13 @@ pub struct App {
     /// `explorer_views` is held in memory rather than re-read each access. The
     /// gates for the bundled features (PDF/CSV/Vim/LSPs) consult this set.
     disabled_extensions: std::collections::BTreeSet<String>,
+    /// VS Code `editor.formatOnSave`: when true, `Cmd+S` first asks the language
+    /// server to format the buffer, then writes once the reply lands. Loaded
+    /// from prefs at startup, toggled from the palette / `Cmd+K F`.
+    format_on_save: bool,
+    /// Latch set while a save is waiting on a format reply. `drain_lsp_format`
+    /// consumes it to write the (now formatted) buffer to disk.
+    save_after_format: bool,
     /// Background `git log` results for the TIMELINE, keyed by the file they
     /// describe so a stale reply for a since-closed file is ignored on drain.
     timeline_rx: std::sync::mpsc::Receiver<(PathBuf, Vec<crate::git::FileHistoryEntry>)>,
@@ -2840,6 +2847,8 @@ impl App {
             test_worker: crate::testing::worker::TestWorker::spawn(root.clone()),
             extensions,
             disabled_extensions,
+            format_on_save: loaded_prefs.format_on_save,
+            save_after_format: false,
             outline,
             open_editors,
             timeline,
@@ -6837,6 +6846,7 @@ impl App {
         self.format_request_id = None;
         if unsupported {
             self.status = String::from("No formatter available for this file");
+            self.complete_pending_save();
             return true;
         }
         match (edits, path) {
@@ -6851,6 +6861,9 @@ impl App {
             }
             _ => self.status = String::from("Document already formatted"),
         }
+        // A format-on-save write is deferred until now so the disk file gets the
+        // formatted text in one go.
+        self.complete_pending_save();
         true
     }
 
@@ -10340,6 +10353,12 @@ impl App {
             // Cmd+K Z: toggle Zen Mode (VS Code's binding).
             KeyCode::Char(c) if plain && c.eq_ignore_ascii_case(&'z') => {
                 self.toggle_zen_mode();
+                true
+            }
+            // Cmd+K F: toggle Format on Save (croft binding; VS Code leaves this
+            // preference unbound, but every croft action carries an accelerator).
+            KeyCode::Char(c) if plain && c.eq_ignore_ascii_case(&'f') => {
+                self.toggle_format_on_save();
                 true
             }
             // Cmd+K K: clear the active terminal (VS Code clears with Cmd+K).
@@ -17210,6 +17229,7 @@ impl App {
                 self.status = String::from("Converted indentation to tabs");
             }
             Cmd::FormatDocument => self.start_format_document(),
+            Cmd::ToggleFormatOnSave => self.toggle_format_on_save(),
             Cmd::QuickFix => self.start_code_action(),
             Cmd::ToggleFold => {
                 let row = self.editor.cursor_row;
@@ -19957,8 +19977,63 @@ impl App {
         }
     }
 
+    /// Whether formatting the current buffer is supported by an active server.
+    /// Gates format-on-save so a file whose server advertises no formatter is
+    /// saved directly rather than waiting on a reply that never mutates it.
+    fn editor_language_supports_formatting(&self) -> bool {
+        let Some(lang) = self
+            .editor
+            .path
+            .as_deref()
+            .and_then(|p| p.extension())
+            .and_then(|e| e.to_str())
+            .and_then(crate::lsp::Language::from_extension)
+        else {
+            return false;
+        };
+        self.lsp
+            .as_ref()
+            .and_then(|lsp| lsp.language_supports_formatting(lang))
+            .unwrap_or(false)
+    }
+
+    /// Whether `Cmd+S` should format before writing: the pref is on, a
+    /// formatter is available, and the active tab is a real editable code file
+    /// (not a diff/sheet/image preview). `supports_formatting` is passed in so
+    /// the decision is pure and unit-testable.
+    fn format_on_save_eligible(&self, supports_formatting: bool) -> bool {
+        self.format_on_save
+            && supports_formatting
+            && self.editor.path.is_some()
+            && self.editor.diff.is_none()
+            && self.editor.sheet.is_none()
+            && self.editor.image.is_none()
+    }
+
+    /// Write the deferred buffer to disk once its format reply has landed.
+    /// A no-op unless [`Self::save`] armed `save_after_format`.
+    fn complete_pending_save(&mut self) {
+        if std::mem::take(&mut self.save_after_format) {
+            self.write_current_to_disk();
+        }
+    }
+
+    /// Flip `editor.formatOnSave`, persist it, and report the new state.
+    /// Persistence is skipped under test so the suite never writes the
+    /// developer's `~/.config/croft/config.json` (mirrors the layout prefs).
+    fn toggle_format_on_save(&mut self) {
+        self.format_on_save = !self.format_on_save;
+        self.status = if self.format_on_save {
+            String::from("Format on Save: on")
+        } else {
+            String::from("Format on Save: off")
+        };
+        if !cfg!(test) {
+            let _ = crate::prefs::save_format_on_save(self.format_on_save);
+        }
+    }
+
     fn save(&mut self) {
-        use crate::widgets::editor::SaveOutcome;
         // A previously-refused save arms a one-shot override: the very next
         // Cmd+S overwrites the external change. Consume it here so it never
         // lingers past the press it was meant for.
@@ -19969,6 +20044,18 @@ impl App {
             }
             return;
         }
+        // Format-on-save: defer the write until the format reply arrives, then
+        // `drain_lsp_format` calls `complete_pending_save`.
+        if self.format_on_save_eligible(self.editor_language_supports_formatting()) {
+            self.save_after_format = true;
+            self.start_format_document();
+            return;
+        }
+        self.write_current_to_disk();
+    }
+
+    fn write_current_to_disk(&mut self) {
+        use crate::widgets::editor::SaveOutcome;
         match self.editor.save_to_disk() {
             Ok(SaveOutcome::Saved) => self.status = self.editor.status.clone(),
             Ok(SaveOutcome::DiskConflict) => {

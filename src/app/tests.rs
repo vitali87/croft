@@ -15093,3 +15093,58 @@ fn unsaved_count_tracks_dirty_editors() {
         "an edited buffer counts as one unsaved file"
     );
 }
+
+#[test]
+fn toggle_format_on_save_command_flips_the_pref_and_reports_it() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.format_on_save = false;
+    app.run_command(Command::ToggleFormatOnSave);
+    assert!(app.format_on_save, "the command turns format-on-save on");
+    assert!(app.status.contains("on") || app.status.contains("On"));
+    app.run_command(Command::ToggleFormatOnSave);
+    assert!(!app.format_on_save, "the command toggles it back off");
+}
+
+#[test]
+fn format_on_save_eligible_requires_pref_and_formatter_and_code_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("m.py");
+    std::fs::write(&f, "x=1\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&f).unwrap();
+    // Pref off: never eligible, even when a formatter is available.
+    app.format_on_save = false;
+    assert!(!app.format_on_save_eligible(true));
+    // Pref on but no formatter advertised: not eligible (would hang the save).
+    app.format_on_save = true;
+    assert!(!app.format_on_save_eligible(false));
+    // Pref on + formatter + a real code file: eligible.
+    assert!(app.format_on_save_eligible(true));
+}
+
+#[test]
+fn complete_pending_save_writes_formatted_buffer_to_disk() {
+    let tmp = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("m.py");
+    std::fs::write(&f, "x=1\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&f).unwrap();
+    // Simulate a format edit landing in the buffer, then the deferred save
+    // firing when the format response arrives.
+    app.editor.insert_char('y');
+    app.save_after_format = true;
+    app.complete_pending_save();
+    assert!(!app.save_after_format, "the deferred-save latch is consumed");
+    let on_disk = std::fs::read_to_string(&f).unwrap();
+    assert!(
+        on_disk.starts_with('y'),
+        "the buffer was written to disk, got {on_disk:?}"
+    );
+    // With the latch clear, a second call is a no-op (no re-save).
+    app.editor.insert_char('z');
+    app.complete_pending_save();
+    let unchanged = std::fs::read_to_string(&f).unwrap();
+    assert_eq!(unchanged, on_disk, "no write without the latch set");
+}
