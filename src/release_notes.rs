@@ -60,6 +60,6 @@ pub struct ReleaseNote {
 
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
-    kind: NoteKind::Feature,
-    summary: "Code folding: collapse any indented block to its header line. Click the ▾/▸ chevron in the gutter, or use Cmd+K Cmd+L (toggle at cursor), Cmd+K Cmd+0 (fold all), Cmd+K Cmd+J (unfold all).",
+    kind: NoteKind::Fix,
+    summary: "Opening a parent-of-repos folder (e.g. ~/Documents) no longer scans the whole tree: the watch-target walk is now budget-capped, cutting startup/rebind from ~7.6s over 140k dirs to under 0.4s, with the adaptive poll covering the rest.",
 }];

@@ -13,6 +13,13 @@ const FS_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 const FS_WATCH_PROTECTED_NAMES: &[&str] = &["Library", ".Trash"];
 
+/// Max directories the macOS watch-target walk may visit before it stops and
+/// leaves the remainder to the adaptive poll. Bounds the startup/rebind scan on
+/// a parent-of-repos root (~/Documents measured at ~140k dirs / 7.6s) to a
+/// fraction of a second, while comfortably covering any normal single repo in
+/// full. See `collect_macos_watch_targets`.
+const WATCH_WALK_DIR_BUDGET: usize = 8_192;
+
 type FsWatcherInit = (
     notify_debouncer_full::Debouncer<
         notify::RecommendedWatcher,
@@ -293,7 +300,14 @@ impl FsWatch {
             // poll, which stats only the expanded/visible dirs — cheap, and
             // already the fallback for everything not under a watch.
             let mut targets: Vec<(PathBuf, RecursiveMode)> = Vec::new();
-            if collect_macos_watch_targets(root, &mut targets) {
+            // Cap the discovery walk so opening a parent-of-repos root (e.g.
+            // ~/Documents, ~140k non-noise dirs → a 7.6s scan) can't turn the
+            // watcher thread into a multi-second readdir burst. A typical single
+            // repo is far under this, so its behaviour is unchanged; a tree that
+            // exceeds it gets watches on the subtrees discovered before the cap
+            // and the adaptive poll covers the rest.
+            let mut budget = WATCH_WALK_DIR_BUDGET;
+            if collect_macos_watch_targets(root, &mut targets, &mut budget) {
                 // Whole tree is noise-free (e.g. a small repo with no
                 // node_modules): one recursive watch covers it in a single
                 // stream, exactly as before.
@@ -405,8 +419,23 @@ fn is_skippable_name(name: &std::ffi::OsStr) -> bool {
 pub(super) fn collect_macos_watch_targets(
     dir: &Path,
     targets: &mut Vec<(PathBuf, notify::RecursiveMode)>,
+    budget: &mut usize,
 ) -> bool {
     use notify::RecursiveMode;
+    // Bound the discovery walk. A parent-of-repos root (e.g. ~/Documents) can
+    // hold 100k+ non-noise dirs; walking all of them to confirm they are
+    // noise-free costs seconds on the watcher thread. When the budget is spent
+    // we report the subtree as NOT clean, so no recursive stream is ever rooted
+    // over a tree we didn't finish verifying (the iron law: never watch above
+    // unseen noise). The adaptive poll, which already stats every expanded dir
+    // each cycle, is the floor for whatever we stop short of watching.
+    // ponytail: a flat dir-visit cap; a huge *single* clean repo past the cap
+    // falls back to poll-only instead of one recursive watch. Raise the cap if
+    // that ever matters; typical single repos are far under it.
+    if *budget == 0 {
+        return false;
+    }
+    *budget -= 1;
     let mut has_noise = false;
     let mut subdirs: Vec<PathBuf> = Vec::new();
     if let Ok(rd) = std::fs::read_dir(dir) {
@@ -427,7 +456,7 @@ pub(super) fn collect_macos_watch_targets(
     let child_clean: Vec<(PathBuf, bool)> = subdirs
         .into_iter()
         .map(|sd| {
-            let clean = collect_macos_watch_targets(&sd, targets);
+            let clean = collect_macos_watch_targets(&sd, targets, budget);
             (sd, clean)
         })
         .collect();

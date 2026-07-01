@@ -1506,6 +1506,37 @@ fn fs_watcher_prunes_noise_dirs_nested_below_the_workspace_root() {
 // and on each repo dir) and its tests only checked debouncer events, never the
 // callback cost — so the burn shipped. The invariant the watcher MUST hold:
 // no installed watch target is an ancestor of any noise dir.
+// A parent-of-repos root (e.g. ~/Documents with ~40 repos) holds 100k+
+// non-noise dirs. Walking all of them to prove they're noise-free costs
+// seconds on the watcher thread and yields thousands of FSEvents watches. The
+// walk MUST stop once it has spent its dir-visit budget and let the adaptive
+// poll cover the rest, rather than scan the whole tree.
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_watch_walk_stops_when_the_dir_budget_is_spent() {
+    let tmp = tempfile::tempdir().unwrap();
+    // A dirty root (has .git) so its clean children are collected individually
+    // instead of the whole root being watched as one clean subtree.
+    std::fs::create_dir_all(tmp.path().join(".git")).unwrap();
+    for i in 0..300 {
+        std::fs::create_dir_all(tmp.path().join(format!("d{i}/sub"))).unwrap();
+    }
+
+    let mut targets: Vec<(std::path::PathBuf, notify::RecursiveMode)> = Vec::new();
+    let mut budget = 50usize; // far fewer than the ~600 dirs present
+    super::fs_watch::collect_macos_watch_targets(tmp.path(), &mut targets, &mut budget);
+
+    assert_eq!(
+        budget, 0,
+        "the walk must spend its whole budget and stop, not visit every dir"
+    );
+    assert!(
+        targets.len() < 300,
+        "once the budget caps, not every clean subtree is watched (the poll covers the rest); got {}",
+        targets.len()
+    );
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn macos_watch_targets_never_root_a_stream_above_a_noise_dir() {
@@ -1522,7 +1553,8 @@ fn macos_watch_targets_never_root_a_stream_above_a_noise_dir() {
     }
 
     let mut targets: Vec<(std::path::PathBuf, notify::RecursiveMode)> = Vec::new();
-    super::fs_watch::collect_macos_watch_targets(tmp.path(), &mut targets);
+    let mut budget = usize::MAX; // generous: this small tree is walked in full
+    super::fs_watch::collect_macos_watch_targets(tmp.path(), &mut targets, &mut budget);
 
     // No target may contain a noise dir anywhere beneath it (which on macOS
     // would put that noise dir inside the target's recursive FSEvents stream).
