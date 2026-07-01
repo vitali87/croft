@@ -6770,6 +6770,21 @@ impl App {
         }
     }
 
+    /// VS Code "Add Selection to Next Find Match" (`Cmd+D`): select the word
+    /// under the cursor, then grow the multi-cursor one occurrence per press.
+    fn start_select_next_occurrence(&mut self) {
+        if self.editor.diff.is_some() || self.editor.sheet.is_some() || self.editor.image.is_some()
+        {
+            return;
+        }
+        let n = self.editor.select_next_occurrence();
+        if n == 0 {
+            self.status = String::from("No symbol under cursor");
+        } else if n > 1 {
+            self.status = format!("Selected {n} occurrences (type to replace, Esc to cancel)");
+        }
+    }
+
     /// VS Code "Rename Symbol" (F2): prompt for a new name pre-filled with the
     /// identifier under the cursor; committing fires an LSP `rename` request.
     fn start_rename_symbol(&mut self) {
@@ -14069,6 +14084,10 @@ impl App {
             self.start_change_all_occurrences();
             return;
         }
+        if is_select_next_occurrence_key(key) {
+            self.start_select_next_occurrence();
+            return;
+        }
         // VS Code "Reveal in Finder" (Cmd+Opt+R) for the active file. Works on
         // any tab backed by a real path (text, diff, sheet, image), so it sits
         // above the text-only guards. Local-macOS only, matching the Explorer
@@ -17283,6 +17302,7 @@ impl App {
             }
             Cmd::AddCursorAbove => self.editor.add_cursor_above(),
             Cmd::AddCursorBelow => self.editor.add_cursor_below(),
+            Cmd::AddSelectionToNextMatch => self.start_select_next_occurrence(),
             Cmd::JumpToBracket => {
                 if !self.editor.jump_to_matching_bracket() {
                     self.status = String::from("Go to Bracket: no matching bracket");
@@ -19718,6 +19738,25 @@ impl App {
                         self.poke_cursor();
                         return;
                     }
+                    // VS Code Shift+Alt+drag: start a column (box) selection.
+                    // Checked before the plain Alt+click caret so the two
+                    // modifiers don't both fire.
+                    if m.modifiers.contains(KeyModifiers::ALT)
+                        && m.modifiers.contains(KeyModifiers::SHIFT)
+                        && self.editor.begin_box_select(m.column, m.row)
+                    {
+                        self.poke_cursor();
+                        return;
+                    }
+                    // VS Code Alt+click: add (or toggle off) a secondary caret
+                    // at the click instead of moving the single cursor.
+                    if m.modifiers.contains(KeyModifiers::ALT)
+                        && !m.modifiers.contains(KeyModifiers::SHIFT)
+                        && self.editor.add_caret_at_screen(m.column, m.row)
+                    {
+                        self.poke_cursor();
+                        return;
+                    }
                     let now = std::time::Instant::now();
                     let is_double = self.editor_click.is_double(now, m.column, m.row);
                     if is_double {
@@ -19857,6 +19896,11 @@ impl App {
                         self.poke_cursor();
                         return;
                     }
+                    if self.editor.box_selecting() {
+                        self.editor.box_drag_to_screen(m.column, m.row);
+                        self.poke_cursor();
+                        return;
+                    }
                     self.editor.mouse_drag(m.column, m.row);
                     self.poke_cursor();
                 } else if in_tree {
@@ -19910,6 +19954,11 @@ impl App {
             MouseEventKind::Up(MouseButton::Left) => {
                 // Releasing the button ends any terminal edge auto-scroll.
                 self.terminal_select_autoscroll = None;
+                // Finish a column (box) selection, keeping the carets it built.
+                if self.editor.box_selecting() {
+                    self.editor.end_box_select();
+                    return;
+                }
                 if self.splitter_drag.take().is_some() {
                     return;
                 }
@@ -23345,6 +23394,17 @@ fn is_change_all_occurrences_key(key: KeyEvent) -> bool {
         && (key.modifiers.contains(KeyModifiers::SUPER)
             || key.modifiers.contains(KeyModifiers::CONTROL)
             || key.modifiers.contains(KeyModifiers::ALT))
+}
+
+/// VS Code "Add Selection to Next Find Match" (`Cmd+D` on macOS, `Ctrl+D`
+/// elsewhere). Neither Shift nor Alt may be held, so this never collides with
+/// `Cmd+Shift+D` (Run and Debug) or `Cmd+Opt+Shift+D` (Sort Lines Descending).
+fn is_select_next_occurrence_key(key: KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char('d') | KeyCode::Char('D'))
+        && (key.modifiers.contains(KeyModifiers::SUPER)
+            || key.modifiers.contains(KeyModifiers::CONTROL))
+        && !key.modifiers.contains(KeyModifiers::SHIFT)
+        && !key.modifiers.contains(KeyModifiers::ALT)
 }
 
 /// Editor-pane Go to Definition: plain `F12` (VS Code's binding). The F12

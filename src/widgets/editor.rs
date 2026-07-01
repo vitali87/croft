@@ -1312,6 +1312,10 @@ pub struct Editor {
     /// Screen `(row, logical line)` pairs the sticky bar painted last render, so
     /// `App` can map a click on a pinned header to a jump.
     sticky_click_rows: Vec<(u16, u32)>,
+    /// Anchor of an in-progress column (box) selection (VS Code's Shift+Alt+drag),
+    /// as a `(row, col)` buffer position. `Some` while the box drag is live; each
+    /// drag rebuilds `carets` from the rectangle between it and the pointer.
+    box_anchor: Option<(usize, usize)>,
     /// Currently-collapsed fold headers, as 0-based logical line indexes. A
     /// header's body (the more-indented lines below it, up to `fold_range`'s
     /// end) is hidden from the render while its index is in this set. Purely a
@@ -1470,6 +1474,7 @@ impl Editor {
             carets: Vec::new(),
             sticky_lines: Vec::new(),
             sticky_click_rows: Vec::new(),
+            box_anchor: None,
             folded: std::collections::BTreeSet::new(),
             fold_epoch_lines: 0,
             preview: false,
@@ -2623,6 +2628,73 @@ impl Editor {
             .filter(|(i, _)| *i != primary_idx)
             .map(|(_, s)| s)
             .collect();
+        self.carets.len() + 1
+    }
+
+    /// VS Code "Add Selection to Next Find Match" (`Cmd+D`): the first press
+    /// selects the word under the cursor; each further press finds the next
+    /// occurrence of the selected text (document order, wrapping) that is not
+    /// already a caret and adds it as a secondary caret, moving the primary to
+    /// it so the view follows. Returns the number of cursors (0 when the first
+    /// press lands off a word, leaving state untouched).
+    pub fn select_next_occurrence(&mut self) -> usize {
+        // First press with no selection: select the word under the cursor.
+        let Some(sel) = self.selection else {
+            let Some((s, e)) = self.word_at(self.cursor_row, self.cursor_col) else {
+                return 0;
+            };
+            self.selection = Some(EditorSelection {
+                anchor: (self.cursor_row, s),
+                head: (self.cursor_row, e),
+            });
+            self.cursor_col = e;
+            self.ensure_cursor_col_visible();
+            return 1;
+        };
+        // Only single-line word selections drive the incremental match search.
+        let (start, end) = sel.normalised();
+        if start.0 != end.0 {
+            return self.carets.len() + 1;
+        }
+        let word: Vec<char> = self.lines[start.0]
+            .chars()
+            .skip(start.1)
+            .take(end.1 - start.1)
+            .collect();
+        if word.is_empty() {
+            return self.carets.len() + 1;
+        }
+        // Every occurrence in document order, and the set already selected
+        // (the primary plus each existing caret), keyed by its start.
+        let mut occ: Vec<(usize, usize)> = Vec::new();
+        for (row, line) in self.lines.iter().enumerate() {
+            let chars: Vec<char> = line.chars().collect();
+            for col in find_word_occurrences(&chars, &word) {
+                occ.push((row, col));
+            }
+        }
+        let mut taken: Vec<(usize, usize)> = self.carets.iter().map(|c| c.normalised().0).collect();
+        taken.push(start);
+        // Scan forward from the primary, wrapping, for the first match not yet
+        // taken.
+        let from = occ.iter().position(|&o| o == start).unwrap_or(0);
+        let n = occ.len();
+        let next = (1..=n)
+            .map(|k| occ[(from + k) % n])
+            .find(|o| !taken.contains(o));
+        let Some((row, col)) = next else {
+            return self.carets.len() + 1;
+        };
+        // Demote the current primary to a caret, promote the new match.
+        self.carets.push(sel);
+        let head = (row, col + word.len());
+        self.selection = Some(EditorSelection {
+            anchor: (row, col),
+            head,
+        });
+        self.cursor_row = head.0;
+        self.cursor_col = head.1;
+        self.ensure_cursor_col_visible();
         self.carets.len() + 1
     }
 
@@ -4065,6 +4137,109 @@ impl Editor {
             anchor: (target, col),
             head: (target, col),
         });
+    }
+
+    /// VS Code Alt+click: add a caret at the screen cell `(col, row)`, keeping
+    /// the existing cursor(s). The old primary (with any selection) becomes a
+    /// caret and the clicked point becomes the new primary. Clicking an
+    /// existing zero-width caret removes it (toggle). Returns false when the
+    /// click misses the text area.
+    pub fn add_caret_at_screen(&mut self, col: u16, row: u16) -> bool {
+        let Some((r, c)) = self.buffer_pos_at(col, row) else {
+            return false;
+        };
+        // Clicking the current primary is a no-op (nothing to add).
+        if (r, c) == (self.cursor_row, self.cursor_col) {
+            return true;
+        }
+        // Clicking an existing zero-width caret removes it (toggle off).
+        if let Some(idx) = self
+            .carets
+            .iter()
+            .position(|s| !s.has_area() && s.head == (r, c))
+        {
+            self.carets.remove(idx);
+            return true;
+        }
+        // Demote the current primary (preserving any selection) to a caret and
+        // promote the clicked point.
+        let primary = self.selection.unwrap_or(EditorSelection {
+            anchor: (self.cursor_row, self.cursor_col),
+            head: (self.cursor_row, self.cursor_col),
+        });
+        self.carets.push(primary);
+        self.selection = None;
+        self.cursor_row = r;
+        self.cursor_col = c;
+        self.ensure_cursor_col_visible();
+        true
+    }
+
+    /// Begin a column (box) selection anchored at the screen cell `(col, row)`
+    /// (VS Code's Shift+Alt+drag). Clears any existing selection/carets and
+    /// parks the primary at the anchor. Returns false if the cell misses text.
+    pub fn begin_box_select(&mut self, col: u16, row: u16) -> bool {
+        let Some((r, c)) = self.buffer_pos_at(col, row) else {
+            return false;
+        };
+        self.box_anchor = Some((r, c));
+        self.carets.clear();
+        self.selection = None;
+        self.cursor_row = r;
+        self.cursor_col = c;
+        true
+    }
+
+    /// Whether a column (box) selection drag is in progress.
+    pub fn box_selecting(&self) -> bool {
+        self.box_anchor.is_some()
+    }
+
+    /// Extend the live column selection to the screen cell `(col, row)`,
+    /// rebuilding one caret per spanned row. No-op if no box drag is active.
+    pub fn box_drag_to_screen(&mut self, col: u16, row: u16) {
+        if self.box_anchor.is_none() {
+            return;
+        }
+        if let Some((r, c)) = self.buffer_pos_at(col, row) {
+            self.box_select_to(r, c);
+        }
+    }
+
+    /// Rebuild the column selection so it spans the rectangle from the box
+    /// anchor to `(head_row, head_col)`: every row in the range gets a caret
+    /// over the shared column span (clamped to that line's length); the head
+    /// row is the primary. Zero-width columns become bare carets.
+    fn box_select_to(&mut self, head_row: usize, head_col: usize) {
+        let Some((ar, ac)) = self.box_anchor else {
+            return;
+        };
+        let (r0, r1) = (ar.min(head_row), ar.max(head_row));
+        let (c0, c1) = (ac.min(head_col), ac.max(head_col));
+        self.carets.clear();
+        self.selection = None;
+        for r in r0..=r1 {
+            let len = self.line_char_len(r);
+            let s = c0.min(len);
+            let e = c1.min(len);
+            let sel = EditorSelection {
+                anchor: (r, s),
+                head: (r, e),
+            };
+            if r == head_row {
+                self.selection = (e > s).then_some(sel);
+                self.cursor_row = r;
+                self.cursor_col = e;
+            } else {
+                self.carets.push(sel);
+            }
+        }
+        self.ensure_cursor_col_visible();
+    }
+
+    /// End the column-selection drag, keeping the carets it produced.
+    pub fn end_box_select(&mut self) {
+        self.box_anchor = None;
     }
 
     /// VS Code "Add Cursor Above" (Cmd+Alt+Up): mirror of `add_cursor_below`.
@@ -12063,6 +12238,79 @@ mod tests {
         e.cursor_col = 1;
         e.add_cursor_below();
         assert!(e.carets.is_empty());
+    }
+
+    #[test]
+    fn select_next_occurrence_grows_selection_one_match_at_a_time() {
+        let mut e = editor_with("foo bar foo baz foo");
+        e.cursor_row = 0;
+        e.cursor_col = 1; // inside the first "foo"
+        // First press selects the word under the cursor; no extra carets yet.
+        assert_eq!(e.select_next_occurrence(), 1);
+        assert!(!e.has_multi_cursor());
+        assert_eq!(e.selection.unwrap().normalised(), ((0, 0), (0, 3)));
+        // Each further press adds the next occurrence as a secondary caret.
+        assert_eq!(e.select_next_occurrence(), 2);
+        assert!(e.has_multi_cursor());
+        assert_eq!(e.select_next_occurrence(), 3);
+        // Every "foo" is now selected: another press wraps and adds nothing.
+        assert_eq!(e.select_next_occurrence(), 3);
+    }
+
+    #[test]
+    fn add_caret_at_screen_adds_and_toggles_a_secondary_caret() {
+        let mut e = editor_with("fn main() {}\nlet x = 1;");
+        e.last_inner = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 25,
+        };
+        e.last_gutter_width = 2;
+        e.cursor_row = 0;
+        e.cursor_col = 0;
+        // Alt+click on line 1, char 3: the old primary becomes a caret and the
+        // click point becomes the new primary.
+        assert!(e.add_caret_at_screen(6, 1));
+        assert_eq!((e.cursor_row, e.cursor_col), (1, 3));
+        assert_eq!(e.carets.len(), 1, "the previous cursor is now a caret");
+        assert_eq!(e.carets[0].head, (0, 0));
+        // Alt+click again on that same caret removes it (toggle).
+        assert!(e.add_caret_at_screen(3, 0));
+        assert_eq!(e.carets.len(), 0, "clicking an existing caret removes it");
+    }
+
+    #[test]
+    fn box_select_spans_rows_into_a_column_of_carets() {
+        let mut e = editor_with("aaaa\nbbbb\ncccc");
+        e.last_inner = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 25,
+        };
+        e.last_gutter_width = 2; // text_x = 3
+        // Anchor at row 0 char 1 (screen col 4), drag to row 2 char 3 (col 6).
+        assert!(e.begin_box_select(4, 0));
+        e.box_drag_to_screen(6, 2);
+        assert!(e.box_selecting());
+        // Head row is the primary; its selection covers cols 1..3.
+        assert_eq!(e.selection.unwrap().normalised(), ((2, 1), (2, 3)));
+        // The other two rows become carets over the same column span.
+        assert_eq!(e.carets.len(), 2);
+        assert_eq!(e.carets[0].normalised(), ((0, 1), (0, 3)));
+        assert_eq!(e.carets[1].normalised(), ((1, 1), (1, 3)));
+        e.end_box_select();
+        assert!(!e.box_selecting());
+    }
+
+    #[test]
+    fn select_next_occurrence_noop_off_a_word() {
+        let mut e = editor_with("   foo");
+        e.cursor_row = 0;
+        e.cursor_col = 0; // on whitespace, not a word
+        assert_eq!(e.select_next_occurrence(), 0);
+        assert!(e.selection.is_none());
     }
 
     // ---- Toggle Word Wrap (Alt+Z) ----

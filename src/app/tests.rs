@@ -15133,6 +15133,29 @@ fn breadcrumb_symbol_chain_returns_enclosing_symbols_outermost_first() {
 }
 
 #[test]
+fn cmd_d_selects_word_then_adds_the_next_match_as_a_caret() {
+    let tmp = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("a.rs");
+    std::fs::write(&f, "foo foo foo\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&f).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.editor.cursor_col = 1; // inside the first "foo"
+    app.handle_key(key(KeyCode::Char('d'), KeyModifiers::SUPER))
+        .unwrap();
+    assert!(
+        app.editor.selection.is_some() && !app.editor.has_multi_cursor(),
+        "first Cmd+D selects the word only"
+    );
+    app.handle_key(key(KeyCode::Char('d'), KeyModifiers::SUPER))
+        .unwrap();
+    assert!(
+        app.editor.has_multi_cursor(),
+        "second Cmd+D adds the next match as a caret"
+    );
+}
+
+#[test]
 fn build_sticky_lines_pins_enclosing_headers_scrolled_above_the_viewport() {
     use crate::lsp::manager::OutlineKind;
     let tmp = tempfile::tempdir().unwrap();
