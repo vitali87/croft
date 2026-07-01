@@ -3841,6 +3841,21 @@ impl Editor {
     /// left, then a close to the right; failing all four it falls back to the
     /// enclosing pair, then the next bracket forward.
     fn find_bracket_pair(&self) -> Option<(BPos, BPos, bool)> {
+        if let Some(pair) = self.adjacent_bracket_pair() {
+            return Some(pair);
+        }
+        if let Some((open, close)) = self.enclosing_brackets() {
+            return Some((open, close, false));
+        }
+        self.next_bracket_pair().map(|(o, c)| (o, c, false))
+    }
+
+    /// The bracket pair whose bracket sits immediately to the left or right of
+    /// the caret, as `(open, close, anchored_on_close)`. `None` when the caret
+    /// touches no bracket. Adjacency priority mirrors VS Code's `matchBracket`:
+    /// a close to the left wins, then an open to the right, then an open to the
+    /// left, then a close to the right.
+    fn adjacent_bracket_pair(&self) -> Option<(BPos, BPos, bool)> {
         let row = self.cursor_row;
         let col = self.cursor_col;
         let left = col.checked_sub(1).and_then(|c| self.char_at(row, c));
@@ -3861,10 +3876,15 @@ impl Editor {
             let close = (row, col);
             return self.match_bracket_backward(close).map(|o| (o, close, true));
         }
-        if let Some((open, close)) = self.enclosing_brackets() {
-            return Some((open, close, false));
-        }
-        self.next_bracket_pair().map(|(o, c)| (o, c, false))
+        None
+    }
+
+    /// The bracket pair to highlight (VS Code's `editorBracketMatch`): the
+    /// bracket adjacent to the caret and its match, as `(open, close)`. Unlike
+    /// [`Self::find_bracket_pair`] it never falls back to the enclosing or next
+    /// pair, so the highlight appears only when the caret is beside a bracket.
+    pub fn bracket_match_pair(&self) -> Option<(BPos, BPos)> {
+        self.adjacent_bracket_pair().map(|(o, c, _)| (o, c))
     }
 
     /// VS Code "Go to Bracket" (`editor.action.jumpToBracket`, Cmd+Shift+\):
@@ -5373,6 +5393,13 @@ impl Widget for &mut Editor {
             .filter(|s| s.has_area())
             .map(|s| s.normalised());
         let occ_needle = self.selection_occurrence_needle();
+        // Bracket-match highlight (VS Code `editorBracketMatch`): only in the
+        // focused editor, and only when the caret is beside a bracket.
+        let bracket_pair = if self.focused {
+            self.bracket_match_pair()
+        } else {
+            None
+        };
 
         for (row_idx, &(line_idx, row_start, row_end)) in visual_rows.iter().enumerate() {
             let y = inner.y + row_idx as u16;
@@ -5565,6 +5592,16 @@ impl Widget for &mut Editor {
                 let visible_end = sel_end.saturating_sub(row_start);
                 if visible_end > visible_start {
                     paint_selection_band(buf, text_x, y, row_width, visible_start, visible_end);
+                }
+            }
+
+            // Bracket-match highlight: tint the two matched bracket cells that
+            // fall on this visual row, honouring horizontal scroll.
+            if let Some((open, close)) = bracket_pair {
+                for pos in [open, close] {
+                    if pos.0 == line_idx {
+                        paint_bracket_match(buf, text_x, y, row_width, pos.1, row_start, self.theme);
+                    }
                 }
             }
 
@@ -5840,6 +5877,29 @@ fn paint_block_cursor(
             .bg(Color::Rgb(0xae, 0xc6, 0xff))
             .add_modifier(Modifier::BOLD),
     );
+}
+
+/// Tint the single bracket cell at char column `col_char` of row `y` with the
+/// theme's bracket-match background, leaving the glyph's foreground intact so
+/// the bracket stays readable. No-op when the cell is scrolled out of view.
+fn paint_bracket_match(
+    buf: &mut Buffer,
+    text_x: u16,
+    y: u16,
+    text_width: u16,
+    col_char: usize,
+    scroll_col: usize,
+    theme: crate::theme::Theme,
+) {
+    if col_char < scroll_col {
+        return;
+    }
+    let col = (col_char - scroll_col) as u16;
+    if col >= text_width {
+        return;
+    }
+    let cell = &mut buf[(text_x + col, y)];
+    cell.set_style(cell.style().bg(theme.bracket_match_bg()));
 }
 
 /// Apply the selection background colour to columns `[start_char..end_char)`
@@ -11899,6 +11959,54 @@ mod tests {
         e.cursor_col = 2;
         assert!(!e.jump_to_matching_bracket());
         assert_eq!((e.cursor_row, e.cursor_col), (0, 2));
+    }
+
+    // ---- Bracket match highlight (editorBracketMatch) ----
+
+    #[test]
+    fn bracket_match_pair_from_open_returns_both_brackets() {
+        let mut e = editor_with("foo(bar)baz");
+        e.cursor_col = 3; // immediately before '('
+        assert_eq!(e.bracket_match_pair(), Some(((0, 3), (0, 7))));
+    }
+
+    #[test]
+    fn bracket_match_pair_from_after_close_returns_both_brackets() {
+        let mut e = editor_with("foo(bar)baz");
+        e.cursor_col = 8; // immediately after ')'
+        assert_eq!(e.bracket_match_pair(), Some(((0, 3), (0, 7))));
+    }
+
+    #[test]
+    fn bracket_match_pair_none_when_caret_touches_no_bracket() {
+        let mut e = editor_with("foo(bar)baz");
+        e.cursor_col = 5; // inside the pair but not adjacent to a bracket
+        assert_eq!(e.bracket_match_pair(), None);
+    }
+
+    #[test]
+    fn render_paints_bracket_match_background_on_both_brackets() {
+        let mut e = editor_with("foo(bar)baz");
+        e.focused = true;
+        e.cursor_col = 3; // beside '('
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 6,
+        };
+        let mut buf = Buffer::empty(area);
+        (&mut e).render(area, &mut buf);
+        let text_x = e.last_inner.x + e.last_gutter_width + 1;
+        let y = e.last_inner.y;
+        let bm = e.theme.bracket_match_bg();
+        assert_eq!(buf[(text_x + 3, y)].bg, bm, "the '(' is highlighted");
+        assert_eq!(buf[(text_x + 7, y)].bg, bm, "the ')' is highlighted");
+        assert_ne!(
+            buf[(text_x + 5, y)].bg,
+            bm,
+            "a non-bracket cell is not highlighted"
+        );
     }
 
     // ---- Select to Bracket (editor.action.selectToBracket) ----

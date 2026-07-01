@@ -231,6 +231,14 @@ impl Theme {
         Color::Rgb(mix(fg.0, br), mix(fg.1, bgc), mix(fg.2, bb))
     }
 
+    /// Background box under a matched bracket pair. VS Code paints
+    /// `editorBracketMatch.border` (a subtle outline) which a terminal cell
+    /// can't carry, so a faint grey fill blended over each theme's background
+    /// stands in, staying legible on both dark themes.
+    pub fn bracket_match_bg(self) -> Color {
+        self.blend_over_bg((0x9a, 0x9a, 0x9a), 0.35)
+    }
+
     /// Git gutter bar for an added line (VS Code `editorGutter.addedBackground`,
     /// a vivid green). The add/modify/delete decorations are semantic status
     /// colours, identical across both dark themes and legible on either
