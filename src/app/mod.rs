@@ -2523,6 +2523,9 @@ enum SplitterDrag {
 /// can't collapse a pane to nothing.
 const EDITOR_SPLIT_MIN: u16 = 10;
 
+/// Maximum pinned sticky-scroll header rows (VS Code's default is 5).
+const STICKY_SCROLL_MAX: usize = 5;
+
 const SIDEBAR_WIDTH_DEFAULT: u16 = 32;
 const SIDEBAR_WIDTH_MIN: u16 = 12;
 const TERMINAL_HEIGHT_MIN: u16 = 3;
@@ -5537,6 +5540,71 @@ impl App {
             Ok(()) => self.status = format!("Jumped to {} line {}", path.display(), line + 1),
             Err(e) => self.status = format!("Go to definition failed: {e}"),
         }
+    }
+
+    /// The breadcrumb segments for the active editor: the workspace-relative
+    /// path folders and file name, then the enclosing symbol chain at the
+    /// caret. Empty for the welcome screen, preview tabs, and buffers with no
+    /// path (so the bar hides). Symbol crumbs carry a jump target; path crumbs
+    /// are informational.
+    fn build_breadcrumbs(&self) -> Vec<crate::widgets::editor::Crumb> {
+        use crate::widgets::editor::Crumb;
+        let Some(path) = self.editor.path.as_deref() else {
+            return Vec::new();
+        };
+        if self.editor.diff.is_some() || self.editor.sheet.is_some() || self.editor.image.is_some()
+        {
+            return Vec::new();
+        }
+        let mut crumbs = Vec::new();
+        let rel = path.strip_prefix(&self.workspace_root).unwrap_or(path);
+        for comp in rel.components() {
+            if let std::path::Component::Normal(os) = comp {
+                crumbs.push(Crumb {
+                    label: os.to_string_lossy().into_owned(),
+                    target: None,
+                });
+            }
+        }
+        // Symbol scope chain, only when the outline belongs to this file so a
+        // stale outline from the previous tab never leaks into the bar.
+        if self.outline.path() == Some(path) {
+            let line = self.editor.cursor_row as u32;
+            let symbols = self.outline.symbols();
+            for i in breadcrumb_symbol_chain(symbols, line) {
+                let s = &symbols[i];
+                crumbs.push(Crumb {
+                    label: s.name.clone(),
+                    target: Some((s.line, s.character)),
+                });
+            }
+        }
+        crumbs
+    }
+
+    /// The scope-header lines to pin as sticky scroll: the enclosing symbols of
+    /// the top visible line whose header has scrolled above the viewport,
+    /// outermost first, capped. Empty when the feature does not apply (welcome
+    /// screen, preview tab, no outline, or nothing scrolled off).
+    fn build_sticky_lines(&self) -> Vec<u32> {
+        let Some(path) = self.editor.path.as_deref() else {
+            return Vec::new();
+        };
+        if self.editor.diff.is_some() || self.editor.sheet.is_some() || self.editor.image.is_some()
+        {
+            return Vec::new();
+        }
+        if self.outline.path() != Some(path) {
+            return Vec::new();
+        }
+        let top = self.editor.scroll as u32;
+        let symbols = self.outline.symbols();
+        breadcrumb_symbol_chain(symbols, top)
+            .into_iter()
+            .map(|i| symbols[i].range_start_line)
+            .filter(|&l| l < top)
+            .take(STICKY_SCROLL_MAX)
+            .collect()
     }
 
     /// Keep the OUTLINE in sync with the active editor: request fresh symbols
@@ -8854,6 +8922,12 @@ impl App {
             // mirroring the terminal pane buttons' hover affordance.
             let pointer = self.pointer_cell;
             self.editor.hover_pointer = pointer;
+            // Breadcrumb bar: recompute the path + symbol trail for the active
+            // file each frame so it tracks caret moves and outline updates.
+            self.editor.breadcrumbs = self.build_breadcrumbs();
+            // Sticky scroll: recompute the pinned scope headers from the top
+            // visible line each frame so they track scrolling.
+            self.editor.sticky_lines = self.build_sticky_lines();
             // Render the editor group layout tree. The active group is hoisted
             // into `self.editor`; every other group lives in `editor_layout`.
             // Lay the leaves out and paint each at its rect (depth-first order),
@@ -19554,7 +19628,15 @@ impl App {
                         }
                     }
                 } else if in_editor_pane && !in_editor {
-                    if let Some(idx) = self.editor.close_at(m.column, m.row) {
+                    if let Some((line, col)) = self.editor.breadcrumb_target_at(m.column, m.row) {
+                        // A click on a symbol crumb jumps to that symbol (same
+                        // file); path crumbs return None and fall through.
+                        self.focus_pane(Pane::Editor);
+                        if let Some(path) = self.editor.path.clone() {
+                            self.go_to_definition(path, line, col);
+                        }
+                        self.poke_cursor();
+                    } else if let Some(idx) = self.editor.close_at(m.column, m.row) {
                         // The close cell of a pinned tab is an unpin button (it
                         // shows a thumb-tack, not the close cross), matching VS
                         // Code: a pinned tab is never closed by that click.
@@ -19578,6 +19660,15 @@ impl App {
                     }
                 } else if in_editor {
                     self.focus_pane(Pane::Editor);
+                    // A click on a pinned sticky-scroll header jumps to that
+                    // scope instead of moving the caret into the covered line.
+                    if let Some(line) = self.editor.sticky_line_at(m.column, m.row) {
+                        if let Some(path) = self.editor.path.clone() {
+                            self.go_to_definition(path, line, 0);
+                        }
+                        self.poke_cursor();
+                        return;
+                    }
                     // Mirror of the terminal branch: a selection lives in one
                     // pane only, so anchoring one in the editor drops any
                     // leftover terminal selection (issue #23).
@@ -22870,6 +22961,32 @@ fn is_trim_trailing_whitespace_key(key: KeyEvent) -> bool {
 /// `Shift+Alt+F`). Reformats the whole buffer through the language server.
 fn is_format_document_key(key: KeyEvent) -> bool {
     is_cmd_alt_shift_letter(key, 'f')
+}
+
+/// The breadcrumb scope chain for `line`: the indices of every outline symbol
+/// whose range encloses the caret line, ordered outermost first (the enclosing
+/// class before the method inside it). Sibling symbols never overlap, so the
+/// enclosing symbols form a single nesting chain and ordering by decreasing
+/// span puts the outermost first.
+fn breadcrumb_symbol_chain(
+    symbols: &[crate::lsp::manager::OutlineSymbol],
+    line: u32,
+) -> Vec<usize> {
+    let mut hits: Vec<usize> = symbols
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| line >= s.range_start_line && line <= s.range_end_line)
+        .map(|(i, _)| i)
+        .collect();
+    hits.sort_by(|&a, &b| {
+        let span = |i: usize| symbols[i].range_end_line - symbols[i].range_start_line;
+        span(b).cmp(&span(a)).then(
+            symbols[a]
+                .range_start_line
+                .cmp(&symbols[b].range_start_line),
+        )
+    });
+    hits
 }
 
 /// VS Code "Quick Fix": `Cmd+.` on macOS (delivered as `Char('.')` + SUPER by

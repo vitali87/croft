@@ -383,8 +383,7 @@ mod tests {
 
     #[test]
     fn round_trips_format_on_save_and_old_configs_default_off() {
-        let dir =
-            std::env::temp_dir().join(format!("croft-prefs-fos-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("croft-prefs-fos-test-{}", std::process::id()));
         let path = dir.join("config.json");
         let prefs = Prefs {
             format_on_save: true,

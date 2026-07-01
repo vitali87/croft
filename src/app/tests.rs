@@ -15094,6 +15094,94 @@ fn unsaved_count_tracks_dirty_editors() {
     );
 }
 
+fn sym(
+    name: &str,
+    kind: crate::lsp::manager::OutlineKind,
+    depth: u16,
+    start: u32,
+    end: u32,
+) -> crate::lsp::manager::OutlineSymbol {
+    crate::lsp::manager::OutlineSymbol {
+        name: name.to_string(),
+        detail: None,
+        kind,
+        depth,
+        line: start,
+        character: 0,
+        range_start_line: start,
+        range_end_line: end,
+    }
+}
+
+#[test]
+fn breadcrumb_symbol_chain_returns_enclosing_symbols_outermost_first() {
+    use crate::lsp::manager::OutlineKind;
+    let symbols = vec![
+        sym("Widget", OutlineKind::Class, 0, 0, 20),
+        sym("build", OutlineKind::Method, 1, 2, 8),
+        sym("paint", OutlineKind::Method, 1, 10, 18),
+    ];
+    // Caret on line 4 sits inside Widget::build.
+    let chain = breadcrumb_symbol_chain(&symbols, 4);
+    assert_eq!(chain, vec![0, 1], "outermost (Widget) then inner (build)");
+    // Caret on line 15 sits inside Widget::paint.
+    assert_eq!(breadcrumb_symbol_chain(&symbols, 15), vec![0, 2]);
+    // Caret on line 0 (the class header) is inside the class only.
+    assert_eq!(breadcrumb_symbol_chain(&symbols, 0), vec![0]);
+    // Caret past every symbol has no scope chain.
+    assert!(breadcrumb_symbol_chain(&symbols, 30).is_empty());
+}
+
+#[test]
+fn build_sticky_lines_pins_enclosing_headers_scrolled_above_the_viewport() {
+    use crate::lsp::manager::OutlineKind;
+    let tmp = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("m.rs");
+    std::fs::write(&f, "x\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&f).unwrap();
+    app.outline.set_symbols(
+        f.clone(),
+        vec![
+            sym("Widget", OutlineKind::Class, 0, 0, 40),
+            sym("build", OutlineKind::Method, 1, 10, 30),
+        ],
+    );
+    // Scrolled deep inside build: both the class and method headers are above.
+    app.editor.scroll = 20;
+    assert_eq!(app.build_sticky_lines(), vec![0, 10], "outermost first");
+    // Scrolled inside the class but above the method: only the class pins.
+    app.editor.scroll = 5;
+    assert_eq!(app.build_sticky_lines(), vec![0]);
+    // Parked on the class header itself: nothing is scrolled off, so no pins.
+    app.editor.scroll = 0;
+    assert!(app.build_sticky_lines().is_empty());
+}
+
+#[test]
+fn build_breadcrumbs_lists_path_segments_then_the_symbol_chain() {
+    use crate::lsp::manager::OutlineKind;
+    let tmp = tempfile::tempdir().unwrap();
+    let sub = tmp.path().join("src");
+    std::fs::create_dir_all(&sub).unwrap();
+    let f = sub.join("m.rs");
+    std::fs::write(&f, "fn a() {}\nfn b() {\n    x\n}\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&f).unwrap();
+    app.outline
+        .set_symbols(f.clone(), vec![sym("b", OutlineKind::Function, 0, 1, 3)]);
+    app.editor.cursor_row = 2; // inside fn b
+    let crumbs = app.build_breadcrumbs();
+    let labels: Vec<&str> = crumbs.iter().map(|c| c.label.as_str()).collect();
+    assert_eq!(labels, vec!["src", "m.rs", "b"]);
+    assert_eq!(crumbs[0].target, None, "path crumbs are informational");
+    assert_eq!(
+        crumbs[2].target,
+        Some((1, 0)),
+        "symbol crumb jumps to itself"
+    );
+}
+
 #[test]
 fn toggle_format_on_save_command_flips_the_pref_and_reports_it() {
     use crate::widgets::command_palette::Command;
@@ -15136,7 +15224,10 @@ fn complete_pending_save_writes_formatted_buffer_to_disk() {
     app.editor.insert_char('y');
     app.save_after_format = true;
     app.complete_pending_save();
-    assert!(!app.save_after_format, "the deferred-save latch is consumed");
+    assert!(
+        !app.save_after_format,
+        "the deferred-save latch is consumed"
+    );
     let on_disk = std::fs::read_to_string(&f).unwrap();
     assert!(
         on_disk.starts_with('y'),

@@ -1304,6 +1304,14 @@ pub struct Editor {
     /// Each entry is a full selection (anchor and head); head is that caret's
     /// cursor. Edits apply to the primary and all of these as one undo step.
     pub carets: Vec<EditorSelection>,
+    /// Enclosing scope header lines to pin at the top of the viewport (VS Code
+    /// "Sticky Scroll"), outermost first, set by `App` from the outline scope
+    /// chain of the top visible line. Empty disables the feature (e.g. wrap
+    /// mode, no symbols, or nothing scrolled off).
+    pub sticky_lines: Vec<u32>,
+    /// Screen `(row, logical line)` pairs the sticky bar painted last render, so
+    /// `App` can map a click on a pinned header to a jump.
+    sticky_click_rows: Vec<(u16, u32)>,
     /// Currently-collapsed fold headers, as 0-based logical line indexes. A
     /// header's body (the more-indented lines below it, up to `fold_range`'s
     /// end) is hidden from the render while its index is in this set. Purely a
@@ -1460,6 +1468,8 @@ impl Editor {
             last_gutter_width: 0,
             selection: None,
             carets: Vec::new(),
+            sticky_lines: Vec::new(),
+            sticky_click_rows: Vec::new(),
             folded: std::collections::BTreeSet::new(),
             fold_epoch_lines: 0,
             preview: false,
@@ -5600,7 +5610,9 @@ impl Widget for &mut Editor {
             if let Some((open, close)) = bracket_pair {
                 for pos in [open, close] {
                     if pos.0 == line_idx {
-                        paint_bracket_match(buf, text_x, y, row_width, pos.1, row_start, self.theme);
+                        paint_bracket_match(
+                            buf, text_x, y, row_width, pos.1, row_start, self.theme,
+                        );
                     }
                 }
             }
@@ -5635,6 +5647,40 @@ impl Widget for &mut Editor {
             // `frame.set_cursor_position(...)` so the blink/overlay never
             // hides the underlying character.
         }
+
+        // Sticky scroll: pin the enclosing scope headers to the top of the
+        // viewport, overpainting the topmost content rows (VS Code's sticky
+        // widget floats over the content the same way). Non-wrap only; the app
+        // supplies the header lines outermost-first, already filtered to those
+        // scrolled above the viewport.
+        self.sticky_click_rows.clear();
+        if !wrap && !self.sticky_lines.is_empty() && inner.height > 1 {
+            let bg = self.theme.sticky_scroll_bg();
+            let text_w = (inner.x + inner.width).saturating_sub(text_x);
+            let max_rows = (inner.height - 1) as usize;
+            let sticky = self.sticky_lines.clone();
+            for (i, &line) in sticky.iter().take(max_rows).enumerate() {
+                let y = inner.y + i as u16;
+                for x in inner.x..inner.x + inner.width {
+                    buf[(x, y)].set_symbol(" ");
+                    buf[(x, y)].set_style(Style::default().bg(bg));
+                }
+                let line_no = format!(
+                    "{:>width$} ",
+                    line + 1,
+                    width = gutter_width.saturating_sub(1) as usize
+                );
+                buf.set_string(
+                    inner.x,
+                    y,
+                    &line_no,
+                    Style::default().fg(Color::DarkGray).bg(bg),
+                );
+                self.paint_highlighted_line(buf, text_x, y, text_w, line as usize);
+                self.sticky_click_rows.push((y, line));
+            }
+        }
+
         if let Some(metrics) = scrollbar_metrics {
             scrollbar::render_vertical(buf, metrics, self.focused, self.theme);
         }
@@ -5645,6 +5691,52 @@ impl Widget for &mut Editor {
 }
 
 impl Editor {
+    /// Paint logical line `line_idx`'s syntax/semantic-highlighted text at row
+    /// `y` from column 0 (no horizontal scroll), clipped to `width`. Used by
+    /// the sticky-scroll bar to render pinned scope headers. Assumes the row
+    /// background is already filled by the caller.
+    fn paint_highlighted_line(
+        &self,
+        buf: &mut Buffer,
+        text_x: u16,
+        y: u16,
+        width: u16,
+        line_idx: usize,
+    ) {
+        let Some(raw) = self.lines.get(line_idx) else {
+            return;
+        };
+        let empty: Vec<HiSpan> = Vec::new();
+        let line_spans = self.highlights.get(line_idx).unwrap_or(&empty);
+        let sem_spans = self.semantic_overlay.get(line_idx).unwrap_or(&empty);
+        let merged = merge_overlay(line_spans, sem_spans);
+        let raw_bytes = raw.len();
+        let clamped: Vec<HiSpan> = merged
+            .into_iter()
+            .filter_map(|mut sp| {
+                if sp.start >= raw_bytes {
+                    return None;
+                }
+                sp.end = sp.end.min(raw_bytes);
+                Some(sp)
+            })
+            .collect();
+        let spans = build_line_spans(raw, &clamped);
+        buf.set_line(text_x, y, &Line::from(spans), width);
+    }
+
+    /// If `(col, row)` lands on a pinned sticky-scroll header, return the
+    /// logical line to jump to. `None` when the row is not a sticky header.
+    pub fn sticky_line_at(&self, col: u16, row: u16) -> Option<u32> {
+        if col < self.last_inner.x || col >= self.last_inner.x + self.last_inner.width {
+            return None;
+        }
+        self.sticky_click_rows
+            .iter()
+            .find(|&&(y, _)| y == row)
+            .map(|&(_, line)| line)
+    }
+
     /// Absolute (column, row) of the editor's cursor in screen coordinates,
     /// or `None` if the cursor is outside the visible viewport. Used by
     /// `App::render` to position the host terminal's hardware caret.
@@ -5967,9 +6059,30 @@ fn paint_diagnostic_underline(
 /// one, plus a 1-row clickable tab strip rendered above the active editor.
 /// `Deref`/`DerefMut` aim at the active editor so existing call sites that
 /// were written for a single `Editor` continue to work without rewrites.
+/// One segment of the breadcrumb bar (VS Code's editor breadcrumbs): a path
+/// folder, the file name, or an enclosing symbol. `target` is the caret
+/// position a click jumps to; `None` for the informational path/file crumbs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Crumb {
+    pub label: String,
+    pub target: Option<(u32, u32)>,
+}
+
+/// A rendered breadcrumb crumb's hit-test span: `(x_start, width, jump target)`.
+type BreadcrumbRange = (u16, u16, Option<(u32, u32)>);
+
 pub struct EditorTabs {
     pub editors: Vec<Editor>,
     active: usize,
+    /// Breadcrumb segments for the active file, set by `App` each frame from
+    /// the workspace-relative path and the outline scope chain at the caret.
+    /// Empty hides the bar (e.g. the welcome screen or an unsaved buffer).
+    pub breadcrumbs: Vec<Crumb>,
+    /// Per-crumb `(x_start, width, target)` recorded by the most recent render,
+    /// so `App::handle_mouse` can map a click on the breadcrumb row to a jump.
+    breadcrumb_ranges: Vec<BreadcrumbRange>,
+    /// Screen row the breadcrumb bar rendered on, or `None` when it was hidden.
+    breadcrumb_y: Option<u16>,
     /// Per-tab on-screen `(x_start, width)` recorded by the most recent
     /// render. `tab_at(col, row)` reads this to map mouse clicks to tab
     /// indices.
@@ -6005,6 +6118,9 @@ impl EditorTabs {
         Self {
             editors: vec![Editor::new()],
             active: 0,
+            breadcrumbs: Vec::new(),
+            breadcrumb_ranges: Vec::new(),
+            breadcrumb_y: None,
             tab_screen_ranges: Vec::new(),
             tab_close_x: Vec::new(),
             tab_strip_y: 0,
@@ -6869,7 +6985,7 @@ impl Widget for &mut EditorTabs {
             width: area.width,
             height: strip_h,
         };
-        let body = Rect {
+        let mut body = Rect {
             x: area.x,
             y: area.y + strip_h,
             width: area.width,
@@ -6983,8 +7099,72 @@ impl Widget for &mut EditorTabs {
             cursor_x = cursor_x.saturating_add(width);
         }
 
+        // Breadcrumb bar (VS Code editor breadcrumbs): one row below the tab
+        // strip showing the file path + enclosing symbol chain. Carve it off
+        // the body so the editor's own coordinate math shrinks with it.
+        self.breadcrumb_ranges.clear();
+        self.breadcrumb_y = None;
+        if !self.breadcrumbs.is_empty() && body.height > 1 {
+            let crumb_y = body.y;
+            self.breadcrumb_y = Some(crumb_y);
+            let theme = self.editors[active].theme;
+            let bg = theme.editor_bg();
+            for x in area.x..area.x + area.width {
+                buf[(x, crumb_y)].set_symbol(" ");
+                buf[(x, crumb_y)].set_style(Style::default().bg(bg));
+            }
+            let max_x = area.x + area.width;
+            let mut x = area.x + 1;
+            for (i, crumb) in self.breadcrumbs.iter().enumerate() {
+                if i > 0 {
+                    let sep = " \u{203A} "; // " › "
+                    let sw = sep.chars().count() as u16;
+                    if x + sw >= max_x {
+                        break;
+                    }
+                    buf.set_string(x, crumb_y, sep, Style::default().fg(Color::DarkGray).bg(bg));
+                    x += sw;
+                }
+                if x >= max_x {
+                    break;
+                }
+                let avail = (max_x - x) as usize;
+                let shown: String = crumb.label.chars().take(avail).collect();
+                let sw = shown.chars().count() as u16;
+                // Symbol crumbs (clickable) read brighter than the informational
+                // path crumbs, mirroring VS Code's active/inactive breadcrumbs.
+                let fg = if crumb.target.is_some() {
+                    Color::Gray
+                } else {
+                    Color::DarkGray
+                };
+                buf.set_string(x, crumb_y, &shown, Style::default().fg(fg).bg(bg));
+                self.breadcrumb_ranges.push((x, sw, crumb.target));
+                x += sw;
+            }
+            body = Rect {
+                y: body.y + 1,
+                height: body.height - 1,
+                ..body
+            };
+        }
+
         let active_editor = &mut self.editors[active];
         Widget::render(active_editor, body, buf);
+    }
+}
+
+impl EditorTabs {
+    /// If `(col, row)` lands on a breadcrumb crumb with a jump target, return
+    /// the caret position to navigate to. Path/file crumbs return `None`.
+    pub fn breadcrumb_target_at(&self, col: u16, row: u16) -> Option<(u32, u32)> {
+        if self.breadcrumb_y != Some(row) {
+            return None;
+        }
+        self.breadcrumb_ranges
+            .iter()
+            .find(|&&(x, w, _)| col >= x && col < x + w)
+            .and_then(|&(_, _, target)| target)
     }
 }
 
@@ -11959,6 +12139,104 @@ mod tests {
         e.cursor_col = 2;
         assert!(!e.jump_to_matching_bracket());
         assert_eq!((e.cursor_row, e.cursor_col), (0, 2));
+    }
+
+    // ---- Breadcrumbs bar ----
+
+    #[test]
+    fn breadcrumb_row_renders_below_tab_strip_and_maps_symbol_clicks() {
+        let mut tabs = EditorTabs::new();
+        tabs.breadcrumbs = vec![
+            Crumb {
+                label: "src".into(),
+                target: None,
+            },
+            Crumb {
+                label: "m.rs".into(),
+                target: None,
+            },
+            Crumb {
+                label: "build".into(),
+                target: Some((5, 2)),
+            },
+        ];
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 10,
+        };
+        let mut buf = Buffer::empty(area);
+        (&mut tabs).render(area, &mut buf);
+        // The bar sits on the row directly below the one-row tab strip.
+        let by = area.y + 1;
+        // Somewhere on the bar a click lands on the "build" symbol crumb and
+        // resolves to its jump target; the path crumbs resolve to nothing.
+        let hit = (0..area.width).find_map(|x| tabs.breadcrumb_target_at(x, by));
+        assert_eq!(hit, Some((5, 2)), "clicking the symbol crumb jumps there");
+        // A click off the bar (the tab strip row) never maps to a crumb.
+        assert_eq!(tabs.breadcrumb_target_at(10, area.y), None);
+    }
+
+    #[test]
+    fn breadcrumb_bar_hidden_when_there_are_no_crumbs() {
+        let mut tabs = EditorTabs::new();
+        tabs.breadcrumbs.clear();
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 10,
+        };
+        let mut buf = Buffer::empty(area);
+        (&mut tabs).render(area, &mut buf);
+        assert_eq!(tabs.breadcrumb_target_at(10, area.y + 1), None);
+    }
+
+    // ---- Sticky scroll ----
+
+    #[test]
+    fn sticky_scroll_pins_header_rows_and_maps_clicks_to_their_lines() {
+        let text = (0..40)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut e = editor_with(&text);
+        e.focused = true;
+        e.scroll = 20;
+        e.sticky_lines = vec![0, 10];
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 15,
+        };
+        let mut buf = Buffer::empty(area);
+        (&mut e).render(area, &mut buf);
+        let top = e.last_inner.y;
+        assert_eq!(e.sticky_line_at(5, top), Some(0), "row 0 pins line 0");
+        assert_eq!(e.sticky_line_at(5, top + 1), Some(10), "row 1 pins line 10");
+        assert_eq!(
+            e.sticky_line_at(5, top + 5),
+            None,
+            "a content row below the band is not sticky"
+        );
+    }
+
+    #[test]
+    fn sticky_scroll_hidden_without_pinned_lines() {
+        let mut e = editor_with("a\nb\nc\n");
+        e.focused = true;
+        e.sticky_lines.clear();
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 10,
+        };
+        let mut buf = Buffer::empty(area);
+        (&mut e).render(area, &mut buf);
+        assert_eq!(e.sticky_line_at(5, e.last_inner.y), None);
     }
 
     // ---- Bracket match highlight (editorBracketMatch) ----

@@ -239,6 +239,13 @@ impl Theme {
         self.blend_over_bg((0x9a, 0x9a, 0x9a), 0.35)
     }
 
+    /// Background of the pinned sticky-scroll header rows (VS Code
+    /// `editorStickyScroll.background`): the editor background lifted a hair so
+    /// the pinned scope headers read as a distinct band above the content.
+    pub fn sticky_scroll_bg(self) -> Color {
+        self.blend_over_bg((0xff, 0xff, 0xff), 0.06)
+    }
+
     /// Git gutter bar for an added line (VS Code `editorGutter.addedBackground`,
     /// a vivid green). The add/modify/delete decorations are semantic status
     /// colours, identical across both dark themes and legible on either
