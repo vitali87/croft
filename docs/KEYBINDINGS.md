@@ -49,6 +49,7 @@ On macOS, the `Cmd` chords below only reach croft after you run a one-time setup
 | `Cmd+K` `Shift+O` | Move into New Window: same, and close the file's tab here (macOS only) |
 | `Cmd+K` `Z` | Toggle Zen Mode: hide the activity bar, both side bars, the panel, and the status bar; press again to restore exactly what was shown before |
 | `Cmd+K` `B` | Show the Testing view (beaker icon); it discovers tests on first open. In the view: Enter runs all tests, `r` re-discovers, ↑/↓ scroll |
+| `Cmd+K` `F` | Toggle Format on Save: when on, `Cmd+S` reformats through the language server before writing (also in the Command Palette) |
 | `Cmd+K` `Cmd+L` | Toggle the code fold at the cursor: collapse the enclosing indented block (function, loop, struct) to its header line, or re-expand it |
 | `Cmd+K` `Cmd+0` | Fold All: collapse every foldable block in the buffer |
 | `Cmd+K` `Cmd+J` | Unfold All: expand every collapsed block |
@@ -169,6 +170,9 @@ Every choice except the side-bar / panel visibility persists across launches in 
 | `Cmd`+`Opt`+`Shift`+`A` / `D` | Sort the selected lines (or the whole file) Ascending / Descending |
 | `Cmd`+`Opt`+`Shift`+`W` | Trim Trailing Whitespace: strip trailing spaces and tabs from every line |
 | `Cmd`+`Opt`+`Shift`+`F` | Format Document: reformat the whole buffer through the language server (rustfmt, ruff, prettier, …); the edit lands as one undo step and leaves the tab dirty |
+| `Cmd+K` `F` | Toggle Format on Save: when on, `Cmd+S` formats through the language server before writing (off by default, matching VS Code) |
+| Click a breadcrumb symbol | The breadcrumbs bar above the editor shows the file path and the enclosing symbol trail at the caret; clicking a symbol crumb jumps to it |
+| Click a sticky-scroll header | Sticky scroll pins the enclosing scope headers (class, function) to the top while you scroll; clicking one jumps to that line |
 | Click the gutter fold chevron | Toggle the fold on that line: a `▾` marks an expanded foldable block (a function, loop, struct — any line whose body is more indented), a `▸` marks a collapsed one. Also on `Cmd+K` `Cmd+L` at the cursor, and Command Palette "Toggle Fold" / "Fold All" / "Unfold All" |
 | Mouse drag | Select text; every other occurrence of a single-line selection highlights in blue |
 | `Ctrl`+`C` / `Cmd`+`C` | Copy the selection to the system clipboard |
@@ -184,12 +188,15 @@ Every choice except the side-bar / panel visibility persists across launches in 
 | `Ctrl`+`Shift`+`o` / `Cmd`+`Shift`+`O` | Go to Symbol in Editor: fuzzy-search the file's symbols and jump (type `:` then a number to go to a line) |
 | `Cmd`+`g` `g` | Go to the top of the file (`Cmd`+`N` `Cmd`+`g` `g` for line N) |
 | `Cmd`+`Shift`+`G` | Go to the bottom of the file (with a leading count, that line) |
-| `Cmd`+`d` `d` | Delete the current line (`Cmd`+`N` `Cmd`+`d` `d` for N lines; yanks to clipboard) |
+| `Cmd`+`Shift`+`K` / `Ctrl`+`Shift`+`K` | Delete Line: remove the cursor's line, or every line a selection touches; yanks to clipboard |
 | `Cmd`+`y` `y` | Yank the current line (`Cmd`+`N` `Cmd`+`y` `y` for N lines) |
+| `Cmd`+`D` / `Ctrl`+`D` | Add Selection to Next Find Match: select the word under the cursor, then grow the multi-cursor one occurrence per press |
+| `Option`+click | Add (or toggle off) a secondary caret at the click |
+| `Shift`+`Option`+drag | Column (box) selection: one caret per spanned row |
+| `Cmd`+`F2` / `Ctrl`+`F2` | Change All Occurrences of the word under the cursor at once |
 | `Esc` | Clear the selection, or collapse multi-cursors back to one |
 | `Cmd`+`.` / `Ctrl`+`.` | Quick Fix: ask the language server for the code actions at the cursor (auto-import, fix-all, organize imports, refactors) and pick one from a menu; the diagnostics on the line ride along as context. One action with a deferred edit resolves and applies on pick (`codeAction/resolve`); also on the editor right-click menu and as Command Palette "Quick Fix" |
 | `F2` | Rename Symbol across every file it touches (open tabs edit in-memory and stay dirty) |
-| `Cmd`+`F2` / `Ctrl`+`F2` | Change All Occurrences in the current file; type to replace, `Esc` to finish |
 | `F12` / `Cmd`/`Option`+click | Go to Definition (`Cmd`+`Shift`+click navigates back) |
 | `Shift`+`F12` | Go to References (project-wide; one use jumps, several open a picker) |
 | `Ctrl`+`Shift`+`F12` | Go to Declaration (where the server implements it; hidden for TypeScript) |
@@ -361,6 +368,10 @@ The PORTS tab in the bottom panel group lists the loopback ports croft has notic
 | `⌘⌥⇧A` / `⌘⌥⇧D` | Sort Lines Ascending / Descending |
 | `⌘⌥⇧W` | Trim Trailing Whitespace |
 | `⌘⌥⇧F` | Format Document (reformat the whole buffer via the language server) |
+| `⌘K` `F` | Toggle Format on Save |
+| `⌘D` | Add Selection to Next Find Match (multi-cursor) |
+| `⌘⇧K` | Delete Line |
+| `⌥`+click / `⇧⌥`+drag | Add a caret / column (box) selection |
 | `⌥⌘←` / `⌥⌘→` | Focus the left / right editor group |
 | `⌘F12` | Go to Implementations |
 | `⌃⇧F12` | Go to Declaration |

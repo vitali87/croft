@@ -59,7 +59,25 @@ pub struct ReleaseNote {
 }
 
 /// What shipped in the current release. Replace on every version bump.
-pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
-    kind: NoteKind::Fix,
-    summary: "Opening a parent-of-repos folder (e.g. ~/Documents) no longer scans the whole tree: the watch-target walk is now budget-capped, cutting startup/rebind from ~7.6s over 140k dirs to under 0.4s, with the adaptive poll covering the rest.",
-}];
+pub const RELEASE_NOTES: &[ReleaseNote] = &[
+    ReleaseNote {
+        kind: NoteKind::Feature,
+        summary: "Breadcrumbs bar above the editor shows the file path and the enclosing symbol trail at the caret; click a symbol crumb to jump to it.",
+    },
+    ReleaseNote {
+        kind: NoteKind::Feature,
+        summary: "Sticky scroll pins the enclosing scope headers (class, function) to the top of the editor while you scroll; click one to jump there.",
+    },
+    ReleaseNote {
+        kind: NoteKind::Feature,
+        summary: "Multi-cursor: Cmd+D adds the next match one at a time, Opt+click drops a caret, and Shift+Alt+drag makes a column selection.",
+    },
+    ReleaseNote {
+        kind: NoteKind::Feature,
+        summary: "Bracket matching highlights the bracket beside the caret and its partner.",
+    },
+    ReleaseNote {
+        kind: NoteKind::Feature,
+        summary: "Format on Save (toggle from the palette or Cmd+K F) reformats through the language server before writing.",
+    },
+];
