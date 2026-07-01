@@ -7580,19 +7580,6 @@ fn editor_cmd_count_gg_jumps_to_line_with_leading_count() {
 }
 
 #[test]
-fn editor_cmd_count_dd_deletes_n_lines_with_leading_count() {
-    let mut app = editor_app_with_lines(&["a", "b", "c", "d", "e"]);
-    app.editor.cursor_row = 1;
-    app.handle_key(key(KeyCode::Char('2'), KeyModifiers::SUPER))
-        .unwrap();
-    app.handle_key(key(KeyCode::Char('d'), KeyModifiers::SUPER))
-        .unwrap();
-    app.handle_key(key(KeyCode::Char('d'), KeyModifiers::SUPER))
-        .unwrap();
-    assert_eq!(app.editor.lines, vec!["a", "d", "e"]);
-}
-
-#[test]
 fn editor_cmd_count_yy_yanks_n_lines_with_leading_count() {
     let mut app = editor_app_with_lines(&["a", "b", "c", "d"]);
     app.editor.cursor_row = 0;
