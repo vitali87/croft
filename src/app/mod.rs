@@ -2339,7 +2339,6 @@ enum VimOp {
     #[default]
     None,
     G,
-    D,
     Y,
 }
 
@@ -6783,6 +6782,31 @@ impl App {
         } else if n > 1 {
             self.status = format!("Selected {n} occurrences (type to replace, Esc to cancel)");
         }
+    }
+
+    /// VS Code "Delete Line" (`Cmd+Shift+K`): delete the cursor's line, or
+    /// every line a selection touches, yanking the removed text to the
+    /// clipboard. Replaces the old `Cmd+d d` convenience, whose leader now
+    /// belongs to Add Selection to Next Match.
+    fn delete_current_line(&mut self) {
+        if self.editor.diff.is_some() || self.editor.sheet.is_some() || self.editor.image.is_some()
+        {
+            return;
+        }
+        let n = if let Some(sel) = self.editor.selection {
+            let (a, h) = sel.normalised();
+            self.editor.cursor_row = a.0;
+            self.editor.cursor_col = 0;
+            self.editor.clear_selection();
+            h.0 - a.0 + 1
+        } else {
+            1
+        };
+        let yanked = self.editor.delete_lines(n);
+        if !yanked.is_empty() {
+            copy_to_clipboard(&yanked);
+        }
+        self.status = format!("Deleted {n} {}", if n == 1 { "line" } else { "lines" });
     }
 
     /// VS Code "Rename Symbol" (F2): prompt for a new name pre-filled with the
@@ -14088,6 +14112,10 @@ impl App {
             self.start_select_next_occurrence();
             return;
         }
+        if is_delete_line_key(key) {
+            self.delete_current_line();
+            return;
+        }
         // VS Code "Reveal in Finder" (Cmd+Opt+R) for the active file. Works on
         // any tab backed by a real path (text, diff, sheet, image), so it sits
         // above the text-only guards. Local-macOS only, matching the Explorer
@@ -14632,7 +14660,6 @@ impl App {
                 .saturating_add(d);
             let op = match self.editor_vim_chord.op {
                 VimOp::G => 'g',
-                VimOp::D => 'd',
                 VimOp::Y => 'y',
                 VimOp::None => ' ',
             };
@@ -14644,11 +14671,6 @@ impl App {
             if is_vim_chord_g(key) {
                 self.editor_vim_chord.op = VimOp::G;
                 self.status = chord_status_text('g', self.editor_vim_chord.count);
-                return true;
-            }
-            if is_vim_chord_d(key) {
-                self.editor_vim_chord.op = VimOp::D;
-                self.status = chord_status_text('d', self.editor_vim_chord.count);
                 return true;
             }
             if is_vim_chord_y(key) {
@@ -14671,7 +14693,6 @@ impl App {
 
         let completes = match self.editor_vim_chord.op {
             VimOp::G => is_plain_letter(key, 'g') || is_vim_chord_g(key),
-            VimOp::D => is_plain_letter(key, 'd') || is_vim_chord_d(key),
             VimOp::Y => is_plain_letter(key, 'y') || is_vim_chord_y(key),
             VimOp::None => false,
         };
@@ -14687,14 +14708,6 @@ impl App {
                         self.editor.goto_top();
                         self.status = String::from("Top of file");
                     }
-                }
-                VimOp::D => {
-                    let n = count.max(1);
-                    let yanked = self.editor.delete_lines(n);
-                    if !yanked.is_empty() {
-                        copy_to_clipboard(&yanked);
-                    }
-                    self.status = format!("Deleted {n} {}", if n == 1 { "line" } else { "lines" });
                 }
                 VimOp::Y => {
                     let n = count.max(1);
@@ -17282,6 +17295,7 @@ impl App {
                 }
             }
             Cmd::JoinLines => self.editor.join_lines(),
+            Cmd::DeleteLine => self.delete_current_line(),
             Cmd::TransformUpper => self.editor.transform_selection_case(CaseTransform::Upper),
             Cmd::TransformLower => self.editor.transform_selection_case(CaseTransform::Lower),
             Cmd::TransformTitle => self.editor.transform_selection_case(CaseTransform::Title),
@@ -23407,6 +23421,16 @@ fn is_select_next_occurrence_key(key: KeyEvent) -> bool {
         && !key.modifiers.contains(KeyModifiers::ALT)
 }
 
+/// VS Code "Delete Line" (`Cmd+Shift+K` on macOS, `Ctrl+Shift+K` elsewhere).
+/// Requires Shift (to distinguish it from the `Cmd+K` chord leader) and no Alt.
+fn is_delete_line_key(key: KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char('k') | KeyCode::Char('K'))
+        && (key.modifiers.contains(KeyModifiers::SUPER)
+            || key.modifiers.contains(KeyModifiers::CONTROL))
+        && key.modifiers.contains(KeyModifiers::SHIFT)
+        && !key.modifiers.contains(KeyModifiers::ALT)
+}
+
 /// Editor-pane Go to Definition: plain `F12` (VS Code's binding). The F12
 /// navigation family splits on the modifier, matching VS Code: bare F12 is
 /// Definition, `Shift+F12` is Declaration, `Ctrl+F12` is Type Definition, and
@@ -23495,10 +23519,6 @@ fn is_vim_chord_letter(key: KeyEvent, letter: char) -> bool {
 
 fn is_vim_chord_g(key: KeyEvent) -> bool {
     is_vim_chord_letter(key, 'g')
-}
-
-fn is_vim_chord_d(key: KeyEvent) -> bool {
-    is_vim_chord_letter(key, 'd')
 }
 
 fn is_vim_chord_y(key: KeyEvent) -> bool {

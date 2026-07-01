@@ -170,6 +170,14 @@ const CMD_SHIFT_N_HEX: &str = "0x1b 0x5b 0x37 0x38 0x3b 0x31 0x30 0x75";
 /// `kVK_ANSI_T` = 0x11. CSI-u `ESC [ 84 ; 10 u`.
 const CMD_SHIFT_T_KEY: &str = "0x54-0x120000-0x11";
 const CMD_SHIFT_T_HEX: &str = "0x1b 0x5b 0x38 0x34 0x3b 0x31 0x30 0x75";
+/// `Cmd+Shift+K` — Delete Line (VS Code's binding), the new home of the
+/// delete-line action after `Cmd+D` moved to Add Selection to Next Match.
+/// Cmd+Shift+K is unbound by default macOS / iTerm2, so no NSUserKeyEquivalents
+/// relocation is needed; the GlobalKeyMap forwarder simply claims it. Codepoint
+/// 'K' (0x4b = 75), virtualKeyCode `kVK_ANSI_K` = 0x28. CSI-u `ESC [ 75 ; 10 u`
+/// (modifier byte 10 = 1 base + Shift(1) + Super(8)).
+const CMD_SHIFT_K_KEY: &str = "0x4b-0x120000-0x28";
+const CMD_SHIFT_K_HEX: &str = "0x1b 0x5b 0x37 0x35 0x3b 0x31 0x30 0x75";
 /// `Cmd+T` — open another terminal next to the active one (croft's
 /// `is_terminal_split_key`). iTerm2 binds the bare chord to the "New Tab"
 /// menu item (MainMenu.xib: `keyEquivalent="t"`); the NSUserKeyEquivalents
@@ -748,6 +756,7 @@ pub fn apply_croft_key_settings(plist: &mut Value) -> Result<(), ITerm2Error> {
         (CMD_SHIFT_L_KEY, CMD_SHIFT_L_HEX),
         (CMD_SHIFT_N_KEY, CMD_SHIFT_N_HEX),
         (CMD_SHIFT_T_KEY, CMD_SHIFT_T_HEX),
+        (CMD_SHIFT_K_KEY, CMD_SHIFT_K_HEX),
         (CMD_T_KEY, CMD_T_HEX),
         (CMD_LBRACKET_KEY, CMD_LBRACKET_HEX),
         (CMD_RBRACKET_KEY, CMD_RBRACKET_HEX),

@@ -7499,27 +7499,22 @@ fn editor_cmd_shift_g_jumps_to_bottom_of_file() {
 }
 
 #[test]
-fn editor_cmd_dd_deletes_current_line() {
+fn editor_cmd_d_now_selects_the_word_instead_of_deleting() {
+    // Cmd+D moved from the old `Cmd+d d` delete-line convenience to VS Code's
+    // "Add Selection to Next Find Match"; delete-line now lives on Cmd+Shift+K.
     let mut app = editor_app_with_lines(&["alpha", "beta", "gamma"]);
     app.editor.cursor_row = 1;
     app.handle_key(key(KeyCode::Char('d'), KeyModifiers::SUPER))
         .unwrap();
-    app.handle_key(key(KeyCode::Char('d'), KeyModifiers::SUPER))
-        .unwrap();
-    assert_eq!(app.editor.lines, vec!["alpha", "gamma"]);
-}
-
-#[test]
-fn editor_cmd_d_count_d_deletes_n_lines() {
-    let mut app = editor_app_with_lines(&["a", "b", "c", "d", "e"]);
-    app.editor.cursor_row = 1;
-    app.handle_key(key(KeyCode::Char('d'), KeyModifiers::SUPER))
-        .unwrap();
-    app.handle_key(key(KeyCode::Char('3'), KeyModifiers::NONE))
-        .unwrap();
-    app.handle_key(key(KeyCode::Char('d'), KeyModifiers::NONE))
-        .unwrap();
-    assert_eq!(app.editor.lines, vec!["a", "e"]);
+    assert_eq!(
+        app.editor.lines,
+        vec!["alpha", "beta", "gamma"],
+        "Cmd+D no longer deletes the line"
+    );
+    assert!(
+        app.editor.selection.is_some(),
+        "Cmd+D selects the word under the cursor"
+    );
 }
 
 #[test]
@@ -15152,6 +15147,27 @@ fn cmd_d_selects_word_then_adds_the_next_match_as_a_caret() {
     assert!(
         app.editor.has_multi_cursor(),
         "second Cmd+D adds the next match as a caret"
+    );
+}
+
+#[test]
+fn cmd_shift_k_deletes_the_current_line() {
+    let tmp = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("a.rs");
+    std::fs::write(&f, "one\ntwo\nthree\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&f).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.editor.cursor_row = 1; // the "two" line
+    app.handle_key(key(
+        KeyCode::Char('k'),
+        KeyModifiers::SUPER | KeyModifiers::SHIFT,
+    ))
+    .unwrap();
+    assert_eq!(
+        app.editor.lines,
+        vec!["one".to_string(), "three".to_string()],
+        "Cmd+Shift+K removes the cursor's line"
     );
 }
 
