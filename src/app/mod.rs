@@ -8260,7 +8260,7 @@ impl App {
                 frame.buffer_mut().set_style(row, Style::default().bg(bg));
             }
             let label = self.terminals[i].label().to_string();
-            let room = rail.width.saturating_sub(TERMINAL_RAIL_CHROME_W) as usize;
+            let room = TERMINAL_RAIL_LABEL_W as usize;
             let shown: String = label.chars().take(room).collect();
             let fg = if active {
                 Style::default()
@@ -9225,18 +9225,9 @@ impl App {
                     // terminal-tabs list); hidden panes drop their hit rects
                     // so clicks can't phantom-match. Otherwise: even split.
                     let cols: Vec<Rect> = if maximized {
-                        // The rail hugs the longest terminal name (plus icon
-                        // chrome) up to a hard cap, so short names like `zsh`
-                        // don't leave a mostly-empty gutter.
-                        let longest = self
-                            .terminals
-                            .iter()
-                            .map(|t| t.label().chars().count() as u16)
-                            .max()
-                            .unwrap_or(0);
-                        let rail_w = (longest + TERMINAL_RAIL_CHROME_W)
-                            .min(TERMINAL_RAIL_MAX_W)
-                            .min(content.width.saturating_sub(20));
+                        // The rail is a fixed, very narrow switcher column:
+                        // icon + 4 label characters, nothing adaptive.
+                        let rail_w = TERMINAL_RAIL_W.min(content.width.saturating_sub(20));
                         let pane = Rect {
                             x: content.x,
                             y: content.y,
@@ -24322,12 +24313,12 @@ const TERMINAL_RESTORE_LABEL: &str = " \u{eb4d} ";
 /// Codicon terminal (Nerd Fonts `cod-terminal` = U+EA85), leading each
 /// maximize-rail row the way VS Code's terminal tabs list does.
 const TERMINAL_RAIL_ICON: char = '\u{ea85}';
-/// Cells a rail row spends around the label (leading space, icon, gap,
-/// trailing pad): the rail is sized as longest-label + this chrome.
-const TERMINAL_RAIL_CHROME_W: u16 = 4;
-/// Hard cap on the rail's width: the rail hugs the terminal names and never
-/// grabs panel space beyond this; longer labels truncate inside it.
-const TERMINAL_RAIL_MAX_W: u16 = 16;
+/// How many label characters a rail row shows. Fixed and deliberately tiny:
+/// the rail is a switcher, not a directory, so four letters identify a pane.
+const TERMINAL_RAIL_LABEL_W: u16 = 4;
+/// The rail's fixed total width: leading space + icon + gap + the 4 label
+/// characters. The rail never grows past this, whatever the names are.
+const TERMINAL_RAIL_W: u16 = 3 + TERMINAL_RAIL_LABEL_W;
 
 /// True when croft was invoked over an SSH login (or otherwise inside a
 /// remote shell). Used to throttle PTY-driven redraws further so the SSH

@@ -10974,7 +10974,7 @@ fn maximized_terminal_fills_width_and_lists_others_in_rail() {
 }
 
 #[test]
-fn rail_width_hugs_short_names_and_truncates_long_ones() {
+fn rail_is_a_fixed_narrow_column_showing_four_label_chars() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.split_terminal().unwrap();
@@ -10982,26 +10982,34 @@ fn rail_width_hugs_short_names_and_truncates_long_ones() {
     let backend = ratatui::backend::TestBackend::new(180, 40);
     let mut term = ratatui::Terminal::new(backend).unwrap();
 
-    // Short names: the rail hugs them instead of grabbing a fixed slice of
-    // the panel ("Too much space left. only terminal names should be shown").
+    // The rail is a fixed, very narrow column: icon + exactly 4 label
+    // characters, regardless of how short or long the names are.
     app.terminals[0].set_manual_name(Some(String::from("zsh")));
-    app.terminals[1].set_manual_name(Some(String::from("zsh")));
-    term.draw(|f| app.render(f)).unwrap();
-    let w = app.terminal_rail_rects[0].width;
-    assert_eq!(
-        w,
-        3 + TERMINAL_RAIL_CHROME_W,
-        "rail width must be the longest label plus icon/padding chrome, got {w}"
-    );
-
-    // A long name doesn't drag the rail wide: the cap wins and the label
-    // truncates inside it.
     app.terminals[1].set_manual_name(Some(String::from("a-very-long-terminal-pane-name")));
     term.draw(|f| app.render(f)).unwrap();
-    let w = app.terminal_rail_rects[0].width;
-    assert_eq!(
-        w, TERMINAL_RAIL_MAX_W,
-        "a long label must be truncated at the rail cap, got {w}"
+    for r in &app.terminal_rail_rects {
+        assert_eq!(
+            r.width, TERMINAL_RAIL_W,
+            "the rail must always be exactly {TERMINAL_RAIL_W} cells wide"
+        );
+    }
+    // The long name is cut to its first 4 characters in the rail row.
+    let rail = app.terminal_rail_rects[1];
+    let cells: String = (rail.x..rail.x + rail.width)
+        .map(|x| {
+            term.backend()
+                .buffer()
+                .cell(ratatui::layout::Position::new(x, rail.y))
+                .unwrap()
+                .symbol()
+                .chars()
+                .next()
+                .unwrap()
+        })
+        .collect();
+    assert!(
+        cells.contains("a-ve") && !cells.contains("a-ver"),
+        "rail row must show exactly the first 4 label chars, got {cells:?}"
     );
 }
 
