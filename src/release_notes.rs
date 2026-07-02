@@ -60,6 +60,6 @@ pub struct ReleaseNote {
 
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
-    kind: NoteKind::Fix,
-    summary: "A file changed outside Croft now recolorizes correctly on auto-reload: the language server is resynced and stale semantic-token colors are dropped instead of painting the old file's colors over the new text.",
+    kind: NoteKind::Feature,
+    summary: "Git-ignored files and folders now grey out in the Explorer, matching VS Code's ignored-resource decoration: a fully ignored folder dims along with everything under it, and the shading follows .gitignore edits live.",
 }];
