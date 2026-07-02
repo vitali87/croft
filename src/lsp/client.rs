@@ -18,15 +18,15 @@ use lsp_types::{
     ClientCapabilities, CodeAction, CodeActionContext, CodeActionParams, CodeActionResponse,
     CompletionContext, CompletionParams, CompletionResponse, CompletionTriggerKind,
     Diagnostic as LspDiagnostic, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
-    DidOpenTextDocumentParams, DocumentFormattingParams, DocumentSymbolParams,
-    DocumentSymbolResponse, ExecuteCommandParams, FormattingOptions, GotoDefinitionParams,
-    GotoDefinitionResponse, Hover, HoverParams, InitializeParams, InitializedParams, Location,
-    PartialResultParams, Position, ProgressParamsValue, Range, ReferenceContext, ReferenceParams,
-    RenameParams, SemanticTokensParams, SemanticTokensRangeParams, SemanticTokensRangeResult,
-    SemanticTokensResult, ServerCapabilities, TextDocumentContentChangeEvent,
-    TextDocumentIdentifier, TextDocumentItem, TextDocumentPositionParams, TextEdit, Url,
-    VersionedTextDocumentIdentifier, WorkDoneProgress, WorkDoneProgressParams, WorkspaceEdit,
-    WorkspaceFolder,
+    DidOpenTextDocumentParams, DidSaveTextDocumentParams, DocumentFormattingParams,
+    DocumentSymbolParams, DocumentSymbolResponse, ExecuteCommandParams, FormattingOptions,
+    GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverParams, InitializeParams,
+    InitializedParams, Location, PartialResultParams, Position, ProgressParamsValue, Range,
+    ReferenceContext, ReferenceParams, RenameParams, SemanticTokensParams,
+    SemanticTokensRangeParams, SemanticTokensRangeResult, SemanticTokensResult, ServerCapabilities,
+    TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem,
+    TextDocumentPositionParams, TextEdit, Url, VersionedTextDocumentIdentifier, WorkDoneProgress,
+    WorkDoneProgressParams, WorkspaceEdit, WorkspaceFolder,
 };
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
@@ -51,6 +51,25 @@ fn msg_level(typ: lsp_types::MessageType) -> OutputLevel {
     } else {
         OutputLevel::Debug
     }
+}
+
+/// Classify a language-server stderr line by its tracing level token, so
+/// rust-analyzer's WARN/ERROR lines (e.g. "overly long loop turn" during
+/// cache priming) reach the OUTPUT panel with their real severity instead of
+/// a blanket Info. The token sits near the start of a tracing-formatted line
+/// (after an optional timestamp / opening bracket), so only the first few
+/// words are inspected; anything unrecognised stays Info.
+fn stderr_level(line: &str) -> OutputLevel {
+    for word in line.split_whitespace().take(3) {
+        match word.trim_matches(|c: char| !c.is_ascii_alphabetic()) {
+            "ERROR" => return OutputLevel::Error,
+            "WARN" | "WARNING" => return OutputLevel::Warn,
+            "INFO" => return OutputLevel::Info,
+            "DEBUG" | "TRACE" => return OutputLevel::Debug,
+            _ => {}
+        }
+    }
+    OutputLevel::Info
 }
 
 struct ClientState {
@@ -312,7 +331,7 @@ impl LspClient {
             let mut lines = BufReader::new(stderr).lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 log_file::log(&format!("lsp[{stderr_name}] stderr: {line}"));
-                output::push(&stderr_name, OutputLevel::Info, &line);
+                output::push(&stderr_name, stderr_level(&line), &line);
             }
         });
 
@@ -402,6 +421,17 @@ impl LspClient {
                 }],
             })
             .context("did_change")
+    }
+
+    pub fn did_save(&mut self, uri: Url) -> Result<()> {
+        // No `text`: rust-analyzer (the server this exists for) registers
+        // save notifications with includeText=false; it re-reads from disk.
+        self.server
+            .did_save(DidSaveTextDocumentParams {
+                text_document: TextDocumentIdentifier { uri },
+                text: None,
+            })
+            .context("did_save")
     }
 
     pub fn did_close(&mut self, uri: Url) -> Result<()> {
@@ -764,6 +794,38 @@ mod tests {
     use crate::lsp::runtime::LspRuntime;
     use async_lsp::{AnyNotification, LspService};
     use serde_json::json;
+
+    #[test]
+    fn stderr_level_reads_the_tracing_level_token() {
+        // Issue #37: rust-analyzer writes warnings to stderr in tracing
+        // format; croft showed them all as Info. The level token must map
+        // to the matching OUTPUT level.
+        assert_eq!(
+            stderr_level(
+                "2026-07-02T10:00:00Z WARN rust_analyzer::main_loop: overly long loop turn: 141ms"
+            ),
+            OutputLevel::Warn
+        );
+        assert_eq!(
+            stderr_level("[ERROR rust_analyzer::lsp] request failed"),
+            OutputLevel::Error
+        );
+        assert_eq!(
+            stderr_level("2026-07-02T10:00:00Z INFO ra: loaded workspace"),
+            OutputLevel::Info
+        );
+        assert_eq!(
+            stderr_level("2026-07-02T10:00:00Z DEBUG ra: vfs tick"),
+            OutputLevel::Debug
+        );
+        // A level word deep in the message body is not a level token.
+        assert_eq!(
+            stderr_level("loading config a b c d e ERROR handling disabled"),
+            OutputLevel::Info
+        );
+        // Unstructured stderr chatter stays Info.
+        assert_eq!(stderr_level("starting language server"), OutputLevel::Info);
+    }
 
     #[test]
     fn compose_progress_joins_title_message_and_percentage() {

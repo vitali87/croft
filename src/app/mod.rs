@@ -20393,7 +20393,10 @@ impl App {
         // lingers past the press it was meant for.
         if std::mem::take(&mut self.force_save_armed) {
             match self.editor.save_to_disk_force() {
-                Ok(()) => self.status = self.editor.status.clone(),
+                Ok(()) => {
+                    self.status = self.editor.status.clone();
+                    self.lsp_notify_saved();
+                }
                 Err(e) => self.status = format!("Save failed: {e}"),
             }
             return;
@@ -20408,10 +20411,23 @@ impl App {
         self.write_current_to_disk();
     }
 
+    /// Tell the language servers the focused file hit the disk. rust-analyzer
+    /// re-runs its check-on-save (`cargo check`, which produces the Rust
+    /// PROBLEMS entries) only on `textDocument/didSave`; without this the
+    /// panel never refreshes after a save (issue #37).
+    fn lsp_notify_saved(&mut self) {
+        if let (Some(lsp), Some(path)) = (self.lsp.as_ref(), self.editor.path.clone()) {
+            lsp.save_doc(path);
+        }
+    }
+
     fn write_current_to_disk(&mut self) {
         use crate::widgets::editor::SaveOutcome;
         match self.editor.save_to_disk() {
-            Ok(SaveOutcome::Saved) => self.status = self.editor.status.clone(),
+            Ok(SaveOutcome::Saved) => {
+                self.status = self.editor.status.clone();
+                self.lsp_notify_saved();
+            }
             Ok(SaveOutcome::DiskConflict) => {
                 self.force_save_armed = true;
                 let name = self

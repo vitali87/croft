@@ -385,6 +385,9 @@ enum Cmd {
         path: PathBuf,
         text: String,
     },
+    SaveDoc {
+        path: PathBuf,
+    },
     CloseDoc {
         path: PathBuf,
     },
@@ -630,6 +633,13 @@ impl LspManager {
 
     pub fn change_doc(&self, path: PathBuf, text: String) {
         let _ = self.cmd_tx.send(Cmd::ChangeDoc { path, text });
+    }
+
+    /// Notify the servers a document was written to disk. rust-analyzer only
+    /// re-runs its check-on-save (`cargo check`, the source of most Rust
+    /// PROBLEMS entries) on `textDocument/didSave`.
+    pub fn save_doc(&self, path: PathBuf) {
+        let _ = self.cmd_tx.send(Cmd::SaveDoc { path });
     }
 
     pub fn close_doc(&self, path: PathBuf) {
@@ -1118,6 +1128,7 @@ async fn worker_loop(
                     .await
             }
             Cmd::ChangeDoc { path, text } => state.change_doc(path, text).await,
+            Cmd::SaveDoc { path } => state.save_doc(path).await,
             Cmd::CloseDoc { path } => state.close_doc(path).await,
             Cmd::RequestCompletion {
                 request_id,
@@ -1473,6 +1484,29 @@ impl WorkerState {
             let mut client = client_arc.lock().await;
             if let Err(e) = client.did_change_full(uri.clone(), version, text.clone()) {
                 log_file::log(&format!("lsp[{name}] did_change failed: {e}"));
+            }
+        }
+    }
+
+    async fn save_doc(&mut self, path: PathBuf) {
+        let Some(doc) = self.docs.get(&path) else {
+            return;
+        };
+        let key: ClientKey = (doc.language, doc.project_root.clone());
+        let Ok(uri) = Url::from_file_path(&path) else {
+            return;
+        };
+        let arcs: Vec<(String, Arc<TokioMutex<LspClient>>)> = match self.clients.get(&key) {
+            Some(cs) => cs
+                .iter()
+                .map(|c| (c.name.clone(), c.client.clone()))
+                .collect(),
+            None => return,
+        };
+        for (name, client_arc) in arcs {
+            let mut client = client_arc.lock().await;
+            if let Err(e) = client.did_save(uri.clone()) {
+                log_file::log(&format!("lsp[{name}] did_save failed: {e}"));
             }
         }
     }
@@ -4384,5 +4418,118 @@ mod tests {
             colored_on(3),
             "body parameter must be colored on its real row (line 3); overlay={overlay:?}"
         );
+    }
+
+    /// Minimal LSP server that answers `initialize` and appends every
+    /// incoming method name to the log file given as argv[1]. Lets a test
+    /// assert exactly which notifications croft put on the wire.
+    const FAKE_LSP_RECORDER: &str = r#"
+import json, sys
+
+log = open(sys.argv[1], "a")
+
+def read_msg():
+    length = None
+    while True:
+        line = sys.stdin.buffer.readline()
+        if not line:
+            return None
+        line = line.strip()
+        if not line:
+            break
+        if line.lower().startswith(b"content-length:"):
+            length = int(line.split(b":")[1])
+    if length is None:
+        return None
+    return json.loads(sys.stdin.buffer.read(length))
+
+def send(msg):
+    body = json.dumps(msg).encode()
+    sys.stdout.buffer.write(b"Content-Length: %d\r\n\r\n" % len(body))
+    sys.stdout.buffer.write(body)
+    sys.stdout.buffer.flush()
+
+while True:
+    msg = read_msg()
+    if msg is None:
+        break
+    method = msg.get("method", "")
+    log.write(method + "\n")
+    log.flush()
+    if "id" in msg:
+        if method == "initialize":
+            send({"jsonrpc": "2.0", "id": msg["id"], "result": {"capabilities": {}}})
+        else:
+            send({"jsonrpc": "2.0", "id": msg["id"], "result": None})
+    if method == "exit":
+        break
+"#;
+
+    /// Issue #37: rust-analyzer re-runs its check-on-save (`cargo check`, the
+    /// source of the Rust PROBLEMS entries) only when the client sends
+    /// `textDocument/didSave`. Saving a file must therefore emit didSave, or
+    /// the PROBLEMS panel goes permanently stale after the first open.
+    #[test]
+    fn save_doc_sends_did_save_notification_to_the_server() {
+        if !is_on_path("python3") {
+            eprintln!("SKIPPED: python3 not on PATH");
+            return;
+        }
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().canonicalize().expect("canonicalize");
+        let file = root.join("demo.py");
+        std::fs::write(&file, "x = 1\n").expect("write demo");
+        let script = root.join("fake_lsp.py");
+        std::fs::write(&script, FAKE_LSP_RECORDER).expect("write fake server");
+        let log = root.join("methods.log");
+
+        let mut registry = ServerRegistry::new();
+        registry.register(
+            Language::PYTHON,
+            ServerConfig {
+                name: "fake-recorder",
+                command: "python3".into(),
+                args: vec![script.display().to_string(), log.display().to_string()],
+                language: Language::PYTHON,
+                initialization_options: None,
+                provision: None,
+            },
+        );
+        let (diag_tx, _diag_rx) = std_mpsc::channel();
+        let (prog_tx, _prog_rx) = std_mpsc::channel();
+        let mut state = WorkerState {
+            workspace_root: root.clone(),
+            registry,
+            clients: HashMap::new(),
+            docs: HashMap::new(),
+            capability_support: Arc::new(StdMutex::new(LangCapabilitySupport::default())),
+            semantic_refresh: Arc::new(AtomicBool::new(false)),
+            diagnostics_tx: diag_tx,
+            progress_tx: prog_tx,
+        };
+
+        let runtime = LspRuntime::new().expect("runtime");
+        runtime.handle().clone().block_on(async {
+            state.open_doc(file.clone(), String::from("x = 1\n")).await;
+            state.save_doc(file.clone()).await;
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let methods = loop {
+            let text = std::fs::read_to_string(&log).unwrap_or_default();
+            if text.contains("textDocument/didSave") || Instant::now() >= deadline {
+                break text;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        assert!(
+            methods.contains("textDocument/didOpen"),
+            "sanity: the fake server must have received didOpen; got: {methods:?}"
+        );
+        assert!(
+            methods.contains("textDocument/didSave"),
+            "saving a document must send textDocument/didSave; server received: {methods:?}"
+        );
+        runtime.handle().clone().block_on(state.shutdown_all());
     }
 }
