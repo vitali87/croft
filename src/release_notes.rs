@@ -61,11 +61,11 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[
     ReleaseNote {
-        kind: NoteKind::Feature,
-        summary: "Maximize a terminal: the ⛶ button (or Cmd+K M) gives one pane the panel's full width; the other terminals wait in a rail on the right, and clicking one there hands it the maximized pane.",
+        kind: NoteKind::Fix,
+        summary: "Saving a file now tells the language server, so rust-analyzer re-runs cargo check and the PROBLEMS panel refreshes on every Cmd+S instead of going stale after the first open.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "The F1 shortcuts panel now documents Cmd+D (Add Selection to Next Find Match) and Cmd+Shift+K (Delete Line).",
+        summary: "Language-server warnings and errors printed to stderr (like rust-analyzer's slow cache-priming notice) now show in OUTPUT with their real severity instead of all reading as info.",
     },
 ];
