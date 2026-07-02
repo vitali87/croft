@@ -170,29 +170,44 @@ pub fn install_only_streaming(
     ));
     let _ = log_tx.send(format!("Adopting control socket for {host_label}"));
     let ssh = SshControl::adopt(adopted.clone());
-    let _ = log_tx.send("Hashing local source tree".to_string());
-    let local_stamp = local_source_stamp()?;
-    let _ = log_tx.send(format!("Local source stamp: {local_stamp}"));
-    let _ = log_tx.send(format!("Checking installed croft version on {host_label}"));
+    let result = install_only_streaming_over(&ssh, &host_label, &log_tx, &can_launch_tx);
+    // Never drop `ssh`: its Drop kills the shared control master, and by now
+    // the user may already be attached through it (the launch signal fires
+    // before any fallible work).
+    std::mem::forget(ssh);
+    result.map(|_| adopted)
+}
+
+fn install_only_streaming_over(
+    ssh: &SshControl,
+    host_label: &str,
+    log_tx: &std::sync::mpsc::Sender<String>,
+    can_launch_tx: &std::sync::mpsc::Sender<()>,
+) -> Result<()> {
     // If a croft is already on the remote, the user gets dropped into it
     // immediately and the (re)install proceeds in the background. The
     // running croft re-execs into the new binary once the stamp advances.
-    let present = remote_croft_present(&ssh).unwrap_or(false);
+    // This probe runs BEFORE any local work so the launch signal fires
+    // within one SSH roundtrip of connecting.
+    let _ = log_tx.send(format!("Checking installed croft on {host_label}"));
+    let present = remote_croft_present(ssh).unwrap_or(false);
     if present {
         let _ = can_launch_tx.send(());
     }
-    if !remote_install_needed(&ssh, &local_stamp)? {
+    let _ = log_tx.send("Hashing local source tree".to_string());
+    let local_stamp = local_source_stamp()?;
+    let _ = log_tx.send(format!("Local source stamp: {local_stamp}"));
+    if !remote_install_needed(ssh, &local_stamp)? {
         let _ = log_tx.send(format!("Croft on {host_label} is already up to date."));
         if !present {
             let _ = can_launch_tx.send(());
         }
-        std::mem::forget(ssh);
-        return Ok(adopted);
+        return Ok(());
     }
     // Mark the remote as updating before the local cross-compile so the
     // running croft shows "Updating" for the whole build+ship, not just
     // the final remote activation.
-    mark_remote_updating(&ssh);
+    mark_remote_updating(ssh);
     // The user may already be inside the remote croft over the interactive
     // master. Route every bulk byte of this install through a bulk lane so
     // the transfer never queues ahead of their keystrokes in the shared
@@ -201,14 +216,12 @@ pub fn install_only_streaming(
         let _ = log_tx.send(msg);
     });
     let _ = log_tx.send(format!("Installing/updating Croft on {host_label}"));
-    if let Err(e) = install_remote_croft_streaming(&ssh, &bulk.lane, &local_stamp, &log_tx) {
-        clear_remote_updating(&ssh);
-        std::mem::forget(ssh);
+    if let Err(e) = install_remote_croft_streaming(ssh, &bulk.lane, &local_stamp, log_tx) {
+        clear_remote_updating(ssh);
         return Err(e);
     }
     let _ = log_tx.send("Install complete.".to_string());
-    std::mem::forget(ssh);
-    Ok(adopted)
+    Ok(())
 }
 
 /// Tee every install log line into a persistent file so a backgrounded
@@ -325,12 +338,10 @@ fn reconnect_master(host: &str) -> Option<SshControl> {
 /// SSH transport dies on a host that supports session persistence. Owns the
 /// control connection so a reconnect can swap in a fresh master and reattach
 /// the dtach session (which kept croft alive remotely) with its state intact.
-/// `local_stamp` is only consulted on the rare first-run bootstrap path.
 fn run_croft_session(
     mut ssh: SshControl,
     host: &str,
     path: Option<&str>,
-    local_stamp: &str,
     persistent: bool,
 ) -> Result<RemoteOutcome> {
     let mut bootstrapped = false;
@@ -361,7 +372,7 @@ fn run_croft_session(
             RemoteStatusClass::Exited => return Ok(RemoteOutcome::Exited),
             RemoteStatusClass::NotInstalled if !bootstrapped => {
                 println!("Croft is not installed on {host}; bootstrapping from local source");
-                install_remote_croft(&ssh, local_stamp)?;
+                install_remote_croft(&ssh, &local_source_stamp()?)?;
                 bootstrapped = true;
             }
             RemoteStatusClass::Failed if persistent && is_transport_failure(status.code()) => {
@@ -383,9 +394,8 @@ fn run_croft_session(
 pub fn launch_only(adopted: AdoptedMaster, path: Option<&str>) -> Result<RemoteOutcome> {
     let ssh = SshControl::adopt(adopted);
     let host = ssh.host.clone();
-    let local_stamp = local_source_stamp()?;
     let persistent = remote_has_session_supervisor(&ssh);
-    run_croft_session(ssh, &host, path, &local_stamp, persistent)
+    run_croft_session(ssh, &host, path, persistent)
 }
 
 fn run_command_streaming(
@@ -580,13 +590,41 @@ pub fn launch_croft_with(
         Some(a) => SshControl::adopt(a),
         None => SshControl::start(host)?,
     };
-    let local_stamp = local_source_stamp()?;
-    if remote_install_needed(&ssh, &local_stamp)? {
-        println!("Installing/updating Croft on {host}");
+    if remote_croft_present(&ssh).unwrap_or(false) {
+        // A croft is already installed: attach to it right away. Any update
+        // cross-builds and ships on a background thread, and the running
+        // remote croft offers the F9 reload once the new binary lands. The
+        // user must never wait behind a build for a session that already
+        // exists.
+        spawn_background_install(&ssh);
+    } else {
+        let local_stamp = local_source_stamp()?;
+        println!("Installing Croft on {host}");
         install_remote_croft(&ssh, &local_stamp)?;
     }
     let persistent = remote_has_session_supervisor(&ssh);
-    run_croft_session(ssh, host, path, &local_stamp, persistent)
+    run_croft_session(ssh, host, path, persistent)
+}
+
+/// Run the update check + (re)install on a detached thread so the caller can
+/// hand the terminal to the already-installed remote croft immediately. Every
+/// line of progress goes to `~/.cache/croft/install.log` via the streaming
+/// installer's tee; nothing here may touch stdout/stderr, which belong to the
+/// remote session once the caller attaches.
+fn spawn_background_install(ssh: &SshControl) {
+    let adopted = AdoptedMaster {
+        host: ssh.host.clone(),
+        socket_dir: ssh.socket_dir.clone(),
+        socket_path: ssh.socket_path.clone(),
+    };
+    std::thread::spawn(move || {
+        // Both receivers are dropped on purpose: every send in the streaming
+        // installer is best-effort, and the log tee keeps writing the file
+        // even with a disconnected downstream.
+        let (log_tx, _) = std::sync::mpsc::channel();
+        let (can_launch_tx, _) = std::sync::mpsc::channel();
+        let _ = install_only_streaming(adopted, log_tx, can_launch_tx);
+    });
 }
 
 pub struct SshControl {
@@ -2219,9 +2257,41 @@ command -v croft >/dev/null 2>&1 && echo yes"#,
 }
 
 fn local_source_stamp() -> Result<String> {
-    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    source_stamp_for(&PathBuf::from(env!("CARGO_MANIFEST_DIR")))
+}
+
+/// Names of the root entries that shape the shipped binary: the crate source,
+/// the embedded asset tree, and the build/toolchain pins. The stamp hashes
+/// exactly these, so build artifacts (`target`, `target.noindex`), `.git`,
+/// docs, and editor scratch dirs can never stall the hash or force a reship —
+/// the old deny-list stamp read a 98 GB `target.noindex` on every connect and
+/// changed after every local build.
+const SOURCE_STAMP_INPUTS: &[&str] = &[
+    "Cargo.toml",
+    "Cargo.lock",
+    "build.rs",
+    "rust-toolchain.toml",
+    "src",
+    "assets",
+];
+
+fn source_stamp_for(root: &PathBuf) -> Result<String> {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    hash_source_dir(&source, &source, &mut hasher)?;
+    for name in SOURCE_STAMP_INPUTS {
+        let path = root.join(name);
+        let Ok(meta) = std::fs::metadata(&path) else {
+            continue;
+        };
+        hasher.write(name.as_bytes());
+        if meta.is_dir() {
+            hash_source_dir(root, &path, &mut hasher)?;
+        } else {
+            hasher.write_u64(meta.len());
+            hasher.write(
+                &std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?,
+            );
+        }
+    }
     Ok(format!("{:016x}", hasher.finish()))
 }
 
@@ -2268,6 +2338,40 @@ fn ssh_control_socket_path_for_test(dir: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_stamp_tracks_build_inputs_only() {
+        // The stamp decides whether a remote reinstall is needed, so it must
+        // cover exactly the inputs that shape the shipped binary. Build
+        // artifacts (`target.noindex` reached 98 GB) and docs must not feed
+        // it: hashing them made every connect stall for a minute and reship
+        // croft even when the source was untouched.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("target.noindex")).unwrap();
+        std::fs::create_dir_all(root.join("docs")).unwrap();
+        std::fs::write(root.join("Cargo.toml"), "[package]").unwrap();
+        std::fs::write(root.join("src/main.rs"), "fn main() {}").unwrap();
+        std::fs::write(root.join("target.noindex/dep.rlib"), "artifact-v1").unwrap();
+        std::fs::write(root.join("docs/NOTES.md"), "notes-v1").unwrap();
+        let base = source_stamp_for(&root).unwrap();
+
+        std::fs::write(root.join("target.noindex/dep.rlib"), "artifact-v2").unwrap();
+        std::fs::write(root.join("docs/NOTES.md"), "notes-v2").unwrap();
+        assert_eq!(
+            source_stamp_for(&root).unwrap(),
+            base,
+            "build artifacts and docs must not change the source stamp"
+        );
+
+        std::fs::write(root.join("src/main.rs"), "fn main() { changed(); }").unwrap();
+        assert_ne!(
+            source_stamp_for(&root).unwrap(),
+            base,
+            "a source edit must change the stamp"
+        );
+    }
 
     #[test]
     fn drop_to_local_exit_code_maps_to_return_to_local() {
