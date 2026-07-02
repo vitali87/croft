@@ -62,10 +62,6 @@ pub struct ReleaseNote {
 pub const RELEASE_NOTES: &[ReleaseNote] = &[
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "Saving a file now tells the language server, so rust-analyzer re-runs cargo check and the PROBLEMS panel refreshes on every Cmd+S instead of going stale after the first open.",
-    },
-    ReleaseNote {
-        kind: NoteKind::Fix,
-        summary: "Language-server warnings and errors printed to stderr (like rust-analyzer's slow cache-priming notice) now show in OUTPUT with their real severity instead of all reading as info.",
+        summary: "Typing no longer blinks the whole app on Ghostty and Kitty terminals, local or over SSH: stale inline images (minimap, count badges) are now deleted on the graphics layer instead of wiping and repainting the entire screen.",
     },
 ];
