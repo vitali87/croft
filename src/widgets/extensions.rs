@@ -670,7 +670,7 @@ impl Widget for &mut ExtensionsPanel {
 
             let name_fg = if item.enabled { NAME_FG } else { DESC_FG };
             let mut name_style = Style::default().fg(name_fg).add_modifier(Modifier::BOLD);
-            let mut desc_style = Style::default().fg(DESC_FG);
+            let mut desc_style = Style::default().fg(DESC_FG).add_modifier(Modifier::ITALIC);
             if let Some(bg) = row_bg {
                 name_style = name_style.bg(bg);
                 desc_style = desc_style.bg(bg);

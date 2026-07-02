@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Feature,
-    summary: "Git-ignored files and folders now grey out in the Explorer, matching VS Code's ignored-resource decoration: a fully ignored folder dims along with everything under it, and the shading follows .gitignore edits live.",
+    summary: "Extension descriptions in the Extensions panel now render in italics, visually separating the blurb from the extension name.",
 }];
