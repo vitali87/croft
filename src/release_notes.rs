@@ -59,13 +59,7 @@ pub struct ReleaseNote {
 }
 
 /// What shipped in the current release. Replace on every version bump.
-pub const RELEASE_NOTES: &[ReleaseNote] = &[
-    ReleaseNote {
-        kind: NoteKind::Fix,
-        summary: "Connecting to a remote now drops you straight into the installed croft: any update builds and ships in the background and the running session offers F9 to reload once the new binary lands, instead of stalling the connect behind the build and a blank screen.",
-    },
-    ReleaseNote {
-        kind: NoteKind::Fix,
-        summary: "Unchanged source no longer reinstalls croft on every remote connect: the update check hashes only real build inputs, where it previously read the entire multi-gigabyte build directory and mistook every local build for a new version.",
-    },
-];
+pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
+    kind: NoteKind::Fix,
+    summary: "Reconnecting to a running remote session no longer comes back as a black screen with only the icons and status bar visible: the reattach signal now forces a full repaint on Ghostty and Kitty terminals, where the typing-blink fix had removed the screen wipe the reattach quietly relied on.",
+}];
