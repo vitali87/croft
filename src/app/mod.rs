@@ -2073,6 +2073,14 @@ pub struct App {
     /// right edge, in lock-step with `terminals`. Clicking one hands that
     /// terminal the maximized pane. Empty outside maximize mode.
     terminal_rail_rects: Vec<Rect>,
+    /// Hit-test rectangles of the pane name pills at each pane's top-left, in
+    /// lock-step with `terminals`. A press on one starts a drag-reorder;
+    /// hidden or unlabeled panes hold an empty rect. Empty with one terminal.
+    terminal_label_rects: Vec<Rect>,
+    /// Index of the terminal being drag-reordered (grabbed by its pane label
+    /// or its maximize-rail row). The reorder is live: crossing another pane
+    /// or rail row moves the terminal there immediately, and this follows it.
+    terminal_drag_from: Option<usize>,
     /// True while one terminal pane fills the panel's width and the others
     /// are listed in the right-side rail (the per-pane `⛶` button / Cmd+K M).
     /// Distinct from `terminal_maximized`, which grows the panel vertically
@@ -3001,6 +3009,8 @@ impl App {
             terminal_close_buttons: Vec::new(),
             terminal_max_buttons: Vec::new(),
             terminal_rail_rects: Vec::new(),
+            terminal_label_rects: Vec::new(),
+            terminal_drag_from: None,
             terminal_pane_maximized: false,
             bottom_panel_tab: BottomPanelTab::Terminal,
             problems: crate::widgets::problems::ProblemsPanel::new(),
@@ -8322,6 +8332,23 @@ impl App {
         }
     }
 
+    /// Move the terminal at `from` so it sits at slot `to`, keeping
+    /// `active_terminal` pointing at the same terminal it did before. Drives
+    /// the drag-reorder of side-by-side panes and maximize-mode rail rows.
+    pub fn move_terminal(&mut self, from: usize, to: usize) {
+        if from == to || from >= self.terminals.len() || to >= self.terminals.len() {
+            return;
+        }
+        let t = self.terminals.remove(from);
+        self.terminals.insert(to, t);
+        self.active_terminal = match self.active_terminal {
+            a if a == from => to,
+            a if from < a && a <= to => a - 1,
+            a if to <= a && a < from => a + 1,
+            a => a,
+        };
+    }
+
     /// Drop the currently-active terminal. Thin wrapper kept for the
     /// keyboard shortcut and existing callers.
     pub fn close_active_terminal(&mut self) -> bool {
@@ -9318,6 +9345,7 @@ impl App {
                     self.terminal_profile_buttons.clear();
                     self.terminal_close_buttons.clear();
                     self.terminal_max_buttons.clear();
+                    self.terminal_label_rects.clear();
                     for (i, col) in cols.iter().enumerate().take(self.terminals.len()) {
                         // Hidden panes still push placeholders so a button's
                         // position in each vec names its terminal index.
@@ -9326,6 +9354,7 @@ impl App {
                             self.terminal_profile_buttons.push(Rect::default());
                             self.terminal_close_buttons.push(Rect::default());
                             self.terminal_max_buttons.push(Rect::default());
+                            self.terminal_label_rects.push(Rect::default());
                             continue;
                         }
                         let buttons = paint_terminal_pane_buttons(
@@ -9346,19 +9375,30 @@ impl App {
                             .push(buttons.max.unwrap_or_default());
                         // Auto/manual pane label at top-left, only with 2+ panes
                         // (a lone pane needs no name). Kept clear of the buttons.
+                        // The painted pill doubles as the drag-reorder handle,
+                        // so its rect is recorded index-aligned with the pane.
+                        let mut label_rect = Rect::default();
                         if multi {
                             let label = self.terminals[i].label().to_string();
                             let room = col.width.saturating_sub(14) as usize;
                             if !label.is_empty() && room >= 3 {
                                 let shown: String = label.chars().take(room).collect();
+                                let text = format!(" {shown} ");
+                                label_rect = Rect {
+                                    x: col.x,
+                                    y: col.y,
+                                    width: (text.chars().count() as u16).min(col.width),
+                                    height: 1,
+                                };
                                 frame.buffer_mut().set_string(
                                     col.x,
                                     col.y,
-                                    format!(" {shown} "),
+                                    text,
                                     crate::widgets::header_pill::action_style(brand, false),
                                 );
                             }
                         }
+                        self.terminal_label_rects.push(label_rect);
                     }
                 }
                 BottomPanelTab::Problems => {
@@ -9369,6 +9409,7 @@ impl App {
                     self.terminal_profile_buttons.clear();
                     self.terminal_close_buttons.clear();
                     self.terminal_max_buttons.clear();
+                    self.terminal_label_rects.clear();
                     self.terminal_rail_rects.clear();
                     for t in self.terminals.iter_mut() {
                         t.last_area = Rect::default();
@@ -9382,6 +9423,7 @@ impl App {
                     self.terminal_profile_buttons.clear();
                     self.terminal_close_buttons.clear();
                     self.terminal_max_buttons.clear();
+                    self.terminal_label_rects.clear();
                     self.terminal_rail_rects.clear();
                     for t in self.terminals.iter_mut() {
                         t.last_area = Rect::default();
@@ -9395,6 +9437,7 @@ impl App {
                     self.terminal_profile_buttons.clear();
                     self.terminal_close_buttons.clear();
                     self.terminal_max_buttons.clear();
+                    self.terminal_label_rects.clear();
                     self.terminal_rail_rects.clear();
                     for t in self.terminals.iter_mut() {
                         t.last_area = Rect::default();
@@ -9407,6 +9450,7 @@ impl App {
             self.terminal_profile_buttons.clear();
             self.terminal_close_buttons.clear();
             self.terminal_max_buttons.clear();
+            self.terminal_label_rects.clear();
             self.terminal_rail_rects.clear();
             self.problems_tab_rect = Rect::default();
             self.output_tab_rect = Rect::default();
@@ -19437,6 +19481,23 @@ impl App {
                 {
                     self.active_terminal = idx;
                     self.focus_pane(Pane::Terminal);
+                    // Holding the press arms a drag-reorder: crossing other
+                    // rail rows live-moves this terminal between them.
+                    self.terminal_drag_from = Some(idx);
+                    return;
+                }
+                if let Some(idx) = self
+                    .terminal_label_rects
+                    .iter()
+                    .position(|r| rect_contains(*r, m.column, m.row))
+                {
+                    // The pane name pill is the drag handle for reordering
+                    // side-by-side panes (VS Code drags its terminal tabs the
+                    // same way). The press itself focuses the pane, exactly
+                    // like a click into its body would.
+                    self.active_terminal = idx;
+                    self.focus_pane(Pane::Terminal);
+                    self.terminal_drag_from = Some(idx);
                     return;
                 }
                 if self
@@ -20064,6 +20125,28 @@ impl App {
                 }
             }
             MouseEventKind::Drag(MouseButton::Left) => {
+                if let Some(from) = self.terminal_drag_from {
+                    // Live reorder: the moment the pointer crosses another
+                    // pane (side-by-side) or rail row (maximize mode), the
+                    // dragged terminal moves there and the drag follows it.
+                    // No ghost or indicator needed - the panes themselves
+                    // rearrange under the pointer, and `move_terminal` keeps
+                    // the dragged pane active.
+                    let target = if self.terminal_pane_maximized && self.terminals.len() > 1 {
+                        self.terminal_rail_rects
+                            .iter()
+                            .position(|r| rect_contains(*r, m.column, m.row))
+                    } else {
+                        self.terminal_at_pos(m.column, m.row)
+                    };
+                    if let Some(to) = target
+                        && to != from
+                    {
+                        self.move_terminal(from, to);
+                        self.terminal_drag_from = Some(to);
+                    }
+                    return;
+                }
                 if let Some(kind) = self.splitter_drag.clone() {
                     self.handle_splitter_drag(kind, m.column, m.row);
                     return;
@@ -20214,6 +20297,9 @@ impl App {
             MouseEventKind::Up(MouseButton::Left) => {
                 // Releasing the button ends any terminal edge auto-scroll.
                 self.terminal_select_autoscroll = None;
+                // Releasing ends a pane drag-reorder; the order is already
+                // final because the reorder is live during the drag.
+                self.terminal_drag_from = None;
                 // Finish a column (box) selection, keeping the carets it built.
                 if self.editor.box_selecting() {
                     self.editor.end_box_select();

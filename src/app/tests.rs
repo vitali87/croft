@@ -15599,6 +15599,108 @@ fn resize_must_force_a_full_text_repaint_on_every_protocol() {
 }
 
 #[test]
+fn drag_reorders_terminal_panes_and_active_follows_its_terminal() {
+    // Dragging a pane label (side-by-side) or a rail row (maximize mode)
+    // live-moves that terminal to the hovered slot. The reorder must keep
+    // `active_terminal` pinned to the same underlying terminal: the dragged
+    // pane stays active while it moves, and an unrelated active pane must not
+    // silently switch because its index shifted.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.split_terminal().unwrap();
+    app.split_terminal().unwrap();
+    for (i, name) in ["one", "two", "three"].iter().enumerate() {
+        app.terminals[i].set_manual_name(Some(name.to_string()));
+    }
+
+    app.active_terminal = 0;
+    app.move_terminal(0, 2);
+    let order: Vec<&str> = app.terminals.iter().map(|t| t.label()).collect();
+    assert_eq!(order, ["two", "three", "one"], "pane moved to the far slot");
+    assert_eq!(app.active_terminal, 2, "the dragged pane stays active");
+
+    app.active_terminal = 1; // "three"
+    app.move_terminal(2, 0); // drag "one" back to the front
+    let order: Vec<&str> = app.terminals.iter().map(|t| t.label()).collect();
+    assert_eq!(order, ["one", "two", "three"]);
+    assert_eq!(
+        app.terminals[app.active_terminal].label(),
+        "three",
+        "an unrelated active pane keeps its terminal when indices shift"
+    );
+
+    // Out-of-range and no-op moves must not disturb anything.
+    app.move_terminal(1, 1);
+    app.move_terminal(9, 0);
+    app.move_terminal(0, 9);
+    let order: Vec<&str> = app.terminals.iter().map(|t| t.label()).collect();
+    assert_eq!(order, ["one", "two", "three"]);
+}
+
+#[test]
+fn dragging_a_pane_label_and_a_rail_row_reorders_terminals_end_to_end() {
+    // Full wiring pass over real hit rects: render a frame, press the first
+    // pane's name pill, drag into the third pane, release - the terminal
+    // must land in the far slot. Then the same through the maximize rail.
+    use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.split_terminal().unwrap();
+    app.split_terminal().unwrap();
+    for (i, name) in ["one", "two", "three"].iter().enumerate() {
+        app.terminals[i].set_manual_name(Some(name.to_string()));
+    }
+    let backend = ratatui::backend::TestBackend::new(180, 50);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+
+    let mouse = |kind, x: u16, y: u16| MouseEvent {
+        kind,
+        column: x,
+        row: y,
+        modifiers: KeyModifiers::NONE,
+    };
+    let grab = app.terminal_label_rects[0];
+    assert!(grab.width > 0, "pane label pill must record a drag handle");
+    let dest = app.terminals[2].last_area;
+    app.handle_mouse(mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        grab.x + 1,
+        grab.y,
+    ));
+    let (dx, dy) = (dest.x + dest.width / 2, dest.y + 2);
+    app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), dx, dy));
+    app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), dx, dy));
+    let order: Vec<&str> = app.terminals.iter().map(|t| t.label()).collect();
+    assert_eq!(order, ["two", "three", "one"], "label drag moves the pane");
+    assert_eq!(app.active_terminal, 2, "the dragged pane lands focused");
+
+    // Maximize mode: drag the top rail row onto the bottom one.
+    app.terminal_pane_maximized = true;
+    term.draw(|f| app.render(f)).unwrap();
+    let from_row = app.terminal_rail_rects[0];
+    let to_row = app.terminal_rail_rects[2];
+    assert!(from_row.width > 0 && to_row.width > 0, "rail rows painted");
+    app.handle_mouse(mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        from_row.x + 1,
+        from_row.y,
+    ));
+    app.handle_mouse(mouse(
+        MouseEventKind::Drag(MouseButton::Left),
+        to_row.x + 1,
+        to_row.y,
+    ));
+    app.handle_mouse(mouse(
+        MouseEventKind::Up(MouseButton::Left),
+        to_row.x + 1,
+        to_row.y,
+    ));
+    let order: Vec<&str> = app.terminals.iter().map(|t| t.label()).collect();
+    assert_eq!(order, ["three", "one", "two"], "rail drag moves the row");
+}
+
+#[test]
 fn stale_document_symbol_reply_must_not_replace_the_fresher_outline() {
     // While typing on a slow language server, `documentSymbol` replies land
     // several edits behind the buffer. Applying one replaces the fresh
