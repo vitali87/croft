@@ -62,10 +62,10 @@ pub struct ReleaseNote {
 pub const RELEASE_NOTES: &[ReleaseNote] = &[
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "Typing no longer blinks the whole app on Ghostty and Kitty terminals, local or over SSH: stale inline images (minimap, count badges) are now deleted on the graphics layer instead of wiping and repainting the entire screen.",
+        summary: "Connecting to a remote now drops you straight into the installed croft: any update builds and ships in the background and the running session offers F9 to reload once the new binary lands, instead of stalling the connect behind the build and a blank screen.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "The breadcrumb's symbol name no longer flickers while typing against a slow language server: outline replies computed for an older buffer are dropped instead of briefly overriding the live one.",
+        summary: "Unchanged source no longer reinstalls croft on every remote connect: the update check hashes only real build inputs, where it previously read the entire multi-gigabyte build directory and mistook every local build for a new version.",
     },
 ];
