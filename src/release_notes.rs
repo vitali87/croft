@@ -64,4 +64,8 @@ pub const RELEASE_NOTES: &[ReleaseNote] = &[
         kind: NoteKind::Fix,
         summary: "Typing no longer blinks the whole app on Ghostty and Kitty terminals, local or over SSH: stale inline images (minimap, count badges) are now deleted on the graphics layer instead of wiping and repainting the entire screen.",
     },
+    ReleaseNote {
+        kind: NoteKind::Fix,
+        summary: "The breadcrumb's symbol name no longer flickers while typing against a slow language server: outline replies computed for an older buffer are dropped instead of briefly overriding the live one.",
+    },
 ];

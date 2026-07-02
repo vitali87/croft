@@ -170,6 +170,9 @@ pub struct OutlineSymbol {
 #[derive(Debug)]
 pub struct DocumentSymbolsResult {
     pub path: PathBuf,
+    /// Echo of the edit seq the request was issued at, so the app can drop a
+    /// reply that answers an older buffer than the newest request.
+    pub seq: u64,
     pub symbols: Vec<OutlineSymbol>,
 }
 
@@ -417,6 +420,7 @@ enum Cmd {
     },
     RequestDocumentSymbols {
         path: PathBuf,
+        seq: u64,
     },
     RequestDeclaration {
         request_id: u64,
@@ -757,10 +761,12 @@ impl LspManager {
 
     /// Ask the server for the document's symbol tree (the Outline). Fire on
     /// open, on the active editor tab changing, and (debounced) after edits;
-    /// the freshest reply for the active file wins. No request id: replies are
-    /// keyed by path and the app drops any whose path is no longer active.
-    pub fn request_document_symbols(&self, path: PathBuf) {
-        let _ = self.cmd_tx.send(Cmd::RequestDocumentSymbols { path });
+    /// the freshest reply for the active file wins. `seq` is echoed back in
+    /// the result so the app can drop a reply answering an older buffer than
+    /// the newest request (a stale reply's shifted ranges made the
+    /// breadcrumb's symbol crumb flicker while typing on a slow server).
+    pub fn request_document_symbols(&self, path: PathBuf, seq: u64) {
+        let _ = self.cmd_tx.send(Cmd::RequestDocumentSymbols { path, seq });
     }
 
     pub fn drain_document_symbols(&self) -> Option<DocumentSymbolsResult> {
@@ -1170,9 +1176,9 @@ async fn worker_loop(
                     .request_definition(request_id, path, line, character, &tx.definition)
                     .await
             }
-            Cmd::RequestDocumentSymbols { path } => {
+            Cmd::RequestDocumentSymbols { path, seq } => {
                 state
-                    .request_document_symbols(path, &tx.document_symbols)
+                    .request_document_symbols(path, seq, &tx.document_symbols)
                     .await
             }
             Cmd::RequestDeclaration {
@@ -1999,6 +2005,7 @@ impl WorkerState {
     async fn request_document_symbols(
         &mut self,
         path: PathBuf,
+        seq: u64,
         tx: &std_mpsc::Sender<DocumentSymbolsResult>,
     ) {
         let Some(doc) = self.docs.get(&path) else {
@@ -2019,6 +2026,7 @@ impl WorkerState {
             // "No symbols" rather than a stale tree from a previous file.
             let _ = tx.send(DocumentSymbolsResult {
                 path,
+                seq,
                 symbols: Vec::new(),
             });
             return;
@@ -2046,6 +2054,7 @@ impl WorkerState {
             ));
             let _ = tx.send(DocumentSymbolsResult {
                 path: path_clone,
+                seq,
                 symbols,
             });
         });

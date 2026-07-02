@@ -5664,8 +5664,8 @@ impl App {
             let lsp_pending = seq.is_some();
             self.outline
                 .set_syntax_symbols(path.clone(), syntax, lsp_pending);
-            if lsp_pending && let Some(lsp) = self.lsp.as_ref() {
-                lsp.request_document_symbols(path);
+            if lsp_pending && let (Some(lsp), Some(seq)) = (self.lsp.as_ref(), seq) {
+                lsp.request_document_symbols(path, seq);
             }
         }
         // Follow-cursor every tick; cheap (O(symbols)) and only repaints when
@@ -5815,9 +5815,23 @@ impl App {
     fn apply_outline_symbols(
         &mut self,
         path: std::path::PathBuf,
+        seq: u64,
         symbols: Vec<crate::lsp::manager::OutlineSymbol>,
     ) -> bool {
         if self.editor.path.as_ref() != Some(&path) {
+            return false;
+        }
+        // Drop a reply answering an older buffer than the newest request: its
+        // ranges are shifted by the edits made since, the caret falls outside
+        // them, and the breadcrumb's symbol crumb flickers off and on with
+        // every keystroke (visible against a slow remote rust-analyzer while
+        // tree-sitter and the late reply take turns owning the outline). Only
+        // enforced when a request seq is tracked for this file; an untracked
+        // file has no newer request to be stale against.
+        if let Some((p, Some(newest))) = self.outline_synced.as_ref()
+            && *p == path
+            && seq != *newest
+        {
             return false;
         }
         // An empty reply (server lacks `documentSymbol`, or answered before it
@@ -5851,14 +5865,14 @@ impl App {
     /// OUTLINE (guarded to the active file by `apply_outline_symbols`). Mirrors
     /// the other `drain_lsp_*` pollers; the latest batch per file wins.
     pub fn drain_lsp_document_symbols(&mut self) -> bool {
-        let mut latest: Option<(PathBuf, Vec<crate::lsp::manager::OutlineSymbol>)> = None;
+        let mut latest: Option<(PathBuf, u64, Vec<crate::lsp::manager::OutlineSymbol>)> = None;
         if let Some(lsp) = self.lsp.as_ref() {
             while let Some(r) = lsp.drain_document_symbols() {
-                latest = Some((r.path, r.symbols));
+                latest = Some((r.path, r.seq, r.symbols));
             }
         }
         match latest {
-            Some((path, symbols)) => self.apply_outline_symbols(path, symbols),
+            Some((path, seq, symbols)) => self.apply_outline_symbols(path, seq, symbols),
             None => false,
         }
     }

@@ -12705,13 +12705,13 @@ fn outline_symbols_apply_only_for_the_active_file() {
     // A reply for a file the user already navigated away from is dropped.
     let other = tmp.path().join("b.rs");
     assert!(
-        !app.apply_outline_symbols(other, syms.clone()),
+        !app.apply_outline_symbols(other, 0, syms.clone()),
         "a reply whose path is not the active editor file must be ignored"
     );
     assert!(app.outline.path.is_none(), "stale reply must not populate");
 
     // A reply for the active file populates the outline.
-    assert!(app.apply_outline_symbols(active.clone(), syms));
+    assert!(app.apply_outline_symbols(active.clone(), 0, syms));
     assert_eq!(app.outline.path.as_ref(), Some(&active));
     assert!(!app.outline.is_empty());
 }
@@ -12765,7 +12765,7 @@ fn empty_lsp_reply_keeps_the_tree_sitter_outline() {
     app.sync_outline();
     assert!(!app.outline.is_empty(), "tree-sitter painted the outline");
     assert!(
-        !app.apply_outline_symbols(active, Vec::new()),
+        !app.apply_outline_symbols(active, 0, Vec::new()),
         "an empty LSP reply is ignored when an outline already exists"
     );
     assert!(
@@ -12784,6 +12784,7 @@ fn clicking_the_outline_header_toggles_collapse() {
     let active = app.editor.path.clone().unwrap();
     app.apply_outline_symbols(
         active,
+        0,
         vec![outline_sym(
             "a",
             crate::lsp::manager::OutlineKind::Function,
@@ -12821,6 +12822,7 @@ fn clicking_an_outline_row_jumps_the_editor_to_that_symbol() {
     app.outline.toggle_collapse(); // expand so rows render
     app.apply_outline_symbols(
         active,
+        0,
         vec![
             outline_sym("a", OutlineKind::Function, 0, 0),
             outline_sym("b", OutlineKind::Function, 1, 1),
@@ -15566,4 +15568,62 @@ fn image_eviction_wipes_the_screen_only_on_cell_buffer_protocols() {
     assert!(app.image_eviction_needs_screen_wipe());
     app.inline_protocol = InlineImageProtocol::None;
     assert!(app.image_eviction_needs_screen_wipe());
+}
+
+#[test]
+fn stale_document_symbol_reply_must_not_replace_the_fresher_outline() {
+    // While typing on a slow language server, `documentSymbol` replies land
+    // several edits behind the buffer. Applying one replaces the fresh
+    // tree-sitter outline with ranges that no longer contain the caret, the
+    // breadcrumb's symbol crumb drops off, and the next keystroke restores it:
+    // the "hello_there blinks in the breadcrumb" bug. A reply is only valid
+    // when it answers the NEWEST request (same path, same edit seq).
+    use crate::lsp::manager::{OutlineKind, OutlineSymbol};
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("demo.rs");
+    std::fs::write(
+        &file,
+        "fn hello_there() {\n    let a = 1;\n    let b = 2;\n}\n",
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.open_file_at_launch(&file);
+    // The LSP manager tracks this file at edit seq 7; the newest outline
+    // request was issued for that seq.
+    app.lsp_last_seen.insert(file.clone(), 7);
+    app.sync_outline();
+    assert!(
+        app.outline
+            .symbols()
+            .iter()
+            .any(|s| s.name == "hello_there"),
+        "tree-sitter must have painted the fresh outline"
+    );
+
+    let stale_symbol = OutlineSymbol {
+        name: String::from("hello_there"),
+        detail: None,
+        kind: OutlineKind::Function,
+        depth: 0,
+        line: 0,
+        character: 3,
+        range_start_line: 0,
+        range_end_line: 0, // ranges from an older buffer: caret now outside
+    };
+    let applied = app.apply_outline_symbols(file.clone(), 3, vec![stale_symbol.clone()]);
+    assert!(
+        !applied,
+        "a documentSymbol reply for an older edit seq must be dropped, not applied"
+    );
+    assert!(
+        app.outline
+            .symbols()
+            .iter()
+            .any(|s| s.name == "hello_there" && s.range_end_line >= 3),
+        "the fresh tree-sitter ranges must survive the stale reply"
+    );
+
+    // The reply answering the newest request (seq 7) refines the outline.
+    let applied = app.apply_outline_symbols(file.clone(), 7, vec![stale_symbol]);
+    assert!(applied, "the reply matching the newest request must apply");
 }
