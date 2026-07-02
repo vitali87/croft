@@ -4319,6 +4319,10 @@ impl App {
                 }
             }
             self.refresh_scm_change_badge();
+            // Keep the Explorer's greyed-out ignored rows in step with the
+            // refreshed status (a .gitignore edit rides the same debounced
+            // refresh that landed here). Arc clone: no set copy.
+            self.tree.ignored = self.git.status().ignored.clone();
         }
         changed
     }

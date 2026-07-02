@@ -7,8 +7,9 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Widget},
 };
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 pub struct Node {
     pub path: PathBuf,
@@ -32,6 +33,11 @@ pub struct FileTree {
     /// Active color theme. Drives the scrollbar track/thumb colors (which
     /// pre-blend against the theme background). Set by the app's theme sync.
     pub theme: crate::theme::Theme,
+    /// Git-ignored paths (absolute; fully-ignored dirs collapsed to one
+    /// entry), fed from the git worker's status refresh. Rows whose path is
+    /// in the set — or under a dir in the set — render their name in the
+    /// theme's dimmed foreground, VS Code's ignored-resource decoration.
+    pub ignored: Arc<HashSet<PathBuf>>,
     pub last_inner: Rect,
     pub last_area: Rect,
     pub last_scrollbar: Rect,
@@ -78,6 +84,7 @@ impl FileTree {
             focused: true,
             focus_gradient: false,
             theme: crate::theme::Theme::default(),
+            ignored: Arc::default(),
             last_inner: Rect::default(),
             last_area: Rect::default(),
             last_scrollbar: Rect::default(),
@@ -112,7 +119,33 @@ impl FileTree {
         self.anchor = 0;
         self.marked.clear();
         self.drag_target = None;
+        // The old workspace's ignore set is meaningless under the new root;
+        // the git worker re-queries after its SetRoot and repopulates.
+        self.ignored = Arc::default();
         self.load_children(0);
+    }
+
+    /// True when `path` is git-ignored: either listed in the ignored set
+    /// itself or a descendant of an ignored directory (the set stores a
+    /// fully-ignored dir as one collapsed entry). Walks ancestors up to the
+    /// workspace root, so the cost is O(depth) per visible row.
+    pub fn is_ignored(&self, path: &Path) -> bool {
+        if self.ignored.is_empty() {
+            return false;
+        }
+        let mut p = path;
+        loop {
+            if self.ignored.contains(p) {
+                return true;
+            }
+            if p == self.root {
+                return false;
+            }
+            match p.parent() {
+                Some(parent) => p = parent,
+                None => return false,
+            }
+        }
     }
 
     /// Map a screen y coordinate to a node index, if any. Screen rows map
@@ -1299,6 +1332,14 @@ impl Widget for &mut FileTree {
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| node.path.display().to_string());
 
+            // Git-ignored rows dim the *name* only — icons keep their color,
+            // matching VS Code's ignored-resource decoration.
+            let name_fg = if self.is_ignored(&node.path) {
+                self.theme.ignored_fg()
+            } else {
+                Color::White
+            };
+
             if node.is_dir {
                 let chev = if node.expanded {
                     icons::CHEVRON_OPEN
@@ -1318,9 +1359,7 @@ impl Widget for &mut FileTree {
                     format!("{} ", icon.glyph),
                     Style::default().fg(icon.color),
                 ));
-                let base = Style::default()
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD);
+                let base = Style::default().fg(name_fg).add_modifier(Modifier::BOLD);
                 push_name_spans(&mut spans, &name, &query, base);
             } else {
                 let suffix = node
@@ -1334,7 +1373,7 @@ impl Widget for &mut FileTree {
                     format!("{} ", icon.glyph),
                     Style::default().fg(icon.color),
                 ));
-                push_name_spans(&mut spans, &name, &query, Style::default().fg(Color::White));
+                push_name_spans(&mut spans, &name, &query, Style::default().fg(name_fg));
             }
 
             let line = Line::from(spans);
@@ -1690,6 +1729,72 @@ mod tests {
         assert!(
             tree.nodes.iter().any(|n| n.path.ends_with("dummy2.txt")),
             "Explorer must show disk reality, including gitignored files"
+        );
+    }
+
+    #[test]
+    fn is_ignored_covers_set_members_and_their_descendants() {
+        let (_tmp, mut tree) = fixture();
+        let root = tree.root.clone();
+        tree.ignored = std::sync::Arc::new(std::collections::HashSet::from([
+            root.join("target"),
+            root.join("debug.log"),
+        ]));
+        assert!(tree.is_ignored(&root.join("debug.log")));
+        assert!(tree.is_ignored(&root.join("target")));
+        assert!(
+            tree.is_ignored(&root.join("target/debug/deps/foo.rlib")),
+            "descendants of an ignored dir are ignored too"
+        );
+        assert!(!tree.is_ignored(&root.join("main.rs")));
+        assert!(!tree.is_ignored(&root));
+    }
+
+    #[test]
+    fn ignored_rows_render_with_the_dimmed_foreground() {
+        let (_tmp, mut tree) = fixture();
+        let root = tree.root.clone();
+        tree.ignored =
+            std::sync::Arc::new(std::collections::HashSet::from([root.join("README.md")]));
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 10,
+        };
+        let mut buf = Buffer::empty(area);
+        (&mut tree).render(area, &mut buf);
+        let dim = tree.theme.ignored_fg();
+        // Multi-byte icon glyphs mean a byte offset into the joined row text
+        // is not a column; walk the cells to map the match back to its column.
+        let row_fg = |needle: &str| {
+            for y in 0..area.height {
+                let cells: Vec<String> = (0..area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect();
+                let joined = cells.concat();
+                let Some(target) = joined.find(needle) else {
+                    continue;
+                };
+                let mut acc = 0usize;
+                for (x, s) in cells.iter().enumerate() {
+                    if acc == target {
+                        return buf[(x as u16, y)].fg;
+                    }
+                    acc += s.len();
+                }
+            }
+            panic!("{needle} not on screen");
+        };
+        assert_eq!(
+            row_fg("README.md"),
+            dim,
+            "a gitignored file's name wears the dimmed foreground"
+        );
+        assert_eq!(
+            row_fg("main.rs"),
+            Color::White,
+            "non-ignored names keep the normal foreground"
         );
     }
 

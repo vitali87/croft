@@ -270,6 +270,14 @@ impl Theme {
         (0xf8, 0x51, 0x49)
     }
 
+    /// Explorer name foreground for a git-ignored file or directory (VS Code
+    /// `gitDecoration.ignoredResourceForeground`, #8C8C8C on dark themes).
+    /// White at 55% over the theme background lands exactly on that grey for
+    /// the Black theme and stays a legible muted grey on every dark bg.
+    pub fn ignored_fg(self) -> Color {
+        self.blend_over_bg((0xff, 0xff, 0xff), 0.55)
+    }
+
     /// The scrollbar track. VS Code paints no track, so we match the editor
     /// background and the lane melts away on every theme.
     pub fn scrollbar_track(self) -> Color {

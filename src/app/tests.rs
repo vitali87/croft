@@ -2495,6 +2495,7 @@ fn git_status_spans_clean_branch_is_green() {
         ahead: 0,
         behind: 0,
         head_oid: None,
+        ignored: std::sync::Arc::default(),
     };
     let spans = git_status_spans(&st);
     let main_span = spans
@@ -2516,6 +2517,7 @@ fn git_status_spans_dirty_branch_is_yellow_not_red() {
         ahead: 0,
         behind: 0,
         head_oid: None,
+        ignored: std::sync::Arc::default(),
     };
     let spans = git_status_spans(&st);
     let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
@@ -2540,6 +2542,7 @@ fn git_status_spans_renders_detached_hash_when_no_branch() {
         ahead: 0,
         behind: 0,
         head_oid: None,
+        ignored: std::sync::Arc::default(),
     };
     let spans = git_status_spans(&st);
     let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
@@ -2556,6 +2559,7 @@ fn git_status_spans_renders_ahead_behind_counts() {
         ahead: 2,
         behind: 1,
         head_oid: None,
+        ignored: std::sync::Arc::default(),
     };
     let spans = git_status_spans(&st);
     let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
@@ -6029,6 +6033,40 @@ fn clicking_source_control_does_not_block_on_git_and_posts_a_changes_request() {
         "the worker must reply with the dirty file's Changes entry; entries = {:?}",
         app.source_control.entries,
     );
+}
+
+#[test]
+fn git_worker_status_response_feeds_the_explorer_ignored_set() {
+    // End-to-end wiring for the greyed-out gitignored Explorer rows: the
+    // worker's Status reply carries the ignored set and drain must push it
+    // into the file tree, where descendants of a collapsed ignored dir
+    // resolve via the ancestor walk.
+    let tmp = tempfile::tempdir().unwrap();
+    let _ = std::process::Command::new("git")
+        .args(["-C"])
+        .arg(tmp.path())
+        .args(["init", "-q", "-b", "main"])
+        .output();
+    std::fs::write(tmp.path().join(".gitignore"), "build/\n").unwrap();
+    std::fs::create_dir(tmp.path().join("build")).unwrap();
+    std::fs::write(tmp.path().join("build/out.txt"), "").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    // App::new seeds one Status request; wait for its reply to land.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while app.tree.ignored.is_empty() && std::time::Instant::now() < deadline {
+        let _ = app.drain_git_responses();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(
+        app.tree.is_ignored(&tmp.path().join("build")),
+        "ignored dir must reach the tree; set = {:?}",
+        app.tree.ignored,
+    );
+    assert!(
+        app.tree.is_ignored(&tmp.path().join("build/out.txt")),
+        "descendants of the collapsed ignored dir dim too"
+    );
+    assert!(!app.tree.is_ignored(&tmp.path().join(".gitignore")));
 }
 
 #[test]

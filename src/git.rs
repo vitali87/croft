@@ -1,5 +1,7 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 
 /// Snapshot of the workspace's git state, refreshed periodically and after
 /// filesystem events.  Cheap to compute on small repos; we shell out rather
@@ -18,6 +20,12 @@ pub struct GitStatus {
     /// baseline invalidation: when this moves (commit, checkout, pull) the
     /// cached HEAD file snapshots are stale and must be refetched.
     pub head_oid: Option<String>,
+    /// Absolute paths of git-ignored files and directories, so the Explorer
+    /// can grey them out (VS Code's ignored-resource decoration). A fully
+    /// ignored directory appears as one collapsed entry — descendants are
+    /// resolved by walking ancestors, never enumerated. Arc: the status is
+    /// cloned per consumer each refresh and the set can be large.
+    pub ignored: Arc<HashSet<PathBuf>>,
 }
 
 pub fn query(root: &Path) -> GitStatus {
@@ -55,7 +63,31 @@ pub fn query(root: &Path) -> GitStatus {
         ahead,
         behind,
         head_oid,
+        ignored: Arc::new(query_ignored(root)),
     }
+}
+
+/// The git-ignored paths under `root`, absolute. `--directory` collapses a
+/// fully-ignored directory (e.g. `target/`) to a single entry instead of
+/// enumerating its contents, keeping the set small and the scan cheap;
+/// `-z` NUL-separates so no filename is ever quote-mangled.
+fn query_ignored(root: &Path) -> HashSet<PathBuf> {
+    let out = run_git(
+        root,
+        &[
+            "ls-files",
+            "-z",
+            "--others",
+            "--ignored",
+            "--directory",
+            "--exclude-standard",
+        ],
+    )
+    .unwrap_or_default();
+    out.split('\0')
+        .filter(|s| !s.is_empty())
+        .map(|s| root.join(s.trim_end_matches('/')))
+        .collect()
 }
 
 fn is_git_repo(path: &Path) -> bool {
@@ -1446,6 +1478,41 @@ mod tests {
         let s = query(p);
         assert!(s.in_repo);
         assert!(s.dirty);
+    }
+
+    #[test]
+    fn query_collects_ignored_files_and_collapsed_dirs() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        let _ = Command::new("git")
+            .args(["-C"])
+            .arg(p)
+            .args(["init", "-q", "-b", "main"])
+            .output();
+        std::fs::write(p.join(".gitignore"), "*.log\nbuild/\n").unwrap();
+        std::fs::write(p.join("app.log"), "").unwrap();
+        std::fs::write(p.join("keep.txt"), "").unwrap();
+        std::fs::create_dir(p.join("build")).unwrap();
+        std::fs::write(p.join("build/out.txt"), "").unwrap();
+        let s = query(p);
+        assert!(s.ignored.contains(&p.join("app.log")));
+        assert!(
+            s.ignored.contains(&p.join("build")),
+            "a fully-ignored directory collapses to one entry, not its contents"
+        );
+        assert!(
+            !s.ignored.contains(&p.join("build/out.txt")),
+            "children of a collapsed ignored dir are not enumerated"
+        );
+        assert!(!s.ignored.contains(&p.join("keep.txt")));
+        assert!(!s.ignored.contains(&p.join(".gitignore")));
+    }
+
+    #[test]
+    fn query_outside_a_repo_has_an_empty_ignored_set() {
+        let tmp = TempDir::new().unwrap();
+        let s = query(tmp.path());
+        assert!(s.ignored.is_empty());
     }
 
     #[test]

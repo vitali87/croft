@@ -1636,6 +1636,7 @@ mod tests {
             ahead: 0,
             behind: 0,
             head_oid: None,
+            ignored: std::sync::Arc::default(),
             dirty: false,
         }
     }
