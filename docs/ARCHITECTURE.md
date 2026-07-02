@@ -123,7 +123,7 @@ src/
     ├── scm_menu.rs      the Source Control "⋯" title menu: a static tree of leaves + one-level fly-out submenus (Commit/Changes/Pull-Push/Branch/Remote/Stash/Tags); every leaf is an `ScmAction` dispatched in `App::dispatch_scm_action`
     ├── source_control.rs Source Control sidebar widget: branch summary (click to open the branch picker), commit input, change list, inline stage/unstage/discard row actions, commit split-button + actions menu (push/pull/sync/branch/stash/diffs), header refresh pill, no-repo hero
     ├── symbol_picker.rs VS Code "Go to Symbol in Editor" (Cmd/Ctrl+Shift+O): a fuzzy picker over the active file's outline symbols (kind-iconed, depth-indented); a `:` prefix switches to Go to Line; the App jumps via go_to_definition
-    ├── terminal.rs      portable-pty + alacritty_terminal + ratatui integration with selection + scrollback
+    ├── terminal.rs      portable-pty + alacritty_terminal + ratatui integration with selection + scrollback; pane order lives in `App::terminals` and is drag-reorderable live (grab a pane's name pill side-by-side, or its rail row in maximize mode; `App::move_terminal` keeps the active pane pinned to its terminal)
     ├── timeline.rs      collapsible TIMELINE section: the active file's git history (`git log --follow`) fetched off-thread, two rows per commit (summary + author/age), click-to-open the commit's diff; a ⋯-menu Explorer sub-view
     └── zoxide_jump.rs   Cmd+Z zoxide jump popup: fuzzy directory jumper that re-roots + cd's the terminal
 tests/cli.rs             integration tests for the CLI surface
