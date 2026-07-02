@@ -3138,6 +3138,17 @@ impl App {
         self.inline_protocol != crate::iterm2_inline::InlineImageProtocol::None
     }
 
+    /// Whether evicting stale inline images requires wiping the whole screen.
+    /// iTerm2 OSC-1337 and sixel graphics live in the normal cell buffer, so
+    /// only a `\x1b[2J` removes their cached cells. Kitty graphics live on
+    /// their own layer and are deleted by [`Self::evict_inline_images_on_clear`]
+    /// without touching a single text cell - wiping the screen there blanks
+    /// the whole app for an SSH round trip on every latch (the "croft blinks
+    /// while I type" bug), so the Kitty path must never `terminal.clear()`.
+    pub fn image_eviction_needs_screen_wipe(&self) -> bool {
+        self.inline_protocol != crate::iterm2_inline::InlineImageProtocol::Kitty
+    }
+
     /// Kitty graphics live on a layer that survives the `\x1b[2J` the main
     /// loop fires to evict iTerm2's image cells, so on the Kitty path that
     /// same clear frame must also delete every placement; the visible
@@ -21414,7 +21425,24 @@ impl App {
         if self.overlays.minimap.layout_matches(&desired) {
             return;
         }
-        self.overlays.minimap.request_clear_if_displayed();
+        // Only a moved or resized strip needs the full-screen eviction (image
+        // cells outside the new rect would ghost). A content-only change
+        // (edit, scroll, selection, theme) re-emits over the SAME cells - the
+        // fixed Kitty id / same-cell OSC-1337 emit replaces the image in
+        // place - so it must NOT arm the clear: that `2J` + full redraw is a
+        // whole-app blink on every keystroke over an SSH round trip.
+        let placement_moved = self.overlays.minimap.layout().is_none_or(|prev| {
+            (prev.cell_x, prev.cell_y, prev.cell_w, prev.cell_h)
+                != (
+                    desired.cell_x,
+                    desired.cell_y,
+                    desired.cell_w,
+                    desired.cell_h,
+                )
+        });
+        if placement_moved {
+            self.overlays.minimap.request_clear_if_displayed();
+        }
         // Cold path only: clone the path into the rebake signature.
         let canvas_w = cell_w as u32 * cw_px;
         let canvas_h = cell_h as u32 * ch_px;
@@ -25295,6 +25323,30 @@ fn run_pending_scp_uploads(app: &mut App, terminal: &mut CroftTerminal) -> Resul
     Ok(())
 }
 
+/// Consume every overlay's one-shot image-clear latch; true when any fired.
+/// Shared by the pre-draw and post-draw eviction checks in [`main_loop`].
+fn consume_any_image_clear(app: &mut App) -> bool {
+    let fired = [
+        app.consume_welcome_image_clear(),
+        app.consume_editor_image_clear(),
+        app.consume_run_debug_image_clear(),
+        app.consume_problems_badge_image_clear(),
+        app.consume_no_repo_hero_image_clear(),
+        app.consume_shortcuts_image_clear(),
+        app.consume_file_finder_image_clear(),
+        app.consume_command_palette_image_clear(),
+        app.consume_process_picker_image_clear(),
+        app.consume_zoxide_jump_image_clear(),
+        app.consume_branch_picker_image_clear(),
+        app.consume_input_prompt_image_clear(),
+        app.consume_list_picker_image_clear(),
+        app.consume_ssh_empty_state_image_clear(),
+        app.consume_minimap_image_clear(),
+        app.consume_activity_image_clear(),
+    ];
+    fired.into_iter().any(|f| f)
+}
+
 fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
     // Force the very first frame to render so the user sees the UI even
     // before the first event arrives or any timer fires.
@@ -25493,27 +25545,15 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             // its cached image cells AND ratatui repaints every cell on
             // the next draw (its diff alone misses cells whose content
             // didn't change between welcome and editor buffers).
-            if app.consume_welcome_image_clear()
-                || app.consume_editor_image_clear()
-                || app.consume_run_debug_image_clear()
-                || app.consume_problems_badge_image_clear()
-                || app.consume_no_repo_hero_image_clear()
-                || app.consume_shortcuts_image_clear()
-                || app.consume_file_finder_image_clear()
-                || app.consume_command_palette_image_clear()
-                || app.consume_process_picker_image_clear()
-                || app.consume_zoxide_jump_image_clear()
-                || app.consume_branch_picker_image_clear()
-                || app.consume_input_prompt_image_clear()
-                || app.consume_list_picker_image_clear()
-                || app.consume_ssh_empty_state_image_clear()
-                || app.consume_minimap_image_clear()
-                || app.consume_activity_image_clear()
-            {
-                terminal.clear()?;
-                // `\x1b[2J` evicts iTerm2's cached image cells but leaves
-                // Kitty graphics on their layer; on the Kitty path delete
-                // every placement here too so nothing ghosts. No-op on iTerm2.
+            if consume_any_image_clear(app) {
+                // iTerm2/sixel image cells live in the normal cell buffer, so
+                // evicting them takes a full `2J` + repaint. Kitty images are
+                // deleted on their own layer below - wiping the text there
+                // blanks the whole app for an SSH round trip per latch (the
+                // every-keystroke blink), so Kitty skips the screen clear.
+                if app.image_eviction_needs_screen_wipe() {
+                    terminal.clear()?;
+                }
                 app.evict_inline_images_on_clear();
                 // Activity-bar icons live outside ratatui too; re-emit
                 // them on the next post-draw flush. The welcome wordmark
@@ -25532,24 +25572,10 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             // frame so the F8 HUD can show where remote latency goes.
             app.perf.record_draw(draw_start.elapsed().as_micros());
             frames_in_window += 1;
-            if app.consume_welcome_image_clear()
-                || app.consume_editor_image_clear()
-                || app.consume_run_debug_image_clear()
-                || app.consume_problems_badge_image_clear()
-                || app.consume_no_repo_hero_image_clear()
-                || app.consume_shortcuts_image_clear()
-                || app.consume_file_finder_image_clear()
-                || app.consume_command_palette_image_clear()
-                || app.consume_process_picker_image_clear()
-                || app.consume_zoxide_jump_image_clear()
-                || app.consume_branch_picker_image_clear()
-                || app.consume_input_prompt_image_clear()
-                || app.consume_list_picker_image_clear()
-                || app.consume_ssh_empty_state_image_clear()
-                || app.consume_minimap_image_clear()
-                || app.consume_activity_image_clear()
-            {
-                terminal.clear()?;
+            if consume_any_image_clear(app) {
+                if app.image_eviction_needs_screen_wipe() {
+                    terminal.clear()?;
+                }
                 app.evict_inline_images_on_clear();
                 app.overlays.activity.mark_dirty();
                 app.overlays.welcome.mark_dirty();

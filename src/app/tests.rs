@@ -15497,3 +15497,73 @@ fn complete_pending_save_writes_formatted_buffer_to_disk() {
     let unchanged = std::fs::read_to_string(&f).unwrap();
     assert_eq!(unchanged, on_disk, "no write without the latch set");
 }
+
+#[test]
+fn minimap_edit_rebakes_in_place_but_a_moved_strip_arms_the_clear() {
+    // Issue: every keystroke bumped `edit_seq`, the minimap layout signature
+    // mismatched, and `update_minimap_overlay` armed the full-screen clear
+    // latch - so the whole app blinked on every edit (a 2J + full redraw is
+    // one visible round trip over SSH). A content-only change re-emits the
+    // raster over the SAME cells (fixed Kitty id / same-cell OSC-1337 emit
+    // replaces in place), so only a moved or resized strip may arm the clear.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.cell_pixel = Some((8, 16));
+    app.inline_protocol = crate::iterm2_inline::InlineImageProtocol::Kitty;
+    app.editor.lines = (0..80).map(|i| format!("line {i}")).collect();
+    let strip = ratatui::layout::Rect {
+        x: 100,
+        y: 1,
+        width: 6,
+        height: 40,
+    };
+    app.update_minimap_overlay(strip);
+    assert!(app.minimap_image_payload().is_some(), "minimap must bake");
+    let _ = app.consume_minimap_image_clear();
+    app.mark_minimap_image_displayed();
+
+    app.editor.lines.push(String::from("one more line"));
+    app.editor.edit_seq += 1;
+    app.update_minimap_overlay(strip);
+    assert!(
+        !app.consume_minimap_image_clear(),
+        "a content-only minimap change must replace the image in place, not blank the screen"
+    );
+    assert!(
+        app.minimap_image_payload().is_some(),
+        "the rebaked raster must still be there to re-emit"
+    );
+
+    app.mark_minimap_image_displayed();
+    let moved = ratatui::layout::Rect { x: 60, ..strip };
+    app.update_minimap_overlay(moved);
+    assert!(
+        app.consume_minimap_image_clear(),
+        "a moved minimap strip must arm the eviction clear so no ghost remains"
+    );
+}
+
+#[test]
+fn image_eviction_wipes_the_screen_only_on_cell_buffer_protocols() {
+    // The `terminal.clear()` the main loop fires when an image-clear latch is
+    // armed exists to evict CACHED IMAGE CELLS: iTerm2 OSC-1337 and sixel
+    // graphics live in the normal cell buffer, so only a `2J` removes them.
+    // Kitty graphics live on their own layer and are deleted by
+    // `evict_inline_images_on_clear` (delete-all-by-escape) without touching a
+    // single text cell - wiping the screen there blanks the whole app for a
+    // full SSH round trip on every latch (the "croft blinks while I type" bug).
+    use crate::iterm2_inline::InlineImageProtocol;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.inline_protocol = InlineImageProtocol::Kitty;
+    assert!(
+        !app.image_eviction_needs_screen_wipe(),
+        "Kitty images are deleted on their own layer; the text buffer must stay intact"
+    );
+    app.inline_protocol = InlineImageProtocol::ITerm2;
+    assert!(app.image_eviction_needs_screen_wipe());
+    app.inline_protocol = InlineImageProtocol::Sixel;
+    assert!(app.image_eviction_needs_screen_wipe());
+    app.inline_protocol = InlineImageProtocol::None;
+    assert!(app.image_eviction_needs_screen_wipe());
+}

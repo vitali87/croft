@@ -40,6 +40,10 @@ impl<L: PartialEq> ImageOverlay<L> {
         self.layout.as_ref() == Some(desired)
     }
 
+    pub fn layout(&self) -> Option<&L> {
+        self.layout.as_ref()
+    }
+
     pub fn set(&mut self, image: String, layout: L) {
         self.image = Some(image);
         self.layout = Some(layout);
