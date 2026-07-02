@@ -10974,6 +10974,38 @@ fn maximized_terminal_fills_width_and_lists_others_in_rail() {
 }
 
 #[test]
+fn rail_width_hugs_short_names_and_truncates_long_ones() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.split_terminal().unwrap();
+    app.terminal_pane_maximized = true;
+    let backend = ratatui::backend::TestBackend::new(180, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+
+    // Short names: the rail hugs them instead of grabbing a fixed slice of
+    // the panel ("Too much space left. only terminal names should be shown").
+    app.terminals[0].set_manual_name(Some(String::from("zsh")));
+    app.terminals[1].set_manual_name(Some(String::from("zsh")));
+    term.draw(|f| app.render(f)).unwrap();
+    let w = app.terminal_rail_rects[0].width;
+    assert_eq!(
+        w,
+        3 + TERMINAL_RAIL_CHROME_W,
+        "rail width must be the longest label plus icon/padding chrome, got {w}"
+    );
+
+    // A long name doesn't drag the rail wide: the cap wins and the label
+    // truncates inside it.
+    app.terminals[1].set_manual_name(Some(String::from("a-very-long-terminal-pane-name")));
+    term.draw(|f| app.render(f)).unwrap();
+    let w = app.terminal_rail_rects[0].width;
+    assert_eq!(
+        w, TERMINAL_RAIL_MAX_W,
+        "a long label must be truncated at the rail cap, got {w}"
+    );
+}
+
+#[test]
 fn clicking_rail_row_switches_terminal_and_stays_maximized() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
