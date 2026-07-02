@@ -10879,6 +10879,198 @@ fn each_terminal_paints_its_own_add_close_buttons_when_multiple_open() {
 }
 
 #[test]
+fn clicking_terminal_maximize_button_maximizes_that_pane() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.split_terminal().unwrap();
+    app.split_terminal().unwrap();
+    assert_eq!(app.active_terminal, 2);
+    app.terminal_max_buttons = vec![
+        Rect {
+            x: 10,
+            y: 30,
+            width: 3,
+            height: 1,
+        },
+        Rect {
+            x: 30,
+            y: 30,
+            width: 3,
+            height: 1,
+        },
+        Rect {
+            x: 50,
+            y: 30,
+            width: 3,
+            height: 1,
+        },
+    ];
+    app.handle_mouse(crossterm::event::MouseEvent {
+        kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        column: 11,
+        row: 30,
+        modifiers: KeyModifiers::NONE,
+    });
+    assert!(
+        app.terminal_pane_maximized,
+        "the ⛶ click enters maximize mode"
+    );
+    assert_eq!(
+        app.active_terminal, 0,
+        "the pane whose ⛶ was clicked becomes the maximized one"
+    );
+}
+
+#[test]
+fn maximized_terminal_fills_width_and_lists_others_in_rail() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.split_terminal().unwrap();
+    app.split_terminal().unwrap();
+    app.terminal_pane_maximized = true;
+    let backend = ratatui::backend::TestBackend::new(180, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let active = app.active_terminal;
+    assert!(
+        app.terminals[active].last_area.width >= 100,
+        "the maximized pane must span (almost) the whole panel width, got {}",
+        app.terminals[active].last_area.width
+    );
+    for (i, t) in app.terminals.iter().enumerate() {
+        if i != active {
+            assert_eq!(
+                t.last_area,
+                Rect::default(),
+                "hidden pane {i} must drop its hit rect so clicks can't phantom-match"
+            );
+        }
+    }
+    assert_eq!(
+        app.terminal_rail_rects.len(),
+        3,
+        "the right-side rail lists every terminal"
+    );
+    let xs: std::collections::HashSet<u16> = app.terminal_rail_rects.iter().map(|r| r.x).collect();
+    assert_eq!(xs.len(), 1, "rail rows stack vertically in one column");
+    let ys: std::collections::HashSet<u16> = app.terminal_rail_rects.iter().map(|r| r.y).collect();
+    assert_eq!(ys.len(), 3, "each rail row sits on its own line");
+    // Index alignment: in maximize mode only the visible pane carries live
+    // button rects; the hidden panes hold empty placeholders so a button's
+    // position in the vec still names its terminal index.
+    assert_eq!(app.terminal_max_buttons.len(), 3);
+    let live: Vec<usize> = app
+        .terminal_max_buttons
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.width > 0)
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(
+        live,
+        vec![active],
+        "only the maximized pane paints a restore button"
+    );
+}
+
+#[test]
+fn clicking_rail_row_switches_terminal_and_stays_maximized() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.split_terminal().unwrap();
+    app.split_terminal().unwrap();
+    app.terminal_pane_maximized = true;
+    let backend = ratatui::backend::TestBackend::new(180, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let r = app.terminal_rail_rects[0];
+    app.handle_mouse(crossterm::event::MouseEvent {
+        kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        column: r.x + 1,
+        row: r.y,
+        modifiers: KeyModifiers::NONE,
+    });
+    assert_eq!(app.active_terminal, 0, "the rail row picks its terminal");
+    assert!(
+        app.terminal_pane_maximized,
+        "shuffling via the rail stays in maximize mode"
+    );
+    term.draw(|f| app.render(f)).unwrap();
+    assert!(
+        app.terminals[0].last_area.width >= 100,
+        "the newly picked terminal now owns the maximized pane"
+    );
+}
+
+#[test]
+fn clicking_restore_button_returns_to_split_layout() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.split_terminal().unwrap();
+    app.terminal_pane_maximized = true;
+    let backend = ratatui::backend::TestBackend::new(180, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let r = app.terminal_max_buttons[app.active_terminal];
+    assert!(r.width > 0, "the maximized pane paints a restore button");
+    app.handle_mouse(crossterm::event::MouseEvent {
+        kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        column: r.x + 1,
+        row: r.y,
+        modifiers: KeyModifiers::NONE,
+    });
+    assert!(
+        !app.terminal_pane_maximized,
+        "clicking the restore button leaves maximize mode"
+    );
+    term.draw(|f| app.render(f)).unwrap();
+    assert!(
+        app.terminals.iter().all(|t| t.last_area.width > 0),
+        "all panes are visible again after restore"
+    );
+    assert!(
+        app.terminal_rail_rects.is_empty(),
+        "the rail disappears with the split restored"
+    );
+}
+
+#[test]
+fn cmd_k_m_toggles_terminal_maximize() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.split_terminal().unwrap();
+    app.handle_key(key(KeyCode::Char('k'), KeyModifiers::SUPER))
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('m'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(
+        app.terminal_pane_maximized,
+        "Cmd+K M maximizes the active pane"
+    );
+    app.handle_key(key(KeyCode::Char('k'), KeyModifiers::SUPER))
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('m'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(
+        !app.terminal_pane_maximized,
+        "Cmd+K M again restores the split"
+    );
+}
+
+#[test]
+fn closing_down_to_one_terminal_exits_maximize() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.split_terminal().unwrap();
+    app.terminal_pane_maximized = true;
+    assert!(app.close_terminal_at(0));
+    assert!(
+        !app.terminal_pane_maximized,
+        "a lone terminal has nothing to maximize against; the flag resets"
+    );
+}
+
+#[test]
 fn cwd_of_pid_on_self_returns_a_directory_under_tempdir() {
     // The harness runs each test from the crate root by default, but
     // we don't depend on that — we just need cwd_of_pid to round-trip

@@ -1018,6 +1018,9 @@ enum MenuAction {
     RenameTerminal(usize),
     /// Terminal pane right-click: clear the pane at `idx`'s screen + scrollback.
     ClearTerminal(usize),
+    /// Terminal pane right-click: maximize the pane at `idx` across the
+    /// panel (or restore the even split when already maximized).
+    ToggleMaximizeTerminal(usize),
     /// Terminal profile dropdown (`⌄`): open a new pane running this shell path.
     NewTerminalWithProfile(String),
     /// Minimap right-click menu: show/hide the editor minimap.
@@ -1084,6 +1087,7 @@ fn shortcut_for(action: &MenuAction) -> Option<&'static str> {
         MenuAction::CompareWithSelected { .. } => Some("⌘K C"),
         MenuAction::RenameTerminal(_) => Some("⌘K R"),
         MenuAction::ClearTerminal(_) => Some("⌘K K"),
+        MenuAction::ToggleMaximizeTerminal(_) => Some("⌘K M"),
         _ => None,
     }
 }
@@ -2055,6 +2059,20 @@ pub struct App {
     /// is open (closing the last one would leave the pane empty, which we
     /// explicitly forbid) or the pane is hidden.
     terminal_close_buttons: Vec<Rect>,
+    /// Hit-test rectangles of the maximize / restore (`⛶`) buttons - one per
+    /// pane, in lock-step with `terminals`. Hidden panes hold an empty rect
+    /// so a button's position still names its terminal index.
+    terminal_max_buttons: Vec<Rect>,
+    /// Hit-test rectangles of the maximize-mode rail rows down the panel's
+    /// right edge, in lock-step with `terminals`. Clicking one hands that
+    /// terminal the maximized pane. Empty outside maximize mode.
+    terminal_rail_rects: Vec<Rect>,
+    /// True while one terminal pane fills the panel's width and the others
+    /// are listed in the right-side rail (the per-pane `⛶` button / Cmd+K M).
+    /// Distinct from `terminal_maximized`, which grows the panel vertically
+    /// over the editor. Only meaningful with 2+ terminals; closing down to
+    /// one resets it.
+    terminal_pane_maximized: bool,
     /// Which tab the bottom panel group is showing (TERMINAL or PROBLEMS).
     bottom_panel_tab: BottomPanelTab,
     /// The PROBLEMS view: aggregated workspace diagnostics, projected from
@@ -2974,6 +2992,9 @@ impl App {
             terminal_add_buttons: Vec::new(),
             terminal_profile_buttons: Vec::new(),
             terminal_close_buttons: Vec::new(),
+            terminal_max_buttons: Vec::new(),
+            terminal_rail_rects: Vec::new(),
+            terminal_pane_maximized: false,
             bottom_panel_tab: BottomPanelTab::Terminal,
             problems: crate::widgets::problems::ProblemsPanel::new(),
             output: crate::widgets::output::OutputPanel::new(),
@@ -8175,8 +8196,84 @@ impl App {
         } else if self.active_terminal > idx {
             self.active_terminal -= 1;
         }
+        // A lone terminal has nothing to maximize against; the rail would be
+        // empty, so the split view is the honest state.
+        if self.terminals.len() <= 1 {
+            self.terminal_pane_maximized = false;
+        }
         self.sync_focus_flags();
         true
+    }
+
+    /// Toggle maximize mode for the active terminal pane (Cmd+K M / the
+    /// pane's `⛶` button): one pane spans the panel's width and the other
+    /// terminals move to the right rail, where clicking a row hands it the
+    /// maximized pane. Orthogonal to `toggle_terminal_maximize`
+    /// (Ctrl+Shift+J), which grows the panel over the editor: this
+    /// reapportions the panel's width, not the window's rows.
+    pub fn toggle_terminal_pane_maximize(&mut self) {
+        if self.terminal_pane_maximized {
+            self.terminal_pane_maximized = false;
+            self.status = String::from("Restored terminal split");
+        } else if self.terminals.len() > 1 {
+            self.terminal_pane_maximized = true;
+            self.status = String::from("Maximized terminal");
+        } else {
+            self.status = String::from("Only one terminal open");
+        }
+    }
+
+    /// Paint the maximize-mode rail: one row per terminal down the panel's
+    /// right edge — the active one highlighted, the rest hover-lit — so the
+    /// user can shuffle between maximized terminals. Records one hit rect
+    /// per row in `terminal_rail_rects`, index-aligned with `terminals`.
+    fn paint_terminal_rail(&mut self, frame: &mut ratatui::Frame, rail: Rect) {
+        if rail.width == 0 || rail.height == 0 {
+            return;
+        }
+        let brand = self.theme.gradient();
+        // Same selected-row treatment as the OPEN EDITORS list, so the rail
+        // reads as the same family of chrome in both themes.
+        let sel_bg = if brand {
+            crate::gradient::rgb_color(crate::gradient::POPUP_SEL_BG)
+        } else {
+            Color::Rgb(0x09, 0x4d, 0x77)
+        };
+        for i in 0..self.terminals.len() {
+            let y = rail.y + i as u16;
+            if y >= rail.y + rail.height {
+                break;
+            }
+            let row = Rect {
+                x: rail.x,
+                y,
+                width: rail.width,
+                height: 1,
+            };
+            let active = i == self.active_terminal;
+            let bg = if active {
+                Some(sel_bg)
+            } else {
+                crate::widgets::hover::row_hover_bg(row, self.pointer_cell, brand)
+            };
+            if let Some(bg) = bg {
+                frame.buffer_mut().set_style(row, Style::default().bg(bg));
+            }
+            let label = self.terminals[i].label().to_string();
+            let room = rail.width.saturating_sub(4) as usize;
+            let shown: String = label.chars().take(room).collect();
+            let fg = if active {
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            frame
+                .buffer_mut()
+                .set_string(row.x, y, format!(" {TERMINAL_RAIL_ICON} {shown}"), fg);
+            self.terminal_rail_rects.push(row);
+        }
     }
 
     /// Drop the currently-active terminal. Thin wrapper kept for the
@@ -9120,38 +9217,87 @@ impl App {
             match self.bottom_panel_tab {
                 BottomPanelTab::Terminal => {
                     let n = self.terminals.len().max(1);
-                    let constraints: Vec<Constraint> =
-                        (0..n).map(|_| Constraint::Ratio(1, n as u32)).collect();
-                    let cols = Layout::default()
-                        .direction(Direction::Horizontal)
-                        .constraints(constraints)
-                        .split(content);
+                    let multi = self.terminals.len() > 1;
+                    let maximized = self.terminal_pane_maximized && multi;
+                    self.terminal_rail_rects.clear();
+                    // Maximize mode: the active pane owns the panel's width
+                    // minus a right rail listing every terminal (VS Code's
+                    // terminal-tabs list); hidden panes drop their hit rects
+                    // so clicks can't phantom-match. Otherwise: even split.
+                    let cols: Vec<Rect> = if maximized {
+                        let rail_w = (content.width / 5)
+                            .clamp(14, 26)
+                            .min(content.width.saturating_sub(20));
+                        let pane = Rect {
+                            x: content.x,
+                            y: content.y,
+                            width: content.width - rail_w,
+                            height: content.height,
+                        };
+                        let rail = Rect {
+                            x: content.x + pane.width,
+                            y: content.y,
+                            width: rail_w,
+                            height: content.height,
+                        };
+                        self.paint_terminal_rail(frame, rail);
+                        (0..n)
+                            .map(|i| {
+                                if i == self.active_terminal {
+                                    pane
+                                } else {
+                                    Rect::default()
+                                }
+                            })
+                            .collect()
+                    } else {
+                        let constraints: Vec<Constraint> =
+                            (0..n).map(|_| Constraint::Ratio(1, n as u32)).collect();
+                        Layout::default()
+                            .direction(Direction::Horizontal)
+                            .constraints(constraints)
+                            .split(content)
+                            .to_vec()
+                    };
                     for (i, t) in self.terminals.iter_mut().enumerate() {
-                        frame.render_widget(t, cols[i]);
+                        if cols[i].width == 0 {
+                            t.last_area = Rect::default();
+                        } else {
+                            frame.render_widget(t, cols[i]);
+                        }
                     }
-                    let show_close = self.terminals.len() > 1;
+                    let show_close = multi;
                     let brand = self.theme.gradient();
                     self.terminal_add_buttons.clear();
                     self.terminal_profile_buttons.clear();
                     self.terminal_close_buttons.clear();
-                    let multi = self.terminals.len() > 1;
+                    self.terminal_max_buttons.clear();
                     for (i, col) in cols.iter().enumerate().take(self.terminals.len()) {
+                        // Hidden panes still push placeholders so a button's
+                        // position in each vec names its terminal index.
+                        if col.width == 0 {
+                            self.terminal_add_buttons.push(Rect::default());
+                            self.terminal_profile_buttons.push(Rect::default());
+                            self.terminal_close_buttons.push(Rect::default());
+                            self.terminal_max_buttons.push(Rect::default());
+                            continue;
+                        }
                         let buttons = paint_terminal_pane_buttons(
                             frame,
                             *col,
                             show_close,
+                            maximized,
                             brand,
                             self.pointer_cell,
                         );
-                        if let Some(r) = buttons.add {
-                            self.terminal_add_buttons.push(r);
-                        }
-                        if let Some(r) = buttons.profile {
-                            self.terminal_profile_buttons.push(r);
-                        }
-                        if let Some(r) = buttons.close {
-                            self.terminal_close_buttons.push(r);
-                        }
+                        self.terminal_add_buttons
+                            .push(buttons.add.unwrap_or_default());
+                        self.terminal_profile_buttons
+                            .push(buttons.profile.unwrap_or_default());
+                        self.terminal_close_buttons
+                            .push(buttons.close.unwrap_or_default());
+                        self.terminal_max_buttons
+                            .push(buttons.max.unwrap_or_default());
                         // Auto/manual pane label at top-left, only with 2+ panes
                         // (a lone pane needs no name). Kept clear of the buttons.
                         if multi {
@@ -9176,6 +9322,8 @@ impl App {
                     self.terminal_add_buttons.clear();
                     self.terminal_profile_buttons.clear();
                     self.terminal_close_buttons.clear();
+                    self.terminal_max_buttons.clear();
+                    self.terminal_rail_rects.clear();
                     for t in self.terminals.iter_mut() {
                         t.last_area = Rect::default();
                     }
@@ -9187,6 +9335,8 @@ impl App {
                     self.terminal_add_buttons.clear();
                     self.terminal_profile_buttons.clear();
                     self.terminal_close_buttons.clear();
+                    self.terminal_max_buttons.clear();
+                    self.terminal_rail_rects.clear();
                     for t in self.terminals.iter_mut() {
                         t.last_area = Rect::default();
                     }
@@ -9198,6 +9348,8 @@ impl App {
                     self.terminal_add_buttons.clear();
                     self.terminal_profile_buttons.clear();
                     self.terminal_close_buttons.clear();
+                    self.terminal_max_buttons.clear();
+                    self.terminal_rail_rects.clear();
                     for t in self.terminals.iter_mut() {
                         t.last_area = Rect::default();
                     }
@@ -9208,6 +9360,8 @@ impl App {
             self.terminal_add_buttons.clear();
             self.terminal_profile_buttons.clear();
             self.terminal_close_buttons.clear();
+            self.terminal_max_buttons.clear();
+            self.terminal_rail_rects.clear();
             self.problems_tab_rect = Rect::default();
             self.output_tab_rect = Rect::default();
             self.ports_tab_rect = Rect::default();
@@ -10488,6 +10642,17 @@ impl App {
                     self.show_terminal = true;
                 }
                 self.begin_rename_terminal(self.active_terminal);
+                true
+            }
+            // Cmd+K M: maximize the active terminal pane / restore the even
+            // split (croft binding; VS Code leaves its panel-maximize
+            // relative unbound, and every croft action carries an
+            // accelerator).
+            KeyCode::Char(c) if plain && c.eq_ignore_ascii_case(&'m') => {
+                if !self.show_terminal {
+                    self.show_terminal = true;
+                }
+                self.toggle_terminal_pane_maximize();
                 true
             }
             // Cmd+K B: show the Testing view (B for the beaker icon). Cmd+Shift+T
@@ -18808,7 +18973,7 @@ impl App {
                 {
                     self.active_terminal = idx;
                     self.focus_pane(Pane::Terminal);
-                    let items = vec![
+                    let mut items = vec![
                         MenuEntry::Item {
                             label: String::from("Rename Terminal"),
                             action: MenuAction::RenameTerminal(idx),
@@ -18818,6 +18983,18 @@ impl App {
                             action: MenuAction::ClearTerminal(idx),
                         },
                     ];
+                    // Maximize needs a second pane to trade space with, so a
+                    // lone terminal doesn't offer it.
+                    if self.terminals.len() > 1 {
+                        items.push(MenuEntry::Item {
+                            label: String::from(if self.terminal_pane_maximized {
+                                "Restore Terminal Split"
+                            } else {
+                                "Maximize Terminal"
+                            }),
+                            action: MenuAction::ToggleMaximizeTerminal(idx),
+                        });
+                    }
                     self.context_menu = Some(ContextMenu {
                         origin: (m.column, m.row),
                         items,
@@ -19191,6 +19368,29 @@ impl App {
                     .any(|r| rect_contains(*r, m.column, m.row))
                 {
                     self.open_terminal_profile_picker();
+                    return;
+                }
+                if let Some(idx) = self
+                    .terminal_max_buttons
+                    .iter()
+                    .position(|r| rect_contains(*r, m.column, m.row))
+                {
+                    // Entering maximize mode hands the clicked pane the
+                    // panel; the button on the maximized pane restores.
+                    if !self.terminal_pane_maximized {
+                        self.active_terminal = idx;
+                        self.focus_pane(Pane::Terminal);
+                    }
+                    self.toggle_terminal_pane_maximize();
+                    return;
+                }
+                if let Some(idx) = self
+                    .terminal_rail_rects
+                    .iter()
+                    .position(|r| rect_contains(*r, m.column, m.row))
+                {
+                    self.active_terminal = idx;
+                    self.focus_pane(Pane::Terminal);
                     return;
                 }
                 if self
@@ -20857,6 +21057,12 @@ impl App {
             MenuAction::ToggleZenMode => self.toggle_zen_mode(),
             MenuAction::RenameTerminal(idx) => self.begin_rename_terminal(idx),
             MenuAction::ClearTerminal(idx) => self.clear_terminal_at(idx),
+            MenuAction::ToggleMaximizeTerminal(idx) => {
+                if !self.terminal_pane_maximized {
+                    self.active_terminal = idx;
+                }
+                self.toggle_terminal_pane_maximize();
+            }
             MenuAction::NewTerminalWithProfile(shell) => {
                 let label = std::path::Path::new(&shell)
                     .file_name()
@@ -24098,6 +24304,15 @@ const TERMINAL_CLOSE_LABEL: &str = " - ";
 /// Codicon chevron-down, matching the OUTPUT dropdown caret. Opens the terminal
 /// profile picker (VS Code's `∨` beside `+`).
 const TERMINAL_PROFILE_LABEL: &str = " \u{eab4} ";
+/// Codicon screen-full (Nerd Fonts `cod-screen_full` = U+EB4C): maximize this
+/// terminal pane across the panel, parking the other panes in the right rail.
+const TERMINAL_MAX_LABEL: &str = " \u{eb4c} ";
+/// Codicon screen-normal (Nerd Fonts `cod-screen_normal` = U+EB4D): restore
+/// the even split. Swapped in for the `⛶` while a pane is maximized.
+const TERMINAL_RESTORE_LABEL: &str = " \u{eb4d} ";
+/// Codicon terminal (Nerd Fonts `cod-terminal` = U+EA85), leading each
+/// maximize-rail row the way VS Code's terminal tabs list does.
+const TERMINAL_RAIL_ICON: char = '\u{ea85}';
 
 /// True when croft was invoked over an SSH login (or otherwise inside a
 /// remote shell). Used to throttle PTY-driven redraws further so the SSH
@@ -24444,12 +24659,14 @@ fn paint_terminal_pane_buttons(
     frame: &mut ratatui::Frame,
     area: Rect,
     show_close_button: bool,
+    pane_maximized: bool,
     brand: bool,
     pointer: Option<(u16, u16)>,
 ) -> TerminalPaneButtons {
     let add_w = TERMINAL_ADD_LABEL.chars().count() as u16;
     let caret_w = TERMINAL_PROFILE_LABEL.chars().count() as u16;
     let close_w = TERMINAL_CLOSE_LABEL.chars().count() as u16;
+    let max_w = TERMINAL_MAX_LABEL.chars().count() as u16;
     let mut out = TerminalPaneButtons::default();
     if area.height == 0 {
         return out;
@@ -24500,6 +24717,26 @@ fn paint_terminal_pane_buttons(
             height: 1,
         });
     }
+    // The maximize / restore button sits left of `-` and shares its
+    // visibility: with a single terminal there is nothing to maximize
+    // against, just as there is nothing to close.
+    if show_close_button && area.width >= add_w + caret_w + close_w + max_w + 2 {
+        let x = area.x + area.width - add_w - caret_w - close_w - max_w - 1;
+        let label = if pane_maximized {
+            TERMINAL_RESTORE_LABEL
+        } else {
+            TERMINAL_MAX_LABEL
+        };
+        frame
+            .buffer_mut()
+            .set_string(x, y, label, style_at(x, max_w));
+        out.max = Some(Rect {
+            x,
+            y,
+            width: max_w,
+            height: 1,
+        });
+    }
     out
 }
 
@@ -24510,6 +24747,7 @@ struct TerminalPaneButtons {
     add: Option<Rect>,
     profile: Option<Rect>,
     close: Option<Rect>,
+    max: Option<Rect>,
 }
 
 fn key_to_bytes(key: KeyEvent) -> Vec<u8> {

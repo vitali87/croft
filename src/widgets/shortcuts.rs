@@ -297,6 +297,16 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 handler: "",
             },
             ShortcutEntry {
+                keys: "Cmd/Ctrl+D",
+                description: "Add Selection to Next Find Match (multi-cursor on repeats)",
+                handler: "is_select_next_occurrence_key",
+            },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+Shift+K",
+                description: "Delete the current line or every selected line",
+                handler: "is_delete_line_key",
+            },
+            ShortcutEntry {
                 keys: "Cmd/Ctrl+/",
                 description: "Toggle line comment for the line or selection",
                 handler: "is_toggle_line_comment_key",
@@ -790,6 +800,11 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 keys: "Cmd+[ / Cmd+]",
                 description: "Cycle to the previous / next terminal",
                 handler: "is_terminal_cycle_back_key is_terminal_cycle_key",
+            },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+K M",
+                description: "Maximize the active terminal across the panel (again to restore the split)",
+                handler: "",
             },
             ShortcutEntry {
                 keys: "Cmd+V / Ctrl+V",

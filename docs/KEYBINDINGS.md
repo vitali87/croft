@@ -49,6 +49,7 @@ On macOS, the `Cmd` chords below only reach croft after you run a one-time setup
 | `Cmd+K` `Shift+O` | Move into New Window: same, and close the file's tab here (macOS only) |
 | `Cmd+K` `Z` | Toggle Zen Mode: hide the activity bar, both side bars, the panel, and the status bar; press again to restore exactly what was shown before |
 | `Cmd+K` `B` | Show the Testing view (beaker icon); it discovers tests on first open. In the view: Enter runs all tests, `r` re-discovers, ↑/↓ scroll |
+| `Cmd+K` `M` | Maximize the active terminal pane across the panel width (the other terminals move to a right-edge rail); press again to restore the even split |
 | `Cmd+K` `F` | Toggle Format on Save: when on, `Cmd+S` reformats through the language server before writing (also in the Command Palette) |
 | `Cmd+K` `Cmd+L` | Toggle the code fold at the cursor: collapse the enclosing indented block (function, loop, struct) to its header line, or re-expand it |
 | `Cmd+K` `Cmd+0` | Fold All: collapse every foldable block in the buffer |
@@ -320,7 +321,10 @@ Disabling takes effect immediately for the viewers and Vim (a disabled PDF/CSV v
 | Click the `⌄` caret (beside `+`) | Drop the terminal profile menu anchored under the caret: pick a shell (from `/etc/shells` + `$SHELL`) to launch a new pane |
 | `Cmd+K` `R` | Rename the active terminal pane (a blank name clears it, restoring the auto label) |
 | `Cmd+K` `K` | Clear the active terminal's screen and scrollback (VS Code clears with `Cmd+K`) |
-| Right-click a terminal pane | Open the pane menu: **Rename Terminal**, **Clear** |
+| `Cmd+K` `M` | Maximize the active terminal across the panel; press again to restore the even split |
+| Click the `⛶` button (beside `-`) | Maximize that pane: it takes the panel's full width and the other terminals move to a rail down the right edge; the button becomes a restore glyph while maximized |
+| Click a rail row | While maximized: hand that terminal the maximized pane (the highlight marks the active one), so you can shuffle between full-size terminals |
+| Right-click a terminal pane | Open the pane menu: **Rename Terminal**, **Clear**, **Maximize Terminal** (or **Restore Terminal Split**) |
 
 With two or more panes open, each pane's header shows its live foreground process (`zsh`, `vim`, `node`…); a manual rename overrides that label.
 | `Cmd`/`Ctrl` + click a printed URL | Open it. A loopback dev-server URL on a remote session (`http://localhost:3000`) is forwarded home over the live SSH connection first, then opened in your local browser; any other link opens directly |

@@ -62,22 +62,10 @@ pub struct ReleaseNote {
 pub const RELEASE_NOTES: &[ReleaseNote] = &[
     ReleaseNote {
         kind: NoteKind::Feature,
-        summary: "Breadcrumbs bar above the editor shows the file path and the enclosing symbol trail at the caret; click a symbol crumb to jump to it.",
+        summary: "Maximize a terminal: the ⛶ button (or Cmd+K M) gives one pane the panel's full width; the other terminals wait in a rail on the right, and clicking one there hands it the maximized pane.",
     },
     ReleaseNote {
-        kind: NoteKind::Feature,
-        summary: "Sticky scroll pins the enclosing scope headers (class, function) to the top of the editor while you scroll; click one to jump there.",
-    },
-    ReleaseNote {
-        kind: NoteKind::Feature,
-        summary: "Multi-cursor: Cmd+D adds the next match one at a time, Opt+click drops a caret, and Shift+Alt+drag makes a column selection.",
-    },
-    ReleaseNote {
-        kind: NoteKind::Feature,
-        summary: "Bracket matching highlights the bracket beside the caret and its partner.",
-    },
-    ReleaseNote {
-        kind: NoteKind::Feature,
-        summary: "Format on Save (toggle from the palette or Cmd+K F) reformats through the language server before writing.",
+        kind: NoteKind::Fix,
+        summary: "The F1 shortcuts panel now documents Cmd+D (Add Selection to Next Find Match) and Cmd+Shift+K (Delete Line).",
     },
 ];
