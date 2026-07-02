@@ -1939,6 +1939,12 @@ pub struct App {
     /// is true, and preserves it across the theme-switch re-detect that would
     /// otherwise reset to `None` (sixel has no env signal to re-derive from).
     sixel_supported: bool,
+    /// One-shot: a WINCH arrived, so the next frame must wipe and repaint every
+    /// cell on EVERY protocol. A dtach reattach fires WINCH (`-r winch`) against
+    /// a blank physical screen while ratatui's buffer still says everything is
+    /// painted, so the diff alone emits nothing; the Kitty path skips the
+    /// image-eviction wipe (the typing-blink fix), so resize owns its own.
+    resize_repaint_needed: bool,
     /// VS Code-style editor minimap (rasterized document preview in a right/left
     /// strip). On by default; toggled and re-sided from the strip's right-click
     /// menu.
@@ -2958,6 +2964,7 @@ impl App {
             problems_badge_cell: None,
             inline_protocol: crate::iterm2_inline::detect_inline_image_protocol(),
             sixel_supported: false,
+            resize_repaint_needed: false,
             minimap_visible: true,
             minimap_side: MinimapSide::Right,
             minimap_base: None,
@@ -3161,6 +3168,15 @@ impl App {
             let _ = out.write_all(crate::iterm2_inline::delete_all_kitty_images().as_bytes());
             let _ = out.flush();
         }
+    }
+
+    /// One-shot consumer for [`Self::resize_repaint_needed`]: the main loop
+    /// answers `true` with an unconditional `terminal.clear()` on every
+    /// protocol, Kitty included. Resize is not image eviction: the wipe here
+    /// restores text a WINCH (window resize or dtach reattach) invalidated,
+    /// and it never fires while the user merely types.
+    pub fn consume_resize_repaint(&mut self) -> bool {
+        std::mem::take(&mut self.resize_repaint_needed)
     }
 
     pub fn init_graphics(&mut self) {
@@ -3748,6 +3764,11 @@ impl App {
         if self.overlays.activity.has_images() {
             self.overlays.activity.request_clear();
         }
+        // A WINCH invalidates the physical screen (window resize reflow, or a
+        // dtach reattach against a blank terminal) while ratatui's back buffer
+        // still claims every cell is painted; force the next frame to wipe and
+        // re-emit everything on every protocol.
+        self.resize_repaint_needed = true;
     }
 
     /// One-shot consumer for the "leaving Source Control after the no-repo
@@ -25559,13 +25580,18 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             // its cached image cells AND ratatui repaints every cell on
             // the next draw (its diff alone misses cells whose content
             // didn't change between welcome and editor buffers).
-            if consume_any_image_clear(app) {
+            // A resize/WINCH is not image eviction: it invalidated the text on
+            // screen (dtach reattach repaints into a blank terminal), so it
+            // wipes unconditionally, Kitty included. It never fires while the
+            // user merely types, so the blink fix below is untouched.
+            let resize_repaint = app.consume_resize_repaint();
+            if consume_any_image_clear(app) || resize_repaint {
                 // iTerm2/sixel image cells live in the normal cell buffer, so
                 // evicting them takes a full `2J` + repaint. Kitty images are
                 // deleted on their own layer below - wiping the text there
                 // blanks the whole app for an SSH round trip per latch (the
                 // every-keystroke blink), so Kitty skips the screen clear.
-                if app.image_eviction_needs_screen_wipe() {
+                if resize_repaint || app.image_eviction_needs_screen_wipe() {
                     terminal.clear()?;
                 }
                 app.evict_inline_images_on_clear();

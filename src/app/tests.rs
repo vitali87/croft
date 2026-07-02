@@ -15571,6 +15571,34 @@ fn image_eviction_wipes_the_screen_only_on_cell_buffer_protocols() {
 }
 
 #[test]
+fn resize_must_force_a_full_text_repaint_on_every_protocol() {
+    // dtach reattaches with `-r winch` precisely so the app repaints: after a
+    // reattach the physical screen is blank while ratatui's back buffer still
+    // says every cell is painted, so the diff alone emits nothing and only
+    // later-changing cells (status bar, cursor) ever appear - the "remote
+    // croft comes back all black" bug. The image-eviction wipe used to cover
+    // this by accident; Kitty skips that wipe (the typing-blink fix), so a
+    // WINCH must arm its own unconditional repaint.
+    use crate::iterm2_inline::InlineImageProtocol;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.inline_protocol = InlineImageProtocol::Kitty;
+    assert!(
+        !app.consume_resize_repaint(),
+        "no repaint owed before any resize"
+    );
+    app.on_resize();
+    assert!(
+        app.consume_resize_repaint(),
+        "a WINCH must force the full text repaint even where image eviction skips the wipe"
+    );
+    assert!(
+        !app.consume_resize_repaint(),
+        "the resize repaint latch is one-shot"
+    );
+}
+
+#[test]
 fn stale_document_symbol_reply_must_not_replace_the_fresher_outline() {
     // While typing on a slow language server, `documentSymbol` replies land
     // several edits behind the buffer. Applying one replaces the fresh
