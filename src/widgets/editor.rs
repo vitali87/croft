@@ -1950,6 +1950,18 @@ impl Editor {
         self.image = None;
         self.sheet = None;
         self.status = format!("Opened {}", path.display());
+        // The buffer now matches disk; bump the edit seq so the LSP doc sync
+        // sees the new content (an external reload lands here too, and without
+        // the bump the server keeps analysing the old text and never sends
+        // fresh semantic tokens — codeberg issue #39).
+        self.edit_seq = self.edit_seq.wrapping_add(1);
+        // Drop any semantic-token batch measured against the previous content:
+        // decoding it over the new lines paints the old file's colors at the
+        // wrong offsets. Tree-sitter colors cover the gap until the fresh
+        // batch triggered by the seq bump arrives.
+        self.semantic_data = Vec::new();
+        self.semantic_overlay = Vec::new();
+        self.semantic_is_full = false;
         self.recompute_highlights();
         Ok(())
     }
@@ -9409,6 +9421,31 @@ mod tests {
         assert!(matches!(outcome, Some(Ok(()))));
         assert_eq!(e.lines[0], "def hi():");
         assert!(!e.dirty);
+    }
+
+    #[test]
+    fn external_reload_bumps_edit_seq_and_drops_stale_semantic_overlay() {
+        let tmp = NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), "def hello():\n    pass\n").unwrap();
+        let mut e = Editor::new();
+        e.open(tmp.path()).unwrap();
+        let seq_before = e.edit_seq;
+        let legend = std::sync::Arc::new(vec![String::from("function")]);
+        e.apply_semantic_tokens(tmp.path().to_path_buf(), vec![0, 4, 5, 0, 0], legend, true);
+        assert!(e.semantic_overlay_for_test().iter().any(|l| !l.is_empty()));
+
+        std::fs::write(tmp.path(), "x = 1\n").unwrap();
+        assert!(matches!(
+            e.reload_or_flag_conflict(),
+            ExternalChange::Reloaded
+        ));
+        // The LSP doc resync is keyed on edit_seq; if the reload doesn't move
+        // it, the server never hears about the new content and never sends
+        // fresh semantic tokens.
+        assert_ne!(e.edit_seq, seq_before);
+        // The old token batch was measured against the old text; decoding it
+        // over the new lines paints wrong colors, so it must be dropped.
+        assert!(e.semantic_overlay_for_test().iter().all(|l| l.is_empty()));
     }
 
     #[test]

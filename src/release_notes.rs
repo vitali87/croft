@@ -60,6 +60,6 @@ pub struct ReleaseNote {
 
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
-    kind: NoteKind::Feature,
-    summary: "Terminal panes can be rearranged by drag and drop: grab a pane's name pill (side by side) or its row in the maximized rail and drag it across its neighbours - the panes reorder live under the pointer and the dragged pane stays focused.",
+    kind: NoteKind::Fix,
+    summary: "A file changed outside Croft now recolorizes correctly on auto-reload: the language server is resynced and stale semantic-token colors are dropped instead of painting the old file's colors over the new text.",
 }];
