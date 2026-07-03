@@ -19,6 +19,7 @@ src/
 ├── clipboard.rs         native macOS clipboard read/write (NSPasteboard) with pbpaste fallback
 ├── ghostty.rs           Ghostty config keybinds (setup-ghostty): re-emit every croft chord as its CSI-u sequence so Ghostty's own binds don't swallow them
 ├── git.rs               branch / dirty / ahead-behind status and the full set of working-tree operations the Source Control panel drives: stage(/all), unstage(/all), commit (staged / all / amend), push (/force/to-remote/publish), pull (/rebase), fetch, sync, clone, branch list / checkout / create (/from) / rename / delete / merge / rebase, remote list / add / remove, stash push (/untracked/staged) / list / apply / pop / drop, tag list / create / delete, discard (/all), and diffs
+├── merge.rs             merge-conflict machinery: VS Code-regex marker scanning (`<<<<<<<` / `|||||||` diff3 base / `=======` / `>>>>>>>`) into ConflictBlocks, and Accept Current / Incoming / Both resolution line-splicing; the editor caches blocks per edit_seq, tints the regions, and Cmd+. opens the resolve picker
 ├── gradient.rs          shared orange→green corner gradient: the welcome activity box border and the Black-theme focused-pane border
 ├── highlight.rs         tree-sitter highlight registry per language
 ├── icons.rs             Codicon and file-type Nerd Font glyphs and per-language colors

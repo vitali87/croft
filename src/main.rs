@@ -13,6 +13,7 @@ mod iterm2_inline;
 mod launcher;
 mod lsp;
 mod mcp;
+mod merge;
 mod outline_syntax;
 mod output;
 mod pdf;

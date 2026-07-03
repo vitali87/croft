@@ -15930,3 +15930,107 @@ fn replace_all_chord_replaces_every_match_in_one_undo_step() {
     assert_eq!(app.editor.lines[0], "alpha beta");
     assert_eq!(app.editor.lines[1], "gamma alpha");
 }
+
+// --- Merge conflict resolution ---------------------------------------------
+
+const CONFLICTED_BODY: &str =
+    "fn main() {\n<<<<<<< HEAD\n    ours();\n=======\n    theirs();\n>>>>>>> feature\n}";
+
+#[test]
+fn quick_fix_inside_a_conflict_opens_the_merge_picker() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.rs", CONFLICTED_BODY);
+    app.editor.cursor_row = 2; // inside the ours section
+    app.start_code_action();
+    let picker = app
+        .list_picker
+        .as_ref()
+        .expect("Quick Fix inside a conflict must open the merge picker without an LSP round-trip");
+    assert_eq!(
+        picker.purpose,
+        crate::widgets::list_picker::ListPurpose::MergeConflict
+    );
+    assert_eq!(
+        picker.rows.len(),
+        3,
+        "Accept Current / Accept Incoming / Accept Both"
+    );
+}
+
+#[test]
+fn merge_picker_accept_current_replaces_the_block_with_ours() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.rs", CONFLICTED_BODY);
+    app.editor.cursor_row = 4; // inside the theirs section, still the same block
+    app.start_code_action();
+    assert!(app.list_picker.is_some(), "the merge picker must open");
+    app.confirm_list_picker(); // first row = Accept Current
+    assert_eq!(
+        app.editor.lines,
+        vec!["fn main() {", "    ours();", "}"],
+        "the whole marker block collapses to the current section"
+    );
+    assert!(app.editor.dirty, "resolving a conflict dirties the buffer");
+    assert!(app.editor.undo(), "resolution is one undo step");
+    assert_eq!(app.editor.lines.len(), 7, "undo restores the marker block");
+}
+
+#[test]
+fn palette_merge_accept_incoming_resolves_at_cursor() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.rs", CONFLICTED_BODY);
+    app.editor.cursor_row = 1;
+    app.run_command(crate::widgets::command_palette::Command::MergeAcceptIncoming);
+    assert_eq!(app.editor.lines, vec!["fn main() {", "    theirs();", "}"]);
+    assert_eq!(app.status, "Accepted incoming change");
+}
+
+#[test]
+fn palette_merge_accept_both_keeps_ours_then_theirs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.rs", CONFLICTED_BODY);
+    app.editor.cursor_row = 3;
+    app.run_command(crate::widgets::command_palette::Command::MergeAcceptBoth);
+    assert_eq!(
+        app.editor.lines,
+        vec!["fn main() {", "    ours();", "    theirs();", "}"]
+    );
+}
+
+#[test]
+fn merge_commands_outside_a_conflict_report_and_leave_the_buffer_alone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.rs", CONFLICTED_BODY);
+    app.editor.cursor_row = 0; // outside the block
+    app.run_command(crate::widgets::command_palette::Command::MergeAcceptCurrent);
+    assert_eq!(app.status, "No merge conflict at the cursor");
+    assert_eq!(app.editor.lines.len(), 7, "the buffer is untouched");
+}
+
+#[test]
+fn conflict_regions_render_with_tinted_backgrounds() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.rs", CONFLICTED_BODY);
+    let backend = ratatui::backend::TestBackend::new(100, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|frame| app.render(frame)).unwrap();
+    let x = app.editor.last_inner.x + app.editor.last_gutter_width as u16 + 1;
+    let y0 = app.editor.last_inner.y; // row 0: "fn main() {"
+    let buf = term.backend().buffer();
+    let bg_at = |dy: u16| buf[(x, y0 + dy)].style().bg;
+    assert_ne!(
+        bg_at(2),
+        bg_at(0),
+        "the ours content row must be tinted differently from a plain row"
+    );
+    assert_ne!(
+        bg_at(4),
+        bg_at(0),
+        "the theirs content row must be tinted differently from a plain row"
+    );
+    assert_ne!(
+        bg_at(2),
+        bg_at(4),
+        "ours and theirs tint differently, like VS Code's current vs incoming"
+    );
+}

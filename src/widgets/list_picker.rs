@@ -28,6 +28,9 @@ pub enum ListPurpose {
     /// LSP Quick Fix: the rows are the code actions at the cursor; the App
     /// reads back the chosen row's `id` as an index into its pending actions.
     CodeAction,
+    /// Merge-conflict resolution: the rows are Accept Current / Incoming /
+    /// Both for the conflict block at the cursor; `id` names the resolution.
+    MergeConflict,
 }
 
 /// One selectable row: a stable `id` the App acts on (a stash index, a

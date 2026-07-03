@@ -1238,6 +1238,12 @@ pub struct Editor {
     /// The `edit_seq` `git_marks` was computed at; `u64::MAX` forces a first
     /// recompute once a baseline arrives.
     git_marks_seq: u64,
+    /// Merge-conflict blocks in the buffer, lazily recomputed whenever
+    /// `edit_seq` moves (same pattern as the git-gutter marks).
+    conflicts: Vec<crate::merge::ConflictBlock>,
+    /// The `edit_seq` `conflicts` was computed at; `u64::MAX` forces the
+    /// first scan.
+    conflicts_seq: u64,
     pub scroll: usize,
     /// In soft-wrap mode, the index of the first visible visual segment within
     /// the top logical line (`self.scroll`). Lets the viewport start partway
@@ -1452,6 +1458,8 @@ impl Editor {
             git_baseline_for: None,
             git_marks: std::collections::HashMap::new(),
             git_marks_seq: u64::MAX,
+            conflicts: Vec::new(),
+            conflicts_seq: u64::MAX,
             scroll: 0,
             scroll_sub: 0,
             wrap_total_cache: Vec::new(),
@@ -1640,6 +1648,40 @@ impl Editor {
         self.git_baseline_for = Some(path);
         self.git_head_lines = head;
         self.git_marks_seq = u64::MAX;
+    }
+
+    /// The buffer's merge-conflict blocks, rescanned only when the buffer
+    /// changed since the last call — cheap enough for the render loop and
+    /// every cursor-position query.
+    pub fn conflicts(&mut self) -> &[crate::merge::ConflictBlock] {
+        if self.conflicts_seq != self.edit_seq {
+            self.conflicts_seq = self.edit_seq;
+            self.conflicts = crate::merge::find_conflicts(&self.lines);
+        }
+        &self.conflicts
+    }
+
+    /// Resolve the conflict containing `row` (VS Code's Accept Current /
+    /// Incoming / Both): one undo step replacing the whole marker block.
+    /// Returns false when `row` is not inside a conflict.
+    pub fn resolve_conflict_at(&mut self, row: usize, res: crate::merge::Resolution) -> bool {
+        let Some(block) = crate::merge::conflict_containing(self.conflicts(), row) else {
+            return false;
+        };
+        let replacement = crate::merge::resolution_lines(&self.lines, &block, res);
+        self.pin_on_edit();
+        self.push_undo(EditKind::Replace);
+        self.clear_selection();
+        self.lines
+            .splice(block.ours_start..=block.theirs_end, replacement);
+        if self.lines.is_empty() {
+            self.lines.push(String::new());
+        }
+        self.cursor_row = block.ours_start.min(self.lines.len() - 1);
+        self.cursor_col = self.cursor_col.min(self.line_char_len(self.cursor_row));
+        self.mark_buffer_changed();
+        self.recompute_highlights();
+        true
     }
 
     /// Recompute the per-line git marks from the cached HEAD baseline if the
@@ -5479,6 +5521,9 @@ impl Widget for &mut Editor {
         // Rebuild the git-gutter marks if the buffer moved since last frame
         // (cheap no-op otherwise), so the bars below diff against HEAD.
         self.refresh_git_marks();
+        // Rescan merge-conflict blocks on the same cadence so the region
+        // tints below always match the buffer.
+        self.conflicts();
         // Fold headers are line indexes; an insert/delete anywhere shifts them.
         // If the line count changed since folds were set, drop them wholesale
         // rather than hide the wrong lines (see `fold_epoch_lines`).
@@ -5787,6 +5832,13 @@ impl Widget for &mut Editor {
                 .collect();
             let spans = build_line_spans(visible_raw, &shifted);
             buf.set_line(text_x, y, &Line::from(spans), row_width);
+
+            // Merge-conflict region tints (VS Code's current/incoming
+            // backgrounds), painted right after the text so diagnostics,
+            // search highlights, and the selection all win over them.
+            if let Some(tint) = conflict_row_tint(&self.conflicts, line_idx) {
+                paint_full_row_bg(buf, text_x, y, row_width, tint);
+            }
 
             // LSP diagnostics: underline each problem span in its severity
             // colour, clipped to the visible row window. VS Code draws a wavy
@@ -6233,6 +6285,39 @@ fn paint_bracket_match(
 /// Apply the selection background colour to columns `[start_char..end_char)`
 /// of row `y`, where columns are character indices within the editor's text
 /// area.  Clamps to the visible width.
+/// The background tint for a row inside a merge-conflict block, or `None`
+/// outside one. Header / footer marker rows tint stronger than their
+/// content, mirroring VS Code's current(green) / incoming(blue) scheme; the
+/// diff3 base section and the `=======` separator sit on a neutral grey.
+/// Fixed dark tints, like the selection band: both bundled themes are dark,
+/// and the hues are semantic (green = yours, blue = theirs), not accents.
+fn conflict_row_tint(blocks: &[crate::merge::ConflictBlock], row: usize) -> Option<Color> {
+    let block = blocks.iter().find(|b| b.contains(row))?;
+    let ours_end = block.base_start.unwrap_or(block.sep);
+    Some(if row == block.ours_start {
+        Color::Rgb(0x2a, 0x4f, 0x33)
+    } else if row < ours_end {
+        Color::Rgb(0x1b, 0x33, 0x22)
+    } else if row < block.sep {
+        Color::Rgb(0x2a, 0x2a, 0x2a)
+    } else if row == block.sep {
+        Color::Rgb(0x28, 0x28, 0x28)
+    } else if row == block.theirs_end {
+        Color::Rgb(0x1f, 0x41, 0x66)
+    } else {
+        Color::Rgb(0x16, 0x2b, 0x44)
+    })
+}
+
+/// Tint every cell of one text row, keeping the glyphs and their colours.
+fn paint_full_row_bg(buf: &mut Buffer, text_x: u16, y: u16, text_width: u16, bg: Color) {
+    for col in 0..text_width {
+        let x = text_x + col;
+        let cell = &mut buf[(x, y)];
+        cell.set_style(cell.style().bg(bg));
+    }
+}
+
 fn paint_selection_band(
     buf: &mut Buffer,
     text_x: u16,

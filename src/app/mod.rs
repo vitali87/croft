@@ -7059,9 +7059,58 @@ impl App {
     /// actions available at the cursor (with the diagnostics on that line as
     /// context) and present them in a picker. No-op on read-only preview tabs.
     /// The reply is handled in [`Self::drain_lsp_code_actions`].
+    /// The Quick Fix picker for a merge conflict at the cursor: VS Code's
+    /// three accept actions, applied locally with no LSP involvement.
+    fn open_merge_conflict_picker(&mut self) {
+        use crate::widgets::list_picker::{ListPicker, ListPurpose, ListRow};
+        let rows = vec![
+            ListRow {
+                id: String::from("current"),
+                label: String::from("Accept Current Change"),
+            },
+            ListRow {
+                id: String::from("incoming"),
+                label: String::from("Accept Incoming Change"),
+            },
+            ListRow {
+                id: String::from("both"),
+                label: String::from("Accept Both Changes"),
+            },
+        ];
+        self.open_list_picker(
+            ListPicker::new(ListPurpose::MergeConflict, "Resolve Merge Conflict", rows),
+            "No merge conflict at the cursor",
+        );
+    }
+
+    /// Resolve the merge conflict at the cursor, reporting VS Code's
+    /// wording in the status line. Backs both the palette's Merge Conflict
+    /// commands and the Quick Fix picker rows.
+    fn resolve_merge_at_cursor(&mut self, res: crate::merge::Resolution) {
+        let row = self.editor.cursor_row;
+        if !self.editor.resolve_conflict_at(row, res) {
+            self.status = String::from("No merge conflict at the cursor");
+            return;
+        }
+        self.status = String::from(match res {
+            crate::merge::Resolution::Current => "Accepted current change",
+            crate::merge::Resolution::Incoming => "Accepted incoming change",
+            crate::merge::Resolution::Both => "Accepted both changes",
+        });
+    }
+
     fn start_code_action(&mut self) {
         if self.editor.diff.is_some() || self.editor.sheet.is_some() || self.editor.image.is_some()
         {
+            return;
+        }
+        // A merge conflict at the cursor takes the Quick Fix over LSP code
+        // actions, like VS Code's Accept Current / Incoming / Both lenses:
+        // resolving markers is what the user wants there, and it needs no
+        // server round-trip.
+        let cursor_row = self.editor.cursor_row;
+        if crate::merge::conflict_containing(self.editor.conflicts(), cursor_row).is_some() {
+            self.open_merge_conflict_picker();
             return;
         }
         let Some(path) = self.editor.path.clone() else {
@@ -13356,6 +13405,14 @@ impl App {
                 let r = crate::git::push_to_remote(&self.tree.root, &row.id);
                 self.run_scm_op("push", r, "Pushed");
             }
+            ListPurpose::MergeConflict => {
+                let res = match row.id.as_str() {
+                    "current" => crate::merge::Resolution::Current,
+                    "both" => crate::merge::Resolution::Both,
+                    _ => crate::merge::Resolution::Incoming,
+                };
+                self.resolve_merge_at_cursor(res);
+            }
             ListPurpose::CodeAction => {
                 if let Some(item) = self.pending_code_actions.get(index).cloned() {
                     self.apply_code_action(item);
@@ -17603,6 +17660,13 @@ impl App {
             Cmd::ToggleFormatOnSave => self.toggle_format_on_save(),
             Cmd::QuickFix => self.start_code_action(),
             Cmd::ReplaceInFile => self.open_editor_replace(),
+            Cmd::MergeAcceptCurrent => {
+                self.resolve_merge_at_cursor(crate::merge::Resolution::Current)
+            }
+            Cmd::MergeAcceptIncoming => {
+                self.resolve_merge_at_cursor(crate::merge::Resolution::Incoming)
+            }
+            Cmd::MergeAcceptBoth => self.resolve_merge_at_cursor(crate::merge::Resolution::Both),
             Cmd::ToggleFold => {
                 let row = self.editor.cursor_row;
                 self.editor.toggle_fold(row);

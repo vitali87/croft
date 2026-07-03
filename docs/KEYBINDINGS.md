@@ -197,7 +197,8 @@ Every choice except the side-bar / panel visibility persists across launches in 
 | `Shift`+`Option`+drag | Column (box) selection: one caret per spanned row |
 | `Cmd`+`F2` / `Ctrl`+`F2` | Change All Occurrences of the word under the cursor at once |
 | `Esc` | Clear the selection, or collapse multi-cursors back to one |
-| `Cmd`+`.` / `Ctrl`+`.` | Quick Fix: ask the language server for the code actions at the cursor (auto-import, fix-all, organize imports, refactors) and pick one from a menu; the diagnostics on the line ride along as context. One action with a deferred edit resolves and applies on pick (`codeAction/resolve`); also on the editor right-click menu and as Command Palette "Quick Fix" |
+| `Cmd`+`.` / `Ctrl`+`.` | Quick Fix: ask the language server for the code actions at the cursor (auto-import, fix-all, organize imports, refactors) and pick one from a menu; the diagnostics on the line ride along as context. One action with a deferred edit resolves and applies on pick (`codeAction/resolve`); also on the editor right-click menu and as Command Palette "Quick Fix"|
+| `Cmd`+`.` / `Ctrl`+`.` inside a merge conflict | Resolve Merge Conflict picker: Accept Current / Accept Incoming / Accept Both (also Command Palette "Merge Conflict: Accept Current / Incoming / Both"); conflict regions render with VS Code's green (current) / blue (incoming) tints |
 | `F2` | Rename Symbol across every file it touches (open tabs edit in-memory and stay dirty) |
 | `F12` / `Cmd`/`Option`+click | Go to Definition (`Cmd`+`Shift`+click navigates back) |
 | `Shift`+`F12` | Go to References (project-wide; one use jumps, several open a picker) |
@@ -356,7 +357,7 @@ The PORTS tab in the bottom panel group lists the loopback ports croft has notic
 | `⌥⌘F` | Replace in File (find bar with the replace row) |
 | `⌥⌘↩` | Replace All while the replace row is open |
 | `⌘/` | Toggle line comment |
-| `⌘.` | Quick Fix (code actions at the cursor) |
+| `⌘.` | Quick Fix (code actions at the cursor; inside a merge conflict, the Accept Current / Incoming / Both picker) |
 | `⌥⌘↑` / `⌥⌘↓` | Add a cursor above / below (multi-cursor) |
 | `⌘⇧E` / `⌘⇧F` / `⌘⇧S` / `⌘⇧D` / `⌘⇧R` / `⌘⇧X` | Jump to Explorer / Search / Source Control / Run and Debug / Remote / Extensions |
 | `⌘⇧L` | Disconnect a remote session |
