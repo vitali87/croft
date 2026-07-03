@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Feature,
-    summary: "Merge-conflict resolution: conflict blocks tint green (current) and blue (incoming) like VS Code, and Cmd/Ctrl+. or the Command Palette offers Accept Current / Incoming / Both, each one undo step.",
+    summary: "Auto Save: the Command Palette's File: Toggle Auto Save makes every dirty buffer (background tabs included) write itself a second after the last edit, VS Code's afterDelay; external disk changes are never overwritten.",
 }];

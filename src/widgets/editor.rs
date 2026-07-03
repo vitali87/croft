@@ -1442,6 +1442,9 @@ pub struct Editor {
     /// the flag drives the conflict warning and makes `save_to_disk` refuse
     /// to overwrite until the user forces it.
     pub disk_conflict: bool,
+    /// When the buffer last changed, driving the auto-save delay. `None`
+    /// until the first edit.
+    pub last_edit_at: Option<std::time::Instant>,
 }
 
 impl Editor {
@@ -1516,6 +1519,7 @@ impl Editor {
             diff_next_arrow: Rect::default(),
             disk_stamp: None,
             disk_conflict: false,
+            last_edit_at: None,
         }
     }
 
@@ -1635,6 +1639,7 @@ impl Editor {
 
     fn mark_buffer_changed(&mut self) {
         self.dirty = true;
+        self.last_edit_at = Some(std::time::Instant::now());
         self.edit_seq = self.edit_seq.wrapping_add(1);
         self.hscroll_content_cols = None;
         self.wrap_total_cache.clear();

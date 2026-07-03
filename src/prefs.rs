@@ -129,6 +129,11 @@ pub struct Prefs {
     /// an older config parses straight to disabled.
     #[serde(default)]
     pub format_on_save: bool,
+    /// When true, a dirty buffer writes itself to disk about a second after
+    /// the last edit (VS Code's `files.autoSave: afterDelay`). Off by
+    /// default, matching VS Code.
+    #[serde(default)]
+    pub auto_save: bool,
 }
 
 impl Prefs {
@@ -243,6 +248,15 @@ pub fn save_format_on_save(enabled: bool) -> Result<()> {
     let path = config_path();
     let mut prefs = Prefs::load(&path).unwrap_or_default();
     prefs.format_on_save = enabled;
+    prefs.save(&path)
+}
+
+/// Persist the auto-save choice, preserving other settings. Best-effort:
+/// a write failure is swallowed by the caller.
+pub fn save_auto_save(enabled: bool) -> Result<()> {
+    let path = config_path();
+    let mut prefs = Prefs::load(&path).unwrap_or_default();
+    prefs.auto_save = enabled;
     prefs.save(&path)
 }
 
@@ -395,6 +409,23 @@ mod tests {
         // format-on-save to off (matching VS Code's `editor.formatOnSave`).
         std::fs::write(&path, r#"{"theme":"dark"}"#).expect("write old config");
         assert!(!Prefs::load(&path).expect("load old").format_on_save);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn round_trips_auto_save_and_old_configs_default_off() {
+        let dir = std::env::temp_dir().join(format!("croft-prefs-as-test-{}", std::process::id()));
+        let path = dir.join("config.json");
+        let prefs = Prefs {
+            auto_save: true,
+            ..Prefs::default()
+        };
+        prefs.save(&path).expect("save");
+        assert!(Prefs::load(&path).expect("load").auto_save);
+        // A config written before this field existed still parses, defaulting
+        // auto-save to off (matching VS Code's `files.autoSave`).
+        std::fs::write(&path, r#"{"theme":"dark"}"#).expect("write old config");
+        assert!(!Prefs::load(&path).expect("load old").auto_save);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

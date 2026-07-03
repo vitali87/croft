@@ -16034,3 +16034,98 @@ fn conflict_regions_render_with_tinted_backgrounds() {
         "ours and theirs tint differently, like VS Code's current vs incoming"
     );
 }
+
+// --- Auto Save (files.autoSave: afterDelay) --------------------------------
+
+/// Rewind a buffer's last-edit stamp so the auto-save delay has elapsed.
+fn age_last_edit(e: &mut crate::widgets::editor::Editor) {
+    e.last_edit_at = std::time::Instant::now().checked_sub(std::time::Duration::from_secs(5));
+}
+
+#[test]
+fn auto_save_writes_a_dirty_buffer_after_the_delay() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.txt", "hello");
+    app.auto_save = true;
+    app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.editor.dirty, "typing dirties the buffer");
+    assert!(
+        !app.tick_auto_save(),
+        "a buffer edited a moment ago must not save yet"
+    );
+    assert!(app.editor.dirty, "still dirty before the delay elapses");
+    age_last_edit(&mut app.editor);
+    assert!(app.tick_auto_save(), "the aged buffer must save");
+    assert!(!app.editor.dirty, "saving clears the dirty flag");
+    let on_disk = std::fs::read_to_string(tmp.path().join("a.txt")).unwrap();
+    assert!(
+        on_disk.contains('x'),
+        "the edit must be on disk, got: {on_disk:?}"
+    );
+}
+
+#[test]
+fn auto_save_stays_off_by_default() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.txt", "hello");
+    assert!(!app.auto_save, "auto save defaults off, like VS Code");
+    app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE))
+        .unwrap();
+    age_last_edit(&mut app.editor);
+    assert!(!app.tick_auto_save());
+    assert!(app.editor.dirty, "nothing saves while the pref is off");
+}
+
+#[test]
+fn auto_save_never_overwrites_an_external_disk_change() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.txt", "hello");
+    app.auto_save = true;
+    app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE))
+        .unwrap();
+    // The file changes under croft before the delay elapses.
+    std::fs::write(tmp.path().join("a.txt"), "external edit").unwrap();
+    age_last_edit(&mut app.editor);
+    app.tick_auto_save();
+    let on_disk = std::fs::read_to_string(tmp.path().join("a.txt")).unwrap();
+    assert_eq!(
+        on_disk, "external edit",
+        "auto save must refuse the write and keep the external content"
+    );
+}
+
+#[test]
+fn auto_save_sweeps_dirty_background_tabs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.txt", "first");
+    app.auto_save = true;
+    app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE))
+        .unwrap();
+    // Open a second file; the dirty first tab moves to the background.
+    let b = tmp.path().join("b.txt");
+    std::fs::write(&b, "second").unwrap();
+    app.editor.open_pinned(&b).unwrap();
+    for e in app.editor.editors.iter_mut() {
+        age_last_edit(e);
+    }
+    assert!(app.tick_auto_save(), "the background tab must save");
+    let on_disk = std::fs::read_to_string(tmp.path().join("a.txt")).unwrap();
+    assert!(
+        on_disk.contains('x'),
+        "the background tab's edit must be on disk, got: {on_disk:?}"
+    );
+}
+
+#[test]
+fn toggle_auto_save_command_flips_the_pref_and_reports_it() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.txt", "hello");
+    app.run_command(Command::ToggleAutoSave);
+    assert!(app.auto_save);
+    assert_eq!(app.status, "Auto Save: on");
+    app.run_command(Command::ToggleAutoSave);
+    assert!(!app.auto_save);
+    assert_eq!(app.status, "Auto Save: off");
+}

@@ -1748,6 +1748,9 @@ pub struct App {
     /// server to format the buffer, then writes once the reply lands. Loaded
     /// from prefs at startup, toggled from the palette / `Cmd+K F`.
     format_on_save: bool,
+    /// VS Code's `files.autoSave: afterDelay`: dirty buffers write
+    /// themselves to disk once the delay elapses after the last edit.
+    auto_save: bool,
     /// Latch set while a save is waiting on a format reply. `drain_lsp_format`
     /// consumes it to write the (now formatted) buffer to disk.
     save_after_format: bool,
@@ -2882,6 +2885,7 @@ impl App {
             extensions,
             disabled_extensions,
             format_on_save: loaded_prefs.format_on_save,
+            auto_save: loaded_prefs.auto_save,
             save_after_format: false,
             outline,
             open_editors,
@@ -17658,6 +17662,7 @@ impl App {
             }
             Cmd::FormatDocument => self.start_format_document(),
             Cmd::ToggleFormatOnSave => self.toggle_format_on_save(),
+            Cmd::ToggleAutoSave => self.toggle_auto_save(),
             Cmd::QuickFix => self.start_code_action(),
             Cmd::ReplaceInFile => self.open_editor_replace(),
             Cmd::MergeAcceptCurrent => {
@@ -20741,6 +20746,63 @@ impl App {
     /// Flip `editor.formatOnSave`, persist it, and report the new state.
     /// Persistence is skipped under test so the suite never writes the
     /// developer's `~/.config/croft/config.json` (mirrors the layout prefs).
+    /// The auto-save delay after the last edit, VS Code's
+    /// `files.autoSaveDelay` default.
+    const AUTO_SAVE_DELAY: std::time::Duration = std::time::Duration::from_millis(1000);
+
+    /// Write every dirty, conflict-free buffer whose last edit is older
+    /// than the delay — the whole `files.autoSave: afterDelay` feature.
+    /// Runs every frame; returns true when anything was saved so the
+    /// caller redraws (dirty markers, badges, status).
+    pub fn tick_auto_save(&mut self) -> bool {
+        if !self.auto_save {
+            return false;
+        }
+        let mut saved_paths: Vec<PathBuf> = Vec::new();
+        let due = |e: &crate::widgets::editor::Editor| {
+            e.dirty
+                && e.path.is_some()
+                && !e.disk_conflict
+                && e.last_edit_at
+                    .is_some_and(|t| t.elapsed() >= Self::AUTO_SAVE_DELAY)
+        };
+        let mut sweep = |editors: &mut [crate::widgets::editor::Editor]| {
+            for e in editors.iter_mut().filter(|e| due(e)) {
+                // `save_to_disk` re-checks the disk and flags (never
+                // overwrites) an external change; auto save must not
+                // arm the force-overwrite path an explicit Cmd+S offers.
+                if let Ok(crate::widgets::editor::SaveOutcome::Saved) = e.save_to_disk() {
+                    saved_paths.extend(e.path.clone());
+                }
+            }
+        };
+        sweep(&mut self.editor.editors);
+        for group in self.editor_layout.inactive_groups_mut() {
+            sweep(&mut group.editors);
+        }
+        if saved_paths.is_empty() {
+            return false;
+        }
+        if let Some(lsp) = self.lsp.as_ref() {
+            for path in &saved_paths {
+                lsp.save_doc(path.clone());
+            }
+        }
+        true
+    }
+
+    fn toggle_auto_save(&mut self) {
+        self.auto_save = !self.auto_save;
+        self.status = if self.auto_save {
+            String::from("Auto Save: on")
+        } else {
+            String::from("Auto Save: off")
+        };
+        if !cfg!(test) {
+            let _ = crate::prefs::save_auto_save(self.auto_save);
+        }
+    }
+
     fn toggle_format_on_save(&mut self) {
         self.format_on_save = !self.format_on_save;
         self.status = if self.format_on_save {
@@ -25806,6 +25868,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let pulls_changed = app.drain_remote_pulls();
         let ports_changed = app.drain_ports_and_poll();
         let labels_changed = app.refresh_terminal_labels();
+        let auto_save_changed = app.tick_auto_save();
         let connect_changed = app.poll_connect_dialog();
         let install_changed = app.poll_install_session();
         let update_changed = app.poll_update_watch();
@@ -25872,6 +25935,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             || pulls_changed
             || ports_changed
             || labels_changed
+            || auto_save_changed
             || connect_changed
             || install_changed
             || update_changed
