@@ -32,6 +32,24 @@ const CMD_OPT_C_HEX: &str = "0x1b 0x5b 0x39 0x39 0x3b 0x31 0x31 0x75";
 /// NSUserKeyEquivalents relocation is needed; the forwarder claims it.
 const CMD_OPT_M_KEY: &str = "0x6d-0x180000-0x2e";
 const CMD_OPT_M_HEX: &str = "0x1b 0x5b 0x31 0x30 0x39 0x3b 0x31 0x31 0x75";
+/// `Cmd+Opt+F` -> "Replace in File" (the editor find bar expanded with the
+/// replace row). Modifier mask 0x180000 (Cmd 0x100000 | Opt 0x80000),
+/// `kVK_ANSI_F` = 0x03. CSI-u `ESC [ 102 ; 11 u` (102 = 'f'; modbyte 11 =
+/// 1 + Alt(2) + Super(8)) so crossterm decodes it as ALT|SUPER. iTerm2
+/// binds this chord to "Password Manager" by default (MainMenu.xib,
+/// verified 2026-07-04), so the NSUserKeyEquivalents relocation below
+/// moves that item to Cmd+Opt+Ctrl+F for the forwarder to claim the bare
+/// chord.
+const CMD_OPT_F_KEY: &str = "0x66-0x180000-0x3";
+const CMD_OPT_F_HEX: &str = "0x1b 0x5b 0x31 0x30 0x32 0x3b 0x31 0x31 0x75";
+/// `Cmd+Opt+Return` -> Replace All in the editor find bar. Return reports
+/// character 0xd, mask 0x180000, `kVK_Return` = 0x24. CSI-u
+/// `ESC [ 13 ; 11 u` (modbyte 11 = 1 + Alt(2) + Super(8)) decodes to
+/// `Enter + ALT | SUPER`. No default iTerm2 menu item claims this chord
+/// (MainMenu.xib has no Option+Command Return equivalent, verified
+/// 2026-07-04), so no relocation is needed; the forwarder claims it.
+const CMD_OPT_ENTER_KEY: &str = "0xd-0x180000-0x24";
+const CMD_OPT_ENTER_HEX: &str = "0x1b 0x5b 0x31 0x33 0x3b 0x31 0x31 0x75";
 const CMD_SLASH_KEY: &str = "0x2f-0x100000-0x2c";
 const CMD_SLASH_HEX: &str = "0x1b 0x5b 0x34 0x37 0x3b 0x39 0x75";
 /// `Cmd+.` (period) for Quick Fix (VS Code's `editor.action.quickFix`).
@@ -498,6 +516,8 @@ pub(crate) mod payloads {
     pub(crate) const CMD_OPT_R_HEX: &str = super::CMD_OPT_R_HEX;
     pub(crate) const CMD_OPT_C_HEX: &str = super::CMD_OPT_C_HEX;
     pub(crate) const CMD_OPT_M_HEX: &str = super::CMD_OPT_M_HEX;
+    pub(crate) const CMD_OPT_F_HEX: &str = super::CMD_OPT_F_HEX;
+    pub(crate) const CMD_OPT_ENTER_HEX: &str = super::CMD_OPT_ENTER_HEX;
     pub(crate) const CMD_OPT_RIGHT_HEX: &str = super::CMD_OPT_RIGHT_HEX;
     pub(crate) const CMD_OPT_UP_HEX: &str = super::CMD_OPT_UP_HEX;
     pub(crate) const CMD_OPT_DOWN_HEX: &str = super::CMD_OPT_DOWN_HEX;
@@ -680,6 +700,10 @@ pub fn apply_croft_key_settings(plist: &mut Value) -> Result<(), ITerm2Error> {
     // croft's terminal-focus chord can claim it. Cmd+Opt+Shift+T keeps
     // the iTerm2 action reachable on a chord croft does not use.
     set_string(menu, "Restore Closed Session", "@~T".to_string());
+    // Relocate iTerm2's "Password Manager" off Cmd+Opt+F so croft's
+    // Replace in File chord can claim it. Cmd+Opt+Ctrl+F keeps the
+    // password manager reachable on a chord croft does not use.
+    set_string(menu, "Password Manager", "@~^f".to_string());
     // Relocate iTerm2's "New Tab" off Cmd+T so croft's new-terminal chord
     // can claim it. Cmd+Ctrl+T keeps the iTerm2 action reachable and stays
     // clear of the Cmd+Opt+T "New Tab Next to Current Tab" alternate.
@@ -763,6 +787,8 @@ pub fn apply_croft_key_settings(plist: &mut Value) -> Result<(), ITerm2Error> {
         (CMD_OPT_R_KEY, CMD_OPT_R_HEX),
         (CMD_OPT_C_KEY, CMD_OPT_C_HEX),
         (CMD_OPT_M_KEY, CMD_OPT_M_HEX),
+        (CMD_OPT_F_KEY, CMD_OPT_F_HEX),
+        (CMD_OPT_ENTER_KEY, CMD_OPT_ENTER_HEX),
         (CTRL_SHIFT_J_KEY, CTRL_SHIFT_J_HEX),
         (CMD_F12_KEY, CMD_F12_HEX),
         (CTRL_SHIFT_F12_KEY, CTRL_SHIFT_F12_HEX),
@@ -1532,6 +1558,38 @@ mod tests {
             action_text(global, CMD_OPT_C_KEY),
             CMD_OPT_C_HEX,
             "GlobalKeyMap must forward Cmd+Opt+C as a CSI-u sequence so croft's `is_copy_path_key` fires and copies the active file's path. Encoding: 'c' (codepoint 0x63 = 99) with kitty modifier byte 11 = 1 base + Alt(2) + Super(8), giving `ESC [ 99 ; 11 u` (decoded as ALT|SUPER, disjoint from plain Cmd+C = Copy)"
+        );
+    }
+
+    #[test]
+    fn apply_croft_key_settings_forwards_cmd_opt_f_for_replace_in_file() {
+        let mut plist = synth_plist("GUID-1", &["GUID-1"]);
+        apply_croft_key_settings(&mut plist).unwrap();
+        let top = plist.as_dictionary().unwrap();
+        let global = dict_in(top, "GlobalKeyMap");
+        assert_eq!(
+            action_text(global, CMD_OPT_F_KEY),
+            CMD_OPT_F_HEX,
+            "GlobalKeyMap must forward Cmd+Opt+F as a CSI-u sequence so croft's `is_editor_replace_key` fires and opens the find bar with the replace row. Encoding: 'f' (codepoint 0x66 = 102) with kitty modifier byte 11 = 1 base + Alt(2) + Super(8), giving `ESC [ 102 ; 11 u` (decoded as ALT|SUPER, disjoint from plain Cmd+F = Find)"
+        );
+        let menu = dict_in(top, "NSUserKeyEquivalents");
+        assert_eq!(
+            menu.get("Password Manager").and_then(|v| v.as_string()),
+            Some("@~^f"),
+            "iTerm2 binds Cmd+Opt+F to Password Manager by default (MainMenu.xib); it must be relocated to Cmd+Opt+Ctrl+F so the bare chord reaches croft"
+        );
+    }
+
+    #[test]
+    fn apply_croft_key_settings_forwards_cmd_opt_enter_for_replace_all() {
+        let mut plist = synth_plist("GUID-1", &["GUID-1"]);
+        apply_croft_key_settings(&mut plist).unwrap();
+        let top = plist.as_dictionary().unwrap();
+        let global = dict_in(top, "GlobalKeyMap");
+        assert_eq!(
+            action_text(global, CMD_OPT_ENTER_KEY),
+            CMD_OPT_ENTER_HEX,
+            "GlobalKeyMap must forward Cmd+Opt+Return as a CSI-u sequence so the find bar's Replace All fires. Encoding: Enter (codepoint 13) with kitty modifier byte 11 = 1 base + Alt(2) + Super(8), giving `ESC [ 13 ; 11 u`"
         );
     }
 

@@ -7,6 +7,14 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph, Widget},
 };
 
+/// Which input row of the find bar owns the keyboard (Tab toggles).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum FindField {
+    #[default]
+    Query,
+    Replace,
+}
+
 #[derive(Default)]
 pub struct EditorFind {
     pub query: String,
@@ -14,6 +22,10 @@ pub struct EditorFind {
     pub last_rect: Rect,
     pub match_count: usize,
     pub match_index: Option<usize>,
+    /// Second input row (VS Code's expanded find widget, `Cmd+Opt+F`).
+    pub replace_visible: bool,
+    pub replace: String,
+    pub focus: FindField,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -129,6 +141,99 @@ pub fn find_prev_match(
     None
 }
 
+/// Compile the find query + `SearchOpts` into a `regex::Regex` mirroring
+/// `split_for_highlight`'s matching exactly (no trimming — a query with
+/// leading / trailing spaces matches literally, like the highlighter), so
+/// replace touches precisely what the find bar shows.
+fn build_find_regex(needle: &str, opts: SearchOpts) -> Option<regex::Regex> {
+    if needle.is_empty() {
+        return None;
+    }
+    let body = if opts.use_regex {
+        needle.to_string()
+    } else {
+        regex::escape(needle)
+    };
+    let mut pattern = String::new();
+    if !opts.case_sensitive {
+        pattern.push_str("(?i)");
+    }
+    if opts.whole_word {
+        pattern.push_str("\\b(?:");
+        pattern.push_str(&body);
+        pattern.push_str(")\\b");
+    } else {
+        pattern.push_str(&body);
+    }
+    regex::Regex::new(&pattern).ok()
+}
+
+/// Expand what the match at `(col_chars, len_chars)` in `line` should be
+/// replaced with. Literal mode returns `replacement` verbatim; regex mode
+/// expands `$1` / `${name}` capture references against that exact match,
+/// like VS Code. Returns `None` when no match starts at `col_chars` with
+/// that length (a stale position), so callers never splice blindly.
+pub fn expand_replacement(
+    line: &str,
+    col_chars: usize,
+    len_chars: usize,
+    needle: &str,
+    replacement: &str,
+    opts: SearchOpts,
+) -> Option<String> {
+    let re = build_find_regex(needle, opts)?;
+    for caps in re.captures_iter(line) {
+        let m = caps.get(0)?;
+        let start_chars = line[..m.start()].chars().count();
+        if start_chars != col_chars {
+            continue;
+        }
+        if line[m.start()..m.end()].chars().count() != len_chars {
+            return None;
+        }
+        if !opts.use_regex {
+            return Some(replacement.to_string());
+        }
+        let mut dst = String::new();
+        caps.expand(replacement, &mut dst);
+        return Some(dst);
+    }
+    None
+}
+
+/// Replace every match of `needle` across `lines` (per line, exactly what
+/// the highlighter shows), returning the new lines and the number of
+/// matches replaced. Returns `None` when the needle is empty or the
+/// pattern can't compile, so callers leave the buffer untouched.
+pub fn replace_all_in_lines(
+    lines: &[String],
+    needle: &str,
+    replacement: &str,
+    opts: SearchOpts,
+) -> Option<(Vec<String>, usize)> {
+    let re = build_find_regex(needle, opts)?;
+    let mut total = 0usize;
+    let mut out: Vec<String> = Vec::with_capacity(lines.len());
+    for line in lines {
+        let count = re.find_iter(line).count();
+        if count == 0 {
+            out.push(line.clone());
+            continue;
+        }
+        total += count;
+        let replaced = if opts.use_regex {
+            re.replace_all(line, replacement).into_owned()
+        } else {
+            // Literal replacement: escape `$` so the substituted text is
+            // inserted verbatim rather than parsed as a capture reference.
+            let escaped = replacement.replace('$', "$$");
+            re.replace_all(line, escaped.as_str()).into_owned()
+        };
+        out.push(replaced);
+    }
+    Some((out, total))
+}
+
 /// 1-based "N of M" for the current cursor + first match at-or-after.
 pub fn match_index_at(
     lines: &[String],
@@ -166,7 +271,11 @@ pub fn render_editor_find(
         return;
     }
     let width = 48u16.min(editor_area.width.saturating_sub(2));
-    let height = 3u16;
+    let height = if state.replace_visible && editor_area.height >= 4 {
+        4u16
+    } else {
+        3u16
+    };
     let x = editor_area
         .x
         .saturating_add(editor_area.width.saturating_sub(width).saturating_sub(1));
@@ -212,22 +321,39 @@ pub fn render_editor_find(
     if inner.width == 0 || inner.height == 0 {
         return;
     }
-    let prompt = Line::from(vec![
-        Span::styled("> ", Style::default().fg(Color::Rgb(0x88, 0xc0, 0xd0))),
-        Span::styled(
-            state.query.clone(),
-            Style::default()
-                .fg(Color::Rgb(0xec, 0xef, 0xf4))
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            "_",
-            Style::default()
-                .fg(Color::Rgb(0xec, 0xef, 0xf4))
-                .add_modifier(Modifier::SLOW_BLINK),
-        ),
-    ]);
-    Widget::render(Paragraph::new(prompt), inner, buf);
+    let input_row = |marker: &str, text: &str, focused: bool| {
+        let mut spans = vec![
+            Span::styled(
+                marker.to_string(),
+                Style::default().fg(Color::Rgb(0x88, 0xc0, 0xd0)),
+            ),
+            Span::styled(
+                text.to_string(),
+                Style::default()
+                    .fg(Color::Rgb(0xec, 0xef, 0xf4))
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ];
+        if focused {
+            spans.push(Span::styled(
+                "_",
+                Style::default()
+                    .fg(Color::Rgb(0xec, 0xef, 0xf4))
+                    .add_modifier(Modifier::SLOW_BLINK),
+            ));
+        }
+        Line::from(spans)
+    };
+    if state.replace_visible && inner.height >= 2 {
+        let rows = vec![
+            input_row("> ", &state.query, state.focus == FindField::Query),
+            input_row("⤷ ", &state.replace, state.focus == FindField::Replace),
+        ];
+        Widget::render(Paragraph::new(rows), inner, buf);
+    } else {
+        let prompt = input_row("> ", &state.query, true);
+        Widget::render(Paragraph::new(prompt), inner, buf);
+    }
 }
 
 #[cfg(test)]
@@ -290,6 +416,89 @@ mod tests {
         let buf = lines(&["alpha", "beta"]);
         assert!(find_next_match(&buf, "zzz", SearchOpts::default(), 0, 0, true).is_none());
         assert!(find_prev_match(&buf, "zzz", SearchOpts::default(), 0, 0, true).is_none());
+    }
+
+    #[test]
+    fn expand_replacement_literal_returns_replacement_verbatim() {
+        let got = expand_replacement(
+            "let alpha = 1;",
+            4,
+            5,
+            "alpha",
+            "beta",
+            SearchOpts::default(),
+        );
+        assert_eq!(got.as_deref(), Some("beta"));
+    }
+
+    #[test]
+    fn expand_replacement_literal_keeps_dollar_verbatim() {
+        // A `$` in a literal replacement is inserted as-is, never parsed as
+        // a capture reference.
+        let got = expand_replacement("price", 0, 5, "price", "$total", SearchOpts::default());
+        assert_eq!(got.as_deref(), Some("$total"));
+    }
+
+    #[test]
+    fn expand_replacement_regex_expands_capture_groups() {
+        let opts = SearchOpts {
+            use_regex: true,
+            ..SearchOpts::default()
+        };
+        let got = expand_replacement("foo(1, 2)", 0, 9, r"foo\((\d), (\d)\)", "foo($2, $1)", opts);
+        assert_eq!(got.as_deref(), Some("foo(2, 1)"));
+    }
+
+    #[test]
+    fn expand_replacement_returns_none_for_a_stale_position() {
+        // No match starts at col 1 — a stale MatchPos must never splice.
+        let got = expand_replacement("alpha", 1, 5, "alpha", "beta", SearchOpts::default());
+        assert_eq!(got, None);
+    }
+
+    #[test]
+    fn expand_replacement_matches_case_insensitively_by_default() {
+        let got = expand_replacement("Alpha beta", 0, 5, "alpha", "gamma", SearchOpts::default());
+        assert_eq!(got.as_deref(), Some("gamma"));
+    }
+
+    #[test]
+    fn replace_all_in_lines_replaces_every_match_and_counts() {
+        let buf = lines(&["alpha alpha", "beta", "alpha"]);
+        let (new_lines, n) =
+            replace_all_in_lines(&buf, "alpha", "x", SearchOpts::default()).unwrap();
+        assert_eq!(n, 3);
+        assert_eq!(new_lines, lines(&["x x", "beta", "x"]));
+    }
+
+    #[test]
+    fn replace_all_in_lines_honours_whole_word() {
+        let buf = lines(&["cat catalog cat"]);
+        let opts = SearchOpts {
+            whole_word: true,
+            ..SearchOpts::default()
+        };
+        let (new_lines, n) = replace_all_in_lines(&buf, "cat", "dog", opts).unwrap();
+        assert_eq!(n, 2, "'catalog' must survive a whole-word replace");
+        assert_eq!(new_lines, lines(&["dog catalog dog"]));
+    }
+
+    #[test]
+    fn replace_all_in_lines_regex_expands_captures_per_match() {
+        let buf = lines(&["a=1 b=2"]);
+        let opts = SearchOpts {
+            use_regex: true,
+            ..SearchOpts::default()
+        };
+        let (new_lines, n) = replace_all_in_lines(&buf, r"(\w)=(\d)", "$2:$1", opts).unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(new_lines, lines(&["1:a 2:b"]));
+    }
+
+    #[test]
+    fn replace_all_in_lines_returns_none_for_empty_needle() {
+        let buf = lines(&["alpha"]);
+        assert!(replace_all_in_lines(&buf, "", "x", SearchOpts::default()).is_none());
     }
 
     #[test]

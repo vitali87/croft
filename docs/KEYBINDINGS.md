@@ -183,6 +183,7 @@ Every choice except the side-bar / panel visibility persists across launches in 
 | `Ctrl`+`Z` / `Cmd`+`Z` | Undo (typing bursts coalesce; backspace, paste, cut, replace are each one step) |
 | `Cmd`+`A` | Select the entire buffer |
 | `Ctrl`+`f` / `Cmd`+`f` | Inline Find bar: pre-filled from the selection or word under the cursor; active match in orange, the rest in yellow; `Enter`/`F3` forward, `Shift+Enter`/`Shift+F3` back, `Esc` closes |
+| `Ctrl`+`Alt`+`f` / `Cmd`+`Opt`+`f` | Replace in File: the Find bar expanded with a replace row; `Tab` switches field, `Enter` in the replace row replaces the current match and advances, `Cmd`+`Opt`+`Enter` (`Ctrl`+`Alt`+`Enter` on Linux) replaces all as one undo step; `$1` capture references work in regex mode |
 | `Ctrl`+`A` / `Ctrl`+`E` | Move to start / end of line |
 | `Ctrl`+`K` / `Ctrl`+`U` | Kill to end / start of line (yanks to clipboard) |
 | `Cmd`+`o` / `Cmd`+`Shift`+`Enter` | Open a new line below / above, inheriting indent |
@@ -352,6 +353,8 @@ The PORTS tab in the bottom panel group lists the loopback ports croft has notic
 | `⌘P` | Quick Open |
 | `⌘⇧P` | Command Palette |
 | `⌘F` | In-editor Find |
+| `⌥⌘F` | Replace in File (find bar with the replace row) |
+| `⌥⌘↩` | Replace All while the replace row is open |
 | `⌘/` | Toggle line comment |
 | `⌘.` | Quick Fix (code actions at the cursor) |
 | `⌥⌘↑` / `⌥⌘↓` | Add a cursor above / below (multi-cursor) |

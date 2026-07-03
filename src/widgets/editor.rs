@@ -1081,6 +1081,9 @@ enum EditKind {
     IndentConvert,
     /// Remove trailing blank lines at end of file. Its own step.
     TrimFinalNewlines,
+    /// Find-bar Replace / Replace All. Never coalesces, so each replace is
+    /// its own undo step like VS Code.
+    Replace,
 }
 
 /// The three case transforms VS Code exposes as
@@ -3414,6 +3417,52 @@ impl Editor {
         self.mark_buffer_changed();
         self.recompute_highlights();
         killed
+    }
+
+    /// Splice `text` over the `len_chars` characters starting at
+    /// `(row, col_chars)` — the find bar's Replace. One undo step; the
+    /// cursor lands at the end of the inserted text so replace-and-advance
+    /// continues from there.
+    pub fn replace_find_match(
+        &mut self,
+        row: usize,
+        col_chars: usize,
+        len_chars: usize,
+        text: &str,
+    ) {
+        if row >= self.lines.len() {
+            return;
+        }
+        let line_len = self.line_char_len(row);
+        if col_chars.saturating_add(len_chars) > line_len {
+            return;
+        }
+        self.pin_on_edit();
+        self.push_undo(EditKind::Replace);
+        self.clear_selection();
+        let from = self.byte_index(row, col_chars);
+        let to = self.byte_index(row, col_chars + len_chars);
+        self.lines[row].replace_range(from..to, text);
+        self.cursor_row = row;
+        self.cursor_col = col_chars + text.chars().count();
+        self.mark_buffer_changed();
+        self.recompute_highlights();
+    }
+
+    /// Swap in a whole new buffer as one undo step — the find bar's
+    /// Replace All. The cursor clamps to the new buffer's bounds.
+    pub fn replace_all_lines(&mut self, new_lines: Vec<String>) {
+        self.pin_on_edit();
+        self.push_undo(EditKind::Replace);
+        self.clear_selection();
+        self.lines = new_lines;
+        if self.lines.is_empty() {
+            self.lines.push(String::new());
+        }
+        self.cursor_row = self.cursor_row.min(self.lines.len() - 1);
+        self.cursor_col = self.cursor_col.min(self.line_char_len(self.cursor_row));
+        self.mark_buffer_changed();
+        self.recompute_highlights();
     }
 
     fn lines_slice_text(&self, start: usize, count: usize) -> String {

@@ -15795,3 +15795,138 @@ fn stale_document_symbol_reply_must_not_replace_the_fresher_outline() {
     let applied = app.apply_outline_symbols(file.clone(), 7, vec![stale_symbol]);
     assert!(applied, "the reply matching the newest request must apply");
 }
+
+// --- In-editor Find & Replace ---------------------------------------------
+
+/// The Cmd+Opt+F chord as crossterm decodes the forwarded CSI-u sequence
+/// (ALT|SUPER on macOS; Ctrl+Alt+F arrives as ALT|CONTROL on Linux).
+fn replace_chord() -> KeyEvent {
+    key(KeyCode::Char('f'), KeyModifiers::ALT | KeyModifiers::SUPER)
+}
+
+#[test]
+fn replace_chord_opens_the_find_bar_with_the_replace_row() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.txt", "alpha beta");
+    app.handle_key(replace_chord()).unwrap();
+    let s = app
+        .editor_find
+        .as_ref()
+        .expect("Cmd+Opt+F must open the find bar");
+    assert!(s.replace_visible, "the replace row must be shown");
+}
+
+#[test]
+fn replace_chord_toggles_the_replace_row_on_an_open_find_bar() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.txt", "alpha beta");
+    app.handle_key(key(KeyCode::Char('f'), KeyModifiers::SUPER))
+        .unwrap();
+    assert!(
+        !app.editor_find.as_ref().unwrap().replace_visible,
+        "plain Cmd+F opens find without the replace row"
+    );
+    app.handle_key(replace_chord()).unwrap();
+    assert!(
+        app.editor_find.as_ref().unwrap().replace_visible,
+        "Cmd+Opt+F on an open find bar expands the replace row"
+    );
+    app.handle_key(replace_chord()).unwrap();
+    assert!(
+        !app.editor_find.as_ref().unwrap().replace_visible,
+        "Cmd+Opt+F again collapses the replace row"
+    );
+}
+
+#[test]
+fn tab_switches_focus_between_the_find_and_replace_fields() {
+    use crate::widgets::editor_find::FindField;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.txt", "alpha beta");
+    app.handle_key(replace_chord()).unwrap();
+    for c in "alpha".chars() {
+        app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
+            .unwrap();
+    }
+    assert_eq!(
+        app.editor_find.as_ref().unwrap().query,
+        "alpha",
+        "typing lands in the query row first"
+    );
+    app.handle_key(key(KeyCode::Tab, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(
+        app.editor_find.as_ref().unwrap().focus,
+        FindField::Replace,
+        "Tab moves focus to the replace row"
+    );
+    for c in "x".chars() {
+        app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
+            .unwrap();
+    }
+    assert_eq!(
+        app.editor_find.as_ref().unwrap().replace,
+        "x",
+        "typing lands in the replace row once focused"
+    );
+    assert_eq!(
+        app.editor_find.as_ref().unwrap().query,
+        "alpha",
+        "the query is untouched by replace-row typing"
+    );
+}
+
+#[test]
+fn enter_in_the_replace_field_replaces_the_current_match_and_advances() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.txt", "alpha beta\ngamma alpha");
+    app.handle_key(replace_chord()).unwrap();
+    for c in "alpha".chars() {
+        app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
+            .unwrap();
+    }
+    app.handle_key(key(KeyCode::Tab, KeyModifiers::NONE))
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE))
+        .unwrap();
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(
+        app.editor.lines[0], "x beta",
+        "the current match is replaced"
+    );
+    assert_eq!(
+        app.editor.lines[1], "gamma alpha",
+        "only the current match is replaced"
+    );
+    assert_eq!(
+        app.editor.cursor_row, 1,
+        "the editor advances to the next match"
+    );
+    assert!(app.editor.dirty, "a replace dirties the buffer");
+    assert!(app.editor.undo(), "the replace is undoable");
+    assert_eq!(app.editor.lines[0], "alpha beta");
+}
+
+#[test]
+fn replace_all_chord_replaces_every_match_in_one_undo_step() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.txt", "alpha beta\ngamma alpha");
+    app.handle_key(replace_chord()).unwrap();
+    for c in "alpha".chars() {
+        app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
+            .unwrap();
+    }
+    app.handle_key(key(KeyCode::Tab, KeyModifiers::NONE))
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE))
+        .unwrap();
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::ALT | KeyModifiers::SUPER))
+        .unwrap();
+    assert_eq!(app.editor.lines[0], "x beta");
+    assert_eq!(app.editor.lines[1], "gamma x");
+    assert!(app.editor.dirty, "replace all dirties the buffer");
+    assert!(app.editor.undo(), "replace all is one undo step");
+    assert_eq!(app.editor.lines[0], "alpha beta");
+    assert_eq!(app.editor.lines[1], "gamma alpha");
+}

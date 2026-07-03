@@ -14340,6 +14340,10 @@ impl App {
             self.open_editor_find();
             return;
         }
+        if is_editor_replace_key(key) {
+            self.open_editor_replace();
+            return;
+        }
         // Completion popup intercepts navigation / accept / dismiss keys
         // before normal editor handling. Any other key dismisses the popup
         // and falls through so the character lands in the buffer.
@@ -17598,6 +17602,7 @@ impl App {
             Cmd::FormatDocument => self.start_format_document(),
             Cmd::ToggleFormatOnSave => self.toggle_format_on_save(),
             Cmd::QuickFix => self.start_code_action(),
+            Cmd::ReplaceInFile => self.open_editor_replace(),
             Cmd::ToggleFold => {
                 let row = self.editor.cursor_row;
                 self.editor.toggle_fold(row);
@@ -18207,6 +18212,34 @@ impl App {
         self.status = String::from("Find: type to search, Enter next, Shift+Enter prev, Esc close");
     }
 
+    /// `Cmd+Opt+F` (VS Code `editor.action.startFindReplaceAction`): open
+    /// the find bar expanded with the replace row, or toggle the row on an
+    /// already-open bar. Read-only tabs (diff / sheet / image previews)
+    /// get the plain find bar — there is nothing to replace into.
+    fn open_editor_replace(&mut self) {
+        if !self.editor_is_text() {
+            self.open_editor_find();
+            return;
+        }
+        if self.editor_find.is_none() {
+            self.open_editor_find();
+        }
+        let Some(state) = self.editor_find.as_mut() else {
+            return;
+        };
+        state.replace_visible = !state.replace_visible;
+        state.focus = if state.replace_visible && !state.query.is_empty() {
+            crate::widgets::editor_find::FindField::Replace
+        } else {
+            crate::widgets::editor_find::FindField::Query
+        };
+        if state.replace_visible {
+            self.status = String::from(
+                "Replace: Tab switches field, Enter replaces, Cmd+Opt+Enter replaces all, Esc close",
+            );
+        }
+    }
+
     fn close_editor_find(&mut self) {
         if self.editor_find.take().is_some() {
             self.editor.set_search_highlight(None, self.search.opts);
@@ -18426,15 +18459,68 @@ impl App {
         );
     }
 
+    /// True when the replace row is shown and owns the keyboard.
+    fn editor_find_replace_focused(&self) -> bool {
+        self.editor_find
+            .as_ref()
+            .map(|s| {
+                s.replace_visible && s.focus == crate::widgets::editor_find::FindField::Replace
+            })
+            .unwrap_or(false)
+    }
+
+    /// Append / edit the focused find-bar field: the replace row edits in
+    /// place, the query row re-runs the search via `editor_find_set_query`.
+    fn editor_find_edit_focused(&mut self, edit: impl FnOnce(&mut String)) {
+        if self.editor_find_replace_focused() {
+            if let Some(s) = self.editor_find.as_mut() {
+                edit(&mut s.replace);
+            }
+            return;
+        }
+        let mut new_q = self
+            .editor_find
+            .as_ref()
+            .map(|s| s.query.clone())
+            .unwrap_or_default();
+        edit(&mut new_q);
+        self.editor_find_set_query(new_q);
+    }
+
     fn handle_editor_find_key(&mut self, key: KeyEvent) {
+        if is_editor_replace_key(key) {
+            self.open_editor_replace();
+            return;
+        }
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        let cmd_like = key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER);
         match (key.code, key.modifiers) {
             (KeyCode::Esc, _) => self.close_editor_find(),
+            // `Cmd+Opt+Enter` (Linux: `Ctrl+Alt+Enter`) = Replace All,
+            // VS Code's binding, from either field.
+            (KeyCode::Enter, m) if m.contains(KeyModifiers::ALT) && cmd_like => {
+                self.editor_find_replace_all();
+            }
             (KeyCode::Enter, _) => {
-                if shift {
+                if self.editor_find_replace_focused() {
+                    self.editor_find_replace_current();
+                } else if shift {
                     self.editor_find_jump_prev();
                 } else {
                     self.editor_find_jump_next();
+                }
+            }
+            (KeyCode::Tab | KeyCode::BackTab, _) => {
+                if let Some(s) = self.editor_find.as_mut()
+                    && s.replace_visible
+                {
+                    use crate::widgets::editor_find::FindField;
+                    s.focus = match s.focus {
+                        FindField::Query => FindField::Replace,
+                        FindField::Replace => FindField::Query,
+                    };
                 }
             }
             (KeyCode::F(3), _) => {
@@ -18445,42 +18531,122 @@ impl App {
                 }
             }
             (KeyCode::Backspace, _) => {
-                let mut new_q = self
-                    .editor_find
-                    .as_ref()
-                    .map(|s| s.query.clone())
-                    .unwrap_or_default();
-                new_q.pop();
-                self.editor_find_set_query(new_q);
+                self.editor_find_edit_focused(|s| {
+                    s.pop();
+                });
             }
             (KeyCode::Char('v'), m)
                 if m.contains(KeyModifiers::CONTROL) || m.contains(KeyModifiers::SUPER) =>
             {
                 if let Some(text) = (self.clipboard_reader)() {
-                    let mut new_q = self
-                        .editor_find
-                        .as_ref()
-                        .map(|s| s.query.clone())
-                        .unwrap_or_default();
-                    for c in text.chars() {
-                        if !c.is_control() {
-                            new_q.push(c);
+                    self.editor_find_edit_focused(|s| {
+                        for c in text.chars() {
+                            if !c.is_control() {
+                                s.push(c);
+                            }
                         }
-                    }
-                    self.editor_find_set_query(new_q);
+                    });
                 }
             }
             (KeyCode::Char(c), m) if !m.intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER) => {
-                let mut new_q = self
-                    .editor_find
-                    .as_ref()
-                    .map(|s| s.query.clone())
-                    .unwrap_or_default();
-                new_q.push(c);
-                self.editor_find_set_query(new_q);
+                self.editor_find_edit_focused(|s| s.push(c));
             }
             _ => {}
         }
+    }
+
+    /// Replace the active find match with the replace field's text
+    /// (expanding `$1` captures in regex mode) and advance to the next
+    /// match — the find bar's Replace (Enter in the replace row). With no
+    /// active match, Enter just finds the next one, like VS Code.
+    fn editor_find_replace_current(&mut self) {
+        if !self.editor_is_text() {
+            return;
+        }
+        let Some(state) = self.editor_find.as_ref() else {
+            return;
+        };
+        if state.query.is_empty() {
+            return;
+        }
+        let (needle, replacement, opts) = (state.query.clone(), state.replace.clone(), state.opts);
+        let Some((row, col, len)) = self.editor.active_search_match else {
+            self.editor_find_jump_next();
+            return;
+        };
+        let Some(line) = self.editor.lines.get(row) else {
+            return;
+        };
+        let Some(text) = crate::widgets::editor_find::expand_replacement(
+            line,
+            col,
+            len,
+            &needle,
+            &replacement,
+            opts,
+        ) else {
+            // Stale match position (buffer changed underneath): resync
+            // instead of splicing blindly.
+            self.editor_find_jump_next();
+            return;
+        };
+        self.editor.replace_find_match(row, col, len, &text);
+        self.editor.active_search_match = None;
+        self.editor.set_search_highlight(Some(needle.clone()), opts);
+        if let Some(s) = self.editor_find.as_mut() {
+            s.match_count =
+                crate::widgets::editor_find::count_matches(&self.editor.lines, &needle, opts);
+        }
+        if let Some(m) = crate::widgets::editor_find::find_next_match(
+            &self.editor.lines,
+            &needle,
+            opts,
+            self.editor.cursor_row,
+            self.editor.cursor_col,
+            false,
+        ) {
+            self.jump_editor_to_match(m);
+        }
+        self.refresh_editor_find_index();
+    }
+
+    /// Replace every match in the buffer as one undo step — the find
+    /// bar's Replace All (`Cmd+Opt+Enter`).
+    fn editor_find_replace_all(&mut self) {
+        if !self.editor_is_text() {
+            return;
+        }
+        let Some(state) = self.editor_find.as_ref() else {
+            return;
+        };
+        if !state.replace_visible || state.query.is_empty() {
+            return;
+        }
+        let (needle, replacement, opts) = (state.query.clone(), state.replace.clone(), state.opts);
+        let Some((new_lines, n)) = crate::widgets::editor_find::replace_all_in_lines(
+            &self.editor.lines,
+            &needle,
+            &replacement,
+            opts,
+        ) else {
+            return;
+        };
+        if n == 0 {
+            self.status = String::from("Replace All: no matches");
+            return;
+        }
+        self.editor.replace_all_lines(new_lines);
+        self.editor.active_search_match = None;
+        self.editor.set_search_highlight(Some(needle), opts);
+        if let Some(s) = self.editor_find.as_mut() {
+            s.match_count = 0;
+            s.match_index = None;
+        }
+        self.status = if n == 1 {
+            String::from("Replaced 1 occurrence")
+        } else {
+            format!("Replaced {n} occurrences")
+        };
     }
 
     fn render_editor_find(&mut self, frame: &mut ratatui::Frame) {
@@ -22873,6 +23039,25 @@ fn is_editor_find_key(key: KeyEvent) -> bool {
         return false;
     }
     if key.modifiers.contains(KeyModifiers::SHIFT) || key.modifiers.contains(KeyModifiers::ALT) {
+        return false;
+    }
+    key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::SUPER)
+}
+
+/// VS Code-style `Cmd+Opt+F` / `Ctrl+Alt+F` inside the editor: open the
+/// find bar expanded with the replace row (VS Code's
+/// `editor.action.startFindReplaceAction`). The iTerm2 / Ghostty
+/// forwarders deliver the macOS chord as CSI-u decoding to ALT|SUPER;
+/// Linux kitty-protocol terminals report Ctrl+Alt+F as ALT|CONTROL.
+/// Shift excluded: `Cmd+Opt+Shift+F` is Format Document.
+fn is_editor_replace_key(key: KeyEvent) -> bool {
+    let KeyCode::Char(c) = key.code else {
+        return false;
+    };
+    if !c.eq_ignore_ascii_case(&'f') {
+        return false;
+    }
+    if key.modifiers.contains(KeyModifiers::SHIFT) || !key.modifiers.contains(KeyModifiers::ALT) {
         return false;
     }
     key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::SUPER)

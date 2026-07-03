@@ -262,6 +262,11 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 handler: "is_editor_find_key",
             },
             ShortcutEntry {
+                keys: "Cmd+Opt+F / Ctrl+Alt+F",
+                description: "Replace in current file (Tab switches field, Enter replaces, Cmd+Opt+Enter all)",
+                handler: "is_editor_replace_key",
+            },
+            ShortcutEntry {
                 keys: "Arrows / Home / End",
                 description: "Navigate; clears any active selection",
                 handler: "",

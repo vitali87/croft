@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Feature,
-    summary: "Extension descriptions in the Extensions panel now render in italics, visually separating the blurb from the extension name.",
+    summary: "In-editor Find & Replace: Cmd/Ctrl+Opt+F expands the find bar with a replace row where Tab switches field, Enter replaces and advances, Cmd+Opt+Enter replaces all in one undo step, with $1 captures in regex mode.",
 }];
