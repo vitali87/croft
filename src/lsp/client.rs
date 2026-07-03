@@ -601,6 +601,23 @@ impl LspClient {
             .context("implementation")
     }
 
+    /// `workspace/symbol`: server-side fuzzy query over every symbol in the
+    /// project. Both response shapes (flat `SymbolInformation` and nested
+    /// `WorkspaceSymbol`) are normalised by the manager.
+    pub async fn workspace_symbols(
+        &mut self,
+        query: String,
+    ) -> Result<Option<lsp_types::WorkspaceSymbolResponse>> {
+        self.server
+            .symbol(lsp_types::WorkspaceSymbolParams {
+                query,
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+            })
+            .await
+            .context("workspace/symbol")
+    }
+
     pub async fn references(
         &mut self,
         uri: Url,

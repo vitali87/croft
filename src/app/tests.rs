@@ -16129,3 +16129,105 @@ fn toggle_auto_save_command_flips_the_pref_and_reports_it() {
     assert!(!app.auto_save);
     assert_eq!(app.status, "Auto Save: off");
 }
+
+// --- Workspace symbol search (# in Quick Open) ------------------------------
+
+fn ws_item(
+    name: &str,
+    path: &std::path::Path,
+    line: u32,
+) -> crate::lsp::manager::WorkspaceSymbolItem {
+    crate::lsp::manager::WorkspaceSymbolItem {
+        name: name.to_string(),
+        kind: crate::lsp::manager::OutlineKind::Function,
+        path: path.to_path_buf(),
+        line,
+        character: 0,
+        container: None,
+    }
+}
+
+#[test]
+fn hash_prefix_in_quick_open_switches_to_workspace_symbols() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.rs", "fn main() {}");
+    app.handle_key(key(KeyCode::Char('p'), KeyModifiers::SUPER))
+        .unwrap();
+    assert!(app.file_finder.is_some(), "Cmd+P opens Quick Open");
+    app.handle_key(key(KeyCode::Char('#'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(
+        app.file_finder.is_none(),
+        "typing # hands Quick Open over to the workspace symbol picker"
+    );
+    let picker = app
+        .workspace_symbols
+        .as_ref()
+        .expect("the workspace symbol picker must open");
+    assert_eq!(picker.query, "", "the # itself is not part of the query");
+}
+
+#[test]
+fn palette_go_to_symbol_in_workspace_opens_the_picker() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.rs", "fn main() {}");
+    app.run_command(crate::widgets::command_palette::Command::GoToWorkspaceSymbol);
+    assert!(app.workspace_symbols.is_some());
+}
+
+#[test]
+fn stale_workspace_symbol_replies_are_dropped() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.rs", "fn main() {}");
+    app.open_workspace_symbols("ma");
+    app.ws_symbols_request_id = Some(7);
+    let f = tmp.path().join("a.rs");
+    assert!(
+        !app.apply_workspace_symbols(3, vec![ws_item("old", &f, 0)], false),
+        "a reply for a superseded request must be dropped"
+    );
+    assert!(app.workspace_symbols.as_ref().unwrap().results.is_empty());
+    assert!(
+        app.apply_workspace_symbols(7, vec![ws_item("main", &f, 0)], false),
+        "the newest request's reply applies"
+    );
+    assert_eq!(app.workspace_symbols.as_ref().unwrap().results.len(), 1);
+}
+
+#[test]
+fn enter_opens_the_selected_symbols_file_at_its_line() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.rs", "fn main() {}");
+    let other = tmp.path().join("b.rs");
+    std::fs::write(&other, "line0\nline1\nfn target() {}\n").unwrap();
+    app.open_workspace_symbols("target");
+    app.ws_symbols_request_id = Some(1);
+    assert!(app.apply_workspace_symbols(1, vec![ws_item("target", &other, 2)], false));
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.workspace_symbols.is_none(), "Enter closes the picker");
+    assert_eq!(
+        app.editor.path.as_deref(),
+        Some(other.as_path()),
+        "Enter opens the symbol's file"
+    );
+    assert_eq!(
+        app.editor.cursor_row, 2,
+        "the caret lands on the symbol's line"
+    );
+}
+
+#[test]
+fn typing_in_the_picker_without_a_language_server_reports_unsupported() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.rs", "fn main() {}");
+    app.lsp = None;
+    app.open_workspace_symbols("");
+    app.handle_key(key(KeyCode::Char('m'), KeyModifiers::NONE))
+        .unwrap();
+    let picker = app.workspace_symbols.as_ref().unwrap();
+    assert!(
+        picker.unsupported,
+        "with no language server the picker must say so instead of spinning"
+    );
+}

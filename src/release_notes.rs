@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Feature,
-    summary: "Auto Save: the Command Palette's File: Toggle Auto Save makes every dirty buffer (background tabs included) write itself a second after the last edit, VS Code's afterDelay; external disk changes are never overwritten.",
+    summary: "Go to Symbol in Workspace: type # in Quick Open (Cmd/Ctrl+P) to search every symbol in the project through the language servers and jump straight to a definition, VS Code's workspace symbol search.",
 }];

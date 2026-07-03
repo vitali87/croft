@@ -2305,6 +2305,11 @@ pub struct App {
     /// VS Code-style Cmd+Shift+O / Ctrl+Shift+O "Go to Symbol in Editor"
     /// picker (also Go to Line via a `:` prefix). None when the modal is closed.
     pub go_to_symbol: Option<crate::widgets::symbol_picker::SymbolPicker>,
+    /// "Go to Symbol in Workspace" (`#` in Quick Open): query + merged
+    /// `workspace/symbol` results across every running language server.
+    pub workspace_symbols: Option<crate::widgets::workspace_symbols::WorkspaceSymbolPicker>,
+    /// The newest `workspace/symbol` request id; stale replies are dropped.
+    ws_symbols_request_id: Option<u64>,
     /// Receiver for an in-flight MCP sidecar command's result (the off-thread
     /// worker delivers one [`crate::mcp::McpOutcome`] then disconnects). `None`
     /// when no extension command is running; polled each frame by `poll_mcp`.
@@ -3080,6 +3085,8 @@ impl App {
             file_finder: None,
             command_palette: None,
             go_to_symbol: None,
+            workspace_symbols: None,
+            ws_symbols_request_id: None,
             mcp_rx: None,
             mcp_started: None,
             mcp_busy_label: None,
@@ -3494,6 +3501,7 @@ impl App {
             || self.file_finder.is_some()
             || self.command_palette.is_some()
             || self.go_to_symbol.is_some()
+            || self.workspace_symbols.is_some()
             || self.process_picker.is_some()
             || self.zoxide_jump.is_some()
             || self.branch_picker.is_some()
@@ -3573,6 +3581,7 @@ impl App {
             || self.file_finder.is_some()
             || self.command_palette.is_some()
             || self.go_to_symbol.is_some()
+            || self.workspace_symbols.is_some()
             || self.process_picker.is_some()
             || self.zoxide_jump.is_some()
             || self.branch_picker.is_some()
@@ -3624,6 +3633,7 @@ impl App {
             || self.file_finder.is_some()
             || self.command_palette.is_some()
             || self.go_to_symbol.is_some()
+            || self.workspace_symbols.is_some()
             || self.process_picker.is_some()
             || self.zoxide_jump.is_some()
             || self.branch_picker.is_some()
@@ -3968,6 +3978,7 @@ impl App {
             self.file_finder.as_ref().map(|f| f.last_rect),
             self.command_palette.as_ref().map(|p| p.last_rect),
             self.go_to_symbol.as_ref().map(|p| p.last_rect),
+            self.workspace_symbols.as_ref().map(|p| p.last_rect),
             self.process_picker.as_ref().map(|p| p.last_rect),
         ];
         let visible = |block: Rect| {
@@ -9742,6 +9753,7 @@ impl App {
         self.render_file_finder(frame);
         self.render_command_palette(frame);
         self.render_go_to_symbol(frame);
+        self.render_workspace_symbols(frame);
         self.render_process_picker(frame);
         self.render_zoxide_jump(frame);
         self.render_branch_picker(frame);
@@ -10876,6 +10888,10 @@ impl App {
         }
         if self.command_palette.is_some() {
             self.handle_command_palette_key(key);
+            return Ok(());
+        }
+        if self.workspace_symbols.is_some() {
+            self.handle_workspace_symbols_key(key);
             return Ok(());
         }
         if self.go_to_symbol.is_some() {
@@ -15906,6 +15922,15 @@ impl App {
             }
             return;
         }
+        if let Some(picker) = self.workspace_symbols.as_mut() {
+            for c in s.chars() {
+                if !c.is_control() {
+                    picker.push_char(c);
+                }
+            }
+            self.workspace_symbols_requery();
+            return;
+        }
         if let Some(finder) = self.file_finder.as_mut() {
             for c in s.chars() {
                 if !c.is_control() {
@@ -17023,6 +17048,17 @@ impl App {
             }
             _ => {}
         }
+        // VS Code's shared quick input: a leading `#` turns Quick Open into
+        // Go to Symbol in Workspace, carrying any text after it as the query.
+        let hash_query = self
+            .file_finder
+            .as_ref()
+            .and_then(|f| f.query.strip_prefix('#'))
+            .map(str::to_string);
+        if let Some(q) = hash_query {
+            self.close_file_finder();
+            self.open_workspace_symbols(&q);
+        }
     }
 
     fn handle_file_finder_mouse(&mut self, m: MouseEvent) {
@@ -17298,6 +17334,182 @@ impl App {
         };
         let area = frame.area();
         crate::widgets::symbol_picker::render_symbol_picker(
+            picker,
+            area,
+            frame.buffer_mut(),
+            gradient,
+            center,
+        );
+    }
+
+    /// Open "Go to Symbol in Workspace" seeded with `initial` (the text
+    /// after Quick Open's `#`). The query goes to every running language
+    /// server; results stream in via [`Self::drain_lsp_workspace_symbols`].
+    fn open_workspace_symbols(&mut self, initial: &str) {
+        if self.workspace_symbols.is_some() {
+            return;
+        }
+        self.workspace_symbols = Some(
+            crate::widgets::workspace_symbols::WorkspaceSymbolPicker::new(
+                self.tree.root.clone(),
+                initial,
+            ),
+        );
+        self.overlays.command_palette_clear.request();
+        self.workspace_symbols_requery();
+        self.status = String::from("Go to Symbol in Workspace: type to search — Esc to close");
+    }
+
+    fn close_workspace_symbols(&mut self) {
+        if self.workspace_symbols.take().is_some() {
+            self.ws_symbols_request_id = None;
+            self.overlays.command_palette_clear.request();
+            self.overlays.activity.mark_dirty();
+            self.overlays.welcome.mark_dirty();
+            self.overlays.hero.mark_dirty();
+            self.invalidate_editor_image_layouts();
+            self.status.clear();
+        }
+    }
+
+    /// Re-send the `workspace/symbol` query for the picker's current text.
+    /// Every call bumps the request id, so only the newest reply applies.
+    fn workspace_symbols_requery(&mut self) {
+        let Some(picker) = self.workspace_symbols.as_mut() else {
+            return;
+        };
+        let query = picker.query.trim().to_string();
+        if query.is_empty() {
+            picker.set_results(Vec::new());
+            self.ws_symbols_request_id = None;
+            return;
+        }
+        picker.loading = true;
+        let Some(lsp) = self.lsp.as_mut() else {
+            if let Some(p) = self.workspace_symbols.as_mut() {
+                p.loading = false;
+                p.unsupported = true;
+            }
+            return;
+        };
+        self.ws_symbols_request_id = Some(lsp.request_workspace_symbols(query));
+    }
+
+    /// Install a `workspace/symbol` reply into the open picker. Only the
+    /// newest request's reply applies; anything else is a stale answer to a
+    /// query the user has already typed past. Returns true when applied.
+    pub fn apply_workspace_symbols(
+        &mut self,
+        request_id: u64,
+        symbols: Vec<crate::lsp::manager::WorkspaceSymbolItem>,
+        unsupported: bool,
+    ) -> bool {
+        if self.ws_symbols_request_id != Some(request_id) {
+            return false;
+        }
+        self.ws_symbols_request_id = None;
+        let Some(picker) = self.workspace_symbols.as_mut() else {
+            return false;
+        };
+        picker.unsupported = unsupported;
+        picker.set_results(symbols);
+        true
+    }
+
+    pub fn drain_lsp_workspace_symbols(&mut self) -> bool {
+        let mut results = Vec::new();
+        if let Some(lsp) = self.lsp.as_ref() {
+            while let Some(r) = lsp.drain_workspace_symbols() {
+                results.push(r);
+            }
+        }
+        let mut changed = false;
+        for r in results {
+            changed |= self.apply_workspace_symbols(r.request_id, r.symbols, r.unsupported);
+        }
+        changed
+    }
+
+    fn handle_workspace_symbols_key(&mut self, key: KeyEvent) {
+        let Some(picker) = self.workspace_symbols.as_mut() else {
+            return;
+        };
+        match (key.code, key.modifiers) {
+            (KeyCode::Esc, _) => self.close_workspace_symbols(),
+            (KeyCode::Enter, _) => {
+                let target = picker
+                    .selected_item()
+                    .map(|i| (i.path.clone(), i.line, i.character));
+                self.close_workspace_symbols();
+                if let Some((path, line, character)) = target {
+                    self.go_to_definition(path, line, character);
+                }
+            }
+            (KeyCode::Up, _) => picker.select_prev(),
+            (KeyCode::Down, _) => picker.select_next(),
+            (KeyCode::PageUp, _) => {
+                for _ in 0..10 {
+                    picker.select_prev();
+                }
+            }
+            (KeyCode::PageDown, _) => {
+                for _ in 0..10 {
+                    picker.select_next();
+                }
+            }
+            (KeyCode::Left, _) => picker.move_cursor_left(),
+            (KeyCode::Right, _) => picker.move_cursor_right(),
+            (KeyCode::Home, _) => picker.move_cursor_home(),
+            (KeyCode::End, _) => picker.move_cursor_end(),
+            (KeyCode::Backspace, _) => {
+                picker.pop_char();
+                self.workspace_symbols_requery();
+            }
+            (KeyCode::Delete, _) => {
+                picker.delete_char();
+                self.workspace_symbols_requery();
+            }
+            (KeyCode::Char(c), m) if !m.intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER) => {
+                picker.push_char(c);
+                self.workspace_symbols_requery();
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_workspace_symbols_mouse(&mut self, m: MouseEvent) {
+        let Some(picker) = self.workspace_symbols.as_mut() else {
+            return;
+        };
+        let inside = rect_contains(picker.last_rect, m.column, m.row);
+        match m.kind {
+            MouseEventKind::ScrollDown => {
+                for _ in 0..3 {
+                    picker.select_next();
+                }
+            }
+            MouseEventKind::ScrollUp => {
+                for _ in 0..3 {
+                    picker.select_prev();
+                }
+            }
+            MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Down(MouseButton::Right)
+                if !inside =>
+            {
+                self.close_workspace_symbols();
+            }
+            _ => {}
+        }
+    }
+
+    fn render_workspace_symbols(&mut self, frame: &mut ratatui::Frame) {
+        let gradient = self.popup_gradient();
+        let center = self.quick_input_position == QuickInputPosition::Center;
+        let Some(picker) = self.workspace_symbols.as_mut() else {
+            return;
+        };
+        let area = frame.area();
+        crate::widgets::workspace_symbols::render_workspace_symbols(
             picker,
             area,
             frame.buffer_mut(),
@@ -17694,6 +17906,7 @@ impl App {
             Cmd::SplitEditor => self.split_editor(),
             Cmd::QuickOpen => self.open_file_finder(),
             Cmd::GoToSymbol => self.open_go_to_symbol(),
+            Cmd::GoToWorkspaceSymbol => self.open_workspace_symbols(""),
             Cmd::ToggleVimMode => self.toggle_vim_mode(),
             Cmd::ShowExplorer => self.set_sidebar_view(SidebarView::Explorer),
             Cmd::ShowSearch => self.set_sidebar_view(SidebarView::Search),
@@ -18979,6 +19192,10 @@ impl App {
         }
         if self.command_palette.is_some() {
             self.handle_command_palette_mouse(m);
+            return;
+        }
+        if self.workspace_symbols.is_some() {
+            self.handle_workspace_symbols_mouse(m);
             return;
         }
         if self.go_to_symbol.is_some() {
@@ -21783,6 +22000,7 @@ impl App {
             || self.file_finder.is_some()
             || self.command_palette.is_some()
             || self.go_to_symbol.is_some()
+            || self.workspace_symbols.is_some()
             || self.process_picker.is_some()
             || self.zoxide_jump.is_some()
             || self.branch_picker.is_some()
@@ -21998,6 +22216,7 @@ impl App {
             || self.file_finder.is_some()
             || self.command_palette.is_some()
             || self.go_to_symbol.is_some()
+            || self.workspace_symbols.is_some()
             || self.process_picker.is_some()
             || self.zoxide_jump.is_some()
             || self.branch_picker.is_some()
@@ -22159,6 +22378,7 @@ impl App {
             || self.file_finder.is_some()
             || self.command_palette.is_some()
             || self.go_to_symbol.is_some()
+            || self.workspace_symbols.is_some()
             || self.process_picker.is_some()
             || self.zoxide_jump.is_some()
             || self.branch_picker.is_some()
@@ -25878,6 +26098,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         // edit-seq it reads is current) and advance follow-cursor.
         let outline_sync_changed = app.sync_outline();
         let outline_changed = app.drain_lsp_document_symbols();
+        let ws_symbols_changed = app.drain_lsp_workspace_symbols();
         // Refresh the Explorer's other stacked sub-views (Open Editors list,
         // Timeline git history, Dependencies) and drain their workers.
         let explorer_panels_changed = app.sync_explorer_panels();
@@ -25936,6 +26157,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             || ports_changed
             || labels_changed
             || auto_save_changed
+            || ws_symbols_changed
             || connect_changed
             || install_changed
             || update_changed

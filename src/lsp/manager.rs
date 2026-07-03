@@ -211,6 +211,25 @@ pub struct ImplementationResult {
     pub unsupported: bool,
 }
 
+/// One `workspace/symbol` hit, mapped to croft's outline vocabulary.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkspaceSymbolItem {
+    pub name: String,
+    pub kind: OutlineKind,
+    pub path: PathBuf,
+    pub line: u32,
+    pub character: u32,
+    /// The enclosing symbol's name, for the dim qualifier in the picker row.
+    pub container: Option<String>,
+}
+
+pub struct WorkspaceSymbolsResult {
+    pub request_id: u64,
+    pub symbols: Vec<WorkspaceSymbolItem>,
+    /// True when no spawned server advertises a `workspaceSymbolProvider`.
+    pub unsupported: bool,
+}
+
 #[derive(Debug)]
 pub struct ReferencesResult {
     pub request_id: u64,
@@ -440,6 +459,10 @@ enum Cmd {
         line: u32,
         character: u32,
     },
+    RequestWorkspaceSymbols {
+        request_id: u64,
+        query: String,
+    },
     RequestReferences {
         request_id: u64,
         path: PathBuf,
@@ -510,6 +533,7 @@ pub struct LspManager {
     type_def_rx: std_mpsc::Receiver<TypeDefinitionResult>,
     impl_rx: std_mpsc::Receiver<ImplementationResult>,
     ref_rx: std_mpsc::Receiver<ReferencesResult>,
+    ws_symbols_rx: std_mpsc::Receiver<WorkspaceSymbolsResult>,
     rename_rx: std_mpsc::Receiver<RenameResult>,
     format_rx: std_mpsc::Receiver<FormatResult>,
     code_action_rx: std_mpsc::Receiver<CodeActionResult>,
@@ -552,6 +576,7 @@ impl LspManager {
         let (type_def_tx, type_def_rx) = std_mpsc::channel();
         let (impl_tx, impl_rx) = std_mpsc::channel();
         let (ref_tx, ref_rx) = std_mpsc::channel();
+        let (ws_symbols_tx, ws_symbols_rx) = std_mpsc::channel();
         let (rename_tx, rename_rx) = std_mpsc::channel();
         let (format_tx, format_rx) = std_mpsc::channel();
         let (code_action_tx, code_action_rx) = std_mpsc::channel();
@@ -592,6 +617,7 @@ impl LspManager {
                 type_definition: type_def_tx,
                 implementation: impl_tx,
                 references: ref_tx,
+                workspace_symbols: ws_symbols_tx,
                 rename: rename_tx,
                 formatting: format_tx,
                 code_action: code_action_tx,
@@ -613,6 +639,7 @@ impl LspManager {
             type_def_rx,
             impl_rx,
             ref_rx,
+            ws_symbols_rx,
             rename_rx,
             format_rx,
             code_action_rx,
@@ -833,6 +860,23 @@ impl LspManager {
         id
     }
 
+    /// Fire a `workspace/symbol` query at every running server that
+    /// supports it; the merged reply arrives via
+    /// [`Self::drain_workspace_symbols`] tagged with the returned id.
+    pub fn request_workspace_symbols(&mut self, query: String) -> u64 {
+        let id = self.next_request_id;
+        self.next_request_id += 1;
+        let _ = self.cmd_tx.send(Cmd::RequestWorkspaceSymbols {
+            request_id: id,
+            query,
+        });
+        id
+    }
+
+    pub fn drain_workspace_symbols(&self) -> Option<WorkspaceSymbolsResult> {
+        self.ws_symbols_rx.try_recv().ok()
+    }
+
     pub fn drain_references(&self) -> Option<ReferencesResult> {
         self.ref_rx.try_recv().ok()
     }
@@ -1026,6 +1070,7 @@ struct ManagedClient {
     supports_type_definition: bool,
     supports_implementation: bool,
     supports_references: bool,
+    supports_workspace_symbols: bool,
     supports_rename: bool,
     supports_formatting: bool,
     supports_code_action: bool,
@@ -1085,6 +1130,7 @@ struct ResultSenders {
     type_definition: std_mpsc::Sender<TypeDefinitionResult>,
     implementation: std_mpsc::Sender<ImplementationResult>,
     references: std_mpsc::Sender<ReferencesResult>,
+    workspace_symbols: std_mpsc::Sender<WorkspaceSymbolsResult>,
     rename: std_mpsc::Sender<RenameResult>,
     formatting: std_mpsc::Sender<FormatResult>,
     code_action: std_mpsc::Sender<CodeActionResult>,
@@ -1209,6 +1255,11 @@ async fn worker_loop(
             } => {
                 state
                     .request_implementation(request_id, path, line, character, &tx.implementation)
+                    .await
+            }
+            Cmd::RequestWorkspaceSymbols { request_id, query } => {
+                state
+                    .request_workspace_symbols(request_id, query, &tx.workspace_symbols)
                     .await
             }
             Cmd::RequestReferences {
@@ -1376,6 +1427,8 @@ impl WorkerState {
                         let supports_implementation =
                             implementation_supported(&caps.implementation_provider);
                         let supports_references = one_of_supported(&caps.references_provider);
+                        let supports_workspace_symbols =
+                            one_of_supported(&caps.workspace_symbol_provider);
                         let supports_rename = one_of_supported(&caps.rename_provider);
                         let supports_formatting =
                             one_of_supported(&caps.document_formatting_provider);
@@ -1400,6 +1453,7 @@ impl WorkerState {
                             supports_type_definition,
                             supports_implementation,
                             supports_references,
+                            supports_workspace_symbols,
                             supports_rename,
                             supports_formatting,
                             supports_code_action,
@@ -2267,6 +2321,63 @@ impl WorkerState {
         });
     }
 
+    /// `workspace/symbol`: fan the query out to every running server that
+    /// advertises the capability (across every language and root — VS Code
+    /// merges all providers the same way) and send one merged reply.
+    async fn request_workspace_symbols(
+        &mut self,
+        request_id: u64,
+        query: String,
+        tx: &std_mpsc::Sender<WorkspaceSymbolsResult>,
+    ) {
+        let picked: Vec<(String, Arc<TokioMutex<LspClient>>)> = self
+            .clients
+            .values()
+            .flatten()
+            .filter(|c| c.supports_workspace_symbols)
+            .map(|c| (c.name.clone(), c.client.clone()))
+            .collect();
+        if picked.is_empty() {
+            let _ = tx.send(WorkspaceSymbolsResult {
+                request_id,
+                symbols: Vec::new(),
+                unsupported: true,
+            });
+            return;
+        }
+        let tx = tx.clone();
+        log_file::log(&format!(
+            "workspace symbols request id={request_id} servers={} query={query:?}",
+            picked.len()
+        ));
+        tokio::spawn(async move {
+            let mut symbols: Vec<WorkspaceSymbolItem> = Vec::new();
+            for (server_name, client_arc) in picked {
+                let mut client = client_arc.lock().await;
+                let resp = client.workspace_symbols(query.clone()).await;
+                drop(client);
+                match resp {
+                    Ok(Some(r)) => symbols.extend(workspace_symbol_items(r)),
+                    Ok(None) => {}
+                    Err(e) => {
+                        log_file::log(&format!(
+                            "lsp[{server_name}] workspace symbols error: {e:#}"
+                        ));
+                    }
+                }
+            }
+            log_file::log(&format!(
+                "workspace symbols response id={request_id} count={}",
+                symbols.len()
+            ));
+            let _ = tx.send(WorkspaceSymbolsResult {
+                request_id,
+                symbols,
+                unsupported: false,
+            });
+        });
+    }
+
     async fn request_references(
         &mut self,
         request_id: u64,
@@ -2854,6 +2965,55 @@ fn code_action_supported(cap: &Option<CodeActionProviderCapability>) -> bool {
         Some(CodeActionProviderCapability::Simple(b)) => *b,
         Some(CodeActionProviderCapability::Options(_)) => true,
         None => false,
+    }
+}
+
+/// Flatten a `workspace/symbol` response (either shape) into picker rows.
+/// Nested `WorkspaceSymbol`s may carry a range-less location (a bare URI);
+/// those land on line 0, which is still a useful jump target.
+fn workspace_symbol_items(resp: lsp_types::WorkspaceSymbolResponse) -> Vec<WorkspaceSymbolItem> {
+    use lsp_types::WorkspaceSymbolResponse;
+    let item = |name: String,
+                kind: SymbolKind,
+                container: Option<String>,
+                uri: &lsp_types::Url,
+                pos: Option<Position>| {
+        let path = uri.to_file_path().ok()?;
+        Some(WorkspaceSymbolItem {
+            name,
+            kind: OutlineKind::from_lsp(kind),
+            path,
+            line: pos.map(|p| p.line).unwrap_or(0),
+            character: pos.map(|p| p.character).unwrap_or(0),
+            container,
+        })
+    };
+    match resp {
+        WorkspaceSymbolResponse::Flat(list) => list
+            .into_iter()
+            .filter_map(|si| {
+                item(
+                    si.name,
+                    si.kind,
+                    si.container_name,
+                    &si.location.uri,
+                    Some(si.location.range.start),
+                )
+            })
+            .collect(),
+        WorkspaceSymbolResponse::Nested(list) => list
+            .into_iter()
+            .filter_map(|ws| match ws.location {
+                OneOf::Left(loc) => item(
+                    ws.name,
+                    ws.kind,
+                    ws.container_name,
+                    &loc.uri,
+                    Some(loc.range.start),
+                ),
+                OneOf::Right(wloc) => item(ws.name, ws.kind, ws.container_name, &wloc.uri, None),
+            })
+            .collect(),
     }
 }
 
@@ -3480,6 +3640,93 @@ mod tests {
         SemanticTokensOptions,
     };
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn workspace_symbol_items_maps_the_flat_response() {
+        use lsp_types::{SymbolInformation, SymbolKind, Url, WorkspaceSymbolResponse};
+        #[allow(deprecated)]
+        let resp = WorkspaceSymbolResponse::Flat(vec![SymbolInformation {
+            name: "main".into(),
+            kind: SymbolKind::FUNCTION,
+            tags: None,
+            deprecated: None,
+            location: Location {
+                uri: Url::from_file_path("/w/src/main.rs").unwrap(),
+                range: lsp_types::Range {
+                    start: Position {
+                        line: 4,
+                        character: 3,
+                    },
+                    end: Position {
+                        line: 4,
+                        character: 7,
+                    },
+                },
+            },
+            container_name: Some("app".into()),
+        }]);
+        let items = workspace_symbol_items(resp);
+        assert_eq!(
+            items,
+            vec![WorkspaceSymbolItem {
+                name: "main".into(),
+                kind: OutlineKind::Function,
+                path: PathBuf::from("/w/src/main.rs"),
+                line: 4,
+                character: 3,
+                container: Some("app".into()),
+            }]
+        );
+    }
+
+    #[test]
+    fn workspace_symbol_items_maps_the_nested_response_and_bare_uris() {
+        use lsp_types::{
+            SymbolKind, Url, WorkspaceLocation, WorkspaceSymbol, WorkspaceSymbolResponse,
+        };
+        let resp = WorkspaceSymbolResponse::Nested(vec![
+            WorkspaceSymbol {
+                name: "Config".into(),
+                kind: SymbolKind::STRUCT,
+                tags: None,
+                container_name: None,
+                location: OneOf::Left(Location {
+                    uri: Url::from_file_path("/w/src/config.rs").unwrap(),
+                    range: lsp_types::Range {
+                        start: Position {
+                            line: 9,
+                            character: 0,
+                        },
+                        end: Position {
+                            line: 9,
+                            character: 6,
+                        },
+                    },
+                }),
+                data: None,
+            },
+            WorkspaceSymbol {
+                name: "helper".into(),
+                kind: SymbolKind::FUNCTION,
+                tags: None,
+                container_name: None,
+                location: OneOf::Right(WorkspaceLocation {
+                    uri: Url::from_file_path("/w/src/lib.rs").unwrap(),
+                }),
+                data: None,
+            },
+        ]);
+        let items = workspace_symbol_items(resp);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].kind, OutlineKind::Struct);
+        assert_eq!(items[0].line, 9);
+        assert_eq!(
+            items[1].path,
+            PathBuf::from("/w/src/lib.rs"),
+            "a range-less nested location still yields a jump target"
+        );
+        assert_eq!(items[1].line, 0, "bare-URI locations land on line 0");
+    }
 
     #[test]
     fn normalise_signature_help_resolves_active_param_range() {

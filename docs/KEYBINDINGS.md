@@ -19,6 +19,7 @@ On macOS, the `Cmd` chords below only reach croft after you run a one-time setup
 | `Cmd+\` | Split the editor into two side-by-side columns; each keeps its own tabs, scroll, and cursor. Closing the last tab in a column collapses the split |
 | `Cmd+Opt+←` / `Cmd+Opt+→` | Move focus to the left / right editor group while split (or click a column) |
 | `Ctrl+p` / `Cmd+p` | Quick Open: fuzzy-search workspace files and jump to one (auto-reveals it in the Explorer) |
+| `Ctrl+p` / `Cmd+p`, then `#` | Go to Symbol in Workspace: the query goes to every running language server as a `workspace/symbol` search; Enter opens the picked symbol's file at its definition (also Command Palette "Go to Symbol in Workspace") |
 | `Ctrl+Shift+p` / `Cmd+Shift+p` | Command Palette: fuzzy-search every named command and run it, with its keybinding shown alongside |
 | `Ctrl+Shift+e` / `Cmd+Shift+e` | Jump to the Explorer sidebar |
 | `Ctrl+Shift+f` / `Cmd+Shift+f` | Jump to the Search sidebar |
