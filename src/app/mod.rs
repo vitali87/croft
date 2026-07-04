@@ -4305,16 +4305,45 @@ impl App {
                 self.status = format!("Reloaded {n} files changed on disk");
             }
             (_, _) => {
-                let p = report.conflicts[0].display();
-                self.status = format!(
-                    "{p} changed on disk and has unsaved edits - save to overwrite, or close the tab to keep the disk version"
-                );
+                self.prompt_disk_conflict(report.conflicts.clone());
             }
         }
         // Keep the watcher's active-file baseline aligned with the reload so
         // a just-applied change doesn't re-trigger on the next poll.
         self.sync_open_file_poll_mtime();
         true
+    }
+
+    /// A dirty buffer collided with an external write. Surface it unmissably
+    /// via the confirm popup (Enter reloads and discards local edits, Esc
+    /// keeps them). Falls back to the status line only when another prompt
+    /// already owns the modal slot, so we never stomp an in-progress input.
+    fn prompt_disk_conflict(&mut self, paths: Vec<PathBuf>) {
+        use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
+        let (title, placeholder) = match paths.as_slice() {
+            [one] => (
+                format!(
+                    "{} changed on disk and you have unsaved edits.",
+                    one.display()
+                ),
+                "Enter to reload (discard your edits) · Esc to keep editing",
+            ),
+            many => (
+                format!(
+                    "{} open files changed on disk with unsaved edits.",
+                    many.len()
+                ),
+                "Enter to reload all (discard your edits) · Esc to keep editing",
+            ),
+        };
+        if self.input_prompt.is_some() {
+            self.status = title;
+            return;
+        }
+        self.open_input_prompt(
+            InputPrompt::new(InputPurpose::ReloadConflict { paths }, title, placeholder)
+                .with_value("reload"),
+        );
     }
 
     fn poll_filesystem_changes(&mut self) -> bool {
@@ -13687,6 +13716,16 @@ impl App {
             InputPurpose::TreeDelete { paths } => {
                 self.close_input_prompt();
                 self.perform_delete_paths(paths);
+            }
+            InputPurpose::ReloadConflict { paths } => {
+                self.close_input_prompt();
+                let reverted = self.editor.revert_paths_to_disk(&paths);
+                self.sync_open_file_poll_mtime();
+                match reverted.len() {
+                    0 => {}
+                    1 => self.status = format!("Reloaded {} from disk", reverted[0].display()),
+                    n => self.status = format!("Reloaded {n} files from disk"),
+                }
             }
         }
     }

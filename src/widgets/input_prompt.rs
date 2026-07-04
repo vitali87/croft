@@ -53,6 +53,12 @@ pub enum InputPurpose {
     TreeDelete {
         paths: Vec<PathBuf>,
     },
+    /// A dirty buffer collided with an external write. Submitting (Enter)
+    /// reloads `paths` from disk, discarding local edits; Esc keeps the edits.
+    /// The value is a sentinel.
+    ReloadConflict {
+        paths: Vec<PathBuf>,
+    },
 }
 
 pub struct InputPrompt {

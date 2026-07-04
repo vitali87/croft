@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Feature,
-    summary: "Terminal wheel now scrolls full-screen apps in their own buffer: spin the wheel over Claude Code, htop, or vim and it scrolls that app (no more \"scroll wheel is sending arrow keys\"); Shift+wheel scrolls croft's own scrollback.",
+    summary: "When a file you have unsaved edits in changes on disk, croft now raises an unmissable confirm popup instead of a quiet footer line: Enter reloads and discards your edits, Esc keeps them. Clean files still reload silently.",
 }];

@@ -3302,8 +3302,16 @@ impl Editor {
             return ExternalChange::Unchanged;
         }
         if self.dirty {
+            // Announce the conflict only on the transition into it. A buffer
+            // that stays dirty while disk keeps differing must not re-fire on
+            // every FS poll, or the confirm popup would reopen endlessly.
+            let newly_conflicted = !self.disk_conflict;
             self.disk_conflict = true;
-            return ExternalChange::Conflict;
+            return if newly_conflicted {
+                ExternalChange::Conflict
+            } else {
+                ExternalChange::Unchanged
+            };
         }
         match self.reload_from_disk() {
             Ok(()) => ExternalChange::Reloaded,
@@ -6629,6 +6637,20 @@ impl EditorTabs {
         report
     }
 
+    /// Discard unsaved edits and reload the given paths from disk — the
+    /// "Reload" resolution of an external-change conflict. Returns the paths
+    /// actually reverted (a tab must still be open on each).
+    pub fn revert_paths_to_disk(&mut self, paths: &[PathBuf]) -> Vec<PathBuf> {
+        let mut reverted = Vec::new();
+        for ed in &mut self.editors {
+            let Some(p) = ed.path.clone() else { continue };
+            if paths.iter().any(|q| q == &p) && ed.revert_to_disk().is_ok() {
+                reverted.push(p);
+            }
+        }
+        reverted
+    }
+
     /// If any tab currently points at `old`, repoint it to `new`. The on-
     /// disk file has already been moved; this only updates the in-memory
     /// path so subsequent saves and the tab label track the new name.
@@ -9809,6 +9831,38 @@ mod tests {
             "dirty buffer must NOT be reloaded over"
         );
         assert!(e.disk_conflict);
+    }
+
+    #[test]
+    fn reload_or_flag_conflict_fires_once_then_stays_quiet() {
+        // A dirty buffer whose disk keeps differing must announce the conflict
+        // exactly once so the confirm popup doesn't reopen on every FS poll.
+        let tmp = NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), "original\n").unwrap();
+        let mut e = Editor::new();
+        e.open(tmp.path()).unwrap();
+        e.insert_str("my unsaved edit");
+        std::fs::write(tmp.path(), "external change\n").unwrap();
+        assert_eq!(e.reload_or_flag_conflict(), ExternalChange::Conflict);
+        // Disk still differs and the buffer is still dirty, but the conflict
+        // has already been announced.
+        assert_eq!(e.reload_or_flag_conflict(), ExternalChange::Unchanged);
+        assert!(e.disk_conflict);
+    }
+
+    #[test]
+    fn revert_paths_to_disk_discards_edits_and_reloads() {
+        let tmp = NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), "original\n").unwrap();
+        let mut tabs = EditorTabs::new();
+        tabs.open_pinned(tmp.path()).unwrap();
+        tabs.insert_str("my unsaved edit"); // deref to the active editor
+        std::fs::write(tmp.path(), "external change\n").unwrap();
+        let reverted = tabs.revert_paths_to_disk(&[tmp.path().to_path_buf()]);
+        assert_eq!(reverted, vec![tmp.path().to_path_buf()]);
+        assert_eq!(tabs.lines[0], "external change");
+        assert!(!tabs.dirty);
+        assert!(!tabs.disk_conflict);
     }
 
     #[test]
