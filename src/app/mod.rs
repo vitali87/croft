@@ -1779,6 +1779,13 @@ pub struct App {
     blame_fetched: Option<PathBuf>,
     /// User pref: show the current-line inline blame annotation (default on).
     inline_blame_enabled: bool,
+    /// Local-history root (`~/.config/croft/history`), cached so tests can
+    /// redirect snapshots to a tempdir.
+    history_root: PathBuf,
+    /// The snapshot currently shown in a local-history diff, `(live file,
+    /// snapshot contents)`, so "Local History: Restore Snapshot" can write it
+    /// back. Cleared when a non-snapshot diff opens.
+    history_restore: Option<(PathBuf, String)>,
     /// Background per-ecosystem dependency-resolution result for DEPENDENCIES.
     deps_rx: std::sync::mpsc::Receiver<Vec<Dependency>>,
     deps_tx: std::sync::mpsc::Sender<Vec<Dependency>>,
@@ -2933,6 +2940,14 @@ impl App {
             blame_tx,
             blame_fetched: None,
             inline_blame_enabled: !loaded_prefs.disable_inline_blame,
+            // Keep the suite off the user's real ~/.config/croft/history: a
+            // per-process temp root in test builds, the real dir otherwise.
+            history_root: if cfg!(test) {
+                std::env::temp_dir().join(format!("croft-test-history-{}", std::process::id()))
+            } else {
+                crate::history::history_dir()
+            },
+            history_restore: None,
             deps_rx,
             deps_tx,
             deps_fetched: None,
@@ -5855,8 +5870,15 @@ impl App {
                             let root = self.tree.root.clone();
                             let rel = rel.to_string_lossy().into_owned();
                             let tx = self.timeline_tx.clone();
+                            let history_root = self.history_root.clone();
+                            let abs = path.clone();
+                            let now = now_millis();
                             std::thread::spawn(move || {
-                                let entries = crate::git::file_history(&root, &rel, 50);
+                                // Merge git commits with local snapshots so the
+                                // TIMELINE shows both sources, like VS Code.
+                                let commits = crate::git::file_history(&root, &rel, 50);
+                                let snaps = crate::history::entries_in(&history_root, &abs);
+                                let entries = crate::history::merged_timeline(commits, &snaps, now);
                                 let _ = tx.send((path, entries));
                             });
                         }
@@ -5933,6 +5955,31 @@ impl App {
             Ok(r) => r.to_string_lossy().into_owned(),
             Err(_) => path.display().to_string(),
         };
+        // A local-history row: diff the snapshot against the working file and
+        // remember it so "Restore Snapshot" can write it back.
+        if let Some(millis) = crate::history::snapshot_millis(&hash) {
+            let Some(snap_file) =
+                crate::history::snapshot_file_in(&self.history_root, &path, millis)
+            else {
+                self.status = String::from("Snapshot no longer available");
+                return;
+            };
+            let Ok(content) = std::fs::read_to_string(&snap_file) else {
+                self.status = String::from("Could not read snapshot");
+                return;
+            };
+            let label = std::path::PathBuf::from(format!("{rel} (local snapshot)"));
+            if let Err(e) = self.editor.open_head_diff_with_text(label, &content, &path) {
+                self.status = format!("Could not open snapshot diff: {e}");
+                return;
+            }
+            self.history_restore = Some((path, content));
+            self.focus_pane(Pane::Editor);
+            self.status = format!("Showing {rel} at a local snapshot");
+            return;
+        }
+        // A git commit row: no snapshot to restore.
+        self.history_restore = None;
         match crate::git::show_commit_file_diff(&self.tree.root, &hash, &rel) {
             Ok(raw) => {
                 let label = std::path::PathBuf::from(format!("{rel} @ {hash}"));
@@ -5947,6 +5994,28 @@ impl App {
                 self.status = format!("git show failed: {e}");
             }
         }
+    }
+
+    /// Restore the local snapshot currently shown in a TIMELINE diff: write its
+    /// contents back to the file and reload the buffer. Reachable from the
+    /// Command Palette once a snapshot diff is open (which records the target).
+    fn restore_history_snapshot(&mut self) {
+        let Some((file, content)) = self.history_restore.clone() else {
+            self.status = String::from("Open a local snapshot from the TIMELINE first");
+            return;
+        };
+        if let Err(e) = std::fs::write(&file, &content) {
+            self.status = format!("Restore failed: {e}");
+            return;
+        }
+        // If that file is the active tab (the snapshot diff opened it), reload
+        // so the editor shows the restored contents and the disk stamp resyncs.
+        if self.editor.path.as_deref() == Some(file.as_path()) {
+            let _ = self.editor.revert_to_disk();
+        }
+        // The restore is itself a new version worth keeping.
+        self.record_history_snapshot(&file);
+        self.status = format!("Restored {}", file.display());
     }
 
     /// Apply a `documentSymbol` reply to the OUTLINE panel, but only when its
@@ -18369,6 +18438,7 @@ impl App {
             Cmd::ToggleFormatOnSave => self.toggle_format_on_save(),
             Cmd::ToggleAutoSave => self.toggle_auto_save(),
             Cmd::ToggleInlineBlame => self.toggle_inline_blame(),
+            Cmd::RestoreSnapshot => self.restore_history_snapshot(),
             Cmd::QuickFix => self.start_code_action(),
             Cmd::ReplaceInFile => self.open_editor_replace(),
             Cmd::MergeAcceptCurrent => {
@@ -21534,6 +21604,9 @@ impl App {
                 lsp.save_doc(path.clone());
             }
         }
+        for path in saved_paths.clone() {
+            self.record_history_snapshot(&path);
+        }
         true
     }
 
@@ -21587,6 +21660,9 @@ impl App {
             match self.editor.save_to_disk_force() {
                 Ok(()) => {
                     self.status = self.editor.status.clone();
+                    if let Some(path) = self.editor.path.clone() {
+                        self.record_history_snapshot(&path);
+                    }
                     self.lsp_notify_saved();
                 }
                 Err(e) => self.status = format!("Save failed: {e}"),
@@ -21613,11 +21689,28 @@ impl App {
         }
     }
 
+    /// Record a local-history snapshot of a file that just hit the disk, and
+    /// refresh the TIMELINE when it's the active file so the new version shows
+    /// immediately. Reads back what was written so the snapshot matches the
+    /// on-disk bytes exactly (encoding / EOL included).
+    fn record_history_snapshot(&mut self, path: &Path) {
+        let Ok(content) = std::fs::read_to_string(path) else {
+            return;
+        };
+        let _ = crate::history::record_in(&self.history_root, path, &content, now_millis());
+        if self.editor.path.as_deref() == Some(path) {
+            self.timeline_fetched = None;
+        }
+    }
+
     fn write_current_to_disk(&mut self) {
         use crate::widgets::editor::SaveOutcome;
         match self.editor.save_to_disk() {
             Ok(SaveOutcome::Saved) => {
                 self.status = self.editor.status.clone();
+                if let Some(path) = self.editor.path.clone() {
+                    self.record_history_snapshot(&path);
+                }
                 self.lsp_notify_saved();
             }
             Ok(SaveOutcome::DiskConflict) => {
@@ -24272,6 +24365,15 @@ fn is_drop_to_local_key(key: KeyEvent) -> bool {
 /// Cmd+Ctrl+B so this chord reaches croft.
 fn is_run_build_task_key(key: KeyEvent) -> bool {
     is_cmd_shift_letter(key, 'b')
+}
+
+/// Milliseconds since the Unix epoch, for stamping local-history snapshots
+/// and dating TIMELINE rows.
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 fn is_cmd_shift_letter(key: KeyEvent, letter: char) -> bool {

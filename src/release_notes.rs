@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Feature,
-    summary: "GitLens-style inline blame: a dim annotation trailing the cursor's line shows who last changed it, how long ago, and the commit summary, updating as you move. On by default; toggle with the palette's \"Git: Toggle Inline Blame\".",
+    summary: "Local history: every save is snapshotted, and the Explorer's TIMELINE now lists those snapshots beside git commits. Click one to diff it against your working file, and \"Local History: Restore Snapshot\" in the palette writes it back, so a version is recoverable even when it was never committed.",
 }];

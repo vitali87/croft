@@ -110,6 +110,8 @@ Every choice except the side-bar / panel visibility persists across launches in 
 | Click the `⋯` button on the EXPLORER title line | Open the "Views and More Actions" menu: toggle which sub-views stack in the Explorer (Open Editors, Folders, Outline, Timeline, and a language-aware Dependencies view that only appears when the workspace root has a recognized manifest), each with a checkmark when shown. Choices persist across launches |
 | Click a row in OPEN EDITORS | Activate that editor's tab (dirty tabs show a dot, the active tab is highlighted) |
 | Click a commit in TIMELINE | Open that commit's diff for the active file in a read-only editor tab |
+| Click a local snapshot in TIMELINE | croft snapshots every save into local history; the TIMELINE lists those snapshots alongside git commits. Click one to diff it against the working file |
+| Command Palette: `Local History: Restore Snapshot` | Write the snapshot shown in the open TIMELINE diff back over the working file |
 
 ## Search sidebar
 

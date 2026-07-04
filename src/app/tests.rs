@@ -7830,6 +7830,50 @@ fn editor_app_with_lines(lines: &[&str]) -> App {
 }
 
 #[test]
+fn saving_records_a_local_history_snapshot_that_diffs_and_restores() {
+    let tmp = tempfile::tempdir().unwrap();
+    let hist = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("note.txt");
+    std::fs::write(&f, "v1\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.history_root = hist.path().to_path_buf();
+    app.editor.open(&f).unwrap();
+    app.focus_pane(Pane::Editor);
+
+    // Type and save: the save hook records a snapshot of the on-disk bytes.
+    app.handle_key(key(KeyCode::Char('X'), KeyModifiers::NONE))
+        .unwrap();
+    app.save();
+    let saved = std::fs::read_to_string(&f).unwrap();
+    let snaps = crate::history::entries_in(&app.history_root, &f);
+    assert_eq!(snaps.len(), 1, "a save must record one snapshot");
+    assert_eq!(
+        std::fs::read_to_string(&snaps[0].file).unwrap(),
+        saved,
+        "the snapshot holds exactly what hit the disk"
+    );
+
+    // Clicking the snapshot row opens a diff of snapshot vs working file and
+    // arms restore.
+    let hash = format!("local:{}", snaps[0].millis);
+    app.open_timeline_diff(f.clone(), hash);
+    assert!(
+        app.editor.diff.is_some(),
+        "a local snapshot row opens a diff view"
+    );
+    assert!(app.history_restore.is_some(), "restore is armed");
+
+    // Corrupt the file, then restore the snapshot back over it.
+    std::fs::write(&f, "clobbered\n").unwrap();
+    app.restore_history_snapshot();
+    assert_eq!(
+        std::fs::read_to_string(&f).unwrap(),
+        saved,
+        "restore writes the snapshot contents back to disk"
+    );
+}
+
+#[test]
 fn inline_blame_annotation_paints_on_the_cursor_line() {
     let tmp = tempfile::tempdir().unwrap();
     let f = tmp.path().join("m.rs");

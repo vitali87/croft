@@ -23,6 +23,7 @@ src/
 ├── merge.rs             merge-conflict machinery: VS Code-regex marker scanning (`<<<<<<<` / `|||||||` diff3 base / `=======` / `>>>>>>>`) into ConflictBlocks, and Accept Current / Incoming / Both resolution line-splicing; the editor caches blocks per edit_seq, tints the regions, and Cmd+. opens the resolve picker
 ├── gradient.rs          shared orange→green corner gradient: the welcome activity box border and the Black-theme focused-pane border
 ├── highlight.rs         tree-sitter highlight registry per language
+├── history.rs           local history: per-save snapshots under ~/.config/croft/history (hash-keyed, deduped, capped); merges into the Explorer TIMELINE beside git commits and backs snapshot diff/restore
 ├── icons.rs             Codicon and file-type Nerd Font glyphs and per-language colors
 ├── install_session.rs   streams install-progress events while a remote host builds / installs the croft binary
 ├── iterm2.rs            iTerm2 plist mutation helpers for fonts and Croft key mappings

@@ -7,6 +7,7 @@ mod ghostty;
 mod git;
 mod gradient;
 mod highlight;
+mod history;
 mod icons;
 mod install_session;
 mod iterm2;
