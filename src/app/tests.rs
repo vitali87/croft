@@ -5394,6 +5394,23 @@ fn changing_workspace_root_retargets_search_at_the_new_explorer_root() {
 }
 
 #[test]
+fn changing_workspace_root_rebinds_the_test_worker_to_the_new_root() {
+    let tmp = tempfile::tempdir().unwrap();
+    let inner = tmp.path().join("inner");
+    std::fs::create_dir_all(&inner).unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    assert_eq!(app.test_worker.root(), tmp.path());
+
+    app.change_workspace_root(inner.clone());
+
+    assert_eq!(
+        app.test_worker.root(),
+        inner,
+        "the test runner must follow the Explorer root; left at the launch dir (e.g. ~/Documents, no Cargo.toml) `cargo test -- --list` errors and the Testing view stays empty"
+    );
+}
+
+#[test]
 fn changing_workspace_root_rebinds_the_lsp_manager_to_the_new_root() {
     let tmp = tempfile::tempdir().unwrap();
     let inner = tmp.path().join("inner");

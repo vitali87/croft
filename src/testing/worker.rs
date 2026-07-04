@@ -18,6 +18,11 @@ use crate::widgets::testing::TestingPanel;
 pub enum TestRequest {
     RunAll,
     Discover,
+    /// Rebind the worker's working directory (Explorer re-root). Without it the
+    /// worker keeps shelling cargo in the launch dir captured at spawn, so after
+    /// a Make Root into a child repo `cargo test -- --list` errors with "could
+    /// not find Cargo.toml" and the tree never populates.
+    SetRoot(PathBuf),
 }
 
 pub enum TestResponse {
@@ -32,16 +37,24 @@ pub enum TestResponse {
 pub struct TestWorker {
     request_tx: Sender<TestRequest>,
     response_rx: Receiver<TestResponse>,
+    // Mirror of the root the loop last saw, for tests that assert the re-root
+    // wiring. The loop owns its own copy via `SetRoot`; prod never reads this.
+    #[cfg(test)]
+    root: PathBuf,
 }
 
 impl TestWorker {
     pub fn spawn(workspace_root: PathBuf) -> Self {
         let (request_tx, request_rx) = std::sync::mpsc::channel::<TestRequest>();
         let (response_tx, response_rx) = std::sync::mpsc::channel::<TestResponse>();
+        #[cfg(test)]
+        let root = workspace_root.clone();
         std::thread::spawn(move || worker_loop(workspace_root, request_rx, response_tx));
         Self {
             request_tx,
             response_rx,
+            #[cfg(test)]
+            root,
         }
     }
 
@@ -51,6 +64,20 @@ impl TestWorker {
 
     pub fn discover(&self) {
         let _ = self.request_tx.send(TestRequest::Discover);
+    }
+
+    /// Rebind the worker to a new workspace root after an Explorer re-root.
+    pub fn set_root(&mut self, root: PathBuf) {
+        #[cfg(test)]
+        {
+            self.root = root.clone();
+        }
+        let _ = self.request_tx.send(TestRequest::SetRoot(root));
+    }
+
+    #[cfg(test)]
+    pub fn root(&self) -> &Path {
+        &self.root
     }
 
     /// Drain streamed results into the panel. Returns true iff anything was
@@ -69,11 +96,12 @@ impl TestWorker {
     }
 }
 
-fn worker_loop(root: PathBuf, rx: Receiver<TestRequest>, tx: Sender<TestResponse>) {
+fn worker_loop(mut root: PathBuf, rx: Receiver<TestRequest>, tx: Sender<TestResponse>) {
     while let Ok(req) = rx.recv() {
         match req {
             TestRequest::RunAll => run_all(&root, &tx),
             TestRequest::Discover => discover(&root, &tx),
+            TestRequest::SetRoot(p) => root = p,
         }
     }
 }

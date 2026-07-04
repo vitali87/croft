@@ -60,6 +60,6 @@ pub struct ReleaseNote {
 
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
-    kind: NoteKind::Feature,
-    summary: "Zero-config task runner: Cmd/Ctrl+Shift+B runs the project's build task auto-detected from its own manifests (Makefile, justfile, package.json, Cargo.toml, pyproject.toml, tasks.json); Tasks: Run Task in the palette lists everything, each task in a named reused terminal pane.",
+    kind: NoteKind::Fix,
+    summary: "The Testing view now follows the Explorer root: after a Make Root into a child repo the test runner rebinds to the new directory instead of staying at the launch dir, so cargo test discovery finds Cargo.toml and the tree populates.",
 }];

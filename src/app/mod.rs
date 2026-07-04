@@ -21678,6 +21678,10 @@ impl App {
         self.git.set_root(new_root.clone());
         self.refresh_git_status_debounced();
         self.refresh_source_control();
+        // Rebind the test runner too, else `cargo test -- --list` keeps running
+        // in the launch dir captured at spawn (e.g. ~/Documents, no Cargo.toml)
+        // and the Testing view stays empty after a Make Root into a child repo.
+        self.test_worker.set_root(new_root.clone());
         // Rebind the search worker and the panel's display root to the new
         // Explorer root so the next search targets this directory and its
         // subdirectories, not the root captured when the worker was spawned.
