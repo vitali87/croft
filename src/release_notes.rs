@@ -60,6 +60,6 @@ pub struct ReleaseNote {
 
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
-    kind: NoteKind::Fix,
-    summary: "Closing a terminal pane now kills its shell and joins its reader thread instead of leaking both; the process/thread pileup that leak caused also destabilized the test suite, which now passes fully in parallel.",
+    kind: NoteKind::Feature,
+    summary: "Terminal wheel now scrolls full-screen apps in their own buffer: spin the wheel over Claude Code, htop, or vim and it scrolls that app (no more \"scroll wheel is sending arrow keys\"); Shift+wheel scrolls croft's own scrollback.",
 }];

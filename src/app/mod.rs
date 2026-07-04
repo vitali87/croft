@@ -52,7 +52,7 @@ use crate::widgets::{
     run_debug::RunDebugPanel,
     search::{SearchPanel, SearchRequest},
     source_control::SourceControlPanel,
-    terminal::PtyTerminal,
+    terminal::{MouseAction, MouseButtonKind, MouseMods, PtyTerminal},
     timeline::TimelinePanel,
 };
 
@@ -21456,10 +21456,21 @@ impl App {
                         self.editor.scroll_down(3);
                     }
                 } else if let Some(idx) = terminal_hit {
+                    let shift = m.modifiers.contains(KeyModifiers::SHIFT);
                     let t = &mut self.terminals[idx];
-                    // Try our scrollback first; if we're in vim/less/htop
-                    // (alternate-screen), fall back to forwarding arrow keys.
-                    if !t.scroll_down(3) {
+                    // A child tracking the mouse (Claude Code, htop, vim) gets
+                    // a real wheel report so it scrolls its own content. Shift
+                    // bypasses that for croft's scrollback. Otherwise fall back
+                    // to arrow keys for alternate-screen apps that don't track.
+                    if t.mouse_reporting() && !shift {
+                        t.report_mouse(
+                            MouseButtonKind::WheelDown,
+                            MouseAction::Press,
+                            m.column,
+                            m.row,
+                            mouse_mods(&m),
+                        );
+                    } else if !t.scroll_down(3) {
                         t.write_input(b"\x1b[B\x1b[B\x1b[B");
                     }
                 }
@@ -21494,8 +21505,17 @@ impl App {
                         self.editor.scroll_up(3);
                     }
                 } else if let Some(idx) = terminal_hit {
+                    let shift = m.modifiers.contains(KeyModifiers::SHIFT);
                     let t = &mut self.terminals[idx];
-                    if !t.scroll_up(3) {
+                    if t.mouse_reporting() && !shift {
+                        t.report_mouse(
+                            MouseButtonKind::WheelUp,
+                            MouseAction::Press,
+                            m.column,
+                            m.row,
+                            mouse_mods(&m),
+                        );
+                    } else if !t.scroll_up(3) {
                         t.write_input(b"\x1b[A\x1b[A\x1b[A");
                     }
                 }
@@ -25612,6 +25632,17 @@ fn sheet_visible_rows(inner: Rect) -> usize {
 
 fn rect_contains(r: Rect, x: u16, y: u16) -> bool {
     r.width > 0 && r.height > 0 && x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height
+}
+
+/// Fold a mouse event's Shift/Alt/Ctrl state into the form `report_mouse`
+/// wants, so a forwarded wheel event carries the same modifiers the child
+/// would have seen natively.
+fn mouse_mods(m: &MouseEvent) -> MouseMods {
+    MouseMods {
+        shift: m.modifiers.contains(KeyModifiers::SHIFT),
+        alt: m.modifiers.contains(KeyModifiers::ALT),
+        ctrl: m.modifiers.contains(KeyModifiers::CONTROL),
+    }
 }
 
 /// The SGR prefix (reset + truecolor fg/bg) for one ratatui cell, used when

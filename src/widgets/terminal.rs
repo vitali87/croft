@@ -21,6 +21,35 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 const SCROLLBACK_LINES: usize = 5000;
 
+/// A mouse button (or wheel direction) to forward to the child program
+/// when it has mouse tracking enabled. Encoded as an SGR (1006) report when
+/// the child selected that encoding, otherwise as a legacy X10 report.
+#[derive(Clone, Copy, PartialEq)]
+pub enum MouseButtonKind {
+    Left,
+    Middle,
+    Right,
+    WheelUp,
+    WheelDown,
+}
+
+/// What happened to the button: a press, a release, or motion while held.
+#[derive(Clone, Copy, PartialEq)]
+pub enum MouseAction {
+    Press,
+    Release,
+    Motion,
+}
+
+/// Keyboard modifiers held during a mouse event, folded into the report's
+/// button byte (Shift +4, Alt +8, Ctrl +16).
+#[derive(Clone, Copy, Default)]
+pub struct MouseMods {
+    pub shift: bool,
+    pub alt: bool,
+    pub ctrl: bool,
+}
+
 /// A terminal text selection, anchored to *absolute* alacritty grid lines
 /// rather than viewport rows. `line` is the grid `Line` index: `0..rows`
 /// is the live screen, negative values are scrollback history. Storing
@@ -626,6 +655,56 @@ impl PtyTerminal {
         self.pty_dirty.store(true, Ordering::Release);
     }
 
+    /// True when the child program has enabled any mouse-tracking mode
+    /// (DECSET 1000 click / 1002 button-drag / 1003 any-motion). When it has,
+    /// wheel events should be forwarded to it via `report_mouse` so it scrolls
+    /// its own buffer rather than croft synthesising arrow keys.
+    pub fn mouse_reporting(&self) -> bool {
+        self.term.lock().mode().intersects(TermMode::MOUSE_MODE)
+    }
+
+    /// Encode a mouse gesture at host-screen cell `(col, row)` as a mouse
+    /// report and send it to the child. Returns false without writing when
+    /// the cell is outside the pane, the child isn't tracking the mouse, or
+    /// the event is motion the child didn't ask for (no 1002/1003). The report
+    /// is SGR (1006) when the child selected it, otherwise legacy X10.
+    pub fn report_mouse(
+        &mut self,
+        button: MouseButtonKind,
+        action: MouseAction,
+        col: u16,
+        row: u16,
+        mods: MouseMods,
+    ) -> bool {
+        let Some((r, c)) = self.cell_at(col, row) else {
+            return false;
+        };
+        let mode = *self.term.lock().mode();
+        if !mode.intersects(TermMode::MOUSE_MODE) {
+            return false;
+        }
+        // Motion (a held-button drag) is only wanted under 1002/1003.
+        if action == MouseAction::Motion
+            && !mode.intersects(TermMode::MOUSE_DRAG | TermMode::MOUSE_MOTION)
+        {
+            return false;
+        }
+        let report = encode_mouse_report(
+            mode.contains(TermMode::SGR_MOUSE),
+            button,
+            action,
+            c,
+            r,
+            mods,
+        );
+        if let Ok(mut w) = self.writer.lock() {
+            let _ = w.write_all(&report);
+            let _ = w.flush();
+        }
+        self.pty_dirty.store(true, Ordering::Release);
+        true
+    }
+
     /// Seed a `cd <path>` into the embedded shell so the terminal
     /// follows an Explorer-side workspace-root change. Sent verbatim to
     /// the PTY input - the shell parses it like a typed command. See
@@ -854,6 +933,58 @@ fn is_terminal_word_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
 
+/// Encode a mouse event as the byte sequence a child program expects.
+/// `sgr` selects SGR (1006) encoding over legacy X10. `local_col`/`local_row`
+/// are 0-based cells within the pane; the wire protocol is 1-based, so both
+/// are offset by one. Button/modifier bit layout follows xterm: Left/Middle/
+/// Right = 0/1/2, wheel up/down = 64/65, +32 for motion, +4/+8/+16 for
+/// Shift/Alt/Ctrl. Under X10 a release reports button code 3 and coordinates
+/// clamp to 223 (the largest a single 0x20-based byte can carry).
+pub fn encode_mouse_report(
+    sgr: bool,
+    button: MouseButtonKind,
+    action: MouseAction,
+    local_col: u16,
+    local_row: u16,
+    mods: MouseMods,
+) -> Vec<u8> {
+    let mut cb: u8 = match button {
+        MouseButtonKind::Left => 0,
+        MouseButtonKind::Middle => 1,
+        MouseButtonKind::Right => 2,
+        MouseButtonKind::WheelUp => 64,
+        MouseButtonKind::WheelDown => 65,
+    };
+    if action == MouseAction::Motion {
+        cb += 32;
+    }
+    if mods.shift {
+        cb += 4;
+    }
+    if mods.alt {
+        cb += 8;
+    }
+    if mods.ctrl {
+        cb += 16;
+    }
+    let cx = local_col + 1;
+    let cy = local_row + 1;
+    if sgr {
+        let terminator = if action == MouseAction::Release {
+            'm'
+        } else {
+            'M'
+        };
+        format!("\x1b[<{cb};{cx};{cy}{terminator}").into_bytes()
+    } else {
+        if action == MouseAction::Release {
+            cb = (cb & !0b11) | 0b11;
+        }
+        let enc = |v: u16| (v.min(223) as u8).wrapping_add(32);
+        vec![0x1b, b'[', b'M', cb.wrapping_add(32), enc(cx), enc(cy)]
+    }
+}
+
 /// Build the byte sequence that retargets a POSIX shell's working
 /// directory to `path`. Prefixed with `\x05\x15` so cursor moves to end
 /// of line and the existing line is killed backward before the `cd` is
@@ -1071,6 +1202,70 @@ mod tests {
     fn feed(term: &mut Term<VoidListener>, bytes: &[u8]) {
         let mut p = Processor::<StdSyncHandler>::new();
         p.advance(term, bytes);
+    }
+
+    #[test]
+    fn mouse_report_encoding_matches_the_xterm_wire_format() {
+        let none = MouseMods::default();
+        let shift = MouseMods {
+            shift: true,
+            ..MouseMods::default()
+        };
+        // SGR: 1-based coords, 'M' press / 'm' release, wheel = 64/65.
+        assert_eq!(
+            encode_mouse_report(true, MouseButtonKind::Left, MouseAction::Press, 0, 0, none),
+            b"\x1b[<0;1;1M"
+        );
+        assert_eq!(
+            encode_mouse_report(
+                true,
+                MouseButtonKind::Left,
+                MouseAction::Release,
+                4,
+                2,
+                none
+            ),
+            b"\x1b[<0;5;3m"
+        );
+        assert_eq!(
+            encode_mouse_report(
+                true,
+                MouseButtonKind::WheelDown,
+                MouseAction::Press,
+                9,
+                9,
+                none
+            ),
+            b"\x1b[<65;10;10M"
+        );
+        // Motion adds 32; Shift adds 4.
+        assert_eq!(
+            encode_mouse_report(
+                true,
+                MouseButtonKind::Left,
+                MouseAction::Motion,
+                0,
+                0,
+                shift
+            ),
+            b"\x1b[<36;1;1M"
+        );
+        // Legacy X10: 0x20-based bytes, release collapses the button to code 3.
+        assert_eq!(
+            encode_mouse_report(false, MouseButtonKind::Left, MouseAction::Press, 0, 0, none),
+            &[0x1b, b'[', b'M', 32, 33, 33]
+        );
+        assert_eq!(
+            encode_mouse_report(
+                false,
+                MouseButtonKind::Left,
+                MouseAction::Release,
+                0,
+                0,
+                none
+            ),
+            &[0x1b, b'[', b'M', 35, 33, 33]
+        );
     }
 
     #[test]
