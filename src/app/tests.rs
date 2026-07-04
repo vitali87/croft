@@ -2156,6 +2156,168 @@ fn click_on_a_modified_source_control_entry_opens_a_diff_view_against_head() {
     );
 }
 
+/// Shared ritual for the hunk-staging tests: a real repo whose committed
+/// 20-line file has been edited at line 2 and line 18, so the working
+/// tree carries two well-separated hunks, opened as an SCM diff.
+fn scm_two_hunk_app() -> (tempfile::TempDir, App) {
+    use crate::git::{ChangeEntry, ChangeKind};
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let git = |args: &[&str]| {
+        let ok = std::process::Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .unwrap()
+            .status
+            .success();
+        assert!(ok, "git {args:?} failed");
+    };
+    git(&["init", "-q", "-b", "main"]);
+    git(&["config", "user.email", "t@t"]);
+    git(&["config", "user.name", "t"]);
+    let original: String = (1..=20).map(|i| format!("line{i}\n")).collect();
+    std::fs::write(root.join("f.txt"), original).unwrap();
+    git(&["add", "f.txt"]);
+    git(&["commit", "-q", "-m", "init"]);
+    let mut edited: Vec<String> = (1..=20).map(|i| format!("line{i}")).collect();
+    edited[1] = "LINE2".into();
+    edited[17] = "LINE18".into();
+    std::fs::write(root.join("f.txt"), edited.join("\n") + "\n").unwrap();
+    let mut app = App::new(root.to_path_buf()).unwrap();
+    app.source_control.entries = vec![ChangeEntry {
+        path: "f.txt".into(),
+        kind: ChangeKind::Modified,
+        ..Default::default()
+    }];
+    app.set_sidebar_view(SidebarView::SourceControl);
+    app.open_source_control_entry(0);
+    assert!(app.editor.diff.is_some(), "the SCM diff must be open");
+    (tmp, app)
+}
+
+fn git_stdout_in(root: &std::path::Path, args: &[&str]) -> String {
+    let out = std::process::Command::new("git")
+        .args(args)
+        .current_dir(root)
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).to_string()
+}
+
+#[test]
+fn pressing_s_in_a_scm_diff_stages_only_the_hunk_under_the_caret() {
+    let (tmp, mut app) = scm_two_hunk_app();
+    // Caret on the first hunk (row 1 = the line2 edit).
+    app.editor
+        .diff
+        .as_mut()
+        .unwrap()
+        .start_selection(crate::widgets::diff::DiffSide::Right, 1, 0);
+    app.handle_key(key(KeyCode::Char('s'), KeyModifiers::NONE))
+        .unwrap();
+    let staged = git_stdout_in(tmp.path(), &["diff", "--cached"]);
+    assert!(
+        staged.contains("+LINE2"),
+        "hunk 1 must land in the index: {staged}"
+    );
+    assert!(
+        !staged.contains("LINE18"),
+        "hunk 2 must stay unstaged: {staged}"
+    );
+    let unstaged = git_stdout_in(tmp.path(), &["diff"]);
+    assert!(
+        unstaged.contains("+LINE18"),
+        "hunk 2 must remain a working-tree change: {unstaged}"
+    );
+}
+
+#[test]
+fn pressing_s_with_no_caret_stages_the_first_visible_hunk() {
+    // Right after opening, the diff parks the first hunk in view; with no
+    // click yet, S must act on that hunk, not silently no-op.
+    let (tmp, mut app) = scm_two_hunk_app();
+    app.handle_key(key(KeyCode::Char('s'), KeyModifiers::NONE))
+        .unwrap();
+    let staged = git_stdout_in(tmp.path(), &["diff", "--cached"]);
+    assert!(
+        staged.contains("+LINE2") && !staged.contains("LINE18"),
+        "the first hunk is the default target: {staged}"
+    );
+}
+
+#[test]
+fn pressing_u_in_a_scm_diff_unstages_only_the_hunk_under_the_caret() {
+    let (tmp, mut app) = scm_two_hunk_app();
+    let ok = std::process::Command::new("git")
+        .args(["add", "f.txt"])
+        .current_dir(tmp.path())
+        .output()
+        .unwrap()
+        .status
+        .success();
+    assert!(ok);
+    app.editor
+        .diff
+        .as_mut()
+        .unwrap()
+        .start_selection(crate::widgets::diff::DiffSide::Right, 1, 0);
+    app.handle_key(key(KeyCode::Char('u'), KeyModifiers::NONE))
+        .unwrap();
+    let staged = git_stdout_in(tmp.path(), &["diff", "--cached"]);
+    assert!(
+        !staged.contains("LINE2"),
+        "hunk 1 must leave the index: {staged}"
+    );
+    assert!(
+        staged.contains("+LINE18"),
+        "hunk 2 must stay staged: {staged}"
+    );
+}
+
+#[test]
+fn pressing_r_in_a_scm_diff_confirms_then_reverts_only_that_hunk() {
+    let (tmp, mut app) = scm_two_hunk_app();
+    app.editor
+        .diff
+        .as_mut()
+        .unwrap()
+        .start_selection(crate::widgets::diff::DiffSide::Right, 1, 0);
+    app.handle_key(key(KeyCode::Char('r'), KeyModifiers::NONE))
+        .unwrap();
+    // Destructive: nothing may change until the confirm.
+    let before = std::fs::read_to_string(tmp.path().join("f.txt")).unwrap();
+    assert!(
+        before.contains("LINE2"),
+        "revert must wait for the confirm popup"
+    );
+    app.handle_key(key(KeyCode::Char('y'), KeyModifiers::NONE))
+        .unwrap();
+    let after = std::fs::read_to_string(tmp.path().join("f.txt")).unwrap();
+    assert!(
+        after.contains("line2") && !after.contains("LINE2"),
+        "hunk 1 must be reverted: {after}"
+    );
+    assert!(
+        after.contains("LINE18"),
+        "hunk 2 must survive the revert: {after}"
+    );
+}
+
+#[test]
+fn revert_hunk_confirm_cancels_on_n() {
+    let (tmp, mut app) = scm_two_hunk_app();
+    app.handle_key(key(KeyCode::Char('r'), KeyModifiers::NONE))
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('n'), KeyModifiers::NONE))
+        .unwrap();
+    let content = std::fs::read_to_string(tmp.path().join("f.txt")).unwrap();
+    assert!(
+        content.contains("LINE2") && content.contains("LINE18"),
+        "Esc/N must leave the working tree untouched"
+    );
+}
+
 /// The user dislikes underlined text in the welcome panel: it adds visual
 /// noise. Assert the rendered buffer contains zero cells with the UNDERLINED
 /// modifier so this preference is enforced by the test suite.

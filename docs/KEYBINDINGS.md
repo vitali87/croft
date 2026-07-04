@@ -133,6 +133,10 @@ Every choice except the side-bar / panel visibility persists across launches in 
 | `Enter` | Commit all tracked changes with the message |
 | Click ✓ Commit | Same as `Enter` |
 | Click a change row | Open that file's diff against HEAD in a read-only editor tab |
+| `S` in a diff tab | Stage only the change hunk under the cursor (click a row or `F7` to pick the hunk) |
+| `U` in a diff tab | Unstage only the change hunk under the cursor |
+| `R` in a diff tab | Revert only the change hunk under the cursor after a `Y`/`N` confirm modal |
+| `F7` / `Shift`+`F7` in a diff tab | Jump to the next / previous change hunk |
 | `Cmd`+`A` / `Ctrl`+`A`, then `Cmd`+`S` / `Ctrl`+`S` | Select every change, then stage the selection |
 | Click `+` on a selected unstaged row | Stage that file |
 | Click `↶` on a selected unstaged row | Discard that file (confirms first; deletes untracked files) |

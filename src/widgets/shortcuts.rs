@@ -871,6 +871,16 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 description: "Open the checkout / create-branch picker",
                 handler: "",
             },
+            ShortcutEntry {
+                keys: "S / U / R in a diff",
+                description: "Stage / unstage / revert the change hunk under the cursor (revert confirms first)",
+                handler: "",
+            },
+            ShortcutEntry {
+                keys: "F7 / Shift+F7 in a diff",
+                description: "Jump to the next / previous change hunk",
+                handler: "",
+            },
         ],
     },
     ShortcutGroup {

@@ -59,7 +59,13 @@ pub struct ReleaseNote {
 }
 
 /// What shipped in the current release. Replace on every version bump.
-pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
-    kind: NoteKind::Feature,
-    summary: "Go to Symbol in Workspace: type # in Quick Open (Cmd/Ctrl+P) to search every symbol in the project through the language servers and jump straight to a definition, VS Code's workspace symbol search.",
-}];
+pub const RELEASE_NOTES: &[ReleaseNote] = &[
+    ReleaseNote {
+        kind: NoteKind::Feature,
+        summary: "Hunk-level staging: inside a Source Control diff, S stages, U unstages, and R reverts (with a confirm) just the change hunk under the cursor, so one messy file becomes several focused commits.",
+    },
+    ReleaseNote {
+        kind: NoteKind::Fix,
+        summary: "Background git status polls no longer take index.lock (GIT_OPTIONAL_LOCKS=0), so staging can never fail with a transient lock error while croft refreshes.",
+    },
+];

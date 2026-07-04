@@ -107,6 +107,12 @@ fn run_git(path: &Path, args: &[&str]) -> std::io::Result<String> {
         .to_str()
         .ok_or_else(|| std::io::Error::other("non-utf8 workspace path"))?;
     let mut cmd = Command::new("git");
+    // Read-only queries must never take `.git/index.lock`: `git status` /
+    // `git diff` opportunistically rewrite the refreshed index, and that
+    // background lock races user-initiated mutations (`git add`, `git
+    // apply --cached`) into transient "index.lock exists" failures. This
+    // is exactly what git ships GIT_OPTIONAL_LOCKS for.
+    cmd.env("GIT_OPTIONAL_LOCKS", "0");
     cmd.args(["-C", path_str]).args(args);
     let output = cmd.output()?;
     if !output.status.success() {
@@ -442,6 +448,8 @@ pub fn query_changes(root: &Path) -> Vec<ChangeEntry> {
         None => return Vec::new(),
     };
     let output = match Command::new("git")
+        // Poll without taking index.lock; see run_git.
+        .env("GIT_OPTIONAL_LOCKS", "0")
         .args(["-C", path_str, "status", "--porcelain"])
         .output()
     {
@@ -500,6 +508,8 @@ pub fn parse_numstat(out: &str) -> std::collections::HashMap<String, (usize, usi
 
 fn numstat_map(workdir: &str, args: &[&str]) -> std::collections::HashMap<String, (usize, usize)> {
     let output = match Command::new("git")
+        // Poll without taking index.lock; see run_git.
+        .env("GIT_OPTIONAL_LOCKS", "0")
         .args(["-C", workdir])
         .args(args)
         .output()
@@ -554,6 +564,70 @@ pub fn read_file_at_head(root: &Path, rel_path: &str) -> Result<String, String> 
         });
     }
     String::from_utf8(output.stdout).map_err(|_| format!("{rel_path} at HEAD is not UTF-8"))
+}
+
+/// Apply a unified-diff patch fed on stdin via `git apply`. `cached`
+/// targets the index (stage), `reverse` un-applies (`cached + reverse` =
+/// unstage, `reverse` alone = revert the working tree). Logged to the
+/// OUTPUT panel's Git channel like every other mutation; the caller gets
+/// git's verbatim error when a hunk no longer applies.
+pub fn apply_patch(
+    root: &Path,
+    patch: &str,
+    cached: bool,
+    reverse: bool,
+) -> Result<String, String> {
+    let path_str = root
+        .to_str()
+        .ok_or_else(|| "non-utf8 workspace path".to_string())?;
+    let mut args: Vec<&str> = vec!["-C", path_str, "apply", "--whitespace=nowarn"];
+    if cached {
+        args.push("--cached");
+    }
+    if reverse {
+        args.push("-R");
+    }
+    args.push("-");
+    crate::output::push(
+        crate::output::CHANNEL_GIT,
+        crate::output::OutputLevel::Info,
+        &format!("> git {} <<patch", args[2..].join(" ")),
+    );
+    let mut child = Command::new("git")
+        .args(&args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("failed to spawn git: {e}"))?;
+    if let Some(stdin) = child.stdin.take() {
+        use std::io::Write;
+        let mut stdin = stdin;
+        stdin
+            .write_all(patch.as_bytes())
+            .map_err(|e| format!("failed to feed patch to git apply: {e}"))?;
+    }
+    let output = child
+        .wait_with_output()
+        .map_err(|e| format!("git apply did not exit cleanly: {e}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if output.status.success() {
+        Ok(if !stdout.is_empty() { stdout } else { stderr })
+    } else {
+        let msg = if !stderr.is_empty() { stderr } else { stdout };
+        let err = if msg.is_empty() {
+            format!("git apply failed with code {:?}", output.status.code())
+        } else {
+            msg
+        };
+        crate::output::push(
+            crate::output::CHANNEL_GIT,
+            crate::output::OutputLevel::Error,
+            &err,
+        );
+        Err(err)
+    }
 }
 
 /// message verbatim so the user sees exactly what blocked them.
@@ -1435,6 +1509,99 @@ mod tests {
     fn parse_ahead_behind_falls_back_to_zero_on_garbage() {
         assert_eq!(parse_ahead_behind(""), (0, 0));
         assert_eq!(parse_ahead_behind("?"), (0, 0));
+    }
+
+    /// Init a repo, commit a 20-line file, then edit line 2 and line 18
+    /// so the working tree carries two well-separated hunks.
+    fn repo_with_two_hunks(root: &Path) {
+        let run = |args: &[&str]| {
+            let ok = Command::new("git")
+                .args(["-C", root.to_str().unwrap()])
+                .args(args)
+                .output()
+                .unwrap()
+                .status
+                .success();
+            assert!(ok, "git {args:?} failed");
+        };
+        run(&["init", "-q", "-b", "main"]);
+        run(&["config", "user.email", "t@t"]);
+        run(&["config", "user.name", "t"]);
+        let original: String = (1..=20).map(|i| format!("line{i}\n")).collect();
+        std::fs::write(root.join("f.txt"), original).unwrap();
+        run(&["add", "f.txt"]);
+        run(&["commit", "-q", "-m", "init"]);
+        let mut edited: Vec<String> = (1..=20).map(|i| format!("line{i}")).collect();
+        edited[1] = "LINE2".into();
+        edited[17] = "LINE18".into();
+        std::fs::write(root.join("f.txt"), edited.join("\n") + "\n").unwrap();
+    }
+
+    fn git_stdout(root: &Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .args(["-C", root.to_str().unwrap()])
+            .args(args)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).to_string()
+    }
+
+    #[test]
+    fn apply_patch_cached_stages_only_the_given_hunk() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        repo_with_two_hunks(root);
+        let head = read_file_at_head(root, "f.txt").unwrap();
+        let work = std::fs::read_to_string(root.join("f.txt")).unwrap();
+        let diff = crate::widgets::diff::DiffData::build(
+            std::path::PathBuf::new(),
+            std::path::PathBuf::new(),
+            head.lines().map(str::to_string).collect(),
+            work.lines().map(str::to_string).collect(),
+        );
+        let range = diff.hunk_range_at(0).unwrap();
+        let patch = diff.hunk_patch("f.txt", range);
+        apply_patch(root, &patch, true, false).unwrap();
+        let staged = git_stdout(root, &["diff", "--cached"]);
+        assert!(staged.contains("+LINE2"), "hunk 1 must be staged: {staged}");
+        assert!(
+            !staged.contains("LINE18"),
+            "hunk 2 must NOT be staged: {staged}"
+        );
+        let unstaged = git_stdout(root, &["diff"]);
+        assert!(
+            unstaged.contains("+LINE18"),
+            "hunk 2 must stay in the working tree: {unstaged}"
+        );
+        // Round-trip: unstage the same hunk again.
+        apply_patch(root, &patch, true, true).unwrap();
+        let staged = git_stdout(root, &["diff", "--cached"]);
+        assert!(
+            staged.trim().is_empty(),
+            "reverse cached apply must empty the index diff: {staged}"
+        );
+    }
+
+    #[test]
+    fn apply_patch_reverse_reverts_only_the_given_hunk_in_the_working_tree() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        repo_with_two_hunks(root);
+        let head = read_file_at_head(root, "f.txt").unwrap();
+        let work = std::fs::read_to_string(root.join("f.txt")).unwrap();
+        let diff = crate::widgets::diff::DiffData::build(
+            std::path::PathBuf::new(),
+            std::path::PathBuf::new(),
+            head.lines().map(str::to_string).collect(),
+            work.lines().map(str::to_string).collect(),
+        );
+        let range = diff.hunk_range_at(0).unwrap();
+        let patch = diff.hunk_patch("f.txt", range);
+        apply_patch(root, &patch, false, true).unwrap();
+        let after = std::fs::read_to_string(root.join("f.txt")).unwrap();
+        assert!(after.contains("line2\n"), "hunk 1 must be reverted");
+        assert!(!after.contains("LINE2"), "hunk 1 edit must be gone");
+        assert!(after.contains("LINE18"), "hunk 2 must survive the revert");
     }
 
     #[test]

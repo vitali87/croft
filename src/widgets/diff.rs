@@ -857,6 +857,142 @@ impl DiffData {
             self.nav_anchor = Some(row);
         }
     }
+
+    /// The row hunk actions (stage / unstage / revert) anchor on: the
+    /// caret when the user has clicked, else the row the last hunk jump
+    /// landed on, else the top of the viewport — `hunk_range_at`'s
+    /// fall-forward then lands on the first visible hunk, which is the
+    /// one parked in view right after the diff opens.
+    pub fn action_row(&self) -> usize {
+        self.caret_row().or(self.nav_anchor).unwrap_or(self.scroll)
+    }
+
+    /// Inclusive row range of the contiguous change hunk containing
+    /// `row`. A `row` sitting on context falls forward to the next hunk,
+    /// the same forgiving anchor Next Change uses. `None` when no change
+    /// hunk exists at or after `row`.
+    pub fn hunk_range_at(&self, row: usize) -> Option<(usize, usize)> {
+        if self.rows.is_empty() {
+            return None;
+        }
+        let is_change = |i: usize| !matches!(self.rows.get(i), Some(DiffRow::Equal { .. }) | None);
+        let anchor = row.min(self.rows.len() - 1);
+        let start = if is_change(anchor) {
+            anchor
+        } else {
+            (anchor..self.rows.len()).find(|&i| is_change(i))?
+        };
+        let mut s = start;
+        while s > 0 && is_change(s - 1) {
+            s -= 1;
+        }
+        let mut e = start;
+        while e + 1 < self.rows.len() && is_change(e + 1) {
+            e += 1;
+        }
+        Some((s, e))
+    }
+
+    /// A minimal unified diff containing only the hunk at `range` plus up
+    /// to three lines of surrounding context, in the exact shape
+    /// `git apply` accepts on stdin (`--- a/rel`, `+++ b/rel`, one `@@`
+    /// header). Because `git apply` verifies a hunk against its context
+    /// (with offset search), the same patch stages (`--cached`), unstages
+    /// (`--cached -R`) or reverts (`-R`) that one hunk.
+    pub fn hunk_patch(&self, rel_path: &str, range: (usize, usize)) -> String {
+        const CTX: usize = 3;
+        let (hs, he) = range;
+        let s = hs.saturating_sub(CTX).max(
+            // Context must not swallow a neighbouring hunk: back up only
+            // across Equal rows.
+            (0..hs)
+                .rev()
+                .take(CTX)
+                .take_while(|&i| matches!(self.rows.get(i), Some(DiffRow::Equal { .. })))
+                .last()
+                .unwrap_or(hs),
+        );
+        let e = {
+            let mut e = he;
+            for i in he + 1..self.rows.len() {
+                if i > he + CTX || !matches!(self.rows.get(i), Some(DiffRow::Equal { .. })) {
+                    break;
+                }
+                e = i;
+            }
+            e
+        };
+        let mut old_start: Option<usize> = None;
+        let mut new_start: Option<usize> = None;
+        let mut old_count = 0usize;
+        let mut new_count = 0usize;
+        let mut body: Vec<String> = Vec::new();
+        // Within a change run, emit every `-` line before the `+` lines so
+        // Replaced pairs read as a canonical delete-then-insert block.
+        let mut minus: Vec<String> = Vec::new();
+        let mut plus: Vec<String> = Vec::new();
+        for i in s..=e {
+            match self.rows[i] {
+                DiffRow::Equal { left, right } => {
+                    body.append(&mut minus);
+                    body.append(&mut plus);
+                    old_start.get_or_insert(left + 1);
+                    new_start.get_or_insert(right + 1);
+                    old_count += 1;
+                    new_count += 1;
+                    body.push(format!(" {}", self.left_lines[left]));
+                }
+                DiffRow::Removed { left } => {
+                    old_start.get_or_insert(left + 1);
+                    old_count += 1;
+                    minus.push(format!("-{}", self.left_lines[left]));
+                }
+                DiffRow::Added { right } => {
+                    new_start.get_or_insert(right + 1);
+                    new_count += 1;
+                    plus.push(format!("+{}", self.right_lines[right]));
+                }
+                DiffRow::Replaced { left, right } => {
+                    old_start.get_or_insert(left + 1);
+                    new_start.get_or_insert(right + 1);
+                    old_count += 1;
+                    new_count += 1;
+                    minus.push(format!("-{}", self.left_lines[left]));
+                    plus.push(format!("+{}", self.right_lines[right]));
+                }
+            }
+        }
+        body.append(&mut minus);
+        body.append(&mut plus);
+        // A side with zero lines names the line BEFORE the change in its
+        // `@@` field (`-N,0` / `+N,0`), per the unified-diff format. That
+        // only happens with no context at all (edits touching an empty
+        // side), so derive it from the other side's insertion point.
+        let old_start = old_start.unwrap_or_else(|| {
+            (e + 1..self.rows.len())
+                .find_map(|i| match self.rows.get(i) {
+                    Some(DiffRow::Equal { left, .. })
+                    | Some(DiffRow::Removed { left })
+                    | Some(DiffRow::Replaced { left, .. }) => Some(*left),
+                    _ => None,
+                })
+                .unwrap_or(self.left_lines.len())
+        });
+        let new_start = new_start.unwrap_or_else(|| {
+            (e + 1..self.rows.len())
+                .find_map(|i| match self.rows.get(i) {
+                    Some(DiffRow::Equal { right, .. })
+                    | Some(DiffRow::Added { right })
+                    | Some(DiffRow::Replaced { right, .. }) => Some(*right),
+                    _ => None,
+                })
+                .unwrap_or(self.right_lines.len())
+        });
+        format!(
+            "--- a/{rel_path}\n+++ b/{rel_path}\n@@ -{old_start},{old_count} +{new_start},{new_count} @@\n{}\n",
+            body.join("\n")
+        )
+    }
 }
 
 fn row_has_right(row: &DiffRow) -> bool {
@@ -1193,6 +1329,73 @@ mod tests {
         assert_eq!(starts.len(), 2);
         assert_eq!(starts[0], 1);
         assert_eq!(starts[1], 4);
+    }
+
+    #[test]
+    fn hunk_range_at_expands_to_the_contiguous_change_block() {
+        let d = DiffData::build(
+            PathBuf::new(),
+            PathBuf::new(),
+            lines(&["a", "b", "c", "d", "e", "f"]),
+            lines(&["a", "B", "c", "d", "E", "F"]),
+        );
+        assert_eq!(d.hunk_range_at(1), Some((1, 1)));
+        assert_eq!(d.hunk_range_at(4), Some((4, 5)));
+        assert_eq!(d.hunk_range_at(5), Some((4, 5)));
+        // A context row falls forward to the next hunk, like Next Change.
+        assert_eq!(d.hunk_range_at(2), Some((4, 5)));
+        assert_eq!(d.hunk_range_at(0), Some((1, 1)));
+    }
+
+    #[test]
+    fn hunk_patch_contains_only_the_requested_hunk() {
+        // 15 untouched lines between the two edits so their context
+        // windows cannot overlap.
+        let left: Vec<String> = (1..=20).map(|i| format!("line{i}")).collect();
+        let mut right = left.clone();
+        right[1] = "LINE2".into();
+        right[17] = "LINE18".into();
+        let d = DiffData::build(PathBuf::new(), PathBuf::new(), left, right);
+        let range = d.hunk_range_at(1).unwrap();
+        assert_eq!(range, (1, 1));
+        let patch = d.hunk_patch("src/x.rs", range);
+        assert_eq!(
+            patch,
+            "--- a/src/x.rs\n+++ b/src/x.rs\n@@ -1,5 +1,5 @@\n line1\n-line2\n+LINE2\n line3\n line4\n line5\n",
+            "the patch must carry only the first hunk with three context lines"
+        );
+    }
+
+    #[test]
+    fn hunk_patch_handles_a_pure_addition() {
+        let d = DiffData::build(
+            PathBuf::new(),
+            PathBuf::new(),
+            lines(&["a", "b"]),
+            lines(&["a", "x", "b"]),
+        );
+        let range = d.hunk_range_at(0).unwrap();
+        let patch = d.hunk_patch("f.txt", range);
+        assert_eq!(
+            patch,
+            "--- a/f.txt\n+++ b/f.txt\n@@ -1,2 +1,3 @@\n a\n+x\n b\n"
+        );
+    }
+
+    #[test]
+    fn hunk_patch_handles_a_deletion_at_end_of_file() {
+        let d = DiffData::build(
+            PathBuf::new(),
+            PathBuf::new(),
+            lines(&["a", "b", "c"]),
+            lines(&["a", "b"]),
+        );
+        let range = d.hunk_range_at(0).unwrap();
+        let patch = d.hunk_patch("f.txt", range);
+        assert_eq!(
+            patch,
+            "--- a/f.txt\n+++ b/f.txt\n@@ -1,3 +1,2 @@\n a\n b\n-c\n"
+        );
     }
 
     #[test]

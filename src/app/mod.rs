@@ -1680,6 +1680,15 @@ struct PendingDiscard {
     untracked: bool,
 }
 
+/// A revert-hunk request waiting on its confirm popup. Holds the
+/// single-hunk patch built when the user pressed R, so the confirm
+/// reverse-applies exactly what they were looking at.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingRevertHunk {
+    rel_path: String,
+    patch: String,
+}
+
 /// Why the branch picker is open, deciding what its Enter does. `Checkout`
 /// is the default (click the branch name / "Checkout to"); the others are
 /// reached from the Branch submenu and act on the highlighted *existing*
@@ -2013,6 +2022,9 @@ pub struct App {
     /// tracked discard runs `git checkout HEAD -- <path>`). Both paths
     /// destroy uncommitted work, so the modal must always run first.
     pending_discard: Option<PendingDiscard>,
+    /// Armed by R in a Source-Control diff; reverting a hunk destroys
+    /// uncommitted work, so the confirm modal always runs first.
+    pending_revert_hunk: Option<PendingRevertHunk>,
     /// Set on startup (after `init_graphics` resolves the inline-image
     /// protocol) when the host terminal can't render croft's icons/images
     /// and the user hasn't silenced the nudge. Drawn as a dismissible modal
@@ -3002,6 +3014,7 @@ impl App {
             pending_remote_pulls: Vec::new(),
             pending_local_open: None,
             pending_discard: None,
+            pending_revert_hunk: None,
             pending_terminal_warning: false,
             commit_menu_open: false,
             default_branch_label: None,
@@ -9748,6 +9761,7 @@ impl App {
         self.render_prompt(frame);
         self.render_local_open_confirm(frame);
         self.render_discard_confirm(frame);
+        self.render_revert_hunk_confirm(frame);
         self.render_discard_all_confirm(frame);
         self.render_editor_find(frame);
         self.render_file_finder(frame);
@@ -10144,6 +10158,72 @@ impl App {
                     Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
                 ),
                 ratatui::text::Span::raw("es, discard   "),
+                ratatui::text::Span::styled(
+                    "[N]",
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                ratatui::text::Span::raw("o / Esc"),
+            ]),
+        ]);
+        frame.render_widget(ratatui::widgets::Paragraph::new(body), inner);
+    }
+
+    /// Confirmation modal for Revert Hunk: destroys the uncommitted edit
+    /// under the diff caret, so it gets the same red Y/N gate as discard.
+    fn render_revert_hunk_confirm(&self, frame: &mut ratatui::Frame) {
+        let Some(pr) = self.pending_revert_hunk.as_ref() else {
+            return;
+        };
+        let area = frame.area();
+        let width = area.width.saturating_sub(8).clamp(50, 96);
+        let height: u16 = 8;
+        let x = (area.width.saturating_sub(width)) / 2 + area.x;
+        let y = (area.height.saturating_sub(height)) / 2 + area.y;
+        let rect = Rect {
+            x,
+            y,
+            width,
+            height,
+        };
+        let warn = Color::Rgb(0xe7, 0x70, 0x70);
+        let block = ratatui::widgets::Block::default()
+            .borders(ratatui::widgets::Borders::ALL)
+            .border_style(Style::default().fg(warn))
+            .style(Style::default().bg(Color::Rgb(0x1e, 0x1e, 0x1e)))
+            .title(ratatui::text::Span::styled(
+                " REVERT HUNK? ",
+                Style::default()
+                    .fg(Color::White)
+                    .bg(warn)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        frame.render_widget(ratatui::widgets::Clear, rect);
+        frame.render_widget(block, rect);
+        let inner = Rect {
+            x: rect.x + 2,
+            y: rect.y + 1,
+            width: rect.width.saturating_sub(4),
+            height: rect.height.saturating_sub(2),
+        };
+        let body = ratatui::text::Text::from(vec![
+            ratatui::text::Line::from(ratatui::text::Span::styled(
+                "This will undo the change hunk under the cursor on disk.",
+                Style::default().fg(Color::White),
+            )),
+            ratatui::text::Line::from(""),
+            ratatui::text::Line::from(ratatui::text::Span::styled(
+                truncate_for_display(&pr.rel_path, inner.width as usize),
+                Style::default().fg(Color::Rgb(0xeb, 0xcb, 0x8b)),
+            )),
+            ratatui::text::Line::from(""),
+            ratatui::text::Line::from(vec![
+                ratatui::text::Span::styled(
+                    "[Y]",
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                ),
+                ratatui::text::Span::raw("es, revert   "),
                 ratatui::text::Span::styled(
                     "[N]",
                     Style::default()
@@ -11040,6 +11120,20 @@ impl App {
                 }
                 KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                     self.cancel_pending_discard();
+                }
+                _ => {}
+            }
+            return Ok(());
+        }
+        // Modal layer: revert-hunk confirmation, same contract as the
+        // discard modal above.
+        if self.pending_revert_hunk.is_some() {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                    self.confirm_pending_revert_hunk();
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    self.cancel_pending_revert_hunk();
                 }
                 _ => {}
             }
@@ -13641,6 +13735,127 @@ impl App {
                 self.source_control.commit_feedback = Some(err);
                 self.source_control.commit_feedback_is_error = true;
             }
+        }
+    }
+
+    /// The workspace-relative path + single-hunk patch for the hunk under
+    /// the diff caret. Sets a status message and returns `None` when the
+    /// active tab isn't a working-tree diff or no hunk is at the cursor.
+    fn diff_hunk_patch_at_caret(&mut self) -> Option<(String, String)> {
+        let root = self.tree.root.clone();
+        let built = match self.editor.diff.as_ref() {
+            None => Err("Hunk actions work inside a Source Control diff"),
+            Some(diff) if diff.unified || diff.left_is_real_file => {
+                Err("Hunk actions need a working-tree diff from Source Control")
+            }
+            Some(diff) => match diff.right_path.strip_prefix(&root) {
+                Err(_) => Err("File is outside the workspace"),
+                Ok(rel) => {
+                    let rel = rel.to_string_lossy().to_string();
+                    match diff.hunk_range_at(diff.action_row()) {
+                        None => Err("No change hunk at the cursor"),
+                        Some(range) => {
+                            let patch = diff.hunk_patch(&rel, range);
+                            Ok((rel, patch))
+                        }
+                    }
+                }
+            },
+        };
+        match built {
+            Ok(pair) => Some(pair),
+            Err(msg) => {
+                self.status = msg.to_string();
+                None
+            }
+        }
+    }
+
+    /// Stage only the hunk under the diff caret (`git apply --cached`).
+    pub fn stage_hunk_at_caret(&mut self) {
+        let Some((rel, patch)) = self.diff_hunk_patch_at_caret() else {
+            return;
+        };
+        match crate::git::apply_patch(&self.tree.root, &patch, true, false) {
+            Ok(_) => {
+                self.status = format!("Staged hunk in {rel}");
+                self.refresh_after_hunk_op();
+            }
+            Err(err) => self.status = format!("Stage hunk failed: {err}"),
+        }
+    }
+
+    /// Remove only the hunk under the diff caret from the index
+    /// (`git apply --cached -R`). Errors surface verbatim, e.g. when the
+    /// hunk was never staged.
+    pub fn unstage_hunk_at_caret(&mut self) {
+        let Some((rel, patch)) = self.diff_hunk_patch_at_caret() else {
+            return;
+        };
+        match crate::git::apply_patch(&self.tree.root, &patch, true, true) {
+            Ok(_) => {
+                self.status = format!("Unstaged hunk in {rel}");
+                self.refresh_after_hunk_op();
+            }
+            Err(err) => self.status = format!("Unstage hunk failed: {err}"),
+        }
+    }
+
+    /// Arm the revert-hunk confirm popup for the hunk under the caret.
+    pub fn request_revert_hunk_at_caret(&mut self) {
+        if let Some((rel_path, patch)) = self.diff_hunk_patch_at_caret() {
+            self.pending_revert_hunk = Some(PendingRevertHunk { rel_path, patch });
+        }
+    }
+
+    pub fn confirm_pending_revert_hunk(&mut self) {
+        let Some(pr) = self.pending_revert_hunk.take() else {
+            return;
+        };
+        match crate::git::apply_patch(&self.tree.root, &pr.patch, false, true) {
+            Ok(_) => {
+                self.status = format!("Reverted hunk in {}", pr.rel_path);
+                self.refresh_after_hunk_op();
+                self.rebuild_open_scm_diff(&pr.rel_path);
+            }
+            Err(err) => self.status = format!("Revert hunk failed: {err}"),
+        }
+    }
+
+    pub fn cancel_pending_revert_hunk(&mut self) {
+        self.pending_revert_hunk = None;
+    }
+
+    fn refresh_after_hunk_op(&mut self) {
+        self.git.bypass_debounce();
+        self.refresh_git_status_debounced();
+        self.refresh_source_control();
+    }
+
+    /// Re-diff HEAD against the working tree after a revert so the open
+    /// diff pane shows the surviving hunks instead of stale rows. Stage /
+    /// unstage don't touch either side of the displayed diff, so only the
+    /// revert path needs this.
+    fn rebuild_open_scm_diff(&mut self, rel: &str) {
+        let root = self.tree.root.clone();
+        let (label, path, scroll) = {
+            let Some(diff) = self.editor.diff.as_ref() else {
+                return;
+            };
+            (diff.left_path.clone(), diff.right_path.clone(), diff.scroll)
+        };
+        let Ok(head) = crate::git::read_file_at_head(&root, rel) else {
+            return;
+        };
+        if self
+            .editor
+            .open_head_diff_with_text(label, &head, &path)
+            .is_ok()
+            && let Some(diff) = self.editor.diff.as_mut()
+        {
+            // Keep the viewport where the user was working instead of
+            // snapping back to the first hunk.
+            diff.scroll = scroll.min(diff.rows.len().saturating_sub(1));
         }
     }
 
@@ -17884,6 +18099,9 @@ impl App {
                 self.resolve_merge_at_cursor(crate::merge::Resolution::Incoming)
             }
             Cmd::MergeAcceptBoth => self.resolve_merge_at_cursor(crate::merge::Resolution::Both),
+            Cmd::StageHunk => self.stage_hunk_at_caret(),
+            Cmd::UnstageHunk => self.unstage_hunk_at_caret(),
+            Cmd::RevertHunk => self.request_revert_hunk_at_caret(),
             Cmd::ToggleFold => {
                 let row = self.editor.cursor_row;
                 self.editor.toggle_fold(row);
@@ -22466,6 +22684,29 @@ impl App {
         if matches!(key.code, KeyCode::Enter) {
             self.jump_to_diff_file_under_caret();
             return;
+        }
+        // Hunk actions on the change under the caret (VS Code's Stage /
+        // Unstage / Discard Selected Ranges, one keystroke each since the
+        // diff pane owns no text input). R is destructive and routes
+        // through the confirm popup.
+        if let KeyCode::Char(c) = key.code
+            && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT)
+        {
+            match c.to_ascii_lowercase() {
+                's' => {
+                    self.stage_hunk_at_caret();
+                    return;
+                }
+                'u' => {
+                    self.unstage_hunk_at_caret();
+                    return;
+                }
+                'r' => {
+                    self.request_revert_hunk_at_caret();
+                    return;
+                }
+                _ => {}
+            }
         }
         // Page = inner viewport rows minus the header + footer the diff
         // renderer reserves. Falls back to a sane default when the editor
