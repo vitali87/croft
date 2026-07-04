@@ -1770,6 +1770,15 @@ pub struct App {
     /// The file the TIMELINE has been fetched (or is being fetched) for, so the
     /// fetch fires exactly once per active-file change.
     timeline_fetched: Option<PathBuf>,
+    /// Off-thread per-line git blame for the active editor (GitLens-style
+    /// inline annotation). Fetched once per (file, HEAD) like the gutter.
+    blame_rx: std::sync::mpsc::Receiver<(PathBuf, Vec<crate::git::BlameLine>)>,
+    blame_tx: std::sync::mpsc::Sender<(PathBuf, Vec<crate::git::BlameLine>)>,
+    /// The file blame has been fetched (or is in flight) for; reset to `None`
+    /// on HEAD move so the annotation refreshes after a commit / checkout.
+    blame_fetched: Option<PathBuf>,
+    /// User pref: show the current-line inline blame annotation (default on).
+    inline_blame_enabled: bool,
     /// Background per-ecosystem dependency-resolution result for DEPENDENCIES.
     deps_rx: std::sync::mpsc::Receiver<Vec<Dependency>>,
     deps_tx: std::sync::mpsc::Sender<Vec<Dependency>>,
@@ -2847,6 +2856,7 @@ impl App {
         let explorer_views = ExplorerViewVisibility::from_prefs(loaded_prefs.explorer_views);
         let disabled_extensions = loaded_prefs.disabled_extensions.clone();
         let (timeline_tx, timeline_rx) = std::sync::mpsc::channel();
+        let (blame_tx, blame_rx) = std::sync::mpsc::channel();
         let (deps_tx, deps_rx) = std::sync::mpsc::channel();
         let (voice_tx, voice_rx) = std::sync::mpsc::channel();
         let editor = EditorTabs::new();
@@ -2919,6 +2929,10 @@ impl App {
             timeline_rx,
             timeline_tx,
             timeline_fetched: None,
+            blame_rx,
+            blame_tx,
+            blame_fetched: None,
+            inline_blame_enabled: !loaded_prefs.disable_inline_blame,
             deps_rx,
             deps_tx,
             deps_fetched: None,
@@ -4354,6 +4368,9 @@ impl App {
                 for ed in &mut self.editor.editors {
                     ed.git_baseline_for = None;
                 }
+                // Blame is dated against HEAD too; force a refetch so the
+                // annotation reflects the new commit.
+                self.blame_fetched = None;
             }
             self.refresh_scm_change_badge();
             // Keep the Explorer's greyed-out ignored rows in step with the
@@ -4828,6 +4845,58 @@ impl App {
                 .map(|text| text.lines().map(str::to_string).collect());
             ed.set_git_head_lines(path, head);
         }
+    }
+
+    /// Fetch per-line git blame for the active editor off-thread, once per
+    /// (file, HEAD). Mirrors the TIMELINE fetch: a marker gates the spawn so
+    /// it fires exactly once per active-file change, and a HEAD move resets
+    /// the marker (see the git-drain path) so blame refreshes after a commit.
+    /// Gated on the pref so a subprocess never runs when blame is off.
+    fn sync_blame(&mut self) {
+        self.editor.blame_enabled = self.inline_blame_enabled;
+        if !self.inline_blame_enabled {
+            return;
+        }
+        let Some(path) = self.editor.path.clone() else {
+            self.blame_fetched = None;
+            return;
+        };
+        if self.blame_fetched.as_deref() == Some(path.as_path()) {
+            return;
+        }
+        self.blame_fetched = Some(path.clone());
+        let root = self.tree.root.clone();
+        let Some(rel) = path
+            .strip_prefix(&root)
+            .ok()
+            .and_then(|r| r.to_str())
+            .map(String::from)
+        else {
+            // Outside the repo: no blame, but the marker is set so we don't
+            // respawn every tick.
+            self.editor.set_blame(path, None);
+            return;
+        };
+        let tx = self.blame_tx.clone();
+        std::thread::spawn(move || {
+            let blame = crate::git::blame(&root, &rel);
+            let _ = tx.send((path, blame));
+        });
+    }
+
+    /// Install any blame reply whose file is still the active editor. An
+    /// empty result (untracked file, git unavailable) clears the annotation.
+    /// Returns true when a reply landed so the frame redraws with it.
+    fn drain_blame(&mut self) -> bool {
+        let mut changed = false;
+        while let Ok((path, blame)) = self.blame_rx.try_recv() {
+            if self.editor.path.as_deref() == Some(path.as_path()) {
+                let data = if blame.is_empty() { None } else { Some(blame) };
+                self.editor.set_blame(path, data);
+                changed = true;
+            }
+        }
+        changed
     }
 
     /// Drain LSP completion responses. Drops responses with stale request
@@ -18299,6 +18368,7 @@ impl App {
             Cmd::FormatDocument => self.start_format_document(),
             Cmd::ToggleFormatOnSave => self.toggle_format_on_save(),
             Cmd::ToggleAutoSave => self.toggle_auto_save(),
+            Cmd::ToggleInlineBlame => self.toggle_inline_blame(),
             Cmd::QuickFix => self.start_code_action(),
             Cmd::ReplaceInFile => self.open_editor_replace(),
             Cmd::MergeAcceptCurrent => {
@@ -21476,6 +21546,24 @@ impl App {
         };
         if !cfg!(test) {
             let _ = crate::prefs::save_auto_save(self.auto_save);
+        }
+    }
+
+    fn toggle_inline_blame(&mut self) {
+        self.inline_blame_enabled = !self.inline_blame_enabled;
+        self.editor.blame_enabled = self.inline_blame_enabled;
+        // Re-enabling refetches (the sync marker was left set); disabling
+        // keeps the data so a later re-enable can be instant if unchanged.
+        if self.inline_blame_enabled {
+            self.blame_fetched = None;
+        }
+        self.status = if self.inline_blame_enabled {
+            String::from("Inline Blame: on")
+        } else {
+            String::from("Inline Blame: off")
+        };
+        if !cfg!(test) {
+            let _ = crate::prefs::save_inline_blame(self.inline_blame_enabled);
         }
     }
 
@@ -26588,6 +26676,8 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let update_changed = app.poll_update_watch();
         app.sync_lsp();
         app.sync_git_gutters();
+        app.sync_blame();
+        let blame_changed = app.drain_blame();
         // Request/refresh the OUTLINE for the active file (after sync_lsp so the
         // edit-seq it reads is current) and advance follow-cursor.
         let outline_sync_changed = app.sync_outline();
@@ -26676,6 +26766,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             || outline_changed
             || explorer_panels_changed
             || install_status_changed
+            || blame_changed
             || dap_changed;
         let pty_eligible = pty_pending
             && (app.peek_terminals_pending_bytes() <= PTY_SMALL_UPDATE_BYTES

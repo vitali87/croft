@@ -134,6 +134,12 @@ pub struct Prefs {
     /// default, matching VS Code.
     #[serde(default)]
     pub auto_save: bool,
+    /// Opt-out for the GitLens-style current-line inline blame annotation,
+    /// which is on by default. Stored as the disable flag (like
+    /// `suppress_terminal_warning`) so the derived `Default` and an older
+    /// config both mean "blame shown".
+    #[serde(default)]
+    pub disable_inline_blame: bool,
 }
 
 impl Prefs {
@@ -257,6 +263,13 @@ pub fn save_auto_save(enabled: bool) -> Result<()> {
     let path = config_path();
     let mut prefs = Prefs::load(&path).unwrap_or_default();
     prefs.auto_save = enabled;
+    prefs.save(&path)
+}
+
+pub fn save_inline_blame(enabled: bool) -> Result<()> {
+    let path = config_path();
+    let mut prefs = Prefs::load(&path).unwrap_or_default();
+    prefs.disable_inline_blame = !enabled;
     prefs.save(&path)
 }
 

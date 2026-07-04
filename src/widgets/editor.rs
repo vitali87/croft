@@ -1244,6 +1244,17 @@ pub struct Editor {
     /// The `edit_seq` `conflicts` was computed at; `u64::MAX` forces the
     /// first scan.
     conflicts_seq: u64,
+    /// Per-source-line git blame for the current file, index 0 = line 1. Set
+    /// by the app off-thread once per (file, HEAD); `None` until fetched or
+    /// when blame is disabled. Drives the GitLens-style current-line inline
+    /// annotation.
+    pub blame_lines: Option<Vec<crate::git::BlameLine>>,
+    /// The path `blame_lines` was fetched for; the app refetches when this
+    /// stops matching `path` so blame can never show another file's authors.
+    pub blame_for: Option<PathBuf>,
+    /// Whether to paint the current-line blame annotation (user pref, default
+    /// on). The blame data is still fetched so toggling is instant.
+    pub blame_enabled: bool,
     pub scroll: usize,
     /// In soft-wrap mode, the index of the first visible visual segment within
     /// the top logical line (`self.scroll`). Lets the viewport start partway
@@ -1463,6 +1474,9 @@ impl Editor {
             git_marks_seq: u64::MAX,
             conflicts: Vec::new(),
             conflicts_seq: u64::MAX,
+            blame_lines: None,
+            blame_for: None,
+            blame_enabled: true,
             scroll: 0,
             scroll_sub: 0,
             wrap_total_cache: Vec::new(),
@@ -1653,6 +1667,49 @@ impl Editor {
         self.git_baseline_for = Some(path);
         self.git_head_lines = head;
         self.git_marks_seq = u64::MAX;
+    }
+
+    /// Install (or clear) per-line git blame for `path`. The app fetches this
+    /// off-thread once per file and after HEAD moves.
+    pub fn set_blame(&mut self, path: PathBuf, blame: Option<Vec<crate::git::BlameLine>>) {
+        self.blame_for = Some(path);
+        self.blame_lines = blame;
+    }
+
+    /// The GitLens-style inline annotation for the cursor's line, or `None`
+    /// when blame is off, unavailable, or the line was edited past the blamed
+    /// range. Committed lines read `author, age • summary`; a line git blames
+    /// against the zero hash (a working-tree edit) reads `Uncommitted changes`.
+    pub fn current_line_blame_annotation(&self) -> Option<String> {
+        if !self.blame_enabled {
+            return None;
+        }
+        let blame = self.blame_lines.as_ref()?;
+        // A line the git gutter flags as added/modified diverges from HEAD, so
+        // its committed author is meaningless — show the uncommitted marker
+        // (this also covers unsaved edits, since the gutter recomputes per
+        // edit while `blame` is only refetched per file / HEAD change).
+        if matches!(
+            self.git_mark_at(self.cursor_row),
+            Some(GitMark::Added | GitMark::Modified)
+        ) {
+            return Some("Uncommitted changes".to_string());
+        }
+        // Insertions/deletions shift line indices out from under the blamed
+        // snapshot; only trust the 1:1 mapping while the line counts match.
+        if blame.len() != self.lines.len() {
+            return None;
+        }
+        let line = blame.get(self.cursor_row)?;
+        if line.uncommitted {
+            return Some("Uncommitted changes".to_string());
+        }
+        Some(format!(
+            "{}, {} • {}",
+            line.author,
+            crate::git::humanize_age(line.age_secs),
+            line.summary
+        ))
     }
 
     /// The buffer's merge-conflict blocks, rescanned only when the buffer
@@ -5935,6 +5992,32 @@ impl Widget for &mut Editor {
                 }
             }
 
+            // GitLens-style inline blame: a dim italic annotation trailing the
+            // cursor's line, on its last visual segment, in the focused editor
+            // only. Painted last so no overlay covers it, and clipped to the
+            // pane's right edge.
+            if self.focused
+                && line_idx == self.cursor_row
+                && row_end >= line_len
+                && let Some(note) = self.current_line_blame_annotation()
+            {
+                let text_cols = line_len.saturating_sub(row_start);
+                let start_x = text_x + text_cols as u16 + 2;
+                let right = inner.x + inner.width;
+                if start_x < right {
+                    let avail = (right - start_x) as usize;
+                    let shown: String = note.chars().take(avail).collect();
+                    buf.set_string(
+                        start_x,
+                        y,
+                        &shown,
+                        Style::default()
+                            .fg(self.theme.ignored_fg())
+                            .add_modifier(Modifier::ITALIC),
+                    );
+                }
+            }
+
             // The cursor itself is drawn by the host terminal as a hardware
             // caret (DECSCUSR `BlinkingBar`); App calls
             // `frame.set_cursor_position(...)` so the blink/overlay never
@@ -7536,6 +7619,77 @@ mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::NamedTempFile;
+
+    fn blame_line(
+        author: &str,
+        summary: &str,
+        age: i64,
+        uncommitted: bool,
+    ) -> crate::git::BlameLine {
+        crate::git::BlameLine {
+            short_hash: "abc12345".into(),
+            summary: summary.into(),
+            author: author.into(),
+            age_secs: age,
+            uncommitted,
+        }
+    }
+
+    #[test]
+    fn current_line_blame_annotation_reads_author_age_and_summary() {
+        let mut e = editor_with("one\ntwo\n");
+        e.set_blame(
+            PathBuf::from("f.rs"),
+            Some(vec![
+                blame_line("Vitali", "fix: the thing", 90, false),
+                blame_line("Alice", "feat: two", 7200, false),
+            ]),
+        );
+        e.cursor_row = 0;
+        assert_eq!(
+            e.current_line_blame_annotation().as_deref(),
+            Some("Vitali, 1 minute ago • fix: the thing")
+        );
+        e.cursor_row = 1;
+        assert_eq!(
+            e.current_line_blame_annotation().as_deref(),
+            Some("Alice, 2 hours ago • feat: two")
+        );
+    }
+
+    #[test]
+    fn current_line_blame_annotation_marks_uncommitted_lines() {
+        let mut e = editor_with("edited\n");
+        e.set_blame(
+            PathBuf::from("f.rs"),
+            Some(vec![blame_line("Not Committed Yet", "x", 0, true)]),
+        );
+        e.cursor_row = 0;
+        assert_eq!(
+            e.current_line_blame_annotation().as_deref(),
+            Some("Uncommitted changes")
+        );
+    }
+
+    #[test]
+    fn current_line_blame_annotation_is_none_when_disabled_or_unavailable() {
+        let mut e = editor_with("one\n");
+        // No blame fetched yet.
+        assert!(e.current_line_blame_annotation().is_none());
+        e.set_blame(
+            PathBuf::from("f.rs"),
+            Some(vec![blame_line("V", "s", 5, false)]),
+        );
+        e.blame_enabled = false;
+        assert!(
+            e.current_line_blame_annotation().is_none(),
+            "the toggle suppresses the annotation without dropping the data"
+        );
+        // A cursor past the blamed range (line added after the fetch) is safe.
+        e.blame_enabled = true;
+        e.cursor_row = 9;
+        assert!(e.current_line_blame_annotation().is_none());
+    }
 
     #[test]
     fn disabling_the_csv_viewer_opens_the_file_as_plain_text() {

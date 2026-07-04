@@ -7830,6 +7830,73 @@ fn editor_app_with_lines(lines: &[&str]) -> App {
 }
 
 #[test]
+fn inline_blame_annotation_paints_on_the_cursor_line() {
+    let tmp = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("m.rs");
+    std::fs::write(&f, "fn main() {}\nlet x = 1;\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&f).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.editor.cursor_row = 0;
+    app.editor.set_blame(
+        f.clone(),
+        Some(vec![
+            crate::git::BlameLine {
+                short_hash: "abc12345".into(),
+                summary: "init".into(),
+                author: "Vitali".into(),
+                age_secs: 3600,
+                uncommitted: false,
+            },
+            crate::git::BlameLine {
+                short_hash: "abc12345".into(),
+                summary: "add x".into(),
+                author: "Alice".into(),
+                age_secs: 60,
+                uncommitted: false,
+            },
+        ]),
+    );
+    let backend = ratatui::backend::TestBackend::new(120, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|frame| app.render(frame)).unwrap();
+    let buf = term.backend().buffer();
+    let mut whole = String::new();
+    for y in 0..30 {
+        for x in 0..120 {
+            whole.push_str(buf[(x, y)].symbol());
+        }
+        whole.push('\n');
+    }
+    assert!(
+        whole.contains("Vitali, 1 hour ago"),
+        "the cursor line's blame annotation must render; got:\n{whole}"
+    );
+    assert!(
+        !whole.contains("Alice"),
+        "only the cursor line is annotated, not every line"
+    );
+}
+
+#[test]
+fn toggle_inline_blame_command_flips_the_editor_flag_and_pref() {
+    let mut app = editor_app_with_lines(&["one", "two"]);
+    assert!(
+        app.inline_blame_enabled,
+        "inline blame is on by default (GitLens parity)"
+    );
+    app.run_command(crate::widgets::command_palette::Command::ToggleInlineBlame);
+    assert!(!app.inline_blame_enabled, "the command turns it off");
+    // sync_blame propagates the pref onto the active editor each tick.
+    app.sync_blame();
+    assert!(!app.editor.blame_enabled);
+    app.run_command(crate::widgets::command_palette::Command::ToggleInlineBlame);
+    assert!(app.inline_blame_enabled, "toggling again turns it back on");
+    app.sync_blame();
+    assert!(app.editor.blame_enabled);
+}
+
+#[test]
 fn editor_cmd_gg_jumps_to_top_of_file() {
     let mut app = editor_app_with_lines(&["a", "b", "c", "d"]);
     app.editor.cursor_row = 3;

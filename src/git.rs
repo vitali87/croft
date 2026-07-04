@@ -804,6 +804,85 @@ pub fn show_commit_file_diff(root: &Path, hash: &str, rel_path: &str) -> Result<
     diff_text(root, &["show", hash, "--", rel_path])
 }
 
+/// The commit that last touched one line, for GitLens-style inline blame.
+/// Lines not yet committed (staged or unstaged working-tree edits) blame
+/// against the all-zero hash, which [`parse_blame`] marks `uncommitted`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlameLine {
+    pub short_hash: String,
+    pub summary: String,
+    pub author: String,
+    /// Seconds since the commit's author-time, for [`humanize_age`].
+    pub age_secs: i64,
+    /// True for a not-yet-committed line (the zero hash `git blame` reports
+    /// for working-tree changes).
+    pub uncommitted: bool,
+}
+
+/// Per-line blame for `rel_path`, indexed 0-based by result position (result
+/// `[0]` is line 1). Uses `git blame --line-porcelain` so each line carries
+/// its author, author-time, and summary. Returns empty on any failure so the
+/// caller renders no annotation rather than an error.
+pub fn blame(root: &Path, rel_path: &str) -> Vec<BlameLine> {
+    let Some(path_str) = root.to_str() else {
+        return Vec::new();
+    };
+    let output = Command::new("git")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .args(["-C", path_str, "blame", "--line-porcelain", "--", rel_path])
+        .output();
+    let Ok(output) = output else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    parse_blame(
+        &String::from_utf8_lossy(&output.stdout),
+        current_unix_seconds(),
+    )
+}
+
+/// Parse `git blame --line-porcelain` output into one [`BlameLine`] per source
+/// line, in order. Porcelain groups each line as a header (`<hash> <orig>
+/// <final> [group]`) followed by `author`, `author-time`, `summary`, etc.,
+/// then a tab-prefixed content line. `now` (unix seconds) dates each line.
+pub fn parse_blame(out: &str, now: i64) -> Vec<BlameLine> {
+    let mut lines = Vec::new();
+    let mut hash: Option<String> = None;
+    let mut author = String::new();
+    let mut summary = String::new();
+    let mut author_time: i64 = now;
+    for raw in out.lines() {
+        if let Some(rest) = raw.strip_prefix("author ") {
+            author = rest.to_string();
+        } else if let Some(rest) = raw.strip_prefix("author-time ") {
+            author_time = rest.trim().parse().unwrap_or(now);
+        } else if let Some(rest) = raw.strip_prefix("summary ") {
+            summary = rest.to_string();
+        } else if raw.starts_with('\t') {
+            // The content line closes a group: emit the accumulated blame.
+            if let Some(full) = hash.take() {
+                let uncommitted = full.chars().all(|c| c == '0');
+                lines.push(BlameLine {
+                    short_hash: full.chars().take(8).collect(),
+                    summary: std::mem::take(&mut summary),
+                    author: std::mem::take(&mut author),
+                    age_secs: now - author_time,
+                    uncommitted,
+                });
+            }
+        } else if let Some(h) = raw.split(' ').next() {
+            // A header line begins with a 40-char hash; other porcelain
+            // metadata (previous/filename/committer/…) is ignored.
+            if h.len() == 40 && h.chars().all(|c| c.is_ascii_hexdigit()) {
+                hash = Some(h.to_string());
+            }
+        }
+    }
+    lines
+}
+
 /// Repo's default branch name. Tries `origin/HEAD` first (set by
 /// `git clone` / `git remote set-head -a origin`), then falls back to
 /// common local names (`main`, `master`, `develop`, `trunk`) by checking
@@ -2210,6 +2289,51 @@ mod tests {
             !hist.is_empty(),
             "a committed file must have at least one history entry"
         );
+    }
+
+    #[test]
+    fn parse_blame_groups_porcelain_into_one_entry_per_line() {
+        let now = 10_000i64;
+        // Two source lines: line 1 committed, line 2 an uncommitted edit
+        // (the all-zero hash git reports for working-tree changes).
+        let out = "\
+abcdef0123456789abcdef0123456789abcdef01 1 1 1
+author Vitali
+author-time 9996
+summary fix: the thing
+filename seed.txt
+\tone
+0000000000000000000000000000000000000000 2 2 1
+author Not Committed Yet
+author-time 9999
+summary Version of seed.txt from seed.txt
+filename seed.txt
+\ttwo
+";
+        let b = parse_blame(out, now);
+        assert_eq!(b.len(), 2, "one entry per source line");
+        assert_eq!(b[0].short_hash, "abcdef01");
+        assert_eq!(b[0].author, "Vitali");
+        assert_eq!(b[0].summary, "fix: the thing");
+        assert_eq!(b[0].age_secs, 4, "now (10000) minus author-time (9996)");
+        assert!(!b[0].uncommitted);
+        assert!(b[1].uncommitted, "the zero hash marks an uncommitted line");
+    }
+
+    #[test]
+    fn blame_returns_one_entry_per_committed_line() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        init_repo_with_commit(p);
+        // seed.txt is "one\ntwo\n" — two committed lines.
+        let b = blame(p, "seed.txt");
+        assert_eq!(b.len(), 2, "blame reports every source line");
+        assert_eq!(
+            b[0].author, "a",
+            "committed by init_repo_with_commit's user"
+        );
+        assert!(!b[0].uncommitted);
+        assert!(!b[0].short_hash.is_empty());
     }
 
     /// Stage a path so we can exercise `unstage_*` against a real index.

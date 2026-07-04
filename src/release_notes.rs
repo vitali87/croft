@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Feature,
-    summary: "Testing view run granularity: click a suite header to run the whole module, and Cmd+K Enter (or the palette's \"Testing: Run Test at Cursor\") runs the test the editor caret sits in.",
+    summary: "GitLens-style inline blame: a dim annotation trailing the cursor's line shows who last changed it, how long ago, and the commit summary, updating as you move. On by default; toggle with the palette's \"Git: Toggle Inline Blame\".",
 }];
