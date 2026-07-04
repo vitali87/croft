@@ -19,6 +19,9 @@ pub enum TestRequest {
     RunAll,
     /// Run a single test by its exact name (click-to-run from the tree).
     RunOne(String),
+    /// Run every test whose name contains the string (a suite, or run-at-cursor
+    /// by function name). cargo's name filter is a substring match.
+    RunFilter(String),
     Discover,
     /// Rebind the worker's working directory (Explorer re-root). Without it the
     /// worker keeps shelling cargo in the launch dir captured at spawn, so after
@@ -72,6 +75,10 @@ impl TestWorker {
         let _ = self.request_tx.send(TestRequest::RunOne(name));
     }
 
+    pub fn run_filter(&self, pattern: String) {
+        let _ = self.request_tx.send(TestRequest::RunFilter(pattern));
+    }
+
     pub fn discover(&self) {
         let _ = self.request_tx.send(TestRequest::Discover);
     }
@@ -112,6 +119,7 @@ fn worker_loop(mut root: PathBuf, rx: Receiver<TestRequest>, tx: Sender<TestResp
         match req {
             TestRequest::RunAll => run_all(&root, &tx),
             TestRequest::RunOne(name) => run_one(&root, &tx, &name),
+            TestRequest::RunFilter(pattern) => run_filter(&root, &tx, &pattern),
             TestRequest::Discover => discover(&root, &tx),
             TestRequest::SetRoot(p) => root = p,
         }
@@ -221,6 +229,16 @@ fn run_all(root: &Path, tx: &Sender<TestResponse>) {
 /// a single-test run doesn't wipe the discovered list.
 fn run_one(root: &Path, tx: &Sender<TestResponse>, name: &str) {
     let cmd = cargo_cmd(root, &["test", name, "--color=never", "--", "--exact"]);
+    let ok = run_streaming(tx, cmd, parse_test_line).unwrap_or(false);
+    let _ = tx.send(TestResponse::Finished { ok: Some(ok) });
+}
+
+/// Run every test matching a name substring: `cargo test <pattern> --no-fail-fast`
+/// (no `--exact`, so it selects a whole suite / all fns sharing the name). Like
+/// [`run_one`], the app has already marked the affected cases and shown the busy
+/// state, so no `Started` is sent.
+fn run_filter(root: &Path, tx: &Sender<TestResponse>, pattern: &str) {
+    let cmd = cargo_cmd(root, &["test", pattern, "--no-fail-fast", "--color=never"]);
     let ok = run_streaming(tx, cmd, parse_test_line).unwrap_or(false);
     let _ = tx.send(TestResponse::Finished { ok: Some(ok) });
 }

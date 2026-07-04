@@ -62,6 +62,35 @@ pub fn find_test_source(root: &Path, full_name: &str) -> Option<(PathBuf, u32)> 
     best.map(|(p, l, _)| (p, l))
 }
 
+/// The name of the nearest `fn` at or above `cursor_row` — the test the caret
+/// sits in, for run-at-cursor. Scans upward and returns the first `fn <ident>`
+/// it finds. `None` if the caret is above every function.
+pub fn enclosing_fn_name(lines: &[String], cursor_row: usize) -> Option<String> {
+    let start = cursor_row.min(lines.len().saturating_sub(1));
+    for line in lines[..=start].iter().rev() {
+        if let Some(name) = fn_name_in(line) {
+            return Some(name);
+        }
+    }
+    None
+}
+
+/// Extract the identifier after `fn ` in a single line, or `None`. Deliberately
+/// simple: it does not skip `fn` inside comments or strings, which is a rare
+/// enough case for a run-at-cursor convenience that it isn't worth a parser.
+fn fn_name_in(line: &str) -> Option<String> {
+    let after = line.split("fn ").nth(1)?;
+    let name: String = after
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_')
+        .collect();
+    // `fn ` must be a keyword boundary (preceded by start/whitespace), and the
+    // name non-empty — guards against `define_fn foo` style false hits.
+    let before = &line[..line.find("fn ")?];
+    let boundary = before.is_empty() || before.ends_with(|c: char| c.is_whitespace());
+    (boundary && !name.is_empty()).then_some(name)
+}
+
 /// How many module segments appear as components of `path` — the more, the more
 /// likely this file defines the test (disambiguates same-named fns).
 fn path_score(path: &Path, module: &[&str]) -> usize {
@@ -109,6 +138,31 @@ mod tests {
             "the module-matching file wins over the decoy, got {path:?}"
         );
         assert_eq!(line, 2, "0-based line of `fn target_test` in testing.rs");
+    }
+
+    #[test]
+    fn enclosing_fn_scans_upward_to_the_nearest_fn() {
+        let lines: Vec<String> = [
+            "mod tests {",
+            "    fn first() {",
+            "        assert!(true);", // cursor here -> first
+            "    }",
+            "    fn second() {",
+            "        assert!(false);", // cursor here -> second
+            "    }",
+            "}",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+
+        assert_eq!(enclosing_fn_name(&lines, 2).as_deref(), Some("first"));
+        assert_eq!(enclosing_fn_name(&lines, 5).as_deref(), Some("second"));
+        // Above every fn: nothing to run.
+        assert_eq!(enclosing_fn_name(&lines, 0), None);
+        // A word merely ending in "fn" is not a keyword boundary.
+        let noise = vec![String::from("let define_fn_thing = 3;")];
+        assert_eq!(enclosing_fn_name(&noise, 0), None);
     }
 
     #[test]

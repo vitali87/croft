@@ -10910,6 +10910,13 @@ impl App {
                 self.open_testing_view();
                 true
             }
+            // Cmd+K Enter: run the test the editor caret sits in. Enter already
+            // means "run" in the Testing view (runs all), so it carries over as
+            // the run verb under the Cmd+K leader (no new terminal registration).
+            KeyCode::Enter => {
+                self.run_test_at_cursor();
+                true
+            }
             // Cmd+K Cmd+0 / Cmd+K 0: collapse every fold (VS Code "Fold All").
             KeyCode::Char('0') if plain => {
                 self.editor.fold_all();
@@ -11759,6 +11766,37 @@ impl App {
             Some((path, line)) => self.go_to_definition(path, line, 0),
             None => self.status = format!("No source found for test {name}"),
         }
+    }
+
+    /// Run every test in a suite (click on its header in the tree). The suite
+    /// name is a prefix of its tests' names, so cargo's substring filter runs
+    /// exactly that module.
+    fn run_suite(&mut self, suite: String) {
+        if self.testing.is_busy() {
+            return;
+        }
+        self.testing.start_filter(&suite);
+        self.test_worker.run_filter(suite);
+        self.set_sidebar_view(SidebarView::Testing);
+    }
+
+    /// Run the test the editor caret sits in (Cmd+K Enter / palette). Finds the
+    /// enclosing `fn` and runs it by name substring; results stream into the
+    /// Testing view like any other run.
+    fn run_test_at_cursor(&mut self) {
+        let Some(name) =
+            crate::testing::locate::enclosing_fn_name(&self.editor.lines, self.editor.cursor_row)
+        else {
+            self.status = String::from("Run Test at Cursor: no function at the caret");
+            return;
+        };
+        if self.testing.is_busy() {
+            return;
+        }
+        self.testing.start_filter(&name);
+        self.test_worker.run_filter(name.clone());
+        self.set_sidebar_view(SidebarView::Testing);
+        self.status = format!("Running test {name}");
     }
 
     /// List tests without running them (populate the tree). No-op while busy or
@@ -18304,6 +18342,7 @@ impl App {
             Cmd::ShowRemote => self.set_sidebar_view(SidebarView::Remote),
             Cmd::ShowExtensions => self.set_sidebar_view(SidebarView::Extensions),
             Cmd::ShowTesting => self.open_testing_view(),
+            Cmd::RunTestAtCursor => self.run_test_at_cursor(),
             Cmd::ToggleSideBar => self.show_tree = !self.show_tree,
             Cmd::ToggleSecondarySideBar => self.toggle_secondary_side_bar(),
             Cmd::ToggleZenMode => self.toggle_zen_mode(),
@@ -20659,6 +20698,8 @@ impl App {
                         } else {
                             self.run_test(name);
                         }
+                    } else if let Some(suite) = self.testing.suite_at(m.row) {
+                        self.run_suite(suite);
                     }
                     return;
                 }

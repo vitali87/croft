@@ -110,6 +110,20 @@ impl TestingPanel {
         });
     }
 
+    /// Begin a filtered run (a suite, or a run-at-cursor by leaf name): mark
+    /// every known case whose name contains `pattern` as Running and enter the
+    /// busy state, keeping the rest of the tree. cargo's name filter is a
+    /// substring match, so the same `pattern` selects the same set.
+    pub fn start_filter(&mut self, pattern: &str) {
+        self.activity = Activity::Running;
+        self.progress = None;
+        for c in &mut self.cases {
+            if c.name.contains(pattern) {
+                c.status = TestStatus::Running;
+            }
+        }
+    }
+
     /// Apply one streamed result: update the matching case in place, or insert
     /// it (kept sorted by name so the tree is stable).
     pub fn apply_case(&mut self, case: TestCase) {
@@ -209,6 +223,19 @@ impl TestingPanel {
         match self.rows.get(self.scroll + shown)? {
             RenderRow::Case(idx) => Some(self.cases[*idx].name.clone()),
             RenderRow::Header(_) => None,
+        }
+    }
+
+    /// The suite name at screen row `y`, if that row is a suite header. Used to
+    /// run a whole suite by clicking its header.
+    pub fn suite_at(&self, y: u16) -> Option<String> {
+        if y < self.first_row_y {
+            return None;
+        }
+        let shown = (y - self.first_row_y) as usize;
+        match self.rows.get(self.scroll + shown)? {
+            RenderRow::Header(idx) => self.cases[*idx].suite_and_leaf().0.map(str::to_string),
+            RenderRow::Case(_) => None,
         }
     }
 
@@ -456,5 +483,31 @@ mod tests {
         assert_eq!(p.cases.len(), 3, "the rest of the tree is preserved");
         let b = p.cases.iter().find(|c| c.name == "m::b").unwrap();
         assert_eq!(b.status, TestStatus::Running, "only the target is Running");
+    }
+
+    #[test]
+    fn start_filter_marks_the_whole_suite_running_and_leaves_others() {
+        let mut p = TestingPanel::new();
+        p.on_busy_started(Activity::Running);
+        for n in ["suite_a::one", "suite_a::two", "suite_b::three"] {
+            p.apply_case(TestCase {
+                name: n.into(),
+                status: TestStatus::Passed,
+            });
+        }
+        p.on_finished(Some(true));
+
+        p.start_filter("suite_a");
+
+        assert!(p.is_busy());
+        let running: Vec<&str> = p
+            .cases
+            .iter()
+            .filter(|c| c.status == TestStatus::Running)
+            .map(|c| c.name.as_str())
+            .collect();
+        assert_eq!(running, ["suite_a::one", "suite_a::two"]);
+        let other = p.cases.iter().find(|c| c.name == "suite_b::three").unwrap();
+        assert_eq!(other.status, TestStatus::Passed, "other suites untouched");
     }
 }

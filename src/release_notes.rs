@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Feature,
-    summary: "Cmd/Opt+click a test in the Testing view to jump to its source: since cargo's test list carries no location, croft greps the workspace for the test's fn and ranks matches by module path. Plain click still runs the test.",
+    summary: "Testing view run granularity: click a suite header to run the whole module, and Cmd+K Enter (or the palette's \"Testing: Run Test at Cursor\") runs the test the editor caret sits in.",
 }];
