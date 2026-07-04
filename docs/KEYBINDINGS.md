@@ -50,7 +50,7 @@ On macOS, the `Cmd` chords below only reach croft after you run a one-time setup
 | `Cmd+K` `O` | Copy into New Window: open the active file in a new window of your terminal, focused on just the file (Explorer + terminal hidden; the current window is untouched; Ghostty / iTerm2 / Terminal; macOS only) |
 | `Cmd+K` `Shift+O` | Move into New Window: same, and close the file's tab here (macOS only) |
 | `Cmd+K` `Z` | Toggle Zen Mode: hide the activity bar, both side bars, the panel, and the status bar; press again to restore exactly what was shown before |
-| `Cmd+K` `B` | Show the Testing view (beaker icon); it discovers tests on first open. In the view: Enter runs all tests, `r` re-discovers, click a test to run just it, ↑/↓ scroll or drag the scrollbar |
+| `Cmd+K` `B` | Show the Testing view (beaker icon); it discovers tests on first open. In the view: Enter runs all tests, `r` re-discovers, click a test to run just it, Cmd/Opt+click a test to jump to its source, ↑/↓ scroll or drag the scrollbar |
 | `Cmd+K` `M` | Maximize the active terminal pane across the panel width (the other terminals move to a right-edge rail); press again to restore the even split |
 | `Cmd+K` `F` | Toggle Format on Save: when on, `Cmd+S` reformats through the language server before writing (also in the Command Palette) |
 | `Cmd+K` `Cmd+L` | Toggle the code fold at the cursor: collapse the enclosing indented block (function, loop, struct) to its header line, or re-expand it |

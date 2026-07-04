@@ -11752,6 +11752,15 @@ impl App {
         self.set_sidebar_view(SidebarView::Testing);
     }
 
+    /// Jump the editor to a test's `fn` definition (Cmd/Opt+click in the tree).
+    /// `--list` carries no location, so we grep the source for the function.
+    fn jump_to_test_source(&mut self, name: String) {
+        match crate::testing::locate::find_test_source(&self.workspace_root, &name) {
+            Some((path, line)) => self.go_to_definition(path, line, 0),
+            None => self.status = format!("No source found for test {name}"),
+        }
+    }
+
     /// List tests without running them (populate the tree). No-op while busy or
     /// outside a Cargo project — `cargo test -- --list` would error with no
     /// manifest, and it compiles the test binary so we never auto-fire it
@@ -20637,13 +20646,19 @@ impl App {
                 }
                 if in_tree && self.sidebar_view == SidebarView::Testing {
                     self.focus_pane(Pane::Tree);
-                    // The scrollbar lane starts a thumb drag; a test row runs
-                    // just that test (suite headers and empty space do nothing).
+                    // The scrollbar lane starts a thumb drag; a plain click on a
+                    // test row runs it; Cmd/Opt+click (arrives as ALT here, like
+                    // go-to-definition) jumps to the test's source instead.
+                    // Suite headers and empty space do nothing.
                     if rect_contains(self.testing.last_scrollbar, m.column, m.row) {
                         self.testing.scroll_to_bar_y(m.row);
                         self.testing_scrollbar_drag = true;
                     } else if let Some(name) = self.testing.case_name_at(m.row) {
-                        self.run_test(name);
+                        if m.modifiers.contains(KeyModifiers::ALT) {
+                            self.jump_to_test_source(name);
+                        } else {
+                            self.run_test(name);
+                        }
                     }
                     return;
                 }

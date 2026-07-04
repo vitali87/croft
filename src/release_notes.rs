@@ -59,13 +59,7 @@ pub struct ReleaseNote {
 }
 
 /// What shipped in the current release. Replace on every version bump.
-pub const RELEASE_NOTES: &[ReleaseNote] = &[
-    ReleaseNote {
-        kind: NoteKind::Feature,
-        summary: "Click any test in the Testing view to run just that test; the compile now shows live cargo progress instead of a frozen \"Discovering tests\", the scrollbar drags, and long names no longer spill past the panel border.",
-    },
-    ReleaseNote {
-        kind: NoteKind::Fix,
-        summary: "The Testing view follows the Explorer root: after a Make Root into a child repo the test runner rebinds to the new directory instead of the launch dir, so discovery finds Cargo.toml and the tree populates.",
-    },
-];
+pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
+    kind: NoteKind::Feature,
+    summary: "Cmd/Opt+click a test in the Testing view to jump to its source: since cargo's test list carries no location, croft greps the workspace for the test's fn and ranks matches by module path. Plain click still runs the test.",
+}];
