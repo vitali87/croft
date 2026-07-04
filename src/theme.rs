@@ -83,10 +83,18 @@ impl Theme {
                 .iter()
                 .map(|s| s.to_string())
                 .collect();
-            sources.extend(crate::lsp::manifest::read_extension_sources(
-                &crate::lsp::manifest::user_extensions_dir(),
-            ));
-            let disabled = crate::prefs::Prefs::load_or_default().disabled_extensions;
+            // Under test the registry must be hermetic: reading the developer's
+            // real ~/.config/croft (user extensions + disabled set) made this
+            // process-wide cache depend on machine state and on which test
+            // touched it first. Tests see only the bundled themes.
+            let disabled = if cfg!(test) {
+                std::collections::BTreeSet::new()
+            } else {
+                sources.extend(crate::lsp::manifest::read_extension_sources(
+                    &crate::lsp::manifest::user_extensions_dir(),
+                ));
+                crate::prefs::Prefs::load_or_default().disabled_extensions
+            };
             let themes: Vec<Theme> = sources
                 .iter()
                 .filter_map(|s| crate::lsp::manifest::parse(s).ok())

@@ -136,6 +136,12 @@ pub struct PtyTerminal {
     /// and both paths funnel through this mutex.
     writer: Arc<std::sync::Mutex<Box<dyn Write + Send>>>,
     _child: Box<dyn portable_pty::Child + Send + Sync>,
+    /// The PTY reader thread's handle, joined in `Drop` after the child is
+    /// killed so a dropped terminal never leaves a live shell + blocked
+    /// reader behind. Across the test suite that leak piled up into resource
+    /// pressure that broke timing-sensitive tests; production drops (closing
+    /// a pane) leaked the same way.
+    reader_thread: Option<std::thread::JoinHandle<()>>,
     /// The interactive shell's pid, captured at spawn. A shell at its
     /// prompt is its own foreground process-group leader, so this is the
     /// value `foreground_is_shell` compares `tcgetpgrp(master)` against.
@@ -347,7 +353,7 @@ impl PtyTerminal {
 
         let script_mode = run_label.is_some();
 
-        std::thread::spawn(move || {
+        let reader_thread = std::thread::spawn(move || {
             let mut processor = Processor::<StdSyncHandler>::new();
             let mut port_sniffer = crate::port_detect::PortSniffer::new();
             let mut buf = [0u8; 65536];
@@ -384,6 +390,7 @@ impl PtyTerminal {
             master: pair.master,
             writer,
             _child: child,
+            reader_thread: Some(reader_thread),
             shell_pid,
             cols,
             rows,
@@ -720,6 +727,21 @@ impl PtyTerminal {
         let size = TermSize::new(cols as usize, rows as usize);
         term.resize(size);
         self.pty_dirty.store(true, Ordering::Release);
+    }
+}
+
+impl Drop for PtyTerminal {
+    fn drop(&mut self) {
+        // Kill the shell so its slave fd closes; the reader thread's blocked
+        // `read` then returns EOF and the thread exits, which we join here.
+        // Without this a dropped terminal (a closed pane, or every terminal
+        // an App test creates) leaves a live shell process and a parked
+        // reader thread behind. The responder thread ends on its own once
+        // `self.term` (holding its channel sender) drops with this struct.
+        let _ = self._child.kill();
+        if let Some(handle) = self.reader_thread.take() {
+            let _ = handle.join();
+        }
     }
 }
 

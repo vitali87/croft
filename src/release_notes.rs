@@ -60,6 +60,6 @@ pub struct ReleaseNote {
 
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
-    kind: NoteKind::Feature,
-    summary: "Local history: every save is snapshotted, and the Explorer's TIMELINE now lists those snapshots beside git commits. Click one to diff it against your working file, and \"Local History: Restore Snapshot\" in the palette writes it back, so a version is recoverable even when it was never committed.",
+    kind: NoteKind::Fix,
+    summary: "Closing a terminal pane now kills its shell and joins its reader thread instead of leaking both; the process/thread pileup that leak caused also destabilized the test suite, which now passes fully in parallel.",
 }];
