@@ -2025,6 +2025,11 @@ pub struct App {
     /// Armed by R in a Source-Control diff; reverting a hunk destroys
     /// uncommitted work, so the confirm modal always runs first.
     pending_revert_hunk: Option<PendingRevertHunk>,
+    /// The tasks backing the open Run Task picker; the picker row `id`
+    /// indexes into this list.
+    run_tasks: Vec<crate::tasks::Task>,
+    /// The most recently run task, for "Tasks: Rerun Last Task".
+    last_task: Option<crate::tasks::Task>,
     /// Set on startup (after `init_graphics` resolves the inline-image
     /// protocol) when the host terminal can't render croft's icons/images
     /// and the user hasn't silenced the nudge. Drawn as a dismissible modal
@@ -3015,6 +3020,8 @@ impl App {
             pending_local_open: None,
             pending_discard: None,
             pending_revert_hunk: None,
+            run_tasks: Vec::new(),
+            last_task: None,
             pending_terminal_warning: false,
             commit_menu_open: false,
             default_branch_label: None,
@@ -11202,6 +11209,10 @@ impl App {
             self.focus_pane(Pane::Terminal);
             return Ok(());
         }
+        if is_run_build_task_key(key) {
+            self.run_build_task();
+            return Ok(());
+        }
         // Explorer-pane shortcuts get first refusal so Cmd+Shift+F creates
         // a folder when the user is browsing the tree, rather than always
         // jumping to Search. Outside Explorer the global Search-jump wins.
@@ -13533,6 +13544,86 @@ impl App {
                 }
                 self.pending_code_actions.clear();
             }
+            ListPurpose::RunTask => {
+                if let Some(task) = self.run_tasks.get(index).cloned() {
+                    self.run_project_task(task);
+                }
+            }
+        }
+    }
+
+    /// Tasks: Run Task — discover the workspace's tasks and open the
+    /// picker over them.
+    pub fn open_run_task_picker(&mut self) {
+        self.run_tasks = crate::tasks::discover_tasks(&self.workspace_root);
+        let rows: Vec<crate::widgets::list_picker::ListRow> = self
+            .run_tasks
+            .iter()
+            .enumerate()
+            .map(|(i, t)| crate::widgets::list_picker::ListRow {
+                id: i.to_string(),
+                label: format!("{} — {}", t.label, t.source),
+            })
+            .collect();
+        self.open_list_picker(
+            crate::widgets::list_picker::ListPicker::new(
+                crate::widgets::list_picker::ListPurpose::RunTask,
+                "Run Task",
+                rows,
+            ),
+            "No tasks found (Makefile, justfile, package.json, Cargo.toml, pyproject.toml, .vscode/tasks.json)",
+        );
+    }
+
+    /// Run `task` in its own named terminal pane. Rerunning a task whose
+    /// pane sits idle at a prompt writes the command into that pane
+    /// instead of stacking a new one; a busy pane gets a fresh sibling.
+    pub fn run_project_task(&mut self, task: crate::tasks::Task) {
+        let pane_name = format!("Task: {}", task.label);
+        let command = format!("{}\r", task.command);
+        self.last_task = Some(task.clone());
+        if let Some(idx) = self.terminals.iter().position(|t| t.label() == pane_name)
+            && self.terminals[idx].foreground_is_shell()
+        {
+            self.active_terminal = idx;
+            self.terminals[idx].write_input(command.as_bytes());
+            self.show_terminal = true;
+            self.focus_pane(Pane::Terminal);
+            self.status = format!("Running {}", task.label);
+            return;
+        }
+        match crate::widgets::terminal::PtyTerminal::new(&self.workspace_root) {
+            Ok(mut term) => {
+                term.set_manual_name(Some(pane_name));
+                term.write_input(command.as_bytes());
+                self.insert_terminal(term);
+                self.status = format!("Running {}", task.label);
+            }
+            Err(e) => {
+                self.status = format!("Could not start task pane: {e}");
+            }
+        }
+    }
+
+    /// Tasks: Run Build Task (`Cmd+Shift+B`) — run the conventional build
+    /// for whatever the workspace is; fall back to the picker when no
+    /// manifest declares one.
+    pub fn run_build_task(&mut self) {
+        let tasks = crate::tasks::discover_tasks(&self.workspace_root);
+        match crate::tasks::default_build_task(&tasks).cloned() {
+            Some(task) => self.run_project_task(task),
+            None => {
+                self.open_run_task_picker();
+                self.status = "No build task detected; pick one".to_string();
+            }
+        }
+    }
+
+    /// Tasks: Rerun Last Task.
+    pub fn rerun_last_task(&mut self) {
+        match self.last_task.clone() {
+            Some(task) => self.run_project_task(task),
+            None => self.status = "No task has run yet".to_string(),
         }
     }
 
@@ -18214,6 +18305,9 @@ impl App {
             Cmd::ToggleRaisedExceptions => self.debug_toggle_raised_exceptions(),
             Cmd::AttachPythonProcess => self.open_attach_python_picker(),
             Cmd::ColorTheme => self.open_theme_picker(),
+            Cmd::RunTask => self.open_run_task_picker(),
+            Cmd::RunBuildTask => self.run_build_task(),
+            Cmd::RerunLastTask => self.rerun_last_task(),
             Cmd::KeyboardShortcuts => self.open_shortcuts_modal(),
         }
     }
@@ -23990,6 +24084,14 @@ fn is_extensions_jump_key(key: KeyEvent) -> bool {
 
 fn is_drop_to_local_key(key: KeyEvent) -> bool {
     is_cmd_shift_letter(key, 'l')
+}
+
+/// `Ctrl/Cmd+Shift+B`: run the project's auto-detected build task, VS
+/// Code's "Tasks: Run Build Task" chord. iTerm2 binds the same chord to
+/// "Show Toolbelt" — `setup-iterm2` relocates that menu item to
+/// Cmd+Ctrl+B so this chord reaches croft.
+fn is_run_build_task_key(key: KeyEvent) -> bool {
+    is_cmd_shift_letter(key, 'b')
 }
 
 fn is_cmd_shift_letter(key: KeyEvent, letter: char) -> bool {

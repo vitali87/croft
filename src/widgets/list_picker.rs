@@ -31,6 +31,10 @@ pub enum ListPurpose {
     /// Merge-conflict resolution: the rows are Accept Current / Incoming /
     /// Both for the conflict block at the cursor; `id` names the resolution.
     MergeConflict,
+    /// Auto-detected project tasks (Tasks: Run Task): the rows are the
+    /// commands discovered from the workspace's manifests; `id` is an
+    /// index into the App's discovered-task list.
+    RunTask,
 }
 
 /// One selectable row: a stable `id` the App acts on (a stash index, a

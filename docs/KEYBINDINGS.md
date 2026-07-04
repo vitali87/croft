@@ -24,6 +24,7 @@ On macOS, the `Cmd` chords below only reach croft after you run a one-time setup
 | `Ctrl+Shift+e` / `Cmd+Shift+e` | Jump to the Explorer sidebar |
 | `Ctrl+Shift+f` / `Cmd+Shift+f` | Jump to the Search sidebar |
 | `Ctrl+Shift+s` / `Cmd+Shift+s` | Jump to Source Control |
+| `Ctrl+Shift+b` / `Cmd+Shift+b` | Run the project's build task in a named terminal pane, auto-detected from its manifests (`.vscode/tasks.json`, Makefile, justfile, package.json, Cargo.toml, pyproject.toml). "Tasks: Run Task" and "Tasks: Rerun Last Task" live in the Command Palette |
 | `Ctrl+Shift+d` / `Cmd+Shift+d` | Jump to Run and Debug |
 | `Ctrl+Shift+r` / `Cmd+Shift+r` | Jump to Remote (SSH) |
 | `Ctrl+Shift+x` / `Cmd+Shift+x` | Jump to Extensions |
@@ -367,6 +368,7 @@ The PORTS tab in the bottom panel group lists the loopback ports croft has notic
 | `⌥⌘↑` / `⌥⌘↓` | Add a cursor above / below (multi-cursor) |
 | `⌘⇧E` / `⌘⇧F` / `⌘⇧S` / `⌘⇧D` / `⌘⇧R` / `⌘⇧X` | Jump to Explorer / Search / Source Control / Run and Debug / Remote / Extensions |
 | `⌘⇧L` | Disconnect a remote session |
+| `⌘⇧B` | Run the project's build task (auto-detected); iTerm2's View ▸ Show Toolbelt is relocated to `⌃⌘B` |
 | `⌘⇧N` | Explorer "New folder" prompt |
 | `⌃⇧J` | Maximize the terminal pane |
 | `⌥⌘R` | Reveal in Finder: the selected Explorer entry, or the active editor file when the editor is focused (local macOS only) |

@@ -38,6 +38,7 @@ src/
 ├── remote_connect.rs    interactive SSH connect flow (host + password prompt phases) behind the connect dialog
 ├── session_state.rs     captures open tabs / layout so a self-update re-exec can restore them
 ├── sheet.rs             CSV / TSV / XLSX / XLS / XLSB / ODS parsing via the csv and calamine crates
+├── tasks.rs             auto-detected project tasks: reads the manifests the repo already has (.vscode/tasks.json with JSONC tolerated, Makefile, justfile, package.json + lockfile-matched runner, Cargo.toml, pyproject.toml) into runnable Task commands; backs "Tasks: Run Task" and the Cmd+Shift+B default build, each running in a named reused terminal pane
 ├── termux.rs            Termux font auto-install: downloads Meslo Nerd Font Mono into ~/.termux/font.ttf (background, no-clobber) so the activity-bar codicon glyphs render
 ├── theme.rs             IDE color theme: a `Theme` is a palette (background, accent, selection, button, gradient flag, OSK colors) loaded as data from `[[themes]]` blocks in bundled + user extension manifests (Croft Black/Dark ship in assets/extensions/themes/, baked in); `Theme::BLACK` is a const fallback so croft is never themeless. Drives SetColors + baked-image fills
 ├── update_watch.rs      remote self-update: watch for a newer binary installed under a running remote croft

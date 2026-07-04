@@ -28,6 +28,8 @@ The editor brings tree-sitter highlighting, inline previews for images / PDFs / 
 
 Source Control mirrors VS Code's git flow: stage, unstage, and discard per file or in bulk, commit / amend / push / pull / sync, branches, stashes, and tags, with clickable change rows opening a side-by-side diff against HEAD. Inside that diff, single keys act on the change hunk under the cursor: `S` stages just that hunk, `U` unstages it, and `R` reverts it after a confirm, so one messy working tree becomes several focused commits without leaving the editor.
 
+A task runner with zero configuration: `Cmd`/`Ctrl`+`Shift`+`B` runs the project's build task, auto-detected from the manifests the repo already has (Makefile, justfile, package.json with the right lockfile runner, Cargo.toml, pyproject.toml, and `.vscode/tasks.json` when present). "Tasks: Run Task" in the palette lists everything discovered; each task runs in its own named terminal pane, and rerunning reuses that pane.
+
 The status bar mirrors VS Code's: branch and ahead/behind, error/warning counts (click to open Problems) and the active language server on the left; cursor position, indentation, encoding, line ending, and language mode on the right. Click the encoding, line ending, or language segment to change it (reopen with a different encoding, switch LF/CRLF, or override the language mode).
 
 See **[LAYOUT.md](docs/LAYOUT.md)** for the full pane-by-pane reference, debugging workflow, and language-server setup.

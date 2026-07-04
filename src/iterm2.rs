@@ -196,6 +196,15 @@ const CMD_SHIFT_T_HEX: &str = "0x1b 0x5b 0x38 0x34 0x3b 0x31 0x30 0x75";
 /// (modifier byte 10 = 1 base + Shift(1) + Super(8)).
 const CMD_SHIFT_K_KEY: &str = "0x4b-0x120000-0x28";
 const CMD_SHIFT_K_HEX: &str = "0x1b 0x5b 0x37 0x35 0x3b 0x31 0x30 0x75";
+/// `Cmd+Shift+B` — Tasks: Run Build Task (VS Code's binding, croft's
+/// `is_run_build_task_key`). iTerm2 binds the same chord to the "Show
+/// Toolbelt" menu item (MainMenu.xib id 1297: keyEquivalent="B", default
+/// command mask); the NSUserKeyEquivalents override below relocates it to
+/// Cmd+Ctrl+B so this forwarder wins. Codepoint 'B' (0x42 = 66),
+/// virtualKeyCode `kVK_ANSI_B` = 0x0b. CSI-u `ESC [ 66 ; 10 u`
+/// (modifier byte 10 = 1 base + Shift(1) + Super(8)).
+const CMD_SHIFT_B_KEY: &str = "0x42-0x120000-0xb";
+const CMD_SHIFT_B_HEX: &str = "0x1b 0x5b 0x36 0x36 0x3b 0x31 0x30 0x75";
 /// `Cmd+T` — open another terminal next to the active one (croft's
 /// `is_terminal_split_key`). iTerm2 binds the bare chord to the "New Tab"
 /// menu item (MainMenu.xib: `keyEquivalent="t"`); the NSUserKeyEquivalents
@@ -526,6 +535,7 @@ pub(crate) mod payloads {
     pub(crate) const CMD_R_HEX: &str = super::CMD_R_HEX;
     pub(crate) const CMD_RBRACKET_HEX: &str = super::CMD_RBRACKET_HEX;
     pub(crate) const CMD_S_HEX: &str = super::CMD_S_HEX;
+    pub(crate) const CMD_SHIFT_B_HEX: &str = super::CMD_SHIFT_B_HEX;
     pub(crate) const CMD_SHIFT_D_HEX: &str = super::CMD_SHIFT_D_HEX;
     pub(crate) const CMD_SHIFT_E_HEX: &str = super::CMD_SHIFT_E_HEX;
     pub(crate) const CMD_SHIFT_ENTER_HEX: &str = super::CMD_SHIFT_ENTER_HEX;
@@ -704,6 +714,10 @@ pub fn apply_croft_key_settings(plist: &mut Value) -> Result<(), ITerm2Error> {
     // Replace in File chord can claim it. Cmd+Opt+Ctrl+F keeps the
     // password manager reachable on a chord croft does not use.
     set_string(menu, "Password Manager", "@~^f".to_string());
+    // Relocate iTerm2's "Show Toolbelt" off Cmd+Shift+B so croft's Run
+    // Build Task chord can claim it. Cmd+Ctrl+B keeps the toolbelt
+    // reachable on a chord croft does not use.
+    set_string(menu, "Show Toolbelt", "@^b".to_string());
     // Relocate iTerm2's "New Tab" off Cmd+T so croft's new-terminal chord
     // can claim it. Cmd+Ctrl+T keeps the iTerm2 action reachable and stays
     // clear of the Cmd+Opt+T "New Tab Next to Current Tab" alternate.
@@ -781,6 +795,7 @@ pub fn apply_croft_key_settings(plist: &mut Value) -> Result<(), ITerm2Error> {
         (CMD_SHIFT_N_KEY, CMD_SHIFT_N_HEX),
         (CMD_SHIFT_T_KEY, CMD_SHIFT_T_HEX),
         (CMD_SHIFT_K_KEY, CMD_SHIFT_K_HEX),
+        (CMD_SHIFT_B_KEY, CMD_SHIFT_B_HEX),
         (CMD_T_KEY, CMD_T_HEX),
         (CMD_LBRACKET_KEY, CMD_LBRACKET_HEX),
         (CMD_RBRACKET_KEY, CMD_RBRACKET_HEX),
@@ -1577,6 +1592,25 @@ mod tests {
             menu.get("Password Manager").and_then(|v| v.as_string()),
             Some("@~^f"),
             "iTerm2 binds Cmd+Opt+F to Password Manager by default (MainMenu.xib); it must be relocated to Cmd+Opt+Ctrl+F so the bare chord reaches croft"
+        );
+    }
+
+    #[test]
+    fn apply_croft_key_settings_forwards_cmd_shift_b_for_run_build_task() {
+        let mut plist = synth_plist("GUID-1", &["GUID-1"]);
+        apply_croft_key_settings(&mut plist).unwrap();
+        let top = plist.as_dictionary().unwrap();
+        let global = dict_in(top, "GlobalKeyMap");
+        assert_eq!(
+            action_text(global, CMD_SHIFT_B_KEY),
+            CMD_SHIFT_B_HEX,
+            "GlobalKeyMap must forward Cmd+Shift+B as a CSI-u sequence so croft's `is_run_build_task_key` fires. Encoding: 'B' (codepoint 0x42 = 66) with kitty modifier byte 10 = 1 base + Shift(1) + Super(8), giving `ESC [ 66 ; 10 u`"
+        );
+        let menu = dict_in(top, "NSUserKeyEquivalents");
+        assert_eq!(
+            menu.get("Show Toolbelt").and_then(|v| v.as_string()),
+            Some("@^b"),
+            "iTerm2 binds Cmd+Shift+B to Show Toolbelt by default (MainMenu.xib id 1297); it must be relocated to Cmd+Ctrl+B so the bare chord reaches croft"
         );
     }
 

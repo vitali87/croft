@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Feature,
-    summary: "Cmd/Ctrl+click any path:line reference printed in a terminal pane (compiler errors, test failures, grep hits, Python tracebacks) to jump the editor straight there; relative paths resolve against the pane's live cwd.",
+    summary: "Zero-config task runner: Cmd/Ctrl+Shift+B runs the project's build task auto-detected from its own manifests (Makefile, justfile, package.json, Cargo.toml, pyproject.toml, tasks.json); Tasks: Run Task in the palette lists everything, each task in a named reused terminal pane.",
 }];

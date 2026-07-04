@@ -26,6 +26,7 @@ mod remote_bulk;
 mod remote_connect;
 mod session_state;
 mod sheet;
+mod tasks;
 mod termux;
 mod testing;
 mod theme;

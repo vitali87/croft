@@ -2969,6 +2969,114 @@ fn cmd_c_on_terminal_selection_lands_text_on_macos_clipboard() {
 }
 
 #[test]
+fn cmd_shift_b_runs_the_projects_build_task_in_a_named_pane() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("Makefile"), "build:\n\ttrue\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let before = app.terminals.len();
+    app.handle_key(key(
+        KeyCode::Char('B'),
+        KeyModifiers::SUPER | KeyModifiers::SHIFT,
+    ))
+    .unwrap();
+    assert_eq!(
+        app.terminals.len(),
+        before + 1,
+        "the build task gets its own pane"
+    );
+    assert_eq!(
+        app.terminals[app.active_terminal].label(),
+        "Task: make build",
+        "the pane is named after the task"
+    );
+    assert!(app.show_terminal, "the panel reveals");
+    assert!(
+        matches!(app.focus, Pane::Terminal),
+        "focus follows the task"
+    );
+}
+
+#[test]
+fn rerunning_a_task_reuses_its_pane_instead_of_stacking_new_ones() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("Makefile"), "build:\n\ttrue\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let chord = key(
+        KeyCode::Char('B'),
+        KeyModifiers::SUPER | KeyModifiers::SHIFT,
+    );
+    app.handle_key(chord).unwrap();
+    // Wait for the pane's shell to come back to its prompt so the rerun
+    // path sees an idle pane (a busy pane legitimately gets a new one).
+    let started = std::time::Instant::now();
+    while started.elapsed() < std::time::Duration::from_millis(5000) {
+        if app.terminals[app.active_terminal].foreground_is_shell() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let after_first = app.terminals.len();
+    app.handle_key(chord).unwrap();
+    assert_eq!(
+        app.terminals.len(),
+        after_first,
+        "rerunning the same task must reuse its idle pane"
+    );
+    assert_eq!(
+        app.terminals
+            .iter()
+            .filter(|t| t.label() == "Task: make build")
+            .count(),
+        1,
+        "exactly one pane carries the task's name"
+    );
+}
+
+#[test]
+fn run_task_palette_command_opens_the_task_picker() {
+    use crate::widgets::list_picker::ListPurpose;
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("Makefile"),
+        "build:\n\ttrue\ntest:\n\ttrue\n",
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.run_command(crate::widgets::command_palette::Command::RunTask);
+    let picker = app
+        .list_picker
+        .as_ref()
+        .expect("Tasks: Run Task must open the picker");
+    assert_eq!(picker.purpose, ListPurpose::RunTask);
+    assert!(
+        picker.rows.iter().any(|r| r.label.contains("make build")),
+        "discovered tasks appear as rows: {:?}",
+        picker.rows.iter().map(|r| &r.label).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn run_build_task_key_predicate_accepts_the_chord_and_rejects_neighbours() {
+    assert!(is_run_build_task_key(key(
+        KeyCode::Char('b'),
+        KeyModifiers::SUPER | KeyModifiers::SHIFT
+    )));
+    assert!(is_run_build_task_key(key(
+        KeyCode::Char('B'),
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT
+    )));
+    // Bare Cmd+B is Toggle Side Bar, not Run Build Task.
+    assert!(!is_run_build_task_key(key(
+        KeyCode::Char('b'),
+        KeyModifiers::SUPER
+    )));
+    assert!(!is_run_build_task_key(key(
+        KeyCode::Char('b'),
+        KeyModifiers::SUPER | KeyModifiers::SHIFT | KeyModifiers::ALT
+    )));
+}
+
+#[test]
 fn cmd_click_on_a_file_line_reference_in_the_terminal_opens_the_file_there() {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(tmp.path().join("src")).unwrap();

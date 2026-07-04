@@ -137,6 +137,11 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 handler: "is_terminal_focus_key",
             },
             ShortcutEntry {
+                keys: "Cmd/Ctrl+Shift+B",
+                description: "Run the project's build task, auto-detected from its manifests (Makefile, package.json, Cargo.toml, …)",
+                handler: "is_run_build_task_key",
+            },
+            ShortcutEntry {
                 keys: "Cmd+\\",
                 description: "Split the editor into two side-by-side columns (duplicates the active file)",
                 handler: "is_editor_split_key",

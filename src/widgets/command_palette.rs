@@ -92,6 +92,9 @@ pub enum Command {
     AttachPythonProcess,
     ColorTheme,
     KeyboardShortcuts,
+    RunTask,
+    RunBuildTask,
+    RerunLastTask,
 }
 
 /// Every command, in palette display order. Single source of truth for both
@@ -162,6 +165,9 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::StepOver,
     Command::ToggleRaisedExceptions,
     Command::AttachPythonProcess,
+    Command::RunTask,
+    Command::RunBuildTask,
+    Command::RerunLastTask,
     Command::ColorTheme,
     Command::KeyboardShortcuts,
 ];
@@ -236,6 +242,9 @@ impl Command {
             Command::StepOver => "Debug: Step Over",
             Command::ToggleRaisedExceptions => "Debug: Toggle Break on Raised Exceptions",
             Command::AttachPythonProcess => "Debug: Attach to Python Process",
+            Command::RunTask => "Tasks: Run Task",
+            Command::RunBuildTask => "Tasks: Run Build Task",
+            Command::RerunLastTask => "Tasks: Rerun Last Task",
             Command::ColorTheme => "Preferences: Color Theme",
             Command::KeyboardShortcuts => "Help: Keyboard Shortcuts Reference",
         }
@@ -312,6 +321,9 @@ impl Command {
             Command::EditBreakpointCondition => "Shift+F9",
             Command::ToggleRaisedExceptions => "Alt+F9",
             Command::AttachPythonProcess => "Ctrl+F5",
+            Command::RunTask => "",
+            Command::RunBuildTask => "Cmd+Shift+B",
+            Command::RerunLastTask => "",
             Command::ColorTheme => "Cmd+K Cmd+T",
         }
         // No catch-all: every Command must carry an accelerator (croft tenet),
