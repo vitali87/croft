@@ -59,7 +59,13 @@ pub struct ReleaseNote {
 }
 
 /// What shipped in the current release. Replace on every version bump.
-pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
-    kind: NoteKind::Fix,
-    summary: "The Testing view now follows the Explorer root: after a Make Root into a child repo the test runner rebinds to the new directory instead of staying at the launch dir, so cargo test discovery finds Cargo.toml and the tree populates.",
-}];
+pub const RELEASE_NOTES: &[ReleaseNote] = &[
+    ReleaseNote {
+        kind: NoteKind::Feature,
+        summary: "Click any test in the Testing view to run just that test; the compile now shows live cargo progress instead of a frozen \"Discovering tests\", the scrollbar drags, and long names no longer spill past the panel border.",
+    },
+    ReleaseNote {
+        kind: NoteKind::Fix,
+        summary: "The Testing view follows the Explorer root: after a Make Root into a child repo the test runner rebinds to the new directory instead of the launch dir, so discovery finds Cargo.toml and the tree populates.",
+    },
+];

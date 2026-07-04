@@ -17,6 +17,8 @@ use crate::widgets::testing::TestingPanel;
 
 pub enum TestRequest {
     RunAll,
+    /// Run a single test by its exact name (click-to-run from the tree).
+    RunOne(String),
     Discover,
     /// Rebind the worker's working directory (Explorer re-root). Without it the
     /// worker keeps shelling cargo in the launch dir captured at spawn, so after
@@ -28,6 +30,10 @@ pub enum TestRequest {
 pub enum TestResponse {
     Started(Activity),
     Case(TestCase),
+    /// A cargo build-status line (e.g. "Compiling ratatui v0.29") to show as
+    /// live progress while the test binary compiles, so a multi-minute
+    /// discovery doesn't look frozen behind a static "Discovering tests".
+    Progress(String),
     /// `ok` is the runner's exit success for a run, `None` for discovery.
     Finished {
         ok: Option<bool>,
@@ -62,6 +68,10 @@ impl TestWorker {
         let _ = self.request_tx.send(TestRequest::RunAll);
     }
 
+    pub fn run_one(&self, name: String) {
+        let _ = self.request_tx.send(TestRequest::RunOne(name));
+    }
+
     pub fn discover(&self) {
         let _ = self.request_tx.send(TestRequest::Discover);
     }
@@ -88,6 +98,7 @@ impl TestWorker {
             match resp {
                 TestResponse::Started(activity) => panel.on_busy_started(activity),
                 TestResponse::Case(case) => panel.apply_case(case),
+                TestResponse::Progress(line) => panel.set_progress(line),
                 TestResponse::Finished { ok } => panel.on_finished(ok),
             }
             changed = true;
@@ -100,6 +111,7 @@ fn worker_loop(mut root: PathBuf, rx: Receiver<TestRequest>, tx: Sender<TestResp
     while let Ok(req) = rx.recv() {
         match req {
             TestRequest::RunAll => run_all(&root, &tx),
+            TestRequest::RunOne(name) => run_one(&root, &tx, &name),
             TestRequest::Discover => discover(&root, &tx),
             TestRequest::SetRoot(p) => root = p,
         }
@@ -150,9 +162,13 @@ fn run_streaming(
         }
     };
     let stderr_handle = child.stderr.take().map(|err| {
+        let tx = tx.clone();
         std::thread::spawn(move || {
             for line in BufReader::new(err).lines().map_while(Result::ok) {
                 output::push(output::CHANNEL_TESTS, OutputLevel::Info, &line);
+                if let Some(p) = cargo_progress(&line) {
+                    let _ = tx.send(TestResponse::Progress(p));
+                }
             }
         })
     });
@@ -170,9 +186,41 @@ fn run_streaming(
     Some(child.wait().map(|s| s.success()).unwrap_or(false))
 }
 
+/// The cargo build-status verbs printed to stderr (whitespace-indented on a
+/// non-TTY). We surface these as live progress; everything else (diagnostics,
+/// the `--list` chrome) stays in the OUTPUT channel only.
+const CARGO_PROGRESS_VERBS: [&str; 6] = [
+    "Compiling",
+    "Building",
+    "Downloading",
+    "Updating",
+    "Finished",
+    "Running",
+];
+
+/// Turn a cargo stderr line into a short progress string (trimmed), or `None`
+/// if it is not a build-status line.
+pub(crate) fn cargo_progress(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    let verb = trimmed.split_whitespace().next()?;
+    CARGO_PROGRESS_VERBS
+        .contains(&verb)
+        .then(|| trimmed.to_string())
+}
+
 fn run_all(root: &Path, tx: &Sender<TestResponse>) {
     let _ = tx.send(TestResponse::Started(Activity::Running));
     let cmd = cargo_cmd(root, &["test", "--no-fail-fast", "--color=never"]);
+    let ok = run_streaming(tx, cmd, parse_test_line).unwrap_or(false);
+    let _ = tx.send(TestResponse::Finished { ok: Some(ok) });
+}
+
+/// Run a single test by exact name: `cargo test <name> --color=never -- --exact`.
+/// `--exact` stops the name being treated as a substring filter. No `Started` is
+/// sent: the app marks just this case Running and keeps the rest of the tree, so
+/// a single-test run doesn't wipe the discovered list.
+fn run_one(root: &Path, tx: &Sender<TestResponse>, name: &str) {
+    let cmd = cargo_cmd(root, &["test", name, "--color=never", "--", "--exact"]);
     let ok = run_streaming(tx, cmd, parse_test_line).unwrap_or(false);
     let _ = tx.send(TestResponse::Finished { ok: Some(ok) });
 }

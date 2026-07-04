@@ -1879,6 +1879,7 @@ pub struct App {
     open_editors_scrollbar_drag: bool,
     timeline_scrollbar_drag: bool,
     deps_scrollbar_drag: bool,
+    testing_scrollbar_drag: bool,
     welcome: WelcomeState,
     /// One-shot background refresh of the remote extension index. Polled in the
     /// main loop; rebuilds the Extensions panel once if the verified cache
@@ -2980,6 +2981,7 @@ impl App {
             open_editors_scrollbar_drag: false,
             timeline_scrollbar_drag: false,
             deps_scrollbar_drag: false,
+            testing_scrollbar_drag: false,
             welcome,
             ext_index_refresh,
             ext_index_manual_refresh: false,
@@ -11736,6 +11738,17 @@ impl App {
             return;
         }
         self.test_worker.run_all();
+        self.set_sidebar_view(SidebarView::Testing);
+    }
+
+    /// Run a single test by exact name (click-to-run from the tree). Marks just
+    /// that case Running and keeps the rest of the discovered list intact.
+    fn run_test(&mut self, name: String) {
+        if self.testing.is_busy() {
+            return;
+        }
+        self.testing.start_single(&name);
+        self.test_worker.run_one(name);
         self.set_sidebar_view(SidebarView::Testing);
     }
 
@@ -20622,6 +20635,18 @@ impl App {
                     }
                     return;
                 }
+                if in_tree && self.sidebar_view == SidebarView::Testing {
+                    self.focus_pane(Pane::Tree);
+                    // The scrollbar lane starts a thumb drag; a test row runs
+                    // just that test (suite headers and empty space do nothing).
+                    if rect_contains(self.testing.last_scrollbar, m.column, m.row) {
+                        self.testing.scroll_to_bar_y(m.row);
+                        self.testing_scrollbar_drag = true;
+                    } else if let Some(name) = self.testing.case_name_at(m.row) {
+                        self.run_test(name);
+                    }
+                    return;
+                }
                 if in_tree && self.sidebar_view == SidebarView::Remote {
                     self.focus_pane(Pane::Tree);
                     if rect_contains(self.remote.header_chevron_btn, m.column, m.row) {
@@ -21003,6 +21028,10 @@ impl App {
                     self.dependencies.scroll_to_bar_y(m.row);
                     return;
                 }
+                if self.testing_scrollbar_drag {
+                    self.testing.scroll_to_bar_y(m.row);
+                    return;
+                }
                 if let Some(pane) = self.scrollbar_drag {
                     match pane {
                         Pane::Tree => match self.sidebar_view {
@@ -21154,6 +21183,9 @@ impl App {
                     return;
                 }
                 if std::mem::take(&mut self.deps_scrollbar_drag) {
+                    return;
+                }
+                if std::mem::take(&mut self.testing_scrollbar_drag) {
                     return;
                 }
                 if let Some(drag) = self.tree_drag.take() {

@@ -71,6 +71,23 @@ mod tests {
     }
 
     #[test]
+    fn cargo_progress_surfaces_status_verbs_and_ignores_diagnostics() {
+        use crate::testing::worker::cargo_progress;
+        assert_eq!(
+            cargo_progress("   Compiling ratatui v0.29.0").as_deref(),
+            Some("Compiling ratatui v0.29.0")
+        );
+        assert_eq!(
+            cargo_progress("    Finished `test` profile").as_deref(),
+            Some("Finished `test` profile")
+        );
+        // Not a status line: a diagnostic, a blank, the list output.
+        assert!(cargo_progress("error[E0433]: failed to resolve").is_none());
+        assert!(cargo_progress("").is_none());
+        assert!(cargo_progress("mymod::works: test").is_none());
+    }
+
+    #[test]
     fn list_parser_takes_test_lines_and_skips_benches_and_tally() {
         assert_eq!(
             parse_list_line("mymod::works: test").as_deref(),

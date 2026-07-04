@@ -45,6 +45,9 @@ pub struct TestingPanel {
     /// `Some(ok)` after a run completes (`ok` = the runner exited 0). Drives the
     /// summary line; `None` before the first run.
     last_run_ok: Option<bool>,
+    /// Latest cargo build-status line while busy (e.g. "Compiling ratatui"), so
+    /// a long compile shows movement instead of a static "Discovering tests".
+    progress: Option<String>,
     scroll: usize,
 
     pub focus_gradient: bool,
@@ -53,6 +56,7 @@ pub struct TestingPanel {
     pub hover_pointer: Option<(u16, u16)>,
 
     pub last_area: Rect,
+    pub last_scrollbar: Rect,
     rows: Vec<RenderRow>,
     first_row_y: u16,
     viewport_rows: u16,
@@ -64,12 +68,14 @@ impl TestingPanel {
             cases: Vec::new(),
             activity: Activity::Idle,
             last_run_ok: None,
+            progress: None,
             scroll: 0,
             focus_gradient: false,
             theme: Theme::default(),
             focused: false,
             hover_pointer: None,
             last_area: Rect::default(),
+            last_scrollbar: Rect::default(),
             rows: Vec::new(),
             first_row_y: 0,
             viewport_rows: 0,
@@ -83,7 +89,25 @@ impl TestingPanel {
         self.cases.clear();
         self.activity = activity;
         self.last_run_ok = None;
+        self.progress = None;
         self.scroll = 0;
+    }
+
+    /// Update the live compile-progress line shown while busy.
+    pub fn set_progress(&mut self, line: String) {
+        self.progress = Some(line);
+    }
+
+    /// Begin a single-test run: mark that case Running and enter the busy state
+    /// WITHOUT clearing the tree (unlike a full run/discovery, which re-emits
+    /// every case). The worker streams the result back to update it in place.
+    pub fn start_single(&mut self, name: &str) {
+        self.activity = Activity::Running;
+        self.progress = None;
+        self.apply_case(TestCase {
+            name: name.to_string(),
+            status: TestStatus::Running,
+        });
     }
 
     /// Apply one streamed result: update the matching case in place, or insert
@@ -99,6 +123,7 @@ impl TestingPanel {
     /// or `None` for discovery (which reports no pass/fail).
     pub fn on_finished(&mut self, ok: Option<bool>) {
         self.activity = Activity::Idle;
+        self.progress = None;
         if ok.is_some() {
             self.last_run_ok = ok;
         }
@@ -155,6 +180,36 @@ impl TestingPanel {
         self.rows
             .len()
             .saturating_sub(self.viewport_rows.max(1) as usize)
+    }
+
+    /// Map a click/drag y within the scrollbar lane to a scroll offset. Returns
+    /// true if the offset moved.
+    pub fn scroll_to_bar_y(&mut self, y: u16) -> bool {
+        let Some(metrics) = scrollbar::vertical_metrics(
+            self.last_scrollbar,
+            self.rows.len(),
+            self.viewport_rows.max(1) as usize,
+            self.scroll,
+        ) else {
+            return false;
+        };
+        let target = scrollbar::scroll_for_y(metrics, y);
+        let moved = target != self.scroll;
+        self.scroll = target;
+        moved
+    }
+
+    /// The name of the test case at screen row `y`, if that row is a case (not a
+    /// suite header or empty space). Used to run a single test on click.
+    pub fn case_name_at(&self, y: u16) -> Option<String> {
+        if y < self.first_row_y {
+            return None;
+        }
+        let shown = (y - self.first_row_y) as usize;
+        match self.rows.get(self.scroll + shown)? {
+            RenderRow::Case(idx) => Some(self.cases[*idx].name.clone()),
+            RenderRow::Header(_) => None,
+        }
     }
 
     /// Build the flat render-row list: a header per suite followed by its cases,
@@ -223,9 +278,18 @@ impl Widget for &mut TestingPanel {
                 .add_modifier(Modifier::BOLD),
         );
 
+        // All content stops one column short of the border so the vertical
+        // scrollbar (drawn at `right - 1`) has its own column and no string
+        // bleeds past the panel into the neighbouring pane.
+        let right = inner.x + inner.width;
+        let text_right = right.saturating_sub(1);
+        let clip = |s: &str, start_x: u16| -> String {
+            let avail = text_right.saturating_sub(start_x) as usize;
+            s.chars().take(avail).collect()
+        };
+
         // Summary line: busy state, the pass/fail/skip tally, or a kickoff hint.
         let (passed, failed, skipped) = self.counts();
-        let right = inner.x + inner.width;
         let summary_y = inner.y + 1;
         if self.activity != Activity::Idle {
             let label = match self.activity {
@@ -235,14 +299,14 @@ impl Widget for &mut TestingPanel {
             buf.set_string(
                 inner.x + 1,
                 summary_y,
-                label,
+                clip(label, inner.x + 1),
                 Style::default().fg(self.theme.accent()),
             );
         } else if self.cases.is_empty() {
             buf.set_string(
                 inner.x + 1,
                 summary_y,
-                "Run All Tests (Enter)",
+                clip("Run All Tests (Enter)", inner.x + 1),
                 Style::default().fg(COLOR_DIM),
             );
         } else {
@@ -252,13 +316,33 @@ impl Widget for &mut TestingPanel {
             } else {
                 self.theme.git_added()
             };
-            buf.set_string(inner.x + 1, summary_y, &summary, Style::default().fg(color));
+            buf.set_string(
+                inner.x + 1,
+                summary_y,
+                clip(&summary, inner.x + 1),
+                Style::default().fg(color),
+            );
         }
 
         // Tree.
         self.build_rows();
         let body_y0 = inner.y + 2;
         let body_h = inner.height.saturating_sub(2);
+
+        // While compiling the test binary the tree is empty; show the latest
+        // cargo status line there so a multi-minute discovery visibly moves.
+        if self.activity != Activity::Idle
+            && self.cases.is_empty()
+            && let Some(p) = &self.progress
+            && body_h > 0
+        {
+            buf.set_string(
+                inner.x + 1,
+                body_y0,
+                clip(p, inner.x + 1),
+                Style::default().fg(COLOR_DIM),
+            );
+        }
         self.first_row_y = body_y0;
         self.viewport_rows = body_h;
         if body_h == 0 {
@@ -281,7 +365,7 @@ impl Widget for &mut TestingPanel {
                     buf.set_string(
                         inner.x + 1,
                         y,
-                        suite,
+                        clip(suite, inner.x + 1),
                         Style::default()
                             .fg(COLOR_HEADER)
                             .add_modifier(Modifier::BOLD),
@@ -297,25 +381,29 @@ impl Widget for &mut TestingPanel {
                         glyph.to_string(),
                         Style::default().fg(color),
                     );
-                    let avail = right.saturating_sub(inner.x + 4) as usize;
-                    let leaf: String = leaf.chars().take(avail).collect();
-                    buf.set_string(inner.x + 4, y, &leaf, Style::default().fg(COLOR_CASE));
+                    buf.set_string(
+                        inner.x + 4,
+                        y,
+                        clip(leaf, inner.x + 4),
+                        Style::default().fg(COLOR_CASE),
+                    );
                 }
             }
         }
 
-        if let Some(metrics) = scrollbar::vertical_metrics(
-            Rect {
-                x: right.saturating_sub(1),
-                y: body_y0,
-                width: 1,
-                height: body_h,
-            },
-            self.rows.len(),
-            body_h as usize,
-            self.scroll,
-        ) {
+        let lane = Rect {
+            x: right.saturating_sub(1),
+            y: body_y0,
+            width: 1,
+            height: body_h,
+        };
+        if let Some(metrics) =
+            scrollbar::vertical_metrics(lane, self.rows.len(), body_h as usize, self.scroll)
+        {
+            self.last_scrollbar = lane;
             scrollbar::render_vertical(buf, metrics, self.focused, self.theme);
+        } else {
+            self.last_scrollbar = Rect::default();
         }
     }
 }
@@ -348,5 +436,25 @@ mod tests {
         });
         assert_eq!(p.failed_count(), 1);
         assert_eq!(p.cases.len(), 3);
+    }
+
+    #[test]
+    fn start_single_marks_one_case_running_without_clearing_the_tree() {
+        let mut p = TestingPanel::new();
+        p.on_busy_started(Activity::Running);
+        for n in ["m::a", "m::b", "m::c"] {
+            p.apply_case(TestCase {
+                name: n.into(),
+                status: TestStatus::Passed,
+            });
+        }
+        p.on_finished(Some(true));
+
+        p.start_single("m::b");
+
+        assert!(p.is_busy(), "a single-test run enters the busy state");
+        assert_eq!(p.cases.len(), 3, "the rest of the tree is preserved");
+        let b = p.cases.iter().find(|c| c.name == "m::b").unwrap();
+        assert_eq!(b.status, TestStatus::Running, "only the target is Running");
     }
 }
