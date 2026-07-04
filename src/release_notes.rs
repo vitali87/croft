@@ -59,13 +59,7 @@ pub struct ReleaseNote {
 }
 
 /// What shipped in the current release. Replace on every version bump.
-pub const RELEASE_NOTES: &[ReleaseNote] = &[
-    ReleaseNote {
-        kind: NoteKind::Feature,
-        summary: "Hunk-level staging: inside a Source Control diff, S stages, U unstages, and R reverts (with a confirm) just the change hunk under the cursor, so one messy file becomes several focused commits.",
-    },
-    ReleaseNote {
-        kind: NoteKind::Fix,
-        summary: "Background git status polls no longer take index.lock (GIT_OPTIONAL_LOCKS=0), so staging can never fail with a transient lock error while croft refreshes.",
-    },
-];
+pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
+    kind: NoteKind::Feature,
+    summary: "Cmd/Ctrl+click any path:line reference printed in a terminal pane (compiler errors, test failures, grep hits, Python tracebacks) to jump the editor straight there; relative paths resolve against the pane's live cwd.",
+}];

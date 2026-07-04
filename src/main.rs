@@ -2,6 +2,7 @@ mod app;
 mod cli;
 mod clipboard;
 mod dap;
+mod file_ref;
 mod ghostty;
 mod git;
 mod gradient;

@@ -2968,6 +2968,76 @@ fn cmd_c_on_terminal_selection_lands_text_on_macos_clipboard() {
     );
 }
 
+#[test]
+fn cmd_click_on_a_file_line_reference_in_the_terminal_opens_the_file_there() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+    std::fs::write(tmp.path().join("src/probe.rs"), "one\ntwo\nthree\nfour\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+
+    // Render once so `terminal.last_inner` / `last_area` are populated and
+    // mouse coordinates map to grid cells like on a live click.
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    app.terminal_mut().focused = true;
+    term.draw(|f| app.render(f)).unwrap();
+
+    let reference = "src/probe.rs:3:2";
+    app.terminal_mut()
+        .write_input(format!("printf 'ref {reference}\\n'\r").as_bytes());
+    // The echoed command line also contains the reference; wait for the
+    // OUTPUT line (the one starting with "ref "), then click that one.
+    let is_output_line = |l: &str| l.trim_start().starts_with("ref src/probe.rs");
+    let started = std::time::Instant::now();
+    while started.elapsed() < std::time::Duration::from_millis(5000) {
+        if app.terminal().visible_text().lines().any(is_output_line) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    term.draw(|f| app.render(f)).unwrap();
+    let snapshot = app.terminal().visible_text();
+    let row_idx = snapshot
+        .lines()
+        .position(is_output_line)
+        .unwrap_or_else(|| panic!("shell must print the reference within 5s; got:\n{snapshot}"));
+    let line = snapshot.lines().nth(row_idx).unwrap();
+    let col = line.find("probe.rs").unwrap() + 2;
+
+    let inner = app.terminal().last_inner;
+    app.handle_mouse(crossterm::event::MouseEvent {
+        kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        column: inner.x + col as u16,
+        row: inner.y + row_idx as u16,
+        modifiers: KeyModifiers::SUPER,
+    });
+
+    // Canonicalize both sides: on macOS the pane cwd resolves through the
+    // /var → /private/var symlink while tempdir reports the alias.
+    let opened = app
+        .editor
+        .path
+        .as_deref()
+        .map(|p| p.canonicalize().unwrap_or_else(|_| p.to_path_buf()));
+    assert_eq!(
+        opened,
+        Some(
+            tmp.path()
+                .join("src/probe.rs")
+                .canonicalize()
+                .expect("probe file exists")
+        ),
+        "Cmd+click on path:line:col must open the file (status: {})",
+        app.status
+    );
+    assert_eq!(app.editor.cursor_row, 2, "line 3 is 0-based row 2");
+    assert_eq!(app.editor.cursor_col, 1, "col 2 is 0-based col 1");
+    assert!(
+        matches!(app.focus, Pane::Editor),
+        "the jump must focus the editor"
+    );
+}
+
 // Cross-platform: asserts via `clipboard::read_string()`, so the per-thread
 // test mock covers the diff-selection → Cmd+C → clipboard wiring on every OS.
 // The macOS NSPasteboard FFI is verified separately by the cfg(macos) tests in

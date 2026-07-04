@@ -335,6 +335,7 @@ Disabling takes effect immediately for the viewers and Vim (a disabled PDF/CSV v
 
 With two or more panes open, each pane's header shows its live foreground process (`zsh`, `vim`, `node`…); a manual rename overrides that label.
 | `Cmd`/`Ctrl` + click a printed URL | Open it. A loopback dev-server URL on a remote session (`http://localhost:3000`) is forwarded home over the live SSH connection first, then opened in your local browser; any other link opens directly |
+| `Cmd`/`Ctrl` + click a printed `path:line[:col]` | Open that file in the editor at that line and column. Works on compiler errors (`src/x.rs:12:5`), test failures, grep hits, and Python tracebacks (`File "x.py", line 3`); relative paths resolve against the pane's current directory |
 
 ## Ports
 

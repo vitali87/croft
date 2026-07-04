@@ -816,6 +816,16 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 description: "Paste local clipboard into the shell",
                 handler: "is_clipboard_paste_key",
             },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+click a path:line",
+                description: "Open that file in the editor at that line (compiler errors, test failures, grep hits, tracebacks)",
+                handler: "",
+            },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+click a URL",
+                description: "Open the link (a remote dev-server port forwards home first)",
+                handler: "",
+            },
         ],
     },
     ShortcutGroup {

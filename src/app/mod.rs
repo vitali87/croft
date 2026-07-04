@@ -16915,6 +16915,64 @@ impl App {
         true
     }
 
+    /// Cmd/Ctrl+click on a printed `path:line[:col]` reference (compiler
+    /// errors, test failures, grep hits, tracebacks) jumps the editor
+    /// there. Relative paths resolve against the pane shell's live cwd,
+    /// then the workspace root; `~` against $HOME. The click only lands
+    /// when the resolved file exists, which also filters lookalikes such
+    /// as `host.com:443`.
+    fn terminal_file_click(&mut self, col: u16, row: u16) -> bool {
+        let Some((text, c)) = self.terminal().line_text_at(col, row) else {
+            return false;
+        };
+        let Some(fr) = crate::file_ref::file_ref_at(&text, c) else {
+            return false;
+        };
+        let path = std::path::PathBuf::from(&fr.path);
+        let abs = if let Some(rest) = fr.path.strip_prefix("~/") {
+            match std::env::var_os("HOME") {
+                Some(h) => std::path::PathBuf::from(h).join(rest),
+                None => return false,
+            }
+        } else if path.is_absolute() {
+            path
+        } else {
+            let cwd = self
+                .terminal()
+                .pid()
+                .and_then(cwd_of_pid)
+                .filter(|p| p.is_dir())
+                .unwrap_or_else(|| self.workspace_root.clone());
+            let joined = cwd.join(&path);
+            if joined.is_file() {
+                joined
+            } else {
+                self.workspace_root.join(&path)
+            }
+        };
+        if !abs.is_file() {
+            return false;
+        }
+        // Record where the user was so Back returns to it, exactly like
+        // go-to-definition.
+        if let Some(from) = self.editor.path.clone() {
+            self.nav.record(NavLoc {
+                path: from,
+                row: self.editor.cursor_row,
+                col: self.editor.cursor_col,
+            });
+        }
+        let line0 = (fr.line as usize).saturating_sub(1);
+        let col0 = fr.column.map(|c| c as usize).unwrap_or(1).saturating_sub(1);
+        match self.open_at(&abs, line0, col0) {
+            Ok(()) => {
+                self.status = format!("{}:{}", abs.display(), fr.line);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
     /// Open a URL discovered in the terminal. On a remote session a loopback
     /// dev-server URL is forwarded home and opened; any other link opens on the
     /// local Mac through the drop relay (with the usual confirm gate). On a
@@ -20775,7 +20833,8 @@ impl App {
                     // doesn't also start a text selection.
                     if (m.modifiers.contains(KeyModifiers::SUPER)
                         || m.modifiers.contains(KeyModifiers::CONTROL))
-                        && self.terminal_url_click(m.column, m.row)
+                        && (self.terminal_url_click(m.column, m.row)
+                            || self.terminal_file_click(m.column, m.row))
                     {
                         return;
                     }
