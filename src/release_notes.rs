@@ -62,14 +62,10 @@ pub struct ReleaseNote {
 pub const RELEASE_NOTES: &[ReleaseNote] = &[
     ReleaseNote {
         kind: NoteKind::Feature,
-        summary: "Custom keybindings: rebind any Command Palette command in ~/.config/croft/keybindings.json. Your binding wins over the default, applies on save, and reserved Cmd chords are forwarded so they reach croft in iTerm2 and Ghostty (re-run croft setup-iterm2 / setup-ghostty).",
+        summary: "Status-bar indentation control: the \"Spaces: 4\" pill is now clickable — switch Indent Using Spaces / Tabs, change the tab size, and convert the buffer's existing indentation, all from the status bar (VS Code's Select Indentation menu).",
     },
     ReleaseNote {
         kind: NoteKind::Feature,
-        summary: "User snippets: define prefixes in ~/.config/croft/snippets.json, then type one and press Tab (or pick it from the completion popup) to expand it with $1/$0 tab stops and ${1:placeholder} defaults.",
-    },
-    ReleaseNote {
-        kind: NoteKind::Feature,
-        summary: "Preferences: Open Settings — a searchable hub to flip settings, pick a theme, and jump to the settings / keybindings / snippets JSON files, all from the Command Palette.",
+        summary: "Problems panel toolbar: filter by severity (All / Errors / Errors & Warnings) and toggle grouping by file versus a flat, file-annotated list, both one click away.",
     },
 ];

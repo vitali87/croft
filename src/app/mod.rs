@@ -1033,6 +1033,12 @@ enum MenuAction {
     SetLineEnding(crate::widgets::editor::LineEnding),
     /// Status-bar encoding picker: reopen the file decoded with this encoding.
     SetEncoding(&'static encoding_rs::Encoding),
+    /// Status-bar indentation picker: pin spaces-vs-tabs and width for newly
+    /// typed indentation.
+    SetIndentStyle(crate::widgets::editor::IndentStyle),
+    /// Status-bar indentation picker: rewrite existing leading indentation.
+    /// `true` converts tabs to spaces, `false` converts spaces to tabs.
+    ConvertIndentation(bool),
 }
 
 /// Return the macOS-style keyboard shortcut hint to display on the right
@@ -2314,6 +2320,7 @@ pub struct App {
     /// the bar is hidden or the segment doesn't fit. Diagnostics → PROBLEMS;
     /// encoding / EOL / language → their respective "change" pickers.
     status_diag_rect: Rect,
+    status_indent_rect: Rect,
     status_encoding_rect: Rect,
     status_eol_rect: Rect,
     status_language_rect: Rect,
@@ -3123,6 +3130,7 @@ impl App {
             shortcuts_modal: None,
             shortcuts_hit_rect: None,
             status_diag_rect: Rect::default(),
+            status_indent_rect: Rect::default(),
             status_encoding_rect: Rect::default(),
             status_eol_rect: Rect::default(),
             status_language_rect: Rect::default(),
@@ -9921,9 +9929,9 @@ impl App {
             Rect::default()
         };
 
-        // ---- Right cluster: document facts, right-justified. Encoding / EOL /
-        // language are clickable to change (hit rects recorded below). ----
-        let (tab_w, _spaces) = self.editor.indent_preference();
+        // ---- Right cluster: document facts, right-justified. Indentation /
+        // encoding / EOL / language are clickable to change (hit rects recorded
+        // below). ----
         let dim = Style::default().fg(Color::Rgb(0x9a, 0xa4, 0xb8));
         let right: Vec<Span> = vec![
             Span::styled(
@@ -9934,7 +9942,7 @@ impl App {
                 ),
                 dim,
             ),
-            Span::styled(format!(" Spaces: {tab_w} "), dim),
+            Span::styled(format!(" {} ", self.editor.indent_style().label()), dim),
             Span::styled(format!(" {} ", self.editor.encoding.name()), dim),
             Span::styled(format!(" {} ", self.editor.eol.label()), dim),
             Span::styled(format!(" {} ", self.editor.language_label()), dim),
@@ -9960,6 +9968,7 @@ impl App {
             status_rect,
         );
         // Reset clickable rects; re-record only when the right cluster fits.
+        self.status_indent_rect = Rect::default();
         self.status_encoding_rect = Rect::default();
         self.status_eol_rect = Rect::default();
         self.status_language_rect = Rect::default();
@@ -9974,7 +9983,7 @@ impl App {
                     height: status_rect.height,
                 },
             );
-            // Record hit rects: indices 2=encoding, 3=EOL, 4=language.
+            // Record hit rects: indices 1=indentation, 2=encoding, 3=EOL, 4=language.
             let mut cx = rx;
             for (i, w) in widths.iter().enumerate() {
                 let r = Rect {
@@ -9984,6 +9993,7 @@ impl App {
                     height: 1,
                 };
                 match i {
+                    1 => self.status_indent_rect = r,
                     2 => self.status_encoding_rect = r,
                     3 => self.status_eol_rect = r,
                     4 => self.status_language_rect = r,
@@ -20080,6 +20090,10 @@ impl App {
                 );
                 return;
             }
+            if rect_contains(self.status_indent_rect, m.column, m.row) {
+                self.open_status_indent_menu(self.status_indent_rect.x, self.status_indent_rect.y);
+                return;
+            }
             if rect_contains(self.status_diag_rect, m.column, m.row) {
                 self.set_bottom_panel_tab(BottomPanelTab::Problems);
                 return;
@@ -20683,6 +20697,11 @@ impl App {
                     && rect_contains(self.problems.last_area, m.column, m.row)
                 {
                     use crate::widgets::problems::ProblemHit;
+                    // Toolbar buttons (severity filter / group toggle) consume
+                    // the click before it resolves to a row.
+                    if self.problems.click(m.column, m.row) {
+                        return;
+                    }
                     match self.problems.hit_at(m.row) {
                         Some(ProblemHit::Header(path)) => self.problems.toggle_collapse(&path),
                         Some(ProblemHit::Diagnostic { path, line, col }) => {
@@ -22697,6 +22716,19 @@ impl App {
                 Ok(()) => self.status = format!("Reopened with {}", enc.name()),
                 Err(e) => self.status = format!("Reopen failed: {e}"),
             },
+            MenuAction::SetIndentStyle(style) => {
+                self.editor.set_indent_style(style);
+                self.status = style.label();
+            }
+            MenuAction::ConvertIndentation(to_spaces) => {
+                if to_spaces {
+                    self.editor.indentation_to_spaces();
+                    self.status = String::from("Converted indentation to spaces");
+                } else {
+                    self.editor.indentation_to_tabs();
+                    self.status = String::from("Converted indentation to tabs");
+                }
+            }
         }
     }
 
@@ -23277,6 +23309,51 @@ impl App {
                 action: MenuAction::SetEncoding(enc),
             })
             .collect();
+        self.open_status_menu(col, row, items);
+    }
+
+    /// Status-bar indentation picker, mirroring VS Code's "Select Indentation"
+    /// quick pick: switch spaces-vs-tabs for future typing, change the width,
+    /// and convert the buffer's existing indentation.
+    fn open_status_indent_menu(&mut self, col: u16, row: u16) {
+        use crate::widgets::editor::IndentStyle;
+        let check = |on: bool| if on { "\u{2713} " } else { "  " };
+        let cur = self.editor.indent_style();
+        let mut items = vec![
+            MenuEntry::Item {
+                label: format!("{}Indent Using Spaces", check(cur.use_spaces)),
+                action: MenuAction::SetIndentStyle(IndentStyle {
+                    width: cur.width,
+                    use_spaces: true,
+                }),
+            },
+            MenuEntry::Item {
+                label: format!("{}Indent Using Tabs", check(!cur.use_spaces)),
+                action: MenuAction::SetIndentStyle(IndentStyle {
+                    width: cur.width,
+                    use_spaces: false,
+                }),
+            },
+            MenuEntry::Separator,
+        ];
+        for width in [2u32, 4, 8] {
+            items.push(MenuEntry::Item {
+                label: format!("{}Tab Size: {width}", check(cur.width == width)),
+                action: MenuAction::SetIndentStyle(IndentStyle {
+                    width,
+                    use_spaces: cur.use_spaces,
+                }),
+            });
+        }
+        items.push(MenuEntry::Separator);
+        items.push(MenuEntry::Item {
+            label: String::from("  Convert Indentation to Spaces"),
+            action: MenuAction::ConvertIndentation(true),
+        });
+        items.push(MenuEntry::Item {
+            label: String::from("  Convert Indentation to Tabs"),
+            action: MenuAction::ConvertIndentation(false),
+        });
         self.open_status_menu(col, row, items);
     }
 

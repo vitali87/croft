@@ -1184,6 +1184,37 @@ impl LineEnding {
     }
 }
 
+/// The buffer's indentation preference for newly typed indentation: the tab
+/// width and whether Tab inserts spaces or a literal tab. Surfaced in the
+/// status bar's "Spaces: N" / "Tab Size: N" pill, which the user can click to
+/// change (VS Code's "Indent Using Spaces / Tabs" + "Change Tab Display Size").
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct IndentStyle {
+    pub width: u32,
+    pub use_spaces: bool,
+}
+
+impl IndentStyle {
+    /// The indentation unit as text: `width` spaces, or a single tab.
+    pub fn unit(self) -> String {
+        if self.use_spaces {
+            " ".repeat(self.width as usize)
+        } else {
+            "\t".to_string()
+        }
+    }
+
+    /// Status-bar label, matching VS Code ("Spaces: 4" / "Tab Size: 4").
+    pub fn label(self) -> String {
+        let kind = if self.use_spaces {
+            "Spaces"
+        } else {
+            "Tab Size"
+        };
+        format!("{kind}: {}", self.width)
+    }
+}
+
 /// How a buffer line differs from its committed (HEAD) version, for the git
 /// gutter. The colour carries the meaning, exactly like VS Code's gutter:
 /// green added, blue modified, red where lines were deleted.
@@ -1377,6 +1408,10 @@ pub struct Editor {
     undo_stack: Vec<Snapshot>,
     last_edit_kind: Option<EditKind>,
     lang: Option<LangKind>,
+    /// Explicit indentation preference set from the status-bar pill. `None`
+    /// falls back to the language default (2 spaces for YAML, 4 otherwise);
+    /// `Some` pins spaces-vs-tabs and width for newly typed indentation.
+    indent_override: Option<IndentStyle>,
     /// Line-ending style, detected on open and applied on save. Surfaced in the
     /// status bar; the user can switch it there.
     pub eol: LineEnding,
@@ -1528,6 +1563,7 @@ impl Editor {
             undo_stack: Vec::new(),
             last_edit_kind: None,
             lang: None,
+            indent_override: None,
             eol: LineEnding::Lf,
             encoding: encoding_rs::UTF_8,
             wrap_override: None,
@@ -2470,13 +2506,32 @@ impl Editor {
         n
     }
 
+    /// The buffer's active indentation style: the status-bar override if set,
+    /// else the language default (2 spaces for YAML, 4 spaces otherwise).
+    pub fn indent_style(&self) -> IndentStyle {
+        self.indent_override.unwrap_or(IndentStyle {
+            width: indent_unit_for(self.lang).chars().count() as u32,
+            use_spaces: true,
+        })
+    }
+
+    /// Pin the buffer's indentation style (status-bar "Indent Using …" /
+    /// "Change Tab Display Size"). Affects newly typed indentation only; use
+    /// [`Editor::convert_indentation`] to rewrite existing lines.
+    pub fn set_indent_style(&mut self, style: IndentStyle) {
+        self.indent_override = Some(style);
+    }
+
+    /// The indentation unit as text for the active style: N spaces or one tab.
+    fn indent_unit(&self) -> String {
+        self.indent_style().unit()
+    }
+
     /// The editor's indentation preference as the LSP `FormattingOptions`
-    /// fields (`tab_size`, `insert_spaces`). croft always indents with spaces,
-    /// so `insert_spaces` is always true and `tab_size` is the width of the
-    /// language's indent unit (2 for YAML, 4 otherwise).
+    /// fields (`tab_size`, `insert_spaces`).
     pub fn indent_preference(&self) -> (u32, bool) {
-        let width = indent_unit_for(self.lang).chars().count() as u32;
-        (width, true)
+        let s = self.indent_style();
+        (s.width, s.use_spaces)
     }
 
     /// Human label for the buffer's language mode, for the status bar.
@@ -2744,9 +2799,9 @@ impl Editor {
             .copied();
         let next_char = line.chars().nth(col);
 
-        let unit = indent_unit_for(self.lang);
+        let unit = self.indent_unit();
         let extra = if extra_indent_triggered(self.lang, last_non_ws) {
-            unit
+            unit.as_str()
         } else {
             ""
         };
@@ -4381,7 +4436,7 @@ impl Editor {
     }
 
     fn convert_indentation(&mut self, to_spaces: bool) {
-        let tab_w = indent_unit_for(self.lang).chars().count().max(1);
+        let tab_w = (self.indent_style().width as usize).max(1);
         let spaces = " ".repeat(tab_w);
         let mut new_lines = self.lines.clone();
         let mut changed = false;
@@ -4612,12 +4667,19 @@ impl Editor {
         if self.lines.is_empty() {
             self.lines.push(String::new());
         }
-        let unit_w = indent_unit_for(self.lang).chars().count();
-        let pad = unit_w - (self.cursor_col % unit_w);
+        let style = self.indent_style();
         let row = self.cursor_row;
         let byte = self.byte_index(row, self.cursor_col);
-        self.lines[row].insert_str(byte, &" ".repeat(pad));
-        self.cursor_col += pad;
+        let (ins, advance): (String, usize) = if style.use_spaces {
+            let unit_w = (style.width as usize).max(1);
+            let pad = unit_w - (self.cursor_col % unit_w);
+            (" ".repeat(pad), pad)
+        } else {
+            // A tab-indented buffer inserts one literal tab (useTabStops).
+            ("\t".to_string(), 1)
+        };
+        self.lines[row].insert_str(byte, &ins);
+        self.cursor_col += advance;
         self.mark_buffer_changed();
         self.recompute_highlights();
         self.ensure_cursor_col_visible();
@@ -4632,12 +4694,12 @@ impl Editor {
     pub fn indent_lines(&mut self) {
         self.pin_on_edit();
         self.push_undo(EditKind::Indent);
-        let unit = indent_unit_for(self.lang);
+        let unit = self.indent_unit();
         let unit_w = unit.chars().count();
         let (start_row, end_row) = self.selected_or_cursor_row_range();
         for row in start_row..=end_row {
             if !self.lines[row].is_empty() {
-                self.lines[row].insert_str(0, unit);
+                self.lines[row].insert_str(0, &unit);
             }
         }
         // A row gained indentation iff it was non-empty (empty lines were
@@ -4670,7 +4732,7 @@ impl Editor {
     pub fn dedent_lines(&mut self) {
         self.pin_on_edit();
         self.push_undo(EditKind::Indent);
-        let unit_w = indent_unit_for(self.lang).chars().count();
+        let unit_w = (self.indent_style().width as usize).max(1);
         let (start_row, end_row) = self.selected_or_cursor_row_range();
         let mut removed = vec![0usize; self.lines.len()];
         let mut any = false;
@@ -13208,6 +13270,46 @@ mod tests {
         e.indentation_to_tabs();
         // 4 spaces -> 1 tab; 6 spaces -> 1 tab + 2 leftover; interior spaces stay.
         assert_eq!(e.lines, vec!["\tfoo", "\t  bar", "b  c"]);
+    }
+
+    #[test]
+    fn indent_override_switches_tab_to_a_literal_tab() {
+        let mut e = editor_with("foo");
+        // Default: spaces, width 4 -> Tab pads to the next stop with spaces.
+        e.cursor_row = 0;
+        e.cursor_col = 0;
+        e.indent_at_cursor();
+        assert_eq!(e.lines[0], "    foo");
+        assert_eq!(e.indent_preference(), (4, true));
+
+        // Pin tabs: Tab now inserts one literal tab, LSP prefs flip insert_spaces.
+        let mut t = editor_with("foo");
+        t.set_indent_style(IndentStyle {
+            width: 4,
+            use_spaces: false,
+        });
+        t.cursor_row = 0;
+        t.cursor_col = 0;
+        t.indent_at_cursor();
+        assert_eq!(t.lines[0], "\tfoo");
+        assert_eq!(t.indent_preference(), (4, false));
+    }
+
+    #[test]
+    fn indent_override_width_changes_status_label_and_unit() {
+        let mut e = editor_with("");
+        e.set_indent_style(IndentStyle {
+            width: 2,
+            use_spaces: true,
+        });
+        assert_eq!(e.indent_style().label(), "Spaces: 2");
+        assert_eq!(e.indent_style().unit(), "  ");
+        e.set_indent_style(IndentStyle {
+            width: 4,
+            use_spaces: false,
+        });
+        assert_eq!(e.indent_style().label(), "Tab Size: 4");
+        assert_eq!(e.indent_style().unit(), "\t");
     }
 
     // ---- Trim Final Newlines (files.trimFinalNewlines) ----

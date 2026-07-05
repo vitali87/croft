@@ -30,6 +30,10 @@ const COLOR_ERROR: Color = Color::Rgb(0xf1, 0x4c, 0x4c);
 const COLOR_WARNING: Color = Color::Rgb(0xcc, 0xa7, 0x00);
 const COLOR_INFO: Color = Color::Rgb(0x3b, 0x9e, 0xff);
 
+/// Subtle raised background for the toolbar buttons, so they read as clickable
+/// against the panel body.
+const COLOR_BTN_BG: Color = Color::Rgb(0x2a, 0x2d, 0x35);
+
 /// Codicon severity glyphs, verified against the upstream codicon
 /// `mapping.json` on 2026-06-28: `error` = 60039 (U+EA87), `warning` = 60012
 /// (U+EA6C), `info` = 60020 (U+EA74). Nerd Fonts preserve codicon codepoints
@@ -70,6 +74,44 @@ enum RenderRow {
     Diag(usize, usize),
 }
 
+/// The severity filter applied to the list, cycled from the toolbar. `Warnings`
+/// keeps errors and warnings (VS Code's "Show Errors & Warnings"); `Errors`
+/// keeps only errors.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProblemFilter {
+    All,
+    Errors,
+    Warnings,
+}
+
+impl ProblemFilter {
+    fn next(self) -> Self {
+        match self {
+            Self::All => Self::Errors,
+            Self::Errors => Self::Warnings,
+            Self::Warnings => Self::All,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::All => "All",
+            Self::Errors => "Errors",
+            Self::Warnings => "Errors & Warnings",
+        }
+    }
+
+    fn keeps(self, sev: DiagnosticSeverity) -> bool {
+        match self {
+            Self::All => true,
+            Self::Errors => sev == DiagnosticSeverity::Error,
+            Self::Warnings => {
+                matches!(sev, DiagnosticSeverity::Error | DiagnosticSeverity::Warning)
+            }
+        }
+    }
+}
+
 /// The action a click on a Problems row resolves to.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ProblemHit {
@@ -83,6 +125,11 @@ pub struct ProblemsPanel {
     groups: Vec<ProblemGroup>,
     collapsed: HashSet<PathBuf>,
     scroll: usize,
+    /// Severity filter, cycled from the toolbar (VS Code's funnel menu).
+    filter: ProblemFilter,
+    /// Group diagnostics under a file header (VS Code default) or show a flat,
+    /// file-annotated list. Toggled from the toolbar.
+    group_by_file: bool,
 
     pub focus_gradient: bool,
     pub theme: Theme,
@@ -91,6 +138,10 @@ pub struct ProblemsPanel {
 
     pub last_area: Rect,
     pub last_scrollbar: Rect,
+
+    // Toolbar hit rects, recomputed each render.
+    filter_rect: Rect,
+    group_rect: Rect,
 
     rows: Vec<RenderRow>,
     first_row_y: u16,
@@ -104,12 +155,16 @@ impl ProblemsPanel {
             groups: Vec::new(),
             collapsed: HashSet::new(),
             scroll: 0,
+            filter: ProblemFilter::All,
+            group_by_file: true,
             focus_gradient: false,
             theme: Theme::default(),
             focused: false,
             hover_pointer: None,
             last_area: Rect::default(),
             last_scrollbar: Rect::default(),
+            filter_rect: Rect::default(),
+            group_rect: Rect::default(),
             rows: Vec::new(),
             first_row_y: 0,
             visible_rows: 0,
@@ -178,16 +233,40 @@ impl ProblemsPanel {
             .saturating_sub(self.viewport_rows as usize)
     }
 
-    /// The number of laid-out rows given the current collapse state (one per
-    /// header plus one per diagnostic of an expanded group).
-    fn total_rows(&self) -> usize {
+    /// The visible groups after the severity filter: `(group index, indices of
+    /// its items that pass the filter)`. Groups with no passing item are
+    /// dropped so a filtered-away file shows no header. Indices are into
+    /// `self.groups`, so `hit_at` / `*_spans` need no remapping.
+    fn visible_groups(&self) -> Vec<(usize, Vec<usize>)> {
         self.groups
             .iter()
-            .map(|g| {
-                1 + if self.collapsed.contains(&g.path) {
-                    0
+            .enumerate()
+            .filter_map(|(g, group)| {
+                let items: Vec<usize> = group
+                    .items
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, it)| self.filter.keeps(it.severity))
+                    .map(|(i, _)| i)
+                    .collect();
+                (!items.is_empty()).then_some((g, items))
+            })
+            .collect()
+    }
+
+    /// The number of laid-out rows for the current filter, collapse state, and
+    /// grouping. Grouped: one header per visible file plus one row per shown
+    /// diagnostic of an expanded group. Flat: one row per shown diagnostic.
+    fn total_rows(&self) -> usize {
+        self.visible_groups()
+            .iter()
+            .map(|(g, items)| {
+                if !self.group_by_file {
+                    items.len()
+                } else if self.collapsed.contains(&self.groups[*g].path) {
+                    1
                 } else {
-                    g.items.len()
+                    1 + items.len()
                 }
             })
             .sum()
@@ -234,19 +313,57 @@ impl ProblemsPanel {
         }
     }
 
-    /// Rebuild the flat row list for the current collapse state. Called at the
-    /// top of `render` so `rows` always matches what was painted.
+    /// Rebuild the flat row list for the current filter, collapse state, and
+    /// grouping. Called at the top of `render` so `rows` always matches what
+    /// was painted.
     fn build_rows(&mut self) {
         self.rows.clear();
-        for (g, group) in self.groups.iter().enumerate() {
+        for (g, items) in self.visible_groups() {
+            if !self.group_by_file {
+                // Flat list: diagnostics only, no headers, no collapse.
+                self.rows
+                    .extend(items.into_iter().map(|i| RenderRow::Diag(g, i)));
+                continue;
+            }
             self.rows.push(RenderRow::Header(g));
-            if !self.collapsed.contains(&group.path) {
-                for i in 0..group.items.len() {
-                    self.rows.push(RenderRow::Diag(g, i));
-                }
+            if !self.collapsed.contains(&self.groups[g].path) {
+                self.rows
+                    .extend(items.into_iter().map(|i| RenderRow::Diag(g, i)));
             }
         }
     }
+
+    /// Cycle the severity filter (toolbar funnel). Resets scroll so the
+    /// viewport can't strand past a now-shorter list.
+    fn cycle_filter(&mut self) {
+        self.filter = self.filter.next();
+        self.scroll = self.scroll.min(self.max_scroll());
+    }
+
+    /// Toggle grouping diagnostics by file (toolbar). Resets scroll.
+    fn toggle_group_by_file(&mut self) {
+        self.group_by_file = !self.group_by_file;
+        self.scroll = self.scroll.min(self.max_scroll());
+    }
+
+    /// Handle a click at `(x, y)`. Returns true if it landed on a toolbar
+    /// button (and was consumed); false if the caller should resolve it as a
+    /// row click via [`ProblemsPanel::hit_at`].
+    pub fn click(&mut self, x: u16, y: u16) -> bool {
+        if rect_has(self.filter_rect, x, y) {
+            self.cycle_filter();
+            return true;
+        }
+        if rect_has(self.group_rect, x, y) {
+            self.toggle_group_by_file();
+            return true;
+        }
+        false
+    }
+}
+
+fn rect_has(r: Rect, x: u16, y: u16) -> bool {
+    x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height
 }
 
 impl Default for ProblemsPanel {
@@ -267,6 +384,8 @@ impl Widget for &mut ProblemsPanel {
     fn render(self, area: Rect, buf: &mut Buffer) {
         self.last_area = area;
         self.last_scrollbar = Rect::default();
+        self.filter_rect = Rect::default();
+        self.group_rect = Rect::default();
         self.visible_rows = 0;
         self.build_rows();
         if area.width == 0 || area.height == 0 {
@@ -293,33 +412,68 @@ impl Widget for &mut ProblemsPanel {
             return;
         }
 
-        self.first_row_y = area.y;
-        self.viewport_rows = area.height;
+        // Reserve the top row for the toolbar (filter funnel + group toggle);
+        // the diagnostic list scrolls in the remaining rows below it.
+        let toolbar = Rect {
+            x: area.x,
+            y: area.y,
+            width: area.width,
+            height: 1,
+        };
+        self.render_toolbar(toolbar, buf);
+        let body = Rect {
+            x: area.x,
+            y: area.y + 1,
+            width: area.width,
+            height: area.height.saturating_sub(1),
+        };
+        if body.height == 0 {
+            return;
+        }
+        if self.rows.is_empty() {
+            Paragraph::new(Line::from(Span::styled(
+                "No problems match the current filter.",
+                Style::default().fg(COLOR_DIM),
+            )))
+            .render(
+                Rect {
+                    x: body.x + 1,
+                    y: body.y,
+                    width: body.width.saturating_sub(1),
+                    height: 1,
+                },
+                buf,
+            );
+            return;
+        }
+
+        self.first_row_y = body.y;
+        self.viewport_rows = body.height;
         let total = self.total_rows();
-        self.scroll = self.scroll.min(total.saturating_sub(area.height as usize));
+        self.scroll = self.scroll.min(total.saturating_sub(body.height as usize));
 
         let bar = scrollbar::vertical_metrics(
             Rect {
-                x: area.x + area.width.saturating_sub(1),
-                y: area.y,
+                x: body.x + body.width.saturating_sub(1),
+                y: body.y,
                 width: 1,
-                height: area.height,
+                height: body.height,
             },
             total,
-            area.height as usize,
+            body.height as usize,
             self.scroll,
         );
-        let content_w = area.width.saturating_sub(u16::from(bar.is_some()));
+        let content_w = body.width.saturating_sub(u16::from(bar.is_some()));
 
-        let visible = (area.height as usize).min(self.rows.len().saturating_sub(self.scroll));
+        let visible = (body.height as usize).min(self.rows.len().saturating_sub(self.scroll));
         self.visible_rows = visible as u16;
         let brand = self.focus_gradient;
 
         for row in 0..visible {
             let render_row = self.rows[self.scroll + row].clone();
-            let y = area.y + row as u16;
+            let y = body.y + row as u16;
             let row_rect = Rect {
-                x: area.x,
+                x: body.x,
                 y,
                 width: content_w,
                 height: 1,
@@ -344,6 +498,42 @@ impl Widget for &mut ProblemsPanel {
 }
 
 impl ProblemsPanel {
+    /// Paint the toolbar row: a severity-filter button and a group-by-file
+    /// toggle, both clickable (hit rects recorded for [`ProblemsPanel::click`]).
+    fn render_toolbar(&mut self, area: Rect, buf: &mut Buffer) {
+        let mut x = area.x + 1;
+        let mut button = |label: String, on: bool, buf: &mut Buffer| -> Rect {
+            let w = label.chars().count() as u16;
+            let r = Rect {
+                x,
+                y: area.y,
+                width: w.min(area.width.saturating_sub(x - area.x)),
+                height: 1,
+            };
+            let fg = if on { COLOR_HEADER } else { COLOR_DIM };
+            Paragraph::new(Line::from(Span::styled(
+                label,
+                Style::default().fg(fg).bg(COLOR_BTN_BG),
+            )))
+            .render(r, buf);
+            x += w + 1;
+            r
+        };
+        self.filter_rect = button(
+            format!(" Show: {} \u{25be}", self.filter.label()),
+            self.filter != ProblemFilter::All,
+            buf,
+        );
+        self.group_rect = button(
+            format!(
+                " Group: {} ",
+                if self.group_by_file { "File" } else { "None" }
+            ),
+            !self.group_by_file,
+            buf,
+        );
+    }
+
     fn header_spans(&self, g: usize) -> Vec<Span<'static>> {
         let group = &self.groups[g];
         let chevron = if self.collapsed.contains(&group.path) {
@@ -399,6 +589,13 @@ impl ProblemsPanel {
             format!("[Ln {}, Col {}]", item.line + 1, item.col + 1),
             Style::default().fg(COLOR_DIM),
         ));
+        // Flat list has no file header, so name the file on the row itself.
+        if !self.group_by_file {
+            spans.push(Span::styled(
+                format!(" {}", self.groups[g].name),
+                Style::default().fg(COLOR_DIM),
+            ));
+        }
         spans
     }
 }
@@ -474,13 +671,15 @@ mod tests {
             ],
         )]);
         render(&mut p, 60, 6);
-        assert_eq!(
-            p.hit_at(0),
-            Some(ProblemHit::Header(PathBuf::from("/repo/src/a.rs"))),
-            "row 0 is the file header",
-        );
+        // Row 0 is the toolbar; the file header and diagnostics start at row 1.
+        assert_eq!(p.hit_at(0), None, "row 0 is the toolbar, not a list row");
         assert_eq!(
             p.hit_at(1),
+            Some(ProblemHit::Header(PathBuf::from("/repo/src/a.rs"))),
+            "row 1 is the file header",
+        );
+        assert_eq!(
+            p.hit_at(2),
             Some(ProblemHit::Diagnostic {
                 path: PathBuf::from("/repo/src/a.rs"),
                 line: 4,
@@ -488,14 +687,14 @@ mod tests {
             }),
         );
         assert_eq!(
-            p.hit_at(2),
+            p.hit_at(3),
             Some(ProblemHit::Diagnostic {
                 path: PathBuf::from("/repo/src/a.rs"),
                 line: 9,
                 col: 0,
             }),
         );
-        assert_eq!(p.hit_at(3), None, "below the last row");
+        assert_eq!(p.hit_at(4), None, "below the last row");
     }
 
     #[test]
@@ -511,8 +710,9 @@ mod tests {
         p.toggle_collapse(&path);
         render(&mut p, 60, 6);
         assert_eq!(p.total_rows(), 1, "collapsed: header only");
-        assert_eq!(p.hit_at(1), None, "no diagnostic row when collapsed");
-        assert_eq!(p.hit_at(0), Some(ProblemHit::Header(path)));
+        // Row 0 is the toolbar; the header sits at row 1 and has no diag below.
+        assert_eq!(p.hit_at(2), None, "no diagnostic row when collapsed");
+        assert_eq!(p.hit_at(1), Some(ProblemHit::Header(path)));
     }
 
     #[test]
@@ -531,6 +731,71 @@ mod tests {
             '\u{ea74}'
         );
         assert_eq!(severity_glyph(DiagnosticSeverity::Hint).0, '\u{ea74}');
+    }
+
+    #[test]
+    fn severity_filter_hides_lower_severities_and_empty_groups() {
+        let mut p = ProblemsPanel::new();
+        p.set_groups(vec![
+            group(
+                "a.rs",
+                vec![
+                    diag(0, DiagnosticSeverity::Error, "boom"),
+                    diag(1, DiagnosticSeverity::Warning, "meh"),
+                ],
+            ),
+            group(
+                "b.rs",
+                vec![diag(2, DiagnosticSeverity::Warning, "only warn")],
+            ),
+        ]);
+        // All: 2 headers + 3 diags = 5 rows.
+        assert_eq!(p.total_rows(), 5);
+        // Errors only: b.rs has no error, so it drops entirely; a.rs keeps its
+        // one error. 1 header + 1 diag = 2 rows.
+        p.cycle_filter();
+        assert_eq!(p.filter, ProblemFilter::Errors);
+        assert_eq!(p.total_rows(), 2);
+        // Tab badge counts stay unfiltered.
+        assert_eq!(p.total_count(), 3);
+        assert_eq!(p.error_count(), 1);
+    }
+
+    #[test]
+    fn group_by_file_toggle_flattens_to_diagnostics_only() {
+        let mut p = ProblemsPanel::new();
+        p.set_groups(vec![
+            group("a.rs", vec![diag(0, DiagnosticSeverity::Error, "boom")]),
+            group("b.rs", vec![diag(2, DiagnosticSeverity::Error, "kaboom")]),
+        ]);
+        // Grouped: 2 headers + 2 diags.
+        assert_eq!(p.total_rows(), 4);
+        p.toggle_group_by_file();
+        assert!(!p.group_by_file);
+        // Flat: 2 diags, no headers.
+        assert_eq!(p.total_rows(), 2);
+        render(&mut p, 80, 6);
+        // Row 1 (below the toolbar) is a diagnostic, not a header.
+        assert!(matches!(p.hit_at(1), Some(ProblemHit::Diagnostic { .. })));
+    }
+
+    #[test]
+    fn toolbar_click_cycles_filter_then_toggles_grouping() {
+        let mut p = ProblemsPanel::new();
+        p.set_groups(vec![group(
+            "a.rs",
+            vec![diag(0, DiagnosticSeverity::Error, "boom")],
+        )]);
+        render(&mut p, 80, 6);
+        let fr = p.filter_rect;
+        assert!(fr.width > 0, "filter button rect recorded");
+        assert!(p.click(fr.x, fr.y), "filter button consumes the click");
+        assert_eq!(p.filter, ProblemFilter::Errors);
+        let gr = p.group_rect;
+        assert!(p.click(gr.x, gr.y), "group button consumes the click");
+        assert!(!p.group_by_file);
+        // A click in the empty body is not consumed by the toolbar.
+        assert!(!p.click(0, 5));
     }
 
     #[test]

@@ -5482,6 +5482,29 @@ fn cmd_shift_slash_on_the_tree_root_walks_up_one_filesystem_level() {
 }
 
 #[test]
+fn status_bar_indent_menu_action_pins_the_editor_indent_style() {
+    use crate::widgets::editor::IndentStyle;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    // Default is spaces; the pill click routes through SetIndentStyle to tabs.
+    app.dispatch_menu_action(
+        MenuAction::SetIndentStyle(IndentStyle {
+            width: 4,
+            use_spaces: false,
+        }),
+        tmp.path().to_path_buf(),
+    );
+    assert_eq!(
+        app.editor.indent_style(),
+        IndentStyle {
+            width: 4,
+            use_spaces: false,
+        }
+    );
+    assert_eq!(app.editor.indent_style().label(), "Tab Size: 4");
+}
+
+#[test]
 fn dispatch_make_root_changes_tree_root_and_workspace_root() {
     let tmp = tempfile::tempdir().unwrap();
     let project = tmp.path().join("project_b");
@@ -10654,8 +10677,10 @@ fn finder_drop_on_remote_view_with_no_target_reports_clear_status() {
 }
 
 fn relay_test_lock() -> &'static std::sync::Mutex<()> {
-    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    // The relay tests mutate $HOME, so share the crate-wide HOME_LOCK rather
+    // than a private mutex — otherwise they could race the file_finder / zoxide
+    // $HOME tests running on another thread of the same binary.
+    &crate::HOME_LOCK
 }
 
 /// Point `$HOME` (hence `croft_cache_dir`) at a temp dir and set a fixed
@@ -14511,9 +14536,9 @@ fn clicking_a_problem_row_opens_that_file_at_the_line() {
     let backend = ratatui::backend::TestBackend::new(140, 50);
     let mut term = ratatui::Terminal::new(backend).unwrap();
     term.draw(|f| app.render(f)).unwrap();
-    // Row 0 of the list is the file header; row 1 is the diagnostic.
+    // Row 0 is the toolbar, row 1 the file header, row 2 the diagnostic.
     let list = app.problems.last_area;
-    left_click(&mut app, list.x + 4, list.y + 1);
+    left_click(&mut app, list.x + 4, list.y + 2);
     assert_eq!(
         app.editor.path.as_deref(),
         Some(file.as_path()),
