@@ -59,13 +59,7 @@ pub struct ReleaseNote {
 }
 
 /// What shipped in the current release. Replace on every version bump.
-pub const RELEASE_NOTES: &[ReleaseNote] = &[
-    ReleaseNote {
-        kind: NoteKind::Feature,
-        summary: "Status-bar indentation control: the \"Spaces: 4\" pill is now clickable — switch Indent Using Spaces / Tabs, change the tab size, and convert the buffer's existing indentation, all from the status bar (VS Code's Select Indentation menu).",
-    },
-    ReleaseNote {
-        kind: NoteKind::Feature,
-        summary: "Problems panel toolbar: filter by severity (All / Errors / Errors & Warnings) and toggle grouping by file versus a flat, file-annotated list, both one click away.",
-    },
-];
+pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
+    kind: NoteKind::Feature,
+    summary: "Redo: Shift+Cmd/Ctrl+Z (Ctrl+R in vim mode) reapplies an undone edit; a fresh edit after an undo discards the redo branch, matching VS Code.",
+}];

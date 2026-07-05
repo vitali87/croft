@@ -2829,6 +2829,21 @@ fn plain_z_is_not_editor_undo_key() {
 fn shift_cmd_z_reserved_for_redo_not_undo() {
     let mods = KeyModifiers::SUPER | KeyModifiers::SHIFT;
     assert!(!is_editor_undo_key(key(KeyCode::Char('z'), mods)));
+    // The shifted chord is redo (both Cmd and Ctrl surfaces), and the plain
+    // command-modifier Z stays undo, not redo.
+    assert!(is_editor_redo_key(key(KeyCode::Char('z'), mods)));
+    assert!(is_editor_redo_key(key(
+        KeyCode::Char('z'),
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT
+    )));
+    assert!(!is_editor_redo_key(key(
+        KeyCode::Char('z'),
+        KeyModifiers::SUPER
+    )));
+    assert!(!is_editor_redo_key(key(
+        KeyCode::Char('z'),
+        KeyModifiers::CONTROL
+    )));
 }
 
 #[test]

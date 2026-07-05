@@ -93,6 +93,10 @@ const CMD_X_KEY: &str = "0x78-0x100000-0x7";
 const CMD_X_HEX: &str = "0x1b 0x5b 0x31 0x32 0x30 0x3b 0x39 0x75";
 const CMD_Z_KEY: &str = "0x7a-0x100000-0x6";
 const CMD_Z_HEX: &str = "0x1b 0x5b 0x31 0x32 0x32 0x3b 0x39 0x75";
+// Cmd+Shift+Z: editor redo (undo's sibling). Codepoint 'Z' (0x5a), Cmd+Shift
+// mask 0x120000, vkcode 0x6; CSI-u `ESC [ 90 ; 10 u`.
+const CMD_SHIFT_Z_KEY: &str = "0x5a-0x120000-0x6";
+const CMD_SHIFT_Z_HEX: &str = "0x1b 0x5b 0x39 0x30 0x3b 0x31 0x30 0x75";
 /// Vim-style chord starts and goto-bottom that the editor consumes.
 /// CSI-u `ESC [ <codepoint> ; 9 u` for Cmd+letter and
 /// `ESC [ <shifted-glyph> ; 10 u` for Cmd+Shift+letter; modifier byte
@@ -555,6 +559,7 @@ pub(crate) mod payloads {
     pub(crate) const CMD_X_HEX: &str = super::CMD_X_HEX;
     pub(crate) const CMD_Y_HEX: &str = super::CMD_Y_HEX;
     pub(crate) const CMD_Z_HEX: &str = super::CMD_Z_HEX;
+    pub(crate) const CMD_SHIFT_Z_HEX: &str = super::CMD_SHIFT_Z_HEX;
     pub(crate) const CTRL_SHIFT_F12_HEX: &str = super::CTRL_SHIFT_F12_HEX;
     pub(crate) const CTRL_SHIFT_J_HEX: &str = super::CTRL_SHIFT_J_HEX;
 }
@@ -776,6 +781,7 @@ pub fn apply_croft_key_settings(plist: &mut Value) -> Result<(), ITerm2Error> {
         (CMD_S_KEY, CMD_S_HEX),
         (CMD_X_KEY, CMD_X_HEX),
         (CMD_Z_KEY, CMD_Z_HEX),
+        (CMD_SHIFT_Z_KEY, CMD_SHIFT_Z_HEX),
         (CMD_D_KEY, CMD_D_HEX),
         (CMD_G_KEY, CMD_G_HEX),
         (CMD_K_KEY, CMD_K_HEX),
@@ -1198,6 +1204,11 @@ mod tests {
             ),
             (CMD_X_KEY, CMD_X_HEX, "Cmd+X (editor cut)"),
             (CMD_Z_KEY, CMD_Z_HEX, "Cmd+Z (editor undo)"),
+            (
+                CMD_SHIFT_Z_KEY,
+                CMD_SHIFT_Z_HEX,
+                "Cmd+Shift+Z (editor redo)",
+            ),
         ] {
             assert_eq!(
                 action_text(global, key),

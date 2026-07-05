@@ -15551,6 +15551,14 @@ impl App {
             }
             return;
         }
+        if is_editor_redo_key(key) {
+            if self.editor.redo() {
+                self.status = String::from("Redo");
+            } else {
+                self.status = String::from("Nothing to redo");
+            }
+            return;
+        }
         if let Some(idx) = jump_to_tab_index(key) {
             if self.editor.select(idx) {
                 self.sync_open_file_poll_mtime();
@@ -15804,6 +15812,13 @@ impl App {
                     String::from("Undo")
                 } else {
                     String::from("Nothing to undo")
+                };
+            }
+            VimAction::Redo => {
+                self.status = if self.editor.redo() {
+                    String::from("Redo")
+                } else {
+                    String::from("Nothing to redo")
                 };
             }
             VimAction::EnterVisual { line } => {
@@ -18673,6 +18688,20 @@ impl App {
                 }
             }
             Cmd::SaveFile => self.save(),
+            Cmd::Undo => {
+                self.status = if self.editor.undo() {
+                    String::from("Undo")
+                } else {
+                    String::from("Nothing to undo")
+                };
+            }
+            Cmd::Redo => {
+                self.status = if self.editor.redo() {
+                    String::from("Redo")
+                } else {
+                    String::from("Nothing to redo")
+                };
+            }
             Cmd::CloseEditor => {
                 if self.editor.close_active() {
                     self.sync_open_file_poll_mtime();
@@ -25359,8 +25388,8 @@ fn is_editor_select_all_key(key: KeyEvent) -> bool {
     key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::SUPER)
 }
 
-/// Undo: `Ctrl+Z` / `Cmd+Z`. Plain Shift is ignored (Shift+Cmd+Z is reserved
-/// for redo, which croft does not implement yet).
+/// Undo: `Ctrl+Z` / `Cmd+Z`. Plain Shift is rejected so it stays distinct from
+/// the redo chord `Shift+Cmd+Z` / `Shift+Ctrl+Z` (see `is_editor_redo_key`).
 fn is_editor_undo_key(key: KeyEvent) -> bool {
     let KeyCode::Char(c) = key.code else {
         return false;
@@ -25369,6 +25398,21 @@ fn is_editor_undo_key(key: KeyEvent) -> bool {
         return false;
     }
     if key.modifiers.contains(KeyModifiers::SHIFT) {
+        return false;
+    }
+    key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::SUPER)
+}
+
+/// Redo: `Shift+Cmd+Z` / `Shift+Ctrl+Z` (VS Code's default). `Cmd+Y` is not a
+/// redo alias here because it is already the `Cmd+y y` yank-line leader.
+fn is_editor_redo_key(key: KeyEvent) -> bool {
+    let KeyCode::Char(c) = key.code else {
+        return false;
+    };
+    if !c.eq_ignore_ascii_case(&'z') {
+        return false;
+    }
+    if !key.modifiers.contains(KeyModifiers::SHIFT) {
         return false;
     }
     key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::SUPER)

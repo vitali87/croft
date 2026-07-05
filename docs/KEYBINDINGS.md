@@ -206,6 +206,7 @@ All three live under `~/.config/croft/` (XDG-resolved, so the same paths on macO
 | `Ctrl`+`X` / `Cmd`+`X` | Cut the selection |
 | `Ctrl`+`V` / `Cmd`+`V` | Paste at the cursor (replaces any selection) |
 | `Ctrl`+`Z` / `Cmd`+`Z` | Undo (typing bursts coalesce; backspace, paste, cut, replace are each one step) |
+| `Shift`+`Ctrl`+`Z` / `Shift`+`Cmd`+`Z` | Redo the most recently undone step; a fresh edit after an undo discards the redo branch (also Command Palette "Redo") |
 | `Cmd`+`A` | Select the entire buffer |
 | `Ctrl`+`f` / `Cmd`+`f` | Inline Find bar: pre-filled from the selection or word under the cursor; active match in orange, the rest in yellow; `Enter`/`F3` forward, `Shift+Enter`/`Shift+F3` back, `Esc` closes |
 | `Ctrl`+`Alt`+`f` / `Cmd`+`Opt`+`f` | Replace in File: the Find bar expanded with a replace row; `Tab` switches field, `Enter` in the replace row replaces the current match and advances, `Cmd`+`Opt`+`Enter` (`Ctrl`+`Alt`+`Enter` on Linux) replaces all as one undo step; `$1` capture references work in regex mode |
@@ -256,6 +257,7 @@ All three live under `~/.config/croft/` (XDG-resolved, so the same paths on macO
 | `dd` `yy` `cc` | Linewise delete / yank / change |
 | `p` `P` | Paste after / before |
 | `u` | Undo |
+| `Ctrl`+`r` | Redo |
 | `v` `V` | Charwise / linewise Visual; a motion extends, `d` `y` `c` operate |
 | `/` `?` then `Enter`, `n` `N` | Search forward / back, jump to next / previous match |
 | `:w` `:q` `:wq` `:x` `:q!` `:qa`, `:{n}` | Write, close tab, write-and-close, quit-all, or jump to line n |
@@ -411,6 +413,7 @@ The PORTS tab in the bottom panel group lists the loopback ports croft has notic
 | `⌘F12` | Go to Implementations |
 | `⌃⇧F12` | Go to Declaration |
 | `⌘S` / `⌘C` / `⌘X` / `⌘Z` / `⌘A` | Save / Copy / Cut / Undo / Select All |
+| `⌘⇧Z` | Redo |
 | `⌘T` / `⌘W` / `⌘]` / `⌘[` | New terminal / close terminal / cycle terminals |
 
 `⌘V` is deliberately left on iTerm2's native Paste; croft reads the system clipboard and routes it by focus, so paste works identically over SSH. If you skip the setup command, the zero-setup `Ctrl`-based chords above still work, and you can map individual `Cmd` chords by hand in iTerm2 → Settings → Profiles → Keys → Key Mappings (e.g. `⌘S` → Send Hex Code `0x13`).

@@ -372,6 +372,11 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 handler: "is_editor_undo_key",
             },
             ShortcutEntry {
+                keys: "Shift+Cmd/Ctrl+Z",
+                description: "Redo",
+                handler: "is_editor_redo_key",
+            },
+            ShortcutEntry {
                 keys: "Cmd/Ctrl+A",
                 description: "Select the entire buffer",
                 handler: "is_editor_select_all_key",

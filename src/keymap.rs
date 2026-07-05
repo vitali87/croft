@@ -480,6 +480,14 @@ mod tests {
         assert_eq!(k, "0x2e-0x100000-0x2f");
         assert_eq!(h, "0x1b 0x5b 0x34 0x36 0x3b 0x39 0x75");
 
+        // Matches the hand-written CMD_SHIFT_Z consts in iterm2.rs (editor redo).
+        let (k, h) = Chord::parse("cmd+shift+z")
+            .unwrap()
+            .iterm2_forwarder()
+            .unwrap();
+        assert_eq!(k, "0x5a-0x120000-0x6");
+        assert_eq!(h, "0x1b 0x5b 0x39 0x30 0x3b 0x31 0x30 0x75");
+
         let (k, _) = Chord::parse("cmd+0").unwrap().iterm2_forwarder().unwrap();
         assert_eq!(k, "0x30-0x100000-0x1d");
     }

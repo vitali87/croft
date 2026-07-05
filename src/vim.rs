@@ -161,6 +161,7 @@ pub enum VimAction {
     Insert(InsertAt),
     Paste(PasteAt, usize),
     Undo,
+    Redo,
     EnterVisual {
         line: bool,
     },
@@ -450,6 +451,19 @@ impl VimState {
             KeyCode::Left => return self.resolve_motion(Motion::Left),
             KeyCode::Right => return self.resolve_motion(Motion::Right),
             _ => {}
+        }
+
+        // Ctrl+R: redo (vim's redo). Normal mode with nothing pending; it
+        // arrives as a Ctrl chord that `plain_char` would otherwise drop to
+        // PassThrough. `Cmd/Ctrl+Shift+Z` still works too via the editor chord.
+        if self.mode == VimMode::Normal
+            && self.pending_op.is_none()
+            && !self.pending_g
+            && matches!(key.code, KeyCode::Char('r' | 'R'))
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+        {
+            self.clear_pending();
+            return VimKeyResult::Consumed(vec![VimAction::Redo]);
         }
 
         let Some(c) = plain_char(key) else {
@@ -1076,6 +1090,16 @@ mod tests {
         assert_eq!(
             v.on_key(ch('u')),
             VimKeyResult::Consumed(vec![VimAction::Undo])
+        );
+    }
+
+    #[test]
+    fn ctrl_r_redoes() {
+        let mut v = enabled();
+        let ctrl_r = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL);
+        assert_eq!(
+            v.on_key(ctrl_r),
+            VimKeyResult::Consumed(vec![VimAction::Redo])
         );
     }
 

@@ -1406,6 +1406,9 @@ pub struct Editor {
     /// tab is never the replaceable preview slot (pinning clears `preview`).
     pub pinned: bool,
     undo_stack: Vec<Snapshot>,
+    /// States popped off `undo_stack` by `undo`, awaiting `redo`. Cleared by any
+    /// fresh edit (`push_undo`) so a new edit branches history like VS Code.
+    redo_stack: Vec<Snapshot>,
     last_edit_kind: Option<EditKind>,
     lang: Option<LangKind>,
     /// Explicit indentation preference set from the status-bar pill. `None`
@@ -1561,6 +1564,7 @@ impl Editor {
             preview: false,
             pinned: false,
             undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
             last_edit_kind: None,
             lang: None,
             indent_override: None,
@@ -2107,6 +2111,7 @@ impl Editor {
         self.dirty = false;
         self.selection = None;
         self.undo_stack.clear();
+        self.redo_stack.clear();
         self.last_edit_kind = None;
         self.image = None;
         self.sheet = None;
@@ -2149,6 +2154,7 @@ impl Editor {
         self.dirty = false;
         self.selection = None;
         self.undo_stack.clear();
+        self.redo_stack.clear();
         self.last_edit_kind = None;
         self.highlights = vec![Vec::new()];
         self.image = Some(ImageView {
@@ -2178,6 +2184,7 @@ impl Editor {
         self.dirty = false;
         self.selection = None;
         self.undo_stack.clear();
+        self.redo_stack.clear();
         self.last_edit_kind = None;
         self.highlights = vec![Vec::new()];
         self.image = None;
@@ -2207,6 +2214,7 @@ impl Editor {
         self.dirty = false;
         self.selection = None;
         self.undo_stack.clear();
+        self.redo_stack.clear();
         self.last_edit_kind = None;
         self.highlights = vec![Vec::new()];
         self.image = Some(ImageView {
@@ -3357,6 +3365,10 @@ impl Editor {
                 self.undo_stack.remove(0);
             }
         }
+        // A fresh edit branches history: whatever was undone can no longer be
+        // redone (VS Code's model). Cleared even on a coalesced keystroke so a
+        // typing burst after an undo discards the redo branch on its first char.
+        self.redo_stack.clear();
         self.last_edit_kind = Some(kind);
     }
 
@@ -3365,6 +3377,27 @@ impl Editor {
         let Some(snap) = self.undo_stack.pop() else {
             return false;
         };
+        // Stash the pre-undo state so `redo` can reinstate it.
+        self.redo_stack.push(self.snapshot());
+        self.restore_snapshot(snap);
+        true
+    }
+
+    /// Reapply the most recently undone edit step. Returns true iff state was
+    /// changed. Mirrors `undo`, moving the current state back onto the undo
+    /// stack so the redone edit can itself be undone.
+    pub fn redo(&mut self) -> bool {
+        let Some(snap) = self.redo_stack.pop() else {
+            return false;
+        };
+        self.undo_stack.push(self.snapshot());
+        self.restore_snapshot(snap);
+        true
+    }
+
+    /// Replace the buffer state with a snapshot (shared by undo/redo), clamping
+    /// the caret into the restored buffer and refreshing highlights.
+    fn restore_snapshot(&mut self, snap: Snapshot) {
         self.lines = snap.lines;
         if self.lines.is_empty() {
             self.lines.push(String::new());
@@ -3375,8 +3408,15 @@ impl Editor {
         self.carets = snap.carets;
         self.dirty = snap.dirty;
         self.last_edit_kind = None;
+        // A restore changes the buffer content, so bump the change counter (the
+        // app resyncs the LSP / git gutter off `edit_seq`) and drop the wrap /
+        // hscroll geometry caches keyed to the old text. `dirty` is taken from
+        // the snapshot above, so this is not `mark_buffer_changed` (which would
+        // force it true and lose an undo back to a saved state).
+        self.edit_seq = self.edit_seq.wrapping_add(1);
+        self.hscroll_content_cols = None;
+        self.wrap_total_cache.clear();
         self.recompute_highlights();
-        true
     }
 
     /// Open a new undo step for the next edit (so a typing run doesn't
@@ -8996,6 +9036,52 @@ mod tests {
         assert_eq!(e.lines, vec!["    pass".to_string()]);
         assert!(e.undo());
         assert_eq!(e.lines, vec!["        pass".to_string()]);
+    }
+
+    #[test]
+    fn redo_reapplies_an_undone_edit() {
+        let mut e = editor_with("");
+        e.insert_char('a');
+        e.insert_char('b');
+        assert_eq!(e.lines, vec!["ab".to_string()]);
+        assert!(e.undo());
+        assert_eq!(e.lines, vec![String::new()]);
+        assert!(e.redo());
+        assert_eq!(e.lines, vec!["ab".to_string()]);
+        assert_eq!(e.cursor_col, 2);
+    }
+
+    #[test]
+    fn redo_is_a_noop_on_an_empty_redo_stack() {
+        let mut e = editor_with("x");
+        assert!(!e.redo());
+    }
+
+    #[test]
+    fn undo_and_redo_bump_edit_seq_so_the_app_resyncs() {
+        // The app drives LSP did_change / git-gutter refresh off edit_seq; a
+        // buffer restore must bump it or diagnostics go stale until the next
+        // keystroke.
+        let mut e = editor_with("");
+        e.insert_char('a');
+        let after_edit = e.edit_seq;
+        assert!(e.undo());
+        assert!(e.edit_seq > after_edit, "undo must bump edit_seq");
+        let after_undo = e.edit_seq;
+        assert!(e.redo());
+        assert!(e.edit_seq > after_undo, "redo must bump edit_seq");
+    }
+
+    #[test]
+    fn a_new_edit_after_undo_discards_the_redo_branch() {
+        let mut e = editor_with("");
+        e.insert_char('a');
+        assert!(e.undo());
+        assert_eq!(e.lines, vec![String::new()]);
+        // A fresh edit branches history: the redo of "a" must be discarded.
+        e.insert_char('b');
+        assert!(!e.redo(), "a fresh edit must clear the redo stack");
+        assert_eq!(e.lines, vec!["b".to_string()]);
     }
 
     #[test]
