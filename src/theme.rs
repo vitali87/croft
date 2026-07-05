@@ -186,6 +186,14 @@ impl Theme {
         rgb(self.selection)
     }
 
+    /// Soft translucent accent fill behind an active toolbar control (VS Code's
+    /// lit-filter highlight): the theme accent blended over the panel
+    /// background so a non-default filter/toggle reads as lit without a heavy
+    /// opaque box.
+    pub fn accent_chip_bg(self) -> Color {
+        self.blend_over_bg(self.accent, 0.18)
+    }
+
     /// Filter/search input fill.
     pub fn search_bg(self) -> Color {
         rgb(self.search)

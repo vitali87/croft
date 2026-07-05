@@ -30,10 +30,6 @@ const COLOR_ERROR: Color = Color::Rgb(0xf1, 0x4c, 0x4c);
 const COLOR_WARNING: Color = Color::Rgb(0xcc, 0xa7, 0x00);
 const COLOR_INFO: Color = Color::Rgb(0x3b, 0x9e, 0xff);
 
-/// Subtle raised background for the toolbar buttons, so they read as clickable
-/// against the panel body.
-const COLOR_BTN_BG: Color = Color::Rgb(0x2a, 0x2d, 0x35);
-
 /// Codicon severity glyphs, verified against the upstream codicon
 /// `mapping.json` on 2026-06-28: `error` = 60039 (U+EA87), `warning` = 60012
 /// (U+EA6C), `info` = 60020 (U+EA74). Nerd Fonts preserve codicon codepoints
@@ -498,40 +494,52 @@ impl Widget for &mut ProblemsPanel {
 }
 
 impl ProblemsPanel {
-    /// Paint the toolbar row: a severity-filter button and a group-by-file
-    /// toggle, both clickable (hit rects recorded for [`ProblemsPanel::click`]).
+    /// Paint the toolbar row, right-aligned like VS Code's panel filter: a
+    /// severity-filter control (`<label> ▾`) and a grouping toggle
+    /// (`Grouped`/`Flat`). Both are plain muted text at their default state;
+    /// when off-default they get a soft translucent accent chip so a lit filter
+    /// or flat view reads at a glance. Clickable (hit rects recorded for
+    /// [`ProblemsPanel::click`]).
     fn render_toolbar(&mut self, area: Rect, buf: &mut Buffer) {
-        let mut x = area.x + 1;
-        let mut button = |label: String, on: bool, buf: &mut Buffer| -> Rect {
-            let w = label.chars().count() as u16;
+        let muted = self.theme.ignored_fg();
+        let accent = self.theme.accent();
+        let chip = self.theme.accent_chip_bg();
+
+        let filter_label = format!(" {} \u{25be} ", self.filter.label());
+        let group_label = format!(
+            " {} ",
+            if self.group_by_file {
+                "Grouped"
+            } else {
+                "Flat"
+            }
+        );
+        let fw = filter_label.chars().count() as u16;
+        let gw = group_label.chars().count() as u16;
+        // A one-cell gap between the two controls and one trailing cell of
+        // breathing room at the right edge.
+        let total = fw + 1 + gw + 1;
+
+        let mut x = area.x + area.width.saturating_sub(total.min(area.width));
+        let mut control = |label: String, active: bool, buf: &mut Buffer| -> Rect {
+            let w = (label.chars().count() as u16).min(area.right().saturating_sub(x));
             let r = Rect {
                 x,
                 y: area.y,
-                width: w.min(area.width.saturating_sub(x - area.x)),
+                width: w,
                 height: 1,
             };
-            let fg = if on { COLOR_HEADER } else { COLOR_DIM };
-            Paragraph::new(Line::from(Span::styled(
-                label,
-                Style::default().fg(fg).bg(COLOR_BTN_BG),
-            )))
-            .render(r, buf);
+            let style = if active {
+                Style::default().fg(accent).bg(chip)
+            } else {
+                Style::default().fg(muted)
+            };
+            Paragraph::new(Line::from(Span::styled(label, style))).render(r, buf);
             x += w + 1;
             r
         };
-        self.filter_rect = button(
-            format!(" Show: {} \u{25be}", self.filter.label()),
-            self.filter != ProblemFilter::All,
-            buf,
-        );
-        self.group_rect = button(
-            format!(
-                " Group: {} ",
-                if self.group_by_file { "File" } else { "None" }
-            ),
-            !self.group_by_file,
-            buf,
-        );
+        self.filter_rect = control(filter_label, self.filter != ProblemFilter::All, buf);
+        self.group_rect = control(group_label, !self.group_by_file, buf);
     }
 
     fn header_spans(&self, g: usize) -> Vec<Span<'static>> {
@@ -777,6 +785,46 @@ mod tests {
         render(&mut p, 80, 6);
         // Row 1 (below the toolbar) is a diagnostic, not a header.
         assert!(matches!(p.hit_at(1), Some(ProblemHit::Diagnostic { .. })));
+    }
+
+    #[test]
+    fn active_toolbar_control_gets_the_accent_chip_default_is_plain() {
+        let mut p = ProblemsPanel::new();
+        p.set_groups(vec![group(
+            "a.rs",
+            vec![diag(0, DiagnosticSeverity::Error, "boom")],
+        )]);
+        // Default: filter All, grouped — neither control is chipped.
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 6,
+        };
+        let mut buf = Buffer::empty(area);
+        p.render(area, &mut buf);
+        let chip = p.theme.accent_chip_bg();
+        let cell_bg = |b: &Buffer, r: Rect| b[(r.x, r.y)].style().bg;
+        assert_ne!(
+            cell_bg(&buf, p.filter_rect),
+            Some(chip),
+            "All filter is plain, no chip",
+        );
+
+        // Turn the filter off-default: it lights up with the accent chip.
+        p.cycle_filter();
+        let mut buf = Buffer::empty(area);
+        p.render(area, &mut buf);
+        assert_eq!(
+            cell_bg(&buf, p.filter_rect),
+            Some(chip),
+            "a non-default filter is chipped with the theme accent",
+        );
+        assert_ne!(
+            cell_bg(&buf, p.group_rect),
+            Some(chip),
+            "grouping is still default, so its control stays plain",
+        );
     }
 
     #[test]
