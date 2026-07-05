@@ -38,6 +38,11 @@ pub struct CompletionItem {
     pub insert_text: Option<String>,
     pub filter_text: Option<String>,
     pub kind: Option<CompletionItemKind>,
+    /// The `insert_text` is a snippet body (`$1`/`$0` tab stops) rather than
+    /// literal text: an LSP item with `insertTextFormat: Snippet`, or a user
+    /// snippet injected into the popup. The app expands it through the editor's
+    /// snippet engine on accept instead of inserting it verbatim.
+    pub is_snippet: bool,
 }
 
 #[derive(Debug)]
@@ -2922,12 +2927,14 @@ fn text_edit_to_span(te: &TextEdit) -> TextSpanEdit {
 }
 
 fn into_item(item: lsp_types::CompletionItem) -> CompletionItem {
+    let is_snippet = item.insert_text_format == Some(lsp_types::InsertTextFormat::SNIPPET);
     CompletionItem {
         label: item.label,
         detail: item.detail,
         insert_text: item.insert_text,
         filter_text: item.filter_text,
         kind: item.kind,
+        is_snippet,
     }
 }
 

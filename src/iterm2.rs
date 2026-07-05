@@ -838,6 +838,13 @@ pub fn apply_croft_key_settings(plist: &mut Value) -> Result<(), ITerm2Error> {
     for key in CMD_ARROW_CLEANUP_KEYS {
         global.remove(key);
     }
+    // User keybindings: forward each reserved-Cmd chord the same way the
+    // built-ins are, so a rebind in keybindings.json actually reaches croft in
+    // iTerm2. Added last so a user chord that collides with a built-in wins.
+    insert_user_keymap_forwarders(
+        global,
+        &crate::keymap::Keymap::load(&crate::keymap::keybindings_path()),
+    );
 
     dict.insert(MOUSE_REPORTING_FRUSTRATION_KEY.into(), Value::Boolean(true));
 
@@ -895,6 +902,16 @@ fn dict_entry_mut<'a>(dict: &'a mut Dictionary, key: &str) -> &'a mut Dictionary
     dict.get_mut(key)
         .and_then(|v| v.as_dictionary_mut())
         .expect("dictionary value was just inserted")
+}
+
+/// Install a `GlobalKeyMap` "Send Hex Code" forwarder for every user-bound
+/// chord that needs one (see [`crate::keymap::Chord::iterm2_forwarder`]).
+fn insert_user_keymap_forwarders(global: &mut Dictionary, keymap: &crate::keymap::Keymap) {
+    for chord in keymap.chords() {
+        if let Some((key, hex)) = chord.iterm2_forwarder() {
+            global.insert(key, send_hex_action(&hex, 0));
+        }
+    }
 }
 
 fn send_hex_action(text: &str, apply_mode: i64) -> Value {
@@ -959,6 +976,22 @@ pub fn default_plist_path() -> PathBuf {
 mod tests {
     use super::*;
     use plist::Value;
+
+    #[test]
+    fn user_keymap_chord_is_forwarded_into_the_global_key_map() {
+        // A user rebind of an otherwise-unbound Cmd chord must install a CSI-u
+        // forwarder, or the chord is eaten by macOS and never reaches croft.
+        let mut global = Dictionary::new();
+        let km = crate::keymap::Keymap::from_json(
+            r#"[{ "key": "cmd+j", "command": "toggle_terminal" }]"#,
+        );
+        insert_user_keymap_forwarders(&mut global, &km);
+        // cmd+j: 'j' = 0x6a, Cmd mask 0x100000, kVK_ANSI_J = 0x26.
+        assert!(
+            global.contains_key("0x6a-0x100000-0x26"),
+            "the user's cmd+j binding must be forwarded so it reaches croft in iTerm2"
+        );
+    }
 
     fn synth_plist(default_guid: &str, profile_guids: &[&str]) -> Value {
         let mut bookmarks: Vec<Value> = Vec::new();

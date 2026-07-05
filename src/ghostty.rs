@@ -138,8 +138,17 @@ fn csi_body(hex: &str) -> String {
 }
 
 /// Render croft's managed keybind block: the begin marker, one `keybind` line
-/// per forwarded chord (including the digit chords), and the end marker.
+/// per forwarded chord (including the digit chords and any user keybindings),
+/// and the end marker.
 pub(crate) fn render_keybind_block() -> String {
+    render_keybind_block_with(&crate::keymap::Keymap::load(
+        &crate::keymap::keybindings_path(),
+    ))
+}
+
+/// The block renderer, taking the user keymap explicitly so it can be tested
+/// without touching the real config.
+pub(crate) fn render_keybind_block_with(keymap: &crate::keymap::Keymap) -> String {
     let mut lines = Vec::with_capacity(CHORDS.len() + pl::CMD_DIGIT_CHORDS.len() + 2);
     lines.push(BLOCK_BEGIN.to_string());
     for (trigger, hex) in CHORDS {
@@ -153,6 +162,18 @@ pub(crate) fn render_keybind_block() -> String {
             "{KEYBIND_PREFIX}cmd+{digit}={CSI_ACTION}{}",
             csi_body(hex)
         ));
+    }
+    // User keybindings: forward each reserved-Cmd chord via the same CSI-u
+    // payload iTerm2 sends, so a rebind reaches croft under Ghostty too.
+    for chord in keymap.chords() {
+        if let (Some(trigger), Some((_key, hex))) =
+            (chord.ghostty_trigger(), chord.iterm2_forwarder())
+        {
+            lines.push(format!(
+                "{KEYBIND_PREFIX}{trigger}={CSI_ACTION}{}",
+                csi_body(&hex)
+            ));
+        }
     }
     lines.push(BLOCK_END.to_string());
     lines.join("\n")
@@ -228,6 +249,19 @@ pub fn default_config_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn user_keybinding_appends_a_forwarding_keybind_line() {
+        let km = crate::keymap::Keymap::from_json(
+            r#"[{ "key": "cmd+j", "command": "toggle_terminal" }]"#,
+        );
+        let block = render_keybind_block_with(&km);
+        // cmd+j forwards as CSI 106;9u (106 = 'j', modbyte 9 = Cmd).
+        assert!(
+            block.contains("keybind = cmd+j=csi:106;9u"),
+            "the user's cmd+j binding must appear as a Ghostty csi forwarder:\n{block}"
+        );
+    }
 
     #[test]
     fn csi_body_strips_the_esc_bracket_introducer() {

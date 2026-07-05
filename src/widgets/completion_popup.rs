@@ -121,6 +121,12 @@ impl CompletionPopup {
         })
     }
 
+    /// Whether the selected item's insertion text is a snippet body (tab stops)
+    /// the caller must expand rather than insert verbatim.
+    pub fn selected_is_snippet(&self) -> bool {
+        self.selected_item().is_some_and(|item| item.is_snippet)
+    }
+
     pub fn area_for(&self, viewport: Rect) -> Rect {
         let visible = self.visible_indices();
         let count = visible.len().clamp(1, MAX_VISIBLE_ITEMS);
@@ -244,6 +250,7 @@ mod tests {
             insert_text: None,
             filter_text: None,
             kind: None,
+            is_snippet: false,
         }
     }
 
@@ -328,6 +335,7 @@ mod tests {
                 insert_text: Some("getcwd".into()),
                 filter_text: None,
                 kind: None,
+                is_snippet: false,
             }],
             "",
         );
@@ -343,6 +351,7 @@ mod tests {
                 insert_text: None,
                 filter_text: Some("matchme".into()),
                 kind: None,
+                is_snippet: false,
             }],
             "match",
         );

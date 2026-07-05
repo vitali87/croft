@@ -62,11 +62,11 @@ pub struct ReleaseNote {
 pub const RELEASE_NOTES: &[ReleaseNote] = &[
     ReleaseNote {
         kind: NoteKind::Feature,
-        summary: "Custom keybindings: rebind any Command Palette command in ~/.config/croft/keybindings.json (VS Code-style chord strings); your binding wins over the default and applies on save.",
+        summary: "Custom keybindings: rebind any Command Palette command in ~/.config/croft/keybindings.json. Your binding wins over the default, applies on save, and reserved Cmd chords are forwarded so they reach croft in iTerm2 and Ghostty (re-run croft setup-iterm2 / setup-ghostty).",
     },
     ReleaseNote {
         kind: NoteKind::Feature,
-        summary: "User snippets: define prefixes in ~/.config/croft/snippets.json, then type one and press Tab to expand it with $1/$0 tab stops and ${1:placeholder} defaults.",
+        summary: "User snippets: define prefixes in ~/.config/croft/snippets.json, then type one and press Tab (or pick it from the completion popup) to expand it with $1/$0 tab stops and ${1:placeholder} defaults.",
     },
     ReleaseNote {
         kind: NoteKind::Feature,

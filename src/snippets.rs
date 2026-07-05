@@ -256,6 +256,16 @@ impl SnippetSet {
         self.snippets.is_empty()
     }
 
+    /// Snippets in `language` whose prefix begins with `word` (case-sensitive,
+    /// like VS Code); for injecting into the completion popup. An empty `word`
+    /// still filters by language but matches every prefix.
+    pub fn matching(&self, word: &str, language: &str) -> Vec<&Snippet> {
+        self.snippets
+            .iter()
+            .filter(|s| s.applies_to(language) && s.prefix.starts_with(word))
+            .collect()
+    }
+
     /// The single snippet whose prefix exactly equals `word` in `language`, if
     /// any — the Tab-to-expand lookup.
     pub fn exact(&self, word: &str, language: &str) -> Option<&Snippet> {
@@ -390,6 +400,29 @@ mod tests {
         let set = SnippetSet::from_json(json);
         assert!(set.exact("log", "python").is_none());
         assert!(set.exact("log", "javascript").is_some());
+    }
+
+    #[test]
+    fn matching_filters_by_prefix_and_scope_for_the_popup() {
+        let json = r#"{
+            "Log": { "prefix": "log", "body": "x", "scope": "javascript" },
+            "Loop": { "prefix": "loop", "body": "y" }
+        }"#;
+        let set = SnippetSet::from_json(json);
+        // Prefix "lo" matches both in JS (Loop has no scope -> universal).
+        let js: Vec<&str> = set
+            .matching("lo", "javascript")
+            .iter()
+            .map(|s| s.prefix.as_str())
+            .collect();
+        assert_eq!(js.len(), 2);
+        // In Python only the unscoped "loop" survives.
+        let py: Vec<&str> = set
+            .matching("lo", "python")
+            .iter()
+            .map(|s| s.prefix.as_str())
+            .collect();
+        assert_eq!(py, vec!["loop"]);
     }
 
     #[test]

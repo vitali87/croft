@@ -66,6 +66,85 @@ impl Chord {
         Self::normalize(key.code, key.modifiers)
     }
 
+    /// The iTerm2 `GlobalKeyMap` forwarder for this chord as `(key, csi_u_hex)`,
+    /// or `None` when no forwarding is needed or the chord can't be encoded.
+    ///
+    /// macOS reserves Cmd for its menus, so only Super chords are swallowed
+    /// before reaching croft; Ctrl/Alt/function chords already arrive, so those
+    /// return `None`. Forwarding re-emits the chord as the same CSI-u sequence
+    /// the built-in chords use, which crossterm decodes straight back into the
+    /// `KeyEvent` the keymap matches. The encoding reproduces the hand-written
+    /// forwarders in `iterm2.rs` byte-for-byte (asserted by a round-trip test).
+    ///
+    /// ponytail: only `Char` keys, and shift only with letters — a shifted
+    /// non-letter's glyph (Shift+/ = ?) is keyboard-layout dependent. Cmd chords
+    /// on named/function keys are niche; add them if a user needs one.
+    pub fn iterm2_forwarder(self) -> Option<(String, String)> {
+        if !self.mods.contains(KeyModifiers::SUPER) {
+            return None;
+        }
+        let KeyCode::Char(c) = self.code else {
+            return None;
+        };
+        let shift = self.mods.contains(KeyModifiers::SHIFT);
+        if shift && !c.is_ascii_alphabetic() {
+            return None;
+        }
+        let vk = mac_ansi_keycode(c)?;
+        let codepoint = if shift {
+            c.to_ascii_uppercase() as u32
+        } else {
+            c as u32
+        };
+        let mut mask = 0x10_0000u32; // Cmd
+        let mut modbyte = 1u32 + 8; // CSI-u base (1) + Super (8)
+        if shift {
+            mask |= 0x2_0000;
+            modbyte += 1;
+        }
+        if self.mods.contains(KeyModifiers::ALT) {
+            mask |= 0x8_0000;
+            modbyte += 2;
+        }
+        if self.mods.contains(KeyModifiers::CONTROL) {
+            mask |= 0x4_0000;
+            modbyte += 4;
+        }
+        Some((
+            format!("0x{codepoint:x}-0x{mask:x}-0x{vk:x}"),
+            csi_u_hex(codepoint, modbyte),
+        ))
+    }
+
+    /// The Ghostty keybind trigger string for this chord (e.g. `"cmd+shift+p"`),
+    /// or `None` under the same conditions as [`Self::iterm2_forwarder`]. Ghostty
+    /// re-emits the chord via its `csi:` action using that forwarder's payload,
+    /// so the two must gate identically.
+    pub fn ghostty_trigger(self) -> Option<String> {
+        if !self.mods.contains(KeyModifiers::SUPER) {
+            return None;
+        }
+        let KeyCode::Char(c) = self.code else {
+            return None;
+        };
+        if self.mods.contains(KeyModifiers::SHIFT) && !c.is_ascii_alphabetic() {
+            return None;
+        }
+        let mut t = String::from("cmd");
+        if self.mods.contains(KeyModifiers::CONTROL) {
+            t.push_str("+ctrl");
+        }
+        if self.mods.contains(KeyModifiers::ALT) {
+            t.push_str("+alt");
+        }
+        if self.mods.contains(KeyModifiers::SHIFT) {
+            t.push_str("+shift");
+        }
+        t.push('+');
+        t.push(c.to_ascii_lowercase());
+        Some(t)
+    }
+
     /// Parse a config string like `"cmd+shift+p"`, `"ctrl+/"`, `"f2"`. Returns
     /// `None` on an unrecognized token so one bad line is skipped, not fatal.
     pub fn parse(s: &str) -> Option<Chord> {
@@ -102,6 +181,76 @@ impl Chord {
         }
         code.map(|c| Chord::normalize(c, mods))
     }
+}
+
+/// The CSI-u escape `ESC [ <codepoint> ; <modbyte> u` as the space-separated
+/// hex-byte string iTerm2's "Send Hex Code" action wants (each decimal digit
+/// becomes its ASCII byte).
+fn csi_u_hex(codepoint: u32, modbyte: u32) -> String {
+    let mut parts = vec![String::from("0x1b"), String::from("0x5b")];
+    parts.extend(codepoint.to_string().bytes().map(|b| format!("0x{b:x}")));
+    parts.push(String::from("0x3b"));
+    parts.extend(modbyte.to_string().bytes().map(|b| format!("0x{b:x}")));
+    parts.push(String::from("0x75"));
+    parts.join(" ")
+}
+
+/// The macOS ANSI virtual key code (`kVK_ANSI_*` from Carbon HIToolbox) for a
+/// US-layout character. iTerm2's `GlobalKeyMap` key is `codepoint-mask-vkcode`,
+/// so a forwarder can't be built without this. `None` for a key not on the
+/// table (skip its forwarder rather than emit a wrong one).
+fn mac_ansi_keycode(c: char) -> Option<u32> {
+    Some(match c.to_ascii_lowercase() {
+        'a' => 0x00,
+        'b' => 0x0b,
+        'c' => 0x08,
+        'd' => 0x02,
+        'e' => 0x0e,
+        'f' => 0x03,
+        'g' => 0x05,
+        'h' => 0x04,
+        'i' => 0x22,
+        'j' => 0x26,
+        'k' => 0x28,
+        'l' => 0x25,
+        'm' => 0x2e,
+        'n' => 0x2d,
+        'o' => 0x1f,
+        'p' => 0x23,
+        'q' => 0x0c,
+        'r' => 0x0f,
+        's' => 0x01,
+        't' => 0x11,
+        'u' => 0x20,
+        'v' => 0x09,
+        'w' => 0x0d,
+        'x' => 0x07,
+        'y' => 0x10,
+        'z' => 0x06,
+        '0' => 0x1d,
+        '1' => 0x12,
+        '2' => 0x13,
+        '3' => 0x14,
+        '4' => 0x15,
+        '5' => 0x17,
+        '6' => 0x16,
+        '7' => 0x1a,
+        '8' => 0x1c,
+        '9' => 0x19,
+        '-' => 0x1b,
+        '=' => 0x18,
+        '[' => 0x21,
+        ']' => 0x1e,
+        '\\' => 0x2a,
+        ';' => 0x29,
+        '\'' => 0x27,
+        ',' => 0x2b,
+        '.' => 0x2f,
+        '/' => 0x2c,
+        '`' => 0x32,
+        ' ' => 0x31,
+        _ => return None,
+    })
 }
 
 fn parse_key(tok: &str) -> Option<KeyCode> {
@@ -220,6 +369,11 @@ impl Keymap {
         self.bindings.is_empty()
     }
 
+    /// Every bound chord, for the terminal-setup pass that installs forwarders.
+    pub fn chords(&self) -> Vec<Chord> {
+        self.bindings.keys().copied().collect()
+    }
+
     /// The command a live key event is bound to, if any. Bare keys and
     /// modifier-less letters are never matched here (see the module note): the
     /// caller only asks for chords that carry a modifier or are function keys.
@@ -304,6 +458,44 @@ mod tests {
             KeyModifiers::CONTROL
         };
         assert_eq!(c, Chord::from_event(ev(KeyCode::Char('s'), expected)));
+    }
+
+    #[test]
+    fn iterm2_forwarder_reproduces_the_hand_written_consts() {
+        // These are copied from src/iterm2.rs; the generated forwarder for a
+        // user binding of the same chord must match byte-for-byte, or iTerm2
+        // would install a subtly different (broken) entry.
+        let (k, h) = Chord::parse("cmd+f").unwrap().iterm2_forwarder().unwrap();
+        assert_eq!(k, "0x66-0x100000-0x3");
+        assert_eq!(h, "0x1b 0x5b 0x31 0x30 0x32 0x3b 0x39 0x75");
+
+        let (k, h) = Chord::parse("cmd+shift+p")
+            .unwrap()
+            .iterm2_forwarder()
+            .unwrap();
+        assert_eq!(k, "0x50-0x120000-0x23");
+        assert_eq!(h, "0x1b 0x5b 0x38 0x30 0x3b 0x31 0x30 0x75");
+
+        let (k, h) = Chord::parse("cmd+.").unwrap().iterm2_forwarder().unwrap();
+        assert_eq!(k, "0x2e-0x100000-0x2f");
+        assert_eq!(h, "0x1b 0x5b 0x34 0x36 0x3b 0x39 0x75");
+
+        let (k, _) = Chord::parse("cmd+0").unwrap().iterm2_forwarder().unwrap();
+        assert_eq!(k, "0x30-0x100000-0x1d");
+    }
+
+    #[test]
+    fn iterm2_forwarder_skips_chords_that_need_no_forwarding_or_cant_encode() {
+        // No Super: the terminal already delivers Ctrl/Alt/function chords.
+        assert_eq!(Chord::parse("ctrl+alt+g").unwrap().iterm2_forwarder(), None);
+        assert_eq!(Chord::parse("f2").unwrap().iterm2_forwarder(), None);
+        // Shifted punctuation is layout-dependent, so it's skipped.
+        assert_eq!(
+            Chord::parse("cmd+shift+/").unwrap().iterm2_forwarder(),
+            None
+        );
+        // A key not on the ANSI table has no virtual keycode.
+        assert_eq!(Chord::parse("cmd+enter").unwrap().iterm2_forwarder(), None);
     }
 
     #[test]

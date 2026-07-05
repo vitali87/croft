@@ -16758,6 +16758,34 @@ fn tab_expands_a_user_snippet_and_places_the_caret() {
 }
 
 #[test]
+fn accepting_a_snippet_completion_expands_it_with_tab_stops() {
+    // A snippet item in the completion popup carries the body as is_snippet
+    // insertion text; Enter must expand it through the editor engine, not
+    // insert the literal "$1".
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.insert_str("log");
+    let item = super::snippet_completion_item(&crate::snippets::Snippet {
+        prefix: "log".into(),
+        body: "console.log($1)".into(),
+        scope: vec![],
+    });
+    app.completion_popup = Some(crate::widgets::completion_popup::CompletionPopup::new(
+        vec![item],
+        "log".into(),
+        (0, 0),
+        std::path::PathBuf::new(),
+        1,
+    ));
+    app.handle_completion_popup_key(key(KeyCode::Enter, KeyModifiers::NONE));
+    assert_eq!(app.editor.lines[app.editor.cursor_row], "console.log()");
+    assert_eq!(
+        app.editor.cursor_col, 12,
+        "the typed prefix is replaced and the caret lands at $1"
+    );
+}
+
+#[test]
 fn settings_view_toggle_flips_the_setting_and_stays_open() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();

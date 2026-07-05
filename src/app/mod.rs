@@ -4963,20 +4963,28 @@ impl App {
             if Some(result.request_id) != self.completion_request_id {
                 continue;
             }
-            if result.items.is_empty() {
+            let Some((cx, cy)) = self.editor.cursor_screen_pos() else {
+                continue;
+            };
+            let prefix = self.editor.word_before_cursor();
+            let server_count = result.items.len();
+            // Merge user snippets whose prefix matches the typed word into the
+            // suggestion list (VS Code shows snippets in the suggest widget);
+            // the popup's own prefix filter narrows them further.
+            let mut items = result.items;
+            let lang = self.editor.scope_id();
+            for snip in self.snippets.matching(&prefix, lang) {
+                items.push(snippet_completion_item(snip));
+            }
+            if items.is_empty() {
                 if self.completion_popup.is_some() {
                     self.completion_popup = None;
                     changed = true;
                 }
                 continue;
             }
-            let Some((cx, cy)) = self.editor.cursor_screen_pos() else {
-                continue;
-            };
-            let prefix = self.editor.word_before_cursor();
-            let server_count = result.items.len();
             let popup = crate::widgets::completion_popup::CompletionPopup::new(
-                result.items,
+                items,
                 prefix.clone(),
                 (cx, cy),
                 result.path,
@@ -7545,13 +7553,23 @@ impl App {
                     .completion_popup
                     .as_ref()
                     .and_then(|p| p.selected_label());
+                let is_snippet = self
+                    .completion_popup
+                    .as_ref()
+                    .is_some_and(|p| p.selected_is_snippet());
                 self.completion_popup = None;
                 self.completion_request_id = None;
                 if let Some(t) = text {
-                    for _ in 0..prefix_len {
-                        self.editor.backspace();
+                    if is_snippet {
+                        // The body carries $1/$0 tab stops; expand_snippet
+                        // removes the typed prefix itself and drives the caret.
+                        self.editor.expand_snippet(&t, prefix_len);
+                    } else {
+                        for _ in 0..prefix_len {
+                            self.editor.backspace();
+                        }
+                        self.editor.insert_str(&t);
                     }
-                    self.editor.insert_str(&t);
                 }
                 true
             }
@@ -21945,7 +21963,9 @@ impl App {
         };
         if path == crate::keymap::keybindings_path() {
             self.keymap = crate::keymap::Keymap::load(&path);
-            self.status = String::from("Keybindings reloaded");
+            self.status = String::from(
+                "Keybindings reloaded (for new Cmd chords, re-run croft setup-iterm2 / setup-ghostty)",
+            );
         } else if path == crate::snippets::snippets_path() {
             self.snippets = crate::snippets::SnippetSet::load(&path);
             self.status = String::from("Snippets reloaded");
@@ -25060,6 +25080,20 @@ enum ConfigFileSeed {
     Settings,
     Keybindings,
     Snippets,
+}
+
+/// Build a completion-popup item for a user snippet: the row shows the prefix,
+/// filters on it, and carries the snippet body as `is_snippet` insertion text
+/// the accept path expands through the editor's tab-stop engine.
+fn snippet_completion_item(snip: &crate::snippets::Snippet) -> crate::lsp::CompletionItem {
+    crate::lsp::CompletionItem {
+        label: snip.prefix.clone(),
+        detail: Some(String::from("snippet")),
+        insert_text: Some(snip.body.clone()),
+        filter_text: Some(snip.prefix.clone()),
+        kind: Some(lsp_types::CompletionItemKind::SNIPPET),
+        is_snippet: true,
+    }
 }
 
 /// A chord eligible for a user rebind: it carries a real modifier
