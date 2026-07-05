@@ -1197,6 +1197,18 @@ pub enum GitMark {
     Deleted,
 }
 
+/// An in-progress snippet expansion: the caret is cycling the tab stops of a
+/// just-expanded snippet. See [`Editor::expand_snippet`].
+#[derive(Debug, Clone)]
+struct SnippetSession {
+    /// Start `(row, col)` of the current stop's placeholder.
+    anchor: (usize, usize),
+    /// Placeholder length (chars) of the current stop, selected on landing.
+    cur_len: usize,
+    /// Remaining stops to visit, in order: `(row, col, placeholder_len)`.
+    stops: std::collections::VecDeque<(usize, usize, usize)>,
+}
+
 pub struct Editor {
     pub path: Option<PathBuf>,
     pub lines: Vec<String>,
@@ -1336,6 +1348,11 @@ pub struct Editor {
     /// as a `(row, col)` buffer position. `Some` while the box drag is live; each
     /// drag rebuilds `carets` from the rectangle between it and the pointer.
     box_anchor: Option<(usize, usize)>,
+    /// Active snippet tab-stop session (VS Code snippet expansion). `Some` while
+    /// the caret is cycling through `$1`, `$2`, … stops of a just-expanded
+    /// snippet; Tab advances, and any structural key cancels it. See
+    /// [`Editor::expand_snippet`].
+    snippet: Option<SnippetSession>,
     /// Currently-collapsed fold headers, as 0-based logical line indexes. A
     /// header's body (the more-indented lines below it, up to `fold_range`'s
     /// end) is hidden from the render while its index is in this set. Purely a
@@ -1503,6 +1520,7 @@ impl Editor {
             sticky_lines: Vec::new(),
             sticky_click_rows: Vec::new(),
             box_anchor: None,
+            snippet: None,
             folded: std::collections::BTreeSet::new(),
             fold_epoch_lines: 0,
             preview: false,
@@ -2556,6 +2574,130 @@ impl Editor {
         self.lines[row].insert(byte, c);
         self.cursor_col += 1;
         self.mark_buffer_changed();
+    }
+
+    /// The language id (VS Code identifier) of this buffer, for snippet scoping.
+    pub fn scope_id(&self) -> &'static str {
+        language_scope_id(self.lang)
+    }
+
+    /// True while a snippet's tab stops are being cycled with Tab.
+    pub fn snippet_active(&self) -> bool {
+        self.snippet.is_some()
+    }
+
+    /// Abandon any active snippet session (a structural key moved the caret
+    /// away, so Tab should return to its normal meaning).
+    pub fn cancel_snippet(&mut self) {
+        self.snippet = None;
+    }
+
+    /// Expand snippet `body` at the caret. `prefix_len` chars of the already
+    /// typed prefix are removed first, then the resolved text is inserted with
+    /// continuation lines indented to the current line. The caret lands on the
+    /// first tab stop (selecting its placeholder); when more stops remain a
+    /// session starts so Tab cycles through them.
+    pub fn expand_snippet(&mut self, body: &str, prefix_len: usize) {
+        self.snippet = None;
+        for _ in 0..prefix_len {
+            self.backspace();
+        }
+        let start = (self.cursor_row, self.cursor_col);
+        let indent: String = self
+            .lines
+            .get(start.0)
+            .map(|l| {
+                l.chars()
+                    .take(start.1)
+                    .take_while(|c| *c == ' ' || *c == '\t')
+                    .collect()
+            })
+            .unwrap_or_default();
+        let indent_len = indent.chars().count();
+        let parsed = crate::snippets::parse_body(body);
+        let inserted = if indent.is_empty() {
+            parsed.text.clone()
+        } else {
+            parsed.text.replace('\n', &format!("\n{indent}"))
+        };
+        self.insert_str(&inserted);
+
+        let mut abs: std::collections::VecDeque<(usize, usize, usize)> = parsed
+            .stops
+            .iter()
+            .map(|s| {
+                let (ld, col) = crate::snippets::offset_to_line_col(&parsed.text, s.offset);
+                let row = start.0 + ld;
+                let c = if ld == 0 {
+                    start.1 + col
+                } else {
+                    indent_len + col
+                };
+                (row, c, s.len)
+            })
+            .collect();
+        let Some(first) = abs.pop_front() else {
+            return; // no stops: leave the caret at the end of the insertion
+        };
+        self.place_at_snippet_stop(first);
+        if !abs.is_empty() {
+            self.snippet = Some(SnippetSession {
+                anchor: (first.0, first.1),
+                cur_len: first.2,
+                stops: abs,
+            });
+        }
+    }
+
+    /// Advance to the next snippet tab stop. Later stops on the current line are
+    /// shifted by the net chars typed at the current stop first. Returns false
+    /// when no session is active (so the caller falls back to indenting).
+    pub fn snippet_next(&mut self) -> bool {
+        let Some(mut sess) = self.snippet.take() else {
+            return false;
+        };
+        // ponytail: only edits made at the current stop, on its own line, are
+        // tracked. Typing newlines or editing elsewhere mid-session drifts the
+        // later stops; upgrade to real markers if that workflow matters.
+        if self.cursor_row == sess.anchor.0 {
+            let typed = self.cursor_col as isize - sess.anchor.1 as isize;
+            let shift = typed - sess.cur_len as isize;
+            if shift != 0 {
+                let after = sess.anchor.1 + sess.cur_len;
+                for s in sess.stops.iter_mut() {
+                    if s.0 == sess.anchor.0 && s.1 >= after {
+                        s.1 = (s.1 as isize + shift).max(0) as usize;
+                    }
+                }
+            }
+        }
+        let Some(next) = sess.stops.pop_front() else {
+            return false;
+        };
+        self.place_at_snippet_stop(next);
+        if !sess.stops.is_empty() {
+            sess.anchor = (next.0, next.1);
+            sess.cur_len = next.2;
+            self.snippet = Some(sess);
+        }
+        true
+    }
+
+    /// Move the caret to a resolved tab stop, selecting its placeholder text so
+    /// the next keystroke replaces it.
+    fn place_at_snippet_stop(&mut self, stop: (usize, usize, usize)) {
+        let (row, col, len) = stop;
+        self.cursor_row = row;
+        self.cursor_col = col + len;
+        self.selection = if len > 0 {
+            Some(EditorSelection {
+                anchor: (row, col),
+                head: (row, col + len),
+            })
+        } else {
+            None
+        };
+        self.clamp_cursor();
     }
 
     fn insert_newline_raw(&mut self) {
@@ -5254,6 +5396,30 @@ pub fn language_label(lang: Option<LangKind>) -> &'static str {
     }
 }
 
+/// The VS Code language id for `lang`, used to scope user snippets (their
+/// `scope` field names these). Lowercase, matching VS Code's identifiers so a
+/// config copied from there just works.
+pub fn language_scope_id(lang: Option<LangKind>) -> &'static str {
+    match lang {
+        None => "plaintext",
+        Some(LangKind::Rust) => "rust",
+        Some(LangKind::Python) => "python",
+        Some(LangKind::JavaScript) => "javascript",
+        Some(LangKind::TypeScript) => "typescript",
+        Some(LangKind::Tsx) => "typescriptreact",
+        Some(LangKind::Json) => "json",
+        Some(LangKind::Toml) => "toml",
+        Some(LangKind::Yaml) => "yaml",
+        Some(LangKind::Markdown) => "markdown",
+        Some(LangKind::Go) => "go",
+        Some(LangKind::Html) => "html",
+        Some(LangKind::Css) => "css",
+        Some(LangKind::Bash) => "shellscript",
+        Some(LangKind::C) => "c",
+        Some(LangKind::Cpp) => "cpp",
+    }
+}
+
 /// Every selectable language mode, in the order the status-bar picker lists
 /// them. `None` (Plain Text) is offered separately by the picker.
 pub const SELECTABLE_LANGUAGES: &[LangKind] = &[
@@ -7655,6 +7821,43 @@ mod tests {
             age_secs: age,
             uncommitted,
         }
+    }
+
+    #[test]
+    fn snippet_expansion_places_caret_and_tab_advances_with_drift() {
+        let mut e = editor_with("");
+        e.insert_str("for");
+        e.expand_snippet("for ${1:i} in ${2:xs}:", 3);
+        // Prefix removed, body inserted, caret on the first placeholder with it
+        // selected so the next keystroke replaces it.
+        assert_eq!(e.lines[0], "for i in xs:");
+        assert_eq!((e.cursor_row, e.cursor_col), (0, 5));
+        assert!(e.snippet_active());
+        assert_eq!(e.selection_text(), "i");
+        // Replacing the 1-char placeholder with a 3-char name shifts $2 right.
+        e.insert_str("idx");
+        assert_eq!(e.lines[0], "for idx in xs:");
+        assert!(e.snippet_next());
+        assert_eq!(
+            e.selection_text(),
+            "xs",
+            "$2 must track the drift from the longer $1"
+        );
+        // The last stop ends the session.
+        assert!(!e.snippet_active());
+    }
+
+    #[test]
+    fn snippet_indents_continuation_lines_to_the_caret() {
+        let mut e = editor_with("    ");
+        e.cursor_row = 0;
+        e.cursor_col = 4;
+        e.expand_snippet("if x:\n    $0", 0);
+        assert_eq!(e.lines[0], "    if x:");
+        assert_eq!(
+            e.lines[1], "        ",
+            "continuation line keeps the 4-space block indent plus its own"
+        );
     }
 
     #[test]

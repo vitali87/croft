@@ -95,6 +95,10 @@ pub enum Command {
     AttachPythonProcess,
     ColorTheme,
     KeyboardShortcuts,
+    OpenSettings,
+    OpenSettingsJson,
+    OpenKeybindingsJson,
+    ConfigureSnippets,
     RunTask,
     RunBuildTask,
     RerunLastTask,
@@ -176,6 +180,10 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::RerunLastTask,
     Command::ColorTheme,
     Command::KeyboardShortcuts,
+    Command::OpenSettings,
+    Command::OpenSettingsJson,
+    Command::OpenKeybindingsJson,
+    Command::ConfigureSnippets,
 ];
 
 impl Command {
@@ -256,6 +264,10 @@ impl Command {
             Command::RerunLastTask => "Tasks: Rerun Last Task",
             Command::ColorTheme => "Preferences: Color Theme",
             Command::KeyboardShortcuts => "Help: Keyboard Shortcuts Reference",
+            Command::OpenSettings => "Preferences: Open Settings",
+            Command::OpenSettingsJson => "Preferences: Open Settings (JSON)",
+            Command::OpenKeybindingsJson => "Preferences: Open Keyboard Shortcuts (JSON)",
+            Command::ConfigureSnippets => "Preferences: Configure User Snippets",
         }
     }
 
@@ -337,9 +349,109 @@ impl Command {
             Command::RunBuildTask => "Cmd+Shift+B",
             Command::RerunLastTask => "",
             Command::ColorTheme => "Cmd+K Cmd+T",
+            // Palette-only by default; the whole point of the keybindings.json
+            // loader is that a user can bind these (the seeded template shows
+            // Cmd+, -> open_settings as the example).
+            Command::OpenSettings => "",
+            Command::OpenSettingsJson => "",
+            Command::OpenKeybindingsJson => "",
+            Command::ConfigureSnippets => "",
         }
         // No catch-all: every Command must carry an accelerator (croft tenet),
         // so adding a variant fails to compile until its hint is supplied.
+    }
+
+    /// The stable snake_case identifier used in `keybindings.json`. This is the
+    /// contract a user's config binds against, so the strings must never drift
+    /// once shipped (unlike `title`, which is display-only). No catch-all: a new
+    /// variant fails to compile until it declares an id.
+    pub fn id(self) -> &'static str {
+        match self {
+            Command::MoveLineUp => "move_line_up",
+            Command::MoveLineDown => "move_line_down",
+            Command::ToggleLineComment => "toggle_line_comment",
+            Command::ToggleBlockComment => "toggle_block_comment",
+            Command::JoinLines => "join_lines",
+            Command::DeleteLine => "delete_line",
+            Command::TransformUpper => "transform_upper",
+            Command::TransformLower => "transform_lower",
+            Command::TransformTitle => "transform_title",
+            Command::SortLinesAscending => "sort_lines_ascending",
+            Command::SortLinesDescending => "sort_lines_descending",
+            Command::TrimTrailingWhitespace => "trim_trailing_whitespace",
+            Command::ToggleWordWrap => "toggle_word_wrap",
+            Command::ReplaceInFile => "replace_in_file",
+            Command::MergeAcceptCurrent => "merge_accept_current",
+            Command::MergeAcceptIncoming => "merge_accept_incoming",
+            Command::MergeAcceptBoth => "merge_accept_both",
+            Command::StageHunk => "stage_hunk",
+            Command::UnstageHunk => "unstage_hunk",
+            Command::RevertHunk => "revert_hunk",
+            Command::AddCursorAbove => "add_cursor_above",
+            Command::AddCursorBelow => "add_cursor_below",
+            Command::AddSelectionToNextMatch => "add_selection_to_next_match",
+            Command::JumpToBracket => "jump_to_bracket",
+            Command::SelectToBracket => "select_to_bracket",
+            Command::TransposeCharacters => "transpose_characters",
+            Command::IndentationToSpaces => "indentation_to_spaces",
+            Command::IndentationToTabs => "indentation_to_tabs",
+            Command::TrimFinalNewlines => "trim_final_newlines",
+            Command::FormatDocument => "format_document",
+            Command::ToggleFormatOnSave => "toggle_format_on_save",
+            Command::QuickFix => "quick_fix",
+            Command::ToggleFold => "toggle_fold",
+            Command::FoldAll => "fold_all",
+            Command::UnfoldAll => "unfold_all",
+            Command::SaveFile => "save_file",
+            Command::ToggleAutoSave => "toggle_auto_save",
+            Command::ToggleInlineBlame => "toggle_inline_blame",
+            Command::RestoreSnapshot => "restore_snapshot",
+            Command::CloseEditor => "close_editor",
+            Command::SplitEditor => "split_editor",
+            Command::QuickOpen => "quick_open",
+            Command::GoToSymbol => "go_to_symbol",
+            Command::GoToWorkspaceSymbol => "go_to_workspace_symbol",
+            Command::ToggleVimMode => "toggle_vim_mode",
+            Command::ShowExplorer => "show_explorer",
+            Command::ShowSearch => "show_search",
+            Command::ShowSourceControl => "show_source_control",
+            Command::ShowRunDebug => "show_run_debug",
+            Command::ShowRemote => "show_remote",
+            Command::ShowExtensions => "show_extensions",
+            Command::ShowTesting => "show_testing",
+            Command::RunTestAtCursor => "run_test_at_cursor",
+            Command::ToggleSideBar => "toggle_side_bar",
+            Command::ToggleSecondarySideBar => "toggle_secondary_side_bar",
+            Command::ToggleZenMode => "toggle_zen_mode",
+            Command::ToggleTerminal => "toggle_terminal",
+            Command::ToggleMinimap => "toggle_minimap",
+            Command::NewTerminal => "new_terminal",
+            Command::StartDebugging => "start_debugging",
+            Command::StopDebugging => "stop_debugging",
+            Command::PauseDebugging => "pause_debugging",
+            Command::RestartDebugging => "restart_debugging",
+            Command::ToggleBreakpoint => "toggle_breakpoint",
+            Command::EditBreakpointCondition => "edit_breakpoint_condition",
+            Command::StepOver => "step_over",
+            Command::ToggleRaisedExceptions => "toggle_raised_exceptions",
+            Command::AttachPythonProcess => "attach_python_process",
+            Command::ColorTheme => "color_theme",
+            Command::KeyboardShortcuts => "keyboard_shortcuts",
+            Command::OpenSettings => "open_settings",
+            Command::OpenSettingsJson => "open_settings_json",
+            Command::OpenKeybindingsJson => "open_keybindings_json",
+            Command::ConfigureSnippets => "configure_snippets",
+            Command::RunTask => "run_task",
+            Command::RunBuildTask => "run_build_task",
+            Command::RerunLastTask => "rerun_last_task",
+        }
+    }
+
+    /// Resolve a `keybindings.json` command id back to its [`Command`]. Returns
+    /// `None` for an unknown id so a typo in the user's config is ignored rather
+    /// than fatal.
+    pub fn from_id(id: &str) -> Option<Command> {
+        ALL_COMMANDS.iter().copied().find(|c| c.id() == id)
     }
 }
 

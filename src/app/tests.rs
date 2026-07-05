@@ -16699,3 +16699,78 @@ fn typing_in_the_picker_without_a_language_server_reports_unsupported() {
         "with no language server the picker must say so instead of spinning"
     );
 }
+
+#[test]
+fn a_user_keybinding_overrides_and_runs_the_bound_command() {
+    // A chord in keybindings.json is consulted ahead of the built-in handlers
+    // and dispatches the palette command it names.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.keymap =
+        crate::keymap::Keymap::from_json(r#"[{ "key": "ctrl+alt+g", "command": "show_search" }]"#);
+    assert_ne!(app.sidebar_view, SidebarView::Search);
+    app.handle_key(key(
+        KeyCode::Char('g'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+    ))
+    .unwrap();
+    assert_eq!(
+        app.sidebar_view,
+        SidebarView::Search,
+        "the bound chord must run Show Search via run_command"
+    );
+}
+
+#[test]
+fn a_user_keybinding_is_ignored_while_the_terminal_is_focused() {
+    // The terminal needs its raw control keys, so the keymap must not fire there.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.keymap =
+        crate::keymap::Keymap::from_json(r#"[{ "key": "ctrl+alt+g", "command": "show_search" }]"#);
+    app.focus = Pane::Terminal;
+    app.handle_key(key(
+        KeyCode::Char('g'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+    ))
+    .unwrap();
+    assert_ne!(
+        app.sidebar_view,
+        SidebarView::Search,
+        "a bound chord must be inert while the terminal is focused"
+    );
+}
+
+#[test]
+fn tab_expands_a_user_snippet_and_places_the_caret() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.snippets = crate::snippets::SnippetSet::from_json(
+        r#"{ "Log": { "prefix": "log", "body": "console.log($1)" } }"#,
+    );
+    app.editor.insert_str("log");
+    app.handle_editor_tab();
+    assert_eq!(app.editor.lines[app.editor.cursor_row], "console.log()");
+    assert_eq!(
+        app.editor.cursor_col, 12,
+        "caret lands inside the parentheses at $1"
+    );
+}
+
+#[test]
+fn settings_view_toggle_flips_the_setting_and_stays_open() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let before = app.format_on_save;
+    app.open_settings_view();
+    // The first row is "Format on Save"; confirming it flips the value.
+    app.confirm_list_picker();
+    assert_eq!(
+        app.format_on_save, !before,
+        "the toggle row flips the setting"
+    );
+    assert!(
+        app.list_picker.is_some(),
+        "a toggle keeps the settings hub open so more can be flipped"
+    );
+}

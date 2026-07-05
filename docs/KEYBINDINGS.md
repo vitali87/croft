@@ -85,6 +85,21 @@ Every choice except the side-bar / panel visibility persists across launches in 
 | Debug: Attach to Python Process | `Ctrl`+`F5` | Pick a running CPython 3.14+ process and drop a `pdb` REPL into it (PEP 768 `sys.remote_exec`); the debugger runs in a croft terminal, elevating with `sudo` when the OS requires it |
 | Preferences: Color Theme | `Cmd`+`K` `Cmd`+`T` | Pick the active color theme (also via the settings gear) |
 
+## Settings, custom keybindings & snippets
+
+All three live under `~/.config/croft/` (XDG-resolved, so the same paths on macOS and Linux) and are reachable from the Command Palette. Opening one that doesn't exist yet seeds it with a working example.
+
+| Command | Opens | Notes |
+|---------|-------|-------|
+| Preferences: Open Settings | a searchable settings hub | Fuzzy-search the toggleable settings; `Enter` flips a toggle and keeps the hub open. Also routes to the Color Theme picker and the JSON files below |
+| Preferences: Open Settings (JSON) | `config.json` | The full preferences document; edits apply on the next launch |
+| Preferences: Open Keyboard Shortcuts (JSON) | `keybindings.json` | Rebind any palette command; **applies on save** |
+| Preferences: Configure User Snippets | `snippets.json` | Define snippets; **applies on save** |
+
+**Custom keybindings.** `keybindings.json` is a JSON (with `//` comments) array of `{ "key": …, "command": … }`. The `key` is a chord like `ctrl+shift+p`, `cmd+,`, `alt+up`, or `f2`; modifiers are `ctrl`, `alt`/`opt`, `shift`, `cmd`/`super`, and `mod` (Cmd on macOS, Ctrl elsewhere). The `command` is a palette command id (see the ids in `Preferences: Open Settings`, e.g. `save_file`, `quick_open`, `toggle_terminal`). A bound chord wins over the built-in default for the same chord. Bindings apply while any pane except the terminal is focused, and only to chords that carry a modifier or are function keys, so plain typing and the terminal's control keys are never shadowed. In iTerm2, reserved `Cmd` chords must be forwarded first (`croft setup-iterm2`); `Ctrl`/`Alt`/function-key bindings always reach croft, and Ghostty forwards everything after `croft setup-ghostty`.
+
+**User snippets.** `snippets.json` mirrors VS Code's global snippets file: an object keyed by a name, each with a `prefix`, a `body` (a string or an array of lines), and an optional `scope` (comma-separated language ids; omit for every language). Type a snippet's prefix and press `Tab` to expand it. The body uses VS Code tab-stop syntax: `$1`, `$2`, … are stops visited in order with `Tab`, `$0` is the final caret, and `${1:name}` seeds a stop with selected placeholder text. Continuation lines are re-indented to the caret.
+
 ## Explorer (file tree)
 
 | Keys | Action |

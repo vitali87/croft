@@ -1753,6 +1753,12 @@ pub struct App {
     /// `explorer_views` is held in memory rather than re-read each access. The
     /// gates for the bundled features (PDF/CSV/Vim/LSPs) consult this set.
     disabled_extensions: std::collections::BTreeSet<String>,
+    /// User key bindings from `~/.config/croft/keybindings.json`, consulted
+    /// ahead of the built-in chords so a rebind wins over the default.
+    keymap: crate::keymap::Keymap,
+    /// User snippets from `~/.config/croft/snippets.json`. Typing a snippet's
+    /// prefix and pressing Tab expands it with tab-stop navigation.
+    snippets: crate::snippets::SnippetSet,
     /// VS Code `editor.formatOnSave`: when true, `Cmd+S` first asks the language
     /// server to format the buffer, then writes once the reply lands. Loaded
     /// from prefs at startup, toggled from the palette / `Cmd+K F`.
@@ -2924,6 +2930,8 @@ impl App {
             test_worker: crate::testing::worker::TestWorker::spawn(root.clone()),
             extensions,
             disabled_extensions,
+            keymap: crate::keymap::Keymap::load(&crate::keymap::keybindings_path()),
+            snippets: crate::snippets::SnippetSet::load(&crate::snippets::snippets_path()),
             format_on_save: loaded_prefs.format_on_save,
             auto_save: loaded_prefs.auto_save,
             save_after_format: false,
@@ -4988,6 +4996,44 @@ impl App {
             changed = true;
         }
         changed
+    }
+
+    /// Tab in the editor: advance a live snippet, else expand a user snippet
+    /// whose prefix sits before the caret, else fall back to indentation.
+    fn handle_editor_tab(&mut self) {
+        if self.editor.snippet_active() {
+            self.editor.snippet_next();
+            return;
+        }
+        if self.try_expand_snippet() {
+            return;
+        }
+        if self.editor.selection_is_multiline() {
+            self.editor.indent_lines();
+        } else {
+            self.editor.indent_at_cursor();
+        }
+    }
+
+    /// Expand the user snippet whose prefix exactly matches the word before the
+    /// caret (in the buffer's language). Returns false when nothing matches, so
+    /// Tab can fall through to indenting.
+    fn try_expand_snippet(&mut self) -> bool {
+        if self.snippets.is_empty() || self.editor.selection.is_some() {
+            return false;
+        }
+        let word = self.editor.word_before_cursor();
+        if word.is_empty() {
+            return false;
+        }
+        let lang = self.editor.scope_id();
+        let Some(body) = self.snippets.exact(&word, lang).map(|s| s.body.clone()) else {
+            return false;
+        };
+        self.completion_popup = None;
+        self.completion_request_id = None;
+        self.editor.expand_snippet(&body, word.chars().count());
+        true
     }
 
     pub fn trigger_completion(&mut self) {
@@ -11197,6 +11243,20 @@ impl App {
             self.scm_menu.close();
             return Ok(());
         }
+        // User keybindings (keybindings.json) win over the built-in chords, but
+        // only when the terminal is not focused (its raw control keys must pass
+        // through) and the chord carries a real modifier or is a function key
+        // (so plain typing and bare Enter/Tab/Esc keep their contextual meaning).
+        // This stands in for VS Code's `when: editorTextFocus` without a full
+        // context engine.
+        if self.focus != Pane::Terminal
+            && !self.keymap.is_empty()
+            && is_rebindable_chord(key)
+            && let Some(cmd) = self.keymap.command_for(key)
+        {
+            self.run_command(cmd);
+            return Ok(());
+        }
         if matches!(key.code, KeyCode::F(1)) {
             self.open_shortcuts_modal();
             return Ok(());
@@ -13786,7 +13846,86 @@ impl App {
                     self.run_project_task(task);
                 }
             }
+            ListPurpose::Settings => {
+                match row.id.as_str() {
+                    "toggle:format_on_save" => self.toggle_format_on_save(),
+                    "toggle:auto_save" => self.toggle_auto_save(),
+                    "toggle:inline_blame" => self.toggle_inline_blame(),
+                    "cmd:color_theme" => {
+                        self.open_theme_picker();
+                        return;
+                    }
+                    "cmd:open_settings_json" => {
+                        self.open_config_file_in_editor(
+                            crate::prefs::config_path(),
+                            ConfigFileSeed::Settings,
+                        );
+                        return;
+                    }
+                    "cmd:open_keybindings_json" => {
+                        self.open_config_file_in_editor(
+                            crate::keymap::keybindings_path(),
+                            ConfigFileSeed::Keybindings,
+                        );
+                        return;
+                    }
+                    "cmd:configure_snippets" => {
+                        self.open_config_file_in_editor(
+                            crate::snippets::snippets_path(),
+                            ConfigFileSeed::Snippets,
+                        );
+                        return;
+                    }
+                    _ => return,
+                }
+                // A toggle stays in the hub: reopen so the new value shows and
+                // the user can flip more without reinvoking the palette.
+                self.open_settings_view();
+            }
         }
+    }
+
+    /// Preferences: Open Settings — a searchable hub over the toggleable
+    /// settings plus shortcuts to the raw JSON files and the theme picker. Each
+    /// toggle row shows its current value; confirming a toggle flips it live and
+    /// reopens the hub so the change is visible and more can be flipped.
+    pub fn open_settings_view(&mut self) {
+        use crate::widgets::list_picker::{ListPicker, ListPurpose, ListRow};
+        let on_off = |b: bool| if b { "on" } else { "off" };
+        let rows = vec![
+            ListRow {
+                id: String::from("toggle:format_on_save"),
+                label: format!("Format on Save: {}", on_off(self.format_on_save)),
+            },
+            ListRow {
+                id: String::from("toggle:auto_save"),
+                label: format!("Auto Save: {}", on_off(self.auto_save)),
+            },
+            ListRow {
+                id: String::from("toggle:inline_blame"),
+                label: format!("Git: Inline Blame: {}", on_off(self.inline_blame_enabled)),
+            },
+            ListRow {
+                id: String::from("cmd:color_theme"),
+                label: format!("Color Theme: {}", self.theme.label()),
+            },
+            ListRow {
+                id: String::from("cmd:open_settings_json"),
+                label: String::from("Open Settings (JSON)"),
+            },
+            ListRow {
+                id: String::from("cmd:open_keybindings_json"),
+                label: String::from("Open Keyboard Shortcuts (JSON)"),
+            },
+            ListRow {
+                id: String::from("cmd:configure_snippets"),
+                label: String::from("Configure User Snippets"),
+            },
+        ];
+        self.open_list_picker(
+            ListPicker::new(ListPurpose::Settings, "Settings", rows),
+            "No settings",
+        );
     }
 
     /// Tasks: Run Task — discover the workspace's tasks and open the
@@ -14970,6 +15109,12 @@ impl App {
         if self.handle_completion_popup_key(key) {
             return;
         }
+        // A snippet tab-stop session survives only plain typing, Backspace, and
+        // Tab (which advances it). Any other key ends the session so Tab returns
+        // to its normal indent role.
+        if self.editor.snippet_active() && !snippet_key_continues(key) {
+            self.editor.cancel_snippet();
+        }
         // Esc closes the parameter-hints popup first (VS Code parity); a second
         // Esc then falls through to clear the selection / collapse cursors.
         if self.signature_help_popup.is_some() && matches!(key.code, KeyCode::Esc) {
@@ -15475,12 +15620,10 @@ impl App {
             KeyCode::Backspace => self.editor.backspace(),
             KeyCode::Delete => self.editor.delete_forward(),
             KeyCode::Enter => self.editor.insert_newline(),
-            // Tab over a multi-line selection indents the whole block (VS
-            // Code); otherwise it inserts indentation to the next tab stop.
-            KeyCode::Tab if self.editor.selection_is_multiline() => {
-                self.editor.indent_lines();
-            }
-            KeyCode::Tab => self.editor.indent_at_cursor(),
+            // Tab advances a live snippet, else expands a snippet whose prefix
+            // was just typed, else indents (whole block for a multi-line
+            // selection, otherwise to the next tab stop).
+            KeyCode::Tab => self.handle_editor_tab(),
             // Shift+Tab arrives as BackTab. Outdent the current line, or every
             // line a selection touches, mirroring VS Code's Shift+Tab.
             KeyCode::BackTab => self.editor.dedent_lines(),
@@ -18549,7 +18692,60 @@ impl App {
             Cmd::RunBuildTask => self.run_build_task(),
             Cmd::RerunLastTask => self.rerun_last_task(),
             Cmd::KeyboardShortcuts => self.open_shortcuts_modal(),
+            Cmd::OpenSettings => self.open_settings_view(),
+            Cmd::OpenSettingsJson => self
+                .open_config_file_in_editor(crate::prefs::config_path(), ConfigFileSeed::Settings),
+            Cmd::OpenKeybindingsJson => self.open_config_file_in_editor(
+                crate::keymap::keybindings_path(),
+                ConfigFileSeed::Keybindings,
+            ),
+            Cmd::ConfigureSnippets => self.open_config_file_in_editor(
+                crate::snippets::snippets_path(),
+                ConfigFileSeed::Snippets,
+            ),
         }
+    }
+
+    /// Open one of the JSON config files in the editor, creating it seeded with
+    /// a helpful starter when it doesn't exist yet, then reload the in-memory
+    /// copy so a subsequent save takes effect without a relaunch.
+    fn open_config_file_in_editor(&mut self, path: std::path::PathBuf, seed: ConfigFileSeed) {
+        if !path.exists() {
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let contents = match seed {
+                ConfigFileSeed::Settings => {
+                    let prefs = crate::prefs::Prefs::load_or_default();
+                    serde_json::to_string_pretty(&prefs).unwrap_or_else(|_| String::from("{}\n"))
+                }
+                ConfigFileSeed::Keybindings => crate::keymap::TEMPLATE.to_string(),
+                ConfigFileSeed::Snippets => crate::snippets::TEMPLATE.to_string(),
+            };
+            if let Err(e) = std::fs::write(&path, contents) {
+                self.status = format!("Could not create {}: {e}", path.display());
+                return;
+            }
+        }
+        if let Some(idx) = self.editor.find_tab_with_path(&path) {
+            self.editor.select(idx);
+        } else if self.editor.open(&path).is_err() {
+            self.status = format!("Could not open {}", path.display());
+            return;
+        }
+        self.focus_pane(Pane::Editor);
+        self.sync_open_file_poll_mtime();
+        self.status = match seed {
+            ConfigFileSeed::Settings => {
+                String::from("Editing settings.json — save to apply on next launch")
+            }
+            ConfigFileSeed::Keybindings => String::from(
+                "Editing keybindings.json — save, then reload keybindings from the palette",
+            ),
+            ConfigFileSeed::Snippets => {
+                String::from("Editing snippets.json — save to apply immediately")
+            }
+        };
     }
 
     pub fn consume_zoxide_jump_image_clear(&mut self) -> bool {
@@ -21723,6 +21919,7 @@ impl App {
                         self.record_history_snapshot(&path);
                     }
                     self.lsp_notify_saved();
+                    self.reload_config_if_needed();
                 }
                 Err(e) => self.status = format!("Save failed: {e}"),
             }
@@ -21736,6 +21933,23 @@ impl App {
             return;
         }
         self.write_current_to_disk();
+    }
+
+    /// After a save, if the file was one of croft's JSON configs, re-read it so
+    /// the change applies without a relaunch (VS Code applies keybindings and
+    /// snippets on save). settings.json fields are read at startup, so that one
+    /// leaves its own "next launch" note rather than reloading here.
+    fn reload_config_if_needed(&mut self) {
+        let Some(path) = self.editor.path.clone() else {
+            return;
+        };
+        if path == crate::keymap::keybindings_path() {
+            self.keymap = crate::keymap::Keymap::load(&path);
+            self.status = String::from("Keybindings reloaded");
+        } else if path == crate::snippets::snippets_path() {
+            self.snippets = crate::snippets::SnippetSet::load(&path);
+            self.status = String::from("Snippets reloaded");
+        }
     }
 
     /// Tell the language servers the focused file hit the disk. rust-analyzer
@@ -21771,6 +21985,7 @@ impl App {
                     self.record_history_snapshot(&path);
                 }
                 self.lsp_notify_saved();
+                self.reload_config_if_needed();
             }
             Ok(SaveOutcome::DiskConflict) => {
                 self.force_save_armed = true;
@@ -24836,6 +25051,40 @@ fn is_word_continuation(c: char) -> bool {
 /// Characters that open or advance a call, triggering parameter hints.
 fn is_signature_help_trigger(c: char) -> bool {
     c == '(' || c == ','
+}
+
+/// Which starter contents to seed when a JSON config file is opened for the
+/// first time from the palette.
+#[derive(Debug, Clone, Copy)]
+enum ConfigFileSeed {
+    Settings,
+    Keybindings,
+    Snippets,
+}
+
+/// A chord eligible for a user rebind: it carries a real modifier
+/// (Ctrl/Alt/Super) or is a function key. Bare keys, unmodified letters, and
+/// Shift-only chords (which are just typing) are excluded so the user keymap
+/// can never shadow plain text entry. Intentionally not named `is_*_key`: it is
+/// a gate, not a shortcut the F1 overlay documents.
+fn is_rebindable_chord(key: KeyEvent) -> bool {
+    matches!(key.code, KeyCode::F(_))
+        || key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+}
+
+/// Whether a key should keep an active snippet tab-stop session alive: plain
+/// typing (an unmodified char), Backspace, and Tab (which advances the session).
+/// Every other key ends it so Tab reverts to indenting.
+fn snippet_key_continues(key: KeyEvent) -> bool {
+    match key.code {
+        KeyCode::Tab | KeyCode::Backspace => true,
+        KeyCode::Char(_) => !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER),
+        _ => false,
+    }
 }
 
 fn is_completion_trigger_key(key: KeyEvent) -> bool {

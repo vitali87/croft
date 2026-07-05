@@ -59,7 +59,17 @@ pub struct ReleaseNote {
 }
 
 /// What shipped in the current release. Replace on every version bump.
-pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
-    kind: NoteKind::Feature,
-    summary: "When a file you have unsaved edits in changes on disk, croft now raises an unmissable confirm popup instead of a quiet footer line: Enter reloads and discards your edits, Esc keeps them. Clean files still reload silently.",
-}];
+pub const RELEASE_NOTES: &[ReleaseNote] = &[
+    ReleaseNote {
+        kind: NoteKind::Feature,
+        summary: "Custom keybindings: rebind any Command Palette command in ~/.config/croft/keybindings.json (VS Code-style chord strings); your binding wins over the default and applies on save.",
+    },
+    ReleaseNote {
+        kind: NoteKind::Feature,
+        summary: "User snippets: define prefixes in ~/.config/croft/snippets.json, then type one and press Tab to expand it with $1/$0 tab stops and ${1:placeholder} defaults.",
+    },
+    ReleaseNote {
+        kind: NoteKind::Feature,
+        summary: "Preferences: Open Settings — a searchable hub to flip settings, pick a theme, and jump to the settings / keybindings / snippets JSON files, all from the Command Palette.",
+    },
+];
