@@ -471,6 +471,17 @@ pub(super) fn collect_macos_watch_targets(
     false
 }
 
+impl Drop for FsWatch {
+    // Dropping the whole watcher (e.g. on app teardown or a workspace swap that
+    // replaces the `App`) must offload the notify `Debouncer` exactly like
+    // `rebind`/`disable` do; otherwise a `_watcher` still `Some` at drop runs
+    // `FsEventWatcher::stop()` inline and can busy-spin the UI thread (see
+    // `offload_drop`). `take` leaves `None`, so the field's own drop is a no-op.
+    fn drop(&mut self) {
+        offload_drop(self._watcher.take());
+    }
+}
+
 // VA 2026-06-23: Drop `value` on a detached background thread instead of
 // inline. Dropping a notify FSEvents watcher runs FsEventWatcher::stop(),
 // which busy-spins `while CFRunLoopIsWaiting(runloop) == 0 { thread::yield_now() }`

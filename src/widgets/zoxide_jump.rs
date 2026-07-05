@@ -560,10 +560,10 @@ mod tests {
 
     #[test]
     fn display_path_collapses_home_to_tilde() {
+        // Serialize with every other $HOME-mutating test in this binary.
+        let _guard = crate::HOME_LOCK.lock().unwrap();
         let saved = std::env::var_os("HOME");
-        // SAFETY: this test sets and restores $HOME; no other test in
-        // this module reads it concurrently (cargo serializes within a
-        // binary only across threads, but these are display-only reads).
+        // SAFETY: guarded by HOME_LOCK; set and restored within this test.
         unsafe {
             std::env::set_var("HOME", "/Users/v");
         }

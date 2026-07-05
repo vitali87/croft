@@ -1012,10 +1012,10 @@ mod tests {
         let logs = fake_home.join("Library").join("Logs");
         std::fs::create_dir_all(&logs).unwrap();
         std::fs::write(logs.join("app.log"), b"").unwrap();
+        // Serialize with every other $HOME-mutating test in this binary.
+        let _guard = crate::HOME_LOCK.lock().unwrap();
         let saved = std::env::var_os("HOME");
-        // SAFETY: tests in this binary are serialized for env vars
-        // via build_file_index's HOME read; the value is restored at
-        // the end of the test. Other tests do not toggle $HOME.
+        // SAFETY: guarded by HOME_LOCK; the value is restored below.
         unsafe {
             std::env::set_var("HOME", fake_home);
         }
