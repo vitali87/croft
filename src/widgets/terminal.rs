@@ -282,15 +282,25 @@ fn apply_shell_integration_env(cmd: &mut CommandBuilder, shell_path: &str) {
     if base != "zsh" {
         return;
     }
-    let Ok(shim) = crate::shell_integration::ensure_zsh_shim(&crate::prefs::config_dir()) else {
+    let config_dir = crate::prefs::config_dir();
+    let Ok(shim) = crate::shell_integration::ensure_zsh_shim(&config_dir) else {
         return;
     };
-    let user_zdotdir = std::env::var("ZDOTDIR")
-        .or_else(|_| std::env::var("HOME"))
+    // An inherited ZDOTDIR pointing at croft's own shim (croft launched
+    // from a croft pane) is poisoned — the user's dotfiles live in HOME.
+    let inherited = std::env::var_os("ZDOTDIR").map(std::path::PathBuf::from);
+    let home = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
         .unwrap_or_default();
-    if !user_zdotdir.is_empty() {
-        cmd.env("CROFT_USER_ZDOTDIR", user_zdotdir);
+    if home.as_os_str().is_empty() {
+        return;
     }
+    let user_zdotdir = crate::shell_integration::resolve_user_zdotdir(
+        inherited.as_deref(),
+        &config_dir.join("shell-integration"),
+        &home,
+    );
+    cmd.env("CROFT_USER_ZDOTDIR", user_zdotdir);
     cmd.env("ZDOTDIR", &shim);
 }
 
@@ -2128,6 +2138,68 @@ mod tests {
             term.drain_notifications().is_empty(),
             "a second drain returns nothing"
         );
+    }
+
+    #[test]
+    fn poisoned_zdotdir_from_a_nested_croft_still_loads_the_user_rc() {
+        // Regression: every pane exports ZDOTDIR=<shim>, so a croft launched
+        // FROM a croft pane inherited it and treated the shim as the user's
+        // dotfile dir — the shim then sourced itself in a recursion loop and
+        // the user's real .zshrc (their theme, aliases) never ran. A
+        // poisoned CROFT_USER_ZDOTDIR pointing at the shim must be ignored
+        // in favour of $HOME.
+        let zsh = "/bin/zsh";
+        if !std::path::Path::new(zsh).exists() {
+            return;
+        }
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            home.path().join(".zshrc"),
+            "USER_RC_SENTINEL=loaded\nexport USER_RC_SENTINEL\n",
+        )
+        .unwrap();
+        let cfg_dir = tempfile::tempdir().unwrap();
+        let shim = crate::shell_integration::ensure_zsh_shim(cfg_dir.path()).unwrap();
+        let mut cmd = CommandBuilder::new(zsh);
+        cmd.arg("-i");
+        cmd.cwd(home.path());
+        cmd.env("HOME", home.path());
+        // The poison: both vars point at the shim itself, exactly what a
+        // pane's environment hands a nested croft.
+        cmd.env("ZDOTDIR", &shim);
+        cmd.env("CROFT_USER_ZDOTDIR", &shim);
+        let mut term = PtyTerminal::spawn_with(cmd, None).unwrap();
+        let mut waited = 0u32;
+        while term.prompt_lines().is_empty() {
+            assert!(
+                waited < 8000,
+                "no prompt mark; grid: {:?}",
+                term.grid_lines().0
+            );
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            waited += 40;
+        }
+        term.write_input(b"echo SENTINEL_IS=$USER_RC_SENTINEL\r");
+        let mut waited = 0u32;
+        loop {
+            let (lines, _) = term.grid_lines();
+            assert!(
+                !lines.iter().any(|l| l.contains("recursion limit")),
+                "the shim must never source itself; grid: {lines:?}"
+            );
+            if lines
+                .iter()
+                .any(|l| l.contains("SENTINEL_IS=loaded") && !l.contains("echo"))
+            {
+                break;
+            }
+            assert!(
+                waited < 8000,
+                "user rc never ran under a poisoned ZDOTDIR; grid: {lines:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            waited += 40;
+        }
     }
 
     #[test]

@@ -59,13 +59,7 @@ pub struct ReleaseNote {
 }
 
 /// What shipped in the current release. Replace on every version bump.
-pub const RELEASE_NOTES: &[ReleaseNote] = &[
-    ReleaseNote {
-        kind: NoteKind::Feature,
-        summary: "Terminal shell integration: croft auto-installs zsh OSC 133 prompt marks (your dotfiles run unchanged), and Cmd/Ctrl+Opt+Up/Down jumps between command prompts.",
-    },
-    ReleaseNote {
-        kind: NoteKind::Feature,
-        summary: "New terminal splits inherit the shell's exact cwd via OSC 7, and OSC 9 notifications surface in the status bar.",
-    },
-];
+pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
+    kind: NoteKind::Fix,
+    summary: "Shell integration no longer skips your zsh dotfiles (theme, aliases) when croft is launched from inside a croft terminal: a pane's inherited ZDOTDIR pointing at croft's own shim is detected and your real HOME dotfiles load.",
+}];

@@ -256,24 +256,29 @@ impl OscSniffer {
 /// cwd report.
 const ZSH_SHIM_ZSHENV: &str = r#"# croft shell integration bootstrap (auto-generated; do not edit)
 _croft_shim_zdotdir="$ZDOTDIR"
+# A CROFT_USER_ZDOTDIR pointing back at the shim is a poisoned inheritance
+# (croft launched from a croft pane); the user's real dotfiles live in HOME.
+if [[ -n "$CROFT_USER_ZDOTDIR" && "$CROFT_USER_ZDOTDIR" == "$_croft_shim_zdotdir" ]]; then
+  export CROFT_USER_ZDOTDIR="$HOME"
+fi
 ZDOTDIR="${CROFT_USER_ZDOTDIR:-$HOME}"
-[[ -f "$ZDOTDIR/.zshenv" ]] && builtin source "$ZDOTDIR/.zshenv"
+[[ "$ZDOTDIR" != "$_croft_shim_zdotdir" && -f "$ZDOTDIR/.zshenv" ]] && builtin source "$ZDOTDIR/.zshenv"
 ZDOTDIR="$_croft_shim_zdotdir"
 "#;
 
 const ZSH_SHIM_ZPROFILE: &str = r#"# croft shell integration (auto-generated; do not edit)
 _croft_user="${CROFT_USER_ZDOTDIR:-$HOME}"
-[[ -f "$_croft_user/.zprofile" ]] && ZDOTDIR="$_croft_user" builtin source "$_croft_user/.zprofile"
+[[ "$_croft_user" != "$ZDOTDIR" && -f "$_croft_user/.zprofile" ]] && ZDOTDIR="$_croft_user" builtin source "$_croft_user/.zprofile"
 "#;
 
 const ZSH_SHIM_ZLOGIN: &str = r#"# croft shell integration (auto-generated; do not edit)
 _croft_user="${CROFT_USER_ZDOTDIR:-$HOME}"
-[[ -f "$_croft_user/.zlogin" ]] && ZDOTDIR="$_croft_user" builtin source "$_croft_user/.zlogin"
+[[ "$_croft_user" != "$ZDOTDIR" && -f "$_croft_user/.zlogin" ]] && ZDOTDIR="$_croft_user" builtin source "$_croft_user/.zlogin"
 "#;
 
 const ZSH_SHIM_ZSHRC: &str = r#"# croft shell integration (auto-generated; do not edit)
 _croft_user="${CROFT_USER_ZDOTDIR:-$HOME}"
-[[ -f "$_croft_user/.zshrc" ]] && ZDOTDIR="$_croft_user" builtin source "$_croft_user/.zshrc"
+[[ "$_croft_user" != "$ZDOTDIR" && -f "$_croft_user/.zshrc" ]] && ZDOTDIR="$_croft_user" builtin source "$_croft_user/.zshrc"
 
 # FinalTerm / OSC 133 semantic prompt marks + OSC 7 cwd, the protocol VS
 # Code, Ghostty, iTerm2 and WezTerm build command navigation on.
@@ -304,6 +309,22 @@ else
   builtin unset ZDOTDIR
 fi
 "#;
+
+/// The user's real dotfile directory for the shim to source. An inherited
+/// `ZDOTDIR` pointing into croft's own shell-integration tree is poisoned
+/// inheritance — a croft launched from a croft pane, whose environment
+/// carries the shim path — and must fall back to `home`, or the shim would
+/// source itself in a recursion loop and the user's rc would never run.
+pub fn resolve_user_zdotdir(
+    inherited: Option<&std::path::Path>,
+    shim_root: &std::path::Path,
+    home: &std::path::Path,
+) -> PathBuf {
+    match inherited {
+        Some(z) if !z.starts_with(shim_root) => z.to_path_buf(),
+        _ => home.to_path_buf(),
+    }
+}
 
 /// Write croft's zsh `ZDOTDIR` shim (idempotently) and return its directory.
 pub fn ensure_zsh_shim(config_dir: &std::path::Path) -> std::io::Result<PathBuf> {
@@ -437,6 +458,22 @@ mod tests {
         }
         let got = s.scan(b"\x1b]133;A\x07");
         assert_eq!(got, vec![(8, OscEvent::PromptStart)]);
+    }
+
+    #[test]
+    fn resolve_user_zdotdir_rejects_croft_shim_paths() {
+        let shim_root = std::path::Path::new("/cfg/croft/shell-integration");
+        let home = std::path::Path::new("/Users/me");
+        // Poisoned: inherited ZDOTDIR inside croft's shim tree → HOME.
+        assert_eq!(
+            resolve_user_zdotdir(Some(&shim_root.join("zsh")), shim_root, home),
+            home
+        );
+        // A genuine user ZDOTDIR redirect is honoured.
+        let custom = std::path::Path::new("/Users/me/.config/zsh");
+        assert_eq!(resolve_user_zdotdir(Some(custom), shim_root, home), custom);
+        // No inherited ZDOTDIR → HOME.
+        assert_eq!(resolve_user_zdotdir(None, shim_root, home), home);
     }
 
     #[test]
