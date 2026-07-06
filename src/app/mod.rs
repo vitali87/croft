@@ -8467,10 +8467,17 @@ impl App {
     /// The cwd a new terminal should inherit: the active terminal's live
     /// directory if it has one, else the workspace root.
     fn next_terminal_cwd(&self) -> PathBuf {
+        // The shell's own OSC 7 report (shell integration) beats sampling
+        // the process table — it is exact and free of proc-inspection races.
         self.terminal()
-            .pid()
-            .and_then(cwd_of_pid)
+            .shell_cwd()
             .filter(|p| p.is_dir())
+            .or_else(|| {
+                self.terminal()
+                    .pid()
+                    .and_then(cwd_of_pid)
+                    .filter(|p| p.is_dir())
+            })
             .unwrap_or_else(|| self.workspace_root.clone())
     }
 
@@ -16516,6 +16523,21 @@ impl App {
             self.cycle_terminal_back();
             return;
         }
+        // Cmd+Opt+Up / Cmd+Opt+Down (Linux: Ctrl+Alt): jump to the previous /
+        // next prompt via the OSC 133 marks shell integration records —
+        // VS Code's command navigation. (VS Code's own Cmd+Up/Down chord is
+        // impossible here: bare Cmd+arrows are reserved by the user, see
+        // src/iterm2.rs. The chord is already forwarded globally for the
+        // editor's Add Cursor Above/Below and is unused in the terminal.)
+        if key
+            .modifiers
+            .intersects(KeyModifiers::SUPER | KeyModifiers::CONTROL)
+            && key.modifiers.contains(KeyModifiers::ALT)
+            && matches!(key.code, KeyCode::Up | KeyCode::Down)
+        {
+            self.terminal_prompt_jump(matches!(key.code, KeyCode::Down));
+            return;
+        }
         // Ctrl+Shift+C / Cmd+C: copy current selection.
         if is_terminal_copy_key(key) {
             self.copy_terminal_selection();
@@ -17233,21 +17255,46 @@ impl App {
     /// poll the socket table. Output-scrape hits are browser-facing
     /// announcements, so a new one raises the toast; socket-poll hits populate
     /// the PORTS tab silently. Returns whether anything changed (for redraw).
-    /// Surface BEL rings from any pane in the status bar (VS Code shows a
-    /// bell on the terminal tab; croft's status line is its equivalent).
-    /// Returns true when a bell arrived so the loop redraws.
+    /// Surface BEL rings and OSC 9 notifications from any pane in the status
+    /// bar (VS Code shows a bell on the terminal tab; croft's status line is
+    /// its equivalent). Returns true when either arrived so the loop redraws.
     fn drain_terminal_bells(&mut self) -> bool {
         let mut rang: Option<String> = None;
+        let mut notes: Vec<String> = Vec::new();
         for t in &self.terminals {
             if t.take_bell() {
                 rang = Some(t.label().to_string());
             }
+            notes.extend(t.drain_notifications());
+        }
+        if let Some(msg) = notes.pop() {
+            self.status = format!("Terminal notification: {msg}");
+            return true;
         }
         let Some(label) = rang else {
             return false;
         };
         self.status = format!("Bell in terminal: {label}");
         true
+    }
+
+    /// Cmd+Opt+Up / Cmd+Opt+Down in the terminal: scroll the previous / next
+    /// OSC 133 prompt mark to the top of the pane.
+    fn terminal_prompt_jump(&mut self, forward: bool) {
+        let prompts = self.terminal().prompt_lines();
+        let top = self.terminal().viewport_top_line();
+        let Some(target) = crate::widgets::terminal::pick_prompt_jump(&prompts, top, forward)
+        else {
+            self.status = String::from(if prompts.is_empty() {
+                "No command marks yet (shell integration needs a zsh prompt)"
+            } else if forward {
+                "No next command"
+            } else {
+                "No previous command"
+            });
+            return;
+        };
+        self.terminal_mut().scroll_line_to_top(target);
     }
 
     fn drain_ports_and_poll(&mut self) -> bool {

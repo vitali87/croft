@@ -28,6 +28,7 @@ mod remote_bulk;
 mod remote_connect;
 mod session_state;
 mod sheet;
+mod shell_integration;
 mod snippets;
 mod tasks;
 mod termux;

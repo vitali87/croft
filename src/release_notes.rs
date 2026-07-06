@@ -62,14 +62,10 @@ pub struct ReleaseNote {
 pub const RELEASE_NOTES: &[ReleaseNote] = &[
     ReleaseNote {
         kind: NoteKind::Feature,
-        summary: "Terminal OSC 8 hyperlinks: Cmd/Ctrl+click opens a real embedded link even when the visible text isn't the URL.",
+        summary: "Terminal shell integration: croft auto-installs zsh OSC 133 prompt marks (your dotfiles run unchanged), and Cmd/Ctrl+Opt+Up/Down jumps between command prompts.",
     },
     ReleaseNote {
         kind: NoteKind::Feature,
-        summary: "Terminal bell: a BEL from any pane surfaces in the status bar with the pane's name.",
-    },
-    ReleaseNote {
-        kind: NoteKind::Fix,
-        summary: "Copying or searching CJK/emoji terminal text no longer inserts a phantom space after every wide character.",
+        summary: "New terminal splits inherit the shell's exact cwd via OSC 7, and OSC 9 notifications surface in the status bar.",
     },
 ];

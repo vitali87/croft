@@ -215,6 +215,83 @@ pub struct PtyTerminal {
     /// Latched by the event listener when the child rings BEL; drained by
     /// [`Self::take_bell`].
     bell: Arc<AtomicBool>,
+    /// OSC 133 semantic prompt marks recorded by the reader thread, in
+    /// arrival order. Positions are stored as `(grid line, history size)`
+    /// at record time; [`Self::command_marks`] translates to current grid
+    /// lines (content scrolls into history as output arrives, so a stored
+    /// line drifts by exactly the history growth since recording).
+    marks: Arc<std::sync::Mutex<Vec<StoredMark>>>,
+    /// Latest OSC 7 cwd report from the shell, when integration is active.
+    osc7_cwd: Arc<std::sync::Mutex<Option<std::path::PathBuf>>>,
+    /// OSC 9 notification payloads awaiting the app's drain.
+    notifications: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+/// One OSC 133 mark at its recording-time position. `line_rec` is the grid
+/// line the cursor sat on (0-based live screen), `hist_rec` the scrollback
+/// size at that moment; the current position is
+/// `line_rec - (history_now - hist_rec)`.
+///
+/// Ceiling: once scrollback saturates (5000 lines), `history_size` stops
+/// growing while content keeps scrolling, so surviving marks drift by the
+/// evicted-line count. Marks that old point near-evicted content anyway
+/// and are GC'd as they pass the scrollback floor.
+struct StoredMark {
+    kind: crate::shell_integration::OscEvent,
+    line_rec: i32,
+    hist_rec: usize,
+}
+
+/// Cap on retained marks per pane (a mark per prompt/command boundary;
+/// thousands would mean a very long session — drop the oldest).
+const MARKS_MAX: usize = 2000;
+
+/// The nearest prompt line strictly above (`forward == false`) or below
+/// (`forward == true`) the viewport-top grid line `current_top`. Feeds
+/// Cmd+Up / Cmd+Down command navigation.
+pub fn pick_prompt_jump(prompt_lines: &[i32], current_top: i32, forward: bool) -> Option<i32> {
+    if forward {
+        prompt_lines
+            .iter()
+            .copied()
+            .filter(|&l| l > current_top)
+            .min()
+    } else {
+        prompt_lines
+            .iter()
+            .copied()
+            .filter(|&l| l < current_top)
+            .max()
+    }
+}
+
+/// Inject croft's shell-integration environment for supported shells.
+/// zsh: point `ZDOTDIR` at croft's shim, which sources the user's real
+/// dotfiles unchanged and then installs `precmd`/`preexec` hooks emitting
+/// OSC 133 prompt marks + the OSC 7 cwd report. Opt out with
+/// `CROFT_SHELL_INTEGRATION=0`. Failures are non-fatal — the shell still
+/// spawns, just without marks.
+fn apply_shell_integration_env(cmd: &mut CommandBuilder, shell_path: &str) {
+    if std::env::var("CROFT_SHELL_INTEGRATION").as_deref() == Ok("0") {
+        return;
+    }
+    let base = std::path::Path::new(shell_path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    if base != "zsh" {
+        return;
+    }
+    let Ok(shim) = crate::shell_integration::ensure_zsh_shim(&crate::prefs::config_dir()) else {
+        return;
+    };
+    let user_zdotdir = std::env::var("ZDOTDIR")
+        .or_else(|_| std::env::var("HOME"))
+        .unwrap_or_default();
+    if !user_zdotdir.is_empty() {
+        cmd.env("CROFT_USER_ZDOTDIR", user_zdotdir);
+    }
+    cmd.env("ZDOTDIR", &shim);
 }
 
 /// Pick the program + args to spawn the user's interactive shell so it
@@ -304,6 +381,7 @@ impl PtyTerminal {
             cmd.arg(a);
         }
         cmd.cwd(cwd);
+        apply_shell_integration_env(&mut cmd, shell_path);
         Self::spawn_with(cmd, None)
     }
 
@@ -482,9 +560,17 @@ impl PtyTerminal {
 
         let script_mode = run_label.is_some();
 
+        let marks = Arc::new(std::sync::Mutex::new(Vec::<StoredMark>::new()));
+        let marks_for_thread = marks.clone();
+        let osc7_cwd = Arc::new(std::sync::Mutex::new(Option::<std::path::PathBuf>::None));
+        let osc7_for_thread = osc7_cwd.clone();
+        let notifications = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let notifications_for_thread = notifications.clone();
+
         let reader_thread = std::thread::spawn(move || {
             let mut processor = Processor::<StdSyncHandler>::new();
             let mut port_sniffer = crate::port_detect::PortSniffer::new();
+            let mut osc_sniffer = crate::shell_integration::OscSniffer::default();
             let mut buf = [0u8; 65536];
             loop {
                 match reader.read(&mut buf) {
@@ -492,8 +578,44 @@ impl PtyTerminal {
                     Ok(n) => {
                         sniff_bracketed_paste_mode(&buf[..n], &bracketed_paste_for_thread);
                         port_sniffer.sniff(&buf[..n], &port_tx);
+                        // Shell-integration marks: split the advance at each
+                        // OSC 133 so the cursor can be sampled exactly where
+                        // the mark landed (alacritty drops the sequences
+                        // themselves as unknown OSC).
+                        let osc_events = osc_sniffer.scan(&buf[..n]);
                         let mut t = term_for_thread.lock();
-                        processor.advance(&mut *t, &buf[..n]);
+                        let mut done = 0usize;
+                        for (end, ev) in osc_events {
+                            processor.advance(&mut *t, &buf[done..end]);
+                            done = end;
+                            use crate::shell_integration::OscEvent as E;
+                            match ev {
+                                E::Cwd(p) => {
+                                    *osc7_for_thread.lock().unwrap() = Some(p);
+                                }
+                                E::Notify(msg) => {
+                                    notifications_for_thread.lock().unwrap().push(msg);
+                                }
+                                kind @ (E::PromptStart
+                                | E::PromptEnd
+                                | E::CommandStart
+                                | E::CommandEnd(_)) => {
+                                    let line_rec = t.grid().cursor.point.line.0;
+                                    let hist_rec = t.grid().history_size();
+                                    let mut ms = marks_for_thread.lock().unwrap();
+                                    if ms.len() >= MARKS_MAX {
+                                        let drop_n = ms.len() + 1 - MARKS_MAX;
+                                        ms.drain(..drop_n);
+                                    }
+                                    ms.push(StoredMark {
+                                        kind,
+                                        line_rec,
+                                        hist_rec,
+                                    });
+                                }
+                            }
+                        }
+                        processor.advance(&mut *t, &buf[done..n]);
                         drop(t);
                         pty_pending_bytes_for_thread.fetch_add(n, Ordering::Relaxed);
                         pty_dirty_for_thread.store(true, Ordering::Release);
@@ -535,7 +657,70 @@ impl PtyTerminal {
             search_opts: crate::widgets::search::SearchOpts::default(),
             current_match: None,
             bell,
+            marks,
+            osc7_cwd,
+            notifications,
         })
+    }
+
+    /// OSC 133 marks with their *current* grid line (negative = scrollback),
+    /// oldest first. Marks whose content scrolled past the scrollback floor
+    /// are garbage-collected here.
+    pub fn command_marks(&self) -> Vec<(crate::shell_integration::OscEvent, i32)> {
+        let term = self.term.lock();
+        let hist_now = term.grid().history_size() as i32;
+        let floor = term.grid().topmost_line().0;
+        drop(term);
+        let mut marks = self.marks.lock().unwrap();
+        marks.retain(|m| m.line_rec - (hist_now - m.hist_rec as i32) >= floor);
+        marks
+            .iter()
+            .map(|m| (m.kind.clone(), m.line_rec - (hist_now - m.hist_rec as i32)))
+            .collect()
+    }
+
+    /// Current grid lines of the PromptStart marks — the Cmd+Up/Cmd+Down
+    /// navigation targets.
+    pub fn prompt_lines(&self) -> Vec<i32> {
+        self.command_marks()
+            .into_iter()
+            .filter(|(kind, _)| *kind == crate::shell_integration::OscEvent::PromptStart)
+            .map(|(_, line)| line)
+            .collect()
+    }
+
+    /// The shell's live cwd per its latest OSC 7 report, when shell
+    /// integration is active. Fresher than sampling `cwd_of_pid`.
+    pub fn shell_cwd(&self) -> Option<std::path::PathBuf> {
+        self.osc7_cwd.lock().unwrap().clone()
+    }
+
+    /// OSC 9 notification payloads since the last drain.
+    pub fn drain_notifications(&self) -> Vec<String> {
+        std::mem::take(&mut *self.notifications.lock().unwrap())
+    }
+
+    /// The viewport-top grid line: what `pick_prompt_jump` navigates from.
+    pub fn viewport_top_line(&self) -> i32 {
+        -(self.term.lock().grid().display_offset() as i32)
+    }
+
+    /// Scroll so absolute grid line `abs_line` sits at the top of the pane
+    /// (VS Code parks the jumped-to command at the top). No-op in alternate
+    /// screen, like the other scrollback moves.
+    pub fn scroll_line_to_top(&mut self, abs_line: i32) {
+        let mut term = self.term.lock();
+        if term.mode().contains(TermMode::ALT_SCREEN) {
+            return;
+        }
+        let max_off = (-term.grid().topmost_line().0).max(0);
+        let desired = (-abs_line).clamp(0, max_off);
+        let delta = desired - term.grid().display_offset() as i32;
+        if delta != 0 {
+            term.scroll_display(Scroll::Delta(delta));
+        }
+        drop(term);
+        self.pty_dirty.store(true, Ordering::Release);
     }
 
     /// True once if the child rang BEL since the last call (drains the latch).
@@ -1842,6 +2027,154 @@ mod tests {
             None,
             "cells outside the link (the header row) carry no URI"
         );
+    }
+
+    #[test]
+    fn osc133_marks_record_kind_exit_code_and_grid_line() {
+        // Emit a prompt mark before "PROMPT", a command-start mark, and a
+        // finished mark carrying exit 3. Marks must land on the grid lines
+        // where the cursor sat when they arrived.
+        let tmp = tempfile::tempdir().unwrap();
+        let script = "printf 'before\\n\\033]133;A\\007PROMPT-LINE\\n\\033]133;C\\007out\\n\\033]133;D;3\\007'";
+        let term =
+            PtyTerminal::new_running("/bin/sh", &[String::from("-c"), script.into()], tmp.path())
+                .unwrap();
+        let is_output = |l: &String| l.contains("PROMPT-LINE") && !l.contains("printf");
+        let lines = wait_for_grid(&term, |ls| {
+            ls.iter().any(is_output) && !term.command_marks().is_empty()
+        });
+        let (_, top) = term.grid_lines();
+        let prompt_row = lines.iter().position(is_output).unwrap();
+        let marks = term.command_marks();
+        let prompt_line = marks
+            .iter()
+            .find(|(kind, _)| *kind == crate::shell_integration::OscEvent::PromptStart)
+            .map(|(_, line)| *line)
+            .expect("a PromptStart mark must be recorded");
+        assert_eq!(
+            prompt_line,
+            top + prompt_row as i32,
+            "the prompt mark must sit on the line where PROMPT-LINE was printed"
+        );
+        assert!(
+            marks
+                .iter()
+                .any(|(kind, _)| *kind == crate::shell_integration::OscEvent::CommandEnd(Some(3))),
+            "the finished mark must carry exit code 3; marks: {marks:?}"
+        );
+    }
+
+    #[test]
+    fn marks_follow_their_content_into_scrollback() {
+        // A mark recorded on the live screen must keep pointing at the same
+        // content after later output scrolls that content into history.
+        let tmp = tempfile::tempdir().unwrap();
+        let script = "printf '\\033]133;A\\007MARKED-PROMPT\\n'; i=0; while [ $i -lt 40 ]; do echo filler-$i; i=$((i+1)); done";
+        let term =
+            PtyTerminal::new_running("/bin/sh", &[String::from("-c"), script.into()], tmp.path())
+                .unwrap();
+        let lines = wait_for_grid(&term, |ls| ls.iter().any(|l| l.contains("filler-39")));
+        let (_, top) = term.grid_lines();
+        let content_row = lines
+            .iter()
+            .position(|l| l.contains("MARKED-PROMPT") && !l.contains("printf"))
+            .expect("the marked line must still be in scrollback");
+        let marks = term.command_marks();
+        let prompt_line = marks
+            .iter()
+            .find(|(kind, _)| *kind == crate::shell_integration::OscEvent::PromptStart)
+            .map(|(_, line)| *line)
+            .expect("the mark must survive the scroll");
+        assert_eq!(
+            prompt_line,
+            top + content_row as i32,
+            "the mark must move with its content into history (negative grid lines)"
+        );
+        assert!(
+            prompt_line < 0,
+            "after 40 filler lines the mark is in scrollback"
+        );
+    }
+
+    #[test]
+    fn osc7_updates_the_shell_cwd() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = "printf '\\033]7;file://anyhost/tmp/croft%%20dir\\007ok\\n'";
+        let term =
+            PtyTerminal::new_running("/bin/sh", &[String::from("-c"), script.into()], tmp.path())
+                .unwrap();
+        wait_for_grid(&term, |ls| {
+            ls.iter().any(|l| l.contains("ok") && !l.contains("printf"))
+        });
+        assert_eq!(
+            term.shell_cwd(),
+            Some(std::path::PathBuf::from("/tmp/croft dir")),
+            "OSC 7 must update the pane's live cwd"
+        );
+    }
+
+    #[test]
+    fn osc9_notifications_drain_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = "printf '\\033]9;build done\\007ok\\n'";
+        let term =
+            PtyTerminal::new_running("/bin/sh", &[String::from("-c"), script.into()], tmp.path())
+                .unwrap();
+        wait_for_grid(&term, |ls| {
+            ls.iter().any(|l| l.contains("ok") && !l.contains("printf"))
+        });
+        assert_eq!(term.drain_notifications(), vec![String::from("build done")]);
+        assert!(
+            term.drain_notifications().is_empty(),
+            "a second drain returns nothing"
+        );
+    }
+
+    #[test]
+    fn zsh_shim_emits_prompt_marks_end_to_end() {
+        // The real proof: an interactive zsh reading croft's ZDOTDIR shim
+        // must emit OSC 133 prompt marks and an OSC 7 cwd report at its
+        // first prompt, with the user's own (here: empty) dotfiles sourced.
+        let zsh = "/bin/zsh";
+        if !std::path::Path::new(zsh).exists() {
+            return; // no zsh on this machine; covered on macOS dev boxes
+        }
+        let user_dir = tempfile::tempdir().unwrap();
+        let cfg_dir = tempfile::tempdir().unwrap();
+        let shim = crate::shell_integration::ensure_zsh_shim(cfg_dir.path()).unwrap();
+        let mut cmd = CommandBuilder::new(zsh);
+        cmd.arg("-i");
+        cmd.cwd(user_dir.path());
+        cmd.env("ZDOTDIR", &shim);
+        cmd.env("CROFT_USER_ZDOTDIR", user_dir.path());
+        let term = PtyTerminal::spawn_with(cmd, None).unwrap();
+        let mut waited_ms = 0u32;
+        while term.prompt_lines().is_empty() {
+            assert!(
+                waited_ms < 8000,
+                "zsh never emitted a prompt mark; grid: {:?}",
+                term.grid_lines().0
+            );
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            waited_ms += 40;
+        }
+        assert!(
+            term.shell_cwd().is_some(),
+            "the shim's precmd must also report the cwd via OSC 7"
+        );
+    }
+
+    #[test]
+    fn prompt_jump_targets_walk_previous_and_next() {
+        // Pure chooser used by Cmd+Up / Cmd+Down: pick the nearest prompt
+        // line above / below the current viewport top, if any.
+        let prompts = [-30, -12, 0];
+        assert_eq!(pick_prompt_jump(&prompts, 0, false), Some(-12));
+        assert_eq!(pick_prompt_jump(&prompts, -12, false), Some(-30));
+        assert_eq!(pick_prompt_jump(&prompts, -30, false), None);
+        assert_eq!(pick_prompt_jump(&prompts, -30, true), Some(-12));
+        assert_eq!(pick_prompt_jump(&prompts, -12, true), Some(0));
+        assert_eq!(pick_prompt_jump(&prompts, 0, true), None);
     }
 
     #[test]

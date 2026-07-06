@@ -1221,6 +1221,56 @@ fn cmd_f_opens_terminal_find_and_captures_typing() {
 }
 
 #[test]
+fn cmd_opt_up_parks_the_previous_prompt_mark_at_the_viewport_top() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    // Swap in a pane that emits an OSC 133 prompt mark and then scrolls it
+    // into history with filler output.
+    let script = "printf '\\033]133;A\\007PROMPT\\n'; i=0; while [ $i -lt 40 ]; do echo filler-$i; i=$((i+1)); done";
+    app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
+        "/bin/sh",
+        &[String::from("-c"), script.into()],
+        tmp.path(),
+    )
+    .unwrap();
+    let mut waited = 0u32;
+    while app.terminals[0].prompt_lines().is_empty()
+        || !app.terminals[0]
+            .grid_lines()
+            .0
+            .iter()
+            .any(|l| l.contains("filler-39"))
+    {
+        assert!(waited < 4000, "mark/filler output never arrived");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        waited += 20;
+    }
+    app.focus_pane(Pane::Terminal);
+    assert_eq!(
+        app.terminal().viewport_top_line(),
+        0,
+        "starts at the live bottom"
+    );
+
+    app.handle_terminal_key(key(KeyCode::Up, KeyModifiers::SUPER | KeyModifiers::ALT));
+    let mark = app.terminal().prompt_lines()[0];
+    assert!(mark < 0, "the mark scrolled into history");
+    assert_eq!(
+        app.terminal().viewport_top_line(),
+        mark,
+        "Cmd+Opt+Up must park the previous prompt mark at the viewport top"
+    );
+
+    // Only one mark: jumping forward finds nothing past it.
+    app.handle_terminal_key(key(KeyCode::Down, KeyModifiers::SUPER | KeyModifiers::ALT));
+    assert!(
+        app.status.contains("No next command"),
+        "status was: {}",
+        app.status
+    );
+}
+
+#[test]
 fn leaving_the_terminal_closes_its_find_bar() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
