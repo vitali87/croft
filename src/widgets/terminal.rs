@@ -194,6 +194,16 @@ pub struct PtyTerminal {
     /// Live foreground-process label (`zsh`, `vim`, `node`…), refreshed off the
     /// event loop on a cadence. Empty until the first refresh resolves.
     auto_label: String,
+    /// Terminal find state: the needle currently highlighted across the grid
+    /// and the options it matches under. `None` when no find bar is open.
+    /// Set by the app's terminal find bar; the render loop paints every
+    /// occurrence on each visible row.
+    search_needle: Option<String>,
+    search_opts: crate::widgets::search::SearchOpts,
+    /// The active match `(abs_line, col, len)` painted in the brighter accent,
+    /// versus the muted highlight on every other occurrence (VS Code's
+    /// current-vs-other match colours).
+    current_match: Option<(i32, usize, usize)>,
 }
 
 /// Pick the program + args to spawn the user's interactive shell so it
@@ -309,6 +319,70 @@ impl PtyTerminal {
         }
         let off = term.grid().display_offset() as i32;
         extract_selection_text(&term, -off, 0, rows as i32 - 1 - off, cols - 1)
+    }
+
+    /// Every readable grid line as plain text — oldest scrollback first, then
+    /// the live screen — paired with the absolute alacritty `Line` index of
+    /// row 0. Terminal find searches these lines; `top + row` maps a hit's
+    /// row back to its grid line so it can be scrolled into view and
+    /// highlighted. One grid column per char (matching the render loop, which
+    /// likewise does not reserve wide-char cells).
+    pub fn grid_lines(&self) -> (Vec<String>, i32) {
+        let term = self.term.lock();
+        let cols = term.columns();
+        if cols == 0 {
+            return (Vec::new(), 0);
+        }
+        let top = term.grid().topmost_line().0;
+        let bottom = term.screen_lines() as i32 - 1;
+        let mut lines = Vec::new();
+        let mut l = top;
+        while l <= bottom {
+            let mut s = String::with_capacity(cols);
+            for c in 0..cols {
+                let ch = term.grid()[Point::new(Line(l), Column(c))].c;
+                s.push(if ch == '\0' { ' ' } else { ch });
+            }
+            lines.push(s.trim_end().to_string());
+            l += 1;
+        }
+        (lines, top)
+    }
+
+    /// Set (or clear) the find highlight. Every occurrence of `needle` is
+    /// painted across the visible grid on the next render.
+    pub fn set_search(&mut self, needle: Option<String>, opts: crate::widgets::search::SearchOpts) {
+        self.search_needle = needle.filter(|s| !s.is_empty());
+        self.search_opts = opts;
+        self.pty_dirty.store(true, Ordering::Release);
+    }
+
+    /// Mark which occurrence is the active match `(abs_line, col, len)` so the
+    /// render loop paints it in the brighter accent.
+    pub fn set_current_match(&mut self, m: Option<(i32, usize, usize)>) {
+        self.current_match = m;
+        self.pty_dirty.store(true, Ordering::Release);
+    }
+
+    /// Scroll the viewport so absolute grid line `abs_line` sits near the
+    /// middle of the pane, clamped to the scrollback range. No-op in
+    /// alternate screen, where there is no scrollback to move through and the
+    /// whole grid is already on screen.
+    pub fn scroll_to_line(&mut self, abs_line: i32) {
+        let mut term = self.term.lock();
+        if term.mode().contains(TermMode::ALT_SCREEN) {
+            return;
+        }
+        let rows = term.screen_lines() as i32;
+        let max_off = (-term.grid().topmost_line().0).max(0);
+        let cur = term.grid().display_offset() as i32;
+        let desired = scroll_offset_for_line(rows, max_off, abs_line);
+        let delta = desired - cur;
+        if delta != 0 {
+            term.scroll_display(Scroll::Delta(delta));
+        }
+        drop(term);
+        self.pty_dirty.store(true, Ordering::Release);
     }
 
     fn spawn_with(mut cmd: CommandBuilder, run_label: Option<String>) -> Result<Self> {
@@ -431,6 +505,9 @@ impl PtyTerminal {
             selection: None,
             manual_name: None,
             auto_label: String::new(),
+            search_needle: None,
+            search_opts: crate::widgets::search::SearchOpts::default(),
+            current_match: None,
         })
     }
 
@@ -1124,6 +1201,19 @@ impl Widget for &mut PtyTerminal {
         let cursor_col_in_viewport = cursor_point.column.0 as i32;
 
         for y in 0..rows {
+            // Find matches on this row once, then paint them per cell below.
+            let row_line_idx = (y as i32) - (display_offset as i32);
+            let row_matches: Vec<(usize, usize)> = match self.search_needle.as_deref() {
+                Some(needle) => {
+                    let mut s = String::with_capacity(cols as usize);
+                    for x in 0..cols {
+                        let ch = term.grid()[Point::new(Line(row_line_idx), Column(x as usize))].c;
+                        s.push(if ch == '\0' { ' ' } else { ch });
+                    }
+                    crate::widgets::editor_find::line_matches(&s, self.search_opts, needle)
+                }
+                None => Vec::new(),
+            };
             for x in 0..cols {
                 let line_idx = (y as i32) - (display_offset as i32);
                 let p = Point::new(Line(line_idx), Column(x as usize));
@@ -1160,6 +1250,19 @@ impl Widget for &mut PtyTerminal {
                 {
                     style = style.bg(Color::Rgb(0x26, 0x4f, 0x78));
                 }
+                // Find highlight: muted amber on every occurrence, bright
+                // orange on the active match (VS Code's find colours).
+                for &(mc, ml) in &row_matches {
+                    if (x as usize) >= mc && (x as usize) < mc + ml {
+                        let bg = if self.current_match == Some((line_idx, mc, ml)) {
+                            Color::Rgb(0xff, 0x8c, 0x2a)
+                        } else {
+                            Color::Rgb(0xff, 0xd7, 0x4a)
+                        };
+                        style = style.fg(Color::Black).bg(bg).add_modifier(Modifier::BOLD);
+                        break;
+                    }
+                }
                 let target_x = inner.x + x;
                 let target_y = inner.y + y;
                 let target = &mut buf[(target_x, target_y)];
@@ -1169,6 +1272,15 @@ impl Widget for &mut PtyTerminal {
             }
         }
     }
+}
+
+/// The display offset that brings absolute grid line `abs_line` to the
+/// vertical middle of a `rows`-tall viewport, clamped to `[0, max_off]` (0 =
+/// live bottom, `max_off` = oldest scrollback). The render loop shows the
+/// grid line `y - display_offset` at viewport row `y`, so centering the
+/// target means `display_offset = rows/2 - abs_line`. Pure for testing.
+pub fn scroll_offset_for_line(rows: i32, max_off: i32, abs_line: i32) -> i32 {
+    (rows / 2 - abs_line).clamp(0, max_off.max(0))
 }
 
 /// True iff (row, col) is inside the inclusive row-major range
@@ -1202,6 +1314,20 @@ mod tests {
     fn feed(term: &mut Term<VoidListener>, bytes: &[u8]) {
         let mut p = Processor::<StdSyncHandler>::new();
         p.advance(term, bytes);
+    }
+
+    #[test]
+    fn scroll_offset_centers_a_scrollback_match_and_clamps_to_the_range() {
+        // 24-row pane, 100 lines of scrollback (max_off 100). A match on an
+        // old line (-80) centers it: 12 - (-80) = 92, within [0, 100].
+        assert_eq!(scroll_offset_for_line(24, 100, -80), 92);
+        // A match on the live screen (line 20) wants a negative offset but is
+        // clamped to 0 — you cannot scroll below the live bottom.
+        assert_eq!(scroll_offset_for_line(24, 100, 20), 0);
+        // A match older than the deepest scrollback is clamped to max_off.
+        assert_eq!(scroll_offset_for_line(24, 100, -200), 100);
+        // No scrollback (alt screen / fresh grid): always pinned to bottom.
+        assert_eq!(scroll_offset_for_line(24, 0, -5), 0);
     }
 
     #[test]
@@ -1530,6 +1656,40 @@ mod tests {
             term.peek_dirty(),
             "direct-spawned /bin/echo must produce output without any write_input"
         );
+    }
+
+    #[test]
+    fn grid_lines_exposes_output_for_terminal_find() {
+        // The find bar searches the grid text this returns. Spawn a program
+        // that prints a known needle, wait for it, and confirm the search
+        // helpers locate it on the mapped grid line.
+        let tmp = tempfile::tempdir().unwrap();
+        let needle = "croft-find-needle-42";
+        let term =
+            PtyTerminal::new_running("/bin/echo", &[String::from(needle)], tmp.path()).unwrap();
+        let mut waited_ms = 0u32;
+        loop {
+            let (lines, top) = term.grid_lines();
+            if let Some(row) = lines.iter().position(|l| l.contains(needle)) {
+                let hit = crate::widgets::editor_find::find_next_match(
+                    &lines,
+                    needle,
+                    crate::widgets::search::SearchOpts::default(),
+                    0,
+                    0,
+                    false,
+                )
+                .expect("search must find the printed needle");
+                assert_eq!(hit.row, row, "match row must line up with the grid row");
+                // `top + row` maps the hit back to an absolute grid line the
+                // viewport can scroll to; for the live screen that is >= 0.
+                assert!(top + hit.row as i32 >= top);
+                break;
+            }
+            assert!(waited_ms < 4000, "echo output never reached the grid");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            waited_ms += 20;
+        }
     }
 
     #[test]

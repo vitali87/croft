@@ -1192,6 +1192,49 @@ fn paste_while_terminal_focused_does_not_leak_into_search_box() {
 }
 
 #[test]
+fn cmd_f_opens_terminal_find_and_captures_typing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus_pane(Pane::Terminal);
+    assert!(app.terminal_find.is_none(), "find starts closed");
+
+    // Cmd+F opens the find bar rather than being forwarded to the shell.
+    app.handle_terminal_key(key(KeyCode::Char('f'), KeyModifiers::SUPER));
+    assert!(app.terminal_find.is_some(), "Cmd+F must open the find bar");
+
+    // Typing while the bar is open builds the query, it is not sent to the PTY.
+    app.handle_terminal_key(key(KeyCode::Char('l'), KeyModifiers::NONE));
+    app.handle_terminal_key(key(KeyCode::Char('s'), KeyModifiers::NONE));
+    assert_eq!(
+        app.terminal_find.as_ref().unwrap().query,
+        "ls",
+        "printable keys must append to the find query"
+    );
+
+    // Backspace edits the query.
+    app.handle_terminal_key(key(KeyCode::Backspace, KeyModifiers::NONE));
+    assert_eq!(app.terminal_find.as_ref().unwrap().query, "l");
+
+    // Esc closes it.
+    app.handle_terminal_key(key(KeyCode::Esc, KeyModifiers::NONE));
+    assert!(app.terminal_find.is_none(), "Esc must close the find bar");
+}
+
+#[test]
+fn leaving_the_terminal_closes_its_find_bar() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus_pane(Pane::Terminal);
+    app.handle_terminal_key(key(KeyCode::Char('f'), KeyModifiers::SUPER));
+    assert!(app.terminal_find.is_some());
+    app.focus_pane(Pane::Editor);
+    assert!(
+        app.terminal_find.is_none(),
+        "moving focus off the terminal must close the find bar so no stale highlight lingers"
+    );
+}
+
+#[test]
 fn mcp_success_opens_a_scratch_tab_and_tells_the_user_where() {
     // Regression: a successful MCP command rendered its output into a scratch
     // tab but the only feedback was a terse "— done", so the user couldn't find

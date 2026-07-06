@@ -2343,6 +2343,13 @@ pub struct App {
     overlays: OverlayManager,
     /// VS Code-style Cmd+F in-editor find overlay. None when closed.
     pub editor_find: Option<crate::widgets::editor_find::EditorFind>,
+    /// Cmd+F find-in-terminal overlay: searches the active pane's grid +
+    /// scrollback (like iTerm2 / Ghostty scrollback search). Reuses the
+    /// editor find widget; the replace row is never shown. None when closed.
+    pub terminal_find: Option<crate::widgets::editor_find::EditorFind>,
+    /// The active terminal-find match as `(abs_grid_line, col, len)`, the
+    /// anchor next/prev navigation walks from. None until the first match.
+    terminal_find_match: Option<(i32, usize, usize)>,
     /// VS Code-style Cmd+P / Ctrl+P quick-open file finder. None when
     /// the modal is closed.
     pub file_finder: Option<crate::widgets::file_finder::FileFinder>,
@@ -3149,6 +3156,8 @@ impl App {
                 overlays
             },
             editor_find: None,
+            terminal_find: None,
+            terminal_find_match: None,
             file_finder: None,
             command_palette: None,
             go_to_symbol: None,
@@ -8735,6 +8744,11 @@ impl App {
     }
 
     fn focus_pane(&mut self, p: Pane) {
+        // Leaving the terminal closes its find bar so a stale match highlight
+        // never lingers on the grid once input goes elsewhere.
+        if p != Pane::Terminal && self.terminal_find.is_some() {
+            self.close_terminal_find();
+        }
         self.focus = p;
         self.sync_focus_flags();
         if self.editor.focused {
@@ -10014,6 +10028,7 @@ impl App {
         self.render_revert_hunk_confirm(frame);
         self.render_discard_all_confirm(frame);
         self.render_editor_find(frame);
+        self.render_terminal_find(frame);
         self.render_file_finder(frame);
         self.render_command_palette(frame);
         self.render_go_to_symbol(frame);
@@ -16457,6 +16472,19 @@ impl App {
     }
 
     fn handle_terminal_key(&mut self, key: KeyEvent) {
+        // The find bar owns every keystroke while it is open.
+        if self.terminal_find.is_some() {
+            self.handle_terminal_find_key(key);
+            return;
+        }
+        // Cmd+F / Ctrl+F: open find-in-terminal (scrollback search), like
+        // iTerm2 / Ghostty. The chord is intercepted here rather than
+        // forwarded to the inner program, matching how real terminals reserve
+        // it for their own find.
+        if is_editor_find_key(key) {
+            self.open_terminal_find();
+            return;
+        }
         // Ctrl+Shift+T: open another terminal next to the active one.
         if is_terminal_split_key(key) {
             match self.split_terminal() {
@@ -16788,7 +16816,21 @@ impl App {
                 self.status = format!("Pasted {} chars", s.chars().count());
             }
             Pane::Terminal => {
-                self.terminal_mut().paste_input(s.as_bytes());
+                if self.terminal_find.is_some() {
+                    let mut q = self
+                        .terminal_find
+                        .as_ref()
+                        .map(|st| st.query.clone())
+                        .unwrap_or_default();
+                    for c in s.chars() {
+                        if !c.is_control() {
+                            q.push(c);
+                        }
+                    }
+                    self.terminal_find_set_query(q);
+                } else {
+                    self.terminal_mut().paste_input(s.as_bytes());
+                }
             }
             Pane::Tree => {}
         }
@@ -19357,6 +19399,177 @@ impl App {
         self.status = String::from("Find: type to search, Enter next, Shift+Enter prev, Esc close");
     }
 
+    /// Cmd+F in the terminal: open a find bar that searches the active pane's
+    /// grid + scrollback (iTerm2 / Ghostty scrollback search). Seeds from a
+    /// single-line selection and lands on the most recent match.
+    fn open_terminal_find(&mut self) {
+        if self.terminal_find.is_some() {
+            return;
+        }
+        let opts = self.search.opts;
+        let sel = self.terminal().selection_text();
+        let initial = if !sel.is_empty() && !sel.contains('\n') {
+            sel
+        } else {
+            String::new()
+        };
+        let (lines, _top) = self.terminal().grid_lines();
+        let mut state = crate::widgets::editor_find::EditorFind {
+            query: initial.clone(),
+            opts,
+            ..Default::default()
+        };
+        state.match_count = crate::widgets::editor_find::count_matches(&lines, &initial, opts);
+        self.terminal_find = Some(state);
+        self.terminal_find_match = None;
+        self.terminal_mut()
+            .set_search((!initial.is_empty()).then(|| initial.clone()), opts);
+        self.status = String::from(
+            "Find in terminal: type to search, Enter next, Shift+Enter prev, Esc close",
+        );
+        if !initial.is_empty() {
+            // Land on the bottom-most (most recent) match, like iTerm2.
+            self.terminal_find_jump(false);
+        }
+    }
+
+    fn close_terminal_find(&mut self) {
+        if self.terminal_find.take().is_some() {
+            self.terminal_find_match = None;
+            let opts = self.search.opts;
+            self.terminal_mut().set_search(None, opts);
+            self.terminal_mut().set_current_match(None);
+        }
+    }
+
+    /// Re-run the terminal search after the query changed: recount,
+    /// re-highlight every occurrence, and re-anchor on the most recent match.
+    fn terminal_find_set_query(&mut self, new_query: String) {
+        let opts = self.search.opts;
+        let (lines, _top) = self.terminal().grid_lines();
+        let count = crate::widgets::editor_find::count_matches(&lines, &new_query, opts);
+        if let Some(state) = self.terminal_find.as_mut() {
+            state.query = new_query.clone();
+            state.match_count = count;
+            state.match_index = None;
+        }
+        self.terminal_find_match = None;
+        self.terminal_mut()
+            .set_search((!new_query.is_empty()).then(|| new_query.clone()), opts);
+        self.terminal_mut().set_current_match(None);
+        if !new_query.is_empty() {
+            self.terminal_find_jump(false);
+        }
+    }
+
+    /// Move to the next (`forward`) or previous match, wrapping. Scrolls the
+    /// pane so the match is visible, marks it active, and updates the "N of M"
+    /// index. Navigation walks from the current match, or — on the first jump —
+    /// from the bottom of the buffer so the newest occurrence wins.
+    fn terminal_find_jump(&mut self, forward: bool) {
+        let Some(state) = self.terminal_find.as_ref() else {
+            return;
+        };
+        let needle = state.query.clone();
+        let opts = state.opts;
+        if needle.is_empty() {
+            return;
+        }
+        let (lines, top) = self.terminal().grid_lines();
+        if lines.is_empty() {
+            return;
+        }
+        let anchor = self.terminal_find_match;
+        let (from_row, from_col) = match anchor {
+            Some((abs, col, _len)) => {
+                let row = (abs - top).clamp(0, lines.len() as i32 - 1) as usize;
+                (row, col)
+            }
+            // No anchor: start past the last line's end so `prev` lands on the
+            // bottom-most match and `next` wraps to the top-most.
+            None => (lines.len().saturating_sub(1), usize::MAX),
+        };
+        let skip_current = anchor.is_some();
+        let m = if forward {
+            crate::widgets::editor_find::find_next_match(
+                &lines,
+                &needle,
+                opts,
+                from_row,
+                from_col,
+                skip_current,
+            )
+        } else {
+            crate::widgets::editor_find::find_prev_match(
+                &lines,
+                &needle,
+                opts,
+                from_row,
+                from_col,
+                skip_current,
+            )
+        };
+        let Some(m) = m else {
+            return;
+        };
+        let abs_line = top + m.row as i32;
+        self.terminal_find_match = Some((abs_line, m.col_chars, m.len_chars));
+        self.terminal_mut()
+            .set_current_match(Some((abs_line, m.col_chars, m.len_chars)));
+        self.terminal_mut().scroll_to_line(abs_line);
+        let idx =
+            crate::widgets::editor_find::match_index_at(&lines, &needle, opts, m.row, m.col_chars);
+        if let Some(state) = self.terminal_find.as_mut() {
+            state.match_index = idx;
+        }
+    }
+
+    fn handle_terminal_find_key(&mut self, key: KeyEvent) {
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        match (key.code, key.modifiers) {
+            (KeyCode::Esc, _) => self.close_terminal_find(),
+            (KeyCode::Enter, _) | (KeyCode::F(3), _) => {
+                self.terminal_find_jump(!shift);
+            }
+            (KeyCode::Backspace, _) => {
+                let mut q = self
+                    .terminal_find
+                    .as_ref()
+                    .map(|s| s.query.clone())
+                    .unwrap_or_default();
+                q.pop();
+                self.terminal_find_set_query(q);
+            }
+            (KeyCode::Char('v'), m)
+                if m.contains(KeyModifiers::CONTROL) || m.contains(KeyModifiers::SUPER) =>
+            {
+                if let Some(text) = (self.clipboard_reader)() {
+                    let mut q = self
+                        .terminal_find
+                        .as_ref()
+                        .map(|s| s.query.clone())
+                        .unwrap_or_default();
+                    for c in text.chars() {
+                        if !c.is_control() {
+                            q.push(c);
+                        }
+                    }
+                    self.terminal_find_set_query(q);
+                }
+            }
+            (KeyCode::Char(c), m) if !m.intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER) => {
+                let mut q = self
+                    .terminal_find
+                    .as_ref()
+                    .map(|s| s.query.clone())
+                    .unwrap_or_default();
+                q.push(c);
+                self.terminal_find_set_query(q);
+            }
+            _ => {}
+        }
+    }
+
     /// `Cmd+Opt+F` (VS Code `editor.action.startFindReplaceAction`): open
     /// the find bar expanded with the replace row, or toggle the row on an
     /// already-open bar. Read-only tabs (diff / sheet / image previews)
@@ -19803,6 +20016,23 @@ impl App {
         if area.width == 0 || area.height == 0 {
             return;
         }
+        crate::widgets::editor_find::render_editor_find(state, area, frame.buffer_mut(), gradient);
+    }
+
+    /// Draw the find-in-terminal bar over the active terminal pane, reusing
+    /// the editor find widget (query row only). Same top-right placement.
+    fn render_terminal_find(&mut self, frame: &mut ratatui::Frame) {
+        if self.terminal_find.is_none() || !self.show_terminal {
+            return;
+        }
+        let gradient = self.popup_gradient();
+        let area = self.terminal().last_area;
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+        let Some(state) = self.terminal_find.as_mut() else {
+            return;
+        };
         crate::widgets::editor_find::render_editor_find(state, area, frame.buffer_mut(), gradient);
     }
 

@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Feature,
-    summary: "Redo: Shift+Cmd/Ctrl+Z (Ctrl+R in vim mode) reapplies an undone edit; a fresh edit after an undo discards the redo branch, matching VS Code.",
+    summary: "Find in terminal: Cmd/Ctrl+F searches the active pane's scrollback, highlights every hit, Enter/Shift+Enter walk matches and scroll them into view.",
 }];
