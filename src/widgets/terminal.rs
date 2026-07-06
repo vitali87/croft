@@ -107,19 +107,27 @@ impl Selection {
 pub struct VoidListener {
     pty_response_tx: Option<std::sync::mpsc::Sender<String>>,
     size: Option<Arc<std::sync::Mutex<(u16, u16)>>>,
+    /// Latched when the child rings BEL (`\a`); the app drains it via
+    /// [`PtyTerminal::take_bell`] to surface the bell in the UI.
+    bell: Option<Arc<AtomicBool>>,
 }
 
 impl EventListener for VoidListener {
     fn send_event(&self, event: AlacEvent) {
-        let Some(tx) = self.pty_response_tx.as_ref() else {
-            return;
-        };
         match event {
+            AlacEvent::Bell => {
+                if let Some(bell) = self.bell.as_ref() {
+                    bell.store(true, Ordering::Release);
+                }
+            }
             AlacEvent::PtyWrite(text) => {
-                let _ = tx.send(text);
+                if let Some(tx) = self.pty_response_tx.as_ref() {
+                    let _ = tx.send(text);
+                }
             }
             AlacEvent::TextAreaSizeRequest(cb) => {
-                let Some(size) = self.size.as_ref() else {
+                let (Some(tx), Some(size)) = (self.pty_response_tx.as_ref(), self.size.as_ref())
+                else {
                     return;
                 };
                 let (cols, rows) = *size.lock().unwrap();
@@ -204,6 +212,9 @@ pub struct PtyTerminal {
     /// versus the muted highlight on every other occurrence (VS Code's
     /// current-vs-other match colours).
     current_match: Option<(i32, usize, usize)>,
+    /// Latched by the event listener when the child rings BEL; drained by
+    /// [`Self::take_bell`].
+    bell: Arc<AtomicBool>,
 }
 
 /// Pick the program + args to spawn the user's interactive shell so it
@@ -325,12 +336,12 @@ impl PtyTerminal {
     /// the live screen — paired with the absolute alacritty `Line` index of
     /// row 0. Terminal find searches these lines; `top + row` maps a hit's
     /// row back to its grid line so it can be scrolled into view and
-    /// highlighted. One grid column per char (matching the render loop, which
-    /// likewise does not reserve wide-char cells).
+    /// highlighted. Wide-char spacer cells are skipped (see
+    /// [`row_text_and_cols`]), so match positions are char indices, not grid
+    /// columns.
     pub fn grid_lines(&self) -> (Vec<String>, i32) {
         let term = self.term.lock();
-        let cols = term.columns();
-        if cols == 0 {
+        if term.columns() == 0 {
             return (Vec::new(), 0);
         }
         let top = term.grid().topmost_line().0;
@@ -338,15 +349,28 @@ impl PtyTerminal {
         let mut lines = Vec::new();
         let mut l = top;
         while l <= bottom {
-            let mut s = String::with_capacity(cols);
-            for c in 0..cols {
-                let ch = term.grid()[Point::new(Line(l), Column(c))].c;
-                s.push(if ch == '\0' { ' ' } else { ch });
-            }
+            let (s, _cols) = row_text_and_cols(&term, l);
             lines.push(s.trim_end().to_string());
             l += 1;
         }
         (lines, top)
+    }
+
+    /// The OSC 8 hyperlink URI stored under viewport cell `(row, col)`, if
+    /// any. Hyperlinked cells carry the URI invisibly; the app's
+    /// Cmd/Ctrl+click handler checks this before the plain-text URL regex.
+    pub fn hyperlink_at(&self, row: usize, col: usize) -> Option<String> {
+        let term = self.term.lock();
+        if col >= term.columns() {
+            return None;
+        }
+        let line_idx = row as i32 - term.grid().display_offset() as i32;
+        if line_idx < term.grid().topmost_line().0 || line_idx >= term.screen_lines() as i32 {
+            return None;
+        }
+        term.grid()[Point::new(Line(line_idx), Column(col))]
+            .hyperlink()
+            .map(|h| h.uri().to_string())
     }
 
     /// Set (or clear) the find highlight. Every occurrence of `needle` is
@@ -416,9 +440,11 @@ impl PtyTerminal {
         };
         let size_shared = Arc::new(std::sync::Mutex::new((cols, rows)));
         let (response_tx, response_rx) = std::sync::mpsc::channel::<String>();
+        let bell = Arc::new(AtomicBool::new(false));
         let listener = VoidListener {
             pty_response_tx: Some(response_tx),
             size: Some(size_shared.clone()),
+            bell: Some(bell.clone()),
         };
         let term = Term::new(cfg, &term_size, listener);
         let term = Arc::new(FairMutex::new(term));
@@ -508,7 +534,13 @@ impl PtyTerminal {
             search_needle: None,
             search_opts: crate::widgets::search::SearchOpts::default(),
             current_match: None,
+            bell,
         })
+    }
+
+    /// True once if the child rang BEL since the last call (drains the latch).
+    pub fn take_bell(&self) -> bool {
+        self.bell.swap(false, Ordering::AcqRel)
     }
 
     /// The pane's foreground process group leader pid (what owns the tty now):
@@ -600,10 +632,20 @@ impl PtyTerminal {
     pub fn line_text_at(&self, col: u16, row: u16) -> Option<(String, usize)> {
         let (r, c) = self.cell_at(col, row)?;
         let term = self.term.lock();
-        let cols = term.columns();
         let line = r as i32 - term.grid().display_offset() as i32;
-        let text = extract_selection_text(&term, line, 0, line, cols.saturating_sub(1));
-        Some((text, c as usize))
+        let (text, cols_map) = row_text_and_cols(&term, line);
+        // Grid column → char index in the spacer-skipped text: the last
+        // produced char at-or-before the clicked column, so clicking a wide
+        // char's spacer cell resolves to the wide char itself.
+        let idx = cols_map.iter().rposition(|&gc| gc <= c as usize)?;
+        Some((text, idx))
+    }
+
+    /// The OSC 8 hyperlink under a screen position (host cell coords), if
+    /// any — the screen-coord twin of [`Self::hyperlink_at`].
+    pub fn hyperlink_at_screen(&self, col: u16, row: u16) -> Option<String> {
+        let (r, c) = self.cell_at(col, row)?;
+        self.hyperlink_at(r as usize, c as usize)
     }
 
     pub fn start_selection_at(&mut self, col: u16, row: u16) {
@@ -914,6 +956,30 @@ impl Drop for PtyTerminal {
 /// the function silently re-reads the live grid at the viewport row,
 /// which is a different cell entirely once `display_offset > 0` and
 /// the user gets the wrong line on the clipboard.
+/// One grid row as text plus a char-index → grid-column map. A wide char
+/// (CJK, emoji) occupies two grid columns — the `WIDE_CHAR` cell and a
+/// spacer cell — so the spacers are skipped, making the text read
+/// contiguously (`"日本語"`, never `"日 本 語"`). `cols[i]` is the grid
+/// column the i-th char starts at, so highlight painters can map a match's
+/// char range back onto grid cells.
+pub fn row_text_and_cols(term: &Term<VoidListener>, line_idx: i32) -> (String, Vec<usize>) {
+    let ncols = term.columns();
+    let mut s = String::with_capacity(ncols);
+    let mut cols = Vec::with_capacity(ncols);
+    for c in 0..ncols {
+        let cell = &term.grid()[Point::new(Line(line_idx), Column(c))];
+        if cell
+            .flags
+            .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+        {
+            continue;
+        }
+        s.push(if cell.c == '\0' { ' ' } else { cell.c });
+        cols.push(c);
+    }
+    (s, cols)
+}
+
 pub fn extract_selection_text(
     term: &Term<VoidListener>,
     sr: i32,
@@ -942,6 +1008,14 @@ pub fn extract_selection_text(
         for col in row_start..=row_end {
             let p = Point::new(Line(line_idx), Column(col));
             let cell = &term.grid()[p];
+            // A wide char's spacer cell holds no glyph of its own — skip it
+            // so copied CJK/emoji text comes out contiguous.
+            if cell
+                .flags
+                .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+            {
+                continue;
+            }
             let c = cell.c;
             if c == '\0' {
                 line.push(' ');
@@ -1202,18 +1276,25 @@ impl Widget for &mut PtyTerminal {
 
         for y in 0..rows {
             // Find matches on this row once, then paint them per cell below.
+            // Match positions are char indices in the spacer-skipped row text
+            // (the same text the find bar searched); the colmap translates
+            // them back to grid columns. 0 = no match, 1 = match, 2 = active.
             let row_line_idx = (y as i32) - (display_offset as i32);
-            let row_matches: Vec<(usize, usize)> = match self.search_needle.as_deref() {
-                Some(needle) => {
-                    let mut s = String::with_capacity(cols as usize);
-                    for x in 0..cols {
-                        let ch = term.grid()[Point::new(Line(row_line_idx), Column(x as usize))].c;
-                        s.push(if ch == '\0' { ' ' } else { ch });
+            let row_paint: Option<Vec<u8>> = self.search_needle.as_deref().map(|needle| {
+                let (text, colmap) = row_text_and_cols(&term, row_line_idx);
+                let mut paint = vec![0u8; cols as usize];
+                for (mc, ml) in
+                    crate::widgets::editor_find::line_matches(&text, self.search_opts, needle)
+                {
+                    let active = self.current_match == Some((row_line_idx, mc, ml));
+                    for k in mc..mc + ml {
+                        if let Some(&col) = colmap.get(k) {
+                            paint[col] = if active { 2 } else { 1 };
+                        }
                     }
-                    crate::widgets::editor_find::line_matches(&s, self.search_opts, needle)
                 }
-                None => Vec::new(),
-            };
+                paint
+            });
             for x in 0..cols {
                 let line_idx = (y as i32) - (display_offset as i32);
                 let p = Point::new(Line(line_idx), Column(x as usize));
@@ -1252,15 +1333,21 @@ impl Widget for &mut PtyTerminal {
                 }
                 // Find highlight: muted amber on every occurrence, bright
                 // orange on the active match (VS Code's find colours).
-                for &(mc, ml) in &row_matches {
-                    if (x as usize) >= mc && (x as usize) < mc + ml {
-                        let bg = if self.current_match == Some((line_idx, mc, ml)) {
-                            Color::Rgb(0xff, 0x8c, 0x2a)
-                        } else {
-                            Color::Rgb(0xff, 0xd7, 0x4a)
-                        };
-                        style = style.fg(Color::Black).bg(bg).add_modifier(Modifier::BOLD);
-                        break;
+                if let Some(paint) = row_paint.as_ref() {
+                    match paint.get(x as usize) {
+                        Some(1) => {
+                            style = style
+                                .fg(Color::Black)
+                                .bg(Color::Rgb(0xff, 0xd7, 0x4a))
+                                .add_modifier(Modifier::BOLD);
+                        }
+                        Some(2) => {
+                            style = style
+                                .fg(Color::Black)
+                                .bg(Color::Rgb(0xff, 0x8c, 0x2a))
+                                .add_modifier(Modifier::BOLD);
+                        }
+                        _ => {}
                     }
                 }
                 let target_x = inner.x + x;
@@ -1409,6 +1496,7 @@ mod tests {
         let listener = VoidListener {
             pty_response_tx: Some(tx),
             size: Some(Arc::new(std::sync::Mutex::new((80, 24)))),
+            bell: None,
         };
         let cfg = Config::default();
         let size = TermSize::new(80, 24);
@@ -1437,6 +1525,7 @@ mod tests {
         let listener = VoidListener {
             pty_response_tx: Some(tx),
             size: Some(size),
+            bell: None,
         };
         let cfg = Config::default();
         let term_size = TermSize::new(120, 40);
@@ -1655,6 +1744,126 @@ mod tests {
         assert!(
             term.peek_dirty(),
             "direct-spawned /bin/echo must produce output without any write_input"
+        );
+    }
+
+    /// Poll `grid_lines` until a predicate matches or 4s elapse.
+    fn wait_for_grid<F: Fn(&[String]) -> bool>(term: &PtyTerminal, pred: F) -> Vec<String> {
+        let mut waited_ms = 0u32;
+        loop {
+            let (lines, _top) = term.grid_lines();
+            if pred(&lines) {
+                return lines;
+            }
+            assert!(
+                waited_ms < 4000,
+                "expected output never reached the grid; grid was: {lines:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            waited_ms += 20;
+        }
+    }
+
+    #[test]
+    fn wide_chars_read_back_without_phantom_spacer_spaces() {
+        // A CJK char occupies two grid columns: the WIDE_CHAR cell plus a
+        // WIDE_CHAR_SPACER cell whose `c` is ' '. Text extraction must skip
+        // the spacer, or copied/searched text comes out as "日 本 語" and a
+        // find for "日本語" can never match.
+        let tmp = tempfile::tempdir().unwrap();
+        let term = PtyTerminal::new_running("/bin/echo", &[String::from("日本語 ok")], tmp.path())
+            .unwrap();
+        let lines = wait_for_grid(&term, |ls| ls.iter().any(|l| l.contains('日')));
+        assert!(
+            lines.iter().any(|l| l.contains("日本語 ok")),
+            "wide chars must read back contiguously (no spacer-cell spaces); grid was: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn wide_chars_render_the_glyph_once_with_a_blank_spacer_cell() {
+        // The render loop writes the double-width glyph into its WIDE_CHAR
+        // cell and must leave the following spacer cell blank — ratatui skips
+        // the cell after a width-2 symbol when diffing, so anything else
+        // there would corrupt column alignment.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut term =
+            PtyTerminal::new_running("/bin/echo", &[String::from("日X")], tmp.path()).unwrap();
+        wait_for_grid(&term, |ls| ls.iter().any(|l| l.contains('日')));
+        let area = Rect::new(0, 0, 40, 10);
+        let mut buf = Buffer::empty(area);
+        Widget::render(&mut term, area, &mut buf);
+        let mut found = false;
+        for y in 0..area.height {
+            for x in 0..area.width.saturating_sub(2) {
+                if buf[(x, y)].symbol() == "日" {
+                    assert_eq!(
+                        buf[(x + 1, y)].symbol(),
+                        " ",
+                        "the spacer cell after a wide glyph must stay blank"
+                    );
+                    assert_eq!(
+                        buf[(x + 2, y)].symbol(),
+                        "X",
+                        "the next glyph must land two columns after the wide char"
+                    );
+                    found = true;
+                }
+            }
+        }
+        assert!(found, "the wide glyph must appear in the rendered buffer");
+    }
+
+    #[test]
+    fn hyperlink_at_returns_the_osc8_uri_under_the_cell() {
+        // OSC 8 hyperlinks live in the cell, invisible in the text. The app's
+        // Cmd/Ctrl+click handler asks `hyperlink_at` before falling back to
+        // the plain-text URL regex.
+        let tmp = tempfile::tempdir().unwrap();
+        let script =
+            "printf '\\033]8;;https://example.com/doc\\033\\\\CLICK-ME\\033]8;;\\033\\\\\\n'";
+        let term =
+            PtyTerminal::new_running("/bin/sh", &[String::from("-c"), script.into()], tmp.path())
+                .unwrap();
+        // The run header echoes the command text, so "CLICK-ME" appears there
+        // too — as plain text without a link. Wait for the child's actual
+        // output row (the one without "printf").
+        let is_output = |l: &String| l.contains("CLICK-ME") && !l.contains("printf");
+        let lines = wait_for_grid(&term, |ls| ls.iter().any(is_output));
+        let row = lines.iter().position(is_output).unwrap();
+        let col = lines[row].find("CLICK-ME").unwrap();
+        assert_eq!(
+            term.hyperlink_at(row, col).as_deref(),
+            Some("https://example.com/doc"),
+            "the cell under the linked text must expose the OSC 8 URI"
+        );
+        assert_eq!(
+            term.hyperlink_at(0, 0),
+            None,
+            "cells outside the link (the header row) carry no URI"
+        );
+    }
+
+    #[test]
+    fn bell_sets_a_flag_the_app_can_drain() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = "printf 'DONE\\007\\n'";
+        let term =
+            PtyTerminal::new_running("/bin/sh", &[String::from("-c"), script.into()], tmp.path())
+                .unwrap();
+        // Wait for the child's output row, not the run header echoing the
+        // command text — the BEL byte arrives with the output.
+        wait_for_grid(&term, |ls| {
+            ls.iter()
+                .any(|l| l.contains("DONE") && !l.contains("printf"))
+        });
+        assert!(
+            term.take_bell(),
+            "BEL from the child must set the bell flag for the app to drain"
+        );
+        assert!(
+            !term.take_bell(),
+            "take_bell drains the flag — a second read is false"
         );
     }
 

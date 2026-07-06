@@ -17233,6 +17233,23 @@ impl App {
     /// poll the socket table. Output-scrape hits are browser-facing
     /// announcements, so a new one raises the toast; socket-poll hits populate
     /// the PORTS tab silently. Returns whether anything changed (for redraw).
+    /// Surface BEL rings from any pane in the status bar (VS Code shows a
+    /// bell on the terminal tab; croft's status line is its equivalent).
+    /// Returns true when a bell arrived so the loop redraws.
+    fn drain_terminal_bells(&mut self) -> bool {
+        let mut rang: Option<String> = None;
+        for t in &self.terminals {
+            if t.take_bell() {
+                rang = Some(t.label().to_string());
+            }
+        }
+        let Some(label) = rang else {
+            return false;
+        };
+        self.status = format!("Bell in terminal: {label}");
+        true
+    }
+
     fn drain_ports_and_poll(&mut self) -> bool {
         let mut changed = false;
         if self
@@ -17461,6 +17478,12 @@ impl App {
     /// or open the link) and return true so the click doesn't start a
     /// selection. Returns false when there's no URL there.
     fn terminal_url_click(&mut self, col: u16, row: u16) -> bool {
+        // A real OSC 8 hyperlink stored in the cell wins over text sniffing —
+        // the visible text of a linked cell often isn't the URI at all.
+        if let Some(uri) = self.terminal().hyperlink_at_screen(col, row) {
+            self.open_detected_url(&uri);
+            return true;
+        }
         let Some((text, c)) = self.terminal().line_text_at(col, row) else {
             return false;
         };
@@ -27475,6 +27498,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let remote_changed = app.refresh_remote_if_config_changed();
         let pulls_changed = app.drain_remote_pulls();
         let ports_changed = app.drain_ports_and_poll();
+        let bells_changed = app.drain_terminal_bells();
         let labels_changed = app.refresh_terminal_labels();
         let auto_save_changed = app.tick_auto_save();
         let connect_changed = app.poll_connect_dialog();
@@ -27545,6 +27569,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             || remote_changed
             || pulls_changed
             || ports_changed
+            || bells_changed
             || labels_changed
             || auto_save_changed
             || ws_symbols_changed

@@ -59,7 +59,17 @@ pub struct ReleaseNote {
 }
 
 /// What shipped in the current release. Replace on every version bump.
-pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
-    kind: NoteKind::Feature,
-    summary: "Find in terminal: Cmd/Ctrl+F searches the active pane's scrollback, highlights every hit, Enter/Shift+Enter walk matches and scroll them into view.",
-}];
+pub const RELEASE_NOTES: &[ReleaseNote] = &[
+    ReleaseNote {
+        kind: NoteKind::Feature,
+        summary: "Terminal OSC 8 hyperlinks: Cmd/Ctrl+click opens a real embedded link even when the visible text isn't the URL.",
+    },
+    ReleaseNote {
+        kind: NoteKind::Feature,
+        summary: "Terminal bell: a BEL from any pane surfaces in the status bar with the pane's name.",
+    },
+    ReleaseNote {
+        kind: NoteKind::Fix,
+        summary: "Copying or searching CJK/emoji terminal text no longer inserts a phantom space after every wide character.",
+    },
+];
