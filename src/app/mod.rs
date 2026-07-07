@@ -17259,16 +17259,37 @@ impl App {
     /// bar (VS Code shows a bell on the terminal tab; croft's status line is
     /// its equivalent). Returns true when either arrived so the loop redraws.
     fn drain_terminal_bells(&mut self) -> bool {
+        // Long-command completion notice, the Ghostty/Warp behaviour: only
+        // when the pane isn't the focused one (the user watching a pane sees
+        // the command end themselves).
+        const LONG_COMMAND_NOTIFY: std::time::Duration = std::time::Duration::from_secs(10);
         let mut rang: Option<String> = None;
         let mut notes: Vec<String> = Vec::new();
+        let mut finished: Option<String> = None;
         for t in &self.terminals {
             if t.take_bell() {
                 rang = Some(t.label().to_string());
             }
             notes.extend(t.drain_notifications());
+            // Always drain so completions never pile up unseen.
+            for (exit, dur) in t.drain_finished_commands() {
+                if t.focused || dur < LONG_COMMAND_NOTIFY {
+                    continue;
+                }
+                let code = exit.map_or_else(|| String::from("?"), |c| c.to_string());
+                finished = Some(format!(
+                    "Command in {} finished: exit {code} in {}",
+                    t.label(),
+                    crate::widgets::terminal::human_duration(dur)
+                ));
+            }
         }
         if let Some(msg) = notes.pop() {
             self.status = format!("Terminal notification: {msg}");
+            return true;
+        }
+        if let Some(msg) = finished {
+            self.status = msg;
             return true;
         }
         let Some(label) = rang else {
@@ -21743,6 +21764,19 @@ impl App {
                         self.active_terminal = idx;
                     }
                     self.focus_pane(Pane::Terminal);
+                    // Click on a gutter decoration dot (the pane's left
+                    // border): surface that command's outcome.
+                    if let Some(d) = self.terminal().decoration_at_screen(m.column, m.row) {
+                        let code = d.exit.map_or_else(|| String::from("?"), |c| c.to_string());
+                        self.status = match d.duration {
+                            Some(dur) => format!(
+                                "Command finished: exit {code} in {}",
+                                crate::widgets::terminal::human_duration(dur)
+                            ),
+                            None => format!("Command finished: exit {code}"),
+                        };
+                        return;
+                    }
                     // Cmd/Ctrl+click on a printed URL opens it (forwarding a
                     // remote dev-server port first), mirroring the editor's
                     // go-to-definition modifier. Consumes the click so it

@@ -225,6 +225,9 @@ pub struct PtyTerminal {
     osc7_cwd: Arc<std::sync::Mutex<Option<std::path::PathBuf>>>,
     /// OSC 9 notification payloads awaiting the app's drain.
     notifications: Arc<std::sync::Mutex<Vec<String>>>,
+    /// Finished commands (exit, duration) from the reader thread, awaiting
+    /// the app's drain for long-command notifications.
+    finished_rx: std::sync::mpsc::Receiver<(Option<i32>, std::time::Duration)>,
 }
 
 /// One OSC 133 mark at its recording-time position. `line_rec` is the grid
@@ -240,6 +243,67 @@ struct StoredMark {
     kind: crate::shell_integration::OscEvent,
     line_rec: i32,
     hist_rec: usize,
+    /// For `CommandEnd` marks: how long the command ran (CommandStart →
+    /// CommandEnd, measured in the reader thread). `None` elsewhere.
+    dur: Option<std::time::Duration>,
+}
+
+/// A finished command derived from the OSC 133 marks: the grid line of the
+/// prompt it was typed at (current coords, negative = scrollback), its exit
+/// code (`None` when the shell omitted it), and how long it ran.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CommandDecoration {
+    pub line: i32,
+    pub exit: Option<i32>,
+    pub duration: Option<std::time::Duration>,
+}
+
+/// Pair the mark stream (oldest first, each with its current grid line and,
+/// for `CommandEnd`, the measured duration) into one record per *finished*
+/// command: the last `PromptStart` line before a `CommandStart` names the
+/// row, the following `CommandEnd` supplies exit + duration. A `CommandEnd`
+/// with no pending `CommandStart` is dropped — that's how a second
+/// integration layer's duplicate marks (Ghostty's hooks chained behind
+/// croft's) stay out of the record.
+pub fn pair_decorations(
+    marks: &[(
+        crate::shell_integration::OscEvent,
+        i32,
+        Option<std::time::Duration>,
+    )],
+) -> Vec<CommandDecoration> {
+    use crate::shell_integration::OscEvent as E;
+    let mut out = Vec::new();
+    let mut prompt: Option<i32> = None;
+    let mut started = false;
+    for (kind, line, dur) in marks {
+        match kind {
+            E::PromptStart => prompt = Some(*line),
+            E::CommandStart => started = true,
+            E::CommandEnd(exit) if started => {
+                started = false;
+                out.push(CommandDecoration {
+                    line: prompt.unwrap_or(*line),
+                    exit: *exit,
+                    duration: *dur,
+                });
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Compact human form of a command duration: "480ms", "3.4s", "2m 05s".
+pub fn human_duration(d: std::time::Duration) -> String {
+    let secs = d.as_secs_f64();
+    if secs < 1.0 {
+        format!("{}ms", d.as_millis())
+    } else if secs < 60.0 {
+        format!("{secs:.1}s")
+    } else {
+        format!("{}m {:02}s", d.as_secs() / 60, d.as_secs() % 60)
+    }
 }
 
 /// Cap on retained marks per pane (a mark per prompt/command boundary;
@@ -572,6 +636,8 @@ impl PtyTerminal {
 
         let marks = Arc::new(std::sync::Mutex::new(Vec::<StoredMark>::new()));
         let marks_for_thread = marks.clone();
+        let (finished_tx, finished_rx) =
+            std::sync::mpsc::channel::<(Option<i32>, std::time::Duration)>();
         let osc7_cwd = Arc::new(std::sync::Mutex::new(Option::<std::path::PathBuf>::None));
         let osc7_for_thread = osc7_cwd.clone();
         let notifications = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
@@ -581,6 +647,8 @@ impl PtyTerminal {
             let mut processor = Processor::<StdSyncHandler>::new();
             let mut port_sniffer = crate::port_detect::PortSniffer::new();
             let mut osc_sniffer = crate::shell_integration::OscSniffer::default();
+            // Command timing: armed by 133;C, consumed by the next 133;D.
+            let mut cmd_start: Option<std::time::Instant> = None;
             let mut buf = [0u8; 65536];
             loop {
                 match reader.read(&mut buf) {
@@ -610,6 +678,20 @@ impl PtyTerminal {
                                 | E::PromptEnd
                                 | E::CommandStart
                                 | E::CommandEnd(_)) => {
+                                    let dur = match &kind {
+                                        E::CommandStart => {
+                                            cmd_start = Some(std::time::Instant::now());
+                                            None
+                                        }
+                                        E::CommandEnd(exit) => {
+                                            let dur = cmd_start.take().map(|s| s.elapsed());
+                                            if let Some(d) = dur {
+                                                let _ = finished_tx.send((*exit, d));
+                                            }
+                                            dur
+                                        }
+                                        _ => None,
+                                    };
                                     let line_rec = t.grid().cursor.point.line.0;
                                     let hist_rec = t.grid().history_size();
                                     let mut ms = marks_for_thread.lock().unwrap();
@@ -621,6 +703,7 @@ impl PtyTerminal {
                                         kind,
                                         line_rec,
                                         hist_rec,
+                                        dur,
                                     });
                                 }
                             }
@@ -670,6 +753,7 @@ impl PtyTerminal {
             marks,
             osc7_cwd,
             notifications,
+            finished_rx,
         })
     }
 
@@ -677,6 +761,21 @@ impl PtyTerminal {
     /// oldest first. Marks whose content scrolled past the scrollback floor
     /// are garbage-collected here.
     pub fn command_marks(&self) -> Vec<(crate::shell_integration::OscEvent, i32)> {
+        self.marks_snapshot()
+            .into_iter()
+            .map(|(kind, line, _)| (kind, line))
+            .collect()
+    }
+
+    /// The marks with current grid lines and, for `CommandEnd`, the measured
+    /// command duration. GC + drift adjustment as in [`Self::command_marks`].
+    fn marks_snapshot(
+        &self,
+    ) -> Vec<(
+        crate::shell_integration::OscEvent,
+        i32,
+        Option<std::time::Duration>,
+    )> {
         let term = self.term.lock();
         let hist_now = term.grid().history_size() as i32;
         let floor = term.grid().topmost_line().0;
@@ -685,8 +784,46 @@ impl PtyTerminal {
         marks.retain(|m| m.line_rec - (hist_now - m.hist_rec as i32) >= floor);
         marks
             .iter()
-            .map(|m| (m.kind.clone(), m.line_rec - (hist_now - m.hist_rec as i32)))
+            .map(|m| {
+                (
+                    m.kind.clone(),
+                    m.line_rec - (hist_now - m.hist_rec as i32),
+                    m.dur,
+                )
+            })
             .collect()
+    }
+
+    /// One record per finished command, for the gutter decorations: prompt
+    /// line (current grid coords), exit code, duration.
+    pub fn command_decorations(&self) -> Vec<CommandDecoration> {
+        pair_decorations(&self.marks_snapshot())
+    }
+
+    /// Finished commands since the last drain: (exit code, duration). Feeds
+    /// the status-bar notification for long commands in unfocused panes.
+    pub fn drain_finished_commands(&self) -> Vec<(Option<i32>, std::time::Duration)> {
+        self.finished_rx.try_iter().collect()
+    }
+
+    /// The decoration whose gutter dot sits at screen cell (col, row), if
+    /// any: col must be the pane's left border column and row a viewport
+    /// row whose grid line carries a finished command.
+    pub fn decoration_at_screen(&self, col: u16, row: u16) -> Option<CommandDecoration> {
+        let inner = self.last_inner;
+        if col != self.last_area.x || row < inner.y || row >= inner.y + inner.height {
+            return None;
+        }
+        let term = self.term.lock();
+        if term.mode().contains(TermMode::ALT_SCREEN) {
+            return None;
+        }
+        let display_offset = term.grid().display_offset() as i32;
+        drop(term);
+        let line = i32::from(row - inner.y) - display_offset;
+        self.command_decorations()
+            .into_iter()
+            .find(|d| d.line == line)
     }
 
     /// Current grid lines of the PromptStart marks — the Cmd+Up/Cmd+Down
@@ -1453,6 +1590,10 @@ impl Widget for &mut PtyTerminal {
         let rows = inner.height;
         self.resize(cols, rows);
 
+        // Snapshot before taking the term lock: command_decorations locks
+        // the term itself and FairMutex is not reentrant.
+        let decorations = self.command_decorations();
+
         let term = self.term.lock();
         let display_offset = term.grid().display_offset();
         let cursor_visible = term.mode().contains(TermMode::SHOW_CURSOR) && self.focused;
@@ -1551,6 +1692,25 @@ impl Widget for &mut PtyTerminal {
                 let mut tmp = [0u8; 4];
                 target.set_symbol(display_char.encode_utf8(&mut tmp));
                 target.set_style(style);
+            }
+        }
+        // Command decorations: a VS Code-style dot on the left border at
+        // each finished command's prompt row — blue for success, red for a
+        // non-zero exit. Normal screen only; an alt-screen app owns the
+        // viewport and has no prompts.
+        if !alt_screen {
+            for d in &decorations {
+                let vp = d.line + display_offset as i32;
+                if (0..rows as i32).contains(&vp) {
+                    let ok = d.exit.unwrap_or(0) == 0;
+                    let cell = &mut buf[(area.x, inner.y + vp as u16)];
+                    cell.set_symbol("●");
+                    cell.set_style(Style::default().fg(if ok {
+                        Color::Rgb(0x1b, 0x81, 0xa8)
+                    } else {
+                        Color::Rgb(0xf1, 0x4c, 0x4c)
+                    }));
+                }
             }
         }
     }
@@ -2200,6 +2360,154 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(40));
             waited += 40;
         }
+    }
+
+    #[test]
+    fn pair_decorations_matches_prompts_with_exits() {
+        use crate::shell_integration::OscEvent as E;
+        let ms = std::time::Duration::from_millis;
+        // Two full cycles (ok then failing), then a bare prompt with no
+        // command: two records, the bare prompt contributes nothing.
+        let marks = [
+            (E::PromptStart, -10, None),
+            (E::PromptEnd, -10, None),
+            (E::CommandStart, -10, None),
+            (E::CommandEnd(Some(0)), -7, Some(ms(2400))),
+            (E::PromptStart, -7, None),
+            (E::PromptEnd, -7, None),
+            (E::CommandStart, -7, None),
+            (E::CommandEnd(Some(3)), -2, Some(ms(150))),
+            (E::PromptStart, -2, None),
+        ];
+        assert_eq!(
+            pair_decorations(&marks),
+            vec![
+                CommandDecoration {
+                    line: -10,
+                    exit: Some(0),
+                    duration: Some(ms(2400)),
+                },
+                CommandDecoration {
+                    line: -7,
+                    exit: Some(3),
+                    duration: Some(ms(150)),
+                },
+            ]
+        );
+        // A duplicate CommandEnd (a second integration layer echoing the
+        // marks) has no pending CommandStart and must be dropped.
+        let dup = [
+            (E::PromptStart, -5, None),
+            (E::CommandStart, -5, None),
+            (E::CommandEnd(Some(0)), -4, Some(ms(90))),
+            (E::CommandEnd(Some(0)), -4, None),
+        ];
+        assert_eq!(pair_decorations(&dup).len(), 1);
+        // A command still running (no CommandEnd yet) has no record.
+        let running = [(E::PromptStart, 0, None), (E::CommandStart, 0, None)];
+        assert!(pair_decorations(&running).is_empty());
+    }
+
+    #[test]
+    fn human_duration_formats_ms_seconds_minutes() {
+        let d = std::time::Duration::from_millis;
+        assert_eq!(human_duration(d(480)), "480ms");
+        assert_eq!(human_duration(d(3400)), "3.4s");
+        assert_eq!(human_duration(d(59_940)), "59.9s");
+        assert_eq!(human_duration(d(125_000)), "2m 05s");
+    }
+
+    #[test]
+    fn osc133_decorations_carry_exit_and_duration_end_to_end() {
+        // A real PTY run emitting the mark protocol: the finished command
+        // must surface as one decoration with its exit code and a duration
+        // covering the sleep between CommandStart and CommandEnd, and the
+        // same completion must arrive once through the notification drain.
+        let tmp = tempfile::tempdir().unwrap();
+        let script = "printf '\\033]133;A\\007$ cmd\\n\\033]133;B\\007\\033]133;C\\007'; sleep 0.3; printf 'out\\n\\033]133;D;2\\007'";
+        let term =
+            PtyTerminal::new_running("/bin/sh", &[String::from("-c"), script.into()], tmp.path())
+                .unwrap();
+        let mut waited = 0u32;
+        loop {
+            let decos = term.command_decorations();
+            if let Some(d) = decos.first() {
+                assert_eq!(d.exit, Some(2), "exit code from 133;D;2");
+                let dur = d.duration.expect("duration must be measured");
+                assert!(
+                    dur >= std::time::Duration::from_millis(250),
+                    "duration must cover the sleep; got {dur:?}"
+                );
+                break;
+            }
+            assert!(
+                waited < 8000,
+                "no decoration appeared; marks: {:?}",
+                term.command_marks()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            waited += 40;
+        }
+        let finished = term.drain_finished_commands();
+        assert_eq!(finished.len(), 1, "one completion in the drain");
+        assert_eq!(finished[0].0, Some(2));
+        assert!(finished[0].1 >= std::time::Duration::from_millis(250));
+        assert!(
+            term.drain_finished_commands().is_empty(),
+            "a second drain returns nothing"
+        );
+    }
+
+    #[test]
+    fn decoration_dot_paints_on_the_left_border_and_hit_tests() {
+        // The finished command's prompt row gets a VS Code-style dot on the
+        // pane's left border: red here (exit 2). Clicking the dot resolves
+        // back to the record via decoration_at_screen.
+        let tmp = tempfile::tempdir().unwrap();
+        let script = "printf '\\033]133;A\\007$ cmd\\n\\033]133;B\\007\\033]133;C\\007out\\n\\033]133;D;2\\007'";
+        let mut term =
+            PtyTerminal::new_running("/bin/sh", &[String::from("-c"), script.into()], tmp.path())
+                .unwrap();
+        let mut waited = 0u32;
+        while term.command_decorations().is_empty() {
+            assert!(
+                waited < 8000,
+                "no decoration; marks: {:?}",
+                term.command_marks()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            waited += 40;
+        }
+        let area = Rect::new(0, 0, 40, 12);
+        let mut buf = Buffer::empty(area);
+        (&mut term).render(area, &mut buf);
+        let deco = term.command_decorations()[0];
+        // Live view: display_offset 0, viewport row = grid line; +1 for the
+        // top border.
+        let y = 1 + u16::try_from(deco.line).unwrap();
+        let cell = &buf[(0, y)];
+        assert_eq!(
+            cell.symbol(),
+            "●",
+            "dot on the left border at the prompt row"
+        );
+        assert_eq!(
+            cell.style().fg,
+            Some(Color::Rgb(0xf1, 0x4c, 0x4c)),
+            "non-zero exit paints the error red"
+        );
+        // The border above the dot is untouched.
+        assert_eq!(buf[(0, y - 1)].symbol(), "│");
+        assert_eq!(
+            term.decoration_at_screen(0, y),
+            Some(deco),
+            "clicking the dot resolves the record"
+        );
+        assert_eq!(
+            term.decoration_at_screen(0, y - 1),
+            None,
+            "no record on a bare border row"
+        );
     }
 
     #[test]

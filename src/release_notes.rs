@@ -59,7 +59,13 @@ pub struct ReleaseNote {
 }
 
 /// What shipped in the current release. Replace on every version bump.
-pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
-    kind: NoteKind::Fix,
-    summary: "Your zsh theme and aliases now load when croft is launched directly by Ghostty or kitty (Dock, --initial-command, croft's own new-window): their injected ZDOTDIR shim is chained through to your real dotfiles instead of being mistaken for them.",
-}];
+pub const RELEASE_NOTES: &[ReleaseNote] = &[
+    ReleaseNote {
+        kind: NoteKind::Feature,
+        summary: "Command decorations in the terminal: every finished command gets a VS Code-style dot on the pane's left border, blue for success and red for failure; click it to see the exit code and how long the command ran.",
+    },
+    ReleaseNote {
+        kind: NoteKind::Feature,
+        summary: "Long-command completion notices: a command that ran over 10s and finishes in a pane you are not focused on announces its exit code and duration in the status bar.",
+    },
+];
