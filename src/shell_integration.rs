@@ -294,6 +294,7 @@ _croft_user="${CROFT_USER_ZDOTDIR:-$HOME}"
 # Code, Ghostty, iTerm2 and WezTerm build command navigation on.
 if [[ -o interactive ]] && (( ! ${+_croft_si_installed} )); then
   typeset -g _croft_si_installed=1
+  typeset -g _croft_b_mark=$'%{\e]133;B\a%}'
   builtin autoload -Uz add-zsh-hook
   _croft_preexec() {
     typeset -g _croft_cmd_inflight=1
@@ -307,6 +308,12 @@ if [[ -o interactive ]] && (( ! ${+_croft_si_installed} )); then
     fi
     builtin printf '\033]7;file://%s%s\007' "${HOST:-localhost}" "$PWD"
     builtin printf '\033]133;A\007'
+    # Mark where the typed command starts (133;B). Themes rebuild PS1 from
+    # their own precmd (which ran before this one), so the zero-width
+    # suffix is re-asserted at every prompt.
+    if [[ "$PS1" != *"$_croft_b_mark" ]]; then
+      PS1+="$_croft_b_mark"
+    fi
   }
   add-zsh-hook preexec _croft_preexec
   add-zsh-hook precmd _croft_precmd
@@ -334,6 +341,208 @@ pub fn resolve_user_zdotdir(
         Some(z) if !z.starts_with(shim_root) => z.to_path_buf(),
         _ => home.to_path_buf(),
     }
+}
+
+/// The bash bootstrap, read via `$ENV` by an interactive `bash --posix`
+/// (kitty invented the trick; Ghostty copied it). Posix-mode bash reads
+/// ONLY `$ENV` at startup — no /etc/profile, no ~/.bashrc — so the shim
+/// backs out of posix mode, replays the user's real startup files (login
+/// vs non-login), then installs hooks emitting the OSC 133 prompt marks
+/// and the OSC 7 cwd report. Runs on every bash croft spawns, from macOS's
+/// system 3.2 to 5.3+.
+const BASH_SHIM: &str = r#"# croft shell integration bootstrap (auto-generated; do not edit)
+[[ "$-" != *i* ]] && builtin return
+
+if [[ -n "$CROFT_BASH_INJECT" ]]; then
+  builtin unset CROFT_BASH_INJECT
+  builtin set +o posix
+  builtin shopt -u inherit_errexit 2>/dev/null
+  # Restore the user's own $ENV (rarely set for bash) or drop croft's.
+  if [[ -n "$CROFT_BASH_ENV" ]]; then
+    builtin export ENV="$CROFT_BASH_ENV"
+    builtin unset CROFT_BASH_ENV
+  else
+    builtin unset ENV
+  fi
+  # Posix mode defaulted HISTFILE to ~/.sh_history; croft pre-seeded the
+  # bash default and flagged it so children do not inherit the export.
+  if [[ -n "$CROFT_BASH_UNEXPORT_HISTFILE" ]]; then
+    builtin export -n HISTFILE
+    builtin unset CROFT_BASH_UNEXPORT_HISTFILE
+  fi
+  # Replay the startup files posix mode skipped, exactly as bash itself
+  # would have chosen them.
+  if builtin shopt -q login_shell; then
+    [[ -r /etc/profile ]] && builtin source /etc/profile
+    for _croft_rc in "$HOME/.bash_profile" "$HOME/.bash_login" "$HOME/.profile"; do
+      if [[ -r "$_croft_rc" ]]; then
+        builtin source "$_croft_rc"
+        break
+      fi
+    done
+  else
+    for _croft_rc in /etc/bash.bashrc /etc/bash/bashrc /etc/bashrc; do
+      if [[ -r "$_croft_rc" ]]; then
+        builtin source "$_croft_rc"
+        break
+      fi
+    done
+    [[ -r "$HOME/.bashrc" ]] && builtin source "$HOME/.bashrc"
+  fi
+  builtin unset _croft_rc
+fi
+
+# FinalTerm / OSC 133 semantic prompt marks + OSC 7 cwd, the protocol VS
+# Code, Ghostty, iTerm2 and WezTerm build command navigation on.
+if [[ -z "$_croft_si_installed" ]]; then
+  _croft_si_installed=1
+  _croft_b_mark='\[\e]133;B\a\]'
+  _croft_preexec() {
+    _croft_cmd_inflight=1
+    builtin printf '\033]133;C\007'
+  }
+  _croft_precmd() {
+    local _croft_ec=$?
+    if [[ -n "$_croft_cmd_inflight" ]]; then
+      builtin unset _croft_cmd_inflight
+      builtin printf '\033]133;D;%d\007' "$_croft_ec"
+    fi
+    builtin printf '\033]7;file://%s%s\007' "${HOSTNAME:-localhost}" "$PWD"
+    builtin printf '\033]133;A\007'
+    # Prompt themes rewrite PS1 from their own PROMPT_COMMAND entries, so
+    # the zero-width input-start mark is re-asserted at every prompt.
+    if [[ "$PS1" != *"$_croft_b_mark" ]]; then
+      PS1+="$_croft_b_mark"
+    fi
+  }
+  # DEBUG fires for every simple command, including PROMPT_COMMAND's own
+  # entries; only the first one after the prompt was armed — and not part
+  # of PROMPT_COMMAND itself (an empty Enter goes straight back to it) —
+  # is the user's command. bash-preexec's exact discipline.
+  _croft_debug_trap() {
+    [[ -n "$COMP_LINE" ]] && builtin return
+    [[ -z "$_croft_at_prompt" ]] && builtin return
+    _croft_at_prompt=
+    case ";${PROMPT_COMMAND[*]};" in
+      *";$BASH_COMMAND;"*) builtin return ;;
+    esac
+    _croft_preexec
+  }
+  _croft_arm() { _croft_at_prompt=1; }
+  if [[ -n "${bash_preexec_imported:-${__bp_imported:-}}" ]]; then
+    # bash-preexec (iTerm2 integration, Atuin, ...) owns the DEBUG trap;
+    # join its cooperative hook arrays instead of fighting over it.
+    precmd_functions+=(_croft_precmd)
+    preexec_functions+=(_croft_preexec)
+  else
+    if ((BASH_VERSINFO[0] > 5 || (BASH_VERSINFO[0] == 5 && BASH_VERSINFO[1] >= 3))); then
+      # bash 5.3 funsub runs in the current shell: a trap-free preexec.
+      PS0='${ _croft_preexec; }'"$PS0"
+    elif [[ -z "$(trap -p DEBUG)" ]]; then
+      builtin trap '_croft_debug_trap' DEBUG
+    fi
+    # An existing DEBUG trap (a hand-rolled preexec) is left alone; marks
+    # degrade to prompt + cwd only.
+    # Precmd runs FIRST so nothing clobbers $? before the exit capture;
+    # the arm runs LAST so user entries never read as the next command.
+    if [[ "$(declare -p PROMPT_COMMAND 2>/dev/null)" == "declare -a"* ]]; then
+      PROMPT_COMMAND=(_croft_precmd "${PROMPT_COMMAND[@]}" _croft_arm)
+    else
+      PROMPT_COMMAND="_croft_precmd${PROMPT_COMMAND:+;$PROMPT_COMMAND};_croft_arm"
+    fi
+  fi
+fi
+"#;
+
+/// Write croft's bash `$ENV` shim (idempotently) and return the file path.
+pub fn ensure_bash_shim(config_dir: &std::path::Path) -> std::io::Result<PathBuf> {
+    let dir = config_dir.join("shell-integration").join("bash");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join("croft.bash");
+    if std::fs::read_to_string(&path).ok().as_deref() != Some(BASH_SHIM) {
+        let mut f = std::fs::File::create(&path)?;
+        f.write_all(BASH_SHIM.as_bytes())?;
+    }
+    Ok(path)
+}
+
+/// The fish integration, auto-sourced from `<data dir>/fish/vendor_conf.d/`
+/// via a prepended `XDG_DATA_DIRS` entry (the mechanism kitty, Ghostty and
+/// VS Code all use; fish reads vendor_conf.d before the user's config).
+///
+/// fish 4.0+ (the Rust rewrite) emits the OSC 133 marks and the OSC 7 cwd
+/// report natively, for every terminal, on by default — a second emitter
+/// would double-mark each prompt, so like kitty (and unlike Ghostty, which
+/// double-marks) croft's hooks install only on old fish, detected the way
+/// kitty does it: modern fish ships the `forward-char-passive` binding.
+const FISH_INTEGRATION: &str = r#"# croft shell integration (auto-generated; do not edit)
+
+# First: put XDG_DATA_DIRS back so child processes never see croft's
+# injection dir.
+if set -q CROFT_FISH_XDG_DATA_DIR
+    if set -q XDG_DATA_DIRS
+        set --local _croft_i (contains --index -- "$CROFT_FISH_XDG_DATA_DIR" $XDG_DATA_DIRS)
+        and set --erase XDG_DATA_DIRS[$_croft_i]
+        if not set -q XDG_DATA_DIRS[1]
+            set --erase XDG_DATA_DIRS
+        else
+            set --global --export --path XDG_DATA_DIRS $XDG_DATA_DIRS
+        end
+    end
+    set --erase CROFT_FISH_XDG_DATA_DIR
+end
+
+if status is-interactive
+    # fish 4.0+ marks prompts natively (OSC 133 + OSC 7 for every
+    # terminal); emitting again would double-decorate. Old fish (<= 3.7)
+    # lacks the forward-char-passive binding and needs croft's hooks.
+    if not bind --function-names 2>/dev/null | string match -q forward-char-passive
+        function _croft_mark_prompt --on-event fish_prompt --on-event fish_cancel --on-event fish_posterror
+            if test "$_croft_prompt_state" = command
+                # the started command never reported back: close the cycle
+                printf '\e]133;D\a'
+            end
+            set --global _croft_prompt_state prompt
+            printf '\e]7;file://%s%s\a' "$hostname" (string escape --style=url -- "$PWD")
+            printf '\e]133;A\a'
+        end
+        function _croft_mark_output_start --on-event fish_preexec
+            set --global _croft_prompt_state command
+            printf '\e]133;C\a'
+        end
+        function _croft_mark_output_end --on-event fish_postexec
+            set --local _croft_s $status
+            set --global _croft_prompt_state finished
+            printf '\e]133;D;%s\a' $_croft_s
+        end
+    end
+end
+"#;
+
+/// Write croft's fish `vendor_conf.d` integration (idempotently) and return
+/// the XDG data dir to prepend to `XDG_DATA_DIRS`.
+pub fn ensure_fish_integration(config_dir: &std::path::Path) -> std::io::Result<PathBuf> {
+    let dir = config_dir.join("shell-integration").join("fish");
+    let conf_dir = dir.join("fish").join("vendor_conf.d");
+    std::fs::create_dir_all(&conf_dir)?;
+    let path = conf_dir.join("croft.fish");
+    if std::fs::read_to_string(&path).ok().as_deref() != Some(FISH_INTEGRATION) {
+        let mut f = std::fs::File::create(&path)?;
+        f.write_all(FISH_INTEGRATION.as_bytes())?;
+    }
+    Ok(dir)
+}
+
+/// The `XDG_DATA_DIRS` value for a croft-spawned fish: croft's injection
+/// data dir first, then the inherited value (or the XDG spec default when
+/// unset/empty, so system data dirs stay visible to fish).
+pub fn fish_xdg_data_dirs(data_dir: &std::path::Path, inherited: Option<&str>) -> String {
+    const XDG_DEFAULT: &str = "/usr/local/share:/usr/share";
+    let rest = match inherited {
+        Some(x) if !x.is_empty() => x,
+        _ => XDG_DEFAULT,
+    };
+    format!("{}:{rest}", data_dir.display())
 }
 
 /// Write croft's zsh `ZDOTDIR` shim (idempotently) and return its directory.
@@ -508,5 +717,110 @@ mod tests {
         );
         // Idempotent: a second call rewrites without error.
         ensure_zsh_shim(tmp.path()).expect("shim rewrite must succeed");
+    }
+
+    #[test]
+    fn fish_native_mark_dialect_is_parsed() {
+        // fish 4.x (the Rust rewrite) emits the marks itself, for every
+        // terminal, in its own dialect: ST-terminated, `A` carrying
+        // `click_events=1`, `C` carrying the URL-escaped command line, and a
+        // bare `D` (no exit code) when it synthesizes a missing output-end
+        // after a cancelled prompt. All must parse.
+        let mut s = OscSniffer::default();
+        let events = scan_all(
+            &mut s,
+            &[b"\x1b]133;A;click_events=1\x1b\\> \x1b]133;B\x1b\\cmd\x1b]133;C;cmdline_url=cmd%20--flag\x1b\\out\x1b]133;D;2\x1b\\"],
+        );
+        assert_eq!(
+            events,
+            vec![
+                OscEvent::PromptStart,
+                OscEvent::PromptEnd,
+                OscEvent::CommandStart,
+                OscEvent::CommandEnd(Some(2)),
+            ]
+        );
+        let bare = scan_all(&mut s, &[b"\x1b]133;D\x1b\\"]);
+        assert_eq!(bare, vec![OscEvent::CommandEnd(None)]);
+    }
+
+    #[test]
+    fn bash_shim_backs_out_of_posix_mode_and_installs_hooks() {
+        // The kitty/Ghostty ENV + --posix injection: an interactive
+        // `bash --posix` reads ONLY $ENV, so the shim must leave posix mode,
+        // replay the user's real startup files (login vs non-login), and
+        // install the OSC 133 / OSC 7 hooks.
+        let tmp = tempfile::tempdir().unwrap();
+        let file = ensure_bash_shim(tmp.path()).expect("shim must be written");
+        assert!(file.is_file(), "croft.bash must exist");
+        let s = std::fs::read_to_string(&file).unwrap();
+        for needle in [
+            "set +o posix",
+            "login_shell",
+            ".bash_profile",
+            ".bashrc",
+            "PROMPT_COMMAND",
+            "133;A",
+            "133;B",
+            "133;C",
+            "133;D",
+            "]7;file://",
+            "HISTFILE",
+        ] {
+            assert!(s.contains(needle), "bash shim must contain {needle:?}");
+        }
+        ensure_bash_shim(tmp.path()).expect("shim rewrite must succeed");
+    }
+
+    #[test]
+    fn fish_integration_writes_a_vendor_conf_that_defers_to_native_marks() {
+        // fish is injected via the standard XDG_DATA_DIRS vendor_conf.d
+        // mechanism. The script must restore XDG_DATA_DIRS first, and only
+        // emit marks itself on old fish (<= 3.7) — modern fish marks
+        // natively, and a second emitter would double-decorate.
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = ensure_fish_integration(tmp.path()).expect("must be written");
+        let f = data_dir
+            .join("fish")
+            .join("vendor_conf.d")
+            .join("croft.fish");
+        assert!(
+            f.is_file(),
+            "croft.fish must exist under fish/vendor_conf.d"
+        );
+        let s = std::fs::read_to_string(&f).unwrap();
+        for needle in [
+            "CROFT_FISH_XDG_DATA_DIR",
+            "forward-char-passive",
+            "fish_preexec",
+            "fish_postexec",
+            "133;A",
+            "133;C",
+            "133;D",
+            "]7;file://",
+        ] {
+            assert!(
+                s.contains(needle),
+                "fish integration must contain {needle:?}"
+            );
+        }
+        ensure_fish_integration(tmp.path()).expect("rewrite must succeed");
+    }
+
+    #[test]
+    fn fish_xdg_data_dirs_prepends_and_keeps_the_spec_default() {
+        let d = std::path::Path::new("/cfg/shell-integration/fish");
+        assert_eq!(
+            fish_xdg_data_dirs(d, Some("/a:/b")),
+            "/cfg/shell-integration/fish:/a:/b"
+        );
+        // Unset or empty inherits the XDG spec default, so fish never loses
+        // sight of the system data dirs.
+        for inherited in [None, Some("")] {
+            assert_eq!(
+                fish_xdg_data_dirs(d, inherited),
+                "/cfg/shell-integration/fish:/usr/local/share:/usr/share"
+            );
+        }
     }
 }

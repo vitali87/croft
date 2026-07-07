@@ -59,7 +59,13 @@ pub struct ReleaseNote {
 }
 
 /// What shipped in the current release. Replace on every version bump.
-pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
-    kind: NoteKind::Fix,
-    summary: "Command decoration dots are now actually clickable on a lone terminal pane: its left border sits in the sidebar resize seam's grab zone, which swallowed the press as a resize drag before the decoration menu could open.",
-}];
+pub const RELEASE_NOTES: &[ReleaseNote] = &[
+    ReleaseNote {
+        kind: NoteKind::Feature,
+        summary: "Shell integration now covers bash and fish, not just zsh: bash 4.4+ gets the ENV + --posix bootstrap kitty and Ghostty use (your real startup files replayed unchanged), fish rides its native fish 4 prompt marks via a vendor_conf.d hand-off, and both gain the full command model in the terminal: gutter decoration dots, exit codes, runtimes, prompt jumps, cwd-inheriting splits, and long-command notices.",
+    },
+    ReleaseNote {
+        kind: NoteKind::Fix,
+        summary: "zsh panes now mark where your typed command starts (OSC 133;B), so Copy Output and Re-run Command work standalone, without another terminal's integration chained in; previously they only worked when Ghostty's hooks happened to supply the mark.",
+    },
+];

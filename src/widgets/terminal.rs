@@ -347,43 +347,120 @@ pub fn pick_prompt_jump(prompt_lines: &[i32], current_top: i32, forward: bool) -
     }
 }
 
-/// Inject croft's shell-integration environment for supported shells.
-/// zsh: point `ZDOTDIR` at croft's shim, which sources the user's real
-/// dotfiles unchanged and then installs `precmd`/`preexec` hooks emitting
-/// OSC 133 prompt marks + the OSC 7 cwd report. Opt out with
-/// `CROFT_SHELL_INTEGRATION=0`. Failures are non-fatal — the shell still
-/// spawns, just without marks.
-fn apply_shell_integration_env(cmd: &mut CommandBuilder, shell_path: &str) {
+/// Inject croft's shell-integration environment for supported shells, and
+/// return any argv to prepend before the login flag.
+/// zsh: point `ZDOTDIR` at croft's shim. bash: the kitty/Ghostty trick —
+/// `--posix` plus `ENV` pointing at croft's shim (posix-mode bash reads
+/// only `$ENV`; the shim backs out and replays the real startup files).
+/// fish: prepend a `vendor_conf.d` data dir to `XDG_DATA_DIRS`; the script
+/// defers to fish 4's native marks. Every shim sources the user's real
+/// dotfiles unchanged and emits OSC 133 prompt marks + the OSC 7 cwd
+/// report. Opt out with `CROFT_SHELL_INTEGRATION=0`. Failures are
+/// non-fatal — the shell still spawns, just without marks.
+fn apply_shell_integration_env(
+    cmd: &mut CommandBuilder,
+    shell_path: &str,
+    config_dir: &std::path::Path,
+) -> Vec<String> {
     if std::env::var("CROFT_SHELL_INTEGRATION").as_deref() == Ok("0") {
-        return;
+        return Vec::new();
     }
     let base = std::path::Path::new(shell_path)
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("");
-    if base != "zsh" {
-        return;
+    match base {
+        "zsh" => {
+            let Ok(shim) = crate::shell_integration::ensure_zsh_shim(config_dir) else {
+                return Vec::new();
+            };
+            // An inherited ZDOTDIR pointing at croft's own shim (croft
+            // launched from a croft pane) is poisoned — the user's dotfiles
+            // live in HOME.
+            let inherited = std::env::var_os("ZDOTDIR").map(std::path::PathBuf::from);
+            let home = std::env::var_os("HOME")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_default();
+            if home.as_os_str().is_empty() {
+                return Vec::new();
+            }
+            let user_zdotdir = crate::shell_integration::resolve_user_zdotdir(
+                inherited.as_deref(),
+                &config_dir.join("shell-integration"),
+                &home,
+            );
+            cmd.env("CROFT_USER_ZDOTDIR", user_zdotdir);
+            cmd.env("ZDOTDIR", &shim);
+            Vec::new()
+        }
+        "bash" => {
+            if !bash_env_injection_supported(shell_path) {
+                return Vec::new();
+            }
+            let Ok(shim) = crate::shell_integration::ensure_bash_shim(config_dir) else {
+                return Vec::new();
+            };
+            // Preserve a user $ENV (rare for bash) for the shim to restore.
+            if let Ok(env) = std::env::var("ENV") {
+                cmd.env("CROFT_BASH_ENV", env);
+            }
+            cmd.env("ENV", &shim);
+            cmd.env("CROFT_BASH_INJECT", "1");
+            // Posix mode defaults HISTFILE to ~/.sh_history; pre-seed the
+            // bash default and let the shim unexport it.
+            if std::env::var_os("HISTFILE").is_none()
+                && let Some(home) = std::env::var_os("HOME")
+            {
+                cmd.env(
+                    "HISTFILE",
+                    std::path::Path::new(&home).join(".bash_history"),
+                );
+                cmd.env("CROFT_BASH_UNEXPORT_HISTFILE", "1");
+            }
+            vec!["--posix".to_string()]
+        }
+        "fish" => {
+            let Ok(dir) = crate::shell_integration::ensure_fish_integration(config_dir) else {
+                return Vec::new();
+            };
+            let inherited = std::env::var("XDG_DATA_DIRS").ok();
+            cmd.env(
+                "XDG_DATA_DIRS",
+                crate::shell_integration::fish_xdg_data_dirs(&dir, inherited.as_deref()),
+            );
+            cmd.env("CROFT_FISH_XDG_DATA_DIR", &dir);
+            Vec::new()
+        }
+        _ => Vec::new(),
     }
-    let config_dir = crate::prefs::config_dir();
-    let Ok(shim) = crate::shell_integration::ensure_zsh_shim(&config_dir) else {
-        return;
+}
+
+/// Whether this bash reads `$ENV` in posix mode, i.e. the injection works
+/// at all. Verified empirically: macOS's system bash 3.2 never reads $ENV
+/// under `--posix`, so injecting would strip its startup files for
+/// nothing; Homebrew/Linux 5.x does. 4.4 is the ecosystem floor (kitty,
+/// Ghostty). One short probe subprocess per pane spawn — pane creation
+/// already forks a shell, so this is noise.
+fn bash_env_injection_supported(shell_path: &str) -> bool {
+    let Ok(out) = std::process::Command::new(shell_path)
+        .args(["-c", "echo \"${BASH_VERSINFO[0]}.${BASH_VERSINFO[1]}\""])
+        .output()
+    else {
+        return false;
     };
-    // An inherited ZDOTDIR pointing at croft's own shim (croft launched
-    // from a croft pane) is poisoned — the user's dotfiles live in HOME.
-    let inherited = std::env::var_os("ZDOTDIR").map(std::path::PathBuf::from);
-    let home = std::env::var_os("HOME")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_default();
-    if home.as_os_str().is_empty() {
-        return;
-    }
-    let user_zdotdir = crate::shell_integration::resolve_user_zdotdir(
-        inherited.as_deref(),
-        &config_dir.join("shell-integration"),
-        &home,
-    );
-    cmd.env("CROFT_USER_ZDOTDIR", user_zdotdir);
-    cmd.env("ZDOTDIR", &shim);
+    parse_bash_version_supported(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// `major.minor` >= 4.4, tolerant of anything a non-bash prints.
+fn parse_bash_version_supported(s: &str) -> bool {
+    let mut it = s.trim().split('.');
+    let (Some(maj), Some(min)) = (
+        it.next().and_then(|v| v.parse::<u32>().ok()),
+        it.next().and_then(|v| v.parse::<u32>().ok()),
+    ) else {
+        return false;
+    };
+    maj > 4 || (maj == 4 && min >= 4)
 }
 
 /// Pick the program + args to spawn the user's interactive shell so it
@@ -469,11 +546,13 @@ impl PtyTerminal {
     pub fn new_shell(shell_path: &str, cwd: &std::path::Path) -> Result<Self> {
         let (program, args) = interactive_shell_invocation(shell_path);
         let mut cmd = CommandBuilder::new(&program);
-        for a in &args {
+        // Integration args go first: bash only recognises long options
+        // (--posix) when they precede single-character ones (-l).
+        let pre = apply_shell_integration_env(&mut cmd, shell_path, &crate::prefs::config_dir());
+        for a in pre.iter().chain(args.iter()) {
             cmd.arg(a);
         }
         cmd.cwd(cwd);
-        apply_shell_integration_env(&mut cmd, shell_path);
         Self::spawn_with(cmd, None)
     }
 
@@ -2724,6 +2803,287 @@ mod tests {
             term.shell_cwd().is_some(),
             "the shim's precmd must also report the cwd via OSC 7"
         );
+    }
+
+    /// A bash new enough for `$ENV` + `--posix` injection (>= 4.4), for the
+    /// e2e tests: Homebrew/Linux bash qualifies, macOS's system 3.2 not.
+    fn modern_bash() -> Option<&'static str> {
+        ["/opt/homebrew/bin/bash", "/usr/local/bin/bash", "/bin/bash"]
+            .into_iter()
+            .find(|b| bash_env_injection_supported(b))
+    }
+
+    #[test]
+    fn shell_integration_env_prepends_posix_for_modern_bash_only() {
+        // bash is injected by inserting `--posix` before `-l` and pointing
+        // $ENV at croft's shim — but only from 4.4 (the kitty/Ghostty
+        // floor): macOS's system bash 3.2 ignores $ENV in posix mode, so
+        // injecting would strip its startup files for nothing. zsh
+        // (ZDOTDIR) and fish (XDG_DATA_DIRS) are env-only and prepend
+        // nothing.
+        let cfg = tempfile::tempdir().unwrap();
+        if let Some(bash) = modern_bash() {
+            let mut cmd = CommandBuilder::new(bash);
+            assert_eq!(
+                apply_shell_integration_env(&mut cmd, bash, cfg.path()),
+                vec!["--posix".to_string()]
+            );
+        }
+        assert!(!parse_bash_version_supported("3.2"));
+        assert!(!parse_bash_version_supported("4.3"));
+        assert!(!parse_bash_version_supported("garbage"));
+        assert!(parse_bash_version_supported("4.4"));
+        assert!(parse_bash_version_supported("5.2"));
+        assert!(parse_bash_version_supported("10.0"));
+        if std::path::Path::new("/bin/bash").exists() && !bash_env_injection_supported("/bin/bash")
+        {
+            // On a macOS box with system bash 3.2: no injection, no args.
+            let mut cmd = CommandBuilder::new("/bin/bash");
+            assert!(
+                apply_shell_integration_env(&mut cmd, "/bin/bash", cfg.path()).is_empty(),
+                "bash 3.2 must spawn clean, without posix injection"
+            );
+        }
+        for shell in ["/bin/zsh", "/usr/bin/fish", "/bin/dash"] {
+            let mut cmd = CommandBuilder::new(shell);
+            assert!(
+                apply_shell_integration_env(&mut cmd, shell, cfg.path()).is_empty(),
+                "{shell} must not gain args"
+            );
+        }
+    }
+
+    #[test]
+    fn zsh_shim_marks_the_prompt_end_for_input_extraction() {
+        // Copy Output / Re-run Command read the typed command from the
+        // PromptEnd (133;B) mark. The shim must emit it itself — relying on
+        // a chained foreign integration (Ghostty's) leaves remote Linux
+        // panes with no input span at all.
+        let zsh = "/bin/zsh";
+        if !std::path::Path::new(zsh).exists() {
+            return;
+        }
+        let user_dir = tempfile::tempdir().unwrap();
+        let cfg_dir = tempfile::tempdir().unwrap();
+        let shim = crate::shell_integration::ensure_zsh_shim(cfg_dir.path()).unwrap();
+        let mut cmd = CommandBuilder::new(zsh);
+        cmd.arg("-i");
+        cmd.cwd(user_dir.path());
+        cmd.env("ZDOTDIR", &shim);
+        cmd.env("CROFT_USER_ZDOTDIR", user_dir.path());
+        let term = PtyTerminal::spawn_with(cmd, None).unwrap();
+        let mut waited = 0u32;
+        loop {
+            let marks = term.command_marks();
+            if marks
+                .iter()
+                .any(|(k, _)| *k == crate::shell_integration::OscEvent::PromptEnd)
+            {
+                break;
+            }
+            assert!(
+                waited < 8000,
+                "zsh never emitted a PromptEnd mark; marks: {marks:?}, grid: {:?}",
+                term.grid_lines().0
+            );
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            waited += 40;
+        }
+    }
+
+    #[test]
+    fn bash_shim_via_posix_env_emits_marks_and_sources_the_user_profile() {
+        // The kitty/Ghostty bash injection end-to-end, exactly as croft
+        // spawns it: `bash --posix -l` with ENV pointing at croft's shim.
+        // In posix mode bash reads ONLY $ENV, so the shim must back out of
+        // posix mode, replay the login startup files (the user's
+        // .bash_profile here), and emit the full mark cycle with exit codes.
+        // Needs a bash >= 4.4 (macOS system 3.2 ignores $ENV in posix mode
+        // and is never injected).
+        let Some(bash) = modern_bash() else {
+            return;
+        };
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            home.path().join(".bash_profile"),
+            "USER_RC_SENTINEL=loaded\nexport USER_RC_SENTINEL\n",
+        )
+        .unwrap();
+        let cfg_dir = tempfile::tempdir().unwrap();
+        let shim = crate::shell_integration::ensure_bash_shim(cfg_dir.path()).unwrap();
+        let mut cmd = CommandBuilder::new(bash);
+        cmd.arg("--posix");
+        cmd.arg("-l");
+        cmd.cwd(home.path());
+        cmd.env("HOME", home.path());
+        cmd.env("ENV", &shim);
+        cmd.env("CROFT_BASH_INJECT", "1");
+        let mut term = PtyTerminal::spawn_with(cmd, None).unwrap();
+        let mut waited = 0u32;
+        while term.prompt_lines().is_empty() {
+            assert!(
+                waited < 8000,
+                "bash never emitted a prompt mark; grid: {:?}",
+                term.grid_lines().0
+            );
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            waited += 40;
+        }
+        assert!(
+            term.shell_cwd().is_some(),
+            "the shim's precmd must report cwd via OSC 7"
+        );
+        term.write_input(b"echo SENTINEL_IS=$USER_RC_SENTINEL\r");
+        let mut waited = 0u32;
+        loop {
+            let (lines, _) = term.grid_lines();
+            if lines
+                .iter()
+                .any(|l| l.contains("SENTINEL_IS=loaded") && !l.contains("echo"))
+            {
+                break;
+            }
+            assert!(
+                waited < 8000,
+                "user .bash_profile never ran through the shim; grid: {lines:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            waited += 40;
+        }
+        // A failing command must round-trip its exit code through 133;D and
+        // the shim must mark the prompt end for input extraction.
+        term.write_input(b"false\r");
+        let mut waited = 0u32;
+        loop {
+            use crate::shell_integration::OscEvent as E;
+            let marks = term.command_marks();
+            if marks.iter().any(|(k, _)| *k == E::CommandEnd(Some(1))) {
+                assert!(
+                    marks.iter().any(|(k, _)| *k == E::PromptEnd),
+                    "bash PS1 must carry the 133;B input-start mark; marks: {marks:?}"
+                );
+                break;
+            }
+            assert!(
+                waited < 8000,
+                "no CommandEnd(1) after `false`; marks: {marks:?}, grid: {:?}",
+                term.grid_lines().0
+            );
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            waited += 40;
+        }
+    }
+
+    /// A fish binary for the e2e: common install paths, then `$PATH`.
+    /// Absent on plain macOS (skips), present on Linux boxes and via nix.
+    fn find_fish() -> Option<String> {
+        let fixed = [
+            "/opt/homebrew/bin/fish",
+            "/usr/local/bin/fish",
+            "/usr/bin/fish",
+        ];
+        if let Some(f) = fixed.iter().find(|f| std::path::Path::new(f).exists()) {
+            return Some((*f).to_string());
+        }
+        let path = std::env::var("PATH").ok()?;
+        path.split(':')
+            .map(|d| std::path::Path::new(d).join("fish"))
+            .find(|p| p.is_file())
+            .map(|p| p.display().to_string())
+    }
+
+    #[test]
+    fn fish_integration_restores_xdg_dirs_and_yields_single_native_marks() {
+        // fish end-to-end through croft's injection env: fish 4 must emit
+        // the marks natively (croft's vendor script installs NO second
+        // emitter, unlike Ghostty's which double-marks), the exit code must
+        // round-trip, and the script must scrub the injection from the
+        // session env so children never see it.
+        let Some(fish) = find_fish() else {
+            return;
+        };
+        let home = tempfile::tempdir().unwrap();
+        let cfg_dir = tempfile::tempdir().unwrap();
+        let dir = crate::shell_integration::ensure_fish_integration(cfg_dir.path()).unwrap();
+        let mut cmd = CommandBuilder::new(&fish);
+        cmd.arg("-i");
+        cmd.arg("-l");
+        cmd.cwd(home.path());
+        cmd.env("HOME", home.path());
+        cmd.env(
+            "XDG_DATA_DIRS",
+            crate::shell_integration::fish_xdg_data_dirs(&dir, None),
+        );
+        cmd.env("CROFT_FISH_XDG_DATA_DIR", &dir);
+        let mut term = PtyTerminal::spawn_with(cmd, None).unwrap();
+        let mut waited = 0u32;
+        while term.prompt_lines().is_empty() {
+            assert!(
+                waited < 8000,
+                "fish never emitted a prompt mark; grid: {:?}",
+                term.grid_lines().0
+            );
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            waited += 40;
+        }
+        term.write_input(b"false\r");
+        let mut waited = 0u32;
+        loop {
+            use crate::shell_integration::OscEvent as E;
+            let marks = term.command_marks();
+            if marks.iter().any(|(k, _)| *k == E::CommandEnd(Some(1))) {
+                break;
+            }
+            assert!(
+                waited < 8000,
+                "no CommandEnd(1) after `false`; marks: {marks:?}, grid: {:?}",
+                term.grid_lines().0
+            );
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            waited += 40;
+        }
+        // Exactly one finished record for `false`: a second emitter would
+        // double-decorate every command.
+        let failing: Vec<_> = term
+            .command_decorations()
+            .into_iter()
+            .filter(|d| d.exit == Some(1))
+            .collect();
+        assert_eq!(failing.len(), 1, "duplicate decorations: {failing:?}");
+        // The injection env must be gone inside the session.
+        term.write_input(b"echo DIRS=$XDG_DATA_DIRS; set -q CROFT_FISH_XDG_DATA_DIR; and echo SI_LEAKED; or echo SI_CLEAN\r");
+        let needle = format!("{}", dir.display());
+        let mut waited = 0u32;
+        loop {
+            let (lines, _) = term.grid_lines();
+            if lines
+                .iter()
+                .any(|l| l.contains("SI_CLEAN") && !l.contains("echo"))
+            {
+                assert!(
+                    !lines
+                        .iter()
+                        .any(|l| l.contains("SI_LEAKED") && !l.contains("echo")),
+                    "grid: {lines:?}"
+                );
+                let dirs_line = lines
+                    .iter()
+                    .find(|l| l.contains("DIRS=") && !l.contains("echo"))
+                    .cloned()
+                    .unwrap_or_default();
+                assert!(
+                    !dirs_line.contains(&needle),
+                    "XDG_DATA_DIRS still carries the injection dir: {dirs_line}"
+                );
+                break;
+            }
+            assert!(
+                waited < 8000,
+                "env scrub probe never answered; grid: {lines:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            waited += 40;
+        }
     }
 
     #[test]
