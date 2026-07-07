@@ -243,6 +243,9 @@ struct StoredMark {
     kind: crate::shell_integration::OscEvent,
     line_rec: i32,
     hist_rec: usize,
+    /// Cursor column when the mark landed (`PromptEnd`'s column is where the
+    /// typed command starts on its prompt line).
+    col_rec: usize,
     /// For `CommandEnd` marks: how long the command ran (CommandStart →
     /// CommandEnd, measured in the reader thread). `None` elsewhere.
     dur: Option<std::time::Duration>,
@@ -250,12 +253,17 @@ struct StoredMark {
 
 /// A finished command derived from the OSC 133 marks: the grid line of the
 /// prompt it was typed at (current coords, negative = scrollback), its exit
-/// code (`None` when the shell omitted it), and how long it ran.
+/// code (`None` when the shell omitted it), how long it ran, where its typed
+/// text starts (`PromptEnd` line + column), and its output span
+/// (`CommandStart` line up to but excluding the `CommandEnd` line).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CommandDecoration {
     pub line: i32,
     pub exit: Option<i32>,
     pub duration: Option<std::time::Duration>,
+    pub input: Option<(i32, usize)>,
+    pub output_start: i32,
+    pub output_end: i32,
 }
 
 /// Pair the mark stream (oldest first, each with its current grid line and,
@@ -269,24 +277,34 @@ pub fn pair_decorations(
     marks: &[(
         crate::shell_integration::OscEvent,
         i32,
+        usize,
         Option<std::time::Duration>,
     )],
 ) -> Vec<CommandDecoration> {
     use crate::shell_integration::OscEvent as E;
     let mut out = Vec::new();
     let mut prompt: Option<i32> = None;
-    let mut started = false;
-    for (kind, line, dur) in marks {
+    let mut input: Option<(i32, usize)> = None;
+    let mut started: Option<i32> = None;
+    for (kind, line, col, dur) in marks {
         match kind {
-            E::PromptStart => prompt = Some(*line),
-            E::CommandStart => started = true,
-            E::CommandEnd(exit) if started => {
-                started = false;
-                out.push(CommandDecoration {
-                    line: prompt.unwrap_or(*line),
-                    exit: *exit,
-                    duration: *dur,
-                });
+            E::PromptStart => {
+                prompt = Some(*line);
+                input = None;
+            }
+            E::PromptEnd => input = Some((*line, *col)),
+            E::CommandStart => started = Some(*line),
+            E::CommandEnd(exit) => {
+                if let Some(output_start) = started.take() {
+                    out.push(CommandDecoration {
+                        line: prompt.unwrap_or(output_start),
+                        exit: *exit,
+                        duration: *dur,
+                        input,
+                        output_start,
+                        output_end: *line,
+                    });
+                }
             }
             _ => {}
         }
@@ -694,6 +712,7 @@ impl PtyTerminal {
                                     };
                                     let line_rec = t.grid().cursor.point.line.0;
                                     let hist_rec = t.grid().history_size();
+                                    let col_rec = t.grid().cursor.point.column.0;
                                     let mut ms = marks_for_thread.lock().unwrap();
                                     if ms.len() >= MARKS_MAX {
                                         let drop_n = ms.len() + 1 - MARKS_MAX;
@@ -703,6 +722,7 @@ impl PtyTerminal {
                                         kind,
                                         line_rec,
                                         hist_rec,
+                                        col_rec,
                                         dur,
                                     });
                                 }
@@ -763,7 +783,7 @@ impl PtyTerminal {
     pub fn command_marks(&self) -> Vec<(crate::shell_integration::OscEvent, i32)> {
         self.marks_snapshot()
             .into_iter()
-            .map(|(kind, line, _)| (kind, line))
+            .map(|(kind, line, _, _)| (kind, line))
             .collect()
     }
 
@@ -774,6 +794,7 @@ impl PtyTerminal {
     ) -> Vec<(
         crate::shell_integration::OscEvent,
         i32,
+        usize,
         Option<std::time::Duration>,
     )> {
         let term = self.term.lock();
@@ -788,6 +809,7 @@ impl PtyTerminal {
                 (
                     m.kind.clone(),
                     m.line_rec - (hist_now - m.hist_rec as i32),
+                    m.col_rec,
                     m.dur,
                 )
             })
@@ -804,6 +826,55 @@ impl PtyTerminal {
     /// the status-bar notification for long commands in unfocused panes.
     pub fn drain_finished_commands(&self) -> Vec<(Option<i32>, std::time::Duration)> {
         self.finished_rx.try_iter().collect()
+    }
+
+    /// The text a finished command printed: its output span (`output_start`
+    /// up to but excluding `output_end`), trailing blank lines dropped.
+    pub fn command_output_text(&self, d: &CommandDecoration) -> String {
+        if d.output_end <= d.output_start {
+            return String::new();
+        }
+        let term = self.term.lock();
+        extract_selection_text(
+            &term,
+            d.output_start,
+            0,
+            d.output_end - 1,
+            term.columns().saturating_sub(1),
+        )
+    }
+
+    /// The command as it was typed at its prompt: from the `PromptEnd`
+    /// mark's cell to the end of the input rows (the row before the output
+    /// starts), soft-wrapped rows joined.
+    pub fn command_input_text(&self, d: &CommandDecoration) -> String {
+        let Some((line, col)) = d.input else {
+            return String::new();
+        };
+        if d.output_start <= line {
+            return String::new();
+        }
+        let term = self.term.lock();
+        extract_selection_text(
+            &term,
+            line,
+            col,
+            d.output_start - 1,
+            term.columns().saturating_sub(1),
+        )
+    }
+
+    /// Select the command's output span (and snap the view to it), so the
+    /// user sees exactly what Copy Output grabbed. No-op for empty output.
+    pub fn select_command_output(&mut self, d: &CommandDecoration) {
+        if d.output_end <= d.output_start {
+            return;
+        }
+        self.selection = Some(Selection {
+            anchor: (d.output_start, 0),
+            head: (d.output_end - 1, self.cols.saturating_sub(1)),
+        });
+        self.scroll_to_line(d.output_start);
     }
 
     /// The decoration whose gutter dot sits at screen cell (col, row), if
@@ -2367,17 +2438,19 @@ mod tests {
         use crate::shell_integration::OscEvent as E;
         let ms = std::time::Duration::from_millis;
         // Two full cycles (ok then failing), then a bare prompt with no
-        // command: two records, the bare prompt contributes nothing.
+        // command: two records, the bare prompt contributes nothing. The
+        // PromptEnd cell names where the typed command starts; the output
+        // span runs from the CommandStart line up to the CommandEnd line.
         let marks = [
-            (E::PromptStart, -10, None),
-            (E::PromptEnd, -10, None),
-            (E::CommandStart, -10, None),
-            (E::CommandEnd(Some(0)), -7, Some(ms(2400))),
-            (E::PromptStart, -7, None),
-            (E::PromptEnd, -7, None),
-            (E::CommandStart, -7, None),
-            (E::CommandEnd(Some(3)), -2, Some(ms(150))),
-            (E::PromptStart, -2, None),
+            (E::PromptStart, -10, 0, None),
+            (E::PromptEnd, -10, 5, None),
+            (E::CommandStart, -9, 0, None),
+            (E::CommandEnd(Some(0)), -7, 0, Some(ms(2400))),
+            (E::PromptStart, -7, 0, None),
+            (E::PromptEnd, -7, 5, None),
+            (E::CommandStart, -6, 0, None),
+            (E::CommandEnd(Some(3)), -2, 0, Some(ms(150))),
+            (E::PromptStart, -2, 0, None),
         ];
         assert_eq!(
             pair_decorations(&marks),
@@ -2386,26 +2459,67 @@ mod tests {
                     line: -10,
                     exit: Some(0),
                     duration: Some(ms(2400)),
+                    input: Some((-10, 5)),
+                    output_start: -9,
+                    output_end: -7,
                 },
                 CommandDecoration {
                     line: -7,
                     exit: Some(3),
                     duration: Some(ms(150)),
+                    input: Some((-7, 5)),
+                    output_start: -6,
+                    output_end: -2,
                 },
             ]
         );
         // A duplicate CommandEnd (a second integration layer echoing the
         // marks) has no pending CommandStart and must be dropped.
         let dup = [
-            (E::PromptStart, -5, None),
-            (E::CommandStart, -5, None),
-            (E::CommandEnd(Some(0)), -4, Some(ms(90))),
-            (E::CommandEnd(Some(0)), -4, None),
+            (E::PromptStart, -5, 0, None),
+            (E::CommandStart, -5, 0, None),
+            (E::CommandEnd(Some(0)), -4, 0, Some(ms(90))),
+            (E::CommandEnd(Some(0)), -4, 0, None),
         ];
         assert_eq!(pair_decorations(&dup).len(), 1);
         // A command still running (no CommandEnd yet) has no record.
-        let running = [(E::PromptStart, 0, None), (E::CommandStart, 0, None)];
+        let running = [(E::PromptStart, 0, 0, None), (E::CommandStart, 0, 0, None)];
         assert!(pair_decorations(&running).is_empty());
+    }
+
+    #[test]
+    fn command_output_and_input_extract_and_select() {
+        // Copy Output / Re-run Command need the exact spans back out of the
+        // grid: the typed command (from the PromptEnd cell) and the output
+        // rows between CommandStart and CommandEnd. Selecting the output
+        // highlights precisely those rows.
+        let tmp = tempfile::tempdir().unwrap();
+        let script = "printf '\\033]133;A\\007$ \\033]133;B\\007cmd --flag\\n\\033]133;C\\007out1\\nout2\\n\\033]133;D;0\\007'";
+        let mut term =
+            PtyTerminal::new_running("/bin/sh", &[String::from("-c"), script.into()], tmp.path())
+                .unwrap();
+        let mut waited = 0u32;
+        while term.command_decorations().is_empty() {
+            assert!(
+                waited < 8000,
+                "no decoration; marks: {:?}",
+                term.command_marks()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            waited += 40;
+        }
+        let deco = term.command_decorations()[0];
+        assert_eq!(term.command_input_text(&deco), "cmd --flag");
+        assert_eq!(term.command_output_text(&deco), "out1\nout2");
+        term.select_command_output(&deco);
+        let sel = term.selection().expect("output must be selected");
+        let (sr, _, er, _) = sel.normalised();
+        assert_eq!(
+            (sr, er),
+            (deco.output_start, deco.output_end - 1),
+            "selection covers exactly the output rows"
+        );
+        assert_eq!(term.selection_text(), "out1\nout2");
     }
 
     #[test]

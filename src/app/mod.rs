@@ -1021,6 +1021,13 @@ enum MenuAction {
     /// Terminal pane right-click: maximize the pane at `idx` across the
     /// panel (or restore the even split when already maximized).
     ToggleMaximizeTerminal(usize),
+    /// Command decoration menu: copy the command's output span to the
+    /// clipboard (pane `idx`, the clicked decoration embedded).
+    CopyCommandOutput(usize, crate::widgets::terminal::CommandDecoration),
+    /// Command decoration menu: select the command's output span in the pane.
+    SelectCommandOutput(usize, crate::widgets::terminal::CommandDecoration),
+    /// Command decoration menu: type the command at the shell again.
+    RerunCommand(usize, crate::widgets::terminal::CommandDecoration),
     /// Terminal profile dropdown (`⌄`): open a new pane running this shell path.
     NewTerminalWithProfile(String),
     /// Minimap right-click menu: show/hide the editor minimap.
@@ -1094,6 +1101,9 @@ fn shortcut_for(action: &MenuAction) -> Option<&'static str> {
         MenuAction::RenameTerminal(_) => Some("⌘K R"),
         MenuAction::ClearTerminal(_) => Some("⌘K K"),
         MenuAction::ToggleMaximizeTerminal(_) => Some("⌘K M"),
+        MenuAction::CopyCommandOutput(..) => Some("⌘K ⇧C"),
+        MenuAction::SelectCommandOutput(..) => Some("⌘K ⇧S"),
+        MenuAction::RerunCommand(..) => Some("⌘K ⇧R"),
         _ => None,
     }
 }
@@ -10993,7 +11003,28 @@ impl App {
     /// key (e.g. `Cmd+K Cmd+T`) is accepted but not required.
     fn handle_cmd_k_chord(&mut self, key: KeyEvent) -> bool {
         let plain = !key.modifiers.contains(KeyModifiers::ALT);
+        let shifted = key.modifiers.contains(KeyModifiers::SHIFT);
         match key.code {
+            // Cmd+K ⇧C / ⇧S / ⇧R with the terminal focused: the keyboard
+            // forms of the decoration-menu actions, applied to the LAST
+            // finished command (VS Code's copyLastCommandOutput family).
+            // Must precede the case-insensitive C/S/R editor arms below.
+            KeyCode::Char('C' | 'S' | 'R') if shifted && plain && self.focus == Pane::Terminal => {
+                let KeyCode::Char(c) = key.code else {
+                    return false;
+                };
+                let Some(d) = self.last_command_decoration() else {
+                    self.status = String::from("No finished commands yet");
+                    return true;
+                };
+                let idx = self.active_terminal;
+                match c {
+                    'C' => self.copy_command_output(idx, d),
+                    'S' => self.select_command_output(idx, d),
+                    _ => self.rerun_command(idx, d),
+                }
+                true
+            }
             // Cmd+K Cmd+T / Cmd+K T: open the Color Theme picker.
             KeyCode::Char(c) if plain && c.eq_ignore_ascii_case(&'t') => {
                 self.open_theme_picker();
@@ -17318,6 +17349,99 @@ impl App {
         self.terminal_mut().scroll_line_to_top(target);
     }
 
+    /// The most recent finished command in the active pane, for the
+    /// `⌘K ⇧C`/`⇧S`/`⇧R` keyboard forms of the decoration-menu actions.
+    fn last_command_decoration(&self) -> Option<crate::widgets::terminal::CommandDecoration> {
+        self.terminal().command_decorations().last().copied()
+    }
+
+    fn copy_command_output(&mut self, idx: usize, d: crate::widgets::terminal::CommandDecoration) {
+        let Some(t) = self.terminals.get(idx) else {
+            return;
+        };
+        let text = t.command_output_text(&d);
+        if text.is_empty() {
+            self.status = String::from("Command produced no output");
+            return;
+        }
+        let lines = text.lines().count();
+        copy_to_clipboard(&text);
+        self.status = if lines == 1 {
+            String::from("Copied command output (1 line)")
+        } else {
+            format!("Copied command output ({lines} lines)")
+        };
+    }
+
+    fn select_command_output(
+        &mut self,
+        idx: usize,
+        d: crate::widgets::terminal::CommandDecoration,
+    ) {
+        let Some(t) = self.terminals.get_mut(idx) else {
+            return;
+        };
+        t.select_command_output(&d);
+        self.status = String::from(if t.selection().is_some_and(|s| s.has_area()) {
+            "Command output selected"
+        } else {
+            "Command produced no output"
+        });
+    }
+
+    fn rerun_command(&mut self, idx: usize, d: crate::widgets::terminal::CommandDecoration) {
+        let Some(t) = self.terminals.get(idx) else {
+            return;
+        };
+        let cmd = t.command_input_text(&d);
+        if cmd.is_empty() {
+            self.status = String::from("No command text recorded at that prompt");
+            return;
+        }
+        self.terminals[idx].write_input(format!("{cmd}\r").as_bytes());
+        self.status = format!("Re-running: {cmd}");
+    }
+
+    /// The context menu a click on a command decoration dot opens: a header
+    /// with the outcome, then the VS Code decoration actions.
+    fn open_command_decoration_menu(
+        &mut self,
+        origin: (u16, u16),
+        d: crate::widgets::terminal::CommandDecoration,
+    ) {
+        let idx = self.active_terminal;
+        let code = d.exit.map_or_else(|| String::from("?"), |c| c.to_string());
+        let header = match d.duration {
+            Some(dur) => format!(
+                "exit {code} in {}",
+                crate::widgets::terminal::human_duration(dur)
+            ),
+            None => format!("exit {code}"),
+        };
+        self.context_menu = Some(ContextMenu {
+            origin,
+            items: vec![
+                MenuEntry::header(header),
+                MenuEntry::Item {
+                    label: String::from("Copy Output"),
+                    action: MenuAction::CopyCommandOutput(idx, d),
+                },
+                MenuEntry::Item {
+                    label: String::from("Select Output"),
+                    action: MenuAction::SelectCommandOutput(idx, d),
+                },
+                MenuEntry::Item {
+                    label: String::from("Re-run Command"),
+                    action: MenuAction::RerunCommand(idx, d),
+                },
+            ],
+            selected: 1,
+            open_submenu: None,
+            submenu_selected: 0,
+            target_dir: self.tree.root.clone(),
+        });
+    }
+
     fn drain_ports_and_poll(&mut self) -> bool {
         let mut changed = false;
         if self
@@ -21765,16 +21889,10 @@ impl App {
                     }
                     self.focus_pane(Pane::Terminal);
                     // Click on a gutter decoration dot (the pane's left
-                    // border): surface that command's outcome.
+                    // border): open the command's action menu (VS Code's
+                    // decoration menu), headed by its outcome.
                     if let Some(d) = self.terminal().decoration_at_screen(m.column, m.row) {
-                        let code = d.exit.map_or_else(|| String::from("?"), |c| c.to_string());
-                        self.status = match d.duration {
-                            Some(dur) => format!(
-                                "Command finished: exit {code} in {}",
-                                crate::widgets::terminal::human_duration(dur)
-                            ),
-                            None => format!("Command finished: exit {code}"),
-                        };
+                        self.open_command_decoration_menu((m.column, m.row), d);
                         return;
                     }
                     // Cmd/Ctrl+click on a printed URL opens it (forwarding a
@@ -23038,6 +23156,9 @@ impl App {
             MenuAction::ToggleZenMode => self.toggle_zen_mode(),
             MenuAction::RenameTerminal(idx) => self.begin_rename_terminal(idx),
             MenuAction::ClearTerminal(idx) => self.clear_terminal_at(idx),
+            MenuAction::CopyCommandOutput(idx, d) => self.copy_command_output(idx, d),
+            MenuAction::SelectCommandOutput(idx, d) => self.select_command_output(idx, d),
+            MenuAction::RerunCommand(idx, d) => self.rerun_command(idx, d),
             MenuAction::ToggleMaximizeTerminal(idx) => {
                 if !self.terminal_pane_maximized {
                     self.active_terminal = idx;

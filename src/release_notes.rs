@@ -59,13 +59,7 @@ pub struct ReleaseNote {
 }
 
 /// What shipped in the current release. Replace on every version bump.
-pub const RELEASE_NOTES: &[ReleaseNote] = &[
-    ReleaseNote {
-        kind: NoteKind::Feature,
-        summary: "Command decorations in the terminal: every finished command gets a VS Code-style dot on the pane's left border, blue for success and red for failure; click it to see the exit code and how long the command ran.",
-    },
-    ReleaseNote {
-        kind: NoteKind::Feature,
-        summary: "Long-command completion notices: a command that ran over 10s and finishes in a pane you are not focused on announces its exit code and duration in the status bar.",
-    },
-];
+pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
+    kind: NoteKind::Feature,
+    summary: "The terminal's command decoration dots grew a menu: click one for Copy Output, Select Output, and Re-run Command, headed by the exit code and runtime; Cmd+K Shift+C / Shift+S / Shift+R apply the same actions to the last finished command from the keyboard.",
+}];
