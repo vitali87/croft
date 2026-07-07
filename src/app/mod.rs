@@ -17355,6 +17355,23 @@ impl App {
         self.terminal().command_decorations().last().copied()
     }
 
+    /// The command decoration dot under the pointer, when the panel shows
+    /// the terminal. Used both to open the decoration menu and to exempt
+    /// dot cells from the resize-seam grab zones they can overlap.
+    fn decoration_dot_at(
+        &self,
+        col: u16,
+        row: u16,
+    ) -> Option<(usize, crate::widgets::terminal::CommandDecoration)> {
+        if !self.show_terminal || self.bottom_panel_tab != BottomPanelTab::Terminal {
+            return None;
+        }
+        let idx = self.terminal_at_pos(col, row)?;
+        self.terminals[idx]
+            .decoration_at_screen(col, row)
+            .map(|d| (idx, d))
+    }
+
     fn copy_command_output(&mut self, idx: usize, d: crate::widgets::terminal::CommandDecoration) {
         let Some(t) = self.terminals.get(idx) else {
             return;
@@ -21059,8 +21076,14 @@ impl App {
                     // this zone. Exempt that column when it's the outline bar so
                     // the press reaches the scrollbar handler below instead of
                     // being swallowed as a resize.
+                    //
+                    // Likewise a lone terminal pane's left border shares this
+                    // column, and its command decoration dots live there: a
+                    // press on a dot cell must reach the decoration handler,
+                    // not start a resize (the rest of the column still drags).
                     if (m.column == x || m.column == x.saturating_sub(1))
                         && !rect_contains(self.outline.last_scrollbar, m.column, m.row)
+                        && self.decoration_dot_at(m.column, m.row).is_none()
                     {
                         self.splitter_drag = Some(SplitterDrag::Sidebar);
                         return;

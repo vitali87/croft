@@ -60,6 +60,6 @@ pub struct ReleaseNote {
 
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
-    kind: NoteKind::Feature,
-    summary: "The terminal's command decoration dots grew a menu: click one for Copy Output, Select Output, and Re-run Command, headed by the exit code and runtime; Cmd+K Shift+C / Shift+S / Shift+R apply the same actions to the last finished command from the keyboard.",
+    kind: NoteKind::Fix,
+    summary: "Command decoration dots are now actually clickable on a lone terminal pane: its left border sits in the sidebar resize seam's grab zone, which swallowed the press as a resize drag before the decoration menu could open.",
 }];

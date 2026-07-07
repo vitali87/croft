@@ -777,6 +777,59 @@ fn outline_scrollbar_drag_is_not_hijacked_by_the_sidebar_splitter() {
 }
 
 #[test]
+fn terminal_decoration_dot_click_is_not_hijacked_by_the_sidebar_splitter() {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    // A pane whose script emits the OSC 133 protocol, so a decoration dot
+    // lands on its left border.
+    let script = "printf '\\033]133;A\\007$ \\033]133;B\\007cmd\\n\\033]133;C\\007out\\n\\033]133;D;0\\007'; sleep 30";
+    app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
+        "/bin/sh",
+        &[String::from("-c"), script.into()],
+        tmp.path(),
+    )
+    .unwrap();
+    let mut waited = 0u32;
+    while app.terminals[0].command_decorations().is_empty() {
+        assert!(waited < 8000, "no decoration mark arrived");
+        std::thread::sleep(std::time::Duration::from_millis(40));
+        waited += 40;
+    }
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|frame| app.render(frame)).unwrap();
+    let deco = app.terminals[0].command_decorations()[0];
+    let pane = app.terminals[0].last_area;
+    let inner_y = app.terminals[0].last_inner.y;
+    let (col, row) = (pane.x, inner_y + u16::try_from(deco.line).unwrap());
+    assert_eq!(
+        app.terminals[0].decoration_at_screen(col, row),
+        Some(deco),
+        "the dot cell must hit-test to the decoration"
+    );
+    // The regression: a lone pane's left border sits exactly in the sidebar
+    // splitter's two-column grab zone, which used to swallow the click as a
+    // resize drag before the decoration handler could see it.
+    let x = app
+        .sidebar_splitter_x
+        .expect("sidebar shown, so the splitter seam exists");
+    assert!(
+        col == x || col == x.saturating_sub(1),
+        "the dot column ({col}) must lie in the splitter grab zone ({x})"
+    );
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), col, row));
+    assert!(
+        app.splitter_drag.is_none(),
+        "pressing a decoration dot must not start a sidebar resize"
+    );
+    assert!(
+        app.context_menu.is_some(),
+        "pressing a decoration dot must open the command's action menu"
+    );
+}
+
+#[test]
 fn tap_in_the_editor_arms_the_hover_dwell_and_release_keeps_it_armed() {
     use crossterm::event::{MouseButton, MouseEventKind};
     let (mut app, _tmp, col, row) = app_with_open_file_and_editor_cell();
