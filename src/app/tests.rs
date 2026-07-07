@@ -1324,6 +1324,288 @@ fn cmd_opt_up_parks_the_previous_prompt_mark_at_the_viewport_top() {
 }
 
 #[test]
+fn ctrl_shift_space_quick_select_labels_matches_and_a_label_commits() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    // A pane that prints two matchable strings, bottom-most last, and stays
+    // alive so the grid does not vanish under the test.
+    let script = "echo see-https://example.com/quick; echo sha de40bdf12ab34; sleep 60";
+    app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
+        "/bin/sh",
+        &[String::from("-c"), String::from(script)],
+        tmp.path(),
+    )
+    .unwrap();
+    // The run-label header (`▶ /bin/sh -c echo …`) also contains both
+    // sentinels, so wait until the SHA shows up on its own echoed row too
+    // (a second occurrence); otherwise quick-select can open on a
+    // header-only viewport and the hint set is timing-dependent.
+    let mut waited = 0u32;
+    while app.terminals[0]
+        .grid_lines()
+        .0
+        .iter()
+        .filter(|l| l.contains("de40bdf12ab34"))
+        .count()
+        < 2
+    {
+        assert!(waited < 4000, "output never arrived");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        waited += 20;
+    }
+    app.focus_pane(Pane::Terminal);
+    assert!(app.terminal_quick_select.is_none(), "starts off");
+
+    app.handle_terminal_key(key(
+        KeyCode::Char(' '),
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+    ));
+    let state = app
+        .terminal_quick_select
+        .as_ref()
+        .expect("Ctrl+Shift+Space must enter quick-select");
+    assert!(
+        state
+            .hints
+            .iter()
+            .any(|h| h.text == "https://example.com/quick"),
+        "the URL must be labelled"
+    );
+    // The echoed SHA is the bottom-most match on screen, so it gets the
+    // cheapest label (WezTerm / tmux-thumbs assignment order).
+    let sha = state.hints.last().expect("hints must not be empty");
+    assert_eq!(
+        (sha.text.as_str(), sha.label.as_str()),
+        ("de40bdf12ab34", "a"),
+        "the bottom-most match gets the cheapest label; hints were: {:?}",
+        state
+            .hints
+            .iter()
+            .map(|h| (h.line, h.text.as_str(), h.label.as_str()))
+            .collect::<Vec<_>>()
+    );
+
+    // Esc cancels without touching anything.
+    app.handle_terminal_key(key(KeyCode::Esc, KeyModifiers::NONE));
+    assert!(app.terminal_quick_select.is_none(), "Esc must cancel");
+
+    // Re-enter and commit the SHA's label: copies and closes the mode.
+    app.handle_terminal_key(key(
+        KeyCode::Char(' '),
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+    ));
+    let label = app
+        .terminal_quick_select
+        .as_ref()
+        .unwrap()
+        .hints
+        .iter()
+        .find(|h| h.text == "de40bdf12ab34")
+        .unwrap()
+        .label
+        .clone();
+    for c in label.chars() {
+        app.handle_terminal_key(key(KeyCode::Char(c), KeyModifiers::NONE));
+    }
+    assert!(
+        app.terminal_quick_select.is_none(),
+        "committing a label must close quick-select"
+    );
+    assert!(
+        app.status.contains("Copied"),
+        "commit must report the copy, status was: {}",
+        app.status
+    );
+}
+
+#[test]
+fn quick_select_paints_gold_labels_and_broadcast_paints_modal_and_pills() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let script = "echo grab https://example.com/paint; sleep 60";
+    app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
+        "/bin/sh",
+        &[String::from("-c"), String::from(script)],
+        tmp.path(),
+    )
+    .unwrap();
+    let mut waited = 0u32;
+    while app.terminals[0]
+        .grid_lines()
+        .0
+        .iter()
+        .filter(|l| l.contains("example.com/paint"))
+        .count()
+        < 2
+    {
+        assert!(waited < 4000, "output never arrived");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        waited += 20;
+    }
+    app.focus_pane(Pane::Terminal);
+    // Render once BEFORE opening quick select: the first render resizes the
+    // pane to its layout size (reflowing the grid), and hints must be
+    // computed against the geometry they will be painted in.
+    let backend = ratatui::backend::TestBackend::new(140, 50);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    app.handle_terminal_key(key(
+        KeyCode::Char(' '),
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+    ));
+    assert!(app.terminal_quick_select.is_some());
+    term.draw(|f| app.render(f)).unwrap();
+    let buf = term.backend().buffer();
+    let gold = Color::Rgb(0xff, 0xd7, 0x4a);
+    let label_cell = (0..buf.area.height)
+        .flat_map(|y| (0..buf.area.width).map(move |x| (x, y)))
+        .find(|&(x, y)| buf[(x, y)].bg == gold && buf[(x, y)].fg == Color::Black);
+    assert!(
+        label_cell.is_some(),
+        "a quick-select label must paint black-on-gold somewhere in the pane"
+    );
+    app.handle_terminal_key(key(KeyCode::Esc, KeyModifiers::NONE));
+
+    // Broadcast: the enable confirm modal paints its red title, and once
+    // confirmed every receiving pane's name pill carries the ⇶ marker.
+    app.terminals.push(
+        crate::widgets::terminal::PtyTerminal::new_running(
+            "/bin/sh",
+            &[String::from("-c"), String::from("sleep 60")],
+            tmp.path(),
+        )
+        .unwrap(),
+    );
+    assert!(app.handle_cmd_k_chord(key(KeyCode::Char('i'), KeyModifiers::NONE)));
+    fn screen_rows(term: &ratatui::Terminal<ratatui::backend::TestBackend>) -> Vec<String> {
+        let buf = term.backend().buffer();
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().chars().next().unwrap_or(' '))
+                    .collect()
+            })
+            .collect()
+    }
+    term.draw(|f| app.render(f)).unwrap();
+    assert!(
+        screen_rows(&term)
+            .iter()
+            .any(|r| r.contains("BROADCAST INPUT TO ALL PANES?")),
+        "the confirm modal must be painted while pending"
+    );
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let marks = screen_rows(&term)
+        .iter()
+        .map(|r| r.matches('\u{21f6}').count())
+        .sum::<usize>();
+    assert_eq!(
+        marks, 2,
+        "both receiving panes must wear the ⇶ broadcast pill"
+    );
+}
+
+#[test]
+fn cmd_k_i_broadcasts_input_to_every_pane_with_confirm_and_auto_off() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let mk = || {
+        crate::widgets::terminal::PtyTerminal::new_running(
+            "/bin/sh",
+            &[
+                String::from("-c"),
+                String::from("read x; echo got-$x; sleep 30"),
+            ],
+            tmp.path(),
+        )
+        .unwrap()
+    };
+    app.terminals[0] = mk();
+    app.terminals.push(mk());
+    app.active_terminal = 0;
+    app.focus_pane(Pane::Terminal);
+
+    // Cmd+K I asks for confirmation first (the classic multi-pane footgun
+    // is typing a destructive command into panes you forgot were listening).
+    assert!(app.handle_cmd_k_chord(key(KeyCode::Char('i'), KeyModifiers::NONE)));
+    assert!(
+        app.pending_broadcast_enable,
+        "enabling broadcast must be gated on a confirm popup"
+    );
+    assert!(!app.broadcast_input);
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.broadcast_input, "Enter must confirm");
+    assert!(!app.pending_broadcast_enable);
+
+    // Typed keys now reach every pane: both shells read the same line.
+    for c in ['h', 'i'] {
+        app.handle_terminal_key(key(KeyCode::Char(c), KeyModifiers::NONE));
+    }
+    app.handle_terminal_key(key(KeyCode::Enter, KeyModifiers::NONE));
+    let mut waited = 0u32;
+    while !app
+        .terminals
+        .iter()
+        .all(|t| t.grid_lines().0.iter().any(|l| l.contains("got-hi")))
+    {
+        assert!(waited < 8000, "broadcast input never reached every pane");
+        std::thread::sleep(std::time::Duration::from_millis(40));
+        waited += 40;
+    }
+
+    // Cmd+K Shift+I toggles the active pane out of the broadcast set.
+    assert!(app.handle_cmd_k_chord(key(KeyCode::Char('I'), KeyModifiers::SHIFT)));
+    assert!(app.terminals[0].broadcast_excluded);
+
+    // Closing down to one pane drops broadcast (safety: never keep
+    // broadcasting silently to a shrunk set).
+    assert!(app.close_active_terminal());
+    assert!(
+        !app.broadcast_input,
+        "broadcast must switch off when only one pane remains"
+    );
+}
+
+#[test]
+fn trigger_hits_surface_in_the_status_bar_via_the_drain_tick() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.triggers = std::sync::Arc::new(crate::triggers::TriggerSet::from_json(
+        r#"[ { "regex": "BUILD (\\w+)", "action": "notify", "message": "build: \\1" } ]"#,
+    ));
+    // The shell waits for input so the drain tick has pushed the trigger set
+    // into the pane before the matching line is produced.
+    let script = "read x; echo BUILD OK; sleep 30";
+    app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
+        "/bin/sh",
+        &[String::from("-c"), String::from(script)],
+        tmp.path(),
+    )
+    .unwrap();
+    app.drain_terminal_bells();
+    app.terminals[0].write_input(b"\n");
+    let mut waited = 0u32;
+    while !app.status.starts_with("Trigger in") {
+        app.drain_terminal_bells();
+        assert!(
+            waited < 8000,
+            "trigger never surfaced, status: {}",
+            app.status
+        );
+        std::thread::sleep(std::time::Duration::from_millis(40));
+        waited += 40;
+    }
+    assert!(
+        app.status.contains("build: OK"),
+        "interpolated message expected, status: {}",
+        app.status
+    );
+}
+
+#[test]
 fn leaving_the_terminal_closes_its_find_bar() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();

@@ -190,6 +190,10 @@ pub struct PtyTerminal {
     /// listener instance through every `resize` call.
     size_shared: Arc<std::sync::Mutex<(u16, u16)>>,
     pub focused: bool,
+    /// While broadcast input is on, an excluded pane stops receiving the
+    /// mirrored keystrokes (it still gets its own input when focused).
+    /// Toggled per pane with Cmd+K Shift+I; session-scoped.
+    pub broadcast_excluded: bool,
     /// When focused, draw the orange→green gradient border (Black theme)
     /// instead of the solid blue one. Set by the app's focus/theme sync.
     pub focus_gradient: bool,
@@ -228,6 +232,32 @@ pub struct PtyTerminal {
     /// Finished commands (exit, duration) from the reader thread, awaiting
     /// the app's drain for long-command notifications.
     finished_rx: std::sync::mpsc::Receiver<(Option<i32>, std::time::Duration)>,
+    /// Quick-select hint spans pushed down by the app while hint mode is
+    /// active; the render loop paints the match spans and overlays each
+    /// label. `None` when quick-select is off.
+    hints: Option<Vec<HintSpan>>,
+    /// The user's trigger set, shared with the reader thread (which scans
+    /// completed lines for notify/bell firings) and read by the render loop
+    /// (which paints highlight-trigger matches). The inner Arc is swapped by
+    /// [`Self::set_triggers`] on startup and config reload.
+    triggers: Arc<std::sync::Mutex<std::sync::Arc<crate::triggers::TriggerSet>>>,
+    /// Notify/bell trigger firings from the reader thread, awaiting the
+    /// app's drain into the status bar.
+    trigger_rx: std::sync::mpsc::Receiver<crate::triggers::TriggerHit>,
+}
+
+/// One quick-select hint for the render loop: the match span on absolute
+/// grid line `line` (char indices into the spacer-skipped row text; the
+/// colmap translates back to grid columns), the label overlaid at its start,
+/// and how many label chars the user has already typed (those are consumed,
+/// only the remainder renders).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HintSpan {
+    pub line: i32,
+    pub start: usize,
+    pub len: usize,
+    pub label: String,
+    pub typed: usize,
 }
 
 /// One OSC 133 mark at its recording-time position. `line_rec` is the grid
@@ -637,6 +667,53 @@ impl PtyTerminal {
         self.pty_dirty.store(true, Ordering::Release);
     }
 
+    /// Set (or clear) the quick-select hint overlay. The app owns hint-mode
+    /// state and re-pushes the filtered set as the user types label chars.
+    pub fn set_hints(&mut self, hints: Option<Vec<HintSpan>>) {
+        self.hints = hints;
+        self.pty_dirty.store(true, Ordering::Release);
+    }
+
+    /// The visible viewport rows as spacer-skipped plain text, paired with
+    /// the absolute grid line of the first row (`-display_offset`).
+    /// Quick-select scans exactly what is on screen — labels the user cannot
+    /// see cannot be typed.
+    pub fn visible_lines(&self) -> (Vec<String>, i32) {
+        let term = self.term.lock();
+        if term.columns() == 0 {
+            return (Vec::new(), 0);
+        }
+        let off = term.grid().display_offset() as i32;
+        let rows = term.screen_lines() as i32;
+        let mut lines = Vec::new();
+        for l in -off..rows - off {
+            let (s, _cols) = row_text_and_cols(&term, l);
+            lines.push(s.trim_end().to_string());
+        }
+        (lines, -off)
+    }
+
+    /// Swap in a new trigger set. The app calls this for every pane on every
+    /// drain tick (so a pane is covered no matter where it was created); the
+    /// ptr-eq check makes the steady state a cheap no-op that never dirties
+    /// the pane. The reader thread picks a new set up on its next chunk; the
+    /// render loop on its next frame.
+    pub fn set_triggers(&self, set: std::sync::Arc<crate::triggers::TriggerSet>) {
+        let mut cur = self.triggers.lock().unwrap();
+        if std::sync::Arc::ptr_eq(&cur, &set) {
+            return;
+        }
+        *cur = set;
+        drop(cur);
+        self.pty_dirty.store(true, Ordering::Release);
+    }
+
+    /// Notify/bell trigger firings recorded by the reader thread since the
+    /// last drain.
+    pub fn drain_trigger_hits(&self) -> Vec<crate::triggers::TriggerHit> {
+        self.trigger_rx.try_iter().collect()
+    }
+
     /// Scroll the viewport so absolute grid line `abs_line` sits near the
     /// middle of the pane, clamped to the scrollback range. No-op in
     /// alternate screen, where there is no scrollback to move through and the
@@ -739,11 +816,20 @@ impl PtyTerminal {
         let osc7_for_thread = osc7_cwd.clone();
         let notifications = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let notifications_for_thread = notifications.clone();
+        // Trigger set shared with the reader thread; the inner Arc is swapped
+        // by `set_triggers` on startup / config reload, picked up per chunk.
+        let triggers = Arc::new(std::sync::Mutex::new(std::sync::Arc::new(
+            crate::triggers::TriggerSet::default(),
+        )));
+        let triggers_for_thread = triggers.clone();
+        let (trigger_tx, trigger_rx) = std::sync::mpsc::channel::<crate::triggers::TriggerHit>();
 
         let reader_thread = std::thread::spawn(move || {
             let mut processor = Processor::<StdSyncHandler>::new();
             let mut port_sniffer = crate::port_detect::PortSniffer::new();
             let mut osc_sniffer = crate::shell_integration::OscSniffer::default();
+            let mut trigger_scanner = crate::triggers::TriggerScanner::new();
+            let mut trigger_hits = Vec::new();
             // Command timing: armed by 133;C, consumed by the next 133;D.
             let mut cmd_start: Option<std::time::Instant> = None;
             let mut buf = [0u8; 65536];
@@ -808,6 +894,17 @@ impl PtyTerminal {
                             }
                         }
                         processor.advance(&mut *t, &buf[done..n]);
+                        // Notify/bell triggers match completed output lines,
+                        // never inside a full-screen app (the alt screen owns
+                        // the bytes; iTerm2 skips those too). Skipped
+                        // entirely when no event trigger is configured.
+                        let trig = triggers_for_thread.lock().unwrap().clone();
+                        if trig.has_events() && !t.mode().contains(TermMode::ALT_SCREEN) {
+                            trigger_scanner.scan(&buf[..n], &trig, &mut trigger_hits);
+                            for h in trigger_hits.drain(..) {
+                                let _ = trigger_tx.send(h);
+                            }
+                        }
                         drop(t);
                         pty_pending_bytes_for_thread.fetch_add(n, Ordering::Relaxed);
                         pty_dirty_for_thread.store(true, Ordering::Release);
@@ -839,6 +936,7 @@ impl PtyTerminal {
             rows,
             size_shared,
             focused: false,
+            broadcast_excluded: false,
             focus_gradient: false,
             last_area: Rect::default(),
             last_inner: Rect::default(),
@@ -853,6 +951,9 @@ impl PtyTerminal {
             osc7_cwd,
             notifications,
             finished_rx,
+            hints: None,
+            triggers,
+            trigger_rx,
         })
     }
 
@@ -1743,6 +1844,8 @@ impl Widget for &mut PtyTerminal {
         // Snapshot before taking the term lock: command_decorations locks
         // the term itself and FairMutex is not reentrant.
         let decorations = self.command_decorations();
+        // Trigger set snapshot for the highlight pass (cheap Arc clone).
+        let trigger_set = self.triggers.lock().unwrap().clone();
 
         let term = self.term.lock();
         let display_offset = term.grid().display_offset();
@@ -1781,11 +1884,55 @@ impl Widget for &mut PtyTerminal {
                 }
                 paint
             });
+            // Quick-select hints on this row: 1 = match span, 2 = label cell
+            // (the char to draw rides in the parallel vec). Char indices go
+            // through the same colmap as the find highlight.
+            let hint_paint: Option<(Vec<u8>, Vec<char>)> = self.hints.as_ref().and_then(|hints| {
+                let row_hints: Vec<&HintSpan> =
+                    hints.iter().filter(|h| h.line == row_line_idx).collect();
+                if row_hints.is_empty() {
+                    return None;
+                }
+                let (_text, colmap) = row_text_and_cols(&term, row_line_idx);
+                let mut span = vec![0u8; cols as usize];
+                let mut label = vec!['\0'; cols as usize];
+                for h in row_hints {
+                    for k in h.start..h.start + h.len {
+                        if let Some(&col) = colmap.get(k) {
+                            span[col] = 1;
+                        }
+                    }
+                    for (j, c) in h.label.chars().skip(h.typed).enumerate() {
+                        if let Some(&col) = colmap.get(h.start + j) {
+                            span[col] = 2;
+                            label[col] = c;
+                        }
+                    }
+                }
+                Some((span, label))
+            });
+            // Trigger highlights on this row: per-cell fg/bg from the first
+            // matching highlight trigger. Painted under the find highlight
+            // and quick-select labels, which both win.
+            let trig_paint: Option<TrigRowPaint> = trigger_set.has_highlights().then(|| {
+                let (text, colmap) = row_text_and_cols(&term, row_line_idx);
+                let mut paint: TrigRowPaint = vec![None; cols as usize];
+                for s in crate::triggers::highlight_spans(&text, &trigger_set) {
+                    let fg = s.fg.map(|(r, g, b)| Color::Rgb(r, g, b));
+                    let bg = s.bg.map(|(r, g, b)| Color::Rgb(r, g, b));
+                    for k in s.start..s.start + s.len {
+                        if let Some(&col) = colmap.get(k) {
+                            paint[col] = Some((fg, bg));
+                        }
+                    }
+                }
+                paint
+            });
             for x in 0..cols {
                 let line_idx = (y as i32) - (display_offset as i32);
                 let p = Point::new(Line(line_idx), Column(x as usize));
                 let cell = &term.grid()[p];
-                let display_char = if cell.c == '\0' { ' ' } else { cell.c };
+                let mut display_char = if cell.c == '\0' { ' ' } else { cell.c };
                 let mut style = Style::default();
                 if let Some(c) = ansi_to_ratatui(cell.fg) {
                     style = style.fg(c);
@@ -1805,6 +1952,19 @@ impl Widget for &mut PtyTerminal {
                 }
                 if flags.contains(Flags::INVERSE) {
                     style = style.add_modifier(Modifier::REVERSED);
+                }
+                // Trigger highlight: the user's per-trigger colours over the
+                // matched span. Cursor / selection / find / quick-select all
+                // paint after this, so they stay visible on top.
+                if let Some(paint) = trig_paint.as_ref()
+                    && let Some(Some((fg, bg))) = paint.get(x as usize)
+                {
+                    if let Some(c) = fg {
+                        style = style.fg(*c);
+                    }
+                    if let Some(c) = bg {
+                        style = style.bg(*c);
+                    }
                 }
                 if cursor_visible
                     && (y as i32) == cursor_row_in_viewport
@@ -1831,6 +1991,30 @@ impl Widget for &mut PtyTerminal {
                             style = style
                                 .fg(Color::Black)
                                 .bg(Color::Rgb(0xff, 0x8c, 0x2a))
+                                .add_modifier(Modifier::BOLD);
+                        }
+                        _ => {}
+                    }
+                }
+                // Quick-select: matched spans turn green, label cells overlay
+                // black-on-gold and replace the glyph underneath (WezTerm's
+                // quick-select colours).
+                if let Some((span, labels)) = hint_paint.as_ref() {
+                    match span.get(x as usize) {
+                        Some(1) => {
+                            style = style
+                                .fg(Color::Rgb(0x66, 0xcc, 0x66))
+                                .add_modifier(Modifier::BOLD);
+                        }
+                        Some(2) => {
+                            if let Some(&lc) = labels.get(x as usize)
+                                && lc != '\0'
+                            {
+                                display_char = lc;
+                            }
+                            style = Style::default()
+                                .fg(Color::Black)
+                                .bg(Color::Rgb(0xff, 0xd7, 0x4a))
                                 .add_modifier(Modifier::BOLD);
                         }
                         _ => {}
@@ -1865,6 +2049,11 @@ impl Widget for &mut PtyTerminal {
         }
     }
 }
+
+/// Per-cell trigger-highlight paint for one row: `None` = cell untouched,
+/// `Some((fg, bg))` = the matching trigger's colours (either side optional,
+/// leaving that half of the cell style alone).
+type TrigRowPaint = Vec<Option<(Option<Color>, Option<Color>)>>;
 
 /// The display offset that brings absolute grid line `abs_line` to the
 /// vertical middle of a `rows`-tall viewport, clamped to `[0, max_off]` (0 =
@@ -2448,6 +2637,36 @@ mod tests {
             term.drain_notifications().is_empty(),
             "a second drain returns nothing"
         );
+    }
+
+    #[test]
+    fn notify_triggers_fire_on_completed_output_lines() {
+        let tmp = tempfile::tempdir().unwrap();
+        // The shell waits for a line of input, so the trigger set is in
+        // place before the matching output is ever produced.
+        let script = "read x; echo deploy failed; sleep 30";
+        let mut term =
+            PtyTerminal::new_running("/bin/sh", &[String::from("-c"), script.into()], tmp.path())
+                .unwrap();
+        let set = crate::triggers::TriggerSet::from_json(
+            r#"[ { "regex": "deploy (\\w+)", "action": "notify", "message": "deploy went \\1" } ]"#,
+        );
+        assert!(set.has_events());
+        term.set_triggers(std::sync::Arc::new(set));
+        term.write_input(b"\n");
+        let mut waited = 0u32;
+        let hits = loop {
+            let hits = term.drain_trigger_hits();
+            if !hits.is_empty() {
+                break hits;
+            }
+            assert!(waited < 8000, "trigger never fired");
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            waited += 40;
+        };
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].action, crate::triggers::TriggerAction::Notify);
+        assert_eq!(hits[0].message, "deploy went failed");
     }
 
     #[test]

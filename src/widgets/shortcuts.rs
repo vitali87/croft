@@ -822,6 +822,21 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 handler: "",
             },
             ShortcutEntry {
+                keys: "Ctrl+Shift+Space",
+                description: "Quick select: label every URL / path / hash / IP on screen; type a label to copy it (UPPERCASE pastes), Esc cancels",
+                handler: "is_quick_select_key",
+            },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+K I",
+                description: "Toggle broadcast input: keystrokes and pastes go to every pane at once (confirm gate; red ⇶ pills mark receiving panes)",
+                handler: "",
+            },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+K Shift+I",
+                description: "Exclude / include the active pane from receiving broadcast input",
+                handler: "",
+            },
+            ShortcutEntry {
                 keys: "Cmd+V / Ctrl+V",
                 description: "Paste local clipboard into the shell",
                 handler: "is_clipboard_paste_key",

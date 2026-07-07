@@ -62,10 +62,14 @@ pub struct ReleaseNote {
 pub const RELEASE_NOTES: &[ReleaseNote] = &[
     ReleaseNote {
         kind: NoteKind::Feature,
-        summary: "Shell integration now covers bash and fish, not just zsh: bash 4.4+ gets the ENV + --posix bootstrap kitty and Ghostty use (your real startup files replayed unchanged), fish rides its native fish 4 prompt marks via a vendor_conf.d hand-off, and both gain the full command model in the terminal: gutter decoration dots, exit codes, runtimes, prompt jumps, cwd-inheriting splits, and long-command notices.",
+        summary: "Quick select in the terminal (Ctrl+Shift+Space, WezTerm's hint mode): every URL, path (incl. path:line:col), git SHA, UUID, IP, hex value, and long number on screen gets a short home-row label; type it to copy the match, type it in UPPERCASE to paste it straight into the shell, Esc cancels.",
     },
     ReleaseNote {
-        kind: NoteKind::Fix,
-        summary: "zsh panes now mark where your typed command starts (OSC 133;B), so Copy Output and Re-run Command work standalone, without another terminal's integration chained in; previously they only worked when Ghostty's hooks happened to supply the mark.",
+        kind: NoteKind::Feature,
+        summary: "iTerm2-style triggers: regexes in ~/.config/croft/triggers.json watch terminal output and highlight matches live in your colours (scrollback included), post status-bar notices with capture-group interpolation, or ring a bell notice; edit via the palette's \"Open Terminal Triggers (JSON)\", applied on save.",
+    },
+    ReleaseNote {
+        kind: NoteKind::Feature,
+        summary: "Broadcast input (Cmd+K I, like iTerm2's Cmd+Opt+I): type and paste into every terminal pane at once for multi-server work, gated behind a confirm popup, with red \u{21f6} name pills marking every receiving pane, per-pane exclusion on Cmd+K Shift+I, and automatic shut-off when only one pane remains.",
     },
 ];

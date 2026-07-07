@@ -1021,6 +1021,14 @@ enum MenuAction {
     /// Terminal pane right-click: maximize the pane at `idx` across the
     /// panel (or restore the even split when already maximized).
     ToggleMaximizeTerminal(usize),
+    /// Terminal pane right-click: enter quick-select hint mode on the pane.
+    TerminalQuickSelect,
+    /// Terminal pane right-click: toggle broadcast input (keystrokes go to
+    /// every pane at once; enabling routes through the confirm popup).
+    ToggleBroadcastInput,
+    /// Terminal pane right-click while broadcasting: toggle whether the
+    /// active pane receives the mirrored input.
+    ToggleBroadcastExclusion,
     /// Command decoration menu: copy the command's output span to the
     /// clipboard (pane `idx`, the clicked decoration embedded).
     CopyCommandOutput(usize, crate::widgets::terminal::CommandDecoration),
@@ -1101,6 +1109,9 @@ fn shortcut_for(action: &MenuAction) -> Option<&'static str> {
         MenuAction::RenameTerminal(_) => Some("⌘K R"),
         MenuAction::ClearTerminal(_) => Some("⌘K K"),
         MenuAction::ToggleMaximizeTerminal(_) => Some("⌘K M"),
+        MenuAction::TerminalQuickSelect => Some("⌃⇧Space"),
+        MenuAction::ToggleBroadcastInput => Some("⌘K I"),
+        MenuAction::ToggleBroadcastExclusion => Some("⌘K ⇧I"),
         MenuAction::CopyCommandOutput(..) => Some("⌘K ⇧C"),
         MenuAction::SelectCommandOutput(..) => Some("⌘K ⇧S"),
         MenuAction::RerunCommand(..) => Some("⌘K ⇧R"),
@@ -1732,6 +1743,28 @@ struct TerminalSelectAutoScroll {
     last: std::time::Instant,
 }
 
+/// Active quick-select session on the focused terminal pane: the labelled
+/// matches overlaid on the viewport, the label prefix typed so far, and
+/// whether any typed char was UPPERCASE (commit then pastes the match into
+/// the shell as well as copying it, WezTerm's convention).
+pub struct QuickSelectState {
+    hints: Vec<QuickHint>,
+    typed: String,
+    shifted: bool,
+}
+
+/// One labelled quick-select match: where it sits (absolute grid line plus
+/// char span in the spacer-skipped row text), the text a committed label
+/// copies, and the label itself.
+#[derive(Clone)]
+struct QuickHint {
+    line: i32,
+    start: usize,
+    len: usize,
+    text: String,
+    label: String,
+}
+
 pub struct App {
     pub tree: FileTree,
     pub search: SearchPanel,
@@ -2360,6 +2393,21 @@ pub struct App {
     /// The active terminal-find match as `(abs_grid_line, col, len)`, the
     /// anchor next/prev navigation walks from. None until the first match.
     terminal_find_match: Option<(i32, usize, usize)>,
+    /// Ctrl+Shift+Space quick-select hint mode on the active terminal pane
+    /// (WezTerm's quick-select): every labelled match on the viewport plus
+    /// the label prefix typed so far. None when the mode is off.
+    pub terminal_quick_select: Option<QuickSelectState>,
+    /// The user's terminal trigger set (`triggers.json`), pushed into every
+    /// pane on the drain tick and swapped wholesale on config reload.
+    pub triggers: std::sync::Arc<crate::triggers::TriggerSet>,
+    /// Broadcast input (Cmd+K I, iTerm2's Cmd+Opt+I): while on, shell-bound
+    /// keystrokes and pastes in the terminal go to every pane instead of
+    /// just the focused one. Session-scoped; never persisted.
+    pub broadcast_input: bool,
+    /// True while the "enable broadcast?" confirm popup is up (enabling is
+    /// gated: the classic footgun is typing into panes you forgot were
+    /// listening).
+    pub pending_broadcast_enable: bool,
     /// VS Code-style Cmd+P / Ctrl+P quick-open file finder. None when
     /// the modal is closed.
     pub file_finder: Option<crate::widgets::file_finder::FileFinder>,
@@ -3168,6 +3216,12 @@ impl App {
             editor_find: None,
             terminal_find: None,
             terminal_find_match: None,
+            terminal_quick_select: None,
+            triggers: std::sync::Arc::new(crate::triggers::TriggerSet::load(
+                &crate::triggers::triggers_path(),
+            )),
+            broadcast_input: false,
+            pending_broadcast_enable: false,
             file_finder: None,
             command_palette: None,
             go_to_symbol: None,
@@ -8611,6 +8665,12 @@ impl App {
         // empty, so the split view is the honest state.
         if self.terminals.len() <= 1 {
             self.terminal_pane_maximized = false;
+            // Safety: never keep broadcast armed against a single pane —
+            // the next split would silently start receiving mirrored input.
+            if self.broadcast_input {
+                self.broadcast_input = false;
+                self.status = String::from("Broadcast input off (one pane left)");
+            }
         }
         self.sync_focus_flags();
         true
@@ -8710,6 +8770,88 @@ impl App {
         self.close_terminal_at(self.active_terminal)
     }
 
+    /// Cmd+K I: toggle broadcast input. Turning it ON goes through a confirm
+    /// popup (iTerm2 warns the same way); turning it OFF is immediate.
+    fn toggle_broadcast_input(&mut self) {
+        if self.broadcast_input {
+            self.broadcast_input = false;
+            self.status = String::from("Broadcast input off");
+            return;
+        }
+        if self.terminals.len() < 2 {
+            self.status =
+                String::from("Broadcast input needs at least two terminal panes (Cmd+T splits)");
+            return;
+        }
+        self.pending_broadcast_enable = true;
+    }
+
+    fn confirm_pending_broadcast(&mut self) {
+        self.pending_broadcast_enable = false;
+        self.broadcast_input = true;
+        let receiving = self
+            .terminals
+            .iter()
+            .filter(|t| !t.broadcast_excluded)
+            .count();
+        self.status = format!(
+            "Broadcast input ON: keystrokes go to {receiving} panes (Cmd+K I to stop, Cmd+K Shift+I excludes a pane)"
+        );
+    }
+
+    fn cancel_pending_broadcast(&mut self) {
+        self.pending_broadcast_enable = false;
+        self.status = String::from("Broadcast input cancelled");
+    }
+
+    /// Cmd+K Shift+I: toggle whether the active pane receives broadcast
+    /// input. The focused pane always gets its own typing; exclusion only
+    /// mutes the mirrored copy while it is unfocused.
+    fn toggle_broadcast_exclusion(&mut self) {
+        let idx = self.active_terminal;
+        let Some(t) = self.terminals.get_mut(idx) else {
+            return;
+        };
+        t.broadcast_excluded = !t.broadcast_excluded;
+        let label = t.label().to_string();
+        self.status = if self.terminals[idx].broadcast_excluded {
+            format!("{label} excluded from broadcast input")
+        } else {
+            format!("{label} receives broadcast input again")
+        };
+    }
+
+    /// Shell-bound bytes from the focused terminal: normally just the active
+    /// pane, mirrored to every non-excluded pane while broadcast is on (the
+    /// focused pane always receives its own input).
+    fn write_terminal_input(&mut self, bytes: &[u8]) {
+        if self.broadcast_input {
+            let active = self.active_terminal;
+            for (i, t) in self.terminals.iter_mut().enumerate() {
+                if i == active || !t.broadcast_excluded {
+                    t.write_input(bytes);
+                }
+            }
+        } else {
+            self.terminal_mut().write_input(bytes);
+        }
+    }
+
+    /// Paste counterpart of [`Self::write_terminal_input`] (bracketed-paste
+    /// aware per pane).
+    fn paste_terminal_input(&mut self, payload: &[u8]) {
+        if self.broadcast_input {
+            let active = self.active_terminal;
+            for (i, t) in self.terminals.iter_mut().enumerate() {
+                if i == active || !t.broadcast_excluded {
+                    t.paste_input(payload);
+                }
+            }
+        } else {
+            self.terminal_mut().paste_input(payload);
+        }
+    }
+
     /// Cycle the active terminal forward by one slot, wrapping at the end.
     pub fn cycle_terminal(&mut self) {
         if self.terminals.len() <= 1 {
@@ -8762,9 +8904,13 @@ impl App {
 
     fn focus_pane(&mut self, p: Pane) {
         // Leaving the terminal closes its find bar so a stale match highlight
-        // never lingers on the grid once input goes elsewhere.
+        // never lingers on the grid once input goes elsewhere. Quick-select
+        // labels are torn down for the same reason.
         if p != Pane::Terminal && self.terminal_find.is_some() {
             self.close_terminal_find();
+        }
+        if p != Pane::Terminal && self.terminal_quick_select.is_some() {
+            self.close_terminal_quick_select();
         }
         self.focus = p;
         self.sync_focus_flags();
@@ -9741,21 +9887,39 @@ impl App {
                         if multi {
                             let label = self.terminals[i].label().to_string();
                             let room = col.width.saturating_sub(14) as usize;
-                            if !label.is_empty() && room >= 3 {
+                            // While broadcast input is on, every pane that
+                            // receives the mirrored keystrokes wears an
+                            // unmissable red pill with a ⇶ marker
+                            // (Terminator's role colouring); excluded panes
+                            // keep the normal pill. The marker paints even
+                            // while the pane's auto-label is still empty.
+                            let receiving = self.broadcast_input
+                                && (i == self.active_terminal
+                                    || !self.terminals[i].broadcast_excluded);
+                            if (!label.is_empty() || receiving) && room >= 3 {
                                 let shown: String = label.chars().take(room).collect();
-                                let text = format!(" {shown} ");
+                                let text = if receiving && shown.is_empty() {
+                                    String::from(" \u{21f6} ")
+                                } else if receiving {
+                                    format!(" \u{21f6} {shown} ")
+                                } else {
+                                    format!(" {shown} ")
+                                };
+                                let style = if receiving {
+                                    Style::default()
+                                        .fg(Color::Black)
+                                        .bg(Color::Rgb(0xe7, 0x70, 0x70))
+                                        .add_modifier(Modifier::BOLD)
+                                } else {
+                                    crate::widgets::header_pill::action_style(brand, false)
+                                };
                                 label_rect = Rect {
                                     x: col.x,
                                     y: col.y,
                                     width: (text.chars().count() as u16).min(col.width),
                                     height: 1,
                                 };
-                                frame.buffer_mut().set_string(
-                                    col.x,
-                                    col.y,
-                                    text,
-                                    crate::widgets::header_pill::action_style(brand, false),
-                                );
+                                frame.buffer_mut().set_string(col.x, col.y, text, style);
                             }
                         }
                         self.terminal_label_rects.push(label_rect);
@@ -10044,6 +10208,7 @@ impl App {
         self.render_discard_confirm(frame);
         self.render_revert_hunk_confirm(frame);
         self.render_discard_all_confirm(frame);
+        self.render_broadcast_confirm(frame);
         self.render_editor_find(frame);
         self.render_terminal_find(frame);
         self.render_file_finder(frame);
@@ -10575,6 +10740,77 @@ impl App {
             ]),
         ]);
         frame.render_widget(ratatui::widgets::Paragraph::new(body), inner);
+    }
+
+    /// Confirmation modal for enabling broadcast input: the classic footgun
+    /// is typing a destructive command into panes you forgot were listening,
+    /// so switching it on gets the same red Y/N gate iTerm2 shows.
+    fn render_broadcast_confirm(&self, frame: &mut ratatui::Frame) {
+        if !self.pending_broadcast_enable {
+            return;
+        }
+        let area = frame.area();
+        let width = area.width.saturating_sub(8).clamp(50, 96);
+        let height: u16 = 7;
+        let rect = Rect {
+            x: (area.width.saturating_sub(width)) / 2 + area.x,
+            y: (area.height.saturating_sub(height)) / 2 + area.y,
+            width,
+            height,
+        };
+        let warn = Color::Rgb(0xe7, 0x70, 0x70);
+        let block = ratatui::widgets::Block::default()
+            .borders(ratatui::widgets::Borders::ALL)
+            .border_style(Style::default().fg(warn))
+            .style(Style::default().bg(Color::Rgb(0x1e, 0x1e, 0x1e)))
+            .title(ratatui::text::Span::styled(
+                " BROADCAST INPUT TO ALL PANES? ",
+                Style::default()
+                    .fg(Color::White)
+                    .bg(warn)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        frame.render_widget(ratatui::widgets::Clear, rect);
+        frame.render_widget(block, rect);
+        let inner = Rect {
+            x: rect.x + 2,
+            y: rect.y + 1,
+            width: rect.width.saturating_sub(4),
+            height: rect.height.saturating_sub(2),
+        };
+        let receiving = self
+            .terminals
+            .iter()
+            .filter(|t| !t.broadcast_excluded)
+            .count()
+            .max(1);
+        let body = ratatui::text::Text::from(vec![
+            ratatui::text::Line::from(ratatui::text::Span::styled(
+                format!(
+                    "Every keystroke and paste will go to {receiving} terminal panes at once (red \u{21f6} pills mark them). Cmd+K I stops it; Cmd+K Shift+I excludes a pane."
+                ),
+                Style::default().fg(Color::White),
+            )),
+            ratatui::text::Line::from(""),
+            ratatui::text::Line::from(vec![
+                ratatui::text::Span::styled(
+                    "[Y]",
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                ),
+                ratatui::text::Span::raw("es, broadcast   "),
+                ratatui::text::Span::styled(
+                    "[N]",
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                ratatui::text::Span::raw("o / Esc"),
+            ]),
+        ]);
+        frame.render_widget(
+            ratatui::widgets::Paragraph::new(body).wrap(ratatui::widgets::Wrap { trim: true }),
+            inner,
+        );
     }
 
     fn render_terminal_warning(&self, frame: &mut ratatui::Frame) {
@@ -11204,6 +11440,20 @@ impl App {
                 self.open_testing_view();
                 true
             }
+            // Cmd+K Shift+I: toggle whether the active pane receives
+            // broadcast input (iTerm2's per-session broadcast-domain
+            // toggle). Must precede the case-insensitive I arm below.
+            KeyCode::Char('I') if shifted && plain => {
+                self.toggle_broadcast_exclusion();
+                true
+            }
+            // Cmd+K I: toggle broadcast input — type into every terminal
+            // pane at once (iTerm2's Cmd+Opt+I; I for Input). Enabling is
+            // gated on a confirm popup.
+            KeyCode::Char(c) if plain && c.eq_ignore_ascii_case(&'i') => {
+                self.toggle_broadcast_input();
+                true
+            }
             // Cmd+K Enter: run the test the editor caret sits in. Enter already
             // means "run" in the Testing view (runs all), so it carries over as
             // the run verb under the Cmd+K leader (no new terminal registration).
@@ -11315,6 +11565,18 @@ impl App {
                 }
                 KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                     self.cancel_pending_discard_all();
+                }
+                _ => {}
+            }
+            return Ok(());
+        }
+        if self.pending_broadcast_enable {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                    self.confirm_pending_broadcast();
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    self.cancel_pending_broadcast();
                 }
                 _ => {}
             }
@@ -16510,9 +16772,20 @@ impl App {
     }
 
     fn handle_terminal_key(&mut self, key: KeyEvent) {
+        // Quick-select owns every keystroke while its labels are up.
+        if self.terminal_quick_select.is_some() {
+            self.handle_terminal_quick_select_key(key);
+            return;
+        }
         // The find bar owns every keystroke while it is open.
         if self.terminal_find.is_some() {
             self.handle_terminal_find_key(key);
+            return;
+        }
+        // Ctrl+Shift+Space (WezTerm's quick-select): label every URL / path /
+        // hash / IP on screen; typing a label copies it, UPPERCASE pastes.
+        if is_quick_select_key(key) {
+            self.open_terminal_quick_select();
             return;
         }
         // Cmd+F / Ctrl+F: open find-in-terminal (scrollback search), like
@@ -16581,7 +16854,7 @@ impl App {
         if is_clipboard_paste_key(key) {
             match crate::clipboard::read_string() {
                 Some(text) if !text.is_empty() => {
-                    self.terminal_mut().paste_input(text.as_bytes());
+                    self.paste_terminal_input(text.as_bytes());
                 }
                 Some(_) => {
                     self.status = String::from("Cmd+V: clipboard is empty");
@@ -16603,7 +16876,7 @@ impl App {
         }
         let bytes = key_to_bytes(key);
         if !bytes.is_empty() {
-            self.terminal_mut().write_input(&bytes);
+            self.write_terminal_input(&bytes);
         }
     }
 
@@ -16882,7 +17155,7 @@ impl App {
                     }
                     self.terminal_find_set_query(q);
                 } else {
-                    self.terminal_mut().paste_input(s.as_bytes());
+                    self.paste_terminal_input(s.as_bytes());
                 }
             }
             Pane::Tree => {}
@@ -17190,7 +17463,7 @@ impl App {
         if let Some(bytes) = clipboard_payload
             && !bytes.is_empty()
         {
-            self.terminal_mut().paste_input(&bytes);
+            self.paste_terminal_input(&bytes);
         }
         let resolved_any = !placed.is_empty()
             || !opened_urls.is_empty()
@@ -17297,7 +17570,19 @@ impl App {
         let mut rang: Option<String> = None;
         let mut notes: Vec<String> = Vec::new();
         let mut finished: Option<String> = None;
+        let mut trigger_note: Option<String> = None;
         for t in &self.terminals {
+            // Keep every pane on the current trigger set, wherever it was
+            // created (a ptr-eq no-op when already current).
+            t.set_triggers(self.triggers.clone());
+            for h in t.drain_trigger_hits() {
+                trigger_note = Some(match h.action {
+                    crate::triggers::TriggerAction::Bell => {
+                        format!("Trigger bell in {}: {}", t.label(), h.message)
+                    }
+                    _ => format!("Trigger in {}: {}", t.label(), h.message),
+                });
+            }
             if t.take_bell() {
                 rang = Some(t.label().to_string());
             }
@@ -17314,6 +17599,10 @@ impl App {
                     crate::widgets::terminal::human_duration(dur)
                 ));
             }
+        }
+        if let Some(msg) = trigger_note {
+            self.status = msg;
+            return true;
         }
         if let Some(msg) = notes.pop() {
             self.status = format!("Terminal notification: {msg}");
@@ -19034,6 +19323,10 @@ impl App {
                 crate::snippets::snippets_path(),
                 ConfigFileSeed::Snippets,
             ),
+            Cmd::OpenTriggersJson => self.open_config_file_in_editor(
+                crate::triggers::triggers_path(),
+                ConfigFileSeed::Triggers,
+            ),
         }
     }
 
@@ -19052,6 +19345,7 @@ impl App {
                 }
                 ConfigFileSeed::Keybindings => crate::keymap::TEMPLATE.to_string(),
                 ConfigFileSeed::Snippets => crate::snippets::TEMPLATE.to_string(),
+                ConfigFileSeed::Triggers => crate::triggers::TEMPLATE.to_string(),
             };
             if let Err(e) = std::fs::write(&path, contents) {
                 self.status = format!("Could not create {}: {e}", path.display());
@@ -19075,6 +19369,9 @@ impl App {
             ),
             ConfigFileSeed::Snippets => {
                 String::from("Editing snippets.json — save to apply immediately")
+            }
+            ConfigFileSeed::Triggers => {
+                String::from("Editing triggers.json — save to apply immediately")
             }
         };
     }
@@ -19797,6 +20094,120 @@ impl App {
                     .unwrap_or_default();
                 q.push(c);
                 self.terminal_find_set_query(q);
+            }
+            _ => {}
+        }
+    }
+
+    /// Ctrl+Shift+Space: enter quick-select on the active pane. Scans the
+    /// visible viewport for URLs / paths / hashes / IPs (see
+    /// [`crate::quick_select`]), assigns home-row labels with the bottom-most
+    /// match getting the cheapest one (WezTerm / tmux-thumbs), and overlays
+    /// them for the render loop.
+    fn open_terminal_quick_select(&mut self) {
+        let (lines, top) = self.terminal().visible_lines();
+        let matches = crate::quick_select::find_matches(&lines);
+        if matches.is_empty() {
+            self.status = String::from("Quick select: nothing to match on screen");
+            return;
+        }
+        let labels =
+            crate::quick_select::assign_labels(matches.len(), crate::quick_select::ALPHABET);
+        let n = labels.len();
+        let hints: Vec<QuickHint> = matches
+            .into_iter()
+            .take(n)
+            .enumerate()
+            .map(|(i, m)| QuickHint {
+                line: top + m.row as i32,
+                start: m.start,
+                len: m.len,
+                text: m.text,
+                label: labels[n - 1 - i].clone(),
+            })
+            .collect();
+        self.push_quick_select_hints(&hints, "");
+        self.terminal_quick_select = Some(QuickSelectState {
+            hints,
+            typed: String::new(),
+            shifted: false,
+        });
+        self.status =
+            String::from("Quick select: type a label to copy, UPPERCASE pastes, Esc cancels");
+    }
+
+    /// Push the hint spans matching the typed label prefix down to the pane
+    /// for painting. Called on open and after every typed / erased char.
+    fn push_quick_select_hints(&mut self, hints: &[QuickHint], typed: &str) {
+        let spans: Vec<crate::widgets::terminal::HintSpan> = hints
+            .iter()
+            .filter(|h| h.label.starts_with(typed))
+            .map(|h| crate::widgets::terminal::HintSpan {
+                line: h.line,
+                start: h.start,
+                len: h.len,
+                label: h.label.clone(),
+                typed: typed.len(),
+            })
+            .collect();
+        self.terminal_mut().set_hints(Some(spans));
+    }
+
+    fn close_terminal_quick_select(&mut self) {
+        if self.terminal_quick_select.take().is_some() {
+            // Clear every pane, not just the active one: a mouse click can
+            // move `active_terminal` while the labels are still up.
+            for t in &mut self.terminals {
+                t.set_hints(None);
+            }
+        }
+    }
+
+    fn handle_terminal_quick_select_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.close_terminal_quick_select();
+                self.status = String::from("Quick select cancelled");
+            }
+            KeyCode::Backspace => {
+                let Some(state) = self.terminal_quick_select.as_mut() else {
+                    return;
+                };
+                state.typed.pop();
+                // Case history is not kept; retyping decides paste-vs-copy.
+                state.shifted = false;
+                let (hints, typed) = (state.hints.clone(), state.typed.clone());
+                self.push_quick_select_hints(&hints, &typed);
+            }
+            KeyCode::Char(c) if c.is_ascii_alphabetic() => {
+                let Some(state) = self.terminal_quick_select.as_ref() else {
+                    return;
+                };
+                let candidate = format!("{}{}", state.typed, c.to_ascii_lowercase());
+                let shifted = state.shifted || c.is_ascii_uppercase();
+                if let Some(hit) = state.hints.iter().find(|h| h.label == candidate) {
+                    let text = hit.text.clone();
+                    self.close_terminal_quick_select();
+                    copy_to_clipboard(&text);
+                    if shifted {
+                        self.terminal_mut().paste_input(text.as_bytes());
+                        self.status = format!(
+                            "Copied {} chars to clipboard and pasted into the shell",
+                            text.chars().count()
+                        );
+                    } else {
+                        self.status = format!("Copied {} chars to clipboard", text.chars().count());
+                    }
+                } else if state.hints.iter().any(|h| h.label.starts_with(&candidate)) {
+                    let Some(state) = self.terminal_quick_select.as_mut() else {
+                        return;
+                    };
+                    state.typed = candidate.clone();
+                    state.shifted = shifted;
+                    let hints = state.hints.clone();
+                    self.push_quick_select_hints(&hints, &candidate);
+                }
+                // A char no label starts with is ignored, like WezTerm.
             }
             _ => {}
         }
@@ -20857,9 +21268,13 @@ impl App {
                             label: String::from("Clear"),
                             action: MenuAction::ClearTerminal(idx),
                         },
+                        MenuEntry::Item {
+                            label: String::from("Quick Select"),
+                            action: MenuAction::TerminalQuickSelect,
+                        },
                     ];
-                    // Maximize needs a second pane to trade space with, so a
-                    // lone terminal doesn't offer it.
+                    // Maximize and broadcast both need a second pane, so a
+                    // lone terminal doesn't offer them.
                     if self.terminals.len() > 1 {
                         items.push(MenuEntry::Item {
                             label: String::from(if self.terminal_pane_maximized {
@@ -20869,6 +21284,24 @@ impl App {
                             }),
                             action: MenuAction::ToggleMaximizeTerminal(idx),
                         });
+                        items.push(MenuEntry::Item {
+                            label: String::from(if self.broadcast_input {
+                                "Stop Broadcast Input"
+                            } else {
+                                "Broadcast Input"
+                            }),
+                            action: MenuAction::ToggleBroadcastInput,
+                        });
+                        if self.broadcast_input {
+                            items.push(MenuEntry::Item {
+                                label: String::from(if self.terminals[idx].broadcast_excluded {
+                                    "Include in Broadcast"
+                                } else {
+                                    "Exclude from Broadcast"
+                                }),
+                                action: MenuAction::ToggleBroadcastExclusion,
+                            });
+                        }
                     }
                     self.context_menu = Some(ContextMenu {
                         origin: (m.column, m.row),
@@ -22492,6 +22925,12 @@ impl App {
         } else if path == crate::snippets::snippets_path() {
             self.snippets = crate::snippets::SnippetSet::load(&path);
             self.status = String::from("Snippets reloaded");
+        } else if path == crate::triggers::triggers_path() {
+            self.triggers = std::sync::Arc::new(crate::triggers::TriggerSet::load(&path));
+            self.status = format!(
+                "Triggers reloaded ({} active)",
+                self.triggers.triggers.len()
+            );
         }
     }
 
@@ -23179,6 +23618,9 @@ impl App {
             MenuAction::ToggleZenMode => self.toggle_zen_mode(),
             MenuAction::RenameTerminal(idx) => self.begin_rename_terminal(idx),
             MenuAction::ClearTerminal(idx) => self.clear_terminal_at(idx),
+            MenuAction::TerminalQuickSelect => self.open_terminal_quick_select(),
+            MenuAction::ToggleBroadcastInput => self.toggle_broadcast_input(),
+            MenuAction::ToggleBroadcastExclusion => self.toggle_broadcast_exclusion(),
             MenuAction::CopyCommandOutput(idx, d) => self.copy_command_output(idx, d),
             MenuAction::SelectCommandOutput(idx, d) => self.select_command_output(idx, d),
             MenuAction::RerunCommand(idx, d) => self.rerun_command(idx, d),
@@ -25359,6 +25801,15 @@ fn is_terminal_maximize_key(key: KeyEvent) -> bool {
 /// In the SUPER branch we reject SHIFT so the `Cmd+Shift+T` focus chord
 /// (see `is_terminal_focus_key`) does not double-fire as a split, and
 /// reject ALT so `Cmd+Opt+T` (iTerm2's relocated New Tab) is left alone.
+/// `Ctrl+Shift+Space`: WezTerm's quick-select chord. No Cmd involved, so it
+/// needs no host-terminal forwarder — it arrives disambiguated through the
+/// kitty keyboard protocol exactly like the Ctrl+Shift+T split chord.
+fn is_quick_select_key(key: KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char(' '))
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+        && key.modifiers.contains(KeyModifiers::SHIFT)
+}
+
 fn is_terminal_split_key(key: KeyEvent) -> bool {
     let KeyCode::Char(c) = key.code else {
         return false;
@@ -25664,6 +26115,7 @@ enum ConfigFileSeed {
     Settings,
     Keybindings,
     Snippets,
+    Triggers,
 }
 
 /// Build a completion-popup item for a user snippet: the row shows the prefix,
