@@ -1419,6 +1419,171 @@ fn ctrl_shift_space_quick_select_labels_matches_and_a_label_commits() {
 }
 
 #[test]
+fn shift_pageup_pages_the_scrollback_and_shift_end_snaps_back() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let script = "i=0; while [ $i -lt 80 ]; do echo page-$i; i=$((i+1)); done; sleep 60";
+    app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
+        "/bin/sh",
+        &[String::from("-c"), String::from(script)],
+        tmp.path(),
+    )
+    .unwrap();
+    let mut waited = 0u32;
+    while !app.terminals[0]
+        .grid_lines()
+        .0
+        .iter()
+        .any(|l| l.contains("page-79"))
+    {
+        assert!(waited < 4000, "filler output never arrived");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        waited += 20;
+    }
+    app.focus_pane(Pane::Terminal);
+    let at_bottom = app.terminal().viewport_top_line();
+
+    app.handle_terminal_key(key(KeyCode::PageUp, KeyModifiers::SHIFT));
+    let paged = app.terminal().viewport_top_line();
+    assert!(
+        paged < at_bottom,
+        "Shift+PageUp must scroll into history: {paged} vs {at_bottom}"
+    );
+
+    app.handle_terminal_key(key(KeyCode::Home, KeyModifiers::SHIFT));
+    let top = app.terminal().viewport_top_line();
+    assert!(
+        top < paged,
+        "Shift+Home must jump to the oldest line: {top} vs {paged}"
+    );
+
+    app.handle_terminal_key(key(KeyCode::End, KeyModifiers::SHIFT));
+    assert_eq!(
+        app.terminal().viewport_top_line(),
+        at_bottom,
+        "Shift+End must snap back to the live bottom"
+    );
+}
+
+#[test]
+fn copy_on_select_puts_a_finished_terminal_selection_on_the_clipboard() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    // A run-label pane writes its `▶ …` header synchronously at spawn, so
+    // the first row has deterministic text to select.
+    app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
+        "/bin/sh",
+        &[String::from("-c"), String::from("sleep 60")],
+        tmp.path(),
+    )
+    .unwrap();
+    app.copy_on_select = true;
+    app.focus_pane(Pane::Terminal);
+    // Render so the pane has a real on-screen area to select inside.
+    let backend = ratatui::backend::TestBackend::new(140, 50);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let inner = app.terminal().last_inner;
+    app.terminal_mut().start_selection_at(inner.x, inner.y);
+    app.terminal_mut().extend_selection_to(inner.x + 8, inner.y);
+    let expected = app.terminal().selection_text();
+    assert!(!expected.is_empty(), "selection must cover some pane text");
+
+    app.handle_mouse(mouse(
+        MouseEventKind::Up(MouseButton::Left),
+        inner.x + 8,
+        inner.y,
+    ));
+    let clip = crate::clipboard::read_string().unwrap_or_default();
+    assert_eq!(
+        clip, expected,
+        "finishing the drag must copy the selection when copy_on_select is on"
+    );
+}
+
+#[test]
+fn pane_inline_image_overlay_anchors_hides_when_scrolled_off_and_returns() {
+    use base64::Engine;
+    let mut png_buf = Vec::new();
+    image::RgbaImage::from_pixel(1, 1, image::Rgba([255, 0, 0, 255]))
+        .write_to(
+            &mut std::io::Cursor::new(&mut png_buf),
+            image::ImageFormat::Png,
+        )
+        .expect("encode test png");
+    let png: &[u8] = &png_buf;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(png);
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    // A real protocol + cell geometry: tests run headless, so the values
+    // init_graphics would have probed are injected directly.
+    app.inline_protocol = crate::iterm2_inline::InlineImageProtocol::ITerm2;
+    app.cell_pixel = Some((10, 20));
+    // The image prints first, then enough filler to scroll it into history.
+    let script = format!(
+        "printf '\\033]1337;File=inline=1:{b64}\\007\\n'; i=0; while [ $i -lt 80 ]; do echo fill-$i; i=$((i+1)); done; sleep 60"
+    );
+    app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
+        "/bin/sh",
+        &[String::from("-c"), script],
+        tmp.path(),
+    )
+    .unwrap();
+    let mut waited = 0u32;
+    while app.terminals[0].pane_images().is_empty()
+        || !app.terminals[0]
+            .grid_lines()
+            .0
+            .iter()
+            .any(|l| l.contains("fill-79"))
+    {
+        assert!(waited < 8000, "image/filler never arrived");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        waited += 20;
+    }
+    app.focus_pane(Pane::Terminal);
+    let backend = ratatui::backend::TestBackend::new(140, 50);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+
+    // At the live bottom the anchor sits in scrollback: no overlay.
+    term.draw(|f| app.render(f)).unwrap();
+    assert!(
+        app.terminal_image_payload().is_none(),
+        "an off-screen anchor must hide the picture"
+    );
+
+    // Scrolling to the top brings the anchor into view: overlay appears,
+    // anchored inside the pane at the image's viewport row.
+    app.terminal_mut().scroll_to_top();
+    term.draw(|f| app.render(f)).unwrap();
+    let (osc, layout) = app
+        .terminal_image_payload()
+        .expect("a visible anchor must produce an overlay payload");
+    assert!(
+        osc.contains("1337;File=inline=1"),
+        "the payload must be a re-baked OSC 1337 image"
+    );
+    let inner = app.terminal().last_inner;
+    assert_eq!(layout.pane, 0);
+    assert!(
+        layout.cell_y >= inner.y && layout.cell_y < inner.y + inner.height,
+        "the picture must anchor inside the pane: {layout:?} vs {inner:?}"
+    );
+    assert!(layout.cell_w >= 1 && layout.cell_h >= 1);
+    // The main loop would flush the escape and mark it displayed.
+    app.mark_terminal_image_displayed();
+
+    // Snapping back to the live bottom hides it again and arms the clear.
+    app.terminal_mut().reset_scrollback();
+    term.draw(|f| app.render(f)).unwrap();
+    assert!(app.terminal_image_payload().is_none());
+    assert!(
+        app.consume_terminal_image_clear(),
+        "hiding a displayed picture must arm the clear latch"
+    );
+}
+
+#[test]
 fn quick_select_paints_gold_labels_and_broadcast_paints_modal_and_pills() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();

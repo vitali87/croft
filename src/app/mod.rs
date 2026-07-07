@@ -1812,6 +1812,10 @@ pub struct App {
     /// server to format the buffer, then writes once the reply lands. Loaded
     /// from prefs at startup, toggled from the palette / `Cmd+K F`.
     format_on_save: bool,
+    /// VS Code `terminal.integrated.copyOnSelection`: a finished terminal
+    /// mouse selection lands on the clipboard without an explicit Cmd+C.
+    /// Loaded from prefs at startup, toggled in the Settings hub.
+    copy_on_select: bool,
     /// VS Code's `files.autoSave: afterDelay`: dirty buffers write
     /// themselves to disk once the delay elapses after the last edit.
     auto_save: bool,
@@ -2516,6 +2520,20 @@ pub struct EditorImageLayout {
     pub path: PathBuf,
 }
 
+/// Re-emit key for the terminal pane's inline-image overlay: the cell rect
+/// the picture occupies plus which image (per-pane `seq`) and pane it is.
+/// Scrolling moves the anchor row, changing `cell_y` — a layout mismatch —
+/// so the overlay clears and re-emits at the new position.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TerminalImageLayout {
+    pub cell_x: u16,
+    pub cell_y: u16,
+    pub cell_w: u16,
+    pub cell_h: u16,
+    pub seq: u64,
+    pub pane: usize,
+}
+
 /// Which edge of the editor pane the minimap strip sits on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MinimapSide {
@@ -3005,6 +3023,7 @@ impl App {
             keymap: crate::keymap::Keymap::load(&crate::keymap::keybindings_path()),
             snippets: crate::snippets::SnippetSet::load(&crate::snippets::snippets_path()),
             format_on_save: loaded_prefs.format_on_save,
+            copy_on_select: loaded_prefs.copy_on_select,
             auto_save: loaded_prefs.auto_save,
             save_after_format: false,
             outline,
@@ -9004,6 +9023,7 @@ impl App {
         self.ports.hover_pointer = self.pointer_cell;
         for t in self.terminals.iter_mut() {
             t.focus_gradient = gradient;
+            t.set_palette(self.theme.ansi());
         }
     }
 
@@ -10209,6 +10229,10 @@ impl App {
         self.render_revert_hunk_confirm(frame);
         self.render_discard_all_confirm(frame);
         self.render_broadcast_confirm(frame);
+        // Terminal-pane inline image: sync after the panes have painted so
+        // last_inner and the scroll offset are this frame's (all gating —
+        // hidden panel, alt screen, off-screen anchor — is inside).
+        self.update_terminal_image_overlay();
         self.render_editor_find(frame);
         self.render_terminal_find(frame);
         self.render_file_finder(frame);
@@ -14194,6 +14218,7 @@ impl App {
                     "toggle:format_on_save" => self.toggle_format_on_save(),
                     "toggle:auto_save" => self.toggle_auto_save(),
                     "toggle:inline_blame" => self.toggle_inline_blame(),
+                    "toggle:copy_on_select" => self.toggle_copy_on_select(),
                     "cmd:color_theme" => {
                         self.open_theme_picker();
                         return;
@@ -14247,6 +14272,13 @@ impl App {
             ListRow {
                 id: String::from("toggle:inline_blame"),
                 label: format!("Git: Inline Blame: {}", on_off(self.inline_blame_enabled)),
+            },
+            ListRow {
+                id: String::from("toggle:copy_on_select"),
+                label: format!(
+                    "Terminal: Copy on Selection: {}",
+                    on_off(self.copy_on_select)
+                ),
             },
             ListRow {
                 id: String::from("cmd:color_theme"),
@@ -16841,6 +16873,31 @@ impl App {
         {
             self.terminal_prompt_jump(matches!(key.code, KeyCode::Down));
             return;
+        }
+        // Shift+PageUp / Shift+PageDown: page through the scrollback;
+        // Shift+Home / Shift+End jump to the oldest line / the live bottom
+        // (xterm's keyboard-scrollback convention, leaving the plain keys
+        // for the running program). In the alternate screen there is no
+        // scrollback, so the chord falls through to the program instead.
+        if key.modifiers.contains(KeyModifiers::SHIFT)
+            && matches!(
+                key.code,
+                KeyCode::PageUp | KeyCode::PageDown | KeyCode::Home | KeyCode::End
+            )
+        {
+            let page = self.terminal().last_inner.height.max(2) as usize - 1;
+            let scrolled = match key.code {
+                KeyCode::PageUp => self.terminal_mut().scroll_up(page),
+                KeyCode::PageDown => self.terminal_mut().scroll_down(page),
+                KeyCode::Home => self.terminal_mut().scroll_to_top(),
+                _ => {
+                    self.terminal_mut().reset_scrollback();
+                    true
+                }
+            };
+            if scrolled {
+                return;
+            }
         }
         // Ctrl+Shift+C / Cmd+C: copy current selection.
         if is_terminal_copy_key(key) {
@@ -22558,6 +22615,19 @@ impl App {
             MouseEventKind::Up(MouseButton::Left) => {
                 // Releasing the button ends any terminal edge auto-scroll.
                 self.terminal_select_autoscroll = None;
+                // Copy-on-select (VS Code's terminal.integrated.copyOnSelection,
+                // iTerm2's default): a finished terminal drag-selection lands
+                // on the clipboard without the explicit Cmd+C. Silent — this
+                // fires on every selection, so no status churn.
+                if self.copy_on_select
+                    && self.focus == Pane::Terminal
+                    && self.terminal().selection().is_some_and(|s| s.has_area())
+                {
+                    let text = self.terminal().selection_text();
+                    if !text.is_empty() {
+                        copy_to_clipboard(&text);
+                    }
+                }
                 // Releasing ends a pane drag-reorder; the order is already
                 // final because the reorder is live during the drag.
                 self.terminal_drag_from = None;
@@ -22878,6 +22948,18 @@ impl App {
         };
         if !cfg!(test) {
             let _ = crate::prefs::save_format_on_save(self.format_on_save);
+        }
+    }
+
+    fn toggle_copy_on_select(&mut self) {
+        self.copy_on_select = !self.copy_on_select;
+        self.status = if self.copy_on_select {
+            String::from("Copy on Selection: on")
+        } else {
+            String::from("Copy on Selection: off")
+        };
+        if !cfg!(test) {
+            let _ = crate::prefs::save_copy_on_select(self.copy_on_select);
         }
     }
 
@@ -23933,6 +24015,131 @@ impl App {
 
     pub fn mark_editor_image_displayed(&mut self, side: usize) {
         self.overlays.editor[side].mark_displayed();
+    }
+
+    /// Bake the active terminal pane's newest captured inline image (imgcat
+    /// / OSC 1337) into an overlay anchored at its grid row. One slot: older
+    /// images scroll away like text, and only the active pane shows its
+    /// picture (focus a pane to see what it printed). alacritty never
+    /// reserved grid rows for the image, so it floats above any text
+    /// printed after it — the honest best without forking the engine.
+    fn update_terminal_image_overlay(&mut self) {
+        if !self.show_terminal
+            || self.bottom_panel_tab != BottomPanelTab::Terminal
+            || !self.inline_images_enabled()
+        {
+            self.disable_terminal_image();
+            return;
+        }
+        let Some((cw_px, ch_px)) = self.cell_pixel else {
+            return;
+        };
+        let idx = self.active_terminal;
+        let Some(t) = self.terminals.get(idx) else {
+            self.disable_terminal_image();
+            return;
+        };
+        let inner = t.last_inner;
+        if t.alt_screen() || inner.width < 6 || inner.height < 3 {
+            self.disable_terminal_image();
+            return;
+        }
+        let Some(img) = t.pane_images().pop() else {
+            self.disable_terminal_image();
+            return;
+        };
+        // Anchor row in the viewport; off-screen anchors hide the picture.
+        let vp = img.line + t.scroll_display_offset();
+        if vp < 0 || vp >= inner.height as i32 {
+            self.disable_terminal_image();
+            return;
+        }
+        // Image pixels → cells, shrunk (never grown) to fit the pane below
+        // the anchor. Reading dimensions only decodes the header.
+        let Ok(Some((px_w, px_h))) =
+            image::ImageReader::new(std::io::Cursor::new(img.data.as_slice()))
+                .with_guessed_format()
+                .map(|r| r.into_dimensions().ok())
+        else {
+            self.disable_terminal_image();
+            return;
+        };
+        let want_w = (px_w.div_ceil(cw_px)).max(1) as f32;
+        let want_h = (px_h.div_ceil(ch_px)).max(1) as f32;
+        let max_w = (inner.width - 2) as f32;
+        let max_h = ((inner.height as i32 - vp).max(1) as f32).min(inner.height as f32 - 1.0);
+        let scale = (max_w / want_w).min(max_h / want_h).min(1.0);
+        let cell_w = ((want_w * scale) as u16).max(1);
+        let cell_h = ((want_h * scale) as u16).max(1);
+        let desired = TerminalImageLayout {
+            cell_x: inner.x,
+            cell_y: inner.y + vp as u16,
+            cell_w,
+            cell_h,
+            seq: img.seq,
+            pane: idx,
+        };
+        // Hot path: unchanged layout means nothing to rebake and no latch.
+        if self.overlays.terminal_image.layout_matches(&desired) {
+            return;
+        }
+        self.overlays.terminal_image.request_clear_if_displayed();
+        let bg = self.theme_bg_pixel();
+        let baked = crate::iterm2_inline::fit_image_auto(
+            &img.data,
+            cell_w as u32 * cw_px,
+            cell_h as u32 * ch_px,
+            bg,
+        );
+        if let Ok(baked) = baked
+            && let Some(raw) = crate::iterm2_inline::build_inline_image(
+                self.inline_protocol,
+                &baked,
+                cell_w,
+                cell_h,
+                true,
+                crate::iterm2_inline::KITTY_ID_TERMINAL,
+            )
+        {
+            let osc = crate::iterm2_inline::maybe_tmux_wrap(
+                self.inline_protocol,
+                crate::iterm2_inline::detect_tmux(),
+                raw,
+            );
+            self.overlays.terminal_image.set(osc, desired);
+        }
+    }
+
+    fn disable_terminal_image(&mut self) {
+        self.overlays.terminal_image.disable();
+    }
+
+    /// See [`Self::consume_editor_image_clear`]; the terminal-image twin.
+    pub fn consume_terminal_image_clear(&mut self) -> bool {
+        self.overlays.terminal_image.consume_clear()
+    }
+
+    /// The pane image escape to flush this frame, gated off while any modal
+    /// popup is up so the picture never paints over it.
+    pub fn terminal_image_payload(&self) -> Option<(&str, &TerminalImageLayout)> {
+        if self.shortcuts_modal.is_some()
+            || self.file_finder.is_some()
+            || self.command_palette.is_some()
+            || self.go_to_symbol.is_some()
+            || self.workspace_symbols.is_some()
+            || self.process_picker.is_some()
+            || self.zoxide_jump.is_some()
+            || self.branch_picker.is_some()
+            || self.input_prompt.is_some()
+            || self.list_picker.is_some()
+        {
+            return None;
+        }
+        self.overlays.terminal_image.payload()
+    }
+
+    pub fn mark_terminal_image_displayed(&mut self) {
+        self.overlays.terminal_image.mark_displayed();
     }
 
     /// Bake/recomposite the editor minimap for `strip` (the text-aligned image
@@ -28073,6 +28280,7 @@ fn consume_any_image_clear(app: &mut App) -> bool {
     let fired = [
         app.consume_welcome_image_clear(),
         app.consume_editor_image_clear(),
+        app.consume_terminal_image_clear(),
         app.consume_run_debug_image_clear(),
         app.consume_problems_badge_image_clear(),
         app.consume_no_repo_hero_image_clear(),
@@ -28375,6 +28583,22 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
                     let _ = out.flush();
                     app.mark_editor_image_displayed(side);
                 }
+            }
+            // Terminal-pane inline image (captured imgcat output): same
+            // bake-once / emit-each-frame overlay, anchored to its grid row.
+            if let Some((osc, layout)) = app.terminal_image_payload() {
+                use std::io::Write;
+                let mut out = stdout();
+                let cursor_on = app.cursor_should_be_visible();
+                let _ = write!(out, "\x1b[?25l\x1b[s");
+                let _ = write!(out, "\x1b[{};{}H", layout.cell_y + 1, layout.cell_x + 1);
+                let _ = out.write_all(osc.as_bytes());
+                let _ = write!(out, "\x1b[u");
+                if cursor_on {
+                    let _ = write!(out, "\x1b[?25h");
+                }
+                let _ = out.flush();
+                app.mark_terminal_image_displayed();
             }
             // Editor minimap: same bake-once / emit-each-frame overlay, painted
             // after ratatui's diff so the raster lands on the strip cells.

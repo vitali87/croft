@@ -18,6 +18,31 @@ use std::sync::OnceLock;
 
 use ratatui::style::Color;
 
+/// VS Code's default dark terminal ANSI palette (the `terminal.ansi*` colors
+/// of the Dark+ theme): black, red, green, yellow, blue, magenta, cyan,
+/// white, then the bright variants. The base for every croft theme that does
+/// not override it with a 16-entry `ansi` array in its `[[themes]]` manifest
+/// block, so terminal panes render the same on every host terminal instead
+/// of inheriting whatever palette the host happens to use.
+pub const VSCODE_ANSI: [(u8, u8, u8); 16] = [
+    (0x00, 0x00, 0x00),
+    (0xcd, 0x31, 0x31),
+    (0x0d, 0xbc, 0x79),
+    (0xe5, 0xe5, 0x10),
+    (0x24, 0x72, 0xc8),
+    (0xbc, 0x3f, 0xbc),
+    (0x11, 0xa8, 0xcd),
+    (0xe5, 0xe5, 0xe5),
+    (0x66, 0x66, 0x66),
+    (0xf1, 0x4c, 0x4c),
+    (0x23, 0xd1, 0x8b),
+    (0xf5, 0xf5, 0x43),
+    (0x3b, 0x8e, 0xea),
+    (0xd6, 0x70, 0xd6),
+    (0x29, 0xb8, 0xdb),
+    (0xe5, 0xe5, 0xe5),
+];
+
 /// A complete IDE color palette. `Copy` and cheap to pass by value: the strings
 /// are interned to `&'static` when loaded from a manifest, and the colors are
 /// plain bytes. Equality is by value, so a registry-loaded theme compares equal
@@ -35,6 +60,8 @@ pub struct Theme {
     osk_key: (u8, u8, u8),
     osk_special: (u8, u8, u8),
     osk_armed: (u8, u8, u8),
+    /// The 16 ANSI terminal colors (black..bright white) panes render with.
+    ansi: [(u8, u8, u8); 16],
 }
 
 impl Theme {
@@ -53,6 +80,7 @@ impl Theme {
         osk_key: (0x20, 0x24, 0x2b),
         osk_special: (0x14, 0x16, 0x1b),
         osk_armed: (0x0e, 0x7e, 0x76),
+        ansi: VSCODE_ANSI,
     };
 
     /// Croft Dark (Blue) — the historical look. Const mirror of the manifest,
@@ -69,6 +97,7 @@ impl Theme {
         osk_key: (0x3a, 0x40, 0x52),
         osk_special: (0x2c, 0x31, 0x40),
         osk_armed: (0x00, 0x7a, 0xcc),
+        ansi: VSCODE_ANSI,
     };
 
     /// Every available theme in pick-list order, loaded once from the bundled +
@@ -128,6 +157,15 @@ impl Theme {
             osk_key: parse_hex(&d.osk_key),
             osk_special: parse_hex(&d.osk_special),
             osk_armed: parse_hex(&d.osk_armed),
+            ansi: if d.ansi.len() == 16 {
+                let mut p = VSCODE_ANSI;
+                for (slot, hex) in p.iter_mut().zip(&d.ansi) {
+                    *slot = parse_hex(hex);
+                }
+                p
+            } else {
+                VSCODE_ANSI
+            },
         }
     }
 
@@ -168,6 +206,12 @@ impl Theme {
     /// Replaces the old hardcoded `theme == Black` checks.
     pub fn gradient(self) -> bool {
         self.gradient
+    }
+
+    /// The 16 ANSI terminal colors (black..bright white) the theme's panes
+    /// render Named/Indexed 0-15 cell colors with.
+    pub fn ansi(self) -> [(u8, u8, u8); 16] {
+        self.ansi
     }
 
     /// Primary accent (selected-row text, active chrome).

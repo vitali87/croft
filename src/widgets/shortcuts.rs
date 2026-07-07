@@ -837,6 +837,11 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 handler: "",
             },
             ShortcutEntry {
+                keys: "Shift+PageUp / Shift+PageDown",
+                description: "Page through the scrollback (Shift+Home jumps to the oldest line, Shift+End back to the live bottom)",
+                handler: "",
+            },
+            ShortcutEntry {
                 keys: "Cmd+V / Ctrl+V",
                 description: "Paste local clipboard into the shell",
                 handler: "is_clipboard_paste_key",

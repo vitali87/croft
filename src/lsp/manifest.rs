@@ -208,6 +208,11 @@ pub struct ThemeDecl {
     pub osk_special: String,
     /// On-screen-keyboard armed (held) key fill (Termux).
     pub osk_armed: String,
+    /// Optional 16-entry ANSI terminal palette (`#rrggbb`, black..bright
+    /// white in the standard order). Absent or wrong-length falls back to
+    /// VS Code's dark terminal defaults.
+    #[serde(default)]
+    pub ansi: Vec<String>,
 }
 
 /// One `[[languages]]` entry: a language identity contributed by an extension.

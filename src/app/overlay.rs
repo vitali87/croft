@@ -335,6 +335,9 @@ pub struct OverlayManager {
     /// focus swap (a focus swap never moves a group's column).
     pub editor: [ImageOverlay<super::EditorImageLayout>; 2],
     pub welcome: ImageOverlay<super::WelcomeLayout>,
+    /// The active terminal pane's newest inline image (captured OSC 1337
+    /// imgcat output), anchored to its grid line.
+    pub terminal_image: ImageOverlay<super::TerminalImageLayout>,
     pub minimap: ImageOverlay<super::MinimapLayout>,
     pub hero: ImageOverlay<super::WelcomeLayout>,
     pub ssh: ImageOverlay<()>,

@@ -140,6 +140,16 @@ pub struct Prefs {
     /// config both mean "blame shown".
     #[serde(default)]
     pub disable_inline_blame: bool,
+    /// Copy a finished terminal mouse selection straight to the clipboard
+    /// (VS Code's `terminal.integrated.copyOnSelection`). Off by default,
+    /// matching VS Code.
+    #[serde(default)]
+    pub copy_on_select: bool,
+    /// Scrollback lines kept per terminal pane (VS Code's
+    /// `terminal.integrated.scrollback`). 0 — the default for older configs —
+    /// means the built-in 5000. Applies to panes opened after the change.
+    #[serde(default)]
+    pub terminal_scrollback: usize,
 }
 
 impl Prefs {
@@ -255,6 +265,24 @@ pub fn save_format_on_save(enabled: bool) -> Result<()> {
     let mut prefs = Prefs::load(&path).unwrap_or_default();
     prefs.format_on_save = enabled;
     prefs.save(&path)
+}
+
+pub fn save_copy_on_select(enabled: bool) -> Result<()> {
+    let path = config_path();
+    let mut prefs = Prefs::load(&path).unwrap_or_default();
+    prefs.copy_on_select = enabled;
+    prefs.save(&path)
+}
+
+/// The scrollback size terminal panes spawn with: the user's
+/// `terminal_scrollback` when set, clamped to a sane range, else the
+/// built-in default.
+pub fn terminal_scrollback_lines(configured: usize, default: usize) -> usize {
+    if configured == 0 {
+        default
+    } else {
+        configured.clamp(100, 200_000)
+    }
 }
 
 /// Persist the auto-save choice, preserving other settings. Best-effort:
@@ -440,6 +468,36 @@ mod tests {
         std::fs::write(&path, r#"{"theme":"dark"}"#).expect("write old config");
         assert!(!Prefs::load(&path).expect("load old").auto_save);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn round_trips_copy_on_select_and_terminal_scrollback() {
+        let dir = std::env::temp_dir().join(format!("croft-prefs-cos-test-{}", std::process::id()));
+        let path = dir.join("config.json");
+        let prefs = Prefs {
+            copy_on_select: true,
+            terminal_scrollback: 20_000,
+            ..Prefs::default()
+        };
+        prefs.save(&path).expect("save");
+        let loaded = Prefs::load(&path).expect("load");
+        assert!(loaded.copy_on_select);
+        assert_eq!(loaded.terminal_scrollback, 20_000);
+        // A config written before these fields existed still parses: copy on
+        // selection off (VS Code's default) and the built-in scrollback.
+        std::fs::write(&path, r#"{"theme":"dark"}"#).expect("write old config");
+        let old = Prefs::load(&path).expect("load old");
+        assert!(!old.copy_on_select);
+        assert_eq!(old.terminal_scrollback, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn terminal_scrollback_lines_defaults_and_clamps() {
+        assert_eq!(terminal_scrollback_lines(0, 5000), 5000, "0 = unset");
+        assert_eq!(terminal_scrollback_lines(20_000, 5000), 20_000);
+        assert_eq!(terminal_scrollback_lines(5, 5000), 100, "floor");
+        assert_eq!(terminal_scrollback_lines(9_999_999, 5000), 200_000, "cap");
     }
 
     #[test]

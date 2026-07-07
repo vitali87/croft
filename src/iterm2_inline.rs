@@ -905,6 +905,8 @@ pub const KITTY_ID_LAYOUT_SIDEBAR: u32 = KITTY_ID_BASE + 15;
 pub const KITTY_ID_LAYOUT_PANEL: u32 = KITTY_ID_BASE + 16;
 pub const KITTY_ID_LAYOUT_CUSTOMIZE: u32 = KITTY_ID_BASE + 17;
 pub const KITTY_ID_MINIMAP: u32 = KITTY_ID_BASE + 18;
+/// The active terminal pane's newest captured inline image (imgcat).
+pub const KITTY_ID_TERMINAL: u32 = KITTY_ID_BASE + 19;
 /// Source-control change-count badge, emitted at z=1 over the SCM icon.
 pub const KITTY_ID_SCM_BADGE: u32 = KITTY_ID_BASE + 19;
 /// Explorer unsaved-file count badge, emitted at z=1 over the Explorer icon.

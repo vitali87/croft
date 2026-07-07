@@ -244,7 +244,38 @@ pub struct PtyTerminal {
     /// Notify/bell trigger firings from the reader thread, awaiting the
     /// app's drain into the status bar.
     trigger_rx: std::sync::mpsc::Receiver<crate::triggers::TriggerHit>,
+    /// The theme's 16 ANSI colors; Named and Indexed 0-15 cell colors render
+    /// through it so panes look the same on every host terminal (VS Code
+    /// owns its terminal palette the same way). Synced by the app's theme
+    /// pass via [`Self::set_palette`].
+    palette: [(u8, u8, u8); 16],
+    /// Inline images captured from the pane's output (iTerm2 OSC 1337
+    /// `inline=1`, the imgcat protocol), anchored like marks. Capped at
+    /// [`IMAGES_MAX`]; the app overlays the newest visible one.
+    images: Arc<std::sync::Mutex<Vec<StoredImage>>>,
 }
+
+/// One captured inline image at its recording-time anchor (same drift model
+/// as [`StoredMark`]: current line = `line_rec - (history_now - hist_rec)`).
+struct StoredImage {
+    seq: u64,
+    data: std::sync::Arc<Vec<u8>>,
+    line_rec: i32,
+    hist_rec: usize,
+}
+
+/// A pane inline image surfaced to the app: its per-pane id, the raw image
+/// bytes, and the anchor's CURRENT grid line (negative = scrolled into
+/// history).
+#[derive(Clone)]
+pub struct PaneImage {
+    pub seq: u64,
+    pub data: std::sync::Arc<Vec<u8>>,
+    pub line: i32,
+}
+
+/// Most inline images kept per pane; older ones scroll away like text.
+const IMAGES_MAX: usize = 4;
 
 /// One quick-select hint for the render loop: the match span on absolute
 /// grid line `line` (char indices into the spacer-skipped row text; the
@@ -714,6 +745,48 @@ impl PtyTerminal {
         self.trigger_rx.try_iter().collect()
     }
 
+    /// Swap the ANSI palette the render loop maps Named/Indexed 0-15 cell
+    /// colors through (the theme sync calls this every pass; unchanged
+    /// palettes are a no-op so the pane never dirties spuriously).
+    pub fn set_palette(&mut self, palette: [(u8, u8, u8); 16]) {
+        if self.palette != palette {
+            self.palette = palette;
+            self.pty_dirty.store(true, Ordering::Release);
+        }
+    }
+
+    /// Inline images captured from the pane's output, oldest first, each
+    /// with its anchor's CURRENT grid line (drift model identical to command
+    /// marks). Images whose anchor scrolled past the scrollback floor are
+    /// garbage-collected here.
+    pub fn pane_images(&self) -> Vec<PaneImage> {
+        let term = self.term.lock();
+        let hist_now = term.grid().history_size() as i32;
+        let floor = term.grid().topmost_line().0;
+        drop(term);
+        let mut imgs = self.images.lock().unwrap();
+        imgs.retain(|m| m.line_rec - (hist_now - m.hist_rec as i32) >= floor);
+        imgs.iter()
+            .map(|m| PaneImage {
+                seq: m.seq,
+                data: m.data.clone(),
+                line: m.line_rec - (hist_now - m.hist_rec as i32),
+            })
+            .collect()
+    }
+
+    /// Whether the pane is in the alternate screen (a full-screen app owns
+    /// the viewport; anchored overlays make no sense there).
+    pub fn alt_screen(&self) -> bool {
+        self.term.lock().mode().contains(TermMode::ALT_SCREEN)
+    }
+
+    /// The viewport's scroll offset into history (0 = live bottom). Public
+    /// so the app can map an anchor's grid line to a viewport row.
+    pub fn scroll_display_offset(&self) -> i32 {
+        self.display_offset()
+    }
+
     /// Scroll the viewport so absolute grid line `abs_line` sits near the
     /// middle of the pane, clamped to the scrollback range. No-op in
     /// alternate screen, where there is no scrollback to move through and the
@@ -761,7 +834,13 @@ impl PtyTerminal {
 
         let term_size = TermSize::new(cols as usize, rows as usize);
         let cfg = Config {
-            scrolling_history: SCROLLBACK_LINES,
+            // The user's `terminal_scrollback` (config.json) when set,
+            // else the built-in default. Read per spawn so a settings edit
+            // applies to the next pane without a relaunch.
+            scrolling_history: crate::prefs::terminal_scrollback_lines(
+                crate::prefs::Prefs::load_or_default().terminal_scrollback,
+                SCROLLBACK_LINES,
+            ),
             ..Config::default()
         };
         let size_shared = Arc::new(std::sync::Mutex::new((cols, rows)));
@@ -810,6 +889,8 @@ impl PtyTerminal {
 
         let marks = Arc::new(std::sync::Mutex::new(Vec::<StoredMark>::new()));
         let marks_for_thread = marks.clone();
+        let images = Arc::new(std::sync::Mutex::new(Vec::<StoredImage>::new()));
+        let images_for_thread = images.clone();
         let (finished_tx, finished_rx) =
             std::sync::mpsc::channel::<(Option<i32>, std::time::Duration)>();
         let osc7_cwd = Arc::new(std::sync::Mutex::new(Option::<std::path::PathBuf>::None));
@@ -830,6 +911,9 @@ impl PtyTerminal {
             let mut osc_sniffer = crate::shell_integration::OscSniffer::default();
             let mut trigger_scanner = crate::triggers::TriggerScanner::new();
             let mut trigger_hits = Vec::new();
+            // Per-pane monotonic id for captured inline images; the overlay
+            // layout key uses it to tell a new picture from a moved one.
+            let mut image_seq = 0u64;
             // Command timing: armed by 133;C, consumed by the next 133;D.
             let mut cmd_start: Option<std::time::Instant> = None;
             let mut buf = [0u8; 65536];
@@ -856,6 +940,26 @@ impl PtyTerminal {
                                 }
                                 E::Notify(msg) => {
                                     notifications_for_thread.lock().unwrap().push(msg);
+                                }
+                                E::InlineImage(data) => {
+                                    // Anchor the picture at the cursor's grid
+                                    // position, exactly like a mark; the
+                                    // overlay derives the current line via
+                                    // the same drift model.
+                                    let line_rec = t.grid().cursor.point.line.0;
+                                    let hist_rec = t.grid().history_size();
+                                    let mut imgs = images_for_thread.lock().unwrap();
+                                    if imgs.len() >= IMAGES_MAX {
+                                        let drop_n = imgs.len() + 1 - IMAGES_MAX;
+                                        imgs.drain(..drop_n);
+                                    }
+                                    image_seq += 1;
+                                    imgs.push(StoredImage {
+                                        seq: image_seq,
+                                        data: std::sync::Arc::new(data),
+                                        line_rec,
+                                        hist_rec,
+                                    });
                                 }
                                 kind @ (E::PromptStart
                                 | E::PromptEnd
@@ -954,6 +1058,8 @@ impl PtyTerminal {
             hints: None,
             triggers,
             trigger_rx,
+            palette: crate::theme::VSCODE_ANSI,
+            images,
         })
     }
 
@@ -1471,6 +1577,19 @@ impl PtyTerminal {
         true
     }
 
+    /// Jump the viewport to the oldest scrollback line (Shift+Home). No-op
+    /// in the alternate screen, which has no scrollback.
+    pub fn scroll_to_top(&mut self) -> bool {
+        let mut term = self.term.lock();
+        if term.mode().contains(TermMode::ALT_SCREEN) {
+            return false;
+        }
+        term.scroll_display(Scroll::Top);
+        drop(term);
+        self.pty_dirty.store(true, Ordering::Release);
+        true
+    }
+
     pub fn reset_scrollback(&mut self) {
         let mut term = self.term.lock();
         term.scroll_display(Scroll::Bottom);
@@ -1773,42 +1892,45 @@ pub fn osc52_copy_seq(text: &str) -> Vec<u8> {
     out
 }
 
-fn ansi_to_ratatui(c: AnsiColor) -> Option<Color> {
+/// Map an alacritty cell color to ratatui through the theme's 16-color ANSI
+/// palette: Named colors and Indexed 0-15 resolve to the palette's RGB (so a
+/// pane renders the same on every host terminal, the way VS Code owns its
+/// terminal palette); true-color cells pass through; higher indexes keep the
+/// standard 256-color cube the host renders.
+fn ansi_to_ratatui(c: AnsiColor, palette: &[(u8, u8, u8); 16]) -> Option<Color> {
     match c {
         AnsiColor::Spec(rgb) => Some(Color::Rgb(rgb.r, rgb.g, rgb.b)),
+        AnsiColor::Indexed(i) if i < 16 => Some(pal(palette, i as usize)),
         AnsiColor::Indexed(i) => Some(Color::Indexed(i)),
-        AnsiColor::Named(named) => named_to_ratatui(named),
+        AnsiColor::Named(named) => named_to_ratatui(named, palette),
     }
 }
 
-fn named_to_ratatui(n: NamedColor) -> Option<Color> {
+fn pal(palette: &[(u8, u8, u8); 16], i: usize) -> Color {
+    let (r, g, b) = palette[i];
+    Color::Rgb(r, g, b)
+}
+
+fn named_to_ratatui(n: NamedColor, palette: &[(u8, u8, u8); 16]) -> Option<Color> {
     use NamedColor::*;
     match n {
         Foreground | Background | Cursor | DimForeground => None,
-        Black => Some(Color::Black),
-        Red => Some(Color::Red),
-        Green => Some(Color::Green),
-        Yellow => Some(Color::Yellow),
-        Blue => Some(Color::Blue),
-        Magenta => Some(Color::Magenta),
-        Cyan => Some(Color::Cyan),
-        White => Some(Color::Gray),
-        BrightBlack => Some(Color::DarkGray),
-        BrightRed => Some(Color::LightRed),
-        BrightGreen => Some(Color::LightGreen),
-        BrightYellow => Some(Color::LightYellow),
-        BrightBlue => Some(Color::LightBlue),
-        BrightMagenta => Some(Color::LightMagenta),
-        BrightCyan => Some(Color::LightCyan),
-        BrightWhite => Some(Color::White),
-        DimBlack => Some(Color::Black),
-        DimRed => Some(Color::Red),
-        DimGreen => Some(Color::Green),
-        DimYellow => Some(Color::Yellow),
-        DimBlue => Some(Color::Blue),
-        DimMagenta => Some(Color::Magenta),
-        DimCyan => Some(Color::Cyan),
-        DimWhite => Some(Color::Gray),
+        Black | DimBlack => Some(pal(palette, 0)),
+        Red | DimRed => Some(pal(palette, 1)),
+        Green | DimGreen => Some(pal(palette, 2)),
+        Yellow | DimYellow => Some(pal(palette, 3)),
+        Blue | DimBlue => Some(pal(palette, 4)),
+        Magenta | DimMagenta => Some(pal(palette, 5)),
+        Cyan | DimCyan => Some(pal(palette, 6)),
+        White | DimWhite => Some(pal(palette, 7)),
+        BrightBlack => Some(pal(palette, 8)),
+        BrightRed => Some(pal(palette, 9)),
+        BrightGreen => Some(pal(palette, 10)),
+        BrightYellow => Some(pal(palette, 11)),
+        BrightBlue => Some(pal(palette, 12)),
+        BrightMagenta => Some(pal(palette, 13)),
+        BrightCyan => Some(pal(palette, 14)),
+        BrightWhite => Some(pal(palette, 15)),
         BrightForeground => None,
     }
 }
@@ -1934,10 +2056,10 @@ impl Widget for &mut PtyTerminal {
                 let cell = &term.grid()[p];
                 let mut display_char = if cell.c == '\0' { ' ' } else { cell.c };
                 let mut style = Style::default();
-                if let Some(c) = ansi_to_ratatui(cell.fg) {
+                if let Some(c) = ansi_to_ratatui(cell.fg, &self.palette) {
                     style = style.fg(c);
                 }
-                if let Some(c) = ansi_to_ratatui(cell.bg) {
+                if let Some(c) = ansi_to_ratatui(cell.bg, &self.palette) {
                     style = style.bg(c);
                 }
                 let flags = cell.flags;
@@ -2095,6 +2217,38 @@ mod tests {
     fn feed(term: &mut Term<VoidListener>, bytes: &[u8]) {
         let mut p = Processor::<StdSyncHandler>::new();
         p.advance(term, bytes);
+    }
+
+    #[test]
+    fn resize_reflows_long_lines_instead_of_truncating() {
+        // Scrollback soft-reflow is an engine property (alacritty_terminal's
+        // Term::resize reflows the normal screen); this pins it so a future
+        // engine upgrade can't silently lose it.
+        let mut term = fresh_term(30, 5);
+        feed(&mut term, b"abcdefghijklmnopqrstuvwxyz1234\r\n");
+        term.resize(TermSize::new(10, 5));
+        let top = term.grid().topmost_line().0;
+        let bottom = term.screen_lines() as i32 - 1;
+        let mut all = String::new();
+        for l in top..=bottom {
+            let (s, _) = row_text_and_cols(&term, l);
+            all.push_str(s.trim_end());
+        }
+        assert!(
+            all.contains("abcdefghijklmnopqrstuvwxyz1234"),
+            "text must survive a narrowing resize by reflowing: {all:?}"
+        );
+        // Widening back re-joins the soft-wrapped rows onto one line.
+        term.resize(TermSize::new(40, 5));
+        let joined: Vec<String> = (term.grid().topmost_line().0..term.screen_lines() as i32)
+            .map(|l| row_text_and_cols(&term, l).0.trim_end().to_string())
+            .collect();
+        assert!(
+            joined
+                .iter()
+                .any(|r| r.contains("abcdefghijklmnopqrstuvwxyz1234")),
+            "widening must re-join the reflowed rows: {joined:?}"
+        );
     }
 
     #[test]
@@ -2456,6 +2610,104 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
             waited_ms += 20;
         }
+    }
+
+    #[test]
+    fn ansi_named_colors_render_through_the_theme_palette() {
+        // SGR 31 red must come out as the theme palette's red (VS Code's
+        // #cd3131 by default), not the host terminal's Color::Red — croft
+        // owns its terminal palette the way VS Code does. A palette swap
+        // repaints with the new colors.
+        let tmp = tempfile::tempdir().unwrap();
+        // The sentinel is assembled at runtime (`${s}RED`) so the pane's
+        // `▶ …` run-label header — which contains the raw command text —
+        // can never match the scan below.
+        let mut term = PtyTerminal::new_running(
+            "/bin/sh",
+            &[
+                String::from("-c"),
+                String::from("s=QQ; printf \"\\033[31m${s}RED\\033[0m\\n\"; sleep 30"),
+            ],
+            tmp.path(),
+        )
+        .unwrap();
+        wait_for_grid(&term, |ls| ls.iter().any(|l| l.contains("QQRED")));
+        let area = Rect::new(0, 0, 60, 10);
+        let find_q_fg = |term: &mut PtyTerminal| -> Option<Color> {
+            let mut buf = Buffer::empty(area);
+            Widget::render(term, area, &mut buf);
+            for y in 0..area.height {
+                for x in 1..area.width - 2 {
+                    if buf[(x, y)].symbol() == "Q"
+                        && buf[(x + 1, y)].symbol() == "Q"
+                        && buf[(x + 2, y)].symbol() == "R"
+                    {
+                        return Some(buf[(x, y)].fg);
+                    }
+                }
+            }
+            None
+        };
+        assert_eq!(
+            find_q_fg(&mut term),
+            Some(Color::Rgb(0xcd, 0x31, 0x31)),
+            "SGR red must map through the default palette"
+        );
+        let mut palette = crate::theme::VSCODE_ANSI;
+        palette[1] = (0x12, 0x34, 0x56);
+        term.set_palette(palette);
+        assert_eq!(
+            find_q_fg(&mut term),
+            Some(Color::Rgb(0x12, 0x34, 0x56)),
+            "a palette swap must repaint SGR red with the new color"
+        );
+    }
+
+    #[test]
+    fn imgcat_style_inline_images_are_captured_with_a_grid_anchor() {
+        use base64::Engine;
+        // A 1x1 red PNG; what `imgcat tiny.png` would emit.
+        let mut png_buf = Vec::new();
+        image::RgbaImage::from_pixel(1, 1, image::Rgba([255, 0, 0, 255]))
+            .write_to(
+                &mut std::io::Cursor::new(&mut png_buf),
+                image::ImageFormat::Png,
+            )
+            .expect("encode test png");
+        let png: &[u8] = &png_buf;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(png);
+        let tmp = tempfile::tempdir().unwrap();
+        let script = format!(
+            "printf 'before\\n'; printf '\\033]1337;File=inline=1:{b64}\\007\\n'; printf 'after\\n'; sleep 30"
+        );
+        let term =
+            PtyTerminal::new_running("/bin/sh", &[String::from("-c"), script], tmp.path()).unwrap();
+        wait_for_grid(&term, |ls| ls.iter().any(|l| l.contains("after")));
+        let mut waited = 0u32;
+        let imgs = loop {
+            let imgs = term.pane_images();
+            if !imgs.is_empty() {
+                break imgs;
+            }
+            assert!(waited < 8000, "inline image never captured");
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            waited += 40;
+        };
+        assert_eq!(imgs.len(), 1);
+        assert_eq!(imgs[0].data.as_slice(), png, "payload must round-trip");
+        // Anchor: the row right after the `before` line (the run-label
+        // header above it wraps, so absolute row numbers are not stable).
+        let (lines, top) = term.grid_lines();
+        let before_row = lines
+            .iter()
+            .rposition(|l| l.trim_end() == "before")
+            .expect("the before line must be on the grid") as i32
+            + top;
+        assert_eq!(
+            imgs[0].line,
+            before_row + 1,
+            "anchor must sit on the image's grid row; grid: {lines:?}"
+        );
     }
 
     #[test]

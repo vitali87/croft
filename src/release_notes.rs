@@ -62,14 +62,14 @@ pub struct ReleaseNote {
 pub const RELEASE_NOTES: &[ReleaseNote] = &[
     ReleaseNote {
         kind: NoteKind::Feature,
-        summary: "Quick select in the terminal (Ctrl+Shift+Space, WezTerm's hint mode): every URL, path (incl. path:line:col), git SHA, UUID, IP, hex value, and long number on screen gets a short home-row label; type it to copy the match, type it in UPPERCASE to paste it straight into the shell, Esc cancels.",
+        summary: "imgcat works in the terminal: a program printing an iTerm2 OSC 1337 inline image shows the picture anchored at its output row, scrolling with the text and hiding once it scrolls off screen (the newest image per pane).",
     },
     ReleaseNote {
         kind: NoteKind::Feature,
-        summary: "iTerm2-style triggers: regexes in ~/.config/croft/triggers.json watch terminal output and highlight matches live in your colours (scrollback included), post status-bar notices with capture-group interpolation, or ring a bell notice; edit via the palette's \"Open Terminal Triggers (JSON)\", applied on save.",
+        summary: "The terminal owns its colors: ANSI output renders through the theme's 16-color palette (VS Code's dark terminal defaults), identical in every host terminal; theme extensions can override it with an ansi array in their [[themes]] block.",
     },
     ReleaseNote {
         kind: NoteKind::Feature,
-        summary: "Broadcast input (Cmd+K I, like iTerm2's Cmd+Opt+I): type and paste into every terminal pane at once for multi-server work, gated behind a confirm popup, with red \u{21f6} name pills marking every receiving pane, per-pane exclusion on Cmd+K Shift+I, and automatic shut-off when only one pane remains.",
+        summary: "Keyboard scrollback and selection niceties: Shift+PageUp/PageDown page through history (Shift+Home/End jump to the oldest line / live bottom), scrollback depth is configurable via terminal_scrollback in config.json, and a new \"Terminal: Copy on Selection\" setting copies a finished mouse selection without the explicit Cmd+C.",
     },
 ];

@@ -40,6 +40,11 @@ pub enum OscEvent {
     Cwd(PathBuf),
     /// OSC 9;<message> — a notification payload.
     Notify(String),
+    /// OSC 1337 `File=…;inline=1:<base64>` (iTerm2's imgcat protocol) — the
+    /// decoded image bytes a program printed into the pane. alacritty drops
+    /// the sequence as unknown OSC, so this tee is the only way the picture
+    /// survives to be drawn as an overlay.
+    InlineImage(Vec<u8>),
 }
 
 /// Incremental scanner for the OSC sequences croft cares about. Feed it
@@ -62,12 +67,21 @@ pub type SniffedEvent = (usize, OscEvent);
 /// legitimate OSC 133/7/9 is far shorter; this bounds a hostile stream).
 const CARRY_MAX: usize = 4096;
 
+/// Carry cap for OSC 1337 inline-image sequences, whose base64 body is
+/// legitimately megabytes. Bounds memory against a hostile or runaway
+/// stream; a photo past ~6MB of pixels is dropped rather than buffered
+/// forever. (The carry is re-prepended per 64KB chunk, so accumulation is
+/// quadratic in chunk count — fine at this cap, a streaming accumulator if
+/// bigger images ever matter.)
+const IMAGE_CARRY_MAX: usize = 8 * 1024 * 1024;
+
 /// Which of croft's OSC numbers a sequence carries.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum OscKind {
     SemanticPrompt, // 133
     Cwd,            // 7
     Notify,         // 9
+    ITerm2File,     // 1337 File= (inline images)
 }
 
 /// What the bytes starting at an ESC look like.
@@ -91,6 +105,9 @@ enum Terminator {
 }
 
 const OSC_PREFIXES: &[(&[u8], OscKind)] = &[
+    // Order matters: `]1337;` must be tried before `]133;`, whose prefix it
+    // contains — `]133;` would otherwise claim it and misparse the body.
+    (b"]1337;", OscKind::ITerm2File),
     (b"]133;", OscKind::SemanticPrompt),
     (b"]7;", OscKind::Cwd),
     (b"]9;", OscKind::Notify),
@@ -185,6 +202,28 @@ fn parse_event(kind: OscKind, body: &[u8]) -> Option<OscEvent> {
             )))
         }
         OscKind::Notify => Some(OscEvent::Notify(String::from_utf8_lossy(body).into_owned())),
+        OscKind::ITerm2File => {
+            let rest = body.strip_prefix(b"File=")?;
+            let colon = rest.iter().position(|&b| b == b':')?;
+            // `inline=1` is what makes the payload a picture to draw; without
+            // it the transfer is a download and none of croft's business.
+            let inline = rest[..colon]
+                .split(|&b| b == b';')
+                .any(|p| p == b"inline=1");
+            if !inline {
+                return None;
+            }
+            use base64::Engine;
+            let b64: Vec<u8> = rest[colon + 1..]
+                .iter()
+                .copied()
+                .filter(|b| !b.is_ascii_whitespace())
+                .collect();
+            let data = base64::engine::general_purpose::STANDARD
+                .decode(&b64)
+                .ok()?;
+            (!data.is_empty()).then_some(OscEvent::InlineImage(data))
+        }
     }
 }
 
@@ -238,8 +277,16 @@ impl OscSniffer {
     }
 
     /// Carry a partial sequence to the next chunk, abandoning runaway ones.
+    /// Inline-image sequences get a far larger allowance — their base64
+    /// bodies are legitimately megabytes — but once one is abandoned it
+    /// stays abandoned (the fuse) so the rest of a huge payload streams by
+    /// without being re-buffered from every later chunk.
     fn hold(&mut self, partial: &[u8]) {
-        if partial.len() > CARRY_MAX {
+        let cap = match classify(partial) {
+            Classify::Ours(OscKind::ITerm2File, _) => IMAGE_CARRY_MAX,
+            _ => CARRY_MAX,
+        };
+        if partial.len() > cap {
             self.carry.clear();
         } else {
             self.carry = partial.to_vec();
@@ -593,6 +640,49 @@ mod tests {
                 OscEvent::CommandStart,
                 OscEvent::CommandEnd(Some(1)),
             ]
+        );
+    }
+
+    #[test]
+    fn inline_image_osc_1337_is_captured_across_chunks() {
+        use base64::Engine;
+        let payload: Vec<u8> = (0u32..600).map(|i| (i % 251) as u8).collect();
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&payload);
+        let seq = format!("\x1b]1337;File=name=eC5wbmc=;size=600;inline=1:{b64}\x07");
+        let bytes = seq.as_bytes();
+        // Split inside the params and inside the base64 body: the payload is
+        // far longer than any OSC 133/7/9, so this exercises the large-image
+        // carry path.
+        let mut s = OscSniffer::default();
+        let events = scan_all(&mut s, &[&bytes[..20], &bytes[20..300], &bytes[300..]]);
+        assert_eq!(events, vec![OscEvent::InlineImage(payload.clone())]);
+        // Without inline=1 the payload is a download, not a picture: ignored.
+        let seq = format!("\x1b]1337;File=name=eC5wbmc=:{b64}\x07");
+        assert!(scan_all(&mut s, &[seq.as_bytes()]).is_empty());
+        // Marks flowing after an image still parse (the carry fully resets).
+        assert_eq!(
+            scan_all(&mut s, &[b"\x1b]133;A\x07"]),
+            vec![OscEvent::PromptStart]
+        );
+    }
+
+    #[test]
+    fn runaway_inline_image_payloads_are_abandoned() {
+        // A payload past the image carry cap is dropped without an event and
+        // without wedging the sniffer for later sequences.
+        let mut s = OscSniffer::default();
+        assert!(s.scan(b"\x1b]1337;File=inline=1:").is_empty());
+        let filler = vec![b'A'; IMAGE_CARRY_MAX + 4096];
+        for chunk in filler.chunks(65536) {
+            assert!(s.scan(chunk).is_empty());
+        }
+        assert!(
+            s.scan(b"\x07").is_empty(),
+            "the oversized image never fires"
+        );
+        assert_eq!(
+            scan_all(&mut s, &[b"\x1b]133;C\x07"]),
+            vec![OscEvent::CommandStart]
         );
     }
 
