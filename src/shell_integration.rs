@@ -263,6 +263,16 @@ if [[ -n "$CROFT_USER_ZDOTDIR" && "$CROFT_USER_ZDOTDIR" == "$_croft_shim_zdotdir
 fi
 ZDOTDIR="${CROFT_USER_ZDOTDIR:-$HOME}"
 [[ "$ZDOTDIR" != "$_croft_shim_zdotdir" && -f "$ZDOTDIR/.zshenv" ]] && builtin source "$ZDOTDIR/.zshenv"
+# The sourced file may be another terminal's injection shim (Ghostty, kitty
+# point ZDOTDIR at their own dir when launching croft as their command);
+# their .zshenv restores the REAL ZDOTDIR when sourced, so whatever it holds
+# now is the user's true dotfile dir. A user .zshenv that re-roots ZDOTDIR
+# (XDG setups) is honoured the same way.
+if [[ -z "$ZDOTDIR" || "$ZDOTDIR" == "$_croft_shim_zdotdir" ]]; then
+  export CROFT_USER_ZDOTDIR="$HOME"
+else
+  export CROFT_USER_ZDOTDIR="$ZDOTDIR"
+fi
 ZDOTDIR="$_croft_shim_zdotdir"
 "#;
 

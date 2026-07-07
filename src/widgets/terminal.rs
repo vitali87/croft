@@ -2203,6 +2203,74 @@ mod tests {
     }
 
     #[test]
+    fn foreign_terminal_shim_zdotdir_chains_to_the_user_rc() {
+        // Regression: Ghostty and kitty inject their own shell integration by
+        // pointing ZDOTDIR at their shim dir before launching their child.
+        // When that child is croft itself (ghostty --initial-command=croft),
+        // croft inherited the foreign shim as the "user" dotfile dir — a dir
+        // with no .zshrc — so the user's real rc (theme, aliases) never ran.
+        // The wrapper contract (kitty invented it, Ghostty copied it) is that
+        // the foreign .zshenv restores the REAL ZDOTDIR when sourced; croft's
+        // shim must re-read ZDOTDIR after chaining and source the user's rc
+        // from wherever it landed.
+        let zsh = "/bin/zsh";
+        if !std::path::Path::new(zsh).exists() {
+            return;
+        }
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            home.path().join(".zshrc"),
+            "USER_RC_SENTINEL=loaded\nexport USER_RC_SENTINEL\n",
+        )
+        .unwrap();
+        // A Ghostty-style wrapper shim: only a .zshenv, which restores the
+        // real ZDOTDIR (here: unset, meaning HOME) and chains onward.
+        let foreign = tempfile::tempdir().unwrap();
+        std::fs::write(
+            foreign.path().join(".zshenv"),
+            "builtin unset ZDOTDIR\n[[ -r \"$HOME/.zshenv\" ]] && builtin source \"$HOME/.zshenv\"\n",
+        )
+        .unwrap();
+        let cfg_dir = tempfile::tempdir().unwrap();
+        let shim = crate::shell_integration::ensure_zsh_shim(cfg_dir.path()).unwrap();
+        let mut cmd = CommandBuilder::new(zsh);
+        cmd.arg("-i");
+        cmd.cwd(home.path());
+        cmd.env("HOME", home.path());
+        cmd.env("ZDOTDIR", &shim);
+        // What resolve_user_zdotdir hands the pane: the inherited foreign dir.
+        cmd.env("CROFT_USER_ZDOTDIR", foreign.path());
+        let mut term = PtyTerminal::spawn_with(cmd, None).unwrap();
+        let mut waited = 0u32;
+        while term.prompt_lines().is_empty() {
+            assert!(
+                waited < 8000,
+                "no prompt mark; grid: {:?}",
+                term.grid_lines().0
+            );
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            waited += 40;
+        }
+        term.write_input(b"echo SENTINEL_IS=$USER_RC_SENTINEL\r");
+        let mut waited = 0u32;
+        loop {
+            let (lines, _) = term.grid_lines();
+            if lines
+                .iter()
+                .any(|l| l.contains("SENTINEL_IS=loaded") && !l.contains("echo"))
+            {
+                break;
+            }
+            assert!(
+                waited < 8000,
+                "user rc never ran behind a foreign terminal shim; grid: {lines:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            waited += 40;
+        }
+    }
+
+    #[test]
     fn zsh_shim_emits_prompt_marks_end_to_end() {
         // The real proof: an interactive zsh reading croft's ZDOTDIR shim
         // must emit OSC 133 prompt marks and an OSC 7 cwd report at its
