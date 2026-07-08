@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Fix,
-    summary: "Terminal selections now stay glued to their content while a program keeps printing (Claude Code and other streaming apps): the highlight, the copied text, and the copy-mode cursor all track the rows they were made on into scrollback instead of sitting at fixed screen lines while output slides underneath.",
+    summary: "Terminal selections now track streaming output in long-lived panes too: once scrollback filled up (5000 lines), the drift correction silently stopped counting and highlights froze at fixed screen rows again while text kept scrolling. The selection clock now measures true lines scrolled, so highlights, copied text and the copy-mode cursor stay glued to their content no matter how old the pane is.",
 }];

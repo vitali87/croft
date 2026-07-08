@@ -1,7 +1,8 @@
 use alacritty_terminal::Term;
 use alacritty_terminal::event::{Event as AlacEvent, EventListener};
 use alacritty_terminal::grid::{Dimensions, Scroll};
-use alacritty_terminal::index::{Column, Line, Point};
+use alacritty_terminal::index::{Column, Line, Point, Side};
+use alacritty_terminal::selection::{Selection as TracerSelection, SelectionType};
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::test::TermSize;
@@ -232,12 +233,20 @@ pub struct PtyTerminal {
     /// a green modal block over the glyph so keyboard selection has a
     /// visible caret. None whenever copy mode is off.
     copy_cursor: Option<(i32, u16)>,
-    /// `history_size` when the selection / copy-cursor coordinates were
-    /// recorded. Grid lines are relative to the buffer bottom, so every row
-    /// the pane scrolls into history afterwards shifts their content up by
-    /// one; subtracting the growth since this stamp keeps them glued to
-    /// their text while output streams (the marks system's drift math).
-    sel_hist: u64,
+    /// Scroll-clock reading (see `clock_now`) when the selection /
+    /// copy-cursor coordinates were recorded. Grid lines are relative to
+    /// the buffer bottom, so every row the pane scrolls afterwards shifts
+    /// their content up by one; subtracting the clock movement since this
+    /// stamp keeps them glued to their text while output streams.
+    sel_scrolled: i64,
+    /// Monotonic scroll clock, folded up to the last `tick_clock`.
+    clock_base: i64,
+    /// Grid line the tracer selection was planted at during the last tick;
+    /// `None` before the first tick.
+    clock_planted: Option<i32>,
+    /// `history_size` at the last tick: fallback delta source for the rare
+    /// windows where the tracer died (screen clear, alt-screen round trip).
+    clock_hist: i64,
     /// User-given pane name (via rename), overriding the auto label. `None`
     /// until the user renames the pane.
     manual_name: Option<String>,
@@ -1185,7 +1194,10 @@ impl PtyTerminal {
             last_inner: Rect::default(),
             selection: None,
             copy_cursor: None,
-            sel_hist: 0,
+            sel_scrolled: 0,
+            clock_base: 0,
+            clock_planted: None,
+            clock_hist: 0,
             manual_name: None,
             auto_label: String::new(),
             search_needle: None,
@@ -1309,7 +1321,7 @@ impl PtyTerminal {
             head: (d.output_end - 1, self.cols.saturating_sub(1)),
             block: false,
         });
-        self.sel_hist = self.hist_size();
+        self.stamp_selection_clock();
         self.scroll_to_line(d.output_start);
     }
 
@@ -1640,28 +1652,88 @@ impl PtyTerminal {
         self.hyperlink_at(r as usize, c as usize)
     }
 
-    /// `history_size` right now: the base every stored selection coordinate
-    /// is stamped against (see `sel_hist`).
-    fn hist_size(&self) -> u64 {
-        self.term.lock().grid().history_size() as u64
+    /// Plant the one-cell tracer selection at `line` in alacritty's own
+    /// `Term::selection` slot (croft paints selections itself, so the slot
+    /// is otherwise unused). alacritty rotates it on every scroll —
+    /// including ring rotation once the scrollback is full, where
+    /// `history_size` saturates and stops counting — so its drift between
+    /// ticks is the true lines-scrolled count.
+    fn plant_tracer(term: &mut Term<VoidListener>, line: i32) {
+        let point = Point::new(Line(line), Column(0));
+        let mut tracer = TracerSelection::new(SelectionType::Simple, point, Side::Left);
+        tracer.update(point, Side::Right);
+        term.selection = Some(tracer);
+    }
+
+    /// Where the tracer sits now, when it survived since the last plant
+    /// (screen clears, alt-screen swaps and content rotating fully off the
+    /// scrollback kill it).
+    fn tracer_line(term: &Term<VoidListener>) -> Option<i32> {
+        let range = term.selection.as_ref()?.to_range(term)?;
+        Some(range.start.line.0)
+    }
+
+    /// The monotonic scroll clock: lines the primary screen has scrolled
+    /// since the pane spawned, read from the tracer's drift. Immune to the
+    /// `history_size` saturation that froze selections in long-lived panes
+    /// (the Claude Code drag-select bug: scrollback full for ages, so the
+    /// old history-growth delta was pinned at zero while content kept
+    /// rotating through the ring). Alt screen freezes the clock — output
+    /// goes to the alternate grid while primary content holds still. A dead
+    /// tracer falls back to history growth since the last tick: exact for
+    /// the viewport-pushing clear that killed it, zero for an alt-screen
+    /// round trip.
+    fn clock_now(&self, term: &Term<VoidListener>) -> i64 {
+        if term.mode().contains(TermMode::ALT_SCREEN) {
+            return self.clock_base;
+        }
+        match (self.clock_planted, Self::tracer_line(term)) {
+            (Some(planted), Some(cur)) => self.clock_base + i64::from(planted - cur),
+            _ => {
+                let growth = term.grid().history_size() as i64 - self.clock_hist;
+                self.clock_base + growth.max(0)
+            }
+        }
+    }
+
+    /// Fold the tracer's drift into the clock, re-plant it fresh and return
+    /// the folded reading. The newest history line is the parking spot:
+    /// application clears only touch live-screen rows, so nothing kills it
+    /// there, and it sits a full scrollback's depth from rotating off the
+    /// top before the next tick (every rendered frame ticks).
+    fn tick_clock(&mut self) -> i64 {
+        let mut term = self.term.lock();
+        let now = self.clock_now(&term);
+        if !term.mode().contains(TermMode::ALT_SCREEN) {
+            self.clock_base = now;
+            self.clock_hist = term.grid().history_size() as i64;
+            let park = if self.clock_hist > 0 { -1 } else { 0 };
+            Self::plant_tracer(&mut term, park);
+            self.clock_planted = Some(park);
+        }
+        now
+    }
+
+    /// Stamp freshly-set selection / copy-cursor coordinates against a
+    /// fresh clock tick.
+    fn stamp_selection_clock(&mut self) {
+        self.sel_scrolled = self.tick_clock();
     }
 
     /// Shift the stored selection and copy-cursor down-anchored coordinates
-    /// by the history growth since they were recorded, so they keep naming
-    /// the same content while output streams. Endpoints whose content fell
-    /// off the scrollback pin to the oldest line; a selection entirely off
-    /// the buffer is dropped for good. No-op (and no lock) when neither
-    /// exists — setters stamp `sel_hist` themselves.
+    /// by the scroll-clock movement since they were recorded, so they keep
+    /// naming the same content while output streams. Endpoints whose
+    /// content fell off the scrollback pin to the oldest line; a selection
+    /// entirely off the buffer is dropped for good. No-op (and no lock)
+    /// when neither exists — setters stamp `sel_scrolled` themselves.
     fn rebase_selection(&mut self) {
         if self.selection.is_none() && self.copy_cursor.is_none() {
             return;
         }
-        let term = self.term.lock();
-        let hist_now = term.grid().history_size() as u64;
-        let top = term.grid().topmost_line().0;
-        drop(term);
-        let delta = hist_now.saturating_sub(self.sel_hist) as i32;
-        self.sel_hist = hist_now;
+        let now = self.tick_clock();
+        let top = self.term.lock().grid().topmost_line().0;
+        let delta = (now - self.sel_scrolled) as i32;
+        self.sel_scrolled = now;
         if delta != 0 {
             if let Some(sel) = self.selection.as_mut() {
                 sel.anchor.0 -= delta;
@@ -1689,7 +1761,7 @@ impl PtyTerminal {
         if let Some((r, c)) = self.cell_at(col, row) {
             let line = r as i32 - self.display_offset();
             self.selection = Some(Selection::new(line, c));
-            self.sel_hist = self.hist_size();
+            self.stamp_selection_clock();
         }
     }
 
@@ -1782,7 +1854,6 @@ impl PtyTerminal {
         else {
             return;
         };
-        let hist_now = term.grid().history_size() as u64;
         drop(term);
         // `select_word_at_in_term` reports viewport rows; anchor them to
         // absolute grid lines so the selection stays put when scrolled.
@@ -1793,15 +1864,15 @@ impl PtyTerminal {
             head: to_abs(head),
             block: false,
         });
-        self.sel_hist = hist_now;
+        self.stamp_selection_clock();
     }
 
-    /// The selection with its endpoints corrected for history growth since
-    /// they were recorded, so callers always see coordinates that name the
-    /// content the user selected (see `rebase_selection`).
+    /// The selection with its endpoints corrected for the scroll-clock
+    /// movement since they were recorded, so callers always see coordinates
+    /// that name the content the user selected (see `rebase_selection`).
     pub fn selection(&self) -> Option<Selection> {
         let mut sel = self.selection?;
-        let delta = self.hist_size().saturating_sub(self.sel_hist) as i32;
+        let delta = (self.clock_now(&self.term.lock()) - self.sel_scrolled) as i32;
         sel.anchor.0 -= delta;
         sel.head.0 -= delta;
         Some(sel)
@@ -1812,7 +1883,7 @@ impl PtyTerminal {
     pub fn set_selection(&mut self, sel: Option<Selection>) {
         self.rebase_selection();
         self.selection = sel;
-        self.sel_hist = self.hist_size();
+        self.stamp_selection_clock();
         self.pty_dirty.store(true, Ordering::Release);
     }
 
@@ -1820,7 +1891,7 @@ impl PtyTerminal {
     pub fn set_copy_cursor(&mut self, cur: Option<(i32, u16)>) {
         self.rebase_selection();
         self.copy_cursor = cur;
-        self.sel_hist = self.hist_size();
+        self.stamp_selection_clock();
         self.pty_dirty.store(true, Ordering::Release);
     }
 
@@ -1854,9 +1925,9 @@ impl PtyTerminal {
             return String::new();
         };
         let term = self.term.lock();
-        // Same history-growth correction as `selection()`, computed under
+        // Same scroll-clock correction as `selection()`, computed under
         // the lock already held for extraction.
-        let delta = (term.grid().history_size() as u64).saturating_sub(self.sel_hist) as i32;
+        let delta = (self.clock_now(&term) - self.sel_scrolled) as i32;
         sel.anchor.0 -= delta;
         sel.head.0 -= delta;
         if sel.block {
@@ -4853,6 +4924,60 @@ mod tests {
         assert!(
             sel.anchor.0 < line,
             "reported endpoints re-anchor upward as lines scroll into history"
+        );
+    }
+
+    #[test]
+    fn selection_survives_streaming_past_a_saturated_scrollback() {
+        // Once a pane has scrolled more than SCROLLBACK_LINES, history_size
+        // saturates at the cap while content keeps rotating through the
+        // ring. A selection made in that state must still track its content
+        // as more output streams (the live Claude Code pane: long-running,
+        // scrollback full since forever).
+        let tmp = tempfile::tempdir().unwrap();
+        let go = tmp.path().join("go");
+        let script = format!(
+            "seq 1 5200; t=TAR; echo \"${{t}}GET-line\"; until [ -e {} ]; do sleep 0.05; done; seq 1 60; sleep 30",
+            go.display()
+        );
+        let mut term =
+            PtyTerminal::new_running("/bin/sh", &[String::from("-c"), script], tmp.path()).unwrap();
+        let mut waited = 0u32;
+        let line = loop {
+            let (lines, top) = term.grid_lines();
+            if let Some(idx) = lines.iter().position(|l| l.starts_with("TARGET-line")) {
+                break top + idx as i32;
+            }
+            assert!(waited < 8000, "sentinel never arrived");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            waited += 20;
+        };
+        let hist_at_select = term.term.lock().grid().history_size();
+        term.set_selection(Some(Selection {
+            anchor: (line, 0),
+            head: (line, 30),
+            block: false,
+        }));
+        assert_eq!(term.selection_text(), "TARGET-line");
+
+        std::fs::File::create(&go).unwrap();
+        let mut waited = 0u32;
+        while !term.grid_lines().0.iter().any(|l| l == "60") {
+            assert!(waited < 8000, "streamed output never arrived");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            waited += 20;
+        }
+        // Premise of this test: the scrollback was already full, so
+        // history_size never moved even though 60 lines scrolled past.
+        assert_eq!(
+            term.term.lock().grid().history_size(),
+            hist_at_select,
+            "test setup must saturate the scrollback before streaming"
+        );
+        assert_eq!(
+            term.selection_text(),
+            "TARGET-line",
+            "the selection must follow its content even with history_size saturated"
         );
     }
 
