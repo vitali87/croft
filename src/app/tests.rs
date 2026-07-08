@@ -17435,3 +17435,348 @@ fn settings_view_toggle_flips_the_setting_and_stays_open() {
         "a toggle keeps the settings hub open so more can be flipped"
     );
 }
+
+#[test]
+fn undo_close_restores_a_closed_terminal_pane_with_its_process_alive() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let mk = || {
+        crate::widgets::terminal::PtyTerminal::new_running(
+            "/bin/sh",
+            &[
+                String::from("-c"),
+                String::from("read x; echo revived-$x; sleep 30"),
+            ],
+            tmp.path(),
+        )
+        .unwrap()
+    };
+    app.terminals[0] = mk();
+    app.terminals.push(mk());
+    app.terminals[1].set_manual_name(Some(String::from("keepme")));
+    app.active_terminal = 1;
+    app.focus_pane(Pane::Terminal);
+
+    assert!(app.close_active_terminal());
+    assert_eq!(app.terminals.len(), 1);
+
+    // Cmd+K Shift+T brings the pane back: same slot, same name, and the
+    // child process never died in the grace window.
+    assert!(app.handle_cmd_k_chord(key(KeyCode::Char('T'), KeyModifiers::SHIFT)));
+    assert_eq!(app.terminals.len(), 2, "undo close must restore the pane");
+    assert_eq!(app.terminals[1].label(), "keepme");
+    assert_eq!(app.active_terminal, 1, "the restored pane takes focus");
+    app.terminals[1].write_input(b"back\n");
+    let mut waited = 0u32;
+    while !app.terminals[1]
+        .grid_lines()
+        .0
+        .iter()
+        .any(|l| l.contains("revived-back"))
+    {
+        assert!(waited < 8000, "restored pane's shell no longer answers");
+        std::thread::sleep(std::time::Duration::from_millis(40));
+        waited += 40;
+    }
+
+    // Past the grace window the parked pane is dropped for real: the tick
+    // reaps it and undo has nothing left to restore.
+    assert!(app.close_active_terminal());
+    for parked in &mut app.closed_terminals {
+        parked.closed_at =
+            std::time::Instant::now() - UNDO_CLOSE_GRACE - std::time::Duration::from_secs(1);
+    }
+    app.drain_terminal_bells();
+    assert!(
+        app.closed_terminals.is_empty(),
+        "expired parked panes must be reaped by the tick"
+    );
+    assert!(app.handle_cmd_k_chord(key(KeyCode::Char('T'), KeyModifiers::SHIFT)));
+    assert_eq!(app.terminals.len(), 1, "nothing to restore after expiry");
+}
+
+#[test]
+fn copy_mode_navigates_scrollback_with_vi_keys_and_copies_char_line_and_block() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    // Row 0 is the deterministic `▶ …` run-label header; the printf rows
+    // land on rows 1..=3. Lines are short so nothing wraps at 80 cols.
+    app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
+        "/bin/sh",
+        &[
+            String::from("-c"),
+            // Sentinels are assembled at runtime so the pane's `▶ …` header
+            // (which echoes the command text) can never match the waits.
+            String::from("x=a; y=b; z=c; printf \"${x}aaa1\\n${y}bbb2\\n${z}cc3\\n\"; sleep 30"),
+        ],
+        tmp.path(),
+    )
+    .unwrap();
+    app.focus_pane(Pane::Terminal);
+    let mut waited = 0u32;
+    while !app.terminals[0]
+        .grid_lines()
+        .0
+        .iter()
+        .any(|l| l.contains("ccc3"))
+    {
+        assert!(waited < 8000, "pane output never arrived");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        waited += 20;
+    }
+    let enter_copy_mode = key(
+        KeyCode::Char('y'),
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+    );
+    let press = |app: &mut App, code: KeyCode| {
+        app.handle_terminal_key(key(code, KeyModifiers::NONE));
+    };
+    // The header may wrap, so locate "aaaa1" by content: its distance from
+    // the grid top is the number of j presses after g.
+    let (lines, top) = app.terminals[0].grid_lines();
+    let hops = lines
+        .iter()
+        .position(|l| l.starts_with("aaaa1"))
+        .expect("printf output must be on the grid");
+    assert!(top <= 0, "no scrollback expected in this tiny session");
+    let down = |app: &mut App, n: usize| {
+        for _ in 0..n {
+            app.handle_terminal_key(key(KeyCode::Char('j'), KeyModifiers::NONE));
+        }
+    };
+
+    // Char selection: g to the grid top, j down to "aaaa1", v at col 0,
+    // $ to the line's last glyph, y copies and leaves copy mode.
+    app.handle_terminal_key(enter_copy_mode);
+    assert!(
+        app.terminal_copy_mode.is_some(),
+        "Ctrl+Shift+Y must enter copy mode"
+    );
+    press(&mut app, KeyCode::Char('g'));
+    down(&mut app, hops);
+    press(&mut app, KeyCode::Char('0'));
+    press(&mut app, KeyCode::Char('v'));
+    press(&mut app, KeyCode::Char('$'));
+    press(&mut app, KeyCode::Char('y'));
+    assert_eq!(
+        crate::clipboard::read_string().unwrap_or_default(),
+        "aaaa1",
+        "v + $ + y must copy the whole first output line"
+    );
+    assert!(app.terminal_copy_mode.is_none(), "y exits copy mode");
+
+    // Line selection: V spans full rows regardless of cursor column.
+    app.handle_terminal_key(enter_copy_mode);
+    press(&mut app, KeyCode::Char('g'));
+    down(&mut app, hops);
+    press(&mut app, KeyCode::Char('l'));
+    press(&mut app, KeyCode::Char('l'));
+    press(&mut app, KeyCode::Char('V'));
+    press(&mut app, KeyCode::Char('j'));
+    press(&mut app, KeyCode::Char('y'));
+    assert_eq!(
+        crate::clipboard::read_string().unwrap_or_default(),
+        "aaaa1\nbbbb2",
+        "V + j + y must copy both full lines"
+    );
+
+    // Block selection: a 2-wide, 3-tall rectangle from the output rows.
+    app.handle_terminal_key(enter_copy_mode);
+    press(&mut app, KeyCode::Char('g'));
+    down(&mut app, hops);
+    press(&mut app, KeyCode::Char('0'));
+    app.handle_terminal_key(key(KeyCode::Char('v'), KeyModifiers::CONTROL));
+    press(&mut app, KeyCode::Char('j'));
+    press(&mut app, KeyCode::Char('j'));
+    press(&mut app, KeyCode::Char('l'));
+    press(&mut app, KeyCode::Char('y'));
+    assert_eq!(
+        crate::clipboard::read_string().unwrap_or_default(),
+        "aa\nbb\ncc",
+        "Ctrl+V must cut a rectangular column slice"
+    );
+
+    // Esc exits and drops the highlight.
+    app.handle_terminal_key(enter_copy_mode);
+    press(&mut app, KeyCode::Char('v'));
+    press(&mut app, KeyCode::Esc);
+    assert!(app.terminal_copy_mode.is_none(), "Esc exits copy mode");
+    assert!(
+        app.terminals[0].selection().is_none(),
+        "leaving copy mode must clear the selection highlight"
+    );
+}
+
+#[test]
+fn capture_triggers_collect_into_the_captures_panel_and_jump_to_the_line() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.triggers = std::sync::Arc::new(crate::triggers::TriggerSet::from_json(
+        r#"[ { "regex": "err-(\\d+)", "action": "capture", "message": "boom \\1" } ]"#,
+    ));
+    // Read-gated so the drain tick pushes the trigger set into the pane
+    // before the matching line prints; the sentinel is assembled at runtime
+    // so the `▶ …` header can never fire the trigger itself.
+    app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
+        "/bin/sh",
+        &[
+            String::from("-c"),
+            String::from("read x; e=err; echo ${e}-7 broke; sleep 30"),
+        ],
+        tmp.path(),
+    )
+    .unwrap();
+    app.drain_terminal_bells();
+    app.terminals[0].write_input(b"\n");
+    let mut waited = 0u32;
+    while app.captures.is_empty() {
+        app.drain_terminal_bells();
+        assert!(waited < 8000, "capture never surfaced");
+        std::thread::sleep(std::time::Duration::from_millis(40));
+        waited += 40;
+    }
+    let entry = app.captures.selected_entry().expect("one capture");
+    assert_eq!(entry.message, "boom 7");
+    assert!(
+        entry.line.contains("err-7 broke"),
+        "the whole line is kept: {:?}",
+        entry.line
+    );
+
+    // Enter on the row jumps back to the pane and selects the matched line.
+    app.captures_open_selected();
+    assert_eq!(app.bottom_panel_tab, BottomPanelTab::Terminal);
+    let sel = app.terminals[0].selection_text();
+    assert!(
+        sel.contains("err-7 broke"),
+        "jump must land the selection on the captured line, got {sel:?}"
+    );
+}
+
+#[test]
+fn finished_commands_land_in_durable_history_and_the_popup_types_them() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    // Point the store at the tempdir so tests never touch the real file.
+    app.command_history =
+        crate::command_history::CommandHistory::load(&tmp.path().join("hist.jsonl"));
+    // Full OSC 133 marks around a fake command (B → command text → C →
+    // 0.25s of "runtime" → D;0), then a read so the popup's Enter-typed
+    // bytes are observable through the shell.
+    let script = "printf '\\033]133;A\\007$ \\033]133;B\\007kubectl get pods\\n\\033]133;C\\007'; sleep 0.25; printf 'out\\n\\033]133;D;0\\007'; read x; echo typed-$x; sleep 30";
+    app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
+        "/bin/sh",
+        &[String::from("-c"), String::from(script)],
+        tmp.path(),
+    )
+    .unwrap();
+    let mut waited = 0u32;
+    while app.command_history.is_empty() {
+        app.drain_terminal_bells();
+        assert!(waited < 8000, "finished command never reached the store");
+        std::thread::sleep(std::time::Duration::from_millis(40));
+        waited += 40;
+    }
+    let e = app.command_history.entries[0].clone();
+    assert_eq!(
+        e.cmd, "kubectl get pods",
+        "the typed text travels with the completion"
+    );
+    assert_eq!(e.exit, Some(0));
+    assert!(
+        e.dur_ms >= 200,
+        "duration must cover the C→D gap, got {}",
+        e.dur_ms
+    );
+
+    // The popup searches the store and Enter types the pick at the prompt.
+    app.focus_pane(Pane::Terminal);
+    app.handle_terminal_key(key(
+        KeyCode::Char('h'),
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+    ));
+    assert!(
+        app.command_history_popup.is_some(),
+        "Ctrl+Shift+H must open the history popup"
+    );
+    for c in "pods".chars() {
+        app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
+            .unwrap();
+    }
+    let picked = app
+        .command_history_popup
+        .as_ref()
+        .and_then(|p| p.selected_entry())
+        .map(|e| e.cmd.clone());
+    assert_eq!(picked.as_deref(), Some("kubectl get pods"));
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert!(
+        app.command_history_popup.is_none(),
+        "Enter closes the popup"
+    );
+    app.terminals[0].write_input(b"\n");
+    let mut waited = 0u32;
+    while !app.terminals[0]
+        .grid_lines()
+        .0
+        .iter()
+        .any(|l| l.contains("typed-kubectl get pods"))
+    {
+        assert!(waited < 8000, "typed command never reached the shell");
+        std::thread::sleep(std::time::Duration::from_millis(40));
+        waited += 40;
+    }
+}
+
+#[test]
+fn terminal_session_restores_pane_layout_names_and_focus_across_restarts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let session_path = tmp.path().join("sessions.json");
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.terminal_session_path = session_path.clone();
+    app.split_terminal().unwrap();
+    app.terminals[1].set_manual_name(Some(String::from("srv")));
+    app.active_terminal = 1;
+    app.save_terminal_session();
+    let raw = std::fs::read_to_string(&session_path).unwrap();
+    assert!(
+        raw.contains("srv"),
+        "the session file records pane names: {raw}"
+    );
+
+    // A fresh app on the same workspace resurrects the layout.
+    let mut app2 = App::new(tmp.path().to_path_buf()).unwrap();
+    app2.terminal_session_path = session_path.clone();
+    app2.restore_terminal_session();
+    assert_eq!(app2.terminals.len(), 2, "both panes come back");
+    assert_eq!(app2.terminals[1].label(), "srv", "names survive");
+    assert_eq!(
+        app2.active_terminal, 1,
+        "focus lands on the pane that had it"
+    );
+    // The restored pane runs a live shell.
+    app2.terminals[1].write_input(b"s=ali; echo ${s}ve-42\n");
+    let mut waited = 0u32;
+    while !app2.terminals[1]
+        .grid_lines()
+        .0
+        .iter()
+        .any(|l| l.contains("alive-42"))
+    {
+        assert!(waited < 8000, "restored pane's shell is not alive");
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        waited += 60;
+    }
+
+    // Closing back down to one default pane prunes the record, so a plain
+    // single-shell workspace never grows the file.
+    app2.terminals[1].set_manual_name(None);
+    assert!(app2.close_terminal_at(1));
+    app2.save_terminal_session();
+    let map = crate::terminal_session::load(&session_path);
+    assert!(
+        !map.contains_key(&tmp.path().display().to_string()),
+        "a trivial session (one unnamed pane at the root) is pruned"
+    );
+}

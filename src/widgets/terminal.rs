@@ -60,6 +60,10 @@ pub struct MouseMods {
 pub struct Selection {
     pub anchor: (i32, u16),
     pub head: (i32, u16),
+    /// Rectangular (column-block) selection: the highlight and the copied
+    /// text cover the same column slice on every row between the endpoints
+    /// (copy mode's Ctrl+V), instead of running row-major to the ends.
+    pub block: bool,
 }
 
 impl Selection {
@@ -67,6 +71,7 @@ impl Selection {
         Self {
             anchor: (line, col),
             head: (line, col),
+            block: false,
         }
     }
     pub fn normalised(&self) -> (i32, u16, i32, u16) {
@@ -77,6 +82,14 @@ impl Selection {
         } else {
             (b_l, b_c, a_l, a_c)
         }
+    }
+    /// Rectangle bounds with rows and columns min/maxed independently
+    /// (row-major normalisation would pair the wrong corners when the head
+    /// sits below-left of the anchor): (row_lo, col_lo, row_hi, col_hi).
+    pub fn block_bounds(&self) -> (i32, u16, i32, u16) {
+        let (a_l, a_c) = self.anchor;
+        let (b_l, b_c) = self.head;
+        (a_l.min(b_l), a_c.min(b_c), a_l.max(b_l), a_c.max(b_c))
     }
     pub fn has_area(&self) -> bool {
         self.anchor != self.head
@@ -200,6 +213,10 @@ pub struct PtyTerminal {
     pub last_area: Rect,
     pub last_inner: Rect,
     selection: Option<Selection>,
+    /// Copy-mode cursor cell (absolute grid line, grid column): painted as
+    /// a green modal block over the glyph so keyboard selection has a
+    /// visible caret. None whenever copy mode is off.
+    copy_cursor: Option<(i32, u16)>,
     /// User-given pane name (via rename), overriding the auto label. `None`
     /// until the user renames the pane.
     manual_name: Option<String>,
@@ -231,7 +248,7 @@ pub struct PtyTerminal {
     notifications: Arc<std::sync::Mutex<Vec<String>>>,
     /// Finished commands (exit, duration) from the reader thread, awaiting
     /// the app's drain for long-command notifications.
-    finished_rx: std::sync::mpsc::Receiver<(Option<i32>, std::time::Duration)>,
+    finished_rx: std::sync::mpsc::Receiver<FinishedCommand>,
     /// Quick-select hint spans pushed down by the app while hint mode is
     /// active; the render loop paints the match spans and overlays each
     /// label. `None` when quick-select is off.
@@ -310,6 +327,19 @@ struct StoredMark {
     /// For `CommandEnd` marks: how long the command ran (CommandStart →
     /// CommandEnd, measured in the reader thread). `None` elsewhere.
     dur: Option<std::time::Duration>,
+}
+
+/// A finished command as reported by the reader thread at its `133;D`
+/// mark: exit + duration (for the long-command notice) plus the typed
+/// command text (extracted from the B→C mark span while the term lock is
+/// held) and the pane's OSC 7 cwd at finish time — everything the durable
+/// command history records.
+#[derive(Clone, Debug)]
+pub struct FinishedCommand {
+    pub exit: Option<i32>,
+    pub dur: std::time::Duration,
+    pub cmd: String,
+    pub cwd: Option<std::path::PathBuf>,
 }
 
 /// A finished command derived from the OSC 133 marks: the grid line of the
@@ -891,8 +921,7 @@ impl PtyTerminal {
         let marks_for_thread = marks.clone();
         let images = Arc::new(std::sync::Mutex::new(Vec::<StoredImage>::new()));
         let images_for_thread = images.clone();
-        let (finished_tx, finished_rx) =
-            std::sync::mpsc::channel::<(Option<i32>, std::time::Duration)>();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel::<FinishedCommand>();
         let osc7_cwd = Arc::new(std::sync::Mutex::new(Option::<std::path::PathBuf>::None));
         let osc7_for_thread = osc7_cwd.clone();
         let notifications = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
@@ -973,7 +1002,21 @@ impl PtyTerminal {
                                         E::CommandEnd(exit) => {
                                             let dur = cmd_start.take().map(|s| s.elapsed());
                                             if let Some(d) = dur {
-                                                let _ = finished_tx.send((*exit, d));
+                                                // The typed command text and the
+                                                // shell's cwd travel with the
+                                                // completion so the durable
+                                                // history records context.
+                                                let cmd = {
+                                                    let ms = marks_for_thread.lock().unwrap();
+                                                    last_command_input_text(&t, &ms)
+                                                };
+                                                let cwd = osc7_for_thread.lock().unwrap().clone();
+                                                let _ = finished_tx.send(FinishedCommand {
+                                                    exit: *exit,
+                                                    dur: d,
+                                                    cmd,
+                                                    cwd,
+                                                });
                                             }
                                             dur
                                         }
@@ -1045,6 +1088,7 @@ impl PtyTerminal {
             last_area: Rect::default(),
             last_inner: Rect::default(),
             selection: None,
+            copy_cursor: None,
             manual_name: None,
             auto_label: String::new(),
             search_needle: None,
@@ -1110,7 +1154,7 @@ impl PtyTerminal {
 
     /// Finished commands since the last drain: (exit code, duration). Feeds
     /// the status-bar notification for long commands in unfocused panes.
-    pub fn drain_finished_commands(&self) -> Vec<(Option<i32>, std::time::Duration)> {
+    pub fn drain_finished_commands(&self) -> Vec<FinishedCommand> {
         self.finished_rx.try_iter().collect()
     }
 
@@ -1159,6 +1203,7 @@ impl PtyTerminal {
         self.selection = Some(Selection {
             anchor: (d.output_start, 0),
             head: (d.output_end - 1, self.cols.saturating_sub(1)),
+            block: false,
         });
         self.scroll_to_line(d.output_start);
     }
@@ -1253,6 +1298,12 @@ impl PtyTerminal {
     /// Set the foreground-process label (from the off-loop refresh).
     pub fn set_auto_label(&mut self, label: String) {
         self.auto_label = label;
+    }
+
+    /// The user's manual pane name, when one was set via rename (what the
+    /// session snapshot persists; `label()` mixes in the auto label).
+    pub fn manual_name(&self) -> Option<&str> {
+        self.manual_name.as_deref()
     }
 
     /// Set or clear the user's manual pane name (a blank name clears it).
@@ -1438,6 +1489,7 @@ impl PtyTerminal {
         self.selection = Some(Selection {
             anchor: to_abs(anchor),
             head: to_abs(head),
+            block: false,
         });
     }
 
@@ -1445,12 +1497,54 @@ impl PtyTerminal {
         self.selection
     }
 
+    /// Replace (or clear) the selection wholesale. Copy mode drives the
+    /// selection from the keyboard through this, bypassing the mouse path.
+    pub fn set_selection(&mut self, sel: Option<Selection>) {
+        self.selection = sel;
+        self.pty_dirty.store(true, Ordering::Release);
+    }
+
+    /// Show / move / hide the copy-mode cursor block.
+    pub fn set_copy_cursor(&mut self, cur: Option<(i32, u16)>) {
+        self.copy_cursor = cur;
+        self.pty_dirty.store(true, Ordering::Release);
+    }
+
+    /// The shell cursor's cell in absolute grid coords (line can be
+    /// negative only transiently; the live screen is 0-based): where copy
+    /// mode starts.
+    pub fn cursor_line_col(&self) -> (i32, u16) {
+        let term = self.term.lock();
+        let p = term.grid().cursor.point;
+        (p.line.0, p.column.0 as u16)
+    }
+
+    /// One grid row as spacer-skipped text plus its char-index → grid-column
+    /// map (the free `row_text_and_cols` behind the term lock).
+    pub fn row_text(&self, line: i32) -> (String, Vec<usize>) {
+        let term = self.term.lock();
+        row_text_and_cols(&term, line)
+    }
+
+    /// The readable grid range and viewport size for keyboard navigation:
+    /// (oldest line, newest line, columns, viewport rows).
+    pub fn grid_bounds(&self) -> (i32, i32, u16, u16) {
+        let term = self.term.lock();
+        let top = term.grid().topmost_line().0;
+        let bottom = term.screen_lines() as i32 - 1;
+        (top, bottom, self.cols, self.rows)
+    }
+
     pub fn selection_text(&self) -> String {
         let Some(sel) = self.selection else {
             return String::new();
         };
-        let (sr, sc, er, ec) = sel.normalised();
         let term = self.term.lock();
+        if sel.block {
+            let (rl, cl, rh, ch) = sel.block_bounds();
+            return block_selection_text(&term, rl, cl as usize, rh, ch as usize);
+        }
+        let (sr, sc, er, ec) = sel.normalised();
         extract_selection_text(&term, sr, sc as usize, er, ec as usize)
     }
 
@@ -1682,6 +1776,42 @@ pub fn row_text_and_cols(term: &Term<VoidListener>, line_idx: i32) -> (String, V
     (s, cols)
 }
 
+/// The typed text of the command now ending: from the newest PromptEnd
+/// (`133;B`) cell to the line before the newest CommandStart (`133;C`) —
+/// the same span `pair_decorations` derives after the fact. Runs in the
+/// reader thread at the `133;D` mark with the term lock held; empty when
+/// the B/C marks are missing (no shell integration on this pane).
+fn last_command_input_text(term: &Term<VoidListener>, marks: &[StoredMark]) -> String {
+    use crate::shell_integration::OscEvent as E;
+    let hist_now = term.grid().history_size() as i32;
+    let cur = |m: &StoredMark| m.line_rec - (hist_now - m.hist_rec as i32);
+    let Some(ci) = marks
+        .iter()
+        .rposition(|m| matches!(m.kind, E::CommandStart))
+    else {
+        return String::new();
+    };
+    let Some(b) = marks[..ci]
+        .iter()
+        .rev()
+        .find(|m| matches!(m.kind, E::PromptEnd))
+    else {
+        return String::new();
+    };
+    let bl = cur(b);
+    let cl = cur(&marks[ci]);
+    if cl <= bl {
+        return String::new();
+    }
+    extract_selection_text(
+        term,
+        bl,
+        b.col_rec,
+        cl - 1,
+        term.columns().saturating_sub(1),
+    )
+}
+
 pub fn extract_selection_text(
     term: &Term<VoidListener>,
     sr: i32,
@@ -1782,7 +1912,7 @@ pub fn select_word_at_in_term(
     Some(((row as u16, start as u16), (row as u16, end as u16)))
 }
 
-fn is_terminal_word_char(c: char) -> bool {
+pub fn is_terminal_word_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
 
@@ -1957,7 +2087,15 @@ impl Widget for &mut PtyTerminal {
         }
         self.last_area = area;
         self.last_inner = inner;
-        let sel_norm = self.selection.map(|s| s.normalised());
+        // (is_block, bounds): block selections rectangle-test each cell,
+        // linear ones use the row-major span.
+        let sel_paint = self.selection.map(|s| {
+            if s.block {
+                (true, s.block_bounds())
+            } else {
+                (false, s.normalised())
+            }
+        });
 
         let cols = inner.width;
         let rows = inner.height;
@@ -2094,8 +2232,12 @@ impl Widget for &mut PtyTerminal {
                 {
                     style = style.add_modifier(Modifier::REVERSED);
                 }
-                if let Some((sr, sc, er, ec)) = sel_norm
-                    && cell_in_selection(line_idx, x, sr, sc, er, ec)
+                if let Some((block, (sr, sc, er, ec))) = sel_paint
+                    && if block {
+                        cell_in_block_selection(line_idx, x, sr, sc, er, ec)
+                    } else {
+                        cell_in_selection(line_idx, x, sr, sc, er, ec)
+                    }
                 {
                     style = style.bg(Color::Rgb(0x26, 0x4f, 0x78));
                 }
@@ -2142,6 +2284,17 @@ impl Widget for &mut PtyTerminal {
                         _ => {}
                     }
                 }
+                // Copy-mode cursor: a green modal block, painted last so the
+                // caret stays visible over selection / find / trigger paint.
+                if let Some((cl, cc)) = self.copy_cursor
+                    && line_idx == cl
+                    && x == cc
+                {
+                    style = Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Rgb(0x66, 0xcc, 0x66))
+                        .add_modifier(Modifier::BOLD);
+                }
                 let target_x = inner.x + x;
                 let target_y = inner.y + y;
                 let target = &mut buf[(target_x, target_y)];
@@ -2186,6 +2339,35 @@ pub fn scroll_offset_for_line(rows: i32, max_off: i32, abs_line: i32) -> i32 {
     (rows / 2 - abs_line).clamp(0, max_off.max(0))
 }
 
+/// The text a rectangular selection covers: the same inclusive column
+/// slice `[cl..=ch]` from every row `[rl..=rh]`, one line per row (what
+/// vim's Ctrl+V yank produces). Rows are clamped to the readable grid the
+/// same way `extract_selection_text` clamps.
+pub fn block_selection_text(
+    term: &Term<VoidListener>,
+    rl: i32,
+    cl: usize,
+    rh: i32,
+    ch: usize,
+) -> String {
+    let max_line = term.screen_lines() as i32 - 1;
+    let min_line = term.grid().topmost_line().0;
+    let rl = rl.max(min_line);
+    let rh = rh.min(max_line);
+    let mut rows = Vec::new();
+    for line in rl..=rh {
+        rows.push(extract_selection_text(term, line, cl, line, ch));
+    }
+    rows.join("\n")
+}
+
+/// True iff (row, col) is inside the inclusive rectangle whose corners are
+/// (rl, cl) and (rh, ch) — [`Selection::block_bounds`] output. Public for
+/// unit testing.
+pub fn cell_in_block_selection(row: i32, col: u16, rl: i32, cl: u16, rh: i32, ch: u16) -> bool {
+    row >= rl && row <= rh && col >= cl && col <= ch
+}
+
 /// True iff (row, col) is inside the inclusive row-major range
 /// [(sr,sc)..=(er,ec)]. Public for unit testing.
 pub fn cell_in_selection(row: i32, col: u16, sr: i32, sc: u16, er: i32, ec: u16) -> bool {
@@ -2217,6 +2399,31 @@ mod tests {
     fn feed(term: &mut Term<VoidListener>, bytes: &[u8]) {
         let mut p = Processor::<StdSyncHandler>::new();
         p.advance(term, bytes);
+    }
+
+    #[test]
+    fn block_selection_highlights_and_extracts_a_rectangle() {
+        let mut term = fresh_term(20, 5);
+        feed(&mut term, b"alpha1\r\nbravo2\r\ncharlie3\r\n");
+        // A rectangle over rows 0..=2, cols 1..=3, anchored bottom-right so
+        // the bounds must come from independent min/max, not the row-major
+        // normalisation linear selections use.
+        let sel = Selection {
+            anchor: (2, 3),
+            head: (0, 1),
+            block: true,
+        };
+        let (rl, cl, rh, ch) = sel.block_bounds();
+        assert_eq!((rl, cl, rh, ch), (0, 1, 2, 3));
+        assert!(cell_in_block_selection(1, 2, rl, cl, rh, ch));
+        assert!(!cell_in_block_selection(1, 0, rl, cl, rh, ch));
+        assert!(!cell_in_block_selection(1, 4, rl, cl, rh, ch));
+        assert!(!cell_in_block_selection(3, 2, rl, cl, rh, ch));
+        assert_eq!(
+            block_selection_text(&term, rl, cl as usize, rh, ch as usize),
+            "lph\nrav\nhar",
+            "a block selection copies the same column slice from every row"
+        );
     }
 
     #[test]
@@ -3114,8 +3321,8 @@ mod tests {
         }
         let finished = term.drain_finished_commands();
         assert_eq!(finished.len(), 1, "one completion in the drain");
-        assert_eq!(finished[0].0, Some(2));
-        assert!(finished[0].1 >= std::time::Duration::from_millis(250));
+        assert_eq!(finished[0].exit, Some(2));
+        assert!(finished[0].dur >= std::time::Duration::from_millis(250));
         assert!(
             term.drain_finished_commands().is_empty(),
             "a second drain returns nothing"
@@ -3721,6 +3928,7 @@ mod tests {
         let s = Selection {
             anchor: (5, 4),
             head: (2, 1),
+            block: false,
         };
         assert_eq!(s.normalised(), (2, 1, 5, 4));
     }
@@ -3730,6 +3938,7 @@ mod tests {
         let s = Selection {
             anchor: (3, 9),
             head: (3, 2),
+            block: false,
         };
         assert_eq!(s.normalised(), (3, 2, 3, 9));
     }
@@ -3741,6 +3950,7 @@ mod tests {
         let s2 = Selection {
             anchor: (2, 5),
             head: (2, 6),
+            block: false,
         };
         assert!(s2.has_area());
     }

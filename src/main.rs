@@ -1,6 +1,7 @@
 mod app;
 mod cli;
 mod clipboard;
+mod command_history;
 mod dap;
 mod file_ref;
 mod ghostty;
@@ -32,6 +33,7 @@ mod sheet;
 mod shell_integration;
 mod snippets;
 mod tasks;
+mod terminal_session;
 mod termux;
 mod testing;
 mod theme;

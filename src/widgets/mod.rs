@@ -1,4 +1,5 @@
 pub mod branch_picker;
+pub mod captures;
 pub mod command_palette;
 pub mod completion_popup;
 pub mod connect_dialog;
@@ -10,6 +11,7 @@ pub mod extensions;
 pub mod file_finder;
 pub mod file_tree;
 pub mod header_pill;
+pub mod history_popup;
 pub mod hover;
 pub mod hover_popup;
 pub mod input_prompt;

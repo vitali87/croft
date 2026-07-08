@@ -1,0 +1,273 @@
+//! Durable, context-rich shell command history (the atuin model, embedded):
+//! every command a shell-integrated pane finishes is recorded with its
+//! working directory, exit code, duration and timestamp, in a JSONL file
+//! under the croft config dir. The Ctrl+Shift+R popup searches it across
+//! sessions and restarts — newest first, deduplicated, filterable to the
+//! current directory or to failures only.
+//!
+//! The file is append-only in the hot path (one `serde_json` line per
+//! finished command); it is compacted back to the newest [`HISTORY_MAX`]
+//! entries when it grows past twice that, so a long-lived install never
+//! rereads an unbounded file.
+
+use std::io::Write;
+use std::path::{Path, PathBuf};
+
+/// Newest entries kept in memory and, after compaction, on disk.
+pub const HISTORY_MAX: usize = 10_000;
+
+/// One finished shell command.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct HistoryEntry {
+    pub cmd: String,
+    /// The pane's OSC 7 working directory at finish time; empty when the
+    /// shell never reported one.
+    #[serde(default)]
+    pub cwd: String,
+    #[serde(default)]
+    pub exit: Option<i32>,
+    #[serde(default)]
+    pub dur_ms: u64,
+    /// Seconds since the Unix epoch.
+    #[serde(default)]
+    pub ts: u64,
+}
+
+/// Which slice of history the popup searches; Ctrl+R cycles it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum HistoryScope {
+    #[default]
+    All,
+    /// Only commands finished in the given directory.
+    Dir,
+    /// Only commands that exited non-zero (or died without a code).
+    Failed,
+}
+
+impl HistoryScope {
+    pub fn next(self) -> Self {
+        match self {
+            Self::All => Self::Dir,
+            Self::Dir => Self::Failed,
+            Self::Failed => Self::All,
+        }
+    }
+}
+
+/// The real store path, `~/.config/croft/command_history.jsonl`. The App
+/// caches a loaded store in a field so tests can point it at a tempdir.
+pub fn history_path() -> PathBuf {
+    crate::prefs::config_dir().join("command_history.jsonl")
+}
+
+pub struct CommandHistory {
+    path: PathBuf,
+    pub entries: Vec<HistoryEntry>,
+    /// Lines on disk (loaded + appended); drives compaction.
+    disk_lines: usize,
+}
+
+impl CommandHistory {
+    /// Load the store, tolerantly: an unparsable line is skipped, a missing
+    /// file is an empty history. Only the newest [`HISTORY_MAX`] survive.
+    pub fn load(path: &Path) -> Self {
+        let raw = std::fs::read_to_string(path).unwrap_or_default();
+        let mut entries: Vec<HistoryEntry> = raw
+            .lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect();
+        let disk_lines = entries.len();
+        if entries.len() > HISTORY_MAX {
+            let drop = entries.len() - HISTORY_MAX;
+            entries.drain(..drop);
+        }
+        Self {
+            path: path.to_path_buf(),
+            entries,
+            disk_lines,
+        }
+    }
+
+    // Read by the app tests' wait loops; the app itself only appends.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Record a finished command: append to memory and to the JSONL file,
+    /// compacting the file once it doubles past the cap.
+    pub fn append(&mut self, entry: HistoryEntry) {
+        if entry.cmd.trim().is_empty() {
+            return;
+        }
+        let line = match serde_json::to_string(&entry) {
+            Ok(l) => l,
+            Err(_) => return,
+        };
+        self.entries.push(entry);
+        if self.entries.len() > HISTORY_MAX {
+            let drop = self.entries.len() - HISTORY_MAX;
+            self.entries.drain(..drop);
+        }
+        self.disk_lines += 1;
+        if self.disk_lines > HISTORY_MAX * 2 {
+            self.rewrite();
+            return;
+        }
+        if let Some(dir) = self.path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+        {
+            let _ = writeln!(f, "{line}");
+        }
+    }
+
+    /// Rewrite the file with just the in-memory entries (compaction).
+    fn rewrite(&mut self) {
+        let mut out = String::new();
+        for e in &self.entries {
+            if let Ok(l) = serde_json::to_string(e) {
+                out.push_str(&l);
+                out.push('\n');
+            }
+        }
+        if let Some(dir) = self.path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(&self.path, out);
+        self.disk_lines = self.entries.len();
+    }
+
+    /// Search: newest first, one row per distinct command text (the newest
+    /// occurrence wins, like atuin), case-insensitive substring `query`,
+    /// narrowed by `scope` (`cwd` is the pane's current directory for
+    /// [`HistoryScope::Dir`]).
+    pub fn search(&self, query: &str, scope: HistoryScope, cwd: &str) -> Vec<HistoryEntry> {
+        let q = query.to_lowercase();
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for e in self.entries.iter().rev() {
+            match scope {
+                HistoryScope::All => {}
+                HistoryScope::Dir => {
+                    if e.cwd != cwd {
+                        continue;
+                    }
+                }
+                HistoryScope::Failed => {
+                    if e.exit == Some(0) {
+                        continue;
+                    }
+                }
+            }
+            if !q.is_empty() && !e.cmd.to_lowercase().contains(&q) {
+                continue;
+            }
+            if seen.insert(e.cmd.clone()) {
+                out.push(e.clone());
+            }
+        }
+        out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(cmd: &str, cwd: &str, exit: Option<i32>, ts: u64) -> HistoryEntry {
+        HistoryEntry {
+            cmd: cmd.to_string(),
+            cwd: cwd.to_string(),
+            exit,
+            dur_ms: 42,
+            ts,
+        }
+    }
+
+    #[test]
+    fn append_persists_and_load_round_trips() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("h.jsonl");
+        let mut h = CommandHistory::load(&path);
+        assert!(h.is_empty());
+        h.append(entry("cargo test", "/repo", Some(0), 100));
+        h.append(entry("ls -la", "/tmp", Some(0), 101));
+        h.append(entry("   ", "/tmp", Some(0), 102)); // blank: dropped
+        let re = CommandHistory::load(&path);
+        assert_eq!(re.entries.len(), 2, "blank commands are never recorded");
+        assert_eq!(re.entries[0].cmd, "cargo test");
+        assert_eq!(re.entries[1].cwd, "/tmp");
+        // A corrupt line is skipped, not fatal.
+        std::fs::write(
+            &path,
+            format!(
+                "not json at all\n{}\n",
+                serde_json::to_string(&entry("ok", "/x", Some(1), 103)).unwrap()
+            ),
+        )
+        .unwrap();
+        let re = CommandHistory::load(&path);
+        assert_eq!(re.entries.len(), 1);
+        assert_eq!(re.entries[0].cmd, "ok");
+    }
+
+    #[test]
+    fn search_dedups_newest_first_and_honours_scopes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("h.jsonl");
+        let mut h = CommandHistory::load(&path);
+        h.append(entry("cargo test", "/repo", Some(0), 1));
+        h.append(entry("cargo build", "/repo", Some(101), 2));
+        h.append(entry("ls", "/tmp", Some(0), 3));
+        h.append(entry("cargo test", "/repo", Some(1), 4)); // rerun, newest
+
+        let all = h.search("", HistoryScope::All, "");
+        assert_eq!(
+            all.iter().map(|e| e.cmd.as_str()).collect::<Vec<_>>(),
+            vec!["cargo test", "ls", "cargo build"],
+            "newest first, duplicate command texts collapse to the newest run"
+        );
+        assert_eq!(all[0].exit, Some(1), "the newest occurrence wins");
+
+        let q = h.search("CARGO", HistoryScope::All, "");
+        assert_eq!(q.len(), 2, "query is case-insensitive substring");
+
+        let dir = h.search("", HistoryScope::Dir, "/tmp");
+        assert_eq!(
+            dir.iter().map(|e| e.cmd.as_str()).collect::<Vec<_>>(),
+            vec!["ls"]
+        );
+
+        let failed = h.search("", HistoryScope::Failed, "");
+        assert_eq!(
+            failed.iter().map(|e| e.cmd.as_str()).collect::<Vec<_>>(),
+            vec!["cargo test", "cargo build"],
+            "failed-only keeps non-zero exits"
+        );
+    }
+
+    #[test]
+    fn the_file_compacts_once_it_doubles_past_the_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("h.jsonl");
+        let mut h = CommandHistory::load(&path);
+        // Simulate an old, bloated file: disk_lines is what triggers
+        // compaction, so seed it near the threshold instead of writing
+        // 20k real lines.
+        h.disk_lines = HISTORY_MAX * 2;
+        for i in 0..3 {
+            h.append(entry(&format!("cmd-{i}"), "/", Some(0), i as u64));
+        }
+        let lines = std::fs::read_to_string(&path).unwrap().lines().count();
+        assert!(
+            lines <= HISTORY_MAX,
+            "compaction must rewrite the file down to the in-memory entries, got {lines} lines"
+        );
+        assert_eq!(h.disk_lines, h.entries.len());
+    }
+}

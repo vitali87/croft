@@ -750,6 +750,7 @@ enum BottomPanelTab {
     Problems,
     Output,
     Ports,
+    Captures,
 }
 
 /// A transient, click-only notification that a browsable port just appeared in
@@ -1023,12 +1024,20 @@ enum MenuAction {
     ToggleMaximizeTerminal(usize),
     /// Terminal pane right-click: enter quick-select hint mode on the pane.
     TerminalQuickSelect,
+    /// Terminal pane right-click: enter copy mode (keyboard selection with
+    /// vi motions) on the pane.
+    TerminalCopyMode,
+    /// Terminal pane right-click: open the durable command-history search.
+    TerminalCommandHistory,
     /// Terminal pane right-click: toggle broadcast input (keystrokes go to
     /// every pane at once; enabling routes through the confirm popup).
     ToggleBroadcastInput,
     /// Terminal pane right-click while broadcasting: toggle whether the
     /// active pane receives the mirrored input.
     ToggleBroadcastExclusion,
+    /// Terminal pane right-click: restore the most recently closed pane
+    /// while it is still inside the undo-close grace window.
+    UndoCloseTerminal,
     /// Command decoration menu: copy the command's output span to the
     /// clipboard (pane `idx`, the clicked decoration embedded).
     CopyCommandOutput(usize, crate::widgets::terminal::CommandDecoration),
@@ -1110,8 +1119,11 @@ fn shortcut_for(action: &MenuAction) -> Option<&'static str> {
         MenuAction::ClearTerminal(_) => Some("⌘K K"),
         MenuAction::ToggleMaximizeTerminal(_) => Some("⌘K M"),
         MenuAction::TerminalQuickSelect => Some("⌃⇧Space"),
+        MenuAction::TerminalCopyMode => Some("⌃⇧Y"),
+        MenuAction::TerminalCommandHistory => Some("⌃⇧H"),
         MenuAction::ToggleBroadcastInput => Some("⌘K I"),
         MenuAction::ToggleBroadcastExclusion => Some("⌘K ⇧I"),
+        MenuAction::UndoCloseTerminal => Some("⌘K ⇧T"),
         MenuAction::CopyCommandOutput(..) => Some("⌘K ⇧C"),
         MenuAction::SelectCommandOutput(..) => Some("⌘K ⇧S"),
         MenuAction::RerunCommand(..) => Some("⌘K ⇧R"),
@@ -1765,6 +1777,42 @@ struct QuickHint {
     label: String,
 }
 
+/// Active copy-mode session on the focused terminal pane (WezTerm / tmux
+/// copy mode): a keyboard cursor over the grid plus the selection anchor
+/// and kind once v / V / Ctrl+V arms one. The pane paints the cursor and
+/// the selection; this state owns the motions.
+pub struct CopyModeState {
+    /// Cursor cell: absolute grid line + grid column.
+    line: i32,
+    col: u16,
+    /// Selection anchor cell; `None` until v / V / Ctrl+V arms a selection.
+    anchor: Option<(i32, u16)>,
+    kind: CopySelKind,
+}
+
+/// Which shape the copy-mode selection takes: vim's v / V / Ctrl+V.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CopySelKind {
+    Char,
+    Line,
+    Block,
+}
+
+/// How long a closed terminal pane stays parked (child alive, hidden)
+/// before the tick drops it for real. Ghostty and iTerm2 default their
+/// undo-close window to 5s; croft doubles it because the hint lives in a
+/// TUI status line that is easier to miss than a native toast.
+pub const UNDO_CLOSE_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// A terminal pane parked by close for the undo-close grace window: the
+/// live pane, the slot it occupied (so restore puts it back where it was),
+/// and when it was closed (for expiry).
+pub struct ClosedTerminal {
+    pub term: crate::widgets::terminal::PtyTerminal,
+    pub idx: usize,
+    pub closed_at: std::time::Instant,
+}
+
 pub struct App {
     pub tree: FileTree,
     pub search: SearchPanel,
@@ -2195,6 +2243,9 @@ pub struct App {
     /// terminal output scrape and the periodic socket poll. Rendered into the
     /// panel content when its tab is active.
     ports: crate::widgets::ports::PortsPanel,
+    /// The CAPTURES view: output lines collected by `capture` triggers
+    /// (iTerm2's Capture Output); Enter / click jumps back to the line.
+    pub captures: crate::widgets::captures::CapturesPanel,
     /// Transient click-only notification for a freshly detected browsable port,
     /// offering forward / open. `None` when nothing is pending.
     port_toast: Option<PortToast>,
@@ -2225,6 +2276,8 @@ pub struct App {
     /// Hit-test rect of the "PORTS" tab in the panel tab strip. Empty when the
     /// panel is hidden.
     ports_tab_rect: Rect,
+    /// Hit-test rect of the "CAPTURES" tab in the panel tab strip.
+    captures_tab_rect: Rect,
     /// Hit-test rect of the "TERMINAL" tab in the panel tab strip. Empty when
     /// the panel is hidden.
     terminal_tab_rect: Rect,
@@ -2401,6 +2454,20 @@ pub struct App {
     /// (WezTerm's quick-select): every labelled match on the viewport plus
     /// the label prefix typed so far. None when the mode is off.
     pub terminal_quick_select: Option<QuickSelectState>,
+    /// Durable cross-session command history (atuin's model): every
+    /// finished command from a shell-integrated pane, with cwd / exit /
+    /// duration / timestamp, persisted as JSONL under the config dir.
+    pub command_history: crate::command_history::CommandHistory,
+    /// Ctrl+Shift+H search popup over [`Self::command_history`]. None when
+    /// closed.
+    pub command_history_popup: Option<crate::widgets::history_popup::HistoryPopup>,
+    /// Where the terminal-session snapshot lives
+    /// (`terminal_sessions.json`); a field so tests point it at a tempdir.
+    pub terminal_session_path: PathBuf,
+    /// Ctrl+Shift+Y copy mode on the active terminal pane (WezTerm / tmux):
+    /// vi keys walk a cursor through the scrollback, v / V / Ctrl+V select,
+    /// y copies. None when the mode is off.
+    pub terminal_copy_mode: Option<CopyModeState>,
     /// The user's terminal trigger set (`triggers.json`), pushed into every
     /// pane on the drain tick and swapped wholesale on config reload.
     pub triggers: std::sync::Arc<crate::triggers::TriggerSet>,
@@ -2412,6 +2479,11 @@ pub struct App {
     /// gated: the classic footgun is typing into panes you forgot were
     /// listening).
     pub pending_broadcast_enable: bool,
+    /// Recently closed terminal panes parked for the undo-close grace window
+    /// (Ghostty's undo, iTerm2's Undo Close Session): the PTY and child stay
+    /// alive but hidden until Cmd+K ⇧T restores the newest or the tick reaps
+    /// entries older than [`UNDO_CLOSE_GRACE`]. Newest last.
+    pub closed_terminals: Vec<ClosedTerminal>,
     /// VS Code-style Cmd+P / Ctrl+P quick-open file finder. None when
     /// the modal is closed.
     pub file_finder: Option<crate::widgets::file_finder::FileFinder>,
@@ -3175,6 +3247,7 @@ impl App {
             problems: crate::widgets::problems::ProblemsPanel::new(),
             output: crate::widgets::output::OutputPanel::new(),
             ports: crate::widgets::ports::PortsPanel::new(),
+            captures: crate::widgets::captures::CapturesPanel::new(),
             port_toast: None,
             last_port_poll: std::time::Instant::now(),
             port_poll_rx,
@@ -3187,6 +3260,7 @@ impl App {
             problems_tab_rect: Rect::default(),
             output_tab_rect: Rect::default(),
             ports_tab_rect: Rect::default(),
+            captures_tab_rect: Rect::default(),
             terminal_tab_rect: Rect::default(),
             pointer_cell: None,
             hovered_activity_icon: None,
@@ -3236,11 +3310,34 @@ impl App {
             terminal_find: None,
             terminal_find_match: None,
             terminal_quick_select: None,
+            // Under test, both durable stores point at per-process scratch
+            // files so app tests that run commands or split panes can never
+            // touch (or race on) the user's real history / session files;
+            // tests that exercise the stores inject their own paths.
+            command_history: crate::command_history::CommandHistory::load(&if cfg!(test) {
+                std::env::temp_dir().join(format!(
+                    "croft-test-command-history-{}.jsonl",
+                    std::process::id()
+                ))
+            } else {
+                crate::command_history::history_path()
+            }),
+            command_history_popup: None,
+            terminal_session_path: if cfg!(test) {
+                std::env::temp_dir().join(format!(
+                    "croft-test-terminal-sessions-{}.json",
+                    std::process::id()
+                ))
+            } else {
+                crate::terminal_session::path()
+            },
+            terminal_copy_mode: None,
             triggers: std::sync::Arc::new(crate::triggers::TriggerSet::load(
                 &crate::triggers::triggers_path(),
             )),
             broadcast_input: false,
             pending_broadcast_enable: false,
+            closed_terminals: Vec::new(),
             file_finder: None,
             command_palette: None,
             go_to_symbol: None,
@@ -3663,6 +3760,7 @@ impl App {
             || self.workspace_symbols.is_some()
             || self.process_picker.is_some()
             || self.zoxide_jump.is_some()
+            || self.command_history_popup.is_some()
             || self.branch_picker.is_some()
             || self.input_prompt.is_some()
             || self.list_picker.is_some()
@@ -3743,6 +3841,7 @@ impl App {
             || self.workspace_symbols.is_some()
             || self.process_picker.is_some()
             || self.zoxide_jump.is_some()
+            || self.command_history_popup.is_some()
             || self.branch_picker.is_some()
             || self.input_prompt.is_some()
             || self.list_picker.is_some()
@@ -3795,6 +3894,7 @@ impl App {
             || self.workspace_symbols.is_some()
             || self.process_picker.is_some()
             || self.zoxide_jump.is_some()
+            || self.command_history_popup.is_some()
             || self.branch_picker.is_some()
             || self.input_prompt.is_some()
             || self.list_picker.is_some()
@@ -3876,6 +3976,7 @@ impl App {
         let should_show = self.shortcuts_modal.is_none()
             && self.file_finder.is_none()
             && self.zoxide_jump.is_none()
+            && self.command_history_popup.is_none()
             && self.branch_picker.is_none()
             && self.input_prompt.is_none()
             && self.list_picker.is_none()
@@ -8574,6 +8675,66 @@ impl App {
             self.show_terminal = true;
         }
         self.focus_pane(Pane::Terminal);
+        self.save_terminal_session();
+    }
+
+    /// Snapshot the terminal panel (pane order, cwds, names, focus) into
+    /// the per-workspace session store. Called on structural changes and at
+    /// quit; the default single-pane layout prunes the record instead.
+    pub fn save_terminal_session(&mut self) {
+        let root = self.workspace_root.display().to_string();
+        let panes = self
+            .terminals
+            .iter()
+            .map(|t| crate::terminal_session::PaneRecord {
+                cwd: t
+                    .shell_cwd()
+                    .filter(|p| p.is_dir())
+                    .or_else(|| t.pid().and_then(cwd_of_pid).filter(|p| p.is_dir()))
+                    .unwrap_or_else(|| self.workspace_root.clone())
+                    .display()
+                    .to_string(),
+                name: t.manual_name().map(str::to_string),
+            })
+            .collect();
+        let record = crate::terminal_session::SessionRecord {
+            panes,
+            active: self.active_terminal,
+        };
+        crate::terminal_session::save_for_root(&self.terminal_session_path, &root, record);
+    }
+
+    /// Resurrect this workspace's terminal panel from the session store:
+    /// each recorded pane comes back as a fresh shell in its directory
+    /// (with its name), and focus returns to the pane that had it. Called
+    /// once at startup, replacing the default lone pane. A recorded
+    /// directory that no longer exists falls back to the workspace root; a
+    /// pane whose shell fails to spawn is skipped.
+    pub fn restore_terminal_session(&mut self) {
+        let map = crate::terminal_session::load(&self.terminal_session_path);
+        let Some(rec) = map.get(&self.workspace_root.display().to_string()) else {
+            return;
+        };
+        let mut terms = Vec::new();
+        for p in &rec.panes {
+            let dir = PathBuf::from(&p.cwd);
+            let dir = if dir.is_dir() {
+                dir
+            } else {
+                self.workspace_root.clone()
+            };
+            if let Ok(mut t) = PtyTerminal::new(&dir) {
+                t.set_manual_name(p.name.clone());
+                terms.push(t);
+            }
+        }
+        if terms.is_empty() {
+            return;
+        }
+        self.terminals = terms;
+        self.active_terminal = rec.active.min(self.terminals.len() - 1);
+        self.sync_focus_flags();
+        self.status = format!("Restored terminal session ({} panes)", self.terminals.len());
     }
 
     /// Available terminal profiles as `(shell_path, label)`: the shells in
@@ -8668,11 +8829,20 @@ impl App {
     /// when an inactive pane is closed; closing the active pane reseats the
     /// focus on the neighbour to the left (or the new last if we removed
     /// the right edge).
+    ///
+    /// The pane is not dropped (which would kill its child): it parks in
+    /// `closed_terminals` for [`UNDO_CLOSE_GRACE`] so Cmd+K ⇧T can bring it
+    /// back, process and scrollback intact. The tick reaps expired entries.
     pub fn close_terminal_at(&mut self, idx: usize) -> bool {
         if self.terminals.len() <= 1 || idx >= self.terminals.len() {
             return false;
         }
-        self.terminals.remove(idx);
+        let term = self.terminals.remove(idx);
+        self.closed_terminals.push(ClosedTerminal {
+            term,
+            idx,
+            closed_at: std::time::Instant::now(),
+        });
         if self.active_terminal == idx {
             if self.active_terminal >= self.terminals.len() {
                 self.active_terminal = self.terminals.len() - 1;
@@ -8692,6 +8862,7 @@ impl App {
             }
         }
         self.sync_focus_flags();
+        self.save_terminal_session();
         true
     }
 
@@ -8781,12 +8952,41 @@ impl App {
             a if to <= a && a < from => a + 1,
             a => a,
         };
+        self.save_terminal_session();
     }
 
     /// Drop the currently-active terminal. Thin wrapper kept for the
     /// keyboard shortcut and existing callers.
     pub fn close_active_terminal(&mut self) -> bool {
         self.close_terminal_at(self.active_terminal)
+    }
+
+    /// Cmd+K ⇧T: bring back the most recently closed terminal pane while it
+    /// is still inside the undo-close grace window. The pane returns to the
+    /// slot it occupied (clamped if the layout shrank) and takes focus; its
+    /// child process and scrollback were never touched.
+    pub fn undo_close_terminal(&mut self) {
+        let Some(parked) = self.closed_terminals.pop() else {
+            self.status = String::from("No recently closed terminals");
+            return;
+        };
+        let idx = parked.idx.min(self.terminals.len());
+        self.terminals.insert(idx, parked.term);
+        self.active_terminal = idx;
+        if !self.show_terminal {
+            self.show_terminal = true;
+        }
+        self.focus_pane(Pane::Terminal);
+        self.sync_focus_flags();
+        self.save_terminal_session();
+        self.status = format!("Restored terminal {}", self.terminals[idx].label());
+    }
+
+    /// Drop parked closed panes whose grace window lapsed (their Drop kills
+    /// the child). Called from the drain tick.
+    fn reap_closed_terminals(&mut self) {
+        self.closed_terminals
+            .retain(|p| p.closed_at.elapsed() <= UNDO_CLOSE_GRACE);
     }
 
     /// Cmd+K I: toggle broadcast input. Turning it ON goes through a confirm
@@ -8931,6 +9131,9 @@ impl App {
         if p != Pane::Terminal && self.terminal_quick_select.is_some() {
             self.close_terminal_quick_select();
         }
+        if p != Pane::Terminal && self.terminal_copy_mode.is_some() {
+            self.close_terminal_copy_mode();
+        }
         self.focus = p;
         self.sync_focus_flags();
         if self.editor.focused {
@@ -9021,6 +9224,10 @@ impl App {
         self.ports.theme = self.theme;
         self.ports.focused = self.focus == Pane::Terminal;
         self.ports.hover_pointer = self.pointer_cell;
+        self.captures.focus_gradient = gradient;
+        self.captures.theme = self.theme;
+        self.captures.focused = self.focus == Pane::Terminal;
+        self.captures.hover_pointer = self.pointer_cell;
         for t in self.terminals.iter_mut() {
             t.focus_gradient = gradient;
             t.set_palette(self.theme.ansi());
@@ -9060,6 +9267,7 @@ impl App {
         self.problems_tab_rect = Rect::default();
         self.output_tab_rect = Rect::default();
         self.ports_tab_rect = Rect::default();
+        self.captures_tab_rect = Rect::default();
         self.terminal_tab_rect = Rect::default();
         // In images mode the count rides as an orange circle (the same raster
         // badge as the activity bar), emitted post-frame; recompute its anchor
@@ -9074,6 +9282,7 @@ impl App {
             (BottomPanelTab::Output, " OUTPUT "),
             (BottomPanelTab::Terminal, " TERMINAL "),
             (BottomPanelTab::Ports, " PORTS "),
+            (BottomPanelTab::Captures, " CAPTURES "),
         ];
 
         // Lay each tab out left to right, recording its hit rect (which, for
@@ -9104,6 +9313,7 @@ impl App {
                 BottomPanelTab::Problems => self.problems_tab_rect = rect,
                 BottomPanelTab::Output => self.output_tab_rect = rect,
                 BottomPanelTab::Ports => self.ports_tab_rect = rect,
+                BottomPanelTab::Captures => self.captures_tab_rect = rect,
                 BottomPanelTab::Terminal => self.terminal_tab_rect = rect,
             }
             placed.push((tab, label, rect, badge_w));
@@ -9988,6 +10198,19 @@ impl App {
                     }
                     frame.render_widget(&mut self.ports, content);
                 }
+                BottomPanelTab::Captures => {
+                    // Same hidden-terminal reset as the PORTS arm above.
+                    self.terminal_add_buttons.clear();
+                    self.terminal_profile_buttons.clear();
+                    self.terminal_close_buttons.clear();
+                    self.terminal_max_buttons.clear();
+                    self.terminal_label_rects.clear();
+                    self.terminal_rail_rects.clear();
+                    for t in self.terminals.iter_mut() {
+                        t.last_area = Rect::default();
+                    }
+                    frame.render_widget(&mut self.captures, content);
+                }
             }
         } else {
             self.terminal_add_buttons.clear();
@@ -9999,6 +10222,7 @@ impl App {
             self.problems_tab_rect = Rect::default();
             self.output_tab_rect = Rect::default();
             self.ports_tab_rect = Rect::default();
+            self.captures_tab_rect = Rect::default();
             self.terminal_tab_rect = Rect::default();
             // A hidden terminal must not keep stale hit rects alive, or
             // `terminal_at_pos` would phantom-match clicks meant for
@@ -10241,6 +10465,7 @@ impl App {
         self.render_workspace_symbols(frame);
         self.render_process_picker(frame);
         self.render_zoxide_jump(frame);
+        self.render_command_history_popup(frame);
         self.render_branch_picker(frame);
         self.render_scm_menu(frame);
         self.render_input_prompt(frame);
@@ -11285,6 +11510,13 @@ impl App {
                 }
                 true
             }
+            // Cmd+K Shift+T: reopen the most recently closed terminal pane
+            // (the browser reopen-tab convention under the Cmd+K leader).
+            // Must precede the case-insensitive T theme arm below.
+            KeyCode::Char('T') if shifted && plain => {
+                self.undo_close_terminal();
+                true
+            }
             // Cmd+K Cmd+T / Cmd+K T: open the Color Theme picker.
             KeyCode::Char(c) if plain && c.eq_ignore_ascii_case(&'t') => {
                 self.open_theme_picker();
@@ -11568,6 +11800,10 @@ impl App {
         }
         if self.zoxide_jump.is_some() {
             self.handle_zoxide_jump_key(key);
+            return Ok(());
+        }
+        if self.command_history_popup.is_some() {
+            self.handle_command_history_key(key);
             return Ok(());
         }
         if self.branch_picker.is_some() {
@@ -11928,6 +12164,7 @@ impl App {
                 BottomPanelTab::Problems => self.handle_problems_key(key),
                 BottomPanelTab::Output => self.handle_output_key(key),
                 BottomPanelTab::Ports => self.handle_ports_key(key),
+                BottomPanelTab::Captures => self.handle_captures_key(key),
                 BottomPanelTab::Terminal => self.handle_terminal_key(key),
             },
         }
@@ -16803,10 +17040,162 @@ impl App {
         }
     }
 
+    fn handle_captures_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Up => self.captures.move_selection(-1),
+            KeyCode::Down => self.captures.move_selection(1),
+            KeyCode::Esc => self.focus_pane(Pane::Editor),
+            KeyCode::Enter => self.captures_open_selected(),
+            KeyCode::Char('x') => self.captures.remove_selected(),
+            KeyCode::Char('c') => {
+                self.captures.clear();
+                self.status = String::from("Cleared captured output");
+            }
+            _ => {}
+        }
+    }
+
+    /// Ctrl+Shift+H: open the durable command-history search over the
+    /// active pane's context (atuin's enhanced Ctrl+R, embedded).
+    fn open_command_history(&mut self) {
+        let mut pop = crate::widgets::history_popup::HistoryPopup::new();
+        pop.cwd = self
+            .terminal()
+            .shell_cwd()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+        pop.set_results(self.command_history.search("", pop.scope, &pop.cwd));
+        self.command_history_popup = Some(pop);
+    }
+
+    /// Re-run the store search after any query / scope change.
+    fn refresh_command_history_results(&mut self) {
+        let Some(pop) = self.command_history_popup.as_ref() else {
+            return;
+        };
+        let (query, scope, cwd) = (pop.query.clone(), pop.scope, pop.cwd.clone());
+        let results = self.command_history.search(&query, scope, &cwd);
+        if let Some(pop) = self.command_history_popup.as_mut() {
+            pop.set_results(results);
+        }
+    }
+
+    fn handle_command_history_key(&mut self, key: KeyEvent) {
+        // Ctrl+R (and the opening chord itself) cycles the scope filter:
+        // all → this directory → failed only.
+        if matches!(key.code, KeyCode::Char('r' | 'R'))
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+        {
+            if let Some(pop) = self.command_history_popup.as_mut() {
+                pop.scope = pop.scope.next();
+            }
+            self.refresh_command_history_results();
+            return;
+        }
+        match key.code {
+            KeyCode::Esc => {
+                self.command_history_popup = None;
+            }
+            KeyCode::Enter => {
+                let cmd = self
+                    .command_history_popup
+                    .as_ref()
+                    .and_then(|p| p.selected_entry())
+                    .map(|e| e.cmd.clone());
+                self.command_history_popup = None;
+                if let Some(cmd) = cmd {
+                    self.focus_pane(Pane::Terminal);
+                    self.terminal_mut().paste_input(cmd.as_bytes());
+                    self.status = String::from("Command typed at the prompt (Enter runs it)");
+                }
+            }
+            KeyCode::Up => {
+                if let Some(pop) = self.command_history_popup.as_mut() {
+                    pop.select_prev();
+                }
+            }
+            KeyCode::Down => {
+                if let Some(pop) = self.command_history_popup.as_mut() {
+                    pop.select_next();
+                }
+            }
+            KeyCode::Left => {
+                if let Some(pop) = self.command_history_popup.as_mut() {
+                    pop.move_cursor_left();
+                }
+            }
+            KeyCode::Right => {
+                if let Some(pop) = self.command_history_popup.as_mut() {
+                    pop.move_cursor_right();
+                }
+            }
+            KeyCode::Backspace => {
+                if let Some(pop) = self.command_history_popup.as_mut() {
+                    pop.pop_char();
+                }
+                self.refresh_command_history_results();
+            }
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(pop) = self.command_history_popup.as_mut() {
+                    pop.push_char(c);
+                }
+                self.refresh_command_history_results();
+            }
+            _ => {}
+        }
+    }
+
+    /// Jump the selected capture's pane back to the captured line: switch to
+    /// the TERMINAL tab, focus the pane (found by shell pid; a closed pane
+    /// falls back to the active one), locate the newest grid row matching
+    /// the captured text, scroll it into view and select it. A very long
+    /// captured line wraps across grid rows, so the match is prefix-based
+    /// on the first wrapped row.
+    pub fn captures_open_selected(&mut self) {
+        let Some(entry) = self.captures.selected_entry().cloned() else {
+            return;
+        };
+        let idx = entry
+            .shell_pid
+            .and_then(|pid| {
+                self.terminals
+                    .iter()
+                    .position(|t| t.shell_pid() == Some(pid))
+            })
+            .unwrap_or(self.active_terminal);
+        self.active_terminal = idx;
+        self.set_bottom_panel_tab(BottomPanelTab::Terminal);
+        self.focus_pane(Pane::Terminal);
+        let (lines, top) = self.terminals[idx].grid_lines();
+        let needle: String = entry.line.trim_end().chars().take(60).collect();
+        let Some(row) = lines
+            .iter()
+            .rposition(|l| !needle.is_empty() && l.starts_with(&needle))
+        else {
+            self.status = String::from("Captured line is no longer in the scrollback");
+            return;
+        };
+        let line = top + row as i32;
+        let (_, _, cols, _) = self.terminals[idx].grid_bounds();
+        let t = &mut self.terminals[idx];
+        t.set_selection(Some(crate::widgets::terminal::Selection {
+            anchor: (line, 0),
+            head: (line, cols.saturating_sub(1)),
+            block: false,
+        }));
+        t.scroll_to_line(line);
+        self.status = format!("Capture: {}", entry.message);
+    }
+
     fn handle_terminal_key(&mut self, key: KeyEvent) {
         // Quick-select owns every keystroke while its labels are up.
         if self.terminal_quick_select.is_some() {
             self.handle_terminal_quick_select_key(key);
+            return;
+        }
+        // Copy mode owns every keystroke while it is on.
+        if self.terminal_copy_mode.is_some() {
+            self.handle_terminal_copy_mode_key(key);
             return;
         }
         // The find bar owns every keystroke while it is open.
@@ -16818,6 +17207,19 @@ impl App {
         // hash / IP on screen; typing a label copies it, UPPERCASE pastes.
         if is_quick_select_key(key) {
             self.open_terminal_quick_select();
+            return;
+        }
+        // Ctrl+Shift+Y (WezTerm's copy mode, Y for yank): keyboard-select
+        // from the grid and scrollback with vi motions.
+        if is_copy_mode_key(key) {
+            self.open_terminal_copy_mode();
+            return;
+        }
+        // Ctrl+Shift+H (H for history; atuin's enhanced Ctrl+R lives on the
+        // shell side): search the durable cross-session command history.
+        // Plain Ctrl+R still reaches the shell's own reverse search.
+        if is_command_history_key(key) {
+            self.open_command_history();
             return;
         }
         // Cmd+F / Ctrl+F: open find-in-terminal (scrollback search), like
@@ -17620,6 +18022,7 @@ impl App {
     /// bar (VS Code shows a bell on the terminal tab; croft's status line is
     /// its equivalent). Returns true when either arrived so the loop redraws.
     fn drain_terminal_bells(&mut self) -> bool {
+        self.reap_closed_terminals();
         // Long-command completion notice, the Ghostty/Warp behaviour: only
         // when the pane isn't the focused one (the user watching a pane sees
         // the command end themselves).
@@ -17628,37 +18031,79 @@ impl App {
         let mut notes: Vec<String> = Vec::new();
         let mut finished: Option<String> = None;
         let mut trigger_note: Option<String> = None;
+        let mut captured: Vec<crate::widgets::captures::CapturedLine> = Vec::new();
         for t in &self.terminals {
             // Keep every pane on the current trigger set, wherever it was
             // created (a ptr-eq no-op when already current).
             t.set_triggers(self.triggers.clone());
             for h in t.drain_trigger_hits() {
-                trigger_note = Some(match h.action {
-                    crate::triggers::TriggerAction::Bell => {
-                        format!("Trigger bell in {}: {}", t.label(), h.message)
+                match h.action {
+                    crate::triggers::TriggerAction::Capture => {
+                        captured.push(crate::widgets::captures::CapturedLine {
+                            pane: t.label().to_string(),
+                            shell_pid: t.shell_pid(),
+                            message: h.message,
+                            line: h.line,
+                        });
                     }
-                    _ => format!("Trigger in {}: {}", t.label(), h.message),
-                });
+                    crate::triggers::TriggerAction::Bell => {
+                        trigger_note =
+                            Some(format!("Trigger bell in {}: {}", t.label(), h.message));
+                    }
+                    _ => {
+                        trigger_note = Some(format!("Trigger in {}: {}", t.label(), h.message));
+                    }
+                }
             }
             if t.take_bell() {
                 rang = Some(t.label().to_string());
             }
             notes.extend(t.drain_notifications());
             // Always drain so completions never pile up unseen.
-            for (exit, dur) in t.drain_finished_commands() {
-                if t.focused || dur < LONG_COMMAND_NOTIFY {
+            for f in t.drain_finished_commands() {
+                // Durable command history: every finished command with a
+                // known text is recorded (cwd, exit, duration, timestamp)
+                // for the Ctrl+Shift+R cross-session search.
+                if !f.cmd.trim().is_empty() {
+                    let ts = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    self.command_history
+                        .append(crate::command_history::HistoryEntry {
+                            cmd: f.cmd.trim().to_string(),
+                            cwd: f
+                                .cwd
+                                .as_deref()
+                                .map(|p| p.display().to_string())
+                                .unwrap_or_default(),
+                            exit: f.exit,
+                            dur_ms: f.dur.as_millis() as u64,
+                            ts,
+                        });
+                }
+                if t.focused || f.dur < LONG_COMMAND_NOTIFY {
                     continue;
                 }
-                let code = exit.map_or_else(|| String::from("?"), |c| c.to_string());
+                let code = f.exit.map_or_else(|| String::from("?"), |c| c.to_string());
                 finished = Some(format!(
                     "Command in {} finished: exit {code} in {}",
                     t.label(),
-                    crate::widgets::terminal::human_duration(dur)
+                    crate::widgets::terminal::human_duration(f.dur)
                 ));
             }
         }
+        // Captures collect silently (iTerm2's model: the panel is the
+        // surface, not the status bar), but still trigger a redraw.
+        let had_captures = !captured.is_empty();
+        for c in captured {
+            self.captures.push(c);
+        }
         if let Some(msg) = trigger_note {
             self.status = msg;
+            return true;
+        }
+        if had_captures {
             return true;
         }
         if let Some(msg) = notes.pop() {
@@ -19624,6 +20069,30 @@ impl App {
         crate::widgets::zoxide_jump::render_zoxide_jump(jump, rect, frame.buffer_mut(), gradient);
     }
 
+    fn render_command_history_popup(&mut self, frame: &mut ratatui::Frame) {
+        let full = frame.area();
+        let gradient = self.popup_gradient();
+        let Some(pop) = self.command_history_popup.as_mut() else {
+            return;
+        };
+        // Centered box, the zoxide-jump fallback geometry: wide enough for
+        // command lines, anchored in the upper half like Quick Open.
+        let width = (full.width.saturating_mul(7) / 10).clamp(40, 110.min(full.width));
+        let height = (full.height.saturating_mul(6) / 10).clamp(10, full.height);
+        let rect = Rect {
+            x: full.x + (full.width.saturating_sub(width)) / 2,
+            y: full.y + (full.height.saturating_sub(height)) / 4,
+            width,
+            height,
+        };
+        crate::widgets::history_popup::render_history_popup(
+            pop,
+            rect,
+            frame.buffer_mut(),
+            gradient,
+        );
+    }
+
     pub fn consume_branch_picker_image_clear(&mut self) -> bool {
         self.overlays.branch_picker_clear.consume()
     }
@@ -20218,6 +20687,230 @@ impl App {
                 t.set_hints(None);
             }
         }
+    }
+
+    /// Ctrl+Shift+Y: enter copy mode on the active pane. The cursor starts
+    /// at the shell's cursor cell (WezTerm's convention) and the pane paints
+    /// it as a green modal block.
+    fn open_terminal_copy_mode(&mut self) {
+        let t = self.terminal();
+        let (line, col) = t.cursor_line_col();
+        let (top, bottom, cols, _) = t.grid_bounds();
+        let line = line.clamp(top, bottom);
+        let col = col.min(cols.saturating_sub(1));
+        self.terminal_mut().set_copy_cursor(Some((line, col)));
+        self.terminal_copy_mode = Some(CopyModeState {
+            line,
+            col,
+            anchor: None,
+            kind: CopySelKind::Char,
+        });
+        self.status = String::from(
+            "Copy mode: h/j/k/l w/b/e 0/$ g/G move, v/V/^V select, y copies, Esc exits",
+        );
+    }
+
+    fn close_terminal_copy_mode(&mut self) {
+        if self.terminal_copy_mode.take().is_some() {
+            // Clear every pane, not just the active one: a mouse click can
+            // move `active_terminal` while the mode is up.
+            for t in &mut self.terminals {
+                t.set_copy_cursor(None);
+                t.clear_selection();
+            }
+        }
+    }
+
+    /// Push the copy-mode cursor + selection into the pane and keep the
+    /// cursor on screen (centering only when it left the viewport).
+    fn apply_terminal_copy_mode(&mut self) {
+        let Some(st) = self.terminal_copy_mode.as_ref() else {
+            return;
+        };
+        let (line, col) = (st.line, st.col);
+        let (_, _, cols, rows) = self.terminal().grid_bounds();
+        let sel = st.anchor.map(|(al, ac)| match st.kind {
+            CopySelKind::Char => crate::widgets::terminal::Selection {
+                anchor: (al, ac),
+                head: (line, col),
+                block: false,
+            },
+            CopySelKind::Line => crate::widgets::terminal::Selection {
+                anchor: (al.min(line), 0),
+                head: (al.max(line), cols.saturating_sub(1)),
+                block: false,
+            },
+            CopySelKind::Block => crate::widgets::terminal::Selection {
+                anchor: (al, ac),
+                head: (line, col),
+                block: true,
+            },
+        });
+        let off = self.terminal().scroll_display_offset();
+        let visible = (-off, rows as i32 - 1 - off);
+        let t = self.terminal_mut();
+        t.set_selection(sel);
+        t.set_copy_cursor(Some((line, col)));
+        if line < visible.0 || line > visible.1 {
+            t.scroll_to_line(line);
+        }
+    }
+
+    /// The char index in `text` whose grid column covers `col` (the last
+    /// char whose start column is <= col), for word motions over the
+    /// spacer-skipped row text.
+    fn char_idx_at_col(colmap: &[usize], col: u16) -> usize {
+        let col = col as usize;
+        match colmap.binary_search(&col) {
+            Ok(i) => i,
+            Err(0) => 0,
+            Err(i) => i - 1,
+        }
+    }
+
+    fn handle_terminal_copy_mode_key(&mut self, key: KeyEvent) {
+        let Some(mut st) = self.terminal_copy_mode.take() else {
+            return;
+        };
+        let (top, bottom, cols, rows) = self.terminal().grid_bounds();
+        let last_col = cols.saturating_sub(1);
+        let half = (rows as i32 / 2).max(1);
+        let page = (rows as i32 - 1).max(1);
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let word = crate::widgets::terminal::is_terminal_word_char;
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.terminal_copy_mode = Some(st);
+                self.close_terminal_copy_mode();
+                self.status = String::from("Copy mode off");
+                return;
+            }
+            KeyCode::Char('y') | KeyCode::Enter => {
+                let text = self.terminal().selection_text();
+                self.terminal_copy_mode = Some(st);
+                self.close_terminal_copy_mode();
+                if text.is_empty() {
+                    self.status =
+                        String::from("Copy mode: nothing selected (v/V/^V starts a selection)");
+                } else {
+                    copy_to_clipboard(&text);
+                    self.status = format!("Copied {} chars to clipboard", text.chars().count());
+                }
+                return;
+            }
+            // Selection arms: v again (same kind) drops the anchor, a
+            // different kind reshapes the existing selection in place.
+            KeyCode::Char('v') if ctrl => {
+                if st.anchor.is_some() && st.kind == CopySelKind::Block {
+                    st.anchor = None;
+                } else {
+                    st.anchor.get_or_insert((st.line, st.col));
+                    st.kind = CopySelKind::Block;
+                }
+            }
+            KeyCode::Char('v') => {
+                if st.anchor.is_some() && st.kind == CopySelKind::Char {
+                    st.anchor = None;
+                } else {
+                    st.anchor.get_or_insert((st.line, st.col));
+                    st.kind = CopySelKind::Char;
+                }
+            }
+            KeyCode::Char('V') => {
+                if st.anchor.is_some() && st.kind == CopySelKind::Line {
+                    st.anchor = None;
+                } else {
+                    st.anchor.get_or_insert((st.line, st.col));
+                    st.kind = CopySelKind::Line;
+                }
+            }
+            KeyCode::Char('h') | KeyCode::Left => st.col = st.col.saturating_sub(1),
+            KeyCode::Char('l') | KeyCode::Right => st.col = (st.col + 1).min(last_col),
+            KeyCode::Char('j') | KeyCode::Down => st.line = (st.line + 1).min(bottom),
+            KeyCode::Char('k') | KeyCode::Up => st.line = (st.line - 1).max(top),
+            KeyCode::Char('0') | KeyCode::Home => st.col = 0,
+            KeyCode::Char('$') | KeyCode::End => {
+                let (text, colmap) = self.terminal().row_text(st.line);
+                let trimmed = text.trim_end();
+                let chars = trimmed.chars().count();
+                st.col = if chars == 0 {
+                    0
+                } else {
+                    colmap.get(chars - 1).map_or(0, |&c| c as u16)
+                };
+            }
+            KeyCode::Char('g') => st.line = top,
+            KeyCode::Char('G') => st.line = bottom,
+            KeyCode::Char('u') if ctrl => st.line = (st.line - half).max(top),
+            KeyCode::Char('d') if ctrl => st.line = (st.line + half).min(bottom),
+            KeyCode::PageUp => st.line = (st.line - page).max(top),
+            KeyCode::PageDown => st.line = (st.line + page).min(bottom),
+            KeyCode::Char('w') => {
+                let (text, colmap) = self.terminal().row_text(st.line);
+                let chars: Vec<char> = text.chars().collect();
+                let mut i = Self::char_idx_at_col(&colmap, st.col);
+                while i < chars.len() && word(chars[i]) {
+                    i += 1;
+                }
+                while i < chars.len() && !word(chars[i]) {
+                    i += 1;
+                }
+                // Trailing blanks reach the row's end: wrap to the next row
+                // start like vim's w does at end of line.
+                if i >= text.trim_end().chars().count() && st.line < bottom {
+                    st.line += 1;
+                    st.col = 0;
+                } else {
+                    st.col = colmap.get(i).map_or(last_col, |&c| c as u16);
+                }
+            }
+            KeyCode::Char('b') => {
+                let (text, colmap) = self.terminal().row_text(st.line);
+                let chars: Vec<char> = text.chars().collect();
+                let mut i = Self::char_idx_at_col(&colmap, st.col);
+                if i == 0 {
+                    if st.line > top {
+                        st.line -= 1;
+                        let (ptext, pcolmap) = self.terminal().row_text(st.line);
+                        let pchars = ptext.trim_end().chars().count();
+                        st.col = if pchars == 0 {
+                            0
+                        } else {
+                            pcolmap.get(pchars - 1).map_or(0, |&c| c as u16)
+                        };
+                    }
+                } else {
+                    i -= 1;
+                    while i > 0 && !word(chars[i]) {
+                        i -= 1;
+                    }
+                    while i > 0 && word(chars[i - 1]) {
+                        i -= 1;
+                    }
+                    st.col = colmap.get(i).map_or(0, |&c| c as u16);
+                }
+            }
+            KeyCode::Char('e') => {
+                let (text, colmap) = self.terminal().row_text(st.line);
+                let chars: Vec<char> = text.chars().collect();
+                let mut i = Self::char_idx_at_col(&colmap, st.col);
+                i += 1;
+                while i < chars.len() && !word(chars[i]) {
+                    i += 1;
+                }
+                while i + 1 < chars.len() && word(chars[i + 1]) {
+                    i += 1;
+                }
+                if i < chars.len() {
+                    st.col = colmap.get(i).map_or(last_col, |&c| c as u16);
+                }
+            }
+            _ => {}
+        }
+        st.line = st.line.clamp(top, bottom);
+        st.col = st.col.min(last_col);
+        self.terminal_copy_mode = Some(st);
+        self.apply_terminal_copy_mode();
     }
 
     fn handle_terminal_quick_select_key(&mut self, key: KeyEvent) {
@@ -20999,6 +21692,25 @@ impl App {
             self.handle_zoxide_jump_mouse(m);
             return;
         }
+        if self.command_history_popup.is_some() {
+            // Keyboard-first popup: a click anywhere dismisses it (Esc's
+            // mouse equivalent); the wheel moves the selection.
+            match m.kind {
+                MouseEventKind::ScrollUp => {
+                    if let Some(pop) = self.command_history_popup.as_mut() {
+                        pop.select_prev();
+                    }
+                }
+                MouseEventKind::ScrollDown => {
+                    if let Some(pop) = self.command_history_popup.as_mut() {
+                        pop.select_next();
+                    }
+                }
+                MouseEventKind::Down(_) => self.command_history_popup = None,
+                _ => {}
+            }
+            return;
+        }
         if self.branch_picker.is_some() {
             self.handle_branch_picker_mouse(m);
             return;
@@ -21329,7 +22041,23 @@ impl App {
                             label: String::from("Quick Select"),
                             action: MenuAction::TerminalQuickSelect,
                         },
+                        MenuEntry::Item {
+                            label: String::from("Copy Mode"),
+                            action: MenuAction::TerminalCopyMode,
+                        },
+                        MenuEntry::Item {
+                            label: String::from("Command History"),
+                            action: MenuAction::TerminalCommandHistory,
+                        },
                     ];
+                    // Undo close only appears while a parked pane is alive
+                    // to restore (the grace window).
+                    if !self.closed_terminals.is_empty() {
+                        items.push(MenuEntry::Item {
+                            label: String::from("Reopen Closed Terminal"),
+                            action: MenuAction::UndoCloseTerminal,
+                        });
+                    }
                     // Maximize and broadcast both need a second pane, so a
                     // lone terminal doesn't offer them.
                     if self.terminals.len() > 1 {
@@ -21665,6 +22393,10 @@ impl App {
                     self.set_bottom_panel_tab(BottomPanelTab::Ports);
                     return;
                 }
+                if rect_contains(self.captures_tab_rect, m.column, m.row) {
+                    self.set_bottom_panel_tab(BottomPanelTab::Captures);
+                    return;
+                }
                 // A click in the OUTPUT view hits its toolbar (dropdown / clear /
                 // rpc / level) or dropdown list; if it lands in the log body the
                 // widget doesn't consume it, so we just focus the panel pane.
@@ -21717,6 +22449,20 @@ impl App {
                             } else {
                                 self.ports_click.record(now, m.column, m.row);
                             }
+                        }
+                        None => self.focus_pane(Pane::Terminal),
+                    }
+                    return;
+                }
+                // A click on a CAPTURES row jumps straight to the captured
+                // line (iTerm2's captured-output click).
+                if self.bottom_panel_tab == BottomPanelTab::Captures
+                    && rect_contains(self.captures.last_area, m.column, m.row)
+                {
+                    match self.captures.row_at(m.column, m.row) {
+                        Some(idx) => {
+                            self.captures.select_index(idx);
+                            self.captures_open_selected();
                         }
                         None => self.focus_pane(Pane::Terminal),
                     }
@@ -23701,8 +24447,11 @@ impl App {
             MenuAction::RenameTerminal(idx) => self.begin_rename_terminal(idx),
             MenuAction::ClearTerminal(idx) => self.clear_terminal_at(idx),
             MenuAction::TerminalQuickSelect => self.open_terminal_quick_select(),
+            MenuAction::TerminalCopyMode => self.open_terminal_copy_mode(),
+            MenuAction::TerminalCommandHistory => self.open_command_history(),
             MenuAction::ToggleBroadcastInput => self.toggle_broadcast_input(),
             MenuAction::ToggleBroadcastExclusion => self.toggle_broadcast_exclusion(),
+            MenuAction::UndoCloseTerminal => self.undo_close_terminal(),
             MenuAction::CopyCommandOutput(idx, d) => self.copy_command_output(idx, d),
             MenuAction::SelectCommandOutput(idx, d) => self.select_command_output(idx, d),
             MenuAction::RerunCommand(idx, d) => self.rerun_command(idx, d),
@@ -24004,6 +24753,7 @@ impl App {
             || self.workspace_symbols.is_some()
             || self.process_picker.is_some()
             || self.zoxide_jump.is_some()
+            || self.command_history_popup.is_some()
             || self.branch_picker.is_some()
             || self.input_prompt.is_some()
             || self.list_picker.is_some()
@@ -24129,6 +24879,7 @@ impl App {
             || self.workspace_symbols.is_some()
             || self.process_picker.is_some()
             || self.zoxide_jump.is_some()
+            || self.command_history_popup.is_some()
             || self.branch_picker.is_some()
             || self.input_prompt.is_some()
             || self.list_picker.is_some()
@@ -24345,6 +25096,7 @@ impl App {
             || self.workspace_symbols.is_some()
             || self.process_picker.is_some()
             || self.zoxide_jump.is_some()
+            || self.command_history_popup.is_some()
             || self.branch_picker.is_some()
             || self.input_prompt.is_some()
             || self.list_picker.is_some()
@@ -24552,6 +25304,7 @@ impl App {
             || self.workspace_symbols.is_some()
             || self.process_picker.is_some()
             || self.zoxide_jump.is_some()
+            || self.command_history_popup.is_some()
             || self.branch_picker.is_some()
             || self.input_prompt.is_some()
             || self.list_picker.is_some()
@@ -25272,6 +26025,7 @@ impl App {
                     } else {
                         format!("Renamed terminal to {name}")
                     };
+                    self.save_terminal_session();
                 }
             }
         }
@@ -26013,6 +26767,24 @@ fn is_terminal_maximize_key(key: KeyEvent) -> bool {
 /// kitty keyboard protocol exactly like the Ctrl+Shift+T split chord.
 fn is_quick_select_key(key: KeyEvent) -> bool {
     matches!(key.code, KeyCode::Char(' '))
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+        && key.modifiers.contains(KeyModifiers::SHIFT)
+}
+
+/// `Ctrl+Shift+Y` (Y for yank; WezTerm's Ctrl+Shift+X is croft's
+/// Extensions jump). Arrives via the kitty keyboard protocol, so no
+/// iTerm2/Ghostty forwarder is needed.
+fn is_copy_mode_key(key: KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char('y' | 'Y'))
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+        && key.modifiers.contains(KeyModifiers::SHIFT)
+}
+
+/// `Ctrl+Shift+H` (H for history; atuin's Ctrl+R belongs to the shell and
+/// Ctrl+Shift+R is croft's Remote jump). Kitty-protocol chord, no
+/// forwarder needed.
+fn is_command_history_key(key: KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char('h' | 'H'))
         && key.modifiers.contains(KeyModifiers::CONTROL)
         && key.modifiers.contains(KeyModifiers::SHIFT)
 }
@@ -27918,6 +28690,9 @@ pub fn run(
     std::thread::spawn(crate::highlight::prewarm_configs);
     let title = build_title(&root);
     let mut app = App::new(root.clone())?;
+    // Resurrect this workspace's terminal panel from the last session
+    // (pane layout, cwds, names, focus) before the first frame paints.
+    app.restore_terminal_session();
     // Restore the tabs / layout carried across a self-update re-exec, then
     // delete the handoff file so a later normal launch starts clean.
     if let Some(session_path) = restore_session.as_ref() {
@@ -28020,6 +28795,10 @@ pub fn run(
     let mut terminal: CroftTerminal = Terminal::new(backend).context("create terminal")?;
 
     let result = main_loop(&mut app, &mut terminal);
+
+    // Snapshot the terminal panel for the next launch (cwds are read live
+    // here, so plain `cd`s during the session are captured at quit).
+    app.save_terminal_session();
 
     disable_raw_mode().ok();
     {

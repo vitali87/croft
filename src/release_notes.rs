@@ -62,14 +62,18 @@ pub struct ReleaseNote {
 pub const RELEASE_NOTES: &[ReleaseNote] = &[
     ReleaseNote {
         kind: NoteKind::Feature,
-        summary: "imgcat works in the terminal: a program printing an iTerm2 OSC 1337 inline image shows the picture anchored at its output row, scrolling with the text and hiding once it scrolls off screen (the newest image per pane).",
+        summary: "The terminal remembers your workspace: the pane layout (directories, names, focus) is saved per workspace and restored as fresh shells on the next launch, and a closed pane stays undoable for 10s via Cmd+K Shift+T with its process and scrollback intact.",
     },
     ReleaseNote {
         kind: NoteKind::Feature,
-        summary: "The terminal owns its colors: ANSI output renders through the theme's 16-color palette (VS Code's dark terminal defaults), identical in every host terminal; theme extensions can override it with an ansi array in their [[themes]] block.",
+        summary: "Copy mode (Ctrl+Shift+Y): vi keys walk the scrollback, v/V/Ctrl+V select by character, line, or rectangular block, y copies to the clipboard — keyboard-only selection like WezTerm and tmux.",
     },
     ReleaseNote {
         kind: NoteKind::Feature,
-        summary: "Keyboard scrollback and selection niceties: Shift+PageUp/PageDown page through history (Shift+Home/End jump to the oldest line / live bottom), scrollback depth is configurable via terminal_scrollback in config.json, and a new \"Terminal: Copy on Selection\" setting copies a finished mouse selection without the explicit Cmd+C.",
+        summary: "Durable command history (Ctrl+Shift+H): every command run under croft is recorded with its directory, exit code, and duration, searchable across sessions and restarts (Ctrl+R narrows to this directory or failures only); Enter types the pick back at your prompt.",
+    },
+    ReleaseNote {
+        kind: NoteKind::Feature,
+        summary: "Captured output: a \"capture\" trigger action collects matching lines (compiler errors, test failures) into the new CAPTURES panel tab, where one click jumps the pane back to that line.",
     },
 ];

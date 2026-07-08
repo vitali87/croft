@@ -2,8 +2,10 @@
 //! output, each firing an action. The pragmatic action set that covers real
 //! trigger usage (per iTerm2 / kitty marks): **highlight** (recolour every
 //! visible occurrence, live, scrollback included), **notify** (status-bar
-//! notice with `\0`..`\9` capture interpolation), and **bell** (status-bar
-//! bell notice). Auto-respond / run-command actions are deliberately absent:
+//! notice with `\0`..`\9` capture interpolation), **bell** (status-bar
+//! bell notice), and **capture** (iTerm2's Capture Output: collect every
+//! matched line into the CAPTURES panel, where clicking an entry jumps the
+//! pane to that line). Auto-respond / run-command actions are deliberately absent:
 //! they are the classic security footgun (hostile output typing into your
 //! shell) and iTerm2 itself ships them behind warnings.
 //!
@@ -37,6 +39,9 @@ pub enum TriggerAction {
     Notify,
     /// Status-bar bell notice.
     Bell,
+    /// Collect the matched line into the CAPTURES panel (iTerm2's Capture
+    /// Output); the message template labels the entry.
+    Capture,
 }
 
 /// One user trigger, compiled and ready to match.
@@ -69,11 +74,15 @@ pub struct HighlightSpan {
     pub bg: Option<(u8, u8, u8)>,
 }
 
-/// One notify/bell firing, drained by the app into the status bar.
+/// One notify/bell/capture firing, drained by the app (status bar for
+/// notify/bell, the CAPTURES panel for capture).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TriggerHit {
     pub action: TriggerAction,
     pub message: String,
+    /// The whole escape-stripped output line that matched, so a captured
+    /// entry can be jumped back to (and shown) in full.
+    pub line: String,
 }
 
 pub fn triggers_path() -> PathBuf {
@@ -115,8 +124,9 @@ pub const TEMPLATE: &str = r##"// croft terminal triggers: regexes watched on te
 //   "action": "highlight"  recolour every visible occurrence ("fg"/"bg" as #rrggbb)
 //             "notify"     status-bar notice ("message" template: \0 whole match, \1-\9 groups)
 //             "bell"       status-bar bell notice
+//             "capture"    collect matched lines into the CAPTURES panel (click jumps to the line)
 // Highlights repaint live on the visible screen and persist into scrollback.
-// notify/bell fire once per completed output line (never inside full-screen apps).
+// notify/bell/capture fire once per completed output line (never inside full-screen apps).
 // "enabled": false keeps a rule without running it.
 [
   { "regex": "\\b(ERROR|FATAL|panicked)\\b", "action": "highlight", "fg": "#ffffff", "bg": "#c0392b" },
@@ -146,6 +156,7 @@ impl TriggerSet {
                     "highlight" => TriggerAction::Highlight,
                     "notify" => TriggerAction::Notify,
                     "bell" => TriggerAction::Bell,
+                    "capture" => TriggerAction::Capture,
                     _ => return None,
                 };
                 Some(Trigger {
@@ -327,6 +338,7 @@ impl TriggerScanner {
                     out.push(TriggerHit {
                         action: t.action,
                         message: interpolate(t.message.as_deref(), &caps),
+                        line: line.to_string(),
                     });
                 }
             }
@@ -400,6 +412,7 @@ mod tests {
             vec![TriggerHit {
                 action: TriggerAction::Notify,
                 message: String::from("build: FAILED"),
+                line: String::from("BUILD FAILED"),
             }]
         );
         out.clear();
@@ -436,6 +449,24 @@ mod tests {
         assert!(
             out.is_empty(),
             "bytes past the cap are dropped, the needle never enters the buffer: {out:?}"
+        );
+    }
+
+    #[test]
+    fn capture_action_parses_and_scanner_reports_the_full_line() {
+        let s = set(
+            r#"[ { "regex": "error\\[(\\w+)\\]", "action": "capture", "message": "rustc \\1" } ]"#,
+        );
+        assert!(s.has_events(), "capture is an event action");
+        let mut sc = TriggerScanner::new();
+        let mut out = Vec::new();
+        sc.scan(b"error[E0308]: mismatched types\r\n", &s, &mut out);
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!(out[0].action, TriggerAction::Capture);
+        assert_eq!(out[0].message, "rustc E0308");
+        assert_eq!(
+            out[0].line, "error[E0308]: mismatched types",
+            "a capture hit carries the whole matched line for the panel"
         );
     }
 

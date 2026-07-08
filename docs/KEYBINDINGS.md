@@ -347,8 +347,11 @@ Disabling takes effect immediately for the viewers and Vim (a disabled PDF/CSV v
 | `Cmd+Opt+Up` / `Cmd+Opt+Down` (Linux: `Ctrl+Alt`) | Jump to the previous / next command prompt (VS Code's command navigation; the jumped-to prompt parks at the top of the pane). Powered by OSC 133 shell integration, auto-installed for zsh (a `ZDOTDIR` shim that sources your own dotfiles unchanged), bash 4.4+ (the `$ENV` + `--posix` bootstrap kitty and Ghostty use; macOS's system bash 3.2 spawns clean, without hooks), and fish (a `vendor_conf.d` script that defers to fish 4's native marks and only adds hooks on old fish). Opt out with `CROFT_SHELL_INTEGRATION=0` |
 | Click a gutter dot on the pane's left border | Each finished command gets a VS Code-style decoration dot at its prompt row: blue for success, red for a non-zero exit. Clicking it opens the command's menu, headed by its exit code and runtime: **Copy Output**, **Select Output**, **Re-run Command**. A command over 10s finishing in a pane you're not focused on announces itself in the status bar on its own |
 | `Cmd+K` `Shift+C` / `Shift+S` / `Shift+R` | Keyboard forms of the decoration menu, applied to the last finished command in the active pane: copy its output, select its output, re-run it |
+| `Ctrl+Shift+Y` | Copy mode (WezTerm/tmux): a keyboard cursor walks the grid and scrollback with vi keys — `h`/`j`/`k`/`l` or arrows, `w`/`b`/`e` word motions, `0`/`$` line start/end, `g`/`G` oldest/newest line, `Ctrl+U`/`Ctrl+D` half page, `PageUp`/`PageDown` full page. `v` starts a character selection, `V` full lines, `Ctrl+V` a rectangular block; `y` (or `Enter`) copies it to the clipboard and exits, `Esc`/`q` exits without copying. The cursor paints as a green block |
+| `Ctrl+Shift+H` | Command history (atuin's model, embedded): search every command croft's shell integration has seen this machine run — across sessions and restarts — each recorded with its directory, exit code, duration, and time. Type to filter (case-insensitive; duplicates collapse to the newest run), `↑`/`↓` select, `Ctrl+R` cycles the scope (all / this directory / failed only), `Enter` types the pick at your prompt without running it, `Esc` closes. Plain `Ctrl+R` still reaches your shell's own reverse search |
+| `Cmd+K` `Shift+T` | Reopen the closed terminal: for 10s after closing a pane its process and scrollback stay alive in the background, and this brings it back exactly where it was (the browser reopen-tab convention). After the grace window the pane is disposed for real |
 | `Ctrl+Shift+Space` | Quick select (WezTerm's hint mode): every URL, filesystem path (including `path:line:col`), git SHA, UUID, IP, hex colour/address, and long number on screen gets a short home-row label overlaid, with the bottom-most match labelled cheapest. Type a label to copy the match to the clipboard; type it in UPPERCASE to also paste it into the shell; `Backspace` erases a typed char, `Esc` cancels |
-| Triggers (no chord) | iTerm2-style output triggers from `~/.config/croft/triggers.json` (palette: "Preferences: Open Terminal Triggers (JSON)", reloaded on save): each rule is a regex plus an action: `highlight` recolours every visible occurrence live (per-rule `#rrggbb` fg/bg, scrollback included), `notify` posts a status-bar notice (`\0` whole match, `\1`-`\9` capture groups), `bell` posts a bell notice. notify/bell fire once per completed output line, capped and never inside full-screen apps |
+| Triggers (no chord) | iTerm2-style output triggers from `~/.config/croft/triggers.json` (palette: "Preferences: Open Terminal Triggers (JSON)", reloaded on save): each rule is a regex plus an action: `highlight` recolours every visible occurrence live (per-rule `#rrggbb` fg/bg, scrollback included), `notify` posts a status-bar notice (`\0` whole match, `\1`-`\9` capture groups), `bell` posts a bell notice, `capture` collects the whole matching line into the CAPTURES panel tab (iTerm2's Capture Output; click an entry there to jump its pane back to that line). notify/bell/capture fire once per completed output line, capped and never inside full-screen apps |
 | `Cmd+K` `I` | Toggle broadcast input (iTerm2's `Cmd+Opt+I`): every keystroke and paste in the terminal goes to every pane at once. Enabling shows a confirm popup first; every receiving pane wears a red `⇶` name pill while it's on; switching off is instant, and closing down to one pane switches it off automatically |
 | `Cmd+K` `Shift+I` | Exclude the active pane from broadcast input (or include it again). The focused pane always receives its own typing; exclusion mutes the mirrored copy while other panes are focused |
 | `Shift+PageUp` / `Shift+PageDown` | Page through the pane's scrollback one screen at a time; `Shift+Home` jumps to the oldest line, `Shift+End` snaps back to the live bottom (xterm's convention, leaving the plain keys for the running program). Scrollback depth is 5000 lines by default, configurable via `terminal_scrollback` in `config.json` (applies to new panes) |
@@ -365,9 +368,11 @@ Disabling takes effect immediately for the viewers and Vim (a disabled PDF/CSV v
 | `Cmd+K` `M` | Maximize the active terminal across the panel; press again to restore the even split |
 | Click the `⛶` button (beside `-`) | Maximize that pane: it takes the panel's full width and the other terminals move to a rail down the right edge; the button becomes a restore glyph while maximized |
 | Click a rail row | While maximized: hand that terminal the maximized pane (the highlight marks the active one), so you can shuffle between full-size terminals |
-| Right-click a terminal pane | Open the pane menu: **Rename Terminal**, **Clear**, **Quick Select**, **Maximize Terminal** (or **Restore Terminal Split**), **Broadcast Input** (and, while broadcasting, **Exclude from Broadcast**) |
+| Right-click a terminal pane | Open the pane menu: **Rename Terminal**, **Clear**, **Quick Select**, **Copy Mode**, **Command History**, **Reopen Closed Terminal** (while one is in its undo window), **Maximize Terminal** (or **Restore Terminal Split**), **Broadcast Input** (and, while broadcasting, **Exclude from Broadcast**) |
 
 With two or more panes open, each pane's header shows its live foreground process (`zsh`, `vim`, `node`…); a manual rename overrides that label.
+
+The panel's layout survives restarts: the pane arrangement, each pane's directory and name, and which pane was focused are saved per workspace (on splits, closes, renames, reorders, and at quit) and restored as fresh shells the next time croft opens that workspace. A plain single-shell workspace stores nothing.
 | `Cmd`/`Ctrl` + click a printed URL | Open it. A loopback dev-server URL on a remote session (`http://localhost:3000`) is forwarded home over the live SSH connection first, then opened in your local browser; any other link opens directly. Real OSC 8 hyperlinks (`ls --hyperlink`, modern CLIs) work too, even when the visible text isn't the URL |
 | `Cmd`/`Ctrl` + click a printed `path:line[:col]` | Open that file in the editor at that line and column. Works on compiler errors (`src/x.rs:12:5`), test failures, grep hits, and Python tracebacks (`File "x.py", line 3`); relative paths resolve against the pane's current directory |
 
@@ -384,6 +389,19 @@ The PORTS tab in the bottom panel group lists the loopback ports croft has notic
 | `x` | Stop watching the port (tearing down its forward on a remote session) |
 | Click a port row | Select it; **double-click** opens it in your browser (forwarding it home first on a remote session), same as `⏎` |
 | Click the toast buttons | `Forward & Open` / `Forward` / `Open` / dismiss, depending on whether the session is remote |
+
+
+## Captures
+
+The CAPTURES tab collects output lines matched by `capture` triggers in `triggers.json` (iTerm2's Capture Output): point a rule at your compiler's error format and every hit funnels into one clickable list, however much output scrolled past.
+
+| Keys | Action |
+|------|--------|
+| `↑` / `↓` | Move the selection |
+| `Enter` / click a row | Jump the capturing pane back to that line: the TERMINAL tab activates, the pane scrolls the line into view and selects it |
+| `x` | Remove the selected entry |
+| `c` | Clear the list |
+| `Esc` | Focus the editor |
 
 ## iTerm2 key mappings
 

@@ -812,6 +812,11 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 handler: "is_terminal_close_key",
             },
             ShortcutEntry {
+                keys: "Cmd/Ctrl+K Shift+T",
+                description: "Reopen the closed terminal: within 10s of closing, the pane comes back with its process and scrollback intact",
+                handler: "",
+            },
+            ShortcutEntry {
                 keys: "Cmd+[ / Cmd+]",
                 description: "Cycle to the previous / next terminal",
                 handler: "is_terminal_cycle_back_key is_terminal_cycle_key",
@@ -825,6 +830,16 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 keys: "Ctrl+Shift+Space",
                 description: "Quick select: label every URL / path / hash / IP on screen; type a label to copy it (UPPERCASE pastes), Esc cancels",
                 handler: "is_quick_select_key",
+            },
+            ShortcutEntry {
+                keys: "Ctrl+Shift+Y",
+                description: "Copy mode: vi keys (h/j/k/l, w/b/e, 0/$, g/G, ^U/^D) walk the scrollback; v/V/^V select char/line/block, y copies, Esc exits",
+                handler: "is_copy_mode_key",
+            },
+            ShortcutEntry {
+                keys: "Ctrl+Shift+H",
+                description: "Command history: search every command this machine ran (cwd, exit, duration kept); ^R cycles all / this directory / failed, Enter types it",
+                handler: "is_command_history_key",
             },
             ShortcutEntry {
                 keys: "Cmd/Ctrl+K I",
