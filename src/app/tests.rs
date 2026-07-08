@@ -18247,6 +18247,23 @@ fn cmd_k_n_annotates_the_selection_and_a_click_shows_the_note() {
         "popup carries the note text"
     );
 
+    // The note must actually be PAINTED, not just set. Regression: the
+    // hover popup rendered only inside the editor-tabs branch, so with the
+    // welcome screen up (no file open — exactly a fresh croft) the click
+    // set the popup but nothing ever drew it.
+    term.draw(|f| app.render(f)).unwrap();
+    let buf = term.backend().buffer();
+    let painted = (0..buf.area.height).any(|y| {
+        (0..buf.area.width)
+            .map(|x| buf[(x, y)].symbol())
+            .collect::<String>()
+            .contains("broke here")
+    });
+    assert!(
+        painted,
+        "the note popup must be painted on screen even with the welcome screen up"
+    );
+
     // A real mouse drifts right after the click: the note must survive
     // pointer motion while it stays on the annotated span, and dismiss
     // once the pointer leaves it (regression: any move outside the editor

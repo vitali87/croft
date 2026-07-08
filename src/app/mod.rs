@@ -10105,13 +10105,6 @@ impl App {
                     frame.render_widget(popup_ref, area);
                 }
             }
-            if let Some(popup) = self.hover_popup.as_mut() {
-                popup.gradient = grad;
-                let area = popup.area_for(focused_area);
-                if area.width > 0 && area.height > 0 {
-                    frame.render_widget(&*popup, area);
-                }
-            }
             if let Some(popup) = self.tab_tooltip.as_mut() {
                 popup.gradient = grad;
                 let area = popup.area_for(focused_area);
@@ -10603,6 +10596,20 @@ impl App {
 
         // Overlays render last so they sit on top of everything else. The port
         // toast goes first so modals/menus paint above it.
+        //
+        // The hover note popup (editor symbol hover / terminal annotation
+        // note) renders here against the WHOLE frame, not the editor's
+        // focused_area: its anchor may sit in the terminal panel, and the
+        // welcome screen skips the editor-tabs branch entirely, which used to
+        // drop a terminal annotation's note without painting it at all.
+        let hover_grad = self.popup_gradient();
+        if let Some(popup) = self.hover_popup.as_mut() {
+            popup.gradient = hover_grad;
+            let area = popup.area_for(frame.area());
+            if area.width > 0 && area.height > 0 {
+                frame.render_widget(&*popup, area);
+            }
+        }
         self.render_port_toast(frame);
         self.render_context_menu(frame);
         self.render_commit_dropdown(frame);

@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Fix,
-    summary: "Clicking an annotated terminal span now reliably pops its note, and the note stays open while the pointer rests on the span (any pointer drift outside the editor used to dismiss it within milliseconds).",
+    summary: "Terminal annotation notes now actually paint when clicked: the popup only rendered inside the editor pane, so with the welcome screen up (or the note anchored in the terminal) the click set it but nothing ever drew it.",
 }];
