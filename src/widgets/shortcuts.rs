@@ -837,6 +837,26 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 handler: "is_copy_mode_key",
             },
             ShortcutEntry {
+                keys: "Cmd/Ctrl+K D",
+                description: "Open the pane's whole scrollback in a scratch editor tab (find, vim mode, save, and path:line jumps all work there)",
+                handler: "",
+            },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+K N",
+                description: "Annotate the selected output span: pin a note that scrolls with the content (amber underline; click it to read, Cmd/Ctrl+K N again over it edits)",
+                handler: "",
+            },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+K Shift+N",
+                description: "Delete the annotation(s) under the selection",
+                handler: "",
+            },
+            ShortcutEntry {
+                keys: "Click the prompt line",
+                description: "Move the shell cursor to the clicked column (arrow keys are synthesized; the typed text is never touched)",
+                handler: "",
+            },
+            ShortcutEntry {
                 keys: "Ctrl+Shift+H",
                 description: "Command history: search every command this machine ran (cwd, exit, duration kept); ^R cycles all / this directory / failed, Enter types it",
                 handler: "is_command_history_key",

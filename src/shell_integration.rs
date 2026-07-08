@@ -36,8 +36,9 @@ pub enum OscEvent {
     /// OSC 133;D;<exit> — the command finished. `None` when the shell
     /// omitted the exit code.
     CommandEnd(Option<i32>),
-    /// OSC 7;file://host/path — the shell's current working directory.
-    Cwd(PathBuf),
+    /// OSC 7;file://host/path — the shell's current working directory plus
+    /// the reporting host (None for an empty authority or a bare path).
+    Cwd(PathBuf, Option<String>),
     /// OSC 9;<message> — a notification payload.
     Notify(String),
     /// OSC 9;4;<state>;<percent> — ConEmu progress (systemd, winget, cargo
@@ -191,20 +192,24 @@ fn parse_event(kind: OscKind, body: &[u8]) -> Option<OscEvent> {
             _ => None,
         },
         OscKind::Cwd => {
-            // file://host/path — strip the scheme and authority; a bare
-            // absolute path (some shells emit that) passes through.
-            let path = if let Some(rest) = body.strip_prefix(b"file://") {
+            // file://host/path — strip the scheme, keep the authority as the
+            // reporting host; a bare absolute path (some shells emit that)
+            // passes through hostless.
+            let (path, host) = if let Some(rest) = body.strip_prefix(b"file://") {
                 let slash = rest.iter().position(|&b| b == b'/')?;
-                &rest[slash..]
+                let host =
+                    (slash > 0).then(|| String::from_utf8_lossy(&rest[..slash]).into_owned());
+                (&rest[slash..], host)
             } else if body.first() == Some(&b'/') {
-                body
+                (body, None)
             } else {
                 return None;
             };
             let decoded = percent_decode(path);
-            Some(OscEvent::Cwd(PathBuf::from(
-                String::from_utf8_lossy(&decoded).into_owned(),
-            )))
+            Some(OscEvent::Cwd(
+                PathBuf::from(String::from_utf8_lossy(&decoded).into_owned()),
+                host,
+            ))
         }
         OscKind::Notify => {
             // The `9;4;` sub-namespace is ConEmu progress, not a
@@ -755,7 +760,32 @@ mod tests {
         );
         assert_eq!(
             events,
-            vec![OscEvent::Cwd(PathBuf::from("/Users/me/dir with space"))]
+            vec![OscEvent::Cwd(
+                PathBuf::from("/Users/me/dir with space"),
+                Some(String::from("mac.local"))
+            )]
+        );
+    }
+
+    #[test]
+    fn osc7_carries_the_reporting_host() {
+        let mut s = OscSniffer::default();
+        let events = scan_all(&mut s, &[b"\x1b]7;file://prod-db-1/var/lib\x07"]);
+        assert_eq!(
+            events,
+            vec![OscEvent::Cwd(
+                PathBuf::from("/var/lib"),
+                Some(String::from("prod-db-1"))
+            )]
+        );
+        // An empty authority (file:///path) and a bare path carry no host.
+        let events = scan_all(&mut s, &[b"\x1b]7;file:///tmp\x07\x1b]7;/opt\x07"]);
+        assert_eq!(
+            events,
+            vec![
+                OscEvent::Cwd(PathBuf::from("/tmp"), None),
+                OscEvent::Cwd(PathBuf::from("/opt"), None),
+            ]
         );
     }
 

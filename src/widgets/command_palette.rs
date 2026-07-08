@@ -102,6 +102,7 @@ pub enum Command {
     OpenKeybindingsJson,
     ConfigureSnippets,
     OpenTriggersJson,
+    ToggleTerminalTimestamps,
     RunTask,
     RunBuildTask,
     RerunLastTask,
@@ -190,6 +191,7 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::OpenKeybindingsJson,
     Command::ConfigureSnippets,
     Command::OpenTriggersJson,
+    Command::ToggleTerminalTimestamps,
 ];
 
 impl Command {
@@ -277,6 +279,7 @@ impl Command {
             Command::OpenKeybindingsJson => "Preferences: Open Keyboard Shortcuts (JSON)",
             Command::ConfigureSnippets => "Preferences: Configure User Snippets",
             Command::OpenTriggersJson => "Preferences: Open Terminal Triggers (JSON)",
+            Command::ToggleTerminalTimestamps => "Terminal: Toggle Timestamps",
         }
     }
 
@@ -368,6 +371,7 @@ impl Command {
             Command::OpenKeybindingsJson => "",
             Command::ConfigureSnippets => "",
             Command::OpenTriggersJson => "",
+            Command::ToggleTerminalTimestamps => "",
         }
         // No catch-all: every Command must carry an accelerator (croft tenet),
         // so adding a variant fails to compile until its hint is supplied.
@@ -456,6 +460,7 @@ impl Command {
             Command::OpenKeybindingsJson => "open_keybindings_json",
             Command::ConfigureSnippets => "configure_snippets",
             Command::OpenTriggersJson => "open_triggers_json",
+            Command::ToggleTerminalTimestamps => "toggle_terminal_timestamps",
             Command::RunTask => "run_task",
             Command::RunBuildTask => "run_build_task",
             Command::RerunLastTask => "rerun_last_task",

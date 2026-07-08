@@ -157,6 +157,21 @@ impl EventListener for VoidListener {
     }
 }
 
+/// A row arriving this long after its predecessor is highlighted amber in
+/// the timestamps gutter (the "where did the deploy stall" signal).
+const STALL_GAP_MS: u64 = 60_000;
+
+/// One user note pinned to a span of terminal output (iTerm2's
+/// annotations), anchored like a mark so it rides the scrollback.
+#[derive(Clone, Debug)]
+struct PaneAnnotation {
+    line_rec: i32,
+    hist_rec: usize,
+    start: u16,
+    len: u16,
+    text: String,
+}
+
 pub struct PtyTerminal {
     term: Arc<FairMutex<Term<VoidListener>>>,
     /// Set by the PTY reader thread on every chunk and by `write_input`;
@@ -244,12 +259,30 @@ pub struct PtyTerminal {
     marks: Arc<std::sync::Mutex<Vec<StoredMark>>>,
     /// Latest OSC 7 cwd report from the shell, when integration is active.
     osc7_cwd: Arc<std::sync::Mutex<Option<std::path::PathBuf>>>,
+    /// Latest OSC 7 reporting host (SSH inside the pane moves it to the
+    /// remote's hostname); feeds the per-host accent rules.
+    osc7_host: Arc<std::sync::Mutex<Option<String>>>,
+    /// Host-accent dressing resolved by the app against the prefs rules:
+    /// border / pill color and the watermark badge.
+    pub accent: Option<(u8, u8, u8)>,
+    pub accent_badge: Option<String>,
     /// OSC 9 notification payloads awaiting the app's drain.
     notifications: Arc<std::sync::Mutex<Vec<String>>>,
     /// Latest OSC 9;4 progress report `(state, percent)`: 1 normal,
     /// 2 error, 3 indeterminate, 4 warning. `None` when idle (state 0,
     /// command end, or never reported). Drives the bottom-border gauge.
     progress: Arc<std::sync::Mutex<Option<(u8, u8)>>>,
+    /// Arrival time (epoch millis) per grid row, keyed by the row's stable
+    /// absolute id (`current line + history size`, constant as content
+    /// scrolls). Stamped by the reader thread at chunk granularity; cleared
+    /// wholesale when the scrollback is wiped (the ids restart).
+    line_times: Arc<std::sync::Mutex<std::collections::BTreeMap<i64, u64>>>,
+    /// Paint the right-edge HH:MM:SS gutter (the "Terminal: Toggle
+    /// Timestamps" palette command flips this on every pane).
+    pub show_timestamps: bool,
+    /// User notes pinned to output spans (Cmd+K N on a selection).
+    /// Session-scoped, like the scrollback they describe.
+    annotations: Vec<PaneAnnotation>,
     /// Finished commands (exit, duration) from the reader thread, awaiting
     /// the app's drain for long-command notifications.
     finished_rx: std::sync::mpsc::Receiver<FinishedCommand>,
@@ -932,6 +965,12 @@ impl PtyTerminal {
         let notifications_for_thread = notifications.clone();
         let progress = Arc::new(std::sync::Mutex::new(None::<(u8, u8)>));
         let progress_for_thread = progress.clone();
+        let line_times = Arc::new(std::sync::Mutex::new(
+            std::collections::BTreeMap::<i64, u64>::new(),
+        ));
+        let line_times_for_thread = line_times.clone();
+        let osc7_host = Arc::new(std::sync::Mutex::new(None::<String>));
+        let osc7_host_for_thread = osc7_host.clone();
         // Trigger set shared with the reader thread; the inner Arc is swapped
         // by `set_triggers` on startup / config reload, picked up per chunk.
         let triggers = Arc::new(std::sync::Mutex::new(std::sync::Arc::new(
@@ -950,6 +989,12 @@ impl PtyTerminal {
             // layout key uses it to tell a new picture from a moved one.
             let mut image_seq = 0u64;
             // Command timing: armed by 133;C, consumed by the next 133;D.
+            // Cursor's absolute row after the previous chunk: the rows this
+            // chunk touched run from there to the cursor's new row, and each
+            // takes the chunk's arrival time (last touch wins, so a row is
+            // stamped when its content actually landed, not when the cursor
+            // first parked on it).
+            let mut prev_cursor_abs: i64 = 0;
             let mut cmd_start: Option<std::time::Instant> = None;
             let mut buf = [0u8; 65536];
             loop {
@@ -970,8 +1015,9 @@ impl PtyTerminal {
                             done = end;
                             use crate::shell_integration::OscEvent as E;
                             match ev {
-                                E::Cwd(p) => {
+                                E::Cwd(p, host) => {
                                     *osc7_for_thread.lock().unwrap() = Some(p);
+                                    *osc7_host_for_thread.lock().unwrap() = host;
                                 }
                                 E::Notify(msg) => {
                                     notifications_for_thread.lock().unwrap().push(msg);
@@ -1057,6 +1103,34 @@ impl PtyTerminal {
                             }
                         }
                         processor.advance(&mut *t, &buf[done..n]);
+                        // Stamp newly-arrived rows for the timestamps gutter:
+                        // every row the cursor moved past in this chunk gets
+                        // the chunk's arrival time (one read of output is
+                        // sub-millisecond, so chunk granularity is honest).
+                        {
+                            let hist = t.grid().history_size() as i64;
+                            let cur_abs = hist + t.grid().cursor.point.line.0 as i64;
+                            let now_ms = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_millis() as u64)
+                                .unwrap_or(0);
+                            let mut lt = line_times_for_thread.lock().unwrap();
+                            if cur_abs < prev_cursor_abs {
+                                // ED 3 wiped the scrollback: history reset, so
+                                // every stored id belongs to a dead row.
+                                lt.clear();
+                                prev_cursor_abs = cur_abs;
+                            }
+                            for a in prev_cursor_abs..=cur_abs {
+                                lt.insert(a, now_ms);
+                            }
+                            prev_cursor_abs = cur_abs;
+                            // Bounded by the largest configurable scrollback
+                            // plus a screen; oldest stamps go first.
+                            while lt.len() > 210_000 {
+                                lt.pop_first();
+                            }
+                        }
                         // Notify/bell triggers match completed output lines,
                         // never inside a full-screen app (the alt screen owns
                         // the bytes; iTerm2 skips those too). Skipped
@@ -1113,8 +1187,14 @@ impl PtyTerminal {
             bell,
             marks,
             osc7_cwd,
+            osc7_host,
+            accent: None,
+            accent_badge: None,
             notifications,
             progress,
+            line_times,
+            show_timestamps: false,
+            annotations: Vec::new(),
             finished_rx,
             hints: None,
             triggers,
@@ -1337,6 +1417,147 @@ impl PtyTerminal {
     /// reporting one.
     pub fn progress(&self) -> Option<(u8, u8)> {
         *self.progress.lock().unwrap()
+    }
+
+    /// The arrow-key bytes a plain click at screen cell (col, row) should
+    /// send to walk the shell cursor to the clicked column (Ghostty's
+    /// click-to-move-cursor). `Some` only when the shell is sitting at a
+    /// prompt (the newest OSC 133 mark is B, on this same row), the click
+    /// lands on the cursor's own row, and the target cell differs from the
+    /// cursor. The target clamps to the typed span: never left of where
+    /// input starts, never past one cell after the row's last glyph. The
+    /// line itself is untouched — only cursor motion is synthesized, so it
+    /// works identically in zsh, bash, and fish line editors.
+    pub fn prompt_click_arrows(&self, col: u16, row: u16) -> Option<Vec<u8>> {
+        let (vr, vc) = self.cell_at(col, row)?;
+        let term = self.term.lock();
+        if term.mode().contains(TermMode::ALT_SCREEN) {
+            return None;
+        }
+        let off = term.grid().display_offset() as i32;
+        let line = vr as i32 - off;
+        let cursor = term.grid().cursor.point;
+        if line != cursor.line.0 {
+            return None;
+        }
+        let hist_now = term.grid().history_size() as i32;
+        let ms = self.marks.lock().unwrap();
+        let last = ms.last()?;
+        if !matches!(last.kind, crate::shell_integration::OscEvent::PromptEnd) {
+            return None;
+        }
+        if last.line_rec - (hist_now - last.hist_rec as i32) != line {
+            return None;
+        }
+        let b_col = last.col_rec as u16;
+        let (text, colmap) = row_text_and_cols(&term, line);
+        let chars = text.trim_end().chars().count();
+        let end_col = if chars == 0 {
+            b_col
+        } else {
+            colmap
+                .get(chars - 1)
+                .map(|&c| c as u16 + 1)
+                .unwrap_or(b_col)
+        };
+        let cur = cursor.column.0 as u16;
+        let target = vc.clamp(b_col, end_col.max(cur));
+        if target == cur {
+            return None;
+        }
+        let (seq, n) = if target > cur {
+            (b"\x1b[C".as_slice(), target - cur)
+        } else {
+            (b"\x1b[D".as_slice(), cur - target)
+        };
+        Some(seq.repeat(n as usize))
+    }
+
+    /// The hostname the shell last reported over OSC 7 (an in-pane SSH
+    /// session with integration moves it to the remote host).
+    pub fn shell_host(&self) -> Option<String> {
+        self.osc7_host.lock().unwrap().clone()
+    }
+
+    /// Pin a note to the span starting at current grid `line`, columns
+    /// `start..start+len` (Cmd+K N's commit).
+    pub fn add_annotation(&mut self, line: i32, start: u16, len: u16, text: String) {
+        let hist_rec = self.term.lock().grid().history_size();
+        self.annotations.push(PaneAnnotation {
+            line_rec: line,
+            hist_rec,
+            start,
+            len: len.max(1),
+            text,
+        });
+        self.pty_dirty.store(true, Ordering::Release);
+    }
+
+    /// Every annotation with its span translated to current grid lines:
+    /// `(line, start, len, text)`. Spans whose content fell off the
+    /// scrollback are dropped for good.
+    pub fn annotations_current(&mut self) -> Vec<(i32, u16, u16, String)> {
+        let term = self.term.lock();
+        let hist_now = term.grid().history_size() as i32;
+        let top = term.grid().topmost_line().0;
+        drop(term);
+        self.annotations
+            .retain(|a| a.line_rec - (hist_now - a.hist_rec as i32) >= top);
+        self.annotations
+            .iter()
+            .map(|a| {
+                (
+                    a.line_rec - (hist_now - a.hist_rec as i32),
+                    a.start,
+                    a.len,
+                    a.text.clone(),
+                )
+            })
+            .collect()
+    }
+
+    /// The annotation index + note under screen cell (col, row), if any.
+    pub fn annotation_at(&self, col: u16, row: u16) -> Option<(usize, String)> {
+        let (vr, vc) = self.cell_at(col, row)?;
+        let term = self.term.lock();
+        let off = term.grid().display_offset() as i32;
+        let hist_now = term.grid().history_size() as i32;
+        drop(term);
+        let line = vr as i32 - off;
+        self.annotations
+            .iter()
+            .enumerate()
+            .find(|(_, a)| {
+                a.line_rec - (hist_now - a.hist_rec as i32) == line
+                    && vc >= a.start
+                    && vc < a.start + a.len
+            })
+            .map(|(i, a)| (i, a.text.clone()))
+    }
+
+    pub fn remove_annotation(&mut self, idx: usize) {
+        if idx < self.annotations.len() {
+            self.annotations.remove(idx);
+            self.pty_dirty.store(true, Ordering::Release);
+        }
+    }
+
+    pub fn set_annotation_text(&mut self, idx: usize, text: String) {
+        if let Some(a) = self.annotations.get_mut(idx) {
+            a.text = text;
+            self.pty_dirty.store(true, Ordering::Release);
+        }
+    }
+
+    /// When the row at current grid `line` arrived (epoch millis), if the
+    /// reader thread stamped it.
+    pub fn row_time(&self, line: i32) -> Option<u64> {
+        let hist = self.term.lock().grid().history_size() as i64;
+        self.line_times
+            .lock()
+            .unwrap()
+            .get(&(line as i64 + hist))
+            .copied()
     }
 
     /// Drain the loopback ports the reader thread scraped since the last call.
@@ -1835,6 +2056,17 @@ fn last_command_input_text(term: &Term<VoidListener>, marks: &[StoredMark]) -> S
     )
 }
 
+/// Epoch millis → local wall-clock `HH:MM:SS` (libc localtime, the same
+/// no-date-crate route the trash metadata writer takes).
+fn hhmmss(millis: u64) -> String {
+    let secs = (millis / 1000) as libc::time_t;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    if unsafe { libc::localtime_r(&secs, &mut tm) }.is_null() {
+        return String::from("--:--:--");
+    }
+    format!("{:02}:{:02}:{:02}", tm.tm_hour, tm.tm_min, tm.tm_sec)
+}
+
 pub fn extract_selection_text(
     term: &Term<VoidListener>,
     sr: i32,
@@ -2090,7 +2322,11 @@ fn named_to_ratatui(n: NamedColor, palette: &[(u8, u8, u8); 16]) -> Option<Color
 
 impl Widget for &mut PtyTerminal {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        let block_style = if self.focused {
+        // A host-accent rule outranks the focus color: a production pane
+        // must read as dangerous whether or not it holds focus.
+        let block_style = if let Some((r, g, b)) = self.accent {
+            Style::default().fg(Color::Rgb(r, g, b))
+        } else if self.focused {
             Style::default().fg(Color::Rgb(0x4e, 0x9a, 0xff))
         } else {
             Style::default().fg(Color::DarkGray)
@@ -2105,7 +2341,7 @@ impl Widget for &mut PtyTerminal {
         block.render(area, buf);
         // Black theme: replace the solid focus border with the orange→green
         // gradient (matching the welcome activity box).
-        if self.focused && self.focus_gradient {
+        if self.focused && self.focus_gradient && self.accent.is_none() {
             crate::gradient::paint_gradient_box(buf, area);
         }
         self.last_area = area;
@@ -2131,6 +2367,13 @@ impl Widget for &mut PtyTerminal {
         let trigger_set = self.triggers.lock().unwrap().clone();
 
         let term = self.term.lock();
+        // Annotation spans at their current grid lines (mark-style drift).
+        let ann_hist = term.grid().history_size() as i32;
+        let ann_spans: Vec<(i32, u16, u16)> = self
+            .annotations
+            .iter()
+            .map(|a| (a.line_rec - (ann_hist - a.hist_rec as i32), a.start, a.len))
+            .collect();
         let display_offset = term.grid().display_offset();
         let cursor_visible = term.mode().contains(TermMode::SHOW_CURSOR) && self.focused;
         let alt_screen = term.mode().contains(TermMode::ALT_SCREEN);
@@ -2249,6 +2492,16 @@ impl Widget for &mut PtyTerminal {
                         style = style.bg(*c);
                     }
                 }
+                // Annotated spans: amber + underline, under the cursor /
+                // selection / find layers so those still win.
+                if ann_spans
+                    .iter()
+                    .any(|&(l, s0, ln)| l == line_idx && x >= s0 && x < s0 + ln)
+                {
+                    style = style
+                        .fg(Color::Rgb(0xe5, 0xc0, 0x7b))
+                        .add_modifier(Modifier::UNDERLINED);
+                }
                 if cursor_visible
                     && (y as i32) == cursor_row_in_viewport
                     && (x as i32) == cursor_col_in_viewport
@@ -2360,6 +2613,129 @@ impl Widget for &mut PtyTerminal {
                 let cell = &mut buf[(x, by)];
                 cell.set_symbol("━");
                 cell.set_style(Style::default().fg(color));
+            }
+        }
+        // Timestamps gutter: the arrival clock of each stamped row hugs the
+        // right edge (iTerm2's Show Timestamps), amber with a warning mark
+        // when the row landed a long stall after its predecessor. Chrome
+        // over content, painted only while the palette toggle is on.
+        if self.show_timestamps && !alt_screen && inner.width > 14 {
+            let lt = self.line_times.lock().unwrap();
+            let hist = term.grid().history_size() as i64;
+            for y in 0..rows {
+                let abs = (y as i32 - display_offset as i32) as i64 + hist;
+                let Some(&ms) = lt.get(&abs) else { continue };
+                let prev = lt.range(..abs).next_back().map(|(_, &v)| v);
+                let stalled = prev.is_some_and(|p| ms.saturating_sub(p) >= STALL_GAP_MS);
+                let mut text = hhmmss(ms);
+                if stalled {
+                    text = format!("\u{26a0} {text}");
+                }
+                let tw = text.chars().count() as u16;
+                if tw >= inner.width {
+                    continue;
+                }
+                let x0 = inner.x + inner.width - tw;
+                let fg = if stalled {
+                    Color::Rgb(0xe5, 0xc0, 0x7b)
+                } else {
+                    Color::Rgb(0x5b, 0x64, 0x72)
+                };
+                for (j, c) in text.chars().enumerate() {
+                    let cell = &mut buf[(x0 + j as u16, inner.y + y)];
+                    let mut tmpc = [0u8; 4];
+                    cell.set_symbol(c.encode_utf8(&mut tmpc));
+                    cell.set_style(Style::default().fg(fg));
+                }
+            }
+        }
+        // Host-accent badge watermark: the rule's badge text, dim in the
+        // accent color, parked at the pane's top-right (under the sticky
+        // header, over content — it is a warning, that is the point).
+        if let (Some((r, g, b)), Some(badge)) = (self.accent, self.accent_badge.as_deref())
+            && !badge.is_empty()
+        {
+            let bw = badge.chars().count() as u16;
+            if bw + 2 < inner.width {
+                let x0 = inner.x + inner.width - bw - 1;
+                for (j, c) in badge.chars().enumerate() {
+                    let cell = &mut buf[(x0 + j as u16, inner.y)];
+                    let mut tmpc = [0u8; 4];
+                    cell.set_symbol(c.encode_utf8(&mut tmpc));
+                    cell.set_style(
+                        Style::default()
+                            .fg(Color::Rgb(r, g, b))
+                            .add_modifier(Modifier::DIM | Modifier::BOLD),
+                    );
+                }
+            }
+        }
+        // Sticky command header (Warp): when the viewport is scrolled so its
+        // top row falls inside one command's output while that command's
+        // prompt sits above the view, the typed command pins to the pane's
+        // top row with the scroll depth. Finished commands resolve through
+        // the decoration spans; the still-running one through the newest
+        // CommandStart mark. Unpins the instant the top row leaves the span.
+        if display_offset > 0 && !alt_screen && rows > 0 && inner.width > 4 {
+            let top_row = -(display_offset as i32);
+            let cols_last = term.columns().saturating_sub(1);
+            let header = decorations
+                .iter()
+                .find(|d| d.line < top_row && d.output_start <= top_row && top_row < d.output_end)
+                .and_then(|d| {
+                    let (l, c) = d.input?;
+                    (d.output_start > l)
+                        .then(|| extract_selection_text(&term, l, c, d.output_start - 1, cols_last))
+                })
+                .or_else(|| {
+                    let ms = self.marks.lock().unwrap();
+                    let running = ms.last().is_some_and(|m| {
+                        matches!(m.kind, crate::shell_integration::OscEvent::CommandStart)
+                    });
+                    if !running {
+                        return None;
+                    }
+                    let hist_now = term.grid().history_size() as i32;
+                    let last = ms.last().unwrap();
+                    let c_line = last.line_rec - (hist_now - last.hist_rec as i32);
+                    (c_line < top_row).then(|| last_command_input_text(&term, &ms))
+                })
+                .filter(|t| !t.trim().is_empty());
+            if let Some(text) = header {
+                let bg = Color::Rgb(0x25, 0x2b, 0x36);
+                for x in 0..inner.width {
+                    let cell = &mut buf[(inner.x + x, inner.y)];
+                    cell.set_symbol(" ");
+                    cell.set_style(Style::default().bg(bg));
+                }
+                let label = format!("\u{25b6} {}", text.trim());
+                let mut xw = inner.x + 1;
+                for ch in label.chars() {
+                    if xw + 1 >= inner.x + inner.width {
+                        break;
+                    }
+                    let cell = &mut buf[(xw, inner.y)];
+                    let mut tmpc = [0u8; 4];
+                    cell.set_symbol(ch.encode_utf8(&mut tmpc));
+                    cell.set_style(
+                        Style::default()
+                            .fg(Color::Rgb(0xec, 0xf0, 0xf4))
+                            .bg(bg)
+                            .add_modifier(Modifier::BOLD),
+                    );
+                    xw += 1;
+                }
+                let right = format!(" \u{2191} {display_offset} ");
+                let rw = right.chars().count() as u16;
+                if xw + rw < inner.x + inner.width {
+                    let x0 = inner.x + inner.width - rw;
+                    for (j, ch) in right.chars().enumerate() {
+                        let cell = &mut buf[(x0 + j as u16, inner.y)];
+                        let mut tmpc = [0u8; 4];
+                        cell.set_symbol(ch.encode_utf8(&mut tmpc));
+                        cell.set_style(Style::default().fg(Color::Rgb(0x8b, 0x93, 0xa1)).bg(bg));
+                    }
+                }
             }
         }
         // Command decorations: a VS Code-style dot on the left border at
@@ -2483,6 +2859,151 @@ mod tests {
             "lph\nrav\nhar",
             "a block selection copies the same column slice from every row"
         );
+    }
+
+    #[test]
+    fn annotations_anchor_to_content_and_ride_the_scrollback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = "n=note; echo ${n}-worthy-line; read x; i=0; while [ $i -lt 30 ]; do echo fill-$i; i=$((i+1)); done; sleep 30";
+        let mut term =
+            PtyTerminal::new_running("/bin/sh", &[String::from("-c"), script.into()], tmp.path())
+                .unwrap();
+        term.last_inner = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 24,
+        };
+        let mut waited = 0u32;
+        while !term
+            .grid_lines()
+            .0
+            .iter()
+            .any(|l| l.starts_with("note-worthy-line"))
+        {
+            assert!(waited < 8000, "line never arrived");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            waited += 20;
+        }
+        let (lines, top) = term.grid_lines();
+        let line = top
+            + lines
+                .iter()
+                .position(|l| l.starts_with("note-worthy-line"))
+                .unwrap() as i32;
+        term.add_annotation(line, 0, 16, String::from("this is where it broke"));
+        // The screen cell over the span resolves to the note.
+        let (idx, text) = term
+            .annotation_at(3, line as u16)
+            .expect("the annotated cell must resolve");
+        assert_eq!(idx, 0);
+        assert_eq!(text, "this is where it broke");
+        assert!(
+            term.annotation_at(30, line as u16).is_none(),
+            "cells past the span carry no note"
+        );
+
+        // 30 more lines push the annotated row toward (or into) history;
+        // the anchor drifts with the content.
+        term.write_input(b"\n");
+        let mut waited = 0u32;
+        while !term.grid_lines().0.iter().any(|l| l.starts_with("fill-29")) {
+            assert!(waited < 8000, "filler never arrived");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            waited += 20;
+        }
+        let (lines, top) = term.grid_lines();
+        let expect_line = top
+            + lines
+                .iter()
+                .position(|l| l.starts_with("note-worthy-line"))
+                .unwrap() as i32;
+        let cur = term.annotations_current();
+        assert_eq!(cur.len(), 1);
+        assert_eq!(
+            cur[0].0, expect_line,
+            "the annotation must still sit on its content line"
+        );
+        assert_eq!(cur[0].3, "this is where it broke");
+    }
+
+    #[test]
+    fn prompt_click_arrows_map_a_click_to_cursor_motion() {
+        let tmp = tempfile::tempdir().unwrap();
+        // A prompt with 133;A/B marks and typed text, cursor parked after
+        // the text (no newline). `read` keeps the shell at the prompt.
+        let script = "h=hello; printf '\\033]133;A\\007$ \\033]133;B\\007'; printf \"${h}-world\"; read x; sleep 30";
+        let mut term =
+            PtyTerminal::new_running("/bin/sh", &[String::from("-c"), script.into()], tmp.path())
+                .unwrap();
+        term.last_inner = Rect {
+            x: 1,
+            y: 1,
+            width: 80,
+            height: 24,
+        };
+        let mut waited = 0u32;
+        while !term
+            .grid_lines()
+            .0
+            .iter()
+            .any(|l| l.contains("hello-world"))
+        {
+            assert!(waited < 8000, "prompt text never arrived");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            waited += 20;
+        }
+        let (lines, top) = term.grid_lines();
+        let vrow = (lines
+            .iter()
+            .position(|l| l.contains("hello-world"))
+            .unwrap() as i32
+            + top) as u16; // display_offset 0: grid line == viewport row
+        // Click on the 'h' (grid col 2): the cursor sits after 'd' (col 13),
+        // so 11 left-arrows bring it there.
+        let bytes = term
+            .prompt_click_arrows(1 + 2, 1 + vrow)
+            .expect("a prompt-row click must produce motion");
+        assert_eq!(bytes, b"\x1b[D".repeat(11));
+        // Clamped left of the input start: col 0 is the "$ " prompt glyphs.
+        let bytes = term.prompt_click_arrows(1, 1 + vrow).unwrap();
+        assert_eq!(bytes, b"\x1b[D".repeat(11), "clamps to the 133;B column");
+        // A click on the cursor cell itself is a no-op.
+        assert!(term.prompt_click_arrows(1 + 13, 1 + vrow).is_none());
+        // A click on another row does nothing.
+        assert!(term.prompt_click_arrows(1 + 2, 1 + vrow + 1).is_none());
+    }
+
+    #[test]
+    fn row_times_record_when_each_line_arrived() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = "a=first; echo ${a}-marker; sleep 0.4; b=second; echo ${b}-marker; sleep 30";
+        let term =
+            PtyTerminal::new_running("/bin/sh", &[String::from("-c"), script.into()], tmp.path())
+                .unwrap();
+        let mut waited = 0u32;
+        loop {
+            let (lines, top) = term.grid_lines();
+            let a = lines.iter().position(|l| l.starts_with("first-marker"));
+            let b = lines.iter().position(|l| l.starts_with("second-marker"));
+            if let (Some(a), Some(b)) = (a, b) {
+                let ta = term
+                    .row_time(top + a as i32)
+                    .expect("the first line must be stamped");
+                let tb = term
+                    .row_time(top + b as i32)
+                    .expect("the second line must be stamped");
+                assert!(
+                    tb.saturating_sub(ta) >= 300,
+                    "stamps must reflect the 400ms gap between the lines, got {}ms",
+                    tb.saturating_sub(ta)
+                );
+                break;
+            }
+            assert!(waited < 8000, "markers never arrived");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            waited += 20;
+        }
     }
 
     #[test]

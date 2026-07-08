@@ -17873,3 +17873,471 @@ fn osc_9_4_progress_paints_a_border_gauge_and_pill_percent() {
         "the pill percent must clear too"
     );
 }
+
+#[test]
+fn cmd_k_d_dumps_the_pane_scrollback_into_a_scratch_editor_tab() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
+        "/bin/sh",
+        &[
+            String::from("-c"),
+            String::from("s=scroll; echo ${s}back-payload-7; sleep 30"),
+        ],
+        tmp.path(),
+    )
+    .unwrap();
+    app.terminals[0].set_manual_name(Some(String::from("bldlog")));
+    app.focus_pane(Pane::Terminal);
+    let mut waited = 0u32;
+    while !app.terminals[0]
+        .grid_lines()
+        .0
+        .iter()
+        .any(|l| l.contains("scrollback-payload-7"))
+    {
+        assert!(waited < 8000, "pane output never arrived");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        waited += 20;
+    }
+
+    assert!(app.handle_cmd_k_chord(key(KeyCode::Char('d'), KeyModifiers::NONE)));
+    assert!(
+        matches!(app.focus, Pane::Editor),
+        "the dump lands in the editor, so focus follows"
+    );
+    let label = app
+        .editor
+        .path
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    assert!(
+        label.contains("bldlog") && label.contains("scrollback"),
+        "the scratch tab is named after the pane: {label:?}"
+    );
+    assert!(
+        app.editor
+            .lines
+            .iter()
+            .any(|l| l.contains("scrollback-payload-7")),
+        "the pane's output is in the buffer"
+    );
+    assert!(
+        !app.editor
+            .lines
+            .last()
+            .map(String::as_str)
+            .unwrap_or("x")
+            .trim()
+            .is_empty()
+            || app.editor.lines.len() > 1,
+        "the blank live-screen tail is trimmed"
+    );
+    let blank_tail = app
+        .editor
+        .lines
+        .iter()
+        .rev()
+        .take_while(|l| l.trim().is_empty())
+        .count();
+    assert!(
+        blank_tail <= 1,
+        "the unused live-screen rows must not pad the buffer: {blank_tail} blank tail lines"
+    );
+}
+
+#[test]
+fn timestamps_gutter_toggles_on_and_shows_arrival_times() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
+        "/bin/sh",
+        &[
+            String::from("-c"),
+            String::from("g=gutter; echo ${g}-row-9; sleep 30"),
+        ],
+        tmp.path(),
+    )
+    .unwrap();
+    app.focus_pane(Pane::Terminal);
+    let mut waited = 0u32;
+    while !app.terminals[0]
+        .grid_lines()
+        .0
+        .iter()
+        .any(|l| l.starts_with("gutter-row-9"))
+    {
+        assert!(waited < 8000, "pane output never arrived");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        waited += 20;
+    }
+    fn screen_rows(term: &ratatui::Terminal<ratatui::backend::TestBackend>) -> Vec<String> {
+        let buf = term.backend().buffer();
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().chars().next().unwrap_or(' '))
+                    .collect()
+            })
+            .collect()
+    }
+    fn gutter_of(rows: &[String], needle: &str) -> Option<String> {
+        let row = rows.iter().find(|r| r.contains(needle))?;
+        let inner = row.trim_end().trim_end_matches(['│', '┃']);
+        Some(
+            inner
+                .chars()
+                .rev()
+                .take(8)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect(),
+        )
+    }
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+
+    // Off by default: the row ends with its own text, no clock.
+    term.draw(|f| app.render(f)).unwrap();
+    let g = gutter_of(&screen_rows(&term), "gutter-row-9").unwrap_or_default();
+    assert!(
+        !g.chars().filter(|c| *c == ':').count().eq(&2),
+        "no gutter while the toggle is off: {g:?}"
+    );
+
+    app.toggle_terminal_timestamps();
+    assert!(app.show_terminal_timestamps);
+    term.draw(|f| app.render(f)).unwrap();
+    let g = gutter_of(&screen_rows(&term), "gutter-row-9").expect("row still on screen");
+    let looks_like_clock = g.len() == 8
+        && g.as_bytes()[2] == b':'
+        && g.as_bytes()[5] == b':'
+        && g.chars().filter(|c| c.is_ascii_digit()).count() == 6;
+    assert!(
+        looks_like_clock,
+        "the toggled gutter shows HH:MM:SS at the row's right edge: {g:?}"
+    );
+
+    app.toggle_terminal_timestamps();
+    term.draw(|f| app.render(f)).unwrap();
+    let g = gutter_of(&screen_rows(&term), "gutter-row-9").unwrap_or_default();
+    assert!(
+        !(g.len() == 8 && g.as_bytes()[2] == b':' && g.as_bytes()[5] == b':'),
+        "toggling off removes the gutter: {g:?}"
+    );
+}
+
+#[test]
+fn sticky_command_header_pins_the_command_while_scrolled_into_its_output() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    // Full OSC 133 marks around a runtime-assembled command (the pane's
+    // `▶ …` run header echoes the script text, so the typed command must
+    // never appear verbatim in it), then enough output to scroll.
+    let script = "b=build; printf \"\\033]133;A\\007$ \\033]133;B\\007${b}-it-77 now\\n\\033]133;C\\007\"; i=0; while [ $i -lt 80 ]; do echo out-$i; i=$((i+1)); done; printf '\\033]133;D;0\\007'; sleep 30";
+    app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
+        "/bin/sh",
+        &[String::from("-c"), String::from(script)],
+        tmp.path(),
+    )
+    .unwrap();
+    app.focus_pane(Pane::Terminal);
+    let mut waited = 0u32;
+    while app.terminals[0].command_decorations().is_empty() {
+        assert!(waited < 8000, "the command never finished");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        waited += 20;
+    }
+    fn screen_rows(term: &ratatui::Terminal<ratatui::backend::TestBackend>) -> Vec<String> {
+        let buf = term.backend().buffer();
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().chars().next().unwrap_or(' '))
+                    .collect()
+            })
+            .collect()
+    }
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let inner = app.terminals[0].last_inner;
+
+    // At the live bottom nothing pins.
+    let rows = screen_rows(&term);
+    assert!(
+        !rows[inner.y as usize].contains("build-it-77"),
+        "no header at the live bottom: {:?}",
+        rows[inner.y as usize]
+    );
+
+    // Scroll so the viewport's top row sits inside the command's output,
+    // with its prompt above the view: the typed command pins to row 0.
+    app.terminals[0].scroll_to_top();
+    for _ in 0..4 {
+        app.terminals[0].scroll_down(1);
+    }
+    term.draw(|f| app.render(f)).unwrap();
+    let rows = screen_rows(&term);
+    assert!(
+        rows[inner.y as usize].contains("build-it-77 now"),
+        "the command must pin to the pane's top row: {:?}",
+        rows[inner.y as usize]
+    );
+
+    // Back at the live bottom the header unpins.
+    app.terminals[0].reset_scrollback();
+    term.draw(|f| app.render(f)).unwrap();
+    let rows = screen_rows(&term);
+    assert!(
+        !rows[inner.y as usize].contains("build-it-77"),
+        "the header unpins at the live bottom: {:?}",
+        rows[inner.y as usize]
+    );
+}
+
+#[test]
+fn a_plain_click_on_the_prompt_row_moves_the_shell_cursor() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let sink = tmp.path().join("clicks.bin");
+    // The shell's `dd` captures exactly what the click writes to the PTY.
+    let script = format!(
+        "h=hello; printf '\\033]133;A\\007$ \\033]133;B\\007'; printf \"${{h}}-world\"; stty raw -echo 2>/dev/null; dd bs=1 count=33 of={} 2>/dev/null; sleep 30",
+        sink.display()
+    );
+    app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
+        "/bin/sh",
+        &[String::from("-c"), script],
+        tmp.path(),
+    )
+    .unwrap();
+    app.focus_pane(Pane::Terminal);
+    let mut waited = 0u32;
+    while !app.terminals[0]
+        .grid_lines()
+        .0
+        .iter()
+        .any(|l| l.contains("hello-world"))
+    {
+        assert!(waited < 8000, "prompt text never arrived");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        waited += 20;
+    }
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let inner = app.terminals[0].last_inner;
+    let (lines, top) = app.terminals[0].grid_lines();
+    let vrow = (lines
+        .iter()
+        .position(|l| l.contains("hello-world"))
+        .unwrap() as i32
+        + top) as u16;
+    let (x, y) = (inner.x + 2, inner.y + vrow);
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), x, y));
+    app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), x, y));
+    let mut waited = 0u32;
+    loop {
+        let got = std::fs::read(&sink).unwrap_or_default();
+        if got.len() == 33 {
+            assert_eq!(
+                got,
+                b"\x1b[D".repeat(11),
+                "eleven left-arrows bring the cursor from after 'd' to 'h'"
+            );
+            break;
+        }
+        assert!(
+            waited < 8000,
+            "the click's arrow keys never reached the shell"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        waited += 20;
+    }
+}
+
+#[test]
+fn cmd_k_n_annotates_the_selection_and_a_click_shows_the_note() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
+        "/bin/sh",
+        &[
+            String::from("-c"),
+            String::from("m=mark; echo ${m}-this-output; sleep 30"),
+        ],
+        tmp.path(),
+    )
+    .unwrap();
+    app.focus_pane(Pane::Terminal);
+    let mut waited = 0u32;
+    while !app.terminals[0]
+        .grid_lines()
+        .0
+        .iter()
+        .any(|l| l.starts_with("mark-this-output"))
+    {
+        assert!(waited < 8000, "output never arrived");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        waited += 20;
+    }
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let inner = app.terminals[0].last_inner;
+    let (lines, top) = app.terminals[0].grid_lines();
+    let vrow = (top
+        + lines
+            .iter()
+            .position(|l| l.starts_with("mark-this-output"))
+            .unwrap() as i32) as u16;
+
+    // Select the word and annotate it through the prompt.
+    app.terminals[0].start_selection_at(inner.x, inner.y + vrow);
+    app.terminals[0].extend_selection_to(inner.x + 15, inner.y + vrow);
+    assert!(app.handle_cmd_k_chord(key(KeyCode::Char('n'), KeyModifiers::NONE)));
+    assert!(
+        app.prompt.is_some(),
+        "Cmd+K N must open the annotation prompt"
+    );
+    app.prompt.as_mut().unwrap().buffer = String::from("broke here");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.prompt.is_none());
+    let (_, text) = app.terminals[0]
+        .annotation_at(inner.x + 3, inner.y + vrow)
+        .expect("the annotation must exist over the selected span");
+    assert_eq!(text, "broke here");
+
+    // The span renders amber + underlined.
+    term.draw(|f| app.render(f)).unwrap();
+    let style = term.backend().buffer()[(inner.x + 3, inner.y + vrow)].style();
+    assert_eq!(
+        style.fg,
+        Some(ratatui::style::Color::Rgb(0xe5, 0xc0, 0x7b)),
+        "annotated cells are tinted amber"
+    );
+    assert!(
+        style
+            .add_modifier
+            .contains(ratatui::style::Modifier::UNDERLINED),
+        "annotated cells are underlined"
+    );
+
+    // A plain click on the span pops the note.
+    app.handle_mouse(mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        inner.x + 3,
+        inner.y + vrow,
+    ));
+    app.handle_mouse(mouse(
+        MouseEventKind::Up(MouseButton::Left),
+        inner.x + 3,
+        inner.y + vrow,
+    ));
+    let popup = app
+        .hover_popup
+        .as_ref()
+        .expect("clicking the span shows the note");
+    assert!(
+        popup.lines.iter().any(|l| l.contains("broke here")),
+        "popup carries the note text"
+    );
+
+    // Cmd+K Shift+N over the span deletes it.
+    app.terminals[0].start_selection_at(inner.x + 2, inner.y + vrow);
+    app.terminals[0].extend_selection_to(inner.x + 5, inner.y + vrow);
+    assert!(app.handle_cmd_k_chord(key(KeyCode::Char('N'), KeyModifiers::SHIFT)));
+    assert!(
+        app.terminals[0]
+            .annotation_at(inner.x + 3, inner.y + vrow)
+            .is_none(),
+        "Cmd+K Shift+N deletes the annotation under the selection"
+    );
+}
+
+#[test]
+fn host_accent_rules_dress_matching_panes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.set_host_accents(&[crate::prefs::HostAccentRule {
+        pattern: String::from("prod-*"),
+        accent: None, // defaults to the danger red
+        badge: Some(String::from("PROD")),
+    }]);
+    // Pane 0 reports a production hostname over OSC 7; pane 1 stays plain.
+    app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
+        "/bin/sh",
+        &[
+            String::from("-c"),
+            String::from("printf '\\033]7;file://prod-db-1/tmp\\007'; sleep 30"),
+        ],
+        tmp.path(),
+    )
+    .unwrap();
+    app.terminals[0].set_manual_name(Some(String::from("db")));
+    app.terminals.push(
+        crate::widgets::terminal::PtyTerminal::new_running(
+            "/bin/sh",
+            &[String::from("-c"), String::from("sleep 30")],
+            tmp.path(),
+        )
+        .unwrap(),
+    );
+    app.focus_pane(Pane::Terminal);
+    let mut waited = 0u32;
+    while app.terminals[0].shell_host().as_deref() != Some("prod-db-1") {
+        assert!(waited < 8000, "the OSC 7 host never arrived");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        waited += 20;
+    }
+    let backend = ratatui::backend::TestBackend::new(140, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+
+    let area = app.terminals[0].last_area;
+    let red = Some(ratatui::style::Color::Rgb(0xf1, 0x4c, 0x4c));
+    let border = term.backend().buffer()[(area.x, area.y + 1)].style();
+    assert_eq!(
+        border.fg, red,
+        "a matching pane's border wears the accent color"
+    );
+    let inner = app.terminals[0].last_inner;
+    let top_row: String = (inner.x..inner.x + inner.width)
+        .map(|x| {
+            term.backend().buffer()[(x, inner.y)]
+                .symbol()
+                .chars()
+                .next()
+                .unwrap_or(' ')
+        })
+        .collect();
+    assert!(
+        top_row.contains("PROD"),
+        "the badge watermark sits on the pane's top row: {top_row:?}"
+    );
+    let pill_row: String = (area.x..area.x + area.width)
+        .map(|x| {
+            term.backend().buffer()[(x, area.y)]
+                .symbol()
+                .chars()
+                .next()
+                .unwrap_or(' ')
+        })
+        .collect();
+    assert!(
+        pill_row.contains("\u{26a0} db"),
+        "the name pill carries the warning mark: {pill_row:?}"
+    );
+
+    // The plain pane keeps croft's normal border color.
+    let other = app.terminals[1].last_area;
+    let other_border = term.backend().buffer()[(other.x, other.y + 1)].style();
+    assert_ne!(
+        other_border.fg, red,
+        "a non-matching pane must not wear the accent"
+    );
+}

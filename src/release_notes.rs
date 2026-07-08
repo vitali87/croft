@@ -59,7 +59,25 @@ pub struct ReleaseNote {
 }
 
 /// What shipped in the current release. Replace on every version bump.
-pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
-    kind: NoteKind::Fix,
-    summary: "Clicking and drag-selecting in soft-wrapped files (markdown) now lands exactly on the line under the pointer; it used to drift a few lines down past every wrapped row — most visibly in a narrow split-editor pane — and the same fix applies under collapsed folds.",
-}];
+pub const RELEASE_NOTES: &[ReleaseNote] = &[
+    ReleaseNote {
+        kind: NoteKind::Feature,
+        summary: "Open Scrollback in Editor (Cmd+K D): the pane's whole history lands in a scratch editor tab, where find, vim mode, block selection, save-to-file, and path:line jumps all work on the captured log.",
+    },
+    ReleaseNote {
+        kind: NoteKind::Feature,
+        summary: "Annotations (Cmd+K N): pin a note to selected terminal output; the span wears an amber underline that scrolls with the content, a click pops the note, and Cmd+K Shift+N deletes it.",
+    },
+    ReleaseNote {
+        kind: NoteKind::Feature,
+        summary: "Sticky command header: scrolled deep into one command's output, the command that produced it pins to the pane's top row with the scroll depth, like Warp.",
+    },
+    ReleaseNote {
+        kind: NoteKind::Feature,
+        summary: "Terminal timestamps (palette toggle): each row's arrival time paints down the right edge, amber with a warning mark where the output stalled for a minute or more.",
+    },
+    ReleaseNote {
+        kind: NoteKind::Feature,
+        summary: "Click the prompt line to move the shell cursor there (arrow keys are synthesized, the typed text is untouched), and host_accents rules in config.json dress panes on matching hostnames — production shells get a red border, warning pill, and badge watermark.",
+    },
+];

@@ -86,6 +86,30 @@ impl Default for ExplorerViewsPrefs {
     }
 }
 
+/// One per-host pane accent rule (iTerm2's automatic profile switching,
+/// scoped to what a TUI can dress): panes whose shell-reported hostname
+/// (OSC 7) matches `pattern` (glob, e.g. "prod-*") wear `accent` (hex
+/// `#rrggbb`, danger red when absent) on their border and name pill, plus
+/// a translucent `badge` watermark.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct HostAccentRule {
+    pub pattern: String,
+    #[serde(default)]
+    pub accent: Option<String>,
+    #[serde(default)]
+    pub badge: Option<String>,
+}
+
+/// `#rrggbb` → bytes; anything else is treated as unset.
+pub fn parse_hex(s: &str) -> Option<(u8, u8, u8)> {
+    let hex = s.strip_prefix('#')?;
+    if hex.len() != 6 {
+        return None;
+    }
+    let n = u32::from_str_radix(hex, 16).ok()?;
+    Some(((n >> 16) as u8, (n >> 8) as u8, n as u8))
+}
+
 /// The on-disk preferences document. New fields must default so an older
 /// config still parses; `#[serde(default)]` covers that.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -145,6 +169,9 @@ pub struct Prefs {
     /// matching VS Code.
     #[serde(default)]
     pub copy_on_select: bool,
+    /// Per-host pane accent rules; see [`HostAccentRule`].
+    #[serde(default)]
+    pub host_accents: Vec<HostAccentRule>,
     /// Scrollback lines kept per terminal pane (VS Code's
     /// `terminal.integrated.scrollback`). 0 — the default for older configs —
     /// means the built-in 5000. Applies to panes opened after the change.

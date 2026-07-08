@@ -1029,6 +1029,9 @@ enum MenuAction {
     TerminalCopyMode,
     /// Terminal pane right-click: open the durable command-history search.
     TerminalCommandHistory,
+    /// Terminal pane right-click: dump the pane's scrollback into a scratch
+    /// editor tab.
+    OpenScrollbackInEditor,
     /// Terminal pane right-click: toggle broadcast input (keystrokes go to
     /// every pane at once; enabling routes through the confirm popup).
     ToggleBroadcastInput,
@@ -1121,6 +1124,7 @@ fn shortcut_for(action: &MenuAction) -> Option<&'static str> {
         MenuAction::TerminalQuickSelect => Some("⌃⇧Space"),
         MenuAction::TerminalCopyMode => Some("⌃⇧Y"),
         MenuAction::TerminalCommandHistory => Some("⌃⇧H"),
+        MenuAction::OpenScrollbackInEditor => Some("⌘K D"),
         MenuAction::ToggleBroadcastInput => Some("⌘K I"),
         MenuAction::ToggleBroadcastExclusion => Some("⌘K ⇧I"),
         MenuAction::UndoCloseTerminal => Some("⌘K ⇧T"),
@@ -1703,6 +1707,17 @@ enum PromptKind {
     /// Rename the terminal pane at `idx`. The buffer is pre-filled with its
     /// current label; on commit the name overrides the auto label.
     RenameTerminal(usize),
+    /// Annotate a span of terminal output on pane `pane` (Cmd+K N with a
+    /// selection). `existing` edits that annotation in place; otherwise
+    /// `line`/`start`/`len` pin a new one. A blank commit cancels (or, for
+    /// an existing note, deletes it).
+    AnnotateTerminal {
+        pane: usize,
+        line: i32,
+        start: u16,
+        len: u16,
+        existing: Option<usize>,
+    },
 }
 
 struct Prompt {
@@ -2479,6 +2494,12 @@ pub struct App {
     /// gated: the classic footgun is typing into panes you forgot were
     /// listening).
     pub pending_broadcast_enable: bool,
+    /// Paint the terminal panes' right-edge arrival-time gutter ("Terminal:
+    /// Toggle Timestamps"). Session-scoped, off by default.
+    pub show_terminal_timestamps: bool,
+    /// Compiled per-host pane accent rules from config.json `host_accents`.
+    /// First match wins.
+    host_accents: Vec<HostAccent>,
     /// Recently closed terminal panes parked for the undo-close grace window
     /// (Ghostty's undo, iTerm2's Undo Close Session): the PTY and child stay
     /// alive but hidden until Cmd+K ⇧T restores the newest or the tick reaps
@@ -3337,6 +3358,8 @@ impl App {
             )),
             broadcast_input: false,
             pending_broadcast_enable: false,
+            show_terminal_timestamps: false,
+            host_accents: compile_host_accents(&loaded_prefs.host_accents),
             closed_terminals: Vec::new(),
             file_finder: None,
             command_palette: None,
@@ -8822,6 +8845,69 @@ impl App {
         });
     }
 
+    /// Cmd+K N: open the annotation prompt for the active pane's selection
+    /// (its first line's span). When the span overlaps an existing
+    /// annotation, the prompt edits that note instead.
+    fn begin_annotate_terminal(&mut self) {
+        let pane = self.active_terminal;
+        let Some(sel) = self.terminals[pane].selection().filter(|s| s.has_area()) else {
+            self.status = String::from("Annotate: select some output first (drag or copy mode)");
+            return;
+        };
+        let (sr, sc, er, ec) = sel.normalised();
+        let (_, _, cols, _) = self.terminals[pane].grid_bounds();
+        let end = if er > sr { cols.saturating_sub(1) } else { ec };
+        let (start, len) = (sc, end.saturating_sub(sc) + 1);
+        let current = self.terminals[pane].annotations_current();
+        let existing = current
+            .iter()
+            .position(|&(l, s0, ln, _)| l == sr && s0 < start + len && start < s0 + ln);
+        let buffer = existing
+            .and_then(|i| current.get(i).map(|a| a.3.clone()))
+            .unwrap_or_default();
+        self.prompt = Some(Prompt {
+            label: String::from("Annotate Selection"),
+            buffer,
+            kind: PromptKind::AnnotateTerminal {
+                pane,
+                line: sr,
+                start,
+                len,
+                existing,
+            },
+            target_dir: PathBuf::new(),
+            error: None,
+        });
+    }
+
+    /// Cmd+K Shift+N: drop every annotation whose span intersects the
+    /// selection's first line span.
+    fn delete_terminal_annotations_in_selection(&mut self) {
+        let pane = self.active_terminal;
+        let Some(sel) = self.terminals[pane].selection().filter(|s| s.has_area()) else {
+            self.status = String::from("Delete annotation: select over the note first");
+            return;
+        };
+        let (sr, sc, er, ec) = sel.normalised();
+        let (_, _, cols, _) = self.terminals[pane].grid_bounds();
+        let end = if er > sr { cols.saturating_sub(1) } else { ec };
+        let hits: Vec<usize> = self.terminals[pane]
+            .annotations_current()
+            .iter()
+            .enumerate()
+            .filter(|&(_, &(l, s0, ln, _))| l == sr && s0 <= end && sc < s0 + ln)
+            .map(|(i, _)| i)
+            .collect();
+        if hits.is_empty() {
+            self.status = String::from("No annotation under the selection");
+            return;
+        }
+        for i in hits.into_iter().rev() {
+            self.terminals[pane].remove_annotation(i);
+        }
+        self.status = String::from("Deleted annotation");
+    }
+
     /// Drop the terminal at `idx`. Returns false (and does nothing) when
     /// only one terminal is left or `idx` is out of range. Hiding the pane
     /// is the user's job (Ctrl+J), not ours, so the last terminal stays.
@@ -8987,6 +9073,25 @@ impl App {
     fn reap_closed_terminals(&mut self) {
         self.closed_terminals
             .retain(|p| p.closed_at.elapsed() <= UNDO_CLOSE_GRACE);
+    }
+
+    /// Swap the per-host accent rules (config.json reload, and tests).
+    pub fn set_host_accents(&mut self, rules: &[crate::prefs::HostAccentRule]) {
+        self.host_accents = compile_host_accents(rules);
+    }
+
+    /// Palette "Terminal: Toggle Timestamps": show / hide the per-row
+    /// arrival-clock gutter on every pane.
+    pub fn toggle_terminal_timestamps(&mut self) {
+        self.show_terminal_timestamps = !self.show_terminal_timestamps;
+        for t in self.terminals.iter_mut() {
+            t.show_timestamps = self.show_terminal_timestamps;
+        }
+        self.status = String::from(if self.show_terminal_timestamps {
+            "Terminal timestamps on"
+        } else {
+            "Terminal timestamps off"
+        });
     }
 
     /// Cmd+K I: toggle broadcast input. Turning it ON goes through a confirm
@@ -9224,6 +9329,9 @@ impl App {
         self.ports.theme = self.theme;
         self.ports.focused = self.focus == Pane::Terminal;
         self.ports.hover_pointer = self.pointer_cell;
+        for t in self.terminals.iter_mut() {
+            t.show_timestamps = self.show_terminal_timestamps;
+        }
         self.captures.focus_gradient = gradient;
         self.captures.theme = self.theme;
         self.captures.focused = self.focus == Pane::Terminal;
@@ -9231,6 +9339,25 @@ impl App {
         for t in self.terminals.iter_mut() {
             t.focus_gradient = gradient;
             t.set_palette(self.theme.ansi());
+            // Host accents: the shell's OSC 7 host against the prefs rules
+            // (first match wins). Cleared the moment the host stops matching
+            // (an in-pane SSH session ends).
+            let dress = t.shell_host().and_then(|h| {
+                self.host_accents
+                    .iter()
+                    .find(|(m, _, _)| m.is_match(&h))
+                    .map(|(_, c, b)| (*c, b.clone()))
+            });
+            match dress {
+                Some((c, b)) => {
+                    t.accent = Some(c);
+                    t.accent_badge = b;
+                }
+                None => {
+                    t.accent = None;
+                    t.accent_badge = None;
+                }
+            }
         }
     }
 
@@ -10145,10 +10272,21 @@ impl App {
                                 {
                                     text = format!("{}\u{b7} {pct}% ", text);
                                 }
+                                let accent = self.terminals[i].accent;
+                                let text = if accent.is_some() && !receiving {
+                                    format!(" \u{26a0}{text}")
+                                } else {
+                                    text
+                                };
                                 let style = if receiving {
                                     Style::default()
                                         .fg(Color::Black)
                                         .bg(Color::Rgb(0xe7, 0x70, 0x70))
+                                        .add_modifier(Modifier::BOLD)
+                                } else if let Some((r, g, b)) = accent {
+                                    Style::default()
+                                        .fg(Color::Black)
+                                        .bg(Color::Rgb(r, g, b))
                                         .add_modifier(Modifier::BOLD)
                                 } else {
                                     crate::widgets::header_pill::action_style(brand, false)
@@ -11442,6 +11580,21 @@ impl App {
                 ]),
                 "Enter to rename, Esc to cancel (blank clears the name)",
             ),
+            PromptKind::AnnotateTerminal { existing, .. } => (
+                ratatui::text::Line::from(vec![
+                    ratatui::text::Span::raw("> "),
+                    ratatui::text::Span::styled(
+                        p.buffer.as_str(),
+                        Style::default().fg(Color::White),
+                    ),
+                    ratatui::text::Span::styled("█", Style::default().fg(cursor_fg)),
+                ]),
+                if existing.is_some() {
+                    "Enter to update the note, Esc to cancel (blank deletes it)"
+                } else {
+                    "Enter to pin the note to the selection, Esc to cancel"
+                },
+            ),
             PromptKind::BreakpointCondition { .. } => (
                 ratatui::text::Line::from(vec![
                     ratatui::text::Span::raw("> "),
@@ -11525,6 +11678,22 @@ impl App {
             // Must precede the case-insensitive T theme arm below.
             KeyCode::Char('T') if shifted && plain => {
                 self.undo_close_terminal();
+                true
+            }
+            // Cmd+K Shift+N with the terminal focused: delete the
+            // annotation(s) under the selection. Must precede any
+            // case-insensitive N arm.
+            KeyCode::Char('N') if shifted && plain && self.focus == Pane::Terminal => {
+                self.delete_terminal_annotations_in_selection();
+                true
+            }
+            // Cmd+K N with the terminal focused: pin a note to the selected
+            // output span (iTerm2's annotations); over an existing note it
+            // edits in place.
+            KeyCode::Char(c)
+                if plain && c.eq_ignore_ascii_case(&'n') && self.focus == Pane::Terminal =>
+            {
+                self.begin_annotate_terminal();
                 true
             }
             // Cmd+K Cmd+T / Cmd+K T: open the Color Theme picker.
@@ -11697,6 +11866,13 @@ impl App {
                     self.show_terminal = true;
                 }
                 self.toggle_terminal_pane_maximize();
+                true
+            }
+            // Cmd+K D: dump the active terminal's scrollback into a scratch
+            // editor tab (kitty's show_scrollback, with the editor as the
+            // pager: find, vim mode, save, and path:line jumps come free).
+            KeyCode::Char(c) if plain && c.eq_ignore_ascii_case(&'d') => {
+                self.open_scrollback_in_editor();
                 true
             }
             // Cmd+K B: show the Testing view (B for the beaker icon). Cmd+Shift+T
@@ -17065,6 +17241,30 @@ impl App {
         }
     }
 
+    /// Cmd+K D: snapshot the active pane's scrollback + screen into a
+    /// scratch editor tab named after the pane. Read from the same
+    /// `grid_lines` the find bar searches; the blank live-screen tail is
+    /// trimmed so the buffer ends at the last real row.
+    fn open_scrollback_in_editor(&mut self) {
+        let (lines, _) = self.terminal().grid_lines();
+        let last = lines
+            .iter()
+            .rposition(|l| !l.trim().is_empty())
+            .map_or(0, |i| i + 1);
+        let text = lines[..last].join("\n");
+        let pane = self.terminal().label();
+        let pane = if pane.is_empty() { "terminal" } else { pane };
+        let label = format!("{pane} scrollback");
+        match self.editor.open_text_buffer(Path::new(&label), &text) {
+            Ok(()) => {
+                self.focus_pane(Pane::Editor);
+                self.sync_open_file_poll_mtime();
+                self.status = format!("Opened {last} scrollback lines in the editor");
+            }
+            Err(e) => self.status = format!("Open scrollback failed: {e}"),
+        }
+    }
+
     /// Ctrl+Shift+H: open the durable command-history search over the
     /// active pane's context (atuin's enhanced Ctrl+R, embedded).
     fn open_command_history(&mut self) {
@@ -19738,6 +19938,7 @@ impl App {
             Cmd::ToggleFormatOnSave => self.toggle_format_on_save(),
             Cmd::ToggleAutoSave => self.toggle_auto_save(),
             Cmd::ToggleInlineBlame => self.toggle_inline_blame(),
+            Cmd::ToggleTerminalTimestamps => self.toggle_terminal_timestamps(),
             Cmd::RestoreSnapshot => self.restore_history_snapshot(),
             Cmd::QuickFix => self.start_code_action(),
             Cmd::ReplaceInFile => self.open_editor_replace(),
@@ -22059,6 +22260,10 @@ impl App {
                             label: String::from("Command History"),
                             action: MenuAction::TerminalCommandHistory,
                         },
+                        MenuEntry::Item {
+                            label: String::from("Open Scrollback in Editor"),
+                            action: MenuAction::OpenScrollbackInEditor,
+                        },
                     ];
                     // Undo close only appears while a parked pane is alive
                     // to restore (the grace window).
@@ -23384,6 +23589,33 @@ impl App {
                         copy_to_clipboard(&text);
                     }
                 }
+                // A plain click on an annotated span pops its note (checked
+                // before click-to-move so a note near the prompt is still
+                // readable).
+                if self.focus == Pane::Terminal
+                    && !self.terminal().selection().is_some_and(|s| s.has_area())
+                    && let Some((_, note)) = self.terminal().annotation_at(m.column, m.row)
+                {
+                    self.hover_popup = Some(crate::widgets::hover_popup::HoverPopup::new(
+                        note,
+                        (m.column, m.row),
+                    ));
+                    return;
+                }
+                // Ghostty's click-to-move-cursor: a plain click (no drag
+                // selection, no reordering, program not tracking the mouse)
+                // on the shell's prompt row walks its cursor to the clicked
+                // cell with synthesized arrow keys. Pane-local input: a
+                // click is not typing, so broadcast never mirrors it.
+                if self.focus == Pane::Terminal
+                    && self.terminal_drag_from.is_none()
+                    && self.terminal_copy_mode.is_none()
+                    && !self.terminal().selection().is_some_and(|s| s.has_area())
+                    && !self.terminal().mouse_reporting()
+                    && let Some(bytes) = self.terminal().prompt_click_arrows(m.column, m.row)
+                {
+                    self.terminal_mut().write_input(&bytes);
+                }
                 // Releasing ends a pane drag-reorder; the order is already
                 // final because the reorder is live during the drag.
                 self.terminal_drag_from = None;
@@ -23769,6 +24001,10 @@ impl App {
                 "Triggers reloaded ({} active)",
                 self.triggers.triggers.len()
             );
+        } else if path == crate::prefs::config_path() {
+            let rules = crate::prefs::Prefs::load_or_default().host_accents;
+            self.set_host_accents(&rules);
+            self.status = format!("Settings reloaded ({} host accent rules)", rules.len());
         }
     }
 
@@ -24459,6 +24695,7 @@ impl App {
             MenuAction::TerminalQuickSelect => self.open_terminal_quick_select(),
             MenuAction::TerminalCopyMode => self.open_terminal_copy_mode(),
             MenuAction::TerminalCommandHistory => self.open_command_history(),
+            MenuAction::OpenScrollbackInEditor => self.open_scrollback_in_editor(),
             MenuAction::ToggleBroadcastInput => self.toggle_broadcast_input(),
             MenuAction::ToggleBroadcastExclusion => self.toggle_broadcast_exclusion(),
             MenuAction::UndoCloseTerminal => self.undo_close_terminal(),
@@ -26038,6 +26275,33 @@ impl App {
                     self.save_terminal_session();
                 }
             }
+            PromptKind::AnnotateTerminal {
+                pane,
+                line,
+                start,
+                len,
+                existing,
+            } => {
+                let text = prompt.buffer.trim().to_string();
+                self.prompt = None;
+                if let Some(t) = self.terminals.get_mut(pane) {
+                    self.status = String::from(match (existing, text.is_empty()) {
+                        (Some(i), true) => {
+                            t.remove_annotation(i);
+                            "Deleted annotation"
+                        }
+                        (Some(i), false) => {
+                            t.set_annotation_text(i, text);
+                            "Updated annotation"
+                        }
+                        (None, true) => "Annotation cancelled (empty note)",
+                        (None, false) => {
+                            t.add_annotation(line, start, len, text);
+                            "Annotated selection (click the span to read it)"
+                        }
+                    });
+                }
+            }
         }
     }
 }
@@ -26775,6 +27039,26 @@ fn is_terminal_maximize_key(key: KeyEvent) -> bool {
 /// `Ctrl+Shift+Space`: WezTerm's quick-select chord. No Cmd involved, so it
 /// needs no host-terminal forwarder — it arrives disambiguated through the
 /// kitty keyboard protocol exactly like the Ctrl+Shift+T split chord.
+/// One compiled per-host accent rule: hostname glob, accent color, badge.
+type HostAccent = (globset::GlobMatcher, (u8, u8, u8), Option<String>);
+
+/// Compile the prefs' host-accent rules: glob matcher + color (danger red
+/// when unset) + badge. A rule with an invalid glob is skipped.
+fn compile_host_accents(rules: &[crate::prefs::HostAccentRule]) -> Vec<HostAccent> {
+    rules
+        .iter()
+        .filter_map(|r| {
+            let m = globset::Glob::new(&r.pattern).ok()?.compile_matcher();
+            let color = r
+                .accent
+                .as_deref()
+                .and_then(crate::prefs::parse_hex)
+                .unwrap_or((0xf1, 0x4c, 0x4c));
+            Some((m, color, r.badge.clone()))
+        })
+        .collect()
+}
+
 fn is_quick_select_key(key: KeyEvent) -> bool {
     matches!(key.code, KeyCode::Char(' '))
         && key.modifiers.contains(KeyModifiers::CONTROL)
