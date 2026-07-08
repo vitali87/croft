@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Fix,
-    summary: "Terminal annotation notes now actually paint when clicked: the popup only rendered inside the editor pane, so with the welcome screen up (or the note anchored in the terminal) the click set it but nothing ever drew it.",
+    summary: "Terminal selections now stay glued to their content while a program keeps printing (Claude Code and other streaming apps): the highlight, the copied text, and the copy-mode cursor all track the rows they were made on into scrollback instead of sitting at fixed screen lines while output slides underneath.",
 }];

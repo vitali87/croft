@@ -232,6 +232,12 @@ pub struct PtyTerminal {
     /// a green modal block over the glyph so keyboard selection has a
     /// visible caret. None whenever copy mode is off.
     copy_cursor: Option<(i32, u16)>,
+    /// `history_size` when the selection / copy-cursor coordinates were
+    /// recorded. Grid lines are relative to the buffer bottom, so every row
+    /// the pane scrolls into history afterwards shifts their content up by
+    /// one; subtracting the growth since this stamp keeps them glued to
+    /// their text while output streams (the marks system's drift math).
+    sel_hist: u64,
     /// User-given pane name (via rename), overriding the auto label. `None`
     /// until the user renames the pane.
     manual_name: Option<String>,
@@ -1179,6 +1185,7 @@ impl PtyTerminal {
             last_inner: Rect::default(),
             selection: None,
             copy_cursor: None,
+            sel_hist: 0,
             manual_name: None,
             auto_label: String::new(),
             search_needle: None,
@@ -1302,6 +1309,7 @@ impl PtyTerminal {
             head: (d.output_end - 1, self.cols.saturating_sub(1)),
             block: false,
         });
+        self.sel_hist = self.hist_size();
         self.scroll_to_line(d.output_start);
     }
 
@@ -1632,14 +1640,61 @@ impl PtyTerminal {
         self.hyperlink_at(r as usize, c as usize)
     }
 
+    /// `history_size` right now: the base every stored selection coordinate
+    /// is stamped against (see `sel_hist`).
+    fn hist_size(&self) -> u64 {
+        self.term.lock().grid().history_size() as u64
+    }
+
+    /// Shift the stored selection and copy-cursor down-anchored coordinates
+    /// by the history growth since they were recorded, so they keep naming
+    /// the same content while output streams. Endpoints whose content fell
+    /// off the scrollback pin to the oldest line; a selection entirely off
+    /// the buffer is dropped for good. No-op (and no lock) when neither
+    /// exists — setters stamp `sel_hist` themselves.
+    fn rebase_selection(&mut self) {
+        if self.selection.is_none() && self.copy_cursor.is_none() {
+            return;
+        }
+        let term = self.term.lock();
+        let hist_now = term.grid().history_size() as u64;
+        let top = term.grid().topmost_line().0;
+        drop(term);
+        let delta = hist_now.saturating_sub(self.sel_hist) as i32;
+        self.sel_hist = hist_now;
+        if delta != 0 {
+            if let Some(sel) = self.selection.as_mut() {
+                sel.anchor.0 -= delta;
+                sel.head.0 -= delta;
+            }
+            if let Some(cur) = self.copy_cursor.as_mut() {
+                cur.0 -= delta;
+            }
+        }
+        if self
+            .selection
+            .is_some_and(|s| s.anchor.0 < top && s.head.0 < top)
+        {
+            self.selection = None;
+        } else if let Some(sel) = self.selection.as_mut() {
+            sel.anchor.0 = sel.anchor.0.max(top);
+            sel.head.0 = sel.head.0.max(top);
+        }
+        if let Some(cur) = self.copy_cursor.as_mut() {
+            cur.0 = cur.0.max(top);
+        }
+    }
+
     pub fn start_selection_at(&mut self, col: u16, row: u16) {
         if let Some((r, c)) = self.cell_at(col, row) {
             let line = r as i32 - self.display_offset();
             self.selection = Some(Selection::new(line, c));
+            self.sel_hist = self.hist_size();
         }
     }
 
     pub fn extend_selection_to(&mut self, col: u16, row: u16) {
+        self.rebase_selection();
         let cell = self.cell_at(col, row);
         let off = self.display_offset();
         if let (Some(sel), Some((r, c))) = (self.selection.as_mut(), cell) {
@@ -1670,6 +1725,7 @@ impl PtyTerminal {
         };
         let max_x = inner.x + inner.width - 1;
         let c = col.clamp(inner.x, max_x) - inner.x;
+        self.rebase_selection();
         let off = self.display_offset();
         if let Some(sel) = self.selection.as_mut() {
             sel.head = (vp_row as i32 - off, c);
@@ -1701,6 +1757,7 @@ impl PtyTerminal {
         let max_x = inner.x + inner.width - 1;
         let c = col.clamp(inner.x, max_x) - inner.x;
         let vp_row = if dir < 0 { 0u16 } else { inner.height - 1 };
+        self.rebase_selection();
         let off = self.display_offset();
         if let Some(sel) = self.selection.as_mut() {
             sel.head = (vp_row as i32 - off, c);
@@ -1725,6 +1782,7 @@ impl PtyTerminal {
         else {
             return;
         };
+        let hist_now = term.grid().history_size() as u64;
         drop(term);
         // `select_word_at_in_term` reports viewport rows; anchor them to
         // absolute grid lines so the selection stays put when scrolled.
@@ -1735,22 +1793,34 @@ impl PtyTerminal {
             head: to_abs(head),
             block: false,
         });
+        self.sel_hist = hist_now;
     }
 
+    /// The selection with its endpoints corrected for history growth since
+    /// they were recorded, so callers always see coordinates that name the
+    /// content the user selected (see `rebase_selection`).
     pub fn selection(&self) -> Option<Selection> {
-        self.selection
+        let mut sel = self.selection?;
+        let delta = self.hist_size().saturating_sub(self.sel_hist) as i32;
+        sel.anchor.0 -= delta;
+        sel.head.0 -= delta;
+        Some(sel)
     }
 
     /// Replace (or clear) the selection wholesale. Copy mode drives the
     /// selection from the keyboard through this, bypassing the mouse path.
     pub fn set_selection(&mut self, sel: Option<Selection>) {
+        self.rebase_selection();
         self.selection = sel;
+        self.sel_hist = self.hist_size();
         self.pty_dirty.store(true, Ordering::Release);
     }
 
     /// Show / move / hide the copy-mode cursor block.
     pub fn set_copy_cursor(&mut self, cur: Option<(i32, u16)>) {
+        self.rebase_selection();
         self.copy_cursor = cur;
+        self.sel_hist = self.hist_size();
         self.pty_dirty.store(true, Ordering::Release);
     }
 
@@ -1780,10 +1850,15 @@ impl PtyTerminal {
     }
 
     pub fn selection_text(&self) -> String {
-        let Some(sel) = self.selection else {
+        let Some(mut sel) = self.selection else {
             return String::new();
         };
         let term = self.term.lock();
+        // Same history-growth correction as `selection()`, computed under
+        // the lock already held for extraction.
+        let delta = (term.grid().history_size() as u64).saturating_sub(self.sel_hist) as i32;
+        sel.anchor.0 -= delta;
+        sel.head.0 -= delta;
         if sel.block {
             let (rl, cl, rh, ch) = sel.block_bounds();
             return block_selection_text(&term, rl, cl as usize, rh, ch as usize);
@@ -2346,6 +2421,11 @@ impl Widget for &mut PtyTerminal {
         }
         self.last_area = area;
         self.last_inner = inner;
+        // Re-anchor the selection / copy-cursor to the content they were
+        // made on before painting, so the highlight scrolls WITH streaming
+        // output instead of sitting at fixed screen rows while text slides
+        // underneath (the Claude Code drag-select bug).
+        self.rebase_selection();
         // (is_block, bounds): block selections rectangle-test each cell,
         // linear ones use the row-major span.
         let sel_paint = self.selection.map(|s| {
@@ -4724,6 +4804,58 @@ mod tests {
     /// is far taller than the 3-row viewport. Before the absolute-
     /// coordinate model the selection was capped at the visible pane
     /// height and the off-screen lines were simply unreachable.
+    #[test]
+    fn selection_stays_glued_to_its_content_while_output_streams() {
+        // A selection made while a program keeps printing (Claude Code, any
+        // streaming TUI) must track its content into scrollback, not stay at
+        // fixed grid lines while the text slides underneath.
+        let tmp = tempfile::tempdir().unwrap();
+        let go = tmp.path().join("go");
+        // Sentinel assembled at runtime so the `▶ sh -c …` run-label header
+        // (which echoes the script text) can never match it.
+        let script = format!(
+            "t=TAR; echo \"${{t}}GET-line\"; until [ -e {} ]; do sleep 0.05; done; seq 1 60; sleep 30",
+            go.display()
+        );
+        let mut term =
+            PtyTerminal::new_running("/bin/sh", &[String::from("-c"), script], tmp.path()).unwrap();
+        let mut waited = 0u32;
+        let line = loop {
+            let (lines, top) = term.grid_lines();
+            if let Some(idx) = lines.iter().position(|l| l.starts_with("TARGET-line")) {
+                break top + idx as i32;
+            }
+            assert!(waited < 8000, "sentinel never arrived");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            waited += 20;
+        };
+        term.set_selection(Some(Selection {
+            anchor: (line, 0),
+            head: (line, 30),
+            block: false,
+        }));
+        assert_eq!(term.selection_text(), "TARGET-line");
+
+        // Release the second phase: 60 more lines scroll the buffer.
+        std::fs::File::create(&go).unwrap();
+        let mut waited = 0u32;
+        while !term.grid_lines().0.iter().any(|l| l == "60") {
+            assert!(waited < 8000, "streamed output never arrived");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            waited += 20;
+        }
+        assert_eq!(
+            term.selection_text(),
+            "TARGET-line",
+            "the selection must follow its content as output streams past it"
+        );
+        let sel = term.selection().expect("selection survives streaming");
+        assert!(
+            sel.anchor.0 < line,
+            "reported endpoints re-anchor upward as lines scroll into history"
+        );
+    }
+
     #[test]
     fn selection_spanning_scrollback_into_live_extracts_every_line() {
         let mut t = fresh_term(20, 3);
