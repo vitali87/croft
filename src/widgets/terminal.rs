@@ -67,6 +67,26 @@ pub struct Selection {
     pub block: bool,
 }
 
+/// What an alternate-screen selection remembers about its content so the
+/// highlight can follow text that the app moves by repainting (alt-screen
+/// programs own scrolling: the grid never scrolls, cells just change).
+/// After every repaint the selection re-finds these rows in the grid and
+/// shifts itself to them; while they are nowhere in view it goes `dormant`
+/// — hidden, coordinates frozen — and reappears when the app scrolls the
+/// content back.
+struct AltSelAnchor {
+    /// Full row text of every selected grid line at last sight, top to
+    /// bottom. Rows the shift math placed outside the grid stay remembered
+    /// so the block can re-anchor when they scroll back in.
+    rows: Vec<String>,
+    /// The extracted selection text at last sight: what copy yields while
+    /// the content is scrolled out of view.
+    text: String,
+    /// The rows are nowhere in the grid right now: paint nothing, keep the
+    /// coordinates frozen until the content reappears.
+    dormant: bool,
+}
+
 impl Selection {
     pub fn new(line: i32, col: u16) -> Self {
         Self {
@@ -247,6 +267,11 @@ pub struct PtyTerminal {
     /// `history_size` at the last tick: fallback delta source for the rare
     /// windows where the tracer died (screen clear, alt-screen round trip).
     clock_hist: i64,
+    /// Content anchor for a selection made on the alternate screen, where
+    /// apps (Claude Code, vim) never scroll the grid — they repaint it in
+    /// place, so no scroll clock can see the text move. `None` while the
+    /// selection lives on the primary screen.
+    alt_sel: Option<AltSelAnchor>,
     /// User-given pane name (via rename), overriding the auto label. `None`
     /// until the user renames the pane.
     manual_name: Option<String>,
@@ -1198,6 +1223,7 @@ impl PtyTerminal {
             clock_base: 0,
             clock_planted: None,
             clock_hist: 0,
+            alt_sel: None,
             manual_name: None,
             auto_label: String::new(),
             search_needle: None,
@@ -1715,9 +1741,84 @@ impl PtyTerminal {
     }
 
     /// Stamp freshly-set selection / copy-cursor coordinates against a
-    /// fresh clock tick.
+    /// fresh clock tick; a selection set on the alternate screen also
+    /// captures its content anchor (see `AltSelAnchor`).
     fn stamp_selection_clock(&mut self) {
         self.sel_scrolled = self.tick_clock();
+        let term = self.term.lock();
+        self.alt_sel = if term.mode().contains(TermMode::ALT_SCREEN) {
+            self.selection.and_then(|s| capture_alt_anchor(&term, s))
+        } else {
+            None
+        };
+    }
+
+    /// Re-anchor an alternate-screen selection to its content after the
+    /// app repainted (see `AltSelAnchor`). Finds the vertical shift whose
+    /// on-grid rows all match the remembered ones — requiring at least one
+    /// non-blank matched row so a blank fingerprint can't latch anywhere —
+    /// preferring the smallest movement; no qualifying shift parks the
+    /// selection dormant until its content scrolls back into view. A
+    /// selection created on the primary screen has no anchor and simply
+    /// stays frozen for the duration of the alt-screen trip.
+    fn rebase_alt_selection(&mut self) {
+        if self.selection.is_none() {
+            self.alt_sel = None;
+            return;
+        }
+        let Some(mut anchor) = self.alt_sel.take() else {
+            return;
+        };
+        let term = self.term.lock();
+        let rows_vis = term.screen_lines() as i32;
+        let sel = self.selection.unwrap();
+        let old_top = sel.anchor.0.min(sel.head.0);
+        let k = anchor.rows.len() as i32;
+        // One grid snapshot up front: the matcher probes every candidate
+        // shift, so per-candidate row reads would re-extract (and
+        // re-allocate) the same rows dozens of times a frame.
+        let grid_rows: Vec<String> = (0..rows_vis)
+            .map(|l| row_text_and_cols(&term, l).0)
+            .collect();
+        let matches_at = |top: i32| {
+            let mut nonblank = false;
+            for (i, want) in anchor.rows.iter().enumerate() {
+                let line = top + i as i32;
+                if line < 0 || line >= rows_vis {
+                    continue;
+                }
+                if grid_rows[line as usize] != *want {
+                    return false;
+                }
+                nonblank |= !want.trim().is_empty();
+            }
+            nonblank
+        };
+        match (1 - k..rows_vis)
+            .filter(|&t| matches_at(t))
+            .min_by_key(|&t| (t - old_top).abs())
+        {
+            Some(top) => {
+                let d = top - old_top;
+                if d != 0
+                    && let Some(s) = self.selection.as_mut()
+                {
+                    s.anchor.0 += d;
+                    s.head.0 += d;
+                }
+                anchor.dormant = false;
+                // Refresh the anchor — this is also what folds in a user
+                // extension of the selection — but only when the whole
+                // block is in view, so the remembered rows never lose an
+                // off-screen part mid-scroll.
+                if let Some(fresh) = capture_alt_anchor(&term, self.selection.unwrap()) {
+                    anchor = fresh;
+                }
+            }
+            None => anchor.dormant = true,
+        }
+        drop(term);
+        self.alt_sel = Some(anchor);
     }
 
     /// Shift the stored selection and copy-cursor down-anchored coordinates
@@ -1728,6 +1829,18 @@ impl PtyTerminal {
     /// when neither exists — setters stamp `sel_scrolled` themselves.
     fn rebase_selection(&mut self) {
         if self.selection.is_none() && self.copy_cursor.is_none() {
+            return;
+        }
+        if self.term.lock().mode().contains(TermMode::ALT_SCREEN) {
+            self.rebase_alt_selection();
+            return;
+        }
+        if self.alt_sel.take().is_some() {
+            // The selection was made on the alternate screen and the app
+            // has left it: the alternate grid — and the content the
+            // coordinates named — is gone with it.
+            self.selection = None;
+            self.copy_cursor = None;
             return;
         }
         let now = self.tick_clock();
@@ -1808,10 +1921,42 @@ impl PtyTerminal {
     /// One step of edge auto-scroll while a drag-selection is held past
     /// the top (`dir < 0`) or bottom (`dir > 0`) edge. Scrolls the
     /// viewport by one row and re-pins the selection head to the new edge
-    /// line at the last-known drag column. No-op in alternate-screen mode
-    /// (where the inner program owns scrolling).
+    /// line at the last-known drag column. On the alternate screen the
+    /// inner program owns scrolling, so a mouse-tracking app (Claude Code,
+    /// a pager) gets a wheel report at the edge cell instead — it scrolls
+    /// its own content, the content anchor drags the selection along, and
+    /// the head re-pins each tick.
     pub fn autoscroll_select(&mut self, dir: i32, col: u16) {
         if dir == 0 {
+            return;
+        }
+        if self.term.lock().mode().contains(TermMode::ALT_SCREEN) {
+            let inner = self.last_inner;
+            if inner.width == 0 || inner.height == 0 || !self.mouse_reporting() {
+                return;
+            }
+            let edge_row = if dir < 0 {
+                inner.y
+            } else {
+                inner.y + inner.height - 1
+            };
+            let ccol = col.clamp(inner.x, inner.x + inner.width - 1);
+            let button = if dir < 0 {
+                MouseButtonKind::WheelUp
+            } else {
+                MouseButtonKind::WheelDown
+            };
+            self.report_mouse(
+                button,
+                MouseAction::Press,
+                ccol,
+                edge_row,
+                MouseMods::default(),
+            );
+            self.rebase_selection();
+            if let Some(sel) = self.selection.as_mut() {
+                sel.head = (i32::from(edge_row - inner.y), ccol - inner.x);
+            }
             return;
         }
         let scrolled = if dir < 0 {
@@ -1838,6 +1983,7 @@ impl PtyTerminal {
 
     pub fn clear_selection(&mut self) {
         self.selection = None;
+        self.alt_sel = None;
     }
 
     /// Double-click word-select: expand the selection to cover the word
@@ -1921,6 +2067,13 @@ impl PtyTerminal {
     }
 
     pub fn selection_text(&self) -> String {
+        // A dormant alt-screen selection names content currently scrolled
+        // out of the app's view: the grid no longer holds it, but the
+        // anchor remembered the text, so copy still yields what was
+        // highlighted.
+        if let Some(anchor) = self.alt_sel.as_ref().filter(|a| a.dormant) {
+            return anchor.text.clone();
+        }
         let Some(mut sel) = self.selection else {
             return String::new();
         };
@@ -2213,6 +2366,31 @@ fn hhmmss(millis: u64) -> String {
     format!("{:02}:{:02}:{:02}", tm.tm_hour, tm.tm_min, tm.tm_sec)
 }
 
+/// Capture the content anchor for an alternate-screen selection: its row
+/// text and extracted text as the grid shows them now. `None` when any
+/// selected line is outside the grid (a partially scrolled-out block keeps
+/// its previous, fuller anchor instead).
+fn capture_alt_anchor(term: &Term<VoidListener>, sel: Selection) -> Option<AltSelAnchor> {
+    let rows_vis = term.screen_lines() as i32;
+    let (lo, hi) = (sel.anchor.0.min(sel.head.0), sel.anchor.0.max(sel.head.0));
+    if lo < 0 || hi >= rows_vis {
+        return None;
+    }
+    let rows = (lo..=hi).map(|l| row_text_and_cols(term, l).0).collect();
+    let text = if sel.block {
+        let (rl, cl, rh, ch) = sel.block_bounds();
+        block_selection_text(term, rl, cl as usize, rh, ch as usize)
+    } else {
+        let (sr, sc, er, ec) = sel.normalised();
+        extract_selection_text(term, sr, sc as usize, er, ec as usize)
+    };
+    Some(AltSelAnchor {
+        rows,
+        text,
+        dormant: false,
+    })
+}
+
 pub fn extract_selection_text(
     term: &Term<VoidListener>,
     sr: i32,
@@ -2498,8 +2676,11 @@ impl Widget for &mut PtyTerminal {
         // underneath (the Claude Code drag-select bug).
         self.rebase_selection();
         // (is_block, bounds): block selections rectangle-test each cell,
-        // linear ones use the row-major span.
-        let sel_paint = self.selection.map(|s| {
+        // linear ones use the row-major span. A dormant alt-screen
+        // selection paints nothing — its content is scrolled out of the
+        // app's view and the frozen coordinates sit over unrelated text.
+        let dormant = self.alt_sel.as_ref().is_some_and(|a| a.dormant);
+        let sel_paint = self.selection.filter(|_| !dormant).map(|s| {
             if s.block {
                 (true, s.block_bounds())
             } else {
@@ -4978,6 +5159,154 @@ mod tests {
             term.selection_text(),
             "TARGET-line",
             "the selection must follow its content even with history_size saturated"
+        );
+    }
+
+    /// Drive a PtyTerminal's grid directly: parse `bytes` into its term as
+    /// if the child had printed them. The child (`sleep`) stays silent, so
+    /// the grid is exactly what the test painted.
+    fn feed_pty(t: &PtyTerminal, bytes: &[u8]) {
+        let mut p = Processor::<StdSyncHandler>::new();
+        let mut term = t.term.lock();
+        p.advance(&mut *term, bytes);
+    }
+
+    fn quiet_pty() -> (tempfile::TempDir, PtyTerminal) {
+        let tmp = tempfile::tempdir().unwrap();
+        let t = PtyTerminal::new_running("/bin/sleep", &[String::from("30")], tmp.path()).unwrap();
+        (tmp, t)
+    }
+
+    #[test]
+    fn alt_screen_selection_follows_content_across_repaints() {
+        // Alt-screen apps (Claude Code) never scroll the grid — they
+        // repaint it in place. The selection must re-find its text after
+        // each repaint, hide while it is scrolled out of the app's view,
+        // and come back when the content does.
+        let (_tmp, mut t) = quiet_pty();
+        feed_pty(
+            &t,
+            b"\x1b[?1049h\x1b[H\x1b[2Jalpha one\r\nbravo two\r\ncharlie three\r\ndelta four",
+        );
+        t.set_selection(Some(Selection {
+            anchor: (1, 0),
+            head: (1, 8),
+            block: false,
+        }));
+        assert_eq!(t.selection_text(), "bravo two");
+
+        // The app scrolls its transcript up one line and repaints.
+        feed_pty(
+            &t,
+            b"\x1b[H\x1b[2Jbravo two\r\ncharlie three\r\ndelta four\r\necho five",
+        );
+        t.rebase_selection();
+        assert_eq!(t.selection_text(), "bravo two");
+        assert_eq!(
+            t.selection().unwrap().anchor.0,
+            0,
+            "the highlight must move to where the app repainted its text"
+        );
+
+        // The selected content scrolls out of the app's view entirely:
+        // highlight goes dormant but copy still yields the remembered text.
+        feed_pty(
+            &t,
+            b"\x1b[H\x1b[2Jfoxtrot six\r\ngolf seven\r\nhotel eight\r\nindia nine",
+        );
+        t.rebase_selection();
+        assert!(
+            t.alt_sel.as_ref().is_some_and(|a| a.dormant),
+            "no matching content anywhere in the grid: dormant"
+        );
+        assert_eq!(t.selection_text(), "bravo two");
+
+        // The app scrolls the content back into view at a new position.
+        feed_pty(
+            &t,
+            b"\x1b[H\x1b[2Jalpha one\r\nbravo two\r\ncharlie three\r\ndelta four",
+        );
+        t.rebase_selection();
+        assert!(t.alt_sel.as_ref().is_some_and(|a| !a.dormant));
+        assert_eq!(t.selection().unwrap().anchor.0, 1);
+        assert_eq!(t.selection_text(), "bravo two");
+    }
+
+    #[test]
+    fn alt_screen_edge_autoscroll_forwards_wheel_to_the_tracking_app() {
+        // On the alternate screen a drag held past the pane edge cannot
+        // scroll croft scrollback (there is none); a mouse-tracking app
+        // gets a wheel report at the edge cell so IT scrolls, and the
+        // selection head re-pins to the edge row.
+        let tmp = tempfile::tempdir().unwrap();
+        // `cat -v` echoes whatever the pty receives back as printable
+        // text, so the wheel report's arrival is observable in the grid.
+        let mut t =
+            PtyTerminal::new_running("/bin/cat", &[String::from("-v")], tmp.path()).unwrap();
+        feed_pty(&t, b"\x1b[?1049h\x1b[?1002h\x1b[?1006h\x1b[H\x1b[2J");
+        t.last_inner = Rect::new(0, 0, 40, 10);
+        t.set_selection(Some(Selection {
+            anchor: (2, 0),
+            head: (2, 5),
+            block: false,
+        }));
+        t.autoscroll_select(1, 5);
+        assert_eq!(
+            t.selection().unwrap().head.0,
+            9,
+            "the head re-pins to the bottom edge row"
+        );
+        let mut waited = 0u32;
+        // SGR wheel-down at 1-based cell (6, 10): `ESC[<65;6;10M`.
+        while !t.grid_lines().0.iter().any(|l| l.contains("[<65;6;10M")) {
+            assert!(waited < 8000, "the app never received the wheel report");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            waited += 20;
+        }
+    }
+
+    #[test]
+    fn primary_selection_survives_alt_round_trip_but_alt_selection_dies_on_exit() {
+        let (_tmp, mut t) = quiet_pty();
+        feed_pty(&t, b"hello world\r\n");
+        // The `▶ /bin/sleep 30` run-label header owns the top row(s), so
+        // find where the fed line actually landed.
+        let (lines, top) = t.grid_lines();
+        let line = top
+            + lines
+                .iter()
+                .position(|l| l.starts_with("hello"))
+                .expect("fed line present") as i32;
+        t.set_selection(Some(Selection {
+            anchor: (line, 0),
+            head: (line, 4),
+            block: false,
+        }));
+        assert_eq!(t.selection_text(), "hello");
+        // vim-style round trip: enter and leave the alternate screen.
+        feed_pty(&t, b"\x1b[?1049h\x1b[H\x1b[2Jvim vim vim");
+        t.rebase_selection();
+        feed_pty(&t, b"\x1b[?1049l");
+        t.rebase_selection();
+        assert_eq!(
+            t.selection_text(),
+            "hello",
+            "a primary-screen selection is frozen across an alt-screen trip"
+        );
+        // A selection made ON the alt screen names alternate-grid content;
+        // leaving the alt screen destroys that content and the selection.
+        feed_pty(&t, b"\x1b[?1049h\x1b[H\x1b[2Jquick brown fox");
+        t.set_selection(Some(Selection {
+            anchor: (0, 0),
+            head: (0, 4),
+            block: false,
+        }));
+        assert_eq!(t.selection_text(), "quick");
+        feed_pty(&t, b"\x1b[?1049l");
+        t.rebase_selection();
+        assert!(
+            t.selection().is_none(),
+            "an alt-screen selection dies with the alternate grid"
         );
     }
 

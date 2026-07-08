@@ -23398,6 +23398,16 @@ impl App {
                     {
                         return;
                     }
+                    // Shift+click extends the existing selection to the
+                    // clicked cell (VS Code / iTerm2) instead of starting a
+                    // fresh one.
+                    if m.modifiers.contains(KeyModifiers::SHIFT)
+                        && self.terminal().selection().is_some()
+                    {
+                        self.terminal_mut().extend_selection_to(m.column, m.row);
+                        self.terminal_click.clear();
+                        return;
+                    }
                     // A selection belongs to exactly one pane: starting one in
                     // the terminal drops any leftover editor selection so the
                     // two panes never paint a highlight at once (issue #23).

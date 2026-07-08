@@ -59,7 +59,17 @@ pub struct ReleaseNote {
 }
 
 /// What shipped in the current release. Replace on every version bump.
-pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
-    kind: NoteKind::Fix,
-    summary: "Terminal selections now track streaming output in long-lived panes too: once scrollback filled up (5000 lines), the drift correction silently stopped counting and highlights froze at fixed screen rows again while text kept scrolling. The selection clock now measures true lines scrolled, so highlights, copied text and the copy-mode cursor stay glued to their content no matter how old the pane is.",
-}];
+pub const RELEASE_NOTES: &[ReleaseNote] = &[
+    ReleaseNote {
+        kind: NoteKind::Fix,
+        summary: "Selections inside full-screen apps that scroll by repainting (Claude Code runs on the alternate screen since v2) now follow their text: the highlight remembers the rows it covers, re-finds them after every repaint, hides while the app scrolls them out of view (copying still yields the remembered text), and reappears when they come back.",
+    },
+    ReleaseNote {
+        kind: NoteKind::Feature,
+        summary: "Shift+click extends the existing terminal selection to the clicked cell instead of starting a new one.",
+    },
+    ReleaseNote {
+        kind: NoteKind::Feature,
+        summary: "Drag-selecting past a pane edge now keeps going inside mouse-tracking full-screen apps too: croft forwards wheel ticks so the app scrolls under the drag while the selection grows.",
+    },
+];
