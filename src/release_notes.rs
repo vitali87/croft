@@ -60,6 +60,6 @@ pub struct ReleaseNote {
 
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
-    kind: NoteKind::Feature,
-    summary: "Live progress bars in the terminal: a program reporting OSC 9;4 progress (systemd, winget, cargo wrappers) fills the pane's bottom border into a gauge — blue advancing, red frozen on error, yellow paused, a sweeping segment while indeterminate — with the percent echoed in the pane's name pill; clears on the program's own reset or when the command finishes.",
+    kind: NoteKind::Fix,
+    summary: "Clicking and drag-selecting in soft-wrapped files (markdown) now lands exactly on the line under the pointer; it used to drift a few lines down past every wrapped row — most visibly in a narrow split-editor pane — and the same fix applies under collapsed folds.",
 }];

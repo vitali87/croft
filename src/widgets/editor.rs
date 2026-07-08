@@ -5174,12 +5174,30 @@ impl Editor {
             return;
         }
         let row_idx = (row - self.last_inner.y) as usize;
-        let target_line = (self.scroll + row_idx).min(self.lines.len().saturating_sub(1));
         let text_x = self.last_inner.x + self.last_gutter_width + 1;
-        let target_col = if col < text_x {
-            0
-        } else {
-            (col - text_x) as usize
+        // Gutter clicks land on the row's first column (saturates to 0).
+        let visible = col.saturating_sub(text_x) as usize;
+        // Map the screen row through the last render's visual-row layout (the
+        // same map `buffer_pos_at` reads) so wrapped and folded lines resolve
+        // to the line actually shown on that row; the linear map drifts by one
+        // for every wrapped continuation row above the pointer. A press below
+        // the last visual row clamps to it. The map is empty only before the
+        // first paint, when nothing can be wrapped or folded and the linear
+        // map is exact.
+        let (target_line, target_col) = match self
+            .last_wrap_rows
+            .get(row_idx.min(self.last_wrap_rows.len().saturating_sub(1)))
+        {
+            Some(&(line, start, end)) => {
+                // In wrap mode a drag past a segment's right edge stops at the
+                // segment end; non-wrap keeps the click-to-line-end behaviour.
+                let cap = if self.wrap_enabled() { end } else { usize::MAX };
+                (line, (start + visible).min(cap))
+            }
+            None => (
+                (self.scroll + row_idx).min(self.lines.len().saturating_sub(1)),
+                visible + self.scroll_col,
+            ),
         };
         self.cursor_row = target_line;
         self.cursor_col = target_col.min(self.line_char_len(target_line));
@@ -11655,6 +11673,29 @@ mod tests {
             col, seg0_end,
             "the first column of the second visual row is where segment one ended"
         );
+    }
+
+    #[test]
+    fn markdown_mouse_down_below_wrapped_lines_lands_on_the_row_under_the_pointer() {
+        // Line 0 wraps onto several visual rows; pressing on the row that
+        // SHOWS line 1 must anchor the selection on line 1, not on the
+        // linear `scroll + visual_row` (which counts every wrapped
+        // continuation row as its own line and drifts downward).
+        let mut e = md_editor(&format!("{}\nsecond\nthird\nfourth", "a".repeat(100)));
+        render_at(&mut e, 30, 10);
+        let vis_row = e
+            .last_wrap_rows
+            .iter()
+            .position(|&(l, _, _)| l == 1)
+            .expect("line 1 is on screen");
+        assert!(vis_row > 1, "line 0 must wrap for the rows to be displaced");
+        let text_x = e.last_inner.x + e.last_gutter_width + 1;
+        e.mouse_down(text_x, e.last_inner.y + vis_row as u16);
+        assert_eq!(
+            e.cursor_row, 1,
+            "the press lands on the line under the pointer"
+        );
+        assert_eq!(e.cursor_col, 0);
     }
 
     #[test]
