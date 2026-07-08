@@ -18247,6 +18247,21 @@ fn cmd_k_n_annotates_the_selection_and_a_click_shows_the_note() {
         "popup carries the note text"
     );
 
+    // A real mouse drifts right after the click: the note must survive
+    // pointer motion while it stays on the annotated span, and dismiss
+    // once the pointer leaves it (regression: any move outside the editor
+    // used to kill the popup instantly).
+    app.handle_mouse(mouse(MouseEventKind::Moved, inner.x + 4, inner.y + vrow));
+    assert!(
+        app.hover_popup.is_some(),
+        "drifting within the span must keep the note open"
+    );
+    app.handle_mouse(mouse(MouseEventKind::Moved, inner.x + 60, inner.y + vrow));
+    assert!(
+        app.hover_popup.is_none(),
+        "leaving the span dismisses the note"
+    );
+
     // Cmd+K Shift+N over the span deletes it.
     app.terminals[0].start_selection_at(inner.x + 2, inner.y + vrow);
     app.terminals[0].extend_selection_to(inner.x + 5, inner.y + vrow);

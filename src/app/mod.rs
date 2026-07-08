@@ -5621,7 +5621,18 @@ impl App {
         self.tab_hover_idx = None;
         if !in_editor {
             self.hover.clear();
-            self.hover_popup = None;
+            // A terminal-annotation note survives pointer drift while the
+            // pointer stays on its own span (the editor's same-region rule);
+            // leaving the span dismisses it. Matching the popup's text to
+            // the span's note keeps a stale editor hover from hiding here.
+            let over_own_note = self
+                .hover_popup
+                .as_ref()
+                .zip(self.terminal().annotation_at(col, row))
+                .is_some_and(|(popup, (_, note))| popup.lines.join("\n") == note);
+            if !over_own_note {
+                self.hover_popup = None;
+            }
             self.hover_word = None;
             self.hover_diagnostic = None;
             self.hover_request_id = None;
