@@ -10128,13 +10128,23 @@ impl App {
                                     || !self.terminals[i].broadcast_excluded);
                             if (!label.is_empty() || receiving) && room >= 3 {
                                 let shown: String = label.chars().take(room).collect();
-                                let text = if receiving && shown.is_empty() {
+                                let mut text = if receiving && shown.is_empty() {
                                     String::from(" \u{21f6} ")
                                 } else if receiving {
                                     format!(" \u{21f6} {shown} ")
                                 } else {
                                     format!(" {shown} ")
                                 };
+                                // A live OSC 9;4 percent joins the pill (the
+                                // border gauge is the primary drawing; this
+                                // keeps unfocused panes glanceable). The
+                                // indeterminate state has no number to show.
+                                if let Some((state, pct)) = self.terminals[i].progress()
+                                    && state != 3
+                                    && text.chars().count() + 6 <= room
+                                {
+                                    text = format!("{}\u{b7} {pct}% ", text);
+                                }
                                 let style = if receiving {
                                     Style::default()
                                         .fg(Color::Black)

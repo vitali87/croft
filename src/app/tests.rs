@@ -17780,3 +17780,96 @@ fn terminal_session_restores_pane_layout_names_and_focus_across_restarts() {
         "a trivial session (one unnamed pane at the root) is pruned"
     );
 }
+
+#[test]
+fn osc_9_4_progress_paints_a_border_gauge_and_pill_percent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    // Pane 0 reports 46% (state 1), then a read gates the state-0 clear so
+    // the test controls both phases. A second pane makes the name pill paint.
+    app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
+        "/bin/sh",
+        &[
+            String::from("-c"),
+            String::from(
+                "printf '\\033]9;4;1;46\\007'; read x; printf '\\033]9;4;0\\007'; sleep 30",
+            ),
+        ],
+        tmp.path(),
+    )
+    .unwrap();
+    app.terminals[0].set_manual_name(Some(String::from("bld")));
+    app.terminals.push(
+        crate::widgets::terminal::PtyTerminal::new_running(
+            "/bin/sh",
+            &[String::from("-c"), String::from("sleep 30")],
+            tmp.path(),
+        )
+        .unwrap(),
+    );
+    app.focus_pane(Pane::Terminal);
+    let mut waited = 0u32;
+    while app.terminals[0].progress() != Some((1, 46)) {
+        assert!(waited < 8000, "progress report never arrived");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        waited += 20;
+    }
+
+    let backend = ratatui::backend::TestBackend::new(140, 50);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    fn screen_rows(term: &ratatui::Terminal<ratatui::backend::TestBackend>) -> Vec<String> {
+        let buf = term.backend().buffer();
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().chars().next().unwrap_or(' '))
+                    .collect()
+            })
+            .collect()
+    }
+    let area = app.terminals[0].last_area;
+    let inner = app.terminals[0].last_inner;
+    let rows = screen_rows(&term);
+    let border_row = &rows[(area.y + area.height - 1) as usize];
+    let fill: usize = border_row
+        .chars()
+        .skip(inner.x as usize)
+        .take(inner.width as usize)
+        .filter(|c| *c == '━')
+        .count();
+    let expected = (inner.width as u32 * 46 / 100) as usize;
+    assert!(
+        expected > 0,
+        "pane too narrow for the test to mean anything"
+    );
+    assert_eq!(
+        fill, expected,
+        "the bottom border must fill to 46% with heavy strokes: {border_row:?}"
+    );
+    let top_row = &rows[area.y as usize];
+    assert!(
+        top_row.contains("bld \u{b7} 46%"),
+        "the name pill carries the percent: {top_row:?}"
+    );
+
+    // State 0 clears: the gauge and the pill percent both vanish.
+    app.terminals[0].write_input(b"\n");
+    let mut waited = 0u32;
+    while app.terminals[0].progress().is_some() {
+        assert!(waited < 8000, "state 0 never cleared the progress");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        waited += 20;
+    }
+    term.draw(|f| app.render(f)).unwrap();
+    let rows = screen_rows(&term);
+    let border_row = &rows[(area.y + area.height - 1) as usize];
+    assert!(
+        !border_row.contains('━'),
+        "a cleared gauge restores the plain border: {border_row:?}"
+    );
+    assert!(
+        !rows[area.y as usize].contains("46%"),
+        "the pill percent must clear too"
+    );
+}

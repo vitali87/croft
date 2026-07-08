@@ -59,21 +59,7 @@ pub struct ReleaseNote {
 }
 
 /// What shipped in the current release. Replace on every version bump.
-pub const RELEASE_NOTES: &[ReleaseNote] = &[
-    ReleaseNote {
-        kind: NoteKind::Feature,
-        summary: "The terminal remembers your workspace: the pane layout (directories, names, focus) is saved per workspace and restored as fresh shells on the next launch, and a closed pane stays undoable for 10s via Cmd+K Shift+T with its process and scrollback intact.",
-    },
-    ReleaseNote {
-        kind: NoteKind::Feature,
-        summary: "Copy mode (Ctrl+Shift+Y): vi keys walk the scrollback, v/V/Ctrl+V select by character, line, or rectangular block, y copies to the clipboard — keyboard-only selection like WezTerm and tmux.",
-    },
-    ReleaseNote {
-        kind: NoteKind::Feature,
-        summary: "Durable command history (Ctrl+Shift+H): every command run under croft is recorded with its directory, exit code, and duration, searchable across sessions and restarts (Ctrl+R narrows to this directory or failures only); Enter types the pick back at your prompt.",
-    },
-    ReleaseNote {
-        kind: NoteKind::Feature,
-        summary: "Captured output: a \"capture\" trigger action collects matching lines (compiler errors, test failures) into the new CAPTURES panel tab, where one click jumps the pane back to that line.",
-    },
-];
+pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
+    kind: NoteKind::Feature,
+    summary: "Live progress bars in the terminal: a program reporting OSC 9;4 progress (systemd, winget, cargo wrappers) fills the pane's bottom border into a gauge — blue advancing, red frozen on error, yellow paused, a sweeping segment while indeterminate — with the percent echoed in the pane's name pill; clears on the program's own reset or when the command finishes.",
+}];

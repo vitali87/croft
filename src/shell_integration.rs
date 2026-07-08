@@ -40,6 +40,11 @@ pub enum OscEvent {
     Cwd(PathBuf),
     /// OSC 9;<message> — a notification payload.
     Notify(String),
+    /// OSC 9;4;<state>;<percent> — ConEmu progress (systemd, winget, cargo
+    /// wrappers; Ghostty/WezTerm render it natively): state 0 clears,
+    /// 1 normal, 2 error, 3 indeterminate, 4 warning/paused. Percent is
+    /// clamped to 100 (0 when absent).
+    Progress(u8, u8),
     /// OSC 1337 `File=…;inline=1:<base64>` (iTerm2's imgcat protocol) — the
     /// decoded image bytes a program printed into the pane. alacritty drops
     /// the sequence as unknown OSC, so this tee is the only way the picture
@@ -201,7 +206,27 @@ fn parse_event(kind: OscKind, body: &[u8]) -> Option<OscEvent> {
                 String::from_utf8_lossy(&decoded).into_owned(),
             )))
         }
-        OscKind::Notify => Some(OscEvent::Notify(String::from_utf8_lossy(body).into_owned())),
+        OscKind::Notify => {
+            // The `9;4;` sub-namespace is ConEmu progress, not a
+            // notification; anything else after `9;` (including a message
+            // that merely starts with a 4) stays a notification.
+            if let Some(rest) = body.strip_prefix(b"4;") {
+                let mut parts = rest.split(|&b| b == b';');
+                let state = std::str::from_utf8(parts.next().unwrap_or_default())
+                    .ok()?
+                    .parse::<u8>()
+                    .ok()
+                    .filter(|s| *s <= 4)?;
+                let percent = parts
+                    .next()
+                    .and_then(|p| std::str::from_utf8(p).ok())
+                    .and_then(|p| p.parse::<u32>().ok())
+                    .unwrap_or(0)
+                    .min(100) as u8;
+                return Some(OscEvent::Progress(state, percent));
+            }
+            Some(OscEvent::Notify(String::from_utf8_lossy(body).into_owned()))
+        }
         OscKind::ITerm2File => {
             let rest = body.strip_prefix(b"File=")?;
             let colon = rest.iter().position(|&b| b == b':')?;
@@ -741,6 +766,38 @@ mod tests {
         assert_eq!(
             events,
             vec![OscEvent::Notify(String::from("Build finished"))]
+        );
+    }
+
+    #[test]
+    fn osc_9_4_progress_is_parsed_and_plain_osc_9_stays_notify() {
+        let mut s = OscSniffer::default();
+        // ConEmu progress: state 1 (normal) at 46%.
+        assert_eq!(
+            scan_all(&mut s, &[b"\x1b]9;4;1;46\x07"]),
+            vec![OscEvent::Progress(1, 46)]
+        );
+        // State 0 clears; percent may be absent. Split across chunks.
+        assert_eq!(
+            scan_all(&mut s, &[b"\x1b]9;4", b";0\x07"]),
+            vec![OscEvent::Progress(0, 0)]
+        );
+        // Error keeps its percent; out-of-range percents clamp; junk state drops.
+        assert_eq!(
+            scan_all(
+                &mut s,
+                &[b"\x1b]9;4;2;63\x07\x1b]9;4;1;250\x07\x1b]9;4;x;5\x07"]
+            ),
+            vec![OscEvent::Progress(2, 63), OscEvent::Progress(1, 100)]
+        );
+        // A plain OSC 9 notification is untouched, even one starting with 4.
+        assert_eq!(
+            scan_all(&mut s, &[b"\x1b]9;Build finished\x07"]),
+            vec![OscEvent::Notify(String::from("Build finished"))]
+        );
+        assert_eq!(
+            scan_all(&mut s, &[b"\x1b]9;4 done\x07"]),
+            vec![OscEvent::Notify(String::from("4 done"))]
         );
     }
 

@@ -246,6 +246,10 @@ pub struct PtyTerminal {
     osc7_cwd: Arc<std::sync::Mutex<Option<std::path::PathBuf>>>,
     /// OSC 9 notification payloads awaiting the app's drain.
     notifications: Arc<std::sync::Mutex<Vec<String>>>,
+    /// Latest OSC 9;4 progress report `(state, percent)`: 1 normal,
+    /// 2 error, 3 indeterminate, 4 warning. `None` when idle (state 0,
+    /// command end, or never reported). Drives the bottom-border gauge.
+    progress: Arc<std::sync::Mutex<Option<(u8, u8)>>>,
     /// Finished commands (exit, duration) from the reader thread, awaiting
     /// the app's drain for long-command notifications.
     finished_rx: std::sync::mpsc::Receiver<FinishedCommand>,
@@ -926,6 +930,8 @@ impl PtyTerminal {
         let osc7_for_thread = osc7_cwd.clone();
         let notifications = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let notifications_for_thread = notifications.clone();
+        let progress = Arc::new(std::sync::Mutex::new(None::<(u8, u8)>));
+        let progress_for_thread = progress.clone();
         // Trigger set shared with the reader thread; the inner Arc is swapped
         // by `set_triggers` on startup / config reload, picked up per chunk.
         let triggers = Arc::new(std::sync::Mutex::new(std::sync::Arc::new(
@@ -970,6 +976,12 @@ impl PtyTerminal {
                                 E::Notify(msg) => {
                                     notifications_for_thread.lock().unwrap().push(msg);
                                 }
+                                E::Progress(state, pct) => {
+                                    // State 0 clears; the rest hold the latest
+                                    // (state, percent) for the border gauge.
+                                    *progress_for_thread.lock().unwrap() =
+                                        (state != 0).then_some((state, pct));
+                                }
                                 E::InlineImage(data) => {
                                     // Anchor the picture at the cursor's grid
                                     // position, exactly like a mark; the
@@ -1000,6 +1012,10 @@ impl PtyTerminal {
                                             None
                                         }
                                         E::CommandEnd(exit) => {
+                                            // A finished command's gauge is
+                                            // stale even if the program never
+                                            // sent the state-0 clear.
+                                            *progress_for_thread.lock().unwrap() = None;
                                             let dur = cmd_start.take().map(|s| s.elapsed());
                                             if let Some(d) = dur {
                                                 // The typed command text and the
@@ -1098,6 +1114,7 @@ impl PtyTerminal {
             marks,
             osc7_cwd,
             notifications,
+            progress,
             finished_rx,
             hints: None,
             triggers,
@@ -1314,6 +1331,12 @@ impl PtyTerminal {
     pub fn take_dirty(&self) -> bool {
         self.pty_pending_bytes.store(0, Ordering::Relaxed);
         self.pty_dirty.swap(false, Ordering::AcqRel)
+    }
+
+    /// The pane's live OSC 9;4 progress `(state, percent)`, if a program is
+    /// reporting one.
+    pub fn progress(&self) -> Option<(u8, u8)> {
+        *self.progress.lock().unwrap()
     }
 
     /// Drain the loopback ports the reader thread scraped since the last call.
@@ -2301,6 +2324,42 @@ impl Widget for &mut PtyTerminal {
                 let mut tmp = [0u8; 4];
                 target.set_symbol(display_char.encode_utf8(&mut tmp));
                 target.set_style(style);
+            }
+        }
+        // OSC 9;4 progress gauge along the bottom border (Ghostty/WezTerm
+        // parity): a fill in the state's colour over the border glyphs —
+        // blue normal, red error, yellow warning — and a sweeping segment
+        // while indeterminate. Border cells are croft chrome, so no program
+        // content is ever covered (same contract as the decoration dots).
+        if let Some((state, pct)) = *self.progress.lock().unwrap()
+            && area.height >= 2
+            && inner.width > 0
+        {
+            let w = inner.width as u32;
+            let (fill_from, fill_len) = if state == 3 {
+                // Indeterminate: a ~fifth-width segment sweeping left to
+                // right, phased off the wall clock so each frame advances.
+                let seg = (w / 5).max(1);
+                let span = (w - seg).max(1);
+                let ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u32)
+                    .unwrap_or(0);
+                ((ms / 80) % span, seg)
+            } else {
+                (0, w * u32::from(pct.min(100)) / 100)
+            };
+            let color = match state {
+                2 => Color::Rgb(0xf1, 0x4c, 0x4c),
+                4 => Color::Rgb(0xe5, 0xc0, 0x7b),
+                _ => Color::Rgb(0x1b, 0x81, 0xa8),
+            };
+            let by = area.y + area.height - 1;
+            for i in 0..fill_len.min(w) {
+                let x = inner.x + (fill_from + i) as u16;
+                let cell = &mut buf[(x, by)];
+                cell.set_symbol("━");
+                cell.set_style(Style::default().fg(color));
             }
         }
         // Command decorations: a VS Code-style dot on the left border at
