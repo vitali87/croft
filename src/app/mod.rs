@@ -23602,8 +23602,13 @@ impl App {
                 }
             }
             MouseEventKind::Up(MouseButton::Left) => {
-                // Releasing the button ends any terminal edge auto-scroll.
+                // Releasing the button ends any terminal edge auto-scroll
+                // and finalizes a drag-selection (the alt-screen content
+                // anchor is captured at release).
                 self.terminal_select_autoscroll = None;
+                if self.focus == Pane::Terminal {
+                    self.terminal_mut().end_drag();
+                }
                 // Copy-on-select (VS Code's terminal.integrated.copyOnSelection,
                 // iTerm2's default): a finished terminal drag-selection lands
                 // on the clipboard without the explicit Cmd+C. Silent — this

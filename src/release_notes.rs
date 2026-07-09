@@ -59,7 +59,13 @@ pub struct ReleaseNote {
 }
 
 /// What shipped in the current release. Replace on every version bump.
-pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
-    kind: NoteKind::Fix,
-    summary: "A selection in a full-screen app (Claude Code) now stays partially highlighted while scrolling slides it under the app's chrome: the rows still on screen keep their highlight instead of the whole block vanishing the moment its edge is covered, and copying still yields the entire remembered selection.",
-}];
+pub const RELEASE_NOTES: &[ReleaseNote] = &[
+    ReleaseNote {
+        kind: NoteKind::Fix,
+        summary: "Bottom-up drag-selection works inside full-screen apps (Claude Code): a drag that starts on a blank row or an animated status line no longer turns invisible. While the button is held the highlight simply follows the pointer; the content anchor is captured on release.",
+    },
+    ReleaseNote {
+        kind: NoteKind::Fix,
+        summary: "A selection row half-covered by a floating overlay (Claude Code's Jump-to-bottom pill) keeps its surviving text highlighted, clipped to the intact columns, instead of dropping the whole row. Blocks split by an overlay also keep both intact parts lit.",
+    },
+];

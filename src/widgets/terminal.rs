@@ -85,11 +85,14 @@ struct AltSelAnchor {
     /// The rows are nowhere in the grid right now: paint nothing, keep the
     /// coordinates frozen until the content reappears.
     dormant: bool,
-    /// Grid-line range (inclusive) of the rows that actually survive on
-    /// screen when the block is only partially visible — the rest is off
-    /// the grid or overdrawn by app chrome (Claude Code's input box).
-    /// Painting clips to it; `None` while the whole block is visible.
-    visible: Option<(i32, i32)>,
+    /// The rows (and column spans) that actually survive on screen when
+    /// the block is only partially visible — the rest is off the grid or
+    /// overdrawn by app chrome (Claude Code's input box, its floating
+    /// "Jump to bottom" pill). Each entry is `(grid line, first column,
+    /// last column)`: a row half-covered by a pill keeps its surviving
+    /// prefix/suffix highlighted. Painting clips to these; `None` while
+    /// the whole block is visible.
+    visible: Option<Vec<(i32, u16, u16)>>,
 }
 
 impl Selection {
@@ -277,6 +280,13 @@ pub struct PtyTerminal {
     /// place, so no scroll clock can see the text move. `None` while the
     /// selection lives on the primary screen.
     alt_sel: Option<AltSelAnchor>,
+    /// A mouse drag-selection is in progress (button still held). While
+    /// dragging, the selection follows the pointer over whatever the grid
+    /// shows — it must never hide itself because the content anchor lost
+    /// its rows (the drag may have started on a blank row or on an app's
+    /// animated status line). The definitive anchor is captured on
+    /// release (`end_drag`).
+    drag_selecting: bool,
     /// User-given pane name (via rename), overriding the auto label. `None`
     /// until the user renames the pane.
     manual_name: Option<String>,
@@ -1229,6 +1239,7 @@ impl PtyTerminal {
             clock_planted: None,
             clock_hist: 0,
             alt_sel: None,
+            drag_selecting: false,
             manual_name: None,
             auto_label: String::new(),
             search_needle: None,
@@ -1779,56 +1790,46 @@ impl PtyTerminal {
         let sel = self.selection.unwrap();
         let old_top = sel.anchor.0.min(sel.head.0);
         let k = anchor.rows.len() as i32;
-        // One grid snapshot up front: the matcher probes every candidate
-        // shift, so per-candidate row reads would re-extract (and
-        // re-allocate) the same rows dozens of times a frame.
-        let grid_rows: Vec<String> = (0..rows_vis)
-            .map(|l| row_text_and_cols(&term, l).0)
-            .collect();
-        // Per candidate shift, the longest contiguous run of block rows
-        // whose grid text matches. Rows can go missing not just off-grid:
-        // app chrome (Claude Code's input box, status rows) overdraws a
-        // block's edge rows as scrolling slides it underneath, so partial
-        // survival must anchor by the run that remains. A run must span at
-        // least two rows (when the block has two) and one non-blank row,
+        // One grid snapshot up front (text + char→column maps): the
+        // matcher probes every candidate shift, so per-candidate row reads
+        // would re-extract (and re-allocate) the same rows dozens of times
+        // a frame.
+        let grid_rows: Vec<(String, Vec<usize>)> =
+            (0..rows_vis).map(|l| row_text_and_cols(&term, l)).collect();
+        // Per candidate shift, how many block rows the grid matches
+        // exactly at that offset. Rows can go missing not just off-grid:
+        // app chrome (Claude Code's input box, its floating pills, an
+        // animated status row) overdraws rows anywhere in the block, so
+        // partial survival anchors by however many exact rows remain — at
+        // least two (when the block has two) including a non-blank one,
         // so a lone repeated divider row can't latch the highlight onto an
-        // unrelated copy of itself. Longer runs win; ties go to the
+        // unrelated copy of itself. More exact rows win; ties go to the
         // smallest movement.
         let k_rows = anchor.rows.len();
-        let min_run = k_rows.min(2);
-        // (top, run start within the block, run length)
-        let mut best: Option<(i32, usize, usize)> = None;
+        let min_exact = k_rows.min(2);
+        // (top, exact-row count)
+        let mut best: Option<(i32, usize)> = None;
         for top in 1 - k..rows_vis {
-            let (mut run_lo, mut run_len, mut run_nb) = (0usize, 0usize, false);
-            let (mut cur_lo, mut cur_len, mut cur_nb) = (0usize, 0usize, false);
+            let (mut exact, mut nonblank) = (0usize, false);
             for (i, want) in anchor.rows.iter().enumerate() {
                 let line = top + i as i32;
-                if (0..rows_vis).contains(&line) && grid_rows[line as usize] == *want {
-                    if cur_len == 0 {
-                        cur_lo = i;
-                        cur_nb = false;
-                    }
-                    cur_len += 1;
-                    cur_nb |= !want.trim().is_empty();
-                    if cur_len > run_len {
-                        (run_lo, run_len, run_nb) = (cur_lo, cur_len, cur_nb);
-                    }
-                } else {
-                    cur_len = 0;
+                if (0..rows_vis).contains(&line) && grid_rows[line as usize].0 == *want {
+                    exact += 1;
+                    nonblank |= !want.trim().is_empty();
                 }
             }
-            if run_len >= min_run
-                && run_nb
-                && best.is_none_or(|(btop, _, blen)| {
-                    run_len > blen
-                        || (run_len == blen && (top - old_top).abs() < (btop - old_top).abs())
+            if exact >= min_exact
+                && nonblank
+                && best.is_none_or(|(btop, bexact)| {
+                    exact > bexact
+                        || (exact == bexact && (top - old_top).abs() < (btop - old_top).abs())
                 })
             {
-                best = Some((top, run_lo, run_len));
+                best = Some((top, exact));
             }
         }
         match best {
-            Some((top, run_lo, run_len)) => {
+            Some((top, _)) => {
                 let d = top - old_top;
                 if d != 0
                     && let Some(s) = self.selection.as_mut()
@@ -1837,15 +1838,47 @@ impl PtyTerminal {
                     s.head.0 += d;
                 }
                 anchor.dormant = false;
-                anchor.visible = (run_len < k_rows)
-                    .then(|| (top + run_lo as i32, top + (run_lo + run_len) as i32 - 1));
+                // The clip: every block row still on screen, whole when its
+                // text matches exactly, or just the surviving prefix/suffix
+                // columns when app chrome (a floating pill) overdraws part
+                // of it. The shift is already pinned by the exact run, so
+                // partial credit here can't drag the highlight elsewhere.
+                let mut clips: Vec<(i32, u16, u16)> = Vec::new();
+                let mut all_exact = true;
+                for (i, want) in anchor.rows.iter().enumerate() {
+                    let line = top + i as i32;
+                    if !(0..rows_vis).contains(&line) {
+                        all_exact = false;
+                        continue;
+                    }
+                    let (got, colmap) = &grid_rows[line as usize];
+                    if got == want {
+                        clips.push((line, 0, u16::MAX));
+                    } else {
+                        all_exact = false;
+                        if let Some((lo, hi)) = partial_overlap_cols(want, got, colmap) {
+                            clips.push((line, lo, hi));
+                        }
+                    }
+                }
+                anchor.visible = (!all_exact).then_some(clips);
                 // Refresh the anchor — this is also what folds in a user
                 // extension of the selection — but only when every row is
-                // in view, so the remembered block never loses a covered
-                // or off-screen part mid-scroll.
-                if run_len == k_rows
-                    && let Some(fresh) = capture_alt_anchor(&term, self.selection.unwrap())
+                // in view and intact, so the remembered block never loses
+                // a covered or off-screen part mid-scroll.
+                if all_exact && let Some(fresh) = capture_alt_anchor(&term, self.selection.unwrap())
                 {
+                    anchor = fresh;
+                }
+            }
+            // Nothing matched anywhere. Mid-drag that must NOT hide the
+            // selection — the drag may have started on a blank row or an
+            // animated status line, and the user is pointing at what they
+            // see right now; the real anchor is captured on release.
+            None if self.drag_selecting => {
+                anchor.dormant = false;
+                anchor.visible = None;
+                if let Some(fresh) = capture_alt_anchor(&term, self.selection.unwrap()) {
                     anchor = fresh;
                 }
             }
@@ -1908,11 +1941,23 @@ impl PtyTerminal {
         if let Some((r, c)) = self.cell_at(col, row) {
             let line = r as i32 - self.display_offset();
             self.selection = Some(Selection::new(line, c));
+            self.drag_selecting = true;
+            self.stamp_selection_clock();
+        }
+    }
+
+    /// The mouse button came up: the drag-selection is final. Capture the
+    /// definitive content anchor now — during the drag the selection
+    /// followed the pointer over whatever the grid showed.
+    pub fn end_drag(&mut self) {
+        if self.drag_selecting {
+            self.drag_selecting = false;
             self.stamp_selection_clock();
         }
     }
 
     pub fn extend_selection_to(&mut self, col: u16, row: u16) {
+        self.drag_selecting = true;
         self.rebase_selection();
         let cell = self.cell_at(col, row);
         let off = self.display_offset();
@@ -1933,6 +1978,7 @@ impl PtyTerminal {
         if inner.width == 0 || inner.height == 0 {
             return 0;
         }
+        self.drag_selecting = true;
         let top = inner.y;
         let bottom = inner.y + inner.height - 1;
         let (vp_row, dir) = if row < top {
@@ -2404,6 +2450,45 @@ fn hhmmss(millis: u64) -> String {
     format!("{:02}:{:02}:{:02}", tm.tm_hour, tm.tm_min, tm.tm_sec)
 }
 
+/// The surviving column span of a block row that app chrome partially
+/// overdrew: the longest common prefix or suffix between the remembered
+/// row and what the grid shows, when it still covers at least half the
+/// remembered text (and four chars) — enough to be that row and not a
+/// coincidence. Returns the grid-column range to keep highlighted.
+fn partial_overlap_cols(want: &str, got: &str, colmap: &[usize]) -> Option<(u16, u16)> {
+    // Row text is full grid width: strip the trailing blank run or it
+    // counts as a huge shared suffix between any two rows.
+    let want = want.trim_end();
+    let got = got.trim_end();
+    let want_n = want.chars().count();
+    let got_n = got.chars().count();
+    if want_n == 0 || got_n == 0 {
+        return None;
+    }
+    let prefix = want
+        .chars()
+        .zip(got.chars())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let suffix = want
+        .chars()
+        .rev()
+        .zip(got.chars().rev())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let need = (want_n / 2).max(4);
+    // The matched segment must carry real content, not just indentation.
+    let solid =
+        |chars: &mut dyn Iterator<Item = char>| chars.filter(|c| !c.is_whitespace()).count() >= 4;
+    if prefix >= need && prefix >= suffix && solid(&mut want.chars().take(prefix)) {
+        Some((colmap[0] as u16, colmap[prefix - 1] as u16))
+    } else if suffix >= need && solid(&mut want.chars().rev().take(suffix)) {
+        Some((colmap[got_n - suffix] as u16, colmap[got_n - 1] as u16))
+    } else {
+        None
+    }
+}
+
 /// Capture the content anchor for an alternate-screen selection: its row
 /// text and extracted text as the grid shows them now. `None` when any
 /// selected line is outside the grid (a partially scrolled-out block keeps
@@ -2720,7 +2805,7 @@ impl Widget for &mut PtyTerminal {
         // app's view and the frozen coordinates sit over unrelated text; a
         // partially covered one paints only its surviving rows.
         let dormant = self.alt_sel.as_ref().is_some_and(|a| a.dormant);
-        let sel_clip = self.alt_sel.as_ref().and_then(|a| a.visible);
+        let sel_clip = self.alt_sel.as_ref().and_then(|a| a.visible.clone());
         let sel_paint = self.selection.filter(|_| !dormant).map(|s| {
             if s.block {
                 (true, s.block_bounds())
@@ -2882,7 +2967,11 @@ impl Widget for &mut PtyTerminal {
                     style = style.add_modifier(Modifier::REVERSED);
                 }
                 if let Some((block, (sr, sc, er, ec))) = sel_paint
-                    && sel_clip.is_none_or(|(lo, hi)| line_idx >= lo && line_idx <= hi)
+                    && sel_clip.as_ref().is_none_or(|clips| {
+                        clips
+                            .iter()
+                            .any(|&(l, lo, hi)| l == line_idx && x >= lo && x <= hi)
+                    })
                     && if block {
                         cell_in_block_selection(line_idx, x, sr, sc, er, ec)
                     } else {
@@ -5238,7 +5327,7 @@ mod tests {
         );
         assert_eq!(
             anchor.visible,
-            Some((0, 1)),
+            Some(vec![(0, 0, u16::MAX), (1, 0, u16::MAX)]),
             "only the surviving rows keep their highlight"
         );
         assert_eq!(
@@ -5327,6 +5416,82 @@ mod tests {
         assert!(t.alt_sel.as_ref().is_some_and(|a| !a.dormant));
         assert_eq!(t.selection().unwrap().anchor.0, 1);
         assert_eq!(t.selection_text(), "bravo two");
+    }
+
+    #[test]
+    fn alt_screen_row_half_covered_by_a_floating_pill_keeps_its_surviving_prefix() {
+        // Claude Code floats a "Jump to bottom" pill ON TOP of a content
+        // row. That row's text no longer equals the remembered row, but
+        // its left part is untouched — it must keep a highlight clipped to
+        // the surviving columns instead of dropping out entirely.
+        let (_tmp, mut t) = quiet_pty();
+        feed_pty(
+            &t,
+            b"\x1b[?1049h\x1b[H\x1b[2Jalpha one\r\nbravo two words here\r\ncharlie three words here\r\ndelta four words here\r\necho five",
+        );
+        t.set_selection(Some(Selection {
+            anchor: (1, 0),
+            head: (3, 20),
+            block: false,
+        }));
+        // The app repaints the same content but overlays a pill over the
+        // right half of the block's middle row.
+        feed_pty(
+            &t,
+            b"\x1b[H\x1b[2Jalpha one\r\nbravo two words here\r\ncharlie three[ PILL ]here\r\ndelta four words here\r\necho five",
+        );
+        t.rebase_selection();
+        let anchor = t.alt_sel.as_ref().expect("anchor survives");
+        assert!(!anchor.dormant);
+        let clips = anchor.visible.as_ref().expect("partially covered");
+        assert!(
+            clips.contains(&(1, 0, u16::MAX)) && clips.contains(&(3, 0, u16::MAX)),
+            "intact rows keep their full highlight: {clips:?}"
+        );
+        assert!(
+            clips
+                .iter()
+                .any(|&(l, lo, hi)| l == 2 && lo == 0 && (12..14).contains(&hi)),
+            "the covered row keeps its surviving prefix ('charlie three'): {clips:?}"
+        );
+    }
+
+    #[test]
+    fn alt_screen_bottom_up_drag_from_a_blank_row_selects_and_survives_release() {
+        // Bottom-up selections usually start on a blank row or an animated
+        // status row: the anchor captured at mouse-down mismatches on the
+        // next frame, and before drag-awareness that turned the whole drag
+        // dormant (invisible). While the button is held the selection must
+        // follow the pointer over whatever is on screen; release captures
+        // the definitive anchor.
+        let (_tmp, mut t) = quiet_pty();
+        feed_pty(
+            &t,
+            b"\x1b[?1049h\x1b[H\x1b[2Jalpha one\r\nbravo two\r\ncharlie three\r\n\r\ntokens 42",
+        );
+        t.last_inner = Rect::new(0, 0, 40, 10);
+        // Mouse-down on the blank row (row 3), then an app repaint changes
+        // the animated status row so the blank-row anchor can't match as a
+        // block, then drag upward.
+        t.start_selection_at(5, 3);
+        feed_pty(&t, b"\x1b[5;1Htokens 43\x1b[K");
+        t.extend_selection_to(0, 1);
+        let anchor = t.alt_sel.as_ref().expect("anchor present");
+        assert!(
+            !anchor.dormant,
+            "a held drag never hides itself, whatever the anchor matched"
+        );
+        assert_eq!(t.selection_text(), "bravo two\ncharlie three\n");
+        t.end_drag();
+        // After release the anchor is definitive: the app scrolls its
+        // content down one row and the highlight follows.
+        feed_pty(
+            &t,
+            b"\x1b[H\x1b[2Jnew line\r\nalpha one\r\nbravo two\r\ncharlie three\r\n\r\ntokens 44",
+        );
+        t.rebase_selection();
+        assert_eq!(t.selection().expect("survives").normalised().0, 2);
+        assert_eq!(t.selection_text(), "bravo two\ncharlie three\n");
     }
 
     #[test]
