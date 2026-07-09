@@ -85,6 +85,11 @@ struct AltSelAnchor {
     /// The rows are nowhere in the grid right now: paint nothing, keep the
     /// coordinates frozen until the content reappears.
     dormant: bool,
+    /// Grid-line range (inclusive) of the rows that actually survive on
+    /// screen when the block is only partially visible — the rest is off
+    /// the grid or overdrawn by app chrome (Claude Code's input box).
+    /// Painting clips to it; `None` while the whole block is visible.
+    visible: Option<(i32, i32)>,
 }
 
 impl Selection {
@@ -1780,25 +1785,50 @@ impl PtyTerminal {
         let grid_rows: Vec<String> = (0..rows_vis)
             .map(|l| row_text_and_cols(&term, l).0)
             .collect();
-        let matches_at = |top: i32| {
-            let mut nonblank = false;
+        // Per candidate shift, the longest contiguous run of block rows
+        // whose grid text matches. Rows can go missing not just off-grid:
+        // app chrome (Claude Code's input box, status rows) overdraws a
+        // block's edge rows as scrolling slides it underneath, so partial
+        // survival must anchor by the run that remains. A run must span at
+        // least two rows (when the block has two) and one non-blank row,
+        // so a lone repeated divider row can't latch the highlight onto an
+        // unrelated copy of itself. Longer runs win; ties go to the
+        // smallest movement.
+        let k_rows = anchor.rows.len();
+        let min_run = k_rows.min(2);
+        // (top, run start within the block, run length)
+        let mut best: Option<(i32, usize, usize)> = None;
+        for top in 1 - k..rows_vis {
+            let (mut run_lo, mut run_len, mut run_nb) = (0usize, 0usize, false);
+            let (mut cur_lo, mut cur_len, mut cur_nb) = (0usize, 0usize, false);
             for (i, want) in anchor.rows.iter().enumerate() {
                 let line = top + i as i32;
-                if line < 0 || line >= rows_vis {
-                    continue;
+                if (0..rows_vis).contains(&line) && grid_rows[line as usize] == *want {
+                    if cur_len == 0 {
+                        cur_lo = i;
+                        cur_nb = false;
+                    }
+                    cur_len += 1;
+                    cur_nb |= !want.trim().is_empty();
+                    if cur_len > run_len {
+                        (run_lo, run_len, run_nb) = (cur_lo, cur_len, cur_nb);
+                    }
+                } else {
+                    cur_len = 0;
                 }
-                if grid_rows[line as usize] != *want {
-                    return false;
-                }
-                nonblank |= !want.trim().is_empty();
             }
-            nonblank
-        };
-        match (1 - k..rows_vis)
-            .filter(|&t| matches_at(t))
-            .min_by_key(|&t| (t - old_top).abs())
-        {
-            Some(top) => {
+            if run_len >= min_run
+                && run_nb
+                && best.is_none_or(|(btop, _, blen)| {
+                    run_len > blen
+                        || (run_len == blen && (top - old_top).abs() < (btop - old_top).abs())
+                })
+            {
+                best = Some((top, run_lo, run_len));
+            }
+        }
+        match best {
+            Some((top, run_lo, run_len)) => {
                 let d = top - old_top;
                 if d != 0
                     && let Some(s) = self.selection.as_mut()
@@ -1807,11 +1837,15 @@ impl PtyTerminal {
                     s.head.0 += d;
                 }
                 anchor.dormant = false;
+                anchor.visible = (run_len < k_rows)
+                    .then(|| (top + run_lo as i32, top + (run_lo + run_len) as i32 - 1));
                 // Refresh the anchor — this is also what folds in a user
-                // extension of the selection — but only when the whole
-                // block is in view, so the remembered rows never lose an
-                // off-screen part mid-scroll.
-                if let Some(fresh) = capture_alt_anchor(&term, self.selection.unwrap()) {
+                // extension of the selection — but only when every row is
+                // in view, so the remembered block never loses a covered
+                // or off-screen part mid-scroll.
+                if run_len == k_rows
+                    && let Some(fresh) = capture_alt_anchor(&term, self.selection.unwrap())
+                {
                     anchor = fresh;
                 }
             }
@@ -2067,11 +2101,15 @@ impl PtyTerminal {
     }
 
     pub fn selection_text(&self) -> String {
-        // A dormant alt-screen selection names content currently scrolled
-        // out of the app's view: the grid no longer holds it, but the
-        // anchor remembered the text, so copy still yields what was
-        // highlighted.
-        if let Some(anchor) = self.alt_sel.as_ref().filter(|a| a.dormant) {
+        // An alt-screen selection scrolled (partly) out of the app's view
+        // names content the grid no longer fully holds — dormant, or
+        // clipped by app chrome. The anchor remembered the text, so copy
+        // still yields the whole highlighted block.
+        if let Some(anchor) = self
+            .alt_sel
+            .as_ref()
+            .filter(|a| a.dormant || a.visible.is_some())
+        {
             return anchor.text.clone();
         }
         let Some(mut sel) = self.selection else {
@@ -2388,6 +2426,7 @@ fn capture_alt_anchor(term: &Term<VoidListener>, sel: Selection) -> Option<AltSe
         rows,
         text,
         dormant: false,
+        visible: None,
     })
 }
 
@@ -2678,8 +2717,10 @@ impl Widget for &mut PtyTerminal {
         // (is_block, bounds): block selections rectangle-test each cell,
         // linear ones use the row-major span. A dormant alt-screen
         // selection paints nothing — its content is scrolled out of the
-        // app's view and the frozen coordinates sit over unrelated text.
+        // app's view and the frozen coordinates sit over unrelated text; a
+        // partially covered one paints only its surviving rows.
         let dormant = self.alt_sel.as_ref().is_some_and(|a| a.dormant);
+        let sel_clip = self.alt_sel.as_ref().and_then(|a| a.visible);
         let sel_paint = self.selection.filter(|_| !dormant).map(|s| {
             if s.block {
                 (true, s.block_bounds())
@@ -2841,6 +2882,7 @@ impl Widget for &mut PtyTerminal {
                     style = style.add_modifier(Modifier::REVERSED);
                 }
                 if let Some((block, (sr, sc, er, ec))) = sel_paint
+                    && sel_clip.is_none_or(|(lo, hi)| line_idx >= lo && line_idx <= hi)
                     && if block {
                         cell_in_block_selection(line_idx, x, sr, sc, er, ec)
                     } else {
@@ -5160,6 +5202,61 @@ mod tests {
             "TARGET-line",
             "the selection must follow its content even with history_size saturated"
         );
+    }
+
+    #[test]
+    fn alt_screen_selection_stays_partially_visible_when_app_chrome_covers_its_edge() {
+        // Scrolling Claude Code slides the selected block toward its input
+        // box; the rows that reach it are overdrawn by the box while the
+        // rest stay visible. The surviving rows must keep their highlight
+        // (matched as a partial block), and copy must still yield the whole
+        // remembered selection.
+        let (_tmp, mut t) = quiet_pty();
+        feed_pty(
+            &t,
+            b"\x1b[?1049h\x1b[H\x1b[2Jalpha one\r\nbravo two\r\ncharlie three\r\ndelta four\r\necho five",
+        );
+        t.set_selection(Some(Selection {
+            anchor: (1, 0),
+            head: (3, 9),
+            block: false,
+        }));
+        assert_eq!(t.selection_text(), "bravo two\ncharlie three\ndelta four");
+
+        // The app scrolls one line; the block's last row slides under the
+        // input box, which repaints over it. Rows 0-1 of the block survive
+        // at lines 0-1; line 2 onward is app chrome.
+        feed_pty(
+            &t,
+            b"\x1b[H\x1b[2Jbravo two\r\ncharlie three\r\n> INPUT BOX\r\n> more chrome\r\n> even more",
+        );
+        t.rebase_selection();
+        let anchor = t.alt_sel.as_ref().expect("anchor survives");
+        assert!(
+            !anchor.dormant,
+            "two of three selected rows are still on screen: not dormant"
+        );
+        assert_eq!(
+            anchor.visible,
+            Some((0, 1)),
+            "only the surviving rows keep their highlight"
+        );
+        assert_eq!(
+            t.selection_text(),
+            "bravo two\ncharlie three\ndelta four",
+            "copy yields the whole remembered selection while partially covered"
+        );
+
+        // Scrolled back: the whole block is visible again, fully live.
+        feed_pty(
+            &t,
+            b"\x1b[H\x1b[2Jalpha one\r\nbravo two\r\ncharlie three\r\ndelta four\r\necho five",
+        );
+        t.rebase_selection();
+        let anchor = t.alt_sel.as_ref().expect("anchor survives");
+        assert!(!anchor.dormant);
+        assert_eq!(anchor.visible, None, "fully visible again: no clip");
+        assert_eq!(t.selection_text(), "bravo two\ncharlie three\ndelta four");
     }
 
     /// Drive a PtyTerminal's grid directly: parse `bytes` into its term as

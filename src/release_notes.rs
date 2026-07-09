@@ -59,17 +59,7 @@ pub struct ReleaseNote {
 }
 
 /// What shipped in the current release. Replace on every version bump.
-pub const RELEASE_NOTES: &[ReleaseNote] = &[
-    ReleaseNote {
-        kind: NoteKind::Fix,
-        summary: "Selections inside full-screen apps that scroll by repainting (Claude Code runs on the alternate screen since v2) now follow their text: the highlight remembers the rows it covers, re-finds them after every repaint, hides while the app scrolls them out of view (copying still yields the remembered text), and reappears when they come back.",
-    },
-    ReleaseNote {
-        kind: NoteKind::Feature,
-        summary: "Shift+click extends the existing terminal selection to the clicked cell instead of starting a new one.",
-    },
-    ReleaseNote {
-        kind: NoteKind::Feature,
-        summary: "Drag-selecting past a pane edge now keeps going inside mouse-tracking full-screen apps too: croft forwards wheel ticks so the app scrolls under the drag while the selection grows.",
-    },
-];
+pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
+    kind: NoteKind::Fix,
+    summary: "A selection in a full-screen app (Claude Code) now stays partially highlighted while scrolling slides it under the app's chrome: the rows still on screen keep their highlight instead of the whole block vanishing the moment its edge is covered, and copying still yields the entire remembered selection.",
+}];
