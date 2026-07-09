@@ -303,6 +303,8 @@ Real breakpoint debugging over the Debug Adapter Protocol. Python is the verifie
 | `F10` | Step over |
 | `F11` / `Shift+F11` | Step into / out |
 
+A bare `F5` / `F9` / `F10` / `F11` pressed while the **terminal pane** is focused and no debug session is live is forwarded to the app running in the shell (process-compose's `F10` Quit, htop's `F9` kill) instead of being claimed by the debugger. Modified chords keep their debug meaning everywhere, and `F9` still re-execs into a landed croft update.
+
 Right-clicking the editor **gutter** (the glyph margin / line-number column) opens a breakpoint menu on the clicked line, mirroring VS Code's glyph-margin menu: **Add Breakpoint** / **Remove Breakpoint** and **Add Conditional Breakpoint** / **Edit Condition** (the cursor does not move).
 
 When paused, the Run and Debug panel shows the **call stack** (click a frame to inspect it) and an expandable **variables** tree, plus a **debug console** of program output with a `❯` **REPL prompt** that evaluates expressions in the selected frame. When the session ends, the console output stays on screen (it isn't wiped back to the Run button), and if the program exited without ever hitting a breakpoint you set, the panel says so rather than just "Debug session ended" — the usual sign you ran a library module whose breakpointed code is never called, rather than its entry point. Hovering a variable in the editor shows its current value. The paused line is marked with a yellow `▶` in the gutter; a breakpoint is a red `●`, a conditional breakpoint a red `◆`, and a breakpoint the adapter could not bind a hollow `○`.

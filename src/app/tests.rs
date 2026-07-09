@@ -12607,6 +12607,51 @@ fn f9_relaunches_only_when_update_is_ready() {
 }
 
 #[test]
+fn bare_f10_reaches_the_shell_when_terminal_is_focused_with_no_debug_session() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    // A pane that prints back the raw bytes it reads: F10 must arrive as
+    // \x1b[21~, which `cat -v` renders as ^[[21~. That sentinel never appears
+    // in the script text, so the echoed run-label header cannot fake a pass.
+    let script = "stty raw -echo; dd bs=1 count=5 2>/dev/null | cat -v; sleep 60";
+    app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
+        "/bin/sh",
+        &[String::from("-c"), String::from(script)],
+        tmp.path(),
+    )
+    .unwrap();
+    app.focus_pane(Pane::Terminal);
+    let _ = app.handle_key(key(KeyCode::F(10), KeyModifiers::NONE));
+    let mut waited = 0u32;
+    while !app.terminals[0]
+        .grid_lines()
+        .0
+        .iter()
+        .any(|l| l.contains("^[[21~"))
+    {
+        assert!(
+            waited < 4000,
+            "F10 was swallowed instead of being forwarded to the PTY"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        waited += 20;
+    }
+}
+
+#[test]
+fn bare_f9_reexecs_a_ready_update_even_when_the_terminal_is_focused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus_pane(Pane::Terminal);
+    app.update_status = UpdateStatus::Ready;
+    let _ = app.handle_key(key(KeyCode::F(9), KeyModifiers::empty()));
+    assert!(
+        app.pending_reexec && app.quit,
+        "a landed update must still win F9 over PTY forwarding"
+    );
+}
+
+#[test]
 fn session_state_round_trip_reopens_tabs_at_saved_cursor_and_active() {
     let tmp = tempfile::tempdir().unwrap();
     let file_a = tmp.path().join("a.txt");

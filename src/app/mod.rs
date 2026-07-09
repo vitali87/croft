@@ -12076,7 +12076,17 @@ impl App {
         // Shift+Cmd+F5 restart, Ctrl+F5 attach to a Python process, F9 toggle
         // breakpoint, F10 step over, F11/Shift+F11 step in/out. Cmd is SUPER on
         // macOS, Ctrl on Linux/Termux.
-        if matches!(key.code, KeyCode::F(5)) {
+        //
+        // A bare F5/F9/F10/F11 pressed while the terminal pane is focused and
+        // no debug session is live belongs to the app running in the shell
+        // (process-compose's F10 Quit, htop's F9 kill), so it falls through to
+        // the PTY instead of dying as a debugger no-op. Modified chords and a
+        // ready update's F9 re-exec keep their croft meaning everywhere.
+        let terminal_owns_fkeys = self.focus == Pane::Terminal
+            && matches!(self.bottom_panel_tab, BottomPanelTab::Terminal)
+            && self.dap_session.is_none()
+            && key.modifiers.is_empty();
+        if matches!(key.code, KeyCode::F(5)) && !terminal_owns_fkeys {
             let shift = key.modifiers.contains(KeyModifiers::SHIFT);
             let cmd = key.modifiers.contains(KeyModifiers::SUPER)
                 || key.modifiers.contains(KeyModifiers::CONTROL);
@@ -12102,7 +12112,9 @@ impl App {
             self.debug_pause();
             return Ok(());
         }
-        if matches!(key.code, KeyCode::F(9)) {
+        if matches!(key.code, KeyCode::F(9))
+            && !(terminal_owns_fkeys && self.update_status != UpdateStatus::Ready)
+        {
             if key.modifiers.contains(KeyModifiers::SHIFT) {
                 // Shift+F9: add or edit a conditional breakpoint at the cursor.
                 self.debug_edit_condition();
@@ -12118,11 +12130,11 @@ impl App {
             }
             return Ok(());
         }
-        if matches!(key.code, KeyCode::F(10)) {
+        if matches!(key.code, KeyCode::F(10)) && !terminal_owns_fkeys {
             self.debug_step("next");
             return Ok(());
         }
-        if matches!(key.code, KeyCode::F(11)) {
+        if matches!(key.code, KeyCode::F(11)) && !terminal_owns_fkeys {
             let cmd = if key.modifiers.contains(KeyModifiers::SHIFT) {
                 "stepOut"
             } else {

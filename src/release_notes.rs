@@ -59,13 +59,7 @@ pub struct ReleaseNote {
 }
 
 /// What shipped in the current release. Replace on every version bump.
-pub const RELEASE_NOTES: &[ReleaseNote] = &[
-    ReleaseNote {
-        kind: NoteKind::Fix,
-        summary: "Bottom-up drag-selection works inside full-screen apps (Claude Code): a drag that starts on a blank row or an animated status line no longer turns invisible. While the button is held the highlight simply follows the pointer; the content anchor is captured on release.",
-    },
-    ReleaseNote {
-        kind: NoteKind::Fix,
-        summary: "A selection row half-covered by a floating overlay (Claude Code's Jump-to-bottom pill) keeps its surviving text highlighted, clipped to the intact columns, instead of dropping the whole row. Blocks split by an overlay also keep both intact parts lit.",
-    },
-];
+pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
+    kind: NoteKind::Fix,
+    summary: "F5/F9/F10/F11 now reach the app running in the terminal (process-compose's F10 Quit, htop's F9 kill) when the terminal pane is focused and no debug session is live, instead of being silently claimed by the debugger. While debugging, and everywhere else, they keep their VS Code debug roles; F9 still re-execs into a landed update.",
+}];
