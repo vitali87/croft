@@ -18418,3 +18418,79 @@ fn host_accent_rules_dress_matching_panes() {
         "a non-matching pane must not wear the accent"
     );
 }
+
+#[test]
+fn alt_screen_upward_drag_through_the_real_mouse_pipeline_selects_upward() {
+    // Field report: mouse-down on a word mid-pane inside Claude Code,
+    // drag UP, and the highlight ran DOWNWARD instead — the drift math
+    // measured against the selection's top, which mid-drag is the pointer,
+    // so every event "corrected" a phantom shift and walked the anchor
+    // down. Reproduce through the production dispatch: an alt-screen
+    // mouse-tracking app, a press mid-pane, upward drags, with app
+    // repaints (animated status row) and renders between every event.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+
+    // Few enough rows that nothing scrolls in the pane's alt grid.
+    let mut screen = String::from("\x1b[?1049h\x1b[?1002h\x1b[?1006h\x1b[H\x1b[2J");
+    for i in 0..6 {
+        screen.push_str(&format!("transcript line number {i:02}\r\n"));
+    }
+    screen.push_str("tokens 100");
+    app.terminal().feed_bytes_for_test(screen.as_bytes());
+
+    let area = app.terminal().last_area;
+    assert!(area.height > 9, "terminal pane must be real: {area:?}");
+    let (ix, iy) = (area.x + 1, area.y + 1);
+    // Press on grid row 4, then drag up to rows 3 and 2, the app
+    // repainting its animated row and croft rendering between events.
+    app.handle_mouse(crossterm::event::MouseEvent {
+        kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        column: ix,
+        row: iy + 4,
+        modifiers: KeyModifiers::NONE,
+    });
+    term.draw(|f| app.render(f)).unwrap();
+    for (step, drag_row) in [iy + 3, iy + 2].into_iter().enumerate() {
+        app.terminal()
+            .feed_bytes_for_test(format!("\x1b[7;1Htokens 10{step}\x1b[K").as_bytes());
+        app.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+            column: ix,
+            row: drag_row,
+            modifiers: KeyModifiers::NONE,
+        });
+        term.draw(|f| app.render(f)).unwrap();
+    }
+    let sel = app.terminal().selection().expect("drag built a selection");
+    let (sr, _, er, _) = sel.normalised();
+    assert_eq!(
+        (sr, er),
+        (2, 4),
+        "dragging up two rows from row 4 must select rows 2..=4, never run downward: {sel:?}"
+    );
+    app.handle_mouse(crossterm::event::MouseEvent {
+        kind: crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
+        column: ix,
+        row: iy + 2,
+        modifiers: KeyModifiers::NONE,
+    });
+    let sel = app
+        .terminal()
+        .selection()
+        .expect("selection survives release");
+    let (sr, _, er, _) = sel.normalised();
+    assert_eq!(
+        (sr, er),
+        (2, 4),
+        "release must not move the selection: {sel:?}"
+    );
+    assert_eq!(
+        app.terminal().selection_text(),
+        "transcript line number 02\ntranscript line number 03\nt",
+        "the extracted text names the rows the pointer actually crossed"
+    );
+}

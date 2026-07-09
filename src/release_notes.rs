@@ -59,7 +59,13 @@ pub struct ReleaseNote {
 }
 
 /// What shipped in the current release. Replace on every version bump.
-pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
-    kind: NoteKind::Fix,
-    summary: "F5/F9/F10/F11 now reach the app running in the terminal (process-compose's F10 Quit, htop's F9 kill) when the terminal pane is focused and no debug session is live, instead of being silently claimed by the debugger. While debugging, and everywhere else, they keep their VS Code debug roles; F9 still re-execs into a landed update.",
-}];
+pub const RELEASE_NOTES: &[ReleaseNote] = &[
+    ReleaseNote {
+        kind: NoteKind::Fix,
+        summary: "Upward drag-selection inside full-screen apps (Claude Code) no longer runs away downward: the content anchor measured its drift against the selection's top row, which mid-drag is the pointer, so each mouse event 'corrected' a phantom shift and walked the anchor down one row. The anchor now remembers its own position.",
+    },
+    ReleaseNote {
+        kind: NoteKind::Fix,
+        summary: "A selection row with a floating overlay in its middle (Claude Code's Jump-to-bottom pill) now keeps BOTH intact ends highlighted, even when each is less than half the row; a row whose middle merely animates (a ticking counter) stays fully lit.",
+    },
+];

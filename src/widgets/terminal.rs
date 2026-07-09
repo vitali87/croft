@@ -79,6 +79,12 @@ struct AltSelAnchor {
     /// bottom. Rows the shift math placed outside the grid stay remembered
     /// so the block can re-anchor when they scroll back in.
     rows: Vec<String>,
+    /// Grid line `rows[0]` was last seen at. Drift is measured against
+    /// THIS, never against the selection's own top: mid-drag the selection
+    /// top is the pointer (the head), not the anchored content, and
+    /// deriving drift from it walked the anchor one row per mouse event on
+    /// upward drags.
+    top: i32,
     /// The extracted selection text at last sight: what copy yields while
     /// the content is scrolled out of view.
     text: String,
@@ -1787,8 +1793,7 @@ impl PtyTerminal {
         };
         let term = self.term.lock();
         let rows_vis = term.screen_lines() as i32;
-        let sel = self.selection.unwrap();
-        let old_top = sel.anchor.0.min(sel.head.0);
+        let old_top = anchor.top;
         let k = anchor.rows.len() as i32;
         // One grid snapshot up front (text + char→column maps): the
         // matcher probes every candidate shift, so per-candidate row reads
@@ -1831,6 +1836,7 @@ impl PtyTerminal {
         match best {
             Some((top, _)) => {
                 let d = top - old_top;
+                anchor.top = top;
                 if d != 0
                     && let Some(s) = self.selection.as_mut()
                 {
@@ -1856,7 +1862,7 @@ impl PtyTerminal {
                         clips.push((line, 0, u16::MAX));
                     } else {
                         all_exact = false;
-                        if let Some((lo, hi)) = partial_overlap_cols(want, got, colmap) {
+                        for (lo, hi) in partial_overlap_cols(want, got, colmap) {
                             clips.push((line, lo, hi));
                         }
                     }
@@ -1944,6 +1950,30 @@ impl PtyTerminal {
             self.drag_selecting = true;
             self.stamp_selection_clock();
         }
+    }
+
+    /// Test-only: parse `bytes` straight into this pane's grid, as if the
+    /// child had printed them — app-level tests drive alt-screen repaint
+    /// scenarios deterministically through this.
+    #[cfg(test)]
+    pub fn feed_bytes_for_test(&self, bytes: &[u8]) {
+        let mut p = Processor::<StdSyncHandler>::new();
+        let mut term = self.term.lock();
+        p.advance(&mut *term, bytes);
+    }
+
+    /// Test-only: the raw state behind the corrected selection accessors —
+    /// (stored selection, sel_scrolled, clock_base, alt anchor top, alt
+    /// mode) — for diagnosing drift math from app-level tests.
+    #[cfg(test)]
+    pub fn debug_sel_state(&self) -> (Option<Selection>, i64, i64, Option<i32>, bool) {
+        (
+            self.selection,
+            self.sel_scrolled,
+            self.clock_base,
+            self.alt_sel.as_ref().map(|a| a.top),
+            self.term.lock().mode().contains(TermMode::ALT_SCREEN),
+        )
     }
 
     /// The mouse button came up: the drag-selection is final. Capture the
@@ -2450,12 +2480,12 @@ fn hhmmss(millis: u64) -> String {
     format!("{:02}:{:02}:{:02}", tm.tm_hour, tm.tm_min, tm.tm_sec)
 }
 
-/// The surviving column span of a block row that app chrome partially
-/// overdrew: the longest common prefix or suffix between the remembered
-/// row and what the grid shows, when it still covers at least half the
-/// remembered text (and four chars) — enough to be that row and not a
-/// coincidence. Returns the grid-column range to keep highlighted.
-fn partial_overlap_cols(want: &str, got: &str, colmap: &[usize]) -> Option<(u16, u16)> {
+/// The surviving column spans of a block row that app chrome partially
+/// overdrew: the longest common prefix and suffix between the remembered
+/// row and what the grid shows. Returns the grid-column ranges to keep
+/// highlighted — a pill floating over the middle of a row leaves BOTH
+/// intact ends lit.
+fn partial_overlap_cols(want: &str, got: &str, colmap: &[usize]) -> Vec<(u16, u16)> {
     // Row text is full grid width: strip the trailing blank run or it
     // counts as a huge shared suffix between any two rows.
     let want = want.trim_end();
@@ -2463,7 +2493,7 @@ fn partial_overlap_cols(want: &str, got: &str, colmap: &[usize]) -> Option<(u16,
     let want_n = want.chars().count();
     let got_n = got.chars().count();
     if want_n == 0 || got_n == 0 {
-        return None;
+        return Vec::new();
     }
     let prefix = want
         .chars()
@@ -2476,17 +2506,28 @@ fn partial_overlap_cols(want: &str, got: &str, colmap: &[usize]) -> Option<(u16,
         .zip(got.chars().rev())
         .take_while(|(a, b)| a == b)
         .count();
-    let need = (want_n / 2).max(4);
-    // The matched segment must carry real content, not just indentation.
+    // Each surviving end must carry real content, not just indentation.
+    // No minimum share of the row: a pill over the MIDDLE leaves both
+    // ends under half, and this credit is paint-only — the shift was
+    // already anchored by exact rows, so it can't move the highlight.
     let solid =
         |chars: &mut dyn Iterator<Item = char>| chars.filter(|c| !c.is_whitespace()).count() >= 4;
-    if prefix >= need && prefix >= suffix && solid(&mut want.chars().take(prefix)) {
-        Some((colmap[0] as u16, colmap[prefix - 1] as u16))
-    } else if suffix >= need && solid(&mut want.chars().rev().take(suffix)) {
-        Some((colmap[got_n - suffix] as u16, colmap[got_n - 1] as u16))
+    let good_prefix = prefix > 0 && solid(&mut want.chars().take(prefix));
+    let good_suffix = suffix > 0 && solid(&mut want.chars().rev().take(suffix));
+    let mut spans = Vec::new();
+    if good_prefix && good_suffix && prefix + suffix >= got_n {
+        // The ends overlap: the row differs by a few mid-row cells (an
+        // animated counter ticking inside the selection) — keep it whole.
+        spans.push((colmap[0] as u16, colmap[got_n - 1] as u16));
     } else {
-        None
+        if good_prefix {
+            spans.push((colmap[0] as u16, colmap[prefix - 1] as u16));
+        }
+        if good_suffix {
+            spans.push((colmap[got_n - suffix] as u16, colmap[got_n - 1] as u16));
+        }
     }
+    spans
 }
 
 /// Capture the content anchor for an alternate-screen selection: its row
@@ -2509,6 +2550,7 @@ fn capture_alt_anchor(term: &Term<VoidListener>, sel: Selection) -> Option<AltSe
     };
     Some(AltSelAnchor {
         rows,
+        top: lo,
         text,
         dormant: false,
         visible: None,
@@ -5453,6 +5495,12 @@ mod tests {
                 .iter()
                 .any(|&(l, lo, hi)| l == 2 && lo == 0 && (12..14).contains(&hi)),
             "the covered row keeps its surviving prefix ('charlie three'): {clips:?}"
+        );
+        assert!(
+            clips
+                .iter()
+                .any(|&(l, lo, hi)| l == 2 && lo == 21 && hi == 24),
+            "the surviving suffix ('here') stays lit too, even under half the row: {clips:?}"
         );
     }
 
