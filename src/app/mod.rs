@@ -26363,6 +26363,31 @@ fn keyboard_enhancement_flags() -> KeyboardEnhancementFlags {
         | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
 }
 
+/// Escape bytes re-asserting every terminal mode croft set at startup. A
+/// dtach reattach (`-r winch`) delivers only a SIGWINCH: the newly attached
+/// terminal never received the startup DECSETs, so the alt screen, mouse
+/// tracking, bracketed paste, and kitty keyboard flags are all off — the
+/// "mouse dead after reconnecting to a persisted remote session" bug. The
+/// main loop emits this on every Resize when `CROFT_SESSION_PERSISTENT` is
+/// set (the dtach branch of the remote launch command); every sequence is
+/// idempotent on a terminal that already has the mode enabled. The kitty
+/// keyboard flags use the SET form (`CSI = flags ; 1 u`), not the push the
+/// startup path uses: a push per WINCH would stack entries the single pop at
+/// exit can't unwind, leaving the user's shell with enhanced keys on.
+fn mode_reassert_seq() -> Vec<u8> {
+    use std::io::Write;
+    let mut seq = Vec::new();
+    let _ = execute!(
+        seq,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableBracketedPaste,
+        crossterm::cursor::SetCursorStyle::SteadyBar,
+    );
+    let _ = write!(seq, "\x1b[={};1u", keyboard_enhancement_flags().bits());
+    seq
+}
+
 /// True when the "command" modifier is effectively held. That is `Super`
 /// (Cmd) everywhere; on Termux (Android, no Cmd key) `Ctrl` stands in for it
 /// too, mirroring VS Code's Linux keymap so the Super-only chords stay
@@ -29799,6 +29824,17 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
                         // re-emit ghosts a fresh icon over the stale one. Re-mark
                         // dirty AND arm a one-shot terminal.clear() to evict it.
                         app.on_resize();
+                        // Under dtach a reattach arrives as a bare WINCH into a
+                        // terminal that never saw the startup DECSETs: without
+                        // this re-assert the mouse (and bracketed paste, kitty
+                        // keyboard flags, alt screen) stays dead until the next
+                        // F9 reload happens to re-exec croft.
+                        if std::env::var_os("CROFT_SESSION_PERSISTENT").is_some() {
+                            use std::io::Write;
+                            let out = terminal.backend_mut();
+                            let _ = out.write_all(&mode_reassert_seq());
+                            let _ = out.flush();
+                        }
                     }
                     _ => {}
                 }

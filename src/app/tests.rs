@@ -5318,6 +5318,28 @@ fn brand_spans_render_the_cr_ft_wordmark_with_orange_brackets() {
 }
 
 #[test]
+fn dtach_reattach_mode_reassert_reenables_mouse_tracking() {
+    // dtach `-r winch` delivers only a SIGWINCH on reattach: the newly
+    // attached terminal never received the startup DECSETs, so without a
+    // re-assert the mouse is dead after every reconnect to a persisted
+    // session (0.1.610 bug on `various`). The Resize-time sequence must
+    // re-enable the alt screen, mouse tracking with SGR encoding, and
+    // bracketed paste, and must SET (not push) the kitty keyboard flags so
+    // repeated WINCHes don't leak stack entries the single exit pop can't
+    // unwind.
+    let s = String::from_utf8(mode_reassert_seq()).unwrap();
+    for m in ["\x1b[?1049h", "\x1b[?1000h", "\x1b[?1006h", "\x1b[?2004h"] {
+        assert!(s.contains(m), "reattach re-assert missing {m:?}");
+    }
+    let set_kbd = format!("\x1b[={};1u", keyboard_enhancement_flags().bits());
+    assert!(s.contains(&set_kbd), "kitty keyboard flags must be re-SET");
+    assert!(
+        !s.contains("\x1b[>"),
+        "a push (CSI > flags u) per WINCH would leak stack entries"
+    );
+}
+
+#[test]
 fn keyboard_enhancement_flags_request_disambiguate_escape_codes() {
     let f = keyboard_enhancement_flags();
     assert!(

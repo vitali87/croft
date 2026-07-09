@@ -59,13 +59,7 @@ pub struct ReleaseNote {
 }
 
 /// What shipped in the current release. Replace on every version bump.
-pub const RELEASE_NOTES: &[ReleaseNote] = &[
-    ReleaseNote {
-        kind: NoteKind::Fix,
-        summary: "Upward drag-selection inside full-screen apps (Claude Code) no longer runs away downward: the content anchor measured its drift against the selection's top row, which mid-drag is the pointer, so each mouse event 'corrected' a phantom shift and walked the anchor down one row. The anchor now remembers its own position.",
-    },
-    ReleaseNote {
-        kind: NoteKind::Fix,
-        summary: "A selection row with a floating overlay in its middle (Claude Code's Jump-to-bottom pill) now keeps BOTH intact ends highlighted, even when each is less than half the row; a row whose middle merely animates (a ticking counter) stays fully lit.",
-    },
-];
+pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
+    kind: NoteKind::Fix,
+    summary: "The mouse works again after reconnecting to a persisted remote session: a dtach reattach arrives as a bare WINCH into a terminal that never saw the startup escape sequences, so croft now re-asserts mouse tracking, bracketed paste, the alt screen, and the kitty keyboard flags on every resize of a persistent session.",
+}];
