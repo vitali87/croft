@@ -5331,6 +5331,14 @@ fn dtach_reattach_mode_reassert_reenables_mouse_tracking() {
     for m in ["\x1b[?1049h", "\x1b[?1000h", "\x1b[?1006h", "\x1b[?2004h"] {
         assert!(s.contains(m), "reattach re-assert missing {m:?}");
     }
+    // Structural guarantee, not just spot checks: the re-assert embeds the
+    // startup takeover block verbatim, so a mode added at startup (via
+    // takeover_mode_seq) can never be missing from the reattach path.
+    let takeover = String::from_utf8(takeover_mode_seq()).unwrap();
+    assert!(
+        s.starts_with(&takeover),
+        "mode_reassert_seq must embed takeover_mode_seq verbatim"
+    );
     let set_kbd = format!("\x1b[={};1u", keyboard_enhancement_flags().bits());
     assert!(s.contains(&set_kbd), "kitty keyboard flags must be re-SET");
     assert!(

@@ -26363,6 +26363,28 @@ fn keyboard_enhancement_flags() -> KeyboardEnhancementFlags {
         | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
 }
 
+/// The terminal modes croft turns on whenever it takes over a screen: alt
+/// screen, mouse tracking, bracketed paste, steady-bar cursor. SINGLE SOURCE
+/// OF TRUTH — the startup takeover, the post-scp TUI restore, and the
+/// dtach-reattach re-assert all emit exactly this block, so the mode lists
+/// can never drift apart. A mode enabled at startup but missing from the
+/// reattach re-assert is the "mouse dead after reconnecting to a persisted
+/// remote session" bug (0.1.611); add any new startup mode HERE, never as an
+/// inline `execute!` at a call site. The kitty keyboard flags are the one
+/// deliberate exception: startup pushes them (the push pairs with the
+/// teardown pop), while [`mode_reassert_seq`] appends the SET form.
+fn takeover_mode_seq() -> Vec<u8> {
+    let mut seq = Vec::new();
+    let _ = execute!(
+        seq,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableBracketedPaste,
+        crossterm::cursor::SetCursorStyle::SteadyBar,
+    );
+    seq
+}
+
 /// Escape bytes re-asserting every terminal mode croft set at startup. A
 /// dtach reattach (`-r winch`) delivers only a SIGWINCH: the newly attached
 /// terminal never received the startup DECSETs, so the alt screen, mouse
@@ -26376,14 +26398,7 @@ fn keyboard_enhancement_flags() -> KeyboardEnhancementFlags {
 /// exit can't unwind, leaving the user's shell with enhanced keys on.
 fn mode_reassert_seq() -> Vec<u8> {
     use std::io::Write;
-    let mut seq = Vec::new();
-    let _ = execute!(
-        seq,
-        EnterAlternateScreen,
-        EnableMouseCapture,
-        EnableBracketedPaste,
-        crossterm::cursor::SetCursorStyle::SteadyBar,
-    );
+    let mut seq = takeover_mode_seq();
     let _ = write!(seq, "\x1b[={};1u", keyboard_enhancement_flags().bits());
     seq
 }
@@ -29092,18 +29107,17 @@ pub fn run(
         app.sixel_supported = crate::iterm2_inline::probe_sixel_support();
     }
     let mut out = stdout();
-    execute!(
-        out,
-        EnterAlternateScreen,
-        EnableMouseCapture,
-        EnableBracketedPaste,
-        // SteadyBar = thin vertical line, no hardware blink. The blink is
-        // done in software (App toggles whether the OS cursor is positioned
-        // each frame) so it works even when the host terminal's own
-        // "Blinking cursor" preference is off.
-        crossterm::cursor::SetCursorStyle::SteadyBar,
-    )
-    .context("enter alt screen")?;
+    // Alt screen + mouse + bracketed paste + SteadyBar cursor (thin vertical
+    // line, no hardware blink: the blink is done in software so it works even
+    // when the host terminal's own "Blinking cursor" preference is off). The
+    // shared takeover block keeps this list identical to the dtach-reattach
+    // re-assert; add new modes in takeover_mode_seq, not here.
+    {
+        use std::io::Write;
+        out.write_all(&takeover_mode_seq())
+            .and_then(|()| out.flush())
+            .context("enter alt screen")?;
+    }
     // From here the tty is in raw mode + alt-screen + mouse + bracketed
     // paste. The normal teardown below restores all of it, but a panic
     // unwinds straight past it and would drop the user back to a shell
@@ -29400,16 +29414,15 @@ fn run_pending_scp_uploads(app: &mut App, terminal: &mut CroftTerminal) -> Resul
     let mut line = String::new();
     let _ = std::io::stdin().read_line(&mut line);
 
-    // Restore the TUI.
+    // Restore the TUI via the shared takeover block (same modes as startup
+    // and the dtach-reattach re-assert).
     enable_raw_mode().ok();
-    execute!(
-        terminal.backend_mut(),
-        EnterAlternateScreen,
-        EnableMouseCapture,
-        EnableBracketedPaste,
-        crossterm::cursor::SetCursorStyle::SteadyBar,
-    )
-    .ok();
+    {
+        use std::io::Write;
+        let out = terminal.backend_mut();
+        let _ = out.write_all(&takeover_mode_seq());
+        let _ = out.flush();
+    }
     terminal.clear().ok();
     app.overlays.activity.mark_dirty();
     app.overlays.welcome.mark_dirty();
