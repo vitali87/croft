@@ -804,6 +804,101 @@ pub fn show_commit_file_diff(root: &Path, hash: &str, rel_path: &str) -> Result<
     diff_text(root, &["show", hash, "--", rel_path])
 }
 
+/// The whole commit as text — header, message, diffstat, and full patch —
+/// for the Source Control graph's click-to-open view (the tig / lazygit
+/// idiom for inspecting a commit in a terminal).
+pub fn show_commit(root: &Path, hash: &str) -> Result<String, String> {
+    diff_text(root, &["show", "--stat", "--patch", hash])
+}
+
+/// One commit of the repo-wide Source Control graph, straight off
+/// `git log --topo-order` with its parent hashes (the lane layout's input)
+/// and its decorations (branch / tag / HEAD ref names).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GraphCommit {
+    pub hash: String,
+    pub short_hash: String,
+    pub parents: Vec<String>,
+    /// Decoration names as git prints them (`HEAD -> main`, `origin/main`,
+    /// `tag: v1.0`), split per ref; empty for an undecorated commit.
+    pub refs: Vec<String>,
+    pub summary: String,
+    pub author: String,
+    /// Seconds elapsed since the commit time, for [`humanize_age`].
+    pub age_secs: i64,
+}
+
+/// The newest `limit` commits across local branches, tags, and HEAD in
+/// topological order (parents never precede children), the input to the
+/// Source Control graph. Empty on any failure — no repo, no commits, no git —
+/// so the panel renders an empty state, never an error.
+pub fn commit_graph(root: &Path, limit: usize) -> Vec<GraphCommit> {
+    let Some(path_str) = root.to_str() else {
+        return Vec::new();
+    };
+    let output = Command::new("git")
+        .args([
+            "-C",
+            path_str,
+            "log",
+            "--branches",
+            "--tags",
+            "HEAD",
+            "--topo-order",
+            &format!("-n{limit}"),
+            "--format=%H\x1f%h\x1f%P\x1f%D\x1f%s\x1f%an\x1f%ct",
+        ])
+        .output();
+    let Ok(output) = output else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    parse_commit_graph(
+        &String::from_utf8_lossy(&output.stdout),
+        current_unix_seconds(),
+    )
+}
+
+/// Parse the `%H\x1f%h\x1f%P\x1f%D\x1f%s\x1f%an\x1f%ct` lines emitted by
+/// [`commit_graph`], computing each commit's age relative to `now`.
+pub fn parse_commit_graph(out: &str, now: i64) -> Vec<GraphCommit> {
+    out.lines()
+        .filter_map(|line| {
+            let mut parts = line.split('\x1f');
+            let hash = parts.next()?.to_string();
+            let short_hash = parts.next()?.to_string();
+            let parents: Vec<String> = parts
+                .next()?
+                .split_whitespace()
+                .map(str::to_string)
+                .collect();
+            let refs: Vec<String> = parts
+                .next()?
+                .split(", ")
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect();
+            let summary = parts.next()?.to_string();
+            let author = parts.next()?.to_string();
+            let ct: i64 = parts.next()?.trim().parse().ok()?;
+            if hash.is_empty() {
+                return None;
+            }
+            Some(GraphCommit {
+                hash,
+                short_hash,
+                parents,
+                refs,
+                summary,
+                author,
+                age_secs: (now - ct).max(0),
+            })
+        })
+        .collect()
+}
+
 /// The commit that last touched one line, for GitLens-style inline blame.
 /// Lines not yet committed (staged or unstaged working-tree edits) blame
 /// against the all-zero hash, which [`parse_blame`] marks `uncommitted`.
@@ -1588,6 +1683,96 @@ mod tests {
     fn parse_ahead_behind_falls_back_to_zero_on_garbage() {
         assert_eq!(parse_ahead_behind(""), (0, 0));
         assert_eq!(parse_ahead_behind("?"), (0, 0));
+    }
+
+    #[test]
+    fn parse_commit_graph_splits_parents_and_refs() {
+        let line = format!(
+            "{h}\x1f{s}\x1f{p1} {p2}\x1fHEAD -> main, tag: v1.0, origin/main\x1ffeat: merge\x1fvitali87\x1f1000",
+            h = "a".repeat(40),
+            s = "aaaaaaa",
+            p1 = "b".repeat(40),
+            p2 = "c".repeat(40),
+        );
+        let commits = parse_commit_graph(&line, 4600);
+        assert_eq!(commits.len(), 1);
+        let c = &commits[0];
+        assert_eq!(c.short_hash, "aaaaaaa");
+        assert_eq!(c.parents, vec!["b".repeat(40), "c".repeat(40)]);
+        assert_eq!(
+            c.refs,
+            vec![
+                "HEAD -> main".to_string(),
+                "tag: v1.0".to_string(),
+                "origin/main".to_string()
+            ]
+        );
+        assert_eq!(c.summary, "feat: merge");
+        assert_eq!(c.age_secs, 3600);
+        // A root commit has an empty %P field → no parents.
+        let root_line = format!(
+            "{h}\x1fddddddd\x1f\x1f\x1finit\x1ft\x1f1",
+            h = "d".repeat(40)
+        );
+        let commits = parse_commit_graph(&root_line, 1);
+        assert!(commits[0].parents.is_empty());
+        assert!(commits[0].refs.is_empty());
+    }
+
+    /// End to end against a REAL repo: init, commit, branch, merge — then
+    /// assert `commit_graph` + the lane layout produce the diamond rails.
+    #[test]
+    fn commit_graph_of_a_real_merge_lays_out_the_diamond() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let run = |args: &[&str]| {
+            let ok = Command::new("git")
+                .args(["-C", root.to_str().unwrap()])
+                .args(args)
+                .output()
+                .unwrap()
+                .status
+                .success();
+            assert!(ok, "git {args:?} failed");
+        };
+        run(&["init", "-q", "-b", "main"]);
+        run(&["config", "user.email", "t@t"]);
+        run(&["config", "user.name", "t"]);
+        std::fs::write(root.join("a.txt"), "1\n").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-q", "-m", "root"]);
+        run(&["checkout", "-q", "-b", "feature"]);
+        std::fs::write(root.join("b.txt"), "2\n").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-q", "-m", "feature work"]);
+        run(&["checkout", "-q", "main"]);
+        std::fs::write(root.join("c.txt"), "3\n").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-q", "-m", "main work"]);
+        run(&["merge", "-q", "--no-ff", "-m", "merge feature", "feature"]);
+
+        let commits = commit_graph(&root, 50);
+        assert_eq!(commits.len(), 4, "root, two branches, one merge");
+        assert_eq!(commits[0].summary, "merge feature");
+        assert_eq!(commits[0].parents.len(), 2, "the merge has two parents");
+        assert!(
+            commits[0].refs.iter().any(|r| r.contains("main")),
+            "HEAD decoration must survive parsing; got {:?}",
+            commits[0].refs
+        );
+        let rows = crate::widgets::commit_graph::layout_graph(commits);
+        let rails: Vec<String> = rows
+            .iter()
+            .map(|r| r.cells.iter().map(|(ch, _)| *ch).collect())
+            .collect();
+        // git's --topo-order emits the second parent's subtree (feature work,
+        // lane 1) before the first parent's (main work, lane 0) here; either
+        // interleaving is a valid diamond, the shape is what matters.
+        assert_eq!(
+            rails,
+            vec!["●╮", "│●", "●│", "●╯"],
+            "a no-ff merge of one branch must draw the diamond"
+        );
     }
 
     /// Init a repo, commit a 20-line file, then edit line 2 and line 18

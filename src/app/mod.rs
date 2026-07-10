@@ -1833,6 +1833,17 @@ pub struct App {
     pub search: SearchPanel,
     pub remote: RemotePanel,
     pub source_control: SourceControlPanel,
+    /// The Source Control COMMITS section: the repo-wide commit graph with
+    /// lane rails, stacked under the change list. See [`CommitGraphPanel`].
+    pub commit_graph: crate::widgets::commit_graph::CommitGraphPanel,
+    /// Background `git log --topo-order` + lane layout for the COMMITS
+    /// section, tagged by the root it describes so a stale reply after a
+    /// Make Root is ignored on drain.
+    graph_rx: std::sync::mpsc::Receiver<(PathBuf, Vec<crate::widgets::commit_graph::GraphRow>)>,
+    graph_tx: std::sync::mpsc::Sender<(PathBuf, Vec<crate::widgets::commit_graph::GraphRow>)>,
+    /// A graph fetch is running; suppresses duplicate spawns when a burst of
+    /// StatusAndChanges responses lands. Cleared when the reply drains.
+    graph_fetch_inflight: bool,
     pub run_debug: RunDebugPanel,
     /// The Testing side panel: the suite tree with live pass/fail status.
     pub testing: crate::widgets::testing::TestingPanel,
@@ -3056,6 +3067,7 @@ impl App {
         let explorer_views = ExplorerViewVisibility::from_prefs(loaded_prefs.explorer_views);
         let disabled_extensions = loaded_prefs.disabled_extensions.clone();
         let (timeline_tx, timeline_rx) = std::sync::mpsc::channel();
+        let (graph_tx, graph_rx) = std::sync::mpsc::channel();
         let (blame_tx, blame_rx) = std::sync::mpsc::channel();
         let (deps_tx, deps_rx) = std::sync::mpsc::channel();
         let (voice_tx, voice_rx) = std::sync::mpsc::channel();
@@ -3112,6 +3124,10 @@ impl App {
             search,
             remote,
             source_control,
+            commit_graph: crate::widgets::commit_graph::CommitGraphPanel::new(),
+            graph_rx,
+            graph_tx,
+            graph_fetch_inflight: false,
             run_debug,
             testing: crate::widgets::testing::TestingPanel::new(),
             test_worker: crate::testing::worker::TestWorker::spawn(root.clone()),
@@ -4646,6 +4662,8 @@ impl App {
             let oid = self.git.status().head_oid.clone();
             if oid != self.git_gutter_head_oid {
                 self.git_gutter_head_oid = oid;
+                // HEAD moved: the COMMITS graph gained (or lost) commits.
+                self.refresh_commit_graph();
                 for ed in &mut self.editor.editors {
                     ed.git_baseline_for = None;
                 }
@@ -6317,6 +6335,14 @@ impl App {
         while let Ok((path, entries)) = self.timeline_rx.try_recv() {
             if self.editor.path.as_deref() == Some(path.as_path()) {
                 self.timeline.set_history(path, entries);
+                changed = true;
+            }
+        }
+        // Drain any COMMITS graph replies; ignore one for a since-left root.
+        while let Ok((root, rows)) = self.graph_rx.try_recv() {
+            self.graph_fetch_inflight = false;
+            if root == self.tree.root {
+                self.commit_graph.set_rows(rows);
                 changed = true;
             }
         }
@@ -9423,6 +9449,10 @@ impl App {
         self.timeline.focus_gradient = gradient;
         self.timeline.theme = self.theme;
         self.timeline.focused = explorer_focused;
+        self.commit_graph.focus_gradient = gradient;
+        self.commit_graph.theme = self.theme;
+        self.commit_graph.focused =
+            self.focus == Pane::Tree && self.sidebar_view == SidebarView::SourceControl;
         self.dependencies.focus_gradient = gradient;
         self.dependencies.theme = self.theme;
         self.dependencies.focused = explorer_focused;
@@ -10059,6 +10089,7 @@ impl App {
             self.timeline.hover_pointer = panel_pointer;
             self.dependencies.hover_pointer = panel_pointer;
             self.extensions.hover_pointer = panel_pointer;
+            self.commit_graph.hover_pointer = panel_pointer;
             // Explorer stacks its toggled sub-views (Open Editors / Folders /
             // Outline / Timeline / Dependencies) inside the usable strip.
             // Every other sidebar view fills it with its single activity widget.
@@ -10066,7 +10097,31 @@ impl App {
                 SidebarView::Explorer => self.render_explorer_sections(frame, usable_area),
                 SidebarView::Search => frame.render_widget(&mut self.search, usable_area),
                 SidebarView::SourceControl => {
-                    frame.render_widget(&mut self.source_control, usable_area)
+                    // The COMMITS graph section docks under the change list,
+                    // capped at half the strip (like the Explorer sub-views).
+                    // Hidden entirely while the repo empty-state hero shows.
+                    let graph_h = if self.source_control.status.in_repo {
+                        self.commit_graph
+                            .desired_height(usable_area.height)
+                            .min(usable_area.height.saturating_sub(6))
+                    } else {
+                        0
+                    };
+                    let scm_area = Rect {
+                        height: usable_area.height - graph_h,
+                        ..usable_area
+                    };
+                    frame.render_widget(&mut self.source_control, scm_area);
+                    if graph_h > 0 {
+                        let graph_area = Rect {
+                            y: usable_area.y + usable_area.height - graph_h,
+                            height: graph_h,
+                            ..usable_area
+                        };
+                        frame.render_widget(&mut self.commit_graph, graph_area);
+                    } else {
+                        self.commit_graph.last_area = Rect::default();
+                    }
                 }
                 SidebarView::Remote => frame.render_widget(&mut self.remote, usable_area),
                 SidebarView::RunDebug => frame.render_widget(&mut self.run_debug, usable_area),
@@ -12720,6 +12775,44 @@ impl App {
         // a commit changes those without changing the file list. Still off
         // the UI thread, so no synchronous `git status` stall.
         self.git.request_status_and_changes();
+        self.refresh_commit_graph();
+    }
+
+    /// Refetch the COMMITS graph off-thread: `git log --topo-order` plus the
+    /// pure lane layout both run on the fetch thread, and the finished rows
+    /// land in [`graph_rx`] tagged with the root they describe. The inflight
+    /// latch collapses a burst of triggers into one shell-out.
+    fn refresh_commit_graph(&mut self) {
+        if self.graph_fetch_inflight {
+            return;
+        }
+        self.graph_fetch_inflight = true;
+        let root = self.tree.root.clone();
+        let tx = self.graph_tx.clone();
+        std::thread::spawn(move || {
+            let commits = crate::git::commit_graph(&root, 400);
+            let rows = crate::widgets::commit_graph::layout_graph(commits);
+            let _ = tx.send((root, rows));
+        });
+    }
+
+    /// Open a commit's full patch (header, message, diffstat, diff) in a
+    /// read-only scratch tab — the graph's click-through, tig's enter key.
+    fn open_commit_patch(&mut self, hash: &str, short_hash: &str) {
+        match crate::git::show_commit(&self.tree.root, hash) {
+            Ok(text) => {
+                let label = format!("commit {short_hash}");
+                match self.editor.open_text_buffer(Path::new(&label), &text) {
+                    Ok(()) => {
+                        self.focus_pane(Pane::Editor);
+                        self.sync_open_file_poll_mtime();
+                        self.status = format!("Opened commit {short_hash}");
+                    }
+                    Err(e) => self.status = format!("Open commit failed: {e}"),
+                }
+            }
+            Err(e) => self.status = format!("Show commit failed: {e}"),
+        }
     }
 
     fn handle_extensions_key(&mut self, key: KeyEvent) {
@@ -23077,6 +23170,23 @@ impl App {
                 }
                 if in_tree && self.sidebar_view == SidebarView::SourceControl {
                     self.focus_pane(Pane::Tree);
+                    // COMMITS graph: header toggles collapse; a row opens that
+                    // commit's full patch in a read-only tab. Checked first —
+                    // its rect is carved out of the Source Control strip.
+                    if rect_contains(self.commit_graph.last_area, m.column, m.row) {
+                        if rect_contains(self.commit_graph.last_scrollbar, m.column, m.row) {
+                            self.commit_graph.scroll_to_bar_y(m.row);
+                        } else if self.commit_graph.hit_header(m.column, m.row) {
+                            self.commit_graph.toggle_collapse();
+                        } else if let Some((hash, short)) = self
+                            .commit_graph
+                            .commit_at(m.row)
+                            .map(|c| (c.hash.clone(), c.short_hash.clone()))
+                        {
+                            self.open_commit_patch(&hash, &short);
+                        }
+                        return;
+                    }
                     if self.source_control.click_more(m.column, m.row) {
                         self.commit_menu_open = false;
                         self.scm_menu.open = !self.scm_menu.open;
@@ -23863,7 +23973,13 @@ impl App {
                     match self.sidebar_view {
                         SidebarView::Explorer => self.tree.scroll_down(3),
                         SidebarView::Remote => self.remote.scroll_down(3),
-                        SidebarView::SourceControl => self.source_control.scroll_down(3),
+                        SidebarView::SourceControl => {
+                            if rect_contains(self.commit_graph.last_area, m.column, m.row) {
+                                self.commit_graph.scroll_down(3);
+                            } else {
+                                self.source_control.scroll_down(3);
+                            }
+                        }
                         SidebarView::Search => self.search.scroll_down(3),
                         SidebarView::RunDebug => {}
                         SidebarView::Extensions => self.extensions.scroll_down(3),
@@ -23912,7 +24028,13 @@ impl App {
                     match self.sidebar_view {
                         SidebarView::Explorer => self.tree.scroll_up(3),
                         SidebarView::Remote => self.remote.scroll_up(3),
-                        SidebarView::SourceControl => self.source_control.scroll_up(3),
+                        SidebarView::SourceControl => {
+                            if rect_contains(self.commit_graph.last_area, m.column, m.row) {
+                                self.commit_graph.scroll_up(3);
+                            } else {
+                                self.source_control.scroll_up(3);
+                            }
+                        }
                         SidebarView::Search => self.search.scroll_up(3),
                         SidebarView::RunDebug => {}
                         SidebarView::Extensions => self.extensions.scroll_up(3),
@@ -24429,6 +24551,10 @@ impl App {
         // landed inside a real git tree.
         self.git.set_root(new_root.clone());
         self.refresh_git_status_debounced();
+        // Drop the old repo's graph before the refresh (inside
+        // refresh_source_control) refetches for the new root; a reply still
+        // in flight for the old root is dropped by the drain's root tag.
+        self.commit_graph.clear();
         self.refresh_source_control();
         // Rebind the test runner too, else `cargo test -- --list` keeps running
         // in the launch dir captured at spawn (e.g. ~/Documents, no Cargo.toml)

@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Feature,
-    summary: "LSP inlay hints: inferred types and parameter names render inline as dim italic annotations (rust-analyzer, vtsls, gopls), on by default like VS Code; toggle with \"Editor: Toggle Inlay Hints\" or the Settings hub.",
+    summary: "Commit graph in Source Control: a COMMITS section under the change list draws the repo's branch-and-merge rails across local branches and tags, with ref badges and ages; click a commit to open its full patch, and the graph follows HEAD on every commit, checkout, or pull.",
 }];
