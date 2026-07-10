@@ -87,6 +87,7 @@ const CHORDS: &[(&str, &str)] = &[
     ("cmd+shift+n", pl::CMD_SHIFT_N_HEX),
     ("cmd+shift+b", pl::CMD_SHIFT_B_HEX),
     ("cmd+shift+t", pl::CMD_SHIFT_T_HEX),
+    ("cmd+shift+v", pl::CMD_SHIFT_V_HEX),
     // Terminal: new + cycle.
     ("cmd+t", pl::CMD_T_HEX),
     ("cmd+[", pl::CMD_LBRACKET_HEX),

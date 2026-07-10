@@ -3,8 +3,8 @@ use ratatui::{
     buffer::Buffer,
     layout::Rect,
     style::{Color, Modifier, Style},
-    text::{Line, Span},
-    widgets::{Block, Borders, Widget},
+    text::{Line, Span, Text},
+    widgets::{Block, Borders, Paragraph, Widget, Wrap},
 };
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
@@ -1495,6 +1495,9 @@ pub struct Editor {
     /// their default empty state and the renderer paints metadata only;
     /// the actual pixels are emitted as an OSC-1337 inline image overlay
     /// by `App` after each frame.
+    /// Rendered Markdown preview (Cmd/Ctrl+Shift+V) replacing the source view
+    /// while set; rebuilt lazily when `built_seq` falls behind `edit_seq`.
+    pub markdown_preview: Option<crate::markdown::MarkdownPreview>,
     pub image: Option<ImageView>,
     /// Read-only spreadsheet preview for `.csv` / `.tsv` / `.xlsx` / etc.
     /// Mutually exclusive with `image` and the text path; none of the
@@ -1602,6 +1605,7 @@ impl Editor {
             search_highlight: None,
             search_highlight_opts: crate::widgets::search::SearchOpts::default(),
             active_search_match: None,
+            markdown_preview: None,
             image: None,
             sheet: None,
             diff: None,
@@ -2144,6 +2148,7 @@ impl Editor {
         self.last_edit_kind = None;
         self.image = None;
         self.sheet = None;
+        self.markdown_preview = None;
         self.status = format!("Opened {}", path.display());
         // The buffer now matches disk; bump the edit seq so the LSP doc sync
         // sees the new content (an external reload lands here too, and without
@@ -2550,6 +2555,39 @@ impl Editor {
     /// Number of logical lines in the buffer (the inlay-hint request range).
     pub fn line_count(&self) -> usize {
         self.lines.len()
+    }
+
+    /// Markdown: Toggle Preview (Cmd/Ctrl+Shift+V). Returns false when the
+    /// active tab is not a Markdown text buffer (the caller reports why).
+    pub fn toggle_markdown_preview(&mut self) -> bool {
+        if self.markdown_preview.take().is_some() {
+            return true;
+        }
+        let is_md_text = matches!(self.lang, Some(LangKind::Markdown))
+            && self.image.is_none()
+            && self.sheet.is_none()
+            && self.diff.is_none();
+        if !is_md_text {
+            return false;
+        }
+        let text = self.lines.join("\n");
+        let lines = crate::markdown::render_markdown(&text, self.theme, &mut self.registry);
+        self.markdown_preview = Some(crate::markdown::MarkdownPreview {
+            lines,
+            scroll: 0,
+            built_seq: self.edit_seq,
+        });
+        true
+    }
+
+    /// Scroll the active Markdown preview; returns false when none is open
+    /// so the caller falls through to normal buffer scrolling.
+    pub fn scroll_markdown_preview(&mut self, delta: i32) -> bool {
+        let Some(md) = self.markdown_preview.as_mut() else {
+            return false;
+        };
+        md.scroll = md.scroll.saturating_add_signed(delta as i16);
+        true
     }
 
     fn line_char_len(&self, row: usize) -> usize {
@@ -5044,6 +5082,9 @@ impl Editor {
     }
 
     pub fn scroll_up(&mut self, n: usize) {
+        if self.scroll_markdown_preview(-(n as i32)) {
+            return;
+        }
         if self.wrap_enabled() {
             let top = self.top_visual_row(self.visible_text_width());
             self.wrap_set_top(top.saturating_sub(n));
@@ -5053,6 +5094,9 @@ impl Editor {
     }
 
     pub fn scroll_down(&mut self, n: usize) {
+        if self.scroll_markdown_preview(n as i32) {
+            return;
+        }
         if self.wrap_enabled() {
             let top = self.top_visual_row(self.visible_text_width());
             self.wrap_set_top(top.saturating_add(n));
@@ -5109,7 +5153,7 @@ impl Editor {
     /// Rows used for text in the last render (inner height minus the
     /// horizontal scrollbar row when present). Falls back to the full inner
     /// height before the first render populates `last_text_rows`.
-    fn text_rows(&self) -> usize {
+    pub(crate) fn text_rows(&self) -> usize {
         let rows = self.last_text_rows as usize;
         if rows > 0 {
             rows
@@ -5990,6 +6034,10 @@ impl Widget for &mut Editor {
             render_sheet(view, self.path.as_deref(), inner, buf);
             return;
         }
+        if self.markdown_preview.is_some() {
+            self.render_markdown_preview(inner, buf);
+            return;
+        }
         if let Some(diff) = self.diff.as_mut() {
             let (prev_arrow, next_arrow) = render_diff(diff, inner, buf);
             self.diff_prev_arrow = prev_arrow;
@@ -6556,6 +6604,57 @@ impl Widget for &mut Editor {
 }
 
 impl Editor {
+    /// Paint the rendered Markdown preview: the pre-built lines flow through
+    /// a wrapping `Paragraph` so paragraphs reflow with the pane, scrolled by
+    /// the preview's own offset, with a scrollbar over the wrapped height.
+    /// Rebuilds first when the buffer moved under the preview (a live edit in
+    /// a split, an external reload) so it always shows the current text.
+    fn render_markdown_preview(&mut self, inner: Rect, buf: &mut Buffer) {
+        let stale = self
+            .markdown_preview
+            .as_ref()
+            .is_some_and(|md| md.built_seq != self.edit_seq);
+        if stale {
+            let text = self.lines.join("\n");
+            let lines = crate::markdown::render_markdown(&text, self.theme, &mut self.registry);
+            if let Some(md) = self.markdown_preview.as_mut() {
+                md.lines = lines;
+                md.built_seq = self.edit_seq;
+            }
+        }
+        let Some(md) = self.markdown_preview.as_mut() else {
+            return;
+        };
+        // One-cell left margin; the right column stays free for the bar.
+        let text_area = Rect {
+            x: inner.x + 1,
+            width: inner.width.saturating_sub(3),
+            ..inner
+        };
+        if text_area.width == 0 {
+            return;
+        }
+        let para = Paragraph::new(Text::from(md.lines.clone())).wrap(Wrap { trim: false });
+        let total = para.line_count(text_area.width);
+        let max_scroll = total.saturating_sub(inner.height as usize) as u16;
+        md.scroll = md.scroll.min(max_scroll);
+        para.scroll((md.scroll, 0)).render(text_area, buf);
+        if let Some(metrics) = scrollbar::vertical_metrics(
+            Rect {
+                x: inner.x + inner.width.saturating_sub(1),
+                y: inner.y,
+                width: 1,
+                height: inner.height,
+            },
+            total,
+            inner.height as usize,
+            md.scroll as usize,
+        ) {
+            self.last_scrollbar = metrics.area;
+            scrollbar::render_vertical(buf, metrics, self.focused, self.theme);
+        }
+    }
+
     /// Paint logical line `line_idx`'s syntax/semantic-highlighted text at row
     /// `y` from column 0 (no horizontal scroll), clipped to `width`. Used by
     /// the sticky-scroll bar to render pinned scope headers. Assumes the row
@@ -8957,6 +9056,68 @@ mod tests {
             !row.contains("i32"),
             "a newly opened file must not inherit stale hints; got {row:?}"
         );
+    }
+
+    #[test]
+    fn markdown_preview_toggles_renders_and_returns_to_source() {
+        let mut e = editor_with("# Title\n\nSome body text.");
+        e.lang = Some(LangKind::Markdown);
+        assert!(e.toggle_markdown_preview(), "a Markdown tab must toggle");
+        let text = first_row_screen(&mut e, 60, 8);
+        assert!(
+            text.contains("Title") && !text.contains("# Title"),
+            "the preview must render the heading without its # marker; got:\n{text}"
+        );
+        assert!(text.contains("Some body text."), "got:\n{text}");
+        assert!(e.toggle_markdown_preview(), "toggling again returns");
+        assert!(e.markdown_preview.is_none());
+        let text = first_row_screen(&mut e, 60, 8);
+        assert!(
+            text.contains("# Title"),
+            "the source view must show the raw markdown again; got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn markdown_preview_refuses_non_markdown_tabs() {
+        let mut e = editor_with("fn main() {}");
+        e.lang = Some(LangKind::Rust);
+        assert!(!e.toggle_markdown_preview());
+        assert!(e.markdown_preview.is_none());
+    }
+
+    #[test]
+    fn markdown_preview_rebuilds_when_the_buffer_moves() {
+        let mut e = editor_with("# Old heading");
+        e.lang = Some(LangKind::Markdown);
+        assert!(e.toggle_markdown_preview());
+        e.lines[0] = String::from("# New heading");
+        e.edit_seq = e.edit_seq.wrapping_add(1);
+        let text = first_row_screen(&mut e, 60, 8);
+        assert!(
+            text.contains("New heading") && !text.contains("Old heading"),
+            "a stale preview must rebuild against the edited buffer; got:\n{text}"
+        );
+    }
+
+    /// Render into a fresh buffer and return the whole screen as one string.
+    fn first_row_screen(e: &mut Editor, width: u16, height: u16) -> String {
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        };
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        (e as &mut Editor).render(area, &mut buf);
+        let mut out = String::new();
+        for y in 0..height {
+            for x in 0..width {
+                out.push_str(buf[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
     }
 
     #[test]

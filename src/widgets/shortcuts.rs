@@ -332,6 +332,11 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 handler: "is_toggle_wrap_key",
             },
             ShortcutEntry {
+                keys: "Cmd/Ctrl+Shift+V",
+                description: "Markdown: toggle the rendered preview for this file",
+                handler: "is_markdown_preview_key",
+            },
+            ShortcutEntry {
                 keys: "Cmd/Ctrl+Opt+Shift+F",
                 description: "Format Document (reformat the whole buffer via the language server)",
                 handler: "is_format_document_key",

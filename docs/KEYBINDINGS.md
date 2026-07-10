@@ -185,6 +185,7 @@ All three live under `~/.config/croft/` (XDG-resolved, so the same paths on macO
 | `Cmd`+`/` / `Ctrl`+`/` | Toggle line comment for the current line or every line the selection touches (language-aware; comments at the block's common indent) |
 | `Shift`+`Alt`+`A` | Toggle block comment around the selection (languages with a block comment) |
 | `Alt`+`Z` | Toggle soft word wrap for this file (overrides the per-language default until the file is reopened) |
+| `Cmd`/`Ctrl`+`Shift`+`V` | Markdown: Toggle Preview — flip the active Markdown tab between its source and the rendered view (headings, emphasis, lists, quotes, tables, links, and fenced code blocks with the editor's own syntax colours). Arrows / PgUp / PgDn / Home / End / wheel scroll the preview; the same chord returns to the source (also Command Palette "Markdown: Toggle Preview") |
 | `Cmd`+`Shift`+`\` | Go to Bracket: jump the cursor to the matching bracket. From an opening bracket it lands on its close (and vice versa); from inside a pair it lands on the enclosing close |
 | `Cmd`+`Opt`+`\` | Select to Bracket: select the region between the matching brackets, including the brackets themselves |
 | `Ctrl`+`T` | Transpose Characters: swap the character before the cursor with the one after it and step right; at the end of a line the last character moves across the line break |

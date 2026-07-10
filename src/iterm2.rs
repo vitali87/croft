@@ -173,6 +173,13 @@ const CMD_SHIFT_R_HEX: &str = "0x1b 0x5b 0x38 0x32 0x3b 0x31 0x30 0x75";
 /// case-insensitively by `is_extensions_jump_key`.
 const CMD_SHIFT_X_KEY: &str = "0x58-0x120000-0x7";
 const CMD_SHIFT_X_HEX: &str = "0x1b 0x5b 0x38 0x38 0x3b 0x31 0x30 0x75";
+/// `Cmd+Shift+V` — Markdown: Toggle Preview (the VS Code default chord).
+/// iTerm2 binds the bare chord to Edit > Paste Special > "Paste Selection";
+/// the NSUserKeyEquivalents override below relocates that item to
+/// Cmd+Opt+Shift+V so this forwarder fires instead. Codepoint 'V' (0x56 =
+/// 86), virtualKeyCode `kVK_ANSI_V` = 0x09. CSI-u `ESC [ 86 ; 10 u`.
+const CMD_SHIFT_V_KEY: &str = "0x56-0x120000-0x9";
+const CMD_SHIFT_V_HEX: &str = "0x1b 0x5b 0x38 0x36 0x3b 0x31 0x30 0x75";
 /// `Cmd+Shift+L` — disconnect a remote session and drop back into the local
 /// croft. Codepoint 'L' (0x4c = 76), virtualKeyCode `kVK_ANSI_L` = 0x25.
 /// CSI-u `ESC [ 76 ; 10 u`. Forwarded defensively so AppKit / iTerm2 cannot
@@ -552,6 +559,7 @@ pub(crate) mod payloads {
     pub(crate) const CMD_SHIFT_S_HEX: &str = super::CMD_SHIFT_S_HEX;
     pub(crate) const CMD_SHIFT_SLASH_HEX: &str = super::CMD_SHIFT_SLASH_HEX;
     pub(crate) const CMD_SHIFT_T_HEX: &str = super::CMD_SHIFT_T_HEX;
+    pub(crate) const CMD_SHIFT_V_HEX: &str = super::CMD_SHIFT_V_HEX;
     pub(crate) const CMD_SHIFT_X_HEX: &str = super::CMD_SHIFT_X_HEX;
     pub(crate) const CMD_SLASH_HEX: &str = super::CMD_SLASH_HEX;
     pub(crate) const CMD_T_HEX: &str = super::CMD_T_HEX;
@@ -715,6 +723,10 @@ pub fn apply_croft_key_settings(plist: &mut Value) -> Result<(), ITerm2Error> {
     // croft's terminal-focus chord can claim it. Cmd+Opt+Shift+T keeps
     // the iTerm2 action reachable on a chord croft does not use.
     set_string(menu, "Restore Closed Session", "@~T".to_string());
+    // Relocate Edit > Paste Special > "Paste Selection" off Cmd+Shift+V so
+    // croft's Markdown preview toggle can claim it. Cmd+Opt+Shift+V keeps
+    // the iTerm2 action reachable on a chord croft does not use.
+    set_string(menu, "Paste Selection", "@~V".to_string());
     // Relocate iTerm2's "Password Manager" off Cmd+Opt+F so croft's
     // Replace in File chord can claim it. Cmd+Opt+Ctrl+F keeps the
     // password manager reachable on a chord croft does not use.
@@ -797,6 +809,7 @@ pub fn apply_croft_key_settings(plist: &mut Value) -> Result<(), ITerm2Error> {
         (CMD_SHIFT_D_KEY, CMD_SHIFT_D_HEX),
         (CMD_SHIFT_R_KEY, CMD_SHIFT_R_HEX),
         (CMD_SHIFT_X_KEY, CMD_SHIFT_X_HEX),
+        (CMD_SHIFT_V_KEY, CMD_SHIFT_V_HEX),
         (CMD_SHIFT_L_KEY, CMD_SHIFT_L_HEX),
         (CMD_SHIFT_N_KEY, CMD_SHIFT_N_HEX),
         (CMD_SHIFT_T_KEY, CMD_SHIFT_T_HEX),
@@ -1578,6 +1591,32 @@ mod tests {
                 .and_then(|v| v.as_string()),
             Some("@~T"),
             "iTerm2's Restore Closed Session must be relocated off Cmd+Shift+T so croft's terminal-focus chord can claim it; @~T = Cmd+Opt+Shift+T keeps the iTerm2 action reachable on a chord croft does not use"
+        );
+    }
+
+    #[test]
+    fn apply_croft_key_settings_forwards_cmd_shift_v_for_markdown_preview() {
+        let mut plist = synth_plist("GUID-1", &["GUID-1"]);
+        apply_croft_key_settings(&mut plist).unwrap();
+        let top = plist.as_dictionary().unwrap();
+        let global = dict_in(top, "GlobalKeyMap");
+        assert_eq!(
+            action_text(global, CMD_SHIFT_V_KEY),
+            CMD_SHIFT_V_HEX,
+            "GlobalKeyMap must forward Cmd+Shift+V as a CSI-u sequence so croft's `is_markdown_preview_key` toggles the rendered Markdown preview. Encoding: 'V' (codepoint 0x56 = 86) with kitty modifier byte 10 = 1 base + Shift(1) + Super(8), giving `ESC [ 86 ; 10 u`"
+        );
+    }
+
+    #[test]
+    fn apply_croft_key_settings_relocates_paste_selection_menu_off_cmd_shift_v() {
+        let mut plist = synth_plist("GUID-1", &["GUID-1"]);
+        apply_croft_key_settings(&mut plist).unwrap();
+        let top = plist.as_dictionary().unwrap();
+        let menu = dict_in(top, "NSUserKeyEquivalents");
+        assert_eq!(
+            menu.get("Paste Selection").and_then(|v| v.as_string()),
+            Some("@~V"),
+            "iTerm2's Paste Special > Paste Selection must be relocated off Cmd+Shift+V so croft's Markdown preview toggle can claim it; @~V = Cmd+Opt+Shift+V keeps the iTerm2 action reachable on a chord croft does not use"
         );
     }
 

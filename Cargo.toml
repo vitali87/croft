@@ -1,6 +1,6 @@
 [package]
 name = "croft"
-version = "0.1.613"
+version = "0.1.614"
 edition = "2024"
 description = "VSCode-style TUI written in Rust"
 license = "MIT"
@@ -47,6 +47,11 @@ tree-sitter-go = "0.25"
 tree-sitter-html = "0.23"
 tree-sitter-css = "0.25"
 tree-sitter-bash = "0.25"
+
+# CommonMark parser behind the rendered Markdown preview (Cmd+Shift+V).
+# rustdoc / mdBook's engine; parser only, no HTML output needed.
+# 0.13.4 verified current on crates.io 2026-07-11.
+pulldown-cmark = { version = "0.13", default-features = false }
 
 ignore = "0.4"
 grep-searcher = "0.1"

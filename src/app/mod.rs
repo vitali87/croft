@@ -16114,7 +16114,24 @@ impl App {
     /// read-only diff / spreadsheet / image preview), so text-editing chords
     /// know whether to act.
     fn editor_is_text(&self) -> bool {
-        self.editor.diff.is_none() && self.editor.sheet.is_none() && self.editor.image.is_none()
+        self.editor.diff.is_none()
+            && self.editor.sheet.is_none()
+            && self.editor.image.is_none()
+            && self.editor.markdown_preview.is_none()
+    }
+
+    /// Markdown: Toggle Preview — flips the active tab between source and the
+    /// rendered view; explains itself on a non-Markdown tab.
+    fn toggle_markdown_preview(&mut self) {
+        if self.editor.toggle_markdown_preview() {
+            self.status = if self.editor.markdown_preview.is_some() {
+                String::from("Markdown Preview")
+            } else {
+                String::from("Markdown source")
+            };
+        } else {
+            self.status = String::from("Markdown Preview needs a Markdown file");
+        }
     }
 
     fn handle_editor_key(&mut self, key: KeyEvent) {
@@ -16129,6 +16146,41 @@ impl App {
         }
         if is_editor_replace_key(key) {
             self.open_editor_replace();
+            return;
+        }
+        // Markdown: Toggle Preview (Cmd/Ctrl+Shift+V, the VS Code default).
+        if is_markdown_preview_key(key) {
+            self.toggle_markdown_preview();
+            return;
+        }
+        // While the rendered preview is up the buffer is not visible, so
+        // navigation scrolls the preview and every other key is swallowed
+        // (no invisible edits). Cmd+Shift+V above flips back to the source.
+        if self.editor.markdown_preview.is_some() {
+            let page = self.editor.text_rows() as i32;
+            match key.code {
+                KeyCode::Up => {
+                    self.editor.scroll_markdown_preview(-1);
+                }
+                KeyCode::Down => {
+                    self.editor.scroll_markdown_preview(1);
+                }
+                KeyCode::PageUp => {
+                    self.editor.scroll_markdown_preview(-page);
+                }
+                KeyCode::PageDown | KeyCode::Char(' ') => {
+                    self.editor.scroll_markdown_preview(page);
+                }
+                KeyCode::Home => {
+                    self.editor.scroll_markdown_preview(i16::MIN as i32);
+                }
+                // The render pass clamps to the wrapped height, so jumping
+                // far past the end lands exactly on the last page.
+                KeyCode::End => {
+                    self.editor.scroll_markdown_preview(i16::MAX as i32);
+                }
+                _ => {}
+            }
             return;
         }
         // Completion popup intercepts navigation / accept / dismiss keys
@@ -20169,6 +20221,7 @@ impl App {
             Cmd::ToggleAutoSave => self.toggle_auto_save(),
             Cmd::ToggleInlineBlame => self.toggle_inline_blame(),
             Cmd::ToggleInlayHints => self.toggle_inlay_hints(),
+            Cmd::ToggleMarkdownPreview => self.toggle_markdown_preview(),
             Cmd::ToggleTerminalTimestamps => self.toggle_terminal_timestamps(),
             Cmd::RestoreSnapshot => self.restore_history_snapshot(),
             Cmd::QuickFix => self.start_code_action(),
@@ -27239,6 +27292,13 @@ fn is_drop_to_local_key(key: KeyEvent) -> bool {
 /// Cmd+Ctrl+B so this chord reaches croft.
 fn is_run_build_task_key(key: KeyEvent) -> bool {
     is_cmd_shift_letter(key, 'b')
+}
+
+/// `Cmd/Ctrl+Shift+V`: Markdown: Toggle Preview (the VS Code default chord).
+/// iTerm2 binds the same chord to Paste Special > "Paste Selection" —
+/// `setup-iterm2` relocates that menu item so this chord reaches croft.
+fn is_markdown_preview_key(key: KeyEvent) -> bool {
+    is_cmd_shift_letter(key, 'v')
 }
 
 /// Milliseconds since the Unix epoch, for stamping local-history snapshots

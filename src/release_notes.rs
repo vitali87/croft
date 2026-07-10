@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Feature,
-    summary: "Commit graph in Source Control: a COMMITS section under the change list draws the repo's branch-and-merge rails across local branches and tags, with ref badges and ages; click a commit to open its full patch, and the graph follows HEAD on every commit, checkout, or pull.",
+    summary: "Rendered Markdown preview on Cmd/Ctrl+Shift+V: headings, lists, task checkboxes, quotes, aligned tables, links, and fenced code blocks in the editor's own syntax colours, reflowing with the pane and following your edits; the same chord flips back to the source.",
 }];
