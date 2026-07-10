@@ -553,6 +553,7 @@ fn render_diff(
                     find_opts,
                     diff.scroll_x,
                     active,
+                    &[],
                 );
             }
             if r_right_idx.is_some() && r_text_w > 0 {
@@ -569,6 +570,7 @@ fn render_diff(
                     find_opts,
                     diff.scroll_x,
                     active,
+                    &[],
                 );
             }
         }
@@ -587,6 +589,7 @@ fn render_diff(
                     &l_text,
                     needle,
                     diff.scroll_x,
+                    &[],
                 );
             }
             if r_right_idx.is_some() && r_text_w > 0 {
@@ -598,6 +601,7 @@ fn render_diff(
                     &r_text,
                     needle,
                     diff.scroll_x,
+                    &[],
                 );
             }
         }
@@ -1457,6 +1461,17 @@ pub struct Editor {
     /// severity)`, recomputed from `diagnostics` whenever they or the buffer
     /// change. The render loop paints a coloured underline over each run.
     diagnostic_spans: Vec<Vec<(usize, usize, crate::lsp::manager::DiagnosticSeverity)>>,
+    /// Inlay hints for the loaded file, retained with their raw LSP UTF-16
+    /// positions so `inlay_spans` can be re-decoded against the buffer after
+    /// each edit. `inlay_path` guards a stale batch from annotating the wrong
+    /// file after a tab switch, exactly as `diagnostics_path` does.
+    inlay_hints: Vec<crate::lsp::manager::InlayHintItem>,
+    inlay_path: Option<PathBuf>,
+    /// Decoded per-logical-line hint runs `(char_col, label)`, sorted by
+    /// column. The render loop splices each label into the row as dim italic
+    /// virtual cells at its anchor; every overlay painter, the caret, and
+    /// mouse mapping translate buffer columns past them.
+    inlay_spans: Vec<Vec<(usize, String)>>,
     registry: LangRegistry,
     /// When set, every occurrence of this string in the visible portion of
     /// the buffer is overpainted with the search-match style after the
@@ -1580,6 +1595,9 @@ impl Editor {
             diagnostics: Vec::new(),
             diagnostics_path: None,
             diagnostic_spans: Vec::new(),
+            inlay_hints: Vec::new(),
+            inlay_path: None,
+            inlay_spans: Vec::new(),
             registry: LangRegistry::new(),
             search_highlight: None,
             search_highlight_opts: crate::widgets::search::SearchOpts::default(),
@@ -1876,7 +1894,18 @@ impl Editor {
         let cols = self
             .lines
             .iter()
-            .map(|l| l.chars().count())
+            .enumerate()
+            .map(|(i, l)| {
+                // Spliced hint cells widen the line's display, so the
+                // horizontal extent must include them or the tail of a long
+                // hinted line could never scroll into view.
+                let extra: usize = self
+                    .inlay_spans
+                    .get(i)
+                    .map(|hs| hs.iter().map(|(_, label)| label.chars().count()).sum())
+                    .unwrap_or(0);
+                l.chars().count() + extra
+            })
             .max()
             .unwrap_or(0);
         self.hscroll_content_cols = Some(cols);
@@ -2128,6 +2157,11 @@ impl Editor {
         self.semantic_data = Vec::new();
         self.semantic_overlay = Vec::new();
         self.semantic_is_full = false;
+        // Same for inlay hints: anchors measured against another file's text
+        // must never splice into this one.
+        self.inlay_hints = Vec::new();
+        self.inlay_path = None;
+        self.inlay_spans = Vec::new();
         self.recompute_highlights();
         Ok(())
     }
@@ -2296,6 +2330,7 @@ impl Editor {
         }
         self.recompute_semantic_overlay();
         self.recompute_diagnostic_spans();
+        self.recompute_inlay_spans();
     }
 
     /// Store a fresh semantic-token batch from the LSP and decode it into
@@ -2322,6 +2357,65 @@ impl Editor {
         self.semantic_legend = Some(legend);
         self.semantic_is_full = is_full;
         self.recompute_semantic_overlay();
+    }
+
+    /// Store a fresh inlay-hint set from the LSP and decode it into per-line
+    /// `(char_col, label)` runs. Called by the app when `drain_inlay_hints`
+    /// yields a batch for this editor's file (an empty set clears them).
+    pub fn apply_inlay_hints(
+        &mut self,
+        path: PathBuf,
+        hints: Vec<crate::lsp::manager::InlayHintItem>,
+    ) {
+        self.inlay_path = Some(path);
+        self.inlay_hints = hints;
+        self.recompute_inlay_spans();
+    }
+
+    /// Drop every inlay hint (the "Editor: Toggle Inlay Hints" off switch).
+    pub fn clear_inlay_hints(&mut self) {
+        self.inlay_hints = Vec::new();
+        self.inlay_path = None;
+        self.recompute_inlay_spans();
+    }
+
+    /// Re-decode the retained hints into per-logical-line `(char_col, label)`
+    /// runs against the current buffer. A no-op (clears the runs) unless the
+    /// batch belongs to the loaded file. Between an edit and the next reply
+    /// the anchors drift with the old positions (clamped to the line), exactly
+    /// like VS Code until its refresh lands; the app replaces the set once the
+    /// server answers for the new edit seq.
+    fn recompute_inlay_spans(&mut self) {
+        // Hint cells change the display width of their lines.
+        self.hscroll_content_cols = None;
+        let same_file = self.inlay_path.as_deref() == self.path.as_deref();
+        if !same_file || self.inlay_hints.is_empty() {
+            self.inlay_spans = Vec::new();
+            return;
+        }
+        let mut spans: Vec<Vec<(usize, String)>> = vec![Vec::new(); self.lines.len()];
+        for h in &self.inlay_hints {
+            let Some(text) = self.lines.get(h.line as usize) else {
+                continue;
+            };
+            let col = utf16_to_char_col(text, h.character).min(text.chars().count());
+            spans[h.line as usize].push((col, h.label.clone()));
+        }
+        for line in &mut spans {
+            line.sort_by_key(|(c, _)| *c);
+        }
+        self.inlay_spans = spans;
+    }
+
+    /// Inlay hints of logical line `line`, or nothing in wrap mode: the
+    /// wrapped row segmentation knows nothing about hint cells.
+    /// ponytail: hints skip wrap mode; code files don't wrap by default, and
+    /// Markdown (the wrapping default) has no hint-serving server.
+    fn row_inlay_spans(&self, line: usize) -> &[(usize, String)] {
+        if self.wrap_enabled() {
+            return &[];
+        }
+        self.inlay_spans.get(line).map(Vec::as_slice).unwrap_or(&[])
     }
 
     /// The buffer text to key a semantic-token cache entry on, but only when
@@ -2451,6 +2545,11 @@ impl Editor {
         let line_starts = compute_line_starts(bytes);
         self.semantic_overlay =
             decode_semantic_tokens(&self.semantic_data, legend, bytes, &line_starts);
+    }
+
+    /// Number of logical lines in the buffer (the inlay-hint request range).
+    pub fn line_count(&self) -> usize {
+        self.lines.len()
     }
 
     fn line_char_len(&self, row: usize) -> usize {
@@ -4872,8 +4971,22 @@ impl Editor {
         }
         if self.cursor_col < self.scroll_col {
             self.scroll_col = self.cursor_col;
-        } else if self.cursor_col >= self.scroll_col + width {
-            self.scroll_col = self.cursor_col + 1 - width;
+        } else {
+            // Hint cells between the scroll origin and the caret consume
+            // viewport width too. Scrolling right drops leading hints out of
+            // the row, so re-measure until the caret fits (the loop is
+            // bounded: `scroll_col` only grows, capped at `cursor_col`).
+            loop {
+                let extra = self.inlay_cells_before_cursor(self.cursor_row, self.scroll_col);
+                if self.cursor_col + extra < self.scroll_col + width {
+                    break;
+                }
+                let target = (self.cursor_col + extra + 1).saturating_sub(width);
+                if target <= self.scroll_col {
+                    break;
+                }
+                self.scroll_col = target.min(self.cursor_col);
+            }
         }
     }
 
@@ -5242,7 +5355,29 @@ impl Editor {
         if visible_col >= text_width as usize {
             return None;
         }
-        let char_col = (visible_col + self.scroll_col).min(self.line_char_len(line));
+        let line_len = self.line_char_len(line);
+        let hints = self.row_inlay_spans(line);
+        if !hints.is_empty() {
+            // Invert the hint-splice display map: the first buffer column
+            // whose display cell reaches the click. A click landing inside a
+            // hint's own cells resolves to its anchor column, so the caret
+            // snaps beside the code the hint annotates.
+            let target = self.scroll_col + visible_col;
+            let mut c = self.scroll_col;
+            while c < line_len {
+                let extra: usize = hints
+                    .iter()
+                    .filter(|(hc, _)| *hc >= self.scroll_col && *hc <= c)
+                    .map(|(_, l)| l.chars().count())
+                    .sum();
+                if c + extra >= target {
+                    break;
+                }
+                c += 1;
+            }
+            return Some((line, c.min(line_len)));
+        }
+        let char_col = (visible_col + self.scroll_col).min(line_len);
         Some((line, char_col))
     }
 
@@ -6174,20 +6309,61 @@ impl Widget for &mut Editor {
             // has an opinion, syntax fills the gaps (the "combined" model).
             let sem_spans = self.semantic_overlay.get(line_idx).unwrap_or(&empty);
             let merged = merge_overlay(line_spans, sem_spans);
-            // Shift highlight spans to the row origin and clip them to the
-            // segment so build_line_spans never slices past `visible_raw`.
-            let shifted: Vec<HiSpan> = shift_spans_for_view(&merged, byte_start)
-                .into_iter()
-                .filter_map(|mut sp| {
-                    if sp.start >= seg_bytes {
-                        return None;
-                    }
-                    sp.end = sp.end.min(seg_bytes);
-                    Some(sp)
-                })
+            // Inlay hints anchored inside this row's window, as (anchor col,
+            // display cells) pairs. A hint's label is spliced into the row
+            // BEFORE the character at its anchor; every buffer column at or
+            // past an anchor therefore paints `inlay_cells_before` cells
+            // further right, and each overlay painter below translates its
+            // columns through that same map so highlights, underlines, and
+            // carets stay glued to their glyphs.
+            let hint_cap = row_end.min(line_len);
+            let hint_cells: Vec<(usize, usize)> = self
+                .row_inlay_spans(line_idx)
+                .iter()
+                .filter(|(hc, _)| *hc >= row_start && *hc <= hint_cap)
+                .map(|(hc, l)| (*hc, l.chars().count()))
                 .collect();
-            let spans = build_line_spans(visible_raw, &shifted);
-            buf.set_line(text_x, y, &Line::from(spans), row_width);
+            let ex = |c: usize| inlay_cells_before(&hint_cells, c);
+            if hint_cells.is_empty() {
+                // Shift highlight spans to the row origin and clip them to the
+                // segment so build_line_spans never slices past `visible_raw`.
+                let shifted: Vec<HiSpan> = shift_spans_for_view(&merged, byte_start)
+                    .into_iter()
+                    .filter_map(|mut sp| {
+                        if sp.start >= seg_bytes {
+                            return None;
+                        }
+                        sp.end = sp.end.min(seg_bytes);
+                        Some(sp)
+                    })
+                    .collect();
+                let spans = build_line_spans(visible_raw, &shifted);
+                buf.set_line(text_x, y, &Line::from(spans), row_width);
+            } else {
+                // Splice each hint label between the text segments it splits.
+                // Style A (Zed's look): dim italic text, one shade quieter
+                // than comments, no chip background.
+                let hint_style = Style::default()
+                    .fg(self.theme.ignored_fg())
+                    .add_modifier(Modifier::ITALIC);
+                let mut out: Vec<Span> = Vec::new();
+                let mut from = row_start;
+                for (hcol, label) in self
+                    .row_inlay_spans(line_idx)
+                    .iter()
+                    .filter(|(hc, _)| *hc >= row_start && *hc <= hint_cap)
+                {
+                    if *hcol > from {
+                        out.extend(inlay_text_segment(raw, &merged, from, *hcol));
+                    }
+                    out.push(Span::styled(label.clone(), hint_style));
+                    from = from.max(*hcol);
+                }
+                if row_end > from {
+                    out.extend(inlay_text_segment(raw, &merged, from, row_end));
+                }
+                buf.set_line(text_x, y, &Line::from(out), row_width);
+            }
 
             // Merge-conflict region tints (VS Code's current/incoming
             // backgrounds), painted right after the text so diagnostics,
@@ -6205,8 +6381,10 @@ impl Widget for &mut Editor {
             let empty_diag: Vec<(usize, usize, crate::lsp::manager::DiagnosticSeverity)> =
                 Vec::new();
             for &(sc, ec, severity) in self.diagnostic_spans.get(line_idx).unwrap_or(&empty_diag) {
-                let vs = sc.saturating_sub(row_start);
-                let ve = ec.saturating_sub(row_start);
+                let vs = (sc + ex(sc)).saturating_sub(row_start);
+                // The exclusive end shifts by the hints before its LAST char,
+                // so an underline never swallows a hint anchored right at it.
+                let ve = (ec + ex(ec.saturating_sub(1))).saturating_sub(row_start);
                 if ve > vs {
                     paint_diagnostic_underline(buf, text_x, y, row_width, vs, ve, severity);
                 }
@@ -6227,11 +6405,21 @@ impl Widget for &mut Editor {
                     self.search_highlight_opts,
                     row_start,
                     active_on_line,
+                    &hint_cells,
                 );
             }
 
             if let Some(needle) = occ_needle.as_deref() {
-                paint_selection_occurrences(buf, text_x, y, row_width, raw, needle, row_start);
+                paint_selection_occurrences(
+                    buf,
+                    text_x,
+                    y,
+                    row_width,
+                    raw,
+                    needle,
+                    row_start,
+                    &hint_cells,
+                );
             }
 
             if let Some(((sr, sc), (er, ec))) = sel_norm
@@ -6242,8 +6430,9 @@ impl Widget for &mut Editor {
                 // For non-final selected rows, paint past the content by one
                 // cell to make the trailing newline visible.
                 let sel_end = if line_idx == er { ec } else { line_len + 1 };
-                let visible_start = sel_start.saturating_sub(row_start);
-                let visible_end = sel_end.saturating_sub(row_start);
+                let visible_start = (sel_start + ex(sel_start)).saturating_sub(row_start);
+                let visible_end =
+                    (sel_end + ex(sel_end.saturating_sub(1))).saturating_sub(row_start);
                 if visible_end > visible_start {
                     paint_selection_band(buf, text_x, y, row_width, visible_start, visible_end);
                 }
@@ -6255,7 +6444,13 @@ impl Widget for &mut Editor {
                 for pos in [open, close] {
                     if pos.0 == line_idx {
                         paint_bracket_match(
-                            buf, text_x, y, row_width, pos.1, row_start, self.theme,
+                            buf,
+                            text_x,
+                            y,
+                            row_width,
+                            pos.1 + ex(pos.1),
+                            row_start,
+                            self.theme,
                         );
                     }
                 }
@@ -6270,8 +6465,8 @@ impl Widget for &mut Editor {
                 if line_idx >= cr0 && line_idx <= cr1 {
                     let cs = if line_idx == cr0 { cc0 } else { 0 };
                     let ce = if line_idx == cr1 { cc1 } else { line_len + 1 };
-                    let vs = cs.saturating_sub(row_start);
-                    let ve = ce.saturating_sub(row_start);
+                    let vs = (cs + ex(cs)).saturating_sub(row_start);
+                    let ve = (ce + ex(ce.saturating_sub(1))).saturating_sub(row_start);
                     if ve > vs {
                         paint_selection_band(buf, text_x, y, row_width, vs, ve);
                     }
@@ -6282,7 +6477,7 @@ impl Widget for &mut Editor {
                     && c >= row_start
                     && (c < row_end || (c == row_end && row_end == line_len));
                 if on_row {
-                    paint_block_cursor(buf, text_x, y, row_width, c, row_start);
+                    paint_block_cursor(buf, text_x, y, row_width, c + ex(c), row_start);
                 }
             }
 
@@ -6295,7 +6490,7 @@ impl Widget for &mut Editor {
                 && row_end >= line_len
                 && let Some(note) = self.current_line_blame_annotation()
             {
-                let text_cols = line_len.saturating_sub(row_start);
+                let text_cols = (line_len + ex(line_len)).saturating_sub(row_start);
                 let start_x = text_x + text_cols as u16 + 2;
                 let right = inner.x + inner.width;
                 if start_x < right {
@@ -6447,7 +6642,11 @@ impl Editor {
         if text_width == 0 || self.cursor_col < self.scroll_col {
             return None;
         }
-        let visible_col = self.cursor_col - self.scroll_col;
+        // Inlay-hint cells before the caret shift it right. Strictly-before
+        // (`hc < cursor_col`, not `<=`): a caret AT a hint's anchor sits left
+        // of the hint, like VS Code, so typing there pushes the hint along.
+        let extra = self.inlay_cells_before_cursor(self.cursor_row, self.scroll_col);
+        let visible_col = self.cursor_col - self.scroll_col + extra;
         if (visible_col as u16) >= text_width {
             return None;
         }
@@ -6455,6 +6654,16 @@ impl Editor {
             text_x + visible_col as u16,
             self.last_inner.y + row_in_view as u16,
         ))
+    }
+
+    /// Hint cells spliced between `scroll_col` and the caret on `line`
+    /// (anchors strictly before `cursor_col`, at or past `scroll_col`).
+    fn inlay_cells_before_cursor(&self, line: usize, scroll_col: usize) -> usize {
+        self.row_inlay_spans(line)
+            .iter()
+            .filter(|(hc, _)| *hc >= scroll_col && *hc < self.cursor_col)
+            .map(|(_, l)| l.chars().count())
+            .sum()
     }
 
     /// Screen cell of the diff view's read-only caret (its selection head),
@@ -6514,6 +6723,43 @@ impl Editor {
 /// to `split_for_highlight` so the highlight rule stays 1:1 with the
 /// search-engine matcher; column conversion uses `chars().count()` over
 /// the byte prefix to stay correct for Unicode.
+/// Hint cells inserted at or before buffer column `c` on this row: the
+/// display-column shift every overlay painter applies past inlay hints.
+/// `hints` is the row's visible (anchor col, label cells) set.
+fn inlay_cells_before(hints: &[(usize, usize)], c: usize) -> usize {
+    hints
+        .iter()
+        .filter(|(hc, _)| *hc <= c)
+        .map(|(_, n)| n)
+        .sum()
+}
+
+/// The syntax-highlighted spans of `raw`'s character range `[from, to)`,
+/// clipped out of the line's merged highlight spans. Paints the text
+/// segments between spliced inlay-hint labels.
+fn inlay_text_segment<'a>(
+    raw: &'a str,
+    merged: &[HiSpan],
+    from: usize,
+    to: usize,
+) -> Vec<Span<'a>> {
+    let byte_from = byte_index_of_char(raw, from);
+    let byte_to = byte_index_of_char(raw, to);
+    let seg = &raw[byte_from..byte_to];
+    let seg_bytes = byte_to - byte_from;
+    let shifted: Vec<HiSpan> = shift_spans_for_view(merged, byte_from)
+        .into_iter()
+        .filter_map(|mut sp| {
+            if sp.start >= seg_bytes {
+                return None;
+            }
+            sp.end = sp.end.min(seg_bytes);
+            Some(sp)
+        })
+        .collect();
+    build_line_spans(seg, &shifted)
+}
+
 // Render helper: each argument is an independent painting input (buffer,
 // geometry, text, styling); bundling them into a struct would add indirection
 // without improving clarity.
@@ -6528,6 +6774,7 @@ fn paint_search_highlight(
     opts: crate::widgets::search::SearchOpts,
     scroll_col: usize,
     active_match_on_line: Option<(usize, usize)>,
+    hints: &[(usize, usize)],
 ) {
     if needle.is_empty() {
         return;
@@ -6560,7 +6807,7 @@ fn paint_search_highlight(
                 if absolute < scroll_col {
                     continue;
                 }
-                let col = (absolute - scroll_col) as u16;
+                let col = (absolute + inlay_cells_before(hints, absolute) - scroll_col) as u16;
                 if col >= text_width {
                     break;
                 }
@@ -6580,6 +6827,8 @@ fn paint_search_highlight(
 /// background is repainted, so syntax foreground colours show through. The
 /// active selection itself is overpainted afterwards by
 /// `paint_selection_band` with a brighter blue, giving the two-tone look.
+// Render helper: same independent-inputs shape as paint_search_highlight.
+#[allow(clippy::too_many_arguments)]
 fn paint_selection_occurrences(
     buf: &mut Buffer,
     text_x: u16,
@@ -6588,6 +6837,7 @@ fn paint_selection_occurrences(
     raw_line: &str,
     needle: &str,
     scroll_col: usize,
+    hints: &[(usize, usize)],
 ) {
     if needle.is_empty() {
         return;
@@ -6603,7 +6853,7 @@ fn paint_selection_occurrences(
             if absolute < scroll_col {
                 continue;
             }
-            let col = (absolute - scroll_col) as u16;
+            let col = (absolute + inlay_cells_before(hints, absolute) - scroll_col) as u16;
             if col >= text_width {
                 break;
             }
@@ -8545,6 +8795,168 @@ mod tests {
         (&mut e as &mut Editor).render(area, &mut buf);
         assert_eq!(buf[(0, 0)].symbol(), "\u{250c}");
         assert_eq!(buf[(0, 0)].fg, Color::Rgb(0x4e, 0x9a, 0xff));
+    }
+
+    fn inlay(line: u32, character: u32, label: &str) -> crate::lsp::manager::InlayHintItem {
+        crate::lsp::manager::InlayHintItem {
+            line,
+            character,
+            label: label.to_string(),
+        }
+    }
+
+    /// Render `e` into a fresh 60x5 buffer and return the full text of the
+    /// first content row (y = 1, inside the border).
+    fn first_row_text(e: &mut Editor) -> String {
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 5,
+        };
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        (e as &mut Editor).render(area, &mut buf);
+        (0..area.width)
+            .map(|x| buf[(x, 1)].symbol().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn inlay_hint_splices_dim_italic_label_into_the_row() {
+        let mut e = editor_with("let x = f(y);");
+        let p = std::path::PathBuf::from("/tmp/hints.rs");
+        e.path = Some(p.clone());
+        e.apply_inlay_hints(p, vec![inlay(0, 5, ": i32"), inlay(0, 10, "n: ")]);
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 5,
+        };
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        (&mut e as &mut Editor).render(area, &mut buf);
+        let row: String = (0..area.width)
+            .map(|x| buf[(x, 1)].symbol().to_string())
+            .collect();
+        assert!(
+            row.contains("let x: i32 = f(n: y);"),
+            "hints must splice into the rendered row; got {row:?}"
+        );
+        // The hint cells are dim italic; the real code cells are not.
+        let hint_fg = e.theme.ignored_fg();
+        let hint_x = (0..area.width)
+            .find(|&x| {
+                buf[(x, 1)].symbol() == "i"
+                    && buf[(x + 1, 1)].symbol() == "3"
+                    && buf[(x + 2, 1)].symbol() == "2"
+            })
+            .expect("the i32 hint must be on the row");
+        for dx in 0..3 {
+            let cell = &buf[(hint_x + dx, 1)];
+            assert!(
+                cell.modifier.contains(Modifier::ITALIC),
+                "hint cells must be italic"
+            );
+            assert_eq!(cell.fg, hint_fg, "hint cells must use the muted grey");
+        }
+        let code_x = (0..area.width)
+            .find(|&x| buf[(x, 1)].symbol() == "x")
+            .expect("the x binding must be on the row");
+        assert!(
+            !buf[(code_x, 1)].modifier.contains(Modifier::ITALIC),
+            "real code cells must stay non-italic"
+        );
+    }
+
+    #[test]
+    fn inlay_hints_for_another_file_do_not_paint() {
+        let mut e = editor_with("let x = f(y);");
+        e.path = Some(std::path::PathBuf::from("/tmp/current.rs"));
+        e.apply_inlay_hints(
+            std::path::PathBuf::from("/tmp/other.rs"),
+            vec![inlay(0, 5, ": i32")],
+        );
+        let row = first_row_text(&mut e);
+        assert!(
+            row.contains("let x = f(y);") && !row.contains("i32"),
+            "hints for a different file must not paint; got {row:?}"
+        );
+    }
+
+    #[test]
+    fn wrap_mode_suppresses_inlay_hints() {
+        let mut e = editor_with("let x = f(y);");
+        let p = std::path::PathBuf::from("/tmp/hints.rs");
+        e.path = Some(p.clone());
+        e.apply_inlay_hints(p, vec![inlay(0, 5, ": i32")]);
+        e.wrap_override = Some(true);
+        let row = first_row_text(&mut e);
+        assert!(
+            row.contains("let x = f(y);") && !row.contains("i32"),
+            "wrap mode must render the raw text unshifted; got {row:?}"
+        );
+    }
+
+    #[test]
+    fn cursor_screen_pos_shifts_past_inlay_hints() {
+        let mut e = editor_with("let x = f(y);");
+        let p = std::path::PathBuf::from("/tmp/hints.rs");
+        e.path = Some(p.clone());
+        e.apply_inlay_hints(p, vec![inlay(0, 5, ": i32")]);
+        e.focused = true;
+        let _ = first_row_text(&mut e);
+        let text_x = e.last_inner.x + e.last_gutter_width + 1;
+        // Caret on the `=` (buffer col 6): five hint cells sit before it.
+        e.cursor_row = 0;
+        e.cursor_col = 6;
+        assert_eq!(
+            e.cursor_screen_pos(),
+            Some((text_x + 11, e.last_inner.y)),
+            "the caret must account for hint cells before it"
+        );
+        // Caret exactly at the hint's anchor (buffer col 5) stays LEFT of the
+        // hint, like VS Code: typing there pushes the hint right.
+        e.cursor_col = 5;
+        assert_eq!(
+            e.cursor_screen_pos(),
+            Some((text_x + 5, e.last_inner.y)),
+            "the caret at the anchor must sit before the hint"
+        );
+    }
+
+    #[test]
+    fn buffer_pos_at_maps_clicks_through_inlay_hints() {
+        let mut e = editor_with("let x = f(y);");
+        let p = std::path::PathBuf::from("/tmp/hints.rs");
+        e.path = Some(p.clone());
+        e.apply_inlay_hints(p, vec![inlay(0, 5, ": i32")]);
+        let _ = first_row_text(&mut e);
+        let text_x = e.last_inner.x + e.last_gutter_width + 1;
+        let y = e.last_inner.y;
+        // A click on the shifted `=` (display col 11) lands on buffer col 6.
+        assert_eq!(e.buffer_pos_at(text_x + 11, y), Some((0, 6)));
+        // A click inside the hint's cells snaps to its anchor column.
+        assert_eq!(e.buffer_pos_at(text_x + 7, y), Some((0, 5)));
+        // Cells before the hint are unaffected.
+        assert_eq!(e.buffer_pos_at(text_x + 2, y), Some((0, 2)));
+    }
+
+    #[test]
+    fn opening_a_file_drops_the_previous_files_inlay_hints() {
+        let mut e = editor_with("let x = f(y);");
+        let p = std::path::PathBuf::from("/tmp/hints.rs");
+        e.path = Some(p.clone());
+        e.apply_inlay_hints(p, vec![inlay(0, 5, ": i32")]);
+        let dir = std::env::temp_dir().join("croft_inlay_open_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let other = dir.join("other.rs");
+        std::fs::write(&other, "fn g() {}\n").unwrap();
+        e.open(&other).unwrap();
+        let row = first_row_text(&mut e);
+        assert!(
+            !row.contains("i32"),
+            "a newly opened file must not inherit stale hints; got {row:?}"
+        );
     }
 
     #[test]

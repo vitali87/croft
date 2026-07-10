@@ -164,6 +164,12 @@ pub struct Prefs {
     /// config both mean "blame shown".
     #[serde(default)]
     pub disable_inline_blame: bool,
+    /// Opt-out for LSP inlay hints (inline type / parameter annotations),
+    /// which are on by default like VS Code's `editor.inlayHints.enabled`.
+    /// Stored as the disable flag so the derived `Default` and an older
+    /// config both mean "hints shown".
+    #[serde(default)]
+    pub disable_inlay_hints: bool,
     /// Copy a finished terminal mouse selection straight to the clipboard
     /// (VS Code's `terminal.integrated.copyOnSelection`). Off by default,
     /// matching VS Code.
@@ -328,6 +334,13 @@ pub fn save_inline_blame(enabled: bool) -> Result<()> {
     prefs.save(&path)
 }
 
+pub fn save_inlay_hints(enabled: bool) -> Result<()> {
+    let path = config_path();
+    let mut prefs = Prefs::load(&path).unwrap_or_default();
+    prefs.disable_inlay_hints = !enabled;
+    prefs.save(&path)
+}
+
 pub fn config_path() -> PathBuf {
     config_dir().join("config.json")
 }
@@ -477,6 +490,24 @@ mod tests {
         // format-on-save to off (matching VS Code's `editor.formatOnSave`).
         std::fs::write(&path, r#"{"theme":"dark"}"#).expect("write old config");
         assert!(!Prefs::load(&path).expect("load old").format_on_save);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn round_trips_inlay_hints_and_old_configs_default_on() {
+        let dir =
+            std::env::temp_dir().join(format!("croft-prefs-inlay-test-{}", std::process::id()));
+        let path = dir.join("config.json");
+        let prefs = Prefs {
+            disable_inlay_hints: true,
+            ..Prefs::default()
+        };
+        prefs.save(&path).expect("save");
+        assert!(Prefs::load(&path).expect("load").disable_inlay_hints);
+        // A config written before this field existed still parses; hints
+        // default ON (matching VS Code's `editor.inlayHints.enabled`).
+        std::fs::write(&path, r#"{"theme":"dark"}"#).expect("write old config");
+        assert!(!Prefs::load(&path).expect("load old").disable_inlay_hints);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

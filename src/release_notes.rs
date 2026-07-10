@@ -60,6 +60,6 @@ pub struct ReleaseNote {
 
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
-    kind: NoteKind::Fix,
-    summary: "The mouse works again after reconnecting to a persisted remote session: a dtach reattach arrives as a bare WINCH into a terminal that never saw the startup escape sequences, so croft now re-asserts mouse tracking, bracketed paste, the alt screen, and the kitty keyboard flags on every resize of a persistent session.",
+    kind: NoteKind::Feature,
+    summary: "LSP inlay hints: inferred types and parameter names render inline as dim italic annotations (rust-analyzer, vtsls, gopls), on by default like VS Code; toggle with \"Editor: Toggle Inlay Hints\" or the Settings hub.",
 }];

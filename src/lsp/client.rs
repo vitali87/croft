@@ -80,6 +80,9 @@ struct ClientState {
     // syntax analysis, then sends refresh once the cargo/crate-graph analysis
     // resolves the richer type-aware tokens. (ty/basedpyright never send it.)
     semantic_refresh: Arc<AtomicBool>,
+    // Same contract for `workspace/inlayHint/refresh`: the app polls and
+    // clears it, then re-requests hints for the visible editor(s).
+    inlay_refresh: Arc<AtomicBool>,
     // Server-pushed `textDocument/publishDiagnostics` batches are normalised
     // and forwarded here; the manager owns the receiver and the app drains it.
     diagnostics_tx: std_mpsc::Sender<DiagnosticsUpdate>,
@@ -120,12 +123,14 @@ impl ClientState {
     fn router(
         name: String,
         semantic_refresh: Arc<AtomicBool>,
+        inlay_refresh: Arc<AtomicBool>,
         diagnostics_tx: std_mpsc::Sender<DiagnosticsUpdate>,
         progress_tx: std_mpsc::Sender<ProgressUpdate>,
     ) -> Router<Self> {
         let mut router = Router::new(ClientState {
             name,
             semantic_refresh,
+            inlay_refresh,
             diagnostics_tx,
             progress_tx,
             progress_titles: std::collections::HashMap::new(),
@@ -135,6 +140,17 @@ impl ClientState {
                 this.semantic_refresh.store(true, Ordering::Relaxed);
                 log_file::log(&format!(
                     "lsp[{}] semanticTokens/refresh -> re-pull queued",
+                    this.name
+                ));
+                std::future::ready(Ok(()))
+            })
+            // `workspace/inlayHint/refresh`: the server's hints changed for
+            // reasons other than an edit (config reload, cross-file analysis);
+            // acknowledge and queue a re-request, like the semantic flag above.
+            .request::<lsp_types::request::InlayHintRefreshRequest, _>(|this, _params| {
+                this.inlay_refresh.store(true, Ordering::Relaxed);
+                log_file::log(&format!(
+                    "lsp[{}] inlayHint/refresh -> re-request queued",
                     this.name
                 ));
                 std::future::ready(Ok(()))
@@ -264,12 +280,16 @@ pub struct LspClient {
 }
 
 impl LspClient {
+    // Spawn wiring: each channel/flag is an independent router input;
+    // bundling them into a struct would add indirection without clarity.
+    #[allow(clippy::too_many_arguments)]
     pub async fn spawn(
         config: &ServerConfig,
         workspace_root: &Path,
         client_capabilities: ClientCapabilities,
         extra_path: &[std::path::PathBuf],
         semantic_refresh: Arc<AtomicBool>,
+        inlay_refresh: Arc<AtomicBool>,
         diagnostics_tx: std_mpsc::Sender<DiagnosticsUpdate>,
         progress_tx: std_mpsc::Sender<ProgressUpdate>,
     ) -> Result<Self> {
@@ -321,6 +341,7 @@ impl LspClient {
                 .service(ClientState::router(
                     router_name,
                     semantic_refresh,
+                    inlay_refresh,
                     diagnostics_tx,
                     progress_tx,
                 ))
@@ -646,6 +667,34 @@ impl LspClient {
             .context("references")
     }
 
+    /// `textDocument/inlayHint` over the whole document (`line_count` caps the
+    /// range end). VS Code requests per viewport and stitches; one whole-file
+    /// request per edit-batch is simpler and matches how croft already pulls
+    /// `semanticTokens/full`.
+    pub async fn inlay_hints(
+        &mut self,
+        uri: Url,
+        line_count: u32,
+    ) -> Result<Option<Vec<lsp_types::InlayHint>>> {
+        self.server
+            .inlay_hint(lsp_types::InlayHintParams {
+                text_document: TextDocumentIdentifier { uri },
+                range: Range {
+                    start: Position {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: line_count,
+                        character: 0,
+                    },
+                },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+            })
+            .await
+            .context("inlay_hint")
+    }
+
     pub async fn rename(
         &mut self,
         uri: Url,
@@ -873,10 +922,16 @@ mod tests {
         // raise the shared flag so the app re-pulls (vs the old behaviour of
         // declining it with METHOD_NOT_FOUND and never updating).
         let flag = Arc::new(AtomicBool::new(false));
+        let inlay_flag = Arc::new(AtomicBool::new(false));
         let (diag_tx, _diag_rx) = std_mpsc::channel();
         let (prog_tx, _prog_rx) = std_mpsc::channel();
-        let mut router =
-            ClientState::router("rust-analyzer".into(), flag.clone(), diag_tx, prog_tx);
+        let mut router = ClientState::router(
+            "rust-analyzer".into(),
+            flag.clone(),
+            inlay_flag,
+            diag_tx,
+            prog_tx,
+        );
         let req: AnyRequest = serde_json::from_value(json!({
             "id": 1,
             "method": "workspace/semanticTokens/refresh",
@@ -887,6 +942,41 @@ mod tests {
         assert!(
             flag.load(Ordering::Relaxed),
             "a workspace/semanticTokens/refresh request must set the re-pull flag"
+        );
+    }
+
+    #[test]
+    fn inlay_hint_refresh_request_sets_the_rerequest_flag() {
+        use async_lsp::AnyRequest;
+        use tower::Service;
+        // rust-analyzer sends `workspace/inlayHint/refresh` when its analysis
+        // (or a config reload) changes the hints without an edit; the router
+        // must acknowledge it AND queue a re-request.
+        let sem_flag = Arc::new(AtomicBool::new(false));
+        let flag = Arc::new(AtomicBool::new(false));
+        let (diag_tx, _diag_rx) = std_mpsc::channel();
+        let (prog_tx, _prog_rx) = std_mpsc::channel();
+        let mut router = ClientState::router(
+            "rust-analyzer".into(),
+            sem_flag.clone(),
+            flag.clone(),
+            diag_tx,
+            prog_tx,
+        );
+        let req: AnyRequest = serde_json::from_value(json!({
+            "id": 1,
+            "method": "workspace/inlayHint/refresh",
+            "params": null
+        }))
+        .expect("AnyRequest deserialization");
+        let _ = futures::executor::block_on(router.call(req));
+        assert!(
+            flag.load(Ordering::Relaxed),
+            "a workspace/inlayHint/refresh request must set the re-request flag"
+        );
+        assert!(
+            !sem_flag.load(Ordering::Relaxed),
+            "the semantic-token flag must stay untouched"
         );
     }
 
@@ -943,6 +1033,7 @@ mod tests {
         let mut router = ClientState::router(
             "basedpyright".into(),
             Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
             diag_tx,
             prog_tx,
         );
@@ -967,6 +1058,7 @@ mod tests {
         let (prog_tx, _prog_rx) = std_mpsc::channel();
         let mut router = ClientState::router(
             "any".into(),
+            Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicBool::new(false)),
             diag_tx,
             prog_tx,
@@ -1035,6 +1127,7 @@ mod tests {
                 &root,
                 ClientCapabilities::default(),
                 &[],
+                Arc::new(AtomicBool::new(false)),
                 Arc::new(AtomicBool::new(false)),
                 diag_tx,
                 prog_tx,

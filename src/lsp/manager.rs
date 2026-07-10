@@ -340,6 +340,29 @@ pub struct SemanticTokensUpdate {
     pub is_full: bool,
 }
 
+/// One inlay hint from a language server (`textDocument/inlayHint`),
+/// normalised off the LSP wire type: the label is already flattened
+/// (label parts joined, padding folded in as spaces, newlines stripped)
+/// so the editor splices it into the row verbatim. `character` is LSP
+/// UTF-16; the editor converts it to a character column against its own
+/// buffer, exactly as it does for diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InlayHintItem {
+    pub line: u32,
+    pub character: u32,
+    pub label: String,
+}
+
+/// A fresh, complete set of inlay hints for one document. `seq` echoes the
+/// edit sequence the request was fired for; the app drops a reply whose seq
+/// no longer matches the buffer (the hints were computed against old text).
+#[derive(Debug)]
+pub struct InlayHintsUpdate {
+    pub path: PathBuf,
+    pub seq: u64,
+    pub hints: Vec<InlayHintItem>,
+}
+
 /// Severity of a diagnostic, normalised off the LSP `DiagnosticSeverity`
 /// wire enum. Drives the underline colour the editor paints (VS Code: red
 /// for errors, yellow for warnings, blue/teal for info & hints).
@@ -407,6 +430,11 @@ enum Cmd {
         path: PathBuf,
         start_line: u32,
         end_line: u32,
+    },
+    RequestInlayHints {
+        path: PathBuf,
+        line_count: u32,
+        seq: u64,
     },
     ChangeDoc {
         path: PathBuf,
@@ -543,10 +571,12 @@ pub struct LspManager {
     format_rx: std_mpsc::Receiver<FormatResult>,
     code_action_rx: std_mpsc::Receiver<CodeActionResult>,
     semantic_rx: std_mpsc::Receiver<SemanticTokensUpdate>,
+    inlay_rx: std_mpsc::Receiver<InlayHintsUpdate>,
     diagnostics_rx: std_mpsc::Receiver<DiagnosticsUpdate>,
     progress_rx: std_mpsc::Receiver<ProgressUpdate>,
     capability_support: CapabilitySupport,
     semantic_refresh: Arc<AtomicBool>,
+    inlay_refresh: Arc<AtomicBool>,
     next_request_id: u64,
     workspace_root: PathBuf,
     _runtime: LspRuntime,
@@ -586,11 +616,13 @@ impl LspManager {
         let (format_tx, format_rx) = std_mpsc::channel();
         let (code_action_tx, code_action_rx) = std_mpsc::channel();
         let (semantic_tx, semantic_rx) = std_mpsc::channel();
+        let (inlay_tx, inlay_rx) = std_mpsc::channel();
         let (diagnostics_tx, diagnostics_rx) = std_mpsc::channel();
         let (progress_tx, progress_rx) = std_mpsc::channel();
         let capability_support: CapabilitySupport =
             Arc::new(StdMutex::new(LangCapabilitySupport::default()));
         let semantic_refresh = Arc::new(AtomicBool::new(false));
+        let inlay_refresh = Arc::new(AtomicBool::new(false));
         let root = workspace_root.clone();
         // Load user-installed extensions (`~/.config/croft/extensions`) and merge
         // them with the bundled ones. The language table must be initialised
@@ -627,11 +659,13 @@ impl LspManager {
                 formatting: format_tx,
                 code_action: code_action_tx,
                 semantic_tokens: semantic_tx,
+                inlay_hints: inlay_tx,
                 diagnostics: diagnostics_tx,
                 progress: progress_tx,
             },
             capability_support.clone(),
             semantic_refresh.clone(),
+            inlay_refresh.clone(),
         ));
         Ok(Self {
             cmd_tx,
@@ -649,10 +683,12 @@ impl LspManager {
             format_rx,
             code_action_rx,
             semantic_rx,
+            inlay_rx,
             diagnostics_rx,
             progress_rx,
             capability_support,
             semantic_refresh,
+            inlay_refresh,
             next_request_id: 1,
             workspace_root,
             _runtime: runtime,
@@ -751,6 +787,29 @@ impl LspManager {
 
     pub fn drain_semantic_tokens(&self) -> Option<SemanticTokensUpdate> {
         self.semantic_rx.try_recv().ok()
+    }
+
+    /// Ask the server for the whole document's inlay hints. Fire-and-forget
+    /// like the semantic-token requests; the reply lands in
+    /// [`drain_inlay_hints`] tagged with `seq` so the app can drop a stale
+    /// batch. A no-op when no spawned server advertises an `inlayHintProvider`.
+    pub fn request_inlay_hints(&self, path: PathBuf, line_count: u32, seq: u64) {
+        let _ = self.cmd_tx.send(Cmd::RequestInlayHints {
+            path,
+            line_count,
+            seq,
+        });
+    }
+
+    pub fn drain_inlay_hints(&self) -> Option<InlayHintsUpdate> {
+        self.inlay_rx.try_recv().ok()
+    }
+
+    /// Returns and clears the "a server asked us to re-request inlay hints"
+    /// flag, set by any client that received `workspace/inlayHint/refresh`.
+    /// Mirrors [`take_semantic_refresh`](Self::take_semantic_refresh).
+    pub fn take_inlay_refresh(&self) -> bool {
+        self.inlay_refresh.swap(false, Ordering::Relaxed)
     }
 
     /// Pop the next server-pushed diagnostics batch, if any. Each batch is the
@@ -1090,6 +1149,9 @@ struct ManagedClient {
     /// slow whole-tree enumeration (e.g. basedpyright). See
     /// `request_semantic_tokens`.
     semantic_supports_range: bool,
+    /// Whether the server advertises an `inlayHintProvider`
+    /// (rust-analyzer, vtsls, gopls do; ruff does not).
+    supports_inlay_hints: bool,
 }
 
 /// Servers are keyed by language AND the file's project root, not language
@@ -1109,6 +1171,8 @@ struct WorkerState {
     // Shared with every spawned client's router; a client sets it on a
     // `workspace/semanticTokens/refresh` and the app polls + clears it.
     semantic_refresh: Arc<AtomicBool>,
+    // Same contract for `workspace/inlayHint/refresh`.
+    inlay_refresh: Arc<AtomicBool>,
     // Cloned into every spawned client's router so the server-pushed
     // `textDocument/publishDiagnostics` notifications reach the app.
     diagnostics_tx: std_mpsc::Sender<DiagnosticsUpdate>,
@@ -1140,6 +1204,7 @@ struct ResultSenders {
     formatting: std_mpsc::Sender<FormatResult>,
     code_action: std_mpsc::Sender<CodeActionResult>,
     semantic_tokens: std_mpsc::Sender<SemanticTokensUpdate>,
+    inlay_hints: std_mpsc::Sender<InlayHintsUpdate>,
     diagnostics: std_mpsc::Sender<DiagnosticsUpdate>,
     progress: std_mpsc::Sender<ProgressUpdate>,
 }
@@ -1151,6 +1216,7 @@ async fn worker_loop(
     tx: ResultSenders,
     capability_support: CapabilitySupport,
     semantic_refresh: Arc<AtomicBool>,
+    inlay_refresh: Arc<AtomicBool>,
 ) {
     let mut state = WorkerState {
         workspace_root,
@@ -1159,6 +1225,7 @@ async fn worker_loop(
         docs: HashMap::new(),
         capability_support,
         semantic_refresh,
+        inlay_refresh,
         diagnostics_tx: tx.diagnostics.clone(),
         progress_tx: tx.progress.clone(),
     };
@@ -1182,6 +1249,15 @@ async fn worker_loop(
             } => {
                 state
                     .request_semantic_tokens_range(path, start_line, end_line, &tx.semantic_tokens)
+                    .await
+            }
+            Cmd::RequestInlayHints {
+                path,
+                line_count,
+                seq,
+            } => {
+                state
+                    .request_inlay_hints(path, line_count, seq, &tx.inlay_hints)
                     .await
             }
             Cmd::ChangeDoc { path, text } => state.change_doc(path, text).await,
@@ -1390,6 +1466,7 @@ impl WorkerState {
                 futures::future::join_all(resolved.into_iter().map(|(config, extra_path)| {
                     let caps = build_client_capabilities();
                     let refresh = self.semantic_refresh.clone();
+                    let inlay_refresh = self.inlay_refresh.clone();
                     let diagnostics = self.diagnostics_tx.clone();
                     let progress = self.progress_tx.clone();
                     async move {
@@ -1399,6 +1476,7 @@ impl WorkerState {
                             caps,
                             &extra_path,
                             refresh,
+                            inlay_refresh,
                             diagnostics,
                             progress,
                         )
@@ -1441,6 +1519,7 @@ impl WorkerState {
                             code_action_supported(&caps.code_action_provider);
                         let semantic_legend = semantic_legend_of(caps).map(Arc::new);
                         let semantic_supports_range = semantic_tokens_range_supported(caps);
+                        let supports_inlay_hints = one_of_supported(&caps.inlay_hint_provider);
                         log_file::log(&format!(
                             "lsp[{}] spawned, root={} supports_completion={supports} supports_signature_help={supports_signature_help} supports_hover={supports_hover} supports_definition={supports_definition} supports_declaration={supports_declaration} supports_type_definition={supports_type_definition} supports_implementation={supports_implementation} supports_references={supports_references} supports_rename={supports_rename}",
                             config.name,
@@ -1464,6 +1543,7 @@ impl WorkerState {
                             supports_code_action,
                             semantic_legend,
                             semantic_supports_range,
+                            supports_inlay_hints,
                         });
                     }
                     Err(e) => {
@@ -1927,6 +2007,54 @@ impl WorkerState {
                 legend,
                 is_full: true,
             });
+        });
+    }
+
+    async fn request_inlay_hints(
+        &mut self,
+        path: PathBuf,
+        line_count: u32,
+        seq: u64,
+        tx: &std_mpsc::Sender<InlayHintsUpdate>,
+    ) {
+        let Some(doc) = self.docs.get(&path) else {
+            return;
+        };
+        let lang = doc.language;
+        let root = doc.project_root.clone();
+        self.ensure_clients(lang, &root).await;
+        let Some(clients) = self.clients.get(&(lang, root)) else {
+            return;
+        };
+        let picked = clients
+            .iter()
+            .find(|c| c.supports_inlay_hints)
+            .map(|c| (c.name.clone(), c.client.clone()));
+        let Some((server_name, client_arc)) = picked else {
+            return;
+        };
+        let Ok(uri) = Url::from_file_path(&path) else {
+            return;
+        };
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let mut client = client_arc.lock().await;
+            let resp = client.inlay_hints(uri, line_count).await;
+            drop(client);
+            let hints = match resp {
+                Ok(Some(hints)) => hints.into_iter().map(normalise_inlay_hint).collect(),
+                Ok(None) => Vec::new(),
+                Err(e) => {
+                    log_file::log(&format!("lsp[{server_name}] inlay_hints error: {e}"));
+                    Vec::new()
+                }
+            };
+            log_file::log(&format!(
+                "inlay_hints response server={server_name} path={} hints={}",
+                path.display(),
+                hints.len()
+            ));
+            let _ = tx.send(InlayHintsUpdate { path, seq, hints });
         });
     }
 
@@ -3024,6 +3152,33 @@ fn workspace_symbol_items(resp: lsp_types::WorkspaceSymbolResponse) -> Vec<Works
     }
 }
 
+/// Normalise one LSP wire inlay hint: flatten a parts label into one string,
+/// fold the padding flags in as literal spaces, and strip newlines (a label
+/// is spliced into a single rendered row, where a line break would corrupt
+/// the cell run). The editor consumes the label verbatim after this.
+fn normalise_inlay_hint(h: lsp_types::InlayHint) -> InlayHintItem {
+    let mut label = match h.label {
+        lsp_types::InlayHintLabel::String(s) => s,
+        lsp_types::InlayHintLabel::LabelParts(parts) => {
+            parts.into_iter().map(|p| p.value).collect()
+        }
+    };
+    if label.contains(['\n', '\r']) {
+        label = label.replace(['\n', '\r'], " ");
+    }
+    if h.padding_left == Some(true) {
+        label.insert(0, ' ');
+    }
+    if h.padding_right == Some(true) {
+        label.push(' ');
+    }
+    InlayHintItem {
+        line: h.position.line,
+        character: h.position.character,
+        label,
+    }
+}
+
 fn one_of_supported<B>(cap: &Option<OneOf<bool, B>>) -> bool {
     match cap {
         Some(OneOf::Left(b)) => *b,
@@ -3413,6 +3568,13 @@ fn build_client_capabilities() -> ClientCapabilities {
                 hierarchical_document_symbol_support: Some(true),
                 ..Default::default()
             }),
+            // Advertise inlay-hint support so servers that gate the provider
+            // on it (vtsls) publish `inlayHintProvider` and answer
+            // `textDocument/inlayHint`.
+            inlay_hint: Some(lsp_types::InlayHintClientCapabilities {
+                dynamic_registration: Some(false),
+                resolve_support: None,
+            }),
             // Declare push-diagnostics support. Several servers gate
             // `textDocument/publishDiagnostics` on the client advertising this
             // (ty and ruff push regardless, but vtsls stays silent without it);
@@ -3460,6 +3622,12 @@ fn build_client_capabilities() -> ClientCapabilities {
         // but declaring support is correct and future-proofs the path for
         // servers that do.
         workspace: Some(WorkspaceClientCapabilities {
+            // Same re-pull contract for hints: rust-analyzer sends
+            // `workspace/inlayHint/refresh` after a config change or when its
+            // analysis upgrades, and croft re-requests for the visible editors.
+            inlay_hint: Some(lsp_types::InlayHintWorkspaceClientCapabilities {
+                refresh_support: Some(true),
+            }),
             semantic_tokens: Some(SemanticTokensWorkspaceClientCapabilities {
                 refresh_support: Some(true),
             }),
@@ -3647,6 +3815,72 @@ mod tests {
         SemanticTokensOptions,
     };
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn normalise_inlay_hint_flattens_parts_and_folds_padding() {
+        // vtsls sends parts labels; rust-analyzer sends plain strings with
+        // padding flags. Both must land as one splice-ready string.
+        let parts = lsp_types::InlayHint {
+            position: Position {
+                line: 3,
+                character: 14,
+            },
+            label: lsp_types::InlayHintLabel::LabelParts(vec![
+                lsp_types::InlayHintLabelPart {
+                    value: ": ".into(),
+                    ..Default::default()
+                },
+                lsp_types::InlayHintLabelPart {
+                    value: "Vec<String>".into(),
+                    ..Default::default()
+                },
+            ]),
+            kind: None,
+            text_edits: None,
+            tooltip: None,
+            padding_left: None,
+            padding_right: None,
+            data: None,
+        };
+        let item = normalise_inlay_hint(parts);
+        assert_eq!(item.line, 3);
+        assert_eq!(item.character, 14);
+        assert_eq!(item.label, ": Vec<String>");
+
+        let padded = lsp_types::InlayHint {
+            position: Position {
+                line: 0,
+                character: 9,
+            },
+            label: lsp_types::InlayHintLabel::String("param:".into()),
+            kind: None,
+            text_edits: None,
+            tooltip: None,
+            padding_left: Some(true),
+            padding_right: Some(true),
+            data: None,
+        };
+        assert_eq!(normalise_inlay_hint(padded).label, " param: ");
+
+        let multiline = lsp_types::InlayHint {
+            position: Position {
+                line: 0,
+                character: 0,
+            },
+            label: lsp_types::InlayHintLabel::String("a\nb".into()),
+            kind: None,
+            text_edits: None,
+            tooltip: None,
+            padding_left: None,
+            padding_right: None,
+            data: None,
+        };
+        assert_eq!(
+            normalise_inlay_hint(multiline).label,
+            "a b",
+            "a newline would corrupt the spliced row"
+        );
+    }
 
     #[test]
     fn workspace_symbol_items_maps_the_flat_response() {
@@ -4767,6 +5001,7 @@ while True:
             docs: HashMap::new(),
             capability_support: Arc::new(StdMutex::new(LangCapabilitySupport::default())),
             semantic_refresh: Arc::new(AtomicBool::new(false)),
+            inlay_refresh: Arc::new(AtomicBool::new(false)),
             diagnostics_tx: diag_tx,
             progress_tx: prog_tx,
         };
@@ -4792,6 +5027,130 @@ while True:
         assert!(
             methods.contains("textDocument/didSave"),
             "saving a document must send textDocument/didSave; server received: {methods:?}"
+        );
+        runtime.handle().clone().block_on(state.shutdown_all());
+    }
+
+    /// A fake server that advertises `inlayHintProvider` and answers
+    /// `textDocument/inlayHint` with one plain-string hint (with padding) and
+    /// one label-parts hint, covering both wire shapes end to end.
+    const FAKE_LSP_INLAY: &str = r#"
+import json, sys
+
+def read_msg():
+    length = None
+    while True:
+        line = sys.stdin.buffer.readline()
+        if not line:
+            return None
+        line = line.strip()
+        if not line:
+            break
+        if line.lower().startswith(b"content-length:"):
+            length = int(line.split(b":")[1])
+    if length is None:
+        return None
+    return json.loads(sys.stdin.buffer.read(length))
+
+def send(msg):
+    body = json.dumps(msg).encode()
+    sys.stdout.buffer.write(b"Content-Length: %d\r\n\r\n" % len(body))
+    sys.stdout.buffer.write(body)
+    sys.stdout.buffer.flush()
+
+while True:
+    msg = read_msg()
+    if msg is None:
+        break
+    method = msg.get("method", "")
+    if "id" in msg:
+        if method == "initialize":
+            send({"jsonrpc": "2.0", "id": msg["id"],
+                  "result": {"capabilities": {"inlayHintProvider": True}}})
+        elif method == "textDocument/inlayHint":
+            send({"jsonrpc": "2.0", "id": msg["id"], "result": [
+                {"position": {"line": 0, "character": 5}, "label": ": int"},
+                {"position": {"line": 0, "character": 9},
+                 "label": [{"value": "n"}, {"value": ":"}],
+                 "paddingRight": True},
+            ]})
+        else:
+            send({"jsonrpc": "2.0", "id": msg["id"], "result": None})
+    if method == "exit":
+        break
+"#;
+
+    /// The full worker wire path: capability gate, `textDocument/inlayHint`
+    /// request, label normalisation, and the seq-tagged reply on the drain
+    /// channel.
+    #[test]
+    fn request_inlay_hints_round_trips_through_a_hinting_server() {
+        if !is_on_path("python3") {
+            eprintln!("SKIPPED: python3 not on PATH");
+            return;
+        }
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().canonicalize().expect("canonicalize");
+        let file = root.join("demo.py");
+        std::fs::write(&file, "x = f(1)\n").expect("write demo");
+        let script = root.join("fake_inlay_lsp.py");
+        std::fs::write(&script, FAKE_LSP_INLAY).expect("write fake server");
+
+        let mut registry = ServerRegistry::new();
+        registry.register(
+            Language::PYTHON,
+            ServerConfig {
+                name: "fake-inlay",
+                command: "python3".into(),
+                args: vec![script.display().to_string()],
+                language: Language::PYTHON,
+                initialization_options: None,
+                provision: None,
+            },
+        );
+        let (diag_tx, _diag_rx) = std_mpsc::channel();
+        let (prog_tx, _prog_rx) = std_mpsc::channel();
+        let mut state = WorkerState {
+            workspace_root: root.clone(),
+            registry,
+            clients: HashMap::new(),
+            docs: HashMap::new(),
+            capability_support: Arc::new(StdMutex::new(LangCapabilitySupport::default())),
+            semantic_refresh: Arc::new(AtomicBool::new(false)),
+            inlay_refresh: Arc::new(AtomicBool::new(false)),
+            diagnostics_tx: diag_tx,
+            progress_tx: prog_tx,
+        };
+
+        let (tx, rx) = std_mpsc::channel();
+        let runtime = LspRuntime::new().expect("runtime");
+        runtime.handle().clone().block_on(async {
+            state
+                .open_doc(file.clone(), String::from("x = f(1)\n"))
+                .await;
+            state.request_inlay_hints(file.clone(), 2, 42, &tx).await;
+        });
+
+        let update = rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("an inlay-hint reply must reach the drain channel");
+        assert_eq!(update.path, file);
+        assert_eq!(update.seq, 42, "the reply must echo the request's seq");
+        assert_eq!(
+            update.hints,
+            vec![
+                InlayHintItem {
+                    line: 0,
+                    character: 5,
+                    label: String::from(": int"),
+                },
+                InlayHintItem {
+                    line: 0,
+                    character: 9,
+                    label: String::from("n: "),
+                },
+            ],
+            "both label shapes must normalise, padding folded in"
         );
         runtime.handle().clone().block_on(state.shutdown_all());
     }

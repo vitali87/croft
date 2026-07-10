@@ -1901,6 +1901,10 @@ pub struct App {
     blame_fetched: Option<PathBuf>,
     /// User pref: show the current-line inline blame annotation (default on).
     inline_blame_enabled: bool,
+    /// LSP inlay hints (inline type / parameter annotations), on by default
+    /// like VS Code's `editor.inlayHints.enabled`; toggled from the palette
+    /// and persisted as `disable_inlay_hints` in config.json.
+    inlay_hints_enabled: bool,
     /// Local-history root (`~/.config/croft/history`), cached so tests can
     /// redirect snapshots to a tempdir.
     history_root: PathBuf,
@@ -3132,6 +3136,7 @@ impl App {
             blame_tx,
             blame_fetched: None,
             inline_blame_enabled: !loaded_prefs.disable_inline_blame,
+            inlay_hints_enabled: !loaded_prefs.disable_inlay_hints,
             // Keep the suite off the user's real ~/.config/croft/history: a
             // per-process temp root in test builds, the real dir otherwise.
             history_root: if cfg!(test) {
@@ -5036,6 +5041,7 @@ impl App {
             None => return,
         };
         for (is_open, path, text, seq, viewport) in to_send {
+            let line_count = text.lines().count() as u32 + 1;
             if is_open {
                 lsp.open_doc(path.clone(), text);
                 // Paint the visible lines first: ty answers a viewport range
@@ -5053,6 +5059,11 @@ impl App {
             // opened or changed. Gated by the same `seq` diff as did_change
             // above, so this fires once per edit-batch, not per keystroke.
             lsp.request_semantic_tokens(path.clone());
+            // Same cadence for inlay hints; the reply carries `seq` so a
+            // stale batch (computed against older text) is dropped on drain.
+            if self.inlay_hints_enabled {
+                lsp.request_inlay_hints(path.clone(), line_count, seq);
+            }
             self.lsp_last_seen.insert(path, seq);
         }
         let closed: Vec<PathBuf> = self
@@ -5835,6 +5846,38 @@ impl App {
         changed
     }
 
+    /// Route drained inlay-hint batches to whichever visible editor holds the
+    /// file. A reply whose `seq` no longer matches the buffer's last-synced
+    /// edit seq is dropped: its anchors were computed against older text, and
+    /// the request fired for the current seq is still in flight.
+    pub fn drain_lsp_inlay_hints(&mut self) -> bool {
+        let Some(lsp) = self.lsp.as_ref() else {
+            return false;
+        };
+        let mut updates = Vec::new();
+        while let Some(u) = lsp.drain_inlay_hints() {
+            updates.push(u);
+        }
+        let mut changed = false;
+        for u in updates {
+            if self.lsp_last_seen.get(&u.path) != Some(&u.seq) {
+                continue;
+            }
+            if self.editor.path.as_deref() == Some(u.path.as_path()) {
+                self.editor
+                    .apply_inlay_hints(u.path.clone(), u.hints.clone());
+                changed = true;
+            }
+            for group in self.editor_layout.inactive_groups_mut() {
+                if group.path.as_deref() == Some(u.path.as_path()) {
+                    group.apply_inlay_hints(u.path.clone(), u.hints.clone());
+                    changed = true;
+                }
+            }
+        }
+        changed
+    }
+
     /// Flatten the per-server diagnostics stored for `path` into one list for
     /// the editor. Servers are layered, not merged across (each owns its own
     /// findings), so this is a simple concatenation of every server's set.
@@ -6030,6 +6073,65 @@ impl App {
             if self.lsp_last_seen.contains_key(&p) {
                 lsp.request_semantic_tokens(p);
             }
+        }
+    }
+
+    /// Re-request inlay hints when a server asked us to via
+    /// `workspace/inlayHint/refresh` (rust-analyzer sends it after a config
+    /// reload or when cross-file analysis changes the hints without an edit).
+    /// Mirrors [`refresh_semantic_tokens_if_requested`].
+    pub fn refresh_inlay_hints_if_requested(&mut self) {
+        let Some(lsp) = self.lsp.as_ref() else {
+            return;
+        };
+        if !lsp.take_inlay_refresh() {
+            return;
+        }
+        if self.inlay_hints_enabled {
+            self.request_inlay_hints_for_open_editors();
+        }
+    }
+
+    /// Fire an inlay-hint request for every visible editor's file at its
+    /// current edit seq. Shared by the server-driven refresh and the palette
+    /// toggle's re-enable path.
+    fn request_inlay_hints_for_open_editors(&mut self) {
+        let Some(lsp) = self.lsp.as_ref() else {
+            return;
+        };
+        let mut targets: Vec<(PathBuf, u32)> = Vec::new();
+        if let Some(p) = self.editor.path.clone() {
+            targets.push((p, self.editor.line_count() as u32 + 1));
+        }
+        for group in self.editor_layout.inactive_groups() {
+            if let Some(p) = group.path.clone() {
+                targets.push((p, group.line_count() as u32 + 1));
+            }
+        }
+        for (p, line_count) in targets {
+            if let Some(&seq) = self.lsp_last_seen.get(&p) {
+                lsp.request_inlay_hints(p, line_count, seq);
+            }
+        }
+    }
+
+    /// Editor: Toggle Inlay Hints — flips the hint display live and persists
+    /// the choice. Off clears every editor's hints; on re-requests them for
+    /// the visible files.
+    fn toggle_inlay_hints(&mut self) {
+        self.inlay_hints_enabled = !self.inlay_hints_enabled;
+        if self.inlay_hints_enabled {
+            self.request_inlay_hints_for_open_editors();
+            self.status = String::from("Inlay Hints: on");
+        } else {
+            self.editor.clear_inlay_hints();
+            for group in self.editor_layout.inactive_groups_mut() {
+                group.clear_inlay_hints();
+            }
+            self.status = String::from("Inlay Hints: off");
+        }
+        if !cfg!(test) {
+            let _ = crate::prefs::save_inlay_hints(self.inlay_hints_enabled);
         }
     }
 
@@ -14671,6 +14773,7 @@ impl App {
                     "toggle:format_on_save" => self.toggle_format_on_save(),
                     "toggle:auto_save" => self.toggle_auto_save(),
                     "toggle:inline_blame" => self.toggle_inline_blame(),
+                    "toggle:inlay_hints" => self.toggle_inlay_hints(),
                     "toggle:copy_on_select" => self.toggle_copy_on_select(),
                     "cmd:color_theme" => {
                         self.open_theme_picker();
@@ -14725,6 +14828,10 @@ impl App {
             ListRow {
                 id: String::from("toggle:inline_blame"),
                 label: format!("Git: Inline Blame: {}", on_off(self.inline_blame_enabled)),
+            },
+            ListRow {
+                id: String::from("toggle:inlay_hints"),
+                label: format!("Editor: Inlay Hints: {}", on_off(self.inlay_hints_enabled)),
             },
             ListRow {
                 id: String::from("toggle:copy_on_select"),
@@ -19968,6 +20075,7 @@ impl App {
             Cmd::ToggleFormatOnSave => self.toggle_format_on_save(),
             Cmd::ToggleAutoSave => self.toggle_auto_save(),
             Cmd::ToggleInlineBlame => self.toggle_inline_blame(),
+            Cmd::ToggleInlayHints => self.toggle_inlay_hints(),
             Cmd::ToggleTerminalTimestamps => self.toggle_terminal_timestamps(),
             Cmd::RestoreSnapshot => self.restore_history_snapshot(),
             Cmd::QuickFix => self.start_code_action(),
@@ -29558,6 +29666,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         // Timeline git history, Dependencies) and drain their workers.
         let explorer_panels_changed = app.sync_explorer_panels();
         app.refresh_semantic_tokens_if_requested();
+        app.refresh_inlay_hints_if_requested();
         let lsp_changed = app.drain_lsp_completion();
         app.refresh_signature_help_if_moved();
         let sig_help_changed = app.drain_lsp_signature_help();
@@ -29574,6 +29683,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let format_changed = app.drain_lsp_format();
         let code_action_changed = app.drain_lsp_code_actions();
         let semantic_changed = app.drain_lsp_semantic_tokens();
+        let inlay_changed = app.drain_lsp_inlay_hints();
         let diagnostics_changed = app.drain_lsp_diagnostics();
         let progress_changed = app.drain_lsp_progress();
         let dap_changed = app.poll_dap();
@@ -29631,6 +29741,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             || format_changed
             || code_action_changed
             || semantic_changed
+            || inlay_changed
             || diagnostics_changed
             || progress_changed
             || voice_changed
