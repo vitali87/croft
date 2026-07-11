@@ -6049,6 +6049,32 @@ fn changing_workspace_root_rebinds_the_test_worker_to_the_new_root() {
 }
 
 #[test]
+fn changing_workspace_root_resets_the_testing_panel() {
+    let tmp = tempfile::tempdir().unwrap();
+    let inner = tmp.path().join("inner");
+    std::fs::create_dir_all(&inner).unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    // The old project's tree (e.g. pytest cases from a Python repo).
+    app.testing.apply_case(crate::testing::model::TestCase {
+        name: String::from("tests/test_x.py::test_a"),
+        status: crate::testing::model::TestStatus::Failed,
+    });
+    assert!(!app.testing.is_empty());
+
+    app.change_workspace_root(inner.clone());
+
+    assert!(
+        app.testing.is_empty(),
+        "a workspace re-root must drop the old project's tests; a stale tree also blocks open_testing_view's discover-on-empty, so the new project is never discovered"
+    );
+    assert_eq!(
+        app.testing.failed_count(),
+        0,
+        "the beaker badge must not keep counting the old project's failures"
+    );
+}
+
+#[test]
 fn changing_workspace_root_rebinds_the_lsp_manager_to_the_new_root() {
     let tmp = tempfile::tempdir().unwrap();
     let inner = tmp.path().join("inner");

@@ -24617,7 +24617,18 @@ impl App {
         // Rebind the test runner too, else `cargo test -- --list` keeps running
         // in the launch dir captured at spawn (e.g. ~/Documents, no Cargo.toml)
         // and the Testing view stays empty after a Make Root into a child repo.
+        // Then drop the old project's tree: its cases are unrelated, they keep
+        // the beaker badge counting dead failures, and a non-empty panel blocks
+        // open_testing_view's discover-on-empty, so the new project would never
+        // be discovered. Results still streaming from the old root are dropped
+        // by the drain's epoch tag (same idea as the commit graph's root tag).
+        // With the Testing view in front, re-discover right away; otherwise the
+        // now-empty panel discovers on its next open.
         self.test_worker.set_root(new_root.clone());
+        self.testing.reset();
+        if self.sidebar_view == SidebarView::Testing {
+            self.discover_tests();
+        }
         // Rebind the search worker and the panel's display root to the new
         // Explorer root so the next search targets this directory and its
         // subdirectories, not the root captured when the worker was spawned.

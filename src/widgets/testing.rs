@@ -106,6 +106,18 @@ impl TestingPanel {
         self.scroll = 0;
     }
 
+    /// Forget everything (workspace re-root): the new project's tests are
+    /// unrelated, so the tree, tally, busy state, and scroll all start over.
+    /// Leaving the old tree in place would also block `open_testing_view`'s
+    /// discover-on-empty, so the new project would never be discovered.
+    pub fn reset(&mut self) {
+        self.cases.clear();
+        self.activity = Activity::Idle;
+        self.last_run_ok = None;
+        self.progress = None;
+        self.scroll = 0;
+    }
+
     /// Update the live compile-progress line shown while busy.
     pub fn set_progress(&mut self, line: String) {
         self.progress = Some(line);

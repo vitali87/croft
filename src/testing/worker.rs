@@ -76,7 +76,15 @@ pub enum TestResponse {
 
 pub struct TestWorker {
     request_tx: Sender<TestRequest>,
-    response_rx: Receiver<TestResponse>,
+    /// Responses arrive tagged with the epoch of the root they ran under; the
+    /// drain drops tags older than [`Self::expected_epoch`] so a run still
+    /// streaming when the Explorer re-roots can't pollute the new project's
+    /// tree (same idea as the commit graph's root-tagged drain).
+    response_rx: Receiver<(u64, TestResponse)>,
+    /// Bumped on every [`Self::set_root`], in lockstep with the loop's own
+    /// counter: the request channel is FIFO, so both sides count the same
+    /// `SetRoot`s in the same order.
+    expected_epoch: u64,
     // Mirror of the root the loop last saw, for tests that assert the re-root
     // wiring. The loop owns its own copy via `SetRoot`; prod never reads this.
     #[cfg(test)]
@@ -86,16 +94,34 @@ pub struct TestWorker {
 impl TestWorker {
     pub fn spawn(workspace_root: PathBuf) -> Self {
         let (request_tx, request_rx) = std::sync::mpsc::channel::<TestRequest>();
-        let (response_tx, response_rx) = std::sync::mpsc::channel::<TestResponse>();
+        let (response_tx, response_rx) = std::sync::mpsc::channel::<(u64, TestResponse)>();
         #[cfg(test)]
         let root = workspace_root.clone();
         std::thread::spawn(move || worker_loop(workspace_root, request_rx, response_tx));
         Self {
             request_tx,
             response_rx,
+            expected_epoch: 0,
             #[cfg(test)]
             root,
         }
+    }
+
+    /// Build a worker around hand-made channels (no thread) so tests can
+    /// inject tagged responses straight into the drain.
+    #[cfg(test)]
+    fn for_test() -> (Self, Sender<(u64, TestResponse)>) {
+        let (request_tx, _request_rx) = std::sync::mpsc::channel::<TestRequest>();
+        let (response_tx, response_rx) = std::sync::mpsc::channel::<(u64, TestResponse)>();
+        (
+            Self {
+                request_tx,
+                response_rx,
+                expected_epoch: 0,
+                root: PathBuf::new(),
+            },
+            response_tx,
+        )
     }
 
     pub fn run_all(&self) {
@@ -115,11 +141,14 @@ impl TestWorker {
     }
 
     /// Rebind the worker to a new workspace root after an Explorer re-root.
+    /// Everything still streaming for the old root carries the old epoch and
+    /// is dropped by [`Self::drain`].
     pub fn set_root(&mut self, root: PathBuf) {
         #[cfg(test)]
         {
             self.root = root.clone();
         }
+        self.expected_epoch += 1;
         let _ = self.request_tx.send(TestRequest::SetRoot(root));
     }
 
@@ -129,10 +158,15 @@ impl TestWorker {
     }
 
     /// Drain streamed results into the panel. Returns true iff anything was
-    /// applied, so the main loop only redraws on a real update.
+    /// applied, so the main loop only redraws on a real update. Responses
+    /// tagged with an epoch older than the last `set_root` belong to the
+    /// previous project and are dropped.
     pub fn drain(&mut self, panel: &mut TestingPanel) -> bool {
         let mut changed = false;
-        while let Ok(resp) = self.response_rx.try_recv() {
+        while let Ok((epoch, resp)) = self.response_rx.try_recv() {
+            if epoch != self.expected_epoch {
+                continue;
+            }
             match resp {
                 TestResponse::Started(activity) => panel.on_busy_started(activity),
                 TestResponse::Case(case) => panel.apply_case(case),
@@ -145,14 +179,37 @@ impl TestWorker {
     }
 }
 
-fn worker_loop(mut root: PathBuf, rx: Receiver<TestRequest>, tx: Sender<TestResponse>) {
+/// A response sender bound to the epoch of the request it serves, so every
+/// line a handler streams is tagged without threading the counter through.
+struct EpochTx<'a> {
+    tx: &'a Sender<(u64, TestResponse)>,
+    epoch: u64,
+}
+
+impl EpochTx<'_> {
+    fn send(&self, resp: TestResponse) {
+        let _ = self.tx.send((self.epoch, resp));
+    }
+
+    /// An owned clone for the stderr tee thread.
+    fn to_owned(&self) -> (Sender<(u64, TestResponse)>, u64) {
+        (self.tx.clone(), self.epoch)
+    }
+}
+
+fn worker_loop(mut root: PathBuf, rx: Receiver<TestRequest>, tx: Sender<(u64, TestResponse)>) {
+    let mut epoch = 0u64;
     while let Ok(req) = rx.recv() {
+        let etx = EpochTx { tx: &tx, epoch };
         match req {
-            TestRequest::RunAll => run_all(&root, &tx),
-            TestRequest::RunOne(name) => run_one(&root, &tx, &name),
-            TestRequest::RunFilter(pattern) => run_filter(&root, &tx, &pattern),
-            TestRequest::Discover => discover(&root, &tx),
-            TestRequest::SetRoot(p) => root = p,
+            TestRequest::RunAll => run_all(&root, &etx),
+            TestRequest::RunOne(name) => run_one(&root, &etx, &name),
+            TestRequest::RunFilter(pattern) => run_filter(&root, &etx, &pattern),
+            TestRequest::Discover => discover(&root, &etx),
+            TestRequest::SetRoot(p) => {
+                root = p;
+                epoch += 1;
+            }
         }
     }
 }
@@ -233,7 +290,7 @@ fn pytest_cmd(root: &Path, args: &[&str]) -> Command {
 /// each stdout line through `parse` — every matched [`TestCase`] is streamed as
 /// it arrives. Returns the child's exit success, or `None` if it never spawned.
 fn run_streaming(
-    tx: &Sender<TestResponse>,
+    tx: &EpochTx,
     mut cmd: Command,
     parse: impl Fn(&str) -> Option<TestCase>,
 ) -> Option<bool> {
@@ -249,12 +306,12 @@ fn run_streaming(
         }
     };
     let stderr_handle = child.stderr.take().map(|err| {
-        let tx = tx.clone();
+        let (tx, epoch) = tx.to_owned();
         std::thread::spawn(move || {
             for line in BufReader::new(err).lines().map_while(Result::ok) {
                 output::push(output::CHANNEL_TESTS, OutputLevel::Info, &line);
                 if let Some(p) = cargo_progress(&line) {
-                    let _ = tx.send(TestResponse::Progress(p));
+                    let _ = tx.send((epoch, TestResponse::Progress(p)));
                 }
             }
         })
@@ -263,7 +320,7 @@ fn run_streaming(
         for line in BufReader::new(out).lines().map_while(Result::ok) {
             output::push(output::CHANNEL_TESTS, OutputLevel::Info, &line);
             if let Some(case) = parse(&line) {
-                let _ = tx.send(TestResponse::Case(case));
+                tx.send(TestResponse::Case(case));
             }
         }
     }
@@ -295,8 +352,8 @@ pub(crate) fn cargo_progress(line: &str) -> Option<String> {
         .then(|| trimmed.to_string())
 }
 
-fn run_all(root: &Path, tx: &Sender<TestResponse>) {
-    let _ = tx.send(TestResponse::Started(Activity::Running));
+fn run_all(root: &Path, tx: &EpochTx) {
+    tx.send(TestResponse::Started(Activity::Running));
     let ok = match runner_for(root) {
         Some(Runner::Pytest) => {
             let cmd = pytest_cmd(root, &["-v", "--color=no"]);
@@ -308,7 +365,7 @@ fn run_all(root: &Path, tx: &Sender<TestResponse>) {
         }
     }
     .unwrap_or(false);
-    let _ = tx.send(TestResponse::Finished { ok: Some(ok) });
+    tx.send(TestResponse::Finished { ok: Some(ok) });
 }
 
 /// Run a single test by exact name: `cargo test <name> --color=never -- --exact`
@@ -316,7 +373,7 @@ fn run_all(root: &Path, tx: &Sender<TestResponse>) {
 /// pytest the node ID itself, which is already exact. No `Started` is sent: the
 /// app marks just this case Running and keeps the rest of the tree, so a
 /// single-test run doesn't wipe the discovered list.
-fn run_one(root: &Path, tx: &Sender<TestResponse>, name: &str) {
+fn run_one(root: &Path, tx: &EpochTx, name: &str) {
     let ok = match runner_for(root) {
         Some(Runner::Pytest) => {
             let cmd = pytest_cmd(root, &["-v", "--color=no", name]);
@@ -328,7 +385,7 @@ fn run_one(root: &Path, tx: &Sender<TestResponse>, name: &str) {
         }
     }
     .unwrap_or(false);
-    let _ = tx.send(TestResponse::Finished { ok: Some(ok) });
+    tx.send(TestResponse::Finished { ok: Some(ok) });
 }
 
 /// Run every test matching a name filter. cargo's positional filter is a
@@ -338,7 +395,7 @@ fn run_one(root: &Path, tx: &Sender<TestResponse>, name: &str) {
 /// (run-at-cursor) goes through `-k`, pytest's substring matcher. Like
 /// [`run_one`], the app has already marked the affected cases and shown the
 /// busy state, so no `Started` is sent.
-fn run_filter(root: &Path, tx: &Sender<TestResponse>, pattern: &str) {
+fn run_filter(root: &Path, tx: &EpochTx, pattern: &str) {
     let ok = match runner_for(root) {
         Some(Runner::Pytest) => {
             let cmd = if pattern.contains(".py") {
@@ -354,14 +411,14 @@ fn run_filter(root: &Path, tx: &Sender<TestResponse>, pattern: &str) {
         }
     }
     .unwrap_or(false);
-    let _ = tx.send(TestResponse::Finished { ok: Some(ok) });
+    tx.send(TestResponse::Finished { ok: Some(ok) });
 }
 
 /// List tests without running them (`cargo test -- --list`, or pytest's
 /// `--collect-only -q`), streaming each as a `NotRun` case. The cargo path
 /// still compiles the test binary, hence the Discovering state.
-fn discover(root: &Path, tx: &Sender<TestResponse>) {
-    let _ = tx.send(TestResponse::Started(Activity::Discovering));
+fn discover(root: &Path, tx: &EpochTx) {
+    tx.send(TestResponse::Started(Activity::Discovering));
     match runner_for(root) {
         Some(Runner::Pytest) => {
             let cmd = pytest_cmd(root, &["--collect-only", "-q", "--color=no"]);
@@ -382,7 +439,7 @@ fn discover(root: &Path, tx: &Sender<TestResponse>) {
             });
         }
     }
-    let _ = tx.send(TestResponse::Finished { ok: None });
+    tx.send(TestResponse::Finished { ok: None });
 }
 
 #[cfg(test)]
@@ -401,5 +458,40 @@ mod tests {
         let py = tempfile::tempdir().unwrap();
         std::fs::write(py.path().join("pytest.ini"), "[pytest]\n").unwrap();
         assert_eq!(runner_for(py.path()), Some(Runner::Pytest));
+    }
+
+    #[test]
+    fn drain_drops_responses_from_before_the_last_set_root() {
+        let (mut w, tx) = TestWorker::for_test();
+        let mut panel = TestingPanel::new();
+        // A run for the OLD root is still streaming when the Explorer re-roots.
+        w.set_root(PathBuf::from("/new"));
+        tx.send((
+            0,
+            TestResponse::Case(TestCase {
+                name: String::from("old_project::stale"),
+                status: TestStatus::Failed,
+            }),
+        ))
+        .unwrap();
+        tx.send((0, TestResponse::Finished { ok: Some(false) }))
+            .unwrap();
+        assert!(
+            !w.drain(&mut panel),
+            "stale-epoch responses must be dropped, not applied"
+        );
+        assert!(panel.is_empty(), "the old project's case never lands");
+
+        // Responses for the new root (epoch 1) still flow.
+        tx.send((
+            1,
+            TestResponse::Case(TestCase {
+                name: String::from("new_project::fresh"),
+                status: TestStatus::Passed,
+            }),
+        ))
+        .unwrap();
+        assert!(w.drain(&mut panel));
+        assert!(!panel.is_empty());
     }
 }

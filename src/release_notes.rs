@@ -59,13 +59,7 @@ pub struct ReleaseNote {
 }
 
 /// What shipped in the current release. Replace on every version bump.
-pub const RELEASE_NOTES: &[ReleaseNote] = &[
-    ReleaseNote {
-        kind: NoteKind::Feature,
-        summary: "The Testing view now runs Python projects: pytest discovery and runs stream into the suite tree exactly like cargo test, with parametrized cases, class methods, and click-to-source jumps to the def.",
-    },
-    ReleaseNote {
-        kind: NoteKind::Feature,
-        summary: "Testing clicks match VS Code: a test's play/status glyph runs it while clicking its name reveals the source, and suite headers gained their own play button so a stray click never kicks a whole run.",
-    },
-];
+pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
+    kind: NoteKind::Fix,
+    summary: "The Testing view follows a workspace switch (Cmd/Ctrl+Z jump, Make Root, Open Folder): the old project's tests clear, the new project's are discovered, and results still streaming from the old root are discarded instead of polluting the tree.",
+}];
