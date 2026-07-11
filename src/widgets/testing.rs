@@ -184,6 +184,14 @@ impl TestingPanel {
         self.cases.is_empty()
     }
 
+    #[cfg(test)]
+    pub fn cases_for_test(&self) -> Vec<(String, TestStatus)> {
+        self.cases
+            .iter()
+            .map(|c| (c.name.clone(), c.status))
+            .collect()
+    }
+
     /// Count of failing tests — the number the beaker badge shows.
     pub fn failed_count(&self) -> usize {
         self.cases

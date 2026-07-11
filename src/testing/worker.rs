@@ -12,7 +12,8 @@ use std::sync::mpsc::{Receiver, Sender};
 
 use super::model::{Activity, TestCase, TestStatus};
 use super::parse::{
-    parse_list_line, parse_pytest_collect_line, parse_pytest_line, parse_test_line,
+    parse_jest_json, parse_list_line, parse_pytest_collect_line, parse_pytest_line,
+    parse_test_line, parse_vitest_list_line, parse_vitest_tap_line,
 };
 use crate::output::{self, OutputLevel};
 use crate::widgets::testing::TestingPanel;
@@ -23,6 +24,8 @@ use crate::widgets::testing::TestingPanel;
 pub enum Runner {
     Cargo,
     Pytest,
+    Vitest,
+    Jest,
 }
 
 /// The manifest files that mark a Python project pytest can run in.
@@ -40,10 +43,48 @@ pub fn runner_for(root: &Path) -> Option<Runner> {
     if root.join("Cargo.toml").is_file() {
         return Some(Runner::Cargo);
     }
+    if let Some(js) = js_runner_for(root) {
+        return Some(js);
+    }
     PYTHON_MARKERS
         .iter()
         .any(|m| root.join(m).is_file())
         .then_some(Runner::Pytest)
+}
+
+/// The JS runner a package.json project uses: named in its (dev)dependencies,
+/// or marked by a config file when the dep is hoisted out of sight (a
+/// monorepo sub-package). A package.json naming neither is NOT a test
+/// project — plenty of repos carry one only for docs tooling.
+fn js_runner_for(root: &Path) -> Option<Runner> {
+    if !root.join("package.json").is_file() {
+        return None;
+    }
+    if let Ok(text) = std::fs::read_to_string(root.join("package.json"))
+        && let Ok(pkg) = serde_json::from_str::<serde_json::Value>(&text)
+    {
+        for section in ["devDependencies", "dependencies"] {
+            if let Some(deps) = pkg.get(section).and_then(|d| d.as_object()) {
+                if deps.contains_key("vitest") {
+                    return Some(Runner::Vitest);
+                }
+                if deps.contains_key("jest") {
+                    return Some(Runner::Jest);
+                }
+            }
+        }
+    }
+    for ext in ["ts", "js", "mts", "mjs"] {
+        if root.join(format!("vitest.config.{ext}")).is_file() {
+            return Some(Runner::Vitest);
+        }
+    }
+    for ext in ["js", "ts", "mjs", "cjs", "json"] {
+        if root.join(format!("jest.config.{ext}")).is_file() {
+            return Some(Runner::Jest);
+        }
+    }
+    None
 }
 
 pub enum TestRequest {
@@ -286,13 +327,90 @@ fn pytest_cmd(root: &Path, args: &[&str]) -> Command {
     cmd
 }
 
+/// Absolute path to a JS test runner binary for a workspace: the project's own
+/// `node_modules/.bin/<name>` first (the installed version, with the project's
+/// config resolvable), then `PATH`, then the usual global dirs — absolute for
+/// the same GUI-stripped-PATH reason as [`cargo_cmd`].
+fn js_binary(root: &Path, name: &str) -> PathBuf {
+    let local = root.join("node_modules").join(".bin").join(name);
+    if local.is_file() {
+        return local;
+    }
+    if let Some(path_var) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path_var) {
+            let candidate = dir.join(name);
+            if candidate.is_file() {
+                return candidate;
+            }
+        }
+    }
+    for dir in ["/opt/homebrew/bin", "/usr/local/bin"] {
+        let candidate = PathBuf::from(dir).join(name);
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+    PathBuf::from(name)
+}
+
+/// `<vitest|jest> <args>` rooted at the workspace, with piped stdio.
+/// `NO_COLOR` strips ANSI from the parsed stream and `CI` keeps vitest out of
+/// watch/interactive mode.
+fn js_cmd<S: AsRef<std::ffi::OsStr>>(root: &Path, runner: &str, args: &[S]) -> Command {
+    let mut cmd = Command::new(js_binary(root, runner));
+    cmd.args(args)
+        .current_dir(root)
+        .env("NO_COLOR", "1")
+        .env("CI", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    cmd
+}
+
+/// Escape a test title for jest's `-t`, which is a REGEX matched against the
+/// full name; titles routinely contain `(`, `?`, `$`.
+fn regex_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if "\\^$.|?*+()[]{}".contains(c) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Split a croft JS node ID (`file::describe...::test`) into its file and an
+/// optional title: the first segment is always the test file, the last (when
+/// present) the name filter to hand `-t`.
+fn js_id_parts(id: &str) -> (&str, Option<&str>) {
+    match id.split_once("::") {
+        Some((file, rest)) => (file, rest.rsplit("::").next()),
+        None => (id, None),
+    }
+}
+
+/// Whether a run-filter pattern is a node-ID (prefix) rooted at a test file,
+/// as opposed to a bare title from run-at-cursor.
+fn is_js_file(pattern: &str) -> bool {
+    super::parse::is_js_test_file(js_id_parts(pattern).0)
+}
+
+/// Adapt a one-line-one-case parser to [`run_streaming`]'s many-cases shape
+/// (jest's `--json` yields every case from a single stdout line, so the
+/// streaming contract is a `Vec` per line).
+fn one(parse: fn(&str) -> Option<TestCase>) -> impl Fn(&str) -> Vec<TestCase> {
+    move |line| parse(line).into_iter().collect()
+}
+
 /// Spawn `cmd`, tee stderr (compile diagnostics) to the OUTPUT channel, and run
 /// each stdout line through `parse` — every matched [`TestCase`] is streamed as
 /// it arrives. Returns the child's exit success, or `None` if it never spawned.
 fn run_streaming(
     tx: &EpochTx,
     mut cmd: Command,
-    parse: impl Fn(&str) -> Option<TestCase>,
+    parse: impl Fn(&str) -> Vec<TestCase>,
 ) -> Option<bool> {
     let mut child = match cmd.spawn() {
         Ok(c) => c,
@@ -319,7 +437,7 @@ fn run_streaming(
     if let Some(out) = child.stdout.take() {
         for line in BufReader::new(out).lines().map_while(Result::ok) {
             output::push(output::CHANNEL_TESTS, OutputLevel::Info, &line);
-            if let Some(case) = parse(&line) {
+            for case in parse(&line) {
                 tx.send(TestResponse::Case(case));
             }
         }
@@ -357,11 +475,19 @@ fn run_all(root: &Path, tx: &EpochTx) {
     let ok = match runner_for(root) {
         Some(Runner::Pytest) => {
             let cmd = pytest_cmd(root, &["-v", "--color=no"]);
-            run_streaming(tx, cmd, parse_pytest_line)
+            run_streaming(tx, cmd, one(parse_pytest_line))
+        }
+        Some(Runner::Vitest) => {
+            let cmd = js_cmd(root, "vitest", &["run", "--reporter=tap-flat"]);
+            run_streaming(tx, cmd, one(parse_vitest_tap_line))
+        }
+        Some(Runner::Jest) => {
+            let cmd = js_cmd(root, "jest", &["--json"]);
+            run_streaming(tx, cmd, |line| parse_jest_json(root, line))
         }
         _ => {
             let cmd = cargo_cmd(root, &["test", "--no-fail-fast", "--color=never"]);
-            run_streaming(tx, cmd, parse_test_line)
+            run_streaming(tx, cmd, one(parse_test_line))
         }
     }
     .unwrap_or(false);
@@ -377,11 +503,34 @@ fn run_one(root: &Path, tx: &EpochTx, name: &str) {
     let ok = match runner_for(root) {
         Some(Runner::Pytest) => {
             let cmd = pytest_cmd(root, &["-v", "--color=no", name]);
-            run_streaming(tx, cmd, parse_pytest_line)
+            run_streaming(tx, cmd, one(parse_pytest_line))
+        }
+        Some(Runner::Vitest) => {
+            // The file scopes the run; `-t` narrows to the title (a substring
+            // match on the full name, like pytest's `-k`).
+            let (file, title) = js_id_parts(name);
+            let mut args = vec!["run", file];
+            if let Some(t) = title {
+                args.extend(["-t", t]);
+            }
+            args.push("--reporter=tap-flat");
+            let cmd = js_cmd(root, "vitest", &args);
+            run_streaming(tx, cmd, one(parse_vitest_tap_line))
+        }
+        Some(Runner::Jest) => {
+            let (file, title) = js_id_parts(name);
+            let escaped = title.map(regex_escape);
+            let mut args = vec![file];
+            if let Some(t) = escaped.as_deref() {
+                args.extend(["-t", t]);
+            }
+            args.push("--json");
+            let cmd = js_cmd(root, "jest", &args);
+            run_streaming(tx, cmd, |line| parse_jest_json(root, line))
         }
         _ => {
             let cmd = cargo_cmd(root, &["test", name, "--color=never", "--", "--exact"]);
-            run_streaming(tx, cmd, parse_test_line)
+            run_streaming(tx, cmd, one(parse_test_line))
         }
     }
     .unwrap_or(false);
@@ -403,11 +552,46 @@ fn run_filter(root: &Path, tx: &EpochTx, pattern: &str) {
             } else {
                 pytest_cmd(root, &["-v", "--color=no", "-k", pattern])
             };
-            run_streaming(tx, cmd, parse_pytest_line)
+            run_streaming(tx, cmd, one(parse_pytest_line))
+        }
+        // A suite click passes a node-ID prefix (`file` or `file::describe`),
+        // run-at-cursor a bare title. The file scopes the run when present;
+        // a describe segment (or the bare title) narrows via `-t`.
+        Some(Runner::Vitest) => {
+            let mut args = vec!["run"];
+            let (file, title) = js_id_parts(pattern);
+            if is_js_file(pattern) {
+                args.push(file);
+                if let Some(t) = title {
+                    args.extend(["-t", t]);
+                }
+            } else {
+                args.extend(["-t", pattern]);
+            }
+            args.push("--reporter=tap-flat");
+            let cmd = js_cmd(root, "vitest", &args);
+            run_streaming(tx, cmd, one(parse_vitest_tap_line))
+        }
+        Some(Runner::Jest) => {
+            let mut args: Vec<String> = Vec::new();
+            if is_js_file(pattern) {
+                let (file, title) = js_id_parts(pattern);
+                args.push(file.to_string());
+                if let Some(t) = title {
+                    args.push(String::from("-t"));
+                    args.push(regex_escape(t));
+                }
+            } else {
+                args.push(String::from("-t"));
+                args.push(regex_escape(pattern));
+            }
+            args.push(String::from("--json"));
+            let cmd = js_cmd(root, "jest", &args);
+            run_streaming(tx, cmd, |line| parse_jest_json(root, line))
         }
         _ => {
             let cmd = cargo_cmd(root, &["test", pattern, "--no-fail-fast", "--color=never"]);
-            run_streaming(tx, cmd, parse_test_line)
+            run_streaming(tx, cmd, one(parse_test_line))
         }
     }
     .unwrap_or(false);
@@ -419,23 +603,47 @@ fn run_filter(root: &Path, tx: &EpochTx, pattern: &str) {
 /// still compiles the test binary, hence the Discovering state.
 fn discover(root: &Path, tx: &EpochTx) {
     tx.send(TestResponse::Started(Activity::Discovering));
+    let not_run = |name: String| TestCase {
+        name,
+        status: TestStatus::NotRun,
+    };
     match runner_for(root) {
         Some(Runner::Pytest) => {
             let cmd = pytest_cmd(root, &["--collect-only", "-q", "--color=no"]);
             run_streaming(tx, cmd, |line| {
-                parse_pytest_collect_line(line).map(|name| TestCase {
-                    name,
-                    status: TestStatus::NotRun,
-                })
+                parse_pytest_collect_line(line)
+                    .map(not_run)
+                    .into_iter()
+                    .collect()
+            });
+        }
+        Some(Runner::Vitest) => {
+            let cmd = js_cmd(root, "vitest", &["list"]);
+            run_streaming(tx, cmd, |line| {
+                parse_vitest_list_line(line)
+                    .map(not_run)
+                    .into_iter()
+                    .collect()
+            });
+        }
+        // jest can only cheaply list FILES (`--listTests`, absolute paths);
+        // per-test names come from the first run's `--json` document.
+        Some(Runner::Jest) => {
+            let cmd = js_cmd(root, "jest", &["--listTests"]);
+            run_streaming(tx, cmd, |line| {
+                let rel = Path::new(line.trim())
+                    .strip_prefix(root)
+                    .map(|p| p.display().to_string());
+                match rel {
+                    Ok(r) if !r.is_empty() => vec![not_run(r)],
+                    _ => Vec::new(),
+                }
             });
         }
         _ => {
             let cmd = cargo_cmd(root, &["test", "--color=never", "--", "--list"]);
             run_streaming(tx, cmd, |line| {
-                parse_list_line(line).map(|name| TestCase {
-                    name,
-                    status: TestStatus::NotRun,
-                })
+                parse_list_line(line).map(not_run).into_iter().collect()
             });
         }
     }
@@ -458,6 +666,42 @@ mod tests {
         let py = tempfile::tempdir().unwrap();
         std::fs::write(py.path().join("pytest.ini"), "[pytest]\n").unwrap();
         assert_eq!(runner_for(py.path()), Some(Runner::Pytest));
+    }
+
+    #[test]
+    fn runner_detection_identifies_js_runners_from_package_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("package.json"),
+            r#"{"devDependencies":{"vitest":"^3.0.0"}}"#,
+        )
+        .unwrap();
+        assert_eq!(runner_for(tmp.path()), Some(Runner::Vitest));
+        std::fs::write(
+            tmp.path().join("package.json"),
+            r#"{"devDependencies":{"jest":"^30.0.0"}}"#,
+        )
+        .unwrap();
+        assert_eq!(runner_for(tmp.path()), Some(Runner::Jest));
+        // A package.json naming neither runner detects nothing (docs tooling,
+        // a plain library) instead of shelling a tool that isn't there.
+        std::fs::write(
+            tmp.path().join("package.json"),
+            r#"{"dependencies":{"react":"^19.0.0"}}"#,
+        )
+        .unwrap();
+        assert_eq!(runner_for(tmp.path()), None);
+        // A config file marks the runner when the dep is hoisted away.
+        std::fs::write(tmp.path().join("vitest.config.ts"), "").unwrap();
+        assert_eq!(runner_for(tmp.path()), Some(Runner::Vitest));
+        // Cargo still outranks JS at a mixed root.
+        std::fs::write(tmp.path().join("Cargo.toml"), "[package]\n").unwrap();
+        assert_eq!(runner_for(tmp.path()), Some(Runner::Cargo));
+
+        let jest_cfg = tempfile::tempdir().unwrap();
+        std::fs::write(jest_cfg.path().join("package.json"), "{}").unwrap();
+        std::fs::write(jest_cfg.path().join("jest.config.js"), "").unwrap();
+        assert_eq!(runner_for(jest_cfg.path()), Some(Runner::Jest));
     }
 
     #[test]
