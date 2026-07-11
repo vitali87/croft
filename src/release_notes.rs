@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Fix,
-    summary: "The Testing view follows a workspace switch (Cmd/Ctrl+Z jump, Make Root, Open Folder): the old project's tests clear, the new project's are discovered, and results still streaming from the old root are discarded instead of polluting the tree.",
+    summary: "Terminal panes render faint text (SGR 2): Claude Code's grayed-out inline suggestions now look dimmed instead of reading as text you typed.",
 }];

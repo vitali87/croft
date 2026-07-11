@@ -2973,6 +2973,12 @@ impl Widget for &mut PtyTerminal {
                 if flags.contains(Flags::ITALIC) {
                     style = style.add_modifier(Modifier::ITALIC);
                 }
+                // SGR 2 (faint): Claude Code's ghost suggestions and other
+                // TUIs de-emphasise text with this; dropping it makes the
+                // suggestion read as typed input.
+                if flags.contains(Flags::DIM) {
+                    style = style.add_modifier(Modifier::DIM);
+                }
                 if flags.intersects(Flags::ALL_UNDERLINES) {
                     style = style.add_modifier(Modifier::UNDERLINED);
                 }
@@ -3953,6 +3959,43 @@ mod tests {
             Some(Color::Rgb(0x12, 0x34, 0x56)),
             "a palette swap must repaint SGR red with the new color"
         );
+    }
+
+    #[test]
+    fn faint_cells_render_with_the_dim_modifier() {
+        // Claude Code paints its inline ghost suggestion as default-foreground
+        // text under SGR 2 (faint). The pane must forward the flag as
+        // Modifier::DIM, or the suggestion renders at full brightness and is
+        // indistinguishable from text the user typed.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut term = PtyTerminal::new_running(
+            "/bin/sh",
+            &[
+                String::from("-c"),
+                String::from("s=QQ; printf \"\\033[2m${s}GHOST\\033[0m\\n\"; sleep 30"),
+            ],
+            tmp.path(),
+        )
+        .unwrap();
+        wait_for_grid(&term, |ls| ls.iter().any(|l| l.contains("QQGHOST")));
+        let area = Rect::new(0, 0, 60, 10);
+        let mut buf = Buffer::empty(area);
+        Widget::render(&mut term, area, &mut buf);
+        for y in 0..area.height {
+            for x in 1..area.width - 2 {
+                if buf[(x, y)].symbol() == "Q"
+                    && buf[(x + 1, y)].symbol() == "Q"
+                    && buf[(x + 2, y)].symbol() == "G"
+                {
+                    assert!(
+                        buf[(x, y)].modifier.contains(Modifier::DIM),
+                        "SGR 2 (faint) cells must carry Modifier::DIM"
+                    );
+                    return;
+                }
+            }
+        }
+        panic!("the faint sentinel never appeared in the rendered buffer");
     }
 
     #[test]
