@@ -1467,6 +1467,12 @@ pub struct Editor {
     /// file after a tab switch, exactly as `diagnostics_path` does.
     inlay_hints: Vec<crate::lsp::manager::InlayHintItem>,
     inlay_path: Option<PathBuf>,
+    /// Occurrences of the symbol under the caret (LSP documentHighlight),
+    /// already converted to `(row, start_char, end_char, write)` against the
+    /// current buffer. Cleared on every edit — the server's columns are
+    /// stale the moment the text changes — and replaced when the app's next
+    /// idle-caret request answers.
+    occurrences: Vec<(usize, usize, usize, bool)>,
     /// Decoded per-logical-line hint runs `(char_col, label)`, sorted by
     /// column. The render loop splices each label into the row as dim italic
     /// virtual cells at its anchor; every overlay painter, the caret, and
@@ -1600,6 +1606,7 @@ impl Editor {
             diagnostic_spans: Vec::new(),
             inlay_hints: Vec::new(),
             inlay_path: None,
+            occurrences: Vec::new(),
             inlay_spans: Vec::new(),
             registry: LangRegistry::new(),
             search_highlight: None,
@@ -1737,6 +1744,7 @@ impl Editor {
         self.edit_seq = self.edit_seq.wrapping_add(1);
         self.hscroll_content_cols = None;
         self.wrap_total_cache.clear();
+        self.occurrences.clear();
     }
 
     /// Install (or clear) the git-gutter HEAD baseline for `path`. The app
@@ -2377,6 +2385,43 @@ impl Editor {
         self.recompute_inlay_spans();
     }
 
+    /// Install the occurrences of the symbol under the caret, converting the
+    /// server's UTF-16 columns to character columns row by row. A multi-line
+    /// occurrence (rare, but legal) tints its first row from the start column,
+    /// its last row up to the end column, and any rows between end to end.
+    pub fn apply_occurrences(&mut self, items: Vec<crate::lsp::manager::OccurrenceItem>) {
+        self.occurrences.clear();
+        for item in items {
+            for row in item.start_line..=item.end_line {
+                let row = row as usize;
+                let Some(text) = self.lines.get(row) else {
+                    continue;
+                };
+                let cols = text.chars().count();
+                let start = if row as u32 == item.start_line {
+                    utf16_to_char_col(text, item.start_char).min(cols)
+                } else {
+                    0
+                };
+                let end = if row as u32 == item.end_line {
+                    utf16_to_char_col(text, item.end_char).min(cols)
+                } else {
+                    cols
+                };
+                if end > start {
+                    self.occurrences.push((row, start, end, item.write));
+                }
+            }
+        }
+    }
+
+    /// Drop the occurrence tints (caret moved; the app re-requests on idle).
+    pub fn clear_occurrences(&mut self) -> bool {
+        let had = !self.occurrences.is_empty();
+        self.occurrences.clear();
+        had
+    }
+
     /// Drop every inlay hint (the "Editor: Toggle Inlay Hints" off switch).
     pub fn clear_inlay_hints(&mut self) {
         self.inlay_hints = Vec::new();
@@ -2435,6 +2480,11 @@ impl Editor {
     #[cfg(test)]
     pub(crate) fn semantic_overlay_for_test(&self) -> &[Vec<HiSpan>] {
         &self.semantic_overlay
+    }
+
+    #[cfg(test)]
+    pub(crate) fn occurrence_count_for_test(&self) -> usize {
+        self.occurrences.len()
     }
 
     #[cfg(test)]
@@ -6470,6 +6520,31 @@ impl Widget for &mut Editor {
                 );
             }
 
+            // LSP occurrences of the symbol under the caret (word highlight):
+            // painted before the selection band and bracket match so both
+            // stay visible on top.
+            for &(occ_row, occ_start, occ_end, occ_write) in &self.occurrences {
+                if occ_row != line_idx {
+                    continue;
+                }
+                let bg = if occ_write {
+                    self.theme.occurrence_write_bg()
+                } else {
+                    self.theme.occurrence_bg()
+                };
+                for c in occ_start..occ_end {
+                    if c < row_start {
+                        continue;
+                    }
+                    let col = (c + inlay_cells_before(&hint_cells, c) - row_start) as u16;
+                    if col >= row_width {
+                        break;
+                    }
+                    let cell = &mut buf[(text_x + col, y)];
+                    cell.set_style(cell.style().bg(bg));
+                }
+            }
+
             if let Some(((sr, sc), (er, ec))) = sel_norm
                 && line_idx >= sr
                 && line_idx <= er
@@ -8964,6 +9039,76 @@ mod tests {
         assert!(
             !buf[(code_x, 1)].modifier.contains(Modifier::ITALIC),
             "real code cells must stay non-italic"
+        );
+    }
+
+    fn occ(
+        start_line: u32,
+        start_char: u32,
+        end_line: u32,
+        end_char: u32,
+        write: bool,
+    ) -> crate::lsp::manager::OccurrenceItem {
+        crate::lsp::manager::OccurrenceItem {
+            start_line,
+            start_char,
+            end_line,
+            end_char,
+            write,
+        }
+    }
+
+    #[test]
+    fn lsp_occurrences_paint_theme_tints_with_utf16_columns_and_clear_on_edit() {
+        // "a𐐀x = x;" — 𐐀 is one char but two UTF-16 code units, so the
+        // server's UTF-16 columns for the second `x` (units 7..8) land on
+        // char column 6, one LESS than a naive unit-as-char mapping.
+        let mut e = editor_with("a𐐀x = x;");
+        let p = std::path::PathBuf::from("/tmp/occ.rs");
+        e.path = Some(p.clone());
+        e.apply_occurrences(vec![occ(0, 0, 0, 4, true), occ(0, 7, 0, 8, false)]);
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 5,
+        };
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        (&mut e as &mut Editor).render(area, &mut buf);
+        let write_bg = e.theme.occurrence_write_bg();
+        let read_bg = e.theme.occurrence_bg();
+        let a_x = (0..area.width)
+            .find(|&x| buf[(x, 1)].symbol() == "a")
+            .expect("the identifier must be on the row");
+        for dx in 0..3 {
+            assert_eq!(
+                buf[(a_x + dx, 1)].bg,
+                write_bg,
+                "the write occurrence must tint all three identifier chars (dx={dx})"
+            );
+        }
+        let second_x = (a_x + 3..area.width)
+            .find(|&x| buf[(x, 1)].symbol() == "x")
+            .expect("the second x must be on the row");
+        assert_eq!(
+            buf[(second_x, 1)].bg,
+            read_bg,
+            "the read occurrence must tint exactly the second x"
+        );
+        assert_ne!(
+            buf[(second_x - 1, 1)].bg,
+            read_bg,
+            "the cell before the second x must stay untinted"
+        );
+        // Any edit invalidates the server's columns: the tints must vanish
+        // until the app's next idle-cursor request answers.
+        e.mark_buffer_changed();
+        let mut buf2 = ratatui::buffer::Buffer::empty(area);
+        (&mut e as &mut Editor).render(area, &mut buf2);
+        assert_ne!(
+            buf2[(second_x, 1)].bg,
+            read_bg,
+            "an edit must clear the occurrence tints"
         );
     }
 

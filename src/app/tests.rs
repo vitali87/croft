@@ -184,6 +184,41 @@ fn terminal_warning_swallows_a_key_and_dismisses_for_the_session() {
 }
 
 #[test]
+fn caret_move_clears_lsp_occurrence_tints_and_edits_already_did() {
+    // The occurrences tick keeps a resting caret's tints and drops them the
+    // moment the caret moves; a reply for the old spot must also be dropped
+    // (the in-flight request is cancelled on move).
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("occ.txt");
+    std::fs::write(&file, "one two\nthree\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.open_at(&file, 0, 0).unwrap();
+    app.tick_occurrences(); // observe the caret's resting spot
+    app.editor
+        .apply_occurrences(vec![crate::lsp::manager::OccurrenceItem {
+            start_line: 0,
+            start_char: 0,
+            end_line: 0,
+            end_char: 3,
+            write: false,
+        }]);
+    app.tick_occurrences();
+    assert_eq!(
+        app.editor.occurrence_count_for_test(),
+        1,
+        "a resting caret must keep its tints across ticks"
+    );
+    app.editor.cursor_col = 4;
+    let changed = app.tick_occurrences();
+    assert!(changed, "the clearing tick must report a redraw");
+    assert_eq!(
+        app.editor.occurrence_count_for_test(),
+        0,
+        "moving the caret must drop the old symbol's tints"
+    );
+}
+
+#[test]
 fn popup_gradient_tracks_black_theme() {
     // Popups/menus/tooltips wear the gradient + muted selection only under the
     // Black theme; Croft Dark keeps the legacy bright-blue accent so it stays

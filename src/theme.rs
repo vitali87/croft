@@ -299,6 +299,20 @@ impl Theme {
         self.blend_over_bg((0x9a, 0x9a, 0x9a), 0.35)
     }
 
+    /// Background tint under read occurrences of the symbol at the caret
+    /// (VS Code `editor.wordHighlightBackground`, #575757 at 72% alpha),
+    /// blended over each theme's background.
+    pub fn occurrence_bg(self) -> Color {
+        self.blend_over_bg((0x57, 0x57, 0x57), 0.72)
+    }
+
+    /// Background tint under write occurrences of the symbol at the caret
+    /// (VS Code `editor.wordHighlightStrongBackground`, #004972 at 72%): the
+    /// assignment site reads stronger than the uses.
+    pub fn occurrence_write_bg(self) -> Color {
+        self.blend_over_bg((0x00, 0x49, 0x72), 0.72)
+    }
+
     /// Background of the pinned sticky-scroll header rows (VS Code
     /// `editorStickyScroll.background`): the editor background lifted a hair so
     /// the pinned scope headers read as a distinct band above the content.

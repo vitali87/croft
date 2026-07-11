@@ -667,6 +667,28 @@ impl LspClient {
             .context("references")
     }
 
+    /// `textDocument/documentHighlight`: the read/write occurrences of the
+    /// symbol at a position, within this document only. Backs the editor's
+    /// occurrences tint (VS Code's word highlight), not any navigation.
+    pub async fn document_highlight(
+        &mut self,
+        uri: Url,
+        line: u32,
+        character: u32,
+    ) -> Result<Option<Vec<lsp_types::DocumentHighlight>>> {
+        self.server
+            .document_highlight(lsp_types::DocumentHighlightParams {
+                text_document_position_params: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri },
+                    position: Position { line, character },
+                },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+            })
+            .await
+            .context("document_highlight")
+    }
+
     /// `textDocument/inlayHint` over the whole document (`line_count` caps the
     /// range end). VS Code requests per viewport and stitches; one whole-file
     /// request per edit-batch is simpler and matches how croft already pulls

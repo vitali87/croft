@@ -363,6 +363,29 @@ pub struct InlayHintsUpdate {
     pub hints: Vec<InlayHintItem>,
 }
 
+/// One occurrence of the symbol under the caret
+/// (`textDocument/documentHighlight`), normalised off the LSP wire type.
+/// Positions are LSP UTF-16; the editor converts them to character columns
+/// against its own buffer, exactly as it does for diagnostics. `write` marks a
+/// Write-kind highlight (VS Code tints those stronger than reads).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OccurrenceItem {
+    pub start_line: u32,
+    pub start_char: u32,
+    pub end_line: u32,
+    pub end_char: u32,
+    pub write: bool,
+}
+
+/// The occurrences of the symbol at one caret position, tagged with the
+/// request id so the app drops a reply the caret has since moved away from.
+#[derive(Debug)]
+pub struct DocumentHighlightsResult {
+    pub request_id: u64,
+    pub path: PathBuf,
+    pub items: Vec<OccurrenceItem>,
+}
+
 /// Severity of a diagnostic, normalised off the LSP `DiagnosticSeverity`
 /// wire enum. Drives the underline colour the editor paints (VS Code: red
 /// for errors, yellow for warnings, blue/teal for info & hints).
@@ -502,6 +525,12 @@ enum Cmd {
         line: u32,
         character: u32,
     },
+    RequestDocumentHighlights {
+        request_id: u64,
+        path: PathBuf,
+        line: u32,
+        character: u32,
+    },
     RequestRename {
         request_id: u64,
         path: PathBuf,
@@ -566,6 +595,7 @@ pub struct LspManager {
     type_def_rx: std_mpsc::Receiver<TypeDefinitionResult>,
     impl_rx: std_mpsc::Receiver<ImplementationResult>,
     ref_rx: std_mpsc::Receiver<ReferencesResult>,
+    doc_highlights_rx: std_mpsc::Receiver<DocumentHighlightsResult>,
     ws_symbols_rx: std_mpsc::Receiver<WorkspaceSymbolsResult>,
     rename_rx: std_mpsc::Receiver<RenameResult>,
     format_rx: std_mpsc::Receiver<FormatResult>,
@@ -611,6 +641,7 @@ impl LspManager {
         let (type_def_tx, type_def_rx) = std_mpsc::channel();
         let (impl_tx, impl_rx) = std_mpsc::channel();
         let (ref_tx, ref_rx) = std_mpsc::channel();
+        let (doc_highlights_tx, doc_highlights_rx) = std_mpsc::channel();
         let (ws_symbols_tx, ws_symbols_rx) = std_mpsc::channel();
         let (rename_tx, rename_rx) = std_mpsc::channel();
         let (format_tx, format_rx) = std_mpsc::channel();
@@ -654,6 +685,7 @@ impl LspManager {
                 type_definition: type_def_tx,
                 implementation: impl_tx,
                 references: ref_tx,
+                document_highlights: doc_highlights_tx,
                 workspace_symbols: ws_symbols_tx,
                 rename: rename_tx,
                 formatting: format_tx,
@@ -678,6 +710,7 @@ impl LspManager {
             type_def_rx,
             impl_rx,
             ref_rx,
+            doc_highlights_rx,
             ws_symbols_rx,
             rename_rx,
             format_rx,
@@ -945,6 +978,26 @@ impl LspManager {
         self.ref_rx.try_recv().ok()
     }
 
+    /// Fire a `textDocument/documentHighlight` for the symbol at the caret;
+    /// the reply arrives via [`Self::drain_document_highlights`] tagged with
+    /// the returned id. Silent when no server supports the method — the app
+    /// simply never gets a reply to paint.
+    pub fn request_document_highlights(&mut self, path: PathBuf, line: u32, character: u32) -> u64 {
+        let id = self.next_request_id;
+        self.next_request_id += 1;
+        let _ = self.cmd_tx.send(Cmd::RequestDocumentHighlights {
+            request_id: id,
+            path,
+            line,
+            character,
+        });
+        id
+    }
+
+    pub fn drain_document_highlights(&self) -> Option<DocumentHighlightsResult> {
+        self.doc_highlights_rx.try_recv().ok()
+    }
+
     /// Whether the server for `lang` implements `textDocument/declaration`.
     /// `None` means no server has reported yet (not spawned). Read synchronously
     /// by the app to decide whether to show the "Go to Declaration" menu item.
@@ -1134,6 +1187,7 @@ struct ManagedClient {
     supports_type_definition: bool,
     supports_implementation: bool,
     supports_references: bool,
+    supports_document_highlight: bool,
     supports_workspace_symbols: bool,
     supports_rename: bool,
     supports_formatting: bool,
@@ -1199,6 +1253,7 @@ struct ResultSenders {
     type_definition: std_mpsc::Sender<TypeDefinitionResult>,
     implementation: std_mpsc::Sender<ImplementationResult>,
     references: std_mpsc::Sender<ReferencesResult>,
+    document_highlights: std_mpsc::Sender<DocumentHighlightsResult>,
     workspace_symbols: std_mpsc::Sender<WorkspaceSymbolsResult>,
     rename: std_mpsc::Sender<RenameResult>,
     formatting: std_mpsc::Sender<FormatResult>,
@@ -1351,6 +1406,22 @@ async fn worker_loop(
             } => {
                 state
                     .request_references(request_id, path, line, character, &tx.references)
+                    .await
+            }
+            Cmd::RequestDocumentHighlights {
+                request_id,
+                path,
+                line,
+                character,
+            } => {
+                state
+                    .request_document_highlights(
+                        request_id,
+                        path,
+                        line,
+                        character,
+                        &tx.document_highlights,
+                    )
                     .await
             }
             Cmd::RequestRename {
@@ -1510,6 +1581,8 @@ impl WorkerState {
                         let supports_implementation =
                             implementation_supported(&caps.implementation_provider);
                         let supports_references = one_of_supported(&caps.references_provider);
+                        let supports_document_highlight =
+                            one_of_supported(&caps.document_highlight_provider);
                         let supports_workspace_symbols =
                             one_of_supported(&caps.workspace_symbol_provider);
                         let supports_rename = one_of_supported(&caps.rename_provider);
@@ -1537,6 +1610,7 @@ impl WorkerState {
                             supports_type_definition,
                             supports_implementation,
                             supports_references,
+                            supports_document_highlight,
                             supports_workspace_symbols,
                             supports_rename,
                             supports_formatting,
@@ -2580,6 +2654,60 @@ impl WorkerState {
         });
     }
 
+    async fn request_document_highlights(
+        &mut self,
+        request_id: u64,
+        path: PathBuf,
+        line: u32,
+        character: u32,
+        tx: &std_mpsc::Sender<DocumentHighlightsResult>,
+    ) {
+        let Some(doc) = self.docs.get(&path) else {
+            return;
+        };
+        let lang = doc.language;
+        let root = doc.project_root.clone();
+        self.ensure_clients(lang, &root).await;
+        let Some(clients) = self.clients.get(&(lang, root)) else {
+            return;
+        };
+        // No unsupported reply: occurrences are a silent background
+        // decoration, so a language without the capability just never
+        // paints (the app cleared the old set when the caret moved).
+        let picked = clients
+            .iter()
+            .find(|c| c.supports_document_highlight)
+            .map(|c| (c.name.clone(), c.client.clone()));
+        let Some((server_name, client_arc)) = picked else {
+            return;
+        };
+        let Ok(uri) = Url::from_file_path(&path) else {
+            return;
+        };
+        let tx = tx.clone();
+        let path_clone = path.clone();
+        tokio::spawn(async move {
+            let mut client = client_arc.lock().await;
+            let resp = client.document_highlight(uri, line, character).await;
+            drop(client);
+            let items = match resp {
+                Ok(Some(hs)) => occurrence_items(hs),
+                Ok(None) => Vec::new(),
+                Err(e) => {
+                    log_file::log(&format!(
+                        "lsp[{server_name}] documentHighlight error: {e:#}"
+                    ));
+                    Vec::new()
+                }
+            };
+            let _ = tx.send(DocumentHighlightsResult {
+                request_id,
+                path: path_clone,
+                items,
+            });
+        });
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn request_code_action(
         &mut self,
@@ -3366,6 +3494,22 @@ fn def_locations(resp: &GotoDefinitionResponse) -> Vec<(PathBuf, u32, u32)> {
 /// (not a `GotoDefinitionResponse`), so it gets its own mapper rather than going
 /// through `def_locations`. Locations whose URI is not a local file path are
 /// dropped (the same rule `def_locations` applies).
+/// Normalise `textDocument/documentHighlight` wire items into croft's own
+/// UTF-16-positioned occurrence spans. A missing kind defaults to a read
+/// tint, matching VS Code (Text and Read share `wordHighlightBackground`;
+/// only Write gets the strong tint).
+fn occurrence_items(hs: Vec<lsp_types::DocumentHighlight>) -> Vec<OccurrenceItem> {
+    hs.into_iter()
+        .map(|h| OccurrenceItem {
+            start_line: h.range.start.line,
+            start_char: h.range.start.character,
+            end_line: h.range.end.line,
+            end_char: h.range.end.character,
+            write: h.kind == Some(lsp_types::DocumentHighlightKind::WRITE),
+        })
+        .collect()
+}
+
 fn reference_locations(locs: &[Location]) -> Vec<(PathBuf, u32, u32)> {
     locs.iter()
         .filter_map(|l| {
@@ -5151,6 +5295,189 @@ while True:
                 },
             ],
             "both label shapes must normalise, padding folded in"
+        );
+        runtime.handle().clone().block_on(state.shutdown_all());
+    }
+
+    #[test]
+    fn occurrence_items_map_ranges_and_the_write_kind() {
+        use lsp_types::{DocumentHighlight, DocumentHighlightKind, Position, Range};
+        let hs = vec![
+            DocumentHighlight {
+                range: Range {
+                    start: Position {
+                        line: 2,
+                        character: 4,
+                    },
+                    end: Position {
+                        line: 2,
+                        character: 9,
+                    },
+                },
+                kind: Some(DocumentHighlightKind::WRITE),
+            },
+            DocumentHighlight {
+                range: Range {
+                    start: Position {
+                        line: 5,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 5,
+                        character: 5,
+                    },
+                },
+                kind: None,
+            },
+        ];
+        assert_eq!(
+            occurrence_items(hs),
+            vec![
+                OccurrenceItem {
+                    start_line: 2,
+                    start_char: 4,
+                    end_line: 2,
+                    end_char: 9,
+                    write: true,
+                },
+                OccurrenceItem {
+                    start_line: 5,
+                    start_char: 0,
+                    end_line: 5,
+                    end_char: 5,
+                    write: false,
+                },
+            ],
+            "WRITE maps to write=true; an absent kind defaults to a read tint"
+        );
+    }
+
+    /// A fake server that advertises `documentHighlightProvider` and answers
+    /// `textDocument/documentHighlight` with one write and one kindless
+    /// occurrence, covering the wire shapes end to end.
+    const FAKE_LSP_HIGHLIGHT: &str = r#"
+import json, sys
+
+def read_msg():
+    length = None
+    while True:
+        line = sys.stdin.buffer.readline()
+        if not line:
+            return None
+        line = line.strip()
+        if not line:
+            break
+        if line.lower().startswith(b"content-length:"):
+            length = int(line.split(b":")[1])
+    if length is None:
+        return None
+    return json.loads(sys.stdin.buffer.read(length))
+
+def send(msg):
+    body = json.dumps(msg).encode()
+    sys.stdout.buffer.write(b"Content-Length: %d\r\n\r\n" % len(body))
+    sys.stdout.buffer.write(body)
+    sys.stdout.buffer.flush()
+
+while True:
+    msg = read_msg()
+    if msg is None:
+        break
+    method = msg.get("method", "")
+    if "id" in msg:
+        if method == "initialize":
+            send({"jsonrpc": "2.0", "id": msg["id"],
+                  "result": {"capabilities": {"documentHighlightProvider": True}}})
+        elif method == "textDocument/documentHighlight":
+            send({"jsonrpc": "2.0", "id": msg["id"], "result": [
+                {"range": {"start": {"line": 0, "character": 0},
+                           "end": {"line": 0, "character": 1}},
+                 "kind": 3},
+                {"range": {"start": {"line": 0, "character": 4},
+                           "end": {"line": 0, "character": 5}}},
+            ]})
+        else:
+            send({"jsonrpc": "2.0", "id": msg["id"], "result": None})
+    if method == "exit":
+        break
+"#;
+
+    /// The full worker wire path for occurrences: capability gate,
+    /// `textDocument/documentHighlight` request, kind normalisation, and the
+    /// request-id-tagged reply on the drain channel.
+    #[test]
+    fn request_document_highlights_round_trips_through_a_highlighting_server() {
+        if !is_on_path("python3") {
+            eprintln!("SKIPPED: python3 not on PATH");
+            return;
+        }
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().canonicalize().expect("canonicalize");
+        let file = root.join("demo.py");
+        std::fs::write(&file, "x = 1; x\n").expect("write demo");
+        let script = root.join("fake_highlight_lsp.py");
+        std::fs::write(&script, FAKE_LSP_HIGHLIGHT).expect("write fake server");
+
+        let mut registry = ServerRegistry::new();
+        registry.register(
+            Language::PYTHON,
+            ServerConfig {
+                name: "fake-highlight",
+                command: "python3".into(),
+                args: vec![script.display().to_string()],
+                language: Language::PYTHON,
+                initialization_options: None,
+                provision: None,
+            },
+        );
+        let (diag_tx, _diag_rx) = std_mpsc::channel();
+        let (prog_tx, _prog_rx) = std_mpsc::channel();
+        let mut state = WorkerState {
+            workspace_root: root.clone(),
+            registry,
+            clients: HashMap::new(),
+            docs: HashMap::new(),
+            capability_support: Arc::new(StdMutex::new(LangCapabilitySupport::default())),
+            semantic_refresh: Arc::new(AtomicBool::new(false)),
+            inlay_refresh: Arc::new(AtomicBool::new(false)),
+            diagnostics_tx: diag_tx,
+            progress_tx: prog_tx,
+        };
+
+        let (tx, rx) = std_mpsc::channel();
+        let runtime = LspRuntime::new().expect("runtime");
+        runtime.handle().clone().block_on(async {
+            state
+                .open_doc(file.clone(), String::from("x = 1; x\n"))
+                .await;
+            state
+                .request_document_highlights(7, file.clone(), 0, 0, &tx)
+                .await;
+        });
+
+        let result = rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("a document-highlight reply must reach the drain channel");
+        assert_eq!(result.request_id, 7, "the reply must echo the request id");
+        assert_eq!(result.path, file);
+        assert_eq!(
+            result.items,
+            vec![
+                OccurrenceItem {
+                    start_line: 0,
+                    start_char: 0,
+                    end_line: 0,
+                    end_char: 1,
+                    write: true,
+                },
+                OccurrenceItem {
+                    start_line: 0,
+                    start_char: 4,
+                    end_line: 0,
+                    end_char: 5,
+                    write: false,
+                },
+            ]
         );
         runtime.handle().clone().block_on(state.shutdown_all());
     }

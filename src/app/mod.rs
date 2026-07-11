@@ -2420,6 +2420,14 @@ pub struct App {
     outline_synced: Option<(PathBuf, Option<u64>)>,
     implementation_request_id: Option<u64>,
     references_request_id: Option<u64>,
+    /// In-flight documentHighlight request, with the (path, row, col,
+    /// edit_seq) it was fired for so a reply for a caret or buffer state the
+    /// editor has since left is dropped.
+    occurrences_request: Option<(u64, PathBuf, usize, usize, u64)>,
+    /// The caret state `tick_occurrences` last observed, and when it changed.
+    /// A caret resting on one spot for `OCCURRENCES_IDLE` fires one request.
+    occ_observed: Option<(PathBuf, usize, usize, u64)>,
+    occ_observed_at: std::time::Instant,
     rename_request_id: Option<u64>,
     format_request_id: Option<u64>,
     code_action_request_id: Option<u64>,
@@ -3436,6 +3444,9 @@ impl App {
             type_definition_request_id: None,
             implementation_request_id: None,
             references_request_id: None,
+            occurrences_request: None,
+            occ_observed: None,
+            occ_observed_at: std::time::Instant::now(),
             nav: NavHistory::default(),
         };
         // Initialise the per-pane focus/gradient flags to match the starting
@@ -6700,6 +6711,82 @@ impl App {
             _ => self.open_location_picker(targets, "references"),
         }
         true
+    }
+
+    /// Idle-caret occurrences trigger, run once per frame: when the caret has
+    /// rested on one buffer position for `OCCURRENCES_IDLE`, fire ONE
+    /// `documentHighlight` request for it; the moment it moves (or the buffer
+    /// edits), drop the painted set. Mirrors VS Code's word highlight, which
+    /// follows the cursor with a small debounce rather than every keystroke.
+    pub fn tick_occurrences(&mut self) -> bool {
+        const OCCURRENCES_IDLE: std::time::Duration = std::time::Duration::from_millis(250);
+        let eligible = self.editor.diff.is_none()
+            && self.editor.sheet.is_none()
+            && self.editor.image.is_none()
+            && self.lsp.is_some();
+        let Some(path) = self.editor.path.clone().filter(|_| eligible) else {
+            self.occ_observed = None;
+            self.occurrences_request = None;
+            return self.editor.clear_occurrences();
+        };
+        let cur = (
+            path,
+            self.editor.cursor_row,
+            self.editor.cursor_col,
+            self.editor.edit_seq,
+        );
+        if self.occ_observed.as_ref() != Some(&cur) {
+            self.occ_observed = Some(cur);
+            self.occ_observed_at = std::time::Instant::now();
+            // The old symbol's tints are stale the moment the caret leaves it
+            // (an edit already cleared them via mark_buffer_changed), and an
+            // in-flight reply for the old spot must never paint late.
+            self.occurrences_request = None;
+            return self.editor.clear_occurrences();
+        }
+        let already_requested = self
+            .occurrences_request
+            .as_ref()
+            .is_some_and(|(_, p, r, c, s)| (p, r, c, s) == (&cur.0, &cur.1, &cur.2, &cur.3));
+        if already_requested || self.occ_observed_at.elapsed() < OCCURRENCES_IDLE {
+            return false;
+        }
+        let Some(lsp) = self.lsp.as_mut() else {
+            return false;
+        };
+        let id = lsp.request_document_highlights(cur.0.clone(), cur.1 as u32, cur.2 as u32);
+        self.occurrences_request = Some((id, cur.0, cur.1, cur.2, cur.3));
+        false
+    }
+
+    /// Apply a documentHighlight reply to the editor, dropping it unless it
+    /// answers the in-flight request AND the editor still shows that file at
+    /// that edit seq (the columns were computed against that text).
+    pub fn drain_lsp_document_highlights(&mut self) -> bool {
+        let mut results = Vec::new();
+        {
+            let Some(lsp) = self.lsp.as_ref() else {
+                return false;
+            };
+            while let Some(r) = lsp.drain_document_highlights() {
+                results.push(r);
+            }
+        }
+        let mut changed = false;
+        for result in results {
+            let Some((id, path, _row, _col, seq)) = self.occurrences_request.as_ref() else {
+                continue;
+            };
+            if result.request_id != *id
+                || self.editor.path.as_deref() != Some(path.as_path())
+                || self.editor.edit_seq != *seq
+            {
+                continue;
+            }
+            self.editor.apply_occurrences(result.items);
+            changed = true;
+        }
+        changed
     }
 
     /// Build a multi-location picker as a `ContextMenu` anchored at the editor
@@ -29901,6 +29988,8 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let type_definition_changed = app.drain_lsp_type_definition();
         let implementation_changed = app.drain_lsp_implementation();
         let references_changed = app.drain_lsp_references();
+        let occ_tick_changed = app.tick_occurrences();
+        let occurrences_changed = app.drain_lsp_document_highlights();
         let rename_changed = app.drain_lsp_rename();
         let format_changed = app.drain_lsp_format();
         let code_action_changed = app.drain_lsp_code_actions();
@@ -29959,6 +30048,8 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             || type_definition_changed
             || implementation_changed
             || references_changed
+            || occ_tick_changed
+            || occurrences_changed
             || rename_changed
             || format_changed
             || code_action_changed
