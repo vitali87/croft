@@ -6687,6 +6687,126 @@ fn mouse_wheel_over_search_panel_scrolls_the_results_list() {
 }
 
 #[test]
+fn mouse_wheel_over_the_commits_graph_scrolls_it() {
+    // Codeberg #41: the COMMITS section cannot be scrolled. The graph
+    // renders BELOW the change list in its own strip, outside
+    // source_control.last_area, so the sidebar hit-test (`in_tree`)
+    // never matched and wheel events over the graph fell through.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.sidebar_view = SidebarView::SourceControl;
+    app.show_tree = true;
+    app.source_control.status.in_repo = true;
+    let commits: Vec<crate::git::GraphCommit> = (0..100)
+        .map(|i| crate::git::GraphCommit {
+            hash: format!("{i:040x}"),
+            short_hash: format!("{i:07x}"),
+            parents: vec![format!("{:040x}", i + 1)],
+            refs: Vec::new(),
+            summary: format!("commit {i}"),
+            author: String::from("t"),
+            age_secs: 0,
+        })
+        .collect();
+    app.commit_graph
+        .set_rows(crate::widgets::commit_graph::layout_graph(commits));
+
+    let backend = ratatui::backend::TestBackend::new(100, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|frame| app.render(frame)).unwrap();
+
+    let area = app.commit_graph.last_area;
+    assert!(area.height > 3, "the COMMITS section must render");
+    let (col, row) = (area.x + 2, area.y + 2);
+    assert!(
+        !rect_contains(app.source_control.last_area, col, row),
+        "the probe cell must sit in the graph strip, below the change list"
+    );
+    let before = app
+        .commit_graph
+        .commit_at(row)
+        .expect("probe row must land on a commit")
+        .hash
+        .clone();
+    app.handle_mouse(mouse(
+        crossterm::event::MouseEventKind::ScrollDown,
+        col,
+        row,
+    ));
+    let after = app
+        .commit_graph
+        .commit_at(row)
+        .expect("scrolled probe row must still land on a commit")
+        .hash
+        .clone();
+    assert_ne!(
+        before, after,
+        "wheel-down over the COMMITS section must scroll the graph"
+    );
+    app.handle_mouse(mouse(crossterm::event::MouseEventKind::ScrollUp, col, row));
+    assert_eq!(
+        app.commit_graph.commit_at(row).map(|c| c.hash.clone()),
+        Some(before),
+        "wheel-up must scroll the graph back to the top"
+    );
+}
+
+#[test]
+fn commits_graph_scrollbar_thumb_drag_follows_the_pointer() {
+    // Codeberg #41 companion: every other sidebar section's scrollbar
+    // supports a thumb drag (outline, timeline, testing, …); the COMMITS
+    // graph's must too, not just a single jump-click.
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.sidebar_view = SidebarView::SourceControl;
+    app.show_tree = true;
+    app.source_control.status.in_repo = true;
+    let commits: Vec<crate::git::GraphCommit> = (0..100)
+        .map(|i| crate::git::GraphCommit {
+            hash: format!("{i:040x}"),
+            short_hash: format!("{i:07x}"),
+            parents: vec![format!("{:040x}", i + 1)],
+            refs: Vec::new(),
+            summary: format!("commit {i}"),
+            author: String::from("t"),
+            age_secs: 0,
+        })
+        .collect();
+    app.commit_graph
+        .set_rows(crate::widgets::commit_graph::layout_graph(commits));
+
+    let backend = ratatui::backend::TestBackend::new(100, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|frame| app.render(frame)).unwrap();
+
+    let bar = app.commit_graph.last_scrollbar;
+    assert!(
+        bar.width > 0 && bar.height > 2,
+        "100 commits in a capped strip must draw a scrollbar"
+    );
+    let body_row = app.commit_graph.last_area.y + 2;
+    let top = app
+        .commit_graph
+        .commit_at(body_row)
+        .expect("probe row must land on a commit")
+        .hash
+        .clone();
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), bar.x, bar.y));
+    app.handle_mouse(mouse(
+        MouseEventKind::Drag(MouseButton::Left),
+        bar.x,
+        bar.y + bar.height - 1,
+    ));
+    assert_ne!(
+        app.commit_graph.commit_at(body_row).map(|c| c.hash.clone()),
+        Some(top),
+        "dragging the thumb to the lane's bottom must scroll the graph"
+    );
+    app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), bar.x, bar.y));
+}
+
+#[test]
 fn search_panel_paints_a_scrollbar_when_hits_exceed_visible_rows() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();

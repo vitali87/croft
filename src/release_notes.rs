@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Fix,
-    summary: "Terminal panes render faint text (SGR 2): Claude Code's grayed-out inline suggestions now look dimmed instead of reading as text you typed.",
+    summary: "The COMMITS graph scrolls: the section rendered outside the Source Control panel's hit-test rect, so the wheel, row clicks, and the scrollbar were all dead over it; the scrollbar thumb now also drags instead of the press being swallowed by the sidebar splitter.",
 }];

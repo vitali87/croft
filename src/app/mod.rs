@@ -2033,6 +2033,7 @@ pub struct App {
     timeline_scrollbar_drag: bool,
     deps_scrollbar_drag: bool,
     testing_scrollbar_drag: bool,
+    graph_scrollbar_drag: bool,
     welcome: WelcomeState,
     /// One-shot background refresh of the remote extension index. Polled in the
     /// main loop; rebuilds the Extensions panel once if the verified cache
@@ -3224,6 +3225,7 @@ impl App {
             timeline_scrollbar_drag: false,
             deps_scrollbar_drag: false,
             testing_scrollbar_drag: false,
+            graph_scrollbar_drag: false,
             welcome,
             ext_index_refresh,
             ext_index_manual_refresh: false,
@@ -22385,7 +22387,14 @@ impl App {
             SidebarView::Extensions => self.extensions.last_area,
             SidebarView::Testing => self.testing.last_area,
         };
-        let in_tree = self.show_tree && rect_contains(active_sidebar_area, m.column, m.row);
+        // The COMMITS graph docks BELOW the change list in its own strip, so
+        // `source_control.last_area` alone misses it; without this union the
+        // graph's wheel-scroll and click handlers (all gated on `in_tree`)
+        // are unreachable (Codeberg #41).
+        let in_commit_graph = self.sidebar_view == SidebarView::SourceControl
+            && rect_contains(self.commit_graph.last_area, m.column, m.row);
+        let in_tree = self.show_tree
+            && (rect_contains(active_sidebar_area, m.column, m.row) || in_commit_graph);
         // The OUTLINE section sits below the tree in the Explorer sidebar and
         // scrolls independently, so wheel events over it must reach the panel
         // rather than the tree above.
@@ -22798,8 +22807,11 @@ impl App {
                     // column, and its command decoration dots live there: a
                     // press on a dot cell must reach the decoration handler,
                     // not start a resize (the rest of the column still drags).
+                    // The COMMITS graph draws no right border either, so its
+                    // scrollbar shares the same column (Codeberg #41).
                     if (m.column == x || m.column == x.saturating_sub(1))
                         && !rect_contains(self.outline.last_scrollbar, m.column, m.row)
+                        && !rect_contains(self.commit_graph.last_scrollbar, m.column, m.row)
                         && self.decoration_dot_at(m.column, m.row).is_none()
                     {
                         self.splitter_drag = Some(SplitterDrag::Sidebar);
@@ -23229,6 +23241,7 @@ impl App {
                     if rect_contains(self.commit_graph.last_area, m.column, m.row) {
                         if rect_contains(self.commit_graph.last_scrollbar, m.column, m.row) {
                             self.commit_graph.scroll_to_bar_y(m.row);
+                            self.graph_scrollbar_drag = true;
                         } else if self.commit_graph.hit_header(m.column, m.row) {
                             self.commit_graph.toggle_collapse();
                         } else if let Some((hash, short)) = self
@@ -23771,6 +23784,10 @@ impl App {
                     self.testing.scroll_to_bar_y(m.row);
                     return;
                 }
+                if self.graph_scrollbar_drag {
+                    self.commit_graph.scroll_to_bar_y(m.row);
+                    return;
+                }
                 if let Some(pane) = self.scrollbar_drag {
                     match pane {
                         Pane::Tree => match self.sidebar_view {
@@ -23970,6 +23987,9 @@ impl App {
                     return;
                 }
                 if std::mem::take(&mut self.testing_scrollbar_drag) {
+                    return;
+                }
+                if std::mem::take(&mut self.graph_scrollbar_drag) {
                     return;
                 }
                 if let Some(drag) = self.tree_drag.take() {
