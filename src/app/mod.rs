@@ -13121,6 +13121,12 @@ impl App {
             self.status = String::from("Run Test at Cursor: no function at the caret");
             return;
         };
+        self.run_named_test(name);
+    }
+
+    /// Start the test `name` through the worker and reveal the Testing view —
+    /// the shared tail of run-at-cursor and the editor's gutter play glyph.
+    fn run_named_test(&mut self, name: String) {
         if self.testing.is_busy() {
             return;
         }
@@ -23723,6 +23729,13 @@ impl App {
                             self.editor_click.record(now, m.column, m.row);
                         }
                         self.poke_cursor();
+                        return;
+                    }
+                    // Gutter play glyph: run the test fn defined on the
+                    // clicked line (VS Code's run bead). Sits in the sign
+                    // margin one cell left of the fold chevron.
+                    if let Some(name) = self.editor.test_glyph_at(m.column, m.row) {
+                        self.run_named_test(name);
                         return;
                     }
                     // Fold chevron in the gutter: toggle the fold, don't anchor

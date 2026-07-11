@@ -219,6 +219,29 @@ fn caret_move_clears_lsp_occurrence_tints_and_edits_already_did() {
 }
 
 #[test]
+fn clicking_the_gutter_play_glyph_runs_that_test() {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let tmp = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("t.rs");
+    std::fs::write(&f, "#[test]\nfn my_case() { assert!(true); }\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&f).unwrap();
+    let backend = ratatui::backend::TestBackend::new(100, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|frame| app.render(frame)).unwrap();
+    // The play glyph sits in the sign margin on `fn my_case`'s row (buffer
+    // line 1 -> second content row). Drive the REAL mouse dispatch so a
+    // splitter grab zone or click-ordering regression fails this test.
+    let col = app.editor.last_inner.x;
+    let row = app.editor.last_inner.y + 1;
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), col, row));
+    assert_eq!(
+        app.status, "Running test my_case",
+        "the glyph click must start that test by name"
+    );
+}
+
+#[test]
 fn popup_gradient_tracks_black_theme() {
     // Popups/menus/tooltips wear the gradient + muted selection only under the
     // Black theme; Croft Dark keeps the legacy bright-blue accent so it stays

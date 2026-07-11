@@ -791,6 +791,11 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 description: "Step out",
                 handler: "",
             },
+            ShortcutEntry {
+                keys: "Click \u{eb2c} in the gutter",
+                description: "Run the test function defined on that line (the green play glyph on #[test] fns and pytest test_* defs)",
+                handler: "",
+            },
         ],
     },
     ShortcutGroup {

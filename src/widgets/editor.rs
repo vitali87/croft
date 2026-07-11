@@ -1711,6 +1711,23 @@ impl Editor {
         false
     }
 
+    /// If `(col, row)` lands on a test fn's gutter play glyph, the test's
+    /// name — the app runs it. Same geometry as the fold chevron, one cell
+    /// left (`inner.x`, the sign margin the breakpoint dot shares).
+    pub fn test_glyph_at(&self, col: u16, row: u16) -> Option<String> {
+        if col != self.last_inner.x || row < self.last_inner.y {
+            return None;
+        }
+        let &(line, start, _) = self
+            .last_wrap_rows
+            .get((row - self.last_inner.y) as usize)?;
+        // The glyph draws only on the definition's first visual row.
+        if self.wrap_enabled() && start != 0 {
+            return None;
+        }
+        crate::testing::locate::test_fn_on_line(&self.lines, line)
+    }
+
     /// 1-based breakpoint lines for `path`, ascending, for a DAP
     /// `setBreakpoints` request.
     pub fn breakpoint_lines(&self, path: &Path) -> Vec<u32> {
@@ -6309,6 +6326,7 @@ impl Widget for &mut Editor {
             // (`inner.x`), VS Code-style, so it never crowds the line number or
             // the code and the number-to-code gap is untouched.
             let sign_x = inner.x;
+            let mut sign_taken = false;
             if (!wrap || row_start == 0)
                 && let Some(path) = self.path.as_deref()
             {
@@ -6336,6 +6354,7 @@ impl Widget for &mut Editor {
                         "▶",
                         Style::default().fg(Color::Rgb(0xff, 0xcc, 0x00)),
                     );
+                    sign_taken = true;
                 } else if is_bp {
                     // Hollow dimmed ring when the adapter could not bind it; a
                     // diamond for a conditional breakpoint; a solid red dot for a
@@ -6348,7 +6367,24 @@ impl Widget for &mut Editor {
                         ("●", Color::Rgb(0xe5, 0x1c, 0x23))
                     };
                     buf.set_string(sign_x, y, glyph, Style::default().fg(color));
+                    sign_taken = true;
                 }
+            }
+
+            // Testing gutter glyph: the play button beside a test fn's
+            // definition (VS Code's run bead, in its testing green), sharing
+            // the sign cell with the debugger — whose stop arrow and
+            // breakpoint dot both outrank it.
+            if (!wrap || row_start == 0)
+                && !sign_taken
+                && crate::testing::locate::test_fn_on_line(&self.lines, line_idx).is_some()
+            {
+                buf.set_string(
+                    sign_x,
+                    y,
+                    "\u{eb2c}", // cod-play, the Testing panel's run glyph
+                    Style::default().fg(Color::Rgb(0x73, 0xc9, 0x91)),
+                );
             }
 
             // Fold chevron: on a foldable header's first visual row, in the
@@ -9039,6 +9075,67 @@ mod tests {
         assert!(
             !buf[(code_x, 1)].modifier.contains(Modifier::ITALIC),
             "real code cells must stay non-italic"
+        );
+    }
+
+    #[test]
+    fn gutter_play_glyph_marks_test_fns_and_maps_clicks_to_the_name() {
+        let mut e = editor_with("#[test]\nfn my_case() {}\nfn helper() {}");
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 6,
+        };
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        (&mut e as &mut Editor).render(area, &mut buf);
+        let sign_x = e.last_inner.x;
+        // Buffer line 1 (`fn my_case`) paints on content row y = 2.
+        assert_eq!(
+            buf[(sign_x, 2)].symbol(),
+            "\u{eb2c}",
+            "a test fn's first row must wear the play glyph in the sign margin"
+        );
+        assert_ne!(
+            buf[(sign_x, 3)].symbol(),
+            "\u{eb2c}",
+            "a plain fn must not wear the glyph"
+        );
+        assert_eq!(
+            e.test_glyph_at(sign_x, 2).as_deref(),
+            Some("my_case"),
+            "clicking the glyph must resolve the test's name"
+        );
+        assert_eq!(
+            e.test_glyph_at(sign_x, 3),
+            None,
+            "clicking the sign margin of a non-test line resolves nothing"
+        );
+        assert_eq!(
+            e.test_glyph_at(sign_x + 1, 2),
+            None,
+            "the fold-chevron column is not the play glyph"
+        );
+    }
+
+    #[test]
+    fn gutter_play_glyph_yields_to_a_breakpoint_dot() {
+        let mut e = editor_with("#[test]\nfn my_case() {}");
+        let p = std::path::PathBuf::from("/tmp/bp.rs");
+        e.path = Some(p.clone());
+        e.breakpoints.entry(p).or_default().insert(2); // 1-based: the fn line
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 5,
+        };
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        (&mut e as &mut Editor).render(area, &mut buf);
+        assert_eq!(
+            buf[(e.last_inner.x, 2)].symbol(),
+            "●",
+            "a breakpoint on the fn line owns the shared sign cell"
         );
     }
 

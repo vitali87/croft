@@ -99,6 +99,31 @@ pub fn enclosing_fn_name(lines: &[String], cursor_row: usize) -> Option<String> 
     None
 }
 
+/// The name of the TEST function whose definition starts on `lines[idx]`, or
+/// `None` when the line defines no function or the function is not a test.
+/// Backs the editor's gutter play glyph. Python follows pytest's collection
+/// convention (`def test_*`); Rust requires a `test`-carrying attribute
+/// (`#[test]`, `#[tokio::test]`, `#[rstest]`, ...) in the contiguous
+/// attribute block directly above the `fn`.
+pub fn test_fn_on_line(lines: &[String], idx: usize) -> Option<String> {
+    let line = lines.get(idx)?;
+    if let Some(name) = name_after(line, "def ") {
+        return name.starts_with("test").then_some(name);
+    }
+    let name = name_after(line, "fn ")?;
+    // Walk the attribute block upward; any attribute naming "test" marks it.
+    for above in lines[..idx].iter().rev() {
+        let t = above.trim_start();
+        if !t.starts_with("#[") {
+            break;
+        }
+        if t.contains("test") {
+            return Some(name);
+        }
+    }
+    None
+}
+
 /// Extract the identifier after a function keyword (`fn ` for Rust, `def ` for
 /// Python) in a single line, or `None`. Deliberately simple: it does not skip
 /// keywords inside comments or strings, which is a rare enough case for a
@@ -241,5 +266,58 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("a.rs"), "fn something_else() {}\n").unwrap();
         assert!(find_test_source(tmp.path(), "m::nope").is_none());
+    }
+
+    #[test]
+    fn test_fn_on_line_detects_rust_test_attributes() {
+        let lines: Vec<String> = [
+            "fn helper() {}",
+            "#[test]",
+            "fn plain_case() {}",
+            "#[rstest]",
+            "#[tokio::test(flavor = \"multi_thread\")]",
+            "async fn async_case() {}",
+            "#[derive(Debug)]",
+            "fn derived_not_a_test() {}",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(test_fn_on_line(&lines, 0), None, "no attribute, no test");
+        assert_eq!(test_fn_on_line(&lines, 2).as_deref(), Some("plain_case"));
+        assert_eq!(
+            test_fn_on_line(&lines, 5).as_deref(),
+            Some("async_case"),
+            "tokio::test in a stacked attribute block must count"
+        );
+        assert_eq!(
+            test_fn_on_line(&lines, 7),
+            None,
+            "a non-test attribute above a fn must not count"
+        );
+        assert_eq!(
+            test_fn_on_line(&lines, 1),
+            None,
+            "attribute lines define no fn"
+        );
+    }
+
+    #[test]
+    fn test_fn_on_line_detects_pytest_defs_by_name() {
+        let lines: Vec<String> = [
+            "def test_first():",
+            "def helper():",
+            "    async def test_inner(self):",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(test_fn_on_line(&lines, 0).as_deref(), Some("test_first"));
+        assert_eq!(
+            test_fn_on_line(&lines, 1),
+            None,
+            "pytest only collects test_*"
+        );
+        assert_eq!(test_fn_on_line(&lines, 2).as_deref(), Some("test_inner"));
     }
 }
