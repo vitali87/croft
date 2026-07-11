@@ -1,0 +1,16 @@
+# Bundled croft extension: Rust test runner.
+# Points the Testing view's cargo libtest mechanism (src/testing/worker.rs) at
+# Cargo workspaces. The commands and parsers stay native; this manifest only
+# declares which marker files route to the cargo mechanism. Disabling this
+# extension stops the Testing view from detecting Rust projects.
+id = "test-cargo"
+name = "Rust Test Runner"
+description = "Discover and run Rust tests with cargo test in the Testing view."
+builtin = true
+api_version = 1
+
+[[test_runners]]
+id = "test-cargo"
+label = "cargo test"
+kind = "cargo"
+markers = ["Cargo.toml"]

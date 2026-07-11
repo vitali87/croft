@@ -18,8 +18,8 @@ use super::parse::{
 use crate::output::{self, OutputLevel};
 use crate::widgets::testing::TestingPanel;
 
-/// Which test tool a workspace uses, detected from its manifest files. Cargo
-/// wins when both manifests exist (a mixed repo's root is usually the crate).
+/// Which built-in run mechanism a workspace's tests use. Which one a given
+/// root resolves to is manifest data ([`super::registry`]), not code.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Runner {
     Cargo,
@@ -28,63 +28,11 @@ pub enum Runner {
     Jest,
 }
 
-/// The manifest files that mark a Python project pytest can run in.
-const PYTHON_MARKERS: [&str; 5] = [
-    "pyproject.toml",
-    "pytest.ini",
-    "setup.cfg",
-    "setup.py",
-    "tox.ini",
-];
-
-/// Detect the workspace's test runner. `None` means no recognised test project,
+/// Detect the workspace's test runner from the enabled extensions'
+/// `[[test_runners]]` declarations. `None` means no recognised test project,
 /// so the Testing view stays empty instead of shelling a tool that would error.
 pub fn runner_for(root: &Path) -> Option<Runner> {
-    if root.join("Cargo.toml").is_file() {
-        return Some(Runner::Cargo);
-    }
-    if let Some(js) = js_runner_for(root) {
-        return Some(js);
-    }
-    PYTHON_MARKERS
-        .iter()
-        .any(|m| root.join(m).is_file())
-        .then_some(Runner::Pytest)
-}
-
-/// The JS runner a package.json project uses: named in its (dev)dependencies,
-/// or marked by a config file when the dep is hoisted out of sight (a
-/// monorepo sub-package). A package.json naming neither is NOT a test
-/// project — plenty of repos carry one only for docs tooling.
-fn js_runner_for(root: &Path) -> Option<Runner> {
-    if !root.join("package.json").is_file() {
-        return None;
-    }
-    if let Ok(text) = std::fs::read_to_string(root.join("package.json"))
-        && let Ok(pkg) = serde_json::from_str::<serde_json::Value>(&text)
-    {
-        for section in ["devDependencies", "dependencies"] {
-            if let Some(deps) = pkg.get(section).and_then(|d| d.as_object()) {
-                if deps.contains_key("vitest") {
-                    return Some(Runner::Vitest);
-                }
-                if deps.contains_key("jest") {
-                    return Some(Runner::Jest);
-                }
-            }
-        }
-    }
-    for ext in ["ts", "js", "mts", "mjs"] {
-        if root.join(format!("vitest.config.{ext}")).is_file() {
-            return Some(Runner::Vitest);
-        }
-    }
-    for ext in ["js", "ts", "mjs", "cjs", "json"] {
-        if root.join(format!("jest.config.{ext}")).is_file() {
-            return Some(Runner::Jest);
-        }
-    }
-    None
+    super::registry::runner_for(root)
 }
 
 pub enum TestRequest {
@@ -715,56 +663,6 @@ fn discover(root: &Path, tx: &EpochTx) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn runner_detection_prefers_cargo_then_python_markers() {
-        let tmp = tempfile::tempdir().unwrap();
-        assert_eq!(runner_for(tmp.path()), None, "no manifest, no runner");
-        std::fs::write(tmp.path().join("pyproject.toml"), "[project]\n").unwrap();
-        assert_eq!(runner_for(tmp.path()), Some(Runner::Pytest));
-        std::fs::write(tmp.path().join("Cargo.toml"), "[package]\n").unwrap();
-        assert_eq!(runner_for(tmp.path()), Some(Runner::Cargo));
-
-        let py = tempfile::tempdir().unwrap();
-        std::fs::write(py.path().join("pytest.ini"), "[pytest]\n").unwrap();
-        assert_eq!(runner_for(py.path()), Some(Runner::Pytest));
-    }
-
-    #[test]
-    fn runner_detection_identifies_js_runners_from_package_json() {
-        let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(
-            tmp.path().join("package.json"),
-            r#"{"devDependencies":{"vitest":"^3.0.0"}}"#,
-        )
-        .unwrap();
-        assert_eq!(runner_for(tmp.path()), Some(Runner::Vitest));
-        std::fs::write(
-            tmp.path().join("package.json"),
-            r#"{"devDependencies":{"jest":"^30.0.0"}}"#,
-        )
-        .unwrap();
-        assert_eq!(runner_for(tmp.path()), Some(Runner::Jest));
-        // A package.json naming neither runner detects nothing (docs tooling,
-        // a plain library) instead of shelling a tool that isn't there.
-        std::fs::write(
-            tmp.path().join("package.json"),
-            r#"{"dependencies":{"react":"^19.0.0"}}"#,
-        )
-        .unwrap();
-        assert_eq!(runner_for(tmp.path()), None);
-        // A config file marks the runner when the dep is hoisted away.
-        std::fs::write(tmp.path().join("vitest.config.ts"), "").unwrap();
-        assert_eq!(runner_for(tmp.path()), Some(Runner::Vitest));
-        // Cargo still outranks JS at a mixed root.
-        std::fs::write(tmp.path().join("Cargo.toml"), "[package]\n").unwrap();
-        assert_eq!(runner_for(tmp.path()), Some(Runner::Cargo));
-
-        let jest_cfg = tempfile::tempdir().unwrap();
-        std::fs::write(jest_cfg.path().join("package.json"), "{}").unwrap();
-        std::fs::write(jest_cfg.path().join("jest.config.js"), "").unwrap();
-        assert_eq!(runner_for(jest_cfg.path()), Some(Runner::Jest));
-    }
 
     #[test]
     fn drain_drops_responses_from_before_the_last_set_root() {

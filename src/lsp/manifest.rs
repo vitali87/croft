@@ -46,6 +46,12 @@ pub const BUNDLED_MANIFESTS: &[&str] = &[
     include_str!("../../assets/extensions/dap-python/extension.toml"),
     include_str!("../../assets/extensions/dap-lldb/extension.toml"),
     include_str!("../../assets/extensions/dap-js/extension.toml"),
+    // Runner order is detection priority: cargo, then the JS runners, then
+    // pytest — a mixed repo's root is usually the crate.
+    include_str!("../../assets/extensions/test-cargo/extension.toml"),
+    include_str!("../../assets/extensions/test-vitest/extension.toml"),
+    include_str!("../../assets/extensions/test-jest/extension.toml"),
+    include_str!("../../assets/extensions/test-pytest/extension.toml"),
     include_str!("../../assets/extensions/themes/extension.toml"),
 ];
 
@@ -89,6 +95,12 @@ pub struct ExtensionManifest {
     /// Disabling the extension stops F5 from offering that debugger.
     #[serde(default)]
     pub debug_adapters: Vec<DebugAdapterDecl>,
+    /// Test runners this extension contributes. Each maps workspace marker
+    /// files (and/or package.json dependency names) to one of croft's built-in
+    /// run mechanisms (its `kind`). Disabling the extension stops the Testing
+    /// view from detecting that runner's projects.
+    #[serde(default)]
+    pub test_runners: Vec<TestRunnerDecl>,
     /// MCP sidecar servers this extension contributes (Tier-1 extensions). Each
     /// is a local process croft spawns lazily and drives over JSON-RPC/NDJSON
     /// stdio. Paired with [`commands`](Self::commands) that invoke their tools.
@@ -176,6 +188,48 @@ pub enum AdapterKindDecl {
     Lldb,
     /// vscode-js-debug, launches a Node program over its TCP multi-session.
     JsDebug,
+}
+
+/// One `[[test_runners]]` entry: a test runner contributed by an extension.
+/// The `kind` selects which built-in run mechanism the Testing view drives
+/// (cargo libtest / pytest / vitest / jest — the commands and parsers are
+/// heterogeneous and stay native, like the debug adapters); the `markers` and
+/// `package_deps` lists are the detection data that used to live in the
+/// hardcoded `runner_for` ladder. A workspace matches when any marker file
+/// exists at its root OR its package.json names any of `package_deps` in
+/// (dev)dependencies.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TestRunnerDecl {
+    /// Stable id (matches the contributing extension's id for the toggle).
+    pub id: String,
+    /// Human-facing runner name (shown in docs / future Testing UI).
+    pub label: String,
+    /// Which built-in run mechanism croft drives for this runner.
+    pub kind: RunnerKindDecl,
+    /// Files whose presence at the workspace root marks the project.
+    #[serde(default)]
+    pub markers: Vec<String>,
+    /// package.json (dev)dependency names that mark the project. A
+    /// package.json naming none of these is NOT a test project — plenty of
+    /// repos carry one only for docs tooling.
+    #[serde(default)]
+    pub package_deps: Vec<String>,
+}
+
+/// The built-in test-run mechanisms croft knows. Mirrors (and maps onto)
+/// `crate::testing::worker::Runner`; kept here as pure manifest data so the
+/// manifest layer carries no dependency on the testing module.
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum RunnerKindDecl {
+    /// `cargo test` libtest output (Rust).
+    Cargo,
+    /// pytest verbose / collect-only output (Python).
+    Pytest,
+    /// vitest tap-flat streaming output (JS/TS).
+    Vitest,
+    /// jest `--json` document output (JS/TS).
+    Jest,
 }
 
 /// One `[[themes]]` entry: a complete IDE color palette. All colors are
@@ -495,7 +549,18 @@ mod tests {
         let s = summaries(BUNDLED_MANIFESTS);
         let ids: Vec<&str> = s.iter().map(|e| e.id.as_str()).collect();
         // The user-facing built-ins appear (incl. the color-themes extension)...
-        for id in ["pdf", "csv", "vim", "lsp-python", "lsp-rust", "themes"] {
+        for id in [
+            "pdf",
+            "csv",
+            "vim",
+            "lsp-python",
+            "lsp-rust",
+            "themes",
+            "test-cargo",
+            "test-pytest",
+            "test-vitest",
+            "test-jest",
+        ] {
             assert!(ids.contains(&id), "missing {id} in {ids:?}");
         }
         // ...and the hidden infrastructure manifest does not.

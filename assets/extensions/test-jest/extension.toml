@@ -1,0 +1,23 @@
+# Bundled croft extension: Jest test runner.
+# Points the Testing view's jest --json mechanism (src/testing/worker.rs) at
+# projects naming jest in package.json, or carrying a jest config when the dep
+# is hoisted out of sight (a monorepo sub-package). Disabling this extension
+# stops the Testing view from detecting jest projects.
+id = "test-jest"
+name = "Jest Test Runner"
+description = "Discover and run JavaScript/TypeScript tests with jest in the Testing view."
+builtin = true
+api_version = 1
+
+[[test_runners]]
+id = "test-jest"
+label = "jest"
+kind = "jest"
+markers = [
+    "jest.config.js",
+    "jest.config.ts",
+    "jest.config.mjs",
+    "jest.config.cjs",
+    "jest.config.json",
+]
+package_deps = ["jest"]

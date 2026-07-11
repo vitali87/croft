@@ -1,0 +1,16 @@
+# Bundled croft extension: Python test runner.
+# Points the Testing view's pytest mechanism (src/testing/worker.rs) at Python
+# projects. Ordered after the cargo and JS runners in the bundled list, so a
+# mixed repo's root resolves to the more specific runner first. Disabling this
+# extension stops the Testing view from detecting Python projects.
+id = "test-pytest"
+name = "Python Test Runner"
+description = "Discover and run Python tests with pytest in the Testing view."
+builtin = true
+api_version = 1
+
+[[test_runners]]
+id = "test-pytest"
+label = "pytest"
+kind = "pytest"
+markers = ["pyproject.toml", "pytest.ini", "setup.cfg", "setup.py", "tox.ini"]

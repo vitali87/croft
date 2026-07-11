@@ -150,6 +150,10 @@ fn chip_for(id: &str) -> Option<(char, Color)> {
         "dap-python" => ('\u{eb91}', (0x37, 0x76, 0xab)), // cod-debug_alt, python blue
         "dap-lldb" => ('\u{eb91}', (0xce, 0x6a, 0x3a)), // cod-debug_alt, rust orange
         "dap-js" => ('\u{eb91}', (0xf7, 0xdf, 0x1e)), // cod-debug_alt, JS yellow
+        "test-cargo" => ('\u{ea79}', (0xce, 0x6a, 0x3a)), // cod-beaker, rust orange
+        "test-pytest" => ('\u{ea79}', (0x37, 0x76, 0xab)), // cod-beaker, python blue
+        "test-vitest" => ('\u{ea79}', (0x72, 0x9b, 0x1b)), // cod-beaker, vitest green
+        "test-jest" => ('\u{ea79}', (0xc2, 0x13, 0x25)), // cod-beaker, jest red
         "mcp-fetch" => ('\u{eb01}', (0x4e, 0x9a, 0xff)), // cod-globe, web blue
         "themes" => ('\u{eb5c}', (0xc5, 0x86, 0xc0)), // cod-symbol_color, theme purple
         _ => return None,

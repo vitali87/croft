@@ -1,0 +1,22 @@
+# Bundled croft extension: Vitest test runner.
+# Points the Testing view's vitest tap-flat mechanism (src/testing/worker.rs)
+# at projects naming vitest in package.json, or carrying a vitest config when
+# the dep is hoisted out of sight (a monorepo sub-package). Disabling this
+# extension stops the Testing view from detecting vitest projects.
+id = "test-vitest"
+name = "Vitest Test Runner"
+description = "Discover and run JavaScript/TypeScript tests with vitest in the Testing view."
+builtin = true
+api_version = 1
+
+[[test_runners]]
+id = "test-vitest"
+label = "vitest"
+kind = "vitest"
+markers = [
+    "vitest.config.ts",
+    "vitest.config.js",
+    "vitest.config.mts",
+    "vitest.config.mjs",
+]
+package_deps = ["vitest"]
