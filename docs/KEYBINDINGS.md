@@ -54,6 +54,8 @@ On macOS, the `Cmd` chords below only reach croft after you run a one-time setup
 | `Cmd+K` `Enter` | Run the test the editor caret sits in (also in the palette as "Testing: Run Test at Cursor") |
 | `Cmd+K` `Shift+Enter` | Debug the test the editor caret sits in: pytest runs as a debugpy module launch under the project's venv, a cargo test binary launches under lldb-dap with the test name as its filter ("Testing: Debug Test at Cursor"); Alt+click a gutter ▷ does the same for that test |
 | `Cmd+K` `P` | Pin / unpin the active editor tab (moved off `Cmd+K` `Shift+Enter`, which now debugs tests) |
+| `Cmd+K` `H` | Show incoming calls: a picker of everyone calling the symbol at the caret (LSP call hierarchy, one level per invocation; pick a caller and invoke again to walk up) |
+| `Cmd+K` `Shift+H` | Show outgoing calls: everything the function at the caret calls, each entry jumping to the callee's definition |
 | `Cmd+K` `M` | Maximize the active terminal pane across the panel width (the other terminals move to a right-edge rail); press again to restore the even split |
 | `Cmd+K` `F` | Toggle Format on Save: when on, `Cmd+S` reformats through the language server before writing (also in the Command Palette) |
 | `Cmd+K` `Cmd+L` | Toggle the code fold at the cursor: collapse the enclosing indented block (function, loop, struct) to its header line, or re-expand it |

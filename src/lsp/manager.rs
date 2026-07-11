@@ -363,6 +363,31 @@ pub struct InlayHintsUpdate {
     pub hints: Vec<InlayHintItem>,
 }
 
+/// One row of a call-hierarchy answer: a caller (incoming) or callee
+/// (outgoing), with the location the picker jumps to — the call expression
+/// for incoming calls when the server reports one, the callee's definition
+/// for outgoing. Positions are LSP UTF-16, like every navigation result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallSite {
+    pub name: String,
+    pub path: PathBuf,
+    pub line: u32,
+    pub character: u32,
+}
+
+/// The callers or callees of the symbol at one caret position
+/// (`prepareCallHierarchy` + `callHierarchy/incomingCalls|outgoingCalls`),
+/// tagged with the request id so stale replies drop.
+#[derive(Debug)]
+pub struct CallHierarchyResult {
+    pub request_id: u64,
+    /// True for incoming calls (callers), false for outgoing (callees).
+    pub incoming: bool,
+    pub sites: Vec<CallSite>,
+    /// True when no spawned server advertises `callHierarchyProvider`.
+    pub unsupported: bool,
+}
+
 /// One occurrence of the symbol under the caret
 /// (`textDocument/documentHighlight`), normalised off the LSP wire type.
 /// Positions are LSP UTF-16; the editor converts them to character columns
@@ -531,6 +556,13 @@ enum Cmd {
         line: u32,
         character: u32,
     },
+    RequestCallHierarchy {
+        request_id: u64,
+        path: PathBuf,
+        line: u32,
+        character: u32,
+        incoming: bool,
+    },
     RequestRename {
         request_id: u64,
         path: PathBuf,
@@ -581,6 +613,7 @@ struct LangCapabilitySupport {
     references: HashMap<Language, bool>,
     formatting: HashMap<Language, bool>,
     code_action: HashMap<Language, bool>,
+    call_hierarchy: HashMap<Language, bool>,
 }
 type CapabilitySupport = Arc<StdMutex<LangCapabilitySupport>>;
 
@@ -596,6 +629,7 @@ pub struct LspManager {
     impl_rx: std_mpsc::Receiver<ImplementationResult>,
     ref_rx: std_mpsc::Receiver<ReferencesResult>,
     doc_highlights_rx: std_mpsc::Receiver<DocumentHighlightsResult>,
+    calls_rx: std_mpsc::Receiver<CallHierarchyResult>,
     ws_symbols_rx: std_mpsc::Receiver<WorkspaceSymbolsResult>,
     rename_rx: std_mpsc::Receiver<RenameResult>,
     format_rx: std_mpsc::Receiver<FormatResult>,
@@ -642,6 +676,7 @@ impl LspManager {
         let (impl_tx, impl_rx) = std_mpsc::channel();
         let (ref_tx, ref_rx) = std_mpsc::channel();
         let (doc_highlights_tx, doc_highlights_rx) = std_mpsc::channel();
+        let (calls_tx, calls_rx) = std_mpsc::channel();
         let (ws_symbols_tx, ws_symbols_rx) = std_mpsc::channel();
         let (rename_tx, rename_rx) = std_mpsc::channel();
         let (format_tx, format_rx) = std_mpsc::channel();
@@ -686,6 +721,7 @@ impl LspManager {
                 implementation: impl_tx,
                 references: ref_tx,
                 document_highlights: doc_highlights_tx,
+                call_hierarchy: calls_tx,
                 workspace_symbols: ws_symbols_tx,
                 rename: rename_tx,
                 formatting: format_tx,
@@ -711,6 +747,7 @@ impl LspManager {
             impl_rx,
             ref_rx,
             doc_highlights_rx,
+            calls_rx,
             ws_symbols_rx,
             rename_rx,
             format_rx,
@@ -998,6 +1035,43 @@ impl LspManager {
         self.doc_highlights_rx.try_recv().ok()
     }
 
+    /// Fire a call-hierarchy expansion (callers when `incoming`, callees
+    /// otherwise) for the symbol at the caret; the reply arrives via
+    /// [`Self::drain_call_hierarchy`] tagged with the returned id.
+    pub fn request_call_hierarchy(
+        &mut self,
+        path: PathBuf,
+        line: u32,
+        character: u32,
+        incoming: bool,
+    ) -> u64 {
+        let id = self.next_request_id;
+        self.next_request_id += 1;
+        let _ = self.cmd_tx.send(Cmd::RequestCallHierarchy {
+            request_id: id,
+            path,
+            line,
+            character,
+            incoming,
+        });
+        id
+    }
+
+    pub fn drain_call_hierarchy(&self) -> Option<CallHierarchyResult> {
+        self.calls_rx.try_recv().ok()
+    }
+
+    /// Whether the server for `lang` implements call hierarchy. `None` means
+    /// no server has reported yet. Drives the right-click menu rows.
+    pub fn language_supports_call_hierarchy(&self, lang: Language) -> Option<bool> {
+        self.capability_support
+            .lock()
+            .ok()?
+            .call_hierarchy
+            .get(&lang)
+            .copied()
+    }
+
     /// Whether the server for `lang` implements `textDocument/declaration`.
     /// `None` means no server has reported yet (not spawned). Read synchronously
     /// by the app to decide whether to show the "Go to Declaration" menu item.
@@ -1188,6 +1262,7 @@ struct ManagedClient {
     supports_implementation: bool,
     supports_references: bool,
     supports_document_highlight: bool,
+    supports_call_hierarchy: bool,
     supports_workspace_symbols: bool,
     supports_rename: bool,
     supports_formatting: bool,
@@ -1254,6 +1329,7 @@ struct ResultSenders {
     implementation: std_mpsc::Sender<ImplementationResult>,
     references: std_mpsc::Sender<ReferencesResult>,
     document_highlights: std_mpsc::Sender<DocumentHighlightsResult>,
+    call_hierarchy: std_mpsc::Sender<CallHierarchyResult>,
     workspace_symbols: std_mpsc::Sender<WorkspaceSymbolsResult>,
     rename: std_mpsc::Sender<RenameResult>,
     formatting: std_mpsc::Sender<FormatResult>,
@@ -1424,6 +1500,24 @@ async fn worker_loop(
                     )
                     .await
             }
+            Cmd::RequestCallHierarchy {
+                request_id,
+                path,
+                line,
+                character,
+                incoming,
+            } => {
+                state
+                    .request_call_hierarchy(
+                        request_id,
+                        path,
+                        line,
+                        character,
+                        incoming,
+                        &tx.call_hierarchy,
+                    )
+                    .await
+            }
             Cmd::RequestRename {
                 request_id,
                 path,
@@ -1583,6 +1677,8 @@ impl WorkerState {
                         let supports_references = one_of_supported(&caps.references_provider);
                         let supports_document_highlight =
                             one_of_supported(&caps.document_highlight_provider);
+                        let supports_call_hierarchy =
+                            call_hierarchy_supported(&caps.call_hierarchy_provider);
                         let supports_workspace_symbols =
                             one_of_supported(&caps.workspace_symbol_provider);
                         let supports_rename = one_of_supported(&caps.rename_provider);
@@ -1611,6 +1707,7 @@ impl WorkerState {
                             supports_implementation,
                             supports_references,
                             supports_document_highlight,
+                            supports_call_hierarchy,
                             supports_workspace_symbols,
                             supports_rename,
                             supports_formatting,
@@ -1635,6 +1732,7 @@ impl WorkerState {
             let supports_references = spawned.iter().any(|c| c.supports_references);
             let supports_formatting = spawned.iter().any(|c| c.supports_formatting);
             let supports_code_action = spawned.iter().any(|c| c.supports_code_action);
+            let supports_call_hierarchy = spawned.iter().any(|c| c.supports_call_hierarchy);
             if let Ok(mut support) = self.capability_support.lock() {
                 support.declaration.insert(lang, supports_declaration);
                 support
@@ -1644,6 +1742,7 @@ impl WorkerState {
                 support.references.insert(lang, supports_references);
                 support.formatting.insert(lang, supports_formatting);
                 support.code_action.insert(lang, supports_code_action);
+                support.call_hierarchy.insert(lang, supports_call_hierarchy);
             }
             self.clients.insert(key.clone(), spawned);
         }
@@ -2708,6 +2807,96 @@ impl WorkerState {
         });
     }
 
+    /// The two-step call-hierarchy flow: `prepareCallHierarchy` resolves the
+    /// symbol at the caret into an item, then `incomingCalls` / `outgoingCalls`
+    /// expands one level of it. One level per request — invoking again at a
+    /// picked site walks the next level, which keeps the UI croft's existing
+    /// location picker instead of a new tree widget.
+    async fn request_call_hierarchy(
+        &mut self,
+        request_id: u64,
+        path: PathBuf,
+        line: u32,
+        character: u32,
+        incoming: bool,
+        tx: &std_mpsc::Sender<CallHierarchyResult>,
+    ) {
+        let Some(doc) = self.docs.get(&path) else {
+            return;
+        };
+        let lang = doc.language;
+        let root = doc.project_root.clone();
+        self.ensure_clients(lang, &root).await;
+        let Some(clients) = self.clients.get(&(lang, root)) else {
+            return;
+        };
+        let picked = clients
+            .iter()
+            .find(|c| c.supports_call_hierarchy)
+            .map(|c| (c.name.clone(), c.client.clone()));
+        let Some((server_name, client_arc)) = picked else {
+            let _ = tx.send(CallHierarchyResult {
+                request_id,
+                incoming,
+                sites: Vec::new(),
+                unsupported: true,
+            });
+            return;
+        };
+        let Ok(uri) = Url::from_file_path(&path) else {
+            return;
+        };
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let mut client = client_arc.lock().await;
+            let item = match client.prepare_call_hierarchy(uri, line, character).await {
+                Ok(Some(mut items)) if !items.is_empty() => items.remove(0),
+                Ok(_) => {
+                    drop(client);
+                    let _ = tx.send(CallHierarchyResult {
+                        request_id,
+                        incoming,
+                        sites: Vec::new(),
+                        unsupported: false,
+                    });
+                    return;
+                }
+                Err(e) => {
+                    log_file::log(&format!(
+                        "lsp[{server_name}] prepareCallHierarchy error: {e:#}"
+                    ));
+                    return;
+                }
+            };
+            let sites = if incoming {
+                match client.incoming_calls(item).await {
+                    Ok(Some(calls)) => incoming_call_sites(calls),
+                    Ok(None) => Vec::new(),
+                    Err(e) => {
+                        log_file::log(&format!("lsp[{server_name}] incomingCalls error: {e:#}"));
+                        Vec::new()
+                    }
+                }
+            } else {
+                match client.outgoing_calls(item).await {
+                    Ok(Some(calls)) => outgoing_call_sites(calls),
+                    Ok(None) => Vec::new(),
+                    Err(e) => {
+                        log_file::log(&format!("lsp[{server_name}] outgoingCalls error: {e:#}"));
+                        Vec::new()
+                    }
+                }
+            };
+            drop(client);
+            let _ = tx.send(CallHierarchyResult {
+                request_id,
+                incoming,
+                sites,
+                unsupported: false,
+            });
+        });
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn request_code_action(
         &mut self,
@@ -3307,6 +3496,15 @@ fn normalise_inlay_hint(h: lsp_types::InlayHint) -> InlayHintItem {
     }
 }
 
+fn call_hierarchy_supported(cap: &Option<lsp_types::CallHierarchyServerCapability>) -> bool {
+    use lsp_types::CallHierarchyServerCapability as C;
+    match cap {
+        Some(C::Simple(b)) => *b,
+        Some(C::Options(_)) => true,
+        None => false,
+    }
+}
+
 fn one_of_supported<B>(cap: &Option<OneOf<bool, B>>) -> bool {
     match cap {
         Some(OneOf::Left(b)) => *b,
@@ -3494,6 +3692,48 @@ fn def_locations(resp: &GotoDefinitionResponse) -> Vec<(PathBuf, u32, u32)> {
 /// (not a `GotoDefinitionResponse`), so it gets its own mapper rather than going
 /// through `def_locations`. Locations whose URI is not a local file path are
 /// dropped (the same rule `def_locations` applies).
+/// Normalise `callHierarchy/incomingCalls` replies: each caller becomes a
+/// site at its first reported call range (the call expression) or, when the
+/// server sends none, at the caller's own selection range.
+fn incoming_call_sites(calls: Vec<lsp_types::CallHierarchyIncomingCall>) -> Vec<CallSite> {
+    calls
+        .into_iter()
+        .filter_map(|c| {
+            let path = c.from.uri.to_file_path().ok()?;
+            let pos = c
+                .from_ranges
+                .first()
+                .map(|r| r.start)
+                .unwrap_or(c.from.selection_range.start);
+            Some(CallSite {
+                name: c.from.name,
+                path,
+                line: pos.line,
+                character: pos.character,
+            })
+        })
+        .collect()
+}
+
+/// Normalise `callHierarchy/outgoingCalls` replies: each callee becomes a
+/// site at its definition (`selection_range`) — the `from_ranges` live in
+/// the CALLER's document and are not jump targets here.
+fn outgoing_call_sites(calls: Vec<lsp_types::CallHierarchyOutgoingCall>) -> Vec<CallSite> {
+    calls
+        .into_iter()
+        .filter_map(|c| {
+            let path = c.to.uri.to_file_path().ok()?;
+            let pos = c.to.selection_range.start;
+            Some(CallSite {
+                name: c.to.name,
+                path,
+                line: pos.line,
+                character: pos.character,
+            })
+        })
+        .collect()
+}
+
 /// Normalise `textDocument/documentHighlight` wire items into croft's own
 /// UTF-16-positioned occurrence spans. A missing kind defaults to a read
 /// tint, matching VS Code (Text and Read share `wordHighlightBackground`;
@@ -3718,6 +3958,15 @@ fn build_client_capabilities() -> ClientCapabilities {
             inlay_hint: Some(lsp_types::InlayHintClientCapabilities {
                 dynamic_registration: Some(false),
                 resolve_support: None,
+            }),
+            // Advertise call-hierarchy and documentHighlight support so
+            // servers that gate their providers on the client declaring
+            // them (vtsls does for several) publish the capability.
+            call_hierarchy: Some(lsp_types::CallHierarchyClientCapabilities {
+                dynamic_registration: Some(false),
+            }),
+            document_highlight: Some(lsp_types::DocumentHighlightClientCapabilities {
+                dynamic_registration: Some(false),
             }),
             // Declare push-diagnostics support. Several servers gate
             // `textDocument/publishDiagnostics` on the client advertising this
@@ -5478,6 +5727,237 @@ while True:
                     write: false,
                 },
             ]
+        );
+        runtime.handle().clone().block_on(state.shutdown_all());
+    }
+
+    #[test]
+    fn incoming_call_sites_prefer_the_call_range_over_the_definition() {
+        use lsp_types::{
+            CallHierarchyIncomingCall, CallHierarchyItem, Position, Range, SymbolKind,
+        };
+        let item = |name: &str, line: u32| CallHierarchyItem {
+            name: name.to_string(),
+            kind: SymbolKind::FUNCTION,
+            tags: None,
+            detail: None,
+            uri: Url::from_file_path("/proj/src/lib.rs").unwrap(),
+            range: Range {
+                start: Position { line, character: 0 },
+                end: Position {
+                    line: line + 5,
+                    character: 0,
+                },
+            },
+            selection_range: Range {
+                start: Position { line, character: 3 },
+                end: Position { line, character: 8 },
+            },
+            data: None,
+        };
+        let calls = vec![
+            CallHierarchyIncomingCall {
+                from: item("caller_a", 10),
+                from_ranges: vec![Range {
+                    start: Position {
+                        line: 12,
+                        character: 8,
+                    },
+                    end: Position {
+                        line: 12,
+                        character: 14,
+                    },
+                }],
+            },
+            CallHierarchyIncomingCall {
+                from: item("caller_b", 30),
+                from_ranges: Vec::new(),
+            },
+        ];
+        let sites = incoming_call_sites(calls);
+        assert_eq!(sites.len(), 2);
+        assert_eq!(sites[0].name, "caller_a");
+        assert_eq!(
+            (sites[0].line, sites[0].character),
+            (12, 8),
+            "jump to the CALL expression when the server reports it"
+        );
+        assert_eq!(
+            (sites[1].line, sites[1].character),
+            (30, 3),
+            "fall back to the caller's own selection range"
+        );
+    }
+
+    #[test]
+    fn outgoing_call_sites_target_the_callee_definition() {
+        use lsp_types::{
+            CallHierarchyItem, CallHierarchyOutgoingCall, Position, Range, SymbolKind,
+        };
+        let callee = CallHierarchyItem {
+            name: String::from("helper"),
+            kind: SymbolKind::FUNCTION,
+            tags: None,
+            detail: None,
+            uri: Url::from_file_path("/proj/src/util.rs").unwrap(),
+            range: Range {
+                start: Position {
+                    line: 4,
+                    character: 0,
+                },
+                end: Position {
+                    line: 9,
+                    character: 0,
+                },
+            },
+            selection_range: Range {
+                start: Position {
+                    line: 4,
+                    character: 7,
+                },
+                end: Position {
+                    line: 4,
+                    character: 13,
+                },
+            },
+            data: None,
+        };
+        let sites = outgoing_call_sites(vec![CallHierarchyOutgoingCall {
+            to: callee,
+            from_ranges: Vec::new(),
+        }]);
+        assert_eq!(sites[0].name, "helper");
+        assert!(sites[0].path.ends_with("src/util.rs"));
+        assert_eq!(
+            (sites[0].line, sites[0].character),
+            (4, 7),
+            "outgoing jumps land on the callee's definition"
+        );
+    }
+
+    /// A fake server that advertises `callHierarchyProvider`, answers
+    /// `textDocument/prepareCallHierarchy` with one item and
+    /// `callHierarchy/incomingCalls` with one caller.
+    const FAKE_LSP_CALLS: &str = r#"
+import json, sys
+
+def read_msg():
+    length = None
+    while True:
+        line = sys.stdin.buffer.readline()
+        if not line:
+            return None
+        line = line.strip()
+        if not line:
+            break
+        if line.lower().startswith(b"content-length:"):
+            length = int(line.split(b":")[1])
+    if length is None:
+        return None
+    return json.loads(sys.stdin.buffer.read(length))
+
+def send(msg):
+    body = json.dumps(msg).encode()
+    sys.stdout.buffer.write(b"Content-Length: %d\r\n\r\n" % len(body))
+    sys.stdout.buffer.write(body)
+    sys.stdout.buffer.flush()
+
+ITEM = None
+while True:
+    msg = read_msg()
+    if msg is None:
+        break
+    method = msg.get("method", "")
+    if "id" in msg:
+        if method == "initialize":
+            send({"jsonrpc": "2.0", "id": msg["id"],
+                  "result": {"capabilities": {"callHierarchyProvider": True}}})
+        elif method == "textDocument/prepareCallHierarchy":
+            uri = msg["params"]["textDocument"]["uri"]
+            ITEM = {"name": "target_fn", "kind": 12, "uri": uri,
+                    "range": {"start": {"line": 0, "character": 0},
+                              "end": {"line": 2, "character": 0}},
+                    "selectionRange": {"start": {"line": 0, "character": 4},
+                                       "end": {"line": 0, "character": 12}}}
+            send({"jsonrpc": "2.0", "id": msg["id"], "result": [ITEM]})
+        elif method == "callHierarchy/incomingCalls":
+            caller = dict(ITEM)
+            caller["name"] = "the_caller"
+            send({"jsonrpc": "2.0", "id": msg["id"], "result": [
+                {"from": caller,
+                 "fromRanges": [{"start": {"line": 7, "character": 4},
+                                 "end": {"line": 7, "character": 12}}]},
+            ]})
+        else:
+            send({"jsonrpc": "2.0", "id": msg["id"], "result": None})
+    if method == "exit":
+        break
+"#;
+
+    /// The full worker wire path for call hierarchy: capability gate, the
+    /// prepare + incomingCalls two-step, and the request-id-tagged reply.
+    #[test]
+    fn request_call_hierarchy_round_trips_through_a_supporting_server() {
+        if !is_on_path("python3") {
+            eprintln!("SKIPPED: python3 not on PATH");
+            return;
+        }
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().canonicalize().expect("canonicalize");
+        let file = root.join("demo.py");
+        std::fs::write(&file, "def target_fn():\n    pass\n").expect("write demo");
+        let script = root.join("fake_calls_lsp.py");
+        std::fs::write(&script, FAKE_LSP_CALLS).expect("write fake server");
+
+        let mut registry = ServerRegistry::new();
+        registry.register(
+            Language::PYTHON,
+            ServerConfig {
+                name: "fake-calls",
+                command: "python3".into(),
+                args: vec![script.display().to_string()],
+                language: Language::PYTHON,
+                initialization_options: None,
+                provision: None,
+            },
+        );
+        let (diag_tx, _diag_rx) = std_mpsc::channel();
+        let (prog_tx, _prog_rx) = std_mpsc::channel();
+        let mut state = WorkerState {
+            workspace_root: root.clone(),
+            registry,
+            clients: HashMap::new(),
+            docs: HashMap::new(),
+            capability_support: Arc::new(StdMutex::new(LangCapabilitySupport::default())),
+            semantic_refresh: Arc::new(AtomicBool::new(false)),
+            inlay_refresh: Arc::new(AtomicBool::new(false)),
+            diagnostics_tx: diag_tx,
+            progress_tx: prog_tx,
+        };
+
+        let (tx, rx) = std_mpsc::channel();
+        let runtime = LspRuntime::new().expect("runtime");
+        runtime.handle().clone().block_on(async {
+            state
+                .open_doc(file.clone(), String::from("def target_fn():\n    pass\n"))
+                .await;
+            state
+                .request_call_hierarchy(9, file.clone(), 0, 4, true, &tx)
+                .await;
+        });
+
+        let result = rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("a call-hierarchy reply must reach the drain channel");
+        assert_eq!(result.request_id, 9);
+        assert!(result.incoming);
+        assert!(!result.unsupported);
+        assert_eq!(result.sites.len(), 1);
+        assert_eq!(result.sites[0].name, "the_caller");
+        assert_eq!(
+            (result.sites[0].line, result.sites[0].character),
+            (7, 4),
+            "the site is the call expression from fromRanges"
         );
         runtime.handle().clone().block_on(state.shutdown_all());
     }

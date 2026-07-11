@@ -806,6 +806,16 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 description: "Debug the test under the caret: pytest via a debugpy module launch, a cargo test binary via lldb-dap with the name as its filter",
                 handler: "",
             },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+K H",
+                description: "Show incoming calls: a picker of everyone calling the symbol at the caret (LSP call hierarchy); pick a site and invoke again to walk up",
+                handler: "",
+            },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+K Shift+H",
+                description: "Show outgoing calls: everything the function at the caret calls, each entry jumping to the callee's definition",
+                handler: "",
+            },
         ],
     },
     ShortcutGroup {

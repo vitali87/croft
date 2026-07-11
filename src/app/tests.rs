@@ -262,6 +262,26 @@ fn cmd_k_shift_enter_debugs_instead_of_running_the_test_at_cursor() {
 }
 
 #[test]
+fn cmd_k_h_chords_fire_call_hierarchy_requests() {
+    // Cmd+K H asks for incoming calls, Cmd+K Shift+H for outgoing; both
+    // must arm the request id so the drain can match the reply.
+    let tmp = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("a.py");
+    std::fs::write(&f, "def target():\n    pass\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&f).unwrap();
+    assert!(app.handle_cmd_k_chord(key(KeyCode::Char('h'), KeyModifiers::NONE)));
+    let first = app
+        .call_hierarchy_request_id
+        .expect("incoming request armed");
+    assert!(app.handle_cmd_k_chord(key(KeyCode::Char('H'), KeyModifiers::SHIFT)));
+    let second = app
+        .call_hierarchy_request_id
+        .expect("outgoing request armed");
+    assert!(second > first, "each chord fires a fresh request");
+}
+
+#[test]
 fn popup_gradient_tracks_black_theme() {
     // Popups/menus/tooltips wear the gradient + muted selection only under the
     // Black theme; Croft Dark keeps the legacy bright-blue accent so it stays

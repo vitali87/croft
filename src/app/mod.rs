@@ -1009,6 +1009,13 @@ enum MenuAction {
     EditLogpointAt {
         line: usize,
     },
+    /// Editor body: one level of the call hierarchy for the symbol at buffer
+    /// `(row, col)` — callers when `incoming`, callees otherwise.
+    ShowCallsAt {
+        row: usize,
+        col: usize,
+        incoming: bool,
+    },
     /// Settings gear → "Color Theme": replace the gear menu with the theme
     /// picker (the list of themes with a check on the active one).
     OpenThemePicker,
@@ -1135,6 +1142,10 @@ fn shortcut_for(action: &MenuAction) -> Option<&'static str> {
         MenuAction::ToggleBreakpointAt { .. } => Some("F9"),
         MenuAction::EditBreakpointConditionAt { .. } => Some("⇧F9"),
         MenuAction::EditLogpointAt { .. } => Some("⇧⌥F9"),
+        MenuAction::ShowCallsAt { incoming: true, .. } => Some("⌘K H"),
+        MenuAction::ShowCallsAt {
+            incoming: false, ..
+        } => Some("⌘K ⇧H"),
         MenuAction::OpenThemePicker => Some("⌘K ⌘T"),
         MenuAction::ToggleSideBar => Some("⌘B"),
         MenuAction::ToggleSecondarySideBar => Some("⌥⌘B"),
@@ -2454,6 +2465,7 @@ pub struct App {
     outline_synced: Option<(PathBuf, Option<u64>)>,
     implementation_request_id: Option<u64>,
     references_request_id: Option<u64>,
+    call_hierarchy_request_id: Option<u64>,
     /// In-flight documentHighlight request, with the (path, row, col,
     /// edit_seq) it was fired for so a reply for a caret or buffer state the
     /// editor has since left is dropped.
@@ -3478,6 +3490,7 @@ impl App {
             type_definition_request_id: None,
             implementation_request_id: None,
             references_request_id: None,
+            call_hierarchy_request_id: None,
             occurrences_request: None,
             occ_observed: None,
             occ_observed_at: std::time::Instant::now(),
@@ -6745,6 +6758,104 @@ impl App {
             _ => self.open_location_picker(targets, "references"),
         }
         true
+    }
+
+    /// Apply a call-hierarchy reply: a picker of callers/callees labelled
+    /// `name — path:line`, jumping on select. Invoking the command again at a
+    /// picked site walks the next level of the hierarchy.
+    pub fn drain_lsp_call_hierarchy(&mut self) -> bool {
+        let mut result = None;
+        {
+            let Some(lsp) = self.lsp.as_ref() else {
+                return false;
+            };
+            while let Some(r) = lsp.drain_call_hierarchy() {
+                if Some(r.request_id) == self.call_hierarchy_request_id {
+                    result = Some(r);
+                }
+            }
+        }
+        let Some(result) = result else {
+            return false;
+        };
+        let noun = if result.incoming {
+            "incoming calls"
+        } else {
+            "outgoing calls"
+        };
+        if result.unsupported {
+            self.status =
+                String::from("Call hierarchy: not supported by this file's language server");
+            return true;
+        }
+        if result.sites.is_empty() {
+            self.status = format!("No {noun}");
+            return true;
+        }
+        let root = self.tree.root.clone();
+        let items: Vec<(String, MenuAction)> = result
+            .sites
+            .into_iter()
+            .map(|s| {
+                let label = format!(
+                    "{} — {}:{}",
+                    s.name,
+                    s.path.strip_prefix(&root).unwrap_or(&s.path).display(),
+                    s.line + 1
+                );
+                (
+                    label,
+                    MenuAction::GoToLocation {
+                        path: s.path,
+                        line: s.line,
+                        col: s.character,
+                    },
+                )
+            })
+            .collect();
+        self.status = format!("{} {noun}", items.len());
+        let origin = self.editor.cursor_screen_pos().unwrap_or((
+            self.editor.last_full_area.x + 1,
+            self.editor.last_full_area.y + 1,
+        ));
+        self.focus_pane(Pane::Editor);
+        self.context_menu = Some(ContextMenu::flat(origin, items, root));
+        true
+    }
+
+    /// Request the callers (`incoming`) or callees of the symbol at the
+    /// cursor. Cmd+K H / Cmd+K Shift+H and the right-click menu rows.
+    fn request_call_hierarchy_at_cursor(&mut self, incoming: bool) {
+        let row = self.editor.cursor_row;
+        let col = self.editor.cursor_col;
+        let Some(path) = self.editor.path.clone() else {
+            return;
+        };
+        let Some(lsp) = self.lsp.as_mut() else {
+            self.status = String::from("Call hierarchy: no language server for this file");
+            return;
+        };
+        let id = lsp.request_call_hierarchy(path, row as u32, col as u32, incoming);
+        self.call_hierarchy_request_id = Some(id);
+    }
+
+    /// Whether the current file's language server implements call hierarchy;
+    /// drives the right-click menu rows, like the other capability gates.
+    fn editor_language_supports_call_hierarchy(&self) -> bool {
+        let Some(lang) = self
+            .editor
+            .path
+            .as_deref()
+            .and_then(|p| p.extension())
+            .and_then(|e| e.to_str())
+            .and_then(crate::lsp::Language::from_extension)
+        else {
+            return false;
+        };
+        self.lsp
+            .as_ref()
+            .and_then(|lsp| lsp.language_supports_call_hierarchy(lang))
+            .unwrap_or(false)
     }
 
     /// Idle-caret occurrences trigger, run once per frame: when the caret has
@@ -12106,6 +12217,18 @@ impl App {
                 } else {
                     self.status = String::from("Reveal in Explorer View: no active file");
                 }
+                true
+            }
+            // Cmd+K Shift+H: outgoing calls (what does this call?). Must
+            // precede the case-insensitive H arm below.
+            KeyCode::Char('H') if shifted && plain => {
+                self.request_call_hierarchy_at_cursor(false);
+                true
+            }
+            // Cmd+K H: incoming calls — who calls the symbol at the caret
+            // (VS Code's call Hierarchy, peek replaced by croft's picker).
+            KeyCode::Char(c) if plain && c.eq_ignore_ascii_case(&'h') => {
+                self.request_call_hierarchy_at_cursor(true);
                 true
             }
             // Cmd+K P: pin / unpin the active tab. This chord was Cmd+K
@@ -20624,6 +20747,8 @@ impl App {
             Cmd::RestartDebugging => self.debug_restart(),
             Cmd::ToggleBreakpoint => self.debug_toggle_breakpoint(),
             Cmd::EditLogpoint => self.debug_edit_logpoint(),
+            Cmd::ShowIncomingCalls => self.request_call_hierarchy_at_cursor(true),
+            Cmd::ShowOutgoingCalls => self.request_call_hierarchy_at_cursor(false),
             Cmd::EditBreakpointCondition => self.debug_edit_condition(),
             Cmd::StepOver => self.debug_step("next"),
             Cmd::ToggleRaisedExceptions => self.debug_toggle_raised_exceptions(),
@@ -23081,6 +23206,26 @@ impl App {
                             MenuAction::GoToReferencesAt { row, col },
                         ));
                     }
+                    // Call hierarchy, one level per invocation: who calls
+                    // this (incoming) and what does this call (outgoing).
+                    if self.editor_language_supports_call_hierarchy() {
+                        items.push((
+                            String::from("Show Incoming Calls"),
+                            MenuAction::ShowCallsAt {
+                                row,
+                                col,
+                                incoming: true,
+                            },
+                        ));
+                        items.push((
+                            String::from("Show Outgoing Calls"),
+                            MenuAction::ShowCallsAt {
+                                row,
+                                col,
+                                incoming: false,
+                            },
+                        ));
+                    }
                     items.push((
                         String::from("Rename Symbol"),
                         MenuAction::RenameSymbolAt { row, col },
@@ -25347,6 +25492,12 @@ impl App {
             MenuAction::EditLogpointAt { line } => {
                 self.focus_pane(Pane::Editor);
                 self.debug_edit_logpoint_line(line);
+            }
+            MenuAction::ShowCallsAt { row, col, incoming } => {
+                self.editor.cursor_row = row;
+                self.editor.cursor_col = col;
+                self.focus_pane(Pane::Editor);
+                self.request_call_hierarchy_at_cursor(incoming);
             }
             MenuAction::OpenThemePicker => self.open_theme_picker(),
             MenuAction::SetTheme(theme) => self.apply_theme(theme),
@@ -30256,6 +30407,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let type_definition_changed = app.drain_lsp_type_definition();
         let implementation_changed = app.drain_lsp_implementation();
         let references_changed = app.drain_lsp_references();
+        let call_hierarchy_changed = app.drain_lsp_call_hierarchy();
         let occ_tick_changed = app.tick_occurrences();
         let occurrences_changed = app.drain_lsp_document_highlights();
         let rename_changed = app.drain_lsp_rename();
@@ -30316,6 +30468,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             || type_definition_changed
             || implementation_changed
             || references_changed
+            || call_hierarchy_changed
             || occ_tick_changed
             || occurrences_changed
             || rename_changed
