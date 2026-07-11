@@ -52,6 +52,8 @@ On macOS, the `Cmd` chords below only reach croft after you run a one-time setup
 | `Cmd+K` `Z` | Toggle Zen Mode: hide the activity bar, both side bars, the panel, and the status bar; press again to restore exactly what was shown before |
 | `Cmd+K` `B` | Show the Testing view (beaker icon); it discovers tests on first open (`cargo test` for Rust, `pytest` for Python). In the view: Enter runs all tests, `r` re-discovers, click a test's play/status glyph to run just it, click its name to jump to its source, click a suite header's play glyph to run the whole suite, ↑/↓ scroll or drag the scrollbar |
 | `Cmd+K` `Enter` | Run the test the editor caret sits in (also in the palette as "Testing: Run Test at Cursor") |
+| `Cmd+K` `Shift+Enter` | Debug the test the editor caret sits in: pytest runs as a debugpy module launch under the project's venv, a cargo test binary launches under lldb-dap with the test name as its filter ("Testing: Debug Test at Cursor"); Alt+click a gutter ▷ does the same for that test |
+| `Cmd+K` `P` | Pin / unpin the active editor tab (moved off `Cmd+K` `Shift+Enter`, which now debugs tests) |
 | `Cmd+K` `M` | Maximize the active terminal pane across the panel width (the other terminals move to a right-edge rail); press again to restore the even split |
 | `Cmd+K` `F` | Toggle Format on Save: when on, `Cmd+S` reformats through the language server before writing (also in the Command Palette) |
 | `Cmd+K` `Cmd+L` | Toggle the code fold at the cursor: collapse the enclosing indented block (function, loop, struct) to its header line, or re-expand it |

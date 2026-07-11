@@ -421,6 +421,26 @@ fn lldb_dap_missing_message() -> String {
     format!("lldb-dap not found ({hint})")
 }
 
+/// The interpreter that runs a Python project's own code: its `.venv` python
+/// (where the project's deps, pytest included, are importable) or the system
+/// python3. The debug venv's python is only the debugpy ADAPTER host — the
+/// debuggee must be this one, or a pytest module launch can't import pytest.
+fn project_python(root: &Path) -> PathBuf {
+    let venv = root.join(".venv").join("bin").join("python");
+    if venv.is_file() {
+        return venv;
+    }
+    if let Some(path_var) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path_var) {
+            let candidate = dir.join("python3");
+            if candidate.is_file() {
+                return candidate;
+            }
+        }
+    }
+    PathBuf::from("python3")
+}
+
 /// Whether `path` is a regular file with the executable bit set — i.e. a
 /// compiled binary or script croft can run directly (`./file`) and debug via
 /// lldb-dap without a build step. The honest signal for "directly executable",
@@ -1096,7 +1116,7 @@ fn shortcut_for(action: &MenuAction) -> Option<&'static str> {
         MenuAction::CloseAllTabs => Some("⌘K W"),
         MenuAction::CloseSavedTabs => Some("⌘K U"),
         MenuAction::KeepTabOpen(_) => Some("⌘K ⏎"),
-        MenuAction::ToggleTabPin(_) => Some("⌘K ⇧⏎"),
+        MenuAction::ToggleTabPin(_) => Some("⌘K P"),
         MenuAction::SplitEditor => Some("⌘\\"),
         MenuAction::SplitEditorUp => Some("⌘K ⌘\\"),
         MenuAction::SplitInGroup => Some("⌘K ⇧⌘\\"),
@@ -12088,22 +12108,16 @@ impl App {
                 }
                 true
             }
-            // Cmd+K Shift+Enter: pin / unpin the active tab (VS Code's "Pin").
-            KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
+            // Cmd+K P: pin / unpin the active tab. This chord was Cmd+K
+            // Shift+Enter (and Keep Open bare Cmd+K Enter) — both silently
+            // SHADOWED the later, documented Cmd+K Enter run-test-at-cursor
+            // arms below, so the Enter family now belongs to Testing alone;
+            // Keep Open stays on the tab context menu.
+            KeyCode::Char(c) if plain && c.eq_ignore_ascii_case(&'p') => {
                 let idx = self.editor.active_index();
                 let pinned = self.editor.toggle_pin(idx);
                 self.status = String::from(if pinned { "Pinned tab" } else { "Unpinned tab" });
                 self.poke_cursor();
-                true
-            }
-            // Cmd+K Enter: keep the active preview tab open (VS Code's
-            // "Keep Open"); a no-op status when the tab is already permanent.
-            KeyCode::Enter if !key.modifiers.contains(KeyModifiers::SHIFT) => {
-                let idx = self.editor.active_index();
-                if self.editor.keep_open(idx) {
-                    self.status = String::from("Kept tab open");
-                    self.poke_cursor();
-                }
                 true
             }
             // Cmd+K Shift+O: move the active tab into a new window. Must precede
@@ -12183,6 +12197,12 @@ impl App {
             // gated on a confirm popup.
             KeyCode::Char(c) if plain && c.eq_ignore_ascii_case(&'i') => {
                 self.toggle_broadcast_input();
+                true
+            }
+            // Cmd+K Shift+Enter: debug the test the caret sits in (checked
+            // before the plain-Enter run arm, which also matches this chord).
+            KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                self.debug_test_at_cursor();
                 true
             }
             // Cmd+K Enter: run the test the editor caret sits in. Enter already
@@ -13165,6 +13185,112 @@ impl App {
         self.test_worker.run_filter(name.clone());
         self.set_sidebar_view(SidebarView::Testing);
         self.status = format!("Running test {name}");
+    }
+
+    /// Debug the test the editor caret sits in (Cmd+K Shift+Enter, palette).
+    fn debug_test_at_cursor(&mut self) {
+        let Some(name) =
+            crate::testing::locate::enclosing_fn_name(&self.editor.lines, self.editor.cursor_row)
+        else {
+            self.status = String::from("Debug Test at Cursor: no function at the caret");
+            return;
+        };
+        self.debug_named_test(name);
+    }
+
+    /// Hand the test `name` to the debugger — the M6 wedge: pytest runs as a
+    /// debugpy module launch under the PROJECT's interpreter, a cargo test
+    /// binary launches under lldb-dap with the name as its libtest filter.
+    /// Shared by debug-at-cursor and Alt+click on the gutter play glyph.
+    fn debug_named_test(&mut self, name: String) {
+        use std::collections::BTreeMap;
+        if self.dap_session.is_some() {
+            self.status = String::from("A debug session is already running (Shift+F5 stops it)");
+            return;
+        }
+        let root = self.tree.root.clone();
+        let breakpoints: BTreeMap<PathBuf, Vec<crate::dap::session::SourceBreakpoint>> = self
+            .editor
+            .breakpoints
+            .iter()
+            .map(|(p, lines)| (p.clone(), self.editor.source_breakpoints(p, lines)))
+            .collect();
+        match crate::testing::worker::runner_for(&root) {
+            Some(crate::testing::worker::Runner::Pytest) => {
+                let adapter_py = match crate::dap::install::ensure_debug_venv() {
+                    Ok(py) => py,
+                    Err(e) => {
+                        self.debug_error(format!("Debugger setup failed: {e}"));
+                        return;
+                    }
+                };
+                let project_py = project_python(&root);
+                let request =
+                    crate::dap::session::pytest_debug_launch_request(&project_py, &root, &name);
+                let adapter_args = vec![String::from("-m"), String::from("debugpy.adapter")];
+                match crate::dap::session::DapSession::launch_with(
+                    &adapter_py.to_string_lossy(),
+                    &adapter_args,
+                    &root,
+                    request,
+                    breakpoints,
+                ) {
+                    Ok(session) => {
+                        self.dap_session = Some(session);
+                        self.run_debug.feedback = Some(format!("Debugging test {name}"));
+                        self.run_debug.feedback_is_error = false;
+                        self.status = format!(
+                            "Debugging test {name} — F5 continue · F10 step over · Shift+F5 stop"
+                        );
+                        self.reveal_debug_view();
+                    }
+                    Err(e) => self.debug_error(format!("Failed to start debugger: {e}")),
+                }
+            }
+            Some(crate::testing::worker::Runner::Cargo) => {
+                let Some(adapter) = lldb_dap_path() else {
+                    self.debug_error(lldb_dap_missing_message());
+                    return;
+                };
+                self.status = format!("Building test binary for {name}");
+                let binary = match crate::testing::worker::build_test_binary(&root) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        self.debug_error(format!("Test build failed: {e}"));
+                        return;
+                    }
+                };
+                // The bare name is libtest's substring filter (run-at-cursor
+                // has no full module path); --nocapture keeps output visible.
+                let args = vec![name.clone(), String::from("--nocapture")];
+                let request = crate::dap::session::lldb_test_launch_request(&binary, &args);
+                match crate::dap::session::DapSession::launch_with(
+                    &adapter,
+                    &[],
+                    &root,
+                    request,
+                    breakpoints,
+                ) {
+                    Ok(session) => {
+                        self.dap_session = Some(session);
+                        self.run_debug.feedback = Some(format!("Debugging test {name} (lldb)"));
+                        self.run_debug.feedback_is_error = false;
+                        self.status = format!(
+                            "Debugging test {name} via lldb-dap — F5 continue · Shift+F5 stop"
+                        );
+                        self.reveal_debug_view();
+                    }
+                    Err(e) => self.debug_error(format!("Failed to start lldb-dap: {e}")),
+                }
+            }
+            Some(crate::testing::worker::Runner::Vitest | crate::testing::worker::Runner::Jest) => {
+                self.status =
+                    String::from("Debugging JS tests is not wired yet — the play glyph runs them");
+            }
+            None => {
+                self.status = String::from("No test runner detected in this workspace");
+            }
+        }
     }
 
     /// List tests without running them (populate the tree). No-op while busy or
@@ -20478,6 +20604,7 @@ impl App {
             Cmd::ShowExtensions => self.set_sidebar_view(SidebarView::Extensions),
             Cmd::ShowTesting => self.open_testing_view(),
             Cmd::RunTestAtCursor => self.run_test_at_cursor(),
+            Cmd::DebugTestAtCursor => self.debug_test_at_cursor(),
             Cmd::ToggleSideBar => self.show_tree = !self.show_tree,
             Cmd::ToggleSecondarySideBar => self.toggle_secondary_side_bar(),
             Cmd::ToggleZenMode => self.toggle_zen_mode(),
@@ -23845,10 +23972,16 @@ impl App {
                         return;
                     }
                     // Gutter play glyph: run the test fn defined on the
-                    // clicked line (VS Code's run bead). Sits in the sign
-                    // margin one cell left of the fold chevron.
+                    // clicked line (VS Code's run bead); Alt+click debugs it
+                    // instead. Sits in the sign margin one cell left of the
+                    // fold chevron, checked before the editor-body Alt+click
+                    // caret so the modifier never adds a caret here.
                     if let Some(name) = self.editor.test_glyph_at(m.column, m.row) {
-                        self.run_named_test(name);
+                        if m.modifiers.contains(KeyModifiers::ALT) {
+                            self.debug_named_test(name);
+                        } else {
+                            self.run_named_test(name);
+                        }
                         return;
                     }
                     // Fold chevron in the gutter: toggle the fold, don't anchor

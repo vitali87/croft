@@ -798,7 +798,12 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
             },
             ShortcutEntry {
                 keys: "Click \u{eb2c} in the gutter",
-                description: "Run the test function defined on that line (the green play glyph on #[test] fns and pytest test_* defs)",
+                description: "Run the test function defined on that line (the green play glyph on #[test] fns and pytest test_* defs); Alt+click debugs it",
+                handler: "",
+            },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+K Shift+Enter",
+                description: "Debug the test under the caret: pytest via a debugpy module launch, a cargo test binary via lldb-dap with the name as its filter",
                 handler: "",
             },
         ],

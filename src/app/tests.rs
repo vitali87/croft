@@ -242,6 +242,26 @@ fn clicking_the_gutter_play_glyph_runs_that_test() {
 }
 
 #[test]
+fn cmd_k_shift_enter_debugs_instead_of_running_the_test_at_cursor() {
+    // The Shift arm must precede the plain-Enter run arm, or the chord
+    // silently RUNS the test it was asked to DEBUG.
+    let tmp = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("t.rs");
+    std::fs::write(&f, "#[test]\nfn my_case() { assert!(true); }\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&f).unwrap();
+    app.editor.cursor_row = 1;
+    assert!(app.handle_cmd_k_chord(key(KeyCode::Enter, KeyModifiers::SHIFT)));
+    // The tmp root has no manifest, so the debug path reports the missing
+    // runner — the run path would have said "Running test my_case".
+    assert_eq!(app.status, "No test runner detected in this workspace");
+    assert!(
+        !app.testing.is_busy(),
+        "the debug chord must not start a run"
+    );
+}
+
+#[test]
 fn popup_gradient_tracks_black_theme() {
     // Popups/menus/tooltips wear the gradient + muted selection only under the
     // Black theme; Croft Dark keeps the legacy bright-blue accent so it stays
@@ -13413,7 +13433,10 @@ fn copy_path_key_is_opt_cmd_c_and_disjoint_from_copy_and_relative_path() {
 }
 
 #[test]
-fn cmd_k_enter_keeps_the_active_preview_tab_open() {
+fn cmd_k_enter_reaches_run_test_at_cursor_not_keep_open() {
+    // Cmd+K Enter is DOCUMENTED as run-test-at-cursor, but an undocumented
+    // earlier Keep Open arm shadowed it from the day it shipped. The chord
+    // must reach the Testing handler; Keep Open lives on the tab menu only.
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     let f = tmp.path().join("a.rs");
@@ -13426,14 +13449,20 @@ fn cmd_k_enter_keeps_the_active_preview_tab_open() {
     assert!(app.cmd_k_leader.is_some(), "Cmd+K arms the chord leader");
     app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
         .unwrap();
+    assert_eq!(
+        app.status, "Run Test at Cursor: no function at the caret",
+        "the chord must land in the Testing handler"
+    );
     assert!(
-        !app.editor.is_preview(app.editor.active_index()),
-        "Cmd+K Enter (Keep Open) promoted the preview tab"
+        app.editor.is_preview(app.editor.active_index()),
+        "Keep Open no longer owns the chord, so the preview stays a preview"
     );
 }
 
 #[test]
-fn cmd_k_shift_enter_pins_then_unpins_the_active_tab() {
+fn cmd_k_p_pins_then_unpins_the_active_tab() {
+    // Pin moved to Cmd+K P: its old Shift+Enter chord now debugs the test
+    // at the caret.
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     let f = tmp.path().join("a.rs");
@@ -13441,19 +13470,19 @@ fn cmd_k_shift_enter_pins_then_unpins_the_active_tab() {
     app.editor.open_pinned(&f).unwrap();
     app.handle_key(key(KeyCode::Char('k'), KeyModifiers::SUPER))
         .unwrap();
-    app.handle_key(key(KeyCode::Enter, KeyModifiers::SHIFT))
+    app.handle_key(key(KeyCode::Char('p'), KeyModifiers::NONE))
         .unwrap();
     assert!(
         app.editor.is_pinned(app.editor.active_index()),
-        "Cmd+K Shift+Enter pins the active tab"
+        "Cmd+K P pins the active tab"
     );
     app.handle_key(key(KeyCode::Char('k'), KeyModifiers::SUPER))
         .unwrap();
-    app.handle_key(key(KeyCode::Enter, KeyModifiers::SHIFT))
+    app.handle_key(key(KeyCode::Char('p'), KeyModifiers::NONE))
         .unwrap();
     assert!(
         !app.editor.is_pinned(app.editor.active_index()),
-        "a second Cmd+K Shift+Enter unpins it"
+        "a second Cmd+K P unpins it"
     );
 }
 

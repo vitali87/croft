@@ -203,6 +203,42 @@ pub fn lldb_launch_request(program: &Path, stop_on_entry: bool) -> Value {
     })
 }
 
+/// Build the lldb-dap `launch` request for a cargo TEST binary: like
+/// [`lldb_launch_request`] plus the debuggee argv — libtest's substring
+/// filter, so only the picked test runs under the debugger.
+pub fn lldb_test_launch_request(program: &Path, args: &[String]) -> Value {
+    json!({
+        "type": "request",
+        "command": "launch",
+        "arguments": {
+            "program": program.to_string_lossy(),
+            "args": args,
+            "stopOnEntry": false,
+        }
+    })
+}
+
+/// Build the debugpy `launch` request that debugs one pytest test: launch the
+/// `pytest` MODULE under the project's own interpreter (`python`, where pytest
+/// is importable — the adapter injects debugpy into the debuggee, so the
+/// project venv needs no debugpy) with `-k name` narrowing the run.
+pub fn pytest_debug_launch_request(python: &Path, cwd: &Path, name: &str) -> Value {
+    json!({
+        "type": "request",
+        "command": "launch",
+        "arguments": {
+            "request": "launch",
+            "module": "pytest",
+            "args": ["-v", "-k", name],
+            "python": [python.to_string_lossy()],
+            "cwd": cwd.to_string_lossy(),
+            "console": "internalConsole",
+            "stopOnEntry": false,
+            "justMyCode": false
+        }
+    })
+}
+
 /// Build the `launch` request body for a Python program under `interpreter`.
 pub fn launch_request(program: &Path, interpreter: &Path, stop_on_entry: bool) -> Value {
     json!({
@@ -1379,6 +1415,50 @@ mod tests {
         assert_eq!(bps[1]["condition"], "n > 0");
         assert_eq!(bps[1]["logMessage"], "n={n}");
         assert!(bps[2].get("logMessage").is_none());
+    }
+
+    #[test]
+    fn pytest_debug_launch_request_launches_the_pytest_module() {
+        // Debug-a-test (Python): debugpy launches the `pytest` MODULE under
+        // the PROJECT's interpreter (where pytest is importable) with the
+        // test name as a `-k` filter; the adapter injects debugpy into the
+        // debuggee itself, so the project venv needs no debugpy install.
+        let req = pytest_debug_launch_request(
+            Path::new("/proj/.venv/bin/python"),
+            Path::new("/proj"),
+            "test_addition",
+        );
+        assert_eq!(req["command"], "launch");
+        assert_eq!(req["arguments"]["module"], "pytest");
+        assert!(
+            req["arguments"].get("program").is_none(),
+            "a module launch must not also name a program"
+        );
+        let args = req["arguments"]["args"].as_array().unwrap();
+        assert_eq!(args[0], "-v");
+        assert_eq!(args[1], "-k");
+        assert_eq!(args[2], "test_addition");
+        assert_eq!(req["arguments"]["python"][0], "/proj/.venv/bin/python");
+        assert_eq!(req["arguments"]["cwd"], "/proj");
+        assert_eq!(req["arguments"]["justMyCode"], false);
+    }
+
+    #[test]
+    fn lldb_test_launch_request_carries_the_filter_args() {
+        // Debug-a-test (Rust): lldb-dap launches the cargo TEST BINARY with
+        // libtest's substring filter as its argv, so only the picked test runs.
+        let req = lldb_test_launch_request(
+            Path::new("/proj/target/debug/deps/croft-abc123"),
+            &[String::from("my_case"), String::from("--nocapture")],
+        );
+        assert_eq!(req["command"], "launch");
+        assert_eq!(
+            req["arguments"]["program"],
+            "/proj/target/debug/deps/croft-abc123"
+        );
+        let args = req["arguments"]["args"].as_array().unwrap();
+        assert_eq!(args[0], "my_case");
+        assert_eq!(args[1], "--nocapture");
     }
 
     #[test]

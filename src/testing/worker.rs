@@ -397,6 +397,68 @@ fn is_js_file(pattern: &str) -> bool {
     super::parse::is_js_test_file(js_id_parts(pattern).0)
 }
 
+/// The test binary from a `cargo test --no-run --message-format=json` output:
+/// the compiler-artifact lines whose profile is `test` and whose `executable`
+/// is set. A bin/lib target (unit tests, the common case) outranks an
+/// integration `test` target.
+/// ponytail: with several integration-test binaries this picks the last one;
+/// mapping a test NAME to its binary would need running each with `--list`.
+pub fn test_binary_from_cargo_json(output: &str) -> Option<PathBuf> {
+    let mut unit: Option<PathBuf> = None;
+    let mut any: Option<PathBuf> = None;
+    for line in output.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if v.get("reason").and_then(|r| r.as_str()) != Some("compiler-artifact")
+            || v.get("profile")
+                .and_then(|p| p.get("test"))
+                .and_then(|t| t.as_bool())
+                != Some(true)
+        {
+            continue;
+        }
+        let Some(exe) = v.get("executable").and_then(|e| e.as_str()) else {
+            continue;
+        };
+        let is_unit = v
+            .get("target")
+            .and_then(|t| t.get("kind"))
+            .and_then(|k| k.as_array())
+            .is_some_and(|kinds| {
+                kinds
+                    .iter()
+                    .filter_map(|k| k.as_str())
+                    .any(|k| k == "bin" || k == "lib")
+            });
+        if is_unit {
+            unit = Some(PathBuf::from(exe));
+        } else {
+            any = Some(PathBuf::from(exe));
+        }
+    }
+    unit.or(any)
+}
+
+/// Build (or reuse) the workspace's test binary for debugging:
+/// `cargo test --no-run --message-format=json`, synchronously.
+/// ponytail: blocks the caller for the build — warm targets answer in
+/// under a second, a cold crate takes as long as it takes; move to a
+/// background thread if that ever hurts in practice.
+pub fn build_test_binary(root: &Path) -> std::io::Result<PathBuf> {
+    let out = cargo_cmd(root, &["test", "--no-run", "--message-format=json"]).output()?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    test_binary_from_cargo_json(&stdout).ok_or_else(|| {
+        std::io::Error::other(format!(
+            "no test binary in cargo's build output: {}",
+            String::from_utf8_lossy(&out.stderr)
+                .lines()
+                .last()
+                .unwrap_or("")
+        ))
+    })
+}
+
 /// Adapt a one-line-one-case parser to [`run_streaming`]'s many-cases shape
 /// (jest's `--json` yields every case from a single stdout line, so the
 /// streaming contract is a `Vec` per line).
@@ -737,5 +799,33 @@ mod tests {
         .unwrap();
         assert!(w.drain(&mut panel));
         assert!(!panel.is_empty());
+    }
+
+    #[test]
+    fn cargo_json_artifact_lines_yield_the_unit_test_binary() {
+        // Shapes captured from a real `cargo test --no-run --message-format=json`
+        // run: one compiler-artifact line per target, `executable` set only on
+        // test binaries. The bin/lib target (unit tests) outranks integration
+        // test targets when both exist.
+        let lines = [
+            r#"{"reason":"compiler-artifact","target":{"kind":["test"],"name":"cli"},"profile":{"test":true},"executable":"/p/target/debug/deps/cli-2a2d806b06669aa7"}"#,
+            r#"{"reason":"compiler-artifact","target":{"kind":["bin"],"name":"croft"},"profile":{"test":true},"executable":"/p/target/debug/deps/croft-ff001122"}"#,
+            r#"{"reason":"build-finished","success":true}"#,
+        ];
+        let joined = lines.join("\n");
+        assert_eq!(
+            test_binary_from_cargo_json(&joined).as_deref(),
+            Some(std::path::Path::new("/p/target/debug/deps/croft-ff001122")),
+            "the bin target's test binary wins over the integration test's"
+        );
+        // Only an integration target: it is still returned.
+        assert_eq!(
+            test_binary_from_cargo_json(lines[0]).as_deref(),
+            Some(std::path::Path::new(
+                "/p/target/debug/deps/cli-2a2d806b06669aa7"
+            ))
+        );
+        assert_eq!(test_binary_from_cargo_json(lines[2]), None);
+        assert_eq!(test_binary_from_cargo_json(""), None);
     }
 }
