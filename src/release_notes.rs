@@ -59,7 +59,13 @@ pub struct ReleaseNote {
 }
 
 /// What shipped in the current release. Replace on every version bump.
-pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
-    kind: NoteKind::Feature,
-    summary: "Rendered Markdown preview on Cmd/Ctrl+Shift+V: headings, lists, task checkboxes, quotes, aligned tables, links, and fenced code blocks in the editor's own syntax colours, reflowing with the pane and following your edits; the same chord flips back to the source.",
-}];
+pub const RELEASE_NOTES: &[ReleaseNote] = &[
+    ReleaseNote {
+        kind: NoteKind::Feature,
+        summary: "The Testing view now runs Python projects: pytest discovery and runs stream into the suite tree exactly like cargo test, with parametrized cases, class methods, and click-to-source jumps to the def.",
+    },
+    ReleaseNote {
+        kind: NoteKind::Feature,
+        summary: "Testing clicks match VS Code: a test's play/status glyph runs it while clicking its name reveals the source, and suite headers gained their own play button so a stray click never kicks a whole run.",
+    },
+];

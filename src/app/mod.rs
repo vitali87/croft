@@ -13042,11 +13042,11 @@ impl App {
     }
 
     /// List tests without running them (populate the tree). No-op while busy or
-    /// outside a Cargo project — `cargo test -- --list` would error with no
-    /// manifest, and it compiles the test binary so we never auto-fire it
-    /// per-keystroke (M1/M2 is Rust-only; gate on Cargo.toml).
+    /// outside a recognised test project (Cargo or pytest) — the tool would
+    /// error with no manifest, and `cargo test -- --list` compiles the test
+    /// binary so we never auto-fire it per-keystroke.
     fn discover_tests(&mut self) {
-        if self.testing.is_busy() || !self.tree.root.join("Cargo.toml").is_file() {
+        if self.testing.is_busy() || crate::testing::worker::runner_for(&self.tree.root).is_none() {
             return;
         }
         self.test_worker.discover();
@@ -23346,21 +23346,26 @@ impl App {
                 }
                 if in_tree && self.sidebar_view == SidebarView::Testing {
                     self.focus_pane(Pane::Tree);
-                    // The scrollbar lane starts a thumb drag; a plain click on a
-                    // test row runs it; Cmd/Opt+click (arrives as ALT here, like
-                    // go-to-definition) jumps to the test's source instead.
-                    // Suite headers and empty space do nothing.
+                    // The scrollbar lane starts a thumb drag; elsewhere the play
+                    // glyph runs a case or suite while a case's name reveals its
+                    // source (VS Code's split: the label shows, the icon runs).
+                    // Empty space does nothing.
                     if rect_contains(self.testing.last_scrollbar, m.column, m.row) {
                         self.testing.scroll_to_bar_y(m.row);
                         self.testing_scrollbar_drag = true;
-                    } else if let Some(name) = self.testing.case_name_at(m.row) {
-                        if m.modifiers.contains(KeyModifiers::ALT) {
-                            self.jump_to_test_source(name);
-                        } else {
-                            self.run_test(name);
+                    } else {
+                        match self.testing.hit_at(m.column, m.row) {
+                            Some(crate::widgets::testing::RowHit::RunCase(name)) => {
+                                self.run_test(name)
+                            }
+                            Some(crate::widgets::testing::RowHit::ShowCase(name)) => {
+                                self.jump_to_test_source(name)
+                            }
+                            Some(crate::widgets::testing::RowHit::RunSuite(suite)) => {
+                                self.run_suite(suite)
+                            }
+                            None => {}
                         }
-                    } else if let Some(suite) = self.testing.suite_at(m.row) {
-                        self.run_suite(suite);
                     }
                     return;
                 }

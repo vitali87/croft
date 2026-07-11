@@ -76,7 +76,7 @@ src/
 │   ├── remote_attach.rs pure attach planning: parse / gate the CPython version (>=3.14 ships sys.remote_exec), the platform-aware sudo-elevation decision (macOS always, Linux unless Yama ptrace_scope is relaxed), and the `pdb -p` command builder
 │   ├── discovery.rs     enumerate attachable CPython 3.14+ processes via sysinfo plus a per-candidate `--version` probe
 │   └── reaper.rs        sweeps orphaned vscode-js-debug processes (server + its detached watchdog, which setsids into its own session and survives a group-kill) left behind when croft crashes/force-quits without running Drop; kills only ~/.croft/js-debug scripts reparented to init (pid 1), so a live session is never touched; run async at startup and after each session teardown
-├── testing/             Test Runner: a background worker runs `cargo test` off the render loop and streams parsed cases into the Testing panel (mirrors app/git_worker + dap drain-per-tick)
+├── testing/             Test Runner: a background worker runs the project's test tool off the render loop (`cargo test` for Rust, `pytest` for Python, picked per workspace by `worker::runner_for`) and streams parsed cases into the Testing panel (mirrors app/git_worker + dap drain-per-tick)
 │   ├── mod.rs
 │   ├── model.rs         TestStatus (NotRun/Running/Passed/Failed/Skipped) + TestCase; suite_and_leaf splits a `module::name` path for the tree
 │   ├── parse.rs         libtest output parsers: parse_test_line (`test <path> ... ok|FAILED|ignored` -> TestCase, run output) and parse_list_line (`<path>: test` -> name, discovery), both skipping chrome / the summary / benches
@@ -129,7 +129,7 @@ src/
     ├── process_picker.rs centered selectable list of attachable Python 3.14+ processes for "Debug: Attach to Python Process"; selecting one has the App spawn `pdb -p <pid>` in a PTY
     ├── remote.rs        Remote (SSH) sidebar widget with empty-state hero illustration
     ├── run_debug.rs     Run and Debug sidebar widget: empty-state Run [filename] button, and when a session is live the paused-state tree (call stack + expandable variables), a debug console of program output, and a `❯` REPL prompt; the App builds the rows and maps clicks back to frames / variables
-    ├── testing.rs       Testing sidebar widget: the test suite tree (grouped by module) with live pass/fail/skip status glyphs, a summary line reflecting the Activity (Discovering / Running / tally), and the failing-test count that feeds the beaker activity badge; the view discovers on first open, Enter runs all tests, `r` re-discovers
+    ├── testing.rs       Testing sidebar widget: the test suite tree (grouped by module / pytest file) with live pass/fail/skip status glyphs, a summary line reflecting the Activity (Discovering / Running / tally), and the failing-test count that feeds the beaker activity badge; the view discovers on first open, Enter runs all tests, `r` re-discovers; each row's play/status glyph is the click-to-run button while a case's name reveals its source (`hit_at` maps the click)
     ├── scrollbar.rs     shared vertical- and horizontal-scrollbar geometry
     ├── search.rs        sidebar search panel (query/replace/include/exclude inputs) + .gitignore-aware walker, glob filtering, and replace
     ├── shortcuts.rs     F1 shortcuts modal: every binding grouped by pane, scrollable

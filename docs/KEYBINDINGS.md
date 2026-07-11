@@ -50,7 +50,7 @@ On macOS, the `Cmd` chords below only reach croft after you run a one-time setup
 | `Cmd+K` `O` | Copy into New Window: open the active file in a new window of your terminal, focused on just the file (Explorer + terminal hidden; the current window is untouched; Ghostty / iTerm2 / Terminal; macOS only) |
 | `Cmd+K` `Shift+O` | Move into New Window: same, and close the file's tab here (macOS only) |
 | `Cmd+K` `Z` | Toggle Zen Mode: hide the activity bar, both side bars, the panel, and the status bar; press again to restore exactly what was shown before |
-| `Cmd+K` `B` | Show the Testing view (beaker icon); it discovers tests on first open. In the view: Enter runs all tests, `r` re-discovers, click a test to run just it, click a suite header to run the whole module, Cmd/Opt+click a test to jump to its source, ↑/↓ scroll or drag the scrollbar |
+| `Cmd+K` `B` | Show the Testing view (beaker icon); it discovers tests on first open (`cargo test` for Rust, `pytest` for Python). In the view: Enter runs all tests, `r` re-discovers, click a test's play/status glyph to run just it, click its name to jump to its source, click a suite header's play glyph to run the whole suite, ↑/↓ scroll or drag the scrollbar |
 | `Cmd+K` `Enter` | Run the test the editor caret sits in (also in the palette as "Testing: Run Test at Cursor") |
 | `Cmd+K` `M` | Maximize the active terminal pane across the panel width (the other terminals move to a right-edge rail); press again to restore the even split |
 | `Cmd+K` `F` | Toggle Format on Save: when on, `Cmd+S` reformats through the language server before writing (also in the Command Palette) |

@@ -1,6 +1,6 @@
 //! The Testing sidebar view: a tree of test suites and cases with live pass/
 //! fail status, mirroring VS Code's Testing view. Results stream in from the
-//! `cargo test` worker ([`crate::testing::worker`]); the panel projects them
+//! test worker ([`crate::testing::worker`]); the panel projects them
 //! into a suite tree (grouped by the module path) and exposes the failing-test
 //! count that drives the beaker activity-icon badge. A run is kicked off from
 //! the Command Palette ("Testing: Run All Tests") or the panel's Enter key.
@@ -23,18 +23,31 @@ const COLOR_CASE: Color = Color::Rgb(0xCC, 0xCC, 0xCC);
 
 /// Codicon status glyphs (Nerd Fonts preserve codicon codepoints): `check`
 /// (U+EAB2) for a pass, `error` (U+EA87) for a fail, `circle-filled` (U+EA71)
-/// for the running / not-run / skipped dot. Verified against the glyphs already
-/// used in `crate::widgets::problems` and `crate::icons`.
+/// for the running / skipped dot, `play` (U+EB2C) for a not-yet-run case and
+/// the suite headers — the glyph doubles as the click-to-run button, so the
+/// idle state advertises it. Verified against the glyphs already used in
+/// `crate::widgets::problems` and `crate::icons`.
 const GLYPH_PASS: char = '\u{eab2}';
 const GLYPH_FAIL: char = '\u{ea87}';
 const GLYPH_DOT: char = '\u{ea71}';
+const GLYPH_PLAY: char = '\u{eb2c}';
 
-/// A rendered line, used to map a click row back to a case (suite headers are
-/// not actionable in M1).
+/// A rendered line, used to map a click row back to a case or suite header.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RenderRow {
     Header(usize),
     Case(usize),
+}
+
+/// What a click in the tree resolves to (see [`TestingPanel::hit_at`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RowHit {
+    /// The play glyph of a test case: run it.
+    RunCase(String),
+    /// A test case's name: reveal its source in the editor.
+    ShowCase(String),
+    /// The play glyph of a suite header: run the whole suite.
+    RunSuite(String),
 }
 
 pub struct TestingPanel {
@@ -213,29 +226,31 @@ impl TestingPanel {
         moved
     }
 
-    /// The name of the test case at screen row `y`, if that row is a case (not a
-    /// suite header or empty space). Used to run a single test on click.
-    pub fn case_name_at(&self, y: u16) -> Option<String> {
-        if y < self.first_row_y {
+    /// What a click at `(x, y)` in the tree hits. The play/status glyph runs
+    /// the case or suite; the case name shows (jumps to) its source — VS Code
+    /// separates the two the same way: the label reveals, the play icon runs.
+    /// A suite header's name is inert so a stray click never kicks a whole
+    /// suite. The x thresholds mirror the render columns (glyphs at
+    /// `inner.x + 1`/`+ 2`, names at `inner.x + 3`/`+ 4`).
+    pub fn hit_at(&self, x: u16, y: u16) -> Option<RowHit> {
+        if y < self.first_row_y || y >= self.first_row_y + self.viewport_rows {
             return None;
         }
+        let inner_x = self.last_area.x + 1;
         let shown = (y - self.first_row_y) as usize;
         match self.rows.get(self.scroll + shown)? {
-            RenderRow::Case(idx) => Some(self.cases[*idx].name.clone()),
-            RenderRow::Header(_) => None,
-        }
-    }
-
-    /// The suite name at screen row `y`, if that row is a suite header. Used to
-    /// run a whole suite by clicking its header.
-    pub fn suite_at(&self, y: u16) -> Option<String> {
-        if y < self.first_row_y {
-            return None;
-        }
-        let shown = (y - self.first_row_y) as usize;
-        match self.rows.get(self.scroll + shown)? {
-            RenderRow::Header(idx) => self.cases[*idx].suite_and_leaf().0.map(str::to_string),
-            RenderRow::Case(_) => None,
+            RenderRow::Case(idx) => {
+                let name = self.cases[*idx].name.clone();
+                if x < inner_x + 4 {
+                    Some(RowHit::RunCase(name))
+                } else {
+                    Some(RowHit::ShowCase(name))
+                }
+            }
+            RenderRow::Header(idx) => {
+                let suite = self.cases[*idx].suite_and_leaf().0?.to_string();
+                (x < inner_x + 3).then_some(RowHit::RunSuite(suite))
+            }
         }
     }
 
@@ -261,7 +276,8 @@ fn status_glyph(status: TestStatus, theme: Theme) -> (char, Color) {
         TestStatus::Passed => (GLYPH_PASS, theme.git_added()),
         TestStatus::Failed => (GLYPH_FAIL, theme.git_deleted()),
         TestStatus::Running => (GLYPH_DOT, theme.accent()),
-        TestStatus::Skipped | TestStatus::NotRun => (GLYPH_DOT, COLOR_DIM),
+        TestStatus::Skipped => (GLYPH_DOT, COLOR_DIM),
+        TestStatus::NotRun => (GLYPH_PLAY, COLOR_DIM),
     }
 }
 
@@ -389,10 +405,17 @@ impl Widget for &mut TestingPanel {
                 RenderRow::Header(case_idx) => {
                     let (suite, _) = self.cases[*case_idx].suite_and_leaf();
                     let suite = suite.unwrap_or("(root)");
+                    // The suite's run button; its name (like a case's) is inert.
                     buf.set_string(
                         inner.x + 1,
                         y,
-                        clip(suite, inner.x + 1),
+                        GLYPH_PLAY.to_string(),
+                        Style::default().fg(COLOR_DIM),
+                    );
+                    buf.set_string(
+                        inner.x + 3,
+                        y,
+                        clip(suite, inner.x + 3),
                         Style::default()
                             .fg(COLOR_HEADER)
                             .add_modifier(Modifier::BOLD),
@@ -483,6 +506,37 @@ mod tests {
         assert_eq!(p.cases.len(), 3, "the rest of the tree is preserved");
         let b = p.cases.iter().find(|c| c.name == "m::b").unwrap();
         assert_eq!(b.status, TestStatus::Running, "only the target is Running");
+    }
+
+    #[test]
+    fn glyph_clicks_run_and_name_clicks_show() {
+        let mut p = TestingPanel::new();
+        p.on_busy_started(Activity::Running);
+        for n in ["m::a", "m::b"] {
+            p.apply_case(TestCase {
+                name: n.into(),
+                status: TestStatus::Passed,
+            });
+        }
+        p.on_finished(Some(true));
+        // Mirror render's geometry: border at x=0 so inner.x = 1; the tree
+        // starts at first_row_y with Header(m), Case(a), Case(b).
+        p.last_area = Rect::new(0, 0, 30, 10);
+        p.first_row_y = 3;
+        p.viewport_rows = 5;
+        p.build_rows();
+
+        // Case rows: glyph column (inner.x+2 .. inner.x+4) runs, the name shows.
+        assert_eq!(p.hit_at(3, 4), Some(RowHit::RunCase("m::a".into())));
+        assert_eq!(p.hit_at(10, 4), Some(RowHit::ShowCase("m::a".into())));
+        assert_eq!(p.hit_at(10, 5), Some(RowHit::ShowCase("m::b".into())));
+        // Suite header: only its play glyph (inner.x+1 .. inner.x+3) runs; the
+        // name itself is inert so a stray click never kicks a whole suite.
+        assert_eq!(p.hit_at(2, 3), Some(RowHit::RunSuite("m".into())));
+        assert_eq!(p.hit_at(10, 3), None);
+        // Outside the tree: nothing.
+        assert_eq!(p.hit_at(3, 2), None);
+        assert_eq!(p.hit_at(3, 9), None);
     }
 
     #[test]

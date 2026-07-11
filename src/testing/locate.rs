@@ -25,8 +25,13 @@ impl Sink for FirstLine {
 
 /// The source location `(path, line)` of the test named `full_name` (e.g.
 /// `widgets::testing::tests::foo`), or `None` if no `fn` is found. `line` is
-/// 0-based, ready for [`crate::app`]'s go-to-definition.
+/// 0-based, ready for [`crate::app`]'s go-to-definition. pytest node IDs
+/// (`tests/test_x.py::test_y`) carry their file, so those skip the walk and
+/// grep just that file for the `def`.
 pub fn find_test_source(root: &Path, full_name: &str) -> Option<(PathBuf, u32)> {
+    if full_name.contains(".py::") {
+        return pytest_source(root, full_name);
+    }
     let mut segments: Vec<&str> = full_name.split("::").collect();
     let leaf = segments.pop()?;
     // Module segments minus the conventional `tests` wrapper: these are what a
@@ -62,6 +67,25 @@ pub fn find_test_source(root: &Path, full_name: &str) -> Option<(PathBuf, u32)> 
     best.map(|(p, l, _)| (p, l))
 }
 
+/// Resolve a pytest node ID: the segment before `.py::` is the file (relative
+/// to the workspace root), the last segment the test name — its parametrize
+/// suffix (`[1]`) stripped, since the source `def` carries no bracket.
+fn pytest_source(root: &Path, full_name: &str) -> Option<(PathBuf, u32)> {
+    let (file, rest) = full_name.split_once(".py::")?;
+    let path = root.join(format!("{file}.py"));
+    let leaf = rest.rsplit("::").next()?.split('[').next()?;
+    let matcher = RegexMatcher::new(&format!(r"\bdef\s+{leaf}\s*\(")).ok()?;
+    let mut searcher = SearcherBuilder::new()
+        .line_number(true)
+        .binary_detection(BinaryDetection::quit(b'\x00'))
+        .memory_map(MmapChoice::never())
+        .build();
+    let mut sink = FirstLine(None);
+    searcher.search_path(&matcher, &path, &mut sink).ok()?;
+    let line1 = sink.0?;
+    Some((path, line1.saturating_sub(1) as u32))
+}
+
 /// The name of the nearest `fn` at or above `cursor_row` — the test the caret
 /// sits in, for run-at-cursor. Scans upward and returns the first `fn <ident>`
 /// it finds. `None` if the caret is above every function.
@@ -75,18 +99,23 @@ pub fn enclosing_fn_name(lines: &[String], cursor_row: usize) -> Option<String> 
     None
 }
 
-/// Extract the identifier after `fn ` in a single line, or `None`. Deliberately
-/// simple: it does not skip `fn` inside comments or strings, which is a rare
-/// enough case for a run-at-cursor convenience that it isn't worth a parser.
+/// Extract the identifier after a function keyword (`fn ` for Rust, `def ` for
+/// Python) in a single line, or `None`. Deliberately simple: it does not skip
+/// keywords inside comments or strings, which is a rare enough case for a
+/// run-at-cursor convenience that it isn't worth a parser.
 fn fn_name_in(line: &str) -> Option<String> {
-    let after = line.split("fn ").nth(1)?;
-    let name: String = after
+    ["fn ", "def "].iter().find_map(|kw| name_after(line, kw))
+}
+
+fn name_after(line: &str, keyword: &str) -> Option<String> {
+    let idx = line.find(keyword)?;
+    let name: String = line[idx + keyword.len()..]
         .chars()
         .take_while(|c| c.is_alphanumeric() || *c == '_')
         .collect();
-    // `fn ` must be a keyword boundary (preceded by start/whitespace), and the
-    // name non-empty — guards against `define_fn foo` style false hits.
-    let before = &line[..line.find("fn ")?];
+    // The keyword must sit on a word boundary (start of line or after
+    // whitespace), and the name non-empty — guards against `define_fn foo`.
+    let before = &line[..idx];
     let boundary = before.is_empty() || before.ends_with(|c: char| c.is_whitespace());
     (boundary && !name.is_empty()).then_some(name)
 }
@@ -163,6 +192,48 @@ mod tests {
         // A word merely ending in "fn" is not a keyword boundary.
         let noise = vec![String::from("let define_fn_thing = 3;")];
         assert_eq!(enclosing_fn_name(&noise, 0), None);
+    }
+
+    #[test]
+    fn pytest_node_ids_resolve_to_the_def_in_their_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("tests")).unwrap();
+        std::fs::write(
+            root.join("tests/test_sample.py"),
+            "import pytest\n\ndef test_passes():\n    assert True\n\nclass TestGroup:\n    def test_method(self):\n        assert True\n",
+        )
+        .unwrap();
+
+        let (path, line) = find_test_source(root, "tests/test_sample.py::test_passes").unwrap();
+        assert!(path.ends_with("tests/test_sample.py"), "got {path:?}");
+        assert_eq!(line, 2, "0-based line of `def test_passes`");
+        let (_, line) =
+            find_test_source(root, "tests/test_sample.py::TestGroup::test_method").unwrap();
+        assert_eq!(line, 6, "class methods resolve through the last segment");
+        // Parametrized IDs strip their bracket suffix before the lookup.
+        let (_, line) = find_test_source(root, "tests/test_sample.py::test_passes[1]").unwrap();
+        assert_eq!(line, 2);
+        // A node ID pointing at a missing file finds nothing.
+        assert!(find_test_source(root, "tests/gone.py::test_x").is_none());
+    }
+
+    #[test]
+    fn enclosing_fn_understands_python_defs() {
+        let lines: Vec<String> = [
+            "import pytest",
+            "def test_first():",
+            "    assert True", // cursor here -> test_first
+            "class TestGroup:",
+            "    def test_method(self):",
+            "        assert True", // cursor here -> test_method
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(enclosing_fn_name(&lines, 2).as_deref(), Some("test_first"));
+        assert_eq!(enclosing_fn_name(&lines, 5).as_deref(), Some("test_method"));
+        assert_eq!(enclosing_fn_name(&lines, 0), None);
     }
 
     #[test]

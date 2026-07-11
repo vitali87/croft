@@ -11,9 +11,40 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc::{Receiver, Sender};
 
 use super::model::{Activity, TestCase, TestStatus};
-use super::parse::{parse_list_line, parse_test_line};
+use super::parse::{
+    parse_list_line, parse_pytest_collect_line, parse_pytest_line, parse_test_line,
+};
 use crate::output::{self, OutputLevel};
 use crate::widgets::testing::TestingPanel;
+
+/// Which test tool a workspace uses, detected from its manifest files. Cargo
+/// wins when both manifests exist (a mixed repo's root is usually the crate).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Runner {
+    Cargo,
+    Pytest,
+}
+
+/// The manifest files that mark a Python project pytest can run in.
+const PYTHON_MARKERS: [&str; 5] = [
+    "pyproject.toml",
+    "pytest.ini",
+    "setup.cfg",
+    "setup.py",
+    "tox.ini",
+];
+
+/// Detect the workspace's test runner. `None` means no recognised test project,
+/// so the Testing view stays empty instead of shelling a tool that would error.
+pub fn runner_for(root: &Path) -> Option<Runner> {
+    if root.join("Cargo.toml").is_file() {
+        return Some(Runner::Cargo);
+    }
+    PYTHON_MARKERS
+        .iter()
+        .any(|m| root.join(m).is_file())
+        .then_some(Runner::Pytest)
+}
 
 pub enum TestRequest {
     RunAll,
@@ -150,6 +181,54 @@ fn cargo_cmd(root: &Path, args: &[&str]) -> Command {
     cmd
 }
 
+/// Absolute path to the `pytest` binary for a workspace. The project's own
+/// `.venv` wins (uv and venv projects put it there, with the project's deps
+/// importable); then `PATH`, then the usual user/tool install dirs — resolved
+/// absolutely like [`cargo_cmd`] because a GUI-launched croft inherits the
+/// stripped launchd PATH.
+fn pytest_binary(root: &Path) -> PathBuf {
+    let venv = root.join(".venv").join("bin").join("pytest");
+    if venv.is_file() {
+        return venv;
+    }
+    if let Some(path_var) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path_var) {
+            let candidate = dir.join("pytest");
+            if candidate.is_file() {
+                return candidate;
+            }
+        }
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        let candidate = PathBuf::from(home)
+            .join(".local")
+            .join("bin")
+            .join("pytest");
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+    for dir in ["/opt/homebrew/bin", "/usr/local/bin"] {
+        let candidate = PathBuf::from(dir).join("pytest");
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+    // Last resort: let the OS resolve it and fail honestly into the empty state.
+    PathBuf::from("pytest")
+}
+
+/// `pytest <args>` rooted at the workspace, with piped stdio.
+fn pytest_cmd(root: &Path, args: &[&str]) -> Command {
+    let mut cmd = Command::new(pytest_binary(root));
+    cmd.args(args)
+        .current_dir(root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    cmd
+}
+
 /// Spawn `cmd`, tee stderr (compile diagnostics) to the OUTPUT channel, and run
 /// each stdout line through `parse` — every matched [`TestCase`] is streamed as
 /// it arrives. Returns the child's exit success, or `None` if it never spawned.
@@ -164,7 +243,7 @@ fn run_streaming(
             output::push(
                 output::CHANNEL_TESTS,
                 OutputLevel::Error,
-                &format!("failed to spawn cargo: {e}"),
+                &format!("failed to spawn the test runner: {e}"),
             );
             return None;
         }
@@ -218,41 +297,109 @@ pub(crate) fn cargo_progress(line: &str) -> Option<String> {
 
 fn run_all(root: &Path, tx: &Sender<TestResponse>) {
     let _ = tx.send(TestResponse::Started(Activity::Running));
-    let cmd = cargo_cmd(root, &["test", "--no-fail-fast", "--color=never"]);
-    let ok = run_streaming(tx, cmd, parse_test_line).unwrap_or(false);
+    let ok = match runner_for(root) {
+        Some(Runner::Pytest) => {
+            let cmd = pytest_cmd(root, &["-v", "--color=no"]);
+            run_streaming(tx, cmd, parse_pytest_line)
+        }
+        _ => {
+            let cmd = cargo_cmd(root, &["test", "--no-fail-fast", "--color=never"]);
+            run_streaming(tx, cmd, parse_test_line)
+        }
+    }
+    .unwrap_or(false);
     let _ = tx.send(TestResponse::Finished { ok: Some(ok) });
 }
 
-/// Run a single test by exact name: `cargo test <name> --color=never -- --exact`.
-/// `--exact` stops the name being treated as a substring filter. No `Started` is
-/// sent: the app marks just this case Running and keeps the rest of the tree, so
-/// a single-test run doesn't wipe the discovered list.
+/// Run a single test by exact name: `cargo test <name> --color=never -- --exact`
+/// (`--exact` stops the name being treated as a substring filter), or for
+/// pytest the node ID itself, which is already exact. No `Started` is sent: the
+/// app marks just this case Running and keeps the rest of the tree, so a
+/// single-test run doesn't wipe the discovered list.
 fn run_one(root: &Path, tx: &Sender<TestResponse>, name: &str) {
-    let cmd = cargo_cmd(root, &["test", name, "--color=never", "--", "--exact"]);
-    let ok = run_streaming(tx, cmd, parse_test_line).unwrap_or(false);
+    let ok = match runner_for(root) {
+        Some(Runner::Pytest) => {
+            let cmd = pytest_cmd(root, &["-v", "--color=no", name]);
+            run_streaming(tx, cmd, parse_pytest_line)
+        }
+        _ => {
+            let cmd = cargo_cmd(root, &["test", name, "--color=never", "--", "--exact"]);
+            run_streaming(tx, cmd, parse_test_line)
+        }
+    }
+    .unwrap_or(false);
     let _ = tx.send(TestResponse::Finished { ok: Some(ok) });
 }
 
-/// Run every test matching a name substring: `cargo test <pattern> --no-fail-fast`
-/// (no `--exact`, so it selects a whole suite / all fns sharing the name). Like
-/// [`run_one`], the app has already marked the affected cases and shown the busy
-/// state, so no `Started` is sent.
+/// Run every test matching a name filter. cargo's positional filter is a
+/// substring match, so the suite prefix or a bare fn name both work. pytest
+/// splits the two shapes: a suite is a node-ID prefix (`tests/test_x.py`,
+/// `tests/test_x.py::TestGroup`) passed positionally, a bare function name
+/// (run-at-cursor) goes through `-k`, pytest's substring matcher. Like
+/// [`run_one`], the app has already marked the affected cases and shown the
+/// busy state, so no `Started` is sent.
 fn run_filter(root: &Path, tx: &Sender<TestResponse>, pattern: &str) {
-    let cmd = cargo_cmd(root, &["test", pattern, "--no-fail-fast", "--color=never"]);
-    let ok = run_streaming(tx, cmd, parse_test_line).unwrap_or(false);
+    let ok = match runner_for(root) {
+        Some(Runner::Pytest) => {
+            let cmd = if pattern.contains(".py") {
+                pytest_cmd(root, &["-v", "--color=no", pattern])
+            } else {
+                pytest_cmd(root, &["-v", "--color=no", "-k", pattern])
+            };
+            run_streaming(tx, cmd, parse_pytest_line)
+        }
+        _ => {
+            let cmd = cargo_cmd(root, &["test", pattern, "--no-fail-fast", "--color=never"]);
+            run_streaming(tx, cmd, parse_test_line)
+        }
+    }
+    .unwrap_or(false);
     let _ = tx.send(TestResponse::Finished { ok: Some(ok) });
 }
 
-/// List tests without running them (`cargo test -- --list`), streaming each as a
-/// `NotRun` case. Still compiles the test binary, hence the Discovering state.
+/// List tests without running them (`cargo test -- --list`, or pytest's
+/// `--collect-only -q`), streaming each as a `NotRun` case. The cargo path
+/// still compiles the test binary, hence the Discovering state.
 fn discover(root: &Path, tx: &Sender<TestResponse>) {
     let _ = tx.send(TestResponse::Started(Activity::Discovering));
-    let cmd = cargo_cmd(root, &["test", "--color=never", "--", "--list"]);
-    run_streaming(tx, cmd, |line| {
-        parse_list_line(line).map(|name| TestCase {
-            name,
-            status: TestStatus::NotRun,
-        })
-    });
+    match runner_for(root) {
+        Some(Runner::Pytest) => {
+            let cmd = pytest_cmd(root, &["--collect-only", "-q", "--color=no"]);
+            run_streaming(tx, cmd, |line| {
+                parse_pytest_collect_line(line).map(|name| TestCase {
+                    name,
+                    status: TestStatus::NotRun,
+                })
+            });
+        }
+        _ => {
+            let cmd = cargo_cmd(root, &["test", "--color=never", "--", "--list"]);
+            run_streaming(tx, cmd, |line| {
+                parse_list_line(line).map(|name| TestCase {
+                    name,
+                    status: TestStatus::NotRun,
+                })
+            });
+        }
+    }
     let _ = tx.send(TestResponse::Finished { ok: None });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runner_detection_prefers_cargo_then_python_markers() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(runner_for(tmp.path()), None, "no manifest, no runner");
+        std::fs::write(tmp.path().join("pyproject.toml"), "[project]\n").unwrap();
+        assert_eq!(runner_for(tmp.path()), Some(Runner::Pytest));
+        std::fs::write(tmp.path().join("Cargo.toml"), "[package]\n").unwrap();
+        assert_eq!(runner_for(tmp.path()), Some(Runner::Cargo));
+
+        let py = tempfile::tempdir().unwrap();
+        std::fs::write(py.path().join("pytest.ini"), "[pytest]\n").unwrap();
+        assert_eq!(runner_for(py.path()), Some(Runner::Pytest));
+    }
 }

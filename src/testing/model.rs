@@ -22,9 +22,11 @@ pub enum TestStatus {
     Skipped,
 }
 
-/// One test case keyed by its full path as the runner prints it (for cargo,
-/// `module::submodule::name`). The suite grouping in the panel is derived from
-/// this path, so the parser need not know about the tree.
+/// One test case keyed by its full path as the runner prints it (for cargo
+/// `module::submodule::name`, for pytest the node ID
+/// `tests/test_x.py::TestGroup::test_y` — both use `::`). The suite grouping in
+/// the panel is derived from this path, so the parser need not know about the
+/// tree.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TestCase {
     pub name: String,
