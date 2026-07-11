@@ -772,6 +772,11 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 handler: "",
             },
             ShortcutEntry {
+                keys: "Shift+Alt+F9",
+                description: "Add or edit a logpoint: the adapter prints the message ({expr} interpolates) instead of pausing",
+                handler: "",
+            },
+            ShortcutEntry {
                 keys: "Alt+F9",
                 description: "Toggle break on raised (not just uncaught) exceptions",
                 handler: "",

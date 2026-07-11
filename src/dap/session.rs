@@ -278,11 +278,14 @@ pub fn start_debugging_request(msg: &Value) -> Option<StartDebuggingRequest> {
 }
 
 /// A breakpoint to set on a source line, with an optional `condition` (a boolean
-/// expression the adapter evaluates; the breakpoint only pauses when it's true).
+/// expression the adapter evaluates; the breakpoint only pauses when it's true)
+/// and an optional `log_message` (a logpoint: the adapter interpolates and
+/// prints the text instead of pausing). The two are independent DAP fields.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceBreakpoint {
     pub line: u32,
     pub condition: Option<String>,
+    pub log_message: Option<String>,
 }
 
 impl SourceBreakpoint {
@@ -290,18 +293,25 @@ impl SourceBreakpoint {
         Self {
             line,
             condition: None,
+            log_message: None,
         }
     }
 }
 
 /// Build a `setBreakpoints` request body for one source file, carrying any
-/// per-breakpoint `condition`.
+/// per-breakpoint `condition` and `logMessage`.
 pub fn set_breakpoints_request(path: &Path, breakpoints: &[SourceBreakpoint]) -> Value {
     let bps: Vec<Value> = breakpoints
         .iter()
-        .map(|b| match &b.condition {
-            Some(c) => json!({ "line": b.line, "condition": c }),
-            None => json!({ "line": b.line }),
+        .map(|b| {
+            let mut bp = json!({ "line": b.line });
+            if let Some(c) = &b.condition {
+                bp["condition"] = json!(c);
+            }
+            if let Some(m) = &b.log_message {
+                bp["logMessage"] = json!(m);
+            }
+            bp
         })
         .collect();
     let lines: Vec<u32> = breakpoints.iter().map(|b| b.line).collect();
@@ -1328,6 +1338,7 @@ mod tests {
                 SourceBreakpoint {
                     line: 7,
                     condition: Some(String::from("i > 3")),
+                    log_message: None,
                 },
             ],
         );
@@ -1339,6 +1350,35 @@ mod tests {
         assert!(bps[0].get("condition").is_none());
         assert_eq!(bps[1]["line"], 7);
         assert_eq!(bps[1]["condition"], "i > 3");
+    }
+
+    #[test]
+    fn set_breakpoints_request_carries_log_messages() {
+        // A logpoint is a breakpoint with a `logMessage`: the adapter prints
+        // the interpolated text instead of pausing. Condition and logMessage
+        // are independent fields and may coexist on one breakpoint.
+        let req = set_breakpoints_request(
+            Path::new("/a/b.py"),
+            &[
+                SourceBreakpoint {
+                    line: 4,
+                    condition: None,
+                    log_message: Some(String::from("x is {x}")),
+                },
+                SourceBreakpoint {
+                    line: 9,
+                    condition: Some(String::from("n > 0")),
+                    log_message: Some(String::from("n={n}")),
+                },
+                SourceBreakpoint::plain(11),
+            ],
+        );
+        let bps = req["arguments"]["breakpoints"].as_array().unwrap();
+        assert_eq!(bps[0]["logMessage"], "x is {x}");
+        assert!(bps[0].get("condition").is_none());
+        assert_eq!(bps[1]["condition"], "n > 0");
+        assert_eq!(bps[1]["logMessage"], "n={n}");
+        assert!(bps[2].get("logMessage").is_none());
     }
 
     #[test]

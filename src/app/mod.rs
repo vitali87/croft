@@ -984,6 +984,11 @@ enum MenuAction {
     EditBreakpointConditionAt {
         line: usize,
     },
+    /// Editor gutter: open the logpoint editor for 1-based `line`, creating
+    /// the breakpoint if absent. VS Code's "Add Logpoint" / "Edit Logpoint".
+    EditLogpointAt {
+        line: usize,
+    },
     /// Settings gear → "Color Theme": replace the gear menu with the theme
     /// picker (the list of themes with a check on the active one).
     OpenThemePicker,
@@ -1109,6 +1114,7 @@ fn shortcut_for(action: &MenuAction) -> Option<&'static str> {
         MenuAction::GoToImplementationAt { .. } => Some("⌘F12"),
         MenuAction::ToggleBreakpointAt { .. } => Some("F9"),
         MenuAction::EditBreakpointConditionAt { .. } => Some("⇧F9"),
+        MenuAction::EditLogpointAt { .. } => Some("⇧⌥F9"),
         MenuAction::OpenThemePicker => Some("⌘K ⌘T"),
         MenuAction::ToggleSideBar => Some("⌘B"),
         MenuAction::ToggleSecondarySideBar => Some("⌥⌘B"),
@@ -1701,6 +1707,14 @@ enum PromptKind {
     /// breakpoint is created (if absent) and the condition attached/cleared,
     /// then pushed to a live session. A popup, never the status line.
     BreakpointCondition {
+        path: PathBuf,
+        line: usize,
+    },
+    /// Debugger "Add Logpoint" / "Edit Logpoint": edit the log message for
+    /// the breakpoint on 1-based `line` of `path` (`{expr}` holes are
+    /// interpolated by the adapter, which prints instead of pausing). Same
+    /// commit shape as [`PromptKind::BreakpointCondition`].
+    Logpoint {
         path: PathBuf,
         line: usize,
     },
@@ -11870,6 +11884,17 @@ impl App {
                 ]),
                 "Enter to set condition (blank for a plain breakpoint), Esc to cancel",
             ),
+            PromptKind::Logpoint { .. } => (
+                ratatui::text::Line::from(vec![
+                    ratatui::text::Span::raw("> "),
+                    ratatui::text::Span::styled(
+                        p.buffer.as_str(),
+                        Style::default().fg(Color::White),
+                    ),
+                    ratatui::text::Span::styled("█", Style::default().fg(cursor_fg)),
+                ]),
+                "Enter to set the log message, {expr} interpolates (blank for a plain breakpoint), Esc to cancel",
+            ),
         };
         frame.render_widget(
             ratatui::widgets::Paragraph::new(top_line),
@@ -12361,7 +12386,13 @@ impl App {
         if matches!(key.code, KeyCode::F(9))
             && !(terminal_owns_fkeys && self.update_status != UpdateStatus::Ready)
         {
-            if key.modifiers.contains(KeyModifiers::SHIFT) {
+            if key.modifiers.contains(KeyModifiers::SHIFT)
+                && key.modifiers.contains(KeyModifiers::ALT)
+            {
+                // Shift+Alt+F9: add or edit a logpoint at the cursor. Must
+                // precede the bare-Shift arm, which also matches this chord.
+                self.debug_edit_logpoint();
+            } else if key.modifiers.contains(KeyModifiers::SHIFT) {
                 // Shift+F9: add or edit a conditional breakpoint at the cursor.
                 self.debug_edit_condition();
             } else if key.modifiers.contains(KeyModifiers::ALT) {
@@ -13960,6 +13991,76 @@ impl App {
                 .or_default()
                 .insert(line, cond.to_string());
             self.status = format!("Conditional breakpoint at line {line}");
+        }
+        let specs = self
+            .editor
+            .breakpoints
+            .get(&path)
+            .map(|l| self.editor.source_breakpoints(&path, l))
+            .unwrap_or_default();
+        if let Some(session) = self.dap_session.as_mut() {
+            session.update_breakpoints(&path, &specs);
+        }
+    }
+
+    /// Open the logpoint editor for the cursor line, pre-filled with any
+    /// existing message.
+    pub fn debug_edit_logpoint(&mut self) {
+        self.debug_edit_logpoint_line(self.editor.cursor_row + 1);
+    }
+
+    /// Open the logpoint editor for an explicit 1-based `line` as a centered
+    /// popup (`PromptKind::Logpoint`). Shared by the palette entry (cursor
+    /// line), Shift+Alt+F9, and the gutter right-click menu (clicked line).
+    fn debug_edit_logpoint_line(&mut self, line: usize) {
+        let Some(path) = self.editor.path.clone() else {
+            self.status = String::from("Open a file to set a logpoint");
+            return;
+        };
+        let existing = self
+            .editor
+            .breakpoint_logs
+            .get(&path)
+            .and_then(|m| m.get(&line))
+            .cloned()
+            .unwrap_or_default();
+        let label = if existing.is_empty() {
+            format!("Add Logpoint · line {line}")
+        } else {
+            format!("Edit Logpoint · line {line}")
+        };
+        let target_dir = self.tree.root.clone();
+        self.prompt = Some(Prompt {
+            label,
+            buffer: existing,
+            kind: PromptKind::Logpoint { path, line },
+            target_dir,
+            error: None,
+        });
+    }
+
+    /// Commit the logpoint popup: ensure a breakpoint exists on the line,
+    /// attach the typed message (or clear it when blank), and push the file's
+    /// breakpoints to a live session.
+    fn commit_logpoint(&mut self, path: PathBuf, line: usize, message: &str) {
+        self.editor
+            .breakpoints
+            .entry(path.clone())
+            .or_default()
+            .insert(line);
+        let msg = message.trim();
+        if msg.is_empty() {
+            if let Some(m) = self.editor.breakpoint_logs.get_mut(&path) {
+                m.remove(&line);
+            }
+            self.status = format!("Plain breakpoint at line {line}");
+        } else {
+            self.editor
+                .breakpoint_logs
+                .entry(path.clone())
+                .or_default()
+                .insert(line, msg.to_string());
+            self.status = format!("Logpoint at line {line}");
         }
         let specs = self
             .editor
@@ -20395,6 +20496,7 @@ impl App {
             Cmd::PauseDebugging => self.debug_pause(),
             Cmd::RestartDebugging => self.debug_restart(),
             Cmd::ToggleBreakpoint => self.debug_toggle_breakpoint(),
+            Cmd::EditLogpoint => self.debug_edit_logpoint(),
             Cmd::EditBreakpointCondition => self.debug_edit_condition(),
             Cmd::StepOver => self.debug_step("next"),
             Cmd::ToggleRaisedExceptions => self.debug_toggle_raised_exceptions(),
@@ -22747,7 +22849,7 @@ impl App {
                 {
                     self.focus_pane(Pane::Editor);
                     let line = line0 + 1; // 1-based, as breakpoints are stored
-                    let (has_bp, has_cond) = self
+                    let (has_bp, has_cond, has_log) = self
                         .editor
                         .path
                         .as_ref()
@@ -22762,9 +22864,14 @@ impl App {
                                 .breakpoint_conditions
                                 .get(p)
                                 .is_some_and(|c| c.contains_key(&line));
-                            (has_bp, has_cond)
+                            let has_log = self
+                                .editor
+                                .breakpoint_logs
+                                .get(p)
+                                .is_some_and(|m| m.contains_key(&line));
+                            (has_bp, has_cond, has_log)
                         })
-                        .unwrap_or((false, false));
+                        .unwrap_or((false, false, false));
                     let toggle_label = if has_bp {
                         String::from("Remove Breakpoint")
                     } else {
@@ -22775,9 +22882,15 @@ impl App {
                     } else {
                         String::from("Add Conditional Breakpoint\u{2026}")
                     };
+                    let log_label = if has_log {
+                        String::from("Edit Logpoint")
+                    } else {
+                        String::from("Add Logpoint")
+                    };
                     let items = vec![
                         (toggle_label, MenuAction::ToggleBreakpointAt { line }),
                         (cond_label, MenuAction::EditBreakpointConditionAt { line }),
+                        (log_label, MenuAction::EditLogpointAt { line }),
                     ];
                     self.context_menu = Some(ContextMenu::flat(
                         (m.column, m.row),
@@ -25098,6 +25211,10 @@ impl App {
                 self.focus_pane(Pane::Editor);
                 self.debug_edit_condition_line(line);
             }
+            MenuAction::EditLogpointAt { line } => {
+                self.focus_pane(Pane::Editor);
+                self.debug_edit_logpoint_line(line);
+            }
             MenuAction::OpenThemePicker => self.open_theme_picker(),
             MenuAction::SetTheme(theme) => self.apply_theme(theme),
             MenuAction::ToggleExplorerView(view) => self.toggle_explorer_view(view),
@@ -26728,6 +26845,11 @@ impl App {
                 let expr = prompt.buffer.clone();
                 self.prompt = None;
                 self.commit_breakpoint_condition(path, line, &expr);
+            }
+            PromptKind::Logpoint { path, line } => {
+                let message = prompt.buffer.clone();
+                self.prompt = None;
+                self.commit_logpoint(path, line, &message);
             }
             PromptKind::RenameTerminal(idx) => {
                 let name = prompt.buffer.trim().to_string();

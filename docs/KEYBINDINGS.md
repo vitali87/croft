@@ -81,6 +81,7 @@ Every choice except the side-bar / panel visibility persists across launches in 
 |---------|-------|--------|
 | Debug: Restart | `Shift`+`Cmd`+`F5` | Restart the active debug session |
 | Debug: Add Conditional Breakpoint | `Shift`+`F9` | Add or edit a conditional breakpoint at the cursor |
+| Debug: Add Logpoint | `Shift`+`Alt`+`F9` | Add or edit a logpoint at the cursor: the adapter prints the message (`{expr}` interpolates) instead of pausing |
 | Debug: Toggle Break on Raised Exceptions | `Alt`+`F9` | Break on raised (not just uncaught) exceptions |
 | Debug: Attach to Python Process | `Ctrl`+`F5` | Pick a running CPython 3.14+ process and drop a `pdb` REPL into it (PEP 768 `sys.remote_exec`); the debugger runs in a croft terminal, elevating with `sudo` when the OS requires it |
 | Preferences: Color Theme | `Cmd`+`K` `Cmd`+`T` | Pick the active color theme (also via the settings gear) |
@@ -300,6 +301,7 @@ Real breakpoint debugging over the Debug Adapter Protocol. Python is the verifie
 | `F6` | Pause (interrupt) a running program |
 | `F9` | Toggle a breakpoint on the cursor's line (a red dot in the gutter); pushed live when a session is running |
 | `Shift+F9` | Add or edit a conditional breakpoint on the cursor's line |
+| `Shift+Alt+F9` | Add or edit a logpoint on the cursor's line (amber diamond; prints instead of pausing) |
 | `Alt+F9` | Toggle break on raised (not just uncaught) exceptions |
 | `F10` | Step over |
 | `F11` / `Shift+F11` | Step into / out |

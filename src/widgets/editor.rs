@@ -1265,6 +1265,11 @@ pub struct Editor {
     /// true. Rendered with a distinct gutter glyph.
     pub breakpoint_conditions:
         std::collections::HashMap<PathBuf, std::collections::HashMap<usize, String>>,
+    /// Optional log message per breakpoint line (path -> line -> message): a
+    /// logpoint. The adapter interpolates `{expr}` holes and prints instead
+    /// of pausing. Rendered as an amber diamond in the gutter.
+    pub breakpoint_logs:
+        std::collections::HashMap<PathBuf, std::collections::HashMap<usize, String>>,
     /// Monotonic counter that bumps on every buffer mutation. The App's
     /// per-tick sync_lsp diff reads this to know when to forward a
     /// did_change to the LSP server, so building lines.join("\n") only
@@ -1546,6 +1551,7 @@ impl Editor {
             stop_line: None,
             unverified_breakpoints: std::collections::HashMap::new(),
             breakpoint_conditions: std::collections::HashMap::new(),
+            breakpoint_logs: std::collections::HashMap::new(),
             edit_seq: 0,
             git_head_lines: None,
             git_baseline_for: None,
@@ -1738,19 +1744,21 @@ impl Editor {
     }
 
     /// Breakpoints for `path` as DAP `SourceBreakpoint`s, attaching any stored
-    /// per-line condition. `lines` is the path's breakpoint set (passed in to
-    /// avoid a second lookup at the call site).
+    /// per-line condition and log message. `lines` is the path's breakpoint
+    /// set (passed in to avoid a second lookup at the call site).
     pub fn source_breakpoints(
         &self,
         path: &Path,
         lines: &std::collections::BTreeSet<usize>,
     ) -> Vec<crate::dap::session::SourceBreakpoint> {
         let conds = self.breakpoint_conditions.get(path);
+        let logs = self.breakpoint_logs.get(path);
         lines
             .iter()
             .map(|&l| crate::dap::session::SourceBreakpoint {
                 line: l as u32,
                 condition: conds.and_then(|c| c.get(&l)).cloned(),
+                log_message: logs.and_then(|m| m.get(&l)).cloned(),
             })
             .collect()
     }
@@ -6347,6 +6355,10 @@ impl Widget for &mut Editor {
                     .breakpoint_conditions
                     .get(path)
                     .is_some_and(|c| c.contains_key(&here));
+                let is_logpoint = self
+                    .breakpoint_logs
+                    .get(path)
+                    .is_some_and(|m| m.contains_key(&here));
                 if is_stop {
                     buf.set_string(
                         sign_x,
@@ -6357,12 +6369,14 @@ impl Widget for &mut Editor {
                     sign_taken = true;
                 } else if is_bp {
                     // Hollow dimmed ring when the adapter could not bind it; a
-                    // diamond for a conditional breakpoint; a solid red dot for a
-                    // plain, live one.
+                    // red diamond for a conditional breakpoint; an amber one
+                    // for a logpoint; a solid red dot for a plain, live one.
                     let (glyph, color) = if is_unverified {
                         ("○", Color::Rgb(0x99, 0x99, 0x99))
                     } else if is_conditional {
                         ("◆", Color::Rgb(0xe5, 0x1c, 0x23))
+                    } else if is_logpoint {
+                        ("◆", Color::Rgb(0xe5, 0xc0, 0x7b))
                     } else {
                         ("●", Color::Rgb(0xe5, 0x1c, 0x23))
                     };
@@ -8676,6 +8690,53 @@ mod tests {
         assert_eq!(specs[0].condition, None);
         assert_eq!(specs[1].line, 5);
         assert_eq!(specs[1].condition.as_deref(), Some("i == 10"));
+    }
+
+    #[test]
+    fn source_breakpoints_attach_log_messages() {
+        let mut e = Editor::new();
+        let p = PathBuf::from("/x/a.py");
+        let mut lines = std::collections::BTreeSet::new();
+        lines.insert(3usize);
+        lines.insert(5usize);
+        e.breakpoint_logs
+            .entry(p.clone())
+            .or_default()
+            .insert(5, String::from("value is {v}"));
+        let specs = e.source_breakpoints(&p, &lines);
+        assert_eq!(specs[0].log_message, None);
+        assert_eq!(specs[1].log_message.as_deref(), Some("value is {v}"));
+    }
+
+    #[test]
+    fn logpoint_wears_an_amber_diamond_in_the_gutter() {
+        let mut e = editor_with("a\nb\nc");
+        let p = PathBuf::from("/x/lp.py");
+        e.path = Some(p.clone());
+        e.breakpoints.entry(p.clone()).or_default().insert(2);
+        e.breakpoint_logs
+            .entry(p)
+            .or_default()
+            .insert(2, String::from("hit {x}"));
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 6,
+        };
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        (&mut e as &mut Editor).render(area, &mut buf);
+        let cell = &buf[(e.last_inner.x, e.last_inner.y + 1)];
+        assert_eq!(
+            cell.symbol(),
+            "◆",
+            "a logpoint paints the diamond in the glyph margin"
+        );
+        assert_eq!(
+            cell.fg,
+            Color::Rgb(0xe5, 0xc0, 0x7b),
+            "the logpoint diamond is amber, distinct from the conditional's red"
+        );
     }
 
     #[test]
