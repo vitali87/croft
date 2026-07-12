@@ -559,6 +559,22 @@ mod tests {
     }
 
     #[test]
+    fn imported_themes_carry_their_own_ansi_terminal_palette() {
+        // The terminal palette must follow the theme too, not fall back to the
+        // shared VS Code default. Pin a couple of signature ANSI slots.
+        let dracula = Theme::from_id("dracula").ansi();
+        assert_eq!(dracula[5], (0xff, 0x79, 0xc6)); // magenta = Dracula pink
+        assert_ne!(dracula, VSCODE_ANSI);
+
+        let gruvbox = Theme::from_id("gruvbox-dark").ansi();
+        assert_eq!(gruvbox[1], (0xcc, 0x24, 0x1d)); // red
+        assert_ne!(gruvbox, dracula);
+
+        // Built-ins keep the VS Code default ANSI (no regression).
+        assert_eq!(Theme::BLACK.ansi(), VSCODE_ANSI);
+    }
+
+    #[test]
     fn omitted_syntax_fields_fall_back_to_base16() {
         assert_eq!(hex_or("", (1, 2, 3)), (1, 2, 3));
         assert_eq!(hex_or("#0a0b0c", (1, 2, 3)), (0x0a, 0x0b, 0x0c));

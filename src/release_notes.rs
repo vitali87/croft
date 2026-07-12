@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Feature,
-    summary: "Ten editor-inspired dark themes join the Color Theme picker — One Dark Pro, Dracula, Monokai, Nord, Gruvbox Dark, Tokyo Night, Catppuccin Mocha, Solarized Dark, GitHub Dark, and Darcula — and themes now carry their own syntax palette, so switching one recolors the code (comments, keywords, strings, types) to match, not just the background.",
+    summary: "The ten editor-inspired themes (One Dark Pro, Dracula, Monokai, Nord, Gruvbox Dark, Tokyo Night, Catppuccin Mocha, Solarized Dark, GitHub Dark, Darcula) now theme the whole IDE: the integrated terminal follows the theme too — its 16-color ANSI palette and its background — alongside the editor's syntax colors, so a theme switch recolors everything, not just the background.",
 }];

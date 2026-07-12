@@ -10606,10 +10606,23 @@ impl App {
                             .split(content)
                             .to_vec()
                     };
+                    // Theme the terminal background like VS Code's integrated
+                    // terminal: prefill each pane with the theme bg before the
+                    // grid paints. Shell-colored cells override it; default-bg
+                    // cells (Style bg = None) keep the fill. On iTerm2 this
+                    // matches the SetColors session bg; on Ghostty/Kitty (which
+                    // ignores SetColors) it's what makes the terminal follow the
+                    // theme at all instead of showing the host's own bg.
+                    let term_bg = self.theme.editor_bg();
                     for (i, t) in self.terminals.iter_mut().enumerate() {
                         if cols[i].width == 0 {
                             t.last_area = Rect::default();
                         } else {
+                            frame.render_widget(
+                                ratatui::widgets::Block::default()
+                                    .style(Style::default().bg(term_bg)),
+                                cols[i],
+                            );
                             frame.render_widget(t, cols[i]);
                         }
                     }

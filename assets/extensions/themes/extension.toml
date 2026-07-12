@@ -43,9 +43,9 @@ osk_armed = "#007acc"
 # (comment / keyword / string / constant / function / type / tag / fg) so
 # switching the theme actually recolors the editor, not just the background.
 # gradient = false so each uses croft's flat accent look rather than the teal
-# brand gradient. Terminal panes fall back to the VS Code ANSI palette (no
-# per-theme `ansi` array); add an `ansi = [...]` block to match a theme's own
-# terminal colors.
+# brand gradient. Each also ships its editor's real 16-color `ansi` terminal
+# palette (black,red,green,yellow,blue,magenta,cyan,white, then bright), so the
+# integrated terminal's colors follow the theme too, not just the editor.
 
 [[themes]]
 id = "one-dark-pro"
@@ -67,6 +67,7 @@ syn_function = "#61afef"
 syn_type = "#e5c07b"
 syn_tag = "#e06c75"
 syn_fg = "#abb2bf"
+ansi = ["#282c34","#e06c75","#98c379","#e5c07b","#61afef","#c678dd","#56b6c2","#abb2bf","#545862","#e06c75","#98c379","#e5c07b","#61afef","#c678dd","#56b6c2","#c8ccd4"]
 
 [[themes]]
 id = "dracula"
@@ -88,6 +89,7 @@ syn_function = "#50fa7b"
 syn_type = "#8be9fd"
 syn_tag = "#ffb86c"
 syn_fg = "#f8f8f2"
+ansi = ["#21222c","#ff5555","#50fa7b","#f1fa8c","#bd93f9","#ff79c6","#8be9fd","#f8f8f2","#6272a4","#ff6e6e","#69ff94","#ffffa5","#d6acff","#ff92df","#a4ffff","#ffffff"]
 
 [[themes]]
 id = "monokai"
@@ -109,6 +111,7 @@ syn_function = "#a6e22e"
 syn_type = "#66d9ef"
 syn_tag = "#f92672"
 syn_fg = "#f8f8f2"
+ansi = ["#272822","#f92672","#a6e22e","#f4bf75","#66d9ef","#ae81ff","#a1efe4","#f8f8f2","#75715e","#f92672","#a6e22e","#f4bf75","#66d9ef","#ae81ff","#a1efe4","#f9f8f5"]
 
 [[themes]]
 id = "nord"
@@ -130,6 +133,7 @@ syn_function = "#88c0d0"
 syn_type = "#8fbcbb"
 syn_tag = "#d08770"
 syn_fg = "#d8dee9"
+ansi = ["#3b4252","#bf616a","#a3be8c","#ebcb8b","#81a1c1","#b48ead","#88c0d0","#e5e9f0","#4c566a","#bf616a","#a3be8c","#ebcb8b","#81a1c1","#b48ead","#8fbcbb","#eceff4"]
 
 [[themes]]
 id = "gruvbox-dark"
@@ -151,6 +155,7 @@ syn_function = "#b8bb26"
 syn_type = "#fabd2f"
 syn_tag = "#8ec07c"
 syn_fg = "#ebdbb2"
+ansi = ["#282828","#cc241d","#98971a","#d79921","#458588","#b16286","#689d6a","#a89984","#928374","#fb4934","#b8bb26","#fabd2f","#83a598","#d3869b","#8ec07c","#ebdbb2"]
 
 [[themes]]
 id = "tokyo-night"
@@ -172,6 +177,7 @@ syn_function = "#7aa2f7"
 syn_type = "#2ac3de"
 syn_tag = "#f7768e"
 syn_fg = "#c0caf5"
+ansi = ["#15161e","#f7768e","#9ece6a","#e0af68","#7aa2f7","#bb9af7","#7dcfff","#a9b1d6","#414868","#f7768e","#9ece6a","#e0af68","#7aa2f7","#bb9af7","#7dcfff","#c0caf5"]
 
 [[themes]]
 id = "catppuccin-mocha"
@@ -193,6 +199,7 @@ syn_function = "#89b4fa"
 syn_type = "#f9e2af"
 syn_tag = "#f38ba8"
 syn_fg = "#cdd6f4"
+ansi = ["#45475a","#f38ba8","#a6e3a1","#f9e2af","#89b4fa","#f5c2e7","#94e2d5","#bac2de","#585b70","#f38ba8","#a6e3a1","#f9e2af","#89b4fa","#f5c2e7","#94e2d5","#a6adc8"]
 
 [[themes]]
 id = "solarized-dark"
@@ -214,6 +221,7 @@ syn_function = "#268bd2"
 syn_type = "#b58900"
 syn_tag = "#cb4b16"
 syn_fg = "#839496"
+ansi = ["#073642","#dc322f","#859900","#b58900","#268bd2","#d33682","#2aa198","#eee8d5","#002b36","#cb4b16","#586e75","#657b83","#839496","#6c71c4","#93a1a1","#fdf6e3"]
 
 [[themes]]
 id = "github-dark"
@@ -235,6 +243,7 @@ syn_function = "#d2a8ff"
 syn_type = "#ffa657"
 syn_tag = "#7ee787"
 syn_fg = "#c9d1d9"
+ansi = ["#484f58","#ff7b72","#3fb950","#d29922","#58a6ff","#bc8cff","#39c5cf","#b1bac4","#6e7681","#ffa198","#56d364","#e3b341","#79c0ff","#d2a8ff","#56d4dd","#f0f6fc"]
 
 [[themes]]
 id = "darcula"
@@ -256,3 +265,4 @@ syn_function = "#ffc66d"
 syn_type = "#a9b7c6"
 syn_tag = "#bbb529"
 syn_fg = "#a9b7c6"
+ansi = ["#000000","#ff6b68","#a8c023","#d6bf55","#5394ec","#ae8abe","#299999","#999999","#555555","#ff8785","#a8c023","#ffff00","#7eaef4","#ff99ff","#6cdada","#ffffff"]
