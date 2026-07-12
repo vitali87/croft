@@ -10146,6 +10146,25 @@ impl App {
     fn render(&mut self, frame: &mut ratatui::Frame) {
         let size = frame.area();
         self.last_frame_area = size;
+        // Theme background, whole frame. croft's chrome (the sidebar panels,
+        // explorer sections, activity bar, gaps) mostly paints `Color::Reset`
+        // and leans on the iTerm2 `SetColors` session bg to color it. Ghostty /
+        // Kitty / sixel ignore `SetColors`, so those Reset cells fall through to
+        // the host terminal's own background (black), leaving only the surfaces
+        // that fill an explicit bg (editor, terminal) themed. Prefilling the
+        // frame with the theme bg colors every unfilled cell; widgets that set
+        // their own bg override it (ratatui patches bg only when `Some`). Gated
+        // to exactly the hosts where `SetColors` is NOT emitted (see
+        // `apply_theme`): on iTerm2 the session bg already handles this and a
+        // full-frame fill would force the OSC-1337 activity images to re-emit
+        // every frame.
+        if !crate::iterm2_inline::detect_iterm2_inline_support() {
+            frame.render_widget(
+                ratatui::widgets::Block::default()
+                    .style(Style::default().bg(self.theme.editor_bg())),
+                size,
+            );
+        }
         // The on-screen keyboard docks as a band between the panes and the
         // status bar, scaling its keys to thumb size on tall frames; frames
         // too short to host it keep it collapsed so the workspace can't be

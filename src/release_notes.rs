@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Feature,
-    summary: "The ten editor-inspired themes (One Dark Pro, Dracula, Monokai, Nord, Gruvbox Dark, Tokyo Night, Catppuccin Mocha, Solarized Dark, GitHub Dark, Darcula) now theme the whole IDE: the integrated terminal follows the theme too — its 16-color ANSI palette and its background — alongside the editor's syntax colors, so a theme switch recolors everything, not just the background.",
+    summary: "Themes now recolor the whole IDE on every terminal, including Ghostty and Kitty: the Explorer, sidebar sections, activity bar, and panels pick up the theme background (they used to stay black because those terminals ignore the iTerm2 SetColors sequence croft relied on), completing the editor, syntax, and integrated-terminal theming.",
 }];
