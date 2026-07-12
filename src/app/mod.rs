@@ -3502,6 +3502,10 @@ impl App {
         // arms on the first focus change because nothing ran the sync at
         // construction time.
         app.sync_focus_flags();
+        // Seed the highlighter with the persisted theme's code palette so a
+        // file opened before the first theme switch already highlights in the
+        // active theme's colors (not the Base16 default).
+        crate::highlight::set_syntax_palette(app.theme.syntax());
         Ok(app)
     }
 
@@ -7413,6 +7417,18 @@ impl App {
     /// image overlays + arm a full clear so nothing ghosts the old background.
     fn apply_theme(&mut self, theme: crate::theme::Theme) {
         self.theme = theme;
+        // Push the theme's code palette into the highlighter and re-highlight
+        // every open editor (across all split groups): cached spans carry baked
+        // colors, so the syntax colors only follow the theme once recomputed.
+        crate::highlight::set_syntax_palette(theme.syntax());
+        for ed in &mut self.editor.editors {
+            ed.rehighlight_for_theme();
+        }
+        for group in self.editor_layout.inactive_groups_mut() {
+            for ed in &mut group.editors {
+                ed.rehighlight_for_theme();
+            }
+        }
         // Refresh the per-pane gradient-border flag for the new theme so the
         // focused box switches its highlight style on the very next frame.
         self.sync_focus_flags();

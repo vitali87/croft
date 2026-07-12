@@ -2354,6 +2354,13 @@ impl Editor {
         true
     }
 
+    /// Recompute this editor's syntax spans against the current global palette.
+    /// Called on a theme switch: cached spans carry baked colors, so without
+    /// this the open file keeps the old theme's code colors until the next edit.
+    pub fn rehighlight_for_theme(&mut self) {
+        self.recompute_highlights();
+    }
+
     fn recompute_highlights(&mut self) {
         match self.lang {
             Some(kind) => {

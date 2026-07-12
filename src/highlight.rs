@@ -1,7 +1,9 @@
 use ratatui::style::{Color, Modifier, Style};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use tree_sitter_highlight::{HighlightConfiguration, HighlightEvent, Highlighter};
+
+use crate::theme::SyntaxPalette;
 
 /// Order matters: the index assigned by `HighlightConfiguration::configure`
 /// is the same as the index into this slice and into `HIGHLIGHT_STYLES`.
@@ -342,42 +344,61 @@ const RUST_LOCALS_QUERY: &str = r#"
 (identifier) @local.reference
 "#;
 
-/// Base16-Ocean-Dark inspired palette, indexed by HIGHLIGHT_NAMES position.
+/// The active code-highlight palette. Seeded to the historical Base16-Ocean
+/// defaults so highlighting works before any theme is applied, then overwritten
+/// by `set_syntax_palette` on every theme switch. A process-wide `RwLock`
+/// because both editors and the markdown preview highlight through the same
+/// free functions; the write happens only on a theme switch (rare), reads are
+/// uncontended.
+// ponytail: one RwLock read per token — uncontended, and tree-sitter parsing
+// dominates the pass, so it never shows up. Snapshot per-pass only if a
+// profile ever says otherwise.
+static SYNTAX: RwLock<SyntaxPalette> = RwLock::new(SyntaxPalette::BASE16);
+
+/// Point the highlighter at a new theme's code palette. The app calls this from
+/// `apply_theme` and then re-highlights open editors so the change is visible
+/// immediately (cached spans carry baked colors).
+pub fn set_syntax_palette(palette: SyntaxPalette) {
+    *SYNTAX.write().unwrap() = palette;
+}
+
+/// Palette, indexed by HIGHLIGHT_NAMES position.
 fn style_for(idx: usize) -> Style {
     style_for_name(HIGHLIGHT_NAMES.get(idx).copied().unwrap_or(""))
 }
 
-/// The palette keyed by capture name. Shared by tree-sitter highlighting
-/// (via `style_for`) and by the LSP semantic-token overlay (via
-/// `semantic_style_for`) so both layers paint the same colors.
+/// The palette keyed by capture name, resolved against the active theme's
+/// [`SyntaxPalette`]. Shared by tree-sitter highlighting (via `style_for`) and
+/// by the LSP semantic-token overlay (via `semantic_style_for`) so both layers
+/// paint the same colors.
 fn style_for_name(name: &str) -> Style {
+    palette_style_for_name(&SYNTAX.read().unwrap(), name)
+}
+
+/// Map a capture name to a style against a given palette (pure — no global
+/// read, so it is unit-testable with any theme's palette). The bold/italic
+/// emphasis on comments and keywords is structural and stays fixed across
+/// themes; only the colors come from `p`.
+fn palette_style_for_name(p: &SyntaxPalette, name: &str) -> Style {
+    let fg = |c: (u8, u8, u8)| Style::default().fg(rgb(c.0, c.1, c.2));
     match name {
-        "comment" => Style::default()
-            .fg(rgb(0x65, 0x73, 0x7e))
-            .add_modifier(Modifier::ITALIC),
-        "keyword" | "label" => Style::default()
-            .fg(rgb(0xb4, 0x8e, 0xad))
-            .add_modifier(Modifier::BOLD),
-        "string" | "string.escape" | "string.special" => Style::default().fg(rgb(0xa3, 0xbe, 0x8c)),
-        "number" | "boolean" | "constant" | "constant.builtin" => {
-            Style::default().fg(rgb(0xd0, 0x87, 0x70))
+        "comment" => fg(p.comment).add_modifier(Modifier::ITALIC),
+        "keyword" | "label" => fg(p.keyword).add_modifier(Modifier::BOLD),
+        "string" | "string.escape" | "string.special" => fg(p.string),
+        "number" | "boolean" | "constant" | "constant.builtin" | "variable.parameter" => {
+            fg(p.constant)
         }
-        "function" | "function.builtin" | "function.macro" | "function.method" | "constructor" => {
-            Style::default().fg(rgb(0x8f, 0xa1, 0xb3))
-        }
-        "type" | "type.builtin" => Style::default().fg(rgb(0xeb, 0xcb, 0x8b)),
-        "attribute" | "tag" => Style::default().fg(rgb(0xbf, 0x61, 0x6a)),
-        "property" => Style::default().fg(rgb(0x8f, 0xa1, 0xb3)),
-        "variable.builtin" => Style::default().fg(rgb(0xbf, 0x61, 0x6a)),
-        "variable.parameter" => Style::default().fg(rgb(0xd0, 0x87, 0x70)),
-        "module" => Style::default().fg(rgb(0xeb, 0xcb, 0x8b)),
+        "function" | "function.builtin" | "function.macro" | "function.method" | "constructor"
+        | "property" => fg(p.function),
+        "type" | "type.builtin" | "module" => fg(p.type_),
+        "attribute" | "tag" | "variable.builtin" => fg(p.tag),
         "operator"
         | "punctuation"
         | "punctuation.bracket"
         | "punctuation.delimiter"
         | "punctuation.special"
-        | "variable" => Style::default().fg(rgb(0xc0, 0xc5, 0xce)),
-        _ => Style::default().fg(rgb(0xc0, 0xc5, 0xce)),
+        | "variable" => fg(p.fg),
+        _ => fg(p.fg),
     }
 }
 
@@ -928,6 +949,47 @@ pub fn compute_line_starts(text: &[u8]) -> Vec<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn palette_style_resolves_each_role_against_the_theme() {
+        // Pure mapping (no global mutation, so no race with the color-asserting
+        // highlight tests that run in parallel and expect Base16). A theme's
+        // own palette must drive the token colors, with the structural
+        // bold/italic emphasis preserved.
+        let one_dark = crate::theme::Theme::from_id("one-dark-pro").syntax();
+        assert_eq!(
+            palette_style_for_name(&one_dark, "keyword").fg,
+            Some(rgb(0xc6, 0x78, 0xdd))
+        );
+        assert!(
+            palette_style_for_name(&one_dark, "keyword")
+                .add_modifier
+                .contains(Modifier::BOLD)
+        );
+        assert_eq!(
+            palette_style_for_name(&one_dark, "string").fg,
+            Some(rgb(0x98, 0xc3, 0x79))
+        );
+        assert_eq!(
+            palette_style_for_name(&one_dark, "comment").fg,
+            Some(rgb(0x7f, 0x84, 0x8e))
+        );
+        assert!(
+            palette_style_for_name(&one_dark, "comment")
+                .add_modifier
+                .contains(Modifier::ITALIC)
+        );
+        // Semantic-overlay aliases share the tree-sitter colors.
+        assert_eq!(
+            palette_style_for_name(&one_dark, "variable.parameter").fg,
+            palette_style_for_name(&one_dark, "number").fg
+        );
+        // Base16 default is unchanged (built-ins don't regress).
+        assert_eq!(
+            palette_style_for_name(&SyntaxPalette::BASE16, "type").fg,
+            Some(rgb(0xeb, 0xcb, 0x8b))
+        );
+    }
 
     /// Color of the first occurrence of `needle` on the line at `row`.
     fn py_color(src: &str, row: usize, needle: &str) -> Option<Color> {

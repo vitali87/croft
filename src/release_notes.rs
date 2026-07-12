@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Feature,
-    summary: "Test runners are extensions: which tool the Testing view drives (cargo, pytest, vitest, jest) is now declared by [[test_runners]] manifest data — four new built-ins appear in the Extensions panel, each switchable off, and a user manifest can point a runner at new marker files.",
+    summary: "Ten editor-inspired dark themes join the Color Theme picker — One Dark Pro, Dracula, Monokai, Nord, Gruvbox Dark, Tokyo Night, Catppuccin Mocha, Solarized Dark, GitHub Dark, and Darcula — and themes now carry their own syntax palette, so switching one recolors the code (comments, keywords, strings, types) to match, not just the background.",
 }];

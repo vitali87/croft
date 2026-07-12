@@ -43,6 +43,42 @@ pub const VSCODE_ANSI: [(u8, u8, u8); 16] = [
     (0xe5, 0xe5, 0xe5),
 ];
 
+/// The eight syntax-highlight colors a theme paints code with, shared by the
+/// tree-sitter highlighter and the LSP semantic-token overlay (both funnel
+/// through `highlight::style_for_name`). Grouped by role the way editor themes
+/// publish their palettes: comment, keyword, string, constant (numbers /
+/// booleans / consts / parameters), function (calls / methods / properties),
+/// type (types / namespaces), tag (attributes / JSX tags / builtins), and the
+/// default foreground for plain identifiers, operators, and punctuation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SyntaxPalette {
+    pub comment: (u8, u8, u8),
+    pub keyword: (u8, u8, u8),
+    pub string: (u8, u8, u8),
+    pub constant: (u8, u8, u8),
+    pub function: (u8, u8, u8),
+    pub type_: (u8, u8, u8),
+    pub tag: (u8, u8, u8),
+    pub fg: (u8, u8, u8),
+}
+
+impl SyntaxPalette {
+    /// The historical Base16-Ocean-Dark palette, inlined from the old hardcoded
+    /// `style_for_name` arms. The default for Croft Black / Croft Dark (Blue)
+    /// and for any theme that omits per-color `syn_*` fields, so no theme is
+    /// ever code-colorless and the built-ins render byte-for-byte as before.
+    pub const BASE16: SyntaxPalette = SyntaxPalette {
+        comment: (0x65, 0x73, 0x7e),
+        keyword: (0xb4, 0x8e, 0xad),
+        string: (0xa3, 0xbe, 0x8c),
+        constant: (0xd0, 0x87, 0x70),
+        function: (0x8f, 0xa1, 0xb3),
+        type_: (0xeb, 0xcb, 0x8b),
+        tag: (0xbf, 0x61, 0x6a),
+        fg: (0xc0, 0xc5, 0xce),
+    };
+}
+
 /// A complete IDE color palette. `Copy` and cheap to pass by value: the strings
 /// are interned to `&'static` when loaded from a manifest, and the colors are
 /// plain bytes. Equality is by value, so a registry-loaded theme compares equal
@@ -62,6 +98,8 @@ pub struct Theme {
     osk_armed: (u8, u8, u8),
     /// The 16 ANSI terminal colors (black..bright white) panes render with.
     ansi: [(u8, u8, u8); 16],
+    /// The code-highlight palette (defaults to [`SyntaxPalette::BASE16`]).
+    syntax: SyntaxPalette,
 }
 
 impl Theme {
@@ -81,6 +119,7 @@ impl Theme {
         osk_special: (0x14, 0x16, 0x1b),
         osk_armed: (0x0e, 0x7e, 0x76),
         ansi: VSCODE_ANSI,
+        syntax: SyntaxPalette::BASE16,
     };
 
     /// Croft Dark (Blue) — the historical look. Const mirror of the manifest,
@@ -98,6 +137,7 @@ impl Theme {
         osk_special: (0x2c, 0x31, 0x40),
         osk_armed: (0x00, 0x7a, 0xcc),
         ansi: VSCODE_ANSI,
+        syntax: SyntaxPalette::BASE16,
     };
 
     /// Every available theme in pick-list order, loaded once from the bundled +
@@ -166,6 +206,18 @@ impl Theme {
             } else {
                 VSCODE_ANSI
             },
+            syntax: SyntaxPalette {
+                // Each syn_* is optional: an empty string keeps the Base16
+                // default for that role, so a theme can override just a few.
+                comment: hex_or(&d.syn_comment, SyntaxPalette::BASE16.comment),
+                keyword: hex_or(&d.syn_keyword, SyntaxPalette::BASE16.keyword),
+                string: hex_or(&d.syn_string, SyntaxPalette::BASE16.string),
+                constant: hex_or(&d.syn_constant, SyntaxPalette::BASE16.constant),
+                function: hex_or(&d.syn_function, SyntaxPalette::BASE16.function),
+                type_: hex_or(&d.syn_type, SyntaxPalette::BASE16.type_),
+                tag: hex_or(&d.syn_tag, SyntaxPalette::BASE16.tag),
+                fg: hex_or(&d.syn_fg, SyntaxPalette::BASE16.fg),
+            },
         }
     }
 
@@ -212,6 +264,13 @@ impl Theme {
     /// render Named/Indexed 0-15 cell colors with.
     pub fn ansi(self) -> [(u8, u8, u8); 16] {
         self.ansi
+    }
+
+    /// The code-highlight palette. The app pushes this into the highlighter
+    /// (`highlight::set_syntax_palette`) on every theme switch so tree-sitter
+    /// and semantic-token colors follow the active theme.
+    pub fn syntax(self) -> SyntaxPalette {
+        self.syntax
     }
 
     /// Primary accent (selected-row text, active chrome).
@@ -397,6 +456,13 @@ fn parse_hex(s: &str) -> (u8, u8, u8) {
     (0, 0, 0)
 }
 
+/// Parse an optional `#rrggbb`, falling back to `default` when the string is
+/// empty (the field was omitted in the manifest) — lets a theme override only
+/// the syntax colors it cares about and inherit Base16 for the rest.
+fn hex_or(s: &str, default: (u8, u8, u8)) -> (u8, u8, u8) {
+    if s.is_empty() { default } else { parse_hex(s) }
+}
+
 /// Leak a manifest string to `&'static` (bounded by the installed theme count,
 /// loaded once). Same rationale as the LSP manifest interner.
 fn intern(s: &str) -> &'static str {
@@ -445,6 +511,57 @@ mod tests {
         let ids: Vec<&str> = Theme::all().iter().map(|t| t.id()).collect();
         assert!(ids.contains(&"black"));
         assert!(ids.contains(&"dark-blue"));
+    }
+
+    #[test]
+    fn editor_inspired_themes_all_load() {
+        // Every bundled [[themes]] block must parse (a bad hex or missing field
+        // silently drops the theme via `.ok()`), so pin the full roster.
+        let ids: Vec<&str> = Theme::all().iter().map(|t| t.id()).collect();
+        for id in [
+            "one-dark-pro",
+            "dracula",
+            "monokai",
+            "nord",
+            "gruvbox-dark",
+            "tokyo-night",
+            "catppuccin-mocha",
+            "solarized-dark",
+            "github-dark",
+            "darcula",
+        ] {
+            assert!(ids.contains(&id), "theme `{id}` missing from registry");
+        }
+        // These are imports of external editor palettes, not croft's own brand:
+        // they must use the flat-accent look, never the teal gradient chrome.
+        for t in Theme::all() {
+            if t.id() != "black" {
+                assert!(!t.gradient(), "`{}` must not use gradient chrome", t.id());
+            }
+        }
+    }
+
+    #[test]
+    fn imported_themes_carry_their_own_syntax_palette() {
+        // The whole point of the fix: switching theme must recolor code. Pin a
+        // couple of signature token colors so a regression to Base16 is caught.
+        let one_dark = Theme::from_id("one-dark-pro");
+        assert_eq!(one_dark.syntax().keyword, (0xc6, 0x78, 0xdd)); // purple
+        assert_ne!(one_dark.syntax(), SyntaxPalette::BASE16);
+
+        let dracula = Theme::from_id("dracula");
+        assert_eq!(dracula.syntax().string, (0xf1, 0xfa, 0x8c)); // yellow
+        assert_ne!(dracula.syntax().keyword, one_dark.syntax().keyword);
+
+        // Built-ins keep the historical Base16 code colors (no regression).
+        assert_eq!(Theme::BLACK.syntax(), SyntaxPalette::BASE16);
+        assert_eq!(Theme::DARK_BLUE.syntax(), SyntaxPalette::BASE16);
+    }
+
+    #[test]
+    fn omitted_syntax_fields_fall_back_to_base16() {
+        assert_eq!(hex_or("", (1, 2, 3)), (1, 2, 3));
+        assert_eq!(hex_or("#0a0b0c", (1, 2, 3)), (0x0a, 0x0b, 0x0c));
     }
 
     #[test]

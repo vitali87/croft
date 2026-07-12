@@ -267,6 +267,27 @@ pub struct ThemeDecl {
     /// VS Code's dark terminal defaults.
     #[serde(default)]
     pub ansi: Vec<String>,
+    /// Optional code-highlight colors (`#rrggbb`). Each omitted field keeps the
+    /// Base16-Ocean-Dark default, so a theme can recolor just a few token roles.
+    /// comment / keyword / string / constant (numbers, consts, params) /
+    /// function (calls, methods, properties) / type (types, namespaces) /
+    /// tag (attributes, JSX tags, builtins) / fg (plain identifiers, operators).
+    #[serde(default)]
+    pub syn_comment: String,
+    #[serde(default)]
+    pub syn_keyword: String,
+    #[serde(default)]
+    pub syn_string: String,
+    #[serde(default)]
+    pub syn_constant: String,
+    #[serde(default)]
+    pub syn_function: String,
+    #[serde(default)]
+    pub syn_type: String,
+    #[serde(default)]
+    pub syn_tag: String,
+    #[serde(default)]
+    pub syn_fg: String,
 }
 
 /// One `[[languages]]` entry: a language identity contributed by an extension.

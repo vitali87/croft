@@ -30,7 +30,7 @@ On macOS, the `Cmd` chords below only reach croft after you run a one-time setup
 | `Ctrl+Shift+x` / `Cmd+Shift+x` | Jump to Extensions |
 | `Ctrl+Shift+l` / `Cmd+Shift+l` | While on a remote, disconnect and return to the local croft at the directory you connected from |
 | Click activity-bar icons | Switch between Explorer, Search, Source Control, Run and Debug, Remote, Extensions, and Testing |
-| Click the settings gear | Open settings → Color Theme picker (Croft Dark Blue / Croft Black) or Customize Layout |
+| Click the settings gear | Open settings → Color Theme picker (Croft Black / Croft Dark Blue plus ten editor-inspired dark themes: One Dark Pro, Dracula, Monokai, Nord, Gruvbox Dark, Tokyo Night, Catppuccin Mocha, Solarized Dark, GitHub Dark, Darcula) or Customize Layout |
 | Click the layout icons (top-right of the editor / welcome) | Toggle the primary side bar, toggle the panel, or open the **Customize Layout** popup |
 | Drag a seam | Resize the sidebar, the split between editor columns, or the editor/terminal split |
 
