@@ -30460,7 +30460,7 @@ pub fn run(
         let launch_result = if let Some(adopted) = remote.adopted {
             crate::remote::launch_only(adopted, remote.path.as_deref())
         } else {
-            crate::remote::launch_croft_with(&remote.host, remote.path.as_deref(), None)
+            crate::remote::launch_croft_with(&remote.host, remote.path.as_deref(), None, false)
         };
         restore_host_terminal_state();
         match launch_result? {

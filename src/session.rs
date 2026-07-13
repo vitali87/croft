@@ -53,7 +53,6 @@ fn mux_socket_path(workspace: &Path) -> PathBuf {
 /// Socket carrying Phase D collab ops between independent-viewport
 /// participants (never PTY bytes), sibling to the mux socket with the same
 /// keying (see docs/MULTIPLAYER.md).
-#[allow(dead_code)] // consumer lands with the solo-viewport launch (slice 4d)
 pub(crate) fn collab_socket_path(workspace: &Path) -> PathBuf {
     sessions_dir().join(format!("{}.collab.sock", socket_name(workspace)))
 }
@@ -186,7 +185,11 @@ fn exec_dtach(_socket: &Path, _inner: &[String]) -> Result<()> {
 /// docs/MULTIPLAYER.md), which needs no external binary. A workspace with a
 /// live legacy dtach session keeps reattaching through dtach so sessions
 /// started under an older croft are never orphaned.
-pub fn attach(path: Option<PathBuf>) -> Result<()> {
+///
+/// With `solo`, open an independent viewport instead: this process runs its
+/// own croft (no shared PTY) and replicates shared-file edits with the other
+/// participants over the workspace's collab relay (Phase D).
+pub fn attach(path: Option<PathBuf>, solo: bool) -> Result<()> {
     let workspace = match path {
         Some(p) => p,
         None => std::env::current_dir().context("resolving workspace path")?,
@@ -195,6 +198,19 @@ pub fn attach(path: Option<PathBuf>) -> Result<()> {
     .context("resolving workspace path")?;
     if !workspace.is_dir() {
         anyhow::bail!("{} is not a directory", workspace.display());
+    }
+
+    if solo {
+        let collab = collab_socket_path(&workspace);
+        crate::collab::ensure_relay(&collab)?;
+        // The app reads these through CollabChannel::env_config, exactly as
+        // the remote launch tail exports them over SSH. Startup here is
+        // still single-threaded; the app's threads spawn inside run().
+        unsafe {
+            std::env::set_var("CROFT_COLLAB_SOCKET", &collab);
+            std::env::set_var("CROFT_COLLAB_ROLE", "guest");
+        }
+        return crate::app::run(workspace, None, None, false);
     }
 
     let croft = std::env::current_exe().context("resolving croft binary path")?;

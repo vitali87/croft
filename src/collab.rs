@@ -391,6 +391,13 @@ impl CollabMsg {
 /// (`<hash>.collab.sock`), so it never carries terminal bytes.
 pub fn relay_serve(socket: &std::path::Path) -> anyhow::Result<()> {
     use std::os::unix::net::UnixListener;
+    // Attach-or-create: a live relay already owns the socket; binding over
+    // it would strand that relay's connected clients mid-session. (Two
+    // creators racing past this check is the same benign window
+    // session_host::attach_or_create accepts.)
+    if crate::session::is_alive(socket) {
+        return Ok(());
+    }
     if let Some(dir) = socket.parent() {
         std::fs::create_dir_all(dir)?;
     }
@@ -410,6 +417,135 @@ pub fn relay_serve(socket: &std::path::Path) -> anyhow::Result<()> {
         std::thread::spawn(move || relay_client(stream, &tx, &clients));
     }
     Ok(())
+}
+
+/// The argv (after the croft binary itself) that serves a relay on `socket`.
+/// Pure so it can be unit-tested.
+fn detached_relay_argv(socket: &std::path::Path) -> Vec<String> {
+    vec![
+        String::from("collab-relay"),
+        String::from("--socket"),
+        socket.to_string_lossy().into_owned(),
+    ]
+}
+
+/// Ensure a relay is serving `socket`: done if one is alive, otherwise spawn
+/// one detached (same null-stdio + setsid pattern as
+/// `session_host::spawn_detached_server`, so it outlives this participant's
+/// terminal) and wait for it to bind.
+pub fn ensure_relay(socket: &std::path::Path) -> anyhow::Result<()> {
+    use anyhow::Context;
+    if crate::session::is_alive(socket) {
+        return Ok(());
+    }
+    let exe = std::env::current_exe().context("resolving croft binary path")?;
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(detached_relay_argv(socket));
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(unix)]
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    cmd.spawn().context("spawning collab relay")?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !crate::session::is_alive(socket) {
+        if std::time::Instant::now() > deadline {
+            anyhow::bail!("collab relay did not start on {}", socket.display());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    Ok(())
+}
+
+/// Which side of the collab session this process is (see docs/MULTIPLAYER.md):
+/// the owner is the mux's inner croft — it answers bootstrap requests,
+/// allocates site ids, and is the only participant that writes shared files
+/// to disk; guests are the solo-viewport processes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CollabRole {
+    Owner,
+    Guest,
+}
+
+/// This process's handle on the collab relay: a non-blocking framed stream
+/// of [`CollabMsg`]s, mirroring `session_host::InnerChannel` (the launch
+/// side puts the socket and role in the environment; the app connects).
+pub struct CollabChannel {
+    stream: std::os::unix::net::UnixStream,
+    reader: crate::session_host::FrameReader,
+    pub role: CollabRole,
+}
+
+impl CollabChannel {
+    /// The socket and role the launch tail exported, if this croft was
+    /// started as a collab participant. Separate from [`from_env`] so the
+    /// app can keep retrying the connect while the relay comes up.
+    ///
+    /// [`from_env`]: Self::from_env
+    pub fn env_config() -> Option<(std::path::PathBuf, CollabRole)> {
+        let socket = std::path::PathBuf::from(std::env::var_os("CROFT_COLLAB_SOCKET")?);
+        let role = match std::env::var("CROFT_COLLAB_ROLE").ok()?.as_str() {
+            "owner" => CollabRole::Owner,
+            "guest" => CollabRole::Guest,
+            _ => return None,
+        };
+        Some((socket, role))
+    }
+
+    /// Connect using the CROFT_COLLAB_SOCKET / CROFT_COLLAB_ROLE pair the
+    /// launch tail put in the environment; None when this croft is not a
+    /// collab participant or the relay is not up yet.
+    pub fn from_env() -> Option<Self> {
+        let (socket, role) = Self::env_config()?;
+        Self::connect(&socket, role)
+    }
+
+    pub fn connect(socket: &std::path::Path, role: CollabRole) -> Option<Self> {
+        let stream = std::os::unix::net::UnixStream::connect(socket).ok()?;
+        // Non-blocking so the app's per-tick drain never stalls the render
+        // loop, same as InnerChannel.
+        stream.set_nonblocking(true).ok()?;
+        Some(Self {
+            stream,
+            reader: crate::session_host::FrameReader::new(),
+            role,
+        })
+    }
+
+    /// Broadcast one message to the other participants. Returns false when
+    /// the relay is gone (the caller drops the channel and reconnects).
+    pub fn send(&mut self, msg: &CollabMsg) -> bool {
+        crate::session_host::write_frame_blocking(&mut self.stream, &msg.encode())
+    }
+
+    /// Drain every message waiting on the channel, in arrival order.
+    /// Non-blocking; malformed frames are skipped (a newer peer may speak a
+    /// larger CollabMsg — ignoring what this side cannot parse beats dying).
+    pub fn drain(&mut self) -> Vec<CollabMsg> {
+        let mut msgs = Vec::new();
+        let mut buf = [0u8; 16384];
+        loop {
+            match self.stream.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    for frame in self.reader.push(&buf[..n]) {
+                        if let crate::session_host::Frame::Bytes(payload) = frame
+                            && let Ok(msg) = serde_json::from_slice::<CollabMsg>(&payload)
+                        {
+                            msgs.push(msg);
+                        }
+                    }
+                }
+            }
+        }
+        msgs
+    }
 }
 
 type Peer = std::sync::Arc<std::sync::Mutex<std::os::unix::net::UnixStream>>;
@@ -769,6 +905,31 @@ mod tests {
         assert_eq!(b.text(), a.text());
     }
 
+    #[test]
+    fn detached_relay_argv_serves_the_socket() {
+        assert_eq!(
+            detached_relay_argv(std::path::Path::new("/x/abc.collab.sock")),
+            vec!["collab-relay", "--socket", "/x/abc.collab.sock"]
+        );
+    }
+
+    /// `ensure_relay` and `relay_serve` are attach-or-create: a live relay on
+    /// the socket short-circuits both instead of being stolen from (a second
+    /// bind would strand the first relay's clients mid-session).
+    #[test]
+    fn a_live_relay_is_not_stolen_from() {
+        use std::os::unix::net::UnixListener;
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("c.collab.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+
+        ensure_relay(&socket).expect("alive socket short-circuits");
+        relay_serve(&socket).expect("alive socket short-circuits");
+        // The original listener still owns the socket path.
+        drop(listener);
+        assert!(!crate::session::is_alive(&socket));
+    }
+
     /// End-to-end transport: two participants connected through the relay
     /// exchange an op and converge, with the relay never inspecting it.
     #[test]
@@ -796,39 +957,64 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         };
         let mut cb = UnixStream::connect(&socket).expect("second client connects");
+        ca.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         cb.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
 
         let mut a = CollabDoc::new(1, "abc");
         let mut b = a.fork(2);
 
-        // A edits and ships the envelope; B is unaware until the relay delivers.
-        let op = a.local_insert(3, "Z"); // a: "abcZ"
-        ca.write_all(
+        // Read framed envelopes off a stream until one arrives.
+        fn read_envelope(stream: &mut UnixStream, reader: &mut FrameReader) -> Envelope {
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = stream.read(&mut buf).expect("relay delivers a frame");
+                for frame in reader.push(&buf[..n]) {
+                    if let Frame::Bytes(payload) = frame {
+                        return serde_json::from_slice(&payload).unwrap();
+                    }
+                }
+            }
+        }
+        let mut reader_a = FrameReader::new();
+        let mut reader_b = FrameReader::new();
+
+        // B edits first and A waits for the forwarded frame: `connect`
+        // returning does not mean the accept loop has registered a client
+        // yet, but A *receiving* B's envelope proves both ends are
+        // registered (B to be forwarded from, A to be forwarded to), so
+        // A's own send below cannot fall into the registration window.
+        // (Live participants tolerate that window by design: joining the
+        // relay only promises messages sent after the join completes, and
+        // the bootstrap handshake is what synchronizes real sessions.)
+        let op_b = b.local_insert(0, "Y"); // b: "Yabc"
+        cb.write_all(
             &Envelope {
                 file: "f.rs".into(),
-                site: 1,
-                op,
+                site: 2,
+                op: op_b,
             }
             .encode(),
         )
         .unwrap();
+        a.apply_remote(&read_envelope(&mut ca, &mut reader_a).op);
+        assert_eq!(a.text(), "Yabc");
 
-        // B reads the forwarded frame and integrates it.
-        let mut reader = FrameReader::new();
-        let mut buf = [0u8; 4096];
-        let got = 'outer: loop {
-            let n = cb.read(&mut buf).expect("relay delivers a frame");
-            for frame in reader.push(&buf[..n]) {
-                if let Frame::Bytes(payload) = frame {
-                    let env: Envelope = serde_json::from_slice(&payload).unwrap();
-                    b.apply_remote(&env.op);
-                    break 'outer env;
-                }
+        // Now the reverse direction: A edits, B integrates, both converge.
+        let op_a = a.local_insert(4, "Z"); // a: "YabcZ"
+        ca.write_all(
+            &Envelope {
+                file: "f.rs".into(),
+                site: 1,
+                op: op_a,
             }
-        };
+            .encode(),
+        )
+        .unwrap();
+        let got = read_envelope(&mut cb, &mut reader_b);
+        b.apply_remote(&got.op);
 
         assert_eq!(got.file, "f.rs");
         assert_eq!(b.text(), a.text());
-        assert_eq!(b.text(), "abcZ");
+        assert_eq!(b.text(), "YabcZ");
     }
 }

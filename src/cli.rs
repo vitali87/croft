@@ -80,6 +80,10 @@ pub enum CliCommand {
         host: String,
         /// Remote workspace folder to open.
         path: Option<String>,
+        /// Open an independent viewport on the remote workspace instead of
+        /// joining the shared screen (see `croft attach --solo`).
+        #[arg(long, default_value_t = false)]
+        solo: bool,
     },
     /// Attach to (or create) a persistent local session for a workspace, so its
     /// terminals, LSP, DAP, and editor state survive closing the window. Detach
@@ -90,6 +94,12 @@ pub enum CliCommand {
     Attach {
         /// Workspace folder to open (defaults to the current directory).
         path: Option<PathBuf>,
+        /// Open an independent viewport on the workspace instead of joining
+        /// the shared screen: your own croft process (scroll and navigate
+        /// freely) with edits to shared files replicated between
+        /// participants over the collab relay (see docs/MULTIPLAYER.md).
+        #[arg(long, default_value_t = false)]
+        solo: bool,
     },
     /// List the running persistent croft sessions started with `croft attach`.
     Ls,
@@ -121,9 +131,17 @@ pub enum CliCommand {
     /// launch; not intended for manual use.
     #[command(hide = true)]
     CollabRelay {
+        /// Exit 0 immediately; lets the remote launch script probe whether
+        /// this binary supports collab relays before preferring them.
+        #[arg(long, default_value_t = false)]
+        probe: bool,
+        /// Ensure a detached relay is serving the socket, then exit.
+        /// Attach-or-create: safe to run when one is already up.
+        #[arg(long, default_value_t = false)]
+        ensure: bool,
         /// Collab socket path (`<hash>.collab.sock`).
         #[arg(long)]
-        socket: PathBuf,
+        socket: Option<PathBuf>,
     },
     /// One-time setup for the cross-compile fast path used by `croft <host>`:
     /// installs cargo-zigbuild and adds the two rustup targets croft ships
@@ -173,8 +191,8 @@ impl Cli {
                 size,
                 yes,
             }) => setup_iterm2(&font, &nonascii, size, yes),
-            Some(CliCommand::Remote { host, path }) => {
-                match crate::remote::launch_croft(&host, path.as_deref())? {
+            Some(CliCommand::Remote { host, path, solo }) => {
+                match crate::remote::launch_croft(&host, path.as_deref(), solo)? {
                     crate::remote::RemoteOutcome::ReturnToLocal => {
                         let cwd = std::env::current_dir().context("resolving workspace path")?;
                         crate::app::run(cwd, None, None, false)
@@ -182,7 +200,7 @@ impl Cli {
                     crate::remote::RemoteOutcome::Exited => Ok(()),
                 }
             }
-            Some(CliCommand::Attach { path }) => crate::session::attach(path),
+            Some(CliCommand::Attach { path, solo }) => crate::session::attach(path, solo),
             Some(CliCommand::Ls) => crate::session::list(),
             Some(CliCommand::SessionHost {
                 probe,
@@ -207,7 +225,21 @@ impl Cli {
                 }
                 Ok(())
             }
-            Some(CliCommand::CollabRelay { socket }) => crate::collab::relay_serve(&socket),
+            Some(CliCommand::CollabRelay {
+                probe,
+                ensure,
+                socket,
+            }) => {
+                if probe {
+                    return Ok(());
+                }
+                let socket = socket.context("collab-relay requires --socket")?;
+                if ensure {
+                    crate::collab::ensure_relay(&socket)
+                } else {
+                    crate::collab::relay_serve(&socket)
+                }
+            }
             Some(CliCommand::SetupCross { yes }) => setup_cross(yes),
             Some(CliCommand::SetupGhostty { yes }) => setup_ghostty(yes),
             Some(CliCommand::InstallLauncher { path, user, yes }) => {
@@ -787,11 +819,14 @@ mod tests {
         let cli = Cli::parse_from(["croft", "attach"]);
         assert!(matches!(
             cli.command,
-            Some(CliCommand::Attach { path: None })
+            Some(CliCommand::Attach {
+                path: None,
+                solo: false
+            })
         ));
         let cli = Cli::parse_from(["croft", "attach", "/work"]);
         match cli.command {
-            Some(CliCommand::Attach { path }) => assert_eq!(path, Some(PathBuf::from("/work"))),
+            Some(CliCommand::Attach { path, .. }) => assert_eq!(path, Some(PathBuf::from("/work"))),
             _ => panic!("expected Attach"),
         }
     }
@@ -846,18 +881,64 @@ mod tests {
     fn parses_collab_relay_subcommand() {
         let cli = Cli::parse_from(["croft", "collab-relay", "--socket", "/x/s.collab.sock"]);
         match cli.command {
-            Some(CliCommand::CollabRelay { socket }) => {
-                assert_eq!(socket, PathBuf::from("/x/s.collab.sock"));
+            Some(CliCommand::CollabRelay {
+                socket,
+                probe,
+                ensure,
+            }) => {
+                assert_eq!(socket, Some(PathBuf::from("/x/s.collab.sock")));
+                assert!(!probe);
+                assert!(!ensure);
             }
             _ => panic!("expected CollabRelay"),
         }
+        // The launch tails probe support and ensure a detached relay.
+        let cli = Cli::parse_from(["croft", "collab-relay", "--probe"]);
+        assert!(matches!(
+            cli.command,
+            Some(CliCommand::CollabRelay { probe: true, .. })
+        ));
+        let cli = Cli::parse_from(["croft", "collab-relay", "--ensure", "--socket", "/x/s.sock"]);
+        assert!(matches!(
+            cli.command,
+            Some(CliCommand::CollabRelay { ensure: true, .. })
+        ));
+    }
+
+    #[test]
+    fn parses_solo_viewport_flags() {
+        // Local: an independent-viewport guest session for a workspace.
+        let cli = Cli::parse_from(["croft", "attach", "--solo", "/work"]);
+        match cli.command {
+            Some(CliCommand::Attach { path, solo }) => {
+                assert_eq!(path, Some(PathBuf::from("/work")));
+                assert!(solo);
+            }
+            _ => panic!("expected Attach"),
+        }
+        let cli = Cli::parse_from(["croft", "attach"]);
+        assert!(matches!(
+            cli.command,
+            Some(CliCommand::Attach { solo: false, .. })
+        ));
+        // Remote: same opt-in on the SSH launch.
+        let cli = Cli::parse_from(["croft", "remote", "reasoner", "/work", "--solo"]);
+        assert!(matches!(
+            cli.command,
+            Some(CliCommand::Remote { solo: true, .. })
+        ));
+        let cli = Cli::parse_from(["croft", "remote", "reasoner"]);
+        assert!(matches!(
+            cli.command,
+            Some(CliCommand::Remote { solo: false, .. })
+        ));
     }
 
     #[test]
     fn parses_remote_command() {
         let cli = Cli::parse_from(["croft", "remote", "reasoner", "/work"]);
         match cli.command {
-            Some(CliCommand::Remote { host, path }) => {
+            Some(CliCommand::Remote { host, path, .. }) => {
                 assert_eq!(host, "reasoner");
                 assert_eq!(path, Some(String::from("/work")));
             }

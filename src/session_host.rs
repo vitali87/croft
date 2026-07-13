@@ -198,6 +198,15 @@ struct Host {
     last_writer: Mutex<Option<u64>>,
 }
 
+/// The collab socket sibling of a mux socket: same directory and hash key,
+/// `.collab.sock` in place of `.mux.sock` (matches the keying in
+/// `session::collab_socket_path` / `remote::collab_socket_path`).
+fn collab_socket_for_mux(mux: &Path) -> PathBuf {
+    let name = mux.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+    let stem = name.strip_suffix(".mux.sock").unwrap_or(name);
+    mux.with_file_name(format!("{stem}.collab.sock"))
+}
+
 /// Run the session server: spawn `inner` on a fresh PTY, listen on `socket`,
 /// broadcast output, arbitrate input. Returns the inner command's exit code
 /// once it terminates (the caller propagates it, so codes like croft's
@@ -275,6 +284,16 @@ pub(crate) fn serve_with_token(
     // control channel (participants UI: grant/revoke/kick).
     cmd.env("CROFT_SESSION_SOCKET", socket.as_os_str());
     cmd.env("CROFT_SESSION_TOKEN", token);
+    // The inner croft is the collab-session owner: when a solo-viewport
+    // guest joins the workspace (docs/MULTIPLAYER.md, Phase D), it answers
+    // bootstrap over the sibling collab socket. Exported unconditionally;
+    // the app connects lazily, so a session with no solo guests never pays
+    // for it.
+    cmd.env(
+        "CROFT_COLLAB_SOCKET",
+        collab_socket_for_mux(socket).as_os_str(),
+    );
+    cmd.env("CROFT_COLLAB_ROLE", "owner");
     let mut child = pair
         .slave
         .spawn_command(cmd)
@@ -820,7 +839,7 @@ impl InnerChannel {
 /// aborts on the first `WouldBlock` even after a partial write, which would leave
 /// a torn `[type][len][payload]` on the wire and desync the peer's FrameReader
 /// for every later control frame. Loop until the frame is fully committed.
-fn write_frame_blocking(stream: &mut UnixStream, frame: &[u8]) -> bool {
+pub(crate) fn write_frame_blocking(stream: &mut UnixStream, frame: &[u8]) -> bool {
     let mut written = 0;
     while written < frame.len() {
         match stream.write(&frame[written..]) {
@@ -869,6 +888,19 @@ fn hostname() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn collab_socket_for_mux_swaps_only_the_socket_kind() {
+        assert_eq!(
+            collab_socket_for_mux(Path::new("/x/sessions/abc123.mux.sock")),
+            PathBuf::from("/x/sessions/abc123.collab.sock")
+        );
+        // A non-mux name still lands on a .collab.sock sibling.
+        assert_eq!(
+            collab_socket_for_mux(Path::new("/x/sessions/abc123.sock")),
+            PathBuf::from("/x/sessions/abc123.sock.collab.sock")
+        );
+    }
 
     #[test]
     fn bytes_frame_round_trips_through_split_chunks() {

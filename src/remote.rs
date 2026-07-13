@@ -146,8 +146,8 @@ fn is_explicit_host_alias(alias: &str) -> bool {
     !alias.starts_with('!') && !alias.contains('*') && !alias.contains('?')
 }
 
-pub fn launch_croft(host: &str, path: Option<&str>) -> Result<RemoteOutcome> {
-    launch_croft_with(host, path, None)
+pub fn launch_croft(host: &str, path: Option<&str>, solo: bool) -> Result<RemoteOutcome> {
+    launch_croft_with(host, path, None, solo)
 }
 
 /// Run any required remote-install work inside the current process,
@@ -343,6 +343,7 @@ fn run_croft_session(
     host: &str,
     path: Option<&str>,
     persistent: bool,
+    solo: bool,
 ) -> Result<RemoteOutcome> {
     let mut bootstrapped = false;
     // The relay rendezvous is keyed on the launch identity — the very same
@@ -366,7 +367,7 @@ fn run_croft_session(
             }
         };
         let env = vec![(String::from("CROFT_RELAY_KEY"), relay_id.clone())];
-        let status = run_remote_croft(&ssh, path, &env)?;
+        let status = run_remote_croft(&ssh, path, &env, solo)?;
         match classify_remote_status(status.code()) {
             RemoteStatusClass::ReturnToLocal => return Ok(RemoteOutcome::ReturnToLocal),
             RemoteStatusClass::Exited => return Ok(RemoteOutcome::Exited),
@@ -395,7 +396,7 @@ pub fn launch_only(adopted: AdoptedMaster, path: Option<&str>) -> Result<RemoteO
     let ssh = SshControl::adopt(adopted);
     let host = ssh.host.clone();
     let persistent = remote_has_session_supervisor(&ssh);
-    run_croft_session(ssh, &host, path, persistent)
+    run_croft_session(ssh, &host, path, persistent, false)
 }
 
 fn run_command_streaming(
@@ -584,6 +585,7 @@ pub fn launch_croft_with(
     host: &str,
     path: Option<&str>,
     adopted: Option<AdoptedMaster>,
+    solo: bool,
 ) -> Result<RemoteOutcome> {
     println!("Connecting to {host}");
     let ssh = match adopted {
@@ -603,7 +605,7 @@ pub fn launch_croft_with(
         install_remote_croft(&ssh, &local_stamp)?;
     }
     let persistent = remote_has_session_supervisor(&ssh);
-    run_croft_session(ssh, host, path, persistent)
+    run_croft_session(ssh, host, path, persistent, solo)
 }
 
 /// Run the update check + (re)install on a detached thread so the caller can
@@ -1427,12 +1429,13 @@ fn run_remote_croft(
     ssh: &SshControl,
     path: Option<&str>,
     env: &[(String, String)],
+    solo: bool,
 ) -> Result<ExitStatus> {
     let mut command = ssh.command();
     command
         .arg("-tt")
         .arg(&ssh.host)
-        .arg(remote_croft_command(path, env));
+        .arg(remote_croft_command(path, env, solo));
     command.status().context("starting ssh")
 }
 
@@ -1845,13 +1848,14 @@ fn try_local_cross_install(ssh: &SshControl, source_stamp: &str) -> Result<bool>
     Ok(true)
 }
 
-pub fn remote_croft_command(path: Option<&str>, env: &[(String, String)]) -> String {
+pub fn remote_croft_command(path: Option<&str>, env: &[(String, String)], solo: bool) -> String {
     remote_croft_command_for_terminal(
         path,
         std::env::var("TERM_PROGRAM").ok().as_deref(),
         std::env::var("TERM").ok().as_deref(),
         crate::iterm2_inline::detect_osk_auto(),
         env,
+        solo,
     )
 }
 
@@ -1861,6 +1865,7 @@ fn remote_croft_command_for_terminal(
     term: Option<&str>,
     osk: bool,
     env: &[(String, String)],
+    solo: bool,
 ) -> String {
     use crate::iterm2_inline::InlineImageProtocol;
     let mut prefix = String::from("export CROFT_REMOTE_AUTOUPDATE=1; ");
@@ -1909,6 +1914,21 @@ fn remote_croft_command_for_terminal(
         Some(p) => format!("croft {}", shell_quote(p)),
         None => String::from("croft"),
     };
+    // A solo guest never attaches the shared PTY: it runs its own croft
+    // (independent viewport) wired to the workspace's collab relay for
+    // shared-file edits (docs/MULTIPLAYER.md, Phase D). The probe keeps a
+    // freshly shipped local croft from driving an unknown subcommand at a
+    // remote binary the background updater hasn't replaced yet, exactly
+    // like the session-host probe below; such a host falls back to a plain
+    // (non-collab) croft rather than failing the connect. No persistence
+    // supervisor: a solo viewport is per-guest scratch state, and wrapping
+    // it in the mux would just share its PTY again.
+    if solo {
+        let collab_socket = collab_socket_path(path);
+        return format!(
+            "{prefix}if croft collab-relay --probe >/dev/null 2>&1; then mkdir -p \"$(dirname \"{collab_socket}\")\"; croft collab-relay --ensure --socket \"{collab_socket}\"; export CROFT_COLLAB_SOCKET=\"{collab_socket}\"; export CROFT_COLLAB_ROLE=guest; exec {croft_invocation}; else exec {croft_invocation}; fi"
+        );
+    }
     // Run croft under a persistence supervisor so the session survives an SSH
     // transport drop (laptop sleep, network change). Preferred: croft's own
     // session host (`croft session-host`, the multiplayer mux; see
@@ -1966,7 +1986,6 @@ fn mux_socket_path(path: Option<&str>) -> String {
 /// Remote socket carrying Phase D collab ops between independent-viewport
 /// participants (never PTY bytes): same keying as the dtach and mux sockets,
 /// its own endpoint (see docs/MULTIPLAYER.md).
-#[allow(dead_code)] // consumer lands with the solo-viewport launch (slice 4d)
 fn collab_socket_path(path: Option<&str>) -> String {
     use std::hash::Hasher;
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -2464,15 +2483,22 @@ Host !blocked *.internal
         // A workspace path with a single quote must be shell-quoted in the
         // croft invocation (which now appears in both the dtach and the
         // direct-exec branch).
-        let command =
-            remote_croft_command_for_terminal(Some("/tmp/it's here"), None, None, false, &[]);
+        let command = remote_croft_command_for_terminal(
+            Some("/tmp/it's here"),
+            None,
+            None,
+            false,
+            &[],
+            false,
+        );
         assert!(command.contains("croft '/tmp/it'\"'\"'s here'"));
         assert!(command.starts_with("export CROFT_REMOTE_AUTOUPDATE=1;"));
     }
 
     #[test]
     fn remote_croft_command_forwards_supported_terminal_program() {
-        let command = remote_croft_command_for_terminal(None, Some("iTerm.app"), None, false, &[]);
+        let command =
+            remote_croft_command_for_terminal(None, Some("iTerm.app"), None, false, &[], false);
         assert!(command.contains("export CROFT_FORCE_INLINE_IMAGES=1 TERM_PROGRAM='iTerm.app';"));
     }
 
@@ -2482,7 +2508,8 @@ Host !blocked *.internal
         // croft must export the hint itself. It must NOT force the OSC-1337 path
         // (Ghostty parses but ignores it); the remote resolves the Kitty
         // protocol from the exported TERM_PROGRAM.
-        let command = remote_croft_command_for_terminal(None, Some("ghostty"), None, false, &[]);
+        let command =
+            remote_croft_command_for_terminal(None, Some("ghostty"), None, false, &[], false);
         assert!(command.contains("export TERM_PROGRAM=ghostty;"));
         assert!(!command.contains("CROFT_FORCE_INLINE_IMAGES"));
     }
@@ -2491,7 +2518,7 @@ Host !blocked *.internal
     fn remote_croft_command_exports_kitty_hint_from_term_only() {
         // A bare `kitty` terminal sets no TERM_PROGRAM; detection keys off TERM.
         let command =
-            remote_croft_command_for_terminal(None, None, Some("xterm-kitty"), false, &[]);
+            remote_croft_command_for_terminal(None, None, Some("xterm-kitty"), false, &[], false);
         assert!(command.contains("export TERM_PROGRAM=ghostty;"));
     }
 
@@ -2504,7 +2531,7 @@ Host !blocked *.internal
         // never desync the running croft from a fresh pump.
         let id = relay_session_id("");
         let env = vec![(String::from("CROFT_RELAY_KEY"), id.clone())];
-        let command = remote_croft_command_for_terminal(None, None, None, false, &env);
+        let command = remote_croft_command_for_terminal(None, None, None, false, &env, false);
         assert!(
             command.contains(&format!("export CROFT_RELAY_KEY='{id}'")),
             "launch must export the deterministic relay key, got: {command}",
@@ -2579,15 +2606,16 @@ Host !blocked *.internal
         // SSH from Termux does not forward TERMUX_VERSION, so a remote croft
         // would never auto-arm the on-screen keyboard; the launcher carries
         // the local detection across the hop explicitly.
-        let command = remote_croft_command_for_terminal(None, None, None, true, &[]);
+        let command = remote_croft_command_for_terminal(None, None, None, true, &[], false);
         assert!(command.contains("export CROFT_FORCE_OSK=1;"));
-        let command = remote_croft_command_for_terminal(None, None, None, false, &[]);
+        let command = remote_croft_command_for_terminal(None, None, None, false, &[], false);
         assert!(!command.contains("CROFT_FORCE_OSK"));
     }
 
     #[test]
     fn remote_command_prefers_session_host_and_falls_back_to_dtach() {
-        let command = remote_croft_command_for_terminal(Some("/srv/app"), None, None, false, &[]);
+        let command =
+            remote_croft_command_for_terminal(Some("/srv/app"), None, None, false, &[], false);
         // Preferred: croft's own session host (multiplayer mux), gated on a
         // probe so an old remote binary is never sent an unknown subcommand.
         assert!(command.contains("if croft session-host --probe"));
@@ -2609,7 +2637,7 @@ Host !blocked *.internal
 
     #[test]
     fn remote_command_omits_workspace_flag_without_a_path() {
-        let command = remote_croft_command_for_terminal(None, None, None, false, &[]);
+        let command = remote_croft_command_for_terminal(None, None, None, false, &[], false);
         assert!(command.contains("exec croft session-host --socket"));
         assert!(!command.contains("--workspace"));
         assert!(command.contains(" -- croft;"));
@@ -2636,6 +2664,40 @@ Host !blocked *.internal
         assert_ne!(c, m);
         assert!(c.ends_with(".collab.sock"));
         assert!(c.contains(&relay_session_id("/srv/app")));
+    }
+
+    #[test]
+    fn remote_command_solo_skips_the_mux_and_wires_the_collab_relay() {
+        let command = remote_croft_command_for_terminal(
+            Some("/srv/app"),
+            Some("iTerm.app"),
+            Some("xterm-256color"),
+            false,
+            &[],
+            true,
+        );
+        // A solo guest never attaches the shared PTY.
+        assert!(!command.contains("session-host --socket"));
+        assert!(!command.contains("dtach -A"));
+        // It probes for collab support (old remote binaries fall back to a
+        // plain croft), ensures the relay, and exports the channel env.
+        assert!(command.contains("if croft collab-relay --probe"));
+        assert!(command.contains("collab-relay --ensure --socket"));
+        assert!(command.contains(&collab_socket_path(Some("/srv/app"))));
+        assert!(command.contains("export CROFT_COLLAB_SOCKET="));
+        assert!(command.contains("export CROFT_COLLAB_ROLE=guest;"));
+        assert!(command.contains("exec croft '/srv/app'"));
+        // Non-solo stays on the shared-session path, untouched.
+        let shared = remote_croft_command_for_terminal(
+            Some("/srv/app"),
+            Some("iTerm.app"),
+            Some("xterm-256color"),
+            false,
+            &[],
+            false,
+        );
+        assert!(shared.contains("if croft session-host --probe"));
+        assert!(!shared.contains("CROFT_COLLAB_ROLE"));
     }
 
     #[test]
