@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Feature,
-    summary: "Themes now recolor the whole IDE on every terminal, including Ghostty and Kitty: the Explorer, sidebar sections, activity bar, and panels pick up the theme background (they used to stay black because those terminals ignore the iTerm2 SetColors sequence croft relied on), completing the editor, syntax, and integrated-terminal theming.",
+    summary: "Persistent local sessions: `croft attach` runs the workspace under dtach so its terminals, language servers, debugger, and open files survive closing the window. Close to detach, run `croft attach` again in the same folder to reattach where you left off, and `croft ls` to list what's still running. This is the persistence `croft remote` already gave over SSH, now local (install dtach; without it, attach opens a normal window).",
 }];

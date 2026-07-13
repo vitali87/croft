@@ -81,6 +81,16 @@ pub enum CliCommand {
         /// Remote workspace folder to open.
         path: Option<String>,
     },
+    /// Attach to (or create) a persistent local session for a workspace, so its
+    /// terminals, LSP, DAP, and editor state survive closing the window. Detach
+    /// by closing the window; reattach by running `croft attach` again. Requires
+    /// dtach on PATH (`brew install dtach`); without it, launches normally.
+    Attach {
+        /// Workspace folder to open (defaults to the current directory).
+        path: Option<PathBuf>,
+    },
+    /// List the running persistent croft sessions started with `croft attach`.
+    Ls,
     /// One-time setup for the cross-compile fast path used by `croft <host>`:
     /// installs cargo-zigbuild and adds the two rustup targets croft ships
     /// binaries for (x86_64 / aarch64 musl). After this finishes, the
@@ -138,6 +148,8 @@ impl Cli {
                     crate::remote::RemoteOutcome::Exited => Ok(()),
                 }
             }
+            Some(CliCommand::Attach { path }) => crate::session::attach(path),
+            Some(CliCommand::Ls) => crate::session::list(),
             Some(CliCommand::SetupCross { yes }) => setup_cross(yes),
             Some(CliCommand::SetupGhostty { yes }) => setup_ghostty(yes),
             Some(CliCommand::InstallLauncher { path, user, yes }) => {
@@ -710,6 +722,26 @@ mod tests {
             }
             _ => panic!("expected SetupIterm2"),
         }
+    }
+
+    #[test]
+    fn parses_attach_command_with_and_without_path() {
+        let cli = Cli::parse_from(["croft", "attach"]);
+        assert!(matches!(
+            cli.command,
+            Some(CliCommand::Attach { path: None })
+        ));
+        let cli = Cli::parse_from(["croft", "attach", "/work"]);
+        match cli.command {
+            Some(CliCommand::Attach { path }) => assert_eq!(path, Some(PathBuf::from("/work"))),
+            _ => panic!("expected Attach"),
+        }
+    }
+
+    #[test]
+    fn parses_ls_command() {
+        let cli = Cli::parse_from(["croft", "ls"]);
+        assert!(matches!(cli.command, Some(CliCommand::Ls)));
     }
 
     #[test]

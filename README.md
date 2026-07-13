@@ -82,10 +82,15 @@ croft ~/projects                 # opens a specific folder
 croft ~/proj --open-file a.rs    # opens a folder with a file already open
 croft ~/proj --open-file a.rs --zen  # ...focused on just the file (no sidebar/terminal)
 croft remote <host>              # launch croft over SSH on a Linux server (host from ~/.ssh/config)
+croft attach                     # open the current folder as a persistent session (survives closing the window)
+croft attach ~/projects          # ...for a specific folder
+croft ls                         # list running persistent sessions
 croft --help
 ```
 
 `croft remote <host>` installs itself on the box on first connect with no manual prep, and a stock cloud image works out of the box. See [LINUX.md](docs/LINUX.md#remote-croft-remote-host) for how the cross-compile and host provisioning work.
+
+`croft attach` runs the session under [dtach](https://github.com/crigler/dtach) so its terminals, language servers, debugger, and open files keep running after you close the window (or lose the SSH connection). Close the window to detach; run `croft attach` again in the same folder to reattach exactly where you left off, and `croft ls` to see what is still running. This is the same persistence `croft remote` already gives you over SSH, now available locally. Requires `dtach` on `PATH` (`brew install dtach`, or your package manager); without it, `croft attach` just opens a normal, non-persistent window.
 
 ## Platform setup
 

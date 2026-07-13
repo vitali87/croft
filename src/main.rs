@@ -29,6 +29,7 @@ mod release_notes;
 mod remote;
 mod remote_bulk;
 mod remote_connect;
+mod session;
 mod session_state;
 mod sheet;
 mod shell_integration;
