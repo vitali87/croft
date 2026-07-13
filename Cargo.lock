@@ -390,6 +390,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "cola"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "242a0cf7940e81cc943599ce00889a975ca13abacfaff4f11796028193603ece"
+dependencies = [
+ "serde",
+ "sha2",
+ "unsigned-varint",
+ "varint-simd",
+]
+
+[[package]]
 name = "color_quant"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -459,7 +471,7 @@ dependencies = [
 
 [[package]]
 name = "croft"
-version = "0.1.630"
+version = "0.1.631"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -468,6 +480,7 @@ dependencies = [
  "base64",
  "calamine",
  "clap",
+ "cola",
  "color_quant",
  "crossterm",
  "csv",
@@ -3411,6 +3424,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ebc1c04c71510c7f702b52b7c350734c9ff1295c464a03335b00bb84fc54f853"
 
 [[package]]
+name = "unsigned-varint"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eb066959b24b5196ae73cb057f45598450d2c5f71460e98c49b738086eff9c06"
+
+[[package]]
 name = "untrusted"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3494,6 +3513,15 @@ dependencies = [
  "getrandom 0.4.2",
  "js-sys",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "varint-simd"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "655d0cf8bfc2bd1f079e767f7ff613cbfa0ef06ca3ceaf1fd6b6cde08cbd012a"
+dependencies = [
+ "rustc_version",
 ]
 
 [[package]]

@@ -1,6 +1,7 @@
 mod app;
 mod cli;
 mod clipboard;
+mod collab;
 mod command_history;
 mod dap;
 mod file_ref;

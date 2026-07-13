@@ -1,6 +1,6 @@
 [package]
 name = "croft"
-version = "0.1.630"
+version = "0.1.631"
 edition = "2024"
 description = "VSCode-style TUI written in Rust"
 license = "MIT"
@@ -106,6 +106,14 @@ resvg = { version = "0.47", default-features = false }
 ureq = { version = "2", default-features = false, features = ["tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Text CRDT for multiplayer Phase D (independent viewports): tracks concurrent
+# edit positions so two participants can edit the same buffer without a central
+# authority. Operation-based, byte-offset model, app owns the text (croft keeps
+# its Vec<String> editor buffer; cola only tracks positions). Fastest of the
+# Rust text CRDTs benchmarked (cola vs diamond-types/yrs/automerge). `serde`
+# feature makes Insertion/Deletion wire-serializable for the control channel.
+# 0.5.1 verified current on crates.io 2026-07-13.
+cola = { version = "0.5", features = ["serde"] }
 # POSIX shell tokenizer, already in the tree transitively. Used to split a
 # terminal command line (`rg -w "two words"`) into args when seeding Search
 # from the last grep/rg command (src/quickfix.rs).

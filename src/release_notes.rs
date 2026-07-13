@@ -60,6 +60,6 @@ pub struct ReleaseNote {
 
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
-    kind: NoteKind::Fix,
-    summary: "Multiplayer session-host hardening from code review: the session socket is now created 0600 with no open window, the privileged-channel token never degrades to a predictable value if the RNG fails, grant/revoke/kick frames can no longer tear on a busy socket, rapid typist hand-offs keep every participant's caret, an open participants picker keeps your filter and selection when the roster changes, and a restarted session no longer inherits a dead one's uptime.",
+    kind: NoteKind::Feature,
+    summary: "Multiplayer groundwork for independent viewports (Phase D): a new replicated-document layer built on the cola text CRDT lets two participants edit the same buffer and always converge, with no central server. This is the foundation for future per-participant scroll and cursor; today's shared-viewport multiplayer was also field-tested end to end over a real SSH session on Linux.",
 }];

@@ -13,11 +13,41 @@ from Session: Participants (Cmd+K A). PR 3c (attributed carets) SHIPPED in
 the writing client changes (ordered before that client's bytes reach the
 PTY), and croft hands the shared cursor over on each switch, parking the
 previous typist's caret, restoring the new typist's, and painting everyone
-else's position as a colored ghost caret. Phase D (independent viewports)
-remains explicitly deferred; the rest of this document is the design the
+else's position as a colored ghost caret. Phases 3a through 3c were then
+field-tested over a real SSH session on a Linux host with the musl binary:
+byte-transparent broadcast to two clients, the presence roster, first-attacher
+write control with server-side read-only enforcement, the 0600 socket, the
+zero-winsize guard, and inner exit-code propagation over SSH all verified end
+to end (see "Field test" below).
+
+Phase D (independent viewports) was deferred until shared-viewport multiplayer
+proved itself; it now has and Phase D is green-lit. Its foundation shipped in
+0.1.631: [`src/collab.rs`], a replicated text document over the `cola` CRDT
+(concurrent inserts and deletes converge without a central authority), with a
+serializable [`Op`] for the control channel. It is not yet wired to the editor
+or the mux; that is the next slice. The rest of this document is the design the
 shipped phases followed. It exists so the multiplayer pillar starts from
 croft's real architecture instead of from a Live Share mental model that
 does not fit a single-process TUI.
+
+## Field test (0.1.630, real SSH, Linux musl)
+
+Cross-built `x86_64-unknown-linux-musl` and driven over `ssh -tt` against a
+Linux box, with a benign inner command in place of the croft TUI for
+deterministic byte assertions:
+
+- `session-host --probe` (the remote launch-tail guard) exits 0 on Linux.
+- Two clients co-attached: a shared banner emitted after both attached reached
+  both clients (verbatim broadcast).
+- Presence sidecar showed both participants with `control: true` for the first
+  attacher and `control: false` for the second (first-attacher control rule).
+- The control holder's keystrokes reached the PTY and broadcast to both; the
+  read-only client's keystrokes appeared in neither output (server-side
+  enforcement, not advisory).
+- The socket was mode `0600` from creation (umask fix), and two clients that
+  reported `0x0` size did not shrink the shared PTY (zero-winsize guard).
+- An inner `exit 7` propagated through the mux and back over SSH as exit 7
+  (the drop-to-local code path).
 
 ## Goal
 
@@ -208,13 +238,20 @@ that limitation is documented, not solved, until Phase D ever happens.
 Follow mode falls out of Phase B for free: everyone shares one viewport by
 construction.
 
-## Phase D, explicitly deferred: independent viewports
+## Phase D (green-lit, in progress): independent viewports
 
 True Live Share (per-participant files, scroll, and cursor with a shared
 document set) requires one croft process per participant with replicated
 buffers, and only here does a CRDT enter (per-buffer sequence CRDT; OT is
 rejected outright since croft has no central server authority to transform
-against and CRDTs are the settled answer in 2026). It collides with every
+against and CRDTs are the settled answer in 2026). The CRDT foundation is
+built ([`src/collab.rs`], the `cola` crate wrapped as [`CollabDoc`], convergence
+and serde round-trip tested). Remaining slices: (1) map the editor's
+`Vec<String>`/row-col edits to `CollabDoc`'s byte offsets and handle UTF-8
+boundaries; (2) carry [`Op`]s over the session-host control channel with an
+initial-state bootstrap for a joining peer; (3) run one inner croft per
+participant and render each its own viewport; (4) reconcile with the
+single-author assumptions catalogued below. It collides with every
 single-author assumption catalogued above: snapshot undo, no apply-edit
 chokepoint, disk-writing code paths that bypass buffers
 (`src/widgets/search.rs:1202`, `src/app/mod.rs:7851`), split views as copies, and
